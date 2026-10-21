@@ -44,6 +44,7 @@ members = [
     "core/connectors/sinks/meilisearch_sink",
     "core/connectors/sinks/mongodb_sink",
     "core/connectors/sinks/postgres_sink",
+    "core/connectors/sinks/questdb_sink",
     "core/connectors/sinks/quickwit_sink",
     "core/connectors/sinks/rabbitmq_sink",
     "core/connectors/sinks/redshift_sink",
@@ -286,6 +287,12 @@ prost = "0.14.4"
 prost-types = "0.14.4"
 protox = "0.10.0"
 protox-parse = "0.10.0"
+questdb-rs = { version = "7.0.0", default-features = false, features = [
+    "sync-sender-qwp-ws",
+    "tls-webpki-certs",
+    "tls-native-certs",
+    "ring-crypto",
+] }
 quinn = "0.11.12"
 quote = "1"
 rand = "0.10.3"

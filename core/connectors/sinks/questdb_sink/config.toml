@@ -1,0 +1,91 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+type = "sink"
+key = "questdb"
+enabled = true
+version = 0
+name = "QuestDB sink"
+path = "../../target/release/libiggy_connector_questdb_sink"
+verbose = false
+
+[[streams]]
+stream = "events"
+topics = ["questdb_events"]
+schema = "json"
+batch_length = 100
+poll_interval = "5ms"
+consumer_group = "questdb_sink"
+
+[plugin_config]
+# QuestDB connect string. Use `wss::` for TLS. See
+# https://questdb.com/docs/connect/clients/connect-string/
+connection_string = "ws::addr=localhost:9000;"
+# Set `sf_dir` to keep unacknowledged frames on disk across disconnects and
+# restarts. Its parent directory must exist. Give each connector instance its
+# own `sender_id` or `sf_dir`.
+# connection_string = "ws::addr=localhost:9000;sf_dir=/var/lib/iggy/questdb-sf;sender_id=iggy;"
+table = "iggy_events"
+
+# message | origin | payload | server
+timestamp_source = "message"
+# Required only when timestamp_source = "payload".
+# timestamp_field = "event_time"
+# Used only when timestamp_source = "payload", but an invalid value is
+# rejected with any source.
+# auto | seconds | millis | micros | nanos
+timestamp_unit = "auto"
+
+# Payload fields to store as SYMBOL rather than VARCHAR.
+symbol_columns = []
+# Payload fields holding RFC-4122 strings to store as UUID.
+uuid_columns = []
+# Payload fields to store as LONG, for integers above 2^53 such as nanosecond
+# epochs, snowflake ids and hashes. A fractional, non-numeric or out-of-range
+# value here is rejected.
+integer_columns = []
+
+include_stream_column = true
+include_topic_column = true
+include_partition_column = false
+include_offset_column = false
+include_headers = false
+
+# ok | durable. `durable` needs QuestDB Enterprise with replication, and
+# request_durable_ack=on in the connect string.
+ack_level = "ok"
+
+# How long a flush waits for its ack without progress. "0s" means fire and
+# forget with ack_level = "ok", and is not allowed with "durable". Shutdown can
+# wait this long for a flush in progress.
+flush_timeout = "30s"
+batch_size = 1000
+
+# Flush when the buffer reaches this many bytes, so wide rows stay under the
+# QWP frame cap of about 4 MiB.
+max_flush_bytes = 1000000
+
+# Write every JSON number as a DOUBLE, so a field sent as both 2 and 2.5 keeps
+# one column type. List integers above 2^53 in integer_columns instead of
+# turning this off. Turn it off only if every numeric field is an integer and
+# the table is created with explicit types.
+numbers_as_double = true
+
+# Add a truncated payload to the log line of a rejected record. This writes
+# user data to the log.
+log_rejected_payload = false
+verbose_logging = false
