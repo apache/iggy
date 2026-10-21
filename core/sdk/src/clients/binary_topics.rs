@@ -30,15 +30,11 @@ impl TopicClient for IggyClient {
         stream_id: &Identifier,
         topic_id: &Identifier,
     ) -> Result<Option<TopicDetails>, IggyError> {
-        self.client
-            .read()
-            .await
-            .get_topic(stream_id, topic_id)
-            .await
+        super::with_client!(self, client => client.get_topic(stream_id, topic_id).await)
     }
 
     async fn get_topics(&self, stream_id: &Identifier) -> Result<Vec<Topic>, IggyError> {
-        self.client.read().await.get_topics(stream_id).await
+        super::with_client!(self, client => client.get_topics(stream_id).await)
     }
 
     async fn create_topic(
@@ -47,11 +43,7 @@ impl TopicClient for IggyClient {
         name: &str,
         options: &TopicCreateOptions,
     ) -> Result<TopicDetails, IggyError> {
-        self.client
-            .read()
-            .await
-            .create_topic(stream_id, name, options)
-            .await
+        super::with_client!(self, client => client.create_topic(stream_id, name, options).await)
     }
 
     async fn update_topic(
@@ -61,11 +53,7 @@ impl TopicClient for IggyClient {
         name: &str,
         options: &TopicUpdateOptions,
     ) -> Result<(), IggyError> {
-        self.client
-            .read()
-            .await
-            .update_topic(stream_id, topic_id, name, options)
-            .await
+        super::with_client!(self, client => client.update_topic(stream_id, topic_id, name, options).await)
     }
 
     async fn delete_topic(
@@ -73,10 +61,6 @@ impl TopicClient for IggyClient {
         stream_id: &Identifier,
         topic_id: &Identifier,
     ) -> Result<(), IggyError> {
-        self.client
-            .read()
-            .await
-            .delete_topic(stream_id, topic_id)
-            .await
+        super::with_client!(self, client => client.delete_topic(stream_id, topic_id).await)
     }
 }

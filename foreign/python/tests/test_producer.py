@@ -1273,8 +1273,8 @@ class TestProducerLifecycle:
             await producer.send_one(SendMessage("outside"))
 
 
-class TestProducerValidationAndRetries:
-    """Test stable error categories and observable retry policy behavior."""
+class TestProducerValidationAndRecovery:
+    """Test stable errors and recovery state."""
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -1287,12 +1287,6 @@ class TestProducerValidationAndRetries:
             ({"topic_partitions_count": 2**63}, OverflowError),
             ({"topic_message_expiry": timedelta(seconds=1)}, TypeError),
             ({"topic_max_size": 1000}, TypeError),
-            ({"send_retries": -1}, ValueError),
-            ({"send_retries": 2**32}, ValueError),
-            ({"send_retries": 2**63}, OverflowError),
-            ({"send_retry_interval": timedelta(0)}, ValueError),
-            ({"send_retry_interval": timedelta(microseconds=-1)}, ValueError),
-            ({"send_retry_interval": 1}, TypeError),
         ],
     )
     async def test_producer_configuration_errors_have_stable_categories(
@@ -1402,7 +1396,6 @@ class TestProducerValidationAndRetries:
         producer = await iggy_client.producer(
             unique_name(),
             unique_name(),
-            send_retries=0,
         )
         try:
             with pytest.raises(ProducerSendError) as raised:
@@ -1423,79 +1416,7 @@ class TestProducerValidationAndRetries:
             await producer.shutdown()
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("send_retries", [None, 0])
-    async def test_none_and_zero_disable_retries(
-        self, iggy_client: IggyClient, unique_name, send_retries: int | None
-    ):
-        producer = await iggy_client.producer(
-            unique_name(),
-            unique_name(),
-            send_retries=send_retries,
-            send_retry_interval=timedelta(seconds=5),
-        )
-        try:
-            with pytest.raises(RuntimeError):
-                await asyncio.wait_for(
-                    producer.send_to(
-                        unique_name(), unique_name(), [SendMessage("single attempt")]
-                    ),
-                    timeout=1,
-                )
-        finally:
-            await producer.shutdown()
-
-    @pytest.mark.asyncio
-    async def test_explicit_none_interval_retries_without_delay(
-        self, iggy_client: IggyClient, unique_name
-    ):
-        producer = await iggy_client.producer(
-            unique_name(),
-            unique_name(),
-            send_retries=10,
-            send_retry_interval=None,
-        )
-        try:
-            with pytest.raises(RuntimeError):
-                await asyncio.wait_for(
-                    producer.send_to(
-                        unique_name(), unique_name(), [SendMessage("immediate retries")]
-                    ),
-                    timeout=1,
-                )
-        finally:
-            await producer.shutdown()
-
-    @pytest.mark.asyncio
-    async def test_terminal_error_does_not_wait_for_custom_retry_interval(
-        self, iggy_client: IggyClient, unique_name
-    ):
-        stream = unique_name()
-        topic = unique_name()
-        producer = await iggy_client.producer(
-            stream,
-            topic,
-            send_retries=2,
-            send_retry_interval=timedelta(seconds=5),
-        )
-        try:
-            with pytest.raises(ProducerSendError) as raised:
-                await asyncio.wait_for(
-                    producer.send_to(
-                        unique_name(), unique_name(), [SendMessage("terminal failure")]
-                    ),
-                    timeout=1,
-                )
-            assert raised.value.committed == []
-            assert len(raised.value.failed) == 1
-            await producer.send(raised.value.failed)
-            assert await wait_for_payloads(
-                iggy_client, stream, topic, ["terminal failure"]
-            ) == ["terminal failure"]
-        finally:
-            await producer.shutdown()
-
-    @pytest.mark.asyncio
-    async def test_terminal_error_ignores_default_retry_budget(
+    async def test_terminal_error_preserves_unconfirmed_messages(
         self, iggy_client: IggyClient, unique_name
     ):
         stream = unique_name()
@@ -1531,8 +1452,6 @@ class TestProducerValidationAndRetries:
                 linger_time=timedelta(0),
                 batch_length=1,
             ),
-            send_retries=10,
-            send_retry_interval=timedelta(seconds=5),
         )
         try:
             response = await producer.send_to(
@@ -1590,8 +1509,6 @@ class TestProducerValidationAndRetries:
                     linger_time=timedelta(0),
                     batch_length=1,
                 ),
-                send_retries=20,
-                send_retry_interval=timedelta(milliseconds=100),
             )
 
             await stop_restartable_server(server)

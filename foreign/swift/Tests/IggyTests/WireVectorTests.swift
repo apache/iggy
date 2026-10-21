@@ -268,8 +268,11 @@ struct VSRHeaderVectorTests {
         #expect(VSRFrame.readReplyCommit(ok) == 12)
         #expect(VSRFrame.readReplyStatus(ok) == 0)
         #expect(VSRFrame.readReplyOperation(ok) == .createStream)
+        #expect(!VSRFrame.hasCommittedResult(ok))
+        #expect(VSRFrame.hasCommittedResult(golden.bytes("vsr.reply.committed")[...]))
 
         let denied = golden.bytes("vsr.reply.denied")[...]
+        #expect(!VSRFrame.hasCommittedResult(denied))
         #expect(throws: IggyError(.unauthorized)) {
             try VSRFrame.decodeReply(header: denied, body: [])
         }

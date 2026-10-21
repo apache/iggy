@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import type { ClientProvider } from '../client/client.type.js';
+import type { ClientProvider, SendCommandOptions } from '../client/client.type.js';
 
 import { COMMAND_CODE } from './command.code.js';
 import { responseError } from './error.utils.js';
@@ -207,6 +207,7 @@ const SESSION_CONTROL_CODES = new Set([
 ]);
 
 const INVALID_COMMAND_ERROR_CODE = 3;
+const FEATURE_UNAVAILABLE_ERROR_CODE = 5;
 
 export abstract class AbstractAPI {
   clientProvider: ClientProvider;
@@ -235,6 +236,20 @@ export abstract class CommandAPI extends AbstractAPI {
     super(c);
   }
 
+  async resolveOperation(operationId: bigint, options?: SendCommandOptions): Promise<void> {
+    const client = await this.clientProvider();
+    if (!client.resolveOperation)
+      throw responseError(0, FEATURE_UNAVAILABLE_ERROR_CODE, 'the supplied raw client does not support operation recovery');
+    return client.resolveOperation(operationId, options);
+  }
+
+  async abandonOperation(operationId: bigint): Promise<void> {
+    const client = await this.clientProvider();
+    if (!client.abandonOperation)
+      throw responseError(0, FEATURE_UNAVAILABLE_ERROR_CODE, 'the supplied raw client does not support operation recovery');
+    client.abandonOperation(operationId);
+  }
+
   /**
    * Sends a command code with a payload and returns the raw response payload.
    * Session-control codes are rejected with an invalid-command error.
@@ -250,10 +265,10 @@ export abstract class CommandAPI extends AbstractAPI {
     if (SESSION_CONTROL_CODES.has(code))
       throw responseError(code, INVALID_COMMAND_ERROR_CODE);
 
-    const requestPayload = Buffer.from(payload);
+    const snapshot = Buffer.from(payload);
     const response = await (await this.clientProvider()).sendCommand(
       code,
-      requestPayload
+      snapshot
     );
     return response.length <= 1 ? Buffer.alloc(0) : response.data;
   }

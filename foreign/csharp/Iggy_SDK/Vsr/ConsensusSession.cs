@@ -162,8 +162,7 @@ internal sealed class ConsensusSession
             return operation switch
             {
                 VsrOperation.Register => RegisterFrameLocked(),
-                VsrOperation.NonReplicated => new SessionFrame(_clientId, _requestCounter, _session ?? 0),
-                _ => ReplicatedFrameLocked(operation)
+                _ => RequestFrameLocked(operation)
             };
         }
     }
@@ -238,18 +237,16 @@ internal sealed class ConsensusSession
         return new SessionFrame(_clientId, 0, 0);
     }
 
-    private SessionFrame ReplicatedFrameLocked(VsrOperation operation)
+    private SessionFrame RequestFrameLocked(VsrOperation operation)
     {
-        var sessionId = _session ?? throw VsrError.Exception(VsrError.UNAUTHENTICATED,
-            "A replicated request requires a bound consensus session.");
+        var sessionId = _session ?? (operation == VsrOperation.NonReplicated ? 0UL
+            : throw VsrError.Exception(VsrError.UNAUTHENTICATED, "A replicated request requires a bound consensus session."));
 
         if (_requestCounter == ulong.MaxValue)
         {
             throw VsrError.Exception(VsrError.REQUEST_ID_EXHAUSTED, "Request ID counter exhausted.");
         }
 
-        // Partition ops consume an id too: dedup needs each send to carry a distinct number, and the
-        // metadata watermark tolerates the gaps.
         var requestId = _requestCounter;
         _requestCounter = checked(_requestCounter + 1);
 
@@ -261,7 +258,6 @@ internal sealed class ConsensusSession
         _clientId = GenerateClientId();
         Array.Clear(_bindSecret);
         _session = null;
-        _requestCounter = 1;
         _registerPending = false;
         _generation++;
     }

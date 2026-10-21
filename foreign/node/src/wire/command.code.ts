@@ -44,13 +44,12 @@ export const COMMAND_CODE = {
   LoginRegisterWithAccessToken: 45,
   PollMessages: 100,
   SendMessages: 101,
-  GetPollRouting: 103,
-  PollMessagesOnPrimary: 104,
+  // 103 and 104 are retired and must never be reused.
   GetPartitionRoute: 105,
   GetOffset: 120,
   StoreOffset: 121,
   DeleteConsumerOffset: 122,
-  GetConsumerOffsetRouting: 123,
+  // 123 is retired and must never be reused.
   GetStream: 200,
   GetStreams: 201,
   CreateStream: 202,

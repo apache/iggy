@@ -26,6 +26,9 @@ import (
 	"github.com/apache/iggy/foreign/go/internal/command"
 )
 
+// usernamePresent flags the optional username of an UpdateUser body.
+const usernamePresent = 1
+
 func (c *IggyTcpClient) GetUser(ctx context.Context, identifier iggcon.Identifier) (*iggcon.UserInfoDetails, error) {
 	buffer, err := c.do(ctx, &command.GetUser{Id: identifier})
 	if err != nil {
@@ -70,9 +73,6 @@ func (c *IggyTcpClient) UpdateUser(ctx context.Context, userID iggcon.Identifier
 		Username: username,
 		Status:   status,
 	})
-	if err == nil && username != nil {
-		c.refreshCredentials(userID, username, nil)
-	}
 	return err
 }
 
@@ -97,20 +97,48 @@ func (c *IggyTcpClient) ChangePassword(ctx context.Context, userID iggcon.Identi
 		CurrentPassword: currentPassword,
 		NewPassword:     newPassword,
 	})
-	if err == nil {
-		c.refreshCredentials(userID, nil, &newPassword)
-	}
 	return err
 }
 
-func (c *IggyTcpClient) refreshCredentials(userID iggcon.Identifier, username, password *string) {
+// refreshSignIn applies a committed password change or rename to the
+// stored sign-in credentials. It reads the committed request body, so
+// typed calls, raw sends and replays follow one rule. A body that does
+// not decode changes nothing and never fails the committed call.
+func (c *IggyTcpClient) refreshSignIn(code command.Code, body []byte) {
+	if (code != command.ChangePasswordCode && code != command.UpdateUserCode) || len(body) < fieldPrefixSize {
+		return
+	}
+	end := fieldPrefixSize + int(body[1])
+	if len(body) < end {
+		return
+	}
+	user, rest := string(body[:end]), body[end:]
+	if code == command.ChangePasswordCode {
+		if _, rest, ok := splitName(rest); ok {
+			if password, _, ok := splitName(rest); ok {
+				c.refreshCredentials(user, nil, &password)
+			}
+		}
+		return
+	}
+	if len(rest) > 0 && rest[0] == usernamePresent {
+		if username, _, ok := splitName(rest[1:]); ok {
+			c.refreshCredentials(user, &username, nil)
+		}
+	}
+}
+
+// refreshCredentials updates each stored login that user names. Only the
+// signed-in user has a known numeric ID, so a change by ID reaches the
+// configured login only when it is the signed-in user.
+func (c *IggyTcpClient) refreshCredentials(user string, username, password *string) {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
 	oldUsername := c.rememberedLogin.credentials.username
-	self := c.rememberedLogin.enabled && matchesUser(userID, c.sessionUserID, oldUsername)
+	configuredUsername := c.config.autoLogin.credentials.username
+	self := c.rememberedLogin.enabled && (user == encodedUser(c.sessionUserID) || user == encodedUser(oldUsername))
 	configured := c.config.autoLogin.enabled &&
-		((self && oldUsername == c.config.autoLogin.credentials.username) ||
-			matchesUser(userID, 0, c.config.autoLogin.credentials.username) && userID.Kind() == iggcon.StringId)
+		(self && oldUsername == configuredUsername || user == encodedUser(configuredUsername))
 	for _, login := range []struct {
 		value   *AutoLogin
 		matches bool
@@ -125,14 +153,25 @@ func (c *IggyTcpClient) refreshCredentials(userID iggcon.Identifier, username, p
 			login.value.credentials.password = *password
 		}
 	}
-	c.publishPollSession()
 }
 
-func matchesUser(identifier iggcon.Identifier, userID uint32, username string) bool {
-	if identifier.Kind() == iggcon.NumericId {
-		value, err := identifier.Uint32()
-		return err == nil && value == userID
+// encodedUser is the wire form of a user identifier. An invalid value,
+// such as the empty username of a token login, encodes to "" and so
+// matches no request body.
+func encodedUser[T uint32 | string](value T) string {
+	identifier, err := iggcon.NewIdentifier(value)
+	if err != nil {
+		return ""
 	}
-	value, err := identifier.String()
-	return err == nil && value == username
+	encoded, _ := identifier.MarshalBinary()
+	return string(encoded)
+}
+
+// splitName splits a [u8 length][value] field off data.
+func splitName(data []byte) (string, []byte, bool) {
+	if len(data) == 0 || len(data) < 1+int(data[0]) {
+		return "", nil, false
+	}
+	end := 1 + int(data[0])
+	return string(data[1:end]), data[end:], true
 }

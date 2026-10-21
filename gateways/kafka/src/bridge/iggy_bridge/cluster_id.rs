@@ -203,7 +203,10 @@ impl IggyBridge {
     }
 
     async fn create_cluster_id_stream(&self, store: &IdStore) -> Result<(), BridgeError> {
-        match with_request_timeout(self.client.create_stream(&store.stream_name)).await {
+        match self
+            .metadata_write(|| self.client.create_stream(&store.stream_name))
+            .await
+        {
             Ok(_) | Err(BridgeError::Iggy(IggyError::StreamNameAlreadyExists(_))) => Ok(()),
             Err(error) => Err(store.call_failed(ClusterIdCall::CreateStream, error)),
         }
@@ -223,12 +226,12 @@ impl IggyBridge {
             durability: created.durability,
             ..TopicCreateOptions::default()
         };
-        match with_request_timeout(self.client.create_topic(
-            &store.stream_id,
-            CLUSTER_ID_TOPIC,
-            &options,
-        ))
-        .await
+        match self
+            .metadata_write(|| {
+                self.client
+                    .create_topic(&store.stream_id, CLUSTER_ID_TOPIC, &options)
+            })
+            .await
         {
             Ok(_) | Err(BridgeError::Iggy(IggyError::TopicNameAlreadyExists(_, _))) => Ok(()),
             Err(error) => Err(store.call_failed(ClusterIdCall::CreateTopic, error)),

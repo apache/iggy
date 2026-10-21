@@ -188,15 +188,13 @@ strategy.
 
 ### Secrets
 
-Four settings have to carry the byte-identical value on every node, so they
-belong in one Secret that all releases reference rather than in each release's
-values. Create it in the release namespace before the first install:
+Use one Secret for initial root credentials and the shared cluster keys. Set `IGGY_ROOT_PASSWORD` to the chosen root password. The chart requires explicit root credentials because its pinned image predates journaled root initialization. Create the Secret in the release namespace before the first install:
 
 ```bash
 JWT="$(head -c 32 /dev/urandom | base64)"
 kubectl create secret generic iggy-cluster-secrets \
   --from-literal=username=iggy \
-  --from-literal=password="$(head -c 24 /dev/urandom | base64)" \
+  --from-literal=password="${IGGY_ROOT_PASSWORD:?set IGGY_ROOT_PASSWORD}" \
   --from-literal=clusterSharedSecret="$(head -c 32 /dev/urandom | base64)" \
   --from-literal=jwtEncodingSecret="$JWT" \
   --from-literal=jwtDecodingSecret="$JWT" \
@@ -211,10 +209,7 @@ an inline value, which the chart turns into a Secret of its own:
 and a poor fit for a cluster, since the value then lives in every release's
 stored values.
 
-* **`server.users.root`** seeds the root user. Every node creates it locally
-  from its own `IGGY_ROOT_USERNAME` and `IGGY_ROOT_PASSWORD`, so a password that
-  differs on one release logs in on that node only, and a first cluster boot
-  refuses to start without both.
+* **`server.users.root`** must use the same Secret on every node. The pinned image creates root independently on each replica from its local environment. Different Secrets create different root accounts across the cluster. Newer images with journaled root initialization replicate the first leader's account and recover it on restart. Supply the same initial credentials to every replica so any node can initialize root after a promotion.
 * **`server.cluster.auth`** makes every replica connection complete an
   authenticated handshake or be rejected. The key is at least 32 bytes of
   CSPRNG output. Turning it on or off is a coordinated restart of the whole
