@@ -36,15 +36,17 @@ public enum SendMode: Sendable {
 /// Options for ``SendMode/direct(_:)``.
 ///
 /// A direct send splits a batch into requests of at most `batchLength`
-/// messages and awaits them one after another, so a failure in the middle
-/// leaves the confirmations of the prefix. Nothing is buffered between calls.
+/// messages, each within the server's 64 MiB frame limit, and awaits them
+/// one after another, so a failure in the middle leaves the confirmations of
+/// the prefix. Nothing is buffered between calls.
 public struct DirectSendOptions: Sendable, Hashable {
-    /// Max messages in one request; a larger send is split. Zero means a
-    /// million.
+    /// Max messages in one request; a larger send is split. Zero, or
+    /// anything above a million, means a million.
     public var batchLength: UInt32
     /// Minimum gap between sequential send calls, waited out before a call.
     /// It does not space out the requests of one call and does not order
-    /// concurrent callers. Must not be negative.
+    /// concurrent callers. Zero disables it; it must not be negative or
+    /// above `UInt64.max` microseconds.
     public var lingerTime: Duration
 
     public init(batchLength: UInt32 = 1000, lingerTime: Duration = .zero) {
@@ -53,12 +55,15 @@ public struct DirectSendOptions: Sendable, Hashable {
     }
 }
 
-/// What a background send does when the byte budget is exhausted.
+/// What a background send does when the byte budget or the queue of its
+/// worker is full. A send larger than the whole budget fails with
+/// ``IggyErrorCode/backgroundSendBufferOverflow`` in every mode, since no
+/// release would make it fit.
 public enum BackpressureMode: Sendable, Hashable {
     /// Waits, without a timeout, until enough capacity is released.
     case block
-    /// Waits for the duration, then fails with
-    /// ``IggyErrorCode/backgroundSendTimeout``.
+    /// Waits up to the duration for the budget and the queue together, then
+    /// fails with ``IggyErrorCode/backgroundSendTimeout``.
     case blockWithTimeout(Duration)
     /// Fails at once with ``IggyErrorCode/backgroundSendBufferOverflow``.
     case failImmediately
@@ -90,12 +95,12 @@ public struct ProducerSendFailure: Sendable {
     /// The per-send override, or nil when the producer's own partitioning
     /// applied.
     public var partitioning: Partitioning?
-    /// The unconfirmed tail. A request can commit before its reply is lost,
-    /// so resending it can append the messages twice. With balanced
-    /// partitioning the client picks the partition per request, so a resend
-    /// can land on another partition than the failed attempt.
+    /// The unconfirmed batch. Whether its request may have committed
+    /// depends on `cause`, read as ``ProducerSendError`` describes. With
+    /// balanced partitioning the client picks the partition per request, so
+    /// a resend can land on another partition than the failed attempt.
     public var messages: [IggyMessage]
-    /// Confirmations of the requests written before the failure.
+    /// Always empty: a background write goes as one request.
     public var committed: [SendConfirmation]
 
     public init(
@@ -118,10 +123,11 @@ public struct ProducerSendFailure: Sendable {
 /// `workerCount` workers. A worker flushes its buffer when one of the
 /// triggers below fires, merging adjacent sends to one destination into one
 /// request. Write failures go to `errorHandler`, since no caller waits for
-/// them. A negative count, size, or duration is refused when the producer is
-/// built.
+/// them. A negative count or size, and a negative duration or one above
+/// `UInt64.max` microseconds, is refused when the producer is built.
 public struct BackgroundSendOptions: Sendable {
-    /// Workers, each with its own queue and buffer. At least one.
+    /// Workers, each with its own queue and buffer. At least one; the Rust
+    /// SDK raises zero to one, this one refuses it.
     public var workerCount: Int
     public var sharding: ShardingStrategy
     /// Flushes a worker once its buffer holds this many bytes, counted as
@@ -131,10 +137,12 @@ public struct BackgroundSendOptions: Sendable {
     /// their message counts. Zero disables the trigger.
     public var batchLength: Int
     /// Flushes a worker this long after the first send of its buffer
-    /// arrived. Zero flushes as soon as the queue is drained.
+    /// arrived. Zero flushes as soon as the queue is drained; no value
+    /// disables it.
     public var lingerTime: Duration
     /// Bytes queued or in flight across the producer. A send that does not
-    /// fit waits or fails as `backpressure` says. Zero lifts the bound.
+    /// fit waits or fails as `backpressure` says, and one larger than the
+    /// whole budget always fails. Zero lifts the bound.
     public var maxBufferSize: Int
     public var backpressure: BackpressureMode
     /// Concurrent writes across workers; each worker stays sequential. Zero
@@ -146,6 +154,11 @@ public struct BackgroundSendOptions: Sendable {
     /// Failures wait for it outside `maxBufferSize`, so a slow handler holds
     /// their messages in memory. It must not await
     /// ``IggyProducer/shutdown()``, which waits for the handler to finish.
+    /// A handler that resends through the producer should capture it
+    /// weakly, since a strong capture keeps the producer, its workers, and
+    /// the client alive after every other reference is gone. Failures of the
+    /// final flush arrive after the producer closed, so a resend through it
+    /// fails with ``IggyErrorCode/producerClosed``.
     public var errorHandler: (@Sendable (ProducerSendFailure) async -> Void)?
 
     public init(
@@ -177,13 +190,16 @@ public struct ProducerConfiguration: Sendable {
     /// Creates the topic during ``IggyProducer/initialize()`` when it is
     /// missing and named, with the four topic settings below.
     public var createTopicIfNotExists: Bool
+    /// At least one while `createTopicIfNotExists` is set.
     public var topicPartitionsCount: UInt32
     public var topicMessageExpiry: IggyExpiry
     public var topicMaxSize: MaxTopicSize
     public var topicDurability: Durability
     /// Retries of a request the server refused to admit or that found no
     /// connection, and checks while the client is signed out. Nil or zero
-    /// sends once.
+    /// sends once. The Rust producer dropped these retries once its client
+    /// gained operation lanes that resolve an uncertain write; the Swift
+    /// client has no lanes yet, so this producer keeps them.
     public var sendRetries: UInt32?
     /// The first retry is immediate; later ones are at most this far apart.
     /// Nil retries back to back.
@@ -208,18 +224,29 @@ public struct ProducerConfiguration: Sendable {
         self.mode = mode
     }
 
-    /// Refuses what the Rust SDK's unsigned fields cannot express.
+    /// Refuses negative values, which the Rust SDK's unsigned fields cannot
+    /// hold, durations its `IggyDuration` cannot hold, which would also trap
+    /// in `Task.sleep`, and a topic it would create with no partitions.
     func validate() throws {
-        if let sendRetryInterval, sendRetryInterval < .zero {
-            throw IggyError(.invalidConfiguration, context: "sendRetryInterval must not be negative")
+        if let sendRetryInterval {
+            try Self.validate(sendRetryInterval, named: "sendRetryInterval")
+        }
+        if createTopicIfNotExists, topicPartitionsCount == 0 {
+            throw IggyError(.invalidConfiguration, context: "topicPartitionsCount must be at least 1 when the topic may be created")
         }
         switch mode {
         case .direct(let options):
-            if options.lingerTime < .zero {
-                throw IggyError(.invalidConfiguration, context: "lingerTime must not be negative")
-            }
+            try Self.validate(options.lingerTime, named: "lingerTime")
         case .background(let options):
             try options.validate()
+        }
+    }
+
+    static let maxDuration = Duration.microseconds(UInt64.max)
+
+    static func validate(_ duration: Duration, named name: String) throws {
+        guard duration >= .zero, duration <= maxDuration else {
+            throw IggyError(.invalidConfiguration, context: "\(name) must be between zero and \(maxDuration), got \(duration)")
         }
     }
 }
@@ -233,26 +260,29 @@ extension BackgroundSendOptions {
         where value < 0 {
             throw IggyError(.invalidConfiguration, context: "\(name) must not be negative, got \(value)")
         }
-        if lingerTime < .zero {
-            throw IggyError(.invalidConfiguration, context: "lingerTime must not be negative")
-        }
-        if case .blockWithTimeout(let timeout) = backpressure, timeout < .zero {
-            throw IggyError(.invalidConfiguration, context: "the backpressure timeout must not be negative")
+        try ProducerConfiguration.validate(lingerTime, named: "lingerTime")
+        if case .blockWithTimeout(let timeout) = backpressure {
+            try ProducerConfiguration.validate(timeout, named: "the backpressure timeout")
         }
     }
 }
 
 /// A direct send that failed, the counterpart of the Rust SDK's
 /// `ProducerSendFailed`. `committed` holds the confirmations of the requests
-/// written before the failure and `failed` the unconfirmed tail, with the
-/// ids the producer minted for it. Check `cause` before resending the tail:
-/// a request can commit before its reply is lost, so a resend can append it
-/// twice. With balanced partitioning the client picks the partition per
-/// request, so a resend can land on another partition than the failed
-/// attempt.
+/// that committed before the failure and `failed` the unconfirmed tail, with
+/// the ids the producer minted for it.
 ///
-/// A cancelled send is reported here too, with `underlying` set to the
-/// `CancellationError`, since its prefix may have committed.
+/// The first request of `failed` may have committed, and the server does not
+/// deduplicate a resend. It provably never committed only when `cause` is
+/// ``IggyErrorCode/transientNotAccepted``, ``IggyErrorCode/notConnected``,
+/// ``IggyErrorCode/cannotEstablishConnection``,
+/// ``IggyErrorCode/cannotSendMessagesDueToClientDisconnection``, or
+/// ``IggyErrorCode/producerClosed``, or when `underlying` is the
+/// partitioner's own error. Treat any other cause as unknown, cancellation
+/// included: a cancelled send is reported here with `underlying` set to the
+/// `CancellationError`, and it may have written the request it interrupted.
+/// With balanced partitioning the client picks the partition per request,
+/// so a resend can land on another partition than the failed attempt.
 public struct ProducerSendError: Error, Sendable, CustomStringConvertible {
     public var cause: IggyError
     /// The error `cause` was made from when it was not an ``IggyError``: a
@@ -276,6 +306,6 @@ public struct ProducerSendError: Error, Sendable, CustomStringConvertible {
     }
 
     public var description: String {
-        "producer send to stream \(streamID), topic \(topicID) failed with \(failed.count) unconfirmed messages after \(committed.count) confirmed requests: \(cause)"
+        "producer send to stream \(streamID), topic \(topicID) failed with \(failed.count) unconfirmed messages after \(committed.count) confirmations: \(cause)"
     }
 }

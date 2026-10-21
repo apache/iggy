@@ -25,11 +25,21 @@ struct QueuedBatch: Sendable {
     /// messages in both SDKs.
     static let messageHeaderSize = 64
 
+    /// The most a batch may be charged and still fit one request of
+    /// ``VSRFrame/maxRequestSize``. The charge counts 64 bytes per message
+    /// where the wire takes 48, which covers the explicit partition the
+    /// client always sends.
+    static let maxRequestBytes = VSRFrame.maxRequestSize - VSRFrame.headerSize - Batch.headerSize - 8
+
     let streamID: Identifier
     let topicID: Identifier
     var messages: [IggyMessage]
     let partitioning: Partitioning?
     var sizeBytes: Int
+    /// The span of origin timestamps, in microseconds, which one request
+    /// may not stretch past ``Batch/maxTimestampDelta``.
+    var earliestTimestamp: UInt64
+    var latestTimestamp: UInt64
 
     init(streamID: Identifier, topicID: Identifier, messages: [IggyMessage], partitioning: Partitioning?) {
         self.streamID = streamID
@@ -38,15 +48,33 @@ struct QueuedBatch: Sendable {
         self.partitioning = partitioning
         var size = streamID.encodedSize + topicID.encodedSize
         size += partitioning?.encodedSize ?? 0
+        var earliest = UInt64.max
+        var latest = UInt64.min
         for message in messages {
             size += Self.messageHeaderSize + message.payload.count
             size += message.rawUserHeaders?.count ?? 0
+            earliest = min(earliest, message.originTimestamp.microseconds)
+            latest = max(latest, message.originTimestamp.microseconds)
         }
         sizeBytes = size
+        earliestTimestamp = earliest
+        latestTimestamp = latest
     }
 
     func sameDestination(as other: QueuedBatch) -> Bool {
         streamID == other.streamID && topicID == other.topicID && partitioning == other.partitioning
+    }
+
+    /// Whether `other` can join this batch in one request: the same
+    /// destination, within the request size, and within the timestamp span
+    /// the client accepts.
+    func canMerge(_ other: QueuedBatch) -> Bool {
+        guard sameDestination(as: other), sizeBytes + other.sizeBytes <= Self.maxRequestBytes else {
+            return false
+        }
+        let latest = max(latestTimestamp, other.latestTimestamp)
+        let earliest = min(earliestTimestamp, other.earliestTimestamp)
+        return latest < earliest || latest - earliest <= Batch.maxTimestampDelta
     }
 }
 
@@ -87,7 +115,9 @@ final class ProducerDispatcher: Sendable {
     }
 
     /// The workers' loops keep them alive, so a producer released without a
-    /// shutdown has them write what they hold and end.
+    /// shutdown has them write what they hold and end. An error handler that
+    /// holds the producer strongly keeps this dispatcher alive too, and then
+    /// only a shutdown ends them.
     deinit {
         state.withLockedValue { state in
             if state.drain == nil {
@@ -104,21 +134,26 @@ final class ProducerDispatcher: Sendable {
         }
         let batch = QueuedBatch(streamID: streamID, topicID: topicID, messages: messages, partitioning: partitioning)
         // A merged request is at most this large, so no single batch may be.
-        guard batch.sizeBytes <= UInt32.max else {
+        guard batch.sizeBytes <= QueuedBatch.maxRequestBytes else {
             throw IggyError(.backgroundSendBufferOverflow, context: "a batch of \(batch.sizeBytes) bytes exceeds a request")
         }
         let worker = workers[try pickWorker(for: batch)]
+        // One deadline covers the budget and the queue slot.
+        var deadline: ContinuousClock.Instant?
+        if case .blockWithTimeout(let timeout) = options.backpressure {
+            deadline = .now + timeout
+        }
         if let byteBudget {
             guard batch.sizeBytes <= options.maxBufferSize else {
                 throw IggyError(
                     .backgroundSendBufferOverflow, context: "a batch of \(batch.sizeBytes) bytes exceeds the \(options.maxBufferSize) byte budget")
             }
             if !byteBudget.tryAcquire(batch.sizeBytes) {
-                try await waitForBudget(byteBudget, bytes: batch.sizeBytes)
+                try await waitForBudget(byteBudget, bytes: batch.sizeBytes, deadline: deadline)
             }
         }
         do {
-            try await worker.enqueue(batch)
+            try await worker.enqueue(batch, deadline: deadline)
         } catch {
             byteBudget?.release(batch.sizeBytes)
             throw error
@@ -154,15 +189,13 @@ final class ProducerDispatcher: Sendable {
 
     /// A cancelled wait leaves nothing queued, so it is reported as the
     /// cancellation it is.
-    private func waitForBudget(_ byteBudget: AsyncSemaphore, bytes: Int) async throws {
+    private func waitForBudget(_ byteBudget: AsyncSemaphore, bytes: Int, deadline: ContinuousClock.Instant?) async throws {
         switch options.backpressure {
         case .failImmediately:
             throw IggyError(.backgroundSendBufferOverflow, context: "the byte budget is used up")
-        case .block:
-            _ = try await byteBudget.acquire(bytes)
-        case .blockWithTimeout(let timeout):
-            guard try await byteBudget.acquire(bytes, deadline: .now + timeout) else {
-                throw IggyError(.backgroundSendTimeout, context: "no buffer capacity within \(timeout)")
+        case .block, .blockWithTimeout:
+            guard try await byteBudget.acquire(bytes, deadline: deadline) else {
+                throw IggyError(.backgroundSendTimeout, context: "no buffer capacity within the backpressure timeout")
             }
         }
     }
@@ -219,6 +252,9 @@ actor ShardWorker {
     private let queueSlots = AsyncSemaphore(permits: ShardWorker.queueCapacity)
 
     private var queue: [QueuedBatch] = []
+    /// The queue's previous storage, swapped in so picking up never
+    /// allocates.
+    private var pickedUp: [QueuedBatch] = []
     private var buffer: [QueuedBatch] = []
     private var bufferBytes = 0
     /// Armed by the first send buffered after a flush, so an idle worker never
@@ -242,7 +278,9 @@ actor ShardWorker {
         self.logger = logger
     }
 
-    func enqueue(_ batch: QueuedBatch) async throws {
+    /// Queues `batch`. A full queue is met the way `backpressure` says, with
+    /// `deadline` shared with the wait for the byte budget.
+    func enqueue(_ batch: QueuedBatch, deadline: ContinuousClock.Instant? = nil) async throws {
         guard !closed else {
             throw IggyError(.producerClosed)
         }
@@ -250,7 +288,14 @@ actor ShardWorker {
             loop = Task { await self.run() }
         }
         if !queueSlots.tryAcquire(1) {
-            _ = try await queueSlots.acquire(1)
+            switch options.backpressure {
+            case .failImmediately:
+                throw IggyError(.backgroundSendBufferOverflow, context: "the queue of the worker is full")
+            case .block, .blockWithTimeout:
+                guard try await queueSlots.acquire(1, deadline: deadline) else {
+                    throw IggyError(.backgroundSendTimeout, context: "no queue slot within the backpressure timeout")
+                }
+            }
         }
         guard !closed else {
             // The worker stopped while this waited for a slot, as a channel
@@ -277,14 +322,19 @@ actor ShardWorker {
         while true {
             if stopping {
                 closed = true
-                for batch in takeQueue() {
+                swap(&queue, &pickedUp)
+                for batch in pickedUp {
                     pickUp(batch)
                 }
+                pickedUp.removeAll(keepingCapacity: true)
                 await flush()
                 return
             }
             if !queue.isEmpty {
-                for batch in takeQueue() {
+                // Sends that arrive while these are picked up wait for the
+                // next round, behind them.
+                swap(&queue, &pickedUp)
+                for batch in pickedUp {
                     pickUp(batch)
                     let exceedsLength = options.batchLength > 0 && buffer.count >= options.batchLength
                     let exceedsSize = options.batchSize > 0 && bufferBytes >= options.batchSize
@@ -292,6 +342,7 @@ actor ShardWorker {
                         await flush()
                     }
                 }
+                pickedUp.removeAll(keepingCapacity: true)
                 continue
             }
             if !buffer.isEmpty, let lingerDeadline, ContinuousClock.now >= lingerDeadline {
@@ -300,14 +351,6 @@ actor ShardWorker {
             }
             await withCheckedContinuation { wakeup = $0 }
         }
-    }
-
-    /// Sends that arrive while these are picked up wait for the next round,
-    /// behind them.
-    private func takeQueue() -> [QueuedBatch] {
-        let pending = queue
-        queue.removeAll(keepingCapacity: true)
-        return pending
     }
 
     private func pickUp(_ batch: QueuedBatch) {
@@ -371,16 +414,18 @@ actor ShardWorker {
         }
     }
 
-    /// Adjacent sends to one destination become one request while the merged
-    /// size still fits a request.
+    /// Adjacent sends to one destination become one request while it still
+    /// fits a request and the client's timestamp span.
     static func merge(_ batches: [QueuedBatch]) -> [QueuedBatch] {
         var merged: [QueuedBatch] = []
         merged.reserveCapacity(batches.count)
         for batch in batches {
-            if let last = merged.indices.last, merged[last].sameDestination(as: batch), merged[last].sizeBytes + batch.sizeBytes <= UInt32.max {
+            if let last = merged.indices.last, merged[last].canMerge(batch) {
                 // In place, so the growing array is not copied per send.
                 merged[last].messages.append(contentsOf: batch.messages)
                 merged[last].sizeBytes += batch.sizeBytes
+                merged[last].earliestTimestamp = min(merged[last].earliestTimestamp, batch.earliestTimestamp)
+                merged[last].latestTimestamp = max(merged[last].latestTimestamp, batch.latestTimestamp)
                 continue
             }
             merged.append(batch)

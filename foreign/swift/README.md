@@ -173,25 +173,36 @@ try await background.send(["queued"])
 await background.shutdown()
 ```
 
-A direct send splits a batch into requests of `batchLength` messages and returns their
-confirmations; a failure, cancellation included, throws `ProducerSendError` with the
-confirmations so far and the unconfirmed tail. A background send returns once queued
-and reports write failures to `errorHandler`; `shutdown()` writes what is still
-buffered. The producer retries only a request the server refused to admit or that
-found no connection, since a retry is a new request: anything that may have committed,
-such as `transientNotCommitted`, is left to the caller. With the default ordered
-sharding, the sends to one stream and topic identifier are written in order. A topic
-addressed by name and by numeric id counts as two, and a failed request does not hold
-back the ones after it, so a resend from `errorHandler` lands behind them.
+A direct send splits a batch into requests of at most `batchLength` messages, each
+within the server's 64 MiB frame limit, and returns their confirmations; a failure,
+cancellation included, throws `ProducerSendError` with the confirmations so far and the
+unconfirmed tail. A background send returns once queued and reports write failures to
+`errorHandler`; `shutdown()` writes what is still buffered, and the producer is closed
+by then, so a resend from `errorHandler` during that final flush fails with
+`producerClosed`.
+
+The producer retries only a request the server refused to admit or that found no
+connection, since a retry is a new request: anything that may have committed, such as
+`transientNotCommitted` or `disconnected`, is left to the caller, and the server does
+not deduplicate a resend. Resend a failed tail only when its `cause` proves the first
+request never committed; `ProducerSendError` lists those causes. The Rust producer has
+since handed these retries to its client's operation lanes, which the Swift client does
+not have yet.
+
+With the default ordered sharding, the sends to one stream and topic identifier are
+written in order. A topic addressed by name and by numeric id counts as two, and a
+failed request does not hold back the ones after it, so a resend from `errorHandler`
+lands behind them.
 
 ### Errors
 
 Every client operation throws `IggyError`, a value carrying the typed `code`
 (`IggyErrorCode`, one case per server error code), the raw wire code, and optional
 context. A cancelled task gets `CancellationError`. A direct producer send is the
-exception: it throws `ProducerSendError`, whose `cause` is the `IggyError` and whose
-`failed` tail is what to resend, and a cancelled one is reported the same way since part
-of it may have committed:
+exception: a failure while sending, cancellation included, throws `ProducerSendError`,
+carrying the `IggyError` as `cause`, the confirmations so far, and the unconfirmed
+`failed` tail. A send refused before it starts, such as with `producerClosed` after
+`shutdown()`, throws a plain `IggyError`:
 
 ```swift
 func handle(_ error: IggyError) {

@@ -56,6 +56,8 @@ final class FakeVSRServer: @unchecked Sendable {
         case wrongRequestID(UInt64)
         /// Closes the connection instead of answering.
         case close
+        /// Answers with status zero and this body, then closes the connection.
+        case okThenClose([UInt8])
         /// Never answers.
         case stall
         /// A status-zero reply written in two TCP chunks with a pause between.
@@ -413,6 +415,9 @@ final class FakeServerHandler: ChannelInboundHandler {
                     clientID: request.clientID, checksum: request.checksum, context: request.context, payload: request.payload)
                 write(FakeVSRServer.encodeReply(request: wrong, operation: operation, status: 0, body: framedBody([])))
             case .close:
+                channel.close(promise: nil)
+            case .okThenClose(let body):
+                write(FakeVSRServer.encodeReply(request: request, operation: operation, status: 0, body: framedBody(body)))
                 channel.close(promise: nil)
             case .stall:
                 break

@@ -19,7 +19,11 @@ import Logging
 import NIOConcurrencyHelpers
 
 /// Appends messages to one topic of one stream, a port of `IggyProducer` in
-/// the Rust SDK.
+/// the Rust SDK as it was before its client gained operation lanes. The Rust
+/// producer now leaves an uncertain write to the client to resolve and no
+/// longer retries or waits for a sign-in; the Swift client has no lanes yet,
+/// so this one keeps ``ProducerConfiguration/sendRetries`` and the sign-in
+/// wait.
 ///
 /// Build one with ``IggyClient/producer(streamID:topicID:configuration:)``,
 /// call ``initialize()`` once, then send. A ``SendMode/direct`` producer
@@ -39,7 +43,6 @@ public final class IggyProducer: Sendable {
 
     let core: ProducerCore
     let dispatcher: ProducerDispatcher?
-    private let closed = NIOLockedValueBox(false)
 
     init(client: IggyClient, streamID: Identifier, topicID: Identifier, configuration: ProducerConfiguration) throws {
         try configuration.validate()
@@ -81,13 +84,14 @@ public final class IggyProducer: Sendable {
         try await send(messages, streamID: streamID, topicID: topicID, partitioning: nil)
     }
 
-    /// Sends one message; see ``send(_:)``.
+    /// Sends one message, as ``send(_:partitioning:)`` with nil.
     @discardableResult
     public func send(_ message: IggyMessage) async throws -> SendMessagesResponse {
         try await send([message])
     }
 
-    /// Sends with a per-call `partitioning`, or the producer's when nil.
+    /// Sends with a per-call `partitioning`, or the producer's when nil. A
+    /// configured ``ProducerConfiguration/partitioner`` wins over both.
     @discardableResult
     public func send(_ messages: [IggyMessage], partitioning: Partitioning?) async throws -> SendMessagesResponse {
         try await send(messages, streamID: streamID, topicID: topicID, partitioning: partitioning)
@@ -114,14 +118,18 @@ public final class IggyProducer: Sendable {
     /// writes and error handler, then stops following the client. Every
     /// caller waits for the same drain. A producer released without it
     /// still writes what it held, but nothing waits for those writes.
+    ///
+    /// A direct send in progress is not waited for: the request it is
+    /// writing finishes, and its remaining requests fail with
+    /// ``IggyErrorCode/producerClosed``.
     public func shutdown() async {
-        closed.withLockedValue { $0 = true }
+        core.closed.withLockedValue { $0 = true }
         await dispatcher?.shutdown()
         await core.shutdown()
     }
 
     private func checkOpen() throws {
-        if closed.withLockedValue({ $0 }) {
+        if core.closed.withLockedValue({ $0 }) {
             throw IggyError(.producerClosed)
         }
     }
@@ -146,12 +154,18 @@ protocol ProducerCoreBackend: Sendable {
 }
 
 /// The state both send modes share: readiness, retries, chunking, and the
-/// stream and topic bootstrap, as `ProducerCore` in the Rust SDK. Sends run
-/// outside the actor, so workers and direct callers do not queue on it; it
-/// holds only the sign-in gate and the linger clock.
+/// stream and topic bootstrap, as `ProducerCore` in the Rust SDK before its
+/// retries were removed. The partitioner, chunking, and writes run outside
+/// the actor, so workers and direct callers do not queue on it. They visit
+/// it only for the linger clock when a direct linger is set, and for the
+/// sign-in gate when retries are on.
 actor ProducerCore: ProducerCoreBackend {
     /// A request when chunking is disabled carries at most this many messages.
     static let maxBatchLength = 1_000_000
+
+    /// Set when the producer shuts down. A direct send checks it between
+    /// requests.
+    let closed = NIOLockedValueBox(false)
 
     private let client: IggyClient
     private let configuration: ProducerConfiguration
@@ -159,7 +173,6 @@ actor ProducerCore: ProducerCoreBackend {
     private let logger: Logger
 
     private var isInitialized = false
-    private var isShutDown = false
     /// Follows the client's events once initialized, and is read only while
     /// a retry budget exists.
     private(set) var canSend = true
@@ -225,7 +238,6 @@ actor ProducerCore: ProducerCoreBackend {
     }
 
     func shutdown() {
-        isShutDown = true
         eventsTask?.cancel()
         eventsTask = nil
     }
@@ -261,11 +273,17 @@ actor ProducerCore: ProducerCoreBackend {
         }
         // Clamped so a `UInt32` length cannot trap where `Int` is 32 bits.
         let chunkLength = directOptions.batchLength == 0 ? Self.maxBatchLength : min(Int(clamping: directOptions.batchLength), Self.maxBatchLength)
+        let requestBudget = Self.requestBudget(streamID: streamID, topicID: topicID)
         var confirmations: [SendConfirmation] = []
         confirmations.reserveCapacity((messages.count - 1) / chunkLength + 1)
         var index = 0
         while index < messages.count {
-            let end = index + min(chunkLength, messages.count - index)
+            if index > 0, closed.withLockedValue({ $0 }) {
+                throw Self.failure(
+                    IggyError(.producerClosed, context: "the producer shut down between requests"), failed: Array(messages[index...]),
+                    committed: confirmations, streamID: streamID, topicID: topicID)
+            }
+            let end = Self.chunkEnd(messages, from: index, length: chunkLength, budget: requestBudget)
             var chunk = Array(messages[index..<end])
             do {
                 let response = try await trySend(streamID: streamID, topicID: topicID, partitioning: resolved, messages: &chunk)
@@ -274,10 +292,37 @@ actor ProducerCore: ProducerCoreBackend {
                 messages.replaceSubrange(index..<end, with: chunk)
                 throw Self.failure(error, failed: Array(messages[index...]), committed: confirmations, streamID: streamID, topicID: topicID)
             }
-            await markSent()
+            if directOptions.lingerTime > .zero {
+                await markSent()
+            }
             index = end
         }
         return SendMessagesResponse(confirmations: confirmations)
+    }
+
+    /// The bytes of messages one send request to the stream and topic can
+    /// carry within ``VSRFrame/maxRequestSize``. The client sends every
+    /// partitioning as an explicit partition.
+    static func requestBudget(streamID: Identifier, topicID: Identifier) -> Int {
+        let metadata = 4 + streamID.encodedSize + topicID.encodedSize + Partitioning.partition(0).encodedSize + 4
+        return VSRFrame.maxRequestSize - VSRFrame.headerSize - metadata - Batch.headerSize
+    }
+
+    /// The end of the request that starts at `start`: at most `length`
+    /// messages within `budget` bytes, and at least one message, which the
+    /// client then refuses or sends on its own.
+    static func chunkEnd(_ messages: [IggyMessage], from start: Int, length: Int, budget: Int) -> Int {
+        var end = start
+        var bytes = 0
+        while end < messages.count, end - start < length {
+            let size = Batch.messageHeaderSize + messages[end].payload.count + (messages[end].rawUserHeaders?.count ?? 0)
+            if end > start, bytes + size > budget {
+                break
+            }
+            bytes += size
+            end += 1
+        }
+        return end
     }
 
     /// A partitioner wins over any partitioning; then the call's, the
@@ -346,9 +391,17 @@ actor ProducerCore: ProducerCoreBackend {
         var retries: UInt32 = 0
         var ticker = RetryTicker(interval: configuration.sendRetryInterval)
         while await !canSend {
-            if (try? await client.requireAuthenticated()) != nil {
+            try Task.checkCancellation()
+            do {
+                try await client.requireAuthenticated()
                 await openGate()
                 return
+            } catch let error as IggyError where error.code == .clientShutdown {
+                throw error
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                // Still signed out; the budget below decides how long to wait.
             }
             retries += 1
             if retries > maxRetries {
@@ -369,12 +422,12 @@ actor ProducerCore: ProducerCoreBackend {
 
     /// A retry is a new request identity, so only a refusal or a failure
     /// before anything was written allows one. An unknown outcome belongs to
-    /// the transport, which replays it under its own identity. The client
-    /// raises `disconnected` for a send only before writing it: a write it
-    /// lost becomes `transientNotCommitted`.
+    /// the transport, which replays it under its own identity. That includes
+    /// `disconnected`: a send refused before its write is replayed after the
+    /// reconnect, and a lost replay reaches the caller as `disconnected`.
     static func stopsSendRetries(_ error: IggyError) -> Bool {
         switch error.code {
-        case .transientNotAccepted, .notConnected, .cannotEstablishConnection, .disconnected:
+        case .transientNotAccepted, .notConnected, .cannotEstablishConnection:
             false
         default:
             true
@@ -387,7 +440,7 @@ actor ProducerCore: ProducerCoreBackend {
     /// and storing it, so concurrent calls leave one subscription.
     private func subscribeEvents() async {
         let events = await client.events
-        guard !isShutDown else {
+        guard !closed.withLockedValue({ $0 }) else {
             return
         }
         eventsTask?.cancel()

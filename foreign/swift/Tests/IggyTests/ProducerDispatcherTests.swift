@@ -31,20 +31,28 @@ private actor RecordingBackend: ProducerCoreBackend {
     }
 
     private(set) var writes: [Write] = []
+    private(set) var started = 0
     private(set) var mostInFlight = 0
     private var inFlight = 0
     private let delay: Duration
+    private let hold: AsyncSemaphore?
     private let failure: (@Sendable ([IggyMessage]) -> (any Error)?)?
 
-    init(delay: Duration = .zero, failure: (@Sendable ([IggyMessage]) -> (any Error)?)? = nil) {
+    /// Each write waits `delay`, and for a permit of `hold` when one is given.
+    init(delay: Duration = .zero, hold: AsyncSemaphore? = nil, failure: (@Sendable ([IggyMessage]) -> (any Error)?)? = nil) {
         self.delay = delay
+        self.hold = hold
         self.failure = failure
     }
 
     func sendInternal(streamID: Identifier, topicID: Identifier, messages: [IggyMessage], partitioning: Partitioning?) async throws -> SendMessagesResponse {
+        started += 1
         inFlight += 1
         mostInFlight = max(mostInFlight, inFlight)
         defer { inFlight -= 1 }
+        if let hold {
+            _ = try? await hold.acquire(1)
+        }
         if delay > .zero {
             try? await Task.sleep(for: delay)
         }
@@ -62,6 +70,12 @@ private func makeDispatcher(_ backend: RecordingBackend, _ options: BackgroundSe
 
 private func message(_ text: String) -> IggyMessage {
     IggyMessage(stringLiteral: text)
+}
+
+private func message(_ text: String, at microseconds: UInt64) -> IggyMessage {
+    var message = IggyMessage(stringLiteral: text)
+    message.originTimestamp = IggyTimestamp(microseconds: microseconds)
+    return message
 }
 
 /// A message whose batch to stream 1 and topic 2 is `bytes` long in the byte budget.
@@ -134,6 +148,66 @@ struct ProducerDispatcherTests {
         await dispatcher.shutdown()
         #expect(await backend.writes.map(\.payloads) == [["a", "b"], ["c"], ["d"], ["e"]])
         #expect(ShardWorker.merge([]).isEmpty)
+    }
+
+    /// A merged request stays within the server's frame limit and the
+    /// timestamp span the client accepts in one request.
+    @Test func aMergeStopsAtTheRequestLimits() throws {
+        let hour: UInt64 = 3_600_000_000
+        let spread = [message("a", at: hour), message("b", at: 2 * hour), message("c", at: 3 * hour)].map {
+            QueuedBatch(streamID: 1, topicID: 2, messages: [$0], partitioning: nil)
+        }
+        #expect(ShardWorker.merge(spread).map { $0.messages.map(\.payloadString) } == [["a", "b"], ["c"]])
+        #expect(ShardWorker.merge(spread).map(\.earliestTimestamp) == [hour, 3 * hour])
+
+        var half = QueuedBatch(streamID: 1, topicID: 2, messages: ["a"], partitioning: nil)
+        half.sizeBytes = QueuedBatch.maxRequestBytes / 2 + 1
+        #expect(ShardWorker.merge([half, half]).count == 2)
+        half.sizeBytes = QueuedBatch.maxRequestBytes / 2
+        #expect(ShardWorker.merge([half, half]).count == 1)
+    }
+
+    @Test func aBatchLargerThanARequestIsRefused() async throws {
+        let dispatcher = makeDispatcher(RecordingBackend(), BackgroundSendOptions(maxBufferSize: 0))
+        // Two messages, since one alone cannot carry this much payload.
+        let half = try IggyMessage(payload: [UInt8](repeating: 1, count: QueuedBatch.maxRequestBytes / 2))
+        await expectCode(.backgroundSendBufferOverflow) { try await dispatcher.dispatch([half, half], streamID: 1, topicID: 2, partitioning: nil) }
+        await dispatcher.shutdown()
+    }
+
+    /// A worker whose write is held does not pick up, so its queue fills
+    /// long before the byte budget; the backpressure mode decides then too.
+    @Test func aFullWorkerQueueFollowsTheBackpressureMode() async throws {
+        for (mode, code) in [
+            (BackpressureMode.failImmediately, IggyErrorCode.backgroundSendBufferOverflow), (.blockWithTimeout(.milliseconds(50)), .backgroundSendTimeout),
+        ] {
+            let hold = AsyncSemaphore(permits: 0)
+            let backend = RecordingBackend(hold: hold)
+            let dispatcher = makeDispatcher(backend, BackgroundSendOptions(batchLength: 1, lingerTime: .zero, backpressure: mode))
+            try await dispatcher.dispatch(["held"], streamID: 1, topicID: 2, partitioning: nil)
+            #expect(await eventually { await backend.started == 1 })
+            var queued = 0
+            var charged = QueuedBatch(streamID: 1, topicID: 2, messages: ["held"], partitioning: nil).sizeBytes
+            var refusal: IggyError?
+            while refusal == nil, queued <= ShardWorker.queueCapacity {
+                let text = message("\(queued)")
+                do {
+                    try await dispatcher.dispatch([text], streamID: 1, topicID: 2, partitioning: nil)
+                    queued += 1
+                    charged += QueuedBatch(streamID: 1, topicID: 2, messages: [text], partitioning: nil).sizeBytes
+                } catch let error as IggyError {
+                    refusal = error
+                }
+            }
+            #expect(queued == ShardWorker.queueCapacity)
+            #expect(refusal?.code == code)
+            // The refused send gave its bytes back.
+            #expect(dispatcher.byteBudget?.availablePermits == BackgroundSendOptions().maxBufferSize - charged)
+            hold.release(1000)
+            await dispatcher.shutdown()
+            // The final flush may merge what was still queued.
+            #expect(await backend.writes.flatMap(\.payloads).count == queued + 1)
+        }
     }
 
     @Test func aFlushMergesManySendsIntoOneRequestInOrder() async throws {

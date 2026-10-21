@@ -27,6 +27,9 @@ enum VSRFrame {
     /// Upper bound on a frame the client is willing to read; a corrupt size
     /// field must not turn into a multi-gigabyte allocation.
     static let maxFrameSize = 1 << 30
+    /// The largest request frame the server reads, its default
+    /// `max_message_size`; it drops the connection on a larger one.
+    static let maxRequestSize = 64 * 1024 * 1024
 
     /// Request header field offsets the client writes.
     enum RequestOffset {

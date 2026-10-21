@@ -149,11 +149,21 @@ struct ProducerTests {
         var configurations = invalid.map { ProducerConfiguration(mode: .background($0)) }
         configurations.append(ProducerConfiguration(mode: .direct(DirectSendOptions(lingerTime: .milliseconds(-1)))))
         configurations.append(ProducerConfiguration(sendRetryInterval: .milliseconds(-1)))
+        // Past what `IggyDuration` holds, where `Task.sleep` would trap.
+        let tooLong = ProducerConfiguration.maxDuration + .microseconds(1)
+        configurations.append(ProducerConfiguration(sendRetryInterval: tooLong))
+        configurations.append(ProducerConfiguration(mode: .direct(DirectSendOptions(lingerTime: tooLong))))
+        configurations.append(ProducerConfiguration(mode: .background(BackgroundSendOptions(lingerTime: tooLong))))
+        configurations.append(ProducerConfiguration(mode: .background(BackgroundSendOptions(backpressure: .blockWithTimeout(tooLong)))))
+        configurations.append(ProducerConfiguration(topicPartitionsCount: 0))
         for configuration in configurations {
             await expectCode(.invalidConfiguration) { _ = try client.producer(streamID: 1, topicID: 2, configuration: configuration) }
         }
         let unbounded = BackgroundSendOptions(batchSize: 0, batchLength: 0, lingerTime: .zero, maxBufferSize: 0, maxInFlight: 0)
         _ = try client.producer(streamID: 1, topicID: 2, configuration: ProducerConfiguration(mode: .background(unbounded)))
+        let longest = BackgroundSendOptions(lingerTime: ProducerConfiguration.maxDuration)
+        _ = try client.producer(streamID: 1, topicID: 2, configuration: ProducerConfiguration(mode: .background(longest)))
+        _ = try client.producer(streamID: 1, topicID: 2, configuration: ProducerConfiguration(createTopicIfNotExists: false, topicPartitionsCount: 0))
         await client.shutdown()
     }
 
@@ -249,6 +259,91 @@ struct ProducerTests {
         await client.shutdown()
     }
 
+    /// A send that found the connection closed before writing is replayed by
+    /// the client after the reconnect. When that replay is written and lost,
+    /// the client reports `disconnected`, and the producer must not send it
+    /// again: the server does not deduplicate a new request id.
+    @Test func aLostReplayIsNotSentAgain() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let routeReads = Locked(0)
+        let sendAttempts = Locked(0)
+        await server.respond { request in
+            switch request.code.flatMap(CommandCode.init(rawValue:)) {
+            case .getPartitionRoute:
+                let first = routeReads.withLock {
+                    $0 += 1; return $0 == 1
+                }
+                // The connection drops right after the route read, so the
+                // send finds it closed before writing anything.
+                return first
+                    ? .okThenClose(FakeVSRServer.partitionRouteBody(FakeVSRServer.routeContext))
+                    : FakeVSRServer.defaultReply(request, address: server.address)
+            case .sendMessages:
+                let first = sendAttempts.withLock {
+                    $0 += 1; return $0 == 1
+                }
+                return first ? .close : .ok([])
+            default:
+                return FakeVSRServer.defaultReply(request, address: server.address)
+            }
+        }
+        let client = try await signedInClient(server)
+        let configuration = ProducerConfiguration(partitioning: .partition(1), sendRetries: 3, sendRetryInterval: nil)
+        let producer = try client.producer(streamID: 1, topicID: 2, configuration: configuration)
+        do {
+            try await producer.send(["once"])
+            Issue.record("the send did not fail")
+        } catch let error as ProducerSendError {
+            #expect(error.cause.code == .disconnected)
+            #expect(error.failed.map(\.payloadString) == ["once"])
+        }
+        #expect(await sends(server).count == 1)
+        await client.shutdown()
+    }
+
+    /// A direct send in progress finishes the request it is writing when the
+    /// producer shuts down, and stops before the next one.
+    @Test func aShutdownStopsADirectSendBetweenRequests() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        await server.respond { request in
+            guard request.code == CommandCode.sendMessages.rawValue else { return FakeVSRServer.defaultReply(request, address: server.address) }
+            try? await Task.sleep(for: .milliseconds(200))
+            return .ok(FakeVSRServer.confirmationBody(partitionID: 1, baseOffset: 0))
+        }
+        let client = try await signedInClient(server)
+        let configuration = ProducerConfiguration(partitioning: .partition(1), mode: .direct(DirectSendOptions(batchLength: 1)))
+        let producer = try client.producer(streamID: 1, topicID: 2, configuration: configuration)
+        let send = Task { try await producer.send(texts(3)) }
+        #expect(await eventually { await sends(server).count == 1 })
+        await producer.shutdown()
+        do {
+            _ = try await send.value
+            Issue.record("the send did not fail")
+        } catch let error as ProducerSendError {
+            #expect(error.cause.code == .producerClosed)
+            #expect(error.committed.count == 1)
+            #expect(error.failed.map(\.payloadString) == ["message 1", "message 2"])
+        }
+        #expect(await sends(server).count == 1)
+        await client.shutdown()
+    }
+
+    /// A request carries at most `batchLength` messages and stays within the
+    /// server's frame limit; a message too large for one goes alone.
+    @Test func aDirectSendIsChunkedByLengthAndBytes() throws {
+        let messages = try (0..<5).map { _ in try IggyMessage(payload: [UInt8](repeating: 1, count: 10)) }
+        let size = Batch.messageHeaderSize + 10
+        #expect(ProducerCore.chunkEnd(messages, from: 0, length: 10, budget: 2 * size) == 2)
+        #expect(ProducerCore.chunkEnd(messages, from: 2, length: 10, budget: 2 * size) == 4)
+        #expect(ProducerCore.chunkEnd(messages, from: 4, length: 10, budget: 2 * size) == 5)
+        #expect(ProducerCore.chunkEnd(messages, from: 0, length: 3, budget: 100 * size) == 3)
+        #expect(ProducerCore.chunkEnd(messages, from: 0, length: 10, budget: size - 1) == 1)
+        let metadata = 4 + 6 + 6 + 6 + 4
+        #expect(ProducerCore.requestBudget(streamID: 1, topicID: 2) == 64 * 1024 * 1024 - VSRFrame.headerSize - metadata - Batch.headerSize)
+    }
+
     @Test func aSendCanTargetAnotherStreamAndTopic() async throws {
         let server = try await FakeVSRServer.started()
         defer { Task { await server.stop() } }
@@ -305,10 +400,10 @@ struct ProducerTests {
     }
 
     @Test func onlyRefusalsBeforeAnythingWasWrittenAreRetried() {
-        for code: IggyErrorCode in [.transientNotAccepted, .notConnected, .cannotEstablishConnection, .disconnected] {
+        for code: IggyErrorCode in [.transientNotAccepted, .notConnected, .cannotEstablishConnection] {
             #expect(!ProducerCore.stopsSendRetries(IggyError(code)))
         }
-        for code: IggyErrorCode in [.transientNotCommitted, .requestTooOld, .historyUnavailable, .invalidCommand] {
+        for code: IggyErrorCode in [.transientNotCommitted, .disconnected, .requestTooOld, .historyUnavailable, .invalidCommand] {
             #expect(ProducerCore.stopsSendRetries(IggyError(code)))
         }
     }
@@ -373,6 +468,39 @@ struct ProducerTests {
         #expect(await sends(server).count == 1)
         await producer.shutdown()
         await client.shutdown()
+    }
+
+    /// A shut-down client is not waited for: the send fails at once with
+    /// the shutdown instead of spending its retry budget.
+    @Test func theSignInWaitEndsAtAClientShutdown() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        await server.respond { request in
+            switch request.code.flatMap(CommandCode.init(rawValue:)) {
+            case .getStream: return .ok(GoldenFixture.shared.bytes("response.get_stream"))
+            case .getTopic: return .ok(GoldenFixture.shared.bytes("response.get_topic"))
+            default: return FakeVSRServer.defaultReply(request, address: server.address)
+            }
+        }
+        let client = try await signedInClient(server)
+        let configuration = ProducerConfiguration(partitioning: .partition(1), sendRetries: 3, sendRetryInterval: .seconds(5))
+        let producer = try client.producer(streamID: 1, topicID: 2, configuration: configuration)
+        try await producer.initialize()
+        await client.shutdown()
+        #expect(await eventually { await !producer.core.canSend })
+        let clock = ContinuousClock()
+        let elapsed = await clock.measure {
+            do {
+                try await producer.send(["late"])
+                Issue.record("the send did not fail")
+            } catch let error as ProducerSendError {
+                #expect(error.cause.code == .clientShutdown)
+            } catch {
+                Issue.record("unexpected \(error)")
+            }
+        }
+        #expect(elapsed < .seconds(2))
+        await producer.shutdown()
     }
 
     @Test func aPartitionerWinsOverAnyPartitioning() async throws {
