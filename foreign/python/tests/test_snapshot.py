@@ -62,5 +62,5 @@ class TestSnapshot:
         self, iggy_client: IggyClient
     ):
         """Combining 'all' with another snapshot type is rejected."""
-        with pytest.raises(RuntimeError):
+        with pytest.raises(RuntimeError, match="(?i)invalid command"):
             await iggy_client.snapshot("deflated", ["all", "test"])
