@@ -73,8 +73,13 @@ struct SessionE2ETests {
             await #expect(throws: IggyError.self) {
                 try await client.login(username: "nobody", password: "wrong-password")
             }
+            #expect(await client.state == .disconnected)
+            try await client.connect()
             #expect(await client.state == .connected)
             try await client.ping()
+            await #expect(throws: IggyError(.unauthenticated)) {
+                try await client.getStreams()
+            }
         }
     }
 

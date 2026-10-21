@@ -33,6 +33,27 @@ namespace Apache.Iggy.Tests.VsrTests;
 public sealed partial class NativeRecoveryTests
 {
     [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task given_replica_links_when_the_caller_changes_sessions_should_keep_the_logout_transport(bool logout)
+    {
+        const int sessionChanges = 64;
+        using var cluster = new RecoveryCluster();
+        using var client = await cluster.ConnectAsync();
+        for (var change = 0; change < sessionChanges; change++)
+        {
+            if (logout)
+            {
+                await client.LogoutUserAsync(cluster.Token);
+                await client.ConnectAsync(cluster.Token);
+            }
+            await client.LoginUserAsync("caller", "own-secret", cluster.Token);
+        }
+        await StoreAsync(client, cluster.Token);
+        Assert.Single(cluster.Writes);
+    }
+
+    [Theory]
     [InlineData(40)]
     [InlineData(42)]
     [InlineData(43)]

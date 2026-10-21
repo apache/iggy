@@ -65,7 +65,7 @@ public sealed partial class TcpMessageStream
             foreach (var slot in _replicaLinks.Values.ToArray())
             {
                 if (!endpoints.TryGetValue(slot.ReplicaId, out var endpoint) || endpoint != slot.Endpoint
-                    || generation != slot.Generation)
+                    || _consensusSession.LinkGeneration(slot.Generation) is null)
                 {
                     _replicaLinks.Remove(slot.ReplicaId);
                     slot.Lifetime.Cancel();
@@ -105,7 +105,7 @@ public sealed partial class TcpMessageStream
         var exhausted = false;
         try
         {
-            while (!token.IsCancellationRequested && !_disposed && slot.Generation == _consensusSession.Generation)
+            while (!token.IsCancellationRequested && !_disposed && _consensusSession.LinkGeneration(slot.Generation) is not null)
             {
                 if (slot.Connection is { } existing)
                 {
@@ -163,7 +163,7 @@ public sealed partial class TcpMessageStream
                     }
                     lock (_pollRoutingGate)
                     {
-                        if (slot.Generation != _consensusSession.Generation || token.IsCancellationRequested || _disposed)
+                        if (_consensusSession.LinkGeneration(slot.Generation) is null || token.IsCancellationRequested || _disposed)
                         {
                             connection.Dispose();
                             return;
@@ -368,7 +368,7 @@ public sealed partial class TcpMessageStream
                 return;
             }
             foreach (var slot in _replicaLinks.Values.Where(slot => slot.RetriesExhausted
-                && slot.Generation == _consensusSession.Generation))
+                && _consensusSession.LinkGeneration(slot.Generation) is not null))
             {
                 slot.RetriesExhausted = false;
                 slot.Failure = null;

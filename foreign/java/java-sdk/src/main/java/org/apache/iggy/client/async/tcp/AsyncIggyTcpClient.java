@@ -66,7 +66,6 @@ import java.util.concurrent.CompletionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 import java.util.function.Function;
@@ -153,7 +152,7 @@ public class AsyncIggyTcpClient {
             IggyErrorCode.PERSONAL_ACCESS_TOKEN_EXPIRED.getCode());
 
     private final ConnectionInfo seedConnectionInfo;
-    private final AtomicBoolean reconnecting = new AtomicBoolean();
+    private final AtomicReference<Object> reconnecting = new AtomicReference<>();
     private volatile Optional<String> username;
     private volatile Optional<String> password;
     private final Optional<Duration> connectionTimeout;
@@ -749,7 +748,7 @@ public class AsyncIggyTcpClient {
      * new channel only when the next request needs one, and the client redials only when the requests or the heartbeat
      * of the connection it uses find the node dead.
      */
-    private void onLinkFailure(AsyncTcpConnection source, Throwable cause) {
+    private synchronized void onLinkFailure(AsyncTcpConnection source, Throwable cause) {
         if (connection.get() == source) {
             onConnectionFailure(cause);
         }
@@ -834,6 +833,10 @@ public class AsyncIggyTcpClient {
         CompletableFuture<Void> failover = new CompletableFuture<>();
         CompletableFuture<Void> previous;
         synchronized (this) {
+            if (failoverState.signedOut()) {
+                return CompletableFuture.failedFuture(
+                        new IggyNotConnectedException(AsyncTcpConnection.SIGN_IN_REPLACED));
+            }
             previous = loginChain.getAndSet(gate);
             pendingFailovers.add(failover);
         }
@@ -976,8 +979,8 @@ public class AsyncIggyTcpClient {
      * expired reply. Requests that were in flight stay failed (their outcome
      * is unknown); the redial only restores the client for subsequent calls.
      * Each rotation sweeps every endpoint the client knows -- where it was,
-     * the configured seed, then the roster it learned -- and only a rotation
-     * that reaches none of them waits out the retry policy's delay. The
+     * the metadata primary, the configured seed, then the roster it learned.
+     * Only a rotation that reaches none of them waits out the retry policy's delay. The
      * sign-in that last succeeded is replayed on whichever endpoint answers,
      * personal access tokens included.
      */
@@ -985,12 +988,13 @@ public class AsyncIggyTcpClient {
         if (closed || !isConnectionLoss(cause)) {
             return;
         }
-        if (!reconnecting.compareAndSet(false, true)) {
+        Object recovery = new Object();
+        if (!reconnecting.compareAndSet(null, recovery)) {
             return;
         }
         log.warn("Connection to {} lost ({}), starting redial", connectionInfo.serverAddress(), cause.getMessage());
         RetryPolicy policy = retryPolicy.orElse(DEFAULT_RECONNECT_POLICY);
-        redialAttempt(1, policy).whenComplete((ignored, error) -> reconnecting.set(false));
+        redialAttempt(1, policy).whenComplete((ignored, error) -> reconnecting.compareAndSet(recovery, null));
     }
 
     /**
@@ -1004,7 +1008,7 @@ public class AsyncIggyTcpClient {
      * with a fresh budget, so a budget bounds one burst, not the session. A
      * policy without retries restarts nothing.
      */
-    private void signInIfOwed(AsyncTcpConnection source) {
+    private synchronized void signInIfOwed(AsyncTcpConnection source) {
         RetryPolicy policy = retryPolicy.orElse(DEFAULT_RECONNECT_POLICY);
         if (closed
                 || policy.getMaxRetries() == 0
@@ -1013,12 +1017,13 @@ public class AsyncIggyTcpClient {
                 || rememberedLogin == null) {
             return;
         }
-        if (!reconnecting.compareAndSet(false, true)) {
+        Object recovery = new Object();
+        if (!reconnecting.compareAndSet(null, recovery)) {
             return;
         }
         log.warn("The session on {} was lost, signing in again", connectionInfo.serverAddress());
         replaySignInOn(connectionInfo, redialCandidates(), 0, 1, policy)
-                .whenComplete((ignored, error) -> reconnecting.set(false));
+                .whenComplete((ignored, error) -> reconnecting.compareAndSet(recovery, null));
     }
 
     private static boolean isConnectionLoss(Throwable cause) {
@@ -1114,6 +1119,7 @@ public class AsyncIggyTcpClient {
      */
     private CompletableFuture<Void> replaySignInOn(
             ConnectionInfo target, List<ConnectionInfo> candidates, int index, int attempt, RetryPolicy policy) {
+        Object recovery = reconnecting.get();
         long generation = session.generation();
         RememberedLogin replay = rememberedLogin;
         LongFunction<CompletableFuture<IdentityInfo>> credentials = replay == null ? null : replay.login;
@@ -1121,6 +1127,14 @@ public class AsyncIggyTcpClient {
                 connection.get().isAuthenticated() ? CompletableFuture.completedFuture(null) : replayLogin(replay);
         return restored.handle((ok, loginError) -> {
                     if (loginError == null) {
+                        synchronized (this) {
+                            // Roster lookup tolerates a lost link. Retire this burst under the failure listener's
+                            // lock, so a later loss starts a new burst that this one's completion cannot clear.
+                            if (rememberedLogin == replay && !connection.get().hasOpenChannel()) {
+                                return sweepCandidates(candidates, index + 1, attempt, policy);
+                            }
+                            reconnecting.compareAndSet(recovery, null);
+                        }
                         log.info("Reconnected to {}", target.serverAddress());
                         return CompletableFuture.<Void>completedFuture(null);
                     }
@@ -1545,8 +1559,9 @@ public class AsyncIggyTcpClient {
 
     /**
      * Endpoints a redial rotates through, likeliest first: where the client
-     * currently is, the address it was configured with, then the roster it
-     * learned while connected. Duplicates are dropped by spelling, so an
+     * currently is, the last known metadata primary, the address it was
+     * configured with, then the roster it learned while connected. Duplicates
+     * are dropped by spelling, so an
      * endpoint the roster merely writes differently does not earn a second
      * attempt. Spelling only: this runs on the Netty event loop, where a
      * resolver lookup per candidate pair would block it.
@@ -1554,7 +1569,8 @@ public class AsyncIggyTcpClient {
     private List<ConnectionInfo> redialCandidates() {
         List<ConnectionInfo> candidates = new ArrayList<>();
         candidates.add(connectionInfo);
-        Stream.concat(Stream.of(seedConnectionInfo), rosterTargets.stream())
+        Stream.concat(Stream.of(pollRouter.metadataPrimary(), seedConnectionInfo), rosterTargets.stream())
+                .filter(Objects::nonNull)
                 .filter(endpoint ->
                         candidates.stream().noneMatch(candidate -> LeaderAwareness.isSameSpelling(candidate, endpoint)))
                 .forEach(candidates::add);
