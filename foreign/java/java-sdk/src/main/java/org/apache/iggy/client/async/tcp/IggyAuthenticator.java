@@ -22,11 +22,13 @@ package org.apache.iggy.client.async.tcp;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.Channel;
 import io.netty.util.AttributeKey;
+import org.apache.iggy.exception.IggyNotConnectedException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BooleanSupplier;
 import java.util.function.Function;
 
 final class IggyAuthenticator {
@@ -75,6 +77,66 @@ final class IggyAuthenticator {
                 result.release();
             }
         });
+    }
+
+    static void attempt(
+            AsyncTcpConnection connection,
+            AsyncTcpConnection.Call call,
+            ByteBuf payload,
+            long requiredSessionGeneration) {
+        var state = call.state();
+        if (state.signedOut()) {
+            payload.release();
+            call.fail(state.lineageEnded(null));
+        } else if (connection.isAuthenticated()
+                || AsyncTcpConnection.isLoginCode(call.commandCode())
+                || connection.isAllowedBeforeAuthentication(call.commandCode())) {
+            connection.acquireForCall(call, payload, requiredSessionGeneration);
+        } else {
+            connection.awaitAuthentication(call.deadline(), state).whenComplete((ignored, error) -> {
+                if (error != null || call.over()) {
+                    payload.release();
+                    call.fail(error != null ? error : AsyncTcpConnection.notAccepted());
+                } else {
+                    attempt(connection, call, payload, requiredSessionGeneration);
+                }
+            });
+        }
+    }
+
+    static CompletableFuture<Void> awaitAuthentication(
+            AsyncTcpConnection connection,
+            long deadline,
+            AsyncTcpConnection.TransientFailoverState state,
+            BooleanSupplier signInOwed) {
+        if (connection.isAuthenticated()) {
+            return CompletableFuture.completedFuture(null);
+        }
+        if (!signInOwed.getAsBoolean()) {
+            return CompletableFuture.failedFuture(new IggyNotConnectedException(AsyncTcpConnection.NOT_AUTHENTICATED));
+        }
+        // Register binds the session before publishing the connection's authentication state.
+        return connection
+                .sessionOwner()
+                .awaitSession(state.lineage(), deadline, connection.eventLoop())
+                .thenRunAsync(() -> {}, connection.eventLoop());
+    }
+
+    static CompletableFuture<Void> authenticate(
+            AsyncTcpConnection connection,
+            Channel channel,
+            long deadline,
+            AsyncTcpConnection.TransientFailoverState state) {
+        var authentication = connection.authenticationSnapshot();
+        if (authentication.isEmpty()) {
+            return CompletableFuture.failedFuture(new IggyNotConnectedException(AsyncTcpConnection.NOT_AUTHENTICATED));
+        }
+        var snapshot = authentication.get();
+        return ensureAuthenticated(
+                channel,
+                snapshot.payload(),
+                connection.authenticationGeneration(),
+                ignored -> connection.sendAuthenticationFrame(channel, snapshot, deadline, state));
     }
 
     static void setAuthGeneration(Channel channel, long generation) {

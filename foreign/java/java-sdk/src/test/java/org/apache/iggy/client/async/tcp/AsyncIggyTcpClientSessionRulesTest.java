@@ -27,6 +27,7 @@ import org.apache.iggy.client.ConnectionInfo;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClientEndpointFailoverTest.MockNode;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.Request;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.Response;
+import org.apache.iggy.client.async.tcp.vsr.ConsensusSession;
 import org.apache.iggy.client.async.tcp.vsr.VsrFrameDecoder;
 import org.apache.iggy.client.async.tcp.vsr.VsrOperation;
 import org.apache.iggy.client.async.tcp.vsr.VsrResponseHandler;
@@ -573,6 +574,113 @@ class AsyncIggyTcpClientSessionRulesTest {
             client.close().get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
             node.close();
         }
+    }
+
+    enum RedialSignInEnd {
+        RESUME,
+        DEADLINE,
+        CLOSE
+    }
+
+    @ParameterizedTest
+    @EnumSource(RedialSignInEnd.class)
+    void shouldWaitForTheAutomaticSignInOnAPublishedRedial(RedialSignInEnd ending) throws Exception {
+        try (ServerSocket sourceSocket = new ServerSocket(0, 2, InetAddress.getLoopbackAddress());
+                ServerSocket targetSocket = new ServerSocket(0, 2, InetAddress.getLoopbackAddress())) {
+            var registering = new CompletableFuture<Void>();
+            var releaseRegister = new CompletableFuture<Void>();
+            MockNode source = MockNode.serve(
+                    sourceSocket,
+                    request -> request.operation() == VsrOperation.REGISTER
+                            ? Response.success(VsrOperation.REGISTER, registerBody(FIRST_SESSION))
+                            : request.commandCode() == CommandCode.System.PING.getValue()
+                                    ? Response.success(VsrOperation.NON_REPLICATED, Unpooled.EMPTY_BUFFER)
+                                    : metadata(sourceSocket, request));
+            MockNode target = MockNode.serve(
+                    targetSocket, request -> redialReply(targetSocket, request, registering, releaseRegister));
+            try {
+                AsyncIggyTcpClient client = AsyncIggyTcpClient.builder()
+                        .host(sourceSocket.getInetAddress().getHostAddress())
+                        .port(sourceSocket.getLocalPort())
+                        .requestTimeout(REQUEST_TIMEOUT)
+                        .heartbeatInterval(Duration.ofMillis(50))
+                        .build();
+                try {
+                    client.connect().get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                    client.users().login("alice", "alice-password").get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                    ((ConsensusSession) field(client, "session")).reset();
+                    client.retarget(new ConnectionInfo(
+                                    targetSocket.getInetAddress().getHostAddress(), targetSocket.getLocalPort()))
+                            .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                    registering.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                    var read = client.sendBinaryRequest(GET_STATS_CODE, new byte[0]);
+                    var poll = client.messages()
+                            .pollMessages(
+                                    StreamId.of(1L),
+                                    TopicId.of(1L),
+                                    Optional.of(0L),
+                                    Consumer.of(ConsumerId.of(1L)),
+                                    PollingStrategy.offset(BigInteger.ZERO),
+                                    1L,
+                                    false);
+                    Thread.sleep(QUEUE_TIME.toMillis());
+                    assertThat(read).isNotDone();
+                    assertThat(poll).isNotDone();
+                    if (ending == RedialSignInEnd.RESUME) {
+                        releaseRegister.complete(null);
+                        read.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                        poll.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                    } else {
+                        if (ending == RedialSignInEnd.CLOSE) {
+                            client.close().get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                        }
+                        int code = ending == RedialSignInEnd.CLOSE
+                                ? IggyErrorCode.UNAUTHENTICATED.getCode()
+                                : IggyErrorCode.TRANSIENT_NOT_ACCEPTED.getCode();
+                        for (var waiting : List.of(read, poll)) {
+                            assertThatThrownBy(() -> waiting.get(TIMEOUT_SECONDS, TimeUnit.SECONDS))
+                                    .cause()
+                                    .isInstanceOfSatisfying(
+                                            IggyServerException.class,
+                                            error -> assertThat(error.getRawErrorCode())
+                                                    .as(waiting == read ? "read" : "poll")
+                                                    .isEqualTo(code));
+                        }
+                    }
+                } finally {
+                    releaseRegister.complete(null);
+                    client.close().get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                }
+            } finally {
+                source.close();
+                target.close();
+            }
+        }
+    }
+
+    private static Response redialReply(
+            ServerSocket targetSocket,
+            Request request,
+            CompletableFuture<Void> registering,
+            CompletableFuture<Void> releaseRegister) {
+
+        if (request.operation() == VsrOperation.REGISTER) {
+            registering.complete(null);
+            releaseRegister.join();
+            return Response.success(VsrOperation.REGISTER, registerBody(FIRST_SESSION + 1));
+        }
+        if (request.commandCode() == CommandCode.System.PING.getValue() || request.commandCode() == GET_STATS_CODE) {
+            return Response.success(VsrOperation.NON_REPLICATED, Unpooled.EMPTY_BUFFER);
+        }
+        if (request.commandCode() == CommandCode.Messages.GET_PARTITION_ROUTE.getValue()) {
+            return Response.success(
+                    VsrOperation.NON_REPLICATED,
+                    AsyncIggyTcpClientTransientFailoverTest.pollRoute(request, 1, 1, targetSocket.getLocalPort()));
+        }
+        if (request.commandCode() == CommandCode.Messages.POLL.getValue()) {
+            return Response.success(VsrOperation.NON_REPLICATED, emptyPoll(0));
+        }
+        return metadata(targetSocket, request);
     }
 
     /** A call whose automatic sign-in gets no reply sent nothing, so it ends with 58 at its deadline. */

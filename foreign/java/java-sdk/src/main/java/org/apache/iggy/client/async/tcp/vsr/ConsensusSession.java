@@ -604,6 +604,55 @@ public final class ConsensusSession {
         }
     }
 
+    /** Waits for an owed automatic sign-in without reserving a mutation lane. */
+    public CompletableFuture<Void> awaitSession(long lineage, long deadline, EventExecutor executor) {
+        return owner().awaitSession(lineage, deadline, executor, null);
+    }
+
+    private CompletableFuture<Void> awaitSession(long lineage, long deadline, EventExecutor executor, Ticket ticket) {
+        CompletableFuture<Void> result = new CompletableFuture<>();
+        awaitSession(lineage, result, ticket);
+        if (result.isDone()) {
+            return result;
+        }
+        try {
+            var timer = executor.schedule(
+                    () -> result.completeExceptionally(
+                            new IggyServerException(IggyErrorCode.TRANSIENT_NOT_ACCEPTED.getCode())),
+                    Math.max(0, deadline - System.nanoTime()),
+                    TimeUnit.NANOSECONDS);
+            result.whenComplete((ignored, error) -> timer.cancel(false));
+        } catch (RejectedExecutionException stopped) {
+            result.completeExceptionally(stopped);
+        }
+        return result;
+    }
+
+    private void awaitSession(long lineage, CompletableFuture<Void> result, Ticket ticket) {
+        CompletableFuture<Void> changed = null;
+        boolean signedOut;
+        boolean ended;
+        synchronized (this) {
+            if (result.isDone()) {
+                return;
+            }
+            signedOut = this.lineage != lineage;
+            ended = ticket != null && ticket.completed;
+            if (!signedOut && !ended && session == null) {
+                changed = admissionChanged;
+            }
+        }
+        if (signedOut) {
+            result.completeExceptionally(this.lineageEnded(lineage, null));
+        } else if (ended) {
+            result.completeExceptionally(ticket.closedWaitError());
+        } else if (changed != null) {
+            changed.thenRun(() -> awaitSession(lineage, result, ticket));
+        } else {
+            result.complete(null);
+        }
+    }
+
     void changed() {
         CompletableFuture<Void> signal;
         synchronized (this) {
@@ -790,52 +839,13 @@ public final class ConsensusSession {
          * {@code TRANSIENT_NOT_ACCEPTED}, like a lane wait. A ticket that a close ended fails the wait at once.
          */
         public CompletableFuture<Void> awaitSession(long lineage, long deadline, EventExecutor executor) {
-            CompletableFuture<Void> result = new CompletableFuture<>();
-            awaitSession(lineage, result);
-            if (result.isDone()) {
-                return result;
-            }
-            try {
-                var timer = executor.schedule(
-                        () -> result.completeExceptionally(
-                                new IggyServerException(IggyErrorCode.TRANSIENT_NOT_ACCEPTED.getCode())),
-                        Math.max(0, deadline - System.nanoTime()),
-                        TimeUnit.NANOSECONDS);
-                result.whenComplete((ignored, error) -> timer.cancel(false));
-            } catch (RejectedExecutionException stopped) {
-                result.completeExceptionally(stopped);
-            }
-            return result;
+            return owner.awaitSession(lineage, deadline, executor, this);
         }
 
-        private void awaitSession(long lineage, CompletableFuture<Void> result) {
-            CompletableFuture<Void> changed = null;
-            boolean signedOut;
-            boolean ended;
-            boolean written;
-            synchronized (owner) {
-                if (result.isDone()) {
-                    return;
-                }
-                signedOut = owner.lineage != lineage;
-                ended = completed;
-                written = sent;
-                if (!signedOut && !ended && owner.session == null) {
-                    changed = owner.admissionChanged;
-                }
-            }
-            if (signedOut) {
-                result.completeExceptionally(owner.lineageEnded(lineage, null));
-            } else if (ended) {
-                result.completeExceptionally(
-                        written
-                                ? new IggyOperationException(IggyErrorCode.OPERATION_NOT_RETAINED, operationId)
-                                : new IggyNotConnectedException("The connection closed before the request was sent"));
-            } else if (changed != null) {
-                changed.thenRun(() -> awaitSession(lineage, result));
-            } else {
-                result.complete(null);
-            }
+        private RuntimeException closedWaitError() {
+            return sent
+                    ? new IggyOperationException(IggyErrorCode.OPERATION_NOT_RETAINED, operationId)
+                    : new IggyNotConnectedException("The connection closed before the request was sent");
         }
 
         public void startWrite() {

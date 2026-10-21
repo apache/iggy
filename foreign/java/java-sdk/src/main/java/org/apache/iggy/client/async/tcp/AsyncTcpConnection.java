@@ -82,6 +82,7 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiConsumer;
+import java.util.function.BooleanSupplier;
 import java.util.function.Function;
 import java.util.function.IntConsumer;
 import java.util.function.LongConsumer;
@@ -108,6 +109,7 @@ public class AsyncTcpConnection {
     static final long LIFECYCLE_RETRY_MAX_INTERVAL_MS = 1000;
     // The pool holds one channel, and one channel lives on one loop.
     static final int DEFAULT_IO_THREADS = 1;
+    static final String NOT_AUTHENTICATED = "Not authenticated, call login first";
 
     private static final int STALE_CLIENT = 30;
     private static final int UNAUTHENTICATED = 40;
@@ -127,7 +129,6 @@ public class AsyncTcpConnection {
     private static final Duration RETRY_BACKOFF_BASE = Duration.ofMillis(50);
     private static final Duration RETRY_BACKOFF_MAX = Duration.ofSeconds(1);
     private static final String EVENT_LOOP_THREAD_PREFIX = "iggy-tcp-io";
-    private static final String NOT_AUTHENTICATED = "Not authenticated, call login first";
 
     private final IoEventLoopGroup eventLoopGroup;
     private final boolean ownsEventLoopGroup;
@@ -150,6 +151,7 @@ public class AsyncTcpConnection {
     private ScheduledFuture<?> heartbeatTask;
     private boolean heartbeatRunning;
     private volatile Runnable heartbeatListener = () -> {};
+    private BooleanSupplier signInOwed = () -> false;
     private volatile CredentialsListener credentialsListener = (source, previousUsername, username, password) -> {};
     private volatile LongConsumer signInRefusedListener = lineage -> {};
 
@@ -335,8 +337,9 @@ public class AsyncTcpConnection {
     }
 
     /** Runs after each heartbeat that the server answered. */
-    void onHeartbeat(Runnable listener) {
+    void onHeartbeat(Runnable listener, BooleanSupplier owed) {
         heartbeatListener = listener;
+        signInOwed = owed;
     }
 
     /**
@@ -596,15 +599,12 @@ public class AsyncTcpConnection {
         return callerFuture;
     }
 
-    /** Retries share the caller future and payload, and run as an event-loop task instead of nesting. */
-    @SuppressWarnings("checkstyle:CyclomaticComplexity")
     private void attempt(Call call, ByteBuf payload, long requiredSessionGeneration) {
+        IggyAuthenticator.attempt(this, call, payload, requiredSessionGeneration);
+    }
+
+    void acquireForCall(Call call, ByteBuf payload, long requiredSessionGeneration) {
         TransientFailoverState failoverState = call.state();
-        if (failoverState.signedOut()) {
-            payload.release();
-            call.fail(failoverState.lineageEnded(null));
-            return;
-        }
         failoverState.linkFailed = false;
         failoverState.detachedSession = false;
         var acquiring = channelPool.acquire();
@@ -685,7 +685,9 @@ public class AsyncTcpConnection {
                 call.state(),
                 response,
                 error));
-        authenticationStep(channel, commandCode, call.deadline(), call.state())
+        (isLoginCommand || isAllowedBeforeAuthentication(commandCode)
+                        ? CompletableFuture.<Void>completedFuture(null)
+                        : IggyAuthenticator.authenticate(this, channel, call.deadline(), call.state()))
                 .whenComplete((ignored, authError) -> completeAuthenticationStep(
                         channel,
                         call,
@@ -696,21 +698,12 @@ public class AsyncTcpConnection {
                         authError));
     }
 
-    private CompletableFuture<Void> authenticationStep(
-            Channel channel, int commandCode, long requestDeadlineNanos, TransientFailoverState state) {
-        if (isLoginCode(commandCode) || !requiresAuthentication(commandCode)) {
-            return CompletableFuture.completedFuture(null);
-        }
-        Optional<AuthenticationSnapshot> authentication = authenticationSnapshot();
-        if (authentication.isEmpty()) {
-            return CompletableFuture.failedFuture(new IggyNotConnectedException(NOT_AUTHENTICATED));
-        }
-        AuthenticationSnapshot snapshot = authentication.get();
-        return IggyAuthenticator.ensureAuthenticated(
-                channel,
-                snapshot.payload(),
-                authGeneration,
-                ignored -> sendAuthenticationFrame(channel, snapshot, requestDeadlineNanos, state));
+    AtomicLong authenticationGeneration() {
+        return authGeneration;
+    }
+
+    CompletableFuture<Void> awaitAuthentication(long deadline, TransientFailoverState state) {
+        return IggyAuthenticator.awaitAuthentication(this, deadline, state, signInOwed);
     }
 
     private void completeAuthenticationStep(
@@ -872,7 +865,7 @@ public class AsyncTcpConnection {
         return error instanceof CompletionException && error.getCause() != null ? error.getCause() : error;
     }
 
-    private static IggyServerException notAccepted() {
+    static IggyServerException notAccepted() {
         return IggyServerException.fromTcpResponse(TRANSIENT_NOT_ACCEPTED, new byte[0]);
     }
 
@@ -976,7 +969,7 @@ public class AsyncTcpConnection {
         }
     }
 
-    private CompletableFuture<ByteBuf> sendAuthenticationFrame(
+    CompletableFuture<ByteBuf> sendAuthenticationFrame(
             Channel channel,
             AuthenticationSnapshot authentication,
             long requestDeadlineNanos,
@@ -1113,7 +1106,7 @@ public class AsyncTcpConnection {
                 .thenCompose(ignored -> send(commandCode, payload, deadline));
     }
 
-    private static boolean isLoginCode(int commandCode) {
+    static boolean isLoginCode(int commandCode) {
         return commandCode == CommandCode.User.LOGIN.getValue()
                 || commandCode == CommandCode.PersonalAccessToken.LOGIN.getValue();
     }
@@ -1139,16 +1132,7 @@ public class AsyncTcpConnection {
         return isLoginCode(commandCode) || commandCode == CommandCode.User.LOGOUT.getValue();
     }
 
-    /**
-     * BindSession authenticates with the parent's proof. Primary polls and offset
-     * writes use that binding, so none of them sends a password login on auxiliary
-     * channels.
-     */
-    private boolean requiresAuthentication(int commandCode) {
-        return !isAllowedBeforeAuthentication(commandCode);
-    }
-
-    private boolean isAllowedBeforeAuthentication(int commandCode) {
+    boolean isAllowedBeforeAuthentication(int commandCode) {
         return commandCode == CommandCode.System.PING.getValue()
                 || (sharedSession
                         && (commandCode == CommandCode.System.BIND_SESSION.getValue()
@@ -1750,7 +1734,7 @@ public class AsyncTcpConnection {
     record AuthenticationSnapshot(int commandCode, ByteBuf payload, long version) {}
 
     /** One call across its attempts, which all send its failover payload again and complete its caller future. */
-    private record Call(
+    record Call(
             int commandCode,
             ByteBuf failoverPayload,
             long deadline,
@@ -1837,6 +1821,10 @@ public class AsyncTcpConnection {
 
         TransientFailoverState(PartitionContext context) {
             this.context = context;
+        }
+
+        long lineage() {
+            return lineage;
         }
 
         /** Starts the call in the current lineage of {@code session}, unless an earlier attempt started it. */

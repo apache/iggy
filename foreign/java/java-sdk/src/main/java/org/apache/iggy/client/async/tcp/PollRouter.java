@@ -723,7 +723,8 @@ final class PollRouter {
     private CompletableFuture<Route> route(Poll poll) {
         AsyncTcpConnection parent = coordinator.get();
         if (!parent.isAuthenticated()) {
-            return CompletableFuture.failedFuture(new IggyNotConnectedException("Not authenticated, call login first"));
+            return parent.awaitAuthentication(poll.deadline, poll.state)
+                    .thenComposeAsync(ignored -> route(poll), parent.eventLoop());
         }
         Route cached;
         synchronized (this) {

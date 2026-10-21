@@ -328,6 +328,7 @@ public class AsyncIggyTcpClient {
      */
     public CompletableFuture<Void> connect() {
         closed = false;
+        session.endLineage();
         session.reset();
         pollRouter.clearSession();
         ConnectionInfo target = connectionInfo;
@@ -649,6 +650,7 @@ public class AsyncIggyTcpClient {
             rememberedLogin = null;
         }
         AsyncTcpConnection currentConnection = connection.get();
+        session.endLineage();
         CompletableFuture<Void> dataClosed = pollRouter.clearSession();
         session.reset();
         CompletableFuture<Void> linksClosed =
@@ -711,7 +713,12 @@ public class AsyncIggyTcpClient {
                 this::onSessionReset,
                 this::onLinkFailure);
         opened.followSession(session);
-        opened.onHeartbeat(() -> signInIfOwed(opened));
+        opened.onHeartbeat(
+                () -> signInIfOwed(opened),
+                () -> !closed
+                        && rememberedLogin != null
+                        && (reconnecting.get() != null
+                                || retryPolicy.orElse(DEFAULT_RECONNECT_POLICY).getMaxRetries() != 0));
         opened.onCredentialsRefreshed(this::refreshLogin);
         opened.onSignInRefused(this::forgetRefusedLogin);
         return opened;
