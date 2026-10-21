@@ -24,7 +24,7 @@ use kafka_protocol::error::ResponseError;
 use kafka_protocol::messages::{
     DescribeAclsRequest, SaslAuthenticateRequest, SaslHandshakeRequest,
 };
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedMutexGuard, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::auth::AuthenticatedPrincipal;
@@ -43,9 +43,9 @@ use crate::protocol::bounds_guard::{
 use crate::protocol::handlers::api_versions::Advertisement;
 use crate::protocol::handlers::init_producer_id::ProducerIdAllocator;
 use crate::protocol::handlers::{
-    alter_configs, api_versions, create_topics, decode_guarded, delete_topics, describe_cluster,
-    describe_configs, describe_groups, dispatch, fetch, find_coordinator, heartbeat,
-    incremental_alter_configs, init_producer_id, join_group, leave_group, list_groups,
+    alter_configs, api_versions, create_partitions, create_topics, decode_guarded, delete_topics,
+    describe_cluster, describe_configs, describe_groups, dispatch, fetch, find_coordinator,
+    heartbeat, incremental_alter_configs, init_producer_id, join_group, leave_group, list_groups,
     list_offsets, metadata, offset_commit, offset_fetch, produce, respond_or_close, sync_group,
 };
 use crate::protocol::probe_board::ProbeBoard;
@@ -75,6 +75,7 @@ pub const API_KEY_DESCRIBE_ACLS: i16 = 29;
 pub const API_KEY_DESCRIBE_CONFIGS: i16 = 32;
 pub const API_KEY_ALTER_CONFIGS: i16 = 33;
 pub const API_KEY_SASL_AUTHENTICATE: i16 = 36;
+pub const API_KEY_CREATE_PARTITIONS: i16 = 37;
 pub const API_KEY_INCREMENTAL_ALTER_CONFIGS: i16 = 44;
 pub const API_KEY_DESCRIBE_CLUSTER: i16 = 60;
 
@@ -298,6 +299,7 @@ static SUPPORTED_RANGES: &[ApiVersionRange] = &[
     api_versions::RANGE,
     create_topics::RANGE,
     delete_topics::RANGE,
+    create_partitions::RANGE,
     describe_configs::RANGE,
     alter_configs::RANGE,
     incremental_alter_configs::RANGE,
@@ -323,8 +325,8 @@ pub fn supported_api_ranges() -> &'static [ApiVersionRange] {
 /// answers with its stub, so APIs can be wired one at a time.
 ///
 /// Produce sends on one Iggy client per producer. Metadata, `CreateTopics`, `DeleteTopics`,
-/// `DescribeConfigs`, `AlterConfigs` and `IncrementalAlterConfigs` share one lockstep
-/// `IggyClient`, so those calls run one at a time across connections. See the README's
+/// `CreatePartitions`, `DescribeConfigs`, `AlterConfigs` and `IncrementalAlterConfigs` share one
+/// lockstep `IggyClient`, so those calls run one at a time across connections. See the README's
 /// "Concurrency ceiling".
 pub struct GatewayState {
     pub bridge: Option<Arc<IggyBridge>>,
@@ -349,6 +351,12 @@ pub struct GatewayState {
     pub(crate) unproven_empty: Mutex<fetch::Spells>,
     /// Topic probes that every Fetch shares.
     pub(crate) probe_board: ProbeBoard,
+    /// Held by `CreatePartitions` from reading a topic's partition count until its write is
+    /// settled, and by `CreateTopics` and `DeleteTopics` around their writes. Iggy adds a number
+    /// of partitions, Kafka asks for a count to reach, and two requests that read the same count
+    /// would otherwise both add and overshoot it. Per process: other gateways and direct Iggy
+    /// clients are not behind it.
+    pub(crate) partition_growth: Arc<tokio::sync::Mutex<()>>,
     /// What Metadata and `DescribeCluster` report. Random unless [`Self::with_cluster_id`] sets
     /// the one stored in Iggy.
     pub cluster_id: ClusterId,
@@ -388,6 +396,7 @@ impl GatewayState {
             loading: Mutex::default(),
             unproven_empty: Mutex::default(),
             probe_board: ProbeBoard::default(),
+            partition_growth: Arc::default(),
             cluster_id: ClusterId::random(),
             auto_topic_creation: None,
         }
@@ -422,6 +431,14 @@ impl GatewayState {
             // behind it.
             bridge.discard_auto_create_client();
         }
+    }
+
+    /// Holds back the writes of `CreateTopics`, `DeleteTopics` and `CreatePartitions` on this
+    /// gateway until the guard drops, the way a `CreatePartitions` settling an unknown outcome
+    /// does. For tests that check those handlers wait for it.
+    #[doc(hidden)]
+    pub async fn hold_topic_changes(&self) -> OwnedMutexGuard<()> {
+        Arc::clone(&self.partition_growth).lock_owned().await
     }
 
     #[must_use]
