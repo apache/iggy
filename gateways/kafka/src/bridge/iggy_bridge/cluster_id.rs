@@ -26,8 +26,8 @@ use std::fmt;
 
 use iggy::prelude::{
     Consumer, Durability, Identifier, IggyError, IggyExpiry, IggyMessage, MaxTopicSize,
-    MessageClient, Partitioning, PollingStrategy, StreamClient, TopicClient, TopicCreateOptions,
-    TopicDetails,
+    MessageClient, Partitioning, PollingStrategy, StreamClient, StreamCreateOptions, TopicClient,
+    TopicCreateOptions, TopicDetails,
 };
 use tracing::{info, warn};
 
@@ -203,8 +203,9 @@ impl IggyBridge {
     }
 
     async fn create_cluster_id_stream(&self, store: &IdStore) -> Result<(), BridgeError> {
+        let options = StreamCreateOptions::default();
         match self
-            .metadata_write(|| self.client.create_stream(&store.stream_name))
+            .metadata_write(|| self.client.create_stream(&store.stream_name, &options))
             .await
         {
             Ok(_) | Err(BridgeError::Iggy(IggyError::StreamNameAlreadyExists(_))) => Ok(()),
@@ -314,11 +315,12 @@ impl IdTopicOptions {
 
 impl From<&TopicDetails> for IdTopicOptions {
     fn from(topic: &TopicDetails) -> Self {
+        let resolved = topic.resolved_options();
         Self {
             partitions_count: topic.partitions_count,
             durability: TopicCreateOptions::from_resource_options(&topic.options).durability,
-            message_expiry: topic.message_expiry,
-            max_topic_size: topic.max_topic_size,
+            message_expiry: resolved.message_expiry,
+            max_topic_size: resolved.max_topic_size,
         }
     }
 }
