@@ -134,7 +134,7 @@ pub fn build_metadata_all_topics_flexible(version: i16) -> Bytes {
     enc.freeze()
 }
 
-/// Minimal `ListOffsets` request for supported versions (v1–v6).
+/// Minimal `ListOffsets` request for supported versions (v1–v7).
 pub fn build_list_offsets_request(version: i16, topic: &str, partition: i32) -> Bytes {
     let flexible = version >= 6;
     let mut enc = Encoder::with_capacity(128);

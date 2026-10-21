@@ -29,11 +29,11 @@ pub mod topic;
 
 use ext_php_rs::prelude::*;
 
-use crate::client::IggyClient;
+use crate::client::{IggyClient, PendingOperationsConfig};
 use crate::consumer::{AutoCommit, AutoCommitWhen, IggyConsumer};
 use crate::error::{
     AuthenticationException, ConnectionException, IggyException, NotFoundException,
-    TransientException,
+    PendingOperationException, TransientException,
 };
 use crate::message_iterator::MessageIterator;
 use crate::receive_message::{ConsumerPosition, PartitionContext, PollingStrategy, ReceiveMessage};
@@ -52,6 +52,8 @@ pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
         .class::<AuthenticationException>()
         .class::<NotFoundException>()
         .class::<TransientException>()
+        .class::<PendingOperationException>()
+        .class::<PendingOperationsConfig>()
         .class::<IggyClient>()
         .class::<IggyConsumer>()
         .class::<MessageIterator>()

@@ -359,11 +359,11 @@ impl Validatable<ConfigurationError> for ServerConfig {
         // These knobs sit on shared section structs, so the rejects live
         // here rather than in those types' own `Validatable` impls. `0` /
         // `disabled` / `unlimited` all parse to the same zero duration.
-        let session_timeout = self.consumer_group.session_timeout.get_duration();
+        let session_timeout = self.heartbeat.session_timeout();
         let heartbeat_interval = self.consumer_group.heartbeat_interval.get_duration();
         if heartbeat_interval.is_zero() {
             eprintln!(
-                "{COMPONENT} consumer_group.heartbeat_interval ({heartbeat_interval:?}) must be nonzero; consumer_group.session_timeout is {session_timeout:?}"
+                "{COMPONENT} consumer_group.heartbeat_interval ({heartbeat_interval:?}) must be nonzero; the session timeout, 1.2 x heartbeat.interval, is {session_timeout:?}"
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
@@ -375,14 +375,14 @@ impl Validatable<ConfigurationError> for ServerConfig {
             .saturating_add(heartbeat_interval);
         if session_timeout <= minimum_timeout {
             eprintln!(
-                "{COMPONENT} consumer_group.session_timeout ({session_timeout:?}) must exceed {minimum_timeout:?}, covering three consumer_group.heartbeat_interval periods and two gather/send deadlines, allowing one missed report"
+                "{COMPONENT} the session timeout, 1.2 x heartbeat.interval ({session_timeout:?}), must exceed {minimum_timeout:?}, covering three consumer_group.heartbeat_interval periods and two gather/send deadlines, allowing one missed report. Raise heartbeat.interval, which sets the session timeout also with heartbeat.enabled = false, or lower consumer_group.heartbeat_interval"
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
         let cluster_timeout = self.cluster.heartbeat_timeout.get_duration();
         if self.cluster.enabled && session_timeout <= cluster_timeout {
             eprintln!(
-                "{COMPONENT} consumer_group.session_timeout ({session_timeout:?}) must exceed cluster.heartbeat_timeout ({cluster_timeout:?})"
+                "{COMPONENT} the session timeout, 1.2 x heartbeat.interval ({session_timeout:?}), must exceed cluster.heartbeat_timeout ({cluster_timeout:?}). Raise heartbeat.interval"
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
@@ -398,13 +398,6 @@ impl Validatable<ConfigurationError> for ServerConfig {
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
-        if self.heartbeat.enabled && self.heartbeat.interval.get_duration().is_zero() {
-            eprintln!(
-                "{COMPONENT} heartbeat.interval must be nonzero when heartbeat.enabled: it sizes both the verifier's sleep and the staleness window, so zero spins the verifier and reaps every live session on its first pass"
-            );
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-
         Ok(())
     }
 }
@@ -1101,30 +1094,35 @@ mod tests {
     }
 
     #[test]
-    fn given_invalid_consumer_session_intervals_when_validating_should_reject() {
-        for settings in [
-            "heartbeat_interval = \"0\"",
-            "session_timeout = \"0\"",
-            "session_timeout = \"disabled\"",
-            "session_timeout = \"unlimited\"",
-            "heartbeat_interval = \"500ms\"\nsession_timeout = \"2s\"",
-            "heartbeat_interval = \"500ms\"\nsession_timeout = \"6500ms\"",
-            "heartbeat_interval = \"500ms\"\nsession_timeout = \"7500ms\"",
-            "heartbeat_interval = \"500ms\"\nsession_timeout = \"7700ms\"",
-            "heartbeat_interval = \"20s\"\nsession_timeout = \"27s\"",
-            "heartbeat_interval = \"20s\"\nsession_timeout = \"66s\"",
-            "heartbeat_interval = \"30s\"\nsession_timeout = \"30s\"",
-            "heartbeat_interval = \"31s\"\nsession_timeout = \"30s\"",
+    fn given_invalid_session_liveness_intervals_when_validating_should_reject() {
+        for (report_interval, heartbeat_interval) in [
+            ("0", "30s"),
+            ("5s", "0"),
+            ("5s", "disabled"),
+            ("5s", "unlimited"),
+            ("500ms", "2s"),
+            ("500ms", "5s"),
+            ("500ms", "6250ms"),
+            ("500ms", "6416ms"),
+            ("20s", "22500ms"),
+            ("20s", "55s"),
+            ("30s", "25s"),
+            ("31s", "25s"),
         ] {
-            let config = config_with_override(&format!("[consumer_group]\n{settings}\n"));
-            assert!(config.validate().is_err(), "accepted {settings}");
+            let config = config_with_override(&format!(
+                "[consumer_group]\nheartbeat_interval = \"{report_interval}\"\n[heartbeat]\ninterval = \"{heartbeat_interval}\"\n"
+            ));
+            assert!(
+                config.validate().is_err(),
+                "accepted {report_interval} reports with a {heartbeat_interval} heartbeat"
+            );
         }
     }
 
     #[test]
-    fn given_consumer_session_timeout_above_missed_report_budget_when_validating_should_pass() {
+    fn given_session_timeout_above_missed_report_budget_when_validating_should_pass() {
         let config = config_with_override(
-            "[consumer_group]\nheartbeat_interval = \"500ms\"\nsession_timeout = \"7701ms\"\n",
+            "[consumer_group]\nheartbeat_interval = \"500ms\"\n[heartbeat]\ninterval = \"6417ms\"\n",
         );
         assert!(config.validate().is_ok());
     }
@@ -1142,16 +1140,15 @@ mod tests {
     }
 
     #[test]
-    fn given_consumer_session_timeout_within_cluster_liveness_window_when_validating_should_reject()
-    {
-        for timeout in ["15s", "20s"] {
+    fn given_session_timeout_within_cluster_liveness_window_when_validating_should_reject() {
+        for interval in ["12500ms", "15s"] {
             let config = config_with_override(&format!(
-                "[cluster]\nenabled = true\nheartbeat_timeout = \"20s\"\n[consumer_group]\nheartbeat_interval = \"500ms\"\nsession_timeout = \"{timeout}\"\n"
+                "[cluster]\nenabled = true\nheartbeat_timeout = \"18s\"\n[consumer_group]\nheartbeat_interval = \"500ms\"\n[heartbeat]\ninterval = \"{interval}\"\n"
             ));
-            assert!(config.validate().is_err(), "accepted {timeout}");
+            assert!(config.validate().is_err(), "accepted {interval}");
         }
         let config = config_with_override(
-            "[cluster]\nenabled = true\nheartbeat_timeout = \"20s\"\n[consumer_group]\nheartbeat_interval = \"500ms\"\nsession_timeout = \"21s\"\n",
+            "[cluster]\nenabled = true\nheartbeat_timeout = \"18s\"\n[consumer_group]\nheartbeat_interval = \"500ms\"\n[heartbeat]\ninterval = \"16s\"\n",
         );
         assert!(config.validate().is_ok());
     }
@@ -1171,17 +1168,15 @@ mod tests {
     }
 
     #[test]
-    fn given_zero_heartbeat_interval_when_heartbeat_enabled_should_reject() {
-        let config = config_with_override("[heartbeat]\nenabled = true\ninterval = \"0\"\n");
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn given_zero_heartbeat_interval_when_heartbeat_disabled_should_pass() {
-        let config = config_with_override("[heartbeat]\nenabled = false\ninterval = \"0\"\n");
-        config
-            .validate()
-            .expect("a disabled heartbeat never reads its interval");
+    fn given_zero_heartbeat_interval_when_validating_should_reject() {
+        // The session timeout derives from the interval even with heartbeat
+        // checks off, so zero would expire every session on its first pass.
+        for enabled in [true, false] {
+            let config = config_with_override(&format!(
+                "[heartbeat]\nenabled = {enabled}\ninterval = \"0\"\n"
+            ));
+            assert!(config.validate().is_err(), "accepted enabled = {enabled}");
+        }
     }
 
     // http.enabled needs a non-ServerDefault JWT expiry to clear the sibling

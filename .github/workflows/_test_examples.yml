@@ -19,14 +19,10 @@ name: _test_examples
 on:
   workflow_call:
     inputs:
-      component:
+      matrix:
         type: string
         required: true
-        description: "Component to test (e.g., 'examples-rust', 'examples-go')"
-      task:
-        type: string
-        required: true
-        description: "Task to run (e.g., 'examples-rust', 'examples-go', 'examples-node')"
+        description: "Selected component/task entries"
 
 permissions:
   contents: read
@@ -34,29 +30,31 @@ permissions:
 
 jobs:
   run:
+    name: ${{ matrix.name || matrix.task }}
+    strategy:
+      fail-fast: true
+      matrix: ${{ fromJSON(inputs.matrix) }}
     runs-on: ubuntu-26.04
     timeout-minutes: 60
     steps:
       - name: Checkout code
         uses: actions/checkout@v7.0.1
 
-      - name: Skip noop
-        if: inputs.component == 'noop'
-        run: echo "No changes detected, skipping tests"
-
       - name: Setup Rust for examples
-        if: startsWith(inputs.component, 'examples-')
+        if: contains(fromJSON('["examples-rust","examples-python","examples-php"]'), matrix.task)
         uses: ./.github/actions/utils/setup-rust
+        with:
+          free-disk-space: ${{ matrix.task != 'examples-python' }}
 
       - name: Setup Node for examples
-        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-node'
+        if: matrix.task == 'examples-node'
         uses: ./.github/actions/utils/setup-node
         with:
           node-version: "23"
           workspace: examples/node
 
       - name: Install PHP build dependencies
-        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-php'
+        if: matrix.task == 'examples-php'
         shell: bash
         run: |
           ./scripts/ci/apt-install.sh --no-install-recommends \
@@ -82,86 +80,53 @@ jobs:
           "${php_config}" --version
 
       - name: Setup Java for examples
-        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-java'
+        if: matrix.task == 'examples-java'
         uses: ./.github/actions/utils/setup-java
         with:
           gradle-cache-disabled: "true"
 
       - name: Setup Go for examples
-        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-go'
+        if: matrix.task == 'examples-go'
         uses: ./.github/actions/utils/setup-go
         with:
           download-deps: "false"
 
       - name: Test Go examples
-        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-go'
+        if: matrix.task == 'examples-go'
         working-directory: examples/go
         run: go test -race ./...
 
       - name: Test Java examples
-        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-java'
+        if: matrix.task == 'examples-java'
         working-directory: examples/java
         run: ./gradlew test
 
-      - name: Build common binaries for all examples
-        if: startsWith(inputs.component, 'examples-')
-        run: |
-          echo "Building common binaries for all examples tests..."
-          echo "Current directory: $(pwd)"
+      - name: Build Rust examples
+        if: matrix.task == 'examples-rust'
+        run: cargo build --locked --examples
 
-          # Every SDK speaks only the VSR wire protocol, so every lane runs
-          # against the VSR server.
-          SERVER_BIN="iggy-server"
-          echo "Building ${SERVER_BIN}..."
-          BUILD_ARGS=(--bin "$SERVER_BIN")
-          if [[ "${{ inputs.task }}" == "examples-rust" ]]; then
-            BUILD_ARGS+=(--bin iggy --examples)
-          fi
-          cargo build --locked "${BUILD_ARGS[@]}"
+      - name: Download runtime binaries
+        uses: ./.github/actions/utils/download-runtime
 
-          # Verify server binary was built (needed by all examples)
-          echo "Verifying server binary:"
-          if [ -f "target/debug/${SERVER_BIN}" ]; then
-            echo "✅ Server binary found at target/debug/${SERVER_BIN}"
-            ls -lh "target/debug/${SERVER_BIN}"
-          else
-            echo "❌ Server binary NOT found at target/debug/${SERVER_BIN}"
-            echo "Checking target directory structure:"
-            find target -name "${SERVER_BIN}" -type f 2>/dev/null || true
-            exit 1
-          fi
-
-          # For Rust examples, verify CLI was built
-          if [[ "${{ inputs.task }}" == "examples-rust" ]]; then
-            if [ -f "target/debug/iggy" ]; then
-              echo "✅ CLI binary found at target/debug/iggy"
-              ls -lh target/debug/iggy
-            else
-              echo "❌ CLI binary NOT found at target/debug/iggy"
-              exit 1
-            fi
-          fi
-
-      # Keep Python's PKG_CONFIG_PATH out of the server build above.
       - name: Setup Python
-        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-python'
+        if: matrix.task == 'examples-python'
         uses: actions/setup-python@v7.0.0
         with:
           python-version: "3.11"
 
       - name: Setup uv
-        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-python'
+        if: matrix.task == 'examples-python'
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
 
       - name: Cache uv
-        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-python'
+        if: matrix.task == 'examples-python'
         uses: actions/cache@v6.1.0
         with:
           path: ~/.cache/uv
           key: uv-${{ runner.os }}-${{ hashFiles('examples/python/uv.lock', 'foreign/python/uv.lock', 'bdd/python/uv.lock') }}
 
       - name: Build PHP extension for examples
-        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-php'
+        if: matrix.task == 'examples-php'
         shell: bash
         run: |
           export CARGO_TARGET_DIR="${GITHUB_WORKSPACE}/target"
@@ -175,7 +140,7 @@ jobs:
           ls -lh "$extension"
 
       - name: Build Node SDK for examples
-        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-node'
+        if: matrix.task == 'examples-node'
         run: |
           cd foreign/node
           npm ci
@@ -186,38 +151,38 @@ jobs:
           cd ../..
 
       - name: Run Rust examples
-        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-rust'
+        if: matrix.task == 'examples-rust'
         run: ./scripts/run-examples-from-readme.sh --language rust
 
       - name: Run Go examples
-        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-go'
+        if: matrix.task == 'examples-go'
         run: ./scripts/run-examples-from-readme.sh --language go
 
       - name: Run C# examples
-        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-csharp'
+        if: matrix.task == 'examples-csharp'
         run: ./scripts/run-examples-from-readme.sh --language csharp
 
       - name: Run Python examples
-        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-python'
+        if: matrix.task == 'examples-python'
         run: ./scripts/run-examples-from-readme.sh --language python
 
       - name: Run PHP examples
-        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-php'
+        if: matrix.task == 'examples-php'
         run: ./scripts/run-examples-from-readme.sh --language php
 
       - name: Run Node.js examples
-        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-node'
+        if: matrix.task == 'examples-node'
         run: ./scripts/run-examples-from-readme.sh --language node
 
       - name: Run Java examples
-        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-java'
+        if: matrix.task == 'examples-java'
         run: ./scripts/run-examples-from-readme.sh --language java
 
       - name: Upload reports
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ inputs.component }}-${{ inputs.task }}-reports-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ${{ matrix.component }}-${{ matrix.task }}-reports-${{ github.run_id }}-${{ github.run_attempt }}
           path: reports/**
           if-no-files-found: ignore
           retention-days: 7

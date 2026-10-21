@@ -200,6 +200,17 @@ impl HttpClient {
             .await
             .expect("delete request")
     }
+
+    /// The unauthenticated `POST /users/refresh-token` route: the current token
+    /// travels in the JSON body, sent with no bearer header.
+    pub async fn refresh(&self, token: &str) -> Response {
+        self.client
+            .post(self.url("/users/refresh-token"))
+            .json(&json!({ "token": token }))
+            .send()
+            .await
+            .expect("refresh-token request")
+    }
 }
 
 /// `http://host:port` of a harness node's HTTP listener.

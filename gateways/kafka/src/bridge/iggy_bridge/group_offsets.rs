@@ -31,6 +31,7 @@ use tracing::info;
 
 use super::{
     IggyBridge, KafkaTopicMetadata, LazyClient, SLOT_LIMIT, TopicTarget, in_slot, permit_by,
+    write_with_recovery,
 };
 use crate::bridge::error::BridgeError;
 
@@ -246,8 +247,7 @@ impl IggyBridge {
         let Some((_queued, _turn)) = calls.take(slot, lane).await else {
             return Err(BridgeError::Timeout);
         };
-        let read = async { call(lane.client.connected(&self.config).await?).await };
-        lane.client.until(calls.deadline, read).await
+        lane.client.until(&self.config, calls.deadline, call).await
     }
 }
 
@@ -345,11 +345,13 @@ async fn commit_on(
     partition: u32,
     offset: i64,
 ) -> Result<(), BridgeError> {
+    let deadline = (Instant::now() + SLOT_LIMIT).into_std();
     let consumer = &names.consumer;
     let Ok(offset) = u64::try_from(offset) else {
-        return match client
-            .delete_consumer_offset(consumer, stream_id, topic_id, Some(partition))
-            .await
+        return match write_with_recovery(client, deadline, || {
+            client.delete_consumer_offset(consumer, stream_id, topic_id, Some(partition))
+        })
+        .await
         {
             Err(
                 IggyError::ConsumerOffsetNotFound(_) | IggyError::ConsumerGroupNameNotFound(..),
@@ -357,8 +359,11 @@ async fn commit_on(
             deleted => landed(deleted),
         };
     };
-    let store =
-        || client.store_consumer_offset(consumer, stream_id, topic_id, Some(partition), offset);
+    let store = || {
+        write_with_recovery(client, deadline, || {
+            client.store_consumer_offset(consumer, stream_id, topic_id, Some(partition), offset)
+        })
+    };
     match store().await {
         Err(IggyError::ConsumerGroupNameNotFound(..)) => {
             create_offset_group(client, stream_id, topic_id, &names.group).await?;
@@ -384,9 +389,11 @@ async fn create_offset_group(
     topic_id: &Identifier,
     name: &str,
 ) -> Result<(), BridgeError> {
-    match client
-        .create_consumer_group(stream_id, topic_id, name)
-        .await
+    let deadline = (Instant::now() + SLOT_LIMIT).into_std();
+    match write_with_recovery(client, deadline, || {
+        client.create_consumer_group(stream_id, topic_id, name)
+    })
+    .await
     {
         Ok(_) => {
             // `{name:?}`: a client picks the group id, and a newline in it would forge a line.

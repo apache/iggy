@@ -128,11 +128,7 @@ public class UsersTcpClient implements UsersClient {
         // server reads an absent block as empty. Settings will ride one here,
         // as topics do.
 
-        return connection().sendAndRelease(CommandCode.User.UPDATE, payload).thenRun(() -> {
-            connection()
-                    .refreshCredentials(userId, username, Optional.empty())
-                    .ifPresent(previous -> routingHook.refreshLogin(previous, username, Optional.empty()));
-        });
+        return connection().sendAndRelease(CommandCode.User.UPDATE, payload);
     }
 
     @Override
@@ -157,22 +153,15 @@ public class UsersTcpClient implements UsersClient {
         payload.writeBytes(toBytes(currentPassword, "current password", MIN_PASSWORD_LENGTH, MAX_PASSWORD_LENGTH));
         payload.writeBytes(toBytes(newPassword, "new password", MIN_PASSWORD_LENGTH, MAX_PASSWORD_LENGTH));
 
-        return connection()
-                .sendAndRelease(CommandCode.User.CHANGE_PASSWORD, payload)
-                .thenRun(() -> {
-                    connection()
-                            .refreshCredentials(userId, Optional.empty(), Optional.of(newPassword))
-                            .ifPresent(previous ->
-                                    routingHook.refreshLogin(previous, Optional.empty(), Optional.of(newPassword)));
-                });
+        return connection().sendAndRelease(CommandCode.User.CHANGE_PASSWORD, payload);
     }
 
     @Override
     public CompletableFuture<IdentityInfo> login(String username, String password) {
-        return routingHook.loginOnLeader(() -> loginWithoutRedirect(username, password));
+        return routingHook.loginOnLeader(deadline -> loginWithoutRedirect(username, password, deadline));
     }
 
-    private CompletableFuture<IdentityInfo> loginWithoutRedirect(String username, String password) {
+    private CompletableFuture<IdentityInfo> loginWithoutRedirect(String username, String password, long deadline) {
         // The VSR codec re-frames this into a Register and carries the SDK
         // version itself, so the payload is only the two credentials.
         var payload = Unpooled.buffer();
@@ -181,14 +170,15 @@ public class UsersTcpClient implements UsersClient {
 
         log.debug("Logging in user: {}", username);
 
-        return connection().send(CommandCode.User.LOGIN.getValue(), payload).thenApply(response -> {
-            try {
-                var userId = response.readUnsignedIntLE();
-                return new IdentityInfo(userId, Optional.empty());
-            } finally {
-                response.release();
-            }
-        });
+        return AsyncTcpConnection.mapResponse(
+                connection().send(CommandCode.User.LOGIN.getValue(), payload, deadline), response -> {
+                    try {
+                        var userId = response.readUnsignedIntLE();
+                        return new IdentityInfo(userId, Optional.empty());
+                    } finally {
+                        response.release();
+                    }
+                });
     }
 
     @Override
@@ -197,10 +187,11 @@ public class UsersTcpClient implements UsersClient {
 
         log.debug("Logging out");
 
-        return connection().send(CommandCode.User.LOGOUT.getValue(), payload).thenAccept(response -> {
+        return AsyncTcpConnection.mapResponse(connection().send(CommandCode.User.LOGOUT, payload), response -> {
             response.release();
             routingHook.forgetLogin();
             log.debug("Logged out successfully");
+            return null;
         });
     }
 }

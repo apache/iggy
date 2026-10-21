@@ -29,16 +29,17 @@
 class LowLevelE2E_Message : public E2ETestFixture {};
 
 TEST_F(LowLevelE2E_Message, SendAndPollMessagesRoundTrip) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description", "Sends 10 messages and polls them back, verifying count, offsets, and payloads.");
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name);
+    client->create_stream(stream_name, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
     client->create_topic(make_numeric_identifier(stream.id), topic_name,
-                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"));
+                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"), error_info);
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 10; i++) {
@@ -48,8 +49,9 @@ TEST_F(LowLevelE2E_Message, SendAndPollMessagesRoundTrip) {
     }
 
     iggy::ffi::SendMessagesResponse sent;
-    ASSERT_NO_THROW(sent = client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0),
-                                                 "partition_id", partition_id_bytes(0), std::move(messages)));
+    ASSERT_NO_THROW(sent =
+                        client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0),
+                                              "partition_id", partition_id_bytes(0), std::move(messages), error_info));
 
     ASSERT_EQ(sent.confirmations.size(), 1u)
         << "The VSR server reports the written partition's offsets, so a single-partition send "
@@ -57,7 +59,7 @@ TEST_F(LowLevelE2E_Message, SendAndPollMessagesRoundTrip) {
     EXPECT_EQ(sent.confirmations.front().partition_id, 0u);
 
     auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                        make_numeric_identifier(1), "offset", 0, 100, false);
+                                        make_numeric_identifier(1), "offset", 0, 100, false, error_info);
 
     ASSERT_EQ(polled.partition_id, 0u) << "Polled partition_id mismatches the partition we sent to";
     ASSERT_EQ(polled.count, 10u);
@@ -71,16 +73,17 @@ TEST_F(LowLevelE2E_Message, SendAndPollMessagesRoundTrip) {
 }
 
 TEST_F(LowLevelE2E_Message, PollMessagesVerifyMessageIds) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description", "Verifies that polled message IDs match the sent IDs.");
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name);
+    client->create_stream(stream_name, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
     client->create_topic(make_numeric_identifier(stream.id), topic_name,
-                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"));
+                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"), error_info);
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     auto msg  = iggy::ffi::make_message(to_payload("id-test-message"), rust::Vec<iggy::ffi::HeaderEntry>());
@@ -89,10 +92,10 @@ TEST_F(LowLevelE2E_Message, PollMessagesVerifyMessageIds) {
     messages.push_back(std::move(msg));
 
     client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
-                          partition_id_bytes(0), std::move(messages));
+                          partition_id_bytes(0), std::move(messages), error_info);
 
     auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                        make_numeric_identifier(1), "offset", 0, 100, false);
+                                        make_numeric_identifier(1), "offset", 0, 100, false, error_info);
 
     ASSERT_EQ(polled.messages.size(), 1u);
     ASSERT_EQ(polled.messages[0].id_lo, 42u);
@@ -100,25 +103,27 @@ TEST_F(LowLevelE2E_Message, PollMessagesVerifyMessageIds) {
 }
 
 TEST_F(LowLevelE2E_Message, PollMessagesFromEmptyPartition) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description", "Verifies polling from an empty partition returns zero messages.");
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name);
+    client->create_stream(stream_name, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
     client->create_topic(make_numeric_identifier(stream.id), topic_name,
-                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"));
+                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"), error_info);
 
     auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                        make_numeric_identifier(1), "offset", 0, 100, false);
+                                        make_numeric_identifier(1), "offset", 0, 100, false, error_info);
 
     ASSERT_EQ(polled.count, 0u);
     ASSERT_EQ(polled.messages.size(), 0u);
 }
 
 TEST_F(LowLevelE2E_Message, SendMessagesBeforeLoginThrows) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description", "Verifies send_messages throws when not authenticated.");
     iggy::ffi::Client *client = GetLoggedOutClient();
     ASSERT_NO_THROW(client->connect());
@@ -128,9 +133,9 @@ TEST_F(LowLevelE2E_Message, SendMessagesBeforeLoginThrows) {
     messages.push_back(std::move(msg));
 
     ASSERT_THROW(client->send_messages(make_numeric_identifier(1), make_numeric_identifier(1), "partition_id",
-                                       partition_id_bytes(0), std::move(messages)),
+                                       partition_id_bytes(0), std::move(messages), error_info),
                  std::exception);
-    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy", error_info));
     ASSERT_NO_THROW(client->disconnect());
 
     rust::Vec<iggy::ffi::IggyMessageToSend> disconnected_messages;
@@ -138,11 +143,12 @@ TEST_F(LowLevelE2E_Message, SendMessagesBeforeLoginThrows) {
         iggy::ffi::make_message(to_payload("should-still-fail"), rust::Vec<iggy::ffi::HeaderEntry>());
     disconnected_messages.push_back(std::move(disconnected_msg));
     ASSERT_THROW(client->send_messages(make_numeric_identifier(1), make_numeric_identifier(1), "partition_id",
-                                       partition_id_bytes(0), std::move(disconnected_messages)),
+                                       partition_id_bytes(0), std::move(disconnected_messages), error_info),
                  std::exception);
 }
 
 TEST_F(LowLevelE2E_Message, SendMessagesWithInvalidStreamId) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description", "Throws when sending messages with an invalid stream identifier.");
     iggy::ffi::Client *client = GetLoggedInClient();
 
@@ -155,11 +161,12 @@ TEST_F(LowLevelE2E_Message, SendMessagesWithInvalidStreamId) {
     invalid_id.length = 0;
 
     ASSERT_THROW(client->send_messages(invalid_id, make_numeric_identifier(1), "partition_id", partition_id_bytes(0),
-                                       std::move(messages)),
+                                       std::move(messages), error_info),
                  std::exception);
 }
 
 TEST_F(LowLevelE2E_Message, SendMessagesToNonExistentStream) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description", "Throws when sending messages to a non-existent stream.");
     iggy::ffi::Client *client = GetLoggedInClient();
 
@@ -168,42 +175,44 @@ TEST_F(LowLevelE2E_Message, SendMessagesToNonExistentStream) {
     messages.push_back(std::move(msg));
 
     ASSERT_THROW(client->send_messages(make_string_identifier("nonexistent-stream-12345"), make_numeric_identifier(0),
-                                       "partition_id", partition_id_bytes(0), std::move(messages)),
+                                       "partition_id", partition_id_bytes(0), std::move(messages), error_info),
                  std::exception);
 }
 
 TEST_F(LowLevelE2E_Message, SendMessagesWithInvalidPartitioningKind) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description", "Throws when sending messages with an invalid partitioning kind.");
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name);
+    client->create_stream(stream_name, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
     client->create_topic(make_numeric_identifier(stream.id), topic_name,
-                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"));
+                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"), error_info);
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     auto msg = iggy::ffi::make_message(to_payload("test"), rust::Vec<iggy::ffi::HeaderEntry>());
     messages.push_back(std::move(msg));
 
     ASSERT_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "invalid_kind",
-                                       partition_id_bytes(0), std::move(messages)),
+                                       partition_id_bytes(0), std::move(messages), error_info),
                  std::exception);
 }
 
 TEST_F(LowLevelE2E_Message, SendMessagesWithInvalidPartitioningValue) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description", "Throws when sending messages with insufficient partitioning value bytes.");
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name);
+    client->create_stream(stream_name, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
     client->create_topic(make_numeric_identifier(stream.id), topic_name,
-                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"));
+                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"), error_info);
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     auto msg = iggy::ffi::make_message(to_payload("test"), rust::Vec<iggy::ffi::HeaderEntry>());
@@ -214,22 +223,23 @@ TEST_F(LowLevelE2E_Message, SendMessagesWithInvalidPartitioningValue) {
     short_bytes.push_back(0x01);
 
     ASSERT_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
-                                       std::move(short_bytes), std::move(messages)),
+                                       std::move(short_bytes), std::move(messages), error_info),
                  std::exception);
 }
 
 TEST_F(LowLevelE2E_Message, SendMessagesToSpecificPartitionVerified) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description",
                    "Verifies messages sent to a specific partition are only retrievable from that partition.");
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name);
+    client->create_stream(stream_name, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
     client->create_topic(make_numeric_identifier(stream.id), topic_name,
-                         make_topic_create_options(3, "none", "never_expire", 0, "server_default"));
+                         make_topic_create_options(3, "none", "never_expire", 0, "server_default"), error_info);
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 5; i++) {
@@ -239,49 +249,53 @@ TEST_F(LowLevelE2E_Message, SendMessagesToSpecificPartitionVerified) {
     }
 
     client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
-                          partition_id_bytes(0), std::move(messages));
+                          partition_id_bytes(0), std::move(messages), error_info);
 
-    auto polled_part0 = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0,
-                                              "consumer", make_numeric_identifier(1), "offset", 0, 100, false);
+    auto polled_part0 =
+        client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
+                              make_numeric_identifier(1), "offset", 0, 100, false, error_info);
     ASSERT_EQ(polled_part0.partition_id, 0u);
     ASSERT_EQ(polled_part0.count, 5u);
 
-    auto polled_part1 = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 1,
-                                              "consumer", make_numeric_identifier(1), "offset", 0, 100, false);
+    auto polled_part1 =
+        client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 1, "consumer",
+                              make_numeric_identifier(1), "offset", 0, 100, false, error_info);
     ASSERT_EQ(polled_part1.partition_id, 1u);
     ASSERT_EQ(polled_part1.count, 0u);
 }
 
 TEST_F(LowLevelE2E_Message, SendEmptyMessageVectorThrows) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description", "Throws when sending an empty message vector.");
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name);
+    client->create_stream(stream_name, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
     client->create_topic(make_numeric_identifier(stream.id), topic_name,
-                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"));
+                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"), error_info);
 
     rust::Vec<iggy::ffi::IggyMessageToSend> empty_messages;
 
     ASSERT_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
-                                       partition_id_bytes(0), std::move(empty_messages)),
+                                       partition_id_bytes(0), std::move(empty_messages), error_info),
                  std::exception);
 }
 
 TEST_F(LowLevelE2E_Message, SendMessageWithEmptyPayloadThrows) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description", "Throws when sending a message with an empty payload.");
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name);
+    client->create_stream(stream_name, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
     client->create_topic(make_numeric_identifier(stream.id), topic_name,
-                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"));
+                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"), error_info);
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     rust::Vec<std::uint8_t> empty_payload;
@@ -289,21 +303,22 @@ TEST_F(LowLevelE2E_Message, SendMessageWithEmptyPayloadThrows) {
     messages.push_back(std::move(msg));
 
     ASSERT_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
-                                       partition_id_bytes(0), std::move(messages)),
+                                       partition_id_bytes(0), std::move(messages), error_info),
                  std::exception);
 }
 
 TEST_F(LowLevelE2E_Message, SendMessageWithOversizedPayloadThrows) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description", "Throws when sending a message exceeding maximum payload size.");
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name);
+    client->create_stream(stream_name, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
     client->create_topic(make_numeric_identifier(stream.id), topic_name,
-                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"));
+                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"), error_info);
 
     // Build a payload one byte over the SDK's max payload size (64 MB).
     constexpr std::uint32_t kOversizedPayloadBytes = 64'000'001u;
@@ -318,21 +333,22 @@ TEST_F(LowLevelE2E_Message, SendMessageWithOversizedPayloadThrows) {
     messages.push_back(std::move(msg));
 
     ASSERT_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
-                                       partition_id_bytes(0), std::move(messages)),
+                                       partition_id_bytes(0), std::move(messages), error_info),
                  std::exception);
 }
 
 TEST_F(LowLevelE2E_Message, SendMessagesPreservesOrder) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description", "Verifies messages are stored and retrieved in the order they were sent.");
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name);
+    client->create_stream(stream_name, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
     client->create_topic(make_numeric_identifier(stream.id), topic_name,
-                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"));
+                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"), error_info);
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 50; i++) {
@@ -342,10 +358,10 @@ TEST_F(LowLevelE2E_Message, SendMessagesPreservesOrder) {
     }
 
     client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
-                          partition_id_bytes(0), std::move(messages));
+                          partition_id_bytes(0), std::move(messages), error_info);
 
     auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                        make_numeric_identifier(1), "offset", 0, 100, false);
+                                        make_numeric_identifier(1), "offset", 0, 100, false, error_info);
 
     ASSERT_EQ(polled.count, 50u);
     for (std::uint32_t i = 0; i < 50; i++) {
@@ -357,16 +373,17 @@ TEST_F(LowLevelE2E_Message, SendMessagesPreservesOrder) {
 }
 
 TEST_F(LowLevelE2E_Message, SendMessagesWithDuplicateIds) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description", "Verifies sending multiple messages with the same ID succeeds.");
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name);
+    client->create_stream(stream_name, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
     client->create_topic(make_numeric_identifier(stream.id), topic_name,
-                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"));
+                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"), error_info);
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 3; i++) {
@@ -378,10 +395,10 @@ TEST_F(LowLevelE2E_Message, SendMessagesWithDuplicateIds) {
     }
 
     ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0),
-                                          "partition_id", partition_id_bytes(0), std::move(messages)));
+                                          "partition_id", partition_id_bytes(0), std::move(messages), error_info));
 
     auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                        make_numeric_identifier(1), "offset", 0, 100, false);
+                                        make_numeric_identifier(1), "offset", 0, 100, false, error_info);
 
     ASSERT_EQ(polled.count, 3u);
     for (const auto &message : polled.messages) {
@@ -390,17 +407,18 @@ TEST_F(LowLevelE2E_Message, SendMessagesWithDuplicateIds) {
 }
 
 TEST_F(LowLevelE2E_Message, SendMessagesWithVariousPayloads) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description",
                    "Verifies various payload types including null bytes, UTF-8, and binary data are preserved.");
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name);
+    client->create_stream(stream_name, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
     client->create_topic(make_numeric_identifier(stream.id), topic_name,
-                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"));
+                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"), error_info);
 
     rust::Vec<std::uint8_t> payload_null;
     payload_null.push_back(0x00);
@@ -429,10 +447,10 @@ TEST_F(LowLevelE2E_Message, SendMessagesWithVariousPayloads) {
     messages.push_back(std::move(msg3));
 
     client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
-                          partition_id_bytes(0), std::move(messages));
+                          partition_id_bytes(0), std::move(messages), error_info);
 
     auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                        make_numeric_identifier(1), "offset", 0, 100, false);
+                                        make_numeric_identifier(1), "offset", 0, 100, false, error_info);
 
     ASSERT_EQ(polled.count, 4u);
 
@@ -456,18 +474,19 @@ TEST_F(LowLevelE2E_Message, SendMessagesWithVariousPayloads) {
 }
 
 TEST_F(LowLevelE2E_Message, SendAndPollMessageWithTypedHeadersRoundTrip) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty(
         "description",
         "Sends one message per typed header kind and verifies payload, IDs, header contents, and encoded size.");
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name);
+    client->create_stream(stream_name, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
     client->create_topic(make_numeric_identifier(stream.id), topic_name,
-                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"));
+                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"), error_info);
 
     struct ExpectedHeaderMessage {
         const char *key;
@@ -523,10 +542,10 @@ TEST_F(LowLevelE2E_Message, SendAndPollMessageWithTypedHeadersRoundTrip) {
     }
 
     ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0),
-                                          "partition_id", partition_id_bytes(0), std::move(messages)));
+                                          "partition_id", partition_id_bytes(0), std::move(messages), error_info));
 
     auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                        make_numeric_identifier(1), "offset", 0, 100, false);
+                                        make_numeric_identifier(1), "offset", 0, 100, false, error_info);
 
     constexpr std::size_t expected_message_count = sizeof(expected_messages) / sizeof(expected_messages[0]);
     ASSERT_EQ(polled.count, expected_message_count);
@@ -547,16 +566,17 @@ TEST_F(LowLevelE2E_Message, SendAndPollMessageWithTypedHeadersRoundTrip) {
 }
 
 TEST_F(LowLevelE2E_Message, SendMessageWithDuplicateTypedHeaderKeysThrows) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description", "Throws when a single message contains duplicate typed header keys.");
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name);
+    client->create_stream(stream_name, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
     client->create_topic(make_numeric_identifier(stream.id), topic_name,
-                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"));
+                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"), error_info);
 
     rust::Vec<iggy::ffi::HeaderEntry> headers;
     headers.push_back(make_header_entry(make_header_field(iggy::ffi::HeaderKind::String, to_payload("dup-key")),
@@ -568,21 +588,22 @@ TEST_F(LowLevelE2E_Message, SendMessageWithDuplicateTypedHeaderKeysThrows) {
     messages.push_back(iggy::ffi::make_message(to_payload("payload"), std::move(headers)));
 
     ASSERT_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
-                                       partition_id_bytes(0), std::move(messages)),
+                                       partition_id_bytes(0), std::move(messages), error_info),
                  std::exception);
 }
 
 TEST_F(LowLevelE2E_Message, SendMessageWithWrongFixedWidthHeaderBytesThrows) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description", "Throws when a typed header uses a fixed-width kind with the wrong byte count.");
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name);
+    client->create_stream(stream_name, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
     client->create_topic(make_numeric_identifier(stream.id), topic_name,
-                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"));
+                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"), error_info);
 
     struct FixedWidthHeaderCase {
         const char *key;
@@ -599,6 +620,7 @@ TEST_F(LowLevelE2E_Message, SendMessageWithWrongFixedWidthHeaderBytesThrows) {
     };
 
     for (const auto &test_case : fixed_width_header_cases) {
+        iggy::ffi::ErrorInfo error_info{};
         SCOPED_TRACE(test_case.key);
 
         rust::Vec<iggy::ffi::HeaderEntry> headers;
@@ -613,22 +635,23 @@ TEST_F(LowLevelE2E_Message, SendMessageWithWrongFixedWidthHeaderBytesThrows) {
         messages.push_back(iggy::ffi::make_message(to_payload("payload"), std::move(headers)));
 
         ASSERT_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0),
-                                           "partition_id", partition_id_bytes(0), std::move(messages)),
+                                           "partition_id", partition_id_bytes(0), std::move(messages), error_info),
                      std::exception);
     }
 }
 
 TEST_F(LowLevelE2E_Message, SendMessageWithInvalidTypedHeaderKindThrows) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description", "Throws when a typed header uses an unsupported header kind code.");
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name);
+    client->create_stream(stream_name, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
     client->create_topic(make_numeric_identifier(stream.id), topic_name,
-                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"));
+                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"), error_info);
 
     iggy::ffi::HeaderField invalid_key;
     invalid_key.kind  = 255;
@@ -642,21 +665,22 @@ TEST_F(LowLevelE2E_Message, SendMessageWithInvalidTypedHeaderKindThrows) {
     messages.push_back(iggy::ffi::make_message(to_payload("payload"), std::move(headers)));
 
     ASSERT_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
-                                       partition_id_bytes(0), std::move(messages)),
+                                       partition_id_bytes(0), std::move(messages), error_info),
                  std::exception);
 }
 
 TEST_F(LowLevelE2E_Message, SendMessageWithInvalidTypedHeaderSizesThrows) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description", "Throws when typed header key or value sizes violate Rust header size constraints.");
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name);
+    client->create_stream(stream_name, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
     client->create_topic(make_numeric_identifier(stream.id), topic_name,
-                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"));
+                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"), error_info);
 
     rust::Vec<iggy::ffi::HeaderEntry> empty_key_headers;
     empty_key_headers.push_back(
@@ -665,7 +689,7 @@ TEST_F(LowLevelE2E_Message, SendMessageWithInvalidTypedHeaderSizesThrows) {
     rust::Vec<iggy::ffi::IggyMessageToSend> empty_key_messages;
     empty_key_messages.push_back(iggy::ffi::make_message(to_payload("payload"), std::move(empty_key_headers)));
     ASSERT_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
-                                       partition_id_bytes(0), std::move(empty_key_messages)),
+                                       partition_id_bytes(0), std::move(empty_key_messages), error_info),
                  std::exception);
 
     rust::Vec<iggy::ffi::HeaderEntry> empty_raw_value_headers;
@@ -676,7 +700,7 @@ TEST_F(LowLevelE2E_Message, SendMessageWithInvalidTypedHeaderSizesThrows) {
     empty_raw_value_messages.push_back(
         iggy::ffi::make_message(to_payload("payload"), std::move(empty_raw_value_headers)));
     ASSERT_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
-                                       partition_id_bytes(0), std::move(empty_raw_value_messages)),
+                                       partition_id_bytes(0), std::move(empty_raw_value_messages), error_info),
                  std::exception);
 
     rust::Vec<std::uint8_t> oversized_value_bytes;
@@ -691,7 +715,7 @@ TEST_F(LowLevelE2E_Message, SendMessageWithInvalidTypedHeaderSizesThrows) {
     oversized_value_messages.push_back(
         iggy::ffi::make_message(to_payload("payload"), std::move(oversized_value_headers)));
     ASSERT_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
-                                       partition_id_bytes(0), std::move(oversized_value_messages)),
+                                       partition_id_bytes(0), std::move(oversized_value_messages), error_info),
                  std::exception);
 
     rust::Vec<std::uint8_t> oversized_string_bytes;
@@ -706,22 +730,23 @@ TEST_F(LowLevelE2E_Message, SendMessageWithInvalidTypedHeaderSizesThrows) {
     oversized_string_messages.push_back(
         iggy::ffi::make_message(to_payload("payload"), std::move(oversized_string_headers)));
     ASSERT_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
-                                       partition_id_bytes(0), std::move(oversized_string_messages)),
+                                       partition_id_bytes(0), std::move(oversized_string_messages), error_info),
                  std::exception);
 }
 
 TEST_F(LowLevelE2E_Message, SendMessageAtUserHeadersSizeBoundary) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description",
                    "Throws when encoded user headers exceed 100_000 bytes and succeeds at exactly 100_000 bytes.");
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name);
+    client->create_stream(stream_name, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
     client->create_topic(make_numeric_identifier(stream.id), topic_name,
-                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"));
+                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"), error_info);
 
     constexpr std::uint32_t kMaxUserHeadersBytes     = 100'000u;
     constexpr std::uint32_t kFullHeaderEncodedBytes  = 267u;  // 10 bytes framing + 2-byte key + 255-byte value
@@ -759,7 +784,7 @@ TEST_F(LowLevelE2E_Message, SendMessageAtUserHeadersSizeBoundary) {
     oversized_messages.push_back(
         iggy::ffi::make_message(to_payload("oversized-user-headers"), std::move(oversized_headers)));
     ASSERT_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
-                                       partition_id_bytes(0), std::move(oversized_messages)),
+                                       partition_id_bytes(0), std::move(oversized_messages), error_info),
                  std::exception);
 
     rust::Vec<iggy::ffi::HeaderEntry> exact_headers;
@@ -791,10 +816,11 @@ TEST_F(LowLevelE2E_Message, SendMessageAtUserHeadersSizeBoundary) {
     rust::Vec<iggy::ffi::IggyMessageToSend> exact_messages;
     exact_messages.push_back(iggy::ffi::make_message(to_payload("exact-user-headers"), std::move(exact_headers)));
     ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0),
-                                          "partition_id", partition_id_bytes(0), std::move(exact_messages)));
+                                          "partition_id", partition_id_bytes(0), std::move(exact_messages),
+                                          error_info));
 
     auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                        make_numeric_identifier(1), "offset", 0, 10, false);
+                                        make_numeric_identifier(1), "offset", 0, 10, false, error_info);
 
     ASSERT_EQ(polled.count, 1u);
     ASSERT_EQ(polled.messages.size(), 1u);
@@ -805,21 +831,23 @@ TEST_F(LowLevelE2E_Message, SendMessageAtUserHeadersSizeBoundary) {
 }
 
 TEST_F(LowLevelE2E_Message, PollMessagesBeforeLoginThrows) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description", "Throws when polling messages before authentication.");
     iggy::ffi::Client *client = GetLoggedOutClient();
     ASSERT_NO_THROW(client->connect());
 
     ASSERT_THROW(client->poll_messages(make_numeric_identifier(1), make_numeric_identifier(0), 0, "consumer",
-                                       make_numeric_identifier(1), "offset", 0, 10, false),
+                                       make_numeric_identifier(1), "offset", 0, 10, false, error_info),
                  std::exception);
-    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy", error_info));
     ASSERT_NO_THROW(client->disconnect());
     ASSERT_THROW(client->poll_messages(make_numeric_identifier(1), make_numeric_identifier(0), 0, "consumer",
-                                       make_numeric_identifier(1), "offset", 0, 10, false),
+                                       make_numeric_identifier(1), "offset", 0, 10, false, error_info),
                  std::exception);
 }
 
 TEST_F(LowLevelE2E_Message, PollMessagesWithInvalidStreamIdThrows) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description", "Throws when polling messages with an invalid stream identifier.");
     iggy::ffi::Client *client = GetLoggedInClient();
 
@@ -828,64 +856,68 @@ TEST_F(LowLevelE2E_Message, PollMessagesWithInvalidStreamIdThrows) {
     invalid_id.length = 0;
 
     ASSERT_THROW(client->poll_messages(invalid_id, make_numeric_identifier(0), 0, "consumer",
-                                       make_numeric_identifier(1), "offset", 0, 10, false),
+                                       make_numeric_identifier(1), "offset", 0, 10, false, error_info),
                  std::exception);
 }
 
 TEST_F(LowLevelE2E_Message, PollMessagesFromNonExistentStreamThrows) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description", "Throws when polling messages from a non-existent stream.");
     iggy::ffi::Client *client = GetLoggedInClient();
 
     ASSERT_THROW(client->poll_messages(make_string_identifier("nonexistent-stream-poll"), make_numeric_identifier(0), 0,
-                                       "consumer", make_numeric_identifier(1), "offset", 0, 10, false),
+                                       "consumer", make_numeric_identifier(1), "offset", 0, 10, false, error_info),
                  std::exception);
 }
 
 TEST_F(LowLevelE2E_Message, PollMessagesWithInvalidConsumerKindThrows) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description", "Throws when polling messages with an invalid consumer kind.");
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name);
+    client->create_stream(stream_name, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
     client->create_topic(make_numeric_identifier(stream.id), topic_name,
-                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"));
+                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"), error_info);
 
     ASSERT_THROW(client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "invalid",
-                                       make_numeric_identifier(1), "offset", 0, 10, false),
+                                       make_numeric_identifier(1), "offset", 0, 10, false, error_info),
                  std::exception);
 }
 
 TEST_F(LowLevelE2E_Message, PollMessagesWithInvalidStrategyKindThrows) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description", "Throws when polling messages with an invalid polling strategy kind.");
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name);
+    client->create_stream(stream_name, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
     client->create_topic(make_numeric_identifier(stream.id), topic_name,
-                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"));
+                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"), error_info);
 
     ASSERT_THROW(client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                       make_numeric_identifier(1), "invalid", 0, 10, false),
+                                       make_numeric_identifier(1), "invalid", 0, 10, false, error_info),
                  std::exception);
 }
 
 TEST_F(LowLevelE2E_Message, PollMessagesCountLessThanAvailable) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description", "Returns only the requested count when fewer messages are requested than available.");
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name);
+    client->create_stream(stream_name, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
     client->create_topic(make_numeric_identifier(stream.id), topic_name,
-                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"));
+                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"), error_info);
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 10; i++) {
@@ -894,26 +926,27 @@ TEST_F(LowLevelE2E_Message, PollMessagesCountLessThanAvailable) {
     }
 
     client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
-                          partition_id_bytes(0), std::move(messages));
+                          partition_id_bytes(0), std::move(messages), error_info);
 
     auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                        make_numeric_identifier(1), "offset", 0, 5, false);
+                                        make_numeric_identifier(1), "offset", 0, 5, false, error_info);
 
     ASSERT_EQ(polled.count, 5u);
     ASSERT_EQ(polled.messages.size(), 5u);
 }
 
 TEST_F(LowLevelE2E_Message, PollMessagesWithLargeOffset) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description", "Returns zero messages when polling with an offset beyond available messages.");
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name);
+    client->create_stream(stream_name, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
     client->create_topic(make_numeric_identifier(stream.id), topic_name,
-                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"));
+                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"), error_info);
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 5; i++) {
@@ -922,26 +955,27 @@ TEST_F(LowLevelE2E_Message, PollMessagesWithLargeOffset) {
     }
 
     client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
-                          partition_id_bytes(0), std::move(messages));
+                          partition_id_bytes(0), std::move(messages), error_info);
 
     auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                        make_numeric_identifier(1), "offset", 999999, 100, false);
+                                        make_numeric_identifier(1), "offset", 999999, 100, false, error_info);
 
     ASSERT_EQ(polled.count, 0u);
     ASSERT_EQ(polled.messages.size(), 0u);
 }
 
 TEST_F(LowLevelE2E_Message, PollMessagesFirstStrategy) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description", "Verifies first polling strategy returns messages from the beginning.");
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name);
+    client->create_stream(stream_name, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
     client->create_topic(make_numeric_identifier(stream.id), topic_name,
-                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"));
+                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"), error_info);
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 10; i++) {
@@ -950,10 +984,10 @@ TEST_F(LowLevelE2E_Message, PollMessagesFirstStrategy) {
     }
 
     client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
-                          partition_id_bytes(0), std::move(messages));
+                          partition_id_bytes(0), std::move(messages), error_info);
 
     auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                        make_numeric_identifier(1), "first", 0, 3, false);
+                                        make_numeric_identifier(1), "first", 0, 3, false, error_info);
 
     ASSERT_EQ(polled.count, 3u);
     ASSERT_EQ(polled.messages.size(), 3u);
@@ -967,16 +1001,17 @@ TEST_F(LowLevelE2E_Message, PollMessagesFirstStrategy) {
 }
 
 TEST_F(LowLevelE2E_Message, PollMessagesLastStrategy) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description", "Verifies last polling strategy returns messages from the end.");
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name);
+    client->create_stream(stream_name, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
     client->create_topic(make_numeric_identifier(stream.id), topic_name,
-                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"));
+                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"), error_info);
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 10; i++) {
@@ -985,10 +1020,10 @@ TEST_F(LowLevelE2E_Message, PollMessagesLastStrategy) {
     }
 
     client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
-                          partition_id_bytes(0), std::move(messages));
+                          partition_id_bytes(0), std::move(messages), error_info);
 
     auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                        make_numeric_identifier(1), "last", 0, 3, false);
+                                        make_numeric_identifier(1), "last", 0, 3, false, error_info);
 
     ASSERT_EQ(polled.count, 3u);
     ASSERT_EQ(polled.messages.size(), 3u);
@@ -1002,17 +1037,18 @@ TEST_F(LowLevelE2E_Message, PollMessagesLastStrategy) {
 }
 
 TEST_F(LowLevelE2E_Message, PollMessagesNextStrategyNoAutoCommit) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description",
                    "Verifies next strategy without auto-commit returns the same messages on repeated calls.");
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name);
+    client->create_stream(stream_name, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
     client->create_topic(make_numeric_identifier(stream.id), topic_name,
-                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"));
+                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"), error_info);
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 5; i++) {
@@ -1021,14 +1057,14 @@ TEST_F(LowLevelE2E_Message, PollMessagesNextStrategyNoAutoCommit) {
     }
 
     client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
-                          partition_id_bytes(0), std::move(messages));
+                          partition_id_bytes(0), std::move(messages), error_info);
 
     auto polled1 = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                         make_numeric_identifier(1), "next", 0, 100, false);
+                                         make_numeric_identifier(1), "next", 0, 100, false, error_info);
     ASSERT_EQ(polled1.count, 5u);
 
     auto polled2 = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                         make_numeric_identifier(1), "next", 0, 100, false);
+                                         make_numeric_identifier(1), "next", 0, 100, false, error_info);
     ASSERT_EQ(polled2.count, 5u);
     for (std::uint32_t i = 0; i < 5; i++) {
         EXPECT_EQ(polled1.messages[i].offset, static_cast<std::uint64_t>(i));
@@ -1045,16 +1081,17 @@ TEST_F(LowLevelE2E_Message, PollMessagesNextStrategyNoAutoCommit) {
 }
 
 TEST_F(LowLevelE2E_Message, PollMessagesNextStrategyAutoCommit) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description", "Verifies next strategy with auto-commit advances the offset on subsequent polls.");
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name);
+    client->create_stream(stream_name, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
     client->create_topic(make_numeric_identifier(stream.id), topic_name,
-                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"));
+                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"), error_info);
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 10; i++) {
@@ -1063,16 +1100,16 @@ TEST_F(LowLevelE2E_Message, PollMessagesNextStrategyAutoCommit) {
     }
 
     client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
-                          partition_id_bytes(0), std::move(messages));
+                          partition_id_bytes(0), std::move(messages), error_info);
 
     auto polled1 = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                         make_numeric_identifier(1), "next", 0, 5, true);
+                                         make_numeric_identifier(1), "next", 0, 5, true, error_info);
     ASSERT_EQ(polled1.count, 5u);
     EXPECT_EQ(polled1.messages[0].offset, 0u);
     EXPECT_EQ(polled1.messages[4].offset, 4u);
 
     auto polled2 = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                         make_numeric_identifier(1), "next", 0, 5, true);
+                                         make_numeric_identifier(1), "next", 0, 5, true, error_info);
     ASSERT_EQ(polled2.count, 5u);
     EXPECT_EQ(polled2.messages[0].offset, 5u);
     EXPECT_EQ(polled2.messages[4].offset, 9u);
@@ -1088,21 +1125,22 @@ TEST_F(LowLevelE2E_Message, PollMessagesNextStrategyAutoCommit) {
     }
 
     auto polled3 = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                         make_numeric_identifier(1), "next", 0, 5, true);
+                                         make_numeric_identifier(1), "next", 0, 5, true, error_info);
     ASSERT_EQ(polled3.count, 0u);
 }
 
 TEST_F(LowLevelE2E_Message, PollMessagesConsumerIdIndependence) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description", "Verifies different consumer IDs maintain independent offsets.");
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name);
+    client->create_stream(stream_name, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
     client->create_topic(make_numeric_identifier(stream.id), topic_name,
-                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"));
+                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"), error_info);
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 5; i++) {
@@ -1111,32 +1149,34 @@ TEST_F(LowLevelE2E_Message, PollMessagesConsumerIdIndependence) {
     }
 
     client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
-                          partition_id_bytes(0), std::move(messages));
+                          partition_id_bytes(0), std::move(messages), error_info);
 
     auto polled_c1 = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0,
-                                           "consumer", make_numeric_identifier(1), "next", 0, 3, true);
+                                           "consumer", make_numeric_identifier(1), "next", 0, 3, true, error_info);
     ASSERT_EQ(polled_c1.count, 3u);
 
     auto polled_c2 = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0,
-                                           "consumer", make_numeric_identifier(2), "next", 0, 5, true);
+                                           "consumer", make_numeric_identifier(2), "next", 0, 5, true, error_info);
     ASSERT_EQ(polled_c2.count, 5u);
 
-    auto polled_c1_again = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0,
-                                                 "consumer", make_numeric_identifier(1), "next", 0, 5, true);
+    auto polled_c1_again =
+        client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
+                              make_numeric_identifier(1), "next", 0, 5, true, error_info);
     ASSERT_EQ(polled_c1_again.count, 2u);
 }
 
 TEST_F(LowLevelE2E_Message, PollMessagesMultipleSendsThenPollOrder) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description", "Verifies message ordering is preserved across multiple send batches.");
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name);
+    client->create_stream(stream_name, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
     client->create_topic(make_numeric_identifier(stream.id), topic_name,
-                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"));
+                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"), error_info);
 
     rust::Vec<iggy::ffi::IggyMessageToSend> batch1;
     for (std::uint32_t i = 0; i < 5; i++) {
@@ -1145,7 +1185,7 @@ TEST_F(LowLevelE2E_Message, PollMessagesMultipleSendsThenPollOrder) {
         batch1.push_back(std::move(msg));
     }
     client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
-                          partition_id_bytes(0), std::move(batch1));
+                          partition_id_bytes(0), std::move(batch1), error_info);
 
     rust::Vec<iggy::ffi::IggyMessageToSend> batch2;
     for (std::uint32_t i = 0; i < 5; i++) {
@@ -1154,10 +1194,10 @@ TEST_F(LowLevelE2E_Message, PollMessagesMultipleSendsThenPollOrder) {
         batch2.push_back(std::move(msg));
     }
     client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
-                          partition_id_bytes(0), std::move(batch2));
+                          partition_id_bytes(0), std::move(batch2), error_info);
 
     auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                        make_numeric_identifier(1), "offset", 0, 100, false);
+                                        make_numeric_identifier(1), "offset", 0, 100, false, error_info);
 
     ASSERT_EQ(polled.count, 10u);
     for (std::uint32_t i = 0; i < 10; i++) {
@@ -1176,16 +1216,17 @@ TEST_F(LowLevelE2E_Message, PollMessagesMultipleSendsThenPollOrder) {
 }
 
 TEST_F(LowLevelE2E_Message, PollMessagesMultipleCustomIds) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description", "Verifies multiple messages with distinct custom IDs are all preserved.");
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name);
+    client->create_stream(stream_name, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
     client->create_topic(make_numeric_identifier(stream.id), topic_name,
-                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"));
+                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"), error_info);
 
     const std::uint64_t id_values[] = {100, 200, 300, 400, 500};
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
@@ -1197,10 +1238,10 @@ TEST_F(LowLevelE2E_Message, PollMessagesMultipleCustomIds) {
     }
 
     client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
-                          partition_id_bytes(0), std::move(messages));
+                          partition_id_bytes(0), std::move(messages), error_info);
 
     auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                        make_numeric_identifier(1), "offset", 0, 100, false);
+                                        make_numeric_identifier(1), "offset", 0, 100, false, error_info);
 
     ASSERT_EQ(polled.count, 5u);
     for (std::uint32_t i = 0; i < 5; i++) {
@@ -1210,79 +1251,83 @@ TEST_F(LowLevelE2E_Message, PollMessagesMultipleCustomIds) {
 }
 
 TEST_F(LowLevelE2E_Message, PollMessagesAfterStreamDeletedThrows) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description", "Throws when polling messages after the stream has been deleted.");
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name);
+    client->create_stream(stream_name, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
     client->create_topic(make_numeric_identifier(stream.id), topic_name,
-                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"));
+                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"), error_info);
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     auto msg = iggy::ffi::make_message(to_payload("test"), rust::Vec<iggy::ffi::HeaderEntry>());
     messages.push_back(std::move(msg));
 
     client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
-                          partition_id_bytes(0), std::move(messages));
+                          partition_id_bytes(0), std::move(messages), error_info);
 
     std::uint32_t saved_stream_id = stream.id;
-    client->delete_stream(make_numeric_identifier(saved_stream_id));
+    client->delete_stream(make_numeric_identifier(saved_stream_id), error_info);
     ForgetTrackedStream(saved_stream_id);
 
     ASSERT_THROW(client->poll_messages(make_numeric_identifier(saved_stream_id), make_numeric_identifier(0), 0,
-                                       "consumer", make_numeric_identifier(1), "offset", 0, 10, false),
+                                       "consumer", make_numeric_identifier(1), "offset", 0, 10, false, error_info),
                  std::exception);
 }
 
 TEST_F(LowLevelE2E_Message, PollMessagesWithInvalidPartitionIdThrows) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description", "Throws when polling with a non-existent partition ID.");
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name);
+    client->create_stream(stream_name, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
     client->create_topic(make_numeric_identifier(stream.id), topic_name,
-                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"));
+                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"), error_info);
 
     ASSERT_THROW(client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 9999, "consumer",
-                                       make_numeric_identifier(1), "offset", 0, 10, false),
+                                       make_numeric_identifier(1), "offset", 0, 10, false, error_info),
                  std::exception);
 }
 
 TEST_F(LowLevelE2E_Message, PollMessagesWithCountZeroThrows) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description", "Throws when polling with count=0.");
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name);
+    client->create_stream(stream_name, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
     client->create_topic(make_numeric_identifier(stream.id), topic_name,
-                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"));
+                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"), error_info);
 
     ASSERT_THROW(client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                       make_numeric_identifier(1), "offset", 0, 0, false),
+                                       make_numeric_identifier(1), "offset", 0, 0, false, error_info),
                  std::exception);
 }
 
 TEST_F(LowLevelE2E_Message, PollMessagesWithoutSpecifyingPartition) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description",
                    "Verifies polling with partition_id=u32::MAX defaults to partition 0 and returns messages.");
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name);
+    client->create_stream(stream_name, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
     client->create_topic(make_numeric_identifier(stream.id), topic_name,
-                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"));
+                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"), error_info);
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 5; i++) {
@@ -1290,10 +1335,10 @@ TEST_F(LowLevelE2E_Message, PollMessagesWithoutSpecifyingPartition) {
         messages.push_back(std::move(msg));
     }
     client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
-                          partition_id_bytes(0), std::move(messages));
+                          partition_id_bytes(0), std::move(messages), error_info);
 
     auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), UINT32_MAX,
-                                        "consumer", make_numeric_identifier(1), "offset", 0, 100, false);
+                                        "consumer", make_numeric_identifier(1), "offset", 0, 100, false, error_info);
 
     // The Rust side maps UINT32_MAX to None, so the server picks a partition. With a single
     // partition topic that should always be partition 0.
@@ -1308,17 +1353,18 @@ TEST_F(LowLevelE2E_Message, PollMessagesWithoutSpecifyingPartition) {
 }
 
 TEST_F(LowLevelE2E_Message, PollMessagesTimestampStrategy) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description",
                    "Verifies timestamp polling strategy returns messages with timestamp >= the specified value.");
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name);
+    client->create_stream(stream_name, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
     client->create_topic(make_numeric_identifier(stream.id), topic_name,
-                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"));
+                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"), error_info);
 
     rust::Vec<iggy::ffi::IggyMessageToSend> batch1;
     for (std::uint32_t i = 0; i < 5; i++) {
@@ -1327,7 +1373,7 @@ TEST_F(LowLevelE2E_Message, PollMessagesTimestampStrategy) {
         batch1.push_back(std::move(msg));
     }
     client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
-                          partition_id_bytes(0), std::move(batch1));
+                          partition_id_bytes(0), std::move(batch1), error_info);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
@@ -1338,10 +1384,10 @@ TEST_F(LowLevelE2E_Message, PollMessagesTimestampStrategy) {
         batch2.push_back(std::move(msg));
     }
     client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
-                          partition_id_bytes(0), std::move(batch2));
+                          partition_id_bytes(0), std::move(batch2), error_info);
 
     auto all = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                     make_numeric_identifier(1), "offset", 0, 100, false);
+                                     make_numeric_identifier(1), "offset", 0, 100, false, error_info);
     ASSERT_EQ(all.count, 10u);
 
     // IggyTimestamp::now() is microsecond-resolution and we slept 100ms between batches; a gap
@@ -1354,8 +1400,9 @@ TEST_F(LowLevelE2E_Message, PollMessagesTimestampStrategy) {
         << "Timestamp gap collapsed (" << (batch2_timestamp - batch1_timestamp)
         << "us) — test no longer exercises timestamp filtering";
 
-    auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                        make_numeric_identifier(2), "timestamp", batch2_timestamp, 100, false);
+    auto polled =
+        client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
+                              make_numeric_identifier(2), "timestamp", batch2_timestamp, 100, false, error_info);
 
     ASSERT_GE(polled.count, 5u);
     // The server contract is `timestamp >= polling_strategy_value`. If a batch1 message lands on
@@ -1371,17 +1418,18 @@ TEST_F(LowLevelE2E_Message, PollMessagesTimestampStrategy) {
 }
 
 TEST_F(LowLevelE2E_Message, PollMessagesMonotonicOffsets) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description",
                    "Verifies offsets are monotonically increasing and continuous across multiple polls.");
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name);
+    client->create_stream(stream_name, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
     client->create_topic(make_numeric_identifier(stream.id), topic_name,
-                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"));
+                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"), error_info);
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 20; i++) {
@@ -1390,13 +1438,14 @@ TEST_F(LowLevelE2E_Message, PollMessagesMonotonicOffsets) {
         messages.push_back(std::move(msg));
     }
     client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
-                          partition_id_bytes(0), std::move(messages));
+                          partition_id_bytes(0), std::move(messages), error_info);
 
     std::uint64_t expected_offset = 0;
     for (int chunk = 0; chunk < 4; chunk++) {
+        iggy::ffi::ErrorInfo error_info{};
         auto polled =
             client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                  make_numeric_identifier(1), "offset", expected_offset, 5, false);
+                                  make_numeric_identifier(1), "offset", expected_offset, 5, false, error_info);
 
         ASSERT_EQ(polled.count, 5u) << "Chunk " << chunk;
         ASSERT_EQ(polled.messages.size(), 5u) << "Chunk " << chunk;
@@ -1411,16 +1460,17 @@ TEST_F(LowLevelE2E_Message, PollMessagesMonotonicOffsets) {
 }
 
 TEST_F(LowLevelE2E_Message, SendMessagesLargeBatch) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description", "Verifies sending a large batch of 1000 messages succeeds and all are retrievable.");
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name);
+    client->create_stream(stream_name, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
     client->create_topic(make_numeric_identifier(stream.id), topic_name,
-                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"));
+                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"), error_info);
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 1000; i++) {
@@ -1430,10 +1480,10 @@ TEST_F(LowLevelE2E_Message, SendMessagesLargeBatch) {
     }
 
     ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0),
-                                          "partition_id", partition_id_bytes(0), std::move(messages)));
+                                          "partition_id", partition_id_bytes(0), std::move(messages), error_info));
 
     auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                        make_numeric_identifier(1), "offset", 0, 1000, false);
+                                        make_numeric_identifier(1), "offset", 0, 1000, false, error_info);
 
     ASSERT_EQ(polled.count, 1000u);
     ASSERT_EQ(polled.messages.size(), 1000u);
@@ -1442,6 +1492,7 @@ TEST_F(LowLevelE2E_Message, SendMessagesLargeBatch) {
 }
 
 TEST_F(LowLevelE2E_Message, SendMessagesWithInvalidTopicIdThrows) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description", "Throws when sending messages with an invalid topic identifier.");
     iggy::ffi::Client *client = GetLoggedInClient();
 
@@ -1454,11 +1505,12 @@ TEST_F(LowLevelE2E_Message, SendMessagesWithInvalidTopicIdThrows) {
     invalid_id.length = 0;
 
     ASSERT_THROW(client->send_messages(make_numeric_identifier(1), invalid_id, "partition_id", partition_id_bytes(0),
-                                       std::move(messages)),
+                                       std::move(messages), error_info),
                  std::exception);
 }
 
 TEST_F(LowLevelE2E_Message, PollMessagesWithInvalidTopicIdThrows) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description", "Throws when polling messages with an invalid topic identifier.");
     iggy::ffi::Client *client = GetLoggedInClient();
 
@@ -1467,51 +1519,53 @@ TEST_F(LowLevelE2E_Message, PollMessagesWithInvalidTopicIdThrows) {
     invalid_id.length = 0;
 
     ASSERT_THROW(client->poll_messages(make_numeric_identifier(1), invalid_id, 0, "consumer",
-                                       make_numeric_identifier(1), "offset", 0, 10, false),
+                                       make_numeric_identifier(1), "offset", 0, 10, false, error_info),
                  std::exception);
 }
 
 TEST_F(LowLevelE2E_Message, PollMessagesWithInvalidConsumerIdThrows) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description", "Throws when polling messages with an invalid consumer identifier.");
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name);
+    client->create_stream(stream_name, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
     client->create_topic(make_numeric_identifier(stream.id), topic_name,
-                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"));
+                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"), error_info);
 
     iggy::ffi::Identifier invalid_id;
     invalid_id.kind   = "invalid";
     invalid_id.length = 0;
 
     ASSERT_THROW(client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                       invalid_id, "offset", 0, 10, false),
+                                       invalid_id, "offset", 0, 10, false, error_info),
                  std::exception);
 }
 
 TEST_F(LowLevelE2E_Message, ConsumerGroupCreateJoinAndPollMessages) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description",
                    "Creates a consumer group, joins it, sends messages, and polls them using consumer_group kind.");
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name);
+    client->create_stream(stream_name, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
     client->create_topic(make_numeric_identifier(stream.id), topic_name,
-                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"));
+                         make_topic_create_options(1, "none", "never_expire", 0, "server_default"), error_info);
 
     const std::string group_name = GetRandomName();
-    auto group =
-        client->create_consumer_group(make_numeric_identifier(stream.id), make_numeric_identifier(0), group_name);
+    auto group = client->create_consumer_group(make_numeric_identifier(stream.id), make_numeric_identifier(0),
+                                               group_name, error_info);
     ASSERT_EQ(group.members_count, 0u);
 
     ASSERT_NO_THROW(client->join_consumer_group(make_numeric_identifier(stream.id), make_numeric_identifier(0),
-                                                make_numeric_identifier(group.id)));
+                                                make_numeric_identifier(group.id), error_info));
     ASSERT_TRUE(wait_for_consumer_group_assignment(client, make_numeric_identifier(stream.id),
                                                    make_numeric_identifier(0), make_numeric_identifier(group.id), 1));
 
@@ -1526,10 +1580,11 @@ TEST_F(LowLevelE2E_Message, ConsumerGroupCreateJoinAndPollMessages) {
         messages.push_back(std::move(msg));
     }
     client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
-                          partition_id_bytes(0), std::move(messages));
+                          partition_id_bytes(0), std::move(messages), error_info);
 
-    auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0,
-                                        "consumer_group", make_numeric_identifier(group.id), "offset", 0, 100, false);
+    auto polled =
+        client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer_group",
+                              make_numeric_identifier(group.id), "offset", 0, 100, false, error_info);
 
     ASSERT_EQ(polled.count, 10u);
     ASSERT_EQ(polled.messages.size(), 10u);
@@ -1540,7 +1595,7 @@ TEST_F(LowLevelE2E_Message, ConsumerGroupCreateJoinAndPollMessages) {
     }
 
     ASSERT_NO_THROW(client->leave_consumer_group(make_numeric_identifier(stream.id), make_numeric_identifier(0),
-                                                 make_numeric_identifier(group.id)));
+                                                 make_numeric_identifier(group.id), error_info));
 
     auto group_after_leave = client->get_consumer_group(make_numeric_identifier(stream.id), make_numeric_identifier(0),
                                                         make_numeric_identifier(group.id));

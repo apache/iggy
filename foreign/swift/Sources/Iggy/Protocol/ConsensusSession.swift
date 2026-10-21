@@ -20,15 +20,14 @@
 /// Each logical login owns one session: an ephemeral random client
 /// identifier and a bind secret. After login the server registers the client
 /// through consensus and returns a session number, the fence every later
-/// request echoes. Replicated requests carry a monotonically increasing
-/// request id the server deduplicates on.
+/// request echoes. Every bound request carries a unique id, shared by reads
+/// and mutations. The server deduplicates replicated requests on it.
 ///
 /// The identity, the secret, and the request counter outlive a transport
 /// reconnect, so a registration retry recovers the session the server already
 /// committed. Only an explicit logout starts a new one, through ``reset()``.
 ///
-/// Not thread-safe: the connection owns one and serializes access through
-/// the lockstep exchange.
+/// Not thread-safe: its owner must serialize access to the counter.
 struct ConsensusSession: Sendable {
     /// Register carries request id 0. Application requests start at 1.
     static let registerRequestID: UInt64 = 0
@@ -63,7 +62,7 @@ struct ConsensusSession: Sendable {
         self.session = session
     }
 
-    /// The next replicated request id, advancing the watermark: 1, 2, 3, ...
+    /// The next request id, advancing the watermark: 1, 2, 3, ...
     mutating func nextRequestID() throws -> UInt64 {
         guard isBound else {
             throw IggyError(.unauthenticated, context: "request id taken before the session is bound")
@@ -76,14 +75,15 @@ struct ConsensusSession: Sendable {
         return id
     }
 
-    /// The watermark without advancing it. Non-replicated requests use it
-    /// because the server never consults the client table for them.
+    /// The watermark without advancing it. Sessionless reads use it.
     var currentRequestID: UInt64 { requestCounter }
 
     /// Ends the logical session and starts a new one under a fresh client
     /// identifier and bind secret. An explicit logout retires the server-side
     /// session, so the next Register must not be mistaken for a retry of it.
     mutating func reset() {
+        let next = requestCounter
         self = ConsensusSession()
+        requestCounter = next
     }
 }

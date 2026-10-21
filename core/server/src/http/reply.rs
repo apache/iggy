@@ -33,6 +33,7 @@ use iggy_common::{
     ConsumerGroupDetails, IggyError, StreamDetails, TopicDetails, UserInfoDetails,
     eviction_reason_to_error,
 };
+use metadata::MetadataSubmitError;
 use server_common::{MESSAGE_ALIGN, Message, iobuf::Frozen};
 use tracing::warn;
 
@@ -229,6 +230,9 @@ pub(in crate::http) const fn login_error_to_iggy(error: &LoginRegisterError) -> 
         LoginRegisterError::InvalidCredentials => IggyError::InvalidCredentials,
         LoginRegisterError::InvalidToken => IggyError::InvalidPersonalAccessToken,
         LoginRegisterError::UserInactive => IggyError::UserInactive,
+        LoginRegisterError::Transient(MetadataSubmitError::NotCaughtUp) => {
+            IggyError::TransientNotAccepted
+        }
         _ => IggyError::Unauthenticated,
     }
 }
@@ -250,6 +254,16 @@ mod tests {
     use crate::responses::NonReplicatedResponse;
 
     use crate::http::wire::build_request_message;
+
+    #[test]
+    fn given_uninitialized_root_when_mapping_login_failure_should_return_a_retryable_error() {
+        assert!(matches!(
+            login_error_to_iggy(&LoginRegisterError::Transient(
+                MetadataSubmitError::NotCaughtUp
+            )),
+            IggyError::TransientNotAccepted
+        ));
+    }
 
     // The dispatch-time deny frame: an empty body plus `ReplyHeader.status` set
     // to the rule's error code, the request-level channel the SDK peeks before

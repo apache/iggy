@@ -64,9 +64,8 @@ public class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
 
         log.debug("Getting consumer group - Stream: {}, Topic: {}, Group: {}", streamId, topicId, groupId);
 
-        return connection()
-                .send(CommandCode.ConsumerGroup.GET.getValue(), payload)
-                .thenApply(response -> {
+        return AsyncTcpConnection.mapResponse(
+                connection().send(CommandCode.ConsumerGroup.GET.getValue(), payload), response -> {
                     try {
                         if (response.isReadable()) {
                             return Optional.of(BytesDeserializer.readConsumerGroupDetails(response));
@@ -86,9 +85,8 @@ public class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
 
         log.debug("Getting consumer groups - Stream: {}, Topic: {}", streamId, topicId);
 
-        return connection()
-                .send(CommandCode.ConsumerGroup.GET_ALL.getValue(), payload)
-                .thenApply(response -> {
+        return AsyncTcpConnection.mapResponse(
+                connection().send(CommandCode.ConsumerGroup.GET_ALL.getValue(), payload), response -> {
                     try {
                         List<ConsumerGroup> groups = new ArrayList<>();
                         while (response.isReadable()) {
@@ -110,9 +108,8 @@ public class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
 
         log.debug("Creating consumer group - Stream: {}, Topic: {}, Name: {}", streamId, topicId, name);
 
-        return connection()
-                .send(CommandCode.ConsumerGroup.CREATE.getValue(), payload)
-                .thenApply(response -> {
+        return AsyncTcpConnection.mapResponse(
+                connection().send(CommandCode.ConsumerGroup.CREATE.getValue(), payload), response -> {
                     try {
                         return BytesDeserializer.readConsumerGroupDetails(response);
                     } finally {
@@ -129,11 +126,7 @@ public class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
 
         log.debug("Deleting consumer group - Stream: {}, Topic: {}, Group: {}", streamId, topicId, groupId);
 
-        return connection()
-                .send(CommandCode.ConsumerGroup.DELETE.getValue(), payload)
-                .thenAccept(response -> {
-                    response.release();
-                });
+        return connection().sendAndRelease(CommandCode.ConsumerGroup.DELETE, payload);
     }
 
     @Override
@@ -151,12 +144,7 @@ public class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
 
         log.debug("Joining consumer group - Stream: {}, Topic: {}, Group: {}", streamId, topicId, groupId);
 
-        return connection()
-                .send(CommandCode.ConsumerGroup.JOIN.getValue(), payload)
-                .thenAccept(response -> {
-                    log.debug("Successfully joined consumer group");
-                    response.release();
-                });
+        return connection().sendAndRelease(CommandCode.ConsumerGroup.JOIN, payload);
     }
 
     @Override
@@ -174,17 +162,17 @@ public class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
 
         log.debug("Leaving consumer group - Stream: {}, Topic: {}, Group: {}", streamId, topicId, groupId);
 
-        return connection()
-                .send(CommandCode.ConsumerGroup.LEAVE.getValue(), payload)
-                .thenAccept(response -> {
-                    log.debug("Successfully left consumer group");
-                    response.release();
-                });
+        return connection().sendAndRelease(CommandCode.ConsumerGroup.LEAVE, payload);
     }
 
     @Override
     public CompletableFuture<Optional<ConsumerGroupAssignment>> syncConsumerGroup(
             StreamId streamId, TopicId topicId, ConsumerId groupId) {
+        return syncConsumerGroup(streamId, topicId, groupId, 0);
+    }
+
+    CompletableFuture<Optional<ConsumerGroupAssignment>> syncConsumerGroup(
+            StreamId streamId, TopicId topicId, ConsumerId groupId, long deadline) {
         var payload = Unpooled.buffer();
         payload.writeBytes(BytesSerializer.toBytes(streamId));
         payload.writeBytes(BytesSerializer.toBytes(topicId));
@@ -195,8 +183,15 @@ public class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
         // An empty body means "not a member", which exchangeForOptional maps
         // to an empty Optional; a member owning zero partitions still gets a
         // non-empty body with a zero partition count.
-        return connection()
-                .exchangeForOptional(
-                        CommandCode.ConsumerGroup.SYNC, payload, BytesDeserializer::readConsumerGroupAssignment);
+        return AsyncTcpConnection.mapResponse(
+                connection().send(CommandCode.ConsumerGroup.SYNC.getValue(), payload, deadline), response -> {
+                    try {
+                        return response.isReadable()
+                                ? Optional.of(BytesDeserializer.readConsumerGroupAssignment(response))
+                                : Optional.empty();
+                    } finally {
+                        response.release();
+                    }
+                });
     }
 }

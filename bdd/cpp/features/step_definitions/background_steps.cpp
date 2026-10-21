@@ -58,10 +58,11 @@ GIVEN("^I have a running Iggy server$") {
 }
 
 GIVEN("^I am authenticated as the root user$") {
+    iggy::ffi::ErrorInfo error_info{};
     cucumber::ScenarioScope<bdd::GlobalContext> context;
     ASSERT_NE(context->client, nullptr);
 
     const std::string username = required_env("IGGY_ROOT_USERNAME");
     const std::string password = required_env("IGGY_ROOT_PASSWORD");
-    context->client->login_user(username, password);
+    context->client->login_user(username, password, error_info);
 }

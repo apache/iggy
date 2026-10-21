@@ -45,13 +45,12 @@ internal static class CommandCodes
     internal const int LOGIN_REGISTER_WITH_PAT_CODE = 45;
     internal const int POLL_MESSAGES_CODE = 100;
     internal const int SEND_MESSAGES_CODE = 101;
-    internal const int GET_POLL_ROUTING_CODE = 103;
-    internal const int POLL_MESSAGES_ON_PRIMARY_CODE = 104;
+    // 103 and 104 are retired and must never be reused.
     internal const int GET_PARTITION_ROUTE_CODE = 105;
     internal const int GET_CONSUMER_OFFSET_CODE = 120;
     internal const int STORE_CONSUMER_OFFSET_CODE = 121;
     internal const int DELETE_CONSUMER_OFFSET_CODE = 122;
-    internal const int GET_CONSUMER_OFFSET_ROUTING_CODE = 123;
+    // 123 is retired and must never be reused.
     internal const int GET_STREAM_CODE = 200;
     internal const int GET_STREAMS_CODE = 201;
     internal const int CREATE_STREAM_CODE = 202;

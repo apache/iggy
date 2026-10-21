@@ -111,10 +111,6 @@ the pod is already scheduled.
   {{- if and $cluster.requireHostNetwork (not .Values.server.hostNetwork) }}
     {{- fail "server.cluster.enabled is true but server.hostNetwork is false. The replica listener binds the roster ip verbatim, which is not an address a pod owns on the cluster network, so the pod dies at boot with CannotBindToSocket. Set server.hostNetwork to true, or server.cluster.requireHostNetwork to false if the roster ip really is one this pod owns." }}
   {{- end }}
-  {{- $root := .Values.server.users.root }}
-  {{- if and (not $root.createSecret) (not $root.existingSecret.name) }}
-    {{- fail "server.users.root has neither createSecret nor existingSecret.name, so the container receives no IGGY_ROOT_USERNAME or IGGY_ROOT_PASSWORD. A first cluster boot refuses to start without both, because every node creates root locally and the credentials have to come out identical on all of them." }}
-  {{- end }}
   {{- $count := len $cluster.nodes }}
   {{- $seen := dict }}
   {{- range $cluster.nodes }}
@@ -251,6 +247,18 @@ anything that names the cause.
 */}}
 {{- define "iggy.validateSecrets" -}}
   {{- $server := .Values.server }}
+  {{- $root := $server.users.root }}
+  {{- if and (not $root.createSecret) (not $root.existingSecret.name) (not (has "--with-default-root-credentials" $server.extraArgs)) }}
+    {{- $rootEnv := list }}
+    {{- range $server.env }}
+      {{- if has .name (list "IGGY_ROOT_USERNAME" "IGGY_ROOT_PASSWORD") }}
+        {{- $rootEnv = append $rootEnv .name }}
+      {{- end }}
+    {{- end }}
+    {{- if lt (len (uniq $rootEnv)) 2 }}
+      {{- fail "server.users.root has neither createSecret nor existingSecret.name, so the container receives no IGGY_ROOT_USERNAME or IGGY_ROOT_PASSWORD. The chart requires both for initial root creation. Point existingSecret.name at a Secret holding them, set createSecret with a username and password, or for a throwaway development install add --with-default-root-credentials to server.extraArgs." }}
+    {{- end }}
+  {{- end }}
   {{- if $server.encryption.enabled }}
     {{- if and (not $server.encryption.key) (not $server.encryption.existingSecret.name) }}
       {{- fail "server.encryption.enabled is true but no key was given. Set server.encryption.key to a base64-encoded 32-byte key, or point server.encryption.existingSecret.name at a Secret holding one." }}
