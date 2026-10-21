@@ -75,6 +75,12 @@ func (c *IggyTcpClient) acquireSignIn(ctx context.Context) error {
 func (c *IggyTcpClient) register(ctx context.Context, code command.Code, credentials Credentials) (identity *iggcon.IdentityInfo, err error) {
 	// Even an invalid or cancelled explicit attempt leaves the previous owner.
 	c.mtx.Lock()
+	select {
+	case <-c.closed:
+		c.mtx.Unlock()
+		return nil, ierror.ErrClientShutdown
+	default:
+	}
 	c.endRecoveryLocked()
 	c.endSignInEpochLocked(nil)
 	epoch := c.epoch.Load()
@@ -175,6 +181,11 @@ func (c *IggyTcpClient) register(ctx context.Context, code command.Code, credent
 	}
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
+	select {
+	case <-c.closed:
+		return nil, ierror.ErrClientShutdown
+	default:
+	}
 	if err = epoch.err(); err != nil {
 		return nil, err
 	}

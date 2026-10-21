@@ -103,6 +103,45 @@ func TestConnectBoundsSilentSignInWithoutCallerDeadline(t *testing.T) {
 	})
 }
 
+func TestConnectDoesNotSpendSignInBudgetWaitingForDial(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		client := newDialingClient(t, "127.0.0.1:1")
+		for range cap(client.links.permits) {
+			client.links.permits <- struct{}{}
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := make(chan error, 1)
+		go func() { done <- client.Connect(ctx) }()
+		time.Sleep(responseReadTimeout + time.Second)
+		synctest.Wait()
+		select {
+		case err := <-done:
+			t.Fatalf("Connect consumed the sign-in budget before dialing: %v", err)
+		default:
+		}
+		cancel()
+		require.ErrorIs(t, <-done, context.Canceled)
+	})
+}
+
+func TestExplicitSignInCannotReplaceEpochAfterCloseStarts(t *testing.T) {
+	serverConnection, connection := net.Pipe()
+	defer func() { _ = serverConnection.Close() }()
+	client := newTestClient(t, connection)
+	server := serve(serverConnection, func(_ int, read request) []byte {
+		return registerReplyFrame(signedInUserID, managedLinkSession)
+	})
+	epoch := client.epoch.Load()
+	client.closeOnce.Do(func() { close(client.closed) })
+	_, err := client.LoginUser(context.Background(), "user", "password")
+	require.ErrorIs(t, err, ierror.ErrClientShutdown)
+	require.Same(t, epoch, client.epoch.Load(), "a new epoch would cancel Close's pending detach")
+	require.Empty(t, server.recorded())
+	require.NoError(t, client.Close())
+	require.False(t, linkReady(client.links.bootstrap))
+}
+
 // testListener is a VSR server on a loopback port. The handler is called with
 // the zero-based index of the accepted connection and of the frame within it.
 type testListener struct {

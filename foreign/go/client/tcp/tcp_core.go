@@ -429,8 +429,11 @@ func (c *IggyTcpClient) Connect(ctx context.Context) error {
 		return ierror.ErrInvalidConfiguration
 	}
 	epoch := c.callEpoch(ctx)
-	ctx, endSignIn := signInContext(ctx, epoch)
-	defer endSignIn()
+	ctx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(epoch.ctx, cancel)
+	defer cancel()
+	defer stop()
+	ctx = context.WithValue(ctx, operationScope{}, epoch)
 	c.connectMu.Lock()
 	if attempt := c.connectionAttempt; attempt != nil {
 		c.connectMu.Unlock()
@@ -452,11 +455,11 @@ func (c *IggyTcpClient) Connect(ctx context.Context) error {
 		if lifetime == nil {
 			err = ierror.ErrNotConnected
 		} else {
-			sessionCtx, cancel := context.WithCancel(ctx)
-			stop := context.AfterFunc(lifetime, cancel)
+			sessionCtx, endSignIn := signInContext(ctx, epoch)
+			stop := context.AfterFunc(lifetime, endSignIn)
 			err = c.establishSession(sessionCtx, link)
 			stop()
-			cancel()
+			endSignIn()
 		}
 	}
 	if ended := epoch.err(); ended != nil {
