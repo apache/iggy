@@ -70,6 +70,7 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BiFunction;
 import java.util.function.Function;
 import java.util.function.Supplier;
 
@@ -283,9 +284,17 @@ class AsyncIggyTcpClientSessionRulesTest {
         private final boolean balanced;
         private final CompletableFuture<Void> decoded = new CompletableFuture<>();
         private final CompletableFuture<Void> resume = new CompletableFuture<>();
+        private final CompletableFuture<Void> published = new CompletableFuture<>();
 
         private HeldRoutingMap(boolean balanced) {
             this.balanced = balanced;
+        }
+
+        @Override
+        public V compute(K key, BiFunction<? super K, ? super V, ? extends V> remappingFunction) {
+            V value = super.compute(key, remappingFunction);
+            published.complete(null);
+            return value;
         }
 
         @Override
@@ -306,6 +315,30 @@ class AsyncIggyTcpClientSessionRulesTest {
                 resume.join();
             }
             return value;
+        }
+    }
+
+    @Test
+    void shouldPublishAnAssignmentWithoutTakingTheConnectionSessionMonitor() throws Exception {
+        try (MultiRequestNode fixture = new MultiRequestNode()) {
+            HeldGroupSync sync = new HeldGroupSync(fixture::connection);
+            var syncField = MessagesTcpClient.class.getDeclaredField("consumerGroupsClient");
+            syncField.setAccessible(true);
+            syncField.set(fixture.client.messages(), sync);
+            HeldRoutingMap<Object, Object> assignments = new HeldRoutingMap<>(true);
+            var cache = ClientRoutingState.class.getDeclaredField("assignments");
+            cache.setAccessible(true);
+            cache.set(field(fixture.client, "routingState"), assignments);
+            var poll = fixture.pollGroup();
+            sync.decoded.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            CompletableFuture<Void> publishing;
+            synchronized (field(fixture.connection(), "consensusSession")) {
+                publishing = CompletableFuture.runAsync(() -> sync.resume.complete(null));
+                assignments.published.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            }
+            publishing.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            assertThat(poll.get(TIMEOUT_SECONDS, TimeUnit.SECONDS).partitionId())
+                    .isEqualTo(0);
         }
     }
 

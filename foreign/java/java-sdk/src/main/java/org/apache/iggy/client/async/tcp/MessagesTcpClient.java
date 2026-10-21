@@ -433,7 +433,7 @@ public class MessagesTcpClient implements MessagesClient {
                 if (state.signedOut()) {
                     return CompletableFuture.failedFuture(state.lineageEnded(null));
                 }
-                if (owner == pollRouter.sessionOwner() && owner.generation() == generation) {
+                if (owner.generation() == generation) {
                     if (assignment.isEmpty()) {
                         routingState.invalidateAssignment(groupKey);
                     } else {
