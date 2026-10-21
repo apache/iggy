@@ -28,15 +28,19 @@ mod iggy_server;
 mod wire;
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::future::Future;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use iggy::prelude::{
-    ConsumerGroupClient, Identifier, Permissions, StreamClient, StreamPermissions, UserClient,
-    UserStatus,
+    Consumer, ConsumerGroupClient, ConsumerOffsetClient, Identifier, Permissions, StreamClient,
+    StreamPermissions, UserClient, UserStatus,
 };
 use secrecy::SecretString;
 use serial_test::serial;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use iggy_gateway_kafka::bridge::{IggyBridge, IggyBridgeConfig, TopicMapping, TopicOverride};
@@ -54,7 +58,8 @@ use iggy_server::TestServer;
 use wire::{
     JoinGroupParams, build_delete_groups_request, build_describe_groups_request,
     build_join_group_request, build_leave_group_request, build_list_groups_request,
-    build_offset_commit_request, build_offset_delete_request, build_offset_fetch_request,
+    build_offset_commit_partition_request, build_offset_commit_request,
+    build_offset_delete_request, build_offset_fetch_request,
 };
 
 const TEST_MAX_FRAME_SIZE: usize = 8 * 1024 * 1024;
@@ -91,14 +96,24 @@ async fn connected_state(server: &TestServer) -> GatewayState {
 }
 
 async fn state_with(config: IggyBridgeConfig) -> GatewayState {
+    state_with_groups(config, groups_config()).await
+}
+
+/// A new group's first join completes at once, so a test can hold a live member.
+fn groups_config() -> GroupCoordinatorConfig {
+    GroupCoordinatorConfig {
+        initial_rebalance_delay: Duration::ZERO,
+        ..GroupCoordinatorConfig::default()
+    }
+}
+
+async fn state_with_groups(
+    config: IggyBridgeConfig,
+    groups: GroupCoordinatorConfig,
+) -> GatewayState {
     let bridge = IggyBridge::connect(config)
         .await
         .expect("bridge should connect to a ready server");
-    // A new group's first join completes at once, so a test can hold a live member.
-    let groups = GroupCoordinatorConfig {
-        initial_rebalance_delay: Duration::ZERO,
-        ..GroupCoordinatorConfig::default()
-    };
     GatewayState::new(
         Some(Arc::new(bridge)),
         TEST_MAX_FRAME_SIZE,
@@ -107,18 +122,143 @@ async fn state_with(config: IggyBridgeConfig) -> GatewayState {
     )
 }
 
+/// A gateway whose bridge reaches `server` through `relay`. Its offset deadline is 500 ms, half
+/// the shortest session, so a test outwaits it while the relay holds a call.
+async fn state_through(server: &TestServer, relay: &PausingRelay) -> GatewayState {
+    let mut config = server.test_config();
+    config.address.clone_from(&relay.address);
+    let groups = GroupCoordinatorConfig {
+        min_session_timeout: Duration::from_secs(1),
+        ..groups_config()
+    };
+    state_with_groups(config, groups).await
+}
+
+/// A TCP relay to a server that numbers its connections in the order they open. It can hold what
+/// the client sends on one of them, so a call there waits, unanswered, until it is released.
+struct PausingRelay {
+    address: String,
+    /// Per connection, in the order they opened: `true` holds what its client sends.
+    holds: Arc<Mutex<Vec<watch::Sender<bool>>>>,
+}
+
+impl PausingRelay {
+    async fn start(server: &TestServer) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the relay");
+        let address = listener.local_addr().expect("relay address").to_string();
+        let upstream = server.test_config().address;
+        let holds = Arc::new(Mutex::new(Vec::new()));
+        let connections = Arc::clone(&holds);
+        tokio::spawn(async move {
+            while let Ok((inbound, _)) = listener.accept().await {
+                let (switch, paused) = watch::channel(false);
+                connections.lock().expect("relay connections").push(switch);
+                let upstream = upstream.clone();
+                tokio::spawn(async move {
+                    if let Ok(outbound) = TcpStream::connect(&upstream).await {
+                        relay(inbound, outbound, paused).await;
+                    }
+                });
+            }
+        });
+        Self { address, holds }
+    }
+
+    /// The connections opened so far.
+    fn opened(&self) -> usize {
+        self.holds.lock().expect("relay connections").len()
+    }
+
+    /// Holds what the client of connection `index` sends from now on.
+    fn hold(&self, index: usize) {
+        self.holds.lock().expect("relay connections")[index].send_replace(true);
+    }
+
+    /// Sends on what connection `index` held.
+    fn release(&self, index: usize) {
+        self.holds.lock().expect("relay connections")[index].send_replace(false);
+    }
+}
+
+/// Copies both ways between a client and the server. What the client sends waits while `paused`
+/// is `true`.
+async fn relay(inbound: TcpStream, outbound: TcpStream, mut paused: watch::Receiver<bool>) {
+    let (mut from_client, mut to_client) = inbound.into_split();
+    let (mut from_server, mut to_server) = outbound.into_split();
+    let requests = async move {
+        let mut buf = vec![0; 64 * 1024];
+        loop {
+            let read = match from_client.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => read,
+            };
+            if paused.wait_for(|paused| !*paused).await.is_err()
+                || to_server.write_all(&buf[..read]).await.is_err()
+            {
+                break;
+            }
+        }
+    };
+    let replies = async move {
+        let _ = tokio::io::copy(&mut from_server, &mut to_client).await;
+    };
+    tokio::join!(requests, replies);
+}
+
 async fn seed_topic(server: &TestServer, topic: &str) {
+    seed_topic_with(server, topic, 1).await;
+}
+
+async fn seed_topic_with(server: &TestServer, topic: &str, partitions: u32) {
     IggyBridge::connect(server.test_config())
         .await
         .expect("seed bridge should connect")
-        .ensure_stream_and_topic(topic, 1)
+        .ensure_stream_and_topic(topic, partitions)
         .await
         .expect("seed the topic");
+}
+
+/// Runs `request` again while it answers `COORDINATOR_LOAD_IN_PROGRESS`, which clients retry, for
+/// up to 30 s. The last answer.
+async fn retried<T, F, R>(mut request: R, code_of: impl Fn(&T) -> i16) -> T
+where
+    F: Future<Output = T>,
+    R: FnMut() -> F,
+{
+    let give_up = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let answer = request().await;
+        if code_of(&answer) != ERROR_COORDINATOR_LOAD_IN_PROGRESS
+            || tokio::time::Instant::now() >= give_up
+        {
+            return answer;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// Commits `offset` for partition 0 of `topic` outside the group protocol, as admin tools do.
 async fn commit(state: &GatewayState, group: &str, topic: &str, offset: i64) {
     let body = build_offset_commit_request(COMMIT_VERSION, group, topic, offset);
+    assert_eq!(commit_body(state, body).await, ERROR_NONE, "the commit");
+}
+
+/// Commits `offset` for `partition` of `topic` outside the group protocol. The partition's code.
+async fn commit_partition(
+    state: &GatewayState,
+    group: &str,
+    topic: &str,
+    partition: i32,
+    offset: i64,
+) -> i16 {
+    let body =
+        build_offset_commit_partition_request(COMMIT_VERSION, group, topic, partition, offset);
+    commit_body(state, body).await
+}
+
+async fn commit_body(state: &GatewayState, body: bytes::Bytes) -> i16 {
     let response = handle_request_bounded(state, API_KEY_OFFSET_COMMIT, COMMIT_VERSION, body)
         .await
         .expect_response("OffsetCommit answers");
@@ -128,7 +268,39 @@ async fn commit(state: &GatewayState, group: &str, topic: &str, offset: i64) {
     let _name = d.read_compact_nullable_string().expect("topic name");
     assert_eq!(d.read_varint().expect("partitions"), 2, "one partition");
     let _index = d.read_i32().expect("partition_index");
-    assert_eq!(d.read_i16().expect("error_code"), ERROR_NONE, "the commit");
+    d.read_i16().expect("error_code")
+}
+
+/// Whether the Iggy group that holds the offsets of [`GROUP`] is on `topic`, asked of Iggy itself.
+async fn offset_group_on(server: &TestServer, topic: &str) -> bool {
+    let raw = iggy_server::raw_client(server).await;
+    let iggy_id = |name: &str| Identifier::named(name).expect("valid Iggy name");
+    raw.get_consumer_group(
+        &iggy_id("kafka"),
+        &iggy_id(topic),
+        &iggy_id("kafka.cg.orders-app"),
+    )
+    .await
+    .expect("get the Iggy group")
+    .is_some()
+}
+
+/// The offset of [`GROUP`] for `partition` of `topic`, asked of Iggy itself. `None` when there is
+/// no offset or no group.
+async fn stored_offset(server: &TestServer, topic: &str, partition: u32) -> Option<u64> {
+    let raw = iggy_server::raw_client(server).await;
+    let iggy_id = |name: &str| Identifier::named(name).expect("valid Iggy name");
+    let consumer = Consumer::external_group(iggy_id("kafka.cg.orders-app"));
+    raw.get_consumer_offset(
+        &consumer,
+        &iggy_id("kafka"),
+        &iggy_id(topic),
+        Some(partition),
+    )
+    .await
+    .ok()
+    .flatten()
+    .map(|offset| offset.stored_offset)
 }
 
 /// The top-level error and every group of a v5 `ListGroups` answer.
@@ -512,34 +684,131 @@ async fn given_a_native_iggy_group_should_not_list_it() {
     assert_eq!(list(&state, &[], &[]).await, (ERROR_NONE, vec![]));
 }
 
-/// Without a scan that found the groups, the gateway cannot tell `Empty` from `Dead`. It answers
-/// `COORDINATOR_LOAD_IN_PROGRESS`, which clients retry, rather than a list that leaves groups out.
+/// While the first scan runs, the gateway cannot tell `Empty` from `Dead`, so it answers
+/// `COORDINATOR_LOAD_IN_PROGRESS`, which clients retry. A failed scan does not leave it there: the
+/// groups it holds still answer, as before it knew of the others, so `--list` works with Iggy down.
 #[tokio::test]
 #[serial]
-async fn given_iggy_unreachable_before_any_scan_should_answer_coordinator_load_in_progress() {
+async fn given_iggy_unreachable_should_answer_from_the_live_groups_once_a_scan_failed() {
     let data_dir = tempfile::tempdir().expect("tempdir");
     let server = TestServer::spawn(data_dir.path()).await;
     let state = connected_state(&server).await;
+    join(&state, "live-app").await;
     drop(server);
 
-    assert_eq!(
-        list(&state, &[], &[]).await,
-        (ERROR_COORDINATOR_LOAD_IN_PROGRESS, vec![])
-    );
     assert_eq!(
         list(&state, &["Stable"], &[]).await,
         (ERROR_NONE, vec![]),
         "a filter that leaves out Empty needs no scan"
     );
-    let unknown = describe(&state, DESCRIBE_VERSION, &[GROUP]).await;
     assert_eq!(
-        unknown,
+        retried(|| list(&state, &[], &[]), |(error, _)| *error).await,
+        (ERROR_NONE, vec![listed("live-app", "CompletingRebalance")])
+    );
+    assert_eq!(
+        describe(&state, DESCRIBE_VERSION, &[GROUP]).await,
         vec![Described {
-            error: ERROR_COORDINATOR_LOAD_IN_PROGRESS,
-            state: String::new(),
+            state: "Dead".to_string(),
             protocol_type: String::new(),
             ..offsets_only(GROUP)
-        }]
+        }],
+        "a group that is not here is Dead, as without a bridge"
+    );
+}
+
+/// A commit that its request gave up on runs on, and can still land. So `DeleteGroups` waits for
+/// it. Deleting first would let the late commit find no Iggy group, create one, and store its
+/// stale offset there, after `DeleteGroups` answered that the group is gone.
+#[tokio::test]
+#[serial]
+async fn given_a_commit_past_its_deadline_delete_groups_should_wait_for_it_to_end() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    seed_topic_with(&server, "orders", 2).await;
+    let relay = PausingRelay::start(&server).await;
+    let state = state_through(&server, &relay).await;
+    let lane = relay.opened();
+    // Partition 1 commits on a lane of its own. The deletion uses the lane of partition 0.
+    assert_eq!(
+        commit_partition(&state, GROUP, "orders", 1, 5).await,
+        ERROR_NONE
+    );
+    assert_eq!(relay.opened(), lane + 1, "the commit lane connected");
+    relay.hold(lane);
+
+    assert_eq!(
+        commit_partition(&state, GROUP, "orders", 1, 9).await,
+        ERROR_COORDINATOR_LOAD_IN_PROGRESS,
+        "the commit runs past its deadline"
+    );
+    assert_eq!(
+        delete_groups(&state, &[GROUP]).await,
+        vec![(GROUP.to_string(), ERROR_COORDINATOR_LOAD_IN_PROGRESS)],
+        "the late commit still runs"
+    );
+
+    relay.release(lane);
+    assert_eq!(
+        retried(|| delete_groups(&state, &[GROUP]), |answer| answer[0].1).await,
+        vec![(GROUP.to_string(), ERROR_NONE)]
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !offset_group_on(&server, "orders").await,
+        "no late commit brings the group back"
+    );
+}
+
+/// A deletion that its request gave up on runs on, and Iggy can still delete the group. Until it
+/// ends, the group takes no commit. A commit that landed first would be acknowledged, then deleted
+/// with the group.
+#[tokio::test]
+#[serial]
+async fn given_a_group_deletion_past_its_deadline_commits_should_wait_for_it_to_end() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    seed_topic_with(&server, "orders", 2).await;
+    let relay = PausingRelay::start(&server).await;
+    let state = state_through(&server, &relay).await;
+    let lane = relay.opened();
+    // The deletion of the group on `orders` runs on the commit lane of partition 0.
+    assert_eq!(
+        commit_partition(&state, GROUP, "orders", 0, 5).await,
+        ERROR_NONE
+    );
+    assert_eq!(relay.opened(), lane + 1, "the commit lane connected");
+    relay.hold(lane);
+
+    assert_eq!(
+        delete_groups(&state, &[GROUP]).await,
+        vec![(GROUP.to_string(), ERROR_COORDINATOR_LOAD_IN_PROGRESS)],
+        "the deletion runs past its deadline"
+    );
+    assert_eq!(
+        commit_partition(&state, GROUP, "orders", 1, 7).await,
+        ERROR_COORDINATOR_LOAD_IN_PROGRESS,
+        "the deletion still runs"
+    );
+
+    relay.release(lane);
+    assert_eq!(
+        retried(
+            || commit_partition(&state, GROUP, "orders", 1, 7),
+            |code| *code
+        )
+        .await,
+        ERROR_NONE
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        stored_offset(&server, "orders", 1).await,
+        Some(7),
+        "no late deletion takes the acknowledged offset"
+    );
+    assert_eq!(
+        stored_offset(&server, "orders", 0).await,
+        None,
+        "the deletion took the older offset"
     );
 }
 
@@ -624,6 +893,31 @@ async fn given_a_group_on_several_topics_delete_should_remove_it_from_each_and_k
             .expect("get the Iggy group");
         assert!(found.is_none(), "the Iggy group is gone from {topic}");
     }
+}
+
+/// A group with no members here exists while it holds offsets. Another gateway committed for this
+/// one after the last scan here, so only asking the topic finds it.
+#[tokio::test]
+#[serial]
+async fn given_a_group_committed_through_another_gateway_since_the_last_scan_delete_offsets_should_find_it()
+ {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    seed_topic(&server, "orders").await;
+    let here = connected_state(&server).await;
+    let other = connected_state(&server).await;
+    assert_eq!(
+        list(&here, &[], &[]).await,
+        (ERROR_NONE, vec![]),
+        "the scan here finds no group"
+    );
+    commit(&other, GROUP, "orders", 5).await;
+
+    assert_eq!(
+        delete_offsets(&here, GROUP, &[("orders", &[0])]).await,
+        (ERROR_NONE, vec![("orders".to_string(), 0, ERROR_NONE)])
+    );
+    assert_eq!(committed(&other, GROUP, "orders").await, -1);
 }
 
 /// Kafka keeps the offsets of a topic that a member subscribes to, and deletes the others, also

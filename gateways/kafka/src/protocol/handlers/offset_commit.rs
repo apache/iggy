@@ -76,10 +76,10 @@ pub async fn handle(
         .validate_commit(&CommitRequest::from(&request))
         .await;
     let topics = match (&state.bridge, validated) {
-        // The commit stays counted until its Iggy calls end, so a deletion of the group's offsets
-        // waits for it.
-        (Some(bridge), Ok(_commit)) => {
-            let calls = OffsetCalls::new(offset_deadline(state, connection).await);
+        (Some(bridge), Ok(commit)) => {
+            // The commit stays counted until its Iggy calls end, also those that run past the
+            // deadline, so a deletion of the group's offsets waits for them.
+            let calls = OffsetCalls::new(offset_deadline(state, connection).await).keeping(commit);
             commit_all(bridge, &request, &calls).await
         }
         (None, Ok(_)) => same_code(&request, ERROR_COORDINATOR_LOAD_IN_PROGRESS),

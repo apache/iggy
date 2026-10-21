@@ -45,7 +45,7 @@ pub use cluster_id::{CLUSTER_ID_TOPIC, ClusterIdCall, cluster_id_stream};
 use fetch::{FetchPool, LazyClient};
 pub(crate) use fetch::{FetchSlot, PartitionProbe, TopicProbe};
 use group_index::GroupIndex;
-pub use group_index::OffsetGroups;
+pub use group_index::{OffsetGroups, ScannedGroups};
 use group_offsets::OffsetPool;
 pub use group_offsets::{OFFSET_GROUP_PREFIX, OffsetCalls};
 pub(crate) use offsets::{LocatedRecord, RecordLookup};
@@ -393,6 +393,8 @@ impl IggyBridge {
         Self {
             // Held rather than lazy, so an auto topic creation fails at once instead of dialing.
             auto_create_client: LazyClient::holding(Arc::clone(&client)),
+            // Held for the same reason, so a scan of the groups that hold offsets fails at once.
+            scan_client: LazyClient::holding(Arc::clone(&client)),
             client,
             produce_pool: Arc::new(ProducePool::new(config.produce_sessions)),
             config,
@@ -401,7 +403,6 @@ impl IggyBridge {
             lookup_client: LazyClient::default(),
             offset_pool: OffsetPool::new(),
             group_index: GroupIndex::new(),
-            scan_client: LazyClient::default(),
         }
     }
 }

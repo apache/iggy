@@ -829,6 +829,17 @@ pub fn build_offset_commit_request(
     topic: &str,
     offset: i64,
 ) -> Bytes {
+    build_offset_commit_partition_request(version, group_id, topic, 0, offset)
+}
+
+/// `OffsetCommit` request for `partition` of `topic`, made outside the group protocol.
+pub fn build_offset_commit_partition_request(
+    version: i16,
+    group_id: &str,
+    topic: &str,
+    partition: i32,
+    offset: i64,
+) -> Bytes {
     let flexible = version >= 8;
     let mut enc = Encoder::with_capacity(64);
 
@@ -844,7 +855,7 @@ pub fn build_offset_commit_request(
     write_array_count(&mut enc, flexible, 1);
     write_string(&mut enc, flexible, Some(topic));
     write_array_count(&mut enc, flexible, 1);
-    enc.write_i32(0); // partition_index
+    enc.write_i32(partition); // partition_index
     enc.write_i64(offset);
     if version >= 6 {
         enc.write_i32(-1); // committed_leader_epoch

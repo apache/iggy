@@ -30,16 +30,25 @@
 //! `COORDINATOR_LOAD_IN_PROGRESS` (14) for the whole group, which the Java admin client retries.
 //! Deleting an offset twice does no harm. v1 is not in a Kafka release, so only v0 is advertised.
 //!
+//! A group with no members here exists while it holds offsets. Unless the last scan of the groups
+//! that hold offsets found it (`IggyBridge::offset_groups`), the gateway asks each requested topic
+//! whether it holds the group. That also finds a group that another gateway committed for since
+//! the scan. Only a group that no requested topic holds waits for a scan, which tells whether it
+//! holds offsets on another topic.
+//!
 //! While the deletion runs, the group takes no join and no commit: both get 14, which clients
 //! retry. So no member subscribes to a topic between the check and the deletions, and a commit
 //! lands whole before or after them. The deletions wait for each commit that passed its check
-//! before them, and the group gets 14 when one still runs at the deadline. A member on another
-//! gateway is not seen here, so its topics count as unsubscribed (`docs/OFFSET_STORAGE.md`).
+//! before them, and the group gets 14 when one still runs at the deadline. A commit or a deletion
+//! runs until its Iggy calls end, also those that its request stopped waiting for. A member on
+//! another gateway is not seen here, so its topics count as unsubscribed
+//! (`docs/OFFSET_STORAGE.md`).
 //!
-//! With SASL on, a principal without `manage_topics` gets `GROUP_AUTHORIZATION_FAILED` (30), and
-//! nothing is deleted.
+//! When a listener names principals, a principal without a global `manage_topics` or
+//! `manage_streams` gets `GROUP_AUTHORIZATION_FAILED` (30), and nothing is deleted.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::future::join_all;
@@ -49,7 +58,7 @@ use kafka_protocol::messages::offset_delete_response::{
 use kafka_protocol::messages::{OffsetDeleteRequest, OffsetDeleteResponse};
 
 use crate::auth::AuthenticatedPrincipal;
-use crate::bridge::{BridgeError, IggyBridge, OffsetCalls, TopicTarget};
+use crate::bridge::{BridgeError, IggyBridge, OffsetCalls, ScannedGroups, TopicTarget};
 use crate::error::Result;
 use crate::group::{OffsetDeletion, Subscribed, is_valid_group_id};
 use crate::protocol::api::{
@@ -133,22 +142,75 @@ async fn delete_offsets(
             OffsetDeletion::Allowed(_) => Ok(same_code(request, ERROR_UNKNOWN_TOPIC_OR_PARTITION)),
         };
     };
-    let calls = OffsetCalls::new(offset_deadline(state, connection).await);
     let subscribed = match deletable {
         OffsetDeletion::Refused => return Err(ERROR_NON_EMPTY_GROUP),
-        OffsetDeletion::Allowed(subscribed) => subscribed,
-        // No members here, so the group exists only while it holds offsets.
-        OffsetDeletion::Absent => match bridge.offset_groups(calls.deadline()).await {
-            None => return Err(ERROR_COORDINATOR_LOAD_IN_PROGRESS),
-            Some(groups) if groups.contains(group) => Subscribed::Topics(HashSet::new()),
-            Some(_) => return Err(ERROR_GROUP_ID_NOT_FOUND),
-        },
+        OffsetDeletion::Allowed(subscribed) => Some(subscribed),
+        OffsetDeletion::Absent => None,
     };
+    let calls = OffsetCalls::new(offset_deadline(state, connection).await);
     let topics = requested_topics(bridge, request, &calls).await?;
     if !deletion.commits_ended(calls.deadline()).await {
         return Err(ERROR_COORDINATOR_LOAD_IN_PROGRESS);
     }
+    let subscribed = match subscribed {
+        Some(subscribed) => subscribed,
+        // No members here, so the group exists only while it holds offsets.
+        None if holds_offsets(bridge, group, &topics, &calls).await? => {
+            Subscribed::Topics(HashSet::new())
+        }
+        None => return Err(ERROR_GROUP_ID_NOT_FOUND),
+    };
+    // Each delete keeps the group fenced until its Iggy calls end, also past the deadline, so no
+    // commit lands while a delete can still land.
+    let calls = calls.keeping(deletion);
     delete_unsubscribed(bridge, request, &topics, &subscribed, &calls).await
+}
+
+/// Whether `group`, which has no members here, holds offsets in Iggy. The last scan answers when
+/// it found the group. Otherwise each requested topic of `topics` is asked, which also finds
+/// offsets that another gateway committed since that scan. A group that none of them holds waits
+/// for a scan, which tells whether it holds offsets on another topic.
+///
+/// # Errors
+///
+/// `COORDINATOR_LOAD_IN_PROGRESS` when no scan has ended yet, or when a requested topic that did
+/// not answer may hold the group.
+async fn holds_offsets(
+    bridge: &Arc<IggyBridge>,
+    group: &str,
+    topics: &HashMap<&str, core::result::Result<(TopicTarget, u32), i16>>,
+    calls: &OffsetCalls,
+) -> core::result::Result<bool, i16> {
+    if bridge
+        .last_offset_groups()
+        .is_some_and(|groups| groups.contains(group))
+    {
+        return Ok(true);
+    }
+    let asked = join_all(
+        topics
+            .values()
+            .filter_map(|topic| topic.as_ref().ok())
+            .map(|(target, _)| bridge.holds_offset_group(group, target, calls)),
+    )
+    .await;
+    let mut unanswered = false;
+    for held in asked {
+        match held {
+            Ok(true) => return Ok(true),
+            Ok(false) => {}
+            Err(error) => {
+                unanswered |= error.to_offset_error_code() == ERROR_COORDINATOR_LOAD_IN_PROGRESS;
+            }
+        }
+    }
+    match bridge.offset_groups(calls.deadline()).await {
+        ScannedGroups::Found(groups) if groups.contains(group) => Ok(true),
+        ScannedGroups::Pending => Err(ERROR_COORDINATOR_LOAD_IN_PROGRESS),
+        _ if unanswered => Err(ERROR_COORDINATOR_LOAD_IN_PROGRESS),
+        // No scan found the groups, and no requested topic holds this one.
+        ScannedGroups::Found(_) | ScannedGroups::Failed => Ok(false),
+    }
 }
 
 /// The Iggy topic and the partition count of each requested topic, or the code for each of its

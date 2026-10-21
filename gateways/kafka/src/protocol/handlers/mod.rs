@@ -173,7 +173,8 @@ pub(crate) fn is_transactional(transactional_id: Option<&TransactionalId>) -> bo
 /// names principals, with nothing to enforce against, as in `DeleteTopics`.
 ///
 /// Kafka asks for `DELETE` on the group. Iggy has no group permission, and lets any reader of a
-/// topic delete a group on it, so the gate asks for `manage_topics`, as `DeleteTopics` does.
+/// topic delete a group on it, so the gate asks for what `DeleteTopics` asks for: a global
+/// `manage_topics` or `manage_streams`, which the principal's `manage_topics` stands for.
 fn may_delete_groups(principal: Option<&AuthenticatedPrincipal>, api: &str) -> bool {
     let Some(principal) = principal else {
         return true;

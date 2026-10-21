@@ -29,15 +29,21 @@ use tracing::warn;
 
 use crate::bridge::error::BridgeError;
 
-/// How long one scan answers for. kafka-ui lists groups every 30 s, and a scan costs one Iggy call
-/// per topic.
+/// How long the groups of a scan answer, counted from the end of the scan, before a caller starts
+/// a new one. The requests of one `kafka-consumer-groups.sh` run, a `ListGroups` and then a
+/// `DescribeGroups`, then share a scan, which costs one Iggy call per topic.
 const SCAN_MAX_AGE: Duration = Duration::from_secs(10);
+
+/// How long the groups of a scan still answer at once while a newer scan runs. So kafka-ui, which
+/// lists groups every 30 s, never waits for a scan. A caller that finds only older groups waits
+/// for the newer scan, until its deadline.
+const SCAN_STALE_LIMIT: Duration = Duration::from_mins(1);
 
 /// The Kafka groups one scan found holding offsets in Iggy.
 #[derive(Debug, Clone)]
 pub struct OffsetGroups {
-    /// When the scan began.
-    started: Instant,
+    /// When the scan ended.
+    ended: Instant,
     groups: BTreeSet<String>,
 }
 
@@ -52,9 +58,27 @@ impl OffsetGroups {
         self.groups.iter().map(String::as_str)
     }
 
-    fn is_fresh(&self) -> bool {
-        self.started.elapsed() < SCAN_MAX_AGE
+    fn age(&self) -> Duration {
+        self.ended.elapsed()
     }
+}
+
+/// What a caller learns about the Kafka groups that hold offsets in Iggy.
+#[derive(Debug, Clone)]
+pub enum ScannedGroups {
+    /// The groups of the last scan that found them.
+    Found(Arc<OffsetGroups>),
+    /// The first scan has not ended yet.
+    Pending,
+    /// Every scan that ended failed, so no scan found the groups.
+    Failed,
+}
+
+/// What one scan found.
+pub(super) struct Scanned {
+    pub(super) groups: BTreeSet<String>,
+    /// `false` when the scan stopped at its time limit before it listed every topic.
+    pub(super) whole: bool,
 }
 
 /// The groups of the last scan that ended, and at most one scan that runs.
@@ -84,32 +108,48 @@ impl GroupIndex {
         }
     }
 
-    /// The groups of a scan that began less than `SCAN_MAX_AGE` ago. Otherwise starts a scan with
-    /// `scan`, unless one runs, and waits for the scan that runs until `deadline`.
+    /// The groups of the last scan, at once while that scan ended less than `SCAN_MAX_AGE` ago.
+    /// An older scan starts a new one with `scan`, unless one runs. The groups of a scan that ended
+    /// less than `SCAN_STALE_LIMIT` ago still answer at once. Otherwise the caller waits for the
+    /// scan that runs, until `deadline`.
     ///
     /// A scan that fails, or that does not end by `deadline`, leaves the groups of the last scan
-    /// that found them, and those are the answer. `None` when no scan found groups yet.
-    pub(super) async fn groups<F, S>(&self, deadline: Instant, scan: F) -> Option<Arc<OffsetGroups>>
+    /// that found them, and those are the answer.
+    pub(super) async fn groups<F, S>(&self, deadline: Instant, scan: F) -> ScannedGroups
     where
         F: FnOnce() -> S,
-        S: Future<Output = Result<BTreeSet<String>, BridgeError>> + Send + 'static,
+        S: Future<Output = Result<Scanned, BridgeError>> + Send + 'static,
     {
         let mut published = self.published.subscribe();
-        let ended = {
+        let (last, ended) = {
             let current = published.borrow_and_update();
-            if let Some(groups) = current.groups.as_ref().filter(|groups| groups.is_fresh()) {
-                return Some(Arc::clone(groups));
-            }
-            current.ended
+            (current.groups.clone(), current.ended)
         };
-        self.start(scan);
+        match last {
+            Some(groups) if groups.age() < SCAN_MAX_AGE => return ScannedGroups::Found(groups),
+            Some(groups) if groups.age() < SCAN_STALE_LIMIT => {
+                self.start(scan);
+                return ScannedGroups::Found(groups);
+            }
+            _ => self.start(scan),
+        }
         // A timeout leaves the groups of the last scan as the answer.
         let _ = timeout_at(
             deadline,
             published.wait_for(|current| current.ended > ended),
         )
         .await;
-        published.borrow().groups.clone()
+        let current = published.borrow();
+        match &current.groups {
+            Some(groups) => ScannedGroups::Found(Arc::clone(groups)),
+            None if current.ended == 0 => ScannedGroups::Pending,
+            None => ScannedGroups::Failed,
+        }
+    }
+
+    /// The groups of the last scan that found them, without a scan.
+    pub(super) fn last(&self) -> Option<Arc<OffsetGroups>> {
+        self.published.borrow().groups.clone()
     }
 
     /// Adds `group` to the groups of the last scan. A commit of this gateway created its offsets,
@@ -149,7 +189,7 @@ impl GroupIndex {
     fn start<F, S>(&self, scan: F)
     where
         F: FnOnce() -> S,
-        S: Future<Output = Result<BTreeSet<String>, BridgeError>> + Send + 'static,
+        S: Future<Output = Result<Scanned, BridgeError>> + Send + 'static,
     {
         let Ok(permit) = Arc::clone(&self.scanning).try_acquire_owned() else {
             return;
@@ -159,7 +199,6 @@ impl GroupIndex {
             current.changes = Some(HashMap::new());
             false
         });
-        let started = Instant::now();
         let scanning = scan();
         tokio::spawn(async move {
             let found = scanning.await;
@@ -169,12 +208,20 @@ impl GroupIndex {
             published.send_modify(|current| {
                 current.ended += 1;
                 let changes = current.changes.take().unwrap_or_default();
-                if let Ok(mut groups) = found {
-                    for (group, holds) in changes {
-                        apply(&mut groups, group, holds);
-                    }
-                    current.groups = Some(Arc::new(OffsetGroups { started, groups }));
+                let Ok(Scanned { mut groups, whole }) = found else {
+                    return;
+                };
+                if !whole && let Some(last) = &current.groups {
+                    // The topics that the scan did not reach keep the groups of the last scan.
+                    groups.extend(last.groups.iter().cloned());
                 }
+                for (group, holds) in changes {
+                    apply(&mut groups, group, holds);
+                }
+                current.groups = Some(Arc::new(OffsetGroups {
+                    ended: Instant::now(),
+                    groups,
+                }));
             });
             drop(permit);
         });
@@ -202,27 +249,40 @@ mod tests {
         Instant::now() + Duration::from_secs(5)
     }
 
-    fn found(groups: &[&str]) -> BTreeSet<String> {
-        groups.iter().map(|group| (*group).to_owned()).collect()
+    fn whole(groups: &[&str]) -> Scanned {
+        Scanned {
+            groups: groups.iter().map(|group| (*group).to_owned()).collect(),
+            whole: true,
+        }
     }
 
-    fn names(groups: Option<Arc<OffsetGroups>>) -> Vec<String> {
-        groups
-            .expect("a scan found groups")
-            .iter()
-            .map(str::to_owned)
-            .collect()
+    fn names(groups: ScannedGroups) -> Vec<String> {
+        let ScannedGroups::Found(groups) = groups else {
+            panic!("a scan found groups: {groups:?}");
+        };
+        groups.iter().map(str::to_owned).collect()
     }
 
     /// A scan that counts its runs and finds `groups`.
     fn counted(
         runs: &Arc<AtomicUsize>,
         groups: &'static [&'static str],
-    ) -> impl FnOnce() -> std::future::Ready<Result<BTreeSet<String>, BridgeError>> {
+    ) -> impl FnOnce() -> std::future::Ready<Result<Scanned, BridgeError>> {
         let runs = Arc::clone(runs);
         move || {
             runs.fetch_add(1, Ordering::SeqCst);
-            std::future::ready(Ok(found(groups)))
+            std::future::ready(Ok(whole(groups)))
+        }
+    }
+
+    fn failing() -> std::future::Ready<Result<Scanned, BridgeError>> {
+        std::future::ready(Err(BridgeError::Iggy(IggyError::CannotEstablishConnection)))
+    }
+
+    /// Lets the task of a scan that already ended publish its groups.
+    async fn settle() {
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
         }
     }
 
@@ -240,17 +300,55 @@ mod tests {
         assert_eq!(runs.load(Ordering::SeqCst), 1);
     }
 
+    /// Groups older than `SCAN_MAX_AGE` still answer at once, and the scan they start serves the
+    /// next caller.
     #[tokio::test(start_paused = true)]
-    async fn given_a_scan_older_than_its_max_age_should_scan_again() {
+    async fn given_an_old_scan_should_answer_from_it_at_once_and_scan_again() {
         let index = GroupIndex::new();
         let runs = Arc::new(AtomicUsize::new(0));
-
         index.groups(later(), counted(&runs, &["orders"])).await;
         tokio::time::advance(SCAN_MAX_AGE).await;
+
+        let old = index
+            .groups(Instant::now(), counted(&runs, &["payments"]))
+            .await;
+        settle().await;
+        let new = index.groups(later(), counted(&runs, &["audit"])).await;
+
+        assert_eq!(names(old), ["orders"], "no wait for the new scan");
+        assert_eq!(names(new), ["payments"]);
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_scan_older_than_the_stale_limit_should_wait_for_a_new_one() {
+        let index = GroupIndex::new();
+        let runs = Arc::new(AtomicUsize::new(0));
+        index.groups(later(), counted(&runs, &["orders"])).await;
+        tokio::time::advance(SCAN_STALE_LIMIT).await;
+
         let second = index.groups(later(), counted(&runs, &["payments"])).await;
 
         assert_eq!(names(second), ["payments"]);
         assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
+
+    /// A slow scan's groups are as new as its end, so they answer for `SCAN_MAX_AGE` after it.
+    #[tokio::test(start_paused = true)]
+    async fn given_a_scan_slower_than_its_max_age_should_count_its_age_from_its_end() {
+        let index = GroupIndex::new();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let slow = || async {
+            tokio::time::sleep(SCAN_MAX_AGE * 2).await;
+            Ok(whole(&["orders"]))
+        };
+
+        let first = index.groups(later() + SCAN_MAX_AGE * 2, slow).await;
+        let second = index.groups(later(), counted(&runs, &["payments"])).await;
+
+        assert_eq!(names(first), ["orders"]);
+        assert_eq!(names(second), ["orders"]);
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
     }
 
     /// Callers that come while a scan runs wait for that scan rather than start their own.
@@ -264,7 +362,7 @@ mod tests {
             first_runs.fetch_add(1, Ordering::SeqCst);
             async move {
                 let _ = released.await;
-                Ok(found(&["orders"]))
+                Ok(whole(&["orders"]))
             }
         };
 
@@ -287,28 +385,35 @@ mod tests {
         let index = GroupIndex::new();
         let runs = Arc::new(AtomicUsize::new(0));
         index.groups(later(), counted(&runs, &["orders"])).await;
-        tokio::time::advance(SCAN_MAX_AGE).await;
+        tokio::time::advance(SCAN_STALE_LIMIT).await;
 
-        let failed = index
-            .groups(later(), || async {
-                Err(BridgeError::Iggy(IggyError::CannotEstablishConnection))
-            })
-            .await;
+        let failed = index.groups(later(), failing).await;
 
         assert_eq!(names(failed), ["orders"]);
     }
 
+    /// With Iggy down, every scan fails. The callers then answer from the live groups instead of
+    /// waiting for a scan that may never find the groups.
     #[tokio::test(start_paused = true)]
-    async fn given_no_scan_that_found_groups_when_a_scan_fails_should_answer_none() {
+    async fn given_no_scan_that_found_groups_when_a_scan_fails_should_answer_failed() {
         let index = GroupIndex::new();
 
-        let failed = index
-            .groups(later(), || async {
-                Err(BridgeError::Iggy(IggyError::CannotEstablishConnection))
+        let failed = index.groups(later(), failing).await;
+
+        assert!(matches!(failed, ScannedGroups::Failed), "{failed:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_first_scan_past_the_deadline_should_answer_pending() {
+        let index = GroupIndex::new();
+
+        let pending = index
+            .groups(Instant::now() + Duration::from_millis(20), || {
+                std::future::pending::<Result<Scanned, BridgeError>>()
             })
             .await;
 
-        assert!(failed.is_none());
+        assert!(matches!(pending, ScannedGroups::Pending), "{pending:?}");
     }
 
     /// A scan past the deadline of its caller keeps running, and the next caller gets its groups
@@ -324,14 +429,14 @@ mod tests {
                 Instant::now() + Duration::from_millis(20),
                 move || async move {
                     let _ = released.await;
-                    Ok(found(&["orders"]))
+                    Ok(whole(&["orders"]))
                 },
             )
             .await;
-        assert!(late.is_none(), "no scan found groups by the deadline");
+        assert!(matches!(late, ScannedGroups::Pending), "{late:?}");
 
         release.send(()).expect("the scan still runs");
-        tokio::task::yield_now().await;
+        settle().await;
         let next = index.groups(later(), counted(&runs, &["payments"])).await;
 
         assert_eq!(names(next), ["orders"]);
@@ -340,6 +445,27 @@ mod tests {
             0,
             "the scan that ended is fresh"
         );
+    }
+
+    /// A scan that stops at its time limit did not list some topics. Those keep the groups that
+    /// the last scan found there.
+    #[tokio::test(start_paused = true)]
+    async fn given_a_partial_scan_should_keep_the_groups_of_the_last_scan_too() {
+        let index = GroupIndex::new();
+        let runs = Arc::new(AtomicUsize::new(0));
+        index.groups(later(), counted(&runs, &["orders"])).await;
+        tokio::time::advance(SCAN_STALE_LIMIT).await;
+
+        let partial = index
+            .groups(later(), || {
+                std::future::ready(Ok(Scanned {
+                    groups: BTreeSet::from(["payments".to_owned()]),
+                    whole: false,
+                }))
+            })
+            .await;
+
+        assert_eq!(names(partial), ["orders", "payments"]);
     }
 
     #[tokio::test(start_paused = true)]
@@ -366,7 +492,7 @@ mod tests {
         let (release, released) = oneshot::channel::<()>();
         let stale = move || async move {
             let _ = released.await;
-            Ok(found(&["deleted", "kept", "flipped"]))
+            Ok(whole(&["deleted", "kept", "flipped"]))
         };
 
         let (groups, ()) = tokio::join!(index.groups(later(), stale), async {
@@ -394,5 +520,18 @@ mod tests {
 
         assert_eq!(names(groups), ["orders", "payments"]);
         assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_no_scan_should_have_no_last_groups() {
+        let index = GroupIndex::new();
+        assert!(index.last().is_none());
+
+        index
+            .groups(later(), || std::future::ready(Ok(whole(&["orders"]))))
+            .await;
+
+        let last = index.last().expect("the scan found groups");
+        assert!(last.contains("orders"));
     }
 }

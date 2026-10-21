@@ -133,7 +133,10 @@ pub const ERROR_GROUP_ID_NOT_FOUND: i16 = ResponseError::GroupIdNotFound.code();
 pub const ERROR_INVALID_SESSION_TIMEOUT: i16 = 26;
 /// How a follower learns to rejoin: its heartbeat is answered with this while the group prepares.
 pub const ERROR_REBALANCE_IN_PROGRESS: i16 = 27;
-/// `DeleteGroups`: the bridge user may not delete the Iggy group that holds the offsets.
+/// `DeleteGroups` and `OffsetDelete`: the principal may not delete groups or their offsets.
+///
+/// `DeleteGroups` also sends it when Iggy refuses the bridge user, either the delete of the Iggy
+/// group that holds the offsets, or the listing of the groups of a topic where it can hold them.
 pub const ERROR_GROUP_AUTHORIZATION_FAILED: i16 = ResponseError::GroupAuthorizationFailed.code();
 /// `DeleteGroups`: the group has members. `OffsetDelete`: it has members of a protocol other than
 /// `consumer`.

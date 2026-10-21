@@ -21,8 +21,9 @@
 //! that is not here is `Empty` when it holds offsets in Iggy, as Kafka keeps a group whose
 //! consumers left. Otherwise it is `Dead`: v6 also carries `GROUP_ID_NOT_FOUND`, and earlier
 //! versions do not, matching Kafka 4.0's `describeGroups`. A v6 client treats error 0 as a real
-//! group. When no scan has found the groups that hold offsets yet (`IggyBridge::offset_groups`),
-//! a group that is not here gets `COORDINATOR_LOAD_IN_PROGRESS` (14), which clients retry.
+//! group. While the first scan of the groups that hold offsets runs (`IggyBridge::offset_groups`),
+//! a group that is not here gets `COORDINATOR_LOAD_IN_PROGRESS` (14), which clients retry. When no
+//! scan could find them, such a group is `Dead`.
 //!
 //! `include_authorized_operations` is not answered. The field stays at the omitted sentinel
 //! (`i32::MIN`): there is no group ACL bitfield to report, and any other value fails the
@@ -35,7 +36,7 @@ use kafka_protocol::messages::describe_groups_response::{DescribedGroup, Describ
 use kafka_protocol::messages::{DescribeGroupsRequest, DescribeGroupsResponse, GroupId};
 use kafka_protocol::protocol::StrBytes;
 
-use crate::bridge::OffsetGroups;
+use crate::bridge::{OffsetGroups, ScannedGroups};
 use crate::error::Result;
 use crate::group::{DESCRIBE_RESPONSE_TOO_LARGE, GroupDescription, MemberDescription};
 use crate::protocol::api::{
@@ -122,11 +123,12 @@ pub async fn handle(
 
 /// How one request answers a group that is not on this coordinator.
 enum Absent {
-    /// Without a bridge no group holds offsets, so each one is `Dead`.
+    /// Without a bridge no group holds offsets, and with no scan that could find them none is
+    /// known to, so each one is `Dead`.
     Dead,
     /// `Empty` for a group that holds offsets, `Dead` for any other.
     Known(Arc<OffsetGroups>),
-    /// No scan has found the groups that hold offsets yet.
+    /// The first scan of the groups that hold offsets has not ended yet.
     Unknown,
 }
 
@@ -136,10 +138,11 @@ impl Absent {
             return Self::Dead;
         };
         let deadline = offset_deadline(state, connection).await;
-        bridge
-            .offset_groups(deadline)
-            .await
-            .map_or(Self::Unknown, Self::Known)
+        match bridge.offset_groups(deadline).await {
+            ScannedGroups::Found(offset_groups) => Self::Known(offset_groups),
+            ScannedGroups::Pending => Self::Unknown,
+            ScannedGroups::Failed => Self::Dead,
+        }
     }
 
     fn answer(&self, version: i16, group_id: &StrBytes) -> DescribedGroup {
@@ -226,4 +229,43 @@ pub(crate) fn missing_group(version: i16, group_id: &StrBytes) -> DescribedGroup
 pub fn encode_response(version: i16, groups: Vec<DescribedGroup>) -> Result<Bytes> {
     let response = DescribeGroupsResponse::default().with_groups(groups);
     encode_message(&response, version, 64)
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::BytesMut;
+    use kafka_protocol::protocol::{Decodable, Encodable};
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+    use crate::bridge::IggyBridge;
+    use crate::group::{GroupCoordinator, GroupCoordinatorConfig};
+
+    /// With Iggy out of reach no scan finds the groups that hold offsets. A group that is not here
+    /// is then `Dead`, as without a bridge, and does not wait for a scan that cannot succeed.
+    #[tokio::test]
+    async fn given_a_scan_that_failed_should_describe_a_missing_group_as_dead() {
+        let state = GatewayState::new(
+            Some(Arc::new(IggyBridge::offline())),
+            8 * 1024 * 1024,
+            0,
+            GroupCoordinator::new(GroupCoordinatorConfig::default(), CancellationToken::new()),
+        );
+        let mut body = BytesMut::new();
+        DescribeGroupsRequest::default()
+            .with_groups(vec![GroupId(StrBytes::from_static_str("orders-app"))])
+            .encode(&mut body, 5)
+            .unwrap();
+
+        let mut response = handle(&state, &ConnectionState::default(), 5, body.freeze())
+            .await
+            .expect_response("DescribeGroups answers");
+        let response = DescribeGroupsResponse::decode(&mut response, 5).unwrap();
+
+        let group = &response.groups[0];
+        assert_eq!(
+            (group.error_code, group.group_state.as_str()),
+            (ERROR_NONE, DEAD)
+        );
+    }
 }

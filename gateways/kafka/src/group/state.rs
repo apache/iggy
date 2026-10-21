@@ -921,11 +921,9 @@ impl GroupState {
         };
         let mut topics = HashSet::new();
         for member in self.members.values() {
-            let Some(subscription) = subscription_topics(&member.metadata_for(protocol_name))
-            else {
+            if add_subscription_topics(&member.metadata_for(protocol_name), &mut topics).is_none() {
                 return Subscribed::All;
-            };
-            topics.extend(subscription);
+            }
         }
         Subscribed::Topics(topics)
     }
@@ -1487,10 +1485,9 @@ pub fn leave_step(groups: &mut Groups, request: &LeaveRequest, now: Instant) -> 
     }
 }
 
-/// Kafka's `ClassicGroup.validateDeleteGroup`. A group with no joined members is `Empty`, so it
-/// goes, with the ids that wait to join it. A join with one of those ids gets
-/// `UNKNOWN_MEMBER_ID`, and the client joins again from scratch.
-pub fn remove_empty(groups: &mut Groups, group_id: &StrBytes, now: Instant) -> GroupRemoval {
+/// Kafka's `ClassicGroup.validateDeleteGroup`. A group with no joined members is `Empty`, and
+/// `DeleteGroups` deletes it.
+pub fn group_removal(groups: &mut Groups, group_id: &StrBytes, now: Instant) -> GroupRemoval {
     if !tick_group(groups, group_id, now) {
         return GroupRemoval::Absent;
     }
@@ -1498,10 +1495,18 @@ pub fn remove_empty(groups: &mut Groups, group_id: &StrBytes, now: Instant) -> G
         .get(group_id)
         .is_some_and(|group| !group.members.is_empty())
     {
-        return GroupRemoval::Live;
+        GroupRemoval::Live
+    } else {
+        GroupRemoval::Empty
     }
-    groups.remove(group_id);
-    GroupRemoval::Removed
+}
+
+/// Removes `group_id` when it is [`GroupRemoval::Empty`], with the ids that wait to join it. A join
+/// with one of those ids gets `UNKNOWN_MEMBER_ID`, and the client joins again from scratch.
+pub fn remove_empty(groups: &mut Groups, group_id: &StrBytes, now: Instant) {
+    if group_removal(groups, group_id, now) == GroupRemoval::Empty {
+        groups.remove(group_id);
+    }
 }
 
 /// Kafka's `ClassicGroup.validateOffsetDelete` and `isSubscribedToTopic`.
@@ -1521,32 +1526,35 @@ pub fn offset_deletion(groups: &mut Groups, group_id: &StrBytes, now: Instant) -
     OffsetDeletion::Allowed(group.subscribed())
 }
 
-/// The topics of a consumer's `ConsumerProtocolSubscription`: a version, then the topics and the
-/// user data of v0, which every later version keeps as its prefix. Kafka reads the same prefix.
-/// `None` when the bytes do not hold it.
+/// Adds the topics of a consumer's `ConsumerProtocolSubscription` to `topics`. The bytes hold a
+/// version, then the topics and the user data of v0, which every later version keeps as its
+/// prefix. Kafka reads the same prefix. `None` when the bytes do not hold it, or for a negative
+/// version, which Kafka's `ConsumerProtocol.checkSubscriptionVersion` refuses.
 ///
 /// Read by hand, not by `kafka_protocol`, which sizes a `Vec` from a declared count before it
-/// checks the bytes (see `protocol::bounds_guard`), and a member chose these bytes.
-fn subscription_topics(metadata: &[u8]) -> Option<Vec<String>> {
+/// checks the bytes (see `protocol::bounds_guard`), and a member chose these bytes. Nothing is
+/// reserved from the count either, since this runs under the coordinator's lock.
+fn add_subscription_topics(metadata: &[u8], topics: &mut HashSet<String>) -> Option<()> {
     let mut rest = metadata;
-    let _version = take_i16(&mut rest)?;
+    if take_i16(&mut rest)? < 0 {
+        return None;
+    }
     let count = usize::try_from(take_i32(&mut rest)?).ok()?;
     // Each topic takes at least its 2 length bytes.
     if count > rest.len() / 2 {
         return None;
     }
-    let mut topics = Vec::with_capacity(count);
     for _ in 0..count {
         let len = usize::try_from(take_i16(&mut rest)?).ok()?;
         let (name, after) = rest.split_at_checked(len)?;
-        topics.push(String::from_utf8_lossy(name).into_owned());
+        topics.insert(String::from_utf8_lossy(name).into_owned());
         rest = after;
     }
     // A negative length is null user data.
     if let Ok(user_data_len) = usize::try_from(take_i32(&mut rest)?) {
         rest.get(..user_data_len)?;
     }
-    Some(topics)
+    Some(())
 }
 
 fn take_i16(rest: &mut &[u8]) -> Option<i16> {
@@ -2683,6 +2691,15 @@ mod tests {
         Subscribed::Topics(names.iter().map(|name| (*name).to_owned()).collect())
     }
 
+    /// The topics that `add_subscription_topics` reads from `metadata`, in name order.
+    fn subscription_topics(metadata: &[u8]) -> Option<Vec<String>> {
+        let mut topics = HashSet::new();
+        add_subscription_topics(metadata, &mut topics)?;
+        let mut topics: Vec<String> = topics.into_iter().collect();
+        topics.sort_unstable();
+        Some(topics)
+    }
+
     /// Every version of the consumer protocol starts with the v0 fields, so the topics read the
     /// same from each.
     #[test]
@@ -2715,6 +2732,16 @@ mod tests {
         assert_eq!(subscription_topics(b"subscription"), None);
     }
 
+    /// Kafka's `checkSubscriptionVersion` refuses a negative version, and the member then counts
+    /// as subscribed to every topic.
+    #[test]
+    fn given_a_negative_subscription_version_should_read_none() {
+        let mut negative = subscription(0, &["orders"]).to_vec();
+        negative[..2].copy_from_slice(&(-1_i16).to_be_bytes());
+
+        assert_eq!(subscription_topics(&negative), None);
+    }
+
     /// Kafka's `ClassicGroup.validateDeleteGroup`: only a group without joined members goes.
     #[test]
     fn given_each_kind_of_group_when_deleting_it_should_remove_only_a_group_without_members() {
@@ -2722,23 +2749,29 @@ mod tests {
         let now = Instant::now();
         let mut groups = Groups::new();
         assert_eq!(
-            remove_empty(&mut groups, &group_id(), now),
+            group_removal(&mut groups, &group_id(), now),
             GroupRemoval::Absent
         );
 
         let _ = join_step(&mut groups, &config, &request("", &["range"]), now);
         assert_eq!(
-            remove_empty(&mut groups, &group_id(), now),
+            group_removal(&mut groups, &group_id(), now),
             GroupRemoval::Live
         );
+        remove_empty(&mut groups, &group_id(), now);
         assert!(groups.contains_key(&group_id()));
 
         let mut groups = Groups::new();
         let pending = member_id_of(&join_step(&mut groups, &config, &pending_request(), now));
         assert_eq!(
-            remove_empty(&mut groups, &group_id(), now),
-            GroupRemoval::Removed
+            group_removal(&mut groups, &group_id(), now),
+            GroupRemoval::Empty
         );
+        assert!(
+            groups.contains_key(&group_id()),
+            "the check removes nothing"
+        );
+        remove_empty(&mut groups, &group_id(), now);
         assert!(groups.is_empty());
         let rejoin = JoinRequest {
             require_known_member_id: true,

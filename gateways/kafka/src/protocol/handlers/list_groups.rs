@@ -25,9 +25,10 @@
 //! does the same ("if invalid, no groups are returned").
 //!
 //! The groups that hold offsets come from a scan that costs one Iggy call per topic, and one scan
-//! answers for 10 s (`IggyBridge::offset_groups`). A filter that leaves out `Empty` or `classic`
-//! needs no scan. When no scan has found the groups yet, the answer is
-//! `COORDINATOR_LOAD_IN_PROGRESS` (14), which clients retry.
+//! answers for a while (`IggyBridge::offset_groups`). A filter that leaves out `Empty` or
+//! `classic` needs no scan. While the first scan runs, the answer is
+//! `COORDINATOR_LOAD_IN_PROGRESS` (14), which clients retry. When no scan could find the groups,
+//! the answer has only the groups this coordinator holds, as before the gateway knew of them.
 
 use std::collections::HashSet;
 
@@ -36,7 +37,7 @@ use kafka_protocol::messages::list_groups_response::ListedGroup;
 use kafka_protocol::messages::{GroupId, ListGroupsRequest, ListGroupsResponse};
 use kafka_protocol::protocol::StrBytes;
 
-use crate::bridge::OffsetGroups;
+use crate::bridge::{OffsetGroups, ScannedGroups};
 use crate::error::Result;
 use crate::group::{GROUP_STATE_EMPTY, GroupListing};
 use crate::protocol::api::{
@@ -90,14 +91,20 @@ pub async fn handle(
         && selected(&request.types_filter, CLASSIC_GROUP_TYPE);
     if lists_offsets_only && let Some(bridge) = &state.bridge {
         let deadline = offset_deadline(state, connection).await;
-        let Some(offset_groups) = bridge.offset_groups(deadline).await else {
-            tracing::debug!("ListGroups found no scan of the groups that hold offsets yet");
-            return respond_or_close(
-                encode_error_response(api_version, ERROR_COORDINATOR_LOAD_IN_PROGRESS),
-                "ListGroups",
-            );
-        };
-        add_offsets_only(&mut listings, &offset_groups);
+        match bridge.offset_groups(deadline).await {
+            ScannedGroups::Found(offset_groups) => add_offsets_only(&mut listings, &offset_groups),
+            ScannedGroups::Pending => {
+                tracing::debug!(
+                    "ListGroups waits for the first scan of the groups that hold offsets"
+                );
+                return respond_or_close(
+                    encode_error_response(api_version, ERROR_COORDINATOR_LOAD_IN_PROGRESS),
+                    "ListGroups",
+                );
+            }
+            // The scan logged why. The groups this coordinator holds still answer.
+            ScannedGroups::Failed => {}
+        }
     }
     let listings: Vec<GroupListing> = listings
         .into_iter()
@@ -239,12 +246,70 @@ pub fn encode_error_response(version: i16, error_code: i16) -> Result<Bytes> {
 
 #[cfg(test)]
 mod tests {
-    use kafka_protocol::protocol::StrBytes;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use bytes::{Bytes, BytesMut};
+    use kafka_protocol::messages::{ListGroupsRequest, ListGroupsResponse};
+    use kafka_protocol::protocol::{Decodable, Encodable, StrBytes};
+    use tokio_util::sync::CancellationToken;
 
     use super::{
-        API_KEY_LIST_GROUPS, GroupListing, encode_response, list_response_frame_len, listed_group,
+        API_KEY_LIST_GROUPS, GroupListing, encode_response, handle, list_response_frame_len,
+        listed_group,
     };
+    use crate::bridge::IggyBridge;
+    use crate::group::{
+        CONSUMER_PROTOCOL_TYPE, GroupCoordinator, GroupCoordinatorConfig, JoinRequest,
+    };
+    use crate::protocol::api::{ConnectionState, ERROR_NONE, GatewayState};
     use crate::protocol::header::response_header_version;
+
+    /// With Iggy out of reach no scan finds the groups that hold offsets. The groups this
+    /// coordinator holds still answer, as they did before the gateway knew of the others.
+    #[tokio::test]
+    async fn given_a_scan_that_failed_should_list_the_groups_of_this_coordinator() {
+        let groups = GroupCoordinatorConfig {
+            initial_rebalance_delay: Duration::ZERO,
+            ..GroupCoordinatorConfig::default()
+        };
+        let state = GatewayState::new(
+            Some(Arc::new(IggyBridge::offline())),
+            8 * 1024 * 1024,
+            0,
+            GroupCoordinator::new(groups, CancellationToken::new()),
+        );
+        let joined = state
+            .groups
+            .join(&JoinRequest {
+                group_id: StrBytes::from_static_str("orders-app"),
+                session_timeout: Duration::from_secs(10),
+                rebalance_timeout: Duration::from_secs(10),
+                member_id: StrBytes::new(),
+                group_instance_id: None,
+                protocol_type: StrBytes::from_static_str(CONSUMER_PROTOCOL_TYPE),
+                protocols: vec![(StrBytes::from_static_str("range"), Bytes::new())],
+                require_known_member_id: false,
+                supports_skip_assignment: false,
+            })
+            .await;
+        assert_eq!(joined.error, ERROR_NONE);
+        let mut body = BytesMut::new();
+        ListGroupsRequest::default().encode(&mut body, 5).unwrap();
+
+        let mut response = handle(&state, &ConnectionState::default(), 5, body.freeze())
+            .await
+            .expect_response("ListGroups answers");
+        let response = ListGroupsResponse::decode(&mut response, 5).unwrap();
+
+        assert_eq!(response.error_code, ERROR_NONE);
+        let listed: Vec<&str> = response
+            .groups
+            .iter()
+            .map(|group| group.group_id.0.as_str())
+            .collect();
+        assert_eq!(listed, ["orders-app"]);
+    }
 
     /// v0-v2 header is 4 bytes, v3+ is 5. v4 adds the state string and v3+ adds a tag byte.
     /// Group id and protocol type sit past the compact-varint boundary so a 1-byte length

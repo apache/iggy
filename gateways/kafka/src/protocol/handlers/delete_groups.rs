@@ -22,18 +22,23 @@
 //! a group with members gets `NON_EMPTY_GROUP` (68), and a group that does not exist gets
 //! `GROUP_ID_NOT_FOUND` (69). A group exists here while ids wait to join it, or while it holds
 //! offsets in Iggy. The gateway deletes the Iggy group `kafka.cg.<group>` on every Kafka topic,
-//! and Iggy deletes the offsets with it (`IggyBridge::delete_offset_groups`).
+//! and Iggy deletes the offsets with it (`IggyBridge::delete_offset_groups`). The ids that wait to
+//! join a group go only once its offsets did, so a deletion that fails changes nothing, as in
+//! Kafka.
 //!
 //! While the deletion runs, the group takes no join and no commit: both get
 //! `COORDINATOR_LOAD_IN_PROGRESS` (14), which clients retry. The deletion waits for each commit
 //! that passed its check before the deletion began, and answers 14 when one still runs at the
-//! deadline. A member on another gateway is not seen here, so a group whose members all use
-//! another gateway is deleted (`docs/OFFSET_STORAGE.md`).
+//! deadline. A commit or a deletion runs until its Iggy calls end, also those that its request
+//! stopped waiting for, for at most 45 s. A deletion that does not end by the deadline answers 14
+//! too. Some topics can then hold no offsets of the group while others still do, and a retry
+//! deletes the rest. A member on another gateway is not seen here, so a group whose members all
+//! use another gateway is deleted (`docs/OFFSET_STORAGE.md`).
 //!
-//! With SASL on, a principal without `manage_topics` gets `GROUP_AUTHORIZATION_FAILED` (30) for
-//! every group, and nothing is deleted. Each group to delete also gets 30, and nothing is deleted,
-//! when the bridge user may not list the Iggy groups of a Kafka topic: a group can hold offsets
-//! there.
+//! When a listener names principals, a principal without a global `manage_topics` or
+//! `manage_streams` gets `GROUP_AUTHORIZATION_FAILED` (30) for every group, and nothing is
+//! deleted. Each group to delete also gets 30, and nothing is deleted, when the bridge user may
+//! not list the Iggy groups of a Kafka topic: a group can hold offsets there.
 //!
 //! An id repeated in one request is answered once, as in `DescribeGroups`. The response has no
 //! top-level error, so a request that cannot be decoded closes the connection.
@@ -116,6 +121,16 @@ pub async fn handle(
     respond_or_close(encode_response(api_version, results), "DeleteGroups")
 }
 
+/// What one group of a request gets before the Iggy step.
+#[derive(Clone, Copy)]
+enum Plan {
+    /// This answer, and nothing to delete.
+    Answer(i16),
+    /// Its offsets go. `held`: this coordinator holds the group, so it exists even when no topic
+    /// holds its offsets.
+    Delete { held: bool },
+}
+
 /// One code per group of `group_ids`, in order.
 async fn delete(
     state: &GatewayState,
@@ -128,51 +143,90 @@ async fn delete(
         .cloned()
         .collect();
     // Until this drops, the groups whose offsets go take no join and no commit.
-    let (removals, deletion) = state.groups.remove_empty(&valid).await;
+    let (removals, deletion) = state.groups.group_deletion(&valid).await;
     let mut removals = removals.into_iter();
-    // Per group: its answer, or whether the coordinator held it when its offsets are to go.
-    let plans: Vec<core::result::Result<bool, i16>> = group_ids
+    let plans: Vec<Plan> = group_ids
         .iter()
         .map(|group_id| {
             if !is_valid_group_id(group_id) {
-                return Err(ERROR_INVALID_GROUP_ID);
+                return Plan::Answer(ERROR_INVALID_GROUP_ID);
             }
             match removals.next() {
-                Some(GroupRemoval::Live) => Err(ERROR_NON_EMPTY_GROUP),
-                removal => Ok(removal == Some(GroupRemoval::Removed)),
+                Some(GroupRemoval::Live) => Plan::Answer(ERROR_NON_EMPTY_GROUP),
+                removal => Plan::Delete {
+                    held: removal == Some(GroupRemoval::Empty),
+                },
             }
         })
         .collect();
-    let deletable: Vec<&str> = group_ids
+    // The index in `group_ids` of each group whose offsets go.
+    let deletable: Vec<usize> = plans
         .iter()
-        .zip(&plans)
-        .filter(|(_, plan)| plan.is_ok())
-        .map(|(group_id, _)| group_id.as_str())
+        .enumerate()
+        .filter(|(_, plan)| matches!(plan, Plan::Delete { .. }))
+        .map(|(at, _)| at)
         .collect();
-    let mut deleted = match &state.bridge {
-        Some(bridge) if !deletable.is_empty() => {
-            let calls = OffsetCalls::new(offset_deadline(state, connection).await);
-            if deletion.commits_ended(calls.deadline()).await {
-                delete_offsets(bridge, &deletable, &calls).await
+    let names: Vec<&str> = deletable.iter().map(|&at| group_ids[at].as_str()).collect();
+    let mut codes: Vec<i16> = plans
+        .iter()
+        .map(|plan| match plan {
+            Plan::Answer(code) => *code,
+            Plan::Delete { .. } => ERROR_NONE,
+        })
+        .collect();
+    let found = match &state.bridge {
+        Some(bridge) if !names.is_empty() => {
+            let deadline = offset_deadline(state, connection).await;
+            if deletion.commits_ended(deadline).await {
+                // Each delete keeps the groups fenced until its Iggy calls end, also past the
+                // deadline, so no commit lands while a delete can still land.
+                let calls = OffsetCalls::new(deadline).keeping(deletion);
+                let found = delete_offsets(bridge, &names, &calls).await;
+                // Still fenced by `calls`, so no member joins before the removal.
+                remove_emptied(state, group_ids, &plans, &deletable, &found).await;
+                found
             } else {
-                vec![Err(ERROR_COORDINATOR_LOAD_IN_PROGRESS); deletable.len()]
+                vec![Err(ERROR_COORDINATOR_LOAD_IN_PROGRESS); names.len()]
             }
         }
-        _ => Vec::new(),
-    }
-    .into_iter();
-    drop(deletion);
-    plans
-        .into_iter()
-        .map(|plan| match plan {
+        // Without a bridge no group holds offsets.
+        _ => {
+            let found = vec![Ok(false); names.len()];
+            remove_emptied(state, group_ids, &plans, &deletable, &found).await;
+            found
+        }
+    };
+    for (&at, found) in deletable.iter().zip(found) {
+        let Plan::Delete { held } = plans[at] else {
+            continue;
+        };
+        codes[at] = match found {
+            Ok(found) if found || held => ERROR_NONE,
+            Ok(_) => ERROR_GROUP_ID_NOT_FOUND,
             Err(code) => code,
-            Ok(held) => match deleted.next().unwrap_or(Ok(false)) {
-                Ok(found) if found || held => ERROR_NONE,
-                Ok(_) => ERROR_GROUP_ID_NOT_FOUND,
-                Err(code) => code,
-            },
-        })
-        .collect()
+        };
+    }
+    codes
+}
+
+/// Removes from the coordinator each group of `deletable` that it holds and whose offsets went,
+/// with the ids that wait to join it. `found` has one result per group of `deletable`.
+async fn remove_emptied(
+    state: &GatewayState,
+    group_ids: &[StrBytes],
+    plans: &[Plan],
+    deletable: &[usize],
+    found: &[core::result::Result<bool, i16>],
+) {
+    let emptied: Vec<StrBytes> = deletable
+        .iter()
+        .zip(found)
+        .filter(|&(&at, found)| matches!(plans[at], Plan::Delete { held: true }) && found.is_ok())
+        .map(|(&at, _)| group_ids[at].clone())
+        .collect();
+    if !emptied.is_empty() {
+        state.groups.remove_empty(&emptied).await;
+    }
 }
 
 /// Deletes the offsets of each group of `groups` in Iggy. Whether any topic held the group, or
@@ -425,6 +479,37 @@ mod tests {
         assert_eq!(
             codes(&state, None, 2, &["orders-app"]).await,
             vec![("orders-app".to_string(), ERROR_COORDINATOR_LOAD_IN_PROGRESS)]
+        );
+    }
+
+    /// Kafka changes nothing on a `DeleteGroups` that fails. With Iggy out of reach, a group whose
+    /// ids wait to join keeps them, so the client that holds one still joins.
+    #[tokio::test]
+    async fn given_a_deletion_that_fails_should_keep_the_ids_that_wait_to_join() {
+        let groups = GroupCoordinatorConfig {
+            initial_rebalance_delay: Duration::ZERO,
+            ..GroupCoordinatorConfig::default()
+        };
+        let state = GatewayState::new(
+            Some(Arc::new(IggyBridge::offline())),
+            8 * 1024 * 1024,
+            0,
+            GroupCoordinator::new(groups, CancellationToken::new()),
+        );
+        let pending = state.groups.join(&join_request("waiting", true)).await;
+        assert_eq!(pending.error, ERROR_MEMBER_ID_REQUIRED);
+
+        let answered = codes(&state, None, 2, &["waiting"]).await;
+        assert_ne!(answered[0].1, ERROR_NONE, "Iggy is out of reach");
+
+        let claim = JoinRequest {
+            member_id: pending.member_id,
+            ..join_request("waiting", true)
+        };
+        assert_eq!(
+            state.groups.join(&claim).await.error,
+            ERROR_NONE,
+            "the id still joins"
         );
     }
 
