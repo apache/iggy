@@ -236,6 +236,16 @@ enum Requests {
         return writer.bytes
     }
 
+    /// The user an ``updateUser(userID:username:status:options:)`` payload
+    /// names and its new name, nil when the name stays.
+    static func renamedUser(_ payload: [UInt8]) throws -> (userID: Identifier, username: String?) {
+        try Responses.decode(payload[...]) { reader in
+            let userID = try Identifier.decode(from: &reader)
+            let renames = try reader.readUInt8() != 0
+            return (userID, renames ? try reader.readName() : nil)
+        }
+    }
+
     static func updatePermissions(userID: Identifier, permissions: Permissions?) throws -> [UInt8] {
         var writer = ByteWriter()
         try userID.encode(into: &writer)
@@ -251,6 +261,16 @@ enum Requests {
         try writer.writeName(currentPassword)
         try writer.writeName(newPassword)
         return writer.bytes
+    }
+
+    /// The user a ``changePassword(userID:currentPassword:newPassword:)``
+    /// payload names and its new password.
+    static func changedPassword(_ payload: [UInt8]) throws -> (userID: Identifier, newPassword: String) {
+        try Responses.decode(payload[...]) { reader in
+            let userID = try Identifier.decode(from: &reader)
+            _ = try reader.readName()
+            return (userID, try reader.readName())
+        }
     }
 
     /// `[protocol_version:u32][sdk_name][sdk_version]`, the prefix of both

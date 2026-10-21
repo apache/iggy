@@ -230,6 +230,9 @@ iggy+tcp://iggy:iggy@127.0.0.1:8090?tls=true&tls_domain=localhost&tls_ca_file=/p
   retained operations. The client keeps the proved outcomes of its last
   `max_pending_operations` replays, also across a session reset. A later
   `resolveOperation()` of a proved operation returns the same outcome without a request.
+- Receipt access follows the server's [session and revocation policy](../../core/server/README.md#sessions-and-retry-receipts).
+  An unresolved operation cannot recover its receipt after its original session
+  ends, even after a new login or account reactivation. A fresh send can duplicate it.
 - Methods are exposed to PHP as camelCase, for example `createStream()` and
   `pollMessages()`.
 - Classes live in the `Iggy` namespace, for example `Iggy\Client` and

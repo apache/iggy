@@ -26,7 +26,7 @@ import { ResponseFrameDecoder, ProtocolFrameError } from './client.frame.js';
 import type { ClientConfig } from './client.type.js';
 import { Command, HEADER_SIZE, REPLY_OFFSET, REQUEST_OFFSET, encodeRequestHeader } from '../wire/vsr/header.js';
 import { Operation } from '../wire/vsr/operation.js';
-import { FrozenFrame, OPERATION_TIMEOUT_MS } from './client.operation.js';
+import { FrozenFrame, OPERATION_TIMEOUT_MS, VsrResponseTimeoutError } from './client.operation.js';
 
 const TLS_CERTIFICATE = readFileSync(new URL('../../../../core/certs/iggy_cert.pem', import.meta.url));
 const TLS_KEY = readFileSync(new URL('../../../../core/certs/iggy_key.pem', import.meta.url));
@@ -163,6 +163,38 @@ describe('IggyConnection multiplexing', () => {
       assert.ok((await exchange(connection, 1n, canceled.signal)).error);
       assert.equal((await exchange(connection, 2n)).response?.subarray(HEADER_SIZE).toString(), 'alive');
       assert.equal(connection.connected, true);
+    } finally { await closeConnection(connection, server); }
+  });
+
+  it('times out an expired deadline before building a frame', async () => {
+    const server = await startServer();
+    const connection = new IggyConnection(connectionConfig(server));
+    let built = 0;
+    try {
+      await connection.connect();
+      const result = await connection.exchange(() => { built += 1; return requestFrame(1n); },
+        Date.now() - 1, new AbortController().signal);
+      assert.ok(result.error instanceof VsrResponseTimeoutError);
+      assert.match(String(result.error), /after 0 ms/);
+      assert.equal(result.started, false);
+      assert.equal(built, 0);
+    } finally { await closeConnection(connection, server); }
+  });
+
+  it('reports a caller abort ahead of an expired deadline', async () => {
+    const server = await startServer();
+    const connection = new IggyConnection(connectionConfig(server));
+    const cancel = new AbortController();
+    const reason = new Error('caller canceled');
+    let built = 0;
+    try {
+      await connection.connect();
+      cancel.abort(reason);
+      const result = await connection.exchange(() => { built += 1; return requestFrame(1n); },
+        Date.now() - 1, cancel.signal);
+      assert.equal(result.error, reason);
+      assert.equal(result.started, false);
+      assert.equal(built, 0);
     } finally { await closeConnection(connection, server); }
   });
 

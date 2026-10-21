@@ -395,6 +395,7 @@ pub struct ProducerSendError {
     cause: String,
     operation_id: Option<u64>,
     failed: Arc<Vec<RustIggyMessage>>,
+    uncertain: usize,
     committed: Arc<Vec<RustSendMessagesConfirmationResponse>>,
 }
 
@@ -414,8 +415,8 @@ impl ProducerSendError {
     }
 
     /// Messages without a usable confirmation after the failure.
-    /// For an `uncertain` cause, the first chunk may already have committed:
-    /// resolve its operation ID without resubmitting the payload as a new send.
+    /// For an `uncertain` cause, the first `uncertain` messages may already have
+    /// committed: resolve its operation ID without resubmitting them as a new send.
     /// For `lane_blocked`, none of these messages was sent; resolve the earlier
     /// blocker before retrying. `not_retained` does not prove non-commit.
     /// Before any safe resubmission, restore payloads changed by encryption.
@@ -425,6 +426,13 @@ impl ProducerSendError {
             .iter()
             .map(SendMessage::clone_from_rust)
             .collect()
+    }
+
+    /// How many messages at the head of `failed` the operation of an `uncertain`
+    /// cause carried, which may have committed. Zero for any other cause.
+    #[getter]
+    fn uncertain(&self) -> usize {
+        self.uncertain
     }
 
     /// Confirmations returned for chunks committed before the failure.
@@ -441,15 +449,11 @@ impl ProducerSendError {
     fn new_err(
         cause: IggyError,
         failed: Arc<Vec<RustIggyMessage>>,
+        uncertain: usize,
         committed: Arc<Vec<RustSendMessagesConfirmationResponse>>,
     ) -> PyErr {
         Python::attach(|py| {
-            let operation_id = match &cause {
-                IggyError::OperationUncertain(operation_id)
-                | IggyError::LaneBlocked(operation_id)
-                | IggyError::OperationNotRetained(operation_id) => Some(*operation_id),
-                _ => None,
-            };
+            let operation_id = cause.operation_id();
             let message = format!("Producer send failed: {cause}");
             let cause_message = cause.to_string();
             let cause_error = to_runtime_error(cause);
@@ -459,6 +463,7 @@ impl ProducerSendError {
                     cause: cause_message,
                     operation_id,
                     failed,
+                    uncertain,
                     committed,
                 },
             ) {
@@ -853,9 +858,10 @@ fn to_send_error(error: IggyError) -> PyErr {
         IggyError::ProducerSendFailed {
             cause,
             failed,
+            uncertain,
             committed,
             ..
-        } => ProducerSendError::new_err(*cause, failed, committed),
+        } => ProducerSendError::new_err(*cause, failed, uncertain, committed),
         error => to_runtime_error(error),
     }
 }
@@ -960,17 +966,19 @@ mod tests {
                     _ => None,
                 };
                 let cause_message = cause.to_string();
+                let uncertain = usize::from(matches!(cause, IggyError::OperationUncertain(_)));
                 let error = to_send_error(IggyError::ProducerSendFailed {
                     cause: Box::new(cause),
                     failed: Arc::new(vec![RustIggyMessage::from_str("failed").unwrap()]),
+                    uncertain,
                     committed: Arc::new(vec![RustSendMessagesConfirmationResponse {
                         stream_id: 1,
                         topic_id: 2,
                         partition_id: 3,
                         base_offset: 4,
                     }]),
-                    stream_name: "stream".to_owned(),
-                    topic_name: "topic".to_owned(),
+                    stream_name: "stream".into(),
+                    topic_name: "topic".into(),
                 });
 
                 assert!(error.is_instance_of::<ProducerSendError>(py));
@@ -993,6 +1001,15 @@ mod tests {
                     .unwrap();
                 assert_eq!(failed.len(), 1);
                 assert_eq!(failed[0].borrow(py).inner.payload.as_ref(), b"failed");
+                assert_eq!(
+                    error
+                        .value(py)
+                        .getattr("uncertain")
+                        .unwrap()
+                        .extract::<usize>()
+                        .unwrap(),
+                    uncertain
+                );
 
                 let committed = error
                     .value(py)

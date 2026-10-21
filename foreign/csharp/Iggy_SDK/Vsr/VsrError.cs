@@ -36,8 +36,10 @@ internal static class VsrError
     internal const int INVALID_CREDENTIALS = 42;
     internal const int INVALID_USERNAME = 43;
     internal const int INVALID_PASSWORD = 44;
+    internal const int USER_INACTIVE = 47;
     internal const int PERSONAL_ACCESS_TOKEN_ALREADY_EXISTS = 51;
     internal const int INVALID_PERSONAL_ACCESS_TOKEN = 53;
+    internal const int PERSONAL_ACCESS_TOKEN_EXPIRED = 54;
     internal const int TRANSIENT_NOT_COMMITTED = 57;
     internal const int TRANSIENT_NOT_ACCEPTED = 58;
     internal const int INVALID_SIZE_BYTES = 80;
@@ -59,9 +61,9 @@ internal static class VsrError
     internal const int REQUEST_ID_EXHAUSTED = 14005;
 
     /// <summary>A failure the client raised itself, before or instead of a server verdict.</summary>
-    internal static IggyInvalidStatusCodeException Exception(int code, string message)
+    internal static IggyInvalidStatusCodeException Exception(int code, string message, Exception? cause = null)
     {
-        return new IggyInvalidStatusCodeException(code, message);
+        return new IggyInvalidStatusCodeException(code, message, innerException: cause);
     }
 
     /// <summary>

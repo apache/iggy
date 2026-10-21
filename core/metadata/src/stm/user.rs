@@ -837,8 +837,9 @@ fn permissioner_of(items: &IdSlab<User>) -> Permissioner {
 /// `RawPersonalAccessTokenResponse` (server `reply_frame::build_raw_pat_reply`).
 ///
 /// One consequence rides on that: the secret exists only on the wire of the
-/// original reply, so a replayed request cannot be served from the client-table
-/// cache. `impls::metadata::unreplayable_secret_refusal` refuses it instead.
+/// original reply, so a replayed request with a re-minted hash cannot be served
+/// from the client-table cache. `impls::metadata::unreplayable_secret_refusal`
+/// refuses it instead.
 impl StateHandler for CreatePersonalAccessTokenRequest {
     type State = UsersInner;
     fn apply(&self, state: &mut UsersInner, timestamp: IggyTimestamp) -> ApplyReply {

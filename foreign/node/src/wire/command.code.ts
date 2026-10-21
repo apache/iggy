@@ -49,7 +49,7 @@ export const COMMAND_CODE = {
   GetOffset: 120,
   StoreOffset: 121,
   DeleteConsumerOffset: 122,
-  // 123 is retired and must never be reused.
+  // 123 and 124 are retired and must never be reused.
   GetStream: 200,
   GetStreams: 201,
   CreateStream: 202,

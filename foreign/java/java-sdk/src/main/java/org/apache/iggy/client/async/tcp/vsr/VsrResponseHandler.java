@@ -26,6 +26,7 @@ import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.util.concurrent.ScheduledFuture;
 import org.apache.iggy.exception.IggyConnectionException;
 import org.apache.iggy.exception.IggyErrorCode;
+import org.apache.iggy.exception.IggyNotConnectedException;
 import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.exception.IggyTimeoutException;
 import org.slf4j.Logger;
@@ -83,8 +84,18 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
         try {
             timeoutFuture = channel.eventLoop()
                     .schedule(
-                            () -> future.completeExceptionally(new IggyTimeoutException(
-                                    "Timed out waiting for a response to command code " + commandCode)),
+                            () -> {
+                                if (pending.operation == VsrOperation.REGISTER
+                                        && pendingRequests.remove(pending.requestId, pending)) {
+                                    // Every Register has the same request id, so its late reply would answer the next
+                                    // Register on this channel and fail its proof check.
+                                    closeChannel(
+                                            channel,
+                                            new IggyNotConnectedException("A Register timed out on this channel"));
+                                }
+                                future.completeExceptionally(new IggyTimeoutException(
+                                        "Timed out waiting for a response to command code " + commandCode));
+                            },
                             timeoutNanos,
                             TimeUnit.NANOSECONDS);
         } catch (RuntimeException error) {

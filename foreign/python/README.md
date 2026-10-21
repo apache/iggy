@@ -279,6 +279,13 @@ only. An application resend creates a new request and can duplicate messages.
 Mutation retries belong to the shared client driver. The producer no longer accepts
 `send_retries` or `send_retry_interval`; passing either raises `TypeError`. HTTP
 keeps its configured HTTP retry policy and does not support operation recovery.
+HTTP 503 `relay_refused` follows that policy; the Rust-backed HTTP retry schedule
+does not use the server's `Retry-After` header.
+
+Receipt access follows the server's [session and revocation policy](../../core/server/README.md#sessions-and-retry-receipts).
+An unresolved operation cannot recover its receipt after its original session
+ends, even after a new login or account reactivation. A fresh send can duplicate
+that operation.
 
 `PendingOperationError` exposes the exact integer `operation_id`, the numeric
 `code`, and `kind` (`"uncertain"`, `"lane_blocked"`, or `"not_retained"`). On the
@@ -308,8 +315,9 @@ subclass. Its `cause` property contains the underlying error text, and its
 optional `operation_id` identifies the retained send to resolve or abandon. Its
 `committed` property contains confirmations from completed chunks, and `failed`
 contains the remaining messages without usable confirmations. For an `uncertain`
-cause, the first chunk of `failed` may already have committed. Resolve its
-`operation_id` without submitting that chunk as a new send. For `lane_blocked`,
+cause, the first `uncertain` messages of `failed` form one chunk that may already
+have committed. Resolve its `operation_id` without submitting that chunk as a new
+send. For any other cause, `uncertain` is zero. For `lane_blocked`,
 none of `failed` was sent: the ID names an earlier operation to resolve before
 retrying. Abandonment or a session reset discards retained results, and
 `not_retained` does not prove non-commit. Resubmitting an uncertain chunk can

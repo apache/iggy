@@ -120,7 +120,7 @@ type Client interface {
 	// Authentication is required, and the permission to send the messages.
 	//
 	// The returned confirmations report where the server committed the batch.
-	// An uncertain mutation returns ierror.UncertainOutcome with its exact OperationID.
+	// An uncertain mutation returns ierror.OperationUncertain with its exact OperationID.
 	// ResolveOperation replays that retained identity; AbandonOperation releases its lane.
 	SendMessages(
 		ctx context.Context,

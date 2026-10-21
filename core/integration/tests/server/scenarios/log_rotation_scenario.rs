@@ -32,6 +32,8 @@ use tokio::time::{sleep, timeout};
 use zip::ZipArchive;
 
 const RETENTION_SECS: u64 = 30;
+/// `logging.retention` of 0 never deletes an archive by age.
+const RETENTION_OFF_SECS: u64 = 0;
 const OPERATION_TIMEOUT_SECS: u64 = 10;
 const OPERATION_LOOP_COUNT: usize = 300;
 const FROM_BYTES_TO_KB: u64 = 1000;
@@ -76,7 +78,8 @@ fn config_unlimited_archives() -> LogRotationTestConfig {
         max_single_log_size: IggyByteSize::new(100_000),
         max_total_log_size: IggyByteSize::new(0),
         rotation_check_interval: IggyDuration::ONE_SECOND,
-        retention: IggyDuration::new_from_secs(RETENTION_SECS),
+        // The check counts archives, so none may expire before it runs.
+        retention: IggyDuration::new_from_secs(RETENTION_OFF_SECS),
     }
 }
 

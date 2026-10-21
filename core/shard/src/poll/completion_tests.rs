@@ -358,7 +358,8 @@ fn apply_poll_metadata(owner: &CompletionTestShard, operation: Operation, body: 
     );
 }
 
-const BOUND_CLIENT: u128 = 41;
+// Wider than u64, so a refusal that truncated it would name another client.
+const BOUND_CLIENT: u128 = (1 << 64) + 41;
 const OTHER_CLIENT: u128 = 42;
 const BOUND_USER: u32 = 7;
 const BOUND_GROUP: u64 = 7;
@@ -736,8 +737,10 @@ fn assert_not_owned(reply: &PartitionReadReply) {
     assert!(
         matches!(
             reply,
-            PartitionReadReply::Rejected(IggyError::ConsumerGroupPartitionNotOwned(client, 0))
-                if u128::from(*client) == BOUND_CLIENT
+            PartitionReadReply::Rejected(IggyError::ConsumerGroupPartitionNotOwned(
+                BOUND_CLIENT,
+                0
+            ))
         ),
         "the poller, client {BOUND_CLIENT}, is not the installed owner, got {reply:?}"
     );
@@ -1836,6 +1839,10 @@ async fn given_metadata_transfer_when_target_is_unavailable_should_retry_only_un
                 });
 
         if transient && !target_accepted {
+            // One stall round short of the budget. A busy reply is no progress,
+            // so it must not refill this: the next stall round still spends it.
+            let charged = STATE_TRANSFER_MAX_STALL_RETRIES - 1;
+            owner.metadata_transfer_attempts.set(charged);
             for _ in 0..=STATE_TRANSFER_MAX_STALL_RETRIES {
                 owner
                     .metadata_transfer
@@ -1843,9 +1850,6 @@ async fn given_metadata_transfer_when_target_is_unavailable_should_retry_only_un
                     .as_mut()
                     .unwrap()
                     .idle_ticks = RETRY_TICKS - 1;
-                owner
-                    .metadata_transfer_attempts
-                    .set(STATE_TRANSFER_MAX_STALL_RETRIES);
 
                 owner.on_state_transfer_target(&unavailable).await;
 
@@ -1858,7 +1862,7 @@ async fn given_metadata_transfer_when_target_is_unavailable_should_retry_only_un
                 assert_eq!(session.idle_ticks, 0);
                 assert!(!session.target_accepted);
                 assert!(session.artifacts.is_empty());
-                assert_eq!(owner.metadata_transfer_attempts.get(), 0);
+                assert_eq!(owner.metadata_transfer_attempts.get(), charged);
                 assert_eq!(
                     consensus.state_transfer_stage(),
                     StateTransferStage::AwaitingTarget
@@ -1884,6 +1888,10 @@ async fn given_metadata_transfer_when_target_is_unavailable_should_retry_only_un
             assert_eq!(peer, PEER);
             assert_eq!(request.header().command, Command::RequestStateTransfer);
             assert_eq!(request.header().nonce, nonce);
+            assert_eq!(
+                owner.metadata_transfer_attempts.get(),
+                STATE_TRANSFER_MAX_STALL_RETRIES
+            );
 
             owner.on_state_transfer_target(&descriptor).await;
 

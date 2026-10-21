@@ -154,6 +154,7 @@ impl ErrorResponse {
 /// body every other route error uses), while a VSR session that cannot be
 /// established right now is a transient server condition (503) and must never
 /// masquerade as an auth failure.
+#[derive(Debug)]
 pub(in crate::http) enum AuthError {
     Unauthenticated(IggyError),
     /// The Register provably never entered the consensus pipeline (not
@@ -287,18 +288,30 @@ pub(in crate::http) enum PartitionWriteError {
     /// consensus-unavailable body) so an operator can tell admission shedding
     /// from a consensus outage.
     ServerBusy,
-    /// No committed reply within [`PARTITION_WRITE_REPLY_TIMEOUT`], or the
-    /// session's reply target was torn down mid-wait. 504: the commit may
+    /// No committed reply within [`PARTITION_WRITE_REPLY_TIMEOUT`], the
+    /// session's reply target was torn down mid-wait, or the relay lost the
+    /// write's verdict (`TransientNotCommitted`, see
+    /// [`classify_partition_reply`]). 504: the commit may
     /// still land (at-least-once), so this is a hard "outcome unknown", not a
     /// failure the server may transparently retry. Carries the write's
     /// operation so the 504 body names which write kind timed out.
     Timeout(Operation),
+    /// The caller's VSR session could not be resolved where the write is
+    /// served. Rendered as the session extractor renders it.
+    Session(AuthError),
+}
+
+impl From<AuthError> for PartitionWriteError {
+    fn from(error: AuthError) -> Self {
+        Self::Session(error)
+    }
 }
 
 impl IntoResponse for PartitionWriteError {
     fn into_response(self) -> Response {
         match self {
             Self::Rejected(error) => CustomError::from(error).into_response(),
+            Self::Session(error) => error.into_response(),
             Self::NotFound => CustomError::ResourceNotFound.into_response(),
             Self::Unavailable => service_unavailable(),
             Self::TooManyInFlight => too_many_in_flight_response(),
@@ -410,7 +423,9 @@ fn server_busy_response() -> Response {
 /// delay. `linearizable` demands the freshest committed state and is honored
 /// only on the primary; a follower redirects (307) to the primary when its HTTP
 /// address resolves from the roster, else fails closed to 503 (see
-/// [`read_local`]).
+/// [`read_local`]). A partition read is the exception: a follower that can
+/// relay holds for the metadata primary's commit floor and serves it through
+/// the partition primary instead (see `handlers::partition_read_consistency`).
 #[derive(Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(in crate::http) enum Consistency {

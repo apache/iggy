@@ -23,7 +23,7 @@
 
 use crate::links::{Frame, Reply};
 use crate::vsr::{decode_eviction, eviction_reason, peek_command, reply_request_id, response_size};
-use bytes::{BufMut, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use iggy_binary_protocol::consensus::{Command, EvictionReason, HEADER_SIZE};
@@ -387,8 +387,10 @@ async fn write_tcp<W: AsyncWrite + Unpin>(
 ) {
     while let Some(frame) = shared.next_frame(&mut frames).await {
         let written = async {
-            writer.write_all(bytemuck::bytes_of(&frame.header)).await?;
-            writer.write_all(&frame.body).await?;
+            // One write for both: a header sent alone makes Nagle hold the
+            // body until the peer acknowledges the header, which it delays.
+            let mut bytes = Buf::chain(bytemuck::bytes_of(&frame.header), &frame.body[..]);
+            writer.write_all_buf(&mut bytes).await?;
             // A frame queued behind this one goes out with the same flush.
             if frames.is_empty() {
                 writer.flush().await?;
@@ -511,10 +513,13 @@ async fn read_websocket<S: AsyncRead + AsyncWrite + Unpin>(
 mod tests {
     use super::*;
     use crate::links::test_support::{
-        CLIENT, DUPLEX_CAPACITY, LOCALHOST, read_request_header, reply, request,
+        CLIENT, DUPLEX_CAPACITY, LOCALHOST, read_request_header, reply, request, request_with_body,
     };
     use bytes::Bytes;
     use iggy_binary_protocol::consensus::{EvictionHeader, EvictionReason, RequestHeader};
+    use std::io::IoSlice;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
     use tokio::io::{DuplexStream, duplex};
     use tokio_tungstenite::{accept_async, client_async};
 
@@ -523,6 +528,56 @@ mod tests {
     const TEST_BUDGET: Duration = Duration::from_secs(5);
     /// Larger than the buffers on both sides, so a reply arrives in pieces.
     const LARGE_REPLY: usize = 3 * DUPLEX_CAPACITY;
+    /// Larger than the write buffer of a TCP link.
+    const LARGE_REQUEST: usize = 16 * 1024;
+
+    /// A socket with room for every write, as a vectored TCP socket has. It
+    /// records the bytes of each write call.
+    #[derive(Clone, Default)]
+    struct RecordingSocket {
+        writes: Arc<StdMutex<Vec<usize>>>,
+    }
+
+    impl RecordingSocket {
+        fn writes(&self) -> Vec<usize> {
+            self.writes.lock().unwrap().clone()
+        }
+
+        fn take(&self, len: usize) -> Poll<io::Result<usize>> {
+            self.writes.lock().unwrap().push(len);
+            Poll::Ready(Ok(len))
+        }
+    }
+
+    impl AsyncWrite for RecordingSocket {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.take(buf.len())
+        }
+
+        fn poll_write_vectored(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bufs: &[IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            self.take(bufs.iter().map(|buf| buf.len()).sum())
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     enum Peer {
         Tcp(DuplexStream),
@@ -608,6 +663,21 @@ mod tests {
             assert_eq!(first.unwrap().body[..], reply_body(1));
             assert_eq!(second.unwrap().body[..], reply_body(2));
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_frame_larger_than_the_write_buffer_when_sent_should_reach_the_socket_in_one_write()
+     {
+        let (reader, _peer) = duplex(DUPLEX_CAPACITY);
+        let socket = RecordingSocket::default();
+        let link = MuxLink::tcp(reader, socket.clone(), LOCALHOST);
+        let frame = request_with_body(1, BOUND_SESSION, Bytes::from(vec![0; LARGE_REQUEST]));
+
+        // The peer never answers, so the request ends at its deadline.
+        let unanswered = send(&link, frame, Instant::now() + TEST_BUDGET).await;
+
+        assert_eq!(unanswered.unwrap_err(), IggyError::Disconnected);
+        assert_eq!(socket.writes(), [HEADER_SIZE + LARGE_REQUEST]);
     }
 
     #[tokio::test]

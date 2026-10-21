@@ -21,17 +21,14 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
-	"net"
 	"os"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/apache/iggy/foreign/go/client/tcp"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
-	"github.com/apache/iggy/foreign/go/internal/command"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -218,33 +215,8 @@ func TestE2E_SplitPrimaryPollsPreserveCoordinatorMembership(t *testing.T) {
 	require.NoError(t, connected.JoinConsumerGroup(ctx, stream, topic, groupID))
 	waitForGroupAssignment(t, connected, stream, topic, groupID)
 	consumer := iggcon.NewGroupConsumer(groupID)
-	streamBytes, err := stream.MarshalBinary()
-	require.NoError(t, err)
-	topicBytes, err := topic.MarshalBinary()
-	require.NoError(t, err)
-	payload := binary.LittleEndian.AppendUint32(append(streamBytes, topicBytes...), 0)
-	body, err := connected.SendBinaryRequest(ctx, uint32(command.GetPartitionRouteCode), payload)
-	require.NoError(t, err)
-	var route iggcon.PartitionRoute
-	require.NoError(t, route.UnmarshalBinary(body))
-	metadata, err := connected.GetClusterMetadata(ctx)
-	require.NoError(t, err)
-	var primary *iggcon.ClusterNode
-	for index := range metadata.Nodes {
-		if metadata.Nodes[index].ReplicaID == route.PrimaryReplica {
-			primary = &metadata.Nodes[index]
-			break
-		}
-	}
-	require.NotNil(t, primary, "route primary must be a configured replica")
+	primaryAddress := requireSplitPrimaries(t, ctx, connected, stream, topic)
 	coordinator := connected.GetConnectionInfo().ServerAddress
-	primaryAddress := net.JoinHostPort(strings.Trim(primary.IP, "[]"), strconv.Itoa(int(primary.Endpoints.Tcp)))
-	coordinatorEndpoint, err := net.ResolveTCPAddr("tcp", coordinator)
-	require.NoError(t, err)
-	primaryEndpoint, err := net.ResolveTCPAddr("tcp", primaryAddress)
-	require.NoError(t, err)
-	require.False(t, coordinatorEndpoint.Port == primaryEndpoint.Port && coordinatorEndpoint.IP.Equal(primaryEndpoint.IP),
-		"the fixture must separate metadata and partition primaries")
 	beforeClient, err := connected.GetMe(ctx)
 	require.NoError(t, err)
 	require.Equal(t, uint32(1), beforeClient.ConsumerGroupsCount)
@@ -303,6 +275,7 @@ func TestE2E_SplitPrimaryManualCommitPreservesMembership(t *testing.T) {
 	require.NoError(t, connected.JoinConsumerGroup(ctx, stream, topic, groupID))
 	waitForGroupAssignment(t, connected, stream, topic, groupID)
 	consumer := iggcon.NewGroupConsumer(groupID)
+	requireSplitPrimaries(t, ctx, connected, stream, topic)
 	coordinator := connected.GetConnectionInfo().ServerAddress
 	beforeClient, err := connected.GetMe(ctx)
 	require.NoError(t, err)

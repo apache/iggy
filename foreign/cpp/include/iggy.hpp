@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -110,9 +111,18 @@ class IggyException : public std::runtime_error {
   public:
     explicit IggyException(const char *message) : std::runtime_error(message) {}
     explicit IggyException(const std::string &message) : std::runtime_error(message) {}
-    IggyException(const std::string &message, const ffi::ErrorInfo &error)
-        : std::runtime_error(message), kind_(error.kind) {
-        if (!kind_.empty()) {
+
+    [[nodiscard]] std::optional<std::uint32_t> Code() const noexcept { return code_; }
+    [[nodiscard]] const std::string &Kind() const noexcept {
+        static const std::string kNoKind;
+        return kind_ ? *kind_ : kNoKind;
+    }
+    [[nodiscard]] std::optional<std::uint64_t> OperationId() const noexcept { return operation_id_; }
+
+  private:
+    IggyException(const std::string &message, const ffi::ErrorInfo &error) : std::runtime_error(message) {
+        if (!error.kind.empty()) {
+            kind_ = std::make_shared<const std::string>(error.kind);
             code_ = error.code;
         }
         if (error.has_operation_id) {
@@ -120,13 +130,11 @@ class IggyException : public std::runtime_error {
         }
     }
 
-    [[nodiscard]] std::optional<std::uint32_t> Code() const noexcept { return code_; }
-    [[nodiscard]] const std::string &Kind() const noexcept { return kind_; }
-    [[nodiscard]] std::optional<std::uint64_t> OperationId() const noexcept { return operation_id_; }
+    friend class IggyBlockingClient;
 
-  private:
     std::optional<std::uint32_t> code_;
-    std::string kind_;
+    // Shared, so that copying the exception cannot throw.
+    std::shared_ptr<const std::string> kind_;
     std::optional<std::uint64_t> operation_id_;
 };
 

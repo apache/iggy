@@ -2544,11 +2544,17 @@ class ProducerSendError(builtins.RuntimeError):
     def failed(self) -> builtins.list[SendMessage]:
         r"""
         Messages without a usable confirmation after the failure.
-        For an `uncertain` cause, the first chunk may already have committed:
-        resolve its operation ID without resubmitting the payload as a new send.
+        For an `uncertain` cause, the first `uncertain` messages may already have
+        committed: resolve its operation ID without resubmitting them as a new send.
         For `lane_blocked`, none of these messages was sent; resolve the earlier
         blocker before retrying. `not_retained` does not prove non-commit.
         Before any safe resubmission, restore payloads changed by encryption.
+        """
+    @property
+    def uncertain(self) -> builtins.int:
+        r"""
+        How many messages at the head of `failed` the operation of an `uncertain`
+        cause carried, which may have committed. Zero for any other cause.
         """
     @property
     def committed(self) -> builtins.list[SendMessagesConfirmation]:

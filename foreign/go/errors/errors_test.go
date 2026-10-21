@@ -80,7 +80,7 @@ func TestIggyError_ConsensusErrors(t *testing.T) {
 			err:      ConsumerGroupPartitionNotOwned{ClientId: 4, PartitionId: 9},
 			sentinel: ErrConsumerGroupPartitionNotOwned,
 			code:     ConsumerGroupPartitionNotOwnedCode,
-			message:  "consumer group member with client id: 4 does not own partition: 9 at the current generation (rebalance in progress).",
+			message:  "consumer group member with VSR client ID: 4 does not own partition: 9 at the current generation (rebalance in progress).",
 		},
 		{
 			err:      TooManyConsumerGroups{},

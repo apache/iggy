@@ -83,7 +83,8 @@ pub use traits::binary_client::BinaryClient;
 pub use traits::binary_transport::BinaryTransport;
 #[doc(hidden)]
 pub use traits::binary_transport::{
-    BINARY_OPERATION_TIMEOUT, binary_operation_deadline, with_binary_deadline,
+    BINARY_OPERATION_TIMEOUT, BinaryOperationLineage, binary_operation_deadline,
+    binary_operation_lineage, with_binary_deadline, with_binary_lineage,
 };
 pub use traits::binary_transport::{VsrSessionControl, VsrSessionSealed, decode_session_binding};
 pub use traits::client::Client;
@@ -104,7 +105,7 @@ pub use traits::user_client::UserClient;
 pub use traits::validatable::Validatable;
 #[doc(hidden)]
 pub use traits::{BinarySendPartitioning, send_binary_messages};
-pub use traits::{rust_sdk_version_info, sign_in_request};
+pub use traits::{binary_sign_in, rust_sdk_version_info, sign_in_request};
 pub use types::args::*;
 pub use types::client::client_info::*;
 pub use types::client_state::ClientState;

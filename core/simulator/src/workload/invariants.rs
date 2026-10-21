@@ -94,6 +94,8 @@ impl Invariants {
     /// - partition `commit_offset` never regresses,
     /// - consensus `view` never regresses (a view change only advances it).
     ///
+    /// Per live replica, no metadata or partition log contradicted an op it applied.
+    ///
     /// Globally:
     /// - total in-flight requests stay within the per-client queue ceiling,
     /// - no shard has shed a frame for an `unroutable` or `misrouted` reason,
@@ -123,6 +125,7 @@ impl Invariants {
                 continue;
             }
             self.check_recovery_barrier(sim, seed, replica_idx);
+            check_applied_log_contradictions(sim, seed, replica_idx);
             self.check_commit_prefix_contiguity(
                 seed,
                 replica_idx,
@@ -308,6 +311,20 @@ impl Invariants {
     pub const fn state_checker(&self) -> &StateChecker {
         &self.state_checker
     }
+}
+
+/// Panic if a replica refused a log that names a different prepare at an op it
+/// applied (`VsrConsensus::contradicts_applied_log`).
+///
+/// Production refuses the log and keeps running. Here the refusal proves a quorum
+/// decided a log without a committed op, so the run fails where it happened.
+fn check_applied_log_contradictions(sim: &Simulator, seed: u64, replica_idx: u8) {
+    let contradictions = sim.applied_log_contradictions(usize::from(replica_idx));
+    assert_eq!(
+        contradictions, 0,
+        "replica {replica_idx} refused {contradictions} log(s) that contradict an op it \
+         applied: a quorum decided a log without a committed op (seed={seed:#x})"
+    );
 }
 
 /// Panic if any shard has shed a frame for a reason no fault can produce.

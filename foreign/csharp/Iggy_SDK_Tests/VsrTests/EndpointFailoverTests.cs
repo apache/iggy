@@ -93,14 +93,16 @@ public sealed class EndpointFailoverTests
     }
 
     [Fact]
-    public async Task given_an_invalid_base_address_when_a_known_endpoint_is_healthy_should_connect_to_it()
+    public async Task given_a_base_address_changed_after_connect_when_the_endpoint_dies_should_ignore_the_change()
     {
         using var primary = new MockNode();
         using var survivor = new MockNode();
+        using var moved = new MockNode();
         primary.Serve(request => request.Code == GET_CLUSTER_METADATA_CODE
             ? Reply(request.Operation, ClusterMetadata(primary.Port, survivor.Port, primary.Port))
             : Answer(request));
         survivor.Serve(Answer);
+        moved.Serve(Answer);
         var configuration = new IggyClientConfigurator
         {
             BaseAddress = $"127.0.0.1:{primary.Port}",
@@ -120,12 +122,13 @@ public sealed class EndpointFailoverTests
         await client.LoginUserAsync("iggy", "iggy", cancellation.Token);
         await client.LogoutUserAsync(cancellation.Token);
         primary.Kill();
-        configuration.BaseAddress = "localhost:invalid";
+        configuration.BaseAddress = $"127.0.0.1:{moved.Port}";
 
         await client.ConnectAsync(cancellation.Token);
         await client.PingAsync(cancellation.Token);
 
         Assert.Equal($"127.0.0.1:{survivor.Port}", client.GetCurrentAddress());
+        Assert.Equal(0, moved.Connections);
         Assert.Equal(1, survivor.Pings);
         Assert.Equal(0, survivor.Registrations);
     }
@@ -631,6 +634,65 @@ public sealed class EndpointFailoverTests
         await Assert.ThrowsAsync<NotConnectedException>(() => ping);
     }
 
+    [Fact]
+    public async Task SessionEndReportsDisconnectedBeforeItsResetFailsCallsWhenReconnectionIsOff()
+    {
+        using var leader = new MockNode();
+        using var follower = new MockNode();
+        ushort[] roster = [leader.Port, follower.Port];
+        var evicting = false;
+        byte[] Handle(MockRequest request)
+        {
+            if (Volatile.Read(ref evicting) && request.Code == CommandCodes.GET_STATS_CODE)
+            {
+                return EvictionFrame((byte)EvictionReason.SessionError);
+            }
+            return request.Code switch
+            {
+                GET_CLUSTER_METADATA_CODE => Reply(request.Operation, RosterMetadata(leader.Port, roster)),
+                CommandCodes.GET_PARTITION_ROUTE_CODE => RouteReply(request, new PartitionContext(17, 0, 1), 1),
+                _ => Answer(request)
+            };
+        }
+
+        leader.Serve(Handle);
+        follower.Serve(Handle);
+        using var client = new TcpMessageStream(new IggyClientConfigurator
+        {
+            BaseAddress = $"127.0.0.1:{leader.Port}",
+            Protocol = Protocol.Tcp,
+            HeartbeatInterval = TimeSpan.FromHours(1),
+            ReconnectionSettings = new ReconnectionSettings { Enabled = false }
+        }, NullLoggerFactory.Instance);
+        await client.ConnectAsync(TestContext.Current.CancellationToken);
+        await client.LoginUserAsync("iggy", "iggy", TestContext.Current.CancellationToken);
+        // The read waits for the link of the follower, which keeps the client signed in when the leader evicts it.
+        await client.GetOffsetAsync(Kinds.Consumer.New(3), Identifier.Numeric(1), Identifier.Numeric(2), 0,
+            TestContext.Current.CancellationToken);
+        var session = (ISessionGenerationProvider)client;
+        var generation = session.SessionGeneration;
+        var disconnectedUnder = new TaskCompletionSource<ulong>(TaskCreationOptions.RunContinuationsAsynchronously);
+        // The handler runs while the state is reported. The reset that fails the calls re-arms the session, so a
+        // report after it sees a later generation.
+        client.SubscribeConnectionEvents(change =>
+        {
+            if (change.CurrentState == ConnectionState.Disconnected)
+            {
+                disconnectedUnder.TrySetResult(session.SessionGeneration);
+            }
+            return Task.CompletedTask;
+        });
+        Volatile.Write(ref evicting, true);
+
+        await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() =>
+            client.GetStatsAsync(TestContext.Current.CancellationToken));
+        var reportedUnder =
+            await disconnectedUnder.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+        await UntilAsync(() => session.SessionGeneration != generation);
+
+        Assert.Equal(generation, reportedUnder);
+    }
+
     [Theory]
     [InlineData("safe read")]
     [InlineData("partition read on a cached route")]
@@ -928,7 +990,8 @@ public sealed class EndpointFailoverTests
         var registrationsBeforeEviction = node.Registrations;
 
         evict = true;
-        await Assert.ThrowsAnyAsync<Exception>(() => client.PingAsync(TestContext.Current.CancellationToken));
+        // The eviction only detached the link, so the ping goes on under the session the client signs in again.
+        await client.PingAsync(TestContext.Current.CancellationToken);
         var (resumed, lastError) = await ResumedWithin(client, TimeSpan.FromSeconds(5));
         Assert.True(resumed, lastError);
 

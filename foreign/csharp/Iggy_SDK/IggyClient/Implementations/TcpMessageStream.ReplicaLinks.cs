@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using System.Buffers.Binary;
 using System.Net.Sockets;
 using System.Security.Authentication;
 using Apache.Iggy.Contracts;
@@ -30,7 +29,6 @@ namespace Apache.Iggy.IggyClient.Implementations;
 
 public sealed partial class TcpMessageStream
 {
-    private const int MaxReplicaLinks = 256;
     private const int MaxConcurrentReplicaDials = 4;
     private const int MaxReconnectBackoffMs = 10_000;
     private readonly Dictionary<byte, ReplicaSlot> _replicaLinks = [];
@@ -63,11 +61,7 @@ public sealed partial class TcpMessageStream
             // which a port mapping or a port-forward hides. Only the configured endpoint is known to reach it.
             var single = nodes.Length == 1;
             var endpoints = nodes.ToDictionary(node => node.ReplicaId, node => single
-                ? _configuration.BaseAddress : ServerAddress.HostPort(node.Ip, node.Endpoints.Tcp));
-            if (endpoints.Count > MaxReplicaLinks)
-            {
-                throw VsrError.Exception(VsrError.INVALID_FORMAT, "Replica roster exceeds the protocol limit.");
-            }
+                ? _baseAddress : ServerAddress.HostPort(node.Ip, node.Endpoints.Tcp));
             foreach (var slot in _replicaLinks.Values.ToArray())
             {
                 if (!endpoints.TryGetValue(slot.ReplicaId, out var endpoint) || endpoint != slot.Endpoint
@@ -148,17 +142,7 @@ public sealed partial class TcpMessageStream
                     {
                         connection = await DialReplicaAsync(slot.Endpoint, token);
                         var snapshot = _consensusSession.Resolve(VsrOperation.NonReplicated);
-                        var identity = new byte[ConsumerSessionSize];
-                        BinaryPrimitives.WriteUInt128LittleEndian(identity, snapshot.ClientId);
-                        BinaryPrimitives.WriteUInt64LittleEndian(identity.AsSpan(ConsumerSessionEpochOffset), snapshot.SessionId);
-                        lock (_pollRoutingGate)
-                        {
-                            BinaryPrimitives.WriteUInt64LittleEndian(identity.AsSpan(ConsumerSessionWatermarkOffset), _metadataWatermark);
-                        }
-                        var deadline = Environment.TickCount64 + VsrRequestTimeoutMs;
-                        var binding = await connection.SendAttemptAsync(CommandCodes.BIND_SESSION_CODE,
-                            LoginRegister.SerializeBindSession(identity, _consensusSession.BindSecret), deadline, deadline,
-                            true, token, retryTransient: false);
+                        var binding = await BindSessionAsync(connection, snapshot.ClientId, snapshot.SessionId, token);
                         if (binding.Error is { } error)
                         {
                             throw error;
@@ -434,11 +418,11 @@ public sealed partial class TcpMessageStream
         }
     }
 
-    private void NotifyReplicaDrop(VsrConnection connection, ulong generation)
+    private void NotifyReplicaDrop(VsrConnection connection, ulong dialedUnder)
     {
         lock (_pollRoutingGate)
         {
-            if (IsSessionFailure(connection.Failure))
+            if (IsSessionFailure(connection.Failure) && _consensusSession.LinkGeneration(dialedUnder) is { } generation)
             {
                 ScheduleSessionRecovery(generation);
             }
@@ -496,16 +480,29 @@ public sealed partial class TcpMessageStream
             {
                 return;
             }
-            var settings = SignInSettings();
             _sessionRecoveryCancellation?.Dispose();
             var cancellation = CancellationTokenSource.CreateLinkedTokenSource(_clientLifetime.Token);
             _sessionRecoveryCancellation = cancellation;
-            _sessionRecovery = Task.Run(() => RecoverSessionAsync(generation, settings, cancellation.Token));
+            _sessionRecovery = Task.Run(() => RecoverSessionAsync(generation, cancellation.Token));
         }
     }
 
-    private async Task RecoverSessionAsync(ulong generation, Apache.Iggy.Configuration.AutoLoginSettings? settings,
-        CancellationToken token)
+    /// <summary>
+    ///     The running session recovery when it signs in again. A call that cannot have been applied yet waits for it,
+    ///     and starts over under the new session instead of failing with the old one.
+    /// </summary>
+    private Task? SignInRecovery() =>
+        _configuration.ReconnectionSettings.Enabled && SignInSettings() is not null
+        && Volatile.Read(ref _sessionRecovery) is { IsCompleted: false } recovery ? recovery : null;
+
+    /// <summary>
+    ///     Whether a call of <paramref name="generation" /> that cannot have been applied yet goes on under another
+    ///     session: a recovery signs one in, or one that continues the call's own is bound.
+    /// </summary>
+    private bool ResumesUnderNewSession(ulong generation) => SignInRecovery() is not null
+        || _consensusSession.Successor(generation) is { } successor && successor != generation;
+
+    private async Task RecoverSessionAsync(ulong generation, CancellationToken token)
     {
         var acquired = false;
         try
@@ -516,21 +513,38 @@ public sealed partial class TcpMessageStream
             {
                 return;
             }
-            ResetConsensusSession();
-            SetConnectionState(ConnectionState.Disconnected);
-            if (!_configuration.ReconnectionSettings.Enabled || settings is null)
+            if (!_configuration.ReconnectionSettings.Enabled || SignInSettings() is null)
             {
+                ResetConsensusSession(ConnectionState.Disconnected, stops: true);
                 return;
             }
-            await TryEstablishConnectionAsync(false, token);
-            await AutoLoginAsync(settings, token);
+            var attempts = 0;
+            while (_consensusSession.Ended(generation) is null && SignInSettings() is { } settings)
+            {
+                try
+                {
+                    lock (_pollRoutingGate)
+                    {
+                        EnsureSignInOwner(generation);
+                        ResetConsensusSession(ConnectionState.Disconnected, continues: true);
+                    }
+                    await TryEstablishConnectionAsync(false, token, generation);
+                    await AutoLoginAsync(settings, token, generation, continues: true);
+                    return;
+                }
+                catch (Exception error) when (!token.IsCancellationRequested
+                    && _consensusSession.Ended(generation) is null)
+                {
+                    _logger.LogWarning(error, "Consensus session recovery will retry before a sign-in decision");
+                    await Task.Delay(ReconnectDelay(attempts++), token);
+                }
+            }
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested)
         {
         }
         catch (Exception error)
         {
-            SetConnectionState(ConnectionState.Disconnected);
             _logger.LogWarning(error, "Consensus session recovery failed");
         }
         finally

@@ -54,6 +54,10 @@ enum VSRFrame {
         static let committedResult = 220
     }
 
+    /// The byte at ``ReplyOffset/committedResult`` that proves a final
+    /// committed result, `ReplyHeader::COMMITTED_RESULT` in Rust.
+    static let committedResultMarker: UInt8 = 1
+
     /// Eviction header field offsets the client reads.
     enum EvictionOffset {
         static let serverProtocolVersion = 144
@@ -216,7 +220,7 @@ enum VSRFrame {
     static func hasCommittedResult(_ header: ArraySlice<UInt8>) -> Bool {
         header.count == headerSize && peekCommand(header) == .reply
             && readReplyStatus(header) == 0
-            && header[header.startIndex + ReplyOffset.committedResult] == 1
+            && header[header.startIndex + ReplyOffset.committedResult] == committedResultMarker
     }
 
     /// The decoded fields of an eviction frame.

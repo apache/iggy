@@ -29,8 +29,8 @@ use crate::shell::{
 };
 use configs::server::ServerConfig;
 use consensus::{
-    ClientTable, JoinMode, LocalPipeline, PipelineEntry, Sequencer, VsrConsensus, VsrRestore,
-    VsrState,
+    ClientTable, HistoryRecovery, JoinMode, LocalPipeline, PipelineEntry, Sequencer, VsrConsensus,
+    VsrRestore, VsrState,
 };
 use iggy_common::{Aes256GcmEncryptor, EncryptorKind, IggyByteSize, TopicRuntimeOptions};
 use journal::Journal;
@@ -497,6 +497,7 @@ pub(in crate::boot) struct RecoveredOwnerState {
     pub(in crate::boot) superblock: PingPongSuperblock,
     pub(in crate::boot) recovered_state: Option<VsrState>,
     pub(in crate::boot) snapshot_checkpoint: (u64, u128),
+    pub(in crate::boot) history: HistoryRecovery,
 }
 
 /// Rebuild metadata consensus from what recovery read off this replica's own disk.
@@ -512,7 +513,7 @@ pub(in crate::boot) fn restore_metadata_consensus(
 ) -> VsrConsensus<Rc<IggyMessageBus>> {
     let journal = &owner.journal;
     let replica_count = topology.replica_count;
-    let recovered_state = owner.recovered_state;
+    let recovered_state = &owner.recovered_state;
     let snapshot_floor = owner
         .snapshot
         .as_ref()
@@ -581,7 +582,11 @@ pub(in crate::boot) fn restore_metadata_consensus(
             // persist-before-send gate guarantees this replica never
             // externalized a view beyond what a re-probe re-derives, and it
             // re-probes as a backup.
-            durable_view: recovered_state.map(|state| (state.view, state.log_view)),
+            // `log_view` from the history certificate, not the record: an adopted
+            // view whose log was never proven must not label this WAL.
+            durable_view: recovered_state
+                .as_ref()
+                .map(|state| (state.view, owner.history.log_view())),
             view_fallback: last_header.map(|header| header.view),
             // Metadata, not a partition group: it has a journal to infer from
             // and no second plane to line up with.
@@ -596,6 +601,11 @@ pub(in crate::boot) fn restore_metadata_consensus(
         },
     );
     consensus.sequencer().set_sequence(restored_op);
+    consensus.restore_history(
+        owner.history,
+        last_header.map_or((snapshot_floor, 0), |header| (header.op, header.checksum)),
+        recovered_state.as_ref(),
+    );
     // A SOLO replica's durable journal head IS its commit point: quorum is
     // 1-of-1, so an entry commits the instant it is durable, and the acks
     // the cluster ceremony below would wait on cannot topologically exist.
@@ -673,6 +683,12 @@ pub(in crate::boot) fn restore_metadata_consensus(
         consensus.sync_prepare_timeout();
     }
 
+    consensus.restore_adopted_view(
+        recovered_state
+            .as_ref()
+            .and_then(|state| state.adopted_view.as_ref()),
+    );
+    consensus.resume_adopted_view();
     consensus
 }
 

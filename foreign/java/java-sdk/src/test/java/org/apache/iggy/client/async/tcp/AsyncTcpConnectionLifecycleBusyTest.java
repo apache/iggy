@@ -432,10 +432,10 @@ class AsyncTcpConnectionLifecycleBusyTest {
                 throw new IllegalStateException("Unexpected request: " + request);
             });
             var failure = new IllegalStateException("replacement metadata link unavailable");
-            var connection = connection(socket, REQUEST_TIMEOUT, (source, code, body, deadline, rejection, state) -> {
-                body.release();
-                return CompletableFuture.failedFuture(failure);
-            });
+            var connection = connection(
+                    socket,
+                    REQUEST_TIMEOUT,
+                    (source, deadline, rejection, state) -> CompletableFuture.failedFuture(failure));
             try {
                 login(connection);
                 assertThatThrownBy(() -> connection
@@ -501,7 +501,7 @@ class AsyncTcpConnectionLifecycleBusyTest {
     }
 
     private static AsyncTcpConnection connection(
-            ServerSocket socket, Duration requestTimeout, AsyncTcpConnection.TransientFailoverHandler failover) {
+            ServerSocket socket, Duration requestTimeout, TransientFailoverHandler failover) {
         return new AsyncTcpConnection(
                 socket.getInetAddress().getHostAddress(),
                 socket.getLocalPort(),

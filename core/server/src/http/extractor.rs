@@ -32,6 +32,7 @@ use super::HttpState;
 use super::error::AuthError;
 use super::jwt::TokenSubject;
 use super::session::HttpSession;
+use super::state::HttpInner;
 use crate::dispatch::session_ops::verify_pat_credentials_with_expiry;
 use crate::http::ClientAddr;
 
@@ -64,39 +65,70 @@ impl FromRequestParts<HttpState> for Authenticated {
         parts: &mut Parts,
         state: &HttpState,
     ) -> Result<Self, Self::Rejection> {
-        let bearer = bearer_token(&parts.headers)?;
-
-        // Both `resolve_credential` (its JWT verify may await a `!Send` JWKS
-        // fetch through cyper) and `resolve_session` (`Rc`-based, `!Send`) must
-        // run, yet axum requires this extractor future to be `Send`.
-        // `SendWrapper` bridges each: sound because compio pins the future to
-        // shard 0's thread - the only thread the JWKS client and session table
-        // ever run on (mirrors legacy `HttpSafeShard`). Neither future holds a
-        // `RefCell` borrow or `DashMap` guard across the `.await` (each such
-        // critical section is synchronous), so a cooperatively-scheduled sibling
-        // task on this thread never observes a borrowed session table.
-        let (jwt_id, user_id, user_created_at, expiry) =
-            SendWrapper::new(resolve_credential(state, bearer)).await?;
-        // External issuers choose their own jti, and their configured username
-        // can resolve to another account later. Scope the session to this account.
-        let key = jwt_id.map_or_else(
-            || {
-                format!(
-                    "{PAT_KEY_PREFIX}{}",
-                    PersonalAccessToken::hash_token(bearer)
-                )
-            },
-            |jwt_id| {
-                format!(
-                    "{JWT_KEY_PREFIX}{user_id}:{}:{jwt_id}",
-                    user_created_at.as_micros()
-                )
-            },
-        );
-        let session =
-            SendWrapper::new(state.resolve_session(key, user_id, user_created_at, expiry)).await?;
+        let credential = Credential::from_request_parts(parts, state).await?;
+        // `resolve_session` is `Rc`-based and `!Send`, yet axum requires this
+        // extractor future to be `Send`. `SendWrapper` bridges it: sound because
+        // compio pins the future to shard 0's thread, the only thread the
+        // session table ever runs on (mirrors legacy `HttpSafeShard`). It holds
+        // no `RefCell` borrow across the `.await` (each such critical section is
+        // synchronous), so a cooperatively-scheduled sibling task on this thread
+        // never observes a borrowed session table.
+        let session = SendWrapper::new(credential.session(state)).await?;
         Ok(Self {
             session: SendWrapper::new(session),
+        })
+    }
+}
+
+/// A verified bearer with what its VSR session is keyed and leased by, but no
+/// session yet. A partition write resolves the session only where it is
+/// served ([`Self::session`]): a relayed write runs under the serving node's
+/// own session, and a `Register` on the relaying node would be a metadata
+/// commit spent on nothing.
+pub struct Credential {
+    key: String,
+    pub user_id: u32,
+    user_created_at: IggyTimestamp,
+    expiry: u64,
+}
+
+impl Credential {
+    /// Whether this node holds a live session for the credential, so serving
+    /// here Registers none.
+    pub(in crate::http) fn has_session(&self, state: &HttpInner) -> bool {
+        state.has_live_session(&self.key)
+    }
+
+    /// The credential's VSR session, minted and Registered on first use.
+    pub(in crate::http) async fn session(
+        &self,
+        state: &HttpInner,
+    ) -> Result<Rc<HttpSession>, AuthError> {
+        state
+            .resolve_session(&self.key, self.user_id, self.user_created_at, self.expiry)
+            .await
+    }
+}
+
+impl FromRequestParts<HttpState> for Credential {
+    type Rejection = AuthError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &HttpState,
+    ) -> Result<Self, Self::Rejection> {
+        let bearer = bearer_token(&parts.headers)?;
+        // The JWT verify may await a `!Send` JWKS fetch through cyper, yet axum
+        // requires this extractor future to be `Send`. `SendWrapper` bridges it,
+        // sound for the reason `Authenticated` gives: the JWKS client only ever
+        // runs on shard 0's thread.
+        let (jwt_id, user_id, user_created_at, expiry) =
+            SendWrapper::new(resolve_credential(state, bearer)).await?;
+        Ok(Self {
+            key: credential_key(bearer, jwt_id, user_id, user_created_at),
+            user_id,
+            user_created_at,
+            expiry,
         })
     }
 }
@@ -224,4 +256,30 @@ pub(in crate::http) async fn resolve_credential(
         verify_pat_credentials_with_expiry(&state.shard, bearer)
             .map_err(|_| IggyError::Unauthenticated)?;
     Ok((None, user_id, user_created_at, expiry))
+}
+
+/// Table key of a credential [`resolve_credential`] resolved: the account and
+/// `jti` of a JWT, or the PAT's hash, so the raw secret never becomes a key.
+pub(in crate::http) fn credential_key(
+    bearer: &str,
+    jwt_id: Option<String>,
+    user_id: u32,
+    user_created_at: IggyTimestamp,
+) -> String {
+    // External issuers choose their own jti, and their configured username
+    // can resolve to another account later. Scope the key to this account.
+    jwt_id.map_or_else(
+        || {
+            format!(
+                "{PAT_KEY_PREFIX}{}",
+                PersonalAccessToken::hash_token(bearer)
+            )
+        },
+        |jwt_id| {
+            format!(
+                "{JWT_KEY_PREFIX}{user_id}:{}:{jwt_id}",
+                user_created_at.as_micros()
+            )
+        },
+    )
 }

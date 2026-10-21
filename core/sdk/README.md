@@ -50,7 +50,7 @@ directories are refused without modification; `--fresh` deletes existing data
 in the configured directory. See the [server recovery guide](../server/README.md#upgrade-recovery).
 Mixed versions and rolling upgrades are unsupported. Binary clients share one
 logical session across replica links using BindSession (15) and discover
-partition primaries with GetPartitionRoute (105). Commands 14, 103, 104 and 123
+partition primaries with GetPartitionRoute (105). Commands 14, 103, 104, 123 and 124
 are retired. HTTP clients use server-side forwarding.
 
 ```bash
@@ -68,6 +68,11 @@ credential for internal session control and must never be logged or exposed.
 `refresh_session_password` and `refresh_session_username` are removed. A
 transport that signs in again applies a committed credential change where its
 calls complete.
+
+`IggyError::ProducerSendFailed` changes its public `stream_name` and `topic_name`
+fields from `String` to `Box<str>`. Existing constructors must convert their names
+with `.into()`; the callback's `ErrorCtx` fields remain `String`. The `uncertain`
+message count remains `usize`.
 
 An established session has its own lifetime. Password or PAT changes and PAT
 expiry do not end it. Logout, session lease expiry, or user deactivation end the
@@ -94,6 +99,24 @@ the outcome unknown. A session reset drops retained requests. An
 `OperationNotRetained` error does not establish the outcome. A reset or an
 abandon came before a proved outcome, or the proved outcome aged out.
 Recovery is unavailable over HTTP.
+
+Receipt access follows the server's [session and revocation policy](../server/README.md#sessions-and-retry-receipts).
+An unresolved operation cannot recover its receipt after its original session
+ends, even after a new login or account reactivation. With a live session,
+partition permission revocation prevents resolution with 41 until a re-grant;
+metadata can replay the user's own committed cached result without a new
+permission check. A fresh application send can duplicate an uncertain operation.
+
+An explicit sign-in or logout ends earlier calls: unsent calls fail with 40,
+and possibly applied mutations remain uncertain. SDK-managed recovery may keep
+an unsent call waiting for a session within its original deadline; expiry returns
+58, and a refused automatic sign-in returns 40 with the refusal as its cause.
+Recovery uses the caller's last explicit sign-in, or configured automatic
+credentials only if the caller never signed in. Logout disables automatic sign-in.
+
+HTTP 503 `relay_refused` uses the configured HTTP retry policy, regardless of
+its body code. Rust's HTTP retry schedule does not use the server's `Retry-After`
+header. This retry support does not provide retained-operation recovery.
 
 A committed password change or rename of the signed-in user updates the
 credentials that the client signs in with again. This holds for a typed call, a

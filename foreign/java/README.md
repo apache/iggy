@@ -305,7 +305,16 @@ info.getUserAgent();   // User-Agent string for HTTP
 
 The SDK's custom exception types inherit from `IggyException`. When you join a failed future, the cause can come back inside a `CompletionException`. The HTTP client's `close()` method declares `IOException`. Handle these two boundaries as well as the specific SDK errors.
 
+The HTTP client treats 503 `relay_refused` through Apache HttpClient's ordinary
+429/503 retry strategy. That behavior does not provide retained-operation
+recovery over HTTP.
+
 ### Retained TCP operations
+
+Receipt access follows the server's [session and revocation policy](../../core/server/README.md#sessions-and-retry-receipts).
+An unresolved operation cannot recover its receipt after its original session
+ends, even after a new login or account reactivation. A fresh send can duplicate
+that operation.
 
 Replicated mutations serialize within their metadata or partition lane. If a sent mutation's
 outcome cannot be established, `IggyOperationException` carries

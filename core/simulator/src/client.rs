@@ -183,10 +183,9 @@ impl SimClient {
     /// nothing, because `ClientTable` admits anything above the watermark
     /// (`client_table.rs`: "There is no `RequestGap`").
     ///
-    /// `NonReplicated` reads never reach here. The poll path builds its own
-    /// header and reads the counter without advancing it, because the server
-    /// ignores the id for ops the table never sees. The SDK spends one id per
-    /// bound read, so a link can match each reply to its request.
+    /// The server ignores the id of a `NonReplicated` read. The SDK still spends
+    /// one per bound read, so a link can match each reply to its request, and
+    /// [`Self::poll_messages_at`] does the same.
     fn next_request_id(&self) -> u64 {
         let next = self.request_counter.get() + 1;
         self.request_counter.set(next);
@@ -230,6 +229,7 @@ impl SimClient {
             iggy_binary_protocol::codes::BIND_SESSION_CODE,
             METADATA_GROUP,
             &request.to_bytes(),
+            self.request_counter.get(),
         )
     }
 
@@ -693,10 +693,9 @@ impl SimClient {
     /// Build a `NonReplicated` request: `code` in the header's `reserved`
     /// prefix, `group` as the routing namespace, `body` already encoded.
     ///
-    /// The request id ECHOES the current counter WITHOUT advancing it (matching
-    /// the SDK, and unlike [`Self::header`]): the server ignores the id for ops
-    /// its `ClientTable` never sees, so burning one would buy nothing - and
-    /// burning one here would desync every replicated request that follows.
+    /// The server ignores `request` for ops its `ClientTable` never sees. The
+    /// setup and fixture reads echo the current counter without advancing it, so
+    /// the request ids their hand-written scenarios pin stay put.
     ///
     /// # Panics
     /// Panics if the request buffer is invalid.
@@ -706,6 +705,7 @@ impl SimClient {
         code: u32,
         group: u64,
         body: &[u8],
+        request: u64,
     ) -> Message<RoutedRequestHeader> {
         let header_size = std::mem::size_of::<RoutedRequestHeader>();
         let total_size = header_size + body.len();
@@ -716,7 +716,7 @@ impl SimClient {
             size: total_size as u32,
             client: self.client_id,
             session: self.session_id(),
-            request: self.request_counter.get(),
+            request,
             reserved,
             group,
             ..Default::default()
@@ -750,7 +750,47 @@ impl SimClient {
             auto_commit: false,
         }
         .to_bytes();
-        self.non_replicated_request(POLL_MESSAGES_CODE, group.inner(), &body)
+        self.non_replicated_request(
+            POLL_MESSAGES_CODE,
+            group.inner(),
+            &body,
+            self.request_counter.get(),
+        )
+    }
+
+    /// Build a `POLL_MESSAGES` request reading `count` messages from `offset` of
+    /// `group`'s partition as `consumer_kind`/`consumer_id`, without auto-commit.
+    ///
+    /// Spends a request id, as the SDK does for every bound read, so a late copy
+    /// of the previous request's reply cannot answer this one.
+    ///
+    /// # Panics
+    /// Panics if the session is unbound or the request buffer is invalid.
+    pub fn poll_messages_at(
+        &self,
+        group: IggyNamespace,
+        consumer_kind: u8,
+        consumer_id: u32,
+        offset: u64,
+        count: u32,
+    ) -> Message<RoutedRequestHeader> {
+        let (stream_id, topic_id, partition_id) = namespace_ids(group);
+        let body = PollMessagesRequest {
+            consumer: namespace_consumer(consumer_kind, consumer_id),
+            stream_id,
+            topic_id,
+            partition_id,
+            strategy: WirePollingStrategy::offset(offset),
+            count,
+            auto_commit: false,
+        }
+        .to_bytes();
+        self.non_replicated_request(
+            POLL_MESSAGES_CODE,
+            group.inner(),
+            &body,
+            self.next_request_id(),
+        )
     }
 
     /// Build a `GET_STREAM` read for `name`.
@@ -768,7 +808,12 @@ impl SimClient {
             stream_id: WireIdentifier::named(name).expect("stream name must be valid"),
         }
         .to_bytes();
-        self.non_replicated_request(GET_STREAM_CODE, METADATA_GROUP, &body)
+        self.non_replicated_request(
+            GET_STREAM_CODE,
+            METADATA_GROUP,
+            &body,
+            self.request_counter.get(),
+        )
     }
 
     /// Store offset with explicit `AckLevel`. A multi-replica partition routes

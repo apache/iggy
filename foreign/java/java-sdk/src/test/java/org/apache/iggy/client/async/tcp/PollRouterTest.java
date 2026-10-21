@@ -27,9 +27,11 @@ import io.netty.channel.EventLoop;
 import io.netty.channel.IoEventLoopGroup;
 import io.netty.channel.MultiThreadIoEventLoopGroup;
 import io.netty.channel.nio.NioIoHandler;
+import io.netty.util.ResourceLeakDetector;
 import io.netty.util.concurrent.ScheduledFuture;
 import org.apache.iggy.client.ConnectionInfo;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.Request;
+import org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.Response;
 import org.apache.iggy.client.async.tcp.vsr.ConsensusSession;
 import org.apache.iggy.client.async.tcp.vsr.VsrFrameDecoder;
 import org.apache.iggy.client.async.tcp.vsr.VsrHeaders;
@@ -45,6 +47,8 @@ import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.SendMessagesResponse;
 import org.apache.iggy.partition.PartitionContext;
 import org.apache.iggy.serde.CommandCode;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
@@ -52,19 +56,33 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import java.math.BigInteger;
 import java.net.InetAddress;
+import java.net.ServerSocket;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Deque;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
+import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientEventLoopGroupTest.await;
+import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.BIND_SESSION_CODE;
+import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.GET_CLUSTER_METADATA_CODE;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.GET_PARTITION_ROUTE_CODE;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.OPERATION_NON_REPLICATED;
+import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.OPERATION_REGISTER;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.assertServerError;
+import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.bindBody;
+import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.connection;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.emptyPoll;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.pollRoute;
+import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.registerBody;
+import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.serve;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -85,6 +103,22 @@ class PollRouterTest {
             new PartitionContext(BigInteger.valueOf(INCARNATION), BigInteger.ZERO, BigInteger.valueOf(ROUTE_WATERMARK));
     private static final Duration TIMEOUT = Duration.ofSeconds(5);
     private static final Duration NEVER = Duration.ofDays(1);
+    private static final long LANE_FRAME_BYTES = 1;
+    // The lane of partition 0, which sendMessage writes to.
+    private static final ConsensusSession.LaneKey PARTITION_LANE = new ConsensusSession.LaneKey(INCARNATION, 0);
+
+    private static ResourceLeakDetector.Level leakDetection;
+
+    @BeforeAll
+    static void detectEveryLeak() {
+        leakDetection = ResourceLeakDetector.getLevel();
+        ResourceLeakDetector.setLevel(ResourceLeakDetector.Level.PARANOID);
+    }
+
+    @AfterAll
+    static void restoreLeakDetection() {
+        ResourceLeakDetector.setLevel(leakDetection);
+    }
 
     @ParameterizedTest
     @EnumSource(
@@ -143,6 +177,7 @@ class PollRouterTest {
                 () -> new ConnectionInfo(InetAddress.getLoopbackAddress().getHostAddress(), PRIMARY_PORT + 1));
         try {
             coordinator.metadataLeaderPort = coordinatorIsLeader ? PRIMARY_PORT + 1 : PRIMARY_PORT;
+            primary.metadataLeaderPort = coordinator.metadataLeaderPort;
             var missing = IggyServerException.fromTcpResponse(IggyErrorCode.TOPIC_ID_NOT_FOUND.getCode(), new byte[0]);
             coordinator.routeReady = CompletableFuture.failedFuture(missing);
             primary.routeReply.completeExceptionally(missing);
@@ -213,6 +248,50 @@ class PollRouterTest {
             assertThat(primary.sentContexts).isEmpty();
         } finally {
             router.clearSession().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            timers.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+            group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    /**
+     * A send that waits for a lane another operation holds was never written. Its deadline fails it as not accepted,
+     * whichever of the lane wait and the poll timeout fires first.
+     */
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void shouldFailASendThatWaitsForItsLaneAsNotAccepted(boolean laneTimeoutFirst) throws Exception {
+        IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+        ManualTimers timers = new ManualTimers();
+        LaneTimers laneTimers = new LaneTimers();
+        Coordinator coordinator = new Coordinator(group, timers);
+        Primary primary = new Primary(group);
+        primary.laneTimers = laneTimers;
+        PollRouter router = new PollRouter(() -> coordinator, endpoint -> primary);
+        router.coordinatorEndpoint(
+                () -> new ConnectionInfo(InetAddress.getLoopbackAddress().getHostAddress(), PRIMARY_PORT + 1));
+        var holder = coordinator
+                .sessionOwner()
+                .acquire(PARTITION_LANE, true, LANE_FRAME_BYTES, System.nanoTime() + NEVER.toNanos(), group.next())
+                .join();
+        try {
+            var sent = sendMessage(coordinator, router);
+            await(() -> !laneTimers.scheduled.isEmpty(), "the send waiting for its lane", TIMEOUT);
+            assertThat(sent).isNotDone();
+            Runnable pollTimeout = timers.scheduled.get(0);
+            Callable<?> laneTimeout = laneTimers.scheduled.get(0);
+            if (laneTimeoutFirst) {
+                laneTimeout.call();
+                pollTimeout.run();
+            } else {
+                pollTimeout.run();
+                laneTimeout.call();
+            }
+            assertServerError(sent, AsyncTcpConnection.TRANSIENT_NOT_ACCEPTED);
+        } finally {
+            holder.complete();
+            router.clearSession().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            coordinator.sessionOwner().reset();
+            laneTimers.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
             timers.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
             group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
         }
@@ -332,6 +411,243 @@ class PollRouterTest {
         }
     }
 
+    /**
+     * A poll over the pending capacity fails at once, and the router holds no more payloads than that capacity. Each
+     * held poll ends with an explicit failure, and every payload goes back.
+     */
+    @Test
+    void shouldReleaseEveryPayloadAboveAndWithinThePendingPollCapacity() throws Exception {
+        IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+        ManualTimers timers = new ManualTimers();
+        Coordinator coordinator = new Coordinator(group, timers);
+        PollRouter router = new PollRouter(() -> coordinator, endpoint -> new Primary(group));
+        try {
+            coordinator.routeReady = new CompletableFuture<>();
+            List<ByteBuf> payloads = new ArrayList<>();
+            List<CompletableFuture<ByteBuf>> held = new ArrayList<>();
+            for (int index = 0; index < PENDING_POLL_CAPACITY; index++) {
+                ByteBuf payload = tracked(pollPayload());
+                payloads.add(payload);
+                held.add(router.poll(payload, Optional.empty()));
+            }
+            ByteBuf rejected = tracked(pollPayload());
+            assertThatThrownBy(() -> router.poll(rejected, Optional.empty()).join())
+                    .hasRootCauseMessage("Too many pending primary polls and offset writes");
+            assertThat(rejected.refCnt()).isZero();
+            assertThat(payloads)
+                    .allSatisfy(payload -> assertThat(payload.refCnt()).isOne());
+
+            router.clearSession().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            assertThat(held).allSatisfy(poll -> assertServerError(poll, AsyncTcpConnection.TRANSIENT_NOT_ACCEPTED));
+            assertThat(payloads)
+                    .allSatisfy(payload -> assertThat(payload.refCnt()).isZero());
+        } finally {
+            timers.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+            group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    /** A reply that comes after its poll timed out goes back, and so does the payload of that poll. */
+    @Test
+    void shouldReleaseALateReplyAndThePayloadOfARoutedPollThatTimedOut() throws Exception {
+        IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+        ManualTimers timers = new ManualTimers();
+        Coordinator coordinator = new Coordinator(group, timers);
+        Primary primary = new Primary(group);
+        PollRouter router = new PollRouter(() -> coordinator, endpoint -> primary);
+        try {
+            router.poll(pollPayload(), Optional.empty())
+                    .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
+                    .release();
+            int pollTimeout = timers.scheduled.size();
+            ByteBuf late = tracked(emptyPoll(0));
+            primary.replies.add(CompletableFuture.completedFuture(late));
+            primary.beforeSend = () -> timers.scheduled.get(pollTimeout).run();
+            ByteBuf payload = tracked(pollPayload());
+
+            var polled = router.poll(payload, Optional.empty());
+
+            assertServerError(polled, AsyncTcpConnection.TRANSIENT_NOT_COMMITTED);
+            assertThat(late.refCnt()).isZero();
+            assertThat(payload.refCnt()).isZero();
+        } finally {
+            router.clearSession().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            timers.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+            group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void shouldReleaseThePayloadOfACancelledRoutedPollAndCancelItsExchange() throws Exception {
+        IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+        ManualTimers timers = new ManualTimers();
+        Coordinator coordinator = new Coordinator(group, timers);
+        Primary primary = new Primary(group);
+        PollRouter router = new PollRouter(() -> coordinator, endpoint -> primary);
+        try {
+            router.poll(pollPayload(), Optional.empty())
+                    .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
+                    .release();
+            CompletableFuture<ByteBuf> exchange = new CompletableFuture<>();
+            primary.replies.add(exchange);
+            ByteBuf payload = tracked(pollPayload());
+            var polled = router.poll(payload, Optional.empty());
+            assertThat(polled).isNotDone();
+
+            assertThat(polled.cancel(false)).isTrue();
+
+            assertThat(exchange).isCancelled();
+            assertThat(payload.refCnt()).isZero();
+        } finally {
+            router.clearSession().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            timers.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+            group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void shouldBackOffRepeatedNotPrimaryRepliesBeforeRoutingAgain() throws Exception {
+        IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+        ManualTimers timers = new ManualTimers();
+        Coordinator coordinator = new Coordinator(group, timers);
+        Primary primary = new Primary(group);
+        PollRouter router = new PollRouter(() -> coordinator, endpoint -> primary);
+        try {
+            router.poll(pollPayload(), Optional.empty())
+                    .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
+                    .release();
+            for (int refusal = 0; refusal < 4; refusal++) {
+                primary.replies.add(CompletableFuture.failedFuture(
+                        IggyServerException.fromTcpResponse(AsyncTcpConnection.NOT_PRIMARY, new byte[0])));
+            }
+            primary.replies.add(CompletableFuture.completedFuture(emptyPoll(0)));
+            var poll = router.poll(pollPayload(), Optional.empty());
+            List<Long> pauses = new ArrayList<>();
+            for (int refusal = 0; refusal < 4; refusal++) {
+                pauses.add(timers.delaysMillis.get(timers.delaysMillis.size() - 1));
+                coordinator.routeView = refusal + 1;
+                primary.routeReply = coordinator.sendRouted(
+                        GET_PARTITION_ROUTE_CODE,
+                        Unpooled.EMPTY_BUFFER,
+                        0,
+                        System.nanoTime() + TIMEOUT.toNanos(),
+                        new AsyncTcpConnection.TransientFailoverState());
+                timers.runLast();
+            }
+            poll.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS).release();
+            assertThat(pauses).containsExactly(0L, 50L, 100L, 200L);
+            assertThat(primary.sentContexts).hasSize(6);
+        } finally {
+            router.clearSession().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            timers.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+            group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void shouldReleaseThePayloadOfARoutedPollRetriedAfterARefusal() throws Exception {
+        IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+        ManualTimers timers = new ManualTimers();
+        Coordinator coordinator = new Coordinator(group, timers);
+        Primary primary = new Primary(group);
+        PollRouter router = new PollRouter(() -> coordinator, endpoint -> primary);
+        try {
+            router.poll(pollPayload(), Optional.empty())
+                    .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
+                    .release();
+            ByteBuf reply = tracked(emptyPoll(0));
+            primary.replies.add(CompletableFuture.failedFuture(
+                    IggyServerException.fromTcpResponse(AsyncTcpConnection.TRANSIENT_NOT_ACCEPTED, new byte[0])));
+            primary.replies.add(CompletableFuture.completedFuture(reply));
+            ByteBuf payload = tracked(pollPayload());
+            var polled = router.poll(payload, Optional.empty());
+            assertThat(polled).isNotDone();
+
+            timers.runLast();
+
+            assertThat(polled.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)).isSameAs(reply);
+            reply.release();
+            assertThat(primary.sentContexts).hasSize(3);
+            assertThat(payload.refCnt()).isZero();
+        } finally {
+            router.clearSession().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            timers.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+            group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    /**
+     * A link that refuses the lane of a routed offset write never writes it. The link releases the copy that the
+     * router gave it, and the router releases the payload. The parent signs in, because a link checks its bind
+     * reply against the session of its parent.
+     */
+    @Test
+    void shouldReleaseTheRoutedPayloadOfAnOffsetWriteWhoseLaneTheLinkRefuses() throws Exception {
+        InetAddress loopback = InetAddress.getLoopbackAddress();
+        try (ServerSocket coordinatorSocket = new ServerSocket(0, 1, loopback);
+                ServerSocket primarySocket = new ServerSocket(0, 1, loopback)) {
+            var coordinatorServing = serve(coordinatorSocket, request -> {
+                if (request.operation() == OPERATION_REGISTER) {
+                    return Response.success(OPERATION_REGISTER, registerBody(SESSION));
+                }
+                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(
+                            OPERATION_NON_REPLICATED,
+                            AsyncIggyTcpClientTransientFailoverTest.clusterMetadata(
+                                    coordinatorSocket.getLocalPort(),
+                                    primarySocket.getLocalPort(),
+                                    coordinatorSocket.getLocalPort()));
+                }
+                if (request.is(GET_PARTITION_ROUTE_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(
+                            OPERATION_NON_REPLICATED,
+                            pollRoute(request, SESSION, ROUTE_WATERMARK, primarySocket.getLocalPort(), INCARNATION));
+                }
+                return pong(request);
+            });
+            var primaryServing = serve(primarySocket, request -> {
+                if (request.is(BIND_SESSION_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(OPERATION_NON_REPLICATED, bindBody(request));
+                }
+                return pong(request);
+            });
+            AsyncTcpConnection parent = connection(coordinatorSocket);
+            AtomicReference<AsyncTcpConnection> link = new AtomicReference<>();
+            PollRouter router = new PollRouter(() -> parent, endpoint -> {
+                link.set(connection(primarySocket));
+                return link.get();
+            });
+            router.coordinatorEndpoint(
+                    () -> new ConnectionInfo(loopback.getHostAddress(), coordinatorSocket.getLocalPort()));
+            try {
+                parent.connect().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                new UsersTcpClient(() -> parent)
+                        .login("user", "password")
+                        .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                retainOffset(parent);
+                ByteBuf payload = tracked(offsetPayload());
+
+                var stored =
+                        router.partitionRequest(CommandCode.ConsumerOffset.STORE.getValue(), payload, Optional.empty());
+
+                assertThatThrownBy(() -> stored.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS))
+                        .hasCauseInstanceOf(IggyOperationException.class)
+                        .satisfies(error -> assertThat(((IggyOperationException) error.getCause()).getErrorCode())
+                                .isEqualTo(IggyErrorCode.LANE_BLOCKED));
+                // The link fails the write in a task of its event loop, which can wake this thread before the
+                // router's completion callback in that task releases the payload.
+                link.get().eventLoop().submit(() -> {}).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                assertThat(payload.refCnt()).isZero();
+            } finally {
+                router.clearSession().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                parent.close().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                parent.sessionOwner().reset();
+            }
+            coordinatorServing.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            primaryServing.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        }
+    }
+
     @Test
     void shouldNotDeadlockWhenTheTimeoutFiresWhileAnInlineSendHoldsTheRouter() throws Exception {
         IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
@@ -374,6 +690,57 @@ class PollRouterTest {
             assertThat(timeout.isAlive()).isFalse();
             assertThat(primary.sentContexts).containsExactly(ROUTE_CONTEXT, ROUTE_CONTEXT);
         } finally {
+            timers.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+            group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void shouldClearTheSessionWhileAPollTimeoutCompletes() throws Exception {
+        IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+        ManualTimers timers = new ManualTimers();
+        CompletableFuture<Void> releaseCompletion = new CompletableFuture<>();
+        try {
+            Coordinator coordinator = new Coordinator(group, timers);
+            Primary primary = new Primary(group);
+            PollRouter router = new PollRouter(() -> coordinator, endpoint -> primary);
+            router.poll(pollPayload(), Optional.empty())
+                    .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
+                    .release();
+            int timerIndex = timers.scheduled.size();
+            ByteBuf payload = tracked(pollPayload());
+            var polled = router.poll(payload, Optional.empty());
+            CompletableFuture<Void> completing = new CompletableFuture<>();
+            polled.whenComplete((response, error) -> {
+                completing.complete(null);
+                releaseCompletion.join();
+            });
+            CompletableFuture<Void> expired = new CompletableFuture<>();
+            Thread timeout = start("poll-timeout", () -> {
+                timers.scheduled.get(timerIndex).run();
+                expired.complete(null);
+            });
+            completing.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            CompletableFuture<Void> cleared = new CompletableFuture<>();
+            Thread clearing = start("session-clear", () -> {
+                router.clearSession().join();
+                cleared.complete(null);
+            });
+            // Force shutdown to overlap the timeout's completion callbacks before they remove the pending poll.
+            await(() -> clearing.getState() == Thread.State.BLOCKED, "session clear waiting for the poll", TIMEOUT);
+            releaseCompletion.complete(null);
+
+            assertThat(expired).succeedsWithin(TIMEOUT);
+            assertThat(cleared).succeedsWithin(TIMEOUT);
+            assertServerError(polled, AsyncTcpConnection.TRANSIENT_NOT_COMMITTED);
+            assertThat(payload.refCnt()).isZero();
+            assertThat(primary.closes).hasValue(1);
+            timeout.join(TIMEOUT.toMillis());
+            clearing.join(TIMEOUT.toMillis());
+            assertThat(timeout.isAlive()).isFalse();
+            assertThat(clearing.isAlive()).isFalse();
+        } finally {
+            releaseCompletion.complete(null);
             timers.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
             group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
         }
@@ -461,19 +828,17 @@ class PollRouterTest {
                         StreamId.of(1L), TopicId.of(1L), Partitioning.partitionId(0L), List.of(Message.of("message")));
     }
 
-    private static ConsensusSession.Ticket retainOffset(Coordinator coordinator) {
-        ByteBuf payload = pollPayload();
-        payload.writerIndex(payload.writerIndex() - PollRouter.POLL_PARAMETERS_BYTES);
-        payload.writeLongLE(1);
+    private static ConsensusSession.Ticket retainOffset(AsyncTcpConnection connection) {
+        ByteBuf payload = offsetPayload();
         int frameBytes = VsrHeaders.HEADER_SIZE + payload.readableBytes();
-        var owner = coordinator.sessionOwner();
+        var owner = connection.sessionOwner();
         owner.configurePendingOperations(1, frameBytes);
         var ticket = owner.acquire(
                         new ConsensusSession.LaneKey(INCARNATION, 0),
                         true,
                         frameBytes,
                         System.nanoTime() + NEVER.toNanos(),
-                        coordinator.eventLoop())
+                        connection.eventLoop())
                 .join();
         ByteBuf frame =
                 Unpooled.buffer(frameBytes).writeZero(VsrHeaders.HEADER_SIZE).writeBytes(payload);
@@ -527,6 +892,30 @@ class PollRouterTest {
                 .writeZero(PollRouter.POLL_PARAMETERS_BYTES);
     }
 
+    /** A StoreConsumerOffset payload for the target of {@link #pollPayload()}. */
+    private static ByteBuf offsetPayload() {
+        ByteBuf payload = pollPayload();
+        payload.writerIndex(payload.writerIndex() - PollRouter.POLL_PARAMETERS_BYTES);
+        return payload.writeLongLE(1);
+    }
+
+    /** Answers a heartbeat, and fails the mock node on any other request it does not expect. */
+    private static Response pong(Request request) {
+        if (request.is(CommandCode.System.PING.getValue(), OPERATION_NON_REPLICATED)) {
+            return Response.success(OPERATION_NON_REPLICATED, Unpooled.EMPTY_BUFFER);
+        }
+        throw new IllegalStateException("Unexpected request: " + request);
+    }
+
+    /** A copy that the leak detector tracks, which an unpooled heap buffer is not. */
+    private static ByteBuf tracked(ByteBuf source) {
+        try {
+            return Unpooled.directBuffer(source.readableBytes()).writeBytes(source);
+        } finally {
+            source.release();
+        }
+    }
+
     private static Thread start(String name, Runnable task) {
         Thread thread = new Thread(task, name);
         // A deadlocked thread must not keep the test JVM alive.
@@ -538,6 +927,7 @@ class PollRouterTest {
     /** Holds every timer back, so the test fires a poll timeout at the instant it needs. */
     private static final class ManualTimers extends DefaultEventLoop {
         private final List<Runnable> scheduled = new CopyOnWriteArrayList<>();
+        private final List<Long> delaysMillis = new CopyOnWriteArrayList<>();
 
         void runLast() {
             scheduled.get(scheduled.size() - 1).run();
@@ -546,12 +936,27 @@ class PollRouterTest {
         @Override
         public ScheduledFuture<?> schedule(Runnable command, long delay, TimeUnit unit) {
             scheduled.add(command);
+            delaysMillis.add(unit.toMillis(delay));
+            return super.schedule(command, NEVER.toNanos(), TimeUnit.NANOSECONDS);
+        }
+    }
+
+    /** Holds the deadline timers of lane admissions, which a lane schedules as callables, until the test runs them. */
+    private static final class LaneTimers extends DefaultEventLoop {
+        private final List<Callable<?>> scheduled = new CopyOnWriteArrayList<>();
+
+        @Override
+        public <V> ScheduledFuture<V> schedule(Callable<V> command, long delay, TimeUnit unit) {
+            scheduled.add(command);
             return super.schedule(command, NEVER.toNanos(), TimeUnit.NANOSECONDS);
         }
     }
 
     /** Never dials: the router only reaches what the subclasses override. */
     private abstract static class OfflineConnection extends AsyncTcpConnection {
+        // The node that the roster read on this connection names as metadata primary.
+        int metadataLeaderPort = PRIMARY_PORT + 1;
+
         OfflineConnection(IoEventLoopGroup group) {
             super(
                     InetAddress.getLoopbackAddress().getHostAddress(),
@@ -569,14 +974,25 @@ class PollRouterTest {
                     errorCode -> {},
                     (source, cause) -> {});
         }
+
+        // A link of this test stays up until the test closes it.
+        @Override
+        boolean hasOpenChannel() {
+            return true;
+        }
+
+        CompletableFuture<ByteBuf> roster() {
+            return CompletableFuture.completedFuture(AsyncIggyTcpClientTransientFailoverTest.clusterMetadata(
+                    PRIMARY_PORT + 1, PRIMARY_PORT, metadataLeaderPort));
+        }
     }
 
     private static final class Coordinator extends OfflineConnection {
         private final EventLoop timers;
         private long watermark;
+        private int routeView;
         private PartitionContext context = ROUTE_CONTEXT;
         private int routes;
-        private int metadataLeaderPort = PRIMARY_PORT + 1;
         private CompletableFuture<Void> routeReady = CompletableFuture.completedFuture(null);
 
         Coordinator(IoEventLoopGroup group, EventLoop timers) {
@@ -614,8 +1030,7 @@ class PollRouterTest {
                 int commandCode, ByteBuf payload, long generation, long deadline, TransientFailoverState state) {
             payload.release();
             if (commandCode == CommandCode.System.GET_CLUSTER_METADATA.getValue()) {
-                return CompletableFuture.completedFuture(AsyncIggyTcpClientTransientFailoverTest.clusterMetadata(
-                        PRIMARY_PORT + 1, PRIMARY_PORT, metadataLeaderPort));
+                return roster();
             }
             assertThat(commandCode).isEqualTo(CommandCode.Messages.GET_PARTITION_ROUTE.getValue());
             routes++;
@@ -631,11 +1046,12 @@ class PollRouterTest {
                     new byte[0],
                     0);
             return routeReady.thenApply(ignored -> pollRoute(
-                    routing,
-                    SESSION,
-                    context.metadataOp().longValue(),
-                    PRIMARY_PORT,
-                    context.incarnation().longValue()));
+                            routing,
+                            SESSION,
+                            context.metadataOp().longValue(),
+                            PRIMARY_PORT,
+                            context.incarnation().longValue())
+                    .setIntLE(Long.BYTES * 2, routeView));
         }
     }
 
@@ -644,12 +1060,16 @@ class PollRouterTest {
         private final List<PartitionContext> sentContexts = new CopyOnWriteArrayList<>();
         private final List<byte[]> sentFrames = new CopyOnWriteArrayList<>();
         private final CompletableFuture<ByteBuf> unanswered = new CompletableFuture<>();
-        private final CompletableFuture<ByteBuf> routeReply = new CompletableFuture<>();
+        private CompletableFuture<ByteBuf> routeReply = new CompletableFuture<>();
+        // Outcomes for the next data sends, in order, before the default answers.
+        private final Deque<CompletableFuture<ByteBuf>> replies = new ConcurrentLinkedDeque<>();
         private int routes;
         private CompletableFuture<ByteBuf> binding = CompletableFuture.completedFuture(Unpooled.EMPTY_BUFFER);
         private final AtomicInteger closes = new AtomicInteger();
         private boolean holdAfterFirst = true;
         private Runnable beforeSend = () -> {};
+        // When set, a send waits for its lane on these timers, as a link admits a send before it writes it.
+        private EventLoop laneTimers;
 
         Primary(IoEventLoopGroup group) {
             super(group);
@@ -667,15 +1087,34 @@ class PollRouterTest {
             if (commandCode == CommandCode.System.BIND_SESSION.getValue()) {
                 return binding;
             }
+            if (commandCode == GET_CLUSTER_METADATA_CODE) {
+                return roster();
+            }
             if (commandCode == GET_PARTITION_ROUTE_CODE) {
                 routes++;
                 return routeReply;
+            }
+            if (laneTimers != null && commandCode == CommandCode.Messages.SEND.getValue()) {
+                return sessionOwner()
+                        .acquire(PARTITION_LANE, true, LANE_FRAME_BYTES, deadline, laneTimers)
+                        .thenApply(ticket -> {
+                            ticket.complete();
+                            return Unpooled.EMPTY_BUFFER;
+                        });
             }
             sentContexts.add(state.context());
             if (state.ticket() != null) {
                 sentFrames.add(frozenFrame(state.ticket()));
             }
             beforeSend.run();
+            return answer(commandCode);
+        }
+
+        private CompletableFuture<ByteBuf> answer(int commandCode) {
+            CompletableFuture<ByteBuf> scripted = replies.poll();
+            if (scripted != null) {
+                return scripted;
+            }
             return !holdAfterFirst || sentContexts.size() == 1
                     ? CompletableFuture.completedFuture(
                             commandCode == CommandCode.Messages.SEND.getValue() ? Unpooled.EMPTY_BUFFER : emptyPoll(0))

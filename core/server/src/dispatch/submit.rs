@@ -51,7 +51,7 @@ use server_common::Message;
 use server_common::sharding::IggyNamespace;
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tracing::{trace, warn};
 
 /// In normal operation the primary commits a completion itself, and a backup
@@ -103,7 +103,7 @@ pub(in crate::dispatch) fn handle_metadata_submit<B, MJ, S, SB>(
                             && !consensus.is_transferring())
                         .then_some(consensus.view()),
                         &message,
-                        Instant::now(),
+                        shard.bus.monotonic_now(),
                         session_timeout,
                     );
                 }

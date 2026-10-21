@@ -57,7 +57,8 @@ pub use io::{
     CapturedPartitionIo, MaterializationIoJob, MaterializationIoResult, PARTITION_IO_DRAIN_TIMEOUT,
     PartitionIncarnation, PartitionIoContinuation, PartitionIoIdentity, PartitionIoJob,
     PartitionIoNotifier, PartitionIoPlan, PartitionIoQuiescence, PartitionIoResources,
-    PartitionIoResult, PartitionIoStep, PartitionTeardown, largest_legal_job_charge,
+    PartitionIoResult, PartitionIoStep, PartitionTeardown, PreparedPrimaryTransfer,
+    largest_legal_job_charge,
 };
 pub use journal::{EVICTED_RING_BYTES_MAX, EVICTED_RING_CAPACITY};
 
@@ -101,8 +102,8 @@ pub use state_transfer::CONSUMER_OFFSETS_ENTRIES_MAX;
 pub use types::{
     AppendResult, COMMIT_WALK_OPS_MAX, FatalCommit, Fragment, PartitionOffsets,
     PartitionPathLayout, PartitionsConfig, PollFragments, PollQueryResult, PollingArgs,
-    PollingConsumer, REPAIR_MAX_STALL_RETRIES, REPAIR_RETRY_TICKS, RepairConclusion, RepairSession,
-    SendMessagesResult,
+    PollingConsumer, REPAIR_MAX_STALL_RETRIES, REPAIR_RETRY_TICKS, RepairConclusion, RepairIngest,
+    RepairSession, SendMessagesResult,
 };
 
 /// A partition's message log, named so a caller can carry one across a rebuild.

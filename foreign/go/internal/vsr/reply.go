@@ -47,6 +47,9 @@ func DecodeReplyFor(request, header *[HeaderSize]byte, body []byte) (ReplyOutcom
 		return ReplyOutcome{Err: ierror.FromCode(ierror.Code(status))}, nil
 	}
 	operation := ReadReplyOperation(header)
+	// SendMessages is not result-framed, so an empty reply would otherwise
+	// reach the send path, which reports undecodable confirmations as a
+	// committed send.
 	if !IsKnownOperation(operation) || operation == OperationSendMessages && len(body) == 0 {
 		return ReplyOutcome{}, ierror.ErrInvalidCommand
 	}
@@ -109,49 +112,6 @@ func (e *EvictionError) Unwrap() error {
 // Code returns the IggyError code the reason maps to.
 func (e *EvictionError) Code() ierror.Code {
 	return e.mapped.Code()
-}
-
-// DecodeReply turns one complete consensus frame into its reply body. The
-// order is fixed: frame discriminant, declared size, pre-commit denial status
-// before any body read, then the committed result section.
-func DecodeReply(header *[HeaderSize]byte, body []byte) ([]byte, error) {
-	switch PeekCommand(header) {
-	case FrameEviction:
-		return nil, NewEvictionError(ReadEviction(header))
-	case FrameReply:
-	default:
-		return nil, ierror.ErrInvalidCommand
-	}
-
-	size := ReadSize(header)
-	if size < HeaderSize || size > MaxFrameSize {
-		return nil, ierror.ErrInvalidCommand
-	}
-	expected := int(size) - HeaderSize
-	if len(body) < expected {
-		return nil, ierror.ErrInvalidCommand
-	}
-
-	// A pre-commit denial always ships an empty body. The status channel and
-	// the committed result section are mutually exclusive.
-	if status := ReadStatus(header); status != 0 {
-		return nil, ierror.FromCode(ierror.Code(status))
-	}
-
-	operation := ReadReplyOperation(header)
-	if !IsKnownOperation(operation) {
-		return nil, ierror.ErrInvalidCommand
-	}
-	if operation == OperationSendMessages && expected == 0 {
-		// A committed send always carries a confirmation section. The server
-		// answers a replicated request on a dead session with an empty
-		// status-0 reply, expecting the decoder to reject it. Every other
-		// replicated operation is result-framed and fails on the missing
-		// section; SendMessages is not, so without this guard a send that
-		// wrote nothing would read as a success.
-		return nil, ierror.ErrInvalidCommand
-	}
-	return SplitMetadataResult(operation, body[:expected])
 }
 
 // SplitMetadataResult strips the committed result section leading a

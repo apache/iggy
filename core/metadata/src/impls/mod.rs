@@ -16,6 +16,7 @@
 // under the License.
 
 pub mod metadata;
+mod placement;
 pub mod recovery;
 
 /// Subdirectory under the data root where metadata state is stored.

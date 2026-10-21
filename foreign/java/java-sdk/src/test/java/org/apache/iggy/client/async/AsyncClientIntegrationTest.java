@@ -19,6 +19,13 @@
 
 package org.apache.iggy.client.async;
 
+import io.netty.buffer.ByteBuf;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelOption;
+import io.netty.channel.ChannelOutboundHandlerAdapter;
+import io.netty.channel.ChannelPromise;
+import io.netty.channel.group.ChannelGroup;
 import org.apache.iggy.client.BaseIntegrationTest;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
 import org.apache.iggy.consumergroup.Consumer;
@@ -26,22 +33,31 @@ import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
+import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.message.SendMessagesResponse;
+import org.apache.iggy.serde.CommandCode;
 import org.apache.iggy.topic.CompressionAlgorithm;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.lang.reflect.Field;
 import java.math.BigInteger;
+import java.time.Duration;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.apache.iggy.TestConstants.PERSISTED_TOPIC_OPTIONS;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -60,6 +76,11 @@ public class AsyncClientIntegrationTest extends BaseIntegrationTest {
     private static final String USERNAME = "iggy";
     private static final String PASSWORD = "iggy";
     private static final int TIMEOUT_SECONDS = 5;
+    private static final int PAUSED_READER_REQUESTS = 8;
+    private static final int REQUEST_COMMAND_CODE_OFFSET = 196;
+    private static final int LARGE_REPLY_BYTES = 8 * 1024 * 1024;
+    private static final int RECEIVE_BUFFER_BYTES = 64 * 1024;
+    private static final int PAUSED_READER_TIMEOUT_SECONDS = 30;
 
     private AsyncIggyTcpClient client;
 
@@ -254,5 +275,148 @@ public class AsyncClientIntegrationTest extends BaseIntegrationTest {
         } finally {
             client.streams().deleteStream(streamId).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
         }
+    }
+
+    /** Requires the external server fixture to use a two-slot reply queue. */
+    @Test
+    @EnabledIfEnvironmentVariable(named = "IGGY_MESSAGE_BUS_CLIENT_QUEUE_CAPACITY", matches = "2")
+    void shouldCompletePipelinedPollsAfterTheReaderResumes() throws Exception {
+        client.close().get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        client = AsyncIggyTcpClient.builder()
+                .host(serverHost())
+                .port(serverTcpPort())
+                .requestTimeout(Duration.ofSeconds(PAUSED_READER_TIMEOUT_SECONDS))
+                .heartbeatInterval(Duration.ofMinutes(1))
+                .build();
+        client.connect().get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        client.users().login(USERNAME, PASSWORD).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        String streamName = "paused-reader-" + UUID.randomUUID();
+        StreamId stream = StreamId.of(streamName);
+        TopicId topic = TopicId.of("large-replies");
+        List<Channel> paused = List.of();
+        try {
+            client.streams().createStream(streamName).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            client.topics()
+                    .createTopic(
+                            stream,
+                            1L,
+                            CompressionAlgorithm.None,
+                            BigInteger.ZERO,
+                            BigInteger.ZERO,
+                            "large-replies",
+                            PERSISTED_TOPIC_OPTIONS)
+                    .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            for (int index = 0; index < PAUSED_READER_REQUESTS; index++) {
+                String payload = String.valueOf((char) ('a' + index)).repeat(LARGE_REPLY_BYTES);
+                client.messages()
+                        .sendMessages(stream, topic, Partitioning.partitionId(0L), List.of(Message.of(payload)))
+                        .get(PAUSED_READER_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            }
+            pollAt(stream, topic, 0).get(PAUSED_READER_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            paused = clientChannels(client);
+            assertThat(paused).isNotEmpty();
+            CompletableFuture<Void> written = pauseReads(paused);
+            List<CompletableFuture<PolledMessages>> polls = new ArrayList<>();
+            for (int index = 0; index < PAUSED_READER_REQUESTS; index++) {
+                polls.add(pollAt(stream, topic, index));
+            }
+            written.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            assertThat(polls).allSatisfy(poll -> assertThat(poll).isNotDone());
+            var observer = AsyncIggyTcpClient.builder()
+                    .host(serverHost())
+                    .port(serverTcpPort())
+                    .build();
+            try {
+                observer.connect().get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                observer.users().login(USERNAME, PASSWORD).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                observer.system().getStats().get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            } finally {
+                observer.close().get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            }
+            for (Channel channel : paused) {
+                channel.eventLoop()
+                        .submit(() -> channel.config().setAutoRead(true))
+                        .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            }
+            CompletableFuture.allOf(polls.toArray(new CompletableFuture<?>[0]))
+                    .get(PAUSED_READER_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            for (int index = 0; index < polls.size(); index++) {
+                byte[] payload = polls.get(index).join().messages().get(0).payload();
+                assertThat(payload).hasSize(LARGE_REPLY_BYTES);
+                assertThat(payload[0]).isEqualTo((byte) ('a' + index));
+            }
+        } finally {
+            for (Channel channel : paused) {
+                channel.eventLoop()
+                        .submit(() -> channel.config().setAutoRead(true))
+                        .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            }
+            client.streams().deleteStream(stream).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        }
+    }
+
+    private static CompletableFuture<Void> pauseReads(List<Channel> channels) throws Exception {
+        CompletableFuture<Void> written = new CompletableFuture<>();
+        AtomicInteger requests = new AtomicInteger();
+        for (Channel channel : channels) {
+            channel.eventLoop()
+                    .submit(() -> {
+                        channel.config().setOption(ChannelOption.SO_RCVBUF, RECEIVE_BUFFER_BYTES);
+                        channel.config().setAutoRead(false);
+                        channel.pipeline().addFirst("count-pipelined-polls", new ChannelOutboundHandlerAdapter() {
+                            @Override
+                            public void write(ChannelHandlerContext context, Object message, ChannelPromise promise) {
+                                if (message instanceof ByteBuf frame
+                                        && frame.getUnsignedIntLE(frame.readerIndex() + REQUEST_COMMAND_CODE_OFFSET)
+                                                == CommandCode.Messages.POLL.getValue()) {
+                                    promise.addListener(done -> {
+                                        if (done.isSuccess() && requests.incrementAndGet() == PAUSED_READER_REQUESTS) {
+                                            written.complete(null);
+                                        }
+                                    });
+                                }
+                                context.write(message, promise);
+                            }
+                        });
+                    })
+                    .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        }
+        return written;
+    }
+
+    private CompletableFuture<PolledMessages> pollAt(StreamId stream, TopicId topic, int offset) {
+        return client.messages()
+                .pollMessages(
+                        stream,
+                        topic,
+                        Optional.of(0L),
+                        Consumer.of(0L),
+                        PollingStrategy.offset(BigInteger.valueOf(offset)),
+                        1L,
+                        false);
+    }
+
+    // Test-side access covers learned replica links without adding a production pause hook.
+    public static List<Channel> clientChannels(AsyncIggyTcpClient client) throws ReflectiveOperationException {
+        List<Object> connections = new ArrayList<>();
+        connections.add(((AtomicReference<?>) field(client, "connection")).get());
+        Map<?, ?> slots = (Map<?, ?>) field(field(client, "pollRouter"), "connections");
+        for (Object slot : slots.values()) {
+            Object connection = field(slot, "connection");
+            if (connection != null) {
+                connections.add(connection);
+            }
+        }
+        var channels = new LinkedHashSet<Channel>();
+        for (Object connection : connections) {
+            channels.addAll((ChannelGroup) field(connection, "channels"));
+        }
+        return List.copyOf(channels);
+    }
+
+    public static Object field(Object target, String name) throws ReflectiveOperationException {
+        Field field = target.getClass().getDeclaredField(name);
+        field.setAccessible(true);
+        return field.get(target);
     }
 }

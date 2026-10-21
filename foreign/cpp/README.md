@@ -25,6 +25,11 @@ bazel test //:unit
 bazel test //:e2e
 ```
 
+Receipt access follows the server's [session and revocation policy](../../core/server/README.md#sessions-and-retry-receipts).
+An unresolved operation cannot recover its receipt after its original session
+ends, even after a new login or account reactivation. A fresh send can duplicate
+that operation.
+
 Binary mutations retain an uncertain operation until it is resolved or abandoned.
 `IggyException::OperationId()` carries an exact `std::uint64_t` for
 `operation_uncertain`, `lane_blocked`, and `operation_not_retained`.

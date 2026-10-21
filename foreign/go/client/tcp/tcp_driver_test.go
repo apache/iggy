@@ -18,6 +18,7 @@
 package tcp
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -32,6 +33,9 @@ import (
 	"github.com/apache/iggy/foreign/go/internal/vsr"
 	"github.com/stretchr/testify/require"
 )
+
+// recoveryWaitDeadline bounds how long a test call waits for a held recovery.
+const recoveryWaitDeadline = 100 * time.Millisecond
 
 func committedReply(read request, code ierror.Code) []byte {
 	var body []byte
@@ -66,7 +70,7 @@ func serveWrites(peer net.Conn, answer func(write, attempt int, read request) []
 }
 
 // uncertainAnswer answers the first two attempts of a write: 57 makes it
-// uncertain and an unproved rejection ends the call with UncertainOutcome.
+// uncertain and an unproved rejection ends the call with OperationUncertain.
 func uncertainAnswer(attempt int, read request) []byte {
 	if attempt == 0 {
 		return statusReplyFrame(read.operation(), uint32(ierror.TransientNotCommittedCode), nil)
@@ -79,7 +83,7 @@ func uncertainAnswer(attempt int, read request) []byte {
 func uncertainWrite(t *testing.T, client *IggyTcpClient) uint64 {
 	t.Helper()
 	_, err := client.do(context.Background(), &command.CreateStream{Name: "orders"})
-	var uncertain ierror.UncertainOutcome
+	var uncertain ierror.OperationUncertain
 	require.ErrorAs(t, err, &uncertain)
 	return uncertain.OperationID
 }
@@ -109,7 +113,7 @@ func TestDriverRetainsUnprovedRejectionAndResolvesExactCommittedResult(t *testin
 		}
 	})
 	_, err := client.do(context.Background(), &command.CreateStream{Name: "orders"})
-	var uncertain ierror.UncertainOutcome
+	var uncertain ierror.OperationUncertain
 	require.ErrorAs(t, err, &uncertain)
 	_, err = client.do(context.Background(), &command.CreateStream{Name: "blocked"})
 	var blocked ierror.LaneBlocked
@@ -401,7 +405,7 @@ func TestDriverCancelledMutationRetainsItsLaneUntilAbandon(t *testing.T) {
 	go func() { _, err := client.do(ctx, &command.CreateStream{Name: "lost"}); done <- err }()
 	<-received
 	cancel()
-	var uncertain ierror.UncertainOutcome
+	var uncertain ierror.OperationUncertain
 	require.ErrorAs(t, <-done, &uncertain)
 	require.NoError(t, client.AbandonOperation(context.Background(), uncertain.OperationID))
 	require.ErrorIs(t, client.AbandonOperation(context.Background(), uncertain.OperationID), ierror.ErrOperationNotRetained)
@@ -444,7 +448,7 @@ func TestDriverUncertainMutationStaysUncertainWhenTheFenceChangesBeforeItsReplay
 	fence := client.sessionFence
 	client.mtx.Unlock()
 	client.recoverSession(fence)
-	var uncertain ierror.UncertainOutcome
+	var uncertain ierror.OperationUncertain
 	require.ErrorAs(t, <-done, &uncertain)
 	require.Equal(t, id, uncertain.OperationID)
 	creates := 0
@@ -457,7 +461,7 @@ func TestDriverUncertainMutationStaysUncertainWhenTheFenceChangesBeforeItsReplay
 	require.ErrorIs(t, client.ResolveOperation(context.Background(), id), ierror.ErrOperationNotRetained)
 }
 
-func TestDriverUnsentCallFailsWithNotAcceptedOnlyWhileTheSessionRecovers(t *testing.T) {
+func TestDriverUnsentCallWaitsForARunningRecoveryUntilItsDeadline(t *testing.T) {
 	for _, end := range []struct {
 		name string
 		want error
@@ -481,13 +485,16 @@ func TestDriverUnsentCallFailsWithNotAcceptedOnlyWhileTheSessionRecovers(t *test
 					link.writes <- linkTestFrame(uint64(plug))
 				}
 				<-plugged
+				start := time.Now()
+				ctx, cancel := context.WithTimeout(context.Background(), recoveryWaitDeadline)
+				defer cancel()
 				done := make(chan error, 1)
 				go func() {
 					if kind == "read" {
-						done <- client.Ping(context.Background())
+						done <- client.Ping(ctx)
 						return
 					}
-					_, err := client.do(context.Background(), &command.CreateStream{Name: "orders"})
+					_, err := client.do(ctx, &command.CreateStream{Name: "orders"})
 					done <- err
 				}()
 				require.Eventually(t, func() bool { link.mu.Lock(); defer link.mu.Unlock(); return len(link.pending) == 1 }, time.Second, time.Millisecond)
@@ -499,13 +506,16 @@ func TestDriverUnsentCallFailsWithNotAcceptedOnlyWhileTheSessionRecovers(t *test
 					client.links.disconnect(true)
 				}
 				require.ErrorIs(t, <-done, end.want)
+				if end.name == "recovery" {
+					require.GreaterOrEqual(t, time.Since(start), recoveryWaitDeadline, "the call waits for the recovery until its deadline")
+				}
 				require.Len(t, server.recorded(), 1, "only the first plug reached the server")
 			})
 		}
 	}
 }
 
-func TestDriverSessionRecoveryFailsUnsentCallsWithNotAcceptedUntilItFails(t *testing.T) {
+func TestDriverSessionRecoveryHoldsUnsentCallsUntilItFails(t *testing.T) {
 	client, peer := newPipeClient(t)
 	client.config.reconnection.enabled = false
 	client.config.serverAddress = "invalid-address"
@@ -534,10 +544,8 @@ func TestDriverSessionRecoveryFailsUnsentCallsWithNotAcceptedUntilItFails(t *tes
 	}, time.Second, time.Millisecond)
 	release := holdRecovery(t, client)
 	recoverNow(client)
-	var uncertain ierror.UncertainOutcome
-	require.ErrorAs(t, <-first, &uncertain)
-	require.ErrorIs(t, <-read, ierror.ErrTransientNotAccepted, "a sent read cannot have changed server state")
-	require.ErrorIs(t, <-waiting, ierror.ErrTransientNotAccepted)
+	var uncertain ierror.OperationUncertain
+	require.ErrorAs(t, <-first, &uncertain, "a sent mutation ends without waiting for the recovery")
 	stream, topic, group := groupConsumer(t)
 	partition := uint32(0)
 	create := func() error {
@@ -548,13 +556,90 @@ func TestDriverSessionRecoveryFailsUnsentCallsWithNotAcceptedUntilItFails(t *tes
 		_, err := client.PollMessages(context.Background(), stream, topic, iggcon.NewSingleConsumer(group.Id), iggcon.FirstPollingStrategy(), 1, false, &partition)
 		return err
 	}
-	require.ErrorIs(t, create(), ierror.ErrTransientNotAccepted)
-	require.ErrorIs(t, poll(), ierror.ErrTransientNotAccepted)
+	created, polled := make(chan error, 1), make(chan error, 1)
+	go func() { created <- create() }()
+	go func() { polled <- poll() }()
+	held := []chan error{read, waiting, created, polled}
+	require.Never(t, func() bool {
+		for _, call := range held {
+			if len(call) != 0 {
+				return true
+			}
+		}
+		return false
+	}, recoveryWaitDeadline, time.Millisecond, "the calls wait for the running recovery")
 	release()
 	awaitRecoveryEnd(t, client)
-	require.ErrorIs(t, create(), ierror.ErrUnauthenticated, "a failed recovery leaves no session to retry on")
+	require.ErrorIs(t, <-read, ierror.ErrNotConnected, "a failed recovery leaves no link to restart the read on")
+	for _, call := range held[1:] {
+		require.ErrorIs(t, <-call, ierror.ErrUnauthenticated, "a failed recovery leaves no session to restart under")
+	}
+	require.ErrorIs(t, create(), ierror.ErrUnauthenticated)
 	require.ErrorIs(t, poll(), ierror.ErrUnauthenticated)
-	require.Len(t, server.recorded(), 2)
+	require.Len(t, server.recorded(), 2, "no call went out again")
+}
+
+// Two creates wait in the lane of a create that the server answers with an
+// eviction that ends the session. The sent create ends uncertain and never goes
+// out again. The waiting ones keep their order and complete under the session
+// of the recovery.
+func TestDriverUnsentCallsInFlightAtAnEvictionCompleteUnderTheRecoveredSession(t *testing.T) {
+	received, release := make(chan struct{}), make(chan struct{})
+	var registers atomic.Uint64
+	var server *testListener
+	server = listenVSR(t, nil, func(connection, index int, read request) []byte {
+		switch {
+		case read.operation() == vsr.OperationRegister:
+			return registerReplyFrame(7, managedLinkSession+registers.Add(1))
+		case read.operation() == vsr.OperationCreateStream && bytes.Contains(read.payload, []byte("sent")):
+			close(received)
+			<-release
+			return evictionFrame(vsr.EvictionSessionError, 0, 0)
+		case read.operation() == vsr.OperationCreateStream:
+			return committedReply(read, 0)
+		default:
+			return singleNodeHandler(t, func() string { return server.address() })(connection, index, read)
+		}
+	})
+	client := newDialingClient(t, server.address(), WithAutoLogin(NewUsernamePasswordCredentials("iggy", "iggy")))
+	require.NoError(t, client.Connect(context.Background()))
+	create := func(name string, result chan<- error) {
+		_, err := client.do(context.Background(), &command.CreateStream{Name: name})
+		result <- err
+	}
+	sent := make(chan error, 1)
+	go create("sent", sent)
+	<-received
+	waiting := []string{"first", "second"}
+	results := make([]chan error, len(waiting))
+	for index, name := range waiting {
+		results[index] = make(chan error, 1)
+		go create(name, results[index])
+		require.Eventually(t, func() bool {
+			client.operations.mu.Lock()
+			defer client.operations.mu.Unlock()
+			return len(client.operations.lanes[laneKey{}].waiters) == index+1
+		}, time.Second, time.Millisecond)
+	}
+
+	close(release)
+
+	var uncertain ierror.OperationUncertain
+	require.ErrorAs(t, <-sent, &uncertain)
+	for _, result := range results {
+		require.NoError(t, <-result)
+	}
+	creates := requestsFor(server.recorded(), vsr.OperationCreateStream)
+	require.Len(t, creates, 1+len(waiting), "each create went out once")
+	require.Equal(t, uncertain.OperationID, creates[0].requestID())
+	require.ErrorIs(t, client.ResolveOperation(context.Background(), uncertain.OperationID), ierror.ErrOperationNotRetained,
+		"the new session cannot replay an operation of the lost one")
+	require.Len(t, registerRequests(server), 2)
+	for index, name := range waiting {
+		waited := creates[index+1]
+		require.True(t, bytes.Contains(waited.payload, []byte(name)), "the waiting creates keep their order")
+		require.Equal(t, managedLinkSession+2, waited.sessionID(), "under the session of the recovery")
+	}
 }
 
 func TestDriverProgressUncertaintyEndsCallAndReleasesLane(t *testing.T) {
@@ -705,7 +790,7 @@ func TestDriverAfterSilentMetadataReplicaDiscoversThroughAnotherLink(t *testing.
 	newPeer, connection := net.Pipe()
 	defer func() { _ = newPeer.Close() }()
 	newLink := newTCPLink(connection, newAddress)
-	newLink.markBound(client.sessionFence, ^uint64(0))
+	newLink.markBound(client.sessionFence)
 	client.links.slots[1] = &replicaSlot{endpoint: newAddress, link: newLink, cancel: func() {}}
 	client.links.rosterOrder = []uint8{0, 1}
 	oldServer := serve(oldPeer, func(_ int, _ request) []byte { return nil })

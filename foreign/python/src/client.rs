@@ -176,17 +176,9 @@ impl IggyClient {
                 );
                 ClientWrapper::Tcp(TcpClient::create(config).map_err(to_runtime_error)?)
             }
-            Some(PyClientConfig::Quic(config)) => {
-                // `quinn::Endpoint::client` (invoked eagerly by `QuicClient::create`) looks
-                // up the current Tokio runtime via `Handle::try_current()` and fails with
-                // `CannotCreateEndpoint` if none is active. This method runs synchronously
-                // from Python without one, so enter the runtime pyo3-async-runtimes uses
-                // for our own async methods before building the endpoint.
-                let _guard = pyo3_async_runtimes::tokio::get_runtime().enter();
-                ClientWrapper::Quic(
-                    QuicClient::create(config.client_config()).map_err(to_runtime_error)?,
-                )
-            }
+            Some(PyClientConfig::Quic(config)) => ClientWrapper::Quic(
+                QuicClient::create(config.client_config()).map_err(to_runtime_error)?,
+            ),
             Some(PyClientConfig::Http(config)) => ClientWrapper::Http(
                 HttpClient::create(config.client_config()).map_err(to_runtime_error)?,
             ),
@@ -213,11 +205,6 @@ impl IggyClient {
         _cls: &Bound<'_, PyType>,
         connection_string: String,
     ) -> PyResult<Self> {
-        // The QUIC transport builds its endpoint eagerly and needs a Tokio runtime context
-        // to do so (see the `QuicConfig` arm of `new()` above for details); entering it here
-        // is a no-op for the other transports since the protocol isn't known until the
-        // connection string is parsed.
-        let _guard = pyo3_async_runtimes::tokio::get_runtime().enter();
         let client =
             RustIggyClient::from_connection_string(&connection_string).map_err(to_runtime_error)?;
         Ok(Self {
