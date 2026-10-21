@@ -35,5 +35,5 @@ pub(crate) mod topic_client;
 pub(crate) mod user_client;
 pub(crate) mod validatable;
 
-pub use binary_impls::decode_send_confirmations;
+pub use binary_impls::{BinarySendPartitioning, decode_send_confirmations, send_binary_messages};
 pub use binary_impls::{rust_sdk_version_info, sign_in_request};

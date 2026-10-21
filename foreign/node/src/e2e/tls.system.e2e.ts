@@ -175,20 +175,21 @@ describe('e2e -> tls', { skip: !tlsEnabled && 'IGGY_TCP_TLS_ENABLED is not set' 
     }
   );
 
-  it('e2e -> tls::rejects a wrong ca path with a TypeError', () => {
-    // The client is constructed eagerly, so an unreadable CA file surfaces
-    // as a TypeError from the constructor instead of a raw ENOENT Error
-    // leaking from the socket layer.
-    assert.throws(
-      () =>
-        new Client(
-          'iggy://iggy:iggy@localhost:8090' +
-          '?tls=true&tls_ca_file=/does/not/exist.pem'
-        ),
-      (error: unknown) =>
-        error instanceof TypeError &&
-        /cannot read tls_ca_file/.test(error.message)
+  it('e2e -> tls::rejects a wrong ca path with a TypeError', async () => {
+    const csClient = new Client(
+      'iggy://iggy:iggy@localhost:8090' +
+      '?tls=true&tls_ca_file=/does/not/exist.pem'
     );
+    try {
+      await assert.rejects(
+        csClient.system.ping(),
+        (error: unknown) =>
+          error instanceof TypeError &&
+          /cannot read tls_ca_file/.test(error.message)
+      );
+    } finally {
+      await csClient.destroy();
+    }
   });
 
   it('e2e -> tls::logout', async () => {

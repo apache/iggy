@@ -17,6 +17,11 @@ segments, users, personal access tokens, and consumer groups, sends and polls me
 and stores consumer offsets. The producer and consumer, examples, and BDD scenarios
 follow in later changes.
 
+Swift supports the consensus wire protocol and checks commitment proof during
+automatic retries. It does not yet expose retained-operation resolve/abandon APIs,
+mutation lanes, or pending-operation limits. Those recovery features in the Rust
+and other native SDKs are outside the current Swift implementation.
+
 ## Requirements
 
 - Swift 6.0 or later (Swift 6 language mode, strict concurrency)

@@ -258,7 +258,7 @@ The `SYS_NICE` capability, the seccomp setting and the unlimited locked memory a
 
 On operating systems other than Linux, Docker runs in a VM, so the container might run slower.
 
-To build the image from source instead, run `docker compose up` from the root of the repository. That image listens on all interfaces and keeps its data in `/local_data`. The container is named `iggy-server`, and the CLI is at `/iggy`. Set `IGGY_ROOT_USERNAME` and `IGGY_ROOT_PASSWORD` in `docker-compose.yml`. Otherwise the server generates a root password and prints it once in the container log.
+To build the image from source instead, run `docker compose up` from the root of the repository. That image listens on all interfaces and keeps its data in `/local_data`. The container is named `iggy-server`, and the CLI is at `/iggy`. The compose file requires `IGGY_ROOT_PASSWORD` from your shell (`IGGY_ROOT_PASSWORD=... docker compose up`) and defaults `IGGY_ROOT_USERNAME` to `iggy`.
 
 ---
 
@@ -308,10 +308,10 @@ Run the tests:
 
 `cargo test`
 
-Set root user credentials (OPTIONAL):
+Set root user credentials before the first start:
 
 Iggy requires credentials to authenticate requests to the server.
-You can set the root user **before** starting the server.
+Set the root user **before** starting the server.
 
 (macOS/Linux)
 
@@ -327,7 +327,7 @@ $env:IGGY_ROOT_USERNAME = "iggy"
 $env:IGGY_ROOT_PASSWORD = "iggy"
 ```
 
-If no root credentials are set and no users exist yet, `iggy-server` generates a random root user password and prints it once in the server log.
+When root does not exist, the leader needs both variables or `--with-default-root-credentials` below to create it. The server never generates a root password and never writes either credential to its output or log files.
 
 Start the server:
 
@@ -341,7 +341,7 @@ it should only be used for development and testing.
 
 `cargo run --bin iggy-server -- --with-default-root-credentials`
 
-Root credentials are only set on the first server startup when the data directory doesn't exist yet. Once the server has been started and persisted data exists, the existing root credentials will be reused, and the `--with-default-root-credentials` flag or environment variables are ignored. They are still validated, though: a half-set pair or an out-of-range value aborts the boot instead of being silently dropped. To reset credentials, delete the data directory.
+The leader creates root once and records the username and password hash in the metadata journal. Followers apply that same operation. Restarts recover the stored account without the variables or the flag, even before the first metadata checkpoint. Supplying different credentials does not replace the stored account. A half-set pair or an out-of-range value still aborts startup. To change the root password, use the API or the CLI.
 
 For configuration options and detailed help:
 

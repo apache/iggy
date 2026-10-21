@@ -234,7 +234,7 @@ async fn test_no_permissions(harness: &TestHarness, root_client: &IggyClient) {
         .await;
     assert!(
         matches!(&snapshot_result, Err(e) if e.as_code() == IggyError::Unauthorized.as_code()),
-        "snapshot must be rejected as unauthorized without read_servers, got {snapshot_result:?}"
+        "snapshot must be rejected as unauthorized without manage_servers, got {snapshot_result:?}"
     );
 
     // Self-read skips read_users, matching the legacy server: a user can
@@ -287,13 +287,18 @@ async fn test_system_permissions(harness: &TestHarness, root_client: &IggyClient
         .get_clients()
         .await
         .expect("read_servers: get_clients should work");
-    client
+    // The archive carries raw server logs and host diagnostics, so read-only
+    // server access is not enough to export it.
+    let snapshot_result = client
         .snapshot(
             SnapshotCompression::Deflated,
-            vec![SystemSnapshotType::Test],
+            vec![SystemSnapshotType::ServerLogs],
         )
-        .await
-        .expect("read_servers: snapshot should work");
+        .await;
+    assert!(
+        matches!(&snapshot_result, Err(e) if e.as_code() == IggyError::Unauthorized.as_code()),
+        "read_servers: snapshot must be rejected as unauthorized, got {snapshot_result:?}"
+    );
 
     // But cannot read users or streams
     assert_unauthorized(client.get_users().await, "read_servers: get_users");

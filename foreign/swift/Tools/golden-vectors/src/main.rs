@@ -67,8 +67,8 @@ use iggy_binary_protocol::responses::consumer_groups::{
 };
 use iggy_binary_protocol::responses::consumer_offsets::ConsumerOffsetResponse;
 use iggy_binary_protocol::responses::messages::{
-    PartitionRouteResponse, PollMessagesResponseHeader, PollRoutingResponse,
-    SendMessagesConfirmationResponse, SendMessagesResponse,
+    PartitionRouteResponse, PollMessagesResponseHeader, SendMessagesConfirmationResponse,
+    SendMessagesResponse,
 };
 use iggy_binary_protocol::responses::personal_access_tokens::{
     GetPersonalAccessTokensResponse, PersonalAccessTokenResponse, RawPersonalAccessTokenResponse,
@@ -947,6 +947,12 @@ fn main() {
         ..Default::default()
     };
     vectors.insert("vsr.reply.ok".to_owned(), hex(bytemuck::bytes_of(&reply)));
+    let mut committed = reply;
+    committed.reserved[0] = ReplyHeader::COMMITTED_RESULT;
+    vectors.insert(
+        "vsr.reply.committed".to_owned(),
+        hex(bytemuck::bytes_of(&committed)),
+    );
     let denied = ReplyHeader {
         command: Command::Reply,
         operation: Operation::NonReplicated,
@@ -1419,33 +1425,6 @@ fn main() {
             view: 3,
             partitions_count: 4,
             primary_replica: 2,
-        },
-    );
-    add(
-        &mut vectors,
-        "response.poll_routing",
-        &PollRoutingResponse {
-            consumer_session: SessionIdentity {
-                client_id: 0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10,
-                session: 42,
-                metadata_watermark: 120,
-            },
-            context: PartitionContext {
-                incarnation: 7,
-                owner_generation: 3,
-                metadata_op: 110,
-            },
-            primary: ClusterNodeResponse {
-                replica_id: 2,
-                name: "node-3".to_owned(),
-                ip: "10.0.0.3".to_owned(),
-                tcp_port: 8092,
-                quic_port: 0,
-                http_port: 3002,
-                websocket_port: 0,
-                role: 1,
-                status: 0,
-            },
         },
     );
 

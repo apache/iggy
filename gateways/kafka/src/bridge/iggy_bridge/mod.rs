@@ -46,7 +46,10 @@ pub use group_offsets::{OFFSET_GROUP_PREFIX, OffsetCalls};
 pub(crate) use offsets::{LocatedRecord, RecordLookup};
 use produce::ProducePool;
 pub use produce::{ProduceTurn, Producer};
-pub use topics::{KafkaTopicMetadata, StreamTopicCache, TopicCreationOutcome, TopicLoad};
+pub use topics::{
+    DEFAULT_TOPIC_PARTITIONS, KafkaTopicMetadata, MAX_TOPIC_PARTITIONS, StreamTopicCache,
+    TopicCreationOutcome, TopicLoad,
+};
 
 /// Passes attempted, after the first, before [`IggyBridge::connect`] gives up and returns `Err`.
 ///
@@ -75,8 +78,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Wraps a single Iggy client call in [`REQUEST_TIMEOUT`].
 ///
-/// On expiry, maps to [`BridgeError::Timeout`], not `IggyError::CannotEstablishConnection`: the
-/// SDK's write/read run in a detached task this timeout cannot abort, so the call may still land.
+/// On expiry, a sent mutation can still commit and remains retained by the SDK.
+/// Metadata writes recover such blockers through [`IggyBridge::metadata_write`].
 async fn with_request_timeout<T>(
     op: impl Future<Output = Result<T, IggyError>>,
 ) -> Result<T, BridgeError> {
@@ -135,9 +138,9 @@ async fn permit_by(turn: &Arc<Semaphore>, deadline: Instant) -> Option<OwnedSema
 ///
 /// Each producer sends on a client of its own, one request at a time. Producers past the session
 /// limit share one more. Metadata, `CreateTopics`, `DeleteTopics`, `CreatePartitions`,
-/// `DescribeConfigs` and `AlterConfigs` share another. Topic probes and certificate user lookups
-/// each use a client of their own, Fetch polls one per read slot, and offset calls two per offset
-/// slot.
+/// `DescribeConfigs` and `AlterConfigs` share another. Topic probes, certificate user lookups and
+/// `Metadata`'s auto topic creations each use a client of their own, Fetch polls one per read
+/// slot, and offset calls two per offset slot.
 ///
 /// Each client signs in at the metadata leader, and a view change or a refused call can move it to
 /// another node. So in a cluster, two clients can read replicas that are not at the same offset.
@@ -154,6 +157,8 @@ pub struct IggyBridge {
     probe_client: LazyClient,
     /// The client of every certificate user lookup. See `resolve`.
     lookup_client: LazyClient,
+    /// The client of every auto topic creation. See `auto_create_kafka_topic`.
+    auto_create_client: LazyClient,
     /// Group offset slots, each with a commit client and a read client. See `OffsetPool`.
     offset_pool: OffsetPool,
 }
@@ -196,6 +201,7 @@ impl IggyBridge {
             fetch_pool: Arc::new(FetchPool::new()),
             probe_client: LazyClient::default(),
             lookup_client: LazyClient::default(),
+            auto_create_client: LazyClient::default(),
             offset_pool: OffsetPool::new(),
         })
     }
@@ -225,6 +231,25 @@ impl IggyBridge {
     pub(crate) fn topic_identity(&self, kafka_topic: &str) -> (String, String) {
         let (stream, topic) = self.config.topic_mapping.resolve(kafka_topic);
         (stream.to_string(), topic.to_string())
+    }
+
+    /// Whether `kafka_topic` is no override's key yet resolves to an override's Iggy topic. See
+    /// [`TopicMapping::aliases_an_override`](crate::bridge::TopicMapping::aliases_an_override).
+    #[must_use]
+    pub(crate) fn aliases_an_override(&self, kafka_topic: &str) -> bool {
+        self.config.topic_mapping.aliases_an_override(kafka_topic)
+    }
+
+    /// Drops the auto topic creation client without signing it out, so [`Self::close`] does not
+    /// wait behind a creation still running on it. Iggy ends its session when the lease runs out.
+    pub(crate) fn discard_auto_create_client(&self) {
+        self.auto_create_client.discard();
+    }
+
+    /// Whether the auto topic creation client is in its slot.
+    #[cfg(test)]
+    pub(crate) async fn holds_auto_create_client(&self) -> bool {
+        self.auto_create_client.held().await.is_some()
     }
 
     /// Signs out and tears down every Iggy client, including its background heartbeat task.
@@ -257,6 +282,7 @@ impl IggyBridge {
             fetch_clients,
             probe_client,
             lookup_client,
+            auto_create_client,
             offset_clients,
             shared_client,
         ) = tokio::join!(
@@ -264,6 +290,7 @@ impl IggyBridge {
             self.fetch_pool.close(),
             self.probe_client.close(),
             self.lookup_client.close(),
+            self.auto_create_client.close(),
             self.offset_pool.close(),
             sign_out_and_shut_down(&self.client),
         );
@@ -271,8 +298,57 @@ impl IggyBridge {
             .and(fetch_clients)
             .and(probe_client)
             .and(lookup_client)
+            .and(auto_create_client)
             .and(offset_clients)
             .and(shared_client)
+    }
+
+    /// Recovers a canceled metadata write before submitting a later, unsent one.
+    /// A timeout keeps the SDK's retained request and never retries it as a new mutation.
+    async fn metadata_write<T, F: Future<Output = Result<T, IggyError>>>(
+        &self,
+        write: impl FnMut() -> F,
+    ) -> Result<T, BridgeError> {
+        metadata_write_on(&self.client, write).await
+    }
+}
+
+/// [`IggyBridge::metadata_write`] on `client`, for the writes that run on the admin client or on
+/// the auto topic creation client.
+async fn metadata_write_on<T, F: Future<Output = Result<T, IggyError>>>(
+    client: &IggyClient,
+    mut write: impl FnMut() -> F,
+) -> Result<T, BridgeError> {
+    let deadline = (Instant::now() + REQUEST_TIMEOUT).into_std();
+    with_request_timeout(write_with_recovery(client, deadline, &mut write)).await
+}
+
+async fn write_with_recovery<T, F: Future<Output = Result<T, IggyError>>>(
+    client: &IggyClient,
+    deadline: std::time::Instant,
+    mut write: impl FnMut() -> F,
+) -> Result<T, IggyError> {
+    loop {
+        match write().await {
+            Err(IggyError::LaneBlocked(operation)) => {
+                resolve_blocker(client, operation, deadline).await?;
+            }
+            result => return result,
+        }
+    }
+}
+
+async fn resolve_blocker(
+    client: &IggyClient,
+    operation: u64,
+    deadline: std::time::Instant,
+) -> Result<(), IggyError> {
+    match client.resolve_operation(operation, deadline).await {
+        Err(error @ (IggyError::OperationUncertain(_) | IggyError::OperationNotRetained(_))) => {
+            Err(error)
+        }
+        // A proved rejection belongs to the earlier call and releases its lane too.
+        _ => Ok(()),
     }
 }
 
@@ -299,8 +375,11 @@ impl IggyBridge {
             produce_sessions: crate::bridge::ProduceSessionLimits::default(),
             tls: crate::bridge::IggyTls::default(),
         };
+        let client = Arc::new(client);
         Self {
-            client: Arc::new(client),
+            // Held rather than lazy, so an auto topic creation fails at once instead of dialing.
+            auto_create_client: LazyClient::holding(Arc::clone(&client)),
+            client,
             produce_pool: Arc::new(ProducePool::new(config.produce_sessions)),
             config,
             fetch_pool: Arc::new(FetchPool::new()),
@@ -361,15 +440,17 @@ impl std::fmt::Debug for IggyBridge {
 #[async_trait]
 impl PrincipalResolver for IggyBridge {
     async fn resolve(&self, username: &str) -> Result<AuthenticatedPrincipal, AuthError> {
-        let client = self.lookup_client.clone();
-        let config = self.config.clone();
         let username = username.to_owned();
-        let lookup = async move {
-            let connected = client.connected(&config).await?;
+        let lookup = |connected: Arc<IggyClient>| async move {
             Ok(resolve_principal(connected.as_ref(), &username).await)
         };
         let deadline = Instant::now() + REQUEST_TIMEOUT;
-        match self.lookup_client.until_detached(deadline, lookup).await {
+        let config = self.config.clone();
+        match self
+            .lookup_client
+            .until_detached(config, deadline, lookup)
+            .await
+        {
             Ok(resolved) => resolved,
             Err(error) => {
                 warn!(%error, "could not reach Iggy to look up the certificate's user");

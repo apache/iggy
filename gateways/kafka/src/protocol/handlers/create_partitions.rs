@@ -76,7 +76,7 @@ use tokio::time::{Instant, timeout_at};
 
 use crate::auth::AuthenticatedPrincipal;
 use crate::bridge::iggy_bridge::in_slot;
-use crate::bridge::{BridgeError, IggyBridge};
+use crate::bridge::{BridgeError, IggyBridge, MAX_TOPIC_PARTITIONS};
 use crate::error::Result;
 use crate::protocol::api::{
     API_KEY_CREATE_PARTITIONS, ApiVersionRange, ERROR_INVALID_PARTITIONS,
@@ -85,7 +85,7 @@ use crate::protocol::api::{
     ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState, HandleOutcome,
 };
 use crate::protocol::bounds_guard::validate_create_partitions_shape;
-use crate::protocol::handlers::create_topics::{MAX_PARTITIONS_COUNT, SINGLE_BROKER_ID};
+use crate::protocol::handlers::create_topics::SINGLE_BROKER_ID;
 use crate::protocol::handlers::topic_config::{
     exceeds_topic_cap, find_duplicate_names, topic_cap_message,
 };
@@ -778,12 +778,12 @@ const fn resizable(topic: &TopicState) -> core::result::Result<(), (i16, StrByte
     Ok(())
 }
 
-/// Iggy adds at most [`MAX_PARTITIONS_COUNT`] partitions to one topic in one call and refuses
+/// Iggy adds at most [`MAX_TOPIC_PARTITIONS`] partitions to one topic in one call and refuses
 /// more with `TooManyPartitions`. Checked here as well, so `validate_only` answers the same
 /// rejection the write would get, with the same `INVALID_REQUEST` (42) that error maps to: not
 /// `INVALID_PARTITIONS` (37), whose wire text says "below 1", the opposite condition.
 fn within_per_request_cap(added: u32) -> core::result::Result<(), (i16, StrBytes)> {
-    if added > MAX_PARTITIONS_COUNT {
+    if added > MAX_TOPIC_PARTITIONS {
         return Err((ERROR_INVALID_REQUEST, too_many_added_message()));
     }
     Ok(())
@@ -791,7 +791,7 @@ fn within_per_request_cap(added: u32) -> core::result::Result<(), (i16, StrBytes
 
 fn too_many_added_message() -> StrBytes {
     StrBytes::from(format!(
-        "at most {MAX_PARTITIONS_COUNT} partitions can be added to one topic in one request"
+        "at most {MAX_TOPIC_PARTITIONS} partitions can be added to one topic in one request"
     ))
 }
 
@@ -1087,8 +1087,8 @@ mod tests {
 
     #[test]
     fn adding_up_to_the_per_request_cap_passes_and_one_more_is_invalid_request() {
-        assert_eq!(within_per_request_cap(MAX_PARTITIONS_COUNT), Ok(()));
-        let (code, message) = within_per_request_cap(MAX_PARTITIONS_COUNT + 1).unwrap_err();
+        assert_eq!(within_per_request_cap(MAX_TOPIC_PARTITIONS), Ok(()));
+        let (code, message) = within_per_request_cap(MAX_TOPIC_PARTITIONS + 1).unwrap_err();
         assert_eq!(code, ERROR_INVALID_REQUEST);
         assert_eq!(
             message.as_str(),

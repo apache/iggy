@@ -22,6 +22,7 @@ use iggy::prelude::{
     Partitioning as RustPartitioning, PollingStrategy as RustPollingStrategy, *,
 };
 use pyo3::PyRef;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDelta, PyList, PyType};
 use pyo3_async_runtimes::tokio::future_into_py;
@@ -31,6 +32,7 @@ use std::collections::BTreeMap;
 use std::fmt::Display;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::config::PyClientConfig;
 use crate::consumer::{
@@ -42,16 +44,19 @@ use crate::identifier::PyIdentifier;
 use crate::options::OptionSpec as PyOptionSpec;
 use crate::partitioning::PyPartitioning;
 use crate::permissions::Permissions as PyPermissions;
-use crate::producer::{IggyProducer, ProducerMode, RetryInterval, u32_param as producer_u32_param};
+use crate::producer::{IggyProducer, ProducerMode, u32_param as producer_u32_param};
 use crate::receive_message::{PartitionContext, PollingStrategy, ReceiveMessage};
 use crate::send_message::{SendMessage, SendMessagesResponse as PySendMessagesResponse};
 use crate::stats::Stats as PyStats;
 use crate::stream::{Stream, StreamDetails};
 use crate::topic::{IggyExpiry, MaxTopicSize, Topic, TopicDetails};
 use crate::user::{
-    UserInfo as PyUserInfo, UserInfoDetails as PyUserInfoDetails, UserStatus as PyUserStatus,
+    IdentityInfo as PyIdentityInfo, UserInfo as PyUserInfo, UserInfoDetails as PyUserInfoDetails,
+    UserStatus as PyUserStatus,
 };
 use tokio::sync::Mutex;
+
+const DEFAULT_RESOLVE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A Python class representing the Iggy client.
 /// It provides asynchronous functionality through the contained runtime.
@@ -61,9 +66,43 @@ pub struct IggyClient {
     inner: Arc<RustIggyClient>,
 }
 
-/// Converts SDK errors to the RuntimeError exposed by the Python API.
-fn to_runtime_error<E: Display>(error: E) -> PyErr {
-    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error.to_string())
+/// An operation whose retained identity is needed to recover or release its lane.
+#[gen_stub_pyclass]
+#[pyclass(frozen, extends=PyRuntimeError)]
+pub struct PendingOperationError {
+    #[pyo3(get)]
+    operation_id: u64,
+    #[pyo3(get)]
+    code: u32,
+    #[pyo3(get)]
+    kind: &'static str,
+}
+
+/// Preserves recovery identity rather than requiring callers to parse an error message.
+pub(crate) fn to_runtime_error(error: IggyError) -> PyErr {
+    let (operation_id, kind) = match error {
+        IggyError::OperationUncertain(operation_id) => (operation_id, "uncertain"),
+        IggyError::LaneBlocked(operation_id) => (operation_id, "lane_blocked"),
+        IggyError::OperationNotRetained(operation_id) => (operation_id, "not_retained"),
+        _ => return PyRuntimeError::new_err(error.to_string()),
+    };
+    Python::attach(|py| {
+        let instance = match Bound::new(
+            py,
+            PendingOperationError {
+                operation_id,
+                code: error.as_code(),
+                kind,
+            },
+        ) {
+            Ok(instance) => instance,
+            Err(error) => return error,
+        };
+        if let Err(error) = instance.setattr("args", (error.to_string(),)) {
+            return error;
+        }
+        PyErr::from_value(instance.into_any())
+    })
 }
 
 fn to_value_error<E: Display>(error: E) -> PyErr {
@@ -78,7 +117,7 @@ fn resolve_topic_params(
     max_topic_size: Option<&MaxTopicSize>,
 ) -> PyResult<(CompressionAlgorithm, RustIggyExpiry, RustMaxTopicSize)> {
     let compression_algorithm = match compression_algorithm {
-        Some(algo) => CompressionAlgorithm::from_str(&algo).map_err(to_runtime_error)?,
+        Some(algo) => CompressionAlgorithm::from_str(&algo).map_err(PyRuntimeError::new_err)?,
         None => CompressionAlgorithm::default(),
     };
 
@@ -114,8 +153,8 @@ impl IggyClient {
     ///
     /// Raises:
     ///     RuntimeError: If the address passed as a string is not a valid
-    ///         `host:port` pair, or if a `QuicConfig` client cannot bind its
-    ///         local UDP socket (for example the port is already in use).
+    ///         `host:port` pair. QUIC binds its local UDP socket during
+    ///         `connect()`, which reports a port already in use.
     #[new]
     #[pyo3(signature = (conn=None))]
     fn new(
@@ -252,8 +291,14 @@ impl IggyClient {
     }
 
     /// Logs in the user with the given credentials.
-    /// Raises `RuntimeError` on failure.
-    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `IdentityInfo`.
+    ///     `access_token` is set only on HTTP; binary transports leave it `None`.
+    ///
+    /// Raises:
+    ///     RuntimeError: If the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[IdentityInfo]", imports=("collections.abc")))]
     fn login_user<'a>(
         &self,
         py: Python<'a>,
@@ -262,11 +307,37 @@ impl IggyClient {
     ) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
         future_into_py(py, async move {
-            inner
+            let identity = inner
                 .login_user(&username, &password)
                 .await
                 .map_err(to_runtime_error)?;
-            Ok(())
+            Ok(PyIdentityInfo::from(identity))
+        })
+    }
+
+    /// Logs in with a personal access token created separately.
+    ///
+    /// Args:
+    ///     token: Raw PAT string.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `IdentityInfo`.
+    ///
+    /// Raises:
+    ///     RuntimeError: If the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[IdentityInfo]", imports=("collections.abc")))]
+    fn login_with_personal_access_token<'a>(
+        &self,
+        py: Python<'a>,
+        token: String,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let identity = inner
+                .login_with_personal_access_token(&token)
+                .await
+                .map_err(to_runtime_error)?;
+            Ok(PyIdentityInfo::from(identity))
         })
     }
 
@@ -535,6 +606,56 @@ impl IggyClient {
         future_into_py(py, async move {
             inner.disconnect().await.map_err(to_runtime_error)?;
             Ok(())
+        })
+    }
+
+    /// Replays the exact retained operation until its final result or the deadline.
+    /// A committed rejection raises its original error and frees the lane.
+    /// Uncertainty keeps the operation retained. HTTP does not support this operation.
+    /// `timeout` must be a positive timedelta; omission or None uses 30 seconds.
+    #[pyo3(signature = (operation_id, *, timeout=None))]
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn resolve_operation<'a>(
+        &self,
+        py: Python<'a>,
+        operation_id: u64,
+        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+        timeout: Option<Py<PyDelta>>,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let timeout = timeout
+            .as_ref()
+            .map(py_delta_to_iggy_duration)
+            .transpose()?
+            .map(|timeout| reject_zero(timeout, "timeout"))
+            .transpose()?
+            .map_or(DEFAULT_RESOLVE_TIMEOUT, |timeout| {
+                timeout.get().get_duration()
+            });
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| PyValueError::new_err("'timeout' is too large"))?;
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            inner
+                .resolve_operation(operation_id, deadline)
+                .await
+                .map_err(to_runtime_error)
+        })
+    }
+
+    /// Releases a retained operation without claiming whether it committed.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn abandon_operation<'a>(
+        &self,
+        py: Python<'a>,
+        operation_id: u64,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            inner
+                .abandon_operation(operation_id)
+                .await
+                .map_err(to_runtime_error)
         })
     }
 
@@ -891,7 +1012,7 @@ impl IggyClient {
         // Absent stays absent: a key the caller did not pass is left alone
         // server-side rather than reset to a default.
         let compression_algorithm = compression_algorithm
-            .map(|algo| CompressionAlgorithm::from_str(&algo).map_err(to_runtime_error))
+            .map(|algo| CompressionAlgorithm::from_str(&algo).map_err(PyRuntimeError::new_err))
             .transpose()?;
         let update_options = TopicUpdateOptions {
             compression_algorithm,
@@ -1378,8 +1499,6 @@ impl IggyClient {
         topic_partitions_count=1,
         topic_message_expiry=None,
         topic_max_size=None,
-        send_retries=Some(3),
-        send_retry_interval=RetryInterval::default(),
         topic_durability=None,
     ))]
     #[gen_stub(override_return_type(type_repr = "collections.abc.Awaitable[IggyProducer]", imports=("collections.abc")))]
@@ -1404,8 +1523,6 @@ impl IggyClient {
         #[gen_stub(override_type(type_repr = "MaxTopicSize | None"))] topic_max_size: Option<
             &MaxTopicSize,
         >,
-        send_retries: Option<i64>,
-        send_retry_interval: RetryInterval,
         #[gen_stub(override_type(type_repr = "Durability | None"))] topic_durability: Option<
             &Bound<'_, PyAny>,
         >,
@@ -1422,17 +1539,10 @@ impl IggyClient {
             .map(RustMaxTopicSize::try_from)
             .transpose()?
             .unwrap_or(RustMaxTopicSize::ServerDefault);
-        let send_retries = send_retries
-            .map(|retries| producer_u32_param(retries, "send_retries"))
-            .transpose()?
-            .filter(|retries| *retries != 0);
-        let send_retry_interval = send_retry_interval.resolve()?;
-
         let mut builder = self
             .inner
             .producer(stream, topic)
             .map_err(to_value_error)?
-            .send_retries(send_retries, send_retry_interval)
             .topic_durability(crate::durability::Durability::try_from(topic_durability)?.0);
 
         builder = match mode {
@@ -1705,3 +1815,61 @@ impl IggyClient {
 }
 
 define_stub_info_gatherer!(stub_info);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_operation_errors_preserve_exact_identity_and_kind() {
+        Python::initialize();
+        Python::attach(|py| {
+            for operation_id in [(1u64 << 53) + 17, u64::MAX] {
+                for (error, kind) in [
+                    (IggyError::OperationUncertain(operation_id), "uncertain"),
+                    (IggyError::LaneBlocked(operation_id), "lane_blocked"),
+                    (
+                        IggyError::OperationNotRetained(operation_id),
+                        "not_retained",
+                    ),
+                ] {
+                    let code = error.as_code();
+                    let error = to_runtime_error(error);
+                    assert!(error.is_instance_of::<PendingOperationError>(py));
+                    assert!(error.is_instance_of::<PyRuntimeError>(py));
+                    let value = error.value(py);
+                    assert_eq!(
+                        value
+                            .getattr("operation_id")
+                            .unwrap()
+                            .extract::<u64>()
+                            .unwrap(),
+                        operation_id
+                    );
+                    assert_eq!(
+                        value.getattr("code").unwrap().extract::<u32>().unwrap(),
+                        code
+                    );
+                    assert_eq!(
+                        value.getattr("kind").unwrap().extract::<String>().unwrap(),
+                        kind
+                    );
+                    assert!(value.setattr("operation_id", 0).is_err());
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn business_rejection_keeps_original_error_without_retained_identity() {
+        Python::initialize();
+        Python::attach(|py| {
+            let rejection = IggyError::UserAlreadyExists;
+            let message = rejection.to_string();
+            let error = to_runtime_error(rejection);
+            assert!(error.is_instance_of::<PyRuntimeError>(py));
+            assert!(!error.is_instance_of::<PendingOperationError>(py));
+            assert_eq!(error.value(py).str().unwrap().to_str().unwrap(), message);
+        });
+    }
+}

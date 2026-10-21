@@ -25,11 +25,14 @@ use tokio::sync::{Semaphore, broadcast};
 use tracing::{info, warn};
 
 use iggy_gateway_kafka::auth::IggyAuthenticator;
-use iggy_gateway_kafka::bridge::{IggyBridge, IggyBridgeConfig, IggyTls};
+use iggy_gateway_kafka::bridge::{
+    DEFAULT_TOPIC_PARTITIONS, IggyBridge, IggyBridgeConfig, IggyTls, MAX_TOPIC_PARTITIONS,
+};
 use iggy_gateway_kafka::env::parse_bool;
 use iggy_gateway_kafka::listener::{
     ListenerConfig, SecurityProtocol, apply_advertised_listeners, parse_listeners,
 };
+use iggy_gateway_kafka::protocol::auto_topic_creation::AutoTopicCreationConfig;
 use iggy_gateway_kafka::server::{bind_listeners, init_tracing};
 use iggy_gateway_kafka::tls::{ClientAuth, TlsConfig};
 use iggy_gateway_kafka::{GatewayConfig, KafkaGateway};
@@ -141,6 +144,8 @@ const KNOWN_KAFKA_ENV_VARS: &[&str] = &[
     "IGGY_KAFKA_SASL_ENABLED",
     "IGGY_KAFKA_PRE_AUTH_TIMEOUT_SECS",
     "IGGY_KAFKA_MAX_CONCURRENT_AUTHENTICATIONS",
+    "IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED",
+    "IGGY_KAFKA_AUTO_CREATE_TOPICS_PARTITIONS",
 ];
 
 /// The variables of the single-listener form, which `IGGY_KAFKA_LISTENERS` replaces as a whole.
@@ -310,6 +315,13 @@ fn load_config() -> Result<GatewayConfig, String> {
         warn!(
             "IGGY_KAFKA_INSTANCE_ID is not set, defaulting to 0: every gateway fronting the same \
              Iggy cluster needs its own value, or they hand out colliding producer ids"
+        );
+    }
+    config.auto_topic_creation = load_auto_topic_creation(bridge_enabled()?)?;
+    if config.auto_topic_creation.enabled {
+        info!(
+            partitions = config.auto_topic_creation.partitions,
+            "auto topic creation is on: a Metadata lookup of a missing topic creates it"
         );
     }
     reject_unread_iggy_tls(
@@ -530,6 +542,47 @@ where
     Ok(value)
 }
 
+/// `IGGY_KAFKA_AUTO_CREATE_TOPICS_*`. A partition count with creation off, or creation without a
+/// bridge to create through, is refused rather than silently ignored.
+fn load_auto_topic_creation(bridge_enabled: bool) -> Result<AutoTopicCreationConfig, String> {
+    let enabled = match env_var("IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED") {
+        Some(raw) => parse_bool("IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED", &raw)?,
+        None => false,
+    };
+    let partitions = env_var("IGGY_KAFKA_AUTO_CREATE_TOPICS_PARTITIONS");
+    if !enabled {
+        if partitions.is_some() {
+            return Err("IGGY_KAFKA_AUTO_CREATE_TOPICS_PARTITIONS is set but \
+                 IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED is not true"
+                .to_string());
+        }
+        return Ok(AutoTopicCreationConfig::default());
+    }
+    if !bridge_enabled {
+        return Err(
+            "IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED needs IGGY_KAFKA_BRIDGE_ENABLED=true"
+                .to_string(),
+        );
+    }
+    let partitions = match partitions {
+        Some(raw) => {
+            let count: u32 = parse_positive("IGGY_KAFKA_AUTO_CREATE_TOPICS_PARTITIONS", &raw)?;
+            if count > MAX_TOPIC_PARTITIONS {
+                return Err(format!(
+                    "IGGY_KAFKA_AUTO_CREATE_TOPICS_PARTITIONS {count} exceeds Iggy's per-topic \
+                     maximum {MAX_TOPIC_PARTITIONS}"
+                ));
+            }
+            count
+        }
+        None => DEFAULT_TOPIC_PARTITIONS,
+    };
+    Ok(AutoTopicCreationConfig {
+        enabled,
+        partitions,
+    })
+}
+
 /// Wait for Ctrl-C (SIGINT) or, on Unix, SIGTERM (`docker stop`).
 async fn shutdown_signal() {
     let ctrl_c = async {
@@ -691,6 +744,59 @@ mod tests {
                 error.contains(raw),
                 "`{raw}` rejection must quote the offending value, got: {error}"
             );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn given_no_auto_create_vars_when_loading_config_should_leave_auto_creation_off() {
+        let config = load_with(&[]).expect("defaults load");
+        assert!(!config.auto_topic_creation.enabled);
+    }
+
+    #[test]
+    #[serial]
+    fn given_auto_creation_with_a_bridge_when_loading_config_should_read_the_partition_count() {
+        let config = load_with(&[
+            ("IGGY_KAFKA_BRIDGE_ENABLED", "true"),
+            ("IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED", "true"),
+            ("IGGY_KAFKA_AUTO_CREATE_TOPICS_PARTITIONS", "6"),
+        ])
+        .expect("a valid auto-creation config loads");
+        assert!(config.auto_topic_creation.enabled);
+        assert_eq!(config.auto_topic_creation.partitions, 6);
+    }
+
+    #[test]
+    #[serial]
+    fn given_an_invalid_auto_create_setting_when_loading_config_should_refuse_and_name_it() {
+        let cases: [(&[(&str, &str)], &str); 4] = [
+            (
+                &[("IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED", "true")],
+                "IGGY_KAFKA_BRIDGE_ENABLED",
+            ),
+            (
+                &[("IGGY_KAFKA_AUTO_CREATE_TOPICS_PARTITIONS", "3")],
+                "IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED",
+            ),
+            (
+                &[
+                    ("IGGY_KAFKA_BRIDGE_ENABLED", "true"),
+                    ("IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED", "true"),
+                    ("IGGY_KAFKA_AUTO_CREATE_TOPICS_PARTITIONS", "1001"),
+                ],
+                "IGGY_KAFKA_AUTO_CREATE_TOPICS_PARTITIONS",
+            ),
+            (
+                &[("IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED", "yes")],
+                "IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED",
+            ),
+        ];
+        for (vars, named) in cases {
+            let error = load_with(vars)
+                .err()
+                .unwrap_or_else(|| panic!("{vars:?} must be refused"));
+            assert!(error.contains(named), "{vars:?}: {error}");
         }
     }
 

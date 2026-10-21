@@ -272,6 +272,12 @@ actor ClientCore {
 
     var bindSecret: [UInt8] { session.bindSecret }
 
+    /// The bound session as a data connection binds to it, at the metadata
+    /// watermark `metadataOp`. Nil while no session is bound.
+    func sessionIdentity(at metadataOp: UInt64) -> Responses.SessionIdentity? {
+        session.session.map { Responses.SessionIdentity(clientID: session.clientID, session: $0, metadataWatermark: metadataOp) }
+    }
+
     /// Stamps a frame for a data connection from the shared session, for the
     /// session `identity` names. Replicated requests take the next id of the
     /// session's counter; reads carry its current value. A session that was
@@ -557,11 +563,17 @@ actor ClientCore {
             }
             observeMetadataReply(header)
             do {
-                return .success(Array(try VSRFrame.decodeReply(header: header, body: raw.body[...])))
+                let body = try VSRFrame.decodeReply(header: header, body: raw.body[...])
+                if outcome.isUncertain && stamped.operation != .nonReplicated && stamped.operation != .register && stamped.operation != .logout
+                    && !VSRFrame.hasCommittedResult(header)
+                {
+                    throw IggyError(.transientNotCommitted, context: "the reply does not prove the earlier attempt committed")
+                }
+                return .success(Array(body))
             } catch let answer as IggyError {
                 // Once one attempt left the outcome unknown, a later refusal
                 // of the same request no longer proves it never committed.
-                let error = outcome.observe(answer)
+                let error = outcome.observe(answer, committed: VSRFrame.hasCommittedResult(header))
                 refusal = error
                 switch error.code {
                 case .transientNotCommitted where replaysUncommitted && clock.now < readDeadline:
@@ -1164,19 +1176,11 @@ actor ClientCore {
         do {
             let body = try await exchange(code: CommandCode.getClusterMetadata.rawValue, payload: [])
             let metadata = try Responses.clusterMetadata(body[...])
-            learnRosterSize(metadata)
+            pollRouter.learnRoster(metadata)
             return Self.transportEndpoints(metadata)
         } catch {
             logger.debug("Failed to read the cluster roster: \(error)")
             return []
-        }
-    }
-
-    /// Tells the router whether polls go to data connections. An empty
-    /// roster says nothing about the cluster, so the router keeps asking.
-    private func learnRosterSize(_ metadata: ClusterMetadata) {
-        if !metadata.nodes.isEmpty {
-            pollRouter.learnRosterSize(metadata.nodes.count)
         }
     }
 
@@ -1224,7 +1228,7 @@ actor ClientCore {
                 logger.debug("Failed to get cluster metadata: \(error), continuing on \(currentAddress)")
                 return LeaderCheck(redirect: nil, endpoints: [])
             }
-            learnRosterSize(metadata)
+            pollRouter.learnRoster(metadata)
             let endpoints = Self.transportEndpoints(metadata)
             if metadata.nodes.count <= 1 {
                 return LeaderCheck(redirect: nil, endpoints: endpoints)
@@ -1302,7 +1306,11 @@ struct RetryOutcome {
         isUncertain = true
     }
 
-    mutating func observe(_ error: IggyError) -> IggyError {
+    mutating func observe(_ error: IggyError, committed: Bool = false) -> IggyError {
+        if committed {
+            isUncertain = false
+            return error
+        }
         if error.code == .requestTooOld {
             // The server took a later request id of this session first, which
             // a replay or a data connection can cause. An earlier attempt of
@@ -1316,11 +1324,6 @@ struct RetryOutcome {
         guard isUncertain else {
             return error
         }
-        switch error.code {
-        case .transientNotAccepted, .historyUnavailable, .unauthorized, .unauthenticated, .staleClient, .notConnected, .cannotEstablishConnection:
-            return IggyError(.transientNotCommitted, context: "an earlier attempt may have committed, then: \(error)")
-        default:
-            return error
-        }
+        return IggyError(.transientNotCommitted, context: "an earlier attempt may have committed, then: \(error)")
     }
 }

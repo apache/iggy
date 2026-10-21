@@ -90,30 +90,34 @@ impl<B: BinaryClient> PersonalAccessTokenClient for B {
         &self,
         token: &str,
     ) -> Result<IdentityInfo, IggyError> {
-        super::logout_before_relogin(self).await?;
-        super::validate_token(token)?;
-        let credentials = Credentials::PersonalAccessToken(SecretString::from(token.to_string()));
-        let fence = self.session_fence();
-        let (code, payload) = super::sign_in_request(
-            &credentials,
-            super::rust_sdk_version_info(self.sdk_version())?,
-            self.session_bind_secret().await?,
-        )?;
-        let response = self.send_raw_with_response(code, payload).await?;
-        let wire_resp = super::decode_response::<LoginRegisterResponse>(&response)?;
-        self.bind_vsr_session_at(fence, wire_resp.session).await?;
-        tracing::debug!(
-            server_version = %wire_resp.server_version,
-            server_protocol_version = wire_resp.server_protocol_version,
-            "authenticated against iggy server"
-        );
-        self.set_state(ClientState::Authenticated).await;
-        self.remember_session_credentials(credentials, wire_resp.user_id)
-            .await;
-        self.publish_event(DiagnosticEvent::SignedIn).await;
-        Ok(IdentityInfo {
-            user_id: wire_resp.user_id,
-            access_token: None,
+        crate::with_binary_deadline(crate::binary_operation_deadline(), async {
+            super::validate_token(token)?;
+            super::logout_before_relogin(self).await?;
+            let credentials =
+                Credentials::PersonalAccessToken(SecretString::from(token.to_string()));
+            let fence = self.session_fence();
+            let (code, payload) = super::sign_in_request(
+                &credentials,
+                super::rust_sdk_version_info(self.sdk_version())?,
+                self.session_bind_secret().await?,
+            )?;
+            let response = self.send_raw_with_response(code, payload).await?;
+            let wire_resp = super::decode_response::<LoginRegisterResponse>(&response)?;
+            self.bind_vsr_session_at(fence, wire_resp.session).await?;
+            tracing::debug!(
+                server_version = %wire_resp.server_version,
+                server_protocol_version = wire_resp.server_protocol_version,
+                "authenticated against iggy server"
+            );
+            self.set_state(ClientState::Authenticated).await;
+            self.remember_session_credentials(credentials, wire_resp.user_id)
+                .await;
+            self.publish_event(DiagnosticEvent::SignedIn).await;
+            Ok(IdentityInfo {
+                user_id: wire_resp.user_id,
+                access_token: None,
+            })
         })
+        .await
     }
 }
