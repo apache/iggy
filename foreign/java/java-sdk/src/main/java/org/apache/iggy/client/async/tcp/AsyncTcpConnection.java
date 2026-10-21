@@ -821,9 +821,8 @@ public class AsyncTcpConnection {
     }
 
     /**
-     * Decides what follows a failed attempt of a call: the routed caller gets the failure, a call that has not sent
-     * its frame starts again once a session is bound, a lost link of an uncertain call or a 58 or 89 refusal moves the
-     * call to the next attempt after a leader recheck, and anything else ends the call.
+     * Retries unsent calls after session recovery and transient refusals after a leader recheck.
+     * Routed calls and terminal failures return to their caller.
      */
     @SuppressWarnings({"checkstyle:CyclomaticComplexity", "checkstyle:NPathComplexity"})
     private void completeFailedRequest(

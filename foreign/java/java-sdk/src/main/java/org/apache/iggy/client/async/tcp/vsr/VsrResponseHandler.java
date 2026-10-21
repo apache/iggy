@@ -226,13 +226,20 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 && resultCode != VsrHeaders.ERROR_TRANSIENT_NOT_COMMITTED
                 && resultCode != VsrHeaders.ERROR_TRANSIENT_NOT_ACCEPTED
                 && resultCode != IggyErrorCode.NOT_PRIMARY.getCode();
+        recordSessionReply(frame, pending, operation, resultCode, bodyStart, bodyLength);
+        if (resultCode != 0) {
+            throw IggyServerException.fromTcpResponse(resultCode, new byte[0]);
+        }
+
+        return frame.retainedSlice(bodyStart, bodyLength);
+    }
+
+    private void recordSessionReply(
+            ByteBuf frame, PendingRequest pending, int operation, long resultCode, int bodyStart, int bodyLength) {
         boolean sessionBound = false;
         synchronized (session) {
             if (pending.identity.matches(session)) {
-                if (pending.committed
-                        && (VsrOperation.isMetadata(operation)
-                                || operation == VsrOperation.REGISTER
-                                || operation == VsrOperation.LOGOUT)) {
+                if (pending.committed && advancesMetadata(operation)) {
                     session.observeMetadata(frame.getLongLE(frame.readerIndex() + VsrHeaders.REPLY_COMMIT_OFFSET));
                 }
                 if (resultCode == 0) {
@@ -245,11 +252,6 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
             session.owner().changed();
         }
         resetLogoutSession(pending, operation, resultCode);
-        if (resultCode != 0) {
-            throw IggyServerException.fromTcpResponse(resultCode, new byte[0]);
-        }
-
-        return frame.retainedSlice(bodyStart, bodyLength);
     }
 
     private int validatedOperation(ByteBuf frame) {
@@ -288,6 +290,12 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
         if (resultCode == 0 && operation == VsrOperation.LOGOUT) {
             session.resetIfCurrent(pending.identity.clientLow, pending.identity.clientHigh);
         }
+    }
+
+    private static boolean advancesMetadata(int operation) {
+        return VsrOperation.isMetadata(operation)
+                || operation == VsrOperation.REGISTER
+                || operation == VsrOperation.LOGOUT;
     }
 
     private void applySessionEffects(ByteBuf frame, int operation, int bodyStart, int bodyLength) {
