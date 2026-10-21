@@ -17,6 +17,8 @@
 
 use thiserror::Error;
 
+use crate::bridge::BridgeError;
+
 #[derive(Debug, Error)]
 pub enum KafkaProtocolError {
     #[error("invalid server configuration: {0}")]
@@ -40,6 +42,8 @@ pub enum KafkaProtocolError {
     Malformed(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("Iggy bridge error: {0}")]
+    Bridge(#[from] BridgeError),
 }
 
 pub type Result<T> = std::result::Result<T, KafkaProtocolError>;

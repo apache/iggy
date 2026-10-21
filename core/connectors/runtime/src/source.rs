@@ -18,11 +18,12 @@
 use dashmap::DashMap;
 use dlopen2::wrapper::Container;
 use flume::{Receiver, Sender};
+use iggy::clients::MAX_BATCH_LENGTH;
 use iggy::prelude::{
-    DirectConfig, HeaderKey, HeaderValue, Identifier, IggyClient, IggyDuration, IggyError,
+    Client, DirectConfig, HeaderKey, HeaderValue, Identifier, IggyClient, IggyDuration, IggyError,
     IggyMessage, IggyProducer, StreamClient, TopicClient, TopicCreateOptions,
 };
-use iggy_common::{Durability, TopicRuntimeOptions};
+use iggy_common::{BINARY_OPERATION_TIMEOUT, Durability, TopicRuntimeOptions};
 use iggy_connector_sdk::encoders::avro::{AvroEncoderConfig, AvroStreamEncoder};
 use iggy_connector_sdk::{
     ConnectorState, DecodedMessage, Error as SdkError, ProducedMessages, Schema, StreamEncoder,
@@ -36,6 +37,7 @@ use iggy_connector_sdk::{
 use std::{
     collections::{BTreeMap, HashMap},
     future::Future,
+    num::NonZeroU32,
     str::FromStr,
     sync::{Arc, LazyLock, atomic::Ordering},
     time::Instant,
@@ -60,6 +62,7 @@ use prometheus_client::metrics::counter::Counter;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio::time::timeout;
 
 const MAX_FAILED_TAIL_RETRIES: u32 = 3;
 const SOURCE_TOPIC_MESSAGES_REQUIRED_TO_SAVE: u32 = 1;
@@ -254,7 +257,7 @@ pub async fn init(
         };
 
         match setup_source_producer(&key, &config, iggy_client).await {
-            Ok((producer, encoder, transforms)) => {
+            Ok((producer, batch_length, encoder, transforms)) => {
                 let connector = source_connectors
                     .get_mut(&path)
                     .expect("source connector was inserted above");
@@ -263,7 +266,11 @@ pub async fn init(
                     .iter_mut()
                     .find(|plugin| plugin.id == plugin_id)
                     .expect("source plugin was pushed above");
-                plugin.producer = Some(SourceConnectorProducer { producer, encoder });
+                plugin.producer = Some(SourceConnectorProducer {
+                    encoder,
+                    producer,
+                    batch_length,
+                });
                 plugin.transforms = transforms;
                 instance_guard.disarm();
                 info!(
@@ -437,6 +444,8 @@ impl Drop for SourceInstanceGuard {
     }
 }
 
+/// Returns the last stream's producer, the batch length that splits its
+/// sends into requests, its encoder and the transforms.
 pub(crate) async fn setup_source_producer(
     key: &str,
     config: &SourceConfig,
@@ -444,6 +453,7 @@ pub(crate) async fn setup_source_producer(
 ) -> Result<
     (
         IggyProducer,
+        NonZeroU32,
         Arc<dyn StreamEncoder>,
         Vec<Arc<dyn Transform>>,
     ),
@@ -469,7 +479,10 @@ pub(crate) async fn setup_source_producer(
                 RuntimeError::InvalidConfiguration(format!("Invalid linger time: {error}"))
             })?;
         ensure_durable_source_topic(iggy_client, &stream.stream, &stream.topic).await?;
-        let batch_length = stream.batch_length.unwrap_or(1000);
+        // Passed explicitly for 0 as well, so the producer splits a send
+        // exactly where `send_with_failed_tail_retries` expects.
+        let batch_length =
+            NonZeroU32::new(stream.batch_length.unwrap_or(1000)).unwrap_or(MAX_BATCH_LENGTH);
         let producer = iggy_client
             .producer(&stream.stream, &stream.topic)?
             // The topic was validated above. If it disappears before init,
@@ -478,7 +491,7 @@ pub(crate) async fn setup_source_producer(
             .do_not_create_topic_if_not_exists()
             .direct(
                 DirectConfig::builder()
-                    .batch_length(batch_length)
+                    .batch_length(batch_length.get())
                     .linger_time(linger_time)
                     .build(),
             )
@@ -501,17 +514,17 @@ pub(crate) async fn setup_source_producer(
             other => other.encoder(),
         };
         last_encoder = Some(encoder);
-        last_producer = Some(producer);
+        last_producer = Some((producer, batch_length));
     }
 
-    let producer = last_producer.ok_or_else(|| {
+    let (producer, batch_length) = last_producer.ok_or_else(|| {
         RuntimeError::InvalidConfiguration("No streams configured for source".to_string())
     })?;
     let encoder = last_encoder.ok_or_else(|| {
         RuntimeError::InvalidConfiguration("No encoder configured for source".to_string())
     })?;
 
-    Ok((producer, encoder, transforms))
+    Ok((producer, batch_length, encoder, transforms))
 }
 
 async fn ensure_durable_source_topic(
@@ -572,6 +585,7 @@ pub(crate) async fn source_forwarding_loop(
     verbose: bool,
     benchmark: bool,
     producer: IggyProducer,
+    batch_length: NonZeroU32,
     encoder: Arc<dyn StreamEncoder>,
     transforms: Vec<Arc<dyn Transform>>,
     state_storage: StateStorage,
@@ -692,9 +706,19 @@ pub(crate) async fn source_forwarding_loop(
         let send_result = if state_unavailable {
             Err(IggyError::Error)
         } else if processing_errors == 0 {
-            send_with_failed_tail_retries(processed.messages, plugin_id, |messages| {
-                producer.send(messages)
-            })
+            send_with_failed_tail_retries(
+                processed.messages,
+                batch_length,
+                plugin_id,
+                &context.iggy_clients.producer,
+                |messages| producer.send(messages),
+                |op| {
+                    context
+                        .iggy_clients
+                        .producer
+                        .resolve_operation(op, Instant::now() + BINARY_OPERATION_TIMEOUT)
+                },
+            )
             .await
         } else {
             Err(IggyError::Error)
@@ -889,6 +913,7 @@ pub(crate) fn spawn_source_handler(
     verbose: bool,
     benchmark: bool,
     producer: IggyProducer,
+    batch_length: NonZeroU32,
     encoder: Arc<dyn StreamEncoder>,
     transforms: Vec<Arc<dyn Transform>>,
     state_storage: StateStorage,
@@ -920,6 +945,7 @@ pub(crate) fn spawn_source_handler(
             verbose,
             benchmark,
             producer,
+            batch_length,
             encoder,
             transforms,
             state_storage,
@@ -990,6 +1016,7 @@ pub fn handle(
                 plugin.verbose,
                 plugin.benchmark,
                 producer_wrapper.producer,
+                producer_wrapper.batch_length,
                 producer_wrapper.encoder,
                 plugin.transforms,
                 plugin.state_storage,
@@ -1087,14 +1114,19 @@ fn process_messages(
     }
 }
 
-async fn send_with_failed_tail_retries<F, Fut, T>(
+async fn send_with_failed_tail_retries<S, SendFut, T, R, ResolveFut>(
     mut messages: Vec<IggyMessage>,
+    batch_length: NonZeroU32,
     plugin_id: u32,
-    mut send: F,
+    client: &IggyClient,
+    mut send: S,
+    mut resolve: R,
 ) -> Result<(), IggyError>
 where
-    F: FnMut(Vec<IggyMessage>) -> Fut,
-    Fut: Future<Output = Result<T, IggyError>>,
+    S: FnMut(Vec<IggyMessage>) -> SendFut,
+    SendFut: Future<Output = Result<T, IggyError>>,
+    R: FnMut(u64) -> ResolveFut,
+    ResolveFut: Future<Output = Result<(), IggyError>>,
 {
     let mut retry = 0;
     loop {
@@ -1108,11 +1140,21 @@ where
                 topic_name,
             }) => {
                 warn!(
+                    cause_code = cause.as_code(),
                     "Source connector with ID: {plugin_id} send failed after {} chunks committed; {} messages remain",
                     committed.len(),
                     failed.len()
                 );
-                if retry >= MAX_FAILED_TAIL_RETRIES || failed.is_empty() {
+                // Exhausted SDK reconnect tasks need an explicit connect. A possibly
+                // submitted binary chunk returns OperationUncertain instead.
+                if retry >= MAX_FAILED_TAIL_RETRIES
+                    || failed.is_empty()
+                    || (matches!(*cause, IggyError::NotConnected | IggyError::Disconnected)
+                        && !matches!(
+                            timeout(BINARY_OPERATION_TIMEOUT, client.connect()).await,
+                            Ok(Ok(()))
+                        ))
+                {
                     return Err(IggyError::ProducerSendFailed {
                         cause,
                         failed,
@@ -1134,6 +1176,23 @@ where
                         });
                     }
                 };
+                // The tail starts with the chunk that `op` sent. A resend under
+                // a new request id would append it twice if it committed, so
+                // only a proved commit lets the rest go out.
+                if let IggyError::OperationUncertain(op) = *cause {
+                    resolve(op).await?;
+                    messages.drain(..messages.len().min(batch_length.get() as usize));
+                    if messages.is_empty() {
+                        return Ok(());
+                    }
+                } else if let IggyError::LaneBlocked(op) = *cause {
+                    // A restart loses the old producer's ownership set. Replaying
+                    // its blocker preserves the outcome for its original caller
+                    // and never confirms any messages in this unsent tail.
+                    if matches!(resolve(op).await, Err(IggyError::OperationUncertain(_))) {
+                        return Err(IggyError::LaneBlocked(op));
+                    }
+                }
                 retry += 1;
             }
             Err(error) => return Err(error),
@@ -1219,8 +1278,9 @@ mod tests {
     use iggy_common::IggyTimestamp;
     use iggy_connector_sdk::source::SendCallback;
     use secrecy::SecretString;
+    use std::cell::Cell;
     use std::collections::VecDeque;
-    use std::future::ready;
+    use std::future::{Ready, ready};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
@@ -1327,6 +1387,7 @@ mod tests {
             false,
             false,
             producer,
+            NonZeroU32::MIN,
             Schema::Raw.encoder(),
             vec![],
             state_storage,
@@ -1385,6 +1446,32 @@ mod tests {
             stream_name: "test-stream".to_string(),
             topic_name: "test-topic".to_string(),
         }
+    }
+
+    /// A send whose first chunk of `messages` was operation `op` and may
+    /// have committed.
+    fn uncertain_send(op: u64, messages: Vec<IggyMessage>) -> IggyError {
+        let mut failure = failed_send(messages);
+        if let IggyError::ProducerSendFailed { cause, .. } = &mut failure {
+            **cause = IggyError::OperationUncertain(op);
+        }
+        failure
+    }
+
+    fn blocked_send(op: u64, messages: Vec<IggyMessage>) -> IggyError {
+        let mut failure = failed_send(messages);
+        if let IggyError::ProducerSendFailed { cause, .. } = &mut failure {
+            **cause = IggyError::LaneBlocked(op);
+        }
+        failure
+    }
+
+    fn no_resolve(op: u64) -> Ready<Result<(), IggyError>> {
+        panic!("operation {op} must not be resolved");
+    }
+
+    fn markers(messages: &[IggyMessage]) -> Vec<u8> {
+        messages.iter().map(|message| message.payload[0]).collect()
     }
 
     /// A close that records the ids it was handed and answers `result`.
@@ -1726,6 +1813,7 @@ mod tests {
             false,
             false,
             producer,
+            NonZeroU32::MIN,
             Schema::Raw.encoder(),
             vec![],
             state_storage,
@@ -1819,6 +1907,7 @@ mod tests {
                 false,
                 false,
                 producer,
+                NonZeroU32::MIN,
                 Schema::Raw.encoder(),
                 vec![],
                 state_storage,
@@ -1954,7 +2043,9 @@ mod tests {
 
             let result = send_with_failed_tail_retries(
                 vec![test_message(1), test_message(2), test_message(3)],
+                NonZeroU32::MIN,
                 31,
+                &IggyClient::default(),
                 |messages| {
                     attempts.push(
                         messages
@@ -1964,6 +2055,7 @@ mod tests {
                     );
                     ready(responses.pop_front().expect("send response should exist"))
                 },
+                no_resolve,
             )
             .await;
 
@@ -1983,10 +2075,17 @@ mod tests {
                     .collect::<Vec<_>>(),
             );
 
-            let result = send_with_failed_tail_retries(vec![test_message(1)], 37, |_| {
-                attempts += 1;
-                ready(responses.pop_front().expect("send response should exist"))
-            })
+            let result = send_with_failed_tail_retries(
+                vec![test_message(1)],
+                NonZeroU32::MIN,
+                37,
+                &IggyClient::default(),
+                |_| {
+                    attempts += 1;
+                    ready(responses.pop_front().expect("send response should exist"))
+                },
+                no_resolve,
+            )
             .await;
 
             assert!(matches!(result, Err(IggyError::ProducerSendFailed { .. })));
@@ -2009,16 +2108,225 @@ mod tests {
             }));
             let mut attempts = 0;
 
-            let result =
-                send_with_failed_tail_retries(vec![test_message(1), test_message(2)], 41, |_| {
+            let result = send_with_failed_tail_retries(
+                vec![test_message(1), test_message(2)],
+                NonZeroU32::MIN,
+                41,
+                &IggyClient::default(),
+                |_| {
                     attempts += 1;
                     ready(response.take().expect("send response should exist"))
-                })
-                .await;
+                },
+                no_resolve,
+            )
+            .await;
 
             assert!(matches!(result, Err(IggyError::ProducerSendFailed { .. })));
             assert_eq!(attempts, 1);
             assert_eq!(retained.len(), 1);
+        });
+    }
+
+    #[test]
+    fn given_unsent_tail_when_reconnect_fails_should_preserve_the_original_failure() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            for failure_cause in [IggyError::NotConnected, IggyError::Disconnected] {
+                let client = IggyClient::default();
+                client.shutdown().await.expect("client should shut down");
+                let mut failure = failed_send(vec![test_message(2), test_message(3)]);
+                let IggyError::ProducerSendFailed { cause, .. } = &mut failure else {
+                    panic!("expected producer failure");
+                };
+                **cause = failure_cause.clone();
+                let mut responses = VecDeque::from([Err(failure), Ok(())]);
+                let mut attempts = 0;
+
+                let result = send_with_failed_tail_retries(
+                    vec![test_message(1), test_message(2), test_message(3)],
+                    NonZeroU32::MIN,
+                    43,
+                    &client,
+                    |_| {
+                        attempts += 1;
+                        ready(responses.pop_front().expect("send response should exist"))
+                    },
+                    no_resolve,
+                )
+                .await;
+
+                let Err(IggyError::ProducerSendFailed {
+                    cause,
+                    failed,
+                    committed,
+                    stream_name,
+                    topic_name,
+                }) = result
+                else {
+                    panic!("reconnect failure must preserve the producer failure");
+                };
+                assert_eq!(*cause, failure_cause);
+                assert_eq!(
+                    failed
+                        .iter()
+                        .map(|message| message.payload[0])
+                        .collect::<Vec<_>>(),
+                    [2, 3]
+                );
+                assert!(committed.is_empty());
+                assert_eq!(stream_name, "test-stream");
+                assert_eq!(topic_name, "test-topic");
+                assert_eq!(attempts, 1, "reconnect failure must not resubmit the tail");
+            }
+        });
+    }
+
+    #[test]
+    fn given_previous_source_blocker_when_resolved_should_send_the_entire_unsent_tail() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            for outcome in [
+                Ok(()),
+                Err(IggyError::StreamNameNotFound("previous-stream".to_string())),
+                Err(IggyError::OperationNotRetained(7)),
+            ] {
+                let resolved = Cell::new(false);
+                let mut attempts = Vec::new();
+                let result = send_with_failed_tail_retries(
+                    vec![test_message(1), test_message(2), test_message(3)],
+                    NonZeroU32::MIN,
+                    47,
+                    &IggyClient::default(),
+                    |messages| {
+                        attempts.push(markers(&messages));
+                        ready(if resolved.get() {
+                            Ok(())
+                        } else {
+                            Err(blocked_send(7, messages))
+                        })
+                    },
+                    |op| {
+                        assert_eq!(op, 7);
+                        resolved.set(true);
+                        ready(outcome.clone())
+                    },
+                )
+                .await;
+
+                assert_eq!(result, Ok(()), "earlier operation outcome: {outcome:?}");
+                assert_eq!(attempts, [vec![1, 2, 3], vec![1, 2, 3]]);
+            }
+        });
+    }
+
+    #[test]
+    fn given_previous_source_blocker_when_still_uncertain_should_not_send_the_unsent_tail() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            let mut attempts = Vec::new();
+            let mut resolved = Vec::new();
+            let result = send_with_failed_tail_retries(
+                vec![test_message(1), test_message(2), test_message(3)],
+                NonZeroU32::MIN,
+                47,
+                &IggyClient::default(),
+                |messages| {
+                    attempts.push(markers(&messages));
+                    ready(Err::<(), _>(blocked_send(7, messages)))
+                },
+                |op| {
+                    resolved.push(op);
+                    ready(Err(IggyError::OperationUncertain(op)))
+                },
+            )
+            .await;
+
+            assert_eq!(result, Err(IggyError::LaneBlocked(7)));
+            assert_eq!(attempts, [vec![1, 2, 3]]);
+            assert_eq!(resolved, [7]);
+        });
+    }
+
+    #[test]
+    fn given_uncertain_chunk_when_resolve_proves_it_should_resend_only_the_rest() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            let failed = vec![test_message(1), test_message(2), test_message(3)];
+            let mut responses = VecDeque::from([Err(uncertain_send(7, failed)), Ok(())]);
+            let mut attempts = Vec::new();
+            let mut resolved = Vec::new();
+
+            let result = send_with_failed_tail_retries(
+                vec![test_message(1), test_message(2), test_message(3)],
+                NonZeroU32::MIN,
+                47,
+                &IggyClient::default(),
+                |messages| {
+                    attempts.push(markers(&messages));
+                    ready(responses.pop_front().expect("send response should exist"))
+                },
+                |op| {
+                    resolved.push(op);
+                    ready(Ok(()))
+                },
+            )
+            .await;
+
+            assert_eq!(result, Ok(()));
+            assert_eq!(attempts, [vec![1, 2, 3], vec![2, 3]]);
+            assert_eq!(resolved, [7]);
+        });
+    }
+
+    #[test]
+    fn given_uncertain_chunk_when_resolve_fails_should_return_that_error_without_a_resend() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            let failed = vec![test_message(1), test_message(2), test_message(3)];
+            let mut responses = VecDeque::from([Err(uncertain_send(7, failed)), Ok(())]);
+            let mut attempts = Vec::new();
+
+            let result = send_with_failed_tail_retries(
+                vec![test_message(1), test_message(2), test_message(3)],
+                NonZeroU32::MIN,
+                53,
+                &IggyClient::default(),
+                |messages| {
+                    attempts.push(markers(&messages));
+                    ready(responses.pop_front().expect("send response should exist"))
+                },
+                |op| ready(Err(IggyError::OperationNotRetained(op))),
+            )
+            .await;
+
+            assert_eq!(result, Err(IggyError::OperationNotRetained(7)));
+            assert_eq!(attempts, [vec![1, 2, 3]]);
+        });
+    }
+
+    #[test]
+    fn given_uncertain_last_chunk_when_resolve_proves_it_should_not_send_again() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            let failed = vec![test_message(1), test_message(2), test_message(3)];
+            let mut responses = VecDeque::from([Err(uncertain_send(7, failed)), Ok(())]);
+            let mut attempts = Vec::new();
+
+            let result = send_with_failed_tail_retries(
+                vec![test_message(1), test_message(2), test_message(3)],
+                NonZeroU32::new(1000).expect("batch length is not zero"),
+                59,
+                &IggyClient::default(),
+                |messages| {
+                    attempts.push(markers(&messages));
+                    ready(responses.pop_front().expect("send response should exist"))
+                },
+                |_| ready(Ok(())),
+            )
+            .await;
+
+            assert_eq!(result, Ok(()));
+            assert_eq!(attempts, [vec![1, 2, 3]]);
         });
     }
 }

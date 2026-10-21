@@ -18,50 +18,61 @@
 using System.Buffers;
 using System.Buffers.Binary;
 using System.Net.Sockets;
+using System.Threading.Channels;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Exceptions;
+using Apache.Iggy.Utils;
 using Microsoft.Extensions.Logging;
 
 namespace Apache.Iggy.Vsr;
 
 /// <summary>
-///     One consensus-framed socket: encodes request frames, replays them while the server answers
-///     transiently, and reads and decodes reply frames. The caller owns the sending lock that serialises
-///     attempts, the leader redirection above this layer, and the reconnect that replaces a dropped
-///     connection.
+///     A bounded multiplexed connection. The writer owns frame boundaries; the reader correlates replies
+///     by request id. Canceling one exchange never interrupts either task or another request.
 /// </summary>
 internal sealed class VsrConnection : IDisposable
 {
-    /// <summary>Backoff between replays of a transiently refused request.</summary>
+    internal const int WRITE_QUEUE_CAPACITY = 32;
+    internal const int MAX_PENDING_REQUESTS = 256;
     private const int TransientRetryIntervalMs = 50;
 
-    private readonly ILogger _logger;
-    private readonly long _maxResponseFrameSize;
+    private sealed class PendingRequest(byte[] frame, int code, long deadline, bool clearSensitiveReply, SharedRequestFrame? owner)
+    {
+        internal readonly byte[] Frame = frame;
+        internal readonly int Code = code;
+        internal readonly long Deadline = deadline;
+        internal readonly bool ClearSensitiveReply = clearSensitiveReply;
+        internal readonly SharedRequestFrame? Owner = owner;
+        internal readonly TaskCompletionSource<VsrAttempt> Completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal readonly ulong RequestId = BinaryPrimitives.ReadUInt64LittleEndian(frame.AsSpan(VsrHeader.REQUEST_ID_OFFSET));
+        internal readonly UInt128 ClientId = BinaryPrimitives.ReadUInt128LittleEndian(frame.AsSpan(VsrHeader.REQUEST_CLIENT_OFFSET));
+        internal readonly UInt128 RequestChecksum = BinaryPrimitives.ReadUInt128LittleEndian(frame.AsSpan(VsrHeader.REQUEST_CHECKSUM_OFFSET));
+        internal readonly ulong Incarnation = BinaryPrimitives.ReadUInt64LittleEndian(frame.AsSpan(VsrHeader.REQUEST_INCARNATION_OFFSET));
+        internal bool Started;
+    }
 
-    /// <summary>
-    ///     Tears this connection down at the transport level when a frame-level
-    ///     failure makes the socket unusable. Runs under the sending lock the caller holds, and it is the
-    ///     transport's job to ignore the call when a reconnect already replaced this connection.
-    /// </summary>
+    private readonly object _gate = new();
+    private readonly Dictionary<ulong, PendingRequest> _pending = [];
+    private readonly SemaphoreSlim _pendingCapacity = new(MAX_PENDING_REQUESTS, MAX_PENDING_REQUESTS);
+    private readonly Channel<PendingRequest> _writes = Channel.CreateBounded<PendingRequest>(
+        new BoundedChannelOptions(WRITE_QUEUE_CAPACITY) { SingleReader = true, FullMode = BoundedChannelFullMode.Wait });
+    private readonly CancellationTokenSource _lifetime = new();
+    private readonly Stream _stream;
+    private readonly ConsensusSession _session;
+    private readonly long _maxResponseFrameSize;
+    private readonly int _requestTimeoutMs;
     private readonly Action<VsrConnection> _onDropped;
     private readonly Action<ulong>? _observeMetadataCommit;
+    private readonly ILogger _logger;
+    private readonly TaskCompletionSource _closed = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private bool _started;
+    private long _replySilenceDeadline;
+    private bool _waitingForActiveDeadlines;
+    private Exception? _failure;
 
-    /// <summary>
-    ///     Bodies up to this size go out as one write: header and body coalesced in
-    ///     <see cref="_requestFrameBuffer" />. With Nagle disabled every write is its own segment (and its own
-    ///     TLS record under a wrapping stream), so the second write a small request would pay is measurable
-    ///     even against the round trip the lockstep protocol already costs.
-    /// </summary>
-    private const int CoalescedBodyLimit = 4096 - VsrHeader.HEADER_SIZE;
-
-    private readonly byte[] _replyHeaderBuffer = new byte[VsrHeader.HEADER_SIZE];
-    private readonly byte[] _requestFrameBuffer = new byte[VsrHeader.HEADER_SIZE + CoalescedBodyLimit];
-    private readonly int _requestTimeoutMs;
-
-    /// <summary>The session identity requests on this connection encode from.</summary>
-    private readonly ConsensusSession _session;
-
-    private readonly Stream _stream;
+    internal Task Closed => _closed.Task;
+    internal bool IsReady => Failure is null && !_closed.Task.IsCompleted;
+    internal Exception? Failure => Volatile.Read(ref _failure);
 
     internal VsrConnection(Stream stream, ConsensusSession session, long maxResponseFrameSize, int requestTimeoutMs,
         Action<VsrConnection> onDropped, ILogger logger, Action<ulong>? observeMetadataCommit = null)
@@ -75,346 +86,449 @@ internal sealed class VsrConnection : IDisposable
         _observeMetadataCommit = observeMetadataCommit;
     }
 
-    public void Dispose()
-    {
-        _stream.Dispose();
-    }
+    public void Dispose() => Fail(new ObjectDisposedException(nameof(VsrConnection)), notify: false);
 
-    internal static bool IsConnectionException(Exception ex)
-    {
-        return ex is IggyZeroBytesException or
-            NotConnectedException or
-            SocketException or
-            IOException or
-            ObjectDisposedException;
-    }
+    internal static bool IsConnectionException(Exception error) => error is IggyZeroBytesException
+        or NotConnectedException or SocketException or IOException or ObjectDisposedException
+        || IsDetachedSession(error);
 
-    /// <summary>
-    ///     One attempt on this connection: encode the header, write the frame, and replay it - same session,
-    ///     same request id - while the server answers transiently. The caller must hold the sending lock,
-    ///     which also guards the reuse of the per-connection frame buffer.
-    /// </summary>
+    internal static bool IsDetachedSession(Exception? error) => error is VsrSessionEvictedException
+    {
+        Reason: EvictionReason.NoSession or EvictionReason.StaleClient
+    };
+
+    internal Task<VsrAttempt> SendFrameAsync(ClientOperation operation, long deadline, bool clearSensitiveReply,
+        CancellationToken token) =>
+        ExchangeAsync(operation.Code, operation.Body, operation.Identity, operation.Context, deadline, clearSensitiveReply, token,
+            operation.Frame);
+
     internal async ValueTask<VsrAttempt> SendAttemptAsync(int code, ReadOnlyMemory<byte> body,
         long transientDeadline, long readDeadline, bool clearSensitiveReply, CancellationToken token,
         bool retryTransient = true, PartitionContext context = default, SessionFrame? retainedFrame = null)
     {
-        var encoded = false;
-        var requestStarted = false;
-        var uncertain = false;
-
+        SessionFrame frame;
         try
         {
-            VsrHeader.EncodeRequestHeader(_requestFrameBuffer, _session, code, body.Span, context, retainedFrame);
+            frame = retainedFrame ?? _session.Resolve(VsrOperations.ForCode(code));
+        }
+        catch (Exception error)
+        {
+            return VsrAttempt.Failed(false, error, false, this);
+        }
 
-            var frameSize = VsrHeader.HEADER_SIZE + body.Length;
-            var coalesced = body.Length <= CoalescedBodyLimit;
-            if (coalesced)
+        var uncertain = false;
+        while (true)
+        {
+            var attempt = await ExchangeAsync(code, body, frame, context, readDeadline, clearSensitiveReply, token);
+            if (attempt.Error is not IggyInvalidStatusCodeException error)
             {
-                body.Span.CopyTo(_requestFrameBuffer.AsSpan(VsrHeader.HEADER_SIZE));
+                return attempt;
             }
+            uncertain |= error is { FromServer: true, StatusCode: VsrError.TRANSIENT_NOT_COMMITTED };
+            var masked = uncertain && error.FromServer && !error.Committed
+                && error.StatusCode != VsrError.TRANSIENT_NOT_COMMITTED;
+            var verdict = masked
+                ? VsrError.FromServer(VsrError.TRANSIENT_NOT_COMMITTED,
+                    "A later refusal does not resolve the original request outcome.")
+                : error;
+            verdict.CommandCode = code;
+            var deadline = verdict.StatusCode == VsrError.TRANSIENT_NOT_COMMITTED
+                ? readDeadline : transientDeadline;
+            if (!retryTransient || !verdict.FromServer || verdict.Committed
+                || (masked && error.StatusCode is VsrError.REQUEST_TOO_OLD or VsrError.INVALID_COMMAND)
+                || verdict.StatusCode is not (VsrError.TRANSIENT_NOT_COMMITTED or VsrError.TRANSIENT_NOT_ACCEPTED)
+                || Environment.TickCount64 >= deadline)
+            {
+                return attempt with { Error = verdict };
+            }
+            try
+            {
+                await Task.Delay((int)Math.Clamp(deadline - Environment.TickCount64, 0, TransientRetryIntervalMs), token);
+                if (Environment.TickCount64 + TransientRetryIntervalMs >= readDeadline)
+                {
+                    return attempt with { Error = verdict };
+                }
+            }
+            catch (OperationCanceledException cancellation)
+            {
+                return VsrAttempt.Failed(true, cancellation, attempt.RequestStarted, this);
+            }
+        }
+    }
 
-            encoded = true;
+    private async Task<VsrAttempt> ExchangeAsync(int code, ReadOnlyMemory<byte> body, SessionFrame frame,
+        PartitionContext context, long deadline, bool clearSensitiveReply, CancellationToken token,
+        SharedRequestFrame? owner = null)
+    {
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(token, _lifetime.Token);
+        cancellation.CancelAfter((int)Math.Clamp(deadline - Environment.TickCount64, 0, int.MaxValue));
+        var admitted = false;
+        PendingRequest? request = null;
+        try
+        {
+            await _pendingCapacity.WaitAsync(cancellation.Token);
+            admitted = true;
+            var encoded = owner?.Bytes ?? new byte[checked(VsrHeader.HEADER_SIZE + body.Length)];
+            if (owner is null)
+            {
+                VsrHeader.EncodeRequestHeader(encoded, _session, code, body.Span, context, frame);
+                body.CopyTo(encoded.AsMemory(VsrHeader.HEADER_SIZE));
+            }
+            request = new PendingRequest(encoded, code, deadline, clearSensitiveReply, owner);
+            lock (_gate)
+            {
+                if (_failure is { } failure)
+                {
+                    return VsrAttempt.Failed(true, failure, false, this);
+                }
+                if (!_pending.TryAdd(frame.RequestId, request))
+                {
+                    return VsrAttempt.Failed(true, VsrError.Exception(VsrError.INVALID_COMMAND,
+                        "The request id already has an active exchange."), false, this);
+                }
+                if (!_started)
+                {
+                    _started = true;
+                    _ = Task.Run(ReadRepliesAsync);
+                    _ = Task.Run(WriteFramesAsync);
+                }
+            }
+            using var registration = cancellation.Token.Register(() => Cancel(request, token));
+            try
+            {
+                while (await _writes.Writer.WaitToWriteAsync(cancellation.Token))
+                {
+                    lock (_gate)
+                    {
+                        if (request.Completion.Task.IsCompleted)
+                        {
+                            break;
+                        }
+                        owner?.Acquire();
+                        request.Started = true;
+                        if (_writes.Writer.TryWrite(request))
+                        {
+                            if (_replySilenceDeadline == 0)
+                            {
+                                _replySilenceDeadline = Environment.TickCount64 + _requestTimeoutMs;
+                            }
+                            break;
+                        }
+                        owner?.Release();
+                        request.Started = false;
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                Cancel(request, token);
+            }
+            return await request.Completion.Task;
+        }
+        catch (Exception error)
+        {
+            if (request is not null)
+            {
+                lock (_gate)
+                {
+                    if (_pending.TryGetValue(request.RequestId, out var active) && ReferenceEquals(active, request))
+                    {
+                        _pending.Remove(request.RequestId);
+                    }
+                }
+            }
+            if (error is OperationCanceledException && !token.IsCancellationRequested)
+            {
+                error = _failure ?? new IOException($"Timed out after {_requestTimeoutMs} ms waiting for a consensus reply.");
+            }
+            return VsrAttempt.Failed(request is not null, error, request?.Started ?? false, this);
+        }
+        finally
+        {
+            if (admitted)
+            {
+                _pendingCapacity.Release();
+            }
+        }
+    }
 
-            while (true)
+    private void Cancel(PendingRequest request, CancellationToken token)
+    {
+        lock (_gate)
+        {
+            if (_pending.TryGetValue(request.RequestId, out var active) && ReferenceEquals(active, request))
+            {
+                _pending.Remove(request.RequestId);
+            }
+            var error = token.IsCancellationRequested ? new OperationCanceledException(token)
+                : _failure ?? new IOException($"Timed out after {_requestTimeoutMs} ms waiting for a consensus reply.");
+            request.Completion.TrySetResult(VsrAttempt.Failed(true, error, request.Started, this));
+        }
+    }
+
+    private async Task WriteFramesAsync()
+    {
+        try
+        {
+            await foreach (var request in _writes.Reader.ReadAllAsync(_lifetime.Token))
             {
                 try
                 {
-                    // Everything that fails without reaching the socket has to fail before this point: past it a
-                    // failure is reported as an outcome the server alone knows, which for a replicated write
-                    // tells the caller its request may have committed twice.
-                    token.ThrowIfCancellationRequested();
-                    requestStarted = true;
-
-                    if (coalesced)
+                    if (!request.Completion.Task.IsCompleted)
                     {
-                        await _stream.WriteAsync(_requestFrameBuffer.AsMemory(0, frameSize), token);
-                    }
-                    else
-                    {
-                        await _stream.WriteAsync(_requestFrameBuffer.AsMemory(0, VsrHeader.HEADER_SIZE), token);
-                        await _stream.WriteAsync(body, token);
-                    }
-
-                    await _stream.FlushAsync(token);
-
-                    IMemoryOwner<byte> response = await ReadReplyAsync(readDeadline, clearSensitiveReply, token);
-
-                    return VsrAttempt.Ok(response, this);
-                }
-                catch (IggyInvalidStatusCodeException e)
-                {
-                    uncertain |= e is { FromServer: true, StatusCode: VsrError.TRANSIENT_NOT_COMMITTED };
-                    var masked = uncertain && e is
-                    {
-                        FromServer: true,
-                        StatusCode: not VsrError.TRANSIENT_NOT_COMMITTED
-                    } && !SettlesOutcome(e);
-                    var verdict = masked
-                        ? VsrError.FromServer(VsrError.TRANSIENT_NOT_COMMITTED,
-                            $"A later refusal with status {e.StatusCode} does not resolve the original request "
-                            + "outcome.")
-                        : e;
-                    verdict.CommandCode = code;
-                    if (!retryTransient || (masked && IsFinalRefusal(e))
-                        || !IsReplayableTransient(verdict, transientDeadline, readDeadline))
-                    {
-                        return VsrAttempt.Failed(encoded, verdict, requestStarted, this);
-                    }
-                    var governingDeadline = verdict.StatusCode == VsrError.TRANSIENT_NOT_COMMITTED
-                        ? readDeadline
-                        : transientDeadline;
-                    var remaining = governingDeadline - Environment.TickCount64;
-                    await Task.Delay((int)Math.Clamp(remaining, 0, TransientRetryIntervalMs), token);
-                    if (Environment.TickCount64 + TransientRetryIntervalMs >= readDeadline)
-                    {
-                        // A replay written now has too little time left for its reply, and the read timeout would
-                        // turn a refusal the caller can act on into an unknown outcome.
-                        return VsrAttempt.Failed(encoded, verdict, requestStarted, this);
+                        using var writeCancellation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+                        writeCancellation.CancelAfter(_requestTimeoutMs);
+                        await _stream.WriteAsync(request.Frame, writeCancellation.Token);
+                        await _stream.FlushAsync(writeCancellation.Token);
                     }
                 }
-                catch (Exception e) when (IsConnectionException(e))
+                finally
                 {
-                    _onDropped(this);
-
-                    return VsrAttempt.Failed(encoded, e, requestStarted, this);
-                }
-                catch (OperationCanceledException e)
-                {
-                    _onDropped(this);
-
-                    return VsrAttempt.Failed(encoded, e, requestStarted, this);
-                }
-                catch (Exception e)
-                {
-                    return VsrAttempt.Failed(encoded, e, requestStarted, this);
+                    request.Owner?.Release();
                 }
             }
         }
-        catch (OperationCanceledException e)
+        catch (Exception error)
         {
-            if (encoded)
+            Fail(error);
+        }
+        finally
+        {
+            while (_writes.Reader.TryRead(out var queued))
             {
-                _onDropped(this);
+                queued.Owner?.Release();
             }
-
-            return VsrAttempt.Failed(encoded, e, requestStarted, this);
-        }
-        catch (Exception e)
-        {
-            return VsrAttempt.Failed(encoded, e, requestStarted, this);
         }
     }
 
-    private async Task<IMemoryOwner<byte>> ReadReplyAsync(long readDeadline, bool clearSensitiveReply,
-        CancellationToken token)
+    private async Task ReadRepliesAsync()
     {
-        var remaining = readDeadline - Environment.TickCount64;
-        if (remaining <= 0)
-        {
-            throw new IOException($"Timed out after {_requestTimeoutMs} ms waiting for a consensus reply.");
-        }
-
-        // One timer for the whole reply: the deadline covers the frame, not each partial read, so a per-read
-        // source would both re-arm the budget and allocate a timer per socket read.
-        using var readCancellation = CancellationTokenSource.CreateLinkedTokenSource(token);
-        readCancellation.CancelAfter((int)Math.Min(remaining, _requestTimeoutMs));
-
-        await ReadExactAsync(_replyHeaderBuffer, readCancellation.Token, token);
-
-        var command = VsrHeader.PeekCommand(_replyHeaderBuffer);
-        if (command == Command.Eviction)
-        {
-            var eviction = VsrHeader.ReadEviction(_replyHeaderBuffer);
-            _logger.LogWarning("Consensus session evicted by the server: {Reason}", eviction.Reason);
-            _onDropped(this);
-
-            throw new VsrSessionEvictedException(VsrReplyDecoder.ToException(eviction));
-        }
-
-        if (command != Command.Reply)
-        {
-            // Neither a reply nor an eviction: this frame was never an answer to the outstanding request, so
-            // whatever the peer does send for it would be read as the next request's reply and handed to the
-            // wrong caller. The size field of a frame the client cannot model is no basis for resynchronising.
-            _onDropped(this);
-
-            throw VsrError.Exception(VsrError.INVALID_COMMAND,
-                $"Unexpected consensus frame {command} on a client connection.");
-        }
-
-        int bodySize;
+        var header = new byte[VsrHeader.HEADER_SIZE];
         try
         {
-            bodySize = VsrReplyDecoder.ReadBodySize(_replyHeaderBuffer);
-            if (VsrHeader.HEADER_SIZE + (long)bodySize > _maxResponseFrameSize)
+            while (true)
             {
-                throw VsrError.Exception(VsrError.INVALID_COMMAND,
-                    $"Reply frame of {VsrHeader.HEADER_SIZE + bodySize} bytes exceeds the configured maximum of " +
-                    $"{_maxResponseFrameSize} bytes.");
+                await ReadFirstReplyByteAsync(header);
+                using var frameCancellation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+                frameCancellation.CancelAfter(_requestTimeoutMs);
+                await _stream.ReadExactlyAsync(header.AsMemory(1), frameCancellation.Token);
+                if (VsrHeader.PeekCommand(header) == Command.Eviction)
+                {
+                    var eviction = VsrHeader.ReadEviction(header);
+                    _logger.LogWarning("Consensus link evicted by the server: {Reason}", eviction.Reason);
+                    var verdict = VsrReplyDecoder.ToException(eviction);
+                    throw new VsrSessionEvictedException(eviction.Reason, verdict);
+                }
+                if (VsrHeader.PeekCommand(header) != Command.Reply)
+                {
+                    throw VsrError.Exception(VsrError.INVALID_COMMAND, "Unexpected consensus frame on a client connection.");
+                }
+                var bodySize = VsrReplyDecoder.ReadBodySize(header);
+                if (VsrHeader.HEADER_SIZE + (long)bodySize > _maxResponseFrameSize)
+                {
+                    throw VsrError.Exception(VsrError.INVALID_COMMAND, "Reply frame exceeds the configured maximum.");
+                }
+                var requestId = BinaryPrimitives.ReadUInt64LittleEndian(header.AsSpan(VsrHeader.REPLY_REQUEST_ID_OFFSET));
+                var buffer = ArrayPool<byte>.Shared.Rent(Math.Max(bodySize, 1));
+                try
+                {
+                    await _stream.ReadExactlyAsync(buffer.AsMemory(0, bodySize), frameCancellation.Token);
+                    PendingRequest? request;
+                    lock (_gate)
+                    {
+                        _pending.TryGetValue(requestId, out request);
+                        _replySilenceDeadline = _pending.Count > (request is null ? 0 : 1)
+                            ? Environment.TickCount64 + _requestTimeoutMs : 0;
+                        _waitingForActiveDeadlines = false;
+                    }
+                    if (request is null)
+                    {
+                        continue;
+                    }
+                    var operation = VsrHeader.ReadReplyOperation(header);
+                    var expected = VsrOperations.ForCode(request.Code);
+                    var alias = (expected, operation) is
+                        (VsrOperation.CreateTopic, VsrOperation.CreateTopicWithAssignments)
+                        or (VsrOperation.CreatePartitions, VsrOperation.CreatePartitionsWithAssignments)
+                        or (VsrOperation.DeleteSegments, VsrOperation.TruncatePartition);
+                    if (operation != expected && !alias)
+                    {
+                        throw VsrError.Exception(VsrError.INVALID_COMMAND, "Reply operation does not match its request.");
+                    }
+                    VsrAttempt result;
+                    IggyInvalidStatusCodeException? detached = null;
+                    try
+                    {
+                        if (VsrHeader.ReadCommitted(header) && !MatchesCommittedRequest(header, request))
+                        {
+                            throw VsrError.Exception(VsrError.INVALID_COMMAND, "Committed reply does not match the original request.");
+                        }
+                        var payload = VsrReplyDecoder.Decode(header, buffer.AsMemory(0, bodySize));
+                        var committed = VsrHeader.ReadCommitted(header);
+                        if (committed && (operation.IsMetadata() || operation == VsrOperation.DeleteSegments))
+                        {
+                            _observeMetadataCommit?.Invoke(BinaryPrimitives.ReadUInt64LittleEndian(
+                                header.AsSpan(VsrHeader.REPLY_COMMIT_OFFSET)));
+                        }
+                        IMemoryOwner<byte> response = payload.IsEmpty ? EmptyMemoryOwner.Instance
+                            : new PooledMemoryOwner(buffer, bodySize - payload.Length, payload.Length, request.ClearSensitiveReply);
+                        if (!payload.IsEmpty)
+                        {
+                            buffer = null;
+                        }
+                        result = VsrAttempt.Ok(response, this, committed);
+                    }
+                    catch (IggyInvalidStatusCodeException error)
+                    {
+                        error.CommandCode = request.Code;
+                        if (error.Committed && (operation.IsMetadata() || operation == VsrOperation.DeleteSegments))
+                        {
+                            _observeMetadataCommit?.Invoke(BinaryPrimitives.ReadUInt64LittleEndian(
+                                header.AsSpan(VsrHeader.REPLY_COMMIT_OFFSET)));
+                        }
+                        if (error.FromServer && !error.Committed && request.Code != CommandCodes.BIND_SESSION_CODE
+                            && BinaryPrimitives.ReadUInt64LittleEndian(request.Frame.AsSpan(VsrHeader.REQUEST_SESSION_OFFSET)) != 0
+                            && error.StatusCode == VsrError.UNAUTHENTICATED)
+                        {
+                            detached = error;
+                            var refusal = VsrError.FromServer(VsrError.TRANSIENT_NOT_ACCEPTED,
+                                "The server detached this connection from its session.");
+                            refusal.CommandCode = request.Code;
+                            result = VsrAttempt.Failed(true, refusal, true, this);
+                        }
+                        else
+                        {
+                            result = VsrAttempt.Failed(true, error, true, this);
+                        }
+                    }
+                    lock (_gate)
+                    {
+                        if (_pending.TryGetValue(requestId, out var active) && ReferenceEquals(active, request))
+                        {
+                            _pending.Remove(requestId);
+                        }
+                        if (!request.Completion.TrySetResult(result))
+                        {
+                            result.Response?.Dispose();
+                        }
+                    }
+                    detached ??= result.Error is IggyInvalidStatusCodeException
+                    { FromServer: true, Committed: false, StatusCode: VsrError.STALE_CLIENT } stale ? stale : null;
+                    if (detached is not null)
+                    {
+                        throw new IOException("The server detached this link from the session.", detached);
+                    }
+                }
+                finally
+                {
+                    if (buffer is not null)
+                    {
+                        ArrayPool<byte>.Shared.Return(buffer, clearArray: true);
+                    }
+                }
             }
         }
-        catch
+        catch (Exception error)
         {
-            // An announced size the client refuses to read - undersized, oversized - leaves the body on the
-            // wire, so the stream no longer sits on a frame boundary and the next reply would decode body bytes
-            // as a header.
-            _onDropped(this);
-
-            throw;
-        }
-
-        if (bodySize == 0)
-        {
-            ObserveMetadataCommit();
-            VsrReplyDecoder.Decode(_replyHeaderBuffer, ReadOnlyMemory<byte>.Empty);
-
-            return EmptyMemoryOwner.Instance;
-        }
-
-        var buffer = ArrayPool<byte>.Shared.Rent(bodySize);
-        try
-        {
-            await ReadExactAsync(buffer.AsMemory(0, bodySize), readCancellation.Token, token);
-            ObserveMetadataCommit();
-            ReadOnlyMemory<byte> decoded = VsrReplyDecoder.Decode(_replyHeaderBuffer, buffer.AsMemory(0, bodySize));
-            if (decoded.IsEmpty)
-            {
-                ArrayPool<byte>.Shared.Return(buffer, clearSensitiveReply);
-
-                return EmptyMemoryOwner.Instance;
-            }
-
-            // The decoded payload is always a suffix of the body - the funnel only strips the leading
-            // committed result section.
-            return new PooledMemoryOwner(buffer, bodySize - decoded.Length, decoded.Length, clearSensitiveReply);
-        }
-        catch
-        {
-            ArrayPool<byte>.Shared.Return(buffer, clearSensitiveReply);
-            throw;
+            Fail(error);
         }
     }
 
-    private void ObserveMetadataCommit()
+    private async Task ReadFirstReplyByteAsync(byte[] header)
     {
-        if (_observeMetadataCommit is null)
+        var read = _stream.ReadExactlyAsync(header.AsMemory(0, 1), _lifetime.Token).AsTask();
+        while (true)
         {
-            return;
-        }
-
-        var operation = VsrHeader.ReadReplyOperation(_replyHeaderBuffer);
-        if (operation is not (VsrOperation.NonReplicated or VsrOperation.SendMessages
-            or VsrOperation.StoreConsumerOffset or VsrOperation.DeleteConsumerOffset))
-        {
-            _observeMetadataCommit(BinaryPrimitives.ReadUInt64LittleEndian(
-                _replyHeaderBuffer.AsSpan(VsrHeader.REPLY_COMMIT_OFFSET)));
-        }
-    }
-
-    private async ValueTask ReadExactAsync(Memory<byte> buffer, CancellationToken readToken, CancellationToken token)
-    {
-        var totalRead = 0;
-        while (totalRead < buffer.Length)
-        {
-            int readBytes;
             try
             {
-                readBytes = await _stream.ReadAsync(buffer[totalRead..], readToken);
+                await read.WaitAsync(TimeSpan.FromMilliseconds(_requestTimeoutMs), _lifetime.Token);
+                return;
             }
-            catch (OperationCanceledException) when (!token.IsCancellationRequested)
+            catch (TimeoutException)
             {
-                throw new IOException($"Timed out after {_requestTimeoutMs} ms waiting for a consensus reply.");
+                lock (_gate)
+                {
+                    var now = Environment.TickCount64;
+                    if (_replySilenceDeadline == 0 || _replySilenceDeadline > now)
+                    {
+                        continue;
+                    }
+                    if (!_waitingForActiveDeadlines)
+                    {
+                        // Later arrivals must not keep a silent connection alive indefinitely.
+                        _waitingForActiveDeadlines = true;
+                        foreach (var request in _pending.Values)
+                        {
+                            if (request.Started)
+                            {
+                                _replySilenceDeadline = Math.Max(_replySilenceDeadline, request.Deadline);
+                            }
+                        }
+                        if (_replySilenceDeadline > now)
+                        {
+                            continue;
+                        }
+                    }
+                }
+                throw new IOException("The connection stopped replying before its requests completed.");
             }
-
-            if (readBytes == 0)
-            {
-                throw new IggyZeroBytesException();
-            }
-
-            totalRead += readBytes;
         }
     }
 
-    private static bool IsReplayableTransient(IggyInvalidStatusCodeException error, long transientDeadline,
-        long readDeadline)
+    private static bool MatchesCommittedRequest(ReadOnlySpan<byte> header, PendingRequest request)
     {
-        if (!error.FromServer)
+        var op = BinaryPrimitives.ReadUInt64LittleEndian(header[VsrHeader.REPLY_OP_OFFSET..]);
+        return BinaryPrimitives.ReadUInt128LittleEndian(header[VsrHeader.REPLY_CLIENT_OFFSET..]) == request.ClientId
+            && BinaryPrimitives.ReadUInt128LittleEndian(header[VsrHeader.REPLY_CHECKSUM_OFFSET..]) == request.RequestChecksum
+            && BinaryPrimitives.ReadUInt64LittleEndian(header[VsrHeader.REPLY_INCARNATION_OFFSET..]) == request.Incarnation
+            && op != 0 && op == BinaryPrimitives.ReadUInt64LittleEndian(header[VsrHeader.REPLY_COMMIT_OFFSET..]);
+    }
+
+    private void Fail(Exception error, bool notify = true)
+    {
+        if (error is OperationCanceledException && !_lifetime.IsCancellationRequested)
         {
-            return false;
+            error = new IOException("Consensus frame transfer timed out.", error);
         }
-
-        return error.StatusCode switch
+        lock (_gate)
         {
-            VsrError.TRANSIENT_NOT_COMMITTED => Environment.TickCount64 < readDeadline,
-            VsrError.TRANSIENT_NOT_ACCEPTED => Environment.TickCount64 < transientDeadline,
-            _ => false
-        };
-    }
-
-    /// <summary>
-    ///     Whether a refusal of a replay settles the outcome of the original request. The primary answers a
-    ///     same-id replay from its session table, so a result-section rejection is the cached reply of the
-    ///     original, the commit of a request that never entered the pipeline, or a refusal of a request neither
-    ///     the session table nor the pipeline holds. The codes below settle nothing: most come from the checks
-    ///     that run before that lookup, and REQUEST_TOO_OLD means the original applied and its reply is gone.
-    ///     PERSONAL_ACCESS_TOKEN_ALREADY_EXISTS settles even as the refusal to replay a token the original
-    ///     minted: either way the name is taken and the caller holds no token. Apply can commit INVALID_COMMAND
-    ///     too, but nothing tells it apart from the preflight one. The server never puts HISTORY_UNAVAILABLE in a
-    ///     result section, and it stays listed because settling on it would be wrong if it ever did. The caller
-    ///     filters TRANSIENT_NOT_COMMITTED out before asking.
-    /// </summary>
-    private static bool SettlesOutcome(IggyInvalidStatusCodeException error)
-    {
-        return error is
+            if (_failure is not null)
+            {
+                return;
+            }
+            _failure = error;
+            _writes.Writer.TryComplete(error);
+            foreach (var request in _pending.Values)
+            {
+                request.Completion.TrySetResult(VsrAttempt.Failed(true, error, request.Started, this));
+            }
+            _pending.Clear();
+        }
+        _lifetime.Cancel();
+        _stream.Dispose();
+        _closed.TrySetResult();
+        if (notify)
         {
-            FromResultSection: true,
-            StatusCode: not (VsrError.TRANSIENT_NOT_ACCEPTED or VsrError.NOT_PRIMARY or VsrError.REQUEST_TOO_OLD
-                or VsrError.INVALID_COMMAND or VsrError.UNAUTHENTICATED or VsrError.HISTORY_UNAVAILABLE)
-        };
-    }
-
-    /// <summary>
-    ///     Whether an unsettled refusal of a replay is final: the primary's preflight answers every replay of the
-    ///     same request id with it again, so replaying until the deadline only ends in the same unknown outcome.
-    ///     The metadata plane carries it in the result section and the partition plane on the status word.
-    /// </summary>
-    private static bool IsFinalRefusal(IggyInvalidStatusCodeException error)
-    {
-        return error is
-        {
-            FromServer: true,
-            StatusCode: VsrError.REQUEST_TOO_OLD or VsrError.INVALID_COMMAND
-        };
+            _onDropped(this);
+        }
     }
 }
 
-/// <summary>Outcome of one <see cref="VsrConnection.SendAttemptAsync" /> call.</summary>
-/// <param name="Encoded">Whether the header was encoded, i.e. whether a request id may have been consumed.</param>
-/// <param name="Response">The decoded reply payload, non-null exactly when <paramref name="Error" /> is null.</param>
-/// <param name="Error">The failure that ended the attempt, or null on success.</param>
-/// <param name="RequestStarted">
-///     Whether any byte of the frame was written, which makes the server-side outcome unknowable on failure.
-/// </param>
-/// <param name="Connection">
-///     The connection the attempt ran on, so a caller that drops it after releasing the sending lock can tell
-///     its own connection from a replacement a reconnect installed since.
-/// </param>
+/// <summary>A correlated attempt outcome; Committed is independent of a successful weak acknowledgement.</summary>
 internal readonly record struct VsrAttempt(
     bool Encoded,
     IMemoryOwner<byte>? Response,
     Exception? Error,
     bool RequestStarted,
-    VsrConnection? Connection)
+    VsrConnection? Connection,
+    bool Committed = false)
 {
-    public static VsrAttempt Ok(IMemoryOwner<byte> response, VsrConnection connection)
-    {
-        return new VsrAttempt(true, response, null, true, connection);
-    }
+    public static VsrAttempt Ok(IMemoryOwner<byte> response, VsrConnection connection, bool committed = false) =>
+        new(true, response, null, true, connection, committed);
 
-    public static VsrAttempt Failed(bool encoded, Exception error, bool requestStarted, VsrConnection? connection)
-    {
-        return new VsrAttempt(encoded, null, error, requestStarted, connection);
-    }
+    public static VsrAttempt Failed(bool encoded, Exception error, bool requestStarted, VsrConnection? connection) =>
+        new(encoded, null, error, requestStarted, connection,
+            error is IggyInvalidStatusCodeException { Committed: true });
 }
 
 /// <summary>Shared empty reply payload; disposes to nothing, so it is safe to hand out repeatedly.</summary>

@@ -1339,7 +1339,7 @@ mod tests {
         bus.instant_timers.set(true);
         let shard = Rc::new(test_shard(&bus, BACKUP, REPLICAS, FIRST_BOOT));
         let shard_handle = Rc::new(RefCell::new(Some(Rc::downgrade(&shard))));
-        let host = ServerHost::new(&bus, &shard_handle, Arc::new(server_config), 1);
+        let host = ServerHost::new(&bus, &shard_handle, Arc::new(server_config));
         let (reply, answer) = shard::channel::<bool>(1);
         host.on_metadata_submit(shard::MetadataSubmit::CompleteLifecycle {
             request: lifecycle_batch(pending_delete_intent(&shard)),

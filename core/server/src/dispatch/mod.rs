@@ -150,7 +150,6 @@ fn enqueue_client_request<B, MJ, S, SB>(
     shard_handle: &ShellShardHandle<B, MJ, S, SB>,
     sessions: &Rc<RefCell<SessionManager>>,
     server_config: &Arc<ServerConfig>,
-    max_tokens_per_user: u32,
     queues: &ClientRequestQueues,
     active: &ActiveClientRequests,
     client_id: u128,
@@ -196,16 +195,7 @@ fn enqueue_client_request<B, MJ, S, SB>(
         let Some(shard) = upgrade_shard_handle(&shard_handle) else {
             return;
         };
-        drain_client_requests(
-            shard,
-            sessions,
-            server_config,
-            max_tokens_per_user,
-            queues,
-            &drain,
-            client_id,
-        )
-        .await;
+        drain_client_requests(shard, sessions, server_config, queues, &drain, client_id).await;
     });
 }
 
@@ -428,7 +418,6 @@ async fn drain_client_requests<B, MJ, S, SB>(
     shard: Rc<ShellShard<B, MJ, S, SB>>,
     sessions: Rc<RefCell<SessionManager>>,
     server_config: Arc<ServerConfig>,
-    max_tokens_per_user: u32,
     queues: ClientRequestQueues,
     drain: &Rc<ClientDrain>,
     client_id: u128,
@@ -464,7 +453,6 @@ async fn drain_client_requests<B, MJ, S, SB>(
                 &shard,
                 &sessions,
                 &server_config,
-                max_tokens_per_user,
                 drain,
                 client_id,
                 queued.message,
@@ -680,16 +668,11 @@ where
     }
 }
 
-#[allow(
-    clippy::future_not_send,
-    clippy::too_many_arguments,
-    clippy::too_many_lines
-)]
+#[allow(clippy::future_not_send, clippy::too_many_lines)]
 async fn handle_client_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
     server_config: &Arc<ServerConfig>,
-    max_tokens_per_user: u32,
     drain: &Rc<ClientDrain>,
     transport_client_id: u128,
     message: Message<iggy_binary_protocol::GenericHeader>,
@@ -970,20 +953,15 @@ async fn handle_client_request<B, MJ, S, SB>(
                         new_header.session = bound_session;
                     }
                 });
-            let (request, raw_pat_token) = match tcp_chain(
-                shard,
-                sessions,
-                transport_client_id,
-                max_tokens_per_user,
-                request,
-            ) {
-                Ok(rewritten) => rewritten,
-                Err(RewriteDeny { stage, error }) => {
-                    send_pre_consensus_deny(shard, transport_client_id, &header, &error, stage)
-                        .await;
-                    return;
-                }
-            };
+            let (request, raw_pat_token) =
+                match tcp_chain(shard, sessions, transport_client_id, request) {
+                    Ok(rewritten) => rewritten,
+                    Err(RewriteDeny { stage, error }) => {
+                        send_pre_consensus_deny(shard, transport_client_id, &header, &error, stage)
+                            .await;
+                        return;
+                    }
+                };
             let request_header = *request.header();
             // Replicated request: run consensus on the metadata owner (shard 0) and
             // bring the committed reply back here. This shard owns the connection,
@@ -1175,8 +1153,7 @@ mod tests {
     use iggy_binary_protocol::Command;
     use iggy_binary_protocol::codes::{
         GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE,
-        GET_CONSUMER_OFFSET_ROUTING_CODE, GET_ME_CODE, GET_PARTITION_ROUTE_CODE,
-        GET_POLL_ROUTING_CODE, GET_STATS_CODE, POLL_MESSAGES_CODE, POLL_MESSAGES_ON_PRIMARY_CODE,
+        GET_ME_CODE, GET_PARTITION_ROUTE_CODE, GET_STATS_CODE, POLL_MESSAGES_CODE,
     };
     use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
     use iggy_binary_protocol::primitives::polling_strategy::WirePollingStrategy;
@@ -1184,6 +1161,7 @@ mod tests {
         GetConsumerOffsetRequest, StoreConsumerOffsetRequest,
     };
     use iggy_binary_protocol::requests::messages::{GetPartitionRouteRequest, PollMessagesRequest};
+    use iggy_binary_protocol::requests::personal_access_tokens::CreatePersonalAccessTokenRequest as WireCreatePersonalAccessTokenRequest;
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
     use iggy_binary_protocol::requests::system::{
         BindSessionRequest, GetClientRequest, GetClientsRequest, GetStatsRequest,
@@ -1211,7 +1189,7 @@ mod tests {
     use metadata::impls::metadata::IggySnapshot;
     use metadata::stm::StateMachine;
     use metadata::stm::lifecycle::{CompleteLifecycleRequest, LifecycleCompletion};
-    use metadata::stm::user::CreatePersonalAccessTokenRequest;
+    use metadata::stm::user::{CreatePersonalAccessTokenRequest, PAT_TOKEN_HASH_BYTES};
     use partitions::{IggyPartitions, PartitionPathLayout, PartitionsConfig};
     use server_common::MESSAGE_ALIGN;
     use server_common::sharding::{PartitionLocation, ShardId};
@@ -1529,7 +1507,6 @@ mod tests {
             &shard,
             &sessions,
             &server_config,
-            1,
             &Rc::new(ClientDrain::new(&server_config)),
             ROOT_TRANSPORT,
             held_get_me(1, UNAPPLIED_OP),
@@ -1688,7 +1665,7 @@ mod tests {
 
     /// Every read that asks another shard before it answers: the client reads
     /// ask every shard, the rest ask the owner of the partition.
-    fn shard_waiting_reads() -> [(u32, Bytes); 9] {
+    fn shard_waiting_reads() -> [(u32, Bytes); 6] {
         let offset = GetConsumerOffsetRequest {
             consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
             stream_id: WireIdentifier::numeric(0),
@@ -1722,10 +1699,7 @@ mod tests {
                 }
                 .to_bytes(),
             ),
-            (GET_POLL_ROUTING_CODE, poll.clone()),
-            (POLL_MESSAGES_CODE, poll.clone()),
-            (POLL_MESSAGES_ON_PRIMARY_CODE, poll),
-            (GET_CONSUMER_OFFSET_ROUTING_CODE, offset.clone()),
+            (POLL_MESSAGES_CODE, poll),
             (GET_CONSUMER_OFFSET_CODE, offset),
         ]
     }
@@ -1772,7 +1746,6 @@ mod tests {
             &shard,
             &sessions,
             &server_config,
-            1,
             &Rc::new(ClientDrain::new(&server_config)),
             READER_TRANSPORT,
             read.into_generic(),
@@ -1973,7 +1946,7 @@ mod tests {
                 })
                 .unwrap(),
             LifecycleFrame::PartitionRead {
-                read: PartitionRead::ConsumerOffset { .. },
+                read: PartitionRead::ConsumerOffsetOnPrimary { .. },
                 reply,
                 ..
             } => reply
@@ -2442,7 +2415,6 @@ mod tests {
                 &shard,
                 &sessions,
                 &server_config,
-                1,
                 &Rc::new(ClientDrain::new(&server_config)),
                 TRANSPORT,
                 metadata_read(),
@@ -2704,7 +2676,6 @@ mod tests {
                 &shard,
                 &sessions,
                 &server_config,
-                1,
                 &Rc::new(ClientDrain::new(&server_config)),
                 TRANSPORT,
                 non_replicated_request(TRANSPORT, code),
@@ -2746,7 +2717,6 @@ mod tests {
             &shard,
             &sessions,
             &server_config,
-            1,
             &Rc::new(ClientDrain::new(&server_config)),
             TRANSPORT,
             wire_request(Operation::CreateStream, TRANSPORT, 1, 1, &[]).into_generic(),
@@ -2783,7 +2753,6 @@ mod tests {
             &shard,
             &sessions,
             &server_config,
-            1,
             &Rc::new(ClientDrain::new(&server_config)),
             TRANSPORT,
             non_replicated_request(TRANSPORT, PING_CODE),
@@ -2828,7 +2797,6 @@ mod tests {
             &shard,
             &sessions,
             &server_config,
-            1,
             &Rc::new(ClientDrain::new(&server_config)),
             TRANSPORT,
             message.into_generic(),
@@ -2896,7 +2864,7 @@ mod tests {
         commit_root_session(&shard);
         let shard_handle = unset_shard_handle();
         *shard_handle.borrow_mut() = Some(Rc::downgrade(&shard));
-        let host = ServerHost::new(&bus, &shard_handle, Arc::new(server_config), 1);
+        let host = ServerHost::new(&bus, &shard_handle, Arc::new(server_config));
         (bus, shard, host)
     }
 
@@ -2910,7 +2878,6 @@ mod tests {
             &bus,
             &unset_shard_handle(),
             Arc::new(ServerConfig::default()),
-            1,
         );
         assert_eq!(
             bus.connection_lost_hooks.get(),
@@ -2929,7 +2896,7 @@ mod tests {
         const TRANSPORT: u128 = 98;
         let bus = SpyBus::default();
         let shard_handle = unset_shard_handle();
-        let host = ServerHost::new(&bus, &shard_handle, Arc::new(ServerConfig::default()), 1);
+        let host = ServerHost::new(&bus, &shard_handle, Arc::new(ServerConfig::default()));
 
         host.on_client_request(TRANSPORT, non_replicated_request(TRANSPORT, PING_CODE));
         run_spawned_tasks().await;
@@ -3000,86 +2967,80 @@ mod tests {
     async fn given_a_held_partition_poll_when_ping_follows_should_answer_ping_before_owner_reply() {
         const POLL_REQUEST: u64 = 1;
         const PING_REQUEST: u64 = 2;
-        for code in [POLL_MESSAGES_CODE, POLL_MESSAGES_ON_PRIMARY_CODE] {
-            let bus = SpyBus::default();
-            let mut shard = test_shard(&bus, 0, 1, FIRST_BOOT);
-            let (sender, owner_inbox, _owner_replies) = shard_channel(0, 1, 1);
-            shard.attach_senders(vec![sender]);
-            let shard = Rc::new(shard);
-            let namespace = create_one_partition(&shard);
-            shard
-                .shards_table()
-                .insert(namespace, PartitionLocation::new(ShardId::new(0), 0));
-            commit_root_session(&shard);
-            let shard_handle = Rc::new(RefCell::new(Some(Rc::downgrade(&shard))));
-            let host = ServerHost::new(&bus, &shard_handle, Arc::new(ServerConfig::default()), 1);
-            bind_root_session(&shard, host.sessions()).await;
-            let body = PollMessagesRequest {
-                consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
-                stream_id: WireIdentifier::numeric(0),
-                topic_id: WireIdentifier::numeric(0),
-                partition_id: Some(0),
-                strategy: WirePollingStrategy::offset(0),
-                count: 1,
-                auto_commit: false,
-            }
-            .to_bytes();
-            let mut poll = wire_request(
-                Operation::NonReplicated,
-                ROOT_CLIENT,
-                ROOT_SESSION,
-                POLL_REQUEST,
-                &body,
-            );
-            let header = bytemuck::checked::from_bytes_mut::<RequestHeader>(
-                &mut poll.as_mut_slice()[..size_of::<RequestHeader>()],
-            );
-            header.reserved[..4].copy_from_slice(&code.to_le_bytes());
-            header.partition_incarnation = shard
-                .plane
-                .metadata()
-                .mux_stm
-                .streams()
-                .created_revision_for_namespace(namespace)
-                .unwrap();
-            host.on_client_request(ROOT_TRANSPORT, poll.into_generic());
-            settle().await;
-            let ShardFrame::Lifecycle(LifecycleFrame::PartitionRead {
-                read: PartitionRead::PollOnPrimary { .. },
-                reply,
-                ..
-            }) = owner_inbox
-                .try_recv()
-                .expect("the poll must reach its partition owner")
-            else {
-                panic!("the owner must receive a primary-gated poll");
-            };
-            assert!(bus.client_replies.borrow().is_empty());
-
-            host.on_client_request(
-                ROOT_TRANSPORT,
-                root_read(PING_CODE, PING_REQUEST).into_generic(),
-            );
-            await_replies(&bus, 1).await;
-            {
-                let replies = bus.client_replies.borrow();
-                assert_eq!(
-                    replies.len(),
-                    1,
-                    "PING must not wait for partition I/O on code {code}"
-                );
-                assert_eq!(reply_request(&replies[0].1), PING_REQUEST);
-            }
-            reply
-                .try_send(PartitionReadReply::Rejected(
-                    IggyError::TransientNotAccepted,
-                ))
-                .unwrap();
-            await_replies(&bus, 2).await;
-            let replies = bus.client_replies.borrow();
-            assert_eq!(replies.len(), 2);
-            assert_eq!(reply_request(&replies[1].1), POLL_REQUEST);
+        let bus = SpyBus::default();
+        let mut shard = test_shard(&bus, 0, 1, FIRST_BOOT);
+        let (sender, owner_inbox, _owner_replies) = shard_channel(0, 1, 1);
+        shard.attach_senders(vec![sender]);
+        let shard = Rc::new(shard);
+        let namespace = create_one_partition(&shard);
+        shard
+            .shards_table()
+            .insert(namespace, PartitionLocation::new(ShardId::new(0), 0));
+        commit_root_session(&shard);
+        let shard_handle = Rc::new(RefCell::new(Some(Rc::downgrade(&shard))));
+        let host = ServerHost::new(&bus, &shard_handle, Arc::new(ServerConfig::default()));
+        bind_root_session(&shard, host.sessions()).await;
+        let body = PollMessagesRequest {
+            consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            partition_id: Some(0),
+            strategy: WirePollingStrategy::offset(0),
+            count: 1,
+            auto_commit: false,
         }
+        .to_bytes();
+        let mut poll = wire_request(
+            Operation::NonReplicated,
+            ROOT_CLIENT,
+            ROOT_SESSION,
+            POLL_REQUEST,
+            &body,
+        );
+        let header = bytemuck::checked::from_bytes_mut::<RequestHeader>(
+            &mut poll.as_mut_slice()[..size_of::<RequestHeader>()],
+        );
+        header.reserved[..4].copy_from_slice(&POLL_MESSAGES_CODE.to_le_bytes());
+        header.partition_incarnation = shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .created_revision_for_namespace(namespace)
+            .unwrap();
+        host.on_client_request(ROOT_TRANSPORT, poll.into_generic());
+        settle().await;
+        let ShardFrame::Lifecycle(LifecycleFrame::PartitionRead {
+            read: PartitionRead::PollOnPrimary { .. },
+            reply,
+            ..
+        }) = owner_inbox
+            .try_recv()
+            .expect("the poll must reach its partition owner")
+        else {
+            panic!("the owner must receive a primary-gated poll");
+        };
+        assert!(bus.client_replies.borrow().is_empty());
+
+        host.on_client_request(
+            ROOT_TRANSPORT,
+            root_read(PING_CODE, PING_REQUEST).into_generic(),
+        );
+        await_replies(&bus, 1).await;
+        {
+            let replies = bus.client_replies.borrow();
+            assert_eq!(replies.len(), 1, "PING must not wait for partition I/O");
+            assert_eq!(reply_request(&replies[0].1), PING_REQUEST);
+        }
+        reply
+            .try_send(PartitionReadReply::Rejected(
+                IggyError::TransientNotAccepted,
+            ))
+            .unwrap();
+        await_replies(&bus, 2).await;
+        let replies = bus.client_replies.borrow();
+        assert_eq!(replies.len(), 2);
+        assert_eq!(reply_request(&replies[1].1), POLL_REQUEST);
     }
 
     #[compio::test]
@@ -3153,7 +3114,6 @@ mod tests {
             Rc::clone(&shard),
             Rc::clone(host.sessions()),
             config,
-            1,
             Rc::clone(&queues),
             &drain,
             ROOT_TRANSPORT,
@@ -3270,7 +3230,6 @@ mod tests {
             shard,
             Rc::clone(host.sessions()),
             config,
-            1,
             queues,
             &drain,
             ROOT_TRANSPORT,
@@ -3420,7 +3379,6 @@ mod tests {
                 &shard_handle,
                 &sessions,
                 &server_config,
-                1,
                 &queues,
                 &active,
                 ROOT_TRANSPORT,
@@ -3596,6 +3554,94 @@ mod tests {
         );
     }
 
+    /// A create that took the caller's last allowed token comes back as a
+    /// same-id replay when its reply is lost. A deny at the token cap proves
+    /// nothing about the create, so the client could never settle it. The
+    /// replay must reach the dedup cache and get the committed refusal.
+    #[compio::test]
+    async fn given_committed_pat_create_at_token_cap_when_replayed_should_prove_the_commit() {
+        const REQUEST: u64 = 1;
+        const TOKEN_NAME: &str = "token";
+        const TOKEN_CAP: u32 = 1;
+        let (bus, shard, host) = root_host(ServerConfig::default());
+        bind_root_session(&shard, host.sessions()).await;
+        let metadata = shard.plane.metadata();
+        metadata.set_max_tokens_per_user(TOKEN_CAP);
+        let token = CreatePersonalAccessTokenRequest {
+            user_id: DEFAULT_ROOT_USER_ID,
+            name: WireName::new(TOKEN_NAME).unwrap(),
+            expiry: 0,
+            token_hash: [b'a'; PAT_TOKEN_HASH_BYTES],
+        };
+        let prepare = prepare_message(
+            Operation::CreatePersonalAccessToken,
+            ROOT_CLIENT,
+            REQUEST,
+            &token.to_bytes(),
+        )
+        .transmute_header(|old, header: &mut PrepareHeader| {
+            *header = old;
+            header.op = UNAPPLIED_OP;
+        });
+        let created = metadata::apply_committed_prepare(
+            &*metadata.mux_stm,
+            &metadata.client_table,
+            true,
+            |_| {},
+            prepare,
+        );
+        assert_eq!(iggy_binary_protocol::result_code(created.body()), Some(0));
+        let create = |request, name| {
+            let body = WireCreatePersonalAccessTokenRequest {
+                name: WireName::new(name).unwrap(),
+                expiry: 0,
+            }
+            .to_bytes();
+            wire_request(
+                Operation::CreatePersonalAccessToken,
+                ROOT_CLIENT,
+                ROOT_SESSION,
+                request,
+                &body,
+            )
+            .into_generic()
+        };
+
+        host.on_client_request(ROOT_TRANSPORT, create(REQUEST, TOKEN_NAME));
+        await_replies(&bus, 1).await;
+        host.on_client_request(ROOT_TRANSPORT, create(REQUEST + 1, "other"));
+        await_replies(&bus, 2).await;
+
+        let replies = bus.client_replies.borrow();
+        assert_eq!(replies.len(), 2, "both creates must be answered");
+        let (client, reply) = &replies[0];
+        assert_eq!(*client, ROOT_TRANSPORT);
+        assert_eq!(
+            reply_status(reply),
+            0,
+            "a deny at the token cap cannot prove that the create committed"
+        );
+        let (header, body) = reply.split_at(size_of::<ReplyHeader>());
+        let header = bytemuck::checked::try_pod_read_unaligned::<ReplyHeader>(header).unwrap();
+        assert!(header.has_committed_result());
+        assert_eq!(
+            (header.op, header.commit, header.request),
+            (UNAPPLIED_OP, UNAPPLIED_OP, REQUEST)
+        );
+        assert_eq!(
+            iggy_binary_protocol::result_code(body),
+            Some(IggyError::PersonalAccessTokenAlreadyExists(String::new(), 0).as_code())
+        );
+        let (header, body) = replies[1].1.split_at(size_of::<ReplyHeader>());
+        let header = bytemuck::checked::try_pod_read_unaligned::<ReplyHeader>(header).unwrap();
+        assert!(!header.has_committed_result());
+        assert_eq!(
+            iggy_binary_protocol::result_code(body),
+            Some(IggyError::PersonalAccessTokensLimitReached(0, 0).as_code()),
+            "a new create at the cap must be denied"
+        );
+    }
+
     /// The two frames differ only in the operation byte. A declared one gets
     /// the retryable deny, and an undeclared one gets `InvalidCommand`,
     /// because no retry of that frame can succeed.
@@ -3705,7 +3751,6 @@ mod tests {
             &Rc::new(shard),
             &sessions,
             &server_config,
-            1,
             &Rc::new(ClientDrain::new(&server_config)),
             HOME_TRANSPORT,
             request.into_generic(),

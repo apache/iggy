@@ -926,11 +926,11 @@ async fn given_a_corrupt_superblock_slot_when_a_node_boots_should_refuse_boot(
         .restart_node(backup)
         .expect_err("boot over a corrupt superblock slot must refuse even beside a valid sibling");
     if stderr_is_captured() {
-        // The refusal reaches stderr as the Debug form of the recovery error,
-        // so the variant name is the decisive marker.
+        // The refusal reaches stderr as the recovery error's Display text with
+        // its source chain inlined, so the unreadable-copy message is the marker.
         let diagnostics = error.to_string();
         assert!(
-            diagnostics.contains("SuperblockUnreadable"),
+            diagnostics.contains("superblock present but a copy holds bytes that do not verify"),
             "the boot refusal must name the unreadable superblock, got: {diagnostics}"
         );
     }

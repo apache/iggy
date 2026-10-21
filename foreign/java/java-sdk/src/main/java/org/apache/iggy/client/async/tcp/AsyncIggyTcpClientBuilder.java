@@ -89,6 +89,8 @@ public final class AsyncIggyTcpClientBuilder {
     private RetryPolicy retryPolicy;
     private Duration acquireTimeout;
     private Duration heartbeatInterval = Duration.ofSeconds(5);
+    private int maxPendingOperations = 256;
+    private long maxPendingOperationBytes = 64L * 1024 * 1024;
     private long maxVsrFrameSize = VsrFrameDecoder.DEFAULT_MAX_FRAME_SIZE;
     private int ioThreads = AsyncTcpConnection.DEFAULT_IO_THREADS;
     private IoEventLoopGroup eventLoopGroup;
@@ -220,6 +222,10 @@ public final class AsyncIggyTcpClientBuilder {
      * Sets how often the client sends a heartbeat while connected. The value
      * should not exceed the server's configured heartbeat interval.
      *
+     * <p>The heartbeat also paces recovery: one that fails starts a new redial
+     * burst, and one that finds the session lost after a burst ran out signs in
+     * again, each with a fresh retry budget. See {@link RetryPolicy}.
+     *
      * @param heartbeatInterval the heartbeat interval
      * @return this builder
      */
@@ -262,7 +268,10 @@ public final class AsyncIggyTcpClientBuilder {
     }
 
     /**
-     * Sets the retry policy.
+     * Sets the retry policy for the redials after a connection loss. It bounds
+     * one burst, and a heartbeat starts the next one with a fresh budget, see
+     * {@link RetryPolicy}. Without a policy, a burst runs up to 12 rounds over
+     * the known endpoints, 5 seconds apart.
      *
      * @param retryPolicy the retry policy
      * @return this builder
@@ -309,6 +318,19 @@ public final class AsyncIggyTcpClientBuilder {
     }
 
     /**
+     * Bounds active and retained mutations; defaults are 256 operations and 64 MiB. The count also bounds the
+     * proved replay outcomes that the client keeps for later resolves.
+     */
+    public AsyncIggyTcpClientBuilder pendingOperations(int count, long bytes) {
+        if (count <= 0 || bytes <= 0) {
+            throw new IggyInvalidArgumentException("Pending operation limits must be positive");
+        }
+        maxPendingOperations = count;
+        maxPendingOperationBytes = bytes;
+        return this;
+    }
+
+    /**
      * Builds and returns a configured AsyncIggyTcpClient instance.
      * Note: You still need to call {@link AsyncIggyTcpClient#connect()} on the returned client.
      *
@@ -326,7 +348,7 @@ public final class AsyncIggyTcpClientBuilder {
         validateIoThreads();
         validateEventLoopGroup();
 
-        return new AsyncIggyTcpClient(
+        AsyncIggyTcpClient client = new AsyncIggyTcpClient(
                 host,
                 port,
                 username,
@@ -341,6 +363,8 @@ public final class AsyncIggyTcpClientBuilder {
                 Optional.ofNullable(tlsCertificate),
                 Optional.ofNullable(eventLoopGroup),
                 ioThreads);
+        client.configurePendingOperations(maxPendingOperations, maxPendingOperationBytes);
+        return client;
     }
 
     private void validateHost() {

@@ -249,7 +249,7 @@ pub struct DirectConfig {
     /// A send carrying more than this is split into consecutive requests of this size, each awaited
     /// before the next one starts. A batch of 2500 therefore becomes three requests at the default.
     ///
-    /// `0` limits to 1,000,000 messages per request.
+    /// `0` limits to [`MAX_BATCH_LENGTH`](crate::clients::MAX_BATCH_LENGTH) messages per request.
     #[builder(default = 1000)]
     pub batch_length: u32,
     /// Requested minimum gap between sequential direct sends.
