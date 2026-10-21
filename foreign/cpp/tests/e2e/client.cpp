@@ -3028,7 +3028,7 @@ TEST_F(LowLevelE2E_Client, SendBinaryRequestUnknownCommandCodeThrows) {
 
 TEST_F(E2E_Client, CreatePersonalAccessTokenBeforeLoginThrows) {
     RecordProperty("description", "Rejects personal access token creation without an active authenticated session.");
-    auto client = GetLoggedOutHighLevelClient();
+    auto client                  = GetLoggedOutHighLevelClient();
     const std::string token_name = GetRandomName(30);
 
     ASSERT_THROW(client.CreatePersonalAccessToken(token_name, iggy::Expiry::ServerDefault()), std::exception);
@@ -3038,19 +3038,17 @@ TEST_F(E2E_Client, CreatePersonalAccessTokenBeforeLoginThrows) {
 
 TEST_F(E2E_Client, CreatePersonalAccessTokenReturnsTokenString) {
     RecordProperty("description", "Creates a personal access token and returns the raw token string.");
-    auto client = GetLoggedInHighLevelClient();
+    auto client                  = GetLoggedInHighLevelClient();
     const std::string token_name = GetRandomName(30);
 
     std::string token;
-    ASSERT_NO_THROW({
-        token = client.CreatePersonalAccessToken(token_name, iggy::Expiry::ServerDefault());
-    });
+    ASSERT_NO_THROW({ token = client.CreatePersonalAccessToken(token_name, iggy::Expiry::ServerDefault()); });
     EXPECT_FALSE(token.empty());
 }
 
 TEST_F(E2E_Client, CreatePersonalAccessTokenDuplicateNameThrows) {
     RecordProperty("description", "Rejects creating a personal access token with a duplicate name.");
-    auto client = GetLoggedInHighLevelClient();
+    auto client                  = GetLoggedInHighLevelClient();
     const std::string token_name = GetRandomName(30);
 
     ASSERT_NO_THROW((void)client.CreatePersonalAccessToken(token_name, iggy::Expiry::ServerDefault()));
@@ -3059,17 +3057,14 @@ TEST_F(E2E_Client, CreatePersonalAccessTokenDuplicateNameThrows) {
 
 TEST_F(E2E_Client, CreatePersonalAccessTokenRoundTripLoginWithToken) {
     RecordProperty("description", "Authenticates a new client using WithPersonalAccessToken with the created token.");
-    auto admin_client = GetLoggedInHighLevelClient();
+    auto admin_client            = GetLoggedInHighLevelClient();
     const std::string token_name = GetRandomName(30);
 
     std::string token;
-    ASSERT_NO_THROW({
-        token = admin_client.CreatePersonalAccessToken(token_name, iggy::Expiry::ServerDefault());
-    });
+    ASSERT_NO_THROW({ token = admin_client.CreatePersonalAccessToken(token_name, iggy::Expiry::ServerDefault()); });
     ASSERT_FALSE(token.empty());
 
     auto pat_client = iggy::IggyBlockingClient::Builder().WithPersonalAccessToken(token).Build();
     ASSERT_NO_THROW(pat_client.Connect());
     ASSERT_NO_THROW((void)pat_client.GetMe());
 }
-
