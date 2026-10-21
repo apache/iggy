@@ -18,6 +18,8 @@
 use iggy::prelude::IggyError;
 use thiserror::Error;
 
+use crate::bridge::iggy_bridge::ClusterIdCall;
+use crate::cluster_id::InvalidClusterId;
 use crate::protocol::api::{
     ERROR_COORDINATOR_LOAD_IN_PROGRESS, ERROR_INVALID_PARTITIONS, ERROR_INVALID_REQUEST,
     ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_POLICY_VIOLATION,
@@ -90,6 +92,29 @@ pub enum BridgeError {
     /// bypassing that layer must not be able to provision a topic nothing can produce to.
     #[error("partition count must be at least 1, got 0 for topic '{kafka_topic}'")]
     InvalidPartitionCount { kafka_topic: String },
+    /// The message Iggy holds as the cluster id is not one. Read once, at startup.
+    #[error(
+        "the earliest stored message of Iggy topic '{stream}/{topic}' is not a Kafka cluster \
+         id: {source}. With every gateway stopped, replace that message with a valid id, or \
+         delete the topic to start a new cluster"
+    )]
+    InvalidClusterId {
+        stream: String,
+        topic: &'static str,
+        source: InvalidClusterId,
+    },
+    /// A call to Iggy for the cluster id failed. Made only at startup.
+    #[error(
+        "cannot {call} '{}' for the Kafka cluster id: {source}{}",
+        call.target(stream, topic),
+        call.permission_hint(source, stream)
+    )]
+    ClusterIdCall {
+        call: ClusterIdCall,
+        stream: String,
+        topic: &'static str,
+        source: Box<Self>,
+    },
 }
 
 impl BridgeError {
@@ -120,7 +145,9 @@ impl BridgeError {
             // is reachable only if a future caller starts constructing configs at request time.
             // `UNKNOWN_SERVER_ERROR` at least doesn't claim a specific, wrong cause the way
             // `UNSUPPORTED_VERSION` (misleadingly implies a Kafka API version mismatch) would.
-            Self::InvalidConfig(_) => ERROR_UNKNOWN_SERVER_ERROR,
+            Self::InvalidConfig(_) | Self::InvalidClusterId { .. } | Self::ClusterIdCall { .. } => {
+                ERROR_UNKNOWN_SERVER_ERROR
+            }
         }
     }
 

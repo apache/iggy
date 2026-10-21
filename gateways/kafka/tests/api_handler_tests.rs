@@ -27,12 +27,16 @@ mod tcp;
 mod wire;
 
 use bytes::Bytes;
+use kafka_protocol::messages::MetadataResponse;
+use kafka_protocol::protocol::Decodable;
 
+use iggy_gateway_kafka::cluster_id::ClusterId;
 use iggy_gateway_kafka::protocol::api::{
     API_KEY_API_VERSIONS, API_KEY_CREATE_TOPICS, API_KEY_DELETE_TOPICS, API_KEY_FETCH,
     API_KEY_LIST_OFFSETS, API_KEY_METADATA, API_KEY_PRODUCE, ERROR_INVALID_REQUEST, ERROR_NONE,
     ERROR_NOT_CONTROLLER, ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
-    ERROR_UNSUPPORTED_VERSION, handle_request, is_supported_version, supported_api_ranges,
+    ERROR_UNSUPPORTED_VERSION, GatewayState, handle_request, handle_request_bounded,
+    is_supported_version, supported_api_ranges,
 };
 
 use codec::Decoder;
@@ -663,6 +667,26 @@ async fn metadata_v2_includes_cluster_id_field() {
     let _cluster_id = d.read_nullable_string().unwrap();
     let _controller = d.read_i32().unwrap();
     assert_eq!(d.read_i32().unwrap(), 0);
+}
+
+/// The stub gateway reports the id its state holds, from v2, where the field begins.
+#[tokio::test]
+async fn metadata_without_a_bridge_reports_the_gateway_cluster_id_from_v2() {
+    let cluster_id = ClusterId::random();
+    let state = GatewayState::stub(8 * 1024 * 1024).with_cluster_id(cluster_id.clone());
+    for version in 0i16..=9 {
+        let request = if version >= 9 {
+            metadata_request_flexible(0)
+        } else {
+            metadata_request_legacy(version, 0)
+        };
+        let mut body = handle_request_bounded(&state, API_KEY_METADATA, version, request)
+            .await
+            .expect_response("Metadata always answers");
+        let response = MetadataResponse::decode(&mut body, version).expect("a Metadata response");
+        let expected = (version >= 2).then_some(cluster_id.as_str());
+        assert_eq!(response.cluster_id.as_deref(), expected, "v{version}");
+    }
 }
 
 #[tokio::test]
