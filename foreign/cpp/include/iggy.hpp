@@ -3671,6 +3671,21 @@ class IggyBlockingClient final {
                     const UserUpdateOptions &options = {});
 
     /**
+     * @brief Creates a personal access token for the authenticated user.
+     *
+     * The token string is only returned once upon creation and cannot be
+     * retrieved again.
+     *
+     * @param name Unique token name.
+     * @param expiry Expiry policy for the token.
+     * @return The raw token string.
+     * @throws IggyException if the client is unavailable or unauthenticated;
+     *         the name or expiry is invalid; the name is already in use; or the
+     *         request fails.
+     */
+    std::string CreatePersonalAccessToken(std::string name, const Expiry &expiry);
+
+    /**
      * @brief Creates a top-level stream in the cluster metadata.
      *
      * A stream is the top-level namespace for topics. This creates no topics,
