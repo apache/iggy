@@ -424,6 +424,9 @@ public partial class IggyConsumer : IAsyncDisposable
         catch (OperationCanceledException) when (afterReceive && IsDisposed && !ct.IsCancellationRequested)
         {
         }
+        catch (VsrRequestOutcomeUnknownException) when (afterReceive && IsDisposed && !ct.IsCancellationRequested)
+        {
+        }
     }
 
     /// <summary>

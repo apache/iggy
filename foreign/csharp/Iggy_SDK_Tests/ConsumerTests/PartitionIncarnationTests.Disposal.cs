@@ -18,6 +18,7 @@
 using System.Collections.Concurrent;
 using Apache.Iggy.Consumers;
 using Apache.Iggy.Contracts;
+using Apache.Iggy.Exceptions;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Kinds;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -164,8 +165,10 @@ public sealed partial class PartitionIncarnationTests
         Assert.Equal(["store", "leave"], events);
     }
 
-    [Fact]
-    public async Task given_an_after_receive_store_in_flight_when_disposed_should_drain_it_before_checkpointing_and_leaving()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task given_an_after_receive_store_in_flight_when_disposed_should_drain_it_before_checkpointing_and_leaving(bool sent)
     {
         var events = new ConcurrentQueue<string>();
         var client = ClientMock(new());
@@ -177,17 +180,28 @@ public sealed partial class PartitionIncarnationTests
         var cancelled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var attempts = 0;
+        client.Setup(mock => mock.ResolveOperationAsync(1, It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .Callback(() => events.Enqueue("resolve")).Returns(Task.CompletedTask);
         client.Setup(mock => mock.StoreOffsetAsync(It.IsAny<Consumer>(), It.IsAny<Identifier>(), It.IsAny<Identifier>(),
                 It.IsAny<ulong>(), It.IsAny<uint>(), It.IsAny<PartitionContext>(), It.IsAny<CancellationToken>()))
             .Returns(async (Consumer _, Identifier _, Identifier _, ulong _, uint _, PartitionContext _, CancellationToken token) =>
             {
-                if (Interlocked.Increment(ref attempts) == 1)
+                var attempt = Interlocked.Increment(ref attempts);
+                if (attempt == 1)
                 {
                     storing.TrySetResult();
                     using var registration = token.Register(() => cancelled.TrySetResult());
                     await release.Task;
                     events.Enqueue("drained");
+                    if (sent)
+                    {
+                        throw new VsrRequestOutcomeUnknownException(new OperationCanceledException(token), 1);
+                    }
                     token.ThrowIfCancellationRequested();
+                }
+                else if (sent && attempt == 2)
+                {
+                    throw new VsrLaneBlockedException(1);
                 }
                 else
                 {
@@ -217,7 +231,7 @@ public sealed partial class PartitionIncarnationTests
         }
         await dispose.WaitAsync(timeout.Token);
         Assert.False(await receive);
-        Assert.Equal(["drained", "checkpoint", "leave"], events);
+        Assert.Equal(sent ? ["drained", "resolve", "checkpoint", "leave"] : ["drained", "checkpoint", "leave"], events);
     }
 
     private static void SetupDisposalGroup(Mock<IIggyClient> client, ConcurrentQueue<string> events)
