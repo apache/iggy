@@ -434,6 +434,7 @@ enum Responses {
     struct PartitionRoute: Equatable {
         /// The context a request routed by the reply carries.
         let context: PartitionContext
+        let view: UInt32
         /// The configured replica id of the partition primary, as
         /// `GetClusterMetadata` reports it, never a roster position.
         let primaryReplica: UInt8
@@ -449,10 +450,9 @@ enum Responses {
         }
         return try decode(body) { reader in
             let context = PartitionContext(incarnation: try reader.readUInt64(), ownerGeneration: 0, metadataOp: try reader.readUInt64())
-            // The view and the partition count, which a client that asks only
-            // the coordinator for routes does not use.
-            try reader.skip(2 * MemoryLayout<UInt32>.size)
-            return PartitionRoute(context: context, primaryReplica: try reader.readUInt8())
+            let view = try reader.readUInt32()
+            try reader.skip(MemoryLayout<UInt32>.size)
+            return PartitionRoute(context: context, view: view, primaryReplica: try reader.readUInt8())
         }
     }
 

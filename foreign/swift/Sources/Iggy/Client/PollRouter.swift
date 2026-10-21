@@ -62,6 +62,9 @@ final class PollRouter: Sendable {
         /// watermark a data connection binds at.
         let consumerSession: Responses.SessionIdentity
         let context: PartitionContext
+        let view: UInt32
+        var minimumView: UInt32 = 0
+        var askFirst: UInt8?
     }
 
     private struct DataConnection {
@@ -175,7 +178,6 @@ final class PollRouter: Sendable {
                 guard error.code == .transientNotAccepted || reconnects else {
                     throw replay.outcome.observe(error)
                 }
-                removeRoute(key)
                 refusal = replay.outcome.observe(error)
                 if !replay.outcome.isUncertain {
                     replay.frame = nil
@@ -367,6 +369,10 @@ final class PollRouter: Sendable {
             removeRoute(request.key)
             throw unsent.refusal
         } catch let error as IggyError {
+            if error.code == .notPrimary {
+                markNotPrimary(route, partitionID: request.key.partitionID)
+                throw ClientCore.graded(error)
+            }
             removeRoute(request.key)
             let source = MissSource.replica(identity: route.consumerSession, lineage: request.lineage, fence: route.fence)
             if error.isNamespaceMiss, await !isMetadataPrimary(route.primaryReplica, answeredOn: source, coordinator: coordinator, deadline: request.deadline) {
@@ -455,6 +461,7 @@ final class PollRouter: Sendable {
                 data.consumerSession = nil
             }
             slot.connection.withLockedValue { $0 = data }
+            if error.code == .notPrimary { throw error }
             if error.isConnectionLoss, error.code != .staleClient {
                 if replay.frame?.operation.isPartition == true, error.code != .notConnected, error.code != .cannotEstablishConnection {
                     replay.outcome.markUncertain()
@@ -574,13 +581,13 @@ final class PollRouter: Sendable {
                 }
                 answer = refusal
             }
+            if answer.code == .notPrimary, !VSRFrame.hasCommittedResult(header) {
+                throw answer
+            }
             guard request.operation.isPartition, replay.outcome.isUncertain || answer.code == .transientNotCommitted else {
                 throw ClientCore.graded(answer)
             }
             let error = replay.outcome.observe(ClientCore.graded(answer), committed: VSRFrame.hasCommittedResult(header))
-            if answer.code == .notPrimary, !VSRFrame.hasCommittedResult(header) {
-                throw answer
-            }
             // Once the outcome is unknown, any answer but a transient one ends
             // the replay, as the same request id gets the same answer again.
             // A replay sent with a sliver of the budget would time out, and
@@ -604,18 +611,24 @@ final class PollRouter: Sendable {
     ) async throws -> Route {
         let watermark = await coordinator.metadataWatermark
         let (fence, cached) = state.withLockedValue { ($0.fence, $0.routes[key]) }
-        if let cached, cached.fence == fence, cached.context.metadataOp >= watermark {
+        if let cached, cached.fence == fence, cached.askFirst == nil, cached.view >= cached.minimumView, cached.context.metadataOp >= watermark {
             return cached
         }
         let response = try await lookUp(
-            key, clustered: clustered, fence: fence, watermark: watermark, lineage: lineage, coordinator: coordinator, deadline: deadline)
+            key, clustered: clustered, fence: fence, watermark: watermark, lineage: lineage, coordinator: coordinator, deadline: deadline, preferred: cached)
         guard let session = await coordinator.sessionIdentity(at: response.context.metadataOp) else {
             throw IggyError(.transientNotAccepted, context: "no session is bound to route partition \(key.partitionID)")
         }
-        let route = Route(fence: fence, primaryReplica: response.primaryReplica, consumerSession: session, context: response.context)
+        var route = Route(fence: fence, primaryReplica: response.primaryReplica, consumerSession: session, context: response.context, view: response.view)
         try await validate(route, coordinator: coordinator)
         try state.withLockedValue { state in
             try Self.checkFence(route.fence, in: state)
+            for (alias, known) in state.routes where alias.partitionID == key.partitionID && known.context.incarnation == route.context.incarnation {
+                route.minimumView = max(route.minimumView, known.minimumView)
+            }
+            guard route.view >= route.minimumView else {
+                throw IggyError(.transientNotAccepted, context: "the partition route predates a primary refusal")
+            }
             if state.routes.count >= Self.maxCachedRoutes {
                 state.routes.removeAll()
             }
@@ -628,10 +641,30 @@ final class PollRouter: Sendable {
     /// the coordinator on a single node.
     private func lookUp(
         _ key: RouteKey, clustered: Bool, fence: UInt128Value, watermark: UInt64, lineage: UInt64, coordinator: ClientCore,
-        deadline: ContinuousClock.Instant
+        deadline: ContinuousClock.Instant, preferred: Route? = nil
     ) async throws -> Responses.PartitionRoute {
         let payload = try Requests.partitionRoute(streamID: key.stream, topicID: key.topic, partitionID: key.partitionID)
         let context = ClientCore.readContext(watermark)
+        if clustered, let preferred, let replica = preferred.askFirst,
+            let identity = await coordinator.sessionIdentity(at: watermark)
+        {
+            do {
+                let body = try await exchange(
+                    onReplica: replica, code: CommandCode.getPartitionRoute.rawValue, payload: payload, context: context,
+                    identity: identity, lineage: lineage, fence: fence, coordinator: coordinator, deadline: deadline,
+                    dialDeadline: min(deadline, .now + ClientCore.failoverDialTimeout))
+                let response = try Responses.partitionRoute(body[...])
+                if response.context.incarnation != preferred.context.incarnation || response.view >= preferred.minimumView {
+                    return response
+                }
+            } catch let unsent as UnsentRequest {
+                throw unsent.refusal
+            } catch let error as IggyError
+                where error.code == .transientNotAccepted || error.code == .transientNotCommitted || error.isNamespaceMiss || error.isConnectionLoss
+            {
+                // A failed hint leaves the metadata primary as the fallback.
+            }
+        }
         let body =
             clustered
             ? try await lookUpInCluster(payload, context: context, fence: fence, lineage: lineage, coordinator: coordinator, deadline: deadline)
@@ -803,5 +836,15 @@ final class PollRouter: Sendable {
 
     private func removeRoute(_ key: RouteKey) {
         _ = state.withLockedValue { $0.routes.removeValue(forKey: key) }
+    }
+
+    private func markNotPrimary(_ route: Route, partitionID: UInt32) {
+        state.withLockedValue { state in
+            for key in state.routes.keys where key.partitionID == partitionID && state.routes[key]?.context.incarnation == route.context.incarnation {
+                let floor = max(state.routes[key]?.minimumView ?? 0, route.view == .max ? .max : route.view + 1)
+                state.routes[key]?.minimumView = floor
+                state.routes[key]?.askFirst = route.primaryReplica
+            }
+        }
     }
 }

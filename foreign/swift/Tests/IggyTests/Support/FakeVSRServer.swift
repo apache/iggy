@@ -174,11 +174,11 @@ final class FakeVSRServer: @unchecked Sendable {
     }
 
     /// The reply to `GetPartitionRoute`.
-    static func partitionRouteBody(_ context: PartitionContext, partitionsCount: UInt32 = 3, primaryReplica: UInt8 = 0) -> [UInt8] {
+    static func partitionRouteBody(_ context: PartitionContext, partitionsCount: UInt32 = 3, primaryReplica: UInt8 = 0, view: UInt32 = 1) -> [UInt8] {
         var writer = ByteWriter()
         writer.write(context.incarnation)
         writer.write(context.metadataOp)
-        writer.write(UInt32(1))
+        writer.write(view)
         writer.write(partitionsCount)
         writer.write(primaryReplica)
         return writer.bytes

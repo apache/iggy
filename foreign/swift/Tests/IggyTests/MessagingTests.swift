@@ -958,6 +958,9 @@ struct MessagingTests {
         }
         let refused = Locked(false)
         await primary.respond { request in
+            if request.code == CommandCode.getPartitionRoute.rawValue {
+                return .ok(FakeVSRServer.partitionRouteBody(FakeVSRServer.routeContext, primaryReplica: 1, view: 3))
+            }
             if request.code == CommandCode.pollMessages.rawValue, !refused.exchange(true) {
                 return .status(IggyErrorCode.notPrimary.rawValue)
             }
@@ -965,7 +968,8 @@ struct MessagingTests {
         }
         let client = try await connectedClient(coordinator)
         _ = try await client.pollMessages(streamID: 1, topicID: 2, partitionID: 0, strategy: .first, count: 1, autoCommit: false)
-        #expect(await requests(coordinator, .getPartitionRoute).count == 2)
+        #expect(await requests(coordinator, .getPartitionRoute).count == 1)
+        #expect(await requests(primary, .getPartitionRoute).count == 1)
         #expect(await requests(primary, .pollMessages).count == 2)
         // The refusal left the data connection at a frame boundary.
         #expect(await primary.connectionCount == 1)
@@ -1164,6 +1168,56 @@ struct MessagingTests {
     }
 
     // MARK: Namespace misses
+
+    @Test func aPrimaryRefusalRefreshesEveryAliasPastTheRejectedView() async throws {
+        let coordinator = try await FakeVSRServer.started()
+        let previous = try await FakeVSRServer.started()
+        let current = try await FakeVSRServer.started()
+        defer {
+            Task {
+                await coordinator.stop()
+                await previous.stop()
+                await current.stop()
+            }
+        }
+        let moved = Locked(false)
+        let hints = Locked(0)
+        await coordinator.respond { request in
+            switch request.code.flatMap(CommandCode.init(rawValue:)) {
+            case .getClusterMetadata:
+                return .ok(FakeVSRServer.rosterBody([coordinator.address, previous.address, current.address]))
+            case .getPartitionRoute:
+                return .ok(FakeVSRServer.partitionRouteBody(FakeVSRServer.routeContext, primaryReplica: 1))
+            default:
+                return FakeVSRServer.defaultReply(request, address: coordinator.address)
+            }
+        }
+        await previous.respond { request in
+            if request.code == CommandCode.pollMessages.rawValue, moved.withLock({ $0 }) {
+                return .status(IggyErrorCode.notPrimary.rawValue)
+            }
+            if request.code == CommandCode.getPartitionRoute.rawValue {
+                let ready = hints.withLock {
+                    $0 += 1; return $0 > 1
+                }
+                return .ok(FakeVSRServer.partitionRouteBody(FakeVSRServer.routeContext, primaryReplica: ready ? 2 : 1, view: ready ? 2 : 1))
+            }
+            return FakeVSRServer.defaultReply(request, address: previous.address)
+        }
+        let client = try await connectedClient(coordinator)
+        let aliases: [Identifier] = [1, "same-stream"]
+        for stream in aliases {
+            _ = try await client.pollMessages(streamID: stream, topicID: 2, partitionID: 0, strategy: .first, count: 1, autoCommit: false)
+        }
+        moved.withLock { $0 = true }
+        for stream in aliases {
+            _ = try await client.pollMessages(streamID: stream, topicID: 2, partitionID: 0, strategy: .first, count: 1, autoCommit: false)
+        }
+        #expect(await requests(previous, .pollMessages).count == 3)
+        #expect(await requests(current, .pollMessages).count == 2)
+        #expect(hints.withLock { $0 } == 3)
+        await client.shutdown()
+    }
 
     /// A backup primary that has not applied the topic yet answers "not
     /// found". The route is looked up again on the metadata primary and the
@@ -1827,7 +1881,8 @@ struct MessagingTests {
             case .getClusterMetadata:
                 return .ok(FakeVSRServer.rosterBody([coordinator.address, first.address, second.address]))
             case .getPartitionRoute:
-                return .ok(FakeVSRServer.partitionRouteBody(FakeVSRServer.routeContext, primaryReplica: moved.withLock { $0 } ? 2 : 1))
+                let hasMoved = moved.withLock { $0 }
+                return .ok(FakeVSRServer.partitionRouteBody(FakeVSRServer.routeContext, primaryReplica: hasMoved ? 2 : 1, view: hasMoved ? 2 : 1))
             default:
                 return FakeVSRServer.defaultReply(request, address: coordinator.address)
             }
