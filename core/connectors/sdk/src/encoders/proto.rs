@@ -778,6 +778,18 @@ mod tests {
     }
 
     #[test]
+    fn given_invalid_field_mappings_when_deserializing_config_should_fail() {
+        let config = config_value_with_field_mappings(serde_json::json!({
+            "id": 123
+        }));
+
+        let error = serde_json::from_value::<ProtoEncoderConfig>(config)
+            .expect_err("non-string field mapping values should be rejected");
+
+        assert!(error.is_data());
+    }
+
+    #[test]
     fn given_unique_json_names_when_deserializing_config_should_preserve_mappings() {
         let expected = HashMap::from([
             ("id".to_string(), "user_id".to_string()),
