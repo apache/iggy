@@ -32,6 +32,7 @@ use server_common::sharding::IggyNamespace;
 pub(super) struct PlacementState {
     observations: AHashMap<IggyNamespace, ObservedView>,
     reservations: AHashMap<(u64, u128), Vec<u64>>,
+    eligible: Option<(u32, Vec<bool>)>,
 }
 
 struct ObservedView {
@@ -40,6 +41,10 @@ struct ObservedView {
 }
 
 impl PlacementState {
+    pub(super) fn observe_replicas(&mut self, view: u32, eligible: &[bool]) {
+        self.eligible = (!eligible.is_empty()).then(|| (view, eligible.to_vec()));
+    }
+
     pub(super) fn observe(&mut self, streams: &Streams, reports: &[PartitionPlacementView]) {
         let () = streams.read(|inner| {
             for report in reports {
@@ -129,12 +134,14 @@ impl PlacementState {
                     }
                     for partition in &topic.partitions {
                         let namespace = IggyNamespace::new(stream_id, topic_id, partition.id);
-                        let report = self.matching_view(namespace, partition)?;
-                        let primary = report.view as usize % replicas;
-                        if !eligible[primary] {
-                            return None;
-                        }
+                        let report = self.matching_view(namespace, partition);
+                        let primary = report.map_or(partition.created_view, |report| report.view)
+                            as usize
+                            % replicas;
                         counts[primary] += 1;
+                        let Some(report) = report.filter(|_| eligible[primary]) else {
+                            continue;
+                        };
                         if first[primary].is_none_or(|first| namespace < first.namespace) {
                             first[primary] = Some(report);
                         }
@@ -196,10 +203,14 @@ impl PlacementState {
         })
     }
 
-    pub(super) fn select(counts: &mut [u64]) -> Result<u32, IggyError> {
+    pub(super) fn select(&self, counts: &mut [u64], view: u32) -> Result<u32, IggyError> {
+        let eligible = self.eligible.as_ref().filter(|(observed_view, eligible)| {
+            *observed_view == view && eligible.len() == counts.len()
+        });
         let (replica, count) = counts
             .iter_mut()
             .enumerate()
+            .filter(|(replica, _)| eligible.is_none_or(|(_, eligible)| eligible[*replica]))
             .min_by_key(|(replica, count)| (**count, *replica))
             .ok_or(IggyError::TransientNotAccepted)?;
         *count += 1;
@@ -435,11 +446,11 @@ mod tests {
             },
         ] {
             placement.observe(&streams, &[stale]);
-            assert!(
-                placement
-                    .primary_rebalance_candidate(&streams, 3, &[true; 3], None)
-                    .is_none()
-            );
+            let transfer = placement
+                .primary_rebalance_candidate(&streams, 3, &[true; 3], None)
+                .unwrap();
+            assert_eq!(transfer.namespace, IggyNamespace::new(0, 1, 0));
+            assert_eq!(transfer.target, 0);
             assert!(
                 placement
                     .partition_placement_view(&streams, namespace, report.created_revision)
@@ -538,11 +549,10 @@ mod tests {
                 ..old_report
             }],
         );
-        assert!(
-            placement
-                .primary_rebalance_candidate(&recreated, 3, &[true; 3], None)
-                .is_none()
-        );
+        let transfer = placement
+            .primary_rebalance_candidate(&recreated, 3, &[true; 3], None)
+            .unwrap();
+        assert_eq!(transfer.namespace, IggyNamespace::new(0, 1, 0));
         assert!(
             placement
                 .partition_placement_view(&recreated, namespace, new_revision)
@@ -566,5 +576,30 @@ mod tests {
                 .partition_placement_view(&recreated, namespace, old_report.created_revision)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn given_an_unavailable_primary_when_other_partitions_are_imbalanced_should_move_a_ready_one() {
+        let (streams, placement) = observed_topics(&[0, 1, 1, 1]);
+        let transfer = placement
+            .primary_rebalance_candidate(&streams, 3, &[false, true, true], None)
+            .unwrap();
+        assert_eq!(transfer.namespace, IggyNamespace::new(0, 1, 0));
+        assert_eq!(transfer.target, 2);
+    }
+
+    #[test]
+    fn given_readiness_from_another_view_when_placing_should_ignore_stale_evidence() {
+        let mut placement = PlacementState::default();
+        placement.observe_replicas(1, &[false, true, true]);
+        assert_eq!(placement.select(&mut [0, 5, 5], 1), Ok(1));
+        assert_eq!(placement.select(&mut [0, 5, 5], 2), Ok(0));
+        placement.observe_replicas(2, &[false; 3]);
+        assert_eq!(
+            placement.select(&mut [0, 5, 5], 2),
+            Err(IggyError::TransientNotAccepted)
+        );
+        placement.observe_replicas(2, &[]);
+        assert_eq!(placement.select(&mut [0, 5, 5], 2), Ok(0));
     }
 }

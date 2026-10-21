@@ -258,6 +258,7 @@ where
         };
         if self.id != 0 || !consensus.is_primary() || !consensus_ready(consensus) {
             self.primary_rebalance.borrow_mut().reset_authority();
+            metadata.observe_replica_readiness(&[]);
             return;
         }
         let mut outgoing = Vec::with_capacity(PROBES_PER_TICK);
@@ -316,6 +317,7 @@ where
             if changed {
                 state.stable_since = now;
                 state.pending = None;
+                metadata.observe_replica_readiness(&state.eligible);
             }
             if let Some(pending) = state.pending.as_ref() {
                 let elapsed = now.duration_since(pending.since);

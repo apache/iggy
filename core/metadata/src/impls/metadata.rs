@@ -4271,6 +4271,16 @@ where
             .observe(self.mux_stm.streams(), reports);
     }
 
+    /// Initial placement uses readiness only within the metadata view that observed it.
+    /// An empty slice clears the evidence when the coordinator loses authority.
+    pub fn observe_replica_readiness(&self, eligible: &[bool]) {
+        if let Some(consensus) = self.consensus.as_ref() {
+            self.placement
+                .borrow_mut()
+                .observe_replicas(consensus.view(), eligible);
+        }
+    }
+
     /// Suggest one count-balancing move only after normal failover has settled.
     /// `after` rotates candidates so a recovering target cannot starve other groups.
     pub fn primary_rebalance_candidate(
@@ -4676,7 +4686,10 @@ where
                             partition_id: u32::try_from(partition_id)
                                 .map_err(|_| IggyError::InvalidCommand)?,
                             consensus_group_id,
-                            initial_view: PlacementState::select(&mut counts)?,
+                            initial_view: self
+                                .placement
+                                .borrow()
+                                .select(&mut counts, consensus.view())?,
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
@@ -4712,7 +4725,10 @@ where
                             partition_id: u32::try_from(offset)
                                 .map_err(|_| IggyError::InvalidCommand)?,
                             consensus_group_id,
-                            initial_view: PlacementState::select(&mut counts)?,
+                            initial_view: self
+                                .placement
+                                .borrow()
+                                .select(&mut counts, consensus.view())?,
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
@@ -6288,6 +6304,30 @@ mod tests {
             .into_iter()
             .map(|partition| partition.initial_view)
             .collect()
+    }
+
+    #[test]
+    fn given_an_offline_replica_when_admitting_creates_should_spread_over_responsive_replicas() {
+        let metadata = placement_metadata();
+        metadata.observe_replica_readiness(&[false, true, true]);
+        let first = metadata
+            .prepare_request(placement_request(1, "first", 4))
+            .unwrap();
+        assert_eq!(assigned_views(&first), [1, 2, 1, 2]);
+        metadata
+            .consensus
+            .as_ref()
+            .unwrap()
+            .pipeline_message(PlaneKind::Metadata, &first);
+        let second = metadata
+            .prepare_request(placement_request(2, "second", 2))
+            .unwrap();
+        assert_eq!(assigned_views(&second), [1, 2]);
+        metadata.observe_replica_readiness(&[true; 3]);
+        let returned = metadata
+            .prepare_request(placement_request(3, "returned", 2))
+            .unwrap();
+        assert_eq!(assigned_views(&returned), [0, 0]);
     }
 
     #[test]

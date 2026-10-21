@@ -120,13 +120,15 @@ Cluster membership, quorum and replica addressing live under `[cluster]`.
 
 New partition primaries are spread across the configured replicas using each
 partition's last observed primary, or its committed initial view before an
-observation arrives. Concurrent creates count pending assignments too. Every
-configured replica remains eligible, including an offline replica; ordinary
-partition failover handles that initial target. After the responsive replica set
+observation arrives. Concurrent creates count pending assignments too. Once
+readiness probes identify responsive replicas, new primaries are assigned only
+to those replicas. Before readiness is known, all configured replicas remain
+eligible. After the responsive replica set
 has been stable for five seconds, the metadata primary balances existing primary
 counts one partition at a time. It confirms the source's committed frontier and
 the target's applied history before requesting a persisted consensus view change.
-Recovering partitions delay transfers. Every replica still stores every partition.
+Recovering partitions are skipped without delaying transfers of other partitions.
+Every replica still stores every partition.
 Balancing primary counts does not balance bytes, throughput or CPU load. A hot
 partition still has one ordering primary.
 
