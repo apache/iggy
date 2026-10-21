@@ -24,6 +24,7 @@ import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.embedded.EmbeddedChannel;
 import org.apache.iggy.exception.IggyErrorCode;
+import org.apache.iggy.exception.IggyNotConnectedException;
 import org.apache.iggy.exception.IggyOperationException;
 import org.apache.iggy.exception.IggyServerException;
 import org.junit.jupiter.api.Test;
@@ -36,6 +37,31 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class ConsensusSessionTest {
     private static final long DEADLINE = TimeUnit.MINUTES.toNanos(1);
+
+    @Test
+    void shouldReportAnUnsentSessionWaitAsDisconnectedAfterReset() {
+        ConsensusSession session = new ConsensusSession();
+        EmbeddedChannel channel = new EmbeddedChannel();
+        long deadline = System.nanoTime() + DEADLINE;
+        try {
+            var ticket = session.acquire(
+                            ConsensusSession.LaneKey.METADATA,
+                            true,
+                            VsrHeaders.HEADER_SIZE,
+                            deadline,
+                            channel.eventLoop())
+                    .join();
+            var waiting = ticket.awaitSession(session.lineage(), deadline, channel.eventLoop());
+            assertThat(waiting).isNotDone();
+
+            session.reset();
+
+            assertThatThrownBy(waiting::join).hasCauseInstanceOf(IggyNotConnectedException.class);
+        } finally {
+            session.reset();
+            channel.finishAndReleaseAll();
+        }
+    }
 
     @Test
     void shouldAdmitLaneWaitersInOrderAfterThreeAdmissionChanges() {

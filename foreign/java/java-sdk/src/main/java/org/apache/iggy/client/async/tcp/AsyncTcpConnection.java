@@ -794,7 +794,8 @@ public class AsyncTcpConnection {
         try {
             synchronized (consensusSession) {
                 synchronized (consensusSession.owner()) {
-                    if (isLoginCommand && failoverState.signedOut()) {
+                    if ((isLoginCommand || VsrOperation.operationForCode(commandCode) == VsrOperation.NON_REPLICATED)
+                            && failoverState.signedOut()) {
                         throw failoverState.lineageEnded(error);
                     }
                     handlePostResponse(channel, commandCode, isLoginCommand, response, error);

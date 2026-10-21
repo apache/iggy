@@ -100,6 +100,12 @@ public final class ConsensusSession {
 
     /** Binds the fence epoch returned by a committed Register reply. */
     void bind(long sessionEpoch) {
+        bindWithoutSignal(sessionEpoch);
+        owner().changed();
+    }
+
+    /** The reply handler signals after releasing the identity-check monitor. */
+    void bindWithoutSignal(long sessionEpoch) {
         ConsensusSession owner;
         synchronized (this) {
             owner = parent;
@@ -115,11 +121,8 @@ public final class ConsensusSession {
             }
         }
         if (owner != null) {
-            owner.bind(sessionEpoch);
-            return;
+            owner.bindWithoutSignal(sessionEpoch);
         }
-        // Wakes the calls that wait for a session, see Ticket#awaitSession.
-        changed();
     }
 
     /**
@@ -601,7 +604,7 @@ public final class ConsensusSession {
         }
     }
 
-    private void changed() {
+    void changed() {
         CompletableFuture<Void> signal;
         synchronized (this) {
             signal = admissionChanged;
@@ -809,12 +812,14 @@ public final class ConsensusSession {
             CompletableFuture<Void> changed = null;
             boolean signedOut;
             boolean ended;
+            boolean written;
             synchronized (owner) {
                 if (result.isDone()) {
                     return;
                 }
                 signedOut = owner.lineage != lineage;
                 ended = completed;
+                written = sent;
                 if (!signedOut && !ended && owner.session == null) {
                     changed = owner.admissionChanged;
                 }
@@ -823,7 +828,9 @@ public final class ConsensusSession {
                 result.completeExceptionally(owner.lineageEnded(lineage, null));
             } else if (ended) {
                 result.completeExceptionally(
-                        new IggyOperationException(IggyErrorCode.OPERATION_NOT_RETAINED, operationId));
+                        written
+                                ? new IggyOperationException(IggyErrorCode.OPERATION_NOT_RETAINED, operationId)
+                                : new IggyNotConnectedException("The connection closed before the request was sent"));
             } else if (changed != null) {
                 changed.thenRun(() -> awaitSession(lineage, result));
             } else {

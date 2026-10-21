@@ -26,6 +26,7 @@ import io.netty.buffer.UnpooledHeapByteBuf;
 import org.apache.iggy.client.async.tcp.vsr.ConsensusSession;
 import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.exception.IggyOperationException;
+import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.partition.PartitionContext;
 import org.apache.iggy.serde.CommandCode;
 import org.junit.jupiter.api.Test;
@@ -665,6 +666,7 @@ class AsyncTcpConnectionConcurrencyTest {
         try (ServerSocket socket = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
             CompletableFuture<Request> observed = new CompletableFuture<>();
             CompletableFuture<Request> registered = new CompletableFuture<>();
+            CompletableFuture<Void> releaseReply = new CompletableFuture<>();
             var serving = CompletableFuture.runAsync(() -> {
                 try (Socket peer = socket.accept()) {
                     Request register = readRequest(peer.getInputStream());
@@ -672,6 +674,7 @@ class AsyncTcpConnectionConcurrencyTest {
                     writeResponse(peer.getOutputStream(), register, registerBody());
                     Request read = readRequest(peer.getInputStream());
                     observed.complete(read);
+                    releaseReply.join();
                     writeResponse(peer.getOutputStream(), read, new byte[0]);
                 } catch (IOException error) {
                     throw new IllegalStateException("Mock VSR server failed", error);
@@ -704,7 +707,11 @@ class AsyncTcpConnectionConcurrencyTest {
                 }
                 payload.releaseEncoding.complete(null);
                 changed.get(5, TimeUnit.SECONDS);
-                read.get(5, TimeUnit.SECONDS).release();
+                releaseReply.complete(null);
+                assertThatThrownBy(() -> read.get(5, TimeUnit.SECONDS))
+                        .hasCauseInstanceOf(IggyServerException.class)
+                        .satisfies(error -> assertThat(((IggyServerException) error.getCause()).getRawErrorCode())
+                                .isEqualTo(IggyErrorCode.UNAUTHENTICATED.getCode()));
                 Request request = observed.get(5, TimeUnit.SECONDS);
                 Request register = registered.get(5, TimeUnit.SECONDS);
                 assertThat(Arrays.copyOfRange(
@@ -714,6 +721,7 @@ class AsyncTcpConnectionConcurrencyTest {
                                 register.header(), REQUEST_CLIENT_OFFSET, REQUEST_CLIENT_OFFSET + CLIENT_ID_BYTES));
                 serving.get(5, TimeUnit.SECONDS);
             } finally {
+                releaseReply.complete(null);
                 payload.releaseEncoding.complete(null);
                 connection.close().get(5, TimeUnit.SECONDS);
             }

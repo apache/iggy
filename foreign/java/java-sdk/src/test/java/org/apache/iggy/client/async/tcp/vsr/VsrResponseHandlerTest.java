@@ -148,6 +148,14 @@ class VsrResponseHandlerTest {
 
     @Test
     void shouldBindSessionOnRegisterReply() throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        var ticket = session.acquire(
+                        ConsensusSession.LaneKey.METADATA, true, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop())
+                .join();
+        var heldMonitor = new AtomicBoolean();
+        var waiting = ticket.awaitSession(session.lineage(), deadline, channel.eventLoop())
+                .thenRun(() -> heldMonitor.set(Thread.holdsLock(session)));
+        assertThat(waiting).isNotDone();
         CompletableFuture<ByteBuf> future = enqueue(VsrOperation.REGISTER, 0);
         ByteBuf body = Unpooled.buffer();
         body.writeIntLE(0); // result section: success
@@ -163,7 +171,10 @@ class VsrResponseHandlerTest {
             assertThat(response.readUnsignedIntLE()).isEqualTo(1);
             assertThat(session.isBound()).isTrue();
             assertThat(session.boundSession()).isEqualTo(99);
+            waiting.get();
+            assertThat(heldMonitor).isFalse();
         } finally {
+            ticket.complete();
             response.release();
         }
     }

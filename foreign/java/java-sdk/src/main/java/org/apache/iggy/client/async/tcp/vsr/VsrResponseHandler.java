@@ -226,6 +226,7 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 && resultCode != VsrHeaders.ERROR_TRANSIENT_NOT_COMMITTED
                 && resultCode != VsrHeaders.ERROR_TRANSIENT_NOT_ACCEPTED
                 && resultCode != IggyErrorCode.NOT_PRIMARY.getCode();
+        boolean sessionBound = false;
         synchronized (session) {
             if (pending.identity.matches(session)) {
                 if (pending.committed
@@ -236,8 +237,12 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 }
                 if (resultCode == 0) {
                     applySessionEffects(frame, operation, bodyStart, bodyLength);
+                    sessionBound = operation == VsrOperation.REGISTER;
                 }
             }
+        }
+        if (sessionBound) {
+            session.owner().changed();
         }
         resetLogoutSession(pending, operation, resultCode);
         if (resultCode != 0) {
@@ -293,7 +298,7 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
             if (bodyLength < REGISTER_BODY_MIN_LEN) {
                 throw IggyServerException.fromTcpResponse(VsrHeaders.ERROR_UNAUTHENTICATED, new byte[0]);
             }
-            session.bind(frame.getLongLE(bodyStart + 4));
+            session.bindWithoutSignal(frame.getLongLE(bodyStart + 4));
         }
     }
 
