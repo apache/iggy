@@ -1419,6 +1419,27 @@ pub fn validate_describe_acls_shape(version: i16, body: &Bytes) -> Result<()> {
     Ok(())
 }
 
+/// Mirrors the field order `DescribeClusterRequest::decode` walks. Every version is flexible.
+///
+/// Fixed-width fields only, and the response echoes none of them, so the walk exists to bound
+/// the tagged fields before `kafka_protocol` reads them.
+///
+/// # Errors
+///
+/// Returns an error when a tagged field's declared length does not fit the remaining frame.
+pub fn validate_describe_cluster_shape(version: i16, body: &Bytes) -> Result<()> {
+    let mut c = ShapeCursor::new(body.clone(), usize::MAX);
+    c.read_bool()?;
+    if version >= 1 {
+        c.read_i8()?;
+    }
+    if version >= 2 {
+        c.read_bool()?;
+    }
+    c.tagged_fields()?;
+    Ok(())
+}
+
 /// `SaslHandshake` carries one non-nullable string, the mechanism name.
 ///
 /// `_version` is unused: the message is never flexible, so v0 and v1 share this shape, and the

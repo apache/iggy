@@ -28,7 +28,9 @@ use kafka_protocol::protocol::StrBytes;
 
 use tokio::time::Instant;
 
-use crate::bridge::{BridgeError, IggyBridge, TopicCreationOutcome};
+use crate::bridge::{
+    BridgeError, DEFAULT_TOPIC_PARTITIONS, IggyBridge, MAX_TOPIC_PARTITIONS, TopicCreationOutcome,
+};
 use crate::error::Result;
 use crate::protocol::api::{
     API_KEY_CREATE_TOPICS, ApiVersionRange, ERROR_INVALID_CONFIG, ERROR_INVALID_PARTITIONS,
@@ -50,20 +52,6 @@ pub const RANGE: ApiVersionRange = ApiVersionRange {
     min_version: 2,
     max_version: 5,
 };
-
-/// KIP-464 `num_partitions = -1` with no manual assignment: the count this bridge creates.
-///
-/// Matches real Kafka's own out-of-box `num.partitions=1` broker default. Not read from any
-/// bridge config - there is no such config surface today.
-const DEFAULT_PARTITION_COUNT: u32 = 1;
-
-/// Iggy's own server-side per-topic partition cap (`rewrite.rs`'s `IggyError::TooManyPartitions`).
-///
-/// Not exported by `iggy::prelude`, so mirrored here as a named constant rather than a bare
-/// literal repeated at every call site. Enforcing it locally means `validate_only` answers the
-/// same rejection the real path would eventually get from the bridge, instead of reporting
-/// `NONE` for a partition count the real path can never actually create.
-const MAX_PARTITIONS_COUNT: u32 = 1000;
 
 pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> HandleOutcome {
     let Some(bridge) = &state.bridge else {
@@ -408,7 +396,7 @@ fn validate_create_topic_shape(topic: &CreatableTopic) -> core::result::Result<u
         {
             return Err(ERROR_INVALID_REPLICA_ASSIGNMENT);
         }
-        return Ok(u32::try_from(topic.assignments.len()).unwrap_or(DEFAULT_PARTITION_COUNT));
+        return Ok(u32::try_from(topic.assignments.len()).unwrap_or(DEFAULT_TOPIC_PARTITIONS));
     }
 
     // Checked ahead of (and separately from) the partition-count check below: that check's own
@@ -418,7 +406,7 @@ fn validate_create_topic_shape(topic: &CreatableTopic) -> core::result::Result<u
     // is the same code the real (non-`validate_only`) path eventually gets back from the bridge
     // once a count this large actually reaches `create_kafka_topic`, so `validate_only` now
     // answers what the real create would.
-    if u32::try_from(topic.num_partitions).is_ok_and(|count| count > MAX_PARTITIONS_COUNT) {
+    if u32::try_from(topic.num_partitions).is_ok_and(|count| count > MAX_TOPIC_PARTITIONS) {
         return Err(ERROR_INVALID_REQUEST);
     }
 
@@ -437,9 +425,9 @@ fn validate_create_topic_shape(topic: &CreatableTopic) -> core::result::Result<u
     }
 
     let partition_count = if topic.num_partitions > 0 {
-        u32::try_from(topic.num_partitions).unwrap_or(DEFAULT_PARTITION_COUNT)
+        u32::try_from(topic.num_partitions).unwrap_or(DEFAULT_TOPIC_PARTITIONS)
     } else {
-        DEFAULT_PARTITION_COUNT
+        DEFAULT_TOPIC_PARTITIONS
     };
     Ok(partition_count)
 }
@@ -574,11 +562,11 @@ mod tests {
     fn broker_default_sentinels_with_no_assignments_resolve_to_the_default_count() {
         assert_eq!(
             validate_create_topic_shape(&creatable_topic(-1, -1)),
-            Ok(DEFAULT_PARTITION_COUNT)
+            Ok(DEFAULT_TOPIC_PARTITIONS)
         );
         assert_eq!(
             validate_create_topic_shape(&creatable_topic(-1, 1)),
-            Ok(DEFAULT_PARTITION_COUNT)
+            Ok(DEFAULT_TOPIC_PARTITIONS)
         );
         assert_eq!(validate_create_topic_shape(&creatable_topic(4, -1)), Ok(4));
     }
@@ -660,10 +648,10 @@ mod tests {
 
     #[test]
     fn partition_count_at_the_cap_is_accepted() {
-        let topic = creatable_topic(i32::try_from(MAX_PARTITIONS_COUNT).unwrap(), 1);
+        let topic = creatable_topic(i32::try_from(MAX_TOPIC_PARTITIONS).unwrap(), 1);
         assert_eq!(
             validate_create_topic_shape(&topic),
-            Ok(MAX_PARTITIONS_COUNT)
+            Ok(MAX_TOPIC_PARTITIONS)
         );
     }
 
@@ -673,7 +661,7 @@ mod tests {
         // condition. This is the same code the real (non-validate_only) path eventually gets
         // back from the bridge once IggyError::TooManyPartitions reaches it
         // (`bridge/error.rs::too_many_partitions_maps_to_invalid_request_not_invalid_partitions`).
-        let topic = creatable_topic(i32::try_from(MAX_PARTITIONS_COUNT).unwrap() + 1, 1);
+        let topic = creatable_topic(i32::try_from(MAX_TOPIC_PARTITIONS).unwrap() + 1, 1);
         assert_eq!(
             validate_create_topic_shape(&topic),
             Err(ERROR_INVALID_REQUEST)

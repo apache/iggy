@@ -68,8 +68,8 @@ use wire::{
 };
 
 #[test]
-fn supported_ranges_table_has_nineteen_entries() {
-    assert_eq!(supported_api_ranges().len(), 19);
+fn supported_ranges_table_has_twenty_entries() {
+    assert_eq!(supported_api_ranges().len(), 20);
 }
 
 #[test]
@@ -109,8 +109,9 @@ fn is_supported_version_matches_scope_table() {
 /// in that order (Produce, Fetch, `ListOffsets`, Metadata, `OffsetCommit`, `OffsetFetch`,
 /// `FindCoordinator`, `JoinGroup`, Heartbeat, `LeaveGroup`, `SyncGroup`, `DescribeGroups`,
 /// `ListGroups`, `ApiVersions`, `CreateTopics`, `DeleteTopics`, `InitProducerId`,
-/// `DescribeConfigs`, `AlterConfigs`). `supported_ranges_table_has_nineteen_entries` and
-/// `is_supported_version_matches_scope_table` pin that both tables cover the same keys.
+/// `DescribeConfigs`, `AlterConfigs`, `DescribeCluster`).
+/// `supported_ranges_table_has_twenty_entries` and `is_supported_version_matches_scope_table` pin
+/// that both tables cover the same keys.
 #[tokio::test]
 async fn apiversions_advertises_exact_supported_ranges_v1() {
     let body = handle_request(API_KEY_API_VERSIONS, 1, Bytes::new(), &default_broker())

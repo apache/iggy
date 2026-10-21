@@ -18,7 +18,8 @@
 //! Shard 0 listener start-up and the accept-fn factories.
 
 use crate::boot::credentials::{
-    load_quic_server_credentials, load_tcp_tls_server_credentials, load_wss_server_credentials,
+    RootCredentials, initialize_root_user, load_quic_server_credentials,
+    load_tcp_tls_server_credentials, load_wss_server_credentials,
 };
 use crate::boot::topology::{
     TcpTopology, client_listeners, derived_address_misses_listener, derived_bind_ip,
@@ -55,7 +56,7 @@ pub(in crate::boot) struct LocalClientAcceptFns {
     wss: AcceptedWssClientFn,
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(in crate::boot) async fn start_tcp_runtime(
     shard: &Rc<ServerShard>,
     session_liveness: Rc<std::cell::RefCell<crate::consumer_group::lease::ConsumerGroupLiveness>>,
@@ -67,7 +68,20 @@ pub(in crate::boot) async fn start_tcp_runtime(
     accepted_clients: LocalClientAcceptFns,
     connections: &Rc<ConnectionCap>,
     shard_metrics_all: &[ShardMetrics],
+    root_credentials: Option<&RootCredentials>,
 ) -> Result<(), ServerError> {
+    if topology.replica_count == 1 {
+        initialize_root_user(
+            shard,
+            root_credentials,
+            shard.bus.token(),
+            compio::time::sleep,
+        )
+        .await?;
+        if shard.bus.token().is_triggered() {
+            return Ok(());
+        }
+    }
     // HTTP is served over TCP but sits outside the replica_io / manual client
     // reactor, so it binds on its own. Config first, so a bad `[http.*]`
     // section fails boot before any listener accepts. Socket only after the
@@ -159,6 +173,17 @@ pub(in crate::boot) async fn start_tcp_runtime(
             connections,
             shard_metrics_all,
         )?;
+    }
+
+    initialize_root_user(
+        shard,
+        root_credentials,
+        shard.bus.token(),
+        compio::time::sleep,
+    )
+    .await?;
+    if !shard.bus.token().is_triggered() {
+        info!("Root user initialization complete.");
     }
 
     Ok(())

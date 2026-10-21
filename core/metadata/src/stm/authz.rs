@@ -156,10 +156,8 @@ impl GatedApply for MuxStateMachine<variadic!(Users, Streams)> {
 
 /// The root user is always the first user created (slab id 0) and holds every
 /// grant. Short-circuited below rather than checked against the permissioner:
-/// server-originated ops carry `user_id` 0 with no session, and WAL replay
-/// gates committed ops before the unreplicated root bootstrap
-/// (`ensure_root_user`) has populated the permissioner, so the gate must not
-/// depend on permissioner contents.
+/// server-originated ops carry `user_id` 0 with no session. Initial root
+/// creation is one such operation and precedes permissioner population.
 const ROOT_USER_ID: u32 = 0;
 
 /// Decides whether the acting user may run this committed op.
