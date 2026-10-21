@@ -46,7 +46,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-const PROBE_INTERVAL: Duration = Duration::from_secs(1);
+pub const PROBE_INTERVAL: Duration = Duration::from_secs(1);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const STABLE_INTERVAL: Duration = Duration::from_secs(5);
 const GRANT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -577,6 +577,7 @@ where
         let consensus = partition.consensus();
         let actions = consensus.request_primary_transfer(request.expected_view, request.target);
         if actions.is_empty() {
+            request.active.store(true, Ordering::Release);
             return;
         }
         tracing::info!(

@@ -5642,13 +5642,11 @@ where
         ) {
             return;
         }
-        if let Some(PendingPartitionTransition::PrimaryTransfer { request, drain }) =
+        if let Some(PendingPartitionTransition::PrimaryTransfer { drain, .. }) =
             self.transition.take()
+            && let (Some(persistence), Some(drain)) = (&self.persistence, drain)
         {
-            request.active.store(false, Ordering::Release);
-            if let (Some(persistence), Some(drain)) = (&self.persistence, drain) {
-                persistence.finish_drain(&drain);
-            }
+            persistence.finish_drain(&drain);
         }
         self.notify_io();
     }
@@ -5886,7 +5884,8 @@ where
         if matches!(
             self.transition,
             Some(PendingPartitionTransition::PrimaryTransfer { .. })
-        ) && self.consensus.commit_min() < self.consensus.commit_max()
+        ) && (self.consensus.commit_min() < self.consensus.commit_max()
+            || self.consensus.is_primary() && !self.consensus.pipeline_is_empty())
         {
             // Commit selection refuses history transitions. This synchronous
             // window keeps admission fenced between pump events while draining
@@ -14473,9 +14472,16 @@ mod tests {
         partition
             .consensus
             .set_last_prepare_checksum(header.checksum);
-        partition.consensus.advance_commit_max(header.op);
         assert_eq!(partition.consensus.commit_min(), 1);
         assert!(partition.defer_primary_transfer(primary_transfer_grant(&partition)));
+        assert!(
+            matches!(
+                partition.resume_io(&config).await,
+                crate::PartitionIoStep::Pending
+            ),
+            "an accepted prepare must finish before the primary hands off"
+        );
+        partition.consensus.advance_commit_max(header.op);
         let mut finished = false;
         for _ in 0..STEPS_MAX {
             match partition.resume_io(&config).await {
@@ -14517,7 +14523,10 @@ mod tests {
                 header.replica = 1;
             });
         partition.defer_view_transition(server_common::MessageBag::StartView(message));
-        assert!(!active.load(Ordering::Acquire));
+        assert!(
+            active.load(Ordering::Acquire),
+            "cancellation must leave the unused grant available to expire"
+        );
         partition.cancel_primary_transfer();
         assert!(matches!(
             partition.transition,

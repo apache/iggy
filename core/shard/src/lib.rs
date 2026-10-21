@@ -8691,6 +8691,11 @@ where
             self.partition_placement_cursor.set(None);
             return;
         }
+        if !u128::from(self.ticks.get().saturating_sub(1))
+            .is_multiple_of(PARTITION_PLACEMENT_REPORT_INTERVAL_TICKS)
+        {
+            return;
+        }
         let Some(sender) = self.senders.first() else {
             return;
         };
@@ -11441,7 +11446,11 @@ const PARTITION_REPAIRS_INFLIGHT_MAX: usize = 8;
 /// `ceil(groups / cap)` ticks however many groups are owed at once.
 const PARTITION_WALKS_PER_TICK_MAX: usize = 16;
 
-/// One lifecycle batch per tick; the cursor also bounds visits to ineligible groups.
+/// Placement observations need only keep pace with rebalance probes.
+const PARTITION_PLACEMENT_REPORT_INTERVAL_TICKS: u128 =
+    primary_rebalance::PROBE_INTERVAL.as_millis() / CONSENSUS_TICK_INTERVAL.as_millis();
+
+/// One lifecycle batch per report interval; the cursor also bounds visits to ineligible groups.
 const PARTITION_PLACEMENT_REPORTS_PER_TICK_MAX: usize = 64;
 
 /// Floor under the gap detector's debounce, in ticks.
@@ -15332,6 +15341,27 @@ mod partition_placement_tests {
         };
         assert!(inbox.try_recv().is_err(), "at most one batch per sweep");
         reports
+    }
+
+    #[compio::test]
+    async fn given_unchanged_placement_when_ticks_advance_should_report_at_probe_intervals() {
+        let (shard, inbox) = owner(1);
+        insert(&shard, 0, 7, 0);
+        shard.ticks.set(1);
+        publish(&shard);
+        assert_eq!(receive(&inbox).len(), 1);
+        let interval = u64::try_from(PARTITION_PLACEMENT_REPORT_INTERVAL_TICKS).unwrap();
+        for tick in 2..=interval {
+            shard.ticks.set(tick);
+            publish(&shard);
+            assert!(
+                inbox.try_recv().is_err(),
+                "placement report repeated at tick {tick}"
+            );
+        }
+        shard.ticks.set(interval + 1);
+        publish(&shard);
+        assert_eq!(receive(&inbox).len(), 1);
     }
 
     #[compio::test]
