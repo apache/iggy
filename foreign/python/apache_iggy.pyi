@@ -1215,6 +1215,28 @@ class IggyClient:
                 authenticated, the user lacks the permission, or the request
                 fails.
         """
+    def snapshot(
+        self, compression: builtins.str, snapshot_types: typing.Sequence[builtins.str]
+    ) -> collections.abc.Awaitable[bytes]:
+        r"""
+        Capture a diagnostic snapshot of the server as a compressed ZIP archive.
+
+        Args:
+            compression: Archive compression method. One of `"stored"`,
+                `"deflated"`, `"bzip2"`, `"zstd"`, `"lzma"`, `"xz"`.
+            snapshot_types: Data to include in the snapshot. Each entry is one
+                of `"filesystem_overview"`, `"process_list"`, `"resource_usage"`,
+                `"test"`, `"server_logs"`, `"server_config"`, `"all"`.
+
+        Returns:
+            An awaitable that resolves to the ZIP archive `bytes`.
+
+        Raises:
+            ValueError: If `compression` is empty or unknown, `snapshot_types`
+                is empty, or any entry in `snapshot_types` is unknown.
+            RuntimeError: If the client is not connected, the session is not
+                authenticated, or the request fails.
+        """
     def describe_options(
         self, scope: builtins.str
     ) -> collections.abc.Awaitable[list[OptionSpec]]:
