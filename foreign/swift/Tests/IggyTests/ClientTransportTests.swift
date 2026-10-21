@@ -115,6 +115,53 @@ private func pingCount(_ server: FakeVSRServer) async -> Int {
 
 @Suite("Client transport", .serialized)
 struct ClientTransportTests {
+    @Test(arguments: [false, true])
+    func aCallStartedBeforeDisconnectEndsUnauthenticated(singleAttempt: Bool) async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let client = makeClient(server)
+        defer { Task { await client.shutdown() } }
+        try await client.connect()
+        let lineage = await client.core.lineage
+        await client.disconnect()
+
+        await expectCode(.unauthenticated) {
+            if singleAttempt {
+                _ = try await client.core.exchangeOnce(code: CommandCode.ping.rawValue, payload: [], context: .empty, lineage: lineage)
+            } else {
+                _ = try await client.core.exchange(code: CommandCode.ping.rawValue, payload: [], lineage: lineage)
+            }
+        }
+        await expectCode(.notConnected) { try await client.ping() }
+        #expect(await pingCount(server) == 0)
+    }
+
+    @Test func aCallWaitingForReconnectEndsUnauthenticatedWhenTheCallerDisconnects() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let client = makeClient(server)
+        defer { Task { await client.shutdown() } }
+        try await client.connect()
+        await client.core.disconnectTransport()
+        let signingIn = Locked(false)
+        let released = Locked(false)
+        await server.respond { request in
+            if request.code == CommandCode.bindSession.rawValue { return .status(IggyErrorCode.unauthenticated.rawValue) }
+            if request.operation == .register {
+                signingIn.withLock { $0 = true }
+                _ = await eventually { released.withLock { $0 } }
+            }
+            return FakeVSRServer.defaultReply(request, address: server.address)
+        }
+        let call = Task { try await client.getStreams() }
+        #expect(await eventually { signingIn.withLock { $0 } })
+        await client.disconnect()
+        released.withLock { $0 = true }
+
+        await expectCode(.unauthenticated) { _ = try await call.value }
+        #expect(await server.requests.allSatisfy { $0.code != CommandCode.getStreams.rawValue })
+    }
+
     @Test func loginBindsTheSessionAndSequencesRequests() async throws {
         let server = try await FakeVSRServer.started()
         defer { Task { await server.stop() } }

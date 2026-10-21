@@ -185,10 +185,10 @@ actor ClientCore {
         code: UInt32, payload: [UInt8], context: PartitionContext = .empty, deadline limit: ContinuousClock.Instant? = nil,
         lineage captured: UInt64? = nil
     ) async throws -> [UInt8] {
-        if disconnectedByCaller {
-            throw IggyError(state == .shutdown ? .clientShutdown : .notConnected)
-        }
+        if state == .shutdown { throw IggyError(.clientShutdown) }
         let lineage = captured ?? lineage
+        if let refusal = lineageRefusal(lineage, code: code) { throw refusal }
+        if disconnectedByCaller { throw IggyError(.notConnected) }
         let deadline = requestDeadline(within: limit)
         var outcome = RetryOutcome()
         var backoff = PollRouter.Backoff()
@@ -308,9 +308,9 @@ actor ClientCore {
     func exchangeOnce(
         code: UInt32, payload: [UInt8], context: PartitionContext, deadline limit: ContinuousClock.Instant? = nil, lineage captured: UInt64? = nil
     ) async throws -> [UInt8] {
-        if disconnectedByCaller || state == .shutdown {
-            throw IggyError(state == .shutdown ? .clientShutdown : .notConnected)
-        }
+        if state == .shutdown { throw IggyError(.clientShutdown) }
+        if let refusal = lineageRefusal(captured ?? lineage, code: code) { throw refusal }
+        if disconnectedByCaller { throw IggyError(.notConnected) }
         var request: VSRFrame.EncodedRequest?
         var epoch = connectionEpoch
         var outcome = RetryOutcome()
@@ -381,11 +381,12 @@ actor ClientCore {
 
     /// The refusal of a call that started under `captured` once the caller
     /// signed in or out since: nothing of it may be written any more.
-    func lineageRefusal(_ captured: UInt64, code: UInt32) -> IggyError? {
+    func lineageRefusal(_ captured: UInt64, code: UInt32? = nil) -> IggyError? {
         guard captured != lineage else {
             return nil
         }
-        return IggyError(.unauthenticated, context: "the caller signed in or out after command \(code) was issued")
+        let context = code.map { "after command \($0) was issued" } ?? "while the call was waiting"
+        return IggyError(.unauthenticated, context: "the caller signed in or out \(context)")
     }
 
     /// Dials `address` with the client's TLS, for a data connection. A host
@@ -423,9 +424,14 @@ actor ClientCore {
                     reconnected = try await withDeadline(ContinuousClock.now + configuration.requestTimeout) { [self] in
                         try await self.connect()
                     }
-                } catch let error as IggyError where error.isCredentialRejection {
-                    throw started == lineage ? Self.signInRefused(error) : error
+                } catch {
+                    if let refusal = lineageRefusal(started) { throw refusal }
+                    if let refusal = error as? IggyError, refusal.isCredentialRejection {
+                        throw Self.signInRefused(refusal)
+                    }
+                    throw error
                 }
+                if let refusal = lineageRefusal(started) { throw refusal }
                 if reconnected == nil {
                     throw IggyError(.transientNotAccepted, context: "could not reconnect within the request timeout")
                 }

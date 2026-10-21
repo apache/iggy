@@ -1776,8 +1776,8 @@ struct MessagingTests {
         #expect(Set(attempts.map(\.requestID)).count == 1)
     }
 
-    @Test(arguments: [1, 3])
-    func anUncommittedOffsetWriteReplaysAcrossLostDataConnections(_ losses: Int) async throws {
+    @Test(arguments: [1, 3], [false, true])
+    func anOffsetWriteReplaysAcrossLostDataConnections(_ losses: Int, refusedFirst: Bool) async throws {
         let primary = try await FakeVSRServer.started()
         let coordinator = try await Self.coordinator(routingTo: primary)
         defer {
@@ -1791,7 +1791,7 @@ struct MessagingTests {
                 let attempt = attempts.withLock {
                     $0 += 1; return $0
                 }
-                if attempt <= losses { return .statusThenClose(IggyErrorCode.transientNotCommitted.rawValue) }
+                if attempt <= losses { return refusedFirst ? .statusThenClose(IggyErrorCode.transientNotCommitted.rawValue) : .close }
             }
             return FakeVSRServer.defaultReply(request, address: primary.address)
         }

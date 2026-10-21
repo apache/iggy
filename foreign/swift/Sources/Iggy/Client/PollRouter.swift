@@ -455,8 +455,11 @@ final class PollRouter: Sendable {
                 data.consumerSession = nil
             }
             slot.connection.withLockedValue { $0 = data }
-            if replay.outcome.isUncertain, error.isConnectionLoss, error.code != .staleClient {
-                throw error
+            if error.isConnectionLoss, error.code != .staleClient {
+                if replay.frame?.operation.isPartition == true, error.code != .notConnected, error.code != .cannotEstablishConnection {
+                    replay.outcome.markUncertain()
+                }
+                if replay.outcome.isUncertain { throw error }
             }
             throw Self.gradedLoss(ClientCore.graded(error), on: endpoint)
         }
@@ -567,7 +570,7 @@ final class PollRouter: Sendable {
                     // its session: either way the request is lost with the
                     // connection, not refused.
                     await connection.close()
-                    throw IggyError(.disconnected, context: "\(refusal)")
+                    throw IggyError(.transientNotCommitted, context: "\(refusal)")
                 }
                 answer = refusal
             }
