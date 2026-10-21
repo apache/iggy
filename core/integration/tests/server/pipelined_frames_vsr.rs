@@ -246,7 +246,10 @@ async fn seed_poll_messages(harness: &mut TestHarness) -> PartitionContext {
     let client = harness.tcp_root_client().await.unwrap();
     let stream = Identifier::named(STREAM).unwrap();
     let topic = Identifier::named(TOPIC).unwrap();
-    client.create_stream(STREAM).await.unwrap();
+    client
+        .create_stream(STREAM, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     client
         .create_topic(
             &stream,

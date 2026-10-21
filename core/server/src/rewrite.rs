@@ -39,28 +39,33 @@ use crate::pat::{maybe_rewrite_pat_request, rewrite_pat_request_for_user};
 use crate::segment_cleaner::UNENFORCEABLE_TOPIC_SIZE_WARN;
 use crate::session_manager::SessionManager;
 use crate::shell::{ShellBus, ShellShard};
+use crate::stream_keys::maybe_rewrite_secret_options_request;
 use crate::users::maybe_rewrite_user_password_request;
-use crate::wire::request_body;
-use consensus::MetadataHandle;
+use crate::wire::{request_body, rewrite_request_body};
+use consensus::{MetadataHandle, PartitionsHandle};
 use iggy_binary_protocol::requests::partitions::{
     CreatePartitionsRequest, DeletePartitionsRequest,
 };
-use iggy_binary_protocol::requests::streams::{CreateStreamRequest, UpdateStreamRequest};
-use iggy_binary_protocol::requests::topics::{CreateTopicRequest, UpdateTopicRequest};
-use iggy_binary_protocol::requests::users::{CreateUserRequest, UpdateUserRequest};
+use iggy_binary_protocol::requests::streams::CreateStreamRequest;
+use iggy_binary_protocol::requests::system::{ResourceTarget, UpdateResourceRequest};
+use iggy_binary_protocol::requests::topics::CreateTopicRequest;
+use iggy_binary_protocol::requests::users::CreateUserRequest;
 use iggy_binary_protocol::{
     MAX_PARTITIONS_PER_REQUEST, Operation, PrepareHeader, RoutedRequestHeader, WireDecode,
-    WireIdentifier, WireOptions,
+    WireEncode, WireIdentifier, WireOptions,
 };
+use iggy_common::wire_conversions::resource_options_to_wire;
 use iggy_common::{
-    IggyByteSize, IggyError, MaxTopicSize, TopicCreateOptions, UPDATABLE_STREAM_OPTION_KEYS,
-    UPDATABLE_TOPIC_OPTION_KEYS, UPDATABLE_USER_OPTION_KEYS, validate_preallocated_topic_bytes,
+    AdmittedOptions, IggyByteSize, IggyError, MaxTopicSize, OptionAdmissionContext, OptionColumns,
+    OptionOperation, OptionsProvenance, OptionsScope, ResourceOptions, TopicCreateOptions,
+    TopicResolvedOptions, UserStatus, admit, derived_defaults, validate_preallocated_topic_bytes,
     validate_topic_segment_size,
 };
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::stream::Streams;
+use metadata::stm::user::Users;
 use server_common::Message;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -72,6 +77,7 @@ pub enum RewriteStage {
     PersonalAccessToken,
     UserPassword,
     StaticBounds,
+    SecretOptions,
     ConsumerGroup,
 }
 
@@ -84,6 +90,7 @@ impl RewriteStage {
             Self::PersonalAccessToken => "personal_access_token",
             Self::UserPassword => "user_password",
             Self::StaticBounds => "static_bounds",
+            Self::SecretOptions => "secret_options",
             Self::ConsumerGroup => "consumer_group",
         }
     }
@@ -98,13 +105,14 @@ pub struct RewriteDeny {
 
 /// The TCP funnel's pre-consensus rewrite chain, in order: the PAT rewrite
 /// (resolving the acting user from the transport `sessions` binding), the
-/// password rewrite, the static bounds gate, then the consumer-group
-/// Join/Leave identity rewrite ([`crate::consumer_group`]). Mirrors
-/// [`http_chain`] plus the bounds step, which the binary wire needs because
-/// it has no `command.validate()` layer, and the group step, which only the
-/// binary wire serves. Returns the rewritten request and the raw PAT token
-/// the funnel substitutes into the committed reply; a rejection names the
-/// failing stage for the deny log line.
+/// password rewrite, the static bounds gate (which also replaces a stream or
+/// user create's options with the admitted canonical block), the secret
+/// options rewrite that wraps or generates a stream key, then the
+/// consumer-group Join/Leave identity rewrite ([`crate::consumer_group`]).
+/// Mirrors [`http_chain`] plus the group step, which only the binary wire
+/// serves. Returns the rewritten request and the raw PAT token the funnel
+/// substitutes into the committed reply. A rejection names the failing stage
+/// for the deny log line.
 pub fn tcp_chain<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
@@ -135,10 +143,16 @@ where
             stage: RewriteStage::UserPassword,
             error,
         })?;
-    static_bounds(shard, &request).map_err(|error| RewriteDeny {
+    let request = static_bounds(shard, request).map_err(|error| RewriteDeny {
         stage: RewriteStage::StaticBounds,
         error,
     })?;
+    let request =
+        maybe_rewrite_secret_options_request(&shard.plane.partitions().key_context(), request)
+            .map_err(|error| RewriteDeny {
+                stage: RewriteStage::SecretOptions,
+                error,
+            })?;
     let request = maybe_rewrite_consumer_group_request(request).map_err(|error| RewriteDeny {
         stage: RewriteStage::ConsumerGroup,
         error,
@@ -147,12 +161,13 @@ where
 }
 
 /// The HTTP submit's pre-consensus rewrite chain: the PAT rewrite for the
-/// already-authenticated `user_id`, then the password rewrite. Mirrors
+/// already-authenticated `user_id`, the password rewrite, the same static
+/// bounds as [`tcp_chain`], so both transports admit options through one
+/// catalog gate and answer the same request with the same error, then the
+/// secret options rewrite. Mirrors
 /// [`tcp_chain`] minus the session lookup (the HTTP listener authenticates
-/// against its own session table and resolves the acting user itself),
-/// minus the static bounds step (HTTP enforces the same bounds in its
-/// handlers via `command.validate()` plus the validators below), and minus
-/// the group step, because HTTP serves no join or leave. Returns the
+/// against its own session table and resolves the acting user itself) and
+/// minus the group step, because HTTP serves no join or leave. Returns the
 /// rewritten request and the raw PAT token the caller substitutes into the
 /// committed reply.
 pub fn http_chain<B, MJ, S, SB>(
@@ -169,6 +184,9 @@ where
 {
     let (request, raw_token) = rewrite_pat_request_for_user(user_id, request)?;
     let request = maybe_rewrite_user_password_request(shard, request)?;
+    let request = static_bounds(shard, request)?;
+    let request =
+        maybe_rewrite_secret_options_request(&shard.plane.partitions().key_context(), request)?;
     Ok((request, raw_token))
 }
 
@@ -314,30 +332,17 @@ pub fn warn_unenforceable_topic_size_on_partition_add(
     );
 }
 
-/// Reject option keys outside the resource's catalog, pre-consensus. Unknown
-/// keys are rejected rather than skipped: a silently ignored knob would hand
-/// the client server defaults without it ever learning. Streams and users
-/// have no catalog keys yet, so `known` is empty for both until one lands.
-pub fn validate_option_keys(options: &WireOptions, known: &[&str]) -> Result<(), IggyError> {
-    for entry in options {
-        // Wire validation already enforced UTF-8 string keys.
-        let key = String::from_utf8_lossy(entry.key);
-        if !known.contains(&key.as_ref()) {
-            return Err(IggyError::UnsupportedOptionKey(key.into_owned()));
-        }
-    }
-    Ok(())
-}
-
 /// Static bounds run pre-consensus so a rejected request burns no
-/// replicated log entry; HTTP covers the same bounds via
-/// `command.validate()`. A body that fails to decode denies typed too
-/// (`InvalidCommand`), instead of riding consensus just to fail there.
-#[allow(clippy::too_many_lines)]
+/// replicated log entry. Both chains run them, so every option block passes
+/// the same catalog admission whatever the transport. A body that fails to
+/// decode denies typed too (`InvalidCommand`), instead of riding consensus
+/// just to fail there. A stream or user create leaves with the admitted
+/// canonical options, so apply stores one kind per key whatever the client
+/// sent.
 fn static_bounds<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    request: &Message<RoutedRequestHeader>,
-) -> Result<(), IggyError>
+    request: Message<RoutedRequestHeader>,
+) -> Result<Message<RoutedRequestHeader>, IggyError>
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -346,31 +351,33 @@ where
     SB: SuperblockStore + 'static,
 {
     match request.header().operation {
-        Operation::CreateTopic => CreateTopicRequest::decode_from(request_body(request))
+        Operation::CreateTopic => CreateTopicRequest::decode_from(request_body(&request))
             .map_err(|_| IggyError::InvalidCommand)
             .and_then(|create_topic| {
-                // `parse` doubles as the catalog gate: an unknown key or a
-                // malformed value denies typed here, pre-consensus.
-                let options = TopicCreateOptions::parse(&create_topic.options)?;
-                if let Some(segment_size) = options.segment_size {
+                let admitted = admit_create(
+                    OptionsScope::Topic,
+                    &create_topic.options,
+                    OptionColumns {
+                        name: Some(create_topic.name.as_str().to_owned()),
+                        ..OptionColumns::default()
+                    },
+                )?;
+                if let Some(segment_size) =
+                    TopicCreateOptions::from_resource_options(&admitted.explicit).segment_size
+                {
                     validate_topic_segment_size(
                         segment_size.as_bytes_u64(),
                         iggy_common::MAX_TOPIC_SEGMENT_SIZE,
                     )?;
                 }
-                let segment_size = options.segment_size.map_or_else(
-                    || iggy_common::DEFAULT_SEGMENT_SIZE,
-                    |segment_size| segment_size.as_bytes_u64(),
-                );
-                if options
-                    .preallocate_segments
-                    .unwrap_or(iggy_common::DEFAULT_PREALLOCATE_SEGMENTS)
-                {
+                let mut stored = derived_defaults(OptionsScope::Topic, &admitted.explicit)?;
+                stored.extend(admitted.explicit);
+                let resolved = TopicResolvedOptions::from(&stored);
+                let segment_size = resolved.runtime.effective_segment_size().as_bytes_u64();
+                if resolved.runtime.preallocate_segments == Some(true) {
                     validate_preallocated_topic_bytes(segment_size, create_topic.partitions_count)?;
                 }
-                let max_topic_size = options
-                    .max_topic_size
-                    .unwrap_or(MaxTopicSize::ServerDefault);
+                let max_topic_size = resolved.max_topic_size;
                 validate_topic_bounds(create_topic.partitions_count, max_topic_size, segment_size)?;
                 warn_unenforceable_topic_size(
                     max_topic_size,
@@ -379,8 +386,8 @@ where
                     create_topic.partitions_count,
                 );
                 Ok(())
-            }),
-        Operation::CreatePartitions => CreatePartitionsRequest::decode_from(request_body(request))
+            })?,
+        Operation::CreatePartitions => CreatePartitionsRequest::decode_from(request_body(&request))
             .map_err(|_| IggyError::InvalidCommand)
             .and_then(|create_partitions| {
                 validate_partitions_change_count(create_partitions.partitions_count)?;
@@ -393,70 +400,499 @@ where
                     create_partitions.partitions_count,
                 );
                 Ok(())
-            }),
-        Operation::DeletePartitions => DeletePartitionsRequest::decode_from(request_body(request))
+            })?,
+        Operation::DeletePartitions => DeletePartitionsRequest::decode_from(request_body(&request))
             .map_err(|_| IggyError::InvalidCommand)
             .and_then(|delete_partitions| {
                 validate_partitions_change_count(delete_partitions.partitions_count)
-            }),
-        // Only the updatable subset: the create-time knobs are pushed to
-        // partitions when the topic is built and nothing re-pushes them, so
-        // accepting one here would store a value no partition ever sees.
-        Operation::UpdateTopic => UpdateTopicRequest::decode_from(request_body(request))
+            })?,
+        Operation::UpdateResource => UpdateResourceRequest::decode_from(request_body(&request))
             .map_err(|_| IggyError::InvalidCommand)
-            .and_then(|update_topic| {
-                validate_option_keys(&update_topic.options, UPDATABLE_TOPIC_OPTION_KEYS)?;
-                let options = TopicCreateOptions::parse(&update_topic.options)?;
-                let Some(max_topic_size) = options.max_topic_size else {
-                    return Ok(());
-                };
-                // An update can lower the cap below one segment just as a
-                // create can, and the stored map would then report a size the
-                // topic can never enforce. The floor is this topic's own
-                // segment size, since that key is create-only.
-                let metadata = shard.plane.metadata();
-                let streams = metadata.mux_stm.streams();
-                let segment_size = streams
-                    .topic_segment_size(&update_topic.stream_id, &update_topic.topic_id)
-                    .map_or_else(
-                        || iggy_common::DEFAULT_SEGMENT_SIZE,
-                        |segment_size| segment_size.as_bytes_u64(),
-                    );
-                validate_topic_size_floor(max_topic_size, segment_size)?;
-                let partitions_count = streams
-                    .topic_partitions_count(&update_topic.stream_id, &update_topic.topic_id)
-                    .unwrap_or(0);
-                warn_unenforceable_topic_size(
-                    max_topic_size,
-                    segment_size,
-                    shard.bus_max_message_size(),
-                    u32::try_from(partitions_count).unwrap_or(u32::MAX),
-                );
-                Ok(())
-            }),
-        Operation::UpdateStream => UpdateStreamRequest::decode_from(request_body(request))
-            .map_err(|_| IggyError::InvalidCommand)
-            .and_then(|update_stream| {
-                validate_option_keys(&update_stream.options, UPDATABLE_STREAM_OPTION_KEYS)
-            }),
-        Operation::UpdateUser => UpdateUserRequest::decode_from(request_body(request))
-            .map_err(|_| IggyError::InvalidCommand)
-            .and_then(|update_user| {
-                validate_option_keys(&update_user.options, UPDATABLE_USER_OPTION_KEYS)
-            }),
-        Operation::CreateStream => CreateStreamRequest::decode_from(request_body(request))
-            .map_err(|_| IggyError::InvalidCommand)
-            .and_then(|create_stream| validate_option_keys(&create_stream.options, &[])),
-        Operation::CreateUser => CreateUserRequest::decode_from(request_body(request))
-            .map_err(|_| IggyError::InvalidCommand)
-            .and_then(|create_user| validate_option_keys(&create_user.options, &[])),
-        _ => Ok(()),
+            .and_then(|patch| patch_bounds(shard, &patch))?,
+        Operation::CreateStream => {
+            let mut create_stream = CreateStreamRequest::decode_from(request_body(&request))
+                .map_err(|_| IggyError::InvalidCommand)?;
+            let admitted = admit_create(
+                OptionsScope::Stream,
+                &create_stream.options,
+                OptionColumns {
+                    name: Some(create_stream.name.as_str().to_owned()),
+                    ..OptionColumns::default()
+                },
+            )?;
+            if let Some(options) = canonical_block(&create_stream.options, &admitted)? {
+                create_stream.options = options;
+                return rewrite_request_body(&request, &create_stream.to_bytes());
+            }
+        }
+        Operation::CreateUser => {
+            let mut create_user = CreateUserRequest::decode_from(request_body(&request))
+                .map_err(|_| IggyError::InvalidCommand)?;
+            let admitted = admit_create(
+                OptionsScope::User,
+                &create_user.options,
+                OptionColumns {
+                    username: Some(create_user.username.as_str().to_owned()),
+                    ..OptionColumns::default()
+                },
+            )?;
+            UserStatus::from_code(create_user.status).map_err(|_| IggyError::InvalidUserStatus)?;
+            if let Some(options) = canonical_block(&create_user.options, &admitted)? {
+                create_user.options = options;
+                return rewrite_request_body(&request, &create_user.to_bytes());
+            }
+        }
+        _ => {}
     }
+    Ok(request)
+}
+
+/// The admitted canonical block when it differs from what the client sent.
+fn canonical_block(
+    client: &WireOptions,
+    admitted: &AdmittedOptions,
+) -> Result<Option<WireOptions>, IggyError> {
+    let canonical = resource_options_to_wire(&admitted.explicit, OptionsProvenance::All)?;
+    Ok((canonical.as_bytes() != client.as_bytes()).then_some(canonical))
+}
+
+/// Catalog admission for a generic patch, plus the floor a topic size cap
+/// keeps against the topic's own segment size.
+fn patch_bounds<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    patch: &UpdateResourceRequest,
+) -> Result<(), IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let metadata = shard.plane.metadata();
+    let admitted = admit_patch(
+        patch,
+        stored_options(
+            metadata.mux_stm.streams(),
+            metadata.mux_stm.users(),
+            &patch.target,
+        ),
+    )?;
+    let ResourceTarget::Topic {
+        stream_id,
+        topic_id,
+    } = &patch.target
+    else {
+        return Ok(());
+    };
+    let Some(max_topic_size) =
+        TopicCreateOptions::from_resource_options(&admitted.explicit).max_topic_size
+    else {
+        return Ok(());
+    };
+    // An update can lower the cap below one segment just as a create can, and
+    // the stored map would then report a size the topic can never enforce. The
+    // floor is this topic's own segment size, since that key is create-only.
+    let streams = metadata.mux_stm.streams();
+    let segment_size = streams.topic_segment_size(stream_id, topic_id).map_or_else(
+        || iggy_common::DEFAULT_SEGMENT_SIZE,
+        |segment_size| segment_size.as_bytes_u64(),
+    );
+    validate_topic_size_floor(max_topic_size, segment_size)?;
+    let partitions_count = streams
+        .topic_partitions_count(stream_id, topic_id)
+        .unwrap_or(0);
+    warn_unenforceable_topic_size(
+        max_topic_size,
+        segment_size,
+        shard.bus_max_message_size(),
+        u32::try_from(partitions_count).unwrap_or(u32::MAX),
+    );
+    Ok(())
+}
+
+/// Catalog admission for a create's options block, with the create's own
+/// fixed fields as columns so the block cannot shadow them.
+fn admit_create(
+    scope: OptionsScope,
+    options: &WireOptions,
+    create_columns: OptionColumns,
+) -> Result<AdmittedOptions, IggyError> {
+    admit(
+        scope,
+        OptionOperation::Create,
+        options,
+        &[],
+        &OptionAdmissionContext {
+            current: None,
+            create_columns,
+        },
+    )
+}
+
+/// The options the patch target stores, `None` for a target that does not
+/// exist, which apply reports.
+fn stored_options(
+    streams: &Streams,
+    users: &Users,
+    target: &ResourceTarget,
+) -> Option<ResourceOptions> {
+    match target {
+        ResourceTarget::Stream { stream_id } => streams.read(|inner| {
+            let stream = inner.resolve_stream_id(stream_id)?;
+            Some(inner.items.get(stream)?.options.clone())
+        }),
+        ResourceTarget::Topic {
+            stream_id,
+            topic_id,
+        } => streams.read(|inner| {
+            let stream = inner.resolve_stream_id(stream_id)?;
+            let topic = inner.resolve_topic_id(stream, topic_id)?;
+            Some(inner.items.get(stream)?.topics.get(topic)?.options.clone())
+        }),
+        ResourceTarget::User { user_id } => users.read(|inner| {
+            let user = inner.resolve_user_id(user_id)?;
+            Some(inner.items.get(user)?.options.clone())
+        }),
+    }
+}
+
+/// Catalog admission for a generic patch against the target's stored
+/// options, with the same rules the metadata primary applies again when it
+/// resolves the patch.
+fn admit_patch(
+    patch: &UpdateResourceRequest,
+    current: Option<ResourceOptions>,
+) -> Result<AdmittedOptions, IggyError> {
+    let reset: Vec<String> = patch
+        .reset
+        .iter()
+        .map(|name| name.as_str().to_owned())
+        .collect();
+    admit(
+        OptionsScope::from_code(patch.target.scope_code())?,
+        OptionOperation::Update,
+        &patch.options,
+        &reset,
+        &OptionAdmissionContext {
+            current,
+            create_columns: OptionColumns::default(),
+        },
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dispatch::test_support::{
+        SpyBus, create_one_partition, prepare_message, request_message, test_shard,
+    };
+    use bytes::Bytes;
+    use iggy_binary_protocol::requests::topics::CreateTopicWithAssignmentsRequest;
+    use iggy_binary_protocol::{MAX_OPTIONS, WireName};
+    use iggy_common::{
+        HeaderKey, HeaderValue, IggyDuration, IggyExpiry, OptionKey, OptionValue, OptionsUpdate,
+        StreamCreateOptions, StreamEncryptionKey, TopicUpdateOptions, UserUpdateOptions, text,
+    };
+    use metadata::stm::StateMachine as _;
+    use std::collections::BTreeMap;
+    use std::str::FromStr;
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn given_patch_constraints_when_using_either_chain_should_return_same_error() {
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, 1));
+        create_one_partition(&shard);
+        let sessions = Rc::new(RefCell::new(SessionManager::new()));
+        let topic = || ResourceTarget::Topic {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+        };
+        let stream = || ResourceTarget::Stream {
+            stream_id: WireIdentifier::numeric(0),
+        };
+        let raw_topic_patch = |key: OptionKey, value: &str| {
+            let patch = TopicUpdateOptions {
+                raw: BTreeMap::from([(key.to_string(), value.to_owned())]),
+                ..TopicUpdateOptions::default()
+            }
+            .to_patch()
+            .unwrap();
+            UpdateResourceRequest {
+                target: topic(),
+                reset: patch.reset,
+                options: patch.set,
+            }
+            .to_bytes()
+        };
+        let short_username = UserUpdateOptions {
+            raw: BTreeMap::from([(OptionKey::Username.to_string(), "ab".to_owned())]),
+            ..UserUpdateOptions::default()
+        }
+        .to_patch()
+        .unwrap();
+        let mut name_column = ResourceOptions::new();
+        name_column.insert(
+            HeaderKey::from(OptionKey::Name),
+            OptionValue::explicit(HeaderValue::try_from("shadow").unwrap()),
+        );
+        let json_patch = |target: ResourceTarget, body: &str| {
+            let patch = serde_json::from_str::<OptionsUpdate>(body)
+                .unwrap()
+                .to_patch()
+                .unwrap();
+            UpdateResourceRequest {
+                target,
+                reset: patch.reset,
+                options: patch.set,
+            }
+            .to_bytes()
+        };
+        let user = || ResourceTarget::User {
+            user_id: WireIdentifier::numeric(0),
+        };
+        let cases: Vec<(Operation, Bytes, IggyError)> = vec![
+            (
+                Operation::UpdateResource,
+                json_patch(topic(), r#"{"name": 42}"#),
+                IggyError::InvalidTopicName,
+            ),
+            (
+                Operation::UpdateResource,
+                json_patch(user(), r#"{"status": true}"#),
+                IggyError::InvalidUserStatus,
+            ),
+            (
+                Operation::UpdateResource,
+                raw_topic_patch(OptionKey::SegmentSize, "64 MiB"),
+                IggyError::OptionNotUpdatable(OptionKey::SegmentSize.to_string()),
+            ),
+            (
+                Operation::UpdateResource,
+                raw_topic_patch(OptionKey::MaxTopicSize, "1 MiB"),
+                IggyError::InvalidTopicSize(
+                    MaxTopicSize::from(1024 * 1024u64),
+                    IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
+                ),
+            ),
+            (
+                Operation::UpdateResource,
+                UpdateResourceRequest {
+                    target: stream(),
+                    reset: vec![WireName::new("name").unwrap()],
+                    options: WireOptions::empty(),
+                }
+                .to_bytes(),
+                IggyError::OptionNotResettable(OptionKey::Name.to_string()),
+            ),
+            (
+                Operation::UpdateResource,
+                UpdateResourceRequest {
+                    target: stream(),
+                    reset: Vec::new(),
+                    options: resource_options_to_wire(
+                        &ResourceOptions::from([(
+                            HeaderKey::from(OptionKey::EncryptionKeySource),
+                            OptionValue::explicit(HeaderValue::try_from("stream").unwrap()),
+                        )]),
+                        OptionsProvenance::All,
+                    )
+                    .unwrap(),
+                }
+                .to_bytes(),
+                IggyError::ReadOnlyOption(OptionKey::EncryptionKeySource.to_string()),
+            ),
+            (
+                Operation::UpdateResource,
+                UpdateResourceRequest {
+                    target: ResourceTarget::User {
+                        user_id: WireIdentifier::numeric(0),
+                    },
+                    reset: short_username.reset,
+                    options: short_username.set,
+                }
+                .to_bytes(),
+                IggyError::InvalidUsername,
+            ),
+            (
+                Operation::CreateStream,
+                CreateStreamRequest {
+                    name: WireName::new("orders").unwrap(),
+                    options: resource_options_to_wire(&name_column, OptionsProvenance::All)
+                        .unwrap(),
+                }
+                .to_bytes(),
+                IggyError::InvalidOptionValue(OptionKey::Name.to_string()),
+            ),
+            (
+                Operation::CreateStream,
+                CreateStreamRequest {
+                    name: WireName::new("orders").unwrap(),
+                    options: StreamCreateOptions {
+                        encryption_key: Some(
+                            StreamEncryptionKey::try_from([7u8; 32].as_slice()).unwrap(),
+                        ),
+                        ..StreamCreateOptions::default()
+                    }
+                    .to_wire()
+                    .unwrap(),
+                }
+                .to_bytes(),
+                IggyError::StreamEncryptionUnavailable,
+            ),
+        ];
+
+        for (operation, body, expected) in cases {
+            let tcp = tcp_chain(
+                &shard,
+                &sessions,
+                1,
+                request_message(operation, 1, 1, 1, &body),
+            )
+            .map(|_| ())
+            .map_err(|deny| deny.error);
+            let http =
+                http_chain(&shard, 0, request_message(operation, 1, 1, 1, &body)).map(|_| ());
+            assert_eq!(tcp, Err(expected.clone()), "binary chain, {operation:?}");
+            assert_eq!(http, Err(expected), "HTTP chain, {operation:?}");
+        }
+    }
+
+    #[test]
+    fn given_out_of_range_status_when_creating_user_with_either_chain_should_refuse_invalid_status()
+    {
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, 1));
+        let sessions = Rc::new(RefCell::new(SessionManager::new()));
+        let body = CreateUserRequest {
+            username: WireName::new("status-user").unwrap(),
+            password: "secret123".to_owned(),
+            status: 9,
+            permissions: None,
+            options: WireOptions::empty(),
+        }
+        .to_bytes();
+
+        let tcp = tcp_chain(
+            &shard,
+            &sessions,
+            1,
+            request_message(Operation::CreateUser, 1, 1, 1, &body),
+        )
+        .map(|_| ())
+        .map_err(|deny| deny.error);
+        let http = http_chain(
+            &shard,
+            0,
+            request_message(Operation::CreateUser, 1, 1, 1, &body),
+        )
+        .map(|_| ());
+
+        assert_eq!(tcp, Err(IggyError::InvalidUserStatus), "binary chain");
+        assert_eq!(http, Err(IggyError::InvalidUserStatus), "HTTP chain");
+    }
+
+    #[test]
+    fn given_text_stream_key_when_bounding_create_should_forward_the_canonical_block() {
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, 1));
+        let key = StreamEncryptionKey::try_from([7u8; 32].as_slice()).unwrap();
+        let block = |value: HeaderValue| {
+            resource_options_to_wire(
+                &ResourceOptions::from([(
+                    HeaderKey::from(OptionKey::EncryptionKey),
+                    OptionValue::explicit(value),
+                )]),
+                OptionsProvenance::All,
+            )
+            .unwrap()
+        };
+        let body = CreateStreamRequest {
+            name: WireName::new("orders").unwrap(),
+            options: block(
+                HeaderValue::try_from(text::as_base64(key.as_bytes()).as_str()).unwrap(),
+            ),
+        }
+        .to_bytes();
+
+        let bounded = static_bounds(
+            &shard,
+            request_message(Operation::CreateStream, 1, 1, 1, &body),
+        )
+        .expect("the create admits");
+
+        let forwarded = CreateStreamRequest::decode_from(request_body(&bounded)).unwrap();
+        assert_eq!(
+            forwarded.options.as_bytes(),
+            block(HeaderValue::try_from(key.as_bytes().as_slice()).unwrap()).as_bytes()
+        );
+    }
+
+    #[test]
+    fn given_stored_map_at_capacity_when_patching_a_new_key_should_refuse_at_the_edge() {
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, 1));
+        create_one_partition(&shard);
+        let full: ResourceOptions = (0..MAX_OPTIONS)
+            .map(|index| {
+                (
+                    HeaderKey::from_str(&format!("future_{index:04}")).unwrap(),
+                    OptionValue::explicit(HeaderValue::from(true)),
+                )
+            })
+            .collect();
+        shard
+            .plane
+            .metadata()
+            .mux_stm
+            .update(prepare_message(
+                Operation::CreateTopicWithAssignments,
+                1,
+                3,
+                &CreateTopicWithAssignmentsRequest {
+                    request: CreateTopicRequest {
+                        stream_id: WireIdentifier::numeric(0),
+                        partitions_count: 0,
+                        name: WireName::new("full").unwrap(),
+                        options: resource_options_to_wire(&full, OptionsProvenance::All).unwrap(),
+                    },
+                    derived_options: WireOptions::empty(),
+                    partitions: Vec::new(),
+                    created_view: 0,
+                }
+                .to_bytes(),
+            ))
+            .unwrap();
+        let patch = TopicUpdateOptions {
+            message_expiry: Some(IggyExpiry::ExpireDuration(IggyDuration::from(
+                60_000_000u64,
+            ))),
+            ..TopicUpdateOptions::default()
+        }
+        .to_patch()
+        .unwrap();
+        let body = UpdateResourceRequest {
+            target: ResourceTarget::Topic {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(1),
+            },
+            reset: patch.reset,
+            options: patch.set,
+        }
+        .to_bytes();
+
+        let bounded = static_bounds(
+            &shard,
+            request_message(Operation::UpdateResource, 1, 1, 1, &body),
+        )
+        .map(|_| ());
+
+        assert!(
+            matches!(bounded, Err(IggyError::OptionsBlockTooLarge(_))),
+            "{bounded:?}"
+        );
+    }
 
     #[test]
     fn create_topic_bounds_deny_pre_consensus() {

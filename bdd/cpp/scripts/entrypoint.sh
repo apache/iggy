@@ -58,6 +58,8 @@ tags=()
 case "${BDD_FEATURE:-all}" in
     basic_messaging) tags=(--tags @basic-messaging) ;;
     raw_command) tags=(--tags @raw-command) ;;
+    stream_options) tags=(--tags @stream-options) ;;
+    resource_options_patch) tags=(--tags @resource-options-patch) ;;
 esac
 
 # --strict fails the run on undefined steps; without it a feature step with no matching C++

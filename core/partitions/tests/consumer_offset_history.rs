@@ -267,7 +267,7 @@ async fn partition_with_old_record(
         validate_checksum: true,
         segment_size,
         preallocate_segments: false,
-        encryptor: None,
+        key_context: Arc::default(),
         path_layout: PartitionPathLayout::default(),
     };
     let consensus = VsrConsensus::new(

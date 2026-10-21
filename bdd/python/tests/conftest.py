@@ -24,7 +24,7 @@ import os
 from dataclasses import dataclass
 
 import pytest
-from apache_iggy import IggyClient, ReceiveMessage
+from apache_iggy import IggyClient, OptionSpec, ReceiveMessage
 
 
 @dataclass
@@ -42,6 +42,10 @@ class GlobalContext:
     last_sent_message: str | None = None  # Store message payload as string
     last_raw_response: bytes | None = None
     last_raw_error: RuntimeError | None = None
+    last_stream_key: bytes | None = None
+    last_update_error: RuntimeError | None = None
+    last_option_specs: list[OptionSpec] | None = None
+    last_user_id: int | None = None
 
 
 def required_env(name: str) -> str:

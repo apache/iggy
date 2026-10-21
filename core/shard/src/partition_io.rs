@@ -5107,7 +5107,7 @@ mod tests {
             validate_checksum: true,
             segment_size: IggyByteSize::from(SEGMENT_BYTES),
             preallocate_segments: false,
-            encryptor: None,
+            key_context: Arc::default(),
             path_layout: PartitionPathLayout::default(),
         };
         let partitions = IggyPartitions::new(shard_id, config);

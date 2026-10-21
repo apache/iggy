@@ -18,7 +18,10 @@
 import type { CommandResponse } from '../../client/client.type.js';
 import { wrapCommand } from '../command.utils.js';
 import { COMMAND_CODE } from '../command.code.js';
+import { HeaderValue } from '../message/header.utils.js';
+import { dedupeOptions, serializeOptions, sortOptions } from '../options.utils.js';
 import { deserializeToStream, type Stream } from './stream.utils.js';
+import { streamEncryptionKey, type StreamOptions } from './stream-options.js';
 
 /**
  * Parameters for the create stream command.
@@ -28,28 +31,39 @@ export type CreateStream = {
   streamId?: number,
   /** Stream name (1-255 bytes) */
   name: string
-};
+} & StreamOptions;
 
 /**
  * Create stream command definition.
  * Creates a new stream with the specified name.
+ * Layout: `[name_len:u8][name]` followed by the options block running to the
+ * end of the payload.
  */
 export const CREATE_STREAM = {
   code: COMMAND_CODE.CreateStream,
 
-  serialize: ({name}: CreateStream) => {
+  serialize: ({ name, encryptionKey, options: extraOptions = [] }: CreateStream) => {
     // Stream ID is now auto-assigned by the server, not sent in the protocol
     const bName = Buffer.from(name);
 
     if (bName.length < 1 || bName.length > 255)
       throw new Error('Stream name should be between 1 and 255 bytes');
 
+    // Caller keys first so a typed field below overwrites one of them.
+    const options = [...extraOptions];
+    if (encryptionKey !== undefined)
+      options.push({
+        key: 'encryption_key',
+        value: HeaderValue.Raw(streamEncryptionKey(encryptionKey, COMMAND_CODE.CreateStream))
+      });
+
     const b = Buffer.allocUnsafe(1);
     b.writeUInt8(bName.length, 0);
 
     return Buffer.concat([
       b,
-      bName
+      bName,
+      serializeOptions(sortOptions(dedupeOptions(options)))
     ]);
   },
 

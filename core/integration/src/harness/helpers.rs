@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use iggy::prelude::UserCreateOptions;
 use iggy::prelude::{
     ConsumerGroupClient, ConsumerGroupDetails, DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME,
     GlobalPermissions, Identifier, IdentityInfo, Permissions, StreamClient, UserClient, UserStatus,
@@ -100,6 +101,7 @@ pub async fn create_user(client: &impl UserClient, username: &str) {
             USER_PASSWORD,
             UserStatus::Active,
             Some(full_permissions()),
+            &UserCreateOptions::default(),
         )
         .await
         .expect("Failed to create user");

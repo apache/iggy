@@ -284,7 +284,7 @@ validate() {
   grep -q 'name: tcp-replica' "$HELM_RENDER_DIR/cluster.yaml"
 
   grep -q 'name: IGGY_CLUSTER_AUTH_SHARED_SECRET' "$HELM_RENDER_DIR/cluster.yaml"
-  grep -q 'name: IGGY_SYSTEM_ENCRYPTION_KEY' "$HELM_RENDER_DIR/cluster.yaml"
+  grep -q 'name: IGGY_ENCRYPTION_KEY' "$HELM_RENDER_DIR/cluster.yaml"
   grep -q 'name: IGGY_HTTP_JWT_ENCODING_SECRET' "$HELM_RENDER_DIR/cluster.yaml"
   if grep -qE '^ +(encryptionKey|clusterSharedSecret|jwtEncodingSecret):' "$HELM_RENDER_DIR/cluster.yaml"; then
     echo "Error: cluster render inlined a secret value instead of referencing the existing Secret" >&2
@@ -300,10 +300,10 @@ validate() {
   grep -q '^                  name: iggy-secrets$' "$HELM_RENDER_DIR/generated-secret.yaml"
   grep -q '^                  key: encryptionKey$' "$HELM_RENDER_DIR/generated-secret.yaml"
   test "$(grep -c '^kind: Secret$' "$HELM_RENDER_DIR/generated-secret.yaml")" -eq 2
-  grep -q 'name: IGGY_SYSTEM_ENCRYPTION_ENABLED' "$HELM_RENDER_DIR/generated-secret.yaml"
-  grep -q 'name: IGGY_SYSTEM_ENCRYPTION_KEY' "$HELM_RENDER_DIR/generated-secret.yaml"
-  if grep -q 'name: IGGY_ENCRYPTION_' "$HELM_RENDER_DIR/generated-secret.yaml"; then
-    echo "Error: the pinned server image requires the legacy encryption variables" >&2
+  grep -q 'name: IGGY_ENCRYPTION_ENABLED' "$HELM_RENDER_DIR/generated-secret.yaml"
+  grep -q 'name: IGGY_ENCRYPTION_KEY' "$HELM_RENDER_DIR/generated-secret.yaml"
+  if grep -q 'name: IGGY_SYSTEM_ENCRYPTION_' "$HELM_RENDER_DIR/generated-secret.yaml"; then
+    echo "Error: the pinned server image requires the flat encryption variables" >&2
     exit 1
   fi
 
@@ -346,6 +346,34 @@ validate() {
     --set server.encryption.configVersion=invalid \
     --set server.encryption.existingSecret.name=shared-key
 
+  # given_disabled_default_with_key_when_rendering_then_should_supply_key_and_false_enabled
+  helm template iggy "$CHART_DIR" \
+    --set-string server.image.tag=custom-flat \
+    --set server.encryption.configVersion=flat \
+    --set-string server.encryption.key="$HELM_TEST_ENCRYPTION_KEY" \
+    > "$HELM_RENDER_DIR/disabled-with-key.yaml"
+  grep -q "^  encryptionKey: \"${HELM_TEST_ENCRYPTION_KEY}\"$" "$HELM_RENDER_DIR/disabled-with-key.yaml"
+  grep -A1 'name: IGGY_ENCRYPTION_ENABLED' "$HELM_RENDER_DIR/disabled-with-key.yaml" | grep -q 'value: "false"'
+  grep -q 'name: IGGY_ENCRYPTION_KEY' "$HELM_RENDER_DIR/disabled-with-key.yaml"
+
+  helm template iggy "$CHART_DIR" \
+    --set-string server.image.tag=custom-flat \
+    --set server.encryption.configVersion=flat \
+    --set server.encryption.existingSecret.name=shared-key \
+    > "$HELM_RENDER_DIR/disabled-with-secret.yaml"
+  grep -A1 'name: IGGY_ENCRYPTION_ENABLED' "$HELM_RENDER_DIR/disabled-with-secret.yaml" | grep -q 'value: "false"'
+  grep -q '^                  name: shared-key$' "$HELM_RENDER_DIR/disabled-with-secret.yaml"
+  if grep -qE '^ +encryptionKey:' "$HELM_RENDER_DIR/disabled-with-secret.yaml"; then
+    echo "Error: an existing encryption Secret must not be inlined" >&2
+    exit 1
+  fi
+
+  helm template iggy "$CHART_DIR" > "$HELM_RENDER_DIR/no-encryption.yaml"
+  if grep -q 'ENCRYPTION_' "$HELM_RENDER_DIR/no-encryption.yaml"; then
+    echo "Error: no encryption value set, yet encryption variables were rendered" >&2
+    exit 1
+  fi
+
   assert_render_rejected "server.replicaCount=3" --set server.replicaCount=3
   assert_render_rejected "a single node without root credentials" \
     --set server.users.root.createSecret=false
@@ -356,6 +384,8 @@ validate() {
   assert_render_rejected "encryption without a key" --set server.encryption.enabled=true
   assert_render_rejected "an encryption key that is not 32 bytes" \
     --set server.encryption.enabled=true \
+    --set-string server.encryption.key=bm90LTMyLWJ5dGVz
+  assert_render_rejected "a disabled encryption key that is not 32 bytes" \
     --set-string server.encryption.key=bm90LTMyLWJ5dGVz
   assert_render_rejected "replica auth without a secret" \
     -f "$CHART_DIR/examples/cluster-3-node.yaml" \

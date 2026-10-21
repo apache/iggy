@@ -18,7 +18,7 @@
 use bytes::Bytes;
 use cucumber::World;
 use iggy::clients::client::IggyClient;
-use iggy::prelude::{IggyError, IggyMessage, PolledMessages};
+use iggy::prelude::{IggyError, IggyMessage, OptionSpec, PolledMessages, StreamEncryptionKey};
 
 #[derive(Debug, World, Default)]
 pub struct GlobalContext {
@@ -33,4 +33,8 @@ pub struct GlobalContext {
     pub last_polled_messages: Option<PolledMessages>,
     pub last_sent_message: Option<IggyMessage>,
     pub last_raw_result: Option<Result<Bytes, IggyError>>,
+    pub last_stream_key: Option<StreamEncryptionKey>,
+    pub last_update_error: Option<IggyError>,
+    pub last_option_specs: Vec<OptionSpec>,
+    pub last_user_id: Option<u32>,
 }

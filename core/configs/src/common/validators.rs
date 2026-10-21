@@ -18,11 +18,11 @@
 use super::COMPONENT;
 use super::server::{DataMaintenanceConfig, MessagesMaintenanceConfig, TelemetryConfig};
 use super::server::{MemoryPoolConfig, PersonalAccessTokenConfig};
-use super::system::LoggingConfig;
+use super::system::{EncryptionConfig, LoggingConfig};
 use crate::ConfigurationError;
 use cpu_allocation::{CpuAllocation, allowed_cpus};
 use err_trail::ErrContext;
-use iggy_common::Validatable;
+use iggy_common::{ServerKeyContext, Validatable};
 use server_common::log::LogFilter;
 use std::thread::available_parallelism;
 
@@ -51,6 +51,22 @@ impl Validatable<ConfigurationError> for TelemetryConfig {
         }
 
         Ok(())
+    }
+}
+
+impl Validatable<ConfigurationError> for EncryptionConfig {
+    /// A supplied key must be 32 bytes of base64, and `enabled` needs one.
+    /// The values are never printed.
+    fn validate(&self) -> Result<(), ConfigurationError> {
+        ServerKeyContext::from_config(&self.key, &self.previous_keys, self.enabled)
+            .map(|_| ())
+            .map_err(|_| {
+                eprintln!(
+                    "encryption.key must be 32 bytes of standard base64, set when encryption is \
+                     enabled, and encryption.previous_keys may hold at most two other such keys"
+                );
+                ConfigurationError::InvalidConfigurationValue
+            })
     }
 }
 
@@ -386,5 +402,63 @@ mod logging_tests {
         };
         assert!(below.validate().is_err());
         assert!(unlimited.validate().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const KEY: &str = "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=";
+    const OTHER_KEY: &str = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=";
+    const THIRD_KEY: &str = "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=";
+
+    #[test]
+    fn given_encryption_config_when_validating_then_should_require_valid_key_only_when_supplied_or_enabled()
+     {
+        for (enabled, key, valid) in [
+            (false, "", true),
+            (false, KEY, true),
+            (true, KEY, true),
+            (true, "", false),
+            (false, "c2hvcnQ=", false),
+            (true, "not base64", false),
+        ] {
+            assert_eq!(
+                config(enabled, key, &[]).validate().is_ok(),
+                valid,
+                "enabled={enabled}, key length {}",
+                key.len()
+            );
+        }
+    }
+
+    #[test]
+    fn given_previous_keys_when_validating_then_should_require_valid_current_key_and_at_most_two() {
+        for (key, previous, valid) in [
+            (KEY, vec![], true),
+            (KEY, vec![OTHER_KEY], true),
+            (KEY, vec![OTHER_KEY, THIRD_KEY], true),
+            (KEY, vec![OTHER_KEY, THIRD_KEY, "AAAA"], false),
+            (KEY, vec![KEY], false),
+            (KEY, vec![OTHER_KEY, OTHER_KEY], false),
+            (KEY, vec!["c2hvcnQ="], false),
+            ("", vec![OTHER_KEY], false),
+        ] {
+            assert_eq!(
+                config(true, key, &previous).validate().is_ok(),
+                valid,
+                "{} previous keys",
+                previous.len()
+            );
+        }
+    }
+
+    fn config(enabled: bool, key: &str, previous_keys: &[&str]) -> EncryptionConfig {
+        EncryptionConfig {
+            enabled,
+            key: key.to_owned(),
+            previous_keys: previous_keys.iter().map(|key| (*key).to_owned()).collect(),
+        }
     }
 }

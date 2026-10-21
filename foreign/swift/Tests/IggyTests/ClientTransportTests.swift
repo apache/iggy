@@ -894,7 +894,7 @@ struct ClientTransportTests {
         await Self.forgetSessions(on: server)
         let client = makeClient(server)
         try await client.connect()
-        try await client.updateUser("iggy", username: "renamed")
+        try await client.updateUser("iggy", options: UserUpdateOptions(username: "renamed"))
         await server.closeAllConnections()
         try await Task.sleep(for: .milliseconds(20))
         try await client.ping()
@@ -911,6 +911,22 @@ struct ClientTransportTests {
         let latest = await server.requests.filter { $0.operation == .register }.last!
         #expect(Self.username(in: latest.payload) == "renamed")
         #expect(Self.password(in: latest.payload) == "new-secret")
+        await client.shutdown()
+    }
+
+    @Test func rawUsernameRenameUpdatesTheReconnectCredentials() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        await Self.forgetSessions(on: server)
+        let client = makeClient(server)
+        try await client.connect()
+        try await client.updateUser("iggy", options: UserUpdateOptions(raw: [UserOptionKey.username.rawValue: "renamed"]))
+        await server.closeAllConnections()
+        try await Task.sleep(for: .milliseconds(20))
+        try await client.ping()
+        let registers = await server.requests.filter { $0.operation == .register }
+        #expect(registers.count == 2)
+        #expect(Self.username(in: registers[1].payload) == "renamed")
         await client.shutdown()
     }
 

@@ -76,6 +76,8 @@ impl IntoResponse for CustomError {
                     | IggyError::InvalidPersonalAccessToken => StatusCode::UNAUTHORIZED,
                     IggyError::Unauthorized => StatusCode::FORBIDDEN,
                     IggyError::PartitionHistoryChanged => StatusCode::CONFLICT,
+                    // Stored state this build cannot read, not a caller error.
+                    IggyError::UnsupportedCriticalOption(_) => StatusCode::INTERNAL_SERVER_ERROR,
                     // The pre-consensus retry frame: reaching this render
                     // means the write path's replay budget is exhausted and
                     // the op never committed - a transient server condition,
@@ -638,6 +640,16 @@ mod tests {
                 crate::cluster_meta::METADATA_VIEW_UNKNOWN,
             )),
         }
+    }
+
+    #[test]
+    fn given_unreadable_critical_option_when_rendering_read_error_should_answer_500() {
+        let response = ReadError::Rejected(IggyError::UnsupportedCriticalOption(
+            "future_key".to_owned(),
+        ))
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]

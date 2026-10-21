@@ -53,6 +53,14 @@ inputs:
     description: "--replica-id <u8> value (leave empty to omit)"
     required: false
     default: ""
+  encryption-enabled:
+    description: "Start the server with encryption enabled, which the SDK stream key tests need"
+    required: false
+    default: "true"
+  encryption-key:
+    description: "Server encryption key (base64 of 32 bytes), a fixed test key shared with the BDD server"
+    required: false
+    default: "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE="
 outputs:
   pid:
     description: "PID of the background server process"
@@ -116,6 +124,11 @@ runs:
         export IGGY_HTTP_ADDRESS="${{ inputs.http_address }}"
         export IGGY_ROOT_USERNAME="iggy"
         export IGGY_ROOT_PASSWORD="iggy"
+        if [[ "${{ inputs.encryption-enabled }}" == "true" ]]; then
+          [[ -n "${{ inputs.encryption-key }}" ]] || { echo "::error::encryption-enabled requires encryption-key"; exit 1; }
+          export IGGY_ENCRYPTION_ENABLED="true"
+          export IGGY_ENCRYPTION_KEY="${{ inputs.encryption-key }}"
+        fi
         CLI_ARGS=()
         if [[ -n "${{ inputs.replica-id }}" ]]; then
           CLI_ARGS+=(--replica-id "${{ inputs.replica-id }}")
@@ -124,7 +137,7 @@ runs:
         nohup "${{ inputs.bin }}" "${CLI_ARGS[@]}" >"$LOG_FILE" 2>&1 &
         echo $! > "$PID_FILE"
         echo "Started server PID $(cat "$PID_FILE") → logs: $LOG_FILE"
-        echo "Server configured with TCP=$IGGY_TCP_ADDRESS, HTTP=$IGGY_HTTP_ADDRESS"
+        echo "Server configured with TCP=$IGGY_TCP_ADDRESS, HTTP=$IGGY_HTTP_ADDRESS, encryption=${IGGY_ENCRYPTION_ENABLED:-false}"
 
     - name: Wait for readiness
       shell: bash

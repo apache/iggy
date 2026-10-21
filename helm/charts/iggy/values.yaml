@@ -103,15 +103,17 @@ server:
     # -- PVC storage size
     size: 8Gi
 
-  # -- Server-side encryption of message payloads and state commands, using
-  # AES-256-GCM. Every node of a cluster must hold the identical key, or it
-  # cannot read data another node wrote.
+  # -- Server-side encryption of message payloads and user headers, using
+  # AES-256-GCM. Every encrypted stream has its own key, stored wrapped under a
+  # key derived from this one. Every node of a cluster must hold the identical
+  # key, or it cannot open the stream keys.
   encryption:
-    # -- Enable encryption at rest
+    # -- Give streams created without their own key a generated key. A key set
+    # while this is false still lets clients create streams with their own key.
     enabled: false
     # -- Encryption config layout: `auto` selects `legacy` for released image
-    # versions through 0.9.0-edge.7. Set `flat` for newer server builds, or
-    # `legacy` for custom builds that still use `[system.encryption]`.
+    # versions through 0.9.0-edge.7 and `flat` for this chart's pinned image.
+    # Select `flat` or `legacy` explicitly for other custom image tags.
     configVersion: auto
     # -- 32-byte key, base64 encoded. Ignored when `existingSecret.name` is set.
     # Prefer `existingSecret` outside development: a value here is stored in the

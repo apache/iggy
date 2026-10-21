@@ -3015,6 +3015,7 @@ mod tests {
     use server_common::sharding::IggyNamespace;
     use std::fs;
     use std::os::unix::fs::symlink;
+    use std::sync::Arc;
     use tempfile::{TempDir, tempdir};
 
     const STREAM_ID: usize = 1;
@@ -3036,7 +3037,7 @@ mod tests {
             validate_checksum: true,
             segment_size: IggyByteSize::from(SEGMENT_MAX_SIZE),
             preallocate_segments: iggy_common::DEFAULT_PREALLOCATE_SEGMENTS,
-            encryptor: None,
+            key_context: Arc::default(),
             path_layout: PartitionPathLayout {
                 streams_root: tmp.path().join("streams").to_string_lossy().into_owned(),
             },

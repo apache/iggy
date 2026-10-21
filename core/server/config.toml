@@ -425,10 +425,23 @@ sysinfo_print_interval = "10 s"
 # `false` means data is stored without encryption.
 enabled = false
 
-# The encryption key used when encryption is enabled (string).
-# Should be a 32 bytes length key, provided as a base64 encoded string.
-# This key is required and used only if encryption is enabled.
+# The server encryption key (string), 32 bytes as standard base64.
+# Every encrypted stream has its own data key, stored wrapped under a key derived from this one.
+# Required when encryption is enabled. With encryption disabled a key may still be set:
+# streams created with their own key are then encrypted, keyless streams stay plaintext.
+# A stream created without encryption stays plaintext for life.
 key = ""
+
+# Retired server keys (list of strings), used only to unwrap stream keys during a key rotation.
+# At most two. Rotation runs in two phases:
+# 1. Set `key` to the new key and `previous_keys` to the old one on every node. The metadata
+#    primary adds a wrap under the new key to every encrypted stream, old wraps stay readable.
+# 2. Once every node runs the phase 1 config and every encrypted stream reports the new
+#    key's fingerprint in `encryption_kek_fingerprint`, remove the old key from
+#    `previous_keys`. The primary drops the wraps under it.
+# Messages are never re-encrypted. Losing a key that still wraps a stream makes it unreadable.
+# As an environment variable: IGGY_ENCRYPTION_PREVIOUS_KEYS='["<old base64 key>"]', a single key may also be given bare.
+previous_keys = []
 
 # Memory pool configuration
 [memory_pool]

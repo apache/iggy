@@ -25,7 +25,10 @@ use crate::driver::{operation_deadline, with_deadline};
 use crate::links::OPERATION_TIMEOUT;
 use bytes::Bytes;
 use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
-use iggy_common::{BinarySendPartitioning, Client, StreamClient, TopicClient, TopicCreateOptions};
+use iggy_common::{
+    BinarySendPartitioning, Client, StreamClient, StreamCreateOptions, TopicClient,
+    TopicCreateOptions,
+};
 use iggy_common::{
     Durability, EncryptorKind, IdKind, Identifier, IggyError, IggyExpiry, IggyMessage,
     IggyTimestamp, MaxTopicSize, Partitioner, Partitioning, SendMessagesConfirmationResponse,
@@ -116,7 +119,9 @@ impl ProducerCore {
             }
 
             info!("Creating stream: {name}");
-            client.create_stream(&name).await?;
+            client
+                .create_stream(&name, &StreamCreateOptions::default())
+                .await?;
         }
 
         if client.get_topic(&stream_id, &topic_id).await?.is_none() {

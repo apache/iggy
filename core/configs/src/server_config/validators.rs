@@ -89,6 +89,9 @@ impl Validatable<ConfigurationError> for ServerConfig {
         self.logging.validate().error(|e: &ConfigurationError| {
             format!("{COMPONENT} (error: {e}) - failed to validate logging config")
         })?;
+        self.encryption.validate().error(|e: &ConfigurationError| {
+            format!("{COMPONENT} (error: {e}) - failed to validate encryption config")
+        })?;
 
         if self.http.enabled
             && let IggyExpiry::ServerDefault = self.http.jwt.access_token_expiry

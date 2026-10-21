@@ -120,7 +120,7 @@ mod tests {
     };
     use iggy_binary_protocol::codes::{
         BIND_SESSION_CODE, CHANGE_PASSWORD_CODE, LOGIN_REGISTER_CODE, LOGOUT_USER_CODE, PING_CODE,
-        UPDATE_USER_CODE,
+        UPDATE_RESOURCE_CODE,
     };
     use iggy_binary_protocol::consensus::EvictionReason;
     use iggy_binary_protocol::requests::users::{
@@ -129,8 +129,8 @@ mod tests {
     use iggy_binary_protocol::{WireDecode, WireEncode, WireIdentifier};
     use iggy_common::{
         BinaryTransport, Client, ClientState, Credentials, Identifier, IggyDuration,
-        PersonalAccessTokenClient, SystemClient, TcpClientReconnectionConfig, UserClient,
-        UserUpdateOptions, with_binary_deadline,
+        PersonalAccessTokenClient, SystemClient, TcpClientReconnectionConfig, TopicClient,
+        TopicUpdateOptions, UserClient, UserUpdateOptions, with_binary_deadline,
     };
     use secrecy::{ExposeSecret, SecretString};
     use std::time::Duration;
@@ -565,21 +565,21 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn given_a_committed_rename_of_the_session_user_when_signing_in_again_should_send_the_new_username()
-     {
+    async fn given_generic_user_rename_when_reconnecting_then_should_use_updated_username() {
         for resolved in [false, true] {
             let cluster = FakeCluster::new(1);
             let client = signed_in_client(&cluster).await;
             if resolved {
-                end_uncertain(&cluster, UPDATE_USER_CODE, Answer::Commit(COMMIT));
+                end_uncertain(&cluster, UPDATE_RESOURCE_CODE, Answer::Commit(COMMIT));
             }
 
             let renamed = client
                 .update_user(
                     &Identifier::named(USERNAME).unwrap(),
-                    Some(NEW_USERNAME),
-                    None,
-                    &UserUpdateOptions::default(),
+                    &UserUpdateOptions {
+                        username: Some(NEW_USERNAME.to_owned()),
+                        ..UserUpdateOptions::default()
+                    },
                 )
                 .await;
             proved(&client, renamed).await.unwrap();
@@ -587,9 +587,49 @@ mod tests {
 
             let case = format!("resolved={resolved}");
             let attempts = if resolved { 3 } else { 1 };
-            assert_eq!(cluster.count(UPDATE_USER_CODE), attempts, "{case}");
+            assert_eq!(cluster.count(UPDATE_RESOURCE_CODE), attempts, "{case}");
             assert_eq!(sign_in.username.as_str(), NEW_USERNAME, "{case}");
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_rejected_rename_or_topic_rename_when_reconnecting_then_should_keep_the_username()
+    {
+        let cluster = FakeCluster::new(1);
+        let client = signed_in_client(&cluster).await;
+        cluster.script(
+            &endpoint(0),
+            UPDATE_RESOURCE_CODE,
+            [Answer::CommitRejected(COMMIT, IggyError::UserAlreadyExists)],
+        );
+        let rejected = client
+            .update_user(
+                &Identifier::named(USERNAME).unwrap(),
+                &UserUpdateOptions {
+                    username: Some(NEW_USERNAME.to_owned()),
+                    ..UserUpdateOptions::default()
+                },
+            )
+            .await;
+        assert_eq!(
+            proved(&client, rejected).await,
+            Err(IggyError::UserAlreadyExists)
+        );
+        client
+            .update_topic(
+                &Identifier::numeric(1).unwrap(),
+                &Identifier::numeric(1).unwrap(),
+                &TopicUpdateOptions {
+                    name: Some(NEW_USERNAME.to_owned()),
+                    ..TopicUpdateOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let sign_in = sign_in_again(&cluster).await;
+
+        assert_eq!(sign_in.username.as_str(), USERNAME);
     }
 
     #[tokio::test(start_paused = true)]

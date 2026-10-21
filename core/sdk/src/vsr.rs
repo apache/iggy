@@ -180,18 +180,9 @@ fn decode_reply_outcome(
             if let Some(request) = request.filter(|_| header.has_committed_result()) {
                 let matches_request = header.client == request.client
                     && header.request_checksum == request.request_checksum
-                    && (header.operation == request.operation
-                        || matches!(
-                            (request.operation, header.operation),
-                            // The primary resolves these commands before committing their prepare.
-                            (
-                                Operation::CreateTopic,
-                                Operation::CreateTopicWithAssignments
-                            ) | (
-                                Operation::CreatePartitions,
-                                Operation::CreatePartitionsWithAssignments
-                            ) | (Operation::DeleteSegments, Operation::TruncatePartition)
-                        ))
+                    // The primary resolves some commands into an internal
+                    // operation before committing their prepare.
+                    && header.operation.request_operation() == request.operation
                     && header.partition_incarnation == request.partition_incarnation
                     && header.op != 0
                     && header.op == header.commit;
@@ -345,7 +336,7 @@ mod tests {
     use bytes::{BufMut, BytesMut};
     use iggy_binary_protocol::codes::{
         CREATE_PARTITIONS_CODE, CREATE_STREAM_CODE, CREATE_TOPIC_CODE, DELETE_SEGMENTS_CODE,
-        GET_STREAM_CODE, LOGOUT_USER_CODE, PING_CODE, SEND_MESSAGES_CODE,
+        GET_STREAM_CODE, LOGOUT_USER_CODE, PING_CODE, SEND_MESSAGES_CODE, UPDATE_RESOURCE_CODE,
     };
     use iggy_binary_protocol::consensus::{NON_REPLICATED_CODE_RANGE, PrepareHeader};
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
@@ -407,6 +398,41 @@ mod tests {
                         Err(IggyError::InvalidCommand)
                     ));
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn given_resolved_update_reply_when_correlating_then_should_accept_only_matching_request_identity()
+     {
+        let request =
+            RequestHeader::for_request(UPDATE_RESOURCE_CODE, 1, 2, 3, b"request").unwrap();
+        let body = rejection_body(0);
+        for resolved in [
+            Operation::UpdateStreamResolved,
+            Operation::UpdateTopicResolved,
+            Operation::UpdateUserResolved,
+        ] {
+            let mut reply = committed_header(&request, &body);
+            reply.operation = resolved;
+            let outcome = decode_for_test(&request, &reply, body.clone()).unwrap();
+            assert!(outcome.committed, "{resolved:?}");
+            assert!(outcome.result.is_ok(), "{resolved:?}");
+            let mismatches: [fn(&mut ReplyHeader); 3] = [
+                |reply| reply.client ^= 1,
+                |reply| reply.request_checksum ^= 1,
+                |reply| reply.operation = Operation::CreateTopicWithAssignments,
+            ];
+            for mismatch in mismatches {
+                let mut unrelated = reply;
+                mismatch(&mut unrelated);
+                assert!(
+                    matches!(
+                        decode_for_test(&request, &unrelated, body.clone()),
+                        Err(IggyError::InvalidCommand)
+                    ),
+                    "{resolved:?}"
+                );
             }
         }
     }

@@ -34,6 +34,7 @@ import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.identifier.UserId;
 import org.apache.iggy.serde.BytesSerializer;
 import org.apache.iggy.serde.CommandCode;
+import org.apache.iggy.user.UserUpdate;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
@@ -85,7 +86,7 @@ class AsyncIggyTcpClientEndpointFailoverTest {
     private static final Duration OUTAGE = Duration.ofSeconds(1);
     private static final Duration RECOVERY = Duration.ofSeconds(5);
     private static final int CHANGE_PASSWORD_CODE = CommandCode.User.CHANGE_PASSWORD.getValue();
-    private static final int UPDATE_USER_CODE = CommandCode.User.UPDATE.getValue();
+    private static final int UPDATE_RESOURCE_CODE = CommandCode.System.UPDATE_RESOURCE.getValue();
     // The user that registerBody signs in.
     private static final long SIGNED_IN_USER_ID = 1;
     private static final long OTHER_USER_ID = 2;
@@ -923,7 +924,9 @@ class AsyncIggyTcpClientEndpointFailoverTest {
                     signIns,
                     request -> committing.get()
                             ? Response.committed(
-                                    request.operation(), 2, Unpooled.buffer().writeIntLE(0))
+                                    committedOperation(request.operation()),
+                                    2,
+                                    Unpooled.buffer().writeIntLE(0))
                             : Response.error(request.operation(), AsyncTcpConnection.TRANSIENT_NOT_COMMITTED));
             AsyncIggyTcpClient client = limitedClient(nodeSocket.getLocalPort());
             try {
@@ -933,14 +936,19 @@ class AsyncIggyTcpClientEndpointFailoverTest {
                 UserId self = rename ? UserId.of(USERNAME) : UserId.of(SIGNED_IN_USER_ID);
                 if (raw) {
                     client.sendBinaryRequest(
-                                    rename ? UPDATE_USER_CODE : CHANGE_PASSWORD_CODE,
+                                    rename ? UPDATE_RESOURCE_CODE : CHANGE_PASSWORD_CODE,
                                     rename
                                             ? renameBody(self, RENAMED)
                                             : changePasswordBody(self, FIRST_PASSWORD, SECOND_PASSWORD))
                             .get(5, TimeUnit.SECONDS);
                 } else {
                     CompletableFuture<Void> change = rename
-                            ? client.users().updateUser(self, Optional.of(RENAMED), Optional.empty())
+                            ? client.users()
+                                    .updateUser(
+                                            self,
+                                            UserUpdate.builder()
+                                                    .username(RENAMED)
+                                                    .build())
                             : client.users().changePassword(self, FIRST_PASSWORD, SECOND_PASSWORD);
                     long operation = uncertainOperation(change);
                     committing.set(true);
@@ -1125,7 +1133,7 @@ class AsyncIggyTcpClientEndpointFailoverTest {
                         : Response.success(OPERATION_REGISTER, registerBody(signIns.size()));
             }
             if (request.operation() == VsrOperation.CHANGE_PASSWORD
-                    || request.operation() == VsrOperation.UPDATE_USER) {
+                    || request.operation() == VsrOperation.UPDATE_RESOURCE) {
                 return change.handle(request);
             }
             return Response.success(request.operation(), Unpooled.EMPTY_BUFFER);
@@ -1171,10 +1179,13 @@ class AsyncIggyTcpClientEndpointFailoverTest {
 
     /** The body that {@code UsersClient.updateUser} writes for a rename: a username and no status. */
     private static byte[] renameBody(UserId user, String username) {
-        return ByteBufUtil.getBytes(BytesSerializer.toBytes(user)
-                .writeByte(1)
-                .writeBytes(BytesSerializer.toBytes(username, "username"))
-                .writeByte(0));
+        return ByteBufUtil.getBytes(BytesSerializer.toUpdateResource(
+                user, UserUpdate.builder().username(username).build()));
+    }
+
+    /** The server commits a generic user patch under its resolved operation. */
+    private static int committedOperation(int requestOperation) {
+        return requestOperation == VsrOperation.UPDATE_RESOURCE ? VsrOperation.UPDATE_USER_RESOLVED : requestOperation;
     }
 
     private static AsyncIggyTcpClient limitedClient(int port) {
@@ -1206,7 +1217,7 @@ class AsyncIggyTcpClientEndpointFailoverTest {
         body.writeIntLE(0);
         body.writeIntLE(1);
         body.writeLongLE(session);
-        body.writeIntLE((11 << 10) | 1);
+        body.writeIntLE(12 << 10);
         body.writeByte(0);
         return body;
     }

@@ -19,6 +19,7 @@
 //! `UserNotFound` (fabricated user). `UsernameAlreadyExists` not targeted.
 
 use iggy_binary_protocol::RoutedRequestHeader;
+use iggy_common::UserStatus;
 use rand_xoshiro::Xoshiro256PlusPlus;
 use server_common::Message;
 
@@ -33,7 +34,7 @@ pub use metadata::stm::result::UpdateUserResult as Outcome;
 pub struct Input {
     pub user: String,
     pub new_username: Option<String>,
-    pub status: Option<u8>,
+    pub status: Option<UserStatus>,
     /// Current password from shadow; carried via `Effect::RenameUser` so the
     /// shadow re-keys `passwords` under `new_username`.
     pub current_password: String,
@@ -54,14 +55,14 @@ pub fn sample(
             Some(Input {
                 user,
                 new_username: Some(shadow.fresh_name("user")),
-                status: Some(1),
+                status: Some(UserStatus::Active),
                 current_password,
             })
         }
         Outcome::UserNotFound => Some(Input {
             user: shadow.fabricate_absent_name("user"),
             new_username: Some(shadow.fresh_name("user")),
-            status: Some(1),
+            status: Some(UserStatus::Active),
             current_password: String::new(),
         }),
         Outcome::UsernameAlreadyExists => {
@@ -70,8 +71,11 @@ pub fn sample(
         Outcome::InvalidUsername => {
             unreachable!("update_user does not target InvalidUsername")
         }
-        Outcome::InvalidOptionValue => {
+        Outcome::InvalidOptionValue | Outcome::OptionsBlockTooLarge => {
             unreachable!("the simulator only sends an empty update options block")
+        }
+        Outcome::InvalidUserStatus => {
+            unreachable!("update_user only sends a valid status")
         }
     }
 }
@@ -104,6 +108,8 @@ pub fn predicted_effect(input: &Input, outcome: Outcome) -> Effect {
         Outcome::UserNotFound
         | Outcome::UsernameAlreadyExists
         | Outcome::InvalidUsername
-        | Outcome::InvalidOptionValue => Effect::None,
+        | Outcome::InvalidUserStatus
+        | Outcome::InvalidOptionValue
+        | Outcome::OptionsBlockTooLarge => Effect::None,
     }
 }

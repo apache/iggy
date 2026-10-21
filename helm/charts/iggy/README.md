@@ -2,7 +2,7 @@
 
 A Helm chart for Apache Iggy server and web-ui
 
-![Version: 0.6.0](https://img.shields.io/badge/Version-0.6.0-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 0.9.0-edge.6](https://img.shields.io/badge/AppVersion-0.9.0--edge.6-informational?style=flat-square)
+![Version: 0.6.1](https://img.shields.io/badge/Version-0.6.1-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 0.9.1-edge.2](https://img.shields.io/badge/AppVersion-0.9.1--edge.2-informational?style=flat-square)
 
 ## Prerequisites
 
@@ -196,13 +196,7 @@ stored values.
   authenticated handshake or be rejected. The key is at least 32 bytes of
   CSPRNG output. Turning it on or off is a coordinated restart of the whole
   cluster: a node that authenticates cannot talk to one that does not.
-* **`server.encryption`** encrypts message payloads and state commands at rest
-  with AES-256-GCM, under a 32-byte base64 key. A node holding a different key
-  cannot read what its peers wrote. The chart selects the legacy configuration
-  for versioned images through `0.9.0-edge.7`, including its pinned image.
-  For newer builds with `[encryption]`, set `server.encryption.configVersion=flat`.
-  Custom tags require an explicit `flat` or `legacy` layout; `legacy` uses
-  `[system.encryption]`.
+* **`server.encryption`** encrypts message payloads and user headers at rest with AES-256-GCM. Every encrypted stream has its own key, stored wrapped under a key derived from the 32-byte base64 key set here. With `enabled` true, streams created without their own key get a generated one. With `enabled` false and a key set, only streams created with their own key are encrypted. A stream created unencrypted stays unencrypted. A node holding a different key cannot open the stream keys and refuses to boot. A server key rotation has no chart value of its own: set `IGGY_ENCRYPTION_PREVIOUS_KEYS` in `server.env` and follow the two-phase procedure in the [server README](https://github.com/apache/iggy/blob/master/core/server/README.md#stream-encryption). The chart selects the legacy configuration for released images through `0.9.0-edge.7` and the flat configuration for its pinned image. Other custom image tags require an explicit `flat` or `legacy` layout. The legacy layout uses `[system.encryption]`.
 * **`server.jwt`** makes HTTP bearer tokens valid on every node and survive a
   restart. With `cluster.auth` enabled the server already derives a cluster-wide
   key from the replica PSK, so setting the JWT secrets is an alternative to that
@@ -369,7 +363,7 @@ Ensure the server binds to `0.0.0.0` instead of `127.0.0.1`. This is configured 
 A wildcard bind says which interfaces accept connections, not where clients
 reach the pod, so the server also needs the address to publish in cluster
 metadata. Server builds that carry the setting refuse to start without it.
-`0.9.0-edge.6`, the image this chart pins, predates it:
+`0.9.1-edge.2`, the image this chart pins, predates it:
 that build logs `IGGY_NODE_ADVERTISED_ADDRESS` as an unknown variable and
 publishes the bind address, so the chart's default stays inert until the pinned
 image moves past it. Either way the chart sets `IGGY_NODE_ADVERTISED_ADDRESS` to
@@ -503,9 +497,9 @@ pre-commit install
 | server.cluster.requireHostNetwork | bool | `true` | Refuse to render a cluster node without `server.hostNetwork`. The replica listener binds the roster `ip` verbatim, which no pod owns on the cluster network, so the pod would die at boot with `CannotBindToSocket`. Set this to false only when the roster `ip` is an address the pod itself holds. |
 | server.cluster.selfReplicaId | int | `0` | Which `nodes` entry this release runs, matched against `replicaId`. |
 | server.enabled | bool | `true` | Enable the Iggy server deployment |
-| server.encryption | object | `{"configVersion":"auto","enabled":false,"existingSecret":{"key":"encryptionKey","name":""},"key":""}` | Server-side encryption of message payloads and state commands, using AES-256-GCM. Every node of a cluster must hold the identical key, or it cannot read data another node wrote. |
-| server.encryption.configVersion | string | `"auto"` | Encryption config layout: `auto` selects `legacy` for released image versions through 0.9.0-edge.7. Set `flat` for newer server builds, or `legacy` for custom builds that still use `[system.encryption]`. |
-| server.encryption.enabled | bool | `false` | Enable encryption at rest |
+| server.encryption | object | `{"configVersion":"auto","enabled":false,"existingSecret":{"key":"encryptionKey","name":""},"key":""}` | Server-side encryption of message payloads and user headers, using AES-256-GCM. Every encrypted stream has its own key, stored wrapped under a key derived from this one. Every node of a cluster must hold the identical key, or it cannot open the stream keys. |
+| server.encryption.configVersion | string | `"auto"` | Encryption config layout: `auto` selects `legacy` for released image versions through 0.9.0-edge.7 and `flat` for this chart's pinned image. Select `flat` or `legacy` explicitly for other custom image tags. |
+| server.encryption.enabled | bool | `false` | Give streams created without their own key a generated key. A key set while this is false still lets clients create streams with their own key. |
 | server.encryption.existingSecret.key | string | `"encryptionKey"` | Key inside that Secret |
 | server.encryption.existingSecret.name | string | `""` | Name of an existing Secret holding the encryption key |
 | server.encryption.key | string | `""` | 32-byte key, base64 encoded. Ignored when `existingSecret.name` is set. Prefer `existingSecret` outside development: a value here is stored in the Helm release and readable by anyone who can read it. |

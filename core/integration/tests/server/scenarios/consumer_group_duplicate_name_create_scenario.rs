@@ -27,6 +27,7 @@ use crate::server::scenarios::{
 };
 use iggy::prelude::Identifier;
 use iggy::prelude::IggyExpiry;
+use iggy::prelude::StreamCreateOptions;
 use iggy::prelude::{ConsumerGroupClient, StreamClient, TopicClient, TopicCreateOptions};
 use integration::harness::{
     TestHarness, assert_clean_system, create_user, delete_user, login_user,
@@ -39,7 +40,10 @@ pub async fn run(harness: &TestHarness) {
         .expect("Failed to get root client");
     let client1 = create_client(harness).await;
 
-    system_client.create_stream(STREAM_NAME).await.unwrap();
+    system_client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     system_client
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),

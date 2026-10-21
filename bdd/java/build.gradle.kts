@@ -49,6 +49,7 @@ spotless {
 
 tasks.test {
     useJUnitPlatform()
+    System.getenv("CUCUMBER_FILTER_TAGS")?.let { systemProperty("cucumber.filter.tags", it) }
 }
 
 tasks.jacocoTestReport {

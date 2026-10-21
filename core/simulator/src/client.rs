@@ -38,20 +38,23 @@ use iggy_binary_protocol::requests::personal_access_tokens::{
 };
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::requests::streams::{
-    CreateStreamRequest, DeleteStreamRequest, GetStreamRequest, UpdateStreamRequest,
+    CreateStreamRequest, DeleteStreamRequest, GetStreamRequest,
 };
-use iggy_binary_protocol::requests::system::{BindSessionRequest, SessionIdentity};
-use iggy_binary_protocol::requests::topics::{
-    CreateTopicRequest, DeleteTopicRequest, UpdateTopicRequest,
+use iggy_binary_protocol::requests::system::{
+    BindSessionRequest, ResourceTarget, SessionIdentity, UpdateResourceRequest,
 };
+use iggy_binary_protocol::requests::topics::{CreateTopicRequest, DeleteTopicRequest};
 use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::requests::users::{
     ChangePasswordRequest, CreateUserRequest, DeleteUserRequest, LoginRegisterRequest,
-    UpdatePermissionsRequest, UpdateUserRequest,
+    UpdatePermissionsRequest,
 };
 use iggy_binary_protocol::{
     AckLevel, ClientVersionInfo, IGGY_PROTOCOL_VERSION, Operation, RoutedRequestHeader, WireEncode,
     WireIdentifier, WireName, WireOptions, WirePartitioning, WirePollingStrategy,
+};
+use iggy_common::{
+    OptionsPatch, StreamUpdateOptions, TopicUpdateOptions, UserStatus, UserUpdateOptions,
 };
 use metadata::stm::user::{
     CreatePersonalAccessTokenRequest, DeletePersonalAccessTokenRequest, ROOT_USER_CREATED_AT_MICROS,
@@ -360,12 +363,18 @@ impl SimClient {
     /// Panics if the new name or the existing stream name is not a valid
     /// `WireName`.
     pub fn update_stream(&self, stream: &str, new_name: &str) -> Message<RoutedRequestHeader> {
-        let wire = UpdateStreamRequest {
-            stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
-            name: WireName::new(new_name).expect("stream name must be valid"),
-            options: WireOptions::empty(),
-        };
-        self.build_request(Operation::UpdateStream, &wire.to_bytes())
+        let patch = StreamUpdateOptions {
+            name: Some(new_name.to_owned()),
+            ..StreamUpdateOptions::default()
+        }
+        .to_patch()
+        .expect("stream name must be valid");
+        self.update_resource(
+            ResourceTarget::Stream {
+                stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
+            },
+            patch,
+        )
     }
 
     /// # Panics
@@ -392,20 +401,22 @@ impl SimClient {
     }
 
     /// # Panics
-    /// Panics if `stream`, `topic`, or `new_name` is not a valid `WireName`.
+    /// Panics if `stream` or `topic` is not a valid `WireName`, or `options`
+    /// fail the client-side patch checks.
     pub fn update_topic(
         &self,
         stream: &str,
         topic: &str,
-        new_name: &str,
+        options: &TopicUpdateOptions,
     ) -> Message<RoutedRequestHeader> {
-        let wire = UpdateTopicRequest {
-            stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
-            topic_id: WireIdentifier::named(topic).expect("topic name must be valid"),
-            name: WireName::new(new_name).expect("topic name must be valid"),
-            options: WireOptions::empty(),
-        };
-        self.build_request(Operation::UpdateTopic, &wire.to_bytes())
+        let patch = options.to_patch().expect("topic patch must be valid");
+        self.update_resource(
+            ResourceTarget::Topic {
+                stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
+                topic_id: WireIdentifier::named(topic).expect("topic name must be valid"),
+            },
+            patch,
+        )
     }
 
     /// # Panics
@@ -557,15 +568,34 @@ impl SimClient {
         &self,
         user: &str,
         new_username: Option<&str>,
-        status: Option<u8>,
+        status: Option<UserStatus>,
     ) -> Message<RoutedRequestHeader> {
-        let wire = UpdateUserRequest {
-            user_id: WireIdentifier::named(user).expect("username must be valid"),
-            username: new_username.map(|n| WireName::new(n).expect("username must be valid")),
+        let patch = UserUpdateOptions {
+            username: new_username.map(ToOwned::to_owned),
             status,
-            options: WireOptions::empty(),
+            ..UserUpdateOptions::default()
+        }
+        .to_patch()
+        .expect("username must be valid");
+        self.update_resource(
+            ResourceTarget::User {
+                user_id: WireIdentifier::named(user).expect("username must be valid"),
+            },
+            patch,
+        )
+    }
+
+    fn update_resource(
+        &self,
+        target: ResourceTarget,
+        patch: OptionsPatch,
+    ) -> Message<RoutedRequestHeader> {
+        let wire = UpdateResourceRequest {
+            target,
+            reset: patch.reset,
+            options: patch.set,
         };
-        self.build_request(Operation::UpdateUser, &wire.to_bytes())
+        self.build_request(Operation::UpdateResource, &wire.to_bytes())
     }
 
     /// # Panics

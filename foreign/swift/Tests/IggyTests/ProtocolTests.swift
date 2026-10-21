@@ -112,11 +112,11 @@ struct ConsensusSessionTests {
 @Suite("Command codes and operations")
 struct CommandCodeTests {
     @Test func retiredCodesStayUnknown() {
-        for code: UInt32 in [14, 102, 103, 104, 123, 205, 305] {
+        for code: UInt32 in [14, 35, 102, 103, 104, 123, 204, 205, 304, 305] {
             #expect(CommandCode(rawValue: code) == nil)
             #expect(ConsensusOperation.forCode(code) == .nonReplicated)
         }
-        for operation: UInt8 in [131, 135, 163, 164, 165] {
+        for operation: UInt8 in [129, 131, 133, 135, 142, 163, 164, 165] {
             #expect(ConsensusOperation(rawValue: operation) == nil)
         }
     }
@@ -142,12 +142,17 @@ struct CommandCodeTests {
             #expect(!operation.isMetadata)
             #expect(!operation.isResultFramed)
         }
-        for operation in [ConsensusOperation.finalizeSession, .completeLifecycle, .truncatePartition] {
+        for operation in [
+            ConsensusOperation.finalizeSession, .completeLifecycle, .truncatePartition, .updateStreamResolved, .updateTopicResolved,
+            .updateUserResolved, .rewrapStreamKeys,
+        ] {
             #expect(operation.isInternal)
             #expect(operation.isMetadata)
             #expect(!operation.isPartition)
         }
-        for operation in [ConsensusOperation.sendMessages, .storeConsumerOffset, .createStream, .register] {
+        #expect(ConsensusOperation.forCode(CommandCode.updateResource.rawValue) == .updateResource)
+        #expect(ConsensusOperation.updateResource.isMetadata && ConsensusOperation.updateResource.isResultFramed)
+        for operation in [ConsensusOperation.sendMessages, .storeConsumerOffset, .createStream, .register, .updateResource] {
             #expect(!operation.isInternal)
         }
     }

@@ -43,7 +43,9 @@ enum Responses {
         let sizeBytes = try reader.readUInt64()
         let messagesCount = try reader.readUInt64()
         let name = try reader.readName()
-        let options = try OptionsBlock.decode(try reader.readPrefixedBytes(), explicit: true)
+        let explicit = try reader.readPrefixedBytes()
+        let derived = try reader.readPrefixedBytes()
+        let options = try OptionsBlock.decodeSplit(explicit: explicit, derived: derived)
         return StreamInfo(
             id: id, createdAt: IggyTimestamp(microseconds: createdAt), name: name, sizeBytes: sizeBytes, messagesCount: messagesCount, topicsCount: topicsCount,
             options: options)
@@ -78,25 +80,14 @@ enum Responses {
         let id = try reader.readUInt32()
         let createdAt = try reader.readUInt64()
         let partitionsCount = try reader.readUInt32()
-        let messageExpiry = try reader.readUInt64()
-        let compression = try reader.readUInt8()
-        let maxTopicSize = try reader.readUInt64()
         let sizeBytes = try reader.readUInt64()
         let messagesCount = try reader.readUInt64()
         let name = try reader.readName()
         let explicit = try reader.readPrefixedBytes()
         let derived = try reader.readPrefixedBytes()
-        guard let compressionAlgorithm = CompressionAlgorithm(rawValue: compression) else {
-            throw IggyError(.invalidCommand, context: "unknown compression algorithm \(compression)")
-        }
-        // A stored expiry of zero means the topic never expires, unlike the
-        // request side where zero is the server default.
-        let expiry: IggyExpiry = messageExpiry == 0 ? .never : IggyExpiry(wireMicroseconds: messageExpiry)
         return Topic(
-            id: id, createdAt: IggyTimestamp(microseconds: createdAt), name: name, sizeBytes: sizeBytes, messageExpiry: expiry,
-            compressionAlgorithm: compressionAlgorithm, maxTopicSize: MaxTopicSize(wireValue: maxTopicSize),
-            messagesCount: messagesCount, partitionsCount: partitionsCount,
-            options: try OptionsBlock.decodeSplit(explicit: explicit, derived: derived))
+            id: id, createdAt: IggyTimestamp(microseconds: createdAt), name: name, sizeBytes: sizeBytes, messagesCount: messagesCount,
+            partitionsCount: partitionsCount, options: try OptionsBlock.decodeSplit(explicit: explicit, derived: derived))
     }
 
     static func partition(from reader: inout ByteReader) throws -> Partition {
@@ -248,7 +239,9 @@ enum Responses {
         let createdAt = try reader.readUInt64()
         let statusCode = try reader.readUInt8()
         let username = try reader.readName()
-        let options = try OptionsBlock.decode(try reader.readPrefixedBytes(), explicit: true)
+        let explicit = try reader.readPrefixedBytes()
+        let derived = try reader.readPrefixedBytes()
+        let options = try OptionsBlock.decodeSplit(explicit: explicit, derived: derived)
         guard let status = UserStatus(rawValue: statusCode) else {
             throw IggyError(.invalidUserStatus, context: "unknown user status \(statusCode)")
         }
@@ -415,12 +408,13 @@ enum Responses {
             for _ in 0..<count {
                 let key = try reader.readName()
                 let kindCode = try reader.readUInt8()
+                let flags = OptionFlags(rawValue: try reader.readUInt8())
                 let defaultValue = Array(try reader.readPrefixedBytes())
                 let description = String(decoding: try reader.readPrefixedBytes(), as: UTF8.self)
                 guard let kind = HeaderKind(rawValue: kindCode) else {
                     throw IggyError(.invalidHeaderKind, context: "unknown option kind \(kindCode)")
                 }
-                specs.append(OptionSpec(key: key, kind: kind, defaultValue: defaultValue, description: description))
+                specs.append(OptionSpec(key: key, kind: kind, flags: flags, defaultValue: defaultValue, description: description))
             }
             return specs
         }

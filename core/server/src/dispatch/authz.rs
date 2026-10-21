@@ -120,14 +120,15 @@ where
                 | Operation::FinalizeSession
                 | Operation::RetireSession
                 | Operation::CompleteLifecycle
+                | Operation::RewrapStreamKeys
                 | Operation::TransitionPartitionHistory
                 | Operation::InstallConsumerGroupOwner
                 | Operation::RetireConsumerGroupOwners
                 | Operation::CreateStream
-                | Operation::UpdateStream
+                | Operation::UpdateStreamResolved
                 | Operation::DeleteStream
                 | Operation::CreateTopic
-                | Operation::UpdateTopic
+                | Operation::UpdateTopicResolved
                 | Operation::DeleteTopic
                 | Operation::CreatePartitions
                 | Operation::DeletePartitions
@@ -135,7 +136,8 @@ where
                 | Operation::CreateConsumerGroup
                 | Operation::DeleteConsumerGroup
                 | Operation::CreateUser
-                | Operation::UpdateUser
+                | Operation::UpdateUserResolved
+                | Operation::UpdateResource
                 | Operation::DeleteUser
                 | Operation::ChangePassword
                 | Operation::UpdatePermissions

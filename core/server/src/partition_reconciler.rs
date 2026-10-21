@@ -166,7 +166,9 @@ use iggy_binary_protocol::{
     AckLevel, Command, Operation, PrepareHeader, ReplyHeader, RoutedRequestHeader, WireConsumer,
     WireEncode, WireIdentifier,
 };
-use iggy_common::{ConsumerKind, IggyTimestamp};
+use iggy_common::{
+    ConsumerKind, IggyError, IggyTimestamp, StreamEncryption, check_critical_options,
+};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::AUTO_COMMIT_CLIENT_ID;
@@ -177,7 +179,7 @@ use metadata::stm::lifecycle::{
     RETIRED_PARTITION_OP,
 };
 use metadata::stm::stream::{Partition, StatsRegistry};
-use partitions::{delete_partitions_from_disk, read_created_revision};
+use partitions::{StreamKeyIdentity, delete_partitions_from_disk, read_created_revision};
 use server_common::Message;
 use server_common::sharding::{IggyNamespace, ShardId};
 use shard::MetadataSubmit;
@@ -185,6 +187,7 @@ use shard::ReconcileOp;
 use shard::shards_table::{ShardsTable, calculate_shard_assignment};
 use shard::{Receiver, Sender};
 use std::cell::{Cell, OnceCell, RefCell};
+use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -539,6 +542,7 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
     reconcile_parked_frames(ctx, &mut counters);
     reconcile_consumer_group_offsets(ctx, &mut counters);
     reconcile_segment_truncations(ctx, &mut counters);
+    reconcile_stream_keys(ctx);
     report_lifecycles(ctx).await;
 
     let local_set: AHashSet<IggyNamespace> =
@@ -580,6 +584,23 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
     }
 
     true
+}
+
+/// Forget the keys of deleted stream incarnations, so a reused stream id can
+/// never meet a previous stream's key.
+fn reconcile_stream_keys(ctx: &ReconcilerCtx) {
+    let live: BTreeSet<StreamKeyIdentity> =
+        ctx.shard.plane.metadata().mux_stm.streams().read(|inner| {
+            inner
+                .items
+                .iter()
+                .map(|(_, stream)| StreamKeyIdentity {
+                    stream_id: stream.id,
+                    created_op: stream.created_op,
+                })
+                .collect()
+        });
+    ctx.shard.plane.partitions().retain_stream_keys(&live);
 }
 
 /// Runs on every wake, apart from the full pass. A fence applies, or its
@@ -748,10 +769,53 @@ async fn reconcile_additions(
         // Resolved only for namespaces actually built, not once per committed
         // partition every pass. A stream, topic or partition that vanished
         // between the target snapshot and this read defers to the next pass.
-        let Some((partition_stats, topic_runtime, partition_metadata)) =
-            fetch_partition_build_inputs(ctx, ns)
+        let Some(PartitionBuildInputs {
+            stats: partition_stats,
+            runtime: topic_runtime,
+            metadata: partition_metadata,
+            stream_key,
+            encryption,
+        }) = fetch_partition_build_inputs(ctx, ns)
         else {
             continue;
+        };
+        let topic_runtime = match topic_runtime {
+            Ok(topic_runtime) => topic_runtime,
+            Err(error) => {
+                ctx.record_failure(ns, FailureCause::Add, now);
+                ctx.shard.metrics().record_partition_reconcile_failure();
+                error!(
+                    shard = shard_id,
+                    stream_id = ns.stream_id(),
+                    topic_id = ns.topic_id(),
+                    partition_id = ns.partition_id(),
+                    %error,
+                    "Partition of topic {} cannot be built, its options hold critical state this node cannot read",
+                    ns.topic_id()
+                );
+                continue;
+            }
+        };
+        // An encrypted partition is built only with its own stream's key. A
+        // key that does not open here leaves the partition unbuilt, never
+        // served as plaintext or under another key.
+        let encryptor = match partitions.resolve_stream_encryptor(stream_key, &encryption) {
+            Ok(encryptor) => encryptor,
+            Err(error) => {
+                ctx.record_failure(ns, FailureCause::Add, now);
+                ctx.shard.metrics().record_partition_reconcile_failure();
+                error!(
+                    shard = shard_id,
+                    stream_id = ns.stream_id(),
+                    topic_id = ns.topic_id(),
+                    partition_id = ns.partition_id(),
+                    kek_fingerprints = %partitions.key_context().kek_fingerprints().join(","),
+                    %error,
+                    "Partition of stream {} cannot be built, its key does not open on this node",
+                    ns.stream_id()
+                );
+                continue;
+            }
         };
 
         // A directory already on disk is a prior life of this namespace. The
@@ -829,7 +893,8 @@ async fn reconcile_additions(
             .map(Some)
         };
         match built {
-            Ok(Some(partition)) => {
+            Ok(Some(mut partition)) => {
+                partition.set_encryptor(encryptor);
                 ctx.shard.enqueue_reconcile_op(ReconcileOp::InsertOwned {
                     namespace: ns,
                     partition: Box::new(partition),
@@ -1491,6 +1556,17 @@ fn settle_partition_stats(ctx: &ReconcilerCtx, ns: IggyNamespace) {
         .remove_partitions(ns.stream_id(), ns.topic_id(), &[ns.partition_id()]);
 }
 
+/// What building one partition reads from committed metadata.
+struct PartitionBuildInputs {
+    stats: Arc<iggy_common::PartitionStats>,
+    /// `UnsupportedCriticalOption` when the topic holds critical state this
+    /// build cannot read.
+    runtime: Result<iggy_common::TopicRuntimeOptions, IggyError>,
+    metadata: Partition,
+    stream_key: StreamKeyIdentity,
+    encryption: StreamEncryption,
+}
+
 /// Everything one namespace's build needs out of committed metadata: the shared
 /// `Arc<PartitionStats>`, the topic's runtime options, and the committed
 /// [`Partition`] record the disk loader reads `created_at` / `created_revision`
@@ -1509,11 +1585,7 @@ fn settle_partition_stats(ctx: &ReconcilerCtx, ns: IggyNamespace) {
 fn fetch_partition_build_inputs(
     ctx: &ReconcilerCtx,
     ns: IggyNamespace,
-) -> Option<(
-    Arc<iggy_common::PartitionStats>,
-    iggy_common::TopicRuntimeOptions,
-    Partition,
-)> {
+) -> Option<PartitionBuildInputs> {
     ctx.shard.plane.metadata().mux_stm.streams().read(|inner| {
         let stream = inner.items.get(ns.stream_id())?;
         let topic = stream.topics.get(ns.topic_id())?;
@@ -1524,16 +1596,22 @@ fn fetch_partition_build_inputs(
             .clone();
         // Get-or-create in the shared registry so the owning shard's counters
         // are the same `Arc` every shard's `get_topic` reply reads.
-        Some((
-            inner.stats_registry.partition(
+        Some(PartitionBuildInputs {
+            stats: inner.stats_registry.partition(
                 ns.stream_id(),
                 ns.topic_id(),
                 &partition,
                 topic.stats.clone(),
             ),
-            iggy_common::TopicRuntimeOptions::from_resource_options(&topic.options),
-            partition,
-        ))
+            runtime: check_critical_options(&topic.options)
+                .map(|()| iggy_common::TopicRuntimeOptions::from_resource_options(&topic.options)),
+            metadata: partition,
+            stream_key: StreamKeyIdentity {
+                stream_id: stream.id,
+                created_op: stream.created_op,
+            },
+            encryption: StreamEncryption::from(&stream.options),
+        })
     })
 }
 
@@ -1872,6 +1950,10 @@ mod tests {
     use iggy_binary_protocol::{
         AckLevel, Command, Operation, PrepareHeader, RepairRangeReplyHeader, ReplyHeader,
         RoutedRequestHeader, WireConsumer, WireIdentifier, WireOptions,
+    };
+    use iggy_common::wire_conversions::resource_options_to_wire;
+    use iggy_common::{
+        HeaderKey, HeaderValue, OptionKey, OptionValue, OptionsProvenance, ResourceOptions,
     };
     use message_bus::IggyMessageBus;
     use metadata::IggyMetadata;
@@ -2354,7 +2436,7 @@ mod tests {
                 validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
                 preallocate_segments: false,
-                encryptor: None,
+                key_context: Arc::default(),
                 // The reconciler reads segment and offset paths off this layout,
                 // so it must root where `test_config` rooted the server's own.
                 path_layout: PartitionPathLayout {
@@ -2590,6 +2672,55 @@ mod tests {
         );
     }
 
+    #[compio::test]
+    async fn given_topic_with_unknown_critical_option_when_reconciling_should_not_build_its_partition()
+     {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-a");
+        let unreadable = ResourceOptions::from([
+            (
+                HeaderKey::from(OptionKey::CriticalKeys),
+                OptionValue::explicit(HeaderValue::try_from("a_future_key").expect("marker fits")),
+            ),
+            (
+                HeaderKey::try_from("a_future_key").expect("key fits"),
+                OptionValue::explicit(HeaderValue::from(7u64)),
+            ),
+        ]);
+        let request = CreateTopicWithAssignmentsRequest {
+            request: CreateTopicRequest {
+                stream_id: WireIdentifier::numeric(0),
+                partitions_count: 1,
+                name: WireName::new("topic-a").expect("test topic name fits WireName"),
+                options: WireOptions::empty(),
+            },
+            derived_options: resource_options_to_wire(&unreadable, OptionsProvenance::All)
+                .expect("options encode"),
+            partitions: vec![assignment(0, 1)],
+            created_view: 0,
+        };
+        mux.update(build_prepare(
+            2,
+            Operation::CreateTopicWithAssignments,
+            &request,
+        ))
+        .expect("CreateTopicWithAssignments apply succeeds");
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+
+        reconcile_pass(&ctx).await;
+
+        assert!(
+            !shard
+                .plane
+                .partitions()
+                .contains(&IggyNamespace::new(0, 0, 0)),
+            "a topic this build cannot read must not be served"
+        );
+    }
+
     /// A delete and a recreate of the same ids can commit while a pass runs,
     /// so the pass holds an older epoch than the committed partition. The
     /// directory of the committed incarnation must survive that deferral,
@@ -2605,8 +2736,9 @@ mod tests {
             let shard = build_test_shard(0, &config, mux);
             let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
             let ns = IggyNamespace::new(0, 0, 0);
-            let (_, _, partition) =
-                fetch_partition_build_inputs(&ctx, ns).expect("committed namespace resolves");
+            let partition = fetch_partition_build_inputs(&ctx, ns)
+                .expect("committed namespace resolves")
+                .metadata;
             let snapshot_epoch = partition
                 .created_revision
                 .checked_sub(1)
@@ -2702,8 +2834,9 @@ mod tests {
 
         reconcile_once(&ctx).await;
         ctx.shard.apply_reconcile_ops();
-        let (stats, ..) =
-            fetch_partition_build_inputs(&ctx, ns).expect("materialised namespace has stats");
+        let stats = fetch_partition_build_inputs(&ctx, ns)
+            .expect("materialised namespace has stats")
+            .stats;
         stats.increment_size_bytes(512);
 
         seed_delete_topic(&ctx.shard.plane.metadata().mux_stm, 3, 0, 0);
@@ -2743,8 +2876,9 @@ mod tests {
 
         reconcile_once(&ctx).await;
         ctx.shard.apply_reconcile_ops();
-        let (stats, _, partition) =
+        let inputs =
             fetch_partition_build_inputs(&ctx, ns).expect("materialised namespace has stats");
+        let (stats, partition) = (inputs.stats, inputs.metadata);
         let topic_stats = stats.parent();
 
         seed_delete_topic(&ctx.shard.plane.metadata().mux_stm, 3, 0, 0);
@@ -2832,8 +2966,9 @@ mod tests {
         // `ensure_initial_segment` plants exactly one segment per build and
         // folds it into the namespace's shared stats, so this counter is the
         // observable that separates them.
-        let (stats, ..) =
-            fetch_partition_build_inputs(&ctx, ns).expect("materialised namespace has stats");
+        let stats = fetch_partition_build_inputs(&ctx, ns)
+            .expect("materialised namespace has stats")
+            .stats;
         assert_eq!(
             stats.segments_count_inconsistent(),
             1,
@@ -2870,8 +3005,9 @@ mod tests {
         let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config.clone()));
         let ns = IggyNamespace::new(0, 0, 0);
 
-        let (stats, ..) =
-            fetch_partition_build_inputs(&ctx, ns).expect("committed namespace has stats");
+        let stats = fetch_partition_build_inputs(&ctx, ns)
+            .expect("committed namespace has stats")
+            .stats;
         let live = build_partition_fresh(
             &config,
             ctx.shard.plane.partitions().config(),

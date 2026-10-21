@@ -25,6 +25,7 @@ public enum CommandCode: UInt32, Sendable, Hashable, CaseIterable {
     case describeOptions = 13
     // 14 was attach_consumer_session; the server keeps the code retired.
     case bindSession = 15
+    case updateResource = 16
     case getMe = 20
     case getClient = 21
     case getClients = 22
@@ -32,7 +33,7 @@ public enum CommandCode: UInt32, Sendable, Hashable, CaseIterable {
     case getUsers = 32
     case createUser = 33
     case deleteUser = 34
-    case updateUser = 35
+    // 35 was update_user. The server keeps the code retired.
     case updatePermissions = 36
     case changePassword = 37
     case loginUser = 38
@@ -56,14 +57,12 @@ public enum CommandCode: UInt32, Sendable, Hashable, CaseIterable {
     case getStreams = 201
     case createStream = 202
     case deleteStream = 203
-    case updateStream = 204
-    // 205 was purge_stream; the server keeps the code retired.
+    // 204 was update_stream and 205 purge_stream. The server keeps both retired.
     case getTopic = 300
     case getTopics = 301
     case createTopic = 302
     case deleteTopic = 303
-    case updateTopic = 304
-    // 305 was purge_topic; the server keeps the code retired.
+    // 304 was update_topic and 305 purge_topic. The server keeps both retired.
     case createPartitions = 402
     case deletePartitions = 403
     case deleteSegments = 503
@@ -84,6 +83,7 @@ public enum CommandCode: UInt32, Sendable, Hashable, CaseIterable {
         case .getClusterMetadata: "cluster.metadata"
         case .describeOptions: "options.describe"
         case .bindSession: "session.bind"
+        case .updateResource: "resource.update"
         case .getMe: "me"
         case .getClient: "client.get"
         case .getClients: "client.list"
@@ -91,7 +91,6 @@ public enum CommandCode: UInt32, Sendable, Hashable, CaseIterable {
         case .getUsers: "user.list"
         case .createUser: "user.create"
         case .deleteUser: "user.delete"
-        case .updateUser: "user.update"
         case .updatePermissions: "user.permissions"
         case .changePassword: "user.password"
         case .loginUser: "user.login"
@@ -112,12 +111,10 @@ public enum CommandCode: UInt32, Sendable, Hashable, CaseIterable {
         case .getStreams: "stream.list"
         case .createStream: "stream.create"
         case .deleteStream: "stream.delete"
-        case .updateStream: "stream.update"
         case .getTopic: "topic.get"
         case .getTopics: "topic.list"
         case .createTopic: "topic.create"
         case .deleteTopic: "topic.delete"
-        case .updateTopic: "topic.update"
         case .createPartitions: "partition.create"
         case .deletePartitions: "partition.delete"
         case .deleteSegments: "segment.delete"

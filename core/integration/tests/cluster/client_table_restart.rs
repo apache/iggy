@@ -1240,7 +1240,10 @@ async fn primary_index(harness: &TestHarness, observer: &IggyClient) -> usize {
 }
 
 async fn create_liveness_group(observer: &IggyClient) {
-    observer.create_stream(LIVENESS_STREAM).await.unwrap();
+    observer
+        .create_stream(LIVENESS_STREAM, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     let stream = Identifier::named(LIVENESS_STREAM).unwrap();
     let topic = Identifier::named(LIVENESS_TOPIC).unwrap();
     observer

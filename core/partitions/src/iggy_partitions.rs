@@ -18,6 +18,7 @@
 #![allow(dead_code)]
 
 use crate::poll_plan::{PollPlan, PollReadResult};
+use crate::stream_keyring::{StreamKeyIdentity, StreamKeyring};
 use crate::types::PartitionsConfig;
 use crate::{IggyPartition, Partition, PollingArgs, PollingConsumer};
 use crate::{PollCompletion, PollReplication};
@@ -29,7 +30,7 @@ use iggy_binary_protocol::{
     Command, ConsensusHeader, Operation, PrepareHeader, PrepareOkHeader, ReplyHeader,
     RoutedRequestHeader,
 };
-use iggy_common::IggyError;
+use iggy_common::{EncryptorKind, IggyError, ServerKeyContext, StreamEncryption};
 use journal::superblock::{PingPongSuperblock, SuperblockStore};
 use message_bus::MessageBus;
 use server_common::Message;
@@ -37,8 +38,9 @@ use server_common::send_messages::{ChecksumMode, convert_request_message, encryp
 use server_common::sharding::{IggyNamespace, LocalIdx, ShardId};
 use std::cell::Cell;
 use std::cell::{RefCell, UnsafeCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::task::Waker;
 use tracing::warn;
 
@@ -110,6 +112,9 @@ where
     /// per-shard runtime is single-threaded, so runtime borrow checks
     /// suffice; callers must not hold a borrow across `.await`.
     tombstoned: RefCell<AHashMap<IggyNamespace, Option<u64>>>,
+    /// Stream encryptors by stream incarnation, opened with this node's keys.
+    /// Same single-threaded borrow rules as `tombstoned`.
+    keyring: RefCell<StreamKeyring>,
     /// Reconciler fences must not borrow a partition held by the pump across await.
     teardown: RefCell<AHashMap<IggyNamespace, crate::PartitionTeardown>>,
     consumer_group_offsets_reconcile_epoch: Rc<Cell<u64>>,
@@ -149,12 +154,14 @@ where
 {
     #[must_use]
     pub fn new(shard_id: ShardId, config: PartitionsConfig) -> Self {
+        let keyring = RefCell::new(StreamKeyring::new(Arc::clone(&config.key_context)));
         Self {
             shard_id,
             config,
             partitions: UnsafeCell::new(Vec::new()),
             namespace_to_local: UnsafeCell::new(BTreeMap::new()),
             tombstoned: RefCell::new(AHashMap::new()),
+            keyring,
             teardown: RefCell::new(AHashMap::new()),
             consumer_group_offsets_reconcile_epoch: Rc::new(Cell::new(0)),
             fence_published: Rc::default(),
@@ -168,6 +175,7 @@ where
 
     #[must_use]
     pub fn with_capacity(shard_id: ShardId, config: PartitionsConfig, capacity: usize) -> Self {
+        let keyring = RefCell::new(StreamKeyring::new(Arc::clone(&config.key_context)));
         Self {
             shard_id,
             config,
@@ -175,6 +183,7 @@ where
             // BTreeMap has no capacity hint; the Vec above absorbs the sizing.
             namespace_to_local: UnsafeCell::new(BTreeMap::new()),
             tombstoned: RefCell::new(AHashMap::new()),
+            keyring,
             teardown: RefCell::new(AHashMap::new()),
             consumer_group_offsets_reconcile_epoch: Rc::new(Cell::new(0)),
             fence_published: Rc::default(),
@@ -184,6 +193,31 @@ where
             #[cfg(debug_assertions)]
             borrow_active: Cell::new(0),
         }
+    }
+
+    /// This node's key-encryption keys, for wrapping new stream keys.
+    #[must_use]
+    pub fn key_context(&self) -> Arc<ServerKeyContext> {
+        Arc::clone(&self.config.key_context)
+    }
+
+    /// The encryptor of one stream incarnation, `None` only for a plaintext
+    /// stream.
+    ///
+    /// # Errors
+    ///
+    /// See [`StreamKeyring::resolve`]: the stream is unavailable on this node.
+    pub fn resolve_stream_encryptor(
+        &self,
+        identity: StreamKeyIdentity,
+        encryption: &StreamEncryption,
+    ) -> Result<Option<Arc<EncryptorKind>>, IggyError> {
+        self.keyring.borrow_mut().resolve(identity, encryption)
+    }
+
+    /// Drop the encryptors of stream incarnations that no longer exist.
+    pub fn retain_stream_keys(&self, live: &BTreeSet<StreamKeyIdentity>) {
+        self.keyring.borrow_mut().retain(live);
     }
 
     pub fn set_persistence_notifier(&self, notifier: crate::PersistenceNotifier) {
@@ -799,8 +833,13 @@ where
         // user headers per message. The ciphertext is what gets journaled,
         // replicated, checksummed, and persisted -- every replica stores
         // identical bytes -- and the poll reply is the single decrypt point.
+        // The partition's own encryptor: each stream has its own key, pinned
+        // to the partition when it was built.
+        let encryptor = self
+            .get_by_ns(&namespace)
+            .and_then(|partition| partition.encryptor().cloned());
         let message = if message.header().operation == Operation::SendMessages
-            && let Some(encryptor) = &self.config().encryptor
+            && let Some(encryptor) = &encryptor
         {
             // Compute the batch checksum: this canonical output is validated by
             // `encrypt_batch_request`'s decode before re-encryption, and the
@@ -986,7 +1025,7 @@ mod tests {
             validate_checksum: true,
             segment_size: IggyByteSize::from(1024 * 1024_u64),
             preallocate_segments: false,
-            encryptor: None,
+            key_context: Arc::default(),
             path_layout: crate::PartitionPathLayout::default(),
         };
         let partitions = IggyPartitions::new(ShardId::new(0), config);
@@ -1332,7 +1371,7 @@ mod tests {
             validate_checksum: false,
             segment_size: IggyByteSize::from(1024 * 1024),
             preallocate_segments: false,
-            encryptor: None,
+            key_context: Arc::default(),
             path_layout: crate::PartitionPathLayout::default(),
         };
         let partitions = IggyPartitions::new(ShardId::new(0), config);

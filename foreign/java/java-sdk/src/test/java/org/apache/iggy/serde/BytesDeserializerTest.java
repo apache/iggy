@@ -29,8 +29,8 @@ import org.apache.iggy.exception.IggyMalformedResponseException;
 import org.apache.iggy.message.HeaderKey;
 import org.apache.iggy.message.HeaderKind;
 import org.apache.iggy.message.HeaderValue;
+import org.apache.iggy.stream.EncryptionKeySource;
 import org.apache.iggy.system.CacheMetricsKey;
-import org.apache.iggy.topic.CompressionAlgorithm;
 import org.apache.iggy.user.UserStatus;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -84,9 +84,6 @@ class BytesDeserializerTest {
         buffer.writeIntLE(10); // topic ID
         writeU64(buffer, BigInteger.valueOf(1000)); // created at
         buffer.writeIntLE(4); // partitions count
-        writeU64(buffer, BigInteger.ZERO); // message expiry
-        buffer.writeByte(CompressionAlgorithm.None.asCode()); // compression
-        writeU64(buffer, BigInteger.valueOf(10000)); // max topic size
         writeU64(buffer, BigInteger.valueOf(500)); // size
         writeU64(buffer, BigInteger.valueOf(50)); // messages count
         buffer.writeByte(4); // name length
@@ -100,9 +97,6 @@ class BytesDeserializerTest {
         buffer.writeIntLE(10);
         writeU64(buffer, BigInteger.valueOf(1000));
         buffer.writeIntLE(4);
-        writeU64(buffer, BigInteger.ZERO);
-        buffer.writeByte(CompressionAlgorithm.None.asCode());
-        writeU64(buffer, BigInteger.valueOf(10000));
         writeU64(buffer, BigInteger.valueOf(500));
         writeU64(buffer, BigInteger.valueOf(50));
         buffer.writeByte(4);
@@ -202,6 +196,8 @@ class BytesDeserializerTest {
             buffer.writeByte(11); // name length
             buffer.writeBytes("test-stream".getBytes(StandardCharsets.UTF_8));
             writeOptionsBlock(buffer, Map.of());
+            writeOptionsBlock(
+                    buffer, Map.of(HeaderKey.fromString("encryption_key_source"), HeaderValue.fromString("server")));
 
             // when
             var stream = readStreamBase(buffer);
@@ -211,6 +207,8 @@ class BytesDeserializerTest {
             assertThat(stream.createdAt()).isEqualTo(BigInteger.valueOf(1000));
             assertThat(stream.topicsCount()).isEqualTo(2L);
             assertThat(stream.name()).isEqualTo("test-stream");
+            assertThat(stream.options()).isEmpty();
+            assertThat(stream.encryptionKeySource()).contains(EncryptionKeySource.SERVER);
         }
 
         @Test
@@ -225,6 +223,7 @@ class BytesDeserializerTest {
             writeU64(buffer, BigInteger.valueOf(100));
             buffer.writeByte(6);
             buffer.writeBytes("stream".getBytes());
+            writeOptionsBlock(buffer, Map.of());
             writeOptionsBlock(buffer, Map.of());
             // Write one topic
             writeTopicData(buffer);
@@ -812,6 +811,7 @@ class BytesDeserializerTest {
             buffer.writeByte(4); // username length
             buffer.writeBytes("user".getBytes());
             writeOptionsBlock(buffer, Map.of());
+            writeOptionsBlock(buffer, Map.of());
 
             // when
             var userInfo = readUserInfo(buffer);
@@ -833,6 +833,7 @@ class BytesDeserializerTest {
             buffer.writeByte(5);
             buffer.writeBytes("admin".getBytes());
             writeOptionsBlock(buffer, Map.of());
+            writeOptionsBlock(buffer, Map.of());
             buffer.writeIntLE(0); // no-permissions marker: u32_le(0)
 
             // when
@@ -852,6 +853,7 @@ class BytesDeserializerTest {
             buffer.writeByte(UserStatus.Active.asCode());
             buffer.writeByte(5);
             buffer.writeBytes("admin".getBytes());
+            writeOptionsBlock(buffer, Map.of());
             writeOptionsBlock(buffer, Map.of());
             buffer.writeBoolean(true); // has permissions
             buffer.writeIntLE(10); // permissions length (ignored but required)

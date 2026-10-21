@@ -911,6 +911,26 @@ async fn shard_main(
         None
     };
 
+    // Stream key rewrapper: shard 0 only, and only when this node holds a
+    // server key. Each pass no-ops unless this node is the caught-up metadata
+    // primary, so a key rotation is replicated once to every replica.
+    let stream_key_rewrapper_stop =
+        if shard_id == 0 && shard.plane.partitions().key_context().accepts_stream_keys() {
+            let (rewrapper_stop_tx, rewrapper_stop_rx) = channel(1);
+            let rewrapper_shard = Rc::clone(&shard);
+            let rewrapper_handle = compio::runtime::spawn(async move {
+                crate::stream_key_rewrapper::run_stream_key_rewrapper(
+                    rewrapper_shard,
+                    rewrapper_stop_rx,
+                )
+                .await;
+            });
+            bus.track_background(rewrapper_handle);
+            Some(rewrapper_stop_tx)
+        } else {
+            None
+        };
+
     // Segment cleaner: runs on every shard (each replica trims its own log,
     // primary and backup alike). Local and unreplicated; gated by the shared
     // data-maintenance config.
@@ -931,6 +951,7 @@ async fn shard_main(
         reconciler: reconcile_stop_tx,
         heartbeat: heartbeat_stop_tx,
         pat_cleaner: pat_cleaner_stop,
+        stream_key_rewrapper: stream_key_rewrapper_stop,
         segment_cleaner: segment_cleaner_stop,
         sysinfo_printer: None,
         consumer_group_liveness: None,

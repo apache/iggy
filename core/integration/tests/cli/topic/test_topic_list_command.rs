@@ -23,6 +23,7 @@ use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::Client;
 use iggy::prelude::IggyExpiry;
+use iggy::prelude::StreamCreateOptions;
 use iggy::prelude::TopicCreateOptions;
 use predicates::str::{contains, starts_with};
 use serial_test::parallel;
@@ -67,7 +68,9 @@ impl TestTopicListCmd {
 #[async_trait]
 impl IggyCmdTestCase for TestTopicListCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
-        let stream = client.create_stream(&self.stream_name).await;
+        let stream = client
+            .create_stream(&self.stream_name, &StreamCreateOptions::default())
+            .await;
         assert!(stream.is_ok());
 
         let topic = client

@@ -917,7 +917,7 @@ async fn await_marker(harness: &TestHarness, node: usize, marker: &str) {
 
 async fn seed_topic(client: &IggyClient) -> PartitionContext {
     client
-        .create_stream(STREAM_NAME)
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
         .await
         .expect("create stream");
     let stream_id = Identifier::named(STREAM_NAME).expect("stream identifier");

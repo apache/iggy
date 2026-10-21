@@ -27,6 +27,9 @@ import { groupConsumerStream, singleConsumerStream } from '../stream/consumer-st
 import { COMMAND_CODE } from '../wire/command.code.js';
 import { LOGIN, LOGIN_WITH_TOKEN, LOGOUT } from '../wire/index.js';
 import { UPDATE_USER } from '../wire/user/update-user.command.js';
+import { UPDATE_TOPIC } from '../wire/topic/update-topic.command.js';
+import { UPDATE_STREAM } from '../wire/stream/update-stream.command.js';
+import { OptionsScope } from '../wire/system/describe-options.command.js';
 import { CHANGE_PASSWORD } from '../wire/user/change-password.command.js';
 import { POLL_MESSAGES } from '../wire/message/poll-messages.command.js';
 import { SEND_MESSAGES, sendMessages } from '../wire/message/send-messages.command.js';
@@ -360,6 +363,19 @@ const metadataResult = (code: number): Buffer => {
   return body;
 };
 
+const RESOLVED_UPDATES = new Map<number, number>([
+  [OptionsScope.Topic, Operation.UpdateTopicResolved],
+  [OptionsScope.Stream, Operation.UpdateStreamResolved],
+  [OptionsScope.User, Operation.UpdateUserResolved]
+]);
+
+/** The operation a committed reply carries: the primary resolves an update by its scope. */
+const committedOperation = (frame: Buffer): number => {
+  const operation = frame[REQUEST_OFFSET.operation];
+  return operation === Operation.UpdateResource
+    ? RESOLVED_UPDATES.get(frame[HEADER_SIZE]) ?? operation : operation;
+};
+
 /** A single node that also commits offset writes. */
 const offsetCommittingHandler = (port: number): FrameHandler => (frame, socket) => {
   const operation = frame.readUInt8(REQUEST_OFFSET.operation);
@@ -499,10 +515,10 @@ describe('unified partition routing', () => {
         socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.alloc(0)));
         return true;
       }, (frame, socket) => {
-        if (frame[REQUEST_OFFSET.operation] === Operation.UpdateUser) {
+        if (frame[REQUEST_OFFSET.operation] === Operation.UpdateResource) {
           watermark = 19n;
           incarnation = 8n;
-          const response = replyFrame(frame, Operation.UpdateUser, metadataResult(0));
+          const response = replyFrame(frame, Operation.UpdateUserResolved, metadataResult(0));
           response.writeBigUInt64LE(watermark, REPLY_OFFSET.commit);
           response.writeBigUInt64LE(watermark, REPLY_OFFSET.op);
           response[REPLY_OFFSET.reserved] = 1;
@@ -519,7 +535,7 @@ describe('unified partition routing', () => {
           ? groupPollPayload() : GET_OFFSET.serialize({ streamId: 1, topicId: 2,
             consumer: { kind: ConsumerKind.Single, id: 1 }, partitionId: 3 });
         await cluster.client.sendCommand(command, payload);
-        await cluster.client.sendCommand(COMMAND_CODE.UpdateUser, Buffer.alloc(0));
+        await cluster.client.sendCommand(COMMAND_CODE.UpdateResource, Buffer.alloc(0));
         await cluster.client.sendCommand(command, payload);
         assert.deepEqual(histories, [7n, 8n]);
         assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.GetPartitionRoute), 2);
@@ -658,9 +674,9 @@ describe('primary auto-commit polling', () => {
       socket.write(response);
       return true;
     }, (frame, socket) => {
-      if (frame[REQUEST_OFFSET.operation] !== Operation.UpdateTopic)
+      if (frame[REQUEST_OFFSET.operation] !== Operation.UpdateResource)
         return false;
-      const response = replyFrame(frame, Operation.UpdateTopic, Buffer.alloc(4));
+      const response = replyFrame(frame, Operation.UpdateTopicResolved, Buffer.alloc(4));
       response.writeBigUInt64LE(15n, REPLY_OFFSET.commit);
       response.writeBigUInt64LE(15n, REPLY_OFFSET.op);
       response[REPLY_OFFSET.reserved] = 1;
@@ -672,7 +688,7 @@ describe('primary auto-commit polling', () => {
       await cluster.client.sendCommand(COMMAND_CODE.SendMessages, explicitSend);
       await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
       assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.GetPartitionRoute), 2);
-      await cluster.client.sendCommand(COMMAND_CODE.UpdateTopic, Buffer.alloc(0), { handleResponse: false });
+      await cluster.client.sendCommand(COMMAND_CODE.UpdateResource, Buffer.alloc(0), { handleResponse: false });
       await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
       const attachments = cluster.primary.frames.filter((frame) =>
         frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.BindSession);
@@ -901,9 +917,9 @@ describe('primary auto-commit polling', () => {
       firstPoll({ socket, frame });
       return true;
     }, (frame, socket) => {
-      if (frame[REQUEST_OFFSET.operation] !== Operation.UpdateTopic)
+      if (frame[REQUEST_OFFSET.operation] !== Operation.UpdateResource)
         return false;
-      const response = replyFrame(frame, Operation.UpdateTopic, Buffer.alloc(4));
+      const response = replyFrame(frame, Operation.UpdateTopicResolved, Buffer.alloc(4));
       response.writeBigUInt64LE(21n, REPLY_OFFSET.commit);
       response.writeBigUInt64LE(21n, REPLY_OFFSET.op);
       response[REPLY_OFFSET.reserved] = 1;
@@ -914,7 +930,7 @@ describe('primary auto-commit polling', () => {
       const first = cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
       const { socket, frame } = await admitted;
       const second = cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
-      await cluster.client.sendCommand(COMMAND_CODE.UpdateTopic, Buffer.alloc(0));
+      await cluster.client.sendCommand(COMMAND_CODE.UpdateResource, Buffer.alloc(0));
       assert.equal(polls, 1, 'progress polls on one partition share its mutation lane');
       socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.from('primary')));
       await Promise.all([first, second]);
@@ -1055,9 +1071,9 @@ describe('primary auto-commit polling', () => {
   it('binds primary connections after credential changes without another login', async () => {
     const cluster = await startPollCluster(undefined, (frame, socket) => {
       const operation = frame[REQUEST_OFFSET.operation];
-      if (operation !== Operation.UpdateUser && operation !== Operation.ChangePassword)
+      if (operation !== Operation.UpdateResource && operation !== Operation.ChangePassword)
         return false;
-      socket.write(replyFrame(frame, operation, Buffer.alloc(4)));
+      socket.write(replyFrame(frame, committedOperation(frame), Buffer.alloc(4)));
       return true;
     });
     try {
@@ -1149,9 +1165,9 @@ describe('primary auto-commit polling', () => {
   it('updates the configured identity after its password and username change', async () => {
     const cluster = await startPollCluster(undefined, (frame, socket) => {
       const operation = frame[REQUEST_OFFSET.operation];
-      if (operation !== Operation.UpdateUser && operation !== Operation.ChangePassword)
+      if (operation !== Operation.UpdateResource && operation !== Operation.ChangePassword)
         return false;
-      socket.write(replyFrame(frame, operation, Buffer.alloc(4)));
+      socket.write(replyFrame(frame, committedOperation(frame), Buffer.alloc(4)));
       return true;
     });
     try {
@@ -1171,6 +1187,58 @@ describe('primary auto-commit polling', () => {
         assertSharedBinding(login, cluster.primary.frames.filter((frame) =>
           frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.BindSession).at(-1)!);
       }
+    } finally {
+      await cluster.close();
+    }
+  });
+
+  it('keeps the signed-in identity when a stream or topic rename names it', async () => {
+    const cluster = await startPollCluster(undefined, (frame, socket) => {
+      if (frame[REQUEST_OFFSET.operation] !== Operation.UpdateResource)
+        return false;
+      socket.write(replyFrame(frame, committedOperation(frame), Buffer.alloc(4)));
+      return true;
+    });
+    try {
+      await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
+      for (const streamId of [7, 'iggy'])
+        await cluster.client.sendCommand(UPDATE_TOPIC.code,
+          UPDATE_TOPIC.serialize({ streamId, topicId: 'iggy', name: 'renamed' }));
+      for (const streamId of [7, 'iggy'])
+        await cluster.client.sendCommand(UPDATE_STREAM.code,
+          UPDATE_STREAM.serialize({ streamId, name: 'renamed' }));
+      await cluster.client.sendCommand(LOGOUT.code, LOGOUT.serialize());
+      await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
+      const login = cluster.coordinator.frames.filter((frame) =>
+        frame[REQUEST_OFFSET.operation] === Operation.Register).at(-1)!;
+      assert.equal(readWireName(registerCredentialsBody(login), 0).value, 'iggy');
+    } finally {
+      await cluster.close();
+    }
+  });
+
+  it('keeps the old identity when its rename is refused', async () => {
+    const cluster = await startPollCluster(undefined, (frame, socket) => {
+      if (frame[REQUEST_OFFSET.operation] !== Operation.UpdateResource)
+        return false;
+      const response = replyFrame(frame, committedOperation(frame), metadataResult(UNAUTHORIZED));
+      response.writeBigUInt64LE(3n, REPLY_OFFSET.commit);
+      response.writeBigUInt64LE(3n, REPLY_OFFSET.op);
+      response[REPLY_OFFSET.reserved] = 1;
+      socket.write(response);
+      return true;
+    });
+    try {
+      await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
+      await assert.rejects(
+        cluster.client.sendCommand(UPDATE_USER.code, UPDATE_USER.serialize({ userId: 7, username: 'renamed' })),
+        (error: unknown) => error instanceof ResponseError && error.errorCode === UNAUTHORIZED
+      );
+      await cluster.client.sendCommand(LOGOUT.code, LOGOUT.serialize());
+      await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
+      const login = cluster.coordinator.frames.filter((frame) =>
+        frame[REQUEST_OFFSET.operation] === Operation.Register).at(-1)!;
+      assert.equal(readWireName(registerCredentialsBody(login), 0).value, 'iggy');
     } finally {
       await cluster.close();
     }

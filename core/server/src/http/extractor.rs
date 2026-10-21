@@ -15,17 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Bearer-credential extractor for protected shard-0 HTTP routes.
+//! Bearer-credential and JSON body extractors for protected shard-0 HTTP
+//! routes.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 use std::rc::Rc;
 
-use axum::extract::{ConnectInfo, FromRequestParts};
+use axum::Json;
+use axum::body::{Body, Bytes};
+use axum::extract::{ConnectInfo, FromRequest, FromRequestParts, Request};
 use axum::http::HeaderMap;
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
+use axum::response::{IntoResponse, Response};
 use iggy_common::{IggyError, IggyTimestamp, PersonalAccessToken};
 use send_wrapper::SendWrapper;
+use serde::de::{DeserializeOwned, IgnoredAny};
 use tracing::debug;
 
 use super::HttpState;
@@ -55,6 +61,13 @@ pub struct Authenticated {
     /// reason: the extractor mints it on shard 0's compio thread and every
     /// handler runs on that same thread, so the wrapper is never crossed.
     pub session: SendWrapper<Rc<HttpSession>>,
+}
+
+/// A JSON body with the names of its top-level members, so a create handler
+/// can refuse an option sent beside `options` instead of silently dropping it.
+pub struct JsonMembers<T> {
+    pub value: T,
+    pub members: BTreeSet<String>,
 }
 
 impl FromRequestParts<HttpState> for Authenticated {
@@ -97,6 +110,33 @@ impl FromRequestParts<HttpState> for Authenticated {
             SendWrapper::new(state.resolve_session(key, user_id, user_created_at, expiry)).await?;
         Ok(Self {
             session: SendWrapper::new(session),
+        })
+    }
+}
+
+impl<T, S> FromRequest<S> for JsonMembers<T>
+where
+    T: DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    /// Runs axum's own `Json` extraction, so content type checks, body limits
+    /// and rejections stay what every other route answers.
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let (parts, body) = request.into_parts();
+        let bytes = Bytes::from_request(Request::from_parts(parts.clone(), body), state)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        let Json(value) =
+            Json::<T>::from_request(Request::from_parts(parts, Body::from(bytes.clone())), state)
+                .await
+                .map_err(IntoResponse::into_response)?;
+        let Json(members) = Json::<BTreeMap<String, IgnoredAny>>::from_bytes(&bytes)
+            .map_err(IntoResponse::into_response)?;
+        Ok(Self {
+            value,
+            members: members.into_keys().collect(),
         })
     }
 }

@@ -57,7 +57,7 @@ use iggy_binary_protocol::{
 #[cfg(feature = "simulator")]
 use iggy_common::PartitionStats;
 use iggy_common::variadic;
-use iggy_common::{ConsumerKind, IggyError, IggyExpiry, IggyTimestamp, PollingKind};
+use iggy_common::{ConsumerKind, EncryptorKind, IggyError, IggyExpiry, IggyTimestamp, PollingKind};
 use journal::superblock::{PingPongSuperblock, SuperblockStore};
 use journal::{Journal, JournalHandle};
 use message_bus::client_listener::RequestHandler;
@@ -82,7 +82,6 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::rc::Rc;
-#[cfg(feature = "simulator")]
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -471,6 +470,8 @@ pub enum PartitionReadReply {
         context: iggy_binary_protocol::primitives::partition_history::PartitionContext,
         fragments: PollFragments,
         current_offset: u64,
+        /// The owning partition's encryptor, captured with the fragments.
+        encryptor: Option<Arc<EncryptorKind>>,
     },
     ConsumerOffset {
         stored: Option<u64>,

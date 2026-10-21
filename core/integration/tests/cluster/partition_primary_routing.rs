@@ -167,7 +167,7 @@ async fn given_metadata_view_moved_when_producing_to_a_fresh_topic_should_reach_
         .await
         .expect("root client on the metadata leader");
     setup
-        .create_stream(STREAM_NAME)
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
         .await
         .expect("create stream");
     let stream_id = Identifier::named(STREAM_NAME).expect("stream identifier");
@@ -241,7 +241,9 @@ async fn given_any_node_when_routing_a_partition_should_name_the_same_primary(
     root.login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
         .await
         .unwrap();
-    root.create_stream(STREAM_NAME).await.unwrap();
+    root.create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     let stream = Identifier::named(STREAM_NAME).unwrap();
     root.create_topic(
         &stream,
@@ -280,6 +282,7 @@ async fn given_any_node_when_routing_a_partition_should_name_the_same_primary(
                 global,
                 streams: None,
             }),
+            &UserCreateOptions::default(),
         )
         .await
         .unwrap();
@@ -1025,7 +1028,10 @@ async fn seed_split_primaries(harness: &mut TestHarness) -> (usize, usize, u32) 
         .unwrap();
     let stream = Identifier::named(STREAM_NAME).unwrap();
     let topic = Identifier::named(TOPIC_NAME).unwrap();
-    producer.create_stream(STREAM_NAME).await.unwrap();
+    producer
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     producer
         .create_topic(
             &stream,
@@ -1064,7 +1070,10 @@ async fn seed_split_primaries(harness: &mut TestHarness) -> (usize, usize, u32) 
     // preserves a real durable state instead of fabricating its other fields.
     for index in 0..METADATA_CHECKPOINT_REQUESTS {
         producer
-            .create_stream(&format!("{STREAM_NAME}-{index}"))
+            .create_stream(
+                &format!("{STREAM_NAME}-{index}"),
+                &StreamCreateOptions::default(),
+            )
             .await
             .expect("fill the metadata journal to trigger its checkpoint");
     }
@@ -1416,7 +1425,13 @@ async fn assert_data_session_fences(
         ..Default::default()
     };
     member
-        .create_user(OTHER_USER, OTHER_PASSWORD, UserStatus::Active, None)
+        .create_user(
+            OTHER_USER,
+            OTHER_PASSWORD,
+            UserStatus::Active,
+            None,
+            &UserCreateOptions::default(),
+        )
         .await
         .unwrap();
     let other_user = Identifier::named(OTHER_USER).unwrap();

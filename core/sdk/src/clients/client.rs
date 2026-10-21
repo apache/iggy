@@ -1097,7 +1097,7 @@ mod tests {
     use crate::links::fake_cluster::{Answer, FakeCluster, connected, endpoint};
     use crate::links::test_support::LOCALHOST;
     use iggy_binary_protocol::codes::{CREATE_STREAM_CODE, GET_STATS_CODE};
-    use iggy_common::{StreamClient, TcpClientConfig};
+    use iggy_common::{StreamClient, StreamCreateOptions, TcpClientConfig};
     use std::time::Duration;
     use tokio::net::TcpListener;
 
@@ -1140,7 +1140,8 @@ mod tests {
         let client_lock = client.client.clone();
         let guard = client_lock.write().await;
         let start = tokio::time::Instant::now();
-        let (result, ()) = tokio::join!(client.create_stream("stream"), async {
+        let options = StreamCreateOptions::default();
+        let (result, ()) = tokio::join!(client.create_stream("stream", &options), async {
             sleep(Duration::from_secs(20)).await;
             drop(guard);
         });

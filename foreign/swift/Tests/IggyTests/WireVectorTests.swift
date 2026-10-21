@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+import Foundation
 import Testing
 
 @testable import Iggy
@@ -61,7 +62,12 @@ struct RequestVectorTests {
         #expect(try encode(5) == golden.bytes("request.delete_stream"))
         #expect(try encode("my-stream") == golden.bytes("request.get_stream"))
         #expect(golden.bytes("request.get_streams").isEmpty)
-        #expect(try Requests.updateStream(streamID: "old-name", name: "new-name", options: []) == golden.bytes("request.update_stream"))
+        let key = Data((0..<UInt8(EncryptionKey.length)).map { $0 })
+        #expect(
+            try Requests.createStream(name: "test-stream", options: StreamCreateOptions(encryptionKey: key).encode())
+                == golden.bytes("request.create_stream.key"))
+        #expect(
+            try Requests.updateResource(.stream("old-name"), StreamUpdateOptions(name: "new-name").toPatch()) == golden.bytes("request.update_resource.stream"))
     }
 
     @Test func topics() throws {
@@ -71,8 +77,13 @@ struct RequestVectorTests {
         #expect(try Requests.streamAndTopic(1, 5) == golden.bytes("request.delete_topic"))
         #expect(try Requests.streamAndTopic("my-stream", "my-topic") == golden.bytes("request.get_topic"))
         #expect(try encode(42) == golden.bytes("request.get_topics"))
-        let options = try OptionsBlock.encode(["message_expiry": .explicit(.uint64(604_800_000_000))])
-        #expect(try Requests.updateTopic(streamID: 1, topicID: 2, name: "updated-topic", options: options) == golden.bytes("request.update_topic"))
+        let update = TopicUpdateOptions(name: "updated-topic", messageExpiry: .after(.seconds(604_800)), reset: [.maxTopicSize])
+        #expect(try Requests.updateResource(.topic(stream: 1, topic: 2), update.toPatch()) == golden.bytes("request.update_resource.topic"))
+        // Reset names travel in byte order, whatever order they were named in.
+        let resets = TopicUpdateOptions(reset: [.maxTopicSize, .messageExpiry])
+        #expect(
+            try Requests.updateResource(.topic(stream: "stream", topic: "topic"), resets.toPatch())
+                == golden.bytes("request.update_resource.topic.reset_only"))
     }
 
     @Test func partitionsAndSegments() throws {
@@ -135,8 +146,11 @@ struct RequestVectorTests {
         #expect(try encode("old-user") == golden.bytes("request.delete_user"))
         #expect(try encode(42) == golden.bytes("request.get_user"))
         #expect(golden.bytes("request.get_users").isEmpty)
-        #expect(try Requests.updateUser(userID: 1, username: "new-name", status: .inactive, options: []) == golden.bytes("request.update_user"))
-        #expect(try Requests.updateUser(userID: 5, username: nil, status: nil, options: []) == golden.bytes("request.update_user.none"))
+        #expect(
+            try Requests.updateResource(.user(1), UserUpdateOptions(username: "new-name", status: .inactive).toPatch())
+                == golden.bytes("request.update_resource.user"))
+        #expect(
+            try Requests.updateResource(.user("admin"), UserUpdateOptions(status: .active).toPatch()) == golden.bytes("request.update_resource.user.status"))
         #expect(try Requests.updatePermissions(userID: 1, permissions: samplePermissions) == golden.bytes("request.update_permissions"))
         #expect(try Requests.updatePermissions(userID: "admin", permissions: nil) == golden.bytes("request.update_permissions.none"))
         #expect(try Requests.changePassword(userID: 1, currentPassword: "old-pass", newPassword: "new-pass-123") == golden.bytes("request.change_password"))
@@ -178,7 +192,7 @@ struct RequestVectorTests {
     @Test func protocolVersionMatchesTheCrate() {
         #expect(ProtocolVersion.current.packed == golden.protocolVersion)
         #expect(ProtocolVersion.current.description == ProtocolVersion(packed: golden.protocolVersion).description)
-        #expect(ProtocolVersion(major: 0, minor: 11, patch: 1).description == "0.11.1")
+        #expect(ProtocolVersion(major: 0, minor: 12, patch: 0).description == "0.12.0")
     }
 }
 
@@ -220,6 +234,18 @@ struct VSRHeaderVectorTests {
         #expect(header(request) == golden.bytes("vsr.request.create_stream"))
         #expect(request.requestID == 1)
         #expect(UInt64(littleEndianBytes: request.bytes[VSRFrame.RequestOffset.request..<VSRFrame.RequestOffset.request + 8]) == 1)
+    }
+
+    /// The generic update is replicated, so its header stamps the payload checksum.
+    @Test func updateResourceHeaderStampsTheChecksum() throws {
+        var session = ConsensusSession(clientID: clientID)
+        try session.bind(99)
+        let payload = golden.bytes("payload.update_resource")
+        let update = TopicUpdateOptions(name: "updated-topic", messageExpiry: .after(.seconds(604_800)), reset: [.maxTopicSize])
+        #expect(payload == (try Requests.updateResource(.topic(stream: 1, topic: 2), update.toPatch())))
+        let request = try VSRFrame.encodeRequest(session: &session, code: CommandCode.updateResource.rawValue, payload: payload)
+        #expect(header(request) == golden.bytes("vsr.request.update_resource"))
+        #expect(request.operation == .updateResource)
     }
 
     @Test func partitionHeaderLeavesTheChecksumZero() throws {

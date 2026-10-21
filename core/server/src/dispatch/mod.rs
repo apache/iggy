@@ -1164,7 +1164,8 @@ mod tests {
     use iggy_binary_protocol::requests::personal_access_tokens::CreatePersonalAccessTokenRequest as WireCreatePersonalAccessTokenRequest;
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
     use iggy_binary_protocol::requests::system::{
-        BindSessionRequest, GetClientRequest, GetClientsRequest, GetStatsRequest,
+        BindSessionRequest, GetClientRequest, GetClientsRequest, GetStatsRequest, ResourceTarget,
+        UpdateResourceRequest,
     };
     use iggy_binary_protocol::requests::topics::{
         CreateTopicRequest, CreateTopicWithAssignmentsRequest, DeleteTopicRequest,
@@ -1174,7 +1175,7 @@ mod tests {
     };
     use iggy_binary_protocol::requests::users::login_register_with_pat::LoginRegisterWithPatRequest;
     use iggy_binary_protocol::requests::users::{
-        CreateUserRequest, DeleteUserRequest, UpdatePermissionsRequest, UpdateUserRequest,
+        CreateUserRequest, DeleteUserRequest, UpdatePermissionsRequest, UpdateUserResolvedRequest,
     };
     use iggy_binary_protocol::{
         AckLevel, ClientVersionInfo, EvictionHeader, IGGY_PROTOCOL_VERSION, ReplyHeader,
@@ -1431,14 +1432,15 @@ mod tests {
                 metadata
                     .mux_stm
                     .update(prepare_message(
-                        Operation::UpdateUser,
+                        Operation::UpdateUserResolved,
                         CLIENT,
                         SESSION,
-                        &UpdateUserRequest {
+                        &UpdateUserResolvedRequest {
                             user_id: WireIdentifier::numeric(0),
                             username: None,
                             status: Some(status.as_code()),
-                            options: WireOptions::empty(),
+                            explicit_options: WireOptions::empty(),
+                            derived_options: WireOptions::empty(),
                         }
                         .to_bytes(),
                     ))
@@ -1943,6 +1945,7 @@ mod tests {
                     context: attachment.metadata.context(0),
                     fragments: Vec::new().into(),
                     current_offset: STORED_OFFSET,
+                    encryptor: None,
                 })
                 .unwrap(),
             LifecycleFrame::PartitionRead {
@@ -1969,7 +1972,7 @@ mod tests {
     #[compio::test]
     async fn given_deactivated_user_when_reactivated_should_reject_retained_session() {
         for primary in [false, true] {
-            assert_revoked_user_cannot_resume(Operation::UpdateUser, primary).await;
+            assert_revoked_user_cannot_resume(Operation::UpdateUserResolved, primary).await;
         }
     }
 
@@ -2046,11 +2049,12 @@ mod tests {
             }
             .to_bytes()
         } else {
-            UpdateUserRequest {
+            UpdateUserResolvedRequest {
                 user_id: WireIdentifier::numeric(USER),
                 username: None,
                 status: Some(UserStatus::Inactive.as_code()),
-                options: WireOptions::empty(),
+                explicit_options: WireOptions::empty(),
+                derived_options: WireOptions::empty(),
             }
             .to_bytes()
         };
@@ -2063,6 +2067,28 @@ mod tests {
             let consensus = metadata.consensus.as_ref().unwrap();
             consensus.restore_commit_state(SESSION, SESSION);
             consensus.sequencer().set_sequence(SESSION);
+            // A client sends the generic patch, the primary resolves it.
+            let (operation, body) = if operation == Operation::UpdateUserResolved {
+                let patch = iggy_common::UserUpdateOptions {
+                    status: Some(UserStatus::Inactive),
+                    ..iggy_common::UserUpdateOptions::default()
+                }
+                .to_patch()
+                .unwrap();
+                (
+                    Operation::UpdateResource,
+                    UpdateResourceRequest {
+                        target: ResourceTarget::User {
+                            user_id: WireIdentifier::numeric(USER),
+                        },
+                        reset: patch.reset,
+                        options: patch.set,
+                    }
+                    .to_bytes(),
+                )
+            } else {
+                (operation, body)
+            };
             let request = request_message(operation, ROOT_CLIENT, 1, 1, &body).transmute_header(
                 |old, header: &mut RoutedRequestHeader| {
                     *header = old;
@@ -2100,14 +2126,15 @@ mod tests {
             )
         } else {
             prepare_message(
-                Operation::UpdateUser,
+                Operation::UpdateUserResolved,
                 0,
                 4,
-                &UpdateUserRequest {
+                &UpdateUserResolvedRequest {
                     user_id: WireIdentifier::numeric(USER),
                     username: None,
                     status: Some(UserStatus::Active.as_code()),
-                    options: WireOptions::empty(),
+                    explicit_options: WireOptions::empty(),
+                    derived_options: WireOptions::empty(),
                 }
                 .to_bytes(),
             )
@@ -2154,7 +2181,7 @@ mod tests {
                 validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 preallocate_segments: false,
-                encryptor: None,
+                key_context: Arc::default(),
                 path_layout: PartitionPathLayout::default(),
             },
         );

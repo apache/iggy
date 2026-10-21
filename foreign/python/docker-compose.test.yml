@@ -42,6 +42,9 @@ services:
       - IGGY_WEBSOCKET_ADDRESS=0.0.0.0:8092
       - IGGY_ROOT_USERNAME=iggy
       - IGGY_ROOT_PASSWORD=iggy
+      # Stream key tests need server encryption. Test-only key.
+      - IGGY_ENCRYPTION_ENABLED=true
+      - IGGY_ENCRYPTION_KEY=/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=
     healthcheck:
       test: [ "CMD", "/usr/local/bin/iggy", "--tcp-server-address", "127.0.0.1:8090", "ping" ]
       interval: 5s

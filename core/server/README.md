@@ -94,7 +94,7 @@ IGGY_TCP_ADDRESS=127.0.0.1:8090 IGGY_HTTP_ENABLED=false cargo run --bin iggy-ser
 
 Cluster membership, quorum and replica addressing live under `[cluster]`.
 
-Protocol 0.11.1 uses client-owned registration proofs and `BindSession` (15) to
+Protocol 0.11.1 and later use client-owned registration proofs and `BindSession` (15) to
 share a logical session across connections. Commands 14, 103, 104 and 123 are
 retired. Partition routing uses 105, polling uses 100 and offset reads use 120. Disconnecting a
 connection does not log out its logical session. Server-observed activity renews
@@ -143,6 +143,41 @@ partitions. Neither policy prevents retention or deletion of the topic.
 Set the option through `TopicCreateOptions::partition_resize_policy`, HTTP's
 `options` map, or the CLI's `--set partition_resize_policy=fixed`.
 
+## Resource options
+
+Streams, topics and users take their settings from one option catalog. The binary `DescribeOptions` command (13), `GET /options/{scope}` over HTTP (`stream`, `topic` or `user`) and `iggy options <scope>` list every key a client can see with its kind, default, description and five flags: updatable, resettable, secret, read-only and critical.
+
+Most keys are fixed at create. A topic's `compression_algorithm`, `segment_size`, `durability`, `consumer_offset_durability`, `partition_resize_policy` and save thresholds, and a stream's `encryption_key`, are refused by an update with `OptionNotUpdatable` (4103). `compression_algorithm` is create-only because the server never applies it and stored batches carry no codec marker.
+
+The updatable keys are `name` for streams and topics, `username` and `status` for users, and a topic's `message_expiry` and `max_topic_size`. Only those two topic keys can be reset to their default, any other reset is refused with `OptionNotResettable` (4104). Read-only keys, such as the stream key projections below, are refused with `ReadOnlyOption` (4105).
+
+`UpdateResource` (16) replaces `UpdateStream` (204), `UpdateTopic` (304) and `UpdateUser` (35). It names a scope and a target, sets the keys it carries, resets the keys it lists and keeps every other key as stored. A key may not be both set and reset.
+
+Reads return every option with its provenance: explicit when a client set it, derived when the server filled it in at create. Topic responses no longer carry fixed `message_expiry`, `compression_algorithm` and `max_topic_size` fields, those values are in the option blocks.
+
+Over HTTP, `POST /streams`, `POST /streams/{stream_id}/topics` and `POST /users` take an optional nested `options` object. `PUT` on the stream, topic and user paths takes one flat JSON object: members other than `reset` are option keys of the scope, `name`, `username` and `status` included. A value sets the key, an absent key or a `null` value leaves it unchanged, and `reset` is an optional array of key names that return to their defaults.
+
+`null` never resets a key. The body is not JSON Merge Patch and there is no `PATCH` route. Request values are strings in the config-file syntax (`"7 days"`, `"1 GiB"`, `"gzip"`), or numbers and booleans where the kind allows. See [server-api.http](../../web/docs/server-api.http) for examples.
+
+## Stream encryption
+
+With encryption, every encrypted stream has its own 32-byte data key. The server `[encryption] key` never encrypts messages: HKDF-SHA256 derives a key-encryption key from it, and each stream key is stored in the stream's options wrapped under that key with AES-256-GCM. Messages and user headers of a stream are encrypted with that stream's key.
+
+A client may give a stream its own key at create, as `encryption_key` (32 random bytes, base64 over HTTP). The key travels inside the create request, so protecting it in transit with TLS is the caller's job. Never derive it from a password, because the reported fingerprint would then allow offline guessing. Without a client key, a server with `enabled = true` generates one for the stream.
+
+With `enabled = false` and a valid `key`, client keys are accepted and keyless streams stay plaintext. Without a server `key`, a client key is refused with `StreamEncryptionUnavailable` (4106). The choice is made once at create: a stream created without a key stays plaintext for life, and enabling encryption later affects only new streams.
+
+The server never returns a stream key. Stream reads report `encryption_key_source` (`stream` for a client key, `server` for a generated one, `none` for a plaintext stream), `encryption_key_fingerprint` and `encryption_kek_fingerprint`, the fingerprints of the server keys that wrap it, comma-separated during a rotation. Every SDK has a helper that computes the fingerprint of a key the caller holds.
+
+Boot opens every stored stream key. A node whose `key` and `previous_keys` open none of a stream's wraps refuses to start and names the stream and both sets of fingerprints. Every node of a cluster must hold the same `[encryption]` section. Losing a server key that still wraps a stream makes that stream unreadable.
+
+Rotating the server key takes two phases, and messages are never re-encrypted:
+
+1. Set `key` to the new key and `previous_keys` to the old one on every node (`IGGY_ENCRYPTION_PREVIOUS_KEYS`). The metadata primary adds a wrap under the new key to every encrypted stream. Old wraps stay, so nodes still on the old key keep serving during the rollout.
+2. Once every node runs the phase 1 config and every encrypted stream reports the new fingerprint in `encryption_kek_fingerprint`, remove the old key from `previous_keys`. The primary then drops the wraps under it. A node given only the new key before phase 1 finished refuses to boot.
+
+`previous_keys` holds at most two keys. Rotation changes only the wraps, so whoever already holds a stream's data key, or an old wrap together with the old server key, can still read that stream. Changing a stream's own data key is not supported.
+
 ## Upgrade recovery
 
 This release changes protocol and storage formats. Servers and compatible
@@ -151,11 +186,9 @@ Peers verify protocol, release and storage-format identity before admission.
 Executable packaging does not affect that identity, so stripping or rebuilding
 the same compatible release does not by itself prevent a replica from joining.
 
-This checkout uses development protocol 0.11.1. Finalize its version and minimum
-before the next stable release. Released `server-0.9.0` uses protocol 0.11.0 and
-accepts every 0.11.x patch. An incompatible release therefore needs a new minor
-protocol version, such as 0.12.0, for that released server to reject new clients
-before decoding their login.
+This checkout uses protocol 0.12.0, and 0.12.0 is also its minimum. It is a breaking change: released `server-0.9.0` uses protocol 0.11.0 and accepts every 0.11.x patch, so it rejects 0.12.0 clients before decoding their login, and this server rejects 0.11.x clients the same way. The retired update commands and the removed fixed topic fields mean older clients cannot work against it in any case.
+
+Metadata snapshot format 13 is both the current and the oldest readable format. A data directory holding an older snapshot is refused, and journals written by older builds hold operations this build no longer knows. Start this release from fresh storage on every replica.
 
 The protocol number is independent of server and SDK package versions. Its
 current and minimum values are maintained manually for stable releases. The

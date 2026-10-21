@@ -21,6 +21,9 @@ use aes_gcm::aead::{Aead, Generate};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use std::fmt::Debug;
 
+const AES_GCM_NONCE_SIZE: usize = 12;
+const AES_GCM_TAG_SIZE: usize = 16;
+
 #[derive(Debug, Clone)]
 pub enum EncryptorKind {
     Aes256Gcm(Aes256GcmEncryptor),
@@ -79,14 +82,14 @@ impl Encryptor for Aes256GcmEncryptor {
     }
 
     fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>, IggyError> {
-        let nonce = (&data[0..12])
-            .try_into()
-            .map_err(|_| IggyError::CannotDecryptData)?;
-        let payload = self.cipher.decrypt(nonce, &data[12..]);
-        if payload.is_err() {
+        if data.len() < AES_GCM_NONCE_SIZE + AES_GCM_TAG_SIZE {
             return Err(IggyError::CannotDecryptData);
         }
-        Ok(payload.unwrap())
+        let (nonce, ciphertext) = data.split_at(AES_GCM_NONCE_SIZE);
+        let nonce = nonce.try_into().map_err(|_| IggyError::CannotDecryptData)?;
+        self.cipher
+            .decrypt(nonce, ciphertext)
+            .map_err(|_| IggyError::CannotDecryptData)
     }
 }
 
@@ -94,6 +97,28 @@ impl Encryptor for Aes256GcmEncryptor {
 mod tests {
     use super::*;
     use crate::{HeaderKey, HeaderValue, IggyMessage};
+
+    #[test]
+    fn given_short_ciphertext_when_decrypting_then_should_return_cannot_decrypt_data() {
+        let encryptor = Aes256GcmEncryptor::new(&[3; 32]).expect("valid key");
+        for length in 0..28 {
+            let ciphertext = vec![0xA5; length];
+            assert_eq!(
+                encryptor
+                    .decrypt(&ciphertext)
+                    .expect_err("ciphertext shorter than nonce and tag must fail")
+                    .as_code(),
+                IggyError::CannotDecryptData.as_code(),
+                "length {length}"
+            );
+        }
+        let empty = encryptor.encrypt(&[]).expect("encrypt empty payload");
+        assert_eq!(empty.len(), 28);
+        assert_eq!(
+            encryptor.decrypt(&empty).expect("decrypt empty payload"),
+            Vec::<u8>::new()
+        );
+    }
 
     #[test]
     fn given_the_same_key_data_should_be_encrypted_and_decrypted_correctly() {

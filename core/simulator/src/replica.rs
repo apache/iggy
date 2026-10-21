@@ -392,7 +392,7 @@ pub fn new_shard(
         validate_checksum: true,
         segment_size: IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
         preallocate_segments: false,
-        encryptor: None,
+        key_context: Arc::default(),
         path_layout: PartitionPathLayout::default(),
     };
 

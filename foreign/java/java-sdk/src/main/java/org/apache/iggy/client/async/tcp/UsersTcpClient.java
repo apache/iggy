@@ -23,12 +23,15 @@ import io.netty.buffer.Unpooled;
 import org.apache.iggy.client.async.UsersClient;
 import org.apache.iggy.identifier.UserId;
 import org.apache.iggy.serde.BytesDeserializer;
+import org.apache.iggy.serde.BytesSerializer;
 import org.apache.iggy.serde.CommandCode;
 import org.apache.iggy.user.IdentityInfo;
 import org.apache.iggy.user.Permissions;
 import org.apache.iggy.user.UserInfo;
 import org.apache.iggy.user.UserInfoDetails;
+import org.apache.iggy.user.UserOptions;
 import org.apache.iggy.user.UserStatus;
+import org.apache.iggy.user.UserUpdate;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -37,6 +40,10 @@ import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Supplier;
 
+import static org.apache.iggy.serde.BytesSerializer.MAX_PASSWORD_LENGTH;
+import static org.apache.iggy.serde.BytesSerializer.MAX_USERNAME_LENGTH;
+import static org.apache.iggy.serde.BytesSerializer.MIN_PASSWORD_LENGTH;
+import static org.apache.iggy.serde.BytesSerializer.MIN_USERNAME_LENGTH;
 import static org.apache.iggy.serde.BytesSerializer.toBytes;
 
 /**
@@ -45,16 +52,6 @@ import static org.apache.iggy.serde.BytesSerializer.toBytes;
  */
 public class UsersTcpClient implements UsersClient {
     private static final Logger log = LoggerFactory.getLogger(UsersTcpClient.class);
-
-    /**
-     * Credential bounds the server enforces, in UTF-8 bytes. Checked here so a bad value fails
-     * before the round trip instead of as an opaque server error.
-     */
-    private static final int MIN_USERNAME_LENGTH = 3;
-
-    private static final int MAX_USERNAME_LENGTH = 50;
-    private static final int MIN_PASSWORD_LENGTH = 3;
-    private static final int MAX_PASSWORD_LENGTH = 100;
 
     private final Supplier<AsyncTcpConnection> connectionSupplier;
     private final LoginRoutingHook routingHook;
@@ -86,19 +83,12 @@ public class UsersTcpClient implements UsersClient {
 
     @Override
     public CompletableFuture<UserInfoDetails> createUser(
-            String username, String password, UserStatus status, Optional<Permissions> permissions) {
-        var payload = Unpooled.buffer();
-        payload.writeBytes(toBytes(username, "username", MIN_USERNAME_LENGTH, MAX_USERNAME_LENGTH));
-        payload.writeBytes(toBytes(password, "password", MIN_PASSWORD_LENGTH, MAX_PASSWORD_LENGTH));
-        payload.writeByte(status.asCode());
-        permissions.ifPresentOrElse(
-                perms -> {
-                    payload.writeByte(1);
-                    var permissionBytes = toBytes(perms);
-                    payload.writeIntLE(permissionBytes.readableBytes());
-                    payload.writeBytes(permissionBytes);
-                },
-                () -> payload.writeByte(0));
+            String username,
+            String password,
+            UserStatus status,
+            Optional<Permissions> permissions,
+            UserOptions options) {
+        var payload = BytesSerializer.toCreateUser(username, password, status, permissions, options.entries());
 
         return connection().exchangeForEntity(CommandCode.User.CREATE, payload, BytesDeserializer::readUserInfoDetails);
     }
@@ -110,25 +100,10 @@ public class UsersTcpClient implements UsersClient {
     }
 
     @Override
-    public CompletableFuture<Void> updateUser(UserId userId, Optional<String> username, Optional<UserStatus> status) {
-        var payload = toBytes(userId);
-        username.ifPresentOrElse(
-                un -> {
-                    payload.writeByte(1);
-                    payload.writeBytes(toBytes(un, "username", MIN_USERNAME_LENGTH, MAX_USERNAME_LENGTH));
-                },
-                () -> payload.writeByte(0));
-        status.ifPresentOrElse(
-                s -> {
-                    payload.writeByte(1);
-                    payload.writeByte(s.asCode());
-                },
-                () -> payload.writeByte(0));
-        // No trailing options block: users have no catalog keys yet and the
-        // server reads an absent block as empty. Settings will ride one here,
-        // as topics do.
+    public CompletableFuture<Void> updateUser(UserId userId, UserUpdate update) {
+        var payload = BytesSerializer.toUpdateResource(userId, update);
 
-        return connection().sendAndRelease(CommandCode.User.UPDATE, payload);
+        return connection().sendAndRelease(CommandCode.System.UPDATE_RESOURCE, payload);
     }
 
     @Override

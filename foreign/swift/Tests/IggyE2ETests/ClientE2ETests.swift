@@ -161,7 +161,7 @@ struct ResourceE2ETests {
             #expect(try await client.getStreams().contains { $0.id == created.id })
 
             let renamed = E2EEnvironment.uniqueName("swift-renamed")
-            try await client.updateStream(id, name: renamed)
+            try await client.updateStream(id, options: StreamUpdateOptions(name: renamed))
             #expect(try await client.getStream(id)?.name == renamed)
 
             try await client.deleteStream(id)
@@ -198,11 +198,15 @@ struct ResourceE2ETests {
             await session.track(stream: try Identifier(named: name))
 
             let specs = try await client.describeOptions(scope: .topic)
-            let keys = Set(specs.map(\.key))
-            #expect(keys.contains(TopicOptionKey.durability))
-            #expect(keys.contains(TopicOptionKey.segmentSize))
-            #expect(try #require(specs.first { $0.key == TopicOptionKey.segmentSize }).kind == .uint64)
-            #expect(try await client.describeOptions(scope: .stream).isEmpty)
+            #expect(specs.map(\.key) == TopicOptionKey.allCases.map(\.rawValue))
+            #expect(try #require(specs.first { $0.key == TopicOptionKey.segmentSize.rawValue }).kind == .uint64)
+            #expect(try #require(specs.first { $0.key == TopicOptionKey.messageExpiry.rawValue }).flags == [.updatable, .resettable])
+            #expect(try #require(specs.first { $0.key == TopicOptionKey.compressionAlgorithm.rawValue }).flags.isEmpty)
+            let streamSpecs = try await client.describeOptions(scope: .stream)
+            #expect(streamSpecs.map(\.key) == StreamOptionKey.allCases.map(\.rawValue))
+            #expect(try #require(streamSpecs.first { $0.key == StreamOptionKey.encryptionKey.rawValue }).flags == [.secret, .critical])
+            #expect(try #require(streamSpecs.first { $0.key == StreamOptionKey.encryptionKeySource.rawValue }).flags == .readOnly)
+            #expect(try await client.describeOptions(scope: .user).map(\.key) == UserOptionKey.allCases.map(\.rawValue))
 
             let options = TopicCreateOptions(
                 partitionsCount: 3, compressionAlgorithm: .gzip, messageExpiry: .after(.seconds(3600)),
@@ -217,20 +221,18 @@ struct ResourceE2ETests {
             let topicID = Identifier(numeric: created.id)
 
             let fetched = try #require(try await client.getTopic(streamID: streamID, topicID: topicID))
-            #expect(fetched.options[TopicOptionKey.durability] == .explicit("persisted"))
+            #expect(fetched.options[TopicOptionKey.durability.rawValue] == .explicit("persisted"))
             // Keys the client left alone are resolved by admission and reported
             // as derived.
-            #expect(fetched.options[TopicOptionKey.segmentSize]?.explicit == false)
+            #expect(fetched.options[TopicOptionKey.segmentSize.rawValue]?.explicit == false)
             #expect(try await client.getTopics(streamID: streamID).map(\.id) == [created.id])
             #expect(try await client.getStream(streamID)?.topics.first?.name == name)
 
             let renamed = E2EEnvironment.uniqueName("swift-topic-renamed")
-            try await client.updateTopic(
-                streamID: streamID, topicID: topicID, name: renamed,
-                options: TopicUpdateOptions(compressionAlgorithm: CompressionAlgorithm.none, messageExpiry: .never))
+            try await client.updateTopic(streamID: streamID, topicID: topicID, options: TopicUpdateOptions(name: renamed, messageExpiry: .never))
             let updated = try #require(try await client.getTopic(streamID: streamID, topicID: topicID))
             #expect(updated.name == renamed)
-            #expect(updated.compressionAlgorithm == CompressionAlgorithm.none)
+            #expect(updated.compressionAlgorithm == .gzip)
             #expect(updated.messageExpiry == .never)
 
             try await client.createPartitions(streamID: streamID, topicID: topicID, count: 2)
@@ -256,9 +258,9 @@ struct ResourceE2ETests {
             // A string value for a typed key is parsed by admission and reported
             // with its canonical kind.
             let created = try await client.createTopic(
-                streamID: streamID, name: name, options: TopicCreateOptions(raw: [TopicOptionKey.durability: "persisted"]))
+                streamID: streamID, name: name, options: TopicCreateOptions(raw: [TopicOptionKey.durability.rawValue: "persisted"]))
             let topic = try #require(try await client.getTopic(streamID: streamID, topicID: Identifier(numeric: created.id)))
-            #expect(topic.options[TopicOptionKey.durability] == .explicit("persisted"))
+            #expect(topic.options[TopicOptionKey.durability.rawValue] == .explicit("persisted"))
         }
     }
 
@@ -322,7 +324,7 @@ struct UserE2ETests {
             }
 
             try await client.changePassword(userID, currentPassword: "secret-1", newPassword: "secret-2")
-            try await client.updateUser(userID, username: username + "-renamed", status: .inactive)
+            try await client.updateUser(userID, options: UserUpdateOptions(username: username + "-renamed", status: .inactive))
             let updated = try #require(try await client.getUser(userID))
             #expect(updated.username == username + "-renamed")
             #expect(updated.status == .inactive)

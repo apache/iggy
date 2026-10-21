@@ -28,7 +28,6 @@ import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.message.SendMessagesResponse;
-import org.apache.iggy.topic.CompressionAlgorithm;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -91,14 +90,7 @@ public class AsyncClientIntegrationTest extends BaseIntegrationTest {
         try {
             client.streams().createStream(streamName).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
             client.topics()
-                    .createTopic(
-                            streamId,
-                            2L,
-                            CompressionAlgorithm.None,
-                            BigInteger.ZERO,
-                            BigInteger.ZERO,
-                            "test-topic",
-                            PERSISTED_TOPIC_OPTIONS)
+                    .createTopic(streamId, "test-topic", 2L, PERSISTED_TOPIC_OPTIONS)
                     .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
             List<Message> messages = new ArrayList<>();
@@ -146,14 +138,7 @@ public class AsyncClientIntegrationTest extends BaseIntegrationTest {
         try {
             client.streams().createStream(streamName).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
             client.topics()
-                    .createTopic(
-                            streamId,
-                            2L,
-                            CompressionAlgorithm.None,
-                            BigInteger.ZERO,
-                            BigInteger.ZERO,
-                            "test-topic",
-                            PERSISTED_TOPIC_OPTIONS)
+                    .createTopic(streamId, "test-topic", 2L, PERSISTED_TOPIC_OPTIONS)
                     .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
             // when — send messages concurrently from multiple threads
@@ -209,14 +194,7 @@ public class AsyncClientIntegrationTest extends BaseIntegrationTest {
         try {
             client.streams().createStream(streamName).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
             client.topics()
-                    .createTopic(
-                            streamId,
-                            2L,
-                            CompressionAlgorithm.None,
-                            BigInteger.ZERO,
-                            BigInteger.ZERO,
-                            "test-topic",
-                            PERSISTED_TOPIC_OPTIONS)
+                    .createTopic(streamId, "test-topic", 2L, PERSISTED_TOPIC_OPTIONS)
                     .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
             // when — send messages in concurrent batches

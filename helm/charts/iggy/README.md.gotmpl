@@ -214,13 +214,7 @@ stored values.
   authenticated handshake or be rejected. The key is at least 32 bytes of
   CSPRNG output. Turning it on or off is a coordinated restart of the whole
   cluster: a node that authenticates cannot talk to one that does not.
-* **`server.encryption`** encrypts message payloads and state commands at rest
-  with AES-256-GCM, under a 32-byte base64 key. A node holding a different key
-  cannot read what its peers wrote. The chart selects the legacy configuration
-  for versioned images through `0.9.0-edge.7`, including its pinned image.
-  For newer builds with `[encryption]`, set `server.encryption.configVersion=flat`.
-  Custom tags require an explicit `flat` or `legacy` layout; `legacy` uses
-  `[system.encryption]`.
+* **`server.encryption`** encrypts message payloads and user headers at rest with AES-256-GCM. Every encrypted stream has its own key, stored wrapped under a key derived from the 32-byte base64 key set here. With `enabled` true, streams created without their own key get a generated one. With `enabled` false and a key set, only streams created with their own key are encrypted. A stream created unencrypted stays unencrypted. A node holding a different key cannot open the stream keys and refuses to boot. A server key rotation has no chart value of its own: set `IGGY_ENCRYPTION_PREVIOUS_KEYS` in `server.env` and follow the two-phase procedure in the [server README](https://github.com/apache/iggy/blob/master/core/server/README.md#stream-encryption). The chart selects the legacy configuration for released images through `0.9.0-edge.7` and the flat configuration for its pinned image. Other custom image tags require an explicit `flat` or `legacy` layout. The legacy layout uses `[system.encryption]`.
 * **`server.jwt`** makes HTTP bearer tokens valid on every node and survive a
   restart. With `cluster.auth` enabled the server already derives a cluster-wide
   key from the replica PSK, so setting the JWT secrets is an alternative to that

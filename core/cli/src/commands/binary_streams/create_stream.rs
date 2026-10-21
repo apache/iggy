@@ -18,23 +18,58 @@
 use crate::commands::cli_command::{CliCommand, PRINT_TARGET};
 use anyhow::Context;
 use async_trait::async_trait;
-use iggy_common::Client;
-use iggy_common::create_stream::CreateStream;
+use iggy_common::{
+    Client, StreamCreateOptions, StreamDetails, StreamEncryptionKey, StreamEncryptionSource,
+};
+use std::path::PathBuf;
+use std::str::FromStr;
+use std::{env, fs};
 use tracing::{Level, event};
 
+pub const STREAM_ENCRYPTION_KEY_ENV: &str = "IGGY_STREAM_ENCRYPTION_KEY";
+
 pub struct CreateStreamCmd {
-    create_stream: CreateStream,
+    name: String,
+    encryption_key_file: Option<PathBuf>,
 }
 
 impl CreateStreamCmd {
-    pub fn new(name: String) -> Self {
+    pub fn new(name: String, encryption_key_file: Option<PathBuf>) -> Self {
         Self {
-            create_stream: CreateStream { name },
+            name,
+            encryption_key_file,
         }
     }
 
     fn get_stream_id_info(&self) -> String {
         "ID auto incremented".to_string()
+    }
+
+    /// The key from the explicit file, else from the environment. The file
+    /// wins so a stale exported variable cannot override a deliberate choice.
+    fn options(&self) -> anyhow::Result<StreamCreateOptions> {
+        let encoded = match &self.encryption_key_file {
+            Some(path) => Some(fs::read_to_string(path).with_context(|| {
+                format!(
+                    "Problem reading stream encryption key file: {}",
+                    path.display()
+                )
+            })?),
+            None => env::var(STREAM_ENCRYPTION_KEY_ENV)
+                .ok()
+                .filter(|value| !value.is_empty()),
+        };
+        let encryption_key = encoded
+            .map(|text| {
+                StreamEncryptionKey::from_str(text.trim_end()).with_context(
+                    || "Stream encryption key must be standard base64 of exactly 32 bytes",
+                )
+            })
+            .transpose()?;
+        Ok(StreamCreateOptions {
+            encryption_key,
+            ..StreamCreateOptions::default()
+        })
     }
 }
 
@@ -43,29 +78,45 @@ impl CliCommand for CreateStreamCmd {
     fn explain(&self) -> String {
         format!(
             "create stream with name: {} and {}",
-            self.create_stream.name,
+            self.name,
             self.get_stream_id_info(),
         )
     }
 
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
-        client
-            .create_stream(&self.create_stream.name)
+        let options = self.options()?;
+        let stream = client
+            .create_stream(&self.name, &options)
             .await
             .with_context(|| {
                 format!(
                     "Problem creating stream (name: {} and {})",
-                    self.create_stream.name,
+                    self.name,
                     self.get_stream_id_info(),
                 )
             })?;
 
         event!(target: PRINT_TARGET, Level::INFO,
             "Stream with name: {} and {} created",
-            self.create_stream.name,
+            self.name,
             self.get_stream_id_info(),
         );
+        print_encryption(&stream);
 
         Ok(())
     }
+}
+
+fn print_encryption(stream: &StreamDetails) {
+    let Some(source) = stream
+        .encryption_key_source()
+        .filter(|source| *source != StreamEncryptionSource::None)
+    else {
+        return;
+    };
+    event!(target: PRINT_TARGET, Level::INFO,
+        "Stream encryption key source: {source}, fingerprint: {}, KEK fingerprints: {}",
+        stream.encryption_key_fingerprint().unwrap_or_default(),
+        stream.encryption_kek_fingerprints().join(", "),
+    );
 }

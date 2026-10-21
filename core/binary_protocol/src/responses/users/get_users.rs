@@ -81,6 +81,7 @@ mod tests {
                     status: 1,
                     username: WireName::new("admin").unwrap(),
                     options: WireOptions::empty(),
+                    derived_options: WireOptions::empty(),
                 },
                 UserResponse {
                     id: 2,
@@ -88,6 +89,7 @@ mod tests {
                     status: 2,
                     username: WireName::new("alice").unwrap(),
                     options: WireOptions::empty(),
+                    derived_options: WireOptions::empty(),
                 },
             ],
         };

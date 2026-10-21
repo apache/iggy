@@ -35,3 +35,5 @@ mod register_forwarding;
 mod replica_read_batching;
 mod root_credentials;
 mod staggered_bootstrap;
+mod stream_encryption;
+mod stream_key_rotation;

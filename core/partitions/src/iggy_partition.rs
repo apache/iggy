@@ -70,7 +70,7 @@ use iggy_binary_protocol::{
 use iggy_binary_protocol::{PrepareOkHeader, ReplyHeader, RoutedRequestHeader};
 use iggy_common::{
     ConsumerGroupId, ConsumerGroupOffsets, ConsumerKind, ConsumerOffset, ConsumerOffsets,
-    IggyByteSize, IggyError, IggyExpiry, IggyTimestamp, PartitionStats, PollingKind,
+    EncryptorKind, IggyByteSize, IggyError, IggyExpiry, IggyTimestamp, PartitionStats, PollingKind,
     TopicRuntimeOptions,
 };
 use journal::Journal as _;
@@ -182,6 +182,11 @@ where
     /// `PartitionsConfig` value (simulator and tests build partitions with
     /// no resolved options at all).
     pub(crate) runtime_options: TopicRuntimeOptions,
+    /// The at-rest encryptor of this partition's stream incarnation, `None`
+    /// for a plaintext stream. Set before the partition becomes servable and
+    /// never swapped, so a poll answered after the stream id is reused still
+    /// decrypts with the key its bytes were written under.
+    encryptor: Option<Arc<EncryptorKind>>,
     pub(crate) persistence: Option<Rc<PartitionPersistence>>,
     pending_retry_checkpoint: Option<u64>,
     pub(crate) materialization_missing: bool,
@@ -449,6 +454,10 @@ pub struct PollCompletion {
     /// Assigned prepare to replicate after releasing the reply. `None` can also
     /// mean the automatic commit is queued and has no prepare slot yet.
     pub replication: Option<PollReplication>,
+    /// The key the fragments were written under, `None` for a plaintext
+    /// stream. Captured with the fragments, so a reply that outlives the stream
+    /// never decrypts with a later stream's key.
+    pub encryptor: Option<Arc<EncryptorKind>>,
 }
 
 /// A prepare assigned by completion, with capacity held through journal staging.
@@ -859,6 +868,7 @@ where
             partition_dir: None,
             segment_names_dirty: Cell::new(true),
             runtime_options: TopicRuntimeOptions::default(),
+            encryptor: None,
             persistence: None,
             pending_retry_checkpoint: None,
             materialization_missing: false,
@@ -3468,6 +3478,15 @@ where
         self.runtime_options
     }
 
+    pub fn set_encryptor(&mut self, encryptor: Option<Arc<EncryptorKind>>) {
+        self.encryptor = encryptor;
+    }
+
+    #[must_use]
+    pub const fn encryptor(&self) -> Option<&Arc<EncryptorKind>> {
+        self.encryptor.as_ref()
+    }
+
     /// Segment size used consistently by live writes, recovery, and transfer.
     #[must_use]
     pub fn effective_segment_size(&self) -> IggyByteSize {
@@ -4079,6 +4098,7 @@ where
             fragments: result.fragments,
             current_offset: result.commit_offset,
             replication,
+            encryptor: self.encryptor.clone(),
         })
     }
 
@@ -12532,6 +12552,7 @@ mod tests {
     use iggy_binary_protocol::{
         Command, CommitHeader, ReplyHeader, StartViewHeader, WireConsumer, WireEncode, WireName,
     };
+    use iggy_common::Aes256GcmEncryptor;
     use journal::DurableAppend;
     use journal::durable_storage::{
         DiskStorage, DurableStorage, OpenMode, RegularFiles, StorageEntry,
@@ -16896,6 +16917,39 @@ mod tests {
             partition.dedup().watermarks_sorted()
         );
         assert_eq!(recovered.required_metadata_frontier, METADATA_FRONTIER);
+    }
+
+    #[test]
+    fn given_delayed_poll_after_stream_recreation_when_replying_then_should_keep_original_encryptor()
+     {
+        let encryptor = |seed: u8| {
+            Arc::new(EncryptorKind::Aes256Gcm(
+                Aes256GcmEncryptor::new(&[seed; 32]).expect("valid key"),
+            ))
+        };
+        let (original_key, replacement_key) = (encryptor(1), encryptor(2));
+        let mut original = test_partition();
+        original.set_encryptor(Some(Arc::clone(&original_key)));
+        let read = poll_read_result(&original, PollingConsumer::Consumer(1, 0), false, None);
+        let completion = original.complete_poll(read).expect("completes");
+
+        // The stream is deleted and its id reused before the reply is built.
+        drop(original);
+        let mut recreated = test_partition();
+        recreated.set_encryptor(Some(Arc::clone(&replacement_key)));
+
+        let pinned = completion.encryptor.expect("an encrypted stream's poll");
+        assert!(Arc::ptr_eq(&pinned, &original_key));
+        assert!(!Arc::ptr_eq(&pinned, &replacement_key));
+        let mut plaintext = test_partition();
+        let read = poll_read_result(&plaintext, PollingConsumer::Consumer(1, 0), false, None);
+        assert!(
+            plaintext
+                .complete_poll(read)
+                .expect("completes")
+                .encryptor
+                .is_none()
+        );
     }
 
     #[compio::test]
@@ -28295,7 +28349,7 @@ mod tests {
             validate_checksum: true,
             segment_size: IggyByteSize::from(1024 * 1024),
             preallocate_segments: false,
-            encryptor: None,
+            key_context: Arc::default(),
             path_layout: crate::PartitionPathLayout::default(),
         }
     }

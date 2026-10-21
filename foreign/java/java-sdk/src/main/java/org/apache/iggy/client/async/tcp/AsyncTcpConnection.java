@@ -68,6 +68,7 @@ import org.apache.iggy.exception.IggyTlsException;
 import org.apache.iggy.identifier.UserId;
 import org.apache.iggy.partition.PartitionContext;
 import org.apache.iggy.serde.CommandCode;
+import org.apache.iggy.system.OptionsScope;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -117,8 +118,6 @@ public class AsyncTcpConnection {
     private static final int UNAUTHENTICATED = 40;
     private static final int LIFECYCLE_BUSY = 88;
     private static final int REGISTER_RESPONSE_MIN_BYTES = 17;
-    // Flags the optional username of an UpdateUser body.
-    private static final int USERNAME_PRESENT = 1;
     private static final Logger log = LoggerFactory.getLogger(AsyncTcpConnection.class);
     private static final Duration DEFAULT_CONNECTION_TIMEOUT = Duration.ofMillis(3000);
     // A missing reply must not hold the single VSR-pinned channel forever.
@@ -1589,11 +1588,15 @@ public class AsyncTcpConnection {
     @SuppressWarnings({"checkstyle:CyclomaticComplexity", "checkstyle:NPathComplexity"})
     private void refreshCredentials(int commandCode, ByteBuf frame) {
         boolean passwordChange = commandCode == CommandCode.User.CHANGE_PASSWORD.getValue();
-        if (!passwordChange && commandCode != CommandCode.User.UPDATE.getValue()) {
+        if (!passwordChange && commandCode != CommandCode.System.UPDATE_RESOURCE.getValue()) {
             return;
         }
         ByteBuf change = frame.slice(
                 frame.readerIndex() + VsrHeaders.HEADER_SIZE, frame.readableBytes() - VsrHeaders.HEADER_SIZE);
+        // A stream or topic patch never touches credentials, even when it renames.
+        if (!passwordChange && (!change.isReadable() || change.readUnsignedByte() != OptionsScope.User.asCode())) {
+            return;
+        }
         String oldUsername;
         Optional<String> username = Optional.empty();
         Optional<String> password = Optional.empty();
@@ -1612,8 +1615,8 @@ public class AsyncTcpConnection {
             }
             if (passwordChange) {
                 password = readField(change).flatMap(currentPassword -> readField(change));
-            } else if (change.isReadable() && change.readUnsignedByte() == USERNAME_PRESENT) {
-                username = readField(change);
+            } else {
+                username = UserPatchCredentials.patchedUsername(change);
             }
             if (username.isEmpty() && password.isEmpty()) {
                 return;

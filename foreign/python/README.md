@@ -214,6 +214,63 @@ async def main():
 asyncio.run(main())
 ```
 
+## Stream, Topic and User Options
+
+`create_stream`, `create_topic` and `create_user` take typed options: `StreamOptions`, `TopicOptions` and `UserOptions`. Updates are patches: `update_stream`, `update_topic` and `update_user` change only the fields you pass, and `reset` returns keys to their server defaults.
+
+A topic's `message_expiry` and `max_topic_size` are the only resettable keys. Settings such as the compression algorithm are fixed at creation and have no update field. `describe_options("stream" | "topic" | "user")` reports which keys are updatable, resettable, secret or read-only.
+
+The update methods also take `options` and `raw_reset`, which send keys and reset names verbatim, so a key newer than this build can be set or reset. The server decides those. A refused option raises `OptionError`, a `RuntimeError` whose `code` and `kind` name the refusal, for example `4103` and `"option_not_updatable"`, the same on every transport.
+
+```python
+import asyncio
+import secrets
+from datetime import timedelta
+
+from apache_iggy import (
+    IggyClient,
+    IggyExpiry,
+    OptionKey,
+    StreamOptions,
+    TopicOptions,
+    encryption_key_fingerprint,
+)
+
+
+async def main():
+    client = IggyClient.from_connection_string("iggy+tcp://iggy:iggy@127.0.0.1:8090")
+    await client.connect()
+
+    key = secrets.token_bytes(32)
+    stream = await client.create_stream("orders", StreamOptions(encryption_key=key))
+    assert stream.encryption_key_source == "stream"
+    assert stream.encryption_key_fingerprint == encryption_key_fingerprint(key)
+
+    await client.create_topic(
+        "orders",
+        "created",
+        TopicOptions(
+            partitions_count=3,
+            compression_algorithm="gzip",
+            message_expiry=IggyExpiry.ExpireDuration(timedelta(days=7)),
+        ),
+    )
+    await client.update_topic(
+        "orders",
+        "created",
+        message_expiry=IggyExpiry.ExpireDuration(timedelta(days=1)),
+        reset=[OptionKey.MaxTopicSize],
+    )
+    await client.update_stream("orders", name="orders-v2")
+
+
+asyncio.run(main())
+```
+
+A stream encryption key must be 32 random bytes, given as `bytes` or as their canonical base64 text. The key travels inside the create request over whatever transport the client uses, so protecting it in transit with TLS is your responsibility.
+
+The server never returns the key, only `encryption_key_source`, `encryption_key_fingerprint` and `encryption_kek_fingerprints`. Without a key, a server with encryption enabled generates one for the stream and reports the source `"server"`. An invalid key raises `ValueError` before anything is sent, and no repr or error message contains it.
+
 ## High-Level Producer
 
 The Python high-level producer API is a port of the Rust high-level producer

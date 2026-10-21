@@ -34,7 +34,7 @@
 //!
 //!     // Client is already logged in as root
 //!     let client = harness.client();
-//!     // client.create_stream(...).await.unwrap();
+//!     // client.create_stream(..., &StreamCreateOptions::default()).await.unwrap();
 //!
 //!     harness.stop().await.unwrap();
 //! }
