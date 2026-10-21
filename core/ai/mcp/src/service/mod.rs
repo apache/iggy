@@ -289,7 +289,7 @@ impl IggyService {
     }
 
     #[tool(
-        description = "Poll messages. Requires read permission; auto_commit=true or strategy=next also requires update permission because it stores the consumer offset."
+        description = "Poll messages. Requires read permission. auto_commit=true or strategy=next stores this server's consumer offset."
     )]
     pub async fn poll_messages(
         &self,
@@ -322,9 +322,6 @@ impl IggyService {
             PollingStrategy::offset(offset)
         };
         let auto_commit = auto_commit.unwrap_or(false) || strategy.kind == PollingKind::Next;
-        if auto_commit {
-            self.permissions.ensure_update()?;
-        }
 
         request(
             self.client
@@ -586,7 +583,7 @@ impl IggyService {
             offset,
         }): Parameters<StoreConsumerOffset>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.permissions.ensure_update()?;
+        self.permissions.ensure_read()?;
         request(
             self.client
                 .store_consumer_offset(
@@ -609,7 +606,7 @@ impl IggyService {
             partition_id,
         }): Parameters<DeleteConsumerOffset>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.permissions.ensure_delete()?;
+        self.permissions.ensure_read()?;
         request(
             self.client
                 .delete_consumer_offset(
