@@ -35,6 +35,7 @@ use kafka_protocol::messages::delete_topics_response::DeletableTopicResult;
 use kafka_protocol::messages::{DeleteTopicsRequest, DeleteTopicsResponse, TopicName};
 use kafka_protocol::protocol::StrBytes;
 
+use tokio::sync::Mutex;
 use tokio::time::Instant;
 
 use crate::auth::AuthenticatedPrincipal;
@@ -147,7 +148,14 @@ pub async fn handle(
     let duplicate_names = find_duplicate_names(&req.topic_names);
 
     let deadline = Instant::now() + clamp_request_timeout(req.timeout_ms);
-    let results = delete_all_topics(bridge, &req.topic_names, &duplicate_names, deadline).await;
+    let results = delete_all_topics(
+        bridge,
+        &state.partition_growth,
+        &req.topic_names,
+        &duplicate_names,
+        deadline,
+    )
+    .await;
     let resp = DeleteTopicsResponse::default().with_responses(results);
     respond_or_close(encode_message(&resp, api_version, 256), "DeleteTopics")
 }
@@ -215,6 +223,7 @@ fn find_duplicate_names(topic_names: &[TopicName]) -> HashSet<TopicName> {
 /// skip it.
 async fn delete_all_topics(
     bridge: &IggyBridge,
+    partition_growth: &Mutex<()>,
     topic_names: &[TopicName],
     duplicate_names: &HashSet<TopicName>,
     deadline: Instant,
@@ -248,7 +257,12 @@ async fn delete_all_topics(
             continue;
         }
 
-        let result = match tokio::time::timeout_at(deadline, delete_one_topic(bridge, name)).await {
+        let result = match tokio::time::timeout_at(
+            deadline,
+            delete_one_topic(bridge, partition_growth, name),
+        )
+        .await
+        {
             Ok(result) => result,
             Err(_elapsed) => {
                 deadline_exceeded = true;
@@ -268,10 +282,17 @@ async fn delete_all_topics(
     results
 }
 
-async fn delete_one_topic(bridge: &IggyBridge, name: &TopicName) -> DeletableTopicResult {
+async fn delete_one_topic(
+    bridge: &IggyBridge,
+    partition_growth: &Mutex<()>,
+    name: &TopicName,
+) -> DeletableTopicResult {
     let result = DeletableTopicResult::default()
         .with_name(Some(name.clone()))
         .with_error_message(None);
+    // `CreatePartitions` reads a topic and then adds to it by name. Holding its lock here keeps
+    // the topic from being deleted between its read and its write.
+    let _growth = partition_growth.lock().await;
     match bridge.delete_kafka_topic(name.as_str()).await {
         // The second arm: the write committed on its first attempt, the SDK's own reconnect path
         // replayed it, and the server's client-table dedup caught the replay - not a fault. Same

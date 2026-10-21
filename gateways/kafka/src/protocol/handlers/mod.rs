@@ -26,13 +26,16 @@
 
 pub mod alter_configs;
 pub mod api_versions;
+pub mod create_partitions;
 pub mod create_topics;
 pub mod delete_topics;
+pub mod describe_cluster;
 pub mod describe_configs;
 pub mod describe_groups;
 pub mod fetch;
 pub mod find_coordinator;
 pub mod heartbeat;
+pub mod incremental_alter_configs;
 pub mod init_producer_id;
 pub mod join_group;
 pub mod leave_group;
@@ -58,12 +61,13 @@ use crate::auth::AuthenticatedPrincipal;
 use crate::bridge::BridgeError;
 use crate::error::{KafkaProtocolError, Result};
 use crate::protocol::api::{
-    API_KEY_ALTER_CONFIGS, API_KEY_API_VERSIONS, API_KEY_CREATE_TOPICS, API_KEY_DELETE_TOPICS,
-    API_KEY_DESCRIBE_CONFIGS, API_KEY_DESCRIBE_GROUPS, API_KEY_FETCH, API_KEY_FIND_COORDINATOR,
-    API_KEY_HEARTBEAT, API_KEY_INIT_PRODUCER_ID, API_KEY_JOIN_GROUP, API_KEY_LEAVE_GROUP,
-    API_KEY_LIST_GROUPS, API_KEY_LIST_OFFSETS, API_KEY_METADATA, API_KEY_OFFSET_COMMIT,
-    API_KEY_OFFSET_FETCH, API_KEY_PRODUCE, API_KEY_SYNC_GROUP, ConnectionState,
-    ERROR_INVALID_REQUEST, ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome,
+    API_KEY_ALTER_CONFIGS, API_KEY_API_VERSIONS, API_KEY_CREATE_PARTITIONS, API_KEY_CREATE_TOPICS,
+    API_KEY_DELETE_TOPICS, API_KEY_DESCRIBE_CLUSTER, API_KEY_DESCRIBE_CONFIGS,
+    API_KEY_DESCRIBE_GROUPS, API_KEY_FETCH, API_KEY_FIND_COORDINATOR, API_KEY_HEARTBEAT,
+    API_KEY_INCREMENTAL_ALTER_CONFIGS, API_KEY_INIT_PRODUCER_ID, API_KEY_JOIN_GROUP,
+    API_KEY_LEAVE_GROUP, API_KEY_LIST_GROUPS, API_KEY_LIST_OFFSETS, API_KEY_METADATA,
+    API_KEY_OFFSET_COMMIT, API_KEY_OFFSET_FETCH, API_KEY_PRODUCE, API_KEY_SYNC_GROUP,
+    ConnectionState, ERROR_INVALID_REQUEST, ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome,
     is_supported_version, supported_max_version,
 };
 
@@ -79,8 +83,8 @@ pub(crate) const MAX_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Clamps KIP-4 `timeout_ms` into `[MIN_REQUEST_TIMEOUT, MAX_REQUEST_TIMEOUT]`.
 ///
-/// `CreateTopics` and `DeleteTopics` honor the request's own deadline. `ListOffsets` and
-/// `Metadata` do not: they have no such field.
+/// `CreateTopics`, `DeleteTopics` and `CreatePartitions` honor the request's own deadline.
+/// `ListOffsets` and `Metadata` do not: they have no such field.
 pub(crate) fn clamp_request_timeout(timeout_ms: i32) -> Duration {
     let requested = Duration::from_millis(u64::try_from(timeout_ms).unwrap_or(0));
     requested.clamp(MIN_REQUEST_TIMEOUT, MAX_REQUEST_TIMEOUT)
@@ -120,8 +124,14 @@ pub async fn dispatch(
         API_KEY_API_VERSIONS => api_versions::handle(connection, api_version, body).await,
         API_KEY_CREATE_TOPICS => create_topics::handle(state, api_version, body).await,
         API_KEY_DELETE_TOPICS => delete_topics::handle(state, principal, api_version, body).await,
+        API_KEY_CREATE_PARTITIONS => {
+            create_partitions::handle(state, principal, api_version, body).await
+        }
         API_KEY_DESCRIBE_CONFIGS => describe_configs::handle(state, api_version, body).await,
         API_KEY_ALTER_CONFIGS => alter_configs::handle(state, principal, api_version, body).await,
+        API_KEY_INCREMENTAL_ALTER_CONFIGS => {
+            incremental_alter_configs::handle(state, principal, api_version, body).await
+        }
         API_KEY_FIND_COORDINATOR => {
             find_coordinator::handle(state, connection, api_version, body).await
         }
@@ -130,6 +140,9 @@ pub async fn dispatch(
         API_KEY_LEAVE_GROUP => leave_group::handle(state, api_version, body).await,
         API_KEY_SYNC_GROUP => sync_group::handle(state, api_version, body).await,
         API_KEY_DESCRIBE_GROUPS => describe_groups::handle(state, api_version, body).await,
+        API_KEY_DESCRIBE_CLUSTER => {
+            describe_cluster::handle(state, connection, api_version, body).await
+        }
         API_KEY_LIST_GROUPS => list_groups::handle(state, api_version, body).await,
         API_KEY_INIT_PRODUCER_ID => init_producer_id::handle(state, api_version, body).await,
         _ => HandleOutcome::Close,
