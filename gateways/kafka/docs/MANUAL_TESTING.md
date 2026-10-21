@@ -360,13 +360,14 @@ For each API key, test **min−1**, **min**, **max**, **max+1** using `kafka-mes
 | 32 | DescribeConfigs | 1 | 4 | 0, 1, 4, 5 |
 | 33 | AlterConfigs | 0 | 2 | −1, 0, 2, 3 |
 | 37 | CreatePartitions | 0 | 3 | −1, 0, 3, 4 |
+| 44 | IncrementalAlterConfigs | 0 | 1 | −1, 0, 1, 2 |
 
 | ID | Test | Expected for in-range | Expected for out-of-range |
 | ---- | ------ | ---------------------- | --------------------------- |
-| B1 | ApiVersions negotiation | `error_code=0`; body lists 14 API keys with correct min/max | KIP-511 exception: still answers, `error_code=35` (UNSUPPORTED_VERSION), v0 response header regardless of the request's own encoding |
+| B1 | ApiVersions negotiation | `error_code=0`; body lists 20 API keys with correct min/max (SASL off) | KIP-511 exception: still answers, `error_code=35` (UNSUPPORTED_VERSION), v0 response header regardless of the request's own encoding |
 | B2 | Metadata out-of-range | N/A | **Connection closes**, no response sent - Metadata has no top-level error field to carry a version-correct error in |
 | B3 | Produce/Fetch/ListOffsets/CreateTopics/DeleteTopics/CreatePartitions/InitProducerId/OffsetCommit/OffsetFetch out-of-range | N/A | **Connection closes** for both above-max and below-min - `kafka_protocol`'s schema floor for each of these nine messages equals `SUPPORTED_RANGES`' own min, so there is no encodable error response below min either (see `SCOPE.md`'s Governance model) |
-| B4 | ApiVersions lists only scoped keys | Decode response | Contains keys 0,1,2,3,8,9,10,11,12,13,14,15,16,18,19,20,22,32,33,37 only, and no transaction keys (24, 25, 26, 28) |
+| B4 | ApiVersions lists only scoped keys | Decode response | Contains keys 0,1,2,3,8,9,10,11,12,13,14,15,16,18,19,20,22,32,33,37,44 only, and no transaction keys (24, 25, 26, 28) |
 
 An out-of-range version only ever produces `error_code=35` on ApiVersions (B1); every other API
 key's out-of-range case closes the connection - see B2/B3. InitProducerId and Produce also send
@@ -461,6 +462,7 @@ success. This category predates the bridge landing: G2/G3's "fails at metadata" 
 | G13 | Describe members | `kafka-consumer-groups.sh --bootstrap-server 127.0.0.1:9093 --describe --members --group g2` | Prints member ids. Assignment and protocol are filled only while the group is Stable |
 | G14 | Describe state | `kafka-consumer-groups.sh --bootstrap-server 127.0.0.1:9093 --describe --state --group g2` | Prints the state string (`Stable`, `PreparingRebalance`, `CompletingRebalance`, or `Empty`). The default `--describe` (no `--members` or `--state`) calls OffsetFetch and fails, because that API is not implemented |
 | G15 | Grow a topic | Bridge on and topic `orders` made as in Category I. `kafka-topics.sh --bootstrap-server 127.0.0.1:9093 --alter --topic orders --partitions 3`, then `--describe --topic orders`, then `--alter --topic orders --partitions 2` | The describe prints `PartitionCount: 3`. The second alter fails with `InvalidPartitionsException` naming the current count, and a describe still prints 3. Automated in `kafka_client_e2e_tests.rs` |
+| G16 | Alter retention with `kafka-configs.sh` | Bridged, topic `orders` as in Category I. `kafka-configs.sh --bootstrap-server 127.0.0.1:9093 --alter --entity-type topics --entity-name orders --add-config retention.ms=8000`, then the same with `--describe`, then with `--delete-config retention.ms` | Sends IncrementalAlterConfigs (44) only. Each alter prints `Completed updating config for topic orders.`; describe shows `retention.ms=8000` after the add and `retention.ms=-1` after the delete |
 
 Record kcat version and exact error strings in your test log. G1 passing is the minimum bar for client compatibility smoke.
 

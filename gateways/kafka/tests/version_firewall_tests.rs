@@ -39,11 +39,12 @@ use tokio::net::TcpStream;
 use iggy_gateway_kafka::protocol::api::{
     API_KEY_ALTER_CONFIGS, API_KEY_API_VERSIONS, API_KEY_CREATE_PARTITIONS, API_KEY_CREATE_TOPICS,
     API_KEY_DELETE_TOPICS, API_KEY_DESCRIBE_CONFIGS, API_KEY_DESCRIBE_GROUPS, API_KEY_FETCH,
-    API_KEY_FIND_COORDINATOR, API_KEY_HEARTBEAT, API_KEY_INIT_PRODUCER_ID, API_KEY_JOIN_GROUP,
-    API_KEY_LEAVE_GROUP, API_KEY_LIST_GROUPS, API_KEY_LIST_OFFSETS, API_KEY_METADATA,
-    API_KEY_OFFSET_COMMIT, API_KEY_OFFSET_FETCH, API_KEY_PRODUCE, API_KEY_SYNC_GROUP,
-    ERROR_INVALID_REQUEST, ERROR_NONE, ERROR_UNSUPPORTED_VERSION, advertised_min_version,
-    handle_request, is_supported_version, supported_api_ranges,
+    API_KEY_FIND_COORDINATOR, API_KEY_HEARTBEAT, API_KEY_INCREMENTAL_ALTER_CONFIGS,
+    API_KEY_INIT_PRODUCER_ID, API_KEY_JOIN_GROUP, API_KEY_LEAVE_GROUP, API_KEY_LIST_GROUPS,
+    API_KEY_LIST_OFFSETS, API_KEY_METADATA, API_KEY_OFFSET_COMMIT, API_KEY_OFFSET_FETCH,
+    API_KEY_PRODUCE, API_KEY_SYNC_GROUP, ERROR_INVALID_REQUEST, ERROR_NONE,
+    ERROR_UNSUPPORTED_VERSION, advertised_min_version, handle_request, is_supported_version,
+    supported_api_ranges,
 };
 
 use codec::Decoder;
@@ -61,15 +62,16 @@ use wire::{
     build_create_topics_empty_request, build_delete_topics_empty_request,
     build_describe_configs_empty_request, build_describe_groups_request,
     build_fetch_empty_topics_request, build_find_coordinator_request, build_heartbeat_request,
-    build_init_producer_id_request, build_join_group_request, build_leave_group_request,
-    build_list_groups_request, build_list_offsets_request, build_metadata_all_topics_flexible,
+    build_incremental_alter_configs_empty_request, build_init_producer_id_request,
+    build_join_group_request, build_leave_group_request, build_list_groups_request,
+    build_list_offsets_request, build_metadata_all_topics_flexible,
     build_metadata_all_topics_legacy, build_metadata_flexible_request_v10,
     build_offset_commit_request, build_offset_fetch_request, build_sync_group_request,
 };
 
 #[test]
-fn supported_ranges_table_has_twenty_one_entries() {
-    assert_eq!(supported_api_ranges().len(), 21);
+fn supported_ranges_table_has_twenty_two_entries() {
+    assert_eq!(supported_api_ranges().len(), 22);
 }
 
 #[test]
@@ -109,8 +111,8 @@ fn is_supported_version_matches_scope_table() {
 /// in that order (Produce, Fetch, `ListOffsets`, Metadata, `OffsetCommit`, `OffsetFetch`,
 /// `FindCoordinator`, `JoinGroup`, Heartbeat, `LeaveGroup`, `SyncGroup`, `DescribeGroups`,
 /// `ListGroups`, `ApiVersions`, `CreateTopics`, `DeleteTopics`, `InitProducerId`,
-/// `DescribeConfigs`, `AlterConfigs`, `CreatePartitions`, `DescribeCluster`).
-/// `supported_ranges_table_has_twenty_one_entries` and `is_supported_version_matches_scope_table`
+/// `DescribeConfigs`, `AlterConfigs`, `CreatePartitions`, `IncrementalAlterConfigs`, `DescribeCluster`).
+/// `supported_ranges_table_has_twenty_two_entries` and `is_supported_version_matches_scope_table`
 /// pin that both tables cover the same keys.
 #[tokio::test]
 async fn apiversions_advertises_exact_supported_ranges_v1() {
@@ -533,6 +535,7 @@ fn request_body_for_scoped_api(api_key: i16, name: &str, version: i16) -> Bytes 
         API_KEY_LIST_GROUPS => build_list_groups_request(version, &[], &[]),
         API_KEY_DESCRIBE_CONFIGS => build_describe_configs_empty_request(version),
         API_KEY_ALTER_CONFIGS => build_alter_configs_empty_request(version),
+        API_KEY_INCREMENTAL_ALTER_CONFIGS => build_incremental_alter_configs_empty_request(version),
         API_KEY_OFFSET_COMMIT => build_offset_commit_request(version, "scope-group", "orders", 0),
         API_KEY_OFFSET_FETCH => build_offset_fetch_request(version, "scope-group", Some("orders")),
         _ => Bytes::new(),
@@ -925,5 +928,42 @@ async fn corrupt_alter_configs_overlong_count_returns_invalid_request_error() {
     let mut d = Decoder::new(resp);
     assert_eq!(d.read_i32().unwrap(), 0, "throttle");
     assert_eq!(d.read_i32().unwrap(), 1, "responses len");
+    assert_eq!(d.read_i16().unwrap(), ERROR_INVALID_REQUEST);
+}
+
+/// v0 is legacy. A count that stops mid-integer never reaches `kafka_protocol`.
+#[tokio::test]
+async fn corrupt_incremental_alter_configs_truncated_body_returns_invalid_request_error() {
+    let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF]);
+    let resp = handle_request(
+        API_KEY_INCREMENTAL_ALTER_CONFIGS,
+        0,
+        body,
+        &default_broker(),
+    )
+    .await
+    .expect_response("IncrementalAlterConfigs v0 has an encodable error response");
+    let mut d = Decoder::new(resp);
+    assert_eq!(d.read_i32().unwrap(), 0, "throttle");
+    assert_eq!(d.read_i32().unwrap(), 1, "responses len");
+    assert_eq!(d.read_i16().unwrap(), ERROR_INVALID_REQUEST);
+}
+
+/// v1 is flexible: the error body carries a compact array, and the count that is rejected is a
+/// compact varint rather than an `i32`.
+#[tokio::test]
+async fn corrupt_incremental_alter_configs_overlong_compact_count_returns_invalid_request_error() {
+    let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F]);
+    let resp = handle_request(
+        API_KEY_INCREMENTAL_ALTER_CONFIGS,
+        1,
+        body,
+        &default_broker(),
+    )
+    .await
+    .expect_response("IncrementalAlterConfigs v1 has an encodable error response");
+    let mut d = Decoder::new(resp);
+    assert_eq!(d.read_i32().unwrap(), 0, "throttle");
+    assert_eq!(d.read_varint().unwrap(), 2, "responses len + 1");
     assert_eq!(d.read_i16().unwrap(), ERROR_INVALID_REQUEST);
 }

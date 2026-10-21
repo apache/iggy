@@ -1,28 +1,29 @@
 # Kafka gateway (`iggy-gateway-kafka`)
 
-Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/3421): a TCP listener on the Kafka wire port that decodes requests and validates scoped API keys and versions. With a bridge, Produce, Fetch, ListOffsets, Metadata, CreateTopics, DeleteTopics, CreatePartitions, DescribeConfigs and AlterConfigs use Iggy. InitProducerId and consumer group coordination work with or without one.
+Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/3421): a TCP listener on the Kafka wire port that decodes requests and validates scoped API keys and versions. With a bridge, Produce, Fetch, ListOffsets, Metadata, CreateTopics, DeleteTopics, CreatePartitions, DescribeConfigs, AlterConfigs and IncrementalAlterConfigs use Iggy. InitProducerId and consumer group coordination work with or without one.
 
 > **Stub warning:** with `IGGY_KAFKA_BRIDGE_ENABLED=true`, Produce, Fetch, ListOffsets, Metadata,
-> CreateTopics, DeleteTopics, CreatePartitions, DescribeConfigs and AlterConfigs use Iggy. With
-> the bridge off (the default), those nine are stubs: Produce, Fetch and ListOffsets answer
-> retriable `NOT_LEADER_OR_FOLLOWER` (6), CreateTopics, DeleteTopics, CreatePartitions,
-> DescribeConfigs and AlterConfigs answer `NOT_CONTROLLER` (41), and Metadata reports every
-> requested topic unknown. **CreateTopics, DeleteTopics, CreatePartitions and AlterConfigs run as
-> the bridge's own Iggy user**: with the bridge on and `IGGY_KAFKA_SASL_ENABLED` off (the
-> default), any client that can reach this port can create topics (up to 1000 partitions each),
-> grow them by up to 1000 partitions per topic per request (100 topics per request), delete
-> topics and their data, or shorten a topic's `retention.ms` low enough that the cleaner drops
-> sealed segments, deleting data. With `IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED=true` and no
-> listener that names principals, any client that reaches this port can also create topics just
-> by naming them in a `Metadata` request. When the connection has a principal (SASL, or a client
-> certificate mapped to an Iggy user), `DeleteTopics`, `CreatePartitions`, `AlterConfigs` and
-> `Metadata` auto-creation additionally require it to hold a global `manage_topics` or
-> `manage_streams`; without it every resource of a `DeleteTopics`, `CreatePartitions` or
-> `AlterConfigs` request, and every missing topic a `Metadata` request would create, fails
-> `TOPIC_AUTHORIZATION_FAILED` (29) and nothing is written, created or deleted. `CreateTopics` has
-> no such gate yet - SASL on does not protect it. Every client reads and writes as the bridge's
-> Iggy user. Iggy's `metadata.partitions_max` defaults to 0 (unlimited), so set it before exposing
-> the gateway. See [docs/SCOPE.md](docs/SCOPE.md).
+> CreateTopics, DeleteTopics, CreatePartitions, DescribeConfigs, AlterConfigs and
+> IncrementalAlterConfigs use Iggy. With the bridge off (the default), those ten are stubs:
+> Produce, Fetch and ListOffsets answer retriable `NOT_LEADER_OR_FOLLOWER` (6), CreateTopics,
+> DeleteTopics, CreatePartitions, DescribeConfigs, AlterConfigs and IncrementalAlterConfigs answer
+> `NOT_CONTROLLER` (41), and Metadata reports every requested topic unknown. **CreateTopics,
+> DeleteTopics, CreatePartitions and both alter APIs run as the bridge's own Iggy user**: with the
+> bridge on and `IGGY_KAFKA_SASL_ENABLED` off (the default), any client that can reach this port
+> can create topics (up to 1000 partitions each), grow them by up to 1000 partitions per topic per
+> request (100 topics per request), delete topics and their data, or shorten a topic's
+> `retention.ms` low enough that the cleaner drops sealed segments, deleting data. With
+> `IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED=true` and no listener that names principals, any client
+> that reaches this port can also create topics just by naming them in a `Metadata` request. When
+> the connection has a principal (SASL, or a client certificate mapped to an Iggy user),
+> `DeleteTopics`, `CreatePartitions`, `AlterConfigs`, `IncrementalAlterConfigs` and `Metadata`
+> auto-creation additionally require it to hold a global `manage_topics` or `manage_streams`;
+> without it every resource of a `DeleteTopics`, `CreatePartitions`, `AlterConfigs` or
+> `IncrementalAlterConfigs` request, and every missing topic a `Metadata` request would create,
+> fails `TOPIC_AUTHORIZATION_FAILED` (29) and nothing is written, created or deleted.
+> `CreateTopics` has no such gate yet - SASL on does not protect it. Every client reads and writes
+> as the bridge's Iggy user. Iggy's `metadata.partitions_max` defaults to 0 (unlimited), so set it
+> before exposing the gateway. See [docs/SCOPE.md](docs/SCOPE.md).
 >
 > InitProducerId does real work too, with or without the bridge: it allocates a producer id, so a stock idempotent producer starts instead of failing at startup.
 >
@@ -216,7 +217,7 @@ See [docs/SCOPE.md](docs/SCOPE.md) for [#3421](https://github.com/apache/iggy/is
 - [docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md) — group membership, rebalances, and why one gateway per bootstrap endpoint
 - [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md) — how a Kafka client authenticates, and why PLAIN only
 - [docs/ACL_MAPPING.md](docs/ACL_MAPPING.md) — how Iggy permissions are described as Kafka ACLs
-- [docs/CONFIGS.md](docs/CONFIGS.md) — DescribeConfigs and AlterConfigs for topic `retention.ms`
+- [docs/CONFIGS.md](docs/CONFIGS.md) — DescribeConfigs, AlterConfigs and IncrementalAlterConfigs for topic `retention.ms`
 
 ### Delivery guarantees
 
@@ -412,9 +413,9 @@ topic per call) and records by time for `ListOffsets`, probes and polls partitio
 stores and reads group offsets for OffsetCommit and OffsetFetch.
 Produce ([#3535](https://github.com/apache/iggy/issues/3535)), Fetch ([#3536](https://github.com/apache/iggy/issues/3536)), ListOffsets
 ([#3537](https://github.com/apache/iggy/issues/3537)), Metadata ([#3534](https://github.com/apache/iggy/issues/3534)), CreateTopics
-([#3538](https://github.com/apache/iggy/issues/3538)), DescribeConfigs and AlterConfigs , OffsetCommit and OffsetFetchcall it.
-Topic configuration behavior is in [docs/CONFIGS.md](docs/CONFIGS.md).
+([#3538](https://github.com/apache/iggy/issues/3538)), DescribeConfigs, AlterConfigs and IncrementalAlterConfigs, OffsetCommit and OffsetFetch
 ([#3542](https://github.com/apache/iggy/issues/3542)) call it.
+Topic configuration behavior is in [docs/CONFIGS.md](docs/CONFIGS.md).
 Tested by `bridge`'s own unit tests, `tests/bridge_iggy_integration_tests.rs` and the
 `tests/*_real_bridge_tests.rs` suites. All but the unit tests start a real `iggy-server`.
 
@@ -609,7 +610,7 @@ call created it." A *different* `partition_count` against an already-existing to
 two concurrent callers requesting different counts for the same topic must not both see success.
 
 Topics created this way have **no message expiry** - Iggy's own server default, not Kafka's 7-day
-default. `AlterConfigs` can set that expiry afterwards through `retention.ms`
+default. `AlterConfigs` or `IncrementalAlterConfigs` can set that expiry afterwards through `retention.ms`
 ([docs/CONFIGS.md](docs/CONFIGS.md)). Until a client does, messages never expire, so a Kafka app
 that assumes the 7-day default will accumulate data on this bridge.
 
@@ -702,9 +703,10 @@ With auto-creation off, the default, nothing changes: a missing topic is answere
   other closes after `IGGY_KAFKA_PRODUCE_SESSION_IDLE_SECS` (600) unused, checked every 30 s.
 - 4 clients sign in at once, 80 a second at most. More wait, up to their request's deadline.
 - `IGGY_KAFKA_PRODUCE_SESSIONS=0`: all producers share one client, one request at a time.
-- Metadata, CreateTopics, DeleteTopics, CreatePartitions, DescribeConfigs and AlterConfigs share
-  1 more client, one Iggy request at a time. Fetch polls use 4 more, one per read slot, and a
-  `ListOffsets` lookup by time borrows one of those slots for its request. Topic probes use 1
+- Metadata, CreateTopics, DeleteTopics, CreatePartitions, DescribeConfigs, AlterConfigs and
+  IncrementalAlterConfigs share 1 more client, one Iggy request at a time. Fetch polls use 4
+  more, one per read slot, and a `ListOffsets` lookup by time borrows one of those slots for its
+  request. Topic probes use 1
   more. With auto topic creation on, creations use 1 more, opened at the first one.
   Offset calls use 8 more: a commit client and a read client per offset slot.
 - CreateTopics, DeleteTopics and CreatePartitions writes also take one gateway-wide lock, so a

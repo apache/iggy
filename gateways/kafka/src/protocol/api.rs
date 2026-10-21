@@ -45,8 +45,8 @@ use crate::protocol::handlers::init_producer_id::ProducerIdAllocator;
 use crate::protocol::handlers::{
     alter_configs, api_versions, create_partitions, create_topics, decode_guarded, delete_topics,
     describe_cluster, describe_configs, describe_groups, dispatch, fetch, find_coordinator,
-    heartbeat, init_producer_id, join_group, leave_group, list_groups, list_offsets, metadata,
-    offset_commit, offset_fetch, produce, respond_or_close, sync_group,
+    heartbeat, incremental_alter_configs, init_producer_id, join_group, leave_group, list_groups,
+    list_offsets, metadata, offset_commit, offset_fetch, produce, respond_or_close, sync_group,
 };
 use crate::protocol::probe_board::ProbeBoard;
 use crate::protocol::sasl::{
@@ -76,6 +76,7 @@ pub const API_KEY_DESCRIBE_CONFIGS: i16 = 32;
 pub const API_KEY_ALTER_CONFIGS: i16 = 33;
 pub const API_KEY_SASL_AUTHENTICATE: i16 = 36;
 pub const API_KEY_CREATE_PARTITIONS: i16 = 37;
+pub const API_KEY_INCREMENTAL_ALTER_CONFIGS: i16 = 44;
 pub const API_KEY_DESCRIBE_CLUSTER: i16 = 60;
 
 pub const DEFAULT_KAFKA_PORT: u16 = 9093;
@@ -301,6 +302,7 @@ static SUPPORTED_RANGES: &[ApiVersionRange] = &[
     create_partitions::RANGE,
     describe_configs::RANGE,
     alter_configs::RANGE,
+    incremental_alter_configs::RANGE,
     init_producer_id::RANGE,
     find_coordinator::RANGE,
     join_group::RANGE,
@@ -323,8 +325,9 @@ pub fn supported_api_ranges() -> &'static [ApiVersionRange] {
 /// answers with its stub, so APIs can be wired one at a time.
 ///
 /// Produce sends on one Iggy client per producer. Metadata, `CreateTopics`, `DeleteTopics`,
-/// `CreatePartitions`, `DescribeConfigs` and `AlterConfigs` share one lockstep `IggyClient`, so
-/// those calls run one at a time across connections. See the README's "Concurrency ceiling".
+/// `CreatePartitions`, `DescribeConfigs`, `AlterConfigs` and `IncrementalAlterConfigs` share one
+/// lockstep `IggyClient`, so those calls run one at a time across connections. See the README's
+/// "Concurrency ceiling".
 pub struct GatewayState {
     pub bridge: Option<Arc<IggyBridge>>,
     pub max_frame_size: usize,
@@ -855,6 +858,9 @@ pub fn encode_error_for_key(
             describe_configs::encode_error_response(api_version, error_code)
         }
         API_KEY_ALTER_CONFIGS => alter_configs::encode_error_response(api_version, error_code),
+        API_KEY_INCREMENTAL_ALTER_CONFIGS => {
+            incremental_alter_configs::encode_error_response(api_version, error_code)
+        }
         API_KEY_DESCRIBE_CLUSTER => {
             describe_cluster::encode_error_response(api_version, error_code)
         }

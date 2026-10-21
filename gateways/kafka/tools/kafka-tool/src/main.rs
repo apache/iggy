@@ -27,6 +27,10 @@ use kafka_protocol::messages::delete_records_request::*;
 use kafka_protocol::messages::delete_topics_request::*;
 use kafka_protocol::messages::describe_configs_request::*;
 use kafka_protocol::messages::fetch_request::*;
+use kafka_protocol::messages::incremental_alter_configs_request::{
+    AlterConfigsResource as IncrementalAlterConfigsResource,
+    AlterableConfig as IncrementalAlterableConfig,
+};
 use kafka_protocol::messages::join_group_request::*;
 use kafka_protocol::messages::leave_group_request::MemberIdentity;
 use kafka_protocol::messages::list_offsets_request::*;
@@ -587,6 +591,21 @@ fn build_payload(api_key: i16, version: i16) -> Result<Bytes> {
                 .with_validate_only(false)
                 .encode(&mut buf, version)
                 .context("CreatePartitions")?;
+        }
+        44 => {
+            let config = IncrementalAlterableConfig::default()
+                .with_name(StrBytes::from_static_str("retention.ms"))
+                .with_config_operation(0)
+                .with_value(Some(StrBytes::from_static_str("60000")));
+            let resource = IncrementalAlterConfigsResource::default()
+                .with_resource_type(2)
+                .with_resource_name(StrBytes::from_static_str("test-topic"))
+                .with_configs(vec![config]);
+            IncrementalAlterConfigsRequest::default()
+                .with_resources(vec![resource])
+                .with_validate_only(false)
+                .encode(&mut buf, version)
+                .context("IncrementalAlterConfigs")?;
         }
         60 => {
             DescribeClusterRequest::default()

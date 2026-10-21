@@ -1448,6 +1448,60 @@ pub fn validate_alter_configs_shape(
     Ok(())
 }
 
+/// Mirrors the field order `IncrementalAlterConfigsRequest::decode` walks.
+///
+/// # Errors
+///
+/// Returns an error when a declared array or string length cannot fit in the bytes remaining
+/// in the frame, or the body is truncated or malformed in a way that cannot be walked.
+pub fn validate_incremental_alter_configs_shape(
+    version: i16,
+    body: &Bytes,
+    max_frame_size: usize,
+) -> Result<()> {
+    let mut c = ShapeCursor::new(body.clone(), max_frame_size);
+    let flexible = version >= 1;
+
+    let resources_count = if flexible {
+        c.compact_array_count()?
+    } else {
+        c.legacy_array_count()?
+    };
+    for _ in 0..resources_count {
+        let _resource_type = c.read_i8()?;
+        if flexible {
+            c.compact_string(false)?;
+        } else {
+            c.legacy_string(false)?;
+        }
+        let configs_count = if flexible {
+            c.compact_array_count()?
+        } else {
+            c.legacy_array_count()?
+        };
+        for _ in 0..configs_count {
+            if flexible {
+                c.compact_string(false)?;
+                let _config_operation = c.read_i8()?;
+                c.compact_string(true)?;
+                c.tagged_fields()?;
+            } else {
+                c.legacy_string(false)?;
+                let _config_operation = c.read_i8()?;
+                c.legacy_string(true)?;
+            }
+        }
+        if flexible {
+            c.tagged_fields()?;
+        }
+    }
+    let _validate_only = c.read_bool()?;
+    if flexible {
+        c.tagged_fields()?;
+    }
+    Ok(())
+}
+
 /// `DescribeAcls` carries a fixed-shape filter: four enums and three nullable strings.
 ///
 /// No arrays and nothing echoed into the response, so there is no amplification to project. The
@@ -2214,6 +2268,34 @@ mod tests {
     fn alter_configs_v2_huge_compact_count_rejected() {
         let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F]); // u32::MAX, 5-byte varint
         assert!(validate_alter_configs_shape(2, &body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    #[test]
+    fn incremental_alter_configs_v0_huge_legacy_count_rejected() {
+        let body = Bytes::from_static(&[0x7F, 0xFF, 0xFF, 0xFF]);
+        assert!(validate_incremental_alter_configs_shape(0, &body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    #[test]
+    fn incremental_alter_configs_v1_huge_compact_count_rejected() {
+        let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F]); // u32::MAX, 5-byte varint
+        assert!(validate_incremental_alter_configs_shape(1, &body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    /// A config entry declaring a value longer than the frame is caught by the walk, at the
+    /// nullable-string position that only this request has after the operation byte.
+    #[test]
+    fn incremental_alter_configs_v0_overlong_value_rejected() {
+        let body = Bytes::from_static(&[
+            0x00, 0x00, 0x00, 0x01, // one resource
+            0x02, // resource_type
+            0x00, 0x01, b'a', // resource_name
+            0x00, 0x00, 0x00, 0x01, // one config
+            0x00, 0x01, b'k', // name
+            0x00, // config_operation
+            0x7F, 0xFF, // value length past the frame
+        ]);
+        assert!(validate_incremental_alter_configs_shape(0, &body, TEST_MAX_FRAME_SIZE).is_err());
     }
 
     #[test]

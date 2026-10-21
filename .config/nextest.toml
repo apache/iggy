@@ -63,6 +63,7 @@ filter = '''
     + binary_id(iggy-gateway-kafka::fetch_real_bridge_tests)
     + binary_id(iggy-gateway-kafka::list_offsets_real_bridge_tests)
     + binary_id(iggy-gateway-kafka::produce_real_bridge_tests)
+    + binary_id(iggy-gateway-kafka::configs_real_bridge_tests)
     + binary_id(iggy-gateway-kafka::create_topics_real_bridge_tests)
     + binary_id(iggy-gateway-kafka::delete_topics_real_bridge_tests)
     + binary_id(iggy-gateway-kafka::create_partitions_real_bridge_tests)

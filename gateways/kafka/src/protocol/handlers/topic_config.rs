@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Topic configuration shared by `DescribeConfigs` and `AlterConfigs`.
+//! Topic configuration shared by `DescribeConfigs`, `AlterConfigs` and
+//! `IncrementalAlterConfigs`.
 //!
 //! Iggy stores `message_expiry` as [`IggyExpiry`]. A duration is microseconds
 //! (`IggyDuration::from(u64)` / `as_micros`). `u64::MAX` is [`IggyExpiry::NeverExpire`]
@@ -31,8 +32,10 @@ use std::str::FromStr;
 use iggy::prelude::{HeaderKey, IggyDuration, IggyExpiry, ResourceOptions, topic_option_keys};
 use kafka_protocol::messages::alter_configs_request::AlterConfigsResource;
 use kafka_protocol::messages::describe_configs_request::DescribeConfigsResource;
+use kafka_protocol::messages::incremental_alter_configs_request::AlterConfigsResource as IncrementalAlterConfigsResource;
 use kafka_protocol::protocol::StrBytes;
 
+use crate::auth::AuthenticatedPrincipal;
 use crate::bridge::BridgeError;
 
 /// Kafka `ConfigResource.Type.TOPIC`.
@@ -54,8 +57,8 @@ pub const ONLY_TOPIC_RESOURCES: &str = "only topic resources are supported";
 
 pub const RETENTION_DOC: &str = "How long a sealed segment is kept, in milliseconds. The active segment does not expire. -1 means sealed segments never expire.";
 
-/// Distinct topic names one `CreateTopics`, `CreatePartitions`, `DescribeConfigs`, or
-/// `AlterConfigs` request may address through the bridge.
+/// Distinct topic names one `CreateTopics`, `CreatePartitions`, `DescribeConfigs`, `AlterConfigs`
+/// or `IncrementalAlterConfigs` request may address through the bridge.
 ///
 /// `bounds_guard`'s element ceiling is a pre-decode limit. `CreateTopics` can spend several
 /// lockstep Iggy calls per name on the shared client (`ensure_stream`, `create_topic`, and a
@@ -63,6 +66,11 @@ pub const RETENTION_DOC: &str = "How long a sealed segment is kept, in milliseco
 /// APIs. Duplicate names count once toward the cap and are rejected on their own. A larger
 /// batch is `POLICY_VIOLATION` on every resource.
 pub const MAX_CONFIG_TOPICS: usize = 100;
+
+const CLEANUP_POLICY_READ_ONLY: &str = "cleanup.policy is read-only";
+
+const NOT_AUTHORIZED_TO_ALTER: &str =
+    "the authenticated principal is not authorized to alter topic configuration";
 
 /// One config name a describe request asked for, in request order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,13 +83,18 @@ pub enum ListedKey {
     Unknown,
 }
 
-/// Why one resource's alter cannot be stored.
+/// Why one resource's alter cannot be stored. Every variant is `INVALID_CONFIG` (40).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigFault {
     UnknownKey(String),
     Repeated(String),
     ReadOnly(&'static str),
     InvalidRetention,
+    /// An `APPEND` or `SUBTRACT` on a key that is not a list, in Kafka's own words.
+    NotAList {
+        operation: ConfigOperation,
+        key: String,
+    },
 }
 
 impl ConfigFault {
@@ -95,6 +108,79 @@ impl ConfigFault {
                 "retention.ms must be -1 or a positive count whose duration is at most {} seconds",
                 u32::MAX
             ),
+            Self::NotAList { operation, key } => {
+                let operation = operation.kafka_name();
+                format!("Can't {operation} to key {key} because its type is not LIST.")
+            }
+        }
+    }
+}
+
+/// Kafka `AlterConfigOp.OpType`, one per `IncrementalAlterConfigs` entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigOperation {
+    Set,
+    Delete,
+    Append,
+    Subtract,
+}
+
+impl ConfigOperation {
+    /// The spelling Kafka's own error text uses.
+    #[must_use]
+    pub const fn kafka_name(self) -> &'static str {
+        match self {
+            Self::Set => "SET",
+            Self::Delete => "DELETE",
+            Self::Append => "APPEND",
+            Self::Subtract => "SUBTRACT",
+        }
+    }
+}
+
+impl TryFrom<i8> for ConfigOperation {
+    /// The byte that matched nothing, for the client-facing text.
+    type Error = i8;
+
+    fn try_from(operation: i8) -> Result<Self, Self::Error> {
+        match operation {
+            0 => Ok(Self::Set),
+            1 => Ok(Self::Delete),
+            2 => Ok(Self::Append),
+            3 => Ok(Self::Subtract),
+            other => Err(other),
+        }
+    }
+}
+
+/// One `IncrementalAlterConfigs` entry that passed [`incremental_ops`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigOp<'a> {
+    pub name: &'a str,
+    pub operation: ConfigOperation,
+    pub value: Option<&'a str>,
+}
+
+/// Why one resource's incremental alter is refused before any Iggy call. Every variant is
+/// `INVALID_REQUEST` (42). The duplicate-key and null-value texts are Kafka's own; the
+/// unknown-operation text is borrowed from Kafka's broker-resource check, because Kafka's topic
+/// path has no well-formed answer for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestFault {
+    DuplicateKeys,
+    NullValues(Vec<String>),
+    UnknownOperation(i8),
+}
+
+impl RequestFault {
+    #[must_use]
+    pub fn message(&self) -> String {
+        match self {
+            Self::DuplicateKeys => "Error due to duplicate config keys".to_string(),
+            Self::NullValues(names) => {
+                format!("Null value not supported for : {}", names.join(", "))
+            }
+            Self::UnknownOperation(operation) => format!("Unknown operations type {operation}"),
         }
     }
 }
@@ -253,6 +339,16 @@ impl TopicResource for DescribeConfigsResource {
     }
 }
 
+impl TopicResource for IncrementalAlterConfigsResource {
+    fn kafka_resource_type(&self) -> i8 {
+        self.resource_type
+    }
+
+    fn kafka_resource_name(&self) -> &str {
+        self.resource_name.as_str()
+    }
+}
+
 /// The cap/duplicate verdict shared by `DescribeConfigs` and `AlterConfigs`: both filter
 /// resources down to [`RESOURCE_TYPE_TOPIC`] before deciding whether the request exceeds
 /// [`MAX_CONFIG_TOPICS`] or repeats a name, and the business decision is identical even
@@ -268,6 +364,31 @@ pub fn topic_cap_and_duplicates<R: TopicResource>(resources: &[R]) -> (bool, Has
         exceeds_topic_cap(names.iter().copied()),
         find_duplicate_names(names.iter().copied()),
     )
+}
+
+/// The denial every resource gets when `principal` may not alter topic configuration, or
+/// `None` when the alter may run.
+///
+/// No principal means no listener of this gateway names principals, so there is nothing to
+/// enforce against. Once one does, a connection that proved no identity carries
+/// [`AuthenticatedPrincipal::anonymous`] instead and is denied here. Permissions that were never
+/// read deny: granting would authorize a write off a value nothing read.
+#[must_use]
+pub fn alter_denial(
+    principal: Option<&AuthenticatedPrincipal>,
+    api_name: &str,
+) -> Option<StrBytes> {
+    let principal = principal?;
+    if principal.permissions_known && principal.permissions.manage_topics {
+        return None;
+    }
+    if !principal.permissions_known {
+        tracing::warn!(
+            principal = %principal.username,
+            "{api_name} asked on a connection whose permissions were never read; denying"
+        );
+    }
+    Some(StrBytes::from_static_str(NOT_AUTHORIZED_TO_ALTER))
 }
 
 /// The reason a topic name failed Kafka's own naming rules, or a fixed fallback.
@@ -363,8 +484,89 @@ pub fn plan_retention_update<'a>(
                 };
                 expiry = Some(parse_retention_ms(value)?);
             }
-            CLEANUP_POLICY => return Err(ConfigFault::ReadOnly("cleanup.policy is read-only")),
+            CLEANUP_POLICY => return Err(ConfigFault::ReadOnly(CLEANUP_POLICY_READ_ONLY)),
             other => return Err(ConfigFault::UnknownKey(other.to_string())),
+        }
+    }
+    Ok(expiry)
+}
+
+/// The entries of one `IncrementalAlterConfigs` resource, checked in the order Kafka's broker
+/// checks them before it forwards the request: a repeated name, a null value on anything but a
+/// delete, then an operation byte it does not know.
+///
+/// # Errors
+///
+/// Returns the first [`RequestFault`] in that order.
+pub fn incremental_ops<'a>(
+    configs: impl IntoIterator<Item = (&'a str, i8, Option<&'a str>)>,
+) -> Result<Vec<ConfigOp<'a>>, RequestFault> {
+    let configs: Vec<(&str, i8, Option<&str>)> = configs.into_iter().collect();
+    let mut seen = HashSet::new();
+    if configs.iter().any(|(name, _, _)| !seen.insert(*name)) {
+        return Err(RequestFault::DuplicateKeys);
+    }
+    let null_values: Vec<String> = configs
+        .iter()
+        .filter(|(_, operation, value)| {
+            value.is_none() && ConfigOperation::try_from(*operation) != Ok(ConfigOperation::Delete)
+        })
+        .map(|(name, _, _)| (*name).to_string())
+        .collect();
+    if !null_values.is_empty() {
+        return Err(RequestFault::NullValues(null_values));
+    }
+    configs
+        .into_iter()
+        .map(|(name, operation, value)| {
+            let operation =
+                ConfigOperation::try_from(operation).map_err(RequestFault::UnknownOperation)?;
+            Ok(ConfigOp {
+                name,
+                operation,
+                value,
+            })
+        })
+        .collect()
+}
+
+/// The expiry an incremental alter stores, or `None` when no entry changes `retention.ms`.
+///
+/// `SET` stores the parsed value. `DELETE` stores never-expire, the value a topic has before any
+/// alter, and a delete of any other key changes nothing: Kafka removes an override there, and
+/// this gateway stored none. `APPEND` and `SUBTRACT` are refused for every key: `cleanup.policy`
+/// is a list in Kafka but read-only here, and no other key this gateway knows is a list. Kafka
+/// refuses them the same way for a key it does not know.
+///
+/// # Errors
+///
+/// Returns the first [`ConfigFault`] in request order.
+pub fn plan_incremental_update(ops: &[ConfigOp<'_>]) -> Result<Option<IggyExpiry>, ConfigFault> {
+    let mut expiry = None;
+    for op in ops {
+        match op.operation {
+            ConfigOperation::Set => match op.name {
+                RETENTION_MS => {
+                    let value = op.value.ok_or(ConfigFault::InvalidRetention)?;
+                    expiry = Some(parse_retention_ms(value)?);
+                }
+                CLEANUP_POLICY => return Err(ConfigFault::ReadOnly(CLEANUP_POLICY_READ_ONLY)),
+                other => return Err(ConfigFault::UnknownKey(other.to_string())),
+            },
+            ConfigOperation::Delete => {
+                if op.name == RETENTION_MS {
+                    expiry = Some(IggyExpiry::NeverExpire);
+                }
+            }
+            ConfigOperation::Append | ConfigOperation::Subtract => {
+                if op.name == CLEANUP_POLICY {
+                    return Err(ConfigFault::ReadOnly(CLEANUP_POLICY_READ_ONLY));
+                }
+                return Err(ConfigFault::NotAList {
+                    operation: op.operation,
+                    key: op.name.to_string(),
+                });
+            }
         }
     }
     Ok(expiry)
@@ -510,5 +712,141 @@ mod tests {
             plan_retention_update([(RETENTION_MS, Some("1000")), (RETENTION_MS, Some("1000"))])
                 .expect_err("repeated key");
         assert_eq!(err, ConfigFault::Repeated(RETENTION_MS.to_string()));
+    }
+
+    #[test]
+    fn incremental_ops_rejects_a_repeated_name_before_a_null_value() {
+        let err = incremental_ops([(RETENTION_MS, 0, Some("1")), (RETENTION_MS, 0, None)])
+            .expect_err("repeated");
+        assert_eq!(err, RequestFault::DuplicateKeys);
+        assert_eq!(err.message(), "Error due to duplicate config keys");
+    }
+
+    #[test]
+    fn incremental_ops_names_every_null_value_except_a_delete() {
+        let err = incremental_ops([
+            (RETENTION_MS, 0, None),
+            (CLEANUP_POLICY, 1, None),
+            ("no.such", 9, None),
+        ])
+        .expect_err("null values");
+        assert_eq!(
+            err,
+            RequestFault::NullValues(vec![RETENTION_MS.to_string(), "no.such".to_string()])
+        );
+        assert_eq!(
+            err.message(),
+            "Null value not supported for : retention.ms, no.such"
+        );
+    }
+
+    #[test]
+    fn incremental_ops_rejects_an_unknown_operation_byte() {
+        let err = incremental_ops([(RETENTION_MS, 4, Some("1"))]).expect_err("unknown op");
+        assert_eq!(err, RequestFault::UnknownOperation(4));
+        assert_eq!(err.message(), "Unknown operations type 4");
+        let err = incremental_ops([(RETENTION_MS, -1, Some("1"))]).expect_err("negative op");
+        assert_eq!(err, RequestFault::UnknownOperation(-1));
+        assert_eq!(err.message(), "Unknown operations type -1");
+    }
+
+    #[test]
+    fn incremental_ops_keeps_request_order_and_a_delete_value() {
+        let ops = incremental_ops([(RETENTION_MS, 1, Some("")), ("no.such", 0, Some("1"))])
+            .expect("well formed");
+        assert_eq!(
+            ops,
+            vec![
+                ConfigOp {
+                    name: RETENTION_MS,
+                    operation: ConfigOperation::Delete,
+                    value: Some(""),
+                },
+                ConfigOp {
+                    name: "no.such",
+                    operation: ConfigOperation::Set,
+                    value: Some("1"),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn incremental_plan_sets_and_deletes_retention() {
+        let set = incremental_ops([(RETENTION_MS, 0, Some("1500"))]).expect("ops");
+        assert_eq!(
+            plan_incremental_update(&set).expect("set"),
+            Some(IggyExpiry::ExpireDuration(IggyDuration::from(
+                1_500_000_u64
+            )))
+        );
+        let delete = incremental_ops([(RETENTION_MS, 1, None)]).expect("ops");
+        assert_eq!(
+            plan_incremental_update(&delete).expect("delete"),
+            Some(IggyExpiry::NeverExpire)
+        );
+    }
+
+    #[test]
+    fn incremental_plan_ignores_a_delete_of_a_key_it_never_stored() {
+        let ops = incremental_ops([("no.such", 1, None), (CLEANUP_POLICY, 1, None)]).expect("ops");
+        assert_eq!(plan_incremental_update(&ops).expect("no-op"), None);
+        assert_eq!(plan_incremental_update(&[]).expect("empty"), None);
+    }
+
+    #[test]
+    fn incremental_plan_refuses_set_of_unknown_read_only_and_invalid_values() {
+        let unknown = incremental_ops([("no.such", 0, Some("1"))]).expect("ops");
+        assert_eq!(
+            plan_incremental_update(&unknown).expect_err("unknown"),
+            ConfigFault::UnknownKey("no.such".to_string())
+        );
+        let read_only = incremental_ops([(CLEANUP_POLICY, 0, Some("compact"))]).expect("ops");
+        assert_eq!(
+            plan_incremental_update(&read_only).expect_err("read only"),
+            ConfigFault::ReadOnly(CLEANUP_POLICY_READ_ONLY)
+        );
+        let invalid = incremental_ops([(RETENTION_MS, 0, Some("abc"))]).expect("ops");
+        assert_eq!(
+            plan_incremental_update(&invalid).expect_err("invalid"),
+            ConfigFault::InvalidRetention
+        );
+    }
+
+    #[test]
+    fn incremental_plan_refuses_append_and_subtract_on_every_key() {
+        let append = incremental_ops([(RETENTION_MS, 2, Some("1"))]).expect("ops");
+        let err = plan_incremental_update(&append).expect_err("append");
+        assert_eq!(
+            err,
+            ConfigFault::NotAList {
+                operation: ConfigOperation::Append,
+                key: RETENTION_MS.to_string(),
+            }
+        );
+        assert_eq!(
+            err.message(),
+            "Can't APPEND to key retention.ms because its type is not LIST."
+        );
+        let subtract = incremental_ops([("no.such", 3, Some("1"))]).expect("ops");
+        let err = plan_incremental_update(&subtract).expect_err("subtract");
+        assert_eq!(
+            err.message(),
+            "Can't SUBTRACT to key no.such because its type is not LIST."
+        );
+    }
+
+    #[test]
+    fn incremental_plan_refuses_append_and_subtract_on_cleanup_policy_as_read_only() {
+        let append = incremental_ops([(CLEANUP_POLICY, 2, Some("compact"))]).expect("ops");
+        assert_eq!(
+            plan_incremental_update(&append).expect_err("append"),
+            ConfigFault::ReadOnly(CLEANUP_POLICY_READ_ONLY)
+        );
+        let subtract = incremental_ops([(CLEANUP_POLICY, 3, Some("delete"))]).expect("ops");
+        assert_eq!(
+            plan_incremental_update(&subtract).expect_err("subtract"),
+            ConfigFault::ReadOnly(CLEANUP_POLICY_READ_ONLY)
+        );
     }
 }

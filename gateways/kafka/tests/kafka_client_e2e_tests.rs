@@ -1155,6 +1155,98 @@ fn kafka_topics(gateway: SocketAddr, args: &[&str]) -> ClientRun {
     run_client(KAFKA_IMAGE, &full_args, &[])
 }
 
+/// Runs `kafka-configs.sh` with `args` against `gateway`, with SASL off like [`kafka_topics`].
+fn kafka_configs(gateway: SocketAddr, args: &[&str]) -> ClientRun {
+    let bootstrap = gateway.to_string();
+    let mut full_args: Vec<&str> = vec![
+        "/opt/kafka/bin/kafka-configs.sh",
+        "--bootstrap-server",
+        &bootstrap,
+    ];
+    full_args.extend_from_slice(args);
+    run_client(KAFKA_IMAGE, &full_args, &[])
+}
+
+/// `kafka-configs.sh --alter` on a topic sends only `IncrementalAlterConfigs` (44): a `SET` for
+/// `--add-config` and a `DELETE` for `--delete-config`, after a describe of the topic's dynamic
+/// configs. This is the real-tool round trip for that key through the bridge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_kafka_configs_sh_when_adding_then_deleting_retention_should_round_trip_through_the_bridge()
+ {
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+    let completed = format!("Completed updating config for topic {TOPIC}.");
+
+    let added = kafka_configs(
+        gateway,
+        &[
+            "--alter",
+            "--entity-type",
+            "topics",
+            "--entity-name",
+            TOPIC,
+            "--add-config",
+            "retention.ms=8000",
+        ],
+    )
+    .expect_ran("kafka-configs.sh --add-config");
+    assert!(
+        added.contains(&completed),
+        "kafka-configs.sh must report the alter completed, got: {added}"
+    );
+
+    let described = kafka_configs(
+        gateway,
+        &[
+            "--describe",
+            "--entity-type",
+            "topics",
+            "--entity-name",
+            TOPIC,
+        ],
+    )
+    .expect_ran("kafka-configs.sh --describe after --add-config");
+    assert!(
+        described.contains("retention.ms=8000 sensitive=false"),
+        "the describe must show the stored retention.ms, got: {described}"
+    );
+
+    let deleted = kafka_configs(
+        gateway,
+        &[
+            "--alter",
+            "--entity-type",
+            "topics",
+            "--entity-name",
+            TOPIC,
+            "--delete-config",
+            "retention.ms",
+        ],
+    )
+    .expect_ran("kafka-configs.sh --delete-config");
+    assert!(
+        deleted.contains(&completed),
+        "kafka-configs.sh must report the delete completed, got: {deleted}"
+    );
+
+    let described_after = kafka_configs(
+        gateway,
+        &[
+            "--describe",
+            "--entity-type",
+            "topics",
+            "--entity-name",
+            TOPIC,
+        ],
+    )
+    .expect_ran("kafka-configs.sh --describe after --delete-config");
+    assert!(
+        described_after.contains("retention.ms=-1 sensitive=false"),
+        "a deleted retention.ms reads as never expire, got: {described_after}"
+    );
+}
+
 /// #3546's own acceptance criterion: `kafka-topics.sh` must work against the gateway for create
 /// and delete. (`--describe` needs `DescribeConfigs`, not yet implemented, so it is not covered
 /// here.) Runs against the bridged stack, since this exercises the real `CreateTopics`/

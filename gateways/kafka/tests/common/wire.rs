@@ -45,11 +45,7 @@ pub fn decode<M: Decodable>(body: Bytes, version: i16) -> M {
 }
 
 /// Consumer-group and admin keys explicitly out of scope in SCOPE.md.
-pub const OUT_OF_SCOPE_API_KEYS: &[(i16, &str)] = &[
-    (21, "DeleteRecords"),
-    (42, "DeleteGroups"),
-    (44, "IncrementalAlterConfigs"),
-];
+pub const OUT_OF_SCOPE_API_KEYS: &[(i16, &str)] = &[(21, "DeleteRecords"), (42, "DeleteGroups")];
 
 /// Append Metadata request fields that follow the topics array for `version`.
 fn write_metadata_request_trailer(enc: &mut Encoder, version: i16) {
@@ -342,6 +338,22 @@ pub fn build_describe_configs_empty_request(version: i16) -> Bytes {
 /// `AlterConfigs` with no resources. Flexible from v2.
 pub fn build_alter_configs_empty_request(version: i16) -> Bytes {
     let flexible = version >= 2;
+    let mut enc = Encoder::with_capacity(16);
+    if flexible {
+        enc.write_varint(1);
+    } else {
+        enc.write_i32(0);
+    }
+    enc.write_bool(false); // validate_only
+    if flexible {
+        enc.write_empty_tagged_fields();
+    }
+    enc.freeze()
+}
+
+/// `IncrementalAlterConfigs` with no resources. Flexible from v1.
+pub fn build_incremental_alter_configs_empty_request(version: i16) -> Bytes {
+    let flexible = version >= 1;
     let mut enc = Encoder::with_capacity(16);
     if flexible {
         enc.write_varint(1);
