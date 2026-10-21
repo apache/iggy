@@ -116,8 +116,8 @@ use tracing::{debug, warn};
 use crate::dispatch::reads::hold_for_frontier;
 use crate::http::admission::{RelayTargetRefusal, RelayTargets};
 use crate::http::error::{
-    CustomError, PartitionWriteError, ReadError, error_response, gateway_timeout_response,
-    primary_http_socket, with_retry_after,
+    CustomError, PartitionWriteError, ReadError, error_response, forward_busy,
+    gateway_timeout_response, primary_http_socket, relay_refused, with_retry_after,
 };
 use crate::http::extractor::{bearer_token, credential_key, resolve_credential};
 use crate::http::relay_proof::{RELAY_PROOF_LIFETIME, RelayKey, UnprovenRelay, parse_decimal};
@@ -723,28 +723,35 @@ async fn relay_to_primary(
 }
 
 /// The metadata primary's commit floor, read before `deadline`: an op at or
-/// above every metadata op acknowledged before this call. `None` without
-/// forwarding, at this node's forward budget, when the metadata primary
-/// refused this node's proof, or when no metadata primary answered in time.
+/// above every metadata op acknowledged before this call. Refusals preserve
+/// whether forwarding is unavailable, its budget is full, or the primary
+/// rejected this node's proof.
 ///
 /// The reads leave this node like a forward, so the wait holds a forward slot
 /// ([`MAX_IN_FLIGHT_FORWARDS`]): a burst of linearizable reads cannot open
 /// unbounded connections to the metadata primary or resend to it every
 /// [`FORWARD_RETRY_INTERVAL`] without bound while it is not settled.
-pub(in crate::http) async fn metadata_floor(state: &HttpInner, deadline: Instant) -> Option<u64> {
-    let relay_key = state.forward.relay_key.as_ref()?;
-    let _guard = ForwardGuard::admit(&state.forward.in_flight)?;
+pub(in crate::http) async fn metadata_floor(
+    state: &HttpInner,
+    deadline: Instant,
+) -> Result<u64, ReadError> {
+    let relay_key = state
+        .forward
+        .relay_key
+        .as_ref()
+        .ok_or(ReadError::NotPrimary)?;
+    let _guard = ForwardGuard::admit(&state.forward.in_flight).ok_or(ReadError::ForwardBusy)?;
     loop {
         if let Some(socket) = primary_socket(state) {
             state.metrics.metadata_floor_reads.inc();
             let read = read_metadata_floor(state, relay_key, socket);
             let remaining = deadline.saturating_duration_since(Instant::now());
             if let Ok(ControlFlow::Break(floor)) = compio::time::timeout(remaining, read).await {
-                return floor;
+                return floor.ok_or(ReadError::RelayRefused);
             }
         }
         if deadline.saturating_duration_since(Instant::now()) <= FORWARD_RETRY_INTERVAL {
-            return None;
+            return Err(ReadError::NotPrimary);
         }
         compio::time::sleep(FORWARD_RETRY_INTERVAL).await;
     }
@@ -1503,14 +1510,6 @@ fn not_primary(primary: Option<PartitionPrimary>) -> Response {
     response
 }
 
-fn forward_busy() -> Response {
-    with_retry_after(error_response(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "forward_busy",
-        "node is at its forward budget; retry with backoff",
-    ))
-}
-
 /// The contacted node relays this answer to its caller as-is: a 429 when the
 /// caller's credential saturated its own share, a 503 under node-wide pressure.
 fn relay_target_refused(refusal: RelayTargetRefusal) -> Response {
@@ -1555,17 +1554,6 @@ fn proof_refused(status: StatusCode, headers: &HeaderMap, target: impl fmt::Disp
         "a node refused this node's relay proof; invalid means the cluster key material differs, expired or early that node clocks disagree"
     );
     true
-}
-
-/// The caller's answer when the partition primary refused this node's relay
-/// proof. Nothing was admitted, so the caller may retry, possibly through
-/// another node.
-fn relay_refused() -> Response {
-    with_retry_after(error_response(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "relay_refused",
-        "the partition primary refused this node's relay; node clocks or cluster key material disagree; nothing was admitted",
-    ))
 }
 
 fn wants_linearizable(query: Option<&str>) -> bool {
@@ -1668,6 +1656,7 @@ mod tests {
     use std::pin::pin;
     use std::task::Poll;
 
+    use configs::cluster::{ClusterNodeConfig, ResolvedClusterNode, TransportPorts};
     use futures::poll;
     use hyper::service::Service as _;
     use hyper_util::service::TowerToHyperService;
@@ -2136,6 +2125,42 @@ mod tests {
     }
 
     #[compio::test]
+    async fn given_a_rejected_proof_when_awaiting_the_metadata_floor_should_report_relay_refused() {
+        let (address, server) = answer_with(vec![refused_proof_reply(UnprovenRelay::Invalid)]);
+        let mut state = read_state_on(None, Some(KEY_MATERIAL));
+        let roster = Rc::get_mut(&mut Rc::get_mut(&mut state).unwrap().roster).unwrap();
+        roster.enabled = true;
+        roster.nodes.push(
+            ResolvedClusterNode::try_from(ClusterNodeConfig {
+                name: "primary".to_owned(),
+                ip: address.ip().to_string(),
+                advertised_address: None,
+                advertised_addresses: Vec::new(),
+                replica_id: 0,
+                ports: TransportPorts {
+                    http: Some(address.port()),
+                    ..TransportPorts::default()
+                },
+            })
+            .unwrap(),
+        );
+        let refusal = crate::http::reads::await_metadata_floor(
+            &state,
+            Instant::now() + PARTITION_REQUEST_DEADLINE,
+        )
+        .await
+        .expect_err("a refused proof must stop the read");
+        assert!(matches!(refusal, ReadError::RelayRefused));
+        let response = refusal.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["code"], "relay_refused");
+        assert_eq!(state.forward.in_flight.get(), 0);
+        server.join().unwrap();
+    }
+
+    #[compio::test]
     async fn given_noncanonical_applied_op_when_reading_metadata_floor_should_retry() {
         let state = read_state_on(None, Some(KEY_MATERIAL));
         let relay_key = state.forward.relay_key.as_ref().unwrap();
@@ -2417,7 +2442,14 @@ mod tests {
         let deadline = Instant::now() + PARTITION_REQUEST_DEADLINE;
         in_flight.set(MAX_IN_FLIGHT_FORWARDS);
         let mut refused = pin!(metadata_floor(&state, deadline));
-        assert_eq!(poll!(refused.as_mut()), Poll::Ready(None));
+        let Poll::Ready(Err(refusal @ ReadError::ForwardBusy)) = poll!(refused.as_mut()) else {
+            panic!("a full budget must retain its forwarding refusal");
+        };
+        let response = refusal.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["code"], "forward_busy");
 
         in_flight.set(MAX_IN_FLIGHT_FORWARDS - 1);
         let mut waiting = Box::pin(metadata_floor(&state, deadline));

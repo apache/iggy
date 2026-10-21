@@ -272,14 +272,12 @@ async fn await_metadata_read_frontier(
 /// alone would not make the read linearizable. Fails closed on the retryable
 /// 503s: [`ReadError::NotPrimary`] when no metadata primary answered its floor
 /// before `deadline`, [`ReadError::MetadataFrontierUnreached`] when this node
-/// did not apply the floor by then.
+/// did not apply the floor by then, or the forwarding capacity/proof refusal.
 pub(in crate::http) async fn await_metadata_floor(
     state: &HttpInner,
     deadline: Instant,
 ) -> Result<u64, ReadError> {
-    let floor = metadata_floor(state, deadline)
-        .await
-        .ok_or(ReadError::NotPrimary)?;
+    let floor = metadata_floor(state, deadline).await?;
     hold_for_frontier(
         state.shard.plane.metadata().applied_frontier(),
         floor,

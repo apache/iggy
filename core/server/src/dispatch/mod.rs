@@ -1205,7 +1205,7 @@ mod tests {
     use iggy_binary_protocol::requests::system::{
         BindSessionRequest, GetClientRequest, GetClientsRequest, GetStatsRequest,
     };
-    use iggy_binary_protocol::requests::topics::UpdateTopicRequest;
+    use iggy_binary_protocol::requests::topics::{DeleteTopicRequest, UpdateTopicRequest};
     use iggy_binary_protocol::requests::users::login_register::{
         LoginRegisterRequest, RegisterRequest,
     };
@@ -1739,6 +1739,19 @@ mod tests {
         }
     }
 
+    #[compio::test]
+    async fn given_a_route_read_waiting_on_a_shard_when_topic_deletion_starts_should_refuse() {
+        let (_, body) =
+            partition_namespace_reads(&WireIdentifier::numeric(0), &WireIdentifier::numeric(0))[2]
+                .clone();
+        assert_read_refused_after_shard_wait(
+            GET_PARTITION_ROUTE_CODE,
+            &body,
+            ReadRevocation::TopicDeleting,
+        )
+        .await;
+    }
+
     /// Every read that asks another shard before it answers: the client reads
     /// ask every shard, the rest ask the owner of the partition.
     fn shard_waiting_reads() -> [(u32, Bytes); 6] {
@@ -1878,6 +1891,7 @@ mod tests {
         /// (`UpdateStream`) or topic (`UpdateTopic`) when one is given.
         Grants(Option<Operation>),
         Topic,
+        TopicDeleting,
         /// The connection is replaced under the same id, so nothing answers.
         Connection,
     }
@@ -1995,6 +2009,26 @@ mod tests {
             }
             ReadRevocation::Topic => {
                 recreate_topic_in(&metadata.mux_stm, namespace);
+                Some(IggyError::TransientNotAccepted)
+            }
+            ReadRevocation::TopicDeleting => {
+                let delete = DeleteTopicRequest {
+                    stream_id: WireIdentifier::numeric(namespace.stream_id().try_into().unwrap()),
+                    topic_id: WireIdentifier::numeric(namespace.topic_id().try_into().unwrap()),
+                };
+                assert_eq!(
+                    metadata
+                        .mux_stm
+                        .update(prepare_message(
+                            Operation::DeleteTopic,
+                            0,
+                            4,
+                            &delete.to_bytes(),
+                        ))
+                        .unwrap()
+                        .code,
+                    0
+                );
                 Some(IggyError::TransientNotAccepted)
             }
         };

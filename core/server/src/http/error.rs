@@ -496,6 +496,10 @@ pub(in crate::http) enum ReadError {
     /// refusal (`TransientNotCommitted`) already renders as, so an SDK that
     /// speaks both sees one answer. Never a 2xx with stale state.
     MetadataFrontierUnreached,
+    /// A metadata floor read could not reserve forwarding capacity.
+    ForwardBusy,
+    /// The metadata primary rejected this node's relay proof.
+    RelayRefused,
     /// A partition read got no reply after submission to the owning shard.
     /// Render HTTP 504 with the same Iggy error identity as binary transports.
     /// A missing reply does not prove that the owner rejected the read.
@@ -512,6 +516,8 @@ impl IntoResponse for ReadError {
             Self::NotPrimary => not_primary_response(),
             Self::RedirectToPrimary(location) => primary_redirect_response(&location),
             Self::RecoveryIncomplete | Self::MetadataFrontierUnreached => service_unavailable(),
+            Self::ForwardBusy => forward_busy(),
+            Self::RelayRefused => relay_refused(),
             Self::Timeout => (
                 StatusCode::GATEWAY_TIMEOUT,
                 Json(ErrorResponse::from_error(
@@ -521,6 +527,23 @@ impl IntoResponse for ReadError {
                 .into_response(),
         }
     }
+}
+
+pub(in crate::http) fn forward_busy() -> Response {
+    with_retry_after(error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "forward_busy",
+        "node is at its forward budget; retry with backoff",
+    ))
+}
+
+/// Nothing was admitted when a primary refused this node's relay proof.
+pub(in crate::http) fn relay_refused() -> Response {
+    with_retry_after(error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "relay_refused",
+        "the primary refused this node's relay; node clocks or cluster key material disagree; nothing was admitted",
+    ))
 }
 
 /// The 503 fail-closed body for a linearizable read that reached a follower

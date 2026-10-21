@@ -723,6 +723,16 @@ where
                 .or_else(|_| permissioner.poll_messages(user_id, stream_id, topic_id))
         },
     )?;
+    if shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .partition_route(namespace)
+        .is_none_or(|(current, _)| current != incarnation)
+    {
+        return Err(IggyError::TransientNotAccepted);
+    }
     Ok(PartitionRouteResponse {
         incarnation,
         metadata_op,
