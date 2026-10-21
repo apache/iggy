@@ -250,6 +250,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aead-stream"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a901e5bcd15b4a9555a8f17a608d28ef92cf77bc4aa3b4a0c1a3fce1a9cc0bac"
+dependencies = [
+ "aead 0.6.1",
+]
+
+[[package]]
 name = "aes"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -298,6 +307,21 @@ dependencies = [
  "ctr 0.10.1",
  "ctutils",
  "ghash 0.6.0",
+ "zeroize",
+]
+
+[[package]]
+name = "aes-gcm-siv"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c32325128cb24de2a2d14d92da7569dae7073f9e47334521d494747fa94d902"
+dependencies = [
+ "aead 0.6.1",
+ "aes 0.9.3",
+ "cipher 0.5.2",
+ "ctr 0.10.1",
+ "ctutils",
+ "polyval 0.7.3",
  "zeroize",
 ]
 
@@ -7095,6 +7119,7 @@ dependencies = [
  "reqwest-middleware",
  "reqwest-retry",
  "reqwest-tracing",
+ "ring",
  "rustls",
  "secrecy",
  "serde",
@@ -7342,6 +7367,7 @@ dependencies = [
  "bytemuck",
  "bytes",
  "enumset",
+ "ring",
  "secrecy",
  "serde",
  "thiserror 2.0.21",
@@ -7353,6 +7379,7 @@ name = "iggy_common"
 version = "0.11.1-edge.2"
 dependencies = [
  "aes-gcm 0.11.1",
+ "aes-gcm-siv",
  "async-broadcast",
  "async-trait",
  "base64 0.23.1",
@@ -7382,6 +7409,7 @@ dependencies = [
  "ulid",
  "url",
  "uuid",
+ "xaes-256-gcm",
 ]
 
 [[package]]
@@ -16203,6 +16231,19 @@ dependencies = [
  "rusticata-macros",
  "thiserror 2.0.21",
  "time",
+]
+
+[[package]]
+name = "xaes-256-gcm"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc0e35bc669c7ce781caf52f51a1e672237825014c7a8cbb1292e194800d97fe"
+dependencies = [
+ "aead 0.6.1",
+ "aead-stream",
+ "aes 0.9.3",
+ "aes-gcm 0.11.1",
+ "cipher 0.5.2",
 ]
 
 [[package]]

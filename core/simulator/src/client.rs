@@ -869,7 +869,7 @@ impl SimClient {
 
         let mut header = self.header(operation, group.inner(), total_size);
         self.stamp_partition_context(&mut header);
-        header.request_checksum = u128::from(iggy_common::calculate_checksum(payload));
+        header.request_checksum = 0;
 
         let header_bytes = bytemuck::bytes_of(&header);
         let mut buffer = Vec::with_capacity(total_size);
@@ -888,7 +888,9 @@ impl SimClient {
         // ops go through `build_request_with_namespace`), and metadata
         // requests carry the metadata consensus group on the wire.
         let mut header = self.header(operation, METADATA_GROUP, total_size);
-        header.request_checksum = u128::from(iggy_common::calculate_checksum(payload));
+        // The simulator keeps request bytes deterministic for seeded replay.
+        // Sequence identity must never expose a hash of a secret-bearing body.
+        header.request_checksum = u128::from(header.request) + 1;
 
         let header_bytes = bytemuck::bytes_of(&header);
         let mut buffer = Vec::with_capacity(total_size);

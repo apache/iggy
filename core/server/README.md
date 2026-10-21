@@ -151,6 +151,8 @@ Most keys are fixed at create. A topic's `compression_algorithm`, `segment_size`
 
 The updatable keys are `name` for streams and topics, `username` and `status` for users, and a topic's `message_expiry` and `max_topic_size`. Only those two topic keys can be reset to their default, any other reset is refused with `OptionNotResettable` (4104). Read-only keys, such as the stream key projections below, are refused with `ReadOnlyOption` (4105).
 
+Only root may rename the root user or change its status. Root cannot deactivate itself. These requests return `CannotModifyRootUser` (4108), and a rejected update leaves root active with its existing username.
+
 `UpdateResource` (16) replaces `UpdateStream` (204), `UpdateTopic` (304) and `UpdateUser` (35). It names a scope and a target, sets the keys it carries, resets the keys it lists and keeps every other key as stored. A key may not be both set and reset.
 
 Reads return every option with its provenance: explicit when a client set it, derived when the server filled it in at create. Topic responses no longer carry fixed `message_expiry`, `compression_algorithm` and `max_topic_size` fields, those values are in the option blocks.
@@ -161,7 +163,7 @@ Over HTTP, `POST /streams`, `POST /streams/{stream_id}/topics` and `POST /users`
 
 ## Stream encryption
 
-With encryption, every encrypted stream has its own 32-byte data key. The server `[encryption] key` never encrypts messages: HKDF-SHA256 derives a key-encryption key from it, and each stream key is stored in the stream's options wrapped under that key with AES-256-GCM. Messages and user headers of a stream are encrypted with that stream's key.
+With encryption, every encrypted stream has its own 32-byte data key. The server `[encryption] key` never encrypts messages: HKDF-SHA256 derives a key-encryption key from it, and each stream key is stored in the stream's options wrapped under that key with AES-256-GCM. Messages and user headers of a stream are encrypted with that stream's key using AES-256-GCM-SIV. The stored form is a 12-byte random nonce, ciphertext and a 16-byte tag. Client-side payload encryption remains AES-256-GCM.
 
 A client may give a stream its own key at create, as `encryption_key` (32 random bytes, base64 over HTTP). The key travels inside the create request, so protecting it in transit with TLS is the caller's job. Never derive it from a password, because the reported fingerprint would then allow offline guessing. Without a client key, a server with `enabled = true` generates one for the stream.
 

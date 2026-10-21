@@ -608,6 +608,14 @@ impl StateHandler for UpdateUserResolvedRequest {
             return ApplyReply::err(UpdateUserResult::UserNotFound);
         };
 
+        if user_id as u32 == DEFAULT_ROOT_USER_ID
+            && (self.username.is_some() || self.status.is_some())
+            && (state.apply_context.user_id != DEFAULT_ROOT_USER_ID
+                || self.status == Some(UserStatus::Inactive.as_code()))
+        {
+            return ApplyReply::err(UpdateUserResult::CannotModifyRootUser);
+        }
+
         // Every check runs before any mutation, so a refused patch leaves the
         // user exactly as it was: no half-applied rename or status change.
         let new_username: Option<Arc<str>> =
@@ -2105,6 +2113,61 @@ mod tests {
         assert_eq!(
             StateHandler::apply(&invalid_status, &mut users, IggyTimestamp::now()).code,
             u32::from(UpdateUserResult::InvalidUserStatus)
+        );
+    }
+
+    #[test]
+    fn given_root_patch_when_applying_should_enforce_root_identity_and_active_status() {
+        let mut users = UsersInner::new();
+        create_user_with(&mut users, "iggy", None);
+        let manager_id = create_user_with(&mut users, "manager", None);
+        let patch =
+            |username: Option<&str>, status: Option<UserStatus>| UpdateUserResolvedRequest {
+                user_id: WireIdentifier::numeric(DEFAULT_ROOT_USER_ID),
+                username: username.map(|name| WireName::new(name).unwrap()),
+                status: status.map(|value| value.as_code()),
+                explicit_options: WireOptions::empty(),
+                derived_options: WireOptions::empty(),
+            };
+
+        users.apply_context.user_id = manager_id;
+        for request in [
+            patch(Some("root-renamed"), None),
+            patch(None, Some(UserStatus::Inactive)),
+        ] {
+            let reply = StateHandler::apply(&request, &mut users, IggyTimestamp::zero());
+            assert_eq!(reply.code, IggyError::CannotModifyRootUser.as_code());
+            assert_eq!(
+                users.items.get(0).map(|user| user.username.as_ref()),
+                Some("iggy")
+            );
+            assert_eq!(
+                users.items.get(0).map(|user| user.status),
+                Some(UserStatus::Active)
+            );
+        }
+
+        users.apply_context.user_id = DEFAULT_ROOT_USER_ID;
+        let renamed = StateHandler::apply(
+            &patch(Some("root-renamed"), None),
+            &mut users,
+            IggyTimestamp::zero(),
+        );
+        assert_eq!(renamed.code, 0);
+        assert_eq!(
+            users.items.get(0).map(|user| user.username.as_ref()),
+            Some("root-renamed")
+        );
+
+        let deactivated = StateHandler::apply(
+            &patch(None, Some(UserStatus::Inactive)),
+            &mut users,
+            IggyTimestamp::zero(),
+        );
+        assert_eq!(deactivated.code, IggyError::CannotModifyRootUser.as_code());
+        assert_eq!(
+            users.items.get(0).map(|user| user.status),
+            Some(UserStatus::Active)
         );
     }
 }

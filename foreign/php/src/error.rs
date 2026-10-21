@@ -67,7 +67,6 @@ pub struct PendingOperationException {
     operation_id: String,
     kind: String,
 }
-
 #[php_impl]
 impl PendingOperationException {
     /// Exact unsigned 64-bit operation ID, represented as a decimal string.
@@ -214,6 +213,7 @@ impl From<&IggyError> for PhpExceptionKind {
             | IggyError::InvalidUsername
             | IggyError::InvalidPassword
             | IggyError::InvalidUserStatus
+            | IggyError::CannotModifyRootUser
             | IggyError::UserInactive
             | IggyError::InvalidPersonalAccessToken
             | IggyError::PersonalAccessTokenExpired(_, _)

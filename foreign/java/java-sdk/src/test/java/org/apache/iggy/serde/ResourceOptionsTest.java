@@ -469,6 +469,11 @@ class ResourceOptionsTest {
     @Test
     void givenFixtureConstantsWhenMirroringShouldMatchCodesKindsAndFlags() {
         JsonNode constants = section("constants");
+        assertThat(IggyErrorCode.CANNOT_MODIFY_ROOT_USER.getCode())
+                .isEqualTo(constants
+                        .get("error_codes")
+                        .get("cannot_modify_root_user")
+                        .asInt());
         JsonNode codes = constants.get("command_codes");
         assertThat(CommandCode.System.UPDATE_RESOURCE.getValue())
                 .isEqualTo(codes.get("update_resource").get("code").asInt());

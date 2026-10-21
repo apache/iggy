@@ -438,7 +438,7 @@ TEST_P(E2E_ResourceOptionsTransport, GivenPatchAdmissionRefusesWhenUpdatingTopic
                                                   .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1073741824)));
     const auto topic_id  = iggy::Identifier::Numeric(created.Id());
 
-    const auto &sentinel_error = FixtureCase("http_update", "topic_zero_sentinel_only").at("error");
+    const auto sentinel_error = FixtureCase("http_update", "topic_zero_sentinel_only").at("error");
     EXPECT_TRUE(ThrowsIggyError(
         [&] {
             client.UpdateTopic(stream_id, topic_id,

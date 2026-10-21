@@ -236,6 +236,7 @@ export const translateErrorCode = (code: number): string => {
     case '4105': return "Option is read-only: {0}";
     case '4106': return "Stream encryption key requires a server encryption key";
     case '4107': return "Unsupported critical option: {0}";
+    case '4108': return "Cannot modify root user";
 
     // CONSUMER GROUP
     case '5000': return "Consumer group with ID: {0} for topic with ID: {1} was not found.";

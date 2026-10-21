@@ -421,7 +421,7 @@ sysinfo_print_interval = "10 s"
 # Encryption configuration
 [encryption]
 # Encrypt message payloads and user headers. Metadata and structural headers remain unencrypted.
-# `true` enables encryption for stored data using AES-256-GCM.
+# `true` enables encryption for stored payloads and user headers using AES-256-GCM-SIV.
 # `false` means data is stored without encryption.
 enabled = false
 

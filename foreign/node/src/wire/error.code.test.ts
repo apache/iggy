@@ -92,4 +92,5 @@ it('translates the resource option refusals', () => {
   assert.equal(translateErrorCode(4105), 'Option is read-only: {0}');
   assert.equal(translateErrorCode(4106), 'Stream encryption key requires a server encryption key');
   assert.equal(translateErrorCode(4107), 'Unsupported critical option: {0}');
+  assert.equal(translateErrorCode(4108), 'Cannot modify root user');
 });

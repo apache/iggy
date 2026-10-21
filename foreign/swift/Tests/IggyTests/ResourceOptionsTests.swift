@@ -407,12 +407,18 @@ struct ResourceOptionsTests {
             #expect(await server.connectionCount == connections + 1)
             let attempts = await server.requests.filter { $0.operation == .updateResource }.suffix(2)
             #expect(attempts.count == 2 && Set(attempts.map(\.requestID)).count == 1)
+            #expect(Set(attempts.map(\.checksum)).count == 1)
             try await client.updateTopic(streamID: 1, topicID: 2, options: TopicUpdateOptions(reset: [.maxTopicSize]))
             try await client.updateUser(9, options: UserUpdateOptions(status: .inactive))
         }
         let updates = await server.requests.filter { $0.operation == .updateResource }
         #expect(updates.count == 4 * resolved.count)
-        #expect(updates.allSatisfy { $0.code == CommandCode.updateResource.rawValue && $0.checksum == XXH3.hash64($0.payload) })
+        #expect(
+            updates.allSatisfy {
+                $0.code == CommandCode.updateResource.rawValue
+                    && $0.checksum != 0
+                    && $0.checksum != XXH3.hash64($0.payload)
+            })
         await client.shutdown()
     }
 

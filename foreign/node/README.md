@@ -299,6 +299,8 @@ Only the topic keys `message_expiry` and `max_topic_size` can be reset. Settings
 
 The SDK checks the typed fields and `reset` before sending, in the server's order and with its error codes (4041 for an unknown key, 4105 for a read-only key, 4103 for a create-only key, 4104 for a key without a default, then the name, username or status error). For a key this build has no field or constant for, pass `options` entries and `rawReset` names. The SDK sends those as they are and the server decides, so a refusal comes back from the server.
 
+The server returns 4108 when a non-root caller tries to rename root or change root's status, or when root tries to deactivate itself.
+
 ```ts
 await client.topic.update({
   streamId: "orders",

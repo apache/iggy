@@ -75,6 +75,9 @@
         "operation": 150
       }
     },
+    "error_codes": {
+      "cannot_modify_root_user": 4108
+    },
     "retired_command_codes": {
       "update_stream": 204,
       "update_topic": 304,

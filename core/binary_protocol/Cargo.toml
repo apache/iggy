@@ -33,6 +33,7 @@ readme = "README.md"
 bytemuck = { workspace = true }
 bytes = { workspace = true }
 enumset = { workspace = true }
+ring = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }

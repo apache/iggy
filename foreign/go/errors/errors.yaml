@@ -1125,6 +1125,10 @@
   fields:
     - name: Key
       type: string
+- name: CannotModifyRootUser
+  code: 4108
+  format: "cannot modify root user"
+  fields: []
 - name: ConsumerGroupIdNotFound
   code: 5000
   format: "consumer group with id: %d for topic with id: %d was not found."

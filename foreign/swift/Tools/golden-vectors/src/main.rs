@@ -340,8 +340,10 @@ fn request_header(
     session: u64,
     payload: &[u8],
 ) -> RequestHeader {
-    RequestHeader::for_request(code, client, request, session, payload)
-        .expect("fixture payloads fit a request frame")
+    let mut header = RequestHeader::for_request(code, client, request, session, payload)
+        .expect("fixture payloads fit a request frame");
+    header.request_checksum = 0;
+    header
 }
 
 fn main() {

@@ -244,6 +244,7 @@ result_enum!(UpdateUserResult {
     UsernameAlreadyExists = 46,
     InvalidOptionValue = 4042,
     OptionsBlockTooLarge = 4043,
+    CannotModifyRootUser = 4108,
 });
 result_enum!(DeleteUserResult {
     UserNotFound = 20,
@@ -700,6 +701,10 @@ mod tests {
         assert_eq!(
             u32::from(UpdateUserResult::InvalidUserStatus),
             IggyError::InvalidUserStatus.as_code()
+        );
+        assert_eq!(
+            u32::from(UpdateUserResult::CannotModifyRootUser),
+            IggyError::CannotModifyRootUser.as_code()
         );
         let invalid_option_value = IggyError::InvalidOptionValue(String::new()).as_code();
         assert_eq!(

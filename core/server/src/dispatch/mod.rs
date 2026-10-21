@@ -57,7 +57,6 @@ use crate::reply_frame::build_raw_pat_reply;
 use crate::rewrite::{RewriteDeny, tcp_chain};
 use crate::session_manager::{ConnectionContext, SessionManager};
 use crate::shell::{ShellBus, ShellShard, ShellShardHandle};
-use crate::wire::verify_request_checksum;
 use ahash::{AHashMap, AHashSet};
 use configs::server::ServerConfig;
 use consensus::MetadataHandle;
@@ -693,25 +692,6 @@ async fn handle_client_request<B, MJ, S, SB>(
     // partition target from the payload), so it starts unset here and the
     // resolution sites below stamp it before anything routes on it.
     let request = request.into_routed();
-
-    // The last point that still sees the body the CLIENT sent; every rewrite below
-    // substitutes server-chosen bytes and carries the stamp through unchanged.
-    if let Err(error) = verify_request_checksum(&request) {
-        warn!(
-            transport_client_id,
-            operation = ?request.header().operation,
-            request = request.header().request,
-            "dropping client request whose body does not match its own checksum"
-        );
-        send_deny_reply(
-            shard,
-            transport_client_id,
-            request.header(),
-            error.as_code(),
-        )
-        .await;
-        return;
-    }
 
     // ONE `connections` walk for the whole prologue. Any request is liveness
     // proof, not just PING: an idle-but-active client (e.g. an admin issuing
@@ -1427,32 +1407,35 @@ mod tests {
             let bus = SpyBus::default();
             let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
             let metadata = shard.plane.metadata();
+            let account_id = u32::from(status == Some(UserStatus::Inactive));
             if let Some(status) = status {
                 metadata.mux_stm.users().ensure_root_user("iggy", "hash");
-                metadata
-                    .mux_stm
-                    .update(prepare_message(
-                        Operation::UpdateUserResolved,
-                        CLIENT,
-                        SESSION,
-                        &UpdateUserResolvedRequest {
-                            user_id: WireIdentifier::numeric(0),
-                            username: None,
-                            status: Some(status.as_code()),
-                            explicit_options: WireOptions::empty(),
-                            derived_options: WireOptions::empty(),
-                        }
-                        .to_bytes(),
-                    ))
-                    .unwrap();
+                if status == UserStatus::Inactive {
+                    metadata
+                        .mux_stm
+                        .update(prepare_message(
+                            Operation::CreateUser,
+                            CLIENT,
+                            SESSION,
+                            &CreateUserRequest {
+                                username: WireName::new("inactive-user").unwrap(),
+                                password: "hash".to_owned(),
+                                status: status.as_code(),
+                                permissions: None,
+                                options: WireOptions::empty(),
+                            }
+                            .to_bytes(),
+                        ))
+                        .unwrap();
+                }
             }
             metadata
                 .client_table
                 .borrow_mut()
                 .commit_register(
                     client_id,
-                    0,
-                    bind_verifier(client_id, 0, &SECRET),
+                    account_id,
+                    bind_verifier(client_id, account_id, &SECRET),
                     register_reply(client_id, SESSION),
                 )
                 .unwrap();
@@ -1478,7 +1461,7 @@ mod tests {
             if status == Some(UserStatus::Active)
                 && !message_bus::is_server_internal_client(client_id)
             {
-                assert_eq!(outcome.unwrap(), (0, SESSION));
+                assert_eq!(outcome.unwrap(), (account_id, SESSION));
                 assert_eq!(
                     sessions.borrow().get_session(TRANSPORT),
                     Some((client_id, SESSION))
@@ -2796,54 +2779,6 @@ mod tests {
             "pre-auth ping must get a Reply, not an eviction"
         );
         assert_eq!(reply_status(frame), 0, "pre-auth ping must succeed");
-    }
-
-    /// The request-checksum gate runs before every probe: a replicated op
-    /// from an UNBOUND transport with a bad stamp must get the checksum deny
-    /// Reply, not the `Eviction(NoSession)` the session gate would send.
-    #[compio::test]
-    async fn checksum_mismatch_denies_before_everything() {
-        const TRANSPORT: u128 = 97;
-        const BODY: &[u8] = b"stream-body";
-        let bus = SpyBus::default();
-        let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
-        let sessions = Rc::new(RefCell::new(SessionManager::new()));
-        let server_config = Arc::new(ServerConfig::default());
-
-        let mut message = wire_request(Operation::CreateStream, TRANSPORT, 1, 1, BODY);
-        {
-            let header_size = size_of::<RequestHeader>();
-            let header = bytemuck::checked::from_bytes_mut::<RequestHeader>(
-                &mut message.as_mut_slice()[..header_size],
-            );
-            // Nonzero (zero means unstamped and skips the check) and never
-            // the body's real checksum.
-            header.request_checksum = u128::from(iggy_common::calculate_checksum(BODY)) + 1;
-        }
-        handle_client_request(
-            &shard,
-            &sessions,
-            &server_config,
-            &Rc::new(ClientDrain::new(&server_config)),
-            TRANSPORT,
-            message.into_generic(),
-            None,
-        )
-        .await;
-        let replies = bus.client_replies.borrow();
-        assert_eq!(replies.len(), 1, "bad stamp must be answered");
-        let (client, frame) = &replies[0];
-        assert_eq!(*client, TRANSPORT);
-        assert_eq!(
-            frame_command(frame),
-            Command::Reply as u8,
-            "a bad stamp must get the checksum deny, not the NoSession eviction"
-        );
-        assert_eq!(
-            reply_status(frame),
-            IggyError::InvalidFormat.as_code(),
-            "the deny status must carry the checksum error"
-        );
     }
 
     /// The late-bound self-reference as the shard build creates it: unset

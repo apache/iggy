@@ -144,6 +144,7 @@ pub struct WireConstants {
     pub protocol_version: ProtocolVersionValue,
     pub protocol_version_min: ProtocolVersionValue,
     pub command_codes: BTreeMap<String, CommandCode>,
+    pub error_codes: BTreeMap<String, u32>,
     pub retired_command_codes: BTreeMap<String, u32>,
     pub operations: BTreeMap<String, OperationValue>,
     pub retired_operations: BTreeMap<String, u8>,
@@ -484,6 +485,10 @@ impl WireConstants {
                     ))
                 })
                 .collect::<Result<_, IggyError>>()?,
+            error_codes: BTreeMap::from([(
+                "cannot_modify_root_user".to_owned(),
+                IggyError::CannotModifyRootUser.as_code(),
+            )]),
             retired_command_codes: RETIRED_COMMANDS
                 .iter()
                 .map(|(name, code)| ((*name).to_owned(), *code))

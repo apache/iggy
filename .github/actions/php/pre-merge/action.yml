@@ -34,6 +34,7 @@ runs:
           composer \
           libclang-dev \
           libhwloc-dev \
+          libphp8.5-embed \
           libssl-dev \
           php8.5-cli \
           php8.5-dev \
@@ -100,7 +101,8 @@ runs:
           exit 1
         fi
         raw_stubs="$(mktemp)"
-        cargo php stubs "$extension" -o "$raw_stubs"
+        # cargo-php loads the extension outside PHP, so expose PHP's allocator symbols.
+        LD_PRELOAD=/usr/lib/libphp8.5.so cargo php stubs "$extension" -o "$raw_stubs"
         {
           printf '<?php\n'
           awk 'NF { print "// " $0; next } { print "//" }' ASF_LICENSE.txt

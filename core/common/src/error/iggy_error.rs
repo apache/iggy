@@ -509,6 +509,8 @@ pub enum IggyError {
     /// serving it could ignore a security setting.
     #[error("Unsupported critical option: {0}")]
     UnsupportedCriticalOption(String) = 4107,
+    #[error("Cannot modify root user")]
+    CannotModifyRootUser = 4108,
     #[error("Consumer group with ID: {0} for topic with ID: {1} was not found.")]
     ConsumerGroupIdNotFound(Identifier, Identifier) = 5000,
     #[error("Invalid consumer group ID")]

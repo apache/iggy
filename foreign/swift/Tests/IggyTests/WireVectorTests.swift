@@ -202,13 +202,23 @@ struct VSRHeaderVectorTests {
     let clientID = UInt128Value(low: 0xFEDC_BA98_7654_3210, high: 0x0123_4567_89AB_CDEF)
 
     func header(_ request: VSRFrame.EncodedRequest) -> [UInt8] {
-        Array(request.bytes[..<VSRFrame.headerSize])
+        var bytes = Array(request.bytes[..<VSRFrame.headerSize])
+        bytes.replaceSubrange(
+            VSRFrame.RequestOffset.requestChecksum..<VSRFrame.RequestOffset.requestChecksum + 16,
+            with: repeatElement(0, count: 16))
+        return bytes
+    }
+
+    func requestIdentifier(_ request: VSRFrame.EncodedRequest) -> UInt128Value {
+        let range = VSRFrame.RequestOffset.requestChecksum..<VSRFrame.RequestOffset.requestChecksum + 16
+        return UInt128Value(littleEndianBytes: request.bytes[range])
     }
 
     @Test func registerHeader() throws {
         var session = ConsensusSession(clientID: clientID)
         let request = try VSRFrame.encodeRequest(session: &session, code: CommandCode.loginRegister.rawValue, payload: [1, 2, 3])
         #expect(header(request) == golden.bytes("vsr.request.register"))
+        #expect(!requestIdentifier(request).isZero)
         #expect(Array(request.bytes[VSRFrame.headerSize...]) == [1, 2, 3])
         #expect(request.requestID == 0)
         #expect(request.operation == .register)
@@ -218,26 +228,29 @@ struct VSRHeaderVectorTests {
         var session = ConsensusSession(clientID: clientID)
         let unbound = try VSRFrame.encodeRequest(session: &session, code: CommandCode.ping.rawValue, payload: [])
         #expect(header(unbound) == golden.bytes("vsr.request.ping"))
+        #expect(requestIdentifier(unbound).isZero)
         try session.bind(99)
         _ = try session.nextRequestID()
         _ = try session.nextRequestID()
         let bound = try VSRFrame.encodeRequest(session: &session, code: CommandCode.ping.rawValue, payload: [])
         #expect(header(bound) == golden.bytes("vsr.request.ping.bound"))
+        #expect(requestIdentifier(bound).isZero)
     }
 
-    @Test func metadataHeaderStampsTheChecksum() throws {
+    @Test func metadataHeaderStampsRandomIdentifier() throws {
         var session = ConsensusSession(clientID: clientID)
         try session.bind(99)
         let payload = golden.bytes("payload.create_stream")
         #expect(payload == (try Requests.createStream(name: "stream")))
         let request = try VSRFrame.encodeRequest(session: &session, code: CommandCode.createStream.rawValue, payload: payload)
         #expect(header(request) == golden.bytes("vsr.request.create_stream"))
+        #expect(!requestIdentifier(request).isZero)
         #expect(request.requestID == 1)
         #expect(UInt64(littleEndianBytes: request.bytes[VSRFrame.RequestOffset.request..<VSRFrame.RequestOffset.request + 8]) == 1)
     }
 
-    /// The generic update is replicated, so its header stamps the payload checksum.
-    @Test func updateResourceHeaderStampsTheChecksum() throws {
+    /// The generic update is replicated, so its header carries a random request identifier.
+    @Test func updateResourceHeaderStampsRandomIdentifier() throws {
         var session = ConsensusSession(clientID: clientID)
         try session.bind(99)
         let payload = golden.bytes("payload.update_resource")
@@ -245,15 +258,17 @@ struct VSRHeaderVectorTests {
         #expect(payload == (try Requests.updateResource(.topic(stream: 1, topic: 2), update.toPatch())))
         let request = try VSRFrame.encodeRequest(session: &session, code: CommandCode.updateResource.rawValue, payload: payload)
         #expect(header(request) == golden.bytes("vsr.request.update_resource"))
+        #expect(!requestIdentifier(request).isZero)
         #expect(request.operation == .updateResource)
     }
 
-    @Test func partitionHeaderLeavesTheChecksumZero() throws {
+    @Test func partitionHeaderLeavesTheIdentifierZero() throws {
         var session = ConsensusSession(clientID: clientID)
         try session.bind(99)
         _ = try session.nextRequestID()
         let request = try VSRFrame.encodeRequest(session: &session, code: CommandCode.sendMessages.rawValue, payload: [9, 9, 9, 9])
         #expect(header(request) == golden.bytes("vsr.request.send_messages"))
+        #expect(requestIdentifier(request).isZero)
         #expect(request.requestID == 2)
     }
 
@@ -280,9 +295,11 @@ struct VSRHeaderVectorTests {
         }
         let logout = try VSRFrame.encodeRequest(session: &session, code: CommandCode.logoutUser.rawValue, payload: [])
         #expect(header(logout) == golden.bytes("vsr.request.logout"))
+        #expect(!requestIdentifier(logout).isZero)
         #expect(logout.operation == .logout)
         let unknown = try VSRFrame.encodeRequest(session: &session, code: 60_000, payload: [])
         #expect(header(unknown) == golden.bytes("vsr.request.unknown_code"))
+        #expect(requestIdentifier(unknown).isZero)
         #expect(unknown.operation == .nonReplicated)
     }
 

@@ -241,11 +241,11 @@ mod tests {
 
         let rename = commit(
             &shard,
-            admin,
+            DEFAULT_ROOT_USER_ID,
             Operation::UpdateUserResolved,
             &rename_body(DEFAULT_ROOT_USER_ID, UNUSED_USERNAME),
         );
-        assert_eq!(rename.code, 0, "manage_users may rename root");
+        assert_eq!(rename.code, 0, "root may rename itself");
         let reply = commit(&shard, admin, Operation::ChangePassword, &change);
 
         assert_eq!(
@@ -267,11 +267,11 @@ mod tests {
         ] {
             let rename = commit(
                 &shard,
-                admin,
+                user_id,
                 Operation::UpdateUserResolved,
                 &rename_body(user_id, username),
             );
-            assert_eq!(rename.code, 0, "manage_users may rename {username}");
+            assert_eq!(rename.code, 0, "a user may rename itself to {username}");
         }
         let reply = commit(&shard, admin, Operation::ChangePassword, &change);
 

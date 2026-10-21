@@ -243,6 +243,7 @@ type fixtureFile struct {
 type fixtureConstants struct {
 	ProtocolVersion     protocolVersion           `json:"protocol_version"`
 	CommandCodes        map[string]commandCode    `json:"command_codes"`
+	ErrorCodes          map[string]uint32         `json:"error_codes"`
 	RetiredCommandCodes map[string]uint32         `json:"retired_command_codes"`
 	Operations          map[string]operationEntry `json:"operations"`
 	RetiredOperations   map[string]uint8          `json:"retired_operations"`
@@ -400,6 +401,7 @@ func loadFixture(t *testing.T) fixtureFile {
 
 func checkConstants(t *testing.T, constants fixtureConstants) {
 	assert.Equal(t, constants.ProtocolVersion.Packed, vsr.ProtocolVersion, constants.ProtocolVersion.Text)
+	assert.Equal(t, uint32(ierror.CannotModifyRootUserCode), constants.ErrorCodes["cannot_modify_root_user"])
 
 	codes := map[string]command.Code{
 		"create_stream":    command.CreateStreamCode,

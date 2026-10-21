@@ -71,6 +71,19 @@ struct ConsensusSessionTests {
         #expect(!session.isBound)
     }
 
+    @Test func metadataRequestIdentifiersAreUniqueAndRetainedInRetryFrame() throws {
+        var session = ConsensusSession(clientID: 7)
+        try session.bind(42)
+        let payload: [UInt8] = [1, 2, 3]
+        let first = try VSRFrame.encodeRequest(session: &session, code: CommandCode.createStream.rawValue, payload: payload)
+        let second = try VSRFrame.encodeRequest(session: &session, code: CommandCode.createStream.rawValue, payload: payload)
+        let range = VSRFrame.RequestOffset.requestChecksum..<VSRFrame.RequestOffset.requestChecksum + 16
+        #expect(Array(first.bytes[range]) != Array(repeating: 0, count: 16))
+        #expect(Array(first.bytes[range]) != Array(second.bytes[range]))
+        let retry = first
+        #expect(Array(retry.bytes[range]) == Array(first.bytes[range]))
+    }
+
     /// A reconnect replays the Register on a bound session and binds to the
     /// fence the server returns again, without losing the request watermark.
     @Test func reconnectPreservesBindingAndRequestCounter() throws {

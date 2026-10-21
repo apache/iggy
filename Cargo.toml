@@ -89,6 +89,7 @@ actix-cors = "0.7.2"
 actix-files = "0.7.0"
 actix-web = "4.16.0"
 aes-gcm = { version = "0.11.1", features = ["zeroize"] }
+aes-gcm-siv = { version = "0.12.1", features = ["zeroize"] }
 ahash = { version = "0.8.12", features = ["serde"] }
 aligned-vec = "0.6.4"
 anyhow = "1.0.104"
@@ -396,6 +397,7 @@ webpki-roots = "1.0.9"
 windows-native-keyring-store = "1.1.0"
 wiremock = "0.6"
 x509-parser = "0.18.1"
+xaes-256-gcm = "0.1.0"
 yew = { version = "0.23", features = ["csr"] }
 yew-router = "0.20"
 zbus-secret-service-keyring-store = { version = "1.0.1", features = ["rt-async-io-crypto-rust"] }

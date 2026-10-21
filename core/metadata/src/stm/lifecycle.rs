@@ -815,6 +815,7 @@ mod tests {
             client_id: 17,
             session: 5,
             request: 8,
+            user_id: 0,
         }
     }
 

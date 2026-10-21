@@ -37,6 +37,7 @@ import {
   CompressionAlgorithm, compressionAlgorithmName, deserializeTopic, Durability, PartitionResizePolicy
 } from '../topic/topic.utils.js';
 import { CREATE_USER } from '../user/create-user.command.js';
+import { translateErrorCode } from '../error.code.js';
 import { UPDATE_USER } from '../user/update-user.command.js';
 import { deserializeUser, UserStatus } from '../user/user.utils.js';
 import { Command, COMMITTED_RESULT_MARKER, HEADER_SIZE, REPLY_OFFSET, REQUEST_OFFSET } from '../vsr/header.js';
@@ -64,6 +65,7 @@ type Fixture = {
   constants: {
     protocol_version: { packed: number },
     command_codes: Record<string, { code: number, operation: number | null }>,
+    error_codes: Record<string, number>,
     retired_command_codes: Record<string, number>,
     operations: Record<string, { value: number, internal: boolean, request_operation: number }>,
     retired_operations: Record<string, number>,
@@ -546,6 +548,7 @@ describe('given shared vectors when encoding should match server contract', () =
 
   it('mirrors command codes, operations, scopes and the protocol version', () => {
     assert.equal(IGGY_PROTOCOL_VERSION, constants.protocol_version.packed);
+    assert.equal(translateErrorCode(constants.error_codes.cannot_modify_root_user), 'Cannot modify root user');
     assert.deepEqual(
       { topic: OptionsScope.Topic, stream: OptionsScope.Stream, user: OptionsScope.User },
       constants.scope_codes

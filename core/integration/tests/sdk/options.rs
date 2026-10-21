@@ -21,6 +21,59 @@ use integration::iggy_harness;
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 
+#[iggy_harness(test_client_transport = [Tcp, Http])]
+async fn given_manage_users_caller_when_updating_root_should_return_4108_and_keep_root_active(
+    harness: &TestHarness,
+) {
+    let root = harness.root_client().await.expect("root client");
+    let root_id = Identifier::numeric(0).expect("root id");
+    root.create_user(
+        "manager",
+        "secret123",
+        UserStatus::Active,
+        Some(Permissions {
+            global: GlobalPermissions {
+                manage_users: true,
+                ..GlobalPermissions::default()
+            },
+            streams: None,
+        }),
+        &UserCreateOptions::default(),
+    )
+    .await
+    .expect("create manager");
+    let manager = harness.new_client().await.expect("manager client");
+    manager
+        .login_user("manager", "secret123")
+        .await
+        .expect("manager login");
+
+    for patch in [
+        UserUpdateOptions {
+            username: Some("root-renamed".to_owned()),
+            ..UserUpdateOptions::default()
+        },
+        UserUpdateOptions {
+            status: Some(UserStatus::Inactive),
+            ..UserUpdateOptions::default()
+        },
+    ] {
+        let error = manager
+            .update_user(&root_id, &patch)
+            .await
+            .expect_err("manager cannot rename or deactivate root");
+        assert_policy_error(error, IggyError::CannotModifyRootUser);
+    }
+
+    let unchanged = root
+        .get_user(&root_id)
+        .await
+        .expect("read root")
+        .expect("root exists");
+    assert_eq!(unchanged.username, "iggy");
+    assert_eq!(unchanged.status, UserStatus::Active);
+}
+
 #[iggy_harness]
 async fn given_topic_scope_when_describing_options_should_list_the_catalog(harness: &TestHarness) {
     let client = harness.root_client().await.unwrap();

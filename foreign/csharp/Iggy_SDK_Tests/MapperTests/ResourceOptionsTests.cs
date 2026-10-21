@@ -360,6 +360,8 @@ public sealed class ResourceOptionsTests
 
     private static void AssertConstants(JsonElement constants)
     {
+        Assert.Equal(VsrError.CANNOT_MODIFY_ROOT_USER,
+            constants.GetProperty("error_codes").GetProperty("cannot_modify_root_user").GetInt32());
         var version = constants.GetProperty("protocol_version");
         Assert.Equal(LoginRegister.PROTOCOL_VERSION, version.GetProperty("packed").GetUInt32());
         Assert.Equal(LoginRegister.PROTOCOL_VERSION_MAJOR, version.GetProperty("major").GetInt32());

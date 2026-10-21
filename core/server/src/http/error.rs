@@ -665,6 +665,12 @@ mod tests {
     }
 
     #[test]
+    fn given_root_guard_error_when_rendering_http_should_answer_400() {
+        let response = CustomError::Error(IggyError::CannotModifyRootUser).into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
     fn primary_redirect_location_targets_primary_http_addr_with_path_passthrough() {
         let roster = roster(vec![
             node(0, "10.0.0.1", Some(8080)),

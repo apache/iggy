@@ -2335,6 +2335,15 @@ func (e UnsupportedCriticalOption) Is(target error) bool {
 	return ok
 }
 
+type CannotModifyRootUser struct{}
+
+func (e CannotModifyRootUser) Error() string { return "cannot modify root user" }
+func (e CannotModifyRootUser) Code() Code    { return 4108 }
+func (e CannotModifyRootUser) Is(target error) bool {
+	_, ok := target.(CannotModifyRootUser)
+	return ok
+}
+
 type ConsumerGroupIdNotFound struct {
 	GroupId uint32
 	TopicId uint32
@@ -3072,6 +3081,7 @@ var (
 	ErrReadOnlyOption                             = ReadOnlyOption{}
 	ErrStreamEncryptionUnavailable                = StreamEncryptionUnavailable{}
 	ErrUnsupportedCriticalOption                  = UnsupportedCriticalOption{}
+	ErrCannotModifyRootUser                       = CannotModifyRootUser{}
 	ErrConsumerGroupIdNotFound                    = ConsumerGroupIdNotFound{}
 	ErrInvalidConsumerGroupId                     = InvalidConsumerGroupId{}
 	ErrConsumerGroupNameNotFound                  = ConsumerGroupNameNotFound{}
@@ -3334,6 +3344,7 @@ const (
 	ReadOnlyOptionCode                             Code = 4105
 	StreamEncryptionUnavailableCode                Code = 4106
 	UnsupportedCriticalOptionCode                  Code = 4107
+	CannotModifyRootUserCode                       Code = 4108
 	ConsumerGroupIdNotFoundCode                    Code = 5000
 	InvalidConsumerGroupIdCode                     Code = 5002
 	ConsumerGroupNameNotFoundCode                  Code = 5003
@@ -3803,6 +3814,8 @@ func (c Code) String() string {
 		return "StreamEncryptionUnavailable"
 	case UnsupportedCriticalOptionCode:
 		return "UnsupportedCriticalOption"
+	case CannotModifyRootUserCode:
+		return "CannotModifyRootUser"
 	case ConsumerGroupIdNotFoundCode:
 		return "ConsumerGroupIdNotFound"
 	case InvalidConsumerGroupIdCode:
@@ -4324,6 +4337,8 @@ func FromCode(code Code) IggyError {
 		return ErrStreamEncryptionUnavailable
 	case UnsupportedCriticalOptionCode:
 		return ErrUnsupportedCriticalOption
+	case CannotModifyRootUserCode:
+		return ErrCannotModifyRootUser
 	case ConsumerGroupIdNotFoundCode:
 		return ErrConsumerGroupIdNotFound
 	case InvalidConsumerGroupIdCode:

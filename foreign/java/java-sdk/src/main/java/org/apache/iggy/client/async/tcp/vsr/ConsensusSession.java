@@ -57,6 +57,8 @@ public final class ConsensusSession {
 
     private long clientIdLow;
     private long clientIdHigh;
+    private long registerIdentifierLow;
+    private long registerIdentifierHigh;
     private Long session;
     private long requestCounter = 1;
     private long generation;
@@ -293,6 +295,14 @@ public final class ConsensusSession {
         return parent == null ? clientIdHigh : parent.clientIdHigh();
     }
 
+    synchronized long registerIdentifierLow() {
+        return parent == null ? registerIdentifierLow : parent.registerIdentifierLow();
+    }
+
+    synchronized long registerIdentifierHigh() {
+        return parent == null ? registerIdentifierHigh : parent.registerIdentifierHigh();
+    }
+
     public ConsensusSession owner() {
         ConsensusSession numbering;
         synchronized (this) {
@@ -512,6 +522,10 @@ public final class ConsensusSession {
 
     private void regenerateClientId() {
         RANDOM.nextBytes(bindSecret);
+        do {
+            registerIdentifierLow = RANDOM.nextLong();
+            registerIdentifierHigh = RANDOM.nextLong();
+        } while (registerIdentifierLow == 0 && registerIdentifierHigh == 0);
         do {
             clientIdLow = RANDOM.nextLong();
             // Keep generated IDs outside the server-only range.

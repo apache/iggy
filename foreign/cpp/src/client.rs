@@ -1493,6 +1493,7 @@ fn is_option_error(error: &IggyError) -> bool {
             | IggyError::ReadOnlyOption(_)
             | IggyError::StreamEncryptionUnavailable
             | IggyError::UnsupportedCriticalOption(_)
+            | IggyError::CannotModifyRootUser
     )
 }
 
@@ -1594,6 +1595,15 @@ mod tests {
             IggyError::ReadOnlyOption(String::new()).as_code()
         );
         assert_eq!(error_info.kind, "read_only_option");
+
+        let mut root = ffi::ErrorInfo::default();
+        root.record(&IggyError::HttpResponseError(
+            400,
+            r#"{"id":4108,"code":"cannot_modify_root_user","reason":"Cannot modify root user","field":null}"#
+                .to_owned(),
+        ));
+        assert_eq!(root.code, IggyError::CannotModifyRootUser.as_code());
+        assert_eq!(root.kind, "cannot_modify_root_user");
 
         let mut other = ffi::ErrorInfo::default();
         other.record(&IggyError::HttpResponseError(

@@ -164,6 +164,7 @@ fn is_option_error(error: &IggyError) -> bool {
             | IggyError::ReadOnlyOption(_)
             | IggyError::StreamEncryptionUnavailable
             | IggyError::UnsupportedCriticalOption(_)
+            | IggyError::CannotModifyRootUser
     )
 }
 
@@ -1883,6 +1884,24 @@ define_stub_info_gatherer!(stub_info);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn given_root_policy_refusal_when_mapping_should_preserve_code_and_kind() {
+        Python::initialize();
+        Python::attach(|py| {
+            let error = to_runtime_error(IggyError::CannotModifyRootUser);
+            assert!(error.is_instance_of::<OptionError>(py));
+            let value = error.value(py);
+            assert_eq!(
+                value.getattr("code").unwrap().extract::<u32>().unwrap(),
+                4108
+            );
+            assert_eq!(
+                value.getattr("kind").unwrap().extract::<String>().unwrap(),
+                "cannot_modify_root_user"
+            );
+        });
+    }
 
     #[test]
     fn pending_operation_errors_preserve_exact_identity_and_kind() {

@@ -54,6 +54,7 @@ use iggy_binary_protocol::{
     MAX_PARTITIONS_PER_REQUEST, Operation, PrepareHeader, RoutedRequestHeader, WireDecode,
     WireEncode, WireIdentifier, WireOptions,
 };
+use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
 use iggy_common::wire_conversions::resource_options_to_wire;
 use iggy_common::{
     AdmittedOptions, IggyByteSize, IggyError, MaxTopicSize, OptionAdmissionContext, OptionColumns,
@@ -498,11 +499,24 @@ where
     let metadata = shard.plane.metadata();
     let streams = metadata.mux_stm.streams();
     let users = metadata.mux_stm.users();
-    let current = user_id
-        .filter(|user_id| may_update(streams, users, *user_id, &patch.target))
-        .and_then(|_| stored_options(streams, users, &patch.target));
+    let authorized_user_id =
+        user_id.filter(|user_id| may_update(streams, users, *user_id, &patch.target));
+    let current = authorized_user_id.and_then(|_| stored_options(streams, users, &patch.target));
     let stored_state_visible = current.is_some();
     let admitted = admit_patch(patch, current)?;
+    if let (Some(actor_id), ResourceTarget::User { user_id: target_id }) =
+        (authorized_user_id, &patch.target)
+    {
+        let target_is_root = users
+            .read(|inner| inner.resolve_user_id(target_id) == Some(DEFAULT_ROOT_USER_ID as usize));
+        if target_is_root
+            && (admitted.columns.username.is_some() || admitted.columns.status.is_some())
+            && (actor_id != DEFAULT_ROOT_USER_ID
+                || admitted.columns.status == Some(UserStatus::Inactive))
+        {
+            return Err(IggyError::CannotModifyRootUser);
+        }
+    }
     let ResourceTarget::Topic {
         stream_id,
         topic_id,
@@ -879,6 +893,98 @@ mod tests {
                 IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
             ))
         );
+    }
+
+    #[test]
+    fn given_root_deactivation_when_admitting_patch_should_refuse_before_consensus() {
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, 1));
+        shard
+            .plane
+            .metadata()
+            .mux_stm
+            .users()
+            .ensure_root_user("iggy", "hash");
+        let patch = UserUpdateOptions {
+            status: Some(UserStatus::Inactive),
+            ..UserUpdateOptions::default()
+        }
+        .to_patch()
+        .expect("status patch encodes");
+        let body = UpdateResourceRequest {
+            target: ResourceTarget::User {
+                user_id: WireIdentifier::numeric(DEFAULT_ROOT_USER_ID),
+            },
+            reset: patch.reset,
+            options: patch.set,
+        }
+        .to_bytes();
+
+        let result = http_chain(
+            &shard,
+            DEFAULT_ROOT_USER_ID,
+            request_message(Operation::UpdateResource, 1, 1, 1, &body),
+        );
+        assert!(
+            matches!(result, Err(IggyError::CannotModifyRootUser)),
+            "actual: {:?}",
+            result.err()
+        );
+        assert!(bus.replica_sends.borrow().is_empty());
+    }
+
+    #[test]
+    fn given_manage_users_caller_when_patching_root_should_refuse_rename_and_deactivation() {
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, 1));
+        let metadata = shard.plane.metadata();
+        metadata.mux_stm.users().ensure_root_user("iggy", "hash");
+        let mut manager = create_reader_request();
+        manager.username = WireName::new("manager").expect("valid name");
+        manager
+            .permissions
+            .as_mut()
+            .expect("permissions")
+            .global
+            .manage_users = true;
+        let created = metadata
+            .mux_stm
+            .update(prepare_message(
+                Operation::CreateUser,
+                1,
+                3,
+                &manager.to_bytes(),
+            ))
+            .expect("create manager");
+        assert_eq!(created.code, 0);
+
+        for update in [
+            UserUpdateOptions {
+                username: Some("root-renamed".to_owned()),
+                ..UserUpdateOptions::default()
+            },
+            UserUpdateOptions {
+                status: Some(UserStatus::Inactive),
+                ..UserUpdateOptions::default()
+            },
+        ] {
+            let patch = update.to_patch().expect("patch encodes");
+            let body = UpdateResourceRequest {
+                target: ResourceTarget::User {
+                    user_id: WireIdentifier::numeric(DEFAULT_ROOT_USER_ID),
+                },
+                reset: patch.reset,
+                options: patch.set,
+            }
+            .to_bytes();
+            let result = http_chain(
+                &shard,
+                1,
+                request_message(Operation::UpdateResource, 1, 1, 1, &body),
+            );
+            assert!(matches!(result, Err(IggyError::CannotModifyRootUser)));
+        }
+        assert!(bus.replica_sends.borrow().is_empty());
     }
 
     #[test]

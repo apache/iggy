@@ -222,6 +222,8 @@ A topic's `message_expiry` and `max_topic_size` are the only resettable keys. Se
 
 The update methods also take `options` and `raw_reset`, which send keys and reset names verbatim, so a key newer than this build can be set or reset. The server decides those. A refused option raises `OptionError`, a `RuntimeError` whose `code` and `kind` name the refusal, for example `4103` and `"option_not_updatable"`, the same on every transport.
 
+Root user rename and status refusals also raise `OptionError` with code `4108` and kind `"cannot_modify_root_user"`.
+
 ```python
 import asyncio
 import secrets

@@ -5098,6 +5098,7 @@ mod tests {
     use crate::stm::stream::{Streams, StreamsInner};
     use crate::stm::user::{PAT_TOKEN_HASH_BYTES, Users, UsersInner};
     use consensus::LocalPipeline;
+    use iggy_binary_protocol::codes::CREATE_USER_CODE;
     use iggy_binary_protocol::primitives::permissions::{
         WireGlobalPermissions, WirePermissions, WireStreamPermissions,
     };
@@ -5105,7 +5106,7 @@ mod tests {
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
     use iggy_binary_protocol::requests::topics::{CreateTopicRequest, DeleteTopicRequest};
     use iggy_binary_protocol::requests::users::{CreateUserRequest, DeleteUserRequest};
-    use iggy_binary_protocol::{StartViewHeader, WireOptions};
+    use iggy_binary_protocol::{RequestHeader, StartViewHeader, WireOptions};
     use iggy_common::{
         HeaderValue, IggyExpiry, IggyTimestamp, OptionKey, OptionStorage, OptionValueCodec,
         ServerKeyContext, StreamEncryptionKey, StreamKeyOrigin, TopicUpdateOptions, UserStatus,
@@ -5125,6 +5126,40 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn given_create_user_when_building_prepare_should_not_store_body_hash_as_request_identifier() {
+        let body = CreateUserRequest {
+            username: WireName::new("alice").expect("valid username"),
+            password: "guessable-password".to_owned(),
+            status: UserStatus::Active.as_code(),
+            permissions: None,
+            options: WireOptions::empty(),
+        }
+        .to_bytes();
+        let client =
+            RequestHeader::for_request(CREATE_USER_CODE, 7, 1, 3, &body).expect("request header");
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            1,
+            server_common::sharding::METADATA_GROUP,
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let routed = RoutedRequestHeader {
+            request_checksum: client.request_checksum,
+            ..RoutedRequestHeader::default()
+        };
+        let prepare = build_prepare_message(&consensus, &routed, Operation::CreateUser, &body);
+        assert_ne!(prepare.header().request_checksum, 0);
+        assert_eq!(prepare.header().request_checksum, client.request_checksum);
+        assert_ne!(
+            prepare.header().request_checksum,
+            u128::from(iggy_common::calculate_checksum(&body))
+        );
+    }
 
     #[test]
     fn given_topic_patch_when_resolving_should_extract_name_and_resolve_reset_defaults() {

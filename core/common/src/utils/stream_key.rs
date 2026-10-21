@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::IggyError;
-use crate::utils::crypto::{Aes256GcmEncryptor, EncryptorKind};
+use crate::utils::crypto::{Aes256GcmSivEncryptor, EncryptorKind};
 use crate::utils::text;
 use aes_gcm::aead::{Aead, Generate, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
@@ -142,9 +142,9 @@ impl StreamEncryptionKey {
     ///
     /// `InvalidEncryptionKey` when the cipher refuses the key.
     pub fn encryptor(&self) -> Result<Arc<EncryptorKind>, IggyError> {
-        Ok(Arc::new(EncryptorKind::Aes256Gcm(Aes256GcmEncryptor::new(
-            self.as_bytes(),
-        )?)))
+        Ok(Arc::new(EncryptorKind::Aes256GcmSiv(
+            Aes256GcmSivEncryptor::new(self.as_bytes())?,
+        )))
     }
 
     fn fingerprint_bytes(&self) -> [u8; FINGERPRINT_LENGTH] {
@@ -854,11 +854,27 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::crypto::{Aes256GcmEncryptor, Encryptor};
 
     const CONFIG_KEY: &str = "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=";
     const OTHER_CONFIG_KEY: &str = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=";
     const THIRD_CONFIG_KEY: &str = "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=";
     const FOURTH_CONFIG_KEY: &str = "QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8=";
+
+    #[test]
+    fn given_stream_key_when_encrypting_should_use_a_distinct_cipher_from_client_payloads() {
+        let key = StreamEncryptionKey::try_from([7u8; 32].as_slice()).expect("valid key");
+        let server = key.encryptor().expect("server encryptor");
+        let client = Aes256GcmEncryptor::new(key.as_bytes()).expect("client encryptor");
+        let encrypted = server
+            .encrypt(b"stream payload")
+            .expect("encrypted payload");
+        assert_eq!(
+            server.decrypt(&encrypted).expect("server decrypts"),
+            b"stream payload"
+        );
+        assert!(client.decrypt(&encrypted).is_err());
+    }
 
     #[test]
     fn given_config_key_when_deriving_should_produce_only_the_pinned_kek() {

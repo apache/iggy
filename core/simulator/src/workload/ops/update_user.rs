@@ -84,6 +84,9 @@ pub fn sample(
         Outcome::InvalidUserStatus => {
             unreachable!("update_user only sends a valid status")
         }
+        Outcome::CannotModifyRootUser => {
+            unreachable!("the simulator only selects non-root users")
+        }
     }
 }
 
@@ -117,7 +120,8 @@ pub fn predicted_effect(input: &Input, outcome: Outcome) -> Effect {
         | Outcome::InvalidUsername
         | Outcome::InvalidUserStatus
         | Outcome::InvalidOptionValue
-        | Outcome::OptionsBlockTooLarge => Effect::None,
+        | Outcome::OptionsBlockTooLarge
+        | Outcome::CannotModifyRootUser => Effect::None,
     }
 }
 
