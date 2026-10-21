@@ -2288,7 +2288,7 @@ mod tests {
     }
 
     #[test]
-    fn given_self_deactivation_through_generic_patch_when_validating_protection_then_should_accept_resolved_operation()
+    fn given_self_deactivation_through_generic_patch_when_validating_protection_should_accept_resolved_operation()
      {
         const CLIENT: u128 = 7;
         const EPOCH: u64 = 10;
@@ -2324,8 +2324,7 @@ mod tests {
     }
 
     #[test]
-    fn given_resolved_update_receipt_when_retrying_client_operation_then_should_return_cached_reply()
-     {
+    fn given_resolved_update_receipt_when_retrying_client_operation_should_return_cached_reply() {
         for resolved in [
             Operation::UpdateStreamResolved,
             Operation::UpdateTopicResolved,

@@ -55,7 +55,8 @@ public record StreamUpdate(
         raw = Collections.unmodifiableMap(new LinkedHashMap<>(raw));
         rawReset = Set.copyOf(rawReset);
         boolean typedOnly = raw.isEmpty() && rawReset.isEmpty();
-        OptionKey.requireValidUpdate(entries(name, raw).keySet(), reset, rawReset, typedOnly);
+        OptionKey.requireValidUpdate(
+                entries(name, raw).keySet(), reset, rawReset, typedOnly, EnumSet.allOf(StreamOptionKey.class));
         if (typedOnly) {
             name.ifPresent(value -> OptionKey.requireTextLength(
                     StreamOptionKey.NAME.value(), value, 1, MAX_NAME_LENGTH, IggyErrorCode.INVALID_STREAM_NAME));
@@ -81,6 +82,13 @@ public record StreamUpdate(
     /** The names this update resets, typed and raw together in ascending order. */
     public List<String> resetKeys() {
         return OptionKey.resetNames(reset, rawReset);
+    }
+
+    /** Raw entries print by name only, because this build cannot tell which newer keys are secret. */
+    @Override
+    public String toString() {
+        return "StreamUpdate[name=" + name + ", reset=" + reset + ", raw=" + raw.keySet() + ", rawReset=" + rawReset
+                + "]";
     }
 
     private static Set<StreamOptionKey> copyOf(Set<StreamOptionKey> keys) {

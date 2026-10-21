@@ -54,6 +54,10 @@ under the License.
     </ItemGroup>
 
     <ItemGroup>
+        <Content Include="xunit.runner.json" CopyToOutputDirectory="PreserveNewest" />
+    </ItemGroup>
+
+    <ItemGroup>
         <ReqnrollFeatureFile Include="..\..\..\bdd\scenarios\basic_messaging.feature">
             <Link>Features\basic_messaging.feature</Link>
         </ReqnrollFeatureFile>

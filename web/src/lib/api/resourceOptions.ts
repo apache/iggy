@@ -37,9 +37,9 @@ export type TopicCreateBody = {
   name: string;
   partitions_count: number;
   options: {
-    compression_algorithm: CompressionAlgorithm;
-    message_expiry: string;
-    max_topic_size: string;
+    compression_algorithm?: CompressionAlgorithm;
+    message_expiry?: string;
+    max_topic_size?: string;
   };
 };
 
@@ -97,17 +97,15 @@ export function streamCreate(name: string, encryptionKey = ''): StreamCreateBody
   return { name, options: { encryption_key: encryptionKey } };
 }
 
+// An omitted key resolves to the catalog default and stays reported as a default.
 export function topicCreate(input: TopicCreateInput): TopicCreateBody {
   const { name, partitionsCount, compressionAlgorithm, messageExpiry, maxTopicSize } = input;
-  return {
-    name,
-    partitions_count: partitionsCount,
-    options: {
-      compression_algorithm: compressionAlgorithm,
-      message_expiry: messageExpiryText(messageExpiry),
-      max_topic_size: maxTopicSize.trim()
-    }
-  };
+  const options: TopicCreateBody['options'] = {};
+  const size = maxTopicSize.trim();
+  if (compressionAlgorithm !== 'none') options.compression_algorithm = compressionAlgorithm;
+  if (messageExpiry > 0) options.message_expiry = messageExpiryText(messageExpiry);
+  if (size !== '') options.max_topic_size = size;
+  return { name, partitions_count: partitionsCount, options };
 }
 
 export function topicUpdate({

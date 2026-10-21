@@ -10,7 +10,7 @@
     "option_maps": "Option maps use the HTTP JSON form: value as reversible text, kind, and explicit provenance. Request blocks mark every entry explicit.",
     "options_block_order": "Options block entries are encoded in ascending key byte order.",
     "request_bodies": "body_hex and update_resource_hex are command payloads without framing. constants.command_codes maps each command to its code and VSR operation.",
-    "reset_order": "The typed encoders write reset keys in catalog order. The HTTP handler writes them in ascending name order.",
+    "reset_order": "The typed encoders and the HTTP handler write reset keys in ascending key byte order.",
     "stream_state": "state is the stored server state a stream response was projected from. SDKs need only response_hex and expected.",
     "u64_values": "u64 option values and typed u64 inputs are decimal strings, so values above 2^53 keep their precision."
   },
@@ -956,6 +956,23 @@
         "name": "invalid_username",
         "code": 43
       }
+    },
+    {
+      "case": "user_short_username_and_status_reset",
+      "scope": "user",
+      "target": {
+        "user_id": 5
+      },
+      "input": {
+        "username": "a",
+        "reset": [
+          "status"
+        ]
+      },
+      "error": {
+        "name": "option_not_resettable",
+        "code": 4104
+      }
     }
   ],
   "create_stream": [
@@ -1181,6 +1198,21 @@
       "body": "{\"max_topic_size\":null}",
       "update_resource_hex": "0101040100000001040200000000",
       "outcome": "decode_refused",
+      "error": {
+        "name": "invalid_command",
+        "code": 3
+      }
+    },
+    {
+      "case": "topic_zero_sentinel_only",
+      "scope": "topic",
+      "target": {
+        "stream_id": 1,
+        "topic_id": 2
+      },
+      "body": "{\"message_expiry\":0}",
+      "update_resource_hex": "0101040100000001040200000000020e0000006d6573736167655f6578706972790c080000000000000000000000",
+      "outcome": "admission_refused",
       "error": {
         "name": "invalid_command",
         "code": 3

@@ -1344,7 +1344,8 @@ async fn given_forwarding_off_when_a_follower_takes_a_write_should_refuse_at_onc
 
 /// A PUT body the update shape refuses answers the Iggy error JSON with
 /// `InvalidCommand`, the category the binary decoder gives the same patch,
-/// and a `null` member leaves its key unchanged.
+/// naming in `field` the member the shape refuses. A `null` member leaves its
+/// key unchanged.
 #[iggy_harness]
 async fn given_malformed_update_body_when_putting_should_reject_invalid_command(
     harness: &TestHarness,
@@ -1353,15 +1354,29 @@ async fn given_malformed_update_body_when_putting_should_reject_invalid_command(
     http.create_stream_and_topic("http-put-shape", "shape", 1)
         .await;
     let path = "/streams/http-put-shape/topics/shape";
-    let bodies = [
-        r#"{"name":"first","name":"second"}"#,
-        r#"{"message_expiry":{"value":"1 day"}}"#,
-        r#"["name"]"#,
-        r#"{"reset":"message_expiry"}"#,
-        r#"{"message_expiry":"1 day","reset":["message_expiry"]}"#,
-        r#"{}"#,
+    let stream_path = "/streams/http-put-shape";
+    let cases = [
+        (path, r#"{"name":"first","name":"second"}"#, Some("name")),
+        (
+            path,
+            r#"{"message_expiry":{"value":"1 day"}}"#,
+            Some("message_expiry"),
+        ),
+        (path, r#"["name"]"#, None),
+        (path, r#"{"reset":"message_expiry"}"#, Some("reset")),
+        (
+            path,
+            r#"{"message_expiry":"1 day","reset":["message_expiry"]}"#,
+            None,
+        ),
+        (path, r#"{}"#, None),
+        (
+            stream_path,
+            r#"{"name":"renamed","options":{}}"#,
+            Some("options"),
+        ),
     ];
-    for body in bodies {
+    for (path, body, field) in cases {
         let response = http
             .client
             .put(http.url(path))
@@ -1379,6 +1394,7 @@ async fn given_malformed_update_body_when_putting_should_reject_invalid_command(
             IggyError::InvalidCommand.as_string(),
             "{body}"
         );
+        assert_eq!(error["field"], json!(field), "{body}");
     }
 
     let before: serde_json::Value = http.get(path).await.json().await.expect("topic json");
@@ -1399,7 +1415,8 @@ async fn given_malformed_update_body_when_putting_should_reject_invalid_command(
 }
 
 /// An option placed beside `options` in a POST create body is refused, not
-/// dropped, so a stream never commits without the key its client sent.
+/// dropped, so a stream never commits without the key its client sent. The
+/// error names the misplaced member in `field`.
 #[iggy_harness]
 async fn given_option_beside_options_when_creating_should_reject_invalid_command(
     harness: &TestHarness,
@@ -1414,17 +1431,20 @@ async fn given_option_beside_options_when_creating_should_reject_invalid_command
                 "name": "misplaced-key",
                 "encryption_key": "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE="
             }),
+            "encryption_key",
         ),
         (
             "/streams/http-misplaced/topics",
             json!({ "name": "misplaced-expiry", "partitions_count": 1, "message_expiry": "7 days" }),
+            "message_expiry",
         ),
     ];
-    for (path, body) in cases {
+    for (path, body, field) in cases {
         let response = http.post_json(path, &body).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
         let error: serde_json::Value = response.json().await.expect("decode the error body");
         assert_eq!(error["id"], IggyError::InvalidCommand.as_code(), "{body}");
+        assert_eq!(error["field"], field, "{body}");
     }
     assert_eq!(
         http.get("/streams/misplaced-key").await.status(),

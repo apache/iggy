@@ -29,7 +29,7 @@ import {
 } from '../options.utils.js';
 import { CREATE_STREAM, createStream } from '../stream/create-stream.command.js';
 import { UPDATE_STREAM } from '../stream/update-stream.command.js';
-import { encryptionKeyFingerprint } from '../stream/stream-options.js';
+import { StreamEncryptionKey, encryptionKeyFingerprint } from '../stream/stream-options.js';
 import { deserializeToStream, type Stream } from '../stream/stream.utils.js';
 import { CREATE_TOPIC } from '../topic/create-topic.command.js';
 import { UPDATE_TOPIC } from '../topic/update-topic.command.js';
@@ -139,6 +139,7 @@ const fixture: Fixture = JSON.parse(
 );
 const { constants } = fixture;
 const INVALID_ENCRYPTION_KEY = 70;
+const UNSUPPORTED_OPTION_KEY = 4041;
 const UPDATE_RESOURCE_CODE = constants.command_codes.update_resource.code;
 
 const fromHex = (hex: string) => Buffer.from(hex, 'hex');
@@ -219,7 +220,7 @@ const kindNames = new Map(
   Object.entries(constants.header_kind_codes).map(([name, code]) => [code, name])
 );
 
-describe('given shared vectors when encoding then should match server contract', () => {
+describe('given shared vectors when encoding should match server contract', () => {
 
   it('encodes every update vector byte for byte through the typed scope commands', () => {
     for (const vector of fixture.update_resource) {
@@ -289,6 +290,19 @@ describe('given shared vectors when encoding then should match server contract',
     );
   });
 
+  it('refuses a raw reset list its count byte or a name length byte cannot carry', () => {
+    const futureNames = (count: number) =>
+      Array.from({ length: count }, (_, index) => `future_${index}`);
+    for (const rawReset of [futureNames(256), [''], ['x'.repeat(256)]])
+      assert.throws(
+        () => UPDATE_TOPIC.serialize({ streamId: 1, topicId: 2, rawReset }),
+        isClientError(UNSUPPORTED_OPTION_KEY, UPDATE_RESOURCE_CODE),
+        `${rawReset.length} names, first ${rawReset[0].length} bytes`
+      );
+    const body = UPDATE_TOPIC.serialize({ streamId: 1, topicId: 2, rawReset: futureNames(255) });
+    assert.equal(body[1 + 2 * serializeIdentifier(1).length], 255);
+  });
+
   it('writes typed and raw reset names together in ascending name order', () => {
     const body = UPDATE_TOPIC.serialize({
       streamId: 1, topicId: 2, reset: ['message_expiry', 'max_topic_size'], rawReset: ['a_future']
@@ -312,7 +326,7 @@ describe('given shared vectors when encoding then should match server contract',
     const typedCreate: Record<Scope, Record<string, () => ParsedOptions>> = {
       stream: {
         encryption_key: () => optionsAt(CREATE_STREAM.serialize({
-          name: 'orders', encryptionKey: fromHex(fixture.stream_key.key_hex)
+          name: 'orders', encryptionKey: StreamEncryptionKey.from(fromHex(fixture.stream_key.key_hex))
         }), 1 + 'orders'.length)
       },
       topic: {
@@ -407,7 +421,8 @@ describe('given shared vectors when encoding then should match server contract',
         .map(([key, value]) => ({ key, value: HeaderValue.String(value) }));
       const encoded = CREATE_STREAM.serialize({
         name,
-        encryptionKey: encryption_key === undefined ? undefined : keyInput(encryption_key),
+        encryptionKey: encryption_key === undefined
+          ? undefined : StreamEncryptionKey.from(keyInput(encryption_key)),
         options
       });
       assert.equal(encoded.toString('hex'), vector.body_hex, vector.case);
@@ -563,7 +578,7 @@ describe('given shared vectors when encoding then should match server contract',
   });
 });
 
-describe('given invalid key when encoding then should reject before network io', () => {
+describe('given invalid key when encoding should reject before network io', () => {
   const { key_hex, key_base64, invalid_keys } = fixture.stream_key;
   const urlSafe = Buffer.alloc(32, 0xff).toString('base64url') + '=';
   const unexpectedNetwork: ClientProvider = () => {
@@ -591,22 +606,29 @@ describe('given invalid key when encoding then should reject before network io',
         return true;
       };
       assert.throws(() => encryptionKeyFingerprint(input), redacted);
-      assert.throws(() => CREATE_STREAM.serialize({ name: 'keyed', encryptionKey: input }), redacted);
+      assert.throws(() => StreamEncryptionKey.from(input), redacted);
       await assert.rejects(
-        createStream(unexpectedNetwork)({ name: 'keyed', encryptionKey: input }), redacted
+        createStream(unexpectedNetwork)({
+          name: 'keyed', encryptionKey: input as unknown as StreamEncryptionKey
+        }),
+        redacted
       );
     });
   }
 
   it('accepts exactly 32 raw bytes and canonical base64 as the same key', () => {
-    const raw = CREATE_STREAM.serialize({ name: 'keyed', encryptionKey: fromHex(key_hex) });
-    const text = CREATE_STREAM.serialize({ name: 'keyed', encryptionKey: key_base64 });
+    const raw = CREATE_STREAM.serialize({
+      name: 'keyed', encryptionKey: StreamEncryptionKey.from(fromHex(key_hex))
+    });
+    const text = CREATE_STREAM.serialize({
+      name: 'keyed', encryptionKey: StreamEncryptionKey.from(key_base64)
+    });
     assert.deepEqual(raw, text);
     assert.ok(raw.subarray(raw.length - 32).equals(fromHex(key_hex)));
   });
 });
 
-describe('given resolved update reply when correlating then should accept only matching request identity', () => {
+describe('given resolved update reply when correlating should accept only matching request identity', () => {
   const receiptFor = (request: Buffer, operation: number): Buffer => {
     const receipt = Buffer.alloc(HEADER_SIZE);
     receipt.writeUInt32LE(HEADER_SIZE, REPLY_OFFSET.size);

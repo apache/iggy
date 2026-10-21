@@ -30,7 +30,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 class VsrOperationTest {
 
     @Test
-    void givenFixtureOperationsWhenMirroringThenShouldMatchCodesAndCorrelation() {
+    void givenFixtureOperationsWhenMirroringShouldMatchCodesAndCorrelation() {
         JsonNode constants = section("constants");
 
         for (Map.Entry<String, JsonNode> command :

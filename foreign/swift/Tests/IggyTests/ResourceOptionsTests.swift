@@ -27,7 +27,7 @@ import Testing
 struct ResourceOptionsTests {
     let fixture = ResourceOptionsFixture.shared
 
-    @Test func givenInvalidKeyWhenEncodingThenShouldRejectBeforeNetworkIo() async throws {
+    @Test func givenInvalidKeyWhenEncodingShouldRejectBeforeNetworkIo() async throws {
         let key = Data([UInt8](hex: fixture.streamKey.keyHex))
         #expect(key.count == EncryptionKey.length)
         #expect(try EncryptionKey.decode(base64: fixture.streamKey.keyBase64) == key)
@@ -81,7 +81,7 @@ struct ResourceOptionsTests {
         await client.shutdown()
     }
 
-    @Test func givenSharedVectorsWhenEncodingThenShouldMatchServerContract() async throws {
+    @Test func givenSharedVectorsWhenEncodingShouldMatchServerContract() async throws {
         #expect(fixture.schemaVersion == 1)
         let constants = fixture.constants
         #expect(ProtocolVersion.current.packed == constants.protocolVersion.packed)
@@ -277,7 +277,7 @@ struct ResourceOptionsTests {
     /// Every public catalog key has its typed surface: a create field per
     /// create-only or updatable map key, an update field per updatable key,
     /// a reset member per resettable key, and an accessor per read-only key.
-    @Test func givenFixtureCatalogWhenBuildingTypedOptionsThenShouldCoverEveryPublicKey() throws {
+    @Test func givenFixtureCatalogWhenBuildingTypedOptionsShouldCoverEveryPublicKey() throws {
         func rows(_ scope: String, _ matches: (ResourceOptionsFixture.CatalogRow) -> Bool) -> Set<String> {
             Set(fixture.catalog.filter { $0.scopes.contains(scope) && matches($0) }.map(\.key))
         }
@@ -344,7 +344,7 @@ struct ResourceOptionsTests {
     /// A raw key or reset name may be one a newer server knows, so only the
     /// shape of such a patch is checked here. A typed-only patch is refused
     /// with the category the server would return, values last.
-    @Test func givenRawKeysWhenPatchingThenShouldLeaveTheCategoryChecksToTheServer() throws {
+    @Test func givenRawKeysWhenPatchingShouldLeaveTheCategoryChecksToTheServer() throws {
         let segment = try TopicUpdateOptions(reset: [.name], raw: [TopicOptionKey.segmentSize.rawValue: "1 GiB"]).toPatch()
         #expect(segment.reset == [TopicOptionKey.name.rawValue])
         #expect(segment.set[TopicOptionKey.segmentSize.rawValue] == .explicit("1 GiB"))
@@ -371,7 +371,7 @@ struct ResourceOptionsTests {
 
     /// The primary commits an `UpdateResource` under its scope's resolved
     /// operation, so the reply names 72, 73 or 74, never the request's 150.
-    @Test func givenResolvedUpdateReplyWhenCorrelatingThenShouldAcceptOnlyMatchingRequestIdentity() async throws {
+    @Test func givenResolvedUpdateReplyWhenCorrelatingShouldAcceptOnlyMatchingRequestIdentity() async throws {
         let golden = GoldenFixture.shared
         let header = golden.bytes("vsr.reply.update_topic_resolved")[...]
         #expect(VSRFrame.readReplyOperation(header) == .updateTopicResolved)
@@ -419,7 +419,7 @@ struct ResourceOptionsTests {
     /// Entries of a kind this build does not know are skipped, so a resource
     /// a newer server wrote still reads back. A known kind with a malformed
     /// value fails the read instead of being reinterpreted.
-    @Test func givenUnknownOptionKindWhenDecodingThenShouldPreserveSupportedValues() throws {
+    @Test func givenUnknownOptionKindWhenDecodingShouldPreserveSupportedValues() throws {
         let derived =
             optionEntry("encryption_key_fingerprint", kind: HeaderKind.string.rawValue, value: Array("8441e38538cbfa57".utf8))
             + optionEntry("encryption_key_source", kind: HeaderKind.string.rawValue, value: Array("stream".utf8))

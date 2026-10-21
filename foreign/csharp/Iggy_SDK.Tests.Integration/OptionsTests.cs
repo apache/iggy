@@ -231,7 +231,7 @@ public class OptionsTests
 
     [Test]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-    public async Task given_stream_key_when_creating_then_should_read_matching_projection(Protocol protocol)
+    public async Task given_stream_key_when_creating_should_read_matching_projection(Protocol protocol)
     {
         var client = await Fixture.CreateAuthenticatedClient(protocol);
         var key = RandomNumberGenerator.GetBytes(EncryptionKeys.KEY_LENGTH);
@@ -255,7 +255,7 @@ public class OptionsTests
 
     [Test]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-    public async Task given_keyless_stream_when_reading_then_should_report_server_generated_key(Protocol protocol)
+    public async Task given_keyless_stream_when_reading_should_report_server_generated_key(Protocol protocol)
     {
         var client = await Fixture.CreateAuthenticatedClient(protocol);
 
@@ -279,7 +279,7 @@ public class OptionsTests
 
     [Test]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-    public async Task given_stream_rename_when_updating_then_should_preserve_encryption_projection(Protocol protocol)
+    public async Task given_stream_rename_when_updating_should_preserve_encryption_projection(Protocol protocol)
     {
         var client = await Fixture.CreateAuthenticatedClient(protocol);
         var key = RandomNumberGenerator.GetBytes(EncryptionKeys.KEY_LENGTH);
@@ -313,7 +313,7 @@ public class OptionsTests
 
     [Test]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-    public async Task given_topic_reset_when_updating_then_should_preserve_unmentioned_values(Protocol protocol)
+    public async Task given_topic_reset_when_updating_should_preserve_unmentioned_values(Protocol protocol)
     {
         var client = await Fixture.CreateAuthenticatedClient(protocol);
         var streamName = $"reset-{Guid.NewGuid():N}";
@@ -346,7 +346,7 @@ public class OptionsTests
 
     [Test]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-    public async Task given_user_options_when_creating_and_updating_then_should_preserve_user_behavior(Protocol protocol)
+    public async Task given_user_options_when_creating_and_updating_should_preserve_user_behavior(Protocol protocol)
     {
         var client = await Fixture.CreateAuthenticatedClient(protocol);
         var username = $"opts-{Guid.NewGuid():N}"[..20];
@@ -381,7 +381,7 @@ public class OptionsTests
     }
 
     [Test]
-    public async Task given_http_status_update_when_deactivating_then_should_prevent_new_login()
+    public async Task given_http_status_update_when_deactivating_should_prevent_new_login()
     {
         var admin = await Fixture.CreateAuthenticatedClient(Protocol.Http);
         var username = $"deact-{Guid.NewGuid():N}"[..20];
@@ -399,7 +399,7 @@ public class OptionsTests
 
     [Test]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-    public async Task given_raw_keys_when_updating_then_should_report_the_server_category(Protocol protocol)
+    public async Task given_raw_keys_when_updating_should_report_the_server_category(Protocol protocol)
     {
         var client = await Fixture.CreateAuthenticatedClient(protocol);
         var created = await client.CreateUserAsync($"raw-{Guid.NewGuid():N}"[..20], "options-password",

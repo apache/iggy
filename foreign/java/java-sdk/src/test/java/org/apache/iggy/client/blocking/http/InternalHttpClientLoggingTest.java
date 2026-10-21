@@ -37,7 +37,7 @@ class InternalHttpClientLoggingTest {
     private static final String PASSWORD = "secret-password";
 
     @Test
-    void givenDebugLoggingWhenPreparingBodiesThenShouldNotLogSecrets() throws Exception {
+    void givenDebugLoggingWhenPreparingBodiesShouldNotLogSecrets() throws Exception {
         var logger = (Logger) LoggerFactory.getLogger(InternalHttpClient.class);
         var previousLevel = logger.getLevel();
         var appender = new ListAppender<ILoggingEvent>();

@@ -455,8 +455,8 @@ pub struct PollCompletion {
     /// mean the automatic commit is queued and has no prepare slot yet.
     pub replication: Option<PollReplication>,
     /// The key the fragments were written under, `None` for a plaintext
-    /// stream. Captured with the fragments, so a reply that outlives the stream
-    /// never decrypts with a later stream's key.
+    /// stream or an empty reply. Captured with the fragments, so a reply that
+    /// outlives the stream never decrypts with a later stream's key.
     pub encryptor: Option<Arc<EncryptorKind>>,
 }
 
@@ -4095,10 +4095,16 @@ where
                 owner_generation: result.context.owner.map_or(0, |owner| owner.generation),
                 metadata_op: self.required_metadata_frontier,
             },
+            // An empty reply has nothing to decrypt, so it skips the cross-core
+            // refcount bump of the owner's encryptor.
+            encryptor: if result.fragments.is_empty() {
+                None
+            } else {
+                self.encryptor.clone()
+            },
             fragments: result.fragments,
             current_offset: result.commit_offset,
             replication,
-            encryptor: self.encryptor.clone(),
         })
     }
 
@@ -16920,8 +16926,7 @@ mod tests {
     }
 
     #[test]
-    fn given_delayed_poll_after_stream_recreation_when_replying_then_should_keep_original_encryptor()
-     {
+    fn given_delayed_poll_after_stream_recreation_when_replying_should_keep_original_encryptor() {
         let encryptor = |seed: u8| {
             Arc::new(EncryptorKind::Aes256Gcm(
                 Aes256GcmEncryptor::new(&[seed; 32]).expect("valid key"),
@@ -16930,7 +16935,7 @@ mod tests {
         let (original_key, replacement_key) = (encryptor(1), encryptor(2));
         let mut original = test_partition();
         original.set_encryptor(Some(Arc::clone(&original_key)));
-        let read = poll_read_result(&original, PollingConsumer::Consumer(1, 0), false, None);
+        let read = poll_read_result(&original, PollingConsumer::Consumer(1, 0), false, Some(0));
         let completion = original.complete_poll(read).expect("completes");
 
         // The stream is deleted and its id reused before the reply is built.
@@ -16950,6 +16955,29 @@ mod tests {
                 .encryptor
                 .is_none()
         );
+    }
+
+    #[test]
+    fn given_empty_poll_of_encrypted_stream_when_replying_should_not_carry_its_key() {
+        let encryptor = Arc::new(EncryptorKind::Aes256Gcm(
+            Aes256GcmEncryptor::new(&[3; 32]).expect("valid key"),
+        ));
+        let mut partition = test_partition();
+        partition.set_encryptor(Some(Arc::clone(&encryptor)));
+
+        let empty = poll_read_result(&partition, PollingConsumer::Consumer(1, 0), false, None);
+        let completion = partition.complete_poll(empty).expect("completes");
+
+        assert!(completion.fragments.is_empty());
+        assert!(completion.encryptor.is_none());
+        assert_eq!(Arc::strong_count(&encryptor), 2);
+        let read = poll_read_result(&partition, PollingConsumer::Consumer(1, 0), false, Some(0));
+        let pinned = partition
+            .complete_poll(read)
+            .expect("completes")
+            .encryptor
+            .expect("a poll with fragments carries its stream's key");
+        assert!(Arc::ptr_eq(&pinned, &encryptor));
     }
 
     #[compio::test]

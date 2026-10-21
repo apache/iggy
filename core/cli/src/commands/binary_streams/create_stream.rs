@@ -21,23 +21,21 @@ use async_trait::async_trait;
 use iggy_common::{
     Client, StreamCreateOptions, StreamDetails, StreamEncryptionKey, StreamEncryptionSource,
 };
+use std::fs;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::{env, fs};
 use tracing::{Level, event};
-
-pub const STREAM_ENCRYPTION_KEY_ENV: &str = "IGGY_STREAM_ENCRYPTION_KEY";
 
 pub struct CreateStreamCmd {
     name: String,
-    encryption_key_file: Option<PathBuf>,
+    stream_key_file: Option<PathBuf>,
 }
 
 impl CreateStreamCmd {
-    pub fn new(name: String, encryption_key_file: Option<PathBuf>) -> Self {
+    pub fn new(name: String, stream_key_file: Option<PathBuf>) -> Self {
         Self {
             name,
-            encryption_key_file,
+            stream_key_file,
         }
     }
 
@@ -45,25 +43,20 @@ impl CreateStreamCmd {
         "ID auto incremented".to_string()
     }
 
-    /// The key from the explicit file, else from the environment. The file
-    /// wins so a stale exported variable cannot override a deliberate choice.
+    /// Only a file named on this call supplies the key, so no key spreads across streams.
     fn options(&self) -> anyhow::Result<StreamCreateOptions> {
-        let encoded = match &self.encryption_key_file {
-            Some(path) => Some(fs::read_to_string(path).with_context(|| {
-                format!(
-                    "Problem reading stream encryption key file: {}",
-                    path.display()
-                )
-            })?),
-            None => env::var(STREAM_ENCRYPTION_KEY_ENV)
-                .ok()
-                .filter(|value| !value.is_empty()),
-        };
-        let encryption_key = encoded
-            .map(|text| {
-                StreamEncryptionKey::from_str(text.trim_end()).with_context(
-                    || "Stream encryption key must be standard base64 of exactly 32 bytes",
-                )
+        let encryption_key = self
+            .stream_key_file
+            .as_ref()
+            .map(|path| {
+                let text = fs::read_to_string(path).with_context(|| {
+                    format!(
+                        "Problem reading stream encryption key file: {}",
+                        path.display()
+                    )
+                })?;
+                StreamEncryptionKey::from_str(text.trim_end())
+                    .context("Stream encryption key must be standard base64 of exactly 32 bytes")
             })
             .transpose()?;
         Ok(StreamCreateOptions {

@@ -82,7 +82,7 @@ final class ResourceOptionsTest extends TestCase
 
     #[DataProvider('transports')]
     #[TestDox('A stream created with its own key reports source stream and the key fingerprint on $transport')]
-    public function testGivenStreamKeyWhenCreatingThenShouldReadMatchingProjection(string $transport): void
+    public function testGivenStreamKeyWhenCreatingShouldReadMatchingProjection(string $transport): void
     {
         $fixture = self::fixture()['stream_key'];
         $client = new_transport_client($transport);
@@ -95,7 +95,7 @@ final class ResourceOptionsTest extends TestCase
 
     #[DataProvider('transports')]
     #[TestDox('A stream created without a key reports a server-generated key on $transport')]
-    public function testGivenKeylessStreamWhenReadingThenShouldReportServerGeneratedKey(string $transport): void
+    public function testGivenKeylessStreamWhenReadingShouldReportServerGeneratedKey(string $transport): void
     {
         $client = new_transport_client($transport);
         $stream = $this->createStream($client, unique_name('keyless-stream'));
@@ -105,7 +105,7 @@ final class ResourceOptionsTest extends TestCase
 
     #[DataProvider('transports')]
     #[TestDox('Renaming a keyed stream keeps its id, key projection and readable messages on $transport')]
-    public function testGivenStreamRenameWhenUpdatingThenShouldPreserveEncryptionProjection(string $transport): void
+    public function testGivenStreamRenameWhenUpdatingShouldPreserveEncryptionProjection(string $transport): void
     {
         $fixture = self::fixture()['stream_key'];
         $client = new_transport_client($transport);
@@ -131,7 +131,7 @@ final class ResourceOptionsTest extends TestCase
 
     #[DataProvider('transports')]
     #[TestDox('Resetting any stream option is refused with the server category and changes nothing on $transport')]
-    public function testGivenStreamResetWhenUpdatingThenShouldRejectWithoutChangingStream(string $transport): void
+    public function testGivenStreamResetWhenUpdatingShouldRejectWithoutChangingStream(string $transport): void
     {
         $fixture = self::fixture()['stream_key'];
         $client = new_transport_client($transport);
@@ -157,7 +157,7 @@ final class ResourceOptionsTest extends TestCase
     }
 
     #[TestDox('A repeated reset name is refused as an invalid command, as server admission refuses it')]
-    public function testGivenDuplicateResetWhenUpdatingThenShouldRejectAsInvalidCommand(): void
+    public function testGivenDuplicateResetWhenUpdatingShouldRejectAsInvalidCommand(): void
     {
         $client = new_client();
         $created = $this->createStream($client, unique_name('duplicate-reset'));
@@ -177,7 +177,7 @@ final class ResourceOptionsTest extends TestCase
     }
 
     #[TestDox('Invalid keys are refused before any request and their text never reaches the error')]
-    public function testGivenInvalidKeyWhenEncodingThenShouldRejectBeforeNetworkIo(): void
+    public function testGivenInvalidKeyWhenEncodingShouldRejectBeforeNetworkIo(): void
     {
         $fixture = self::fixture()['stream_key'];
         $neverConnected = new IggyClient(server_address());
@@ -207,7 +207,7 @@ final class ResourceOptionsTest extends TestCase
     }
 
     #[TestDox('Raw key bytes passed instead of base64 are refused as an invalid key and never reach the exception trace')]
-    public function testGivenRawKeyBytesWhenCreatingThenShouldRejectWithoutLeakingKey(): void
+    public function testGivenRawKeyBytesWhenCreatingShouldRejectWithoutLeakingKey(): void
     {
         $neverConnected = new IggyClient(server_address());
         $key = "\xff" . random_bytes(31);
@@ -225,7 +225,7 @@ final class ResourceOptionsTest extends TestCase
     }
 
     #[TestDox('Raw create and update entries reach the server, which decides keys this build does not know')]
-    public function testGivenRawEntriesWhenCreatingAndUpdatingThenShouldLetServerDecide(): void
+    public function testGivenRawEntriesWhenCreatingAndUpdatingShouldLetServerDecide(): void
     {
         $client = new_client();
         foreach (self::fixture()['create_stream'] as $vector) {
@@ -256,7 +256,7 @@ final class ResourceOptionsTest extends TestCase
     }
 
     #[TestDox('Stream vectors match the shared fixture: fingerprint, key constants, create admission and update refusals')]
-    public function testGivenSharedVectorsWhenEncodingThenShouldMatchServerContract(): void
+    public function testGivenSharedVectorsWhenEncodingShouldMatchServerContract(): void
     {
         $fixture = self::fixture();
         assert_same(1, $fixture['schema_version']);
@@ -298,7 +298,7 @@ final class ResourceOptionsTest extends TestCase
 
     #[DataProvider('transports')]
     #[TestDox('A topic created with options reads them back with provenance, and an update renames, sets and resets on $transport')]
-    public function testGivenTopicOptionsWhenCreatingAndUpdatingThenShouldReadThemWithProvenance(string $transport): void
+    public function testGivenTopicOptionsWhenCreatingAndUpdatingShouldReadThemWithProvenance(string $transport): void
     {
         $vector = self::fixture()['create_topic'][0];
         $input = $vector['input'];
@@ -351,7 +351,7 @@ final class ResourceOptionsTest extends TestCase
     }
 
     #[TestDox('Topic update vectors are refused with the server category and the topic keeps its options')]
-    public function testGivenTopicUpdateVectorsWhenUpdatingThenShouldRejectWithServerCategory(): void
+    public function testGivenTopicUpdateVectorsWhenUpdatingShouldRejectWithServerCategory(): void
     {
         $client = new_client();
         $stream = $this->createStream($client, unique_name('topic-errors'));
@@ -389,7 +389,7 @@ final class ResourceOptionsTest extends TestCase
     }
 
     #[TestDox('A topic created without options reads the catalog defaults as derived, and never-expire and unlimited travel exactly')]
-    public function testGivenTopicDefaultsWhenReadingThenShouldReportDerivedCatalogValues(): void
+    public function testGivenTopicDefaultsWhenReadingShouldReportDerivedCatalogValues(): void
     {
         $client = new_client();
         $stream = $this->createStream($client, unique_name('topic-defaults'));
@@ -420,7 +420,7 @@ final class ResourceOptionsTest extends TestCase
     }
 
     #[TestDox('describeOptions reports every described catalog row with its kind and flags')]
-    public function testGivenEveryScopeWhenDescribingOptionsThenShouldMatchCatalog(): void
+    public function testGivenEveryScopeWhenDescribingOptionsShouldMatchCatalog(): void
     {
         $client = new_client();
         foreach (OptionsScope::cases() as $scope) {
@@ -452,7 +452,7 @@ final class ResourceOptionsTest extends TestCase
     }
 
     #[TestDox('The typed surface covers every catalog row: create arguments, update arguments, reset cases and accessors')]
-    public function testGivenFixtureCatalogWhenInspectingTypedSurfaceThenShouldCoverEveryRow(): void
+    public function testGivenFixtureCatalogWhenInspectingTypedSurfaceShouldCoverEveryRow(): void
     {
         $surface = [
             'stream' => [StreamOptionKey::class, 'createStream', 'updateStream'],

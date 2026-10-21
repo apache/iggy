@@ -104,6 +104,9 @@ pub fn sample(
         Outcome::InvalidOptionValue | Outcome::OptionsBlockTooLarge => {
             unreachable!("the simulator only sends valid option values")
         }
+        Outcome::InvalidTopicSize => {
+            unreachable!("the simulator never sets an explicit max topic size")
+        }
     }
 }
 

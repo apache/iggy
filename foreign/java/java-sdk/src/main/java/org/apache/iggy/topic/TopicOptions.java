@@ -24,7 +24,9 @@ import org.apache.iggy.message.HeaderValue;
 import java.math.BigInteger;
 import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * The options a topic is created with, one typed setter per catalog key.
@@ -45,9 +47,11 @@ import java.util.Map;
 public final class TopicOptions {
 
     private final Map<String, HeaderValue> entries;
+    private final Set<String> rawKeys;
 
-    private TopicOptions(Map<String, HeaderValue> entries) {
+    private TopicOptions(Map<String, HeaderValue> entries, Set<String> rawKeys) {
         this.entries = entries;
+        this.rawKeys = rawKeys;
     }
 
     public static Map<String, HeaderValue> withDurabilityDefaults(Map<String, HeaderValue> source) {
@@ -81,9 +85,12 @@ public final class TopicOptions {
         return entries;
     }
 
+    /** Raw entries print by name only, because this build cannot tell which newer keys are secret. */
     @Override
     public String toString() {
-        return "TopicOptions" + entries;
+        Map<String, HeaderValue> typed = new LinkedHashMap<>(entries);
+        typed.keySet().removeAll(rawKeys);
+        return "TopicOptions[options=" + typed + ", raw=" + rawKeys + "]";
     }
 
     public static final class Builder {
@@ -167,7 +174,9 @@ public final class TopicOptions {
         public TopicOptions build() {
             Map<String, HeaderValue> entries = new LinkedHashMap<>(raw);
             entries.putAll(typed);
-            return new TopicOptions(Collections.unmodifiableMap(entries));
+            Set<String> rawKeys = new LinkedHashSet<>(raw.keySet());
+            rawKeys.removeAll(typed.keySet());
+            return new TopicOptions(Collections.unmodifiableMap(entries), Collections.unmodifiableSet(rawKeys));
         }
 
         private Builder set(TopicOptionKey key, HeaderValue value) {

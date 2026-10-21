@@ -54,7 +54,7 @@ const KNOWN_FINGERPRINT: &str = "8441e38538cbfa57";
 const ABOVE_2_POW_53: u64 = (1 << 53) + 1;
 
 #[test]
-fn given_live_wire_constants_when_comparing_fixture_then_should_match_codes_and_versions() {
+fn given_live_wire_constants_when_comparing_fixture_should_match_codes_and_versions() {
     let fixture = fixture();
     assert_eq!(fixture.schema_version, SCHEMA_VERSION);
     assert_eq!(fixture.generated_by, GENERATOR);
@@ -116,7 +116,7 @@ fn given_live_wire_constants_when_comparing_fixture_then_should_match_codes_and_
 }
 
 #[test]
-fn given_live_catalog_when_comparing_fixture_then_should_match_keys_kinds_defaults_and_flags() {
+fn given_live_catalog_when_comparing_fixture_should_match_keys_kinds_defaults_and_flags() {
     let fixture = fixture();
     let live = CATALOG
         .iter()
@@ -163,7 +163,7 @@ fn given_live_catalog_when_comparing_fixture_then_should_match_keys_kinds_defaul
 }
 
 #[test]
-fn given_describe_options_vectors_when_decoding_then_should_match_catalog_flags() {
+fn given_describe_options_vectors_when_decoding_should_match_catalog_flags() {
     let fixture = fixture();
     let scopes: Vec<OptionsScope> = fixture
         .describe_options
@@ -213,7 +213,7 @@ fn given_describe_options_vectors_when_decoding_then_should_match_catalog_flags(
 }
 
 #[test]
-fn given_fixed_key_when_comparing_fixture_then_should_match_fingerprint() {
+fn given_fixed_key_when_comparing_fixture_should_match_fingerprint() {
     let vectors = fixture().stream_key;
     let key = hex::decode(&vectors.key_hex).expect("key is hex");
     assert_eq!(key, (0u8..32).collect::<Vec<_>>());
@@ -268,7 +268,7 @@ fn given_fixed_key_when_comparing_fixture_then_should_match_fingerprint() {
 }
 
 #[test]
-fn given_update_resource_vectors_when_decoding_then_should_match_all_scopes() {
+fn given_update_resource_vectors_when_decoding_should_match_all_scopes() {
     let fixture = fixture();
     let mut scopes = Vec::new();
     for vector in &fixture.update_resource {
@@ -310,7 +310,7 @@ fn given_update_resource_vectors_when_decoding_then_should_match_all_scopes() {
 }
 
 #[test]
-fn given_invalid_update_inputs_when_encoding_then_should_refuse_before_sending() {
+fn given_invalid_update_inputs_when_encoding_should_refuse_before_sending() {
     let fixture = fixture();
     for vector in &fixture.update_resource_errors {
         let refused = update_resource_request(vector.scope, &vector.target, &vector.input)
@@ -338,7 +338,7 @@ fn given_invalid_update_inputs_when_encoding_then_should_refuse_before_sending()
 }
 
 #[test]
-fn given_create_vectors_when_decoding_then_should_match_typed_requests() {
+fn given_create_vectors_when_decoding_should_match_typed_requests() {
     let fixture = fixture();
     for vector in &fixture.create_stream {
         let bytes = hex::decode(&vector.body_hex).expect("body is hex");
@@ -467,7 +467,7 @@ fn given_create_vectors_when_decoding_then_should_match_typed_requests() {
 }
 
 #[test]
-fn given_http_update_vectors_when_parsing_then_should_match_update_resource() {
+fn given_http_update_vectors_when_parsing_should_match_update_resource() {
     let fixture = fixture();
     let mut outcomes = Vec::new();
     for vector in &fixture.http_update {
@@ -510,7 +510,7 @@ fn given_http_update_vectors_when_parsing_then_should_match_update_resource() {
 }
 
 #[test]
-fn given_response_vectors_when_decoding_then_should_match_typed_projection() {
+fn given_response_vectors_when_decoding_should_match_typed_projection() {
     let fixture = fixture();
     let never_returned: Vec<HeaderKey> = fixture
         .constants
@@ -751,7 +751,7 @@ fn given_response_vectors_when_decoding_then_should_match_typed_projection() {
 }
 
 #[test]
-fn given_language_copies_when_comparing_then_should_match_canonical_bytes() {
+fn given_language_copies_when_comparing_should_match_canonical_bytes() {
     let canonical = read_manifest_file(CANONICAL_PATH);
     for copy in LANGUAGE_COPIES {
         assert!(

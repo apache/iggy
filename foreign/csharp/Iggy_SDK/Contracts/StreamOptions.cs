@@ -19,6 +19,7 @@ using System.Text.Json.Serialization;
 using Apache.Iggy.Encryption;
 using Apache.Iggy.Headers;
 using Apache.Iggy.IggyClient;
+using Apache.Iggy.JsonConverters;
 using Apache.Iggy.Vsr;
 
 namespace Apache.Iggy.Contracts;
@@ -36,8 +37,8 @@ public sealed class StreamOptions
     ///     responsibility. The server stores it wrapped and never returns it, reads report only
     ///     <see cref="StreamResponse.EncryptionKeySource" /> and its fingerprints. Left null, a server with
     ///     encryption enabled generates a key for the stream, otherwise the stream is stored in plaintext.
-    ///     The key cannot be changed after creation, and JSON serialization of these options leaves it out so a
-    ///     structured logger never writes it.
+    ///     The key cannot be changed after creation, and JSON serialization of these options leaves it out and
+    ///     writes <see cref="Options" /> entries by name only, so a structured logger never writes it.
     /// </remarks>
     [JsonIgnore]
     public byte[]? EncryptionKey { get; init; }
@@ -46,6 +47,7 @@ public sealed class StreamOptions
     ///     Option keys with no property of their own, keyed by option name, for keys newer than this build. A
     ///     property above wins on collision, and the server refuses a key outside its catalog by name.
     /// </summary>
+    [JsonConverter(typeof(RedactedOptionsConverter))]
     public IReadOnlyDictionary<string, HeaderValue>? Options { get; init; }
 
     /// <summary>

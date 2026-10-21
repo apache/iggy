@@ -45,6 +45,21 @@ public sealed class ResourceOptionsSteps
         _context = context;
     }
 
+    // Features share one server, and this runs before the default-order hook disposes the client.
+    [AfterScenario(Order = 0)]
+    public async Task DeleteCreatedResources()
+    {
+        if (_streamId is { } streamId)
+        {
+            await _context.IggyClient.DeleteStreamAsync(Identifier.Numeric(streamId));
+        }
+
+        if (_userId is { } userId)
+        {
+            await _context.IggyClient.DeleteUserAsync(Identifier.Numeric(userId));
+        }
+    }
+
     [When("I create a stream named {string} with an encryption key of 32 bytes valued {int}")]
     public async Task CreateKeyedStream(string name, int value)
     {

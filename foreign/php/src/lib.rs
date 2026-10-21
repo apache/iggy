@@ -25,6 +25,7 @@ pub mod options;
 pub mod receive_message;
 pub mod runtime;
 pub mod send_message;
+pub mod sensitive_parameters;
 pub mod stream;
 pub mod topic;
 
@@ -46,6 +47,7 @@ use crate::topic::TopicDetails;
 #[php_module]
 pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
     module
+        .request_startup_function(sensitive_parameters::mark_sensitive_parameters)
         .enumeration::<durability::Durability>()
         .enumeration::<StreamOptionKey>()
         .enumeration::<TopicOptionKey>()

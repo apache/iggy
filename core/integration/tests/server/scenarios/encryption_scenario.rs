@@ -503,7 +503,7 @@ fn encryption_disabled() -> bool {
 /// the segment files directly. Both knobs are topic creation options now.
 #[tokio::test]
 #[parallel]
-async fn given_client_key_and_keyless_streams_when_polling_then_should_use_their_own_keys() {
+async fn given_client_key_and_keyless_streams_when_polling_should_use_their_own_keys() {
     let mut harness = single_node(encryption_config(true, CONFIG_KEY)).await;
     let tcp = harness.tcp_root_client().await.unwrap();
     let http = harness
@@ -598,8 +598,7 @@ async fn given_client_key_and_keyless_streams_when_polling_then_should_use_their
 
 #[tokio::test]
 #[parallel]
-async fn given_keyless_stream_with_encryption_enabled_when_reading_then_should_report_generated_key()
- {
+async fn given_keyless_stream_with_encryption_enabled_when_reading_should_report_generated_key() {
     let harness = single_node(encryption_config(true, CONFIG_KEY)).await;
     let client = harness.tcp_root_client().await.unwrap();
     for name in ["generated-first", "generated-second"] {
@@ -645,7 +644,7 @@ async fn given_keyless_stream_with_encryption_enabled_when_reading_then_should_r
 
 #[tokio::test]
 #[parallel]
-async fn given_disabled_encryption_with_config_key_when_creating_client_key_stream_then_should_encrypt_only_that_stream()
+async fn given_disabled_encryption_with_config_key_when_creating_client_key_stream_should_encrypt_only_that_stream()
  {
     let harness = single_node(encryption_config(false, CONFIG_KEY)).await;
     for transport in [TransportProtocol::Tcp, TransportProtocol::Http] {
@@ -687,7 +686,7 @@ async fn given_disabled_encryption_with_config_key_when_creating_client_key_stre
 
 #[tokio::test]
 #[parallel]
-async fn given_stream_created_while_disabled_when_enabling_encryption_then_should_stay_plaintext() {
+async fn given_stream_created_while_disabled_when_enabling_encryption_should_stay_plaintext() {
     let mut harness = single_node(encryption_config(false, CONFIG_KEY)).await;
     let client = harness.tcp_root_client().await.unwrap();
     create_stream_with_topic(&client, "before-enable", None).await;
@@ -720,7 +719,7 @@ async fn given_stream_created_while_disabled_when_enabling_encryption_then_shoul
 
 #[tokio::test]
 #[parallel]
-async fn given_custom_key_without_config_key_when_creating_then_should_reject_unavailable() {
+async fn given_custom_key_without_config_key_when_creating_should_reject_unavailable() {
     let harness = single_node(TestServerConfig::default()).await;
     for transport in ALL_TRANSPORTS {
         let client = harness.root_client_for(transport).await.unwrap();
@@ -757,7 +756,7 @@ async fn given_custom_key_without_config_key_when_creating_then_should_reject_un
 
 #[tokio::test]
 #[parallel]
-async fn given_custom_key_when_reading_every_response_then_should_return_only_public_projections() {
+async fn given_custom_key_when_reading_every_response_should_return_only_public_projections() {
     let harness = single_node(encryption_config(true, CONFIG_KEY)).await;
     let key = stream_key(55);
     let encoded = text::as_base64(key.as_bytes());
@@ -816,8 +815,7 @@ async fn given_custom_key_when_reading_every_response_then_should_return_only_pu
 
 #[tokio::test]
 #[parallel]
-async fn given_changed_config_key_when_restarting_then_should_refuse_boot_naming_both_fingerprints()
-{
+async fn given_changed_config_key_when_restarting_should_refuse_boot_naming_both_fingerprints() {
     let mut harness = single_node(encryption_config(true, CONFIG_KEY)).await;
     let client = harness.tcp_root_client().await.unwrap();
     create_stream_with_topic(&client, "kept-own", Some(stream_key(66))).await;

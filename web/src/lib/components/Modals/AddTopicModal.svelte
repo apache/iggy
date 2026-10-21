@@ -49,7 +49,7 @@ under the License.
     partitions_count: z.number().min(0).max(numberSizes.max.u32).default(1),
     message_expiry: z.number().min(0).max(Number.MAX_SAFE_INTEGER).default(0),
     compression_algorithm: z.enum(['none', 'gzip']).default('none'),
-    max_topic_size: z.string().trim().min(1, 'Max topic size is required').default('2000000000')
+    max_topic_size: z.string().trim().default('')
   });
 
   const { form, errors, enhance, constraints, submitting } = superForm(defaults(zod4(schema)), {
@@ -153,12 +153,12 @@ under the License.
       <Input
         label="Max topic size"
         name="maxTopicSize"
-        placeholder="e.g. 1 GiB or unlimited"
+        placeholder="Unlimited, or e.g. 1 GiB"
         bind:value={$form.max_topic_size}
         errorMessage={$errors.max_topic_size?.[0]}
       />
       <span class="text-xs text-shade-d200 dark:text-shade-l700 ml-1">
-        Bytes, a size such as 1 GiB, or unlimited.
+        Bytes or a size such as 1 GiB. Leave empty for unlimited.
       </span>
     </div>
 

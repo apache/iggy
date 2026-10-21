@@ -786,7 +786,7 @@ async fn given_own_password_when_current_wrong_should_reject_and_correct_should_
 /// Admin-initiated change (target != caller): the current password is checked
 /// against the TARGET's stored hash, so a wrong one is 400 `InvalidCredentials`;
 /// a target that does not resolve is left to the replicated apply, which
-/// answers 404 `UserNotFound` (the plaintext is still stripped + hashed first).
+/// answers 404 `UserNotFound` (both plaintext passwords are stripped first).
 #[iggy_harness]
 async fn given_admin_change_password_when_target_current_wrong_or_missing_should_reject(
     harness: &TestHarness,

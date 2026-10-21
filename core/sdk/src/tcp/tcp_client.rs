@@ -565,7 +565,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn given_generic_user_rename_when_reconnecting_then_should_use_updated_username() {
+    async fn given_generic_user_rename_when_reconnecting_should_use_updated_username() {
         for resolved in [false, true] {
             let cluster = FakeCluster::new(1);
             let client = signed_in_client(&cluster).await;
@@ -593,8 +593,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn given_rejected_rename_or_topic_rename_when_reconnecting_then_should_keep_the_username()
-    {
+    async fn given_rejected_rename_or_topic_rename_when_reconnecting_should_keep_the_username() {
         let cluster = FakeCluster::new(1);
         let client = signed_in_client(&cluster).await;
         cluster.script(

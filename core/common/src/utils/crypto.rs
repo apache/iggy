@@ -99,7 +99,7 @@ mod tests {
     use crate::{HeaderKey, HeaderValue, IggyMessage};
 
     #[test]
-    fn given_short_ciphertext_when_decrypting_then_should_return_cannot_decrypt_data() {
+    fn given_short_ciphertext_when_decrypting_should_return_cannot_decrypt_data() {
         let encryptor = Aes256GcmEncryptor::new(&[3; 32]).expect("valid key");
         for length in 0..28 {
             let ciphertext = vec![0xA5; length];

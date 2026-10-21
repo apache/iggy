@@ -263,7 +263,7 @@ template <typename Operation>
 
 }  // namespace
 
-TEST(ResourceOptionsFixtureTest, GivenFixtureKeyWhenFingerprintingThenShouldMatchSharedVector) {
+TEST(ResourceOptionsFixtureTest, GivenFixtureKeyWhenFingerprintingShouldMatchSharedVector) {
     const auto &stream_key = Fixture().at("stream_key");
     const auto expected    = stream_key.at("fingerprint").get<std::string>();
 
@@ -271,7 +271,7 @@ TEST(ResourceOptionsFixtureTest, GivenFixtureKeyWhenFingerprintingThenShouldMatc
     EXPECT_EQ(iggy::EncryptionKeyFingerprint(stream_key.at("key_base64").get<std::string>()), expected);
 }
 
-TEST(ResourceOptionsFixtureTest, GivenInvalidKeyVectorsWhenFingerprintingThenShouldRefuseWithoutKeyMaterial) {
+TEST(ResourceOptionsFixtureTest, GivenInvalidKeyVectorsWhenFingerprintingShouldRefuseWithoutKeyMaterial) {
     const auto &stream_key = Fixture().at("stream_key");
     const auto key_base64  = stream_key.at("key_base64").get<std::string>();
     for (const auto &vector : stream_key.at("invalid_keys")) {
@@ -292,13 +292,13 @@ TEST(ResourceOptionsFixtureTest, GivenInvalidKeyVectorsWhenFingerprintingThenSho
     }
 }
 
-TEST(ResourceOptionsFixtureTest, GivenFixtureCatalogWhenListingPublicKeyEnumsThenShouldMatchDescribedKeysInOrder) {
+TEST(ResourceOptionsFixtureTest, GivenFixtureCatalogWhenListingPublicKeyEnumsShouldMatchDescribedKeysInOrder) {
     EXPECT_EQ(PublicKeyNames<iggy::StreamOptionKey>(), DescribedKeys("stream"));
     EXPECT_EQ(PublicKeyNames<iggy::TopicOptionKey>(), DescribedKeys("topic"));
     EXPECT_EQ(PublicKeyNames<iggy::UserOptionKey>(), DescribedKeys("user"));
 }
 
-TEST(ResourceOptionsFixtureTest, GivenFixtureCatalogWhenComparingTypedSurfaceThenShouldCoverEveryKeyByMutability) {
+TEST(ResourceOptionsFixtureTest, GivenFixtureCatalogWhenComparingTypedSurfaceShouldCoverEveryKeyByMutability) {
     const auto flags      = Fixture().at("constants").at("option_flags");
     const auto resettable = flags.at("resettable").get<std::uint32_t>();
     for (const auto &[scope, surface] : TypedSurface()) {
@@ -317,7 +317,7 @@ TEST(ResourceOptionsFixtureTest, GivenFixtureCatalogWhenComparingTypedSurfaceThe
     }
 }
 
-TEST(ResourceOptionsFixtureTest, GivenRawResetNamesWhenBuildingUpdatesThenShouldKeepThemBesideTypedResets) {
+TEST(ResourceOptionsFixtureTest, GivenRawResetNamesWhenBuildingUpdatesShouldKeepThemBesideTypedResets) {
     iggy::TopicUpdateOptions topic;
     topic.Reset(iggy::TopicOptionKey::MaxTopicSize).RawReset("future_key");
     EXPECT_EQ(topic.ResetKeys(), std::set<iggy::TopicOptionKey>{iggy::TopicOptionKey::MaxTopicSize});
@@ -331,7 +331,7 @@ TEST(ResourceOptionsFixtureTest, GivenRawResetNamesWhenBuildingUpdatesThenShould
     EXPECT_EQ(user.RawReset("future_key").RawResetKeys(), std::set<std::string>{"future_key"});
 }
 
-TEST(ResourceOptionsFixtureTest, GivenReadmeSampleWhenCompilingThenShouldMatchThePublicApi) {
+TEST(ResourceOptionsFixtureTest, GivenReadmeSampleWhenCompilingShouldMatchThePublicApi) {
     // Never invoked, it only has to compile, so the README sample cannot drift from the API.
     const auto sample = [](iggy::IggyBlockingClient &client, const std::function<std::string()> &LoadStreamKey) {
         const std::string key_base64 = LoadStreamKey();

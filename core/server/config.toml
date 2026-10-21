@@ -432,16 +432,25 @@ enabled = false
 # A stream created without encryption stays plaintext for life.
 key = ""
 
-# Retired server keys (list of strings), used only to unwrap stream keys during a key rotation.
-# At most two. Rotation runs in two phases:
+# Earlier server keys (list of strings) a key rotation still needs, at most two.
+# A node unwraps stream keys with them and wraps every new stream key under them too.
+# Rotation runs in two phases:
 # 1. Set `key` to the new key and `previous_keys` to the old one on every node. The metadata
-#    primary adds a wrap under the new key to every encrypted stream, old wraps stay readable.
+#    primary adds a wrap under the new key to every encrypted stream and keeps the old wraps,
+#    so nodes still on the old key keep serving and booting, new streams included.
 # 2. Once every node runs the phase 1 config and every encrypted stream reports the new
-#    key's fingerprint in `encryption_kek_fingerprint`, remove the old key from
-#    `previous_keys`. The primary drops the wraps under it.
+#    key's fingerprint in `encryption_kek_fingerprint`, empty `previous_keys` and put the
+#    old key's fingerprint in `retired_kek_fingerprints`. The primary drops the wraps under it.
 # Messages are never re-encrypted. Losing a key that still wraps a stream makes it unreadable.
 # As an environment variable: IGGY_ENCRYPTION_PREVIOUS_KEYS='["<old base64 key>"]', a single key may also be given bare.
 previous_keys = []
+
+# Fingerprints of retired server keys (list of strings), 16 lowercase hex characters each, as
+# `encryption_kek_fingerprint` reports them. The metadata primary drops stream key wraps under
+# these keys and never drops a wrap under a key that is not listed, even one this node lacks.
+# Needs `key`, and may not name `key` or a key in `previous_keys`. Not secret.
+# As an environment variable: IGGY_ENCRYPTION_RETIRED_KEK_FINGERPRINTS='["<fingerprint>"]'.
+retired_kek_fingerprints = []
 
 # Memory pool configuration
 [memory_pool]

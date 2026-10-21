@@ -95,6 +95,7 @@ runs:
       uses: ./.github/actions/utils/server-start
       with:
         bin: target/debug/iggy-server
+        encryption-enabled: "true"
         wait-timeout-seconds: "90"
 
     - name: E2E tests

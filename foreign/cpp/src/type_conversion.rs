@@ -1208,7 +1208,7 @@ mod tests {
     }
 
     #[test]
-    fn given_optional_bridge_fields_when_converting_then_should_preserve_presence() {
+    fn given_optional_bridge_fields_when_converting_should_preserve_presence() {
         let unnamed = RustStreamUpdateOptions::try_from(ffi::StreamUpdateOptions {
             has_name: false,
             name: "ignored".to_owned(),
@@ -1312,7 +1312,7 @@ mod tests {
     }
 
     #[test]
-    fn given_raw_reset_names_when_converting_then_should_leave_them_to_the_server() {
+    fn given_raw_reset_names_when_converting_should_leave_them_to_the_server() {
         let topic = RustTopicUpdateOptions::try_from(ffi::TopicUpdateOptions {
             has_name: false,
             name: String::new(),
@@ -1337,8 +1337,7 @@ mod tests {
     }
 
     #[test]
-    fn given_raw_entry_outside_codec_bounds_when_converting_then_should_keep_the_sdk_error_category()
-     {
+    fn given_raw_entry_outside_codec_bounds_when_converting_should_keep_the_sdk_error_category() {
         let entry = |key: &str, value: &str| ffi::HeaderEntry {
             key: ffi::HeaderField {
                 kind: RustHeaderKind::String.as_code(),
@@ -1372,7 +1371,7 @@ mod tests {
     }
 
     #[test]
-    fn given_stream_projection_when_converting_then_should_split_provenance() {
+    fn given_stream_projection_when_converting_should_split_provenance() {
         let mut options = ResourceOptions::new();
         options.insert(
             HeaderKey::from(OptionKey::EncryptionKeySource),

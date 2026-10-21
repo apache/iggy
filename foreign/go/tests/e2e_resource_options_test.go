@@ -34,7 +34,7 @@ import (
 )
 
 func TestE2E_StreamKeyProjection(t *testing.T) {
-	t.Run("given_stream_key_when_creating_then_should_read_matching_projection", func(t *testing.T) {
+	t.Run("given_stream_key_when_creating_should_read_matching_projection", func(t *testing.T) {
 		connected := connect(t)
 		ctx := context.Background()
 		key := randomStreamKey(t)
@@ -63,7 +63,7 @@ func TestE2E_StreamKeyProjection(t *testing.T) {
 }
 
 func TestE2E_KeylessStream(t *testing.T) {
-	t.Run("given_keyless_stream_when_reading_then_should_report_server_generated_key", func(t *testing.T) {
+	t.Run("given_keyless_stream_when_reading_should_report_server_generated_key", func(t *testing.T) {
 		connected := connect(t)
 		ctx := context.Background()
 
@@ -84,7 +84,7 @@ func TestE2E_KeylessStream(t *testing.T) {
 }
 
 func TestE2E_StreamRename(t *testing.T) {
-	t.Run("given_stream_rename_when_updating_then_should_preserve_encryption_projection", func(t *testing.T) {
+	t.Run("given_stream_rename_when_updating_should_preserve_encryption_projection", func(t *testing.T) {
 		connected := connect(t)
 		ctx := context.Background()
 		key := randomStreamKey(t)
@@ -131,7 +131,7 @@ func TestE2E_StreamRename(t *testing.T) {
 }
 
 func TestE2E_TopicReset(t *testing.T) {
-	t.Run("given_topic_reset_when_updating_then_should_preserve_unmentioned_values", func(t *testing.T) {
+	t.Run("given_topic_reset_when_updating_should_preserve_unmentioned_values", func(t *testing.T) {
 		connected := connect(t)
 		ctx := context.Background()
 		created, err := connected.CreateStream(ctx, uniqueName("topic-reset"), nil)
@@ -188,7 +188,7 @@ func TestE2E_TopicReset(t *testing.T) {
 }
 
 func TestE2E_UserOptions(t *testing.T) {
-	t.Run("given_user_options_when_creating_and_updating_then_should_preserve_user_behavior", func(t *testing.T) {
+	t.Run("given_user_options_when_creating_and_updating_should_preserve_user_behavior", func(t *testing.T) {
 		connected := connect(t)
 		ctx := context.Background()
 

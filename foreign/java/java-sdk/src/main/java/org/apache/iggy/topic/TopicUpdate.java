@@ -66,7 +66,11 @@ public record TopicUpdate(
         rawReset = Set.copyOf(rawReset);
         boolean typedOnly = raw.isEmpty() && rawReset.isEmpty();
         OptionKey.requireValidUpdate(
-                entries(name, messageExpiry, maxTopicSize, raw).keySet(), reset, rawReset, typedOnly);
+                entries(name, messageExpiry, maxTopicSize, raw).keySet(),
+                reset,
+                rawReset,
+                typedOnly,
+                EnumSet.allOf(TopicOptionKey.class));
         if (typedOnly) {
             name.ifPresent(value -> OptionKey.requireTextLength(
                     TopicOptionKey.NAME.value(), value, 1, MAX_NAME_LENGTH, IggyErrorCode.INVALID_TOPIC_NAME));
@@ -102,6 +106,13 @@ public record TopicUpdate(
     /** The names this update resets, typed and raw together in ascending order. */
     public List<String> resetKeys() {
         return OptionKey.resetNames(reset, rawReset);
+    }
+
+    /** Raw entries print by name only, because this build cannot tell which newer keys are secret. */
+    @Override
+    public String toString() {
+        return "TopicUpdate[name=" + name + ", messageExpiry=" + messageExpiry + ", maxTopicSize=" + maxTopicSize
+                + ", reset=" + reset + ", raw=" + raw.keySet() + ", rawReset=" + rawReset + "]";
     }
 
     private static Set<TopicOptionKey> copyOf(Set<TopicOptionKey> keys) {

@@ -54,11 +54,11 @@ inputs:
     required: false
     default: ""
   encryption-enabled:
-    description: "Start the server with encryption enabled, which the SDK stream key tests need"
+    description: "Give streams created without their own key a generated key, which the SDK server-generated key tests need"
     required: false
-    default: "true"
+    default: "false"
   encryption-key:
-    description: "Server encryption key (base64 of 32 bytes), a fixed test key shared with the BDD server"
+    description: "Server encryption key (base64 of 32 bytes), a fixed test key shared with the BDD server. Set even with encryption disabled, so streams created with their own key work. Empty starts without a key."
     required: false
     default: "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE="
 outputs:
@@ -124,10 +124,12 @@ runs:
         export IGGY_HTTP_ADDRESS="${{ inputs.http_address }}"
         export IGGY_ROOT_USERNAME="iggy"
         export IGGY_ROOT_PASSWORD="iggy"
+        if [[ -n "${{ inputs.encryption-key }}" ]]; then
+          export IGGY_ENCRYPTION_KEY="${{ inputs.encryption-key }}"
+        fi
         if [[ "${{ inputs.encryption-enabled }}" == "true" ]]; then
           [[ -n "${{ inputs.encryption-key }}" ]] || { echo "::error::encryption-enabled requires encryption-key"; exit 1; }
           export IGGY_ENCRYPTION_ENABLED="true"
-          export IGGY_ENCRYPTION_KEY="${{ inputs.encryption-key }}"
         fi
         CLI_ARGS=()
         if [[ -n "${{ inputs.replica-id }}" ]]; then

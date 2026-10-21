@@ -996,23 +996,7 @@ pub fn resource_options_to_wire(
     if entries.is_empty() {
         return Ok(WireOptions::empty());
     }
-    if entries.len() > MAX_OPTIONS as usize {
-        return Err(IggyError::OptionsBlockTooLarge(format!(
-            "{} entries, maximum {MAX_OPTIONS}",
-            entries.len()
-        )));
-    }
-    let size: usize = entries
-        .iter()
-        .map(|(key, option)| {
-            OPTION_ENTRY_OVERHEAD + key.as_bytes().len() + option.value.as_bytes().len()
-        })
-        .sum();
-    if size > MAX_OPTIONS_BYTES {
-        return Err(IggyError::OptionsBlockTooLarge(format!(
-            "{size} bytes, maximum {MAX_OPTIONS_BYTES}"
-        )));
-    }
+    let size = options_block_size(entries.iter().copied())?;
     let mut buf = BytesMut::with_capacity(size);
     for (key, option) in entries {
         // A non-string key would encode a block the receiving peer refuses,
@@ -1038,6 +1022,35 @@ pub fn resource_options_to_wire(
     // and the loop above asserts they are string-kinded. The caps cover what
     // construction cannot.
     Ok(WireOptions::from_validated(buf.freeze()))
+}
+
+/// The encoded size of an options block holding `entries`, without encoding
+/// it.
+///
+/// # Errors
+///
+/// Returns `IggyError::OptionsBlockTooLarge` when the entries exceed
+/// `MAX_OPTIONS` or `MAX_OPTIONS_BYTES`.
+pub(crate) fn options_block_size<'a>(
+    entries: impl Iterator<Item = (&'a HeaderKey, &'a OptionValue)>,
+) -> Result<usize, IggyError> {
+    let (count, size) = entries.fold((0usize, 0usize), |(count, size), (key, option)| {
+        (
+            count + 1,
+            size + OPTION_ENTRY_OVERHEAD + key.as_bytes().len() + option.value.as_bytes().len(),
+        )
+    });
+    if count > MAX_OPTIONS as usize {
+        return Err(IggyError::OptionsBlockTooLarge(format!(
+            "{count} entries, maximum {MAX_OPTIONS}"
+        )));
+    }
+    if size > MAX_OPTIONS_BYTES {
+        return Err(IggyError::OptionsBlockTooLarge(format!(
+            "{size} bytes, maximum {MAX_OPTIONS_BYTES}"
+        )));
+    }
+    Ok(size)
 }
 
 #[cfg(test)]

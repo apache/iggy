@@ -15,9 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using System.Text.Json.Serialization;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Headers;
 using Apache.Iggy.IggyClient;
+using Apache.Iggy.JsonConverters;
 using Apache.Iggy.Utils;
 
 namespace Apache.Iggy.Contracts;
@@ -90,6 +92,7 @@ public sealed class TopicOptions
     ///     property above wins on collision, and the server refuses a key outside its catalog by name. A raw
     ///     durability is kept unless the matching property asks for persisted durability.
     /// </summary>
+    [JsonConverter(typeof(RedactedOptionsConverter))]
     public IReadOnlyDictionary<string, HeaderValue>? Options { get; init; }
 
     /// <summary>

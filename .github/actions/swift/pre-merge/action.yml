@@ -124,6 +124,7 @@ runs:
       uses: ./.github/actions/utils/server-start
       with:
         bin: target/debug/iggy-server
+        encryption-enabled: "true"
         replica-id: "0"
         pid-file: ${{ runner.temp }}/iggy-swift-e2e.pid
         log-file: ${{ runner.temp }}/iggy-swift-e2e.log
@@ -156,6 +157,7 @@ runs:
       uses: ./.github/actions/utils/server-start
       with:
         bin: target/debug/iggy-server
+        encryption-enabled: "true"
         replica-id: "0"
         pid-file: ${{ runner.temp }}/iggy-swift-e2e-tls.pid
         log-file: ${{ runner.temp }}/iggy-swift-e2e-tls.log
@@ -197,6 +199,7 @@ runs:
       uses: ./.github/actions/utils/server-start
       with:
         bin: target/debug/iggy-server
+        encryption-enabled: "true"
         replica-id: "0"
         pid-file: ${{ runner.temp }}/iggy-swift-cluster-0.pid
         log-file: ${{ runner.temp }}/iggy-swift-cluster-0.log
@@ -211,6 +214,7 @@ runs:
       uses: ./.github/actions/utils/server-start
       with:
         bin: target/debug/iggy-server
+        encryption-enabled: "true"
         replica-id: "1"
         tcp_address: 127.0.0.1:8091
         http_address: 127.0.0.1:3001

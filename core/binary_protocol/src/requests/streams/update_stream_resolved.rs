@@ -80,7 +80,7 @@ mod tests {
     use crate::primitives::user_headers::encode_user_headers;
 
     #[test]
-    fn given_resolved_patch_when_roundtripping_then_should_preserve_columns_and_provenance() {
+    fn given_resolved_patch_when_roundtripping_should_preserve_columns_and_provenance() {
         for name in [None, Some(WireName::new("renamed").unwrap())] {
             let request = UpdateStreamResolvedRequest {
                 stream_id: WireIdentifier::named("events").unwrap(),

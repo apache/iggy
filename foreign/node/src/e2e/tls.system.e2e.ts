@@ -18,11 +18,12 @@
 // TLS integration tests for the Node.js SDK.
 //
 // These tests require a TLS-enabled Iggy server with an encryption key and are
-// skipped by default. To run them locally:
+// skipped by default. Encryption stays disabled, the shipped default, so a
+// stream created without a key is plaintext. To run them locally:
 //
 //   1. Start the server with TLS:
 //        IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy \
-//        IGGY_ENCRYPTION_ENABLED=true IGGY_ENCRYPTION_KEY=<base64 of 32 bytes> \
+//        IGGY_ENCRYPTION_KEY=<base64 of 32 bytes> \
 //        IGGY_TCP_TLS_ENABLED=true \
 //        IGGY_TCP_TLS_CERT_FILE=core/certs/iggy_cert.pem \
 //        IGGY_TCP_TLS_KEY_FILE=core/certs/iggy_key.pem \
@@ -39,7 +40,7 @@ import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { Client } from '../client/client.js';
 import type { TlsOption } from '../client/client.type.js';
-import { Partitioning, Consumer, PollingStrategy } from '../wire/index.js';
+import { Partitioning, Consumer, EncryptionKeySource, PollingStrategy } from '../wire/index.js';
 import { getIggyAddress } from '../tcp.sm.utils.js';
 import { describeResourceOptions } from './resource-options.suite.js';
 
@@ -70,7 +71,7 @@ const getTlsClient = (credentials = { username: 'iggy', password: 'iggy' }) => {
 };
 
 describeResourceOptions(
-  'e2e -> tls resource options', 'tls-e2e-ro', getTlsClient,
+  'e2e -> tls resource options', 'tls-e2e-ro', getTlsClient, EncryptionKeySource.None,
   !tlsEnabled && 'IGGY_TCP_TLS_ENABLED is not set'
 );
 

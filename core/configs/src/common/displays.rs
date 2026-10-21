@@ -128,9 +128,10 @@ impl Display for EncryptionConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ enabled: {}, previous_keys: {} }}",
+            "{{ enabled: {}, previous_keys: {}, retired_kek_fingerprints: {:?} }}",
             self.enabled,
-            self.previous_keys.len()
+            self.previous_keys.len(),
+            self.retired_kek_fingerprints
         )
     }
 }
@@ -141,6 +142,7 @@ impl Debug for EncryptionConfig {
             .field("enabled", &self.enabled)
             .field("key_set", &!self.key.is_empty())
             .field("previous_keys", &self.previous_keys.len())
+            .field("retired_kek_fingerprints", &self.retired_kek_fingerprints)
             .finish()
     }
 }

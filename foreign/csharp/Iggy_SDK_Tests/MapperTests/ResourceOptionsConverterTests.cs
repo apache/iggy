@@ -76,7 +76,7 @@ public sealed class ResourceOptionsConverterTests
     }
 
     [Fact]
-    public void given_uint64_http_option_when_reading_then_should_keep_kind()
+    public void given_uint64_http_option_when_reading_should_keep_kind()
     {
         const string json = """
                             {

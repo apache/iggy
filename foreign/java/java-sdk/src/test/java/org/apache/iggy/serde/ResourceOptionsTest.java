@@ -62,6 +62,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.stream.IntStream;
 
 import static org.apache.iggy.ResourceOptionsFixture.bytes;
 import static org.apache.iggy.ResourceOptionsFixture.hex;
@@ -76,6 +77,7 @@ import static org.apache.iggy.ResourceOptionsFixture.userId;
 import static org.apache.iggy.ResourceOptionsFixture.userUpdate;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.SoftAssertions.assertSoftly;
 
 /**
  * The shared resource options vectors against this SDK's own encoder and decoder.
@@ -86,7 +88,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class ResourceOptionsTest {
 
     @Test
-    void givenSharedVectorsWhenEncodingThenShouldMatchServerContract() {
+    void givenSharedVectorsWhenEncodingShouldMatchServerContract() {
         for (JsonNode vector : section("update_resource")) {
             String name = vector.get("case").asString();
             assertThat(hex(encodeUpdate(vector)))
@@ -145,7 +147,7 @@ class ResourceOptionsTest {
     }
 
     @Test
-    void givenSharedVectorsWhenSplittingUpdatesThenShouldMatchWireSetAndReset() {
+    void givenSharedVectorsWhenSplittingUpdatesShouldMatchWireSetAndReset() {
         for (JsonNode vector : section("update_resource")) {
             JsonNode input = vector.get("input");
             var expectedSet = optionMap(vector.get("wire_set"), true);
@@ -170,7 +172,7 @@ class ResourceOptionsTest {
     }
 
     @Test
-    void givenSharedUpdateErrorsWhenBuildingThenShouldRefuseWithServerCategoryBeforeSending() {
+    void givenSharedUpdateErrorsWhenBuildingShouldRefuseWithServerCategoryBeforeSending() {
         for (JsonNode vector : section("update_resource_errors")) {
             JsonNode error = vector.get("error");
             if (namesKeyWithoutConstant(vector)) {
@@ -192,7 +194,7 @@ class ResourceOptionsTest {
     }
 
     @Test
-    void givenValuesTheServerRefusesWhenBuildingThenShouldReportTheServerCode() {
+    void givenValuesTheServerRefusesWhenBuildingShouldReportTheServerCode() {
         assertRefusal(() -> TopicUpdate.builder().name("").build(), IggyErrorCode.INVALID_TOPIC_NAME);
         assertRefusal(() -> StreamUpdate.builder().name("n".repeat(256)).build(), IggyErrorCode.INVALID_STREAM_NAME);
         assertRefusal(() -> UserUpdate.builder().username("ab").build(), IggyErrorCode.INVALID_USERNAME);
@@ -209,7 +211,7 @@ class ResourceOptionsTest {
     }
 
     @Test
-    void givenRawResetWhenBuildingUpdateThenShouldSendItForTheServerToDecide() {
+    void givenRawResetWhenBuildingUpdateShouldSendItForTheServerToDecide() {
         assertThat(UserUpdate.builder().rawReset("critical_keys").build().resetKeys())
                 .containsExactly("critical_keys");
         TopicUpdate topic = TopicUpdate.builder()
@@ -231,7 +233,86 @@ class ResourceOptionsTest {
     }
 
     @Test
-    void givenSharedResponsesWhenDecodingThenShouldMatchProjection() {
+    void givenMoreResetNamesThanTheCountByteCarriesWhenBuildingShouldRefuseAnUnsupportedKey() {
+        StreamUpdate.Builder atLimit = StreamUpdate.builder();
+        futureKeys(255).forEach(atLimit::rawReset);
+        ByteBuf payload = BytesSerializer.toUpdateResource(StreamId.of(1L), atLimit.build());
+        try {
+            int resetCountIndex = 1 + 6;
+            assertThat(payload.getUnsignedByte(resetCountIndex)).isEqualTo((short) 255);
+        } finally {
+            payload.release();
+        }
+
+        TopicUpdate.Builder overLimit =
+                TopicUpdate.builder().reset(TopicOptionKey.MESSAGE_EXPIRY).rawReset("compression_algorithm");
+        futureKeys(255).forEach(overLimit::rawReset);
+        assertThatThrownBy(overLimit::build).isInstanceOfSatisfying(IggyValidationException.class, refusal -> {
+            assertThat(refusal.getErrorCode()).isEqualTo(IggyErrorCode.UNSUPPORTED_OPTION_KEY);
+            assertThat(refusal.getField()).contains("future_000");
+        });
+
+        UserUpdate.Builder rawOnly = UserUpdate.builder();
+        futureKeys(256).forEach(rawOnly::rawReset);
+        assertRefusal(rawOnly::build, IggyErrorCode.UNSUPPORTED_OPTION_KEY);
+    }
+
+    @Test
+    void givenResetNameTheWireCannotCarryWhenBuildingShouldRefuseAnUnsupportedKey() {
+        String longest = "é".repeat(127) + "k";
+        ByteBuf payload = BytesSerializer.toUpdateResource(
+                StreamId.of(1L), StreamUpdate.builder().rawReset(longest).build());
+        payload.release();
+        for (String name : List.of("", "é".repeat(128))) {
+            assertThatThrownBy(() -> UserUpdate.builder().rawReset(name).build())
+                    .isInstanceOfSatisfying(IggyValidationException.class, refusal -> {
+                        assertThat(refusal.getErrorCode()).isEqualTo(IggyErrorCode.UNSUPPORTED_OPTION_KEY);
+                        assertThat(refusal.getField()).contains(name);
+                    });
+        }
+    }
+
+    @Test
+    void givenRawSecretEntriesWhenPrintingOptionsShouldShowNamesWithoutValues() {
+        JsonNode key = section("stream_key");
+        String keyHex = key.get("key_hex").asString();
+        String keyBase64 = key.get("key_base64").asString();
+        HeaderValue rawKey = HeaderValue.fromRaw(bytes(keyHex));
+        HeaderValue keyText = HeaderValue.fromString(keyBase64);
+        List<Object> printed = List.of(
+                StreamOptions.builder()
+                        .raw("encryption_key", rawKey)
+                        .raw("future_secret", keyText)
+                        .build(),
+                StreamUpdate.builder()
+                        .raw("encryption_key", rawKey)
+                        .raw("future_secret", keyText)
+                        .build(),
+                TopicOptions.builder()
+                        .raw("encryption_key", rawKey)
+                        .raw("future_secret", keyText)
+                        .build(),
+                TopicUpdate.builder()
+                        .raw("encryption_key", rawKey)
+                        .raw("future_secret", keyText)
+                        .build(),
+                UserOptions.builder()
+                        .raw("encryption_key", rawKey)
+                        .raw("future_secret", keyText)
+                        .build(),
+                UserUpdate.builder()
+                        .raw("encryption_key", rawKey)
+                        .raw("future_secret", keyText)
+                        .build());
+        assertSoftly(softly -> printed.forEach(options -> softly.assertThat(options.toString())
+                .as(options.getClass().getSimpleName())
+                .contains("encryption_key", "future_secret")
+                .doesNotContain(keyHex)
+                .doesNotContain(keyBase64)));
+    }
+
+    @Test
+    void givenSharedResponsesWhenDecodingShouldMatchProjection() {
         for (JsonNode vector : section("stream_responses")) {
             JsonNode expected = vector.get("expected");
             StreamDetails stream = BytesDeserializer.readStreamDetails(responseOf(vector));
@@ -305,7 +386,7 @@ class ResourceOptionsTest {
     }
 
     @Test
-    void givenDescribeVectorsWhenDecodingThenShouldReportKindsDefaultsAndFlags() {
+    void givenDescribeVectorsWhenDecodingShouldReportKindsDefaultsAndFlags() {
         for (JsonNode vector : section("describe_options")) {
             String scope = vector.get("scope").asString();
             OptionsScope optionsScope =
@@ -337,14 +418,14 @@ class ResourceOptionsTest {
     }
 
     @Test
-    void givenLiveCatalogWhenComparingKeyEnumsThenShouldMatchKeysAndFlags() {
+    void givenLiveCatalogWhenComparingKeyEnumsShouldMatchKeysAndFlags() {
         assertThat(catalogKeys("stream")).isEqualTo(enumKeys(StreamOptionKey.values()));
         assertThat(catalogKeys("topic")).isEqualTo(enumKeys(TopicOptionKey.values()));
         assertThat(catalogKeys("user")).isEqualTo(enumKeys(UserOptionKey.values()));
     }
 
     @Test
-    void givenFixtureCatalogWhenComparingTypedSurfaceThenShouldExposeEveryKey() {
+    void givenFixtureCatalogWhenComparingTypedSurfaceShouldExposeEveryKey() {
         Map<String, List<Class<?>>> create = Map.of(
                 "stream", List.of(StreamOptions.Builder.class),
                 "topic", List.of(TopicOptions.Builder.class),
@@ -386,7 +467,7 @@ class ResourceOptionsTest {
     }
 
     @Test
-    void givenFixtureConstantsWhenMirroringThenShouldMatchCodesKindsAndFlags() {
+    void givenFixtureConstantsWhenMirroringShouldMatchCodesKindsAndFlags() {
         JsonNode constants = section("constants");
         JsonNode codes = constants.get("command_codes");
         assertThat(CommandCode.System.UPDATE_RESOURCE.getValue())
@@ -432,7 +513,7 @@ class ResourceOptionsTest {
     }
 
     @Test
-    void givenFixedKeyWhenFingerprintingThenShouldMatchFixture() {
+    void givenFixedKeyWhenFingerprintingShouldMatchFixture() {
         JsonNode key = section("stream_key");
         String expected = key.get("fingerprint").asString();
 
@@ -444,7 +525,7 @@ class ResourceOptionsTest {
     }
 
     @Test
-    void givenInvalidKeyWhenEncodingThenShouldRejectBeforeNetworkIo() {
+    void givenInvalidKeyWhenEncodingShouldRejectBeforeNetworkIo() {
         for (JsonNode vector : section("stream_key").get("invalid_keys")) {
             JsonNode input = vector.get("input");
             assertThat(vector.get("error").get("code").asInt())
@@ -520,6 +601,12 @@ class ResourceOptionsTest {
             }
         }
         return false;
+    }
+
+    private static List<String> futureKeys(int count) {
+        return IntStream.range(0, count)
+                .mapToObj(index -> String.format(Locale.ROOT, "future_%03d", index))
+                .toList();
     }
 
     private static void assertRefusal(ThrowingCallable build, IggyErrorCode expected) {

@@ -36,7 +36,7 @@ const UNBUILT_MARKER: &str = "cannot be built, its key does not open on this nod
     cluster_nodes = 3,
     server(encryption = "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=")
 )]
-async fn given_encrypted_streams_when_primary_fails_then_should_read_after_failover(
+async fn given_encrypted_streams_when_primary_fails_should_read_after_failover(
     harness: &mut TestHarness,
 ) {
     let client = harness.root_client_for_node(0).await.unwrap();
@@ -68,7 +68,7 @@ async fn given_encrypted_streams_when_primary_fails_then_should_read_after_failo
     cluster_nodes = 3,
     server(encryption = "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=")
 )]
-async fn given_empty_replacement_node_when_state_transferring_then_should_unwrap_stream_keys_before_serving(
+async fn given_empty_replacement_node_when_state_transferring_should_unwrap_stream_keys_before_serving(
     harness: &mut TestHarness,
 ) {
     let client = harness.root_client_for_node(0).await.unwrap();
@@ -119,7 +119,7 @@ async fn given_empty_replacement_node_when_state_transferring_then_should_unwrap
     cluster_nodes = 3,
     server(encryption = "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=")
 )]
-async fn given_cluster_when_reading_encrypted_streams_then_should_report_same_projection_on_every_node(
+async fn given_cluster_when_reading_encrypted_streams_should_report_same_projection_on_every_node(
     harness: &mut TestHarness,
 ) {
     let client = harness.root_client_for_node(0).await.unwrap();
@@ -137,10 +137,7 @@ async fn given_cluster_when_reading_encrypted_streams_then_should_report_same_pr
             .unwrap();
         created.push(projection(&details.options));
     }
-    let kek = ServerKeyContext::from_config(CONFIG_KEY, &[], true)
-        .unwrap()
-        .kek_fingerprint()
-        .unwrap();
+    let kek = kek_fingerprint(CONFIG_KEY);
     for node in 0..harness.cluster_size() {
         let client = harness.root_client_for_node(node).await.unwrap();
         for ((name, _), created) in STREAMS.iter().zip(&created) {
@@ -161,6 +158,143 @@ async fn given_cluster_when_reading_encrypted_streams_then_should_report_same_pr
             );
             assert_eq!(details.encryption_kek_fingerprints(), vec![kek.clone()]);
         }
+    }
+}
+
+#[iggy_harness(
+    cluster_nodes = 3,
+    server(encryption = "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=")
+)]
+async fn given_replica_that_missed_a_rotation_when_booting_with_the_new_key_should_serve_after_catching_up(
+    harness: &mut TestHarness,
+) {
+    let client = harness.root_client_for_node(0).await.unwrap();
+    seed_streams(&client, "before-rotation").await;
+    drop(client);
+    harness.stop_node(2).expect("stop node 2");
+    for node in [0, 1] {
+        harness
+            .node_mut(node)
+            .add_env("IGGY_ENCRYPTION_KEY", OTHER_CONFIG_KEY);
+        harness.node_mut(node).add_env(
+            "IGGY_ENCRYPTION_PREVIOUS_KEYS",
+            format!("[\"{CONFIG_KEY}\"]"),
+        );
+        harness.restart_node(node).expect("phase one restart");
+    }
+    let mut rotated = [
+        kek_fingerprint(CONFIG_KEY),
+        kek_fingerprint(OTHER_CONFIG_KEY),
+    ];
+    rotated.sort();
+    let deadline = Instant::now() + CONVERGE_TIMEOUT;
+    loop {
+        if let Some(client) = connect_any(harness, &[0, 1]).await
+            && streams_report_kek_fingerprints(&client, &rotated).await
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the rotated nodes never added the new wraps"
+        );
+        sleep(POLL_INTERVAL).await;
+    }
+
+    // Node 2's own metadata still holds only the old wraps, which its new key
+    // cannot open until catch-up applies the rewrap.
+    harness
+        .node_mut(2)
+        .add_env("IGGY_ENCRYPTION_KEY", OTHER_CONFIG_KEY);
+    harness
+        .restart_node(2)
+        .expect("a replica behind the rotation boots and catches up");
+    // With node 1 down, quorum needs node 2, so a send commits only once node 2
+    // opened each stream's key under the new wraps and built its partitions.
+    harness.stop_node(1).expect("stop node 1");
+    let deadline = Instant::now() + CONVERGE_TIMEOUT;
+    loop {
+        if let Some(client) = connect_any(harness, &[2, 0]).await
+            && send_to_all_streams(&client, "after-rotation").await
+            && all_streams_poll(&client, "after-rotation").await
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the replica behind the rotation never served the encrypted streams"
+        );
+        sleep(POLL_INTERVAL).await;
+    }
+}
+
+#[iggy_harness(
+    cluster_nodes = 3,
+    server(encryption = "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=")
+)]
+async fn given_encrypted_streams_when_replica_restarts_without_a_key_should_refuse_boot(
+    harness: &mut TestHarness,
+) {
+    let client = harness.root_client_for_node(0).await.unwrap();
+    seed_streams(&client, "before-keyless-restart").await;
+    drop(client);
+    let deadline = Instant::now() + CONVERGE_TIMEOUT;
+    loop {
+        if let Some(client) = connect_any(harness, &[2]).await
+            && streams_report_kek_fingerprints(&client, &[kek_fingerprint(CONFIG_KEY)]).await
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "node 2 never applied the encrypted streams"
+        );
+        sleep(POLL_INTERVAL).await;
+    }
+
+    // Catch-up never commits a wrap that opens without a key, so a cluster
+    // replica refuses like a standalone server.
+    harness
+        .node_mut(2)
+        .add_env("IGGY_ENCRYPTION_ENABLED", "false");
+    harness.node_mut(2).add_env("IGGY_ENCRYPTION_KEY", "");
+    let error = harness
+        .restart_node(2)
+        .expect_err("a replica without a key must refuse boot over encrypted streams");
+    if stderr_is_captured() {
+        let diagnostics = error.to_string();
+        let refusal = format!("[{}], this node holds []", kek_fingerprint(CONFIG_KEY));
+        assert!(
+            diagnostics.contains(&refusal),
+            "the refusal must name the stored and the empty node fingerprints, got: {diagnostics}"
+        );
+    }
+
+    harness
+        .node_mut(2)
+        .add_env("IGGY_ENCRYPTION_ENABLED", "true");
+    harness
+        .node_mut(2)
+        .add_env("IGGY_ENCRYPTION_KEY", CONFIG_KEY);
+    harness
+        .restart_node(2)
+        .expect("node 2 boots again under its key");
+    // With node 1 down, quorum needs node 2, so a send commits only once node 2
+    // serves the encrypted streams again.
+    harness.stop_node(1).expect("stop node 1");
+    let deadline = Instant::now() + CONVERGE_TIMEOUT;
+    loop {
+        if let Some(client) = connect_any(harness, &[2, 0]).await
+            && send_to_all_streams(&client, "after-keyless-restart").await
+            && all_streams_poll(&client, "after-keyless-restart").await
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "node 2 never served the encrypted streams under its key"
+        );
+        sleep(POLL_INTERVAL).await;
     }
 }
 
@@ -246,6 +380,18 @@ async fn all_streams_poll(client: &IggyClient, payload_tag: &str) -> bool {
     true
 }
 
+async fn streams_report_kek_fingerprints(client: &IggyClient, expected: &[String]) -> bool {
+    for (name, _) in STREAMS {
+        let Ok(Some(details)) = client.get_stream(&Identifier::named(name).unwrap()).await else {
+            return false;
+        };
+        if details.encryption_kek_fingerprints() != expected {
+            return false;
+        }
+    }
+    true
+}
+
 async fn connect_any(harness: &TestHarness, nodes: &[usize]) -> Option<IggyClient> {
     for &node in nodes {
         if let Ok(builder) = harness.node(node).tcp_client()
@@ -275,10 +421,21 @@ fn projection(options: &ResourceOptions) -> Vec<(String, Option<String>)> {
     .collect()
 }
 
+fn kek_fingerprint(key: &str) -> String {
+    ServerKeyContext::from_config(key, &[], true)
+        .unwrap()
+        .kek_fingerprint()
+        .unwrap()
+}
+
 fn stream_key(seed: u8) -> StreamEncryptionKey {
     StreamEncryptionKey::try_from([seed; 32].as_slice()).unwrap()
 }
 
 fn payload(stream: &str, tag: &str) -> String {
     format!("{tag}-{stream}")
+}
+
+fn stderr_is_captured() -> bool {
+    std::env::var("IGGY_TEST_VERBOSE").is_err()
 }

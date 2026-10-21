@@ -105,7 +105,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn given_resolved_patch_when_roundtripping_then_should_preserve_columns_and_provenance() {
+    fn given_resolved_patch_when_roundtripping_should_preserve_columns_and_provenance() {
         for (username, status) in [
             (None, None),
             (Some(WireName::new("alice2").unwrap()), None),

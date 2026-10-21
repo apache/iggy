@@ -2602,7 +2602,7 @@ mod tests {
     }
 
     #[compio::test]
-    async fn given_decrypt_failure_when_building_poll_reply_then_should_return_rejected_error() {
+    async fn given_decrypt_failure_when_building_poll_reply_should_return_rejected_error() {
         let bus = SpyBus::default();
         let encryptor = Arc::new(EncryptorKind::Aes256Gcm(
             Aes256GcmEncryptor::new(&[7; 32]).expect("valid key"),

@@ -16,7 +16,7 @@
 // under the License.
 
 use iggy_common::{EncryptorKind, IggyError, ServerKeyContext, StreamEncryption};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
@@ -76,10 +76,14 @@ impl StreamKeyring {
         Ok(Some(encryptor))
     }
 
-    /// Drop the encryptors of streams that no longer exist.
-    pub fn retain(&mut self, live: &BTreeSet<StreamKeyIdentity>) {
-        self.encryptors
-            .retain(|identity, _| live.contains(identity));
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.encryptors.is_empty()
+    }
+
+    /// Drop the encryptors of the stream incarnations `is_live` rejects.
+    pub fn retain(&mut self, mut is_live: impl FnMut(StreamKeyIdentity) -> bool) {
+        self.encryptors.retain(|identity, _| is_live(*identity));
     }
 }
 
@@ -102,7 +106,7 @@ mod tests {
     const OTHER_CONFIG_KEY: &str = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=";
 
     #[test]
-    fn given_reused_stream_id_when_resolving_then_should_never_use_previous_key() {
+    fn given_reused_stream_id_when_resolving_should_never_use_previous_key() {
         let context = context(CONFIG_KEY);
         let mut keyring = StreamKeyring::new(Arc::clone(&context));
         let old = StreamKeyIdentity {
@@ -124,7 +128,7 @@ mod tests {
 
         let ciphertext = old_encryptor.encrypt(b"payload").expect("encrypts");
         assert!(new_encryptor.decrypt(&ciphertext).is_err());
-        keyring.retain(&BTreeSet::from([recreated]));
+        keyring.retain(|identity| identity == recreated);
         assert_eq!(keyring.encryptors.len(), 1);
         let again = keyring
             .resolve(recreated, &wrapped(&context, 2))
@@ -134,7 +138,7 @@ mod tests {
     }
 
     #[test]
-    fn given_plaintext_and_wrapped_streams_when_resolving_then_should_never_fall_back() {
+    fn given_plaintext_and_wrapped_streams_when_resolving_should_never_fall_back() {
         let context = context(CONFIG_KEY);
         let mut keyring = StreamKeyring::new(context);
         let identity = StreamKeyIdentity {

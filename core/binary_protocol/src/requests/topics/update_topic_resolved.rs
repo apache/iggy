@@ -86,7 +86,7 @@ mod tests {
     use crate::primitives::user_headers::encode_user_headers;
 
     #[test]
-    fn given_resolved_patch_when_roundtripping_then_should_preserve_columns_and_provenance() {
+    fn given_resolved_patch_when_roundtripping_should_preserve_columns_and_provenance() {
         let request = UpdateTopicResolvedRequest {
             stream_id: WireIdentifier::numeric(1),
             topic_id: WireIdentifier::named("orders").unwrap(),

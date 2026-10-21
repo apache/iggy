@@ -270,7 +270,7 @@ public sealed class VsrMultiplexingTests
     [InlineData((byte)VsrOperation.UpdateTopicResolved, false)]
     [InlineData((byte)VsrOperation.UpdateUserResolved, false)]
     [InlineData((byte)VsrOperation.UpdateUserResolved, true)]
-    public async Task given_resolved_update_reply_when_correlating_then_should_accept_only_matching_request_identity(
+    public async Task given_resolved_update_reply_when_correlating_should_accept_only_matching_request_identity(
         byte resolved, bool wrongChecksum)
     {
         const ulong RequestStamp = 11;

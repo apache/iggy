@@ -73,11 +73,14 @@ use iggy_binary_protocol::{
     ReplyHeader, RoutedRequestHeader, WireDecode, WireEncode, WireIdentifier, WireName, WireOptions,
 };
 use iggy_common::wire_conversions::{describe_options_response, resource_options_to_wire_split};
-use iggy_common::{IggyError, IggyTimestamp, OptionsScope, ResourceOptions, public_options};
+use iggy_common::{
+    IggyError, IggyTimestamp, OptionsScope, ResourceOptions, UserStatus, public_options,
+};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use metadata::impls::metadata::StreamsFrontend;
-use metadata::stm::stream::{Stream, StreamsInner};
+use metadata::stm::stream::{Stream, StreamsInner, Topic};
+use metadata::stm::user::User;
 use server_common::Message;
 use shard::ConnectedClientInfo;
 use std::cell::RefCell;
@@ -85,6 +88,69 @@ use std::net::IpAddr;
 use std::rc::Rc;
 use std::sync::Arc;
 use tracing::warn;
+
+/// The stored fields a stream or topic read returns. Reads copy them under the
+/// metadata read guard and project the options after it, because the writer
+/// publishing the next apply waits for every reader to leave.
+struct StoredEntry {
+    id: usize,
+    created_at: IggyTimestamp,
+    /// Topics of a stream, partitions of a topic.
+    children_count: usize,
+    size_bytes: u64,
+    messages_count: u64,
+    name: Arc<str>,
+    options: ResourceOptions,
+}
+
+/// The stored fields a user read returns, copied like [`StoredEntry`].
+struct StoredUser {
+    id: u32,
+    created_at: IggyTimestamp,
+    status: UserStatus,
+    username: Arc<str>,
+    options: ResourceOptions,
+}
+
+impl From<&Stream> for StoredEntry {
+    fn from(stream: &Stream) -> Self {
+        Self {
+            id: stream.id,
+            created_at: stream.created_at,
+            children_count: stream.topics.len(),
+            size_bytes: stream.stats.size_bytes_inconsistent(),
+            messages_count: stream.stats.messages_count_inconsistent(),
+            name: Arc::clone(&stream.name),
+            options: stream.options.clone(),
+        }
+    }
+}
+
+impl From<&Topic> for StoredEntry {
+    fn from(topic: &Topic) -> Self {
+        Self {
+            id: topic.id,
+            created_at: topic.created_at,
+            children_count: topic.partitions.len(),
+            size_bytes: topic.stats.size_bytes_inconsistent(),
+            messages_count: topic.stats.messages_count_inconsistent(),
+            name: Arc::clone(&topic.name),
+            options: topic.options.clone(),
+        }
+    }
+}
+
+impl From<&User> for StoredUser {
+    fn from(user: &User) -> Self {
+        Self {
+            id: user.id,
+            created_at: user.created_at,
+            status: user.status,
+            username: Arc::clone(&user.username),
+            options: user.options.clone(),
+        }
+    }
+}
 
 /// Build the `get_me` reply for the requesting connection. Identity
 /// (`user_id`, transport kind, peer address) comes from the per-shard
@@ -562,19 +628,29 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    shard.plane.metadata().mux_stm.streams().read(|streams| {
-        let Some(stream_id) = streams.resolve_stream_id(stream_id) else {
-            return Ok(None);
-        };
-        let stream = streams
-            .items
-            .get(stream_id)
-            .ok_or(IggyError::InvalidIdentifier)?;
-        Ok(Some(GetStreamResponse {
-            stream: stream_response(stream)?,
-            topics: listed_topics(stream)?,
-        }))
-    })
+    let stored =
+        shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .read(|streams| -> Result<_, IggyError> {
+                let Some(stream_id) = streams.resolve_stream_id(stream_id) else {
+                    return Ok(None);
+                };
+                let stream = streams
+                    .items
+                    .get(stream_id)
+                    .ok_or(IggyError::InvalidIdentifier)?;
+                Ok(Some((StoredEntry::from(stream), stored_topics(stream))))
+            })?;
+    let Some((stream, topics)) = stored else {
+        return Ok(None);
+    };
+    Ok(Some(GetStreamResponse {
+        stream: stream_response(&stream)?,
+        topics: listed_topics(stream.id, &topics)?,
+    }))
 }
 
 fn build_get_streams_response<B, MJ, S, SB>(
@@ -587,20 +663,36 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    shard
+    let streams = shard
         .plane
         .metadata()
         .mux_stm
         .streams()
-        .read(|streams| listed_streams(streams).map(|streams| GetStreamsResponse { streams }))
+        .read(stored_streams);
+    listed_streams(&streams).map(|streams| GetStreamsResponse { streams })
 }
 
-/// Every stream a list read serves, see [`servable`].
-fn listed_streams(streams: &StreamsInner) -> Result<Vec<StreamResponse>, IggyError> {
+fn stored_streams(streams: &StreamsInner) -> Vec<StoredEntry> {
     streams
         .items
         .iter()
-        .filter_map(|(_, stream)| {
+        .map(|(_, stream)| StoredEntry::from(stream))
+        .collect()
+}
+
+fn stored_topics(stream: &Stream) -> Vec<StoredEntry> {
+    stream
+        .topics
+        .iter()
+        .map(|(_, topic)| StoredEntry::from(topic))
+        .collect()
+}
+
+/// Every stream a list read serves, see [`servable`].
+fn listed_streams(streams: &[StoredEntry]) -> Result<Vec<StreamResponse>, IggyError> {
+    streams
+        .iter()
+        .filter_map(|stream| {
             servable(
                 stream_response(stream),
                 OptionsScope::Stream,
@@ -612,17 +704,19 @@ fn listed_streams(streams: &StreamsInner) -> Result<Vec<StreamResponse>, IggyErr
         .collect()
 }
 
-/// Every topic of `stream` a list read serves, see [`servable`].
-fn listed_topics(stream: &Stream) -> Result<Vec<StreamTopicHeader>, IggyError> {
-    stream
-        .topics
+/// Every topic of stream `stream_id` a list read serves, see [`servable`].
+fn listed_topics(
+    stream_id: usize,
+    topics: &[StoredEntry],
+) -> Result<Vec<StreamTopicHeader>, IggyError> {
+    topics
         .iter()
-        .filter_map(|(_, topic)| {
+        .filter_map(|topic| {
             servable(
                 topic_header(topic),
                 OptionsScope::Topic,
                 topic.id,
-                Some(stream.id),
+                Some(stream_id),
             )
             .transpose()
         })
@@ -674,8 +768,7 @@ fn public_blocks(
     resource_options_to_wire_split(&public_options(scope, stored)?)
 }
 
-#[allow(clippy::cast_possible_truncation)]
-fn user_response(user: &metadata::stm::user::User) -> Result<UserResponse, IggyError> {
+fn user_response(user: &StoredUser) -> Result<UserResponse, IggyError> {
     let (options, derived_options) = public_blocks(OptionsScope::User, &user.options)?;
     Ok(UserResponse {
         id: user.id,
@@ -697,22 +790,26 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    shard.plane.metadata().mux_stm.users().read(|users| {
+    let users = shard.plane.metadata().mux_stm.users().read(|users| {
         users
             .items
             .iter()
-            .filter_map(|(_, user)| {
-                servable(
-                    user_response(user),
-                    OptionsScope::User,
-                    user.id as usize,
-                    None,
-                )
-                .transpose()
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map(|users| GetUsersResponse { users })
-    })
+            .map(|(_, user)| StoredUser::from(user))
+            .collect::<Vec<_>>()
+    });
+    users
+        .iter()
+        .filter_map(|user| {
+            servable(
+                user_response(user),
+                OptionsScope::User,
+                user.id as usize,
+                None,
+            )
+            .transpose()
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(|users| GetUsersResponse { users })
 }
 
 fn build_get_user_response<B, MJ, S, SB>(
@@ -726,19 +823,27 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    shard.plane.metadata().mux_stm.users().read(|users| {
-        let Some(id) = users.resolve_user_id(user_id) else {
-            return Ok(None);
-        };
-        let user = users.items.get(id).ok_or(IggyError::InvalidIdentifier)?;
-        Ok(Some(UserDetailsResponse {
-            user: user_response(user)?,
-            permissions: user
-                .permissions
-                .as_ref()
-                .map(|p| iggy_common::wire_conversions::permissions_to_wire(p)),
-        }))
-    })
+    let stored = shard
+        .plane
+        .metadata()
+        .mux_stm
+        .users()
+        .read(|users| -> Result<_, IggyError> {
+            let Some(id) = users.resolve_user_id(user_id) else {
+                return Ok(None);
+            };
+            let user = users.items.get(id).ok_or(IggyError::InvalidIdentifier)?;
+            Ok(Some((StoredUser::from(user), user.permissions.clone())))
+        })?;
+    let Some((user, permissions)) = stored else {
+        return Ok(None);
+    };
+    Ok(Some(UserDetailsResponse {
+        user: user_response(&user)?,
+        permissions: permissions
+            .as_deref()
+            .map(iggy_common::wire_conversions::permissions_to_wire),
+    }))
 }
 
 fn personal_access_tokens_response(
@@ -770,38 +875,49 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    shard.plane.metadata().mux_stm.streams().read(|streams| {
-        let Some(stream_id) = streams.resolve_stream_id(stream_id) else {
-            return Ok(None);
-        };
-        let Some(topic_id) = streams.resolve_topic_id(stream_id, topic_id) else {
-            return Ok(None);
-        };
-        let stream = streams
-            .items
-            .get(stream_id)
-            .ok_or(IggyError::InvalidIdentifier)?;
-        let topic = stream
-            .topics
-            .get(topic_id)
-            .ok_or(IggyError::InvalidIdentifier)?;
-        Ok(Some(GetTopicResponse {
-            topic: topic_header(topic)?,
-            partitions: topic
-                .partitions
-                .iter()
-                .map(|partition| {
-                    partition_response(
-                        streams,
-                        stream_id,
-                        topic_id,
-                        partition,
-                        shard.plane.metadata().applied_frontier().get(),
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        }))
-    })
+    let stored =
+        shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .read(|streams| -> Result<_, IggyError> {
+                let Some(stream_id) = streams.resolve_stream_id(stream_id) else {
+                    return Ok(None);
+                };
+                let Some(topic_id) = streams.resolve_topic_id(stream_id, topic_id) else {
+                    return Ok(None);
+                };
+                let stream = streams
+                    .items
+                    .get(stream_id)
+                    .ok_or(IggyError::InvalidIdentifier)?;
+                let topic = stream
+                    .topics
+                    .get(topic_id)
+                    .ok_or(IggyError::InvalidIdentifier)?;
+                let partitions = topic
+                    .partitions
+                    .iter()
+                    .map(|partition| {
+                        partition_response(
+                            streams,
+                            stream_id,
+                            topic_id,
+                            partition,
+                            shard.plane.metadata().applied_frontier().get(),
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Some((StoredEntry::from(topic), partitions)))
+            })?;
+    let Some((topic, partitions)) = stored else {
+        return Ok(None);
+    };
+    Ok(Some(GetTopicResponse {
+        topic: topic_header(&topic)?,
+        partitions,
+    }))
 }
 
 fn build_get_topics_response<B, MJ, S, SB>(
@@ -815,41 +931,51 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    shard.plane.metadata().mux_stm.streams().read(|streams| {
-        // Legacy parity: a missing stream lists as empty, not StreamNotFound.
-        let Some(resolved_stream) = streams.resolve_stream_id(stream_id) else {
-            return Ok(GetTopicsResponse { topics: Vec::new() });
-        };
-        let stream = streams
-            .items
-            .get(resolved_stream)
-            .ok_or(IggyError::InvalidIdentifier)?;
-        listed_topics(stream).map(|topics| GetTopicsResponse { topics })
-    })
+    let stored =
+        shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .read(|streams| -> Result<_, IggyError> {
+                // Legacy parity: a missing stream lists as empty, not StreamNotFound.
+                let Some(resolved_stream) = streams.resolve_stream_id(stream_id) else {
+                    return Ok(None);
+                };
+                let stream = streams
+                    .items
+                    .get(resolved_stream)
+                    .ok_or(IggyError::InvalidIdentifier)?;
+                Ok(Some((stream.id, stored_topics(stream))))
+            })?;
+    let Some((stream_id, topics)) = stored else {
+        return Ok(GetTopicsResponse { topics: Vec::new() });
+    };
+    listed_topics(stream_id, &topics).map(|topics| GetTopicsResponse { topics })
 }
 
-fn stream_response(stream: &metadata::stm::stream::Stream) -> Result<StreamResponse, IggyError> {
+fn stream_response(stream: &StoredEntry) -> Result<StreamResponse, IggyError> {
     let (options, derived_options) = public_blocks(OptionsScope::Stream, &stream.options)?;
     Ok(StreamResponse {
         id: usize_to_u32(stream.id)?,
         created_at: stream.created_at.as_micros(),
-        topics_count: usize_to_u32(stream.topics.len())?,
-        size_bytes: stream.stats.size_bytes_inconsistent(),
-        messages_count: stream.stats.messages_count_inconsistent(),
+        topics_count: usize_to_u32(stream.children_count)?,
+        size_bytes: stream.size_bytes,
+        messages_count: stream.messages_count,
         name: WireName::new(stream.name.as_ref()).map_err(|_| IggyError::InvalidFormat)?,
         options,
         derived_options,
     })
 }
 
-fn topic_header(topic: &metadata::stm::stream::Topic) -> Result<StreamTopicHeader, IggyError> {
+fn topic_header(topic: &StoredEntry) -> Result<StreamTopicHeader, IggyError> {
     let (options, derived_options) = public_blocks(OptionsScope::Topic, &topic.options)?;
     Ok(StreamTopicHeader {
         id: usize_to_u32(topic.id)?,
         created_at: topic.created_at.as_micros(),
-        partitions_count: usize_to_u32(topic.partitions.len())?,
-        size_bytes: topic.stats.size_bytes_inconsistent(),
-        messages_count: topic.stats.messages_count_inconsistent(),
+        partitions_count: usize_to_u32(topic.children_count)?,
+        size_bytes: topic.size_bytes,
+        messages_count: topic.messages_count,
         name: WireName::new(topic.name.as_ref()).map_err(|_| IggyError::InvalidFormat)?,
         options,
         derived_options,
@@ -957,7 +1083,6 @@ impl NonReplicatedResponse {
 mod tests {
     use super::*;
     use iggy_common::{HeaderKey, HeaderValue, OptionKey, OptionValue};
-    use metadata::stm::stream::Topic;
     use std::str::FromStr;
 
     #[test]
@@ -990,20 +1115,21 @@ mod tests {
         let names = |names: Vec<&WireName>| -> Vec<String> {
             names.iter().map(|name| name.as_str().to_owned()).collect()
         };
-        let listed = listed_streams(&streams).expect("the stream list builds");
+        let listed = listed_streams(&stored_streams(&streams)).expect("the stream list builds");
         assert_eq!(
             names(listed.iter().map(|stream| &stream.name).collect()),
             ["readable"]
         );
         let readable = streams.items.get(readable_slot).expect("stream stored");
-        let topics = listed_topics(readable).expect("the topic list builds");
+        let topics =
+            listed_topics(readable.id, &stored_topics(readable)).expect("the topic list builds");
         assert_eq!(
             names(topics.iter().map(|topic| &topic.name).collect()),
             ["kept"]
         );
         let hidden = streams.items.get(hidden_slot).expect("stream stored");
         assert!(matches!(
-            stream_response(hidden),
+            stream_response(&StoredEntry::from(hidden)),
             Err(IggyError::UnsupportedCriticalOption(_))
         ));
     }
@@ -1152,7 +1278,7 @@ mod tests {
         );
         topic.set_options(options.clone());
 
-        let header = topic_header(&topic).expect("topic header builds");
+        let header = topic_header(&StoredEntry::from(&topic)).expect("topic header builds");
 
         let mut explicit = resource_options_from_wire(&header.options, true).unwrap();
         explicit.extend(resource_options_from_wire(&header.derived_options, false).unwrap());

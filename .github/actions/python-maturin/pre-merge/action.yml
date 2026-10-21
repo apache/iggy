@@ -54,6 +54,7 @@ runs:
       uses: ./.github/actions/utils/server-start
       with:
         bin: target/debug/iggy-server
+        encryption-enabled: "true"
 
     - name: Setup Python
       uses: actions/setup-python@v6

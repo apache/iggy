@@ -43,6 +43,12 @@ public interface OptionKey {
     /** The longest stream or topic name the server accepts, in UTF-8 bytes. */
     int MAX_NAME_LENGTH = 255;
 
+    /** The most reset names one update carries, the reach of its count byte. */
+    int MAX_RESET_KEYS = 255;
+
+    /** The longest option key the wire carries, in UTF-8 bytes. */
+    int MAX_KEY_LENGTH = 255;
+
     /** The key as the server spells it. */
     String value();
 
@@ -71,10 +77,15 @@ public interface OptionKey {
      * @param reset the typed keys the update returns to their defaults
      * @param rawReset reset names this build has no key constant for
      * @param typedOnly whether every set key and reset name is a typed field of this build
+     * @param catalog every key of the update's scope
      * @throws IggyValidationException carrying the server's error code for the refusal
      */
     static void requireValidUpdate(
-            Set<String> setKeys, Collection<? extends OptionKey> reset, Set<String> rawReset, boolean typedOnly) {
+            Set<String> setKeys,
+            Collection<? extends OptionKey> reset,
+            Set<String> rawReset,
+            boolean typedOnly,
+            Collection<? extends OptionKey> catalog) {
         if (setKeys.isEmpty() && reset.isEmpty() && rawReset.isEmpty()) {
             throw refusal(IggyErrorCode.INVALID_COMMAND, "The update sets and resets nothing", Optional.empty());
         }
@@ -87,6 +98,20 @@ public interface OptionKey {
             if (setKeys.contains(name)) {
                 throw refusal(IggyErrorCode.INVALID_COMMAND, "A key is both set and reset", Optional.of(name));
             }
+        }
+        List<String> names = resetNames(reset, rawReset);
+        for (String name : names) {
+            if (!textFits(name, 1, MAX_KEY_LENGTH)) {
+                throw refusal(IggyErrorCode.UNSUPPORTED_OPTION_KEY, "Unsupported option key", Optional.of(name));
+            }
+        }
+        if (names.size() > MAX_RESET_KEYS) {
+            // The catalog is far smaller than the limit, so such a list always names a key outside it.
+            Optional<String> unknown = names.stream()
+                    .filter(name ->
+                            catalog.stream().noneMatch(key -> key.value().equals(name)))
+                    .findFirst();
+            throw refusal(IggyErrorCode.UNSUPPORTED_OPTION_KEY, "Unsupported option key", unknown);
         }
         if (!typedOnly) {
             return;

@@ -54,7 +54,7 @@ class HttpOptionValueTest {
     private static final TypeReference<Map<String, HttpOptionValue>> OPTIONS = new TypeReference<>() {};
 
     @Test
-    void givenServerDescribeJsonWhenMappingThenShouldRebuildFixtureFlags() {
+    void givenServerDescribeJsonWhenMappingShouldRebuildFixtureFlags() {
         JsonNode flagBits = section("constants").get("option_flags");
         for (JsonNode vector : section("describe_options")) {
             var json = MAPPER.createArrayNode();
@@ -86,7 +86,7 @@ class HttpOptionValueTest {
     }
 
     @Test
-    void givenSharedResponsesWhenDecodingHttpOptionsThenShouldMatchBinaryBlocks() {
+    void givenSharedResponsesWhenDecodingHttpOptionsShouldMatchBinaryBlocks() {
         for (JsonNode vector : section("stream_responses")) {
             StreamBase stream = BytesDeserializer.readStreamBase(response(vector));
             assertSameBlocks(vector, stream.options(), stream.derivedOptions());
@@ -102,7 +102,7 @@ class HttpOptionValueTest {
     }
 
     @Test
-    void givenTypedUpdatesWhenRenderingPutBodyThenShouldMatchWireSetAndReset() {
+    void givenTypedUpdatesWhenRenderingPutBodyShouldMatchWireSetAndReset() {
         Map<String, JsonNode> bodiesByWire = new HashMap<>();
         for (JsonNode vector : section("update_resource")) {
             JsonNode body = render(updateBody(vector));
@@ -140,7 +140,7 @@ class HttpOptionValueTest {
     }
 
     @Test
-    void givenEveryHeaderKindWhenDecodingHttpTextThenShouldRebuildExactBytes() {
+    void givenEveryHeaderKindWhenDecodingHttpTextShouldRebuildExactBytes() {
         Map<String, HttpOptionValue> options = Map.of(
                 "int8", new HttpOptionValue("-5", HeaderKind.Int8, true),
                 "int128", new HttpOptionValue("-170141183460469231731687303715884105728", HeaderKind.Int128, true),

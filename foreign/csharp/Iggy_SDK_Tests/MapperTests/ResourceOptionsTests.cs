@@ -17,6 +17,7 @@
 
 using System.Globalization;
 using System.Reflection;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Apache.Iggy.Configuration;
@@ -71,6 +72,8 @@ public sealed class ResourceOptionsTests
         ["encryption_kek_fingerprint"] = stream => stream.EncryptionKekFingerprints.SingleOrDefault()
     };
 
+    private static readonly byte[] RawKey = Enumerable.Range(1, EncryptionKeys.KEY_LENGTH).Select(value => (byte)value).ToArray();
+
     private static readonly string[] HttpUpdateCases = ["topic_reset_array", "stream_rename", "user_username_and_status"];
 
     public static TheoryData<string, string> SharedVectors
@@ -105,6 +108,12 @@ public sealed class ResourceOptionsTests
         }
     }
 
+    public static TheoryData<string> RawOptionTypes =>
+    [
+        nameof(StreamOptions), nameof(StreamUpdate), nameof(TopicOptions), nameof(TopicUpdate), nameof(UserOptions),
+        nameof(UserUpdate)
+    ];
+
     public static TheoryData<string> InvalidKeys
     {
         get
@@ -121,7 +130,7 @@ public sealed class ResourceOptionsTests
 
     [Theory]
     [MemberData(nameof(SharedVectors))]
-    public async Task given_shared_vectors_when_encoding_then_should_match_server_contract(string section,
+    public async Task given_shared_vectors_when_encoding_should_match_server_contract(string section,
         string vectorCase)
     {
         switch (section)
@@ -179,7 +188,7 @@ public sealed class ResourceOptionsTests
 
     [Theory]
     [MemberData(nameof(InvalidKeys))]
-    public async Task given_invalid_key_when_encoding_then_should_reject_before_network_io(string vectorCase)
+    public async Task given_invalid_key_when_encoding_should_reject_before_network_io(string vectorCase)
     {
         var vector = Fixture.GetProperty("stream_key").GetProperty("invalid_keys").EnumerateArray()
             .Single(entry => entry.GetProperty("case").GetString() == vectorCase);
@@ -226,7 +235,7 @@ public sealed class ResourceOptionsTests
     }
 
     [Fact]
-    public void given_raw_set_key_and_typed_reset_when_patching_then_should_leave_the_verdict_to_the_server()
+    public void given_raw_set_key_and_typed_reset_when_patching_should_leave_the_verdict_to_the_server()
     {
         var patch = new StreamUpdate
         {
@@ -242,7 +251,7 @@ public sealed class ResourceOptionsTests
     }
 
     [Fact]
-    public void given_raw_reset_when_patching_then_should_send_it_for_the_server_to_decide()
+    public void given_raw_reset_when_patching_should_send_it_for_the_server_to_decide()
     {
         var patch = new TopicUpdate
         {
@@ -255,7 +264,7 @@ public sealed class ResourceOptionsTests
     }
 
     [Fact]
-    public void given_raw_reset_no_wire_name_holds_when_patching_then_should_refuse_unsupported_key()
+    public void given_raw_reset_no_wire_name_holds_when_patching_should_refuse_unsupported_key()
     {
         var empty = Assert.Throws<IggyInvalidStatusCodeException>(() =>
             new TopicUpdate { RawReset = new HashSet<string> { string.Empty } }.ToPatch());
@@ -271,7 +280,7 @@ public sealed class ResourceOptionsTests
     }
 
     [Fact]
-    public void given_raw_set_key_also_reset_when_patching_then_should_refuse_invalid_command()
+    public void given_raw_set_key_also_reset_when_patching_should_refuse_invalid_command()
     {
         var both = Assert.Throws<IggyInvalidStatusCodeException>(() => new TopicUpdate
         {
@@ -282,7 +291,7 @@ public sealed class ResourceOptionsTests
     }
 
     [Fact]
-    public void given_unencodable_name_beside_raw_key_when_patching_then_should_send_a_stand_in()
+    public void given_unencodable_name_beside_raw_key_when_patching_should_send_a_stand_in()
     {
         var patch = new TopicUpdate
         {
@@ -294,7 +303,7 @@ public sealed class ResourceOptionsTests
     }
 
     [Fact]
-    public void given_raw_set_key_named_reset_when_building_http_body_then_should_refuse_unsupported_key()
+    public void given_raw_set_key_named_reset_when_building_http_body_should_refuse_unsupported_key()
     {
         var patch = new TopicUpdate
         {
@@ -306,13 +315,47 @@ public sealed class ResourceOptionsTests
     }
 
     [Fact]
-    public void given_stream_options_with_key_when_serializing_to_json_then_should_not_write_the_key()
+    public void given_stream_options_with_key_when_serializing_to_json_should_not_write_the_key()
     {
         var key = Enumerable.Range(1, EncryptionKeys.KEY_LENGTH).Select(value => (byte)value).ToArray();
         var options = new StreamOptions { EncryptionKey = key };
 
         AssertRedacted(JsonSerializer.Serialize(options), key);
         AssertRedacted(JsonSerializer.Serialize(options, HttpJsonOptions), key);
+    }
+
+    [Theory]
+    [MemberData(nameof(RawOptionTypes))]
+    public void given_raw_secret_entries_when_serializing_to_json_should_write_names_without_values(
+        string type)
+    {
+        var raw = new Dictionary<string, HeaderValue>
+        {
+            ["encryption_key"] = HeaderValue.FromBytes(RawKey),
+            ["future_secret"] = HeaderValue.FromString(Convert.ToBase64String(RawKey))
+        };
+        object options = type switch
+        {
+            nameof(StreamOptions) => new StreamOptions { Options = raw },
+            nameof(StreamUpdate) => new StreamUpdate { Options = raw },
+            nameof(TopicOptions) => new TopicOptions { Options = raw },
+            nameof(TopicUpdate) => new TopicUpdate { Options = raw },
+            nameof(UserOptions) => new UserOptions { Options = raw },
+            nameof(UserUpdate) => new UserUpdate { Options = raw },
+            _ => throw new ArgumentOutOfRangeException(nameof(type), type, "Unknown options type")
+        };
+
+        foreach (var json in new[]
+                 {
+                     JsonSerializer.Serialize(options, options.GetType()),
+                     JsonSerializer.Serialize(options, options.GetType(), HttpJsonOptions)
+                 })
+        {
+            AssertRedacted(json, RawKey);
+            AssertRedacted(json, Encoding.UTF8.GetBytes(Convert.ToBase64String(RawKey)));
+            Assert.Contains("\"encryption_key\"", json);
+            Assert.Contains("\"future_secret\"", json);
+        }
     }
 
     private static void AssertConstants(JsonElement constants)

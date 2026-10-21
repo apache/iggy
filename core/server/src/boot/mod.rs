@@ -87,7 +87,7 @@ use tracing::{error, info, warn};
 
 const STORAGE_FORMAT_FILE: &str = "storage-format";
 const STORAGE_FORMAT_TEMP_FILE: &str = "storage-format.tmp";
-const STORAGE_FORMAT: &[u8] = b"IGGY-BOUND-GRANTS-4\n";
+const STORAGE_FORMAT: &[u8] = b"IGGY-RESOURCE-OPTIONS-1\n";
 
 /// Load the server configuration from the active config provider.
 ///
@@ -911,25 +911,38 @@ async fn shard_main(
         None
     };
 
-    // Stream key rewrapper: shard 0 only, and only when this node holds a
-    // server key. Each pass no-ops unless this node is the caught-up metadata
-    // primary, so a key rotation is replicated once to every replica.
-    let stream_key_rewrapper_stop =
-        if shard_id == 0 && shard.plane.partitions().key_context().accepts_stream_keys() {
+    // Stream key rewrapper: shard 0 only, and only while this node's keys call
+    // for a rotation, since otherwise no stored set can differ from its target.
+    // Retired fingerprints matter only to the rewrapper, so only its context
+    // holds them. Each sweep no-ops unless this node is the caught-up metadata
+    // primary, so a rotation is replicated once to every replica.
+    let rewrap_context = if shard_id == 0 {
+        Some(
+            (*shard.plane.partitions().key_context())
+                .clone()
+                .with_retired_kek_fingerprints(&config.encryption.retired_kek_fingerprints)
+                .map_err(|error| ServerError::Iggy(Box::new(error)))?,
+        )
+    } else {
+        None
+    };
+    let stream_key_rewrapper_stop = match rewrap_context {
+        Some(rewrap_context) if rewrap_context.rotating() => {
             let (rewrapper_stop_tx, rewrapper_stop_rx) = channel(1);
             let rewrapper_shard = Rc::clone(&shard);
             let rewrapper_handle = compio::runtime::spawn(async move {
                 crate::stream_key_rewrapper::run_stream_key_rewrapper(
                     rewrapper_shard,
+                    rewrap_context,
                     rewrapper_stop_rx,
                 )
                 .await;
             });
             bus.track_background(rewrapper_handle);
             Some(rewrapper_stop_tx)
-        } else {
-            None
-        };
+        }
+        _ => None,
+    };
 
     // Segment cleaner: runs on every shard (each replica trims its own log,
     // primary and backup alike). Local and unreplicated; gated by the shared
@@ -1261,6 +1274,7 @@ mod tests {
             b"IGGY-OWNERSHIP-HISTORY-5\n",
             b"IGGY-BOUND-GRANTS-2\n",
             b"IGGY-BOUND-GRANTS-3\n",
+            b"IGGY-BOUND-GRANTS-4\n",
             b"IGGY-DURABLE-SESSIONS-3\n",
             &STORAGE_FORMAT[..STORAGE_FORMAT.len() - 1],
         ] {

@@ -789,7 +789,9 @@ mod tests {
     use iggy_binary_protocol::requests::consumer_groups::{
         CreateConsumerGroupRequest, JoinConsumerGroupRequest,
     };
-    use iggy_binary_protocol::requests::system::{ResourceTarget, UpdateResourceRequest};
+    use iggy_binary_protocol::requests::system::{
+        ResourceTarget, UpdateResourceRequest, WireResetKeys,
+    };
     use iggy_binary_protocol::requests::topics::{
         CreateTopicRequest, CreateTopicWithAssignmentsRequest,
     };
@@ -1386,7 +1388,7 @@ mod tests {
     }
 
     #[test]
-    fn given_pending_lifecycle_when_preflighting_generic_patch_then_should_gate_like_the_scope() {
+    fn given_pending_lifecycle_when_preflighting_generic_patch_should_gate_like_the_scope() {
         let streams = streams();
         streams.seed_namespace(IggyNamespace::new(0, 1, 0), 3, 0);
         streams.seed_namespace(IggyNamespace::new(1, 0, 0), 4, 0);
@@ -1407,7 +1409,8 @@ mod tests {
         let blocked = |target| {
             let body = UpdateResourceRequest {
                 target,
-                reset: vec![WireName::new("message_expiry").unwrap()],
+                reset: WireResetKeys::try_from(vec![WireName::new("message_expiry").unwrap()])
+                    .unwrap(),
                 options: WireOptions::empty(),
             }
             .to_bytes();

@@ -235,6 +235,10 @@ impl IntoResponse for AuthError {
 /// business error or, worse, a 200 with a stale body.
 pub(in crate::http) enum WriteError {
     Rejected(IggyError),
+    /// A body member the request shape refuses, rendered as `InvalidCommand`
+    /// with the member named in `field`, because REST has no version handshake
+    /// to tell an older client why its body no longer fits.
+    MalformedMember(String),
     /// The VSR session was evicted (its client slot was reclaimed cluster-side,
     /// e.g. LRU-evicted from the full client table). Renders identically to a
     /// terminal `Rejected` (401 -> re-authenticate), but is a distinct variant
@@ -250,6 +254,14 @@ impl IntoResponse for WriteError {
             Self::Rejected(error) | Self::Evicted(error) => {
                 CustomError::from(error).into_response()
             }
+            Self::MalformedMember(member) => (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    field: Some(member),
+                    ..ErrorResponse::from_error(&IggyError::InvalidCommand)
+                }),
+            )
+                .into_response(),
             Self::Unavailable => service_unavailable(),
         }
     }

@@ -33,6 +33,7 @@ export {
   TopicOptionKey,
   UserOptionKey,
   UserStatus,
+  StreamEncryptionKey,
   encryptionKeyFingerprint,
   type OptionEntry,
   type OptionSpec,

@@ -119,7 +119,7 @@ public abstract class StreamClientBaseTest extends IntegrationTest {
     }
 
     @Test
-    void givenStreamKeyWhenCreatingThenShouldReadMatchingProjection() {
+    void givenStreamKeyWhenCreatingShouldReadMatchingProjection() {
         // given
         byte[] key = randomKey();
         var options = StreamOptions.builder().encryptionKey(key).build();
@@ -148,7 +148,7 @@ public abstract class StreamClientBaseTest extends IntegrationTest {
     }
 
     @Test
-    void givenKeylessStreamWhenReadingThenShouldReportServerGeneratedKey() {
+    void givenKeylessStreamWhenReadingShouldReportServerGeneratedKey() {
         // when
         var created = streamsClient.createStream("keyless-stream");
         trackStream(created.id());
@@ -164,7 +164,7 @@ public abstract class StreamClientBaseTest extends IntegrationTest {
     }
 
     @Test
-    void givenStreamRenameWhenUpdatingThenShouldPreserveEncryptionProjection() {
+    void givenStreamRenameWhenUpdatingShouldPreserveEncryptionProjection() {
         // given
         byte[] key = randomKey();
         var created = streamsClient.createStream(
@@ -204,7 +204,7 @@ public abstract class StreamClientBaseTest extends IntegrationTest {
     }
 
     @Test
-    void givenStreamKeyResetWhenUpdatingThenShouldRejectBeforeSendingAndKeepState() {
+    void givenStreamKeyResetWhenUpdatingShouldRejectBeforeSendingAndKeepState() {
         // given
         byte[] key = randomKey();
         var created = streamsClient.createStream(

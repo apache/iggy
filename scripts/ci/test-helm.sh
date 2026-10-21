@@ -56,6 +56,9 @@ HELM_SMOKE_SERVER_CPU_ALLOCATION="${HELM_SMOKE_SERVER_CPU_ALLOCATION:-1}"
 # A well-formed 32-byte AES-256-GCM key, base64 encoded. Render-only: it never
 # reaches a running server.
 HELM_TEST_ENCRYPTION_KEY="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+HELM_TEST_PREVIOUS_ENCRYPTION_KEY="ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8="
+HELM_TEST_OLDER_ENCRYPTION_KEY="QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8="
+HELM_TEST_OLDEST_ENCRYPTION_KEY="YGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn8="
 
 # HELM_SMOKE_GATEWAY_NAMESPACE and HELM_SMOKE_GATEWAY_NAME must match the
 # defaults in scripts/ci/setup-helm-smoke-cluster.sh - the HTTPRoute
@@ -284,7 +287,7 @@ validate() {
   grep -q 'name: tcp-replica' "$HELM_RENDER_DIR/cluster.yaml"
 
   grep -q 'name: IGGY_CLUSTER_AUTH_SHARED_SECRET' "$HELM_RENDER_DIR/cluster.yaml"
-  grep -q 'name: IGGY_ENCRYPTION_KEY' "$HELM_RENDER_DIR/cluster.yaml"
+  grep -q 'name: IGGY_SYSTEM_ENCRYPTION_KEY' "$HELM_RENDER_DIR/cluster.yaml"
   grep -q 'name: IGGY_HTTP_JWT_ENCODING_SECRET' "$HELM_RENDER_DIR/cluster.yaml"
   if grep -qE '^ +(encryptionKey|clusterSharedSecret|jwtEncodingSecret):' "$HELM_RENDER_DIR/cluster.yaml"; then
     echo "Error: cluster render inlined a secret value instead of referencing the existing Secret" >&2
@@ -300,10 +303,10 @@ validate() {
   grep -q '^                  name: iggy-secrets$' "$HELM_RENDER_DIR/generated-secret.yaml"
   grep -q '^                  key: encryptionKey$' "$HELM_RENDER_DIR/generated-secret.yaml"
   test "$(grep -c '^kind: Secret$' "$HELM_RENDER_DIR/generated-secret.yaml")" -eq 2
-  grep -q 'name: IGGY_ENCRYPTION_ENABLED' "$HELM_RENDER_DIR/generated-secret.yaml"
-  grep -q 'name: IGGY_ENCRYPTION_KEY' "$HELM_RENDER_DIR/generated-secret.yaml"
-  if grep -q 'name: IGGY_SYSTEM_ENCRYPTION_' "$HELM_RENDER_DIR/generated-secret.yaml"; then
-    echo "Error: the pinned server image requires the flat encryption variables" >&2
+  grep -q 'name: IGGY_SYSTEM_ENCRYPTION_ENABLED' "$HELM_RENDER_DIR/generated-secret.yaml"
+  grep -q 'name: IGGY_SYSTEM_ENCRYPTION_KEY' "$HELM_RENDER_DIR/generated-secret.yaml"
+  if grep -q 'name: IGGY_ENCRYPTION_' "$HELM_RENDER_DIR/generated-secret.yaml"; then
+    echo "Error: the pinned server image requires the legacy encryption variables" >&2
     exit 1
   fi
 
@@ -313,6 +316,10 @@ validate() {
     --set server.encryption.existingSecret.name=shared-key \
     > "$HELM_RENDER_DIR/legacy-encryption.yaml"
   grep -q 'name: IGGY_SYSTEM_ENCRYPTION_KEY' "$HELM_RENDER_DIR/legacy-encryption.yaml"
+  if grep -q 'PREVIOUS_KEYS' "$HELM_RENDER_DIR/legacy-encryption.yaml"; then
+    echo "Error: the legacy encryption layout has no previous keys" >&2
+    exit 1
+  fi
 
   helm template iggy "$CHART_DIR" \
     --set-string server.image.tag=custom-flat \
@@ -346,7 +353,7 @@ validate() {
     --set server.encryption.configVersion=invalid \
     --set server.encryption.existingSecret.name=shared-key
 
-  # given_disabled_default_with_key_when_rendering_then_should_supply_key_and_false_enabled
+  # given_disabled_default_with_key_when_rendering_should_supply_key_and_false_enabled
   helm template iggy "$CHART_DIR" \
     --set-string server.image.tag=custom-flat \
     --set server.encryption.configVersion=flat \
@@ -363,8 +370,26 @@ validate() {
     > "$HELM_RENDER_DIR/disabled-with-secret.yaml"
   grep -A1 'name: IGGY_ENCRYPTION_ENABLED' "$HELM_RENDER_DIR/disabled-with-secret.yaml" | grep -q 'value: "false"'
   grep -q '^                  name: shared-key$' "$HELM_RENDER_DIR/disabled-with-secret.yaml"
+  grep -A5 'name: IGGY_ENCRYPTION_PREVIOUS_KEYS' "$HELM_RENDER_DIR/disabled-with-secret.yaml" \
+    | grep -q '^                  key: encryptionPreviousKeys$'
+  grep -A5 'name: IGGY_ENCRYPTION_PREVIOUS_KEYS' "$HELM_RENDER_DIR/disabled-with-secret.yaml" \
+    | grep -q '^                  optional: true$'
   if grep -qE '^ +encryptionKey:' "$HELM_RENDER_DIR/disabled-with-secret.yaml"; then
     echo "Error: an existing encryption Secret must not be inlined" >&2
+    exit 1
+  fi
+
+  helm template iggy "$CHART_DIR" \
+    --set-string server.image.tag=custom-flat \
+    --set server.encryption.configVersion=flat \
+    --set-string server.encryption.key="$HELM_TEST_ENCRYPTION_KEY" \
+    --set-string "server.encryption.previousKeys[0]=$HELM_TEST_PREVIOUS_ENCRYPTION_KEY" \
+    > "$HELM_RENDER_DIR/previous-keys.yaml"
+  grep -qxF "  encryptionPreviousKeys: \"[\\\"${HELM_TEST_PREVIOUS_ENCRYPTION_KEY}\\\"]\"" "$HELM_RENDER_DIR/previous-keys.yaml"
+  grep -A5 'name: IGGY_ENCRYPTION_PREVIOUS_KEYS' "$HELM_RENDER_DIR/previous-keys.yaml" \
+    | grep -q '^                  key: encryptionPreviousKeys$'
+  if [ "$(grep -cF "$HELM_TEST_PREVIOUS_ENCRYPTION_KEY" "$HELM_RENDER_DIR/previous-keys.yaml")" -ne 1 ]; then
+    echo "Error: a previous encryption key must reach the server only through the Secret" >&2
     exit 1
   fi
 
@@ -387,6 +412,28 @@ validate() {
     --set-string server.encryption.key=bm90LTMyLWJ5dGVz
   assert_render_rejected "a disabled encryption key that is not 32 bytes" \
     --set-string server.encryption.key=bm90LTMyLWJ5dGVz
+  assert_render_rejected "previous encryption keys on the legacy layout" \
+    --set-string server.encryption.key="$HELM_TEST_ENCRYPTION_KEY" \
+    --set-string "server.encryption.previousKeys[0]=$HELM_TEST_PREVIOUS_ENCRYPTION_KEY"
+  assert_render_rejected "previous encryption keys without a key" \
+    --set server.encryption.configVersion=flat \
+    --set-string "server.encryption.previousKeys[0]=$HELM_TEST_PREVIOUS_ENCRYPTION_KEY"
+  assert_render_rejected "more than two previous encryption keys" \
+    --set server.encryption.configVersion=flat \
+    --set-string server.encryption.key="$HELM_TEST_ENCRYPTION_KEY" \
+    --set-string "server.encryption.previousKeys={${HELM_TEST_PREVIOUS_ENCRYPTION_KEY},${HELM_TEST_OLDER_ENCRYPTION_KEY},${HELM_TEST_OLDEST_ENCRYPTION_KEY}}"
+  assert_render_rejected "a previous encryption key listed twice" \
+    --set server.encryption.configVersion=flat \
+    --set-string server.encryption.key="$HELM_TEST_ENCRYPTION_KEY" \
+    --set-string "server.encryption.previousKeys={${HELM_TEST_PREVIOUS_ENCRYPTION_KEY},${HELM_TEST_PREVIOUS_ENCRYPTION_KEY}}"
+  assert_render_rejected "a previous encryption key equal to the key" \
+    --set server.encryption.configVersion=flat \
+    --set-string server.encryption.key="$HELM_TEST_ENCRYPTION_KEY" \
+    --set-string "server.encryption.previousKeys[0]=$HELM_TEST_ENCRYPTION_KEY"
+  assert_render_rejected "a previous encryption key that is not 32 bytes" \
+    --set server.encryption.configVersion=flat \
+    --set-string server.encryption.key="$HELM_TEST_ENCRYPTION_KEY" \
+    --set-string "server.encryption.previousKeys[0]=bm90LTMyLWJ5dGVz"
   assert_render_rejected "replica auth without a secret" \
     -f "$CHART_DIR/examples/cluster-3-node.yaml" \
     --set server.cluster.auth.existingSecret.name="" \

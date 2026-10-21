@@ -403,8 +403,7 @@ mod tests {
     }
 
     #[test]
-    fn given_resolved_update_reply_when_correlating_then_should_accept_only_matching_request_identity()
-     {
+    fn given_resolved_update_reply_when_correlating_should_accept_only_matching_request_identity() {
         let request =
             RequestHeader::for_request(UPDATE_RESOURCE_CODE, 1, 2, 3, b"request").unwrap();
         let body = rejection_body(0);

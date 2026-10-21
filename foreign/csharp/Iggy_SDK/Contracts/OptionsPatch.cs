@@ -22,8 +22,8 @@ using Apache.Iggy.Vsr;
 namespace Apache.Iggy.Contracts;
 
 /// <summary>
-///     A validated update: the keys to set and the keys to reset to their defaults, in catalog order. Every key
-///     not named keeps its stored value.
+///     A validated update: the keys to set and the keys to reset to their defaults, the reset keys in ascending
+///     ordinal (key byte) order. Every key not named keeps its stored value.
 /// </summary>
 internal sealed record OptionsPatch(
     OptionsScope Scope,

@@ -48,6 +48,8 @@ namespace {
 
 constexpr char kFixturePath[]         = "tests/fixtures/resource_options.json";
 constexpr std::size_t kFingerprintHex = 16;
+// UpdateResource carries the reset count in one byte.
+constexpr std::size_t kMaxResetKeys = 255;
 
 constexpr iggy::StreamOptionKey kStreamOptionKeys[] = {
     iggy::StreamOptionKey::Name,
@@ -85,6 +87,15 @@ const nlohmann::json &Fixture() {
         return nlohmann::json::parse(file);
     }();
     return fixture;
+}
+
+const nlohmann::json &FixtureCase(const std::string &section, const std::string &name) {
+    for (const auto &vector : Fixture().at(section)) {
+        if (vector.at("case") == name) {
+            return vector;
+        }
+    }
+    throw std::runtime_error("No fixture case " + section + "." + name);
 }
 
 std::vector<std::uint8_t> FromHex(const std::string &hex) {
@@ -279,7 +290,7 @@ INSTANTIATE_TEST_SUITE_P(Transports,
                                            ResourceOptionsTransport{"websocket", "iggy+ws", "127.0.0.1:8092"}),
                          PrintTransport);
 
-TEST_P(E2E_ResourceOptionsTransport, GivenStreamKeyWhenCreatingThenShouldReadMatchingProjection) {
+TEST_P(E2E_ResourceOptionsTransport, GivenStreamKeyWhenCreatingShouldReadMatchingProjection) {
     RecordProperty("description",
                    "Creates a stream with its own key and reads source, key fingerprint and KEK fingerprints through "
                    "create, get and list, with no key material in any options block.");
@@ -305,7 +316,7 @@ TEST_P(E2E_ResourceOptionsTransport, GivenStreamKeyWhenCreatingThenShouldReadMat
     EXPECT_EQ(iggy::EncryptionKeyFingerprint(FixtureKey()), fingerprint);
 }
 
-TEST_P(E2E_ResourceOptionsTransport, GivenKeylessStreamWhenReadingThenShouldReportServerGeneratedKey) {
+TEST_P(E2E_ResourceOptionsTransport, GivenKeylessStreamWhenReadingShouldReportServerGeneratedKey) {
     RecordProperty("description",
                    "Creates a stream without a key on an encryption-enabled server and reads the server-generated "
                    "key's source and fingerprints through the typed accessors.");
@@ -325,7 +336,7 @@ TEST_P(E2E_ResourceOptionsTransport, GivenKeylessStreamWhenReadingThenShouldRepo
     ExpectSameProjection(created, *listed);
 }
 
-TEST_P(E2E_ResourceOptionsTransport, GivenStreamRenameWhenUpdatingThenShouldPreserveEncryptionProjection) {
+TEST_P(E2E_ResourceOptionsTransport, GivenStreamRenameWhenUpdatingShouldPreserveEncryptionProjection) {
     RecordProperty("description",
                    "Renames a keyed stream through the generic update and keeps its id, source, fingerprints and "
                    "readable payloads.");
@@ -352,7 +363,7 @@ TEST_P(E2E_ResourceOptionsTransport, GivenStreamRenameWhenUpdatingThenShouldPres
     EXPECT_EQ(PollPayloads(created.Id(), topic.Id()), std::vector<std::string>{"before-rename"});
 }
 
-TEST_P(E2E_ResourceOptionsTransport, GivenFixedResizePolicyWhenCreatingTopicThenShouldStoreItAndRefuseResize) {
+TEST_P(E2E_ResourceOptionsTransport, GivenFixedResizePolicyWhenCreatingTopicShouldStoreItAndRefuseResize) {
     RecordProperty("description",
                    "Creates a topic with the typed fixed resize policy, reads it back as an explicit option and "
                    "refuses a later partition creation.");
@@ -372,7 +383,7 @@ TEST_P(E2E_ResourceOptionsTransport, GivenFixedResizePolicyWhenCreatingTopicThen
         iggy::IggyException);
 }
 
-TEST_P(E2E_ResourceOptionsTransport, GivenTopicResetWhenUpdatingThenShouldPreserveUnmentionedValues) {
+TEST_P(E2E_ResourceOptionsTransport, GivenTopicResetWhenUpdatingShouldPreserveUnmentionedValues) {
     RecordProperty("description",
                    "Sets a topic's expiry without a name and resets its max size, keeping the name, compression and "
                    "the provenance of every other key.");
@@ -412,7 +423,53 @@ TEST_P(E2E_ResourceOptionsTransport, GivenTopicResetWhenUpdatingThenShouldPreser
     }
 }
 
-TEST_P(E2E_ResourceOptionsTransport, GivenUserOptionsWhenCreatingAndUpdatingThenShouldPreserveUserBehavior) {
+TEST_P(E2E_ResourceOptionsTransport, GivenPatchAdmissionRefusesWhenUpdatingTopicShouldKeepTopicUnchanged) {
+    RecordProperty("description",
+                   "Refuses a topic update of only zero sentinels as invalid_command and one with more resets than "
+                   "the count byte carries as unsupported_option_key, leaving the topic unchanged.");
+    auto client            = GetTransportClient();
+    const auto stream_name = GetRandomName(40);
+    const auto stream      = client.CreateStream(stream_name);
+    TrackStream(stream_name);
+    const auto stream_id = iggy::Identifier::Numeric(stream.Id());
+    const auto created   = client.CreateTopic(stream_id, "bounded",
+                                              iggy::TopicCreateOptions()
+                                                  .SetMessageExpiry(iggy::Expiry::Duration(3600000000))
+                                                  .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1073741824)));
+    const auto topic_id  = iggy::Identifier::Numeric(created.Id());
+
+    const auto &sentinel_error = FixtureCase("http_update", "topic_zero_sentinel_only").at("error");
+    EXPECT_TRUE(ThrowsIggyError(
+        [&] {
+            client.UpdateTopic(stream_id, topic_id,
+                               iggy::TopicUpdateOptions().SetMessageExpiry(iggy::Expiry::ServerDefault()));
+        },
+        sentinel_error));
+    EXPECT_TRUE(ThrowsIggyError(
+        [&] {
+            client.UpdateTopic(stream_id, topic_id,
+                               iggy::TopicUpdateOptions()
+                                   .SetMessageExpiry(iggy::Expiry::ServerDefault())
+                                   .SetMaxTopicSize(iggy::MaxTopicSize::ServerDefault()));
+        },
+        sentinel_error));
+
+    iggy::TopicUpdateOptions too_many_resets;
+    too_many_resets.Reset(iggy::TopicOptionKey::MaxTopicSize);
+    for (std::size_t index = 0; index < kMaxResetKeys; ++index) {
+        too_many_resets.RawReset("future_" + std::to_string(index));
+    }
+    EXPECT_TRUE(ThrowsIggyError([&] { client.UpdateTopic(stream_id, topic_id, too_many_resets); },
+                                nlohmann::json{{"name", "unsupported_option_key"}, {"code", 4041}}));
+
+    const auto topic = client.GetTopic(stream_id, topic_id);
+    EXPECT_EQ(topic.Name(), "bounded");
+    EXPECT_EQ(topic.MessageExpiry(), created.MessageExpiry());
+    EXPECT_EQ(topic.MaxTopicSize(), created.MaxTopicSize());
+    EXPECT_EQ(topic.Options().Explicit().count("max_topic_size"), 1u);
+}
+
+TEST_P(E2E_ResourceOptionsTransport, GivenUserOptionsWhenCreatingAndUpdatingShouldPreserveUserBehavior) {
     RecordProperty("description",
                    "Creates a user with typed empty options, patches its username and status, reads its options with "
                    "provenance and refuses a duplicate username without a partial change.");
@@ -444,7 +501,7 @@ TEST_P(E2E_ResourceOptionsTransport, GivenUserOptionsWhenCreatingAndUpdatingThen
     EXPECT_EQ(other.Status(), iggy::UserStatus::Active);
 }
 
-TEST_F(E2E_ResourceOptions, GivenInvalidKeyWhenEncodingThenShouldRejectBeforeNetworkIo) {
+TEST_F(E2E_ResourceOptions, GivenInvalidKeyWhenEncodingShouldRejectBeforeNetworkIo) {
     RecordProperty("description",
                    "Refuses every invalid key vector with invalid_encryption_key on a client that never connected, "
                    "accepts exactly 32 bytes and keeps key material out of the error text.");
@@ -484,7 +541,7 @@ TEST_F(E2E_ResourceOptions, GivenInvalidKeyWhenEncodingThenShouldRejectBeforeNet
     }
 }
 
-TEST_P(E2E_ResourceOptionsTransport, GivenSharedVectorsWhenEncodingThenShouldMatchServerContract) {
+TEST_P(E2E_ResourceOptionsTransport, GivenSharedVectorsWhenEncodingShouldMatchServerContract) {
     RecordProperty("description",
                    "Matches the shared fixture on every transport: update refusals in the server order, raw resets "
                    "decided by the server and stream create admission.");
@@ -580,7 +637,7 @@ TEST_P(E2E_ResourceOptionsTransport, GivenSharedVectorsWhenEncodingThenShouldMat
     }
 }
 
-TEST_P(E2E_ResourceOptionsTransport, GivenLoggedInUserRenameWhenReconnectingThenShouldKeepNewUsername) {
+TEST_P(E2E_ResourceOptionsTransport, GivenLoggedInUserRenameWhenReconnectingShouldKeepNewUsername) {
     RecordProperty("description",
                    "Renames the signed-in user, reconnects with the new name, keeps it after a refused rename and is "
                    "not affected by a stream rename.");
@@ -625,7 +682,7 @@ TEST_P(E2E_ResourceOptionsTransport, GivenLoggedInUserRenameWhenReconnectingThen
     ASSERT_NO_THROW(client.GetMe());
 }
 
-TEST_P(E2E_ResourceOptionsTransport, GivenPublicDescribeOptionsWhenCalledThenShouldReturnCatalogFlags) {
+TEST_P(E2E_ResourceOptionsTransport, GivenPublicDescribeOptionsWhenCalledShouldReturnCatalogFlags) {
     RecordProperty("description",
                    "Serves every scope's catalog through the public DescribeOptions on every transport with the "
                    "fixture's keys, kinds, flags and defaults.");

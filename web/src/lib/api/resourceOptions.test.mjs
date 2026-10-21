@@ -33,7 +33,7 @@ import {
 const currentTopic = { name: 'orders', messageExpiry: 0, maxTopicSize: '1073741824' };
 const streamKey = Buffer.alloc(32, 7).toString('base64');
 
-test('given_topic_reset_when_building_update_then_should_list_only_reset_keys', () => {
+test('given_topic_reset_when_building_update_should_list_only_reset_keys', () => {
   const body = topicUpdate({
     current: currentTopic,
     next: { name: 'orders', messageExpiry: 604_800_000_000, maxTopicSize: '2 GiB' },
@@ -44,7 +44,7 @@ test('given_topic_reset_when_building_update_then_should_list_only_reset_keys', 
   assert.ok(Object.values(body).every((value) => value !== null));
 });
 
-test('given_changed_topic_when_building_update_then_should_send_only_changed_keys', () => {
+test('given_changed_topic_when_building_update_should_send_only_changed_keys', () => {
   assert.deepEqual(
     topicUpdate({
       current: { ...currentTopic, messageExpiry: 60_000_000 },
@@ -55,7 +55,7 @@ test('given_changed_topic_when_building_update_then_should_send_only_changed_key
   assert.deepEqual(topicUpdate({ current: currentTopic, next: currentTopic }), {});
 });
 
-test('given_topic_settings_when_building_create_then_should_encode_options_as_update_does', () => {
+test('given_topic_settings_when_building_create_should_encode_options_as_update_does', () => {
   const settings = { name: 'orders', messageExpiry: 3_600_000_000, maxTopicSize: ' 1 GiB ' };
   const created = topicCreate({ ...settings, partitionsCount: 3, compressionAlgorithm: 'gzip' });
   const updated = topicUpdate({
@@ -74,14 +74,23 @@ test('given_topic_settings_when_building_create_then_should_encode_options_as_up
   });
   assert.equal(created.options.message_expiry, updated.message_expiry);
   assert.equal(created.options.max_topic_size, updated.max_topic_size);
-  assert.equal(
-    topicCreate({ ...settings, messageExpiry: 0, partitionsCount: 1, compressionAlgorithm: 'none' })
-      .options.message_expiry,
-    'unlimited'
+});
+
+test('given_default_topic_settings_when_building_create_should_omit_default_options', () => {
+  const settings = { name: 'orders', partitionsCount: 1, messageExpiry: 0 };
+
+  assert.deepEqual(topicCreate({ ...settings, compressionAlgorithm: 'none', maxTopicSize: ' ' }), {
+    name: 'orders',
+    partitions_count: 1,
+    options: {}
+  });
+  assert.deepEqual(
+    topicCreate({ ...settings, compressionAlgorithm: 'none', maxTopicSize: 'unlimited' }).options,
+    { max_topic_size: 'unlimited' }
   );
 });
 
-test('given_stream_key_when_building_create_then_should_use_nested_options_without_persistence', () => {
+test('given_stream_key_when_building_create_should_use_nested_options_without_persistence', () => {
   assert.equal(isStreamEncryptionKey(streamKey), true);
   assert.deepEqual(streamCreate('orders', streamKey), {
     name: 'orders',
@@ -107,7 +116,7 @@ test('given_stream_key_when_building_create_then_should_use_nested_options_witho
   }
 });
 
-test('given_u64_option_above_2_pow_53_when_reading_then_should_keep_precision', () => {
+test('given_u64_option_above_2_pow_53_when_reading_should_keep_precision', () => {
   const { options } = JSON.parse(
     '{"options":{' +
       '"max_topic_size":{"value":"9007199254740993","kind":"uint64","explicit":true},' +
@@ -122,7 +131,7 @@ test('given_u64_option_above_2_pow_53_when_reading_then_should_keep_precision', 
   assert.equal(optionUint64(undefined, 'max_topic_size'), undefined);
 });
 
-test('given_option_entries_when_reading_then_should_return_text_and_explicit_flag', () => {
+test('given_option_entries_when_reading_should_return_text_and_explicit_flag', () => {
   const options = {
     compression_algorithm: { value: 'gzip', kind: 'string', explicit: true },
     encryption_key_source: { value: 'server', kind: 'string', explicit: false }
@@ -135,7 +144,7 @@ test('given_option_entries_when_reading_then_should_return_text_and_explicit_fla
   assert.equal(isOptionExplicit(options, 'max_topic_size'), false);
 });
 
-test('given_stream_and_user_changes_when_building_update_then_should_send_only_changed_keys', () => {
+test('given_stream_and_user_changes_when_building_update_should_send_only_changed_keys', () => {
   assert.deepEqual(streamUpdate({ current: { name: 'orders' }, next: { name: 'sales' } }), {
     name: 'sales'
   });

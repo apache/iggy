@@ -419,7 +419,7 @@ mod tests {
     const FIXTURE: &str = include_str!("../tests/fixtures/resource_options.json");
 
     #[test]
-    fn given_stream_response_vectors_when_reading_then_should_match_projections() {
+    fn given_stream_response_vectors_when_reading_should_match_projections() {
         Python::initialize();
         Python::attach(|py| {
             for vector in vectors("stream_responses") {
@@ -454,7 +454,7 @@ mod tests {
     }
 
     #[test]
-    fn given_topic_and_user_response_vectors_when_reading_then_should_match_projections() {
+    fn given_topic_and_user_response_vectors_when_reading_should_match_projections() {
         Python::initialize();
         Python::attach(|py| {
             for vector in vectors("topic_responses") {
@@ -510,7 +510,7 @@ mod tests {
     }
 
     #[test]
-    fn given_describe_options_vectors_when_reading_then_should_expose_every_flag() {
+    fn given_describe_options_vectors_when_reading_should_expose_every_flag() {
         Python::initialize();
         let fixture: Value = serde_json::from_str(FIXTURE).expect("fixture parses");
         let flags = &fixture["constants"]["option_flags"];

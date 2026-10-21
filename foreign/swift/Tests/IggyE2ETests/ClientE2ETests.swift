@@ -538,7 +538,8 @@ struct MessagingE2ETests {
                 streamID: scratch.stream, topicID: scratch.topic, partitioning: .partition(0), messages: try E2EEnvironment.messages(2))
             let target = Self.rawConsumerTarget(consumer: 7, stream: scratch.streamID, topic: scratch.topicID)
             // Strategy first, count 10, no auto-commit.
-            let poll = target + [3] + Self.littleEndian(UInt64(0)) + Self.littleEndian(UInt32(10)) + [0]
+            let strategy: [UInt8] = [3] + Self.littleEndian(UInt64(0))
+            let poll: [UInt8] = target + strategy + Self.littleEndian(UInt32(10)) + [0]
             #expect(!(try await client.sendRawRequest(code: CommandCode.pollMessages.rawValue, payload: poll)).isEmpty)
             // Offset 1, quorum acknowledgement.
             let store = target + Self.littleEndian(UInt64(1)) + [1]
@@ -551,8 +552,10 @@ struct MessagingE2ETests {
     /// `[consumer kind:1][consumer][stream][topic][has partition:1][partition 0:4]`
     /// with numeric identifiers `[kind 1][length 4][id]`.
     private static func rawConsumerTarget(consumer: UInt32, stream: UInt32, topic: UInt32) -> [UInt8] {
-        let numeric = { (id: UInt32) in [1, 4] + littleEndian(id) }
-        return [1] + numeric(consumer) + numeric(stream) + numeric(topic) + [1] + littleEndian(UInt32(0))
+        let numeric = { (id: UInt32) -> [UInt8] in [1, 4] + littleEndian(id) }
+        let identifiers: [UInt8] = numeric(consumer) + numeric(stream) + numeric(topic)
+        let partition: [UInt8] = [1] + littleEndian(UInt32(0))
+        return [1] + identifiers + partition
     }
 
     private static func littleEndian<T: FixedWidthInteger>(_ value: T) -> [UInt8] {

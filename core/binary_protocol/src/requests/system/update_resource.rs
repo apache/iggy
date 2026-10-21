@@ -26,6 +26,8 @@ use crate::primitives::options::{
 use bytes::{BufMut, BytesMut};
 use std::borrow::Cow;
 use std::collections::BTreeSet;
+use std::ops::Deref;
+use std::slice::Iter;
 
 /// Most reset names one patch carries, the reach of its count byte.
 pub const MAX_RESET_KEYS: usize = u8::MAX as usize;
@@ -58,11 +60,16 @@ pub enum ResourceTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateResourceRequest {
     pub target: ResourceTarget,
-    /// At most [`MAX_RESET_KEYS`] names. Callers bound the list, the encoder
-    /// cannot refuse a longer one.
-    pub reset: Vec<WireName>,
+    pub reset: WireResetKeys,
     pub options: WireOptions,
 }
+
+/// The names a patch resets, at most [`MAX_RESET_KEYS`] so the count byte
+/// always matches the names after it.
+///
+/// Wire format: `[count:u8][name:WireName]*`
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WireResetKeys(Vec<WireName>);
 
 impl ResourceTarget {
     /// The options scope code the target is tagged with on the wire.
@@ -73,6 +80,67 @@ impl ResourceTarget {
             Self::Stream { .. } => OPTIONS_SCOPE_STREAM,
             Self::User { .. } => OPTIONS_SCOPE_USER,
         }
+    }
+}
+
+impl TryFrom<Vec<WireName>> for WireResetKeys {
+    type Error = WireError;
+
+    fn try_from(names: Vec<WireName>) -> Result<Self, Self::Error> {
+        if names.len() > MAX_RESET_KEYS {
+            return Err(validation("more reset keys than one patch carries"));
+        }
+        Ok(Self(names))
+    }
+}
+
+impl Deref for WireResetKeys {
+    type Target = [WireName];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<'a> IntoIterator for &'a WireResetKeys {
+    type Item = &'a WireName;
+    type IntoIter = Iter<'a, WireName>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl WireEncode for WireResetKeys {
+    fn encoded_size(&self) -> usize {
+        1 + self.0.iter().map(WireEncode::encoded_size).sum::<usize>()
+    }
+
+    fn encode(&self, buf: &mut BytesMut) {
+        // The constructor bounds the length to what the count byte holds.
+        #[allow(clippy::cast_possible_truncation)]
+        buf.put_u8(self.0.len() as u8);
+        for name in &self.0 {
+            name.encode(buf);
+        }
+    }
+}
+
+impl WireDecode for WireResetKeys {
+    fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
+        let count = read_u8(buf, 0)?;
+        let mut position = 1;
+        let mut names = Vec::with_capacity(usize::from(count));
+        let mut seen = BTreeSet::new();
+        for _ in 0..count {
+            let (name, consumed) = WireName::decode(&buf[position..])?;
+            position += consumed;
+            if !seen.insert(name.as_str().to_owned()) {
+                return Err(validation("a reset key is named twice"));
+            }
+            names.push(name);
+        }
+        Ok((Self(names), position))
     }
 }
 
@@ -141,24 +209,12 @@ impl WireDecode for ResourceTarget {
 
 impl WireEncode for UpdateResourceRequest {
     fn encoded_size(&self) -> usize {
-        self.target.encoded_size()
-            + 1
-            + self
-                .reset
-                .iter()
-                .map(WireEncode::encoded_size)
-                .sum::<usize>()
-            + self.options.encoded_size()
+        self.target.encoded_size() + self.reset.encoded_size() + self.options.encoded_size()
     }
 
     fn encode(&self, buf: &mut BytesMut) {
         self.target.encode(buf);
-        debug_assert!(self.reset.len() <= MAX_RESET_KEYS);
-        #[allow(clippy::cast_possible_truncation)]
-        buf.put_u8(self.reset.len() as u8);
-        for name in &self.reset {
-            name.encode(buf);
-        }
+        self.reset.encode(buf);
         self.options.encode(buf);
     }
 }
@@ -166,21 +222,14 @@ impl WireEncode for UpdateResourceRequest {
 impl WireDecode for UpdateResourceRequest {
     fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
         let (target, mut position) = ResourceTarget::decode(buf)?;
-        let reset_count = read_u8(buf, position)?;
-        position += 1;
-        let mut reset = Vec::with_capacity(usize::from(reset_count));
-        let mut names = BTreeSet::new();
-        for _ in 0..reset_count {
-            let (name, consumed) = WireName::decode(&buf[position..])?;
-            position += consumed;
-            if !names.insert(name.as_str().to_owned()) {
-                return Err(validation("a reset key is named twice"));
-            }
-            reset.push(name);
-        }
+        let (reset, consumed) = WireResetKeys::decode(&buf[position..])?;
+        position += consumed;
         let options = WireOptions::from_slice(&buf[position..])?;
         for entry in &options {
-            if std::str::from_utf8(entry.key).is_ok_and(|key| names.contains(key)) {
+            if reset
+                .iter()
+                .any(|name| name.as_str().as_bytes() == entry.key)
+            {
                 return Err(validation("a key is both set and reset"));
             }
         }
@@ -273,13 +322,13 @@ mod tests {
     const UINT64: u8 = 12;
 
     #[test]
-    fn given_resource_patch_when_roundtripping_then_should_match_golden_bytes() {
+    fn given_resource_patch_when_roundtripping_should_match_golden_bytes() {
         let topic = UpdateResourceRequest {
             target: ResourceTarget::Topic {
                 stream_id: WireIdentifier::numeric(1),
                 topic_id: WireIdentifier::named("orders").unwrap(),
             },
-            reset: vec![WireName::new("max_topic_size").unwrap()],
+            reset: reset_keys(&["max_topic_size"]),
             options: options(&[
                 (
                     STRING,
@@ -301,7 +350,7 @@ mod tests {
             target: ResourceTarget::Stream {
                 stream_id: WireIdentifier::numeric(3),
             },
-            reset: Vec::new(),
+            reset: WireResetKeys::default(),
             options: options(&[(STRING, b"name", STRING, b"renamed")]),
         };
         let bytes = stream.to_bytes();
@@ -316,7 +365,7 @@ mod tests {
             target: ResourceTarget::User {
                 user_id: WireIdentifier::named("alice").unwrap(),
             },
-            reset: Vec::new(),
+            reset: WireResetKeys::default(),
             options: options(&[
                 (STRING, b"status", STRING, b"inactive"),
                 (STRING, b"username", STRING, b"alice2"),
@@ -327,13 +376,13 @@ mod tests {
     }
 
     #[test]
-    fn given_malformed_patch_when_decoding_then_should_reject_without_panicking() {
+    fn given_malformed_patch_when_decoding_should_reject_without_panicking() {
         let valid = UpdateResourceRequest {
             target: ResourceTarget::Topic {
                 stream_id: WireIdentifier::numeric(1),
                 topic_id: WireIdentifier::numeric(2),
             },
-            reset: vec![WireName::new("max_topic_size").unwrap()],
+            reset: reset_keys(&["max_topic_size"]),
             options: options(&[(STRING, b"message_expiry", UINT64, &7u64.to_le_bytes())]),
         };
         let bytes = valid.to_bytes();
@@ -355,23 +404,20 @@ mod tests {
         assert!(UpdateResourceRequest::decode(&unknown_scope).is_err());
 
         let duplicate_reset = UpdateResourceRequest {
-            reset: vec![
-                WireName::new("max_topic_size").unwrap(),
-                WireName::new("max_topic_size").unwrap(),
-            ],
+            reset: reset_keys(&["max_topic_size", "max_topic_size"]),
             options: WireOptions::empty(),
             ..valid.clone()
         };
         assert!(UpdateResourceRequest::decode(&duplicate_reset.to_bytes()).is_err());
 
         let cross_duplicate = UpdateResourceRequest {
-            reset: vec![WireName::new("message_expiry").unwrap()],
+            reset: reset_keys(&["message_expiry"]),
             ..valid.clone()
         };
         assert!(UpdateResourceRequest::decode(&cross_duplicate.to_bytes()).is_err());
 
         let empty = UpdateResourceRequest {
-            reset: Vec::new(),
+            reset: WireResetKeys::default(),
             options: WireOptions::empty(),
             ..valid.clone()
         };
@@ -389,6 +435,37 @@ mod tests {
         );
         duplicate_set.extend_from_slice(&entries);
         assert!(UpdateResourceRequest::decode(&duplicate_set).is_err());
+    }
+
+    #[test]
+    fn given_more_reset_names_than_the_count_byte_holds_when_building_should_refuse() {
+        let names = |count: usize| -> Vec<WireName> {
+            (0..count)
+                .map(|index| WireName::new(format!("key_{index}")).unwrap())
+                .collect()
+        };
+        assert!(WireResetKeys::try_from(names(MAX_RESET_KEYS + 1)).is_err());
+        let request = UpdateResourceRequest {
+            target: ResourceTarget::Stream {
+                stream_id: WireIdentifier::numeric(1),
+            },
+            reset: WireResetKeys::try_from(names(MAX_RESET_KEYS)).unwrap(),
+            options: WireOptions::empty(),
+        };
+        assert_eq!(
+            UpdateResourceRequest::decode_from(&request.to_bytes()).unwrap(),
+            request
+        );
+    }
+
+    fn reset_keys(names: &[&str]) -> WireResetKeys {
+        WireResetKeys::try_from(
+            names
+                .iter()
+                .map(|name| WireName::new(*name).unwrap())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
     }
 
     fn options(entries: &[(u8, &[u8], u8, &[u8])]) -> WireOptions {

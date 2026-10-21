@@ -41,4 +41,4 @@ pub use get_snapshot::GetSnapshotRequest;
 pub use get_stats::GetStatsRequest;
 pub use ping::PingRequest;
 pub use retire_sessions::{MAX_SESSIONS_PER_RETIREMENT, RetireSessionsRequest};
-pub use update_resource::{MAX_RESET_KEYS, ResourceTarget, UpdateResourceRequest};
+pub use update_resource::{MAX_RESET_KEYS, ResourceTarget, UpdateResourceRequest, WireResetKeys};

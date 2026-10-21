@@ -48,6 +48,23 @@ class GlobalContext:
     last_user_id: int | None = None
 
 
+def pytest_configure(config: pytest.Config) -> None:
+    """Register the shared feature tags as markers.
+
+    The Docker image runs pytest from /app, where bdd/python/pyproject.toml is
+    not the rootdir config, so markers declared there would never load.
+    """
+    for marker in (
+        "basic-messaging: shared basic messaging scenarios",
+        "raw-command: shared raw command scenarios",
+        "stream-options: shared stream option scenarios",
+        "resource-options-patch: shared resource patch scenarios",
+        "message-headers: scenarios that assert message headers",
+        "describe-options: scenarios that assert the option catalog",
+    ):
+        config.addinivalue_line("markers", marker)
+
+
 def required_env(name: str) -> str:
     """Read a variable the suite cannot run without.
 

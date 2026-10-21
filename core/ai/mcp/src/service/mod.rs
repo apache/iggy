@@ -905,7 +905,7 @@ mod tests {
     }
 
     #[test]
-    fn given_update_topic_values_when_converting_then_should_parse_them_into_typed_options() {
+    fn given_update_topic_values_when_converting_should_parse_them_into_typed_options() {
         let update = update_topic(
             r#"{"name":"events-v2","message_expiry":"7days","max_size":"15GB","options":{"future_key":"1"}}"#,
         );
@@ -925,7 +925,7 @@ mod tests {
     }
 
     #[test]
-    fn given_unparsable_update_topic_value_when_converting_then_should_refuse() {
+    fn given_unparsable_update_topic_value_when_converting_should_refuse() {
         for body in [r#"{"message_expiry":"soon"}"#, r#"{"max_size":"big"}"#] {
             assert!(
                 TopicUpdateOptions::try_from(update_topic(body)).is_err(),
@@ -935,7 +935,7 @@ mod tests {
     }
 
     #[test]
-    fn given_reset_names_when_converting_then_should_send_known_typed_and_newer_raw() {
+    fn given_reset_names_when_converting_should_send_known_typed_and_newer_raw() {
         let update = update_topic(r#"{"reset":["message_expiry","future_key"]}"#);
 
         let options = TopicUpdateOptions::try_from(update).expect("reset names convert");
@@ -951,7 +951,7 @@ mod tests {
     }
 
     #[test]
-    fn given_stream_and_user_resets_when_converting_then_should_keep_the_name_optional() {
+    fn given_stream_and_user_resets_when_converting_should_keep_the_name_optional() {
         let stream: UpdateStream =
             serde_json::from_str(r#"{"stream_id":"orders","reset":["future_key"]}"#)
                 .expect("a reset without a name parses");

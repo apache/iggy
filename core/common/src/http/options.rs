@@ -18,13 +18,14 @@
 use crate::IggyError;
 use crate::types::message::{HeaderKey, HeaderKind, HeaderValue};
 use crate::types::options::{
-    OptionKey, OptionValue, OptionsPatch, OptionsProvenance, ResourceOptions, key_preview,
-    wire_reset_names,
+    OptionKey, OptionValue, OptionsPatch, OptionsProvenance, ResourceOptions, erase_options,
+    key_preview, wire_reset_names,
 };
 use crate::wire_conversions::resource_options_to_wire;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use iggy_binary_protocol::WireOptions;
+use secrecy::zeroize::Zeroize;
 use serde::de::{Error as _, MapAccess, Visitor};
 use serde::ser::{Error as _, SerializeMap};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -59,7 +60,10 @@ pub struct OptionInputMap(pub BTreeMap<String, OptionInputValue>);
 /// An HTTP update body: one flat object of option keys plus an optional
 /// `reset` array. A value sets the key, an absent key or `null` changes
 /// nothing, a key named in `reset` returns to its default. `null` never resets,
-/// because many JSON serializers write unset optional fields as `null`.
+/// because many JSON serializers write unset optional fields as `null`. A body
+/// that changes nothing, with no keys, only nulls or only zero sentinels such
+/// as `"message_expiry": 0`, is refused with `InvalidCommand` on every
+/// transport.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct OptionsUpdate {
     pub set: BTreeMap<String, OptionInputValue>,
@@ -74,13 +78,17 @@ impl OptionInputMap {
     /// Encode the values into a create options block, each in the kind its
     /// catalog entry expects where the JSON value fits it. Admission validates
     /// the keys and values, so a mismatch fails in the same category as on
-    /// the binary transports.
+    /// the binary transports. The map built on the way may hold the stream
+    /// key, so it is erased once encoded.
     ///
     /// # Errors
     ///
     /// `UnsupportedOptionKey` for a key that is not a valid option name.
     pub fn to_wire(&self) -> Result<WireOptions, IggyError> {
-        resource_options_to_wire(&input_options(&self.0)?, OptionsProvenance::All)
+        let options = input_options(&self.0)?;
+        let wire = resource_options_to_wire(&options, OptionsProvenance::All);
+        erase_options(options);
+        wire
     }
 
     #[must_use]
@@ -100,11 +108,35 @@ impl OptionsUpdate {
     /// wire carries.
     pub fn to_patch(&self) -> Result<OptionsPatch, IggyError> {
         let set = input_options(&self.set)?;
-        let reset = wire_reset_names(self.reset.iter().map(String::as_str))?;
-        Ok(OptionsPatch {
-            set: resource_options_to_wire(&set, OptionsProvenance::All)?,
-            reset,
-        })
+        let patch = wire_reset_names(self.reset.iter().map(String::as_str)).and_then(|reset| {
+            Ok(OptionsPatch {
+                set: resource_options_to_wire(&set, OptionsProvenance::All)?,
+                reset,
+            })
+        });
+        erase_options(set);
+        patch
+    }
+}
+
+impl OptionInputValue {
+    /// Zero text in place, since it may be the base64 stream key.
+    fn erase(&mut self) {
+        if let Self::String(text) = self {
+            text.as_mut_str().zeroize();
+        }
+    }
+}
+
+impl Drop for OptionInputMap {
+    fn drop(&mut self) {
+        self.0.values_mut().for_each(OptionInputValue::erase);
+    }
+}
+
+impl Drop for OptionsUpdate {
+    fn drop(&mut self) {
+        self.set.values_mut().for_each(OptionInputValue::erase);
     }
 }
 
@@ -183,7 +215,7 @@ impl Serialize for OptionInputMap {
 
 impl<'de> Deserialize<'de> for OptionInputMap {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_map(UniqueKeysVisitor).map(Self)
+        deserializer.deserialize_map(UniqueKeysVisitor)
     }
 }
 
@@ -211,19 +243,20 @@ impl<'de> Deserialize<'de> for OptionsUpdate {
 }
 
 impl<'de> Visitor<'de> for UniqueKeysVisitor {
-    type Value = BTreeMap<String, OptionInputValue>;
+    type Value = OptionInputMap;
 
     fn expecting(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("an object of option names to scalar values")
     }
 
     fn visit_map<A: MapAccess<'de>>(self, mut access: A) -> Result<Self::Value, A::Error> {
-        let mut values = BTreeMap::new();
-        while let Some((key, value)) = access.next_entry::<String, OptionInputValue>()? {
-            if values.contains_key(&key) {
+        let mut values = OptionInputMap::default();
+        while let Some((key, mut value)) = access.next_entry::<String, OptionInputValue>()? {
+            if values.0.contains_key(&key) {
+                value.erase();
                 return Err(A::Error::custom(format!("duplicate option key: {key}")));
             }
-            values.insert(key, value);
+            values.0.insert(key, value);
         }
         Ok(values)
     }
@@ -265,8 +298,11 @@ fn input_options(
 ) -> Result<ResourceOptions, IggyError> {
     let mut options = ResourceOptions::new();
     for (key, value) in values {
-        let header_key = HeaderKey::from_str(key)
-            .map_err(|_| IggyError::UnsupportedOptionKey(key_preview(key)))?;
+        let Ok(header_key) = HeaderKey::from_str(key) else {
+            // An entry taken before this one may hold the stream key.
+            erase_options(options);
+            return Err(IggyError::UnsupportedOptionKey(key_preview(key)));
+        };
         options.insert(
             header_key,
             OptionValue::explicit(input_header_value(key, value)),
@@ -334,14 +370,14 @@ mod tests {
     use iggy_binary_protocol::WireName;
 
     #[test]
-    fn given_update_body_when_parsing_json_then_should_skip_nulls_and_separate_resets() {
+    fn given_update_body_when_parsing_json_should_skip_nulls_and_separate_resets() {
         let update: OptionsUpdate = serde_json::from_str(
             r#"{"message_expiry":"1 day","max_topic_size":null,"messages_required_to_save":64,"preallocate_segments":true,"reset":["segment_size"]}"#,
         )
         .expect("valid update body");
         assert!(!update.set.contains_key("max_topic_size"));
         let parts = update.to_patch().expect("encodes");
-        assert_eq!(parts.reset, vec![WireName::new("segment_size").unwrap()]);
+        assert_eq!(*parts.reset, [WireName::new("segment_size").unwrap()]);
         let kinds: BTreeMap<String, u8> = (&parts.set)
             .into_iter()
             .map(|entry| {
@@ -368,7 +404,7 @@ mod tests {
     }
 
     #[test]
-    fn given_update_body_when_serializing_then_should_omit_unset_keys_and_empty_reset() {
+    fn given_update_body_when_serializing_should_omit_unset_keys_and_empty_reset() {
         let update = OptionsUpdate {
             set: BTreeMap::from([(
                 "message_expiry".to_owned(),
@@ -381,8 +417,8 @@ mod tests {
             r#"{"message_expiry":"7 days"}"#
         );
         let with_reset = OptionsUpdate {
+            set: update.set.clone(),
             reset: BTreeSet::from(["max_topic_size".to_owned()]),
-            ..update
         };
         let json = serde_json::to_string(&with_reset).unwrap();
         assert_eq!(
@@ -396,7 +432,7 @@ mod tests {
     }
 
     #[test]
-    fn given_invalid_json_shapes_when_parsing_then_should_refuse() {
+    fn given_invalid_json_shapes_when_parsing_should_refuse() {
         for body in [
             r#"{"message_expiry":1,"message_expiry":2}"#,
             r#"{"message_expiry":{"nested":1}}"#,
@@ -419,8 +455,8 @@ mod tests {
     }
 
     #[test]
-    fn given_json_value_that_does_not_fit_its_key_when_admitting_then_should_report_the_binary_category()
-     {
+    fn given_json_value_that_does_not_fit_its_key_when_admitting_should_report_the_binary_category()
+    {
         let long_name = format!(r#"{{"name":"{}"}}"#, "n".repeat(256));
         for (scope, body, expected) in [
             (
@@ -493,7 +529,7 @@ mod tests {
     }
 
     #[test]
-    fn given_text_no_header_value_holds_for_any_key_when_admitting_then_should_refuse() {
+    fn given_text_no_header_value_holds_for_any_key_when_admitting_should_refuse() {
         let long_text = "v".repeat(256);
         for scope in [
             OptionsScope::Topic,
@@ -519,7 +555,7 @@ mod tests {
     }
 
     #[test]
-    fn given_oversized_key_when_converting_then_should_echo_a_bounded_preview() {
+    fn given_oversized_key_when_converting_should_echo_a_bounded_preview() {
         let key = "k".repeat(300);
         let echoed = |error: Option<IggyError>| match error {
             Some(IggyError::UnsupportedOptionKey(shown)) => shown,
@@ -540,8 +576,7 @@ mod tests {
     }
 
     #[test]
-    fn given_more_resets_than_the_wire_carries_when_converting_then_should_refuse_unsupported_key()
-    {
+    fn given_more_resets_than_the_wire_carries_when_converting_should_refuse_unsupported_key() {
         let update = OptionsUpdate {
             set: BTreeMap::new(),
             reset: (0..256).map(|index| format!("key_{index:03}")).collect(),
@@ -553,7 +588,7 @@ mod tests {
     }
 
     #[test]
-    fn given_u64_above_2_pow_53_when_encoding_for_http_then_should_send_a_decimal_string() {
+    fn given_u64_above_2_pow_53_when_encoding_for_http_should_send_a_decimal_string() {
         let exact = (1u64 << 53) - 1;
         assert_eq!(
             OptionInputValue::try_from(&HeaderValue::from(exact)),
@@ -566,7 +601,7 @@ mod tests {
     }
 
     #[test]
-    fn given_set_key_named_reset_when_serializing_then_should_refuse() {
+    fn given_set_key_named_reset_when_serializing_should_refuse() {
         let update = OptionsUpdate {
             set: BTreeMap::from([(
                 RESET_FIELD.to_owned(),
@@ -578,7 +613,7 @@ mod tests {
     }
 
     #[test]
-    fn given_secret_input_when_debugging_then_should_redact() {
+    fn given_secret_input_when_debugging_should_redact() {
         let input: OptionInputMap =
             serde_json::from_str(r#"{"encryption_key":"c2VjcmV0LXNlY3JldA=="}"#).unwrap();
         let rendered = format!("{input:?}");
@@ -586,6 +621,29 @@ mod tests {
         let update: OptionsUpdate =
             serde_json::from_str(r#"{"encryption_key":"c2VjcmV0LXNlY3JldA=="}"#).unwrap();
         assert!(!format!("{update:?}").contains("c2VjcmV0"));
+    }
+
+    #[test]
+    fn given_parsed_bodies_with_stream_key_when_erasing_should_zero_the_key_text_in_place() {
+        const BODY: &str = r#"{"encryption_key":"c2VjcmV0LXNlY3JldA==","message_expiry":7}"#;
+        let mut input: OptionInputMap = serde_json::from_str(BODY).expect("valid create options");
+        let mut update: OptionsUpdate = serde_json::from_str(BODY).expect("valid update body");
+        for values in [&mut input.0, &mut update.set] {
+            let key = values
+                .get_mut(<&str>::from(OptionKey::EncryptionKey))
+                .expect("key parsed");
+            let OptionInputValue::String(text) = &*key else {
+                panic!("the key parses as text");
+            };
+            let (address, length) = (text.as_ptr(), text.len());
+            key.erase();
+            let OptionInputValue::String(text) = &*key else {
+                panic!("erasing keeps the kind");
+            };
+            assert_eq!(text.as_ptr(), address, "zeroed in its own buffer");
+            assert_eq!(text.as_bytes(), vec![0; length], "every byte zeroed");
+            assert_eq!(values["message_expiry"], OptionInputValue::U64(7));
+        }
     }
 
     fn admit_update(scope: OptionsScope, body: &str) -> Result<AdmittedOptions, IggyError> {

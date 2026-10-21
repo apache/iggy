@@ -28,7 +28,7 @@ struct ResourceOptionsE2ETests {
     /// Keys no read may ever carry.
     static let neverReturnedKeys: Set<String> = ["encryption_key", "encryption_key_wrapped", "critical_keys"]
 
-    @Test func givenStreamKeyWhenCreatingThenShouldReadMatchingProjection() async throws {
+    @Test func givenStreamKeyWhenCreatingShouldReadMatchingProjection() async throws {
         try await E2EEnvironment.withSession() { session in
             let client = session.client
             let key = Self.randomKey()
@@ -52,7 +52,7 @@ struct ResourceOptionsE2ETests {
         }
     }
 
-    @Test func givenKeylessStreamWhenReadingThenShouldReportServerGeneratedKey() async throws {
+    @Test func givenKeylessStreamWhenReadingShouldReportServerGeneratedKey() async throws {
         try await E2EEnvironment.withSession() { session in
             let client = session.client
             var fingerprints: [String] = []
@@ -77,7 +77,7 @@ struct ResourceOptionsE2ETests {
         }
     }
 
-    @Test func givenStreamRenameWhenUpdatingThenShouldPreserveEncryptionProjection() async throws {
+    @Test func givenStreamRenameWhenUpdatingShouldPreserveEncryptionProjection() async throws {
         try await E2EEnvironment.withSession() { session in
             let client = session.client
             let key = Self.randomKey()
@@ -118,7 +118,7 @@ struct ResourceOptionsE2ETests {
         }
     }
 
-    @Test func givenTopicResetWhenUpdatingThenShouldPreserveUnmentionedValues() async throws {
+    @Test func givenTopicResetWhenUpdatingShouldPreserveUnmentionedValues() async throws {
         try await E2EEnvironment.withSession() { session in
             let client = session.client
             let name = E2EEnvironment.uniqueName("swift-reset")
@@ -187,7 +187,7 @@ struct ResourceOptionsE2ETests {
         }
     }
 
-    @Test func givenUserOptionsWhenCreatingAndUpdatingThenShouldPreserveUserBehavior() async throws {
+    @Test func givenUserOptionsWhenCreatingAndUpdatingShouldPreserveUserBehavior() async throws {
         try await E2EEnvironment.withSession() { session in
             let client = session.client
             let first = String(E2EEnvironment.uniqueName("swift-opt-a").prefix(50))
@@ -225,7 +225,7 @@ struct ResourceOptionsE2ETests {
         }
     }
 
-    @Test func givenLoggedInUserRenameWhenReconnectingThenShouldKeepNewUsername() async throws {
+    @Test func givenLoggedInUserRenameWhenReconnectingShouldKeepNewUsername() async throws {
         try await E2EEnvironment.withSession() { session in
             let root = session.client
             let username = String(E2EEnvironment.uniqueName("swift-self").prefix(50))

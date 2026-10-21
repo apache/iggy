@@ -261,7 +261,7 @@ func TestCredentialChange_CommittedChangeIsTheNextSignIn(t *testing.T) {
 }
 
 func TestCredentialChange_GenericUserPatch(t *testing.T) {
-	t.Run("given_logged_in_user_rename_when_reconnecting_then_should_keep_new_username", func(t *testing.T) {
+	t.Run("given_logged_in_user_rename_when_reconnecting_should_keep_new_username", func(t *testing.T) {
 		for _, raw := range []bool{false, true} {
 			for _, autoLogin := range []bool{false, true} {
 				t.Run(fmt.Sprintf("self_rename/raw_%t/auto_login_%t", raw, autoLogin), func(t *testing.T) {

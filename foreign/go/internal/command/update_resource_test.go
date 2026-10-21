@@ -32,7 +32,7 @@ func TestUpdateResource_RawPatches(t *testing.T) {
 	streamId, _ := iggcon.NewIdentifier(uint32(1))
 	topicId, _ := iggcon.NewIdentifier(uint32(2))
 
-	t.Run("given_raw_set_key_and_create_only_reset_when_patching_then_should_send_it_for_the_server_to_decide", func(t *testing.T) {
+	t.Run("given_raw_set_key_and_create_only_reset_when_patching_should_send_it_for_the_server_to_decide", func(t *testing.T) {
 		update := &UpdateTopic{
 			StreamId: streamId,
 			TopicId:  topicId,
@@ -48,7 +48,7 @@ func TestUpdateResource_RawPatches(t *testing.T) {
 		}
 	})
 
-	t.Run("given_raw_reset_when_patching_then_should_send_it_for_the_server_to_decide", func(t *testing.T) {
+	t.Run("given_raw_reset_when_patching_should_send_it_for_the_server_to_decide", func(t *testing.T) {
 		update := &UpdateStream{StreamId: streamId, RawReset: []string{"retention_class", "retention_class"}}
 		body, err := update.MarshalBinary()
 		if err != nil {
@@ -63,7 +63,7 @@ func TestUpdateResource_RawPatches(t *testing.T) {
 		}
 	})
 
-	t.Run("given_raw_reset_also_set_when_patching_then_should_refuse_invalid_command", func(t *testing.T) {
+	t.Run("given_raw_reset_also_set_when_patching_should_refuse_invalid_command", func(t *testing.T) {
 		update := &UpdateTopic{
 			StreamId: streamId,
 			TopicId:  topicId,
@@ -76,7 +76,7 @@ func TestUpdateResource_RawPatches(t *testing.T) {
 		}
 	})
 
-	t.Run("given_more_resets_than_the_wire_carries_when_patching_then_should_refuse_unsupported_key", func(t *testing.T) {
+	t.Run("given_more_resets_than_the_wire_carries_when_patching_should_refuse_unsupported_key", func(t *testing.T) {
 		reset := make([]string, 0, 256)
 		for index := range 256 {
 			reset = append(reset, fmt.Sprintf("future_%03d", index))
@@ -87,7 +87,7 @@ func TestUpdateResource_RawPatches(t *testing.T) {
 		}
 	})
 
-	t.Run("given_reset_name_the_wire_cannot_carry_when_patching_then_should_refuse_with_a_bounded_preview", func(t *testing.T) {
+	t.Run("given_reset_name_the_wire_cannot_carry_when_patching_should_refuse_with_a_bounded_preview", func(t *testing.T) {
 		for _, name := range []string{"", strings.Repeat("k", 256)} {
 			_, err := (&UpdateStream{StreamId: streamId, RawReset: []string{name}}).MarshalBinary()
 			var unsupported ierror.UnsupportedOptionKey
@@ -99,7 +99,7 @@ func TestUpdateResource_RawPatches(t *testing.T) {
 }
 
 func TestUpdateResource_OptionsBlockBounds(t *testing.T) {
-	t.Run("given_block_at_the_byte_limit_when_encoding_then_should_accept_it_and_refuse_one_byte_more", func(t *testing.T) {
+	t.Run("given_block_at_the_byte_limit_when_encoding_should_accept_it_and_refuse_one_byte_more", func(t *testing.T) {
 		// 200 entries of 10 framing bytes, a 245-byte key and a 245-byte value.
 		entries := make([]iggcon.HeaderEntry, 0, 200)
 		for index := range 200 {
@@ -115,7 +115,7 @@ func TestUpdateResource_OptionsBlockBounds(t *testing.T) {
 		}
 	})
 
-	t.Run("given_more_entries_than_the_limit_when_encoding_then_should_refuse_block_too_large", func(t *testing.T) {
+	t.Run("given_more_entries_than_the_limit_when_encoding_should_refuse_block_too_large", func(t *testing.T) {
 		entries := make([]iggcon.HeaderEntry, 0, maxOptions+1)
 		for index := range maxOptions + 1 {
 			entries = append(entries, rawEntry(fmt.Sprintf("key_%04d", index), "v"))
@@ -128,7 +128,7 @@ func TestUpdateResource_OptionsBlockBounds(t *testing.T) {
 		}
 	})
 
-	t.Run("given_malformed_entry_when_encoding_then_should_refuse_with_the_server_category", func(t *testing.T) {
+	t.Run("given_malformed_entry_when_encoding_should_refuse_with_the_server_category", func(t *testing.T) {
 		cases := []struct {
 			name  string
 			entry iggcon.HeaderEntry
@@ -156,7 +156,7 @@ func TestUpdateResource_OptionsBlockBounds(t *testing.T) {
 		}
 	})
 
-	t.Run("given_raw_entries_with_the_same_key_when_encoding_then_should_refuse_invalid_command", func(t *testing.T) {
+	t.Run("given_raw_entries_with_the_same_key_when_encoding_should_refuse_invalid_command", func(t *testing.T) {
 		_, err := encodeOptions([]iggcon.HeaderEntry{rawEntry("future", "a"), rawEntry("future", "b")})
 		if !errors.Is(err, ierror.ErrInvalidCommand) {
 			t.Fatalf("got %v, want invalid command", err)

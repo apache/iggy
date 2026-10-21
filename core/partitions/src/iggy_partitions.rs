@@ -38,7 +38,7 @@ use server_common::send_messages::{ChecksumMode, convert_request_message, encryp
 use server_common::sharding::{IggyNamespace, LocalIdx, ShardId};
 use std::cell::Cell;
 use std::cell::{RefCell, UnsafeCell};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::task::Waker;
@@ -215,9 +215,15 @@ where
         self.keyring.borrow_mut().resolve(identity, encryption)
     }
 
-    /// Drop the encryptors of stream incarnations that no longer exist.
-    pub fn retain_stream_keys(&self, live: &BTreeSet<StreamKeyIdentity>) {
-        self.keyring.borrow_mut().retain(live);
+    /// Whether this shard holds the key of any stream incarnation.
+    #[must_use]
+    pub fn has_stream_keys(&self) -> bool {
+        !self.keyring.borrow().is_empty()
+    }
+
+    /// Drop the encryptors of the stream incarnations `is_live` rejects.
+    pub fn retain_stream_keys(&self, is_live: impl FnMut(StreamKeyIdentity) -> bool) {
+        self.keyring.borrow_mut().retain(is_live);
     }
 
     pub fn set_persistence_notifier(&self, notifier: crate::PersistenceNotifier) {
@@ -827,6 +833,21 @@ where
             );
             return;
         }
+        let Some(partition) = self.get_mut_by_ns(&namespace) else {
+            warn!(
+                target: "iggy.partitions.diag",
+                plane = "partitions",
+                namespace_raw = namespace.inner(),
+                operation = ?message.header().operation,
+                "partition not initialized for namespace"
+            );
+            Self::answer_waiter(
+                reply.take(),
+                message.header(),
+                IggyError::TransientNotAccepted.as_code(),
+            );
+            return;
+        };
         // At-rest encryption happens HERE, once, before the op enters
         // consensus: canonicalize the wire form first so both the legacy and
         // v2 request encodings encrypt identically, then encrypt payload +
@@ -835,11 +856,8 @@ where
         // identical bytes -- and the poll reply is the single decrypt point.
         // The partition's own encryptor: each stream has its own key, pinned
         // to the partition when it was built.
-        let encryptor = self
-            .get_by_ns(&namespace)
-            .and_then(|partition| partition.encryptor().cloned());
         let message = if message.header().operation == Operation::SendMessages
-            && let Some(encryptor) = &encryptor
+            && let Some(encryptor) = partition.encryptor()
         {
             // Compute the batch checksum: this canonical output is validated by
             // `encrypt_batch_request`'s decode before re-encryption, and the
@@ -865,21 +883,6 @@ where
             }
         } else {
             message
-        };
-        let Some(partition) = self.get_mut_by_ns(&namespace) else {
-            warn!(
-                target: "iggy.partitions.diag",
-                plane = "partitions",
-                namespace_raw = namespace.inner(),
-                operation = ?message.header().operation,
-                "partition not initialized for namespace"
-            );
-            Self::answer_waiter(
-                reply.take(),
-                message.header(),
-                IggyError::TransientNotAccepted.as_code(),
-            );
-            return;
         };
         partition.on_request(message, reply).await;
     }

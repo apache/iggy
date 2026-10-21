@@ -109,7 +109,7 @@ class TestStreamOptions:
     """Typed stream create options, encryption projections and updates."""
 
     @pytest.mark.asyncio
-    async def test_given_stream_key_when_creating_then_should_read_matching_projection(
+    async def test_given_stream_key_when_creating_should_read_matching_projection(
         self, transport_client: IggyClient, unique_name
     ):
         """A client key comes back only as its source and fingerprints."""
@@ -133,7 +133,7 @@ class TestStreamOptions:
         assert listed.encryption_kek_fingerprints == fetched.encryption_kek_fingerprints
 
     @pytest.mark.asyncio
-    async def test_given_keyless_stream_when_reading_then_should_report_server_generated_key(  # noqa: E501
+    async def test_given_keyless_stream_when_reading_should_report_server_generated_key(  # noqa: E501
         self, transport_client: IggyClient, unique_name
     ):
         """A server with encryption enabled generates a key for a keyless stream."""
@@ -148,7 +148,7 @@ class TestStreamOptions:
             assert_encryption_projection(stream, "server", fingerprint)
 
     @pytest.mark.asyncio
-    async def test_given_stream_rename_when_updating_then_should_preserve_encryption_projection(  # noqa: E501
+    async def test_given_stream_rename_when_updating_should_preserve_encryption_projection(  # noqa: E501
         self, transport_client: IggyClient, unique_name
     ):
         """A rename keeps the stream's key, so data written before still reads."""
@@ -191,7 +191,7 @@ class TestStreamOptions:
         assert [message.payload().decode() for message in polled] == [payload]
 
     @pytest.mark.asyncio
-    async def test_given_stream_key_reset_when_updating_then_should_reject_without_changing_state(  # noqa: E501
+    async def test_given_stream_key_reset_when_updating_should_reject_without_changing_state(  # noqa: E501
         self, transport_client: IggyClient, unique_name
     ):
         """No stream key is resettable, so a reset is refused before it is sent."""
@@ -218,7 +218,7 @@ class TestTopicOptions:
     """Typed topic create options and generic topic updates."""
 
     @pytest.mark.asyncio
-    async def test_given_keyword_topic_options_when_creating_then_should_preserve_all_ten_settings(  # noqa: E501
+    async def test_given_keyword_topic_options_when_creating_should_preserve_all_ten_settings(  # noqa: E501
         self, transport_client: IggyClient, unique_name
     ):
         """Every known create setting has a typed field and reads back explicit."""
@@ -265,7 +265,7 @@ class TestTopicOptions:
         assert topic.max_topic_size.bytes == GIB
 
     @pytest.mark.asyncio
-    async def test_given_topic_reset_when_updating_then_should_preserve_unmentioned_values(  # noqa: E501
+    async def test_given_topic_reset_when_updating_should_preserve_unmentioned_values(  # noqa: E501
         self, transport_client: IggyClient, unique_name
     ):
         """An update without a name changes only the keys it names or resets."""
@@ -315,7 +315,7 @@ class TestUserOptions:
     """Typed user create options and generic user updates."""
 
     @pytest.mark.asyncio
-    async def test_given_user_options_when_creating_and_updating_then_should_preserve_user_behavior(  # noqa: E501
+    async def test_given_user_options_when_creating_and_updating_should_preserve_user_behavior(  # noqa: E501
         self, transport_client: IggyClient, unique_name
     ):
         """A username and status patch applies together or not at all."""
@@ -361,7 +361,7 @@ class TestUserOptions:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("transport", ["tcp", "quic", "websocket"])
-    async def test_given_logged_in_user_rename_when_reconnecting_then_should_keep_new_username(  # noqa: E501
+    async def test_given_logged_in_user_rename_when_reconnecting_should_keep_new_username(  # noqa: E501
         self, iggy_client: IggyClient, unique_name, transport: str
     ):
         """A self-rename refreshes the credentials a reconnect replays.
@@ -408,7 +408,7 @@ class TestServerOptionContract:
     """Descriptors and refusals that come back from the server."""
 
     @pytest.mark.asyncio
-    async def test_given_every_scope_when_describing_options_then_should_match_fixture(  # noqa: E501
+    async def test_given_every_scope_when_describing_options_should_match_fixture(  # noqa: E501
         self, transport_client: IggyClient
     ):
         """Every transport decodes the same descriptors and flags."""
@@ -423,7 +423,7 @@ class TestServerOptionContract:
                     assert getattr(spec, flag) == bool(entry["flags"] & mask), flag
 
     @pytest.mark.asyncio
-    async def test_given_raw_reset_of_internal_key_when_updating_then_should_get_server_refusal(  # noqa: E501
+    async def test_given_raw_reset_of_internal_key_when_updating_should_get_server_refusal(  # noqa: E501
         self, transport_client: IggyClient, unique_name
     ):
         """A raw reset name travels to the server, which decides it."""
@@ -442,7 +442,7 @@ class TestServerOptionContract:
             await transport_client.delete_user(created.id)
 
     @pytest.mark.asyncio
-    async def test_given_raw_set_key_refused_by_admission_when_updating_then_should_get_server_refusal(  # noqa: E501
+    async def test_given_raw_set_key_refused_by_admission_when_updating_should_get_server_refusal(  # noqa: E501
         self, transport_client: IggyClient, unique_name
     ):
         """Raw set keys reach the server, which refuses them by category."""
@@ -472,7 +472,7 @@ class TestSharedVectors:
     """The binding against the vectors the Rust encoders generated."""
 
     @pytest.mark.unit
-    def test_given_shared_vectors_when_encoding_then_should_match_server_contract(
+    def test_given_shared_vectors_when_encoding_should_match_server_contract(
         self,
     ):
         """Fingerprints, key members and typed refusals match the server."""
@@ -512,7 +512,7 @@ class TestSharedVectors:
                 assert not isinstance(refusal.value, OptionError), name
 
     @pytest.mark.unit
-    def test_given_fixture_catalog_when_reading_typed_surface_then_should_cover_every_key(  # noqa: E501
+    def test_given_fixture_catalog_when_reading_typed_surface_should_cover_every_key(  # noqa: E501
         self,
     ):
         """Every public catalog key has its typed field, reset member or accessor."""
@@ -554,7 +554,7 @@ class TestSharedVectors:
                         )
 
     @pytest.mark.unit
-    def test_given_invalid_key_when_encoding_then_should_reject_before_network_io(
+    def test_given_invalid_key_when_encoding_should_reject_before_network_io(
         self,
     ):
         """Only exactly 32 bytes or their canonical base64 form are accepted."""
@@ -584,7 +584,7 @@ class TestSharedVectors:
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("iggy_client")
-async def test_given_invalid_key_when_creating_then_should_send_no_request(
+async def test_given_invalid_key_when_creating_should_send_no_request(
     transport_client: IggyClient, unique_name
 ):
     """An invalid key never reaches the server on any transport."""

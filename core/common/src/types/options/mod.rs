@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Key-value options attached to streams, topics, and users at creation.
+//! Key-value options of streams, topics, and users: set at creation, changed
+//! later with an `UpdateResource` patch.
 //!
 //! Options reuse the typed [`HeaderKey`] / [`HeaderValue`] machinery from
 //! message user headers. The map MUST stay a `BTreeMap`: metadata snapshots
@@ -24,34 +25,33 @@
 //!
 //! # SDK parity
 //!
-//! Every SDK can set any option key, read both blocks back, and ask the server
-//! which keys it accepts. What differs is only how each language spells the
-//! argument, since each reuses the type it already had for message user headers:
+//! Every SDK sends catalog keys through typed create and update options, names
+//! resets with a typed key enum, reads both option blocks back and asks the
+//! server which keys it accepts with `describe_options`. A key newer than the
+//! build travels through the raw escape hatch, string-keyed entries and reset
+//! names that only server admission judges:
 //!
-//! | SDK    | Arbitrary keys on create/update      | Reads the blocks | `describe_options` |
-//! |--------|--------------------------------------|------------------|--------------------|
-//! | Rust   | `TopicCreateOptions::raw`            | yes              | yes                |
-//! | Node   | `options?: OptionEntry[]`            | yes              | yes                |
-//! | Python | `options=` string dict                | yes              | yes                |
-//! | Go     | trailing `options ...HeaderEntry`    | yes              | yes                |
-//! | Java   | `Map<String, HeaderValue>` overload  | yes              | yes                |
-//! | C#     | optional `IReadOnlyDictionary`       | yes              | yes                |
-//! | C++    | trailing `Vec<HeaderEntry>`          | yes              | yes                |
+//! | SDK    | Typed options                                           | Raw entries and resets          |
+//! |--------|---------------------------------------------------------|---------------------------------|
+//! | Rust   | `StreamCreateOptions`, `TopicUpdateOptions` and kin     | `raw`, `raw_reset`              |
+//! | Node   | `StreamOptions`, `UpdateTopic` and kin                  | `options`, `rawReset`           |
+//! | Python | `StreamOptions`, `TopicOptions`, `update_*` keywords    | `raw` or `options`, `raw_reset` |
+//! | Go     | `StreamOptions`, `TopicUpdate` and kin                  | `Raw` or `Options`, `RawReset`  |
+//! | Java   | `StreamOptions`, `TopicUpdate` and kin                  | `raw`, `rawReset`               |
+//! | C#     | `StreamOptions`, `TopicUpdate` and kin                  | `Options`, `RawReset`           |
+//! | C++    | `StreamCreateOptions`, `TopicUpdateOptions` and kin     | `SetRawEntries()`, `RawReset()` |
+//! | Swift  | `StreamCreateOptions`, `TopicUpdateOptions` and kin     | `raw`, `rawReset`               |
+//! | PHP    | named arguments of `createTopic`, `updateTopic` and kin | `$raw`, `$raw_reset`            |
 //!
-//! One transport caveat everywhere: REST renders option values as readable
-//! strings rather than the typed TLV, so a value read back over HTTP is
-//! String-kinded while the same value over a binary transport carries the kind
-//! the server stored. REST also reports both provenances in one map with a
-//! per-entry flag, which each SDK splits into the two maps its binary path
-//! produces.
+//! REST carries each value as reversible text with its kind, so an HTTP reader
+//! rebuilds the value a binary reader gets. It reports both provenances in one
+//! map with a per-entry flag, which each SDK splits into the two maps its
+//! binary path produces.
 //!
-//! Beyond the eight typed keys, Go, Java, C# and C++ ship typed constructors or
-//! builders for the five keys that have no named parameter of their own, so no
-//! caller has to spell an option key as a bare string.
-//!
-//! The block's byte layout is pinned by a golden vector that Rust, Node, Go and
-//! Java each assert independently, so a new encoder has a fixture to match
-//! rather than a description to interpret.
+//! The byte layout of every option-carrying request and response is pinned by
+//! the `resource_options.json` fixture, which Rust and all eight foreign SDKs
+//! assert independently, so a new encoder has a fixture to match rather than
+//! a description to interpret.
 
 mod catalog;
 mod codec;
@@ -76,10 +76,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Debug, Formatter};
 use std::str::FromStr;
 
-use iggy_binary_protocol::requests::system::MAX_RESET_KEYS;
+use bytes::Bytes;
+use iggy_binary_protocol::requests::system::{MAX_RESET_KEYS, WireResetKeys};
 use iggy_binary_protocol::{WireName, WireOptions, WireUserHeaderEntry};
+use secrecy::zeroize::Zeroize;
 use serde::{Deserialize, Serialize};
 
+use self::catalog::critical_wrap_set;
 use crate::http::options::{OptionInputValue, OptionsUpdate, RESET_FIELD};
 use crate::types::compression::compression_algorithm::CompressionAlgorithm;
 use crate::types::message::{HeaderKey, HeaderKind, HeaderValue};
@@ -136,6 +139,14 @@ impl OptionValue {
             value,
             explicit: false,
         }
+    }
+
+    /// Zero the value's bytes when this is their only handle, for a value that
+    /// may be a secret. Shared bytes are left to their other owners.
+    pub fn erase(self) {
+        let bytes = self.value.value();
+        drop(self);
+        erase_buffer(bytes);
     }
 }
 
@@ -445,6 +456,20 @@ pub fn validate_topic_segment_size(size_bytes: u64, ceiling: u64) -> Result<(), 
     Ok(())
 }
 
+/// Zero every value of `options` this map holds the only handle to, for a map
+/// that may hold a secret value. A value another handle shares is left to it.
+pub fn erase_options(options: ResourceOptions) {
+    options.into_values().for_each(OptionValue::erase);
+}
+
+/// Zero `buffer` when this is its only handle, for a buffer that may hold a
+/// secret. A shared buffer is left to its other owners.
+pub fn erase_buffer(buffer: Bytes) {
+    if let Ok(mut owned) = buffer.try_into_mut() {
+        owned.as_mut().zeroize();
+    }
+}
+
 /// Resource whose option catalog `DescribeOptions` serves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -559,7 +584,7 @@ pub(crate) fn key_preview(key: &str) -> String {
 /// than the wire carries, naming one of its names outside the catalog.
 pub(crate) fn wire_reset_names<'a>(
     names: impl Iterator<Item = &'a str>,
-) -> Result<Vec<WireName>, IggyError> {
+) -> Result<WireResetKeys, IggyError> {
     let reset = names
         .map(|name| {
             WireName::new(name).map_err(|_| IggyError::UnsupportedOptionKey(key_preview(name)))
@@ -575,7 +600,7 @@ pub(crate) fn wire_reset_names<'a>(
                 IggyError::UnsupportedOptionKey(key_preview(name.as_str()))
             }));
     }
-    Ok(reset)
+    WireResetKeys::try_from(reset).map_err(|_| IggyError::InvalidCommand)
 }
 
 /// Build an options map from string key-values, all marked explicit.
@@ -591,11 +616,23 @@ pub(crate) fn wire_reset_names<'a>(
 fn raw_options_map(raw: &BTreeMap<String, String>) -> Result<ResourceOptions, IggyError> {
     let mut options = ResourceOptions::new();
     for (key, value) in raw {
-        let header_key = HeaderKey::from_str(key)
-            .map_err(|_| IggyError::UnsupportedOptionKey(key_preview(key)))?;
-        let header_value = HeaderValue::try_from(value.as_str())
-            .map_err(|_| IggyError::InvalidOptionValue(key_preview(key)))?;
-        options.insert(header_key, OptionValue::explicit(header_value));
+        let entry = HeaderKey::from_str(key)
+            .map_err(|_| IggyError::UnsupportedOptionKey(key_preview(key)))
+            .and_then(|header_key| {
+                HeaderValue::try_from(value.as_str())
+                    .map(|header_value| (header_key, header_value))
+                    .map_err(|_| IggyError::InvalidOptionValue(key_preview(key)))
+            });
+        match entry {
+            Ok((header_key, header_value)) => {
+                options.insert(header_key, OptionValue::explicit(header_value));
+            }
+            Err(error) => {
+                // A raw value may be a secret, the stream key among them.
+                erase_options(options);
+                return Err(error);
+            }
+        }
     }
     Ok(options)
 }
@@ -605,7 +642,7 @@ fn raw_options_map(raw: &BTreeMap<String, String>) -> Result<ResourceOptions, Ig
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OptionsPatch {
     pub set: WireOptions,
-    pub reset: Vec<WireName>,
+    pub reset: WireResetKeys,
 }
 
 /// The options a `CreateStream` may carry.
@@ -717,10 +754,11 @@ impl StreamCreateOptions {
     ///
     /// See `raw_options_map`.
     pub fn to_wire(&self) -> Result<WireOptions, IggyError> {
-        crate::wire_conversions::resource_options_to_wire(
-            &self.to_option_map()?,
-            OptionsProvenance::All,
-        )
+        let options = self.to_option_map()?;
+        let wire =
+            crate::wire_conversions::resource_options_to_wire(&options, OptionsProvenance::All);
+        erase_options(options);
+        wire
     }
 
     /// The present keys as string values for an HTTP body. The key travels as
@@ -730,16 +768,28 @@ impl StreamCreateOptions {
     ///
     /// See `raw_options_map`.
     pub fn to_input_map(&self) -> Result<BTreeMap<String, OptionInputValue>, IggyError> {
-        option_input_map(&self.to_option_map()?)
+        let options = self.to_option_map()?;
+        let input = option_input_map(&options);
+        erase_options(options);
+        input
     }
 
+    /// The present keys as a map that holds the key itself, so callers erase it.
     fn to_option_map(&self) -> Result<ResourceOptions, IggyError> {
         let mut options = raw_options_map(&self.raw)?;
         if let Some(key) = &self.encryption_key {
-            options.insert(
-                HeaderKey::from(OptionKey::EncryptionKey),
-                OptionValue::explicit(HeaderValue::try_from(key.as_bytes().as_slice())?),
-            );
+            match HeaderValue::try_from(key.as_bytes().as_slice()) {
+                Ok(value) => {
+                    options.insert(
+                        HeaderKey::from(OptionKey::EncryptionKey),
+                        OptionValue::explicit(value),
+                    );
+                }
+                Err(error) => {
+                    erase_options(options);
+                    return Err(error);
+                }
+            }
         }
         Ok(options)
     }
@@ -920,7 +970,7 @@ impl UserUpdateOptions {
 
 impl From<&ResourceOptions> for StreamEncryption {
     fn from(options: &ResourceOptions) -> Self {
-        match check_critical_options(options).and_then(|()| stream_wrap_set(options)) {
+        match critical_wrap_set(options) {
             Ok(Some(set)) => Self::Wrapped(set),
             Ok(None) => Self::Plaintext,
             Err(error) => Self::Unavailable(error),
@@ -942,7 +992,7 @@ impl From<&ResourceOptions> for TopicResolvedOptions {
                 .max_topic_size
                 .unwrap_or_else(|| MaxTopicSize::from(DEFAULT_MAX_TOPIC_SIZE)),
             partition_resize_policy: parsed.partition_resize_policy.unwrap_or_default(),
-            runtime: TopicRuntimeOptions::from_resource_options(options),
+            runtime: TopicRuntimeOptions::from(&parsed),
         }
     }
 }
@@ -1092,7 +1142,12 @@ impl TopicRuntimeOptions {
     /// reset its segment size along with it.
     #[must_use]
     pub fn from_resource_options(options: &ResourceOptions) -> Self {
-        let parsed = TopicCreateOptions::from_resource_options(options);
+        Self::from(&TopicCreateOptions::from_resource_options(options))
+    }
+}
+
+impl From<&TopicCreateOptions> for TopicRuntimeOptions {
+    fn from(parsed: &TopicCreateOptions) -> Self {
         Self {
             segment_size: parsed.segment_size,
             durability: parsed.durability,
@@ -1455,7 +1510,7 @@ mod tests {
     use strum::IntoEnumIterator;
 
     #[test]
-    fn given_any_single_reset_when_patching_then_should_match_server_admission() {
+    fn given_any_single_reset_when_patching_should_match_server_admission() {
         let context = OptionAdmissionContext::default();
         for scope in [
             OptionsScope::Topic,
@@ -1487,7 +1542,7 @@ mod tests {
     }
 
     #[test]
-    fn given_raw_key_named_reset_when_building_update_body_then_should_refuse_unsupported_key() {
+    fn given_raw_key_named_reset_when_building_update_body_should_refuse_unsupported_key() {
         let update = TopicUpdateOptions {
             raw: BTreeMap::from([(RESET_FIELD.to_owned(), "x".to_owned())]),
             ..TopicUpdateOptions::default()
@@ -1499,7 +1554,7 @@ mod tests {
     }
 
     #[test]
-    fn given_raw_reset_when_patching_then_should_send_it_for_the_server_to_decide() {
+    fn given_raw_reset_when_patching_should_send_it_for_the_server_to_decide() {
         let update = TopicUpdateOptions {
             reset: BTreeSet::from([OptionKey::MessageExpiry]),
             raw_reset: BTreeSet::from(["future_key".to_owned(), "segment_size".to_owned()]),
@@ -1530,8 +1585,7 @@ mod tests {
     }
 
     #[test]
-    fn given_patch_failing_several_checks_when_patching_then_should_report_the_admission_category()
-    {
+    fn given_patch_failing_several_checks_when_patching_should_report_the_admission_category() {
         let read_only_raw = StreamUpdateOptions {
             reset: BTreeSet::from([OptionKey::Name]),
             raw: BTreeMap::from([(
@@ -1585,7 +1639,7 @@ mod tests {
     }
 
     #[test]
-    fn given_every_topic_catalog_row_when_creating_then_should_parse_store_and_default_it() {
+    fn given_every_topic_catalog_row_when_creating_should_parse_store_and_default_it() {
         let derived = derived_defaults(OptionsScope::Topic, &ResourceOptions::new())
             .expect("derived defaults build");
         let unset = TopicResolvedOptions::from(&ResourceOptions::new());
@@ -1650,7 +1704,7 @@ mod tests {
     }
 
     #[test]
-    fn given_stream_create_options_with_keys_when_debugging_then_should_redact_them() {
+    fn given_stream_create_options_with_keys_when_debugging_should_redact_them() {
         let options = StreamCreateOptions {
             encryption_key: Some(
                 StreamEncryptionKey::try_from([7u8; 32].as_slice()).expect("32-byte key"),
@@ -1827,7 +1881,7 @@ mod tests {
     }
 
     #[test]
-    fn given_all_header_kinds_when_roundtripping_http_then_should_preserve_bytes_and_provenance() {
+    fn given_all_header_kinds_when_roundtripping_http_should_preserve_bytes_and_provenance() {
         #[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq)]
         struct Holder {
             #[serde(default, with = "super::resource_options_json")]

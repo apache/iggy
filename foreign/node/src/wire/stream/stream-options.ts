@@ -16,6 +16,8 @@
 // under the License.
 
 import { createHash } from 'node:crypto';
+import { inspect } from 'node:util';
+import { COMMAND_CODE } from '../command.code.js';
 import { responseError } from '../error.utils.js';
 import type { OptionEntry } from '../options.utils.js';
 
@@ -26,21 +28,66 @@ const FINGERPRINT_LABEL = 'iggy/stream-key-fingerprint/v1';
 /**
  * Options a stream takes at create.
  *
- * `encryptionKey` is the stream's own data key: 32 random bytes, or their
- * canonical padded base64. It travels inside the create request, so protect
- * the connection with TLS. The server stores it wrapped and never returns it,
- * reads report only its source and fingerprints. Without a key, a server with
- * encryption enabled generates one for the stream.
+ * `encryptionKey` is the stream's own data key. It travels inside the create
+ * request, so protect the connection with TLS. The server stores it wrapped
+ * and never returns it, reads report only its source and fingerprints.
+ * Without a key, a server with encryption enabled generates one for the
+ * stream.
  */
 export type StreamOptions = {
   /** The stream's data key, set once at create */
-  encryptionKey?: Buffer | string,
+  encryptionKey?: StreamEncryptionKey,
   /**
    * Option keys with no field of their own, for a key the server catalog
-   * gained after this build shipped. A field above wins on collision.
+   * gained after this build shipped. These entries print as given, so an
+   * `encryption_key` entry is refused with error 70 before anything is sent.
    */
   options?: OptionEntry[]
 };
+
+/**
+ * A stream data key: 32 random bytes. It prints only its fingerprint through
+ * `util.inspect`, `JSON.stringify` and string conversion, so arguments
+ * carrying it are safe to log. Never derive it from a password, because the
+ * fingerprint is then an offline guessing oracle.
+ */
+export class StreamEncryptionKey {
+  readonly #bytes: Buffer;
+
+  private constructor(bytes: Buffer) {
+    this.#bytes = bytes;
+  }
+
+  /**
+   * @param key - 32 raw bytes, or their canonical padded base64. The bytes are copied
+   * @throws ResponseError with code 70 (invalid encryption key) for any other input
+   */
+  static from(key: Buffer | string): StreamEncryptionKey {
+    return new StreamEncryptionKey(Buffer.from(streamEncryptionKey(key, COMMAND_CODE.CreateStream)));
+  }
+
+  /** The value `getStream` reports as `encryptionKeyFingerprint` for this key */
+  fingerprint(): string {
+    return encryptionKeyFingerprint(this.#bytes);
+  }
+
+  /** A copy of the raw key, for the request encoder */
+  asBytes(): Buffer {
+    return Buffer.from(this.#bytes);
+  }
+
+  toString(): string {
+    return `StreamEncryptionKey { fingerprint: ${this.fingerprint()} }`;
+  }
+
+  toJSON(): { fingerprint: string } {
+    return { fingerprint: this.fingerprint() };
+  }
+
+  [inspect.custom](): string {
+    return this.toString();
+  }
+}
 
 /** Who chose a stream's at-rest key. */
 export const EncryptionKeySource = {

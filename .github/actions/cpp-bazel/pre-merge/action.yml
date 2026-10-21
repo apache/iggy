@@ -88,6 +88,7 @@ runs:
       uses: ./.github/actions/utils/server-start
       with:
         bin: target/debug/iggy-server
+        encryption-enabled: "true"
 
     - name: Test Rust bridge and C++ coverage
       if: inputs.task == 'test'

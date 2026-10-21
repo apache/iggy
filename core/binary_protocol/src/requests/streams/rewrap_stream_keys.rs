@@ -148,7 +148,7 @@ mod tests {
     }
 
     #[test]
-    fn given_rewrap_entries_when_roundtripping_then_should_match_golden_bytes() {
+    fn given_rewrap_entries_when_roundtripping_should_match_golden_bytes() {
         let single = RewrapStreamKeysRequest {
             entries: vec![entry(3, 1)],
         };
@@ -170,7 +170,7 @@ mod tests {
     }
 
     #[test]
-    fn given_malformed_rewrap_body_when_decoding_then_should_reject_without_panicking() {
+    fn given_malformed_rewrap_body_when_decoding_should_reject_without_panicking() {
         let bytes = RewrapStreamKeysRequest {
             entries: vec![entry(1, 1), entry(2, 2)],
         }
@@ -200,7 +200,7 @@ mod tests {
     }
 
     #[test]
-    fn given_rewrap_request_when_debugging_then_should_not_print_wrapped_keys() {
+    fn given_rewrap_request_when_debugging_should_not_print_wrapped_keys() {
         let rendered = format!(
             "{:?}",
             RewrapStreamKeysRequest {

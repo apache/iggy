@@ -39,7 +39,7 @@ use crate::pat::{maybe_rewrite_pat_request, rewrite_pat_request_for_user};
 use crate::segment_cleaner::UNENFORCEABLE_TOPIC_SIZE_WARN;
 use crate::session_manager::SessionManager;
 use crate::shell::{ShellBus, ShellShard};
-use crate::stream_keys::maybe_rewrite_secret_options_request;
+use crate::stream_keys::{Bounded, erase_stream_create, maybe_rewrite_secret_options_request};
 use crate::users::maybe_rewrite_user_password_request;
 use crate::wire::{request_body, rewrite_request_body};
 use consensus::{MetadataHandle, PartitionsHandle};
@@ -105,10 +105,11 @@ pub struct RewriteDeny {
 
 /// The TCP funnel's pre-consensus rewrite chain, in order: the PAT rewrite
 /// (resolving the acting user from the transport `sessions` binding), the
-/// password rewrite, the static bounds gate (which also replaces a stream or
-/// user create's options with the admitted canonical block), the secret
-/// options rewrite that wraps or generates a stream key, then the
-/// consumer-group Join/Leave identity rewrite ([`crate::consumer_group`]).
+/// password rewrite, the static bounds gate (which also replaces a user
+/// create's options with the admitted canonical block and hands a stream
+/// create on decoded), the secret options rewrite that builds the stream
+/// create's body with its key wrapped, then the consumer-group Join/Leave
+/// identity rewrite ([`crate::consumer_group`]).
 /// Mirrors [`http_chain`] plus the group step, which only the binary wire
 /// serves. Returns the rewritten request and the raw PAT token the funnel
 /// substitutes into the committed reply. A rejection names the failing stage
@@ -143,12 +144,13 @@ where
             stage: RewriteStage::UserPassword,
             error,
         })?;
-    let request = static_bounds(shard, request).map_err(|error| RewriteDeny {
+    let user_id = sessions.borrow().get_user_id(transport_client_id);
+    let bounded = static_bounds(shard, user_id, request).map_err(|error| RewriteDeny {
         stage: RewriteStage::StaticBounds,
         error,
     })?;
     let request =
-        maybe_rewrite_secret_options_request(&shard.plane.partitions().key_context(), request)
+        maybe_rewrite_secret_options_request(&shard.plane.partitions().key_context(), bounded)
             .map_err(|error| RewriteDeny {
                 stage: RewriteStage::SecretOptions,
                 error,
@@ -184,9 +186,9 @@ where
 {
     let (request, raw_token) = rewrite_pat_request_for_user(user_id, request)?;
     let request = maybe_rewrite_user_password_request(shard, request)?;
-    let request = static_bounds(shard, request)?;
+    let bounded = static_bounds(shard, Some(user_id), request)?;
     let request =
-        maybe_rewrite_secret_options_request(&shard.plane.partitions().key_context(), request)?;
+        maybe_rewrite_secret_options_request(&shard.plane.partitions().key_context(), bounded)?;
     Ok((request, raw_token))
 }
 
@@ -336,13 +338,17 @@ pub fn warn_unenforceable_topic_size_on_partition_add(
 /// replicated log entry. Both chains run them, so every option block passes
 /// the same catalog admission whatever the transport. A body that fails to
 /// decode denies typed too (`InvalidCommand`), instead of riding consensus
-/// just to fail there. A stream or user create leaves with the admitted
-/// canonical options, so apply stores one kind per key whatever the client
-/// sent.
+/// just to fail there. A user create leaves with the admitted canonical
+/// options, so apply stores one kind per key whatever the client sent. A
+/// stream create leaves decoded with its admitted options, so the secret
+/// stage builds its body without encoding a client key again, and a refused
+/// one has its copies of the key erased. `user_id` is the acting user, `None`
+/// when the transport has not bound one.
 fn static_bounds<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    user_id: Option<u32>,
     request: Message<RoutedRequestHeader>,
-) -> Result<Message<RoutedRequestHeader>, IggyError>
+) -> Result<Bounded, IggyError>
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -408,23 +414,8 @@ where
             })?,
         Operation::UpdateResource => UpdateResourceRequest::decode_from(request_body(&request))
             .map_err(|_| IggyError::InvalidCommand)
-            .and_then(|patch| patch_bounds(shard, &patch))?,
-        Operation::CreateStream => {
-            let mut create_stream = CreateStreamRequest::decode_from(request_body(&request))
-                .map_err(|_| IggyError::InvalidCommand)?;
-            let admitted = admit_create(
-                OptionsScope::Stream,
-                &create_stream.options,
-                OptionColumns {
-                    name: Some(create_stream.name.as_str().to_owned()),
-                    ..OptionColumns::default()
-                },
-            )?;
-            if let Some(options) = canonical_block(&create_stream.options, &admitted)? {
-                create_stream.options = options;
-                return rewrite_request_body(&request, &create_stream.to_bytes());
-            }
-        }
+            .and_then(|patch| patch_bounds(shard, user_id, &patch))?,
+        Operation::CreateStream => return bound_stream_create(request),
         Operation::CreateUser => {
             let mut create_user = CreateUserRequest::decode_from(request_body(&request))
                 .map_err(|_| IggyError::InvalidCommand)?;
@@ -439,12 +430,41 @@ where
             UserStatus::from_code(create_user.status).map_err(|_| IggyError::InvalidUserStatus)?;
             if let Some(options) = canonical_block(&create_user.options, &admitted)? {
                 create_user.options = options;
-                return rewrite_request_body(&request, &create_user.to_bytes());
+                return rewrite_request_body(&request, &create_user.to_bytes())
+                    .map(Bounded::Request);
             }
         }
         _ => {}
     }
-    Ok(request)
+    Ok(Bounded::Request(request))
+}
+
+/// Decode and admit a stream create, handed on decoded with its admitted
+/// options. A refused one has its copies of a client key erased.
+fn bound_stream_create(request: Message<RoutedRequestHeader>) -> Result<Bounded, IggyError> {
+    let Ok(create) = CreateStreamRequest::decode_from(request_body(&request)) else {
+        erase_stream_create(request, None);
+        return Err(IggyError::InvalidCommand);
+    };
+    let admitted = admit_create(
+        OptionsScope::Stream,
+        &create.options,
+        OptionColumns {
+            name: Some(create.name.as_str().to_owned()),
+            ..OptionColumns::default()
+        },
+    );
+    match admitted {
+        Ok(admitted) => Ok(Bounded::StreamCreate {
+            request,
+            create,
+            options: admitted.explicit,
+        }),
+        Err(error) => {
+            erase_stream_create(request, Some(create));
+            Err(error)
+        }
+    }
 }
 
 /// The admitted canonical block when it differs from what the client sent.
@@ -458,8 +478,14 @@ fn canonical_block(
 
 /// Catalog admission for a generic patch, plus the floor a topic size cap
 /// keeps against the topic's own segment size.
+///
+/// The capacity check and the floor read the target's stored state, so they
+/// run only for a caller this node lets update the target. Any other caller
+/// is admitted on the request alone and refused by apply, so no answer here
+/// tells it what the target stores.
 fn patch_bounds<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    user_id: Option<u32>,
     patch: &UpdateResourceRequest,
 ) -> Result<(), IggyError>
 where
@@ -470,14 +496,13 @@ where
     SB: SuperblockStore + 'static,
 {
     let metadata = shard.plane.metadata();
-    let admitted = admit_patch(
-        patch,
-        stored_options(
-            metadata.mux_stm.streams(),
-            metadata.mux_stm.users(),
-            &patch.target,
-        ),
-    )?;
+    let streams = metadata.mux_stm.streams();
+    let users = metadata.mux_stm.users();
+    let current = user_id
+        .filter(|user_id| may_update(streams, users, *user_id, &patch.target))
+        .and_then(|_| stored_options(streams, users, &patch.target));
+    let stored_state_visible = current.is_some();
+    let admitted = admit_patch(patch, current)?;
     let ResourceTarget::Topic {
         stream_id,
         topic_id,
@@ -485,15 +510,15 @@ where
     else {
         return Ok(());
     };
-    let Some(max_topic_size) =
-        TopicCreateOptions::from_resource_options(&admitted.explicit).max_topic_size
+    let Some(max_topic_size) = TopicCreateOptions::from_resource_options(&admitted.explicit)
+        .max_topic_size
+        .filter(|_| stored_state_visible)
     else {
         return Ok(());
     };
     // An update can lower the cap below one segment just as a create can, and
     // the stored map would then report a size the topic can never enforce. The
     // floor is this topic's own segment size, since that key is create-only.
-    let streams = metadata.mux_stm.streams();
     let segment_size = streams.topic_segment_size(stream_id, topic_id).map_or_else(
         || iggy_common::DEFAULT_SEGMENT_SIZE,
         |segment_size| segment_size.as_bytes_u64(),
@@ -528,6 +553,33 @@ fn admit_create(
             create_columns,
         },
     )
+}
+
+/// Whether this node's applied permissions let `user_id` update `target`,
+/// the rule apply runs again in committed order. `false` for a target this
+/// node cannot resolve, which apply reports.
+fn may_update(streams: &Streams, users: &Users, user_id: u32, target: &ResourceTarget) -> bool {
+    let decision = match target {
+        ResourceTarget::Stream { stream_id } => {
+            streams.resolve_stream_id(stream_id).map(|stream_id| {
+                users.authorize(|permissioner| permissioner.update_stream(user_id, stream_id))
+            })
+        }
+        ResourceTarget::Topic {
+            stream_id,
+            topic_id,
+        } => streams
+            .resolve_topic_ids(stream_id, topic_id)
+            .map(|(stream_id, topic_id)| {
+                users.authorize(|permissioner| {
+                    permissioner.update_topic(user_id, stream_id, topic_id)
+                })
+            }),
+        ResourceTarget::User { .. } => {
+            Some(users.authorize(|permissioner| permissioner.update_user(user_id)))
+        }
+    };
+    matches!(decision, Some(Ok(())))
 }
 
 /// The options the patch target stores, `None` for a target that does not
@@ -585,18 +637,27 @@ fn admit_patch(
 mod tests {
     use super::*;
     use crate::dispatch::test_support::{
-        SpyBus, create_one_partition, prepare_message, request_message, test_shard,
+        SpyBus, TestShard, create_one_partition, create_reader_request, prepare_message,
+        register_reply, request_message, test_shard, test_shard_with_key_context,
     };
     use bytes::Bytes;
+    use iggy_binary_protocol::requests::system::WireResetKeys;
     use iggy_binary_protocol::requests::topics::CreateTopicWithAssignmentsRequest;
     use iggy_binary_protocol::{MAX_OPTIONS, WireName};
+    use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
+    use iggy_common::wire_conversions::resource_options_from_wire;
     use iggy_common::{
         HeaderKey, HeaderValue, IggyDuration, IggyExpiry, OptionKey, OptionValue, OptionsUpdate,
-        StreamCreateOptions, StreamEncryptionKey, TopicUpdateOptions, UserUpdateOptions, text,
+        ServerKeyContext, StreamCreateOptions, StreamEncryptionKey, StreamKeyOrigin,
+        TopicUpdateOptions, UserUpdateOptions, stream_wrap_set, text,
     };
+    use message_bus::installer::conn_info::ClientTransportKind;
     use metadata::stm::StateMachine as _;
     use std::collections::BTreeMap;
     use std::str::FromStr;
+    use std::sync::Arc;
+
+    const CONFIG_KEY: &str = "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=";
 
     #[test]
     #[allow(clippy::too_many_lines)]
@@ -604,7 +665,7 @@ mod tests {
         let bus = SpyBus::default();
         let shard = Rc::new(test_shard(&bus, 0, 1, 1));
         create_one_partition(&shard);
-        let sessions = Rc::new(RefCell::new(SessionManager::new()));
+        let sessions = root_sessions(&shard, 1);
         let topic = || ResourceTarget::Topic {
             stream_id: WireIdentifier::numeric(0),
             topic_id: WireIdentifier::numeric(0),
@@ -680,7 +741,7 @@ mod tests {
                 Operation::UpdateResource,
                 UpdateResourceRequest {
                     target: stream(),
-                    reset: vec![WireName::new("name").unwrap()],
+                    reset: WireResetKeys::try_from(vec![WireName::new("name").unwrap()]).unwrap(),
                     options: WireOptions::empty(),
                 }
                 .to_bytes(),
@@ -690,7 +751,7 @@ mod tests {
                 Operation::UpdateResource,
                 UpdateResourceRequest {
                     target: stream(),
-                    reset: Vec::new(),
+                    reset: WireResetKeys::default(),
                     options: resource_options_to_wire(
                         &ResourceOptions::from([(
                             HeaderKey::from(OptionKey::EncryptionKeySource),
@@ -752,11 +813,72 @@ mod tests {
             )
             .map(|_| ())
             .map_err(|deny| deny.error);
-            let http =
-                http_chain(&shard, 0, request_message(operation, 1, 1, 1, &body)).map(|_| ());
+            let http = http_chain(
+                &shard,
+                DEFAULT_ROOT_USER_ID,
+                request_message(operation, 1, 1, 1, &body),
+            )
+            .map(|_| ());
             assert_eq!(tcp, Err(expected.clone()), "binary chain, {operation:?}");
             assert_eq!(http, Err(expected), "HTTP chain, {operation:?}");
         }
+    }
+
+    #[test]
+    fn given_caller_without_update_permission_when_patching_topic_below_its_segment_should_leave_the_refusal_to_apply()
+     {
+        const READER: u32 = 1;
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, 1));
+        create_one_partition(&shard);
+        let created = shard
+            .plane
+            .metadata()
+            .mux_stm
+            .update(prepare_message(
+                Operation::CreateUser,
+                1,
+                3,
+                &create_reader_request().to_bytes(),
+            ))
+            .expect("the reader is created");
+        assert_eq!(created.code, 0);
+        let patch = TopicUpdateOptions {
+            raw: BTreeMap::from([(OptionKey::MaxTopicSize.to_string(), "1 MiB".to_owned())]),
+            ..TopicUpdateOptions::default()
+        }
+        .to_patch()
+        .expect("the patch encodes");
+        let body = UpdateResourceRequest {
+            target: ResourceTarget::Topic {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+            },
+            reset: patch.reset,
+            options: patch.set,
+        }
+        .to_bytes();
+        let chain = |user_id: u32| {
+            http_chain(
+                &shard,
+                user_id,
+                request_message(Operation::UpdateResource, 1, 1, 1, &body),
+            )
+            .map(|_| ())
+        };
+
+        assert_eq!(
+            chain(READER),
+            Ok(()),
+            "a caller apply refuses must not learn the topic's segment size here"
+        );
+        assert_eq!(
+            chain(DEFAULT_ROOT_USER_ID),
+            Err(IggyError::InvalidTopicSize(
+                MaxTopicSize::from(1024 * 1024u64),
+                IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
+            ))
+        );
     }
 
     #[test]
@@ -794,39 +916,96 @@ mod tests {
     }
 
     #[test]
-    fn given_text_stream_key_when_bounding_create_should_forward_the_canonical_block() {
+    fn given_text_stream_key_when_bounding_create_should_encode_no_request_with_the_key() {
         let bus = SpyBus::default();
         let shard = Rc::new(test_shard(&bus, 0, 1, 1));
-        let key = StreamEncryptionKey::try_from([7u8; 32].as_slice()).unwrap();
-        let block = |value: HeaderValue| {
-            resource_options_to_wire(
-                &ResourceOptions::from([(
-                    HeaderKey::from(OptionKey::EncryptionKey),
-                    OptionValue::explicit(value),
-                )]),
-                OptionsProvenance::All,
-            )
-            .unwrap()
-        };
+        let key = StreamEncryptionKey::try_from([7u8; 32].as_slice()).expect("32 bytes");
         let body = CreateStreamRequest {
-            name: WireName::new("orders").unwrap(),
-            options: block(
-                HeaderValue::try_from(text::as_base64(key.as_bytes()).as_str()).unwrap(),
-            ),
+            name: WireName::new("orders").expect("a name"),
+            options: text_key_block(&key),
         }
         .to_bytes();
 
-        let bounded = static_bounds(
-            &shard,
-            request_message(Operation::CreateStream, 1, 1, 1, &body),
-        )
-        .expect("the create admits");
+        let sent = request_message(Operation::CreateStream, 1, 1, 1, &body);
 
-        let forwarded = CreateStreamRequest::decode_from(request_body(&bounded)).unwrap();
+        let bounded = static_bounds(&shard, Some(DEFAULT_ROOT_USER_ID), sent.clone())
+            .expect("the create admits");
+
+        let Bounded::StreamCreate {
+            request, options, ..
+        } = bounded
+        else {
+            panic!("a stream create goes on decoded");
+        };
+        assert_eq!(request.as_slice(), sent.as_slice(), "no request is rebuilt");
         assert_eq!(
-            forwarded.options.as_bytes(),
-            block(HeaderValue::try_from(key.as_bytes().as_slice()).unwrap()).as_bytes()
+            options.get(&HeaderKey::from(OptionKey::EncryptionKey)),
+            Some(&OptionValue::explicit(
+                HeaderValue::try_from(key.as_bytes().as_slice()).expect("a raw value")
+            )),
+            "the admitted key is canonical"
         );
+    }
+
+    #[test]
+    fn given_stream_key_in_either_form_when_running_either_chain_should_forward_only_its_wrap_set()
+    {
+        let bus = SpyBus::default();
+        let context =
+            Arc::new(ServerKeyContext::from_config(CONFIG_KEY, &[], true).expect("a valid key"));
+        let shard = Rc::new(test_shard_with_key_context(
+            &bus,
+            0,
+            1,
+            1,
+            Arc::clone(&context),
+        ));
+        let sessions = root_sessions(&shard, 1);
+        let key = StreamEncryptionKey::try_from([7u8; 32].as_slice()).expect("32 bytes");
+        let raw_block = StreamCreateOptions {
+            encryption_key: Some(key.clone()),
+            ..StreamCreateOptions::default()
+        }
+        .to_wire()
+        .expect("encodes");
+
+        for options in [raw_block, text_key_block(&key)] {
+            let body = CreateStreamRequest {
+                name: WireName::new("orders").expect("a name"),
+                options,
+            }
+            .to_bytes();
+            let (tcp, _) = tcp_chain(
+                &shard,
+                &sessions,
+                1,
+                request_message(Operation::CreateStream, 1, 1, 1, &body),
+            )
+            .map_err(|deny| deny.error)
+            .expect("binary chain");
+            let (http, _) = http_chain(
+                &shard,
+                DEFAULT_ROOT_USER_ID,
+                request_message(Operation::CreateStream, 1, 1, 1, &body),
+            )
+            .expect("HTTP chain");
+
+            for forwarded in [tcp, http] {
+                let forwarded = request_body(&forwarded);
+                assert!(!contains(forwarded, key.as_bytes()), "raw key travels on");
+                assert!(
+                    !contains(forwarded, text::as_base64(key.as_bytes()).as_bytes()),
+                    "base64 key travels on"
+                );
+                let create = CreateStreamRequest::decode_from(forwarded).expect("decodes");
+                let stored = resource_options_from_wire(&create.options, true).expect("a block");
+                let set = stream_wrap_set(&stored)
+                    .expect("readable")
+                    .expect("a wrap set");
+                assert_eq!(set.origin(), StreamKeyOrigin::Client);
+                assert_eq!(context.open(&set).expect("opens"), key);
+            }
+        }
     }
 
     #[test]
@@ -884,6 +1063,7 @@ mod tests {
 
         let bounded = static_bounds(
             &shard,
+            Some(DEFAULT_ROOT_USER_ID),
             request_message(Operation::UpdateResource, 1, 1, 1, &body),
         )
         .map(|_| ());
@@ -978,5 +1158,63 @@ mod tests {
             ),
             "the cap still applies"
         );
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    fn text_key_block(key: &StreamEncryptionKey) -> WireOptions {
+        resource_options_to_wire(
+            &ResourceOptions::from([(
+                HeaderKey::from(OptionKey::EncryptionKey),
+                OptionValue::explicit(
+                    HeaderValue::try_from(text::as_base64(key.as_bytes()).as_str())
+                        .expect("a text value"),
+                ),
+            )]),
+            OptionsProvenance::All,
+        )
+        .expect("encodes")
+    }
+
+    /// A session table whose `transport` connection is bound to root.
+    fn root_sessions(shard: &TestShard, transport: u128) -> Rc<RefCell<SessionManager>> {
+        const CLIENT: u128 = 1;
+        const SESSION: u64 = 1;
+        let attachment = {
+            let mut client_table = shard.plane.metadata().client_table.borrow_mut();
+            client_table
+                .commit_register(
+                    CLIENT,
+                    DEFAULT_ROOT_USER_ID,
+                    [0x5a; 32],
+                    register_reply(CLIENT, SESSION),
+                )
+                .expect("root registers");
+            client_table
+                .attach_session(CLIENT, SESSION, DEFAULT_ROOT_USER_ID)
+                .expect("root attaches")
+        };
+        let sessions = Rc::new(RefCell::new(SessionManager::new()));
+        sessions.borrow_mut().ensure_connection(
+            transport,
+            "127.0.0.1:34567".parse().expect("a socket address"),
+            ClientTransportKind::Tcp,
+        );
+        sessions
+            .borrow_mut()
+            .bind_authenticated_connection(
+                transport,
+                CLIENT,
+                SESSION,
+                DEFAULT_ROOT_USER_ID,
+                attachment,
+                SESSION,
+            )
+            .expect("root binds");
+        sessions
     }
 }

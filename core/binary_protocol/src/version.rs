@@ -103,8 +103,10 @@ const PATCH_MASK: u32 = COMPONENT_MAX;
 ///
 /// Version 0.11.1 requires the session-binding secret in login requests.
 /// Version 0.12.0 replaces the per-resource update commands with the generic
-/// `UpdateResource` patch and adds derived option blocks to stream and user
-/// responses.
+/// `UpdateResource` patch, drops the message expiry, compression and size cap
+/// fields from the topic header (50 to 33 fixed bytes, the values live in the
+/// option blocks), adds derived option blocks to stream and user responses and
+/// a flags byte to each `DescribeOptions` descriptor.
 /// Finalize this number and the minimum during stable release preparation.
 /// Released servers using protocol 0.11.0 accept every 0.11.x patch, so an
 /// incompatible release needs a new minor version for those servers to reject it.
@@ -113,8 +115,8 @@ pub const IGGY_PROTOCOL_VERSION: u32 = pack_protocol_version(0, 12, 0);
 /// Oldest protocol version this build accepts at login.
 ///
 /// Version 0.11.0 has no session-binding secret, and 0.11.1 still sends the
-/// per-resource update commands and reads single-block stream and user
-/// responses, so both are incompatible.
+/// per-resource update commands, decodes the 50-byte topic header and reads
+/// single-block stream and user responses, so both are incompatible.
 ///
 /// Keep this equal to the current protocol unless compatibility with older
 /// released protocols has been verified. Decide the range per stable release.

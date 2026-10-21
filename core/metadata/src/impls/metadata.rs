@@ -49,7 +49,8 @@ use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssi
 use iggy_binary_protocol::requests::partitions::CreatePartitionsRequest as WireCreatePartitionsRequest;
 use iggy_binary_protocol::requests::partitions::CreatePartitionsWithAssignmentsRequest as PersistedCreatePartitionsRequest;
 use iggy_binary_protocol::requests::streams::{
-    RewrapStreamKeysRequest, UpdateStreamResolvedRequest,
+    CreateStreamRequest as WireCreateStreamRequest, RewrapStreamKeysRequest,
+    UpdateStreamResolvedRequest,
 };
 use iggy_binary_protocol::requests::system::{
     FinalizeSessionRequest, ResourceTarget, SessionIdentity, UpdateResourceRequest,
@@ -66,7 +67,7 @@ use iggy_binary_protocol::{
 };
 use iggy_common::calculate_checksum;
 use iggy_common::variadic;
-use iggy_common::wire_conversions::resource_options_to_wire;
+use iggy_common::wire_conversions::{resource_options_from_wire, resource_options_to_wire};
 use iggy_common::{
     HeaderKey, IggyError, OptionAdmissionContext, OptionKey, OptionOperation, OptionValue,
     OptionVisibility, OptionsProvenance, OptionsScope, ResourceOptions, TopicCreateOptions,
@@ -4380,6 +4381,19 @@ where
                     &body,
                 ))
             }
+            Operation::CreateStream => {
+                let request = WireCreateStreamRequest::decode_from(body)
+                    .map_err(|_| IggyError::InvalidCommand)?;
+                // Apply refuses a plaintext key too, but only after every replica journaled it.
+                if let Some(secret) = resource_options_from_wire(&request.options, true)?
+                    .keys()
+                    .filter_map(|key| OptionKey::try_from(key).ok())
+                    .find(|key| key.descriptor().visibility == OptionVisibility::Secret)
+                {
+                    return Err(IggyError::InvalidOptionValue(secret.to_string()));
+                }
+                Ok(message.project(consensus))
+            }
             Operation::UpdateResource => {
                 let request = UpdateResourceRequest::decode_from(body)
                     .map_err(|_| IggyError::InvalidCommand)?;
@@ -5092,7 +5106,6 @@ mod tests {
     use iggy_binary_protocol::requests::topics::{CreateTopicRequest, DeleteTopicRequest};
     use iggy_binary_protocol::requests::users::{CreateUserRequest, DeleteUserRequest};
     use iggy_binary_protocol::{StartViewHeader, WireOptions};
-    use iggy_common::wire_conversions::resource_options_from_wire;
     use iggy_common::{
         HeaderValue, IggyExpiry, IggyTimestamp, OptionKey, OptionStorage, OptionValueCodec,
         ServerKeyContext, StreamEncryptionKey, StreamKeyOrigin, TopicUpdateOptions, UserStatus,
@@ -5114,7 +5127,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn given_topic_patch_when_resolving_then_should_extract_name_and_resolve_reset_defaults() {
+    fn given_topic_patch_when_resolving_should_extract_name_and_resolve_reset_defaults() {
         let patch = TopicUpdateOptions {
             name: Some("renamed".to_owned()),
             message_expiry: Some(IggyExpiry::from(9_000_000u64)),
@@ -5167,7 +5180,7 @@ mod tests {
     }
 
     #[test]
-    fn given_default_sentinel_when_resolving_patch_then_should_leave_the_key_unchanged() {
+    fn given_default_sentinel_when_resolving_patch_should_leave_the_key_unchanged() {
         let patch = TopicUpdateOptions {
             name: Some("renamed".to_owned()),
             raw: BTreeMap::from([(
@@ -5196,8 +5209,7 @@ mod tests {
     }
 
     #[test]
-    fn given_create_only_or_foreign_key_when_resolving_patch_then_should_refuse_before_replication()
-    {
+    fn given_create_only_or_foreign_key_when_resolving_patch_should_refuse_before_replication() {
         let topic = ResourceTarget::Topic {
             stream_id: WireIdentifier::numeric(1),
             topic_id: WireIdentifier::numeric(2),
@@ -5241,7 +5253,7 @@ mod tests {
     }
 
     #[test]
-    fn given_user_patch_when_resolving_then_should_carry_username_and_status_columns() {
+    fn given_user_patch_when_resolving_should_carry_username_and_status_columns() {
         let patch = UserUpdateOptions {
             username: Some("alicia".to_owned()),
             status: Some(UserStatus::Inactive),
@@ -6152,6 +6164,47 @@ mod tests {
         }
         assert!(!expected.is_empty(), "the topic catalog has defaulted rows");
         assert_eq!(derived, expected);
+    }
+
+    #[test]
+    fn given_plaintext_stream_key_when_preparing_create_stream_should_refuse_before_replication() {
+        const CLIENT: u128 = 1;
+        const SESSION: u64 = 10;
+        const ACTING_USER: u32 = 7;
+        let plane = metadata_plane();
+        plane
+            .client_table
+            .borrow_mut()
+            .commit_register(
+                CLIENT,
+                ACTING_USER,
+                [0x5a; 32],
+                register_reply(CLIENT, SESSION),
+            )
+            .expect("register commits");
+        let mut options = ResourceOptions::new();
+        options.insert(
+            HeaderKey::from(OptionKey::EncryptionKey),
+            OptionValue::explicit(
+                HeaderValue::try_from([7u8; 32].as_slice()).expect("raw key encodes"),
+            ),
+        );
+        let options =
+            resource_options_to_wire(&options, OptionsProvenance::All).expect("options encode");
+
+        let Err(refusal) =
+            plane.prepare_request(create_stream_request_with(CLIENT, 1, "secrets", options))
+        else {
+            panic!("a plaintext stream key must not be sealed into a prepare");
+        };
+
+        assert!(
+            matches!(
+                &refusal,
+                IggyError::InvalidOptionValue(key) if *key == OptionKey::EncryptionKey.to_string()
+            ),
+            "expected the plaintext key refusal, got {refusal:?}"
+        );
     }
 
     /// Bus whose `send_to_client` parks forever while `stall` is set,
@@ -8844,7 +8897,7 @@ mod tests {
     }
 
     #[compio::test]
-    async fn given_retried_keyless_create_when_committed_then_should_store_one_envelope() {
+    async fn given_retried_keyless_create_when_committed_should_store_one_envelope() {
         const CLIENT: u128 = 9;
         const USER: u32 = 0;
         let directory = tempfile::tempdir().unwrap();

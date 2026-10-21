@@ -223,7 +223,7 @@ public abstract class UsersClientBaseTest extends IntegrationTest {
     }
 
     @Test
-    void givenUserOptionsWhenCreatingAndUpdatingThenShouldPreserveUserBehavior() {
+    void givenUserOptionsWhenCreatingAndUpdatingShouldPreserveUserBehavior() {
         // given
         login();
         UserInfoDetails first = usersClient.createUser(

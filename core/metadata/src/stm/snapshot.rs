@@ -818,7 +818,7 @@ mod tests {
     }
 
     #[test]
-    fn given_format_thirteen_snapshot_when_restoring_then_should_preserve_options_and_created_op() {
+    fn given_format_thirteen_snapshot_when_restoring_should_preserve_options_and_created_op() {
         const PREVIOUS_FORMAT: u32 = 12;
         let mut options = ResourceOptions::new();
         options.insert(

@@ -187,7 +187,7 @@ const ENCRYPTED_PAYLOAD_PREFIX: &str = "server-encrypted-identity-payload";
     cluster_nodes = 3,
     server(encryption = "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=")
 )]
-async fn given_three_nodes_with_server_encryption_when_persisting_then_should_store_identical_ciphertext(
+async fn given_three_nodes_with_server_encryption_when_persisting_should_store_identical_ciphertext(
     harness: &mut TestHarness,
 ) {
     let client = harness.tcp_root_client().await.unwrap();
@@ -260,7 +260,7 @@ async fn given_three_nodes_with_server_encryption_when_persisting_then_should_st
     cluster_nodes = 3,
     server(encryption = "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=")
 )]
-async fn given_three_nodes_with_custom_keys_when_persisting_then_should_store_identical_ciphertext(
+async fn given_three_nodes_with_custom_keys_when_persisting_should_store_identical_ciphertext(
     harness: &mut TestHarness,
 ) {
     let streams = [

@@ -72,7 +72,7 @@ func TestCreateStream_RejectsAnInvalidNameWithoutWriting(t *testing.T) {
 }
 
 func TestCreateStream_RejectsAnInvalidKeyWithoutWriting(t *testing.T) {
-	t.Run("given_invalid_key_when_encoding_then_should_reject_before_network_io", func(t *testing.T) {
+	t.Run("given_invalid_key_when_encoding_should_reject_before_network_io", func(t *testing.T) {
 		client, serverConn := newPipeClient(t)
 		server := serve(serverConn, func(_ int, _ request) []byte {
 			return replyFrame(vsr.OperationCreateStream, resultSection())

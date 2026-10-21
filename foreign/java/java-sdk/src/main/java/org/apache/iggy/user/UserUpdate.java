@@ -62,7 +62,12 @@ public record UserUpdate(
         raw = Collections.unmodifiableMap(new LinkedHashMap<>(raw));
         rawReset = Set.copyOf(rawReset);
         boolean typedOnly = raw.isEmpty() && rawReset.isEmpty();
-        OptionKey.requireValidUpdate(entries(username, status, raw).keySet(), reset, rawReset, typedOnly);
+        OptionKey.requireValidUpdate(
+                entries(username, status, raw).keySet(),
+                reset,
+                rawReset,
+                typedOnly,
+                EnumSet.allOf(UserOptionKey.class));
         if (typedOnly) {
             username.ifPresent(value -> OptionKey.requireTextLength(
                     UserOptionKey.USERNAME.value(),
@@ -96,6 +101,13 @@ public record UserUpdate(
     /** The names this update resets, typed and raw together in ascending order. */
     public List<String> resetKeys() {
         return OptionKey.resetNames(reset, rawReset);
+    }
+
+    /** Raw entries print by name only, because this build cannot tell which newer keys are secret. */
+    @Override
+    public String toString() {
+        return "UserUpdate[username=" + username + ", status=" + status + ", reset=" + reset + ", raw=" + raw.keySet()
+                + ", rawReset=" + rawReset + "]";
     }
 
     private static Set<UserOptionKey> copyOf(Set<UserOptionKey> keys) {

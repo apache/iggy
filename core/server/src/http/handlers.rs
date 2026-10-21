@@ -24,11 +24,11 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
+use bytes::{Bytes, BytesMut};
 use chrono::Local;
 use consensus::MetadataHandle;
 use iggy_binary_protocol::codes::{
@@ -102,14 +102,15 @@ use iggy_common::wire_conversions::{
 use iggy_common::{
     ClientInfo, ClientInfoDetails, ClusterMetadata, Consumer, ConsumerGroup, ConsumerGroupDetails,
     ConsumerOffsetInfo, DEFAULT_MAX_TOPIC_SIZE, Identifier, IdentityInfo, IggyError, IggyTimestamp,
-    OptionSpec, OptionStorage, OptionsScope, OptionsUpdate, Partitioning, PersonalAccessTokenInfo,
-    PollMessages, PolledMessages, RawPersonalAccessToken, SendMessages, SendMessagesConfirmations,
-    Stats, Stream, StreamDetails, TokenInfo, Topic, TopicDetails, UserInfo, UserInfoDetails,
-    Validatable, descriptors_for,
+    OptionSpec, OptionStorage, OptionsScope, Partitioning, PersonalAccessTokenInfo, PollMessages,
+    PolledMessages, RawPersonalAccessToken, SendMessages, SendMessagesConfirmations, Stats, Stream,
+    StreamDetails, TokenInfo, Topic, TopicDetails, UserInfo, UserInfoDetails, Validatable,
+    descriptors_for, erase_buffer,
 };
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
 use secrecy::ExposeSecret;
+use secrecy::zeroize::Zeroizing;
 use send_wrapper::SendWrapper;
 use serde::Deserialize;
 use shard::{PartitionRead, PartitionReadReply};
@@ -123,7 +124,7 @@ use crate::http::error::{
     Consistency, ConsistencyQuery, CustomError, PartitionWriteError, ProduceAck, ProduceQuery,
     ReadError, WriteError,
 };
-use crate::http::extractor::{Authenticated, Identity, JsonMembers};
+use crate::http::extractor::{Authenticated, Identity, JsonMembers, JsonUpdate};
 use crate::http::forward::{PartitionEffect, PartitionHop, PartitionRequest, route_partition};
 use crate::http::metrics::{TopicUsageSample, gauge_value};
 use crate::http::reads::{
@@ -905,7 +906,8 @@ pub(in crate::http) async fn create_stream(
             .map_err(|_| WriteError::Rejected(IggyError::InvalidStreamName))?,
         options: command.options.to_wire().map_err(WriteError::Rejected)?,
     };
-    let body = request.to_bytes();
+    let body = erasing_body(&request);
+    erase_buffer(request.options.into_bytes());
     let payload = SendWrapper::new(submit_write(
         &state,
         &identity.session,
@@ -923,7 +925,7 @@ pub(in crate::http) async fn update_stream(
     State(state): State<HttpState>,
     identity: Authenticated,
     Path(stream_id): Path<String>,
-    update: Result<Json<OptionsUpdate>, JsonRejection>,
+    update: Result<JsonUpdate, WriteError>,
 ) -> Result<StatusCode, WriteError> {
     let stream_id = Identifier::from_str_value(&stream_id).map_err(WriteError::Rejected)?;
     let target = ResourceTarget::Stream {
@@ -1000,7 +1002,7 @@ pub(in crate::http) async fn update_topic(
     State(state): State<HttpState>,
     identity: Authenticated,
     Path((stream_id, topic_id)): Path<(String, String)>,
-    update: Result<Json<OptionsUpdate>, JsonRejection>,
+    update: Result<JsonUpdate, WriteError>,
 ) -> Result<StatusCode, WriteError> {
     let stream_id = Identifier::from_str_value(&stream_id).map_err(WriteError::Rejected)?;
     let topic_id = Identifier::from_str_value(&topic_id).map_err(WriteError::Rejected)?;
@@ -1754,7 +1756,7 @@ pub(in crate::http) async fn update_user(
     State(state): State<HttpState>,
     identity: Authenticated,
     Path(user_id): Path<String>,
-    update: Result<Json<OptionsUpdate>, JsonRejection>,
+    update: Result<JsonUpdate, WriteError>,
 ) -> Result<StatusCode, WriteError> {
     let user_id = Identifier::from_str_value(&user_id).map_err(WriteError::Rejected)?;
     let target = ResourceTarget::User {
@@ -1769,18 +1771,17 @@ async fn submit_update(
     state: &HttpState,
     identity: &Authenticated,
     target: ResourceTarget,
-    update: Result<Json<OptionsUpdate>, JsonRejection>,
+    update: Result<JsonUpdate, WriteError>,
 ) -> Result<StatusCode, WriteError> {
-    // Duplicate members, nested values or a non-object body are malformed
-    // structure, the `InvalidCommand` the binary decoder answers too.
-    let Json(update) = update.map_err(|_| WriteError::Rejected(IggyError::InvalidCommand))?;
+    let JsonUpdate(update) = update?;
     let parts = update.to_patch().map_err(WriteError::Rejected)?;
     let request = UpdateResourceRequest {
         target,
         reset: parts.reset,
         options: parts.set,
     };
-    let body = request.to_bytes();
+    let body = erasing_body(&request);
+    erase_buffer(request.options.into_bytes());
     SendWrapper::new(submit_write(
         state,
         &identity.session,
@@ -1791,19 +1792,28 @@ async fn submit_update(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Encode `request` into a body that zeroes itself when its last handle drops,
+/// since its options may hold the stream key.
+fn erasing_body(request: &impl WireEncode) -> Bytes {
+    let mut buffer = BytesMut::with_capacity(request.encoded_size());
+    request.encode(&mut buffer);
+    Bytes::from_owner(Zeroizing::new(Vec::from(buffer)))
+}
+
 /// Refuses a create body member that names a stored option of `scope`, an
-/// option the client placed beside `options` instead of inside it.
+/// option the client placed beside `options` instead of inside it, and names
+/// that member.
 fn refuse_misplaced_options(
     scope: OptionsScope,
     members: &BTreeSet<String>,
 ) -> Result<(), WriteError> {
-    if descriptors_for(scope).any(|descriptor| {
-        descriptor.storage != OptionStorage::Column
-            && members.contains(<&str>::from(descriptor.key))
-    }) {
-        return Err(WriteError::Rejected(IggyError::InvalidCommand));
-    }
-    Ok(())
+    descriptors_for(scope)
+        .filter(|descriptor| descriptor.storage != OptionStorage::Column)
+        .map(|descriptor| <&str>::from(descriptor.key))
+        .find(|key| members.contains(*key))
+        .map_or(Ok(()), |key| {
+            Err(WriteError::MalformedMember(key.to_owned()))
+        })
 }
 
 /// `DELETE /users/{user_id}`: delete a user. Returns 204.
@@ -2012,15 +2022,42 @@ fn issue_identity(
 mod tests {
     use super::*;
 
+    use std::collections::BTreeMap;
+
     use axum::body::to_bytes;
     use iggy_binary_protocol::responses::messages::{
         SendMessagesConfirmationResponse, SendMessagesResponse,
     };
+    use iggy_common::{OptionInputMap, OptionInputValue, OptionKey};
     use serde_json::Value;
 
     use crate::http::reply::classify_partition_reply;
     use crate::http::wire::build_request_message;
     use crate::reply_frame::build_deny_reply;
+
+    /// A create body can carry the stream key, so it zeroes itself on drop and
+    /// leaves its options block for the handler to erase.
+    #[test]
+    fn given_create_with_stream_key_when_encoding_body_should_zero_on_drop_and_free_its_options() {
+        let options = OptionInputMap(BTreeMap::from([(
+            OptionKey::EncryptionKey.to_string(),
+            OptionInputValue::String("/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=".to_owned()),
+        )]));
+        let request = CreateStreamRequest {
+            name: WireName::new("orders").expect("valid name"),
+            options: options.to_wire().expect("encodes"),
+        };
+        let body = erasing_body(&request);
+        assert_eq!(body, request.to_bytes(), "the plain encoding");
+        assert!(
+            body.try_into_mut().is_err(),
+            "an owned buffer that zeroes on drop"
+        );
+        assert!(
+            request.options.into_bytes().try_into_mut().is_ok(),
+            "the only handle to the options block"
+        );
+    }
 
     /// The produce extractor keeps the caller's context, so the write is fenced
     /// with the incarnation the caller saw rather than the current one.

@@ -15,8 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using System.Text.Json.Serialization;
 using Apache.Iggy.Headers;
 using Apache.Iggy.IggyClient;
+using Apache.Iggy.JsonConverters;
 
 namespace Apache.Iggy.Contracts;
 
@@ -29,6 +31,7 @@ public sealed class UserOptions
     /// <summary>
     ///     Option keys keyed by option name. The server refuses a key outside its catalog by name.
     /// </summary>
+    [JsonConverter(typeof(RedactedOptionsConverter))]
     public IReadOnlyDictionary<string, HeaderValue>? Options { get; init; }
 
     /// <summary>Renders the options that were set.</summary>

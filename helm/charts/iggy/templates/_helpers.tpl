@@ -267,6 +267,26 @@ anything that names the cause.
       {{- fail (printf "server.encryption.key decodes to %d bytes. AES-256-GCM takes a base64-encoded 32-byte key, and the server refuses the config on anything else, enabled or not." (len (b64dec $server.encryption.key))) }}
     {{- end }}
   {{- end }}
+  {{- if and $server.encryption.previousKeys (not $server.encryption.existingSecret.name) }}
+    {{- $previousKeys := $server.encryption.previousKeys }}
+    {{- if not $server.encryption.key }}
+      {{- fail "server.encryption.previousKeys is set without server.encryption.key. A rotation needs the new key in key and the retiring ones in previousKeys." }}
+    {{- end }}
+    {{- if gt (len $previousKeys) 2 }}
+      {{- fail (printf "server.encryption.previousKeys holds %d keys. The server accepts at most two." (len $previousKeys)) }}
+    {{- end }}
+    {{- if ne (len (uniq $previousKeys)) (len $previousKeys) }}
+      {{- fail "server.encryption.previousKeys lists the same key twice, which the server rejects." }}
+    {{- end }}
+    {{- range $previousKeys }}
+      {{- if ne (len (b64dec .)) 32 }}
+        {{- fail (printf "A server.encryption.previousKeys entry decodes to %d bytes. Each must be a base64-encoded 32-byte key." (len (b64dec .))) }}
+      {{- end }}
+      {{- if eq . $server.encryption.key }}
+        {{- fail "server.encryption.previousKeys repeats server.encryption.key, which the server rejects. Leave previousKeys empty outside a rotation." }}
+      {{- end }}
+    {{- end }}
+  {{- end }}
   {{- if $server.cluster.auth.enabled }}
     {{- if not $server.cluster.enabled }}
       {{- fail "server.cluster.auth.enabled is true but server.cluster.enabled is false. Replica authentication only applies to the consensus port, which exists in cluster mode." }}
@@ -301,8 +321,6 @@ Secret owns it.
       {{- $imageTag := $server.image.tag | default .Chart.AppVersion }}
       {{- if and (regexMatch "^v?[0-9]+\\.[0-9]+\\.[0-9]+([+-].*)?$" $imageTag) (semverCompare "<=0.9.0-edge.7" $imageTag) }}
         {{- $configVersion = "legacy" }}
-      {{- else if eq $imageTag .Chart.AppVersion }}
-        {{- $configVersion = "flat" }}
       {{- else }}
         {{- fail "Cannot determine the encryption config layout for this server image. Set server.encryption.configVersion to flat for builds using [encryption], or legacy for builds using [system.encryption]." }}
       {{- end }}
@@ -320,6 +338,19 @@ Secret owns it.
     secretKeyRef:
       name: {{ default $generated $server.encryption.existingSecret.name }}
       key: {{ ternary $server.encryption.existingSecret.key "encryptionKey" (ne $server.encryption.existingSecret.name "") }}
+    {{- if and $server.encryption.previousKeys (not $server.encryption.existingSecret.name) }}
+      {{- if eq $configVersion "legacy" }}
+        {{- fail "server.encryption.previousKeys needs a server build using [encryption]. The legacy [system.encryption] layout has no key rotation. Set server.encryption.configVersion to flat for such a build." }}
+      {{- end }}
+    {{- end }}
+    {{- if and (eq $configVersion "flat") (or $server.encryption.previousKeys $server.encryption.existingSecret.name) }}
+- name: IGGY_ENCRYPTION_PREVIOUS_KEYS
+  valueFrom:
+    secretKeyRef:
+      name: {{ default $generated $server.encryption.existingSecret.name }}
+      key: {{ ternary $server.encryption.existingSecret.previousKeysKey "encryptionPreviousKeys" (ne $server.encryption.existingSecret.name "") }}
+      optional: true
+    {{- end }}
   {{- end }}
   {{- if or $server.jwt.existingSecret.name $server.jwt.encodingSecret }}
 - name: IGGY_HTTP_JWT_ENCODING_SECRET

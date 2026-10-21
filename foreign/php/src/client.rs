@@ -121,6 +121,8 @@ impl IggyClient {
     }
 
     /// Constructs a new IggyClient from a connection string.
+    ///
+    /// The string is marked `#[\SensitiveParameter]`, so exception traces never hold it.
     pub fn from_connection_string(connection_string: String) -> PhpResult<Self> {
         // QUIC creates its endpoint before a blocking API call enters the runtime.
         let _guard = runtime().enter();
@@ -139,6 +141,8 @@ impl IggyClient {
     }
 
     /// Logs in the user with the given credentials.
+    ///
+    /// The password is marked `#[\SensitiveParameter]`, so exception traces never hold it.
     pub fn login_user(&self, username: String, password: String) -> PhpResult {
         let inner = self.inner.clone();
 
@@ -196,10 +200,12 @@ impl IggyClient {
     /// `encryption_key` is the stream's own data key: 32 random bytes as canonical padded
     /// standard base64, for example `base64_encode(random_bytes(32))`. Raw bytes or any other
     /// text are refused before anything is sent. The key travels in the request, so protecting
-    /// it in transit with TLS is the caller's responsibility. The server stores it wrapped and
-    /// never returns it, reads report only its source and fingerprints. Without a key, a
+    /// it in transit with TLS is the caller's responsibility. It is marked
+    /// `#[\SensitiveParameter]`, so exception traces never hold it. The server stores it wrapped
+    /// and never returns it, reads report only its source and fingerprints. Without a key, a
     /// server with encryption enabled generates one. `raw` sends string-valued keys this
-    /// build does not know, and the server decides whether to accept them.
+    /// build does not know, and the server decides whether to accept them. It is marked
+    /// `#[\SensitiveParameter]` too, because an unknown key may hold a secret.
     pub fn create_stream(
         &self,
         name: String,
@@ -226,7 +232,9 @@ impl IggyClient {
     /// A null name keeps the current one. No stream option is resettable, so a non-empty
     /// `reset` list, or an update that changes nothing, is refused before anything is sent.
     /// `raw` and `raw_reset` reach keys this build does not know, and the server decides
-    /// whether each one may be set or reset. Renaming keeps the stream's id, key and messages.
+    /// whether each one may be set or reset. `raw` is marked `#[\SensitiveParameter]`,
+    /// because an unknown key may hold a secret. Renaming keeps the stream's id, key and
+    /// messages.
     #[php(defaults(reset = Vec::<StreamOptionKey>::new()))]
     pub fn update_stream(
         &self,
@@ -256,6 +264,7 @@ impl IggyClient {
 
     /// Fingerprint of a stream key given as canonical padded standard base64 of 32 bytes, the
     /// value `StreamDetails::$encryption_key_fingerprint` reports for a stream created with it.
+    /// The key is marked `#[\SensitiveParameter]`, so exception traces never hold it.
     pub fn encryption_key_fingerprint(key: Binary<u8>) -> PhpResult<String> {
         stream_key(key).map(|key| key.fingerprint())
     }
@@ -279,7 +288,8 @@ impl IggyClient {
     /// Every option left null resolves against the server default at admission. The 64-bit
     /// sizes and durations take an int or a decimal string, so never-expire and unlimited
     /// (18446744073709551615) can be sent. `raw` sends string-valued keys this build does not
-    /// know, and the server decides whether to accept them.
+    /// know, and the server decides whether to accept them. It is marked
+    /// `#[\SensitiveParameter]`, because an unknown key may hold a secret.
     #[allow(clippy::too_many_arguments)]
     pub fn create_topic(
         &self,
@@ -357,7 +367,8 @@ impl IggyClient {
     /// take an int or a decimal string, 18446744073709551615 meaning never expire and
     /// unlimited, and 0 is refused: list the key in `reset` to return it to the server
     /// default. `raw` and `raw_reset` reach keys this build does not know, and the server
-    /// decides whether each one may be set or reset.
+    /// decides whether each one may be set or reset. `raw` is marked
+    /// `#[\SensitiveParameter]`, because an unknown key may hold a secret.
     #[allow(clippy::too_many_arguments)]
     #[php(defaults(reset = Vec::<TopicOptionKey>::new()))]
     pub fn update_topic(

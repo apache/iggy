@@ -242,7 +242,7 @@ pub async fn should_be_successful() {
 
 #[tokio::test]
 #[parallel]
-pub async fn given_topic_reset_when_using_cli_then_should_send_only_requested_keys() {
+pub async fn given_topic_reset_when_using_cli_should_send_only_requested_keys() {
     let mut iggy_cmd_test = IggyCmdTest::default();
     iggy_cmd_test.setup().await;
     iggy_cmd_test

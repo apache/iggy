@@ -23,7 +23,7 @@ import { HeaderValue } from '../wire/message/header.utils.js';
 import { ResponseError } from '../wire/error.utils.js';
 import {
   Consumer, EncryptionKeySource, OptionsScope, PartitionResizePolicy, Partitioning,
-  PollingStrategy, UserStatus, encryptionKeyFingerprint, type ParsedOptions
+  PollingStrategy, StreamEncryptionKey, UserStatus, encryptionKeyFingerprint, type ParsedOptions
 } from '../wire/index.js';
 import type { Stream } from '../wire/stream/stream.utils.js';
 
@@ -39,6 +39,11 @@ const assertProjection = (
   stream: Stream, source: EncryptionKeySource, fingerprint?: string
 ) => {
   assert.equal(stream.encryptionKeySource, source);
+  if (source === EncryptionKeySource.None) {
+    assert.equal(stream.encryptionKeyFingerprint, null);
+    assert.deepEqual(stream.encryptionKekFingerprints, []);
+    return;
+  }
   assert.match(stream.encryptionKeyFingerprint ?? '', FINGERPRINT);
   if (fingerprint !== undefined)
     assert.equal(stream.encryptionKeyFingerprint, fingerprint);
@@ -63,18 +68,20 @@ const assertNoKeyMaterial = (stream: Stream, key?: Buffer) => {
 /**
  * Registers the resource options cases for one transport. `connect` builds a
  * client of that transport signed in with the given credentials.
+ * `keylessSource` is what a stream created without a key reports: `server`
+ * when the server runs with encryption enabled, `none` otherwise.
  */
 export const describeResourceOptions = (
   label: string, prefix: string, connect: (credentials: Credentials) => Client,
-  skip: string | false = false
+  keylessSource: EncryptionKeySource, skip: string | false = false
 ) => describe(label, { skip }, async () => {
 
   const c = connect({ username: 'iggy', password: 'iggy' });
 
-  it('given stream key when creating then should read matching projection', async () => {
+  it('given stream key when creating should read matching projection', async () => {
     const key = randomBytes(32);
     const name = `${prefix}-keyed`;
-    const created = await c.stream.create({ name, encryptionKey: key });
+    const created = await c.stream.create({ name, encryptionKey: StreamEncryptionKey.from(key) });
     try {
       assertProjection(created, EncryptionKeySource.Stream, encryptionKeyFingerprint(key));
       assertNoKeyMaterial(created, key);
@@ -91,7 +98,9 @@ export const describeResourceOptions = (
       assertNoKeyMaterial(listed, key);
 
       const base64 = `${prefix}-keyed-base64`;
-      const fromText = await c.stream.create({ name: base64, encryptionKey: key.toString('base64') });
+      const fromText = await c.stream.create({
+        name: base64, encryptionKey: StreamEncryptionKey.from(key.toString('base64'))
+      });
       assert.equal(fromText.encryptionKeyFingerprint, encryptionKeyFingerprint(key));
       await c.stream.delete({ streamId: fromText.id });
     } finally {
@@ -99,22 +108,24 @@ export const describeResourceOptions = (
     }
   });
 
-  it('given keyless stream when reading then should report server generated key', async () => {
+  it(`given keyless stream when reading should report key source ${keylessSource}`, async () => {
     const created = await c.stream.create({ name: `${prefix}-keyless` });
     try {
-      assertProjection(created, EncryptionKeySource.Server);
+      assertProjection(created, keylessSource);
       const fetched = await c.stream.get({ streamId: created.id });
       assert.ok(fetched);
-      assertProjection(fetched, EncryptionKeySource.Server, created.encryptionKeyFingerprint!);
+      assertProjection(fetched, keylessSource, created.encryptionKeyFingerprint ?? undefined);
       assertNoKeyMaterial(fetched);
     } finally {
       await c.stream.delete({ streamId: created.id });
     }
   });
 
-  it('given stream rename when updating then should preserve encryption projection', async () => {
+  it('given stream rename when updating should preserve encryption projection', async () => {
     const key = randomBytes(32);
-    const created = await c.stream.create({ name: `${prefix}-rename`, encryptionKey: key });
+    const created = await c.stream.create({
+      name: `${prefix}-rename`, encryptionKey: StreamEncryptionKey.from(key)
+    });
     try {
       await c.topic.create({ streamId: created.id, name: 'events', partitionCount: 1 });
       await c.message.send({
@@ -146,7 +157,7 @@ export const describeResourceOptions = (
     }
   });
 
-  it('given topic reset when updating then should preserve unmentioned values', async () => {
+  it('given topic reset when updating should preserve unmentioned values', async () => {
     const stream = await c.stream.create({ name: `${prefix}-topic-reset` });
     try {
       const topic = await c.topic.create({
@@ -176,7 +187,7 @@ export const describeResourceOptions = (
     }
   });
 
-  it('given user options when creating and updating then should preserve user behavior', async () => {
+  it('given user options when creating and updating should preserve user behavior', async () => {
     const password = 'e2e-ro-password';
     const first = await c.user.create({
       username: `${prefix}-user`, password, status: UserStatus.Active, options: []
@@ -211,7 +222,7 @@ export const describeResourceOptions = (
     }
   });
 
-  it('given logged in user rename when reconnecting then should keep new username', async () => {
+  it('given logged in user rename when reconnecting should keep new username', async () => {
     const password = 'e2e-ro-self-password';
     const user = await c.user.create({
       username: `${prefix}-self`, password, status: UserStatus.Active,
@@ -258,7 +269,7 @@ export const describeResourceOptions = (
     }
   });
 
-  it('given raw create-only key or unknown raw reset when updating then should let the server refuse', async () => {
+  it('given raw create-only key or unknown raw reset when updating should let the server refuse', async () => {
     const stream = await c.stream.create({ name: `${prefix}-raw` });
     try {
       const topic = await c.topic.create({
@@ -286,7 +297,7 @@ export const describeResourceOptions = (
     }
   });
 
-  it('given stream scope when describing options then should report sensitivity and mutability', async () => {
+  it('given stream scope when describing options should report sensitivity and mutability', async () => {
     const specs = await c.system.describeOptions({ scope: OptionsScope.Stream });
     const byKey = new Map(specs.map((spec) => [spec.key, spec]));
     assert.deepEqual([...byKey.keys()], [

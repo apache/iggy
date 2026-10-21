@@ -117,7 +117,7 @@ fn get_command(
         Command::Stream(command) => match command {
             StreamAction::Create(args) => Box::new(CreateStreamCmd::new(
                 args.name.clone(),
-                args.encryption_key_file.clone(),
+                args.stream_key_file.clone(),
             )),
             StreamAction::Delete(args) => Box::new(DeleteStreamCmd::new(args.stream_id.clone())),
             StreamAction::Update(args) => Box::new(UpdateStreamCmd::new(

@@ -26,7 +26,7 @@ use iggy::prelude::{Client, StreamEncryptionKey, StreamEncryptionSource};
 use iggy_common::ServerKeyContext;
 use integration::harness::{EncryptionConfig, TestServerConfig};
 use predicates::prelude::PredicateBooleanExt;
-use predicates::str::{contains, diff};
+use predicates::str::{contains, diff, starts_with};
 use serial_test::parallel;
 use std::fs;
 use std::path::PathBuf;
@@ -108,6 +108,13 @@ struct TestStreamCreateWithKeyCmd {
     environment_key: Option<String>,
 }
 
+/// What the server must end up with for one create.
+enum ExpectedKey {
+    Stream(StreamEncryptionKey),
+    Generated,
+    Refused,
+}
+
 impl TestStreamCreateWithKeyCmd {
     fn new(stream_name: &str, file_key: Option<String>, environment_key: Option<String>) -> Self {
         let key_directory = TempDir::new().expect("key directory");
@@ -125,12 +132,14 @@ impl TestStreamCreateWithKeyCmd {
         }
     }
 
-    /// The key the server must hold: the file wins over the environment, and a malformed one is refused.
-    fn applied_key(&self) -> Option<StreamEncryptionKey> {
-        self.file_key
-            .as_ref()
-            .or(self.environment_key.as_ref())
-            .and_then(|text| text.parse().ok())
+    /// Only the file supplies a key, the environment never does.
+    fn expected_key(&self) -> ExpectedKey {
+        match &self.file_key {
+            Some(text) => text
+                .parse()
+                .map_or(ExpectedKey::Refused, ExpectedKey::Stream),
+            None => ExpectedKey::Generated,
+        }
     }
 
     fn secrets(&self) -> Vec<String> {
@@ -150,7 +159,7 @@ impl IggyCmdTestCase for TestStreamCreateWithKeyCmd {
         let mut command = IggyCmdCommand::new().arg("stream").arg("create");
         if let Some(key_file) = &self.key_file {
             command = command
-                .arg("--encryption-key-file")
+                .arg("--stream-key-file")
                 .arg(key_file.to_str().expect("UTF-8 path"));
         }
         let command = command.arg(&self.stream_name).with_env_credentials();
@@ -161,22 +170,26 @@ impl IggyCmdTestCase for TestStreamCreateWithKeyCmd {
     }
 
     fn verify_command(&self, command_state: Assert) {
-        let mut command_state = match self.applied_key() {
-            Some(key) => {
+        let name = &self.stream_name;
+        let created = format!(
+            "Executing create stream with name: {name} and ID auto incremented\n\
+             Stream with name: {name} and ID auto incremented created\n"
+        );
+        let mut command_state = match self.expected_key() {
+            ExpectedKey::Stream(key) => {
                 let kek_fingerprint = ServerKeyContext::from_config(SERVER_KEY, &[], true)
                     .expect("server key")
                     .kek_fingerprint()
                     .expect("KEK fingerprint");
-                let name = &self.stream_name;
-                let message = format!(
-                    "Executing create stream with name: {name} and ID auto incremented\n\
-                     Stream with name: {name} and ID auto incremented created\n\
-                     Stream encryption key source: stream, fingerprint: {}, KEK fingerprints: {kek_fingerprint}\n",
+                command_state.success().stdout(diff(format!(
+                    "{created}Stream encryption key source: stream, fingerprint: {}, KEK fingerprints: {kek_fingerprint}\n",
                     key.fingerprint()
-                );
-                command_state.success().stdout(diff(message))
+                )))
             }
-            None => command_state.failure().stderr(contains(
+            ExpectedKey::Generated => command_state.success().stdout(starts_with(format!(
+                "{created}Stream encryption key source: server, fingerprint: "
+            ))),
+            ExpectedKey::Refused => command_state.failure().stderr(contains(
                 "Stream encryption key must be standard base64 of exactly 32 bytes",
             )),
         };
@@ -190,23 +203,34 @@ impl IggyCmdTestCase for TestStreamCreateWithKeyCmd {
     async fn verify_server_state(&self, client: &dyn Client) {
         let stream_id = self.stream_name.clone().try_into().unwrap();
         let stream = client.get_stream(&stream_id).await.expect("get stream");
-        let Some(key) = self.applied_key() else {
-            assert!(stream.is_none(), "a refused key must not create the stream");
-            return;
+        let (source, fingerprint) = match self.expected_key() {
+            ExpectedKey::Refused => {
+                assert!(stream.is_none(), "a refused key must not create the stream");
+                return;
+            }
+            ExpectedKey::Stream(key) => (StreamEncryptionSource::Stream, Some(key.fingerprint())),
+            ExpectedKey::Generated => (StreamEncryptionSource::Server, None),
         };
         let stream = stream.expect("stream exists");
-        assert_eq!(
-            stream.encryption_key_source(),
-            Some(StreamEncryptionSource::Stream)
-        );
-        assert_eq!(stream.encryption_key_fingerprint(), Some(key.fingerprint()));
+        assert_eq!(stream.encryption_key_source(), Some(source));
+        if let Some(fingerprint) = fingerprint {
+            assert_eq!(stream.encryption_key_fingerprint(), Some(fingerprint));
+        }
+        let environment_fingerprint = self
+            .environment_key
+            .as_ref()
+            .and_then(|text| text.parse::<StreamEncryptionKey>().ok())
+            .map(|key| key.fingerprint());
+        if environment_fingerprint.is_some() {
+            assert_ne!(stream.encryption_key_fingerprint(), environment_fingerprint);
+        }
         client.delete_stream(&stream_id).await.expect("delete");
     }
 }
 
 #[tokio::test]
 #[parallel]
-pub async fn given_key_file_when_creating_stream_then_should_show_only_projections() {
+pub async fn given_key_file_when_creating_stream_should_show_only_projections() {
     let mut iggy_cmd_test = IggyCmdTest::with_server(encrypted_server());
 
     iggy_cmd_test.setup().await;
@@ -221,7 +245,7 @@ pub async fn given_key_file_when_creating_stream_then_should_show_only_projectio
 
 #[tokio::test]
 #[parallel]
-pub async fn given_environment_key_only_when_creating_stream_then_should_apply_it() {
+pub async fn given_environment_key_when_creating_stream_should_ignore_it() {
     let mut iggy_cmd_test = IggyCmdTest::with_server(encrypted_server());
 
     iggy_cmd_test.setup().await;
@@ -236,37 +260,15 @@ pub async fn given_environment_key_only_when_creating_stream_then_should_apply_i
 
 #[tokio::test]
 #[parallel]
-pub async fn given_malformed_key_when_creating_stream_then_should_refuse_without_echoing_it() {
+pub async fn given_malformed_key_file_when_creating_stream_should_refuse_without_echoing_it() {
     let mut iggy_cmd_test = IggyCmdTest::with_server(encrypted_server());
 
     iggy_cmd_test.setup().await;
-    iggy_cmd_test
-        .execute_test(TestStreamCreateWithKeyCmd::new(
-            "short-key",
-            None,
-            Some(STANDARD.encode([5; 31])),
-        ))
-        .await;
     iggy_cmd_test
         .execute_test(TestStreamCreateWithKeyCmd::new(
             "short-key-file",
             Some(STANDARD.encode([5; 31])),
             None,
-        ))
-        .await;
-}
-
-#[tokio::test]
-#[parallel]
-pub async fn given_key_file_and_environment_when_creating_then_should_prefer_file() {
-    let mut iggy_cmd_test = IggyCmdTest::with_server(encrypted_server());
-
-    iggy_cmd_test.setup().await;
-    iggy_cmd_test
-        .execute_test(TestStreamCreateWithKeyCmd::new(
-            "preferred",
-            Some(STANDARD.encode([7; 32])),
-            Some(STANDARD.encode([9; 32])),
         ))
         .await;
 }
@@ -303,7 +305,7 @@ The server assigns the stream ID. The legacy --stream-id flag is ignored.
 Examples:
  iggy stream create prod
  iggy stream create -s 1 test
- iggy stream create --encryption-key-file stream.key payments
+ iggy stream create --stream-key-file stream.key payments
 
 {USAGE_PREFIX} stream create [OPTIONS] <NAME>
 
@@ -315,14 +317,14 @@ Options:
   -s, --stream-id <STREAM_ID>
           Legacy stream ID flag (ignored)
 
-      --encryption-key-file <PATH>
+      --stream-key-file <PATH>
           File holding the stream's own at-rest encryption key
 {CLAP_INDENT}
-          Standard base64 of exactly 32 bytes. Without this flag the key is read
-          from the IGGY_STREAM_ENCRYPTION_KEY environment variable, and without
-          either the server encryption setting applies. The server stores the
-          key wrapped and reads report only its fingerprint. Unrelated to
-          --encryption-key, which encrypts message payloads on the client.
+          Standard base64 of exactly 32 random bytes from a secure source, such
+          as "head -c 32 /dev/urandom | base64". Use a new key for every stream.
+          Without this flag the server encryption setting applies. The server
+          stores the key wrapped and reads report only its fingerprint. Unrelated
+          to --encryption-key, which encrypts message payloads on the client.
 
   -h, --help
           Print help (see a summary with '-h')
@@ -349,9 +351,9 @@ Arguments:
   <NAME>  Name of the stream
 
 Options:
-  -s, --stream-id <STREAM_ID>       Legacy stream ID flag (ignored)
-      --encryption-key-file <PATH>  File holding the stream's own at-rest encryption key
-  -h, --help                        Print help (see more with '--help')
+  -s, --stream-id <STREAM_ID>   Legacy stream ID flag (ignored)
+      --stream-key-file <PATH>  File holding the stream's own at-rest encryption key
+  -h, --help                    Print help (see more with '--help')
 "#,
             ),
         ))

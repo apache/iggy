@@ -173,10 +173,13 @@ pub(in crate::http) async fn submit_committed(
 /// password and, for `ChangePassword`, strips the current one and verifies it
 /// against the stored hash (`CreateUser` / `ChangePassword`), the static bounds
 /// admit every options block through the catalog, and the secret options
-/// rewrite replaces a stream key with its wrap set (`CreateStream`). So
-/// plaintext secrets never enter consensus on any write. A further resolution handles `DeleteSegments`, which is not itself a
-/// consensus op: it is rewritten to the metadata `TruncatePartition` that commits
-/// the trim (see [`resolve_delete_segments_truncate`]), so the truncate rides
+/// rewrite replaces a stream key with its wrap set (`CreateStream`). The
+/// header this gateway builds leaves `request_checksum` zero, so no digest of
+/// the original body rides the prepare either, and no plaintext secret from
+/// an HTTP write enters consensus. A further resolution handles
+/// `DeleteSegments`, which is not itself a consensus op: it is rewritten to the
+/// metadata `TruncatePartition` that commits the trim (see
+/// [`resolve_delete_segments_truncate`]), so the truncate rides
 /// this session's gate id. A rejection (a malformed body or an unresolved
 /// delete-segments namespace) still spends the id like any other exit. A failed
 /// current-password check is not a rejection here: the op still commits with an

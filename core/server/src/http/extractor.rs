@@ -19,6 +19,7 @@
 //! routes.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Formatter;
 use std::net::IpAddr;
 use std::rc::Rc;
 
@@ -29,13 +30,16 @@ use axum::http::HeaderMap;
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
-use iggy_common::{IggyError, IggyTimestamp, PersonalAccessToken};
+use iggy_common::{
+    IggyError, IggyTimestamp, OptionInputValue, OptionsUpdate, PersonalAccessToken, RESET_FIELD,
+};
 use send_wrapper::SendWrapper;
-use serde::de::{DeserializeOwned, IgnoredAny};
+use serde::Deserializer as _;
+use serde::de::{DeserializeOwned, Error as _, IgnoredAny, MapAccess, Visitor};
 use tracing::debug;
 
 use super::HttpState;
-use super::error::AuthError;
+use super::error::{AuthError, WriteError};
 use super::jwt::TokenSubject;
 use super::session::HttpSession;
 use crate::dispatch::session_ops::verify_pat_credentials_with_expiry;
@@ -68,6 +72,19 @@ pub struct Authenticated {
 pub struct JsonMembers<T> {
     pub value: T,
     pub members: BTreeSet<String>,
+}
+
+/// An update body. A body the update shape refuses is `InvalidCommand`, the
+/// category the binary decoder gives the same patch, naming the first member
+/// at fault where one is.
+pub(in crate::http) struct JsonUpdate(pub OptionsUpdate);
+
+/// Walks an update body with the member types [`OptionsUpdate`] parses and
+/// records the first member that does not parse: a repeated name, a `reset`
+/// that is not a list of distinct names, or another member that is not a
+/// scalar or `null`.
+struct RefusedMemberVisitor<'a> {
+    refused: &'a mut Option<String>,
 }
 
 impl FromRequestParts<HttpState> for Authenticated {
@@ -138,6 +155,60 @@ where
             value,
             members: members.into_keys().collect(),
         })
+    }
+}
+
+impl<S> FromRequest<S> for JsonUpdate
+where
+    S: Send + Sync,
+{
+    type Rejection = WriteError;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let (parts, body) = request.into_parts();
+        let bytes = Bytes::from_request(Request::from_parts(parts.clone(), body), state)
+            .await
+            .map_err(|_| WriteError::Rejected(IggyError::InvalidCommand))?;
+        match Json::<OptionsUpdate>::from_request(
+            Request::from_parts(parts, Body::from(bytes.clone())),
+            state,
+        )
+        .await
+        {
+            Ok(Json(update)) => Ok(Self(update)),
+            Err(_) => Err(refused_member(&bytes).map_or(
+                WriteError::Rejected(IggyError::InvalidCommand),
+                WriteError::MalformedMember,
+            )),
+        }
+    }
+}
+
+impl<'de> Visitor<'de> for RefusedMemberVisitor<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("an update body object")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut access: A) -> Result<Self::Value, A::Error> {
+        let mut seen = BTreeSet::new();
+        while let Some(key) = access.next_key::<String>()? {
+            let fits = seen.insert(key.clone())
+                && if key == RESET_FIELD {
+                    access.next_value::<Vec<String>>().is_ok_and(|names| {
+                        let mut distinct = BTreeSet::new();
+                        names.into_iter().all(|name| distinct.insert(name))
+                    })
+                } else {
+                    access.next_value::<Option<OptionInputValue>>().is_ok()
+                };
+            if !fits {
+                *self.refused = Some(key);
+                return Err(A::Error::custom("refused update member"));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -264,4 +335,55 @@ pub(in crate::http) async fn resolve_credential(
         verify_pat_credentials_with_expiry(&state.shard, bearer)
             .map_err(|_| IggyError::Unauthenticated)?;
     Ok((None, user_id, user_created_at, expiry))
+}
+
+/// The member [`RefusedMemberVisitor`] finds in `bytes`, `None` for a body that
+/// is not a JSON object or has no member at fault.
+fn refused_member(bytes: &[u8]) -> Option<String> {
+    let mut refused = None;
+    let walked =
+        serde_json::Deserializer::from_slice(bytes).deserialize_map(RefusedMemberVisitor {
+            refused: &mut refused,
+        });
+    match walked {
+        Ok(()) => None,
+        Err(_) => refused,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn given_update_bodies_when_finding_refused_member_should_name_the_first_misfit() {
+        let cases = [
+            (r#"{"name":"orders","reset":["message_expiry"]}"#, None),
+            (r#"{"name":"orders","message_expiry":null}"#, None),
+            (r#"{"name":["orders"]}"#, Some("name")),
+            (
+                r#"{"name":"a","message_expiry":{"value":"1 day"}}"#,
+                Some("message_expiry"),
+            ),
+            (r#"{"reset":null}"#, Some("reset")),
+            (
+                r#"{"message_expiry":1.5,"name":"a","name":"b"}"#,
+                Some("message_expiry"),
+            ),
+            (r#"{"name":"a","name":"b"}"#, Some("name")),
+            (
+                r#"{"reset":["message_expiry","message_expiry"]}"#,
+                Some("reset"),
+            ),
+            (r#"["name"]"#, None),
+            (r#"{"name":"a""#, None),
+        ];
+        for (body, expected) in cases {
+            assert_eq!(
+                refused_member(body.as_bytes()).as_deref(),
+                expected,
+                "{body}"
+            );
+        }
+    }
 }

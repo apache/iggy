@@ -91,7 +91,7 @@ fn main() -> GeneratorResult<()> {
                 ),
                 (
                     "reset_order",
-                    "The typed encoders write reset keys in catalog order. The HTTP handler writes them in ascending name order.",
+                    "The typed encoders and the HTTP handler write reset keys in ascending key byte order.",
                 ),
                 (
                     "request_bodies",
@@ -437,9 +437,19 @@ fn update_resource_error_vectors() -> GeneratorResult<Vec<UpdateResourceErrorVec
         (
             "user_short_username",
             OptionsScope::User,
+            user.clone(),
+            PatchInput {
+                username: Some("a".to_owned()),
+                ..PatchInput::default()
+            },
+        ),
+        (
+            "user_short_username_and_status_reset",
+            OptionsScope::User,
             user,
             PatchInput {
                 username: Some("a".to_owned()),
+                reset: vec![OptionKey::Status],
                 ..PatchInput::default()
             },
         ),
@@ -631,6 +641,12 @@ fn http_update_vectors() -> GeneratorResult<Vec<HttpUpdateVector>> {
             OptionsScope::Topic,
             &topic,
             r#"{"max_topic_size":null}"#,
+        ),
+        (
+            "topic_zero_sentinel_only",
+            OptionsScope::Topic,
+            &topic,
+            r#"{"message_expiry":0}"#,
         ),
         (
             "topic_reset_names_set_key",

@@ -183,13 +183,13 @@ impl UsersInner {
             .and_then(|&id| self.items.get(id as usize))
     }
 
-    /// Stored password hash of the user named by `identifier`, `None` when
-    /// the user does not resolve.
+    /// Id and stored password hash of the user named by `identifier`, `None`
+    /// when the user does not resolve.
     #[must_use]
-    pub fn password_hash_of(&self, identifier: &WireIdentifier) -> Option<Arc<str>> {
+    pub fn resolve_password_hash(&self, identifier: &WireIdentifier) -> Option<(UserId, Arc<str>)> {
         self.resolve_user_id(identifier)
             .and_then(|user_id| self.items.get(user_id))
-            .map(|user| Arc::clone(&user.password_hash))
+            .map(|user| (user.id, Arc::clone(&user.password_hash)))
     }
 
     /// Clone the committed permissions of the user at slab `id`, if any.
@@ -698,11 +698,12 @@ impl StateHandler for ChangePasswordRequest {
         };
 
         // An empty `new_password` is the primary's signal that the caller's
-        // current password did not match (see the server
-        // `verify_and_rewrite_change_password`): the accept path always
-        // replicates a non-empty Argon2 hash, so this is unambiguous. Rejecting
-        // here (rather than denying pre-consensus) commits the op as a no-op,
-        // recording the request id in the ClientTable so a retry of it dedups.
+        // current password did not match or that the target did not resolve
+        // there (see the server `verify_and_rewrite_change_password`). The
+        // accept path always replicates a non-empty Argon2 hash, so this is
+        // unambiguous. Rejecting here (rather than denying pre-consensus)
+        // commits the op as a no-op, recording the request id in the
+        // ClientTable so a retry of it dedups.
         if self.new_password.is_empty() {
             return ApplyReply::err(ChangePasswordResult::InvalidCredentials);
         }
@@ -2054,7 +2055,7 @@ mod tests {
     }
 
     #[test]
-    fn given_user_status_patch_when_applying_then_should_revoke_inactive_sessions() {
+    fn given_user_status_patch_when_applying_should_revoke_inactive_sessions() {
         let mut users = UsersInner::new();
         create_user_with(&mut users, "iggy", None);
         let alice_id = create_user_with(&mut users, "alice", None);

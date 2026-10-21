@@ -99,7 +99,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn given_missing_or_unparsed_key_source_when_rendering_then_should_print_unknown() {
+    fn given_missing_or_unparsed_key_source_when_rendering_should_print_unknown() {
         assert_eq!(encryption_source(None), "unknown");
         assert_eq!(
             encryption_source(Some(StreamEncryptionSource::None)),

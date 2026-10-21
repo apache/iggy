@@ -479,8 +479,8 @@ mod tests {
     }
 
     #[test]
-    fn given_rewrap_operation_when_classifying_then_should_be_internal_metadata_and_not_client_allowed()
-     {
+    fn given_rewrap_operation_when_classifying_should_be_internal_metadata_and_not_client_allowed()
+    {
         let rewrap = Operation::RewrapStreamKeys;
         assert_eq!(rewrap as u8, 75);
         assert!(rewrap.is_internal());
@@ -493,7 +493,7 @@ mod tests {
     }
 
     #[test]
-    fn given_resolved_update_operations_when_classifying_then_should_be_internal_metadata() {
+    fn given_resolved_update_operations_when_classifying_should_be_internal_metadata() {
         for resolved in [
             Operation::UpdateStreamResolved,
             Operation::UpdateTopicResolved,

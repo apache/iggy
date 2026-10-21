@@ -148,7 +148,7 @@ impl IggyCmdTestCase for TestStreamGetEncryptedCmd {
 
 #[tokio::test]
 #[parallel]
-pub async fn given_encrypted_stream_when_getting_then_should_show_source_and_fingerprints() {
+pub async fn given_encrypted_stream_when_getting_should_show_source_and_fingerprints() {
     let mut iggy_cmd_test = IggyCmdTest::with_server(encrypted_server());
 
     iggy_cmd_test.setup().await;

@@ -235,7 +235,7 @@ mod update_tests {
     }
 
     #[test]
-    fn given_reset_name_newer_than_build_when_parsing_topic_update_then_should_send_it_raw() {
+    fn given_reset_name_newer_than_build_when_parsing_topic_update_should_send_it_raw() {
         let parsed = Update::try_parse_from([
             "iggy",
             "1",

@@ -71,8 +71,8 @@ use iggy_common::wire_conversions::{
 use iggy_common::{
     HeaderKey, HeaderValue, IggyByteSize, IggyExpiry, IggyTimestamp, MaxTopicSize, OptionKey,
     OptionValue, OptionsProvenance, OptionsScope, PartitionResizePolicy, PartitionStats,
-    ResourceOptions, StreamStats, TopicCreateOptions, TopicResolvedOptions, TopicRuntimeOptions,
-    TopicStats, WrapSet, public_options, stream_wrap_set,
+    ResourceOptions, StreamStats, TopicCreateOptions, TopicResolvedOptions, TopicStats, WrapSet,
+    public_options, stream_wrap_set,
 };
 use serde::{Deserialize, Serialize};
 use server_common::sharding::{IggyNamespace, MAX_PARTITIONS, MAX_STREAMS, MAX_TOPICS};
@@ -1231,7 +1231,7 @@ impl Streams {
                 topic.resolved.message_expiry,
                 topic.resolved.max_topic_size,
                 topic.partitions.len(),
-                TopicRuntimeOptions::from_resource_options(&topic.options).segment_size,
+                topic.resolved.runtime.segment_size,
             ))
         })
     }
@@ -1298,7 +1298,7 @@ impl Streams {
             let stream_slab = inner.resolve_stream_id(stream_id)?;
             let topic_slab = inner.resolve_topic_id(stream_slab, topic_id)?;
             let topic = inner.items.get(stream_slab)?.topics.get(topic_slab)?;
-            TopicRuntimeOptions::from_resource_options(&topic.options).segment_size
+            topic.resolved.runtime.segment_size
         })
     }
 
@@ -2117,7 +2117,8 @@ impl StateHandler for CreateStreamRequest {
         // The reply is cached for retries and folded into snapshots, so it is
         // projected here, before caching: internal keys such as the wrapped
         // stream key never leave the state machine. The projections come from
-        // committed state alone, so a replayed reply stays true on any node.
+        // committed state alone, so every node caches the same reply. A replay
+        // keeps the create-time KEK fingerprints, which a later rewrap outdates.
         let reply_options = public_reply_options(OptionsScope::Stream, &options);
         let stream_stats = state.stats_registry.stream(id);
         let stream = Stream {
@@ -2492,6 +2493,16 @@ impl StateHandler for UpdateTopicResolvedRequest {
                 return ApplyReply::err(UpdateTopicResult::OptionsBlockTooLarge);
             }
         };
+        // The edge floor ran on a view a delete and recreate can outrun, and
+        // `segment_size` is create-only, so the committed topic's value decides.
+        let segment_size = topic.resolved.runtime.effective_segment_size();
+        if let Some(max_topic_size) =
+            TopicCreateOptions::parse_committed(&self.explicit_options).max_topic_size
+            && !matches!(max_topic_size, MaxTopicSize::ServerDefault)
+            && max_topic_size.as_bytes_u64() < segment_size.as_bytes_u64()
+        {
+            return ApplyReply::err(UpdateTopicResult::InvalidTopicSize);
+        }
 
         let Some(topic) = stream.topics.get_mut(topic_id) else {
             return ApplyReply::err(UpdateTopicResult::TopicNotFound);
@@ -2674,9 +2685,7 @@ impl StateHandler for CreatePartitionsWithAssignmentsRequest {
             let Some(topic) = stream.topics.get_mut(topic_id) else {
                 return ApplyReply::err(CreatePartitionsResult::TopicNotFound);
             };
-            if TopicCreateOptions::from_resource_options(&topic.options).partition_resize_policy
-                == Some(PartitionResizePolicy::Fixed)
-            {
+            if topic.resolved.partition_resize_policy == PartitionResizePolicy::Fixed {
                 return ApplyReply::err(CreatePartitionsResult::PartitionResizeDisabled);
             }
 
@@ -2768,9 +2777,7 @@ impl StateHandler for DeletePartitionsRequest {
         };
 
         let count_to_delete = self.partitions_count as usize;
-        if TopicCreateOptions::from_resource_options(&topic.options).partition_resize_policy
-            == Some(PartitionResizePolicy::Fixed)
-        {
+        if topic.resolved.partition_resize_policy == PartitionResizePolicy::Fixed {
             return ApplyReply::err(DeletePartitionsResult::PartitionResizeDisabled);
         }
         if count_to_delete > topic.partitions.len() {
@@ -3099,8 +3106,8 @@ mod tests {
     };
     use iggy_binary_protocol::responses::topics::get_topic::GetTopicResponse;
     use iggy_common::{
-        CompressionAlgorithm, HeaderKey, HeaderKind, OptionKey, OptionValue, OptionValueCodec,
-        ServerKeyContext, StreamEncryptionKey, StreamKeyOrigin, WrappedStreamKey,
+        CompressionAlgorithm, DEFAULT_SEGMENT_SIZE, HeaderKey, HeaderKind, OptionKey, OptionValue,
+        OptionValueCodec, ServerKeyContext, StreamEncryptionKey, StreamKeyOrigin, WrappedStreamKey,
         topic_option_keys,
     };
     use std::str::FromStr;
@@ -3388,7 +3395,7 @@ mod tests {
     }
 
     #[test]
-    fn given_stale_rewrap_entry_for_recreated_stream_when_applying_then_should_skip_it() {
+    fn given_stale_rewrap_entry_for_recreated_stream_when_applying_should_skip_it() {
         let old = key_context(OLD_CONFIG_KEY, &[]);
         let rotated = key_context(NEW_CONFIG_KEY, &[OLD_CONFIG_KEY]);
         let mut inner = StreamsInner::new();
@@ -3445,7 +3452,74 @@ mod tests {
     }
 
     #[test]
-    fn given_malformed_rewrap_set_when_applying_then_should_skip_without_mutation() {
+    fn given_rewrap_entry_of_earlier_incarnation_with_same_key_when_applying_should_skip_it() {
+        let old = key_context(OLD_CONFIG_KEY, &[]);
+        let rotated = key_context(NEW_CONFIG_KEY, &[OLD_CONFIG_KEY]);
+        let mut inner = StreamsInner::new();
+        let first = WrapSet::from(envelope(&old, 1, StreamKeyOrigin::Client));
+        create_encrypted_stream(&mut inner, "orders", &first, 5);
+        let delete = DeleteStreamRequest {
+            stream_id: WireIdentifier::numeric(0),
+        };
+        assert_eq!(
+            crate::stm::lifecycle::apply_with_lifecycle_completion(
+                &delete,
+                &mut inner,
+                IggyTimestamp::now()
+            )
+            .code,
+            0
+        );
+        let second = WrapSet::from(envelope(&old, 1, StreamKeyOrigin::Client));
+        create_encrypted_stream(&mut inner, "orders", &second, 9);
+        let stale = rotated
+            .target_set(&first)
+            .expect("rewrap target builds")
+            .expect("first set lacks the new KEK");
+
+        let reply = StateHandler::apply(
+            &RewrapStreamKeysRequest {
+                entries: vec![rewrap_entry(0, 5, &first, stale.as_ref())],
+            },
+            &mut inner,
+            IggyTimestamp::now(),
+        );
+
+        assert_eq!(replaced_count(&reply), 0);
+        assert_eq!(
+            stream_wrap_set(&inner.items[0].options).expect("stored set decodes"),
+            Some(second)
+        );
+    }
+
+    #[test]
+    fn given_rewrap_entry_of_another_key_when_applying_should_skip_it() {
+        let old = key_context(OLD_CONFIG_KEY, &[]);
+        let rotated = key_context(NEW_CONFIG_KEY, &[OLD_CONFIG_KEY]);
+        let mut inner = StreamsInner::new();
+        let stored = WrapSet::from(envelope(&old, 3, StreamKeyOrigin::Server));
+        create_encrypted_stream(&mut inner, "payments", &stored, 4);
+        let before = inner.items[0].options.clone();
+        let other = WrapSet::from(envelope(&old, 9, StreamKeyOrigin::Server));
+        let other_rewrapped = rotated
+            .target_set(&other)
+            .expect("rewrap target builds")
+            .expect("other set lacks the new KEK");
+
+        let reply = StateHandler::apply(
+            &RewrapStreamKeysRequest {
+                entries: vec![rewrap_entry(0, 4, &other, other_rewrapped.as_ref())],
+            },
+            &mut inner,
+            IggyTimestamp::now(),
+        );
+
+        assert_eq!(replaced_count(&reply), 0);
+        assert_eq!(inner.items[0].options, before);
+    }
+
+    #[test]
+    fn given_malformed_rewrap_set_when_applying_should_skip_without_mutation() {
         let old = key_context(OLD_CONFIG_KEY, &[]);
         let new = key_context(NEW_CONFIG_KEY, &[]);
         let third = key_context(THIRD_CONFIG_KEY, &[]);
@@ -3492,7 +3566,7 @@ mod tests {
     }
 
     #[test]
-    fn given_well_formed_set_of_other_key_or_origin_when_rewrapping_then_should_skip_it() {
+    fn given_well_formed_set_of_other_key_or_origin_when_rewrapping_should_skip_it() {
         let old = key_context(OLD_CONFIG_KEY, &[]);
         let new = key_context(NEW_CONFIG_KEY, &[]);
         let mut inner = StreamsInner::new();
@@ -3531,7 +3605,7 @@ mod tests {
     }
 
     #[test]
-    fn given_plaintext_stream_key_when_applying_create_then_should_refuse_without_storing() {
+    fn given_plaintext_stream_key_when_applying_create_should_refuse_without_storing() {
         let mut options = ResourceOptions::new();
         options.insert(
             HeaderKey::from(OptionKey::EncryptionKey),
@@ -3554,11 +3628,12 @@ mod tests {
     }
 
     #[test]
-    fn given_topic_with_retention_when_restoring_snapshot_then_should_rebuild_resolved_view() {
+    fn given_topic_with_retention_when_restoring_snapshot_should_rebuild_resolved_view() {
         let mut inner = StreamsInner::new();
         create_stream(&mut inner, "stream");
         let message_expiry = IggyExpiry::from(5_000_000u64);
         let max_topic_size = MaxTopicSize::from(10_000_000_000u64);
+        let segment_size = IggyByteSize::from(64 * 1024 * 1024);
         let create = CreateTopicWithAssignmentsRequest {
             created_view: 0,
             request: WireCreateTopicRequest {
@@ -3574,6 +3649,7 @@ mod tests {
             },
             derived_options: TopicCreateOptions {
                 max_topic_size: Some(max_topic_size),
+                segment_size: Some(segment_size),
                 ..TopicCreateOptions::default()
             }
             .to_wire()
@@ -3594,16 +3670,18 @@ mod tests {
 
         let restored = Streams::from_snapshot(decoded.streams.unwrap()).unwrap();
 
-        let (expiry, size, partitions, _) = restored.topic_retention_config(0, 0).unwrap();
         assert_eq!(
-            (expiry, size, partitions),
-            (message_expiry, max_topic_size, 1)
+            restored.topic_retention_config(0, 0).unwrap(),
+            (message_expiry, max_topic_size, 1, Some(segment_size))
+        );
+        assert_eq!(
+            restored.topic_segment_size(&WireIdentifier::numeric(0), &WireIdentifier::numeric(0)),
+            Some(segment_size)
         );
     }
 
     #[test]
-    fn given_stored_critical_marker_when_patch_declares_more_keys_then_should_store_the_bounded_union()
-     {
+    fn given_stored_critical_marker_when_patch_declares_more_keys_should_store_the_bounded_union() {
         let marker_key = HeaderKey::from(OptionKey::CriticalKeys);
         let marker = |text: &str| OptionValue::explicit(HeaderValue::try_from(text).unwrap());
         let update = |names: &str| {
@@ -3638,7 +3716,7 @@ mod tests {
     }
 
     #[test]
-    fn given_internal_or_unservable_topic_options_when_creating_then_should_not_echo_them() {
+    fn given_internal_or_unservable_topic_options_when_creating_should_not_echo_them() {
         let marker_key = HeaderKey::from(OptionKey::CriticalKeys);
         let wrapped_key = HeaderKey::from(OptionKey::EncryptionKeyWrapped);
         let future_key = HeaderKey::try_from("a_future_key").unwrap();
@@ -3695,7 +3773,7 @@ mod tests {
     }
 
     #[test]
-    fn given_unknown_critical_key_when_applying_create_stream_then_should_store_it_without_echoing_options()
+    fn given_unknown_critical_key_when_applying_create_stream_should_store_it_without_echoing_options()
      {
         let mut options = ResourceOptions::new();
         options.insert(
@@ -3724,7 +3802,7 @@ mod tests {
     }
 
     #[test]
-    fn given_reused_stream_id_when_creating_then_should_have_distinct_created_op() {
+    fn given_reused_stream_id_when_creating_should_have_distinct_created_op() {
         let mut inner = StreamsInner::new();
         let timestamp = IggyTimestamp::from(1);
         let create = CreateStreamRequest {
@@ -3754,7 +3832,7 @@ mod tests {
     }
 
     #[test]
-    fn given_rename_only_patch_when_applying_then_should_preserve_options_and_provenance() {
+    fn given_rename_only_patch_when_applying_should_preserve_options_and_provenance() {
         let mut inner = StreamsInner::new();
         create_stream(&mut inner, "stream");
         let message_expiry = IggyExpiry::from(5_000_000u64);
@@ -3808,7 +3886,7 @@ mod tests {
     }
 
     #[test]
-    fn given_topic_patch_without_name_when_applying_then_should_preserve_name_and_other_keys() {
+    fn given_topic_patch_without_name_when_applying_should_preserve_name_and_other_keys() {
         let mut inner = streams_with_resize_policy(Some(PartitionResizePolicy::Mutable));
         let before = inner.items[0].topics[0].options.clone();
         let expiry = IggyExpiry::from(9_000_000u64);
@@ -3837,7 +3915,7 @@ mod tests {
     }
 
     #[test]
-    fn given_explicit_topic_key_when_resetting_then_should_store_primary_default_as_derived() {
+    fn given_explicit_topic_key_when_resetting_should_store_primary_default_as_derived() {
         let mut inner = StreamsInner::new();
         create_stream(&mut inner, "stream");
         let create = CreateTopicWithAssignmentsRequest {
@@ -3894,7 +3972,7 @@ mod tests {
     }
 
     #[test]
-    fn given_conflicting_rename_with_patch_when_applying_then_should_leave_state_unchanged() {
+    fn given_conflicting_rename_with_patch_when_applying_should_leave_state_unchanged() {
         let mut inner = StreamsInner::new();
         create_stream(&mut inner, "stream");
         for name in ["first", "second"] {
@@ -3954,6 +4032,67 @@ mod tests {
             inner.resolve_stream_id(&WireIdentifier::named("stream").unwrap()),
             None
         );
+    }
+
+    #[test]
+    fn given_cap_below_topic_segment_size_when_applying_update_should_refuse_it_unchanged() {
+        let segment_size = 64 * 1024 * 1024;
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "stream");
+        let mut request = make_topic_request(0, 1, "topic");
+        request.options = TopicCreateOptions {
+            segment_size: Some(IggyByteSize::from(segment_size)),
+            ..TopicCreateOptions::default()
+        }
+        .to_explicit_wire(|key| key == topic_option_keys::SEGMENT_SIZE)
+        .unwrap();
+        let create = CreateTopicWithAssignmentsRequest {
+            created_view: 0,
+            request,
+            derived_options: WireOptions::empty(),
+            partitions: vec![CreatedPartitionAssignment {
+                partition_id: 0,
+                consensus_group_id: 1,
+            }],
+        };
+        assert_eq!(
+            StateHandler::apply(&create, &mut inner, IggyTimestamp::from(1)).code,
+            0
+        );
+        let before = inner.items[0].topics[0].options.clone();
+
+        let below = topic_cap_update(segment_size - 1, Some("renamed"));
+        assert_eq!(
+            StateHandler::apply(&below, &mut inner, IggyTimestamp::from(2)).code,
+            u32::from(UpdateTopicResult::InvalidTopicSize)
+        );
+        let topic = &inner.items[0].topics[0];
+        assert_eq!(topic.name.as_ref(), "topic");
+        assert_eq!(topic.options, before);
+
+        let at_floor = topic_cap_update(segment_size, Some("renamed"));
+        assert_eq!(
+            StateHandler::apply(&at_floor, &mut inner, IggyTimestamp::from(3)).code,
+            0
+        );
+        let topic = &inner.items[0].topics[0];
+        assert_eq!(topic.name.as_ref(), "renamed");
+        assert_eq!(
+            topic.resolved.max_topic_size,
+            MaxTopicSize::from(segment_size)
+        );
+    }
+
+    #[test]
+    fn given_topic_without_segment_size_when_applying_cap_below_default_should_refuse_it() {
+        let mut inner = streams_with_resize_policy(None);
+        let before = inner.items[0].topics[0].options.clone();
+        let update = topic_cap_update(DEFAULT_SEGMENT_SIZE - 1, None);
+        assert_eq!(
+            StateHandler::apply(&update, &mut inner, IggyTimestamp::now()).code,
+            u32::from(UpdateTopicResult::InvalidTopicSize)
+        );
+        assert_eq!(inner.items[0].topics[0].options, before);
     }
 
     #[test]
@@ -4039,6 +4178,21 @@ mod tests {
             0
         );
         inner
+    }
+
+    fn topic_cap_update(max_topic_size: u64, name: Option<&str>) -> UpdateTopicResolvedRequest {
+        UpdateTopicResolvedRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            name: name.map(|name| WireName::new(name).unwrap()),
+            explicit_options: TopicCreateOptions {
+                max_topic_size: Some(MaxTopicSize::from(max_topic_size)),
+                ..TopicCreateOptions::default()
+            }
+            .to_explicit_wire(|key| key == topic_option_keys::MAX_TOPIC_SIZE)
+            .unwrap(),
+            derived_options: WireOptions::empty(),
+        }
     }
 
     #[test]

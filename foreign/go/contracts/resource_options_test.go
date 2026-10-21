@@ -46,7 +46,7 @@ import (
 func TestResourceOptions_SharedVectors(t *testing.T) {
 	fixture := loadFixture(t)
 
-	t.Run("given_shared_vectors_when_encoding_then_should_match_server_contract", func(t *testing.T) {
+	t.Run("given_shared_vectors_when_encoding_should_match_server_contract", func(t *testing.T) {
 		t.Run("constants", func(t *testing.T) { checkConstants(t, fixture.Constants) })
 		t.Run("catalog", func(t *testing.T) { checkCatalog(t, fixture.Catalog) })
 		t.Run("typed_surface", func(t *testing.T) { checkTypedSurface(t, fixture.Catalog) })
@@ -110,7 +110,7 @@ func TestResourceOptions_SharedVectors(t *testing.T) {
 }
 
 func TestResourceOptions_Diagnostics(t *testing.T) {
-	t.Run("given_raw_entry_of_a_key_newer_than_this_build_when_printing_then_should_redact_its_value", func(t *testing.T) {
+	t.Run("given_raw_entry_of_a_key_newer_than_this_build_when_printing_should_redact_its_value", func(t *testing.T) {
 		secret := "future-secret-value"
 		raw := []iggcon.HeaderEntry{{
 			Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte("future_secret")},
@@ -136,7 +136,7 @@ func TestResourceOptions_Diagnostics(t *testing.T) {
 		}
 	})
 
-	t.Run("given_typed_fields_when_printing_then_should_show_every_field", func(t *testing.T) {
+	t.Run("given_typed_fields_when_printing_should_show_every_field", func(t *testing.T) {
 		size := uint64(4096)
 		durability := iggcon.DurabilityPersisted
 		printed := fmt.Sprintf("%v", iggcon.TopicOptions{MaxTopicSize: &size, Durability: &durability})
@@ -149,7 +149,7 @@ func TestResourceOptions_Diagnostics(t *testing.T) {
 func TestResourceOptions_InvalidKeys(t *testing.T) {
 	fixture := loadFixture(t)
 
-	t.Run("given_invalid_key_when_encoding_then_should_reject_before_network_io", func(t *testing.T) {
+	t.Run("given_invalid_key_when_encoding_should_reject_before_network_io", func(t *testing.T) {
 		for _, vector := range fixture.StreamKey.InvalidKeys {
 			t.Run(vector.Case, func(t *testing.T) {
 				if vector.Input.RawHex != "" {

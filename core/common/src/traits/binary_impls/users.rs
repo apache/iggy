@@ -114,9 +114,6 @@ impl<B: BinaryClient> UserClient for B {
         options: &UserUpdateOptions,
     ) -> Result<(), IggyError> {
         fail_if_not_authenticated(self).await?;
-        if let Some(username) = &options.username {
-            super::validate_username(username)?;
-        }
         let patch = options.to_patch()?;
         let target = ResourceTarget::User {
             user_id: identifier_to_wire(user_id)?,
@@ -212,4 +209,152 @@ impl<B: BinaryClient> UserClient for B {
         self.publish_event(DiagnosticEvent::SignedOut).await;
         Ok(())
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        BinaryTransport, Client, ConsumerGroupClientState, NonZeroIggyDuration, OptionKey,
+        PartitionContext, VsrSessionControl, VsrSessionSealed,
+    };
+    use async_broadcast::Receiver;
+    use bytes::Bytes;
+    use iggy_binary_protocol::requests::messages::PollMessagesRequest;
+    use iggy_binary_protocol::requests::system::SessionIdentity;
+    use iggy_binary_protocol::requests::users::login_register::BindSecret;
+    use std::collections::BTreeSet;
+    use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn given_short_username_and_status_reset_when_updating_user_should_report_admission_category()
+     {
+        let client = RecordingClient::default();
+        let outcome = client
+            .update_user(
+                &Identifier::numeric(5).expect("numeric id"),
+                &UserUpdateOptions {
+                    username: Some("ab".to_owned()),
+                    reset: BTreeSet::from([OptionKey::Status]),
+                    ..UserUpdateOptions::default()
+                },
+            )
+            .await;
+        assert_eq!(
+            outcome,
+            Err(IggyError::OptionNotResettable(
+                OptionKey::Status.to_string()
+            ))
+        );
+        assert!(client.sent_codes().is_empty());
+    }
+
+    /// An authenticated binary client that records the codes it sends.
+    #[derive(Debug, Default)]
+    struct RecordingClient {
+        sent: Mutex<Vec<u32>>,
+        consumer_groups: Arc<ConsumerGroupClientState>,
+    }
+
+    impl RecordingClient {
+        fn sent_codes(&self) -> Vec<u32> {
+            self.sent.lock().expect("lock").clone()
+        }
+
+        fn record(&self, code: u32) -> Result<Bytes, IggyError> {
+            self.sent.lock().expect("lock").push(code);
+            Ok(Bytes::new())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BinaryTransport for RecordingClient {
+        async fn get_state(&self) -> ClientState {
+            ClientState::Authenticated
+        }
+
+        async fn set_state(&self, _state: ClientState) {}
+
+        async fn publish_event(&self, _event: DiagnosticEvent) {}
+
+        async fn send_raw_with_context(
+            &self,
+            code: u32,
+            _payload: Bytes,
+            _context: PartitionContext,
+        ) -> Result<Bytes, IggyError> {
+            self.record(code)
+        }
+
+        async fn send_offset_write_with_response(
+            &self,
+            code: u32,
+            _payload: Bytes,
+            _context: Option<PartitionContext>,
+        ) -> Result<Bytes, IggyError> {
+            self.record(code)
+        }
+
+        async fn send_poll_with_response(
+            &self,
+            _request: &PollMessagesRequest,
+            _context: Option<PartitionContext>,
+        ) -> Result<Bytes, IggyError> {
+            Err(IggyError::FeatureUnavailable)
+        }
+
+        fn get_heartbeat_interval(&self) -> NonZeroIggyDuration {
+            NonZeroIggyDuration::ONE_SECOND
+        }
+
+        fn consumer_group_state(&self) -> Arc<ConsumerGroupClientState> {
+            Arc::clone(&self.consumer_groups)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Client for RecordingClient {
+        async fn connect(&self) -> Result<(), IggyError> {
+            Ok(())
+        }
+
+        async fn disconnect(&self) -> Result<(), IggyError> {
+            Ok(())
+        }
+
+        async fn shutdown(&self) -> Result<(), IggyError> {
+            Ok(())
+        }
+
+        async fn subscribe_events(&self) -> Receiver<DiagnosticEvent> {
+            async_broadcast::broadcast(1).1
+        }
+    }
+
+    impl VsrSessionSealed for RecordingClient {}
+
+    #[async_trait::async_trait]
+    impl VsrSessionControl for RecordingClient {
+        async fn session_bind_secret(&self) -> Result<BindSecret, IggyError> {
+            Err(IggyError::FeatureUnavailable)
+        }
+
+        async fn session_identity(&self) -> Result<SessionIdentity, IggyError> {
+            Err(IggyError::FeatureUnavailable)
+        }
+
+        async fn bind_vsr_session(&self, _session: u64) -> Result<(), IggyError> {
+            Ok(())
+        }
+
+        async fn reset_vsr_session(&self) -> Result<(), IggyError> {
+            Ok(())
+        }
+
+        fn sdk_version(&self) -> &'static str {
+            env!("CARGO_PKG_VERSION")
+        }
+    }
+
+    impl BinaryClient for RecordingClient {}
 }

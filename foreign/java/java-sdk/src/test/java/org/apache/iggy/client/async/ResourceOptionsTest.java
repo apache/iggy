@@ -94,7 +94,7 @@ class ResourceOptionsTest extends BaseIntegrationTest {
     }
 
     @Test
-    void givenStreamKeyWhenCreatingThenShouldReadMatchingProjection() throws Exception {
+    void givenStreamKeyWhenCreatingShouldReadMatchingProjection() throws Exception {
         // given
         byte[] key = randomKey();
 
@@ -123,7 +123,7 @@ class ResourceOptionsTest extends BaseIntegrationTest {
     }
 
     @Test
-    void givenKeylessStreamWhenReadingThenShouldReportServerGeneratedKey() throws Exception {
+    void givenKeylessStreamWhenReadingShouldReportServerGeneratedKey() throws Exception {
         // when
         StreamDetails created = await(client.streams().createStream(unique("async-keyless")));
         streams.add(created.id());
@@ -137,7 +137,7 @@ class ResourceOptionsTest extends BaseIntegrationTest {
     }
 
     @Test
-    void givenStreamRenameWhenUpdatingThenShouldPreserveEncryptionProjection() throws Exception {
+    void givenStreamRenameWhenUpdatingShouldPreserveEncryptionProjection() throws Exception {
         // given
         byte[] key = randomKey();
         StreamDetails created = await(client.streams()
@@ -175,7 +175,7 @@ class ResourceOptionsTest extends BaseIntegrationTest {
     }
 
     @Test
-    void givenTopicResetWhenUpdatingThenShouldPreserveUnmentionedValues() throws Exception {
+    void givenTopicResetWhenUpdatingShouldPreserveUnmentionedValues() throws Exception {
         // given
         StreamDetails stream = await(client.streams().createStream(unique("async-topic")));
         streams.add(stream.id());
@@ -211,7 +211,7 @@ class ResourceOptionsTest extends BaseIntegrationTest {
     }
 
     @Test
-    void givenUserOptionsWhenCreatingAndUpdatingThenShouldPreserveUserBehavior() throws Exception {
+    void givenUserOptionsWhenCreatingAndUpdatingShouldPreserveUserBehavior() throws Exception {
         // given
         String firstName = unique("u1");
         String secondName = unique("u2");
@@ -251,7 +251,7 @@ class ResourceOptionsTest extends BaseIntegrationTest {
     }
 
     @Test
-    void givenLoggedInUserRenameWhenReconnectingThenShouldKeepNewUsername() throws Exception {
+    void givenLoggedInUserRenameWhenReconnectingShouldKeepNewUsername() throws Exception {
         // given
         String username = unique("self");
         String renamed = unique("self-renamed");
@@ -301,7 +301,7 @@ class ResourceOptionsTest extends BaseIntegrationTest {
     }
 
     @Test
-    void givenRawResetWhenUpdatingThenShouldLetTheServerDecide() throws Exception {
+    void givenRawResetWhenUpdatingShouldLetTheServerDecide() throws Exception {
         // given
         StreamDetails stream = await(client.streams().createStream(unique("async-raw-reset")));
         streams.add(stream.id());

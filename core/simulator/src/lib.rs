@@ -3762,7 +3762,7 @@ mod tests {
     /// Submit a metadata op to replica 0 and step until every live replica applied
     /// it and finished its lifecycle. Deletes reply before their partition fences
     /// install.
-    fn complete_metadata_op(
+    pub fn complete_metadata_op(
         sim: &mut Simulator,
         client: &SimClient,
         request: Message<RoutedRequestHeader>,

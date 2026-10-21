@@ -38,6 +38,8 @@ const OPTION_NOT_UPDATABLE = 4103;
 const OPTION_NOT_RESETTABLE = 4104;
 const READ_ONLY_OPTION = 4105;
 const MAX_NAME_LENGTH = 255;
+const MAX_RESET_KEYS = 255;
+const KEY_PREVIEW_LENGTH = 64;
 const MIN_USERNAME_LENGTH = 3;
 const MAX_USERNAME_LENGTH = 50;
 
@@ -127,6 +129,15 @@ const checkPatch = (scope: OptionsScope, set: OptionEntry[], reset: string[], ra
   const conflict = reset.find((key) => set.some((entry) => entry.key === key));
   if (conflict !== undefined)
     refuse(INVALID_COMMAND, `key '${conflict}' is both set and reset`);
+  const nameLength = (key: string) => Buffer.byteLength(key);
+  // The catalog is far smaller than the count byte, so an overlong list always
+  // names a key admission would refuse.
+  const unwritable = reset.find((key) => nameLength(key) < 1 || nameLength(key) > MAX_NAME_LENGTH)
+    ?? (reset.length > MAX_RESET_KEYS
+      ? reset.find((key) => !OPTION_CATALOG.get(key)?.scopes.includes(scope))
+      : undefined);
+  if (unwritable !== undefined)
+    refuse(UNSUPPORTED_OPTION_KEY, `reset of '${unwritable.slice(0, KEY_PREVIEW_LENGTH)}'`);
   if (raw)
     return;
 

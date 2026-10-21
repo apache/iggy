@@ -15,9 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using System.Text.Json.Serialization;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Headers;
 using Apache.Iggy.IggyClient;
+using Apache.Iggy.JsonConverters;
 
 namespace Apache.Iggy.Contracts;
 
@@ -48,6 +50,7 @@ public sealed class UserUpdate
     public IReadOnlySet<string>? RawReset { get; init; }
 
     /// <summary>Updatable keys newer than this build, keyed by option name. A property above wins on collision.</summary>
+    [JsonConverter(typeof(RedactedOptionsConverter))]
     public IReadOnlyDictionary<string, HeaderValue>? Options { get; init; }
 
     internal OptionsPatch ToPatch()

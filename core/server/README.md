@@ -47,7 +47,7 @@ Command-line arguments include `--replica-id`, `--fresh` (`-f`), `--with-default
 Deploy matching server and SDK releases together. Rolling upgrades and mixed
 server versions are unsupported. Partition control frames from older servers
 carry incarnation zero and are rejected, so a mixed-version cluster cannot
-complete partition view changes. The `IGGY-BOUND-GRANTS-4` storage gate
+complete partition view changes. The `IGGY-RESOURCE-OPTIONS-1` storage gate
 requires fresh storage and rejects older data directories without modifying them.
 Cached replies now preserve a committed-result marker, which older receipts lack.
 No in-place upgrade or implicit migration is supported. A separately validated
@@ -169,14 +169,18 @@ With `enabled = false` and a valid `key`, client keys are accepted and keyless s
 
 The server never returns a stream key. Stream reads report `encryption_key_source` (`stream` for a client key, `server` for a generated one, `none` for a plaintext stream), `encryption_key_fingerprint` and `encryption_kek_fingerprint`, the fingerprints of the server keys that wrap it, comma-separated during a rotation. Every SDK has a helper that computes the fingerprint of a key the caller holds.
 
-Boot opens every stored stream key. A node whose `key` and `previous_keys` open none of a stream's wraps refuses to start and names the stream and both sets of fingerprints. Every node of a cluster must hold the same `[encryption]` section. Losing a server key that still wraps a stream makes that stream unreadable.
+Boot opens every stored stream key. A standalone node whose `key` and `previous_keys` open none of a stream's wraps refuses to start and names the stream and both sets of fingerprints. A node without a `key` refuses the same way over any encrypted stream, in a cluster too.
+
+A cluster node holding a key may have metadata that trails the cluster until it catches up, so it starts, logs the stream and both sets of fingerprints, and builds that stream's partitions once a wrap it can open has committed. Every node of a cluster must hold the same `[encryption]` section. Losing a server key that still wraps a stream makes that stream unreadable.
 
 Rotating the server key takes two phases, and messages are never re-encrypted:
 
-1. Set `key` to the new key and `previous_keys` to the old one on every node (`IGGY_ENCRYPTION_PREVIOUS_KEYS`). The metadata primary adds a wrap under the new key to every encrypted stream. Old wraps stay, so nodes still on the old key keep serving during the rollout.
-2. Once every node runs the phase 1 config and every encrypted stream reports the new fingerprint in `encryption_kek_fingerprint`, remove the old key from `previous_keys`. The primary then drops the wraps under it. A node given only the new key before phase 1 finished refuses to boot.
+1. Set `key` to the new key and `previous_keys` to the old one on every node (`IGGY_ENCRYPTION_PREVIOUS_KEYS`). The metadata primary adds a wrap under the new key to every encrypted stream, and a stream created on a phase 1 node is wrapped under both keys. Old wraps stay, so nodes still on the old key keep serving and booting during the rollout, whichever node is primary.
+2. Once every node runs the phase 1 config and every encrypted stream reports the new fingerprint in `encryption_kek_fingerprint`, empty `previous_keys` and set `retired_kek_fingerprints` to the old key's fingerprint (`IGGY_ENCRYPTION_RETIRED_KEK_FINGERPRINTS`). The primary then drops the wraps under it.
 
-`previous_keys` holds at most two keys. Rotation changes only the wraps, so whoever already holds a stream's data key, or an old wrap together with the old server key, can still read that stream. Changing a stream's own data key is not supported.
+   A node given only the new key before phase 1 finished serves none of the streams still wrapped only under the old key, and a standalone node refuses to boot. Without the retired fingerprint a node never drops a wrap.
+
+The primary logs each sweep that rewraps streams, each stream it cannot rewrap, and once that every set is settled. `previous_keys` holds at most two keys. A stream created during phase 1 also carries a wrap under the old key until phase 2 drops it. Rotation changes only the wraps, so whoever already holds a stream's data key, or an old wrap together with the old server key, can still read that stream. Changing a stream's own data key is not supported.
 
 ## Upgrade recovery
 
@@ -187,6 +191,8 @@ Executable packaging does not affect that identity, so stripping or rebuilding
 the same compatible release does not by itself prevent a replica from joining.
 
 This checkout uses protocol 0.12.0, and 0.12.0 is also its minimum. It is a breaking change: released `server-0.9.0` uses protocol 0.11.0 and accepts every 0.11.x patch, so it rejects 0.12.0 clients before decoding their login, and this server rejects 0.11.x clients the same way. The retired update commands and the removed fixed topic fields mean older clients cannot work against it in any case.
+
+REST has no version handshake, so a 0.11 HTTP client is not refused at login. A create body that sends an option beside `options`, such as a top-level `message_expiry`, and an update body with a nested member, such as the `{"name": ..., "options": {}}` stream update older SDKs send, are refused with `InvalidCommand` (3), and the error's `field` names the member.
 
 Metadata snapshot format 13 is both the current and the oldest readable format. A data directory holding an older snapshot is refused, and journals written by older builds hold operations this build no longer knows. Start this release from fresh storage on every replica.
 
@@ -259,7 +265,7 @@ Before a partition can serve, initialization publishes its incarnation in
 `partition-initialization/<namespace>/created.revision` under the system data
 directory. This atomic record remains outside the partition directory, including
 after that directory is lost. Preserve it with metadata and partition backups.
-Storage format `IGGY-BOUND-GRANTS-4` requires this initialization contract;
+Storage format `IGGY-RESOURCE-OPTIONS-1` requires this initialization contract;
 older data directories are refused before mutation.
 
 Retirement also writes `retirement.fence` in that external namespace directory

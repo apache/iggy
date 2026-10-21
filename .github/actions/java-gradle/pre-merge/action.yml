@@ -86,6 +86,7 @@ runs:
       uses: ./.github/actions/utils/server-start
       with:
         bin: target/debug/iggy-server
+        encryption-enabled: "true"
         wait-timeout-seconds: "90"
       env:
         IGGY_PATH: ${{ runner.temp }}/iggy-java-data

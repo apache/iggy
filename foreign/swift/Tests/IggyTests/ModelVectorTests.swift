@@ -106,10 +106,11 @@ struct ModelVectorTests {
     /// Java, Go and C# SDKs. It is in insertion order, not key order, and
     /// decoders accept either.
     @Test func goldenOptionsBlock() throws {
-        let block: [UInt8] =
-            [2, 20, 0, 0, 0] + Array("preallocate_segments".utf8) + [3, 1, 0, 0, 0, 1]
-            + [2, 12, 0, 0, 0] + Array("segment_size".utf8) + [12, 8, 0, 0, 0, 0, 0, 0, 64, 0, 0, 0, 0]
-            + [2, 10, 0, 0, 0] + Array("durability".utf8) + [2, 9, 0, 0, 0] + Array("persisted".utf8)
+        let preallocate: [UInt8] = [2, 20, 0, 0, 0] + [UInt8]("preallocate_segments".utf8) + [3, 1, 0, 0, 0, 1]
+        let segmentSize: [UInt8] = [2, 12, 0, 0, 0] + [UInt8]("segment_size".utf8) + [12, 8, 0, 0, 0, 0, 0, 0, 64, 0, 0, 0, 0]
+        let durabilityKey: [UInt8] = [2, 10, 0, 0, 0] + [UInt8]("durability".utf8)
+        let durabilityValue: [UInt8] = [2, 9, 0, 0, 0] + [UInt8]("persisted".utf8)
+        let block: [UInt8] = preallocate + segmentSize + durabilityKey + durabilityValue
         #expect(block == golden.bytes("options.golden_block"))
         let options = try OptionsBlock.decode(block[...], explicit: true)
         #expect(

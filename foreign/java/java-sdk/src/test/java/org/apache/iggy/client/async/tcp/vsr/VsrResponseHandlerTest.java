@@ -475,7 +475,7 @@ class VsrResponseHandlerTest {
     }
 
     @Test
-    void givenResolvedUpdateReplyWhenCorrelatingThenShouldAcceptOnlyMatchingRequestIdentity() {
+    void givenResolvedUpdateReplyWhenCorrelatingShouldAcceptOnlyMatchingRequestIdentity() {
         int updateResource = 150;
         for (int resolved : new int[] {72, 73, 74}) {
             assertThat(correlates(updateResource, resolved, reply -> {}))

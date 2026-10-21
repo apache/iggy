@@ -190,6 +190,7 @@ result_enum!(CreateTopicResult {
 });
 result_enum!(UpdateTopicResult {
     StreamNotFound = 1009,
+    InvalidTopicSize = 1019,
     TopicNotFound = 2010,
     NameAlreadyExists = 2013,
     InvalidOptionValue = 4042,
@@ -407,7 +408,7 @@ const fn begins_lifecycle(operation: Operation) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iggy_common::{Identifier, IggyError};
+    use iggy_common::{Identifier, IggyByteSize, IggyError, MaxTopicSize};
 
     #[test]
     fn from_u32_round_trips_known_codes_and_rejects_unknown() {
@@ -646,6 +647,12 @@ mod tests {
         assert_eq!(
             u32::from(UpdateTopicResult::NameAlreadyExists),
             topic_name_exists
+        );
+
+        // InvalidTopicSize (1019).
+        assert_eq!(
+            u32::from(UpdateTopicResult::InvalidTopicSize),
+            IggyError::InvalidTopicSize(MaxTopicSize::default(), IggyByteSize::default()).as_code(),
         );
 
         // InvalidPartitionsCount (2019).

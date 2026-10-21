@@ -112,7 +112,7 @@ mod tests {
     use iggy_common::HeaderKind;
 
     #[test]
-    fn given_critical_spec_when_rendering_mutability_then_should_print_critical() {
+    fn given_critical_spec_when_rendering_mutability_should_print_critical() {
         let spec = OptionSpec {
             key: "critical_keys".to_owned(),
             kind: HeaderKind::String,

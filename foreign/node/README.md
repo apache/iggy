@@ -22,7 +22,7 @@ note: previous works on node.js http client has been moved to [iggy-node-http-cl
 npm i --save apache-iggy@edge
 ```
 
-Use matching SDK and server builds from the coordinated VSR release. Older builds are incompatible. This release requires fresh server storage (`IGGY-BOUND-GRANTS-4`). Existing incompatible data is refused unchanged. For a local server with the example credentials, follow the [example setup](../../examples/node/README.md#running-examples).
+Use matching SDK and server builds from the coordinated VSR release. Older builds are incompatible. This release requires fresh server storage (`IGGY-RESOURCE-OPTIONS-1`). Existing incompatible data is refused unchanged. For a local server with the example credentials, follow the [example setup](../../examples/node/README.md#running-examples).
 
 ## basic usage
 
@@ -271,13 +271,15 @@ Durations accept the same expressions as the Rust SDK, for example `500ms`,
 
 ### resource options
 
-A stream can carry its own data encryption key. Pass `encryptionKey` to `stream.create` as exactly 32 random bytes, or as their canonical padded base64. Never derive the key from a password, because its fingerprint is readable by anyone who can read the stream. A key that is not 32 bytes or canonical base64 is refused with error 70 before anything is sent.
+A stream can carry its own data encryption key. Build it with `StreamEncryptionKey.from` from exactly 32 random bytes, or from their canonical padded base64, and pass it to `stream.create` as `encryptionKey`. Never derive the key from a password, because its fingerprint is readable by anyone who can read the stream. A key that is not 32 bytes or canonical base64 is refused with error 70 before anything is sent.
+
+A `StreamEncryptionKey` keeps its own copy of the bytes and prints only its fingerprint through `util.inspect`, `JSON.stringify` and string conversion, so create arguments carrying it can be logged. Entries passed through `options` print as given, so an `encryption_key` entry there is refused with error 70 before anything is sent.
 
 The key travels inside the create request over whatever transport the client uses, so connect over TLS when the key must stay confidential. The server stores the key wrapped and never returns it: reads report only `encryptionKeySource`, `encryptionKeyFingerprint` and `encryptionKekFingerprints`. Without a key, a server with encryption enabled generates one for the stream and reports the source `server`.
 
 ```ts
 import { randomBytes } from "node:crypto";
-import { Client, encryptionKeyFingerprint } from "apache-iggy";
+import { Client, StreamEncryptionKey } from "apache-iggy";
 
 const client = new Client({
   transport: "TLS",
@@ -285,10 +287,10 @@ const client = new Client({
   credentials: { username: "iggy", password: "iggy" },
 });
 
-const key = randomBytes(32);
+const key = StreamEncryptionKey.from(randomBytes(32));
 const stream = await client.stream.create({ name: "orders", encryptionKey: key });
 console.log(stream.encryptionKeySource); // "stream"
-console.log(stream.encryptionKeyFingerprint === encryptionKeyFingerprint(key)); // true
+console.log(stream.encryptionKeyFingerprint === key.fingerprint()); // true
 ```
 
 `stream.update`, `topic.update` and `user.update` change only the keys they name and leave every other setting as it is, so an update without `name` keeps the name. `reset` returns a key to the server default. Use the `StreamOptionKey`, `TopicOptionKey` and `UserOptionKey` constants to name keys.

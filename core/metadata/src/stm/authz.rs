@@ -791,7 +791,7 @@ mod tests {
     }
 
     #[test]
-    fn given_unprivileged_user_when_applying_resolved_patch_then_should_deny_all_scopes() {
+    fn given_unprivileged_user_when_applying_resolved_patch_should_deny_all_scopes() {
         let mux = mux();
         commit_as_root(
             &mux,

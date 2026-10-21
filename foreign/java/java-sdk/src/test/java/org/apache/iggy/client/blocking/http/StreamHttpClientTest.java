@@ -39,7 +39,7 @@ class StreamHttpClientTest extends StreamClientBaseTest {
     }
 
     @Test
-    void givenHttpStreamOptionsWhenListingAndCreatingThenShouldPreserveBothBlocks() {
+    void givenHttpStreamOptionsWhenListingAndCreatingShouldPreserveBothBlocks() {
         // given
         byte[] key = new byte[EncryptionKeys.KEY_LENGTH];
         Arrays.fill(key, (byte) 3);

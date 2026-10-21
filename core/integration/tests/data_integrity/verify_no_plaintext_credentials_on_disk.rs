@@ -63,7 +63,7 @@ async fn should_not_persist_plaintext_password_or_pat_to_disk(harness: &mut Test
     encryption.enabled = "true",
     encryption.key = "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE="
 ))]
-async fn given_stream_keys_when_scanning_state_then_should_find_only_wrapped_keys(
+async fn given_stream_keys_when_scanning_state_should_find_only_wrapped_keys(
     harness: &mut TestHarness,
 ) {
     let client_key = StreamEncryptionKey::try_from([77u8; 32].as_slice()).unwrap();

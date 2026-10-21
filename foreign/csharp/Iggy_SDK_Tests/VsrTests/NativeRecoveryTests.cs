@@ -905,7 +905,7 @@ public sealed class NativeRecoveryTests
     [InlineData("other", 0, "user")]
     [InlineData("stream", 0, "user")]
     [InlineData("topic", 0, "user")]
-    public async Task given_logged_in_user_rename_when_reconnecting_then_should_keep_new_username(string target,
+    public async Task given_logged_in_user_rename_when_reconnecting_should_keep_new_username(string target,
         int status, string username)
     {
         using var cluster = new RecoveryCluster();

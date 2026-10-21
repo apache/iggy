@@ -581,7 +581,7 @@ mod tests {
     use rmcp::schemars::schema_for;
 
     #[test]
-    fn given_stream_tool_schema_when_describing_then_should_exclude_encryption_key() {
+    fn given_stream_tool_schema_when_describing_should_exclude_encryption_key() {
         for schema in [schema_for!(CreateStream), schema_for!(UpdateStream)] {
             let properties = schema
                 .get("properties")
@@ -612,7 +612,7 @@ mod tests {
     }
 
     #[test]
-    fn given_update_topic_with_retired_compression_when_parsing_then_should_refuse() {
+    fn given_update_topic_with_retired_compression_when_parsing_should_refuse() {
         let body = r#"{"stream_id":"orders","topic_id":"events","name":"events-v2","compression_algorithm":"gzip"}"#;
 
         assert!(serde_json::from_str::<UpdateTopic>(body).is_err());

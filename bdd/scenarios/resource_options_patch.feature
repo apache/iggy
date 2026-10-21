@@ -25,7 +25,7 @@ Feature: Resource option updates
     Given I have a running Iggy server
     And I am authenticated as the root user
 
-  Scenario: Given a topic with explicit settings when updating one key then should keep the others
+  Scenario: Update one topic setting
     Given a stream named "patch-topic-stream" exists
     And a topic named "patch-topic" exists in the stream with message expiry 3600000000 microseconds and max topic size 1073741824 bytes
     When I update the topic message expiry to 7200000000 microseconds without a name
@@ -33,14 +33,14 @@ Feature: Resource option updates
     And the topic message expiry should be 7200000000 microseconds set explicitly
     And the topic max topic size should be 1073741824 bytes set explicitly
 
-  Scenario: Given a topic with an explicit max size when resetting it then should read back the default
+  Scenario: Reset a topic setting to the server default
     Given a stream named "patch-reset-stream" exists
     And a topic named "patch-reset" exists in the stream with message expiry 3600000000 microseconds and max topic size 1073741824 bytes
     When I reset the topic option "max_topic_size"
     Then the topic max topic size should be derived from the server default
     And the topic message expiry should be 3600000000 microseconds set explicitly
 
-  Scenario: Given a topic when renaming then should keep its settings
+  Scenario: Rename a topic
     Given a stream named "patch-rename-stream" exists
     And a topic named "patch-rename" exists in the stream with message expiry 3600000000 microseconds and max topic size 1073741824 bytes
     When I rename the topic to "patch-renamed"
@@ -48,7 +48,7 @@ Feature: Resource option updates
     And the topic message expiry should be 3600000000 microseconds set explicitly
     And the topic max topic size should be 1073741824 bytes set explicitly
 
-  Scenario: Given a user when updating username and status then should apply both
+  Scenario: Update a user username and status
     Given a user named "patch-user" with password "patch-password" exists
     When I update the user username to "patch-user-renamed" and status to "inactive"
     Then the user should have username "patch-user-renamed"

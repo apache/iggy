@@ -25,14 +25,14 @@ Feature: Stream options
     Given I have a running Iggy server
     And I am authenticated as the root user
 
-  Scenario: Given a stream key when creating a stream then should read its source and fingerprint
+  Scenario: Create a stream with its own key
     When I create a stream named "stream-options-own-key" with an encryption key of 32 bytes valued 7
     Then the stream should report encryption key source "stream"
     And the stream encryption key fingerprint should match the key
     And the stream should report at least one KEK fingerprint
     And the stream should expose no encryption key material
 
-  Scenario: Given server encryption when creating a stream without a key then should report a generated key
+  Scenario: Create a stream with a server generated key
     When I create a stream named "stream-options-generated" without an encryption key
     Then the stream should report encryption key source "server"
     And the stream should report an encryption key fingerprint
@@ -43,13 +43,13 @@ Feature: Stream options
     Then polling the topic should return the payload "generated-key-payload"
 
   @message-headers
-  Scenario: Given a custom stream when producing and polling then should return the original payload and headers
+  Scenario: Send and poll a message with headers on a keyed stream
     Given a stream named "stream-options-custom" with an encryption key of 32 bytes valued 9 exists
     When I create a topic named "events" with 1 partition in the stream
     And I send a message with payload "custom-key-payload" and header "trace" set to "abc" to the topic
     Then polling the topic should return the payload "custom-key-payload" and header "trace" set to "abc"
 
-  Scenario: Given a keyed stream when renaming then should retain its key identity
+  Scenario: Rename a keyed stream
     Given a stream named "stream-options-rename" with an encryption key of 32 bytes valued 11 exists
     When I create a topic named "events" with 1 partition in the stream
     And I send a message with payload "before-rename" to the topic
@@ -59,7 +59,7 @@ Feature: Stream options
     And the stream encryption key fingerprint should match the key
     And polling the topic should return the payload "before-rename"
 
-  Scenario: Given a stream key when requesting reset then should reject without changing state
+  Scenario: Stream key reset is rejected
     Given a stream named "stream-options-reset" with an encryption key of 32 bytes valued 13 exists
     When I request a reset of the stream option "encryption_key"
     Then the stream update should be rejected
@@ -67,7 +67,7 @@ Feature: Stream options
     And the stream encryption key fingerprint should match the key
 
   @describe-options
-  Scenario: Given stream options when describing then should report sensitivity and mutability
+  Scenario: Describe stream options
     When I describe the stream options
     Then the stream option "name" should be updatable and not secret
     And the stream option "encryption_key" should be create only and secret

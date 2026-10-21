@@ -337,7 +337,7 @@ func TestDecodeReplyForRequiresCompleteFinalResultProof(t *testing.T) {
 }
 
 func TestDecodeReplyFor_ResolvedUpdate(t *testing.T) {
-	t.Run("given_resolved_update_reply_when_correlating_then_should_accept_only_matching_request_identity", func(t *testing.T) {
+	t.Run("given_resolved_update_reply_when_correlating_should_accept_only_matching_request_identity", func(t *testing.T) {
 		var request [HeaderSize]byte
 		EncodeRequestHeader(&request, RequestFields{Size: HeaderSize, Client: ClientID{Lo: 7, Hi: 9}, Request: 42, Operation: OperationUpdateResource, Session: 3})
 		request[requestOffsetChecksum] = 11

@@ -19,7 +19,7 @@ import assert from 'node:assert/strict';
 import { Given, When, Then } from '@cucumber/cucumber';
 import {
   Consumer, HeaderKeyFactory, HeaderValue, OptionsScope, Partitioning, PollingStrategy,
-  UserStatus, encryptionKeyFingerprint,
+  StreamEncryptionKey, UserStatus, encryptionKeyFingerprint,
   type OptionSpec, type StreamOptionKey, type TopicOptionKey
 } from '../wire/index.js';
 import type { Headers } from '../wire/message/header.utils.js';
@@ -28,7 +28,9 @@ import type { TestWorld } from './world.js';
 const NEVER_RETURNED = ['encryption_key', 'encryption_key_wrapped', 'critical_keys'];
 
 const createStream = async (world: TestWorld, name: string, key?: Buffer) => {
-  world.stream = await world.client.stream.create({ name, encryptionKey: key });
+  world.stream = await world.client.stream.create({
+    name, encryptionKey: key === undefined ? undefined : StreamEncryptionKey.from(key)
+  });
   world.streamKey = key;
 };
 

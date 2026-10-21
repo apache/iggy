@@ -296,7 +296,7 @@ Rust HTTP callers can use `HttpClient::send_messages_with_durability` to read th
 
 The CLI exposes `--durability persisted` and `--consumer-offset-durability persisted` on `topic create`. Select either independently. The policy names describe completion guarantees and do not prescribe an I/O syscall.
 
-Streams, topics and users carry options from one catalog, listed by `iggy options <scope>` and changed by one sparse update. Each encrypted stream has its own data key, wrapped under the server's `[encryption] key`, and a stream created without encryption stays plaintext for life. Rotating the server key is a two-phase change through `previous_keys`. See [Resource options](core/server/README.md#resource-options) and [Stream encryption](core/server/README.md#stream-encryption).
+Streams, topics and users carry options from one catalog, listed by `iggy options <scope>` and changed by one sparse update. Each encrypted stream has its own data key, wrapped under the server's `[encryption] key`, and a stream created without encryption stays plaintext for life. Rotating the server key is a two-phase change through `previous_keys` and `retired_kek_fingerprints`. See [Resource options](core/server/README.md#resource-options) and [Stream encryption](core/server/README.md#stream-encryption).
 
 For the detailed documentation of the configuration file, please refer to the [configuration](https://iggy.apache.org/docs/server/configuration) section.
 

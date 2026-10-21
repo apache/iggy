@@ -281,7 +281,7 @@ mod tests {
     }
 
     #[test]
-    fn given_stream_key_when_debugging_options_then_should_hide_key_bytes_and_keep_the_block() {
+    fn given_stream_key_when_debugging_options_should_hide_key_bytes_and_keep_the_block() {
         let key = [b'k'; 32];
         let buf = encode(&[(STRING, b"encryption_key", 1, &key)]);
         let options = WireOptions::from_slice(&buf).expect("valid stream options");

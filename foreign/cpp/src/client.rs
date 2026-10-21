@@ -1582,7 +1582,7 @@ mod tests {
     }
 
     #[test]
-    fn given_http_option_refusal_when_recording_then_should_report_the_server_error_code() {
+    fn given_http_option_refusal_when_recording_should_report_the_server_error_code() {
         let mut error_info = ffi::ErrorInfo::default();
         error_info.record(&IggyError::HttpResponseError(
             400,

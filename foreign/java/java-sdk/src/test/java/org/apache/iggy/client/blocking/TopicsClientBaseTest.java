@@ -117,7 +117,7 @@ public abstract class TopicsClientBaseTest extends IntegrationTest {
     }
 
     @Test
-    void givenTopicResetWhenUpdatingThenShouldPreserveUnmentionedValues() {
+    void givenTopicResetWhenUpdatingShouldPreserveUnmentionedValues() {
         // given
         var created = topicsClient.createTopic(
                 STREAM_NAME,
@@ -151,7 +151,7 @@ public abstract class TopicsClientBaseTest extends IntegrationTest {
     }
 
     @Test
-    void givenTopicRenameWhenUpdatingThenShouldKeepSettings() {
+    void givenTopicRenameWhenUpdatingShouldKeepSettings() {
         // given
         var created = topicsClient.createTopic(
                 STREAM_NAME,
@@ -177,7 +177,7 @@ public abstract class TopicsClientBaseTest extends IntegrationTest {
     }
 
     @Test
-    void givenCreateOnlyTopicKeyWhenUpdatingThenShouldRefuseOnClientAndServer() {
+    void givenCreateOnlyTopicKeyWhenUpdatingShouldRefuseOnClientAndServer() {
         // given
         var created = topicsClient.createTopic(STREAM_NAME, "fixed-topic", 1L);
         var topicId = TopicId.of(created.id());

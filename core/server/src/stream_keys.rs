@@ -15,81 +15,150 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::wire::{request_body, rewrite_request_body};
+use crate::wire::rewrite_request_body;
+use bytes::Bytes;
 use iggy_binary_protocol::requests::streams::CreateStreamRequest;
-use iggy_binary_protocol::{Operation, RoutedRequestHeader, WireDecode, WireEncode};
-use iggy_common::wire_conversions::{resource_options_from_wire, resource_options_to_wire};
+use iggy_binary_protocol::{RoutedRequestHeader, WireEncode};
+use iggy_common::wire_conversions::resource_options_to_wire;
 use iggy_common::{
-    HeaderKey, HeaderValue, IggyError, OptionKey, OptionValue, OptionsProvenance, ServerKeyContext,
-    StreamEncryptionKey, StreamKeyOrigin, WrapSet, critical_keys_marker, stream_key_from_entry,
+    HeaderKey, HeaderValue, IggyError, OptionKey, OptionValue, OptionsProvenance, ResourceOptions,
+    ServerKeyContext, StreamEncryptionKey, StreamKeyOrigin, critical_keys_marker, erase_buffer,
 };
+use secrecy::zeroize::Zeroize;
 use server_common::Message;
+
+/// A request past static bounds. A `CreateStream` keeps its decoded body and
+/// admitted options for [`maybe_rewrite_secret_options_request`], so a client
+/// key is decoded once and never encoded into a request in the clear again.
+pub enum Bounded {
+    Request(Message<RoutedRequestHeader>),
+    StreamCreate {
+        request: Message<RoutedRequestHeader>,
+        create: CreateStreamRequest,
+        /// The admitted canonical options, a client key among them.
+        options: ResourceOptions,
+    },
+}
 
 /// Wrap a `CreateStream`'s key before the request leaves this node: the
 /// client's key when it sent one, or a key generated here when it did not and
-/// this node encrypts new streams. Only the wrapped key and the critical marker
-/// travel on, so no plaintext key reaches a replica, the log or a snapshot.
-/// Runs after catalog admission, which refuses a client-sent wrapped key.
+/// this node encrypts new streams. The key is wrapped under every configured
+/// server key, so the stream also opens on nodes a rotation has not reached.
+/// Only the wrap set and the critical marker travel on, so no plaintext key
+/// reaches a replica, the log or a snapshot. The body is built from the
+/// admitted options, and the copies of a client key this node decoded are
+/// erased whatever the outcome. Runs after catalog admission, which refuses a
+/// client-sent wrapped key.
 ///
 /// # Errors
 ///
 /// `StreamEncryptionUnavailable` for a client key on a node without a server
-/// key, `InvalidEncryptionKey` for a malformed one, `InvalidCommand` for a body
-/// that does not decode.
+/// key, `CannotEncryptData` when generating or wrapping fails.
 pub fn maybe_rewrite_secret_options_request(
     context: &ServerKeyContext,
-    request: Message<RoutedRequestHeader>,
+    bounded: Bounded,
 ) -> Result<Message<RoutedRequestHeader>, IggyError> {
-    if request.header().operation != Operation::CreateStream {
-        return Ok(request);
+    let (request, create, options) = match bounded {
+        Bounded::Request(request) => return Ok(request),
+        Bounded::StreamCreate {
+            request,
+            create,
+            options,
+        } => (request, create, options),
+    };
+    match sealed_body(context, &create, options) {
+        Ok(None) => Ok(request),
+        Ok(Some(body)) => {
+            let rewritten = rewrite_request_body(&request, &body);
+            erase_stream_create(request, Some(create));
+            rewritten
+        }
+        Err(error) => {
+            erase_stream_create(request, Some(create));
+            Err(error)
+        }
     }
-    let mut create = CreateStreamRequest::decode_from(request_body(&request))
-        .map_err(|_| IggyError::InvalidCommand)?;
-    let key_name = <&str>::from(OptionKey::EncryptionKey).as_bytes();
-    let client_key = (&create.options)
-        .into_iter()
-        .find(|entry| entry.key == key_name)
-        .map(|entry| stream_key_from_entry(&entry))
-        .transpose()?;
-    let (key, origin) = match client_key {
+}
+
+/// Zero a create's copies of a client key once it is rewritten or refused:
+/// the decoded options block, when there is one, and the request body.
+pub fn erase_stream_create(
+    mut request: Message<RoutedRequestHeader>,
+    create: Option<CreateStreamRequest>,
+) {
+    if let Some(create) = create {
+        erase_buffer(create.options.into_bytes());
+    }
+    request.as_mut_slice()[size_of::<RoutedRequestHeader>()..].zeroize();
+}
+
+/// The create body apply stores: the admitted options with the stream key
+/// wrapped in place of a client key, or `None` when the client's own body
+/// already is it, which holds no key.
+fn sealed_body(
+    context: &ServerKeyContext,
+    create: &CreateStreamRequest,
+    mut options: ResourceOptions,
+) -> Result<Option<Bytes>, IggyError> {
+    let client_key = match options.remove(&HeaderKey::from(OptionKey::EncryptionKey)) {
+        Some(plaintext) => {
+            let key = StreamEncryptionKey::try_from(plaintext.value.as_bytes());
+            plaintext.erase();
+            Some(key?)
+        }
+        None => None,
+    };
+    let key = match client_key {
         Some(_) if !context.accepts_stream_keys() => {
             return Err(IggyError::StreamEncryptionUnavailable);
         }
-        Some(key) => (key, StreamKeyOrigin::Client),
+        Some(key) => Some((key, StreamKeyOrigin::Client)),
         None if context.generates_stream_keys() => {
-            (StreamEncryptionKey::generate()?, StreamKeyOrigin::Server)
+            Some((StreamEncryptionKey::generate()?, StreamKeyOrigin::Server))
         }
-        None => return Ok(request),
+        None => None,
     };
-    let set = WrapSet::from(context.wrap(&key, origin)?);
-    let mut options = resource_options_from_wire(&create.options, true)?;
-    options.remove(&HeaderKey::from(OptionKey::EncryptionKey));
-    options.insert(
-        HeaderKey::from(OptionKey::EncryptionKeyWrapped),
-        OptionValue::explicit(HeaderValue::try_from(set.as_ref())?),
-    );
-    options.insert(
-        HeaderKey::from(OptionKey::CriticalKeys),
-        OptionValue::explicit(critical_keys_marker(&[OptionKey::EncryptionKeyWrapped])?),
-    );
-    create.options = resource_options_to_wire(&options, OptionsProvenance::All)?;
-    rewrite_request_body(&request, &create.to_bytes())
+    if let Some((key, origin)) = key {
+        let set = context.wrap_set(&key, origin)?;
+        options.insert(
+            HeaderKey::from(OptionKey::EncryptionKeyWrapped),
+            OptionValue::explicit(HeaderValue::try_from(set.as_ref())?),
+        );
+        options.insert(
+            HeaderKey::from(OptionKey::CriticalKeys),
+            OptionValue::explicit(critical_keys_marker(&[OptionKey::EncryptionKeyWrapped])?),
+        );
+    }
+    let block = resource_options_to_wire(&options, OptionsProvenance::All)?;
+    if block.as_bytes() == create.options.as_bytes() {
+        return Ok(None);
+    }
+    Ok(Some(
+        CreateStreamRequest {
+            name: create.name.clone(),
+            options: block,
+        }
+        .to_bytes(),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::dispatch::test_support::request_message;
-    use iggy_binary_protocol::{WireName, WireOptions};
+    use crate::wire::request_body;
+    use iggy_binary_protocol::{Operation, WireDecode, WireName, WireOptions};
+    use iggy_common::wire_conversions::resource_options_from_wire;
     use iggy_common::{
-        OptionAdmissionContext, OptionColumns, OptionOperation, OptionsScope, ResourceOptions,
-        StreamCreateOptions, admit, stream_wrap_set, text,
+        AdmittedOptions, OptionAdmissionContext, OptionColumns, OptionOperation, OptionsScope,
+        StreamCreateOptions, WrapSet, admit, stream_wrap_set, text,
     };
 
     const CONFIG_KEY: &str = "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=";
+    const NEW_CONFIG_KEY: &str = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=";
 
     #[test]
-    fn given_custom_key_on_binary_backup_when_rewriting_then_should_forward_only_wrapped_bytes() {
+    fn given_custom_key_on_binary_backup_when_rewriting_should_forward_only_wrapped_bytes() {
         let context = context(true);
         let key = StreamEncryptionKey::try_from([7u8; 32].as_slice()).unwrap();
         for options in [
@@ -116,7 +185,7 @@ mod tests {
     }
 
     #[test]
-    fn given_keyless_create_with_encryption_enabled_when_rewriting_then_should_attach_server_origin_wrap_set()
+    fn given_keyless_create_with_encryption_enabled_when_rewriting_should_attach_server_origin_wrap_set()
      {
         let context = context(true);
         let first =
@@ -129,12 +198,49 @@ mod tests {
 
         let disabled = self::context(false);
         let request = create_request(WireOptions::empty());
-        let passed = maybe_rewrite_secret_options_request(&disabled, request.clone()).unwrap();
+        let passed = maybe_rewrite_secret_options_request(&disabled, bounded(request.clone()))
+            .expect("passes through");
         assert_eq!(passed.as_slice(), request.as_slice());
     }
 
     #[test]
-    fn given_client_internal_key_when_admitting_then_should_reject_before_wrapping() {
+    fn given_decoded_create_when_erasing_should_hold_the_only_handle_to_its_options() {
+        let request = create_request(raw_key_block(&text::as_base64(&[5u8; 32])));
+        let create = CreateStreamRequest::decode_from(request_body(&request)).expect("decodes");
+        assert!(
+            create.options.into_bytes().is_unique(),
+            "the decoded block shares the request buffer, so erasing it would zero nothing"
+        );
+    }
+
+    #[test]
+    fn given_rotated_node_when_wrapping_a_create_should_open_on_nodes_holding_only_the_old_key() {
+        let rotated = ServerKeyContext::from_config(NEW_CONFIG_KEY, &[CONFIG_KEY.to_owned()], true)
+            .expect("valid keys");
+        let old_only = context(true);
+        let new_only = ServerKeyContext::from_config(NEW_CONFIG_KEY, &[], true).expect("valid key");
+        let key = StreamEncryptionKey::try_from([3u8; 32].as_slice()).expect("32 bytes");
+        for options in [
+            WireOptions::empty(),
+            StreamCreateOptions {
+                encryption_key: Some(key),
+                ..StreamCreateOptions::default()
+            }
+            .to_wire()
+            .expect("encodes"),
+        ] {
+            let set = stored_set(&rewrite(&rotated, options).expect("rewrites")).expect("a set");
+            let opened = rotated.open(&set).expect("opens on the rotated node");
+            assert_eq!(old_only.open(&set).expect("opens on an old node"), opened);
+            assert_eq!(new_only.open(&set).expect("opens after phase 2"), opened);
+        }
+        let single = stored_set(&rewrite(&new_only, WireOptions::empty()).expect("rewrites"))
+            .expect("a set");
+        assert_eq!(single.envelopes().len(), 1);
+    }
+
+    #[test]
+    fn given_client_internal_key_when_admitting_should_reject_before_wrapping() {
         let context = context(true);
         let forged = WrapSet::from(
             context
@@ -195,7 +301,18 @@ mod tests {
         context: &ServerKeyContext,
         options: WireOptions,
     ) -> Result<Message<RoutedRequestHeader>, IggyError> {
-        maybe_rewrite_secret_options_request(context, create_request(options))
+        maybe_rewrite_secret_options_request(context, bounded(create_request(options)))
+    }
+
+    /// `request` past static bounds, admitted the way both chains admit it.
+    fn bounded(request: Message<RoutedRequestHeader>) -> Bounded {
+        let create = CreateStreamRequest::decode_from(request_body(&request)).expect("decodes");
+        let admitted = admit_create(&create.options).expect("admits");
+        Bounded::StreamCreate {
+            request,
+            create,
+            options: admitted.explicit,
+        }
     }
 
     fn stored_set(request: &Message<RoutedRequestHeader>) -> Option<WrapSet> {
@@ -214,7 +331,7 @@ mod tests {
         resource_options_to_wire(&options, OptionsProvenance::All).unwrap()
     }
 
-    fn admit_create(block: &WireOptions) -> Result<(), IggyError> {
+    fn admit_create(block: &WireOptions) -> Result<AdmittedOptions, IggyError> {
         admit(
             OptionsScope::Stream,
             OptionOperation::Create,
@@ -228,7 +345,6 @@ mod tests {
                 },
             },
         )
-        .map(|_| ())
     }
 
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {

@@ -26,7 +26,7 @@ use PHPUnit\Framework\TestCase;
 final class SharedFeatureParserTest extends TestCase
 {
     #[Group('stream-options')]
-    public function testGivenTaggedScenariosWhenLoadingWithExclusionsThenShouldKeepSupportedCases(): void
+    public function testGivenTaggedScenariosWhenLoadingWithExclusionsShouldKeepSupportedCases(): void
     {
         $cases = SharedFeatureParser::load(
             __DIR__ . '/../../scenarios/stream_options.feature',
@@ -35,11 +35,11 @@ final class SharedFeatureParserTest extends TestCase
 
         self::assertCount(4, $cases);
         self::assertArrayNotHasKey(
-            'Given stream options when describing then should report sensitivity and mutability',
+            'Describe stream options',
             $cases,
         );
         self::assertArrayNotHasKey(
-            'Given a custom stream when producing and polling then should return the original payload and headers',
+            'Send and poll a message with headers on a keyed stream',
             $cases,
         );
     }

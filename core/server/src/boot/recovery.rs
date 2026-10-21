@@ -33,8 +33,8 @@ use consensus::{
     VsrState,
 };
 use iggy_common::{
-    IggyByteSize, PartitionStats, ServerKeyContext, StreamEncryption, TopicRuntimeOptions,
-    check_critical_options,
+    IggyByteSize, IggyError, PartitionStats, ServerKeyContext, StreamEncryption,
+    TopicRuntimeOptions, check_critical_options,
 };
 use journal::Journal;
 use journal::prepare_journal::PrepareJournal;
@@ -53,6 +53,7 @@ use shard::{
     ShardIdentity, TaggedSender,
 };
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -143,8 +144,8 @@ pub(in crate::boot) async fn build_shard_for_thread(
         .div_ceil(usize::from(total_shards).max(1))
         .saturating_mul(2);
     // Each encrypted stream holds its own key, wrapped under the server key.
-    // Every one must open here before anything serves, so a changed config key
-    // stops the boot instead of failing sends and polls one by one.
+    // The shards owning its partitions open it below, shard 0 opens the keys of
+    // streams that own no partition.
     let key_context = Arc::new(
         ServerKeyContext::from_config(
             &config.encryption.key,
@@ -153,25 +154,9 @@ pub(in crate::boot) async fn build_shard_for_thread(
         )
         .map_err(|error| ServerError::Iggy(Box::new(error)))?,
     );
-    let unopenable = metadata.mux_stm.streams().read(|inner| {
-        inner.items.iter().find_map(
-            |(_, stream)| match StreamEncryption::from(&stream.options) {
-                StreamEncryption::Plaintext => None,
-                StreamEncryption::Unavailable(error) => Some((stream.id, Vec::new(), error)),
-                StreamEncryption::Wrapped(set) => key_context
-                    .open(&set)
-                    .err()
-                    .map(|error| (stream.id, set.kek_fingerprints(), error)),
-            },
-        )
-    });
-    if let Some((stream_id, stored_kek_fingerprints, source)) = unopenable {
-        return Err(ServerError::StreamKeyUnavailable {
-            stream_id,
-            stored_kek_fingerprints: stored_kek_fingerprints.join(","),
-            node_kek_fingerprints: key_context.kek_fingerprints().join(","),
-            source: Box::new(source),
-        });
+    let solo = topology.replica_count == 1;
+    if shard_id == 0 {
+        refuse_partitionless_stream_keys(metadata.mux_stm.streams(), &key_context, solo)?;
     }
     refuse_unreadable_topics(metadata.mux_stm.streams())?;
     let partitions = IggyPartitions::with_capacity(
@@ -205,7 +190,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
                 stream_id: stream.id,
                 created_op: stream.created_op,
             };
-            let encryption = StreamEncryption::from(&stream.options);
+            let mut encryption = None;
             for (topic_id, topic) in &stream.topics {
                 for partition in &topic.partitions {
                     let namespace = IggyNamespace::new(stream.id, topic_id, partition.id);
@@ -227,7 +212,9 @@ pub(in crate::boot) async fn build_shard_for_thread(
                             metadata: partition.clone(),
                             runtime: TopicRuntimeOptions::from_resource_options(&topic.options),
                             identity,
-                            encryption: encryption.clone(),
+                            encryption: encryption
+                                .get_or_insert_with(|| StreamEncryption::from(&stream.options))
+                                .clone(),
                         });
                     } else {
                         shards_table.insert(
@@ -248,6 +235,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
     // bundle was broadcast (see `MetadataHandoff::Owner`). All shards
     // here only add their per-partition deltas, so the shared
     // `Arc<TopicStats>` atomics race only against other atomic adds.
+    let mut deferred_streams = BTreeSet::new();
     for OwnedPartition {
         stream_id,
         topic_id,
@@ -258,10 +246,24 @@ pub(in crate::boot) async fn build_shard_for_thread(
         encryption,
     } in owned
     {
+        if deferred_streams.contains(&stream_id) {
+            continue;
+        }
         let namespace = IggyNamespace::new(stream_id, topic_id, partition_metadata.id);
-        let encryptor = partitions
-            .resolve_stream_encryptor(identity, &encryption)
-            .map_err(|error| ServerError::Iggy(Box::new(error)))?;
+        let encryptor = match partitions.resolve_stream_encryptor(identity, &encryption) {
+            Ok(encryptor) => encryptor,
+            Err(source) => {
+                defer_or_refuse_stream_key(
+                    stream_id,
+                    &encryption,
+                    &partitions.key_context(),
+                    source,
+                    solo,
+                )?;
+                deferred_streams.insert(stream_id);
+                continue;
+            }
+        };
         let loaded = load_partition_or_fence(
             config,
             namespace,
@@ -456,11 +458,78 @@ const _: () =
     assert!(consensus::DVC_HEADERS_MAX == iggy_binary_protocol::consensus::DVC_HEADERS_MAX);
 const _: () = assert!(consensus::DVC_HEADERS_MAX == u128::BITS as usize);
 
-/// `[cluster] superblock_wedged_fatal_timeout` as a consecutive-failure count,
-/// which is the only shape the shard's `superblock_wedged` can compare. Zero
-/// stays zero (fail-stop disabled).
+/// The boot check of encrypted streams that own no partition, whose keys no
+/// shard opens while building its partitions.
+fn refuse_partitionless_stream_keys(
+    streams: &Streams,
+    key_context: &ServerKeyContext,
+    solo: bool,
+) -> Result<(), ServerError> {
+    let unopenable: Vec<(usize, StreamEncryption, IggyError)> = streams.read(|inner| {
+        inner
+            .items
+            .iter()
+            .filter(|(_, stream)| {
+                stream
+                    .topics
+                    .iter()
+                    .all(|(_, topic)| topic.partitions.is_empty())
+            })
+            .filter_map(|(_, stream)| {
+                let encryption = StreamEncryption::from(&stream.options);
+                let source = match &encryption {
+                    StreamEncryption::Plaintext => None,
+                    StreamEncryption::Unavailable(error) => Some(error.clone()),
+                    StreamEncryption::Wrapped(set) => key_context.open(set).err(),
+                }?;
+                Some((stream.id, encryption, source))
+            })
+            .collect()
+    });
+    for (stream_id, encryption, source) in unopenable {
+        defer_or_refuse_stream_key(stream_id, &encryption, key_context, source, solo)?;
+    }
+    Ok(())
+}
+
+/// A stream key that does not open at boot. A cluster replica's metadata can
+/// trail the commit point until catch-up or state transfer, so the stream waits
+/// for the reconciler, which builds its partitions once a wrap this node opens
+/// commits. Catch-up heals neither a node without a key nor unreadable critical
+/// state, and a solo replay is the whole journal, so these refuse.
+fn defer_or_refuse_stream_key(
+    stream_id: usize,
+    encryption: &StreamEncryption,
+    key_context: &ServerKeyContext,
+    source: IggyError,
+    solo: bool,
+) -> Result<(), ServerError> {
+    let stored_kek_fingerprints = match encryption {
+        StreamEncryption::Wrapped(set) => set.kek_fingerprints().join(","),
+        StreamEncryption::Plaintext | StreamEncryption::Unavailable(_) => String::new(),
+    };
+    let error = ServerError::StreamKeyUnavailable {
+        stream_id,
+        stored_kek_fingerprints,
+        node_kek_fingerprints: key_context.kek_fingerprints().join(","),
+        source: Box::new(source),
+    };
+    if solo
+        || !key_context.accepts_stream_keys()
+        || !matches!(encryption, StreamEncryption::Wrapped(_))
+    {
+        return Err(error);
+    }
+    warn!(
+        stream_id,
+        %error,
+        "Stream {stream_id} is not served on this node until metadata catch-up commits a wrap its keys open"
+    );
+    Ok(())
+}
+
 /// A topic whose critical options this build cannot read is never served, the
-/// way a stream whose key does not open refuses boot.
+/// way unreadable stream state refuses boot.
 fn refuse_unreadable_topics(streams: &Streams) -> Result<(), ServerError> {
     let unreadable = streams.read(|inner| {
         inner.items.iter().find_map(|(_, stream)| {
@@ -481,6 +550,9 @@ fn refuse_unreadable_topics(streams: &Streams) -> Result<(), ServerError> {
     }
 }
 
+/// `[cluster] superblock_wedged_fatal_timeout` as a consecutive-failure count,
+/// which is the only shape the shard's `superblock_wedged` can compare. Zero
+/// stays zero (fail-stop disabled).
 fn superblock_wedged_fatal_failures(config: &ServerConfig) -> u64 {
     superblock_window_to_failures(
         config
@@ -769,8 +841,12 @@ mod tests {
     use iggy_common::wire_conversions::resource_options_to_wire;
     use iggy_common::{
         HeaderKey, HeaderValue, OptionKey, OptionValue, OptionsProvenance, ResourceOptions,
+        StreamEncryptionKey, StreamKeyOrigin, WrapSet,
     };
     use metadata::stm::StateMachine as _;
+
+    const CONFIG_KEY: &str = "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=";
+    const OTHER_CONFIG_KEY: &str = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=";
 
     #[test]
     fn given_topic_with_unknown_critical_option_when_booting_should_refuse_it() {
@@ -832,6 +908,68 @@ mod tests {
                 ),
                 refused,
                 "{result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_stream_key_that_does_not_open_when_booting_should_refuse_only_a_complete_replay() {
+        let stream_context = ServerKeyContext::from_config(CONFIG_KEY, &[], true).expect("key");
+        let key = StreamEncryptionKey::try_from([1; 32].as_slice()).expect("32 bytes");
+        let set = WrapSet::from(
+            stream_context
+                .wrap(&key, StreamKeyOrigin::Server)
+                .expect("wraps"),
+        );
+        let wrapped = ResourceOptions::from([(
+            HeaderKey::from(OptionKey::EncryptionKeyWrapped),
+            OptionValue::explicit(HeaderValue::try_from(set.as_ref()).expect("set fits")),
+        )]);
+        let unreadable = ResourceOptions::from([(
+            HeaderKey::from(OptionKey::CriticalKeys),
+            OptionValue::explicit(HeaderValue::try_from("a_future_key").expect("marker fits")),
+        )]);
+        let plaintext = ResourceOptions::new();
+        let same_key = ServerKeyContext::from_config(CONFIG_KEY, &[], true).expect("key");
+        let other_key = ServerKeyContext::from_config(OTHER_CONFIG_KEY, &[], true).expect("key");
+        let no_key = ServerKeyContext::disabled();
+        for (options, node_context, solo, refused) in [
+            (&wrapped, &same_key, true, false),
+            (&wrapped, &same_key, false, false),
+            (&wrapped, &other_key, true, true),
+            (&wrapped, &other_key, false, false),
+            (&wrapped, &no_key, true, true),
+            (&wrapped, &no_key, false, true),
+            (&plaintext, &no_key, true, false),
+            (&plaintext, &no_key, false, false),
+            (&unreadable, &same_key, true, true),
+            (&unreadable, &same_key, false, true),
+        ] {
+            let mux = TestMux::default();
+            mux.users().ensure_root_user("iggy", "hash");
+            mux.update(prepare_message(
+                Operation::CreateStream,
+                1,
+                1,
+                &CreateStreamRequest {
+                    name: WireName::new("stream").expect("name fits"),
+                    options: resource_options_to_wire(options, OptionsProvenance::All)
+                        .expect("options encode"),
+                }
+                .to_bytes(),
+            ))
+            .expect("stream create applies");
+
+            let result = refuse_partitionless_stream_keys(mux.streams(), node_context, solo);
+
+            assert_eq!(
+                matches!(
+                    result,
+                    Err(ServerError::StreamKeyUnavailable { stream_id: 0, .. })
+                ),
+                refused,
+                "node keys {:?}, solo {solo}: {result:?}",
+                node_context.kek_fingerprints()
             );
         }
     }

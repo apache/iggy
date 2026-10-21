@@ -52,10 +52,12 @@ const STREAM_KEY_AAD_LABEL: &[u8] = b"iggy/stream-key/v1";
 const STREAM_KEY_FINGERPRINT_LABEL: &[u8] = b"iggy/stream-key-fingerprint/v1";
 const KEK_FINGERPRINT_LABEL: &[u8] = b"iggy/stream-kek-fingerprint/v1";
 
-/// A stream's own data encryption key: 32 random bytes.
+/// A stream's own data encryption key: 32 uniformly random bytes.
 ///
 /// Never printed and never serialized. The bytes leave this type only to be
-/// wrapped, encoded into a create request, or turned into an encryptor.
+/// wrapped, encoded into a create request, or turned into an encryptor. A key
+/// derived from a password turns its public fingerprint into an offline
+/// guessing oracle, so callers must draw it from a secure random generator.
 pub struct StreamEncryptionKey(SecretBox<[u8; STREAM_KEY_LENGTH]>);
 
 /// Who chose a stream's key, recorded and authenticated in its envelope.
@@ -86,11 +88,13 @@ pub struct WrapSet {
 }
 
 /// The key-encryption keys derived from the server config: the current one,
-/// which wraps, and the previous ones a rotation still unwraps with.
+/// the previous ones a rotation still unwraps with, and the fingerprints of
+/// retired ones whose wraps a rewrap drops.
 #[derive(Clone)]
 pub struct ServerKeyContext {
     current: Option<KeyEncryptionKey>,
     previous: Vec<KeyEncryptionKey>,
+    retired: Vec<KekFingerprint>,
     generates: bool,
 }
 
@@ -99,6 +103,9 @@ struct KeyEncryptionKey {
     cipher: Aes256Gcm,
     fingerprint: [u8; FINGERPRINT_LENGTH],
 }
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct KekFingerprint([u8; FINGERPRINT_LENGTH]);
 
 struct DerivedKeyLength;
 
@@ -116,7 +123,8 @@ impl StreamEncryptionKey {
         Ok(Self(key))
     }
 
-    /// 16 lowercase hex characters identifying this key without revealing it.
+    /// 16 lowercase hex characters identifying this key without revealing it,
+    /// as long as the key is uniformly random.
     #[must_use]
     pub fn fingerprint(&self) -> String {
         hex(&self.fingerprint_bytes())
@@ -256,6 +264,7 @@ impl ServerKeyContext {
         Self {
             current: None,
             previous: Vec::new(),
+            retired: Vec::new(),
             generates: false,
         }
     }
@@ -302,8 +311,43 @@ impl ServerKeyContext {
         Ok(Self {
             current: Some(current),
             previous,
+            retired: Vec::new(),
             generates: enabled,
         })
+    }
+
+    /// This context with the key-encryption key fingerprints whose wraps a
+    /// rewrap drops, as reads print them.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidEncryptionKey` without a config key, for an entry that is not
+    /// 16 lowercase hex characters, one naming a configured key, or one given
+    /// twice.
+    pub fn with_retired_kek_fingerprints(
+        mut self,
+        fingerprints: &[String],
+    ) -> Result<Self, IggyError> {
+        if fingerprints.is_empty() {
+            return Ok(self);
+        }
+        if self.current.is_none() {
+            return Err(IggyError::InvalidEncryptionKey);
+        }
+        let mut retired = fingerprints
+            .iter()
+            .map(|fingerprint| fingerprint.parse::<KekFingerprint>())
+            .collect::<Result<Vec<_>, _>>()?;
+        retired.sort_unstable();
+        let repeated = retired.windows(2).any(|pair| pair[0] == pair[1]);
+        let configured = retired
+            .iter()
+            .any(|retired| self.keks().any(|kek| kek.fingerprint == retired.0));
+        if repeated || configured {
+            return Err(IggyError::InvalidEncryptionKey);
+        }
+        self.retired = retired;
+        Ok(self)
     }
 
     /// Whether a stream may bring its own key on this node.
@@ -324,14 +368,18 @@ impl ServerKeyContext {
         self.current.as_ref().map(|kek| hex(&kek.fingerprint))
     }
 
+    /// Whether this node's keys can call for a rewrap: a previous key, whose
+    /// streams need a wrap under the current key, or a retired key to drop.
+    /// Without either no stored set can differ from its target.
+    #[must_use]
+    pub const fn rotating(&self) -> bool {
+        self.current.is_some() && !(self.previous.is_empty() && self.retired.is_empty())
+    }
+
     /// Fingerprints of every configured key-encryption key, current first.
     #[must_use]
     pub fn kek_fingerprints(&self) -> Vec<String> {
-        self.current
-            .iter()
-            .chain(&self.previous)
-            .map(|kek| hex(&kek.fingerprint))
-            .collect()
+        self.keks().map(|kek| hex(&kek.fingerprint)).collect()
     }
 
     /// Wrap a stream key under the current key-encryption key.
@@ -345,34 +393,32 @@ impl ServerKeyContext {
         key: &StreamEncryptionKey,
         origin: StreamKeyOrigin,
     ) -> Result<WrappedStreamKey, IggyError> {
-        let kek = self
-            .current
+        self.current
             .as_ref()
-            .ok_or(IggyError::StreamEncryptionUnavailable)?;
-        let key_fingerprint = key.fingerprint_bytes();
-        let aad = associated_data(origin as u8, &kek.fingerprint, &key_fingerprint);
-        let nonce = Nonce::generate();
-        let sealed = kek
-            .cipher
-            .encrypt(
-                &nonce,
-                Payload {
-                    msg: key.as_bytes(),
-                    aad: &aad,
-                },
-            )
-            .map_err(|_| IggyError::CannotEncryptData)?;
-        if sealed.len() != WRAPPED_KEY_CIPHERTEXT_LENGTH {
-            return Err(IggyError::CannotEncryptData);
+            .ok_or(IggyError::StreamEncryptionUnavailable)?
+            .wrap(key, origin)
+    }
+
+    /// The wrap set a new stream stores: its key wrapped under every
+    /// configured key-encryption key, so it also opens on nodes that still
+    /// hold only a previous key while a rotation rolls out.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::wrap`].
+    pub fn wrap_set(
+        &self,
+        key: &StreamEncryptionKey,
+        origin: StreamKeyOrigin,
+    ) -> Result<WrapSet, IggyError> {
+        if self.current.is_none() {
+            return Err(IggyError::StreamEncryptionUnavailable);
         }
-        let mut envelope = [0u8; WRAPPED_STREAM_KEY_LENGTH];
-        envelope[0] = WRAPPED_STREAM_KEY_VERSION;
-        envelope[ORIGIN_OFFSET] = origin as u8;
-        envelope[KEK_FINGERPRINT_OFFSET..NONCE_OFFSET].copy_from_slice(&kek.fingerprint);
-        envelope[NONCE_OFFSET..CIPHERTEXT_OFFSET].copy_from_slice(&nonce);
-        envelope[CIPHERTEXT_OFFSET..KEY_FINGERPRINT_OFFSET].copy_from_slice(&sealed);
-        envelope[KEY_FINGERPRINT_OFFSET..].copy_from_slice(&key_fingerprint);
-        Ok(WrappedStreamKey(envelope))
+        let envelopes = self
+            .keks()
+            .map(|kek| kek.wrap(key, origin))
+            .collect::<Result<Vec<_>, _>>()?;
+        WrapSet::new(envelopes)
     }
 
     /// Authenticate and unwrap one envelope with the configured key-encryption
@@ -388,9 +434,7 @@ impl ServerKeyContext {
             return Err(IggyError::StreamEncryptionUnavailable);
         }
         let kek = self
-            .current
-            .iter()
-            .chain(&self.previous)
+            .keks()
             .find(|kek| kek.fingerprint == wrapped.kek_fingerprint_bytes())
             .ok_or(IggyError::CannotDecryptData)?;
         let nonce = Nonce::try_from(&wrapped.0[NONCE_OFFSET..CIPHERTEXT_OFFSET])
@@ -430,44 +474,70 @@ impl ServerKeyContext {
         Err(last)
     }
 
-    /// The set a rotation should store instead of `stored`: the envelopes
-    /// under configured keys, plus one under the current key when missing.
-    /// `None` when nothing changes, or when no envelope opens, because a set
-    /// this node cannot open is never touched.
+    /// Whether a stored wrap set already is what a rewrap on this node would
+    /// store: one envelope under the current key-encryption key and none
+    /// under a retired one. Reads only the fingerprints in the raw stored
+    /// value, so a sweep over every stream allocates nothing. Without a
+    /// config key nothing can change, so every set is settled.
+    #[must_use]
+    pub fn is_settled(&self, stored: &[u8]) -> bool {
+        let Some(current) = &self.current else {
+            return true;
+        };
+        let (envelopes, rest) = stored.as_chunks::<WRAPPED_STREAM_KEY_LENGTH>();
+        rest.is_empty()
+            && envelopes.iter().any(|envelope| {
+                envelope[KEK_FINGERPRINT_OFFSET..NONCE_OFFSET] == current.fingerprint
+            })
+            && !envelopes
+                .iter()
+                .any(|envelope| self.retires(&envelope[KEK_FINGERPRINT_OFFSET..NONCE_OFFSET]))
+    }
+
+    /// The set a rewrap should store instead of `stored`: every envelope not
+    /// under a retired key-encryption key, plus one under the current key
+    /// when missing. Envelopes under keys this node does not hold stay,
+    /// because a node still being rolled out may need them. `None` when
+    /// nothing changes.
     ///
     /// # Errors
     ///
-    /// `CannotEncryptData` when wrapping fails.
+    /// When the set must change but this node cannot do it, and the set is
+    /// left alone: `CannotDecryptData` when no envelope opens here,
+    /// `UnsupportedCriticalOption` when the set already holds the most
+    /// envelopes and none is retired, `CannotEncryptData` when wrapping
+    /// fails.
     pub fn target_set(&self, stored: &WrapSet) -> Result<Option<WrapSet>, IggyError> {
         let Some(current) = &self.current else {
             return Ok(None);
         };
-        let configured = |envelope: &&WrappedStreamKey| {
-            self.current
-                .iter()
-                .chain(&self.previous)
-                .any(|kek| kek.fingerprint == envelope.kek_fingerprint_bytes())
-        };
-        let kept: Vec<WrappedStreamKey> = stored
+        if self.is_settled(stored.as_ref()) {
+            return Ok(None);
+        }
+        let key = self.open(stored)?;
+        let mut envelopes: Vec<WrappedStreamKey> = stored
             .envelopes()
             .iter()
-            .filter(configured)
+            .filter(|envelope| !self.retires(envelope.kek_fingerprint_bytes()))
             .cloned()
             .collect();
-        let has_current = kept
+        if !envelopes
             .iter()
-            .any(|envelope| envelope.kek_fingerprint_bytes() == current.fingerprint);
-        if has_current && kept.len() == stored.envelopes().len() {
-            return Ok(None);
-        }
-        let Ok(key) = self.open(stored) else {
-            return Ok(None);
-        };
-        let mut envelopes = kept;
-        if !has_current {
-            envelopes.push(self.wrap(&key, stored.origin())?);
+            .any(|envelope| envelope.kek_fingerprint_bytes() == current.fingerprint)
+        {
+            envelopes.push(current.wrap(&key, stored.origin())?);
         }
         WrapSet::new(envelopes).map(Some)
+    }
+
+    fn keks(&self) -> impl Iterator<Item = &KeyEncryptionKey> {
+        self.current.iter().chain(&self.previous)
+    }
+
+    fn retires(&self, kek_fingerprint: &[u8]) -> bool {
+        self.retired
+            .iter()
+            .any(|retired| retired.0 == kek_fingerprint)
     }
 }
 
@@ -493,6 +563,57 @@ impl KeyEncryptionKey {
             fingerprint: labelled_fingerprint(KEK_FINGERPRINT_LABEL, wrapping_key.expose_secret()),
         })
     }
+
+    fn wrap(
+        &self,
+        key: &StreamEncryptionKey,
+        origin: StreamKeyOrigin,
+    ) -> Result<WrappedStreamKey, IggyError> {
+        let key_fingerprint = key.fingerprint_bytes();
+        let aad = associated_data(origin as u8, &self.fingerprint, &key_fingerprint);
+        let nonce = Nonce::generate();
+        let sealed = self
+            .cipher
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: key.as_bytes(),
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| IggyError::CannotEncryptData)?;
+        if sealed.len() != WRAPPED_KEY_CIPHERTEXT_LENGTH {
+            return Err(IggyError::CannotEncryptData);
+        }
+        let mut envelope = [0u8; WRAPPED_STREAM_KEY_LENGTH];
+        envelope[0] = WRAPPED_STREAM_KEY_VERSION;
+        envelope[ORIGIN_OFFSET] = origin as u8;
+        envelope[KEK_FINGERPRINT_OFFSET..NONCE_OFFSET].copy_from_slice(&self.fingerprint);
+        envelope[NONCE_OFFSET..CIPHERTEXT_OFFSET].copy_from_slice(&nonce);
+        envelope[CIPHERTEXT_OFFSET..KEY_FINGERPRINT_OFFSET].copy_from_slice(&sealed);
+        envelope[KEY_FINGERPRINT_OFFSET..].copy_from_slice(&key_fingerprint);
+        Ok(WrappedStreamKey(envelope))
+    }
+}
+
+impl FromStr for KekFingerprint {
+    type Err = IggyError;
+
+    /// Exactly 16 lowercase hex characters, the form reads print.
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let lowercase_hex = text
+            .bytes()
+            .all(|digit| matches!(digit, b'0'..=b'9' | b'a'..=b'f'));
+        if text.len() != 2 * FINGERPRINT_LENGTH || !lowercase_hex {
+            return Err(IggyError::InvalidEncryptionKey);
+        }
+        let mut fingerprint = [0u8; FINGERPRINT_LENGTH];
+        for (index, byte) in fingerprint.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&text[2 * index..2 * index + 2], 16)
+                .map_err(|_| IggyError::InvalidEncryptionKey)?;
+        }
+        Ok(Self(fingerprint))
+    }
 }
 
 impl TryFrom<&[u8]> for StreamEncryptionKey {
@@ -512,7 +633,7 @@ impl TryFrom<&[u8]> for StreamEncryptionKey {
 impl FromStr for StreamEncryptionKey {
     type Err = IggyError;
 
-    /// Canonical standard padded base64 of exactly 32 bytes. Decoding and
+    /// Canonical standard padded base64 of exactly 32 random bytes. Decoding and
     /// re-encoding must reproduce the input, which refuses whitespace, the
     /// URL-safe alphabet, missing padding and noncanonical trailing bits.
     fn from_str(text: &str) -> Result<Self, Self::Err> {
@@ -655,6 +776,14 @@ impl Debug for ServerKeyContext {
         formatter
             .debug_struct("ServerKeyContext")
             .field("kek_fingerprints", &self.kek_fingerprints())
+            .field(
+                "retired_kek_fingerprints",
+                &self
+                    .retired
+                    .iter()
+                    .map(|retired| hex(&retired.0))
+                    .collect::<Vec<_>>(),
+            )
             .field("generates_stream_keys", &self.generates_stream_keys())
             .finish()
     }
@@ -667,6 +796,7 @@ impl hkdf::KeyType for DerivedKeyLength {
 }
 
 /// Fingerprint of a stream key given as 32 raw bytes, without the server.
+/// It hides only a uniformly random key, never one derived from a password.
 ///
 /// # Errors
 ///
@@ -712,7 +842,13 @@ fn unsupported_wrapped_key() -> IggyError {
 }
 
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut text = String::with_capacity(2 * bytes.len());
+    for byte in bytes {
+        text.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        text.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    text
 }
 
 #[cfg(test)]
@@ -722,9 +858,10 @@ mod tests {
     const CONFIG_KEY: &str = "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=";
     const OTHER_CONFIG_KEY: &str = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=";
     const THIRD_CONFIG_KEY: &str = "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=";
+    const FOURTH_CONFIG_KEY: &str = "QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8=";
 
     #[test]
-    fn given_config_key_when_deriving_then_should_produce_only_the_pinned_kek() {
+    fn given_config_key_when_deriving_should_produce_only_the_pinned_kek() {
         let config = text::from_base64_as_bytes(CONFIG_KEY).expect("valid base64");
         let prk = hkdf::Salt::new(hkdf::HKDF_SHA256, &[]).extract(&config);
         let wrapping_key = derive_key(&prk, STREAM_KEY_WRAP_INFO).expect("derive kek");
@@ -757,7 +894,7 @@ mod tests {
     }
 
     #[test]
-    fn given_wrapped_key_when_tampering_then_should_reject_every_envelope_component() {
+    fn given_wrapped_key_when_tampering_should_reject_every_envelope_component() {
         let context = context(CONFIG_KEY, &[], false);
         let key = fixed_key();
         let wrapped = context.wrap(&key, StreamKeyOrigin::Client).expect("wrap");
@@ -790,7 +927,7 @@ mod tests {
     }
 
     #[test]
-    fn given_same_key_when_wrapping_twice_then_should_use_a_fresh_nonce_each_time() {
+    fn given_same_key_when_wrapping_twice_should_use_a_fresh_nonce_each_time() {
         let context = context(CONFIG_KEY, &[], true);
         let key = fixed_key();
         let first = context.wrap(&key, StreamKeyOrigin::Client).expect("wrap");
@@ -808,7 +945,7 @@ mod tests {
     }
 
     #[test]
-    fn given_wrong_config_key_when_unwrapping_then_should_return_error() {
+    fn given_wrong_config_key_when_unwrapping_should_return_error() {
         let context = context(CONFIG_KEY, &[], true);
         let other = self::context(OTHER_CONFIG_KEY, &[], true);
         let wrapped = context
@@ -830,7 +967,7 @@ mod tests {
     }
 
     #[test]
-    fn given_generated_keys_when_wrapping_then_should_differ_and_record_server_origin() {
+    fn given_generated_keys_when_wrapping_should_differ_and_record_server_origin() {
         let context = context(CONFIG_KEY, &[], true);
         let first = StreamEncryptionKey::generate().expect("random key");
         let second = StreamEncryptionKey::generate().expect("random key");
@@ -847,7 +984,7 @@ mod tests {
     }
 
     #[test]
-    fn given_wrap_set_bytes_when_parsing_then_should_enforce_canonical_form() {
+    fn given_wrap_set_bytes_when_parsing_should_enforce_canonical_form() {
         let key = fixed_key();
         let wraps: Vec<WrappedStreamKey> = [CONFIG_KEY, OTHER_CONFIG_KEY, THIRD_CONFIG_KEY]
             .iter()
@@ -902,7 +1039,7 @@ mod tests {
     }
 
     #[test]
-    fn given_previous_keys_when_opening_wrap_set_then_should_use_any_configured_kek() {
+    fn given_previous_keys_when_opening_wrap_set_should_use_any_configured_kek() {
         let key = fixed_key();
         let old = context(CONFIG_KEY, &[], true);
         let set = WrapSet::from(old.wrap(&key, StreamKeyOrigin::Server).expect("wrap"));
@@ -933,39 +1070,245 @@ mod tests {
     }
 
     #[test]
-    fn given_wrap_sets_and_configured_keys_when_planning_then_should_add_current_and_drop_unconfigured()
-     {
+    fn given_rotation_phases_when_planning_should_add_current_and_drop_only_retired_wraps() {
         let key = fixed_key();
-        let old = context(CONFIG_KEY, &[], true);
-        let old_only = WrapSet::from(old.wrap(&key, StreamKeyOrigin::Client).expect("wrap"));
+        let old_only = WrapSet::from(
+            context(CONFIG_KEY, &[], true)
+                .wrap(&key, StreamKeyOrigin::Client)
+                .expect("wrap"),
+        );
         let phase_one = context(OTHER_CONFIG_KEY, &[CONFIG_KEY.to_owned()], true);
-
         let both = phase_one
             .target_set(&old_only)
             .expect("plans")
             .expect("adds the current wrap");
-        assert_eq!(both.envelopes().len(), 2);
+        assert_eq!(
+            both.kek_fingerprints(),
+            sorted(&[KEK_FINGERPRINT_VECTOR, OTHER_KEK_FINGERPRINT_VECTOR])
+        );
         assert_eq!(both.origin(), StreamKeyOrigin::Client);
         assert_eq!(phase_one.open(&both).expect("opens"), key);
         assert_eq!(phase_one.target_set(&both).expect("plans"), None);
 
-        let phase_two = context(OTHER_CONFIG_KEY, &[], true);
+        let new_alone = context(OTHER_CONFIG_KEY, &[], true);
+        assert_eq!(new_alone.target_set(&both).expect("plans"), None);
+
+        let phase_two = new_alone
+            .clone()
+            .with_retired_kek_fingerprints(&[KEK_FINGERPRINT_VECTOR.to_owned()])
+            .expect("valid retirement");
         let new_only = phase_two
             .target_set(&both)
             .expect("plans")
-            .expect("drops the old wrap");
+            .expect("drops the retired wrap");
         assert_eq!(
             new_only.kek_fingerprints(),
             vec![OTHER_KEK_FINGERPRINT_VECTOR]
         );
+        assert_eq!(phase_two.open(&new_only).expect("opens"), key);
         assert_eq!(phase_two.target_set(&new_only).expect("plans"), None);
+        assert_eq!(
+            phase_one.target_set(&new_only).expect("plans"),
+            None,
+            "a phase 1 primary must not re-add a wrap phase 2 dropped"
+        );
 
-        let stranger = context(THIRD_CONFIG_KEY, &[], true);
-        assert_eq!(stranger.target_set(&old_only).expect("plans"), None);
+        for (node, stuck) in [
+            (context(THIRD_CONFIG_KEY, &[], true), &old_only),
+            (phase_two, &old_only),
+        ] {
+            assert_eq!(
+                node.target_set(stuck)
+                    .expect_err("no wrap opens here")
+                    .as_code(),
+                IggyError::CannotDecryptData.as_code()
+            );
+        }
     }
 
     #[test]
-    fn given_fixed_key_when_fingerprinting_then_should_match_shared_vector() {
+    fn given_full_wrap_set_when_planning_should_refuse_until_a_wrap_is_retired() {
+        let key = fixed_key();
+        let full = WrapSet::new(
+            [CONFIG_KEY, OTHER_CONFIG_KEY, THIRD_CONFIG_KEY]
+                .iter()
+                .map(|config_key| {
+                    context(config_key, &[], true)
+                        .wrap(&key, StreamKeyOrigin::Server)
+                        .expect("wrap")
+                })
+                .collect(),
+        )
+        .expect("three wraps");
+        let fourth = context(FOURTH_CONFIG_KEY, &[CONFIG_KEY.to_owned()], true);
+        assert_eq!(
+            fourth
+                .target_set(&full)
+                .expect_err("a fourth wrap does not fit")
+                .as_code(),
+            IggyError::UnsupportedCriticalOption(String::new()).as_code()
+        );
+
+        let retired = fourth
+            .with_retired_kek_fingerprints(&[OTHER_KEK_FINGERPRINT_VECTOR.to_owned()])
+            .expect("valid retirement");
+        let replaced = retired
+            .target_set(&full)
+            .expect("plans")
+            .expect("swaps the retired wrap for the current one");
+        assert_eq!(replaced.envelopes().len(), 3);
+        assert!(
+            !replaced
+                .kek_fingerprints()
+                .contains(&OTHER_KEK_FINGERPRINT_VECTOR.to_owned())
+        );
+        assert_eq!(retired.open(&replaced).expect("opens"), key);
+    }
+
+    #[test]
+    fn given_retired_fingerprints_when_configuring_should_accept_only_unconfigured_lowercase_hex() {
+        let rotated = context(OTHER_CONFIG_KEY, &[THIRD_CONFIG_KEY.to_owned()], true);
+        let accepted = rotated
+            .clone()
+            .with_retired_kek_fingerprints(&[KEK_FINGERPRINT_VECTOR.to_owned()])
+            .expect("an unconfigured fingerprint");
+        assert!(accepted.rotating());
+        let third_fingerprint = context(THIRD_CONFIG_KEY, &[], true)
+            .kek_fingerprint()
+            .expect("a key");
+        for invalid in [
+            vec![KEK_FINGERPRINT_VECTOR.to_uppercase()],
+            vec![KEK_FINGERPRINT_VECTOR[..15].to_owned()],
+            vec![format!("{KEK_FINGERPRINT_VECTOR}0")],
+            vec!["39e4f0f95c3693cg".to_owned()],
+            vec![OTHER_KEK_FINGERPRINT_VECTOR.to_owned()],
+            vec![third_fingerprint],
+            vec![KEK_FINGERPRINT_VECTOR.to_owned(); 2],
+        ] {
+            assert!(
+                rotated
+                    .clone()
+                    .with_retired_kek_fingerprints(&invalid)
+                    .is_err(),
+                "{invalid:?} must be refused"
+            );
+        }
+        assert!(
+            ServerKeyContext::disabled()
+                .with_retired_kek_fingerprints(&[KEK_FINGERPRINT_VECTOR.to_owned()])
+                .is_err()
+        );
+        assert!(
+            !ServerKeyContext::disabled()
+                .with_retired_kek_fingerprints(&[])
+                .expect("nothing to retire")
+                .rotating()
+        );
+
+        assert!(!context(CONFIG_KEY, &[], true).rotating());
+        assert!(!context(CONFIG_KEY, &[], false).rotating());
+        assert!(rotated.rotating());
+        assert!(
+            context(OTHER_CONFIG_KEY, &[], true)
+                .with_retired_kek_fingerprints(&[KEK_FINGERPRINT_VECTOR.to_owned()])
+                .expect("valid retirement")
+                .rotating()
+        );
+    }
+
+    #[test]
+    fn given_raw_stored_sets_when_checking_settled_should_match_the_planner() {
+        let key = fixed_key();
+        let old_only = WrapSet::from(
+            context(CONFIG_KEY, &[], true)
+                .wrap(&key, StreamKeyOrigin::Server)
+                .expect("wrap"),
+        );
+        let phase_one = context(OTHER_CONFIG_KEY, &[CONFIG_KEY.to_owned()], true);
+        let both = phase_one
+            .wrap_set(&key, StreamKeyOrigin::Server)
+            .expect("wraps");
+        let phase_two = context(OTHER_CONFIG_KEY, &[], true)
+            .with_retired_kek_fingerprints(&[KEK_FINGERPRINT_VECTOR.to_owned()])
+            .expect("valid retirement");
+
+        for (node, set, settled) in [
+            (&phase_one, &old_only, false),
+            (&phase_one, &both, true),
+            (&phase_two, &both, false),
+            (&phase_two, &old_only, false),
+        ] {
+            assert_eq!(node.is_settled(set.as_ref()), settled, "{set:?}");
+            assert_eq!(
+                node.target_set(set).is_ok_and(|target| target.is_none()),
+                settled,
+                "{set:?}"
+            );
+        }
+        assert!(!phase_one.is_settled(&both.as_ref()[..WRAPPED_STREAM_KEY_LENGTH + 1]));
+        assert!(!phase_one.is_settled(&[]));
+        assert!(ServerKeyContext::disabled().is_settled(old_only.as_ref()));
+    }
+
+    #[test]
+    fn given_previous_keys_when_wrapping_new_key_should_wrap_under_every_configured_kek() {
+        let key = fixed_key();
+        let phase_one = context(
+            OTHER_CONFIG_KEY,
+            &[CONFIG_KEY.to_owned(), THIRD_CONFIG_KEY.to_owned()],
+            true,
+        );
+        let set = phase_one
+            .wrap_set(&key, StreamKeyOrigin::Client)
+            .expect("wraps");
+        assert_eq!(set.envelopes().len(), 3);
+        assert_eq!(set.origin(), StreamKeyOrigin::Client);
+        for config_key in [CONFIG_KEY, OTHER_CONFIG_KEY, THIRD_CONFIG_KEY] {
+            assert_eq!(
+                context(config_key, &[], true)
+                    .open(&set)
+                    .expect("opens under each key alone"),
+                key
+            );
+        }
+        let single = context(CONFIG_KEY, &[], true)
+            .wrap_set(&key, StreamKeyOrigin::Client)
+            .expect("wraps");
+        assert_eq!(single.kek_fingerprints(), vec![KEK_FINGERPRINT_VECTOR]);
+        assert_eq!(
+            ServerKeyContext::disabled()
+                .wrap_set(&key, StreamKeyOrigin::Client)
+                .expect_err("no kek")
+                .as_code(),
+            IggyError::StreamEncryptionUnavailable.as_code()
+        );
+    }
+
+    #[test]
+    fn given_wraps_under_unknown_keks_when_planning_should_keep_them() {
+        let key = fixed_key();
+        let phase_one = context(OTHER_CONFIG_KEY, &[CONFIG_KEY.to_owned()], true);
+        let both = WrapSet::new(vec![
+            phase_one.wrap(&key, StreamKeyOrigin::Client).expect("wrap"),
+            context(CONFIG_KEY, &[], true)
+                .wrap(&key, StreamKeyOrigin::Client)
+                .expect("wrap"),
+        ])
+        .expect("two wraps");
+
+        for (config, previous) in [(CONFIG_KEY, &[][..]), (OTHER_CONFIG_KEY, &[][..])] {
+            assert_eq!(
+                context(config, previous, true)
+                    .target_set(&both)
+                    .expect("plans"),
+                None,
+                "a node holding one of the keys must keep the other wrap"
+            );
+        }
+    }
+
+    #[test]
+    fn given_fixed_key_when_fingerprinting_should_match_shared_vector() {
         let key = fixed_key();
         assert_eq!(key.fingerprint(), FINGERPRINT_VECTOR);
         assert_eq!(
@@ -977,7 +1320,7 @@ mod tests {
     }
 
     #[test]
-    fn given_secret_values_when_debugging_then_should_redact_raw_and_base64_forms() {
+    fn given_secret_values_when_debugging_should_redact_raw_and_base64_forms() {
         let key = fixed_key();
         let base64 = STANDARD.encode(key.as_bytes());
         let context = context(CONFIG_KEY, &[OTHER_CONFIG_KEY.to_owned()], true);
@@ -1000,7 +1343,7 @@ mod tests {
     }
 
     #[test]
-    fn given_noncanonical_base64_when_parsing_key_then_should_reject() {
+    fn given_noncanonical_base64_when_parsing_key_should_reject() {
         let canonical = STANDARD.encode(fixed_key().as_bytes());
         assert_eq!(
             canonical.parse::<StreamEncryptionKey>().expect("canonical"),
@@ -1027,6 +1370,15 @@ mod tests {
 
     fn context(key: &str, previous_keys: &[String], enabled: bool) -> ServerKeyContext {
         ServerKeyContext::from_config(key, previous_keys, enabled).expect("valid config")
+    }
+
+    fn sorted(fingerprints: &[&str]) -> Vec<String> {
+        let mut sorted: Vec<String> = fingerprints
+            .iter()
+            .map(|fingerprint| (*fingerprint).to_owned())
+            .collect();
+        sorted.sort();
+        sorted
     }
 
     fn fixed_key() -> StreamEncryptionKey {

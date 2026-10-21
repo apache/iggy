@@ -187,7 +187,6 @@ use shard::ReconcileOp;
 use shard::shards_table::{ShardsTable, calculate_shard_assignment};
 use shard::{Receiver, Sender};
 use std::cell::{Cell, OnceCell, RefCell};
-use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -589,18 +588,18 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
 /// Forget the keys of deleted stream incarnations, so a reused stream id can
 /// never meet a previous stream's key.
 fn reconcile_stream_keys(ctx: &ReconcilerCtx) {
-    let live: BTreeSet<StreamKeyIdentity> =
-        ctx.shard.plane.metadata().mux_stm.streams().read(|inner| {
+    let partitions = ctx.shard.plane.partitions();
+    if !partitions.has_stream_keys() {
+        return;
+    }
+    let () = ctx.shard.plane.metadata().mux_stm.streams().read(|inner| {
+        partitions.retain_stream_keys(|identity| {
             inner
                 .items
-                .iter()
-                .map(|(_, stream)| StreamKeyIdentity {
-                    stream_id: stream.id,
-                    created_op: stream.created_op,
-                })
-                .collect()
+                .get(identity.stream_id)
+                .is_some_and(|stream| stream.created_op == identity.created_op)
         });
-    ctx.shard.plane.partitions().retain_stream_keys(&live);
+    });
 }
 
 /// Runs on every wake, apart from the full pass. A fence applies, or its
@@ -1932,6 +1931,7 @@ mod tests {
         reconcile_consumer_group_offsets, reconcile_once, reconcile_partition_lifecycles,
         reconcile_pending_revocations, reconcile_retired_lifecycles,
     };
+    use bytes::Bytes;
     use configs::server::ServerConfig;
     use consensus::{MetadataHandle, PartitionsHandle, Sequencer, StateTransferStage};
     use iggy_binary_protocol::codec::{WireDecode, WireEncode};
@@ -1943,7 +1943,9 @@ mod tests {
         CreatePartitionsRequest, CreatePartitionsWithAssignmentsRequest,
         RetireConsumerGroupOwnersRequest,
     };
-    use iggy_binary_protocol::requests::streams::{CreateStreamRequest, DeleteStreamRequest};
+    use iggy_binary_protocol::requests::streams::{
+        CreateStreamRequest, DeleteStreamRequest, RewrapStreamKeyEntry, RewrapStreamKeysRequest,
+    };
     use iggy_binary_protocol::requests::topics::{
         CreateTopicRequest, CreateTopicWithAssignmentsRequest, DeleteTopicRequest,
     };
@@ -1954,6 +1956,7 @@ mod tests {
     use iggy_common::wire_conversions::resource_options_to_wire;
     use iggy_common::{
         HeaderKey, HeaderValue, OptionKey, OptionValue, OptionsProvenance, ResourceOptions,
+        ServerKeyContext, StreamEncryptionKey, StreamKeyOrigin, WrapSet, critical_keys_marker,
     };
     use message_bus::IggyMessageBus;
     use metadata::IggyMetadata;
@@ -1973,6 +1976,7 @@ mod tests {
     use shard::{IggyShard, PartitionConsensusConfig, ReconcileOp, ShardIdentity};
     use std::cell::Cell;
     use std::mem::size_of;
+    use std::path::Path;
     use std::rc::Rc;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
@@ -1989,6 +1993,8 @@ mod tests {
     >;
 
     const CLUSTER_ID: u128 = 1;
+    const CONFIG_KEY: &str = "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=";
+    const OTHER_CONFIG_KEY: &str = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=";
 
     /// Sanity test that ensures the `()` channel can coalesce wakes
     /// without blocking the producer when the consumer hasn't drained
@@ -2136,6 +2142,46 @@ mod tests {
         };
         mux.update(build_prepare(op, Operation::CreateStream, &req))
             .expect("CreateStream apply succeeds");
+    }
+
+    /// [`seed_stream`] for an encrypted stream, in the committed form the edge
+    /// writes once it has wrapped the stream's key.
+    fn seed_encrypted_stream(mux: &TestMux, op: u64, name: &str, set: &WrapSet) {
+        let options = ResourceOptions::from([
+            (
+                HeaderKey::from(OptionKey::EncryptionKeyWrapped),
+                OptionValue::explicit(HeaderValue::try_from(set.as_ref()).expect("set fits")),
+            ),
+            (
+                HeaderKey::from(OptionKey::CriticalKeys),
+                OptionValue::explicit(
+                    critical_keys_marker(&[OptionKey::EncryptionKeyWrapped]).expect("marker"),
+                ),
+            ),
+        ]);
+        let req = CreateStreamRequest {
+            name: WireName::new(name).expect("test stream name fits WireName"),
+            options: resource_options_to_wire(&options, OptionsProvenance::All)
+                .expect("options encode"),
+        };
+        mux.update(build_prepare(op, Operation::CreateStream, &req))
+            .expect("CreateStream apply succeeds");
+    }
+
+    fn key_context(config_key: &str) -> Arc<ServerKeyContext> {
+        Arc::new(ServerKeyContext::from_config(config_key, &[], true).expect("valid config key"))
+    }
+
+    fn wrap_stream_key(context: &ServerKeyContext, seed: u8) -> WrapSet {
+        let key = StreamEncryptionKey::try_from([seed; 32].as_slice()).expect("32 bytes");
+        WrapSet::from(context.wrap(&key, StreamKeyOrigin::Server).expect("wraps"))
+    }
+
+    fn served_encrypted(shard: &TestShard, ns: IggyNamespace) -> Option<bool> {
+        shard
+            .plane
+            .partitions()
+            .with_partition(&ns, |partition| partition.encryptor().is_some())
     }
 
     /// Drive a `CreateTopicWithAssignments` commit.
@@ -2421,6 +2467,16 @@ mod tests {
     /// Uses `IggyShard::without_inbox` so no inter-shard pump runs; the
     /// reconciler can be driven directly by `reconcile_once`.
     fn build_test_shard(shard_id: u16, config: &ServerConfig, mux: TestMux) -> Rc<TestShard> {
+        build_test_shard_with_keys(shard_id, config, mux, Arc::default())
+    }
+
+    /// [`build_test_shard`] on a node holding `key_context`.
+    fn build_test_shard_with_keys(
+        shard_id: u16,
+        config: &ServerConfig,
+        mux: TestMux,
+        key_context: Arc<ServerKeyContext>,
+    ) -> Rc<TestShard> {
         let bus = Rc::new(IggyMessageBus::with_config(shard_id, config));
         let metadata: IggyMetadata<
             consensus::VsrConsensus<Rc<IggyMessageBus>>,
@@ -2436,7 +2492,7 @@ mod tests {
                 validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
                 preallocate_segments: false,
-                key_context: Arc::default(),
+                key_context,
                 // The reconciler reads segment and offset paths off this layout,
                 // so it must root where `test_config` rooted the server's own.
                 path_layout: PartitionPathLayout {
@@ -2719,6 +2775,104 @@ mod tests {
                 .contains(&IggyNamespace::new(0, 0, 0)),
             "a topic this build cannot read must not be served"
         );
+    }
+
+    #[compio::test]
+    async fn given_stream_key_that_does_not_open_when_reconciling_should_not_build_its_partition() {
+        let stream_context = key_context(CONFIG_KEY);
+        let ns = IggyNamespace::new(0, 0, 0);
+        for (node_context, opens) in [
+            (Arc::clone(&stream_context), true),
+            (key_context(OTHER_CONFIG_KEY), false),
+        ] {
+            let tmp = TempDir::new().expect("tempdir for system path");
+            let config = test_config(&tmp);
+            let partition_dir = config.get_partition_path(0, 0, 0);
+            let mux = TestMux::default();
+            seed_encrypted_stream(&mux, 1, "stream-a", &wrap_stream_key(&stream_context, 1));
+            seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
+            let shard = build_test_shard_with_keys(0, &config, mux, node_context);
+            let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+
+            reconcile_pass(&ctx).await;
+
+            assert_eq!(
+                served_encrypted(&shard, ns),
+                opens.then_some(true),
+                "a partition is served only under its own stream's key"
+            );
+            assert_eq!(
+                ctx.failure_state
+                    .borrow()
+                    .contains_key(&(ns, FailureCause::Add)),
+                !opens
+            );
+            assert_eq!(Path::new(&partition_dir).exists(), opens);
+        }
+    }
+
+    #[compio::test]
+    async fn given_rewrap_committed_after_a_failed_build_when_reconciling_should_build_under_the_new_wrap()
+     {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let old_context = key_context(CONFIG_KEY);
+        let new_context = key_context(OTHER_CONFIG_KEY);
+        let stored = wrap_stream_key(&old_context, 1);
+        let mux = TestMux::default();
+        seed_encrypted_stream(&mux, 1, "stream-a", &stored);
+        seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
+        let shard = build_test_shard_with_keys(0, &config, mux, Arc::clone(&new_context));
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ns = IggyNamespace::new(0, 0, 0);
+
+        reconcile_pass(&ctx).await;
+        assert_eq!(served_encrypted(&shard, ns), None);
+
+        let mux = &shard.plane.metadata().mux_stm;
+        let created_op = mux
+            .streams()
+            .read(|inner| inner.items.get(0).map(|stream| stream.created_op))
+            .expect("stream exists");
+        let rewrap = RewrapStreamKeysRequest {
+            entries: vec![RewrapStreamKeyEntry {
+                stream_id: 0,
+                created_op,
+                key_fingerprint: stored
+                    .key_fingerprint_bytes()
+                    .try_into()
+                    .expect("8-byte fingerprint"),
+                wrap_set: Bytes::copy_from_slice(wrap_stream_key(&new_context, 1).as_ref()),
+            }],
+        };
+        mux.update(build_prepare(3, Operation::RewrapStreamKeys, &rewrap))
+            .expect("RewrapStreamKeys apply succeeds");
+        for record in ctx.failure_state.borrow_mut().values_mut() {
+            record.next_retry_at = Instant::now();
+        }
+        reconcile_pass(&ctx).await;
+
+        assert_eq!(served_encrypted(&shard, ns), Some(true));
+    }
+
+    #[compio::test]
+    async fn given_deleted_encrypted_stream_when_reconciling_should_forget_its_key() {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let context = key_context(CONFIG_KEY);
+        let mux = TestMux::default();
+        seed_encrypted_stream(&mux, 1, "stream-a", &wrap_stream_key(&context, 1));
+        seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
+        let shard = build_test_shard_with_keys(0, &config, mux, context);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+
+        reconcile_pass(&ctx).await;
+        assert!(shard.plane.partitions().has_stream_keys());
+
+        seed_delete_stream(&shard.plane.metadata().mux_stm, 3, 0);
+        reconcile_pass(&ctx).await;
+
+        assert!(!shard.plane.partitions().has_stream_keys());
     }
 
     /// A delete and a recreate of the same ids can commit while a pass runs,

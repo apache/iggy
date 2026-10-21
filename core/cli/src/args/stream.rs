@@ -29,7 +29,7 @@ pub(crate) enum StreamAction {
     /// Examples:
     ///  iggy stream create prod
     ///  iggy stream create -s 1 test
-    ///  iggy stream create --encryption-key-file stream.key payments
+    ///  iggy stream create --stream-key-file stream.key payments
     #[clap(verbatim_doc_comment, visible_alias = "c")]
     Create(StreamCreateArgs),
     /// Delete stream with given ID
@@ -77,13 +77,13 @@ pub(crate) struct StreamCreateArgs {
     pub(crate) stream_id: Option<u32>,
     /// File holding the stream's own at-rest encryption key
     ///
-    /// Standard base64 of exactly 32 bytes. Without this flag the key is read
-    /// from the IGGY_STREAM_ENCRYPTION_KEY environment variable, and without
-    /// either the server encryption setting applies. The server stores the
-    /// key wrapped and reads report only its fingerprint. Unrelated to
-    /// --encryption-key, which encrypts message payloads on the client.
+    /// Standard base64 of exactly 32 random bytes from a secure source, such
+    /// as "head -c 32 /dev/urandom | base64". Use a new key for every stream.
+    /// Without this flag the server encryption setting applies. The server
+    /// stores the key wrapped and reads report only its fingerprint. Unrelated
+    /// to --encryption-key, which encrypts message payloads on the client.
     #[clap(long, value_name = "PATH", verbatim_doc_comment)]
-    pub(crate) encryption_key_file: Option<PathBuf>,
+    pub(crate) stream_key_file: Option<PathBuf>,
     /// Name of the stream
     pub(crate) name: String,
 }
@@ -159,7 +159,7 @@ mod tests {
     }
 
     #[test]
-    fn given_stream_update_without_name_when_parsing_then_should_accept_reset_and_set() {
+    fn given_stream_update_without_name_when_parsing_should_accept_reset_and_set() {
         let parsed = Update::try_parse_from([
             "iggy",
             "orders",

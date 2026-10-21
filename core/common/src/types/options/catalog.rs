@@ -22,12 +22,13 @@ use super::{
     DEFAULT_PREALLOCATE_SEGMENTS, DEFAULT_SEGMENT_SIZE, DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
     Durability, MAX_MESSAGES_REQUIRED_TO_SAVE, MAX_PREALLOCATED_TOPIC_BYTES,
     MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE, MAX_TOPIC_SEGMENT_SIZE, MIN_TOPIC_SEGMENT_SIZE,
-    OptionValue, OptionsProvenance, OptionsScope, PartitionResizePolicy, ResourceOptions,
+    OptionValue, OptionsScope, PartitionResizePolicy, ResourceOptions, erase_options,
 };
 use crate::http::users::defaults::{MAX_USERNAME_LENGTH, MIN_USERNAME_LENGTH};
 use crate::types::compression::compression_algorithm::CompressionAlgorithm;
 use crate::types::message::{HeaderKey, HeaderKind, HeaderValue};
 use crate::utils::stream_key::{StreamEncryptionKey, StreamKeyOrigin, WrapSet};
+use crate::wire_conversions::options_block_size;
 use crate::{IggyByteSize, IggyError, IggyExpiry, MaxTopicSize, UserStatus};
 use iggy_binary_protocol::{WireHeaderKind, WireOptions, WireUserHeaderEntry};
 use serde::{Deserialize, Serialize};
@@ -468,7 +469,9 @@ pub struct OptionAdmissionContext {
 #[derive(Clone, Default, PartialEq)]
 pub struct AdmittedOptions {
     /// Map keys to set, explicit and canonical. Zero sentinels that mean "use
-    /// the default" are dropped, so they leave the stored value alone.
+    /// the default" are dropped, so they leave the stored value alone. A secret
+    /// key holds the secret itself, so a caller done with the map erases it
+    /// with [`super::erase_options`].
     pub explicit: ResourceOptions,
     /// Map keys to reset to their defaults.
     pub reset: Vec<OptionKey>,
@@ -624,7 +627,9 @@ pub fn derived_defaults(
 /// 5. `OptionNotResettable`: a reset of a column or of a key without default.
 /// 6. Value errors: a column inside a create block is `InvalidOptionValue`,
 ///    column values keep their own errors, other keys `InvalidOptionValue`.
-/// 7. `OptionsBlockTooLarge`: the resulting map exceeds the block limits.
+/// 7. `InvalidCommand`: an update that changes nothing once its zero
+///    sentinels are dropped.
+/// 8. `OptionsBlockTooLarge`: the resulting map exceeds the block limits.
 ///
 /// # Errors
 ///
@@ -703,25 +708,31 @@ pub fn admit(
     };
     let mut explicit = ResourceOptions::new();
     for (key, entry) in set_keys.iter().zip(&entries) {
-        match key.descriptor().storage {
-            OptionStorage::Column => decode_column(scope, *key, entry, &mut columns)?,
-            OptionStorage::Map => {
-                if let Some(value) = canonical_value(*key, entry)? {
+        let decoded = match key.descriptor().storage {
+            OptionStorage::Column => decode_column(scope, *key, entry, &mut columns),
+            OptionStorage::Map => canonical_value(*key, entry).map(|value| {
+                if let Some(value) = value {
                     explicit.insert(HeaderKey::from(*key), OptionValue::explicit(value));
                 }
-            }
-            OptionStorage::Computed => return Err(IggyError::ReadOnlyOption(key.to_string())),
+            }),
+            OptionStorage::Computed => Err(IggyError::ReadOnlyOption(key.to_string())),
+        };
+        if let Err(error) = decoded {
+            erase_options(explicit);
+            return Err(error);
         }
     }
-
-    let mut candidate = context.current.clone().unwrap_or_default();
-    for key in &reset_keys {
-        if let Some(default) = key.descriptor().default_value()? {
-            candidate.insert(HeaderKey::from(*key), OptionValue::derived(default));
-        }
+    if operation == OptionOperation::Update
+        && explicit.is_empty()
+        && reset_keys.is_empty()
+        && columns == OptionColumns::default()
+    {
+        return Err(IggyError::InvalidCommand);
     }
-    candidate.extend(explicit.clone());
-    crate::wire_conversions::resource_options_to_wire(&candidate, OptionsProvenance::All)?;
+    if let Err(error) = check_block_size(context.current.as_ref(), &reset_keys, &explicit) {
+        erase_options(explicit);
+        return Err(error);
+    }
 
     Ok(AdmittedOptions {
         explicit,
@@ -731,7 +742,8 @@ pub fn admit(
 }
 
 /// The canonical value of one map key, or `None` for a zero sentinel that
-/// means "use the default" and therefore sets nothing.
+/// means "use the default" and therefore sets nothing. A secret key's value
+/// is the secret itself, for the caller to erase.
 ///
 /// # Errors
 ///
@@ -808,7 +820,8 @@ pub fn stream_key_from_entry(
 /// projections as derived entries.
 ///
 /// The projections come from the stored wrap set alone, so every node answers
-/// the same for the same stream, and a cached create reply stays true.
+/// the same for the same stream state. A cached create reply keeps the
+/// create-time projections, so its KEK fingerprints predate any later rewrap.
 ///
 /// # Errors
 ///
@@ -818,7 +831,7 @@ pub fn public_options(
     scope: OptionsScope,
     stored: &ResourceOptions,
 ) -> Result<ResourceOptions, IggyError> {
-    check_critical_options(stored)?;
+    let wrap_set = critical_wrap_set(stored)?;
     let mut public = ResourceOptions::new();
     for (key, value) in stored {
         let returned = OptionKey::try_from(key).map_or(true, |known| {
@@ -838,7 +851,7 @@ pub fn public_options(
             );
             Ok(())
         };
-        match stream_wrap_set(stored)? {
+        match wrap_set {
             Some(set) => {
                 let source: &'static str = StreamEncryptionSource::from(set.origin()).into();
                 project(OptionKey::EncryptionKeySource, source)?;
@@ -893,6 +906,16 @@ pub fn critical_keys_marker(keys: &[OptionKey]) -> Result<HeaderValue, IggyError
 ///
 /// `UnsupportedCriticalOption` naming the offending key.
 pub fn check_critical_options(stored: &ResourceOptions) -> Result<(), IggyError> {
+    critical_wrap_set(stored).map(|_| ())
+}
+
+/// [`check_critical_options`], returning the stream's wrap set it parsed so a
+/// caller that needs the set reads it once.
+///
+/// # Errors
+///
+/// As [`check_critical_options`].
+pub(super) fn critical_wrap_set(stored: &ResourceOptions) -> Result<Option<WrapSet>, IggyError> {
     if let Some(marker) = stored.get(&HeaderKey::from(OptionKey::CriticalKeys)) {
         let names = parse_critical_marker(&marker.value)?;
         for name in names {
@@ -906,7 +929,7 @@ pub fn check_critical_options(stored: &ResourceOptions) -> Result<(), IggyError>
             }
         }
     }
-    stream_wrap_set(stored).map(|_| ())
+    stream_wrap_set(stored)
 }
 
 /// A string key in `scope`, or `UnsupportedOptionKey`.
@@ -915,6 +938,30 @@ fn scoped_key(scope: OptionsScope, name: &str) -> Result<OptionKey, IggyError> {
         .ok()
         .filter(|key| key.descriptor().applies_to(scope))
         .ok_or_else(|| IggyError::UnsupportedOptionKey(key_preview(name)))
+}
+
+/// Refuse a resulting map past the block limits: `current` with `reset_keys`
+/// at their defaults and `explicit` set. The size is summed over the three
+/// maps, so no value is cloned or encoded to measure it.
+fn check_block_size(
+    current: Option<&ResourceOptions>,
+    reset_keys: &[OptionKey],
+    explicit: &ResourceOptions,
+) -> Result<(), IggyError> {
+    let mut defaults = ResourceOptions::new();
+    for key in reset_keys {
+        if let Some(default) = key.descriptor().default_value()? {
+            defaults.insert(HeaderKey::from(*key), OptionValue::derived(default));
+        }
+    }
+    let kept = current
+        .into_iter()
+        .flatten()
+        .filter(|(key, _)| !defaults.contains_key(*key) && !explicit.contains_key(*key));
+    let reset = defaults
+        .iter()
+        .filter(|(key, _)| !explicit.contains_key(*key));
+    options_block_size(kept.chain(reset).chain(explicit)).map(|_| ())
 }
 
 fn validated_create_columns(
@@ -1008,14 +1055,14 @@ fn key_preview(key: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::topic_option_keys;
+    use super::super::{OptionsProvenance, topic_option_keys};
     use super::*;
     use crate::wire_conversions::resource_options_to_wire;
     use std::str::FromStr;
     use strum::IntoEnumIterator;
 
     #[test]
-    fn given_catalog_when_listing_keys_then_should_never_name_the_reset_field() {
+    fn given_catalog_when_listing_keys_should_never_name_the_reset_field() {
         assert!(
             OptionKey::iter().all(|key| key.to_string() != crate::RESET_FIELD),
             "an option named `reset` would collide with the HTTP update body"
@@ -1023,7 +1070,7 @@ mod tests {
     }
 
     #[test]
-    fn given_secret_catalog_key_when_describing_then_should_be_create_only() {
+    fn given_secret_catalog_key_when_describing_should_be_create_only() {
         // No update path wraps a secret, so an updatable one would be stored in
         // the clear.
         for descriptor in CATALOG
@@ -1040,7 +1087,7 @@ mod tests {
     }
 
     #[test]
-    fn given_catalog_when_iterating_then_should_have_unique_scoped_descriptors() {
+    fn given_catalog_when_iterating_should_have_unique_scoped_descriptors() {
         assert_eq!(CATALOG.len(), OptionKey::iter().count());
         for (index, key) in OptionKey::iter().enumerate() {
             let descriptor = key.descriptor();
@@ -1109,7 +1156,7 @@ mod tests {
     }
 
     #[test]
-    fn given_canonical_and_text_values_when_decoding_then_should_match_typed_values() {
+    fn given_canonical_and_text_values_when_decoding_should_match_typed_values() {
         let cases: Vec<(OptionKey, HeaderValue, HeaderValue)> = vec![
             (
                 OptionKey::CompressionAlgorithm,
@@ -1221,7 +1268,7 @@ mod tests {
     }
 
     #[test]
-    fn given_create_only_option_when_resetting_then_should_reject_not_updatable() {
+    fn given_create_only_option_when_resetting_should_reject_not_updatable() {
         for key in [OptionKey::SegmentSize, OptionKey::Durability] {
             assert_eq!(
                 admit(
@@ -1271,7 +1318,7 @@ mod tests {
     }
 
     #[test]
-    fn given_fixed_create_columns_when_repeated_in_options_then_should_reject() {
+    fn given_fixed_create_columns_when_repeated_in_options_should_reject() {
         assert_eq!(
             admit(
                 OptionsScope::Stream,
@@ -1335,18 +1382,43 @@ mod tests {
     }
 
     #[test]
-    fn given_topic_sentinels_when_canonicalizing_then_should_preserve_existing_provenance_rules() {
+    fn given_update_of_only_zero_sentinels_when_admitting_should_refuse_it_as_empty() {
+        for entries in [
+            vec![(OptionKey::MessageExpiry, HeaderValue::from(0u64))],
+            vec![
+                (OptionKey::MaxTopicSize, HeaderValue::from(0u64)),
+                (OptionKey::MessageExpiry, HeaderValue::from(0u64)),
+            ],
+        ] {
+            assert_eq!(
+                admit(
+                    OptionsScope::Topic,
+                    OptionOperation::Update,
+                    &block(&entries),
+                    &[],
+                    &OptionAdmissionContext::default(),
+                )
+                .err(),
+                Some(IggyError::InvalidCommand),
+                "{entries:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_topic_sentinels_when_canonicalizing_should_preserve_existing_provenance_rules() {
         let admitted = admit(
             OptionsScope::Topic,
             OptionOperation::Update,
             &block(&[
                 (OptionKey::MessageExpiry, HeaderValue::from(0u64)),
                 (OptionKey::MaxTopicSize, HeaderValue::from(0u64)),
+                (OptionKey::Name, HeaderValue::try_from("orders").unwrap()),
             ]),
             &[],
             &OptionAdmissionContext::default(),
         )
-        .expect("zero sentinels are accepted");
+        .expect("zero sentinels next to a rename are accepted");
         assert!(
             admitted.explicit.is_empty(),
             "a zero sentinel leaves the stored value and its provenance alone"
@@ -1370,7 +1442,7 @@ mod tests {
     }
 
     #[test]
-    fn given_oversized_patch_result_when_admitting_then_should_reject_without_mutation() {
+    fn given_oversized_patch_result_when_admitting_should_reject_without_mutation() {
         let mut current = ResourceOptions::new();
         for index in 0..iggy_binary_protocol::MAX_OPTIONS {
             current.insert(
@@ -1396,7 +1468,74 @@ mod tests {
     }
 
     #[test]
-    fn given_unknown_critical_option_when_projecting_then_should_refuse_without_echoing_value() {
+    fn given_patch_result_at_the_byte_cap_when_admitting_should_admit_it_but_not_one_byte_more() {
+        let filler_key = |index: usize| {
+            HeaderKey::try_from(format!("future_key_{index:05}").as_str()).expect("valid key")
+        };
+        let filler_value =
+            |length: usize| HeaderValue::try_from(vec![1u8; length].as_slice()).expect("fits");
+        let mut current = ResourceOptions::new();
+        for key in [OptionKey::MessageExpiry, OptionKey::MaxTopicSize] {
+            current.insert(
+                HeaderKey::from(key),
+                OptionValue::explicit(HeaderValue::from(1u8)),
+            );
+        }
+        for index in 0..355 {
+            current.insert(filler_key(index), OptionValue::explicit(filler_value(255)));
+        }
+        let patch = block(&[(OptionKey::MessageExpiry, HeaderValue::from(9u64))]);
+        let reset = [OptionKey::MaxTopicSize.to_string()];
+        let mut resulting = current.clone();
+        resulting.insert(
+            HeaderKey::from(OptionKey::MessageExpiry),
+            OptionValue::explicit(HeaderValue::from(9u64)),
+        );
+        resulting.insert(
+            HeaderKey::from(OptionKey::MaxTopicSize),
+            OptionValue::derived(
+                OptionKey::MaxTopicSize
+                    .descriptor()
+                    .default_value()
+                    .expect("default encodes")
+                    .expect("has a default"),
+            ),
+        );
+        let resulting_size = resource_options_to_wire(&resulting, OptionsProvenance::All)
+            .expect("under the cap")
+            .as_bytes()
+            .len();
+        // The last entry's kinds, lengths and 16-byte key.
+        let free = iggy_binary_protocol::MAX_OPTIONS_BYTES - resulting_size - 26;
+        assert!(
+            (1..255).contains(&free),
+            "the last value fits a header value"
+        );
+        let admit_with_last_value = |length: usize| {
+            let mut current = current.clone();
+            current.insert(filler_key(355), OptionValue::explicit(filler_value(length)));
+            let context = OptionAdmissionContext {
+                current: Some(current),
+                ..OptionAdmissionContext::default()
+            };
+            admit(
+                OptionsScope::Topic,
+                OptionOperation::Update,
+                &patch,
+                &reset,
+                &context,
+            )
+        };
+
+        assert!(admit_with_last_value(free).is_ok(), "exactly at the cap");
+        assert!(matches!(
+            admit_with_last_value(free + 1),
+            Err(IggyError::OptionsBlockTooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn given_unknown_critical_option_when_projecting_should_refuse_without_echoing_value() {
         let mut stored = ResourceOptions::new();
         stored.insert(
             HeaderKey::try_from("future_secret").unwrap(),
@@ -1437,7 +1576,7 @@ mod tests {
     }
 
     #[test]
-    fn given_wrap_set_when_projecting_stream_then_should_report_origin_and_both_fingerprints() {
+    fn given_wrap_set_when_projecting_stream_should_report_origin_and_both_fingerprints() {
         let context = crate::ServerKeyContext::from_config(
             "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=",
             &[],
@@ -1481,7 +1620,7 @@ mod tests {
     }
 
     #[test]
-    fn given_malformed_critical_marker_when_resolving_then_should_mark_unavailable() {
+    fn given_malformed_critical_marker_when_resolving_should_mark_unavailable() {
         let wrapped = crate::ServerKeyContext::from_config(
             "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=",
             &[],
@@ -1545,7 +1684,7 @@ mod tests {
     }
 
     #[test]
-    fn given_admitted_stream_key_when_debugging_then_should_redact_it() {
+    fn given_admitted_stream_key_when_debugging_should_redact_it() {
         let key = HeaderValue::try_from([7u8; 32].as_slice()).unwrap();
         let admitted = admit(
             OptionsScope::Stream,
@@ -1561,7 +1700,7 @@ mod tests {
     }
 
     #[test]
-    fn given_invalid_requests_when_admitting_then_should_report_categories_in_order() {
+    fn given_invalid_requests_when_admitting_should_report_categories_in_order() {
         let context = OptionAdmissionContext::default();
         let set_and_reset = admit(
             OptionsScope::Topic,
