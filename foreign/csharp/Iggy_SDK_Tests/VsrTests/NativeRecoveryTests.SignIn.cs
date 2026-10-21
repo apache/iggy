@@ -16,6 +16,7 @@
 // under the License.
 
 using System.Collections.Concurrent;
+using System.Reflection;
 using Apache.Iggy.Configuration;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
@@ -32,6 +33,44 @@ namespace Apache.Iggy.Tests.VsrTests;
 
 public sealed partial class NativeRecoveryTests
 {
+    [Fact]
+    public async Task given_session_recovery_when_routing_is_locked_should_not_block_lane_admission()
+    {
+        const BindingFlags fields = BindingFlags.Instance | BindingFlags.NonPublic;
+        var config = new IggyClientConfigurator { BaseAddress = "127.0.0.1:1", Protocol = Protocol.Tcp };
+        using var client = new TcpMessageStream(config, NullLoggerFactory.Instance);
+        var session = (ConsensusSession)typeof(TcpMessageStream).GetField("_consensusSession", fields)!.GetValue(client)!;
+        var routingGate = typeof(TcpMessageStream).GetField("_pollRoutingGate", fields)!.GetValue(client)!;
+        var recovery = Signal();
+        typeof(TcpMessageStream).GetField("_sessionRecovery", fields)!.SetValue(client, recovery.Task);
+        var generation = session.Generation;
+        session.Reset(continues: true);
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        using var admitted = new ManualResetEventSlim();
+        var waiting = Task.CompletedTask;
+        try
+        {
+            lock (routingGate)
+            {
+                waiting = Task.Run(async () =>
+                {
+                    var operation = client.Mutations.EnterAsync(MutationLane.Metadata, CommandCodes.CREATE_STREAM_CODE,
+                        ReadOnlyMemory<byte>.Empty, default, true, generation, cancellation.Token);
+                    admitted.Set();
+                    await Assert.ThrowsAnyAsync<OperationCanceledException>(() => operation);
+                }, cancellation.Token);
+                Assert.True(admitted.Wait(TimeSpan.FromSeconds(5), cancellation.Token),
+                    "Lane admission must yield to recovery without taking the routing lock.");
+            }
+        }
+        finally
+        {
+            await cancellation.CancelAsync();
+            recovery.TrySetResult();
+            await waiting.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+        }
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]

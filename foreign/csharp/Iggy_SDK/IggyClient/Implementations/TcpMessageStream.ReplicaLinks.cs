@@ -490,9 +490,10 @@ public sealed partial class TcpMessageStream
     /// <summary>
     ///     The running session recovery when it signs in again. A call that cannot have been applied yet waits for it,
     ///     and starts over under the new session instead of failing with the old one.
+    ///     Admission holds the lane lock, so this read must not take the routing lock. Recovery checks credentials.
     /// </summary>
     private Task? SignInRecovery() =>
-        _configuration.ReconnectionSettings.Enabled && SignInSettings() is not null
+        _configuration.ReconnectionSettings.Enabled
         && Volatile.Read(ref _sessionRecovery) is { IsCompleted: false } recovery ? recovery : null;
 
     /// <summary>
