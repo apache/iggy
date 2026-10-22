@@ -571,11 +571,15 @@ final class PollRouter: Sendable {
                 }
                 answer = IggyError(.transientNotCommitted, context: "the reply does not prove the earlier attempt committed")
             } catch let refusal as IggyError {
-                if VSRFrame.peekCommand(header) == .eviction, refusal.code == .staleClient || ClientCore.endsSessionOfWrite(refusal, request.operation) {
-                    // A stale client eviction ends only the binding of the
-                    // connection, and a write can commit before an eviction ends
-                    // its session: either way the request is lost with the
-                    // connection, not refused.
+                if VSRFrame.peekCommand(header) == .eviction, refusal.code == .staleClient {
+                    // As on the coordinator, a stale client eviction ends only
+                    // the binding of the connection, so the request is lost with
+                    // it and a new connection binds the same session again.
+                    await connection.close()
+                    throw IggyError(.disconnected, context: "\(refusal)")
+                }
+                if VSRFrame.peekCommand(header) == .eviction, ClientCore.endsSessionOfWrite(refusal, request.operation) {
+                    // A write can commit before an eviction ends its session.
                     await connection.close()
                     throw IggyError(.transientNotCommitted, context: "\(refusal)")
                 }
