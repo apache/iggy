@@ -114,7 +114,7 @@ const SLOT_LIMIT: Duration = Duration::from_secs(45);
 /// its connection. A Fetch poll then drops that connection (`LazyClient::until`). An offset
 /// commit keeps it, so the next commit waits behind it in the SDK and commits stay in order. A
 /// Produce send closes it before the slot frees (`LazyClient::retire`).
-async fn in_slot<S: Send + 'static, T: Send + 'static>(
+pub(crate) async fn in_slot<S: Send + 'static, T: Send + 'static>(
     slot: S,
     deadline: Instant,
     call: impl Future<Output = T> + Send + 'static,
@@ -139,16 +139,16 @@ async fn permit_by(turn: &Arc<Semaphore>, deadline: Instant) -> Option<OwnedSema
 /// Owns the connected `IggyClient`s and resolves Kafka topics against them.
 ///
 /// Each producer sends on a client of its own, one request at a time. Producers past the session
-/// limit share one more. Metadata, `CreateTopics`, `DeleteTopics`, `DescribeConfigs` and
-/// `AlterConfigs` share another. Topic probes, certificate user lookups and `Metadata`'s auto topic
-/// creations each use a client of their own, Fetch polls one per read slot, and offset calls two
-/// per offset slot.
+/// limit share one more. Metadata, `CreateTopics`, `DeleteTopics`, `CreatePartitions`,
+/// `DescribeConfigs` and `AlterConfigs` share another. Topic probes, certificate user lookups and
+/// `Metadata`'s auto topic creations each use a client of their own, Fetch polls one per read
+/// slot, and offset calls two per offset slot.
 ///
 /// Each client signs in at the metadata leader, and a view change or a refused call can move it to
 /// another node. So in a cluster, two clients can read replicas that are not at the same offset.
 pub struct IggyBridge {
-    /// The client of Metadata, `CreateTopics`, `DeleteTopics`, `DescribeConfigs` and
-    /// `AlterConfigs`.
+    /// The client of Metadata, `CreateTopics`, `DeleteTopics`, `CreatePartitions`,
+    /// `DescribeConfigs` and `AlterConfigs`.
     client: Arc<IggyClient>,
     config: IggyBridgeConfig,
     /// One Iggy session per producer. See `produce_turn`.
