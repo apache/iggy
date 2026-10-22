@@ -61,6 +61,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -549,6 +550,41 @@ final class PollRouter {
         var state = new AsyncTcpConnection.TransientFailoverState();
         state.startIn(sessionOwner());
         return state;
+    }
+
+    /**
+     * Passes the outcome of {@code source} to the returned future in a task of the client event loop. The router
+     * completes {@code source} under its monitors, and a caller callback there that waits for the client monitor can
+     * close a cycle with a sign-in that holds the client monitor and ends the pending polls. The loop is read once
+     * here, so a coordinator that is gone when {@code source} completes cannot strand the caller. The loop runs these
+     * tasks in order. A cancel of the returned future cancels {@code source}, and it wins over an outcome that has not
+     * reached the loop yet. A loop that rejects the task completes the returned future in place, under the monitors of
+     * the completing thread. Netty can also drop a task that it accepts during its final shutdown, and then the
+     * returned future never completes.
+     */
+    <T> CompletableFuture<T> onClientLoop(CompletableFuture<T> source) {
+        var loop = coordinator.get().eventLoop();
+        CompletableFuture<T> caller = new CompletableFuture<>();
+        caller.whenComplete((value, error) -> {
+            if (caller.isCancelled()) {
+                source.cancel(false);
+            }
+        });
+        source.whenComplete((value, error) -> {
+            Runnable relay = () -> {
+                if (error == null) {
+                    caller.complete(value);
+                } else {
+                    caller.completeExceptionally(error);
+                }
+            };
+            try {
+                loop.execute(relay);
+            } catch (RejectedExecutionException loopGone) {
+                relay.run();
+            }
+        });
+        return caller;
     }
 
     private CompletableFuture<ByteBuf> send(Poll poll) {

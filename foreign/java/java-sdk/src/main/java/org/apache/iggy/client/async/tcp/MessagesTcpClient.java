@@ -54,6 +54,8 @@ import static org.apache.iggy.serde.BytesSerializer.toBytes;
 
 /**
  * Async TCP implementation of MessagesClient using Netty for non-blocking I/O.
+ *
+ * <p>Its futures complete on the client event loop, as the callbacks section of {@link AsyncIggyTcpClient} says.
  */
 public class MessagesTcpClient implements MessagesClient {
 
@@ -133,9 +135,10 @@ public class MessagesTcpClient implements MessagesClient {
                     cancellation.cancel();
                 }
             });
-            return result;
+            return pollRouter.onClientLoop(result);
         }
-        return pollPartition(streamId, topicId, partitionId, consumer, strategy, count, autoCommit, deadline, state);
+        return pollRouter.onClientLoop(
+                pollPartition(streamId, topicId, partitionId, consumer, strategy, count, autoCommit, deadline, state));
     }
 
     @SuppressWarnings("checkstyle:ParameterNumber")
@@ -191,7 +194,8 @@ public class MessagesTcpClient implements MessagesClient {
         Partitioning frozenPartitioning =
                 new Partitioning(partitioning.kind(), partitioning.value().clone());
         if (partitioning.kind() == PartitioningKind.PartitionId) {
-            return sendToPartition(streamId, topicId, frozenPartitioning, batch, deadline, state);
+            return pollRouter.onClientLoop(
+                    sendToPartition(streamId, topicId, frozenPartitioning, batch, deadline, state));
         }
         CallCancellation cancellation = new CallCancellation();
         CompletableFuture<SendMessagesResponse> result =
@@ -201,7 +205,7 @@ public class MessagesTcpClient implements MessagesClient {
                 cancellation.cancel();
             }
         });
-        return result;
+        return pollRouter.onClientLoop(result);
     }
 
     @SuppressWarnings("checkstyle:ParameterNumber")

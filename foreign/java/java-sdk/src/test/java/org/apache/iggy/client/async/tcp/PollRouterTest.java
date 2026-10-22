@@ -35,15 +35,19 @@ import org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.
 import org.apache.iggy.client.async.tcp.vsr.ConsensusSession;
 import org.apache.iggy.client.async.tcp.vsr.VsrFrameDecoder;
 import org.apache.iggy.client.async.tcp.vsr.VsrHeaders;
+import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.exception.IggyClientException;
 import org.apache.iggy.exception.IggyConnectionException;
 import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.exception.IggyOperationException;
 import org.apache.iggy.exception.IggyServerException;
+import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
+import org.apache.iggy.message.PolledMessages;
+import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.message.SendMessagesResponse;
 import org.apache.iggy.partition.PartitionContext;
 import org.apache.iggy.serde.BytesDeserializer;
@@ -905,6 +909,101 @@ class PollRouterTest {
         }
     }
 
+    /**
+     * A poll deadline ends the poll under the poll monitor. A callback of that poll can call a synchronized client
+     * method, which waits for the client monitor. A sign-in holds that monitor while it ends the pending polls, and
+     * that takes the poll monitor. So the poll future of the caller must complete after the poll monitor is free.
+     */
+    @Test
+    void shouldRunAPollCallbackOutsideThePollMonitorWhileASignInEndsThePendingPolls() throws Exception {
+        IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+        ManualTimers timers = new ManualTimers();
+        CompletableFuture<Void> proceed = new CompletableFuture<>();
+        try {
+            Coordinator coordinator = new Coordinator(group, timers);
+            Primary primary = new Primary(group);
+            PollRouter router = new PollRouter(() -> coordinator, endpoint -> primary);
+            MessagesTcpClient messages = new MessagesTcpClient(() -> coordinator, new ClientRoutingState(), router);
+            // The first poll caches the route, and the primary holds the next one.
+            pollMessage(messages).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            int deadlineIndex = timers.scheduled.size();
+            var polled = pollMessage(messages);
+            Object clientMonitor = new Object();
+            CompletableFuture<List<String>> monitors = new CompletableFuture<>();
+            CompletableFuture<Thread> callback = new CompletableFuture<>();
+            CompletableFuture<Void> callbackEnded = new CompletableFuture<>();
+            polled.whenComplete((response, error) -> {
+                monitors.complete(heldMonitors());
+                callback.complete(Thread.currentThread());
+                synchronized (clientMonitor) {
+                    callbackEnded.complete(null);
+                }
+            });
+
+            CompletableFuture<Void> holding = new CompletableFuture<>();
+            CompletableFuture<Void> cleared = new CompletableFuture<>();
+            Thread signIn = start("sign-in", () -> {
+                synchronized (clientMonitor) {
+                    holding.complete(null);
+                    proceed.join();
+                    router.clearSession();
+                }
+                cleared.complete(null);
+            });
+            holding.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            Thread deadline = start("poll-deadline", timers.scheduled.get(deadlineIndex));
+            await(
+                    () -> callback.isDone() && callback.join().getState() == Thread.State.BLOCKED,
+                    "the poll callback waiting for the client monitor",
+                    TIMEOUT);
+            proceed.complete(null);
+
+            assertThat(cleared).succeedsWithin(TIMEOUT);
+            assertThat(callbackEnded).succeedsWithin(TIMEOUT);
+            assertServerError(polled, AsyncTcpConnection.TRANSIENT_NOT_COMMITTED);
+            assertThat(monitors.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS))
+                    .as("monitors held while the poll callback runs")
+                    .noneMatch(monitor -> monitor.startsWith(PollRouter.class.getName()));
+            signIn.join(TIMEOUT.toMillis());
+            deadline.join(TIMEOUT.toMillis());
+            assertThat(signIn.isAlive()).isFalse();
+            assertThat(deadline.isAlive()).isFalse();
+        } finally {
+            proceed.complete(null);
+            timers.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+            group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    /**
+     * A poll can end at its deadline after its coordinator is gone. The caller must still get the outcome, so the
+     * relay to the caller cannot need the coordinator at that point.
+     */
+    @Test
+    void shouldCompleteAPollWhoseCoordinatorIsGoneWhenItEnds() throws Exception {
+        IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+        ManualTimers timers = new ManualTimers();
+        try {
+            Coordinator coordinator = new Coordinator(group, timers);
+            AtomicReference<AsyncTcpConnection> current = new AtomicReference<>(coordinator);
+            Primary primary = new Primary(group);
+            PollRouter router = new PollRouter(current::get, endpoint -> primary);
+            MessagesTcpClient messages = new MessagesTcpClient(current::get, new ClientRoutingState(), router);
+            // The first poll caches the route, and the primary holds the next one.
+            pollMessage(messages).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            int deadlineIndex = timers.scheduled.size();
+            var polled = pollMessage(messages);
+
+            current.set(null);
+            timers.scheduled.get(deadlineIndex).run();
+
+            assertServerError(polled, AsyncTcpConnection.TRANSIENT_NOT_COMMITTED);
+        } finally {
+            timers.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+            group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+        }
+    }
+
     @Test
     void shouldRefreshCachedHistoryBeforeANewPollAfterMetadataAdvances() throws Exception {
         IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
@@ -985,6 +1084,17 @@ class PollRouterTest {
         return new MessagesTcpClient(() -> coordinator, new ClientRoutingState(), router)
                 .sendMessages(
                         StreamId.of(1L), TopicId.of(1L), Partitioning.partitionId(0L), List.of(Message.of("message")));
+    }
+
+    private static CompletableFuture<PolledMessages> pollMessage(MessagesTcpClient messages) {
+        return messages.pollMessages(
+                StreamId.of(1L),
+                TopicId.of(1L),
+                Optional.of(0L),
+                Consumer.of(ConsumerId.of(7L)),
+                PollingStrategy.offset(BigInteger.ZERO),
+                1L,
+                false);
     }
 
     private static ConsensusSession.Ticket retainOffset(AsyncTcpConnection connection) {

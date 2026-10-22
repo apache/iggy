@@ -116,6 +116,19 @@ import java.util.stream.Stream;
  * the underlying Netty event loop serializes writes to the TCP connection while
  * response handling is performed asynchronously.
  *
+ * <h2>Callbacks</h2>
+ * <p>The futures of {@link MessagesClient}, {@link ConsumerOffsetsClient},
+ * {@link #sendBinaryRequest(int, byte[])} and {@link #resolveOperation(long, Duration)}
+ * complete in a task of the client event loop. No lock of the client is held there, so
+ * their callbacks can call any method of the client, such as {@link #login()} or
+ * {@link #close()}. A callback runs on the event loop, so it must not block.
+ * <p>A cancel can win over an outcome that has not reached the event loop yet. So a
+ * cancelled send or offset store can still have committed. After the event loop shuts
+ * down, these futures complete in the thread that ends the call. That thread can hold a
+ * lock of the client, so the rule above no longer holds. A future whose outcome arrives
+ * during the final shutdown can also stay incomplete, because Netty can drop a task that
+ * it accepts then.
+ *
  * <h2>Resource Management</h2>
  * <p>When the client is no longer needed, call {@link #close()}. This closes the
  * connection and shuts down the event loop group that the client created for itself. A
@@ -416,6 +429,8 @@ public class AsyncIggyTcpClient {
      * partition, one call can fail with code 87 (5009 for a consumer group). The
      * failed route is dropped and the next call routes again.
      *
+     * <p>The future completes on the client event loop, as the callbacks section of this class says.
+     *
      * @param code the command code
      * @param payload the command payload
      * @return a future containing the raw response payload
@@ -432,7 +447,7 @@ public class AsyncIggyTcpClient {
             throw new IggyNotConnectedException();
         }
 
-        return AsyncTcpConnection.mapResponse(raw.send(code, payload), response -> {
+        return pollRouter.onClientLoop(AsyncTcpConnection.mapResponse(raw.send(code, payload), response -> {
             try {
                 if (response.readableBytes() <= 1) {
                     return new byte[0];
@@ -443,7 +458,7 @@ public class AsyncIggyTcpClient {
             } finally {
                 response.release();
             }
-        });
+        }));
     }
 
     /**
@@ -456,6 +471,8 @@ public class AsyncIggyTcpClient {
      * returns the same response body or committed rejection without a request. {@code OPERATION_NOT_RETAINED}
      * means that the outcome is unknown and this client can no longer recover it. A session reset or an abandon
      * dropped the operation before a replay proved its outcome, or that outcome aged out.
+     *
+     * <p>The future completes on the client event loop, as the callbacks section of this class says.
      */
     public CompletableFuture<byte[]> resolveOperation(long operationId, Duration timeout) {
         Objects.requireNonNull(timeout, "timeout");
@@ -472,7 +489,7 @@ public class AsyncIggyTcpClient {
             throw new IggyNotConnectedException();
         }
         try {
-            return AsyncTcpConnection.mapResponse(
+            return pollRouter.onClientLoop(AsyncTcpConnection.mapResponse(
                     pollRouter.resolve(operationId, Duration.ofNanos(timeoutNanos)), response -> {
                         try {
                             byte[] body = new byte[response.readableBytes()];
@@ -481,7 +498,7 @@ public class AsyncIggyTcpClient {
                         } finally {
                             response.release();
                         }
-                    });
+                    }));
         } catch (RuntimeException error) {
             return CompletableFuture.failedFuture(error);
         }
