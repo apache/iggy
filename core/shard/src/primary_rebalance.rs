@@ -246,9 +246,11 @@ where
         let Some(consensus) = self.plane.metadata().consensus.as_ref() else {
             return;
         };
+        // A vote for the current view cannot depose its normal primary. Late
+        // votes keep arriving after a view change and must not reset readiness.
         let invalidates = match message {
-            MessageBag::StartViewChange(message) => message.header().view >= consensus.view(),
-            MessageBag::DoViewChange(message) => message.header().view >= consensus.view(),
+            MessageBag::StartViewChange(message) => message.header().view > consensus.view(),
+            MessageBag::DoViewChange(message) => message.header().view > consensus.view(),
             MessageBag::StartView(message) => message.header().view >= consensus.view(),
             MessageBag::RequestStartView(message) => message.header().view > consensus.view(),
             MessageBag::Commit(message) => message.header().view > consensus.view(),

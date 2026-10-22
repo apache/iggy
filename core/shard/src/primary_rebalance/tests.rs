@@ -21,7 +21,9 @@ use crate::{
     PartitionConsensusConfig, Receiver, ReplicaTopology, ShardIdentity, shard_mesh_channels,
 };
 use consensus::{LocalPipeline, PlaneKind, StateTransferStage};
-use iggy_binary_protocol::{CommitHeader, StartViewChangeHeader, StartViewHeader};
+use iggy_binary_protocol::{
+    CommitHeader, DoViewChangeHeader, StartViewChangeHeader, StartViewHeader,
+};
 use iggy_common::{IggyByteSize, PartitionStats, variadic};
 use journal::prepare_journal::PrepareJournal;
 use journal::superblock::{PingPongSuperblock, SuperblockContents};
@@ -548,28 +550,20 @@ fn suspect_primary(group: u64, view: u32) -> MessageBag {
 #[compio::test]
 async fn given_pending_target_probe_when_metadata_authority_changes_should_not_grant_while_handler_suspends()
  {
-    // A suspect of the current view leaves this replica primary and ready
-    // while its handler waits on persistence, so only the fence refuses the
-    // reply. A suspect of a newer view moves the consensus view first.
-    for view in [METADATA_VIEW, METADATA_VIEW + 1] {
-        let superblock = Rc::new(HeldSuperblock::default());
-        let (shard, inbox) = owner_with_superblock(Some(Rc::clone(&superblock)));
-        let reply = arm(&shard, MovePhase::Probe);
-        let mut dispatch =
-            pin!(shard.dispatch_message(suspect_primary(METADATA_GROUP, view), None));
-        assert_eq!(futures::poll!(&mut dispatch), Poll::Pending, "view={view}");
-        assert!(superblock.entered.get(), "view={view}");
-        shard.on_primary_rebalance(reply).await;
-        assert!(
-            shard.bus.sent.borrow().is_empty(),
-            "view={view}: a reply handled during the suspension granted a move"
-        );
-        assert!(inbox.try_recv().is_err(), "view={view}");
-        assert!(
-            shard.primary_rebalance.borrow().pending.is_none(),
-            "view={view}"
-        );
-    }
+    let superblock = Rc::new(HeldSuperblock::default());
+    let (shard, inbox) = owner_with_superblock(Some(Rc::clone(&superblock)));
+    let reply = arm(&shard, MovePhase::Probe);
+    let mut dispatch =
+        pin!(shard.dispatch_message(suspect_primary(METADATA_GROUP, METADATA_VIEW + 1), None));
+    assert_eq!(futures::poll!(&mut dispatch), Poll::Pending);
+    assert!(superblock.entered.get());
+    shard.on_primary_rebalance(reply).await;
+    assert!(
+        shard.bus.sent.borrow().is_empty(),
+        "a reply handled during the suspension granted a move"
+    );
+    assert!(inbox.try_recv().is_err());
+    assert!(shard.primary_rebalance.borrow().pending.is_none());
 }
 
 #[derive(Default)]
@@ -592,35 +586,55 @@ impl SuperblockStore for HeldSuperblock {
 #[test]
 fn given_pending_move_when_unrelated_or_current_traffic_arrives_should_preserve_authority() {
     let partition_group = IggyNamespace::new(1, 1, 0).inner();
-    for (group, view, changes_view, should_revoke) in [
-        (partition_group, METADATA_VIEW + 1, true, false),
-        (METADATA_GROUP, METADATA_VIEW - 1, true, false),
-        (METADATA_GROUP, METADATA_VIEW, true, true),
-        (METADATA_GROUP, METADATA_VIEW, false, false),
-        (METADATA_GROUP, METADATA_VIEW + 1, false, true),
+    let cases = [
+        (partition_group, METADATA_VIEW + 1, false),
+        (METADATA_GROUP, METADATA_VIEW - 1, false),
+        // Includes a late vote for the view this replica already leads.
+        (METADATA_GROUP, METADATA_VIEW, false),
+        (METADATA_GROUP, METADATA_VIEW + 1, true),
+    ];
+    for command in [
+        Command::StartViewChange,
+        Command::DoViewChange,
+        Command::Commit,
     ] {
-        let (shard, _inbox) = owner();
-        arm(&shard, MovePhase::Transfer);
-        let message = if changes_view {
-            suspect_primary(group, view)
-        } else {
-            MessageBag::Commit(Message::<CommitHeader>::new(HEADER_SIZE).transmute_header(
-                |_, header: &mut CommitHeader| {
-                    header.cluster = CLUSTER;
-                    header.group = group;
-                    header.view = view;
-                    header.replica = 1;
-                    header.command = Command::Commit;
-                    header.size = u32::try_from(HEADER_SIZE).unwrap();
-                },
-            ))
-        };
-        shard.fence_rebalance_authority(&message);
-        assert_eq!(
-            shard.primary_rebalance.borrow().pending.is_none(),
-            should_revoke,
-            "group={group}, view={view}, changes_view={changes_view}"
-        );
+        for (group, view, should_revoke) in cases {
+            let (shard, _inbox) = owner();
+            arm(&shard, MovePhase::Transfer);
+            let message = match command {
+                Command::StartViewChange => suspect_primary(group, view),
+                Command::DoViewChange => MessageBag::DoViewChange(
+                    Message::<DoViewChangeHeader>::new(HEADER_SIZE).transmute_header(
+                        |_, header: &mut DoViewChangeHeader| {
+                            header.cluster = CLUSTER;
+                            header.group = group;
+                            header.view = view;
+                            header.replica = 1;
+                            header.command = command;
+                            header.size = u32::try_from(HEADER_SIZE).unwrap();
+                        },
+                    ),
+                ),
+                _ => {
+                    MessageBag::Commit(Message::<CommitHeader>::new(HEADER_SIZE).transmute_header(
+                        |_, header: &mut CommitHeader| {
+                            header.cluster = CLUSTER;
+                            header.group = group;
+                            header.view = view;
+                            header.replica = 1;
+                            header.command = command;
+                            header.size = u32::try_from(HEADER_SIZE).unwrap();
+                        },
+                    ))
+                }
+            };
+            shard.fence_rebalance_authority(&message);
+            assert_eq!(
+                shard.primary_rebalance.borrow().pending.is_none(),
+                should_revoke,
+                "group={group}, view={view}, command={command:?}"
+            );
+        }
     }
 }
 
