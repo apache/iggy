@@ -7263,6 +7263,7 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "async-trait",
+ "base64 0.23.1",
  "bytes",
  "crc32c",
  "flate2",
