@@ -37,7 +37,7 @@ use crate::{
 #[derive(Debug)]
 pub(crate) struct MultiTableRouter {
     schema_catalog: SchemaCatalog,
-    auto_create_tables: bool,
+    auto_create_table: bool,
     route_key: String,
 }
 
@@ -48,7 +48,7 @@ impl MultiTableRouter {
 
         Self {
             schema_catalog,
-            auto_create_tables: config.auto_create_table,
+            auto_create_table: config.auto_create_table,
             route_key: config.route_key.clone(),
         }
     }
@@ -63,7 +63,7 @@ impl MultiTableRouter {
             Some(schema) => schema,
             None => match self.schema_catalog.load_from_table(table, writer).await? {
                 Some(schema) => schema,
-                None if self.auto_create_tables => {
+                None if self.auto_create_table => {
                     self.schema_catalog
                         .infer_and_create_table(table, messages, writer)
                         .await?
@@ -71,7 +71,7 @@ impl MultiTableRouter {
                 None => {
                     return Err(Error::FailedToResolveSchema {
                         table_path: table.to_owned(),
-                        reason: "schema could not found in the fluss cluster and auto_create_tables is disabled".to_owned(),
+                        reason: "table was not found in the Fluss cluster and auto_create_table is disabled".to_owned(),
                     });
                 }
             },
@@ -403,6 +403,13 @@ mod tests {
         }
     }
 
+    fn auto_create_config() -> ResolvedFlussSinkConfig {
+        ResolvedFlussSinkConfig {
+            auto_create_table: true,
+            ..ResolvedFlussSinkConfig::default()
+        }
+    }
+
     fn run_async<T>(future: impl Future<Output = T>) -> T {
         tokio::runtime::Runtime::new()
             .expect("Tokio runtime should build")
@@ -547,7 +554,7 @@ mod tests {
 
     #[test]
     fn given_valid_and_invalid_messages_when_routing_should_cache_schema_and_count_results() {
-        let router = MultiTableRouter::new(&ResolvedFlussSinkConfig::default());
+        let router = MultiTableRouter::new(&auto_create_config());
         let writer = RecordingWriter::default();
         let mut non_json = json_message(5, r#"{"table":"fluss.orders","id":5}"#);
         non_json.payload = Payload::Text("not JSON".to_owned());
@@ -592,7 +599,7 @@ mod tests {
 
     #[test]
     fn given_multiple_tables_when_routing_should_accumulate_written_and_skipped_counts() {
-        let router = MultiTableRouter::new(&ResolvedFlussSinkConfig::default());
+        let router = MultiTableRouter::new(&auto_create_config());
         let writer = RecordingWriter::default();
         let messages = vec![
             json_message(1, r#"{"table":"fluss.orders","id":1}"#),
@@ -650,7 +657,7 @@ mod tests {
 
     #[test]
     fn given_create_failure_when_routing_should_return_catalog_error() {
-        let router = MultiTableRouter::new(&ResolvedFlussSinkConfig::default());
+        let router = MultiTableRouter::new(&auto_create_config());
         let writer = RecordingWriter {
             fail_create: true,
             ..RecordingWriter::default()
@@ -675,7 +682,7 @@ mod tests {
 
     #[test]
     fn given_write_failure_when_routing_should_return_writer_error() {
-        let router = MultiTableRouter::new(&ResolvedFlussSinkConfig::default());
+        let router = MultiTableRouter::new(&auto_create_config());
         let writer = RecordingWriter {
             failing_writes: vec![TablePath::new("fluss", "orders")],
             ..RecordingWriter::default()
@@ -696,7 +703,7 @@ mod tests {
 
     #[test]
     fn given_one_failing_table_when_routing_should_still_write_other_tables() {
-        let router = MultiTableRouter::new(&ResolvedFlussSinkConfig::default());
+        let router = MultiTableRouter::new(&auto_create_config());
         let writer = RecordingWriter {
             failing_writes: vec![TablePath::new("fluss", "orders")],
             ..RecordingWriter::default()
@@ -733,7 +740,7 @@ mod tests {
                     ..TableConfig::default()
                 },
             )]),
-            ..ResolvedFlussSinkConfig::default()
+            ..auto_create_config()
         };
         let router = MultiTableRouter::new(&config);
         let writer = RecordingWriter::default();

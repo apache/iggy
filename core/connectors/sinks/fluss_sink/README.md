@@ -80,7 +80,7 @@ fields are added because missing fields use the connector defaults.
 | `route_key`                | string | `"table"`         | JSON string field containing `database.table` in `multi` mode.                                                   |
 | `target_database`          | string | `"fluss"`         | Target database in `static` mode. The database must already exist.                                               |
 | `target_table`             | string | `"iggy_messages"` | Target table in `static` mode.                                                                                   |
-| `auto_create_table`        | bool   | `true`            | Create missing tables. The static table is checked at startup; multi-table targets are checked when first used.  |
+| `auto_create_table`        | bool   | `false`           | Create missing tables. The static table is checked at startup; multi-table targets are checked when first used.  |
 | `include_metadata`         | bool   | `true`            | Include Iggy offset, timestamp, stream, topic, and partition columns in an automatically created static table.   |
 | `include_checksum`         | bool   | `true`            | Include the checksum column in an automatically created static table.                                            |
 | `include_origin_timestamp` | bool   | `true`            | Include the origin timestamp column in an automatically created static table.                                    |

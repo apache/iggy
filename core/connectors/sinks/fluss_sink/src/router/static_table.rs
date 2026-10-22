@@ -95,7 +95,7 @@ impl StaticTableRouter {
             None => {
                 return Err(Error::Init {
                     reason: format!(
-                        "Table not found, but auto create is disable for default table {}",
+                        "Table {} was not found and auto_create_table is disabled",
                         self.table_path
                     ),
                 });
@@ -320,6 +320,7 @@ mod tests {
             target_database: "analytics".to_string(),
             target_table: "events".to_string(),
             payload_format: PayloadFormat::Text,
+            auto_create_table: true,
             ..ResolvedFlussSinkConfig::default()
         }
     }

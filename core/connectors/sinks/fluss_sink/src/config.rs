@@ -46,7 +46,7 @@ const DEFAULT_FLUSS_WRITER_RETRIES: i32 = 3;
 const DEFAULT_TARGET_DATABASE: &str = "fluss";
 const DEFAULT_TARGET_TABLE: &str = "iggy_messages";
 const DEFAULT_ROUTE_KEY: &str = "table";
-const DEFAULT_AUTO_CREATE_TABLE: bool = true;
+const DEFAULT_AUTO_CREATE_TABLE: bool = false;
 const DEFAULT_INCLUDE_METADATA: bool = true;
 const DEFAULT_INCLUDE_CHECKSUM: bool = true;
 const DEFAULT_INCLUDE_TIMESTAMP: bool = true;
@@ -464,6 +464,7 @@ mod tests {
         });
 
         assert!(!default_config.verbose_logging);
+        assert!(!default_config.auto_create_table);
         assert!(!explicit_config.auto_create_table);
         assert!(!explicit_config.include_metadata);
         assert!(explicit_config.verbose_logging);
