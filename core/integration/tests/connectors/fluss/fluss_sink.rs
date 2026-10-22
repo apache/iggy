@@ -26,13 +26,13 @@ use fluss::{
 use iggy::prelude::{Consumer, IggyMessage, Partitioning, PollingStrategy};
 use iggy_common::Identifier;
 use iggy_common::MessageClient;
-use integration::harness::seeds;
+use integration::harness::{TestHarness, seeds};
 use integration::iggy_harness;
 use tokio::time::{Instant, timeout_at};
 
 use crate::connectors::fixtures::{
     FlussMultiSinkFixture, FlussPartitionedSinkFixture, FlussPrimaryKeySinkFixture,
-    FlussSinkFixture,
+    FlussSinkFixture, poll_log_rows,
 };
 use crate::connectors::{TestMessage, create_test_messages};
 
@@ -53,6 +53,29 @@ const WAIT_TIMEOUT_S: u64 = 10;
 const AUTO_PARTITION_WAIT_TIMEOUT_S: u64 = 30;
 const MULTI_TABLE_DATABASE: &str = "fluss";
 const MULTI_TABLE_ROUTES: [&str; 2] = ["multi_table_events_a", "multi_table_events_b"];
+
+async fn send_messages(harness: &TestHarness, mut messages: Vec<IggyMessage>) {
+    let client = harness
+        .root_client()
+        .await
+        .expect("Root client should be available");
+    let stream_id: Identifier = seeds::names::STREAM
+        .try_into()
+        .expect("Stream identifier should be valid");
+    let topic_id: Identifier = seeds::names::TOPIC
+        .try_into()
+        .expect("Topic identifier should be valid");
+
+    client
+        .send_messages(
+            &stream_id,
+            &topic_id,
+            &Partitioning::partition_id(0),
+            &mut messages,
+        )
+        .await
+        .expect("Messages should be sent");
+}
 
 fn primary_key_message(
     message_id: u128,
@@ -154,45 +177,9 @@ fn expected_sink_schema() -> Schema {
     seed = seeds::connector_stream
 )]
 async fn sink_should_create_test_table_with_expected_schema(
-    harness: &TestHarness,
+    _harness: &TestHarness,
     fixture: FlussSinkFixture,
 ) {
-    let client = harness
-        .root_client()
-        .await
-        .expect("Root client should be available");
-
-    let stream_id: Identifier = seeds::names::STREAM
-        .try_into()
-        .expect("Stream identifier should be valid");
-    let topic_id: Identifier = seeds::names::TOPIC
-        .try_into()
-        .expect("Topic identifier should be valid");
-
-    let messages_data = create_test_messages(1);
-    let mut messages: Vec<IggyMessage> = messages_data
-        .iter()
-        .enumerate()
-        .map(|(i, msg)| {
-            let payload = serde_json::to_vec(msg).expect("Failed to serialize message");
-            IggyMessage::builder()
-                .id((i + 1) as u128)
-                .payload(Bytes::from(payload))
-                .build()
-                .expect("Failed to build message")
-        })
-        .collect();
-
-    client
-        .send_messages(
-            &stream_id,
-            &topic_id,
-            &Partitioning::partition_id(0),
-            &mut messages,
-        )
-        .await
-        .expect("Failed to send messages");
-
     fixture
         .wait_for_test_table(WAIT_TIMEOUT_S)
         .await
@@ -209,71 +196,10 @@ async fn sink_should_create_test_table_with_expected_schema(
     server(connectors_runtime(config_path = "tests/connectors/fluss/sink.toml")),
     seed = seeds::connector_stream
 )]
-async fn sink_should_write_message_to_test_table(harness: &TestHarness, fixture: FlussSinkFixture) {
-    let client = harness.root_client().await.expect("Client creation failed");
-
-    let stream_id: Identifier = seeds::names::STREAM
-        .try_into()
-        .expect("stream to identifier should not fail");
-    let topic_id: Identifier = seeds::names::TOPIC
-        .try_into()
-        .expect("topic to identifier should not fail");
-
-    let messages_data = create_test_messages(TEST_MESSAGE_COUNT);
-    let mut messages: Vec<IggyMessage> = messages_data
-        .iter()
-        .enumerate()
-        .map(|(i, msg)| {
-            let payload = serde_json::to_vec(msg).expect("Failed to serialize message");
-            IggyMessage::builder()
-                .id((i + 1) as u128)
-                .payload(Bytes::from(payload))
-                .build()
-                .expect("Failed to build message")
-        })
-        .collect();
-
-    client
-        .send_messages(
-            &stream_id,
-            &topic_id,
-            &Partitioning::partition_id(0),
-            &mut messages,
-        )
-        .await
-        .expect("Failed to send messages");
-
-    fixture
-        .wait_for_test_table(WAIT_TIMEOUT_S)
-        .await
-        .expect("Table has not found in time");
-
-    let messages = fixture
-        .read_from_test_table(TEST_MESSAGE_COUNT, WAIT_TIMEOUT_S)
-        .await
-        .expect("read messages");
-
-    assert_eq!(messages.len(), TEST_MESSAGE_COUNT);
-}
-
-#[iggy_harness(
-    server(connectors_runtime(config_path = "tests/connectors/fluss/sink.toml")),
-    seed = seeds::connector_stream
-)]
 async fn partitioned_table_sink_should_ingest_messages(
     harness: &TestHarness,
     fixture: FlussPartitionedSinkFixture,
 ) {
-    let client = harness
-        .root_client()
-        .await
-        .expect("Root client should be available");
-    let stream_id: Identifier = seeds::names::STREAM
-        .try_into()
-        .expect("Stream identifier should be valid");
-    let topic_id: Identifier = seeds::names::TOPIC
-        .try_into()
-        .expect("Topic identifier should be valid");
     let table_path = fixture.test_table_path();
     let current_time = humantime::format_rfc3339(SystemTime::now()).to_string();
     let event_day = current_time
@@ -281,7 +207,7 @@ async fn partitioned_table_sink_should_ingest_messages(
         .expect("RFC 3339 timestamp should contain a date")
         .0;
     let messages_data = create_test_messages(TEST_MESSAGE_COUNT);
-    let mut messages: Vec<IggyMessage> = messages_data
+    let messages: Vec<IggyMessage> = messages_data
         .iter()
         .enumerate()
         .map(|(index, message)| {
@@ -299,15 +225,7 @@ async fn partitioned_table_sink_should_ingest_messages(
         })
         .collect();
 
-    client
-        .send_messages(
-            &stream_id,
-            &topic_id,
-            &Partitioning::partition_id(0),
-            &mut messages,
-        )
-        .await
-        .expect("Messages should be sent");
+    send_messages(harness, messages).await;
 
     fixture
         .wait_for_test_table(WAIT_TIMEOUT_S)
@@ -386,7 +304,7 @@ async fn sink_should_preserve_extra_fields_and_payload_in_rows(
         .expect("Topic identifier should be valid");
 
     let expected_messages = create_test_messages(ROW_COMPARISON_MESSAGE_COUNT as usize);
-    let mut messages: Vec<IggyMessage> = expected_messages
+    let messages: Vec<IggyMessage> = expected_messages
         .iter()
         .enumerate()
         .map(|(index, message)| {
@@ -400,15 +318,7 @@ async fn sink_should_preserve_extra_fields_and_payload_in_rows(
         })
         .collect();
 
-    client
-        .send_messages(
-            &stream_id,
-            &topic_id,
-            &Partitioning::partition_id(0),
-            &mut messages,
-        )
-        .await
-        .expect("Messages should be sent");
+    send_messages(harness, messages).await;
 
     let polled_messages = client
         .poll_messages(
@@ -504,40 +414,14 @@ async fn multi_table_sink_should_upsert_primary_key_rows(
         .expect("Primary-key Fluss test table should be available");
     assert!(table_info.has_primary_key());
 
-    let client = harness
-        .root_client()
-        .await
-        .expect("Root client should be available");
-    let stream_id: Identifier = seeds::names::STREAM
-        .try_into()
-        .expect("Stream identifier should be valid");
-    let topic_id: Identifier = seeds::names::TOPIC
-        .try_into()
-        .expect("Topic identifier should be valid");
     let table_path = fixture.test_table_path();
-    let mut messages = vec![primary_key_message(1, &table_path, 42, Some("before"), "u")];
+    let messages = vec![primary_key_message(1, &table_path, 42, Some("before"), "u")];
 
-    client
-        .send_messages(
-            &stream_id,
-            &topic_id,
-            &Partitioning::partition_id(0),
-            &mut messages,
-        )
-        .await
-        .expect("Initial primary-key message should be sent");
+    send_messages(harness, messages).await;
     wait_for_primary_key_value(&fixture, 42, Some("before")).await;
 
-    let mut messages = vec![primary_key_message(2, &table_path, 42, Some("after"), "u")];
-    client
-        .send_messages(
-            &stream_id,
-            &topic_id,
-            &Partitioning::partition_id(0),
-            &mut messages,
-        )
-        .await
-        .expect("Updated primary-key message should be sent");
+    let messages = vec![primary_key_message(2, &table_path, 42, Some("after"), "u")];
+    send_messages(harness, messages).await;
     wait_for_primary_key_value(&fixture, 42, Some("after")).await;
 }
 
@@ -549,18 +433,8 @@ async fn multi_table_sink_should_delete_primary_key_rows(
     harness: &TestHarness,
     fixture: FlussPrimaryKeySinkFixture,
 ) {
-    let client = harness
-        .root_client()
-        .await
-        .expect("Root client should be available");
-    let stream_id: Identifier = seeds::names::STREAM
-        .try_into()
-        .expect("Stream identifier should be valid");
-    let topic_id: Identifier = seeds::names::TOPIC
-        .try_into()
-        .expect("Topic identifier should be valid");
     let table_path = fixture.test_table_path();
-    let mut messages = vec![primary_key_message(
+    let messages = vec![primary_key_message(
         1,
         &table_path,
         42,
@@ -568,27 +442,11 @@ async fn multi_table_sink_should_delete_primary_key_rows(
         "u",
     )];
 
-    client
-        .send_messages(
-            &stream_id,
-            &topic_id,
-            &Partitioning::partition_id(0),
-            &mut messages,
-        )
-        .await
-        .expect("Initial primary-key message should be sent");
+    send_messages(harness, messages).await;
     wait_for_primary_key_value(&fixture, 42, Some("delete-me")).await;
 
-    let mut messages = vec![primary_key_message(2, &table_path, 42, None, "d")];
-    client
-        .send_messages(
-            &stream_id,
-            &topic_id,
-            &Partitioning::partition_id(0),
-            &mut messages,
-        )
-        .await
-        .expect("Delete primary-key message should be sent");
+    let messages = vec![primary_key_message(2, &table_path, 42, None, "d")];
+    send_messages(harness, messages).await;
     wait_for_primary_key_value(&fixture, 42, None).await;
 }
 
@@ -600,19 +458,9 @@ async fn json_messages_sink_creates_inferred_tables_and_routes_rows(
     harness: &TestHarness,
     fixture: FlussMultiSinkFixture,
 ) {
-    let client = harness
-        .root_client()
-        .await
-        .expect("Root client should be available");
-    let stream_id: Identifier = seeds::names::STREAM
-        .try_into()
-        .expect("Stream identifier should be valid");
-    let topic_id: Identifier = seeds::names::TOPIC
-        .try_into()
-        .expect("Topic identifier should be valid");
     let table_paths = MULTI_TABLE_ROUTES.map(|route| TablePath::new(MULTI_TABLE_DATABASE, route));
 
-    let mut messages: Vec<IggyMessage> = (0..TEST_MESSAGE_COUNT)
+    let messages: Vec<IggyMessage> = (0..TEST_MESSAGE_COUNT)
         .map(|index| {
             let event_id = i64::try_from(index).expect("Test event ID should fit in i64");
             let score =
@@ -659,15 +507,7 @@ async fn json_messages_sink_creates_inferred_tables_and_routes_rows(
         })
         .collect();
 
-    client
-        .send_messages(
-            &stream_id,
-            &topic_id,
-            &Partitioning::partition_id(0),
-            &mut messages,
-        )
-        .await
-        .expect("Messages should be sent");
+    send_messages(harness, messages).await;
 
     let connection = fixture
         .get_fluss_connection()
@@ -745,14 +585,9 @@ async fn json_messages_sink_creates_inferred_tables_and_routes_rows(
             .expect("Multi-table log scanner should subscribe");
 
         let row_read_deadline = Instant::now() + Duration::from_secs(WAIT_TIMEOUT_S);
-        let mut rows = Vec::with_capacity(expected_rows_per_table);
-        while rows.len() < expected_rows_per_table {
-            let records = timeout_at(row_read_deadline, log_scanner.poll(Duration::from_secs(1)))
-                .await
-                .expect("All routed rows should arrive before the timeout")
-                .expect("Routed rows should be readable");
-            rows.extend(records.into_iter().map(|record| record.row));
-        }
+        let mut rows = poll_log_rows(&log_scanner, expected_rows_per_table, row_read_deadline)
+            .await
+            .expect("Routed rows should be readable");
 
         assert_eq!(rows.len(), expected_rows_per_table);
         rows.sort_by_key(|row| {

@@ -23,7 +23,7 @@ use super::cluster::FlussCluster;
 use async_trait::async_trait;
 use fluss::row::{ColumnarRow, DataGetters, GenericRow};
 use fluss::{
-    client::{EARLIEST_OFFSET, FlussConnection},
+    client::{EARLIEST_OFFSET, FlussConnection, LogScanner},
     metadata::{DataTypes, Schema, TableDescriptor, TableInfo, TablePath},
 };
 use integration::harness::{TestBinaryError, TestFixture, seeds};
@@ -49,6 +49,29 @@ const ENV_SINK_PATH: &str = "IGGY_CONNECTORS_SINK_FLUSS_PATH";
 
 fn create_test_table_path(table_name: &str) -> TablePath {
     TablePath::new(DEFAULT_SINK_DB, table_name)
+}
+
+/// Polls an already subscribed scanner until `expected_row_count` rows arrive or
+/// the deadline passes, and returns whatever arrived.
+pub async fn poll_log_rows(
+    log_scanner: &LogScanner,
+    expected_row_count: usize,
+    deadline: Instant,
+) -> Result<Vec<ColumnarRow>, TestBinaryError> {
+    let mut rows = Vec::with_capacity(expected_row_count);
+    while rows.len() < expected_row_count {
+        let records = match timeout_at(deadline, log_scanner.poll(Duration::from_secs(1))).await {
+            Ok(Ok(records)) => records,
+            Ok(Err(error)) => {
+                return Err(fixture_error(format!(
+                    "Failed to poll log scanner: {error}"
+                )));
+            }
+            Err(_) => break,
+        };
+        rows.extend(records.into_iter().map(|record| record.row));
+    }
+    Ok(rows)
 }
 
 pub struct FlussSinkFixture {
@@ -113,26 +136,7 @@ impl FlussSinkFixture {
             .map_err(|e| fixture_error(format!("Failed to subscribe to log scanner: {}", e)))?;
 
         let deadline = Instant::now() + Duration::from_secs(timeout);
-
-        let mut rows = Vec::with_capacity(expected_row_count);
-
-        loop {
-            let records = match timeout_at(deadline, log_scanner.poll(Duration::from_secs(5))).await
-            {
-                Ok(Err(e)) => {
-                    return Err(fixture_error(format!("Failed to poll log scanner: {}", e)));
-                }
-                Ok(Ok(records)) => records,
-                Err(_) => break,
-            };
-
-            rows.extend(records.into_iter().map(|record| record.row));
-            if rows.len() >= expected_row_count {
-                return Ok(rows);
-            }
-        }
-
-        Ok(rows)
+        poll_log_rows(&log_scanner, expected_row_count, deadline).await
     }
 
     pub async fn check_if_test_table_exists(&self) -> Result<bool, TestBinaryError> {
@@ -393,26 +397,7 @@ impl FlussPartitionedSinkFixture {
         }
 
         let deadline = Instant::now() + Duration::from_secs(timeout);
-        let mut rows = Vec::with_capacity(expected_row_count);
-        loop {
-            let records = match timeout_at(deadline, log_scanner.poll(Duration::from_secs(5))).await
-            {
-                Ok(Err(error)) => {
-                    return Err(fixture_error(format!(
-                        "Failed to poll partitioned log scanner: {error}"
-                    )));
-                }
-                Ok(Ok(records)) => records,
-                Err(_) => break,
-            };
-
-            rows.extend(records.into_iter().map(|record| record.row));
-            if rows.len() >= expected_row_count {
-                return Ok(rows);
-            }
-        }
-
-        Ok(rows)
+        poll_log_rows(&log_scanner, expected_row_count, deadline).await
     }
 }
 

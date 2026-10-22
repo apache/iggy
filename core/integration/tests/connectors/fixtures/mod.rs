@@ -66,7 +66,7 @@ pub use doris::{
 pub use elasticsearch::{ElasticsearchSinkFixture, ElasticsearchSourcePreCreatedFixture};
 pub use fluss::{
     FlussMultiSinkFixture, FlussPartitionedSinkFixture, FlussPrimaryKeySinkFixture,
-    FlussSinkFixture,
+    FlussSinkFixture, poll_log_rows,
 };
 pub use http::{
     GITHUB_ENDPOINT_ID, GITHUB_HMAC_HEADER, GITHUB_INSTANCE, HttpSinkIndividualFixture,

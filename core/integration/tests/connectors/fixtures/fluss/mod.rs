@@ -21,7 +21,7 @@ mod sink;
 use integration::harness::TestBinaryError;
 pub use sink::{
     FlussMultiSinkFixture, FlussPartitionedSinkFixture, FlussPrimaryKeySinkFixture,
-    FlussSinkFixture,
+    FlussSinkFixture, poll_log_rows,
 };
 
 fn fixture_error(message: String) -> TestBinaryError {
