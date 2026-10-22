@@ -305,7 +305,8 @@ rmcp = "3.5.1"
 rmp = "0.8.15"
 rmp-serde = "1.3.1"
 rolling-file = "0.2.0"
-rumqttc = { version = "0.25.1", features = ["url"] }
+rumqttc-v4 = { package = "rumqttc-v4-next", version = "0.34.0", features = ["url"] }
+rumqttc-v5 = { package = "rumqttc-v5-next", version = "0.34.0", features = ["url"] }
 rust-embed = "8.13.0"
 rust-s3 = { version = "0.38.0", default-features = false, features = ["tokio-rustls-tls", "tags"] }
 rustls = { version = "0.23.46", features = ["ring"] }

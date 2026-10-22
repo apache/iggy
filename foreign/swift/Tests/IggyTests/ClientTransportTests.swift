@@ -987,7 +987,9 @@ struct ClientTransportTests {
         let client = makeClient(server, requestTimeout: shortTimeout)
         try await client.connect()
         await server.stop()
-        await expectCode(.notConnected) { try await client.ping() }
+        // A ping written before the client sees the close fails as not connected,
+        // one sent after it spends the deadline reconnecting and fails as disconnected.
+        await expectCode(.notConnected, .disconnected) { try await client.ping() }
         #expect(await eventually { await client.state == .disconnected })
 
         let revived = FakeVSRServer()
