@@ -1512,6 +1512,64 @@ class AsyncIggyTcpClientRecoveryTest {
         }
     }
 
+    /**
+     * A node refuses the first write with 89 and drops its link. The next link finds the session lost: the node
+     * refuses its bind, and the sign-in gets a new session. No node admitted the write, so it goes out again under
+     * that session with a new request id and does not end uncertain.
+     */
+    @Test
+    void shouldSendARefusedWriteAgainUnderTheNextSessionWhenTheSessionIsLostBeforeItsRetry() throws Exception {
+        // The link that refuses the write and the link that finds the session lost.
+        int connections = 2;
+        try (ServerSocket socket = new ServerSocket(0, connections, InetAddress.getLoopbackAddress())) {
+            List<Request> registers = new CopyOnWriteArrayList<>();
+            List<Request> writes = new CopyOnWriteArrayList<>();
+            var server = serve(socket, connections, request -> {
+                if (request.operation() == VsrOperation.REGISTER) {
+                    registers.add(request);
+                    return Response.success(VsrOperation.REGISTER, registerBody(registers.size()));
+                }
+                if (request.commandCode() == CommandCode.System.BIND_SESSION.getValue()) {
+                    return Response.error(VsrOperation.NON_REPLICATED, IggyErrorCode.UNAUTHENTICATED.getCode());
+                }
+                if (request.commandCode() == CommandCode.System.GET_CLUSTER_METADATA.getValue()) {
+                    return Response.success(VsrOperation.NON_REPLICATED, singleNodeMetadata(socket.getLocalPort()));
+                }
+                if (request.operation() != VsrOperation.DELETE_STREAM) {
+                    throw new IllegalStateException("Unexpected request " + request);
+                }
+                writes.add(request);
+                return writes.size() == 1
+                        ? Response.errorAndDisconnect(VsrOperation.DELETE_STREAM, AsyncTcpConnection.NOT_PRIMARY)
+                        : Response.committed(
+                                VsrOperation.DELETE_STREAM, 2, Unpooled.buffer().writeIntLE(0));
+            });
+            AsyncIggyTcpClient client = AsyncIggyTcpClient.builder()
+                    .host(socket.getInetAddress().getHostAddress())
+                    .port(socket.getLocalPort())
+                    .credentials("iggy", "iggy")
+                    .requestTimeout(Duration.ofSeconds(2))
+                    .heartbeatInterval(Duration.ofHours(1))
+                    .build();
+            try {
+                client.connect().get(5, TimeUnit.SECONDS);
+                client.login().get(5, TimeUnit.SECONDS);
+
+                writeMutation(client, false).get(5, TimeUnit.SECONDS);
+
+                assertThat(registers).hasSize(2);
+                assertThat(writes).hasSize(2);
+                Request retried = writes.get(1);
+                assertThat(retried.requestId()).isNotEqualTo(writes.get(0).requestId());
+                assertThat(retried.clientLow()).isEqualTo(registers.get(1).clientLow());
+                assertThat(retried.clientHigh()).isEqualTo(registers.get(1).clientHigh());
+            } finally {
+                client.close().get(5, TimeUnit.SECONDS);
+            }
+            server.get(5, TimeUnit.SECONDS);
+        }
+    }
+
     /** The outcome of a resolve as text: the reply body of a commit, or the type and code of its error. */
     private static String outcome(CompletableFuture<byte[]> resolved) throws Exception {
         try {

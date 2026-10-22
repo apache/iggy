@@ -903,6 +903,16 @@ public final class ConsensusSession {
             }
         }
 
+        /**
+         * After a 58 or 89 refusal, counts the frame as sent only while an earlier attempt can have taken effect, as
+         * in Rust. So a call that no node admitted starts again under a new session instead of ending uncertain.
+         */
+        public void settleSent(boolean uncertain) {
+            synchronized (owner) {
+                sent = uncertain;
+            }
+        }
+
         public void finishWrite() {
             synchronized (owner) {
                 writers--;

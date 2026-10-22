@@ -1365,6 +1365,9 @@ public class AsyncTcpConnection {
                                 && exchange.failoverState().ticket != null));
         exchange.failoverState().uncertain = nextUncertain;
         exchange.failoverState().everUncertain |= wasUncertain || nextUncertain;
+        if (exchange.failoverState().ticket != null && isRefusal(serverError)) {
+            exchange.failoverState().ticket.settleSent(nextUncertain);
+        }
         if (shouldRetryTransient(
                         exchange.commandCode(),
                         error,

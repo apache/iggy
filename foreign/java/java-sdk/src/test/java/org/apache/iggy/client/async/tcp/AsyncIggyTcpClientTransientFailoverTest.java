@@ -1982,6 +1982,10 @@ class AsyncIggyTcpClientTransientFailoverTest {
             return new Response(COMMAND_REPLY, operation, 0, 0, 0, body, true);
         }
 
+        static Response errorAndDisconnect(int operation, int status) {
+            return new Response(COMMAND_REPLY, operation, status, 0, 0, Unpooled.EMPTY_BUFFER, true);
+        }
+
         /** A committed reply whose proof names another request. */
         static Response unproved(int operation, ByteBuf body) {
             return new Response(COMMAND_REPLY, operation, 0, 0, 0, body, false, true);
