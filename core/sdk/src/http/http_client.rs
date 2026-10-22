@@ -434,7 +434,8 @@ fn may_have_committed(result: &Result<Response, reqwest_middleware::Error>) -> b
 }
 
 /// Decodes the refusals the client acts on: a producer never repeats `RequestTooOld`, a send
-/// refreshes its context once on `HistoryUnavailable`, and `LifecycleBusy` is retried.
+/// refreshes its context once on `HistoryUnavailable`, `LifecycleBusy` is retried, and
+/// `TransientNotAccepted` proves that the last attempt was admitted nowhere.
 fn typed_refusal(body: &str) -> Option<IggyError> {
     #[derive(Deserialize)]
     struct ErrorId {
@@ -445,6 +446,7 @@ fn typed_refusal(body: &str) -> Option<IggyError> {
         IggyError::RequestTooOld,
         IggyError::HistoryUnavailable,
         IggyError::LifecycleBusy,
+        IggyError::TransientNotAccepted,
     ]
     .into_iter()
     .find(|error| error.as_code() == id)
@@ -596,6 +598,7 @@ mod tests {
             IggyError::RequestTooOld,
             IggyError::HistoryUnavailable,
             IggyError::LifecycleBusy,
+            IggyError::TransientNotAccepted,
         ] {
             let body = format!(r#"{{"id":{},"reason":"unavailable"}}"#, error.as_code());
             assert_eq!(typed_refusal(&body), Some(error));

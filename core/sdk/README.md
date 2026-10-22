@@ -122,6 +122,9 @@ credentials only if the caller never signed in. Logout disables automatic sign-i
 HTTP 503 `relay_refused` uses the configured HTTP retry policy, regardless of
 its body code. Rust's HTTP retry schedule does not use the server's `Retry-After`
 header. This retry support does not provide retained-operation recovery.
+If the last 503 body carries code 58, the call returns `TransientNotAccepted`.
+A write that possibly committed, for example after a 504 or a lost reply, is
+not sent again and returns `TransientNotCommitted`.
 
 A committed password change or rename of the signed-in user updates the
 credentials that the client signs in with again. This holds for a typed call, a
