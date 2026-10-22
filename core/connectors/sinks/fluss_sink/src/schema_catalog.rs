@@ -84,12 +84,9 @@ pub(crate) struct SchemaCatalog {
 }
 
 impl SchemaCatalog {
-    pub(crate) fn new(
-        table_to_entry: Mutex<HashMap<TablePath, Arc<SchemaEntry>>>,
-        table_config: HashMap<String, TableConfig>,
-    ) -> Self {
+    pub(crate) fn new(table_config: HashMap<String, TableConfig>) -> Self {
         Self {
-            table_to_entry,
+            table_to_entry: Mutex::default(),
             table_config,
         }
     }
@@ -304,7 +301,7 @@ mod tests {
     use super::{Error, SchemaCatalog, sample_and_infer_schema, table_descriptor_from_schema};
     use crate::{
         config::TableConfig,
-        writer::{Op, Stat, TableWriter, WriterError},
+        writer::{Stat, TableWriter, WriterError},
     };
 
     #[derive(Default)]
@@ -320,7 +317,6 @@ mod tests {
             &self,
             _table_path: &TablePath,
             _table_descriptor: &TableDescriptor,
-            _op: Op,
             _batch: arrow::record_batch::RecordBatch,
         ) -> Result<Stat, WriterError> {
             unreachable!("schema catalog does not write rows")
@@ -612,16 +608,13 @@ mod tests {
     #[test]
     fn given_invalid_primary_key_when_inferring_should_not_create_or_cache_table() {
         let table = TablePath::new("fluss", "orders");
-        let catalog = SchemaCatalog::new(
-            Mutex::new(HashMap::new()),
-            HashMap::from([(
-                table.to_string(),
-                TableConfig {
-                    primary_keys: Some(vec!["missing".to_owned()]),
-                    ..TableConfig::default()
-                },
-            )]),
-        );
+        let catalog = SchemaCatalog::new(HashMap::from([(
+            table.to_string(),
+            TableConfig {
+                primary_keys: Some(vec!["missing".to_owned()]),
+                ..TableConfig::default()
+            },
+        )]));
         let writer = RecordingWriter::default();
         let messages = [json_message(1, r#"{"id":1}"#)];
 

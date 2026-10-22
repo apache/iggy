@@ -31,7 +31,7 @@ use crate::{
         self, ColumnKind, RowContext, StaticTableBatchBuilder, StaticTableDescriptorBuilder,
         StaticTableLayout, create_extra_columns,
     },
-    writer::{Op, Stat, TableWriter},
+    writer::{Stat, TableWriter},
 };
 
 #[derive(Debug)]
@@ -134,7 +134,7 @@ impl StaticTableRouter {
             self.schema_catalog.get_schema_entry(&self.table_path),
             self.layout.as_ref(),
         ) else {
-            stat.inc_err_by(message_count as u64);
+            stat.errors += message_count as u64;
             return RouteOutcome {
                 stat,
                 last_error: Some(Error::Init {
@@ -149,7 +149,7 @@ impl StaticTableRouter {
                 error!(
                     "FlussSink: Can not add record to batch builder, skipping message because of error: [{error}]"
                 );
-                stat.inc_err();
+                stat.errors += 1;
                 last_error = Some(Error::FailedToAddToRecordBatch {
                     reason: error.to_string(),
                 });
@@ -159,7 +159,7 @@ impl StaticTableRouter {
         let record_batch = match builder.finish() {
             Ok(batch) => batch,
             Err(error) => {
-                stat.inc_err_by(message_count as u64 - stat.errors);
+                stat.errors += message_count as u64 - stat.errors;
                 return RouteOutcome {
                     stat,
                     last_error: Some(Error::FailedToCreateRecordBatch {
@@ -169,25 +169,18 @@ impl StaticTableRouter {
             }
         };
 
-        let op = if schema_entry.table_descriptor.has_primary_key() {
-            Op::UpsertOrDelete
-        } else {
-            Op::Append
-        };
-
         let batch_rows = record_batch.num_rows();
         let write_stat = match writer
             .write_to_table(
                 &self.table_path,
                 &schema_entry.table_descriptor,
-                op,
                 record_batch,
             )
             .await
         {
             Ok(write_stat) => write_stat,
             Err(error) => {
-                stat.inc_err_by(batch_rows as u64);
+                stat.errors += batch_rows as u64;
                 return RouteOutcome {
                     stat,
                     last_error: Some(error.into()),
@@ -195,7 +188,7 @@ impl StaticTableRouter {
             }
         };
 
-        stat = stat.add(write_stat);
+        stat += write_stat;
         RouteOutcome { stat, last_error }
     }
 
@@ -227,7 +220,7 @@ mod tests {
     use crate::{
         PayloadFormat, ResolvedFlussSinkConfig,
         router::RouteOutcome,
-        writer::{Op, Stat, TableWriter, WriterError},
+        writer::{Stat, TableWriter, WriterError},
     };
 
     const MESSAGE_TIMESTAMP: u64 = 1_700_000_000_123_456;
@@ -241,7 +234,7 @@ mod tests {
     struct TableWrite {
         table_path: TablePath,
         batch: RecordBatch,
-        op: Op,
+        has_primary_key: bool,
     }
 
     #[derive(Default)]
@@ -257,8 +250,7 @@ mod tests {
         async fn write_to_table(
             &self,
             table_path: &TablePath,
-            _table_descriptor: &TableDescriptor,
-            op: Op,
+            table_descriptor: &TableDescriptor,
             batch: RecordBatch,
         ) -> Result<Stat, WriterError> {
             if self.fail_table_write {
@@ -272,11 +264,11 @@ mod tests {
                 .push(TableWrite {
                     table_path: table_path.clone(),
                     batch,
-                    op,
+                    has_primary_key: table_descriptor.has_primary_key(),
                 });
             let mut stat = Stat::default();
-            stat.inc_appended_by(row_count as u64 - self.skipped_rows);
-            stat.inc_err_by(self.skipped_rows);
+            stat.appended += row_count as u64 - self.skipped_rows;
+            stat.errors += self.skipped_rows;
             Ok(stat)
         }
 
@@ -586,8 +578,7 @@ mod tests {
             .expect("Table writes lock should not be poisoned");
         assert_eq!(table_writes.len(), 1);
 
-        let op = &table_writes[0].op;
-        assert_eq!(op, &Op::Append);
+        assert!(!table_writes[0].has_primary_key);
     }
 
     #[test]

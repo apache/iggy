@@ -121,7 +121,7 @@ impl Sink for FlussSink {
         {
             let mut state = self.state.lock().await;
             state.insertion_errors += stat.errors;
-            state.messages_processed += stat.appended + stat.inserted + stat.deleted;
+            state.messages_processed += stat.appended + stat.deleted;
         }
 
         if let Some(error) = last_error {

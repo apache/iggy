@@ -17,6 +17,7 @@
 
 use std::{
     fmt::{self},
+    ops::AddAssign,
     sync::Arc,
     time::Duration,
 };
@@ -221,45 +222,15 @@ impl fmt::Display for RowOp {
 pub(crate) struct Stat {
     pub(crate) errors: u64,
     pub(crate) appended: u64,
-    pub(crate) inserted: u64,
     pub(crate) deleted: u64,
 }
 
-impl Stat {
-    pub(crate) fn add(self, other: Self) -> Self {
-        Self {
-            errors: self.errors + other.errors,
-            appended: self.appended + other.appended,
-            inserted: self.inserted + other.inserted,
-            deleted: self.deleted + other.deleted,
-        }
+impl AddAssign for Stat {
+    fn add_assign(&mut self, other: Self) {
+        self.errors += other.errors;
+        self.appended += other.appended;
+        self.deleted += other.deleted;
     }
-
-    pub(crate) fn inc_err(&mut self) {
-        self.errors += 1;
-    }
-
-    pub(crate) fn inc_err_by(&mut self, count: u64) {
-        self.errors += count;
-    }
-
-    pub(crate) fn inc_appended(&mut self) {
-        self.appended += 1;
-    }
-
-    pub(crate) fn inc_appended_by(&mut self, count: u64) {
-        self.appended += count;
-    }
-
-    pub(crate) fn inc_deleted(&mut self) {
-        self.deleted += 1;
-    }
-}
-
-#[derive(Eq, PartialEq, Debug)]
-pub(crate) enum Op {
-    Append,
-    UpsertOrDelete,
 }
 
 pub(crate) trait TableWriter {
@@ -267,7 +238,6 @@ pub(crate) trait TableWriter {
         &self,
         table_path: &TablePath,
         table_descriptor: &TableDescriptor,
-        op: Op,
         batch: RecordBatch,
     ) -> Result<Stat, WriterError>;
 
@@ -351,9 +321,9 @@ impl FlussWriter {
         self.flush_appender(&writer, table_path).await?;
         let mut stat = Stat::default();
         match pending.await {
-            Ok(()) => stat.inc_appended_by(rows as u64),
+            Ok(()) => stat.appended += rows as u64,
             Err(error) => {
-                stat.inc_err_by(rows as u64);
+                stat.errors += rows as u64;
                 warn!(
                     "FlussSink: Failed to append {rows} rows to table '{table_path}' because of: {error}"
                 );
@@ -381,7 +351,7 @@ impl FlussWriter {
                     warn!(
                         "FlussSink: Failed to enqueue row {i} for append in table '{table_path}' because of: {error}"
                     );
-                    stat.inc_err();
+                    stat.errors += 1;
                 }
             }
         }
@@ -389,12 +359,12 @@ impl FlussWriter {
 
         for (i, future) in pending {
             match future.await {
-                Ok(()) => stat.inc_appended(),
+                Ok(()) => stat.appended += 1,
                 Err(error) => {
                     warn!(
                         "FlussSink: Row {i} rejected for append in table '{table_path}' because of: {error}"
                     );
-                    stat.inc_err();
+                    stat.errors += 1;
                 }
             }
         }
@@ -433,7 +403,7 @@ impl FlussWriter {
             match result {
                 Ok(future) => pending.push((row_op, i, future)),
                 Err(error) => {
-                    stat.inc_err();
+                    stat.errors += 1;
                     warn!(
                         "FlussSink: Failed to enqueue row {i} for {row_op} in table '{table_path}' because of: {error}"
                     );
@@ -444,13 +414,13 @@ impl FlussWriter {
 
         for (row_op, i, future) in pending {
             match (row_op, future.await) {
-                (RowOp::Delete, Ok(())) => stat.inc_deleted(),
-                (RowOp::Upsert, Ok(())) => stat.inc_appended(),
+                (RowOp::Delete, Ok(())) => stat.deleted += 1,
+                (RowOp::Upsert, Ok(())) => stat.appended += 1,
                 (_, Err(error)) => {
                     warn!(
                         "FlussSink: Row {i} rejected for {row_op} in table '{table_path}' because of: {error}"
                     );
-                    stat.inc_err();
+                    stat.errors += 1;
                 }
             }
         }
@@ -590,23 +560,17 @@ impl TableWriter for FlussWriter {
         &self,
         table_path: &TablePath,
         table_descriptor: &TableDescriptor,
-        op: Op,
         batch: RecordBatch,
     ) -> Result<Stat, WriterError> {
-        match op {
-            Op::Append => {
-                if table_descriptor.is_partitioned() {
-                    // fallback to rows if table is partitioned
-                    self.append_record_batch_as_rows(table_path, table_descriptor, batch)
-                        .await
-                } else {
-                    self.append_record_batch(table_path, batch).await
-                }
-            }
-            Op::UpsertOrDelete => {
-                self.upsert_or_delete_arrow_batch_as_rows(table_path, table_descriptor, batch)
-                    .await
-            }
+        if table_descriptor.has_primary_key() {
+            self.upsert_or_delete_arrow_batch_as_rows(table_path, table_descriptor, batch)
+                .await
+        } else if table_descriptor.is_partitioned() {
+            // fallback to rows if table is partitioned
+            self.append_record_batch_as_rows(table_path, table_descriptor, batch)
+                .await
+        } else {
+            self.append_record_batch(table_path, batch).await
         }
     }
 

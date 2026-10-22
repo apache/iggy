@@ -26,7 +26,7 @@ use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use fluss::{
     error::Error as FlussError,
-    metadata::{Column, TableDescriptor},
+    metadata::{Column, DataTypes, TableDescriptor},
 };
 use iggy_connector_sdk::{ConsumedMessage, Error as IggyError, Payload};
 use thiserror::Error;
@@ -174,37 +174,19 @@ impl ColumnKind {
 
 impl From<ColumnKind> for Column {
     fn from(column: ColumnKind) -> Self {
-        let name = column.name();
-        match column {
-            ColumnKind::MessageId => Column::new(name, fluss::metadata::DataTypes::string())
-                .with_comment("Apache Iggy message ID"),
-            ColumnKind::Checksum => Column::new(
-                name,
-                fluss::metadata::DataTypes::decimal(UNSIGNED_64_DECIMAL_PRECISION as u32, 0),
-            )
-            .with_comment("Apache Iggy message checksum"),
-            ColumnKind::MessageTimestamp => Column::new(
-                name,
-                fluss::metadata::DataTypes::timestamp_ltz_with_precision(TIMESTAMP_PRECISION),
-            )
-            .with_comment("Apache Iggy message timestamp"),
-            ColumnKind::OriginTimestamp => Column::new(
-                name,
-                fluss::metadata::DataTypes::timestamp_ltz_with_precision(TIMESTAMP_PRECISION),
-            )
-            .with_comment("Apache Iggy message origin timestamp"),
-            ColumnKind::MessageOffset => Column::new(
-                name,
-                fluss::metadata::DataTypes::decimal(UNSIGNED_64_DECIMAL_PRECISION as u32, 0),
-            )
-            .with_comment("Apache Iggy message offset"),
-            ColumnKind::Stream => Column::new(name, fluss::metadata::DataTypes::string())
-                .with_comment("Apache Iggy stream name"),
-            ColumnKind::Topic => Column::new(name, fluss::metadata::DataTypes::string())
-                .with_comment("Apache Iggy topic name"),
-            ColumnKind::PartitionId => Column::new(name, fluss::metadata::DataTypes::bigint())
-                .with_comment("Apache Iggy partition ID"),
-        }
+        let unsigned_64 = DataTypes::decimal(UNSIGNED_64_DECIMAL_PRECISION as u32, 0);
+        let timestamp = DataTypes::timestamp_ltz_with_precision(TIMESTAMP_PRECISION);
+        let (data_type, comment) = match column {
+            ColumnKind::MessageId => (DataTypes::string(), "Apache Iggy message ID"),
+            ColumnKind::Checksum => (unsigned_64, "Apache Iggy message checksum"),
+            ColumnKind::MessageTimestamp => (timestamp, "Apache Iggy message timestamp"),
+            ColumnKind::OriginTimestamp => (timestamp, "Apache Iggy message origin timestamp"),
+            ColumnKind::MessageOffset => (unsigned_64, "Apache Iggy message offset"),
+            ColumnKind::Stream => (DataTypes::string(), "Apache Iggy stream name"),
+            ColumnKind::Topic => (DataTypes::string(), "Apache Iggy topic name"),
+            ColumnKind::PartitionId => (DataTypes::bigint(), "Apache Iggy partition ID"),
+        };
+        Column::new(column.name(), data_type).with_comment(comment)
     }
 }
 
@@ -457,13 +439,11 @@ impl<'a> StaticTableDescriptorBuilder<'a> {
 
     fn build_schema(&self) -> Result<fluss::metadata::Schema, Error> {
         let payload_column = match self.payload_format {
-            PayloadFormat::Bytea => {
-                Column::new(PAYLOAD_COLUMN_NAME, fluss::metadata::DataTypes::bytes())
-                    .with_comment("Apache Iggy message payload")
-            }
+            PayloadFormat::Bytea => Column::new(PAYLOAD_COLUMN_NAME, DataTypes::bytes())
+                .with_comment("Apache Iggy message payload"),
 
             PayloadFormat::Json | PayloadFormat::Text => {
-                Column::new(PAYLOAD_COLUMN_NAME, fluss::metadata::DataTypes::string())
+                Column::new(PAYLOAD_COLUMN_NAME, DataTypes::string())
                     .with_comment("Apache Iggy message payload")
             }
         };

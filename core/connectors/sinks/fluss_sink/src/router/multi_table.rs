@@ -15,10 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-};
+use std::{collections::HashMap, sync::Arc};
 
 use arrow::{array::RecordBatch, datatypes::Schema, json::ReaderBuilder};
 use fluss::metadata::TablePath;
@@ -31,7 +28,7 @@ use crate::{
     ResolvedFlussSinkConfig,
     router::RouteOutcome,
     schema_catalog::{SchemaCatalog, SchemaEntry},
-    writer::{Op, Stat, TableWriter},
+    writer::{Stat, TableWriter},
 };
 
 #[derive(Debug)]
@@ -43,8 +40,7 @@ pub(crate) struct MultiTableRouter {
 
 impl MultiTableRouter {
     pub(crate) fn new(config: &ResolvedFlussSinkConfig) -> Self {
-        let schema_catalog =
-            SchemaCatalog::new(Mutex::new(HashMap::new()), config.tables.to_owned());
+        let schema_catalog = SchemaCatalog::new(config.tables.to_owned());
 
         Self {
             schema_catalog,
@@ -86,7 +82,7 @@ impl MultiTableRouter {
         let mut result = Stat::default();
         let (partitioned_messages, stat) =
             partition_messages_by_route_key(messages, &self.route_key);
-        result = result.add(stat);
+        result += stat;
         let mut last_error: Option<Error> = None;
 
         for (table, messages) in partitioned_messages {
@@ -101,7 +97,7 @@ impl MultiTableRouter {
                     warn!(
                         "FlussSink: Skipping {message_count} messages for table '{table}', schema could not be resolved: {error}"
                     );
-                    result.inc_err_by(message_count as u64);
+                    result.errors += message_count as u64;
                     last_error = Some(error);
                     continue;
                 }
@@ -111,7 +107,7 @@ impl MultiTableRouter {
             {
                 Ok(converted) => converted,
                 Err(error) => {
-                    result.inc_err_by(message_count as u64);
+                    result.errors += message_count as u64;
                     warn!(
                         "FlussSink: Skipping {message_count} messages for table '{table}', record batch conversion failed: {error}"
                     );
@@ -119,22 +115,17 @@ impl MultiTableRouter {
                     continue;
                 }
             };
-            result = result.add(stat);
+            result += stat;
 
             if let Some(batch) = batch {
-                let op = if entry.table_descriptor.has_primary_key() {
-                    Op::UpsertOrDelete
-                } else {
-                    Op::Append
-                };
                 let batch_len = batch.num_rows();
                 match writer
-                    .write_to_table(&table, &entry.table_descriptor, op, batch)
+                    .write_to_table(&table, &entry.table_descriptor, batch)
                     .await
                 {
-                    Ok(stat) => result = result.add(stat),
+                    Ok(stat) => result += stat,
                     Err(error) => {
-                        result.inc_err_by(batch_len as u64);
+                        result.errors += batch_len as u64;
                         warn!(
                             "FlussSink: Skipping {batch_len} rows for table '{table}', write failed: {error}"
                         );
@@ -174,7 +165,7 @@ fn to_record_batch(
                     "FlussSink: Skipping message [{}] for table [{}] because only JSON payloads are supported",
                     message.id, table
                 );
-                stat.inc_err();
+                stat.errors += 1;
                 None
             }
         })
@@ -249,7 +240,7 @@ fn partition_messages_by_route_key(
         let route = match extract_string_field(&message, route_key) {
             Ok(route) => route,
             Err(error) => {
-                stat.inc_err();
+                stat.errors += 1;
                 warn!(
                     "FlussSink: Skipping message [{}] because route key extraction failed: {error}",
                     message.id
@@ -271,7 +262,7 @@ fn partition_messages_by_route_key(
         match to_table_path(&route) {
             Ok(table_path) => by_table.entry(table_path).or_default().extend(messages),
             Err(error) => {
-                stat.inc_err_by(messages.len() as u64);
+                stat.errors += messages.len() as u64;
                 warn!(
                     "FlussSink: Skipping {} messages because route '{route}' is not a valid table path: {error}",
                     messages.len()
@@ -309,12 +300,12 @@ mod tests {
         ResolvedFlussSinkConfig,
         config::TableConfig,
         router::RouteOutcome,
-        writer::{Op, Stat, TableWriter, WriterError},
+        writer::{Stat, TableWriter, WriterError},
     };
 
     struct TableWrite {
         table_path: TablePath,
-        op: Op,
+        has_primary_key: bool,
         rows: usize,
     }
 
@@ -332,8 +323,7 @@ mod tests {
         async fn write_to_table(
             &self,
             table_path: &TablePath,
-            _table_descriptor: &TableDescriptor,
-            op: Op,
+            table_descriptor: &TableDescriptor,
             batch: RecordBatch,
         ) -> Result<Stat, WriterError> {
             if self.failing_writes.contains(table_path) {
@@ -345,11 +335,11 @@ mod tests {
                 .expect("table writes lock should not be poisoned")
                 .push(TableWrite {
                     table_path: table_path.clone(),
-                    op,
+                    has_primary_key: table_descriptor.has_primary_key(),
                     rows,
                 });
             let mut stat = Stat::default();
-            stat.inc_appended_by(rows as u64);
+            stat.appended += rows as u64;
             Ok(stat)
         }
 
@@ -578,7 +568,7 @@ mod tests {
         assert_eq!(created.as_slice(), &[TablePath::new("fluss", "orders")]);
         assert_eq!(writes.len(), 2);
         assert_eq!(writes[0].table_path, TablePath::new("fluss", "orders"));
-        assert_eq!(writes[0].op, Op::Append);
+        assert!(!writes[0].has_primary_key);
         assert_eq!(writes[0].rows, 2);
         assert_eq!(writes[1].rows, 1);
     }
@@ -743,6 +733,6 @@ mod tests {
         assert_eq!(stat.appended, 1);
         assert!(last_error.is_none());
         assert_eq!(writes.len(), 1);
-        assert_eq!(writes[0].op, Op::UpsertOrDelete);
+        assert!(writes[0].has_primary_key);
     }
 }
