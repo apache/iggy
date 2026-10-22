@@ -43,7 +43,7 @@ use server_common::sharding::IggyNamespace;
 use server_common::{SegmentStorage, yield_to_reactor};
 use std::io;
 use std::path::{Path, PathBuf};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 const LOG_EXTENSION: &str = "log";
 const INDEX_EXTENSION: &str = "index";
@@ -663,6 +663,7 @@ pub async fn load_persisted_segments_with_checkpoint(
                 &messages_path,
                 start_offset,
                 messages_size,
+                RewriteCause::Checkpoint,
             )
             .await?
         } else {
@@ -787,14 +788,20 @@ pub async fn load_persisted_segments_with_checkpoint(
         // index over the shortened log; the next boot re-discards it and
         // rebuilds from the log again, and truncation is monotone, so the
         // pair converges.
-        if checkpoint.is_none_or(|checkpoint| checkpoint.start_offset != plan.segment.start_offset)
-        {
-            truncate_to(&plan.messages_path, messages_size).await?;
+        let checkpoint_segment = checkpoint
+            .is_some_and(|checkpoint| checkpoint.start_offset == plan.segment.start_offset);
+        if !checkpoint_segment {
+            truncate_to(&plan.messages_path, messages_size, RewriteCause::Damage).await?;
         }
         if let Some(staging_path) = &plan.rebuilt_index_staging {
             install_rebuilt_index(staging_path, &plan.index_path, identity.partition_path).await?;
         } else {
-            truncate_to(&plan.index_path, plan.index_size).await?;
+            let cause = if checkpoint_segment {
+                RewriteCause::Checkpoint
+            } else {
+                RewriteCause::Damage
+            };
+            truncate_to(&plan.index_path, plan.index_size, cause).await?;
         }
 
         let mut storage = if checkpoint.is_some() {
@@ -1230,6 +1237,17 @@ async fn file_len(path: &str) -> Result<u64, PartitionRecoveryError> {
     }
 }
 
+/// Why recovery rewrites segment bytes, which decides whether an operator must
+/// see the rewrite.
+#[derive(Clone, Copy)]
+enum RewriteCause {
+    /// A crash tore the bytes, or damage left an index that the log cannot back.
+    Damage,
+    /// The checkpoint segment's index is derived data that every boot replaces,
+    /// because the WAL owns the bytes past the checkpoint.
+    Checkpoint,
+}
+
 /// Physically truncates a segment file to its recovered byte length, so disk
 /// and the seeded size counters agree before storage reopens: reopen verifies
 /// the on-disk length against the recovered size and refuses a divergence,
@@ -1243,13 +1261,19 @@ async fn file_len(path: &str) -> Result<u64, PartitionRecoveryError> {
 /// The tail being discarded was proven dead by the bounds walk: nothing past
 /// the recovered size decodes (the interior-damage probe refuses recovery
 /// outright when something does), so polls could never serve those bytes.
+/// The checkpoint segment's index is the exception: its entries describe
+/// bytes that the WAL owns, and the WAL replay indexes them again.
 ///
 /// Stats the file fresh instead of trusting a length carried from pass A: the
 /// whole chain was walked in between, and the mutation must key on what is on
 /// disk now. The fsync bounds the crash window: a power cut right after `set_len` may
 /// re-present the torn tail on the next boot, which only walks and truncates
 /// again (idempotent), but the sync keeps the common case deterministic.
-async fn truncate_to(path: &str, target_size: u64) -> Result<(), PartitionRecoveryError> {
+async fn truncate_to(
+    path: &str,
+    target_size: u64,
+    cause: RewriteCause,
+) -> Result<(), PartitionRecoveryError> {
     let current_size = file_len(path).await?;
     if current_size == target_size {
         return Ok(());
@@ -1268,13 +1292,22 @@ async fn truncate_to(path: &str, target_size: u64) -> Result<(), PartitionRecove
         );
         return Err(IggyError::CannotWriteToFile.into());
     }
-    warn!(
-        path,
-        current_size,
-        target_size,
-        "truncating a segment file to its recovered bounds; discarding \
-         torn tail bytes"
-    );
+    match cause {
+        RewriteCause::Damage => warn!(
+            path,
+            current_size,
+            target_size,
+            "truncating a segment file to its recovered bounds; discarding \
+             torn tail bytes"
+        ),
+        RewriteCause::Checkpoint => debug!(
+            path,
+            current_size,
+            target_size,
+            "dropping sparse index entries past the WAL checkpoint; the WAL \
+             replay indexes them again"
+        ),
+    }
     let file = fs::OpenOptions::new()
         .write(true)
         .open(path)
@@ -1663,6 +1696,7 @@ async fn recover_segment_bounds(
                     messages_path,
                     start_offset,
                     messages_size,
+                    RewriteCause::Damage,
                 )
                 .await;
             }
@@ -1750,6 +1784,7 @@ async fn recover_segment_bounds(
                     messages_path,
                     start_offset,
                     messages_size,
+                    RewriteCause::Damage,
                 )
                 .await?;
                 if durable_segments {
@@ -1771,6 +1806,7 @@ async fn recover_segment_bounds(
                     messages_path,
                     start_offset,
                     messages_size,
+                    RewriteCause::Damage,
                 )
                 .await?;
                 if durable_segments {
@@ -1823,6 +1859,7 @@ async fn recover_segment_bounds(
                     messages_path,
                     start_offset,
                     messages_size,
+                    RewriteCause::Damage,
                 )
                 .await;
             }
@@ -1868,6 +1905,7 @@ async fn recover_segment_bounds(
                 messages_path,
                 start_offset,
                 messages_size,
+                RewriteCause::Damage,
             )
             .await
         }
@@ -1915,6 +1953,7 @@ async fn recover_by_walking_log(
     messages_path: &str,
     start_offset: u64,
     messages_size: u64,
+    cause: RewriteCause,
 ) -> Result<Option<WalkedBounds>, PartitionRecoveryError> {
     let mut position = 0u64;
     let mut start_timestamp = None;
@@ -2006,17 +2045,29 @@ async fn recover_by_walking_log(
         // empty recovery is right after all.
         return Ok(None);
     };
-    warn!(
-        stream_id = identity.stream_id,
-        topic_id = identity.topic_id,
-        partition_id = identity.partition_id,
-        start_offset,
-        messages_size,
-        walked_size = position,
-        rebuilt_entries = rebuilt_index.len() / IGGY_INDEX_SIZE,
-        "recovered segment bounds by walking the log and rebuilding its \
-         index from the walked batches"
-    );
+    match cause {
+        RewriteCause::Damage => warn!(
+            stream_id = identity.stream_id,
+            topic_id = identity.topic_id,
+            partition_id = identity.partition_id,
+            start_offset,
+            messages_size,
+            walked_size = position,
+            rebuilt_entries = rebuilt_index.len() / IGGY_INDEX_SIZE,
+            "recovered segment bounds by walking the log and rebuilding its \
+             index from the walked batches"
+        ),
+        RewriteCause::Checkpoint => debug!(
+            stream_id = identity.stream_id,
+            topic_id = identity.topic_id,
+            partition_id = identity.partition_id,
+            start_offset,
+            walked_size = position,
+            rebuilt_entries = rebuilt_index.len() / IGGY_INDEX_SIZE,
+            "rebuilt the checkpoint segment's sparse index from the walked \
+             log; the WAL replay indexes the bytes past the checkpoint again"
+        ),
+    }
     Ok(Some(WalkedBounds {
         start_timestamp,
         end_timestamp,

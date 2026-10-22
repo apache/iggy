@@ -46,7 +46,7 @@ const (
 	LoginRegisterWithPATCode Code = 45
 	PollMessagesCode         Code = 100
 	SendMessagesCode         Code = 101
-	// 35, 103, 104, 123, 204 and 304 are retired and must never be reused.
+	// 35, 103, 104, 123, 124, 204 and 304 are retired and must never be reused.
 	GetPartitionRouteCode    Code = 105
 	GetOffsetCode            Code = 120
 	StoreOffsetCode          Code = 121

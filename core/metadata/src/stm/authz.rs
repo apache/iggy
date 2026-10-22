@@ -633,7 +633,6 @@ mod tests {
 
     fn create_topic_body(stream_id: u32, name: &str) -> bytes::Bytes {
         CreateTopicWithAssignmentsRequest {
-            created_view: 0,
             request: CreateTopicRequest {
                 stream_id: WireIdentifier::numeric(stream_id),
                 partitions_count: 1,
@@ -642,6 +641,7 @@ mod tests {
             },
             derived_options: WireOptions::empty(),
             partitions: vec![CreatedPartitionAssignment {
+                initial_view: 0,
                 partition_id: 0,
                 consensus_group_id: 1,
             }],

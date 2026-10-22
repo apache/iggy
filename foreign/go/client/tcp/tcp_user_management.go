@@ -111,11 +111,11 @@ func (c *IggyTcpClient) ChangePassword(ctx context.Context, userID iggcon.Identi
 	return err
 }
 
-// refreshSignIn applies a committed password change or rename to the
+// refreshSignInLocked applies a committed password change or rename to the
 // stored sign-in credentials. It reads the committed request body, so
 // typed calls, raw sends and replays follow one rule. A body that does
 // not decode changes nothing and never fails the committed call.
-func (c *IggyTcpClient) refreshSignIn(code command.Code, body []byte) {
+func (c *IggyTcpClient) refreshSignInLocked(epoch *signInEpoch, code command.Code, body []byte) {
 	switch code {
 	case command.ChangePasswordCode:
 		user, rest, ok := splitIdentifier(body)
@@ -124,7 +124,7 @@ func (c *IggyTcpClient) refreshSignIn(code command.Code, body []byte) {
 		}
 		if _, rest, ok := splitName(rest); ok {
 			if password, _, ok := splitName(rest); ok {
-				c.refreshCredentials(user, nil, &password)
+				c.refreshCredentialsLocked(epoch, user, nil, &password)
 			}
 		}
 	case command.UpdateResourceCode:
@@ -132,7 +132,7 @@ func (c *IggyTcpClient) refreshSignIn(code command.Code, body []byte) {
 			return
 		}
 		if user, username, ok := patchedUsername(body[1:]); ok {
-			c.refreshCredentials(user, &username, nil)
+			c.refreshCredentialsLocked(epoch, user, &username, nil)
 		}
 	}
 }
@@ -173,12 +173,13 @@ func splitIdentifier(data []byte) (string, []byte, bool) {
 	return string(data[:end]), data[end:], true
 }
 
-// refreshCredentials updates each stored login that user names. Only the
+// refreshCredentialsLocked updates each stored login that user names. Only the
 // signed-in user has a known numeric ID, so a change by ID reaches the
 // configured login only when it is the signed-in user.
-func (c *IggyTcpClient) refreshCredentials(user string, username, password *string) {
-	c.mtx.Lock()
-	defer c.mtx.Unlock()
+func (c *IggyTcpClient) refreshCredentialsLocked(epoch *signInEpoch, user string, username, password *string) {
+	if c.epoch.Load() != epoch {
+		return
+	}
 	oldUsername := c.rememberedLogin.credentials.username
 	configuredUsername := c.config.autoLogin.credentials.username
 	self := c.rememberedLogin.enabled && (user == encodedUser(c.sessionUserID) || user == encodedUser(oldUsername))

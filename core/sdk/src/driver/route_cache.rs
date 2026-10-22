@@ -24,7 +24,7 @@ use iggy_binary_protocol::requests::messages::GetPartitionRouteRequest;
 use iggy_binary_protocol::responses::messages::PartitionRouteResponse;
 use iggy_common::wire_conversions::identifier_to_wire;
 use iggy_common::{Identifier, IggyError};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use super::PartitionTarget;
 
@@ -34,7 +34,7 @@ pub(crate) const MAX_CACHED_ROUTES: usize = 4096;
 
 /// A partition as its caller spelled it. A stream or topic named by number
 /// and the same one named by name are two keys.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PartitionKey {
     pub(crate) stream_id: Identifier,
     pub(crate) topic_id: Identifier,
@@ -77,9 +77,25 @@ struct Entry {
     lookup: u64,
 }
 
+impl Entry {
+    /// Whether the route serves the session of `fence` and is not stale or
+    /// older than the metadata `watermark` that the session saw.
+    fn is_usable(&self, fence: u64, watermark: u64) -> bool {
+        !self.stale && self.fence == fence && self.route.metadata_op >= watermark
+    }
+}
+
+/// The routes of one topic as its caller spelled it, by partition.
+type TopicRoutes = HashMap<u32, Entry>;
+
 #[derive(Debug, Default)]
 pub(crate) struct RouteCache {
-    entries: HashMap<PartitionKey, Entry>,
+    /// The routes by stream, then by topic, so the partition count of a
+    /// topic reads only the routes of that topic.
+    streams: HashMap<Identifier, HashMap<Identifier, TopicRoutes>>,
+    /// The key of every entry by its lookup, so an eviction at capacity
+    /// finds the oldest entry without a scan.
+    by_lookup: BTreeMap<u64, PartitionKey>,
     lookups: u64,
 }
 
@@ -91,39 +107,40 @@ impl RouteCache {
         fence: u64,
         watermark: u64,
     ) -> Option<u32> {
-        self.entries
-            .iter()
-            .filter(|(key, entry)| {
-                key.stream_id == *stream_id
-                    && key.topic_id == *topic_id
-                    && !entry.stale
-                    && entry.fence == fence
-                    && entry.route.metadata_op >= watermark
-            })
-            .max_by_key(|(_, entry)| (entry.route.metadata_op, entry.lookup))
-            .map(|(_, entry)| entry.route.partitions_count)
+        self.topic(stream_id, topic_id)?
+            .values()
+            .filter(|entry| entry.is_usable(fence, watermark))
+            .max_by_key(|entry| (entry.route.metadata_op, entry.lookup))
+            .map(|entry| entry.route.partitions_count)
     }
 
     /// The route of `key`, unless it is stale, from another session, or
     /// older than the metadata `watermark` that the session saw.
+    ///
+    /// The watermark is global: one metadata write of the session costs every
+    /// cached route one more lookup at its next use, even for topics that the
+    /// write did not touch. A fence per topic needs trusted provenance of the
+    /// topics that each metadata commit touched, and the client has none. A
+    /// reply names only its commit. A request names its stream and topic as
+    /// the caller spelled them, by number or by name, or names only the stream
+    /// for a change to all of its topics. A fence keyed by those spellings
+    /// would miss a route cached under another spelling of the same topic, so
+    /// a route from before the write could stay usable.
     pub(crate) fn usable(
         &self,
         key: &PartitionKey,
         fence: u64,
         watermark: u64,
     ) -> Option<PartitionRouteResponse> {
-        self.entries
-            .get(key)
-            .filter(|entry| {
-                !entry.stale && entry.fence == fence && entry.route.metadata_op >= watermark
-            })
+        self.entry(key)
+            .filter(|entry| entry.is_usable(fence, watermark))
             .map(|entry| entry.route)
     }
 
     /// The replica that the next lookup of `key` asks first, if a refusal
     /// or a failure named one.
     pub(crate) fn ask_first(&self, key: &PartitionKey) -> Option<u8> {
-        self.entries.get(key).and_then(|entry| entry.ask_first)
+        self.entry(key).and_then(|entry| entry.ask_first)
     }
 
     /// Takes a lookup answer for `key`, unless it is older than the cached
@@ -138,7 +155,7 @@ impl RouteCache {
         fence: u64,
     ) -> Option<PartitionRouteResponse> {
         let mut route = answer;
-        if let Some(cached) = self.entries.get(key) {
+        if let Some(cached) = self.entry(key) {
             let cached_route = cached.route;
             if route.incarnation == cached_route.incarnation {
                 let newer = route.view >= cached.floor
@@ -154,21 +171,31 @@ impl RouteCache {
             } else if route.metadata_op < cached_route.metadata_op {
                 return None;
             }
-        } else if self.entries.len() >= MAX_CACHED_ROUTES {
+        } else if self.by_lookup.len() >= MAX_CACHED_ROUTES {
             self.evict_oldest();
         }
         self.lookups += 1;
-        self.entries.insert(
-            key.clone(),
-            Entry {
-                route,
-                fence,
-                stale: false,
-                floor: route.view,
-                ask_first: None,
-                lookup: self.lookups,
-            },
-        );
+        let replaced = self
+            .streams
+            .entry(key.stream_id.clone())
+            .or_default()
+            .entry(key.topic_id.clone())
+            .or_default()
+            .insert(
+                key.partition_id,
+                Entry {
+                    route,
+                    fence,
+                    stale: false,
+                    floor: route.view,
+                    ask_first: None,
+                    lookup: self.lookups,
+                },
+            );
+        if let Some(replaced) = replaced {
+            self.by_lookup.remove(&replaced.lookup);
+        }
+        self.by_lookup.insert(self.lookups, key.clone());
         Some(route)
     }
 
@@ -214,23 +241,46 @@ impl RouteCache {
         partition_id: u32,
         mut update: impl FnMut(&mut Entry),
     ) {
-        for (key, entry) in &mut self.entries {
-            if key.partition_id == partition_id && entry.route.incarnation == route.incarnation {
+        let partitions = self
+            .streams
+            .values_mut()
+            .flat_map(HashMap::values_mut)
+            .filter_map(|routes| routes.get_mut(&partition_id));
+        for entry in partitions {
+            if entry.route.incarnation == route.incarnation {
                 entry.stale = true;
                 update(entry);
             }
         }
     }
 
+    /// Removes the oldest entry, and the maps of its topic and stream once
+    /// they hold no route.
     fn evict_oldest(&mut self) {
-        let oldest = self
-            .entries
-            .iter()
-            .min_by_key(|(_, entry)| entry.lookup)
-            .map(|(key, _)| key.clone());
-        if let Some(oldest) = oldest {
-            self.entries.remove(&oldest);
+        let Some((_, oldest)) = self.by_lookup.pop_first() else {
+            return;
+        };
+        let Some(topics) = self.streams.get_mut(&oldest.stream_id) else {
+            return;
+        };
+        if let Some(routes) = topics.get_mut(&oldest.topic_id) {
+            routes.remove(&oldest.partition_id);
+            if routes.is_empty() {
+                topics.remove(&oldest.topic_id);
+            }
         }
+        if topics.is_empty() {
+            self.streams.remove(&oldest.stream_id);
+        }
+    }
+
+    fn topic(&self, stream_id: &Identifier, topic_id: &Identifier) -> Option<&TopicRoutes> {
+        self.streams.get(stream_id)?.get(topic_id)
+    }
+
+    fn entry(&self, key: &PartitionKey) -> Option<&Entry> {
+        self.topic(&key.stream_id, &key.topic_id)?
+            .get(&key.partition_id)
     }
 }
 
@@ -277,6 +327,16 @@ mod tests {
             )
             .unwrap();
         (cache, route)
+    }
+
+    /// Every route in the maps by stream and topic.
+    fn cached_routes(cache: &RouteCache) -> usize {
+        cache
+            .streams
+            .values()
+            .flat_map(HashMap::values)
+            .map(HashMap::len)
+            .sum()
     }
 
     #[test]
@@ -397,6 +457,75 @@ mod tests {
     }
 
     #[test]
+    fn given_newer_routes_of_other_topics_when_selecting_should_count_only_the_asked_topic() {
+        let (mut cache, route) = cached(1, 0);
+        let newer = PartitionRouteResponse {
+            incarnation: INCARNATION + 1,
+            partitions_count: PARTITIONS_COUNT + 5,
+            metadata_op: METADATA_OP + 1,
+            ..route
+        };
+        let other_topic = PartitionKey {
+            topic_id: Identifier::numeric(3).unwrap(),
+            ..key(PARTITION_ID)
+        };
+        let other_stream = PartitionKey {
+            stream_id: Identifier::numeric(9).unwrap(),
+            ..key(PARTITION_ID)
+        };
+        let other_spelling = PartitionKey {
+            topic_id: Identifier::named("topic").unwrap(),
+            ..key(PARTITION_ID)
+        };
+        for other in [&other_topic, &other_stream, &other_spelling] {
+            cache.merge(other, newer, FENCE).unwrap();
+        }
+
+        let topic = key(PARTITION_ID);
+        assert_eq!(
+            cache.partition_count(&topic.stream_id, &topic.topic_id, FENCE, METADATA_OP),
+            Some(PARTITIONS_COUNT)
+        );
+        assert_eq!(
+            cache.partition_count(
+                &other_topic.stream_id,
+                &other_topic.topic_id,
+                FENCE,
+                METADATA_OP
+            ),
+            Some(newer.partitions_count)
+        );
+    }
+
+    #[test]
+    fn given_an_identifier_read_back_by_serde_when_counting_partitions_should_find_no_route() {
+        let (cache, _) = cached(1, 0);
+        let topic = key(PARTITION_ID);
+        let read_back = |id: &Identifier| -> Identifier {
+            serde_json::from_str(&serde_json::to_string(id).unwrap()).unwrap()
+        };
+
+        assert_eq!(
+            cache.partition_count(
+                &read_back(&topic.stream_id),
+                &topic.topic_id,
+                FENCE,
+                METADATA_OP
+            ),
+            None
+        );
+        assert_eq!(
+            cache.partition_count(
+                &topic.stream_id,
+                &read_back(&topic.topic_id),
+                FENCE,
+                METADATA_OP
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn given_a_full_route_cache_when_a_new_lookup_arrives_should_evict_only_the_oldest() {
         let mut cache = RouteCache::default();
         let capacity = u32::try_from(MAX_CACHED_ROUTES).unwrap();
@@ -414,18 +543,83 @@ mod tests {
             .merge(&first, answer(INCARNATION, METADATA_OP, 2, 1), FENCE)
             .unwrap();
 
-        let newcomer = key(capacity);
-        cache
-            .merge(&newcomer, answer(INCARNATION, METADATA_OP, 1, 0), FENCE)
-            .unwrap();
+        let newcomers = [key(capacity), key(capacity + 1)];
+        for newcomer in &newcomers {
+            cache
+                .merge(newcomer, answer(INCARNATION, METADATA_OP, 1, 0), FENCE)
+                .unwrap();
+        }
 
-        assert_eq!(cache.entries.len(), MAX_CACHED_ROUTES);
-        assert_eq!(
-            cache.usable(&key(1), FENCE, METADATA_OP),
-            None,
-            "the oldest lookup goes"
-        );
-        assert!(cache.usable(&first, FENCE, METADATA_OP).is_some());
-        assert!(cache.usable(&newcomer, FENCE, METADATA_OP).is_some());
+        assert_eq!(cached_routes(&cache), MAX_CACHED_ROUTES);
+        assert_eq!(cache.by_lookup.len(), MAX_CACHED_ROUTES);
+        for evicted in [key(1), key(2)] {
+            assert_eq!(
+                cache.usable(&evicted, FENCE, METADATA_OP),
+                None,
+                "the oldest lookups go"
+            );
+        }
+        for kept in [&first, &key(3)].into_iter().chain(&newcomers) {
+            assert!(cache.usable(kept, FENCE, METADATA_OP).is_some(), "{kept:?}");
+        }
+    }
+
+    #[test]
+    fn given_the_last_route_of_a_stream_when_evicted_should_drop_the_maps_of_its_stream() {
+        let mut cache = RouteCache::default();
+        let lone = PartitionKey {
+            stream_id: Identifier::numeric(9).unwrap(),
+            ..key(PARTITION_ID)
+        };
+        cache
+            .merge(&lone, answer(INCARNATION, METADATA_OP, 1, 0), FENCE)
+            .unwrap();
+        let capacity = u32::try_from(MAX_CACHED_ROUTES).unwrap();
+        for partition_id in 0..capacity {
+            cache
+                .merge(
+                    &key(partition_id),
+                    answer(INCARNATION, METADATA_OP, 1, 0),
+                    FENCE,
+                )
+                .unwrap();
+        }
+
+        assert_eq!(cache.usable(&lone, FENCE, METADATA_OP), None);
+        assert!(!cache.streams.contains_key(&lone.stream_id));
+        assert_eq!(cache.streams.len(), 1);
+        assert_eq!(cached_routes(&cache), MAX_CACHED_ROUTES);
+    }
+
+    #[test]
+    fn given_the_last_route_of_a_topic_when_evicted_should_keep_the_other_topics_of_its_stream() {
+        let mut cache = RouteCache::default();
+        let lone = PartitionKey {
+            topic_id: Identifier::numeric(3).unwrap(),
+            ..key(PARTITION_ID)
+        };
+        cache
+            .merge(&lone, answer(INCARNATION, METADATA_OP, 1, 0), FENCE)
+            .unwrap();
+        let capacity = u32::try_from(MAX_CACHED_ROUTES).unwrap();
+        for partition_id in 0..capacity {
+            cache
+                .merge(
+                    &key(partition_id),
+                    answer(INCARNATION, METADATA_OP, 1, 0),
+                    FENCE,
+                )
+                .unwrap();
+        }
+
+        assert_eq!(cache.usable(&lone, FENCE, METADATA_OP), None);
+        let topics = cache
+            .streams
+            .get(&lone.stream_id)
+            .expect("the stream keeps its other topic");
+        assert!(!topics.contains_key(&lone.topic_id));
+        assert_eq!(topics.len(), 1);
+        assert!(cache.usable(&key(0), FENCE, METADATA_OP).is_some());
+        assert_eq!(cached_routes(&cache), MAX_CACHED_ROUTES);
     }
 }

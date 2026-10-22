@@ -19,7 +19,7 @@ from datetime import timedelta
 
 import pytest
 
-from apache_iggy import IggyClient, PendingOperationError
+from apache_iggy import IggyClient, IggyError, PendingOperationError
 
 
 @pytest.mark.asyncio
@@ -62,10 +62,35 @@ async def test_missing_retained_operation_preserves_exact_identity(
     assert raised.value.operation_id == operation_id
     assert raised.value.kind == "not_retained"
     assert raised.value.code == 14008
+    assert isinstance(raised.value, IggyError)
     assert isinstance(raised.value, RuntimeError)
     with pytest.raises(AttributeError):
         # pyrefly: ignore  # read-only
         raised.value.operation_id = 0
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_request_on_unconnected_client_raises_its_code():
+    client = IggyClient("127.0.0.1:1")
+    with pytest.raises(IggyError) as raised:
+        await client.send_binary_request(1, b"")
+    assert raised.value.code == 61
+    assert str(raised.value) == "Not connected"
+    assert isinstance(raised.value, RuntimeError)
+    with pytest.raises(AttributeError):
+        # pyrefly: ignore  # read-only
+        raised.value.code = 0
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_request_after_shutdown_raises_its_code():
+    client = IggyClient("127.0.0.1:1")
+    await client.shutdown()
+    with pytest.raises(IggyError) as raised:
+        await client.ping()
+    assert raised.value.code == 63
 
 
 @pytest.mark.unit

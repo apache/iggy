@@ -340,7 +340,7 @@ fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
 struct ReplyRouter {
     /// Waiting streams by request id, oldest first.
     waiters: HashMap<u64, VecDeque<oneshot::Sender<BusMessage>>>,
-    /// Frames that came while no stream waited for them, oldest first.
+    /// Keyed replies that came while no stream waited for them, oldest first.
     unclaimed: VecDeque<BusMessage>,
     /// When `unclaimed` holds this many frames, it drops its oldest one.
     unclaimed_max: usize,
@@ -357,15 +357,15 @@ impl ReplyRouter {
 
     /// Register a stream that waits for the reply to `request_id`.
     ///
-    /// The stream first takes the oldest unclaimed frame that has no request
-    /// id or has its own. The SDK replays an explicit transient with the same
+    /// The stream first takes the oldest unclaimed reply with its request
+    /// id. The SDK replays an explicit transient with the same
     /// request id on a new stream, so a late reply of the first attempt
     /// answers the replay. The replies for other ids ahead of that frame are
     /// dropped, because their streams already ended.
     fn register(&mut self, request_id: u64) -> oneshot::Receiver<BusMessage> {
         let (waiter, reply) = oneshot::channel();
         while let Some(frame) = self.unclaimed.pop_front() {
-            if !matches!(reply_route(&frame), ReplyRoute::Keyed(id) if id != request_id) {
+            if matches!(reply_route(&frame), ReplyRoute::Keyed(id) if id == request_id) {
                 // `reply` is alive, so the send cannot fail.
                 let _ = waiter.send(frame);
                 return reply;
@@ -380,11 +380,15 @@ impl ReplyRouter {
 
     /// Hand a reply to the oldest waiter of its request id, and a frame
     /// without one to every waiter, because an eviction ends every request
-    /// of the connection. A frame no stream takes stays unclaimed.
+    /// of the connection. Only keyed replies can wait for a future stream;
+    /// an old eviction must not answer a newly registered request.
     fn route(&mut self, frame: BusMessage) {
         let unclaimed = match reply_route(&frame) {
             ReplyRoute::Keyed(request_id) => self.deliver(request_id, frame),
-            ReplyRoute::Unkeyed => self.broadcast(frame),
+            ReplyRoute::Unkeyed => {
+                self.broadcast(&frame);
+                None
+            }
         };
         if let Some(frame) = unclaimed {
             if self.unclaimed.len() == self.unclaimed_max {
@@ -424,13 +428,10 @@ impl ReplyRouter {
         unclaimed
     }
 
-    /// Returns the frame if no waiter took it.
-    fn broadcast(&mut self, frame: BusMessage) -> Option<BusMessage> {
-        let mut delivered = false;
+    fn broadcast(&mut self, frame: &BusMessage) {
         for waiter in self.waiters.drain().flat_map(|(_, waiters)| waiters) {
-            delivered |= waiter.send(frame.clone()).is_ok();
+            let _ = waiter.send(frame.clone());
         }
-        (!delivered).then_some(frame)
     }
 }
 
@@ -686,11 +687,16 @@ mod tests {
     use crate::lifecycle::{FusedShutdown, Shutdown};
     use async_channel::bounded;
     use compio::io::AsyncWrite;
+    use compio::net::UdpSocket;
     use compio_quic::ClientBuilder;
     use iggy_binary_protocol::{Command, GenericHeader, HEADER_SIZE, Operation, SIZE_FIELD_OFFSET};
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     use server_common::iobuf::Frozen;
     use server_common::{MESSAGE_ALIGN, Message};
+    use std::cell::Cell;
+    use std::future::Future;
+    use std::rc::Rc;
+    use std::task::Poll;
     use std::time::Duration;
 
     const TEST_CLIENT: u128 = 1;
@@ -1142,6 +1148,84 @@ mod tests {
         assert_eq!(routed_commit(&mut second), Some(SECOND_COMMIT));
     }
 
+    #[test]
+    fn given_no_live_waiters_when_an_eviction_arrives_should_not_reach_a_later_stream() {
+        for canceled_waiter in [false, true] {
+            let mut router = ReplyRouter::new(UNCLAIMED_MAX);
+            if canceled_waiter {
+                drop(router.register(FIRST_REQUEST));
+            }
+            router.route(header_only(Command::Eviction).into());
+            let mut later = router.register(SECOND_REQUEST);
+            assert!(
+                later.try_recv().unwrap().is_none(),
+                "an eviction with no live waiter must not answer a later request"
+            );
+            router.route(reply(SECOND_REQUEST, SECOND_COMMIT));
+            assert_eq!(routed_commit(&mut later), Some(SECOND_COMMIT));
+            assert!(router.unclaimed.is_empty());
+        }
+    }
+
+    #[compio::test]
+    async fn given_an_unclaimed_eviction_when_a_new_quic_stream_opens_should_receive_its_reply() {
+        let (conn, client, _endpoints) = connect(ONE_STREAM).await;
+        let (outbound, inbound, shutdown, server) = drive(conn);
+        outbound
+            .send(header_only(Command::Eviction).into())
+            .await
+            .unwrap();
+        // Routing finishes in the same poll as dequeue, before another task can run.
+        compio::time::timeout(
+            TEST_WAIT,
+            futures::future::poll_fn(|cx| {
+                if outbound.is_empty() {
+                    Poll::Ready(())
+                } else {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            }),
+        )
+        .await
+        .expect("the transport routed the eviction before the next stream opens");
+
+        let mut response = send_request(&client, SECOND_REQUEST).await;
+        assert_eq!(forwarded(&inbound).await, SECOND_REQUEST);
+        outbound
+            .send(reply(SECOND_REQUEST, SECOND_COMMIT))
+            .await
+            .unwrap();
+        let answer = read_answer(&mut response).await;
+        assert_eq!(answer.header().command, Command::Reply);
+        assert_eq!(reply_header(answer.as_slice()).request, SECOND_REQUEST);
+        assert_eq!(reply_header(answer.as_slice()).commit, SECOND_COMMIT);
+
+        shutdown.trigger();
+        compio::time::timeout(TEST_WAIT, server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn given_live_waiters_when_evicted_should_broadcast_only_to_existing_streams() {
+        let mut router = ReplyRouter::new(UNCLAIMED_MAX);
+        let mut first = router.register(FIRST_REQUEST);
+        let mut second = router.register(SECOND_REQUEST);
+        router.route(header_only(Command::Eviction).into());
+        for receiver in [&mut first, &mut second] {
+            assert_eq!(
+                receiver.try_recv().unwrap().unwrap().first().as_slice()[COMMAND_OFFSET],
+                Command::Eviction as u8
+            );
+        }
+        let mut later = router.register(FIRST_REQUEST);
+        assert!(later.try_recv().unwrap().is_none());
+        router.route(reply(FIRST_REQUEST, SECOND_COMMIT));
+        assert_eq!(routed_commit(&mut later), Some(SECOND_COMMIT));
+    }
+
     /// A late reply waits for the stream that replays its request id. The
     /// replies for other ids ahead of it are dropped, so a later stream with
     /// such an id gets only its own reply.
@@ -1231,6 +1315,129 @@ mod tests {
             .await
             .expect("the acknowledged reply releases the drain")
             .expect("the server exits normally");
+    }
+
+    #[compio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn given_reply_fin_before_shutdown_when_ack_arrives_late_should_drain_before_closing() {
+        const MAX_UDP_DATAGRAM_SIZE: usize = u16::MAX as usize;
+        install_crypto_provider();
+        let (cert, key) = self_signed();
+        let server = server_endpoint(cert.clone(), key, &tuning(ONE_STREAM)).await;
+        let server_addr = server.local_addr().unwrap();
+        let listener = QuicTransportListener::new(server);
+        let client_endpoint = client_endpoint(cert).await;
+        let relay = Rc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let hold_upstream = Rc::new(Cell::new(false));
+        let held_packet = Rc::new(RefCell::new(None));
+        let (held_tx, held_rx) = bounded(1);
+        let relay_socket = Rc::clone(&relay);
+        let relay_hold = Rc::clone(&hold_upstream);
+        let relay_packet = Rc::clone(&held_packet);
+        let relay_task = compio::runtime::spawn(async move {
+            let mut client_addr = None;
+            loop {
+                let BufResult(result, mut packet) =
+                    relay_socket.recv_from(vec![0; MAX_UDP_DATAGRAM_SIZE]).await;
+                let (length, source) = result.unwrap();
+                packet.truncate(length);
+                let destination = if source == server_addr {
+                    client_addr.expect("client starts the handshake")
+                } else {
+                    client_addr = Some(source);
+                    if relay_hold.get() {
+                        *relay_packet.borrow_mut() = Some(packet);
+                        let _ = held_tx.try_send(());
+                        continue;
+                    }
+                    server_addr
+                };
+                let BufResult(sent, _) = relay_socket.send_to(packet, destination).await;
+                assert_eq!(sent.unwrap(), length);
+            }
+        });
+        let connecting = client_endpoint
+            .connect(relay.local_addr().unwrap(), "localhost", None)
+            .unwrap();
+        let (accepted, client) = futures::join!(listener.accept(), connecting);
+        let (conn, _) = accepted.unwrap();
+        let server_connection = conn.connection.clone();
+        let client = client.unwrap();
+        let (outbound, out_rx) = bounded(1);
+        let (in_tx, inbound) = bounded(1);
+        let (shutdown, token) = Shutdown::new();
+        let shutdown_observer = shutdown.clone();
+        let (polled_tx, polled_rx) = bounded(1);
+        let ctx = ActorContext {
+            in_tx,
+            rx: out_rx,
+            shutdown: FusedShutdown::single(token),
+            conn_shutdown: shutdown.clone(),
+            max_batch: 1,
+            max_message_size: framing::MAX_MESSAGE_SIZE,
+            label: "late-ack-test",
+            peer: "relay".to_string(),
+        };
+        let mut run = Box::pin(conn.with_close_grace(TEST_WAIT).run(ctx));
+        let server_task = compio::runtime::spawn(futures::future::poll_fn(move |cx| {
+            let result = run.as_mut().poll(cx);
+            if shutdown_observer.is_triggered() {
+                let _ = polled_tx.try_send(result.is_pending());
+            }
+            result
+        }));
+
+        let mut response = send_request(&client, FIRST_REQUEST).await;
+        assert_eq!(forwarded(&inbound).await, FIRST_REQUEST);
+        let acks_before_reply = client.stats().frame_tx.acks;
+        hold_upstream.set(true);
+        outbound
+            .send(reply(FIRST_REQUEST, FIRST_COMMIT))
+            .await
+            .unwrap();
+        let BufResult(received, bytes) =
+            compio::time::timeout(TEST_WAIT, response.read_to_end(Vec::new()))
+                .await
+                .expect("reply and FIN arrive while upstream ACKs are held");
+        assert_eq!(received.unwrap(), HEADER_SIZE);
+        assert_eq!(reply_header(&bytes).commit, FIRST_COMMIT);
+        compio::time::timeout(TEST_WAIT, async {
+            while client.stats().frame_tx.acks == acks_before_reply
+                || held_packet.borrow().is_none()
+            {
+                held_rx.recv().await.unwrap();
+            }
+        })
+        .await
+        .expect("client generated an ACK and relay retained upstream traffic");
+
+        shutdown.trigger();
+        assert!(
+            compio::time::timeout(TEST_WAIT, polled_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            "the real transport must remain pending after shutdown while its FIN is unacknowledged"
+        );
+        let acks_before_release = server_connection.stats().frame_rx.acks;
+        hold_upstream.set(false);
+        let packet = held_packet
+            .borrow_mut()
+            .take()
+            .expect("held upstream packet");
+        let BufResult(sent, _) = relay.send_to(packet, server_addr).await;
+        sent.unwrap();
+        compio::time::timeout(TEST_WAIT, server_task)
+            .await
+            .expect("late ACK releases the drain within close_grace")
+            .unwrap();
+        assert!(
+            server_connection.stats().frame_rx.acks > acks_before_release,
+            "the drain completes after a late ACK reaches the server"
+        );
+        compio::time::timeout(TEST_WAIT, relay_task.cancel())
+            .await
+            .expect("relay task releases its socket within the test bound");
     }
 
     #[compio::test]

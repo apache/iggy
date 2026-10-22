@@ -1553,7 +1553,6 @@ mod tests {
     #[test]
     fn given_pending_intent_when_topic_is_created_should_admit_and_apply_alike() {
         let create_topic = CreateTopicWithAssignmentsRequest {
-            created_view: 0,
             request: CreateTopicRequest {
                 stream_id: WireIdentifier::numeric(0),
                 partitions_count: 1,
@@ -1562,6 +1561,7 @@ mod tests {
             },
             derived_options: WireOptions::empty(),
             partitions: vec![CreatedPartitionAssignment {
+                initial_view: 0,
                 partition_id: 0,
                 consensus_group_id: 1,
             }],

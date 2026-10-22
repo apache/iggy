@@ -232,6 +232,22 @@ enum Requests {
         }
     }
 
+    /// The user a user-scope ``updateResource(_:_:)`` payload names and the
+    /// name it sets, nil when it patches another scope or keeps the name.
+    static func renamedUser(_ payload: [UInt8]) throws -> (userID: Identifier, username: String)? {
+        guard payload.first == OptionsScope.user.rawValue else {
+            return nil
+        }
+        return try Responses.decode(payload.dropFirst()) { reader in
+            let userID = try Identifier.decode(from: &reader)
+            for _ in 0..<(try reader.readUInt8()) {
+                _ = try reader.readName()
+            }
+            let options = try OptionsBlock.decode(try reader.readBytes(reader.remaining), explicit: true)
+            return options[UserOptionKey.username.rawValue]?.value.stringValue.map { (userID, $0) }
+        }
+    }
+
     static func updatePermissions(userID: Identifier, permissions: Permissions?) throws -> [UInt8] {
         var writer = ByteWriter()
         try userID.encode(into: &writer)
@@ -247,6 +263,16 @@ enum Requests {
         try writer.writeName(currentPassword)
         try writer.writeName(newPassword)
         return writer.bytes
+    }
+
+    /// The user a ``changePassword(userID:currentPassword:newPassword:)``
+    /// payload names and its new password.
+    static func changedPassword(_ payload: [UInt8]) throws -> (userID: Identifier, newPassword: String) {
+        try Responses.decode(payload[...]) { reader in
+            let userID = try Identifier.decode(from: &reader)
+            _ = try reader.readName()
+            return (userID, try reader.readName())
+        }
     }
 
     /// `[protocol_version:u32][sdk_name][sdk_version]`, the prefix of both

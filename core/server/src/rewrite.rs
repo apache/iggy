@@ -686,6 +686,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::str::FromStr;
     use std::sync::Arc;
+    use std::time::Instant;
 
     const CONFIG_KEY: &str = "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=";
 
@@ -1160,7 +1161,6 @@ mod tests {
                     },
                     derived_options: WireOptions::empty(),
                     partitions: Vec::new(),
-                    created_view: 0,
                 }
                 .to_bytes(),
             ))
@@ -1325,6 +1325,7 @@ mod tests {
             transport,
             "127.0.0.1:34567".parse().expect("a socket address"),
             ClientTransportKind::Tcp,
+            Instant::now(),
         );
         sessions
             .borrow_mut()
@@ -1335,6 +1336,7 @@ mod tests {
                 DEFAULT_ROOT_USER_ID,
                 attachment,
                 SESSION,
+                Instant::now(),
             )
             .expect("root binds");
         sessions

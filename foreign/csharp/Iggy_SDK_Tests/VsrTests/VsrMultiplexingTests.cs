@@ -231,7 +231,7 @@ public sealed class VsrMultiplexingTests
         var session = new ConsensusSession(7, 42, new byte[LoginRegister.BIND_SECRET_BYTES]);
         var lanes = new MutationLanes(session, new IggyClientConfigurator { BaseAddress = "127.0.0.1:1", Protocol = Protocol.Tcp });
         var operation = await lanes.EnterAsync(new MutationLane(17, 0), CommandCodes.STORE_CONSUMER_OFFSET_CODE,
-            ReadOnlyMemory<byte>.Empty, default, true, TestContext.Current.CancellationToken);
+            ReadOnlyMemory<byte>.Empty, default, true, session.Generation, TestContext.Current.CancellationToken);
         try
         {
             BinaryPrimitives.WriteUInt128LittleEndian(operation.Frame.Bytes.AsSpan(VsrHeader.REQUEST_CHECKSUM_OFFSET), RequestStamp);
@@ -278,7 +278,7 @@ public sealed class VsrMultiplexingTests
         var session = new ConsensusSession(7, 42, new byte[LoginRegister.BIND_SECRET_BYTES]);
         var lanes = new MutationLanes(session, new IggyClientConfigurator { BaseAddress = "127.0.0.1:1", Protocol = Protocol.Tcp });
         var operation = await lanes.EnterAsync(MutationLane.Metadata, CommandCodes.UPDATE_RESOURCE_CODE,
-            new byte[] { 2, 1, 4, 3, 0, 0, 0, 0 }, default, true, TestContext.Current.CancellationToken);
+            new byte[] { 2, 1, 4, 3, 0, 0, 0, 0 }, default, true, session.Generation, TestContext.Current.CancellationToken);
         try
         {
             BinaryPrimitives.WriteUInt128LittleEndian(operation.Frame.Bytes.AsSpan(VsrHeader.REQUEST_CHECKSUM_OFFSET), RequestStamp);
@@ -335,7 +335,7 @@ public sealed class VsrMultiplexingTests
         var session = new ConsensusSession(7, 42, new byte[LoginRegister.BIND_SECRET_BYTES]);
         var lanes = new MutationLanes(session, new IggyClientConfigurator { BaseAddress = "127.0.0.1:1", Protocol = Protocol.Tcp });
         var operation = await lanes.EnterAsync(MutationLane.Metadata, CommandCodes.CREATE_PERSONAL_ACCESS_TOKEN_CODE,
-            ReadOnlyMemory<byte>.Empty, default, true, TestContext.Current.CancellationToken);
+            ReadOnlyMemory<byte>.Empty, default, true, session.Generation, TestContext.Current.CancellationToken);
         try
         {
             var pending = pair.SendFrozenAsync(operation, clearSensitiveReply: true);

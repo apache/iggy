@@ -10,6 +10,7 @@ the bdd test suite has no defaults and fails when any of these is missing:
 
 - `IGGY_TCP_ADDRESS="host:port"` - server address
 - `IGGY_ROOT_USERNAME` / `IGGY_ROOT_PASSWORD` - root credentials
+- `IGGY_TCP_ADDRESS_NO_QUORUM="host:port"` - cluster node that cannot reach quorum, read only by the session contract scenarios
 
 ## Run (recommended)
 

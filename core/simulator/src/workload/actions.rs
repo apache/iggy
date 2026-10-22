@@ -52,6 +52,7 @@ pub enum Action {
     JoinFixtureGroup,
     LeaveFixtureGroup,
     StoreStaleOwnerOffset,
+    PollMessages,
     CreateKeyedStream,
 }
 

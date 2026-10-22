@@ -46,6 +46,7 @@ class GlobalContext:
     last_update_error: RuntimeError | None = None
     last_option_specs: list[OptionSpec] | None = None
     last_user_id: int | None = None
+    last_call_error: RuntimeError | None = None
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -57,6 +58,7 @@ def pytest_configure(config: pytest.Config) -> None:
     for marker in (
         "basic-messaging: shared basic messaging scenarios",
         "raw-command: shared raw command scenarios",
+        "session-contract: shared session contract scenarios",
         "stream-options: shared stream option scenarios",
         "resource-options-patch: shared resource patch scenarios",
         "message-headers: scenarios that assert message headers",
@@ -84,6 +86,12 @@ def required_env(name: str) -> str:
 def root_credentials() -> tuple[str, str]:
     """Root username and password the server was started with."""
     return required_env("IGGY_ROOT_USERNAME"), required_env("IGGY_ROOT_PASSWORD")
+
+
+@pytest.fixture(scope="session")
+def no_quorum_address() -> str:
+    """Address of the cluster node that cannot reach quorum."""
+    return required_env("IGGY_TCP_ADDRESS_NO_QUORUM")
 
 
 @pytest.fixture(scope="session")

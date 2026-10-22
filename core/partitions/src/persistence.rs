@@ -18,10 +18,11 @@
 use crate::FILE_SYNC_CONCURRENCY;
 use crate::offset_storage::{OffsetFilePermit, RetainedOffsetFile, RetainedOffsetFiles};
 use futures::TryStreamExt;
+use futures::future::Either;
 use iggy_binary_protocol::{Operation, PrepareHeader};
 use iggy_common::ConsumerKind;
 use journal::PartitionPrepareJournal;
-use journal::durable_storage::{DiskStorage, DurableFile, DurableStorage};
+use journal::durable_storage::{DurableFile, DurableStorage};
 use journal::partition_journal::{PARTITION_WAL_BYTES_MAX, SegmentPosition, SegmentReference};
 use server_common::Message;
 use server_common::iobuf::Frozen;
@@ -126,7 +127,7 @@ impl FileSyncBarrier {
     }
 }
 
-pub struct PartitionPersistence<S: DurableStorage = DiskStorage> {
+pub struct PartitionPersistence<S: DurableStorage = crate::WalStorage> {
     group: u64,
     instance: u64,
     recovered_frontier: bool,
@@ -490,7 +491,7 @@ impl PartitionPersistence {
         group: u64,
         incarnation: u64,
     ) -> io::Result<(Rc<Self>, Vec<Message<PrepareHeader>>)> {
-        Self::open_with_storage(directory, group, incarnation, DiskStorage).await
+        Self::open_with_storage(directory, group, incarnation, crate::WalStorage::default()).await
     }
 }
 
@@ -839,20 +840,31 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         }
     }
 
+    /// An injected file has no disk handle to lend, so it is checked out as absent.
     pub(crate) fn checkout_offset_file(
         &self,
         path: &str,
-    ) -> Option<(Option<S::File>, Rc<OffsetFilePermit>)> {
-        self.offset_files.checkout(path)
+    ) -> Option<(Option<compio::fs::File>, Rc<OffsetFilePermit>)>
+    where
+        compio::fs::File: TryFrom<S::File>,
+    {
+        self.offset_files.checkout(path).map(|(file, permit)| {
+            (
+                file.and_then(|file| compio::fs::File::try_from(file).ok()),
+                permit,
+            )
+        })
     }
 
     pub(crate) fn return_offset_file(
         &self,
         path: &str,
-        file: S::File,
+        file: compio::fs::File,
         permit: Rc<OffsetFilePermit>,
-    ) {
-        self.offset_files.put(path, file, permit);
+    ) where
+        S::File: From<compio::fs::File>,
+    {
+        self.offset_files.put(path, S::File::from(file), permit);
     }
 
     pub fn retire_offset_file(&self, path: &str) {
@@ -1197,12 +1209,23 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         .await
     }
 
+    /// Times out on the caller's clock, so a simulated owner drains in virtual time.
+    ///
     /// # Errors
     /// Returns a storage failure or a timeout without allowing a second writer.
-    pub async fn drain_with_timeout(&self) -> io::Result<()> {
-        compio::runtime::time::timeout(PERSISTENCE_DRAIN_TIMEOUT, self.drain())
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "partition WAL drain timed out"))?
+    pub async fn drain_with_timeout<F>(&self, sleep: impl FnOnce(Duration) -> F) -> io::Result<()>
+    where
+        F: Future<Output = ()>,
+    {
+        let drain = std::pin::pin!(self.drain());
+        let timeout = std::pin::pin!(sleep(PERSISTENCE_DRAIN_TIMEOUT));
+        match futures::future::select(drain, timeout).await {
+            Either::Left((result, _)) => result,
+            Either::Right(((), _)) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "partition WAL drain timed out",
+            )),
+        }
     }
 
     /// Queue a barrier for preceding buffered writes; drain before claiming durability.

@@ -239,8 +239,9 @@ export const describeResourceOptions = (
       username: `${prefix}-self-taken`, password, status: UserStatus.Active
     });
     const self = connect({ username: `${prefix}-self`, password });
-    const signedInAs = async () => {
+    const signedInAs = async (username: string) => {
       await self.session.logout();
+      await self.session.login({ username, password });
       const me = await self.client.getMe();
       return (await c.user.get({ userId: me.userId }))?.userName;
     };
@@ -251,17 +252,17 @@ export const describeResourceOptions = (
         self.user.update({ userId: user.id, username: `${prefix}-self-taken` }),
         (error: unknown) => error instanceof ResponseError && error.fromServer
       );
-      assert.equal(await signedInAs(), `${prefix}-self`);
+      assert.equal(await signedInAs(`${prefix}-self`), `${prefix}-self`);
 
       const stream = await self.stream.create({ name: `${prefix}-self-stream` });
       await self.stream.update({ streamId: stream.id, name: `${prefix}-self` });
       const topic = await self.topic.create({ streamId: stream.id, name: 'events', partitionCount: 1 });
       await self.topic.update({ streamId: stream.id, topicId: topic.id, name: `${prefix}-self-topic` });
       await self.stream.delete({ streamId: stream.id });
-      assert.equal(await signedInAs(), `${prefix}-self`);
+      assert.equal(await signedInAs(`${prefix}-self`), `${prefix}-self`);
 
       assert.ok(await self.user.update({ userId: user.id, username: `${prefix}-self-renamed` }));
-      assert.equal(await signedInAs(), `${prefix}-self-renamed`);
+      assert.equal(await signedInAs(`${prefix}-self-renamed`), `${prefix}-self-renamed`);
     } finally {
       await self.destroy();
       await c.user.delete({ userId: user.id });

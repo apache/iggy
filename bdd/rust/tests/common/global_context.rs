@@ -37,4 +37,5 @@ pub struct GlobalContext {
     pub last_update_error: Option<IggyError>,
     pub last_option_specs: Vec<OptionSpec>,
     pub last_user_id: Option<u32>,
+    pub last_call_result: Option<Result<(), IggyError>>,
 }

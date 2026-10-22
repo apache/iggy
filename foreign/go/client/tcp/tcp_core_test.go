@@ -224,7 +224,7 @@ func TestExchange_GivesUpOnNotCommittedWhenTheBudgetExpires(t *testing.T) {
 
 	_, err := client.do(ctx, &command.CreateStream{Name: "orders"})
 	require.Error(t, err)
-	var uncertain ierror.UncertainOutcome
+	var uncertain ierror.OperationUncertain
 	require.ErrorAs(t, err, &uncertain)
 	require.NotZero(t, uncertain.OperationID)
 }
@@ -286,12 +286,11 @@ func TestExchange_RetriesALifecycleRefusalAsANewRequest(t *testing.T) {
 		return replyFrame(vsr.OperationJoinConsumerGroup, append(resultSection(), "joined"...))
 	})
 	captured := iggcon.PartitionContext{Incarnation: 17, OwnerGeneration: 3, MetadataOp: 4}
-	ctx := context.WithValue(context.Background(), capturedPartitionContext{}, captured)
 
 	join := lifecycleBusyJoin(t)
 	frame, err := appendCommandFrame(nil, join)
 	require.NoError(t, err)
-	response, err := client.drive(ctx, join.Code(), nil, frame, &captured)
+	response, err := client.drive(context.Background(), join.Code(), nil, frame, &captured)
 	require.NoError(t, err)
 	assert.Equal(t, []byte("joined"), response)
 
@@ -451,7 +450,7 @@ func TestExchange_SessionEvictionLeavesASentWriteUncertainUntilTheResetDropsIt(t
 
 				err := write.send(context.Background(), client)
 
-				var uncertain ierror.UncertainOutcome
+				var uncertain ierror.OperationUncertain
 				require.ErrorAs(t, err, &uncertain)
 				require.Len(t, requestsFor(server.recorded(), write.operation), 1)
 				client.mtx.Lock()
@@ -494,7 +493,7 @@ func TestExchange_LostLinkKeepsTheSessionAndTheSentWrite(t *testing.T) {
 
 				err := write.send(ctx, client)
 
-				var uncertain ierror.UncertainOutcome
+				var uncertain ierror.OperationUncertain
 				require.ErrorAs(t, err, &uncertain)
 				client.mtx.Lock()
 				bound, kept := client.session.Bound(), client.session.SessionID()
@@ -569,7 +568,7 @@ func TestExchange_DenyReplyToASentWriteStaysDefinitive(t *testing.T) {
 			err := write.send(context.Background(), client)
 
 			require.ErrorIs(t, err, ierror.ErrNotConnected)
-			require.NotErrorIs(t, err, ierror.ErrUncertainOutcome)
+			require.NotErrorIs(t, err, ierror.ErrOperationUncertain)
 			written := requestsFor(server.recorded(), write.operation)
 			require.Len(t, written, 1)
 			require.ErrorIs(t, client.ResolveOperation(context.Background(), written[0].requestID()), ierror.ErrOperationNotRetained)
@@ -701,7 +700,7 @@ func TestSendMessages_RejectsAnEmptyReplyBody(t *testing.T) {
 	_, err = client.SendMessages(context.Background(),
 		numericIdentifier(t, 1), numericIdentifier(t, 1),
 		iggcon.PartitionId(0), []iggcon.IggyMessage{message})
-	assert.ErrorIs(t, err, ierror.ErrUncertainOutcome)
+	assert.ErrorIs(t, err, ierror.ErrOperationUncertain)
 }
 
 func TestSendMessages_AcceptsAZeroCountConfirmationBody(t *testing.T) {

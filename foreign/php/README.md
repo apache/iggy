@@ -264,6 +264,14 @@ foreach ($client->describeOptions(Iggy\OptionsScope::Topic) as $spec) {
   retained operations. The client keeps the proved outcomes of its last
   `max_pending_operations` replays, also across a session reset. A later
   `resolveOperation()` of a proved operation returns the same outcome without a request.
+- Receipt access follows the server's [session and revocation policy](../../core/server/README.md#sessions-and-retry-receipts).
+  An unresolved operation cannot recover its receipt after its original session
+  ends, even after a new login or account reactivation. A fresh send can duplicate it.
+- Each node counts the messages in its stream, topic and system stats. After a
+  successful send, a node that is not the partition primary shows the new count
+  only after the next prepare or commit broadcast. When no other write follows,
+  this delay is at most `cluster.commit_broadcast_interval` (500 ms by default).
+  See [metadata freshness and counters](../../core/server/README.md#metadata-freshness-and-counters).
 - Methods are exposed to PHP as camelCase, for example `createStream()` and
   `pollMessages()`.
 - Classes live in the `Iggy` namespace, for example `Iggy\Client` and

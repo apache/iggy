@@ -32,5 +32,6 @@ export interface TestWorld {
   streamKey?: Buffer,
   updateError?: unknown,
   optionSpecs?: OptionSpec[],
-  userId?: number
+  userId?: number,
+  callError?: Error
 };

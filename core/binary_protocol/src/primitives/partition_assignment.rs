@@ -23,11 +23,14 @@ use bytes::{BufMut, BytesMut};
 pub struct CreatedPartitionAssignment {
     pub partition_id: u32,
     pub consensus_group_id: u64,
+    /// Committed placement seed, sealed by the request body checksum and never
+    /// restamped when a later metadata view retransmits the create.
+    pub initial_view: u32,
 }
 
 impl CreatedPartitionAssignment {
-    /// Fixed wire size: a `u32` partition id and a `u64` consensus group id.
-    pub const ENCODED_SIZE: usize = 12;
+    /// Fixed wire size: partition id, consensus group id and initial view.
+    pub const ENCODED_SIZE: usize = 16;
 }
 
 impl WireEncode for CreatedPartitionAssignment {
@@ -38,6 +41,7 @@ impl WireEncode for CreatedPartitionAssignment {
     fn encode(&self, buf: &mut BytesMut) {
         buf.put_u32_le(self.partition_id);
         buf.put_u64_le(self.consensus_group_id);
+        buf.put_u32_le(self.initial_view);
     }
 }
 
@@ -55,8 +59,9 @@ impl WireDecode for CreatedPartitionAssignment {
             Self {
                 partition_id: read_u32_le(buf, 0)?,
                 consensus_group_id: read_u64_le(buf, 4)?,
+                initial_view: read_u32_le(buf, 12)?,
             },
-            12,
+            Self::ENCODED_SIZE,
         ))
     }
 }
@@ -69,12 +74,21 @@ mod tests {
     #[test]
     fn roundtrip() {
         let request = CreatedPartitionAssignment {
-            partition_id: 7,
-            consensus_group_id: 42,
+            partition_id: 0x0102_0304,
+            consensus_group_id: 0x0506_0708_090A_0B0C,
+            initial_view: 0x0D0E_0F10,
         };
         let bytes = request.to_bytes();
         let (decoded, consumed) = CreatedPartitionAssignment::decode(&bytes).unwrap();
         assert_eq!(consumed, bytes.len());
         assert_eq!(decoded, request);
+        assert_eq!(bytes.len(), CreatedPartitionAssignment::ENCODED_SIZE);
+        assert_eq!(
+            bytes.as_ref(),
+            &[4, 3, 2, 1, 12, 11, 10, 9, 8, 7, 6, 5, 16, 15, 14, 13]
+        );
+        for truncated in 0..bytes.len() {
+            assert!(CreatedPartitionAssignment::decode(&bytes[..truncated]).is_err());
+        }
     }
 }

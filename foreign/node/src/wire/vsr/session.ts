@@ -106,11 +106,6 @@ export class ConsensusSession {
     this.requestCounter += 1n;
     return id;
   }
-
-  /** Current counter value without advancing it. */
-  currentRequestId(): bigint {
-    return this.requestCounter;
-  }
 }
 
 function nonzeroIdentifier(): Buffer {

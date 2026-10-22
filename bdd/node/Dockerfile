@@ -22,6 +22,7 @@ COPY ./bdd/scenarios/basic_messaging.feature ./bdd/
 COPY ./bdd/scenarios/raw_command.feature ./bdd/
 COPY ./bdd/scenarios/stream_options.feature ./bdd/
 COPY ./bdd/scenarios/resource_options_patch.feature ./bdd/
+COPY ./bdd/scenarios/session_contract.feature ./bdd/
 
 RUN npm ci
 

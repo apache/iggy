@@ -269,9 +269,11 @@ const fn iggy_error_to_kafka_code(err: &IggyError) -> i16 {
         | IggyError::CannotEstablishConnection
         | IggyError::TcpError
         | IggyError::TransientNotAccepted => ERROR_NOT_LEADER_OR_FOLLOWER,
-        IggyError::TransientNotCommitted | IggyError::OperationUncertain(_) => {
-            ERROR_REQUEST_TIMED_OUT
-        }
+        // `OperationNotRetained` comes only from resolving the earlier operation that blocks a
+        // call. That call was not sent, so unlike `RequestTooOld` a retry cannot write it twice.
+        IggyError::TransientNotCommitted
+        | IggyError::OperationUncertain(_)
+        | IggyError::OperationNotRetained(_) => ERROR_REQUEST_TIMED_OUT,
         // The outcome was forgotten; a retry after client eviction could duplicate the write.
         // UNKNOWN_SERVER_ERROR is non-retryable in the Kafka protocol.
         IggyError::RequestTooOld => ERROR_UNKNOWN_SERVER_ERROR,
@@ -525,6 +527,17 @@ mod tests {
     fn uncertain_operation_maps_to_request_timed_out() {
         let err = BridgeError::Iggy(IggyError::OperationUncertain(42));
         assert_eq!(err.to_kafka_error_code(), ERROR_REQUEST_TIMED_OUT);
+    }
+
+    #[test]
+    fn given_an_unretained_blocker_when_mapped_should_answer_a_retriable_timeout() {
+        let err = BridgeError::Iggy(IggyError::OperationNotRetained(42));
+
+        assert_eq!(err.to_kafka_error_code(), ERROR_REQUEST_TIMED_OUT);
+        assert_eq!(
+            err.to_offset_error_code(),
+            ERROR_COORDINATOR_LOAD_IN_PROGRESS
+        );
     }
 
     #[test]

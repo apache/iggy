@@ -124,8 +124,6 @@ impl IggyClient {
     ///
     /// The string is marked `#[\SensitiveParameter]`, so exception traces never hold it.
     pub fn from_connection_string(connection_string: String) -> PhpResult<Self> {
-        // QUIC creates its endpoint before a blocking API call enters the runtime.
-        let _guard = runtime().enter();
         let client =
             RustIggyClient::from_connection_string(&connection_string).map_err(to_php_exception)?;
 

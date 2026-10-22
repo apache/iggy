@@ -59,6 +59,7 @@ struct GlobalContext {
     std::optional<std::vector<std::uint8_t>> last_stream_key;
     bool last_update_rejected = false;
     std::vector<iggy::OptionSpec> last_option_specs;
+    std::string call_error;
 
     GlobalContext()                                 = default;
     GlobalContext(const GlobalContext &)            = delete;

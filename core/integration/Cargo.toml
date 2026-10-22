@@ -38,6 +38,9 @@ arrow = { workspace = true }
 assert_cmd = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
+# Derives the HTTP relay proof key the way a cluster node does, so a test can
+# pose as a node relaying a partition request.
+blake3 = { workspace = true }
 bon = { workspace = true }
 bytemuck = { workspace = true }
 bytes = { workspace = true }

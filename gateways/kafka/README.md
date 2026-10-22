@@ -785,10 +785,14 @@ costs about 10 `get_topic` calls per second per topic. `ListOffsets` probes on t
   credential misconfiguration, and blaming its own ACLs for one is worse than an unexplained
   fatal error
 - Connection-shaped failures → `NOT_LEADER_OR_FOLLOWER` (6). On a send, `Disconnected`,
-  `EmptyResponse`, `TcpError` and `StaleClient` → 7 instead: the write may have landed
+  `EmptyResponse` and `TcpError` → 7 instead: the write may have landed. `StaleClient` stays 6:
+  the SDK returns it only for a send that Iggy rejected
 - An Iggy commit whose outcome is genuinely unknown (`TransientNotCommitted`) →
   `REQUEST_TIMED_OUT` (7) - retriable in real Kafka too, chosen because it's what a real broker
   sends for the same shape of failure, not to make a client stop retrying
+- A call behind an earlier operation whose outcome the SDK no longer keeps
+  (`OperationNotRetained`) → `REQUEST_TIMED_OUT` (7), not -1. The call itself was not sent, so a
+  retry cannot write it twice.
 - A bridge-side call timeout (`BridgeError::Timeout`) → `REQUEST_TIMED_OUT` (7), the same code and
   the same reasoning as `TransientNotCommitted` above - the SDK's write/read run on a task this
   timeout cannot abort, so the outcome is unknown, not known-safe-to-retry (see Connection config's

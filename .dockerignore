@@ -19,6 +19,8 @@
 /foreign/swift/.build
 /foreign/java/**/build
 /bdd/java/build
+/examples/java/**/build
+/web/build
 /foreign/csharp/**/bin
 /foreign/csharp/**/obj
 /foreign/cpp/bazel-*

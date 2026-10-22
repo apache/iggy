@@ -852,20 +852,31 @@ impl fmt::Display for AdvertisedAddressError {
 
 impl std::error::Error for AdvertisedAddressError {}
 
-/// Whether cluster-wide JWT key material exists: a configured `http.jwt`
-/// secret, or the signing key derived from the cluster PSK. When it does, a
-/// bearer minted on any node verifies on every node - the invariant
-/// follower-to-primary HTTP forwarding depends on. Callers gate `http.enabled`
-/// themselves; this covers only the key material.
+/// The cluster-wide JWT key material, when it exists: a configured `http.jwt`
+/// secret, else the cluster PSK the signing key derives from - the precedence
+/// the JWT manager applies. With it, a bearer minted on any node verifies on
+/// every node - the invariant follower-to-primary HTTP forwarding depends on.
+/// The key that proves a relay comes from a node derives from the same
+/// material, so relay proofs verify exactly where bearers do. Callers gate
+/// `http.enabled` themselves; this covers only the key material.
 ///
 /// Forwarding targets resolve from the roster (`ip:ports.http`); the config
 /// validator unconditionally requires a roster port for every enabled
 /// transport, so a forward never dials a node without a declared http port.
-pub fn http_forwarding_key_material(jwt: &HttpJwtConfig, cluster: &ClusterConfig) -> bool {
-    cluster.enabled
-        && ((cluster.auth.enabled && !cluster.auth.shared_secret.is_empty())
-            || !jwt.encoding_secret.is_empty()
-            || !jwt.decoding_secret.is_empty())
+pub fn http_forwarding_key_material<'a>(
+    jwt: &'a HttpJwtConfig,
+    cluster: &'a ClusterConfig,
+) -> Option<&'a str> {
+    if !cluster.enabled {
+        return None;
+    }
+    let psk = (cluster.auth.enabled && !cluster.auth.shared_secret.is_empty())
+        .then_some(&cluster.auth.shared_secret);
+    [&jwt.encoding_secret, &jwt.decoding_secret]
+        .into_iter()
+        .find(|secret| !secret.is_empty())
+        .or(psk)
+        .map(String::as_str)
 }
 
 impl Validatable<ConfigurationError> for ClusterConfig {
@@ -1945,6 +1956,40 @@ mod cluster_validate_tests {
             tls: ClusterTlsConfig::default(),
             coordinator: ClusterCoordinatorConfig::default(),
         }
+    }
+
+    /// Every node must pick the same material, or nodes refuse each other's
+    /// relay proofs: the secret the JWT manager signs with, else the PSK.
+    #[test]
+    fn given_jwt_secrets_and_a_psk_when_choosing_key_material_should_follow_the_jwt_signing_secret()
+    {
+        let jwt = |encoding: &str, decoding: &str| HttpJwtConfig {
+            encoding_secret: encoding.to_owned(),
+            decoding_secret: decoding.to_owned(),
+            ..HttpJwtConfig::default()
+        };
+        let mut cluster = cfg(Vec::new());
+        cluster.auth = ClusterAuthConfig {
+            enabled: true,
+            shared_secret: "psk".to_owned(),
+            previous_shared_secret: String::new(),
+        };
+        let material = |jwt: &HttpJwtConfig, cluster: &ClusterConfig| {
+            http_forwarding_key_material(jwt, cluster).map(str::to_owned)
+        };
+        assert_eq!(
+            material(&jwt("enc", "dec"), &cluster).as_deref(),
+            Some("enc")
+        );
+        assert_eq!(material(&jwt("", "dec"), &cluster).as_deref(), Some("dec"));
+        assert_eq!(material(&jwt("", ""), &cluster).as_deref(), Some("psk"));
+
+        cluster.auth.enabled = false;
+        assert_eq!(material(&jwt("", ""), &cluster), None);
+        assert_eq!(material(&jwt("enc", ""), &cluster).as_deref(), Some("enc"));
+
+        cluster.enabled = false;
+        assert_eq!(material(&jwt("enc", "dec"), &cluster), None);
     }
 
     #[test]

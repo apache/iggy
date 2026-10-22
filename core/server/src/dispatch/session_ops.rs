@@ -33,7 +33,7 @@
 
 use crate::dispatch::complete_session_binding;
 use crate::dispatch::failure::{
-    FrameChannel, send_eviction, send_host_frame, send_result_rejection,
+    ClientOrigin, FrameChannel, send_eviction, send_host_frame, send_result_rejection,
 };
 use crate::dispatch::login_error::LoginRegisterError;
 use crate::reply_frame::{
@@ -220,7 +220,7 @@ where
 async fn complete_login_register<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
-    transport_client_id: u128,
+    origin: ClientOrigin,
     vsr_client_id: u128,
     request_header: &RoutedRequestHeader,
     (user_id, user_created_at): (u32, IggyTimestamp),
@@ -234,6 +234,7 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
+    let transport_client_id = origin.id;
     let sdk_info = ClientSdkInfo {
         sdk_name: client_version.sdk_name.as_str().to_owned(),
         sdk_version: client_version.sdk_version.as_str().to_owned(),
@@ -282,8 +283,8 @@ where
     let commit = current_metadata_commit(shard).max(session);
     let reply = build_login_register_reply(request_header, vsr_client_id, session, commit, user_id);
     send_host_frame(
-        &shard.bus,
-        transport_client_id,
+        shard,
+        origin,
         reply.into_generic().into_frozen(),
         FrameChannel::Reply,
         "login_register_reply",
@@ -310,7 +311,7 @@ where
 #[allow(clippy::future_not_send)]
 async fn surface_login_failure<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    transport_client_id: u128,
+    origin: ClientOrigin,
     request_header: &RoutedRequestHeader,
     error: &LoginRegisterError,
 ) where
@@ -323,7 +324,7 @@ async fn surface_login_failure<B, MJ, S, SB>(
     if error.is_terminal() {
         send_eviction(
             shard,
-            transport_client_id,
+            origin,
             request_header.client,
             eviction_reason_for(error),
             "login_rejection",
@@ -334,7 +335,7 @@ async fn surface_login_failure<B, MJ, S, SB>(
         // replay may move to another node: see `transient_login_code`.
         send_result_rejection(
             shard,
-            transport_client_id,
+            origin,
             request_header,
             &transient_login_code(error),
             "login_transient_replay_hint",
@@ -386,6 +387,7 @@ const fn eviction_reason_for(error: &LoginRegisterError) -> EvictionReason {
 
 /// Per-shard heartbeat verifier: every `interval`, evict group-member
 /// connections that sent nothing for `max_age`, the session timeout.
+///
 /// Mirrors the legacy `verify_heartbeats` periodic task. Eviction
 /// removes the connection binding and sends `Eviction(StaleClient)`. The
 /// shared logical session and its group membership remain until committed
@@ -405,22 +407,15 @@ pub async fn run_heartbeat_verifier<B, MJ, S, SB>(
     SB: SuperblockStore + 'static,
 {
     loop {
-        // `Ok(_)`: stop signalled -> exit. `Err(_)`: interval elapsed -> pass.
-        // Waiting on the stop channel rather than sleeping past it keeps this
-        // task inside the shutdown drain budget, which is shorter than the
-        // heartbeat interval.
-        let stop_signal = compio::time::timeout(interval, stop_rx.recv()).await;
-        if stop_signal.is_ok() {
+        if shard::bus_timeout(&shard.bus, interval, stop_rx.recv())
+            .await
+            .is_some()
+        {
             break;
         }
-        // Production-only wall clock: the heartbeat verifier is spawned solely
-        // by `build_shard_for_thread`, never by the simulator's shell mode, so
-        // neither the interval wait above nor this read is on a deterministic
-        // path. Driving this task under the deterministic executor means
-        // routing both through the injected clock.
         let stale = sessions
             .borrow()
-            .collect_stale(max_age, std::time::Instant::now());
+            .collect_stale(max_age, shard.bus.monotonic_now());
         for transport_client_id in stale {
             // Preserve idle admin connections. Group-member connections get an
             // eviction notice; membership ends through committed lease expiry.
@@ -461,9 +456,11 @@ async fn evict_stale_client<B, MJ, S, SB>(
         transport_client_id,
         "evicted stale client (missed heartbeat); sending the eviction notice"
     );
+    // The verifier found the binding stale just now, so the notice goes to
+    // the installation serving the transport id at this moment.
     send_eviction(
         shard,
-        transport_client_id,
+        ClientOrigin::capture(&shard.bus, transport_client_id),
         transport_client_id,
         EvictionReason::StaleClient,
         "stale_client_eviction",
@@ -1011,7 +1008,7 @@ where
 pub(in crate::dispatch) async fn handle_logout_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
-    transport_client_id: u128,
+    origin: ClientOrigin,
     request: Message<RoutedRequestHeader>,
 ) where
     B: ShellBus,
@@ -1020,6 +1017,7 @@ pub(in crate::dispatch) async fn handle_logout_request<B, MJ, S, SB>(
     S: 'static,
     SB: SuperblockStore + 'static,
 {
+    let transport_client_id = origin.id;
     let Some((vsr_client_id, session)) = sessions.borrow().get_session(transport_client_id) else {
         // Logout on an unbound transport: the desired state already holds,
         // so answer ok. A silent drop would wedge the lockstep SDK on this
@@ -1032,8 +1030,8 @@ pub(in crate::dispatch) async fn handle_logout_request<B, MJ, S, SB>(
         let commit = current_metadata_commit(shard);
         let reply = build_empty_reply(request.header(), transport_client_id, 0, commit);
         send_host_frame(
-            &shard.bus,
-            transport_client_id,
+            shard,
+            origin,
             reply.into_generic().into_frozen(),
             FrameChannel::Reply,
             "unbound_logout_reply",
@@ -1059,8 +1057,8 @@ pub(in crate::dispatch) async fn handle_logout_request<B, MJ, S, SB>(
                 logout_deny_code(&error).as_code(),
             );
             send_host_frame(
-                &shard.bus,
-                transport_client_id,
+                shard,
+                origin,
                 reply.into_generic().into_frozen(),
                 FrameChannel::TypedDeny,
                 "logout_transient_deny",
@@ -1074,8 +1072,8 @@ pub(in crate::dispatch) async fn handle_logout_request<B, MJ, S, SB>(
 
     let reply = build_empty_reply(request.header(), vsr_client_id, session, commit);
     send_host_frame(
-        &shard.bus,
-        transport_client_id,
+        shard,
+        origin,
         reply.into_generic().into_frozen(),
         FrameChannel::Reply,
         "logout_reply",
@@ -1101,7 +1099,7 @@ const fn logout_deny_code(error: &MetadataSubmitError) -> IggyError {
 pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
-    transport_client_id: u128,
+    origin: ClientOrigin,
     request: Message<RoutedRequestHeader>,
 ) where
     B: ShellBus,
@@ -1110,13 +1108,14 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
     S: 'static,
     SB: SuperblockStore + 'static,
 {
+    let transport_client_id = origin.id;
     let body = request_body(&request);
     let vsr_client_id = request.header().client;
 
     if message_bus::is_server_internal_client(vsr_client_id) {
         send_eviction(
             shard,
-            transport_client_id,
+            origin,
             vsr_client_id,
             EvictionReason::MalformedLogin,
             "login_rejection",
@@ -1139,7 +1138,7 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
         );
         send_eviction(
             shard,
-            transport_client_id,
+            origin,
             vsr_client_id,
             EvictionReason::MalformedLogin,
             "login_rejection",
@@ -1157,7 +1156,7 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
         );
         send_eviction(
             shard,
-            transport_client_id,
+            origin,
             vsr_client_id,
             EvictionReason::IncompatibleProtocol,
             "login_rejection",
@@ -1180,7 +1179,7 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
                 if let Err(error) = complete_login_register(
                     shard,
                     sessions,
-                    transport_client_id,
+                    origin,
                     vsr_client_id,
                     request.header(),
                     account,
@@ -1190,8 +1189,7 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
                 .await
                 {
                     warn!(transport_client_id, error = %error, "login/register failed");
-                    surface_login_failure(shard, transport_client_id, request.header(), &error)
-                        .await;
+                    surface_login_failure(shard, origin, request.header(), &error).await;
                 }
                 return;
             }
@@ -1205,7 +1203,7 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
             }
             Err(error) => {
                 warn!(transport_client_id, error = %error, "login/register failed");
-                surface_login_failure(shard, transport_client_id, request.header(), &error).await;
+                surface_login_failure(shard, origin, request.header(), &error).await;
                 return;
             }
         }
@@ -1219,7 +1217,7 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
                 if let Err(error) = complete_login_register(
                     shard,
                     sessions,
-                    transport_client_id,
+                    origin,
                     vsr_client_id,
                     request.header(),
                     account,
@@ -1233,8 +1231,7 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
                         error = %error,
                         "login/register with PAT failed"
                     );
-                    surface_login_failure(shard, transport_client_id, request.header(), &error)
-                        .await;
+                    surface_login_failure(shard, origin, request.header(), &error).await;
                 }
                 return;
             }
@@ -1244,7 +1241,7 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
                     error = %error,
                     "login/register with PAT failed"
                 );
-                surface_login_failure(shard, transport_client_id, request.header(), &error).await;
+                surface_login_failure(shard, origin, request.header(), &error).await;
                 return;
             }
         }
@@ -1257,7 +1254,7 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
         );
         send_eviction(
             shard,
-            transport_client_id,
+            origin,
             request.header().client,
             EvictionReason::InvalidCredentials,
             "login_rejection",
@@ -1272,7 +1269,7 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
     );
     send_eviction(
         shard,
-        transport_client_id,
+        origin,
         request.header().client,
         EvictionReason::MalformedLogin,
         "login_rejection",
@@ -1570,6 +1567,7 @@ mod tests {
             TRANSPORT_A,
             "127.0.0.1:34567".parse().unwrap(),
             ClientTransportKind::Tcp,
+            std::time::Instant::now(),
         );
         let attachment = md
             .client_table
@@ -1585,6 +1583,7 @@ mod tests {
                 ACTING_USER,
                 attachment,
                 SESSION,
+                std::time::Instant::now(),
             )
             .unwrap();
 
@@ -1630,7 +1629,13 @@ mod tests {
 
         // A's logout lands in the window, through the real dispatch path.
         let logout = request_message(Operation::Logout, CLIENT_A, SESSION, 2, &[]);
-        handle_logout_request(&shard, &sessions, TRANSPORT_A, logout).await;
+        handle_logout_request(
+            &shard,
+            &sessions,
+            ClientOrigin::capture(&shard.bus, TRANSPORT_A),
+            logout,
+        )
+        .await;
 
         // DESIRED CONTRACT (red on current code): the client must never be
         // left in silence — that silence is what a one-shot CLI reports as
@@ -1880,7 +1885,13 @@ mod tests {
             ),
         ] {
             let error = LoginRegisterError::Transient(submit_error);
-            surface_login_failure(&shard, TRANSPORT, request.header(), &error).await;
+            surface_login_failure(
+                &shard,
+                ClientOrigin::capture(&shard.bus, TRANSPORT),
+                request.header(),
+                &error,
+            )
+            .await;
 
             let replies = bus.client_replies.borrow();
             assert_eq!(replies.len(), 1, "a transient login must answer a frame");

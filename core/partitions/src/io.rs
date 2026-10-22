@@ -21,7 +21,7 @@ use std::io::IoSlice;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::task::{Poll, Waker};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use compio::fs::File;
 use consensus::VsrState;
@@ -276,7 +276,9 @@ impl PartitionTeardown {
             self.io.drain().await?;
             if let Some(persistence) = &self.persistence {
                 persistence.retire();
-                persistence.drain_with_timeout().await?;
+                persistence
+                    .drain_with_timeout(compio::runtime::time::sleep)
+                    .await?;
             }
             Ok(())
         })
@@ -298,12 +300,33 @@ pub struct PartitionIoPlan {
     pub allocation_charge: usize,
 }
 
+/// A coordinator grant issued only after fresh target readiness.
+///
+/// The source node sets the deadline on its own clock when the grant arrives,
+/// so no coordinator, stalled or replaced, can extend it. The shard rechecks it
+/// and the captured history/view after draining, before election.
+#[derive(Debug)]
+pub struct PreparedPrimaryTransfer {
+    pub created_revision: u64,
+    pub expected_view: u32,
+    pub target: u8,
+    pub expires_at: Instant,
+}
+
+impl PreparedPrimaryTransfer {
+    #[must_use]
+    pub fn is_active_at(&self, now: Instant) -> bool {
+        now < self.expires_at
+    }
+}
+
 pub enum PartitionIoStep {
     WireActions(Vec<consensus::VsrAction>),
     Progress,
     Pending,
     Ready(PartitionIoPlan),
     Transition(server_common::MessageBag),
+    PrimaryTransfer(PreparedPrimaryTransfer),
     ViewApplied {
         actions: Vec<consensus::VsrAction>,
         peer: Option<u8>,

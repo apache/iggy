@@ -33,7 +33,7 @@ namespace Apache.Iggy.Tests.ConsumerTests;
 ///     0, so the consumer has to deliver its messages even below the last offset the old incarnation delivered,
 ///     and must never commit an offset of the old incarnation into it.
 /// </summary>
-public sealed class PartitionIncarnationTests
+public sealed partial class PartitionIncarnationTests
 {
     private const uint PartitionId = 3;
     private const ulong OriginalOffset = 100;
