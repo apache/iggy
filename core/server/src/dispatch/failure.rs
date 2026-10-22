@@ -41,9 +41,10 @@
 //! (`IggyShard::deny_partition_request_transient` and `stage_transient_deny`,
 //! both `TypedDeny`-shaped, the latter shedding the frame outright when its
 //! lifecycle queue is full). A frame for a client request returns here over
-//! the request's own channel and leaves through [`send_host_frame`]. What they
-//! send by client id reaches only an in-process (HTTP) reply slot, never a
-//! client socket.
+//! the request's own channel and leaves through [`send_host_frame`]. On the
+//! production bus, a frame they send by client id alone reaches neither a
+//! client socket nor an HTTP reply slot: both need the installation captured
+//! at admission, so the send fails with `ClientNotFound`.
 
 use crate::reply_frame::{build_deny_reply, current_metadata_commit};
 use crate::responses::NonReplicatedResponse;
