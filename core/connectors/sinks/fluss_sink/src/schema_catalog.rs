@@ -138,15 +138,6 @@ impl SchemaCatalog {
         Ok(Some(entry))
     }
 
-    fn infer_table_descriptor(
-        &self,
-        table: &TablePath,
-        messages: &[ConsumedMessage],
-    ) -> Result<TableDescriptor, Error> {
-        let schema = drop_null_fields(sample_and_infer_schema(messages)?, table)?;
-        table_descriptor_from_schema(&schema, table, self.table_config.get(&table.to_string()))
-    }
-
     pub(crate) fn store(&self, table: &TablePath, entry: Arc<SchemaEntry>) {
         self.table_to_entry
             .lock()
@@ -160,8 +151,15 @@ impl SchemaCatalog {
         messages: &[ConsumedMessage],
         writer: &impl TableWriter,
     ) -> Result<Arc<SchemaEntry>, Error> {
-        let table_descriptor = self
-            .infer_table_descriptor(table, messages)
+        let table_descriptor = sample_and_infer_schema(messages)
+            .and_then(|schema| drop_null_fields(schema, table))
+            .and_then(|schema| {
+                table_descriptor_from_schema(
+                    &schema,
+                    table,
+                    self.table_config.get(&table.to_string()),
+                )
+            })
             .map_err(|err| Error::InferSchemaFailed {
                 table_path: table.to_owned(),
                 reason: err.to_string(),
