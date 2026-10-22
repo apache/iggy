@@ -114,6 +114,8 @@ class PollRouterTest {
     private static final Duration NEVER = Duration.ofDays(1);
     // Outlasts the queueing of a dial, and passes while the dial waits for a permit.
     private static final Duration QUEUED_DIAL_BUDGET = Duration.ofMillis(200);
+    // Shorter than the retry interval of the router, so a failed attempt is the last one.
+    private static final Duration LAST_RETRY_WINDOW = Duration.ofMillis(40);
     private static final long LANE_FRAME_BYTES = 1;
     // The lane of partition 0, which sendMessage writes to.
     private static final ConsensusSession.LaneKey PARTITION_LANE = new ConsensusSession.LaneKey(INCARNATION, 0);
@@ -580,6 +582,76 @@ class PollRouterTest {
             reply.release();
             assertThat(primary.sentContexts).hasSize(3);
             assertThat(payload.refCnt()).isZero();
+        } finally {
+            router.clearSession().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            timers.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+            group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    /**
+     * A dead primary answers nothing, so only its lost link can move the partition. The next attempt reads the route
+     * again on the replica after the dead one, which a view change makes the next primary.
+     */
+    @Test
+    void shouldRouteAgainOnTheNextReplicaAfterThePrimaryLinkIsLost() throws Exception {
+        IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+        ManualTimers timers = new ManualTimers();
+        Coordinator coordinator = new Coordinator(group, timers);
+        Primary lost = new Primary(group);
+        Primary next = new Primary(group);
+        PollRouter router =
+                new PollRouter(() -> coordinator, endpoint -> endpoint.port() == PRIMARY_PORT ? lost : next);
+        router.coordinatorEndpoint(
+                () -> new ConnectionInfo(InetAddress.getLoopbackAddress().getHostAddress(), PRIMARY_PORT + 2));
+        try {
+            router.poll(pollPayload(), Optional.empty())
+                    .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
+                    .release();
+            lost.replies.add(CompletableFuture.failedFuture(new IggyConnectionException("Connection reset")));
+            coordinator.routePort = PRIMARY_PORT + 1;
+            next.routeReply = coordinator.sendRouted(
+                    GET_PARTITION_ROUTE_CODE,
+                    Unpooled.EMPTY_BUFFER,
+                    0,
+                    System.nanoTime() + TIMEOUT.toNanos(),
+                    new AsyncTcpConnection.TransientFailoverState());
+            var poll = router.poll(pollPayload(), Optional.empty());
+
+            timers.runLast();
+
+            poll.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS).release();
+            assertThat(lost.sentContexts).hasSize(2);
+            assertThat(next.routes).isEqualTo(1);
+            assertThat(next.sentContexts).hasSize(1);
+        } finally {
+            router.clearSession().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            timers.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+            group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    /** A write that never reached a primary before its deadline was not accepted, also when it lost its link. */
+    @Test
+    void shouldEndAWriteThatLostThePrimaryLinkAtItsDeadlineAsNotAccepted() throws Exception {
+        IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+        ManualTimers timers = new ManualTimers();
+        Coordinator coordinator = new Coordinator(group, timers);
+        Primary primary = new Primary(group);
+        PollRouter router = new PollRouter(() -> coordinator, endpoint -> primary);
+        try {
+            router.poll(pollPayload(), Optional.empty())
+                    .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
+                    .release();
+            primary.replies.add(CompletableFuture.failedFuture(new IggyConnectionException("Connection reset")));
+
+            var stored = router.partitionRequest(
+                    CommandCode.ConsumerOffset.STORE.getValue(),
+                    offsetPayload(),
+                    Optional.empty(),
+                    System.nanoTime() + LAST_RETRY_WINDOW.toNanos());
+
+            assertServerError(stored, AsyncTcpConnection.TRANSIENT_NOT_ACCEPTED);
         } finally {
             router.clearSession().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
             timers.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
@@ -1298,6 +1370,8 @@ class PollRouterTest {
         private final EventLoop timers;
         private long watermark;
         private int routeView;
+        // The node that a route read on this connection names as primary.
+        private int routePort = PRIMARY_PORT;
         private PartitionContext context = ROUTE_CONTEXT;
         private int routes;
         private CompletableFuture<Void> routeReady = CompletableFuture.completedFuture(null);
@@ -1356,7 +1430,7 @@ class PollRouterTest {
                             routing,
                             SESSION,
                             context.metadataOp().longValue(),
-                            PRIMARY_PORT,
+                            routePort,
                             context.incarnation().longValue())
                     .setIntLE(Long.BYTES * 2, routeView));
         }

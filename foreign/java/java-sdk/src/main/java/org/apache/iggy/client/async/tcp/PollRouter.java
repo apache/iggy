@@ -57,8 +57,10 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.NavigableMap;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.RejectedExecutionException;
@@ -96,7 +98,7 @@ final class PollRouter {
     private final Map<ConnectionInfo, Slot> connections = new HashMap<>();
     private final Set<Poll> pending = new HashSet<>();
     private volatile int rosterSize;
-    private final Map<Integer, ConnectionInfo> replicas = new HashMap<>();
+    private final NavigableMap<Integer, ConnectionInfo> replicas = new TreeMap<>();
     // Read without the monitor: a slot opens its link under the slot monitor, and the client reads this there to size
     // the dial timeout.
     private volatile ConnectionInfo metadataPrimary;
@@ -690,12 +692,16 @@ final class PollRouter {
             return;
         }
         IggyServerException refusal = AsyncTcpConnection.findServerError(error);
+        boolean notPrimary = refusal != null && refusal.getRawErrorCode() == AsyncTcpConnection.NOT_PRIMARY;
+        boolean lostLink = connectionFailed(error);
+        invalidateRoute(poll, error, notPrimary);
         if ((!poll.requiresLane || poll.isMutation())
-                && (connectionFailed(error)
+                && (lostLink
                         || (refusal != null
                                 && refusal.getRawErrorCode() == AsyncTcpConnection.TRANSIENT_NOT_COMMITTED))) {
             if (poll.deadline - System.nanoTime() <= TimeUnit.MILLISECONDS.toNanos(RETRY_INTERVAL_MILLIS)) {
-                poll.fail(uncommitted());
+                // A mutation that an attempt can have applied keeps that in its ticket, which fail() retains.
+                poll.fail(lostLink && (poll.isMutation() || !poll.dataSent) ? notAccepted() : uncommitted());
             } else {
                 coordinator
                         .get()
@@ -704,8 +710,6 @@ final class PollRouter {
             }
             return;
         }
-        boolean notPrimary = refusal != null && refusal.getRawErrorCode() == AsyncTcpConnection.NOT_PRIMARY;
-        invalidateRoute(poll, error, notPrimary);
         if (poll.restartHistory(refusal)) {
             attempt(poll);
             return;
@@ -724,11 +728,12 @@ final class PollRouter {
     @SuppressWarnings("checkstyle:CyclomaticComplexity")
     private synchronized void invalidateRoute(Poll poll, Throwable error, boolean notPrimary) {
         IggyServerException server = AsyncTcpConnection.findServerError(error);
+        boolean lostLink = connectionFailed(error);
         if (server != null && server.getRawErrorCode() == IggyErrorCode.HISTORY_UNAVAILABLE.getCode()) {
             TargetKey topic = poll.key.topic();
             routes.keySet().removeIf(route -> route.startsWith(topic));
             partitionCounts.remove(topic);
-        } else if (isNotAccepted(error) || notPrimary) {
+        } else if (isNotAccepted(error) || notPrimary || lostLink) {
             Route previous = routes.get(poll.key);
             if (previous != null) {
                 routes.put(
@@ -748,9 +753,25 @@ final class PollRouter {
                                 true,
                                 poll.backupMiss
                                         ? metadataPrimary
-                                        : notPrimary && poll.dataSent ? previous.endpoint : previous.hint));
+                                        : notPrimary && poll.dataSent
+                                                ? previous.endpoint
+                                                : lostLink ? nextReplica(previous.endpoint) : previous.hint));
             }
         }
+    }
+
+    /**
+     * The replica after {@code failed} in id order, or null if the roster does not name {@code failed}. A view change
+     * passes the primary to the next replica, so it is the likely primary after {@code failed}.
+     */
+    private synchronized ConnectionInfo nextReplica(ConnectionInfo failed) {
+        for (var replica : replicas.entrySet()) {
+            if (replica.getValue().equals(failed)) {
+                var next = replicas.higherEntry(replica.getKey());
+                return (next == null ? replicas.firstEntry() : next).getValue();
+            }
+        }
+        return null;
     }
 
     private void retryLifecycle(Poll poll, IggyServerException refusal) {
