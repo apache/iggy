@@ -29,7 +29,7 @@ use crate::{
     schema_catalog::SchemaCatalog,
     static_schema::{
         self, ColumnKind, RowContext, StaticTableBatchBuilder, StaticTableDescriptorBuilder,
-        create_extra_columns,
+        StaticTableLayout, create_extra_columns,
     },
     writer::{Op, Stat, TableWriter},
 };
@@ -42,6 +42,7 @@ pub(crate) struct StaticTableRouter {
     extra_columns: Vec<ColumnKind>,
     payload_format: PayloadFormat,
     table_config: Option<TableConfig>,
+    layout: Option<StaticTableLayout>,
 }
 
 impl StaticTableRouter {
@@ -61,17 +62,18 @@ impl StaticTableRouter {
             ),
             payload_format: config.payload_format,
             table_config,
+            layout: None,
         }
     }
 
-    pub(crate) async fn init(&self, writer: &impl TableWriter) -> Result<(), Error> {
-        let entry = self
+    pub(crate) async fn init(&mut self, writer: &impl TableWriter) -> Result<(), Error> {
+        let entry = match self
             .schema_catalog
             .load_from_table(&self.table_path, writer)
-            .await?;
-
-        if entry.is_none() {
-            if self.auto_create_table {
+            .await?
+        {
+            Some(entry) => entry,
+            None if self.auto_create_table => {
                 let table_descriptor =
                     self.build_table_descriptor().map_err(|err| Error::Init {
                         reason: err.to_string(),
@@ -80,8 +82,9 @@ impl StaticTableRouter {
                     .create_table_if_not_exists(&self.table_path, &table_descriptor)
                     .await?;
                 self.schema_catalog
-                    .load_from_table_descriptor(&self.table_path, table_descriptor)?;
-            } else {
+                    .load_from_table_descriptor(&self.table_path, table_descriptor)?
+            }
+            None => {
                 return Err(Error::Init {
                     reason: format!(
                         "Table not found, but auto create is disable for default table {}",
@@ -89,7 +92,16 @@ impl StaticTableRouter {
                     ),
                 });
             }
-        }
+        };
+
+        let layout = StaticTableLayout::new(Arc::clone(&entry.schema), self.payload_format)
+            .map_err(|error| Error::Init {
+                reason: format!(
+                    "Table {} does not match the static table layout: {error}",
+                    self.table_path
+                ),
+            })?;
+        self.layout = Some(layout);
         Ok(())
     }
 
@@ -109,17 +121,21 @@ impl StaticTableRouter {
         let mut last_error: Option<Error> = None;
         let message_count = messages.len();
 
-        let schema_entry = self
-            .schema_catalog
-            .get_schema_entry(&self.table_path)
-            .expect("Static schema needs to be initialized");
-
         let mut stat = Stat::default();
-        let mut builder = StaticTableBatchBuilder::new(
-            self.payload_format,
-            context,
-            Arc::clone(&schema_entry.schema),
-        );
+        let (Some(schema_entry), Some(layout)) = (
+            self.schema_catalog.get_schema_entry(&self.table_path),
+            self.layout.as_ref(),
+        ) else {
+            stat.inc_err_by(message_count as u64);
+            return RouteOutcome {
+                stat,
+                last_error: Some(Error::Init {
+                    reason: format!("Router for table {} is not initialized", self.table_path),
+                }),
+            };
+        };
+
+        let mut builder = StaticTableBatchBuilder::new(self.payload_format, context, layout);
         for message in messages {
             if let Err(error) = builder.append(message) {
                 error!(
@@ -352,7 +368,7 @@ mod tests {
     #[test]
     fn given_auto_create_enabled_when_initializing_should_create_expected_table() {
         let config = test_config();
-        let router = StaticTableRouter::new(&config);
+        let mut router = StaticTableRouter::new(&config);
         let writer = RecordingWriter::default();
 
         run_async(router.init(&writer)).expect("Router should initialize");
@@ -377,7 +393,7 @@ mod tests {
             auto_create_table: false,
             ..test_config()
         };
-        let router = StaticTableRouter::new(&config);
+        let mut router = StaticTableRouter::new(&config);
         let writer = RecordingWriter::default();
 
         let error = run_async(router.init(&writer)).expect_err("Router initialization should fail");
@@ -394,7 +410,7 @@ mod tests {
 
     #[test]
     fn given_table_creation_failure_when_initializing_should_return_writer_error() {
-        let router = StaticTableRouter::new(&test_config());
+        let mut router = StaticTableRouter::new(&test_config());
         let writer = RecordingWriter {
             fail_table_creation: true,
             ..RecordingWriter::default()
@@ -411,7 +427,7 @@ mod tests {
     #[test]
     fn given_valid_messages_when_routing_should_write_batch_with_context_and_return_success_stats()
     {
-        let router = StaticTableRouter::new(&test_config());
+        let mut router = StaticTableRouter::new(&test_config());
         let writer = RecordingWriter::default();
         let messages = vec![
             test_message(101, Payload::Text("first".to_string())),
@@ -468,7 +484,7 @@ mod tests {
 
     #[test]
     fn given_invalid_and_valid_messages_when_routing_should_skip_invalid_message() {
-        let router = StaticTableRouter::new(&test_config());
+        let mut router = StaticTableRouter::new(&test_config());
         let writer = RecordingWriter::default();
         let messages = vec![
             test_message(101, Payload::Raw(vec![0xff])),
@@ -509,7 +525,7 @@ mod tests {
 
     #[test]
     fn given_writer_skips_row_when_routing_should_report_writer_stats() {
-        let router = StaticTableRouter::new(&test_config());
+        let mut router = StaticTableRouter::new(&test_config());
         let writer = RecordingWriter {
             skipped_rows: 1,
             ..RecordingWriter::default()
@@ -536,7 +552,7 @@ mod tests {
 
     #[test]
     fn given_write_messages_router_should_write_with_append_mode() {
-        let router = StaticTableRouter::new(&test_config());
+        let mut router = StaticTableRouter::new(&test_config());
         let writer = RecordingWriter::default();
         let messages = vec![test_message(102, Payload::Text("valid".to_string()))];
 
@@ -561,7 +577,7 @@ mod tests {
 
     #[test]
     fn given_table_write_failure_when_routing_should_return_writer_error() {
-        let router = StaticTableRouter::new(&test_config());
+        let mut router = StaticTableRouter::new(&test_config());
         let writer = RecordingWriter {
             fail_table_write: true,
             ..RecordingWriter::default()

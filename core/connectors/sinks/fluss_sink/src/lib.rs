@@ -76,7 +76,7 @@ impl FlussSink {
 impl Sink for FlussSink {
     async fn open(&mut self) -> Result<(), Error> {
         self.writer.connect().await?;
-        if let Router::StaticTable(router) = &self.router {
+        if let Router::StaticTable(router) = &mut self.router {
             router.init(&self.writer).await?;
         }
         info!("Opened Fluss sink connector ID: {}", self.id);

@@ -87,6 +87,16 @@ pub(crate) enum Error {
     },
     #[error("Unsupported static table column: {name}")]
     UnsupportedColumn { name: String },
+    #[error("Static table has no '{PAYLOAD_COLUMN_NAME}' column")]
+    MissingPayloadColumn,
+    #[error(
+        "Static table column '{PAYLOAD_COLUMN_NAME}' has type {actual}, but payload format {payload_format:?} needs {expected}"
+    )]
+    PayloadColumnType {
+        payload_format: PayloadFormat,
+        expected: DataType,
+        actual: DataType,
+    },
 }
 
 impl From<FlussError> for Error {
@@ -218,6 +228,59 @@ impl TryFrom<&Field> for ColumnKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TableColumn {
+    Metadata(ColumnKind),
+    Payload,
+}
+
+impl TryFrom<&Field> for TableColumn {
+    type Error = Error;
+
+    fn try_from(field: &Field) -> Result<Self, Self::Error> {
+        if field.name() == PAYLOAD_COLUMN_NAME {
+            Ok(Self::Payload)
+        } else {
+            ColumnKind::try_from(field).map(Self::Metadata)
+        }
+    }
+}
+
+/// Column order of an existing static table, so batches match the table even
+/// when columns were added or reordered after it was created.
+#[derive(Debug)]
+pub(crate) struct StaticTableLayout {
+    schema: Arc<Schema>,
+    columns: Vec<TableColumn>,
+}
+
+impl StaticTableLayout {
+    pub(crate) fn new(schema: Arc<Schema>, payload_format: PayloadFormat) -> Result<Self, Error> {
+        let columns = schema
+            .fields()
+            .iter()
+            .map(|field| TableColumn::try_from(field.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let payload = schema
+            .field_with_name(PAYLOAD_COLUMN_NAME)
+            .map_err(|_| Error::MissingPayloadColumn)?;
+        let expected = match payload_format {
+            PayloadFormat::Bytea => DataType::Binary,
+            PayloadFormat::Json | PayloadFormat::Text => DataType::Utf8,
+        };
+        if payload.data_type() != &expected {
+            return Err(Error::PayloadColumnType {
+                payload_format,
+                expected,
+                actual: payload.data_type().clone(),
+            });
+        }
+
+        Ok(Self { schema, columns })
+    }
+}
+
 #[derive(Debug)]
 pub struct RowContext<'a> {
     pub stream: &'a str,
@@ -235,7 +298,7 @@ pub struct StaticTableBatchBuilder<'a> {
     payload_binary_builder: BinaryBuilder,
     payload_format: PayloadFormat,
     context: RowContext<'a>,
-    schema: Arc<Schema>,
+    layout: &'a StaticTableLayout,
     len: usize,
 }
 
@@ -243,7 +306,7 @@ impl<'a> StaticTableBatchBuilder<'a> {
     pub(crate) fn new(
         payload_format: PayloadFormat,
         context: RowContext<'a>,
-        schema: Arc<Schema>,
+        layout: &'a StaticTableLayout,
     ) -> Self {
         Self {
             id_builder: StringBuilder::new(),
@@ -257,7 +320,7 @@ impl<'a> StaticTableBatchBuilder<'a> {
             payload_string_builder: StringBuilder::new(),
             payload_format,
             context,
-            schema,
+            layout,
             len: 0,
         }
     }
@@ -296,19 +359,25 @@ impl<'a> StaticTableBatchBuilder<'a> {
             },
         };
 
-        for field in self.schema.fields.iter() {
-            let name = field.name().as_str();
-            match name {
-                MESSAGE_ID_COLUMN_NAME => self.id_builder.append_value(&id),
-                CHECKSUM_COLUMN_NAME => self.checksum_builder.append_value(checksum),
-                MESSAGE_OFFSET_COLUMN_NAME => self.message_offset_builder.append_value(offset),
-                MESSAGE_TIMESTAMP_COLUMN_NAME => {
+        for column in &self.layout.columns {
+            match column {
+                TableColumn::Metadata(ColumnKind::MessageId) => self.id_builder.append_value(&id),
+                TableColumn::Metadata(ColumnKind::Checksum) => {
+                    self.checksum_builder.append_value(checksum)
+                }
+                TableColumn::Metadata(ColumnKind::MessageOffset) => {
+                    self.message_offset_builder.append_value(offset)
+                }
+                TableColumn::Metadata(ColumnKind::MessageTimestamp) => {
                     self.message_timestamp_builder.append_value(timestamp)
                 }
-                ORIGIN_TIMESTAMP_COLUMN_NAME => {
+                TableColumn::Metadata(ColumnKind::OriginTimestamp) => {
                     self.origin_timestamp_builder.append_value(origin_timestamp)
                 }
-                _ => continue, // skipping unknown columns
+                TableColumn::Metadata(
+                    ColumnKind::Stream | ColumnKind::Topic | ColumnKind::PartitionId,
+                )
+                | TableColumn::Payload => {}
             }
         }
         self.len += 1;
@@ -316,40 +385,45 @@ impl<'a> StaticTableBatchBuilder<'a> {
     }
 
     pub(crate) fn finish(&mut self) -> Result<RecordBatch, Error> {
-        let mut cols: Vec<ArrayRef> = Vec::with_capacity(self.schema.fields.len());
+        let mut cols: Vec<ArrayRef> = Vec::with_capacity(self.layout.columns.len());
 
-        for field in self.schema.fields.iter() {
-            let name = field.name().as_str();
-            let array: ArrayRef = match name {
-                MESSAGE_ID_COLUMN_NAME => Arc::new(self.id_builder.finish()),
-                CHECKSUM_COLUMN_NAME => Arc::new(self.checksum_builder.finish()),
-                MESSAGE_OFFSET_COLUMN_NAME => Arc::new(self.message_offset_builder.finish()),
-                MESSAGE_TIMESTAMP_COLUMN_NAME => Arc::new(self.message_timestamp_builder.finish()),
-                ORIGIN_TIMESTAMP_COLUMN_NAME => Arc::new(self.origin_timestamp_builder.finish()),
-                STREAM_COLUMN_NAME => {
+        for column in &self.layout.columns {
+            let array: ArrayRef = match column {
+                TableColumn::Metadata(ColumnKind::MessageId) => Arc::new(self.id_builder.finish()),
+                TableColumn::Metadata(ColumnKind::Checksum) => {
+                    Arc::new(self.checksum_builder.finish())
+                }
+                TableColumn::Metadata(ColumnKind::MessageOffset) => {
+                    Arc::new(self.message_offset_builder.finish())
+                }
+                TableColumn::Metadata(ColumnKind::MessageTimestamp) => {
+                    Arc::new(self.message_timestamp_builder.finish())
+                }
+                TableColumn::Metadata(ColumnKind::OriginTimestamp) => {
+                    Arc::new(self.origin_timestamp_builder.finish())
+                }
+                TableColumn::Metadata(ColumnKind::Stream) => {
                     Arc::new(StringArray::new_repeated(self.context.stream, self.len))
                 }
-                TOPIC_COLUMN_NAME => {
+                TableColumn::Metadata(ColumnKind::Topic) => {
                     Arc::new(StringArray::new_repeated(self.context.topic, self.len))
                 }
-                PARTITION_ID_COLUMN_NAME => Arc::new(Int64Array::from_value(
+                TableColumn::Metadata(ColumnKind::PartitionId) => Arc::new(Int64Array::from_value(
                     i64::from(self.context.partition_id),
                     self.len,
                 )),
-                _ => continue, // skipping unknown columns
+                TableColumn::Payload => match self.payload_format {
+                    PayloadFormat::Bytea => Arc::new(self.payload_binary_builder.finish()),
+                    PayloadFormat::Json | PayloadFormat::Text => {
+                        Arc::new(self.payload_string_builder.finish())
+                    }
+                },
             };
             cols.push(array);
         }
 
-        let payload: ArrayRef = match self.payload_format {
-            PayloadFormat::Bytea => Arc::new(self.payload_binary_builder.finish()),
-            PayloadFormat::Json | PayloadFormat::Text => {
-                Arc::new(self.payload_string_builder.finish())
-            }
-        };
-        cols.push(payload);
         self.len = 0;
-        RecordBatch::try_new(Arc::clone(&self.schema), cols)
+        RecordBatch::try_new(Arc::clone(&self.layout.schema), cols)
             .map_err(|source| Error::RecordBatchCreation { source })
     }
 }
@@ -475,7 +549,7 @@ mod tests {
         MESSAGE_ID_COLUMN_NAME, MESSAGE_OFFSET_COLUMN_NAME, MESSAGE_TIMESTAMP_COLUMN_NAME,
         ORIGIN_TIMESTAMP_COLUMN_NAME, PARTITION_ID_COLUMN_NAME, PAYLOAD_COLUMN_NAME, RowContext,
         STREAM_COLUMN_NAME, StaticTableBatchBuilder, StaticTableDescriptorBuilder,
-        TIMESTAMP_PRECISION, TOPIC_COLUMN_NAME, UNSIGNED_64_DECIMAL_PRECISION,
+        StaticTableLayout, TIMESTAMP_PRECISION, TOPIC_COLUMN_NAME, UNSIGNED_64_DECIMAL_PRECISION,
         create_extra_columns,
     };
     use crate::{PayloadFormat, ResolvedFlussSinkConfig, config::TableConfig};
@@ -548,17 +622,19 @@ mod tests {
             .expect("Fluss schema should convert to Arrow schema")
     }
 
+    fn layout(payload_format: PayloadFormat, columns: &[ColumnKind]) -> StaticTableLayout {
+        StaticTableLayout::new(arrow_schema(payload_format, columns), payload_format)
+            .expect("Default table should match the static layout")
+    }
+
     fn build_arrow_rows(
         config: &ResolvedFlussSinkConfig,
         messages: Vec<ConsumedMessage>,
     ) -> RecordBatch {
         let columns = extra_columns(config);
         let context = test_context();
-        let mut builder = StaticTableBatchBuilder::new(
-            config.payload_format,
-            context,
-            arrow_schema(config.payload_format, &columns),
-        );
+        let layout = layout(config.payload_format, &columns);
+        let mut builder = StaticTableBatchBuilder::new(config.payload_format, context, &layout);
         for message in messages {
             builder.append(message).expect("Message should append");
         }
@@ -681,12 +757,9 @@ mod tests {
         let config = config_without_optional_columns(PayloadFormat::Text);
         let columns = extra_columns(&config);
         let context = test_context();
+        let layout = layout(config.payload_format, &columns);
 
-        let mut builder = StaticTableBatchBuilder::new(
-            config.payload_format,
-            context,
-            arrow_schema(config.payload_format, &columns),
-        );
+        let mut builder = StaticTableBatchBuilder::new(config.payload_format, context, &layout);
         let mut valid_message = test_message(Payload::Text("valid".to_string()));
         valid_message.id = 102;
         let messages = [test_message(Payload::Raw(vec![0xff])), valid_message];
@@ -783,6 +856,82 @@ mod tests {
         assert!(matches!(
             error,
             SchemaError::UnsupportedColumn { name } if name == PAYLOAD_COLUMN_NAME
+        ));
+    }
+
+    fn string_schema(names: &[&str]) -> Arc<arrow::datatypes::Schema> {
+        Arc::new(arrow::datatypes::Schema::new(
+            names
+                .iter()
+                .map(|name| Field::new(*name, DataType::Utf8, true))
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    #[test]
+    fn given_payload_before_metadata_column_when_building_batch_should_follow_table_order() {
+        let schema = string_schema(&[
+            MESSAGE_ID_COLUMN_NAME,
+            PAYLOAD_COLUMN_NAME,
+            STREAM_COLUMN_NAME,
+        ]);
+        let layout = StaticTableLayout::new(schema, PayloadFormat::Text)
+            .expect("Reordered table should match the static layout");
+        let mut builder =
+            StaticTableBatchBuilder::new(PayloadFormat::Text, test_context(), &layout);
+
+        builder
+            .append(test_message(Payload::Text("hello".to_string())))
+            .expect("Message should append");
+        let batch = builder.finish().expect("Record batch should build");
+
+        assert_eq!(
+            arrow_column::<StringArray>(batch.columns(), 1).value(0),
+            "hello"
+        );
+        assert_eq!(
+            arrow_column::<StringArray>(batch.columns(), 2).value(0),
+            "orders"
+        );
+    }
+
+    #[test]
+    fn given_unknown_column_when_building_layout_should_return_unsupported_column() {
+        let schema = string_schema(&[MESSAGE_ID_COLUMN_NAME, "notes", PAYLOAD_COLUMN_NAME]);
+
+        let error = StaticTableLayout::new(schema, PayloadFormat::Text)
+            .expect_err("Unknown column should be rejected");
+
+        assert!(matches!(
+            error,
+            SchemaError::UnsupportedColumn { name } if name == "notes"
+        ));
+    }
+
+    #[test]
+    fn given_missing_payload_column_when_building_layout_should_return_error() {
+        let schema = string_schema(&[MESSAGE_ID_COLUMN_NAME, STREAM_COLUMN_NAME]);
+
+        let error = StaticTableLayout::new(schema, PayloadFormat::Text)
+            .expect_err("Missing payload column should be rejected");
+
+        assert!(matches!(error, SchemaError::MissingPayloadColumn));
+    }
+
+    #[test]
+    fn given_string_payload_column_when_building_bytea_layout_should_return_type_error() {
+        let schema = string_schema(&[MESSAGE_ID_COLUMN_NAME, PAYLOAD_COLUMN_NAME]);
+
+        let error = StaticTableLayout::new(schema, PayloadFormat::Bytea)
+            .expect_err("Bytea format should need a binary payload column");
+
+        assert!(matches!(
+            error,
+            SchemaError::PayloadColumnType {
+                expected: DataType::Binary,
+                actual: DataType::Utf8,
+                ..
+            }
         ));
     }
 
