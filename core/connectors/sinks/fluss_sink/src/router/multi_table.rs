@@ -194,52 +194,38 @@ fn to_record_batch(
     Ok((batch, stat))
 }
 
-fn to_table_path(table: &str) -> Result<TablePath, Error> {
-    let parts = table.split('.').collect::<Vec<_>>();
-    if parts.len() != 2 {
-        return Err(Error::FailedToExtractTablePath {
-            reason: format!("Invalid table format, expected 'database.table', got {table}"),
-        });
-    }
-    let database = parts[0];
-    let table_name = parts[1];
+fn to_table_path(route: &str) -> Result<TablePath, Error> {
+    let (database, table_name) =
+        route
+            .split_once('.')
+            .ok_or_else(|| Error::FailedToExtractTablePath {
+                reason: format!("Invalid table format, expected 'database.table', got {route}"),
+            })?;
 
-    if let Some(reason) = TablePath::detect_invalid_name(database) {
-        return Err(Error::FailedToExtractTablePath {
-            reason: format!("Invalid name detected, for {database} : {reason}"),
-        });
-    }
-
-    if let Some(reason) = TablePath::detect_invalid_name(table_name) {
-        return Err(Error::FailedToExtractTablePath {
-            reason: format!("Invalid name detected, for {table_name} : {reason}"),
-        });
-    }
-
-    if let Some(reason) = TablePath::validate_prefix(database) {
-        return Err(Error::FailedToExtractTablePath {
-            reason: format!("Invalid name detected, for {database} : {reason}"),
-        });
-    }
-
-    if let Some(reason) = TablePath::validate_prefix(table_name) {
-        return Err(Error::FailedToExtractTablePath {
-            reason: format!("Invalid name detected, for {table_name} : {reason}"),
-        });
+    for name in [database, table_name] {
+        if let Some(reason) =
+            TablePath::detect_invalid_name(name).or_else(|| TablePath::validate_prefix(name))
+        {
+            return Err(Error::FailedToExtractTablePath {
+                reason: format!("Invalid name detected, for {name} : {reason}"),
+            });
+        }
     }
 
     Ok(TablePath::new(database, table_name))
 }
 
-fn extract_string_field(message: &ConsumedMessage, route_key: &str) -> Result<String, Error> {
+fn extract_string_field<'a>(
+    message: &'a ConsumedMessage,
+    route_key: &str,
+) -> Result<&'a str, Error> {
     let id = message.id;
     match &message.payload {
         Payload::Json(payload) => payload
             .as_object()
             .and_then(|obj| obj.get(route_key))
             .and_then(|value| value.as_str())
-            .map(str::to_owned)
-            .ok_or(Error::ExtractStringField {
+            .ok_or_else(|| Error::ExtractStringField {
                 id,
                 key: route_key.to_owned(),
                 reason: "Value not found".to_owned(),
@@ -252,49 +238,49 @@ fn extract_string_field(message: &ConsumedMessage, route_key: &str) -> Result<St
     }
 }
 
-fn partition_messages_by_route_key<I>(
-    messages: I,
+fn partition_messages_by_route_key(
+    messages: Vec<ConsumedMessage>,
     route_key: &str,
-) -> (HashMap<TablePath, Vec<ConsumedMessage>>, Stat)
-where
-    I: IntoIterator<Item = ConsumedMessage>,
-{
-    let mut table_to_message = HashMap::<TablePath, Vec<ConsumedMessage>>::new();
-    let mut extract = Stat::default();
-    let mut path_convert = Stat::default();
+) -> (HashMap<TablePath, Vec<ConsumedMessage>>, Stat) {
+    let mut stat = Stat::default();
+    let mut by_route = HashMap::<String, Vec<ConsumedMessage>>::new();
 
-    messages
-        .into_iter()
-        .filter_map(|message| match extract_string_field(&message, route_key) {
-            Ok(route_target) => Some((route_target, message)),
+    for message in messages {
+        let route = match extract_string_field(&message, route_key) {
+            Ok(route) => route,
             Err(error) => {
-                extract.inc_err();
+                stat.inc_err();
                 warn!(
-                    "FlussSink: Skipping message [{}] because route key extraction failed: {}",
-                    message.id, error
+                    "FlussSink: Skipping message [{}] because route key extraction failed: {error}",
+                    message.id
                 );
-                None
+                continue;
             }
-        })
-        .filter_map(|(table, message)| match to_table_path(&table) {
-            Ok(table_path) => Some((table_path, message)),
-            Err(error) => {
-                path_convert.inc_err();
-                warn!(
-                    "FlussSink: Skipping message [{}] because table path extraction failed: {}",
-                    message.id, error
-                );
-                None
-            }
-        })
-        .for_each(|(table_path, message)| {
-            table_to_message
-                .entry(table_path)
-                .or_default()
-                .push(message)
-        });
+        };
 
-    (table_to_message, extract.add(path_convert))
+        if let Some(group) = by_route.get_mut(route) {
+            group.push(message);
+        } else {
+            let route = route.to_owned();
+            by_route.insert(route, vec![message]);
+        }
+    }
+
+    let mut by_table = HashMap::<TablePath, Vec<ConsumedMessage>>::with_capacity(by_route.len());
+    for (route, messages) in by_route {
+        match to_table_path(&route) {
+            Ok(table_path) => by_table.entry(table_path).or_default().extend(messages),
+            Err(error) => {
+                stat.inc_err_by(messages.len() as u64);
+                warn!(
+                    "FlussSink: Skipping {} messages because route '{route}' is not a valid table path: {error}",
+                    messages.len()
+                );
+            }
+        }
+    }
+
+    (by_table, stat)
 }
 
 #[cfg(test)]
