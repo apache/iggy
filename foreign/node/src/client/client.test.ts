@@ -147,6 +147,27 @@ describe('Client lifecycle events', () => {
     }
   });
 
+  it('completes facade destruction after the raw client already emitted end', async () => {
+    const server = await startServer();
+    const client = new Client(clientConfig(server.server));
+    const raw = await client.clientProvider();
+    try {
+      await client.system.ping();
+      const ended = new Promise<void>((resolve) => raw.once('end', () => resolve()));
+      raw.destroy();
+      await ended;
+      let finished = false;
+      const destroyed = client.destroy();
+      void destroyed.then(() => { finished = true; });
+      await nextTick();
+      assert.ok(finished, 'facade must observe the completed raw shutdown');
+      assert.equal(client.destroy(), destroyed);
+    } finally {
+      raw.destroy();
+      await server.close();
+    }
+  });
+
   it('waits for a socket that was already closing when destroy was called', async () => {
     const server = await startServer();
     const client = new Client(clientConfig(server.server));

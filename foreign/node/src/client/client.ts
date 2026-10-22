@@ -24,7 +24,7 @@ import { normalizeClientConfig } from './client.config.js';
 export class Client extends CommandAPI {
   readonly _config: ClientConfig;
   private readonly events: CommandResponseStream;
-  private destroyPromise?: Promise<void>;
+  private readonly destroyPromise: Promise<void>;
 
   constructor(config: ClientConfigOrString) {
     const normalized = normalizeClientConfig(config);
@@ -32,6 +32,7 @@ export class Client extends CommandAPI {
     super(async () => client);
     this._config = normalized;
     this.events = client;
+    this.destroyPromise = new Promise<void>((resolve) => client.once('end', resolve));
   }
 
   /** Registers a listener for a connection lifecycle event. */
@@ -59,10 +60,7 @@ export class Client extends CommandAPI {
 
   /** Cancels calls immediately and resolves after the final `end` event. */
   destroy(): Promise<void> {
-    if (!this.destroyPromise) {
-      this.destroyPromise = new Promise<void>((resolve) => this.events.once('end', resolve));
-      this.events.destroy();
-    }
+    this.events.destroy();
     return this.destroyPromise;
   }
 }

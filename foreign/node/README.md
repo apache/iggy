@@ -255,8 +255,9 @@ client
 - `connected` fires when each socket is ready: TCP connected, or the TLS
   handshake done. It fires before the client logs in.
 - `error` receives each error the connection reports, for example a refused
-  dial. A command that the error fails still rejects with it. Without an
-  `error` listener, the client does not throw.
+  dial. Failed commands reject separately and can wrap the connection error
+  in `cause`, for example a refused login. Without an `error` listener,
+  the diagnostic event does not throw.
 - `end` fires once, after `destroy()` closes every link, and no lifecycle event
   follows it. Destruction cancels requests immediately; `await client.destroy()`
   resolves after `end`. Repeated calls share that completion.
