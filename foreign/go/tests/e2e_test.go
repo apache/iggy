@@ -18,9 +18,12 @@
 package tests_test
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"strconv"
@@ -411,11 +414,31 @@ func TestE2E_ConsumerOffsetAckLevelsOverTheRawPath(t *testing.T) {
 func TestE2E_FetchesASnapshot(t *testing.T) {
 	connected := connect(t)
 
-	// [compression = Stored][types count = 1][type = FilesystemOverview]
-	snapshot, err := connected.SendBinaryRequest(
-		context.Background(), getSnapshotCode, []byte{1, 1, 1})
-	require.NoError(t, err)
-	assert.NotEmpty(t, snapshot, "the snapshot archive is not empty")
+	for _, test := range []struct {
+		name        string
+		compression iggcon.SnapshotCompression
+	}{
+		{"stored", iggcon.SnapshotCompressionStored},
+		{"deflated", iggcon.SnapshotCompressionDeflated},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			snapshot, err := connected.Snapshot(ctx, test.compression,
+				[]iggcon.SystemSnapshotType{iggcon.SystemSnapshotTypeTest})
+			require.NoError(t, err)
+			require.NotEmpty(t, snapshot)
+
+			archive, err := zip.NewReader(bytes.NewReader(snapshot), int64(len(snapshot)))
+			require.NoError(t, err)
+			entry, err := archive.Open("test.txt")
+			require.NoError(t, err)
+			t.Cleanup(func() { assert.NoError(t, entry.Close()) })
+			content, err := io.ReadAll(entry)
+			require.NoError(t, err)
+			assert.Equal(t, "test", strings.TrimSpace(string(content)))
+		})
+	}
 }
 
 func TestE2E_AutoLoginSignsInOnConnect(t *testing.T) {

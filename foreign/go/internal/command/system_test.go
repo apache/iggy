@@ -19,9 +19,11 @@ package command
 
 import (
 	"bytes"
+	"errors"
 	"testing"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 )
 
 func TestGetClientMarshalBinary(t *testing.T) {
@@ -102,5 +104,94 @@ func TestEmptySystemCommandBodies(t *testing.T) {
 				t.Fatalf("%s body = %v, want empty", test.name, got)
 			}
 		})
+	}
+}
+
+func TestSnapshotMarshalBinary(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		compression iggcon.SnapshotCompression
+		want        byte
+	}{
+		{"stored", iggcon.SnapshotCompressionStored, 1},
+		{"deflated", iggcon.SnapshotCompressionDeflated, 2},
+		{"bzip2", iggcon.SnapshotCompressionBzip2, 3},
+		{"zstd", iggcon.SnapshotCompressionZstd, 4},
+		{"lzma", iggcon.SnapshotCompressionLzma, 5},
+		{"xz", iggcon.SnapshotCompressionXz, 6},
+		{"unknown compression", iggcon.SnapshotCompression(99), 99},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := &Snapshot{
+				Compression:   test.compression,
+				SnapshotTypes: []iggcon.SystemSnapshotType{iggcon.SystemSnapshotTypeTest},
+			}
+			if request.Code() != GetSnapshotFileCode {
+				t.Fatalf("Snapshot code = %d, want %d", request.Code(), GetSnapshotFileCode)
+			}
+			got, err := request.MarshalBinary()
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := []byte{test.want, 1, 4}
+			if !bytes.Equal(got, want) {
+				t.Fatalf("Snapshot body = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+func TestSnapshotMarshalBinaryTypes(t *testing.T) {
+	maxTypes := make([]iggcon.SystemSnapshotType, 255)
+	for index := range maxTypes {
+		maxTypes[index] = iggcon.SystemSnapshotTypeTest
+	}
+	for _, test := range []struct {
+		name  string
+		types []iggcon.SystemSnapshotType
+		want  []byte
+	}{
+		{"empty", nil, []byte{1, 0}},
+		{"all", []iggcon.SystemSnapshotType{iggcon.SystemSnapshotTypeAll}, []byte{1, 1, 100}},
+		{"unknown type", []iggcon.SystemSnapshotType{99}, []byte{1, 1, 99}},
+		{"multiple", []iggcon.SystemSnapshotType{
+			iggcon.SystemSnapshotTypeFileSystemOverview,
+			iggcon.SystemSnapshotTypeProcessList,
+			iggcon.SystemSnapshotTypeResourceUsage,
+			iggcon.SystemSnapshotTypeTest,
+			iggcon.SystemSnapshotTypeServerLogs,
+			iggcon.SystemSnapshotTypeServerConfig,
+		}, []byte{1, 6, 1, 2, 3, 4, 5, 6}},
+		{"maximum count", maxTypes, append([]byte{1, 255}, bytes.Repeat([]byte{4}, 255)...)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := (&Snapshot{
+				Compression:   iggcon.SnapshotCompressionStored,
+				SnapshotTypes: test.types,
+			}).MarshalBinary()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, test.want) {
+				t.Fatalf("Snapshot body = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestSnapshotMarshalBinaryRejectsTooManyTypes(t *testing.T) {
+	tooManyTypes := make([]iggcon.SystemSnapshotType, 256)
+	for index := range tooManyTypes {
+		tooManyTypes[index] = iggcon.SystemSnapshotTypeTest
+	}
+	got, err := (&Snapshot{
+		Compression:   iggcon.SnapshotCompressionStored,
+		SnapshotTypes: tooManyTypes,
+	}).MarshalBinary()
+	if !errors.Is(err, ierror.ErrInvalidCommand) {
+		t.Fatalf("Snapshot error = %v, want ErrInvalidCommand", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("Snapshot returned a body on error: %v", got)
 	}
 }

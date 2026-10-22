@@ -79,6 +79,10 @@ type Client interface {
 	// Authentication is required.
 	DescribeOptions(ctx context.Context, scope OptionsScope) ([]OptionSpec, error)
 
+	// Snapshot returns a ZIP archive of the requested server diagnostics.
+	// Authentication is required. All must be requested without other types.
+	Snapshot(ctx context.Context, compression SnapshotCompression, snapshotTypes []SystemSnapshotType) ([]byte, error)
+
 	// CreateTopic create a new topic.
 	// Authentication is required, and the permission to manage the topics.
 	//
