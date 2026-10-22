@@ -18,6 +18,8 @@
 use iggy::prelude::IggyError;
 use thiserror::Error;
 
+use crate::bridge::iggy_bridge::ClusterIdCall;
+use crate::cluster_id::InvalidClusterId;
 use crate::protocol::api::{
     ERROR_COORDINATOR_LOAD_IN_PROGRESS, ERROR_INVALID_PARTITIONS, ERROR_INVALID_REQUEST,
     ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_POLICY_VIOLATION,
@@ -84,12 +86,36 @@ pub enum BridgeError {
     /// raw or non-conformant client, not an expected path.
     #[error("invalid Kafka topic name '{kafka_topic}': {reason}")]
     InvalidKafkaTopicName { kafka_topic: String, reason: String },
-    /// `ensure_stream_and_topic` was asked for `partition_count == 0`. Enforced here, not only
-    /// at the `CreateTopics` wire-validation layer that's this bridge's only caller today - the
-    /// method is `pub`, so a future caller (a test, or a later Produce auto-create path)
-    /// bypassing that layer must not be able to provision a topic nothing can produce to.
+    /// `ensure_stream_and_topic`, `create_kafka_topic` or `create_kafka_partitions` was asked
+    /// for `partition_count == 0`. Enforced here, not only at the wire-validation layer of the
+    /// handlers that call them - the methods are `pub`, so a future caller (a test, or a later
+    /// Produce auto-create path) bypassing that layer must not be able to provision a topic
+    /// nothing can produce to, or spend a replicated log entry adding nothing.
     #[error("partition count must be at least 1, got 0 for topic '{kafka_topic}'")]
     InvalidPartitionCount { kafka_topic: String },
+    /// The message Iggy holds as the cluster id is not one. Read once, at startup.
+    #[error(
+        "the earliest stored message of Iggy topic '{stream}/{topic}' is not a Kafka cluster \
+         id: {source}. With every gateway stopped, replace that message with a valid id, or \
+         delete the topic to start a new cluster"
+    )]
+    InvalidClusterId {
+        stream: String,
+        topic: &'static str,
+        source: InvalidClusterId,
+    },
+    /// A call to Iggy for the cluster id failed. Made only at startup.
+    #[error(
+        "cannot {call} '{}' for the Kafka cluster id: {source}{}",
+        call.target(stream, topic),
+        call.permission_hint(source, stream)
+    )]
+    ClusterIdCall {
+        call: ClusterIdCall,
+        stream: String,
+        topic: &'static str,
+        source: Box<Self>,
+    },
 }
 
 impl BridgeError {
@@ -120,7 +146,9 @@ impl BridgeError {
             // is reachable only if a future caller starts constructing configs at request time.
             // `UNKNOWN_SERVER_ERROR` at least doesn't claim a specific, wrong cause the way
             // `UNSUPPORTED_VERSION` (misleadingly implies a Kafka API version mismatch) would.
-            Self::InvalidConfig(_) => ERROR_UNKNOWN_SERVER_ERROR,
+            Self::InvalidConfig(_) | Self::InvalidClusterId { .. } | Self::ClusterIdCall { .. } => {
+                ERROR_UNKNOWN_SERVER_ERROR
+            }
         }
     }
 
@@ -248,6 +276,12 @@ const fn iggy_error_to_kafka_code(err: &IggyError) -> i16 {
         // The node is at `[metadata] partitions_max`. Kafka answers a create that breaks a
         // broker-side rule with 44, and the request itself is valid, so not `INVALID_REQUEST`.
         IggyError::PartitionsLimitReached => ERROR_POLICY_VIOLATION,
+        // A topic created with a fixed partition count refuses `CreatePartitions`. The same
+        // reasoning: the request is one Kafka would accept, and a rule on the server refuses it.
+        IggyError::PartitionResizeDisabled => ERROR_POLICY_VIOLATION,
+        // The topic has no partition ids left to mint. A server-side rule refuses a valid
+        // request, as with the two above.
+        IggyError::PartitionIdSpaceExhausted => ERROR_POLICY_VIOLATION,
         // Deliberately NOT special-cased here to ERROR_NONE: this function is shared by every
         // handler's error path, but "the operation did commit, so report success" only holds for
         // a caller that issued a *write* - the SDK's own reconnect path replayed a write whose
@@ -322,6 +356,18 @@ mod tests {
     #[test]
     fn partitions_limit_reached_maps_to_policy_violation() {
         let err = BridgeError::Iggy(IggyError::PartitionsLimitReached);
+        assert_eq!(err.to_kafka_error_code(), ERROR_POLICY_VIOLATION);
+    }
+
+    #[test]
+    fn partition_resize_disabled_maps_to_policy_violation() {
+        let err = BridgeError::Iggy(IggyError::PartitionResizeDisabled);
+        assert_eq!(err.to_kafka_error_code(), ERROR_POLICY_VIOLATION);
+    }
+
+    #[test]
+    fn partition_id_space_exhausted_maps_to_policy_violation() {
+        let err = BridgeError::Iggy(IggyError::PartitionIdSpaceExhausted);
         assert_eq!(err.to_kafka_error_code(), ERROR_POLICY_VIOLATION);
     }
 
