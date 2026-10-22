@@ -274,10 +274,23 @@ HTTP retries 429 and 503 responses, including `relay_refused`, within its existi
 30-second retry budget. It uses the delta value of `Retry-After`, or 50 ms when
 that value is absent. Retained-operation recovery below applies to TCP.
 
+On a multi-node cluster, an HTTP call often reaches a node that is not the
+partition primary. For message sends, polls and consumer offset calls, that
+node relays the call to the primary. The relay needs identical `http.jwt`
+secrets or `cluster.auth` on every node. Without that key material, these calls
+answer 503 with code 58. See
+[HTTP routing and backpressure](../../core/server/README.md#http-routing-and-backpressure).
+
 Receipt access follows the server's [session and revocation policy](../../core/server/README.md#sessions-and-retry-receipts).
 An unresolved operation cannot recover its receipt after its original session
 ends, even after a new login or account reactivation. A fresh send can duplicate
 that operation.
+
+Each node counts the messages in its stream, topic and system stats. After a
+successful send, a node that is not the partition primary shows the new count
+only after the next prepare or commit broadcast. When no other write follows,
+this delay is at most `cluster.commit_broadcast_interval` (500 ms by default).
+See [metadata freshness and counters](../../core/server/README.md#metadata-freshness-and-counters).
 
 Within one call deadline, the SDK retries an unresolved replicated mutation using its original session,
 request id, context, and frozen frame. Metadata mutations share one lane; partition mutations share a lane

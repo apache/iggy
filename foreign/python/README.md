@@ -282,10 +282,23 @@ keeps its configured HTTP retry policy and does not support operation recovery.
 HTTP 503 `relay_refused` follows that policy; the Rust-backed HTTP retry schedule
 does not use the server's `Retry-After` header.
 
+On a multi-node cluster, an HTTP call often reaches a node that is not the
+partition primary. For message sends, polls and consumer offset calls, that
+node relays the call to the primary. The relay needs identical `http.jwt`
+secrets or `cluster.auth` on every node. Without that key material, these calls
+answer 503 with code 58. See
+[HTTP routing and backpressure](../../core/server/README.md#http-routing-and-backpressure).
+
 Receipt access follows the server's [session and revocation policy](../../core/server/README.md#sessions-and-retry-receipts).
 An unresolved operation cannot recover its receipt after its original session
 ends, even after a new login or account reactivation. A fresh send can duplicate
 that operation.
+
+Each node counts the messages in its stream, topic and system stats. After a
+successful send, a node that is not the partition primary shows the new count
+only after the next prepare or commit broadcast. When no other write follows,
+this delay is at most `cluster.commit_broadcast_interval` (500 ms by default).
+See [metadata freshness and counters](../../core/server/README.md#metadata-freshness-and-counters).
 
 `PendingOperationError` exposes the exact integer `operation_id`, the numeric
 `code`, and `kind` (`"uncertain"`, `"lane_blocked"`, or `"not_retained"`). On the

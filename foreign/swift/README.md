@@ -219,6 +219,12 @@ reactivation or a new login. Swift has no resolver for that receipt; a fresh sen
 can duplicate the earlier write. See the server's
 [session and revocation policy](../../core/server/README.md#sessions-and-retry-receipts).
 
+Each node counts the messages in its stream, topic and system stats. After a
+successful send, a node that is not the partition primary shows the new count
+only after the next prepare or commit broadcast. When no other write follows,
+this delay is at most `cluster.commit_broadcast_interval` (500 ms by default).
+See [metadata freshness and counters](../../core/server/README.md#metadata-freshness-and-counters).
+
 ## Testing
 
 ```bash

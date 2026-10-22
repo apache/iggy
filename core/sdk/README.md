@@ -109,6 +109,12 @@ partition permission revocation prevents resolution with 41 until a re-grant;
 metadata can replay the user's own committed cached result without a new
 permission check. A fresh application send can duplicate an uncertain operation.
 
+Each node counts the messages in its stream, topic and system stats. After a
+successful send, a node that is not the partition primary shows the new count
+only after the next prepare or commit broadcast. When no other write follows,
+this delay is at most `cluster.commit_broadcast_interval` (500 ms by default).
+See [metadata freshness and counters](../server/README.md#metadata-freshness-and-counters).
+
 An explicit sign-in or logout ends earlier calls: unsent calls fail with 40,
 and possibly applied mutations remain uncertain. SDK-managed recovery can keep
 an unsent call waiting for a session or a primary within its original deadline.
@@ -125,6 +131,13 @@ header. This retry support does not provide retained-operation recovery.
 If the last 503 body carries code 58, the call returns `TransientNotAccepted`.
 A write that possibly committed, for example after a 504 or a lost reply, is
 not sent again and returns `TransientNotCommitted`.
+
+On a multi-node cluster, an HTTP call often reaches a node that is not the
+partition primary. For message sends, polls and consumer offset calls, that
+node relays the call to the primary. The relay needs identical `http.jwt`
+secrets or `cluster.auth` on every node. Without that key material, these calls
+answer 503 with code 58. See
+[HTTP routing and backpressure](../server/README.md#http-routing-and-backpressure).
 
 A committed password change or rename of the signed-in user updates the
 credentials that the client signs in with again. This holds for a typed call, a
