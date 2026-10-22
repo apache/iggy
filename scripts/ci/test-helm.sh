@@ -284,12 +284,26 @@ validate() {
   grep -q 'name: tcp-replica' "$HELM_RENDER_DIR/cluster.yaml"
 
   grep -q 'name: IGGY_CLUSTER_AUTH_SHARED_SECRET' "$HELM_RENDER_DIR/cluster.yaml"
-  grep -q 'name: IGGY_SYSTEM_ENCRYPTION_KEY' "$HELM_RENDER_DIR/cluster.yaml"
+  grep -q 'name: IGGY_ENCRYPTION_KEY' "$HELM_RENDER_DIR/cluster.yaml"
   grep -q 'name: IGGY_HTTP_JWT_ENCODING_SECRET' "$HELM_RENDER_DIR/cluster.yaml"
   if grep -qE '^ +(encryptionKey|clusterSharedSecret|jwtEncodingSecret):' "$HELM_RENDER_DIR/cluster.yaml"; then
     echo "Error: cluster render inlined a secret value instead of referencing the existing Secret" >&2
     exit 1
   fi
+
+  helm template iggy "$CHART_DIR" \
+    --set server.persistence.enabled=true \
+    > "$HELM_RENDER_DIR/persistence.yaml"
+  grep -q '^    type: Recreate$' "$HELM_RENDER_DIR/persistence.yaml"
+  if grep -q '^  strategy:$' "$HELM_RENDER_DIR/default.yaml"; then
+    echo "Error: the default render without persistence set an update strategy" >&2
+    exit 1
+  fi
+  helm template iggy "$CHART_DIR" \
+    --set server.persistence.enabled=true \
+    --set server.strategy.type=RollingUpdate \
+    > "$HELM_RENDER_DIR/persistence-rolling.yaml"
+  grep -q '^    type: RollingUpdate$' "$HELM_RENDER_DIR/persistence-rolling.yaml"
 
   helm template iggy "$CHART_DIR" \
     --set server.encryption.enabled=true \
@@ -300,10 +314,10 @@ validate() {
   grep -q '^                  name: iggy-secrets$' "$HELM_RENDER_DIR/generated-secret.yaml"
   grep -q '^                  key: encryptionKey$' "$HELM_RENDER_DIR/generated-secret.yaml"
   test "$(grep -c '^kind: Secret$' "$HELM_RENDER_DIR/generated-secret.yaml")" -eq 2
-  grep -q 'name: IGGY_SYSTEM_ENCRYPTION_ENABLED' "$HELM_RENDER_DIR/generated-secret.yaml"
-  grep -q 'name: IGGY_SYSTEM_ENCRYPTION_KEY' "$HELM_RENDER_DIR/generated-secret.yaml"
-  if grep -q 'name: IGGY_ENCRYPTION_' "$HELM_RENDER_DIR/generated-secret.yaml"; then
-    echo "Error: the pinned server image requires the legacy encryption variables" >&2
+  grep -q 'name: IGGY_ENCRYPTION_ENABLED' "$HELM_RENDER_DIR/generated-secret.yaml"
+  grep -q 'name: IGGY_ENCRYPTION_KEY' "$HELM_RENDER_DIR/generated-secret.yaml"
+  if grep -q 'name: IGGY_SYSTEM_ENCRYPTION_' "$HELM_RENDER_DIR/generated-secret.yaml"; then
+    echo "Error: the pinned server image requires the flat encryption variables" >&2
     exit 1
   fi
 
@@ -313,6 +327,13 @@ validate() {
     --set server.encryption.existingSecret.name=shared-key \
     > "$HELM_RENDER_DIR/legacy-encryption.yaml"
   grep -q 'name: IGGY_SYSTEM_ENCRYPTION_KEY' "$HELM_RENDER_DIR/legacy-encryption.yaml"
+
+  helm template iggy "$CHART_DIR" \
+    --set-string server.image.tag=0.9.0-edge.8 \
+    --set server.encryption.enabled=true \
+    --set server.encryption.existingSecret.name=shared-key \
+    > "$HELM_RENDER_DIR/auto-flat-encryption.yaml"
+  grep -q 'name: IGGY_ENCRYPTION_KEY' "$HELM_RENDER_DIR/auto-flat-encryption.yaml"
 
   helm template iggy "$CHART_DIR" \
     --set-string server.image.tag=custom-flat \
@@ -335,12 +356,10 @@ validate() {
     > "$HELM_RENDER_DIR/custom-legacy-encryption.yaml"
   grep -q 'name: IGGY_SYSTEM_ENCRYPTION_KEY' "$HELM_RENDER_DIR/custom-legacy-encryption.yaml"
 
-  for image_tag in custom-unknown 0.9.0-edge.8; do
-    assert_render_rejected "encryption config layout unknown for ${image_tag}" \
-      --set-string server.image.tag="$image_tag" \
-      --set server.encryption.enabled=true \
-      --set server.encryption.existingSecret.name=shared-key
-  done
+  assert_render_rejected "encryption config layout unknown for custom-unknown" \
+    --set-string server.image.tag=custom-unknown \
+    --set server.encryption.enabled=true \
+    --set server.encryption.existingSecret.name=shared-key
   assert_render_rejected "invalid encryption config layout" \
     --set server.encryption.enabled=true \
     --set server.encryption.configVersion=invalid \

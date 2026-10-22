@@ -110,8 +110,8 @@ server:
     # -- Enable encryption at rest
     enabled: false
     # -- Encryption config layout: `auto` selects `legacy` for released image
-    # versions through 0.9.0-edge.7. Set `flat` for newer server builds, or
-    # `legacy` for custom builds that still use `[system.encryption]`.
+    # versions through 0.9.0-edge.7 and `flat` for later ones. Set `flat` or
+    # `legacy` explicitly for custom tags.
     configVersion: auto
     # -- 32-byte key, base64 encoded. Ignored when `existingSecret.name` is set.
     # Prefer `existingSecret` outside development: a value here is stored in the
@@ -206,7 +206,9 @@ server:
 
   # -- Deployment update strategy. Empty lets the chart choose: `Recreate` when
   # `hostNetwork` is set, because a rolling update would wait forever for a
-  # replacement pod that cannot bind host ports the outgoing pod still holds,
+  # replacement pod that cannot bind host ports the outgoing pod still holds;
+  # `Recreate` when persistence is enabled, because a rolling update starts the
+  # replacement server while the outgoing one is still running on the volume;
   # and the Kubernetes default otherwise.
   strategy: {}
 
