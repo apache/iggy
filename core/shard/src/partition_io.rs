@@ -5604,6 +5604,103 @@ mod tests {
         elect_beside_proven_backup(namespace, &backup, &candidate, &store).await;
     }
 
+    /// A backup adopts a view whose log ends below an op it held. Dropping that op
+    /// proves the adopted log with no repair frame, so no frame moves the chain
+    /// anchor off the dropped op. The next view change reaches the backup before
+    /// any prepare of the adopted view.
+    #[compio::test]
+    async fn given_adopted_head_below_held_op_when_start_view_change_precedes_any_prepare_should_elect_primary()
+     {
+        Box::pin(elect_after_dropping_held_op(false)).await;
+    }
+
+    /// As above, but the adopted head is the commit point. A segment holds it, so
+    /// the resident headers no longer do.
+    #[compio::test]
+    async fn given_evicted_commit_point_below_held_op_when_start_view_change_precedes_any_prepare_should_elect_primary()
+     {
+        Box::pin(elect_after_dropping_held_op(true)).await;
+    }
+
+    /// If `head_committed`, the adopted head is also the commit point, and the
+    /// backup holds it only in the repair ring.
+    #[allow(clippy::future_not_send)]
+    async fn elect_after_dropping_held_op(head_committed: bool) {
+        const ADOPTED_HEAD: u64 = 1;
+        const HELD_HEAD: u64 = ADOPTED_HEAD + 1;
+        let commit = if head_committed { ADOPTED_HEAD } else { 0 };
+        let directory = tempfile::tempdir().unwrap();
+        let store = Rc::new(HeldSuperblock {
+            entered: RefCell::new(None),
+            held: RefCell::new(None),
+        });
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let prepares =
+            primary_prepares(&Rc::new(IggyMessageBus::new(0)), namespace, HELD_HEAD).await;
+        let adopted = usize::try_from(ADOPTED_HEAD).unwrap();
+        let backup = HeadlessReplica::journaled(
+            HEADLESS_BACKUP,
+            namespace,
+            &prepares,
+            Some((directory.path(), &store)),
+        )
+        .await;
+        assert_eq!(
+            backup.partition(namespace).log.journal().inner.last_op(),
+            Some(HELD_HEAD)
+        );
+        let candidate =
+            HeadlessReplica::journaled(HEADLESS_CANDIDATE, namespace, &prepares[..adopted], None)
+                .await;
+        if head_committed {
+            for replica in [&backup, &candidate] {
+                replica
+                    .partition(namespace)
+                    .consensus()
+                    .restore_commit_state(commit, commit);
+            }
+            let journal = &backup.partition(namespace).log.journal().inner;
+            assert_eq!(
+                journal.evict_prefix(adopted).len(),
+                prepares.len() - adopted
+            );
+            assert!(journal.header_by_op(ADOPTED_HEAD).is_none());
+            assert!(journal.repair_header(ADOPTED_HEAD).is_some());
+        }
+        let start_view = start_view_suffix(
+            namespace,
+            HEADLESS_VIEW,
+            ADOPTED_HEAD,
+            commit,
+            &[*prepares[adopted - 1].header()],
+        );
+        for replica in [&backup, &candidate] {
+            replica.owner.on_start_view(start_view.clone()).await;
+        }
+        // The adoption leaves the drop of the held op to the IO lane, and the
+        // backup runs nothing once its proof settles.
+        let mut scratch = Vec::new();
+        let settling = async {
+            while backup.partition(namespace).consensus().view_log_unproven() {
+                backup.step(&mut scratch).await;
+            }
+        };
+        compio::time::timeout(REPLY_DEADLINE, Box::pin(settling))
+            .await
+            .expect("dropping the held op must prove the adopted log");
+        let partition = backup.partition(namespace);
+        assert!(partition.repair.is_none());
+        assert_eq!(
+            partition.log.journal().inner.last_op(),
+            (!head_committed).then_some(ADOPTED_HEAD)
+        );
+        assert_eq!(
+            partition.consensus().sequencer().current_sequence(),
+            ADOPTED_HEAD
+        );
+        elect_beside_proven_backup(namespace, &backup, &candidate, &store).await;
+    }
+
     /// The walk refuses an unproven view log, so a resident op after
     /// `commit_min` cannot move a group whose proof waits on a missing body.
     /// When the session ceiling refuses the arm at `StartView` adoption, the

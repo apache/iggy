@@ -12237,7 +12237,20 @@ async fn reconcile_partition_view_divergence<B, SB>(
             |op| partition.log.journal().inner.header_by_op(op),
         ) {
             consensus::ViewLogProof::Proven => {
-                partition.consensus().settle_view_log_proof();
+                let consensus = partition.consensus();
+                consensus.settle_view_log_proof();
+                // An adoption moves the sequencer, not the chain anchor. If the
+                // journal already held the adopted head, no repair frame moves the
+                // anchor, which then names a dropped op the WAL cannot certify.
+                // A durable commit point survives only in the repair ring.
+                if let Some(head) = partition
+                    .log
+                    .journal()
+                    .inner
+                    .repair_header(consensus.sequencer().current_sequence())
+                {
+                    consensus.set_last_prepare_checksum(head.checksum);
+                }
                 return;
             }
             consensus::ViewLogProof::Missing {
