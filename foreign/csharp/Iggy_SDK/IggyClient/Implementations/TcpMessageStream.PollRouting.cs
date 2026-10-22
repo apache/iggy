@@ -535,6 +535,7 @@ public sealed partial class TcpMessageStream
         }
         catch (OperationCanceledException) when (!token.IsCancellationRequested)
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             if (generation == _consensusSession.Generation && refusal is not null)
             {
                 ExceptionDispatchInfo.Throw(refusal);

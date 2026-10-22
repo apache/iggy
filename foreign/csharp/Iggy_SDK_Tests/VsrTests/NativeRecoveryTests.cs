@@ -773,6 +773,35 @@ public sealed partial class NativeRecoveryTests
         Assert.Empty(cluster.Polls);
     }
 
+    [Fact]
+    public async Task given_a_read_waiting_for_a_session_recovery_when_the_client_is_disposed_should_end_it_as_disposed()
+    {
+        using var cluster = new RecoveryCluster();
+        using var client = await cluster.ConnectAsync();
+        var registering = Signal();
+        var release = Signal();
+        // The recovery register gets no reply, so the read waits for the recovery.
+        cluster.HoldReply = request => request.Operation == (byte)VsrOperation.Register
+            ? Hold(registering, release) : Task.CompletedTask;
+        cluster.PingEviction = EvictionReason.SessionError;
+        await Assert.ThrowsAnyAsync<Exception>(() => client.PingAsync(cluster.Token));
+        await registering.Task.WaitAsync(cluster.Token);
+        try
+        {
+            var poll = PollAsync(client, cluster.Token);
+
+            client.Dispose();
+
+            await Assert.ThrowsAsync<ObjectDisposedException>(() => poll).WaitAsync(cluster.Token);
+        }
+        finally
+        {
+            release.TrySetResult();
+        }
+
+        Assert.Empty(cluster.Polls);
+    }
+
     [Theory]
     [InlineData("invalid credentials")]
     [InlineData("malformed login")]
