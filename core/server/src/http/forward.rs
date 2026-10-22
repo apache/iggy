@@ -102,6 +102,7 @@ use cyper::IntoUrl;
 use futures::{Stream, StreamExt};
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_common::{IggyError, IggyTimestamp};
+use message_bus::MessageBus;
 use message_bus::transports::tls::load_pem;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms};
@@ -844,12 +845,20 @@ pub(in crate::http) async fn answer_metadata_floor(
 /// applied, with any recovered suffix applied too. A newer primary's merged
 /// log can hold ops an older view acknowledged above its commit, so its
 /// applied op becomes a floor only once it applied that log.
+///
+/// The floor also needs this node's own partition admission: a primary cut
+/// off from its quorum stops vouching when its quorum evidence expires, as
+/// its own partition requests stop. That bounds the stale window by the
+/// freshness lease, not by a quorum round, so it is not strictly
+/// linearizable.
 fn metadata_commit_floor(state: &HttpInner) -> Option<u64> {
     let consensus = state.shard.plane.metadata().consensus.as_ref()?;
+    let frontier = state.shard.plane.metadata().applied_frontier();
     let settled = is_settled_primary(consensus)
         && consensus.applied_view_start()
-        && consensus.commit_min() >= consensus.recovery_barrier();
-    settled.then(|| state.shard.plane.metadata().applied_frontier().get())
+        && consensus.commit_min() >= consensus.recovery_barrier()
+        && frontier.partition_requests_allowed(state.shard.bus.monotonic_now());
+    settled.then(|| frontier.get())
 }
 
 async fn forward_or_pass(state: HttpState, request: Request, next: Next) -> Response {
@@ -2049,6 +2058,40 @@ mod tests {
                 Some(&HeaderValue::from_static(UnprovenRelay::Invalid.as_str())),
                 "{path}"
             );
+        }
+    }
+
+    #[compio::test]
+    async fn given_expired_partition_admission_when_answering_the_metadata_floor_should_refuse() {
+        let epoch = Instant::now().checked_sub(Duration::from_secs(9)).unwrap();
+        for (credited_at, expected) in [
+            (Instant::now(), StatusCode::NO_CONTENT),
+            (epoch, StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            let frontier = Arc::new(
+                metadata::AppliedFrontier::default()
+                    .with_partition_freshness(epoch, Duration::from_secs(5)),
+            );
+            frontier.credit_partition_freshness(credited_at, Duration::ZERO);
+            let state = read_state_with_frontier(None, Some(KEY_MATERIAL), frontier);
+            let proof = RelayKey::derive(KEY_MATERIAL)
+                .prove(
+                    &Method::GET,
+                    METADATA_FLOOR_PATH,
+                    &NO_PARTITION_ROUTE,
+                    IggyTimestamp::now(),
+                )
+                .expect("a proof is a valid header value");
+            let mut headers = HeaderMap::new();
+            headers.insert(RELAY_PROOF_HEADER, proof);
+
+            let response = answer_metadata_floor(
+                State(state),
+                received(Method::GET, METADATA_FLOOR_PATH, headers),
+            )
+            .await;
+
+            assert_eq!(response.status(), expected);
         }
     }
 
