@@ -1741,6 +1741,8 @@ where
     /// the tail would never be reached. See [`rotate_sweep_to_cursor`].
     partition_walk_cursor: Cell<Option<IggyNamespace>>,
     partition_placement_cursor: Cell<Option<IggyNamespace>>,
+    /// Namespaces still owed a placement report in the current interval.
+    partition_placement_owed: Cell<usize>,
     primary_rebalance: RefCell<primary_rebalance::PrimaryRebalance>,
 
     /// Consecutive metadata superblock write failures tolerated before the
@@ -1996,6 +1998,7 @@ where
             partition_repairs_inflight: Cell::new(0),
             partition_walk_cursor: Cell::new(None),
             partition_placement_cursor: Cell::new(None),
+            partition_placement_owed: Cell::new(0),
             primary_rebalance: RefCell::default(),
             superblock_wedged_fatal_failures: Cell::new(0),
             bus_max_message_size: Cell::new(DEFAULT_BUS_MAX_MESSAGE_SIZE),
@@ -2604,6 +2607,7 @@ where
             partition_repairs_inflight: Cell::new(0),
             partition_walk_cursor: Cell::new(None),
             partition_placement_cursor: Cell::new(None),
+            partition_placement_owed: Cell::new(0),
             primary_rebalance: RefCell::default(),
             superblock_wedged_fatal_failures: Cell::new(0),
             bus_max_message_size: Cell::new(DEFAULT_BUS_MAX_MESSAGE_SIZE),
@@ -8758,14 +8762,21 @@ where
     }
 
     /// Re-read a bounded range on retry so a full inbox retains no stale payload.
+    /// Each interval visits every namespace once, in batches over consecutive ticks,
+    /// up to `PARTITION_PLACEMENT_REPORTS_PER_TICK_MAX` namespaces per tick of the
+    /// interval. A shard with more namespaces reports each one every few intervals.
     fn publish_partition_views(&self, namespaces: &[IggyNamespace]) {
         if namespaces.is_empty() {
             self.partition_placement_cursor.set(None);
             return;
         }
-        if !u128::from(self.ticks.get().saturating_sub(1))
+        if u128::from(self.ticks.get().saturating_sub(1))
             .is_multiple_of(PARTITION_PLACEMENT_REPORT_INTERVAL_TICKS)
         {
+            self.partition_placement_owed.set(namespaces.len());
+        }
+        let owed = self.partition_placement_owed.get();
+        if owed == 0 {
             return;
         }
         let Some(sender) = self.senders.first() else {
@@ -8774,8 +8785,8 @@ where
         let start = self.partition_placement_cursor.get().map_or(0, |cursor| {
             namespaces.partition_point(|namespace| *namespace < cursor) % namespaces.len()
         });
-        let visited = namespaces
-            .len()
+        let visited = owed
+            .min(namespaces.len())
             .min(PARTITION_PLACEMENT_REPORTS_PER_TICK_MAX);
         let partitions = self.plane.partitions();
         let mut reports = Vec::with_capacity(visited);
@@ -8811,10 +8822,13 @@ where
                 metrics::frame_drop_variant::PARTITION_PLACEMENT_VIEWS,
                 coordinator::classify_try_send_err(&error),
             );
+            // The cursor stays, so the next interval resumes at this range.
+            self.partition_placement_owed.set(0);
             return;
         }
         self.partition_placement_cursor
             .set(Some(namespaces[(start + visited) % namespaces.len()]));
+        self.partition_placement_owed.set(owed - visited);
     }
 
     /// Whether this shard may build a partition offer for `namespace` without
@@ -11522,7 +11536,8 @@ const PARTITION_WALKS_PER_TICK_MAX: usize = 16;
 const PARTITION_PLACEMENT_REPORT_INTERVAL_TICKS: u128 =
     primary_rebalance::PROBE_INTERVAL.as_millis() / CONSENSUS_TICK_INTERVAL.as_millis();
 
-/// One lifecycle batch per report interval; the cursor also bounds visits to ineligible groups.
+/// One lifecycle batch per tick until the interval's pass ends; the cursor also
+/// bounds visits to ineligible groups.
 const PARTITION_PLACEMENT_REPORTS_PER_TICK_MAX: usize = 64;
 
 /// Floor under the gap detector's debounce, in ticks.
@@ -15434,6 +15449,35 @@ mod partition_placement_tests {
         shard.ticks.set(interval + 1);
         publish(&shard);
         assert_eq!(receive(&inbox).len(), 1);
+    }
+
+    #[compio::test]
+    async fn given_more_groups_than_one_batch_when_an_interval_starts_should_report_each_group_within_it()
+     {
+        let (shard, inbox) = owner(1);
+        let count = PARTITION_PLACEMENT_REPORTS_PER_TICK_MAX * 2 + 3;
+        for id in 0..count {
+            insert(&shard, id, 7, 0);
+        }
+        let batches =
+            u64::try_from(count.div_ceil(PARTITION_PLACEMENT_REPORTS_PER_TICK_MAX)).unwrap();
+        let mut observed = BTreeSet::new();
+        for tick in 1..=batches {
+            shard.ticks.set(tick);
+            publish(&shard);
+            observed.extend(
+                receive(&inbox)
+                    .into_iter()
+                    .map(|report| report.namespace.partition_id()),
+            );
+        }
+        assert_eq!(observed, (0..count).collect());
+        shard.ticks.set(batches + 1);
+        publish(&shard);
+        assert!(
+            inbox.try_recv().is_err(),
+            "a finished pass waits for the next interval"
+        );
     }
 
     #[compio::test]
