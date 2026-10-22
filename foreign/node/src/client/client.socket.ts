@@ -218,7 +218,9 @@ export class CommandResponseStream extends EventEmitter {
         const generation = this.routingGeneration;
         // The call waits for a session lost meanwhile itself.
         await this.refreshRoster(deadline, signal).catch((error: unknown) => {
-          if (generation === this.routingGeneration) throw error;
+          if (generation !== this.routingGeneration) return;
+          // The call sent nothing yet, so a deadline leaves it not accepted.
+          throw error instanceof VsrResponseTimeoutError ? responseError(command, TRANSIENT_NOT_ACCEPTED) : error;
         });
       }
       return await this.drive(command, payload, options, deadline, signal, lineage);
@@ -286,6 +288,7 @@ export class CommandResponseStream extends EventEmitter {
     let refresh = false;
     let lastRefusal: ResponseError | undefined;
     let previousLink: IggyConnection | undefined;
+    let sent = false;
     try {
       for (;;) {
         this.ensureLineage(lineage, command);
@@ -383,6 +386,7 @@ export class CommandResponseStream extends EventEmitter {
         } catch (error) {
           attempt = { error, committed: false, started: false };
         }
+        sent ||= attempt.started;
         if (generation !== this.routingGeneration && attempt.started && (replicated || progress))
           throw new OperationUncertainError(operation?.retainable ? operation.id : undefined,
             attempt.error ?? responseError(command, TRANSIENT_NOT_ACCEPTED));
@@ -505,7 +509,9 @@ export class CommandResponseStream extends EventEmitter {
         retryDelay = Math.min(retryDelay * 2, MAX_RETRY_INTERVAL_MS);
       }
     } catch (error) {
-      if (error instanceof VsrResponseTimeoutError && lastRefusal) error = lastRefusal;
+      // A call that sent nothing and saw no refusal was not accepted either.
+      if (error instanceof VsrResponseTimeoutError && (lastRefusal || !sent))
+        error = lastRefusal ?? responseError(command, TRANSIENT_NOT_ACCEPTED);
       if (operation?.uncertain) {
         // A frame of a replaced session must not block the lane of the new one.
         if (generation === this.routingGeneration && this.lanes.owns(operation)) this.lanes.retain(operation);

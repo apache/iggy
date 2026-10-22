@@ -214,8 +214,9 @@ A replica link redials on its own after it drops, with jittered exponential
 backoff. `reconnect.maxRetries` limits one burst of redials, not the life of
 the client. While the client stays signed in, each heartbeat restarts a link
 that used its budget, with a fresh budget. A request does not redial a link. It
-retries within its deadline until the link returns. `destroy()` and logout stop
-the restarts.
+retries within its deadline until the link returns. If the deadline ends before
+the request was sent and no replica refused it, it fails with status 58.
+`destroy()` and logout stop the restarts.
 
 When every link used its budget, a request fails with `NotConnectedError` and
 does not wait for its deadline. When no endpoint accepts a dial before its retry

@@ -1784,7 +1784,7 @@ describe('VSR client socket', () => {
       };
       await assert.rejects(
         () => client.sendCommand(60_013, Buffer.alloc(0)),
-        /timed out after 0 ms/
+        (error: unknown) => error instanceof ResponseError && error.errorCode === TRANSIENT_NOT_ACCEPTED
       );
       assert.equal(
         server.frames.some(
@@ -3771,14 +3771,14 @@ describe('native replica and selection lifecycle', () => {
       await waitUntilUnmocked(() => countCommand(unlinked.later, COMMAND_CODE.BindSession) === 2);
       context.mock.timers.tick(OPERATION_TIMEOUT_MS);
       const error = await outcome;
-      assert.ok(error instanceof VsrResponseTimeoutError, String(error));
+      assert.ok(error instanceof ResponseError && error.errorCode === TRANSIENT_NOT_ACCEPTED, String(error));
     } finally {
       context.mock.timers.reset();
       await unlinked.close();
     }
   });
 
-  it('reports the bind deadline of a dialed endpoint when the retry budget ends after it', async (context) => {
+  it('refuses a call as not accepted when the retry budget ends after the bind deadline of a dialed endpoint', async (context) => {
     const reconnect = { enabled: true, interval: 1, maxRetries: 1 };
     const unlinked = await startUnlinkedClient({ reconnect });
     try {
@@ -3800,7 +3800,7 @@ describe('native replica and selection lifecycle', () => {
       await new Promise<void>((resolve) => setImmediate(resolve));
       context.mock.timers.tick(reconnect.interval);
       const error = await second;
-      assert.ok(error instanceof VsrResponseTimeoutError, String(error));
+      assert.ok(error instanceof ResponseError && error.errorCode === TRANSIENT_NOT_ACCEPTED, String(error));
     } finally {
       context.mock.timers.reset();
       await unlinked.close();
