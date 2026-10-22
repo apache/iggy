@@ -497,8 +497,7 @@ where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
-    consensus.is_normal()
-        || (consensus.view_log_is_pending() && consensus.is_primary_for_view(consensus.view()))
+    consensus.is_normal() || consensus.is_primary_elect()
 }
 
 /// Header of the pipeline head, iff its op is the next one this replica owes its

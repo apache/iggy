@@ -1395,8 +1395,9 @@ where
     /// The log a DVC quorum settled on, parked until this replica's journal can
     /// serve all of it.
     ///
-    /// Non-`None` means "primary-elect, repairing": decided but not started, so
-    /// this replica prepares and announces nothing. Cleared by
+    /// Under `do_view_change_quorum` it means "primary-elect, repairing": decided
+    /// but not started, so this replica prepares and announces nothing. Otherwise
+    /// it is an adopted `StartView` suffix. Cleared by
     /// [`VsrConsensus::start_pending_view`], or by `reset_view_change_state`.
     pending_view_log: RefCell<Option<MergedLog>>,
     /// The log the last adopted `StartView` announced, for this replica's
@@ -4715,6 +4716,17 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.pending_view_log.borrow().is_some()
     }
 
+    /// Whether the parked log is the merge a `DoViewChange` quorum of this view
+    /// decided, which this replica starts once its journal covers it.
+    ///
+    /// Primary by index is not enough. A replica that restarts as primary of its
+    /// recovered view parks its adopted `StartView` suffix, and the quorum it may
+    /// have collected before the crash is gone.
+    #[must_use]
+    pub fn is_primary_elect(&self) -> bool {
+        self.do_view_change_quorum.get() && self.view_log_is_pending()
+    }
+
     /// Read the parked merge in place. The closure must not re-enter consensus: the
     /// `RefCell` stays borrowed for its whole body.
     pub fn with_pending_view_log<T>(&self, read: impl FnOnce(&MergedLog) -> T) -> Option<T> {
@@ -4771,16 +4783,18 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// Finish the parked view change: this replica's journal now covers the merged
     /// log, so it can serve any op it is about to announce.
     ///
-    /// Called by the shard after repair progress. No-op when nothing is parked.
+    /// Called by the shard after repair progress. No-op unless
+    /// [`Self::is_primary_elect`].
     ///
     /// # Panics
     /// If the merged uncommitted range exceeds pipeline capacity, which needs a head
     /// more than one pipeline depth above the proven commit point.
     pub fn start_pending_view(&self, plane: PlaneKind) -> Vec<VsrAction> {
-        // A backup's parked log (the `StartView` suffix) is only what its ingest
-        // verifies bodies against. It must never take this path: starting the view
-        // claims the primaryship of a view this replica did not win.
-        if !self.is_primary_for_view(self.view.get()) {
+        // A parked `StartView` suffix is only what the repair ingest verifies
+        // bodies against, also on a replica restarted as primary by index. It must
+        // never take this path: starting the view claims the primaryship of a view
+        // this replica did not win.
+        if !self.is_primary_elect() {
             return Vec::new();
         }
         let Some(merged) = self.pending_view_log.borrow_mut().take() else {
@@ -8413,6 +8427,84 @@ mod adopted_view_claim_tests {
             "the backup nacked op {HEAD} as a canonical sender of view {ADOPTED_VIEW}, so the \
              view-{OLD_VIEW} primary's copy counted as a second nack",
         );
+    }
+
+    #[test]
+    fn given_a_restart_as_primary_of_the_recovered_view_when_the_adopted_log_is_proven_should_not_start_the_view()
+     {
+        const RECOVERED_VIEW: u32 = ADOPTED_VIEW + 1;
+        // Acked `COMMITTED` in `ADOPTED_VIEW`, then never learned its commit.
+        const PEER: u8 = 1;
+        const COMMITTED: u64 = HEAD + 1;
+        let history = history();
+        let backup = adopt_unrepaired(&history);
+        assert!(backup.is_primary_for_view(RECOVERED_VIEW));
+
+        // The view-11 primary committed op 27 with the peer's ack and crashed.
+        let mut committed = at(&history, HEAD);
+        committed.op = COMMITTED;
+        committed.view = ADOPTED_VIEW;
+        committed.parent = at(&history, HEAD).checksum;
+        committed.commit = HEAD;
+        committed.timestamp = COMMITTED;
+        committed.checksum = committed.identity_checksum();
+        let peer = StoredDvc {
+            replica: PEER,
+            log_view: ADOPTED_VIEW,
+            op: COMMITTED,
+            commit: HEAD,
+            suffix: DvcSuffix::new(vec![committed, at(&history, HEAD)], 0, 0b11),
+        };
+        backup.enter_view_change(
+            PlaneKind::Metadata,
+            RECOVERED_VIEW,
+            ViewChangeReason::ReceivedStartViewChange,
+        );
+        for dvc in [dvc_of(&backup), peer] {
+            assert!(dvc_record(
+                &mut backup.do_view_change_from_all_replicas.borrow_mut(),
+                dvc
+            ));
+        }
+        assert!(
+            backup
+                .complete_view_change_as_primary(PlaneKind::Metadata)
+                .is_empty()
+        );
+        assert_eq!(
+            backup.pending_view_log().map(|merged| merged.op_head),
+            Some(COMMITTED)
+        );
+        assert!(backup.is_primary_elect());
+
+        // Repair brought ops 24 to 26 before the crash. The view never started.
+        let durable = backup.vsr_state(0, 0);
+        let restarted = backup_at(
+            durable.history_certificate().unwrap().view,
+            durable.view,
+            HEAD,
+            HEAD - 1,
+        );
+        restarted.begin_view_probe();
+        restarted.restore_adopted_view(durable.adopted_view.as_ref());
+        restarted.resume_adopted_view();
+        // What the plane's reconcile does once the journal matches the parked headers.
+        restarted.settle_view_log_proof();
+        assert!(
+            !restarted.is_primary_elect(),
+            "the planes would drive repair and the view start from the adopted log"
+        );
+
+        let actions = restarted.start_pending_view(PlaneKind::Metadata);
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, VsrAction::SendStartView { .. })),
+            "the restarted replica announced view {RECOVERED_VIEW} from the view-{ADOPTED_VIEW} \
+             log with no DoViewChange quorum, so its peer adopts head {HEAD} and drops op \
+             {COMMITTED}, which view {ADOPTED_VIEW} committed",
+        );
+        assert_eq!(restarted.status(), Status::Recovering);
     }
 
     #[test]

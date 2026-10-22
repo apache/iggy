@@ -5679,7 +5679,7 @@ where
             if header.op > session.to_op {
                 return;
             }
-            let is_primary = consensus.is_primary_for_view(consensus.view());
+            let is_primary_elect = consensus.is_primary_elect();
             let commit_min = consensus.commit_min();
             let closes_proof_gap = consensus
                 .view_log_repair_op()
@@ -5687,9 +5687,11 @@ where
             // In place: runs once per repaired prepare, and the clone is two Vecs.
             let in_scope = consensus
                 .with_pending_view_log(|pending| {
-                    repair_op_in_scope(Some(pending), is_primary, commit_min, header.op)
+                    repair_op_in_scope(Some(pending), is_primary_elect, commit_min, header.op)
                 })
-                .unwrap_or_else(|| repair_op_in_scope(None, is_primary, commit_min, header.op));
+                .unwrap_or_else(|| {
+                    repair_op_in_scope(None, is_primary_elect, commit_min, header.op)
+                });
             if !in_scope {
                 return;
             }
@@ -6019,9 +6021,7 @@ where
                     // burned -- an unthrottled request/reply loop across two pumps.
                     // Dropping first lands the trailing frame on the `is_none`
                     // guard, as it did before this arm existed.
-                    if consensus.view_log_is_pending()
-                        && consensus.is_primary_for_view(consensus.view())
-                    {
+                    if consensus.is_primary_elect() {
                         tracing::warn!(
                             shard = self.id,
                             peer = header.replica,
@@ -6417,10 +6417,7 @@ where
             if partition.history_is_busy() {
                 return;
             }
-            if !partition
-                .consensus()
-                .is_primary_for_view(partition.consensus().view())
-            {
+            if !partition.consensus().is_primary_elect() {
                 return;
             }
             let Some(pending) = partition.consensus().pending_view_log() else {
@@ -6538,8 +6535,7 @@ where
         // and cannot start until the window fills. Gating on `Normal` alone
         // defers a dropped frame to the 500-tick escalation, and closes the one
         // session that legitimately runs outside `Normal`.
-        let repairing_view =
-            consensus.view_log_is_pending() && consensus.is_primary_for_view(consensus.view());
+        let repairing_view = consensus.is_primary_elect();
 
         // Closed at the TOP of the tick, not after an idle window: a standing
         // session fences every arming site and holds the gap debounce at zero
@@ -6658,7 +6654,7 @@ where
     {
         *self.metadata_repair.borrow_mut() = None;
 
-        if consensus.view_log_is_pending() && consensus.is_primary_for_view(consensus.view()) {
+        if consensus.is_primary_elect() {
             let sources = view_repair_sources(consensus, from_op);
             let Some(next_peer) = next_view_repair_peer(&sources, Some(peer)) else {
                 // Only the quiet peer named this op. The session is dropped either
@@ -6816,7 +6812,7 @@ where
         // its ingest verifies bodies against; driving repair from it would put a
         // rejoining node on the tail-repair path when its gap sits below every
         // peer's retention floor, racing the view probe that picks state transfer.
-        if !consensus.is_primary_for_view(consensus.view()) {
+        if !consensus.is_primary_elect() {
             return;
         }
         // Before the coverage scan, and a primary-elect's only shot at it: the repair
@@ -8473,11 +8469,7 @@ where
                     // `maybe_request_partition_repair` refuses outside `Normal`,
                     // and a replica that never named the op answers `RangeEvicted`
                     // for a range it never held.
-                    if partition.consensus().view_log_is_pending()
-                        && partition
-                            .consensus()
-                            .is_primary_for_view(partition.consensus().view())
-                    {
+                    if partition.consensus().is_primary_elect() {
                         self.request_partition_view_repair(partition, from_op, to_op, Some(peer))
                             .await;
                         continue;
