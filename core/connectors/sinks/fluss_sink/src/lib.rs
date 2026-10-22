@@ -22,7 +22,10 @@ use iggy_connector_sdk::{
 use tokio::sync::Mutex;
 use tracing::info;
 
-use crate::{router::Router, writer::FlussWriter};
+use crate::{
+    router::{RouteOutcome, Router},
+    writer::FlussWriter,
+};
 
 mod config;
 mod router;
@@ -106,7 +109,7 @@ impl Sink for FlussSink {
             );
         }
 
-        let result = match &self.router {
+        let RouteOutcome { stat, last_error } = match &self.router {
             Router::StaticTable(router) => {
                 router
                     .route(&self.writer, topic_metadata, messages_metadata, messages)
@@ -115,18 +118,22 @@ impl Sink for FlussSink {
             Router::MultiTable(router) => router.route(&self.writer, messages).await,
         };
 
-        match result {
-            Ok(r) => {
-                {
-                    let mut state = self.state.lock().await;
-                    state.insertion_errors += r.errors;
-                    state.messages_processed += r.appended + r.inserted + r.deleted;
-                }
-                Ok(())
-            }
-
-            Err(error) => Err(error.into()),
+        {
+            let mut state = self.state.lock().await;
+            state.insertion_errors += stat.errors;
+            state.messages_processed += stat.appended + stat.inserted + stat.deleted;
         }
+
+        if let Some(error) = last_error {
+            return Err(error.into());
+        }
+        let errors = stat.errors;
+        if errors > 0 {
+            return Err(Error::CannotStoreData(format!(
+                "{errors} messages could not be stored in Fluss"
+            )));
+        }
+        Ok(())
     }
 
     async fn close(&mut self) -> Result<(), Error> {

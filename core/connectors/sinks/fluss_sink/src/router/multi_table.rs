@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{collections::HashMap, sync::Arc, sync::Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use arrow::{array::RecordBatch, datatypes::Schema, json::ReaderBuilder};
 use fluss::metadata::TablePath;
@@ -26,6 +29,7 @@ use tracing::warn;
 use super::Error;
 use crate::{
     ResolvedFlussSinkConfig,
+    router::RouteOutcome,
     schema_catalog::{SchemaCatalog, SchemaEntry},
     writer::{Op, Stat, TableWriter},
 };
@@ -78,49 +82,72 @@ impl MultiTableRouter {
         &self,
         writer: &impl TableWriter,
         messages: Vec<ConsumedMessage>,
-    ) -> Result<Stat, Error> {
+    ) -> RouteOutcome {
         let mut result = Stat::default();
         let (partitioned_messages, stat) =
             partition_messages_by_route_key(messages, &self.route_key);
         result = result.add(stat);
+        let mut last_error: Option<Error> = None;
+
         for (table, messages) in partitioned_messages {
             let maybe_entry = self
                 .resolve_schema_entry(&table, writer, messages.as_slice())
                 .await;
+            let message_count = messages.len();
 
             let entry = match maybe_entry {
                 Ok(entry) => entry,
-                Err(Error::FailedToResolveSchema {
-                    table_path: table,
-                    reason,
-                }) => {
+                Err(error) => {
                     warn!(
-                        "FlussSink: Skipping messages for table [{}] because schema could not be resolve because of [{reason}]",
-                        table
+                        "FlussSink: Skipping {message_count} messages for table '{table}', schema could not be resolved: {error}"
                     );
-                    result.inc_err_by(messages.len() as u64);
+                    result.inc_err_by(message_count as u64);
+                    last_error = Some(error);
                     continue;
                 }
-                // Retryable errors
-                Err(e) => return Err(e),
             };
 
-            let (batch, stat) = to_record_batch(&messages, Arc::clone(&entry.schema), &table)?;
+            let (batch, stat) = match to_record_batch(&messages, Arc::clone(&entry.schema), &table)
+            {
+                Ok(converted) => converted,
+                Err(error) => {
+                    result.inc_err_by(message_count as u64);
+                    warn!(
+                        "FlussSink: Skipping {message_count} messages for table '{table}', record batch conversion failed: {error}"
+                    );
+                    last_error = Some(error);
+                    continue;
+                }
+            };
             result = result.add(stat);
+
             if let Some(batch) = batch {
                 let op = if entry.table_descriptor.has_primary_key() {
                     Op::UpsertOrDelete
                 } else {
                     Op::Append
                 };
-                let stat = writer
+                let batch_len = batch.num_rows();
+                match writer
                     .write_to_table(&table, &entry.table_descriptor, op, batch)
-                    .await?;
-                result = result.add(stat);
+                    .await
+                {
+                    Ok(stat) => result = result.add(stat),
+                    Err(error) => {
+                        result.inc_err_by(batch_len as u64);
+                        warn!(
+                            "FlussSink: Skipping {batch_len} rows for table '{table}', write failed: {error}"
+                        );
+                        last_error = Some(error.into());
+                    }
+                }
             }
         }
 
-        Ok(result)
+        RouteOutcome {
+            stat: result,
+            last_error,
+        }
     }
 }
 
@@ -298,6 +325,7 @@ mod tests {
     use crate::{
         ResolvedFlussSinkConfig,
         config::TableConfig,
+        router::RouteOutcome,
         writer::{Op, Stat, TableWriter, WriterError},
     };
 
@@ -313,7 +341,7 @@ mod tests {
         created: Mutex<Vec<TablePath>>,
         writes: Mutex<Vec<TableWrite>>,
         fail_create: bool,
-        fail_write: bool,
+        failing_writes: Vec<TablePath>,
     }
 
     impl TableWriter for RecordingWriter {
@@ -324,7 +352,7 @@ mod tests {
             op: Op,
             batch: RecordBatch,
         ) -> Result<Stat, WriterError> {
-            if self.fail_write {
+            if self.failing_writes.contains(table_path) {
                 return Err(WriterError::ConnectionNotInitialized);
             }
             let rows = batch.num_rows();
@@ -520,12 +548,14 @@ mod tests {
             non_json,
         ];
 
-        let stat = run_async(router.route(&writer, messages)).expect("Valid messages should route");
-        let second_stat = run_async(router.route(
+        let RouteOutcome { stat, last_error } = run_async(router.route(&writer, messages));
+        let RouteOutcome {
+            stat: second_stat,
+            last_error: second_last_error,
+        } = run_async(router.route(
             &writer,
             vec![json_message(6, r#"{"table":"fluss.orders","id":6}"#)],
-        ))
-        .expect("Cached table should route");
+        ));
         let created = writer
             .created
             .lock()
@@ -536,7 +566,9 @@ mod tests {
             .expect("table writes lock should not be poisoned");
 
         assert_eq!((stat.appended, stat.errors), (2, 3));
+        assert!(last_error.is_none());
         assert_eq!((second_stat.appended, second_stat.errors), (1, 0));
+        assert!(second_last_error.is_none());
         assert_eq!(writer.get_calls.load(Ordering::Relaxed), 1);
         assert_eq!(created.as_slice(), &[TablePath::new("fluss", "orders")]);
         assert_eq!(writes.len(), 2);
@@ -557,13 +589,14 @@ mod tests {
             json_message(4, r#"{"table":"bad path","id":4}"#),
         ];
 
-        let stat = run_async(router.route(&writer, messages)).expect("Valid tables should route");
+        let RouteOutcome { stat, last_error } = run_async(router.route(&writer, messages));
         let writes = writer
             .writes
             .lock()
             .expect("table writes lock should not be poisoned");
 
         assert_eq!((stat.appended, stat.errors), (3, 1));
+        assert!(last_error.is_none());
         assert_eq!(writes.len(), 2);
         assert_eq!(writes.iter().map(|write| write.rows).sum::<usize>(), 3);
     }
@@ -577,13 +610,16 @@ mod tests {
         let router = MultiTableRouter::new(&config);
         let writer = RecordingWriter::default();
 
-        let stat = run_async(router.route(
+        let RouteOutcome { stat, last_error } = run_async(router.route(
             &writer,
             vec![json_message(1, r#"{"table":"fluss.orders","id":1}"#)],
-        ))
-        .expect("Missing table should be skipped");
+        ));
 
         assert_eq!((stat.appended, stat.errors), (0, 1));
+        assert!(matches!(
+            last_error,
+            Some(Error::FailedToResolveSchema { .. })
+        ));
         assert!(
             writer
                 .created
@@ -612,7 +648,7 @@ mod tests {
             &writer,
             vec![json_message(1, r#"{"table":"fluss.orders","id":1}"#)],
         ))
-        .err()
+        .last_error
         .expect("Create failure should propagate");
 
         assert!(matches!(error, Error::SchemaCatalog(_)));
@@ -629,7 +665,7 @@ mod tests {
     fn given_write_failure_when_routing_should_return_writer_error() {
         let router = MultiTableRouter::new(&ResolvedFlussSinkConfig::default());
         let writer = RecordingWriter {
-            fail_write: true,
+            failing_writes: vec![TablePath::new("fluss", "orders")],
             ..RecordingWriter::default()
         };
 
@@ -637,13 +673,42 @@ mod tests {
             &writer,
             vec![json_message(1, r#"{"table":"fluss.orders","id":1}"#)],
         ))
-        .err()
+        .last_error
         .expect("Write failure should propagate");
 
         assert!(matches!(
             error,
             Error::WriterError(WriterError::ConnectionNotInitialized)
         ));
+    }
+
+    #[test]
+    fn given_one_failing_table_when_routing_should_still_write_other_tables() {
+        let router = MultiTableRouter::new(&ResolvedFlussSinkConfig::default());
+        let writer = RecordingWriter {
+            failing_writes: vec![TablePath::new("fluss", "orders")],
+            ..RecordingWriter::default()
+        };
+        let messages = vec![
+            json_message(1, r#"{"table":"fluss.orders","id":1}"#),
+            json_message(2, r#"{"table":"fluss.events","id":2}"#),
+            json_message(3, r#"{"table":"fluss.events","id":3}"#),
+        ];
+
+        let RouteOutcome { stat, last_error } = run_async(router.route(&writer, messages));
+        let writes = writer
+            .writes
+            .lock()
+            .expect("table writes lock should not be poisoned");
+
+        assert_eq!((stat.appended, stat.errors), (2, 1));
+        assert!(matches!(
+            last_error,
+            Some(Error::WriterError(WriterError::ConnectionNotInitialized))
+        ));
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].table_path, TablePath::new("fluss", "events"));
+        assert_eq!(writes[0].rows, 2);
     }
 
     #[test]
@@ -661,17 +726,17 @@ mod tests {
         let router = MultiTableRouter::new(&config);
         let writer = RecordingWriter::default();
 
-        let stat = run_async(router.route(
+        let RouteOutcome { stat, last_error } = run_async(router.route(
             &writer,
             vec![json_message(1, r#"{"table":"fluss.orders","id":1}"#)],
-        ))
-        .expect("Primary-key message should route");
+        ));
         let writes = writer
             .writes
             .lock()
             .expect("table writes lock should not be poisoned");
 
         assert_eq!(stat.appended, 1);
+        assert!(last_error.is_none());
         assert_eq!(writes.len(), 1);
         assert_eq!(writes[0].op, Op::UpsertOrDelete);
     }

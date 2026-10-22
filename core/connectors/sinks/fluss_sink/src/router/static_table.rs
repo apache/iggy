@@ -25,6 +25,7 @@ use super::Error;
 use crate::{
     PayloadFormat, ResolvedFlussSinkConfig,
     config::TableConfig,
+    router::RouteOutcome,
     schema_catalog::SchemaCatalog,
     static_schema::{
         self, ColumnKind, RowContext, StaticTableBatchBuilder, StaticTableDescriptorBuilder,
@@ -98,12 +99,15 @@ impl StaticTableRouter {
         topic_metadata: &TopicMetadata,
         messages_metadata: MessagesMetadata,
         messages: Vec<ConsumedMessage>,
-    ) -> Result<Stat, Error> {
+    ) -> RouteOutcome {
         let context = RowContext {
             topic: &topic_metadata.topic,
             stream: &topic_metadata.stream,
             partition_id: messages_metadata.partition_id,
         };
+
+        let mut last_error: Option<Error> = None;
+        let message_count = messages.len();
 
         let schema_entry = self
             .schema_catalog
@@ -122,14 +126,24 @@ impl StaticTableRouter {
                     "FlussSink: Can not add record to batch builder, skipping message because of error: [{error}]"
                 );
                 stat.inc_err();
+                last_error = Some(Error::FailedToAddToRecordBatch {
+                    reason: error.to_string(),
+                });
             }
         }
 
-        let record_batch = builder
-            .finish()
-            .map_err(|error| Error::FailedToCreateRecordBatch {
-                reason: error.to_string(),
-            })?;
+        let record_batch = match builder.finish() {
+            Ok(batch) => batch,
+            Err(error) => {
+                stat.inc_err_by(message_count as u64 - stat.errors);
+                return RouteOutcome {
+                    stat,
+                    last_error: Some(Error::FailedToCreateRecordBatch {
+                        reason: error.to_string(),
+                    }),
+                };
+            }
+        };
 
         let op = if schema_entry.table_descriptor.has_primary_key() {
             Op::UpsertOrDelete
@@ -137,16 +151,28 @@ impl StaticTableRouter {
             Op::Append
         };
 
-        let write_stat = writer
+        let batch_rows = record_batch.num_rows();
+        let write_stat = match writer
             .write_to_table(
                 &self.table_path,
                 &schema_entry.table_descriptor,
                 op,
                 record_batch,
             )
-            .await?;
+            .await
+        {
+            Ok(write_stat) => write_stat,
+            Err(error) => {
+                stat.inc_err_by(batch_rows as u64);
+                return RouteOutcome {
+                    stat,
+                    last_error: Some(error.into()),
+                };
+            }
+        };
 
-        Ok(stat.add(write_stat))
+        stat = stat.add(write_stat);
+        RouteOutcome { stat, last_error }
     }
 
     fn build_table_descriptor(&self) -> Result<TableDescriptor, static_schema::Error> {
@@ -179,6 +205,7 @@ mod tests {
     use super::{Error as RouterError, StaticTableRouter};
     use crate::{
         PayloadFormat, ResolvedFlussSinkConfig,
+        router::RouteOutcome,
         writer::{Op, Stat, TableWriter, WriterError},
     };
 
@@ -392,15 +419,18 @@ mod tests {
         ];
 
         run_async(router.init(&writer)).expect("Router should initialize");
-        let stats = run_async(router.route(
+        let RouteOutcome {
+            stat: stats,
+            last_error,
+        } = run_async(router.route(
             &writer,
             &test_topic_metadata(),
             test_messages_metadata(),
             messages,
-        ))
-        .expect("Messages should be routed");
+        ));
 
         assert_stats(&stats, 2, 0);
+        assert!(last_error.is_none());
         let table_writes = writer
             .table_writes
             .lock()
@@ -446,15 +476,21 @@ mod tests {
         ];
 
         run_async(router.init(&writer)).expect("Router should initialize");
-        let stats = run_async(router.route(
+        let RouteOutcome {
+            stat: stats,
+            last_error,
+        } = run_async(router.route(
             &writer,
             &test_topic_metadata(),
             test_messages_metadata(),
             messages,
-        ))
-        .expect("Valid message should be routed");
+        ));
 
         assert_stats(&stats, 1, 1);
+        assert!(matches!(
+            last_error,
+            Some(RouterError::FailedToAddToRecordBatch { .. })
+        ));
         let table_writes = writer
             .table_writes
             .lock()
@@ -484,15 +520,18 @@ mod tests {
         ];
 
         run_async(router.init(&writer)).expect("Router should initialize");
-        let stats = run_async(router.route(
+        let RouteOutcome {
+            stat: stats,
+            last_error,
+        } = run_async(router.route(
             &writer,
             &test_topic_metadata(),
             test_messages_metadata(),
             messages,
-        ))
-        .expect("Messages should be routed");
+        ));
 
         assert_stats(&stats, 1, 1);
+        assert!(last_error.is_none());
     }
 
     #[test]
@@ -502,14 +541,14 @@ mod tests {
         let messages = vec![test_message(102, Payload::Text("valid".to_string()))];
 
         run_async(router.init(&writer)).expect("Router should initialize");
-        run_async(router.route(
+        let RouteOutcome { last_error, .. } = run_async(router.route(
             &writer,
             &test_topic_metadata(),
             test_messages_metadata(),
             messages,
-        ))
-        .expect("Valid message should be routed");
+        ));
 
+        assert!(last_error.is_none());
         let table_writes = writer
             .table_writes
             .lock()
@@ -529,15 +568,15 @@ mod tests {
         };
 
         run_async(router.init(&writer)).expect("Router should initialize");
-        let error = run_async(router.route(
+        let RouteOutcome { stat, last_error } = run_async(router.route(
             &writer,
             &test_topic_metadata(),
             test_messages_metadata(),
             vec![test_message(101, Payload::Text("payload".to_string()))],
-        ))
-        .err()
-        .expect("Table write should fail");
+        ));
+        let error = last_error.expect("Table write should fail");
 
         assert!(matches!(error, RouterError::WriterError { .. }));
+        assert_eq!(stat.errors, 1);
     }
 }

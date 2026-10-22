@@ -60,6 +60,8 @@ pub(crate) enum Error {
     FailedToExtractTablePath { reason: String },
     #[error("Failed to create record batch: [{reason}]")]
     FailedToCreateRecordBatch { reason: String },
+    #[error("Failed to add record to record batch: [{reason}]")]
+    FailedToAddToRecordBatch { reason: String },
     #[error("Failed to resolve schema for table [{table_path}]: [{reason}]")]
     FailedToResolveSchema {
         table_path: TablePath,
@@ -94,11 +96,16 @@ impl From<Error> for ConnectorError {
             Error::SchemaCatalog(_)
             | Error::FailedToCreateRecordBatch { .. }
             | Error::FailedToResolveSchema { .. } => Self::SchemaMismatch(message),
-            Error::ExtractStringField { .. } | Error::FailedToExtractTablePath { .. } => {
-                Self::InvalidRecordValue(message)
-            }
+            Error::ExtractStringField { .. }
+            | Error::FailedToExtractTablePath { .. }
+            | Error::FailedToAddToRecordBatch { .. } => Self::InvalidRecordValue(message),
         }
     }
+}
+
+pub(crate) struct RouteOutcome {
+    pub(crate) stat: writer::Stat,
+    pub(crate) last_error: Option<Error>,
 }
 
 #[cfg(test)]
