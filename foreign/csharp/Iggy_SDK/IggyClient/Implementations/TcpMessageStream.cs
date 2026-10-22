@@ -1231,13 +1231,13 @@ public sealed partial class TcpMessageStream : IIggyClient
     private async Task<IMemoryOwner<byte>> SendSessionControlAsync(int code, ReadOnlyMemory<byte> body,
         CancellationToken token, ulong? owner)
     {
+        var deadline = Environment.TickCount64 + VsrRequestTimeoutMs;
         using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(token);
         cancellation.CancelAfter(VsrRequestTimeoutMs);
         await _sendingSemaphore.WaitAsync(cancellation.Token);
         try
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            var deadline = Environment.TickCount64 + VsrRequestTimeoutMs;
             SessionFrame frame;
             lock (_pollRoutingGate)
             {
@@ -1249,8 +1249,10 @@ public sealed partial class TcpMessageStream : IIggyClient
             }
             var connection = _connection is { IsReady: true } bootstrap
                 ? bootstrap : ReadyReplicaLinks().FirstOrDefault() ?? throw new NotConnectedException();
+            // The attempt keeps the deadline itself and returns the refusal it holds at the deadline. A timer token
+            // would end its retry pause with a cancellation, which reads as an unknown outcome.
             var attempt = await connection.SendAttemptAsync(code, body, deadline, deadline, HasSensitiveReply(code),
-                cancellation.Token, retainedFrame: frame);
+                token, retainedFrame: frame);
             if (attempt.Error is null)
             {
                 return attempt.Response!;

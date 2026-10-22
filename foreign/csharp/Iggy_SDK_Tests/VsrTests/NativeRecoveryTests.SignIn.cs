@@ -155,6 +155,50 @@ public sealed partial class NativeRecoveryTests
         Assert.Equal(registrations.Last().ClientId, Assert.Single(cluster.Writes).ClientId);
     }
 
+    [Fact]
+    public async Task given_a_held_send_lock_when_a_recovery_register_is_not_admitted_until_its_deadline_should_sign_in_again()
+    {
+        // The send lock stays held for a second after the register starts, so the 30 s of the call end while the 58
+        // resends still run. The register must end with the refusal it holds, so that the recovery signs in again.
+        using var cluster = new RecoveryCluster(TimeSpan.FromSeconds(45));
+        using var client = await cluster.ConnectAsync();
+        var sending = (SemaphoreSlim)typeof(TcpMessageStream)
+            .GetField("_sendingSemaphore", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(client)!;
+        var authenticating = Signal();
+        client.SubscribeConnectionEvents(change =>
+        {
+            if (change.CurrentState == ConnectionState.Authenticating)
+            {
+                authenticating.TrySetResult();
+            }
+            return Task.CompletedTask;
+        });
+        var registrations = new ConcurrentQueue<MockRequest>();
+        cluster.OnRegister = request =>
+        {
+            registrations.Enqueue(request);
+            return registrations.TryPeek(out var refused) && refused.ClientId == request.ClientId
+                ? Reply(request.Operation, [], VsrError.TRANSIENT_NOT_ACCEPTED) : Answer(request);
+        };
+        await sending.WaitAsync(cluster.Token);
+        try
+        {
+            cluster.PingEviction = EvictionReason.SessionError;
+            await Assert.ThrowsAnyAsync<Exception>(() => client.PingAsync(cluster.Token));
+            await authenticating.Task.WaitAsync(cluster.Token);
+            await Task.Delay(TimeSpan.FromSeconds(1), cluster.Token);
+        }
+        finally
+        {
+            sending.Release();
+        }
+        await cluster.UntilAsync(() => registrations.Select(registration => registration.ClientId).Distinct().Count() == 2);
+
+        await StoreAsync(client, cluster.Token);
+
+        Assert.Equal(registrations.Last().ClientId, Assert.Single(cluster.Writes).ClientId);
+    }
+
     [Theory]
     [InlineData("invalid password")]
     [InlineData("invalid token")]
