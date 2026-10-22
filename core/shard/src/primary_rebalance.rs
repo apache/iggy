@@ -152,6 +152,10 @@ impl PrimaryRebalance {
     }
 
     pub(crate) fn reset_authority(&mut self) {
+        // Only a coordinator holding a view sets the fields cleared here.
+        if self.view.is_none() {
+            return;
+        }
         // Authority can change without a new view. Keep replay protection and
         // the separately published deadline through that transition.
         *self = Self {
@@ -276,7 +280,7 @@ where
             metadata.observe_replica_readiness(&[]);
             return;
         }
-        let mut outgoing = Vec::with_capacity(PROBES_PER_TICK);
+        let mut outgoing = Vec::new();
         let mut capture = None;
         let now = self.bus.monotonic_now();
         {
