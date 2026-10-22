@@ -797,7 +797,8 @@ mod tests {
 
     use consensus::{
         ArtifactProgress, Consensus, DvcSuffix, LocalPipeline, PartitionsHandle, Pipeline, Plane,
-        Sequencer, StateArtifact, StateTransferStage, VsrAction, VsrConsensus, artifact_kind,
+        Sequencer, StateArtifact, StateTransferStage, TimeoutManager, VsrAction, VsrConsensus,
+        artifact_kind,
     };
     use futures::FutureExt;
     use futures::channel::oneshot;
@@ -5330,6 +5331,181 @@ mod tests {
         let partition = owner.plane.partitions().get_by_ns(&namespace).unwrap();
         assert!(!partition.consensus().view_log_unproven());
         assert_eq!(partition.consensus().commit_min(), NEW_HEAD);
+    }
+
+    /// A backup proves its adopted log through a repair while its WAL still
+    /// certifies the view it replicated in. The next view change reaches it before
+    /// any persist sweep certifies the proven view, and that view's primary is down.
+    #[compio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn given_settled_view_proof_when_start_view_change_precedes_wal_certification_should_elect_primary()
+     {
+        const REPLICAS: u8 = 3;
+        const BACKUP: u8 = 0;
+        const DOWN: u8 = REPAIR_PRIMARY;
+        const CANDIDATE: u8 = REPAIR_BACKUP;
+        const ADOPTED_VIEW: u32 = 4;
+        const ELECTED_VIEW: u32 = ADOPTED_VIEW + 1;
+        const LOCAL_HEAD: u64 = 1;
+        const HEAD: u64 = 2;
+        assert_eq!(u32::from(DOWN), ADOPTED_VIEW % u32::from(REPLICAS));
+        assert_eq!(u32::from(CANDIDATE), ELECTED_VIEW % u32::from(REPLICAS));
+        let directory = tempfile::tempdir().unwrap();
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let prepares = primary_prepares(&Rc::new(IggyMessageBus::new(0)), namespace, HEAD).await;
+        let mut owners = Vec::new();
+        for replica in [BACKUP, CANDIDATE] {
+            let bus = Rc::new(IggyMessageBus::new(0));
+            let sent = Rc::new(RefCell::new(Vec::new()));
+            let captured = Rc::clone(&sent);
+            bus.set_replica_forward_fn(Box::new(move |target, _, frame| {
+                let message =
+                    Message::<GenericHeader>::try_from(Owned::copy_from_slice(frame.as_slice()))
+                        .unwrap();
+                captured.borrow_mut().push((target, message));
+                Ok(())
+            }));
+            for peer in (0..REPLICAS).filter(|peer| *peer != replica) {
+                assert!(bus.owner_table().try_claim(peer, 1));
+            }
+            let (owner, inbox) = test_owner(&bus, None);
+            let mut partition = repairing_replica(&bus, namespace, (replica, REPLICAS), DOWN, 0, 0);
+            partition.repair = None;
+            let held = if replica == BACKUP {
+                partition.set_partition_dir(directory.path().to_str().unwrap().to_owned());
+                partition.open_persistence().await.unwrap();
+                LOCAL_HEAD
+            } else {
+                HEAD
+            };
+            for prepare in prepares.iter().take(usize::try_from(held).unwrap()) {
+                partition.on_replicate(prepare.clone()).await;
+            }
+            let partitions = owner.plane.partitions();
+            partitions.remove(&namespace).unwrap();
+            partitions.insert(namespace, partition);
+            partitions.set_io_notifier(
+                owner.partition_io.notifier(),
+                owner.partition_io.limits.bytes_max(),
+            );
+            owner
+                .on_start_view(start_view_suffix(
+                    namespace,
+                    ADOPTED_VIEW,
+                    HEAD,
+                    0,
+                    &[*prepares.last().unwrap().header()],
+                ))
+                .await;
+            owners.push((owner, inbox, sent));
+        }
+        let [(backup, _, backup_sent), (candidate, _, candidate_sent)] = &owners[..] else {
+            unreachable!("one owner per live replica");
+        };
+        let backup_consensus = || {
+            backup
+                .plane
+                .partitions()
+                .get_by_ns(&namespace)
+                .unwrap()
+                .consensus()
+        };
+        let candidate_consensus = || {
+            candidate
+                .plane
+                .partitions()
+                .get_by_ns(&namespace)
+                .unwrap()
+                .consensus()
+        };
+        let take = |source: u8, target: u8, command: Command| {
+            let sent = if source == BACKUP {
+                backup_sent
+            } else {
+                candidate_sent
+            };
+            let mut sent = sent.borrow_mut();
+            let index = sent
+                .iter()
+                .position(|(replica, message)| {
+                    *replica == target && message.header().command == command
+                })
+                .unwrap_or_else(|| panic!("missing {command:?} from {source} to {target}"));
+            MessageBag::try_from(sent.remove(index).1).unwrap()
+        };
+        let voted = || {
+            [Command::StartViewChange, Command::DoViewChange]
+                .iter()
+                .all(|command| {
+                    backup_sent.borrow().iter().any(|(target, message)| {
+                        *target == CANDIDATE
+                            && message.header().command == *command
+                            && message.header().view == ELECTED_VIEW
+                    })
+                })
+        };
+        assert!(!candidate_consensus().view_log_unproven());
+        assert!(backup_consensus().view_log_unproven());
+
+        let repaired = prepares[usize::try_from(HEAD - 1).unwrap()]
+            .clone()
+            .transmute_header(
+                |header, repaired: &mut iggy_binary_protocol::RepairPrepareHeader| {
+                    repaired.0 = header;
+                    repaired.0.command = Command::RepairPrepare;
+                },
+            );
+        backup.on_repair_prepare(repaired).await;
+        assert!(backup_consensus().is_normal());
+        assert!(!backup_consensus().view_log_unproven());
+
+        // Only the candidate ticks: its heartbeat timeout starts the next view
+        // while the backup runs nothing after its proof settled.
+        let mut scratch = Vec::new();
+        for _ in 0..2 * TimeoutManager::NORMAL_HEARTBEAT_TICKS {
+            if candidate_consensus().view() == ELECTED_VIEW {
+                break;
+            }
+            assert!(candidate.tick_partitions(&mut scratch).await.is_none());
+        }
+        assert_eq!(candidate_consensus().view(), ELECTED_VIEW);
+        backup
+            .on_message(take(CANDIDATE, BACKUP, Command::StartViewChange))
+            .await;
+        assert_eq!(backup_consensus().view(), ELECTED_VIEW);
+        assert!(!backup_consensus().is_normal());
+
+        let votes = async {
+            while !voted() {
+                assert!(backup.tick_partitions(&mut scratch).await.is_none());
+                backup.service_partition_io().await;
+                compio::time::sleep(crate::CONSENSUS_TICK_INTERVAL).await;
+            }
+        };
+        compio::time::timeout(REPLY_DEADLINE, Box::pin(votes))
+            .await
+            .expect("the backup must vote once its WAL certifies the view it proved");
+
+        candidate
+            .on_message(take(BACKUP, CANDIDATE, Command::StartViewChange))
+            .await;
+        candidate
+            .on_message(take(BACKUP, CANDIDATE, Command::DoViewChange))
+            .await;
+        for _ in 0..TimeoutManager::VIEW_CHANGE_STATUS_TICKS {
+            if candidate_consensus().is_normal() {
+                break;
+            }
+            assert!(candidate.tick_partitions(&mut scratch).await.is_none());
+        }
+        assert!(candidate_consensus().is_normal());
+        assert!(candidate_consensus().is_primary());
+        assert_eq!(candidate_consensus().view(), ELECTED_VIEW);
+        backup
+            .on_message(take(CANDIDATE, BACKUP, Command::StartView))
+            .await;
+        assert!(backup_consensus().is_normal());
+        assert_eq!(backup_consensus().view(), ELECTED_VIEW);
     }
 
     /// The walk refuses an unproven view log, so a resident op after

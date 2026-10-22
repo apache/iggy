@@ -2272,10 +2272,17 @@ where
         if persistence.certified_log_view() == Some(self.consensus.log_view()) {
             return true;
         }
+        // Outside `Normal` the journal stays the log of `log_view` once that log is
+        // proven, unless it is a primary-elect's merge, which `log_view` names only
+        // once the view starts.
+        if !self.consensus.is_normal()
+            && (self.consensus.view_log_unproven() || self.consensus.view_log_merged())
+        {
+            return false;
+        }
         // An install certifies the WAL it reset. Until it publishes its consensus,
         // the sequencer still names the history that the install replaces.
         if self.materialization_missing
-            || !self.consensus.is_normal()
             || matches!(
                 self.transition,
                 Some(PendingPartitionTransition::Install(_))

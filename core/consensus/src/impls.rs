@@ -1418,6 +1418,9 @@ where
     /// Partition-plane claim while an adopted log is unproven. Metadata uses
     /// `history_certificate`, including its durable WAL binding, instead.
     log_view_proven: Cell<u32>,
+    /// The proven journal is a primary-elect's merge while `log_view` still names
+    /// an older view. Set when the proof settles, cleared when the view starts.
+    view_log_merged: Cell<bool>,
     /// The prefix below a repair gap is unknown; entries above it can be proven.
     view_log_unproven_through: Cell<u64>,
     /// Set only after adoption has removed the superseded tail.
@@ -1811,6 +1814,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             adopted_view_dirty: Cell::new(false),
             view_log_unproven: Cell::new(false),
             log_view_proven: Cell::new(0),
+            view_log_merged: Cell::new(false),
             view_log_unproven_through: Cell::new(u64::MAX),
             view_log_missing_op: Cell::new(None),
             history_certificate: Cell::new(empty_history),
@@ -4624,8 +4628,17 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.view_log_unproven.get()
     }
 
+    /// Whether the proven journal is a primary-elect's merge that `log_view` does
+    /// not name yet. A replica superseded before it starts the view keeps the
+    /// merge under its older `log_view` until a later proof settles.
+    #[must_use]
+    pub const fn view_log_merged(&self) -> bool {
+        self.view_log_merged.get()
+    }
+
     pub fn settle_view_log_proof(&self) {
         self.view_log_unproven.set(false);
+        self.view_log_merged.set(self.is_primary_elect());
         if self.group != METADATA_GROUP {
             self.log_view_proven.set(self.log_view.get());
         }
@@ -4845,6 +4858,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         // header is installed there; parking installs nothing and the repair ingest
         // only fills holes, so a parked replica still holds its old view's log.
         self.log_view.set(self.view.get());
+        self.view_log_merged.set(false);
         // The view starts only once the merged log is proven against the WAL.
         if self.group == METADATA_GROUP {
             self.certify_view_log(
@@ -8510,6 +8524,65 @@ mod adopted_view_claim_tests {
              {COMMITTED}, which view {ADOPTED_VIEW} committed",
         );
         assert_eq!(restarted.status(), Status::Recovering);
+    }
+
+    #[test]
+    fn given_a_proven_merge_when_the_elect_is_superseded_should_stay_marked_until_a_view_starts() {
+        const ELECTED_VIEW: u32 = ADOPTED_VIEW + 1;
+        let history = history();
+        let elect = || {
+            let backup = adopt_unrepaired(&history);
+            // What the plane's reconcile does once the journal matches the parked headers.
+            backup.settle_view_log_proof();
+            assert!(
+                !backup.view_log_merged(),
+                "a backup proves the log its log_view names"
+            );
+            backup.enter_view_change(
+                PlaneKind::Metadata,
+                ELECTED_VIEW,
+                ViewChangeReason::ReceivedStartViewChange,
+            );
+            let peer = StoredDvc {
+                replica: OLD_PRIMARY,
+                log_view: ADOPTED_VIEW,
+                op: HEAD,
+                commit: HEAD - 1,
+                suffix: held(&history, HEAD - 1, HEAD),
+            };
+            for dvc in [dvc_of(&backup), peer] {
+                assert!(dvc_record(
+                    &mut backup.do_view_change_from_all_replicas.borrow_mut(),
+                    dvc
+                ));
+            }
+            assert!(
+                backup
+                    .complete_view_change_as_primary(PlaneKind::Metadata)
+                    .is_empty()
+            );
+            assert!(backup.is_primary_elect());
+            backup.settle_view_log_proof();
+            assert!(backup.view_log_merged());
+            backup
+        };
+
+        let superseded = elect();
+        superseded.enter_view_change(
+            PlaneKind::Metadata,
+            ELECTED_VIEW + 1,
+            ViewChangeReason::ReceivedStartViewChange,
+        );
+        assert!(!superseded.is_primary_elect());
+        assert!(
+            superseded.view_log_merged(),
+            "log_view {ADOPTED_VIEW} would name a journal that holds the view-{ELECTED_VIEW} merge"
+        );
+
+        let started = elect();
+        started.start_pending_view(PlaneKind::Metadata);
+        assert_eq!(started.log_view(), ELECTED_VIEW);
+        assert!(!started.view_log_merged());
     }
 
     #[test]
