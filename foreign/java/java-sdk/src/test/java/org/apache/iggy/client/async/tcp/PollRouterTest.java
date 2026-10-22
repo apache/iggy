@@ -55,11 +55,15 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.lang.management.ManagementFactory;
+import java.lang.management.MonitorInfo;
+import java.lang.management.ThreadInfo;
 import java.math.BigInteger;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Deque;
 import java.util.List;
 import java.util.Optional;
@@ -872,6 +876,35 @@ class PollRouterTest {
         }
     }
 
+    /**
+     * A close ends the dial of its slot, and the waiters of that dial fail inline. They take the router, poll and
+     * client monitors, and a holder of the client monitor can wait for the slot monitor, so they must run outside it.
+     */
+    @Test
+    void shouldFailTheWaitersOfADialOutsideTheRouterMonitorsWhenItsSlotCloses() throws Exception {
+        IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+        ManualTimers timers = new ManualTimers();
+        try {
+            Coordinator coordinator = new Coordinator(group, timers);
+            PollRouter router = new PollRouter(() -> coordinator, endpoint -> new StalledDial(group));
+            var waiter = router.connectionFor(
+                    new ConnectionInfo(InetAddress.getLoopbackAddress().getHostAddress(), PRIMARY_PORT),
+                    System.nanoTime() + TIMEOUT.toNanos());
+            CompletableFuture<List<String>> monitors = new CompletableFuture<>();
+            waiter.whenComplete((connection, error) -> monitors.complete(heldMonitors()));
+
+            router.clearSession().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+
+            assertThat(waiter).isCompletedExceptionally();
+            assertThat(monitors.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS))
+                    .as("monitors held while the waiters of the dial fail")
+                    .noneMatch(monitor -> monitor.startsWith(PollRouter.class.getName()));
+        } finally {
+            timers.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+            group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+        }
+    }
+
     @Test
     void shouldRefreshCachedHistoryBeforeANewPollAfterMetadataAdvances() throws Exception {
         IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
@@ -1048,6 +1081,15 @@ class PollRouterTest {
         thread.setDaemon(true);
         thread.start();
         return thread;
+    }
+
+    /** The classes of the monitors that the calling thread holds. */
+    private static List<String> heldMonitors() {
+        ThreadInfo thread = ManagementFactory.getThreadMXBean()
+                .getThreadInfo(new long[] {Thread.currentThread().getId()}, true, false)[0];
+        return Arrays.stream(thread.getLockedMonitors())
+                .map(MonitorInfo::getClassName)
+                .toList();
     }
 
     /** Holds every timer back, so the test fires a poll timeout at the instant it needs. */

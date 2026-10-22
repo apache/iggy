@@ -1207,6 +1207,7 @@ final class PollRouter {
 
         CompletableFuture<Void> close(AsyncTcpConnection keep) {
             AsyncTcpConnection previous;
+            CompletableFuture<Void> dialing;
             synchronized (this) {
                 if (maintenance != null) {
                     maintenance.cancel(false);
@@ -1215,11 +1216,14 @@ final class PollRouter {
                 previous = connection;
                 connection = null;
                 attachment = null;
-                if (connecting != null) {
-                    connecting.cancel(false);
-                    connecting = null;
-                }
+                dialing = connecting;
+                connecting = null;
                 binding = null;
+            }
+            // Outside the monitor: the waiters of the dial fail inline, and they take the router, poll and client
+            // monitors.
+            if (dialing != null) {
+                dialing.cancel(false);
             }
             return previous == null || previous == keep ? CompletableFuture.completedFuture(null) : previous.close();
         }
