@@ -32,8 +32,9 @@ Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/34
 > rebalances, graceful leave, session expiry and admin views of that membership
 > ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md)). `kafka-consumer-groups.sh --list`,
 > `--describe --members` and `--describe --state` use those views. The default `--describe`
-> calls OffsetFetch (API key 9), which is not implemented, so that mode does not work. With the bridge off,
-> Metadata reports every topic unknown, so a consumer joins a group and is assigned 0 partitions.
+> calls OffsetFetch (API key 9), which requires the bridge and otherwise answers
+> `COORDINATOR_LOAD_IN_PROGRESS` (14). With the bridge off, Metadata reports every topic unknown,
+> so a consumer joins a group and is assigned 0 partitions.
 > With the bridge on, OffsetCommit and OffsetFetch keep each group's offsets in Iggy, so a group
 > resumes from its last commit, also after a gateway restart
 > ([docs/OFFSET_STORAGE.md](docs/OFFSET_STORAGE.md)). Every Iggy server must run a build with the
@@ -78,6 +79,30 @@ Default bind: a `PLAINTEXT` listener on `127.0.0.1:9093`. Environment variables:
 | `IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED` | `false` | Kafka's `auto.create.topics.enable`: a `Metadata` lookup of a missing topic creates it ([Auto topic creation](#auto-topic-creation)). Needs `IGGY_KAFKA_BRIDGE_ENABLED=true`. Off by default, unlike Kafka |
 | `IGGY_KAFKA_AUTO_CREATE_TOPICS_PARTITIONS` | `1` | Partitions of an auto-created topic, at most 1000. Only read while auto-creation is on, and refused otherwise |
 
+## Docker image
+
+CI publishes [`apache/iggy-kafka-gateway`](https://hub.docker.com/r/apache/iggy-kafka-gateway)
+for `linux/amd64` and `linux/arm64`, using the same publishing rules as the Iggy server and
+connectors runtime:
+
+| Tag | Publishing rule |
+| --- | --- |
+| `edge` | Rolling build refreshed by successful publishing after affected changes merge to `master`. It can lag after a failed publish run. |
+| `<version>` | Version from `gateways/kafka/Cargo.toml`. Stable releases are published manually; new prereleases can be published automatically. |
+| `latest` | Updated only by a manual stable release. |
+
+CI treats only versions containing `-edge` or `-rc` as prereleases, such as `0.2.0-edge.1`
+or `0.2.0-rc.1`.
+
+```bash
+docker pull apache/iggy-kafka-gateway:edge
+```
+
+With the image's default listener, set `IGGY_KAFKA_ADVERTISED_HOST` to a host reachable by
+Kafka clients; see [Run](#run). Produce and Fetch need `IGGY_KAFKA_BRIDGE_ENABLED=true`
+and the Iggy connection settings. The [Compose quick start](#quick-start-docker-compose)
+sets both the advertised address and the bridge configuration.
+
 ## Quick start (Docker Compose)
 
 The fastest way to see a Kafka client talk to Iggy: two containers, no local Rust toolchain to
@@ -94,13 +119,26 @@ cd gateways/kafka
 docker compose up --build
 ```
 
-`iggy-server` pulls the prebuilt `apache/iggy:edge` image (refreshed on a master push only when `server` or `iggy-cli` is affected, or `web` or `core/server/Dockerfile` changes),
+By default, `iggy-server` pulls the prebuilt `apache/iggy:edge` image,
 so only `iggy-gateway-kafka` compiles from source. Its Dockerfile mounts a cargo registry/target
 cache, so a first run costs one real compile and every run after reuses it, even across a source
 change elsewhere in the workspace. Testing a local `iggy-server` change: comment out `image:` and
 uncomment `build:` in `docker-compose.yml` first. That build mounts cargo registry, git, and
 target caches, so the first run is still a full release build of several minutes and later runs
 reuse those mounts.
+
+To use the prebuilt gateway too, comment out its `build:` block in
+[`docker-compose.yml`](docker-compose.yml) and uncomment its `image:` and `pull_policy:` lines.
+The [`pull_policy: always`](https://docs.docker.com/reference/compose-file/services/#pull_policy)
+setting checks for a newer rolling image each time. From `gateways/kafka`, start both images
+without compiling:
+
+```bash
+docker compose up --no-build
+```
+
+Before testing local gateway changes or running [manual testing](docs/MANUAL_TESTING.md)
+Category I, restore the `build:` block and comment out `image:` and `pull_policy:`.
 
 This starts `iggy-server` (the real Iggy broker) and `iggy-gateway-kafka` (bridge enabled,
 pointed at that server) on a shared Docker network, with the gateway waiting for the server's
@@ -152,9 +190,7 @@ stack. See `gateways/kafka/docker-compose.yml` and the environment variable tabl
 every other knob.
 
 **Limitations** (see the stub warning above for the full list): single gateway, single Iggy node,
-SASL off by default. This is a development quick start, not a production deployment shape. If your
-local `apache/iggy:edge` predates [#4392](https://github.com/apache/iggy/pull/4392), run
-`docker compose pull`, because that server refuses every offset commit.
+SASL off by default. This is a development quick start, not a production deployment shape.
 
 This quick start's topics use Iggy's default `Durability::Replicated` - a Produce ack is a
 quorum commit, not an fsync. A `docker kill` or host power loss can lose acked records despite
@@ -252,8 +288,6 @@ Limits:
 - Classic protocol only. A consumer with `group.protocol=consumer` (KIP-848) fails.
 - `group.instance.id` is accepted but not honoured. A static member that restarts causes two
   rebalances.
-- No DescribeGroups or ListGroups yet ([#3548](https://github.com/apache/iggy/issues/3548)), so
-  `kafka-consumer-groups.sh` cannot list or describe a group.
 - No DeleteGroups or OffsetDelete, and offsets never expire. An operator deletes a group's offsets
   in Iggy ([docs/OFFSET_STORAGE.md](docs/OFFSET_STORAGE.md#limits)).
 - Delivery is at-least-once. A consumer that stops before it commits reads those records again.
@@ -413,8 +447,8 @@ topic per call) and records by time for `ListOffsets`, probes and polls partitio
 stores and reads group offsets for OffsetCommit and OffsetFetch.
 Produce ([#3535](https://github.com/apache/iggy/issues/3535)), Fetch ([#3536](https://github.com/apache/iggy/issues/3536)), ListOffsets
 ([#3537](https://github.com/apache/iggy/issues/3537)), Metadata ([#3534](https://github.com/apache/iggy/issues/3534)), CreateTopics
-([#3538](https://github.com/apache/iggy/issues/3538)), DescribeConfigs, AlterConfigs and IncrementalAlterConfigs, OffsetCommit and OffsetFetch
-([#3542](https://github.com/apache/iggy/issues/3542)) call it.
+([#3538](https://github.com/apache/iggy/issues/3538)), DescribeConfigs, AlterConfigs, IncrementalAlterConfigs,
+OffsetCommit and OffsetFetch ([#3542](https://github.com/apache/iggy/issues/3542)) call it.
 Topic configuration behavior is in [docs/CONFIGS.md](docs/CONFIGS.md).
 Tested by `bridge`'s own unit tests, `tests/bridge_iggy_integration_tests.rs` and the
 `tests/*_real_bridge_tests.rs` suites. All but the unit tests start a real `iggy-server`.
