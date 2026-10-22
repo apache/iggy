@@ -805,7 +805,7 @@ final class PollRouter {
     }
 
     /** Whether {@code error} tells that the replica has no such stream, topic or partition. */
-    private static boolean isNamespaceMiss(Throwable error) {
+    static boolean isNamespaceMiss(Throwable error) {
         IggyServerException refusal = AsyncTcpConnection.findServerError(error);
         return refusal != null
                 && switch (refusal.getErrorCode()) {

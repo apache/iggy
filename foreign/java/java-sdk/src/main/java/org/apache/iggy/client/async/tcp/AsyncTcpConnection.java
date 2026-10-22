@@ -1365,7 +1365,7 @@ public class AsyncTcpConnection {
                                 && exchange.failoverState().ticket != null));
         exchange.failoverState().uncertain = nextUncertain;
         exchange.failoverState().everUncertain |= wasUncertain || nextUncertain;
-        if (exchange.failoverState().ticket != null && isRefusal(serverError)) {
+        if (exchange.failoverState().ticket != null && (isRefusal(serverError) || PollRouter.isNamespaceMiss(error))) {
             exchange.failoverState().ticket.settleSent(nextUncertain);
         }
         if (shouldRetryTransient(

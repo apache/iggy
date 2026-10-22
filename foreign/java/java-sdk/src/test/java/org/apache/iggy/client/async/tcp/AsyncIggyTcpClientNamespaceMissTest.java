@@ -43,6 +43,7 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.IntUnaryOperator;
 
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.BIND_SESSION_CODE;
@@ -295,6 +296,81 @@ class AsyncIggyTcpClientNamespaceMissTest {
             }
             cluster.awaitServed();
             assertThat(cluster.leader.sends).hasSize(2);
+        }
+    }
+
+    /**
+     * The metadata primary drops the link of the client after it routes the send, and it refuses the bind on the next
+     * link, so the client registers a new session before the retry of the miss. No node admitted the send, so it
+     * goes out again under that session with a new request id and does not end uncertain.
+     */
+    @Test
+    @SuppressWarnings("checkstyle:NPathComplexity")
+    void shouldSendABackupMissAgainUnderTheNextSessionWhenTheSessionIsLostBeforeItsRetry() throws Exception {
+        InetAddress loopback = InetAddress.getLoopbackAddress();
+        // The link that routes the send and the link that finds the session lost.
+        int leaderLinks = 2;
+        try (ServerSocket leader = new ServerSocket(0, leaderLinks, loopback);
+                ServerSocket backup = new ServerSocket(0, 1, loopback)) {
+            List<Request> registers = new CopyOnWriteArrayList<>();
+            AtomicInteger lookups = new AtomicInteger();
+            var leaderServed = serve(leader, leaderLinks, request -> {
+                if (request.operation() == OPERATION_REGISTER) {
+                    registers.add(request);
+                    return Response.success(OPERATION_REGISTER, registerBody(registers.size()));
+                }
+                if (request.is(BIND_SESSION_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.error(OPERATION_NON_REPLICATED, IggyErrorCode.UNAUTHENTICATED.getCode());
+                }
+                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(
+                            OPERATION_NON_REPLICATED,
+                            clusterMetadata(leader.getLocalPort(), backup.getLocalPort(), leader.getLocalPort()));
+                }
+                if (!request.is(GET_PARTITION_ROUTE_CODE, OPERATION_NON_REPLICATED)) {
+                    throw new IllegalStateException("Unexpected leader request: " + request);
+                }
+                ByteBuf route = pollRoute(request, 1, 1, backup.getLocalPort());
+                return lookups.incrementAndGet() == 1
+                        ? Response.successAndDisconnect(OPERATION_NON_REPLICATED, route)
+                        : Response.success(OPERATION_NON_REPLICATED, route);
+            });
+            List<Request> sends = new CopyOnWriteArrayList<>();
+            var backupServed = serve(backup, request -> {
+                if (request.is(BIND_SESSION_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(OPERATION_NON_REPLICATED, bindBody(request));
+                }
+                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(
+                            OPERATION_NON_REPLICATED,
+                            clusterMetadata(leader.getLocalPort(), backup.getLocalPort(), leader.getLocalPort()));
+                }
+                if (request.operation() != OPERATION_SEND_MESSAGES) {
+                    throw new IllegalStateException("Unexpected backup request: " + request);
+                }
+                sends.add(request);
+                return sends.size() == 1
+                        ? Response.error(OPERATION_SEND_MESSAGES, IggyErrorCode.TOPIC_ID_NOT_FOUND.getCode())
+                        : Response.success(OPERATION_SEND_MESSAGES, Unpooled.EMPTY_BUFFER);
+            });
+            AsyncIggyTcpClient client = client(leader);
+            try {
+                client.connect().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                client.login().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+
+                send(client).get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+
+                assertThat(registers).hasSize(2);
+                assertThat(sends).hasSize(2);
+                Request retried = sends.get(1);
+                assertThat(retried.requestId()).isNotEqualTo(sends.get(0).requestId());
+                assertThat(retried.clientLow()).isEqualTo(registers.get(1).clientLow());
+                assertThat(retried.clientHigh()).isEqualTo(registers.get(1).clientHigh());
+            } finally {
+                client.close().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            }
+            leaderServed.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            backupServed.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
         }
     }
 
