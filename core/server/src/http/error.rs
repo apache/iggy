@@ -76,14 +76,15 @@ impl IntoResponse for CustomError {
                     | IggyError::InvalidPersonalAccessToken => StatusCode::UNAUTHORIZED,
                     IggyError::Unauthorized => StatusCode::FORBIDDEN,
                     IggyError::PartitionHistoryChanged => StatusCode::CONFLICT,
-                    // The pre-consensus retry frame: reaching this render
-                    // means the write path's replay budget is exhausted and
-                    // the op never committed - a transient server condition,
-                    // retryable like the other cannot-commit-right-now 503s
-                    // (see `service_unavailable`), never a caller error.
-                    IggyError::TransientNotCommitted
-                    | IggyError::TransientNotAccepted
-                    | IggyError::NotPrimary => StatusCode::SERVICE_UNAVAILABLE,
+                    // The write path ran out of replays of a request id whose
+                    // op may still commit (see `submit::submit_committed`).
+                    // HTTP mints a new id per request, so a resend could apply
+                    // the op twice: 504, the unknown outcome, never a
+                    // retryable 503.
+                    IggyError::TransientNotCommitted => StatusCode::GATEWAY_TIMEOUT,
+                    IggyError::TransientNotAccepted | IggyError::NotPrimary => {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    }
                     _ => StatusCode::BAD_REQUEST,
                 };
                 let response =
@@ -93,9 +94,7 @@ impl IntoResponse for CustomError {
                 // (`service_unavailable`, `server_busy`).
                 if matches!(
                     error,
-                    IggyError::TransientNotCommitted
-                        | IggyError::TransientNotAccepted
-                        | IggyError::NotPrimary
+                    IggyError::TransientNotAccepted | IggyError::NotPrimary
                 ) {
                     with_retry_after(response)
                 } else {
@@ -492,9 +491,7 @@ pub(in crate::http) enum ReadError {
     /// still below the op the caller was told committed. Fail-closed on the
     /// same retryable 503 as [`Self::RecoveryIncomplete`]: the two are the same
     /// hazard (serving state the caller already saw replaced) reached from
-    /// different directions, and 503 is what the binary transports' equivalent
-    /// refusal (`TransientNotCommitted`) already renders as, so an SDK that
-    /// speaks both sees one answer. Never a 2xx with stale state.
+    /// different directions. Never a 2xx with stale state.
     MetadataFrontierUnreached,
     /// A metadata floor read could not reserve forwarding capacity.
     ForwardBusy,
@@ -805,11 +802,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn transient_not_committed_renders_503_with_retry_after() {
+    #[tokio::test]
+    async fn transient_not_committed_renders_504_without_retry_after() {
         let response = CustomError::from(IggyError::TransientNotCommitted).into_response();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert!(response.headers().contains_key(RETRY_AFTER));
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(!response.headers().contains_key(RETRY_AFTER));
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["id"], IggyError::TransientNotCommitted.as_code());
     }
 
     #[test]

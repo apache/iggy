@@ -56,9 +56,9 @@ use crate::reply_frame::reply_body;
 ///
 /// `TransientNotCommitted` is the exception to that map: the relay that lost
 /// the write's verdict answers it, and it licenses only a replay of the same
-/// request id. HTTP mints a new id per request and never replays one, so the
-/// write may still commit and grades as the unknown-outcome
-/// [`PartitionWriteError::Timeout`].
+/// request id. HTTP mints a new id per request, so a resend is a new request
+/// that cannot replay this one: the write may still commit and grades as the
+/// unknown-outcome [`PartitionWriteError::Timeout`].
 ///
 /// Grading only, and it hands the graded header back: the committed body is
 /// read separately (see [`send_confirmations`]) because it is

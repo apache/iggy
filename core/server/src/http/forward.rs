@@ -1352,9 +1352,9 @@ fn classify_transport_error(error: &cyper::Error, kind: RelayKind) -> AttemptOut
 /// A 307 means the target itself was not the metadata primary and knows a
 /// better one; the retry re-resolves from the LOCAL view instead of trusting
 /// the `Location`. A 503 is retried only when its body proves the target was
-/// not the primary for this [`RelayKind`] - a `TransientNotCommitted` 503 may
-/// still commit and is relayed untouched. Everything else is the primary's
-/// answer and is relayed. A retry carries `hint`, the primary a refusing
+/// not the primary for this [`RelayKind`]. Everything else is the primary's
+/// answer and is relayed, such as a `TransientNotCommitted` 504 whose op may
+/// still commit. A retry carries `hint`, the primary a refusing
 /// target named.
 fn classify_reply(
     status: StatusCode,

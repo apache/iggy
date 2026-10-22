@@ -171,6 +171,13 @@ policy. Rust and Python use their configured retry schedule rather than
 `Retry-After`; C# honors its delta value; Java uses Apache HttpClient's ordinary
 429/503 retry strategy.
 
+A 503 answer to a write means that nothing was admitted, so the write can be sent
+again. A 502 or 504 answer to a write means that its outcome is unknown, and the
+write can still commit. The body `id` 57 (`TransientNotCommitted`) or the body
+`code`, such as `produce_timeout`, names the cause. Read the state before writing
+again, because a resend is a new request that can apply twice. The Rust, C# and
+Java SDKs never resend such a write, and the Rust SDK reports it as 57.
+
 Metadata forwards, partition relays and metadata-floor waits share a limit of
 128 concurrent forwards per node. New forwards at capacity return 503 `forward_busy` with
 `Retry-After: 1`. Metadata forwarding has one 30-second retry budget beginning

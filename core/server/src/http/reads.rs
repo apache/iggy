@@ -226,7 +226,7 @@ pub(in crate::http) async fn gate_local_read(
 /// (`http::forward::record_relayed_floor`), so a caller that posted through
 /// this follower is held here too. A user who wrote through a different node
 /// entirely still leaves no floor here, and neither does a relayed write
-/// answered with the `TransientNotCommitted` 503, whose op may have committed
+/// answered with the `TransientNotCommitted` 504, whose op may have committed
 /// anyway (see `http::submit::submit_committed`).
 ///
 /// The wait itself is the binary plane's [`hold_for_frontier`]: woken by the

@@ -114,7 +114,7 @@ pub(in crate::http) async fn submit_committed(
         // A follower with HTTP forwarding ON never runs this task: the
         // middleware relays the write and records the floor from the serving
         // primary's applied op instead (`http::forward::record_relayed_floor`).
-        // One gap survives that split - a relayed 503 carrying
+        // One gap survives that split - a relayed 504 carrying
         // `TransientNotCommitted` is passed through untouched rather than
         // retried, because its op may still commit, and only a 2xx records a
         // floor. A write that did commit behind that code therefore leaves
@@ -268,8 +268,9 @@ async fn submit_gated(
         // the same transient.
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            // Budget exhausted: surface a retryable 503 (never the catch-all
-            // 400), with the code sticky across frames. Once ANY frame was
+            // Budget exhausted: surface the transient code (never the
+            // catch-all 400), sticky across frames: a 503 when nothing was
+            // admitted, else the 504 unknown outcome. Once ANY frame was
             // `TransientNotCommitted` the op may still commit cluster-wide (a
             // view-change-canceled prepare can reach quorum and be inherited
             // by the new primary), so a later `TransientNotAccepted` frame -

@@ -198,10 +198,10 @@ pub(in crate::http) async fn login_user(
     // re-commits, like every other local read. On barrier expiry, fail with a
     // retryable 503 rather than validating against rolled-back credentials:
     // this route's error currency is `IggyError -> CustomError`, and
-    // `TransientNotCommitted` is the variant `CustomError` renders 503.
+    // `TransientNotAccepted` is the variant `CustomError` renders 503.
     SendWrapper::new(crate::http::reads::await_recovery_barrier(&state.shard))
         .await
-        .map_err(|_| IggyError::TransientNotCommitted)?;
+        .map_err(|_| IggyError::TransientNotAccepted)?;
     let (user_id, created_at) = verify_login_credentials(
         &state.shard,
         &command.username,
@@ -219,7 +219,7 @@ pub(in crate::http) async fn login_with_personal_access_token(
     // `login_user`.
     SendWrapper::new(crate::http::reads::await_recovery_barrier(&state.shard))
         .await
-        .map_err(|_| IggyError::TransientNotCommitted)?;
+        .map_err(|_| IggyError::TransientNotAccepted)?;
     let (user_id, created_at) = verify_pat_credentials(&state.shard, command.token.expose_secret())
         .map_err(|error| login_error_to_iggy(&error))?;
     issue_identity(&state, user_id, created_at)
@@ -2291,7 +2291,7 @@ mod tests {
 
     /// A relay that lost a write's verdict answers `TransientNotCommitted`,
     /// which licenses only a replay of the same request id. HTTP mints a new
-    /// id for every request and never replays one, so the write may still
+    /// id for every request, so no resend replays it and the write may still
     /// commit: it must render as the 504 unknown outcome of its write kind,
     /// never as a retryable 503.
     #[tokio::test]
