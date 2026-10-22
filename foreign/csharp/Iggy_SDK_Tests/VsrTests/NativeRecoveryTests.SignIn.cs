@@ -132,6 +132,30 @@ public sealed partial class NativeRecoveryTests
     }
 
     [Theory]
+    [InlineData(VsrError.TRANSIENT_NOT_ACCEPTED)]
+    [InlineData(VsrError.NOT_PRIMARY)]
+    public async Task given_an_unadmitted_automatic_register_when_the_session_recovers_should_sign_in_again(int code)
+    {
+        // The client resends a register refused with 58 until its 30 s deadline, before the recovery sees the refusal.
+        using var cluster = new RecoveryCluster(TimeSpan.FromSeconds(45));
+        using var client = await cluster.ConnectAsync();
+        var registrations = new ConcurrentQueue<MockRequest>();
+        cluster.OnRegister = request =>
+        {
+            registrations.Enqueue(request);
+            return registrations.TryPeek(out var refused) && refused.ClientId == request.ClientId
+                ? Reply(request.Operation, [], (uint)code) : Answer(request);
+        };
+        cluster.PingEviction = EvictionReason.SessionError;
+        await Assert.ThrowsAnyAsync<Exception>(() => client.PingAsync(cluster.Token));
+        await cluster.UntilAsync(() => registrations.Select(registration => registration.ClientId).Distinct().Count() == 2);
+
+        await StoreAsync(client, cluster.Token);
+
+        Assert.Equal(registrations.Last().ClientId, Assert.Single(cluster.Writes).ClientId);
+    }
+
+    [Theory]
     [InlineData("invalid password")]
     [InlineData("invalid token")]
     [InlineData("refused")]

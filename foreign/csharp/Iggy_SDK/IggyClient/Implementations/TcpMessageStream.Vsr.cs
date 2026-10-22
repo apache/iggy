@@ -246,8 +246,15 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
                 }
             }
             var canceled = token.IsCancellationRequested;
+            // A register refused before admission leaves no session behind, so the recovery signs in again.
+            var unadmitted = continues && !bound && error is IggyInvalidStatusCodeException
+            {
+                FromServer: true,
+                StatusCode: VsrError.TRANSIENT_NOT_ACCEPTED or VsrError.NOT_PRIMARY
+            };
             await ResetConsensusSessionAsync(canceled ? null : error,
-                stops: continues && !canceled && !refused, owner: owner, continues: updated);
+                stops: continues && !canceled && !refused && !unadmitted, owner: owner,
+                continues: updated || unadmitted);
             throw;
         }
     }
