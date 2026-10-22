@@ -94,10 +94,6 @@ const DEFAULT_MEMBER_PREFIX: &str = "member";
 /// a park into a spin.
 const MIN_PARK: Duration = Duration::from_millis(1);
 
-/// Old member ids kept per instance for `FENCED_INSTANCE_ID`. Bounded because a client looping
-/// static rejoins would otherwise grow the list without limit; past it the oldest answers 25.
-const MAX_FENCED_PER_INSTANCE: usize = 8;
-
 pub type Groups = HashMap<StrBytes, GroupState>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,14 +127,6 @@ pub enum Step<T> {
 struct Departures {
     members: bool,
     pending: bool,
-}
-
-/// The member holding one `group_instance_id`, and the ids it replaced while held.
-struct StaticInstance {
-    holder: StrBytes,
-    /// Their parked waiters and requests are answered `FENCED_INSTANCE_ID`, not
-    /// `UNKNOWN_MEMBER_ID`. At most [`MAX_FENCED_PER_INSTANCE`], oldest first.
-    fenced: Vec<StrBytes>,
 }
 
 pub struct Member {
@@ -288,9 +276,9 @@ pub struct GroupState {
     /// First join of a new group: the barrier waits out the full delay even once every known
     /// member has joined, so a second consumer starting a moment later lands in generation 1.
     initial: bool,
-    /// Every static member, by instance id. An entry is dropped with its holder, so the map never
-    /// outgrows `members`.
-    static_members: HashMap<StrBytes, StaticInstance>,
+    /// The member id holding each instance id. An entry is dropped with its holder, so the map
+    /// never outgrows `members`.
+    static_members: HashMap<StrBytes, StrBytes>,
     changed: watch::Sender<u64>,
 }
 
@@ -464,18 +452,13 @@ impl GroupState {
     /// Adds a member, indexing it under its instance id when it names one.
     fn insert_member(&mut self, member_id: StrBytes, member: Member) {
         if let Some(instance_id) = &member.group_instance_id {
-            self.static_members.insert(
-                instance_id.clone(),
-                StaticInstance {
-                    holder: member_id.clone(),
-                    fenced: Vec::new(),
-                },
-            );
+            self.static_members
+                .insert(instance_id.clone(), member_id.clone());
         }
         self.members.insert(member_id, member);
     }
 
-    /// Removes a member for good. Its instance id, and the ids that instance fenced, go with it.
+    /// Removes a member for good. Its instance id goes with it.
     fn remove_member(&mut self, member_id: &StrBytes) {
         if let Some(instance_id) = self
             .members
@@ -491,9 +474,7 @@ impl GroupState {
 
     /// The member holding `instance_id`.
     fn static_holder(&self, instance_id: &StrBytes) -> Option<&StrBytes> {
-        self.static_members
-            .get(instance_id)
-            .map(|instance| &instance.holder)
+        self.static_members.get(instance_id)
     }
 
     /// Kafka's `ClassicGroup.validateMember`: a named instance must be held, and by this member.
@@ -513,19 +494,6 @@ impl GroupState {
             Ok(())
         } else {
             Err(ERROR_UNKNOWN_MEMBER_ID)
-        }
-    }
-
-    /// The answer for a parked waiter whose member is no longer in the group.
-    fn departed_member_error(&self, member_id: &StrBytes) -> i16 {
-        let fenced = self
-            .static_members
-            .values()
-            .any(|instance| instance.fenced.contains(member_id));
-        if fenced {
-            ERROR_FENCED_INSTANCE_ID
-        } else {
-            ERROR_UNKNOWN_MEMBER_ID
         }
     }
 
@@ -1309,10 +1277,14 @@ fn refresh_parked_session(
     }
 }
 
+/// The waiter is checked against its instance id's holder again, so one whose instance was
+/// taken over while it slept is answered `FENCED_INSTANCE_ID`, as Kafka's `replaceStaticMember`
+/// answers it at once.
 pub fn join_resume_step(
     groups: &mut Groups,
     group_id: &StrBytes,
     member_id: &StrBytes,
+    group_instance_id: Option<&StrBytes>,
     now: Instant,
 ) -> Step<JoinResult> {
     refresh_parked_session(groups, group_id, member_id, now);
@@ -1328,11 +1300,8 @@ pub fn join_resume_step(
             member_id.clone(),
         ));
     };
-    if !group.members.contains_key(member_id) {
-        return Step::Respond(JoinResult::error(
-            group.departed_member_error(member_id),
-            member_id.clone(),
-        ));
+    if let Err(error) = group.validate_member(member_id, group_instance_id) {
+        return Step::Respond(JoinResult::error(error, member_id.clone()));
     }
     park_or_respond(group, member_id, now)
 }
@@ -1433,10 +1402,12 @@ pub fn sync_step(
     }
 }
 
+/// Like [`join_resume_step`], the waiter is checked against its instance id's holder again.
 pub fn sync_resume_step(
     groups: &mut Groups,
     group_id: &StrBytes,
     member_id: &StrBytes,
+    group_instance_id: Option<&StrBytes>,
     generation_id: i32,
     now: Instant,
 ) -> Step<SyncResult> {
@@ -1447,8 +1418,8 @@ pub fn sync_resume_step(
     let Some(group) = groups.get_mut(group_id) else {
         return Step::Respond(SyncResult::error(ERROR_UNKNOWN_MEMBER_ID));
     };
-    if !group.members.contains_key(member_id) {
-        return Step::Respond(SyncResult::error(group.departed_member_error(member_id)));
+    if let Err(error) = group.validate_member(member_id, group_instance_id) {
+        return Step::Respond(SyncResult::error(error));
     }
     if group.generation_id != generation_id || group.phase == Phase::PreparingRebalance {
         return Step::Respond(SyncResult::error(ERROR_REBALANCE_IN_PROGRESS));
@@ -1866,21 +1837,17 @@ fn replace_static(
         ));
     }
     let previous_leader = group.leader.clone().unwrap_or_default();
-    let instance = request
+    let holder = request
         .group_instance_id
         .as_ref()
         .and_then(|instance_id| group.static_members.get_mut(instance_id));
-    let (Some(instance), Some(mut member)) = (instance, group.members.remove(old_member_id)) else {
+    let (Some(holder), Some(mut member)) = (holder, group.members.remove(old_member_id)) else {
         return Step::Respond(JoinResult::error(
             ERROR_UNKNOWN_MEMBER_ID,
             request.member_id.clone(),
         ));
     };
-    instance.holder = new_member_id.clone();
-    if instance.fenced.len() >= MAX_FENCED_PER_INSTANCE {
-        instance.fenced.remove(0);
-    }
-    instance.fenced.push(old_member_id.clone());
+    *holder = new_member_id.clone();
     member.rejoin(request, now, config.max_rebalance_timeout);
     group.members.insert(new_member_id.clone(), member);
     if group.leader.as_ref() == Some(old_member_id) {
@@ -2172,7 +2139,7 @@ mod tests {
 
         // The leader is parked, waiting for the barrier. Its session lapses while it waits.
         let woken = now + Duration::from_secs(11);
-        let step = join_resume_step(&mut groups, &group_id(), &leader, woken);
+        let step = join_resume_step(&mut groups, &group_id(), &leader, None, woken);
 
         assert!(
             groups[&group_id()].members.contains_key(&leader),
@@ -2304,11 +2271,11 @@ mod tests {
         assert_eq!(groups[&group_id()].phase, Phase::Stable);
 
         // The follower collects its answer, which is destructive.
-        let first = join_resume_step(&mut groups, &group_id(), &follower, now);
+        let first = join_resume_step(&mut groups, &group_id(), &follower, None, now);
         assert!(matches!(first, Step::Respond(_)));
 
         // A second in-flight call for the same member now finds no snapshot at all.
-        let stranded = join_resume_step(&mut groups, &group_id(), &follower, now);
+        let stranded = join_resume_step(&mut groups, &group_id(), &follower, None, now);
 
         assert!(
             matches!(stranded, Step::Respond(_)),
@@ -2888,8 +2855,8 @@ mod tests {
             now,
         );
 
-        let _collected = join_resume_step(&mut groups, &group_id(), &follower, now);
-        let stranded = join_resume_step(&mut groups, &group_id(), &follower, now);
+        let _collected = join_resume_step(&mut groups, &group_id(), &follower, None, now);
+        let stranded = join_resume_step(&mut groups, &group_id(), &follower, None, now);
 
         let Step::Respond(result) = stranded else {
             panic!("a waiter with no barrier to wait on must be answered");
@@ -2924,8 +2891,8 @@ mod tests {
         let (_leader, follower) = two_members(&mut groups, &config, &["x"], &["x"], now);
         assert_eq!(groups[&group_id()].phase, Phase::CompletingRebalance);
 
-        let _collected = join_resume_step(&mut groups, &group_id(), &follower, now);
-        let stranded = join_resume_step(&mut groups, &group_id(), &follower, now);
+        let _collected = join_resume_step(&mut groups, &group_id(), &follower, None, now);
+        let stranded = join_resume_step(&mut groups, &group_id(), &follower, None, now);
 
         assert!(
             matches!(stranded, Step::Respond(_)),
@@ -3065,7 +3032,7 @@ mod tests {
         );
 
         let woken = now + Duration::from_secs(11);
-        let step = sync_resume_step(&mut groups, &group_id(), &follower, generation, woken);
+        let step = sync_resume_step(&mut groups, &group_id(), &follower, None, generation, woken);
 
         assert!(
             groups[&group_id()].members.contains_key(&follower),
@@ -3240,6 +3207,7 @@ mod tests {
             &mut groups,
             &group_id(),
             &follower,
+            None,
             now + Duration::from_secs(5),
         );
 
@@ -4010,7 +3978,7 @@ mod tests {
         assert!(matches!(parked, Step::Wait { .. }));
 
         let _ = leave(&mut groups, &[(follower.as_str(), None)], now);
-        let resumed = join_resume_step(&mut groups, &group_id(), &follower, now);
+        let resumed = join_resume_step(&mut groups, &group_id(), &follower, None, now);
 
         assert_eq!(error_of(&resumed), ERROR_UNKNOWN_MEMBER_ID);
         assert!(!groups[&group_id()].members.contains_key(&follower));
@@ -4562,7 +4530,13 @@ mod tests {
         assert_ne!(new_id, old);
         assert_eq!(groups[&group_id()].generation_id, generation + 1);
 
-        let resumed = joined(join_resume_step(&mut groups, &group_id(), &old, now));
+        let resumed = joined(join_resume_step(
+            &mut groups,
+            &group_id(),
+            &old,
+            Some(&instance("i-b")),
+            now,
+        ));
         assert_eq!(resumed.error, ERROR_FENCED_INSTANCE_ID);
         assert_eq!(resumed.member_id, old);
     }
@@ -4734,12 +4708,6 @@ mod tests {
         );
         assert_ne!(member_id_of(&returned), follower);
         assert_eq!(holders_of(&groups, "i-b"), vec![member_id_of(&returned)]);
-        assert!(
-            groups[&group_id()].static_members[&instance("i-b")]
-                .fenced
-                .is_empty(),
-            "the expired holder was not replaced, so nothing is fenced"
-        );
     }
 
     fn holders_of(groups: &Groups, instance_id: &str) -> Vec<StrBytes> {
@@ -4767,7 +4735,13 @@ mod tests {
             now,
         );
         assert!(matches!(rejoin, Step::Wait { .. }));
-        joined(join_resume_step(groups, &group_id(), leader, closed))
+        joined(join_resume_step(
+            groups,
+            &group_id(),
+            leader,
+            Some(&instance("i-a")),
+            closed,
+        ))
     }
 
     #[test]
@@ -4968,7 +4942,13 @@ mod tests {
             now,
         ));
         let generation = follower_answer.generation_id;
-        let _ = joined(join_resume_step(&mut groups, &group_id(), &leader, now));
+        let _ = joined(join_resume_step(
+            &mut groups,
+            &group_id(),
+            &leader,
+            Some(&instance("i-a")),
+            now,
+        ));
         let assign = SyncRequest {
             assignments: vec![
                 (leader.clone(), Bytes::from_static(b"a-2")),
@@ -5051,7 +5031,13 @@ mod tests {
             now,
         ))
         .generation_id;
-        let _ = joined(join_resume_step(&mut groups, &group_id(), &leader, now));
+        let _ = joined(join_resume_step(
+            &mut groups,
+            &group_id(),
+            &leader,
+            Some(&instance("i-a")),
+            now,
+        ));
         let parked = sync_step(
             &mut groups,
             &config,
@@ -5071,9 +5057,14 @@ mod tests {
             error_of_sync(&sync_step(&mut groups, &config, &assign, synced_at)),
             ERROR_NONE
         );
-        let Step::Respond(answered) =
-            sync_resume_step(&mut groups, &group_id(), &follower, generation, synced_at)
-        else {
+        let Step::Respond(answered) = sync_resume_step(
+            &mut groups,
+            &group_id(),
+            &follower,
+            Some(&instance("i-b")),
+            generation,
+            synced_at,
+        ) else {
             panic!("the leader's sync answers the parked follower");
         };
         assert_eq!(answered.assignment, Bytes::from_static(b"b-2"));
@@ -5088,7 +5079,7 @@ mod tests {
         assert_eq!(group.phase, Phase::Stable);
     }
 
-    /// `stable_static_pair` with `i-b` replaced once, so its entry holds a fenced id.
+    /// `stable_static_pair` with `i-b` replaced once.
     fn replaced_follower(
         groups: &mut Groups,
         config: &GroupCoordinatorConfig,
@@ -5102,8 +5093,8 @@ mod tests {
             now,
         ));
         assert_eq!(
-            groups[&group_id()].static_members[&instance("i-b")].fenced,
-            vec![old.clone()]
+            groups[&group_id()].static_holder(&instance("i-b")),
+            Some(&new)
         );
         (leader, old, new)
     }
@@ -5161,7 +5152,7 @@ mod tests {
         let config = config();
         let mut groups = Groups::new();
         let now = Instant::now();
-        let (old_leader, follower) = stable_static_pair(&mut groups, &config, &["x"], now);
+        let (_, follower) = stable_static_pair(&mut groups, &config, &["x"], now);
         let leader = joined(join_step(
             &mut groups,
             &config,
@@ -5170,8 +5161,8 @@ mod tests {
         ))
         .member_id;
         assert_eq!(
-            groups[&group_id()].static_members[&instance("i-a")].fenced,
-            vec![old_leader]
+            groups[&group_id()].static_holder(&instance("i-a")),
+            Some(&leader)
         );
         let rejoin = join_step(
             &mut groups,
@@ -5199,6 +5190,7 @@ mod tests {
             &mut groups,
             &group_id(),
             &follower,
+            Some(&instance("i-b")),
             generation,
             now + Duration::from_secs(6),
         );
@@ -5284,7 +5276,14 @@ mod tests {
         let (old, generation) = follower_parked_in_sync(&mut groups, &config, now);
 
         let _ = join_step(&mut groups, &config, &static_join("", "i-b", &["x"]), now);
-        let resumed = sync_resume_step(&mut groups, &group_id(), &old, generation, now);
+        let resumed = sync_resume_step(
+            &mut groups,
+            &group_id(),
+            &old,
+            Some(&instance("i-b")),
+            generation,
+            now,
+        );
 
         assert_eq!(error_of_sync(&resumed), ERROR_FENCED_INSTANCE_ID);
     }
@@ -5317,27 +5316,36 @@ mod tests {
                 &mut groups,
                 &group_id(),
                 &first,
+                Some(&instance("i-b")),
                 generation,
                 now
             )),
             ERROR_FENCED_INSTANCE_ID
         );
         assert_eq!(
-            error_of(&join_resume_step(&mut groups, &group_id(), &second, now)),
+            error_of(&join_resume_step(
+                &mut groups,
+                &group_id(),
+                &second,
+                Some(&instance("i-b")),
+                now
+            )),
             ERROR_FENCED_INSTANCE_ID
         );
         assert_eq!(holders_of(&groups, "i-b"), vec![third]);
     }
 
+    /// Nothing is kept per replaced id, so no number of replacements wears the fence off.
     #[test]
-    fn given_an_instance_replaced_past_the_cap_when_fencing_should_keep_only_the_newest_ids() {
+    fn given_a_parked_sync_when_its_instance_is_replaced_many_times_should_still_answer_fenced_instance_id()
+     {
         let config = config();
         let mut groups = Groups::new();
         let now = Instant::now();
-        let (_, first) = stable_static_pair(&mut groups, &config, &["x"], now);
+        let (first, generation) = follower_parked_in_sync(&mut groups, &config, now);
 
         let mut holder = first.clone();
-        for _ in 0..=MAX_FENCED_PER_INSTANCE {
+        for _ in 0..16 {
             holder = member_id_of(&join_step(
                 &mut groups,
                 &config,
@@ -5346,10 +5354,17 @@ mod tests {
             ));
         }
 
-        let fenced = &groups[&group_id()].static_members[&instance("i-b")].fenced;
-        assert_eq!(fenced.len(), MAX_FENCED_PER_INSTANCE);
-        assert!(!fenced.contains(&first));
-        assert!(!fenced.contains(&holder));
+        assert_eq!(
+            error_of_sync(&sync_resume_step(
+                &mut groups,
+                &group_id(),
+                &first,
+                Some(&instance("i-b")),
+                generation,
+                now
+            )),
+            ERROR_FENCED_INSTANCE_ID
+        );
         assert_eq!(holders_of(&groups, "i-b"), vec![holder]);
     }
 }

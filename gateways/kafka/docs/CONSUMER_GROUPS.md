@@ -183,10 +183,10 @@ against `max_members_per_group` or `max_total_members`, since the group does not
 `JoinGroup`, `SyncGroup`, `Heartbeat`, `OffsetCommit` and `LeaveGroup` that name an instance id
 are checked against its holder. Another member's id gets `FENCED_INSTANCE_ID` (82), and an
 instance id nobody holds gets `UNKNOWN_MEMBER_ID` (25). A request parked in `JoinGroup` or
-`SyncGroup` by the replaced member is answered 82. A request from the replaced member id that
-names no instance id gets 25, because that member id is gone. The most recent replaced member ids
-per instance id, up to `MAX_FENCED_PER_INSTANCE`, are fenced while the instance id is held. Once its holder leaves or expires, the
-replaced ids get 25.
+`SyncGroup` by the replaced member is checked against the holder again when it resumes, so it is
+answered 82. A request from the replaced member id that names no instance id gets 25, because
+that member id is gone. Nothing is kept per replaced id: one is fenced for as long as another
+member holds its instance id, and gets 25 once that holder leaves or expires.
 
 A static member that rejoins without its instance id stays static. A dynamic member cannot become
 static by naming an instance id: it gets 25, or 82 if another member holds it. A member id handed

@@ -472,9 +472,13 @@ impl GroupCoordinator {
                 let now = Instant::now();
                 let step = match parked.as_ref() {
                     None => state::join_step(&mut groups, &self.config, request, now),
-                    Some(member_id) => {
-                        state::join_resume_step(&mut groups, &request.group_id, member_id, now)
-                    }
+                    Some(member_id) => state::join_resume_step(
+                        &mut groups,
+                        &request.group_id,
+                        member_id,
+                        request.group_instance_id.as_ref(),
+                        now,
+                    ),
                 };
                 let outcome = park_outcome(&groups, &request.group_id, step, |member_id| {
                     JoinResult::error(ERROR_UNKNOWN_MEMBER_ID, member_id)
@@ -505,6 +509,7 @@ impl GroupCoordinator {
                         &mut groups,
                         &request.group_id,
                         &request.member_id,
+                        request.group_instance_id.as_ref(),
                         request.generation_id,
                         now,
                     )
