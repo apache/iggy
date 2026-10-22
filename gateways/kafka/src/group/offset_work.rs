@@ -24,9 +24,10 @@
 //! whole after it, and no member subscribes to a topic between the check of `OffsetDelete` and its
 //! deletions.
 //!
-//! A commit or a deletion runs until its Iggy calls end, not until its request is answered. A call
-//! that its request stopped waiting for goes on, for up to `SLOT_LIMIT`, and can still land, so it
-//! keeps its [`RunningCommit`] or [`RunningDeletion`] until it ends.
+//! A commit or a deletion runs until none of its Iggy calls can land, not until its request is
+//! answered. A call that its request stopped waiting for goes on and can still land, and so can a
+//! call that ended in doubt until a replay proves its outcome. So the call keeps its
+//! [`RunningCommit`] or [`RunningDeletion`] until then.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -112,7 +113,8 @@ impl OffsetWork {
     }
 }
 
-/// A commit of one group, counted until it drops. Keep it until the commit's Iggy calls end.
+/// A commit of one group, counted until it drops. Keep it until no Iggy call of the commit can
+/// land.
 pub struct RunningCommit {
     work: Arc<OffsetWork>,
     group_id: StrBytes,
@@ -134,8 +136,8 @@ impl Drop for RunningCommit {
     }
 }
 
-/// A deletion of the offsets of some groups, counted until it drops. Keep it until the deletion's
-/// Iggy calls end.
+/// A deletion of the offsets of some groups, counted until it drops. Keep it until no Iggy call
+/// of the deletion can land.
 pub struct RunningDeletion {
     work: Arc<OffsetWork>,
     group_ids: Vec<StrBytes>,

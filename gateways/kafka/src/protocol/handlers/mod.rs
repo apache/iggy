@@ -198,6 +198,14 @@ async fn offset_deadline(state: &GatewayState, connection: &ConnectionState) -> 
     Instant::now() + hold
 }
 
+/// When the Iggy calls of a `DeleteGroups` or `OffsetDelete` on `connection` give up. See
+/// `GroupCoordinator::deletion_hold`.
+async fn deletion_deadline(state: &GatewayState, connection: &ConnectionState) -> Instant {
+    let member = connection.heartbeat_member();
+    let hold = state.groups.deletion_hold(member.as_ref()).await;
+    Instant::now() + hold
+}
+
 /// What the operator can do about an offset call that the client sees as -1. The client sees no
 /// more, so the log is the one place the cause shows.
 const fn offset_refusal_cause(error: &BridgeError) -> &'static str {

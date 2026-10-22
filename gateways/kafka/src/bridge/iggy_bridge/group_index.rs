@@ -20,13 +20,14 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use tokio::sync::{Semaphore, watch};
 use tokio::time::{Instant, timeout_at};
 use tracing::warn;
 
+use super::TopicTarget;
 use crate::bridge::error::BridgeError;
 
 /// How long the groups of a scan answer, counted from the end of the scan, before a caller starts
@@ -38,6 +39,16 @@ const SCAN_MAX_AGE: Duration = Duration::from_secs(10);
 /// lists groups every 30 s, never waits for a scan. A caller that finds only older groups waits
 /// for the newer scan, until its deadline.
 const SCAN_STALE_LIMIT: Duration = Duration::from_mins(1);
+
+/// How long `DeleteGroups` also deletes on a topic that a commit through this gateway stored
+/// offsets to, counted from the end of the commit. It lists the groups on the scan client, which
+/// can read a replica that missed the commit.
+const STORED_TOPICS_MAX_AGE: Duration = Duration::from_mins(1);
+
+/// How long `DeleteGroups` answers 0, once, for a group that this gateway deleted but no longer
+/// finds. A deletion can end after its request answered 14, and the Java admin client retries
+/// that request for up to 60 s (`default.api.timeout.ms`).
+const DELETED_MAX_AGE: Duration = Duration::from_mins(1);
 
 /// The Kafka groups one scan found holding offsets in Iggy.
 #[derive(Debug, Clone)]
@@ -86,7 +97,42 @@ pub(super) struct GroupIndex {
     published: Arc<watch::Sender<Published>>,
     /// One permit, held by the scan that runs.
     scanning: Arc<Semaphore>,
+    stored: StoredTopics,
+    deleted: DeletedGroups,
 }
+
+/// Per group, the topics that commits through this gateway stored offsets to. See
+/// `STORED_TOPICS_MAX_AGE`.
+#[derive(Clone)]
+pub(super) struct StoredTopics(Arc<Mutex<Stores>>);
+
+struct Stores {
+    groups: HashMap<String, HashMap<TopicTarget, Stored>>,
+    /// When the topics past `STORED_TOPICS_MAX_AGE` last went.
+    pruned: Instant,
+}
+
+/// The last commit that stored offsets of a group to a topic.
+#[derive(Clone, Copy)]
+struct Stored {
+    ended: Instant,
+    /// The numeric id of the Iggy group there, when a commit through this gateway created it.
+    id: Option<u32>,
+}
+
+/// The commits of one request that store offsets of `group`. The topics they stored to count
+/// when this drops, once none of those commits can land.
+pub(super) struct Storing {
+    stored: StoredTopics,
+    group: String,
+    /// Each topic that a commit stored to, or may have, with the numeric id of the Iggy group that
+    /// a commit created there.
+    topics: Mutex<HashMap<TopicTarget, Option<u32>>>,
+}
+
+/// The groups whose offsets this gateway deleted, and when. See `DELETED_MAX_AGE`.
+#[derive(Clone, Default)]
+pub(super) struct DeletedGroups(Arc<Mutex<HashMap<String, Instant>>>);
 
 #[derive(Default)]
 struct Published {
@@ -105,6 +151,11 @@ impl GroupIndex {
         Self {
             published: Arc::new(watch::Sender::new(Published::default())),
             scanning: Arc::new(Semaphore::new(1)),
+            stored: StoredTopics(Arc::new(Mutex::new(Stores {
+                groups: HashMap::new(),
+                pruned: Instant::now(),
+            }))),
+            deleted: DeletedGroups::default(),
         }
     }
 
@@ -158,10 +209,40 @@ impl GroupIndex {
         self.change(group, true);
     }
 
-    /// Removes `group` from the groups of the last scan. This gateway deleted its offsets, so it
-    /// goes before the next scan.
+    /// The commits of one request that store offsets of `group`. See [`Storing`].
+    pub(super) fn storing(&self, group: &str) -> Storing {
+        Storing {
+            stored: self.stored.clone(),
+            group: group.to_owned(),
+            topics: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The topics that commits through this gateway stored offsets of `group` to, each with the
+    /// numeric id of the Iggy group there when one of those commits created it. Only those of
+    /// commits that ended in the last `STORED_TOPICS_MAX_AGE`.
+    pub(super) fn stored_topics(&self, group: &str) -> Vec<(TopicTarget, Option<u32>)> {
+        lock(&self.stored.0)
+            .groups
+            .get(group)
+            .map_or_else(Vec::new, |topics| {
+                topics
+                    .iter()
+                    .filter(|(_, stored)| stored.ended.elapsed() < STORED_TOPICS_MAX_AGE)
+                    .map(|(topic, stored)| (topic.clone(), stored.id))
+                    .collect()
+            })
+    }
+
+    /// Removes `group` from the groups of the last scan, with the topics it was stored to. This
+    /// gateway deleted its offsets, so it goes before the next scan.
     pub(super) fn forget(&self, group: &str) {
         self.change(group, false);
+        lock(&self.stored.0).groups.remove(group);
+    }
+
+    pub(super) const fn deleted(&self) -> &DeletedGroups {
+        &self.deleted
     }
 
     fn change(&self, group: &str, holds: bool) {
@@ -228,6 +309,82 @@ impl GroupIndex {
     }
 }
 
+impl StoredTopics {
+    /// Notes that commits that ended now stored offsets of `group` to each topic of `topics`. A
+    /// topic without an id keeps the id noted before.
+    fn record(&self, group: &str, topics: Vec<(TopicTarget, Option<u32>)>) {
+        if topics.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let mut noted = lock(&self.0);
+        noted.prune(now);
+        if let Some(stored) = noted.groups.get_mut(group) {
+            refresh(stored, topics, now);
+        } else {
+            let mut stored = HashMap::with_capacity(topics.len());
+            refresh(&mut stored, topics, now);
+            noted.groups.insert(group.to_owned(), stored);
+        }
+    }
+}
+
+impl Stores {
+    /// Drops the topics past `STORED_TOPICS_MAX_AGE`, at most once in that time.
+    fn prune(&mut self, now: Instant) {
+        if now.duration_since(self.pruned) < STORED_TOPICS_MAX_AGE {
+            return;
+        }
+        self.pruned = now;
+        self.groups.retain(|_, topics| {
+            topics.retain(|_, stored| now.duration_since(stored.ended) < STORED_TOPICS_MAX_AGE);
+            !topics.is_empty()
+        });
+    }
+}
+
+impl Storing {
+    /// Notes that a commit stored offsets to `topic`, or may have, and the id of the Iggy group
+    /// there when it `created` that group.
+    pub(super) fn stored(&self, topic: &TopicTarget, created: Option<u32>) {
+        let mut topics = lock(&self.topics);
+        if let Some(id) = topics.get_mut(topic) {
+            *id = created.or(*id);
+        } else {
+            topics.insert(topic.clone(), created);
+        }
+    }
+}
+
+impl Drop for Storing {
+    fn drop(&mut self) {
+        let topics = std::mem::take(
+            self.topics
+                .get_mut()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        self.stored
+            .record(&self.group, topics.into_iter().collect());
+    }
+}
+
+impl DeletedGroups {
+    /// Notes that the offsets of `group` went from a topic.
+    pub(super) fn record(&self, group: &str) {
+        let now = Instant::now();
+        let mut deleted = lock(&self.0);
+        deleted.retain(|_, at| now.duration_since(*at) < DELETED_MAX_AGE);
+        deleted.insert(group.to_owned(), now);
+    }
+
+    /// Whether the offsets of `group` went in the last `DELETED_MAX_AGE`. Forgets that they did.
+    pub(super) fn take(&self, group: &str) -> bool {
+        lock(&self.0)
+            .remove(group)
+            .is_some_and(|at| at.elapsed() < DELETED_MAX_AGE)
+    }
+}
+
 fn apply(groups: &mut BTreeSet<String>, group: String, holds: bool) {
     if holds {
         groups.insert(group);
@@ -236,17 +393,48 @@ fn apply(groups: &mut BTreeSet<String>, group: String, holds: bool) {
     }
 }
 
+fn refresh(
+    stored: &mut HashMap<TopicTarget, Stored>,
+    topics: Vec<(TopicTarget, Option<u32>)>,
+    ended: Instant,
+) {
+    for (topic, id) in topics {
+        match stored.get_mut(&topic) {
+            Some(last) => {
+                last.ended = ended;
+                last.id = id.or(last.id);
+            }
+            None => {
+                stored.insert(topic, Stored { ended, id });
+            }
+        }
+    }
+}
+
+/// Each update is whole, so the state stays sound after a panic elsewhere.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use iggy::prelude::IggyError;
+    use iggy::prelude::{Identifier, IggyError};
     use tokio::sync::oneshot;
 
     use super::*;
 
     fn later() -> Instant {
         Instant::now() + Duration::from_secs(5)
+    }
+
+    fn target(topic: &str) -> TopicTarget {
+        TopicTarget {
+            stream_id: Identifier::named("kafka").unwrap(),
+            topic_id: Identifier::named(topic).unwrap(),
+        }
     }
 
     fn whole(groups: &[&str]) -> Scanned {
@@ -533,5 +721,131 @@ mod tests {
 
         let last = index.last().expect("the scan found groups");
         assert!(last.contains("orders"));
+    }
+
+    /// The commits of one request that ended now stored offsets of `group` to `topics`.
+    fn stored(index: &GroupIndex, group: &str, topics: &[&str]) {
+        let storing = index.storing(group);
+        for topic in topics {
+            storing.stored(&target(topic), None);
+        }
+    }
+
+    /// The listing of `DeleteGroups` can miss a recent commit, so it also deletes on the topics
+    /// that commits through this gateway stored to lately.
+    #[tokio::test(start_paused = true)]
+    async fn given_stored_topics_should_name_them_for_their_group_until_they_are_old() {
+        let index = GroupIndex::new();
+        stored(&index, "orders-app", &["orders", "payments"]);
+        stored(&index, "audit-app", &["audit"]);
+
+        let named: HashSet<(TopicTarget, Option<u32>)> =
+            index.stored_topics("orders-app").into_iter().collect();
+        assert_eq!(
+            named,
+            HashSet::from([(target("orders"), None), (target("payments"), None)])
+        );
+        assert_eq!(index.stored_topics("audit-app"), [(target("audit"), None)]);
+        assert_eq!(index.stored_topics("never-stored"), []);
+
+        tokio::time::advance(STORED_TOPICS_MAX_AGE).await;
+        assert_eq!(index.stored_topics("orders-app"), []);
+        stored(&index, "billing-app", &["billing"]);
+        assert_eq!(
+            lock(&index.stored.0).groups.len(),
+            1,
+            "a later commit drops the old topics"
+        );
+    }
+
+    /// A commit can still land until its task ends, so its age counts from then.
+    #[tokio::test(start_paused = true)]
+    async fn given_a_commit_that_still_runs_should_count_its_topics_from_its_end() {
+        let index = GroupIndex::new();
+        let storing = index.storing("orders-app");
+        storing.stored(&target("orders"), None);
+        assert_eq!(index.stored_topics("orders-app"), []);
+
+        tokio::time::advance(STORED_TOPICS_MAX_AGE).await;
+        drop(storing);
+        tokio::time::advance(STORED_TOPICS_MAX_AGE / 2).await;
+
+        assert_eq!(
+            index.stored_topics("orders-app"),
+            [(target("orders"), None)]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_topic_stored_to_again_should_count_its_age_from_the_last_commit() {
+        let index = GroupIndex::new();
+        stored(&index, "orders-app", &["orders"]);
+        tokio::time::advance(STORED_TOPICS_MAX_AGE / 2).await;
+
+        stored(&index, "orders-app", &["orders"]);
+        tokio::time::advance(STORED_TOPICS_MAX_AGE / 2).await;
+
+        assert_eq!(
+            index.stored_topics("orders-app"),
+            [(target("orders"), None)]
+        );
+    }
+
+    /// A read can miss a group that a commit just created, so the id from the create counts.
+    /// A later commit that only stores there keeps it, and a later create replaces it.
+    #[tokio::test(start_paused = true)]
+    async fn given_a_commit_that_created_the_iggy_group_should_keep_its_id() {
+        let index = GroupIndex::new();
+        let storing = index.storing("orders-app");
+        storing.stored(&target("orders"), Some(7));
+        storing.stored(&target("payments"), None);
+        storing.stored(&target("orders"), None);
+        drop(storing);
+
+        let named: HashSet<(TopicTarget, Option<u32>)> =
+            index.stored_topics("orders-app").into_iter().collect();
+        assert_eq!(
+            named,
+            HashSet::from([(target("orders"), Some(7)), (target("payments"), None)])
+        );
+
+        stored(&index, "orders-app", &["orders"]);
+        assert!(
+            index
+                .stored_topics("orders-app")
+                .contains(&(target("orders"), Some(7)))
+        );
+        let storing = index.storing("orders-app");
+        storing.stored(&target("orders"), Some(8));
+        drop(storing);
+        assert!(
+            index
+                .stored_topics("orders-app")
+                .contains(&(target("orders"), Some(8)))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_forgotten_group_should_drop_its_stored_topics() {
+        let index = GroupIndex::new();
+        stored(&index, "orders-app", &["orders"]);
+
+        index.forget("orders-app");
+
+        assert_eq!(index.stored_topics("orders-app"), []);
+    }
+
+    /// A deletion can end after its request answered 14. The retry then finds no offsets, and
+    /// answers for that deletion once.
+    #[tokio::test(start_paused = true)]
+    async fn given_a_recorded_deletion_should_answer_once_while_it_is_fresh() {
+        let deleted = DeletedGroups::default();
+        deleted.record("orders-app");
+        deleted.record("payments-app");
+
+        assert!(deleted.take("orders-app"));
+        assert!(!deleted.take("orders-app"), "only once");
+        tokio::time::advance(DELETED_MAX_AGE).await;
+        assert!(!deleted.take("payments-app"), "too old");
     }
 }

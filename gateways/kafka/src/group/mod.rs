@@ -89,6 +89,8 @@ const DEFAULT_MAX_SESSION_TIMEOUT: Duration = Duration::from_mins(30);
 const DEFAULT_MAX_REBALANCE_TIMEOUT: Duration = Duration::from_mins(30);
 /// Kafka's own `group.initial.rebalance.delay.ms` default.
 const DEFAULT_INITIAL_REBALANCE_DELAY: Duration = Duration::from_secs(3);
+/// Below the 30 s after which the Java admin client gives up on a request (`request.timeout.ms`).
+const DEFAULT_DELETION_HOLD: Duration = Duration::from_secs(25);
 
 /// Bounds on the state an unauthenticated client can make this gateway retain.
 ///
@@ -124,6 +126,10 @@ pub struct GroupCoordinatorConfig {
     /// is 64 MiB at the defaults, so without this a full group builds a response far larger than
     /// the default 8 MiB `max_frame_size` the gateway itself accepts.
     pub max_group_roster_bytes: usize,
+    /// How long a `DeleteGroups` or `OffsetDelete` may run on a connection where no member
+    /// heartbeats, as an admin client's. Such a request can list every topic, which takes longer
+    /// than an offset call may hold a member's connection.
+    pub deletion_hold: Duration,
 }
 
 impl Default for GroupCoordinatorConfig {
@@ -138,6 +144,7 @@ impl Default for GroupCoordinatorConfig {
             max_total_members: 10_000,
             max_member_blob_bytes: 64 * 1024,
             max_group_roster_bytes: 4 * 1024 * 1024,
+            deletion_hold: DEFAULT_DELETION_HOLD,
         }
     }
 }
@@ -688,8 +695,8 @@ impl GroupCoordinator {
     }
 
     /// The commit of `request`, counted until it drops, when `request` may commit offsets for its
-    /// group. Keep it until the commit's Iggy calls end. A member's commit also refreshes its
-    /// session. Never parks.
+    /// group. Keep it until no Iggy call of the commit can land. A member's commit also refreshes
+    /// its session. Never parks.
     ///
     /// # Errors
     ///
@@ -708,8 +715,8 @@ impl GroupCoordinator {
 
     /// What `DeleteGroups` may do with each group of `group_ids`. One answer per id, in order. The
     /// deletion of the offsets of each group that is not [`GroupRemoval::Live`] runs until the
-    /// returned value drops. Keep it until the deletion's Iggy calls end. Removes no group, so a
-    /// deletion that fails changes nothing, as in Kafka. Never parks.
+    /// returned value drops. Keep it until no Iggy call of the deletion can land. Removes no group,
+    /// so a deletion that fails changes nothing, as in Kafka. Never parks.
     pub async fn group_deletion(
         &self,
         group_ids: &[StrBytes],
@@ -742,7 +749,7 @@ impl GroupCoordinator {
     }
 
     /// What `OffsetDelete` may do with the offsets of `group_id`. The deletion runs until the
-    /// returned value drops. Keep it until the deletion's Iggy calls end. Never parks.
+    /// returned value drops. Keep it until no Iggy call of the deletion can land. Never parks.
     pub async fn offset_deletion(&self, group_id: &StrBytes) -> (OffsetDeletion, RunningDeletion) {
         let mut groups = self.groups.lock().await;
         let allowed = state::offset_deletion(&mut groups, group_id, Instant::now());
@@ -762,6 +769,16 @@ impl GroupCoordinator {
         let groups = self.groups.lock().await;
         state::offset_hold(&groups, member, hold, Instant::now())
     }
+
+    /// How long a `DeleteGroups` or `OffsetDelete` may hold its connection: `deletion_hold` when
+    /// no member heartbeats there, else [`Self::offset_hold`]. Never parks.
+    pub async fn deletion_hold(&self, member: Option<&GroupMember>) -> Duration {
+        match member {
+            Some(_) => self.offset_hold(member).await,
+            None => self.config.deletion_hold,
+        }
+    }
+
     /// Every group currently in the map, ordered by group id.
     ///
     /// Does not tick. A list names no group, and sweeping here would open rebalances as a side
@@ -1097,6 +1114,27 @@ mod tests {
         assert_eq!(
             coordinator.join(&join_request("orders")).await.error,
             ERROR_NONE
+        );
+    }
+
+    /// A deletion can list every topic. On an admin client's connection no member waits behind
+    /// it, so it may take longer there than an offset call may on a member's connection.
+    #[tokio::test]
+    async fn given_a_connection_without_a_member_a_deletion_should_hold_it_longer() {
+        let coordinator = coordinator();
+        let joined = coordinator.join(&join_request("orders")).await;
+        let member = GroupMember {
+            group_id: id("orders"),
+            member_id: joined.member_id,
+        };
+
+        assert_eq!(
+            coordinator.deletion_hold(None).await,
+            GroupCoordinatorConfig::default().deletion_hold
+        );
+        assert_eq!(
+            coordinator.deletion_hold(Some(&member)).await,
+            coordinator.offset_hold(Some(&member)).await
         );
     }
 

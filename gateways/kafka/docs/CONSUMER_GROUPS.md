@@ -115,15 +115,24 @@ a bridge, no group holds offsets, and both APIs report only the groups in the ma
 `DeleteGroups` deletes the Iggy group `kafka.cg.<group>` on every Kafka topic, and Iggy deletes its
 offsets with it. It first lists the Kafka topics and the Iggy groups of each topic. It lists them on
 the client of the scan, so the listing does not wait behind `OffsetFetch`. That costs one call per
-topic, and at least two per deletion. It answers a repeated group id once. A group that only has ids
-that wait to join loses those ids only after its offsets are gone. So a deletion that fails changes
-nothing, as in Kafka.
+topic, and at least two per deletion. In a cluster, that client can read a replica that missed a
+recent commit. So `DeleteGroups` also deletes on each topic that a recent commit through this
+gateway stored offsets of the group to. A commit is recent for a minute after it ends. When the
+commit created the Iggy group, the gateway keeps the numeric id that the create returned, and
+deletes by that id. No read can miss such a group. It answers a repeated group id once. A group that
+only has ids that wait to join loses those ids only after its offsets are gone. So a deletion that
+fails changes nothing, as in Kafka.
 
-Iggy answers the delete of a group once every partition of the topic dropped the group, and it
-deletes the offsets after that. In a cluster, another replica can still list the group for a short
-time. So the gateway then looks up the group on the topic every 5 to 100 milliseconds. It looks on
-the client that deleted the group, which reads what it wrote. When the group is gone, the gateway
-answers. Then `OffsetFetch` returns -1 for the group, and the admin APIs no longer find it.
+The gateway deletes an Iggy group by its numeric id, so a delete that lands late cannot hit a newer
+group of the same name. Iggy never gives an id to a second group of the same topic. A topic that is
+deleted and created again numbers its groups from the start, though. So before the gateway deletes
+by an id that it kept, it reads the group with that id. When that group has another name, the kept
+group went with the older topic, and the gateway looks the group up by name instead. Iggy answers
+the delete of a group once every partition of the topic dropped the group, and it deletes the
+offsets after that. In a cluster, another replica can still list the group for a short time. So the
+gateway then looks up the id on the topic every 5 to 100 milliseconds. It looks on the client that
+deleted the group, which reads what it wrote. When the id is gone, or names another group, the
+gateway answers. Then `OffsetFetch` returns -1 for the group, and the admin APIs no longer find it.
 
 `OffsetDelete` first finds out whether a group with no members here holds offsets. When the last
 scan found the group, that scan answers. Otherwise the gateway asks each requested topic, which also
@@ -134,17 +143,29 @@ While a deletion runs, the group takes no join and no commit. `JoinGroup` and `O
 `COORDINATOR_LOAD_IN_PROGRESS` (14), and clients retry. The deletion waits for each commit that
 passed its check before the deletion began. So a commit lands whole before the deletion or whole
 after it. Also, no member subscribes to a topic between the check of `OffsetDelete` and its
-deletions. If one of those commits still runs at the offset deadline, the deletion answers 14.
+deletions. If one of those commits still runs at the deadline of the deletion, the deletion
+answers 14.
 
-A commit or a deletion runs until its Iggy calls end. A call that its request stopped waiting for,
-at the offset deadline, goes on for up to 45 seconds and can still land. So the commit or the
-deletion counts until that call ends. While Iggy deletes a group, an offset stored there is deleted
-with the group. That happens even after the gateway acknowledged the commit.
+`DeleteGroups` and `OffsetDelete` give up at 25 seconds on a connection where no member heartbeats,
+as on an admin client's. A deletion can list every topic, which takes longer than the offset
+deadline. On a connection where a member heartbeats, they give up at the offset deadline.
 
-A deletion that does not end by the offset deadline answers 14. The group then takes no join and
-no commit until the Iggy calls of the deletion end. Some topics can then hold no offsets of the
-group while others still do. A consumer that joins before the admin retries reads the former from
-`auto.offset.reset` and the latter from their old offsets. A retry deletes the rest.
+A commit or a deletion counts until none of its Iggy calls can land. A call that its request
+stopped waiting for goes on, and can still land. A call that Iggy has not answered after 30 seconds
+ends in doubt, and Iggy can still run it. So the gateway sends it again until Iggy proves what it
+did. When the SDK lost such a delete, the gateway deletes the group again, by numeric id, until Iggy
+answers. Each call holds its lane for at most 45 seconds. A later write on the same client first
+waits up to 45 seconds for the write in doubt to settle. A delete that still waits then is not sent,
+and its deletion answers 14. While Iggy deletes a group, an offset stored there is deleted with the
+group. That happens even after the gateway acknowledged the commit.
+
+A deletion that does not end by its deadline answers 14. The group then takes no join and no commit
+until no Iggy call of the deletion can land. Some topics can then hold no offsets of the group while
+others still do. A consumer that joins before the admin retries reads the former from
+`auto.offset.reset` and the latter from their old offsets. A retry deletes the rest. When the
+deletion ends before the retry, the retry finds no offsets of the group. Within a minute it still
+answers 0, once, as Kafka answers the deletion that the client asked for. A later request answers
+`GROUP_ID_NOT_FOUND` (69).
 
 A gateway does not see the members on another gateway. Through a gateway where a group has no
 members, `DeleteGroups` deletes the group. `OffsetDelete` there also deletes offsets of the topics

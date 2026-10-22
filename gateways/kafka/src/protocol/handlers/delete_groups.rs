@@ -29,11 +29,13 @@
 //! While the deletion runs, the group takes no join and no commit: both get
 //! `COORDINATOR_LOAD_IN_PROGRESS` (14), which clients retry. The deletion waits for each commit
 //! that passed its check before the deletion began, and answers 14 when one still runs at the
-//! deadline. A commit or a deletion runs until its Iggy calls end, also those that its request
-//! stopped waiting for, for at most 45 s. A deletion that does not end by the deadline answers 14
-//! too. Some topics can then hold no offsets of the group while others still do, and a retry
-//! deletes the rest. A member on another gateway is not seen here, so a group whose members all
-//! use another gateway is deleted (`docs/OFFSET_STORAGE.md`).
+//! deadline: 25 s on a connection where no member heartbeats, as an admin client's, else the
+//! offset deadline. A commit or a deletion runs until none of its Iggy calls can land, also after
+//! its request stopped waiting. A deletion that does not end by the deadline answers 14 too. Some
+//! topics can then hold no offsets of the group while others still do, and a retry deletes the
+//! rest. A retry that finds no offsets of a group whose deletion ended meanwhile answers 0. A
+//! member on another gateway is not seen here, so a group whose members all use another gateway
+//! is deleted (`docs/OFFSET_STORAGE.md`).
 //!
 //! When a listener names principals, a principal without a global `manage_topics` or
 //! `manage_streams` gets `GROUP_AUTHORIZATION_FAILED` (30) for every group, and nothing is
@@ -61,7 +63,7 @@ use crate::protocol::api::{
 use crate::protocol::bounds_guard::validate_delete_groups_shape;
 use crate::protocol::dedup::dedup_first_seen;
 use crate::protocol::handlers::{
-    decode_guarded, encode_message, may_delete_groups, offset_deadline, offset_refusal_cause,
+    decode_guarded, deletion_deadline, encode_message, may_delete_groups, offset_refusal_cause,
     respond_or_close, unsupported_version_response,
 };
 
@@ -176,9 +178,9 @@ async fn delete(
         .collect();
     let found = match &state.bridge {
         Some(bridge) if !names.is_empty() => {
-            let deadline = offset_deadline(state, connection).await;
+            let deadline = deletion_deadline(state, connection).await;
             if deletion.commits_ended(deadline).await {
-                // Each delete keeps the groups fenced until its Iggy calls end, also past the
+                // Each delete keeps the groups fenced until it can no longer land, also past the
                 // deadline, so no commit lands while a delete can still land.
                 let calls = OffsetCalls::new(deadline).keeping(deletion);
                 let found = delete_offsets(bridge, &names, &calls).await;
@@ -453,9 +455,8 @@ mod tests {
     #[tokio::test]
     async fn given_a_commit_that_runs_past_the_deadline_should_answer_coordinator_load_in_progress()
     {
-        // A 50 ms offset deadline.
         let groups = GroupCoordinatorConfig {
-            min_session_timeout: Duration::from_millis(100),
+            deletion_hold: Duration::from_millis(50),
             ..GroupCoordinatorConfig::default()
         };
         let state = GatewayState::new(

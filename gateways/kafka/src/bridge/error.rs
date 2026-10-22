@@ -157,12 +157,15 @@ impl BridgeError {
     /// and `OffsetFetch`, but fails the call on 6, and on 7 in `OffsetFetch`. Offset calls are
     /// idempotent, so the unknown outcome behind 7 does no harm on a retry. Nor does
     /// `RequestTooOld`'s: the retry is a new request, which Iggy runs. `LifecycleBusy` ends when
-    /// the delete of a group on the topic ends.
+    /// the delete of a group on the topic ends. `LaneBlocked` sent nothing: an earlier write of the
+    /// client is still in doubt, and a retry runs once it settles.
     #[must_use]
     pub const fn to_offset_error_code(&self) -> i16 {
         if matches!(
             self,
-            Self::Iggy(IggyError::RequestTooOld | IggyError::LifecycleBusy)
+            Self::Iggy(
+                IggyError::RequestTooOld | IggyError::LifecycleBusy | IggyError::LaneBlocked(_)
+            )
         ) {
             return ERROR_COORDINATOR_LOAD_IN_PROGRESS;
         }

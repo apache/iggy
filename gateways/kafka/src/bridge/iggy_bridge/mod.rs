@@ -173,6 +173,7 @@ pub struct IggyBridge {
 }
 
 /// The Iggy stream and topic one Kafka topic maps to. Resolve once per topic, use many times.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TopicTarget {
     stream_id: Identifier,
     topic_id: Identifier,

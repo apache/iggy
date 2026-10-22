@@ -39,10 +39,10 @@
 //! While the deletion runs, the group takes no join and no commit: both get 14, which clients
 //! retry. So no member subscribes to a topic between the check and the deletions, and a commit
 //! lands whole before or after them. The deletions wait for each commit that passed its check
-//! before them, and the group gets 14 when one still runs at the deadline. A commit or a deletion
-//! runs until its Iggy calls end, also those that its request stopped waiting for. A member on
-//! another gateway is not seen here, so its topics count as unsubscribed
-//! (`docs/OFFSET_STORAGE.md`).
+//! before them, and the group gets 14 when one still runs at the deadline, which is as in
+//! `DeleteGroups`. A commit or a deletion runs until none of its Iggy calls can land, also after
+//! its request stopped waiting. A member on another gateway is not seen here, so its topics count
+//! as unsubscribed (`docs/OFFSET_STORAGE.md`).
 //!
 //! When a listener names principals, a principal without a global `manage_topics` or
 //! `manage_streams` gets `GROUP_AUTHORIZATION_FAILED` (30), and nothing is deleted.
@@ -70,7 +70,7 @@ use crate::protocol::api::{
 };
 use crate::protocol::bounds_guard::validate_offset_delete_shape;
 use crate::protocol::handlers::{
-    decode_guarded, encode_message, may_delete_groups, offset_deadline, offset_refusal_cause,
+    decode_guarded, deletion_deadline, encode_message, may_delete_groups, offset_refusal_cause,
     respond_or_close, unsupported_version_response,
 };
 
@@ -147,7 +147,7 @@ async fn delete_offsets(
         OffsetDeletion::Allowed(subscribed) => Some(subscribed),
         OffsetDeletion::Absent => None,
     };
-    let calls = OffsetCalls::new(offset_deadline(state, connection).await);
+    let calls = OffsetCalls::new(deletion_deadline(state, connection).await);
     let topics = requested_topics(bridge, request, &calls).await?;
     if !deletion.commits_ended(calls.deadline()).await {
         return Err(ERROR_COORDINATOR_LOAD_IN_PROGRESS);
@@ -160,8 +160,8 @@ async fn delete_offsets(
         }
         None => return Err(ERROR_GROUP_ID_NOT_FOUND),
     };
-    // Each delete keeps the group fenced until its Iggy calls end, also past the deadline, so no
-    // commit lands while a delete can still land.
+    // Each delete keeps the group fenced until it can no longer land, also past the deadline, so
+    // no commit lands while a delete can still land.
     let calls = calls.keeping(deletion);
     delete_unsubscribed(bridge, request, &topics, &subscribed, &calls).await
 }
