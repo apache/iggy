@@ -23,10 +23,10 @@
 //! across an `.await`.
 //!
 //! A group with no joined members is reported as Kafka's `Empty`. One with neither members nor
-//! pending member ids is dropped: offsets live in Iggy, so nothing here is worth keeping.
-//! TODO(#3542): keep an offsets-only group and report `Empty` once those offsets are stored here.
+//! pending member ids is dropped. Its offsets stay in Iggy, and the `ListGroups` and
+//! `DescribeGroups` handlers report it as `Empty` from there.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -36,11 +36,12 @@ use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::group::{
-    CommitRequest, DESCRIBE_RESPONSE_TOO_LARGE, GROUP_STATE_COMPLETING_REBALANCE,
-    GROUP_STATE_EMPTY, GROUP_STATE_PREPARING_REBALANCE, GROUP_STATE_STABLE, GroupCoordinatorConfig,
-    GroupDescription, GroupListing, GroupMember, JoinRequest, JoinResult, JoinedMember,
-    LeaveRequest, LeaveResult, LeavingMember, LeftMember, MemberDescription, SyncRequest,
-    SyncResult, owned_str,
+    CONSUMER_PROTOCOL_TYPE, CommitRequest, DESCRIBE_RESPONSE_TOO_LARGE,
+    GROUP_STATE_COMPLETING_REBALANCE, GROUP_STATE_EMPTY, GROUP_STATE_PREPARING_REBALANCE,
+    GROUP_STATE_STABLE, GroupCoordinatorConfig, GroupDescription, GroupListing, GroupMember,
+    GroupRemoval, JoinRequest, JoinResult, JoinedMember, LeaveRequest, LeaveResult, LeavingMember,
+    LeftMember, MemberDescription, OFFSETS_ONLY_PROTOCOL_TYPE, OffsetDeletion, Subscribed,
+    SyncRequest, SyncResult, owned_str,
 };
 use crate::protocol::api::{
     API_KEY_DESCRIBE_GROUPS, ERROR_COORDINATOR_NOT_AVAILABLE, ERROR_FENCED_INSTANCE_ID,
@@ -912,6 +913,20 @@ impl GroupState {
         }
         total
     }
+
+    /// The topics in each member's subscription for the selected protocol.
+    fn subscribed(&self) -> Subscribed {
+        let Some(protocol_name) = &self.protocol_name else {
+            return Subscribed::All;
+        };
+        let mut topics = HashSet::new();
+        for member in self.members.values() {
+            if add_subscription_topics(&member.metadata_for(protocol_name), &mut topics).is_none() {
+                return Subscribed::All;
+            }
+        }
+        Subscribed::Topics(topics)
+    }
 }
 
 /// Tick every group and drop the ones that emptied, returning how many were reclaimed.
@@ -945,8 +960,7 @@ fn tick_group(groups: &mut Groups, group_id: &StrBytes, now: Instant) -> bool {
     };
     group.tick(now);
     if group.is_empty() {
-        // TODO(#3542): keep a group that only holds committed offsets and report Empty.
-        // Offsets are not stored here yet, so nothing remains that a later join would need.
+        // Its offsets stay in Iggy, and the admin APIs find the group there.
         groups.remove(group_id);
         return false;
     }
@@ -1471,10 +1485,95 @@ pub fn leave_step(groups: &mut Groups, request: &LeaveRequest, now: Instant) -> 
     }
 }
 
+/// Kafka's `ClassicGroup.validateDeleteGroup`. A group with no joined members is `Empty`, and
+/// `DeleteGroups` deletes it.
+pub fn group_removal(groups: &mut Groups, group_id: &StrBytes, now: Instant) -> GroupRemoval {
+    if !tick_group(groups, group_id, now) {
+        return GroupRemoval::Absent;
+    }
+    if groups
+        .get(group_id)
+        .is_some_and(|group| !group.members.is_empty())
+    {
+        GroupRemoval::Live
+    } else {
+        GroupRemoval::Empty
+    }
+}
+
+/// Removes `group_id` when it is [`GroupRemoval::Empty`], with the ids that wait to join it. A join
+/// with one of those ids gets `UNKNOWN_MEMBER_ID`, and the client joins again from scratch.
+pub fn remove_empty(groups: &mut Groups, group_id: &StrBytes, now: Instant) {
+    if group_removal(groups, group_id, now) == GroupRemoval::Empty {
+        groups.remove(group_id);
+    }
+}
+
+/// Kafka's `ClassicGroup.validateOffsetDelete` and `isSubscribedToTopic`.
+pub fn offset_deletion(groups: &mut Groups, group_id: &StrBytes, now: Instant) -> OffsetDeletion {
+    if !tick_group(groups, group_id, now) {
+        return OffsetDeletion::Absent;
+    }
+    let Some(group) = groups.get(group_id) else {
+        return OffsetDeletion::Absent;
+    };
+    if group.members.is_empty() {
+        return OffsetDeletion::Allowed(Subscribed::Topics(HashSet::new()));
+    }
+    if group.protocol_type.as_str() != CONSUMER_PROTOCOL_TYPE {
+        return OffsetDeletion::Refused;
+    }
+    OffsetDeletion::Allowed(group.subscribed())
+}
+
+/// Adds the topics of a consumer's `ConsumerProtocolSubscription` to `topics`. The bytes hold a
+/// version, then the topics and the user data of v0, which every later version keeps as its
+/// prefix. Kafka reads the same prefix. `None` when the bytes do not hold it, or for a negative
+/// version, which Kafka's `ConsumerProtocol.checkSubscriptionVersion` refuses.
+///
+/// Read by hand, not by `kafka_protocol`, which sizes a `Vec` from a declared count before it
+/// checks the bytes (see `protocol::bounds_guard`), and a member chose these bytes. Nothing is
+/// reserved from the count either, since this runs under the coordinator's lock.
+fn add_subscription_topics(metadata: &[u8], topics: &mut HashSet<String>) -> Option<()> {
+    let mut rest = metadata;
+    if take_i16(&mut rest)? < 0 {
+        return None;
+    }
+    let count = usize::try_from(take_i32(&mut rest)?).ok()?;
+    // Each topic takes at least its 2 length bytes.
+    if count > rest.len() / 2 {
+        return None;
+    }
+    for _ in 0..count {
+        let len = usize::try_from(take_i16(&mut rest)?).ok()?;
+        let (name, after) = rest.split_at_checked(len)?;
+        topics.insert(String::from_utf8_lossy(name).into_owned());
+        rest = after;
+    }
+    // A negative length is null user data.
+    if let Ok(user_data_len) = usize::try_from(take_i32(&mut rest)?) {
+        rest.get(..user_data_len)?;
+    }
+    Some(())
+}
+
+fn take_i16(rest: &mut &[u8]) -> Option<i16> {
+    let (bytes, after) = rest.split_first_chunk::<2>()?;
+    *rest = after;
+    Some(i16::from_be_bytes(*bytes))
+}
+
+fn take_i32(rest: &mut &[u8]) -> Option<i32> {
+    let (bytes, after) = rest.split_first_chunk::<4>()?;
+    *rest = after;
+    Some(i32::from_be_bytes(*bytes))
+}
+
 /// How one requested id is answered. Priced before [`GroupState::description`] copies blobs.
 #[derive(Clone, Copy)]
 enum DescribedChoice {
-    /// Not in the map after the tick. Encoded as `Dead`.
+    /// Not in the map after the tick. Encoded as `Empty` when the group holds offsets in Iggy,
+    /// and as `Dead` otherwise.
     Missing,
     /// `summary` is Kafka's `summaryNoMetadata` shape.
     Present { summary: bool },
@@ -1658,9 +1757,16 @@ fn too_large_described_len(version: i16, group_id: &StrBytes) -> usize {
     total
 }
 
-/// A group that is not in the map. v6 carries `GROUP_ID_NOT_FOUND` and `Group {id} not found.`;
-/// older versions encode error 0 and omit `error_message`. Matches `missing_group` in the handler.
+/// A group that is not in the map. The handler answers it after this lock is released, `Empty`
+/// when it holds offsets in Iggy and `Dead` otherwise, so it is priced as the larger answer. A
+/// `COORDINATOR_LOAD_IN_PROGRESS` answer, for when the handler cannot tell, is smaller than both.
 fn missing_described_len(version: i16, group_id: &StrBytes) -> usize {
+    dead_described_len(version, group_id).max(offsets_only_described_len(version, group_id))
+}
+
+/// v6 carries `GROUP_ID_NOT_FOUND` and `Group {id} not found.`. Older versions encode error 0 and
+/// omit `error_message`. Matches `missing_group` in the handler.
+fn dead_described_len(version: i16, group_id: &StrBytes) -> usize {
     let flexible = version >= 5;
     let mut total = 2;
     if version >= 6 {
@@ -1670,6 +1776,28 @@ fn missing_described_len(version: i16, group_id: &StrBytes) -> usize {
     total += kafka_string_len(flexible, group_id.len());
     total += kafka_string_len(flexible, "Dead".len());
     total += kafka_string_len(flexible, 0);
+    total += kafka_string_len(flexible, 0);
+    total += kafka_array_prefix(flexible, 0);
+    if version >= 3 {
+        total += 4;
+    }
+    if flexible {
+        total += 1;
+    }
+    total
+}
+
+/// Error 0 with a null v6 `error_message`, `Empty`, [`OFFSETS_ONLY_PROTOCOL_TYPE`], no protocol
+/// and no members. Matches [`GroupDescription::offsets_only`] through `described_group`.
+fn offsets_only_described_len(version: i16, group_id: &StrBytes) -> usize {
+    let flexible = version >= 5;
+    let mut total = 2;
+    if version >= 6 {
+        total += kafka_nullable_string_len(true, None);
+    }
+    total += kafka_string_len(flexible, group_id.len());
+    total += kafka_string_len(flexible, GROUP_STATE_EMPTY.len());
+    total += kafka_string_len(flexible, OFFSETS_ONLY_PROTOCOL_TYPE.len());
     total += kafka_string_len(flexible, 0);
     total += kafka_array_prefix(flexible, 0);
     if version >= 3 {
@@ -1915,6 +2043,11 @@ fn generate_member_id(group_instance_id: Option<&StrBytes>) -> StrBytes {
 
 #[cfg(test)]
 mod tests {
+    use bytes::{BufMut, BytesMut};
+    use kafka_protocol::messages::ConsumerProtocolSubscription;
+    use kafka_protocol::messages::describe_groups_response::DescribedGroup;
+    use kafka_protocol::protocol::Encodable;
+
     use super::*;
     use crate::protocol::handlers::describe_groups::{
         described_group, encode_response, missing_group,
@@ -2538,6 +2671,170 @@ mod tests {
         assert!(groups.contains_key(&group_id()));
     }
 
+    /// A `ConsumerProtocolSubscription` as a consumer sends it: its version, then its fields.
+    fn subscription(version: i16, topics: &[&str]) -> Bytes {
+        let mut buf = BytesMut::new();
+        buf.put_i16(version);
+        ConsumerProtocolSubscription::default()
+            .with_topics(
+                topics
+                    .iter()
+                    .map(|topic| StrBytes::from_string((*topic).to_owned()))
+                    .collect(),
+            )
+            .encode(&mut buf, version)
+            .expect("a subscription encodes");
+        buf.freeze()
+    }
+
+    fn topics(names: &[&str]) -> Subscribed {
+        Subscribed::Topics(names.iter().map(|name| (*name).to_owned()).collect())
+    }
+
+    /// The topics that `add_subscription_topics` reads from `metadata`, in name order.
+    fn subscription_topics(metadata: &[u8]) -> Option<Vec<String>> {
+        let mut topics = HashSet::new();
+        add_subscription_topics(metadata, &mut topics)?;
+        let mut topics: Vec<String> = topics.into_iter().collect();
+        topics.sort_unstable();
+        Some(topics)
+    }
+
+    /// Every version of the consumer protocol starts with the v0 fields, so the topics read the
+    /// same from each.
+    #[test]
+    fn given_a_consumer_subscription_should_read_its_topics_at_every_version() {
+        for version in 0..=3 {
+            assert_eq!(
+                subscription_topics(&subscription(version, &["orders", "payments"])),
+                Some(vec!["orders".to_owned(), "payments".to_owned()]),
+                "v{version}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_bytes_that_are_not_a_subscription_should_read_none() {
+        let whole = subscription(0, &["orders"]);
+        for cut in 0..whole.len() {
+            assert_eq!(subscription_topics(&whole[..cut]), None, "cut at {cut}");
+        }
+        assert_eq!(
+            subscription_topics(&[0, 0, 0x7F, 0xFF, 0xFF, 0xFF]),
+            None,
+            "a count that six bytes cannot hold"
+        );
+        assert_eq!(
+            subscription_topics(&[0, 0, 0xFF, 0xFF, 0xFF, 0xFF]),
+            None,
+            "a null topic list"
+        );
+        assert_eq!(subscription_topics(b"subscription"), None);
+    }
+
+    /// Kafka's `checkSubscriptionVersion` refuses a negative version, and the member then counts
+    /// as subscribed to every topic.
+    #[test]
+    fn given_a_negative_subscription_version_should_read_none() {
+        let mut negative = subscription(0, &["orders"]).to_vec();
+        negative[..2].copy_from_slice(&(-1_i16).to_be_bytes());
+
+        assert_eq!(subscription_topics(&negative), None);
+    }
+
+    /// Kafka's `ClassicGroup.validateDeleteGroup`: only a group without joined members goes.
+    #[test]
+    fn given_each_kind_of_group_when_deleting_it_should_remove_only_a_group_without_members() {
+        let config = config();
+        let now = Instant::now();
+        let mut groups = Groups::new();
+        assert_eq!(
+            group_removal(&mut groups, &group_id(), now),
+            GroupRemoval::Absent
+        );
+
+        let _ = join_step(&mut groups, &config, &request("", &["range"]), now);
+        assert_eq!(
+            group_removal(&mut groups, &group_id(), now),
+            GroupRemoval::Live
+        );
+        remove_empty(&mut groups, &group_id(), now);
+        assert!(groups.contains_key(&group_id()));
+
+        let mut groups = Groups::new();
+        let pending = member_id_of(&join_step(&mut groups, &config, &pending_request(), now));
+        assert_eq!(
+            group_removal(&mut groups, &group_id(), now),
+            GroupRemoval::Empty
+        );
+        assert!(
+            groups.contains_key(&group_id()),
+            "the check removes nothing"
+        );
+        remove_empty(&mut groups, &group_id(), now);
+        assert!(groups.is_empty());
+        let rejoin = JoinRequest {
+            require_known_member_id: true,
+            ..request(pending.as_str(), &["x"])
+        };
+        assert_eq!(
+            error_of(&join_step(&mut groups, &config, &rejoin, now)),
+            ERROR_UNKNOWN_MEMBER_ID,
+            "the id of a deleted group no longer joins, so the client starts over"
+        );
+    }
+
+    /// Kafka's `ClassicGroup.validateOffsetDelete` and `isSubscribedToTopic`.
+    #[test]
+    fn given_each_kind_of_group_when_deleting_offsets_should_answer_as_kafka() {
+        let config = config();
+        let now = Instant::now();
+        let mut groups = Groups::new();
+        assert_eq!(
+            offset_deletion(&mut groups, &group_id(), now),
+            OffsetDeletion::Absent
+        );
+
+        let step = join_step(&mut groups, &config, &pending_request(), now);
+        assert_eq!(error_of(&step), ERROR_MEMBER_ID_REQUIRED);
+        assert_eq!(
+            offset_deletion(&mut groups, &group_id(), now),
+            OffsetDeletion::Allowed(topics(&[])),
+            "only an id that waits to join: Empty, so nothing is subscribed"
+        );
+
+        let mut groups = Groups::new();
+        let mut member = request("", &["range"]);
+        member.protocols = vec![(
+            StrBytes::from_static_str("range"),
+            subscription(3, &["orders", "payments"]),
+        )];
+        let _ = join_step(&mut groups, &config, &member, now);
+        assert_eq!(
+            offset_deletion(&mut groups, &group_id(), now),
+            OffsetDeletion::Allowed(topics(&["orders", "payments"]))
+        );
+
+        let mut groups = Groups::new();
+        let _ = join_step(&mut groups, &config, &request("", &["range"]), now);
+        assert_eq!(
+            offset_deletion(&mut groups, &group_id(), now),
+            OffsetDeletion::Allowed(Subscribed::All),
+            "metadata that is not a subscription subscribes to every topic"
+        );
+
+        let mut groups = Groups::new();
+        let connect = JoinRequest {
+            protocol_type: StrBytes::from_static_str("connect"),
+            ..request("", &["sessioned"])
+        };
+        let _ = join_step(&mut groups, &config, &connect, now);
+        assert_eq!(
+            offset_deletion(&mut groups, &group_id(), now),
+            OffsetDeletion::Refused
+        );
+    }
+
     /// List skips a fully expired group and does not tick it. Describe then ticks and the group
     /// is gone, which the handler reports as `Dead`.
     #[test]
@@ -2578,6 +2875,9 @@ mod tests {
         }
     }
 
+    /// A missing id is answered `Dead`, or `Empty` when it holds offsets in Iggy. One of the two
+    /// is larger for every id at a given version, `Empty` up to v5 and `Dead` at v6, where it
+    /// carries a message. So the price is the larger of the two whole responses.
     fn assert_priced_response(
         version: i16,
         groups: &mut Groups,
@@ -2587,33 +2887,67 @@ mod tests {
     ) {
         let priced = describe_frame_len(version, groups, ids, max_frame_size);
         let described = describe_groups(groups, ids, version, max_frame_size, now);
-        let encoded = encode_described(version, &dedup_first_seen(ids), &described);
+        let ids = dedup_first_seen(ids);
         let header = kafka_response_header_len(API_KEY_DESCRIBE_GROUPS, version);
+        let dead = header + encode_described(version, &ids, &described, missing_group).len();
+        let offsets_only =
+            header + encode_described(version, &ids, &described, offsets_only_group).len();
         assert_eq!(
             priced,
-            header + encoded.len(),
-            "version {version} ids {} priced {priced} encoded {}",
+            dead.max(offsets_only),
+            "version {version} ids {} priced {priced} dead {dead} offsets only {offsets_only}",
             ids.len(),
-            header + encoded.len()
         );
+    }
+
+    fn offsets_only_group(version: i16, group_id: &StrBytes) -> DescribedGroup {
+        described_group(version, GroupDescription::offsets_only(group_id.clone()))
     }
 
     fn encode_described(
         version: i16,
         ids: &[StrBytes],
         described: &[Option<GroupDescription>],
+        missing: fn(i16, &StrBytes) -> DescribedGroup,
     ) -> Bytes {
         let groups = ids
             .iter()
             .zip(described)
             .map(|(group_id, group)| {
                 group.clone().map_or_else(
-                    || missing_group(version, group_id),
+                    || missing(version, group_id),
                     |group| described_group(version, group),
                 )
             })
             .collect();
         encode_response(version, groups).expect("described group encodes")
+    }
+
+    /// Each answer to a missing id on its own, so neither hides behind the other in the maximum.
+    /// The id is past the compact varint boundary.
+    #[test]
+    fn given_a_missing_group_when_pricing_each_answer_should_match_the_encoder() {
+        let group_id = StrBytes::from_string("m".repeat(200));
+        for version in 0..=6 {
+            let header = kafka_response_header_len(API_KEY_DESCRIBE_GROUPS, version);
+            let fixed = describe_fixed_len(version, 1);
+            let encoded = |group: DescribedGroup| {
+                header
+                    + encode_response(version, vec![group])
+                        .expect("described group encodes")
+                        .len()
+            };
+            assert_eq!(
+                fixed + dead_described_len(version, &group_id),
+                encoded(missing_group(version, &group_id)),
+                "version {version} dead"
+            );
+            assert_eq!(
+                fixed + offsets_only_described_len(version, &group_id),
+                encoded(offsets_only_group(version, &group_id)),
+                "version {version} offsets only"
+            );
+        }
     }
 
     fn join_wide(groups: &mut Groups, config: &GroupCoordinatorConfig, now: Instant) -> JoinResult {

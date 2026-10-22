@@ -43,10 +43,11 @@ use crate::protocol::bounds_guard::{
 use crate::protocol::handlers::api_versions::Advertisement;
 use crate::protocol::handlers::init_producer_id::ProducerIdAllocator;
 use crate::protocol::handlers::{
-    alter_configs, api_versions, create_partitions, create_topics, decode_guarded, delete_topics,
-    describe_cluster, describe_configs, describe_groups, dispatch, fetch, find_coordinator,
-    heartbeat, incremental_alter_configs, init_producer_id, join_group, leave_group, list_groups,
-    list_offsets, metadata, offset_commit, offset_fetch, produce, respond_or_close, sync_group,
+    alter_configs, api_versions, create_partitions, create_topics, decode_guarded, delete_groups,
+    delete_topics, describe_cluster, describe_configs, describe_groups, dispatch, fetch,
+    find_coordinator, heartbeat, incremental_alter_configs, init_producer_id, join_group,
+    leave_group, list_groups, list_offsets, metadata, offset_commit, offset_delete, offset_fetch,
+    produce, respond_or_close, sync_group,
 };
 use crate::protocol::probe_board::ProbeBoard;
 use crate::protocol::sasl::{
@@ -76,7 +77,9 @@ pub const API_KEY_DESCRIBE_CONFIGS: i16 = 32;
 pub const API_KEY_ALTER_CONFIGS: i16 = 33;
 pub const API_KEY_SASL_AUTHENTICATE: i16 = 36;
 pub const API_KEY_CREATE_PARTITIONS: i16 = 37;
+pub const API_KEY_DELETE_GROUPS: i16 = 42;
 pub const API_KEY_INCREMENTAL_ALTER_CONFIGS: i16 = 44;
+pub const API_KEY_OFFSET_DELETE: i16 = 47;
 pub const API_KEY_DESCRIBE_CLUSTER: i16 = 60;
 
 pub const DEFAULT_KAFKA_PORT: u16 = 9093;
@@ -130,6 +133,16 @@ pub const ERROR_GROUP_ID_NOT_FOUND: i16 = ResponseError::GroupIdNotFound.code();
 pub const ERROR_INVALID_SESSION_TIMEOUT: i16 = 26;
 /// How a follower learns to rejoin: its heartbeat is answered with this while the group prepares.
 pub const ERROR_REBALANCE_IN_PROGRESS: i16 = 27;
+/// `DeleteGroups` and `OffsetDelete`: the principal may not delete groups or their offsets.
+///
+/// `DeleteGroups` also sends it when Iggy refuses the bridge user, either the delete of the Iggy
+/// group that holds the offsets, or the listing of the groups of a topic where it can hold them.
+pub const ERROR_GROUP_AUTHORIZATION_FAILED: i16 = ResponseError::GroupAuthorizationFailed.code();
+/// `DeleteGroups`: the group has members. `OffsetDelete`: it has members of a protocol other than
+/// `consumer`.
+pub const ERROR_NON_EMPTY_GROUP: i16 = ResponseError::NonEmptyGroup.code();
+/// `OffsetDelete`: a member subscribes to the topic, so its offsets stay.
+pub const ERROR_GROUP_SUBSCRIBED_TO_TOPIC: i16 = ResponseError::GroupSubscribedToTopic.code();
 /// Closest fit for an Iggy permission/credential rejection in `bridge`'s error mapping.
 ///
 /// Still not `SASL_AUTHENTICATION_FAILED`, and now for a firmer reason than when this was written:
@@ -312,6 +325,8 @@ static SUPPORTED_RANGES: &[ApiVersionRange] = &[
     sync_group::RANGE,
     describe_groups::RANGE,
     list_groups::RANGE,
+    delete_groups::RANGE,
+    offset_delete::RANGE,
     describe_cluster::RANGE,
 ];
 

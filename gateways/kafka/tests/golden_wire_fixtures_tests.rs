@@ -41,11 +41,11 @@ async fn golden_apiversions_v3_flexible_response_fixture() {
         .await
         .expect_response("test request has acks != 0 and expects a response");
 
-    // error_code=0, api_count=22 (compact array: N+1=23)
+    // error_code=0, api_count=24 (compact array: N+1=25)
     // each entry followed by an empty tagged-fields byte; throttle_ms=0; top-level tagged fields
-    let expected: [u8; 162] = [
+    let expected: [u8; 176] = [
         0x00, 0x00, // error_code
-        0x17, // compact array count (22+1)
+        0x19, // compact array count (24+1)
         0x00, 0x00, 0x00, 0x00, 0x00, 0x09, 0x00, // key 0:  Produce         0-9 (advertised)
         0x00, 0x01, 0x00, 0x04, 0x00, 0x0C, 0x00, // key 1:  Fetch           4-12
         0x00, 0x02, 0x00, 0x01, 0x00, 0x07, 0x00, // key 2:  ListOffsets     1-7
@@ -66,7 +66,9 @@ async fn golden_apiversions_v3_flexible_response_fixture() {
         0x00, 0x20, 0x00, 0x01, 0x00, 0x04, 0x00, // key 32: DescribeConfigs 1-4
         0x00, 0x21, 0x00, 0x00, 0x00, 0x02, 0x00, // key 33: AlterConfigs    0-2
         0x00, 0x25, 0x00, 0x00, 0x00, 0x03, 0x00, // key 37: CreatePartitions 0-3
+        0x00, 0x2A, 0x00, 0x00, 0x00, 0x02, 0x00, // key 42: DeleteGroups    0-2
         0x00, 0x2C, 0x00, 0x00, 0x00, 0x01, 0x00, // key 44: IncrementalAlterConfigs 0-1
+        0x00, 0x2F, 0x00, 0x00, 0x00, 0x00, 0x00, // key 47: OffsetDelete    0-0
         0x00, 0x3C, 0x00, 0x00, 0x00, 0x02, 0x00, // key 60: DescribeCluster 0-2
         0x00, 0x00, 0x00, 0x00, // throttle_ms
         0x00, // top-level tagged fields
@@ -81,10 +83,10 @@ async fn golden_apiversions_v1_response_fixture() {
         .await
         .expect_response("test request has acks != 0 and expects a response");
 
-    // error_code=0, api_count=22; Produce advertises min=0 per KAFKA-18659; throttle_ms=0
-    let expected: [u8; 142] = [
+    // error_code=0, api_count=24; Produce advertises min=0 per KAFKA-18659; throttle_ms=0
+    let expected: [u8; 154] = [
         0x00, 0x00, // error_code
-        0x00, 0x00, 0x00, 0x16, // api count = 22
+        0x00, 0x00, 0x00, 0x18, // api count = 24
         0x00, 0x00, 0x00, 0x00, 0x00, 0x09, // key 0:  Produce         0-9 (advertised)
         0x00, 0x01, 0x00, 0x04, 0x00, 0x0C, // key 1:  Fetch           4-12
         0x00, 0x02, 0x00, 0x01, 0x00, 0x07, // key 2:  ListOffsets     1-7
@@ -105,7 +107,9 @@ async fn golden_apiversions_v1_response_fixture() {
         0x00, 0x20, 0x00, 0x01, 0x00, 0x04, // key 32: DescribeConfigs 1-4
         0x00, 0x21, 0x00, 0x00, 0x00, 0x02, // key 33: AlterConfigs    0-2
         0x00, 0x25, 0x00, 0x00, 0x00, 0x03, // key 37: CreatePartitions 0-3
+        0x00, 0x2A, 0x00, 0x00, 0x00, 0x02, // key 42: DeleteGroups    0-2
         0x00, 0x2C, 0x00, 0x00, 0x00, 0x01, // key 44: IncrementalAlterConfigs 0-1
+        0x00, 0x2F, 0x00, 0x00, 0x00, 0x00, // key 47: OffsetDelete    0-0
         0x00, 0x3C, 0x00, 0x00, 0x00, 0x02, // key 60: DescribeCluster 0-2
         0x00, 0x00, 0x00, 0x00, // throttle_ms
     ];
