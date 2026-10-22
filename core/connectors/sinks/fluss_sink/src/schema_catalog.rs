@@ -20,13 +20,18 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use arrow::{datatypes::Schema, error::ArrowError, json::reader::infer_json_schema_from_iterator};
+use arrow::{
+    datatypes::{DataType, Schema},
+    error::ArrowError,
+    json::reader::infer_json_schema_from_iterator,
+};
 use fluss::{
     metadata::{DataField, RowType, SchemaBuilder, TableDescriptor, TablePath},
     record::from_arrow_field,
 };
 use iggy_connector_sdk::{ConsumedMessage, Payload};
 use thiserror::Error;
+use tracing::warn;
 
 use crate::{
     config::TableConfig,
@@ -60,6 +65,10 @@ pub(crate) enum Error {
     FlussToArrowSchemaFailed { reason: String },
     #[error("Fluss table {table_path} was not found right after it was created")]
     TableMissingAfterCreate { table_path: TablePath },
+    #[error(
+        "No column type could be inferred for table {table_path}, every sampled field was null or empty"
+    )]
+    NoInferableColumns { table_path: TablePath },
 }
 
 #[derive(Debug)]
@@ -134,7 +143,7 @@ impl SchemaCatalog {
         table: &TablePath,
         messages: &[ConsumedMessage],
     ) -> Result<TableDescriptor, Error> {
-        let schema = sample_and_infer_schema(messages)?;
+        let schema = drop_null_fields(sample_and_infer_schema(messages)?, table)?;
         table_descriptor_from_schema(&schema, table, self.table_config.get(&table.to_string()))
     }
 
@@ -220,6 +229,47 @@ fn schema_to_row_type(schema: &Schema, table: &TablePath) -> Result<RowType, Err
             table_path: table.clone(),
             reason: error.to_string(),
         })
+}
+
+fn drop_null_fields(schema: Schema, table: &TablePath) -> Result<Schema, Error> {
+    let (null_fields, fields): (Vec<_>, Vec<_>) = schema
+        .fields()
+        .iter()
+        .cloned()
+        .partition(|field| contains_null_type(field.data_type()));
+
+    if !null_fields.is_empty() {
+        let names = null_fields
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        warn!(
+            "FlussSink: Leaving out columns [{names}] of table '{table}', every sampled value was null or empty"
+        );
+    }
+
+    if fields.is_empty() {
+        return Err(Error::NoInferableColumns {
+            table_path: table.clone(),
+        });
+    }
+
+    Ok(Schema::new_with_metadata(fields, schema.metadata().clone()))
+}
+
+fn contains_null_type(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Null => true,
+        DataType::List(item)
+        | DataType::LargeList(item)
+        | DataType::FixedSizeList(item, _)
+        | DataType::Map(item, _) => contains_null_type(item.data_type()),
+        DataType::Struct(fields) => fields
+            .iter()
+            .any(|field| contains_null_type(field.data_type())),
+        _ => false,
+    }
 }
 
 fn sample_and_infer_schema(messages: &[ConsumedMessage]) -> Result<Schema, Error> {
@@ -488,6 +538,53 @@ mod tests {
                 .data_type(),
             &DataType::Utf8
         );
+    }
+
+    #[test]
+    fn given_null_and_empty_fields_when_inferring_should_create_table_without_them() {
+        let catalog = SchemaCatalog::default();
+        let table = TablePath::new("fluss", "orders");
+        let writer = RecordingWriter::default();
+        let messages = [json_message(
+            1,
+            r#"{"id":1,"note":null,"tags":[],"meta":{"source":null}}"#,
+        )];
+
+        let entry = run_async(catalog.infer_and_create_table(&table, &messages, &writer))
+            .expect("Table should be created from the remaining fields");
+        let names = entry
+            .schema
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, ["id"]);
+    }
+
+    #[test]
+    fn given_only_null_fields_when_inferring_should_not_create_or_cache_table() {
+        let catalog = SchemaCatalog::default();
+        let table = TablePath::new("fluss", "orders");
+        let writer = RecordingWriter::default();
+        let messages = [json_message(1, r#"{"note":null,"tags":[]}"#)];
+
+        let error = run_async(catalog.infer_and_create_table(&table, &messages, &writer))
+            .expect_err("Inference should fail without any typed field");
+
+        assert!(matches!(
+            error,
+            Error::InferSchemaFailed { table_path, reason }
+                if table_path == table && reason.contains("null or empty")
+        ));
+        assert!(
+            writer
+                .created
+                .lock()
+                .expect("created tables lock should not be poisoned")
+                .is_empty()
+        );
+        assert!(catalog.get_schema_entry(&table).is_none());
     }
 
     #[test]
