@@ -1,0 +1,97 @@
+# Template source connector
+
+Starting point for a new Apache Iggy **source** connector. Everything except
+talking to your actual external system is already implemented and follows
+the project's required resilience/security patterns — see the module-level
+doc comment at the top of `src/lib.rs` for the full rationale, and the
+`iggy-connector-review` skill / the "Building Connectors That Pass Review"
+blog post for the checklist this template is built against.
+
+## Delivery Semantics
+
+The framework around `fetch_records()` gives you retry (`max_retries` total
+attempts), a circuit breaker, and the ACK/NACK cursor handshake described
+below. Everything past "what fetches" depends on what you write in
+`fetch_records()` — fill in the blanks with your real behavior before
+shipping:
+
+1. **Transient failure**: retries up to `max_retries` total attempts, then
+   `poll()` returns the error; the circuit breaker counts it. The runtime
+   retries `poll()` again next interval.
+2. **Permanent failure** (auth rejected, schema gone): return
+   `Error::PermanentHttpError` from `fetch_records()` — `poll()` does not
+   trip the circuit breaker on it, since a bad config/auth state isn't a
+   connectivity signal the breaker should react to.
+3. **Duplication window**: at-least-once. `poll()` stages the cursor as
+   *candidate* state; the runtime persists it only after the batch is sent,
+   then reports `Ack`/`Nack`. A NACK (or a crash between send and the
+   persisted-state write) redelivers the same range on the next poll.
+4. **Dedup key**: set `FetchedRecord::natural_id` from a true per-record
+   identity (row PK, document `_id`, event UUID) whenever your source has
+   one — it becomes `ProducedMessage.id`, which a downstream sink can key an
+   idempotent upsert on (see `mongodb_sink`) so the redelivery above doesn't
+   produce a duplicate at the destination. Leave it `None` only when records
+   genuinely have no natural identity (a pure generator). See
+   `connector-pr-review` B5.
+
+## What's already done for you
+
+- Config parsing with `#[serde(deny_unknown_fields)]` so a typo in a TOML
+  file fails loudly instead of silently doing nothing.
+- Config validation in `open()` (not `new()`, which has no way to return an
+  error).
+- `connection_string` and the optional `auth_token` field both typed as
+  `SecretString`, since either can carry credentials.
+- A retry-wrapped HTTP client (`iggy_connector_sdk::retry::build_retry_client`)
+  and a startup connectivity probe with its own backoff
+  (`check_connectivity_with_retry`).
+- A `CircuitBreaker` that's actually consulted before polling and updated
+  after every attempt — not just constructed and forgotten.
+- Cursor staging: `poll()` never commits its progress directly; it stages a
+  candidate and `on_batch_result()` commits it only on `Ack`, discarding it
+  on `Nack` so a failed delivery gets re-polled instead of silently lost.
+- The `source_connector!` FFI macro invocation and a `Cargo.toml` with the
+  right `crate-type`, workspace-pinned dependencies, and license header.
+- `verbose_logging: Option<bool>` upgrading the per-poll log line from
+  `debug!` to `info!`, mirroring the runtime's own `verbose` flag.
+- The six canonical state/Ack-Nack tests, plus config validation and the
+  `verbose_logging` flag.
+
+## What you need to fill in
+
+Search for `TODO(ConnectorDeveloper)` in `src/lib.rs` — there are exactly
+three spots: one required, one conditional, one documentation-only.
+
+1. **`fetch_records()`** (required) — fetch up to `self.batch_size` new
+   records from your system, ordered after `cursor` (`None` = start from the
+   beginning, or from "now" — whichever fits your source). Map each result
+   to a `FetchedRecord { cursor_value, payload }`, using something
+   monotonically increasing as `cursor_value` (a timestamp, an ID, a page
+   token) — that's what lets the cursor-staging logic advance correctly.
+2. **`build_raw_client()`** (only if your source isn't HTTP) — replace the
+   `reqwest::Client` construction with your driver's connection/pool setup
+   (see `core/connectors/sources/postgres_source` for a real non-HTTP
+   example), store it on `TemplateSource` (you'll need to add a field —
+   `client: Option<ClientWithMiddleware>` here is HTTP-specific), and adjust
+   or remove the `check_connectivity_with_retry` call in `open()` in favor
+   of whatever connectivity check your driver offers.
+3. **`connection_string`'s doc comment** (documentation only) — describe
+   the exact shape your connector expects instead of the generic example.
+
+## Using it
+
+1. Copy this directory, rename it and the package in `Cargo.toml`
+   (`iggy_connector_<yourname>_source`), and add it to the `members` list in
+   the workspace root `Cargo.toml`.
+2. Fill in `fetch_records()` (and `build_raw_client()` if not HTTP).
+3. Update `config.toml` with your real `connection_string` and any
+   settings specific to your system; delete `auth_token` if you don't need
+   it, or add fields of your own the same way (see `TemplateSourceConfig`).
+4. `cargo build --release -p iggy_connector_<yourname>_source`, point a
+   runtime connector config file's `path` at the built `.so`/`.dylib`/`.dll`,
+   and run the connector runtime — see `core/connectors/README.md` in this
+   repo for the full runtime quick-start.
+5. Before opening a PR: `cargo test`, `cargo clippy --all-targets`,
+   `cargo fmt --check`, and re-read the connector-review checklist once more
+   with fresh eyes — most review round-trips come from one of the items in
+   that list, not from the connector-specific logic in `fetch_records()`.

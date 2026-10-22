@@ -1,0 +1,57 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# TEMPLATE — rename the package (and this directory) to
+# `iggy_connector_<yourname>_sink` before publishing, and update the
+# `[[sinks]]` entry you add to the workspace root Cargo.toml accordingly.
+
+[package]
+name = "iggy_connector_template_sink"
+version = "0.1.0"
+description = "Template for an Apache Iggy sink connector — copy this crate and fill in the TODO sections."
+edition = "2024"
+license = "Apache-2.0"
+keywords = ["iggy", "messaging", "streaming"]
+categories = ["command-line-utilities", "database", "network-programming"]
+homepage = "https://iggy.apache.org"
+documentation = "https://iggy.apache.org/docs"
+repository = "https://github.com/apache/iggy"
+publish = false
+
+[package.metadata.cargo-machete]
+# dashmap is used only inside the `sink_connector!` macro expansion, so a
+# naive unused-dependency scan won't see the usage — keep it ignored rather
+# than removing it, or the plugin will fail to compile.
+ignored = ["dashmap"]
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+async-trait = { workspace = true }
+dashmap = { workspace = true }
+iggy_common = { workspace = true }
+iggy_connector_sdk = { workspace = true }
+reqwest = { workspace = true }
+reqwest-middleware = { workspace = true }
+secrecy = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
