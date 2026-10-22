@@ -776,7 +776,6 @@ public sealed partial class NativeRecoveryTests
     [Theory]
     [InlineData("invalid credentials")]
     [InlineData("malformed login")]
-    [InlineData("lost reply")]
     [InlineData("eviction after the bind")]
     public async Task given_a_failed_recovery_sign_in_when_a_mutation_waits_should_end_it_and_forget_only_a_refused_credential(
         string failure)
@@ -804,17 +803,6 @@ public sealed partial class NativeRecoveryTests
             {
                 cluster.RegisterRefusal = malformed ? EvictionReason.MalformedLogin : EvictionReason.InvalidCredentials;
                 cluster.RejectRegister = true;
-            }
-            else if (failure == "lost reply")
-            {
-                // The sign-in gets no reply, so the client stops without a session.
-                cluster.BeforeReply = (request, _) =>
-                {
-                    if (request.Operation == (byte)VsrOperation.Register)
-                    {
-                        throw new IOException("The reply is lost.");
-                    }
-                };
             }
             else
             {
@@ -847,7 +835,6 @@ public sealed partial class NativeRecoveryTests
 
         Assert.Empty(cluster.Writes);
         Assert.Equal(2, cluster.Coordinator.Registrations);
-        cluster.BeforeReply = null;
         // Only a refused credential is forgotten, so a connect signs in again with any other.
         await client.ConnectAsync(cluster.Token);
         Assert.Equal(refused ? 2 : 3, cluster.Coordinator.Registrations);

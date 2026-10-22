@@ -253,15 +253,14 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
                 SetConnectionState(ConnectionState.Disconnected);
                 throw;
             }
-            // A register refused before admission leaves no session behind, so the recovery signs in again.
-            var unadmitted = continues && !bound && error is IggyInvalidStatusCodeException
-            {
-                FromServer: true,
-                StatusCode: VsrError.TRANSIENT_NOT_ACCEPTED or VsrError.NOT_PRIMARY
-            };
+            // After a register that was not sent or admitted, lost its link or has an unknown outcome, the recovery
+            // signs in again under a new client id. A register that did commit leaves an idle session, which lease
+            // expiry retires.
+            var retryable = continues && !bound && (IsTransientFailure(error)
+                || error is VsrRequestOutcomeUnknownException or OperationCanceledException);
             await ResetConsensusSessionAsync(canceled ? null : error,
-                stops: continues && !canceled && !refused && !unadmitted, owner: owner,
-                continues: updated || unadmitted);
+                stops: continues && !canceled && !refused && !retryable, owner: owner,
+                continues: updated || retryable);
             throw;
         }
     }

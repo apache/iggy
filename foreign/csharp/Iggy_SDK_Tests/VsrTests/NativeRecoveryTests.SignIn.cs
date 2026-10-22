@@ -132,11 +132,13 @@ public sealed partial class NativeRecoveryTests
     }
 
     [Theory]
+    [InlineData(VsrError.TRANSIENT_NOT_COMMITTED)]
     [InlineData(VsrError.TRANSIENT_NOT_ACCEPTED)]
     [InlineData(VsrError.NOT_PRIMARY)]
-    public async Task given_an_unadmitted_automatic_register_when_the_session_recovers_should_sign_in_again(int code)
+    public async Task given_a_transient_register_refusal_when_the_session_recovers_should_sign_in_again(int code)
     {
-        // The client resends a register refused with 58 until its 30 s deadline, before the recovery sees the refusal.
+        // The client resends a register refused with 57 or 58 until its 30 s deadline, before the recovery sees the
+        // refusal.
         using var cluster = new RecoveryCluster(TimeSpan.FromSeconds(45));
         using var client = await cluster.ConnectAsync();
         var registrations = new ConcurrentQueue<MockRequest>();
@@ -145,6 +147,35 @@ public sealed partial class NativeRecoveryTests
             registrations.Enqueue(request);
             return registrations.TryPeek(out var refused) && refused.ClientId == request.ClientId
                 ? Reply(request.Operation, [], (uint)code) : Answer(request);
+        };
+        cluster.PingEviction = EvictionReason.SessionError;
+        await Assert.ThrowsAnyAsync<Exception>(() => client.PingAsync(cluster.Token));
+        await cluster.UntilAsync(() => registrations.Select(registration => registration.ClientId).Distinct().Count() == 2);
+
+        await StoreAsync(client, cluster.Token);
+
+        Assert.Equal(registrations.Last().ClientId, Assert.Single(cluster.Writes).ClientId);
+    }
+
+    [Fact]
+    public async Task given_a_lost_register_reply_when_the_session_recovers_should_sign_in_again()
+    {
+        using var cluster = new RecoveryCluster();
+        using var client = await cluster.ConnectAsync();
+        var registrations = new ConcurrentQueue<MockRequest>();
+        var lost = 0;
+        cluster.OnRegister = request =>
+        {
+            registrations.Enqueue(request);
+            return Answer(request);
+        };
+        // The lost register may have committed, so the client signs in again under a new client id.
+        cluster.BeforeReply = (request, _) =>
+        {
+            if (request.Operation == (byte)VsrOperation.Register && Interlocked.Exchange(ref lost, 1) == 0)
+            {
+                throw new IOException("The reply is lost.");
+            }
         };
         cluster.PingEviction = EvictionReason.SessionError;
         await Assert.ThrowsAnyAsync<Exception>(() => client.PingAsync(cluster.Token));
