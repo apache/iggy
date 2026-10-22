@@ -27,6 +27,7 @@ import type { ClientConfig } from './client.type.js';
 import { Command, HEADER_SIZE, REPLY_OFFSET, REQUEST_OFFSET, encodeRequestHeader } from '../wire/vsr/header.js';
 import { Operation } from '../wire/vsr/operation.js';
 import { FrozenFrame, OPERATION_TIMEOUT_MS, VsrResponseTimeoutError } from './client.operation.js';
+import { ConnectionClosedError } from '../index.js';
 
 const TLS_CERTIFICATE = readFileSync(new URL('../../../../core/certs/iggy_cert.pem', import.meta.url));
 const TLS_KEY = readFileSync(new URL('../../../../core/certs/iggy_key.pem', import.meta.url));
@@ -299,7 +300,7 @@ describe('IggyConnection multiplexing', () => {
     const connection = new IggyConnection(connectionConfig(server));
     try {
       await connection.connect();
-      assert.ok((await exchange(connection, 1n)).error);
+      assert.ok((await exchange(connection, 1n)).error instanceof ConnectionClosedError);
       await assert.rejects(connection.connect());
       assert.equal(accepted, 1);
     } finally { await closeConnection(connection, server); }

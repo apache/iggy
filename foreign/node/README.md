@@ -228,8 +228,9 @@ budget, so the request fails with a plain `Error` instead.
 
 When a poll fails with status 30, 40, 57, 58 or 89, `singleConsumerStream` and
 `groupConsumerStream` poll again after `interval`. They also poll again after a
-poll deadline, after a poll with unknown progress and after
-`NotConnectedError` and a lost connected socket. The client binds the session again, signs in again,
+poll deadline, after a poll with unknown progress, after `NotConnectedError` and
+after `ConnectionClosedError`. That error reports a lost connected socket. The
+client binds the session again, signs in again,
 reconnects or routes again after these on its own. Any other error ends the
 stream. The server can also refuse a sign-in with status 40, for example for an
 inactive user. So after a 40 the stream waits for the next sign-in, and a
