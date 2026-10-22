@@ -433,6 +433,13 @@ public sealed partial class TcpMessageStream
                     if (error.FromServer && error.CommandCode == code)
                     {
                         refusal = error;
+                        if (error.StatusCode == VsrError.NOT_PRIMARY)
+                        {
+                            // Neither 58 nor 89 admitted the call, so the deadline reports both as 58.
+                            refusal = VsrError.FromServer(VsrError.TRANSIENT_NOT_ACCEPTED,
+                                "No replica admitted the call as its primary.");
+                            refusal.CommandCode = code;
+                        }
                     }
                     var retryImmediately = error.StatusCode == VsrError.NOT_PRIMARY && !lastWasNotPrimary;
                     lastWasNotPrimary = error.StatusCode == VsrError.NOT_PRIMARY;

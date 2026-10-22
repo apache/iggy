@@ -1458,6 +1458,24 @@ public sealed partial class NativeRecoveryTests
         Assert.Equal(0, cluster.Primary.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
     }
 
+    [Fact]
+    public async Task given_not_primary_until_the_deadline_when_polling_should_report_not_accepted()
+    {
+        const int DeadlineMs = 1_000;
+        using var cluster = new RecoveryCluster();
+        using var client = await cluster.ConnectAsync();
+        // A public poll gives the body that the call with the earlier deadline sends.
+        await PollAsync(client, cluster.Token);
+        var poll = Assert.Single(cluster.Polls).Body;
+        cluster.OnPoll = request => Reply(request.Operation, [], VsrError.NOT_PRIMARY);
+
+        var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() => SendWithinAsync(client,
+            CommandCodes.POLL_MESSAGES_CODE, poll, TimeSpan.FromMilliseconds(DeadlineMs), cluster.Token));
+
+        Assert.Equal(VsrError.TRANSIENT_NOT_ACCEPTED, error.StatusCode);
+        Assert.True(error.FromServer);
+    }
+
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
