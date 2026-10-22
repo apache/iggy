@@ -69,6 +69,8 @@ public final class ConsensusSession {
     private long lineage;
     // The lineage in which a sign-in of the caller runs, see signingIn().
     private long signInLineage = NO_SIGN_IN;
+    // See beganSignIn().
+    private boolean signInBegun;
     // The automatic sign-in that the server refused, and the lineage that the refusal ended.
     private Throwable signInRefusal;
     private long refusedLineage;
@@ -353,8 +355,20 @@ public final class ConsensusSession {
         ConsensusSession owner = owner();
         synchronized (owner) {
             owner.signInLineage = ++owner.lineage;
+            owner.signInBegun = true;
         }
         owner.changed();
+    }
+
+    /**
+     * Whether the caller ever began a sign-in. From then on, a call that finds no session and none on its way ends
+     * with 40, as in Rust, instead of asking for a first sign-in.
+     */
+    public boolean beganSignIn() {
+        ConsensusSession owner = owner();
+        synchronized (owner) {
+            return owner.signInBegun;
+        }
     }
 
     public void finishSignIn() {
@@ -904,9 +918,9 @@ public final class ConsensusSession {
         }
 
         /**
-         * After a 58 or 89 refusal or a namespace miss, counts the frame as sent only while an earlier attempt can
-         * have taken effect, as in Rust. So a call that no node admitted starts again under a new session instead of
-         * ending uncertain.
+         * After a 58 or 89 refusal, an 88 lifecycle refusal or a namespace miss, counts the frame as sent only while
+         * an earlier attempt can have taken effect, as in Rust. So a call that no node admitted starts again under a
+         * new session instead of ending uncertain.
          */
         public void settleSent(boolean uncertain) {
             synchronized (owner) {

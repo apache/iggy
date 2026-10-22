@@ -1098,9 +1098,13 @@ impl Call {
         }
     }
 
-    /// Ends the call at its deadline with its last refusal.
+    /// Ends the call at its deadline with its last refusal. A sign-in that no
+    /// primary answered was not accepted, also after it was sent.
     fn expire(mut self) -> IggyError {
         let refusal = std::mem::replace(&mut self.refusal, IggyError::TransientNotAccepted);
+        if is_sign_in(self.code) {
+            self.uncertain = false;
+        }
         self.end(refusal)
     }
 }

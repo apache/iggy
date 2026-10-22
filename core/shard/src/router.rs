@@ -943,20 +943,17 @@ where
             }
             LifecycleFrame::ForwardClientSend { client_id, msg } => {
                 if let Err(e) = self.bus.send_to_client(client_id, msg).await {
-                    // Terminal per `SendError` docs: the client never
-                    // receives the reply and request / response semantics
-                    // break above the bus. Bump the receiver-side counter
-                    // (sender side already bumps in `builder.rs`) and raise
-                    // to `warn!` so it surfaces in default operator logs.
+                    // The production bus refuses every frame sent by id, so
+                    // this is the expected outcome there, not a fault.
                     self.metrics.record_frame_drop(
                         frame_drop_variant::FORWARD_CLIENT_SEND,
                         frame_drop_reason::DELIVERY_FAILED,
                     );
-                    tracing::warn!(
+                    tracing::debug!(
                         shard = self.id,
                         client_id,
                         error = ?e,
-                        "forward-client-send delivery failed"
+                        "staged client deny has no route by client id"
                     );
                 }
             }

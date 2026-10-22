@@ -300,6 +300,14 @@ only after the next prepare or commit broadcast. When no other write follows,
 this delay is at most `cluster.commit_broadcast_interval` (500 ms by default).
 See [metadata freshness and counters](../../core/server/README.md#metadata-freshness-and-counters).
 
+Every error that the Rust SDK reports reaches Python as `IggyError`, a `RuntimeError` subclass. Its `code` is the numeric Iggy error code, the same code that the other SDKs report, and its message is the SDK's error text, so branch on `code` rather than on the message. Three codes tell what happened to a request that did not complete:
+
+- 58 (`TransientNotAccepted`): the server did not admit the request, so a retry is safe.
+- 57 (`TransientNotCommitted`): the outcome is unknown, and the server possibly applied the write. Read the state before you write it again.
+- 40 (`Unauthenticated`): the request needs a session. Sign in, then retry.
+
+`PendingOperationError` and `ProducerSendError` are `IggyError` subclasses. An error that the binding raises itself, such as a `ValueError`, a `TypeError`, or a plain `RuntimeError` for an invalid argument or a shut-down producer, is not an `IggyError` and carries no code.
+
 `PendingOperationError` exposes the exact integer `operation_id`, the numeric
 `code`, and `kind` (`"uncertain"`, `"lane_blocked"`, or `"not_retained"`). On the
 same live client, `await client.resolve_operation(operation_id,
@@ -322,15 +330,14 @@ TCP, QUIC and WebSocket connection strings accept `max_pending_operations` and
 `max_pending_operation_bytes` as positive integers, for example
 `iggy+tcp://iggy:iggy@localhost:8090?max_pending_operations=256&max_pending_operation_bytes=67108864`.
 
-A failed direct send raises `ProducerSendError`, which is a `RuntimeError`
-subclass. Its `cause` property contains the underlying error text, and its
-`__cause__` preserves a structured `PendingOperationError` when applicable. The
-optional `operation_id` identifies the retained send to resolve or abandon. Its
+A failed direct send raises `ProducerSendError`, an `IggyError` with code 4056 (`ProducerSendFailed`). Its `cause` property contains the underlying error text, and its `__cause__` is the `IggyError` that ended the send, a structured `PendingOperationError` when applicable.
+
+The optional `operation_id` of a `ProducerSendError` identifies the retained send to resolve or abandon. Its
 `committed` property contains confirmations from completed chunks, and `failed`
 contains the remaining messages without usable confirmations. For an `uncertain`
 cause, the first `uncertain` messages of `failed` form one chunk that may already
 have committed. Resolve its `operation_id` without submitting that chunk as a new
-send. For any other cause, `uncertain` is zero. For `lane_blocked`,
+send. A cause with code 57 retains no operation, yet its first `uncertain` messages may also have committed. For any other cause, `uncertain` is zero. For `lane_blocked`,
 none of `failed` was sent: the ID names an earlier operation to resolve before
 retrying. Abandonment or a session reset discards retained results, and
 `not_retained` does not prove non-commit. Resubmitting an uncertain chunk can

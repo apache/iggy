@@ -509,8 +509,6 @@ pub(in crate::http) enum ReadError {
     /// hazard (serving state the caller already saw replaced) reached from
     /// different directions. Never a 2xx with stale state.
     MetadataFrontierUnreached,
-    /// A metadata floor read could not reserve forwarding capacity.
-    ForwardBusy,
     /// The metadata primary rejected this node's relay proof.
     RelayRefused,
     /// A partition read got no reply after submission to the owning shard.
@@ -529,7 +527,6 @@ impl IntoResponse for ReadError {
             Self::NotPrimary => not_primary_response(),
             Self::RedirectToPrimary(location) => primary_redirect_response(&location),
             Self::RecoveryIncomplete | Self::MetadataFrontierUnreached => service_unavailable(),
-            Self::ForwardBusy => forward_busy(),
             Self::RelayRefused => relay_refused(),
             Self::Timeout => (
                 StatusCode::GATEWAY_TIMEOUT,

@@ -35,7 +35,7 @@ use crate::{collect_handlers, define_state, impl_fill_restore};
 use ahash::{AHashMap, AHashSet};
 use bytes::{BufMut, Bytes, BytesMut};
 use iggy_binary_protocol::codec::{WireDecode, WireEncode};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 // Only `seed_namespace` (sim/test-gated) uses this at module scope, so keep the
 // import under the same gate. The test module re-imports it independently.
 #[cfg(any(test, feature = "simulator"))]
@@ -79,6 +79,10 @@ use serde::{Deserialize, Serialize};
 use server_common::sharding::{IggyNamespace, MAX_PARTITIONS, MAX_STREAMS, MAX_TOPICS};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Removals [`RemovedPartitions`] keeps. A reader that falls further behind
+/// rebuilds from the tree, which a delete of this many partitions costs anyway.
+pub(crate) const REMOVED_PARTITIONS_RETAINED: usize = 4096;
 
 /// Partition snapshot representation for serialization.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -784,10 +788,58 @@ define_state! {
         pub(crate) pending_revocations: BTreeMap<(usize, usize, u64, usize), ConsumerGroupOwnershipTransition>,
         // Locations are (stream, topic, group, member); never persisted.
         pub(crate) consumer_group_members: AHashMap<u128, Vec<(usize, usize, u64, usize)>>,
+        // Committed partitions per created view, so placement counts them
+        // without a walk. Rebuilt on restore.
+        pub(crate) created_views: BTreeMap<u32, u64>,
+        // Partitions the newest commits removed, so placement retires what it
+        // observed of them without a walk. A restore starts it empty.
+        pub(crate) removed_partitions: RemovedPartitions,
         // Shared aggregate stats, one `Arc` per stream/topic across both
         // left-right buffers (see `StatsRegistry`). Not snapshotted -- rebuilt
         // as streams/topics restore.
         pub stats_registry: Arc<StatsRegistry>,
+    }
+}
+
+/// Partitions that recent commits removed, oldest first, each stamped with
+/// the `namespace_revision` its commit set. Only the newest entries stay, so a
+/// reader that last looked before [`Self::since`] can answer must start over.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RemovedPartitions {
+    entries: VecDeque<RemovedPartition>,
+    /// Newest stamp whose entries are gone, evicted or never recorded.
+    forgotten_through: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RemovedPartition {
+    pub namespace_revision: u64,
+    pub namespace: IggyNamespace,
+    pub created_revision: u64,
+}
+
+impl RemovedPartitions {
+    /// Every partition removed after `namespace_revision`, or `None` when some
+    /// of those removals are no longer recorded.
+    pub(crate) fn since(
+        &self,
+        namespace_revision: u64,
+    ) -> Option<impl Iterator<Item = &RemovedPartition>> {
+        (self.forgotten_through <= namespace_revision).then(|| {
+            let first = self
+                .entries
+                .partition_point(|removed| removed.namespace_revision <= namespace_revision);
+            self.entries.range(first..)
+        })
+    }
+
+    fn push(&mut self, removed: RemovedPartition) {
+        if self.entries.len() == REMOVED_PARTITIONS_RETAINED
+            && let Some(evicted) = self.entries.pop_front()
+        {
+            self.forgotten_through = evicted.namespace_revision;
+        }
+        self.entries.push_back(removed);
     }
 }
 
@@ -985,6 +1037,24 @@ impl StreamsInner {
         }
         self.consumer_group_members
             .retain(|_, memberships| !memberships.is_empty());
+    }
+
+    /// Takes partitions a commit removed out of the placement indexes, after
+    /// that commit set `namespace_revision`.
+    fn retire_partitions(&mut self, stream_id: usize, topic_id: usize, partitions: &[Partition]) {
+        for partition in partitions {
+            if let Some(count) = self.created_views.get_mut(&partition.created_view) {
+                *count -= 1;
+                if *count == 0 {
+                    self.created_views.remove(&partition.created_view);
+                }
+            }
+            self.removed_partitions.push(RemovedPartition {
+                namespace_revision: self.namespace_revision,
+                namespace: IggyNamespace::new(stream_id, topic_id, partition.id),
+                created_revision: partition.created_revision,
+            });
+        }
     }
 
     /// Resolve a wire stream identifier to its committed slab id, `None` when
@@ -2029,6 +2099,18 @@ impl Streams {
     }
 }
 
+fn count_created_views(items: &IdSlab<Stream>) -> BTreeMap<u32, u64> {
+    let mut created_views = BTreeMap::new();
+    for partition in items
+        .iter()
+        .flat_map(|(_, stream)| stream.topics.iter())
+        .flat_map(|(_, topic)| topic.partitions.iter())
+    {
+        *created_views.entry(partition.created_view).or_default() += 1;
+    }
+    created_views
+}
+
 /// Whether the next insert's slab key still fits the packed namespace layout.
 ///
 /// Takes `vacant_key()` rather than `len()` because the KEY is what gets packed
@@ -2192,10 +2274,13 @@ impl StateHandler for DeleteStreamRequest {
         // Evict registry entries so a reused slab id starts with fresh stats.
         // Before the removal: the committed tree is what names the entries.
         state.stats_registry.remove_stream(stream_id, stream);
-        state.items.remove(stream_id);
+        let removed = state.items.remove(stream_id);
         state.index.remove(&name);
         state.revision = state.revision.wrapping_add(1);
         state.namespace_revision = state.revision;
+        for (topic_id, topic) in &removed.topics {
+            state.retire_partitions(stream_id, topic_id, &topic.partitions);
+        }
         // The dropped stream may have held groups with pending revocations.
         state.recompute_consumer_group_metadata();
         ApplyReply {
@@ -2329,6 +2414,10 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
                     created_view: partition.initial_view,
                     deleted_up_to_offset: 0,
                 };
+                *state
+                    .created_views
+                    .entry(partition.created_view)
+                    .or_default() += 1;
                 topic.partitions.push(partition);
             }
         }
@@ -2515,7 +2604,7 @@ impl StateHandler for DeleteTopicRequest {
             .iter()
             .map(|partition| partition.id)
             .collect();
-        stream.topics.remove(topic_id);
+        let removed = stream.topics.remove(topic_id);
         stream.topic_index.remove(&name);
         // Roll the topic and its partitions out of the stream total and evict
         // their entries, so a reused slab id starts from zero.
@@ -2524,6 +2613,7 @@ impl StateHandler for DeleteTopicRequest {
             .remove_topic(stream_id, topic_id, &partition_ids);
         state.revision = state.revision.wrapping_add(1);
         state.namespace_revision = state.revision;
+        state.retire_partitions(stream_id, topic_id, &removed.partitions);
         // The dropped topic may have held groups with pending revocations.
         state.recompute_consumer_group_metadata();
         ApplyReply {
@@ -2616,6 +2706,10 @@ impl StateHandler for CreatePartitionsWithAssignmentsRequest {
             return ApplyReply::err(CreatePartitionsResult::TopicNotFound);
         };
         for (resolved_id_usize, partition) in resolved.into_iter().zip(self.partitions.iter()) {
+            *state
+                .created_views
+                .entry(partition.initial_view)
+                .or_default() += 1;
             topic.partitions.push(Partition {
                 id: resolved_id_usize,
                 consensus_group_id: partition.consensus_group_id,
@@ -2682,14 +2776,11 @@ impl StateHandler for DeletePartitionsRequest {
         // applies as the historical ok no-op.
         if count_to_delete > 0 {
             let retained = topic.partitions.len() - count_to_delete;
-            // Read the ids off the tail before it goes: `retained` is a count,
-            // and only a primary that minted dense ids makes it double as an id
+            // Read the ids off the removed tail: `retained` is a count, and
+            // only a primary that minted dense ids makes it double as an id
             // threshold.
-            let removed_ids: Vec<usize> = topic.partitions[retained..]
-                .iter()
-                .map(|partition| partition.id)
-                .collect();
-            topic.partitions.truncate(retained);
+            let removed = topic.partitions.split_off(retained);
+            let removed_ids: Vec<usize> = removed.iter().map(|partition| partition.id).collect();
             // Members assigned the removed partitions must give them up.
             topic.rebalance_consumer_groups(state.apply_context.metadata_op, timestamp);
             state.recompute_consumer_group_metadata();
@@ -2700,6 +2791,7 @@ impl StateHandler for DeletePartitionsRequest {
                 .remove_partitions(stream_id, topic_id, &removed_ids);
             state.revision = state.revision.wrapping_add(1);
             state.namespace_revision = state.revision;
+            state.retire_partitions(stream_id, topic_id, &removed);
         }
         ApplyReply::ok(Bytes::new())
     }
@@ -2949,6 +3041,7 @@ impl StreamsInner {
             .values()
             .map(LifecycleIntent::scope)
             .collect();
+        let created_views = count_created_views(&items);
         let mut inner = Self {
             index,
             items,
@@ -2960,6 +3053,11 @@ impl StreamsInner {
             // Recomputed from the restored groups just below.
             pending_revocations: BTreeMap::new(),
             consumer_group_members: AHashMap::new(),
+            created_views,
+            removed_partitions: RemovedPartitions {
+                entries: VecDeque::new(),
+                forgotten_through: snapshot.namespace_revision,
+            },
             last_result: None,
             apply_context: ApplyContext::default(),
             stats_registry,

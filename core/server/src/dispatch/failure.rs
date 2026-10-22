@@ -141,7 +141,8 @@ impl ClientOrigin {
 /// frozen frame or the vectored poll reply.
 ///
 /// A frame for a queued request waits for room in a full reply queue, so a
-/// client that reads its replies keeps its connection. Any other frame, the
+/// client that reads its replies keeps its connection. A queue that stays full
+/// for `message_bus.client_write_stall_timeout` closes it. Any other frame, the
 /// overflow deny and the heartbeat eviction included, closes the connection
 /// on a full queue: nothing bounds how many of them could wait.
 #[allow(clippy::future_not_send)]

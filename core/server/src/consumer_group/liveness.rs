@@ -1663,16 +1663,19 @@ mod tests {
     async fn given_failed_partition_when_retiring_should_allow_new_sessions() {
         let (directory, shard) = shard_with_members(1).await;
         let metadata = shard.plane.metadata();
+        let namespace = server_common::sharding::IggyNamespace::new(0, 0, 0);
+        let created_revision = metadata
+            .mux_stm
+            .streams()
+            .created_revision_for_namespace(namespace)
+            .unwrap();
         assert!(
             metadata
                 .client_table
                 .borrow_mut()
                 .end_session(CLIENT, 0, SESSION, SESSION)
         );
-        shard
-            .plane
-            .partitions()
-            .fence(server_common::sharding::IggyNamespace::new(0, 0, 0), 1);
+        shard.plane.partitions().fence(namespace, created_revision);
         let tracker = RefCell::new(ConsumerGroupLiveness::default());
         let (_stop, receiver) = shard::channel(1);
         let (_signal, shutdown) = Shutdown::new();
@@ -1696,11 +1699,11 @@ mod tests {
         assert_eq!(
             crate::partition_helpers::partition_retirement_fence(
                 directory.path().to_str().unwrap(),
-                server_common::sharding::IggyNamespace::new(0, 0, 0),
+                namespace,
             )
             .await
             .unwrap(),
-            Some(1)
+            Some(created_revision)
         );
         metadata
             .client_table
@@ -1726,7 +1729,12 @@ mod tests {
                 .end_session(CLIENT, 0, SESSION, SESSION)
         );
         let namespace = server_common::sharding::IggyNamespace::new(0, 0, 0);
-        shard.plane.partitions().fence(namespace, 1);
+        let created_revision = metadata
+            .mux_stm
+            .streams()
+            .created_revision_for_namespace(namespace)
+            .unwrap();
+        shard.plane.partitions().fence(namespace, created_revision);
         let obstruction = directory.path().join("partition-initialization");
         std::fs::write(&obstruction, b"not a directory").unwrap();
         let tracker = RefCell::new(ConsumerGroupLiveness::default());

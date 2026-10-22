@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::impls::metadata::{PartitionPlacementView, PartitionPrimaryTransfer};
-use crate::stm::stream::{Partition, Streams, find_partition};
+use crate::stm::stream::{Partition, Streams, StreamsInner, find_partition};
 use ahash::AHashMap;
 use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
 use iggy_binary_protocol::requests::partitions::CreatePartitionsWithAssignmentsRequest;
@@ -31,13 +31,32 @@ use server_common::sharding::IggyNamespace;
 #[derive(Default)]
 pub(super) struct PlacementState {
     observations: AHashMap<IggyNamespace, ObservedView>,
+    /// Per replica, observed primaries minus created ones, for one replica count.
+    moved: Option<(u8, Vec<i64>)>,
+    /// The `namespace_revision` whose removals `observations` reflects.
+    synced_revision: Option<u64>,
+    /// Changes with every observation, so a scan can tell its input moved.
+    observed_generation: u64,
+    last_scan: Option<(ScanInputs, Option<PartitionPrimaryTransfer>)>,
     reservations: AHashMap<(u64, u128), Vec<u64>>,
     eligible: Option<(u32, Vec<bool>)>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct ObservedView {
     report: PartitionPlacementView,
-    present: bool,
+    created_view: u32,
+}
+
+/// Everything a rebalance scan reads. `revision` moves with the partition set
+/// and with every lifecycle intent, which hides partitions from the scan.
+#[derive(PartialEq, Eq)]
+struct ScanInputs {
+    revision: u64,
+    observed_generation: u64,
+    replicas: u8,
+    eligible: Vec<bool>,
+    after: Option<IggyNamespace>,
 }
 
 impl PlacementState {
@@ -49,12 +68,7 @@ impl PlacementState {
         let () = streams.read(|inner| {
             for report in reports {
                 let namespace = report.namespace;
-                let Some(partition) = inner
-                    .items
-                    .get(namespace.stream_id())
-                    .and_then(|stream| stream.topics.get(namespace.topic_id()))
-                    .and_then(|topic| find_partition(&topic.partitions, namespace.partition_id()))
-                else {
+                let Some(partition) = committed_partition(inner, namespace) else {
                     continue;
                 };
                 if partition.created_revision != report.created_revision {
@@ -63,120 +77,69 @@ impl PlacementState {
                 if report.view < partition.created_view {
                     continue;
                 }
-                self.observations
-                    .entry(namespace)
-                    .and_modify(|previous| {
-                        if previous.report.created_revision == report.created_revision {
-                            previous.report.view = previous.report.view.max(report.view);
-                        } else {
-                            previous.report = *report;
-                        }
-                    })
-                    .or_insert(ObservedView {
-                        report: *report,
-                        present: true,
-                    });
+                let mut observed = ObservedView {
+                    report: *report,
+                    created_view: partition.created_view,
+                };
+                if let Some(previous) = self.observations.get(&namespace).copied() {
+                    if previous.report.created_revision == report.created_revision {
+                        observed.report.view = previous.report.view.max(report.view);
+                    }
+                    if observed == previous {
+                        continue;
+                    }
+                    self.track(previous, -1);
+                }
+                self.track(observed, 1);
+                self.observations.insert(namespace, observed);
+                self.observed_generation += 1;
             }
         });
     }
 
     pub(super) fn committed_counts(&mut self, streams: &Streams, replicas: u8) -> Vec<u64> {
-        let counts = streams.read(|inner| {
-            let mut counts = vec![0; usize::from(replicas)];
-            for observation in self.observations.values_mut() {
-                observation.present = false;
+        streams.read(|inner| {
+            self.retire_removed(inner);
+            let mut counts = vec![0_u64; usize::from(replicas)];
+            for (&view, &partitions) in &inner.created_views {
+                counts[(view % u32::from(replicas)) as usize] += partitions;
             }
-            for (stream_id, stream) in &inner.items {
-                for (topic_id, topic) in &stream.topics {
-                    for partition in &topic.partitions {
-                        let namespace = IggyNamespace::new(stream_id, topic_id, partition.id);
-                        let view = self
-                            .observations
-                            .get_mut(&namespace)
-                            .filter(|observation| {
-                                observation.report.created_revision == partition.created_revision
-                            })
-                            .map_or(partition.created_view, |observation| {
-                                observation.present = true;
-                                observation.report.view.max(partition.created_view)
-                            });
-                        counts[(view % u32::from(replicas)) as usize] += 1;
-                    }
-                }
+            for (count, &moved) in counts.iter_mut().zip(self.moved(replicas)) {
+                *count = count.saturating_add_signed(moved);
             }
             counts
-        });
-        self.observations
-            .retain(|_, observation| observation.present);
-        counts
+        })
     }
 
     pub(super) fn primary_rebalance_candidate(
-        &self,
+        &mut self,
         streams: &Streams,
         replicas: u8,
         eligible: &[bool],
         after: Option<IggyNamespace>,
     ) -> Option<PartitionPrimaryTransfer> {
-        let replicas = usize::from(replicas);
+        let replica_count = usize::from(replicas);
         let available = eligible.iter().filter(|&&available| available).count();
-        if eligible.len() != replicas || available < 2 || available <= replicas / 2 {
+        if eligible.len() != replica_count || available < 2 || available <= replica_count / 2 {
             return None;
         }
         streams.read(|inner| {
-            let mut counts = vec![0_u64; replicas];
-            let mut first: Vec<Option<PartitionPlacementView>> = vec![None; replicas];
-            let mut next: Vec<Option<PartitionPlacementView>> = vec![None; replicas];
-            for (stream_id, stream) in &inner.items {
-                for (topic_id, topic) in &stream.topics {
-                    if inner.lifecycle_blocks(stream_id, Some(topic_id)) {
-                        continue;
-                    }
-                    for partition in &topic.partitions {
-                        let namespace = IggyNamespace::new(stream_id, topic_id, partition.id);
-                        let report = self.matching_view(namespace, partition);
-                        let primary = report.map_or(partition.created_view, |report| report.view)
-                            as usize
-                            % replicas;
-                        counts[primary] += 1;
-                        let Some(report) = report.filter(|_| eligible[primary]) else {
-                            continue;
-                        };
-                        if first[primary].is_none_or(|first| namespace < first.namespace) {
-                            first[primary] = Some(report);
-                        }
-                        if after.is_none_or(|cursor| namespace > cursor)
-                            && next[primary].is_none_or(|next| namespace < next.namespace)
-                        {
-                            next[primary] = Some(report);
-                        }
-                    }
-                }
+            self.retire_removed(inner);
+            let inputs = ScanInputs {
+                revision: inner.revision,
+                observed_generation: self.observed_generation,
+                replicas,
+                eligible: eligible.to_vec(),
+                after,
+            };
+            if let Some((scanned, plan)) = &self.last_scan
+                && *scanned == inputs
+            {
+                return *plan;
             }
-            let mut available = eligible
-                .iter()
-                .enumerate()
-                .filter_map(|(replica, &eligible)| eligible.then_some(replica));
-            let mut source = available.next()?;
-            let mut target = source;
-            for replica in available {
-                if counts[replica] > counts[source] {
-                    source = replica;
-                }
-                if counts[replica] < counts[target] {
-                    target = replica;
-                }
-            }
-            if counts[source].saturating_sub(counts[target]) <= 1 {
-                return None;
-            }
-            let report = next[source].or(first[source])?;
-            Some(PartitionPrimaryTransfer {
-                namespace: report.namespace,
-                created_revision: report.created_revision,
-                view: report.view,
-                target: u8::try_from(target).ok()?,
-            })
+            let plan = self.scan(inner, replica_count, eligible, after);
+            self.last_scan = Some((inputs, plan));
+            plan
         })
     }
 
@@ -284,6 +247,68 @@ impl PlacementState {
         Ok(Some(highest_group_id))
     }
 
+    fn scan(
+        &self,
+        inner: &StreamsInner,
+        replicas: usize,
+        eligible: &[bool],
+        after: Option<IggyNamespace>,
+    ) -> Option<PartitionPrimaryTransfer> {
+        let mut counts = vec![0_u64; replicas];
+        let mut first: Vec<Option<PartitionPlacementView>> = vec![None; replicas];
+        let mut next: Vec<Option<PartitionPlacementView>> = vec![None; replicas];
+        for (stream_id, stream) in &inner.items {
+            for (topic_id, topic) in &stream.topics {
+                if inner.lifecycle_blocks(stream_id, Some(topic_id)) {
+                    continue;
+                }
+                for partition in &topic.partitions {
+                    let namespace = IggyNamespace::new(stream_id, topic_id, partition.id);
+                    let report = self.matching_view(namespace, partition);
+                    let primary = report.map_or(partition.created_view, |report| report.view)
+                        as usize
+                        % replicas;
+                    counts[primary] += 1;
+                    let Some(report) = report.filter(|_| eligible[primary]) else {
+                        continue;
+                    };
+                    if first[primary].is_none_or(|first| namespace < first.namespace) {
+                        first[primary] = Some(report);
+                    }
+                    if after.is_none_or(|cursor| namespace > cursor)
+                        && next[primary].is_none_or(|next| namespace < next.namespace)
+                    {
+                        next[primary] = Some(report);
+                    }
+                }
+            }
+        }
+        let mut available = eligible
+            .iter()
+            .enumerate()
+            .filter_map(|(replica, &eligible)| eligible.then_some(replica));
+        let mut source = available.next()?;
+        let mut target = source;
+        for replica in available {
+            if counts[replica] > counts[source] {
+                source = replica;
+            }
+            if counts[replica] < counts[target] {
+                target = replica;
+            }
+        }
+        if counts[source].saturating_sub(counts[target]) <= 1 {
+            return None;
+        }
+        let report = next[source].or(first[source])?;
+        Some(PartitionPrimaryTransfer {
+            namespace: report.namespace,
+            created_revision: report.created_revision,
+            view: report.view,
+            target: u8::try_from(target).ok()?,
+        })
+    }
+
     fn matching_view(
         &self,
         namespace: IggyNamespace,
@@ -295,6 +320,82 @@ impl PlacementState {
             .filter(|report| report.created_revision == partition.created_revision)
             .filter(|report| report.view >= partition.created_view)
     }
+
+    /// Drops what was observed of partitions that commits removed since the
+    /// last call. When the tree no longer records all of those removals, every
+    /// observation is checked against the tree instead.
+    fn retire_removed(&mut self, inner: &StreamsInner) {
+        if self.synced_revision == Some(inner.namespace_revision) {
+            return;
+        }
+        let removals = self
+            .synced_revision
+            .and_then(|synced| inner.removed_partitions.since(synced));
+        if let Some(removals) = removals {
+            for removed in removals {
+                if self
+                    .observations
+                    .get(&removed.namespace)
+                    .is_some_and(|observed| {
+                        observed.report.created_revision == removed.created_revision
+                    })
+                    && let Some(observed) = self.observations.remove(&removed.namespace)
+                {
+                    self.track(observed, -1);
+                    self.observed_generation += 1;
+                }
+            }
+        } else {
+            self.observations.retain(|&namespace, observed| {
+                committed_partition(inner, namespace).is_some_and(|partition| {
+                    partition.created_revision == observed.report.created_revision
+                })
+            });
+            self.moved = None;
+            self.observed_generation += 1;
+        }
+        self.synced_revision = Some(inner.namespace_revision);
+    }
+
+    fn moved(&mut self, replicas: u8) -> &[i64] {
+        if self
+            .moved
+            .as_ref()
+            .is_none_or(|(built_for, _)| *built_for != replicas)
+        {
+            let mut moved = vec![0; usize::from(replicas)];
+            for observed in self.observations.values() {
+                observed.shift(replicas, &mut moved, 1);
+            }
+            self.moved = Some((replicas, moved));
+        }
+        self.moved.as_ref().map_or(&[], |(_, moved)| moved)
+    }
+
+    fn track(&mut self, observed: ObservedView, by: i64) {
+        if let Some((replicas, moved)) = self.moved.as_mut() {
+            observed.shift(*replicas, moved, by);
+        }
+    }
+}
+
+impl ObservedView {
+    /// Counts this partition at its observed primary instead of its created
+    /// one, or back for a negative `by`.
+    fn shift(self, replicas: u8, moved: &mut [i64], by: i64) {
+        let replicas = u32::from(replicas);
+        let observed = self.report.view.max(self.created_view);
+        moved[(observed % replicas) as usize] += by;
+        moved[(self.created_view % replicas) as usize] -= by;
+    }
+}
+
+fn committed_partition(inner: &StreamsInner, namespace: IggyNamespace) -> Option<&Partition> {
+    inner
+        .items
+        .get(namespace.stream_id())
+        .and_then(|stream| stream.topics.get(namespace.topic_id()))
+        .and_then(|topic| find_partition(&topic.partitions, namespace.partition_id()))
 }
 
 #[cfg(test)]
@@ -302,7 +403,10 @@ mod tests {
     use super::*;
     use crate::stm::StateHandler;
     use crate::stm::lifecycle::apply_with_lifecycle_completion;
+    use crate::stm::snapshot::Snapshotable;
+    use crate::stm::stream::{REMOVED_PARTITIONS_RETAINED, StreamsInner};
     use iggy_binary_protocol::WireIdentifier;
+    use iggy_binary_protocol::requests::partitions::DeletePartitionsRequest;
     use iggy_binary_protocol::requests::streams::DeleteStreamRequest;
     use iggy_binary_protocol::requests::topics::DeleteTopicRequest;
     use iggy_common::IggyTimestamp;
@@ -323,6 +427,186 @@ mod tests {
             );
         }
         (streams, placement)
+    }
+
+    #[test]
+    fn given_creates_moves_deletes_and_recreates_when_counting_should_equal_the_full_walk() {
+        const REPLICAS: u8 = 3;
+        let (streams, mut placement) = observed_topics(&[0, 1, 2, 0, 1, 2]);
+        let wide = IggyNamespace::new(0, 6, 4);
+        streams.seed_namespace(wide, 100, 1);
+        assert_counts_match_walk(&mut placement, &streams, REPLICAS);
+
+        let moves = [
+            ((0, 0), 4),
+            ((1, 0), 5),
+            ((6, 1), 3),
+            ((6, 3), 2),
+            ((6, 4), 6),
+        ];
+        observe_views(&mut placement, &streams, &moves);
+        assert_counts_match_walk(&mut placement, &streams, REPLICAS);
+
+        let recreated = IggyNamespace::new(0, 1, 0);
+        let old_revision = streams.created_revision_for_namespace(recreated).unwrap();
+        let streams = apply_to(
+            &streams,
+            &DeleteTopicRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(1),
+            },
+        );
+        assert_counts_match_walk(&mut placement, &streams, REPLICAS);
+
+        let streams = apply_to(
+            &streams,
+            &DeletePartitionsRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(6),
+                partitions_count: 2,
+            },
+        );
+        assert_counts_match_walk(&mut placement, &streams, REPLICAS);
+
+        streams.seed_namespace(recreated, 200, 2);
+        placement.observe(
+            &streams,
+            &[PartitionPlacementView {
+                namespace: recreated,
+                created_revision: old_revision,
+                view: 9,
+            }],
+        );
+        assert_counts_match_walk(&mut placement, &streams, REPLICAS);
+        observe_views(
+            &mut placement,
+            &streams,
+            &[((1, 0), 3), ((6, 2), 7), ((0, 0), 5)],
+        );
+        assert_counts_match_walk(&mut placement, &streams, REPLICAS);
+        assert_counts_match_walk(&mut placement, &streams, 5);
+        assert_counts_match_walk(&mut placement, &streams, REPLICAS);
+    }
+
+    #[test]
+    fn given_a_restored_tree_without_the_removals_when_counting_should_equal_the_full_walk() {
+        const REPLICAS: u8 = 3;
+        let (streams, mut placement) = observed_topics(&[0, 1, 2, 0]);
+        observe_views(&mut placement, &streams, &[((0, 0), 4), ((2, 0), 3)]);
+        assert_counts_match_walk(&mut placement, &streams, REPLICAS);
+
+        let deleted = apply_to(
+            &streams,
+            &DeleteTopicRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+            },
+        );
+        let restored = Streams::from_snapshot(deleted.to_snapshot()).unwrap();
+
+        assert_counts_match_walk(&mut placement, &restored, REPLICAS);
+    }
+
+    #[test]
+    fn given_more_removals_than_the_tree_keeps_when_counting_should_equal_the_full_walk() {
+        const REPLICAS: u8 = 3;
+        let (streams, mut placement) = observed_topics(&[0, 1]);
+        let wide = IggyNamespace::new(0, 2, REMOVED_PARTITIONS_RETAINED);
+        streams.seed_namespace(wide, 100, 1);
+        let moves: Vec<_> = (0..=REMOVED_PARTITIONS_RETAINED)
+            .map(|partition| ((2, partition), 2))
+            .chain([((0, 0), 4)])
+            .collect();
+        observe_views(&mut placement, &streams, &moves);
+        assert_counts_match_walk(&mut placement, &streams, REPLICAS);
+
+        let streams = apply_to(
+            &streams,
+            &DeleteTopicRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(2),
+            },
+        );
+        assert!(
+            streams.read(|inner| inner.removed_partitions.since(0).is_none()),
+            "the delete must outgrow what the tree keeps"
+        );
+        assert_counts_match_walk(&mut placement, &streams, REPLICAS);
+
+        let streams = apply_to(
+            &streams,
+            &DeleteTopicRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+            },
+        );
+        assert_counts_match_walk(&mut placement, &streams, REPLICAS);
+        assert_eq!(placement.observations.len(), 1);
+    }
+
+    #[test]
+    fn given_unchanged_inputs_when_selecting_again_should_reuse_the_last_scan() {
+        let (streams, mut placement) = observed_topics(&[0, 0, 0]);
+        let first = placement.primary_rebalance_candidate(&streams, 3, &[true; 3], None);
+        assert!(first.is_some());
+        // A tree at the same revision cannot differ from the scanned one, so a
+        // changed tree that kept its revision exposes a skipped scan.
+        let mut inner = streams.read(Clone::clone);
+        for topic in [1, 2] {
+            inner
+                .items
+                .get_mut(0)
+                .unwrap()
+                .topics
+                .get_mut(topic)
+                .unwrap()
+                .partitions
+                .clear();
+        }
+        let same_revision = Streams::from(inner);
+
+        assert_eq!(
+            placement.primary_rebalance_candidate(&same_revision, 3, &[true; 3], None),
+            first
+        );
+        assert!(
+            PlacementState::default()
+                .primary_rebalance_candidate(&same_revision, 3, &[true; 3], None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn given_a_new_lifecycle_intent_when_selecting_again_should_scan_again() {
+        let (streams, mut placement) = observed_topics(&[0, 0, 1, 2]);
+        assert!(
+            placement
+                .primary_rebalance_candidate(&streams, 3, &[true; 3], None)
+                .is_none()
+        );
+        let mut inner = streams.read(Clone::clone);
+        inner.apply_context.metadata_op = 100;
+        assert_eq!(
+            DeleteTopicRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(2),
+            }
+            .apply(&mut inner, IggyTimestamp::from(1))
+            .code,
+            0
+        );
+        assert_eq!(
+            inner.namespace_revision,
+            streams.read(|inner| inner.namespace_revision),
+            "a pending delete leaves the partition set alone"
+        );
+        let deleting = Streams::from(inner);
+
+        let transfer = placement
+            .primary_rebalance_candidate(&deleting, 3, &[true; 3], None)
+            .unwrap();
+
+        assert_eq!(transfer.target, 1);
     }
 
     #[test]
@@ -379,7 +663,7 @@ mod tests {
     #[test]
     fn given_balanced_or_almost_balanced_primaries_when_selecting_should_not_transfer() {
         for views in [&[][..], &[0, 1, 2], &[0, 1, 2, 0]] {
-            let (streams, placement) = observed_topics(views);
+            let (streams, mut placement) = observed_topics(views);
             assert!(
                 placement
                     .primary_rebalance_candidate(&streams, 3, &[true; 3], None)
@@ -390,7 +674,7 @@ mod tests {
 
     #[test]
     fn given_unsettled_failover_or_no_quorum_when_selecting_should_wait() {
-        let (streams, placement) = observed_topics(&[0, 0, 0, 1, 2]);
+        let (streams, mut placement) = observed_topics(&[0, 0, 0, 1, 2]);
         for eligible in [
             &[false, true, true, true, true][..],
             &[true, true, false, false, false],
@@ -417,7 +701,7 @@ mod tests {
 
     #[test]
     fn given_tied_load_and_recovering_target_when_selecting_should_rotate_candidates() {
-        let (streams, placement) = observed_topics(&[0, 0, 0, 1, 1, 1]);
+        let (streams, mut placement) = observed_topics(&[0, 0, 0, 1, 1, 1]);
         for (after, expected_topic) in [(None, 0), (Some(0), 1), (Some(1), 2), (Some(2), 0)] {
             let transfer = placement
                 .primary_rebalance_candidate(
@@ -467,7 +751,7 @@ mod tests {
 
     #[test]
     fn given_pending_parent_deletion_when_selecting_should_exclude_its_partitions() {
-        let (streams, placement) = observed_topics(&[0, 0, 0]);
+        let (streams, mut placement) = observed_topics(&[0, 0, 0]);
         let namespace = IggyNamespace::new(0, 0, 0);
         let revision = streams.created_revision_for_namespace(namespace).unwrap();
         let mut inner = streams.read(Clone::clone);
@@ -492,6 +776,8 @@ mod tests {
                 .is_none()
         );
 
+        // A sibling history with the same revision needs its own placement.
+        let (streams, mut placement) = observed_topics(&[0, 0, 0]);
         let mut inner = streams.read(Clone::clone);
         inner.apply_context.metadata_op = 101;
         assert_eq!(
@@ -580,7 +866,7 @@ mod tests {
 
     #[test]
     fn given_an_unavailable_primary_when_other_partitions_are_imbalanced_should_move_a_ready_one() {
-        let (streams, placement) = observed_topics(&[0, 1, 1, 1]);
+        let (streams, mut placement) = observed_topics(&[0, 1, 1, 1]);
         let transfer = placement
             .primary_rebalance_candidate(&streams, 3, &[false, true, true], None)
             .unwrap();
@@ -601,5 +887,63 @@ mod tests {
         );
         placement.observe_replicas(2, &[]);
         assert_eq!(placement.select(&mut [0, 5, 5], 2), Ok(0));
+    }
+
+    fn observe_views(
+        placement: &mut PlacementState,
+        streams: &Streams,
+        views: &[((usize, usize), u32)],
+    ) {
+        for &((topic, partition), view) in views {
+            let namespace = IggyNamespace::new(0, topic, partition);
+            placement.observe(
+                streams,
+                &[PartitionPlacementView {
+                    namespace,
+                    created_revision: streams.created_revision_for_namespace(namespace).unwrap(),
+                    view,
+                }],
+            );
+        }
+    }
+
+    fn apply_to<R: StateHandler<State = StreamsInner>>(streams: &Streams, request: &R) -> Streams {
+        let mut inner = streams.read(Clone::clone);
+        assert_eq!(
+            apply_with_lifecycle_completion(request, &mut inner, IggyTimestamp::from(1)).code,
+            0
+        );
+        Streams::from(inner)
+    }
+
+    fn assert_counts_match_walk(placement: &mut PlacementState, streams: &Streams, replicas: u8) {
+        let counted = placement.committed_counts(streams, replicas);
+        assert_eq!(counted, walked_counts(placement, streams, replicas));
+    }
+
+    /// Every committed partition at its observed view, or its created view
+    /// before an observation of its incarnation.
+    fn walked_counts(placement: &PlacementState, streams: &Streams, replicas: u8) -> Vec<u64> {
+        streams.read(|inner| {
+            let mut counts = vec![0; usize::from(replicas)];
+            for (stream_id, stream) in &inner.items {
+                for (topic_id, topic) in &stream.topics {
+                    for partition in &topic.partitions {
+                        let namespace = IggyNamespace::new(stream_id, topic_id, partition.id);
+                        let view = placement
+                            .observations
+                            .get(&namespace)
+                            .filter(|observed| {
+                                observed.report.created_revision == partition.created_revision
+                            })
+                            .map_or(partition.created_view, |observed| {
+                                observed.report.view.max(partition.created_view)
+                            });
+                        counts[(view % u32::from(replicas)) as usize] += 1;
+                    }
+                }
+            }
+            counts
+        })
     }
 }

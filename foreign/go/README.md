@@ -69,14 +69,11 @@ new registration. While the client registers that new session by itself, a call
 that it did not send waits for the session. So does a call that starts while
 `Connect` signs in. Then the call goes out under the new session. If no session
 comes before the call deadline, the call fails with 58, and the caller can retry
-it. If registration ends with a refusal, every call that waits for it fails with
-40 and the refusal as its cause. A `Connect` whose own sign-in is refused returns
-the refusal itself. The client also logs the refusal. A refusal of the current
-credentials with code 4, 40, 42, 43, 44, 47, 53 or 54 blocks automatic sign-in
-until another explicit sign-in. `Connect`, including after `Disconnect`, cannot
-unblock it. If a committed password change already updated the same owner's
-credentials, refusal of the older password retries the updated credentials.
-Other refusals keep the last sign-in, so a later `Connect` can retry it.
+it.
+
+If the server refuses the current credentials of that registration, with code 4, 40, 42, 43, 44, 47, 53 or 54, every call that waits for it fails with 40 and the refusal as its cause. Such a refusal blocks automatic sign-in until another explicit sign-in. `Connect`, including after `Disconnect`, cannot unblock it. If a committed password change already updated the same owner's credentials, refusal of the older password retries the updated credentials.
+
+Other refusals keep the last sign-in and leave the session owed. After a session loss the client keeps registering, and a call that waits for the session fails with 58 at its deadline. A call that waits for a `Connect` fails with 58 and the refusal as its cause, and a later `Connect` can retry the sign-in. A `Connect` whose own sign-in is refused returns the refusal itself. The client also logs every refusal.
 
 A sign-in, a logout or a disconnect by the application ends every call that
 started before it. A call that did not change server state fails with 40. A

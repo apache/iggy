@@ -129,7 +129,8 @@ public class IggyTypedConsumerTests
 
         offset.ShouldNotBeNull();
         count.ShouldBe(5);
-        offset.StoredOffset.ShouldBe(4ul);
+        // The loop broke inside the body of offset 4, so that message is delivered again.
+        offset.StoredOffset.ShouldBe(3ul);
     }
 
     [Test]

@@ -254,7 +254,6 @@ impl MessageBus for SimOutbox {
 
     fn set_connection_lost_fn(&self, _f: message_bus::ConnectionLostFn) {}
     fn set_replica_forward_fn(&self, _f: message_bus::ReplicaForwardFn) {}
-    fn set_client_forward_fn(&self, _f: message_bus::ClientForwardFn) {}
 
     fn sleep(&self, duration: Duration) -> impl Future<Output = ()> {
         self.timer.sleep(duration)
@@ -301,6 +300,7 @@ impl MessageBus for SharedSimOutbox {
         if self.0.shell {
             return Err(SendError::ClientNotFound(client_id));
         }
+        // Raw mode dispatches client packets with no installation to reply to.
         self.0.send_to_client(client_id, data).await
     }
 
@@ -318,10 +318,6 @@ impl MessageBus for SharedSimOutbox {
 
     fn set_replica_forward_fn(&self, f: message_bus::ReplicaForwardFn) {
         self.0.set_replica_forward_fn(f);
-    }
-
-    fn set_client_forward_fn(&self, f: message_bus::ClientForwardFn) {
-        self.0.set_client_forward_fn(f);
     }
 
     fn sleep(&self, duration: Duration) -> impl Future<Output = ()> {

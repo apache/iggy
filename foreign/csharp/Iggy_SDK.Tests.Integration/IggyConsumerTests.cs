@@ -440,7 +440,8 @@ public class IggyConsumerTests
         offset.ShouldNotBeNull();
         receivedCount.ShouldBe(5);
         lastOffset.ShouldBe(4ul);
-        offset.StoredOffset.ShouldBe(lastOffset);
+        // The loop broke inside the body of offset 4, so that message is delivered again.
+        offset.StoredOffset.ShouldBe(3ul);
     }
 
     [Test]

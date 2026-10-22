@@ -1097,7 +1097,7 @@ async fn shard_main(
     // Await the watchdog even when the drain verdict is an error: the token
     // has fired, so it either stands down within one poll interval or is
     // mid-`bus.shutdown()`, and dropping it there truncates in-flight
-    // `ClientForwardFailed` replies.
+    // client replies.
     let pump_verdict = await_pump_drain(pump_handle.take(), config, shard_id).await;
     if let Some(watchdog) = shutdown_watchdog.take() {
         let _ = watchdog.await;

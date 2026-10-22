@@ -41,9 +41,9 @@ use message_bus::installer::ConnectionInstaller;
 use message_bus::installer::conn_info::ClientConnMeta;
 use message_bus::replica::listener::MessageHandler;
 use message_bus::{
-    BusMessage, ClientConnectionLostFn, ClientForwardFn, ConnectionLostFn, ConnectionPermit,
-    ConnectionRegistry, InstanceToken, JoinHandle, MessageBus, ReplicaForwardFn,
-    ReplicaHandshakeDoneFn, SendError, SharedTlsServerConfig,
+    BusMessage, ClientConnectionLostFn, ConnectionLostFn, ConnectionPermit, ConnectionRegistry,
+    InstanceToken, JoinHandle, MessageBus, ReplicaForwardFn, ReplicaHandshakeDoneFn, SendError,
+    SharedTlsServerConfig,
 };
 use metadata::impls::metadata::{IggySnapshot, StreamsFrontend};
 use metadata::stm::StateMachine as _;
@@ -180,7 +180,6 @@ impl MessageBus for SpyBus {
     }
     fn set_connection_lost_fn(&self, _f: ConnectionLostFn) {}
     fn set_replica_forward_fn(&self, _f: ReplicaForwardFn) {}
-    fn set_client_forward_fn(&self, _f: ClientForwardFn) {}
 }
 
 impl ConnectionInstaller for SpyBus {

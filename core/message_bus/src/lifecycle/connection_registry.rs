@@ -163,12 +163,15 @@ impl ReplyTarget {
 /// so the caller can decode the request id and fire the matching oneshot
 /// via [`ConnectionRegistry::fire_in_process`], keeping that decode off the
 /// socket path. `NoSlot` means no entry matches the captured installation.
+/// `Stalled` means a waiting send found no room within its stall timeout: the
+/// reply is dropped and its connection closed.
 #[derive(Debug)]
 #[must_use]
 pub enum ReplyRoute {
     Delivered(Result<(), async_channel::TrySendError<BusMessage>>),
     InProcess(BusMessage),
     NoSlot(BusMessage),
+    Stalled,
 }
 
 /// Rejection reasons for [`ConnectionRegistry::install_reply_slot`].
@@ -248,7 +251,8 @@ struct Entry {
     /// would close the broadcast channel and falsely wake readers waiting
     /// on `conn_token.wait()`. Triggered by
     /// [`ConnectionRegistry::try_send_to_instance`] when a client connection's
-    /// queue refuses a reply; implicitly dropped on entry removal.
+    /// queue refuses a reply, and by [`ConnectionRegistry::send_to_instance`]
+    /// when it stalls. Dropped with the entry.
     conn_shutdown: super::Shutdown,
 }
 
@@ -326,16 +330,6 @@ where
             .map(f)
     }
 
-    /// Route `msg` by `key` alone, handing it back when no target accepts it.
-    ///
-    /// Both socket and in-process targets require the installation captured
-    /// at admission, so this returns [`ReplyRoute::NoSlot`]. A request's
-    /// client id alone cannot identify the connection or HTTP waiter that
-    /// owns its reply.
-    pub fn try_send_or_return(&self, key: K, msg: BusMessage) -> ReplyRoute {
-        self.route_reply(key, None, msg)
-    }
-
     /// Route `msg` to the installation `instance` names, handing it back when
     /// no live target accepts it.
     ///
@@ -367,21 +361,39 @@ where
         instance: InstanceToken,
         msg: BusMessage,
     ) -> ReplyRoute {
-        self.route_reply(key, Some(instance), msg)
+        let entries = self.entries.borrow();
+        let Some(entry) = entries.get(&key).filter(|entry| entry.token == instance) else {
+            return ReplyRoute::NoSlot(msg);
+        };
+        match &entry.reply {
+            ReplyTarget::Socket(sender) => {
+                let sent = sender.try_send(msg);
+                if matches!(sent, Err(async_channel::TrySendError::Full(_))) {
+                    sender.close();
+                    entry.conn_shutdown.trigger();
+                }
+                ReplyRoute::Delivered(sent)
+            }
+            ReplyTarget::InProcess { .. } => ReplyRoute::InProcess(msg),
+        }
     }
 
-    /// [`Self::try_send_to_instance`] that waits for room in a full socket
-    /// queue instead of closing the connection.
+    /// [`Self::try_send_to_instance`] that waits up to `stall_timeout` for room
+    /// in a full socket queue before it closes the connection.
     ///
     /// The wait ends when the writer takes a frame off the queue, or with
     /// `Closed` when the connection goes away, a reinstall under `key`
-    /// included, because only this installation's queue is waited on.
+    /// included, because only this installation's queue is waited on. A queue
+    /// that stays full for `stall_timeout` belongs to a client that stopped
+    /// reading. The reply is then dropped with [`ReplyRoute::Stalled`] and
+    /// this installation is shut down as a refused reply shuts it down.
     #[allow(clippy::future_not_send)]
     pub async fn send_to_instance(
         &self,
         key: K,
         instance: InstanceToken,
         msg: BusMessage,
+        stall_timeout: Duration,
     ) -> ReplyRoute {
         // Only a full queue clones the `Sender` to wait on it, so a reply that
         // finds room costs no atomic RMW on the channel state.
@@ -398,11 +410,20 @@ where
                 ReplyTarget::InProcess { .. } => return ReplyRoute::InProcess(msg),
             }
         };
+        let Ok(sent) = compio::time::timeout(stall_timeout, sender.send(msg)).await else {
+            sender.close();
+            if let Some(entry) = self
+                .entries
+                .borrow()
+                .get(&key)
+                .filter(|entry| entry.token == instance)
+            {
+                entry.conn_shutdown.trigger();
+            }
+            return ReplyRoute::Stalled;
+        };
         ReplyRoute::Delivered(
-            sender
-                .send(msg)
-                .await
-                .map_err(|async_channel::SendError(msg)| async_channel::TrySendError::Closed(msg)),
+            sent.map_err(|async_channel::SendError(msg)| async_channel::TrySendError::Closed(msg)),
         )
     }
 
@@ -411,27 +432,6 @@ where
     #[must_use]
     pub fn instance(&self, key: K) -> Option<InstanceToken> {
         self.entries.borrow().get(&key).map(|entry| entry.token)
-    }
-
-    fn route_reply(&self, key: K, instance: Option<InstanceToken>, msg: BusMessage) -> ReplyRoute {
-        let entries = self.entries.borrow();
-        let Some(entry) = entries
-            .get(&key)
-            .filter(|entry| instance == Some(entry.token))
-        else {
-            return ReplyRoute::NoSlot(msg);
-        };
-        match &entry.reply {
-            ReplyTarget::Socket(sender) => {
-                let sent = sender.try_send(msg);
-                if matches!(sent, Err(async_channel::TrySendError::Full(_))) {
-                    sender.close();
-                    entry.conn_shutdown.trigger();
-                }
-                ReplyRoute::Delivered(sent)
-            }
-            ReplyTarget::InProcess { .. } => ReplyRoute::InProcess(msg),
-        }
     }
 
     /// Fire the in-process reply registered under `request` for `key`.
@@ -876,8 +876,8 @@ impl ReplicaRegistry {
     /// `msg` back as `Err` when no slot is present.
     ///
     /// Replicas only ever register socket reply targets, so unlike
-    /// [`ConnectionRegistry::try_send_or_return`] (which returns a [`ReplyRoute`]
-    /// also covering the in-process case) this stays a flat
+    /// [`ConnectionRegistry::try_send_to_instance`] (which returns a
+    /// [`ReplyRoute`] also covering the in-process case) this stays a flat
     /// `Result<try-send outcome, BusMessage>`.
     ///
     /// # Errors
@@ -1372,10 +1372,6 @@ mod tests {
             .insert(1u8, tx, writer, reader, dummy_conn_shutdown())
             .expect("insert ok");
 
-        assert!(matches!(
-            reg.try_send_or_return(1u8, make_bus_msg()),
-            ReplyRoute::NoSlot(_)
-        ));
         let outer = reg.try_send_to_instance(1u8, instance, make_bus_msg());
         assert!(matches!(outer, ReplyRoute::Delivered(Ok(()))));
         // Receiver drains the message; closing the writer's rx end via
@@ -1384,15 +1380,14 @@ mod tests {
         assert_eq!(received.total_len(), HEADER_SIZE);
     }
 
-    /// No slot for `key`: the message is handed back to the caller so the
-    /// slow path (or no-op for clients) can decide what to do.
+    /// No slot for `key`: the message is handed back to the caller.
     #[compio::test]
-    async fn try_send_or_return_returns_msg_when_slot_missing() {
+    async fn try_send_to_instance_returns_msg_when_slot_missing() {
         let reg: ConnectionRegistry<u8> = ConnectionRegistry::new();
         let msg = make_bus_msg();
         let original_len = msg.total_len();
 
-        let outcome = reg.try_send_or_return(99u8, msg);
+        let outcome = reg.try_send_to_instance(99u8, InstanceToken(1), msg);
         let ReplyRoute::NoSlot(returned) = outcome else {
             panic!("missing slot should return msg");
         };
@@ -1435,6 +1430,7 @@ mod tests {
     /// full queue until the writer takes a frame, and never closes it.
     #[compio::test]
     async fn send_to_instance_waits_only_for_a_full_queue() {
+        const STALL_TIMEOUT: Duration = Duration::from_secs(30);
         let reg: ConnectionRegistry<u8> = ConnectionRegistry::new();
         let (_shutdown, token) = Shutdown::new();
         let (tx, rx) = async_channel::bounded(1);
@@ -1445,15 +1441,70 @@ mod tests {
             .expect("insert ok");
 
         assert!(matches!(
-            reg.send_to_instance(1u8, instance, make_bus_msg()).await,
+            reg.send_to_instance(1u8, instance, make_bus_msg(), STALL_TIMEOUT)
+                .await,
             ReplyRoute::Delivered(Ok(()))
         ));
-        let mut waiting = pin!(reg.send_to_instance(1u8, instance, make_bus_msg()));
+        let mut waiting = pin!(reg.send_to_instance(1u8, instance, make_bus_msg(), STALL_TIMEOUT));
         assert!(poll!(waiting.as_mut()).is_pending());
         rx.recv().await.expect("the first reply is queued");
         assert!(matches!(waiting.await, ReplyRoute::Delivered(Ok(()))));
         assert_eq!(rx.len(), 1);
         assert!(!rx.is_closed());
+    }
+
+    /// A client that leaves its socket unread keeps its queue full. A reply
+    /// that finds no room within the stall timeout closes that exact
+    /// connection, so the replies and tasks it pins are released, and every
+    /// reply still waiting on that queue ends with `Closed`.
+    #[compio::test]
+    async fn given_stalled_reply_queue_when_waiting_past_stall_timeout_should_close_that_connection()
+     {
+        const STALL: Duration = Duration::from_millis(50);
+        const TEST_BOUND: Duration = Duration::from_secs(5);
+        let reg: ConnectionRegistry<u8> = ConnectionRegistry::new();
+        let (stalled, stalled_rx, stalled_token) = insert_stalled(&reg, 1u8);
+        let (other, other_rx, other_token) = insert_stalled(&reg, 2u8);
+        assert!(matches!(
+            reg.send_to_instance(1u8, stalled, make_bus_msg(), STALL)
+                .await,
+            ReplyRoute::Delivered(Ok(()))
+        ));
+
+        let mut behind = pin!(reg.send_to_instance(1u8, stalled, make_bus_msg(), TEST_BOUND));
+        assert!(poll!(behind.as_mut()).is_pending());
+        let outcome = compio::time::timeout(
+            TEST_BOUND,
+            reg.send_to_instance(1u8, stalled, make_bus_msg(), STALL),
+        )
+        .await
+        .expect("a reply must stop waiting at the stall timeout");
+        assert!(matches!(outcome, ReplyRoute::Stalled));
+        assert!(
+            stalled_token.is_triggered(),
+            "the stalled connection must shut down"
+        );
+        assert!(stalled_rx.is_closed());
+        assert_eq!(
+            stalled_rx.len(),
+            1,
+            "the reply queued before the stall stays for the writer"
+        );
+        assert!(matches!(
+            behind.await,
+            ReplyRoute::Delivered(Err(async_channel::TrySendError::Closed(_)))
+        ));
+
+        assert!(
+            !other_token.is_triggered(),
+            "an unrelated connection must stay open"
+        );
+        assert!(matches!(
+            reg.send_to_instance(2u8, other, make_bus_msg(), STALL)
+                .await,
+            ReplyRoute::Delivered(Ok(()))
+        ));
+        assert_eq!(other_rx.len(), 1);
     }
 
     /// A refused reply leaves its request unanswered, so the refusal must
@@ -1573,7 +1624,7 @@ mod tests {
         (token, rx, conn_token)
     }
 
-    /// Mirror of `try_send_or_return_returns_msg_when_slot_missing` for the
+    /// Mirror of `try_send_to_instance_returns_msg_when_slot_missing` for the
     /// fixed-array `ReplicaRegistry`. Guards the slow-path forward in
     /// `send_to_replica` against silent payload loss when no slot exists.
     #[compio::test]
@@ -1594,10 +1645,6 @@ mod tests {
         let instance = reg.insert_in_process(1u8).expect("fresh key");
 
         let (guard, reply_rx) = reg.install_reply_slot(1u8, 42).expect("slot installs");
-        assert!(matches!(
-            reg.try_send_or_return(1u8, make_bus_msg()),
-            ReplyRoute::NoSlot(_)
-        ));
         let msg = match reg.try_send_to_instance(1u8, instance, make_bus_msg()) {
             ReplyRoute::InProcess(msg) => msg,
             other => panic!("expected InProcess route, got {other:?}"),

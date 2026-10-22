@@ -77,8 +77,8 @@ final class SharedFeatureParser
         if ($currentScenario !== null) {
             $scenarios[$currentScenario] = $currentSteps;
         }
-        if ($backgroundSteps === [] || $scenarios === []) {
-            throw new RuntimeException("feature must contain a background and at least one scenario: {$featureFile}");
+        if ($scenarios === []) {
+            throw new RuntimeException("feature must contain at least one scenario: {$featureFile}");
         }
 
         $cases = [];

@@ -3767,18 +3767,19 @@ where
             let reply_buffers = freeze_client_reply(generic_reply);
             emit_sim_event(SimEventKind::ClientReplyEmitted, &event);
 
+            // The production bus refuses it, and a resend gets the cached reply.
             if let Err(e) = consensus
                 .message_bus()
                 .send_to_client(event.client_id, reply_buffers)
                 .await
             {
-                error!(
+                debug!(
                     client = event.client_id,
                     op = event.op,
                     request_id = event.request_id,
                     operation = ?event.operation,
                     %e,
-                    "client reply forward failed, no retransmit path; client will time out",
+                    "client reply has no route by client id",
                 );
             }
         }
@@ -4288,7 +4289,7 @@ where
         eligible: &[bool],
         after: Option<IggyNamespace>,
     ) -> Option<PartitionPrimaryTransfer> {
-        self.placement.borrow().primary_rebalance_candidate(
+        self.placement.borrow_mut().primary_rebalance_candidate(
             self.mux_stm.streams(),
             self.consensus.as_ref()?.replica_count(),
             eligible,
@@ -5446,7 +5447,9 @@ mod tests {
     use crate::stm::StateHandler;
     use crate::stm::authz::GatedApply;
     use crate::stm::consumer_group::JoinConsumerGroupRequest;
-    use crate::stm::lifecycle::{CompleteLifecycleRequest, LifecycleCompletion};
+    use crate::stm::lifecycle::{
+        CompleteLifecycleRequest, LifecycleCompletion, apply_with_lifecycle_completion,
+    };
     use crate::stm::stream::{Streams, StreamsInner};
     use crate::stm::user::{PAT_TOKEN_HASH_BYTES, Users, UsersInner};
     use consensus::{HistoryRecovery, LocalPipeline};
@@ -5463,9 +5466,7 @@ mod tests {
     use iggy_common::{IggyTimestamp, UserStatus, variadic};
     use journal::prepare_journal::{DEFAULT_SLOT_COUNT, PrepareJournal};
     use journal::superblock::SuperblockContents;
-    use message_bus::{
-        BusMessage, ClientForwardFn, ConnectionLostFn, JoinHandle, ReplicaForwardFn, SendError,
-    };
+    use message_bus::{BusMessage, ConnectionLostFn, JoinHandle, ReplicaForwardFn, SendError};
     use server_common::MESSAGE_ALIGN;
     use server_common::iobuf::Frozen;
     use std::cell::RefCell;
@@ -6115,7 +6116,6 @@ mod tests {
         }
         fn set_connection_lost_fn(&self, _f: ConnectionLostFn) {}
         fn set_replica_forward_fn(&self, _f: ReplicaForwardFn) {}
-        fn set_client_forward_fn(&self, _f: ClientForwardFn) {}
     }
 
     /// Single-node metadata plane whose `prepare_request` is callable. `J` is
@@ -6524,17 +6524,17 @@ mod tests {
     #[test]
     fn given_partition_observations_when_creating_should_keep_highest_matching_incarnation() {
         let mut metadata = placement_metadata();
-        let mut streams = stream_with_one_partition();
-        let partition = &mut streams
+        let streams = stream_with_one_partition_in_view(2);
+        let revision = streams
             .items
-            .get_mut(0)
+            .get(0)
             .unwrap()
             .topics
-            .get_mut(0)
+            .get(0)
             .unwrap()
-            .partitions[0];
-        partition.created_revision = 7;
-        partition.created_view = 2;
+            .partitions[0]
+            .created_revision;
+        let mut recreated = streams.clone();
         metadata.mux_stm = Rc::new(TestMux::new((
             users_with_topic_manager(),
             (streams.into(), ()),
@@ -6543,22 +6543,22 @@ mod tests {
         metadata.observe_partition_views(&[
             PartitionPlacementView {
                 namespace,
-                created_revision: 7,
+                created_revision: revision,
                 view: 6,
             },
             PartitionPlacementView {
                 namespace,
-                created_revision: 7,
+                created_revision: revision,
                 view: 4,
             },
             PartitionPlacementView {
                 namespace,
-                created_revision: 6,
+                created_revision: revision - 1,
                 view: 100,
             },
             PartitionPlacementView {
                 namespace,
-                created_revision: 8,
+                created_revision: revision + 1,
                 view: 101,
             },
         ]);
@@ -6576,24 +6576,26 @@ mod tests {
             .unwrap();
         assert_eq!(assigned_views(&unchanged), [1]);
 
-        let mut recreated = stream_with_one_partition();
-        let partition = &mut recreated
-            .items
-            .get_mut(0)
-            .unwrap()
-            .topics
-            .get_mut(0)
-            .unwrap()
-            .partitions[0];
-        partition.created_revision = 8;
-        partition.created_view = 2;
+        assert_eq!(
+            apply_with_lifecycle_completion(
+                &DeleteTopicRequest {
+                    stream_id: WireIdentifier::numeric(0),
+                    topic_id: WireIdentifier::numeric(0),
+                },
+                &mut recreated,
+                IggyTimestamp::now(),
+            )
+            .code,
+            0
+        );
+        create_topic_in_view(&mut recreated, 2);
         metadata.mux_stm = Rc::new(TestMux::new((
             users_with_topic_manager(),
             (recreated.into(), ()),
         )));
         metadata.observe_partition_views(&[PartitionPlacementView {
             namespace,
-            created_revision: 7,
+            created_revision: revision,
             view: 102,
         }]);
         let next = metadata
@@ -6902,7 +6904,6 @@ mod tests {
         }
         fn set_connection_lost_fn(&self, _f: ConnectionLostFn) {}
         fn set_replica_forward_fn(&self, _f: ReplicaForwardFn) {}
-        fn set_client_forward_fn(&self, _f: ClientForwardFn) {}
     }
 
     /// Bus that records the client id of every `send_to_client`.
@@ -6933,7 +6934,6 @@ mod tests {
         }
         fn set_connection_lost_fn(&self, _f: ConnectionLostFn) {}
         fn set_replica_forward_fn(&self, _f: ReplicaForwardFn) {}
-        fn set_client_forward_fn(&self, _f: ClientForwardFn) {}
     }
 
     /// A view change or a boot re-pipeline rebuilds a pending expired-token
@@ -7885,16 +7885,25 @@ mod tests {
 
     /// Stream 0 holding one topic with one partition.
     fn stream_with_one_partition() -> StreamsInner {
+        stream_with_one_partition_in_view(0)
+    }
+
+    fn stream_with_one_partition_in_view(view: u32) -> StreamsInner {
         let mut inner = StreamsInner::new();
-        let timestamp = IggyTimestamp::now();
         let _ = StateHandler::apply(
             &CreateStreamRequest {
                 name: WireName::new("stream").unwrap(),
                 options: WireOptions::empty(),
             },
             &mut inner,
-            timestamp,
+            IggyTimestamp::now(),
         );
+        create_topic_in_view(&mut inner, view);
+        inner
+    }
+
+    /// Topic "existing" in stream 0, with one partition created in `view`.
+    fn create_topic_in_view(inner: &mut StreamsInner, view: u32) {
         let _ = StateHandler::apply(
             &PersistedCreateTopicRequest {
                 request: CreateTopicRequest {
@@ -7907,13 +7916,12 @@ mod tests {
                 partitions: vec![CreatedPartitionAssignment {
                     partition_id: 0,
                     consensus_group_id: 1,
-                    initial_view: 0,
+                    initial_view: view,
                 }],
             },
-            &mut inner,
-            timestamp,
+            inner,
+            IggyTimestamp::now(),
         );
-        inner
     }
 
     #[test]
@@ -8386,7 +8394,6 @@ mod tests {
         }
         fn set_connection_lost_fn(&self, _f: ConnectionLostFn) {}
         fn set_replica_forward_fn(&self, _f: ReplicaForwardFn) {}
-        fn set_client_forward_fn(&self, _f: ClientForwardFn) {}
     }
 
     /// `(target replica, op, prepare checksum)` of every `PrepareOk` sent on `bus`.

@@ -33,7 +33,7 @@ use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_enum, gen_stub_py
 use pyo3_stub_gen::{PyStubType, TypeInfo};
 use tokio::sync::{RwLock, Semaphore};
 
-use crate::client::to_runtime_error;
+use crate::client::{PyIggyError, to_runtime_error};
 use crate::duration::{duration_repr, iggy_duration_to_py_delta, py_delta_to_iggy_duration};
 use crate::partitioning::Partitioning;
 use crate::send_message::{SendMessage, SendMessagesConfirmation, SendMessagesResponse};
@@ -388,9 +388,10 @@ impl BackgroundProducerConfig {
     }
 }
 
-/// A direct producer error that preserves partial-send recovery state.
+/// A direct producer error that preserves partial-send recovery state. Its
+/// `__cause__` is the `IggyError` that ended the send.
 #[gen_stub_pyclass]
-#[pyclass(frozen, extends=PyRuntimeError)]
+#[pyclass(frozen, extends=PyIggyError)]
 pub struct ProducerSendError {
     cause: String,
     operation_id: Option<u64>,
@@ -448,6 +449,7 @@ impl ProducerSendError {
 
 impl ProducerSendError {
     fn new_err(
+        coded: PyIggyError,
         cause: IggyError,
         failed: Arc<Vec<RustIggyMessage>>,
         uncertain: usize,
@@ -460,13 +462,13 @@ impl ProducerSendError {
             let cause_error = to_runtime_error(cause);
             let instance = match Bound::new(
                 py,
-                Self {
+                PyClassInitializer::from(coded).add_subclass(Self {
                     cause: cause_message,
                     operation_id,
                     failed,
                     uncertain,
                     committed,
-                },
+                }),
             ) {
                 Ok(instance) => instance,
                 Err(error) => return error,
@@ -855,6 +857,7 @@ fn clone_rust_message(message: &SendMessage) -> RustIggyMessage {
 }
 
 fn to_send_error(error: IggyError) -> PyErr {
+    let coded = PyIggyError::from(&error);
     match error {
         IggyError::ProducerSendFailed {
             cause,
@@ -862,7 +865,7 @@ fn to_send_error(error: IggyError) -> PyErr {
             uncertain,
             committed,
             ..
-        } => ProducerSendError::new_err(*cause, failed, uncertain, committed),
+        } => ProducerSendError::new_err(coded, *cause, failed, uncertain, committed),
         error => to_runtime_error(error),
     }
 }
@@ -967,8 +970,9 @@ mod tests {
                     _ => None,
                 };
                 let cause_message = cause.to_string();
+                let cause_code = cause.as_code();
                 let uncertain = usize::from(matches!(cause, IggyError::OperationUncertain(_)));
-                let error = to_send_error(IggyError::ProducerSendFailed {
+                let send_failed = IggyError::ProducerSendFailed {
                     cause: Box::new(cause),
                     failed: Arc::new(vec![RustIggyMessage::from_str("failed").unwrap()]),
                     uncertain,
@@ -980,10 +984,22 @@ mod tests {
                     }]),
                     stream_name: "stream".into(),
                     topic_name: "topic".into(),
-                });
+                };
+                let code = send_failed.as_code();
+                let error = to_send_error(send_failed);
 
                 assert!(error.is_instance_of::<ProducerSendError>(py));
+                assert!(error.is_instance_of::<PyIggyError>(py));
                 assert!(error.is_instance_of::<PyRuntimeError>(py));
+                assert_eq!(
+                    error
+                        .value(py)
+                        .getattr("code")
+                        .unwrap()
+                        .extract::<u32>()
+                        .unwrap(),
+                    code
+                );
                 assert_eq!(
                     error
                         .value(py)
@@ -1046,7 +1062,17 @@ mod tests {
                         operation_id
                     );
                 }
+                assert!(source.is_instance_of::<PyIggyError>(py));
                 assert!(source.is_instance_of::<PyRuntimeError>(py));
+                assert_eq!(
+                    source
+                        .value(py)
+                        .getattr("code")
+                        .unwrap()
+                        .extract::<u32>()
+                        .unwrap(),
+                    cause_code
+                );
                 assert_eq!(
                     source.value(py).str().unwrap().to_str().unwrap(),
                     cause_message

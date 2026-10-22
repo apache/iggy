@@ -300,6 +300,51 @@ public class BasicMessagingSteps {
         assertEquals(IggyErrorCode.INVALID_COMMAND, error.getErrorCode());
     }
 
+    @Given("I have a cluster node that cannot reach quorum")
+    public void clusterNodeWithoutQuorum() {
+        HostPort hostPort = HostPort.parse(TestEnvironment.noQuorumAddress());
+
+        IggyTcpClient client =
+                IggyTcpClient.builder().host(hostPort.host).port(hostPort.port).build();
+
+        client.connect();
+        context.client = client;
+    }
+
+    @When("I sign out")
+    public void signOut() {
+        getClient().users().logout();
+    }
+
+    @When("I request the stream with ID {int}")
+    public void requestStream(int streamId) {
+        recordCallError(() -> getClient().streams().getStream((long) streamId));
+    }
+
+    @When("I sign in to that node as the root user")
+    public void signInToNode() {
+        recordCallError(
+                () -> getClient().users().login(TestEnvironment.rootUsername(), TestEnvironment.rootPassword()));
+    }
+
+    @Then("the call should fail with error code {int}")
+    public void callFailsWithCode(int code) {
+        assertTrue(
+                context.lastCallError instanceof IggyServerException,
+                "Expected an Iggy server error, got " + context.lastCallError);
+        IggyServerException error = (IggyServerException) context.lastCallError;
+        assertEquals(code, error.getRawErrorCode());
+    }
+
+    private void recordCallError(Runnable call) {
+        try {
+            call.run();
+            context.lastCallError = null;
+        } catch (RuntimeException error) {
+            context.lastCallError = error;
+        }
+    }
+
     private IggyBaseClient getClient() {
         if (context.client == null) {
             throw new IllegalStateException("Iggy client not initialized");

@@ -66,6 +66,7 @@ import java.util.concurrent.CompletionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 import java.util.function.Function;
@@ -1316,7 +1317,11 @@ public class AsyncIggyTcpClient {
             }
             previous.whenComplete((prior, priorError) -> gate.complete(null));
             if (error != null) {
-                callerFuture.completeExceptionally(error);
+                Throwable failure = unwrap(error);
+                callerFuture.completeExceptionally(
+                        explicit && (failure instanceof IggyTimeoutException || failure instanceof TimeoutException)
+                                ? AsyncTcpConnection.notAccepted()
+                                : error);
             } else {
                 callerFuture.complete(identity);
             }

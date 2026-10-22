@@ -1882,7 +1882,7 @@ mod tests {
             &root.path().join("prepares-0"),
             namespace.inner(),
             0,
-            journal::durable_storage::DiskStorage,
+            partitions::WalStorage::default(),
             capacity,
             false,
         )

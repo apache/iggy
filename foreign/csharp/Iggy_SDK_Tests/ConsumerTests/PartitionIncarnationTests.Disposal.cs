@@ -119,12 +119,45 @@ public sealed partial class PartitionIncarnationTests
             Assert.Equal(1, owner.DisposeCount);
         }
         await consumer.DisposeAsync();
-        Assert.Equal(mode == AutoCommitMode.Disabled ? [] : [(0ul, Original)], stores);
-        Assert.Equal(mode == AutoCommitMode.Disabled ? ["leave", "logout", "dispose"] : ["store", "leave", "logout", "dispose"], events);
+        Assert.Equal(mode == AutoCommitMode.Auto ? [(0ul, Original)] : [], stores);
+        Assert.Equal(mode == AutoCommitMode.Auto ? ["store", "leave", "logout", "dispose"] : ["leave", "logout", "dispose"], events);
         if (receive == "plain")
         {
             rental.Dispose();
         }
+    }
+
+    [Fact]
+    public async Task given_after_receive_when_a_loop_body_throws_should_not_commit_its_message_on_dispose()
+    {
+        var stores = new ConcurrentQueue<(ulong Offset, PartitionContext Context)>();
+        var client = ClientMock(stores);
+        client.Setup(mock => mock.PollMessagesAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(),
+                It.IsAny<uint?>(), It.IsAny<Consumer>(), It.IsAny<Func<uint, PollingStrategy>>(), It.IsAny<uint>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new PolledMessages
+            {
+                Context = Original,
+                PartitionId = PartitionId,
+                CurrentOffset = 1,
+                Messages = [.. Batch(0, Original).Messages, .. Batch(1, Original).Messages]
+            });
+        await using var consumer = new IggyConsumer(client.Object, Config(), NullLoggerFactory.Instance);
+        using var timeout = Timeout();
+        await consumer.InitAsync(timeout.Token);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+        {
+            await foreach (var message in consumer.ReceiveAsync(timeout.Token))
+            {
+                if (message.CurrentOffset == 1)
+                {
+                    throw new InvalidOperationException("Processing failed.");
+                }
+            }
+        });
+        await consumer.DisposeAsync();
+
+        Assert.Equal([(0ul, Original)], stores);
     }
 
     [Theory]
@@ -147,7 +180,7 @@ public sealed partial class PartitionIncarnationTests
                 events.Enqueue("store");
                 return alreadyStored ? Task.CompletedTask : Task.FromException(new IOException("Checkpoint failed."));
             });
-        var config = Config();
+        var config = Config(AutoCommitMode.Auto);
         config.Consumer = Consumer.Group("group");
         await using var consumer = new IggyConsumer(client.Object, config, NullLoggerFactory.Instance);
         using var timeout = Timeout();

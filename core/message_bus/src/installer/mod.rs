@@ -175,8 +175,8 @@ pub trait ConnectionInstaller {
     ) -> impl Future<Output = Result<(), SendError>>;
 
     /// [`Self::send_to_client_instance`] that waits for room in a full queue
-    /// instead of closing the connection. A bus whose queues never fill
-    /// sends at once.
+    /// instead of closing the connection, until the bus's write stall timeout
+    /// closes it. A bus whose queues never fill sends at once.
     fn send_to_client_instance_waiting(
         &self,
         client_id: u128,

@@ -422,6 +422,17 @@ func appendCommandFrame(buf []byte, cmd command.Command) ([]byte, error) {
 }
 
 func (c *IggyTcpClient) Connect(ctx context.Context) error {
+	err := c.connect(ctx)
+	var refusal *signInRefusal
+	if errors.As(err, &refusal) {
+		return refusal.err
+	}
+	return err
+}
+
+// connect is Connect, except that a refused sign-in stays a signInRefusal, so
+// the recovery and the calls that wait for the attempt can tell it apart.
+func (c *IggyTcpClient) connect(ctx context.Context) error {
 	if ctx == nil {
 		return ierror.ErrNilContext
 	}
@@ -463,9 +474,7 @@ func (c *IggyTcpClient) Connect(ctx context.Context) error {
 		}
 	}
 	var refusal *signInRefusal
-	if errors.As(err, &refusal) {
-		err = refusal.err
-	} else if ended := epoch.err(); ended != nil {
+	if ended := epoch.err(); ended != nil && !errors.As(err, &refusal) {
 		err = ended
 	}
 	c.connectMu.Lock()

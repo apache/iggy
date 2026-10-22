@@ -256,10 +256,7 @@ class AsyncIggyTcpClientFailoverSignInTest {
 
                 AsyncIggyTcpClientSessionRulesTest.assertEndedByTheRefusal(first, refusal);
                 AsyncIggyTcpClientSessionRulesTest.assertEndedByTheRefusal(second, refusal);
-                assertThatThrownBy(() -> client.sendBinaryRequest(GET_STATS_CODE, new byte[0])
-                                .get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS))
-                        .cause()
-                        .isInstanceOf(IggyNotConnectedException.class);
+                AsyncIggyTcpClientSessionRulesTest.assertSignedOut(client);
                 assertThat(survivorSignIns)
                         .as("the sign-ins with the refused token")
                         .hasValue(1);

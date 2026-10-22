@@ -103,6 +103,29 @@ func TestConnectBoundsSilentSignInWithoutCallerDeadline(t *testing.T) {
 	})
 }
 
+func TestExplicitSilentSignInFailsAsNotAcceptedAtItsDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		serverConnection, connection := net.Pipe()
+		defer func() { _ = serverConnection.Close() }()
+		client := newTestClient(t, connection)
+		server := serve(serverConnection, func(_ int, read request) []byte { return nil })
+		done := make(chan error, 1)
+		go func() {
+			_, err := client.LoginUser(context.Background(), "iggy", "secret")
+			done <- err
+		}()
+		time.Sleep(responseReadTimeout)
+		synctest.Wait()
+		select {
+		case err := <-done:
+			require.ErrorIs(t, err, ierror.ErrTransientNotAccepted)
+		default:
+			t.Fatal("LoginUser outlived its sign-in deadline")
+		}
+		require.Len(t, server.recorded(), 1)
+	})
+}
+
 func TestConnectDoesNotSpendSignInBudgetWaitingForDial(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		client := newDialingClient(t, "127.0.0.1:1")
@@ -797,6 +820,56 @@ func TestCallsThatStartDuringConnectWaitForItsSession(t *testing.T) {
 	for _, call := range calls {
 		require.Equal(t, managedLinkSession, call.sessionID(), "the call goes out under the new session")
 	}
+}
+
+// The server refuses the sign-in of Connect for a reason other than its
+// credentials. Connect returns the refusal, and the calls that wait for it end
+// with 58 and the refusal as their cause. The client keeps its sign-in.
+func TestCallsThatWaitForAConnectRefusedForAnotherReasonEndWith58(t *testing.T) {
+	registered, release := make(chan struct{}), make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(release) })
+	defer unblock()
+	newerProtocol := vsr.ProtocolVersion + 1
+	var refused atomic.Bool
+	var server *testListener
+	server = listenVSR(t, nil, func(_, _ int, read request) []byte {
+		if read.operation() == vsr.OperationRegister && refused.CompareAndSwap(false, true) {
+			close(registered)
+			<-release
+			return evictionFrame(vsr.EvictionIncompatibleProtocol, newerProtocol, newerProtocol)
+		}
+		return singleNodeHandler(t, func() string { return server.address() })(0, 0, read)
+	})
+	client := newDialingClient(t, server.address(), WithAutoLogin(NewUsernamePasswordCredentials("iggy", "iggy")))
+	epoch := client.epoch.Load()
+	connected := make(chan error, 1)
+	go func() { connected <- client.Connect(context.Background()) }()
+	<-registered
+	ctx, cancel := context.WithTimeout(context.Background(), managedLinkTestBudget)
+	defer cancel()
+	created, pinged := make(chan error, 1), make(chan error, 1)
+	go func() {
+		_, err := client.do(ctx, &command.CreateStream{Name: "waiting"})
+		created <- err
+	}()
+	go func() { pinged <- client.Ping(ctx) }()
+	require.Never(t, func() bool { return len(created) != 0 || len(pinged) != 0 }, recoveryWaitDeadline, managedLinkPoll,
+		"the calls wait for the session of the Connect")
+
+	unblock()
+	err := <-connected
+	var refusal ierror.IggyError
+	require.ErrorAs(t, err, &refusal)
+	require.Equal(t, ierror.IncompatibleProtocolVersionCode, refusal.Code(), "Connect returns its own refusal")
+	for _, call := range []chan error{created, pinged} {
+		err := <-call
+		require.ErrorIs(t, err, ierror.ErrTransientNotAccepted)
+		require.ErrorIs(t, err, ierror.ErrIncompatibleProtocolVersion, "the call keeps the refusal as its cause")
+	}
+	require.Same(t, epoch, client.epoch.Load(), "the refusal keeps the epoch")
+	require.Empty(t, createStreams(server.recorded()), "the create never went out")
+	require.NoError(t, client.Connect(ctx), "the client keeps its sign-in")
+	require.True(t, sessionBound(client))
 }
 
 func TestLoginUserRacingDisconnectCannotRememberItsCredentials(t *testing.T) {

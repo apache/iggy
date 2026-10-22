@@ -227,8 +227,13 @@ fn allowed_cores_cpu_usage(sys: &System, allowed: &[usize]) -> Option<f32> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::sync::Mutex;
+
     use sysinfo::{Pid, ProcessesToUpdate};
+
+    use super::*;
+
+    static OPEN_FILES_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn given_fresh_system_when_capturing_probe_should_sample_own_process() {
@@ -257,6 +262,7 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn given_extra_open_files_when_counting_should_include_them() {
+        let _guard = OPEN_FILES_TEST_LOCK.lock().unwrap();
         const EXTRA: u64 = 64;
         let manifest = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
         let before = count_open_files().expect("open files countable");
@@ -274,6 +280,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn given_fd_dir_size_when_kernel_reports_it_should_match_the_scan() {
+        let _guard = OPEN_FILES_TEST_LOCK.lock().unwrap();
         let Some(from_size) = count_open_files_without_scan() else {
             return;
         };

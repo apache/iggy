@@ -1148,6 +1148,20 @@ peer_queue_capacity = 4096
 # connection whose outbound queue is full.
 client_queue_capacity = 256
 
+# How long a reply waits for room in a connection's outbound queue before the
+# server closes that connection. The queue stays full only while the client
+# leaves its socket unread, so this bounds how long such a client pins its
+# queued replies and request tasks. The client then reconnects and recovers
+# its session. Must be > 0.
+client_write_stall_timeout = "30 s"
+
+# Bytes of requests that wait in the per-connection queue of 1024 described
+# above. A request that would take the queue past it gets the same retryable
+# error 58, unless the queue is empty, so one request of any legal size always
+# fits. The default holds the 256 requests one connection runs at once at
+# 1 MiB each. Must be > 0.
+client_request_queue_bytes_max = "256 MiB"
+
 # Interval between outbound reconnect attempts to peers with peer_id > self_id.
 # Also bounds each dial, so a peer that drops SYNs cannot stall the sweep.
 reconnect_period = "1 s"

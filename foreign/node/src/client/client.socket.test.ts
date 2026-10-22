@@ -55,8 +55,7 @@ import { VsrEvictionError } from '../wire/vsr/reply.js';
 import { IggyConnection, type LinkAttempt } from './client.connection.js';
 import { OPERATION_TIMEOUT_MS } from './client.operation.js';
 import {
-  CommandResponseStream, LaneBlockedError, NotConnectedError, OperationNotRetainedError, OperationUncertainError,
-  VsrResponseTimeoutError
+  CommandResponseStream, LaneBlockedError, NotConnectedError, OperationNotRetainedError, OperationUncertainError
 } from './client.socket.js';
 import type { ClientConfig } from './client.type.js';
 import { SimpleClient } from './client.js';
@@ -1006,7 +1005,7 @@ describe('primary auto-commit polling', () => {
         await assert.rejects(first, (error: unknown) =>
           failure === 'stale session'
             ? error instanceof ResponseError && error.errorCode === STALE_CLIENT
-            : error instanceof OperationUncertainError && error.operationId === undefined);
+            : error instanceof ResponseError && error.errorCode === TRANSIENT_NOT_COMMITTED);
         assert.equal(polls, 1);
         assert.equal(resets, 0);
         if (failure === 'partial reply') {
@@ -1219,7 +1218,7 @@ describe('primary auto-commit polling', () => {
     try {
       const polling = cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
       const failed = assert.rejects(polling, (error: unknown) =>
-        error instanceof OperationUncertainError && error.operationId === undefined);
+        error instanceof ResponseError && error.errorCode === TRANSIENT_NOT_COMMITTED);
       await pendingAdmission;
       await cluster.client.sendCommand(LOGOUT.code, LOGOUT.serialize());
       await failed;
@@ -3560,7 +3559,7 @@ describe('native mutation recovery', () => {
 
   for (const strategy of ['auto-commit', 'Next'] as const) {
     for (const failure of ['not committed', 'cancel'] as const) {
-      it(`ends uncertain ${strategy} polls after ${failure} and releases the transient lane`, async () => {
+      it(`ends uncertain ${strategy} polls with 57 after ${failure} and releases the transient lane`, async () => {
         const cancel = new AbortController();
         let polls = 0;
         const cluster = await startPollCluster((frame, socket) => {
@@ -3576,7 +3575,8 @@ describe('native mutation recovery', () => {
           autocommit: strategy === 'auto-commit' });
         try {
           await assert.rejects(cluster.client.sendCommand(COMMAND_CODE.PollMessages, body,
-            { signal: cancel.signal }), (error: unknown) => error instanceof OperationUncertainError && error.operationId === undefined);
+            { signal: cancel.signal }), (error: unknown) => error instanceof ResponseError &&
+            error.errorCode === TRANSIENT_NOT_COMMITTED);
           assert.equal(polls, 1);
           await cluster.client.sendCommand(COMMAND_CODE.SendMessages, explicitSend);
         } finally { await cluster.close(); }
@@ -3884,7 +3884,8 @@ describe('native replica and selection lifecycle', () => {
     const client = new CommandResponseStream(vsrConfig(server.port));
     try {
       await client.authenticate(vsrConfig(server.port).credentials);
-      await assert.rejects(client.sendCommand(LOGIN.code, LOGIN.serialize({ username: 'other', password: 'secret' })), OperationUncertainError);
+      await assert.rejects(client.sendCommand(LOGIN.code, LOGIN.serialize({ username: 'other', password: 'secret' })),
+        (error: unknown) => error instanceof ResponseError && error.errorCode === TRANSIENT_NOT_COMMITTED);
       assert.equal(framesOf(server, Operation.Register).length, 1);
       assert.equal(framesOf(server, Operation.Logout).length, 1);
     } finally { client.destroy(); await server.close(); }
@@ -4037,6 +4038,30 @@ describe('native retry pacing', () => {
       assert.equal(random.mock.callCount(), 2, 'a new 89 after a different refusal is immediate again');
       for (const frame of mutations) assert.deepEqual(frame, mutations[0]);
     } finally { context.mock.timers.reset(); client.destroy(); await server.close(); }
+  });
+
+  it('ends a call that gets 89 until its deadline with 58', async (context) => {
+    const server = await startVsrServer((frame, socket) => singleNodeHandler(server.port)(frame, socket));
+    const client = new CommandResponseStream({ ...vsrConfig(server.port), heartbeatInterval: 0 });
+    let lookups = 0;
+    let refusals = 0;
+    try {
+      await client.authenticate(vsrConfig(server.port).credentials);
+      context.mock.method(IggyConnection.prototype, 'exchange', async (encode: () => Buffer): Promise<LinkAttempt> => {
+        const frame = encode();
+        if (frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.GetPartitionRoute) {
+          const route = routingBody(1n, 1n, 0);
+          route.writeUInt32LE(lookups++, 16);
+          return { started: true, response: replyFrame(frame, Operation.NonReplicated, route) };
+        }
+        refusals += 1;
+        return { started: true, response: replyFrame(frame, Operation.StoreConsumerOffset, Buffer.alloc(0), 89) };
+      });
+      await assert.rejects(client.sendCommand(COMMAND_CODE.StoreOffset, storeOffsetPayload,
+        { deadline: Date.now() + 300 }), (error: unknown) => error instanceof ResponseError &&
+        error.errorCode === TRANSIENT_NOT_ACCEPTED && error.fromServer);
+      assert.ok(refusals > 1);
+    } finally { client.destroy(); await server.close(); }
   });
 
   for (const [sample, delays] of [
@@ -5158,7 +5183,8 @@ describe('explicit sign-in ownership', () => {
           { deadline: Date.now() + 150, signal: abort.signal }).catch((error: unknown) => error);
         if (typeof failure === 'number') assert.ok(error instanceof ResponseError && error.errorCode === failure);
         else if (failure === 'eviction') assert.ok(error instanceof VsrEvictionError);
-        else if (failure === 'timeout') assert.ok(error instanceof VsrResponseTimeoutError);
+        else if (failure === 'timeout') assert.ok(error instanceof ResponseError &&
+          error.errorCode === TRANSIENT_NOT_ACCEPTED);
         else assert.equal(error, failure === 'cancel' ? cancellation : configuration);
         dial?.mock.restore();
         refuse = false;
@@ -5214,7 +5240,7 @@ describe('explicit sign-in ownership', () => {
       const queued = client.sendCommand(LOGIN.code, LOGIN.serialize(caller), { deadline: Date.now() + 50 })
         .catch((error: unknown) => { failure = error; });
       await waitUntil(() => failure !== undefined);
-      assert.ok(failure instanceof VsrResponseTimeoutError);
+      assert.ok(failure instanceof ResponseError && failure.errorCode === TRANSIENT_NOT_ACCEPTED);
       held!();
       await queued;
       assert.ok(isSignedOut(await older));
@@ -5259,7 +5285,8 @@ describe('explicit sign-in ownership', () => {
           { deadline: Date.now() + 100, signal: abort.signal }).catch((error: unknown) => error);
         if (failure === 'refusal') assert.ok(error instanceof ResponseError && error.errorCode === LIFECYCLE_BUSY);
         else if (failure === 'closed link') assert.ok(error instanceof Error && error.message === CLOSED_LINK);
-        else if (failure === 'timeout') assert.ok(error instanceof VsrResponseTimeoutError);
+        else if (failure === 'timeout') assert.ok(error instanceof ResponseError &&
+          error.errorCode === TRANSIENT_NOT_ACCEPTED);
         else assert.equal(error, cancellation);
         assert.equal(client.isAuthenticated, false);
         await waitUntil(() => server.sockets.size === 0);
@@ -5605,7 +5632,7 @@ describe('consumer stream', () => {
       await cluster.primary.reopen();
       assert.equal((await ended()).length, 1);
       assert.equal(polls, 2);
-      assert.ok(refusals[0] instanceof OperationUncertainError &&
+      assert.ok(refusals[0] instanceof ResponseError && refusals[0].errorCode === TRANSIENT_NOT_COMMITTED &&
         refusals[0].cause instanceof VsrEvictionError && refusals[0].cause.errorCode === UNAUTHENTICATED,
       String(refusals[0]));
       for (const refusal of refusals.slice(1)) assert.ok(refusal instanceof NotConnectedError, String(refusal));

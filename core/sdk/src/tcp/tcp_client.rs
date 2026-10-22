@@ -1171,6 +1171,18 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn given_an_unanswered_register_when_login_deadline_passes_should_return_58() {
+        let cluster = FakeCluster::new(1);
+        cluster.script(&endpoint(0), LOGIN_REGISTER_CODE, [Answer::Silence]);
+        let client = manual_client(&cluster);
+        let deadline = Instant::now() + Duration::from_millis(10);
+        let result = with_binary_deadline(deadline, client.login_user("iggy", "iggy")).await;
+        assert_eq!(result.unwrap_err(), IggyError::TransientNotAccepted);
+        assert_eq!(cluster.count(LOGIN_REGISTER_CODE), 1);
+        assert!(!client.driver.session().epoch().bound);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn given_stop_during_explicit_login_when_reply_is_pending_should_not_restore_session() {
         for shutdown in [false, true] {
             let cluster = FakeCluster::new(1);

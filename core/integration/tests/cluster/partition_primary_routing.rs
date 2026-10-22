@@ -21,28 +21,35 @@
 //! settle on the metadata leader, so both writes to new partitions and group
 //! polls of existing partitions must reach an owner that can commit progress.
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use super::register_forwarding::connect_without_login;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
+use futures::future::join_all;
 use iggy::prelude::*;
 use iggy_binary_protocol::codes::{
     BIND_SESSION_CODE, GET_CONSUMER_GROUP_CODE, GET_PARTITION_ROUTE_CODE, POLL_MESSAGES_CODE,
-    STORE_CONSUMER_OFFSET_CODE,
+    SEND_MESSAGES_CODE, STORE_CONSUMER_OFFSET_CODE,
 };
 use iggy_binary_protocol::consensus::{RequestHeader, result_code, result_section_len};
 use iggy_binary_protocol::requests::consumer_groups::GetConsumerGroupRequest;
 use iggy_binary_protocol::requests::consumer_offsets::StoreConsumerOffsetRequest;
+use iggy_binary_protocol::requests::messages::send_messages::{RawMessage, SendMessagesEncoder};
 use iggy_binary_protocol::requests::messages::{GetPartitionRouteRequest, PollMessagesRequest};
 use iggy_binary_protocol::requests::system::BindSessionRequest;
 use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::responses::consumer_groups::ConsumerGroupDetailsResponse;
 use iggy_binary_protocol::responses::messages::PartitionRouteResponse;
 use iggy_binary_protocol::{
-    ClientVersionInfo, IGGY_PROTOCOL_VERSION, WireDecode, WireEncode, WireName,
+    ClientVersionInfo, IGGY_PROTOCOL_VERSION, WireDecode, WireEncode, WireIdentifier, WireName,
+    WirePartitioning,
 };
 use iggy_common::locking::IggyRwLockFn;
 use iggy_common::store_consumer_offset::StoreConsumerOffset;
@@ -63,6 +70,7 @@ use reqwest::StatusCode;
 use reqwest::header::RETRY_AFTER;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::runtime;
 use tokio::time::{Instant, sleep, timeout};
 
 use crate::server::http_client::{
@@ -151,6 +159,30 @@ const SEND_BUDGET: Duration = Duration::from_secs(20);
 const PRECONDITION_BUDGET: Duration = Duration::from_secs(20);
 const PRECONDITION_POLL: Duration = Duration::from_millis(500);
 const REBALANCE_BUDGET: Duration = Duration::from_secs(120);
+/// `cluster.heartbeat_timeout` at its default.
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long quorum evidence keeps partition admission open past
+/// `HEARTBEAT_TIMEOUT`, as the server sets it.
+const FRESHNESS_MARGIN: Duration = Duration::from_secs(3);
+/// How long a source primary drains a granted move before it gives the grant
+/// up, as the server sets it.
+const GRANT_TIMEOUT: Duration = Duration::from_secs(1);
+/// The longest pause the SDK takes between two attempts of one call.
+const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(1);
+/// A send that meets a move waits out the source's drain and a retry pause. A
+/// handover that stalls ends in an election after a heartbeat timeout.
+const MOVE_STALL_BOUND: Duration = GRANT_TIMEOUT
+    .saturating_add(HEARTBEAT_TIMEOUT)
+    .saturating_add(RETRY_BACKOFF_MAX);
+/// Logged by a source primary when it hands its partition to the move target.
+const TRANSFER_MARKER: &str = "rebalancing partition primary after target readiness confirmation";
+const READBACK_BATCH: u32 = 1_000;
+/// How late an isolated primary may close admission on a loaded machine.
+const FENCE_SLACK: Duration = Duration::from_secs(2);
+const FENCE_BOUND: Duration = HEARTBEAT_TIMEOUT
+    .saturating_add(FRESHNESS_MARGIN)
+    .saturating_add(FENCE_SLACK);
+const FENCE_PROBE_INTERVAL: Duration = Duration::from_millis(100);
 
 fn message(payload: &str) -> IggyMessage {
     IggyMessage::from_str(payload).expect("build message")
@@ -564,6 +596,464 @@ async fn append_and_assert_partition_sentinels(
     })
     .await
     .expect("every partition must preserve and serve its history across rebalancing");
+}
+
+/// Producers write every partition back to back while the rebalancer moves
+/// primaries to a returning replica. Every acknowledged send stays readable in
+/// send order. A send that ends uncertain is never sent again, so no message
+/// may appear twice. Each send ends acknowledged, uncertain or with the refusal
+/// the SDK retries, and none waits longer than a move can fence its partition.
+#[iggy_harness(cluster_nodes = 3, server(sharding.cpu_allocation = "2"))]
+async fn given_producers_on_every_partition_when_primaries_move_should_keep_acknowledged_order_without_stalls(
+    harness: &mut TestHarness,
+) {
+    const TOPIC_COUNT: usize = 12;
+    const RETURNING_MOVES: usize = 4;
+
+    let client = connect_without_login(harness.node(1).tcp_addr().unwrap()).await;
+    client
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    let identity = client.session_identity().await.unwrap();
+    client.create_stream(STREAM_NAME).await.unwrap();
+    let stream = Identifier::named(STREAM_NAME).unwrap();
+    let options = TopicCreateOptions {
+        partitions_count: Some(1),
+        durability: Durability::Persisted,
+        message_expiry: Some(IggyExpiry::NeverExpire),
+        ..TopicCreateOptions::default()
+    };
+    let mut topics = Vec::with_capacity(TOPIC_COUNT);
+    for index in 0..TOPIC_COUNT {
+        let name = format!("moving-{index}");
+        client.create_topic(&stream, &name, &options).await.unwrap();
+        topics.push(Identifier::named(&name).unwrap());
+    }
+    let mut request = RequestHeader {
+        client: identity.client_id,
+        session: identity.session,
+        request: RAW_REQUEST_START,
+        ..Default::default()
+    };
+    wait_for_balanced_routes(harness, &client, &stream, &topics, &[4; 3], &mut request).await;
+    harness.kill_node(0).unwrap();
+    wait_for_balanced_routes(harness, &client, &stream, &topics, &[0, 6, 6], &mut request).await;
+
+    let producing = Arc::new(AtomicUsize::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let producers = spawn_producers(
+        harness.node(1).tcp_addr().unwrap(),
+        topics.clone(),
+        Arc::clone(&producing),
+        Arc::clone(&stop),
+    );
+    timeout(PRECONDITION_BUDGET, async {
+        while producing.load(Ordering::Acquire) < topics.len() {
+            sleep(PRECONDITION_POLL).await;
+        }
+    })
+    .await
+    .expect("every producer must acknowledge a send before the replica returns");
+    let transfers_before = transfers_started(harness);
+    harness.restart_node(0).unwrap();
+    wait_for_balanced_routes(harness, &client, &stream, &topics, &[4; 3], &mut request).await;
+    let transfers = transfers_started(harness) - transfers_before;
+    stop.store(true, Ordering::Release);
+    let logs = producers.join().expect("producer thread");
+
+    let mut latencies: Vec<Duration> = logs
+        .iter()
+        .flat_map(|log| log.latencies.iter().copied())
+        .collect();
+    latencies.sort_unstable();
+    println!(
+        "{} sends across {transfers} primary moves: {} acknowledged, {} uncertain, {} refused, \
+         {} unexpected; latency p50 {:?}, p99 {:?}, max {:?}",
+        latencies.len(),
+        logs.iter().map(|log| log.acknowledged.len()).sum::<usize>(),
+        logs.iter().map(|log| log.uncertain.len()).sum::<usize>(),
+        logs.iter().map(|log| log.refused.len()).sum::<usize>(),
+        logs.iter().map(|log| log.unexpected.len()).sum::<usize>(),
+        latencies[latencies.len() / 2],
+        latencies[latencies.len() * 99 / 100],
+        latencies[latencies.len() - 1],
+    );
+    assert!(
+        transfers >= RETURNING_MOVES,
+        "the producers ran across {transfers} moves, expected at least {RETURNING_MOVES}"
+    );
+    for (topic, log) in topics.iter().zip(&logs) {
+        let sequences = read_sequences(&client, &stream, topic).await;
+        assert_produced_history(topic, log, &sequences);
+    }
+}
+
+/// What one producer saw of its sends. Sequence `n` is the `n`th send.
+#[derive(Default)]
+struct ProducerLog {
+    acknowledged: Vec<u64>,
+    uncertain: Vec<u64>,
+    refused: Vec<u64>,
+    unexpected: Vec<(u64, IggyError)>,
+    latencies: Vec<Duration>,
+}
+
+/// The producers run on a thread of their own, so a blocking harness call on
+/// the test thread does not stretch their latencies.
+fn spawn_producers(
+    address: SocketAddr,
+    topics: Vec<Identifier>,
+    producing: Arc<AtomicUsize>,
+    stop: Arc<AtomicBool>,
+) -> JoinHandle<Vec<ProducerLog>> {
+    thread::spawn(move || {
+        runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("producer runtime")
+            .block_on(join_all(topics.iter().map(|topic| {
+                produce_until_stopped(address, topic, &producing, &stop)
+            })))
+    })
+}
+
+async fn produce_until_stopped(
+    address: SocketAddr,
+    topic: &Identifier,
+    producing: &AtomicUsize,
+    stop: &AtomicBool,
+) -> ProducerLog {
+    let client = connect_without_login(address).await;
+    client
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    let stream = Identifier::named(STREAM_NAME).unwrap();
+    let partitioning = Partitioning::partition_id(PARTITION_ID);
+    let mut log = ProducerLog::default();
+    let mut sequence = 0;
+    while !stop.load(Ordering::Acquire) {
+        let payload = format!("{topic}:{sequence}");
+        let started = Instant::now();
+        let outcome = client
+            .send_messages(&stream, topic, &partitioning, &mut [message(&payload)])
+            .await;
+        log.latencies.push(started.elapsed());
+        match outcome {
+            Ok(_) => {
+                if log.acknowledged.is_empty() {
+                    producing.fetch_add(1, Ordering::Release);
+                }
+                log.acknowledged.push(sequence);
+            }
+            Err(IggyError::OperationUncertain(operation)) => {
+                client
+                    .abandon_operation(operation)
+                    .await
+                    .expect("free the lane of an uncertain send");
+                log.uncertain.push(sequence);
+            }
+            Err(IggyError::TransientNotAccepted) => log.refused.push(sequence),
+            Err(error) => log.unexpected.push((sequence, error)),
+        }
+        sequence += 1;
+    }
+    log
+}
+
+fn transfers_started(harness: &TestHarness) -> usize {
+    // Node 0 restarts, which truncates its log, and it never moves a primary away.
+    (1..harness.cluster_size())
+        .map(|node| harness.node(node).stdout_occurrences(TRANSFER_MARKER))
+        .sum()
+}
+
+async fn read_sequences(client: &TcpClient, stream: &Identifier, topic: &Identifier) -> Vec<u64> {
+    let mut sequences = Vec::new();
+    let mut offset = 0;
+    loop {
+        let polled = client
+            .poll_messages(
+                stream,
+                topic,
+                Some(PARTITION_ID),
+                &Consumer::default(),
+                &PollingStrategy::offset(offset),
+                READBACK_BATCH,
+                false,
+            )
+            .await
+            .unwrap();
+        let Some(last) = polled.messages.last() else {
+            return sequences;
+        };
+        offset = last.header.offset + 1;
+        for message in &polled.messages {
+            let payload = std::str::from_utf8(&message.payload).expect("a produced payload");
+            let (name, sequence) = payload.rsplit_once(':').expect("a produced payload");
+            assert_eq!(name, topic.to_string());
+            sequences.push(sequence.parse().expect("a produced sequence"));
+        }
+    }
+}
+
+fn assert_produced_history(topic: &Identifier, log: &ProducerLog, sequences: &[u64]) {
+    assert!(
+        log.unexpected.is_empty(),
+        "{topic}: sends ended with errors the SDK does not retry: {:?}",
+        log.unexpected
+    );
+    let stalled: Vec<_> = log
+        .latencies
+        .iter()
+        .enumerate()
+        .filter(|(_, latency)| **latency > MOVE_STALL_BOUND)
+        .collect();
+    assert!(
+        stalled.is_empty(),
+        "{topic}: sends stalled past {MOVE_STALL_BOUND:?}: {stalled:?}"
+    );
+    if let Some(pair) = sequences.windows(2).find(|pair| pair[0] >= pair[1]) {
+        panic!(
+            "{topic}: sequence {} follows {} in the log",
+            pair[1], pair[0]
+        );
+    }
+    let read: HashSet<u64> = sequences.iter().copied().collect();
+    let lost: Vec<_> = log
+        .acknowledged
+        .iter()
+        .filter(|sequence| !read.contains(sequence))
+        .collect();
+    assert!(
+        lost.is_empty(),
+        "{topic}: acknowledged sends lost: {lost:?}"
+    );
+    let sent: HashSet<u64> = log
+        .acknowledged
+        .iter()
+        .chain(&log.uncertain)
+        .copied()
+        .collect();
+    let refused: Vec<_> = sequences
+        .iter()
+        .filter(|sequence| !sent.contains(sequence))
+        .collect();
+    assert!(
+        refused.is_empty(),
+        "{topic}: refused sends reached the log: {refused:?}"
+    );
+}
+
+#[iggy_harness(cluster_nodes = 3)]
+async fn given_a_partition_primary_leading_metadata_when_its_quorum_freezes_should_refuse_writes_until_it_resumes(
+    harness: &mut TestHarness,
+) {
+    assert_isolated_primary_fence(harness, true).await;
+}
+
+#[iggy_harness(cluster_nodes = 3)]
+async fn given_a_partition_primary_backing_up_metadata_when_its_quorum_freezes_should_refuse_writes_until_it_resumes(
+    harness: &mut TestHarness,
+) {
+    assert_isolated_primary_fence(harness, false).await;
+}
+
+/// A partition primary whose quorum peers are frozen gets no fresh metadata
+/// quorum evidence, whether it credits answered probes as the metadata primary
+/// or probes as a backup. It must refuse partition writes with 58 once that
+/// evidence is `heartbeat_timeout + 3s` old, admit nothing it refused, and
+/// serve the partition again after the peers resume.
+async fn assert_isolated_primary_fence(harness: &TestHarness, leads_metadata: bool) {
+    const ADMITTED: [&str; 2] = ["before-isolation", "after-resume"];
+    const REFUSED: &str = "refused-while-isolated";
+
+    let client = connect_without_login(harness.node(0).tcp_addr().unwrap()).await;
+    client
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    client.create_stream(STREAM_NAME).await.unwrap();
+    let stream = Identifier::named(STREAM_NAME).unwrap();
+    let topic = Identifier::named(TOPIC_NAME).unwrap();
+    let partitions = u32::try_from(harness.cluster_size()).unwrap();
+    let options = TopicCreateOptions {
+        partitions_count: Some(partitions),
+        ..TopicCreateOptions::default()
+    };
+    client
+        .create_topic(&stream, TOPIC_NAME, &options)
+        .await
+        .unwrap();
+    let leader = leader_node_index_via(harness, 0).await;
+    let mut routes = Vec::with_capacity(harness.cluster_size());
+    for partition_id in 0..partitions {
+        routes.push(partition_route(&client, &stream, &topic, partition_id).await);
+    }
+    let (partition_id, route) = (0..partitions)
+        .zip(routes)
+        .find(|(_, route)| (usize::from(route.primary_replica) == leader) == leads_metadata)
+        .expect("one partition primary on every node, the metadata primary among them");
+    let primary = usize::from(route.primary_replica);
+    let address = harness.node(primary).tcp_addr().unwrap();
+    let partitioning = Partitioning::partition_id(partition_id);
+    client
+        .send_messages(&stream, &topic, &partitioning, &mut [message(ADMITTED[0])])
+        .await
+        .unwrap();
+
+    let probe = connect_without_login(address).await;
+    probe
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    let identity = probe.session_identity().await.unwrap();
+    let binding = BindSessionRequest {
+        version_info: ClientVersionInfo {
+            protocol_version: IGGY_PROTOCOL_VERSION,
+            sdk_name: WireName::new("routing-test").unwrap(),
+            sdk_version: WireName::new("1.0.0").unwrap(),
+        },
+        identity,
+        bind_secret: probe.session_bind_secret().await.unwrap(),
+    }
+    .to_bytes();
+    let mut request = RequestHeader {
+        client: identity.client_id,
+        session: identity.session,
+        request: RAW_REQUEST_START,
+        ..Default::default()
+    };
+    let mut socket = raw_tcp::connect_to(address).await;
+    data_request(&mut socket, &mut request, BIND_SESSION_CODE, &binding, None)
+        .await
+        .expect("bind the probe session on the partition primary");
+    let poll = PollMessagesRequest {
+        consumer: consumer_to_wire(&Consumer::default()).unwrap(),
+        stream_id: identifier_to_wire(&stream).unwrap(),
+        topic_id: identifier_to_wire(&topic).unwrap(),
+        partition_id: Some(partition_id),
+        strategy: polling_strategy_to_wire(&PollingStrategy::offset(0)),
+        count: 1,
+        auto_commit: false,
+    }
+    .to_bytes();
+    data_request(
+        &mut socket,
+        &mut request,
+        POLL_MESSAGES_CODE,
+        &poll,
+        Some(route.context()),
+    )
+    .await
+    .expect("a primary with its quorum must serve the partition");
+
+    let peers: Vec<usize> = (0..harness.cluster_size())
+        .filter(|node| *node != primary)
+        .collect();
+    let isolated_at = Instant::now();
+    for &peer in &peers {
+        pause_node(harness, peer, true);
+    }
+    let fenced = timeout(FENCE_BOUND, async {
+        loop {
+            match data_request(
+                &mut socket,
+                &mut request,
+                POLL_MESSAGES_CODE,
+                &poll,
+                Some(route.context()),
+            )
+            .await
+            {
+                Ok(_) => sleep(FENCE_PROBE_INTERVAL).await,
+                Err(error) => break error,
+            }
+        }
+    })
+    .await;
+    let write = data_request(
+        &mut socket,
+        &mut request,
+        SEND_MESSAGES_CODE,
+        &raw_send_body(partition_id, REFUSED),
+        Some(route.context()),
+    )
+    .await;
+    let refused_after = isolated_at.elapsed();
+    for &peer in &peers {
+        pause_node(harness, peer, false);
+    }
+    println!(
+        "node {primary}, metadata leader {leader}, refused a write to partition {partition_id} \
+         {refused_after:?} after isolation"
+    );
+    assert_eq!(
+        fenced,
+        Ok(IggyError::TransientNotAccepted),
+        "the isolated primary must close partition admission within {FENCE_BOUND:?}"
+    );
+    assert_eq!(
+        write.err(),
+        Some(IggyError::TransientNotAccepted),
+        "the isolated primary must refuse a write with 58"
+    );
+    assert!(
+        refused_after <= FENCE_BOUND,
+        "the write was refused {refused_after:?} after isolation, past {FENCE_BOUND:?}"
+    );
+
+    timeout(
+        DATA_FAILOVER_BUDGET,
+        client.send_messages(&stream, &topic, &partitioning, &mut [message(ADMITTED[1])]),
+    )
+    .await
+    .expect("the cluster must answer a write after the peers resume")
+    .expect("the cluster must accept a write after the peers resume");
+    let polled = client
+        .poll_messages(
+            &stream,
+            &topic,
+            Some(partition_id),
+            &Consumer::default(),
+            &PollingStrategy::offset(0),
+            u32::try_from(ADMITTED.len() + 1).unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+    let payloads: Vec<&[u8]> = polled
+        .messages
+        .iter()
+        .map(|message| message.payload.as_ref())
+        .collect();
+    assert_eq!(
+        payloads,
+        ADMITTED.map(str::as_bytes),
+        "a write refused with 58 must not reach the log"
+    );
+}
+
+fn raw_send_body(partition_id: u32, payload: &str) -> Bytes {
+    let stream_id = WireIdentifier::named(STREAM_NAME).unwrap();
+    let topic_id = WireIdentifier::named(TOPIC_NAME).unwrap();
+    let partitioning = WirePartitioning::PartitionId(partition_id);
+    let messages = [RawMessage {
+        id: 0,
+        origin_timestamp: 0,
+        headers: None,
+        payload: payload.as_bytes(),
+    }];
+    let mut body = BytesMut::with_capacity(SendMessagesEncoder::encoded_size(
+        &stream_id,
+        &topic_id,
+        &partitioning,
+        &messages,
+    ));
+    SendMessagesEncoder::encode(&mut body, &stream_id, &topic_id, &partitioning, &messages)
+        .unwrap();
+    body.freeze()
 }
 
 #[iggy_harness(cluster_nodes = 3)]

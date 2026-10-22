@@ -107,12 +107,12 @@ after the server refuses those credentials, it does not sign in by itself, and
 a call fails with status 40 until the caller signs in again. A sign-in or
 logout of the caller ends each earlier call that has to wait for a new session:
 with status 40 if it sent nothing, or with `OperationUncertainError` if its
-outcome is unknown. A typed send and a group poll can send more than one
+outcome is unknown. An auto-commit or Next poll, which has no operation ID, ends with status 57 instead. A typed send and a group poll can send more than one
 command. If the caller signs in or logs out before the next command of such a
 call, the call fails with status 40. Only a call that waits for the client's own sign-in goes on
 under the new session. If the server refuses that sign-in, the call fails with
 status 40, and its `cause` holds the refusal. A call whose deadline ends while
-it waits for a session fails with status 58.
+it waits for a session fails with status 58. So does a call that replicas refuse with 89 until its deadline.
 
 A reply with status 30 (`StaleClient`) says that the server no longer attaches
 the link to the session. This happens, for example, after the user was deleted
@@ -170,7 +170,7 @@ discards retained operations. It does not wait for outstanding calls to finish.
 Await those calls before destroying the client when their results are needed.
 
 Auto-commit and Next polls hold their partition lane only during the active call.
-Error 57 or a lost reply ends the call immediately with unknown progress and no
+Error 57, a lost reply or another unknown outcome ends the call immediately with status 57 and no
 retained operation ID. These polls never replay after uncertainty. Known
 non-admission errors 58/89 remain retryable; pure reads may retry lost replies.
 Before uncertainty, lifecycle error 88 retries with a fresh ID within the same

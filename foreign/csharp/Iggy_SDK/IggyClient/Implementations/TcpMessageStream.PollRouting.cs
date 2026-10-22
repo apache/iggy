@@ -274,7 +274,7 @@ public sealed partial class TcpMessageStream
                     {
                         captured ??= new PartitionContext(0, 0, _metadataWatermark);
                     }
-                    EnsureOperationSession(generation);
+                    EnsureOperationSession(code, generation);
                     if (operation is null && (retainable || progress))
                     {
                         var lane = target is { } selected
@@ -316,7 +316,7 @@ public sealed partial class TcpMessageStream
                     {
                         connection = ReadyReplicaLinks().FirstOrDefault() ?? throw new NotConnectedException();
                     }
-                    EnsureOperationSession(generation);
+                    EnsureOperationSession(code, generation);
                     if (operation is not null && !_mutations.Owns(operation))
                     {
                         throw PollNotAccepted();
@@ -465,7 +465,16 @@ public sealed partial class TcpMessageStream
                     await Task.Delay(pause, cancellation.Token);
                     if (target is null)
                     {
-                        await RefreshPartitionRosterAsync(deadline, cancellation.Token);
+                        try
+                        {
+                            await RefreshPartitionRosterAsync(deadline, cancellation.Token);
+                        }
+                        catch (Exception refreshError) when (retained is null && operation is not { Uncertain: true }
+                            && (refreshError is NotConnectedException || IsSessionFailure(refreshError))
+                            && ResumesUnderNewSession(generation))
+                        {
+                            // The refused call was never admitted, so the next pass waits for the new session.
+                        }
                     }
                 }
                 catch (Exception error) when (!sending && retained is null && operation is not { Uncertain: true }
@@ -515,7 +524,7 @@ public sealed partial class TcpMessageStream
                 {
                     if (!ResumesUnderNewSession(generation))
                     {
-                        EnsureOperationSession(generation);
+                        EnsureOperationSession(code, generation);
                     }
                     lastWasNotPrimary = false;
                     terminal = false;
@@ -631,11 +640,11 @@ public sealed partial class TcpMessageStream
         return Task.CompletedTask;
     }
 
-    private void EnsureOperationSession(ulong generation)
+    private void EnsureOperationSession(int code, ulong generation)
     {
         lock (_pollRoutingGate)
         {
-            if (_signInWithdrawn && _consensusSession.IsBound)
+            if (_signInWithdrawn && code != CommandCodes.PING_CODE)
             {
                 throw _consensusSession.Ended(generation)
                     ?? VsrError.Exception(VsrError.UNAUTHENTICATED, "An explicit sign-in is required.");

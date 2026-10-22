@@ -5570,15 +5570,20 @@ mod tests {
         let namespace = IggyNamespace::new(0, 0, 0);
         let prepares = primary_prepares(&Rc::new(IggyMessageBus::new(0)), namespace, HEAD).await;
         let local = usize::try_from(LOCAL_HEAD).unwrap();
-        let backup = HeadlessReplica::journaled(
+        let backup = Box::pin(HeadlessReplica::journaled(
             HEADLESS_BACKUP,
             namespace,
             &prepares[..local],
             Some((directory.path(), &store)),
-        )
+        ))
         .await;
-        let candidate =
-            HeadlessReplica::journaled(HEADLESS_CANDIDATE, namespace, &prepares, None).await;
+        let candidate = Box::pin(HeadlessReplica::journaled(
+            HEADLESS_CANDIDATE,
+            namespace,
+            &prepares,
+            None,
+        ))
+        .await;
         let start_view = start_view_suffix(
             namespace,
             HEADLESS_VIEW,
@@ -5638,20 +5643,24 @@ mod tests {
         let prepares =
             primary_prepares(&Rc::new(IggyMessageBus::new(0)), namespace, HELD_HEAD).await;
         let adopted = usize::try_from(ADOPTED_HEAD).unwrap();
-        let backup = HeadlessReplica::journaled(
+        let backup = Box::pin(HeadlessReplica::journaled(
             HEADLESS_BACKUP,
             namespace,
             &prepares,
             Some((directory.path(), &store)),
-        )
+        ))
         .await;
         assert_eq!(
             backup.partition(namespace).log.journal().inner.last_op(),
             Some(HELD_HEAD)
         );
-        let candidate =
-            HeadlessReplica::journaled(HEADLESS_CANDIDATE, namespace, &prepares[..adopted], None)
-                .await;
+        let candidate = Box::pin(HeadlessReplica::journaled(
+            HEADLESS_CANDIDATE,
+            namespace,
+            &prepares[..adopted],
+            None,
+        ))
+        .await;
         if head_committed {
             for replica in [&backup, &candidate] {
                 replica
@@ -5725,14 +5734,19 @@ mod tests {
                     header.request += 1;
                     header.checksum = header.identity_checksum();
                 });
-        let backup =
-            HeadlessReplica::journaled(HEADLESS_BACKUP, namespace, &prepares[..prefix], None).await;
-        let elect = HeadlessReplica::journaled(
+        let backup = Box::pin(HeadlessReplica::journaled(
+            HEADLESS_BACKUP,
+            namespace,
+            &prepares[..prefix],
+            None,
+        ))
+        .await;
+        let elect = Box::pin(HeadlessReplica::journaled(
             HEADLESS_CANDIDATE,
             namespace,
             &prepares,
             Some((directory, store)),
-        )
+        ))
         .await;
         backup
             .owner
@@ -6018,14 +6032,19 @@ mod tests {
                     header.view = HEADLESS_VIEW;
                     header.checksum = header.identity_checksum();
                 });
-        let backup =
-            HeadlessReplica::journaled(HEADLESS_BACKUP, namespace, &prepares[..1], None).await;
-        let elect = HeadlessReplica::journaled(
+        let backup = Box::pin(HeadlessReplica::journaled(
+            HEADLESS_BACKUP,
+            namespace,
+            &prepares[..1],
+            None,
+        ))
+        .await;
+        let elect = Box::pin(HeadlessReplica::journaled(
             HEADLESS_CANDIDATE,
             namespace,
             &prepares[..adopted],
             Some((directory.path(), &store)),
-        )
+        ))
         .await;
         let backup_consensus = || backup.partition(namespace).consensus();
         let elect_partition = || elect.partition(namespace);
@@ -6324,6 +6343,102 @@ mod tests {
             "a log naming another prepare at applied op {APPLIED} must be refused, not adopted"
         );
         assert_eq!(partition.consensus().applied_log_contradictions(), 1);
+    }
+
+    #[compio::test]
+    async fn given_a_refused_contradicting_start_view_when_ticking_should_export_it_once() {
+        const APPLIED: u64 = 2;
+        const NEW_VIEW: u32 = 3;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let (owner, _sender) = test_owner(&bus, None);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let prepares = primary_prepares(&bus, namespace, APPLIED).await;
+        host_applied_backup(&owner, &bus, namespace, &prepares).await;
+        let mut forged = *prepares.last().unwrap().header();
+        forged.timestamp += 1;
+        forged.checksum = forged.identity_checksum();
+        owner
+            .on_start_view(start_view_suffix(
+                namespace,
+                NEW_VIEW,
+                APPLIED,
+                APPLIED,
+                &[forged],
+            ))
+            .await;
+
+        for _ in 0..2 {
+            assert!(owner.tick_partitions(&mut Vec::new()).await.is_none());
+        }
+
+        assert_eq!(
+            owner.metrics.partition_applied_log_contradictions_value(),
+            1
+        );
+        let partition = owner.plane.partitions().get_by_ns(&namespace).unwrap();
+        assert_eq!(
+            partition.consensus().applied_log_contradictions(),
+            1,
+            "the export must leave the total for the simulator invariants"
+        );
+    }
+
+    #[compio::test]
+    async fn given_a_refused_contradicting_metadata_log_when_ticking_should_export_it_once() {
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let (mut owner, _sender) = test_owner(&bus, None);
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            1,
+            METADATA_GROUP,
+            Rc::clone(&bus),
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        owner.plane.inner_mut().0 = IggyMetadata::new(
+            Some(consensus),
+            None,
+            None,
+            None,
+            IoTestMetadata::new((
+                UsersInner::new().into(),
+                (StreamsInner::default().into(), ()),
+            )),
+            None,
+        );
+        let announced = PrepareHeader {
+            checksum: 1,
+            ..PrepareHeader::default()
+        };
+        let consensus = owner.plane.inner().0.consensus.as_ref().unwrap();
+        assert!(consensus.contradicts_applied_log(
+            consensus::PlaneKind::Metadata,
+            consensus::ContradictionSource::StartView,
+            1,
+            [&announced],
+            |_| Some(PrepareHeader {
+                checksum: 2,
+                ..announced
+            }),
+        ));
+
+        for _ in 0..2 {
+            owner.tick_metadata().await;
+        }
+
+        assert_eq!(owner.metrics.metadata_applied_log_contradictions_value(), 1);
+        assert_eq!(
+            owner
+                .plane
+                .inner()
+                .0
+                .consensus
+                .as_ref()
+                .unwrap()
+                .applied_log_contradictions(),
+            1
+        );
     }
 
     #[compio::test]

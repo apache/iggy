@@ -886,11 +886,11 @@ pub enum LifecycleFrame {
         replica_id: u8,
         msg: Frozen<MESSAGE_ALIGN>,
     },
-    /// A reply by client id (`MessageBus::send_to_client`) for the receiving
-    /// shard's pump to send: one for a client homed there (top 16 bits of
-    /// `client_id`), or a deny a synchronous caller staged. By id it reaches
-    /// only an in-process (HTTP) reply slot: a client socket takes a reply
-    /// only from the shard that holds it, addressed to its installation.
+    /// A deny a synchronous caller staged for its own shard's pump to send by
+    /// client id (`MessageBus::send_to_client`). The production bus refuses
+    /// every frame sent by id, because a client socket or HTTP reply slot
+    /// takes a reply only addressed to its installation. Only a bus that
+    /// delivers by id, such as the raw simulator, answers with it.
     ForwardClientSend {
         client_id: u128,
         msg: BusMessage,
@@ -2912,6 +2912,9 @@ where
                         // the floor with the partition value.
                         self.metrics
                             .record_partition_prepare_gap_drops(partition.take_prepare_gap_drops());
+                        self.metrics.record_partition_applied_log_contradictions(
+                            partition.consensus().take_applied_log_contradictions(),
+                        );
                         // Roll whatever this partition still counts out of its
                         // parent topic and stream. Here and not in the
                         // reconciler's teardown: a handler suspended mid-append
@@ -4242,8 +4245,8 @@ where
     /// Deny a client partition request with `TransientNotAccepted`: the frame
     /// never reached journal admission, so the SDK can safely replay it
     /// anywhere, and partition rebuild completes well inside the replay
-    /// budget. Sent directly over the bus; delivery failure is terminal for
-    /// this reply (the client recovers via its own read-timeout).
+    /// budget. Sent by client id, which only a raw request without a reply
+    /// channel reaches, and which the production bus refuses.
     #[allow(clippy::future_not_send)]
     async fn deny_partition_request_transient(&self, request_header: &RoutedRequestHeader) {
         let reply = build_deny_reply_from_request_header(
@@ -4263,12 +4266,12 @@ where
                 crate::metrics::frame_drop_variant::PARTITION,
                 crate::metrics::frame_drop_reason::DELIVERY_FAILED,
             );
-            tracing::warn!(
+            tracing::debug!(
                 shard = self.id,
                 client = request_header.client,
                 operation = ?request_header.operation,
                 error = %error,
-                "failed to send transient deny for partition request"
+                "transient deny for partition request has no route by client id"
             );
             return;
         }
@@ -4305,12 +4308,12 @@ where
                 crate::metrics::frame_drop_variant::CONSENSUS,
                 crate::metrics::frame_drop_reason::DELIVERY_FAILED,
             );
-            tracing::warn!(
+            tracing::debug!(
                 shard = self.id,
                 client = request_header.client,
                 operation = ?request_header.operation,
                 error = %error,
-                "failed to send deny for unroutable request"
+                "deny for unroutable request has no route by client id"
             );
         }
     }
@@ -4643,6 +4646,10 @@ where
     /// reports `commit_offset` 0, which reads as a regression rather than a
     /// harness that discarded the log.
     ///
+    /// `persistence` is this group's WAL, reopened by the caller from its
+    /// filesystem model. Its certificate restores `log_view` as boot's does, and
+    /// every acknowledgement and view-scoped send waits for it.
+    ///
     /// `materialisation` carries the committed `created_revision` and this
     /// partition's assigned initial view; see `fresh_group_start`.
     ///
@@ -4655,8 +4662,8 @@ where
     // while `partitions` builds as a plain dependency, so `RetainedPartitionLog`
     // and `adopt_retained_log` are configured out and the crate does not compile.
     // The feature forwards to `partitions/simulator` instead.
-    /// Persisted policies use ideal storage here: journal and receipts survive
-    /// together. Filesystem barriers and torn writes belong to storage fault tests.
+    /// The WAL runs on the simulator's filesystem model. The retained log and
+    /// receipts stand in for segment and receipt files, which it does not model.
     #[cfg(feature = "simulator")]
     pub fn init_partition(
         &self,
@@ -4664,6 +4671,7 @@ where
         superblock: Option<Rc<SB>>,
         recovered_state: Option<&consensus::VsrState>,
         retained: Option<partitions::RetainedPartitionState>,
+        persistence: Rc<partitions::PartitionPersistence>,
         materialisation: PartitionMaterialisation,
     ) where
         B: MessageBus + Clone + 'static,
@@ -4725,7 +4733,6 @@ where
             consensus,
             partitions.config().segment_size,
         );
-        partition.enable_ideal_storage();
         partition.set_created_revision(epoch);
         let runtime_options = self.plane.metadata().mux_stm.streams().read(|inner| {
             inner
@@ -4764,6 +4771,7 @@ where
         // the restore at all, a simulator replica rebuilt against a retained
         // store resumes minting at 0 while its group is at N.
         partition.restore_offset_frontier(recovered_state);
+        partition.attach_simulated_persistence(persistence);
         partition.consensus().resume_adopted_view();
         // Match production's solo reservation handling. A replicated WAL may
         // retain a suffix the next view discards; anchoring at its dirty offset
@@ -8243,6 +8251,11 @@ where
             if gap_drops > 0 {
                 self.metrics.record_partition_prepare_gap_drops(gap_drops);
             }
+            let contradictions = partition.consensus().take_applied_log_contradictions();
+            if contradictions > 0 {
+                self.metrics
+                    .record_partition_applied_log_contradictions(contradictions);
+            }
             // A fenced partition must not tick: its consensus would emit
             // view-scoped sends for a log the cluster has already passed.
             if let Some(fault) = partition.fatal() {
@@ -8762,9 +8775,9 @@ where
     }
 
     /// Re-read a bounded range on retry so a full inbox retains no stale payload.
-    /// Each interval visits every namespace once, in batches over consecutive ticks,
-    /// up to `PARTITION_PLACEMENT_REPORTS_PER_TICK_MAX` namespaces per tick of the
-    /// interval. A shard with more namespaces reports each one every few intervals.
+    /// Each interval visits every namespace once, in batches over consecutive ticks.
+    /// A batch holds `PARTITION_PLACEMENT_REPORTS_PER_TICK_MIN` namespaces, or more
+    /// when the shard owns too many for that pace to finish within the interval.
     fn publish_partition_views(&self, namespaces: &[IggyNamespace]) {
         if namespaces.is_empty() {
             self.partition_placement_cursor.set(None);
@@ -8785,9 +8798,13 @@ where
         let start = self.partition_placement_cursor.get().map_or(0, |cursor| {
             namespaces.partition_point(|namespace| *namespace < cursor) % namespaces.len()
         });
-        let visited = owed
-            .min(namespaces.len())
-            .min(PARTITION_PLACEMENT_REPORTS_PER_TICK_MAX);
+        let batch = namespaces
+            .len()
+            .div_ceil(
+                usize::try_from(PARTITION_PLACEMENT_REPORT_INTERVAL_TICKS).unwrap_or(usize::MAX),
+            )
+            .max(PARTITION_PLACEMENT_REPORTS_PER_TICK_MIN);
+        let visited = owed.min(namespaces.len()).min(batch);
         let partitions = self.plane.partitions();
         let mut reports = Vec::with_capacity(visited);
         for namespace in namespaces[start..]
@@ -10921,6 +10938,11 @@ where
         // Placed before the transfer-stall block below: that block's exhausted
         // branch returns early, so a detector after it would be skipped on the
         // tick that abandons a transfer.
+        let contradictions = consensus.take_applied_log_contradictions();
+        if contradictions > 0 {
+            self.metrics
+                .record_metadata_applied_log_contradictions(contradictions);
+        }
         if let Some(journal) = metadata.journal.as_ref() {
             let gap_drops = metadata.take_prepare_gap_drops();
             if gap_drops > 0 {
@@ -11538,9 +11560,9 @@ const PARTITION_WALKS_PER_TICK_MAX: usize = 16;
 const PARTITION_PLACEMENT_REPORT_INTERVAL_TICKS: u128 =
     primary_rebalance::PROBE_INTERVAL.as_millis() / CONSENSUS_TICK_INTERVAL.as_millis();
 
-/// One lifecycle batch per tick until the interval's pass ends; the cursor also
-/// bounds visits to ineligible groups.
-const PARTITION_PLACEMENT_REPORTS_PER_TICK_MAX: usize = 64;
+/// The smallest lifecycle batch sent per tick until the interval's pass ends.
+/// The cursor also bounds visits to ineligible groups.
+const PARTITION_PLACEMENT_REPORTS_PER_TICK_MIN: usize = 64;
 
 /// Floor under the gap detector's debounce, in ticks.
 ///
@@ -15474,12 +15496,12 @@ mod partition_placement_tests {
     async fn given_more_groups_than_one_batch_when_an_interval_starts_should_report_each_group_within_it()
      {
         let (shard, inbox) = owner(1);
-        let count = PARTITION_PLACEMENT_REPORTS_PER_TICK_MAX * 2 + 3;
+        let count = PARTITION_PLACEMENT_REPORTS_PER_TICK_MIN * 2 + 3;
         for id in 0..count {
             insert(&shard, id, 7, 0);
         }
         let batches =
-            u64::try_from(count.div_ceil(PARTITION_PLACEMENT_REPORTS_PER_TICK_MAX)).unwrap();
+            u64::try_from(count.div_ceil(PARTITION_PLACEMENT_REPORTS_PER_TICK_MIN)).unwrap();
         let mut observed = BTreeSet::new();
         for tick in 1..=batches {
             shard.ticks.set(tick);
@@ -15496,6 +15518,44 @@ mod partition_placement_tests {
         assert!(
             inbox.try_recv().is_err(),
             "a finished pass waits for the next interval"
+        );
+    }
+
+    #[compio::test]
+    async fn given_more_groups_than_an_interval_of_batches_when_an_interval_runs_should_report_each_group_within_it()
+     {
+        let (shard, inbox) = owner(1);
+        let interval = u64::try_from(PARTITION_PLACEMENT_REPORT_INTERVAL_TICKS).unwrap();
+        let count = PARTITION_PLACEMENT_REPORTS_PER_TICK_MIN * usize::try_from(interval).unwrap()
+            + PARTITION_PLACEMENT_REPORTS_PER_TICK_MIN
+            + 3;
+        for id in 0..count {
+            insert(&shard, id, 7, 0);
+        }
+        let mut observed = BTreeSet::new();
+        for tick in 1..=interval {
+            shard.ticks.set(tick);
+            publish(&shard);
+            if !inbox.is_empty() {
+                observed.extend(
+                    receive(&inbox)
+                        .into_iter()
+                        .map(|report| report.namespace.partition_id()),
+                );
+            }
+        }
+        assert_eq!(
+            observed.len(),
+            count,
+            "every group reports within one interval"
+        );
+
+        shard.ticks.set(interval + 1);
+        publish(&shard);
+        assert_eq!(
+            receive(&inbox)[0].namespace,
+            IggyNamespace::new(0, 0, 0),
+            "the next interval starts a new pass at the front"
         );
     }
 
@@ -15545,15 +15605,15 @@ mod partition_placement_tests {
     async fn given_more_groups_than_one_batch_when_publishing_should_bound_batches_and_cover_the_tail()
      {
         let (shard, inbox) = owner(1);
-        let count = PARTITION_PLACEMENT_REPORTS_PER_TICK_MAX * 2 + 3;
+        let count = PARTITION_PLACEMENT_REPORTS_PER_TICK_MIN * 2 + 3;
         for id in 0..count {
             insert(&shard, id, 7, 0);
         }
         let mut observed = BTreeSet::new();
-        for _ in 0..count.div_ceil(PARTITION_PLACEMENT_REPORTS_PER_TICK_MAX) {
+        for _ in 0..count.div_ceil(PARTITION_PLACEMENT_REPORTS_PER_TICK_MIN) {
             publish(&shard);
             let reports = receive(&inbox);
-            assert_eq!(reports.len(), PARTITION_PLACEMENT_REPORTS_PER_TICK_MAX);
+            assert_eq!(reports.len(), PARTITION_PLACEMENT_REPORTS_PER_TICK_MIN);
             observed.extend(
                 reports
                     .into_iter()
@@ -15615,9 +15675,9 @@ mod partition_placement_tests {
     async fn given_an_ineligible_prefix_when_publishing_should_bound_visits_and_reach_live_groups()
     {
         let (shard, inbox) = owner(1);
-        for id in 0..=PARTITION_PLACEMENT_REPORTS_PER_TICK_MAX {
+        for id in 0..=PARTITION_PLACEMENT_REPORTS_PER_TICK_MIN {
             let namespace = insert(&shard, id, 7, 0);
-            if id < PARTITION_PLACEMENT_REPORTS_PER_TICK_MAX {
+            if id < PARTITION_PLACEMENT_REPORTS_PER_TICK_MIN {
                 shard
                     .plane
                     .partitions()
@@ -15638,7 +15698,7 @@ mod partition_placement_tests {
         assert_eq!(reports.len(), 1);
         assert_eq!(
             reports[0].namespace.partition_id(),
-            PARTITION_PLACEMENT_REPORTS_PER_TICK_MAX
+            PARTITION_PLACEMENT_REPORTS_PER_TICK_MIN
         );
     }
 

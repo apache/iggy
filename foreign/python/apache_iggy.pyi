@@ -48,6 +48,7 @@ __all__ = [
     "IdentityInfo",
     "IggyClient",
     "IggyConsumer",
+    "IggyError",
     "IggyExpiry",
     "IggyProducer",
     "MaxTopicSize",
@@ -2135,6 +2136,14 @@ class IggyConsumer:
         next poll routes again.
         """
 
+class IggyError(builtins.RuntimeError):
+    r"""
+    An error of the Iggy SDK. `code` is the numeric Iggy error code, the same
+    code that every other Iggy SDK reports for it.
+    """
+    @property
+    def code(self) -> builtins.int: ...
+
 class IggyExpiry:
     r"""
     The expiry of the messages in a topic.
@@ -2434,14 +2443,12 @@ class Partitioning:
         """
 
 @typing.final
-class PendingOperationError(builtins.RuntimeError):
+class PendingOperationError(IggyError):
     r"""
     An operation whose retained identity is needed to recover or release its lane.
     """
     @property
     def operation_id(self) -> builtins.int: ...
-    @property
-    def code(self) -> builtins.int: ...
     @property
     def kind(self) -> builtins.str: ...
 
@@ -2526,9 +2533,10 @@ class PollingStrategy:
     ...
 
 @typing.final
-class ProducerSendError(builtins.RuntimeError):
+class ProducerSendError(IggyError):
     r"""
-    A direct producer error that preserves partial-send recovery state.
+    A direct producer error that preserves partial-send recovery state. Its
+    `__cause__` is the `IggyError` that ended the send.
     """
     @property
     def operation_id(self) -> builtins.int | None:

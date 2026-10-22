@@ -43,6 +43,14 @@ pub mod segment_anchor;
 mod segment_recovery;
 pub mod state_transfer;
 mod types;
+#[cfg(feature = "simulator")]
+mod wal_storage;
+#[cfg(feature = "simulator")]
+pub use wal_storage::{InjectedFile, InjectedStorage, WalFile, WalStorage};
+
+/// The storage under every partition WAL.
+#[cfg(not(feature = "simulator"))]
+pub type WalStorage = ::journal::durable_storage::DiskStorage;
 
 pub use consumer_offset_capacity::{AutoCommitReservation, ConsumerOffsetCapacityError};
 use iggy_binary_protocol::PrepareHeader;

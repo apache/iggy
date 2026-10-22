@@ -115,6 +115,8 @@ automatic sign-in. If it fails, the client does not sign in again as the
 previous user. While the explicit sign-in runs, a call that finds no signed-in
 connection ends with 40 (`UNAUTHENTICATED`) at once.
 
+After a logout, a refused automatic sign-in or a failed explicit sign-in, a call that needs a session fails with 40 (`UNAUTHENTICATED`) until the caller signs in again. Before the first sign-in, such a call fails with `IggyNotConnectedException`.
+
 A committed password change or rename of the signed-in user updates the
 credentials of the automatic sign-in. It also updates the builder credentials
 that `login()` uses when they name that user. This holds for typed calls,
@@ -340,6 +342,8 @@ connection, an eviction or a malformed reply leaves it uncertain. After a lost c
 stale-client eviction or a malformed reply, the call replays the same request on a new
 connection within its deadline. If the server refuses to bind the session again, the client
 registers a new session and drops the operation.
+
+A call that loses its connection before it sends its request, or that cannot open one, waits for a connection within its deadline. If no connection carries it by then, the call ends with 58 (`TRANSIENT_NOT_ACCEPTED`).
 
 An eviction and a reply can carry the same status, for example 30 (`STALE_CLIENT`) or 40
 (`UNAUTHENTICATED`). Only the eviction is a lost connection, so the call does not replay a

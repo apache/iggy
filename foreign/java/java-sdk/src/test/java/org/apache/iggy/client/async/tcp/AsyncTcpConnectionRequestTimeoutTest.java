@@ -19,6 +19,7 @@
 
 package org.apache.iggy.client.async.tcp;
 
+import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.exception.IggyTimeoutException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -126,9 +127,8 @@ class AsyncTcpConnectionRequestTimeoutTest {
                 first.setSoTimeout((int) TimeUnit.SECONDS.toMillis(TEST_TIMEOUT_SECONDS));
                 var timedOut = client.users().login(USERNAME, PASSWORD);
                 var lateRegister = AsyncIggyTcpClientTransientFailoverTest.readRequest(first.getInputStream(), 0);
-                assertThatThrownBy(() -> timedOut.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS))
-                        .isInstanceOf(ExecutionException.class)
-                        .hasCauseInstanceOf(IggyTimeoutException.class);
+                AsyncIggyTcpClientTransientFailoverTest.assertServerError(
+                        timedOut, IggyErrorCode.TRANSIENT_NOT_ACCEPTED.getCode());
                 AsyncIggyTcpClientTransientFailoverTest.serve(server, request -> {
                     if (request.operation() == AsyncIggyTcpClientTransientFailoverTest.OPERATION_REGISTER) {
                         return AsyncIggyTcpClientTransientFailoverTest.Response.success(

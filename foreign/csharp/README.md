@@ -889,6 +889,8 @@ keeps the delivered message's partition context. `AutoCommitMode.Disabled` skips
 checkpoint. The final stores share one 30-second budget; failures are logged and cleanup continues.
 Disposing from inside a receive loop is supported, including rented and deserialized messages.
 
+Under `AutoCommitMode.AfterReceive` a message counts as delivered once its loop body completes. A message whose body threw, broke or was still running when the consumer was disposed is not checkpointed and is delivered again.
+
 For automatic deserialization:
 
 ```c#

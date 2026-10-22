@@ -78,7 +78,7 @@ public class IggyConsumer<T> : IggyConsumer
                 continue;
             }
 
-            if (!RecordDelivery(message.Header.Offset, message.PartitionId, message.Context))
+            if (!BeginDelivery(message.Header.Offset, message.PartitionId, message.Context))
             {
                 yield break;
             }

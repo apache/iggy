@@ -21,7 +21,9 @@ package org.apache.iggy.client.async;
 
 import org.apache.iggy.client.BaseIntegrationTest;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
+import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.exception.IggyNotConnectedException;
+import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
@@ -129,10 +131,8 @@ class AsyncConnectionPoolAuthTest extends BaseIntegrationTest {
         client.users().logout().get(5, TimeUnit.SECONDS);
         log.info("Logout successful");
 
-        // then - commands should fail after logout
-        assertThatThrownBy(() -> client.streams().getStreams().get(5, TimeUnit.SECONDS))
-                .isInstanceOf(ExecutionException.class)
-                .hasCauseInstanceOf(IggyNotConnectedException.class);
+        // then - commands should fail with 40 after logout
+        assertUnauthenticated(client.streams().getStreams());
         log.info("Commands correctly rejected after logout");
 
         // when - re-login
@@ -261,10 +261,18 @@ class AsyncConnectionPoolAuthTest extends BaseIntegrationTest {
             client.users().logout().get(5, TimeUnit.SECONDS);
 
             // then - verify commands are rejected
-            assertThatThrownBy(() -> client.streams().getStreams().get(5, TimeUnit.SECONDS))
-                    .isInstanceOf(ExecutionException.class)
-                    .hasCauseInstanceOf(IggyNotConnectedException.class);
+            assertUnauthenticated(client.streams().getStreams());
             log.info("Cycle {}: logout and rejection verified", i + 1);
         }
+    }
+
+    private static void assertUnauthenticated(CompletableFuture<?> call) {
+        assertThatThrownBy(() -> call.get(5, TimeUnit.SECONDS))
+                .isInstanceOf(ExecutionException.class)
+                .cause()
+                .isInstanceOfSatisfying(
+                        IggyServerException.class,
+                        error ->
+                                assertThat(error.getRawErrorCode()).isEqualTo(IggyErrorCode.UNAUTHENTICATED.getCode()));
     }
 }

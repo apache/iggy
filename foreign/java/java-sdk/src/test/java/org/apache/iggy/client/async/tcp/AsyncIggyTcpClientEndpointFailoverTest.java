@@ -925,8 +925,8 @@ class AsyncIggyTcpClientEndpointFailoverTest {
                 node.rejectBindings = true;
                 lost.set(true);
                 node.dropConnections();
-                assertThatThrownBy(() -> client.sendBinaryRequest(GET_STATS_CODE, new byte[0])
-                                .get(5, TimeUnit.SECONDS))
+                // A roster read never waits for a session, so it ends when the sign-in on the next link hangs up.
+                assertThatThrownBy(() -> client.system().getClusterMetadata().get(5, TimeUnit.SECONDS))
                         .isInstanceOf(ExecutionException.class);
                 held.get(RECOVERY.toMillis(), TimeUnit.MILLISECONDS);
                 node.rejectBindings = false;
@@ -1024,8 +1024,8 @@ class AsyncIggyTcpClientEndpointFailoverTest {
                 node.rejectBindings = true;
                 lost.set(true);
                 node.dropConnections();
-                assertThatThrownBy(() -> client.sendBinaryRequest(GET_STATS_CODE, new byte[0])
-                                .get(5, TimeUnit.SECONDS))
+                // A roster read never waits for a session, so it ends when the sign-in on the next link hangs up.
+                assertThatThrownBy(() -> client.system().getClusterMetadata().get(5, TimeUnit.SECONDS))
                         .isInstanceOf(ExecutionException.class);
                 held.get(RECOVERY.toMillis(), TimeUnit.MILLISECONDS);
                 node.rejectBindings = false;
@@ -1598,7 +1598,8 @@ class AsyncIggyTcpClientEndpointFailoverTest {
 
     /**
      * Ends the session and returns the sign-ins that restore it: the one on the next link of the connection,
-     * which hangs up, and the one that the redial replays.
+     * which hangs up, and the one that the redial replays. A roster read never waits for a session, so it ends
+     * when that sign-in hangs up.
      */
     private static List<String> signInsAfterTheSessionIsLost(
             AsyncIggyTcpClient client, MockNode node, AtomicBoolean hangUpOnRegister, List<String> signIns)
@@ -1607,8 +1608,7 @@ class AsyncIggyTcpClientEndpointFailoverTest {
         node.rejectBindings = true;
         hangUpOnRegister.set(true);
         node.dropConnections();
-        assertThatThrownBy(() ->
-                        client.sendBinaryRequest(GET_STATS_CODE, new byte[0]).get(5, TimeUnit.SECONDS))
+        assertThatThrownBy(() -> client.system().getClusterMetadata().get(5, TimeUnit.SECONDS))
                 .isInstanceOf(ExecutionException.class);
         AsyncIggyTcpClientEventLoopGroupTest.await(() -> signIns.size() >= before + 2, "the redial sign-in", RECOVERY);
         List<String> all = List.copyOf(signIns);

@@ -1047,44 +1047,41 @@ func (l *errorLog) holds(target error) bool {
 	return slices.ContainsFunc(l.errors, func(err error) bool { return errors.Is(err, target) })
 }
 
-// The server refuses the sign-in of a recovery with an eviction or with a
-// status. A create and a read wait for the recovery, and both end with 40,
-// also when no link is left, with the refusal as their cause. A credential
-// refusal blocks automatic sign-in until the caller explicitly signs in again.
+// The server refuses the credentials of the sign-in of a recovery with an
+// eviction or with a status. A create and a read wait for the recovery, and
+// both end with 40, also when no link is left, with the refusal as their
+// cause. The refusal blocks automatic sign-in until the caller explicitly
+// signs in again.
 func TestSessionRecovery_ARefusedSignInEndsTheCallsThatWaitForIt(t *testing.T) {
 	// The connect signs in as iggy and the caller as other, so the recovery
 	// sends the third sign-in.
 	const recoverySignIn = 3
-	newerProtocol := vsr.ProtocolVersion + 1
 	for _, refusal := range []struct {
-		name    string
-		answer  []byte
-		cause   error
-		forgets bool
-		token   bool
+		name   string
+		answer []byte
+		cause  error
+		token  bool
 	}{
-		{"evicted_invalid_credentials", evictionFrame(vsr.EvictionInvalidCredentials, 0, 0), ierror.ErrInvalidCredentials, true, false},
-		{"evicted_user_inactive", evictionFrame(vsr.EvictionUserInactive, 0, 0), ierror.ErrUnauthenticated, true, false},
-		{"evicted_session_error", evictionFrame(vsr.EvictionSessionError, 0, 0), ierror.ErrUnauthenticated, true, false},
-		{"evicted_invalid_token", evictionFrame(vsr.EvictionInvalidToken, 0, 0), ierror.ErrInvalidPersonalAccessToken, true, true},
-		{"evicted_incompatible_protocol", evictionFrame(vsr.EvictionIncompatibleProtocol, newerProtocol, newerProtocol),
-			ierror.ErrIncompatibleProtocolVersion, false, false},
+		{"evicted_invalid_credentials", evictionFrame(vsr.EvictionInvalidCredentials, 0, 0), ierror.ErrInvalidCredentials, false},
+		{"evicted_user_inactive", evictionFrame(vsr.EvictionUserInactive, 0, 0), ierror.ErrUnauthenticated, false},
+		{"evicted_session_error", evictionFrame(vsr.EvictionSessionError, 0, 0), ierror.ErrUnauthenticated, false},
+		{"evicted_invalid_token", evictionFrame(vsr.EvictionInvalidToken, 0, 0), ierror.ErrInvalidPersonalAccessToken, true},
 		{"status_invalid_credentials", statusReplyFrame(vsr.OperationRegister, uint32(ierror.InvalidCredentialsCode), nil),
-			ierror.ErrInvalidCredentials, true, false},
+			ierror.ErrInvalidCredentials, false},
 		{"status_invalid_token", statusReplyFrame(vsr.OperationRegister, uint32(ierror.InvalidPersonalAccessTokenCode), nil),
-			ierror.ErrInvalidPersonalAccessToken, true, true},
+			ierror.ErrInvalidPersonalAccessToken, true},
 		{"status_expired_token", statusReplyFrame(vsr.OperationRegister, uint32(ierror.PersonalAccessTokenExpiredCode), nil),
-			ierror.ErrPersonalAccessTokenExpired, true, true},
+			ierror.ErrPersonalAccessTokenExpired, true},
 		{"status_invalid_format", statusReplyFrame(vsr.OperationRegister, uint32(ierror.InvalidFormatCode), nil),
-			ierror.ErrInvalidFormat, true, false},
+			ierror.ErrInvalidFormat, false},
 		{"status_invalid_username", statusReplyFrame(vsr.OperationRegister, uint32(ierror.InvalidUsernameCode), nil),
-			ierror.ErrInvalidUsername, true, false},
+			ierror.ErrInvalidUsername, false},
 		{"status_invalid_password", statusReplyFrame(vsr.OperationRegister, uint32(ierror.InvalidPasswordCode), nil),
-			ierror.ErrInvalidPassword, true, false},
+			ierror.ErrInvalidPassword, false},
 		{"status_user_inactive", statusReplyFrame(vsr.OperationRegister, uint32(ierror.UserInactiveCode), nil),
-			ierror.ErrUserInactive, true, false},
+			ierror.ErrUserInactive, false},
 		{"status_unauthenticated", statusReplyFrame(vsr.OperationRegister, uint32(ierror.UnauthenticatedCode), nil),
-			ierror.ErrUnauthenticated, true, false},
+			ierror.ErrUnauthenticated, false},
 	} {
 		t.Run(refusal.name, func(t *testing.T) {
 			server, _ := lostSessionServer(t, func(number int, _ request) []byte {
@@ -1139,23 +1136,103 @@ func TestSessionRecovery_ARefusedSignInEndsTheCallsThatWaitForIt(t *testing.T) {
 			require.True(t, logged.holds(refusal.cause), "the log keeps the refusal")
 			require.Empty(t, requestsFor(server.recorded(), vsr.OperationCreateStream), "the create never went out")
 			require.NoError(t, client.Connect(ctx))
-			if refusal.forgets {
-				require.NoError(t, client.Disconnect())
-				require.NoError(t, client.Connect(ctx))
-				require.Len(t, registerRequests(server), recoverySignIn, "a refused credential must not fall back to AutoLogin")
-				require.False(t, sessionBound(client))
-				_, err := client.LoginUser(ctx, "retry", "password")
-				require.NoError(t, err)
-			}
-			connectedAs := caller
-			if refusal.forgets {
-				connectedAs = "retry"
-			}
+			require.NoError(t, client.Disconnect())
+			require.NoError(t, client.Connect(ctx))
+			require.Len(t, registerRequests(server), recoverySignIn, "a refused credential must not fall back to AutoLogin")
+			require.False(t, sessionBound(client))
+			_, err := client.LoginUser(ctx, "retry", "password")
+			require.NoError(t, err)
 			var signIns []string
 			for _, read := range registerRequests(server) {
 				signIns = append(signIns, registerUsername(read.payload))
 			}
-			require.Equal(t, []string{"iggy", caller, caller, connectedAs}, signIns)
+			require.Equal(t, []string{"iggy", caller, caller, "retry"}, signIns)
+		})
+	}
+}
+
+// The server refuses the sign-in of a recovery for a reason other than its
+// credentials. The session stays owed, so the calls that wait for the recovery
+// keep waiting and end with 58 with their context, and the recovery signs in
+// again as the caller once the server accepts it.
+func TestSessionRecovery_ASignInRefusedForAnotherReasonKeepsTheSessionOwed(t *testing.T) {
+	// The connect signs in as iggy and the caller as other, so the recovery
+	// sends the third sign-in.
+	const recoverySignIn = 3
+	newerProtocol := vsr.ProtocolVersion + 1
+	for _, refusal := range []struct {
+		name   string
+		answer []byte
+		cause  error
+	}{
+		{"evicted_incompatible_protocol", evictionFrame(vsr.EvictionIncompatibleProtocol, newerProtocol, newerProtocol),
+			ierror.ErrIncompatibleProtocolVersion},
+		{"evicted_release_too_low", evictionFrame(vsr.EvictionClientReleaseTooLow, 0, 0), ierror.ErrInvalidCommand},
+		{"status_stale_client", statusReplyFrame(vsr.OperationRegister, uint32(ierror.StaleClientCode), nil), ierror.ErrStaleClient},
+	} {
+		t.Run(refusal.name, func(t *testing.T) {
+			var refuse atomic.Bool
+			refuse.Store(true)
+			server, _ := lostSessionServer(t, func(number int, _ request) []byte {
+				if number >= recoverySignIn && refuse.Load() {
+					// Each answer goes out on its own link and gets its own request id.
+					return slices.Clone(refusal.answer)
+				}
+				return registerReplyFrame(7, managedLinkSession+uint64(number))
+			})
+			client := newDialingClient(t, server.address(), WithAutoLogin(NewUsernamePasswordCredentials("iggy", "iggy")))
+			logged := &errorLog{}
+			client.logger = slog.New(logged)
+			ctx, cancel := context.WithTimeout(context.Background(), managedLinkTestBudget)
+			defer cancel()
+			require.NoError(t, client.Connect(ctx))
+			_, err := client.LoginUser(ctx, "other", "password")
+			require.NoError(t, err)
+			epoch := client.epoch.Load()
+			release := holdRecovery(t, client)
+			recoverNow(client)
+			// Ending the wait stands in for the deadline of the calls.
+			wait, endWait := context.WithCancel(ctx)
+			defer endWait()
+			callCtx, endCalls := client.operationContext(wait)
+			defer endCalls()
+			created, pinged := make(chan error, 1), make(chan error, 1)
+			go func() {
+				_, err := client.do(callCtx, &command.CreateStream{Name: "waiting"})
+				created <- err
+			}()
+			go func() { pinged <- client.Ping(callCtx) }()
+
+			release()
+			require.Eventually(t, func() bool { return logged.holds(refusal.cause) }, managedLinkTestBudget, managedLinkPoll,
+				"the log keeps the refusal")
+			require.Never(t, func() bool { return len(created) != 0 || len(pinged) != 0 }, recoveryWaitDeadline, managedLinkPoll,
+				"the calls still wait for the owed session")
+			endWait()
+			for _, call := range []chan error{created, pinged} {
+				select {
+				case err := <-call:
+					require.ErrorIs(t, err, ierror.ErrTransientNotAccepted)
+				case <-ctx.Done():
+					t.Fatal("a call still waits")
+				}
+			}
+			require.Same(t, epoch, client.epoch.Load(), "the refusal keeps the epoch of the caller")
+			require.Empty(t, requestsFor(server.recorded(), vsr.OperationCreateStream), "the create never went out")
+
+			refuse.Store(false)
+			require.Eventually(t, func() bool { return sessionBound(client) }, managedLinkTestBudget, managedLinkPoll,
+				"the recovery signs in again")
+			require.NoError(t, client.Ping(context.Background()))
+			var signIns []string
+			for _, read := range registerRequests(server) {
+				signIns = append(signIns, registerUsername(read.payload))
+			}
+			require.Greater(t, len(signIns), recoverySignIn, "the recovery signs in again after the refusal")
+			require.Equal(t, "iggy", signIns[0])
+			for _, signIn := range signIns[1:] {
+				require.Equal(t, "other", signIn, "the recovery signs in as the caller")
+			}
 		})
 	}
 }

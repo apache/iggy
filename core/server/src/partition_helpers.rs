@@ -684,7 +684,7 @@ async fn load_partition(
             &directory,
             namespace.inner(),
             partition_metadata.created_revision,
-            DiskStorage,
+            partitions::WalStorage::default(),
             config.partition.wal_bytes_max.as_bytes_u64(),
             runtime_options
                 .preallocate_segments

@@ -40,7 +40,6 @@ import org.apache.iggy.exception.IggyMissingCredentialsException;
 import org.apache.iggy.exception.IggyNotConnectedException;
 import org.apache.iggy.exception.IggyOperationException;
 import org.apache.iggy.exception.IggyServerException;
-import org.apache.iggy.exception.IggyTimeoutException;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
@@ -68,7 +67,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -877,10 +875,7 @@ class AsyncIggyTcpClientSessionRulesTest {
 
                 assertEndedByTheRefusal(signingIn, refusal);
                 assertEndedByTheRefusal(waiting, refusal);
-                assertThatThrownBy(() -> client.sendBinaryRequest(GET_STATS_CODE, new byte[0])
-                                .get(TIMEOUT_SECONDS, TimeUnit.SECONDS))
-                        .cause()
-                        .isInstanceOf(IggyNotConnectedException.class);
+                assertSignedOut(client);
                 assertThat(registers).as("the sign-ins with the token").hasValue(2);
             } finally {
                 refuse.complete(null);
@@ -950,6 +945,52 @@ class AsyncIggyTcpClientSessionRulesTest {
         }
     }
 
+    /**
+     * Before its first sign-in, a call asks the caller to sign in. After a logout it fails with 40 until the caller
+     * signs in again, as in Rust.
+     */
+    @Test
+    void shouldEndCallsWith40AfterALogoutUntilTheCallerSignsInAgain() throws Exception {
+        try (ServerSocket socket = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
+            AtomicInteger registers = new AtomicInteger();
+            AtomicInteger reads = new AtomicInteger();
+            var server = serve(socket, request -> {
+                if (request.operation() == VsrOperation.REGISTER) {
+                    return Response.success(
+                            VsrOperation.REGISTER, registerBody(FIRST_SESSION + registers.getAndIncrement()));
+                }
+                if (request.operation() == VsrOperation.LOGOUT) {
+                    return Response.success(VsrOperation.LOGOUT, Unpooled.EMPTY_BUFFER);
+                }
+                if (request.commandCode() == GET_STATS_CODE) {
+                    reads.incrementAndGet();
+                    return Response.success(VsrOperation.NON_REPLICATED, Unpooled.EMPTY_BUFFER);
+                }
+                return metadata(socket, request);
+            });
+            AsyncIggyTcpClient client = client(socket);
+            try {
+                client.connect().get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                assertThatThrownBy(() -> client.sendBinaryRequest(GET_STATS_CODE, new byte[0])
+                                .get(TIMEOUT_SECONDS, TimeUnit.SECONDS))
+                        .cause()
+                        .isInstanceOf(IggyNotConnectedException.class);
+                client.users().login("alice", "alice-password").get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                client.users().logout().get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+
+                assertSignedOut(client);
+                assertThat(reads).hasValue(0);
+
+                client.users().login("alice", "alice-password").get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                client.sendBinaryRequest(GET_STATS_CODE, new byte[0]).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                assertThat(reads).hasValue(1);
+            } finally {
+                client.close().get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            }
+            assertThat(server).isNotCompletedExceptionally();
+        }
+    }
+
     @ParameterizedTest(name = "failure={0}")
     @EnumSource(ExplicitFailure.class)
     @SuppressWarnings({"checkstyle:CyclomaticComplexity", "checkstyle:NPathComplexity"})
@@ -1006,9 +1047,11 @@ class AsyncIggyTcpClientSessionRulesTest {
                 if (cause instanceof IggyServerException refusal) {
                     assertThat(refusal.getRawErrorCode())
                             .isEqualTo(
-                                    failure == ExplicitFailure.LOGOUT_REFUSED
-                                            ? IggyErrorCode.UNAUTHENTICATED.getCode()
-                                            : IggyErrorCode.INVALID_CREDENTIALS.getCode());
+                                    switch (failure) {
+                                        case LOGOUT_REFUSED -> IggyErrorCode.UNAUTHENTICATED.getCode();
+                                        case REGISTER_REFUSED -> IggyErrorCode.INVALID_CREDENTIALS.getCode();
+                                        default -> IggyErrorCode.TRANSIENT_NOT_ACCEPTED.getCode();
+                                    });
                 }
                 assertSignedOut(client);
                 assertThat(reads).hasValue(0);
@@ -1057,8 +1100,7 @@ class AsyncIggyTcpClientSessionRulesTest {
                 switch (ending) {
                     case QUEUED_TIMEOUT -> {
                         var later = client.users().login("bob", "bob-password");
-                        assertThatThrownBy(() -> later.get(TIMEOUT_SECONDS, TimeUnit.SECONDS))
-                                .hasCauseInstanceOf(TimeoutException.class);
+                        assertServerError(later, IggyErrorCode.TRANSIENT_NOT_ACCEPTED.getCode());
                     }
                     case CANCELLED -> assertThat(first.cancel(false)).isTrue();
                     default -> {
@@ -1079,11 +1121,10 @@ class AsyncIggyTcpClientSessionRulesTest {
         }
     }
 
-    private static void assertSignedOut(AsyncIggyTcpClient client) {
-        assertThatThrownBy(() ->
-                        client.sendBinaryRequest(GET_STATS_CODE, new byte[0]).get(TIMEOUT_SECONDS, TimeUnit.SECONDS))
-                .cause()
-                .isInstanceOf(IggyNotConnectedException.class);
+    /** A call fails with 40 until the caller signs in again, as in Rust. */
+    static void assertSignedOut(AsyncIggyTcpClient client) {
+        assertServerError(
+                client.sendBinaryRequest(GET_STATS_CODE, new byte[0]), IggyErrorCode.UNAUTHENTICATED.getCode());
     }
 
     private enum SettlementEnd {
@@ -1097,9 +1138,9 @@ class AsyncIggyTcpClientSessionRulesTest {
         INVALID_TOKEN(IggyInvalidArgumentException.class),
         MISSING_CREDENTIALS(IggyMissingCredentialsException.class),
         LOGOUT_REFUSED(IggyServerException.class),
-        LOGOUT_TIMEOUT(IggyTimeoutException.class),
+        LOGOUT_TIMEOUT(IggyServerException.class),
         REGISTER_REFUSED(IggyServerException.class),
-        REGISTER_TIMEOUT(IggyTimeoutException.class);
+        REGISTER_TIMEOUT(IggyServerException.class);
 
         private final Class<? extends Throwable> errorType;
 

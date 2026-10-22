@@ -276,7 +276,9 @@ impl PartitionTeardown {
             self.io.drain().await?;
             if let Some(persistence) = &self.persistence {
                 persistence.retire();
-                persistence.drain_with_timeout().await?;
+                persistence
+                    .drain_with_timeout(compio::runtime::time::sleep)
+                    .await?;
             }
             Ok(())
         })

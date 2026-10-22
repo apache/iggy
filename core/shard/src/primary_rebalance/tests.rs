@@ -95,7 +95,6 @@ impl MessageBus for RecordingBus {
 
     fn set_connection_lost_fn(&self, _callback: message_bus::ConnectionLostFn) {}
     fn set_replica_forward_fn(&self, _callback: message_bus::ReplicaForwardFn) {}
-    fn set_client_forward_fn(&self, _callback: message_bus::ClientForwardFn) {}
 }
 
 type TestShard<SB = PingPongSuperblock> = IggyShard<

@@ -20,6 +20,7 @@ package tcp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
@@ -635,8 +636,10 @@ func (c *IggyTcpClient) sessionRecovers(ctx context.Context, err error) bool {
 // waitForRecovery waits while an automatic recovery replaces a lost session,
 // or a Connect signs in, so a call that starts or restarts meanwhile runs
 // under the new session. A sign-in that binds no session by the deadline ends
-// the call with 58. A sign-in, logout or disconnect of the caller, and a
-// refused automatic sign-in, end the calls that started before them with 40.
+// the call with 58, and so does a Connect that the server refuses for a reason
+// other than its credentials. A sign-in, logout or disconnect of the caller,
+// and a refusal of the credentials of an automatic sign-in, end the calls that
+// started before them with 40.
 func (c *IggyTcpClient) waitForRecovery(ctx context.Context) error {
 	epoch := c.callEpoch(ctx)
 	for {
@@ -649,11 +652,12 @@ func (c *IggyTcpClient) waitForRecovery(ctx context.Context) error {
 			return err
 		}
 		var signInEnded <-chan struct{}
+		var attempt *connectAttempt
 		if unbound && recovery != nil && recovery.Err() == nil {
 			signInEnded = recovery.Done()
 		} else if unbound && signsIn {
 			c.connectMu.Lock()
-			if attempt := c.connectionAttempt; attempt != nil {
+			if attempt = c.connectionAttempt; attempt != nil {
 				signInEnded = attempt.done
 			}
 			c.connectMu.Unlock()
@@ -663,6 +667,10 @@ func (c *IggyTcpClient) waitForRecovery(ctx context.Context) error {
 		}
 		select {
 		case <-signInEnded:
+			var refusal *signInRefusal
+			if attempt != nil && errors.As(attempt.err, &refusal) && !epoch.over() {
+				return fmt.Errorf("%w: %w", ierror.ErrTransientNotAccepted, refusal.err)
+			}
 		case <-epoch.ended:
 		case <-ctx.Done():
 			return ierror.ErrTransientNotAccepted

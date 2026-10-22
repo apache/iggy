@@ -25,6 +25,7 @@ import org.apache.iggy.client.ConnectionInfo;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.Request;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.Response;
 import org.apache.iggy.exception.IggyErrorCode;
+import org.apache.iggy.serde.CommandCode;
 import org.junit.jupiter.api.Test;
 
 import java.net.InetAddress;
@@ -33,8 +34,10 @@ import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
 
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.BIND_SESSION_CODE;
@@ -49,6 +52,7 @@ import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailov
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.serve;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.threeNodeMetadata;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * A request that replays after a lost link is not routed, so it belongs on the metadata primary. The replay tries
@@ -58,6 +62,7 @@ class AsyncIggyTcpClientLostLinkReplayTest {
     private static final int TEST_TIMEOUT_SECONDS = 5;
     private static final int BACKLOG = 4;
     private static final int MAX_REPLAY_ROUNDS = 100;
+    private static final int PING_CODE = CommandCode.System.PING.getValue();
 
     @Test
     void shouldReplayALostMutationOnTheMetadataPrimaryBeforeTheNextRosterNode() throws Exception {
@@ -176,6 +181,106 @@ class AsyncIggyTcpClientLostLinkReplayTest {
             }
             assertThat(serving).isNotCompletedExceptionally();
         }
+    }
+
+    /**
+     * The link of the client drops, and the next one drops during the bind that a mutation waits for. The mutation
+     * sent nothing, so it waits for another link within its deadline and goes out there once, as in Rust.
+     */
+    @Test
+    void shouldSendAnUnsentMutationOnTheNextLinkWhenItsLinkDropsDuringTheBind() throws Exception {
+        // The link of the sign-in, the link whose bind drops and the link that carries the mutation.
+        int links = 3;
+        try (ServerSocket socket = new ServerSocket(0, links, InetAddress.getLoopbackAddress())) {
+            AtomicInteger binds = new AtomicInteger();
+            List<Request> writes = new CopyOnWriteArrayList<>();
+            var serving = serve(socket, links, request -> {
+                if (request.is(BIND_SESSION_CODE, OPERATION_NON_REPLICATED)) {
+                    return binds.incrementAndGet() == 1
+                            ? Response.disconnect()
+                            : Response.success(OPERATION_NON_REPLICATED, bindBody(request));
+                }
+                if (request.operation() == OPERATION_CREATE_STREAM) {
+                    writes.add(request);
+                    return Response.success(
+                            OPERATION_CREATE_STREAM, Unpooled.buffer().writeIntLE(0));
+                }
+                return answerSignIn(request, socket);
+            });
+            AsyncIggyTcpClient client = client(socket);
+            try {
+                client.connect().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                client.login().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                dropTheLink(client);
+
+                client.sendBinaryRequest(CREATE_STREAM_CODE, new byte[0]).get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+
+                assertThat(binds).hasValue(2);
+                assertThat(writes).hasSize(1);
+            } finally {
+                client.close().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            }
+            serving.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        }
+    }
+
+    /** No link opens after the link of the client drops, so a mutation that sent nothing ends with 58 at its deadline. */
+    @Test
+    void shouldEndAnUnsentMutationWith58WhenNoLinkOpensBeforeItsDeadline() throws Exception {
+        try (ServerSocket socket = new ServerSocket(0, BACKLOG, InetAddress.getLoopbackAddress())) {
+            List<Request> writes = new CopyOnWriteArrayList<>();
+            var serving = serve(socket, request -> {
+                if (request.operation() == OPERATION_CREATE_STREAM) {
+                    writes.add(request);
+                    return Response.success(
+                            OPERATION_CREATE_STREAM, Unpooled.buffer().writeIntLE(0));
+                }
+                return answerSignIn(request, socket);
+            });
+            AsyncIggyTcpClient client = AsyncIggyTcpClient.builder()
+                    .host(socket.getInetAddress().getHostAddress())
+                    .port(socket.getLocalPort())
+                    .credentials("iggy", "iggy")
+                    .requestTimeout(Duration.ofSeconds(1))
+                    .heartbeatInterval(Duration.ofHours(1))
+                    .build();
+            try {
+                client.connect().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                client.login().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                dropTheLink(client);
+                serving.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                socket.close();
+
+                AsyncIggyTcpClientTransientFailoverTest.assertServerError(
+                        client.sendBinaryRequest(CREATE_STREAM_CODE, new byte[0]),
+                        IggyErrorCode.TRANSIENT_NOT_ACCEPTED.getCode());
+                assertThat(writes).isEmpty();
+            } finally {
+                client.close().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            }
+        }
+    }
+
+    /** Sends a ping that the node answers by dropping the link. The ping went out, so it fails at once. */
+    private static void dropTheLink(AsyncIggyTcpClient client) {
+        assertThatThrownBy(() ->
+                        client.sendBinaryRequest(PING_CODE, new byte[0]).get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+                .isInstanceOf(ExecutionException.class);
+    }
+
+    private static Response answerSignIn(Request request, ServerSocket socket) {
+        if (request.operation() == OPERATION_REGISTER) {
+            return Response.success(OPERATION_REGISTER, registerBody(1));
+        }
+        if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+            return Response.success(
+                    OPERATION_NON_REPLICATED,
+                    AsyncIggyTcpClientTransientFailoverTest.singleNodeMetadata(socket.getLocalPort()));
+        }
+        if (request.is(PING_CODE, OPERATION_NON_REPLICATED)) {
+            return Response.disconnect();
+        }
+        throw new IllegalStateException("Unexpected request " + request);
     }
 
     private static Response answerDataSlot(Request request, Supplier<ByteBuf> roster) {

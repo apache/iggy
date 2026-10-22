@@ -64,6 +64,17 @@ func TestFeatures(t *testing.T) {
 			},
 		})
 	}
+	if feature == "all" || feature == "session_contract" {
+		suites = append(suites, godog.TestSuite{
+			ScenarioInitializer: initSessionContractScenario,
+			Options: &godog.Options{
+				Format:   "pretty",
+				Paths:    []string{"../../scenarios/session_contract.feature"},
+				Strict:   true,
+				TestingT: t,
+			},
+		})
+	}
 
 	if len(suites) == 0 {
 		t.Fatalf("unknown BDD_FEATURE=%q", feature)

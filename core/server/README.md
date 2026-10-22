@@ -178,20 +178,20 @@ write can still commit. The body `id` 57 (`TransientNotCommitted`) or the body
 again, because a resend is a new request that can apply twice. The Rust, C# and
 Java SDKs never resend such a write, and the Rust SDK reports it as 57.
 
-Metadata forwards, partition relays and metadata-floor waits share a limit of
+Metadata forwards and partition relays share a limit of
 128 concurrent forwards per node. New forwards at capacity return 503 `forward_busy` with
 `Retry-After: 1`. Metadata forwarding has one 30-second retry budget beginning
 before the request body is buffered, so a slow upload leaves less time for
 forwarding. Partition requests share a 10-second deadline across their metadata
 wait, local attempts, relays and reply waits.
 
-Socket replies use `message_bus.client_queue_capacity` per connection. A reply
-that cannot enter the non-waiting queue closes that connection, leaving the
-caller to recover any uncertain operation. Paths that wait for reply space hold
-their bounded permit until delivery or connection teardown. An administrative
-client that stops reading can retain that bounded queue until delivery, overflow
-or teardown; consumer-group heartbeat eviction does not apply to an admin-only
-connection.
+A node sends one metadata-floor read at a time and holds no forward slot for it. The read serves every linearizable read that arrived before it was sent, and the reads that arrive while it is in flight share the next one.
+
+Socket replies use `message_bus.client_queue_capacity` per connection. A reply that cannot enter the non-waiting queue closes that connection, leaving the caller to recover any uncertain operation. Paths that wait for reply space hold their bounded permit until delivery or connection teardown.
+
+A reply that waits longer than `message_bus.client_write_stall_timeout` (30 seconds by default) closes the connection, so a client that stops reading its socket, an administrative one included, holds its queue and request tasks for at most that long.
+
+Requests queued behind the ones a connection runs are capped at 1024 frames and at `message_bus.client_request_queue_bytes_max` (256 MiB by default). A request past either cap gets 58 (`TransientNotAccepted`), unless the queue is empty.
 
 ### Metadata freshness and counters
 

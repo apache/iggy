@@ -110,15 +110,11 @@ impl From<Command> for FrameCommandLabel {
 /// Variant labels used in `frame_drops_total`. Exposed as constants to
 /// catch typos at compile time and to keep the cardinality bounded.
 ///
-/// `FORWARD_CLIENT_SEND` ticks when the cross-shard client-reply forward
-/// closure fails. Unlike `CONSENSUS` drops (which VSR retransmit
-/// recovers), a `FORWARD_CLIENT_SEND` drop is terminal: the client never
-/// receives the reply and request / response semantics break above the
-/// bus. Operators should alert on this pair in the scrape (backed by the
-/// drop-site `tracing` logs) and size `inbox_capacity` for the worst-case
-/// cross-shard reply burst.
-/// `FORWARD_REPLICA_SEND` is the symmetric variant for replica forwards;
-/// VSR retransmit covers its loss so it stays informational.
+/// `FORWARD_CLIENT_SEND` ticks when the pump cannot send a deny a synchronous
+/// caller staged by client id. The production bus refuses every frame sent by
+/// id, so only a raw request without a reply channel ends up here.
+/// `FORWARD_REPLICA_SEND` ticks when a replica forward fails. VSR retransmit
+/// covers its loss, so it stays informational.
 ///
 /// `PARTITION` covers the partition plane: a frame shed because the namespace
 /// had not materialised and its park buffer was at capacity
@@ -293,6 +289,8 @@ pub struct ShardMetrics {
     partition_requests_denied_transient_total: Counter,
     partition_prepare_gap_drops_total: Counter,
     metadata_prepare_gap_drops_total: Counter,
+    partition_applied_log_contradictions_total: Counter,
+    metadata_applied_log_contradictions_total: Counter,
     metadata_read_frontier_refusals_total: Counter,
     client_requests_denied_queue_full_total: Counter,
     replica_socket_reads_total: Counter,
@@ -370,6 +368,8 @@ impl ShardMetrics {
             partition_requests_denied_transient_total: Counter::default(),
             partition_prepare_gap_drops_total: Counter::default(),
             metadata_prepare_gap_drops_total: Counter::default(),
+            partition_applied_log_contradictions_total: Counter::default(),
+            metadata_applied_log_contradictions_total: Counter::default(),
             metadata_read_frontier_refusals_total: Counter::default(),
             client_requests_denied_queue_full_total: Counter::default(),
             replica_socket_reads_total: Counter::default(),
@@ -838,6 +838,40 @@ impl ShardMetrics {
         self.metadata_prepare_gap_drops_total.get()
     }
 
+    /// Add the views whose logs a partition refused for contradicting an op
+    /// it applied, drained from `VsrConsensus::take_applied_log_contradictions`.
+    ///
+    /// A refusing replica keeps refusing every later log of that quorum, so it
+    /// drops out of its group. Any non-zero value is a safety violation that
+    /// needs an operator. Shard-scoped for the reason given at
+    /// [`Self::record_partition_prepare_gap_drops`].
+    pub fn record_partition_applied_log_contradictions(&self, views: u64) {
+        self.partition_applied_log_contradictions_total
+            .inc_by(views);
+    }
+
+    /// Snapshot of `partition_applied_log_contradictions_total`. Test/simulator
+    /// accessor.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn partition_applied_log_contradictions_value(&self) -> u64 {
+        self.partition_applied_log_contradictions_total.get()
+    }
+
+    /// The metadata sibling of
+    /// [`Self::record_partition_applied_log_contradictions`].
+    pub fn record_metadata_applied_log_contradictions(&self, views: u64) {
+        self.metadata_applied_log_contradictions_total.inc_by(views);
+    }
+
+    /// Snapshot of `metadata_applied_log_contradictions_total`. Test/simulator
+    /// accessor.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn metadata_applied_log_contradictions_value(&self) -> u64 {
+        self.metadata_applied_log_contradictions_total.get()
+    }
+
     /// Snapshot of `partition_frames_rejected_stale_total`. Test/simulator
     /// accessor, readable from any crate under those cfgs so the crates that
     /// drive the reconciler can assert a reject did not happen.
@@ -997,6 +1031,18 @@ impl ShardMetrics {
             "metadata_prepare_gap_drops",
             "replicated metadata prepares dropped out of order by a backup's gap check",
             self.metadata_prepare_gap_drops_total.clone(),
+        );
+        registry.register(
+            "partition_applied_log_contradictions",
+            "views whose partition log this replica refused for naming another prepare at an op \
+             it applied; non-zero is a safety violation",
+            self.partition_applied_log_contradictions_total.clone(),
+        );
+        registry.register(
+            "metadata_applied_log_contradictions",
+            "views whose metadata log this replica refused for naming another prepare at an op \
+             it applied; non-zero is a safety violation",
+            self.metadata_applied_log_contradictions_total.clone(),
         );
         registry.register(
             "metadata_read_frontier_refusals",

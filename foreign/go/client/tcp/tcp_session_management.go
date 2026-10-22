@@ -106,6 +106,9 @@ func (c *IggyTcpClient) register(ctx context.Context, code command.Code, credent
 			err = ended
 		} else if callerCtx != nil && callerCtx.Err() != nil && unanswered(err) {
 			err = callerCtx.Err()
+		} else if callerCtx != nil && callerCtx.Err() == nil && (errors.Is(err, context.DeadlineExceeded) ||
+			errors.Is(err, ierror.ErrTransientNotCommitted) && errors.Is(ctx.Err(), context.DeadlineExceeded)) {
+			err = ierror.ErrTransientNotAccepted
 		}
 		c.mtx.Lock()
 		var stopped func(bool)
@@ -346,7 +349,7 @@ func (c *IggyTcpClient) establishSession(ctx context.Context, link *tcpLink) err
 			var refusal *signInRefusal
 			if errors.As(err, &refusal) {
 				err = refusal.err
-				retry, ended := c.endRefusedSignIn(epoch, credentials, err)
+				retry, refused := c.endRefusedSignIn(epoch, credentials, err)
 				if retry {
 					link.close(err)
 					link, err = c.links.connect(ctx)
@@ -355,8 +358,8 @@ func (c *IggyTcpClient) establishSession(ctx context.Context, link *tcpLink) err
 					}
 					continue
 				}
-				if ended {
-					// Connect returns its own refusal, not the 40 of the epoch it ended.
+				if refused {
+					// Connect returns its own refusal, also when it ended the epoch.
 					link.close(err)
 					return refusal
 				}
@@ -463,7 +466,7 @@ func (c *IggyTcpClient) invalidateSessionLocked() {
 }
 
 // signInEpoch lasts from one sign-in, logout or disconnect of the caller, or
-// one terminal automatic sign-in refusal, to the next. A call keeps its
+// one refusal of the credentials of an automatic sign-in, to the next. A call keeps its
 // starting epoch, so only the SDK's own recovery continues it, and no call goes out
 // under a later sign-in. The client replaces its epoch only under mtx, and a
 // call reads it without the lock as it starts.
@@ -529,13 +532,16 @@ func (c *IggyTcpClient) recoverSession(expected uint64) {
 		}
 		// The session loss stopped every link and the heartbeat, so only
 		// this task brings the client back. A sign-in that the server never
-		// answered goes again, until an answer, a sign-in by the caller or a
-		// disconnect ends the recovery.
+		// answered, or refused for a reason other than its credentials, goes
+		// again, until a session, a refusal of the credentials, a sign-in by
+		// the caller or a disconnect ends the recovery.
 		for retry := uint32(0); ; retry++ {
 			signInCtx, endSignIn := context.WithTimeout(ctx, responseReadTimeout)
-			err := c.Connect(signInCtx)
+			err := c.connect(signInCtx)
 			endSignIn()
-			if err == nil || !c.config.reconnection.enabled || !unanswered(err) ||
+			var refusal *signInRefusal
+			owed := unanswered(err) || errors.As(err, &refusal) && !credentialRefused(refusal.err)
+			if err == nil || !c.config.reconnection.enabled || !owed ||
 				c.pause(ctx, reconnectDelay(c.config.reconnection.interval, retry)) != nil {
 				return
 			}
@@ -552,25 +558,27 @@ func (r *signInRefusal) Error() string { return r.err.Error() }
 func (r *signInRefusal) Unwrap() error { return r.err }
 
 // endRefusedSignIn retries only credentials updated by this same owner.
-// A refusal of its current credentials blocks fallback until an explicit login.
-// ended reports whether the refusal ended the epoch. It is false when a newer
-// owner ended the epoch first.
-func (c *IggyTcpClient) endRefusedSignIn(epoch *signInEpoch, attempted Credentials, refusal error) (retry, ended bool) {
+// A refusal of its current credentials ends the epoch and blocks fallback until
+// an explicit login. Any other refusal keeps the epoch, so the session stays
+// owed. refused reports whether the refusal answers the current epoch. It is
+// false when a newer owner ended the epoch first.
+func (c *IggyTcpClient) endRefusedSignIn(epoch *signInEpoch, attempted Credentials, refusal error) (retry, refused bool) {
 	c.logger.Error("The server refused the automatic sign-in", slog.Any("error", refusal))
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
 	if c.epoch.Load() != epoch {
 		return false, false
 	}
-	if credentialRefused(refusal) {
-		current, enabled := c.signInCredentialsLocked()
-		if enabled && current != attempted {
-			return true, false
-		}
-		c.rememberedLogin = AutoLogin{}
-		c.autoLoginBlocked = true
-		c.loggedOut = true
+	if !credentialRefused(refusal) {
+		return false, true
 	}
+	current, enabled := c.signInCredentialsLocked()
+	if enabled && current != attempted {
+		return true, false
+	}
+	c.rememberedLogin = AutoLogin{}
+	c.autoLoginBlocked = true
+	c.loggedOut = true
 	c.endSignInEpochLocked(refusal)
 	return false, true
 }

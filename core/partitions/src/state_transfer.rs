@@ -4486,7 +4486,11 @@ where
                 },
                 crate::PartitionIoStep::Pending => {
                     if let Some(persistence) = &self.persistence {
-                        if let Err(source) = persistence.drain_with_timeout().await
+                        if let Err(source) = persistence
+                            .drain_with_timeout(|timeout| {
+                                self.consensus().message_bus().sleep(timeout)
+                            })
+                            .await
                             && let Some(crate::iggy_partition::PendingPartitionTransition::Install(
                                 mut install,
                             )) = self.transition.take()

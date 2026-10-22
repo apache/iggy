@@ -42,7 +42,6 @@ import io.netty.util.concurrent.DefaultThreadFactory;
 import io.netty.util.concurrent.Future;
 import io.netty.util.concurrent.FutureListener;
 import io.netty.util.concurrent.GlobalEventExecutor;
-import io.netty.util.concurrent.ScheduledFuture;
 import org.apache.iggy.client.ConnectionInfo;
 import org.apache.iggy.client.async.tcp.vsr.ConsensusSession;
 import org.apache.iggy.client.async.tcp.vsr.VsrFrameDecoder;
@@ -144,13 +143,9 @@ public class AsyncTcpConnection {
     private final IntConsumer sessionResetListener;
     private final BiConsumer<AsyncTcpConnection, Throwable> connectionFailureListener;
     private final long requestTimeoutNanos;
-    private final long heartbeatIntervalNanos;
-    private final Object heartbeatLock = new Object();
+    private final ConnectionHeartbeat heartbeat;
     // Shared with the connections that bind this session, see bindSharedSession.
     private volatile SessionLogin login = new SessionLogin();
-    private ScheduledFuture<?> heartbeatTask;
-    private boolean heartbeatRunning;
-    private volatile Runnable heartbeatListener = () -> {};
     private BooleanSupplier signInOwed = () -> false;
     private volatile CredentialsListener credentialsListener = (source, previousUsername, username, password) -> {};
     private volatile LongConsumer signInRefusedListener = lineage -> {};
@@ -202,7 +197,6 @@ public class AsyncTcpConnection {
         this.sessionResetListener = sessionResetListener;
         this.connectionFailureListener = connectionFailureListener;
         this.requestTimeoutNanos = toTimeoutNanos(requestTimeout.orElse(DEFAULT_REQUEST_TIMEOUT));
-        this.heartbeatIntervalNanos = toTimeoutNanos(heartbeatInterval);
         SslContext sslContext = null;
         if (enableTls) {
             try {
@@ -219,6 +213,8 @@ public class AsyncTcpConnection {
         this.ownsEventLoopGroup = sharedEventLoopGroup.isEmpty();
         this.eventLoopGroup = sharedEventLoopGroup.orElseGet(() -> newEventLoopGroup(ioThreads));
         this.eventLoop = eventLoopGroup.next();
+        this.heartbeat = new ConnectionHeartbeat(
+                eventLoop, toTimeoutNanos(heartbeatInterval), this::sendHeartbeat, isClosed::get);
 
         long dialTimeoutMillis =
                 connectionTimeout.orElse(DEFAULT_CONNECTION_TIMEOUT).toMillis();
@@ -262,7 +258,7 @@ public class AsyncTcpConnection {
             if (f.isSuccess()) {
                 channelPool.release(f.getNow()).addListener(release -> {
                     if (release.isSuccess()) {
-                        startHeartbeat();
+                        heartbeat.start();
                         future.complete(null);
                     } else {
                         future.completeExceptionally(release.cause());
@@ -280,65 +276,16 @@ public class AsyncTcpConnection {
         return future;
     }
 
-    private void startHeartbeat() {
-        synchronized (heartbeatLock) {
-            if (heartbeatRunning || isClosed.get()) {
-                return;
-            }
-            heartbeatRunning = true;
-            scheduleNextHeartbeat();
-        }
-    }
-
-    private void scheduleNextHeartbeat() {
-        synchronized (heartbeatLock) {
-            if (!heartbeatRunning || isClosed.get()) {
-                return;
-            }
-            try {
-                heartbeatTask = eventLoop.schedule(this::sendHeartbeat, heartbeatIntervalNanos, TimeUnit.NANOSECONDS);
-            } catch (RejectedExecutionException loopGone) {
-                // Only a caller-owned group shuts down under a live connection.
-                heartbeatRunning = false;
-                log.warn("Event loop rejected the heartbeat, stopping it: {}", loopGone.getMessage());
-            }
-        }
-    }
-
-    private void sendHeartbeat() {
-        synchronized (heartbeatLock) {
-            heartbeatTask = null;
-            if (!heartbeatRunning || isClosed.get()) {
-                return;
-            }
-        }
-        CompletableFuture<ByteBuf> heartbeat;
-        try {
-            TransientFailoverState state = new TransientFailoverState();
-            state.heartbeat = true;
-            heartbeat = send(CommandCode.System.PING.getValue(), Unpooled.EMPTY_BUFFER, 0, state);
-        } catch (RuntimeException error) {
-            log.warn("Failed to send heartbeat: {}", error.getMessage());
-            scheduleNextHeartbeat();
-            return;
-        }
-        heartbeat.whenComplete((response, error) -> {
-            if (response != null) {
-                response.release();
-            }
-            if (error != null && !isClosed.get()) {
-                log.warn("Heartbeat failed: {}", error.getMessage());
-            }
-            scheduleNextHeartbeat();
-            if (error == null) {
-                heartbeatListener.run();
-            }
-        });
+    /** Sends a ping whose timed-out reply counts as a lost link, see completeRequest. */
+    private CompletableFuture<ByteBuf> sendHeartbeat() {
+        TransientFailoverState state = new TransientFailoverState();
+        state.heartbeat = true;
+        return send(CommandCode.System.PING.getValue(), Unpooled.EMPTY_BUFFER, 0, state);
     }
 
     /** Runs after each heartbeat that the server answered. */
     void onHeartbeat(Runnable listener, BooleanSupplier owed) {
-        heartbeatListener = listener;
+        heartbeat.onAnswered(listener);
         signInOwed = owed;
     }
 
@@ -402,20 +349,8 @@ public class AsyncTcpConnection {
         signInRefusedListener = listener;
     }
 
-    private void stopHeartbeat() {
-        synchronized (heartbeatLock) {
-            heartbeatRunning = false;
-            if (heartbeatTask != null) {
-                heartbeatTask.cancel(false);
-                heartbeatTask = null;
-            }
-        }
-    }
-
     boolean heartbeatScheduled() {
-        synchronized (heartbeatLock) {
-            return heartbeatTask != null;
-        }
+        return heartbeat.scheduled();
     }
 
     EventLoop eventLoop() {
@@ -634,7 +569,7 @@ public class AsyncTcpConnection {
                 payload.release();
                 notifyConnectionFailure(f.cause());
                 if (settles) {
-                    call.fail(mapAcquireException(f.cause()));
+                    completeFailedRequest(call, mapAcquireException(f.cause()));
                 }
             } else if (!settles || call.callerFuture().isDone()) {
                 payload.release();
@@ -810,42 +745,41 @@ public class AsyncTcpConnection {
             channel.close();
             notifyConnectionFailure(new IggyConnectionException("The heartbeat reply timed out", cause));
         }
-        completeFailedRequest(commandCode, failoverPayload, requestDeadlineNanos, callerFuture, failoverState, error);
-    }
-
-    /**
-     * Retries unsent calls after session recovery and transient refusals after a leader recheck.
-     * Routed calls and terminal failures return to their caller.
-     */
-    @SuppressWarnings({"checkstyle:CyclomaticComplexity", "checkstyle:NPathComplexity"})
-    private void completeFailedRequest(
-            int commandCode,
-            ByteBuf failoverPayload,
-            long requestDeadlineNanos,
-            CompletableFuture<ByteBuf> callerFuture,
-            TransientFailoverState failoverState,
-            Throwable error) {
-        Throwable cause = unwrap(error);
         if (cause instanceof IggyConnectionException || cause instanceof java.io.IOException) {
             notifyConnectionFailure(cause);
         }
+        completeFailedRequest(
+                new Call(commandCode, failoverPayload, requestDeadlineNanos, callerFuture, failoverState), error);
+    }
+
+    /**
+     * Retries unsent calls after session recovery, and transient refusals and links lost before the frame went out
+     * after a leader recheck, as in Rust. Routed calls and terminal failures return to their caller.
+     */
+    @SuppressWarnings({"checkstyle:CyclomaticComplexity", "checkstyle:NPathComplexity"})
+    private void completeFailedRequest(Call call, Throwable error) {
+        Throwable cause = unwrap(error);
+        TransientFailoverState failoverState = call.state();
         if (failoverState.routed) {
-            releaseIfPresent(failoverPayload);
-            callerFuture.completeExceptionally(failoverState.linkFailed ? new LinkFailure(error) : error);
+            releaseIfPresent(call.failoverPayload());
+            call.callerFuture().completeExceptionally(failoverState.linkFailed ? new LinkFailure(error) : error);
             return;
         }
-        Call call = new Call(commandCode, failoverPayload, requestDeadlineNanos, callerFuture, failoverState);
         IggyServerException serverError = findServerError(error);
         boolean notPrimaryInARow = failoverState.notPrimary;
         failoverState.notPrimary = serverError != null && serverError.getRawErrorCode() == NOT_PRIMARY;
-        if (failoverPayload == null || call.over()) {
+        // Only a link that failed a registered frame can have carried it.
+        boolean unsentLoss = lostLink(failoverState, cause) && !failoverState.linkFailed;
+        if (call.failoverPayload() == null || call.over()) {
             call.end(error);
         } else if (failoverState.ticket != null && failoverState.ticket.takeRestart()) {
             restartUnderSession(call);
-        } else if (!isRefusal(serverError) && !(failoverState.uncertain && lostLink(failoverState, cause))) {
+        } else if (!isRefusal(serverError)
+                && !unsentLoss
+                && !(failoverState.uncertain && lostLink(failoverState, cause))) {
             call.end(error);
         } else {
-            failoverState.refused |= isRefusal(serverError);
+            failoverState.refused |= isRefusal(serverError) || unsentLoss;
             if (!failoverState.notPrimary || notPrimaryInARow) {
                 pauseBeforeRecheck(call, cause);
             } else {
@@ -1069,7 +1003,7 @@ public class AsyncTcpConnection {
             Channel channel, long requestDeadlineNanos, TransientFailoverState callerState) {
         return authenticationSnapshot()
                 .map(current -> sendAuthenticationFrame(channel, current, requestDeadlineNanos, callerState))
-                .orElseGet(() -> CompletableFuture.failedFuture(new IggyNotConnectedException(NOT_AUTHENTICATED)));
+                .orElseGet(() -> CompletableFuture.failedFuture(IggyAuthenticator.notSignedIn(this)));
     }
 
     /** Lets the client redial after a pool acquire failure or expired reply. */
@@ -1365,7 +1299,10 @@ public class AsyncTcpConnection {
                                 && exchange.failoverState().ticket != null));
         exchange.failoverState().uncertain = nextUncertain;
         exchange.failoverState().everUncertain |= wasUncertain || nextUncertain;
-        if (exchange.failoverState().ticket != null && (isRefusal(serverError) || PollRouter.isNamespaceMiss(error))) {
+        if (exchange.failoverState().ticket != null
+                && (isRefusal(serverError)
+                        || (serverError != null && serverError.getRawErrorCode() == LIFECYCLE_BUSY)
+                        || PollRouter.isNamespaceMiss(error))) {
             exchange.failoverState().ticket.settleSent(nextUncertain);
         }
         if (shouldRetryTransient(
@@ -1704,7 +1641,7 @@ public class AsyncTcpConnection {
         if (!isClosed.compareAndSet(false, true)) {
             return CompletableFuture.completedFuture(null);
         }
-        stopHeartbeat();
+        heartbeat.stop();
         if (consensusSession.owner() == consensusSession) {
             consensusSession.reset();
         }
@@ -1766,8 +1703,9 @@ public class AsyncTcpConnection {
 
         /**
          * Ends the call with {@code error}, or with its uncertainty when an attempt can have taken effect. A call
-         * that a 58 or 89 refusal sent to another attempt and that its deadline ends without another answer reports
-         * 58, as the deadline of the Rust driver reports the refusal of a call that no node admitted.
+         * that a 58 or 89 refusal or a link lost before its frame went out sent to another attempt, and that its
+         * deadline ends without another answer, reports 58, as the deadline of the Rust driver reports the refusal
+         * of a call that no node admitted.
          */
         void end(Throwable error) {
             releaseIfPresent(failoverPayload);
@@ -1814,7 +1752,7 @@ public class AsyncTcpConnection {
         private boolean everUncertain;
         // The last attempt got NOT_PRIMARY, so another one in a row pauses first, see pauseBeforeRecheck.
         private boolean notPrimary;
-        // A 58 or 89 refusal sent the call to another attempt, see Call#end.
+        // A 58 or 89 refusal or a link lost before the frame went out sent the call to another attempt, see Call#end.
         private boolean refused;
         private long pauseCeilingNanos = RETRY_BACKOFF_BASE.toNanos();
         private ConsensusSession.LaneKey lane;

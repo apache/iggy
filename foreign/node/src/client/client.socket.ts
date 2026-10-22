@@ -388,8 +388,7 @@ export class CommandResponseStream extends EventEmitter {
         }
         sent ||= attempt.started;
         if (generation !== this.routingGeneration && attempt.started && (replicated || progress))
-          throw new OperationUncertainError(operation?.retainable ? operation.id : undefined,
-            attempt.error ?? responseError(command, TRANSIENT_NOT_ACCEPTED));
+          throw uncertainOutcome(command, operation, attempt.error ?? responseError(command, TRANSIENT_NOT_ACCEPTED));
         // A committed rejection proves the outcome even when it also ends the session.
         if (operation?.uncertain && attempt.committed && attempt.error) {
           operation.uncertain = false;
@@ -404,7 +403,7 @@ export class CommandResponseStream extends EventEmitter {
             (attempt.started && (replicated || progress) && attempt.error instanceof VsrEvictionError);
           this.recoverSession(generation);
           if (uncertain)
-            throw new OperationUncertainError(operation?.retainable ? operation.id : undefined, attempt.error);
+            throw uncertainOutcome(command, operation, attempt.error);
           // An eviction fails every exchange of its link, also one never written.
           if (restartable && exchanged && !attempt.started && generation !== this.routingGeneration) continue;
           throw attempt.error;
@@ -439,13 +438,18 @@ export class CommandResponseStream extends EventEmitter {
         notPrimary = code === NOT_PRIMARY;
         if (code === TRANSIENT_NOT_COMMITTED) {
           if (operation?.retainable) operation.uncertain = true;
-          else if (!safeRead) throw new OperationUncertainError(undefined, error);
+          else if (!safeRead) throw error;
         } else if (code === OPERATION_NOT_RETAINED) {
           if (operation?.retainable) operation.uncertain = true;
-          throw new OperationUncertainError(operation?.retainable ? operation.id : undefined, error);
+          throw uncertainOutcome(command, operation, error);
         } else if (code === NOT_PRIMARY || code === TRANSIENT_NOT_ACCEPTED) {
           if (selected) this.invalidateRoute(selected, code === NOT_PRIMARY);
           refresh = true;
+          if (code === NOT_PRIMARY) {
+            // Neither 58 nor 89 admitted the call, so the deadline reports both as 58.
+            lastRefusal = responseError(command, TRANSIENT_NOT_ACCEPTED);
+            lastRefusal.fromServer = true;
+          }
           if (code === NOT_PRIMARY && !repeatedNotPrimary) continue;
         } else if (code === HISTORY_UNAVAILABLE && !operation?.uncertain) {
           if (selected) this.invalidateRoute(selected, false);
@@ -496,7 +500,7 @@ export class CommandResponseStream extends EventEmitter {
         } else {
           if (attempt.started) {
             if (operation?.retainable) operation.uncertain = true;
-            else if (!safeRead) throw new OperationUncertainError(undefined, error);
+            else if (!safeRead) throw uncertainOutcome(command, operation, error);
           }
           // NotConnectedError and an exhausted link leave no link up or
           // redialing, so the call fails now instead of at its deadline.
@@ -1158,6 +1162,8 @@ export class CommandResponseStream extends EventEmitter {
         this.signInCredentials = undefined;
         this.resetSession();
       }
+      if (error instanceof VsrResponseTimeoutError)
+        throw responseError(command, TRANSIENT_NOT_ACCEPTED);
       throw error;
     } finally { release(); }
   }
@@ -1257,6 +1263,13 @@ const isTransient = (code: number): boolean =>
 const unauthenticated = (command: number, cause: unknown): ResponseError => {
   const error = responseError(command, UNAUTHENTICATED);
   if (cause !== undefined) error.cause = cause;
+  return error;
+};
+/** An unknown outcome. Only a retainable operation has an ID to resolve, any other call ends with 57. */
+const uncertainOutcome = (command: number, operation: ClientOperation | undefined, cause: unknown): Error => {
+  if (operation?.retainable) return new OperationUncertainError(operation.id, cause);
+  const error = responseError(command, TRANSIENT_NOT_COMMITTED);
+  error.cause = cause;
   return error;
 };
 const isDetachedFailure = (error: unknown): boolean =>

@@ -496,7 +496,7 @@ func (e InvalidPersonalAccessTokenExpiry) Is(target error) bool {
 
 type TransientNotCommitted struct{}
 
-func (e TransientNotCommitted) Error() string { return "request transiently not committed; retry" }
+func (e TransientNotCommitted) Error() string { return "request outcome unknown; it may have applied" }
 func (e TransientNotCommitted) Code() Code    { return 57 }
 func (e TransientNotCommitted) Is(target error) bool {
 	_, ok := target.(TransientNotCommitted)
@@ -2378,12 +2378,11 @@ func (e CannotDeleteConsumerGroupInfo) Is(target error) bool {
 }
 
 type ConsumerGroupPartitionNotOwned struct {
-	ClientId    uint32
 	PartitionId uint32
 }
 
 func (e ConsumerGroupPartitionNotOwned) Error() string {
-	return fmt.Sprintf("consumer group member with VSR client ID: %d does not own partition: %d at the current generation (rebalance in progress).", e.ClientId, e.PartitionId)
+	return fmt.Sprintf("consumer group member does not own partition: %d at the current generation (rebalance in progress).", e.PartitionId)
 }
 func (e ConsumerGroupPartitionNotOwned) Code() Code { return 5009 }
 func (e ConsumerGroupPartitionNotOwned) Is(target error) bool {

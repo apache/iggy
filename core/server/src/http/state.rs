@@ -21,9 +21,12 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::future::{Future, poll_fn};
 use std::net::IpAddr;
+use std::ops::ControlFlow;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::task::{Poll, Waker};
 
 use axum::http::{HeaderName, HeaderValue};
 use axum::response::Response;
@@ -195,6 +198,84 @@ pub(in crate::http) struct ForwardState {
     pub(in crate::http) body_limit: usize,
     pub(in crate::http) in_flight: Rc<Cell<u32>>,
     pub(in crate::http) relay_targets: RelayTargets,
+    pub(in crate::http) floor_reads: FloorReads,
+}
+
+/// This node's metadata floor reads, single flight. A read already sent can
+/// miss an op acknowledged after it left, so it serves only the waiters that
+/// came before it was sent. The waiters that come while it is in flight share
+/// the next read, which the first of them sends once it ends.
+#[derive(Default)]
+pub(in crate::http) struct FloorReads {
+    /// Reads sent so far, which also numbers each read.
+    sent: Cell<u64>,
+    in_flight: Cell<bool>,
+    /// The number and outcome of the newest read that ended.
+    ended: Cell<Option<(u64, ControlFlow<Option<u64>>)>>,
+    /// Waiters parked until the read in flight ends.
+    parked: RefCell<Vec<Waker>>,
+}
+
+impl FloorReads {
+    /// The outcome of a read sent after this call. A waiter shares the read in
+    /// flight only when it was sent after the waiter came, and otherwise sends
+    /// the next one with `read` unless another waiter sent it first.
+    pub(in crate::http) async fn read<F>(
+        &self,
+        read: impl FnOnce() -> F,
+    ) -> ControlFlow<Option<u64>>
+    where
+        F: Future<Output = ControlFlow<Option<u64>>>,
+    {
+        let sent_before = self.sent.get();
+        loop {
+            if let Some((number, outcome)) = self.ended.get()
+                && number > sent_before
+            {
+                return outcome;
+            }
+            if !self.in_flight.get() {
+                break;
+            }
+            self.park().await;
+        }
+        let number = self.sent.get() + 1;
+        self.sent.set(number);
+        self.in_flight.set(true);
+        let sending = SentFloorRead { reads: self };
+        let outcome = read().await;
+        self.ended.set(Some((number, outcome)));
+        drop(sending);
+        outcome
+    }
+
+    async fn park(&self) {
+        let mut parked = false;
+        poll_fn(|context| {
+            if parked {
+                return Poll::Ready(());
+            }
+            parked = true;
+            self.parked.borrow_mut().push(context.waker().clone());
+            Poll::Pending
+        })
+        .await;
+    }
+}
+
+/// The read in flight. Its drop ends it, also when its waiter is dropped
+/// mid-read, and wakes the parked waiters so one of them sends the next read.
+struct SentFloorRead<'a> {
+    reads: &'a FloorReads,
+}
+
+impl Drop for SentFloorRead<'_> {
+    fn drop(&mut self) {
+        self.reads.in_flight.set(false);
+        for waker in self.reads.parked.take() {
+            waker.wake();
+        }
+    }
 }
 
 impl ForwardState {

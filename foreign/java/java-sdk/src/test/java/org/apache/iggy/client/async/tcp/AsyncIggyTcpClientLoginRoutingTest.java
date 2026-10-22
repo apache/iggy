@@ -22,6 +22,7 @@ package org.apache.iggy.client.async.tcp;
 import org.apache.iggy.client.ConnectionInfo;
 import org.apache.iggy.client.async.tcp.vsr.ConsensusSession;
 import org.apache.iggy.client.async.tcp.vsr.VsrFrameDecoder;
+import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.user.IdentityInfo;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -35,7 +36,6 @@ import java.util.Queue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
@@ -177,7 +177,8 @@ class AsyncIggyTcpClientLoginRoutingTest {
             queuedAttempts.incrementAndGet();
             return CompletableFuture.completedFuture(SECOND_IDENTITY);
         });
-        assertThatThrownBy(() -> expired.get(5, TimeUnit.SECONDS)).hasCauseInstanceOf(TimeoutException.class);
+        AsyncIggyTcpClientTransientFailoverTest.assertServerError(
+                expired, IggyErrorCode.TRANSIENT_NOT_ACCEPTED.getCode());
         var successor = client.loginOnLeader(deadline -> {
             queuedAttempts.incrementAndGet();
             return CompletableFuture.completedFuture(SECOND_IDENTITY);

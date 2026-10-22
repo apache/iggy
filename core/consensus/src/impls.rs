@@ -1460,6 +1460,8 @@ where
     /// Views whose logs were refused for naming a different prepare at an op
     /// this replica applied; see [`Self::contradicts_applied_log`].
     applied_log_contradictions: Cell<u64>,
+    /// Part of `applied_log_contradictions` already handed to a metric.
+    applied_log_contradictions_taken: Cell<u64>,
     /// Newest view counted in `applied_log_contradictions`.
     contradiction_reported_view: Cell<Option<u32>>,
 
@@ -1835,6 +1837,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             eager_commit: Cell::new(false),
             commit_announcements: RefCell::new(CommitAnnouncements::new(replica_count)),
             applied_log_contradictions: Cell::new(0),
+            applied_log_contradictions_taken: Cell::new(0),
             contradiction_reported_view: Cell::new(None),
             clock,
         }
@@ -4074,6 +4077,14 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.applied_log_contradictions.get()
     }
 
+    /// Views counted by [`Self::applied_log_contradictions`] since the last
+    /// call. The total keeps counting, so invariants still read it whole.
+    #[must_use]
+    pub const fn take_applied_log_contradictions(&self) -> u64 {
+        let total = self.applied_log_contradictions.get();
+        total - self.applied_log_contradictions_taken.replace(total)
+    }
+
     /// [`Self::handle_start_view_guarded`] for a caller that cannot read back the
     /// prepares it applied.
     ///
@@ -5930,7 +5941,6 @@ pub mod test_bus {
 
         fn set_connection_lost_fn(&self, _f: message_bus::ConnectionLostFn) {}
         fn set_replica_forward_fn(&self, _f: message_bus::ReplicaForwardFn) {}
-        fn set_client_forward_fn(&self, _f: message_bus::ClientForwardFn) {}
         fn track_background(&self, _handle: message_bus::JoinHandle<()>) {}
     }
 }
@@ -6634,7 +6644,6 @@ mod vsr_consensus_tests {
         fn track_background(&self, _handle: message_bus::JoinHandle<()>) {}
         fn set_connection_lost_fn(&self, _f: message_bus::ConnectionLostFn) {}
         fn set_replica_forward_fn(&self, _f: message_bus::ReplicaForwardFn) {}
-        fn set_client_forward_fn(&self, _f: message_bus::ClientForwardFn) {}
     }
 
     #[test]

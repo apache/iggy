@@ -234,7 +234,11 @@ public partial class IggyConsumer : IAsyncDisposable
         }
     }
 
-    private protected bool RecordDelivery(ulong offset, uint partition, PartitionContext context)
+    // Under AfterReceive a message counts as delivered once its loop body completes, in CommitDeliveredAsync.
+    private protected bool BeginDelivery(ulong offset, uint partition, PartitionContext context) =>
+        _config.AutoCommitMode == AutoCommitMode.AfterReceive ? !IsDisposed : RecordDelivery(offset, partition, context);
+
+    private bool RecordDelivery(ulong offset, uint partition, PartitionContext context)
     {
         lock (_deliveryGate)
         {
@@ -255,7 +259,9 @@ public partial class IggyConsumer : IAsyncDisposable
         first.Incarnation == second.Incarnation && first.OwnerGeneration == second.OwnerGeneration;
 
     private protected Task CommitDeliveredAsync(ulong offset, uint partition, PartitionContext context, CancellationToken ct) =>
-        StoreOffsetCoreAsync(offset, partition, context, ct, afterReceive: true);
+        RecordDelivery(offset, partition, context)
+            ? StoreOffsetCoreAsync(offset, partition, context, ct, afterReceive: true)
+            : Task.CompletedTask;
 
     /// <summary>
     ///     Initializes the consumer by logging in (if needed) and setting up consumer groups
@@ -336,7 +342,7 @@ public partial class IggyConsumer : IAsyncDisposable
                 continue;
             }
 
-            if (!RecordDelivery(message.CurrentOffset, message.PartitionId, message.Context))
+            if (!BeginDelivery(message.CurrentOffset, message.PartitionId, message.Context))
             {
                 yield break;
             }

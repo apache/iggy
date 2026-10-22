@@ -118,7 +118,7 @@ final class IggyAuthenticator {
             return CompletableFuture.failedFuture(new IggyServerException(IggyErrorCode.UNAUTHENTICATED.getCode()));
         }
         if (!signInOwed.getAsBoolean()) {
-            return CompletableFuture.failedFuture(new IggyNotConnectedException(AsyncTcpConnection.NOT_AUTHENTICATED));
+            return CompletableFuture.failedFuture(notSignedIn(connection));
         }
         // Register binds the session before publishing the connection's authentication state.
         return connection
@@ -134,7 +134,7 @@ final class IggyAuthenticator {
             AsyncTcpConnection.TransientFailoverState state) {
         var authentication = connection.authenticationSnapshot();
         if (authentication.isEmpty()) {
-            return CompletableFuture.failedFuture(new IggyNotConnectedException(AsyncTcpConnection.NOT_AUTHENTICATED));
+            return CompletableFuture.failedFuture(notSignedIn(connection));
         }
         var snapshot = authentication.get();
         return ensureAuthenticated(
@@ -142,6 +142,17 @@ final class IggyAuthenticator {
                 snapshot.payload(),
                 connection.authenticationGeneration(),
                 ignored -> connection.sendAuthenticationFrame(channel, snapshot, deadline, state));
+    }
+
+    /**
+     * The error of a call that needs a session while no sign-in can bring one: 40 once the caller began a sign-in,
+     * as in Rust, so after a logout, a refused automatic sign-in or a failed sign-in. Before that, the caller has to
+     * sign in first.
+     */
+    static RuntimeException notSignedIn(AsyncTcpConnection connection) {
+        return connection.sessionOwner().beganSignIn()
+                ? new IggyServerException(IggyErrorCode.UNAUTHENTICATED.getCode())
+                : new IggyNotConnectedException(AsyncTcpConnection.NOT_AUTHENTICATED);
     }
 
     static void setAuthGeneration(Channel channel, long generation) {

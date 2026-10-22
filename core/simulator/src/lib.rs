@@ -27,6 +27,8 @@ pub mod seeds;
 pub mod storage;
 pub mod workload;
 
+mod partition_wal;
+
 use bus::SimOutbox;
 use client::SimClient;
 use clock::Clock;
@@ -37,7 +39,8 @@ use deps::{MemStorage, SimJournal};
 use executor::{DetExecutor, RunOutcome, TaskId};
 use iggy_binary_protocol::primitives::partition_history::{ConsumerGroupOwner, PartitionContext};
 use iggy_binary_protocol::{
-    Command, GenericHeader, PrepareHeader, ReplyHeader, RequestHeader, RoutedRequestHeader,
+    Command, CommitHeader, DoViewChangeHeader, GenericHeader, PrepareHeader, ReplyHeader,
+    RequestHeader, RoutedRequestHeader, StartViewChangeHeader, StartViewHeader,
 };
 use iggy_common::IggyError;
 use message_bus::MessageBus;
@@ -55,7 +58,7 @@ use rand_xoshiro::rand_core::SeedableRng;
 use replica::{Replica, SIM_INBOX_CAPACITY, new_shard};
 use seeds::SimSeeds;
 use server_common::Message;
-use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
+use server_common::sharding::{IggyNamespace, METADATA_GROUP, PartitionLocation, ShardId};
 use shard::shards_table::{ShardsTable, calculate_shard_assignment};
 use shard::{CONSENSUS_TICK_INTERVAL, PartitionMaterialisation};
 use std::cell::RefCell;
@@ -65,6 +68,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use storage::{Crash, SimStorage};
 
 /// Poll budget per [`DetExecutor::run_until_stalled`]. Pumps are event-driven, so
 /// hitting it means a task is spin-waking: a bug, panicked with the seed.
@@ -103,6 +107,9 @@ pub struct SimReplica {
     /// persist gate marks every view durable without writing, leaving the gate, its
     /// write-failure fence and view recovery unexercised.
     pub partition_superblocks: RefCell<HashMap<IggyNamespace, (u64, Rc<SimSuperblock>)>>,
+    /// The disk under every partition WAL of this replica, retained across a
+    /// restart like `superblock`. A crash keeps only what the WAL synced.
+    pub partition_storage: SimStorage,
     /// One retained message log per partition group, plus the offsets recovered from
     /// it. A real server's messages are in segment files; the simulator has none, so
     /// without this a rebuilt partition comes back empty and the monotonicity
@@ -236,6 +243,10 @@ pub struct Simulator {
     /// their committed per-assignment views. Later seeds reuse the same choice
     /// so replicas cannot initialize one group with different views.
     partition_created_views: HashMap<IggyNamespace, u32>,
+    /// Highest view in which each replica sent a view-scoped message of a
+    /// partition group, keyed with the incarnation it hosted when the message
+    /// left. A restart may forget a later view only if it sent nothing in it.
+    partition_sent_views: HashMap<(u8, IggyNamespace, u64), u32>,
     /// Replies a setup handshake pulled off the wire that were not its own.
     ///
     /// `await_setup_reply` steps the whole simulator, so it sees every client's
@@ -564,6 +575,7 @@ impl Simulator {
                 metadata_journal,
                 metadata_incarnation,
                 partition_superblocks: RefCell::new(HashMap::new()),
+                partition_storage: SimStorage::default(),
                 partition_logs: RefCell::new(HashMap::new()),
                 deferred_partitions: RefCell::new(BTreeSet::new()),
                 data_dir: replica_data_dir,
@@ -587,6 +599,7 @@ impl Simulator {
             entry_rng: Xoshiro256PlusPlus::seed_from_u64(SimSeeds::derive(seed).entry_shard),
             evicted: Vec::new(),
             partition_created_views: HashMap::new(),
+            partition_sent_views: HashMap::new(),
             deferred_client_replies: Vec::new(),
             seed,
             shell,
@@ -993,6 +1006,14 @@ impl Simulator {
                 let message = match envelope.payload {
                     bus::EnvelopePayload::Replica(m) | bus::EnvelopePayload::Client(m) => m,
                 };
+                if let Some((namespace, incarnation, view)) = view_scoped_partition_frame(&message)
+                {
+                    let sent = self
+                        .partition_sent_views
+                        .entry((i as u8, namespace, incarnation))
+                        .or_default();
+                    *sent = (*sent).max(view);
+                }
                 self.network.submit(from, to, message);
             }
         }
@@ -1388,6 +1409,12 @@ impl Simulator {
         // Discard any unsent messages (never reached the wire).
         self.outboxes[replica_index as usize].drain();
 
+        // Power loss: the WAL keeps only what it synced. Handles the dead
+        // process held go stale, as they do across a real restart.
+        self.replicas[replica_index as usize]
+            .partition_storage
+            .crash(Crash::PowerLoss);
+
         // Block all network links to/from this process.
         self.network
             .process_disable(ProcessId::Replica(replica_index));
@@ -1432,6 +1459,7 @@ impl Simulator {
         // partition reads the record in its directory.
         let partition_superblocks =
             std::mem::take(&mut *self.replicas[idx].partition_superblocks.borrow_mut());
+        let partition_storage = self.replicas[idx].partition_storage.clone();
         // Take each live partition's log while its shard still stands: a real
         // server's messages are in segment files its boot recovers the offset counter
         // from, so rebuilding with nothing would model total data loss rather than a
@@ -1548,6 +1576,7 @@ impl Simulator {
             metadata_journal,
             metadata_incarnation,
             partition_superblocks: RefCell::new(partition_superblocks),
+            partition_storage,
             partition_logs: RefCell::new(partition_logs),
             deferred_partitions: RefCell::new(BTreeSet::new()),
             data_dir: replica_data_dir,
@@ -1762,6 +1791,19 @@ impl Simulator {
     /// Consensus view for a replica's partition-plane group, or `None` if that
     /// replica does not host the namespace.
     #[must_use]
+    /// Highest view in which `replica_idx` sent a view-scoped message of
+    /// `incarnation` of `namespace`, or `None` when it sent none.
+    pub(crate) fn partition_sent_view(
+        &self,
+        replica_idx: u8,
+        namespace: IggyNamespace,
+        incarnation: u64,
+    ) -> Option<u32> {
+        self.partition_sent_views
+            .get(&(replica_idx, namespace, incarnation))
+            .copied()
+    }
+
     pub(crate) fn consensus_view(
         &self,
         replica_idx: usize,
@@ -1986,6 +2028,7 @@ fn materialise_partition(
                 Ordering::Less => {
                     stores.remove(&namespace);
                     replica.partition_logs.borrow_mut().remove(&namespace);
+                    partition_wal::remove(&replica.partition_storage, namespace, stored);
                 }
                 Ordering::Equal => {}
             }
@@ -2008,15 +2051,26 @@ fn materialise_partition(
     // Removed rather than cloned: the rebuilt partition becomes its sole owner, and
     // a second materialisation with no restart between would otherwise resurrect a
     // log the live partition has moved past.
-    let retained = replica.partition_logs.borrow_mut().remove(&namespace);
-    replica.shards[usize::from(owner)].init_partition(
-        namespace,
-        Some(superblock),
-        recovered_state.as_ref(),
-        retained,
-        PartitionMaterialisation::new(epoch, created_view, first_initialization)
-            .with_consumer_offsets_max(consumer_offsets_max),
-    );
+    let mut retained = replica.partition_logs.borrow_mut().remove(&namespace);
+    let owner_shard = &replica.shards[usize::from(owner)];
+    // The live group holds this incarnation's WAL lease; a second open is refused.
+    if !owner_shard.plane.partitions().contains(&namespace) {
+        let persistence = partition_wal::reopen(
+            &replica.partition_storage,
+            namespace,
+            epoch,
+            retained.as_mut(),
+        );
+        owner_shard.init_partition(
+            namespace,
+            Some(superblock),
+            recovered_state.as_ref(),
+            retained,
+            persistence,
+            PartitionMaterialisation::new(epoch, created_view, first_initialization)
+                .with_consumer_offsets_max(consumer_offsets_max),
+        );
+    }
     for shard in &replica.shards {
         shard.shards_table().insert(
             namespace,
@@ -2024,6 +2078,47 @@ fn materialise_partition(
         );
     }
     true
+}
+
+/// The partition group, incarnation and view of a message the persist gate
+/// holds until the replica's view is durable, or `None` for any other message.
+/// `PrepareOk` names no incarnation, so it is left out.
+fn view_scoped_partition_frame(
+    message: &Message<GenericHeader>,
+) -> Option<(IggyNamespace, u64, u32)> {
+    let (group, incarnation) = match message.header().command {
+        Command::Prepare => {
+            let header = message.try_as_typed::<PrepareHeader>().ok()?.header();
+            (header.group, header.partition_incarnation)
+        }
+        Command::Commit => {
+            let header = message.try_as_typed::<CommitHeader>().ok()?.header();
+            (header.group, header.partition_incarnation)
+        }
+        Command::StartViewChange => {
+            let header = message
+                .try_as_typed::<StartViewChangeHeader>()
+                .ok()?
+                .header();
+            (header.group, header.partition_incarnation)
+        }
+        Command::DoViewChange => {
+            let header = message.try_as_typed::<DoViewChangeHeader>().ok()?.header();
+            (header.group, header.partition_incarnation)
+        }
+        Command::StartView => {
+            let header = message.try_as_typed::<StartViewHeader>().ok()?.header();
+            (header.group, header.partition_incarnation)
+        }
+        _ => return None,
+    };
+    (group != METADATA_GROUP).then(|| {
+        (
+            IggyNamespace::from_raw(group),
+            incarnation,
+            message.header().view,
+        )
+    })
 }
 
 /// How long the reconciler lets a revocation wait for its drain, in microseconds.
@@ -3861,6 +3956,7 @@ mod tests {
             None,
             None,
             None,
+            crate::partition_wal::reopen(&replica.partition_storage, fixture, named + 1, None),
             PartitionMaterialisation::new(named + 1, created_view, true),
         );
         assert_eq!(sim.partition_incarnation(FORGED, fixture), Some(named + 1));
@@ -8249,12 +8345,15 @@ mod tests {
             });
             executor.run_until_stalled(POLL_BUDGET); // borrow acquired; task parks
             let grow = Rc::clone(&sim.replicas[0].shards[0]);
+            let persistence =
+                crate::partition_wal::reopen(&SimStorage::default(), ns_grow, 0, None);
             executor.spawn(async move {
                 grow.init_partition(
                     ns_grow,
                     None,
                     None,
                     None,
+                    persistence,
                     PartitionMaterialisation::new(0, 0, true),
                 );
             });
@@ -8290,12 +8389,14 @@ mod tests {
         });
         executor.run_until_stalled(POLL_BUDGET);
         let grow = Rc::clone(&sim.replicas[0].shards[0]);
+        let persistence = crate::partition_wal::reopen(&SimStorage::default(), ns_grow, 0, None);
         executor.spawn(async move {
             grow.init_partition(
                 ns_grow,
                 None,
                 None,
                 None,
+                persistence,
                 PartitionMaterialisation::new(0, 0, true),
             );
         });

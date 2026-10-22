@@ -55,7 +55,7 @@ public partial class IggyConsumer
                 continue;
             }
 
-            if (!RecordDelivery(message.CurrentOffset, message.PartitionId, message.Context))
+            if (!BeginDelivery(message.CurrentOffset, message.PartitionId, message.Context))
             {
                 message.Dispose();
                 yield break;

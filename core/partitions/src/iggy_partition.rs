@@ -288,8 +288,6 @@ where
     #[cfg(test)]
     offset_dir_sync_count: Cell<usize>,
     pub(crate) required_metadata_frontier: u64,
-    #[cfg(feature = "simulator")]
-    ideal_storage: bool,
     /// Durable superblock for this partition's consensus group, recording
     /// `(view, log_view)` across a crash so this replica can never
     /// re-participate in a view older than one it advertised. `None` for
@@ -910,8 +908,6 @@ where
             #[cfg(test)]
             offset_dir_sync_count: Cell::new(0),
             required_metadata_frontier: 0,
-            #[cfg(feature = "simulator")]
-            ideal_storage: false,
             superblock: None,
             superblock_lock: Rc::new(LocalGate::new()),
             superblock_intent: Cell::new(None),
@@ -1388,13 +1384,6 @@ where
         }
     }
 
-    /// The consensus simulator retains every journal write across crashes.
-    /// This does not model filesystem barriers or physical storage failures.
-    #[cfg(feature = "simulator")]
-    pub const fn enable_ideal_storage(&mut self) {
-        self.ideal_storage = true;
-    }
-
     #[must_use]
     pub fn with_in_memory_storage(
         stats: Arc<PartitionStats>,
@@ -1607,7 +1596,7 @@ where
                 &directory,
                 self.namespace().inner(),
                 self.created_revision(),
-                journal::durable_storage::DiskStorage,
+                crate::WalStorage::default(),
                 capacity,
                 self.runtime_options
                     .preallocate_segments
@@ -1649,10 +1638,13 @@ where
                     .message_bus()
                     .spawn(Rc::clone(&persistence).run());
             }
-            persistence.drain_with_timeout().await.map_err(|error| {
-                warn!(%error, "cannot enable partition segment persistence");
-                IggyError::CannotSyncFile
-            })?;
+            persistence
+                .drain_with_timeout(|timeout| self.consensus.message_bus().sleep(timeout))
+                .await
+                .map_err(|error| {
+                    warn!(%error, "cannot enable partition segment persistence");
+                    IggyError::CannotSyncFile
+                })?;
         }
         self.restore_certified_log_view(&persistence).await?;
         if !self.materialization_missing && persistence.recovered_frontier() {
@@ -1727,7 +1719,7 @@ where
                     .spawn(Rc::clone(persistence).run());
             }
             persistence
-                .drain_with_timeout()
+                .drain_with_timeout(|timeout| self.consensus.message_bus().sleep(timeout))
                 .await
                 .map_err(|_| IggyError::CannotSyncFile)?;
         }
@@ -2321,10 +2313,6 @@ where
     }
 
     pub fn register_rebuilt_ack(&self, header: &PrepareHeader) -> bool {
-        #[cfg(feature = "simulator")]
-        if self.ideal_storage {
-            return true;
-        }
         // State-transfer admission uses the accepted WAL head to protect every
         // acknowledged op, including replicated prepares adopted in a new view.
         let accepted = self
@@ -2981,6 +2969,39 @@ where
         self.dirty_offset.store(dirty, Ordering::Relaxed);
         self.offset_space = offset_space;
         self.recovered_durable_offset = offset_space.committed_seeded.then_some(durable);
+    }
+
+    /// Attach the WAL the simulator reopened from its filesystem model, as
+    /// [`Self::open_persistence_with_recovered`] attaches one after segment
+    /// recovery. The adopted log stands in for the replayed prepares, so it must
+    /// hold exactly what the WAL holds above the applied prefix.
+    #[cfg(feature = "simulator")]
+    pub fn attach_simulated_persistence(&mut self, persistence: Rc<PartitionPersistence>) {
+        // New empty WALs carry view zero; positive certificates belong to recovered history.
+        if self.recovered_log_view.is_none()
+            && persistence.head() == 0
+            && matches!(persistence.certified_log_view(), None | Some(0))
+        {
+            persistence.certify_log_view(self.consensus.log_view(), 0, 0);
+        } else {
+            match persistence.certified_log_view() {
+                Some(view) if view >= self.consensus.log_view() => {
+                    if view > self.consensus.view() {
+                        self.consensus.set_view(view);
+                    }
+                    self.consensus.set_log_view(view);
+                }
+                _ => {
+                    self.materialization_missing = true;
+                    self.ensure_materialization_recovery();
+                }
+            }
+        }
+        if !self.materialization_missing && persistence.recovered_frontier() {
+            self.consensus.set_recovery_election_allowed(true);
+        }
+        self.persistence = Some(persistence);
+        self.start_persistence();
     }
 
     #[cfg(any(test, feature = "simulator"))]
@@ -8944,7 +8965,7 @@ where
             persistence.truncate_from(from_op);
             self.start_persistence();
             persistence
-                .drain_with_timeout()
+                .drain_with_timeout(|timeout| self.consensus.message_bus().sleep(timeout))
                 .await
                 .map_err(|_| IggyError::CannotSyncFile)?;
         }
@@ -8979,7 +9000,7 @@ where
             persistence.truncate_from(*ops.start());
             self.start_persistence();
             persistence
-                .drain_with_timeout()
+                .drain_with_timeout(|timeout| self.consensus.message_bus().sleep(timeout))
                 .await
                 .map_err(|_| IggyError::CannotSyncFile)?;
         }
@@ -9138,10 +9159,13 @@ where
             self.start_persistence();
             // Shutdown and transfer must finish the flush, but never drain while
             // holding the lock used to append new messages.
-            persistence.drain_with_timeout().await.map_err(|error| {
-                warn!(%error, "cannot flush committed partition messages");
-                IggyError::CannotSyncFile
-            })?;
+            persistence
+                .drain_with_timeout(|timeout| self.consensus.message_bus().sleep(timeout))
+                .await
+                .map_err(|error| {
+                    warn!(%error, "cannot flush committed partition messages");
+                    IggyError::CannotSyncFile
+                })?;
         }
         if self
             .commit_messages_inner(config, true, self.consensus.commit_max())
@@ -10654,7 +10678,7 @@ where
                 debug!(
                     namespace_raw = self.namespace().inner(),
                     client = header.client, op = header.op, %error,
-                    "client reply not routable by the bus; client will time out"
+                    "client reply has no route by client id"
                 );
             }
         }
@@ -11542,7 +11566,7 @@ where
             persistence.request_checkpoint();
             self.checkpoint_persistence(config).await;
             persistence
-                .drain_with_timeout()
+                .drain_with_timeout(|timeout| self.consensus.message_bus().sleep(timeout))
                 .await
                 .map_err(|_| IggyError::CannotSyncFile)?;
             if self.fatal.is_some() || persistence.checkpoint_op() != persistence.head() {
@@ -11689,10 +11713,13 @@ where
         {
             persistence.reanchor_segments(self.log.active_segment().start_offset);
             self.start_persistence();
-            persistence.drain_with_timeout().await.map_err(|error| {
-                warn!(%error, "cannot reanchor the partition WAL at its reserved offset");
-                IggyError::CannotSyncFile
-            })?;
+            persistence
+                .drain_with_timeout(|timeout| self.consensus.message_bus().sleep(timeout))
+                .await
+                .map_err(|error| {
+                    warn!(%error, "cannot reanchor the partition WAL at its reserved offset");
+                    IggyError::CannotSyncFile
+                })?;
         }
         Ok(())
     }
@@ -15218,7 +15245,10 @@ mod tests {
         assert_eq!(batch.iter().next().unwrap().payload, b"replacement");
         persistence.request_checkpoint();
         partition.checkpoint_persistence(&config).await;
-        persistence.drain_with_timeout().await.unwrap();
+        persistence
+            .drain_with_timeout(compio::runtime::time::sleep)
+            .await
+            .unwrap();
         assert!(persistence.failure().is_none());
         assert_eq!(persistence.checkpoint_op(), 2);
     }
@@ -15406,7 +15436,10 @@ mod tests {
                 persistence.append(prepare.into_frozen(), true).unwrap();
             }
             partition.start_persistence();
-            persistence.drain_with_timeout().await.unwrap();
+            persistence
+                .drain_with_timeout(compio::runtime::time::sleep)
+                .await
+                .unwrap();
 
             let rotated = directory.path().join("00000000000000000001.log");
             let metadata = std::fs::metadata(&rotated).unwrap();
@@ -16546,7 +16579,7 @@ mod tests {
             .persistence
             .as_ref()
             .unwrap()
-            .drain_with_timeout()
+            .drain_with_timeout(compio::runtime::time::sleep)
             .await
             .unwrap();
         backup.drive_persistence().await;
@@ -16749,7 +16782,7 @@ mod tests {
             .persistence
             .as_ref()
             .unwrap()
-            .drain_with_timeout()
+            .drain_with_timeout(compio::runtime::time::sleep)
             .await
             .unwrap();
         backup.drive_persistence().await;
@@ -16775,7 +16808,7 @@ mod tests {
             .persistence
             .as_ref()
             .unwrap()
-            .drain_with_timeout()
+            .drain_with_timeout(compio::runtime::time::sleep)
             .await
             .unwrap();
         backup.drive_persistence().await;
@@ -16846,7 +16879,10 @@ mod tests {
         assert!(!partition.register_rebuilt_ack(&header));
         assert!(partition.pending_persisted_acks.borrow().contains_key(&1));
         partition.start_persistence();
-        persistence.drain_with_timeout().await.unwrap();
+        persistence
+            .drain_with_timeout(compio::runtime::time::sleep)
+            .await
+            .unwrap();
         assert!(partition.register_rebuilt_ack(&header));
     }
 
@@ -16890,7 +16926,7 @@ mod tests {
                 .persistence
                 .as_ref()
                 .unwrap()
-                .drain_with_timeout()
+                .drain_with_timeout(compio::runtime::time::sleep)
                 .await
                 .unwrap();
             partition.drive_persistence().await;
@@ -16995,7 +17031,10 @@ mod tests {
             assert_eq!(partition.consensus().sequencer().current_sequence(), 3);
             partition.on_replicate(third.clone()).await;
             if let Some(persistence) = &partition.persistence {
-                persistence.drain_with_timeout().await.unwrap();
+                persistence
+                    .drain_with_timeout(compio::runtime::time::sleep)
+                    .await
+                    .unwrap();
             }
             partition.drive_persistence().await;
             assert_eq!(
@@ -17071,7 +17110,10 @@ mod tests {
         persistence.append(prepare.into_frozen(), true).unwrap();
         assert!(!partition.register_rebuilt_ack(&header));
         partition.start_persistence();
-        persistence.drain_with_timeout().await.unwrap();
+        persistence
+            .drain_with_timeout(compio::runtime::time::sleep)
+            .await
+            .unwrap();
 
         (directory, partition, header)
     }
@@ -17107,7 +17149,10 @@ mod tests {
         assert!(!partition.register_rebuilt_ack(&header));
         persistence.certify_log_view(3, header.op, header.checksum);
         partition.start_persistence();
-        persistence.drain_with_timeout().await.unwrap();
+        persistence
+            .drain_with_timeout(compio::runtime::time::sleep)
+            .await
+            .unwrap();
         let store = Rc::new(RecordingSuperblock::default());
         partition.set_superblock(store.clone(), None);
         assert!(partition.consensus().needs_superblock_persist());
@@ -21370,7 +21415,6 @@ mod tests {
 
         fn set_connection_lost_fn(&self, _f: message_bus::ConnectionLostFn) {}
         fn set_replica_forward_fn(&self, _f: message_bus::ReplicaForwardFn) {}
-        fn set_client_forward_fn(&self, _f: message_bus::ClientForwardFn) {}
     }
 
     pub(super) type SentFrames = Rc<RefCell<Vec<(u128, Frozen<MESSAGE_ALIGN>)>>>;
@@ -21640,7 +21684,10 @@ mod tests {
         let mut conclusion = RepairConclusion::InProgress;
         for _ in 0..COMPLETION_STEPS_MAX {
             conclusion = replica.complete_repair(&config).await;
-            persistence.drain_with_timeout().await.unwrap();
+            persistence
+                .drain_with_timeout(compio::runtime::time::sleep)
+                .await
+                .unwrap();
             replica.drive_persistence().await;
             if conclusion == RepairConclusion::Done {
                 break;
@@ -22104,7 +22151,10 @@ mod tests {
                                 );
                             }
                             if let Some(persistence) = &persistence {
-                                persistence.drain_with_timeout().await.unwrap();
+                                persistence
+                                    .drain_with_timeout(compio::runtime::time::sleep)
+                                    .await
+                                    .unwrap();
                                 assert!(partition.send_prepare_ok(&header).await);
                             }
                             partition.consensus().advance_commit_max(op);
@@ -22352,7 +22402,10 @@ mod tests {
         assert_eq!(persistence.head(), 2);
         assert_eq!(backup.consensus().sequencer().current_sequence(), 2);
         assert!(persistence.failure().is_none());
-        persistence.drain_with_timeout().await.unwrap();
+        persistence
+            .drain_with_timeout(compio::runtime::time::sleep)
+            .await
+            .unwrap();
         assert!(persistence.is_durable_through(2));
         backup.drive_persistence().await;
         assert!(
@@ -22490,7 +22543,10 @@ mod tests {
         }
         settle_partition_io(partition, config).await;
         let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
-        persistence.drain_with_timeout().await.unwrap();
+        persistence
+            .drain_with_timeout(compio::runtime::time::sleep)
+            .await
+            .unwrap();
         for completion in completions.take() {
             partition.on_persistence_completed(completion, config).await;
         }
@@ -22788,7 +22844,10 @@ mod tests {
                 crate::PartitionIoStep::Progress => {}
                 crate::PartitionIoStep::Pending => {
                     if let Some(persistence) = &partition.persistence {
-                        persistence.drain_with_timeout().await.unwrap();
+                        persistence
+                            .drain_with_timeout(compio::runtime::time::sleep)
+                            .await
+                            .unwrap();
                     } else {
                         compio::time::sleep(std::time::Duration::from_millis(1)).await;
                     }
@@ -23017,7 +23076,7 @@ mod tests {
                         .persistence
                         .as_ref()
                         .unwrap()
-                        .drain_with_timeout()
+                        .drain_with_timeout(compio::runtime::time::sleep)
                         .await
                         .unwrap();
                 }
@@ -24936,7 +24995,10 @@ mod tests {
         let held = checksummed_segment_prepare(HELD, 0, 0, b"retained");
         partition.on_replicate(held.clone()).await;
         let persistence = partition.persistence.as_ref().unwrap().clone();
-        persistence.drain_with_timeout().await.unwrap();
+        persistence
+            .drain_with_timeout(compio::runtime::time::sleep)
+            .await
+            .unwrap();
         assert_eq!(persistence.head(), HELD);
         assert_eq!(persistence.certified_log_view(), Some(0));
         assert!(
@@ -25080,7 +25142,10 @@ mod tests {
             partition.consensus().advance_commit_max(APPLIED);
             for _ in 0..COMMIT_ROUNDS_MAX {
                 partition.commit_journal(&config).await;
-                persistence.drain_with_timeout().await.unwrap();
+                persistence
+                    .drain_with_timeout(compio::runtime::time::sleep)
+                    .await
+                    .unwrap();
                 partition.drive_persistence().await;
                 if partition.consensus().commit_min() == APPLIED {
                     break;
@@ -25108,7 +25173,10 @@ mod tests {
                         break;
                     }
                     partition.resume_io(&config).await;
-                    persistence.drain_with_timeout().await.unwrap();
+                    persistence
+                        .drain_with_timeout(compio::runtime::time::sleep)
+                        .await
+                        .unwrap();
                 }
                 assert!(!partition.view_truncation_pending());
             } else {
@@ -25181,7 +25249,10 @@ mod tests {
         let persistence = Rc::clone(donor.persistence.as_ref().unwrap());
         persistence.request_checkpoint();
         donor.checkpoint_persistence(&config).await;
-        persistence.drain_with_timeout().await.unwrap();
+        persistence
+            .drain_with_timeout(compio::runtime::time::sleep)
+            .await
+            .unwrap();
         assert!(donor.fatal().is_none(), "{:?}", donor.fatal());
         assert_eq!(persistence.checkpoint_op(), commit_op);
         drop(persistence);
@@ -25209,7 +25280,10 @@ mod tests {
         // Each applied op waits on persistence, so drive it between commits.
         for _ in 0..COMMIT_ROUNDS_MAX {
             replica.commit_journal(config).await;
-            persistence.drain_with_timeout().await.unwrap();
+            persistence
+                .drain_with_timeout(compio::runtime::time::sleep)
+                .await
+                .unwrap();
             replica.drive_persistence().await;
             if replica.consensus().commit_min() == commit_op {
                 break;
@@ -25338,7 +25412,10 @@ mod tests {
 
         persistence.request_checkpoint();
         partition.checkpoint_persistence(&config).await;
-        persistence.drain_with_timeout().await.unwrap();
+        persistence
+            .drain_with_timeout(compio::runtime::time::sleep)
+            .await
+            .unwrap();
 
         assert!(partition.fatal().is_none());
         assert!(persistence.failure().is_none());
@@ -26516,7 +26593,10 @@ mod tests {
                 if partition.shutdown_io_complete() {
                     break;
                 }
-                persistence.drain_with_timeout().await.unwrap();
+                persistence
+                    .drain_with_timeout(compio::runtime::time::sleep)
+                    .await
+                    .unwrap();
             }
             assert!(
                 partition.shutdown_io_complete(),
@@ -31425,7 +31505,10 @@ mod tests {
             let persistence = backup.persistence.as_ref().unwrap();
             persistence.sync();
             backup.start_persistence();
-            persistence.drain_with_timeout().await.unwrap();
+            persistence
+                .drain_with_timeout(compio::runtime::time::sleep)
+                .await
+                .unwrap();
             assert!(persistence.is_durable_through(1), "{durability:?}");
             drop(backup);
 

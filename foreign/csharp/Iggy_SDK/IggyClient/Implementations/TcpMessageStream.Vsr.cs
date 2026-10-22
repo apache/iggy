@@ -157,6 +157,13 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
         catch (Exception error)
         {
             await ResetConsensusSessionAsync(error, owner: owner, interrupt: true);
+            if (deadline.IsCancellationRequested && !token.IsCancellationRequested
+                && !_clientLifetime.IsCancellationRequested
+                && error is VsrRequestOutcomeUnknownException or OperationCanceledException)
+            {
+                throw VsrError.Exception(VsrError.TRANSIENT_NOT_ACCEPTED,
+                    "No primary accepted the sign-in before its deadline.");
+            }
             throw;
         }
         finally

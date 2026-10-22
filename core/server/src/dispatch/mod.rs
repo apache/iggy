@@ -89,7 +89,37 @@ use std::sync::Arc;
 use std::task::{Poll, Waker};
 use tracing::{debug, warn};
 
-type ClientRequestQueues = Rc<RefCell<AHashMap<u128, VecDeque<QueuedClientRequest>>>>;
+type ClientRequestQueues = Rc<RefCell<AHashMap<u128, ClientRequestQueue>>>;
+
+/// The frames one connection has queued for its drain, and their bytes.
+#[derive(Default)]
+struct ClientRequestQueue {
+    requests: VecDeque<QueuedClientRequest>,
+    bytes: u64,
+}
+
+impl ClientRequestQueue {
+    fn push_back(&mut self, request: QueuedClientRequest) {
+        self.bytes += request.bytes();
+        self.requests.push_back(request);
+    }
+
+    fn remove(&mut self, index: usize) -> Option<QueuedClientRequest> {
+        let request = self.requests.remove(index)?;
+        self.bytes -= request.bytes();
+        Some(request)
+    }
+}
+
+impl FromIterator<QueuedClientRequest> for ClientRequestQueue {
+    fn from_iter<I: IntoIterator<Item = QueuedClientRequest>>(requests: I) -> Self {
+        let mut queue = Self::default();
+        for request in requests {
+            queue.push_back(request);
+        }
+        queue
+    }
+}
 
 struct QueuedClientRequest {
     origin: ClientOrigin,
@@ -105,6 +135,10 @@ impl QueuedClientRequest {
             message,
             progress: None,
         }
+    }
+
+    fn bytes(&self) -> u64 {
+        self.message.as_slice().len() as u64
     }
 
     fn progress_key(
@@ -140,7 +174,9 @@ impl QueuedClientRequest {
 /// re-issue it anywhere, including here once the queue drains. Sized far above
 /// any SDK's in-flight window, so it only ever fires under a genuine stall.
 /// The deny does not wait for room in the reply queue, so with that queue
-/// full it closes the connection.
+/// full it closes the connection. `message_bus.client_request_queue_bytes_max`
+/// bounds the same queue by bytes and refuses a frame past it the same way,
+/// unless the queue is empty.
 const MAX_QUEUED_CLIENT_REQUESTS: usize = 1024;
 type ActiveClientRequests = Rc<RefCell<AHashMap<u128, Rc<ClientDrain>>>>;
 type ConsumerProgress = (u64, u8, usize);
@@ -170,16 +206,23 @@ fn enqueue_client_request<B, MJ, S, SB>(
     // connection that sent it.
     let origin = ClientOrigin::capture(bus, client_id);
     {
+        let request = QueuedClientRequest::new(origin.queued(), message);
+        let bytes_max = server_config
+            .message_bus
+            .client_request_queue_bytes_max
+            .as_bytes_u64();
         let mut queues = queues.borrow_mut();
         let queue = queues.entry(client_id).or_default();
-        if queue.len() >= MAX_QUEUED_CLIENT_REQUESTS {
+        if queue.requests.len() >= MAX_QUEUED_CLIENT_REQUESTS
+            || (!queue.requests.is_empty() && queue.bytes + request.bytes() > bytes_max)
+        {
             // Borrow released before the deny, which spawns onto this same
             // task and would otherwise re-enter the table.
             drop(queues);
-            deny_overflowing_client_request(shard_handle, origin, message);
+            deny_overflowing_client_request(shard_handle, origin, request.message);
             return;
         }
-        queue.push_back(QueuedClientRequest::new(origin.queued(), message));
+        queue.push_back(request);
     }
     let running = active.borrow().get(&client_id).cloned();
     if let Some(drain) = running {
@@ -208,7 +251,8 @@ fn enqueue_client_request<B, MJ, S, SB>(
 }
 
 /// Answer a request that arrived with this client's queue already at
-/// [`MAX_QUEUED_CLIENT_REQUESTS`] with the retryable transient denial.
+/// [`MAX_QUEUED_CLIENT_REQUESTS`] or its byte budget with the retryable
+/// transient denial.
 ///
 /// Spawned rather than awaited: the enqueue path is sync (it runs straight off
 /// frame arrival) and the reply goes out on the bus. The header decodes as in
@@ -250,7 +294,6 @@ fn deny_overflowing_client_request<B, MJ, S, SB>(
         debug!(
             transport_client_id,
             operation = ?request.header().operation,
-            queued = MAX_QUEUED_CLIENT_REQUESTS,
             "denying client request retryable: this connection's request queue is full"
         );
         send_deny_reply(
@@ -497,7 +540,7 @@ fn pop_next_client_request(
     let queue = queues.get_mut(&client_id)?;
     let mut waiting = false;
     let mut barrier = false;
-    let index = queue.iter_mut().position(|queued| {
+    let index = queue.requests.iter_mut().position(|queued| {
         if is_ping(&queued.message) {
             return true;
         }
@@ -528,7 +571,7 @@ fn pop_next_client_request(
         false
     })?;
     let message = queue.remove(index);
-    if queue.is_empty() {
+    if queue.requests.is_empty() {
         queues.remove(&client_id);
     }
     message
@@ -871,7 +914,7 @@ async fn handle_client_request<B, MJ, S, SB>(
                 if queues
                     .borrow()
                     .get(&transport_client_id)
-                    .is_some_and(|queue| !queue.is_empty())
+                    .is_some_and(|queue| !queue.requests.is_empty())
                 {
                     return Poll::Ready(false);
                 }
@@ -1219,8 +1262,8 @@ mod tests {
         WireConsumer,
     };
     use iggy_binary_protocol::{WireEncode, WireIdentifier, WireName, WireOptions};
-    use iggy_common::Identifier;
     use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
+    use iggy_common::{Identifier, IggyByteSize};
     use journal::prepare_journal::PrepareJournal;
     use message_bus::installer::conn_info::ClientTransportKind;
     use metadata::impls::metadata::IggySnapshot;
@@ -3141,7 +3184,7 @@ mod tests {
         );
         let queues = Rc::new(RefCell::new(AHashMap::from_iter([(
             ROOT_TRANSPORT,
-            VecDeque::from([queued]),
+            ClientRequestQueue::from_iter([queued]),
         )])));
         let drain = Rc::new(ClientDrain::new(&config));
         let spawned_before = bus.spawned.get();
@@ -3173,7 +3216,7 @@ mod tests {
         );
         let queues = Rc::new(RefCell::new(AHashMap::from_iter([(
             ROOT_TRANSPORT,
-            VecDeque::from([queued]),
+            ClientRequestQueue::from_iter([queued]),
         )])));
         let drain = Rc::new(ClientDrain::new(&config));
         let unrelated = drain.admit(Admission::Cap).await;
@@ -3434,7 +3477,7 @@ mod tests {
             partition_id: Some(0),
         }
         .to_bytes();
-        let mut reads = VecDeque::new();
+        let mut reads = ClientRequestQueue::default();
         for (request, code, body) in [
             (NEXT_REQUEST, POLL_MESSAGES_CODE, poll),
             (OFFSET_REQUEST, GET_CONSUMER_OFFSET_CODE, offset),
@@ -3472,7 +3515,7 @@ mod tests {
             queues
                 .borrow()
                 .get(&ROOT_TRANSPORT)
-                .map_or(0, VecDeque::len),
+                .map_or(0, |queue| queue.requests.len()),
             2,
             "Next without auto-commit and GetConsumerOffset must both stay queued"
         );
@@ -3562,7 +3605,7 @@ mod tests {
         let metadata = drain.admit(Admission::MetadataLane).await;
         let queues = Rc::new(RefCell::new(AHashMap::from_iter([(
             ROOT_TRANSPORT,
-            VecDeque::from(
+            ClientRequestQueue::from_iter(
                 [
                     held_get_me(READ_REQUEST, 0),
                     root_read(PING_CODE, PING_REQUEST).into_generic(),
@@ -3616,7 +3659,7 @@ mod tests {
             };
             let queues = Rc::new(RefCell::new(AHashMap::from_iter([(
                 ROOT_TRANSPORT,
-                VecDeque::from(
+                ClientRequestQueue::from_iter(
                     [
                         wire_request(
                             Operation::StoreConsumerOffset,
@@ -3779,6 +3822,79 @@ mod tests {
             [1, 2],
             "both reads run, and the dropped ping does not"
         );
+    }
+
+    /// Frames that would take a connection's queue past its byte budget get
+    /// the retryable deny at once, like frames past the frame cap. The frames
+    /// already queued are still served in order.
+    #[compio::test]
+    async fn given_a_queue_at_its_byte_budget_when_another_frame_arrives_should_deny_it_retryable()
+    {
+        const OVER_BUDGET: u64 = 5;
+        let ping_bytes = root_read(PING_CODE, OVER_BUDGET).as_slice().len() as u64;
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
+        commit_root_session(&shard);
+        let shard_handle = unset_shard_handle();
+        *shard_handle.borrow_mut() = Some(Rc::downgrade(&shard));
+        let sessions = Rc::new(RefCell::new(SessionManager::new()));
+        bind_root_session(&shard, &sessions).await;
+        let mut server_config = ServerConfig::default();
+        server_config.message_bus.client_queue_capacity = 1;
+        server_config.message_bus.client_request_queue_bytes_max =
+            IggyByteSize::from(2 * ping_bytes);
+        let server_config = Arc::new(server_config);
+        let queues: ClientRequestQueues = Rc::default();
+        let active: ActiveClientRequests = Rc::default();
+        let enqueue = |message| {
+            enqueue_client_request(
+                &bus,
+                &shard_handle,
+                &sessions,
+                &server_config,
+                &queues,
+                &active,
+                ROOT_TRANSPORT,
+                message,
+            );
+        };
+
+        // The first read takes the only place under the cap and the second
+        // holds the drain, so the pings behind them stay queued.
+        enqueue(held_get_me(1, UNAPPLIED_OP));
+        enqueue(held_get_me(2, UNAPPLIED_OP));
+        settle().await;
+        for request in 3..=OVER_BUDGET {
+            enqueue(root_read(PING_CODE, request).into_generic());
+        }
+        await_replies(&bus, 1).await;
+        {
+            let replies = bus.client_replies.borrow();
+            assert_eq!(
+                replies.len(),
+                1,
+                "only the frame past the budget is answered"
+            );
+            assert_eq!(reply_request(&replies[0].1), OVER_BUDGET);
+            assert_eq!(
+                reply_status(&replies[0].1),
+                IggyError::TransientNotAccepted.as_code()
+            );
+        }
+
+        shard
+            .plane
+            .metadata()
+            .applied_frontier()
+            .advance(UNAPPLIED_OP);
+        await_replies(&bus, 5).await;
+        let replies = bus.client_replies.borrow();
+        let served: Vec<u64> = replies[1..]
+            .iter()
+            .filter(|(_, frame)| reply_status(frame) == 0)
+            .map(|(_, frame)| reply_request(frame))
+            .collect();
+        assert_eq!(served, [1, 2, 3, 4]);
     }
 
     /// `BIND_SESSION` runs on the drain, so the replicated frame behind it is
