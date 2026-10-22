@@ -742,8 +742,11 @@ where
     /// started, or that installs a transfer, may miss whole sealed segments,
     /// so it lags for every answer. That primary's commits above `commit_min`
     /// only seal its active segment and append after it: they leave a sealed
-    /// offset settled and make only a no-op lag. `None` means no local
-    /// partition.
+    /// offset settled and make only a no-op lag. A `count` above the sealed
+    /// segments resolves to the newest one even though those commits may seal
+    /// another, so the delete can remove fewer segments than `count`. Lagging
+    /// there would answer `TransientNotAccepted` for as long as disk-bound load
+    /// keeps commits waiting. `None` means no local partition.
     pub fn segment_delete_resolution(
         &self,
         namespace: &IggyNamespace,
@@ -1432,7 +1435,7 @@ mod tests {
             assert_eq!(
                 resolve(count),
                 Some((Some(SEALED_END), false)),
-                "the waiting commits cannot change the sealed segment that count {count} resolves to"
+                "count {count} resolves to a sealed segment, which the waiting commits cannot change"
             );
         }
     }
