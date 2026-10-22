@@ -104,6 +104,8 @@ class PollRouterTest {
             new PartitionContext(BigInteger.valueOf(INCARNATION), BigInteger.ZERO, BigInteger.valueOf(ROUTE_WATERMARK));
     private static final Duration TIMEOUT = Duration.ofSeconds(5);
     private static final Duration NEVER = Duration.ofDays(1);
+    // Outlasts the queueing of a dial, and passes while the dial waits for a permit.
+    private static final Duration QUEUED_DIAL_BUDGET = Duration.ofMillis(200);
     private static final long LANE_FRAME_BYTES = 1;
     // The lane of partition 0, which sendMessage writes to.
     private static final ConsensusSession.LaneKey PARTITION_LANE = new ConsensusSession.LaneKey(INCARNATION, 0);
@@ -807,6 +809,69 @@ class PollRouterTest {
         }
     }
 
+    /**
+     * A dial that waits for a permit fails once its deadline passes. Its waiters fail inline, and one of them can wait
+     * for the client monitor, which a sign-in holds while it clears the session. So that failure must not hold the
+     * router.
+     */
+    @Test
+    void shouldClearTheSessionWhileAnExpiredQueuedDialFailsItsWaiters() throws Exception {
+        IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+        ManualTimers timers = new ManualTimers();
+        CompletableFuture<Void> proceed = new CompletableFuture<>();
+        try {
+            Coordinator coordinator = new Coordinator(group, timers);
+            PollRouter router = new PollRouter(() -> coordinator, endpoint -> new StalledDial(group));
+            String loopback = InetAddress.getLoopbackAddress().getHostAddress();
+            long later = System.nanoTime() + TIMEOUT.toNanos();
+            for (int port = PRIMARY_PORT; port < PRIMARY_PORT + PollRouter.MAX_CONCURRENT_DIALS; port++) {
+                router.connectionFor(new ConnectionInfo(loopback, port), later);
+            }
+            ConnectionInfo queued = new ConnectionInfo(loopback, PRIMARY_PORT + PollRouter.MAX_CONCURRENT_DIALS);
+            int retryIndex = timers.scheduled.size();
+            long expiry = System.nanoTime() + QUEUED_DIAL_BUDGET.toNanos();
+            assertThat(router.connectionFor(queued, expiry)).isNotDone();
+            Runnable retry = timers.scheduled.get(retryIndex);
+            Object clientMonitor = new Object();
+            CompletableFuture<Void> waiterEnded = new CompletableFuture<>();
+            var joined = router.connectionFor(queued, later);
+            joined.whenComplete((connection, error) -> {
+                synchronized (clientMonitor) {
+                    waiterEnded.complete(null);
+                }
+            });
+            await(() -> System.nanoTime() - expiry > 0, "deadline of the queued dial", TIMEOUT);
+
+            CompletableFuture<Void> holding = new CompletableFuture<>();
+            CompletableFuture<Void> cleared = new CompletableFuture<>();
+            Thread signIn = start("sign-in", () -> {
+                synchronized (clientMonitor) {
+                    holding.complete(null);
+                    proceed.join();
+                    router.clearSession();
+                }
+                cleared.complete(null);
+            });
+            holding.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            Thread dialRetry = start("dial-retry", retry);
+            // The expired dial failed the waiter, whose callback now waits for the client monitor.
+            await(() -> joined.isDone() && dialRetry.getState() == Thread.State.BLOCKED, "failed waiter", TIMEOUT);
+            proceed.complete(null);
+
+            assertThat(cleared).succeedsWithin(TIMEOUT);
+            assertThat(waiterEnded).succeedsWithin(TIMEOUT);
+            assertServerError(joined, AsyncTcpConnection.TRANSIENT_NOT_ACCEPTED);
+            signIn.join(TIMEOUT.toMillis());
+            dialRetry.join(TIMEOUT.toMillis());
+            assertThat(signIn.isAlive()).isFalse();
+            assertThat(dialRetry.isAlive()).isFalse();
+        } finally {
+            proceed.complete(null);
+            timers.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+            group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+        }
+    }
+
     @Test
     void shouldRefreshCachedHistoryBeforeANewPollAfterMetadataAdvances() throws Exception {
         IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
@@ -1190,6 +1255,18 @@ class PollRouterTest {
                     .execute(() -> unanswered.completeExceptionally(
                             new IggyConnectionException("Connection closed before a response arrived")));
             return CompletableFuture.completedFuture(null);
+        }
+    }
+
+    /** Dials until the test ends, so it holds its dial permit. */
+    private static final class StalledDial extends OfflineConnection {
+        StalledDial(IoEventLoopGroup group) {
+            super(group);
+        }
+
+        @Override
+        public CompletableFuture<Void> connect() {
+            return new CompletableFuture<>();
         }
     }
 }

@@ -76,12 +76,12 @@ final class PollRouter {
     static final int POLL_PARAMETERS_BYTES = 14;
 
     static final Duration POLL_TIMEOUT = Duration.ofSeconds(30);
+    static final int MAX_CONCURRENT_DIALS = 4;
     private static final int MAX_ROUTES = 4096;
     private static final int MAX_CONNECTIONS = 256;
     private static final int MAX_PENDING_POLLS = 4096;
     private static final long RETRY_INTERVAL_MILLIS = 50;
     private static final long MAX_RETRY_INTERVAL_MILLIS = 1000;
-    private static final int MAX_CONCURRENT_DIALS = 4;
     private static final long MAX_REDIAL_MILLIS = 2000;
 
     private final Supplier<AsyncTcpConnection> coordinator;
@@ -222,14 +222,15 @@ final class PollRouter {
     }
 
     private void dialWhenAvailable(AsyncTcpConnection data, long deadline, CompletableFuture<Void> result) {
+        if (result.isDone()) {
+            return;
+        }
+        // Outside the monitor: the waiters of the dial fail inline, and they take the slot, poll and client monitors.
+        if (deadline - System.nanoTime() <= 0) {
+            result.completeExceptionally(notAccepted());
+            return;
+        }
         synchronized (this) {
-            if (result.isDone()) {
-                return;
-            }
-            if (deadline - System.nanoTime() <= 0) {
-                result.completeExceptionally(notAccepted());
-                return;
-            }
             if (activeDials >= MAX_CONCURRENT_DIALS) {
                 coordinator
                         .get()
