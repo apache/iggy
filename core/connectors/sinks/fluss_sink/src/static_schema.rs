@@ -105,46 +105,6 @@ impl From<FlussError> for Error {
     }
 }
 
-struct ConvertedMessage {
-    message_id: u128,
-    id: String,
-    offset: i128,
-    checksum: i128,
-    timestamp: i64,
-    origin_timestamp: i64,
-    payload: Payload,
-}
-
-impl TryFrom<ConsumedMessage> for ConvertedMessage {
-    type Error = Error;
-    fn try_from(message: ConsumedMessage) -> Result<Self, Self::Error> {
-        let message_id = message.id;
-        Ok(Self {
-            message_id,
-            id: string_from_id(message.id),
-            offset: i128::from(message.offset),
-            checksum: i128::from(message.checksum),
-            timestamp: i64::try_from(message.timestamp).map_err(|error| {
-                Error::TimestampConversion {
-                    message_id,
-                    field: "timestamp",
-                    value: message.timestamp,
-                    reason: error.to_string(),
-                }
-            })?,
-            origin_timestamp: i64::try_from(message.origin_timestamp).map_err(|error| {
-                Error::TimestampConversion {
-                    message_id,
-                    field: "origin_timestamp",
-                    value: message.origin_timestamp,
-                    reason: error.to_string(),
-                }
-            })?,
-            payload: message.payload,
-        })
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ColumnKind {
     MessageId,
@@ -308,15 +268,17 @@ impl<'a> StaticTableBatchBuilder<'a> {
     }
 
     pub(crate) fn append(&mut self, message: ConsumedMessage) -> Result<(), Error> {
-        let ConvertedMessage {
-            message_id,
-            id,
+        let ConsumedMessage {
+            id: message_id,
             offset,
             checksum,
             timestamp,
             origin_timestamp,
             payload,
-        } = message.try_into()?;
+            ..
+        } = message;
+        let timestamp = to_timestamp(message_id, "timestamp", timestamp)?;
+        let origin_timestamp = to_timestamp(message_id, "origin_timestamp", origin_timestamp)?;
 
         match &self.payload_format {
             PayloadFormat::Bytea => {
@@ -343,12 +305,14 @@ impl<'a> StaticTableBatchBuilder<'a> {
 
         for column in &self.layout.columns {
             match column {
-                TableColumn::Metadata(ColumnKind::MessageId) => self.id_builder.append_value(&id),
+                TableColumn::Metadata(ColumnKind::MessageId) => {
+                    self.id_builder.append_value(string_from_id(message_id))
+                }
                 TableColumn::Metadata(ColumnKind::Checksum) => {
-                    self.checksum_builder.append_value(checksum)
+                    self.checksum_builder.append_value(i128::from(checksum))
                 }
                 TableColumn::Metadata(ColumnKind::MessageOffset) => {
-                    self.message_offset_builder.append_value(offset)
+                    self.message_offset_builder.append_value(i128::from(offset))
                 }
                 TableColumn::Metadata(ColumnKind::MessageTimestamp) => {
                     self.message_timestamp_builder.append_value(timestamp)
@@ -478,6 +442,15 @@ impl<'a> StaticTableDescriptorBuilder<'a> {
     }
 }
 
+fn to_timestamp(message_id: u128, field: &'static str, value: u64) -> Result<i64, Error> {
+    i64::try_from(value).map_err(|error| Error::TimestampConversion {
+        message_id,
+        field,
+        value,
+        reason: error.to_string(),
+    })
+}
+
 fn string_from_id(id: u128) -> String {
     format!("{:032x}", id)
 }
@@ -525,11 +498,11 @@ mod tests {
     use iggy_connector_sdk::{ConsumedMessage, Payload, Schema};
 
     use super::{
-        CHECKSUM_COLUMN_NAME, ColumnKind, ConvertedMessage, Error as SchemaError,
-        MESSAGE_ID_COLUMN_NAME, MESSAGE_OFFSET_COLUMN_NAME, MESSAGE_TIMESTAMP_COLUMN_NAME,
-        ORIGIN_TIMESTAMP_COLUMN_NAME, PARTITION_ID_COLUMN_NAME, PAYLOAD_COLUMN_NAME, RowContext,
-        STREAM_COLUMN_NAME, StaticTableBatchBuilder, StaticTableDescriptorBuilder,
-        StaticTableLayout, TIMESTAMP_PRECISION, TOPIC_COLUMN_NAME, UNSIGNED_64_DECIMAL_PRECISION,
+        CHECKSUM_COLUMN_NAME, ColumnKind, Error as SchemaError, MESSAGE_ID_COLUMN_NAME,
+        MESSAGE_OFFSET_COLUMN_NAME, MESSAGE_TIMESTAMP_COLUMN_NAME, ORIGIN_TIMESTAMP_COLUMN_NAME,
+        PARTITION_ID_COLUMN_NAME, PAYLOAD_COLUMN_NAME, RowContext, STREAM_COLUMN_NAME,
+        StaticTableBatchBuilder, StaticTableDescriptorBuilder, StaticTableLayout,
+        TIMESTAMP_PRECISION, TOPIC_COLUMN_NAME, UNSIGNED_64_DECIMAL_PRECISION,
         create_extra_columns,
     };
     use crate::{PayloadFormat, ResolvedFlussSinkConfig, config::TableConfig};
@@ -627,11 +600,18 @@ mod tests {
         message.timestamp = i64::MAX as u64;
         message.origin_timestamp = i64::MAX as u64;
 
-        let encoded_message = ConvertedMessage::try_from(message)
-            .expect("Timestamps within the i64 range should encode");
+        let batch = build_arrow_rows(&test_config(PayloadFormat::Bytea), vec![message]);
+        let timestamps = batch
+            .column_by_name(MESSAGE_TIMESTAMP_COLUMN_NAME)
+            .and_then(|column| column.as_any().downcast_ref::<TimestampMicrosecondArray>())
+            .expect("Timestamp column should exist");
+        let origin_timestamps = batch
+            .column_by_name(ORIGIN_TIMESTAMP_COLUMN_NAME)
+            .and_then(|column| column.as_any().downcast_ref::<TimestampMicrosecondArray>())
+            .expect("Origin timestamp column should exist");
 
-        assert_eq!(encoded_message.timestamp, i64::MAX);
-        assert_eq!(encoded_message.origin_timestamp, i64::MAX);
+        assert_eq!(timestamps.value(0), i64::MAX);
+        assert_eq!(origin_timestamps.value(0), i64::MAX);
     }
 
     #[test]
@@ -771,9 +751,17 @@ mod tests {
         let mut message = test_message(Payload::Text(PAYLOAD_COLUMN_NAME.to_owned()));
         message.timestamp = i64::MAX as u64 + 1;
 
-        let error = ConvertedMessage::try_from(message)
-            .err()
-            .expect("Timestamp above the i64 range should fail");
+        let config = test_config(PayloadFormat::Text);
+        let layout = layout(config.payload_format, &extra_columns(&config));
+        let mut builder =
+            StaticTableBatchBuilder::new(config.payload_format, test_context(), &layout);
+
+        let error = builder
+            .append(message)
+            .expect_err("Timestamp above the i64 range should fail");
+        let batch = builder.finish().expect("Record batch should build");
+
+        assert_eq!(batch.num_rows(), 0);
 
         assert!(matches!(
             error,
@@ -1103,9 +1091,17 @@ mod tests {
         let mut message = test_message(Payload::Raw(vec![1]));
         message.origin_timestamp = i64::MAX as u64 + 1;
 
-        let error = ConvertedMessage::try_from(message)
-            .err()
-            .expect("Origin timestamp above the i64 range should fail");
+        let config = test_config(PayloadFormat::Text);
+        let layout = layout(config.payload_format, &extra_columns(&config));
+        let mut builder =
+            StaticTableBatchBuilder::new(config.payload_format, test_context(), &layout);
+
+        let error = builder
+            .append(message)
+            .expect_err("Origin timestamp above the i64 range should fail");
+        let batch = builder.finish().expect("Record batch should build");
+
+        assert_eq!(batch.num_rows(), 0);
 
         assert!(matches!(
             error,
