@@ -33,7 +33,7 @@ mod schema_catalog;
 mod static_schema;
 mod writer;
 pub(crate) use config::ResolvedFlussSinkConfig;
-pub use config::{FlussSinkConfig, PayloadFormat};
+pub use config::{FlussSinkConfig, PayloadFormat, RouterType, TableConfig};
 
 sink_connector!(FlussSink);
 

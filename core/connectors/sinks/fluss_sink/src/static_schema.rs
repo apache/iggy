@@ -61,9 +61,9 @@ pub(crate) enum Error {
         reason: String,
     },
     #[error(
-        "Payload from Iggy message ID {message_id} is not valid UTF-8 for a Fluss STRING column: {source}"
+        "Failed to serialize JSON payload from Iggy message ID {message_id} for a Fluss STRING column: {source}"
     )]
-    InvalidPayloadUtf8 {
+    PayloadSerialization {
         message_id: u128,
         #[source]
         source: SimdJsonError,
@@ -290,7 +290,7 @@ impl<'a> StaticTableBatchBuilder<'a> {
             PayloadFormat::Json | PayloadFormat::Text => match payload {
                 Payload::Json(value) => self.payload_string_builder.append_value(
                     simd_json::to_string(&value)
-                        .map_err(|source| Error::InvalidPayloadUtf8 { message_id, source })?,
+                        .map_err(|source| Error::PayloadSerialization { message_id, source })?,
                 ),
                 Payload::Text(str) => self.payload_string_builder.append_value(str),
                 Payload::Proto(str) => self.payload_string_builder.append_value(str),
@@ -460,8 +460,7 @@ pub(crate) fn create_extra_columns(
     include_checksum: bool,
     include_origin_timestamp: bool,
 ) -> Vec<ColumnKind> {
-    let mut columns: Vec<ColumnKind> = Vec::with_capacity(10);
-    columns.push(ColumnKind::MessageId);
+    let mut columns = vec![ColumnKind::MessageId];
 
     if include_checksum {
         columns.push(ColumnKind::Checksum);

@@ -35,6 +35,12 @@ use tracing::warn;
 
 use crate::ResolvedFlussSinkConfig;
 
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Name of the optional column that selects upsert or delete per row.
+const OPERATION_COLUMN_NAME: &str = "op";
+/// Value of `OPERATION_COLUMN_NAME` that deletes the row.
+const DELETE_OPERATION: &str = "d";
+
 #[derive(Debug, Error)]
 pub(crate) enum WriterError {
     #[error("Fluss connection is not initialized")]
@@ -203,7 +209,7 @@ enum RowOp {
 impl From<&str> for RowOp {
     fn from(value: &str) -> Self {
         match value {
-            "d" => Self::Delete,
+            DELETE_OPERATION => Self::Delete,
             _ => Self::Upsert,
         }
     }
@@ -298,7 +304,7 @@ impl FlussWriter {
             .ok_or(WriterError::ConnectionNotInitialized)?;
 
         connection
-            .close(Duration::from_secs(30))
+            .close(CLOSE_TIMEOUT)
             .await
             .map_err(|source| WriterError::CloseConnection {
                 source: Box::new(source),
@@ -340,7 +346,7 @@ impl FlussWriter {
         batch: RecordBatch,
     ) -> Result<Stat, WriterError> {
         let writer = self.create_append_writer(table_path).await?;
-        let (rows, mut row) = to_columnal_row(table_path, table_descriptor, batch)?;
+        let (rows, mut row) = to_columnar_row(table_path, table_descriptor, batch)?;
         let mut stat = Stat::default();
         let mut pending = Vec::with_capacity(rows);
         for i in 0..rows {
@@ -379,12 +385,12 @@ impl FlussWriter {
         batch: RecordBatch,
     ) -> Result<Stat, WriterError> {
         let operations_column = batch
-            .column_by_name("op")
+            .column_by_name(OPERATION_COLUMN_NAME)
             .and_then(|col| col.as_any().downcast_ref::<StringArray>())
             .cloned();
 
         let writer = self.create_upsert_writer(table_path).await?;
-        let (rows, mut row) = to_columnal_row(table_path, table_descriptor, batch)?;
+        let (rows, mut row) = to_columnar_row(table_path, table_descriptor, batch)?;
         let mut pending = Vec::with_capacity(rows);
         let mut stat = Stat::default();
 
@@ -589,7 +595,7 @@ impl TableWriter for FlussWriter {
     }
 }
 
-fn to_columnal_row(
+fn to_columnar_row(
     table: &TablePath,
     table_descriptor: &TableDescriptor,
     batch: RecordBatch,
@@ -620,7 +626,7 @@ mod tests {
     };
     use iggy_connector_sdk::Error as ConnectorError;
 
-    use super::{WriterError, to_columnal_row};
+    use super::{WriterError, to_columnar_row};
 
     type ErrorConstructor = fn(String) -> ConnectorError;
 
@@ -646,7 +652,7 @@ mod tests {
         )
         .expect("Record batch should build");
 
-        let (rows, row) = to_columnal_row(&table, &descriptor, batch)
+        let (rows, row) = to_columnar_row(&table, &descriptor, batch)
             .expect("Matching batch should create a columnar row");
 
         assert_eq!(rows, 2);
@@ -666,7 +672,7 @@ mod tests {
         let batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
 
         let error =
-            to_columnal_row(&table, &descriptor, batch).expect_err("Mismatched batch should fail");
+            to_columnar_row(&table, &descriptor, batch).expect_err("Mismatched batch should fail");
 
         assert!(
             matches!(error, WriterError::CreateColumnarRow { table_path, .. } if table_path == table)

@@ -454,7 +454,7 @@ async fn multi_table_sink_should_delete_primary_key_rows(
     server(connectors_runtime(config_path = "tests/connectors/fluss/sink.toml")),
     seed = seeds::connector_stream
 )]
-async fn json_messages_sink_creates_inferred_tables_and_routes_rows(
+async fn multi_table_sink_should_create_inferred_tables_and_route_rows(
     harness: &TestHarness,
     fixture: FlussMultiSinkFixture,
 ) {

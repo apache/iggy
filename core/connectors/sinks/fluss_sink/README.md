@@ -85,7 +85,7 @@ fields are added because missing fields use the connector defaults.
 | `include_checksum`         | bool   | `true`            | Include the checksum column in an automatically created static table.                                            |
 | `include_origin_timestamp` | bool   | `true`            | Include the origin timestamp column in an automatically created static table.                                    |
 | `payload_format`           | enum   | `"json"`          | Static-table payload column format: `bytea`, `json`, or `text`. Multi-table routing uses JSON fields as columns. |
-| `verbose_logging`          | bool   | `false`           | Emit a per-batch debug log when enabled; set the tracing filter to debug to display it.                          |
+| `verbose_logging`          | bool   | `false`           | Log one info line per batch with the message count, stream, topic and offset.                                    |
 
 `target_database`, `target_table`, `include_metadata`, `include_checksum`,
 `include_origin_timestamp`, and `payload_format` apply to static routing.
