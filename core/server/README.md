@@ -196,9 +196,14 @@ messages alone do not renew this evidence.
 The gate uses elapsed time, so a brief view or role change preserves existing
 credit without restarting its lifetime. A restarted node has no credit until
 fresh evidence arrives. Single-replica nodes do not require network evidence.
-For backups the revocation/stale-metadata exposure bound includes K plus the
-one-way delay of the qualifying probe; K alone is not an instantaneous revocation
-guarantee.
+A primary advertises evidence to a backup only after that backup answered its
+previous probe. The backup ages the evidence from the arrival of that previous
+probe. A delayed probe therefore cannot extend backup credit past K. The one
+exception is a primary restart in the same view: a late probe of the old
+incarnation can then add its own transit time. The aging costs up to one probe
+interval of credit. If the primary stops probing, a backup therefore stops
+admitting up to one probe interval before the primary does.
+K is a lease, not an instantaneous revocation guarantee.
 
 Message and size counters in stream, topic and system stats (`get_stream`,
 `get_topic`, `get_stats` and the list forms) are counted per node. A node that

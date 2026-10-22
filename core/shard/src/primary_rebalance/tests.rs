@@ -456,6 +456,7 @@ fn given_health_challenge_when_reply_is_overdue_or_replayed_should_not_extend_re
             sent_at: Some(Instant::now()),
             ready_at: Some(previous),
             answered_at: None,
+            replied: false,
         };
         let mut invalid = reply;
         match changed {
@@ -741,6 +742,9 @@ async fn given_backup_credit_when_probes_are_stale_replayed_or_lack_evidence_sho
     let mut probe = probe_header(consensus, 100);
     probe.replica = 0;
     probe.quorum_age_ns = 0;
+    let mut previous = probe;
+    previous.nonce -= 1;
+    shard.on_primary_rebalance(previous).await;
     shard.on_primary_rebalance(probe).await;
     assert!(frontier.partition_requests_allowed(epoch));
     shard.bus.now.set(Some(epoch + Duration::from_secs(1)));
@@ -848,18 +852,102 @@ fn given_empty_primary_restart_with_lower_nonce_when_metadata_advances_should_re
     let (shard, _inbox) = owner();
     let consensus = shard.plane.metadata().consensus.as_ref().unwrap();
     let mut state = PrimaryRebalance::default();
+    let epoch = Instant::now();
+    let at = |seconds| epoch + Duration::from_secs(seconds);
     let mut probe = probe_header(consensus, 100);
-    assert!(state.accept_probe(&probe));
+    assert_eq!(state.accept_probe(&probe, at(0)), None);
     probe.nonce = 1;
-    assert!(!state.accept_probe(&probe));
+    assert_eq!(state.accept_probe(&probe, at(1)), None);
     probe.commit = 1;
-    assert!(state.accept_probe(&probe));
+    assert_eq!(
+        state.accept_probe(&probe, at(2)),
+        Some(at(0)),
+        "the lower nonce must not have been accepted"
+    );
     let mut old = probe;
     old.commit = 0;
     old.nonce = 101;
-    assert!(!state.accept_probe(&old));
+    assert_eq!(state.accept_probe(&old, at(3)), None);
     state.reset_authority();
-    assert!(!state.accept_probe(&probe));
+    assert_eq!(state.accept_probe(&probe, at(4)), None);
     probe.nonce += 1;
-    assert!(state.accept_probe(&probe));
+    assert_eq!(
+        state.accept_probe(&probe, at(5)),
+        Some(at(2)),
+        "replay protection must survive the authority reset"
+    );
+}
+
+#[compio::test]
+async fn given_a_delayed_probe_when_crediting_a_backup_should_age_its_evidence_from_the_previous_probe()
+ {
+    let (shard, _inbox) = owner_at::<PingPongSuperblock>(None, 1, 3, 0);
+    let consensus = shard.plane.metadata().consensus.as_ref().unwrap();
+    let frontier = shard.plane.metadata().applied_frontier();
+    let epoch = shard.bus.monotonic_now();
+    let window = Duration::from_secs(5) + metadata::AppliedFrontier::PARTITION_FRESHNESS_MARGIN;
+    let mut probe = probe_header(consensus, NONCE);
+    probe.replica = 0;
+    probe.quorum_age_ns = 0;
+    shard.on_primary_rebalance(probe).await;
+    assert!(
+        !frontier.partition_requests_allowed(epoch),
+        "nothing bounds when the first probe of a view left the primary"
+    );
+    let transit = Duration::from_secs(3);
+    shard.bus.now.set(Some(epoch + transit));
+    probe.nonce += 1;
+    shard.on_primary_rebalance(probe).await;
+    assert!(
+        frontier.partition_requests_allowed(
+            (epoch + window)
+                .checked_sub(Duration::from_nanos(1))
+                .unwrap()
+        )
+    );
+    assert!(
+        !frontier.partition_requests_allowed(epoch + window),
+        "the transit of the probe must not extend the credit"
+    );
+}
+
+#[compio::test]
+async fn given_an_overdue_probe_when_probing_again_should_withhold_evidence_until_the_peer_replies()
+{
+    let (shard, _inbox) = owner_at::<PingPongSuperblock>(None, 0, REPLICAS, 0);
+    let epoch = shard.bus.monotonic_now();
+    let advance = |millis| {
+        shard
+            .bus
+            .now
+            .set(Some(epoch + Duration::from_millis(millis)));
+    };
+    let sent = |index: usize| shard.bus.sent.borrow()[index];
+    let answer = |index: usize| {
+        let (replica, mut reply) = sent(index);
+        reply.replica = replica;
+        reply.kind = PrimaryRebalanceKind::MetadataReply;
+        reply
+    };
+    let carries_evidence =
+        |index: usize| sent(index).1.quorum_age_ns != PrimaryRebalanceHeader::NO_QUORUM_EVIDENCE;
+
+    shard.tick_primary_rebalance().await;
+    advance(10);
+    shard.on_primary_rebalance(answer(0)).await;
+    advance(3_100);
+    shard.tick_primary_rebalance().await;
+    assert_eq!(sent(2).0, 1);
+    assert!(carries_evidence(2), "a peer that answered gets evidence");
+    assert_eq!(sent(3).0, 2);
+    assert!(
+        !carries_evidence(3),
+        "the overdue probe can still reach the peer after this one"
+    );
+    advance(3_200);
+    shard.on_primary_rebalance(answer(3)).await;
+    advance(4_200);
+    shard.tick_primary_rebalance().await;
+    assert_eq!(sent(4).0, 2);
+    assert!(carries_evidence(4), "the reply restores the evidence");
 }

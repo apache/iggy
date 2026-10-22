@@ -207,9 +207,9 @@ where
     // the op's frame with an empty body and a nonzero `status` the SDK peeks.
     //
     // Authorization uses this node's committed metadata. Admission requires
-    // quorum evidence younger than heartbeat_timeout + 3s; a backup's bound
-    // additionally includes the probe's one-way delay. This limits stale grants
-    // while keeping partition traffic independent of metadata consensus.
+    // quorum evidence younger than heartbeat_timeout + 3s, on a backup too,
+    // because it ages the evidence from its previous probe. This limits stale
+    // grants while keeping partition traffic independent of metadata consensus.
     let scope = IggyNamespace::from_raw(namespace);
     if let Some(status) = authorize_partition_op(
         shard,

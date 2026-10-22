@@ -64,7 +64,8 @@ pub struct PrimaryRebalance {
     next_move: Instant,
     cursor: Option<IggyNamespace>,
     pending: Option<PendingMove>,
-    received_probe: Option<(u32, u64, u128)>,
+    /// Identity and local receipt time of the newest accepted metadata probe.
+    received_probe: Option<((u32, u64, u128), Instant)>,
     /// When this node's partition admission last opened under this authority.
     /// A probe sent before then carried no fresh quorum evidence.
     admission_opened: Option<Instant>,
@@ -76,6 +77,9 @@ struct Peer {
     sent_at: Option<Instant>,
     ready_at: Option<Instant>,
     answered_at: Option<Instant>,
+    /// The peer answered the newest probe that left this node, so it accepts no
+    /// older probe after the next one.
+    replied: bool,
 }
 
 struct PendingMove {
@@ -129,6 +133,7 @@ impl PrimaryRebalance {
         peer.nonce = None;
         peer.answered_at = peer.sent_at;
         peer.ready_at = (header.ready == 1).then_some(now);
+        peer.replied = true;
     }
 
     /// A probe the bus refused never left this node, so nothing can answer it.
@@ -167,19 +172,22 @@ impl PrimaryRebalance {
             .flatten()
     }
 
-    fn accept_probe(&mut self, header: &PrimaryRebalanceHeader) -> bool {
+    /// Records a probe newer than every accepted one and returns when the
+    /// previous accepted probe of its view arrived. A primary advertises
+    /// evidence only once the peer answered its previous probe, so that
+    /// receipt precedes the evidence leaving the primary, however long this
+    /// probe was in transit.
+    fn accept_probe(&mut self, header: &PrimaryRebalanceHeader, now: Instant) -> Option<Instant> {
         // A restarted primary with retained metadata must advance the view.
         // An empty view-0 restart may lower its boot-seeded nonce, but cannot
         // serve a partition until its metadata commit advances.
         let identity = (header.view, header.commit, header.nonce);
-        if self
-            .received_probe
-            .is_some_and(|previous| identity <= previous)
-        {
-            return false;
+        let previous = self.received_probe;
+        if previous.is_some_and(|(previous, _)| identity <= previous) {
+            return None;
         }
-        self.received_probe = Some(identity);
-        true
+        self.received_probe = Some((identity, now));
+        previous.and_then(|((view, ..), received)| (view == header.view).then_some(received))
     }
 
     fn matches_pending(
@@ -310,6 +318,7 @@ where
                     continue;
                 }
                 let nonce = self.next_forward_nonce(consensus.replica());
+                peer.replied &= peer.nonce.is_none();
                 peer.nonce = Some(nonce);
                 peer.sent_at = Some(now);
                 outgoing.push((replica, probe_header(consensus, nonce)));
@@ -645,10 +654,17 @@ where
         header: &PrimaryRebalanceHeader,
         now: Instant,
     ) {
-        if header.replica == consensus.replica()
-            || !self.primary_rebalance.borrow_mut().accept_probe(header)
-            || header.quorum_age_ns == PrimaryRebalanceHeader::NO_QUORUM_EVIDENCE
-        {
+        if header.replica == consensus.replica() {
+            return;
+        }
+        let Some(previous_received) = self
+            .primary_rebalance
+            .borrow_mut()
+            .accept_probe(header, now)
+        else {
+            return;
+        };
+        if header.quorum_age_ns == PrimaryRebalanceHeader::NO_QUORUM_EVIDENCE {
             return;
         }
         let floor = match consensus.adopted_view_head() {
@@ -661,7 +677,8 @@ where
             self.credit_partition_admission(
                 consensus,
                 now,
-                Duration::from_nanos(header.quorum_age_ns),
+                Duration::from_nanos(header.quorum_age_ns)
+                    .saturating_add(now.saturating_duration_since(previous_received)),
             );
         }
     }
@@ -702,11 +719,16 @@ where
                 return false;
             }
             header.commit = self.plane.metadata().applied_frontier().get();
-            header.quorum_age_ns = self
-                .primary_rebalance
-                .borrow()
-                .quorum_evidence(consensus.quorum_replication())
-                .map_or(PrimaryRebalanceHeader::NO_QUORUM_EVIDENCE, |sent| {
+            let evidence = {
+                let state = self.primary_rebalance.borrow();
+                state
+                    .peers
+                    .get(usize::from(target))
+                    .filter(|peer| peer.replied)
+                    .and_then(|_| state.quorum_evidence(consensus.quorum_replication()))
+            };
+            header.quorum_age_ns =
+                evidence.map_or(PrimaryRebalanceHeader::NO_QUORUM_EVIDENCE, |sent| {
                     u64::try_from(
                         self.bus
                             .monotonic_now()
