@@ -872,7 +872,9 @@ impl StateHandler for CreatePersonalAccessTokenRequest {
             return ApplyReply::err(CreatePersonalAccessTokenResult::AlreadyExists);
         }
 
-        let expiry_at = PersonalAccessToken::calculate_expiry_at(timestamp, expiry);
+        let Ok(expiry_at) = PersonalAccessToken::calculate_expiry_at(timestamp, expiry) else {
+            return ApplyReply::err(CreatePersonalAccessTokenResult::InvalidExpiry);
+        };
         if let Some(expiry_at) = expiry_at
             && expiry_at.as_micros() <= timestamp.as_micros()
         {
@@ -1252,6 +1254,29 @@ mod tests {
         }
         .apply(&mut users, IggyTimestamp::now());
         assert_eq!(users.pat_count_of(9), 1);
+    }
+
+    #[test]
+    fn given_expiry_past_the_end_of_the_clock_when_creating_token_should_refuse_it() {
+        let mut users = UsersInner::new();
+        let now = IggyTimestamp::now();
+        for expiry in [u64::MAX - now.as_micros() + 1, 0xFFFF_FFFF_0000_0000] {
+            let reply = CreatePersonalAccessTokenRequest {
+                user_id: 4,
+                name: WireName::new("far").unwrap(),
+                expiry,
+                token_hash: [b'a'; PAT_TOKEN_HASH_BYTES],
+            }
+            .apply(&mut users, now);
+
+            assert_eq!(
+                reply.code,
+                u32::from(CreatePersonalAccessTokenResult::InvalidExpiry)
+            );
+        }
+        assert_eq!(users.pat_count_of(4), 0);
+        assert!(users.personal_access_token_index.is_empty());
+        assert!(users.personal_access_token_expiry_index.is_empty());
     }
 
     #[test]

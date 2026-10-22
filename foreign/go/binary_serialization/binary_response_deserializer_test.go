@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
@@ -355,5 +356,39 @@ func TestDeserializeStream_LyingTopicsCountDoesNotPreallocate(t *testing.T) {
 
 	if _, err := DeserializeStream(payload); err == nil {
 		t.Fatal("expected error for topics count with no elements, got nil")
+	}
+}
+
+func TestDeserializeAccessTokens_ReadsExpiryAsMicroseconds(t *testing.T) {
+	const expiryMicros = 1_792_000_000_123_456
+	appendToken := func(payload []byte, name string, expiry uint64) []byte {
+		payload = append(payload, byte(len(name)))
+		payload = append(payload, name...)
+		return binary.LittleEndian.AppendUint64(payload, expiry)
+	}
+	payload := appendToken(appendToken(nil, "never", 0), "expiring", expiryMicros)
+
+	tokens, err := DeserializeAccessTokens(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tokens) != 2 {
+		t.Fatalf("got %d tokens, want 2: %+v", len(tokens), tokens)
+	}
+	if tokens[0].Name != "never" || tokens[0].Expiry != nil {
+		t.Errorf("token without expiry decoded as %s expiring at %v, want never with no expiry", tokens[0].Name, tokens[0].Expiry)
+	}
+	if tokens[1].Name != "expiring" || tokens[1].Expiry == nil || !tokens[1].Expiry.Equal(time.UnixMicro(expiryMicros)) {
+		t.Errorf("token with expiry decoded as %s expiring at %v, want expiring at %v", tokens[1].Name, tokens[1].Expiry, time.UnixMicro(expiryMicros))
+	}
+}
+
+func TestDeserializeAccessTokens_EmptyPayloadIsAnEmptyList(t *testing.T) {
+	tokens, err := DeserializeAccessTokens(nil)
+	if err != nil {
+		t.Fatalf("a user without tokens got error %v, want an empty list", err)
+	}
+	if len(tokens) != 0 {
+		t.Fatalf("got %+v, want no tokens", tokens)
 	}
 }

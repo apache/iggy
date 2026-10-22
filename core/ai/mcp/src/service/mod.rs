@@ -633,7 +633,8 @@ impl IggyService {
     ) -> Result<CallToolResult, ErrorData> {
         self.permissions.ensure_create()?;
         let expiry = expiry
-            .and_then(|expiry| expiry.parse().ok())
+            .map(|expiry| parsed(&expiry, "personal access token expiry"))
+            .transpose()?
             .unwrap_or_default();
         request(
             self.client

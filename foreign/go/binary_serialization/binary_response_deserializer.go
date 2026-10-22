@@ -880,7 +880,7 @@ func DeserializeAccessToken(payload []byte) (*iggcon.RawPersonalAccessToken, err
 
 func DeserializeAccessTokens(payload []byte) ([]iggcon.PersonalAccessTokenInfo, error) {
 	if len(payload) == 0 {
-		return []iggcon.PersonalAccessTokenInfo{}, ierror.ErrEmptyMessagePayload
+		return []iggcon.PersonalAccessTokenInfo{}, nil
 	}
 
 	var result []iggcon.PersonalAccessTokenInfo
@@ -903,9 +903,10 @@ func deserializeToPersonalAccessTokenResponse(payload []byte, position int) (igg
 	var expiry *time.Time
 
 	if len(expiryBytes) >= 8 {
-		unixMicroSeconds := binary.LittleEndian.Uint64(expiryBytes)
-		expiryTime := time.Unix(0, int64(unixMicroSeconds))
-		expiry = &expiryTime
+		if unixMicroSeconds := binary.LittleEndian.Uint64(expiryBytes); unixMicroSeconds != 0 {
+			expiryTime := time.UnixMicro(int64(unixMicroSeconds))
+			expiry = &expiryTime
+		}
 	}
 
 	readBytes := 1 + nameLength + 8

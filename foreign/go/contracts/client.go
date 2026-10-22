@@ -365,7 +365,8 @@ type Client interface {
 	DeleteUser(ctx context.Context, identifier Identifier) error
 
 	// CreatePersonalAccessToken create a new personal access token for the currently authenticated user.
-	CreatePersonalAccessToken(ctx context.Context, name string, expiry uint32) (*RawPersonalAccessToken, error)
+	// The expiry is the token lifetime in microseconds. IggyExpiryServerDefault and IggyExpiryNeverExpire create a token that never expires.
+	CreatePersonalAccessToken(ctx context.Context, name string, expiry Duration) (*RawPersonalAccessToken, error)
 
 	// DeletePersonalAccessToken delete a personal access token of the currently authenticated user by unique token name.
 	DeletePersonalAccessToken(ctx context.Context, name string) error
