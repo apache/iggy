@@ -20,7 +20,7 @@
 use std::collections::HashSet;
 
 use bytes::Bytes;
-use iggy::prelude::IggyError;
+use iggy::prelude::{IggyError, IggyExpiry};
 use kafka_protocol::messages::AlterConfigsRequest;
 use kafka_protocol::messages::alter_configs_request::AlterConfigsResource;
 use kafka_protocol::messages::alter_configs_response::{
@@ -40,8 +40,8 @@ use crate::protocol::api::{
 };
 use crate::protocol::bounds_guard::validate_alter_configs_shape;
 use crate::protocol::handlers::topic_config::{
-    ONLY_TOPIC_RESOURCES, RESOURCE_TYPE_TOPIC, bridge_failure, name_reason, plan_retention_update,
-    topic_cap_and_duplicates, topic_cap_message,
+    ONLY_TOPIC_RESOURCES, RESOURCE_TYPE_TOPIC, alter_denial, bridge_failure, name_reason,
+    plan_retention_update, topic_cap_and_duplicates, topic_cap_message,
 };
 use crate::protocol::handlers::{
     decode_guarded, encode_message, is_supported_version, respond_or_close,
@@ -123,29 +123,13 @@ pub async fn handle(
     )
 }
 
-/// Denies every resource when `principal` is not allowed to alter topic configuration, or when
-/// its permissions could not be read. `None` means no listener of this gateway names principals,
-/// so there is nothing to enforce against; once one does, a connection that proved no identity
-/// carries [`AuthenticatedPrincipal::anonymous`] instead and is denied here.
+/// Denies every resource when [`alter_denial`] says `principal` may not alter topic
+/// configuration.
 fn authorize(
     principal: Option<&AuthenticatedPrincipal>,
     resources: &[AlterConfigsResource],
 ) -> Option<Vec<AlterConfigsResourceResponse>> {
-    let principal = principal?;
-    if principal.permissions_known && principal.permissions.manage_topics {
-        return None;
-    }
-    if !principal.permissions_known {
-        // The permission read failed after a successful login, so this connection holds no
-        // real answer. Denying is the fail-closed choice: granting would authorize a write off
-        // a value nothing ever actually read.
-        tracing::warn!(
-            principal = %principal.username,
-            "AlterConfigs asked on a connection whose permissions were never read; denying"
-        );
-    }
-    let message =
-        StrBytes::from_static_str("the principal is not authorized to alter topic configuration");
+    let message = alter_denial(principal, "AlterConfigs")?;
     Some(
         resources
             .iter()
@@ -291,6 +275,16 @@ async fn alter_one(
         return resource_error(resource, ERROR_NONE, None);
     }
 
+    write_expiry(bridge, resource, expiry, deadline).await
+}
+
+async fn write_expiry(
+    bridge: &IggyBridge,
+    resource: &AlterConfigsResource,
+    expiry: IggyExpiry,
+    deadline: Instant,
+) -> AlterConfigsResourceResponse {
+    let name = resource.resource_name.as_str();
     // Do not start the write once the deadline has passed, and do not wrap it in
     // `timeout_at`. Dropping that future does not abort the SDK task, so
     // `UpdateTopic` can commit after this handler has already answered
@@ -384,5 +378,20 @@ mod tests {
         let principal = principal(true, false);
         let responses = authorize(Some(&principal), &[resource("orders")]).expect("denied");
         assert_eq!(responses[0].error_code, ERROR_TOPIC_AUTHORIZATION_FAILED);
+    }
+
+    #[tokio::test]
+    async fn given_a_passed_deadline_when_writing_should_answer_timed_out_without_calling_iggy() {
+        let bridge = IggyBridge::offline();
+        let response = write_expiry(
+            &bridge,
+            &resource("orders"),
+            IggyExpiry::NeverExpire,
+            Instant::now(),
+        )
+        .await;
+        // A write started on the offline bridge fails fast as NOT_LEADER_OR_FOLLOWER instead.
+        assert_eq!(response.error_code, ERROR_REQUEST_TIMED_OUT);
+        assert!(response.error_message.is_none());
     }
 }
