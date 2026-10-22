@@ -288,7 +288,11 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
     private void resetLogoutSession(PendingRequest pending, int operation, long resultCode) {
         if (resultCode == 0 && operation == VsrOperation.LOGOUT) {
-            session.resetIfCurrent(pending.identity.clientLow, pending.identity.clientHigh);
+            if (pending.keepsLineage) {
+                session.resetForSignIn(pending.identity.clientLow, pending.identity.clientHigh);
+            } else {
+                session.resetIfCurrent(pending.identity.clientLow, pending.identity.clientHigh);
+            }
         }
     }
 
@@ -333,6 +337,7 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
         private volatile boolean committed;
         private volatile boolean failedByLink;
         private volatile boolean detachedSession;
+        private volatile boolean keepsLineage;
 
         private PendingRequest(
                 CompletableFuture<ByteBuf> future, int operation, long requestId, RequestIdentity identity) {
@@ -353,6 +358,11 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
         public boolean isSessionDetached() {
             return detachedSession;
+        }
+
+        /** Marks the logout that a sign-in sends first, so that its reply keeps the lineage that the sign-in began. */
+        public void keepLineage() {
+            keepsLineage = true;
         }
     }
 

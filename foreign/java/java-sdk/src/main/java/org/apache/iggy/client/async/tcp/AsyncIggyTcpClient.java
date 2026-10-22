@@ -1287,6 +1287,7 @@ public class AsyncIggyTcpClient {
                 if (explicit && error == null && ownsSignIn(generation, callerFuture)) {
                     rememberedLogin =
                             new RememberedLogin(loginAttempt, connection.get().sessionLogin());
+                    session.finishSignIn();
                 }
             }
             if (explicit && error != null && !callerFuture.isCancelled()) {
@@ -1309,7 +1310,7 @@ public class AsyncIggyTcpClient {
 
     private synchronized long beginExplicitSignIn() {
         explicitLoginGeneration++;
-        session.endLineage();
+        session.beginSignIn();
         endAutomaticSignIn();
         AsyncTcpConnection current = connection.get();
         if (current != null && !session.isBound() && (current.isAuthenticated() || registeringConnection == current)) {

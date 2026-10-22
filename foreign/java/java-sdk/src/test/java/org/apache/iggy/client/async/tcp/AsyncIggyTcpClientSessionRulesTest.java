@@ -23,6 +23,7 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.util.concurrent.GlobalEventExecutor;
 import org.apache.iggy.client.ConnectionInfo;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClientEndpointFailoverTest.MockNode;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.Request;
@@ -167,6 +168,123 @@ class AsyncIggyTcpClientSessionRulesTest {
                         });
                 assertThat(writes).as("the writes that reached the server").hasSize(1);
             } finally {
+                client.close().get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            }
+            assertThat(server).isNotCompletedExceptionally();
+        }
+    }
+
+    /**
+     * The caller signs in as another user while signed in. The sign-in ends the lineage once, as it begins, and the
+     * reply to the logout that it sends first keeps that lineage. So a wait for a session in that lineage lasts until
+     * the sign-in binds its session.
+     */
+    @Test
+    void shouldKeepTheLineageOfASignInWhenItsLogoutReplies() throws Exception {
+        try (ServerSocket socket = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
+            AtomicInteger registers = new AtomicInteger();
+            CompletableFuture<Void> logoutReceived = new CompletableFuture<>();
+            CompletableFuture<Void> releaseLogout = new CompletableFuture<>();
+            CompletableFuture<Void> secondRegisterReceived = new CompletableFuture<>();
+            CompletableFuture<Void> releaseSecondRegister = new CompletableFuture<>();
+            var server = serve(socket, request -> {
+                if (request.operation() == VsrOperation.REGISTER) {
+                    if (registers.getAndIncrement() == 1) {
+                        secondRegisterReceived.complete(null);
+                        releaseSecondRegister.join();
+                    }
+                    return Response.success(VsrOperation.REGISTER, registerBody(FIRST_SESSION + registers.get()));
+                }
+                if (request.operation() == VsrOperation.LOGOUT) {
+                    logoutReceived.complete(null);
+                    releaseLogout.join();
+                    return Response.success(VsrOperation.LOGOUT, Unpooled.EMPTY_BUFFER);
+                }
+                return metadata(socket, request);
+            });
+            AsyncIggyTcpClient client = client(socket);
+            try {
+                client.connect().get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                client.users().login("alice", "alice-password").get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                ConsensusSession session = (ConsensusSession) field(client, "session");
+                var signIn = client.users().login("bob", "bob-password");
+                logoutReceived.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                long lineage = session.lineage();
+                releaseLogout.complete(null);
+                secondRegisterReceived.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+
+                var waiting = session.awaitSession(
+                        lineage, System.nanoTime() + REQUEST_TIMEOUT.toNanos(), GlobalEventExecutor.INSTANCE);
+                assertThat(waiting).isNotDone();
+                releaseSecondRegister.complete(null);
+
+                signIn.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                waiting.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                assertThat(session.lineage()).isEqualTo(lineage);
+            } finally {
+                releaseLogout.complete(null);
+                releaseSecondRegister.complete(null);
+                client.close().get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            }
+            assertThat(server).isNotCompletedExceptionally();
+        }
+    }
+
+    /**
+     * The caller signs in as another user while signed in, and a read and a routed poll start once the logout of
+     * that sign-in replied. Both need a session, so they end with 40 at once, as in Rust, while the Register of the
+     * sign-in still has no reply. The sign-in then completes.
+     */
+    @Test
+    void shouldEndACallThatNeedsASessionWith40WhileTheCallerSignsIn() throws Exception {
+        try (ServerSocket socket = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
+            AtomicInteger registers = new AtomicInteger();
+            CompletableFuture<Void> secondRegisterReceived = new CompletableFuture<>();
+            CompletableFuture<Void> releaseSecondRegister = new CompletableFuture<>();
+            var server = serve(socket, request -> {
+                if (request.operation() == VsrOperation.REGISTER) {
+                    if (registers.getAndIncrement() == 1) {
+                        secondRegisterReceived.complete(null);
+                        releaseSecondRegister.join();
+                    }
+                    return Response.success(VsrOperation.REGISTER, registerBody(FIRST_SESSION + registers.get()));
+                }
+                if (request.operation() == VsrOperation.LOGOUT) {
+                    return Response.success(VsrOperation.LOGOUT, Unpooled.EMPTY_BUFFER);
+                }
+                return metadata(socket, request);
+            });
+            AsyncIggyTcpClient client = client(socket);
+            try {
+                client.connect().get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                client.users().login("alice", "alice-password").get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                var signIn = client.users().login("bob", "bob-password");
+                secondRegisterReceived.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+
+                var read = client.sendBinaryRequest(GET_STATS_CODE, new byte[0]);
+                var poll = client.messages()
+                        .pollMessages(
+                                StreamId.of(1L),
+                                TopicId.of(1L),
+                                Optional.of(0L),
+                                Consumer.of(ConsumerId.of(1L)),
+                                PollingStrategy.offset(BigInteger.ZERO),
+                                1L,
+                                false);
+                for (var call : List.of(read, poll)) {
+                    assertThatThrownBy(() -> call.get(TIMEOUT_SECONDS, TimeUnit.SECONDS))
+                            .cause()
+                            .isInstanceOfSatisfying(
+                                    IggyServerException.class,
+                                    error -> assertThat(error.getRawErrorCode())
+                                            .as(call == read ? "read" : "poll")
+                                            .isEqualTo(IggyErrorCode.UNAUTHENTICATED.getCode()));
+                }
+                releaseSecondRegister.complete(null);
+
+                signIn.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            } finally {
+                releaseSecondRegister.complete(null);
                 client.close().get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
             }
             assertThat(server).isNotCompletedExceptionally();

@@ -55,6 +55,8 @@ public final class ConsensusSession {
     public static final int DEFAULT_MAX_PENDING_OPERATIONS = 256;
     public static final long DEFAULT_MAX_PENDING_OPERATION_BYTES = 64L * 1024 * 1024;
     static final int BIND_SECRET_BYTES = 32;
+    // No lineage is negative, see signingIn().
+    private static final long NO_SIGN_IN = -1;
     private static final SecureRandom RANDOM = new SecureRandom();
     private final byte[] bindSecret = new byte[BIND_SECRET_BYTES];
 
@@ -65,6 +67,8 @@ public final class ConsensusSession {
     private long generation;
     // See lineage().
     private long lineage;
+    // The lineage in which a sign-in of the caller runs, see signingIn().
+    private long signInLineage = NO_SIGN_IN;
     // The automatic sign-in that the server refused, and the lineage that the refusal ended.
     private Throwable signInRefusal;
     private long refusedLineage;
@@ -217,7 +221,15 @@ public final class ConsensusSession {
      * did. The caller signed out, so the lineage ends too.
      */
     public boolean resetIfCurrent(long clientLow, long clientHigh) {
-        return clearIdentityIfCurrent(clientLow, clientHigh, false);
+        return clearIdentityIfCurrent(clientLow, clientHigh, false, true);
+    }
+
+    /**
+     * {@link #resetIfCurrent} for the logout that a sign-in of the caller sends first. The lineage stays, as in Rust,
+     * because that sign-in ended it as it began.
+     */
+    boolean resetForSignIn(long clientLow, long clientHigh) {
+        return clearIdentityIfCurrent(clientLow, clientHigh, false, false);
     }
 
     /**
@@ -228,19 +240,22 @@ public final class ConsensusSession {
      * them.
      */
     public boolean replaceLostSession(long clientLow, long clientHigh) {
-        return clearIdentityIfCurrent(clientLow, clientHigh, true);
+        return clearIdentityIfCurrent(clientLow, clientHigh, true, false);
     }
 
-    /** A lost session keeps the live lanes and the lineage, because the client recovers it. A logout ends both. */
-    private boolean clearIdentityIfCurrent(long clientLow, long clientHigh, boolean lost) {
+    /**
+     * A lost session keeps the live lanes and the lineage, because the client recovers it. A logout ends both. The
+     * logout that a sign-in sends first ends the lanes and keeps the lineage, because that sign-in ended it.
+     */
+    private boolean clearIdentityIfCurrent(long clientLow, long clientHigh, boolean keepLiveLanes, boolean endLineage) {
         ConsensusSession owner = owner();
         List<Ticket> ended;
         synchronized (owner) {
             if (owner.clientIdLow != clientLow || owner.clientIdHigh != clientHigh) {
                 return false;
             }
-            ended = owner.clearIdentity(lost);
-            if (!lost) {
+            ended = owner.clearIdentity(keepLiveLanes);
+            if (endLineage) {
                 owner.lineage++;
             }
         }
@@ -331,6 +346,34 @@ public final class ConsensusSession {
             owner.lineage++;
         }
         owner.changed();
+    }
+
+    /** {@link #endLineage} for a sign-in of the caller, which then runs in the new lineage, see {@link #signingIn}. */
+    public void beginSignIn() {
+        ConsensusSession owner = owner();
+        synchronized (owner) {
+            owner.signInLineage = ++owner.lineage;
+        }
+        owner.changed();
+    }
+
+    public void finishSignIn() {
+        ConsensusSession owner = owner();
+        synchronized (owner) {
+            owner.signInLineage = NO_SIGN_IN;
+        }
+    }
+
+    /**
+     * Whether a sign-in of the caller runs. Like {@code sign_in_blocked} in Rust, a call that needs a session then
+     * ends with 40 at once and does not wait for the session of that sign-in. The sign-in stops running at
+     * {@link #finishSignIn} or at the next end of the lineage, such as a failed sign-in or a close.
+     */
+    public boolean signingIn() {
+        ConsensusSession owner = owner();
+        synchronized (owner) {
+            return owner.signInLineage == owner.lineage;
+        }
     }
 
     /**

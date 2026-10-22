@@ -1093,8 +1093,13 @@ public class AsyncTcpConnection {
 
     /** Logs out first because a bound connection would replay its original Register identity. */
     private CompletableFuture<ByteBuf> logoutThenLogin(int commandCode, ByteBuf payload, long deadline) {
-        consensusSession.endLineage();
-        return send(CommandCode.User.LOGOUT.getValue(), Unpooled.EMPTY_BUFFER, deadline)
+        // A sign-in ends the lineage once, as in Rust. The client already did it for a link that follows its session.
+        if (consensusSession.owner() == consensusSession) {
+            consensusSession.endLineage();
+        }
+        TransientFailoverState logout = new TransientFailoverState();
+        logout.keepsLineage = true;
+        return send(CommandCode.User.LOGOUT.getValue(), Unpooled.EMPTY_BUFFER, deadline, logout)
                 .handle((logoutResponse, logoutError) -> {
                     if (logoutError != null) {
                         payload.release();
@@ -1288,6 +1293,9 @@ public class AsyncTcpConnection {
             releaseFrame(exchange, frame);
             responseFuture.completeExceptionally(error);
             return;
+        }
+        if (exchange.failoverState().keepsLineage) {
+            pending.keepLineage();
         }
         attempt.whenComplete((response, error) ->
                 completeAttempt(exchange, frame, uncertain, pending, lifecycleRetryIntervalMs, response, error));
@@ -1793,6 +1801,7 @@ public class AsyncTcpConnection {
         private PartitionContext context;
         private boolean routed;
         private boolean heartbeat;
+        private boolean keepsLineage;
         private boolean retryAuthentication;
         private long requestId;
         private boolean committed;

@@ -112,7 +112,8 @@ An explicit sign-in ends the automatic sign-in as soon as it starts. It does not
 wait for an automatic Register whose reply is late, and that reply cannot
 replace the new session. If the explicit sign-in succeeds, it becomes the
 automatic sign-in. If it fails, the client does not sign in again as the
-previous user.
+previous user. While the explicit sign-in runs, a call that finds no signed-in
+connection ends with 40 (`UNAUTHENTICATED`) at once.
 
 A committed password change or rename of the signed-in user updates the
 credentials of the automatic sign-in. It also updates the builder credentials

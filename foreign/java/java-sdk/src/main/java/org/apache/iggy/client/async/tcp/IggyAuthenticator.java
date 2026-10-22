@@ -22,7 +22,9 @@ package org.apache.iggy.client.async.tcp;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.Channel;
 import io.netty.util.AttributeKey;
+import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.exception.IggyNotConnectedException;
+import org.apache.iggy.exception.IggyServerException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -111,6 +113,9 @@ final class IggyAuthenticator {
             BooleanSupplier signInOwed) {
         if (connection.isAuthenticated()) {
             return CompletableFuture.completedFuture(null);
+        }
+        if (connection.sessionOwner().signingIn()) {
+            return CompletableFuture.failedFuture(new IggyServerException(IggyErrorCode.UNAUTHENTICATED.getCode()));
         }
         if (!signInOwed.getAsBoolean()) {
             return CompletableFuture.failedFuture(new IggyNotConnectedException(AsyncTcpConnection.NOT_AUTHENTICATED));
