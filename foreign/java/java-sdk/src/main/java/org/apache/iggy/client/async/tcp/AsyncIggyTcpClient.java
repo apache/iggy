@@ -754,8 +754,11 @@ public class AsyncIggyTcpClient {
      * <p>The Rust SDK differs: each replica link redials itself with backoff when it drops. Here a poll link opens a
      * new channel only when the next request needs one, and the client redials only when the requests or the heartbeat
      * of the connection it uses find the node dead.
+     *
+     * <p>A link reports its failure inline, also on the event loop while that thread holds a poll monitor that a
+     * caller under the lock of this client can wait for, so this listener takes no lock of this client.
      */
-    private synchronized void onLinkFailure(AsyncTcpConnection source, Throwable cause) {
+    private void onLinkFailure(AsyncTcpConnection source, Throwable cause) {
         if (connection.get() == source) {
             onConnectionFailure(cause);
         }
@@ -1134,13 +1137,14 @@ public class AsyncIggyTcpClient {
                 connection.get().isAuthenticated() ? CompletableFuture.completedFuture(null) : replayLogin(replay);
         return restored.handle((ok, loginError) -> {
                     if (loginError == null) {
-                        synchronized (this) {
-                            // Roster lookup tolerates a lost link. Retire this burst under the failure listener's
-                            // lock, so a later loss starts a new burst that this one's completion cannot clear.
-                            if (rememberedLogin == replay && !connection.get().hasOpenChannel()) {
-                                return sweepCandidates(candidates, index + 1, attempt, policy);
-                            }
-                            reconnecting.compareAndSet(recovery, null);
+                        // Roster lookup tolerates a lost link. The burst retires before it checks the link, since a
+                        // loss that the failure listener saw first found this burst running and started none. A loss
+                        // after the retire starts its own burst, and this one stops.
+                        reconnecting.compareAndSet(recovery, null);
+                        if (rememberedLogin == replay
+                                && !connection.get().hasOpenChannel()
+                                && reconnecting.compareAndSet(null, recovery)) {
+                            return sweepCandidates(candidates, index + 1, attempt, policy);
                         }
                         log.info("Reconnected to {}", target.serverAddress());
                         return CompletableFuture.<Void>completedFuture(null);
