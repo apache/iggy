@@ -373,8 +373,9 @@ roster names this replica as the metadata primary, the reply is final. Otherwise
   Logout and `Dispose` stop the restarts. Invalid local CA configuration and rejected credentials surface as
   errors. A caller's cancellation stops that call while the link owner continues reconnecting. Request replay
   has its own deadline.
-  Configured auto-login credentials take precedence over credentials remembered from successful
-  username/password or PAT login. Without either, reconnecting cannot restore the authenticated session.
+  Reconnecting signs in with the last successful username/password or PAT login, or with the configured
+  auto-login credentials if the caller never signed in. Without either, reconnecting cannot restore the
+  authenticated session.
   A committed password change or rename of the signed-in user updates these credentials. This includes a
   change that `ResolveOperationAsync` proves. A committed rejection leaves them unchanged.
 - `AutoLoginSettings` properties are now `init`-only, as is `IggyClientConfigurator.HeartbeatInterval`. Build
