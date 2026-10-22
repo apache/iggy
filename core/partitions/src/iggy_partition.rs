@@ -5885,6 +5885,15 @@ where
         if matches!(
             self.transition,
             Some(PendingPartitionTransition::PrimaryTransfer { .. })
+        ) && self.consensus.request_queue_len() > 0
+        {
+            self.deny_queued_requests("primary transfer queued request reply failed")
+                .await;
+            return Ok(crate::PartitionIoStep::Progress);
+        }
+        if matches!(
+            self.transition,
+            Some(PendingPartitionTransition::PrimaryTransfer { .. })
         ) && (self.consensus.commit_min() < self.consensus.commit_max()
             || self.consensus.is_primary() && !self.consensus.pipeline_is_empty())
         {
@@ -6009,7 +6018,8 @@ where
             return self.io_plan(crate::PartitionIoContinuation::Retention);
         }
         if self.maintenance.shutdown.is_some() && self.consensus.request_queue_len() > 0 {
-            self.deny_queued_requests_at_shutdown().await;
+            self.deny_queued_requests("shutdown queued request reply failed")
+                .await;
             return Ok(crate::PartitionIoStep::Progress);
         }
         if self.queued_requests_ready() {
@@ -7688,12 +7698,7 @@ where
             };
             // A refusal below drops the queued install, so its latch goes with
             // it; promotion re-arms the latch.
-            let queued_install = (header.operation == Operation::InstallConsumerGroupOwner)
-                .then(|| InstallConsumerGroupOwnerRequest::decode_from(request.message.body()).ok())
-                .flatten();
-            if queued_install.is_some() && queued_install == self.pending_owner_install.get() {
-                self.pending_owner_install.set(None);
-            }
+            let queued_install = self.release_queued_install(&request);
             let context = request.take_auto_commit();
             if context.as_ref().is_some_and(|context| {
                 !self
@@ -7941,20 +7946,37 @@ where
         .then_some(IggyError::TransientNotAccepted)
     }
 
-    /// Shutdown promotes nothing, so answer every queued request now. None
-    /// holds an op yet, so its client can safely retry it.
-    async fn deny_queued_requests_at_shutdown(&self) {
+    /// Nothing promotes a queued request during shutdown or a primary transfer,
+    /// so answer every one now. None holds an op yet, so its client can safely
+    /// retry it.
+    async fn deny_queued_requests(&self, send_fail_label: &'static str) {
         while let Some(mut request) = self.consensus.pop_queued_request() {
+            self.release_queued_install(&request);
             let waiter = request.take_reply_sender();
             Self::send_partition_deny_or_log(
                 &self.consensus,
                 request.message.header(),
                 IggyError::TransientNotAccepted.as_code(),
-                "shutdown queued request reply failed",
+                send_fail_label,
                 waiter,
             )
             .await;
         }
+    }
+
+    /// A queued install leaves the queue with its latch. A refused install never
+    /// publishes, so its latch would refuse every later copy as already pending.
+    fn release_queued_install(
+        &self,
+        request: &consensus::RequestEntry,
+    ) -> Option<InstallConsumerGroupOwnerRequest> {
+        let install = (request.message.header().operation == Operation::InstallConsumerGroupOwner)
+            .then(|| InstallConsumerGroupOwnerRequest::decode_from(request.message.body()).ok())
+            .flatten();
+        if install.is_some() && install == self.pending_owner_install.get() {
+            self.pending_owner_install.set(None);
+        }
+        install
     }
 
     /// Resume a bounded promotion turn without waiting for another commit.
@@ -14506,6 +14528,114 @@ mod tests {
         }
         assert!(finished);
         assert_eq!(partition.stats.messages_count_inconsistent(), 2);
+        assert!(partition.fatal().is_none());
+    }
+
+    #[compio::test]
+    async fn given_queued_requests_when_primary_transfer_drains_should_refuse_them_and_hand_off() {
+        const GROUP_ID: u64 = 8;
+        const OWNER_ID: u128 = 42;
+        const ADMITTED_CLIENT: u128 = 100;
+        const QUEUED_CLIENT: u128 = 101;
+        const STEPS_MAX: usize = 64;
+        let directory = tempfile::tempdir().unwrap();
+        let (mut partition, replies) =
+            recording_partition_with_pipeline(0, 3, LocalPipeline::with_capacities(1, 2));
+        install_test_owner(&mut partition, GROUP_ID, OWNER_ID).await;
+        set_offset_dirs_under(&mut partition, directory.path());
+        partition.set_io_notifier(
+            Rc::new(|_, _| {}),
+            crate::largest_legal_job_charge().unwrap(),
+        );
+        partition.stats.increment_messages_count(1);
+        for (client_id, consumer_id) in [(ADMITTED_CLIENT, 7), (QUEUED_CLIENT, 9)] {
+            let store = store_offset_request(
+                client_id,
+                1,
+                ConsumerKind::Consumer,
+                consumer_id,
+                0,
+                AckLevel::Quorum,
+            )
+            .transmute_header(|mut header, next: &mut RoutedRequestHeader| {
+                header.metadata_watermark = partition.required_metadata_frontier;
+                *next = header;
+            });
+            partition.on_request(store, None).await;
+        }
+        let installation = next_test_installation(&partition, GROUP_ID, OWNER_ID + 1);
+        let (sender, receiver) = consensus::oneshot_channel();
+        partition
+            .on_request(
+                owner_install_request(&partition, &installation),
+                Some(sender),
+            )
+            .await;
+        assert_eq!(partition.consensus.pipeline_len(), 1);
+        assert_eq!(partition.consensus.request_queue_len(), 2);
+        assert_eq!(partition.pending_owner_install.get(), Some(installation));
+
+        assert!(partition.defer_primary_transfer(primary_transfer_grant(&partition)));
+        partition
+            .consensus
+            .advance_commit_max(partition.consensus.sequencer().current_sequence());
+        let config = repair_config();
+        let mut transfer = None;
+        for _ in 0..STEPS_MAX {
+            match partition.resume_io(&config).await {
+                crate::PartitionIoStep::Progress => {}
+                crate::PartitionIoStep::Ready(plan) => {
+                    execute_partition_io_plan(&mut partition, &config, plan).await;
+                }
+                crate::PartitionIoStep::PrimaryTransfer(request) => {
+                    transfer = Some(request);
+                    break;
+                }
+                crate::PartitionIoStep::Pending => break,
+                _ => panic!("the drain must only commit and hand off"),
+            }
+        }
+        let Some(request) = transfer else {
+            panic!(
+                "a queued request must not hold the handoff: {} queued, {} prepared, commit {}/{}",
+                partition.consensus.request_queue_len(),
+                partition.consensus.pipeline_len(),
+                partition.consensus.commit_min(),
+                partition.consensus.commit_max(),
+            );
+        };
+        assert!(
+            !partition
+                .consensus
+                .request_primary_transfer(request.expected_view, request.target)
+                .is_empty()
+        );
+        assert_eq!(
+            receiver.await.unwrap().header().status,
+            IggyError::TransientNotAccepted.as_code()
+        );
+        let statuses = |client_id| {
+            replies
+                .borrow()
+                .iter()
+                .filter(|(client, _)| *client == client_id)
+                .map(|(_, frame)| {
+                    bytemuck::checked::from_bytes::<ReplyHeader>(
+                        &frame.as_slice()[..size_of::<ReplyHeader>()],
+                    )
+                    .status
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(statuses(ADMITTED_CLIENT), [0]);
+        assert_eq!(
+            statuses(QUEUED_CLIENT),
+            [IggyError::TransientNotAccepted.as_code()]
+        );
+        assert!(
+            partition.pending_owner_install.get().is_none(),
+            "a refused install must release its latch"
+        );
         assert!(partition.fatal().is_none());
     }
 
