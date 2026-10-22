@@ -108,9 +108,10 @@ metadata can replay the user's own committed cached result without a new
 permission check. A fresh application send can duplicate an uncertain operation.
 
 An explicit sign-in or logout ends earlier calls: unsent calls fail with 40,
-and possibly applied mutations remain uncertain. SDK-managed recovery may keep
-an unsent call waiting for a session within its original deadline; expiry returns
-58, and a refused automatic sign-in returns 40 with the refusal as its cause.
+and possibly applied mutations remain uncertain. SDK-managed recovery can keep
+an unsent call waiting for a session or a primary within its original deadline.
+Expiry returns 58, and a refused automatic sign-in returns 40 with the refusal as
+its cause.
 Recovery uses the caller's last explicit sign-in, or configured automatic
 credentials only if the caller never signed in. Logout disables automatic sign-in.
 

@@ -524,7 +524,7 @@ impl OperationDriver {
         match self.route(&partition.key, lineage, call.deadline).await {
             Ok(route) => Ok(Some(route)),
             Err(error) if retries_lookup(&error) => {
-                call.refusal = error;
+                call.refusal = IggyError::TransientNotAccepted;
                 Err(Next::Pause)
             }
             Err(error) => Err(Next::Fail(error)),
@@ -586,11 +586,10 @@ impl OperationDriver {
         let target = route.map_or(Target::MetadataPrimary, |route| {
             Target::Replica(route.primary_replica)
         });
-        let error = match self.links.link(target) {
-            Ok(link) => return Ok(Hop { link, route }),
-            Err(error) => error,
-        };
-        call.refusal = error;
+        if let Ok(link) = self.links.link(target) {
+            return Ok(Hop { link, route });
+        }
+        call.refusal = IggyError::TransientNotAccepted;
         match (&call.partition, route) {
             (Some(partition), Some(route)) => {
                 self.routes()
@@ -644,7 +643,7 @@ impl OperationDriver {
             }
             error if lost_link(&error) => {
                 call.uncertain |= sent;
-                call.refusal = error;
+                call.refusal = IggyError::TransientNotAccepted;
                 self.refresh(call, hop, Failure::LostLink).await;
                 Err(Next::Pause)
             }
@@ -755,6 +754,8 @@ impl OperationDriver {
     /// Asks one ready replica at a time for the route of `key`, in id order.
     /// The first one is the replica that a refusal named, else the metadata
     /// primary. An answer older than the cached route goes to the next one.
+    /// A lookup that no replica answers usably ends with 58, which the caller
+    /// retries until its deadline.
     async fn lookup(
         &self,
         key: &PartitionKey,
@@ -769,14 +770,9 @@ impl OperationDriver {
         let mut replicas = self.links.ready_replicas();
         let start = first.map_or(0, |first| replicas.partition_point(|id| *id < first));
         replicas.rotate_left(start);
-        let mut refusal = IggyError::NotConnected;
         for replica in replicas {
-            let link = match self.links.link(Target::Replica(replica)) {
-                Ok(link) => link,
-                Err(error) => {
-                    refusal = error;
-                    continue;
-                }
+            let Ok(link) = self.links.link(Target::Replica(replica)) else {
+                continue;
             };
             let answer = self
                 .read(
@@ -793,25 +789,22 @@ impl OperationDriver {
                 });
             match answer {
                 Ok(answer) => {
-                    let merged = self.routes().merge(key, answer, fence);
-                    match merged {
-                        Some(route) => return Ok(route),
-                        None => refusal = IggyError::TransientNotAccepted,
+                    if let Some(route) = self.routes().merge(key, answer, fence) {
+                        return Ok(route);
                     }
                 }
-                Err(error) if retries_lookup(&error) => refusal = error,
+                Err(error) if retries_lookup(&error) => {}
                 Err(error) if is_namespace_miss(&error) => {
                     // A backup can miss metadata that another client just created.
                     // Only the metadata primary can make this miss terminal.
                     if self.is_metadata_primary(&link, replica, deadline).await {
                         return Err(error);
                     }
-                    refusal = IggyError::TransientNotAccepted;
                 }
                 Err(error) => return Err(error),
             }
         }
-        Err(refusal)
+        Err(IggyError::TransientNotAccepted)
     }
 
     /// Whether `replica` is the metadata primary. The belief can predate a
@@ -895,6 +888,7 @@ struct Call {
     /// freezes again.
     uncertain: bool,
     /// The error at the deadline, unless an attempt can have taken effect.
+    /// A call that waited for a link or a primary until then ends with 58.
     refusal: IggyError,
     retries: u32,
     /// The last attempt got `NotPrimary`. Another one in a row pauses first.
@@ -1799,7 +1793,7 @@ mod tests {
 
         let result = f.send_messages().await;
 
-        assert_eq!(result.unwrap_err(), IggyError::NotConnected);
+        assert_eq!(result.unwrap_err(), IggyError::TransientNotAccepted);
         // Lets a frame that left after the deadline reach its replica.
         sleep(CALLER_TIMEOUT).await;
         assert_eq!(f.cluster.count(GET_PARTITION_ROUTE_CODE), 1);
@@ -2317,22 +2311,34 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn given_replicas_that_refuse_every_lookup_when_the_deadline_passes_should_fail_with_the_last_refusal()
-     {
-        let f = Fixture::new().await;
-        *f.cluster.route.lock().unwrap() = None;
-        let started = Instant::now();
+    async fn given_replicas_that_refuse_every_lookup_when_the_deadline_passes_should_fail_with_58()
+    {
+        for refusal in [IggyError::TransientNotAccepted, IggyError::NotPrimary] {
+            let f = Fixture::new().await;
+            for replica in 0..REPLICAS {
+                f.cluster.script(
+                    &endpoint(replica),
+                    GET_PARTITION_ROUTE_CODE,
+                    repeat_n(Answer::Refuse(refusal.clone()), ENDLESS),
+                );
+            }
+            let started = Instant::now();
 
-        let result = f.send_messages().await;
+            let result = f.send_messages().await;
 
-        assert_eq!(result.unwrap_err(), IggyError::TransientNotAccepted);
-        let elapsed = started.elapsed();
-        assert!(elapsed <= OPERATION_TIMEOUT, "{elapsed:?}");
-        assert!(
-            elapsed >= OPERATION_TIMEOUT - RETRY_BACKOFF_MAX,
-            "{elapsed:?}"
-        );
-        assert!(f.sends().is_empty());
+            assert_eq!(
+                result.unwrap_err(),
+                IggyError::TransientNotAccepted,
+                "{refusal}"
+            );
+            let elapsed = started.elapsed();
+            assert!(elapsed <= OPERATION_TIMEOUT, "{refusal}: {elapsed:?}");
+            assert!(
+                elapsed >= OPERATION_TIMEOUT - RETRY_BACKOFF_MAX,
+                "{refusal}: {elapsed:?}"
+            );
+            assert!(f.sends().is_empty(), "{refusal}");
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -2709,6 +2715,30 @@ mod tests {
             f.send_messages().await.unwrap_err(),
             IggyError::LaneBlocked(op)
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_no_link_to_the_primary_when_the_deadline_passes_should_fail_with_58_without_sending()
+     {
+        // The partition primary, then the metadata primary of the fixture.
+        for (code, primary) in [(SEND_MESSAGES_CODE, PRIMARY), (CREATE_STREAM_CODE, 0)] {
+            let f = Fixture::new().await;
+            f.cluster.down.lock().unwrap().insert(endpoint(primary));
+            f.cluster.drop_connections(&endpoint(primary));
+            eventually("the link to the primary is gone", || {
+                !f.driver.links.ready_replicas().contains(&primary)
+            })
+            .await;
+
+            let result = f.call_to(code).await;
+
+            assert_eq!(
+                result.unwrap_err(),
+                IggyError::TransientNotAccepted,
+                "{code}"
+            );
+            assert_eq!(f.cluster.count(code), 0, "{code}");
+        }
     }
 
     #[tokio::test(start_paused = true)]

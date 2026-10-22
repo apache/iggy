@@ -3422,7 +3422,10 @@ mod tests {
 
         let lost = consumer.create_poll_messages_future().await;
 
-        assert!(matches!(lost, Err(IggyError::NotConnected)), "{lost:?}");
+        assert!(
+            matches!(lost, Err(IggyError::TransientNotAccepted)),
+            "{lost:?}"
+        );
         cluster.down.lock().unwrap().clear();
         cluster.script(&primary, POLL_MESSAGES_CODE, [empty_poll()]);
         assert!(poll_until_success(&consumer).await.is_some());
