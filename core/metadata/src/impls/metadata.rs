@@ -4454,8 +4454,11 @@ where
     /// pipeline. A pipeline entry keeps only its header, so a create in flight
     /// counts for its acting user. Every transport rewrites the body for the
     /// session's user, and `prepare_request` stamps that same user into the
-    /// header. It runs before the apply, so a create at the cap reports the
-    /// cap even when its name is taken, as the legacy server did.
+    /// header. The apply can still refuse a create in flight, for a taken name
+    /// or an expiry already past, so a create that fits the committed tokens
+    /// alone is refused as transient. It runs before the apply, so a create
+    /// past the cap on committed tokens reports the cap even when its name is
+    /// taken, as the legacy server did.
     ///
     /// The PAT rewrite of every transport encodes the body, so the decode
     /// cannot fail for a client request.
@@ -4486,6 +4489,9 @@ where
             .users()
             .read(|users| users.pat_count_of(request.user_id));
         if committed.saturating_add(pending) >= max_tokens_per_user as usize {
+            if committed < max_tokens_per_user as usize {
+                return Err(IggyError::TransientNotAccepted);
+            }
             return Err(IggyError::PersonalAccessTokensLimitReached(
                 request.user_id,
                 max_tokens_per_user,
@@ -7424,7 +7430,9 @@ mod tests {
     /// The cap counts the creates in flight, not only the committed tokens, so
     /// creates pipelined at the boundary never take a user past it. A create
     /// in flight holds its slot until it leaves the pipeline: the apply
-    /// refuses it, it commits as a token, or a view change drops it.
+    /// refuses it, it commits as a token, or a view change drops it. Only the
+    /// committed tokens prove that a create cannot fit, so until then a create
+    /// waits instead of getting the cap's error.
     #[test]
     fn given_token_creates_in_flight_when_admitting_at_cap_should_count_them_until_they_leave_the_pipeline()
      {
@@ -7434,7 +7442,7 @@ mod tests {
             users_holding_token().into(),
             StreamsInner::new(),
             TOKEN_OWNER,
-            FIRST_CLIENT..=FIRST_CLIENT + 3,
+            FIRST_CLIENT..=FIRST_CLIENT + 4,
         );
         metadata.set_max_tokens_per_user(TOKENS_MAX);
         let consensus = metadata.consensus.as_ref().unwrap();
@@ -7446,17 +7454,11 @@ mod tests {
                 &token_create(name).to_bytes(),
             ))
         };
-        let assert_at_cap = |client: u128, name: &str| {
+        let assert_deferred = |client: u128, name: &str| {
             let refused = create(client, name);
             assert!(
-                matches!(
-                    refused,
-                    Err(IggyError::PersonalAccessTokensLimitReached(
-                        TOKEN_OWNER,
-                        TOKENS_MAX
-                    ))
-                ),
-                "{name} must be refused at the cap, got {:?}",
+                matches!(refused, Err(IggyError::TransientNotAccepted)),
+                "{name} must wait for the creates in flight, got {:?}",
                 refused.err()
             );
         };
@@ -7482,7 +7484,7 @@ mod tests {
             }
         }
         assert_eq!(in_flight.len(), 2, "two slots admit two creates in flight");
-        assert_at_cap(FIRST_CLIENT + 2, "third");
+        assert_deferred(FIRST_CLIENT + 2, "third");
 
         assert_ne!(
             commit_head(in_flight.remove(0)),
@@ -7491,15 +7493,27 @@ mod tests {
         );
         let third = create(FIRST_CLIENT + 2, "third").expect("the refused create freed its slot");
         consensus.pipeline_message(PlaneKind::Metadata, &third);
-        assert_at_cap(FIRST_CLIENT + 3, "fourth");
+        assert_deferred(FIRST_CLIENT + 3, "fourth");
 
         assert_eq!(commit_head(in_flight.remove(0)), Some(0));
-        assert_at_cap(FIRST_CLIENT + 3, "fourth");
+        assert_deferred(FIRST_CLIENT + 3, "fourth");
 
         drop_uncommitted_suffix(consensus);
+        let fourth =
+            create(FIRST_CLIENT + 3, "fourth").expect("a dropped create must free its slot");
+        consensus.pipeline_message(PlaneKind::Metadata, &fourth);
+        assert_eq!(commit_head(fourth), Some(0));
+        let refused = create(FIRST_CLIENT + 4, "fifth");
         assert!(
-            create(FIRST_CLIENT + 3, "fourth").is_ok(),
-            "a dropped create must free its slot"
+            matches!(
+                refused,
+                Err(IggyError::PersonalAccessTokensLimitReached(
+                    TOKEN_OWNER,
+                    TOKENS_MAX
+                ))
+            ),
+            "a create past the cap on committed tokens keeps the cap error, got {:?}",
+            refused.err()
         );
     }
 

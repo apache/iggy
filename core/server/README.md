@@ -138,7 +138,8 @@ traffic its retries can reach the deadline with 58 instead of the namespace
 error. A valid create that exceeds its configured capacity with the committed
 partitions alone still gets the capacity error. If only the creates in flight
 leave no room, it gets 58, and under steady create traffic its retries can reach
-the deadline with 58.
+the deadline with 58. A personal access token create follows the same rule for
+the user's tokens and `max_tokens_per_user`.
 
 ### HTTP routing and backpressure
 
