@@ -978,6 +978,7 @@ TEST_F(E2E_Topic, UpdateTopicDoesNotChangePartitionsCount) {
 }
 
 TEST_F(E2E_Topic, UpdateTopicDoesNotChangeMessages) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description", "Keeps existing messages readable after updating topic metadata.");
     const std::string stream_name        = GetRandomName();
     const std::string original_topic     = GetRandomName();
@@ -1000,7 +1001,7 @@ TEST_F(E2E_Topic, UpdateTopicDoesNotChangeMessages) {
         iggy::ffi::make_message(to_payload("message-before-topic-update"), rust::Vec<iggy::ffi::HeaderEntry>()));
     ASSERT_NO_THROW(message_client->send_messages(make_numeric_identifier(created_stream.Id()),
                                                   make_numeric_identifier(topic_id), "partition_id",
-                                                  partition_id_bytes(0), std::move(messages)));
+                                                  partition_id_bytes(0), std::move(messages), error_info));
 
     ASSERT_NO_THROW(client.UpdateTopic(
         iggy::Identifier::String(stream_name), iggy::Identifier::String(original_topic), updated_topic_name,
@@ -1010,9 +1011,10 @@ TEST_F(E2E_Topic, UpdateTopicDoesNotChangeMessages) {
             .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL))));
 
     ASSERT_NO_THROW({
-        const auto polled = message_client->poll_messages(make_numeric_identifier(created_stream.Id()),
-                                                          make_string_identifier(updated_topic_name), 0, "consumer",
-                                                          make_numeric_identifier(1), "offset", 0, 10, false);
+        iggy::ffi::ErrorInfo error_info{};
+        const auto polled = message_client->poll_messages(
+            make_numeric_identifier(created_stream.Id()), make_string_identifier(updated_topic_name), 0, "consumer",
+            make_numeric_identifier(1), "offset", 0, 10, false, error_info);
         ASSERT_EQ(polled.count, 1u);
         ASSERT_EQ(polled.messages.size(), 1u);
         const std::string actual(polled.messages[0].payload.begin(), polled.messages[0].payload.end());

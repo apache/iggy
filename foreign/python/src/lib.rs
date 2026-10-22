@@ -34,11 +34,11 @@ mod topic;
 mod user;
 mod user_headers;
 
-use client::IggyClient;
+use client::{IggyClient, PendingOperationError};
 use cluster::{ClusterMetadata, ClusterNode, TransportEndpoints};
 use config::{
-    AutoLogin, HttpConfig, QuicConfig, QuicReconnectionConfig, TcpConfig, TcpReconnectionConfig,
-    WebSocketConfig, WebSocketFramingConfig, WebSocketReconnectionConfig,
+    AutoLogin, HttpConfig, PendingOperationsConfig, QuicConfig, QuicReconnectionConfig, TcpConfig,
+    TcpReconnectionConfig, WebSocketConfig, WebSocketFramingConfig, WebSocketReconnectionConfig,
 };
 use consumer::{
     AutoCommit, AutoCommitAfter, AutoCommitWhen, Consumer, ConsumerGroup, ConsumerGroupDetails,
@@ -57,7 +57,7 @@ use send_message::{SendMessage, SendMessagesConfirmation, SendMessagesResponse};
 use stats::{CacheMetrics, CacheMetricsKey, Stats};
 use stream::{Stream, StreamDetails};
 use topic::{IggyExpiry, MaxTopicSize, Partition, Topic, TopicDetails};
-use user::{UserInfo, UserInfoDetails, UserStatus};
+use user::{IdentityInfo, TokenInfo, UserInfo, UserInfoDetails, UserStatus};
 use user_headers::{HeaderKey, HeaderValue, UserHeaders};
 
 /// Python client for Apache Iggy, the persistent message streaming platform.
@@ -71,6 +71,7 @@ fn apache_iggy(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PartitionContext>()?;
     m.add_class::<ConsumerPosition>()?;
     m.add_class::<IggyClient>()?;
+    m.add_class::<PendingOperationError>()?;
     m.add_class::<IggyProducer>()?;
     m.add_class::<ProducerSendError>()?;
     m.add_class::<DirectProducerConfig>()?;
@@ -78,6 +79,7 @@ fn apache_iggy(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ProducerSharding>()?;
     m.add_class::<BackpressureMode>()?;
     m.add_class::<AutoLogin>()?;
+    m.add_class::<PendingOperationsConfig>()?;
     m.add_class::<TcpConfig>()?;
     m.add_class::<TcpReconnectionConfig>()?;
     m.add_class::<QuicConfig>()?;
@@ -108,6 +110,8 @@ fn apache_iggy(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<AutoCommitAfter>()?;
     m.add_class::<AutoCommitWhen>()?;
     m.add_class::<ReceiveMessageIterator>()?;
+    m.add_class::<IdentityInfo>()?;
+    m.add_class::<TokenInfo>()?;
     m.add_class::<UserStatus>()?;
     m.add_class::<UserInfo>()?;
     m.add_class::<UserInfoDetails>()?;

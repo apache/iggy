@@ -206,6 +206,30 @@ iggy+tcp://iggy:iggy@127.0.0.1:8090?tls=true&tls_domain=localhost&tls_ca_file=/p
 
 ## API Notes
 
+- `new Iggy\Client($address, new Iggy\PendingOperationsConfig(256, 64 * 1024 * 1024))`
+  configures client-wide active/retained mutation limits. Both limits must be positive;
+  omission uses 256 operations and 64 MiB of frozen headers and bodies. Admission waits
+  within the operation deadline before assigning an ID. Queued writer references keep
+  bytes charged after abandonment or reset until their final owner releases the frame.
+  TCP, QUIC and WebSocket connection strings accept `max_pending_operations` and
+  `max_pending_operation_bytes`, for example
+  `iggy+quic://iggy:iggy@localhost:8080?max_pending_operations=256&max_pending_operation_bytes=67108864`.
+- `Iggy\Exception\PendingOperationException` preserves the read-only `operation_id`
+  decimal string and `kind` (`uncertain`, `lane_blocked`, or `not_retained`).
+  `getCode()` returns the SDK error code. Keep IDs as strings: PHP integers cannot
+  represent the full unsigned 64-bit range. `lane_blocked` identifies an earlier
+  operation, and the blocked call was not sent. `not_retained` does not prove
+  that the earlier operation failed to commit.
+- `Iggy\Client::resolveOperation(string $operation_id, ?int $timeout_micros = null)`
+  replays that retained operation, with a positive timeout (30 seconds by default).
+  A proved committed business rejection raises its original exception and frees the
+  lane. An uncertain result keeps the operation retained for another resolution attempt.
+  `abandonOperation(string $operation_id)` releases it without proving whether it
+  committed. Both methods reject malformed or overflowing IDs. HTTP does not support
+  retained-operation recovery. A session reset, disconnect or shutdown discards
+  retained operations. The client keeps the proved outcomes of its last
+  `max_pending_operations` replays, also across a session reset. A later
+  `resolveOperation()` of a proved operation returns the same outcome without a request.
 - Methods are exposed to PHP as camelCase, for example `createStream()` and
   `pollMessages()`.
 - Classes live in the `Iggy` namespace, for example `Iggy\Client` and

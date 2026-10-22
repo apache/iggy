@@ -49,6 +49,7 @@ __all__ = [
     "HeaderKey",
     "HeaderValue",
     "HttpConfig",
+    "IdentityInfo",
     "IggyClient",
     "IggyConsumer",
     "IggyExpiry",
@@ -58,6 +59,8 @@ __all__ = [
     "Partition",
     "PartitionContext",
     "Partitioning",
+    "PendingOperationError",
+    "PendingOperationsConfig",
     "Permissions",
     "PollingStrategy",
     "ProducerSendError",
@@ -74,6 +77,7 @@ __all__ = [
     "StreamPermissions",
     "TcpConfig",
     "TcpReconnectionConfig",
+    "TokenInfo",
     "Topic",
     "TopicDetails",
     "TopicPermissions",
@@ -1197,6 +1201,23 @@ class HttpConfig:
     def __repr__(self) -> builtins.str: ...
 
 @typing.final
+class IdentityInfo:
+    r"""
+    Identity returned by username/password login and PAT login.
+    """
+    @property
+    def user_id(self) -> builtins.int:
+        r"""
+        The unique identifier (numeric) of the authenticated user.
+        """
+    @property
+    def access_token(self) -> TokenInfo | None:
+        r"""
+        HTTP access token, or `None` on TCP/QUIC/WebSocket.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
 class IggyClient:
     r"""
     A Python class representing the Iggy client.
@@ -1228,8 +1249,8 @@ class IggyClient:
 
         Raises:
             RuntimeError: If the address passed as a string is not a valid
-                `host:port` pair, or if a `QuicConfig` client cannot bind its
-                local UDP socket (for example the port is already in use).
+                `host:port` pair. QUIC binds its local UDP socket during
+                `connect()`, which reports a port already in use.
         """
     @classmethod
     def from_connection_string(cls, connection_string: builtins.str) -> IggyClient:
@@ -1294,10 +1315,31 @@ class IggyClient:
         """
     def login_user(
         self, username: builtins.str, password: builtins.str
-    ) -> collections.abc.Awaitable[None]:
+    ) -> collections.abc.Awaitable[IdentityInfo]:
         r"""
         Logs in the user with the given credentials.
-        Raises `RuntimeError` on failure.
+
+        Returns:
+            An awaitable that resolves to `IdentityInfo`.
+            `access_token` is set only on HTTP; binary transports leave it `None`.
+
+        Raises:
+            RuntimeError: If the request fails.
+        """
+    def login_with_personal_access_token(
+        self, token: builtins.str
+    ) -> collections.abc.Awaitable[IdentityInfo]:
+        r"""
+        Logs in with a personal access token created separately.
+
+        Args:
+            token: Raw PAT string.
+
+        Returns:
+            An awaitable that resolves to `IdentityInfo`.
+
+        Raises:
+            RuntimeError: If the request fails.
         """
     def get_user(
         self, user_id: builtins.str | builtins.int
@@ -1461,6 +1503,21 @@ class IggyClient:
 
         Raises:
             RuntimeError: If the connection cannot be closed.
+        """
+    def resolve_operation(
+        self, operation_id: builtins.int, *, timeout: datetime.timedelta | None = None
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Replays the exact retained operation until its final result or the deadline.
+        A committed rejection raises its original error and frees the lane.
+        Uncertainty keeps the operation retained. HTTP does not support this operation.
+        `timeout` must be a positive timedelta; omission or None uses 30 seconds.
+        """
+    def abandon_operation(
+        self, operation_id: builtins.int
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Releases a retained operation without claiming whether it committed.
         """
     def shutdown(self) -> collections.abc.Awaitable[None]:
         r"""
@@ -1949,8 +2006,6 @@ class IggyClient:
         topic_partitions_count: builtins.int = 1,
         topic_message_expiry: IggyExpiry | None = None,
         topic_max_size: MaxTopicSize | None = None,
-        send_retries: builtins.int | None = 3,
-        send_retry_interval: datetime.timedelta | None = ...,
         topic_durability: Durability | None = None,
     ) -> collections.abc.Awaitable[IggyProducer]:
         r"""
@@ -2456,6 +2511,33 @@ class Partitioning:
         """
 
 @typing.final
+class PendingOperationError(builtins.RuntimeError):
+    r"""
+    An operation whose retained identity is needed to recover or release its lane.
+    """
+    @property
+    def operation_id(self) -> builtins.int: ...
+    @property
+    def code(self) -> builtins.int: ...
+    @property
+    def kind(self) -> builtins.str: ...
+
+@typing.final
+class PendingOperationsConfig:
+    r"""
+    Client-wide limits for active and retained mutations across every connection.
+    Queued writer frames keep their bytes charged until their last owner drops.
+    """
+    @property
+    def max_operations(self) -> builtins.int: ...
+    @property
+    def max_bytes(self) -> builtins.int: ...
+    def __new__(
+        cls, *, max_operations: builtins.int = 256, max_bytes: builtins.int = 67108864
+    ) -> PendingOperationsConfig: ...
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
 class Permissions:
     r"""
     The permissions of a user: global permissions applied to all streams,
@@ -2526,6 +2608,11 @@ class ProducerSendError(builtins.RuntimeError):
     A direct producer error that preserves partial-send recovery state.
     """
     @property
+    def operation_id(self) -> builtins.int | None:
+        r"""
+        The retained operation to resolve or abandon, when the send is uncertain or blocked.
+        """
+    @property
     def cause(self) -> builtins.str:
         r"""
         The underlying Iggy error message.
@@ -2534,8 +2621,11 @@ class ProducerSendError(builtins.RuntimeError):
     def failed(self) -> builtins.list[SendMessage]:
         r"""
         Messages without a usable confirmation after the failure.
-        An encryptor can leave these messages encrypted, so do not submit them
-        to the same producer without restoring their original payloads.
+        For an `uncertain` cause, the first chunk may already have committed:
+        resolve its operation ID without resubmitting the payload as a new send.
+        For `lane_blocked`, none of these messages was sent; resolve the earlier
+        blocker before retrying. `not_retained` does not prove non-commit.
+        Before any safe resubmission, restore payloads changed by encryption.
         """
     @property
     def committed(self) -> builtins.list[SendMessagesConfirmation]:
@@ -2556,6 +2646,8 @@ class QuicConfig:
     def client_address(self) -> builtins.str: ...
     @property
     def server_name(self) -> builtins.str: ...
+    @property
+    def pending_operations(self) -> PendingOperationsConfig: ...
     @property
     def auto_login(self) -> AutoLogin: ...
     @property
@@ -2587,6 +2679,7 @@ class QuicConfig:
         client_address: builtins.str | None = None,
         server_name: builtins.str | None = None,
         auto_login: AutoLogin | None = None,
+        pending_operations: PendingOperationsConfig | None = None,
         reconnection: QuicReconnectionConfig | None = None,
         heartbeat_interval: datetime.timedelta | None = None,
         response_buffer_size: builtins.int | None = None,
@@ -2612,6 +2705,7 @@ class QuicConfig:
             server_name: Server name used for the QUIC/TLS handshake. Defaults to
                 `localhost`.
             auto_login: Credentials replayed on every connect. Defaults to `AutoLogin.disabled()`.
+            pending_operations: Client-wide mutation limits; defaults to 256 operations and 64 MiB.
             reconnection: Reconnection policy. Defaults to `QuicReconnectionConfig()`.
             heartbeat_interval: Interval of heartbeats sent by the client. Defaults to 5 seconds.
             response_buffer_size: Size of the response buffer in bytes. Defaults to 10 MB.
@@ -2669,20 +2763,19 @@ class QuicReconnectionConfig:
 
         Args:
             enabled: Whether to reconnect at all. Defaults to enabled.
-            max_retries: Redials of the configured server address after the first
-                attempt, or `None` for unlimited; `0` still makes that first
-                attempt. Unlike the TCP transport, QUIC redials the one address
-                it was configured with rather than walking a cluster roster, so
-                this counts dials. Defaults to unlimited, which means a call
-                awaited while the server is down never returns: `connect()`
-                waits inside the retry loop, as do `send_messages()` and
-                `poll_messages()` once auto-login is configured. Set a finite
-                number for request/reply style usage, so a call fails instead.
-            interval: Delay before each redial. Defaults to 1 second.
-            reestablish_after: Cooldown before redialing after a previously
-                successful connection, measured from when it was established, so
-                a session that outlived the interval is redialed at once.
-                Defaults to 5 seconds.
+            max_retries: Retry passes over known endpoints after the initial
+                connect pass, or retries per background replica link. `None`
+                means unlimited; `0` permits only the initial attempt. An
+                explicit `connect()` may wait indefinitely with unlimited retries.
+                Binary commands still use one 30-second operation deadline.
+                The limit covers one reconnect burst: while the client is
+                signed in, each heartbeat restarts the replica links that used
+                it up, with a fresh budget.
+            interval: Base delay for exponential backoff with full jitter,
+                capped at 10 seconds. Defaults to 1 second. Explicit connect
+                starts immediately; background links wait before their first dial.
+            reestablish_after: Connection lifetime that resets a background
+                link's retry counter after loss. Defaults to 5 seconds.
 
         Raises:
             ValueError: If a duration is negative, if `max_retries` is outside the
@@ -3176,6 +3269,8 @@ class TcpConfig:
     @property
     def server_address(self) -> builtins.str: ...
     @property
+    def pending_operations(self) -> PendingOperationsConfig: ...
+    @property
     def auto_login(self) -> AutoLogin: ...
     @property
     def reconnection(self) -> TcpReconnectionConfig: ...
@@ -3196,6 +3291,7 @@ class TcpConfig:
         *,
         server_address: builtins.str | None = None,
         auto_login: AutoLogin | None = None,
+        pending_operations: PendingOperationsConfig | None = None,
         reconnection: TcpReconnectionConfig | None = None,
         heartbeat_interval: datetime.timedelta | None = None,
         tls_enabled: builtins.bool | None = None,
@@ -3210,6 +3306,7 @@ class TcpConfig:
         Args:
             server_address: `host:port` of the Iggy server. Defaults to `127.0.0.1:8090`.
             auto_login: Credentials replayed on every connect. Defaults to `AutoLogin.disabled()`.
+            pending_operations: Client-wide mutation limits; defaults to 256 operations and 64 MiB.
             reconnection: Reconnection policy. Defaults to `TcpReconnectionConfig()`.
             heartbeat_interval: Interval of heartbeats sent by the client. Defaults to 5 seconds.
             tls_enabled: Whether to connect over TLS. Defaults to disabled.
@@ -3259,27 +3356,42 @@ class TcpReconnectionConfig:
 
         Args:
             enabled: Whether to reconnect at all. Defaults to enabled.
-            max_retries: Passes over the known endpoints after the first, or
-                `None` for unlimited; `0` still makes that first pass. One pass
-                tries the endpoint the client is on, the address it was
-                configured with, and every node the roster named, so this counts
-                passes rather than dials. Defaults
-                to unlimited, which means a call awaited while the server is
-                down never returns: `connect()`, `send_messages()` and
-                `poll_messages()` all wait inside the retry loop. Set a finite
-                number for request/reply style usage, so a call fails instead.
-            interval: Delay between passes. Defaults to 1 second. The first pass
-                runs at once when more than one endpoint is known.
-            reestablish_after: Cooldown before redialing the endpoint of the last
-                successful connection, measured from when it was established, so
-                a session that outlived the interval is redialed at once. Owed to
-                that endpoint alone. Defaults to 5 seconds.
+            max_retries: Retry passes over known endpoints after the initial
+                connect pass, or retries per background replica link. `None`
+                means unlimited; `0` permits only the initial attempt. An
+                explicit `connect()` may wait indefinitely with unlimited retries.
+                Binary commands still use one 30-second operation deadline.
+                The limit covers one reconnect burst: while the client is
+                signed in, each heartbeat restarts the replica links that used
+                it up, with a fresh budget.
+            interval: Base delay for exponential backoff with full jitter,
+                capped at 10 seconds. Defaults to 1 second. Explicit connect
+                starts immediately; background links wait before their first dial.
+            reestablish_after: Connection lifetime that resets a background
+                link's retry counter after loss. Defaults to 5 seconds.
 
         Raises:
             ValueError: If a duration is negative, if `max_retries` is outside the
                 range of an unsigned 32-bit integer, or if `interval` is zero.
             OverflowError: If `max_retries` does not fit a signed 64-bit integer,
                 raised by the underlying conversion before this constructor runs.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class TokenInfo:
+    r"""
+    HTTP session token returned by login. Binary transports leave this unset.
+    """
+    @property
+    def token(self) -> builtins.str:
+        r"""
+        The access token value. Present only after HTTP login.
+        """
+    @property
+    def expiry(self) -> builtins.int:
+        r"""
+        Unix-seconds expiry of the HTTP access token.
         """
     def __repr__(self) -> builtins.str: ...
 
@@ -3597,6 +3709,8 @@ class WebSocketConfig:
     @property
     def server_address(self) -> builtins.str: ...
     @property
+    def pending_operations(self) -> PendingOperationsConfig: ...
+    @property
     def auto_login(self) -> AutoLogin: ...
     @property
     def reconnection(self) -> WebSocketReconnectionConfig: ...
@@ -3617,6 +3731,7 @@ class WebSocketConfig:
         *,
         server_address: builtins.str | None = None,
         auto_login: AutoLogin | None = None,
+        pending_operations: PendingOperationsConfig | None = None,
         reconnection: WebSocketReconnectionConfig | None = None,
         heartbeat_interval: datetime.timedelta | None = None,
         framing: WebSocketFramingConfig | None = None,
@@ -3631,6 +3746,7 @@ class WebSocketConfig:
         Args:
             server_address: `host:port` of the Iggy server. Defaults to `127.0.0.1:8092`.
             auto_login: Credentials replayed on every connect. Defaults to `AutoLogin.disabled()`.
+            pending_operations: Client-wide mutation limits; defaults to 256 operations and 64 MiB.
             reconnection: Reconnection policy. Defaults to `WebSocketReconnectionConfig()`.
             heartbeat_interval: Interval of heartbeats sent by the client. Defaults to 5 seconds.
             framing: Frame- and buffer-level options. Defaults to `WebSocketFramingConfig()`.
@@ -3743,21 +3859,19 @@ class WebSocketReconnectionConfig:
 
         Args:
             enabled: Whether to reconnect at all. Defaults to enabled.
-            max_retries: Redials of the configured server address after the first
-                attempt, or `None` for unlimited; `0` still makes that first
-                attempt. Unlike the TCP transport, WebSocket redials the one
-                address it was configured with rather than walking a cluster
-                roster, so this counts dials. Defaults to unlimited, which means
-                a call awaited while the server is down never returns:
-                `connect()` waits inside the retry loop, as do `send_messages()`
-                and `poll_messages()` once auto-login is configured. Set a finite
-                number for request/reply style usage, so a call fails instead.
-            interval: Delay before each redial. Defaults to 1 second.
-            reestablish_after: Cooldown before redialing after a previously
-                successful connection, measured from when it was established, so
-                a session that outlived the interval is redialed at once. Applied
-                from the first redial onward, not to the initial connect.
-                Defaults to 5 seconds.
+            max_retries: Retry passes over known endpoints after the initial
+                connect pass, or retries per background replica link. `None`
+                means unlimited; `0` permits only the initial attempt. An
+                explicit `connect()` may wait indefinitely with unlimited retries.
+                Binary commands still use one 30-second operation deadline.
+                The limit covers one reconnect burst: while the client is
+                signed in, each heartbeat restarts the replica links that used
+                it up, with a fresh budget.
+            interval: Base delay for exponential backoff with full jitter,
+                capped at 10 seconds. Defaults to 1 second. Explicit connect
+                starts immediately; background links wait before their first dial.
+            reestablish_after: Connection lifetime that resets a background
+                link's retry counter after loss. Defaults to 5 seconds.
 
         Raises:
             ValueError: If a duration is negative, if `max_retries` is outside the

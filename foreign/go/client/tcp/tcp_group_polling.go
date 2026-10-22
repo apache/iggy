@@ -58,8 +58,7 @@ type groupAssignment struct {
 }
 
 // groupAssignmentCache holds the assignments this client polls with. It is
-// guarded by its own lock rather than the connection lock, because a poll
-// reads it around an exchange that already holds the connection.
+// guarded independently of network exchanges.
 type groupAssignmentCache struct {
 	mtx     sync.Mutex
 	entries map[groupKey]*groupAssignment
@@ -157,8 +156,7 @@ func (c *groupAssignmentCache) hasLeft(key groupKey) bool {
 	return ok
 }
 
-// clear forgets every assignment. A new connection registers a new client
-// identity, so nothing the server assigned to the old one still holds.
+// clear forgets assignments when the logical session changes.
 func (c *groupAssignmentCache) clear() {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
@@ -253,6 +251,9 @@ func (c *IggyTcpClient) ensureAssignment(
 	key groupKey,
 	streamId, topicId, groupId iggcon.Identifier,
 ) (groupAssignment, error) {
+	c.mtx.Lock()
+	fence := c.sessionFence
+	c.mtx.Unlock()
 	// As in Rust, an empty assignment is synced again on every poll: a member
 	// gets its partitions only as each one installs it as the owner.
 	if cached, ok := c.groups.get(key); ok && len(cached.partitions) > 0 &&
@@ -282,6 +283,12 @@ func (c *IggyTcpClient) ensureAssignment(
 	c.logger.Debug("Synced the consumer group assignment",
 		slog.Uint64("generation", assignment.generation),
 		slog.Int("partitions", len(assignment.partitions)))
+	c.mtx.Lock()
+	if c.sessionFence != fence {
+		c.mtx.Unlock()
+		return groupAssignment{}, c.sessionLossError(ierror.ErrUnauthenticated)
+	}
 	c.groups.putSynced(key, assignment)
+	c.mtx.Unlock()
 	return assignment, nil
 }

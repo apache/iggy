@@ -42,50 +42,144 @@ namespace Apache.Iggy.Tests.VsrTests;
 /// </summary>
 public sealed class EndpointFailoverTests
 {
-    // An unmasked TRANSIENT_NOT_ACCEPTED replays the same id for the 2s failover check anyway, so only more
-    // refusals than fit in it (50 x 50ms) tell masking apart. The other codes are not replayed unmasked.
     [Theory]
-    [InlineData(VsrError.TRANSIENT_NOT_ACCEPTED, false, 50)]
-    [InlineData(VsrError.UNAUTHORIZED, false, 3)]
-    [InlineData(VsrError.UNAUTHENTICATED, false, 3)]
-    [InlineData(VsrError.STALE_CLIENT, false, 3)]
-    [InlineData(VsrError.NOT_PRIMARY, false, 3)]
-    [InlineData(VsrError.LIFECYCLE_BUSY, false, 3)]
-    [InlineData(VsrError.FEATURE_UNAVAILABLE, false, 3)]
-    [InlineData(VsrError.TRANSIENT_NOT_ACCEPTED, true, 50)]
-    [InlineData(VsrError.NOT_PRIMARY, true, 3)]
-    [InlineData(VsrError.UNAUTHENTICATED, true, 3)]
-    [InlineData(VsrError.HISTORY_UNAVAILABLE, true, 3)]
-    public async Task LaterRefusalsKeepTheIdentityOfAnUncertainMetadataWrite(int refusal, bool resultSection,
-        int refusalCount)
+    [InlineData("localhost")]
+    [InlineData("localhost:invalid")]
+    public async Task given_an_invalid_base_address_when_retries_are_unlimited_should_report_configuration_fault(
+        string address)
+    {
+        using var client = new TcpMessageStream(new IggyClientConfigurator
+        {
+            BaseAddress = address,
+            Protocol = Protocol.Tcp,
+            ReconnectionSettings = new ReconnectionSettings
+            {
+                Enabled = true,
+                MaxRetries = 0,
+                InitialDelay = TimeSpan.FromMilliseconds(1)
+            }
+        }, NullLoggerFactory.Instance);
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        cancellation.CancelAfter(TimeSpan.FromSeconds(2));
+
+        await Assert.ThrowsAsync<InvalidBaseAddressException>(() => client.ConnectAsync(cancellation.Token));
+
+        Assert.False(cancellation.IsCancellationRequested);
+    }
+
+    [Fact]
+    public async Task given_a_missing_certificate_when_retries_are_unlimited_should_report_configuration_fault()
+    {
+        using var node = new MockNode();
+        node.Serve(Answer);
+        using var client = new TcpMessageStream(new IggyClientConfigurator
+        {
+            BaseAddress = $"127.0.0.1:{node.Port}",
+            Protocol = Protocol.Tcp,
+            TlsSettings = new TlsSettings { Enabled = true, Hostname = "localhost", CertificatePath = string.Empty },
+            ReconnectionSettings = new ReconnectionSettings
+            {
+                Enabled = true,
+                MaxRetries = 0,
+                InitialDelay = TimeSpan.FromMilliseconds(1)
+            }
+        }, NullLoggerFactory.Instance);
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        cancellation.CancelAfter(TimeSpan.FromSeconds(2));
+
+        await Assert.ThrowsAsync<InvalidCertificatePathException>(() => client.ConnectAsync(cancellation.Token));
+
+        Assert.False(cancellation.IsCancellationRequested);
+    }
+
+    [Fact]
+    public async Task given_an_invalid_base_address_when_a_known_endpoint_is_healthy_should_connect_to_it()
+    {
+        using var primary = new MockNode();
+        using var survivor = new MockNode();
+        primary.Serve(request => request.Code == GET_CLUSTER_METADATA_CODE
+            ? Reply(request.Operation, ClusterMetadata(primary.Port, survivor.Port, primary.Port))
+            : Answer(request));
+        survivor.Serve(Answer);
+        var configuration = new IggyClientConfigurator
+        {
+            BaseAddress = $"127.0.0.1:{primary.Port}",
+            Protocol = Protocol.Tcp,
+            HeartbeatInterval = TimeSpan.FromHours(1),
+            ReconnectionSettings = new ReconnectionSettings
+            {
+                Enabled = true,
+                MaxRetries = 0,
+                InitialDelay = TimeSpan.FromMilliseconds(1)
+            }
+        };
+        using var client = new TcpMessageStream(configuration, NullLoggerFactory.Instance);
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        cancellation.CancelAfter(TimeSpan.FromSeconds(5));
+        await client.ConnectAsync(cancellation.Token);
+        await client.LoginUserAsync("iggy", "iggy", cancellation.Token);
+        await client.LogoutUserAsync(cancellation.Token);
+        primary.Kill();
+        configuration.BaseAddress = "localhost:invalid";
+
+        await client.ConnectAsync(cancellation.Token);
+        await client.PingAsync(cancellation.Token);
+
+        Assert.Equal($"127.0.0.1:{survivor.Port}", client.GetCurrentAddress());
+        Assert.Equal(1, survivor.Pings);
+        Assert.Equal(0, survivor.Registrations);
+    }
+
+    [Theory]
+    [InlineData(VsrError.TRANSIENT_NOT_ACCEPTED, false)]
+    [InlineData(VsrError.UNAUTHORIZED, false)]
+    [InlineData(VsrError.UNAUTHENTICATED, false)]
+    [InlineData(VsrError.STALE_CLIENT, false)]
+    [InlineData(VsrError.NOT_PRIMARY, false)]
+    [InlineData(VsrError.LIFECYCLE_BUSY, false)]
+    [InlineData(VsrError.FEATURE_UNAVAILABLE, false)]
+    [InlineData(VsrError.TRANSIENT_NOT_ACCEPTED, true)]
+    [InlineData(VsrError.NOT_PRIMARY, true)]
+    [InlineData(VsrError.UNAUTHENTICATED, true)]
+    [InlineData(VsrError.HISTORY_UNAVAILABLE, true)]
+    public async Task LaterRefusalsKeepTheIdentityOfAnUncertainMetadataWrite(int refusal, bool resultSection)
     {
         using var node = new MockNode();
         var attempts = new ConcurrentQueue<MockRequest>();
+        var proveCommit = false;
         node.Serve(request =>
         {
             if (request.Operation == (byte)VsrOperation.CreatePartitions)
             {
                 attempts.Enqueue(request);
-                var status = attempts.Count switch
+                var status = proveCommit ? 0 : attempts.Count == 1 ? VsrError.TRANSIENT_NOT_COMMITTED : refusal;
+                if (resultSection && status != 0)
                 {
-                    1 => VsrError.TRANSIENT_NOT_COMMITTED,
-                    _ when attempts.Count <= refusalCount => refusal,
-                    _ => 0
-                };
-                return status == 0 ? Reply(request.Operation, new byte[4])
-                    : resultSection ? Reply(request.Operation, VsrTestPayloads.Rejection(status))
-                    : Reply(request.Operation, [], (uint)status);
+                    var reply = Reply(request.Operation, VsrTestPayloads.Rejection(status));
+                    reply[VsrHeader.REPLY_COMMITTED_OFFSET] = 0;
+                    return reply;
+                }
+                return Reply(request.Operation, status == 0 ? new byte[4] : [], (uint)status);
             }
             return request.Code == GET_CLUSTER_METADATA_CODE
                 ? Reply(OPERATION_NON_REPLICATED, ClusterMetadata(node.Port, node.Port, node.Port))
                 : Answer(request);
         });
-        using var client = await SignedInClientAsync(node);
-
-        await client.CreatePartitionsAsync(Identifier.Numeric(1), Identifier.Numeric(1), 1,
-            TestContext.Current.CancellationToken);
-
-        Assert.Equal(refusalCount + 1, attempts.Count);
+        using var client = new TcpMessageStream(new IggyClientConfigurator
+        {
+            BaseAddress = $"127.0.0.1:{node.Port}",
+            Protocol = Protocol.Tcp,
+            HeartbeatInterval = TimeSpan.FromHours(1),
+            ReconnectionSettings = new ReconnectionSettings { Enabled = true, InitialDelay = TimeSpan.Zero }
+        }, NullLoggerFactory.Instance);
+        await client.ConnectAsync(TestContext.Current.CancellationToken);
+        await client.LoginUserAsync("iggy", "iggy", TestContext.Current.CancellationToken);
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        cancellation.CancelAfter(TimeSpan.FromMilliseconds(500));
+        var unknown = await Assert.ThrowsAsync<VsrRequestOutcomeUnknownException>(() =>
+            client.CreatePartitionsAsync(Identifier.Numeric(1), Identifier.Numeric(1), 1, cancellation.Token));
+        var id = Assert.IsType<ulong>(unknown.OperationId);
+        Assert.True(attempts.Count >= 2);
         var original = attempts.First();
         Assert.All(attempts, replay =>
         {
@@ -94,6 +188,15 @@ public sealed class EndpointFailoverTests
             Assert.Equal(original.RequestId, replay.RequestId);
             Assert.Equal(original.Body, replay.Body);
         });
+        proveCommit = true;
+        var count = attempts.Count;
+        var blocked = await Assert.ThrowsAsync<VsrLaneBlockedException>(() =>
+            client.CreatePartitionsAsync(Identifier.Numeric(1), Identifier.Numeric(1), 1,
+                TestContext.Current.CancellationToken));
+        Assert.Equal(id, blocked.OperationId);
+        Assert.Equal(count, attempts.Count);
+        await client.ResolveOperationAsync(id, TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken);
+        Assert.Equal(original.RequestId, attempts.Last().RequestId);
     }
 
     [Theory]
@@ -108,9 +211,11 @@ public sealed class EndpointFailoverTests
             if (request.Operation == (byte)VsrOperation.CreatePartitions)
             {
                 attempts.Enqueue(request);
-                return Reply(request.Operation, VsrTestPayloads.Rejection(attempts.Count == 1
+                var reply = Reply(request.Operation, VsrTestPayloads.Rejection(attempts.Count == 1
                     ? VsrError.TRANSIENT_NOT_COMMITTED
                     : rejection));
+                reply[VsrHeader.REPLY_COMMITTED_OFFSET] = 0;
+                return reply;
             }
             return request.Code == GET_CLUSTER_METADATA_CODE
                 ? Reply(OPERATION_NON_REPLICATED, ClusterMetadata(node.Port, node.Port, node.Port))
@@ -138,7 +243,7 @@ public sealed class EndpointFailoverTests
             if (request.Operation == (byte)VsrOperation.CreatePartitions)
             {
                 return Interlocked.Increment(ref attempts) == 1
-                    ? Reply(request.Operation, VsrTestPayloads.Rejection(VsrError.TRANSIENT_NOT_COMMITTED))
+                    ? Reply(request.Operation, [], VsrError.TRANSIENT_NOT_COMMITTED)
                     : Reply(request.Operation, VsrTestPayloads.Rejection(rejectionCode));
             }
             return request.Code == GET_CLUSTER_METADATA_CODE
@@ -165,7 +270,7 @@ public sealed class EndpointFailoverTests
             if (request.Operation == (byte)VsrOperation.CreatePersonalAccessToken)
             {
                 return Interlocked.Increment(ref attempts) == 1
-                    ? Reply(request.Operation, VsrTestPayloads.Rejection(VsrError.TRANSIENT_NOT_COMMITTED))
+                    ? Reply(request.Operation, [], VsrError.TRANSIENT_NOT_COMMITTED)
                     : Reply(request.Operation,
                         VsrTestPayloads.Rejection(VsrError.PERSONAL_ACCESS_TOKEN_ALREADY_EXISTS));
             }
@@ -183,7 +288,7 @@ public sealed class EndpointFailoverTests
     }
 
     [Fact]
-    public async Task CommittedLifecycleBusyOfAReplayResendsAnUncertainMetadataWriteUnderANewId()
+    public async Task CommittedLifecycleBusyOfAReplaySettlesAnUncertainMetadataWrite()
     {
         using var node = new MockNode();
         var attempts = new ConcurrentQueue<MockRequest>();
@@ -194,7 +299,7 @@ public sealed class EndpointFailoverTests
                 attempts.Enqueue(request);
                 return attempts.Count switch
                 {
-                    1 => Reply(request.Operation, VsrTestPayloads.Rejection(VsrError.TRANSIENT_NOT_COMMITTED)),
+                    1 => Reply(request.Operation, [], VsrError.TRANSIENT_NOT_COMMITTED),
                     2 => Reply(request.Operation, VsrTestPayloads.Rejection(VsrError.LIFECYCLE_BUSY)),
                     _ => Reply(request.Operation, new byte[4])
                 };
@@ -205,13 +310,24 @@ public sealed class EndpointFailoverTests
         });
         using var client = await SignedInClientAsync(node);
 
+        var rejection = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() =>
+            client.CreatePartitionsAsync(Identifier.Numeric(1), Identifier.Numeric(1), 1,
+                TestContext.Current.CancellationToken));
+
+        Assert.Equal(VsrError.LIFECYCLE_BUSY, rejection.StatusCode);
+        Assert.True(rejection.FromServer);
+        Assert.True(rejection.Committed);
+        var sent = attempts.ToArray();
+        Assert.Equal(2, sent.Length);
+        Assert.Equal(sent[0].RequestId, sent[1].RequestId);
+        Assert.Equal(sent[0].Body, sent[1].Body);
+        await Assert.ThrowsAsync<VsrOperationNotRetainedException>(() => client.ResolveOperationAsync(
+            sent[0].RequestId, TimeSpan.FromSeconds(1), TestContext.Current.CancellationToken));
+
         await client.CreatePartitionsAsync(Identifier.Numeric(1), Identifier.Numeric(1), 1,
             TestContext.Current.CancellationToken);
-
-        var sent = attempts.ToArray();
-        Assert.Equal(3, sent.Length);
-        Assert.Equal(sent[0].RequestId, sent[1].RequestId);
-        Assert.NotEqual(sent[0].RequestId, sent[2].RequestId);
+        Assert.Equal(3, attempts.Count);
+        Assert.True(attempts.Last().RequestId > sent[0].RequestId);
     }
 
     [Theory]
@@ -222,8 +338,6 @@ public sealed class EndpointFailoverTests
         using var primary = new MockNode();
         using var survivor = new MockNode();
 
-        // The primary leads, so the sign-in settles there and the roster is only remembered - not acted on -
-        // until the node dies.
         primary.Serve(request => request.Code == GET_CLUSTER_METADATA_CODE
             ? Reply(OPERATION_NON_REPLICATED, ClusterMetadata(primary.Port, survivor.Port, primary.Port))
             : Answer(request));
@@ -288,6 +402,7 @@ public sealed class EndpointFailoverTests
         var bindings = new ConcurrentQueue<MockRequest>();
         var writes = new ConcurrentQueue<MockRequest>();
         var pings = new ConcurrentQueue<MockRequest>();
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
         node.Serve(request =>
         {
             if (request.Operation == OPERATION_REGISTER)
@@ -309,15 +424,19 @@ public sealed class EndpointFailoverTests
             if (request.Operation == (byte)VsrOperation.CreateStream)
             {
                 writes.Enqueue(request);
+                cancellation.Cancel();
                 throw new IOException("The connection lost the committed write reply.");
             }
             if (request.Code == PING_CODE)
             {
                 pings.Enqueue(request);
             }
-            return request.Code == GET_CLUSTER_METADATA_CODE
-                ? Reply(OPERATION_NON_REPLICATED, ClusterMetadata(node.Port, node.Port, node.Port))
-                : Answer(request);
+            return request.Code switch
+            {
+                GET_CLUSTER_METADATA_CODE => Reply(OPERATION_NON_REPLICATED, ClusterMetadata(node.Port, node.Port, node.Port)),
+                CommandCodes.GET_PARTITION_ROUTE_CODE => RouteReply(request, new PartitionContext(17, 0, 1), 0),
+                _ => Answer(request)
+            };
         });
         using var client = new TcpMessageStream(new IggyClientConfigurator
         {
@@ -327,7 +446,7 @@ public sealed class EndpointFailoverTests
             ReconnectionSettings = new ReconnectionSettings
             {
                 Enabled = true,
-                MaxRetries = 1,
+                MaxRetries = 4,
                 InitialDelay = TimeSpan.Zero,
                 WaitAfterReconnect = TimeSpan.Zero
             }
@@ -338,30 +457,33 @@ public sealed class EndpointFailoverTests
         var registration = Assert.Single(registrations);
 
         await Assert.ThrowsAsync<VsrRequestOutcomeUnknownException>(() =>
-            client.CreateStreamAsync("lost-reply", token: TestContext.Current.CancellationToken));
+            client.CreateStreamAsync("lost-reply", token: cancellation.Token));
         var write = Assert.Single(writes);
         Assert.Equal(registration.ClientId, write.ClientId);
 
-        if (bindStatus is VsrError.TRANSIENT_NOT_COMMITTED or VsrError.TRANSIENT_NOT_ACCEPTED or VsrError.SESSION_MISMATCH)
+        if (bindStatus == VsrError.SESSION_MISMATCH)
         {
+            await UntilAsync(() => bindings.Count == 1);
             var refusal = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() =>
                 client.PingAsync(TestContext.Current.CancellationToken));
             Assert.Equal(bindStatus, refusal.StatusCode);
             Assert.Single(registrations);
             Assert.Equal(generation, ((ISessionGenerationProvider)client).SessionGeneration);
+            await client.ConnectAsync(TestContext.Current.CancellationToken);
         }
-        await client.PingAsync(TestContext.Current.CancellationToken);
+        var (resumed, lastError) = await ResumedWithin(client, TimeSpan.FromSeconds(5));
+        Assert.True(resumed, lastError);
 
         Assert.Single(writes);
         Assert.NotEmpty(bindings);
-        Assert.All(bindings, binding =>
+        Assert.All(bindings.Where(binding => binding.ClientId == registration.ClientId), binding =>
         {
             Assert.Equal(registration.ClientId, binding.ClientId);
             Assert.Equal(write.Session, binding.Session);
             Assert.Equal(LoginRegister.ReadBindSecret(registration.Body),
                 binding.Body.AsSpan(binding.Body.Length - LoginRegister.BIND_SECRET_BYTES).ToArray());
         });
-        var ping = Assert.Single(pings);
+        var ping = pings.Last();
         if (bindStatus is VsrError.UNAUTHENTICATED or VsrError.STALE_CLIENT)
         {
             Assert.Equal(2, registrations.Count);
@@ -379,112 +501,340 @@ public sealed class EndpointFailoverTests
     }
 
     [Fact]
-    public async Task WalksPastTwoRefusingReplicasToThePartitionPrimary()
+    public async Task CallWaitingForAReconnectFailsWithTheBindRefusal()
     {
-        const uint commandCode = 60_040;
-        using var metadataLeader = new MockNode();
-        using var follower = new MockNode();
-        using var partitionPrimary = new MockNode();
-
-        metadataLeader.Serve(request => request.Code switch
+        using var node = new MockNode();
+        var bindings = new ConcurrentQueue<MockRequest>();
+        var pingStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var lostReply = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        node.Serve(request =>
         {
-            GET_CLUSTER_METADATA_CODE => Reply(OPERATION_NON_REPLICATED,
-                ThreeNodeClusterMetadata(metadataLeader.Port, follower.Port, partitionPrimary.Port)),
-            (int)commandCode => Reply(request.Operation, [], TRANSIENT_NOT_ACCEPTED),
+            if (request.Operation == OPERATION_REGISTER)
+            {
+                return Reply(request.Operation, RegisterBody(session: 128));
+            }
+            if (request.Code == BIND_SESSION_CODE)
+            {
+                bindings.Enqueue(request);
+                pingStarted.Task.Wait(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+                return Reply(request.Operation, RegisterBody(request.Session + 1)[4..]);
+            }
+            if (request.Operation == (byte)VsrOperation.CreateStream)
+            {
+                lostReply.Cancel();
+                throw new IOException("The connection lost the write reply.");
+            }
+            return request.Code == GET_CLUSTER_METADATA_CODE
+                ? Reply(OPERATION_NON_REPLICATED, ClusterMetadata(node.Port, node.Port, node.Port))
+                : Answer(request);
+        });
+        using var client = new TcpMessageStream(new IggyClientConfigurator
+        {
+            BaseAddress = $"127.0.0.1:{node.Port}",
+            Protocol = Protocol.Tcp,
+            HeartbeatInterval = TimeSpan.FromHours(1),
+            ReconnectionSettings = new ReconnectionSettings { Enabled = true, InitialDelay = TimeSpan.Zero }
+        }, NullLoggerFactory.Instance);
+        await client.ConnectAsync(TestContext.Current.CancellationToken);
+        await client.LoginUserAsync("iggy", "iggy", TestContext.Current.CancellationToken);
+        await Assert.ThrowsAsync<VsrRequestOutcomeUnknownException>(() =>
+            client.CreateStreamAsync("lost-reply", token: lostReply.Token));
+        await UntilAsync(() => bindings.Count == 1);
+
+        // PingAsync checks the link before its first await, so it sees the bind still pending.
+        var ping = client.PingAsync(TestContext.Current.CancellationToken);
+        pingStarted.SetResult();
+
+        var refusal = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() => ping);
+        Assert.Equal(VsrError.SESSION_MISMATCH, refusal.StatusCode);
+
+        // A partition read with no cached route looks the route up on a ready link, so it needs the same verdict.
+        var read = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() => client.GetOffsetAsync(
+            Kinds.Consumer.New(3), Identifier.Numeric(1), Identifier.Numeric(2), 0, TestContext.Current.CancellationToken));
+        Assert.Equal(VsrError.SESSION_MISMATCH, read.StatusCode);
+    }
+
+    [Theory]
+    [InlineData("ping")]
+    [InlineData("partition read")]
+    [InlineData("partition read on a cached route")]
+    public async Task CallAfterALostLinkFailsAsNotConnectedWhenReconnectionIsOff(string call)
+    {
+        using var node = new MockNode();
+        node.Serve(request => request.Code switch
+        {
+            GET_CLUSTER_METADATA_CODE => StandaloneRoster(node.Port),
+            CommandCodes.GET_PARTITION_ROUTE_CODE => RouteReply(request, new PartitionContext(17, 0, 1), 0),
             _ => Answer(request)
         });
-        follower.Serve(request => request.Code == (int)commandCode
-            ? Reply(request.Operation, [], TRANSIENT_NOT_ACCEPTED)
-            : Answer(request));
-        partitionPrimary.Serve(Answer);
-
-        var configuration = new IggyClientConfigurator
+        using var client = new TcpMessageStream(new IggyClientConfigurator
         {
-            BaseAddress = $"127.0.0.1:{metadataLeader.Port}",
+            BaseAddress = $"127.0.0.1:{node.Port}",
             Protocol = Protocol.Tcp,
-            ReconnectionSettings = new ReconnectionSettings
-            {
-                Enabled = true,
-                MaxRetries = 1,
-                InitialDelay = TimeSpan.FromMilliseconds(20)
-            }
-        };
-        using var client = new TcpMessageStream(configuration, NullLoggerFactory.Instance);
-
+            HeartbeatInterval = TimeSpan.FromHours(1),
+            ReconnectionSettings = new ReconnectionSettings { Enabled = false }
+        }, NullLoggerFactory.Instance);
         await client.ConnectAsync(TestContext.Current.CancellationToken);
         await client.LoginUserAsync("iggy", "iggy", TestContext.Current.CancellationToken);
-
-        Assert.Empty(await client.SendBinaryRequestAsync(commandCode, [], TestContext.Current.CancellationToken));
-        Assert.True(follower.Connections >= 1, "the roster walk skipped the second replica");
-        Assert.True(partitionPrimary.Connections >= 1, "the roster walk never reached the partition primary");
-    }
-
-    [Fact]
-    public async Task WalksTheWholeRosterBeyondTheMetadataRedirectCap()
-    {
-        const uint commandCode = 60_041;
-        using var metadataLeader = new MockNode();
-        using var second = new MockNode();
-        using var third = new MockNode();
-        using var fourth = new MockNode();
-        using var partitionPrimary = new MockNode();
-        var roster = new[]
+        Func<Task> read = () => client.GetOffsetAsync(Kinds.Consumer.New(3), Identifier.Numeric(1),
+            Identifier.Numeric(2), 0, TestContext.Current.CancellationToken);
+        if (call == "partition read on a cached route")
         {
-            metadataLeader.Port,
-            second.Port,
-            third.Port,
-            fourth.Port,
-            partitionPrimary.Port
-        };
-
-        byte[] Refuse(MockRequest request)
-        {
-            return request.Code == (int)commandCode
-                ? Reply(request.Operation, [], TRANSIENT_NOT_ACCEPTED)
-                : Answer(request);
+            await read();
         }
 
-        metadataLeader.Serve(request => request.Code == GET_CLUSTER_METADATA_CODE
-            ? Reply(OPERATION_NON_REPLICATED, RosterMetadata(metadataLeader.Port, roster))
-            : Refuse(request));
-        second.Serve(Refuse);
-        third.Serve(Refuse);
-        fourth.Serve(Refuse);
-        partitionPrimary.Serve(Answer);
+        node.Kill();
 
-        var configuration = new IggyClientConfigurator
-        {
-            BaseAddress = $"127.0.0.1:{metadataLeader.Port}",
-            Protocol = Protocol.Tcp,
-            ReconnectionSettings = new ReconnectionSettings
-            {
-                Enabled = true,
-                MaxRetries = 1,
-                InitialDelay = TimeSpan.FromMilliseconds(20)
-            }
-        };
-        using var client = new TcpMessageStream(configuration, NullLoggerFactory.Instance);
-
-        await client.ConnectAsync(TestContext.Current.CancellationToken);
-        await client.LoginUserAsync("iggy", "iggy", TestContext.Current.CancellationToken);
-
-        Assert.Empty(await client.SendBinaryRequestAsync(commandCode, [], TestContext.Current.CancellationToken));
-        Assert.True(partitionPrimary.Connections >= 1,
-            "the arbitrary metadata redirect cap stopped the bounded roster walk");
+        // A call that races the close is replayed, because both calls are safe reads, so it also ends at the link
+        // failure.
+        await Assert.ThrowsAsync<NotConnectedException>(call == "ping"
+            ? () => client.PingAsync(TestContext.Current.CancellationToken) : read);
     }
 
     [Fact]
-    public async Task ReturnsToANodeThatRefusedEarlierOnceTheWalkFindsNoOtherPrimary()
+    public async Task CallWaitingOnTheRosterFailsAsNotConnectedAfterDetachmentWhenReconnectionIsOff()
+    {
+        using var node = new MockNode();
+        var refusing = false;
+        node.Serve(request =>
+        {
+            if (request.Code == CommandCodes.GET_STATS_CODE)
+            {
+                return Reply(OPERATION_NON_REPLICATED, [], VsrError.UNAUTHENTICATED);
+            }
+            if (Volatile.Read(ref refusing) && request.Code is CommandCodes.PING_CODE or GET_CLUSTER_METADATA_CODE)
+            {
+                return Reply(OPERATION_NON_REPLICATED, [], VsrError.TRANSIENT_NOT_ACCEPTED);
+            }
+            return request.Code == GET_CLUSTER_METADATA_CODE ? StandaloneRoster(node.Port) : Answer(request);
+        });
+        using var client = new TcpMessageStream(new IggyClientConfigurator
+        {
+            BaseAddress = $"127.0.0.1:{node.Port}",
+            Protocol = Protocol.Tcp,
+            HeartbeatInterval = TimeSpan.FromHours(1),
+            ReconnectionSettings = new ReconnectionSettings { Enabled = false }
+        }, NullLoggerFactory.Instance);
+        await client.ConnectAsync(TestContext.Current.CancellationToken);
+        await client.LoginUserAsync("iggy", "iggy", TestContext.Current.CancellationToken);
+        var rosterReads = node.Requests(GET_CLUSTER_METADATA_CODE);
+        Volatile.Write(ref refusing, true);
+
+        // A refused ping reads the roster again, and the refused roster reads keep it in that loop.
+        var ping = client.PingAsync(TestContext.Current.CancellationToken);
+        await UntilAsync(() => node.Requests(GET_CLUSTER_METADATA_CODE) > rosterReads);
+
+        await Assert.ThrowsAsync<NotConnectedException>(() =>
+            client.GetStatsAsync(TestContext.Current.CancellationToken));
+        Assert.Equal(1, node.Registrations);
+
+        await Assert.ThrowsAsync<NotConnectedException>(() => ping);
+    }
+
+    [Theory]
+    [InlineData("safe read")]
+    [InlineData("partition read on a cached route")]
+    [InlineData("poll")]
+    [InlineData("route lookup")]
+    [InlineData("roster read")]
+    [InlineData("session resume")]
+    public async Task CallEndedByASessionEvictionFailsWithTheServerVerdict(string call)
+    {
+        using var node = new MockNode();
+        var evicted = call switch
+        {
+            "safe read" => CommandCodes.GET_STATS_CODE,
+            "partition read on a cached route" => CommandCodes.GET_CONSUMER_OFFSET_CODE,
+            "poll" => CommandCodes.POLL_MESSAGES_CODE,
+            "route lookup" => CommandCodes.GET_PARTITION_ROUTE_CODE,
+            "roster read" => GET_CLUSTER_METADATA_CODE,
+            _ => BIND_SESSION_CODE
+        };
+        var armed = false;
+        var evictions = 0;
+        var drops = 0;
+        node.Serve(request =>
+        {
+            if (Volatile.Read(ref armed))
+            {
+                if (request.Code == evicted && Interlocked.Increment(ref evictions) == 1)
+                {
+                    return EvictionFrame((byte)(call == "session resume" ? EvictionReason.NoSession : EvictionReason.SessionError));
+                }
+                // A refused ping reads the roster again.
+                if (call == "roster read" && request.Code == CommandCodes.PING_CODE)
+                {
+                    return Reply(OPERATION_NON_REPLICATED, [], VsrError.TRANSIENT_NOT_ACCEPTED);
+                }
+                if (call == "session resume" && request.Code == CommandCodes.PING_CODE
+                    && Interlocked.Increment(ref drops) == 1)
+                {
+                    throw new IOException("The node dropped the link.");
+                }
+            }
+            return request.Code == GET_CLUSTER_METADATA_CODE ? StandaloneRoster(node.Port) : Answer(request);
+        });
+        using var client = new TcpMessageStream(new IggyClientConfigurator
+        {
+            BaseAddress = $"127.0.0.1:{node.Port}",
+            Protocol = Protocol.Tcp,
+            HeartbeatInterval = TimeSpan.FromHours(1),
+            ReconnectionSettings = new ReconnectionSettings { Enabled = false }
+        }, NullLoggerFactory.Instance);
+        await client.ConnectAsync(TestContext.Current.CancellationToken);
+        await client.LoginUserAsync("iggy", "iggy", TestContext.Current.CancellationToken);
+        Func<Task> read = () => client.GetOffsetAsync(Kinds.Consumer.New(3), Identifier.Numeric(1),
+            Identifier.Numeric(2), 0, TestContext.Current.CancellationToken);
+        if (call == "partition read on a cached route")
+        {
+            await read();
+        }
+        Volatile.Write(ref armed, true);
+        if (call == "session resume")
+        {
+            // A lost link keeps the session, so the next connect binds it again.
+            await Assert.ThrowsAsync<NotConnectedException>(() =>
+                client.PingAsync(TestContext.Current.CancellationToken));
+        }
+
+        Func<Task> act = call switch
+        {
+            "safe read" => () => client.GetStatsAsync(TestContext.Current.CancellationToken),
+            "poll" => () => client.PollMessagesAsync(Identifier.Numeric(1), Identifier.Numeric(2), 0,
+                Kinds.Consumer.New(1), Kinds.PollingStrategy.Offset(0), 1, false, TestContext.Current.CancellationToken),
+            "roster read" => () => client.PingAsync(TestContext.Current.CancellationToken),
+            "session resume" => () => client.ConnectAsync(TestContext.Current.CancellationToken),
+            _ => read
+        };
+        var verdict = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(act);
+        Assert.Equal(VsrError.UNAUTHENTICATED, verdict.StatusCode);
+    }
+
+    [Theory]
+    [InlineData(3)]
+    [InlineData(5)]
+    public async Task RoutesPartitionWritesToTheAdvertisedPrimaryWithoutWalkingReplicas(int replicaCount)
+    {
+        var nodes = Enumerable.Range(0, replicaCount).Select(_ => new MockNode()).ToArray();
+        try
+        {
+            var roster = nodes.Select(node => node.Port).ToArray();
+            var writes = new int[nodes.Length];
+            for (var index = 0; index < nodes.Length; index++)
+            {
+                var replica = index;
+                nodes[index].Serve(request =>
+                {
+                    if (request.Operation == (byte)VsrOperation.StoreConsumerOffset)
+                    {
+                        Interlocked.Increment(ref writes[replica]);
+                        return replica != nodes.Length - 1
+                            ? Reply(request.Operation, [], VsrError.TRANSIENT_NOT_ACCEPTED) : Answer(request);
+                    }
+                    return request.Code switch
+                    {
+                        GET_CLUSTER_METADATA_CODE => Reply(request.Operation, RosterMetadata(nodes[0].Port, roster)),
+                        CommandCodes.GET_PARTITION_ROUTE_CODE => RouteReply(request, new PartitionContext(17, 0, 1),
+                            checked((byte)(nodes.Length - 1))),
+                        _ => Answer(request)
+                    };
+                });
+            }
+            using var client = new TcpMessageStream(new IggyClientConfigurator
+            {
+                BaseAddress = $"127.0.0.1:{nodes[0].Port}",
+                Protocol = Protocol.Tcp,
+                HeartbeatInterval = TimeSpan.FromHours(1)
+            }, NullLoggerFactory.Instance);
+            await client.ConnectAsync(TestContext.Current.CancellationToken);
+            await client.LoginUserAsync("iggy", "iggy", TestContext.Current.CancellationToken);
+            await client.StoreOffsetAsync(Kinds.Consumer.New(3), Identifier.Numeric(1), Identifier.Numeric(2),
+                10, 0, TestContext.Current.CancellationToken);
+            Assert.All(writes[..^1], count => Assert.Equal(0, count));
+            Assert.Equal(1, writes[^1]);
+            await UntilAsync(() => nodes.All(node => node.Connections == 1));
+            Assert.All(nodes[1..], node => Assert.Equal(0, node.Registrations));
+        }
+        finally
+        {
+            foreach (var node in nodes)
+            {
+                node.Dispose();
+            }
+        }
+    }
+
+    [Fact]
+    public async Task given_an_exhausted_primary_link_when_discovering_leaders_should_use_a_healthy_replica()
+    {
+        using var healthy = new MockNode();
+        using var unavailable = new MockNode();
+        var rosterReads = 0;
+        var routeReads = 0;
+        var stores = 0;
+        healthy.Serve(request =>
+        {
+            if (request.Code == GET_CLUSTER_METADATA_CODE)
+            {
+                var leader = Interlocked.Increment(ref rosterReads) == 1 ? unavailable.Port : healthy.Port;
+                return Reply(request.Operation, ClusterMetadata(healthy.Port, unavailable.Port, leader));
+            }
+            if (request.Code == CommandCodes.GET_PARTITION_ROUTE_CODE)
+            {
+                var first = Interlocked.Increment(ref routeReads) == 1;
+                return RouteReply(request, new PartitionContext(17, 0, 1), first ? (byte)1 : (byte)0,
+                    view: first ? 0u : 1u);
+            }
+            if (request.Operation == (byte)VsrOperation.StoreConsumerOffset)
+            {
+                Interlocked.Increment(ref stores);
+            }
+            return Answer(request);
+        });
+        unavailable.Serve(request => request.Code == BIND_SESSION_CODE
+            ? throw new IOException("The advertised primary is unavailable while binding.") : Answer(request));
+        using var client = new TcpMessageStream(new IggyClientConfigurator
+        {
+            BaseAddress = $"127.0.0.1:{healthy.Port}",
+            Protocol = Protocol.Tcp,
+            HeartbeatInterval = TimeSpan.FromHours(1),
+            ReconnectionSettings = new ReconnectionSettings
+            {
+                MaxRetries = 1,
+                InitialDelay = TimeSpan.FromMilliseconds(1),
+                WaitAfterReconnect = TimeSpan.Zero
+            }
+        }, NullLoggerFactory.Instance);
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        cancellation.CancelAfter(TimeSpan.FromSeconds(5));
+        await client.ConnectAsync(cancellation.Token);
+        await client.LoginUserAsync("iggy", "iggy", cancellation.Token);
+        var generation = ((ISessionGenerationProvider)client).SessionGeneration;
+
+        await client.GetClusterMetadataAsync(cancellation.Token);
+        await client.StoreOffsetAsync(Kinds.Consumer.New(3), Identifier.Numeric(1), Identifier.Numeric(1), 10, 0,
+            cancellation.Token);
+
+        Assert.Equal(2, unavailable.Requests(BIND_SESSION_CODE));
+        Assert.Equal(2, unavailable.Connections);
+        Assert.Equal(3, rosterReads);
+        Assert.Equal(2, routeReads);
+        Assert.Equal(1, stores);
+        Assert.Equal(1, healthy.Registrations);
+        Assert.Equal(0, unavailable.Registrations);
+        Assert.Equal(generation, ((ISessionGenerationProvider)client).SessionGeneration);
+        Assert.Equal($"127.0.0.1:{healthy.Port}", client.GetCurrentAddress());
+    }
+
+    [Fact]
+    public async Task RetriesTheMetadataPrimaryAfterANeverAcceptedRefusal()
     {
         const uint commandCode = 60_042;
         using var leader = new MockNode();
         using var follower = new MockNode();
         var roster = new[] { leader.Port, follower.Port };
-        var followerRefusals = 0;
-        var leaderAnswers = 0;
+        var leaderAttempts = 0;
 
-        // The leader refuses until the walk has been to the follower, as a primary does until it has
-        // materialised the partition.
         leader.Serve(request =>
         {
             if (request.Code == GET_CLUSTER_METADATA_CODE)
@@ -497,24 +847,14 @@ public sealed class EndpointFailoverTests
                 return Answer(request);
             }
 
-            if (Volatile.Read(ref followerRefusals) == 0)
+            if (Interlocked.Increment(ref leaderAttempts) == 1)
             {
                 return Reply(request.Operation, [], TRANSIENT_NOT_ACCEPTED);
             }
 
-            Interlocked.Increment(ref leaderAnswers);
             return Answer(request);
         });
-        follower.Serve(request =>
-        {
-            if (request.Code != (int)commandCode)
-            {
-                return Answer(request);
-            }
-
-            Interlocked.Increment(ref followerRefusals);
-            return Reply(request.Operation, [], TRANSIENT_NOT_ACCEPTED);
-        });
+        follower.Serve(Answer);
 
         using var client = new TcpMessageStream(new IggyClientConfigurator
         {
@@ -531,7 +871,8 @@ public sealed class EndpointFailoverTests
         await client.LoginUserAsync("iggy", "iggy", TestContext.Current.CancellationToken);
 
         Assert.Empty(await client.SendBinaryRequestAsync(commandCode, [], TestContext.Current.CancellationToken));
-        Assert.Equal(1, Volatile.Read(ref leaderAnswers));
+        Assert.Equal(2, Volatile.Read(ref leaderAttempts));
+        Assert.Equal(0, follower.Requests((int)commandCode));
     }
 
     /// <summary>
@@ -586,10 +927,10 @@ public sealed class EndpointFailoverTests
         await client.PingAsync(TestContext.Current.CancellationToken);
         var registrationsBeforeEviction = node.Registrations;
 
-        // A ping is replay-safe, so the eviction is absorbed: the reconnect signs in again with the
-        // remembered credentials and the request completes over the session it re-established.
         evict = true;
-        await client.PingAsync(TestContext.Current.CancellationToken);
+        await Assert.ThrowsAnyAsync<Exception>(() => client.PingAsync(TestContext.Current.CancellationToken));
+        var (resumed, lastError) = await ResumedWithin(client, TimeSpan.FromSeconds(5));
+        Assert.True(resumed, lastError);
 
         Assert.True(node.Registrations > registrationsBeforeEviction,
             "the reconnect signed in again with the remembered credentials");
@@ -651,7 +992,8 @@ public sealed class EndpointFailoverTests
         await Assert.ThrowsAsync<VsrRequestOutcomeUnknownException>(() =>
             client.CreateStreamAsync("evicted-mid-write", token: TestContext.Current.CancellationToken));
 
-        await client.PingAsync(TestContext.Current.CancellationToken);
+        var (resumed, lastError) = await ResumedWithin(client, TimeSpan.FromSeconds(5));
+        Assert.True(resumed, lastError);
         Assert.True(node.Registrations > registrationsBeforeEviction,
             "the reconnect signed in again with the remembered credentials");
     }
@@ -666,17 +1008,24 @@ public sealed class EndpointFailoverTests
         using var advanced = new ManualResetEventSlim();
         var committed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var writes = 0;
+        var applied = new ConcurrentDictionary<(UInt128 Client, ulong Request), byte>();
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
         long storedOffset = 0;
         node.Serve(request =>
         {
             if (request.Operation == (byte)VsrOperation.StoreConsumerOffset)
             {
                 var attempt = Interlocked.Increment(ref writes);
+                if (!applied.TryAdd((request.ClientId, request.RequestId), 0))
+                {
+                    return Reply(request.Operation, new byte[4]);
+                }
                 var offset = BinaryPrimitives.ReadInt64LittleEndian(
                     request.Body.AsSpan(request.Body.Length - OffsetAndAckSize, sizeof(long)));
                 Interlocked.Exchange(ref storedOffset, offset);
                 if (attempt == 1)
                 {
+                    cancellation.Cancel();
                     committed.SetResult();
                     if (!advanced.Wait(TimeSpan.FromSeconds(5)))
                     {
@@ -715,14 +1064,24 @@ public sealed class EndpointFailoverTests
         await second.ConnectAsync(TestContext.Current.CancellationToken);
         await second.LoginUserAsync("iggy", "iggy", TestContext.Current.CancellationToken);
         var pending = first.StoreOffsetAsync(Kinds.Consumer.New(3), Identifier.Numeric(1), Identifier.Numeric(2),
-            FirstOffset, 0, TestContext.Current.CancellationToken);
-        await committed.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
-        Assert.Equal(FirstOffset, Volatile.Read(ref storedOffset));
-        await second.StoreOffsetAsync(Kinds.Consumer.New(3), Identifier.Numeric(1), Identifier.Numeric(2),
-            AdvancedOffset, 0, TestContext.Current.CancellationToken);
-        await Assert.ThrowsAsync<VsrRequestOutcomeUnknownException>(() => pending);
-        Assert.Equal(2, Volatile.Read(ref writes));
-        Assert.Equal(AdvancedOffset, Volatile.Read(ref storedOffset));
+            FirstOffset, 0, cancellation.Token);
+        try
+        {
+            await committed.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+            var unknown = await Assert.ThrowsAsync<VsrRequestOutcomeUnknownException>(() => pending);
+            var id = Assert.IsType<ulong>(unknown.OperationId);
+            Assert.Equal(FirstOffset, Volatile.Read(ref storedOffset));
+            await second.StoreOffsetAsync(Kinds.Consumer.New(3), Identifier.Numeric(1), Identifier.Numeric(2),
+                AdvancedOffset, 0, TestContext.Current.CancellationToken);
+            await first.ResolveOperationAsync(id, TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+            Assert.Equal(3, Volatile.Read(ref writes));
+            Assert.Equal(2, applied.Count);
+            Assert.Equal(AdvancedOffset, Volatile.Read(ref storedOffset));
+        }
+        finally
+        {
+            advanced.Set();
+        }
     }
 
     /// <summary>
@@ -744,9 +1103,12 @@ public sealed class EndpointFailoverTests
                 return Reply(request.Operation, [], VsrError.REQUEST_TOO_OLD);
             }
 
-            return request.Code == GET_CLUSTER_METADATA_CODE
-                ? Reply(OPERATION_NON_REPLICATED, ClusterMetadata(node.Port, node.Port, node.Port))
-                : Answer(request);
+            return request.Code switch
+            {
+                GET_CLUSTER_METADATA_CODE => Reply(OPERATION_NON_REPLICATED, ClusterMetadata(node.Port, node.Port, node.Port)),
+                CommandCodes.GET_PARTITION_ROUTE_CODE => RouteReply(request, new PartitionContext(17, 0, 1), 0),
+                _ => Answer(request)
+            };
         });
 
         var configuration = new IggyClientConfigurator
@@ -769,15 +1131,6 @@ public sealed class EndpointFailoverTests
         Assert.Equal(1, Volatile.Read(ref sends));
     }
 
-    /// <summary>
-    ///     A survivor that is not listening yet when its node dies still has to be found: the client keeps
-    ///     rotating over every endpoint it knows, so one that comes up while it is retrying is dialed on a
-    ///     later pass rather than only on the first.
-    ///     <para>
-    ///         The retry budget counts rotations, not dials: a single retry buys a whole second pass over
-    ///         both endpoints. Spent per dial, the budget would be gone before the survivor came up.
-    ///     </para>
-    /// </summary>
     [Fact]
     public async Task ResumesOnASurvivorThatComesUpWhileTheClientIsRetrying()
     {
@@ -801,9 +1154,7 @@ public sealed class EndpointFailoverTests
             ReconnectionSettings = new ReconnectionSettings
             {
                 Enabled = true,
-                // One retry, so the pass that finds the survivor is the one the budget pays for. A larger
-                // budget would find it whether the budget counts rotations or dials.
-                MaxRetries = 1,
+                MaxRetries = 0,
                 InitialDelay = TimeSpan.FromMilliseconds(200)
             }
         };
@@ -829,7 +1180,8 @@ public sealed class EndpointFailoverTests
 
         try
         {
-            await client.PingAsync(TestContext.Current.CancellationToken);
+            var (resumed, lastError) = await ResumedWithin(client, TimeSpan.FromSeconds(5));
+            Assert.True(resumed, lastError);
             await comesUp;
 
             Assert.NotNull(survivor);
@@ -915,7 +1267,9 @@ public sealed class EndpointFailoverTests
             attempts++;
             try
             {
-                await client.PingAsync(TestContext.Current.CancellationToken);
+                using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+                cancellation.CancelAfter(deadline - DateTimeOffset.UtcNow);
+                await client.PingAsync(cancellation.Token);
 
                 return (true, lastError);
             }
@@ -929,25 +1283,26 @@ public sealed class EndpointFailoverTests
         return (false, lastError);
     }
 
+    private static async Task UntilAsync(Func<bool> predicate)
+    {
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        cancellation.CancelAfter(TimeSpan.FromSeconds(5));
+        while (!predicate())
+        {
+            await Task.Delay(10, cancellation.Token);
+        }
+    }
+
     private static byte[] ClusterMetadata(ushort primaryPort, ushort survivorPort, ushort leaderPort)
     {
         var body = new List<byte>();
         WriteString(body, "test-cluster");
-        body.AddRange(BitConverter.GetBytes(2u));
+        body.AddRange(BitConverter.GetBytes(primaryPort == survivorPort ? 1u : 2u));
         WriteNode(body, "primary", primaryPort, primaryPort == leaderPort, 0);
-        WriteNode(body, "survivor", survivorPort, survivorPort == leaderPort, 1);
-
-        return body.ToArray();
-    }
-
-    private static byte[] ThreeNodeClusterMetadata(ushort firstPort, ushort secondPort, ushort thirdPort)
-    {
-        var body = new List<byte>();
-        WriteString(body, "test-cluster");
-        body.AddRange(BitConverter.GetBytes(3u));
-        WriteNode(body, "metadata-leader", firstPort, true, 0);
-        WriteNode(body, "follower", secondPort, false, 1);
-        WriteNode(body, "partition-primary", thirdPort, false, 2);
+        if (primaryPort != survivorPort)
+        {
+            WriteNode(body, "survivor", survivorPort, survivorPort == leaderPort, 1);
+        }
 
         return body.ToArray();
     }

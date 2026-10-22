@@ -22,17 +22,20 @@
 //! `broker`-feature-only: request `Decodable` and response `Encodable`, not the reverse).
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use iggy::prelude::{Identifier, IggyMessage, MessageClient, Partitioning};
 use serial_test::serial;
+use tokio::io::copy_bidirectional;
+use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
 use iggy_gateway_kafka::bridge::IggyBridge;
 use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
 use iggy_gateway_kafka::protocol::api::{
-    ERROR_NONE, ERROR_REQUEST_TIMED_OUT, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
-    ERROR_UNSUPPORTED_FOR_MESSAGE_FORMAT, GatewayState,
+    ERROR_NONE, ERROR_REQUEST_TIMED_OUT, ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState,
 };
 use iggy_gateway_kafka::protocol::handlers::list_offsets;
 
@@ -48,6 +51,9 @@ const REQUEST_VERSION: i16 = 6;
 const TEST_MAX_FRAME_SIZE: usize = 8 * 1024 * 1024;
 const LATEST_TIMESTAMP: i64 = -1;
 const EARLIEST_TIMESTAMP: i64 = -2;
+const MAX_TIMESTAMP: i64 = -3;
+/// The first version that may ask for [`MAX_TIMESTAMP`]. Its request and response share v6's shape.
+const MAX_TIMESTAMP_VERSION: i16 = 7;
 
 /// Builds a v6 flexible `ListOffsets` request body for one topic/partition.
 fn build_request(topic: &str, partition_index: i32, timestamp: i64) -> Bytes {
@@ -71,6 +77,12 @@ fn build_request(topic: &str, partition_index: i32, timestamp: i64) -> Bytes {
 /// Decodes a v6 flexible `ListOffsets` response's first partition result into `(error_code,
 /// offset)`.
 fn decode_first_result(body: Bytes) -> (i16, i64) {
+    let (error_code, _timestamp, offset) = decode_first_entry(body);
+    (error_code, offset)
+}
+
+/// As [`decode_first_result`], keeping the timestamp: `(error_code, timestamp, offset)`.
+fn decode_first_entry(body: Bytes) -> (i16, i64, i64) {
     let mut d = Decoder::new(body);
     let _throttle_time_ms = d.read_i32().expect("throttle_time_ms");
     let _topics_plus_one = d.read_varint().expect("topics array count");
@@ -78,9 +90,22 @@ fn decode_first_result(body: Bytes) -> (i16, i64) {
     let _partitions_plus_one = d.read_varint().expect("partitions array count");
     let _partition_index = d.read_i32().expect("partition_index");
     let error_code = d.read_i16().expect("error_code");
-    let _timestamp = d.read_i64().expect("timestamp");
+    let timestamp = d.read_i64().expect("timestamp");
     let offset = d.read_i64().expect("offset");
-    (error_code, offset)
+    (error_code, timestamp, offset)
+}
+
+/// One lookup at `version`, answered as `(error_code, timestamp, offset)`.
+async fn send_at(
+    state: &GatewayState,
+    version: i16,
+    topic: &str,
+    partition_index: i32,
+    timestamp: i64,
+) -> (i16, i64, i64) {
+    let body = build_request(topic, partition_index, timestamp);
+    let outcome = list_offsets::handle(state, version, body).await;
+    decode_first_entry(outcome.expect_response("ListOffsets request always answers"))
 }
 
 async fn send(
@@ -262,9 +287,104 @@ async fn a_nonexistent_topic_returns_unknown_topic_or_partition() {
     assert_eq!(error_code, ERROR_UNKNOWN_TOPIC_OR_PARTITION);
 }
 
+/// Milliseconds since the epoch, the unit Kafka timestamps use.
+fn now_millis() -> i64 {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("the clock is past the epoch");
+    i64::try_from(elapsed.as_millis()).expect("now fits an i64")
+}
+
+/// Sends `values` to partition 0 of `orders` in one batch, so they share one append time.
+async fn produce_batch(server: &TestServer, values: &[&str]) {
+    produce_batch_to(server, 0, values).await;
+}
+
+/// As [`produce_batch`], to `partition`.
+async fn produce_batch_to(server: &TestServer, partition: u32, values: &[&str]) {
+    let raw = iggy_server::raw_client(server).await;
+    let mut messages: Vec<IggyMessage> = values
+        .iter()
+        .map(|value| IggyMessage::from(*value))
+        .collect();
+    raw.send_messages(
+        &Identifier::named("kafka").expect("valid stream name"),
+        &Identifier::named("orders").expect("valid topic name"),
+        &Partitioning::partition_id(partition),
+        &mut messages,
+    )
+    .await
+    .expect("send a batch");
+}
+
+/// Two batches with a measured gap between their append times: offsets 0-1, then 2-4. Returns a
+/// time inside the gap.
+async fn two_batches_with_a_gap(server: &TestServer) -> i64 {
+    produce_batch(server, &["a", "b"]).await;
+    // Iggy stamps append time in microseconds and the lookup takes milliseconds, so the gap has to
+    // be wide enough that a millisecond inside it is after the first batch and before the second.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let between = now_millis();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    produce_batch(server, &["c", "d", "e"]).await;
+    between
+}
+
 #[tokio::test]
 #[serial]
-async fn an_arbitrary_timestamp_is_unsupported() {
+async fn a_timestamp_resolves_to_the_first_record_appended_at_or_after_it() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let (state, seed) = connected_state(&server).await;
+    seed.ensure_stream_and_topic("orders", 1)
+        .await
+        .expect("seed the topic");
+    let before = now_millis() - 60_000;
+    let between = two_batches_with_a_gap(&server).await;
+
+    let (error_code, timestamp, offset) =
+        send_at(&state, REQUEST_VERSION, "orders", 0, between).await;
+    assert_eq!(error_code, ERROR_NONE);
+    assert_eq!(offset, 2, "the second batch starts at offset 2");
+    assert!(
+        timestamp >= between,
+        "the record found was appended after the time asked for, got {timestamp} for {between}"
+    );
+
+    let (error_code, _, offset) = send_at(&state, REQUEST_VERSION, "orders", 0, before).await;
+    assert_eq!(error_code, ERROR_NONE);
+    assert_eq!(offset, 0, "a time before every record finds the first");
+
+    // AKHQ asks for time 0 to find where each partition starts.
+    let (error_code, _, offset) = send_at(&state, REQUEST_VERSION, "orders", 0, 0).await;
+    assert_eq!(error_code, ERROR_NONE);
+    assert_eq!(offset, 0);
+}
+
+#[tokio::test]
+#[serial]
+async fn a_timestamp_after_every_record_is_minus_one_without_an_error() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let (state, seed) = connected_state(&server).await;
+    seed.ensure_stream_and_topic("orders", 1)
+        .await
+        .expect("seed the topic");
+    produce_batch(&server, &["a", "b"]).await;
+
+    let later = now_millis() + 3_600_000;
+    let (error_code, timestamp, offset) =
+        send_at(&state, REQUEST_VERSION, "orders", 0, later).await;
+    assert_eq!(
+        (error_code, timestamp, offset),
+        (ERROR_NONE, -1, -1),
+        "Kafka answers a time past the last record with no error and -1"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_timestamp_on_an_empty_partition_is_minus_one_without_an_error() {
     let data_dir = tempfile::tempdir().expect("tempdir");
     let server = TestServer::spawn(data_dir.path()).await;
     let (state, seed) = connected_state(&server).await;
@@ -272,8 +392,197 @@ async fn an_arbitrary_timestamp_is_unsupported() {
         .await
         .expect("seed the topic");
 
-    let (error_code, _) = send(&state, "orders", 0, 1_700_000_000_000).await;
-    assert_eq!(error_code, ERROR_UNSUPPORTED_FOR_MESSAGE_FORMAT);
+    for (version, requested) in [(REQUEST_VERSION, 0), (MAX_TIMESTAMP_VERSION, MAX_TIMESTAMP)] {
+        let (error_code, timestamp, offset) =
+            send_at(&state, version, "orders", 0, requested).await;
+        assert_eq!((error_code, timestamp, offset), (ERROR_NONE, -1, -1));
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn max_timestamp_resolves_to_the_last_record_at_any_version() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let (state, seed) = connected_state(&server).await;
+    seed.ensure_stream_and_topic("orders", 1)
+        .await
+        .expect("seed the topic");
+    let between = two_batches_with_a_gap(&server).await;
+
+    for version in [REQUEST_VERSION, MAX_TIMESTAMP_VERSION] {
+        let (error_code, timestamp, offset) =
+            send_at(&state, version, "orders", 0, MAX_TIMESTAMP).await;
+        assert_eq!(error_code, ERROR_NONE, "v{version}");
+        assert_eq!(offset, 4, "v{version}: the last of five records");
+        assert!(
+            timestamp >= between,
+            "v{version}: got {timestamp}, the last batch came after {between}"
+        );
+    }
+}
+
+/// A TCP relay to `server` that leaves the next connections [`Self::stall_next`] counts
+/// unanswered, so a client on one waits in its handshake until it gives up.
+struct StallingRelay {
+    address: String,
+    stall: Arc<AtomicUsize>,
+}
+
+impl StallingRelay {
+    async fn start(server: &TestServer) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the relay");
+        let address = listener.local_addr().expect("relay address").to_string();
+        let upstream = server.test_config().address;
+        let stall = Arc::new(AtomicUsize::new(0));
+        let stall_count = Arc::clone(&stall);
+        tokio::spawn(async move {
+            while let Ok((mut inbound, _)) = listener.accept().await {
+                if stall_count
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                        left.checked_sub(1)
+                    })
+                    .is_ok()
+                {
+                    tokio::spawn(async move {
+                        std::future::pending::<()>().await;
+                        drop(inbound);
+                    });
+                    continue;
+                }
+                let upstream = upstream.clone();
+                tokio::spawn(async move {
+                    if let Ok(mut outbound) = TcpStream::connect(&upstream).await {
+                        let _ = copy_bidirectional(&mut inbound, &mut outbound).await;
+                    }
+                });
+            }
+        });
+        Self { address, stall }
+    }
+
+    fn stall_next(&self, connections: usize) {
+        self.stall.store(connections, Ordering::SeqCst);
+    }
+}
+
+/// The first two lookups' read clients connect through a relay that never answers. Each lookup's
+/// own budget ends it, and the lookup after them still answers. With only the request deadline
+/// bounding them, the second stall would run the request out and the last lookup would answer 7.
+#[tokio::test]
+#[serial]
+async fn a_stalled_lookup_leaves_the_later_partitions_of_the_request_their_answers() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let relay = StallingRelay::start(&server).await;
+    let mut config = server.test_config();
+    config.address.clone_from(&relay.address);
+    let bridge = IggyBridge::connect(config)
+        .await
+        .expect("bridge should connect through the relay");
+    let state = GatewayState::new(
+        Some(Arc::new(bridge)),
+        TEST_MAX_FRAME_SIZE,
+        0,
+        GroupCoordinator::new(GroupCoordinatorConfig::default(), CancellationToken::new()),
+    );
+    let seed = IggyBridge::connect(server.test_config())
+        .await
+        .expect("seed bridge should connect to a ready server");
+    seed.ensure_stream_and_topic("orders", 3)
+        .await
+        .expect("seed a 3-partition topic");
+    for partition in 0..3 {
+        produce_batch_to(&server, partition, &["a", "b"]).await;
+    }
+    // Connects the probe client now, so the stalled connection is the first read slot's.
+    let (error_code, _) = send(&state, "orders", 0, LATEST_TIMESTAMP).await;
+    assert_eq!(error_code, ERROR_NONE);
+
+    relay.stall_next(2);
+    let topics = [TopicRequest {
+        name: "orders",
+        partitions: &[(0, 0), (1, 0), (2, 0)],
+    }];
+    let answers: Vec<(i32, i16, i64)> = send_multi(&state, &topics)
+        .await
+        .iter()
+        .map(|(_, partition, error_code, offset)| (*partition, *error_code, *offset))
+        .collect();
+    assert_eq!(
+        answers,
+        vec![
+            (0, ERROR_REQUEST_TIMED_OUT, -1),
+            (1, ERROR_REQUEST_TIMED_OUT, -1),
+            (2, ERROR_NONE, 0),
+        ]
+    );
+}
+
+/// Every lookup by time in one request shares one read slot, handed back after each lookup. If
+/// it were not, every partition after the first would answer 7.
+#[tokio::test]
+#[serial]
+async fn several_partitions_looked_up_by_time_in_one_request_each_resolve() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let (state, seed) = connected_state(&server).await;
+    seed.ensure_stream_and_topic("orders", 2)
+        .await
+        .expect("seed a 2-partition topic");
+    produce_batch_to(&server, 0, &["a", "b"]).await;
+    produce_batch_to(&server, 1, &["x"]).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let between = now_millis();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    produce_batch_to(&server, 0, &["c"]).await;
+    produce_batch_to(&server, 1, &["y", "z"]).await;
+
+    let topics = [TopicRequest {
+        name: "orders",
+        partitions: &[
+            (0, between),
+            (1, between),
+            (1, 0),
+            (0, LATEST_TIMESTAMP),
+            (0, between),
+        ],
+    }];
+    let results = send_multi(&state, &topics).await;
+    let answers: Vec<(i32, i16, i64)> = results
+        .iter()
+        .map(|(_, partition, error_code, offset)| (*partition, *error_code, *offset))
+        .collect();
+    assert_eq!(
+        answers,
+        vec![
+            (0, ERROR_NONE, 2),
+            (1, ERROR_NONE, 1),
+            (1, ERROR_NONE, 0),
+            (0, ERROR_NONE, 3),
+            (0, ERROR_NONE, 2),
+        ],
+        "each lookup by time resolves on its own partition, in request order, and a repeated \
+         entry gets the same answer"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_timestamp_on_a_missing_partition_or_topic_is_unknown() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let (state, seed) = connected_state(&server).await;
+    seed.ensure_stream_and_topic("orders", 1)
+        .await
+        .expect("seed the topic");
+
+    let (error_code, _, _) = send_at(&state, REQUEST_VERSION, "orders", 5, 0).await;
+    assert_eq!(error_code, ERROR_UNKNOWN_TOPIC_OR_PARTITION);
+    let (error_code, _, _) = send_at(&state, REQUEST_VERSION, "missing", 0, 0).await;
+    assert_eq!(error_code, ERROR_UNKNOWN_TOPIC_OR_PARTITION);
 }
 
 /// Regression test: a topic named in two separate request entries must still resolve every

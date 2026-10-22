@@ -344,7 +344,7 @@ For each API key, test **min−1**, **min**, **max**, **max+1** using `kafka-mes
 | 3 | Metadata | 0 | 9 | −1, 0, 9, 10 |
 | 0 | Produce | 3 | 9 | 2, 3, 9, 10 |
 | 1 | Fetch | 4 | 12 | 3, 4, 12, 13 |
-| 2 | ListOffsets | 1 | 6 | 0, 1, 6, 7 |
+| 2 | ListOffsets | 1 | 7 | 0, 1, 7, 8 |
 | 19 | CreateTopics | 2 | 5 | 1, 2, 5, 6 |
 | 20 | DeleteTopics | 1 | 5 | 0, 1, 5, 6 |
 | 8 | OffsetCommit | 2 | 9 | 1, 2, 9, 10 |
@@ -359,13 +359,15 @@ For each API key, test **min−1**, **min**, **max**, **max+1** using `kafka-mes
 | 22 | InitProducerId | 0 | 5 | −1, 0, 5, 6 |
 | 32 | DescribeConfigs | 1 | 4 | 0, 1, 4, 5 |
 | 33 | AlterConfigs | 0 | 2 | −1, 0, 2, 3 |
+| 37 | CreatePartitions | 0 | 3 | −1, 0, 3, 4 |
+| 44 | IncrementalAlterConfigs | 0 | 1 | −1, 0, 1, 2 |
 
 | ID | Test | Expected for in-range | Expected for out-of-range |
 | ---- | ------ | ---------------------- | --------------------------- |
-| B1 | ApiVersions negotiation | `error_code=0`; body lists 14 API keys with correct min/max | KIP-511 exception: still answers, `error_code=35` (UNSUPPORTED_VERSION), v0 response header regardless of the request's own encoding |
+| B1 | ApiVersions negotiation | `error_code=0`; body lists 20 API keys with correct min/max (SASL off) | KIP-511 exception: still answers, `error_code=35` (UNSUPPORTED_VERSION), v0 response header regardless of the request's own encoding |
 | B2 | Metadata out-of-range | N/A | **Connection closes**, no response sent - Metadata has no top-level error field to carry a version-correct error in |
-| B3 | Produce/Fetch/ListOffsets/CreateTopics/DeleteTopics/InitProducerId/OffsetCommit/OffsetFetch out-of-range | N/A | **Connection closes** for both above-max and below-min - `kafka_protocol`'s schema floor for each of these eight messages equals `SUPPORTED_RANGES`' own min, so there is no encodable error response below min either (see `SCOPE.md`'s Governance model) |
-| B4 | ApiVersions lists only scoped keys | Decode response | Contains keys 0,1,2,3,8,9,10,11,12,13,14,15,16,18,19,20,22,32,33 only, and no transaction keys (24, 25, 26, 28) |
+| B3 | Produce/Fetch/ListOffsets/CreateTopics/DeleteTopics/CreatePartitions/InitProducerId/OffsetCommit/OffsetFetch out-of-range | N/A | **Connection closes** for both above-max and below-min - `kafka_protocol`'s schema floor for each of these nine messages equals `SUPPORTED_RANGES`' own min, so there is no encodable error response below min either (see `SCOPE.md`'s Governance model) |
+| B4 | ApiVersions lists only scoped keys | Decode response | Contains keys 0,1,2,3,8,9,10,11,12,13,14,15,16,18,19,20,22,32,33,37,44 only, and no transaction keys (24, 25, 26, 28) |
 
 An out-of-range version only ever produces `error_code=35` on ApiVersions (B1); every other API
 key's out-of-range case closes the connection - see B2/B3. InitProducerId and Produce also send
@@ -458,7 +460,9 @@ success. This category predates the bridge landing: G2/G3's "fails at metadata" 
 | G11 | Two members share a topic | Bridge on and a topic with 2 partitions. Run `kafka-console-consumer.sh --bootstrap-server 127.0.0.1:9093 --group g11 --topic <topic> --property print.partition=true --property print.offset=true` in two terminals, produce to both partitions, stop one, produce again | Each prints one partition. After the stop, the other prints the new records of both partitions, and none twice |
 | G12 | List groups | `kafka-consumer-groups.sh --bootstrap-server 127.0.0.1:9093 --list` after G5 has joined | Prints the group. `--list --state Empty` matches a group that was issued a member id and has not joined yet. A group whose members have all expired is absent |
 | G13 | Describe members | `kafka-consumer-groups.sh --bootstrap-server 127.0.0.1:9093 --describe --members --group g2` | Prints member ids. Assignment and protocol are filled only while the group is Stable |
-| G14 | Describe state | `kafka-consumer-groups.sh --bootstrap-server 127.0.0.1:9093 --describe --state --group g2` | Prints the state string (`Stable`, `PreparingRebalance`, `CompletingRebalance`, or `Empty`). The default `--describe` (no `--members` or `--state`) calls OffsetFetch and fails, because that API is not implemented |
+| G14 | Describe state | `kafka-consumer-groups.sh --bootstrap-server 127.0.0.1:9093 --describe --state --group g2` | Prints the state string (`Stable`, `PreparingRebalance`, `CompletingRebalance`, or `Empty`). The default `--describe` (no `--members` or `--state`) calls OffsetFetch, which requires the bridge and otherwise answers `COORDINATOR_LOAD_IN_PROGRESS` (14) |
+| G15 | Grow a topic | Bridge on and topic `orders` made as in Category I. `kafka-topics.sh --bootstrap-server 127.0.0.1:9093 --alter --topic orders --partitions 3`, then `--describe --topic orders`, then `--alter --topic orders --partitions 2` | The describe prints `PartitionCount: 3`. The second alter fails with `InvalidPartitionsException` naming the current count, and a describe still prints 3. Automated in `kafka_client_e2e_tests.rs` |
+| G16 | Alter retention with `kafka-configs.sh` | Bridged, topic `orders` as in Category I. `kafka-configs.sh --bootstrap-server 127.0.0.1:9093 --alter --entity-type topics --entity-name orders --add-config retention.ms=8000`, then the same with `--describe`, then with `--delete-config retention.ms` | Sends IncrementalAlterConfigs (44) only. Each alter prints `Completed updating config for topic orders.`; describe shows `retention.ms=8000` after the add and `retention.ms=-1` after the delete |
 
 Record kcat version and exact error strings in your test log. G1 passing is the minimum bar for client compatibility smoke.
 
@@ -499,6 +503,38 @@ Record wall-clock time from `git clone` to I3 passing - README.md's Quick start 
 target for a new contributor ([#3539](https://github.com/apache/iggy/issues/3539) acceptance
 criteria).
 
+### Category J — ListOffsets by timestamp with AKHQ
+
+AKHQ reads a topic's first and last offsets with `ListOffsets` EARLIEST and LATEST, and its
+time search with `offsetsForTimes`. It is not in the automated suite, which would need one more
+CI image. Start Iggy with `iggy`/`iggy` root credentials and the gateway with
+`IGGY_KAFKA_BRIDGE_ENABLED=true` on `127.0.0.1:9093`, create stream `kafka` with topic `orders`
+(2 partitions), and send a few messages to each partition at different times. Then run AKHQ on
+the host network with this `application.yml`:
+
+```yaml
+micronaut:
+  server:
+    port: 18080
+akhq:
+  connections:
+    iggy:
+      properties:
+        bootstrap.servers: "127.0.0.1:9093"
+```
+
+```bash
+docker run -d --name akhq-iggy --network host \
+  -v "$PWD/application.yml:/app/application.yml:ro" tchiotludo/akhq:0.25.1
+```
+
+| ID | Test | Steps | Expected |
+| ---- | ------ | ------- | ---------- |
+| J1 | Topic sizes | `curl -s 'http://127.0.0.1:18080/api/iggy/topic?show=ALL'` | `orders` with `firstOffset` 0 and `lastOffset` equal to each partition's record count, and `size` the total |
+| J2 | Records | `curl -s 'http://127.0.0.1:18080/api/iggy/topic/orders/data?sort=OLDEST'` (also `sort=NEWEST`) | Every record, with its partition, offset, timestamp and value |
+| J3 | Time search | Add `&timestamp=<ISO-8601 time between two sends>` to J2 | Only the records sent after that time |
+| J4 | Teardown | `docker rm -f akhq-iggy` | Container removed |
+
 ---
 
 ## 4. Validation reference
@@ -509,17 +545,17 @@ criteria).
 | ------ | ------ | --------------- |
 | -1 | UNKNOWN_SERVER_ERROR | Produce with a bridge: Iggy error with no closer code, or bad bridge login |
 | 0 | NONE | Fetch top-level error field only (`ec=0` there does not mean per-partition success - see A6) |
-| 3 | UNKNOWN_TOPIC_OR_PARTITION | Metadata stub, per topic. Produce with a bridge: missing topic or partition |
-| 6 | NOT_LEADER_OR_FOLLOWER | Produce/Fetch/ListOffsets stub (not stored). Produce with a bridge: Iggy unreachable, or the request budget ran out. Fetch with a bridge: Iggy unreachable, too slow, loading the partition, or an offset past the end in its first 30 s on the connection |
-| 7 | REQUEST_TIMED_OUT | Produce with a bridge: deadline passed, or connection lost mid-send (may be stored) |
+| 3 | UNKNOWN_TOPIC_OR_PARTITION | Metadata stub, per topic. Produce or ListOffsets with a bridge: missing topic or partition |
+| 6 | NOT_LEADER_OR_FOLLOWER | Produce/Fetch/ListOffsets stub (not stored). Produce with a bridge: Iggy unreachable, or the request budget ran out. Fetch with a bridge: Iggy unreachable, too slow, loading the partition, or an offset past the end in its first 30 s on the connection. ListOffsets with a bridge: Iggy unreachable, partition loading, Iggy refused the read for now, or a lookup by time polled empty without proof that no record matches |
+| 7 | REQUEST_TIMED_OUT | Produce with a bridge: deadline passed, or connection lost mid-send (may be stored). ListOffsets with a bridge: past the 100-topic cap, the request deadline passed, or a lookup by time ran out of its time |
 | 10 | MESSAGE_TOO_LARGE | Produce with a bridge: record, send or partition too large, even alone |
 | 17 | INVALID_TOPIC_EXCEPTION | Produce with a bridge: bad topic name |
 | 21 | INVALID_REQUIRED_ACKS | Produce with a bridge: `acks` is not 0, 1 or -1 |
 | 29 | TOPIC_AUTHORIZATION_FAILED | Produce with a bridge: Iggy user lacks permission |
 | 35 | UNSUPPORTED_VERSION | Out of range: **ApiVersions only** (KIP-511 exception); every other API key's out-of-range version closes the connection instead - see Category B. In range: InitProducerId with a `transactional_id`; Produce with a `transactional_id`, on every partition with or without a bridge (an `acks=0` one closes instead); and, with a bridge, a transactional or control batch - transactions are not supported, see `SCOPE.md` |
-| 37 | INVALID_PARTITIONS | CreateTopics: partition count `0` or `< -1` |
+| 37 | INVALID_PARTITIONS | CreateTopics: partition count `0` or `< -1`. CreatePartitions with a bridge: count not above the current one |
 | 38 | INVALID_REPLICATION_FACTOR | CreateTopics: replication factor `0` or `< -1` |
-| 41 | NOT_CONTROLLER | CreateTopics stub (topic not created) |
+| 41 | NOT_CONTROLLER | CreateTopics and CreatePartitions stub (nothing created or grown) |
 | 42 | INVALID_REQUEST | Fetch/ListOffsets/CreateTopics/ApiVersions decode failure. Not Produce: it closes the connection (H1) |
 | 76 | UNSUPPORTED_COMPRESSION_TYPE | Produce with a bridge: zstd before v7 |
 | 87 | INVALID_RECORD | Produce with a bridge: a record batch this gateway cannot map, including a missing, empty or second one, or bytes after it |
@@ -591,6 +627,7 @@ kcat version (if used): ___________
 [ ] G1–G11  kcat / Java client / kafka-consumer-groups.sh (record errors for G2/G3; G11's default `--describe` is expected to fail)
 [ ] H1–H6  Adversarial input
 [ ] I1–I6  Docker Compose quick start (record wall-clock time to I3; I5 is restart durability)
+[ ] J1–J4  AKHQ ListOffsets by timestamp
 
 Automated regression:
 [ ] cargo test -p iggy-gateway-kafka — all passed (see `TEST_SUITE.md` for why this checklist

@@ -32,15 +32,12 @@ use iggy::prelude::*;
 use iggy_binary_protocol::WireEncode;
 use iggy_binary_protocol::codes::*;
 use iggy_binary_protocol::dispatch::COMMAND_TABLE;
-use iggy_binary_protocol::requests::consumer_offsets::GetConsumerOffsetRequest;
-use iggy_binary_protocol::requests::messages::{GetPartitionRouteRequest, PollMessagesRequest};
+use iggy_binary_protocol::requests::messages::GetPartitionRouteRequest;
 use iggy_binary_protocol::requests::system::{BindSessionRequest, SessionIdentity};
 use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::{ClientVersionInfo, IGGY_PROTOCOL_VERSION, WireName};
 use iggy_common::VsrSessionControl;
-use iggy_common::wire_conversions::{
-    consumer_to_wire, identifier_to_wire, polling_strategy_to_wire,
-};
+use iggy_common::wire_conversions::identifier_to_wire;
 use integration::harness::{TestHarness, login_root};
 
 const STREAM_NAME: &str = "auth-test-stream";
@@ -318,37 +315,7 @@ async fn test_all_commands_require_auth(client: &IggyClient, binding_identity: S
                 )
                 .await
                 .map(|_| ()),
-            GET_POLL_ROUTING_CODE | POLL_MESSAGES_ON_PRIMARY_CODE => client
-                .send_binary_request(
-                    code,
-                    PollMessagesRequest {
-                        consumer: consumer_to_wire(&ctx.consumer).unwrap(),
-                        stream_id: identifier_to_wire(&ctx.stream_id).unwrap(),
-                        topic_id: identifier_to_wire(&ctx.topic_id).unwrap(),
-                        partition_id: Some(0),
-                        strategy: polling_strategy_to_wire(&PollingStrategy::offset(0)),
-                        count: 1,
-                        auto_commit: true,
-                    }
-                    .to_bytes(),
-                )
-                .await
-                .map(|_| ()),
-
             // Consumer Offsets
-            GET_CONSUMER_OFFSET_ROUTING_CODE => client
-                .send_binary_request(
-                    code,
-                    GetConsumerOffsetRequest {
-                        consumer: consumer_to_wire(&ctx.consumer).unwrap(),
-                        stream_id: identifier_to_wire(&ctx.stream_id).unwrap(),
-                        topic_id: identifier_to_wire(&ctx.topic_id).unwrap(),
-                        partition_id: Some(0),
-                    }
-                    .to_bytes(),
-                )
-                .await
-                .map(|_| ()),
             GET_CONSUMER_OFFSET_CODE => client
                 .get_consumer_offset(&ctx.consumer, &ctx.stream_id, &ctx.topic_id, Some(0))
                 .await

@@ -40,6 +40,18 @@ public sealed class ConsensusSessionTests
     }
 
     [Fact]
+    public void NewAndResetSessions_KeepClientIdsOutsideServerRange()
+    {
+        const int samples = 64;
+        var session = new ConsensusSession();
+        for (var sample = 0; sample < samples; sample++)
+        {
+            Assert.InRange(session.ClientId, UInt128.One, (UInt128)Int128.MaxValue);
+            session.Reset();
+        }
+    }
+
+    [Fact]
     public void BeginRegister_OnFreshSessionKeepsClientId()
     {
         var session = new ConsensusSession(7);
@@ -77,7 +89,7 @@ public sealed class ConsensusSessionTests
         Assert.Equal(0UL, session.Resolve(VsrOperation.Register).RequestId);
         Assert.NotEqual((UInt128)7, session.ClientId);
         Assert.False(session.IsBound);
-        Assert.Equal(1UL, session.RequestCounter);
+        Assert.Equal(2UL, session.RequestCounter);
     }
 
     /// <summary>
@@ -156,19 +168,21 @@ public sealed class ConsensusSessionTests
             Assert.Equal(bindSecret, session.BindSecret);
         }
 
-        Assert.Equal(new SessionFrame(clientId, ulong.MaxValue, 10), session.Resolve(VsrOperation.NonReplicated));
+        var exhausted = Assert.Throws<IggyInvalidStatusCodeException>(() => session.Resolve(VsrOperation.NonReplicated));
+        Assert.Equal(VsrError.REQUEST_ID_EXHAUSTED, exhausted.StatusCode);
         Assert.Equal(ulong.MaxValue, session.RequestCounter);
     }
 
     [Fact]
-    public void Resolve_DoesNotConsumeAnIdForNonReplicatedOps()
+    public void Resolve_ConsumesDistinctIdsForNonReplicatedOps()
     {
         var session = new ConsensusSession(1);
         session.Resolve(VsrOperation.Register);
         session.Bind(10, new byte[LoginRegister.BIND_SECRET_BYTES]);
 
         Assert.Equal(1UL, session.Resolve(VsrOperation.NonReplicated).RequestId);
-        Assert.Equal(1UL, session.RequestCounter);
+        Assert.Equal(2UL, session.Resolve(VsrOperation.NonReplicated).RequestId);
+        Assert.Equal(3UL, session.RequestCounter);
     }
 
     [Fact]
@@ -259,7 +273,7 @@ public sealed class ConsensusSessionTests
     }
 
     [Fact]
-    public void Reset_ClearsBindingAndCounter()
+    public void Reset_ClearsBindingAndPreservesCounter()
     {
         var session = new ConsensusSession(1);
         session.Resolve(VsrOperation.Register);
@@ -269,7 +283,7 @@ public sealed class ConsensusSessionTests
         session.Reset();
 
         Assert.False(session.IsBound);
-        Assert.Equal(1UL, session.RequestCounter);
+        Assert.Equal(2UL, session.RequestCounter);
         Assert.NotEqual((UInt128)1, session.ClientId);
     }
 

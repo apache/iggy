@@ -18,11 +18,67 @@
 package vsr
 
 import (
+	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 
 	ierror "github.com/apache/iggy/foreign/go/errors"
 )
+
+// ReplyOutcome separates a decoded business rejection from malformed wire data.
+type ReplyOutcome struct {
+	Body      []byte
+	Err       error
+	Committed bool
+}
+
+// DecodeReplyFor verifies the final-result proof against the frozen request.
+func DecodeReplyFor(request, header *[HeaderSize]byte, body []byte) (ReplyOutcome, error) {
+	if PeekCommand(header) == FrameEviction {
+		return ReplyOutcome{}, NewEvictionError(ReadEviction(header))
+	}
+	if PeekCommand(header) != FrameReply || ReadSize(header) < HeaderSize ||
+		ReadSize(header) > MaxFrameSize || int(ReadSize(header))-HeaderSize != len(body) ||
+		ReadReplyRequestID(header) != StampedRequestID(request[:]) {
+		return ReplyOutcome{}, ierror.ErrInvalidCommand
+	}
+	if status := ReadStatus(header); status != 0 {
+		return ReplyOutcome{Err: ierror.FromCode(ierror.Code(status))}, nil
+	}
+	operation := ReadReplyOperation(header)
+	if !IsKnownOperation(operation) || operation == OperationSendMessages && len(body) == 0 {
+		return ReplyOutcome{}, ierror.ErrInvalidCommand
+	}
+	if IsResultFramed(operation) || operation == OperationRegister && len(body) > 0 {
+		if len(body) < resultCountLength ||
+			uint64(resultCountLength)+uint64(binary.LittleEndian.Uint32(body))*resultEntryLength > uint64(len(body)) {
+			return ReplyOutcome{}, ierror.ErrInvalidCommand
+		}
+	}
+	response, err := SplitMetadataResult(operation, body)
+	op := binary.LittleEndian.Uint64(header[replyOffsetOp:])
+	identity := op != 0 &&
+		op == binary.LittleEndian.Uint64(header[replyOffsetCommit:]) &&
+		bytes.Equal(header[replyOffsetClient:replyOffsetClient+16], request[requestOffsetClient:requestOffsetClient+16]) &&
+		bytes.Equal(header[replyOffsetChecksum:replyOffsetChecksum+16], request[requestOffsetChecksum:requestOffsetChecksum+16]) &&
+		bytes.Equal(header[replyOffsetIncarnation:replyOffsetIncarnation+8], request[requestOffsetContext:requestOffsetContext+8]) &&
+		ReplyOperationMatches(Operation(request[requestOffsetOperation]), operation)
+	if header[replyOffsetResult] == committedResult && !identity {
+		return ReplyOutcome{}, ierror.ErrInvalidCommand
+	}
+	committed := header[replyOffsetResult] == committedResult && identity && !errors.Is(err, ierror.ErrTransientNotCommitted) && !errors.Is(err, ierror.ErrTransientNotAccepted) &&
+		!errors.Is(err, ierror.ErrNotPrimary)
+	return ReplyOutcome{Body: response, Err: err, Committed: committed}, nil
+}
+
+// ReplyOperationMatches includes only the primary's canonical prepare rewrites.
+func ReplyOperationMatches(request, reply Operation) bool {
+	return request == reply ||
+		request == OperationCreateTopic && reply == OperationCreateTopicWithAssignments ||
+		request == OperationCreatePartitions && reply == OperationCreatePartitionsWithAssignments ||
+		request == OperationDeleteSegments && reply == OperationTruncatePartition
+}
 
 // Result section layout: [count u32][{index u32, result u32} x count].
 const (
@@ -30,7 +86,7 @@ const (
 	resultEntryLength = 8
 )
 
-// EvictionError is a session-terminal eviction frame. The mapped IggyError is
+// EvictionError is an eviction frame. The mapped IggyError is
 // what callers match on. The protocol window is kept for diagnostics on a
 // version mismatch.
 type EvictionError struct {

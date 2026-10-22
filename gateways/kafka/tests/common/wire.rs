@@ -45,11 +45,7 @@ pub fn decode<M: Decodable>(body: Bytes, version: i16) -> M {
 }
 
 /// Consumer-group and admin keys explicitly out of scope in SCOPE.md.
-pub const OUT_OF_SCOPE_API_KEYS: &[(i16, &str)] = &[
-    (21, "DeleteRecords"),
-    (42, "DeleteGroups"),
-    (44, "IncrementalAlterConfigs"),
-];
+pub const OUT_OF_SCOPE_API_KEYS: &[(i16, &str)] = &[(21, "DeleteRecords"), (42, "DeleteGroups")];
 
 /// Append Metadata request fields that follow the topics array for `version`.
 fn write_metadata_request_trailer(enc: &mut Encoder, version: i16) {
@@ -134,7 +130,7 @@ pub fn build_metadata_all_topics_flexible(version: i16) -> Bytes {
     enc.freeze()
 }
 
-/// Minimal `ListOffsets` request for supported versions (v1–v6).
+/// Minimal `ListOffsets` request for supported versions (v1–v7).
 pub fn build_list_offsets_request(version: i16, topic: &str, partition: i32) -> Bytes {
     let flexible = version >= 6;
     let mut enc = Encoder::with_capacity(128);
@@ -231,6 +227,58 @@ pub fn build_delete_topics_request_with_name(version: i16, name: &str) -> Bytes 
     enc.freeze()
 }
 
+/// Empty `CreatePartitions` request (no topics) for supported versions (v0-v3).
+pub fn build_create_partitions_empty_request(version: i16) -> Bytes {
+    let flexible = version >= 2;
+    let mut enc = Encoder::with_capacity(16);
+
+    if flexible {
+        enc.write_varint(1); // empty topics compact array (N+1 = 1)
+    } else {
+        enc.write_i32(0);
+    }
+    enc.write_i32(5_000); // timeout_ms
+    enc.write_bool(false); // validate_only
+    if flexible {
+        enc.write_empty_tagged_fields();
+    }
+
+    enc.freeze()
+}
+
+/// `CreatePartitions` request raising one topic to `count` partitions with no manual
+/// assignment, the shape `NewPartitions.increaseTo(count)` sends, for supported versions
+/// (v0-v3).
+///
+/// Unlike [`build_create_partitions_empty_request`], this actually produces a per-topic result -
+/// an empty request's response has zero entries, so no error code in it is ever observed.
+pub fn build_create_partitions_request(version: i16, topic: &str, count: i32) -> Bytes {
+    let flexible = version >= 2;
+    let mut enc = Encoder::with_capacity(64);
+
+    if flexible {
+        enc.write_varint(2); // one topic (N+1 = 2)
+        enc.write_compact_nullable_string(Some(topic));
+    } else {
+        enc.write_i32(1);
+        enc.write_nullable_string(Some(topic)).expect("topic fits");
+    }
+    enc.write_i32(count);
+    if flexible {
+        enc.write_varint(0); // null assignments
+        enc.write_empty_tagged_fields();
+    } else {
+        enc.write_i32(-1); // null assignments
+    }
+    enc.write_i32(5_000); // timeout_ms
+    enc.write_bool(false); // validate_only
+    if flexible {
+        enc.write_empty_tagged_fields();
+    }
+
+    enc.freeze()
+}
+
 /// Produce v2–v8 legacy request with optional transactional id and topic.
 pub fn build_produce_legacy_request(
     version: i16,
@@ -290,6 +338,22 @@ pub fn build_describe_configs_empty_request(version: i16) -> Bytes {
 /// `AlterConfigs` with no resources. Flexible from v2.
 pub fn build_alter_configs_empty_request(version: i16) -> Bytes {
     let flexible = version >= 2;
+    let mut enc = Encoder::with_capacity(16);
+    if flexible {
+        enc.write_varint(1);
+    } else {
+        enc.write_i32(0);
+    }
+    enc.write_bool(false); // validate_only
+    if flexible {
+        enc.write_empty_tagged_fields();
+    }
+    enc.freeze()
+}
+
+/// `IncrementalAlterConfigs` with no resources. Flexible from v1.
+pub fn build_incremental_alter_configs_empty_request(version: i16) -> Bytes {
+    let flexible = version >= 1;
     let mut enc = Encoder::with_capacity(16);
     if flexible {
         enc.write_varint(1);
