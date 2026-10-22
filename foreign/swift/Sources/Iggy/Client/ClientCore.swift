@@ -279,6 +279,9 @@ actor ClientCore {
                     }
                     throw outcome.observe(reconnectError)
                 }
+                if let refusal = lineageRefusal(lineage, code: code) {
+                    throw replay ? refusal : failure
+                }
                 guard reconnected != nil else {
                     // A request that was not sent is refused as not accepted: the
                     // reconnect may still finish, so a retry can succeed.

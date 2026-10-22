@@ -162,6 +162,26 @@ struct ClientTransportTests {
         #expect(await server.requests.allSatisfy { $0.code != CommandCode.getStreams.rawValue })
     }
 
+    @Test func aDisconnectDuringAStalledReconnectEndsTheRequestUnauthenticated() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let connector = GatedConnector()
+        connector.released.withLock { $0 = true }
+        let client = makeClient(server, requestTimeout: shortTimeout, connector: connector)
+        defer { Task { await client.shutdown() } }
+        try await client.connect()
+        connector.released.withLock { $0 = false }
+        await client.core.disconnectTransport()
+        let call = Task { try await client.ping() }
+        #expect(await eventually { await client.state == .connecting })
+        await client.disconnect()
+
+        // The dial is still held when the deadline ends the wait for it.
+        await expectCode(.unauthenticated) { try await call.value }
+        connector.released.withLock { $0 = true }
+        #expect(await pingCount(server) == 0)
+    }
+
     @Test func loginBindsTheSessionAndSequencesRequests() async throws {
         let server = try await FakeVSRServer.started()
         defer { Task { await server.stop() } }
