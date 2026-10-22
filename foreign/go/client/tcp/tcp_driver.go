@@ -37,6 +37,13 @@ func (c *IggyTcpClient) drive(ctx context.Context, code command.Code, query, fra
 	ctx, cancel := c.operationContext(ctx)
 	defer cancel()
 	epoch := c.callEpoch(ctx)
+	_, mutation := vsr.ReplicatedOperation(uint32(code))
+	progress := isProgressPoll(code, frame[vsr.HeaderSize:])
+	// A plain read reports a context that is done before its first attempt.
+	// Later, also when a session recovery restarts the call, it ends with 58.
+	if err := ctx.Err(); err != nil && !mutation && !progress {
+		return nil, err
+	}
 	historyRefreshed := false
 	keptContext := exact
 	lifecycleDelay := replayInterval
@@ -49,9 +56,6 @@ func (c *IggyTcpClient) drive(ctx context.Context, code command.Code, query, fra
 	}()
 	for {
 		if ctx.Err() != nil {
-			if _, mutation := vsr.ReplicatedOperation(uint32(code)); !mutation && !isProgressPoll(code, frame[vsr.HeaderSize:]) {
-				return nil, ctx.Err()
-			}
 			return nil, ierror.ErrTransientNotAccepted
 		}
 		select {
@@ -89,8 +93,6 @@ func (c *IggyTcpClient) drive(ctx context.Context, code command.Code, query, fra
 			saved := captured
 			keptContext = &saved
 		}
-		_, mutation := vsr.ReplicatedOperation(uint32(code))
-		progress := isProgressPoll(code, frame[vsr.HeaderSize:])
 		if ticket == nil && (mutation || progress) {
 			key := laneKey{}
 			if query != nil {

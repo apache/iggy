@@ -884,3 +884,25 @@ func TestDriverEndsACallWith40WhenItsSessionChangesDuringABind(t *testing.T) {
 		require.Equal(t, uint32(2), binds.Load(), "the bind went again under the replaced session")
 	})
 }
+
+// A session loss restarts a read whose context ended during its exchange. The
+// read then fails with 58, as a call that waits for the recovery does, and
+// not with the error of its context.
+func TestDriverEndsARestartedReadWith58AfterItsContextEnds(t *testing.T) {
+	client, peer := newPipeClient(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	serve(peer, func(_ int, _ request) []byte {
+		// The read sees both changes at once, because it compares the fence
+		// under the same lock.
+		client.mtx.Lock()
+		defer client.mtx.Unlock()
+		cancel()
+		client.recovery, client.recoveryCancel = context.WithCancel(context.Background())
+		client.session.Reset()
+		client.invalidateSessionLocked()
+		return nil
+	})
+
+	require.ErrorIs(t, client.Ping(ctx), ierror.ErrTransientNotAccepted)
+}
