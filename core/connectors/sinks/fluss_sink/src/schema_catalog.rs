@@ -79,13 +79,15 @@ pub(crate) struct SchemaEntry {
 
 #[derive(Debug, Default)]
 pub(crate) struct SchemaCatalog {
+    connector_id: u32,
     table_to_entry: Mutex<HashMap<TablePath, Arc<SchemaEntry>>>,
     table_config: HashMap<String, TableConfig>,
 }
 
 impl SchemaCatalog {
-    pub(crate) fn new(table_config: HashMap<String, TableConfig>) -> Self {
+    pub(crate) fn new(connector_id: u32, table_config: HashMap<String, TableConfig>) -> Self {
         Self {
+            connector_id,
             table_to_entry: Mutex::default(),
             table_config,
         }
@@ -149,7 +151,7 @@ impl SchemaCatalog {
         writer: &impl TableWriter,
     ) -> Result<Arc<SchemaEntry>, Error> {
         let table_descriptor = sample_and_infer_schema(messages)
-            .and_then(|schema| drop_null_fields(schema, table))
+            .and_then(|schema| drop_null_fields(self.connector_id, schema, table))
             .and_then(|schema| {
                 table_descriptor_from_schema(
                     &schema,
@@ -231,7 +233,7 @@ fn schema_to_row_type(schema: &Schema, table: &TablePath) -> Result<RowType, Err
         })
 }
 
-fn drop_null_fields(schema: Schema, table: &TablePath) -> Result<Schema, Error> {
+fn drop_null_fields(connector_id: u32, schema: Schema, table: &TablePath) -> Result<Schema, Error> {
     let (null_fields, fields): (Vec<_>, Vec<_>) = schema
         .fields()
         .iter()
@@ -245,7 +247,8 @@ fn drop_null_fields(schema: Schema, table: &TablePath) -> Result<Schema, Error> 
             .collect::<Vec<_>>()
             .join(", ");
         warn!(
-            "FlussSink: Leaving out columns [{names}] of table '{table}', every sampled value was null or empty"
+            "Fluss sink ID {}: Leaving out columns [{names}] of table '{table}', every sampled value was null or empty",
+            connector_id
         );
     }
 
@@ -613,13 +616,16 @@ mod tests {
     #[test]
     fn given_invalid_primary_key_when_inferring_should_not_create_or_cache_table() {
         let table = TablePath::new("fluss", "orders");
-        let catalog = SchemaCatalog::new(HashMap::from([(
-            table.to_string(),
-            TableConfig {
-                primary_keys: Some(vec!["missing".to_owned()]),
-                ..TableConfig::default()
-            },
-        )]));
+        let catalog = SchemaCatalog::new(
+            1,
+            HashMap::from([(
+                table.to_string(),
+                TableConfig {
+                    primary_keys: Some(vec!["missing".to_owned()]),
+                    ..TableConfig::default()
+                },
+            )]),
+        );
         let writer = RecordingWriter::default();
         let messages = [json_message(1, r#"{"id":1}"#)];
 

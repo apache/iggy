@@ -36,6 +36,7 @@ use crate::{
 
 #[derive(Debug)]
 pub(crate) struct StaticTableRouter {
+    connector_id: u32,
     schema_catalog: SchemaCatalog,
     table_path: TablePath,
     auto_create_table: bool,
@@ -46,12 +47,13 @@ pub(crate) struct StaticTableRouter {
 }
 
 impl StaticTableRouter {
-    pub(crate) fn new(config: &ResolvedFlussSinkConfig) -> Self {
+    pub(crate) fn new(connector_id: u32, config: &ResolvedFlussSinkConfig) -> Self {
         let table_path =
             TablePath::new(config.target_database.clone(), config.target_table.clone());
         let schema_catalog = SchemaCatalog::default();
         let table_config = config.tables.get(&table_path.to_string()).cloned();
         Self {
+            connector_id,
             schema_catalog,
             table_path,
             auto_create_table: config.auto_create_table,
@@ -147,7 +149,8 @@ impl StaticTableRouter {
         for message in messages {
             if let Err(error) = builder.append(message) {
                 error!(
-                    "FlussSink: Can not add record to batch builder, skipping message because of error: [{error}]"
+                    "Fluss sink ID {}: Can not add record to batch builder, skipping message because of error: [{error}]",
+                    self.connector_id
                 );
                 stat.errors += 1;
                 last_error = Some(Error::FailedToAddToRecordBatch {
@@ -370,7 +373,7 @@ mod tests {
             ..test_config()
         };
 
-        let router = StaticTableRouter::new(&config);
+        let router = StaticTableRouter::new(1, &config);
 
         assert_eq!(router.table_path, TablePath::new("analytics", "events"));
         assert!(!router.auto_create_table);
@@ -379,7 +382,7 @@ mod tests {
     #[test]
     fn given_auto_create_enabled_when_initializing_should_create_expected_table() {
         let config = test_config();
-        let mut router = StaticTableRouter::new(&config);
+        let mut router = StaticTableRouter::new(1, &config);
         let writer = RecordingWriter::default();
 
         run_async(router.init(&writer)).expect("Router should initialize");
@@ -404,7 +407,7 @@ mod tests {
             auto_create_table: false,
             ..test_config()
         };
-        let mut router = StaticTableRouter::new(&config);
+        let mut router = StaticTableRouter::new(1, &config);
         let writer = RecordingWriter::default();
 
         let error = run_async(router.init(&writer)).expect_err("Router initialization should fail");
@@ -421,7 +424,7 @@ mod tests {
 
     #[test]
     fn given_table_creation_failure_when_initializing_should_return_writer_error() {
-        let mut router = StaticTableRouter::new(&test_config());
+        let mut router = StaticTableRouter::new(1, &test_config());
         let writer = RecordingWriter {
             fail_table_creation: true,
             ..RecordingWriter::default()
@@ -438,7 +441,7 @@ mod tests {
     #[test]
     fn given_valid_messages_when_routing_should_write_batch_with_context_and_return_success_stats()
     {
-        let mut router = StaticTableRouter::new(&test_config());
+        let mut router = StaticTableRouter::new(1, &test_config());
         let writer = RecordingWriter::default();
         let messages = vec![
             test_message(101, Payload::Text("first".to_string())),
@@ -495,7 +498,7 @@ mod tests {
 
     #[test]
     fn given_only_invalid_messages_when_routing_should_not_write_empty_batch() {
-        let mut router = StaticTableRouter::new(&test_config());
+        let mut router = StaticTableRouter::new(1, &test_config());
         let writer = RecordingWriter::default();
         let messages = vec![
             test_message(101, Payload::Raw(vec![0xff])),
@@ -529,7 +532,7 @@ mod tests {
 
     #[test]
     fn given_invalid_and_valid_messages_when_routing_should_skip_invalid_message() {
-        let mut router = StaticTableRouter::new(&test_config());
+        let mut router = StaticTableRouter::new(1, &test_config());
         let writer = RecordingWriter::default();
         let messages = vec![
             test_message(101, Payload::Raw(vec![0xff])),
@@ -570,7 +573,7 @@ mod tests {
 
     #[test]
     fn given_writer_skips_row_when_routing_should_report_writer_stats() {
-        let mut router = StaticTableRouter::new(&test_config());
+        let mut router = StaticTableRouter::new(1, &test_config());
         let writer = RecordingWriter {
             skipped_rows: 1,
             ..RecordingWriter::default()
@@ -597,7 +600,7 @@ mod tests {
 
     #[test]
     fn given_write_messages_router_should_write_with_append_mode() {
-        let mut router = StaticTableRouter::new(&test_config());
+        let mut router = StaticTableRouter::new(1, &test_config());
         let writer = RecordingWriter::default();
         let messages = vec![test_message(102, Payload::Text("valid".to_string()))];
 
@@ -621,7 +624,7 @@ mod tests {
 
     #[test]
     fn given_table_write_failure_when_routing_should_return_writer_error() {
-        let mut router = StaticTableRouter::new(&test_config());
+        let mut router = StaticTableRouter::new(1, &test_config());
         let writer = RecordingWriter {
             fail_table_write: true,
             ..RecordingWriter::default()

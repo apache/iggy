@@ -33,16 +33,18 @@ use crate::{
 
 #[derive(Debug)]
 pub(crate) struct MultiTableRouter {
+    connector_id: u32,
     schema_catalog: SchemaCatalog,
     auto_create_table: bool,
     route_key: String,
 }
 
 impl MultiTableRouter {
-    pub(crate) fn new(config: &ResolvedFlussSinkConfig) -> Self {
-        let schema_catalog = SchemaCatalog::new(config.tables.to_owned());
+    pub(crate) fn new(connector_id: u32, config: &ResolvedFlussSinkConfig) -> Self {
+        let schema_catalog = SchemaCatalog::new(connector_id, config.tables.to_owned());
 
         Self {
+            connector_id,
             schema_catalog,
             auto_create_table: config.auto_create_table,
             route_key: config.route_key.clone(),
@@ -81,7 +83,7 @@ impl MultiTableRouter {
     ) -> RouteOutcome {
         let mut result = Stat::default();
         let (partitioned_messages, stat) =
-            partition_messages_by_route_key(messages, &self.route_key);
+            partition_messages_by_route_key(self.connector_id, messages, &self.route_key);
         result += stat;
         let mut last_error: Option<Error> = None;
 
@@ -95,7 +97,8 @@ impl MultiTableRouter {
                 Ok(entry) => entry,
                 Err(error) => {
                     warn!(
-                        "FlussSink: Skipping {message_count} messages for table '{table}', schema could not be resolved: {error}"
+                        "Fluss sink ID {}: Skipping {message_count} messages for table '{table}', schema could not be resolved: {error}",
+                        self.connector_id
                     );
                     result.errors += message_count as u64;
                     last_error = Some(error);
@@ -103,13 +106,18 @@ impl MultiTableRouter {
                 }
             };
 
-            let (batch, stat) = match to_record_batch(&messages, Arc::clone(&entry.schema), &table)
-            {
+            let (batch, stat) = match to_record_batch(
+                self.connector_id,
+                &messages,
+                Arc::clone(&entry.schema),
+                &table,
+            ) {
                 Ok(converted) => converted,
                 Err(error) => {
                     result.errors += message_count as u64;
                     warn!(
-                        "FlussSink: Skipping {message_count} messages for table '{table}', record batch conversion failed: {error}"
+                        "Fluss sink ID {}: Skipping {message_count} messages for table '{table}', record batch conversion failed: {error}",
+                        self.connector_id
                     );
                     last_error = Some(error);
                     continue;
@@ -127,7 +135,8 @@ impl MultiTableRouter {
                     Err(error) => {
                         result.errors += batch_len as u64;
                         warn!(
-                            "FlussSink: Skipping {batch_len} rows for table '{table}', write failed: {error}"
+                            "Fluss sink ID {}: Skipping {batch_len} rows for table '{table}', write failed: {error}",
+                            self.connector_id
                         );
                         last_error = Some(error.into());
                     }
@@ -143,6 +152,7 @@ impl MultiTableRouter {
 }
 
 fn to_record_batch(
+    connector_id: u32,
     messages: &[ConsumedMessage],
     schema: Arc<Schema>,
     table: &TablePath,
@@ -162,8 +172,8 @@ fn to_record_batch(
             Payload::Json(payload) => Some(payload),
             _ => {
                 warn!(
-                    "FlussSink: Skipping message [{}] for table [{}] because only JSON payloads are supported",
-                    message.id, table
+                    "Fluss sink ID {}: Skipping message [{}] for table [{}] because only JSON payloads are supported",
+                    connector_id, message.id, table
                 );
                 stat.errors += 1;
                 None
@@ -230,6 +240,7 @@ fn extract_string_field<'a>(
 }
 
 fn partition_messages_by_route_key(
+    connector_id: u32,
     messages: Vec<ConsumedMessage>,
     route_key: &str,
 ) -> (HashMap<TablePath, Vec<ConsumedMessage>>, Stat) {
@@ -242,8 +253,8 @@ fn partition_messages_by_route_key(
             Err(error) => {
                 stat.errors += 1;
                 warn!(
-                    "FlussSink: Skipping message [{}] because route key extraction failed: {error}",
-                    message.id
+                    "Fluss sink ID {}: Skipping message [{}] because route key extraction failed: {error}",
+                    connector_id, message.id
                 );
                 continue;
             }
@@ -264,7 +275,8 @@ fn partition_messages_by_route_key(
             Err(error) => {
                 stat.errors += messages.len() as u64;
                 warn!(
-                    "FlussSink: Skipping {} messages because route '{route}' is not a valid table path: {error}",
+                    "Fluss sink ID {}: Skipping {} messages because route '{route}' is not a valid table path: {error}",
+                    connector_id,
                     messages.len()
                 );
             }
@@ -478,7 +490,7 @@ mod tests {
             json_message(5, r#"{"id":5}"#),
         ];
 
-        let (groups, stat) = partition_messages_by_route_key(messages, "table");
+        let (groups, stat) = partition_messages_by_route_key(1, messages, "table");
 
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[&TablePath::new("fluss", "orders")].len(), 2);
@@ -495,6 +507,7 @@ mod tests {
         non_json.payload = Payload::Text("not JSON".to_owned());
 
         let (batch, stat) = to_record_batch(
+            1,
             &[json_message(1, r#"{"id":1}"#), non_json],
             std::sync::Arc::clone(&schema),
             &table,
@@ -503,7 +516,7 @@ mod tests {
         let mut non_json = json_message(3, r#"{"id":3}"#);
         non_json.payload = Payload::Text("not JSON".to_owned());
         let (empty_batch, empty_stat) =
-            to_record_batch(&[non_json], schema, &table).expect("Non-JSON should be skipped");
+            to_record_batch(1, &[non_json], schema, &table).expect("Non-JSON should be skipped");
 
         assert_eq!(batch.expect("JSON batch should exist").num_rows(), 1);
         assert_eq!(stat.errors, 1);
@@ -518,6 +531,7 @@ mod tests {
             std::sync::Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
 
         let error = to_record_batch(
+            1,
             &[json_message(1, r#"{"id":"not an integer"}"#)],
             schema,
             &table,
@@ -530,7 +544,7 @@ mod tests {
 
     #[test]
     fn given_valid_and_invalid_messages_when_routing_should_cache_schema_and_count_results() {
-        let router = MultiTableRouter::new(&auto_create_config());
+        let router = MultiTableRouter::new(1, &auto_create_config());
         let writer = RecordingWriter::default();
         let mut non_json = json_message(5, r#"{"table":"fluss.orders","id":5}"#);
         non_json.payload = Payload::Text("not JSON".to_owned());
@@ -575,7 +589,7 @@ mod tests {
 
     #[test]
     fn given_multiple_tables_when_routing_should_accumulate_written_and_skipped_counts() {
-        let router = MultiTableRouter::new(&auto_create_config());
+        let router = MultiTableRouter::new(1, &auto_create_config());
         let writer = RecordingWriter::default();
         let messages = vec![
             json_message(1, r#"{"table":"fluss.orders","id":1}"#),
@@ -602,7 +616,7 @@ mod tests {
             auto_create_table: false,
             ..ResolvedFlussSinkConfig::default()
         };
-        let router = MultiTableRouter::new(&config);
+        let router = MultiTableRouter::new(1, &config);
         let writer = RecordingWriter::default();
 
         let RouteOutcome { stat, last_error } = run_async(router.route(
@@ -633,7 +647,7 @@ mod tests {
 
     #[test]
     fn given_create_failure_when_routing_should_return_catalog_error() {
-        let router = MultiTableRouter::new(&auto_create_config());
+        let router = MultiTableRouter::new(1, &auto_create_config());
         let writer = RecordingWriter {
             fail_create: true,
             ..RecordingWriter::default()
@@ -658,7 +672,7 @@ mod tests {
 
     #[test]
     fn given_write_failure_when_routing_should_return_writer_error() {
-        let router = MultiTableRouter::new(&auto_create_config());
+        let router = MultiTableRouter::new(1, &auto_create_config());
         let writer = RecordingWriter {
             failing_writes: vec![TablePath::new("fluss", "orders")],
             ..RecordingWriter::default()
@@ -679,7 +693,7 @@ mod tests {
 
     #[test]
     fn given_one_failing_table_when_routing_should_still_write_other_tables() {
-        let router = MultiTableRouter::new(&auto_create_config());
+        let router = MultiTableRouter::new(1, &auto_create_config());
         let writer = RecordingWriter {
             failing_writes: vec![TablePath::new("fluss", "orders")],
             ..RecordingWriter::default()
@@ -718,7 +732,7 @@ mod tests {
             )]),
             ..auto_create_config()
         };
-        let router = MultiTableRouter::new(&config);
+        let router = MultiTableRouter::new(1, &config);
         let writer = RecordingWriter::default();
 
         let RouteOutcome { stat, last_error } = run_async(router.route(

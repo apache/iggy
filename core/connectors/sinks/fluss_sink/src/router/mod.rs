@@ -34,10 +34,12 @@ pub(crate) enum Router {
 }
 
 impl Router {
-    pub(crate) fn from_config(config: &ResolvedFlussSinkConfig) -> Router {
+    pub(crate) fn from_config(connector_id: u32, config: &ResolvedFlussSinkConfig) -> Router {
         match config.router_type {
-            RouterType::Static => Router::StaticTable(Box::new(StaticTableRouter::new(config))),
-            RouterType::Multi => Router::MultiTable(MultiTableRouter::new(config)),
+            RouterType::Static => {
+                Router::StaticTable(Box::new(StaticTableRouter::new(connector_id, config)))
+            }
+            RouterType::Multi => Router::MultiTable(MultiTableRouter::new(connector_id, config)),
         }
     }
 }
@@ -128,11 +130,11 @@ mod tests {
         };
 
         assert!(matches!(
-            Router::from_config(&static_config),
+            Router::from_config(1, &static_config),
             Router::StaticTable(_)
         ));
         assert!(matches!(
-            Router::from_config(&multi_config),
+            Router::from_config(1, &multi_config),
             Router::MultiTable(_)
         ));
     }

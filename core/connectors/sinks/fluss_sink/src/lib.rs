@@ -57,7 +57,7 @@ impl FlussSink {
     pub fn new(id: u32, config: FlussSinkConfig) -> Self {
         let config = ResolvedFlussSinkConfig::from(config);
         let verbose = config.verbose_logging;
-        let writer = FlussWriter::new(config.clone());
+        let writer = FlussWriter::new(id, config.clone());
         Self {
             id,
             state: Mutex::new(State {
@@ -66,7 +66,7 @@ impl FlussSink {
                 insertion_errors: 0,
             }),
             writer,
-            router: Router::from_config(&config),
+            router: Router::from_config(id, &config),
             verbose,
         }
     }

@@ -31,7 +31,7 @@ use fluss::{
 };
 use iggy_connector_sdk::Error as ConnectorError;
 use thiserror::Error;
-use tracing::warn;
+use tracing::error;
 
 use crate::ResolvedFlussSinkConfig;
 
@@ -260,6 +260,7 @@ pub(crate) trait TableWriter {
 }
 
 pub struct FlussWriter {
+    connector_id: u32,
     connection: Option<FlussConnection>,
     config: ResolvedFlussSinkConfig,
 }
@@ -273,8 +274,9 @@ impl fmt::Debug for FlussWriter {
 }
 
 impl FlussWriter {
-    pub fn new(config: ResolvedFlussSinkConfig) -> Self {
+    pub fn new(connector_id: u32, config: ResolvedFlussSinkConfig) -> Self {
         Self {
+            connector_id,
             config,
             connection: None,
         }
@@ -330,8 +332,9 @@ impl FlussWriter {
             Ok(()) => stat.appended += rows as u64,
             Err(error) => {
                 stat.errors += rows as u64;
-                warn!(
-                    "FlussSink: Failed to append {rows} rows to table '{table_path}' because of: {error}"
+                error!(
+                    "Fluss sink ID {}: Failed to append {rows} rows to table '{table_path}' because of: {error}",
+                    self.connector_id
                 );
             }
         }
@@ -354,8 +357,9 @@ impl FlussWriter {
             match writer.append(&row) {
                 Ok(future) => pending.push((i, future)),
                 Err(error) => {
-                    warn!(
-                        "FlussSink: Failed to enqueue row {i} for append in table '{table_path}' because of: {error}"
+                    error!(
+                        "Fluss sink ID {}: Failed to enqueue row {i} for append in table '{table_path}' because of: {error}",
+                        self.connector_id
                     );
                     stat.errors += 1;
                 }
@@ -367,8 +371,9 @@ impl FlussWriter {
             match future.await {
                 Ok(()) => stat.appended += 1,
                 Err(error) => {
-                    warn!(
-                        "FlussSink: Row {i} rejected for append in table '{table_path}' because of: {error}"
+                    error!(
+                        "Fluss sink ID {}: Row {i} rejected for append in table '{table_path}' because of: {error}",
+                        self.connector_id
                     );
                     stat.errors += 1;
                 }
@@ -410,8 +415,9 @@ impl FlussWriter {
                 Ok(future) => pending.push((row_op, i, future)),
                 Err(error) => {
                     stat.errors += 1;
-                    warn!(
-                        "FlussSink: Failed to enqueue row {i} for {row_op} in table '{table_path}' because of: {error}"
+                    error!(
+                        "Fluss sink ID {}: Failed to enqueue row {i} for {row_op} in table '{table_path}' because of: {error}",
+                        self.connector_id
                     );
                 }
             }
@@ -423,8 +429,9 @@ impl FlussWriter {
                 (RowOp::Delete, Ok(())) => stat.deleted += 1,
                 (RowOp::Upsert, Ok(())) => stat.appended += 1,
                 (_, Err(error)) => {
-                    warn!(
-                        "FlussSink: Row {i} rejected for {row_op} in table '{table_path}' because of: {error}"
+                    error!(
+                        "Fluss sink ID {}: Row {i} rejected for {row_op} in table '{table_path}' because of: {error}",
+                        self.connector_id
                     );
                     stat.errors += 1;
                 }
