@@ -624,6 +624,41 @@ fn given_pending_move_when_unrelated_or_current_traffic_arrives_should_preserve_
     }
 }
 
+#[compio::test]
+async fn given_a_new_authority_when_peers_have_not_answered_should_keep_them_eligible_until_their_first_probe_times_out()
+ {
+    let (shard, _inbox) = owner_at::<PingPongSuperblock>(None, 0, REPLICAS, 0);
+    let epoch = shard.bus.monotonic_now();
+    let eligible = || shard.primary_rebalance.borrow().eligible.clone();
+    shard.tick_primary_rebalance().await;
+    assert_eq!(
+        eligible(),
+        [true; 3],
+        "placement must not narrow to the coordinator before any peer answers"
+    );
+
+    let (replica, mut not_ready) = shard.bus.sent.borrow()[0];
+    not_ready.replica = replica;
+    not_ready.kind = PrimaryRebalanceKind::MetadataReply;
+    shard.on_primary_rebalance(not_ready).await;
+    shard.tick_primary_rebalance().await;
+    assert_eq!(eligible(), [true, false, true]);
+
+    shard.bus.now.set(Some(epoch + PROBE_TIMEOUT));
+    shard.tick_primary_rebalance().await;
+    assert_eq!(eligible(), [true, false, true]);
+    shard
+        .bus
+        .now
+        .set(Some(epoch + PROBE_TIMEOUT + Duration::from_nanos(1)));
+    shard.tick_primary_rebalance().await;
+    assert_eq!(
+        eligible(),
+        [true, false, false],
+        "an unanswered first probe ends the presumption at its timeout"
+    );
+}
+
 #[test]
 fn given_health_challenge_when_reply_is_overdue_or_replayed_should_not_extend_readiness() {
     let (shard, _inbox) = owner();

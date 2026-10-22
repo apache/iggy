@@ -16,7 +16,7 @@
 // under the License.
 
 //! The metadata primary coordinates one partition view change at a time.
-//! Eligibility requires fresh challenges, and a transfer additionally requires
+//! Moves require fresh challenges, and a transfer additionally requires
 //! the target's applied partition prefix. The grant then goes to the source
 //! primary, because only its drain fences the replica where prepares start.
 //! The source bounds that drain to `GRANT_TIMEOUT` after receipt. Authority
@@ -283,7 +283,15 @@ where
             if state.view != Some(consensus.view()) {
                 *state = PrimaryRebalance {
                     view: Some(consensus.view()),
-                    peers: vec![Peer::default(); replicas],
+                    // Placement keeps a peer eligible until it answers not
+                    // ready or its first probe times out.
+                    peers: vec![
+                        Peer {
+                            ready_at: Some(now),
+                            ..Peer::default()
+                        };
+                        replicas
+                    ],
                     eligible: vec![false; replicas],
                     stable_since: now,
                     next_move: now,
