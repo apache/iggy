@@ -50,6 +50,7 @@ import org.apache.iggy.serde.CommandCode;
 
 import java.io.IOException;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -95,7 +96,9 @@ final class PollRouter {
     private final Set<Poll> pending = new HashSet<>();
     private volatile int rosterSize;
     private final Map<Integer, ConnectionInfo> replicas = new HashMap<>();
-    private ConnectionInfo metadataPrimary;
+    // Read without the monitor: a slot opens its link under the slot monitor, and the client reads this there to size
+    // the dial timeout.
+    private volatile ConnectionInfo metadataPrimary;
     private final Map<TargetKey, Long> partitionCounts = new HashMap<>();
 
     PollRouter(Supplier<AsyncTcpConnection> coordinator, Function<ConnectionInfo, AsyncTcpConnection> connectData) {
@@ -433,29 +436,38 @@ final class PollRouter {
         partitionCounts.clear();
     }
 
+    void observeTopology(ClusterMetadata metadata) {
+        // Outside the monitor, as in clearSession: a close takes the slot monitor, which a slot holds while it opens
+        // its link, and fails the waiters of the dial inline.
+        applyTopology(metadata).forEach(Slot::close);
+    }
+
+    /** Returns the slots whose endpoints left the roster. */
     @SuppressWarnings({"checkstyle:CyclomaticComplexity", "checkstyle:NPathComplexity"})
-    synchronized void observeTopology(ClusterMetadata metadata) {
+    private synchronized List<Slot> applyTopology(ClusterMetadata metadata) {
         replicas.clear();
-        metadataPrimary = null;
+        ConnectionInfo leader = null;
         rosterSize = metadata.nodes().size();
         for (var node : metadata.nodes()) {
             if (node.endpoints().tcp() != 0) {
                 ConnectionInfo endpoint = LeaderAwareness.nodeTarget(metadata, node, configuredEndpoint);
                 replicas.put(node.replicaId(), endpoint);
                 if (node.role() == ClusterNodeRole.Leader) {
-                    metadataPrimary = endpoint;
+                    leader = endpoint;
                 }
             }
         }
+        metadataPrimary = leader;
         if (connectData == null || !coordinator.get().isAuthenticated()) {
-            return;
+            return List.of();
         }
-        var obsolete = connections.entrySet().iterator();
-        while (obsolete.hasNext()) {
-            var entry = obsolete.next();
+        List<Slot> obsolete = new ArrayList<>();
+        var entries = connections.entrySet().iterator();
+        while (entries.hasNext()) {
+            var entry = entries.next();
             if (!replicas.containsValue(entry.getKey())) {
-                obsolete.remove();
-                entry.getValue().close();
+                entries.remove();
+                obsolete.add(entry.getValue());
             }
         }
         for (ConnectionInfo endpoint : replicas.values()) {
@@ -474,10 +486,11 @@ final class PollRouter {
                 maintain(endpoint, slot, topologyGeneration, 0);
             }
         }
+        return obsolete;
     }
 
     /** The node that the last roster named as metadata primary, or null if it named none. */
-    synchronized ConnectionInfo metadataPrimary() {
+    ConnectionInfo metadataPrimary() {
         return metadataPrimary;
     }
 

@@ -46,6 +46,7 @@ import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.SendMessagesResponse;
 import org.apache.iggy.partition.PartitionContext;
+import org.apache.iggy.serde.BytesDeserializer;
 import org.apache.iggy.serde.CommandCode;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -741,6 +742,66 @@ class PollRouterTest {
             assertThat(clearing.isAlive()).isFalse();
         } finally {
             releaseCompletion.complete(null);
+            timers.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+            group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    /**
+     * A slot opens its link under the slot monitor, where the client reads the metadata primary to size the dial
+     * timeout. A roster read that drops the endpoint of that slot meanwhile closes the slot, so it waits for that
+     * monitor, and it must not hold the router while it waits.
+     */
+    @Test
+    void shouldReadTheMetadataPrimaryWhileARosterReadClosesTheSlotThatOpensItsLink() throws Exception {
+        IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+        ManualTimers timers = new ManualTimers();
+        CompletableFuture<Void> opening = new CompletableFuture<>();
+        CompletableFuture<Void> releaseOpen = new CompletableFuture<>();
+        try {
+            Coordinator coordinator = new Coordinator(group, timers);
+            AtomicReference<PollRouter> routerOfLinks = new AtomicReference<>();
+            PollRouter router = new PollRouter(() -> coordinator, endpoint -> {
+                opening.complete(null);
+                releaseOpen.join();
+                routerOfLinks.get().metadataPrimary();
+                return new Primary(group);
+            });
+            routerOfLinks.set(router);
+            // A roster spells its nodes by address, so it never names the slot of a hostname.
+            ConnectionInfo hostname = new ConnectionInfo("localhost", PRIMARY_PORT);
+            CompletableFuture<Void> dialed = new CompletableFuture<>();
+            Thread dialing = start("slot-open", () -> {
+                try {
+                    router.connectionFor(hostname, System.nanoTime() + TIMEOUT.toNanos());
+                    dialed.complete(null);
+                } catch (RuntimeException error) {
+                    dialed.completeExceptionally(error);
+                }
+            });
+            opening.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            CompletableFuture<Void> observed = new CompletableFuture<>();
+            ByteBuf metadata = coordinator.roster().join();
+            Thread roster = start("roster-read", () -> {
+                try {
+                    router.observeTopology(BytesDeserializer.readClusterMetadata(metadata));
+                } finally {
+                    metadata.release();
+                }
+                observed.complete(null);
+            });
+            await(() -> roster.getState() == Thread.State.BLOCKED || observed.isDone(), "roster read", TIMEOUT);
+            releaseOpen.complete(null);
+
+            assertThat(dialed).succeedsWithin(TIMEOUT);
+            assertThat(observed).succeedsWithin(TIMEOUT);
+            assertThat(router.metadataPrimary().port()).isEqualTo(PRIMARY_PORT + 1);
+            dialing.join(TIMEOUT.toMillis());
+            roster.join(TIMEOUT.toMillis());
+            assertThat(dialing.isAlive()).isFalse();
+            assertThat(roster.isAlive()).isFalse();
+        } finally {
+            releaseOpen.complete(null);
             timers.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
             group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
         }
