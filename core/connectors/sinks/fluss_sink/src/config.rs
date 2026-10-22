@@ -19,11 +19,10 @@ use std::collections::HashMap;
 
 use fluss::{
     config::{Config as FlussConfig, NoKeyAssigner},
-    error::Error,
     metadata::{SchemaBuilder, TableDescriptorBuilder},
 };
 use secrecy::{ExposeSecret, SecretString};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -55,6 +54,7 @@ const DEFAULT_INCLUDE_TIMESTAMP: bool = true;
 pub struct FlussSinkConfig {
     pub bootstrap_servers: Option<String>,
     pub writer_request_max_size: Option<i32>,
+    #[serde(default, deserialize_with = "deserialize_writer_acks")]
     pub writer_acks: Option<String>,
     pub writer_retries: Option<i32>,
     pub writer_batch_size: Option<i32>,
@@ -63,7 +63,7 @@ pub struct FlussSinkConfig {
     pub writer_enable_idempotence: Option<bool>,
     pub writer_max_inflight_requests_per_bucket: Option<usize>,
     pub writer_buffer_memory_size: Option<usize>,
-    pub writer_buffer_wait_timeout_ms: Option<String>,
+    pub writer_buffer_wait_timeout_ms: Option<u64>,
     pub connect_timeout_ms: Option<u64>,
     pub security_protocol: Option<String>,
     pub security_sasl_mechanism: Option<String>,
@@ -133,7 +133,7 @@ pub(crate) struct ResolvedFlussSinkConfig {
     pub(crate) writer_enable_idempotence: bool,
     pub(crate) writer_max_inflight_requests_per_bucket: usize,
     pub(crate) writer_buffer_memory_size: usize,
-    pub(crate) writer_buffer_wait_timeout_ms: String,
+    pub(crate) writer_buffer_wait_timeout_ms: u64,
     pub(crate) connect_timeout_ms: u64,
     pub(crate) security_protocol: String,
     pub(crate) security_sasl_mechanism: String,
@@ -167,7 +167,7 @@ impl Default for ResolvedFlussSinkConfig {
             writer_max_inflight_requests_per_bucket: fluss_config
                 .writer_max_inflight_requests_per_bucket,
             writer_buffer_memory_size: fluss_config.writer_buffer_memory_size,
-            writer_buffer_wait_timeout_ms: fluss_config.writer_buffer_wait_timeout_ms.to_string(),
+            writer_buffer_wait_timeout_ms: fluss_config.writer_buffer_wait_timeout_ms,
             connect_timeout_ms: fluss_config.connect_timeout_ms,
             security_protocol: fluss_config.security_protocol,
             security_sasl_mechanism: fluss_config.security_sasl_mechanism,
@@ -255,49 +255,62 @@ impl From<FlussSinkConfig> for ResolvedFlussSinkConfig {
     }
 }
 
-impl TryFrom<&ResolvedFlussSinkConfig> for FlussConfig {
-    type Error = Error;
-
-    fn try_from(config: &ResolvedFlussSinkConfig) -> Result<Self, Self::Error> {
-        let writer_buffer_wait_timeout_ms =
-            config
-                .writer_buffer_wait_timeout_ms
-                .parse()
-                .map_err(|error| Error::UnexpectedError {
-                    message: format!(
-                        "invalid writer_buffer_wait_timeout_ms '{}': {error}",
-                        config.writer_buffer_wait_timeout_ms
-                    ),
-                    source: Some(Box::new(error)),
-                })?;
-
-        Ok(Self {
+impl From<&ResolvedFlussSinkConfig> for FlussConfig {
+    fn from(config: &ResolvedFlussSinkConfig) -> Self {
+        let defaults = FlussConfig::default();
+        Self {
             bootstrap_servers: config.bootstrap_servers.clone(),
             writer_request_max_size: config.writer_request_max_size,
             writer_acks: config.writer_acks.clone(),
             writer_retries: config.writer_retries,
             writer_batch_size: config.writer_batch_size,
+            // Fluss rejects a dynamic minimum above the batch size, and its default
+            // minimum is 256 KB, so a smaller writer_batch_size would fail to open.
+            writer_dynamic_batch_size_min: defaults
+                .writer_dynamic_batch_size_min
+                .min(config.writer_batch_size),
             writer_bucket_no_key_assigner: config.writer_bucket_no_key_assigner,
             writer_batch_timeout_ms: config.writer_batch_timeout_ms,
             writer_enable_idempotence: config.writer_enable_idempotence,
             writer_max_inflight_requests_per_bucket: config.writer_max_inflight_requests_per_bucket,
             writer_buffer_memory_size: config.writer_buffer_memory_size,
-            writer_buffer_wait_timeout_ms,
+            writer_buffer_wait_timeout_ms: config.writer_buffer_wait_timeout_ms,
             connect_timeout_ms: config.connect_timeout_ms,
             security_protocol: config.security_protocol.clone(),
             security_sasl_mechanism: config.security_sasl_mechanism.clone(),
             security_sasl_username: config.security_sasl_username.clone(),
             security_sasl_password: config.security_sasl_password.expose_secret().to_string(),
-            ..FlussConfig::default()
-        })
+            ..defaults
+        }
     }
+}
+
+/// Env overrides and TOML integers reach serde as numbers, so `-1` must be
+/// accepted as well as `"all"`.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum WriterAcks {
+    Text(String),
+    Number(i64),
+}
+
+fn deserialize_writer_acks<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(
+        Option::<WriterAcks>::deserialize(deserializer)?.map(|acks| match acks {
+            WriterAcks::Text(text) => text,
+            WriterAcks::Number(number) => number.to_string(),
+        }),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
-    use fluss::{config::Config as FlussConfig, error::Error};
+    use fluss::config::Config as FlussConfig;
     use serde_json::json;
 
     use super::{
@@ -308,7 +321,7 @@ mod tests {
     #[test]
     fn given_default_sink_config_when_converting_should_use_connector_retry_default() {
         let sink_config = ResolvedFlussSinkConfig::from(FlussSinkConfig::default());
-        let fluss_config = FlussConfig::try_from(&sink_config).expect("Sink config should convert");
+        let fluss_config = FlussConfig::from(&sink_config);
         let actual = serde_json::to_value(fluss_config).expect("Fluss config should serialize");
         let expected = serde_json::to_value(FlussConfig {
             writer_retries: DEFAULT_FLUSS_WRITER_RETRIES,
@@ -327,7 +340,7 @@ mod tests {
         };
         let config = ResolvedFlussSinkConfig::from(config);
 
-        let fluss_config = FlussConfig::try_from(&config).expect("Sink config should convert");
+        let fluss_config = FlussConfig::from(&config);
 
         assert_eq!(fluss_config.writer_retries, i32::MAX);
     }
@@ -349,7 +362,7 @@ mod tests {
 
         assert_eq!(config.writer_batch_size, 2 * 1024 * 1024);
         assert_eq!(config.writer_retries, DEFAULT_FLUSS_WRITER_RETRIES);
-        assert_eq!(config.writer_buffer_wait_timeout_ms, u64::MAX.to_string());
+        assert_eq!(config.writer_buffer_wait_timeout_ms, u64::MAX);
         assert_eq!(config.payload_format, PayloadFormat::Json);
         assert_eq!(config.target_database, "analytics");
         assert_eq!(config.target_table, "events");
@@ -416,41 +429,37 @@ mod tests {
     }
 
     #[test]
-    fn given_u64_max_as_string_when_converting_should_parse_value() {
+    fn given_numeric_buffer_wait_timeout_when_converting_should_use_value() {
         let config: FlussSinkConfig = serde_json::from_value(json!({
-            "writer_buffer_wait_timeout_ms": u64::MAX.to_string()
-        }))
-        .expect("String-encoded u64 should deserialize");
-        let config = ResolvedFlussSinkConfig::from(config);
-        let fluss_config = FlussConfig::try_from(&config).expect("Sink config should convert");
-
-        assert_eq!(fluss_config.writer_buffer_wait_timeout_ms, u64::MAX);
-    }
-
-    #[test]
-    fn given_numeric_buffer_wait_timeout_when_deserializing_should_fail() {
-        let config = serde_json::from_value::<FlussSinkConfig>(json!({
             "writer_buffer_wait_timeout_ms": 100
-        }));
+        }))
+        .expect("Numeric timeout should deserialize");
+        let fluss_config = FlussConfig::from(&ResolvedFlussSinkConfig::from(config));
 
-        assert!(config.is_err());
+        assert_eq!(fluss_config.writer_buffer_wait_timeout_ms, 100);
     }
 
     #[test]
-    fn given_invalid_buffer_wait_timeout_when_converting_should_return_fluss_error() {
-        let config = FlussSinkConfig {
-            writer_buffer_wait_timeout_ms: Some("invalid".to_string()),
+    fn given_string_or_numeric_acks_when_deserializing_should_resolve_to_string() {
+        for (value, expected) in [(json!("all"), "all"), (json!(-1), "-1"), (json!(1), "1")] {
+            let config: FlussSinkConfig = serde_json::from_value(json!({ "writer_acks": value }))
+                .expect("Acks should deserialize");
+
+            assert_eq!(config.writer_acks.as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn given_small_writer_batch_size_when_converting_should_cap_dynamic_minimum() {
+        let config = ResolvedFlussSinkConfig::from(FlussSinkConfig {
+            writer_batch_size: Some(64 * 1024),
             ..FlussSinkConfig::default()
-        };
-        let config = ResolvedFlussSinkConfig::from(config);
+        });
 
-        let error = FlussConfig::try_from(&config).expect_err("Invalid value should fail");
+        let fluss_config = FlussConfig::from(&config);
 
-        assert!(matches!(
-            error,
-            Error::UnexpectedError { message, .. }
-                if message.contains("invalid writer_buffer_wait_timeout_ms 'invalid'")
-        ));
+        assert_eq!(fluss_config.writer_dynamic_batch_size_min, 64 * 1024);
+        assert_eq!(fluss_config.validate_writer(), Ok(()));
     }
 
     #[test]

@@ -128,15 +128,15 @@ unless Fluss is configured to create them automatically.
 | ----------------------------------------- | ------ | ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- |
 | `bootstrap_servers`                       | string | `"127.0.0.1:9123"`       | Fluss coordinator address.                                                                                                               |
 | `writer_request_max_size`                 | i32    | `10485760`               | Maximum writer request size in bytes.                                                                                                    |
-| `writer_acks`                             | string | `"all"`                  | Required acknowledgements. `"all"` waits for all required replicas.                                                                      |
+| `writer_acks`                             | string | `"all"`                  | Required acknowledgements: `"all"`, `-1`, `0` or `1`, as a string or an integer. `"all"` waits for all replicas.                         |
 | `writer_retries`                          | i32    | `3`                      | Maximum retries for transient writer failures.                                                                                           |
-| `writer_batch_size`                       | i32    | `2097152`                | Target Fluss writer batch size in bytes.                                                                                                 |
+| `writer_batch_size`                       | i32    | `2097152`                | Target writer batch size in bytes. Values below 256 KB also lower the dynamic batch size minimum to match.                               |
 | `writer_batch_timeout_ms`                 | i64    | `100`                    | Maximum time to wait for a writer batch to fill before sending it.                                                                       |
 | `writer_bucket_no_key_assigner`           | enum   | `"sticky"`               | Bucket selection for tables without bucket keys: `sticky` or `round_robin`.                                                              |
 | `writer_enable_idempotence`               | bool   | `true`                   | Add writer IDs and per-bucket sequence numbers so Fluss can deduplicate retried batches.                                                 |
 | `writer_max_inflight_requests_per_bucket` | usize  | `5`                      | Maximum unacknowledged requests per bucket. Idempotent writes require a value no greater than `5`.                                       |
 | `writer_buffer_memory_size`               | usize  | `67108864`               | Total memory in bytes available for buffered write batches.                                                                              |
-| `writer_buffer_wait_timeout_ms`           | string | `"18446744073709551615"` | Maximum time to wait for writer buffer memory. This is a string because the default is `u64::MAX`, which TOML integers cannot represent. |
+| `writer_buffer_wait_timeout_ms`           | u64    | no limit                 | Maximum time in milliseconds to wait for writer buffer memory. Leave unset to wait without a limit.                                      |
 | `connect_timeout_ms`                      | u64    | `15000`                  | TCP connection timeout in milliseconds.                                                                                                  |
 
 Idempotent writes require `writer_acks = "all"` or `"-1"`,

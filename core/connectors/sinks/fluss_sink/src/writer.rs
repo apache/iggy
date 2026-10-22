@@ -305,11 +305,7 @@ impl FlussWriter {
     }
 
     pub(crate) async fn connect(&mut self) -> Result<(), WriterError> {
-        let config = fluss::config::Config::try_from(&self.config).map_err(|source| {
-            WriterError::InvalidWriterConfig {
-                source: Box::new(source),
-            }
-        })?;
+        let config = fluss::config::Config::from(&self.config);
         let connection =
             FlussConnection::new(config)
                 .await

@@ -54,7 +54,8 @@ writer_batch_timeout_ms = 100
 writer_enable_idempotence = true
 writer_max_inflight_requests_per_bucket = 5
 writer_buffer_memory_size = 67108864
-writer_buffer_wait_timeout_ms = "18446744073709551615"
+# leave unset to wait for buffer memory without a limit
+# writer_buffer_wait_timeout_ms = 60000
 connect_timeout_ms = 120000
 security_protocol = "PLAINTEXT"
 security_sasl_mechanism = "PLAIN"
