@@ -135,8 +135,10 @@ partition still has one ordering primary.
 A create whose namespace is invalid can receive 58 (`TransientNotAccepted`) while
 any metadata write is pending, even an unrelated one. Under steady unrelated
 traffic its retries can reach the deadline with 58 instead of the namespace
-error. A valid create that exceeds its configured capacity still gets the
-capacity error.
+error. A valid create that exceeds its configured capacity with the committed
+partitions alone still gets the capacity error. If only the creates in flight
+leave no room, it gets 58, and under steady create traffic its retries can reach
+the deadline with 58.
 
 ### HTTP routing and backpressure
 

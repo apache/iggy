@@ -4359,7 +4359,9 @@ where
     /// of them commits cannot take the node past the cap. A create leaves the
     /// count when it leaves the pipeline: it commits, the apply refuses it, or
     /// a view change drops it. A create parked in the request queue is checked
-    /// when it is promoted.
+    /// when it is promoted. The apply can still refuse a create in flight, so a
+    /// create that fits the committed partitions alone is refused as transient,
+    /// and only one past the cap on committed partitions gets the cap's error.
     ///
     /// A body that does not decode passes here, and `prepare_request` evicts
     /// the session for it. A create that the gated apply refuses, for a
@@ -4396,12 +4398,10 @@ where
             },
             _ => return Ok(()),
         };
-        let committed = self.mux_stm.streams().partition_count();
+        let committed = u64::try_from(self.mux_stm.streams().partition_count()).unwrap_or(u64::MAX);
         let pending = self.pending_partitions()?;
-        let held = u64::try_from(committed)
-            .unwrap_or(u64::MAX)
-            .saturating_add(pending);
-        let admitted = validate_partitions_limit(partitions_max, requested, held);
+        let admitted =
+            validate_partitions_limit(partitions_max, requested, committed.saturating_add(pending));
         if admitted.is_err() {
             let applies =
                 resolve_acting_user_id(header.operation, header.client, &self.client_table)
@@ -4419,7 +4419,8 @@ where
             if !applies {
                 // Any pending metadata may change validity. Conservatively defer
                 // even unrelated work; steady traffic can leave this request at
-                // 58 until its deadline. A valid over-cap create keeps its cap error.
+                // 58 until its deadline. A valid create gets the cap error only
+                // when the committed partitions alone exceed the cap.
                 let consensus = self
                     .consensus
                     .as_ref()
@@ -4428,6 +4429,9 @@ where
                     return Err(IggyError::TransientNotAccepted);
                 }
                 return Ok(());
+            }
+            if validate_partitions_limit(partitions_max, requested, committed).is_ok() {
+                return Err(IggyError::TransientNotAccepted);
             }
             warn!(
                 operation = ?header.operation,
@@ -7532,8 +7536,8 @@ mod tests {
                     in_flight += 1;
                 }
                 Err(error) => assert!(
-                    matches!(error, IggyError::PartitionsLimitReached),
-                    "{name} must be refused at the cap, got {error:?}"
+                    matches!(error, IggyError::TransientNotAccepted),
+                    "{name} must wait for the creates in flight, got {error:?}"
                 ),
             }
         }
@@ -7543,6 +7547,63 @@ mod tests {
         assert!(
             create(FIRST_CLIENT + 3, "d").is_ok(),
             "a dropped create must free its partitions"
+        );
+    }
+
+    /// A create in flight that its apply refuses holds a reservation until it
+    /// commits. A valid create that fits once that reservation is freed must
+    /// not get the terminal cap error before then.
+    #[test]
+    fn given_refused_create_in_flight_when_a_valid_create_fits_committed_partitions_should_defer_it()
+     {
+        const PARTITIONS_MAX: u32 = 3;
+        let metadata = primary_with_clients(
+            NoopBus,
+            users_with_topic_manager(),
+            stream_with_one_partition(),
+            TOPIC_MANAGER,
+            FIRST_CLIENT..=FIRST_CLIENT + 2,
+        );
+        metadata.set_partitions_max(PARTITIONS_MAX);
+        let consensus = metadata.consensus.as_ref().unwrap();
+        let create = |client: u128, name: &str, partitions_count: u32| {
+            metadata.prepare_request(create_topic_request_with_count(
+                client,
+                TOPIC_MANAGER,
+                WireIdentifier::numeric(0),
+                name,
+                partitions_count,
+            ))
+        };
+
+        let taken_name = create(FIRST_CLIENT, "existing", 2).unwrap();
+        consensus.pipeline_message(PlaneKind::Metadata, &taken_name);
+        assert!(
+            matches!(
+                create(FIRST_CLIENT + 1, "fresh", 1),
+                Err(IggyError::TransientNotAccepted)
+            ),
+            "a create that fits the committed partitions must wait"
+        );
+        assert!(
+            matches!(
+                create(FIRST_CLIENT + 2, "large", PARTITIONS_MAX),
+                Err(IggyError::PartitionsLimitReached)
+            ),
+            "a create past the cap on committed partitions keeps the cap error"
+        );
+
+        let op = taken_name.header().op;
+        consensus.with_pipeline_mut(|pipeline| {
+            pipeline.pop().unwrap();
+        });
+        let reply = metadata.apply_prepare(taken_name);
+        assert_ne!(iggy_binary_protocol::result_code(reply.body()), Some(0));
+        consensus.advance_commit_max(op);
+        consensus.advance_commit_min(op);
+        assert!(
+            create(FIRST_CLIENT + 1, "fresh", 1).is_ok(),
+            "the refused create must free its reservation"
         );
     }
 
