@@ -236,6 +236,7 @@ const stats = await client.system.getStats();
 `Client` and `SingleClient` report their connection lifecycle through Node.js-style `on`, `once`,
 `off` and `removeListener` methods. Each method returns the client, so calls
 can be chained. `SimpleClient` wraps an arbitrary raw client and does not expose these methods.
+The `getClient()` factory returns a `SimpleClient`, so it does not expose them either.
 
 ```ts
 client
@@ -245,12 +246,13 @@ client
   .on("end", () => console.log("client destroyed"));
 ```
 
-- `connecting` fires once for each dial: the first one, each redial after
-  a link is lost, and each dial to another cluster replica. All links share
-  the client's listeners; an event does not identify a replica. The client
-  dials lazily on its first command. Each dial is announced on the next tick,
-  so attach listeners before issuing commands or awaiting them to receive it.
-- `connected` fires when that dial is ready: TCP connected, or the TLS
+- `connecting` fires when dialing starts. Failed retries share that event
+  until a connection succeeds, including retries from later commands.
+  A subsequent dial starts a new phase. All links share this state and the
+  client's listeners; an event does not identify a replica. The client
+  dials lazily on its first command and announces the phase on the next tick.
+  Attach listeners before issuing commands or awaiting them to receive it.
+- `connected` fires when each socket is ready: TCP connected, or the TLS
   handshake done. It fires before the client logs in.
 - `error` receives each error the connection reports, for example a refused
   dial. A command that the error fails still rejects with it. Without an
@@ -258,6 +260,9 @@ client
 - `end` fires once, after `destroy()` closes every link, and no lifecycle event
   follows it. Destruction cancels requests immediately; `await client.destroy()`
   resolves after `end`. Repeated calls share that completion.
+
+The low-level `getRawClient()` keeps a synchronous `destroy()` method.
+Listen for its `end` event to wait for socket closure.
 
 ### Connection strings
 

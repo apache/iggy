@@ -128,7 +128,7 @@ export class CommandResponseStream extends EventEmitter {
   private readonly lanes: MutationLanes;
   private readonly replicas = new Map<number, ReplicaSlot>();
   private readonly connections = new Set<IggyConnection>();
-  private destroyPromise?: Promise<void>;
+  private connecting = false;
   private readonly partitionRoutes = new Map<string, CachedRoute>();
   private readonly changed = new ChangeSignal();
   private readonly lifetime = new AbortController();
@@ -738,10 +738,16 @@ export class CommandResponseStream extends EventEmitter {
     this.connections.add(connection);
     void connection.socketClosed.then(() => this.connections.delete(connection));
     connection.on('connecting', () => {
-      if (!this.lifetime.signal.aborted) this.emit('connecting');
+      if (!this.lifetime.signal.aborted && !this.connecting) {
+        this.connecting = true;
+        this.emit('connecting');
+      }
     });
     connection.on('connect', () => {
-      if (!this.lifetime.signal.aborted) this.emit('connected');
+      if (!this.lifetime.signal.aborted) {
+        this.connecting = false;
+        this.emit('connected');
+      }
     });
     connection.on('error', (error: Error) => {
       // Keep diagnostic link errors separate from EventEmitter's special
@@ -988,18 +994,20 @@ export class CommandResponseStream extends EventEmitter {
     return connection.socket;
   }
 
-  destroy(): Promise<void> {
-    if (this.destroyPromise) return this.destroyPromise;
+  destroy(): void {
+    if (this.lifetime.signal.aborted) return;
     const closed = [...this.connections].map((connection) => connection.socketClosed);
-    this.destroyPromise = Promise.all(closed).then(() => { this.emit('end'); });
+    void Promise.allSettled(closed).then(() => {
+      // Listener exceptions follow EventEmitter semantics, outside a promise chain.
+      process.nextTick(() => this.emit('end'));
+    });
     this.rememberedCredentials = undefined;
     this.lifetime.abort(new Error('client destroyed'));
     this.resetSession();
-    return this.destroyPromise;
   }
 }
 
-export function getRawClient(options: ClientConfigOrString): Omit<RawClient, 'destroy'> & { destroy: () => Promise<void> } {
+export function getRawClient(options: ClientConfigOrString): RawClient {
   return new CommandResponseStream(options);
 }
 

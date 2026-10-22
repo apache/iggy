@@ -398,16 +398,15 @@ describe('unified partition routing', () => {
     const cluster = await startPollCluster();
     const events: string[] = [];
     let connected = 0;
-    let ended: Promise<void> | undefined;
+    const ended = once(cluster.client, 'end');
     for (const event of ['connecting', 'error', 'end'])
       cluster.client.on(event, () => events.push(event));
     cluster.client.on('connected', () => {
       events.push('connected');
-      if (++connected === 2) ended = cluster.client.destroy();
+      if (++connected === 2) cluster.client.destroy();
     });
     try {
       await cluster.client.authenticate(vsrConfig(cluster.coordinator.port).credentials);
-      await waitUntil(() => ended !== undefined);
       await ended;
       const afterEnd = [...events];
       await waitUntil(() => cluster.primary.sockets.size === 0 && cluster.coordinator.sockets.size === 0);
@@ -436,7 +435,8 @@ describe('unified partition routing', () => {
       const rejected = assert.rejects(login);
       await waitUntil(() => held !== undefined);
       const { frame, socket } = held!;
-      const ended = cluster.client.destroy();
+      const ended = once(cluster.client, 'end');
+      cluster.client.destroy();
       socket.write(replyFrame(frame, Operation.NonReplicated,
         twoNodeMetadataBody(cluster.primary.port, cluster.coordinator.port)));
       await rejected;

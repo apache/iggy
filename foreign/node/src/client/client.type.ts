@@ -74,7 +74,7 @@ export type SendCommandOptions = {
  * Connection lifecycle events of a `Client`, with their listener arguments.
  */
 export type ClientEventMap = {
-  /** A dial to a cluster replica starts, including redials */
+  /** Dialing starts; retries share one event until a connection succeeds */
   connecting: [],
   /** The dialed socket is ready: TCP connected, or TLS handshake done */
   connected: [],
@@ -114,8 +114,8 @@ export type RawClient = {
    * client keeps the outcome that it proves.
    */
   abandonOperation?: (operationId: bigint) => void,
-  /** Destroys the connection; asynchronous clients resolve after socket closure. */
-  destroy: (() => void) | (() => Promise<void>),
+  /** Destroys the connection. Socket closure is reported through `end`. */
+  destroy: () => void,
   /** Tracks one facade operation across multiple command submissions. */
   hold?: () => () => void,
   /** Registers an event listener */

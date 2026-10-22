@@ -16,6 +16,7 @@
 // under the License.
 
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { once, type EventEmitter } from 'node:events';
 import { createServer, Socket, type AddressInfo, type Server } from 'node:net';
 import { setImmediate as nextTick } from 'node:timers/promises';
@@ -25,6 +26,7 @@ import { CommandResponseStream, getRawClient, NotConnectedError } from './client
 import type { ClientConfig } from './client.type.js';
 import { ResponseFrameDecoder } from './client.frame.js';
 import { ResponseError } from '../wire/error.utils.js';
+import { COMMAND_CODE } from '../wire/command.code.js';
 import { Command, HEADER_SIZE, REPLY_OFFSET, REQUEST_OFFSET } from '../wire/vsr/header.js';
 
 const startServer = async (reply = true) => {
@@ -220,7 +222,7 @@ describe('Client lifecycle events', () => {
     assert.ok(socket.destroyed);
   });
 
-  it('exposes the socket closure promise from getRawClient', async () => {
+  it('keeps raw destroy synchronous and reports socket closure through end', async () => {
     const server = await startServer();
     const raw = getRawClient(clientConfig(server.server));
     const client = new SimpleClient(raw);
@@ -229,10 +231,80 @@ describe('Client lifecycle events', () => {
       const socket = raw.getReadStream() as Socket;
       let closed = false;
       socket.once('close', () => { closed = true; });
-      const ended: Promise<void> = raw.destroy();
-      await ended.then(() => assert.ok(closed));
+      const ended = new Promise<void>((resolve) => raw.once('end', () => {
+        assert.ok(closed);
+        resolve();
+      }));
+      const result: void = raw.destroy();
+      assert.equal(result, undefined);
+      assert.ok(socket.destroyed);
+      assert.equal(raw.destroy(), undefined);
+      await ended;
     } finally {
       await raw.destroy();
+      await server.close();
+    }
+  });
+
+  it('does not turn an end listener exception into an unhandled rejection', () => {
+    const result = spawnSync(process.execPath, [
+      '--import', '@swc-node/register/esm-register', '--input-type=module', '--eval', `
+        import { CommandResponseStream } from ${JSON.stringify(new URL('./client.socket.ts', import.meta.url).href)};
+        process.on('unhandledRejection', () => process.exit(2));
+        process.once('uncaughtException', (error, origin) => {
+          process.exit(error.message === 'listener failed' && origin === 'uncaughtException' ? 0 : 3);
+        });
+        const client = new CommandResponseStream('iggy://iggy:iggy@127.0.0.1:1');
+        client.on('end', () => { throw new Error('listener failed'); });
+        client.destroy();
+        setTimeout(() => process.exit(4), 2000);
+      `
+    ], { encoding: 'utf8', timeout: 10_000 });
+    assert.equal(result.status, 0, result.stderr || String(result.error));
+  });
+
+  it('announces one connecting phase across command retries until a link succeeds', async () => {
+    const server = await startServer();
+    const config = clientConfig(server.server);
+    await server.close();
+    const client = new CommandResponseStream(config);
+    let connecting = 0;
+    let failures = 0;
+    client.on('connecting', () => { connecting += 1; });
+    client.on('connectionError', () => { failures += 1; });
+    const failThreeDials = async () => {
+      const signal = new AbortController();
+      const target = failures + 3;
+      const cancel = () => { if (failures === target) signal.abort(); };
+      client.on('connectionError', cancel);
+      try {
+        await assert.rejects(client.sendCommand(COMMAND_CODE.Ping, Buffer.alloc(0), {
+          signal: signal.signal, deadline: Date.now() + 5000
+        }));
+        assert.equal(failures, target, 'drive must retry the failed dial');
+      } finally {
+        client.off('connectionError', cancel);
+      }
+    };
+    try {
+      await failThreeDials();
+      assert.equal(connecting, 1);
+      await failThreeDials();
+      assert.equal(connecting, 1);
+      server.server.listen(config.options.port, '127.0.0.1');
+      await once(server.server, 'listening');
+      await client.sendCommand(COMMAND_CODE.Ping, Buffer.alloc(0));
+      assert.equal(connecting, 1);
+      const socket = client.getReadStream() as Socket;
+      const closed = once(socket, 'close');
+      socket.destroy();
+      await closed;
+      await client.sendCommand(COMMAND_CODE.Ping, Buffer.alloc(0));
+      assert.equal(connecting, 2);
+    } finally {
+      const ended = once(client, 'end');
+      client.destroy();
+      await ended;
       await server.close();
     }
   });
@@ -301,7 +373,7 @@ describe('Client lifecycle events', () => {
           assert.equal((error.cause as NodeJS.ErrnoException).code, 'ECONNREFUSED');
           return true;
         });
-        assert.equal(dials.length, 3);
+        assert.equal(dials.length, 1);
         assert.equal(errors.length, listen ? 1 : 0);
       } finally {
         await client.destroy();
