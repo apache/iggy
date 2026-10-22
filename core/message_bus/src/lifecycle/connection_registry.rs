@@ -383,13 +383,18 @@ where
         instance: InstanceToken,
         msg: BusMessage,
     ) -> ReplyRoute {
-        let sender = {
+        // Only a full queue clones the `Sender` to wait on it, so a reply that
+        // finds room costs no atomic RMW on the channel state.
+        let (sender, msg) = {
             let entries = self.entries.borrow();
             let Some(entry) = entries.get(&key).filter(|entry| entry.token == instance) else {
                 return ReplyRoute::NoSlot(msg);
             };
             match &entry.reply {
-                ReplyTarget::Socket(sender) => sender.clone(),
+                ReplyTarget::Socket(sender) => match sender.try_send(msg) {
+                    Err(async_channel::TrySendError::Full(msg)) => (sender.clone(), msg),
+                    sent => return ReplyRoute::Delivered(sent),
+                },
                 ReplyTarget::InProcess { .. } => return ReplyRoute::InProcess(msg),
             }
         };
@@ -1027,8 +1032,10 @@ impl ReplicaRegistry {
 mod tests {
     use super::*;
     use crate::lifecycle::Shutdown;
+    use futures::poll;
     use iggy_binary_protocol::{Command, GenericHeader, HEADER_SIZE};
     use server_common::Message;
+    use std::pin::pin;
 
     #[allow(clippy::cast_possible_truncation)]
     fn make_bus_msg() -> BusMessage {
@@ -1422,6 +1429,31 @@ mod tests {
             outcome,
             ReplyRoute::Delivered(Err(async_channel::TrySendError::Full(_)))
         ));
+    }
+
+    /// The waiting send delivers at once while the queue has room, waits on a
+    /// full queue until the writer takes a frame, and never closes it.
+    #[compio::test]
+    async fn send_to_instance_waits_only_for_a_full_queue() {
+        let reg: ConnectionRegistry<u8> = ConnectionRegistry::new();
+        let (_shutdown, token) = Shutdown::new();
+        let (tx, rx) = async_channel::bounded(1);
+        let writer = compio::runtime::spawn(std::future::pending::<()>());
+        let reader = spawn_dummy_reader(token);
+        let instance = reg
+            .insert(1u8, tx, writer, reader, dummy_conn_shutdown())
+            .expect("insert ok");
+
+        assert!(matches!(
+            reg.send_to_instance(1u8, instance, make_bus_msg()).await,
+            ReplyRoute::Delivered(Ok(()))
+        ));
+        let mut waiting = pin!(reg.send_to_instance(1u8, instance, make_bus_msg()));
+        assert!(poll!(waiting.as_mut()).is_pending());
+        rx.recv().await.expect("the first reply is queued");
+        assert!(matches!(waiting.await, ReplyRoute::Delivered(Ok(()))));
+        assert_eq!(rx.len(), 1);
+        assert!(!rx.is_closed());
     }
 
     /// A refused reply leaves its request unanswered, so the refusal must
