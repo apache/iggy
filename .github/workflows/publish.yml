@@ -74,6 +74,7 @@ permissions:
 concurrency:
   group: publish-release
   cancel-in-progress: false
+  queue: max
 
 jobs:
   validate:
@@ -178,13 +179,12 @@ jobs:
     runs-on: ubuntu-26.04
     outputs:
       targets: ${{ steps.mk.outputs.targets }}
-      non_rust_targets: ${{ steps.mk.outputs.non_rust_targets }}
+      crates: ${{ steps.mk.outputs.crates }}
       non_docker_targets: ${{ steps.mk.outputs.non_docker_targets }}
       docker_matrix: ${{ steps.mk.outputs.docker_matrix }}
       docker_components: ${{ steps.mk.outputs.docker_components }}
       count: ${{ steps.mk.outputs.count }}
       has_python: ${{ steps.mk.outputs.has_python }}
-      has_rust_crates: ${{ steps.mk.outputs.has_rust_crates }}
       has_docker: ${{ steps.mk.outputs.has_docker }}
     steps:
       - name: Download latest copy script from master
@@ -223,13 +223,24 @@ jobs:
           fi
           echo "components_b64=$(yq -o=json -I=0 '.components' .github/config/publish.yml | base64 -w0)" >> "$GITHUB_OUTPUT"
 
+      - name: Cache Cargo metadata
+        if: inputs.create_edge_docker_tag && !inputs.skip_tag_creation && inputs.publish_crates != ''
+        env:
+          IGGY_CARGO_METADATA_FILE: ${{ runner.temp }}/iggy-cargo-metadata.json
+        run: |
+          cargo metadata --format-version 1 --no-deps > "$IGGY_CARGO_METADATA_FILE"
+          echo "IGGY_CARGO_METADATA_FILE=$IGGY_CARGO_METADATA_FILE" >> "$GITHUB_ENV"
+
       - name: Build matrix from inputs
         id: mk
         uses: actions/github-script@v9
         with:
           script: |
+            const { execFileSync } = require('node:child_process');
             const componentsB64 = '${{ steps.cfg.outputs.components_b64 }}';
             const cfg = JSON.parse(Buffer.from(componentsB64, 'base64').toString('utf-8') || "{}");
+            const skipReleased = '${{ inputs.create_edge_docker_tag }}' === 'true' &&
+              '${{ inputs.skip_tag_creation }}' !== 'true';
 
             const wants = [];
 
@@ -265,9 +276,7 @@ jobs:
             }[entry.registry] || 'unknown');
 
             const targets = [];
-            const nonRustTargets = [];
             const seen = new Set();
-            let hasRustCrates = false;
 
             for (const key of wants) {
               if (seen.has(key)) continue;
@@ -275,6 +284,22 @@ jobs:
 
               const entry = cfg[key];
               if (!entry) { core.warning(`Component '${key}' not found in publish.yml`); continue; }
+
+              // A queued dispatch can contain releases completed by the previous publisher.
+              if (skipReleased && entry.registry !== 'dockerhub') {
+                const shouldTag = execFileSync('bash',
+                  ['scripts/extract-version.sh', key, '--should-tag'], { encoding: 'utf-8' }).trim();
+                if (shouldTag === 'true') {
+                  const tag = execFileSync('bash',
+                    ['scripts/extract-version.sh', key, '--tag'], { encoding: 'utf-8' }).trim();
+                  const remoteTag = execFileSync('git',
+                    ['ls-remote', '--tags', 'origin', `refs/tags/${tag}`], { encoding: 'utf-8' }).trim();
+                  if (remoteTag) {
+                    core.info(`Skipping ${key}: ${tag} is already released`);
+                    continue;
+                  }
+                }
+              }
 
               const target = {
                 key,
@@ -291,17 +316,10 @@ jobs:
               };
 
               targets.push(target);
-
-              // Separate Rust crates from other targets
-              if (target.type === 'rust') {
-                hasRustCrates = true;
-                // Rust crates are handled by the sequential job
-              } else {
-                nonRustTargets.push(target);
-              }
             }
 
             // Separate Docker targets from other non-Rust targets
+            const nonRustTargets = targets.filter(t => t.type !== 'rust');
             const dockerTargets = nonRustTargets.filter(t => t.type === 'docker');
             const nonDockerTargets = nonRustTargets.filter(t => t.type !== 'docker');
 
@@ -313,8 +331,7 @@ jobs:
             // Output all targets for reference and tag creation
             core.setOutput('targets', JSON.stringify(targets.length ? { include: targets } : { include: [{ key: 'noop', type: 'noop' }] }));
 
-            // Output only non-Rust targets for the parallel publish job
-            core.setOutput('non_rust_targets', JSON.stringify(nonRustTargets.length ? { include: nonRustTargets } : { include: [{ key: 'noop', type: 'noop' }] }));
+            core.setOutput('crates', targets.filter(t => t.type === 'rust').map(t => t.key).join(','));
 
             // Output non-Docker, non-Rust targets (SDKs only)
             core.setOutput('non_docker_targets', JSON.stringify(nonDockerTargets.length ? { include: nonDockerTargets } : { include: [{ key: 'noop', type: 'noop' }] }));
@@ -337,7 +354,6 @@ jobs:
             core.setOutput('has_docker', String(dockerTargets.length > 0));
 
             core.setOutput('count', String(targets.length));
-            core.setOutput('has_rust_crates', String(hasRustCrates));
 
             // Check if Python SDK is in targets and extract version
             const pythonTarget = targets.find(t => t.key === 'sdk-python');
@@ -349,7 +365,7 @@ jobs:
             }
 
   check-tags:
-    name: Check existing tags
+    name: Existing tags
     needs: [validate, plan]
     if: needs.validate.outputs.has_targets == 'true' && fromJson(needs.plan.outputs.targets).include[0].key != 'noop'
     runs-on: ubuntu-26.04
@@ -651,13 +667,13 @@ jobs:
     needs: [validate, plan, check-tags]
     if: |
       needs.validate.outputs.has_targets == 'true' &&
-      contains(inputs.publish_crates, 'rust-')
+      needs.plan.outputs.crates != ''
     uses: ./.github/workflows/_publish_rust_crates.yml
     permissions:
       contents: write
       id-token: write
     with:
-      crates: ${{ inputs.publish_crates }}
+      crates: ${{ needs.plan.outputs.crates }}
       dry_run: ${{ inputs.dry_run }}
       commit: ${{ needs.validate.outputs.commit }}
       use_latest_ci: ${{ inputs.use_latest_ci }}
@@ -1026,11 +1042,7 @@ jobs:
         run: |
           test -x scripts/extract-version.sh || chmod +x scripts/extract-version.sh
 
-      # matrix.type == 'rust' is dead: Rust crates are routed to the
-      # dedicated publish-rust-crates reusable workflow and never reach
-      # this SDK matrix (see plan job's hasRustCrates split at L349-354).
-      # Python uses maturin which depends on Rust, so python rows still
-      # need the toolchain.
+      # Python's maturin build needs the Rust toolchain.
       - name: Setup Rust toolchain (if needed)
         if: matrix.type == 'python'
         uses: ./.github/actions/utils/setup-rust
@@ -1484,7 +1496,7 @@ jobs:
         summary,
       ]
     if: failure() && inputs.dry_run == false
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-slim
     steps:
       - name: Notify failure
         run: |
