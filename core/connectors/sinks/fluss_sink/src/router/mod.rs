@@ -131,25 +131,6 @@ mod tests {
     }
 
     #[test]
-    fn given_writer_error_when_routed_should_preserve_connector_variant() {
-        for expected in [
-            ConnectorError::SchemaMismatch("incompatible columns".into()),
-            ConnectorError::InvalidConfigValue("invalid acks".into()),
-            ConnectorError::InvalidRecordValue("null key".into()),
-            ConnectorError::Connection("disconnected".into()),
-            ConnectorError::CannotStoreData("backpressure".into()),
-            ConnectorError::InitError("not initialized".into()),
-        ] {
-            let direct = Error::WriterError(WriterError::Connector(expected.clone()));
-            let catalog = Error::SchemaCatalog(schema_catalog::Error::Writer(
-                WriterError::Connector(expected.clone()),
-            ));
-            assert_eq!(ConnectorError::from(direct), expected);
-            assert_eq!(ConnectorError::from(catalog), expected);
-        }
-    }
-
-    #[test]
     fn given_invalid_table_when_routed_should_return_schema_mismatch_with_context() {
         let writer_error = WriterError::CreateTable {
             table_path: TablePath::new("fluss", "orders"),

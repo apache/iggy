@@ -16,7 +16,7 @@
 // under the License.
 
 use std::{
-    fmt::{self, Display, Formatter},
+    fmt::{self},
     sync::Arc,
     time::Duration,
 };
@@ -36,8 +36,6 @@ use crate::ResolvedFlussSinkConfig;
 
 #[derive(Debug, Error)]
 pub(crate) enum WriterError {
-    #[error(transparent)]
-    Connector(ConnectorError),
     #[error("Fluss connection is not initialized")]
     ConnectionNotInitialized,
     #[error("Failed to connect to Fluss: {source}")]
@@ -111,17 +109,10 @@ pub(crate) enum WriterError {
     },
 }
 
-impl From<ConnectorError> for WriterError {
-    fn from(error: ConnectorError) -> Self {
-        Self::Connector(error)
-    }
-}
-
 impl From<WriterError> for ConnectorError {
     fn from(error: WriterError) -> Self {
         let message = error.to_string();
         match error {
-            WriterError::Connector(source) => source,
             WriterError::ConnectionNotInitialized | WriterError::Connect { .. } => {
                 Self::InitError(message)
             }
@@ -263,12 +254,6 @@ pub struct FlussWriter {
     config: ResolvedFlussSinkConfig,
 }
 
-impl Display for FlussWriter {
-    fn fmt(&self, formatter: &mut Formatter) -> std::fmt::Result {
-        write!(formatter, "FlussWriter")
-    }
-}
-
 impl fmt::Debug for FlussWriter {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -402,52 +387,11 @@ impl FlussWriter {
             .ok_or(WriterError::ConnectionNotInitialized)
     }
 
-    async fn get_table_by_path(
-        &self,
-        table_path: &TablePath,
-    ) -> Result<FlussTable<'_>, WriterError> {
-        let connection = self.get_connection()?;
-
-        // The fluss get table API at the moment, doesn't return a specific error for table not
-        // found, so we need to check if the table exists first.
-        let table_id = connection
-            .get_metadata()
-            .fetch_table_id(table_path)
-            .await
-            .map_err(|source| WriterError::GetTableFailed {
-                table_path: table_path.clone(),
-                source: Box::new(source),
-            })?;
-
-        if table_id.is_none() {
-            return Err(WriterError::TableNotFound {
-                table_path: table_path.clone(),
-            });
-        }
-
-        connection
-            .get_table(table_path)
-            .await
-            .map_err(|source| match source {
-                FlussError::FlussAPIError { api_error }
-                    if api_error.code == fluss::rpc::FlussError::TableNotExist.code() =>
-                {
-                    WriterError::TableNotFound {
-                        table_path: table_path.clone(),
-                    }
-                }
-                _ => WriterError::GetTableFailed {
-                    table_path: table_path.clone(),
-                    source: Box::new(source),
-                },
-            })
-    }
-
     async fn create_append_writer(
         &self,
         table_path: &TablePath,
     ) -> Result<AppendWriter, WriterError> {
-        let table = self.get_table_by_path(table_path).await?;
+        let table = self.get_table(table_path).await?;
         table
             .new_append()
             .map_err(|source| WriterError::CreateAppender {
@@ -465,7 +409,7 @@ impl FlussWriter {
         &self,
         table_path: &TablePath,
     ) -> Result<UpsertWriter, WriterError> {
-        let table = self.get_table_by_path(table_path).await?;
+        let table = self.get_table(table_path).await?;
         table
             .new_upsert()
             .map_err(|source| WriterError::CreateWriter {
@@ -552,7 +496,41 @@ impl TableWriter for FlussWriter {
     }
 
     async fn get_table(&self, table_path: &TablePath) -> Result<FlussTable<'_>, WriterError> {
-        self.get_table_by_path(table_path).await
+        let connection = self.get_connection()?;
+
+        // The fluss get table API at the moment, doesn't return a specific error for table not
+        // found, so we need to check if the table exists first.
+        let table_id = connection
+            .get_metadata()
+            .fetch_table_id(table_path)
+            .await
+            .map_err(|source| WriterError::GetTableFailed {
+                table_path: table_path.clone(),
+                source: Box::new(source),
+            })?;
+
+        if table_id.is_none() {
+            return Err(WriterError::TableNotFound {
+                table_path: table_path.clone(),
+            });
+        }
+
+        connection
+            .get_table(table_path)
+            .await
+            .map_err(|source| match source {
+                FlussError::FlussAPIError { api_error }
+                    if api_error.code == fluss::rpc::FlussError::TableNotExist.code() =>
+                {
+                    WriterError::TableNotFound {
+                        table_path: table_path.clone(),
+                    }
+                }
+                _ => WriterError::GetTableFailed {
+                    table_path: table_path.clone(),
+                    source: Box::new(source),
+                },
+            })
     }
 }
 
@@ -638,15 +616,6 @@ mod tests {
         assert!(
             matches!(error, WriterError::CreateColumnarRow { table_path, .. } if table_path == table)
         );
-    }
-
-    #[test]
-    fn given_connector_error_when_converting_should_preserve_original_variant() {
-        let expected = ConnectorError::InvalidConfigValue("invalid value".to_string());
-
-        let actual: ConnectorError = WriterError::Connector(expected.clone()).into();
-
-        assert_eq!(actual, expected);
     }
 
     #[test]

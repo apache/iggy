@@ -95,21 +95,6 @@ impl From<FlussError> for Error {
     }
 }
 
-impl From<Error> for IggyError {
-    fn from(error: Error) -> Self {
-        let message = error.to_string();
-        match error {
-            Error::Fluss(_) => Self::CannotStoreData(message),
-            Error::InvalidPayloadUtf8 { .. }
-            | Error::PayloadFormatNotSupported { .. }
-            | Error::RecordBatchCreation { .. } => Self::Serialization(message),
-            Error::TimestampConversion { .. }
-            | Error::PayloadBytesConversion { .. }
-            | Error::UnsupportedColumn { .. } => Self::InvalidRecordValue(message),
-        }
-    }
-}
-
 struct ConvertedMessage {
     message_id: u128,
     id: String,

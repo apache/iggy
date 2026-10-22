@@ -110,15 +110,9 @@ pub struct FlussCluster {
     #[allow(dead_code)]
     tablet_server: ContainerAsync<GenericImage>,
     pub coordinator_address: String,
-    #[allow(dead_code)]
-    pub fluss_version: String,
 }
 
 impl FlussCluster {
-    pub async fn new(fluss_version: &str) -> Result<Self, TestBinaryError> {
-        Self::start(fluss_version).await
-    }
-
     pub async fn get_connection(&self) -> Result<FlussConnection, TestBinaryError> {
         let config = fluss::config::Config {
             bootstrap_servers: self.coordinator_address.clone(),
@@ -157,7 +151,7 @@ impl FlussCluster {
         }
     }
 
-    async fn start(fluss_version: &str) -> Result<Self, TestBinaryError> {
+    pub async fn new(fluss_version: &str) -> Result<Self, TestBinaryError> {
         let network = fixtures::unique_container_name("fluss-network");
         let zookeeper_name = fixtures::unique_container_name("fluss-zookeeper");
         let coordinator_name = fixtures::unique_container_name("fluss-coordinator");
@@ -210,7 +204,6 @@ impl FlussCluster {
         configure_fluss_server(&tablet_server, &tablet_properties).await?;
 
         let result = Self {
-            fluss_version: fluss_version.to_string(),
             zookeeper,
             coordinator_server,
             tablet_server,
