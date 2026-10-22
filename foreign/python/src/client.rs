@@ -353,7 +353,7 @@ impl IggyClient {
             return Err(PyValueError::new_err("snapshot_types must not be empty"));
         }
 
-        let mut parsed_types = Vec::with_capacity(snapshot_types.len().min(7));
+        let mut parsed_types = Vec::with_capacity(snapshot_types.len());
         for snapshot_type in snapshot_types {
             let parsed =
                 SystemSnapshotType::from_str(snapshot_type.trim()).map_err(to_value_error)?;
