@@ -70,7 +70,7 @@ public final class ConsensusSession {
     private long refusedLineage;
     private long metadataWatermark;
     private boolean shared;
-    private ConsensusSession parent;
+    private volatile ConsensusSession parent;
     private final Map<LaneKey, Ticket> lanes = new HashMap<>();
     private final Map<LaneKey, ArrayDeque<CompletableFuture<Ticket>>> laneAdmissions = new HashMap<>();
     private final Map<Long, Ticket> retained = new HashMap<>();
@@ -396,11 +396,12 @@ public final class ConsensusSession {
         return parent == null ? clientIdHigh : parent.clientIdHigh();
     }
 
+    /**
+     * Takes no monitor. A link that holds its session waits for the owner, so a caller that holds the owner and
+     * resolves the owner of another link, for the lineage of a call that started there, must not wait for that link.
+     */
     public ConsensusSession owner() {
-        ConsensusSession numbering;
-        synchronized (this) {
-            numbering = parent;
-        }
+        ConsensusSession numbering = parent;
         return numbering == null ? this : numbering.owner();
     }
 
