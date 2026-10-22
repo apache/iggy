@@ -2265,6 +2265,26 @@ where
         }
     }
 
+    /// Whether the WAL still certifies `log_view` over this journal. A truncation
+    /// clears the certificate at once. An entry of a later view clears it when
+    /// the WAL writes that entry, and before that the journal already holds a log
+    /// that `log_view` does not name.
+    #[must_use]
+    pub fn wal_keeps_log_view(&self) -> bool {
+        let Some(persistence) = &self.persistence else {
+            return true;
+        };
+        let log_view = self.consensus.log_view();
+        let journal = &self.log.journal().inner;
+        let floor = self.consensus.commit_min().max(journal.evicted_through());
+        persistence.certified_log_view() == Some(log_view)
+            && journal.last_op().is_none_or(|last| {
+                (floor.saturating_add(1)..=last)
+                    .filter_map(|op| journal.header_by_op(op))
+                    .all(|header| header.view <= log_view)
+            })
+    }
+
     fn ensure_wal_view(&self) -> bool {
         let Some(persistence) = &self.persistence else {
             return true;

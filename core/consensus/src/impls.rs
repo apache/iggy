@@ -1420,7 +1420,13 @@ where
     log_view_proven: Cell<u32>,
     /// The proven journal is a primary-elect's merge while `log_view` still names
     /// an older view. Set when the proof settles, cleared when the view starts.
+    /// If the merge cleared the WAL certificate of a partition, a superseding
+    /// view change clears it too (`unprove_superseded_merge`).
     view_log_merged: Cell<bool>,
+    /// The settled merge cleared the WAL certificate of `log_view`. Only the
+    /// partition plane reports it. The proof settling resets it, and nothing
+    /// reads it unless `view_log_merged` holds.
+    view_log_merge_uncertified: Cell<bool>,
     /// The prefix below a repair gap is unknown; entries above it can be proven.
     view_log_unproven_through: Cell<u64>,
     /// Set only after adoption has removed the superseded tail.
@@ -1815,6 +1821,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             view_log_unproven: Cell::new(false),
             log_view_proven: Cell::new(0),
             view_log_merged: Cell::new(false),
+            view_log_merge_uncertified: Cell::new(false),
             view_log_unproven_through: Cell::new(u64::MAX),
             view_log_missing_op: Cell::new(None),
             history_certificate: Cell::new(empty_history),
@@ -2896,9 +2903,10 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     }
 
     /// This replica's suffix snapshot, or an empty one when none matches the log's
-    /// current head and commit point. Empty is the safe direction: it nacks nothing
-    /// and offers no bodies, so it can only stall a view change, never authorise a
-    /// truncation.
+    /// current head and commit point. Empty nacks nothing and offers no bodies,
+    /// but it does not abstain either. From a canonical sender it lets every
+    /// lower-`log_view` copy of an op count as a nack (`tally_op`), which can
+    /// truncate. So the shard refreshes the snapshot before every vote.
     #[must_use]
     pub fn local_dvc_suffix(&self) -> DvcSuffix {
         let tag = self.local_dvc_suffix_tag();
@@ -3241,6 +3249,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.view.set(new_view);
         self.status.set(Status::ViewChange);
         self.reset_view_change_state();
+        self.unprove_superseded_merge();
         self.sent_own_start_view_change.set(true);
         self.start_view_change_from_all_replicas
             .borrow_mut()
@@ -4495,9 +4504,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         let new_op = merged.op_head;
         self.advance_commit_max(max_commit);
         *self.pending_view_log.borrow_mut() = Some(merged);
-        self.mark_view_log_unproven();
-        self.view_log_unproven_through.set(u64::MAX);
-        self.view_log_missing_op.set(None);
+        self.reopen_view_log_proof();
 
         // Stale pipeline entries are invalid in new view; reconciliation
         // replays from journal.
@@ -4561,10 +4568,12 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
     /// The log the last adopted `StartView` announced, while this replica's
     /// journal does not hold it yet. Unlike the parked copy it survives view
-    /// changes, and it is never this replica's own merge.
+    /// changes, and it is never this replica's own merge. A settled merge that
+    /// cleared the WAL certificate reads as unproven here
+    /// (`uncertified_merge_settled`).
     #[must_use]
     pub fn adopted_view_log(&self) -> Option<MergedLog> {
-        self.view_log_unproven()
+        (self.view_log_unproven() || self.uncertified_merge_settled())
             .then(|| {
                 self.adopted_view
                     .borrow()
@@ -4630,7 +4639,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
     /// Whether the proven journal is a primary-elect's merge that `log_view` does
     /// not name yet. A replica superseded before it starts the view keeps the
-    /// merge under its older `log_view` until a later proof settles.
+    /// merge under its older `log_view` until a later proof settles. Only a
+    /// partition whose merge cleared the WAL certificate goes back to unproven.
     #[must_use]
     pub const fn view_log_merged(&self) -> bool {
         self.view_log_merged.get()
@@ -4639,9 +4649,18 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     pub fn settle_view_log_proof(&self) {
         self.view_log_unproven.set(false);
         self.view_log_merged.set(self.is_primary_elect());
+        self.view_log_merge_uncertified.set(false);
         if self.group != METADATA_GROUP {
             self.log_view_proven.set(self.log_view.get());
         }
+        self.invalidate_local_dvc_suffix();
+    }
+
+    /// The merge that just settled cleared the WAL certificate of `log_view`, by
+    /// a truncation or by an entry of a later view. A superseding view change
+    /// then makes this replica unproven, so the snapshot follows that rule now.
+    pub fn note_uncertified_merge(&self) {
+        self.view_log_merge_uncertified.set(true);
         self.invalidate_local_dvc_suffix();
     }
 
@@ -4652,6 +4671,43 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             self.log_view_proven.set(self.log_view.get());
         }
         self.view_log_unproven.set(true);
+    }
+
+    /// Unproven above `commit_min`, with no gap named until the shard runs the
+    /// proof again.
+    fn reopen_view_log_proof(&self) {
+        self.mark_view_log_unproven();
+        self.view_log_unproven_through.set(u64::MAX);
+        self.view_log_missing_op.set(None);
+    }
+
+    /// A partition primary-elect whose proven merge cleared the WAL certificate of
+    /// `log_view`, before the view starts. Its DVC snapshot is built as if
+    /// unproven: a superseding view change makes it unproven and votes with the
+    /// snapshot taken before.
+    const fn uncertified_merge_settled(&self) -> bool {
+        self.group != METADATA_GROUP
+            && self.view_log_merged.get()
+            && self.view_log_merge_uncertified.get()
+            && !self.view_log_unproven.get()
+    }
+
+    /// The journal holds a merge that no view started, and the merge cleared the
+    /// WAL certificate of `log_view`. The superblock gate then refuses every
+    /// write. Go back to the state of an elect superseded before its proof
+    /// settled, whose superblock records the older claim with no certificate.
+    /// An elect whose WAL still certifies `log_view` stays proven and votes with
+    /// its merged journal, which is also what a restart from that WAL restores.
+    ///
+    /// The snapshot stays. It was built over this same range and stitch
+    /// (`uncertified_merge_settled`), and the vote this handler may cast reads it
+    /// before the shard can refresh it. An empty suffix from a canonical sender
+    /// lets every lower-`log_view` copy count as a nack (`tally_op`).
+    fn unprove_superseded_merge(&self) {
+        if self.uncertified_merge_settled() {
+            self.view_log_merged.set(false);
+            self.reopen_view_log_proof();
+        }
     }
 
     pub fn fence_view_log(&self, op: u64, unproven_through: u64) {
@@ -4684,6 +4740,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     pub const fn view_log_unproven_range(&self) -> std::ops::RangeInclusive<u64> {
         self.commit_min().saturating_add(1)..=if self.view_log_unproven() {
             self.view_log_unproven_through.get()
+        } else if self.uncertified_merge_settled() {
+            u64::MAX
         } else {
             0
         }
@@ -8236,15 +8294,24 @@ mod adopted_view_claim_tests {
     const OLD_PRIMARY: u8 = 1;
     /// Committed in `OLD_VIEW`; the backup never receives its body.
     const HEAD: u64 = 26;
+    /// The view whose primary-elect the backup becomes.
+    const MERGED_VIEW: u32 = ADOPTED_VIEW + 1;
+    /// Every group but metadata's runs the partition rules.
+    const PARTITION_GROUP: u64 = 0;
 
-    /// Hash-chained prepare headers for ops `1..=HEAD`, indexed by op.
+    /// Hash-chained metadata prepare headers for ops `1..=HEAD`, indexed by op.
     fn history() -> Vec<PrepareHeader> {
+        history_in(METADATA_GROUP)
+    }
+
+    /// [`history`] in `group`.
+    fn history_in(group: u64) -> Vec<PrepareHeader> {
         let mut headers = vec![PrepareHeader::default()];
         for op in 1..=HEAD {
             let mut header = PrepareHeader {
                 command: Command::Prepare,
                 cluster: 1,
-                group: METADATA_GROUP,
+                group,
                 timestamp: op,
                 operation: Operation::CreateStream,
                 size: u32::try_from(size_of::<PrepareHeader>()).unwrap(),
@@ -8271,37 +8338,64 @@ mod adopted_view_claim_tests {
         DvcSuffix::new(headers, 0, present)
     }
 
-    /// A backup in normal status at `OLD_VIEW` whose journal ends at `head`.
+    fn plane_of(group: u64) -> PlaneKind {
+        if group == METADATA_GROUP {
+            PlaneKind::Metadata
+        } else {
+            PlaneKind::Partitions
+        }
+    }
+
+    /// A metadata backup in normal status at `OLD_VIEW` whose journal ends at `head`.
     fn backup_at(log_view: u32, view: u32, head: u64, commit: u64) -> VsrConsensus<NoopBus> {
-        let mut consensus =
-            VsrConsensus::new(1, BACKUP, 3, METADATA_GROUP, NoopBus, LocalPipeline::new());
+        backup_in(METADATA_GROUP, log_view, view, head, commit)
+    }
+
+    /// [`backup_at`] in `group`.
+    fn backup_in(
+        group: u64,
+        log_view: u32,
+        view: u32,
+        head: u64,
+        commit: u64,
+    ) -> VsrConsensus<NoopBus> {
+        let mut consensus = VsrConsensus::new(1, BACKUP, 3, group, NoopBus, LocalPipeline::new());
         consensus.restore_view(ViewRestore {
             durable_view: Some((view, log_view)),
             view_fallback: None,
             seed_view: None,
         });
-        consensus.restore_history(
-            HistoryRecovery::Certified {
-                view: log_view,
-                truncate_from: None,
-            },
-            (head, 0),
-            None,
-        );
+        // A partition binds its history in the partition journal instead.
+        if group == METADATA_GROUP {
+            consensus.restore_history(
+                HistoryRecovery::Certified {
+                    view: log_view,
+                    truncate_from: None,
+                },
+                (head, 0),
+                None,
+            );
+        }
         consensus.init_as_backup();
         consensus.sequencer().set_sequence(head);
         consensus.restore_commit_state(commit, commit);
         consensus
     }
 
-    /// Adopt the view-11 `StartView` (head `HEAD`, commit `HEAD - 1`) with the
-    /// journal still ending at op 23.
+    /// Adopt the view-11 `StartView` (head `HEAD`, commit `HEAD - 1`) in the group
+    /// of `history`, with the journal still ending at op 23.
     fn adopt_unrepaired(history: &[PrepareHeader]) -> VsrConsensus<NoopBus> {
-        let backup = backup_at(OLD_VIEW, OLD_VIEW, 23, 22);
+        let group = at(history, HEAD).group;
+        let backup = backup_in(group, OLD_VIEW, OLD_VIEW, 23, 22);
         let suffix = [at(history, HEAD), at(history, HEAD - 1)];
+        let start_view = make_start_view(ADOPTED_VIEW, HEAD, HEAD - 1, ADOPTED_VIEW_PRIMARY, 0);
+        let original = *start_view.header();
+        let start_view = start_view.transmute_header(|_, header: &mut StartViewHeader| {
+            *header = StartViewHeader { group, ..original };
+        });
         backup.handle_start_view(
-            PlaneKind::Metadata,
-            make_start_view(ADOPTED_VIEW, HEAD, HEAD - 1, ADOPTED_VIEW_PRIMARY, 0).header(),
+            plane_of(group),
+            start_view.header(),
             bytemuck::cast_slice(&suffix),
         );
         assert_eq!(backup.log_view(), ADOPTED_VIEW);
@@ -8526,63 +8620,149 @@ mod adopted_view_claim_tests {
         assert_eq!(restarted.status(), Status::Recovering);
     }
 
-    #[test]
-    fn given_a_proven_merge_when_the_elect_is_superseded_should_stay_marked_until_a_view_starts() {
-        const ELECTED_VIEW: u32 = ADOPTED_VIEW + 1;
-        let history = history();
-        let elect = || {
-            let backup = adopt_unrepaired(&history);
-            // What the plane's reconcile does once the journal matches the parked headers.
-            backup.settle_view_log_proof();
-            assert!(
-                !backup.view_log_merged(),
-                "a backup proves the log its log_view names"
-            );
-            backup.enter_view_change(
-                PlaneKind::Metadata,
-                ELECTED_VIEW,
-                ViewChangeReason::ReceivedStartViewChange,
-            );
-            let peer = StoredDvc {
-                replica: OLD_PRIMARY,
-                log_view: ADOPTED_VIEW,
-                op: HEAD,
-                commit: HEAD - 1,
-                suffix: held(&history, HEAD - 1, HEAD),
-            };
-            for dvc in [dvc_of(&backup), peer] {
-                assert!(dvc_record(
-                    &mut backup.do_view_change_from_all_replicas.borrow_mut(),
-                    dvc
-                ));
-            }
-            assert!(
-                backup
-                    .complete_view_change_as_primary(PlaneKind::Metadata)
-                    .is_empty()
-            );
-            assert!(backup.is_primary_elect());
-            backup.settle_view_log_proof();
-            assert!(backup.view_log_merged());
-            backup
-        };
-
-        let superseded = elect();
-        superseded.enter_view_change(
-            PlaneKind::Metadata,
-            ELECTED_VIEW + 1,
+    /// The `MERGED_VIEW` primary-elect once its journal holds the merge of its own
+    /// and the view-10 primary's logs, in the group of `history`. The view has
+    /// not started.
+    fn proven_merge_elect(history: &[PrepareHeader]) -> VsrConsensus<NoopBus> {
+        let plane = plane_of(at(history, HEAD).group);
+        let backup = adopt_unrepaired(history);
+        // What the plane's reconcile does once the journal matches the parked headers.
+        backup.settle_view_log_proof();
+        assert!(
+            !backup.view_log_merged(),
+            "a backup proves the log its log_view names"
+        );
+        backup.enter_view_change(
+            plane,
+            MERGED_VIEW,
             ViewChangeReason::ReceivedStartViewChange,
         );
-        assert!(!superseded.is_primary_elect());
+        let peer = StoredDvc {
+            replica: OLD_PRIMARY,
+            log_view: ADOPTED_VIEW,
+            op: HEAD,
+            commit: HEAD - 1,
+            suffix: held(history, HEAD - 1, HEAD),
+        };
+        for dvc in [dvc_of(&backup), peer] {
+            assert!(dvc_record(
+                &mut backup.do_view_change_from_all_replicas.borrow_mut(),
+                dvc
+            ));
+        }
+        assert!(backup.complete_view_change_as_primary(plane).is_empty());
+        assert!(backup.is_primary_elect());
+        backup.settle_view_log_proof();
+        assert!(backup.view_log_merged());
+        backup
+    }
+
+    #[test]
+    fn given_a_proven_merge_when_the_elect_is_superseded_should_unprove_only_an_uncertified_partition_merge()
+     {
+        const SUPERSEDING_VIEW: u32 = MERGED_VIEW + 1;
+        let partition = proven_merge_elect(&history_in(PARTITION_GROUP));
+        // What the partition reconcile reports once the merge cleared the WAL certificate.
+        partition.note_uncertified_merge();
+        partition.enter_view_change(
+            PlaneKind::Partitions,
+            SUPERSEDING_VIEW,
+            ViewChangeReason::ReceivedStartViewChange,
+        );
+        assert!(!partition.is_primary_elect());
+        assert!(!partition.view_log_merged());
         assert!(
-            superseded.view_log_merged(),
-            "log_view {ADOPTED_VIEW} would name a journal that holds the view-{ELECTED_VIEW} merge"
+            partition.view_log_unproven(),
+            "log_view {ADOPTED_VIEW} would name a journal that holds the view-{MERGED_VIEW} merge"
+        );
+        assert_eq!(partition.log_view_claim(), ADOPTED_VIEW);
+        assert_eq!(
+            partition.view_log_unproven_range(),
+            partition.commit_min() + 1..=u64::MAX
+        );
+        assert_eq!(
+            partition.view_log_repair_op(),
+            None,
+            "the proven merge has no gap to repair"
         );
 
-        let started = elect();
-        started.start_pending_view(PlaneKind::Metadata);
-        assert_eq!(started.log_view(), ELECTED_VIEW);
-        assert!(!started.view_log_merged());
+        // A partition whose WAL still certifies log_view votes with its merged
+        // journal, as a restart from that WAL restores it. Metadata claims through
+        // its history certificate, whatever the WAL reports.
+        for (group, uncertified) in [(PARTITION_GROUP, false), (METADATA_GROUP, true)] {
+            let elect = proven_merge_elect(&history_in(group));
+            if uncertified {
+                elect.note_uncertified_merge();
+            }
+            elect.enter_view_change(
+                plane_of(group),
+                SUPERSEDING_VIEW,
+                ViewChangeReason::ReceivedStartViewChange,
+            );
+            assert!(!elect.is_primary_elect());
+            assert!(elect.view_log_merged(), "group {group}");
+            assert!(!elect.view_log_unproven(), "group {group}");
+            assert!(elect.view_log_unproven_range().is_empty(), "group {group}");
+        }
+
+        for group in [PARTITION_GROUP, METADATA_GROUP] {
+            let started = proven_merge_elect(&history_in(group));
+            started.start_pending_view(plane_of(group));
+            assert_eq!(started.log_view(), MERGED_VIEW);
+            assert!(!started.view_log_merged());
+        }
+    }
+
+    #[test]
+    fn given_an_uncertified_partition_merge_when_a_start_view_change_supersedes_it_should_vote_with_the_snapshot_taken_before()
+     {
+        const SUPERSEDING_VIEW: u32 = MERGED_VIEW + 1;
+        let elect = proven_merge_elect(&history_in(PARTITION_GROUP));
+        assert!(
+            elect.view_log_unproven_range().is_empty() && elect.adopted_view_log().is_none(),
+            "a merge that kept the WAL certificate offers its journal in the snapshot"
+        );
+        elect.note_uncertified_merge();
+        // The shard reads both to snapshot the suffix this replica will vote with.
+        assert_eq!(
+            elect.view_log_unproven_range(),
+            elect.commit_min() + 1..=u64::MAX,
+            "the snapshot must not offer the merge under log_view {ADOPTED_VIEW}"
+        );
+        let stitched = elect
+            .adopted_view_log()
+            .expect("the snapshot must stitch the adopted log, as once superseded")
+            .headers;
+        elect.set_local_dvc_suffix(DvcSuffix::new(stitched.clone(), 0, 0));
+
+        let start_view_change =
+            Message::<StartViewChangeHeader>::new(size_of::<StartViewChangeHeader>())
+                .transmute_header(|_, header: &mut StartViewChangeHeader| {
+                    header.command = Command::StartViewChange;
+                    header.cluster = 1;
+                    header.replica = OLD_PRIMARY;
+                    header.view = SUPERSEDING_VIEW;
+                    header.group = PARTITION_GROUP;
+                    header.size = u32::try_from(size_of::<StartViewChangeHeader>()).unwrap();
+                    header.seal();
+                });
+        let actions =
+            elect.handle_start_view_change(PlaneKind::Partitions, start_view_change.header());
+
+        let vote = actions.iter().find_map(|action| match action {
+            VsrAction::SendDoViewChange {
+                view: SUPERSEDING_VIEW,
+                log_view,
+                suffix,
+                ..
+            } => Some((*log_view, suffix.headers().to_vec())),
+            _ => None,
+        });
+        assert_eq!(
+            vote,
+            Some((ADOPTED_VIEW, stitched)),
+            "an empty suffix from a canonical sender lets every lower log_view copy count as a nack"
+        );
     }
 
     #[test]

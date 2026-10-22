@@ -11172,8 +11172,10 @@ fn rebuild_pipeline_entries<B, P>(
 /// Called before every handler that could start or join a view change: consensus
 /// records its own `DoViewChange` there and has no journal to read. A stale
 /// snapshot is never reused; consensus tags it with the journal's head, commit
-/// point and mutation count, and falls back to an empty suffix, stalling the view
-/// change rather than nacking an op since acquired.
+/// point and mutation count, and falls back to an empty suffix rather than
+/// nacking an op since acquired. The empty suffix is no safe vote either: from a
+/// canonical sender it lets every lower-`log_view` copy of an op count as a nack,
+/// so every vote must follow a refresh.
 fn refresh_metadata_dvc_suffix<B, P, MJ>(consensus: &VsrConsensus<B, P>, journal: Option<&MJ>)
 where
     B: MessageBus,
@@ -11998,8 +12000,9 @@ fn build_dvc_suffix(
     if op - low + 1 > DVC_HEADERS_MAX as u64 {
         // Defensive: every plane's `prepare_queue_depth` is capped below
         // `DVC_HEADERS_MAX` so `op - commit` cannot reach this. If it does, the
-        // clamped-away ops go out described by nobody and the merge stalls rather
-        // than deciding wrongly. Keep the highest entries, whose fate the view
+        // clamped-away ops go out described by nobody. That is no abstention:
+        // from a canonical sender it lets every lower-`log_view` copy of such an
+        // op count as a nack. Keep the highest entries, whose fate the view
         // change decides, and log it rather than shipping a different window.
         let clamped = op - DVC_HEADERS_MAX as u64 + 1;
         tracing::warn!(
@@ -12239,6 +12242,9 @@ async fn reconcile_partition_view_divergence<B, SB>(
             consensus::ViewLogProof::Proven => {
                 let consensus = partition.consensus();
                 consensus.settle_view_log_proof();
+                if consensus.view_log_merged() && !partition.wal_keeps_log_view() {
+                    consensus.note_uncertified_merge();
+                }
                 // An adoption moves the sequencer, not the chain anchor. If the
                 // journal already held the adopted head, no repair frame moves the
                 // anchor, which then names a dropped op the WAL cannot certify.
