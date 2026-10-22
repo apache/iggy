@@ -48,8 +48,9 @@ second snapshot of the same members would otherwise multiply the encoded respons
 count.
 
 `kafka-consumer-groups.sh --list`, `--describe --members` and `--describe --state` use these
-two APIs. The default `--describe` calls `OffsetFetch` (API key 9), which is not implemented,
-so that mode does not work. `--reset-offsets` needs the same API.
+two APIs. The default `--describe` and `--reset-offsets` use `OffsetFetch` (API key 9),
+which requires the bridge. Without it, OffsetFetch answers `COORDINATOR_LOAD_IN_PROGRESS`
+(14). See [OFFSET_STORAGE.md](OFFSET_STORAGE.md) for offset behavior and limits.
 
 Member `client_id` and `client_host` are empty. The coordinator does not keep the request
 header's client id or the connection's peer address. `include_authorized_operations` is answered

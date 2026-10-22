@@ -44,7 +44,7 @@ on:
         required: false
         default: ""
       publish_dockerhub:
-        description: "Docker images to publish (comma-separated: rust-server, rust-mcp, rust-bench-dashboard, rust-connectors, web-ui)"
+        description: "Docker images to publish (comma-separated: rust-server, rust-mcp, rust-bench-dashboard, rust-connectors, rust-kafka-gateway, web-ui)"
         type: string
         required: false
         default: ""
@@ -375,12 +375,7 @@ jobs:
         run: |
           /tmp/copy-latest-from-master.sh save \
             .github \
-            scripts \
-            web/Dockerfile \
-            core/server/Dockerfile \
-            core/ai/mcp/Dockerfile \
-            core/connectors/runtime/Dockerfile \
-            core/bench/dashboard/server/Dockerfile
+            scripts
 
           /tmp/copy-latest-from-master.sh apply
 
@@ -674,6 +669,7 @@ jobs:
     needs: [validate, plan, check-tags, build-python-wheels, publish-rust-crates]
     if: |
       !cancelled() &&
+      needs.check-tags.result == 'success' &&
       needs.validate.outputs.has_targets == 'true' &&
       needs.plan.outputs.has_docker == 'true' &&
       fromJson(needs.plan.outputs.docker_matrix).include[0].key != 'noop' &&
@@ -704,15 +700,14 @@ jobs:
 
       - name: Save and apply latest CI from master
         if: inputs.use_latest_ci
+        env:
+          DOCKERFILE: ${{ matrix.dockerfile }}
         run: |
           /tmp/copy-latest-from-master.sh save \
             .github \
             scripts \
-            web/Dockerfile \
-            core/server/Dockerfile \
-            core/ai/mcp/Dockerfile \
-            core/connectors/runtime/Dockerfile \
-            core/bench/dashboard/server/Dockerfile
+            "$DOCKERFILE" \
+            "$DOCKERFILE.dockerignore"
 
           /tmp/copy-latest-from-master.sh apply
 
@@ -781,7 +776,7 @@ jobs:
       needs.validate.outputs.has_targets == 'true' &&
       needs.plan.outputs.has_docker == 'true' &&
       fromJson(needs.plan.outputs.docker_components).include[0].key != 'noop' &&
-      needs.publish-docker.result == 'success' &&
+      (needs.publish-docker.result == 'success' || needs.publish-docker.result == 'failure') &&
       inputs.dry_run == false
     runs-on: ubuntu-26.04
     strategy:
@@ -791,6 +786,14 @@ jobs:
       DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USER }}
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
     steps:
+      - name: Download latest copy script from master
+        if: inputs.use_latest_ci
+        run: |
+          curl -fsSL --retry 5 --retry-all-errors "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+            -o /tmp/copy-latest-from-master.sh
+          chmod +x /tmp/copy-latest-from-master.sh
+          echo "✅ Downloaded latest copy script from master"
+
       - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ needs.validate.outputs.commit }}
@@ -800,6 +803,15 @@ jobs:
           # fetches via allowReachableSHA1InWant=true, so fetch-depth:1
           # here is enough - no need to pay for full history.
           fetch-depth: 1
+
+      - name: Save and apply latest CI from master
+        if: inputs.use_latest_ci
+        run: |
+          /tmp/copy-latest-from-master.sh save \
+            .github \
+            scripts
+
+          /tmp/copy-latest-from-master.sh apply
 
       - name: Ensure version extractor is executable
         run: |
@@ -853,21 +865,6 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "✅ Resolved $MATRIX_KEY -> version=$VERSION tag=${TAG:-<none>} should_tag=$SHOULD_TAG"
 
-      - name: Resolve image from config
-        id: config
-        shell: bash
-        run: |
-          if ! command -v yq >/dev/null 2>&1; then
-            YQ_VERSION="v4.47.1"
-            YQ_CHECKSUM="0fb28c6680193c41b364193d0c0fc4a03177aecde51cfc04d506b1517158c2fb"
-            curl -fsSL --retry 5 --retry-all-errors -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64
-            echo "${YQ_CHECKSUM}  /usr/local/bin/yq" | sha256sum -c - || exit 1
-            chmod +x /usr/local/bin/yq
-          fi
-          image=$(yq ".components.${{ matrix.key }}.image" .github/config/publish.yml)
-          echo "image=$image" >> "$GITHUB_OUTPUT"
-          echo "📦 Image: $image"
-
       - name: Download amd64 digest
         uses: actions/download-artifact@v8
         with:
@@ -892,9 +889,9 @@ jobs:
       - name: Create and push manifest
         working-directory: ${{ runner.temp }}/digests
         env:
+          IMAGE: ${{ matrix.image }}
           SHOULD_TAG: ${{ steps.ver.outputs.should_tag }}
         run: |
-          IMAGE="${{ steps.config.outputs.image }}"
           VERSION="${{ steps.ver.outputs.version }}"
 
           echo "Creating manifests for $IMAGE from digests:"
@@ -939,9 +936,9 @@ jobs:
 
       - name: Inspect manifest
         env:
+          IMAGE: ${{ matrix.image }}
           SHOULD_TAG: ${{ steps.ver.outputs.should_tag }}
         run: |
-          IMAGE="${{ steps.config.outputs.image }}"
           VERSION="${{ steps.ver.outputs.version }}"
 
           # Auto-publish pushed :version only when should_tag was true; in
@@ -981,6 +978,7 @@ jobs:
     needs: [validate, plan, check-tags, build-python-wheels, publish-rust-crates]
     if: |
       !cancelled() &&
+      needs.check-tags.result == 'success' &&
       needs.validate.outputs.has_targets == 'true' &&
       fromJson(needs.plan.outputs.non_docker_targets).include[0].key != 'noop' &&
       (needs.build-python-wheels.result == 'success' || needs.build-python-wheels.result == 'skipped') &&
@@ -1020,12 +1018,7 @@ jobs:
         run: |
           /tmp/copy-latest-from-master.sh save \
             .github \
-            scripts \
-            web/Dockerfile \
-            core/server/Dockerfile \
-            core/ai/mcp/Dockerfile \
-            core/connectors/runtime/Dockerfile \
-            core/bench/dashboard/server/Dockerfile
+            scripts
 
           /tmp/copy-latest-from-master.sh apply
 
