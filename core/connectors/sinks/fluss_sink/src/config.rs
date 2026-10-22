@@ -123,22 +123,7 @@ impl TableConfig {
 
 #[derive(Clone)]
 pub(crate) struct ResolvedFlussSinkConfig {
-    pub(crate) bootstrap_servers: String,
-    pub(crate) writer_request_max_size: i32,
-    pub(crate) writer_acks: String,
-    pub(crate) writer_retries: i32,
-    pub(crate) writer_batch_size: i32,
-    pub(crate) writer_bucket_no_key_assigner: NoKeyAssigner,
-    pub(crate) writer_batch_timeout_ms: i64,
-    pub(crate) writer_enable_idempotence: bool,
-    pub(crate) writer_max_inflight_requests_per_bucket: usize,
-    pub(crate) writer_buffer_memory_size: usize,
-    pub(crate) writer_buffer_wait_timeout_ms: u64,
-    pub(crate) connect_timeout_ms: u64,
-    pub(crate) security_protocol: String,
-    pub(crate) security_sasl_mechanism: String,
-    pub(crate) security_sasl_username: String,
-    pub(crate) security_sasl_password: SecretString,
+    pub(crate) fluss: FlussConfig,
     pub(crate) target_database: String,
     pub(crate) target_table: String,
     pub(crate) auto_create_table: bool,
@@ -154,25 +139,11 @@ pub(crate) struct ResolvedFlussSinkConfig {
 
 impl Default for ResolvedFlussSinkConfig {
     fn default() -> Self {
-        let fluss_config = FlussConfig::default();
         Self {
-            bootstrap_servers: fluss_config.bootstrap_servers,
-            writer_request_max_size: fluss_config.writer_request_max_size,
-            writer_acks: fluss_config.writer_acks,
-            writer_retries: DEFAULT_FLUSS_WRITER_RETRIES,
-            writer_batch_size: fluss_config.writer_batch_size,
-            writer_bucket_no_key_assigner: fluss_config.writer_bucket_no_key_assigner,
-            writer_batch_timeout_ms: fluss_config.writer_batch_timeout_ms,
-            writer_enable_idempotence: fluss_config.writer_enable_idempotence,
-            writer_max_inflight_requests_per_bucket: fluss_config
-                .writer_max_inflight_requests_per_bucket,
-            writer_buffer_memory_size: fluss_config.writer_buffer_memory_size,
-            writer_buffer_wait_timeout_ms: fluss_config.writer_buffer_wait_timeout_ms,
-            connect_timeout_ms: fluss_config.connect_timeout_ms,
-            security_protocol: fluss_config.security_protocol,
-            security_sasl_mechanism: fluss_config.security_sasl_mechanism,
-            security_sasl_username: fluss_config.security_sasl_username,
-            security_sasl_password: fluss_config.security_sasl_password.into(),
+            fluss: FlussConfig {
+                writer_retries: DEFAULT_FLUSS_WRITER_RETRIES,
+                ..FlussConfig::default()
+            },
             target_database: DEFAULT_TARGET_DATABASE.to_owned(),
             target_table: DEFAULT_TARGET_TABLE.to_owned(),
             auto_create_table: DEFAULT_AUTO_CREATE_TABLE,
@@ -191,51 +162,66 @@ impl Default for ResolvedFlussSinkConfig {
 impl From<FlussSinkConfig> for ResolvedFlussSinkConfig {
     fn from(config: FlussSinkConfig) -> Self {
         let defaults = Self::default();
-        Self {
+        let fluss_defaults = defaults.fluss;
+        let writer_batch_size = config
+            .writer_batch_size
+            .unwrap_or(fluss_defaults.writer_batch_size);
+        let fluss = FlussConfig {
             bootstrap_servers: config
                 .bootstrap_servers
-                .unwrap_or(defaults.bootstrap_servers),
+                .unwrap_or(fluss_defaults.bootstrap_servers),
             writer_request_max_size: config
                 .writer_request_max_size
-                .unwrap_or(defaults.writer_request_max_size),
-            writer_acks: config.writer_acks.unwrap_or(defaults.writer_acks),
-            writer_retries: config.writer_retries.unwrap_or(defaults.writer_retries),
-            writer_batch_size: config
-                .writer_batch_size
-                .unwrap_or(defaults.writer_batch_size),
+                .unwrap_or(fluss_defaults.writer_request_max_size),
+            writer_acks: config.writer_acks.unwrap_or(fluss_defaults.writer_acks),
+            writer_retries: config
+                .writer_retries
+                .unwrap_or(fluss_defaults.writer_retries),
+            writer_batch_size,
+            // Fluss rejects a dynamic minimum above the batch size, and its default
+            // minimum is 256 KB, so a smaller writer_batch_size would fail to open.
+            writer_dynamic_batch_size_min: fluss_defaults
+                .writer_dynamic_batch_size_min
+                .min(writer_batch_size),
             writer_bucket_no_key_assigner: config
                 .writer_bucket_no_key_assigner
-                .unwrap_or(defaults.writer_bucket_no_key_assigner),
+                .unwrap_or(fluss_defaults.writer_bucket_no_key_assigner),
             writer_batch_timeout_ms: config
                 .writer_batch_timeout_ms
-                .unwrap_or(defaults.writer_batch_timeout_ms),
+                .unwrap_or(fluss_defaults.writer_batch_timeout_ms),
             writer_enable_idempotence: config
                 .writer_enable_idempotence
-                .unwrap_or(defaults.writer_enable_idempotence),
+                .unwrap_or(fluss_defaults.writer_enable_idempotence),
             writer_max_inflight_requests_per_bucket: config
                 .writer_max_inflight_requests_per_bucket
-                .unwrap_or(defaults.writer_max_inflight_requests_per_bucket),
+                .unwrap_or(fluss_defaults.writer_max_inflight_requests_per_bucket),
             writer_buffer_memory_size: config
                 .writer_buffer_memory_size
-                .unwrap_or(defaults.writer_buffer_memory_size),
+                .unwrap_or(fluss_defaults.writer_buffer_memory_size),
             writer_buffer_wait_timeout_ms: config
                 .writer_buffer_wait_timeout_ms
-                .unwrap_or(defaults.writer_buffer_wait_timeout_ms),
+                .unwrap_or(fluss_defaults.writer_buffer_wait_timeout_ms),
             connect_timeout_ms: config
                 .connect_timeout_ms
-                .unwrap_or(defaults.connect_timeout_ms),
+                .unwrap_or(fluss_defaults.connect_timeout_ms),
             security_protocol: config
                 .security_protocol
-                .unwrap_or(defaults.security_protocol),
+                .unwrap_or(fluss_defaults.security_protocol),
             security_sasl_mechanism: config
                 .security_sasl_mechanism
-                .unwrap_or(defaults.security_sasl_mechanism),
+                .unwrap_or(fluss_defaults.security_sasl_mechanism),
             security_sasl_username: config
                 .security_sasl_username
-                .unwrap_or(defaults.security_sasl_username),
+                .unwrap_or(fluss_defaults.security_sasl_username),
             security_sasl_password: config
                 .security_sasl_password
-                .unwrap_or(defaults.security_sasl_password),
+                .map(|password| password.expose_secret().to_owned())
+                .unwrap_or(fluss_defaults.security_sasl_password),
+            ..fluss_defaults
+        };
+
+        Self {
+            fluss,
             target_database: config.target_database.unwrap_or(defaults.target_database),
             target_table: config.target_table.unwrap_or(defaults.target_table),
             auto_create_table: config
@@ -250,37 +236,7 @@ impl From<FlussSinkConfig> for ResolvedFlussSinkConfig {
             route_key: config.route_key.unwrap_or(defaults.route_key),
             router_type: config.router_type.unwrap_or(defaults.router_type),
             tables: config.tables.unwrap_or(defaults.tables),
-            verbose_logging: config.verbose_logging.unwrap_or(false),
-        }
-    }
-}
-
-impl From<&ResolvedFlussSinkConfig> for FlussConfig {
-    fn from(config: &ResolvedFlussSinkConfig) -> Self {
-        let defaults = FlussConfig::default();
-        Self {
-            bootstrap_servers: config.bootstrap_servers.clone(),
-            writer_request_max_size: config.writer_request_max_size,
-            writer_acks: config.writer_acks.clone(),
-            writer_retries: config.writer_retries,
-            writer_batch_size: config.writer_batch_size,
-            // Fluss rejects a dynamic minimum above the batch size, and its default
-            // minimum is 256 KB, so a smaller writer_batch_size would fail to open.
-            writer_dynamic_batch_size_min: defaults
-                .writer_dynamic_batch_size_min
-                .min(config.writer_batch_size),
-            writer_bucket_no_key_assigner: config.writer_bucket_no_key_assigner,
-            writer_batch_timeout_ms: config.writer_batch_timeout_ms,
-            writer_enable_idempotence: config.writer_enable_idempotence,
-            writer_max_inflight_requests_per_bucket: config.writer_max_inflight_requests_per_bucket,
-            writer_buffer_memory_size: config.writer_buffer_memory_size,
-            writer_buffer_wait_timeout_ms: config.writer_buffer_wait_timeout_ms,
-            connect_timeout_ms: config.connect_timeout_ms,
-            security_protocol: config.security_protocol.clone(),
-            security_sasl_mechanism: config.security_sasl_mechanism.clone(),
-            security_sasl_username: config.security_sasl_username.clone(),
-            security_sasl_password: config.security_sasl_password.expose_secret().to_string(),
-            ..defaults
+            verbose_logging: config.verbose_logging.unwrap_or(defaults.verbose_logging),
         }
     }
 }
@@ -321,7 +277,7 @@ mod tests {
     #[test]
     fn given_default_sink_config_when_converting_should_use_connector_retry_default() {
         let sink_config = ResolvedFlussSinkConfig::from(FlussSinkConfig::default());
-        let fluss_config = FlussConfig::from(&sink_config);
+        let fluss_config = sink_config.fluss;
         let actual = serde_json::to_value(fluss_config).expect("Fluss config should serialize");
         let expected = serde_json::to_value(FlussConfig {
             writer_retries: DEFAULT_FLUSS_WRITER_RETRIES,
@@ -340,7 +296,7 @@ mod tests {
         };
         let config = ResolvedFlussSinkConfig::from(config);
 
-        let fluss_config = FlussConfig::from(&config);
+        let fluss_config = config.fluss;
 
         assert_eq!(fluss_config.writer_retries, i32::MAX);
     }
@@ -360,9 +316,9 @@ mod tests {
         .expect("Existing Fluss sink config should deserialize");
         let config = ResolvedFlussSinkConfig::from(config);
 
-        assert_eq!(config.writer_batch_size, 2 * 1024 * 1024);
-        assert_eq!(config.writer_retries, DEFAULT_FLUSS_WRITER_RETRIES);
-        assert_eq!(config.writer_buffer_wait_timeout_ms, u64::MAX);
+        assert_eq!(config.fluss.writer_batch_size, 2 * 1024 * 1024);
+        assert_eq!(config.fluss.writer_retries, DEFAULT_FLUSS_WRITER_RETRIES);
+        assert_eq!(config.fluss.writer_buffer_wait_timeout_ms, u64::MAX);
         assert_eq!(config.payload_format, PayloadFormat::Json);
         assert_eq!(config.target_database, "analytics");
         assert_eq!(config.target_table, "events");
@@ -434,7 +390,7 @@ mod tests {
             "writer_buffer_wait_timeout_ms": 100
         }))
         .expect("Numeric timeout should deserialize");
-        let fluss_config = FlussConfig::from(&ResolvedFlussSinkConfig::from(config));
+        let fluss_config = ResolvedFlussSinkConfig::from(config).fluss;
 
         assert_eq!(fluss_config.writer_buffer_wait_timeout_ms, 100);
     }
@@ -456,7 +412,7 @@ mod tests {
             ..FlussSinkConfig::default()
         });
 
-        let fluss_config = FlussConfig::from(&config);
+        let fluss_config = config.fluss;
 
         assert_eq!(fluss_config.writer_dynamic_batch_size_min, 64 * 1024);
         assert_eq!(fluss_config.validate_writer(), Ok(()));

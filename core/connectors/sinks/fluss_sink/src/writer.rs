@@ -305,7 +305,7 @@ impl FlussWriter {
     }
 
     pub(crate) async fn connect(&mut self) -> Result<(), WriterError> {
-        let config = fluss::config::Config::from(&self.config);
+        let config = self.config.fluss.clone();
         let connection =
             FlussConnection::new(config)
                 .await
