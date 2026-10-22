@@ -138,6 +138,9 @@ pub struct JoinRequest {
     pub protocols: Vec<(StrBytes, Bytes)>,
     /// KIP-394: from v4 a member must claim an id the coordinator handed it first.
     pub require_known_member_id: bool,
+    /// v9+: a static leader replaced while `Stable` is told to skip the assignment it already
+    /// ran, instead of being named a follower.
+    pub supports_skip_assignment: bool,
 }
 
 /// Every field is copied out of the frame rather than cloned: a clone is a refcounted view that
@@ -170,6 +173,7 @@ impl From<(i16, &JoinGroupRequest)> for JoinRequest {
                 })
                 .collect(),
             require_known_member_id: api_version >= 4,
+            supports_skip_assignment: api_version >= 9,
         }
     }
 }
@@ -180,6 +184,8 @@ pub struct SyncRequest {
     pub group_id: StrBytes,
     pub generation_id: i32,
     pub member_id: StrBytes,
+    /// Present from v3; validated against the instance's current holder.
+    pub group_instance_id: Option<StrBytes>,
     /// Present from v5 only; validated against the group when set.
     pub protocol_type: Option<StrBytes>,
     pub protocol_name: Option<StrBytes>,
@@ -193,6 +199,7 @@ impl From<&SyncGroupRequest> for SyncRequest {
             group_id: owned_str(&request.group_id.0),
             generation_id: request.generation_id,
             member_id: owned_str(&request.member_id),
+            group_instance_id: request.group_instance_id.as_ref().map(owned_str),
             protocol_type: request.protocol_type.as_ref().map(owned_str),
             protocol_name: request.protocol_name.as_ref().map(owned_str),
             assignments: request
@@ -229,6 +236,9 @@ pub struct JoinResult {
     pub member_id: StrBytes,
     /// Non-empty only for the leader.
     pub members: Vec<JoinedMember>,
+    /// v9+: the leader keeps the assignment already in effect. Set only for a static leader
+    /// replaced while the group is `Stable`.
+    pub skip_assignment: bool,
 }
 
 impl JoinResult {
@@ -242,6 +252,7 @@ impl JoinResult {
             leader: StrBytes::new(),
             member_id,
             members: Vec::new(),
+            skip_assignment: false,
         }
     }
 }
@@ -461,9 +472,13 @@ impl GroupCoordinator {
                 let now = Instant::now();
                 let step = match parked.as_ref() {
                     None => state::join_step(&mut groups, &self.config, request, now),
-                    Some(member_id) => {
-                        state::join_resume_step(&mut groups, &request.group_id, member_id, now)
-                    }
+                    Some(member_id) => state::join_resume_step(
+                        &mut groups,
+                        &request.group_id,
+                        member_id,
+                        request.group_instance_id.as_ref(),
+                        now,
+                    ),
                 };
                 let outcome = park_outcome(&groups, &request.group_id, step, |member_id| {
                     JoinResult::error(ERROR_UNKNOWN_MEMBER_ID, member_id)
@@ -494,6 +509,7 @@ impl GroupCoordinator {
                         &mut groups,
                         &request.group_id,
                         &request.member_id,
+                        request.group_instance_id.as_ref(),
                         request.generation_id,
                         now,
                     )
@@ -525,6 +541,7 @@ impl GroupCoordinator {
         group_id: &StrBytes,
         generation_id: i32,
         member_id: &StrBytes,
+        group_instance_id: Option<&StrBytes>,
     ) -> i16 {
         let mut groups = self.groups.lock().await;
         state::heartbeat_step(
@@ -532,6 +549,7 @@ impl GroupCoordinator {
             group_id,
             generation_id,
             member_id,
+            group_instance_id,
             Instant::now(),
         )
     }

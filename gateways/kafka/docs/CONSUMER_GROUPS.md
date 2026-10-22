@@ -150,9 +150,9 @@ How each identity in a request is resolved:
 | id of a member | null | removed, 0 |
 | id handed out with `MEMBER_ID_REQUIRED` and not yet claimed | any | id dropped, 0 |
 | id of a member holding `X` | `X` | removed, 0 |
-| id of any member | `X`, held by other members | `FENCED_INSTANCE_ID` (82) |
+| id of any member | `X`, held by another member | `FENCED_INSTANCE_ID` (82) |
 | any | `X`, held by nobody | `UNKNOWN_MEMBER_ID` (25) |
-| `""` | `X`, held by members | every holder removed, 0 |
+| `""` | `X`, held by a member | that member removed, 0 |
 | `""` | null or unheld | `UNKNOWN_MEMBER_ID` (25) |
 | unknown | null | `UNKNOWN_MEMBER_ID` (25) |
 
@@ -161,26 +161,52 @@ From v3 the response carries one entry per request identity, in request order, e
 the `member_id` and `group_instance_id` that were sent. Below v3 it carries one top-level code:
 the request's own error, else the first member's.
 
-## Static membership is accepted, not honoured
+## Static membership
 
-`group.instance.id` (JoinGroup v5+) is stored and echoed back to the leader, and it seeds the
-generated member id so a static member is recognisable in logs. Nothing else about KIP-345 is
-implemented, and it would need its own issue: a returning static member is **not** matched to its
-previous identity. It gets a new member id and its join triggers a rebalance, while its previous
-incarnation stays a member, holding its partitions, until its session expires and triggers a
-second one. Kafka replaces the old identity with no rebalance at all.
+`group.instance.id` (JoinGroup v5+) makes a member static, as KIP-345 defines it. One instance id
+is held by at most one member, and the generated member id starts with the instance id.
 
-The consequences:
+A static member that joins with an empty member id while its instance id is held takes that
+member over under a new member id, and the old member id is fenced. In `Stable` it keeps the
+assignment and the generation:
 
-- One instance id can be held by several members at once. A `LeaveGroup` by instance id removes
-  every holder, since leaving by instance id means that instance is gone, and still answers with
-  one entry. With at most one holder this is Kafka's behaviour.
-- `FENCED_INSTANCE_ID` (82) is returned only by `LeaveGroup`, never by `JoinGroup`, `SyncGroup` or
-  `Heartbeat`.
-- A static consumer does not send `LeaveGroup` on close, with either the Java client or
-  librdkafka, so its partitions stay assigned until its session expires, exactly as before
-  `LeaveGroup` existed. For prompt release use a short `session.timeout.ms`, or Java 4.1+
-  `CloseOptions.LEAVE_GROUP`.
+| Group state when it returns | What happens |
+| --- | --- |
+| `Stable` | No rebalance. The member gets the current generation and syncs to its previous assignment. From JoinGroup v9 a returning leader is sent the roster with `skip_assignment` set. Below v9 the response names the previous leader, so the client acts as a follower and does not reassign. A rebalance opens only if the member's protocols change the group's selected protocol |
+| `CompletingRebalance` | A rebalance opens, since the leader may already be assigning to the old member id |
+| `PreparingRebalance` | The member counts as rejoined for the open barrier |
+
+A static member joining for the first time is admitted at once, without the `MEMBER_ID_REQUIRED`
+(79) round trip a dynamic member makes from v4, as in Kafka. The replacement does not count
+against `max_members_per_group` or `max_total_members`, since the group does not grow. Kafka checks
+`group.max.size` on a replacement too, though its default is unlimited.
+
+`JoinGroup`, `SyncGroup`, `Heartbeat`, `OffsetCommit` and `LeaveGroup` that name an instance id
+are checked against its holder. Another member's id gets `FENCED_INSTANCE_ID` (82), and an
+instance id nobody holds gets `UNKNOWN_MEMBER_ID` (25). A request parked in `JoinGroup` or
+`SyncGroup` by the replaced member is checked against the holder again when it resumes, so it is
+answered 82. A request from the replaced member id that names no instance id gets 25, because
+that member id is gone. Nothing is kept per replaced id: one is fenced for as long as another
+member holds its instance id, and gets 25 once that holder leaves or expires.
+
+A static member that rejoins without its instance id stays static. A dynamic member cannot become
+static by naming an instance id: it gets 25, or 82 if another member holds it. A member id handed
+out with `MEMBER_ID_REQUIRED` that comes back naming an instance id gets 25 and is dropped.
+
+A static member that does not rejoin before a join window closes stays in the group and in the
+leader's roster, as in Kafka, so it can come back to its assignment without another rebalance. A
+dynamic member that does not rejoin is removed. When the sync deadline passes, every member of
+that generation that has not synced is removed and the group rebalances, an absent static member
+included, as in Kafka. The deadline still applies after the leader syncs and the group is
+`Stable`. A member that syncs late, or a static member that returns to its assignment, no longer
+owes a sync.
+
+The session still bounds a static member. If it does not come back within `session.timeout.ms`,
+it is evicted and the group rebalances, as for a dynamic member.
+
+A static consumer does not send `LeaveGroup` on close, with either the Java client or librdkafka,
+so its partitions stay assigned until it returns or its session expires. For prompt release use a
+short `session.timeout.ms`, or Java 4.1+ `CloseOptions.LEAVE_GROUP`.
 
 ## Capacity caps
 
@@ -221,10 +247,9 @@ keep the offsets in Iggy ([`OFFSET_STORAGE.md`](OFFSET_STORAGE.md)). Without a b
 `COORDINATOR_LOAD_IN_PROGRESS` (14), and the client retries them.
 
 A dynamic consumer releases its partitions on close through `LeaveGroup`. A static one does not
-send it (see [Static membership](#static-membership-is-accepted-not-honoured)), so a static
-consumer's shutdown still costs the survivors up to `session.timeout.ms` before they rebalance.
-That is exactly what Kafka does for a *crashed* consumer, so it is a degraded shutdown rather than
-a wedge.
+send it (see [Static membership](#static-membership)), so a static consumer that stops for good
+costs the survivors up to `session.timeout.ms` before they rebalance, as in Kafka. One that
+restarts within that time takes its partitions back with no rebalance.
 
 `ConsumerGroupHeartbeat` (68), the KIP-848 protocol, is not implemented and a client cannot fall
 back from it. It is opt-in: a Kafka 4.0 client still defaults to `group.protocol=classic`, which reaches

@@ -286,8 +286,6 @@ Limits:
 - One gateway per bootstrap endpoint. Group membership is gateway memory
   ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md)).
 - Classic protocol only. A consumer with `group.protocol=consumer` (KIP-848) fails.
-- `group.instance.id` is accepted but not honoured. A static member that restarts causes two
-  rebalances.
 - No DeleteGroups or OffsetDelete, and offsets never expire. An operator deletes a group's offsets
   in Iggy ([docs/OFFSET_STORAGE.md](docs/OFFSET_STORAGE.md#limits)).
 - Delivery is at-least-once. A consumer that stops before it commits reads those records again.
