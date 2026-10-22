@@ -5701,6 +5701,147 @@ mod tests {
         elect_beside_proven_backup(namespace, &backup, &candidate, &store).await;
     }
 
+    /// A primary-elect truncates the op that the merged log replaces and proves the
+    /// merge through a repair. Its `log_view` names the view it replicated in until
+    /// the view starts, so its WAL must not certify that view over the merged
+    /// journal in between.
+    #[compio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn given_a_settled_merge_when_the_elect_persists_before_the_view_starts_should_not_certify_its_old_log_view()
+     {
+        const HEAD: u64 = 2;
+        // Persist calls between the settled proof and the view start, one tick
+        // apart. The WAL task publishes a queued certificate within the first few.
+        const WINDOW_ROUNDS: usize = 20;
+        let directory = tempfile::tempdir().unwrap();
+        let store = Rc::new(HeldSuperblock {
+            entered: RefCell::new(None),
+            held: RefCell::new(None),
+        });
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let prepares = primary_prepares(&Rc::new(IggyMessageBus::new(0)), namespace, HEAD).await;
+        let prefix = usize::try_from(HEAD - 1).unwrap();
+        // The primary of both views prepared op 2 in the elect's view, lost it,
+        // and prepared another op 2 in the adopted view.
+        let merged =
+            prepares[prefix]
+                .clone()
+                .transmute_header(|previous, header: &mut PrepareHeader| {
+                    *header = previous;
+                    header.view = HEADLESS_VIEW;
+                    header.request += 1;
+                    header.checksum = header.identity_checksum();
+                });
+        let backup =
+            HeadlessReplica::journaled(HEADLESS_BACKUP, namespace, &prepares[..prefix], None).await;
+        let elect = HeadlessReplica::journaled(
+            HEADLESS_CANDIDATE,
+            namespace,
+            &prepares,
+            Some((directory.path(), &store)),
+        )
+        .await;
+        backup
+            .owner
+            .on_start_view(start_view_suffix(
+                namespace,
+                HEADLESS_VIEW,
+                HEAD,
+                0,
+                &[*merged.header()],
+            ))
+            .await;
+        backup
+            .owner
+            .on_repair_prepare(as_repair_prepare(merged.clone()))
+            .await;
+        let backup_consensus = || backup.partition(namespace).consensus();
+        let elect_partition = || elect.partition(namespace);
+        assert!(backup_consensus().is_normal());
+        assert!(!backup_consensus().view_log_unproven());
+        assert_eq!(elect_partition().log.journal().inner.last_op(), Some(HEAD));
+
+        let mut scratch = Vec::new();
+        for _ in 0..2 * TimeoutManager::NORMAL_HEARTBEAT_TICKS {
+            if backup_consensus().view() == HEADLESS_NEXT_VIEW {
+                break;
+            }
+            assert!(backup.owner.tick_partitions(&mut scratch).await.is_none());
+        }
+        assert_eq!(backup_consensus().view(), HEADLESS_NEXT_VIEW);
+        elect
+            .owner
+            .on_message(backup.take(HEADLESS_CANDIDATE, Command::StartViewChange))
+            .await;
+        let announced = async {
+            while !elect.sent_to(
+                HEADLESS_BACKUP,
+                Command::StartViewChange,
+                HEADLESS_NEXT_VIEW,
+            ) {
+                elect.step(&mut scratch).await;
+            }
+        };
+        compio::time::timeout(REPLY_DEADLINE, Box::pin(announced))
+            .await
+            .expect("the elect must announce the view change");
+        backup
+            .owner
+            .on_message(elect.take(HEADLESS_BACKUP, Command::StartViewChange))
+            .await;
+        elect
+            .owner
+            .on_message(backup.take(HEADLESS_CANDIDATE, Command::DoViewChange))
+            .await;
+        assert!(elect_partition().consensus().is_primary_elect());
+        // The IO lane truncates the replaced op, then the elect fetches the merged one.
+        let truncating = async {
+            while elect_partition().repair.is_none() {
+                elect.step(&mut scratch).await;
+            }
+        };
+        compio::time::timeout(REPLY_DEADLINE, Box::pin(truncating))
+            .await
+            .expect("the elect must truncate the replaced op and fetch the merged one");
+        assert_eq!(
+            elect_partition().log.journal().inner.last_op(),
+            Some(HEAD - 1)
+        );
+        elect
+            .owner
+            .on_repair_prepare(as_repair_prepare(merged))
+            .await;
+        assert!(!elect_partition().consensus().view_log_unproven());
+        assert!(elect_partition().consensus().is_primary_elect());
+        assert_eq!(elect_partition().consensus().log_view(), REPAIR_VIEW);
+
+        // The next tick sweep starts the view. Until then the journal is the
+        // merged log while `log_view` still names the elect's own view.
+        for _ in 0..WINDOW_ROUNDS {
+            assert!(
+                !elect_partition().persist_superblock_if_needed().await,
+                "the WAL must not certify view {REPAIR_VIEW} over the merged log"
+            );
+            compio::time::sleep(crate::CONSENSUS_TICK_INTERVAL).await;
+        }
+        let started = async {
+            while !elect.sent_to(HEADLESS_BACKUP, Command::StartView, HEADLESS_NEXT_VIEW) {
+                elect.step(&mut scratch).await;
+            }
+        };
+        compio::time::timeout(REPLY_DEADLINE, Box::pin(started))
+            .await
+            .expect("the elect must start the view once its WAL certifies it");
+        assert!(elect_partition().consensus().is_primary());
+        assert_eq!(elect_partition().consensus().log_view(), HEADLESS_NEXT_VIEW);
+        backup
+            .owner
+            .on_message(elect.take(HEADLESS_BACKUP, Command::StartView))
+            .await;
+        assert!(backup_consensus().is_normal());
+        assert_eq!(backup_consensus().view(), HEADLESS_NEXT_VIEW);
+    }
+
     /// The walk refuses an unproven view log, so a resident op after
     /// `commit_min` cannot move a group whose proof waits on a missing body.
     /// When the session ceiling refuses the arm at `StartView` adoption, the
