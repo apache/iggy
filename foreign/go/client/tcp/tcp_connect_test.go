@@ -496,6 +496,9 @@ func TestConnect_DropsTheConnectionWhenAutomaticSignInFails(t *testing.T) {
 	err := client.Connect(context.Background())
 
 	assert.ErrorIs(t, err, ierror.ErrInvalidCredentials)
+	var refusal ierror.IggyError
+	require.ErrorAs(t, err, &refusal)
+	assert.Equal(t, ierror.InvalidCredentialsCode, refusal.Code(), "Connect returns the refusal, not the 40 of the epoch it ended")
 	assert.False(t, linkReady(client.links.any()))
 	assert.Nil(t, client.links.any())
 }
@@ -746,6 +749,54 @@ func TestConcurrentConnectWaiterCannotRestartOrCancelSharedRegistration(t *testi
 	require.Equal(t, 1, registrations)
 	require.Equal(t, 1, requestCount(server.recorded(), command.GetClusterMetadataCode))
 	require.True(t, client.session.Bound())
+}
+
+// A call that starts while Connect signs in waits for that session, as it
+// waits for a recovery, and then goes out under it.
+func TestCallsThatStartDuringConnectWaitForItsSession(t *testing.T) {
+	registered, release := make(chan struct{}), make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(release) })
+	defer unblock()
+	var server *testListener
+	server = listenVSR(t, nil, func(_, _ int, read request) []byte {
+		switch read.operation() {
+		case vsr.OperationRegister:
+			close(registered)
+			<-release
+		case vsr.OperationCreateStream:
+			return replyFrame(vsr.OperationCreateStream, resultSection())
+		}
+		return singleNodeHandler(t, func() string { return server.address() })(0, 0, read)
+	})
+	client := newDialingClient(t, server.address(), WithAutoLogin(NewUsernamePasswordCredentials("iggy", "iggy")))
+	connected := make(chan error, 1)
+	go func() { connected <- client.Connect(context.Background()) }()
+	<-registered
+	ctx, cancel := context.WithTimeout(context.Background(), managedLinkTestBudget)
+	defer cancel()
+	created, pinged := make(chan error, 1), make(chan error, 1)
+	go func() {
+		_, err := client.do(ctx, &command.CreateStream{Name: "waiting"})
+		created <- err
+	}()
+	go func() { pinged <- client.Ping(ctx) }()
+	require.Never(t, func() bool { return len(created) != 0 || len(pinged) != 0 }, recoveryWaitDeadline, managedLinkPoll,
+		"the calls wait for the session of the Connect")
+
+	unblock()
+	require.NoError(t, <-connected)
+	require.NoError(t, <-created)
+	require.NoError(t, <-pinged)
+	calls := createStreams(server.recorded())
+	for _, read := range server.recorded() {
+		if read.code() == uint32(command.PingCode) {
+			calls = append(calls, read)
+		}
+	}
+	require.Len(t, calls, 2)
+	for _, call := range calls {
+		require.Equal(t, managedLinkSession, call.sessionID(), "the call goes out under the new session")
+	}
 }
 
 func TestLoginUserRacingDisconnectCannotRememberItsCredentials(t *testing.T) {

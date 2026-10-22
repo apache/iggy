@@ -631,25 +631,36 @@ func (c *IggyTcpClient) sessionRecovers(ctx context.Context, err error) bool {
 }
 
 // waitForRecovery waits while an automatic recovery replaces a lost session,
-// so a call that starts or restarts meanwhile runs under the new session. A
-// recovery that binds no session by the deadline ends the call with 58. A
-// sign-in, logout or disconnect of the caller, and a refused automatic
-// sign-in, end the calls that started before them with 40.
+// or a Connect signs in, so a call that starts or restarts meanwhile runs
+// under the new session. A sign-in that binds no session by the deadline ends
+// the call with 58. A sign-in, logout or disconnect of the caller, and a
+// refused automatic sign-in, end the calls that started before them with 40.
 func (c *IggyTcpClient) waitForRecovery(ctx context.Context) error {
 	epoch := c.callEpoch(ctx)
 	for {
 		c.mtx.Lock()
 		recovery := c.recovery
-		recovering := recovery != nil && recovery.Err() == nil && !c.loggedOut && !c.session.Bound()
+		unbound := !c.loggedOut && !c.session.Bound()
+		_, signsIn := c.signInCredentialsLocked()
 		c.mtx.Unlock()
 		if err := epoch.err(); err != nil {
 			return err
 		}
-		if !recovering {
+		var signInEnded <-chan struct{}
+		if unbound && recovery != nil && recovery.Err() == nil {
+			signInEnded = recovery.Done()
+		} else if unbound && signsIn {
+			c.connectMu.Lock()
+			if attempt := c.connectionAttempt; attempt != nil {
+				signInEnded = attempt.done
+			}
+			c.connectMu.Unlock()
+		}
+		if signInEnded == nil {
 			return nil
 		}
 		select {
-		case <-recovery.Done():
+		case <-signInEnded:
 		case <-epoch.ended:
 		case <-ctx.Done():
 			return ierror.ErrTransientNotAccepted

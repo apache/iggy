@@ -346,13 +346,19 @@ func (c *IggyTcpClient) establishSession(ctx context.Context, link *tcpLink) err
 			var refusal *signInRefusal
 			if errors.As(err, &refusal) {
 				err = refusal.err
-				if c.endRefusedSignIn(epoch, credentials, err) {
+				retry, ended := c.endRefusedSignIn(epoch, credentials, err)
+				if retry {
 					link.close(err)
 					link, err = c.links.connect(ctx)
 					if err != nil {
 						return err
 					}
 					continue
+				}
+				if ended {
+					// Connect returns its own refusal, not the 40 of the epoch it ended.
+					link.close(err)
+					return refusal
 				}
 			}
 			link.close(err)
@@ -541,24 +547,26 @@ func (r *signInRefusal) Unwrap() error { return r.err }
 
 // endRefusedSignIn retries only credentials updated by this same owner.
 // A refusal of its current credentials blocks fallback until an explicit login.
-func (c *IggyTcpClient) endRefusedSignIn(epoch *signInEpoch, attempted Credentials, refusal error) bool {
+// ended reports whether the refusal ended the epoch. It is false when a newer
+// owner ended the epoch first.
+func (c *IggyTcpClient) endRefusedSignIn(epoch *signInEpoch, attempted Credentials, refusal error) (retry, ended bool) {
 	c.logger.Error("The server refused the automatic sign-in", slog.Any("error", refusal))
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
 	if c.epoch.Load() != epoch {
-		return false
+		return false, false
 	}
 	if credentialRefused(refusal) {
 		current, enabled := c.signInCredentialsLocked()
 		if enabled && current != attempted {
-			return true
+			return true, false
 		}
 		c.rememberedLogin = AutoLogin{}
 		c.autoLoginBlocked = true
 		c.loggedOut = true
 	}
 	c.endSignInEpochLocked(refusal)
-	return false
+	return false, true
 }
 
 func credentialRefused(refusal error) bool {

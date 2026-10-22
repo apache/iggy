@@ -347,7 +347,8 @@ func TestRecoveryRegisterKeepsCredentialsPublishedByTheSameOwner(t *testing.T) {
 				if refused {
 					var refusal *signInRefusal
 					require.ErrorAs(t, err, &refusal)
-					require.True(t, client.endRefusedSignIn(epoch, attempted, refusal.err), "the new credential was never refused")
+					retry, _ := client.endRefusedSignIn(epoch, attempted, refusal.err)
+					require.True(t, retry, "the new credential was never refused")
 					require.Same(t, epoch, client.epoch.Load())
 					require.NoError(t, client.Connect(ctx))
 					require.Len(t, registerRequests(server), 3)
@@ -381,7 +382,8 @@ func TestCredentialAcceptanceCannotChangeANewerExplicitOwner(t *testing.T) {
 	_, err := client.LoginUser(ctx, signInUsername, newerPassword)
 	require.NoError(t, err)
 	require.False(t, client.acceptOperationReply(epoch, operation, &reply.header, true))
-	require.False(t, client.endRefusedSignIn(epoch, NewUsernamePasswordCredentials(signInUsername, signInPassword), ierror.ErrInvalidCredentials), "old refusal cannot end the newer owner")
+	retry, ended := client.endRefusedSignIn(epoch, NewUsernamePasswordCredentials(signInUsername, signInPassword), ierror.ErrInvalidCredentials)
+	require.False(t, retry || ended, "old refusal cannot end the newer owner")
 	requireSignInAgain(t, client, server, evict, signInUsername, newerPassword)
 	client.mtx.Lock()
 	configuredPassword := client.config.autoLogin.credentials.password

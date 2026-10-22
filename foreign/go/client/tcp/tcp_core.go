@@ -462,7 +462,10 @@ func (c *IggyTcpClient) Connect(ctx context.Context) error {
 			endSignIn()
 		}
 	}
-	if ended := epoch.err(); ended != nil {
+	var refusal *signInRefusal
+	if errors.As(err, &refusal) {
+		err = refusal.err
+	} else if ended := epoch.err(); ended != nil {
 		err = ended
 	}
 	c.connectMu.Lock()
