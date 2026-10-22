@@ -312,10 +312,7 @@ mod tests {
         datatypes::{DataType, Field, Schema},
         record_batch::RecordBatch,
     };
-    use fluss::{
-        client::FlussTable,
-        metadata::{TableDescriptor, TablePath},
-    };
+    use fluss::metadata::{TableDescriptor, TablePath};
     use iggy_connector_sdk::{ConsumedMessage, Payload, Schema as IggySchema};
 
     use super::{
@@ -339,6 +336,7 @@ mod tests {
     struct RecordingWriter {
         get_calls: AtomicUsize,
         created: Mutex<Vec<TablePath>>,
+        existing: Mutex<HashMap<TablePath, TableDescriptor>>,
         writes: Mutex<Vec<TableWrite>>,
         fail_create: bool,
         failing_writes: Vec<TablePath>,
@@ -372,7 +370,7 @@ mod tests {
         async fn create_table_if_not_exists(
             &self,
             table_path: &TablePath,
-            _table_descriptor: &TableDescriptor,
+            table_descriptor: &TableDescriptor,
         ) -> Result<(), WriterError> {
             if self.fail_create {
                 return Err(WriterError::ConnectionNotInitialized);
@@ -381,14 +379,27 @@ mod tests {
                 .lock()
                 .expect("created tables lock should not be poisoned")
                 .push(table_path.clone());
+            self.existing
+                .lock()
+                .expect("existing tables lock should not be poisoned")
+                .entry(table_path.clone())
+                .or_insert_with(|| table_descriptor.clone());
             Ok(())
         }
 
-        async fn get_table(&self, table_path: &TablePath) -> Result<FlussTable<'_>, WriterError> {
+        async fn get_table_descriptor(
+            &self,
+            table_path: &TablePath,
+        ) -> Result<TableDescriptor, WriterError> {
             self.get_calls.fetch_add(1, Ordering::Relaxed);
-            Err(WriterError::TableNotFound {
-                table_path: table_path.clone(),
-            })
+            self.existing
+                .lock()
+                .expect("existing tables lock should not be poisoned")
+                .get(table_path)
+                .cloned()
+                .ok_or_else(|| WriterError::TableNotFound {
+                    table_path: table_path.clone(),
+                })
         }
     }
 
@@ -569,7 +580,8 @@ mod tests {
         assert!(last_error.is_none());
         assert_eq!((second_stat.appended, second_stat.errors), (1, 0));
         assert!(second_last_error.is_none());
-        assert_eq!(writer.get_calls.load(Ordering::Relaxed), 1);
+        // One lookup before the create and one reload after it; the second batch hits the cache.
+        assert_eq!(writer.get_calls.load(Ordering::Relaxed), 2);
         assert_eq!(created.as_slice(), &[TablePath::new("fluss", "orders")]);
         assert_eq!(writes.len(), 2);
         assert_eq!(writes[0].table_path, TablePath::new("fluss", "orders"));

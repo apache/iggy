@@ -72,6 +72,12 @@ pub(crate) enum WriterError {
         #[source]
         source: Box<FlussError>,
     },
+    #[error("Failed to read Fluss table descriptor for '{table_path}': {source}")]
+    BuildTableDescriptor {
+        table_path: TablePath,
+        #[source]
+        source: Box<FlussError>,
+    },
     #[error("Failed to create appender for Fluss table '{table_path}': {source}")]
     CreateAppender {
         table_path: TablePath,
@@ -122,6 +128,7 @@ impl From<WriterError> for ConnectorError {
             WriterError::GetAdminClient { source }
             | WriterError::CreateTable { source, .. }
             | WriterError::GetTableFailed { source, .. }
+            | WriterError::BuildTableDescriptor { source, .. }
             | WriterError::CreateAppender { source, .. }
             | WriterError::CreateWriter { source, .. }
             | WriterError::AppendArrowBatch { source, .. }
@@ -270,7 +277,10 @@ pub(crate) trait TableWriter {
         table_descriptor: &TableDescriptor,
     ) -> Result<(), WriterError>;
 
-    async fn get_table(&self, table_path: &TablePath) -> Result<FlussTable<'_>, WriterError>;
+    async fn get_table_descriptor(
+        &self,
+        table_path: &TablePath,
+    ) -> Result<TableDescriptor, WriterError>;
 }
 
 pub struct FlussWriter {
@@ -452,6 +462,44 @@ impl FlussWriter {
         Ok(stat)
     }
 
+    async fn get_table(&self, table_path: &TablePath) -> Result<FlussTable<'_>, WriterError> {
+        let connection = self.get_connection()?;
+
+        // The fluss get table API at the moment, doesn't return a specific error for table not
+        // found, so we need to check if the table exists first.
+        let table_id = connection
+            .get_metadata()
+            .fetch_table_id(table_path)
+            .await
+            .map_err(|source| WriterError::GetTableFailed {
+                table_path: table_path.clone(),
+                source: Box::new(source),
+            })?;
+
+        if table_id.is_none() {
+            return Err(WriterError::TableNotFound {
+                table_path: table_path.clone(),
+            });
+        }
+
+        connection
+            .get_table(table_path)
+            .await
+            .map_err(|source| match source {
+                FlussError::FlussAPIError { api_error }
+                    if api_error.code == fluss::rpc::FlussError::TableNotExist.code() =>
+                {
+                    WriterError::TableNotFound {
+                        table_path: table_path.clone(),
+                    }
+                }
+                _ => WriterError::GetTableFailed {
+                    table_path: table_path.clone(),
+                    source: Box::new(source),
+                },
+            })
+    }
+
     fn get_connection(&self) -> Result<&FlussConnection, WriterError> {
         self.connection
             .as_ref()
@@ -566,41 +614,17 @@ impl TableWriter for FlussWriter {
         }
     }
 
-    async fn get_table(&self, table_path: &TablePath) -> Result<FlussTable<'_>, WriterError> {
-        let connection = self.get_connection()?;
-
-        // The fluss get table API at the moment, doesn't return a specific error for table not
-        // found, so we need to check if the table exists first.
-        let table_id = connection
-            .get_metadata()
-            .fetch_table_id(table_path)
-            .await
-            .map_err(|source| WriterError::GetTableFailed {
+    async fn get_table_descriptor(
+        &self,
+        table_path: &TablePath,
+    ) -> Result<TableDescriptor, WriterError> {
+        self.get_table(table_path)
+            .await?
+            .get_table_info()
+            .to_table_descriptor()
+            .map_err(|source| WriterError::BuildTableDescriptor {
                 table_path: table_path.clone(),
                 source: Box::new(source),
-            })?;
-
-        if table_id.is_none() {
-            return Err(WriterError::TableNotFound {
-                table_path: table_path.clone(),
-            });
-        }
-
-        connection
-            .get_table(table_path)
-            .await
-            .map_err(|source| match source {
-                FlussError::FlussAPIError { api_error }
-                    if api_error.code == fluss::rpc::FlussError::TableNotExist.code() =>
-                {
-                    WriterError::TableNotFound {
-                        table_path: table_path.clone(),
-                    }
-                }
-                _ => WriterError::GetTableFailed {
-                    table_path: table_path.clone(),
-                    source: Box::new(source),
-                },
             })
     }
 }

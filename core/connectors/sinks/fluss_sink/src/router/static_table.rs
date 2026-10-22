@@ -81,8 +81,16 @@ impl StaticTableRouter {
                 writer
                     .create_table_if_not_exists(&self.table_path, &table_descriptor)
                     .await?;
+                // Another sink can win the create with a different schema, so use what Fluss has.
                 self.schema_catalog
-                    .load_from_table_descriptor(&self.table_path, table_descriptor)?
+                    .load_from_table(&self.table_path, writer)
+                    .await?
+                    .ok_or_else(|| Error::Init {
+                        reason: format!(
+                            "Table {} was not found right after it was created",
+                            self.table_path
+                        ),
+                    })?
             }
             None => {
                 return Err(Error::Init {
@@ -212,10 +220,7 @@ mod tests {
         array::{Int64Array, StringArray},
         record_batch::RecordBatch,
     };
-    use fluss::{
-        client::FlussTable,
-        metadata::{TableDescriptor, TablePath},
-    };
+    use fluss::metadata::{TableDescriptor, TablePath};
     use iggy_connector_sdk::{ConsumedMessage, MessagesMetadata, Payload, Schema, TopicMetadata};
 
     use super::{Error as RouterError, StaticTableRouter};
@@ -294,10 +299,19 @@ mod tests {
             Ok(())
         }
 
-        async fn get_table(&self, table_path: &TablePath) -> Result<FlussTable<'_>, WriterError> {
-            Err(WriterError::TableNotFound {
-                table_path: table_path.to_owned(),
-            })
+        async fn get_table_descriptor(
+            &self,
+            table_path: &TablePath,
+        ) -> Result<TableDescriptor, WriterError> {
+            self.table_creations
+                .lock()
+                .expect("Table creations lock should not be poisoned")
+                .iter()
+                .find(|creation| &creation.table_path == table_path)
+                .map(|creation| creation.table_descriptor.clone())
+                .ok_or_else(|| WriterError::TableNotFound {
+                    table_path: table_path.to_owned(),
+                })
         }
     }
 

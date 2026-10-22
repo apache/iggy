@@ -58,6 +58,8 @@ pub(crate) enum Error {
     },
     #[error("Failed to convert Fluss schema to Arrow schema because: {reason}")]
     FlussToArrowSchemaFailed { reason: String },
+    #[error("Fluss table {table_path} was not found right after it was created")]
+    TableMissingAfterCreate { table_path: TablePath },
 }
 
 #[derive(Debug)]
@@ -117,37 +119,23 @@ impl SchemaCatalog {
         table: &TablePath,
         writer: &impl TableWriter,
     ) -> Result<Option<Arc<SchemaEntry>>, Error> {
-        let fluss_table = writer.get_table(table).await;
-        let fluss_table = match fluss_table {
-            Ok(table) => table,
+        let descriptor = match writer.get_table_descriptor(table).await {
+            Ok(descriptor) => descriptor,
             Err(writer::WriterError::TableNotFound { .. }) => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-
-        let descriptor = fluss_table
-            .get_table_info()
-            .to_table_descriptor()
-            .map_err(|error| Error::BuildTableDescriptor {
-                table_path: table.clone(),
-                reason: error.to_string(),
-            })?;
 
         let entry = self.load_from_table_descriptor(table, descriptor)?;
         Ok(Some(entry))
     }
 
-    fn infer_schema(
+    fn infer_table_descriptor(
         &self,
         table: &TablePath,
         messages: &[ConsumedMessage],
-    ) -> Result<(Schema, TableDescriptor), Error> {
+    ) -> Result<TableDescriptor, Error> {
         let schema = sample_and_infer_schema(messages)?;
-        let table_descriptor = table_descriptor_from_schema(
-            &schema,
-            table,
-            self.table_config.get(&table.to_string()),
-        )?;
-        Ok((schema, table_descriptor))
+        table_descriptor_from_schema(&schema, table, self.table_config.get(&table.to_string()))
     }
 
     pub(crate) fn store(&self, table: &TablePath, entry: Arc<SchemaEntry>) {
@@ -163,22 +151,21 @@ impl SchemaCatalog {
         messages: &[ConsumedMessage],
         writer: &impl TableWriter,
     ) -> Result<Arc<SchemaEntry>, Error> {
-        let (schema, table_descriptor) =
-            self.infer_schema(table, messages)
-                .map_err(|err| Error::InferSchemaFailed {
-                    table_path: table.to_owned(),
-                    reason: err.to_string(),
-                })?;
+        let table_descriptor = self
+            .infer_table_descriptor(table, messages)
+            .map_err(|err| Error::InferSchemaFailed {
+                table_path: table.to_owned(),
+                reason: err.to_string(),
+            })?;
         writer
             .create_table_if_not_exists(table, &table_descriptor)
             .await?;
 
-        let entry = Arc::new(SchemaEntry {
-            schema: Arc::new(schema),
-            table_descriptor,
-        });
-        self.store(table, Arc::clone(&entry));
-        Ok(entry)
+        self.load_from_table(table, writer)
+            .await?
+            .ok_or_else(|| Error::TableMissingAfterCreate {
+                table_path: table.to_owned(),
+            })
     }
 }
 
@@ -263,10 +250,7 @@ mod tests {
     };
 
     use arrow::datatypes::{DataType, Field, Schema};
-    use fluss::{
-        client::FlussTable,
-        metadata::{TableDescriptor, TablePath},
-    };
+    use fluss::metadata::{TableDescriptor, TablePath};
     use iggy_connector_sdk::{ConsumedMessage, Schema as IggySchema};
 
     use super::{Error, SchemaCatalog, sample_and_infer_schema, table_descriptor_from_schema};
@@ -278,6 +262,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingWriter {
         created: Mutex<Vec<(TablePath, TableDescriptor)>>,
+        existing: Mutex<HashMap<TablePath, TableDescriptor>>,
         fail_create: bool,
         fail_get: bool,
     }
@@ -305,17 +290,29 @@ mod tests {
                 .lock()
                 .expect("created tables lock should not be poisoned")
                 .push((table_path.clone(), table_descriptor.clone()));
+            self.existing
+                .lock()
+                .expect("existing tables lock should not be poisoned")
+                .entry(table_path.clone())
+                .or_insert_with(|| table_descriptor.clone());
             Ok(())
         }
 
-        async fn get_table(&self, table_path: &TablePath) -> Result<FlussTable<'_>, WriterError> {
+        async fn get_table_descriptor(
+            &self,
+            table_path: &TablePath,
+        ) -> Result<TableDescriptor, WriterError> {
             if self.fail_get {
-                Err(WriterError::ConnectionNotInitialized)
-            } else {
-                Err(WriterError::TableNotFound {
+                return Err(WriterError::ConnectionNotInitialized);
+            }
+            self.existing
+                .lock()
+                .expect("existing tables lock should not be poisoned")
+                .get(table_path)
+                .cloned()
+                .ok_or_else(|| WriterError::TableNotFound {
                     table_path: table_path.clone(),
                 })
-            }
         }
     }
 
@@ -458,6 +455,39 @@ mod tests {
         assert_eq!(created[0].0, table);
         assert_eq!(created[0].1, entry.table_descriptor);
         assert_eq!(entry.schema.fields().len(), 2);
+    }
+
+    #[test]
+    fn given_table_created_concurrently_when_inferring_should_cache_existing_table_schema() {
+        let catalog = SchemaCatalog::default();
+        let table = TablePath::new("fluss", "orders");
+        let winner_schema = Schema::new(vec![Field::new("id", DataType::Utf8, true)]);
+        let winner_descriptor = table_descriptor_from_schema(&winner_schema, &table, None)
+            .expect("Winner descriptor should build");
+        let writer = RecordingWriter::default();
+        writer
+            .existing
+            .lock()
+            .expect("existing tables lock should not be poisoned")
+            .insert(table.clone(), winner_descriptor.clone());
+        let messages = [json_message(1, r#"{"id":1}"#)];
+
+        let entry = run_async(catalog.infer_and_create_table(&table, &messages, &writer))
+            .expect("Existing table should be loaded");
+        let cached = catalog
+            .get_schema_entry(&table)
+            .expect("Table should be cached");
+
+        assert_eq!(entry.table_descriptor, winner_descriptor);
+        assert_eq!(cached.table_descriptor, winner_descriptor);
+        assert_eq!(
+            entry
+                .schema
+                .field_with_name("id")
+                .expect("id field should exist")
+                .data_type(),
+            &DataType::Utf8
+        );
     }
 
     #[test]
