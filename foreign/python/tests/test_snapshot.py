@@ -64,3 +64,12 @@ class TestSnapshot:
         """Combining 'all' with another snapshot type is rejected."""
         with pytest.raises(RuntimeError, match="(?i)invalid command"):
             await iggy_client.snapshot("deflated", ["all", "test"])
+
+    @pytest.mark.asyncio
+    async def test_snapshot_deduplicates_snapshot_types(self, iggy_client: IggyClient):
+        """Duplicate snapshot types are deduplicated before encoding."""
+        data = await iggy_client.snapshot("deflated", ["test"] * 255 + [" TEST "])
+
+        assert isinstance(data, bytes)
+        assert len(data) > 0
+        assert zipfile.is_zipfile(io.BytesIO(data))
