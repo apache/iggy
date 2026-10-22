@@ -170,6 +170,10 @@ impl StaticTableRouter {
         };
 
         let batch_rows = record_batch.num_rows();
+        if batch_rows == 0 {
+            return RouteOutcome { stat, last_error };
+        }
+
         let write_stat = match writer
             .write_to_table(
                 &self.table_path,
@@ -487,6 +491,40 @@ mod tests {
         assert_eq!(streams.iter().collect::<Vec<_>>(), vec![Some("orders"); 2]);
         assert_eq!(topics.iter().collect::<Vec<_>>(), vec![Some("created"); 2]);
         assert_eq!(partition_ids.iter().collect::<Vec<_>>(), vec![Some(7); 2]);
+    }
+
+    #[test]
+    fn given_only_invalid_messages_when_routing_should_not_write_empty_batch() {
+        let mut router = StaticTableRouter::new(&test_config());
+        let writer = RecordingWriter::default();
+        let messages = vec![
+            test_message(101, Payload::Raw(vec![0xff])),
+            test_message(102, Payload::Raw(vec![0xfe])),
+        ];
+
+        run_async(router.init(&writer)).expect("Router should initialize");
+        let RouteOutcome {
+            stat: stats,
+            last_error,
+        } = run_async(router.route(
+            &writer,
+            &test_topic_metadata(),
+            test_messages_metadata(),
+            messages,
+        ));
+
+        assert_stats(&stats, 0, 2);
+        assert!(matches!(
+            last_error,
+            Some(RouterError::FailedToAddToRecordBatch { .. })
+        ));
+        assert!(
+            writer
+                .table_writes
+                .lock()
+                .expect("Table writes lock should not be poisoned")
+                .is_empty()
+        );
     }
 
     #[test]

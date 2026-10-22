@@ -101,7 +101,6 @@ An absent or empty `primary_keys` list creates a log table.
 ```toml
 [plugin_config.tables."fluss.iggy_messages"]
 primary_keys = []
-bucket_keys = []
 bucket_count = 1
 
 [plugin_config.tables."fluss.iggy_messages".properties]
@@ -113,7 +112,7 @@ bucket_count = 1
 | `primary_keys`   | string array | Column names for a primary-key table; omit or leave empty for a log table. |
 | `partitioned_by` | string array | Columns used to partition the table.                                       |
 | `bucket_keys`    | string array | Columns used to distribute rows across buckets.                            |
-| `bucket_count`   | integer      | Bucket count passed to Fluss when `bucket_keys` is set.                    |
+| `bucket_count`   | integer      | Number of buckets. Works with or without `bucket_keys`.                    |
 | `properties`     | string map   | Fluss table properties.                                                    |
 
 Named columns must exist in the table schema. The sink creates the table, but

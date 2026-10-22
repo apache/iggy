@@ -92,24 +92,28 @@ pub struct TableConfig {
 }
 
 impl TableConfig {
-    pub(crate) fn enrich_schema_builder(&self, mut builder: SchemaBuilder) -> SchemaBuilder {
+    pub(crate) fn enrich_schema_builder(
+        &self,
+        mut builder: SchemaBuilder,
+    ) -> fluss::error::Result<SchemaBuilder> {
         if let Some(primary_keys) = &self.primary_keys
             && !primary_keys.is_empty()
         {
-            builder = builder
-                .primary_key(primary_keys.clone())
-                .expect("Enrich only once");
+            builder = builder.primary_key(primary_keys.clone())?;
         }
 
-        builder
+        Ok(builder)
     }
 
     pub(crate) fn enrich_descriptor_builder(
         &self,
         mut builder: TableDescriptorBuilder,
     ) -> TableDescriptorBuilder {
-        if let Some(bucket_keys) = &self.bucket_keys {
-            builder = builder.distributed_by(self.bucket_count, bucket_keys.to_owned());
+        if self.bucket_keys.is_some() || self.bucket_count.is_some() {
+            builder = builder.distributed_by(
+                self.bucket_count,
+                self.bucket_keys.clone().unwrap_or_default(),
+            );
         }
         if let Some(partitioned_by) = &self.partitioned_by {
             builder = builder.partitioned_by(partitioned_by.to_owned());

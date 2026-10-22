@@ -184,7 +184,12 @@ fn table_descriptor_from_schema(
         SchemaBuilder::new().with_row_type(&fluss::metadata::DataType::Row(row_type));
 
     if let Some(table_config) = table_config {
-        schema_builder = table_config.enrich_schema_builder(schema_builder);
+        schema_builder = table_config
+            .enrich_schema_builder(schema_builder)
+            .map_err(|error| Error::BuildTableDescriptor {
+                table_path: table.clone(),
+                reason: error.to_string(),
+            })?;
     }
 
     let fluss_schema = schema_builder

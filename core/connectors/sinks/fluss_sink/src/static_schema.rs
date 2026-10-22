@@ -423,7 +423,7 @@ impl<'a> StaticTableDescriptorBuilder<'a> {
         let mut builder = fluss::metadata::Schema::builder().with_columns(columns);
 
         if let Some(table_config) = &self.table_config {
-            builder = table_config.enrich_schema_builder(builder);
+            builder = table_config.enrich_schema_builder(builder)?;
         }
         Ok(builder.build()?)
     }
