@@ -464,6 +464,19 @@ public sealed partial class TcpMessageStream
         or IggyInvalidStatusCodeException { FromServer: true, Committed: true, StatusCode: VsrError.STALE_CLIENT };
 
     /// <summary>
+    ///     Whether a failure can clear on another link or in a later attempt: a lost link, a refusal during a view
+    ///     change or a primary move, or a link that the server detached. The Rust sweep goes on after the same set. A
+    ///     recovery resumes the session it kept only after these, because a retry repeats any other failure, such as
+    ///     a malformed roster.
+    /// </summary>
+    private static bool IsTransientFailure(Exception error) => VsrConnection.IsConnectionException(error)
+        || error is IggyInvalidStatusCodeException
+        {
+            StatusCode: VsrError.TRANSIENT_NOT_COMMITTED or VsrError.TRANSIENT_NOT_ACCEPTED or VsrError.NOT_PRIMARY
+                or VsrError.STALE_CLIENT
+        };
+
+    /// <summary>
     ///     The error a caller sees for a failed attempt. The eviction type is internal, so an eviction surfaces as
     ///     the verdict it carries. Apply it only where the error leaves for a caller: the session failure and
     ///     unknown outcome checks need the eviction itself.
@@ -522,19 +535,32 @@ public sealed partial class TcpMessageStream
             var attempts = 0;
             while (_consensusSession.Ended(generation) is null && SignInSettings() is { } settings)
             {
+                // The first attempt finds the session that failed. A later one finds a session bound only when an
+                // earlier attempt kept it.
+                var resumes = attempts > 0 && _consensusSession.IsBound;
                 try
                 {
                     lock (_pollRoutingGate)
                     {
                         EnsureSignInOwner(generation);
-                        ResetConsensusSession(ConnectionState.Disconnected, continues: true);
+                        if (!resumes)
+                        {
+                            ResetConsensusSession(ConnectionState.Disconnected, continues: true);
+                        }
+                    }
+                    if (resumes)
+                    {
+                        await TryEstablishConnectionAsync(true, token, generation, continues: true);
+                        StartHeartbeat();
+                        return;
                     }
                     await TryEstablishConnectionAsync(false, token, generation);
                     await AutoLoginAsync(settings, token, generation, continues: true);
                     return;
                 }
                 catch (Exception error) when (!token.IsCancellationRequested
-                    && _consensusSession.Ended(generation) is null)
+                    && _consensusSession.Ended(generation) is null
+                    && (!_consensusSession.IsBound || IsTransientFailure(error)))
                 {
                     _logger.LogWarning(error, "Consensus session recovery will retry before a sign-in decision");
                     await Task.Delay(ReconnectDelay(attempts++), token);

@@ -1003,7 +1003,8 @@ public sealed partial class TcpMessageStream : IIggyClient
         };
     }
 
-    private async Task TryEstablishConnectionAsync(bool autoLogin, CancellationToken token, ulong? startedUnder = null)
+    private async Task TryEstablishConnectionAsync(bool autoLogin, CancellationToken token, ulong? startedUnder = null,
+        bool continues = false)
     {
         var owner = startedUnder ?? _consensusSession.Generation;
         var attempts = 0;
@@ -1058,7 +1059,7 @@ public sealed partial class TcpMessageStream : IIggyClient
                         }
                         else
                         {
-                            await AutoLoginAsync(settings, token, owner);
+                            await AutoLoginAsync(settings, token, owner, continues);
                         }
                     }
                     return;

@@ -246,6 +246,13 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
                 }
             }
             var canceled = token.IsCancellationRequested;
+            // A session that the recovery bound outlives a failed roster read, so its next attempt resumes it.
+            if (continues && bound && !canceled && !IsSessionFailure(error))
+            {
+                await DropConnectionAsync();
+                SetConnectionState(ConnectionState.Disconnected);
+                throw;
+            }
             // A register refused before admission leaves no session behind, so the recovery signs in again.
             var unadmitted = continues && !bound && error is IggyInvalidStatusCodeException
             {

@@ -200,6 +200,67 @@ public sealed partial class NativeRecoveryTests
     }
 
     [Theory]
+    [InlineData("lost link")]
+    [InlineData("malformed roster")]
+    public async Task given_a_bound_recovery_sign_in_when_its_roster_read_fails_should_keep_the_session(string failure)
+    {
+        // A lost link ends the roster read only at its 30 s deadline.
+        using var cluster = new RecoveryCluster(TimeSpan.FromSeconds(45));
+        using var client = await cluster.ConnectAsync();
+        const BindingFlags fields = BindingFlags.Instance | BindingFlags.NonPublic;
+        var malformed = failure == "malformed roster";
+        var corrupt = malformed;
+        var lost = 0;
+        var registrations = new ConcurrentQueue<MockRequest>();
+        cluster.OnRegister = request =>
+        {
+            registrations.Enqueue(request);
+            return Answer(request);
+        };
+        cluster.BeforeReply = (request, _) =>
+        {
+            if (!malformed && request.Code == CommandCodes.GET_CLUSTER_METADATA_CODE && !registrations.IsEmpty
+                && Interlocked.Exchange(ref lost, 1) == 0)
+            {
+                throw new IOException("The bootstrap link is lost.");
+            }
+        };
+        cluster.OnRoster = request =>
+        {
+            if (!Volatile.Read(ref corrupt) || registrations.IsEmpty)
+            {
+                return null;
+            }
+            var name = new List<byte>();
+            WriteString(name, "recovery");
+            return Reply(request.Operation, name.ToArray());
+        };
+        cluster.PingEviction = EvictionReason.SessionError;
+        await Assert.ThrowsAnyAsync<Exception>(() => client.PingAsync(cluster.Token));
+        await cluster.UntilAsync(() => !registrations.IsEmpty);
+        var binds = Binds(cluster);
+
+        if (malformed)
+        {
+            // The roster stays malformed, so a recovery that read it again would not end.
+            await ((Task)typeof(TcpMessageStream).GetField("_sessionRecovery", fields)!.GetValue(client)!)
+                .WaitAsync(cluster.Token);
+            Assert.Equal(binds, Binds(cluster));
+            Assert.Equal(ConnectionState.Disconnected,
+                (ConnectionState)(int)typeof(TcpMessageStream).GetField("_stateValue", fields)!.GetValue(client)!);
+            Volatile.Write(ref corrupt, false);
+            await client.ConnectAsync(cluster.Token);
+        }
+        else
+        {
+            await cluster.UntilAsync(() => Binds(cluster) > binds);
+        }
+        await StoreAsync(client, cluster.Token);
+
+        Assert.Equal(Assert.Single(registrations).ClientId, Assert.Single(cluster.Writes).ClientId);
+    }
+
+    [Theory]
     [InlineData("invalid password")]
     [InlineData("invalid token")]
     [InlineData("refused")]
