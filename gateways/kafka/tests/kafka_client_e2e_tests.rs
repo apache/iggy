@@ -1493,6 +1493,124 @@ fn consume_as_group(gateway: SocketAddr, count: usize) -> String {
     .expect_ran("java console consumer in a group")
 }
 
+/// KIP-345 with the Java client. A static consumer sends no `LeaveGroup` on close, so its
+/// member stays in the group, holding the only partition, for its whole session. The second run
+/// comes back under the same `group.instance.id` and must take that member over at once. Without
+/// replacement it would join as a new member, wait out a rebalance its old incarnation never
+/// rejoins, and exit after `--timeout-ms` with nothing read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_a_static_java_consumer_when_it_restarts_within_its_session_should_resume_at_once() {
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+    produce_with_kcat(gateway, &RECORDS);
+    let first = consume_as_static_member(gateway, RECORDS.len());
+    assert_eq!(
+        records_read(&first).len(),
+        RECORDS.len(),
+        "the first run must read every record, got: {first}"
+    );
+
+    produce_with_kcat(gateway, &[("k4", "delta")]);
+    let second = consume_as_static_member(gateway, 1);
+    assert_eq!(
+        records_read(&second),
+        vec![format!("Offset:{}\tk4\tdelta", RECORDS.len())],
+        "the returning static member must take its partition back, got: {second}"
+    );
+}
+
+/// [`consume_as_group`] as static member `e2e-static-0` of group `e2e-static`, with a session long
+/// enough that its previous incarnation is still a member when it returns.
+fn consume_as_static_member(gateway: SocketAddr, count: usize) -> String {
+    let count = count.to_string();
+    run_client(
+        KAFKA_IMAGE,
+        &[
+            "/opt/kafka/bin/kafka-console-consumer.sh",
+            "--bootstrap-server",
+            &gateway.to_string(),
+            "--topic",
+            TOPIC,
+            "--group",
+            "e2e-static",
+            "--consumer-property",
+            "group.instance.id=e2e-static-0",
+            "--consumer-property",
+            "session.timeout.ms=60000",
+            "--from-beginning",
+            "--max-messages",
+            &count,
+            "--timeout-ms",
+            "20000",
+            "--property",
+            "print.offset=true",
+            "--property",
+            "print.key=true",
+        ],
+        &[],
+    )
+    .expect_ran("java console consumer as a static member")
+}
+
+/// KIP-345 with librdkafka, which sends `JoinGroup` below v9: the returning member is told the
+/// previous leader, acts as a follower, and gets its old assignment back through `SyncGroup`.
+/// Without replacement the second run would wait on a rebalance its old incarnation never rejoins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_a_static_kcat_consumer_when_it_restarts_within_its_session_should_resume_at_once() {
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+    produce_with_kcat(gateway, &RECORDS);
+    let first = consume_as_static_kcat(gateway);
+    assert_eq!(
+        kcat_records_read(&first).len(),
+        RECORDS.len(),
+        "the first run must read every record, got: {first}"
+    );
+
+    produce_with_kcat(gateway, &[("k4", "delta")]);
+    let second = consume_as_static_kcat(gateway);
+    assert_eq!(
+        kcat_records_read(&second),
+        vec![format!("record {} k4=delta", RECORDS.len())],
+        "the returning static member must take its partition back, got: {second}"
+    );
+}
+
+/// kcat in balanced mode as static member `e2e-kcat-0` of group `e2e-kcat-static`, reading to
+/// the end of its partitions. It commits as it closes and sends no `LeaveGroup`.
+fn consume_as_static_kcat(gateway: SocketAddr) -> String {
+    run_client(
+        KCAT_IMAGE,
+        &[
+            "-b",
+            &gateway.to_string(),
+            "-G",
+            "e2e-kcat-static",
+            "-X",
+            "group.instance.id=e2e-kcat-0",
+            "-X",
+            "session.timeout.ms=60000",
+            "-X",
+            "auto.offset.reset=earliest",
+            "-e",
+            "-f",
+            "record %o %k=%s\n",
+            TOPIC,
+        ],
+        &[],
+    )
+    .expect_ran("kcat as a static member")
+}
+
+fn kcat_records_read(output: &str) -> Vec<&str> {
+    output
+        .lines()
+        .filter(|line| line.starts_with("record "))
+        .collect()
+}
+
 /// With auto topic creation on, a stock Java producer sends to a topic nobody created and succeeds.
 /// Its first `Metadata` is answered `UNKNOWN_TOPIC_OR_PARTITION` while the gateway creates the
 /// topic, and it retries until the topic appears.

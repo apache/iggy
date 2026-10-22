@@ -197,7 +197,8 @@ pub const ERROR_UNSUPPORTED_COMPRESSION_TYPE: i16 =
 /// this code, and the client rejoins carrying it.
 pub const ERROR_MEMBER_ID_REQUIRED: i16 = 79;
 pub const ERROR_GROUP_MAX_SIZE_REACHED: i16 = 81;
-/// Sent only by `LeaveGroup`: the member id does not hold the `group_instance_id` it named.
+/// The member id does not hold the `group_instance_id` it named, or a static member that
+/// returned has since replaced it.
 pub const ERROR_FENCED_INSTANCE_ID: i16 = 82;
 /// Produce: a record or batch this gateway cannot map.
 ///
