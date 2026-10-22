@@ -27,14 +27,17 @@ pub enum PrimaryRebalanceKind {
     PartitionReply = 3,
     SourceProbe = 4,
     SourceReply = 5,
+    PrimaryTransfer = 6,
 }
 
-/// Same-release readiness exchange, always routed through the metadata owner.
+/// Same-release rebalance exchange, always routed through the metadata owner.
 ///
 /// `view` identifies the metadata coordinator's view, while `partition_view`
-/// belongs to the probed partition. A ready reply supplies evidence to the
-/// coordinator; it does not transfer ownership. Ingress must authenticate
-/// `replica`, and the coordinator must correlate the nonce and history fields.
+/// belongs to the probed partition. A ready reply only supplies evidence to the
+/// coordinator. A `PrimaryTransfer` from the metadata primary of `view` grants
+/// the source primary of `partition_view` a handoff to `target`. Ingress must
+/// authenticate `replica`, and the coordinator must correlate the nonce and
+/// history fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
 #[repr(C)]
 pub struct PrimaryRebalanceHeader {
@@ -56,7 +59,9 @@ pub struct PrimaryRebalanceHeader {
     pub partition_view: u32,
     pub kind: PrimaryRebalanceKind,
     pub ready: u8,
-    pub reserved: [u8; 74],
+    /// The replica a `PrimaryTransfer` hands off to. Zero in every other kind.
+    pub target: u8,
+    pub reserved: [u8; 73],
 }
 
 const _: () = assert!(size_of::<PrimaryRebalanceHeader>() == HEADER_SIZE);
@@ -111,7 +116,7 @@ impl ConsensusHeader for PrimaryRebalanceHeader {
                 "primary rebalance body checksum and release must be zero".into(),
             ));
         }
-        if self.reserved_frame != [0; 66] || self.reserved != [0; 74] {
+        if self.reserved_frame != [0; 66] || self.reserved != [0; 73] {
             return Err(ConsensusError::InvalidField(
                 "primary rebalance reserved bytes must be zero".into(),
             ));
@@ -128,10 +133,17 @@ impl ConsensusHeader for PrimaryRebalanceHeader {
                     PrimaryRebalanceKind::MetadataProbe
                         | PrimaryRebalanceKind::PartitionProbe
                         | PrimaryRebalanceKind::SourceProbe
+                        | PrimaryRebalanceKind::PrimaryTransfer
                 ))
         {
             return Err(ConsensusError::InvalidField(
-                "primary rebalance probes cannot be ready; replies require 0 or 1".into(),
+                "primary rebalance probes and grants cannot be ready; replies require 0 or 1"
+                    .into(),
+            ));
+        }
+        if self.kind != PrimaryRebalanceKind::PrimaryTransfer && self.target != 0 {
+            return Err(ConsensusError::InvalidField(
+                "only a primary rebalance grant names a target".into(),
             ));
         }
         if self.kind != PrimaryRebalanceKind::MetadataProbe
@@ -157,7 +169,8 @@ impl ConsensusHeader for PrimaryRebalanceHeader {
             PrimaryRebalanceKind::PartitionProbe
             | PrimaryRebalanceKind::PartitionReply
             | PrimaryRebalanceKind::SourceProbe
-            | PrimaryRebalanceKind::SourceReply => {
+            | PrimaryRebalanceKind::SourceReply
+            | PrimaryRebalanceKind::PrimaryTransfer => {
                 if self.created_revision == 0 {
                     return Err(ConsensusError::InvalidField(
                         "primary rebalance partition revision must be nonzero".into(),
@@ -182,6 +195,7 @@ mod tests {
                 | PrimaryRebalanceKind::PartitionReply
                 | PrimaryRebalanceKind::SourceProbe
                 | PrimaryRebalanceKind::SourceReply
+                | PrimaryRebalanceKind::PrimaryTransfer
         );
         PrimaryRebalanceHeader {
             checksum: 0,
@@ -201,7 +215,8 @@ mod tests {
             partition_view: if partition { 5 } else { 0 },
             kind,
             ready: 0,
-            reserved: [0; 74],
+            target: u8::from(kind == PrimaryRebalanceKind::PrimaryTransfer),
+            reserved: [0; 73],
         }
     }
 
@@ -215,7 +230,8 @@ mod tests {
         assert_eq!(offset_of!(PrimaryRebalanceHeader, partition_view), 176);
         assert_eq!(offset_of!(PrimaryRebalanceHeader, kind), 180);
         assert_eq!(offset_of!(PrimaryRebalanceHeader, ready), 181);
-        assert_eq!(offset_of!(PrimaryRebalanceHeader, reserved), 182);
+        assert_eq!(offset_of!(PrimaryRebalanceHeader, target), 182);
+        assert_eq!(offset_of!(PrimaryRebalanceHeader, reserved), 183);
         for kind in [
             PrimaryRebalanceKind::MetadataProbe,
             PrimaryRebalanceKind::MetadataReply,
@@ -223,6 +239,7 @@ mod tests {
             PrimaryRebalanceKind::PartitionReply,
             PrimaryRebalanceKind::SourceProbe,
             PrimaryRebalanceKind::SourceReply,
+            PrimaryRebalanceKind::PrimaryTransfer,
         ] {
             for ready in 0..=1 {
                 let mut original = header(kind);
@@ -271,6 +288,7 @@ mod tests {
             PrimaryRebalanceKind::PartitionReply,
             PrimaryRebalanceKind::SourceProbe,
             PrimaryRebalanceKind::SourceReply,
+            PrimaryRebalanceKind::PrimaryTransfer,
         ] {
             let mut invalid = header(kind);
             invalid.quorum_age_ns = 0;
@@ -288,14 +306,14 @@ mod tests {
         valid.seal();
         let mut bytes: AVec<u8, ConstAlign<16>> = AVec::new(16);
         bytes.extend_from_slice(bytemuck::bytes_of(&valid));
-        for offset in [32, 52, 61, 128, 144, 152, 160, 168, 176, 180, 181] {
+        for offset in [32, 52, 61, 128, 144, 152, 160, 168, 176, 180, 181, 182] {
             bytes[offset] ^= 1;
             let corrupted =
                 bytemuck::checked::try_from_bytes::<PrimaryRebalanceHeader>(&bytes).unwrap();
             assert!(corrupted.verify_frame().is_err(), "offset {offset}");
             bytes[offset] ^= 1;
         }
-        for kind in 6..=u8::MAX {
+        for kind in 7..=u8::MAX {
             bytes[offset_of!(PrimaryRebalanceHeader, kind)] = kind;
             assert!(bytemuck::checked::try_from_bytes::<PrimaryRebalanceHeader>(&bytes).is_err());
         }
@@ -316,10 +334,11 @@ mod tests {
             |value: &mut PrimaryRebalanceHeader| value.checksum_body = 1,
             |value: &mut PrimaryRebalanceHeader| value.release = 1,
             |value: &mut PrimaryRebalanceHeader| value.reserved_frame[65] = 1,
-            |value: &mut PrimaryRebalanceHeader| value.reserved[73] = 1,
+            |value: &mut PrimaryRebalanceHeader| value.reserved[72] = 1,
             |value: &mut PrimaryRebalanceHeader| value.nonce = 0,
             |value: &mut PrimaryRebalanceHeader| value.ready = 2,
             |value: &mut PrimaryRebalanceHeader| value.created_revision = 0,
+            |value: &mut PrimaryRebalanceHeader| value.target = 1,
         ] {
             let mut invalid = valid;
             change(&mut invalid);
@@ -346,6 +365,7 @@ mod tests {
             PrimaryRebalanceKind::PartitionReply,
             PrimaryRebalanceKind::SourceProbe,
             PrimaryRebalanceKind::SourceReply,
+            PrimaryRebalanceKind::PrimaryTransfer,
         ] {
             let mut invalid = header(kind);
             invalid.created_revision = 0;

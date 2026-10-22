@@ -15533,6 +15533,7 @@ mod primary_transfer_crash_tests {
         SourceReply,
         PartitionProbe,
         PartitionReply,
+        PrimaryTransfer,
         StartViewChange,
         DoViewChange,
         StartView,
@@ -15576,6 +15577,7 @@ mod primary_transfer_crash_tests {
                     Kind::SourceReply,
                     Kind::PartitionProbe,
                     Kind::PartitionReply,
+                    Kind::PrimaryTransfer,
                     Kind::StartViewChange,
                     Kind::DoViewChange,
                     Kind::StartView,
@@ -15601,6 +15603,7 @@ mod primary_transfer_crash_tests {
                     PrimaryRebalanceKind::SourceReply => Kind::SourceReply,
                     PrimaryRebalanceKind::PartitionProbe => Kind::PartitionProbe,
                     PrimaryRebalanceKind::PartitionReply => Kind::PartitionReply,
+                    PrimaryRebalanceKind::PrimaryTransfer => Kind::PrimaryTransfer,
                 };
                 (
                     kind,
@@ -15664,6 +15667,16 @@ mod primary_transfer_crash_tests {
             })
             .collect();
         handoffs.push(reply);
+        handoffs.extend(
+            trace[confirmed..]
+                .iter()
+                .find(|handoff| {
+                    handoff.kind == Kind::PrimaryTransfer
+                        && handoff.group == reply.group
+                        && handoff.view == reply.view
+                })
+                .copied(),
+        );
         let started = *trace[confirmed..].iter().find(|handoff| {
             handoff.kind == Kind::StartView
                 && handoff.group == reply.group

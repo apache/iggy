@@ -450,8 +450,6 @@ mod tests {
     use partitions::PreparedPrimaryTransfer;
     use std::cell::Cell;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn test_outbox() -> SimOutbox {
         SimOutbox::new(
@@ -474,12 +472,10 @@ mod tests {
         ))));
         let start = MessageBus::monotonic_now(&bus);
         let timeout = Duration::from_secs(1);
-        let active = Arc::new(AtomicBool::new(true));
         let grant = PreparedPrimaryTransfer {
             created_revision: 1,
             expected_view: 0,
             target: 1,
-            active: Arc::clone(&active),
             expires_at: start + timeout,
         };
         assert!(grant.is_active_at(MessageBus::monotonic_now(&bus)));
@@ -494,7 +490,6 @@ mod tests {
         assert_eq!(timer.advance(timeout / 2), [] as [u64; 0]);
         assert_eq!(MessageBus::monotonic_now(&bus), start + timeout);
         assert!(!grant.is_active_at(MessageBus::monotonic_now(&bus)));
-        assert!(active.load(Ordering::Acquire));
     }
 
     #[test]

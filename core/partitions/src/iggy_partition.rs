@@ -5631,6 +5631,9 @@ where
         request.is_active_at(self.consensus.message_bus().monotonic_now())
             && request.created_revision == self.created_revision()
             && request.expected_view == self.consensus.view()
+            // A fenced backup refuses prepares while the primary keeps
+            // committing, so its drain stalls until the grant expires.
+            && self.consensus.is_primary()
             && request.target < self.consensus.replica_count()
             && request.target != self.consensus.primary_index(self.consensus.view())
             && self.consensus.is_normal()
@@ -5902,14 +5905,14 @@ where
             self.transition,
             Some(PendingPartitionTransition::PrimaryTransfer { .. })
         ) && (self.consensus.commit_min() < self.consensus.commit_max()
-            || self.consensus.is_primary() && !self.consensus.pipeline_is_empty())
+            || !self.consensus.pipeline_is_empty())
         {
             // Commit selection refuses history transitions. This synchronous
             // window keeps admission fenced between pump events while draining
             // the already committed prefix before handing leadership away.
             let transition = self.transition.take();
             let mut headers = self.select_persistable_commits(config);
-            let reply = !headers.is_empty() && self.consensus.is_primary();
+            let reply = !headers.is_empty();
             if headers.is_empty() {
                 headers = self.collect_committable_from_journal(COMMIT_WALK_OPS_MAX, config);
             }
@@ -14278,7 +14281,6 @@ mod tests {
             created_revision: partition.created_revision(),
             expected_view: partition.consensus.view(),
             target: 1,
-            active: Arc::new(AtomicBool::new(true)),
             expires_at: std::time::Instant::now() + TEST_GRANT_TTL,
         }
     }
@@ -14286,7 +14288,7 @@ mod tests {
     #[compio::test]
     async fn given_busy_wal_when_primary_transfer_drains_should_fence_admission_and_release_pause()
     {
-        for (cancel, expire) in [(false, false), (true, false), (false, true)] {
+        for expire in [false, true] {
             let directory = tempfile::tempdir().unwrap();
             let (mut partition, replies) = recording_partition_at(0, 3);
             partition.set_created_revision(7);
@@ -14295,24 +14297,34 @@ mod tests {
             let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
             let writer = hold_wal_writer(&persistence);
             let request = primary_transfer_grant(&partition);
-            for (created_revision, expected_view, active) in [
-                (request.created_revision + 1, request.expected_view, true),
-                (request.created_revision, request.expected_view + 1, true),
-                (request.created_revision, request.expected_view, false),
+            for (created_revision, expected_view, expires_at) in [
+                (
+                    request.created_revision + 1,
+                    request.expected_view,
+                    request.expires_at,
+                ),
+                (
+                    request.created_revision,
+                    request.expected_view + 1,
+                    request.expires_at,
+                ),
+                (
+                    request.created_revision,
+                    request.expected_view,
+                    std::time::Instant::now(),
+                ),
             ] {
                 assert!(
                     !partition.defer_primary_transfer(crate::PreparedPrimaryTransfer {
                         created_revision,
                         expected_view,
                         target: request.target,
-                        active: Arc::new(AtomicBool::new(active)),
-                        expires_at: request.expires_at,
+                        expires_at,
                     })
                 );
                 assert!(partition.transition.is_none());
                 assert!(persistence.has_capacity(size_of::<PrepareHeader>()));
             }
-            let active = Arc::clone(&request.active);
             assert!(partition.defer_primary_transfer(request));
             let config = repair_config();
             assert!(matches!(
@@ -14334,18 +14346,13 @@ mod tests {
             assert_eq!(partition.consensus.sequencer().current_sequence(), 0);
             assert!(!partition.defer_primary_transfer(primary_transfer_grant(&partition)));
 
-            if cancel || expire {
-                if expire {
-                    let Some(PendingPartitionTransition::PrimaryTransfer { request, .. }) =
-                        &mut partition.transition
-                    else {
-                        panic!("the held writer must keep its grant");
-                    };
-                    request.expires_at = std::time::Instant::now();
-                    assert!(active.load(Ordering::Acquire));
-                } else {
-                    active.store(false, Ordering::Release);
-                }
+            if expire {
+                let Some(PendingPartitionTransition::PrimaryTransfer { request, .. }) =
+                    &mut partition.transition
+                else {
+                    panic!("the held writer must keep its grant");
+                };
+                request.expires_at = std::time::Instant::now();
                 assert!(matches!(
                     partition.resume_io(&config).await,
                     crate::PartitionIoStep::Pending
@@ -14355,7 +14362,7 @@ mod tests {
             }
             writer.await;
             let step = partition.resume_io(&config).await;
-            if cancel || expire {
+            if expire {
                 assert!(matches!(step, crate::PartitionIoStep::Pending));
             } else {
                 let crate::PartitionIoStep::PrimaryTransfer(request) = step else {
@@ -14364,7 +14371,6 @@ mod tests {
                 assert_eq!(request.created_revision, 7);
                 assert_eq!(request.expected_view, 0);
                 assert_eq!(request.target, 1);
-                assert!(Arc::ptr_eq(&request.active, &active));
             }
             assert!(persistence.has_capacity(size_of::<PrepareHeader>()));
             assert_eq!(partition.consensus.view(), 0);
@@ -14650,9 +14656,7 @@ mod tests {
     async fn given_planned_primary_transfer_when_a_view_frame_arrives_should_preserve_real_transition()
      {
         let (mut partition, _) = recording_partition_at(0, 3);
-        let request = primary_transfer_grant(&partition);
-        let active = Arc::clone(&request.active);
-        assert!(partition.defer_primary_transfer(request));
+        assert!(partition.defer_primary_transfer(primary_transfer_grant(&partition)));
         let message = Message::<StartViewHeader>::new(size_of::<StartViewHeader>())
             .transmute_header(|_, header: &mut StartViewHeader| {
                 header.command = Command::StartView;
@@ -14661,10 +14665,6 @@ mod tests {
                 header.replica = 1;
             });
         partition.defer_view_transition(server_common::MessageBag::StartView(message));
-        assert!(
-            active.load(Ordering::Acquire),
-            "cancellation must leave the unused grant available to expire"
-        );
         partition.cancel_primary_transfer();
         assert!(matches!(
             partition.transition,
@@ -14673,6 +14673,55 @@ mod tests {
         assert!(matches!(partition.resume_io(&repair_config()).await,
             crate::PartitionIoStep::Transition(server_common::MessageBag::StartView(message))
             if message.header().view == 1));
+    }
+
+    #[compio::test]
+    async fn given_backup_replica_when_granted_a_primary_transfer_should_refuse_and_keep_committing()
+     {
+        const BACKUP: u8 = 2;
+        for target in [1, BACKUP] {
+            let root = tempfile::tempdir().unwrap();
+            let mut config = repair_config();
+            config.path_layout.streams_root = root.path().to_string_lossy().into_owned();
+            let directory = std::path::PathBuf::from(config.get_partition_path(1, 1, 0));
+            std::fs::create_dir_all(&directory).unwrap();
+            let (mut backup, _) = recording_partition_at(BACKUP, 3);
+            backup.set_partition_dir(directory.to_string_lossy().into_owned());
+            set_offset_dirs_under(&mut backup, &directory);
+            backup.open_persistence().await.unwrap();
+            backup.log.retire_front().unwrap();
+            backup.install_empty_segment(&config, 0).await.unwrap();
+            backup.set_io_notifier(
+                Rc::new(|_, _| {}),
+                crate::largest_legal_job_charge().unwrap(),
+            );
+            let persistence = Rc::clone(backup.persistence.as_ref().unwrap());
+            let writer = hold_wal_writer(&persistence);
+            let first = checksummed_segment_prepare(1, 0, 0, b"before-grant");
+            let parent = first.header().checksum;
+            backup.on_replicate(first).await;
+            assert!(
+                !backup.defer_primary_transfer(crate::PreparedPrimaryTransfer {
+                    target,
+                    ..primary_transfer_grant(&backup)
+                }),
+                "backup {BACKUP} accepted a grant for target {target}"
+            );
+            assert!(backup.transition.is_none());
+            assert!(persistence.has_capacity(size_of::<PrepareHeader>()));
+
+            // Replica 1 acks op 2, so the primary commits it. An unfenced
+            // backup journals the forwarded prepare and commits it as well.
+            backup
+                .on_replicate(checksummed_segment_prepare(2, parent, 1, b"after-grant"))
+                .await;
+            writer.await;
+            commit_on_heartbeat(&mut backup, &config, 2).await;
+            settle_partition_io(&mut backup, &config).await;
+            assert_eq!(backup.consensus.sequencer().current_sequence(), 2);
+            assert_eq!(persistence.written_op(), 2);
+            assert_eq!(backup.consensus.commit_min(), 2);
+        }
     }
 
     /// The primary's Commit heartbeat, handled as the shard's `on_commit` does.

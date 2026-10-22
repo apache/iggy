@@ -238,13 +238,14 @@ mod tests {
     use server_common::sharding::METADATA_GROUP;
     use shard::{ShardFrame, shard_channel};
 
-    const REBALANCE_KINDS: [PrimaryRebalanceKind; 6] = [
+    const REBALANCE_KINDS: [PrimaryRebalanceKind; 7] = [
         PrimaryRebalanceKind::MetadataProbe,
         PrimaryRebalanceKind::MetadataReply,
         PrimaryRebalanceKind::PartitionProbe,
         PrimaryRebalanceKind::PartitionReply,
         PrimaryRebalanceKind::SourceProbe,
         PrimaryRebalanceKind::SourceReply,
+        PrimaryRebalanceKind::PrimaryTransfer,
     ];
 
     fn rebalance_frame(kind: PrimaryRebalanceKind) -> Message<GenericHeader> {
@@ -263,6 +264,7 @@ mod tests {
                         | PrimaryRebalanceKind::PartitionReply
                         | PrimaryRebalanceKind::SourceProbe
                         | PrimaryRebalanceKind::SourceReply
+                        | PrimaryRebalanceKind::PrimaryTransfer
                 ) {
                     header.created_revision = 1;
                 }
@@ -272,6 +274,7 @@ mod tests {
                         | PrimaryRebalanceKind::PartitionReply
                         | PrimaryRebalanceKind::SourceReply
                 ));
+                header.target = u8::from(kind == PrimaryRebalanceKind::PrimaryTransfer);
                 header.seal();
             })
             .into_generic()

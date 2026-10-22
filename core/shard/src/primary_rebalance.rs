@@ -17,8 +17,11 @@
 
 //! The metadata primary coordinates one partition view change at a time.
 //! Eligibility requires fresh challenges, and a transfer additionally requires
-//! the target's applied partition prefix. The local drain holds a revocable
-//! grant so queued work cannot outlive the coordinator's readiness evidence.
+//! the target's applied partition prefix. The grant then goes to the source
+//! primary, because only its drain fences the replica where prepares start.
+//! The source bounds that drain to `GRANT_TIMEOUT` after receipt. Authority
+//! loss after receipt does not revoke an accepted grant, so the worst case is
+//! one extra move.
 
 use crate::shards_table::calculate_shard_assignment;
 use crate::{
@@ -42,8 +45,6 @@ use server_common::Message;
 use server_common::MessageBag;
 use server_common::sharding::IggyNamespace;
 use server_common::sharding::METADATA_GROUP;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 pub const PROBE_INTERVAL: Duration = Duration::from_secs(1);
@@ -87,7 +88,6 @@ struct PendingMove {
     probe: PrimaryRebalanceHeader,
     phase: MovePhase,
     since: Instant,
-    active: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -95,12 +95,6 @@ enum MovePhase {
     Capture,
     Probe,
     Transfer,
-}
-
-impl Drop for PendingMove {
-    fn drop(&mut self) {
-        self.active.store(false, Ordering::Release);
-    }
 }
 
 /// Only the metadata owner accepts wire frames. Partition owners receive
@@ -143,6 +137,17 @@ impl PrimaryRebalance {
             && peer.nonce == Some(nonce)
         {
             peer.nonce = None;
+        }
+    }
+
+    /// A grant the bus refused never reached the source, so no view change can
+    /// follow it. The move ends at once instead of holding the next one until
+    /// the transfer timeout.
+    fn forget_unsent_grant(&mut self, nonce: u128) {
+        if self.pending.as_ref().is_some_and(|pending| {
+            pending.phase == MovePhase::Transfer && pending.probe.nonce == nonce
+        }) {
+            self.pending = None;
         }
     }
 
@@ -251,8 +256,8 @@ where
             MessageBag::RepairPrepare(message) => message.header().0.view > consensus.view(),
             _ => false,
         };
-        // Revoke before a metadata handler can suspend on persistence while
-        // another shard still holds an unconsumed grant from this coordinator.
+        // Drop authority before a metadata handler can suspend on persistence,
+        // so no reply handled meanwhile grants a move or credits admission.
         if invalidates {
             self.primary_rebalance.borrow_mut().reset_authority();
         }
@@ -335,14 +340,14 @@ where
                     pending.plan.created_revision,
                 );
                 let invalid = current.is_none_or(|current| current.view != pending.plan.view);
-                let expired = match pending.phase {
-                    MovePhase::Capture | MovePhase::Probe => elapsed > PROBE_TIMEOUT,
-                    MovePhase::Transfer => {
-                        elapsed > TRANSFER_TIMEOUT
-                            || (elapsed > GRANT_TIMEOUT
-                                && pending.active.swap(false, Ordering::AcqRel))
-                    }
-                };
+                let expired = elapsed
+                    > match pending.phase {
+                        MovePhase::Capture | MovePhase::Probe => PROBE_TIMEOUT,
+                        // The coordinator cannot see whether the source used the
+                        // grant. Planning before the new view shows up would
+                        // count the moved primary twice.
+                        MovePhase::Transfer => TRANSFER_TIMEOUT,
+                    };
                 if invalid || expired {
                     state.pending = None;
                 }
@@ -367,7 +372,6 @@ where
                         probe,
                         phase: MovePhase::Capture,
                         since: now,
-                        active: Arc::new(AtomicBool::new(true)),
                     });
                     capture = Some(probe);
                 }
@@ -486,7 +490,7 @@ where
                 if !consensus.is_primary() || !consensus_ready(consensus) {
                     return;
                 }
-                let request = {
+                let outgoing = {
                     let mut state = self.primary_rebalance.borrow_mut();
                     if !state.matches_pending(&header, MovePhase::Probe, now)
                         || state
@@ -503,21 +507,34 @@ where
                     let Some(pending) = state.pending.as_mut() else {
                         return;
                     };
+                    pending.probe.kind = PrimaryRebalanceKind::PrimaryTransfer;
+                    pending.probe.target = pending.plan.target;
                     pending.phase = MovePhase::Transfer;
                     pending.since = now;
-                    PreparedPrimaryTransfer {
-                        created_revision: pending.plan.created_revision,
-                        expected_view: pending.plan.view,
-                        target: pending.plan.target,
-                        active: Arc::clone(&pending.active),
-                        expires_at: pending.since + GRANT_TIMEOUT,
-                    }
+                    (consensus.primary_index(pending.plan.view), pending.probe)
                 };
+                if !self.send_rebalance(outgoing.0, outgoing.1).await {
+                    self.primary_rebalance
+                        .borrow_mut()
+                        .forget_unsent_grant(outgoing.1.nonce);
+                }
+            }
+            PrimaryRebalanceKind::PrimaryTransfer => {
+                if header.replica != consensus.primary_index(header.view)
+                    || !consensus_ready(consensus)
+                {
+                    return;
+                }
                 self.send_local_rebalance(
                     self.rebalance_partition_shard(header.namespace),
                     LocalRebalance::Transfer {
                         namespace: IggyNamespace::from_raw(header.namespace),
-                        request,
+                        request: PreparedPrimaryTransfer {
+                            created_revision: header.created_revision,
+                            expected_view: header.partition_view,
+                            target: header.target,
+                            expires_at: now + GRANT_TIMEOUT,
+                        },
                     },
                 );
             }
@@ -580,7 +597,6 @@ where
             || partition.requires_state_transfer()
             || partition.history_is_busy()
             || self.bus.monotonic_now() >= request.expires_at
-            || !request.active.swap(false, Ordering::AcqRel)
         {
             return;
         }
@@ -588,7 +604,6 @@ where
         let consensus = partition.consensus();
         let actions = consensus.request_primary_transfer(request.expected_view, request.target);
         if actions.is_empty() {
-            request.active.store(true, Ordering::Release);
             return;
         }
         tracing::info!(
@@ -810,6 +825,7 @@ const fn probe_header<B: MessageBus>(
         partition_view: 0,
         kind: PrimaryRebalanceKind::MetadataProbe,
         ready: 0,
-        reserved: [0; 74],
+        target: 0,
+        reserved: [0; 73],
     }
 }

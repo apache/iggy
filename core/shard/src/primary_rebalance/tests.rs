@@ -26,7 +26,7 @@ use iggy_common::{IggyByteSize, PartitionStats, variadic};
 use journal::prepare_journal::PrepareJournal;
 use journal::superblock::{PingPongSuperblock, SuperblockContents};
 use message_bus::{BusMessage, SendError};
-use metadata::impls::metadata::IggySnapshot;
+use metadata::impls::metadata::{IggySnapshot, PartitionPlacementView, StreamsFrontend};
 use metadata::stm::stream::Streams;
 use metadata::stm::user::Users;
 use metadata::{IggyMetadata, MuxStateMachine};
@@ -37,6 +37,7 @@ use server_common::sharding::{METADATA_GROUP, ShardId};
 use std::cell::{Cell, RefCell};
 use std::pin::pin;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::task::Poll;
 
 const CLUSTER: u128 = 7;
@@ -45,6 +46,8 @@ const METADATA_VIEW: u32 = 3;
 const PARTITION_VIEW: u32 = 4;
 const CREATED_REVISION: u64 = 11;
 const COMMITTED: u64 = 13;
+/// The primary of `PARTITION_VIEW`.
+const SOURCE: u8 = 1;
 const TARGET: u8 = 2;
 const NONCE: u128 = 17;
 
@@ -168,10 +171,7 @@ fn owner_at<SB: SuperblockStore>(
     (shard, inboxes[0].take().unwrap())
 }
 
-fn arm<SB: SuperblockStore>(
-    shard: &TestShard<SB>,
-    phase: MovePhase,
-) -> (PrimaryRebalanceHeader, Arc<AtomicBool>) {
+fn arm<SB: SuperblockStore>(shard: &TestShard<SB>, phase: MovePhase) -> PrimaryRebalanceHeader {
     let namespace = IggyNamespace::new(1, 1, 0);
     let consensus = shard.plane.metadata().consensus.as_ref().unwrap();
     let mut probe = probe_header(consensus, NONCE);
@@ -184,7 +184,6 @@ fn arm<SB: SuperblockStore>(
     } else {
         PrimaryRebalanceKind::PartitionProbe
     };
-    let active = Arc::new(AtomicBool::new(true));
     *shard.primary_rebalance.borrow_mut() = PrimaryRebalance {
         view: Some(METADATA_VIEW),
         peers: vec![Peer::default(); usize::from(REPLICAS)],
@@ -199,7 +198,6 @@ fn arm<SB: SuperblockStore>(
             probe,
             phase,
             since: Instant::now(),
-            active: Arc::clone(&active),
         }),
         ..PrimaryRebalance::default()
     };
@@ -214,7 +212,7 @@ fn arm<SB: SuperblockStore>(
         TARGET
     };
     probe.ready = 1;
-    (probe, active)
+    probe
 }
 
 #[compio::test]
@@ -231,8 +229,7 @@ async fn given_pending_target_probe_when_reply_is_stale_or_mismatched_should_not
         "expired",
     ] {
         let (shard, inbox) = owner();
-        let (valid, active) = arm(&shard, MovePhase::Probe);
-        let mut reply = valid;
+        let mut reply = arm(&shard, MovePhase::Probe);
         match changed {
             "cluster" => reply.cluster += 1,
             "nonce" => reply.nonce += 1,
@@ -261,7 +258,6 @@ async fn given_pending_target_probe_when_reply_is_stale_or_mismatched_should_not
             "{changed} reply granted a transfer"
         );
         assert!(shard.bus.sent.borrow().is_empty());
-        assert!(active.load(Ordering::Acquire));
         assert!(
             shard
                 .primary_rebalance
@@ -274,9 +270,9 @@ async fn given_pending_target_probe_when_reply_is_stale_or_mismatched_should_not
 }
 
 #[compio::test]
-async fn given_primary_frontier_when_target_confirms_it_should_issue_one_revocable_grant() {
+async fn given_primary_frontier_when_target_confirms_it_should_grant_the_source_primary_once() {
     let (shard, inbox) = owner();
-    let (mut source, active) = arm(&shard, MovePhase::Capture);
+    let mut source = arm(&shard, MovePhase::Capture);
     source.commit = COMMITTED + 1;
     let mut wrong_source = source;
     wrong_source.replica = TARGET;
@@ -300,52 +296,238 @@ async fn given_primary_frontier_when_target_confirms_it_should_issue_one_revocab
     reply.replica = TARGET;
     reply.ready = 1;
     shard.on_primary_rebalance(reply).await;
-    let ShardFrame::Lifecycle(LifecycleFrame::PrimaryRebalance(frame)) = inbox.try_recv().unwrap()
+    assert!(
+        inbox.try_recv().is_err(),
+        "the coordinator must not grant its own replica of the partition"
+    );
+    let (source_replica, grant) = shard.bus.sent.borrow()[1];
+    assert_eq!(source_replica, source.replica);
+    assert_eq!(grant.kind, PrimaryRebalanceKind::PrimaryTransfer);
+    assert_eq!(grant.replica, 0);
+    assert_eq!(grant.view, METADATA_VIEW);
+    assert_eq!(grant.nonce, NONCE);
+    assert_eq!(grant.namespace, probe.namespace);
+    assert_eq!(grant.created_revision, CREATED_REVISION);
+    assert_eq!(grant.partition_view, PARTITION_VIEW);
+    assert_eq!(grant.target, TARGET);
+    shard.on_primary_rebalance(reply).await;
+    assert_eq!(
+        shard.bus.sent.borrow().len(),
+        2,
+        "a replay must not issue a second grant"
+    );
+
+    let (source_node, source_inbox) =
+        owner_at::<PingPongSuperblock>(None, source_replica, REPLICAS, METADATA_VIEW);
+    let received_at = source_node.bus.monotonic_now();
+    source_node.on_primary_rebalance(grant).await;
+    let ShardFrame::Lifecycle(LifecycleFrame::PrimaryRebalance(frame)) =
+        source_inbox.try_recv().unwrap()
     else {
-        panic!("ready target must dispatch the local grant");
+        panic!("the source must route the grant to the partition's shard");
     };
     let LocalRebalance::Transfer { namespace, request } = *frame else {
-        panic!("target confirmation must yield a transfer");
+        panic!("a grant must yield a transfer");
     };
     assert_eq!(namespace.inner(), probe.namespace);
     assert_eq!(request.created_revision, CREATED_REVISION);
     assert_eq!(request.expected_view, PARTITION_VIEW);
     assert_eq!(request.target, TARGET);
-    assert!(Arc::ptr_eq(&active, &request.active));
-    assert!(request.is_active_at(shard.bus.monotonic_now()));
-    assert!(request.expires_at <= Instant::now() + GRANT_TIMEOUT);
-    shard.on_primary_rebalance(reply).await;
-    assert!(
-        inbox.try_recv().is_err(),
-        "a replay must not issue a second grant"
+    assert_eq!(
+        request.expires_at,
+        received_at + GRANT_TIMEOUT,
+        "the source must time the grant on its own clock"
     );
-
-    shard
-        .plane
-        .metadata()
-        .consensus
-        .as_ref()
-        .unwrap()
-        .begin_view_probe();
-    shard.tick_primary_rebalance().await;
-    assert!(
-        !request.is_active_at(shard.bus.monotonic_now()),
-        "coordinator authority loss must revoke queued work"
-    );
-    assert!(shard.primary_rebalance.borrow().pending.is_none());
 }
 
 #[compio::test]
-async fn given_target_rejection_when_reply_is_correlated_should_revoke_and_ignore_late_success() {
+async fn given_a_grant_frame_when_its_sender_is_not_the_ready_metadata_primary_should_drop_it() {
+    for changed in ["none", "cluster", "metadata view", "sender", "not ready"] {
+        let (source_node, inbox) =
+            owner_at::<PingPongSuperblock>(None, SOURCE, REPLICAS, METADATA_VIEW);
+        let consensus = source_node.plane.metadata().consensus.as_ref().unwrap();
+        let mut grant = probe_header(consensus, NONCE);
+        grant.replica = consensus.primary_index(METADATA_VIEW);
+        grant.kind = PrimaryRebalanceKind::PrimaryTransfer;
+        grant.namespace = IggyNamespace::new(1, 1, 0).inner();
+        grant.created_revision = CREATED_REVISION;
+        grant.partition_view = PARTITION_VIEW;
+        grant.target = TARGET;
+        match changed {
+            "none" => {}
+            "cluster" => grant.cluster += 1,
+            "metadata view" => grant.view += 1,
+            "sender" => grant.replica = TARGET,
+            "not ready" => consensus.begin_view_probe(),
+            _ => unreachable!(),
+        }
+        source_node.on_primary_rebalance(grant).await;
+        assert_eq!(inbox.try_recv().is_ok(), changed == "none", "{changed}");
+    }
+}
+
+#[compio::test]
+async fn given_the_coordinator_leads_the_partition_when_target_confirms_it_should_grant_through_its_own_ingress()
+ {
     let (shard, inbox) = owner();
-    let (mut reply, active) = arm(&shard, MovePhase::Probe);
+    let mut reply = arm(&shard, MovePhase::Probe);
+    let consensus = shard.plane.metadata().consensus.as_ref().unwrap();
+    // The coordinator leads the metadata view, so it leads this partition view too.
+    let led_view = METADATA_VIEW;
+    assert_eq!(consensus.primary_index(led_view), consensus.replica());
+    {
+        let mut state = shard.primary_rebalance.borrow_mut();
+        let pending = state.pending.as_mut().unwrap();
+        pending.plan.view = led_view;
+        pending.probe.partition_view = led_view;
+    }
+    reply.partition_view = led_view;
+    shard.on_primary_rebalance(reply).await;
+    assert!(
+        shard.bus.sent.borrow().is_empty(),
+        "a local grant must not leave the node"
+    );
+    let ShardFrame::Lifecycle(LifecycleFrame::PrimaryRebalance(frame)) = inbox.try_recv().unwrap()
+    else {
+        panic!("the grant must enter the metadata owner's inbox");
+    };
+    let frame = *frame;
+    let LocalRebalance::Wire(grant) = &frame else {
+        panic!("a local grant must take the wire path");
+    };
+    assert_eq!(grant.kind, PrimaryRebalanceKind::PrimaryTransfer);
+    shard.on_local_rebalance(frame).await;
+    let ShardFrame::Lifecycle(LifecycleFrame::PrimaryRebalance(frame)) = inbox.try_recv().unwrap()
+    else {
+        panic!("the checked grant must reach the partition's shard");
+    };
+    let LocalRebalance::Transfer { request, .. } = *frame else {
+        panic!("a grant must yield a transfer");
+    };
+    assert_eq!(request.expected_view, led_view);
+    assert_eq!(request.target, TARGET);
+}
+
+#[compio::test]
+async fn given_target_rejection_when_reply_is_correlated_should_drop_the_move_and_ignore_late_success()
+ {
+    let (shard, inbox) = owner();
+    let mut reply = arm(&shard, MovePhase::Probe);
     reply.ready = 0;
     shard.on_primary_rebalance(reply).await;
-    assert!(!active.load(Ordering::Acquire));
     assert!(shard.primary_rebalance.borrow().pending.is_none());
     reply.ready = 1;
     shard.on_primary_rebalance(reply).await;
     assert!(inbox.try_recv().is_err());
+    assert!(shard.bus.sent.borrow().is_empty());
+}
+
+/// Ticks the coordinator at `at` with every peer freshly ready, so only the
+/// pending move can change.
+#[allow(clippy::future_not_send)]
+async fn tick_with_ready_peers(shard: &TestShard, at: Instant) {
+    for peer in &mut shard.primary_rebalance.borrow_mut().peers {
+        peer.ready_at = Some(at);
+    }
+    shard.bus.now.set(Some(at));
+    shard.tick_primary_rebalance().await;
+}
+
+#[compio::test]
+async fn given_a_sent_grant_when_the_new_view_is_unseen_should_hold_the_move_until_it_shows_or_times_out()
+ {
+    for shows in [true, false] {
+        let (shard, _inbox) = owner();
+        arm(&shard, MovePhase::Transfer);
+        let metadata = shard.plane.metadata();
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let streams = metadata.mux_stm.streams();
+        streams.seed_namespace(namespace, namespace.inner(), PARTITION_VIEW);
+        let created_revision = streams.created_revision_for_namespace(namespace).unwrap();
+        let observe = |view| {
+            metadata.observe_partition_views(&[PartitionPlacementView {
+                namespace,
+                created_revision,
+                view,
+            }]);
+        };
+        observe(PARTITION_VIEW);
+        let sent_at = shard.bus.monotonic_now();
+        {
+            let mut state = shard.primary_rebalance.borrow_mut();
+            let pending = state.pending.as_mut().unwrap();
+            pending.plan.created_revision = created_revision;
+            pending.since = sent_at;
+        }
+        let pending = || shard.primary_rebalance.borrow().pending.is_some();
+
+        tick_with_ready_peers(&shard, sent_at + GRANT_TIMEOUT * 2).await;
+        assert!(
+            pending(),
+            "an expired grant may have started a view change that is not visible yet"
+        );
+        if shows {
+            observe(PARTITION_VIEW + 1);
+            tick_with_ready_peers(&shard, sent_at + GRANT_TIMEOUT * 2).await;
+        } else {
+            tick_with_ready_peers(&shard, sent_at + TRANSFER_TIMEOUT).await;
+            assert!(pending(), "the move lasts the whole transfer timeout");
+            tick_with_ready_peers(&shard, sent_at + TRANSFER_TIMEOUT + Duration::from_nanos(1))
+                .await;
+        }
+        assert!(!pending(), "shows={shows}");
+    }
+}
+
+#[compio::test]
+async fn given_an_unsent_grant_when_the_coordinator_ticks_should_plan_again_before_the_transfer_timeout()
+ {
+    let (shard, _inbox) = owner();
+    let reply = arm(&shard, MovePhase::Probe);
+    let metadata = shard.plane.metadata();
+    let streams = metadata.mux_stm.streams();
+    // Both partitions of the seeded topic start on the source, so a move
+    // stays planned after the refused one.
+    let last = IggyNamespace::new(1, 1, 1);
+    streams.seed_namespace(last, last.inner(), PARTITION_VIEW);
+    let views: Vec<_> = (0..=last.partition_id())
+        .map(|partition| {
+            let namespace = IggyNamespace::new(1, 1, partition);
+            PartitionPlacementView {
+                namespace,
+                created_revision: streams.created_revision_for_namespace(namespace).unwrap(),
+                view: PARTITION_VIEW,
+            }
+        })
+        .collect();
+    metadata.observe_partition_views(&views);
+    shard
+        .primary_rebalance
+        .borrow_mut()
+        .pending
+        .as_mut()
+        .unwrap()
+        .plan
+        .created_revision = views[0].created_revision;
+
+    shard.bus.disconnected.set(true);
+    shard.on_primary_rebalance(reply).await;
+    shard.bus.disconnected.set(false);
+    assert!(shard.bus.sent.borrow().is_empty());
+
+    let replan_after = STABLE_INTERVAL * 2;
+    assert!(replan_after < TRANSFER_TIMEOUT);
+    tick_with_ready_peers(&shard, shard.bus.monotonic_now() + replan_after).await;
+    assert!(
+        shard
+            .bus
+            .sent
+            .borrow()
+            .iter()
+            .any(|(replica, probe)| *replica == SOURCE
+                && probe.kind == PrimaryRebalanceKind::SourceProbe),
+        "the coordinator must plan again before the transfer timeout"
+    );
 }
 
 fn suspect_primary(group: u64, view: u32) -> MessageBag {
@@ -364,18 +546,30 @@ fn suspect_primary(group: u64, view: u32) -> MessageBag {
 }
 
 #[compio::test]
-async fn given_queued_grant_when_metadata_authority_changes_should_revoke_before_handler_suspends()
-{
-    let superblock = Rc::new(HeldSuperblock::default());
-    let (shard, _inbox) = owner_with_superblock(Some(Rc::clone(&superblock)));
-    let (_probe, active) = arm(&shard, MovePhase::Transfer);
-    let mut dispatch =
-        pin!(shard.dispatch_message(suspect_primary(METADATA_GROUP, METADATA_VIEW + 1), None,));
-    assert_eq!(futures::poll!(&mut dispatch), Poll::Pending);
-    assert!(superblock.entered.get());
-    assert!(shard.bus.sent.borrow().is_empty());
-    assert!(!active.load(Ordering::Acquire));
-    assert!(shard.primary_rebalance.borrow().pending.is_none());
+async fn given_pending_target_probe_when_metadata_authority_changes_should_not_grant_while_handler_suspends()
+ {
+    // A suspect of the current view leaves this replica primary and ready
+    // while its handler waits on persistence, so only the fence refuses the
+    // reply. A suspect of a newer view moves the consensus view first.
+    for view in [METADATA_VIEW, METADATA_VIEW + 1] {
+        let superblock = Rc::new(HeldSuperblock::default());
+        let (shard, inbox) = owner_with_superblock(Some(Rc::clone(&superblock)));
+        let reply = arm(&shard, MovePhase::Probe);
+        let mut dispatch =
+            pin!(shard.dispatch_message(suspect_primary(METADATA_GROUP, view), None));
+        assert_eq!(futures::poll!(&mut dispatch), Poll::Pending, "view={view}");
+        assert!(superblock.entered.get(), "view={view}");
+        shard.on_primary_rebalance(reply).await;
+        assert!(
+            shard.bus.sent.borrow().is_empty(),
+            "view={view}: a reply handled during the suspension granted a move"
+        );
+        assert!(inbox.try_recv().is_err(), "view={view}");
+        assert!(
+            shard.primary_rebalance.borrow().pending.is_none(),
+            "view={view}"
+        );
+    }
 }
 
 #[derive(Default)]
@@ -396,7 +590,7 @@ impl SuperblockStore for HeldSuperblock {
 }
 
 #[test]
-fn given_queued_grant_when_unrelated_or_current_traffic_arrives_should_preserve_authority() {
+fn given_pending_move_when_unrelated_or_current_traffic_arrives_should_preserve_authority() {
     let partition_group = IggyNamespace::new(1, 1, 0).inner();
     for (group, view, changes_view, should_revoke) in [
         (partition_group, METADATA_VIEW + 1, true, false),
@@ -406,7 +600,7 @@ fn given_queued_grant_when_unrelated_or_current_traffic_arrives_should_preserve_
         (METADATA_GROUP, METADATA_VIEW + 1, false, true),
     ] {
         let (shard, _inbox) = owner();
-        let (_probe, active) = arm(&shard, MovePhase::Transfer);
+        arm(&shard, MovePhase::Transfer);
         let message = if changes_view {
             suspect_primary(group, view)
         } else {
@@ -423,13 +617,9 @@ fn given_queued_grant_when_unrelated_or_current_traffic_arrives_should_preserve_
         };
         shard.fence_rebalance_authority(&message);
         assert_eq!(
-            active.load(Ordering::Acquire),
-            !should_revoke,
-            "group={group}, view={view}, changes_view={changes_view}"
-        );
-        assert_eq!(
             shard.primary_rebalance.borrow().pending.is_none(),
-            should_revoke
+            should_revoke,
+            "group={group}, view={view}, changes_view={changes_view}"
         );
     }
 }
@@ -490,12 +680,12 @@ fn given_health_challenge_when_reply_is_overdue_or_replayed_should_not_extend_re
     }
 }
 
-fn ready_partition() -> (IggyPartition<Rc<RecordingBus>>, PrimaryRebalanceHeader) {
+fn ready_partition(replica: u8) -> (IggyPartition<Rc<RecordingBus>>, PrimaryRebalanceHeader) {
     let (shard, _inbox) = owner();
-    let (probe, _active) = arm(&shard, MovePhase::Probe);
+    let probe = arm(&shard, MovePhase::Probe);
     let mut consensus = VsrConsensus::new(
         CLUSTER,
-        TARGET,
+        replica,
         REPLICAS,
         probe.namespace,
         Rc::clone(&shard.bus),
@@ -528,7 +718,7 @@ fn given_partition_probe_when_local_history_is_not_ready_should_refuse() {
         "recovery barrier",
         "transition",
     ] {
-        let (mut partition, mut probe) = ready_partition();
+        let (mut partition, mut probe) = ready_partition(TARGET);
         assert!(
             partition_ready(&partition, &probe),
             "ready fixture: {changed}"
@@ -557,7 +747,8 @@ fn given_partition_probe_when_local_history_is_not_ready_should_refuse() {
 
 #[test]
 fn given_busy_source_history_when_capturing_frontier_should_allow_drain_but_not_target_readiness() {
-    let (mut partition, probe) = ready_partition();
+    let (mut partition, probe) = ready_partition(SOURCE);
+    assert!(partition.consensus().is_primary());
     partition.consensus().advance_commit_max(COMMITTED + 1);
     assert!(partition_history_ready(&partition, &probe));
     assert!(!partition_ready(&partition, &probe));
@@ -565,7 +756,6 @@ fn given_busy_source_history_when_capturing_frontier_should_allow_drain_but_not_
         created_revision: CREATED_REVISION,
         expected_view: PARTITION_VIEW,
         target: TARGET,
-        active: Arc::new(AtomicBool::new(true)),
         expires_at: Instant::now() + GRANT_TIMEOUT,
     };
     assert!(partition.defer_primary_transfer(request));

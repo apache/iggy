@@ -20,8 +20,6 @@ use std::collections::HashSet;
 use std::io::IoSlice;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Poll, Waker};
 use std::time::{Duration, Instant};
 
@@ -302,22 +300,21 @@ pub struct PartitionIoPlan {
 
 /// A coordinator grant issued only after fresh target readiness.
 ///
-/// The shared flag revokes this one move on timeout or metadata leadership loss; the shard
-/// rechecks it and the captured history/view after draining, before election.
-/// The deadline also expires the grant while the coordinator is stalled.
+/// The source node sets the deadline on its own clock when the grant arrives,
+/// so no coordinator, stalled or replaced, can extend it. The shard rechecks it
+/// and the captured history/view after draining, before election.
 #[derive(Debug)]
 pub struct PreparedPrimaryTransfer {
     pub created_revision: u64,
     pub expected_view: u32,
     pub target: u8,
-    pub active: Arc<AtomicBool>,
     pub expires_at: Instant,
 }
 
 impl PreparedPrimaryTransfer {
     #[must_use]
     pub fn is_active_at(&self, now: Instant) -> bool {
-        self.active.load(Ordering::Acquire) && now < self.expires_at
+        now < self.expires_at
     }
 }
 

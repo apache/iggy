@@ -126,7 +126,9 @@ to those replicas. Before readiness is known, all configured replicas remain
 eligible. After the responsive replica set
 has been stable for five seconds, the metadata primary balances existing primary
 counts one partition at a time. It confirms the source's committed frontier and
-the target's applied history before requesting a persisted consensus view change.
+the target's applied history, then grants the move to the source primary. The
+source finishes its accepted writes before it requests a persisted consensus
+view change.
 Recovering partitions are skipped without delaying transfers of other partitions.
 Every replica still stores every partition.
 Balancing primary counts does not balance bytes, throughput or CPU load. A hot

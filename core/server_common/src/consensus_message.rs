@@ -1356,6 +1356,7 @@ mod tests {
                         | PrimaryRebalanceKind::PartitionReply
                         | PrimaryRebalanceKind::SourceProbe
                         | PrimaryRebalanceKind::SourceReply
+                        | PrimaryRebalanceKind::PrimaryTransfer
                 ) {
                     header.namespace = 17;
                     header.created_revision = 19;
@@ -1368,6 +1369,7 @@ mod tests {
                         | PrimaryRebalanceKind::PartitionReply
                         | PrimaryRebalanceKind::SourceReply
                 ));
+                header.target = u8::from(kind == PrimaryRebalanceKind::PrimaryTransfer);
                 header.seal();
             },
         )
@@ -1382,6 +1384,7 @@ mod tests {
             PrimaryRebalanceKind::PartitionReply,
             PrimaryRebalanceKind::SourceProbe,
             PrimaryRebalanceKind::SourceReply,
+            PrimaryRebalanceKind::PrimaryTransfer,
         ] {
             let frame = primary_rebalance_frame(kind);
             let expected = *frame.header();
