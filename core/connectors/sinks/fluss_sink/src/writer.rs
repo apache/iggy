@@ -186,6 +186,30 @@ impl WriterError {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowOp {
+    Upsert,
+    Delete,
+}
+
+impl From<&str> for RowOp {
+    fn from(value: &str) -> Self {
+        match value {
+            "d" => Self::Delete,
+            _ => Self::Upsert,
+        }
+    }
+}
+
+impl fmt::Display for RowOp {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Upsert => formatter.write_str("upsert"),
+            Self::Delete => formatter.write_str("delete"),
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Stat {
     pub(crate) errors: u64,
@@ -311,17 +335,28 @@ impl FlussWriter {
     ) -> Result<Stat, WriterError> {
         let rows = batch.num_rows();
         let writer = self.create_append_writer(table_path).await?;
-        writer
-            .append_arrow_batch(batch)
-            .map_err(|source| WriterError::AppendArrowBatch {
-                table_path: table_path.clone(),
-                source: Box::new(source),
-            })?;
+        let pending =
+            writer
+                .append_arrow_batch(batch)
+                .map_err(|source| WriterError::AppendArrowBatch {
+                    table_path: table_path.clone(),
+                    source: Box::new(source),
+                })?;
         self.flush_appender(&writer, table_path).await?;
         let mut stat = Stat::default();
-        stat.inc_appended_by(rows as u64);
+        match pending.await {
+            Ok(()) => stat.inc_appended_by(rows as u64),
+            Err(error) => {
+                stat.inc_err_by(rows as u64);
+                warn!(
+                    "FlussSink: Failed to append {rows} rows to table '{table_path}' because of: {error}"
+                );
+            }
+        }
+
         Ok(stat)
     }
+
     async fn append_record_batch_as_rows(
         &self,
         table_path: &TablePath,
@@ -331,17 +366,33 @@ impl FlussWriter {
         let writer = self.create_append_writer(table_path).await?;
         let (rows, mut row) = to_columnal_row(table_path, table_descriptor, batch)?;
         let mut stat = Stat::default();
+        let mut pending = Vec::with_capacity(rows);
         for i in 0..rows {
             row.set_row_id(i);
             match writer.append(&row) {
-                Ok(_) => stat.inc_appended(),
+                Ok(future) => pending.push((i, future)),
                 Err(error) => {
-                    warn!("FlussSink: Failed to append row {i} to table '{table_path}': {error}");
+                    warn!(
+                        "FlussSink: Failed to enqueue row {i} for append in table '{table_path}' because of: {error}"
+                    );
                     stat.inc_err();
                 }
             }
         }
         self.flush_appender(&writer, table_path).await?;
+
+        for (i, future) in pending {
+            match future.await {
+                Ok(()) => stat.inc_appended(),
+                Err(error) => {
+                    warn!(
+                        "FlussSink: Row {i} rejected for append in table '{table_path}' because of: {error}"
+                    );
+                    stat.inc_err();
+                }
+            }
+        }
+
         Ok(stat)
     }
 
@@ -351,33 +402,53 @@ impl FlussWriter {
         table_descriptor: &TableDescriptor,
         batch: RecordBatch,
     ) -> Result<Stat, WriterError> {
-        let op = batch
+        let operations_column = batch
             .column_by_name("op")
             .and_then(|col| col.as_any().downcast_ref::<StringArray>())
             .cloned();
 
         let writer = self.create_upsert_writer(table_path).await?;
         let (rows, mut row) = to_columnal_row(table_path, table_descriptor, batch)?;
+        let mut pending = Vec::with_capacity(rows);
         let mut stat = Stat::default();
+
         for i in 0..rows {
             row.set_row_id(i);
-            let (operation, write_result) = if op.as_ref().is_some_and(|op| op.value(i) == "d") {
-                ("d", writer.delete(&row))
-            } else {
-                ("u", writer.upsert(&row))
+
+            let row_op = operations_column
+                .as_ref()
+                .map_or(RowOp::Upsert, |column| RowOp::from(column.value(i)));
+
+            let result = match row_op {
+                RowOp::Upsert => writer.upsert(&row),
+                RowOp::Delete => writer.delete(&row),
             };
-            match (operation, write_result) {
-                ("d", Ok(_)) => stat.inc_deleted(),
-                (_, Ok(_)) => stat.inc_appended(),
+
+            match result {
+                Ok(future) => pending.push((row_op, i, future)),
+                Err(error) => {
+                    stat.inc_err();
+                    warn!(
+                        "FlussSink: Failed to enqueue row {i} for {row_op} in table '{table_path}' because of: {error}"
+                    );
+                }
+            }
+        }
+        self.flush_upserter(&writer, table_path).await?;
+
+        for (row_op, i, future) in pending {
+            match (row_op, future.await) {
+                (RowOp::Delete, Ok(())) => stat.inc_deleted(),
+                (RowOp::Upsert, Ok(())) => stat.inc_appended(),
                 (_, Err(error)) => {
                     warn!(
-                        "FlussSink: Failed to {operation} row {i} in table '{table_path}': {error}"
+                        "FlussSink: Row {i} rejected for {row_op} in table '{table_path}' because of: {error}"
                     );
                     stat.inc_err();
                 }
             }
         }
-        self.flush_upserter(&writer, table_path).await?;
+
         Ok(stat)
     }
 
