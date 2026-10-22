@@ -336,7 +336,8 @@ impl IggyClient {
     ///         is empty, or any entry in `snapshot_types` is unknown.
     ///     RuntimeError: If the client is not connected, the session is not
     ///         authenticated, the user lacks the permission, `"all"` is
-    ///         combined with another snapshot type, or the request fails.
+    ///         combined with another snapshot type, the 30-second binary
+    ///         operation deadline expires, or the request fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[bytes]", imports=("collections.abc")))]
     fn snapshot<'a>(
         &self,
@@ -352,9 +353,10 @@ impl IggyClient {
             return Err(PyValueError::new_err("snapshot_types must not be empty"));
         }
 
-        let mut parsed_types = Vec::with_capacity(snapshot_types.len());
+        let mut parsed_types = Vec::with_capacity(snapshot_types.len().min(7));
         for snapshot_type in snapshot_types {
-            let parsed = SystemSnapshotType::from_str(&snapshot_type).map_err(to_value_error)?;
+            let parsed =
+                SystemSnapshotType::from_str(snapshot_type.trim()).map_err(to_value_error)?;
             if !parsed_types.contains(&parsed) {
                 parsed_types.push(parsed);
             }

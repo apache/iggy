@@ -1269,6 +1269,11 @@ class IggyClient:
         Requires an authenticated session whose user holds the `manage_servers`
         global permission.
 
+        Binary transports enforce a 30-second operation deadline. Large
+        snapshots (such as `"server_logs"` or `"all"`) that exceed 30 seconds
+        fail with `RuntimeError`, and the server rejects concurrent retries
+        until the in-flight snapshot collection finishes.
+
         Args:
             compression: Archive compression method. One of `"stored"`,
                 `"deflated"`, `"bzip2"`, `"zstd"`, `"lzma"`, `"xz"`.
@@ -1285,7 +1290,8 @@ class IggyClient:
                 is empty, or any entry in `snapshot_types` is unknown.
             RuntimeError: If the client is not connected, the session is not
                 authenticated, the user lacks the permission, `"all"` is
-                combined with another snapshot type, or the request fails.
+                combined with another snapshot type, the 30-second binary
+                operation deadline expires, or the request fails.
         """
     def describe_options(
         self, scope: builtins.str
