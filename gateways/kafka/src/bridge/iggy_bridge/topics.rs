@@ -75,6 +75,14 @@ pub struct KafkaTopicMetadata {
     pub partitions_count: u32,
 }
 
+/// [`IggyBridge::list_kafka_topics`], with the override topics that it leaves out because the
+/// bridge user may not read them.
+pub(super) struct KafkaTopicListing {
+    pub(super) topics: Vec<KafkaTopicMetadata>,
+    /// The Kafka names of those override topics.
+    pub(super) unreadable: Vec<String>,
+}
+
 impl IggyBridge {
     /// Ensures the Iggy stream and topic backing `kafka_topic` exist, creating either or both if
     /// missing. Resolves `kafka_topic` through the configured [`TopicMapping`](crate::bridge::topic_map::TopicMapping).
@@ -329,7 +337,7 @@ impl IggyBridge {
     }
 
     /// [`Self::get_kafka_topic`] on `client`.
-    async fn get_kafka_topic_on(
+    pub(super) async fn get_kafka_topic_on(
         &self,
         client: &IggyClient,
         kafka_topic: &str,
@@ -591,10 +599,20 @@ impl IggyBridge {
         &self,
         client: &IggyClient,
     ) -> Result<Vec<KafkaTopicMetadata>, BridgeError> {
+        Ok(self.kafka_topic_listing_on(client).await?.topics)
+    }
+
+    /// [`Self::list_kafka_topics_on`], with the override topics that it leaves out because the
+    /// bridge user may not read them.
+    pub(super) async fn kafka_topic_listing_on(
+        &self,
+        client: &IggyClient,
+    ) -> Result<KafkaTopicListing, BridgeError> {
         let default_stream = self.config.topic_mapping.default_stream();
         let mut default_stream_override_targets: HashSet<&str> = HashSet::new();
         let mut override_keys: HashSet<&str> = HashSet::new();
         let mut results = Vec::new();
+        let mut unreadable = Vec::new();
 
         for (kafka_topic, over) in self.config.topic_mapping.overrides() {
             override_keys.insert(kafka_topic);
@@ -618,6 +636,7 @@ impl IggyBridge {
                          unauthorized to read it",
                         over.stream, over.topic
                     );
+                    unreadable.push(kafka_topic.to_string());
                 }
                 Err(err) => return Err(err),
             }
@@ -654,7 +673,10 @@ impl IggyBridge {
             });
         }
 
-        Ok(results)
+        Ok(KafkaTopicListing {
+            topics: results,
+            unreadable,
+        })
     }
 }
 

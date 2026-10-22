@@ -22,19 +22,24 @@ Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/34
 > `IncrementalAlterConfigs` request, and every missing topic a `Metadata` request would create,
 > fails `TOPIC_AUTHORIZATION_FAILED` (29) and nothing is written, created or deleted.
 > `CreateTopics` has no such gate yet - SASL on does not protect it. Every client reads and writes
-> as the bridge's Iggy user. Iggy's `metadata.partitions_max` defaults to 0 (unlimited), so set it
-> before exposing the gateway. See [docs/SCOPE.md](docs/SCOPE.md).
+> as the bridge's Iggy user. DeleteGroups and OffsetDelete also run as that user. When no listener
+> names a principal, any client can delete committed offsets. When one does (SASL, or client
+> certificates), they also require a global `manage_topics` or `manage_streams`, and without it
+> they answer `GROUP_AUTHORIZATION_FAILED` (30). Iggy's `metadata.partitions_max` defaults to 0
+> (unlimited), so set it before exposing the gateway. See [docs/SCOPE.md](docs/SCOPE.md).
 >
 > InitProducerId does real work too, with or without the bridge: it allocates a producer id, so a stock idempotent producer starts instead of failing at startup.
 >
 > Consumer group coordination is not a stub either: `FindCoordinator`, `JoinGroup`, `Heartbeat`,
 > `LeaveGroup`, `SyncGroup`, `DescribeGroups` and `ListGroups` are real, with real membership,
 > rebalances, graceful leave, session expiry and admin views of that membership
-> ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md)). `kafka-consumer-groups.sh --list`,
-> `--describe --members` and `--describe --state` use those views. The default `--describe`
-> calls OffsetFetch (API key 9), which requires the bridge and otherwise answers
-> `COORDINATOR_LOAD_IN_PROGRESS` (14). With the bridge off, Metadata reports every topic unknown,
-> so a consumer joins a group and is assigned 0 partitions.
+> ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md)). `kafka-consumer-groups.sh --list` and
+> `--describe` use those views. With the bridge on, they also show a group whose consumers stopped,
+> as `Empty`, while it holds offsets. The default `--describe` then prints each committed offset
+> and its lag. `--delete` deletes such a group with its offsets, and `--delete-offsets` deletes
+> single offsets. With the bridge off, the default `--describe` gets `COORDINATOR_LOAD_IN_PROGRESS`
+> (14) from OffsetFetch (API key 9), and Metadata reports every topic unknown, so a consumer joins
+> a group and is assigned 0 partitions.
 > With the bridge on, OffsetCommit and OffsetFetch keep each group's offsets in Iggy, so a group
 > resumes from its last commit, also after a gateway restart
 > ([docs/OFFSET_STORAGE.md](docs/OFFSET_STORAGE.md)). Every Iggy server must run a build with the
@@ -286,8 +291,13 @@ Limits:
 - One gateway per bootstrap endpoint. Group membership is gateway memory
   ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md)).
 - Classic protocol only. A consumer with `group.protocol=consumer` (KIP-848) fails.
-- No DeleteGroups or OffsetDelete, and offsets never expire. An operator deletes a group's offsets
-  in Iggy ([docs/OFFSET_STORAGE.md](docs/OFFSET_STORAGE.md#limits)).
+- Offsets never expire. `kafka-consumer-groups.sh --delete` and `--delete-offsets` delete them
+  ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md#deleting-groups-and-offsets)).
+- If `--delete` fails with `GroupAuthorizationException` although the principal holds a global
+  `manage_topics` or `manage_streams`, look in the gateway log for `the bridge user may not list
+  the Iggy groups of these Kafka topics, so DeleteGroups deletes nothing`. The bridge's Iggy user,
+  not the principal, lacks the permission to read the topics that the line names. `--list` still
+  shows the group as `Empty`, because its scan leaves those topics out.
 - Delivery is at-least-once. A consumer that stops before it commits reads those records again.
 
 ## Listeners and TLS ([#4510](https://github.com/apache/iggy/issues/4510))
@@ -344,10 +354,11 @@ protocol: SASL names the principal there.
 With `requested`, a client that presents no certificate is Kafka's `ANONYMOUS` principal, which
 holds no permissions. Once any listener names principals (a SASL listener, or an `SSL` listener
 with client authentication), every connection that proved no identity is `ANONYMOUS`, on a
-`PLAINTEXT` listener beside it too. The requests the gateway checks against a principal,
-`DeleteTopics`, `AlterConfigs` and the auto-creation a `Metadata` request asks for, need
-`manage_topics` and are refused for it; everything else is served as the bridge's user. A gateway whose listeners name nobody serves every request as the
-bridge's user.
+`PLAINTEXT` listener beside it too. The requests the gateway checks against a principal are
+`DeleteTopics`, `AlterConfigs`, `DeleteGroups`, `OffsetDelete` and the auto-creation a `Metadata`
+request asks for. Each needs a global `manage_topics` or `manage_streams`, so the gateway refuses
+them for `ANONYMOUS`. Everything else is served as the bridge's user. A gateway whose listeners
+name nobody serves every request as the bridge's user.
 
 The rules are Kafka's syntax, tried in order: `RULE:pattern/replacement/[LU]` applies when the
 pattern matches the whole subject, `DEFAULT` keeps the subject as is. Iggy accepts any username of

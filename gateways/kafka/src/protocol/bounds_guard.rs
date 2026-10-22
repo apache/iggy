@@ -1331,6 +1331,66 @@ pub fn validate_list_groups_shape(version: i16, body: &Bytes, max_frame_size: us
     Ok(())
 }
 
+/// Mirrors the field order `DeleteGroupsRequest::decode` walks.
+///
+/// Group ids are echoed, so their lengths count toward the projected response.
+///
+/// # Errors
+///
+/// Returns an error when a declared array/string length cannot fit in the bytes remaining in the
+/// frame, or the body is truncated or malformed in a way that cannot be walked.
+pub fn validate_delete_groups_shape(
+    version: i16,
+    body: &Bytes,
+    max_frame_size: usize,
+) -> Result<()> {
+    let mut c = ShapeCursor::new(body.clone(), max_frame_size);
+    let flexible = version >= 2;
+    let groups_count = if flexible {
+        c.compact_array_count()?
+    } else {
+        c.legacy_array_count()?
+    };
+    for _ in 0..groups_count {
+        if flexible {
+            c.compact_string(false)?;
+        } else {
+            c.legacy_string(false)?;
+        }
+    }
+    if flexible {
+        c.tagged_fields()?;
+    }
+    Ok(())
+}
+
+/// Mirrors the field order `OffsetDeleteRequest::decode` walks at v0, the only version this
+/// gateway advertises.
+///
+/// Topic names are echoed, so their lengths count toward the projected response.
+///
+/// # Errors
+///
+/// Returns an error when a declared array/string length cannot fit in the bytes remaining in the
+/// frame, or the body is truncated or malformed in a way that cannot be walked.
+pub fn validate_offset_delete_shape(
+    _version: i16,
+    body: &Bytes,
+    max_frame_size: usize,
+) -> Result<()> {
+    let mut c = ShapeCursor::new(body.clone(), max_frame_size);
+    c.legacy_string(false)?;
+    let topics_count = c.legacy_array_count()?;
+    for _ in 0..topics_count {
+        c.legacy_string(false)?;
+        let partitions_count = c.legacy_array_count()?;
+        for _ in 0..partitions_count {
+            let _partition_index = c.read_i32()?;
+        }
+    }
+    Ok(())
+}
+
 /// Cap on a whole `SaslAuthenticate` body.
 ///
 /// The body is one length-prefixed blob, so capping it is the same as capping `auth_bytes`.
@@ -1624,8 +1684,8 @@ fn walk_offset_fetch_topics(
 mod tests {
     use bytes::BytesMut;
     use kafka_protocol::messages::{
-        DescribeGroupsRequest, LeaveGroupRequest, ListGroupsRequest, OffsetCommitRequest,
-        OffsetFetchRequest,
+        DeleteGroupsRequest, DescribeGroupsRequest, LeaveGroupRequest, ListGroupsRequest,
+        OffsetCommitRequest, OffsetDeleteRequest, OffsetFetchRequest,
     };
 
     use super::*;
@@ -2348,6 +2408,59 @@ mod tests {
     fn list_groups_v4_huge_states_filter_rejected() {
         let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F]);
         assert!(validate_list_groups_shape(4, &body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    #[test]
+    fn delete_groups_v0_two_groups_accepted() {
+        let body = Bytes::from_static(&[
+            0x00, 0x00, 0x00, 0x02, // groups_names: 2
+            0x00, 0x01, b'g', // first
+            0x00, 0x02, b'g', b'2', // second
+        ]);
+        assert!(validate_delete_groups_shape(0, &body, TEST_MAX_FRAME_SIZE).is_ok());
+        decode_exhaustive::<DeleteGroupsRequest>(0, body).expect("body matches the schema");
+    }
+
+    #[test]
+    fn delete_groups_v2_one_group_accepted() {
+        let body = Bytes::from_static(&[
+            0x02, // groups_names: 1
+            0x02, b'g', // group id
+            0x00, // tagged fields
+        ]);
+        assert!(validate_delete_groups_shape(2, &body, TEST_MAX_FRAME_SIZE).is_ok());
+        decode_exhaustive::<DeleteGroupsRequest>(2, body).expect("body matches the schema");
+    }
+
+    #[test]
+    fn delete_groups_v2_huge_group_count_rejected() {
+        let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F]);
+        assert!(validate_delete_groups_shape(2, &body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    #[test]
+    fn offset_delete_v0_topic_with_partitions_accepted() {
+        let body = Bytes::from_static(&[
+            0x00, 0x01, b'g', // group_id
+            0x00, 0x00, 0x00, 0x01, // topics: 1
+            0x00, 0x01, b't', // name
+            0x00, 0x00, 0x00, 0x02, // partitions: 2
+            0x00, 0x00, 0x00, 0x00, // 0
+            0x00, 0x00, 0x00, 0x01, // 1
+        ]);
+        assert!(validate_offset_delete_shape(0, &body, TEST_MAX_FRAME_SIZE).is_ok());
+        decode_exhaustive::<OffsetDeleteRequest>(0, body).expect("body matches the schema");
+    }
+
+    #[test]
+    fn offset_delete_v0_huge_partitions_count_rejected() {
+        let body = Bytes::from_static(&[
+            0x00, 0x01, b'g', // group_id
+            0x00, 0x00, 0x00, 0x01, // topics: 1
+            0x00, 0x01, b't', // name
+            0x7F, 0xFF, 0xFF, 0xFF, // partitions count
+        ]);
+        assert!(validate_offset_delete_shape(0, &body, TEST_MAX_FRAME_SIZE).is_err());
     }
 
     #[test]
