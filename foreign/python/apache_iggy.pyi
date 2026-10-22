@@ -1224,11 +1224,6 @@ class IggyClient:
         Requires an authenticated session whose user holds the `manage_servers`
         global permission.
 
-        Binary transports enforce a 30-second operation deadline. Large
-        snapshots (such as `"server_logs"` or `"all"`) that exceed 30 seconds
-        fail with `RuntimeError`, and the server rejects concurrent retries
-        until the in-flight snapshot collection finishes.
-
         Args:
             compression: Archive compression method. One of `"stored"`,
                 `"deflated"`, `"bzip2"`, `"zstd"`, `"lzma"`, `"xz"`.
