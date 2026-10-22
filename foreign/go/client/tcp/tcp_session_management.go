@@ -418,8 +418,14 @@ func (c *IggyTcpClient) bindLink(ctx context.Context, link *tcpLink) error {
 			return err
 		}
 		c.mtx.Lock()
-		valid := c.sessionFence == fence && c.session.ClientID() == identity.client && c.session.SessionID() == identity.session && bound.Session == identity.session
+		current := c.sessionFence == fence
+		valid := c.session.ClientID() == identity.client && c.session.SessionID() == identity.session && bound.Session == identity.session
 		c.mtx.Unlock()
+		// A session change during the bind ends the call like one during any
+		// other exchange, so a recovery can restart it.
+		if !current {
+			return ierror.ErrUnauthenticated
+		}
 		if !valid {
 			return ierror.ErrSessionMismatch
 		}

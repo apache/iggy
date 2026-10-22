@@ -25,6 +25,7 @@ import (
 	"net"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
@@ -851,4 +852,35 @@ func TestDetachedLinkPreservesRetainedMutation(t *testing.T) {
 			require.Len(t, registerRequests(server), 1)
 		})
 	}
+}
+
+// A caller sign-in replaces the session while a read waits to retry the bind
+// of its link. The read ends with 40, as after a session change during any
+// other exchange, so a running recovery could restart it.
+func TestDriverEndsACallWith40WhenItsSessionChangesDuringABind(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		client, peer := newPipeClient(t)
+		client.links.bootstrap.markBound(0)
+		var binds atomic.Uint32
+		serve(peer, func(_ int, read request) []byte {
+			if read.code() != uint32(command.BindSessionCode) {
+				return replyFrame(vsr.OperationNonReplicated, nil)
+			}
+			if binds.Add(1) == 1 {
+				return statusReplyFrame(read.operation(), uint32(ierror.TransientNotAcceptedCode), nil)
+			}
+			return bindReplyFrame(7, read.sessionID())
+		})
+		pinged := make(chan error, 1)
+		go func() { pinged <- client.Ping(context.Background()) }()
+		synctest.Wait()
+
+		client.mtx.Lock()
+		client.endSignInEpochLocked(nil)
+		client.invalidateSessionLocked()
+		client.mtx.Unlock()
+
+		require.ErrorIs(t, <-pinged, ierror.ErrUnauthenticated)
+		require.Equal(t, uint32(2), binds.Load(), "the bind went again under the replaced session")
+	})
 }
