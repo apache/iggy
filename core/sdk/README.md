@@ -110,8 +110,10 @@ permission check. A fresh application send can duplicate an uncertain operation.
 An explicit sign-in or logout ends earlier calls: unsent calls fail with 40,
 and possibly applied mutations remain uncertain. SDK-managed recovery can keep
 an unsent call waiting for a session or a primary within its original deadline.
-Expiry returns 58, and a refused automatic sign-in returns 40 with the refusal as
-its cause.
+Expiry returns 58. A refused automatic sign-in ends each unsent call that waits
+for it with 40. Until the caller signs in, later calls also fail with 40.
+`IggyError` carries no cause, so the client logs the refusal as a warning. If
+the sign-in of a `connect()` call is refused, that call returns the refusal.
 Recovery uses the caller's last explicit sign-in, or configured automatic
 credentials only if the caller never signed in. Logout disables automatic sign-in.
 
