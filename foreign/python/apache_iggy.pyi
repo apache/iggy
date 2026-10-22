@@ -2553,8 +2553,9 @@ class ProducerSendError(builtins.RuntimeError):
     @property
     def uncertain(self) -> builtins.int:
         r"""
-        How many messages at the head of `failed` the operation of an `uncertain`
-        cause carried, which may have committed. Zero for any other cause.
+        How many messages at the head of `failed` may have committed: those the
+        operation of an `uncertain` cause carried, or those of an HTTP send whose
+        outcome is unknown (code 57). Zero for any other cause.
         """
     @property
     def committed(self) -> builtins.list[SendMessagesConfirmation]:

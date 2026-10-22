@@ -285,7 +285,10 @@ impl ProducerCore {
         sent: usize,
         committed: Vec<SendMessagesConfirmationResponse>,
     ) -> IggyError {
-        let uncertain = if matches!(cause, IggyError::OperationUncertain(_)) {
+        let uncertain = if matches!(
+            cause,
+            IggyError::OperationUncertain(_) | IggyError::TransientNotCommitted
+        ) {
             sent
         } else {
             0
@@ -597,7 +600,9 @@ unsafe impl Sync for IggyProducer {}
 ///
 /// `OperationUncertain(op)` identifies the first chunk of `failed`, its first
 /// `uncertain` messages; it may already have committed. `LaneBlocked(op)` means
-/// none of `failed` was sent.
+/// none of `failed` was sent. HTTP retains no operation, so its unknown outcome is
+/// [`IggyError::TransientNotCommitted`]: the first `uncertain` messages of `failed`
+/// may already have committed, and only a read of the partition tells.
 /// Resolving the blocker never resubmits the earlier failed chunk as a new write.
 /// [`Client::resolve_operation`] tells the caller that got `OperationUncertain(op)`
 /// the outcome of that chunk, also after a later producer or consumer call
@@ -1486,6 +1491,23 @@ mod tests {
         assert_eq!(failed.len(), 1);
         assert_eq!(uncertain, 0);
         assert_eq!(cluster.count(SEND_MESSAGES_CODE), 1);
+    }
+
+    /// HTTP reports a send that may have committed as `TransientNotCommitted`.
+    #[tokio::test(start_paused = true)]
+    async fn given_a_chunk_with_an_unknown_outcome_when_it_fails_should_count_it_as_uncertain() {
+        let (_cluster, producer) = connected_producer().await;
+
+        let IggyError::ProducerSendFailed { uncertain, .. } = producer.core.make_failed_error(
+            IggyError::TransientNotCommitted,
+            vec![message(b"sent"), message(b"sent"), message(b"unsent")],
+            2,
+            Vec::new(),
+        ) else {
+            panic!("the producer must return the failed messages");
+        };
+
+        assert_eq!(uncertain, 2);
     }
 
     #[tokio::test(start_paused = true)]

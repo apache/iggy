@@ -127,7 +127,7 @@ pub enum IggyError {
     UsersLimitReached = 55,
     #[error("Invalid personal access token expiry")]
     InvalidPersonalAccessTokenExpiry = 56,
-    #[error("Request transiently not committed; retry")]
+    #[error("Request outcome unknown; it may have applied")]
     TransientNotCommitted = 57,
     #[error("Request transiently not accepted; retry, on any replica")]
     TransientNotAccepted = 58,
@@ -475,9 +475,9 @@ pub enum IggyError {
     ProducerSendFailed {
         cause: Box<IggyError>,
         failed: Arc<Vec<IggyMessage>>,
-        /// How many messages at the head of `failed` the operation of an
-        /// `OperationUncertain` cause carried, which may have committed. Zero
-        /// for any other cause.
+        /// How many messages at the head of `failed` the request of an
+        /// `OperationUncertain` or `TransientNotCommitted` cause carried, which
+        /// may have committed. Zero for any other cause.
         uncertain: usize,
         /// Confirmations of the chunks that committed before `cause`; the
         /// durable prefix of a send that was split into several requests.
