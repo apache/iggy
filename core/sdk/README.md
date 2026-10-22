@@ -71,8 +71,10 @@ calls complete.
 
 `IggyError::ProducerSendFailed` changes its public `stream_name` and `topic_name`
 fields from `String` to `Box<str>`. Existing constructors must convert their names
-with `.into()`; the callback's `ErrorCtx` fields remain `String`. The `uncertain`
-message count remains `usize`.
+with `.into()`; the callback's `ErrorCtx` fields remain `String`. It also adds a
+public `uncertain: usize` field, so struct literals and exhaustive patterns must
+name it. `ConsumerGroupClientState` no longer has its public `partition_count` and
+`set_partition_context` methods.
 
 An established session has its own lifetime. Password or PAT changes and PAT
 expiry do not end it. Logout, session lease expiry, or user deactivation end the

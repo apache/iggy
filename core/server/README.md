@@ -259,9 +259,11 @@ An explicit SDK sign-in or logout ends earlier calls: an unsent call fails with
 40 (`Unauthenticated`), while a possibly applied mutation remains uncertain.
 Only SDK-managed recovery can continue an unsent waiting call under a replacement
 session. It never replays an uncertain mutation under a new identity. A session
-wait reaching its deadline fails with 58; a refused automatic sign-in
-fails with 40 and the refusal as its cause. Recovery uses the caller's last
-explicit sign-in, falling back to configured automatic credentials only before
+wait reaching its deadline fails with 58, and a refused automatic sign-in fails
+with 40. The Rust SDK, and the C++, PHP and Python bindings built on it, log the
+refusal as a warning. The other SDKs attach it as the cause of that 40. Recovery
+uses the caller's last explicit sign-in, falling back to configured automatic
+credentials only before
 any explicit sign-in. Logout disables automatic sign-in; consult the SDK's
 connect/disconnect contract before opening a new session. Swift reports an
 unknown mutation as 57 and has no retained-operation resolver.

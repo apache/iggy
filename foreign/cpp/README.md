@@ -88,6 +88,10 @@ Bridge-local argument errors leave it empty. Inspect `kind`, `code`, and, when
 `has_operation_id` is true, `operation_id`. Use separate values for concurrent
 calls; error state is never stored globally or on the client.
 
+The `IggyException(const std::string &, const ffi::ErrorInfo &)` constructor is
+private. Only `IggyBlockingClient` builds an exception with a code. Other code
+builds an `IggyException` from its message.
+
 Concurrent calls on one client are safe. Moving, assigning, or destroying the
 client while any call is in progress is undefined behavior.
 
