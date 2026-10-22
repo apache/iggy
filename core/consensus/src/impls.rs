@@ -1392,8 +1392,8 @@ where
     /// planes.
     journal_mutations: Cell<u64>,
 
-    /// The log a DVC quorum settled on, parked until this replica's journal can
-    /// serve all of it.
+    /// The log a DVC quorum settled on or an adopted `StartView` announced,
+    /// parked until this replica's journal can serve all of it.
     ///
     /// Under `do_view_change_quorum` it means "primary-elect, repairing": decided
     /// but not started, so this replica prepares and announces nothing. Otherwise
@@ -8488,6 +8488,11 @@ mod adopted_view_claim_tests {
         restarted.begin_view_probe();
         restarted.restore_adopted_view(durable.adopted_view.as_ref());
         restarted.resume_adopted_view();
+        assert_eq!(
+            restarted.with_pending_view_log(|merged| merged.op_head),
+            Some(HEAD),
+            "the restart did not park the view-{ADOPTED_VIEW} log, so nothing below tests the gate"
+        );
         // What the plane's reconcile does once the journal matches the parked headers.
         restarted.settle_view_log_proof();
         assert!(
