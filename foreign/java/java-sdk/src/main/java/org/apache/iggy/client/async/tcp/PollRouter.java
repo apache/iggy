@@ -130,7 +130,14 @@ final class PollRouter {
     CompletableFuture<AsyncTcpConnection> connectionFor(ConnectionInfo endpoint, long deadline) {
         Route route = attachmentRoute(endpoint);
         Slot slot = slotFor(endpoint);
-        return slot.prepare(route, deadline).thenApply(ignored -> slot.connection);
+        // A close of the slot during its bind clears the link, and the bind can still end without an error.
+        return slot.prepare(route, deadline).thenApply(ignored -> {
+            AsyncTcpConnection prepared = slot.connection;
+            if (prepared == null) {
+                throw notAccepted();
+            }
+            return prepared;
+        });
     }
 
     private Route attachmentRoute(ConnectionInfo endpoint) {

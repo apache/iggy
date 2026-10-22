@@ -1004,6 +1004,35 @@ class PollRouterTest {
         }
     }
 
+    /**
+     * A sign-in can close a slot while its bind is in flight, and the bind can still succeed. The slot then has no
+     * link, so a redial to it must fail instead of publishing a null coordinator.
+     */
+    @Test
+    void shouldRefuseAConnectionWhoseSlotClosesDuringItsBind() throws Exception {
+        IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+        ManualTimers timers = new ManualTimers();
+        try {
+            Coordinator coordinator = new Coordinator(group, timers);
+            Primary primary = new Primary(group);
+            primary.binding = new CompletableFuture<>();
+            PollRouter router = new PollRouter(() -> coordinator, endpoint -> primary);
+            ConnectionInfo target = new ConnectionInfo("localhost", PRIMARY_PORT);
+            var connection = router.connectionFor(target, System.nanoTime() + TIMEOUT.toNanos());
+            assertThat(connection)
+                    .as("the connection while its bind is in flight")
+                    .isNotDone();
+
+            router.clearSession().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            primary.binding.complete(Unpooled.EMPTY_BUFFER);
+
+            assertServerError(connection, AsyncTcpConnection.TRANSIENT_NOT_ACCEPTED);
+        } finally {
+            timers.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+            group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+        }
+    }
+
     @Test
     void shouldRefreshCachedHistoryBeforeANewPollAfterMetadataAdvances() throws Exception {
         IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());

@@ -1653,6 +1653,10 @@ public class AsyncIggyTcpClient {
                 return CompletableFuture.failedFuture(
                         new IggyNotConnectedException(AsyncTcpConnection.SIGN_IN_REPLACED));
             }
+            // Every routed call reads the coordinator, so it must never become null.
+            if (newConnection == null) {
+                return CompletableFuture.failedFuture(AsyncTcpConnection.notAccepted());
+            }
             if (!connection.compareAndSet(oldConnection, newConnection)) {
                 return CompletableFuture.failedFuture(
                         new IllegalStateException("Connection replaced concurrently during leader redirection"));
