@@ -512,12 +512,12 @@ pub enum PartitionReadReply {
     },
     /// Reply to [`PartitionRead::ResolveSegmentDeleteOffset`]: the resolved
     /// truncation offset, or `None` when the partition has no sealed segments
-    /// to delete. `lagging` means this replica has not converged on the
-    /// replicated log (follower, mid-view-change, or `commit_min` behind
-    /// `commit_max`): a `None` offset is then transient rather than a settled
-    /// no-op, since sealed segments may exist that this replica has not
-    /// learned about. A converged replica's committed-but-unflushed resident
-    /// tail does NOT make the no-op transient.
+    /// to delete. `lagging` means the answer is transient: this replica is not
+    /// a normal primary that applied the view it started, it installs a state
+    /// transfer, or it has nothing sealed while commits above `commit_min`
+    /// can still seal a segment. Those commits never change a sealed segment,
+    /// so they do not make an offset transient. A committed-but-unflushed
+    /// resident tail does NOT make the no-op transient.
     SegmentDeleteOffset {
         up_to_offset: Option<u64>,
         lagging: bool,

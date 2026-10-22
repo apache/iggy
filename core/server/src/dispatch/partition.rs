@@ -1422,11 +1422,13 @@ pub(in crate::dispatch) async fn handle_delete_segments_request<B, MJ, S, SB>(
 /// truncate commits under. A resolvable namespace with nothing sealed to delete
 /// still yields a `TruncatePartition(up_to_offset = 0)` so the metadata request
 /// sequence stays contiguous. Both deletion and no-op resolution require a
-/// converged partition primary and retain their history guard.
+/// normal partition primary that applied the view it started, and retain their
+/// history guard. A no-op also waits for the commits that primary has not
+/// executed yet, since they can seal a segment.
 /// An UNRESOLVABLE namespace yields the truncate
 /// against the client's raw identifiers (the apply rejects it as a committed
 /// result). `Err` is only `InvalidCommand` for a malformed body and
-/// `TransientNotAccepted` for a partition behind the commit frontier or committed
+/// `TransientNotAccepted` for a resolution that must wait or a changed committed
 /// history: both transports surface that transient rejection.
 #[allow(clippy::future_not_send)]
 #[allow(clippy::cast_possible_truncation)]
