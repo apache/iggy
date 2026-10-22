@@ -246,8 +246,9 @@ actor ClientCore {
                 }
                 guard ContinuousClock.now < deadline else {
                     // Nothing is left of the deadline to reconnect in; the next
-                    // request does it.
-                    throw failure
+                    // request does it. As after a reconnect that outlasts the
+                    // deadline, a request that can go again is not accepted.
+                    throw replay ? IggyError(.transientNotAccepted, context: "the request deadline passed after: \(error)") : failure
                 }
                 if !replay {
                     // The request was written and lost, as the Rust SDK marks a
@@ -446,7 +447,7 @@ actor ClientCore {
         case .shutdown:
             throw IggyError(.clientShutdown)
         case .disconnected, .connecting, .authenticating:
-            throw IggyError(.disconnected)
+            throw IggyError(disconnectedByCaller ? .notConnected : .disconnected)
         case .connected:
             throw IggyError(.unauthenticated)
         case .authenticated:

@@ -133,6 +133,7 @@ struct ClientTransportTests {
             }
         }
         await expectCode(.notConnected) { try await client.ping() }
+        await expectCode(.notConnected) { _ = try await client.getMe() }
         #expect(await pingCount(server) == 0)
     }
 
@@ -235,7 +236,7 @@ struct ClientTransportTests {
             (.status(IggyErrorCode.invalidPersonalAccessToken.rawValue), .invalidPersonalAccessToken),
             (.status(IggyErrorCode.personalAccessTokenExpired.rawValue), .personalAccessTokenExpired),
             (.status(IggyErrorCode.userInactive.rawValue), .userInactive),
-            (.stall, .disconnected),
+            (.stall, .transientNotAccepted),
         ], [false, true])
     func aFailedExplicitSignInDisablesAutomaticFallback(_ failure: (FakeVSRServer.Reply, IggyErrorCode), token: Bool) async throws {
         let (reply, code) = failure
@@ -924,7 +925,7 @@ struct ClientTransportTests {
         try await client.connect()
         let clock = ContinuousClock()
         let elapsed = await clock.measure {
-            await expectCode(.disconnected) { _ = try await client.getStats() }
+            await expectCode(.transientNotAccepted) { _ = try await client.getStats() }
         }
         #expect(elapsed >= .milliseconds(450) && elapsed < .seconds(10))
         #expect(await client.state == .disconnected)
