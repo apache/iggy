@@ -5701,24 +5701,17 @@ mod tests {
         elect_beside_proven_backup(namespace, &backup, &candidate, &store).await;
     }
 
-    /// A primary-elect truncates the op that the merged log replaces and proves the
-    /// merge through a repair. Its `log_view` names the view it replicated in until
-    /// the view starts, so its WAL must not certify that view over the merged
-    /// journal in between.
-    #[compio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn given_a_settled_merge_when_the_elect_persists_before_the_view_starts_should_not_certify_its_old_log_view()
-     {
+    /// The candidate becomes the [`HEADLESS_NEXT_VIEW`] primary-elect beside the
+    /// backup. It truncates the op that the merged log replaces, which clears the
+    /// WAL certificate of the view it replicated in, and proves the merge through
+    /// a repair. Returns the backup and the elect, whose view has not started.
+    #[allow(clippy::future_not_send)]
+    async fn elect_with_settled_merge(
+        namespace: IggyNamespace,
+        directory: &Path,
+        store: &Rc<HeldSuperblock>,
+    ) -> (HeadlessReplica, HeadlessReplica) {
         const HEAD: u64 = 2;
-        // Persist calls between the settled proof and the view start, one tick
-        // apart. The WAL task publishes a queued certificate within the first few.
-        const WINDOW_ROUNDS: usize = 20;
-        let directory = tempfile::tempdir().unwrap();
-        let store = Rc::new(HeldSuperblock {
-            entered: RefCell::new(None),
-            held: RefCell::new(None),
-        });
-        let namespace = IggyNamespace::new(0, 0, 0);
         let prepares = primary_prepares(&Rc::new(IggyMessageBus::new(0)), namespace, HEAD).await;
         let prefix = usize::try_from(HEAD - 1).unwrap();
         // The primary of both views prepared op 2 in the elect's view, lost it,
@@ -5738,7 +5731,7 @@ mod tests {
             HEADLESS_CANDIDATE,
             namespace,
             &prepares,
-            Some((directory.path(), &store)),
+            Some((directory, store)),
         )
         .await;
         backup
@@ -5814,6 +5807,34 @@ mod tests {
         assert!(!elect_partition().consensus().view_log_unproven());
         assert!(elect_partition().consensus().is_primary_elect());
         assert_eq!(elect_partition().consensus().log_view(), REPAIR_VIEW);
+        (backup, elect)
+    }
+
+    /// A primary-elect truncates the op that the merged log replaces and proves the
+    /// merge through a repair. Its `log_view` names the view it replicated in until
+    /// the view starts, so its WAL must not certify that view over the merged
+    /// journal in between.
+    #[compio::test]
+    async fn given_a_settled_merge_when_the_elect_persists_before_the_view_starts_should_not_certify_its_old_log_view()
+     {
+        // Persist calls between the settled proof and the view start, one tick
+        // apart. The WAL task publishes a queued certificate within the first few.
+        const WINDOW_ROUNDS: usize = 20;
+        let directory = tempfile::tempdir().unwrap();
+        let store = Rc::new(HeldSuperblock {
+            entered: RefCell::new(None),
+            held: RefCell::new(None),
+        });
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let (backup, elect) = Box::pin(elect_with_settled_merge(
+            namespace,
+            directory.path(),
+            &store,
+        ))
+        .await;
+        let backup_consensus = || backup.partition(namespace).consensus();
+        let elect_partition = || elect.partition(namespace);
+        let mut scratch = Vec::new();
 
         // The next tick sweep starts the view. Until then the journal is the
         // merged log while `log_view` still names the elect's own view.
@@ -5840,6 +5861,342 @@ mod tests {
             .await;
         assert!(backup_consensus().is_normal());
         assert_eq!(backup_consensus().view(), HEADLESS_NEXT_VIEW);
+    }
+
+    /// As above, but the backup's view change supersedes the elect before its view
+    /// starts. The third replica is down, so the new view needs the elect's votes,
+    /// and those wait for a superblock write.
+    #[compio::test]
+    async fn given_a_settled_merge_when_a_view_change_supersedes_the_elect_should_vote_and_elect_a_primary()
+     {
+        const SUPERSEDING_VIEW: u32 = HEADLESS_NEXT_VIEW + 1;
+        const SUPERSEDING_PRIMARY: u8 = HEADLESS_BACKUP;
+        let directory = tempfile::tempdir().unwrap();
+        let store = Rc::new(HeldSuperblock {
+            entered: RefCell::new(None),
+            held: RefCell::new(None),
+        });
+        let namespace = IggyNamespace::new(0, 0, 0);
+        assert_eq!(
+            u32::from(SUPERSEDING_PRIMARY),
+            SUPERSEDING_VIEW % u32::from(HEADLESS_REPLICAS)
+        );
+        let (backup, elect) = Box::pin(elect_with_settled_merge(
+            namespace,
+            directory.path(),
+            &store,
+        ))
+        .await;
+        let backup_consensus = || backup.partition(namespace).consensus();
+        let elect_consensus = || elect.partition(namespace).consensus();
+        // What the first refresh after the settled proof snapshots.
+        crate::refresh_partition_dvc_suffix(elect.partition(namespace));
+        let settled = elect_consensus().local_dvc_suffix();
+
+        // Only the backup ticks: its status timeout supersedes the elect, which runs
+        // nothing after its proof settled.
+        let mut scratch = Vec::new();
+        for _ in 0..2 * TimeoutManager::VIEW_CHANGE_STATUS_TICKS {
+            if backup_consensus().view() == SUPERSEDING_VIEW {
+                break;
+            }
+            assert!(backup.owner.tick_partitions(&mut scratch).await.is_none());
+        }
+        assert_eq!(backup_consensus().view(), SUPERSEDING_VIEW);
+        // `take` returns the first match, so drop the frames of earlier views, the
+        // backup's retransmits among them.
+        for replica in [&backup, &elect] {
+            replica
+                .sent
+                .borrow_mut()
+                .retain(|(_, frame)| frame.header().view == SUPERSEDING_VIEW);
+        }
+        assert!(elect_consensus().view_log_merged());
+        elect
+            .owner
+            .on_message(backup.take(HEADLESS_CANDIDATE, Command::StartViewChange))
+            .await;
+        assert_eq!(elect_consensus().view(), SUPERSEDING_VIEW);
+
+        let voted = async {
+            while ![Command::StartViewChange, Command::DoViewChange]
+                .into_iter()
+                .all(|command| elect.sent_to(SUPERSEDING_PRIMARY, command, SUPERSEDING_VIEW))
+            {
+                elect.step(&mut scratch).await;
+            }
+        };
+        compio::time::timeout(REPLY_DEADLINE, Box::pin(voted))
+            .await
+            .expect("the superseded elect must persist the view and vote in it");
+        let MessageBag::DoViewChange(vote) = elect.take(SUPERSEDING_PRIMARY, Command::DoViewChange)
+        else {
+            unreachable!("take returns the command it was asked for");
+        };
+        let header = *vote.header();
+        assert_eq!(
+            header.log_view, REPAIR_VIEW,
+            "the merge never started, so the elect claims the view it replicated in"
+        );
+        assert_eq!(
+            (header.commit, header.nack_bitset, header.present_bitset),
+            (0, 0, 0),
+            "nothing is committed, and an unproven journal neither offers nor nacks an uncommitted op"
+        );
+        let suffix = consensus::dvc_suffix_decode(
+            vote.body(),
+            header.op,
+            header.nack_bitset,
+            header.present_bitset,
+        )
+        .unwrap();
+        assert!(
+            !suffix.is_empty(),
+            "the vote must carry the snapshot taken before the view change"
+        );
+        assert_eq!(
+            (suffix.headers(), header.nack_bitset, header.present_bitset),
+            (
+                settled.headers(),
+                settled.nack_bitset(),
+                settled.present_bitset()
+            ),
+            "the superseding handler must vote with the snapshot of the settled proof"
+        );
+
+        backup
+            .owner
+            .on_message(elect.take(SUPERSEDING_PRIMARY, Command::StartViewChange))
+            .await;
+        backup
+            .owner
+            .on_message(MessageBag::DoViewChange(vote))
+            .await;
+        for _ in 0..TimeoutManager::VIEW_CHANGE_STATUS_TICKS {
+            if backup_consensus().is_normal() {
+                break;
+            }
+            assert!(backup.owner.tick_partitions(&mut scratch).await.is_none());
+        }
+        assert!(backup_consensus().is_normal());
+        assert!(backup_consensus().is_primary());
+        assert_eq!(backup_consensus().view(), SUPERSEDING_VIEW);
+        elect
+            .owner
+            .on_message(backup.take(HEADLESS_CANDIDATE, Command::StartView))
+            .await;
+        assert!(elect_consensus().is_normal());
+        assert_eq!(elect_consensus().view(), SUPERSEDING_VIEW);
+    }
+
+    /// As above, but the elect adopted the view of the third replica, which goes
+    /// silent after it prepares one more op. The third replica still votes for the
+    /// next view with that op, then goes down. The merge truncates nothing, so the
+    /// elect's WAL still certifies its `log_view`, and the backup's `log_view` is
+    /// below it. Only the elect's journal then holds every op, so it must stay
+    /// proven and offer them.
+    #[compio::test]
+    async fn given_a_settled_merge_that_kept_the_wal_certificate_when_a_lagging_backup_supersedes_the_elect_should_elect_the_backup_from_the_merged_log()
+     {
+        const HEAD: u64 = 3;
+        const SUPERSEDING_VIEW: u32 = HEADLESS_NEXT_VIEW + 1;
+        const SUPERSEDING_PRIMARY: u8 = HEADLESS_BACKUP;
+        let directory = tempfile::tempdir().unwrap();
+        let store = Rc::new(HeldSuperblock {
+            entered: RefCell::new(None),
+            held: RefCell::new(None),
+        });
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let prepares = primary_prepares(&Rc::new(IggyMessageBus::new(0)), namespace, HEAD).await;
+        let adopted = usize::try_from(HEAD - 1).unwrap();
+        // The primary prepared the last op after it started the adopted view.
+        let lagged =
+            prepares[adopted]
+                .clone()
+                .transmute_header(|previous, header: &mut PrepareHeader| {
+                    *header = previous;
+                    header.view = HEADLESS_VIEW;
+                    header.checksum = header.identity_checksum();
+                });
+        let backup =
+            HeadlessReplica::journaled(HEADLESS_BACKUP, namespace, &prepares[..1], None).await;
+        let elect = HeadlessReplica::journaled(
+            HEADLESS_CANDIDATE,
+            namespace,
+            &prepares[..adopted],
+            Some((directory.path(), &store)),
+        )
+        .await;
+        let backup_consensus = || backup.partition(namespace).consensus();
+        let elect_partition = || elect.partition(namespace);
+        let elect_consensus = || elect.partition(namespace).consensus();
+        elect
+            .owner
+            .on_start_view(start_view_suffix(
+                namespace,
+                HEADLESS_VIEW,
+                HEAD - 1,
+                0,
+                &[*prepares[adopted - 1].header()],
+            ))
+            .await;
+        assert!(!elect_consensus().view_log_unproven());
+        assert_eq!(elect_consensus().log_view(), HEADLESS_VIEW);
+
+        let mut scratch = Vec::new();
+        let certified = async {
+            while !elect_partition().wal_keeps_log_view() {
+                elect.step(&mut scratch).await;
+            }
+        };
+        compio::time::timeout(REPLY_DEADLINE, Box::pin(certified))
+            .await
+            .expect("the elect's WAL must certify the view it adopted");
+        for _ in 0..2 * TimeoutManager::NORMAL_HEARTBEAT_TICKS {
+            if elect_consensus().view() == HEADLESS_NEXT_VIEW {
+                break;
+            }
+            assert!(elect.owner.tick_partitions(&mut scratch).await.is_none());
+        }
+        assert_eq!(elect_consensus().view(), HEADLESS_NEXT_VIEW);
+        let announced = async {
+            while !elect.sent_to(
+                HEADLESS_BACKUP,
+                Command::StartViewChange,
+                HEADLESS_NEXT_VIEW,
+            ) {
+                elect.step(&mut scratch).await;
+            }
+        };
+        compio::time::timeout(REPLY_DEADLINE, Box::pin(announced))
+            .await
+            .expect("the elect must announce the view change");
+        backup
+            .owner
+            .on_message(elect.take(HEADLESS_BACKUP, Command::StartViewChange))
+            .await;
+        elect
+            .owner
+            .on_message(backup.take(HEADLESS_CANDIDATE, Command::StartViewChange))
+            .await;
+        // The backup's own vote never arrives, so the quorum is the elect's and the
+        // third replica's, which offers a body for every op.
+        let third_replica = DvcSuffix::new(
+            [&lagged, &prepares[1], &prepares[0]]
+                .map(|prepare| *prepare.header())
+                .to_vec(),
+            0,
+            (1 << HEAD) - 1,
+        );
+        elect
+            .owner
+            .on_message(MessageBag::DoViewChange(do_view_change_suffix(
+                namespace,
+                HEADLESS_PRIMARY,
+                HEADLESS_NEXT_VIEW,
+                HEADLESS_VIEW,
+                HEAD,
+                &third_replica,
+            )))
+            .await;
+        assert!(elect_consensus().is_primary_elect());
+        let fetching = async {
+            while elect_partition().repair.is_none() {
+                elect.step(&mut scratch).await;
+            }
+        };
+        compio::time::timeout(REPLY_DEADLINE, Box::pin(fetching))
+            .await
+            .expect("the elect must fetch the op it lacks");
+        assert_eq!(
+            elect_partition().log.journal().inner.last_op(),
+            Some(HEAD - 1),
+            "the elect holds a prefix of the merged log, so nothing truncates"
+        );
+        elect
+            .owner
+            .on_repair_prepare(as_repair_prepare(lagged.clone()))
+            .await;
+        assert!(!elect_consensus().view_log_unproven());
+        assert!(elect_consensus().is_primary_elect());
+        assert!(elect_partition().wal_keeps_log_view());
+
+        // Only the backup ticks: its status timeout supersedes the elect, which runs
+        // nothing after its proof settled.
+        for _ in 0..2 * TimeoutManager::VIEW_CHANGE_STATUS_TICKS {
+            if backup_consensus().view() == SUPERSEDING_VIEW {
+                break;
+            }
+            assert!(backup.owner.tick_partitions(&mut scratch).await.is_none());
+        }
+        assert_eq!(backup_consensus().view(), SUPERSEDING_VIEW);
+        for replica in [&backup, &elect] {
+            replica
+                .sent
+                .borrow_mut()
+                .retain(|(_, frame)| frame.header().view == SUPERSEDING_VIEW);
+        }
+        elect
+            .owner
+            .on_message(backup.take(HEADLESS_CANDIDATE, Command::StartViewChange))
+            .await;
+        let voted = async {
+            while ![Command::StartViewChange, Command::DoViewChange]
+                .into_iter()
+                .all(|command| elect.sent_to(SUPERSEDING_PRIMARY, command, SUPERSEDING_VIEW))
+            {
+                elect.step(&mut scratch).await;
+            }
+        };
+        compio::time::timeout(REPLY_DEADLINE, Box::pin(voted))
+            .await
+            .expect("the superseded elect must vote");
+        let MessageBag::DoViewChange(vote) = elect.take(SUPERSEDING_PRIMARY, Command::DoViewChange)
+        else {
+            unreachable!("take returns the command it was asked for");
+        };
+        assert!(
+            backup_consensus().log_view() < vote.header().log_view,
+            "no copy the backup holds can stand in for the elect's"
+        );
+        backup
+            .owner
+            .on_message(elect.take(SUPERSEDING_PRIMARY, Command::StartViewChange))
+            .await;
+        backup
+            .owner
+            .on_message(MessageBag::DoViewChange(vote))
+            .await;
+
+        let merging = async {
+            while backup.partition(namespace).repair.is_none() {
+                backup.step(&mut scratch).await;
+            }
+        };
+        compio::time::timeout(REPLY_DEADLINE, Box::pin(merging))
+            .await
+            .expect("the backup must merge the elect's log and fetch the ops it lacks");
+        for prepare in [&prepares[1], &lagged] {
+            backup
+                .owner
+                .on_repair_prepare(as_repair_prepare(prepare.clone()))
+                .await;
+        }
+        for _ in 0..TimeoutManager::VIEW_CHANGE_STATUS_TICKS {
+            if backup_consensus().is_normal() {
+                break;
+            }
+            assert!(backup.owner.tick_partitions(&mut scratch).await.is_none());
+        }
+        assert!(backup_consensus().is_normal());
+        assert!(backup_consensus().is_primary());
+        assert_eq!(backup_consensus().view(), SUPERSEDING_VIEW);
+        elect
+            .owner
+            .on_message(backup.take(HEADLESS_CANDIDATE, Command::StartView))
+            .await;
+        assert!(elect_consensus().is_normal());
+        assert_eq!(elect_consensus().view(), SUPERSEDING_VIEW);
     }
 
     /// The walk refuses an unproven view log, so a resident op after
@@ -7025,6 +7382,37 @@ mod tests {
             header.view = view;
             header.op = op;
             header.commit = commit;
+            header.size = u32::try_from(total).unwrap();
+            header.checksum_body = checksum_body;
+            header.seal();
+        })
+    }
+
+    /// The vote of `replica` in `view` with `suffix` as its log up to `op` and
+    /// nothing committed.
+    fn do_view_change_suffix(
+        namespace: IggyNamespace,
+        replica: u8,
+        view: u32,
+        log_view: u32,
+        op: u64,
+        suffix: &DvcSuffix,
+    ) -> Message<DoViewChangeHeader> {
+        let header_size = size_of::<DoViewChangeHeader>();
+        let total = header_size + suffix.encoded_len();
+        let mut message = Message::<DoViewChangeHeader>::new(total);
+        suffix.encode_into(&mut message.as_mut_slice()[header_size..]);
+        let checksum_body = crate::control_body_checksum(&message.as_slice()[header_size..]);
+        message.transmute_header(|_, header: &mut DoViewChangeHeader| {
+            header.command = Command::DoViewChange;
+            header.cluster = 1;
+            header.group = namespace.inner();
+            header.replica = replica;
+            header.view = view;
+            header.log_view = log_view;
+            header.op = op;
+            header.nack_bitset = suffix.nack_bitset();
+            header.present_bitset = suffix.present_bitset();
             header.size = u32::try_from(total).unwrap();
             header.checksum_body = checksum_body;
             header.seal();
