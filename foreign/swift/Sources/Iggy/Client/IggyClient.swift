@@ -172,7 +172,9 @@ public final class IggyClient: Sendable {
     /// so it never runs under a session signed in after it. The client does
     /// not sign in by itself again, not even with the configured auto-login,
     /// until the next ``login(username:password:)``, or the first
-    /// ``connect()`` after a ``disconnect()``.
+    /// ``connect()`` after a ``disconnect()``. A logout while the client is
+    /// not signed in, such as after a lost connection, fails with
+    /// ``IggyErrorCode/unauthenticated`` and still signs out.
     public func logout() async throws {
         try await core.logout()
     }

@@ -1341,11 +1341,16 @@ actor ClientCore {
     }
 
     func logout(lineage captured: UInt64? = nil, deadline: ContinuousClock.Instant? = nil) async throws {
-        guard state == .authenticated else {
-            throw IggyError(.unauthenticated)
-        }
         if captured == nil { lineage += 1 }
         let started = captured ?? lineage
+        guard state == .authenticated else {
+            // No connection carries the session to end it on the server, so
+            // it is dropped here: no reconnect binds it or signs in again.
+            rememberedSignIn = nil
+            signInWithdrawn = true
+            resetSession()
+            throw IggyError(.unauthenticated)
+        }
         _ = try await exchange(code: CommandCode.logoutUser.rawValue, payload: [], deadline: deadline, lineage: started)
         if let refusal = lineageRefusal(started, code: CommandCode.logoutUser.rawValue) { throw refusal }
         rememberedSignIn = nil

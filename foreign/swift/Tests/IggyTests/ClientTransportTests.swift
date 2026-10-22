@@ -1769,6 +1769,28 @@ struct ClientTransportTests {
         await client.shutdown()
     }
 
+    /// A logout after a lost connection finds no session to end, yet the
+    /// client signs out: no reconnect binds the old session or signs in.
+    @Test func aLogoutWhileDisconnectedSignsOut() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        await server.respond { request in
+            if let reply = FakeVSRServer.sessionReply(request) { return reply }
+            return request.code == CommandCode.getStats.rawValue ? .stall : .ok([])
+        }
+        let client = makeClient(server, requestTimeout: shortTimeout)
+        try await client.connect()
+        _ = try? await client.getStats()
+        #expect(await client.state == .disconnected)
+
+        await expectCode(.unauthenticated) { try await client.logout() }
+
+        await #expect(throws: IggyError.self) { try await client.ping() }
+        #expect(await codes(server).filter { $0 == CommandCode.bindSession.rawValue }.isEmpty)
+        #expect(await operations(server).filter { $0 == .register }.count == 1)
+        await client.shutdown()
+    }
+
     /// A call that waits for a reconnect whose sign-in the server refuses
     /// ends unauthenticated, with the refusal as its cause, whether it waited
     /// in the exchange or before a typed call. The client forgets the refused
