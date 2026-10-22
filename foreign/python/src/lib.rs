@@ -16,6 +16,7 @@
 // under the License.
 
 pub mod client;
+pub mod cluster;
 mod config;
 mod consumer;
 mod durability;
@@ -34,6 +35,7 @@ mod user;
 mod user_headers;
 
 use client::{IggyClient, PendingOperationError};
+use cluster::{ClusterMetadata, ClusterNode, TransportEndpoints};
 use config::{
     AutoLogin, HttpConfig, PendingOperationsConfig, QuicConfig, QuicReconnectionConfig, TcpConfig,
     TcpReconnectionConfig, WebSocketConfig, WebSocketFramingConfig, WebSocketReconnectionConfig,
@@ -120,5 +122,9 @@ fn apache_iggy(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<GlobalPermissions>()?;
     m.add_class::<StreamPermissions>()?;
     m.add_class::<TopicPermissions>()?;
+    cluster::register_enums(py, m)?;
+    m.add_class::<TransportEndpoints>()?;
+    m.add_class::<ClusterNode>()?;
+    m.add_class::<ClusterMetadata>()?;
     Ok(())
 }
