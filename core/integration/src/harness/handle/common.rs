@@ -16,6 +16,7 @@
 // under the License.
 
 use std::fs;
+use std::io;
 use std::path::PathBuf;
 use std::process::Child;
 use std::thread;
@@ -23,7 +24,8 @@ use std::time::{Duration, Instant};
 
 pub const DEFAULT_HEALTH_CHECK_RETRIES: u32 = 1000;
 pub const DEFAULT_HEALTH_CHECK_INTERVAL_MS: u64 = 20;
-const SIGTERM_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a graceful stop waits after SIGTERM before it sends SIGKILL.
+pub const SIGTERM_TIMEOUT: Duration = Duration::from_secs(5);
 const SIGKILL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Collect stdout and stderr logs from file paths.
@@ -133,27 +135,65 @@ pub fn reap_exit_status(pid: u32) -> Option<String> {
     Some(format!("unrecognized wait status {status}"))
 }
 
-/// Gracefully stop a child process: SIGTERM, wait up to 5s, then SIGKILL.
-/// Returns the child for final cleanup (wait_with_output).
-pub fn graceful_kill(mut child: Child) -> Child {
-    let pid = child.id() as libc::pid_t;
+/// A child after [`graceful_kill`], ready for final cleanup
+/// (`wait_with_output`).
+pub struct GracefulKill {
+    pub child: Child,
+    /// The child outlived the SIGTERM grace period and got SIGKILL.
+    pub killed_after_timeout: bool,
+    /// Polling the child failed, so whether it exited inside the grace is
+    /// unknown.
+    pub wait_error: Option<io::ErrorKind>,
+}
 
+/// Gracefully stop a child process: SIGTERM, wait up to
+/// [`SIGTERM_TIMEOUT`], then SIGKILL.
+pub fn graceful_kill(child: Child) -> GracefulKill {
+    send_sigterm(&child);
+    wait_or_kill(child, Instant::now() + SIGTERM_TIMEOUT)
+}
+
+/// The first half of [`graceful_kill`], for callers that signal several
+/// processes before waiting for any of them.
+pub fn send_sigterm(child: &Child) {
     unsafe {
-        libc::kill(pid, libc::SIGTERM);
+        libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
     }
+}
 
-    let deadline = Instant::now() + SIGTERM_TIMEOUT;
-    while Instant::now() < deadline {
+/// The second half of [`graceful_kill`]: wait for a child that already got
+/// SIGTERM until `deadline`, then SIGKILL it.
+pub fn wait_or_kill(mut child: Child, deadline: Instant) -> GracefulKill {
+    // Polls once even past the deadline: a caller that waited for other
+    // children first may reach this one after it already exited in time.
+    loop {
         match child.try_wait() {
-            Ok(Some(_)) => return child,
-            Ok(None) => thread::sleep(SIGKILL_POLL_INTERVAL),
-            Err(_) => return child,
+            Ok(None) if Instant::now() < deadline => thread::sleep(SIGKILL_POLL_INTERVAL),
+            Ok(None) => break,
+            Ok(Some(_)) => {
+                return GracefulKill {
+                    child,
+                    killed_after_timeout: false,
+                    wait_error: None,
+                };
+            }
+            Err(error) => {
+                return GracefulKill {
+                    child,
+                    killed_after_timeout: false,
+                    wait_error: Some(error.kind()),
+                };
+            }
         }
     }
 
     unsafe {
-        libc::kill(pid, libc::SIGKILL);
+        libc::kill(child.id() as libc::pid_t, libc::SIGKILL);
     }
 
-    child
+    GracefulKill {
+        child,
+        killed_after_timeout: true,
+        wait_error: None,
+    }
 }

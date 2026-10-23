@@ -20,11 +20,14 @@ package iggcon
 import "encoding/binary"
 
 type UserInfo struct {
-	Id        uint32                 `json:"Id"`
-	CreatedAt uint64                 `json:"CreatedAt"`
-	Status    UserStatus             `json:"Status"`
-	Username  string                 `json:"Username"`
-	Options   map[string]HeaderValue `json:"Options,omitempty"`
+	Id        uint32     `json:"Id"`
+	CreatedAt uint64     `json:"CreatedAt"`
+	Status    UserStatus `json:"Status"`
+	Username  string     `json:"Username"`
+	// Options are the keys the client set.
+	Options map[string]HeaderValue `json:"Options,omitempty"`
+	// DerivedOptions are the values the server filled.
+	DerivedOptions map[string]HeaderValue `json:"DerivedOptions,omitempty"`
 }
 
 type UserInfoDetails struct {

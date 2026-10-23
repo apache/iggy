@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+import { optionText } from '#lib/api/resourceOptions.js';
+
 export type Stream = {
   id: number;
   name: string;
@@ -23,9 +25,13 @@ export type Stream = {
   messagesCount: number;
   topicsCount: number;
   createdAt: number;
+  encryptionKeySource: string | undefined;
+  encryptionKeyFingerprint: string | undefined;
+  encryptionKekFingerprints: string[];
 };
 
 export function streamMapper(item: any): Stream {
+  const kekFingerprints = optionText(item.options, 'encryption_kek_fingerprint');
   return {
     id: item.id,
     name: item.name,
@@ -33,7 +39,10 @@ export function streamMapper(item: any): Stream {
     sizeFormatted: item.size,
     messagesCount: item.messages_count,
     topicsCount: item.topics_count,
-    createdAt: item.created_at
+    createdAt: item.created_at,
+    encryptionKeySource: optionText(item.options, 'encryption_key_source'),
+    encryptionKeyFingerprint: optionText(item.options, 'encryption_key_fingerprint'),
+    encryptionKekFingerprints: kekFingerprints ? kekFingerprints.split(',') : []
   };
 }
 

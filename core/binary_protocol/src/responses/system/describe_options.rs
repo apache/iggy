@@ -24,33 +24,36 @@ use bytes::{BufMut, Bytes, BytesMut};
 ///
 /// Wire format:
 /// ```text
-/// [key_len:u8][key:N][kind:u8]
+/// [key_len:u8][key:N][kind:u8][flags:u8]
 /// [default_len:u32][default bytes][description_len:u32][description]
 /// ```
 ///
 /// `kind` is this key's canonical header kind code: what the server encodes its
-/// default under, and what a value set at create is stored as, since create
-/// admission re-encodes the block from its own parse (a `String` value parsed by
-/// the same rules as a config file value is accepted and canonicalized). An
-/// update stores the client's bytes verbatim and is the exception. `default` is
-/// that default in `kind`'s encoding, empty when the key has none, and is a
-/// build constant rather than a per-node value.
+/// default under, and what a value set at create or update is stored as, since
+/// admission re-encodes every block from its own parse (a `String` value parsed
+/// by the same rules as a config file value is accepted and canonicalized).
+/// `flags` bits: 0 updatable, 1 resettable, 2 secret (write-only), 3 read-only
+/// (server-computed), 4 critical. Higher bits are zero and readers ignore them.
+/// `default` is that default in `kind`'s encoding, empty when the key has none,
+/// and is a build constant rather than a per-node value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OptionDescriptor {
     pub key: WireName,
     pub kind: u8,
+    pub flags: u8,
     pub default_value: Bytes,
     pub description: String,
 }
 
 impl WireEncode for OptionDescriptor {
     fn encoded_size(&self) -> usize {
-        self.key.encoded_size() + 1 + 4 + self.default_value.len() + 4 + self.description.len()
+        self.key.encoded_size() + 1 + 1 + 4 + self.default_value.len() + 4 + self.description.len()
     }
 
     fn encode(&self, buf: &mut BytesMut) {
         self.key.encode(buf);
         buf.put_u8(self.kind);
+        buf.put_u8(self.flags);
         #[allow(clippy::cast_possible_truncation)]
         buf.put_u32_le(self.default_value.len() as u32);
         buf.put_slice(&self.default_value);
@@ -64,6 +67,8 @@ impl WireDecode for OptionDescriptor {
     fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
         let (key, mut pos) = WireName::decode(buf)?;
         let kind = read_u8(buf, pos)?;
+        pos += 1;
+        let flags = read_u8(buf, pos)?;
         pos += 1;
         let default_len = read_u32_le(buf, pos)? as usize;
         pos += 4;
@@ -108,6 +113,7 @@ impl WireDecode for OptionDescriptor {
             Self {
                 key,
                 kind,
+                flags,
                 default_value,
                 description,
             },
@@ -143,9 +149,9 @@ impl WireEncode for DescribeOptionsResponse {
 }
 
 /// Smallest a descriptor can encode as: a one-character `WireName` (a length
-/// byte plus at least one byte of name), a kind byte, and empty
+/// byte plus at least one byte of name), a kind byte, a flags byte, and empty
 /// length-prefixed default and description.
-const MIN_DESCRIPTOR_SIZE: usize = 2 + 1 + 4 + 4;
+const MIN_DESCRIPTOR_SIZE: usize = 2 + 1 + 1 + 4 + 4;
 
 impl WireDecode for DescribeOptionsResponse {
     fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
@@ -175,12 +181,14 @@ mod tests {
                 OptionDescriptor {
                     key: WireName::new("partitions_count").unwrap(),
                     kind: 11,
+                    flags: 0,
                     default_value: Bytes::copy_from_slice(&1u32.to_le_bytes()),
                     description: "Number of partitions to create".to_string(),
                 },
                 OptionDescriptor {
                     key: WireName::new("max_topic_size").unwrap(),
                     kind: 12,
+                    flags: 0b11,
                     default_value: Bytes::new(),
                     description: String::new(),
                 },

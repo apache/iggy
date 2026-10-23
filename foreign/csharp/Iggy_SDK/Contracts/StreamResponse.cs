@@ -16,6 +16,7 @@
 // under the License.
 
 using System.Text.Json.Serialization;
+using Apache.Iggy.Enums;
 using Apache.Iggy.Headers;
 using Apache.Iggy.JsonConverters;
 
@@ -64,8 +65,61 @@ public sealed class StreamResponse
     public IEnumerable<TopicResponse> Topics { get; init; } = [];
 
     /// <summary>
-    ///     Options attached to the stream at creation. TCP transport only.
+    ///     Options the client set on the stream. The server never returns the encryption key.
     /// </summary>
     [JsonIgnore]
     public Dictionary<HeaderKey, HeaderValue>? Options { get; init; }
+
+    /// <summary>
+    ///     Options the server filled or computes on reads, such as the encryption key source and fingerprints.
+    /// </summary>
+    [JsonIgnore]
+    public Dictionary<HeaderKey, HeaderValue>? DerivedOptions { get; init; }
+
+    /// <summary>
+    ///     Who chose the key that encrypts the stream at rest, or null when the server reported no source.
+    /// </summary>
+    [JsonIgnore]
+    public StreamEncryptionSource? EncryptionKeySource =>
+        OptionValues.Text(Options, DerivedOptions, StreamOptionKey.EncryptionKeySource) switch
+        {
+            "none" => StreamEncryptionSource.None,
+            "stream" => StreamEncryptionSource.Stream,
+            "server" => StreamEncryptionSource.Server,
+            _ => null
+        };
+
+    /// <summary>
+    ///     Fingerprint of the stream's key, the value <see cref="Encryption.EncryptionKeys.Fingerprint(ReadOnlySpan{byte})" />
+    ///     computes from it. Null for a plaintext stream.
+    /// </summary>
+    [JsonIgnore]
+    public string? EncryptionKeyFingerprint =>
+        OptionValues.Text(Options, DerivedOptions, StreamOptionKey.EncryptionKeyFingerprint);
+
+    /// <summary>
+    ///     Fingerprints of the server keys that wrap the stream's key: one outside a key rotation, empty for a
+    ///     plaintext stream.
+    /// </summary>
+    [JsonIgnore]
+    public IReadOnlyList<string> EncryptionKekFingerprints =>
+        OptionValues.Text(Options, DerivedOptions, StreamOptionKey.EncryptionKekFingerprint) is { Length: > 0 } joined
+            ? joined.Split(',')
+            : [];
+
+    /// <summary>
+    ///     REST renders both provenances into one object keyed by option name, so one JSON property
+    ///     fills <see cref="Options" /> and <see cref="DerivedOptions" />.
+    /// </summary>
+    [JsonInclude]
+    [JsonPropertyName("options")]
+    [JsonConverter(typeof(ResourceOptionsConverter))]
+    internal ResourceOptions RestOptions
+    {
+        init
+        {
+            Options = value.Explicit;
+            DerivedOptions = value.Derived;
+        }
+    }
 }

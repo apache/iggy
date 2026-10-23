@@ -209,7 +209,7 @@ class TestCreateUserWithPermissions:
         stream = await iggy_client.get_stream(stream_name)
         assert stream is not None
         topic_name = unique_name(prefix="perm-topic-")
-        await iggy_client.create_topic(stream_name, topic_name, partitions_count=1)
+        await iggy_client.create_topic(stream_name, topic_name)
         topic = await iggy_client.get_topic(stream_name, topic_name)
         assert topic is not None
 

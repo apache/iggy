@@ -34,6 +34,7 @@ namespace Apache.Iggy.Tests.Integrations.Fixtures;
 internal sealed class VsrCluster : IAsyncDisposable
 {
     private const string ClusterName = "test-vsr-cluster";
+    private const string HttpJwtSecret = "test-vsr-cluster-http-jwt-secret!";
 
     // TCP and HTTP get real host ports on every node: a view change can make any replica the
     // primary clients are redirected to, so every advertised 127.0.0.1:port must be dialable from
@@ -297,6 +298,14 @@ internal sealed class VsrCluster : IAsyncDisposable
 
         environment["IGGY_CLUSTER_NAME"] = ClusterName;
         environment["IGGY_MESSAGE_BUS_RECONNECT_PERIOD"] = "100ms";
+        // The metadata primary seeds a new partition group seconds after its backups when the whole suite runs
+        // at once, and at the default 5s the backups read that as a dead primary and elect a new one.
+        environment["IGGY_CLUSTER_HEARTBEAT_TIMEOUT"] = "15s";
+        // A partition primary can move off the node HTTP clients talk to. Without a JWT secret every node
+        // verifies, that node cannot forward to the new primary and refuses the partition until the budget
+        // runs out.
+        environment["IGGY_HTTP_JWT_ENCODING_SECRET"] = HttpJwtSecret;
+        environment["IGGY_HTTP_JWT_DECODING_SECRET"] = HttpJwtSecret;
 
         for (var node = 0; node < _nodeCount; node++)
         {

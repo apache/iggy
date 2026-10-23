@@ -24,9 +24,11 @@ import io.netty.channel.IoEventLoopGroup;
 import io.netty.channel.nio.NioIoHandle;
 import io.netty.util.concurrent.EventExecutor;
 import org.apache.commons.lang3.StringUtils;
+import org.apache.iggy.client.async.tcp.vsr.ConsensusSession;
 import org.apache.iggy.client.async.tcp.vsr.VsrFrameDecoder;
 import org.apache.iggy.client.async.tcp.vsr.VsrHeaders;
 import org.apache.iggy.config.RetryPolicy;
+import org.apache.iggy.config.TcpConnectionString;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.exception.IggyMissingCredentialsException;
 
@@ -88,6 +90,8 @@ public final class AsyncIggyTcpClientBuilder {
     private RetryPolicy retryPolicy;
     private Duration acquireTimeout;
     private Duration heartbeatInterval = Duration.ofSeconds(5);
+    private int maxPendingOperations = ConsensusSession.DEFAULT_MAX_PENDING_OPERATIONS;
+    private long maxPendingOperationBytes = ConsensusSession.DEFAULT_MAX_PENDING_OPERATION_BYTES;
     private long maxVsrFrameSize = VsrFrameDecoder.DEFAULT_MAX_FRAME_SIZE;
     private int ioThreads = AsyncTcpConnection.DEFAULT_IO_THREADS;
     private IoEventLoopGroup eventLoopGroup;
@@ -174,6 +178,37 @@ public final class AsyncIggyTcpClientBuilder {
     }
 
     /**
+     * Sets the host, port, credentials and TLS options from a connection string.
+     *
+     * <p>The format is {@code iggy://<username>:<password>@<host>:<port>?<options>}, with
+     * {@code tls=true|false} and {@code tls_ca_file=<path>} as the supported options.
+     * Settings that are not in the connection string keep their current values, so a string
+     * without {@code tls} leaves an earlier {@link #enableTls()} in place.
+     *
+     * @param connectionString the connection string, for example {@code iggy://iggy:iggy@localhost:8090?tls=true}
+     * @return this builder
+     * @throws IggyInvalidArgumentException if the connection string is invalid
+     * @see TcpConnectionString
+     */
+    public AsyncIggyTcpClientBuilder fromConnectionString(String connectionString) {
+        TcpConnectionString parsed = TcpConnectionString.parse(connectionString);
+        host(parsed.host());
+        port(parsed.port());
+        credentials(parsed.username(), parsed.password());
+        parsed.tls().ifPresent(this::tls);
+        parsed.tlsCaFile().ifPresent(this::tlsCertificate);
+        return this;
+    }
+
+    boolean isTlsEnabled() {
+        return enableTls;
+    }
+
+    File tlsCertificateFile() {
+        return tlsCertificate;
+    }
+
+    /**
      * Sets channel acquire timeout
      *
      * @param acquireTimeout the acquire timeout duration
@@ -187,6 +222,10 @@ public final class AsyncIggyTcpClientBuilder {
     /**
      * Sets how often the client sends a heartbeat while connected. The value
      * should not exceed the server's configured heartbeat interval.
+     *
+     * <p>The heartbeat also paces recovery: one that fails starts a new redial
+     * burst, and one that finds the session lost after a burst ran out signs in
+     * again, each with a fresh retry budget. See {@link RetryPolicy}.
      *
      * @param heartbeatInterval the heartbeat interval
      * @return this builder
@@ -230,7 +269,10 @@ public final class AsyncIggyTcpClientBuilder {
     }
 
     /**
-     * Sets the retry policy.
+     * Sets the retry policy for the redials after a connection loss. It bounds
+     * one burst, and a heartbeat starts the next one with a fresh budget, see
+     * {@link RetryPolicy}. Without a policy, a burst runs up to 12 rounds over
+     * the known endpoints, 5 seconds apart.
      *
      * @param retryPolicy the retry policy
      * @return this builder
@@ -277,6 +319,30 @@ public final class AsyncIggyTcpClientBuilder {
     }
 
     /**
+     * Bounds active and retained mutations; defaults are {@value ConsensusSession#DEFAULT_MAX_PENDING_OPERATIONS}
+     * operations and {@value ConsensusSession#DEFAULT_MAX_PENDING_OPERATION_BYTES} bytes (64 MiB). The count also
+     * bounds the proved replay outcomes that the client keeps for later resolves.
+     */
+    public AsyncIggyTcpClientBuilder pendingOperations(int count, long bytes) {
+        if (count <= 0 || bytes <= 0) {
+            throw new IggyInvalidArgumentException("Pending operation limits must be positive");
+        }
+        maxPendingOperations = count;
+        maxPendingOperationBytes = bytes;
+        return this;
+    }
+
+    /** The pending operation count that {@link #build()} applies, for tests in this package. */
+    int maxPendingOperations() {
+        return maxPendingOperations;
+    }
+
+    /** The pending operation bytes that {@link #build()} applies, for tests in this package. */
+    long maxPendingOperationBytes() {
+        return maxPendingOperationBytes;
+    }
+
+    /**
      * Builds and returns a configured AsyncIggyTcpClient instance.
      * Note: You still need to call {@link AsyncIggyTcpClient#connect()} on the returned client.
      *
@@ -294,7 +360,7 @@ public final class AsyncIggyTcpClientBuilder {
         validateIoThreads();
         validateEventLoopGroup();
 
-        return new AsyncIggyTcpClient(
+        AsyncIggyTcpClient client = new AsyncIggyTcpClient(
                 host,
                 port,
                 username,
@@ -309,6 +375,8 @@ public final class AsyncIggyTcpClientBuilder {
                 Optional.ofNullable(tlsCertificate),
                 Optional.ofNullable(eventLoopGroup),
                 ioThreads);
+        client.configurePendingOperations(maxPendingOperations, maxPendingOperationBytes);
+        return client;
     }
 
     private void validateHost() {

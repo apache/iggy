@@ -23,7 +23,7 @@ use super::{
     http::{HttpConfig, HttpCorsConfig, HttpJwtConfig, HttpMetricsConfig, HttpTlsConfig},
     system::{EncryptionConfig, LoggingConfig},
 };
-use std::fmt::{Display, Formatter};
+use std::fmt::{Debug, Display, Formatter};
 
 impl Display for HttpConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -108,8 +108,8 @@ impl Display for ConsumerGroupConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ rebalancing_timeout: {}, session_timeout: {}, heartbeat_interval: {} }}",
-            self.rebalancing_timeout, self.session_timeout, self.heartbeat_interval
+            "{{ rebalancing_timeout: {}, heartbeat_interval: {} }}",
+            self.rebalancing_timeout, self.heartbeat_interval
         )
     }
 }
@@ -126,7 +126,24 @@ impl Display for HeartbeatConfig {
 
 impl Display for EncryptionConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{{ enabled: {} }}", self.enabled)
+        write!(
+            f,
+            "{{ enabled: {}, previous_keys: {}, retired_kek_fingerprints: {:?} }}",
+            self.enabled,
+            self.previous_keys.len(),
+            self.retired_kek_fingerprints
+        )
+    }
+}
+
+impl Debug for EncryptionConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncryptionConfig")
+            .field("enabled", &self.enabled)
+            .field("key_set", &!self.key.is_empty())
+            .field("previous_keys", &self.previous_keys.len())
+            .field("retired_kek_fingerprints", &self.retired_kek_fingerprints)
+            .finish()
     }
 }
 

@@ -24,10 +24,10 @@ use tracing::{Level, event};
 
 /// `iggy options <scope>`: print the server's option catalog.
 ///
-/// This is the discovery surface for `--set`. A key outside the catalog is
-/// refused at create, and the binary transports carry only the error code back,
-/// so without this command a CLI user has no way to see which keys their server
-/// knows or what each one is bounded by.
+/// This is the discovery surface for `--set` and `--reset`. A key outside the
+/// catalog is refused, and the binary transports carry only the error code
+/// back, so without this command a CLI user has no way to see which keys their
+/// server knows or what a client may do with each one.
 pub struct DescribeOptionsCmd {
     scope: OptionsScope,
 }
@@ -52,17 +52,18 @@ impl CliCommand for DescribeOptionsCmd {
 
         if specs.is_empty() {
             event!(target: PRINT_TARGET, Level::INFO,
-                "{} resources accept no options yet", self.scope);
+                "{} resources accept no options", self.scope);
             return Ok(());
         }
 
         let mut table = Table::new();
-        table.set_header(vec!["Key", "Kind", "Default", "Description"]);
+        table.set_header(vec!["Key", "Kind", "Default", "Mutability", "Description"]);
         for spec in &specs {
             table.add_row(vec![
                 spec.key.as_str(),
                 spec.kind.to_string().as_str(),
                 render_default(spec).as_str(),
+                render_mutability(spec).as_str(),
                 spec.description.as_str(),
             ]);
         }
@@ -70,6 +71,26 @@ impl CliCommand for DescribeOptionsCmd {
 
         Ok(())
     }
+}
+
+/// What a client may do with the key after the resource exists.
+fn render_mutability(spec: &OptionSpec) -> String {
+    let mutability = if spec.read_only {
+        "read only"
+    } else if spec.updatable && spec.resettable {
+        "updatable, resettable"
+    } else if spec.updatable {
+        "updatable"
+    } else {
+        "create only"
+    };
+    let flags = [(spec.secret, "secret"), (spec.critical, "critical")];
+    flags
+        .into_iter()
+        .filter(|(set, _)| *set)
+        .fold(mutability.to_owned(), |text, (_, flag)| {
+            format!("{text}, {flag}")
+        })
 }
 
 /// The catalog's default in the string form `--set` takes, so the printed value
@@ -82,5 +103,28 @@ fn render_default(spec: &OptionSpec) -> String {
         Ok(value) => value.to_string_value(),
         // A kind this build cannot name still has a readable byte count.
         Err(_) => format!("<{} bytes>", spec.default_value.len()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iggy_common::HeaderKind;
+
+    #[test]
+    fn given_critical_spec_when_rendering_mutability_should_print_critical() {
+        let spec = OptionSpec {
+            key: "critical_keys".to_owned(),
+            kind: HeaderKind::String,
+            updatable: false,
+            resettable: false,
+            secret: false,
+            read_only: true,
+            critical: true,
+            default_value: Vec::new(),
+            description: String::new(),
+        };
+
+        assert_eq!(render_mutability(&spec), "read only, critical");
     }
 }
