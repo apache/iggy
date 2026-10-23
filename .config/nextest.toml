@@ -102,13 +102,10 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 slow-timeout = { period = "60s" }
 
 [[profile.default-miri.overrides]]
-# Start the longest interpreted tests early so other work overlaps them.
+# Start the options boundary test early so other work overlaps it.
 filter = '''
-    package(=iggy_binary_protocol) & (
-        test(=primitives::options::tests::entry_count_over_limit_is_rejected)
-        | test(~requests::messages::poll_messages::tests::progress_peek_encodings::)
-        | test(~requests::messages::poll_messages::tests::progress_peek_mutations::)
-    )
+    package(=iggy_binary_protocol)
+    & test(=primitives::options::tests::entry_count_over_limit_is_rejected)
 '''
 priority = 100
 
