@@ -26,8 +26,8 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - name: Setup Java with cache
-      uses: ./.github/actions/utils/setup-java-with-cache
+    - name: Setup Java
+      uses: ./.github/actions/utils/setup-java
       with:
         gradle-cache-disabled: "true"
 
@@ -76,16 +76,18 @@ runs:
         # Exit with build exit code
         exit $BUILD_EXIT_CODE
 
-    - name: Setup Rust with cache
+    - name: Download runtime binaries
       if: inputs.task == 'test'
-      uses: ./.github/actions/utils/setup-rust-with-cache
+      uses: ./.github/actions/utils/download-runtime
 
     - name: Start Iggy server
       if: inputs.task == 'test'
       id: iggy
       uses: ./.github/actions/utils/server-start
       with:
-        cargo-bin: iggy-server
+        bin: target/debug/iggy-server
+        encryption-enabled: "true"
+        encryption-key: "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE="
         wait-timeout-seconds: "90"
       env:
         IGGY_PATH: ${{ runner.temp }}/iggy-java-data
@@ -156,12 +158,14 @@ runs:
         pid-file: ${{ steps.iggy.outputs.pid_file }}
         log-file: ${{ steps.iggy.outputs.log_file }}
 
+    # No encryption key, the shipped default, so this lane also covers a server
+    # that keeps streams plaintext and refuses client stream keys.
     - name: Start Iggy server (TLS)
       id: iggy-tls
       if: inputs.task == 'test'
       uses: ./.github/actions/utils/server-start
       with:
-        cargo-bin: iggy-server
+        bin: target/debug/iggy-server
         wait-timeout-seconds: "90"
         pid-file: ${{ runner.temp }}/iggy-server-tls.pid
         log-file: ${{ runner.temp }}/iggy-server-tls.log

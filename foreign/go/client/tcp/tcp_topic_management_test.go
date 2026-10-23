@@ -37,8 +37,9 @@ func TestCreateTopic_DecodesTheCreatedTopic(t *testing.T) {
 			append(resultSection(), topicDetailsBody(t, 3)...))
 	})
 
+	partitions := uint32(3)
 	topic, err := client.CreateTopic(context.Background(),
-		numericIdentifier(t, 1), "orders", 3, 0, iggcon.Duration(0), 0)
+		numericIdentifier(t, 1), "orders", &iggcon.TopicOptions{PartitionsCount: &partitions})
 	require.NoError(t, err)
 	assert.Equal(t, uint32(3), topic.PartitionsCount)
 	assert.Equal(t, "orders", topic.Name)
@@ -67,7 +68,7 @@ func TestCreateTopic_RejectsInvalidArgumentsWithoutWriting(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			_, err := client.CreateTopic(context.Background(), streamId,
-				test.topicName, test.partitions, 0, iggcon.Duration(0), 0)
+				test.topicName, &iggcon.TopicOptions{PartitionsCount: &test.partitions})
 			assert.ErrorIs(t, err, test.want)
 		})
 	}
@@ -77,27 +78,46 @@ func TestCreateTopic_RejectsInvalidArgumentsWithoutWriting(t *testing.T) {
 func TestUpdateTopic_RejectsInvalidArgumentsWithoutWriting(t *testing.T) {
 	client, serverConn := newPipeClient(t)
 	server := serve(serverConn, func(_ int, _ request) []byte {
-		return replyFrame(vsr.OperationUpdateTopic, resultSection())
+		return replyFrame(vsr.OperationUpdateTopicResolved, resultSection())
 	})
 
 	streamId := numericIdentifier(t, 1)
 	topicId := numericIdentifier(t, 2)
 
-	err := client.UpdateTopic(context.Background(), streamId, topicId,
-		"", 0, iggcon.Duration(0), 0)
-	assert.ErrorIs(t, err, ierror.ErrInvalidTopicName)
+	empty := ""
+	serverDefault := iggcon.IggyExpiryServerDefault
+	tests := []struct {
+		name   string
+		update iggcon.TopicUpdate
+		want   error
+	}{
+		{name: "empty name", update: iggcon.TopicUpdate{Name: &empty}, want: ierror.ErrInvalidTopicName},
+		{name: "nothing to change", update: iggcon.TopicUpdate{}, want: ierror.ErrInvalidCommand},
+		{name: "sentinel only", update: iggcon.TopicUpdate{MessageExpiry: &serverDefault}, want: ierror.ErrInvalidCommand},
+		{name: "create-only reset", update: iggcon.TopicUpdate{Reset: []iggcon.TopicOptionKey{iggcon.TopicOptionSegmentSize}}, want: ierror.ErrOptionNotUpdatable},
+		{name: "unknown reset", update: iggcon.TopicUpdate{Reset: []iggcon.TopicOptionKey{"not_a_key"}}, want: ierror.ErrUnsupportedOptionKey},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := client.UpdateTopic(context.Background(), streamId, topicId, test.update)
+			assert.ErrorIs(t, err, test.want)
+		})
+	}
 	assert.Empty(t, server.recorded())
 }
 
 func TestUpdateTopic_AcceptsACommittedUpdate(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	serve(serverConn, func(_ int, _ request) []byte {
-		return replyFrame(vsr.OperationUpdateTopic, resultSection())
+	serve(serverConn, func(_ int, read request) []byte {
+		reply := committedReply(read, 0)
+		reply[replyFrameOffsetOperation] = byte(vsr.OperationUpdateTopicResolved)
+		return reply
 	})
 
+	name := "renamed"
 	assert.NoError(t, client.UpdateTopic(context.Background(),
 		numericIdentifier(t, 1), numericIdentifier(t, 2),
-		"renamed", 0, iggcon.Duration(0), 0))
+		iggcon.TopicUpdate{Name: &name, Reset: []iggcon.TopicOptionKey{iggcon.TopicOptionMaxTopicSize}}))
 }
 
 func TestGetTopics_DecodesTheRoster(t *testing.T) {

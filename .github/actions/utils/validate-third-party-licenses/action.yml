@@ -37,9 +37,10 @@ runs:
       uses: actions/setup-node@v6
       with:
         node-version: ${{ inputs.node-version }}
+        package-manager-cache: false
 
-    - name: Setup Rust with cache
-      uses: ./.github/actions/utils/setup-rust-with-cache
+    - name: Setup Rust
+      uses: ./.github/actions/utils/setup-rust
       with:
         read-cache: "false"
 
@@ -73,6 +74,10 @@ runs:
     - name: Validate iggy-connect bundle
       shell: bash
       run: ./scripts/ci/third-party-licenses.sh --validate --manifest core/connectors/runtime/Cargo.toml
+
+    - name: Validate iggy-kafka-gateway bundle
+      shell: bash
+      run: ./scripts/ci/third-party-licenses.sh --validate --manifest gateways/kafka/Cargo.toml
 
     - name: Validate Python wheel bundle
       shell: bash

@@ -27,11 +27,12 @@ import (
 
 func TestSerialize_CreateTopic_ServerDefaults(t *testing.T) {
 	streamId, _ := iggcon.NewIdentifier("stream")
+	partitions := uint32(2)
+	compression := iggcon.CompressionAlgorithmNone
 	request := CreateTopic{
-		StreamId:             streamId,
-		Name:                 "topic",
-		PartitionsCount:      2,
-		CompressionAlgorithm: iggcon.CompressionAlgorithmNone,
+		StreamId: streamId,
+		Name:     "topic",
+		Options:  iggcon.TopicOptions{PartitionsCount: &partitions, CompressionAlgorithm: &compression},
 	}
 
 	serialized, err := request.MarshalBinary()
@@ -46,9 +47,10 @@ func TestSerialize_CreateTopic_ServerDefaults(t *testing.T) {
 		0x02, 0x00, 0x00, 0x00, // PartitionsCount (2)
 		0x05,                         // Name Length (5)
 		0x74, 0x6F, 0x70, 0x69, 0x63, // Name ("topic")
-		2, 10, 0, 0, 0, 'd', 'u', 'r', 'a', 'b', 'i', 'l', 'i', 't', 'y',
-		2, 10, 0, 0, 0, 'r', 'e', 'p', 'l', 'i', 'c', 'a', 't', 'e', 'd',
+		// Options travel in ascending key order.
 		2, 26, 0, 0, 0, 'c', 'o', 'n', 's', 'u', 'm', 'e', 'r', '_', 'o', 'f', 'f', 's', 'e', 't', '_', 'd', 'u', 'r', 'a', 'b', 'i', 'l', 'i', 't', 'y',
+		2, 10, 0, 0, 0, 'r', 'e', 'p', 'l', 'i', 'c', 'a', 't', 'e', 'd',
+		2, 10, 0, 0, 0, 'd', 'u', 'r', 'a', 'b', 'i', 'l', 'i', 't', 'y',
 		2, 10, 0, 0, 0, 'r', 'e', 'p', 'l', 'i', 'c', 'a', 't', 'e', 'd',
 	}
 
@@ -59,13 +61,19 @@ func TestSerialize_CreateTopic_ServerDefaults(t *testing.T) {
 
 func TestSerialize_CreateTopic_NonDefaultsBecomeOptions(t *testing.T) {
 	streamId, _ := iggcon.NewIdentifier(uint32(1))
+	partitions := uint32(4)
+	compression := iggcon.CompressionAlgorithmGzip
+	expiry := 100 * iggcon.Microsecond
+	maxTopicSize := uint64(1 << 30)
 	request := CreateTopic{
-		StreamId:             streamId,
-		Name:                 "topic",
-		PartitionsCount:      4,
-		CompressionAlgorithm: iggcon.CompressionAlgorithmGzip,
-		MessageExpiry:        100 * iggcon.Microsecond,
-		MaxTopicSize:         1 << 30,
+		StreamId: streamId,
+		Name:     "topic",
+		Options: iggcon.TopicOptions{
+			PartitionsCount:      &partitions,
+			CompressionAlgorithm: &compression,
+			MessageExpiry:        &expiry,
+			MaxTopicSize:         &maxTopicSize,
+		},
 	}
 
 	serialized, err := request.MarshalBinary()
@@ -99,15 +107,15 @@ func TestSerialize_CreateTopic_NonDefaultsBecomeOptions(t *testing.T) {
 	if _, found := byKey["partitions_count"]; found {
 		t.Error("partitions_count rides the fixed field, not the options block")
 	}
-	compression := byKey[topicOptionCompressionAlgorithm]
-	if compression.Kind != iggcon.String || string(compression.Value) != "gzip" {
-		t.Errorf("compression_algorithm = %+v, want String %q", compression, "gzip")
+	compressionValue := byKey[string(iggcon.TopicOptionCompressionAlgorithm)]
+	if compressionValue.Kind != iggcon.String || string(compressionValue.Value) != "gzip" {
+		t.Errorf("compression_algorithm = %+v, want String %q", compressionValue, "gzip")
 	}
-	expiry := byKey[topicOptionMessageExpiry]
-	if expiry.Kind != iggcon.Uint64 || binary.LittleEndian.Uint64(expiry.Value) != 100 {
-		t.Errorf("message_expiry = %+v, want Uint64 100", expiry)
+	expiryValue := byKey[string(iggcon.TopicOptionMessageExpiry)]
+	if expiryValue.Kind != iggcon.Uint64 || binary.LittleEndian.Uint64(expiryValue.Value) != 100 {
+		t.Errorf("message_expiry = %+v, want Uint64 100", expiryValue)
 	}
-	maxSize := byKey[topicOptionMaxTopicSize]
+	maxSize := byKey[string(iggcon.TopicOptionMaxTopicSize)]
 	if maxSize.Kind != iggcon.Uint64 || binary.LittleEndian.Uint64(maxSize.Value) != 1<<30 {
 		t.Errorf("max_topic_size = %+v, want Uint64 %d", maxSize, 1<<30)
 	}
@@ -116,12 +124,15 @@ func TestSerialize_CreateTopic_NonDefaultsBecomeOptions(t *testing.T) {
 func TestSerialize_UpdateTopic(t *testing.T) {
 	streamId, _ := iggcon.NewIdentifier("stream")
 	topicId, _ := iggcon.NewIdentifier(uint32(1))
+	name := "update_topic"
+	expiry := 100 * iggcon.Microsecond
+	maxTopicSize := uint64(100)
 	request := UpdateTopic{
 		StreamId:      streamId,
 		TopicId:       topicId,
-		Name:          "update_topic",
-		MessageExpiry: 100 * iggcon.Microsecond,
-		MaxTopicSize:  100,
+		Name:          &name,
+		MessageExpiry: &expiry,
+		MaxTopicSize:  &maxTopicSize,
 	}
 
 	serialized1, err := request.MarshalBinary()
@@ -130,23 +141,27 @@ func TestSerialize_UpdateTopic(t *testing.T) {
 	}
 
 	expected := []byte{
+		0x01,                               // Scope (topic)
 		0x02,                               // StreamId Kind (StringId)
-		0x06,                               // StreamId Length (2)
+		0x06,                               // StreamId Length (6)
 		0x73, 0x74, 0x72, 0x65, 0x61, 0x6D, // StreamId Value ("stream")
 		0x01,                   // TopicId Kind (NumericId)
 		0x04,                   // TopicId Length (4)
 		0x01, 0x00, 0x00, 0x00, // TopicId Value (1)
-		0x0C,                                                                   // Name Length (12)
-		0x75, 0x70, 0x64, 0x61, 0x74, 0x65, 0x5F, 0x74, 0x6F, 0x70, 0x69, 0x63, // Name ("update_topic")
-		// Settings ride the options block; compression is None so it is omitted.
-		0x02, 0x0E, 0x00, 0x00, 0x00, // key kind (String), key length (14)
-		0x6D, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x5F, 0x65, 0x78, 0x70, 0x69, 0x72, 0x79, // "message_expiry"
-		0x0C, 0x08, 0x00, 0x00, 0x00, // value kind (Uint64), value length (8)
-		0x64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 100
+		0x00, // Reset count
+		// The name and the settings ride the options block in ascending key order.
 		0x02, 0x0E, 0x00, 0x00, 0x00, // key kind (String), key length (14)
 		0x6D, 0x61, 0x78, 0x5F, 0x74, 0x6F, 0x70, 0x69, 0x63, 0x5F, 0x73, 0x69, 0x7A, 0x65, // "max_topic_size"
 		0x0C, 0x08, 0x00, 0x00, 0x00, // value kind (Uint64), value length (8)
 		0x64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 100
+		0x02, 0x0E, 0x00, 0x00, 0x00, // key kind (String), key length (14)
+		0x6D, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x5F, 0x65, 0x78, 0x70, 0x69, 0x72, 0x79, // "message_expiry"
+		0x0C, 0x08, 0x00, 0x00, 0x00, // value kind (Uint64), value length (8)
+		0x64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 100
+		0x02, 0x04, 0x00, 0x00, 0x00, // key kind (String), key length (4)
+		0x6E, 0x61, 0x6D, 0x65, // "name"
+		0x02, 0x0C, 0x00, 0x00, 0x00, // value kind (String), value length (12)
+		0x75, 0x70, 0x64, 0x61, 0x74, 0x65, 0x5F, 0x74, 0x6F, 0x70, 0x69, 0x63, // "update_topic"
 	}
 
 	if !bytes.Equal(serialized1, expected) {
@@ -159,12 +174,11 @@ func TestCreateTopic_CallerOptionsRideTheBlockAndTypedFieldsWin(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	maxTopicSize := uint64(4096)
 	command := CreateTopic{
-		StreamId:        streamId,
-		Name:            "t",
-		PartitionsCount: 1,
-		MaxTopicSize:    4096,
-		Options: []iggcon.HeaderEntry{
+		StreamId: streamId,
+		Name:     "t",
+		Options: iggcon.TopicOptions{MaxTopicSize: &maxTopicSize, Raw: []iggcon.HeaderEntry{
 			{
 				Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte("durability")},
 				Value: iggcon.HeaderValue{Kind: iggcon.String, Value: []byte("persisted")},
@@ -175,7 +189,7 @@ func TestCreateTopic_CallerOptionsRideTheBlockAndTypedFieldsWin(t *testing.T) {
 				Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte("max_topic_size")},
 				Value: iggcon.HeaderValue{Kind: iggcon.String, Value: []byte("1 GiB")},
 			},
-		},
+		}},
 	}
 
 	options, err := command.options()
@@ -205,16 +219,15 @@ func TestCreateTopic_TypedOptionConstructorsReachTheBlock(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	command := CreateTopic{
-		StreamId:        streamId,
-		Name:            "topic",
-		PartitionsCount: 1,
-		Options: []iggcon.HeaderEntry{
+		StreamId: streamId,
+		Name:     "topic",
+		Options: iggcon.TopicOptions{Raw: []iggcon.HeaderEntry{
 			iggcon.SegmentSizeOption(1 << 20),
 			iggcon.DurabilityOption(iggcon.DurabilityPersisted),
 			iggcon.MessagesRequiredToSaveOption(7),
 			iggcon.SizeOfMessagesRequiredToSaveOption(4096),
 			iggcon.PreallocateSegmentsOption(false),
-		},
+		}},
 	}
 
 	serialized, err := command.MarshalBinary()
@@ -271,13 +284,12 @@ func TestCreateTopic_NonStringOptionKeyIsRejected(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	command := CreateTopic{
-		StreamId:        streamId,
-		Name:            "t",
-		PartitionsCount: 1,
-		Options: []iggcon.HeaderEntry{{
+		StreamId: streamId,
+		Name:     "t",
+		Options: iggcon.TopicOptions{Raw: []iggcon.HeaderEntry{{
 			Key:   iggcon.HeaderKey{Kind: iggcon.Uint32, Value: []byte{1, 0, 0, 0}},
 			Value: iggcon.HeaderValue{Kind: iggcon.String, Value: []byte("x")},
-		}},
+		}}},
 	}
 
 	if _, err := command.MarshalBinary(); err == nil {

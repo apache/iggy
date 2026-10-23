@@ -65,8 +65,28 @@ Content-Type: application/json
 Authorization: Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJqdGkiOiJjMmQ5ZWZmNS03OTQ5LTQ1MTEtYmM2YS1hZGY3MmQwN2VjNDkiLCJpc3MiOiJpZ2d5LnJzIiwiYXVkIjoiaWdneS5ycyIsInN1YiI6MSwiaWF0IjoxNjk5OTg0MzU4LCJleHAiOjE2OTk5ODc5NTgsIm5iZiI6MTY5OTk4NDM1OH0.-C96N0kTHKnjxkUXobGnfkejkvUIHrQa8yEKHD-N5cU
 
 {
-    "stream_id": 29,
     "name":"stream29"
+}
+
+### Create stream with its own encryption key, 32 random bytes as standard base64 (never reuse this sample)
+POST {{url}}/streams
+Content-Type: application/json
+Authorization: Bearer {{access_token}}
+
+{
+  "name": "payments",
+  "options": {
+    "encryption_key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+  }
+}
+
+### Update stream
+PUT {{url}}/streams/29
+Content-Type: application/json
+Authorization: Bearer {{access_token}}
+
+{
+  "name": "stream29-renamed"
 }
 
 ### Create topic
@@ -75,13 +95,31 @@ Content-Type: application/json
 Authorization: Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJqdGkiOiJmODM0NTI5MC05NzBlLTQ3YzAtOTMwOS02YWM5MmZiMWEyYTYiLCJpc3MiOiJpZ2d5LnJzIiwiYXVkIjoiaWdneS5ycyIsInN1YiI6MSwiaWF0IjoxNjk5OTgxMTU4LCJleHAiOjE2OTk5ODQ3NTgsIm5iZiI6MTY5OTk4MTE1OH0.6WxgKsOAZQfeAPciwHOcE1oR3iJXM0VORX-RtsvT2hU
 
 {
-  "topic_id": 16,
   "name": "topic16",
   "partitions_count": 10,
-  "message_expiry": 0,
-  "compression_algorithm": "none",
-  "max_topic_size": "1000000000"
+  "options": {
+    "message_expiry": "7 days",
+    "compression_algorithm": "none",
+    "max_topic_size": "1000000000"
+  }
 }
+
+### Update topic
+# A value sets a key, an absent key or null keeps it, a key in reset returns to its default.
+# compression_algorithm and the other create-only keys are refused here.
+PUT {{url}}/streams/11/topics/16
+Content-Type: application/json
+Authorization: Bearer {{access_token}}
+
+{
+  "name": "topic16-renamed",
+  "message_expiry": "1 day",
+  "reset": ["max_topic_size"]
+}
+
+### Describe the topic option catalog (scope: stream, topic or user)
+GET {{url}}/options/topic
+Authorization: Bearer {{access_token}}
 
 
 ### Create partitions
@@ -121,6 +159,15 @@ Content-Type: application/json
 GET {{url}}/users/37
 Authorization: Bearer {{access_token}}
 Content-Type: application/json
+
+### Update User
+PUT {{url}}/users/37
+Authorization: Bearer {{access_token}}
+Content-Type: application/json
+
+{
+  "status": "inactive"
+}
 
 ### Delete User
 DELETE {{url}}/users/2

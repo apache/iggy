@@ -350,7 +350,7 @@ async fn given_checkpointed_metadata_when_solo_replica_restarts_should_recover_f
     let client = connect(harness).await;
     for index in 0..STREAMS {
         client
-            .create_stream(&stream_name(index))
+            .create_stream(&stream_name(index), &StreamCreateOptions::default())
             .await
             .unwrap_or_else(|e| panic!("create stream {index}: {e}"));
     }

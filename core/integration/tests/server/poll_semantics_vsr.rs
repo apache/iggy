@@ -36,7 +36,7 @@ async fn given_missing_partition_when_polling_should_reject_partition_not_found(
 ) {
     let client = harness.tcp_root_client().await.expect("tcp root client");
     client
-        .create_stream("poll-stream")
+        .create_stream("poll-stream", &StreamCreateOptions::default())
         .await
         .expect("create stream");
     let stream_id = Identifier::from_str_value("poll-stream").expect("stream identifier");
@@ -121,7 +121,7 @@ async fn given_missing_stream_when_polling_should_reject_stream_not_found(harnes
 async fn given_missing_topic_when_polling_should_reject_topic_not_found(harness: &TestHarness) {
     let client = harness.tcp_root_client().await.expect("tcp root client");
     client
-        .create_stream("topicless-stream")
+        .create_stream("topicless-stream", &StreamCreateOptions::default())
         .await
         .expect("create stream");
     let stream_id = Identifier::from_str_value("topicless-stream").expect("stream identifier");
@@ -161,7 +161,7 @@ async fn given_missing_partition_when_getting_consumer_offset_should_reject_part
 ) {
     let client = harness.tcp_root_client().await.expect("tcp root client");
     client
-        .create_stream("offset-stream")
+        .create_stream("offset-stream", &StreamCreateOptions::default())
         .await
         .expect("create stream");
     let stream_id = Identifier::from_str_value("offset-stream").expect("stream identifier");
@@ -238,7 +238,7 @@ async fn given_missing_topic_when_getting_consumer_offset_should_reject_topic_no
 ) {
     let client = harness.tcp_root_client().await.expect("tcp root client");
     client
-        .create_stream("offset-topicless-stream")
+        .create_stream("offset-topicless-stream", &StreamCreateOptions::default())
         .await
         .expect("create stream");
     let stream_id =
@@ -264,7 +264,7 @@ async fn given_missing_topic_when_getting_consumer_offset_should_reject_topic_no
 async fn given_message_at_polled_timestamp_when_polling_should_include_it(harness: &TestHarness) {
     let client = harness.tcp_root_client().await.expect("tcp root client");
     client
-        .create_stream("ts-stream")
+        .create_stream("ts-stream", &StreamCreateOptions::default())
         .await
         .expect("create stream");
     let stream_id = Identifier::from_str_value("ts-stream").expect("stream identifier");

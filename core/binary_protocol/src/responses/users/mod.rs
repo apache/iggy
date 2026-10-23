@@ -24,7 +24,6 @@ pub mod login_register;
 pub mod login_user;
 mod logout_user;
 mod update_permissions;
-mod update_user;
 pub mod user_response;
 
 pub use super::EmptyResponse;
@@ -37,5 +36,4 @@ pub use login_register::LoginRegisterResponse;
 pub use login_user::IdentityResponse;
 pub use logout_user::LogoutUserResponse;
 pub use update_permissions::UpdatePermissionsResponse;
-pub use update_user::UpdateUserResponse;
 pub use user_response::UserResponse;

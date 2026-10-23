@@ -16,12 +16,15 @@
 // under the License.
 
 use iggy::prelude::{
-    UserInfo as RustUserInfo, UserInfoDetails as RustUserInfoDetails, UserStatus as RustUserStatus,
+    IdentityInfo as RustIdentityInfo, UserInfo as RustUserInfo,
+    UserInfoDetails as RustUserInfoDetails, UserStatus as RustUserStatus,
 };
 use pyo3::prelude::*;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_enum, gen_stub_pymethods};
 
+use crate::options::options_by_provenance;
 use crate::permissions::Permissions;
+use crate::user_headers::UserHeaders;
 
 /// The status of a user account.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +52,74 @@ impl From<RustUserStatus> for UserStatus {
             RustUserStatus::Active => UserStatus::Active,
             RustUserStatus::Inactive => UserStatus::Inactive,
         }
+    }
+}
+
+/// HTTP session token returned by login. Binary transports leave this unset.
+#[gen_stub_pyclass]
+#[pyclass]
+pub struct TokenInfo {
+    token: String,
+    expiry: u64,
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl TokenInfo {
+    /// The access token value. Present only after HTTP login.
+    #[getter]
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    /// Unix-seconds expiry of the HTTP access token.
+    #[getter]
+    pub fn expiry(&self) -> u64 {
+        self.expiry
+    }
+
+    fn __repr__(&self) -> String {
+        "TokenInfo(token=..., expiry=...)".to_owned()
+    }
+}
+
+/// Identity returned by username/password login and PAT login.
+#[gen_stub_pyclass]
+#[pyclass]
+pub struct IdentityInfo {
+    inner: RustIdentityInfo,
+}
+
+impl From<RustIdentityInfo> for IdentityInfo {
+    fn from(identity: RustIdentityInfo) -> Self {
+        Self { inner: identity }
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl IdentityInfo {
+    /// The unique identifier (numeric) of the authenticated user.
+    #[getter]
+    pub fn user_id(&self) -> u32 {
+        self.inner.user_id
+    }
+
+    /// HTTP access token, or `None` on TCP/QUIC/WebSocket.
+    #[getter]
+    #[gen_stub(override_return_type(type_repr = "TokenInfo | None"))]
+    pub fn access_token(&self) -> Option<TokenInfo> {
+        self.inner.access_token.as_ref().map(|token| TokenInfo {
+            token: token.token.clone(),
+            expiry: token.expiry,
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "IdentityInfo(user_id={}, access_token=...)",
+            self.inner.user_id
+        )
     }
 }
 
@@ -89,6 +160,23 @@ impl UserInfo {
     #[getter]
     pub fn username(&self) -> String {
         self.inner.username.to_string()
+    }
+
+    /// Options the creating client set explicitly. No user key exists yet,
+    /// so this is empty unless a newer server added one.
+    ///
+    /// The same `dict[HeaderKey, HeaderValue]` that `ReceiveMessage.user_headers`
+    /// returns, since options ride that codec.
+    #[getter]
+    pub fn options<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, UserHeaders>> {
+        options_by_provenance(py, &self.inner.options, true)
+    }
+
+    /// Options the server resolved for the keys the client did not send.
+    /// Same shape as `options`.
+    #[getter]
+    pub fn derived_options<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, UserHeaders>> {
+        options_by_provenance(py, &self.inner.options, false)
     }
 }
 
@@ -136,5 +224,22 @@ impl UserInfoDetails {
     #[gen_stub(override_return_type(type_repr = "Permissions | None"))]
     pub fn permissions(&self) -> Option<Permissions> {
         self.inner.permissions.clone().map(Permissions::from)
+    }
+
+    /// Options the creating client set explicitly. No user key exists yet,
+    /// so this is empty unless a newer server added one.
+    ///
+    /// The same `dict[HeaderKey, HeaderValue]` that `ReceiveMessage.user_headers`
+    /// returns, since options ride that codec.
+    #[getter]
+    pub fn options<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, UserHeaders>> {
+        options_by_provenance(py, &self.inner.options, true)
+    }
+
+    /// Options the server resolved for the keys the client did not send.
+    /// Same shape as `options`.
+    #[getter]
+    pub fn derived_options<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, UserHeaders>> {
+        options_by_provenance(py, &self.inner.options, false)
     }
 }

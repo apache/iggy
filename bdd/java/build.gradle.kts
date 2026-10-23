@@ -29,8 +29,8 @@ repositories {
 
 dependencies {
     testImplementation("org.apache.iggy:iggy")
-    testImplementation("io.cucumber:cucumber-java:8.0.3")
-    testImplementation("io.cucumber:cucumber-junit-platform-engine:8.0.3")
+    testImplementation("io.cucumber:cucumber-java:8.0.4")
+    testImplementation("io.cucumber:cucumber-junit-platform-engine:8.0.4")
     testImplementation("org.junit.jupiter:junit-jupiter:6.1.3")
     testImplementation("org.junit.platform:junit-platform-suite:6.1.3")
 }
@@ -49,6 +49,10 @@ spotless {
 
 tasks.test {
     useJUnitPlatform()
+    System.getenv("CUCUMBER_FILTER_TAGS")?.let { systemProperty("cucumber.filter.tags", it) }
+    testLogging {
+        exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
+    }
 }
 
 tasks.jacocoTestReport {

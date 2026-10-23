@@ -31,9 +31,10 @@
 //! kcat and the Java consumer read them back through Fetch. The group tests run Java consumers in
 //! one group across a gateway restart and a member leaving.
 //!
-//! Prerequisites are Docker and an already-built `iggy-server`. Missing either skips, the way the
-//! wire-fixture suites do, unless `KAFKA_E2E_REQUIRED=1` is set, which turns a skip into a failure
-//! so a broken CI step cannot leave these silently green.
+//! Prerequisites are Docker, an already-built `iggy-server`, and a host JDK (`javac`) for the
+//! `offsetsForTimes` probe. Missing any skips, the way the wire-fixture suites do, unless
+//! `KAFKA_E2E_REQUIRED=1` is set, which turns a skip into a failure so a broken CI step cannot
+//! leave these silently green.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Read};
@@ -44,6 +45,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
+use iggy::prelude::IggyTimestamp;
 use secrecy::SecretString;
 use serde_json::Value;
 use tokio::sync::broadcast;
@@ -51,15 +53,22 @@ use tokio::task::JoinHandle;
 
 use iggy_gateway_kafka::auth::IggyAuthenticator;
 use iggy_gateway_kafka::bridge::{
-    DEFAULT_MAX_MESSAGE_SIZE, IggyBridge, IggyBridgeConfig, ProduceSessionLimits, TopicMapping,
+    DEFAULT_MAX_MESSAGE_SIZE, IggyBridge, IggyBridgeConfig, IggyTls, ProduceSessionLimits,
+    TopicMapping,
 };
-use iggy_gateway_kafka::server::bind_listener;
+use iggy_gateway_kafka::listener::{ListenerConfig, SecurityProtocol};
+use iggy_gateway_kafka::protocol::auto_topic_creation::AutoTopicCreationConfig;
+use iggy_gateway_kafka::server::{BoundListener, bind_listener};
 use iggy_gateway_kafka::{GatewayConfig, KafkaGateway};
 
+#[path = "common/certs.rs"]
+mod certs;
 #[path = "common/server.rs"]
 mod server;
 
-use server::spawn_test_server_with_authenticator;
+use certs::{Issued, TestPki};
+use iggy_gateway_kafka::tls::{ClientAuth, TlsConfig};
+use server::{spawn_gateway as spawn_listeners, spawn_test_server_with_authenticator};
 
 const KCAT_IMAGE: &str = "edenhill/kcat:1.7.1";
 const KAFKA_IMAGE: &str = "apache/kafka:3.9.0";
@@ -287,7 +296,10 @@ fn free_port() -> u16 {
 /// Starts the gateway with SASL on, verifying credentials against `iggy_address`.
 async fn spawn_gateway(iggy_address: &str) -> SocketAddr {
     let config = GatewayConfig {
-        sasl_enabled: true,
+        listeners: vec![ListenerConfig::new(
+            SecurityProtocol::SaslPlaintext,
+            "127.0.0.1:0",
+        )],
         ..GatewayConfig::default()
     };
     let authenticator = Arc::new(IggyAuthenticator::new(iggy_address.to_string()));
@@ -327,6 +339,21 @@ impl BridgedGateway {
 
 /// As [`spawn_bridged_gateway`], creating each `(topic, partitions)` first.
 async fn start_bridged_gateway(server: &TestServer, topics: &[(&str, u32)]) -> BridgedGateway {
+    start_bridged_gateway_with(server, topics, GatewayConfig::default()).await
+}
+
+/// [`start_bridged_gateway`] with `gateway_config` instead of the defaults. Its listeners are
+/// replaced by one plaintext listener on an ephemeral port.
+async fn start_bridged_gateway_with(
+    server: &TestServer,
+    topics: &[(&str, u32)],
+    gateway_config: GatewayConfig,
+) -> BridgedGateway {
+    start_gateway(server, topics, false, gateway_config).await
+}
+
+/// A bridge to `server` as the root user, with the default topic mapping.
+async fn root_bridge(server: &TestServer) -> IggyBridge {
     let config = IggyBridgeConfig {
         address: server.address.clone(),
         username: ROOT_USER.to_string(),
@@ -334,11 +361,23 @@ async fn start_bridged_gateway(server: &TestServer, topics: &[(&str, u32)]) -> B
         topic_mapping: TopicMapping::new("kafka".to_string(), HashMap::new())
             .expect("the default mapping is valid"),
         max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+        tls: IggyTls::default(),
         produce_sessions: ProduceSessionLimits::default(),
     };
-    let bridge = IggyBridge::connect(config)
+    IggyBridge::connect(config)
         .await
-        .expect("the bridge connects to a ready server");
+        .expect("the bridge connects to a ready server")
+}
+
+/// A bridged gateway on `gateway_config`, with SASL on when `sasl` is set, creating each
+/// `(topic, partitions)` first. Its listeners are replaced by one on an ephemeral port.
+async fn start_gateway(
+    server: &TestServer,
+    topics: &[(&str, u32)],
+    sasl: bool,
+    gateway_config: GatewayConfig,
+) -> BridgedGateway {
+    let bridge = root_bridge(server).await;
     for &(topic, partitions) in topics {
         bridge
             .ensure_stream_and_topic(topic, partitions)
@@ -347,14 +386,20 @@ async fn start_bridged_gateway(server: &TestServer, topics: &[(&str, u32)]) -> B
     }
     let listener = bind_listener("127.0.0.1:0").expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local addr");
-    let config = GatewayConfig {
-        bind_addr: addr.to_string(),
-        ..GatewayConfig::default()
+    let protocol = if sasl {
+        SecurityProtocol::SaslPlaintext
+    } else {
+        SecurityProtocol::Plaintext
     };
-    let gateway = KafkaGateway::new(config).with_bridge(Some(Arc::new(bridge)));
+    let listener = BoundListener::new(ListenerConfig::new(protocol, addr.to_string()), listener);
+    let mut gateway = KafkaGateway::new(gateway_config).with_bridge(Some(Arc::new(bridge)));
+    if sasl {
+        gateway =
+            gateway.with_authenticator(Arc::new(IggyAuthenticator::new(server.address.clone())));
+    }
     let (shutdown, receiver) = broadcast::channel(1);
     let task = tokio::spawn(async move {
-        let _ = gateway.run(listener, receiver).await;
+        let _ = gateway.run(vec![listener], receiver).await;
     });
     BridgedGateway {
         addr,
@@ -670,6 +715,16 @@ async fn bridged_stack() -> Option<(TestServer, SocketAddr)> {
     Some((server, gateway))
 }
 
+/// As [`bridged_stack`], with SASL on, so every client has to authenticate before the bridge
+/// serves it.
+async fn sasl_bridged_stack() -> Option<(TestServer, SocketAddr)> {
+    let server = ready_server()?;
+    let gateway = start_gateway(&server, &[(TOPIC, 1)], true, GatewayConfig::default()).await;
+    // Held for the test's lifetime: dropping the sender shuts the gateway down mid-exchange.
+    std::mem::forget(gateway.shutdown);
+    Some((server, gateway.addr))
+}
+
 /// Brings up a server once every prerequisite holds, or reports why it could not.
 fn ready_server() -> Option<TestServer> {
     if host_unsupported() || docker_missing() {
@@ -706,6 +761,31 @@ fn produce_to_partition(
     partition: u32,
     records: &[(&str, &str)],
 ) {
+    kcat_produce(gateway, topic, partition, records, &[]).expect_ran("kcat produce");
+}
+
+/// The kcat properties that authenticate as `username` with SASL/PLAIN.
+fn sasl_plain_args(username: &str, password: &str) -> Vec<String> {
+    [
+        "security.protocol=SASL_PLAINTEXT".to_string(),
+        "sasl.mechanisms=PLAIN".to_string(),
+        format!("sasl.username={username}"),
+        format!("sasl.password={password}"),
+    ]
+    .into_iter()
+    .flat_map(|property| ["-X".to_string(), property])
+    .collect()
+}
+
+/// Writes `records` to `partition` of `topic` with kcat's producer, one header on each record,
+/// with `auth` prepended to kcat's arguments.
+fn kcat_produce(
+    gateway: SocketAddr,
+    topic: &str,
+    partition: u32,
+    records: &[(&str, &str)],
+    auth: &[String],
+) -> ClientRun {
     let dir = tempfile::tempdir().expect("create records dir");
     let path = dir.path().join("records.txt");
     let lines: String = records
@@ -713,29 +793,80 @@ fn produce_to_partition(
         .flat_map(|&(key, value)| [key, ":", value, "\n"])
         .collect();
     std::fs::write(&path, lines).expect("write records");
+    let bootstrap = gateway.to_string();
+    let partition = partition.to_string();
+    let mut args: Vec<&str> = vec!["-b", &bootstrap];
+    args.extend(auth.iter().map(String::as_str));
+    args.extend([
+        "-P",
+        "-t",
+        topic,
+        "-p",
+        &partition,
+        "-K",
+        ":",
+        "-H",
+        "trace=e2e",
+        "-l",
+        "/tmp/records.txt",
+    ]);
     run_client(
         KCAT_IMAGE,
-        &[
-            "-b",
-            &gateway.to_string(),
-            "-P",
-            "-t",
-            topic,
-            "-p",
-            &partition.to_string(),
-            "-K",
-            ":",
-            "-H",
-            "trace=e2e",
-            "-l",
-            "/tmp/records.txt",
-        ],
+        &args,
         &[(
             path.to_str().expect("records path is utf-8"),
             "/tmp/records.txt",
         )],
     )
-    .expect_ran("kcat produce");
+}
+
+/// Reads partition 0 of `TOPIC` from the beginning to the high watermark with kcat's consumer,
+/// with `auth` prepended to kcat's arguments. One `record <offset> <key>=<value> <headers>` line
+/// per record.
+fn kcat_consume(gateway: SocketAddr, auth: &[String]) -> ClientRun {
+    let bootstrap = gateway.to_string();
+    let mut args: Vec<&str> = vec!["-b", &bootstrap];
+    args.extend(auth.iter().map(String::as_str));
+    // `-e` stops at the end of the partition, which kcat takes from the high watermark that Fetch
+    // sends. A wrong watermark stops it early or holds it until the container timeout.
+    args.extend([
+        "-C",
+        "-t",
+        TOPIC,
+        "-p",
+        "0",
+        "-o",
+        "beginning",
+        "-e",
+        "-f",
+        "record %o %k=%s %h\n",
+    ]);
+    run_client(KCAT_IMAGE, &args, &[])
+}
+
+/// Asserts `output` holds exactly `records`, in order from offset 0, and that kcat stopped at the
+/// high watermark after them.
+fn assert_read_in_order(output: &str, records: &[(&str, &str)]) {
+    let read: Vec<&str> = output
+        .lines()
+        .filter(|line| line.starts_with("record "))
+        .collect();
+    let expected: Vec<String> = records
+        .iter()
+        .enumerate()
+        .map(|(offset, (key, value))| format!("record {offset} {key}={value} trace=e2e"))
+        .collect();
+    assert_eq!(
+        read, expected,
+        "librdkafka must read every record in order, with its key and header, got: {output}"
+    );
+    assert!(
+        output.contains(&format!(
+            "Reached end of topic {TOPIC} [0] at offset {}",
+            records.len()
+        )),
+        "kcat must stop at the high watermark, got: {output}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1024,6 +1155,98 @@ fn kafka_topics(gateway: SocketAddr, args: &[&str]) -> ClientRun {
     run_client(KAFKA_IMAGE, &full_args, &[])
 }
 
+/// Runs `kafka-configs.sh` with `args` against `gateway`, with SASL off like [`kafka_topics`].
+fn kafka_configs(gateway: SocketAddr, args: &[&str]) -> ClientRun {
+    let bootstrap = gateway.to_string();
+    let mut full_args: Vec<&str> = vec![
+        "/opt/kafka/bin/kafka-configs.sh",
+        "--bootstrap-server",
+        &bootstrap,
+    ];
+    full_args.extend_from_slice(args);
+    run_client(KAFKA_IMAGE, &full_args, &[])
+}
+
+/// `kafka-configs.sh --alter` on a topic sends only `IncrementalAlterConfigs` (44): a `SET` for
+/// `--add-config` and a `DELETE` for `--delete-config`, after a describe of the topic's dynamic
+/// configs. This is the real-tool round trip for that key through the bridge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_kafka_configs_sh_when_adding_then_deleting_retention_should_round_trip_through_the_bridge()
+ {
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+    let completed = format!("Completed updating config for topic {TOPIC}.");
+
+    let added = kafka_configs(
+        gateway,
+        &[
+            "--alter",
+            "--entity-type",
+            "topics",
+            "--entity-name",
+            TOPIC,
+            "--add-config",
+            "retention.ms=8000",
+        ],
+    )
+    .expect_ran("kafka-configs.sh --add-config");
+    assert!(
+        added.contains(&completed),
+        "kafka-configs.sh must report the alter completed, got: {added}"
+    );
+
+    let described = kafka_configs(
+        gateway,
+        &[
+            "--describe",
+            "--entity-type",
+            "topics",
+            "--entity-name",
+            TOPIC,
+        ],
+    )
+    .expect_ran("kafka-configs.sh --describe after --add-config");
+    assert!(
+        described.contains("retention.ms=8000 sensitive=false"),
+        "the describe must show the stored retention.ms, got: {described}"
+    );
+
+    let deleted = kafka_configs(
+        gateway,
+        &[
+            "--alter",
+            "--entity-type",
+            "topics",
+            "--entity-name",
+            TOPIC,
+            "--delete-config",
+            "retention.ms",
+        ],
+    )
+    .expect_ran("kafka-configs.sh --delete-config");
+    assert!(
+        deleted.contains(&completed),
+        "kafka-configs.sh must report the delete completed, got: {deleted}"
+    );
+
+    let described_after = kafka_configs(
+        gateway,
+        &[
+            "--describe",
+            "--entity-type",
+            "topics",
+            "--entity-name",
+            TOPIC,
+        ],
+    )
+    .expect_ran("kafka-configs.sh --describe after --delete-config");
+    assert!(
+        described_after.contains("retention.ms=-1 sensitive=false"),
+        "a deleted retention.ms reads as never expire, got: {described_after}"
+    );
+}
+
 /// #3546's own acceptance criterion: `kafka-topics.sh` must work against the gateway for create
 /// and delete. (`--describe` needs `DescribeConfigs`, not yet implemented, so it is not covered
 /// here.) Runs against the bridged stack, since this exercises the real `CreateTopics`/
@@ -1082,52 +1305,132 @@ async fn given_kafka_topics_sh_when_creating_then_deleting_a_topic_should_round_
     );
 }
 
+/// `kafka-topics.sh --alter --partitions N` grows a topic through
+/// the bridge and `--describe` (Metadata) reports the new count, while a smaller count fails
+/// with `INVALID_PARTITIONS` and leaves the count alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_kafka_topics_sh_when_altering_the_partition_count_should_grow_the_topic_through_the_bridge()
+ {
+    const NEW_TOPIC: &str = "kafka-topics-grow";
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+
+    let created = kafka_topics(
+        gateway,
+        &[
+            "--create",
+            "--topic",
+            NEW_TOPIC,
+            "--partitions",
+            "1",
+            "--replication-factor",
+            "1",
+        ],
+    )
+    .expect_ran("kafka-topics.sh --create");
+    assert!(
+        created.contains(&format!("Created topic {NEW_TOPIC}")),
+        "kafka-topics.sh must report the topic created, got: {created}"
+    );
+
+    let altered = kafka_topics(
+        gateway,
+        &["--alter", "--topic", NEW_TOPIC, "--partitions", "3"],
+    )
+    .expect_ran("kafka-topics.sh --alter --partitions 3");
+    assert!(
+        !altered.to_lowercase().contains("error"),
+        "kafka-topics.sh --alter must succeed, got: {altered}"
+    );
+
+    let described = kafka_topics(gateway, &["--describe", "--topic", NEW_TOPIC])
+        .expect_ran("kafka-topics.sh --describe after the grow");
+    assert!(
+        described.contains("PartitionCount: 3"),
+        "Metadata must report the grown count, got: {described}"
+    );
+
+    let shrunk = kafka_topics(
+        gateway,
+        &["--alter", "--topic", NEW_TOPIC, "--partitions", "2"],
+    )
+    .text();
+    assert!(
+        shrunk.contains("InvalidPartitionsException"),
+        "a smaller count must fail with INVALID_PARTITIONS, got: {shrunk}"
+    );
+
+    let described_after = kafka_topics(gateway, &["--describe", "--topic", NEW_TOPIC])
+        .expect_ran("kafka-topics.sh --describe after the refused shrink");
+    assert!(
+        described_after.contains("PartitionCount: 3"),
+        "a refused shrink must leave the count alone, got: {described_after}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn given_records_produced_by_kcat_when_kcat_consumes_should_read_them_back_in_order() {
     let Some((_server, gateway)) = bridged_stack().await else {
         return;
     };
     produce_with_kcat(gateway, &RECORDS);
-    // `-e` stops at the end of the partition, which kcat takes from the high watermark that Fetch
-    // sends. A wrong watermark stops it early or holds it until the container timeout.
-    let output = run_client(
-        KCAT_IMAGE,
-        &[
-            "-b",
-            &gateway.to_string(),
-            "-C",
-            "-t",
-            TOPIC,
-            "-p",
-            "0",
-            "-o",
-            "beginning",
-            "-e",
-            "-f",
-            "record %o %k=%s %h\n",
-        ],
-        &[],
+    let output = kcat_consume(gateway, &[]).expect_ran("kcat consume");
+    assert_read_in_order(&output, &RECORDS);
+}
+
+/// #4340: SASL and the bridge together. Every other SASL test stops at Metadata on a gateway with
+/// no bridge, and every produce and consume test runs with SASL off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_sasl_and_the_bridge_when_kcat_produces_and_consumes_should_read_back_in_order() {
+    let Some((_server, gateway)) = sasl_bridged_stack().await else {
+        return;
+    };
+    let auth = sasl_plain_args(ROOT_USER, ROOT_PASSWORD);
+    kcat_produce(gateway, TOPIC, 0, &RECORDS, &auth).expect_ran("kcat produce over SASL");
+    let output = kcat_consume(gateway, &auth).expect_ran("kcat consume over SASL");
+    assert_read_in_order(&output, &RECORDS);
+}
+
+/// The other half of the same path: a client the gateway refuses must not reach the bridge. kcat
+/// exits non-zero here by design, so only its output and what the partition holds are asserted.
+///
+/// What the partition holds is read from Iggy, not through the gateway. Every container shares
+/// the host's address, so the rejected logins put that address in the gateway's failed-login
+/// delay, and a SASL read-back right after could be refused for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_sasl_and_the_bridge_when_a_rejected_client_produces_should_write_nothing() {
+    let Some((server, gateway)) = sasl_bridged_stack().await else {
+        return;
+    };
+    let auth = sasl_plain_args(ROOT_USER, ROOT_PASSWORD);
+    kcat_produce(gateway, TOPIC, 0, &RECORDS, &auth).expect_ran("kcat produce over SASL");
+
+    let rejected = kcat_produce(
+        gateway,
+        TOPIC,
+        0,
+        &[("k4", "delta")],
+        &sasl_plain_args(ROOT_USER, "definitely-not-the-password"),
     )
-    .expect_ran("kcat consume");
-    let read: Vec<&str> = output
-        .lines()
-        .filter(|line| line.starts_with("record "))
-        .collect();
-    let expected: Vec<String> = RECORDS
-        .iter()
-        .enumerate()
-        .map(|(offset, (key, value))| format!("record {offset} {key}={value} trace=e2e"))
-        .collect();
-    assert_eq!(
-        read, expected,
-        "librdkafka must read every record in order, with its key and header, got: {output}"
-    );
+    .text();
     assert!(
-        output.contains(&format!(
-            "Reached end of topic {TOPIC} [0] at offset {}",
-            RECORDS.len()
-        )),
-        "kcat must stop at the high watermark, got: {output}"
+        rejected.contains("Authentication failed"),
+        "a rejected credential must reach the producer as an auth failure, got: {rejected}"
+    );
+    // A client that never authenticates is cut off before Produce; the read-back below is what
+    // proves its record never landed.
+    kcat_produce(gateway, TOPIC, 0, &[("k5", "epsilon")], &[]);
+
+    let watermark = root_bridge(&server)
+        .await
+        .high_watermark(TOPIC, 0)
+        .await
+        .expect("read the partition's high watermark");
+    assert_eq!(
+        watermark,
+        i64::try_from(RECORDS.len()).expect("record count fits i64"),
+        "only the authenticated producer's records may land"
     );
 }
 
@@ -1188,6 +1491,191 @@ fn consume_as_group(gateway: SocketAddr, count: usize) -> String {
         &[],
     )
     .expect_ran("java console consumer in a group")
+}
+
+/// KIP-345 with the Java client. A static consumer sends no `LeaveGroup` on close, so its
+/// member stays in the group, holding the only partition, for its whole session. The second run
+/// comes back under the same `group.instance.id` and must take that member over at once. Without
+/// replacement it would join as a new member, wait out a rebalance its old incarnation never
+/// rejoins, and exit after `--timeout-ms` with nothing read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_a_static_java_consumer_when_it_restarts_within_its_session_should_resume_at_once() {
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+    produce_with_kcat(gateway, &RECORDS);
+    let first = consume_as_static_member(gateway, RECORDS.len());
+    assert_eq!(
+        records_read(&first).len(),
+        RECORDS.len(),
+        "the first run must read every record, got: {first}"
+    );
+
+    produce_with_kcat(gateway, &[("k4", "delta")]);
+    let second = consume_as_static_member(gateway, 1);
+    assert_eq!(
+        records_read(&second),
+        vec![format!("Offset:{}\tk4\tdelta", RECORDS.len())],
+        "the returning static member must take its partition back, got: {second}"
+    );
+}
+
+/// [`consume_as_group`] as static member `e2e-static-0` of group `e2e-static`, with a session long
+/// enough that its previous incarnation is still a member when it returns.
+fn consume_as_static_member(gateway: SocketAddr, count: usize) -> String {
+    let count = count.to_string();
+    run_client(
+        KAFKA_IMAGE,
+        &[
+            "/opt/kafka/bin/kafka-console-consumer.sh",
+            "--bootstrap-server",
+            &gateway.to_string(),
+            "--topic",
+            TOPIC,
+            "--group",
+            "e2e-static",
+            "--consumer-property",
+            "group.instance.id=e2e-static-0",
+            "--consumer-property",
+            "session.timeout.ms=60000",
+            "--from-beginning",
+            "--max-messages",
+            &count,
+            "--timeout-ms",
+            "20000",
+            "--property",
+            "print.offset=true",
+            "--property",
+            "print.key=true",
+        ],
+        &[],
+    )
+    .expect_ran("java console consumer as a static member")
+}
+
+/// KIP-345 with librdkafka, which sends `JoinGroup` below v9: the returning member is told the
+/// previous leader, acts as a follower, and gets its old assignment back through `SyncGroup`.
+/// Without replacement the second run would wait on a rebalance its old incarnation never rejoins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_a_static_kcat_consumer_when_it_restarts_within_its_session_should_resume_at_once() {
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+    produce_with_kcat(gateway, &RECORDS);
+    let first = consume_as_static_kcat(gateway);
+    assert_eq!(
+        kcat_records_read(&first).len(),
+        RECORDS.len(),
+        "the first run must read every record, got: {first}"
+    );
+
+    produce_with_kcat(gateway, &[("k4", "delta")]);
+    let second = consume_as_static_kcat(gateway);
+    assert_eq!(
+        kcat_records_read(&second),
+        vec![format!("record {} k4=delta", RECORDS.len())],
+        "the returning static member must take its partition back, got: {second}"
+    );
+}
+
+/// kcat in balanced mode as static member `e2e-kcat-0` of group `e2e-kcat-static`, reading to
+/// the end of its partitions. It commits as it closes and sends no `LeaveGroup`.
+fn consume_as_static_kcat(gateway: SocketAddr) -> String {
+    run_client(
+        KCAT_IMAGE,
+        &[
+            "-b",
+            &gateway.to_string(),
+            "-G",
+            "e2e-kcat-static",
+            "-X",
+            "group.instance.id=e2e-kcat-0",
+            "-X",
+            "session.timeout.ms=60000",
+            "-X",
+            "auto.offset.reset=earliest",
+            "-e",
+            "-f",
+            "record %o %k=%s\n",
+            TOPIC,
+        ],
+        &[],
+    )
+    .expect_ran("kcat as a static member")
+}
+
+fn kcat_records_read(output: &str) -> Vec<&str> {
+    output
+        .lines()
+        .filter(|line| line.starts_with("record "))
+        .collect()
+}
+
+/// With auto topic creation on, a stock Java producer sends to a topic nobody created and succeeds.
+/// Its first `Metadata` is answered `UNKNOWN_TOPIC_OR_PARTITION` while the gateway creates the
+/// topic, and it retries until the topic appears.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_auto_topic_creation_when_the_java_producer_sends_to_a_new_topic_should_succeed() {
+    const NEW_TOPIC: &str = "auto-created";
+    let Some(server) = ready_server() else {
+        return;
+    };
+    let gateway = start_bridged_gateway_with(
+        &server,
+        &[],
+        GatewayConfig {
+            auto_topic_creation: AutoTopicCreationConfig {
+                enabled: true,
+                partitions: 1,
+            },
+            ..GatewayConfig::default()
+        },
+    )
+    .await;
+    let bootstrap = gateway.addr.to_string();
+
+    let produce = format!(
+        "printf 'k1:alpha\\n' | /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server \
+         {bootstrap} --topic {NEW_TOPIC} --property parse.key=true --property key.separator=: \
+         --producer-property max.block.ms=20000"
+    );
+    let produced =
+        run_client(KAFKA_IMAGE, &["sh", "-c", &produce], &[]).expect_ran("java console producer");
+    assert!(
+        !produced.contains("ERROR"),
+        "the producer must send to the new topic, got: {produced}"
+    );
+
+    let consumed = run_client(
+        KAFKA_IMAGE,
+        &[
+            "/opt/kafka/bin/kafka-console-consumer.sh",
+            "--bootstrap-server",
+            &bootstrap,
+            "--topic",
+            NEW_TOPIC,
+            "--partition",
+            "0",
+            "--offset",
+            "earliest",
+            "--max-messages",
+            "1",
+            "--timeout-ms",
+            "20000",
+            "--property",
+            "print.offset=true",
+            "--property",
+            "print.key=true",
+        ],
+        &[],
+    )
+    .expect_ran("java console consumer");
+    assert_eq!(
+        records_read(&consumed),
+        vec!["Offset:0\tk1\talpha"],
+        "the auto-created topic must hold the record, got: {consumed}"
+    );
+    gateway.stop().await;
 }
 
 /// The records a console consumer printed, as `Offset:<offset>\t<key>\t<value>`.
@@ -1276,6 +1764,44 @@ async fn given_a_group_that_committed_when_the_gateway_restarts_should_resume_af
         vec![format!("Offset:{}\tk4\tdelta", RECORDS.len())],
         "the group must resume after its commit on a gateway that never saw it, got: {second}"
     );
+}
+
+/// The id `kafka-cluster.sh cluster-id` prints, which it reads through `DescribeCluster`.
+fn cluster_id(gateway: SocketAddr) -> String {
+    let bootstrap = gateway.to_string();
+    let output = run_client(
+        KAFKA_IMAGE,
+        &[
+            "/opt/kafka/bin/kafka-cluster.sh",
+            "cluster-id",
+            "--bootstrap-server",
+            &bootstrap,
+        ],
+        &[],
+    )
+    .expect_ran("kafka-cluster.sh cluster-id");
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix("Cluster ID: "))
+        .unwrap_or_else(|| panic!("no cluster id printed, got: {output}"))
+        .trim()
+        .to_string()
+}
+
+/// The Java tool prints the same id before and after a gateway restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_a_gateway_restart_when_kafka_cluster_prints_the_id_should_print_the_same_one() {
+    let Some(server) = ready_server() else {
+        return;
+    };
+    let gateway = start_bridged_gateway(&server, &[]).await;
+    let before = cluster_id(gateway.addr);
+    gateway.stop().await;
+
+    let restarted = start_bridged_gateway(&server, &[]).await;
+    let after = cluster_id(restarted.addr);
+    assert_eq!(before, after, "the id must survive a restart");
+    assert_ne!(before, "None", "a null id prints as None");
 }
 
 /// G11 of `docs/MANUAL_TESTING.md`. Two members split the topic. When one leaves, the other
@@ -1399,4 +1925,549 @@ fn records_by_partition(output: &[String]) -> BTreeMap<i64, Vec<i64>> {
         }
     }
     read
+}
+
+/// Milliseconds since the epoch, the unit Kafka timestamps use.
+fn now_millis() -> i64 {
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the clock is past the epoch");
+    i64::try_from(elapsed.as_millis()).expect("now fits an i64")
+}
+
+/// `millis` as the `YYYY-MM-DDTHH:mm:SS.sssZ` that `--to-datetime` reads. The zone is explicit,
+/// so the client container's own zone does not matter.
+fn utc_datetime(millis: i64) -> String {
+    let micros = u64::try_from(millis).expect("a time after the epoch") * 1000;
+    IggyTimestamp::from(micros).to_utc_string("%Y-%m-%dT%H:%M:%S%.3fZ")
+}
+
+/// Runs `command` under the same GNU `timeout` bound as [`run_client`].
+fn output_bounded(command: &[&str], what: &str) -> std::process::Output {
+    Command::new("timeout")
+        .args(["--kill-after=10s", CLIENT_RUN_TIMEOUT])
+        .args(command)
+        .output()
+        .unwrap_or_else(|error| panic!("run {what}: {error}"))
+}
+
+/// Compiles `tests/java/OffsetsForTimesProbe.java` against the `kafka-clients` jar of the client
+/// image, into a directory the client container mounts. `None`, after reporting why, when there
+/// is no JDK.
+fn compile_offsets_for_times_probe() -> Option<tempfile::TempDir> {
+    let javac = Command::new("javac")
+        .arg("-version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if !javac {
+        skip("javac is unavailable, so the consumer offsetsForTimes probe cannot be built");
+        return None;
+    }
+    let dir = tempfile::tempdir().expect("create probe dir");
+    let jar = dir.path().join("kafka-clients.jar");
+    let (_, kafka_version) = KAFKA_IMAGE
+        .rsplit_once(':')
+        .expect("the client image is pinned to a version tag");
+    let image_jar = format!("/opt/kafka/libs/kafka-clients-{kafka_version}.jar");
+    let extracted = output_bounded(
+        &[
+            "docker",
+            "run",
+            "--rm",
+            "--pull",
+            "never",
+            "--entrypoint",
+            "cat",
+            KAFKA_IMAGE,
+            &image_jar,
+        ],
+        "kafka-clients extraction",
+    );
+    assert!(
+        extracted.status.success(),
+        "extracting {image_jar} failed: {}",
+        String::from_utf8_lossy(&extracted.stderr)
+    );
+    std::fs::write(&jar, extracted.stdout).expect("write kafka-clients jar");
+    let source =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/java/OffsetsForTimesProbe.java");
+    let (jar, out, source) = (
+        jar.to_str().expect("jar path is utf-8"),
+        dir.path().to_str().expect("probe dir is utf-8"),
+        source.to_str().expect("probe source path is utf-8"),
+    );
+    let compiled = output_bounded(
+        &["javac", "--release", "17", "-cp", jar, "-d", out, source],
+        "javac",
+    );
+    assert!(
+        compiled.status.success(),
+        "javac failed: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    Some(dir)
+}
+
+/// #4516 acceptance: Java's lookups by time resolve against what the gateway stored. Three
+/// records, then a time, then a fourth record a second later, so every lookup has one right
+/// answer whichever clock the client and Iggy stamp with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_records_on_both_sides_of_a_time_when_java_looks_up_by_time_should_find_the_later_one()
+ {
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+    produce_with_kcat(gateway, &RECORDS);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let between = now_millis();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    produce_with_kcat(gateway, &[("k4", "delta")]);
+
+    let get_offsets = |time: &str| {
+        run_client(
+            KAFKA_IMAGE,
+            &[
+                "/opt/kafka/bin/kafka-get-offsets.sh",
+                "--bootstrap-server",
+                &gateway.to_string(),
+                "--topic",
+                TOPIC,
+                "--time",
+                time,
+            ],
+            &[],
+        )
+        .expect_ran(&format!("kafka-get-offsets --time {time}"))
+    };
+    let at = get_offsets(&between.to_string());
+    assert!(
+        at.lines().any(|line| line.trim() == format!("{TOPIC}:0:3")),
+        "a lookup by time must find the record after the time, got: {at}"
+    );
+    let start = get_offsets("0");
+    assert!(
+        start
+            .lines()
+            .any(|line| line.trim() == format!("{TOPIC}:0:0")),
+        "time 0 finds where the partition starts, as AKHQ asks, got: {start}"
+    );
+    let max = get_offsets("-3");
+    assert!(
+        max.lines()
+            .any(|line| line.trim() == format!("{TOPIC}:0:3")),
+        "max-timestamp names the last record, got: {max}"
+    );
+    let future = now_millis() + 3_600_000;
+    let after = get_offsets(&future.to_string());
+    assert!(
+        !after
+            .lines()
+            .any(|line| line.starts_with(&format!("{TOPIC}:0:"))),
+        "a time past every record has no offset, which the tool prints as nothing, got: {after}"
+    );
+
+    let reset = run_client(
+        KAFKA_IMAGE,
+        &[
+            "/opt/kafka/bin/kafka-consumer-groups.sh",
+            "--bootstrap-server",
+            &gateway.to_string(),
+            "--group",
+            "e2e-reset-by-time",
+            "--topic",
+            TOPIC,
+            "--reset-offsets",
+            "--to-datetime",
+            &utc_datetime(between),
+            "--execute",
+        ],
+        &[],
+    )
+    .expect_ran("kafka-consumer-groups --reset-offsets --to-datetime");
+    // The tool prints its header and rows without a line break between them, so the row is
+    // matched as a run of fields anywhere in the output.
+    let fields: Vec<&str> = reset.split_whitespace().collect();
+    let moved = fields
+        .windows(4)
+        .any(|row| row == ["e2e-reset-by-time", TOPIC, "0", "3"]);
+    assert!(
+        moved,
+        "the group must move to the first record after the time, got: {reset}"
+    );
+
+    // The consumer's own `offsetsForTimes`, which plain consumers and Kafka Streams seek by time
+    // with, not the Admin call the tools above use. Same request on the wire, different client
+    // code.
+    let Some(probe) = compile_offsets_for_times_probe() else {
+        return;
+    };
+    let probe_dir = probe.path().to_str().expect("probe path is utf-8");
+    let consumer = run_client(
+        KAFKA_IMAGE,
+        &[
+            "java",
+            "-cp",
+            "/opt/kafka/libs/*:/probe",
+            "OffsetsForTimesProbe",
+            &gateway.to_string(),
+            TOPIC,
+            "0",
+            &between.to_string(),
+            "0",
+            &future.to_string(),
+        ],
+        &[(probe_dir, "/probe")],
+    )
+    .expect_ran("java consumer offsetsForTimes");
+    for expected in [
+        format!("time={between} offset=3"),
+        "time=0 offset=0".to_string(),
+        format!("time={future} offset=null"),
+    ] {
+        assert!(
+            consumer.lines().any(|line| line.trim() == expected),
+            "offsetsForTimes must answer `{expected}`, got: {consumer}"
+        );
+    }
+}
+
+/// The TLS-side stack: a bridged gateway with an `SSL` and a `SASL_SSL` listener, client
+/// certificates requested and mapped to Iggy users by common name, and the material every
+/// client needs on disk.
+struct TlsStack {
+    _server: TestServer,
+    ssl: SocketAddr,
+    sasl_ssl: SocketAddr,
+    _certs_dir: tempfile::TempDir,
+    ca_file: PathBuf,
+    /// A certificate whose common name is `TLS_USER`, an Iggy user the stack creates.
+    user_cert: Issued,
+    /// A certificate the CA signed for a name no Iggy user has.
+    stranger_cert: Issued,
+}
+
+/// The Iggy user a client certificate maps to. Created with a topic read so `DescribeAcls`
+/// renders a binding that names it.
+const TLS_USER: &str = "cert-alice";
+
+/// Brings up the TLS stack, or reports why it could not.
+async fn tls_stack() -> Option<TlsStack> {
+    let server = ready_server()?;
+    let token = root_token(&server.http_address);
+    create_user(
+        &server.http_address,
+        &token,
+        TLS_USER,
+        r#"{"global":{"manage_servers":false,"read_servers":false,"manage_users":false,
+           "read_users":false,"manage_streams":false,"read_streams":false,"manage_topics":false,
+           "read_topics":true,"poll_messages":false,"send_messages":false},"streams":null}"#,
+    );
+
+    let certs_dir = tempfile::tempdir().expect("certs dir");
+    let pki = TestPki::new();
+    let (cert_file, key_file) = pki.server_cert("gateway").write(certs_dir.path(), "server");
+    let ca_file = pki.write_ca(certs_dir.path());
+    let user_cert = pki.client_cert(TLS_USER, "Iggy");
+    let stranger_cert = pki.client_cert("nobody", "Iggy");
+
+    let bridge = IggyBridge::connect(IggyBridgeConfig {
+        address: server.address.clone(),
+        username: ROOT_USER.to_string(),
+        password: SecretString::from(ROOT_PASSWORD.to_string()),
+        topic_mapping: TopicMapping::new("kafka".to_string(), HashMap::new())
+            .expect("the default mapping is valid"),
+        max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+        produce_sessions: ProduceSessionLimits::default(),
+        tls: IggyTls::default(),
+    })
+    .await
+    .expect("the bridge connects to a ready server");
+    bridge
+        .ensure_stream_and_topic(TOPIC, 1)
+        .await
+        .expect("create the topic");
+    let authenticator = Arc::new(IggyAuthenticator::new(server.address.clone()));
+    let config = GatewayConfig {
+        listeners: vec![
+            ListenerConfig::new(SecurityProtocol::Ssl, "127.0.0.1:0"),
+            ListenerConfig::new(SecurityProtocol::SaslSsl, "127.0.0.1:0"),
+        ],
+        tls: Some(
+            TlsConfig::new(cert_file, key_file)
+                .with_client_auth(ClientAuth::Requested, &ca_file)
+                .with_principal_mapping("RULE:^CN=([^,]+).*$/$1/".parse().expect("valid rule")),
+        ),
+        ..GatewayConfig::default()
+    };
+    let (addrs, shutdown) = spawn_listeners(
+        move |config| {
+            KafkaGateway::new(config)
+                .with_bridge(Some(Arc::new(bridge)))
+                .with_authenticator(authenticator)
+        },
+        config,
+    );
+    // Held for the test's lifetime: dropping the sender shuts the gateway down mid-exchange.
+    std::mem::forget(shutdown);
+    Some(TlsStack {
+        _server: server,
+        ssl: addrs[0],
+        sasl_ssl: addrs[1],
+        _certs_dir: certs_dir,
+        ca_file,
+        user_cert,
+        stranger_cert,
+    })
+}
+
+impl TlsStack {
+    /// kcat against `addr` with `extra` librdkafka properties, trusting the stack's CA.
+    fn kcat_tls(&self, addr: SocketAddr, extra: &[&str], client: Option<&Issued>) -> ClientRun {
+        let dir = tempfile::tempdir().expect("client certs dir");
+        let mut args = vec![
+            "-b".to_string(),
+            addr.to_string(),
+            "-X".to_string(),
+            "ssl.ca.location=/tmp/certs/ca.pem".to_string(),
+        ];
+        let mut mounts = vec![(self.ca_file.display().to_string(), "/tmp/certs/ca.pem")];
+        let (cert_file, key_file) = client.map_or_else(
+            || (PathBuf::new(), PathBuf::new()),
+            |issued| issued.write(dir.path(), "client"),
+        );
+        if client.is_some() {
+            args.extend([
+                "-X".to_string(),
+                "ssl.certificate.location=/tmp/certs/client.pem".to_string(),
+                "-X".to_string(),
+                "ssl.key.location=/tmp/certs/client.key".to_string(),
+            ]);
+            mounts.push((cert_file.display().to_string(), "/tmp/certs/client.pem"));
+            mounts.push((key_file.display().to_string(), "/tmp/certs/client.key"));
+        }
+        for property in extra {
+            args.extend(["-X".to_string(), (*property).to_string()]);
+        }
+        args.push("-L".to_string());
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let mounts: Vec<(&str, &str)> = mounts
+            .iter()
+            .map(|(host, guest)| (host.as_str(), *guest))
+            .collect();
+        run_client(KCAT_IMAGE, &args, &mounts)
+    }
+
+    /// Writes a Java client config for TLS with `extra` properties, plus the CA and, when
+    /// given, a PEM keystore. Returns the mounts the container needs.
+    fn java_tls_config(
+        &self,
+        extra: &str,
+        client: Option<&Issued>,
+    ) -> (tempfile::TempDir, Vec<(String, &'static str)>) {
+        let dir = tempfile::tempdir().expect("create config dir");
+        let mut mounts = vec![(self.ca_file.display().to_string(), "/tmp/certs/ca.pem")];
+        let mut properties = format!(
+            "ssl.truststore.type=PEM\n\
+             ssl.truststore.location=/tmp/certs/ca.pem\n\
+             request.timeout.ms={JAVA_CLIENT_TIMEOUT_MS}\n\
+             default.api.timeout.ms={JAVA_CLIENT_TIMEOUT_MS}\n\
+             {extra}\n"
+        );
+        if let Some(issued) = client {
+            let bundle = issued.write_bundle(dir.path(), "client");
+            mounts.push((bundle.display().to_string(), "/tmp/certs/client.pem"));
+            properties.push_str(
+                "ssl.keystore.type=PEM\n\
+                 ssl.keystore.location=/tmp/certs/client.pem\n",
+            );
+        }
+        let path = dir.path().join("client.properties");
+        std::fs::write(&path, properties).expect("write client config");
+        mounts.push((path.display().to_string(), "/tmp/client.properties"));
+        (dir, mounts)
+    }
+
+    fn java(
+        &self,
+        tool: &str,
+        addr: SocketAddr,
+        extra: &str,
+        client: Option<&Issued>,
+    ) -> ClientRun {
+        let (_dir, mounts) = self.java_tls_config(extra, client);
+        let mounts: Vec<(&str, &str)> = mounts
+            .iter()
+            .map(|(host, guest)| (host.as_str(), *guest))
+            .collect();
+        let bootstrap = addr.to_string();
+        let mut args = vec![
+            tool,
+            "--bootstrap-server",
+            &bootstrap,
+            "--command-config",
+            "/tmp/client.properties",
+        ];
+        if tool.ends_with("kafka-acls.sh") {
+            args.push("--list");
+        }
+        run_client(KAFKA_IMAGE, &args, &mounts)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_an_ssl_listener_when_librdkafka_connects_with_ssl_should_serve_metadata() {
+    let Some(stack) = tls_stack().await else {
+        return;
+    };
+    let output = stack
+        .kcat_tls(stack.ssl, &["security.protocol=SSL"], None)
+        .expect_ran("kcat over SSL");
+    assert!(
+        output.contains("Metadata for all topics"),
+        "librdkafka must handshake against the gateway certificate and be served, got: {output}"
+    );
+    assert!(
+        output.contains(&format!("127.0.0.1:{}", stack.ssl.port())),
+        "the broker advertised must be the SSL listener the client used, got: {output}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_a_sasl_ssl_listener_when_librdkafka_authenticates_should_serve_metadata() {
+    let Some(stack) = tls_stack().await else {
+        return;
+    };
+    let sasl = |password: &str| {
+        stack.kcat_tls(
+            stack.sasl_ssl,
+            &[
+                "security.protocol=SASL_SSL",
+                "sasl.mechanisms=PLAIN",
+                &format!("sasl.username={ROOT_USER}"),
+                &format!("sasl.password={password}"),
+            ],
+            None,
+        )
+    };
+    let output = sasl(ROOT_PASSWORD).expect_ran("kcat over SASL_SSL");
+    assert!(
+        output.contains("Metadata for all topics"),
+        "librdkafka must authenticate inside TLS and be served, got: {output}"
+    );
+    assert!(
+        output.contains(&format!("127.0.0.1:{}", stack.sasl_ssl.port())),
+        "the broker advertised must be the SASL_SSL listener the client used, got: {output}"
+    );
+
+    // kcat exits non-zero here by design, so only its output is asserted.
+    let rejected = sasl("definitely-not-the-password").text();
+    assert!(
+        rejected.contains("Authentication failed"),
+        "a rejected credential must reach the client as an auth failure, got: {rejected}"
+    );
+    assert!(
+        !rejected.contains("Metadata for all topics"),
+        "nothing may be served to a rejected client"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_a_client_certificate_when_librdkafka_connects_should_be_admitted_as_its_user() {
+    let Some(stack) = tls_stack().await else {
+        return;
+    };
+    let output = stack
+        .kcat_tls(
+            stack.ssl,
+            &["security.protocol=SSL"],
+            Some(&stack.user_cert),
+        )
+        .expect_ran("kcat with a client certificate");
+    assert!(
+        output.contains("Metadata for all topics"),
+        "a certificate naming an Iggy user must be admitted, got: {output}"
+    );
+
+    let stranger = stack.kcat_tls(
+        stack.ssl,
+        &["security.protocol=SSL"],
+        Some(&stack.stranger_cert),
+    );
+    assert!(
+        !stranger.text.contains("Metadata for all topics"),
+        "a certificate naming no Iggy user must not be served, got: {}",
+        stranger.text
+    );
+    assert!(
+        !stranger.succeeded,
+        "kcat must fail when the gateway closes on it, got: {}",
+        stranger.text
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_the_java_client_with_ssl_and_sasl_ssl_should_connect_through_both_listeners() {
+    let Some(stack) = tls_stack().await else {
+        return;
+    };
+    let ssl = stack
+        .java(
+            "/opt/kafka/bin/kafka-broker-api-versions.sh",
+            stack.ssl,
+            "security.protocol=SSL",
+            None,
+        )
+        .expect_ran("java client over SSL");
+    assert!(
+        ssl.contains(&format!("127.0.0.1:{}", stack.ssl.port())),
+        "the Java client reads Metadata and then dials the advertised SSL listener, got: {ssl}"
+    );
+    assert!(
+        ssl.contains("SaslHandshake(17): UNSUPPORTED"),
+        "an SSL listener advertises no SASL keys, got: {ssl}"
+    );
+
+    let sasl_ssl = stack
+        .java(
+            "/opt/kafka/bin/kafka-broker-api-versions.sh",
+            stack.sasl_ssl,
+            &format!(
+                "security.protocol=SASL_SSL\n\
+                 sasl.mechanism=PLAIN\n\
+                 sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule \
+                 required username=\"{ROOT_USER}\" password=\"{ROOT_PASSWORD}\";"
+            ),
+            None,
+        )
+        .expect_ran("java client over SASL_SSL");
+    assert!(
+        sasl_ssl.contains("SaslHandshake(17): 0 to 1")
+            && sasl_ssl.contains("SaslAuthenticate(36): 0 to 2"),
+        "the Java client must authenticate inside TLS and read the advertisement, got: {sasl_ssl}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_the_java_client_with_a_client_certificate_should_be_described_as_its_user() {
+    let Some(stack) = tls_stack().await else {
+        return;
+    };
+    let listing = stack
+        .java(
+            "/opt/kafka/bin/kafka-acls.sh",
+            stack.ssl,
+            "security.protocol=SSL",
+            Some(&stack.user_cert),
+        )
+        .expect_ran("java kafka-acls over mTLS");
+    assert!(
+        listing.contains(&format!("principal=User:{TLS_USER}")),
+        "the certificate's common name is the principal described, got: {listing}"
+    );
+    assert!(
+        grants(&listing, "TOPIC", "READ"),
+        "the mapped user's read_topics grant renders, got: {listing}"
+    );
 }

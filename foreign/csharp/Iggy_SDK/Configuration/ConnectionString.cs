@@ -61,7 +61,7 @@ internal static class ConnectionString
 
         var serverAddress = serverAndOptions[0];
         var serverHost = ParseHost(serverAddress);
-        var (tlsSettings, reconnectionSettings, heartbeatInterval) =
+        var (tlsSettings, reconnectionSettings, heartbeatInterval, maxPendingOperations, maxPendingOperationBytes) =
             ParseOptions(serverAndOptions.ElementAtOrDefault(1), serverHost);
 
         return new IggyClientConfigurator
@@ -69,6 +69,8 @@ internal static class ConnectionString
             BaseAddress = serverAddress,
             Protocol = Protocol.Tcp,
             HeartbeatInterval = heartbeatInterval,
+            MaxPendingOperations = maxPendingOperations,
+            MaxPendingOperationBytes = maxPendingOperationBytes,
             TlsSettings = tlsSettings,
             ReconnectionSettings = reconnectionSettings,
             AutoLoginSettings = autoLoginSettings
@@ -128,7 +130,7 @@ internal static class ConnectionString
             : addressMatch.Groups[2].Value;
     }
 
-    private static (TlsSettings, ReconnectionSettings, TimeSpan) ParseOptions(string? query, string serverHost)
+    private static (TlsSettings, ReconnectionSettings, TimeSpan, int, long) ParseOptions(string? query, string serverHost)
     {
         // The certificate name check needs a hostname when tls_domain is missing.
         var tlsSettings = new TlsSettings { Hostname = serverHost };
@@ -140,6 +142,8 @@ internal static class ConnectionString
             UseExponentialBackoff = false
         };
         var heartbeatInterval = TimeSpan.FromSeconds(5);
+        var maxPendingOperations = IggyClientConfigurator.DEFAULT_MAX_PENDING_OPERATIONS;
+        var maxPendingOperationBytes = IggyClientConfigurator.DEFAULT_MAX_PENDING_OPERATION_BYTES;
 
         foreach (var option in query?.Split('&') ?? [])
         {
@@ -168,6 +172,21 @@ internal static class ConnectionString
                 case "heartbeat_interval":
                     heartbeatInterval = ParseInterval(name, value);
                     break;
+                case "max_pending_operations":
+                    if (!int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out maxPendingOperations)
+                        || maxPendingOperations <= 0)
+                    {
+                        throw new FormatException($"Option \"{name}\" must be an integer between 1 and {int.MaxValue}.");
+                    }
+                    break;
+                case "max_pending_operation_bytes":
+                    if (!long.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out maxPendingOperationBytes)
+                        || maxPendingOperationBytes <= 0)
+                    {
+                        throw new FormatException(
+                            $"Option \"{name}\" must be an integer between 1 and {long.MaxValue}.");
+                    }
+                    break;
                 case "nodelay":
                     // Validated only, the TCP client always disables Nagle.
                     ParseBoolean(name, value);
@@ -182,7 +201,7 @@ internal static class ConnectionString
             throw new FormatException("Option \"tls\" requires \"tls_ca_file\".");
         }
 
-        return (tlsSettings, reconnectionSettings, heartbeatInterval);
+        return (tlsSettings, reconnectionSettings, heartbeatInterval, maxPendingOperations, maxPendingOperationBytes);
     }
 
     private static (string Name, string Value) SplitOption(string option)
