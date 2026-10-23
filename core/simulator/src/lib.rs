@@ -1916,6 +1916,10 @@ impl Simulator {
     /// Logs a replica refused for contradicting an op it applied, over its
     /// metadata consensus and every partition group it hosts. See
     /// `VsrConsensus::contradicts_applied_log`.
+    ///
+    /// Read through the tombstone: a refused partition `StartView` fences its
+    /// partition for resync, and the fenced owner stays until its quarantine
+    /// drains.
     #[must_use]
     pub(crate) fn applied_log_contradictions(&self, replica_idx: usize) -> u64 {
         let metadata = self
@@ -1928,7 +1932,11 @@ impl Simulator {
                 let partitions = shard.plane.partitions();
                 partitions
                     .namespaces()
-                    .filter_map(|namespace| partitions.get_by_ns(namespace))
+                    .filter_map(|namespace| {
+                        partitions
+                            .local_idx(namespace)
+                            .and_then(|local| partitions.get(local))
+                    })
                     .map(|partition| partition.consensus().applied_log_contradictions())
                     .sum::<u64>()
             })
@@ -16306,7 +16314,7 @@ mod applied_divergence_resync_tests {
     }
 
     #[test]
-    fn given_start_view_contradicting_an_applied_op_when_adopted_should_fence_the_partition_for_resync()
+    fn given_start_view_contradicting_an_applied_op_when_offered_should_fence_the_partition_for_resync()
      {
         let namespace = IggyNamespace::new(1, 1, 0);
         let sim = applied_sends(namespace);
@@ -16319,12 +16327,17 @@ mod applied_divergence_resync_tests {
         );
 
         assert_resynced(&sim, namespace, live_frontier - 1);
+        assert_eq!(
+            sim.applied_log_contradictions(usize::from(DIVERGED)),
+            1,
+            "the fence must not hide the refusal from the simulator invariants"
+        );
     }
 
-    /// Adopts a view whose history leaves the cluster's at `diverged_op` and
+    /// Offers a view whose history leaves the cluster's at `diverged_op` and
     /// carries `window` of its newest headers plus the cluster's own `agreed`
     /// ones, then checks the rebuild recorded `frontier`.
-    fn adopt_multi_op_divergence(diverged_op: u64, window: usize, agreed: &[u64], frontier: u64) {
+    fn offer_multi_op_divergence(diverged_op: u64, window: usize, agreed: &[u64], frontier: u64) {
         let namespace = IggyNamespace::new(1, 1, 0);
         let sim = applied_sends(namespace);
         let mut headers: Vec<PrepareHeader> = forged_suffix(&sim, namespace, diverged_op)
@@ -16346,30 +16359,30 @@ mod applied_divergence_resync_tests {
     }
 
     #[test]
-    fn given_multi_op_divergence_with_agreed_header_when_adopted_should_record_frontier_below_first_diverged_op()
+    fn given_multi_op_divergence_with_agreed_header_when_offered_should_record_frontier_below_first_diverged_op()
      {
         // Ops 4 and 5 diverge and the view still carries the cluster's op 3, so
         // the offsets of ops 1..=3 are the only ones both histories minted.
-        adopt_multi_op_divergence(4, 2, &[3], 3);
+        offer_multi_op_divergence(4, 2, &[3], 3);
     }
 
     #[test]
-    fn given_multi_op_divergence_agreed_only_by_parent_when_adopted_should_record_frontier_below_first_diverged_op()
+    fn given_multi_op_divergence_agreed_only_by_parent_when_offered_should_record_frontier_below_first_diverged_op()
      {
         // The view's op 4 names the cluster's op 3 as parent, which is the only
         // witness that op 3 is shared.
-        adopt_multi_op_divergence(4, 2, &[], 3);
+        offer_multi_op_divergence(4, 2, &[], 3);
     }
 
     #[test]
-    fn given_divergence_below_the_view_window_when_adopted_should_record_no_frontier() {
+    fn given_divergence_below_the_view_window_when_offered_should_record_no_frontier() {
         // The histories split at op 2 but the view carries only ops 4 and 5, so
         // nothing it holds confirms a shared op and the rebuild accepts any offer.
-        adopt_multi_op_divergence(2, 2, &[], 0);
+        offer_multi_op_divergence(2, 2, &[], 0);
     }
 
     #[test]
-    fn given_contradicting_view_adopted_while_transfer_fetching_when_transfer_refused_should_fence_the_partition_for_resync()
+    fn given_contradicting_view_offered_while_transfer_fetching_when_transfer_refused_should_fence_the_partition_for_resync()
      {
         const TRANSFER_NONCE: u128 = 0x4500;
         let namespace = IggyNamespace::new(1, 1, 0);

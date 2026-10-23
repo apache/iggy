@@ -1533,6 +1533,18 @@ pub enum ContradictionSource {
     Prepare,
 }
 
+/// Why [`VsrConsensus::try_handle_start_view`] refused a `StartView`.
+#[derive(Debug)]
+pub enum StartViewRefusal {
+    /// The body is malformed or names another cluster, group or partition
+    /// incarnation.
+    InvalidEvidence,
+    /// The log names a different prepare at an op this replica applied. A plane
+    /// that can rebuild the group from its peers reads it for the history both
+    /// sides still share.
+    ContradictsAppliedLog(MergedLog),
+}
+
 /// Boot-time timer set for a consensus group, one struct so every plane's
 /// restore path applies the same values in the same place.
 #[derive(Debug, Clone, Copy)]
@@ -4309,6 +4321,22 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             .unwrap_or_default()
     }
 
+    /// [`Self::try_handle_start_view`] for a caller that only needs to know
+    /// whether the `StartView` was refused.
+    ///
+    /// # Panics
+    /// If `header.group` does not match this replica's namespace.
+    pub fn handle_start_view_guarded(
+        &self,
+        plane: PlaneKind,
+        header: &StartViewHeader,
+        suffix_body: &[u8],
+        applied_at: impl Fn(u64) -> Option<PrepareHeader>,
+    ) -> Option<Vec<VsrAction>> {
+        self.try_handle_start_view(plane, header, suffix_body, applied_at)
+            .ok()
+    }
+
     /// Handle a received `StartView` message (backups only).
     ///
     /// "When other replicas receive the STARTVIEW message, they replace their log
@@ -4330,21 +4358,21 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// `suffix_body` is the message body: the view's canonical headers, empty
     /// when the announcement carries numbers only.
     ///
-    /// `None` refuses a `StartView` that would be adopted but whose headers
-    /// contradict a prepare `applied_at` reports (see
-    /// [`Self::contradicts_applied_log`]): nothing changed, and nothing may act
-    /// on it.
+    /// # Errors
+    /// Refuses a `StartView` that would be adopted, and nothing changed: its
+    /// body is malformed or names another group, or its headers contradict a
+    /// prepare `applied_at` reports (see [`Self::contradicts_applied_log`]).
     #[expect(
         clippy::too_many_lines,
         reason = "keep StartView validation and both commit paths together"
     )]
-    pub fn handle_start_view_guarded(
+    pub fn try_handle_start_view(
         &self,
         plane: PlaneKind,
         header: &StartViewHeader,
         suffix_body: &[u8],
         applied_at: impl Fn(u64) -> Option<PrepareHeader>,
-    ) -> Option<Vec<VsrAction>> {
+    ) -> Result<Vec<VsrAction>, StartViewRefusal> {
         assert_eq!(header.group, self.group, "SV routed to wrong group");
         let from_replica = header.replica;
         let msg_view = header.view;
@@ -4353,12 +4381,12 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
         // Verify sender is the primary for this view
         if self.primary_index(msg_view) != from_replica {
-            return Some(Vec::new());
+            return Ok(Vec::new());
         }
 
         // Ignore old views
         if msg_view < self.view.get() {
-            return Some(Vec::new());
+            return Ok(Vec::new());
         }
 
         // Incarnation guard. While Recovering (probing after a restart), only adopt
@@ -4390,7 +4418,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                 self_incarnation,
                 "ignoring StartView while recovering: stale incarnation"
             );
-            return Some(Vec::new());
+            return Ok(Vec::new());
         }
 
         // Within one view the primary's log only grows. A Normal replica already
@@ -4408,9 +4436,9 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         {
             if msg_commit > self.commit_max() {
                 self.advance_commit_max(msg_commit);
-                return Some(vec![VsrAction::CommitJournal]);
+                return Ok(vec![VsrAction::CommitJournal]);
             }
-            return Some(Vec::new());
+            return Ok(Vec::new());
         }
 
         // Adoption may discard an uncommitted WAL suffix, never a committed prefix. A
@@ -4435,19 +4463,19 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                 commit_max = self.commit_max(),
                 "ignoring StartView that omits known committed entries"
             );
-            return Some(Vec::new());
+            return Ok(Vec::new());
         }
 
         // We shouldn't process our own StartView
         if from_replica == self.replica {
-            return Some(Vec::new());
+            return Ok(Vec::new());
         }
 
         let suffix = match dvc_suffix_decode(suffix_body, msg_op, 0, 0) {
             Ok(suffix) => suffix,
             Err(error) => {
                 tracing::warn!(view = msg_view, op = msg_op, %error, "refusing malformed StartView evidence");
-                return None;
+                return Err(StartViewRefusal::InvalidEvidence);
             }
         };
         let adopted = crate::AdoptedView {
@@ -4460,7 +4488,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         };
         if let Err(error) = adopted.validate(self.cluster, msg_view) {
             tracing::warn!(view = msg_view, op = msg_op, %error, "refusing mismatched StartView evidence");
-            return None;
+            return Err(StartViewRefusal::InvalidEvidence);
         }
         if self.contradicts_applied_log(
             plane,
@@ -4469,7 +4497,9 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             suffix.headers(),
             applied_at,
         ) {
-            return None;
+            return Err(StartViewRefusal::ContradictsAppliedLog(
+                adopted.merged_log(),
+            ));
         }
 
         // Accept the StartView and transition to normal
@@ -4560,7 +4590,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             );
             actions.push(send_prepare_ok);
         }
-        Some(actions)
+        Ok(actions)
     }
 
     /// Handle a `Commit` (heartbeat) message from the primary.

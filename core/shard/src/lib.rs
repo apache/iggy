@@ -38,9 +38,10 @@ use consensus::{
     ChunkProgress, CommitOutcome, Consensus, ConsensusClock, DVC_HEADERS_MAX, DvcHeaderKind,
     DvcSuffix, FatalReason, MergedLog, MetadataHandle, MuxPlane, PartitionsHandle, Pipeline, Plane,
     PlaneKind, RepairEvidence, STATE_TRANSFER_MAX_DECODE_RETRIES, STATE_TRANSFER_MAX_STALL_RETRIES,
-    Sequencer, Status, VsrAction, VsrConsensus, build_deny_reply_from_request_header, dvc_blank,
-    dvc_header_kind, encode_prepare_headers, fatal, repaired_frontier_update,
-    repaired_prepare_evidence, restamp_prepare_view, verify_prepare_integrity,
+    Sequencer, StartViewRefusal, Status, VsrAction, VsrConsensus,
+    build_deny_reply_from_request_header, dvc_blank, dvc_header_kind, encode_prepare_headers,
+    fatal, repaired_frontier_update, repaired_prepare_evidence, restamp_prepare_view,
+    verify_prepare_integrity,
 };
 #[cfg(any(test, feature = "simulator"))]
 use crossfire::AsyncRxTrait;
@@ -5151,13 +5152,30 @@ where
             return;
         };
         partition.ensure_materialization_recovery();
-        let Some(actions) = partition.consensus().handle_start_view_guarded(
+        let actions = match partition.consensus().try_handle_start_view(
             PlaneKind::Partitions,
             &header,
             suffix_body,
             |op| partition.applied_header(op),
-        ) else {
-            return;
+        ) {
+            Ok(actions) => actions,
+            // Refusing alone leaves this replica refusing every retransmit of the
+            // view, out of the group for good. The refused log still names the
+            // history both sides share, which is where the rebuild resumes.
+            Err(StartViewRefusal::ContradictsAppliedLog(refused)) => {
+                if let Some((diverged_op, agreed_op)) =
+                    partition_applied_divergence(partition, &refused)
+                {
+                    self.resync_diverged_partition(
+                        IggyNamespace::from_raw(header.group),
+                        partition,
+                        diverged_op,
+                        agreed_op,
+                    );
+                }
+                return;
+            }
+            Err(StartViewRefusal::InvalidEvidence) => return,
         };
         // Checked on every adoption, transferring or not: a transfer that later
         // fails leaves the applied history the view contradicts in place.
@@ -9584,6 +9602,11 @@ where
         B: MessageBus + 'static,
         T: ShardsTable,
     {
+        // The tick exports this count through the tombstone gate, so a refusal
+        // that fenced the partition would otherwise surface only at its removal.
+        self.metrics.record_partition_applied_log_contradictions(
+            partition.consensus().take_applied_log_contradictions(),
+        );
         partition.begin_quarantine(intended_frontier);
         self.plane.partitions().tombstone(namespace);
         self.shards_table.remove(&namespace);
@@ -12280,12 +12303,11 @@ where
     SB: SuperblockStore,
 {
     let applied_floor = partition.consensus().commit_min();
+    // The repair ring too: a `StartView` the consensus refused on an evicted
+    // header must still find the op it contradicted here.
     let checksum_at = |op| {
         partition
-            .log
-            .journal()
-            .inner
-            .header_by_op(op)
+            .applied_header(op)
             .map(|header| header.checksum)
             .or_else(|| partition.wal_checksum(op))
     };
