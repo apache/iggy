@@ -35,12 +35,13 @@ pub use router::CONSENSUS_TICK_INTERVAL;
 #[cfg(feature = "simulator")]
 use consensus::LocalPipeline;
 use consensus::{
-    ChunkProgress, CommitOutcome, Consensus, ConsensusClock, DVC_HEADERS_MAX, DvcHeaderKind,
-    DvcSuffix, FatalReason, MergedLog, MetadataHandle, MuxPlane, PartitionsHandle, Pipeline, Plane,
-    PlaneKind, RepairEvidence, STATE_TRANSFER_MAX_DECODE_RETRIES, STATE_TRANSFER_MAX_STALL_RETRIES,
-    Sequencer, Status, VsrAction, VsrConsensus, build_deny_reply_from_request_header, dvc_blank,
-    dvc_header_kind, encode_prepare_headers, fatal, repaired_frontier_update,
-    repaired_prepare_evidence, restamp_prepare_view, verify_prepare_integrity,
+    AdoptedView, ChunkProgress, CommitOutcome, Consensus, ConsensusClock, DVC_HEADERS_MAX,
+    DvcHeaderKind, DvcSuffix, FatalReason, MergedLog, MetadataHandle, MuxPlane, PartitionsHandle,
+    Pipeline, Plane, PlaneKind, RepairEvidence, STATE_TRANSFER_MAX_DECODE_RETRIES,
+    STATE_TRANSFER_MAX_STALL_RETRIES, Sequencer, Status, VsrAction, VsrConsensus,
+    build_deny_reply_from_request_header, dvc_blank, dvc_header_kind, encode_prepare_headers,
+    fatal, repaired_frontier_update, repaired_prepare_evidence, restamp_prepare_view,
+    verify_prepare_integrity,
 };
 #[cfg(any(test, feature = "simulator"))]
 use crossfire::AsyncRxTrait;
@@ -5595,10 +5596,8 @@ where
         // until the body is journaled, and the primary's retransmit is dropped
         // by the backup gap check (adoption already advanced its sequencer to
         // the head), so repair is the only channel that can deliver them.
-        let to_op = fenced_serve_ceiling(
-            repair_serve_ceiling(&header, partition.consensus()),
-            partition.view_fenced().then(|| partition.fence_floor()),
-        );
+        let to_op = repair_serve_ceiling(&header, partition.consensus());
+        let fence_floor = partition.view_fenced().then(|| partition.fence_floor());
         // `None` means the journal holds NOTHING, not "nothing was evicted":
         // the partition journal is memory-only and `clear_all` wipes the
         // evicted ring with it, so a freshly installed or freshly restarted
@@ -5638,6 +5637,14 @@ where
         let mut served_through = from_op.saturating_sub(1);
         for op in from_op..=chunk_end {
             if !partition.consensus().view_log_entry_proven(op) {
+                break;
+            }
+            let Some(held) = partition.log.journal().inner.repair_header(op) else {
+                break;
+            };
+            if !fenced_serve_admits(fence_floor, op, || {
+                partition.consensus().adopted_view_vouches_for(&held)
+            }) {
                 break;
             }
             let Some(entry) = partition.log.journal().inner.repair_entry(op) else {
@@ -11581,10 +11588,10 @@ fn repair_op_in_scope(
         })
 }
 
-/// A fenced replica never hands out entries it has not proven: its serve stops at
-/// `fenced_floor`, the higher of its `commit_min` and its recovered commit point.
-fn fenced_serve_ceiling(ceiling: u64, fenced_floor: Option<u64>) -> u64 {
-    fenced_floor.map_or(ceiling, |floor| ceiling.min(floor))
+/// A fenced replica serves what it has proven: ops up to `fence_floor`, and above
+/// it only entries the adopted view's log names, which `build_dvc_suffix` advertises.
+fn fenced_serve_admits(fence_floor: Option<u64>, op: u64, vouched: impl FnOnce() -> bool) -> bool {
+    fence_floor.is_none_or(|floor| op <= floor || vouched())
 }
 
 /// Ceiling on the op range a repair request may ask this replica to walk.
@@ -12527,6 +12534,25 @@ async fn anchor_view_fence_from_start_view<B, SB>(
             return;
         }
     };
+    let proof = AdoptedView {
+        view: header.view,
+        group: consensus.group(),
+        partition_incarnation: consensus.partition_incarnation(),
+        op_head: pending.op_head,
+        commit_max: pending.commit_max,
+        headers: pending.headers,
+    };
+    if let Err(error) = proof.validate(consensus.cluster(), consensus.view()) {
+        tracing::warn!(
+            shard,
+            namespace_raw = consensus.group(),
+            view = header.view,
+            %error,
+            "start_view suffix names another partition or incarnation, so the fence keeps waiting for an anchor"
+        );
+        return;
+    }
+    let pending = proof.merged_log();
     if let Some(op) = first_view_divergence(partition, &pending) {
         tracing::warn!(
             shard,
@@ -13171,16 +13197,14 @@ mod persist_gate_tests {
 mod repair_scope_tests {
     //! Who parked the log decides what it means.
 
-    use consensus::{LocalPipeline, PlaneKind, Sequencer, Status, VsrConsensus};
-    use iggy_binary_protocol::{
-        Command, ConsensusHeader, PrepareHeader, RequestPreparesHeader, StartViewChangeHeader,
-    };
+    use consensus::{LocalPipeline, Sequencer, VsrConsensus};
+    use iggy_binary_protocol::{Command, PrepareHeader, RequestPreparesHeader};
     use message_bus::IggyMessageBus;
     use server_common::Message;
 
     use super::{
-        MergedLog, adopted_suffix_head, fenced_serve_ceiling, pending_covers_suffix,
-        repair_op_in_scope, repair_serve_ceiling,
+        MergedLog, adopted_suffix_head, pending_covers_suffix, repair_op_in_scope,
+        repair_serve_ceiling,
     };
 
     fn header(op: u64) -> PrepareHeader {
@@ -13270,58 +13294,6 @@ mod repair_scope_tests {
         // `commit_max` above the local head still counts: heartbeats outrun prepares.
         consensus.advance_commit_max(120);
         assert_eq!(ceiling(u64::MAX), 120);
-    }
-
-    #[test]
-    fn given_a_fenced_view_change_donor_when_serving_should_stop_at_its_fence_floor() {
-        const COMMIT_MIN: u64 = 20;
-        const FENCE_FLOOR: u64 = 30;
-        const HEAD: u64 = 90;
-        const NEXT_VIEW: u32 = 1;
-        let consensus = VsrConsensus::new(1, 0, 3, 0, IggyMessageBus::new(0), LocalPipeline::new());
-        consensus.init();
-        consensus.restore_commit_state(COMMIT_MIN, 40);
-        consensus.sequencer().set_sequence(HEAD);
-        let change = Message::<StartViewChangeHeader>::new(std::mem::size_of::<
-            StartViewChangeHeader,
-        >())
-        .transmute_header(|_, header: &mut StartViewChangeHeader| {
-            header.command = Command::StartViewChange;
-            header.size = u32::try_from(std::mem::size_of::<StartViewChangeHeader>()).unwrap();
-            header.cluster = consensus.cluster();
-            header.replica = 2;
-            header.view = NEXT_VIEW;
-            header.seal();
-        });
-        consensus.handle_start_view_change(PlaneKind::Partitions, change.header());
-        assert_eq!(consensus.status(), Status::ViewChange);
-        let next_primary = consensus.primary_index(NEXT_VIEW);
-        let backup = (0..3)
-            .find(|replica| *replica != next_primary && *replica != consensus.replica())
-            .unwrap();
-        let ceiling = |requester: u8, fenced_floor: Option<u64>| {
-            let request = Message::<RequestPreparesHeader>::new(std::mem::size_of::<
-                RequestPreparesHeader,
-            >())
-            .transmute_header(|_, header: &mut RequestPreparesHeader| {
-                header.command = Command::RequestPrepares;
-                header.cluster = consensus.cluster();
-                header.size = u32::try_from(std::mem::size_of::<RequestPreparesHeader>()).unwrap();
-                header.replica = requester;
-                header.view = NEXT_VIEW;
-                header.from_op = 1;
-                header.to_op = u64::MAX;
-            });
-            fenced_serve_ceiling(
-                repair_serve_ceiling(request.header(), &consensus),
-                fenced_floor,
-            )
-        };
-        assert_eq!(ceiling(next_primary, None), HEAD);
-        // The fence floor counts the recovered commit point, above `commit_min`.
-        assert_eq!(ceiling(next_primary, Some(FENCE_FLOOR)), FENCE_FLOOR);
-        assert_eq!(ceiling(backup, None), COMMIT_MIN);
-        assert_eq!(ceiling(backup, Some(FENCE_FLOOR)), COMMIT_MIN);
     }
 
     #[test]
@@ -13669,7 +13641,7 @@ mod view_coverage_tests {
 mod view_fence_gate_tests {
     //! The gates around the partition view fence, apart from the partition.
 
-    use super::{fenced_serve_ceiling, start_view_may_anchor, view_fence_anchor};
+    use super::{fenced_serve_admits, start_view_may_anchor, view_fence_anchor};
     use consensus::dvc_blank;
     use iggy_binary_protocol::{Command, Operation, PrepareHeader};
 
@@ -13724,10 +13696,11 @@ mod view_fence_gate_tests {
     }
 
     #[test]
-    fn given_a_fenced_server_when_capping_a_repair_should_stop_at_its_commit_point() {
-        assert_eq!(fenced_serve_ceiling(9, None), 9);
-        assert_eq!(fenced_serve_ceiling(9, Some(4)), 4);
-        assert_eq!(fenced_serve_ceiling(3, Some(4)), 3);
+    fn given_a_fenced_server_when_serving_should_admit_only_proven_entries_above_its_floor() {
+        assert!(fenced_serve_admits(None, 9, || false));
+        assert!(fenced_serve_admits(Some(4), 4, || false));
+        assert!(!fenced_serve_admits(Some(4), 5, || false));
+        assert!(fenced_serve_admits(Some(4), 5, || true));
     }
 }
 

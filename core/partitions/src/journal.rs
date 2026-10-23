@@ -203,6 +203,10 @@ where
     /// A resident op follows a higher one, so the next op to flush can sit
     /// behind the front. Flushes wait for `sort_by_op`.
     out_of_order: Cell<bool>,
+    /// `(floor, through)`: every op in `floor + 1..=through` is resident. Repair
+    /// ticks resume the walk from here instead of rescanning the held prefix, and
+    /// any removal resets it.
+    held_run: Cell<(u64, u64)>,
 }
 
 /// How many evicted entries each partition retains for repair. Sized to
@@ -237,6 +241,7 @@ where
             resident_control_ops: Cell::new(0),
             evicted_through: Cell::new(0),
             out_of_order: Cell::new(false),
+            held_run: Cell::new((0, 0)),
         }
     }
 }
@@ -436,22 +441,6 @@ impl PartitionJournal<PartitionJournalMemStorage> {
     /// width of `ops`. Resident entries take precedence over retained repairs.
     #[must_use]
     pub fn repair_headers_in(&self, ops: RangeInclusive<u64>) -> BTreeMap<u64, PrepareHeader> {
-        self.headers_in(ops, false)
-    }
-
-    /// Like [`Self::repair_headers_in`], but the FIRST resident header wins on a
-    /// duplicated op, as in [`Self::committed_headers_from`]: the entry proven is
-    /// the entry the commit walk would apply.
-    #[must_use]
-    pub fn walked_headers_in(&self, ops: RangeInclusive<u64>) -> BTreeMap<u64, PrepareHeader> {
-        self.headers_in(ops, true)
-    }
-
-    fn headers_in(
-        &self,
-        ops: RangeInclusive<u64>,
-        first_wins: bool,
-    ) -> BTreeMap<u64, PrepareHeader> {
         let mut found = BTreeMap::new();
         if ops.is_empty() {
             return found;
@@ -459,11 +448,7 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         {
             let headers = unsafe { &*self.headers.get() };
             for header in headers.iter().filter(|header| ops.contains(&header.op)) {
-                if first_wins {
-                    found.entry(header.op).or_insert(*header);
-                } else {
-                    found.insert(header.op, *header);
-                }
+                found.insert(header.op, *header);
             }
         }
         let ring = unsafe { &*self.evicted_ring.get() };
@@ -839,6 +824,7 @@ where
             resident_control_ops: Cell::new(0),
             evicted_through: Cell::new(0),
             out_of_order: Cell::new(false),
+            held_run: Cell::new((0, 0)),
         }
     }
 
@@ -848,6 +834,7 @@ where
         self.first_header_by_op.borrow_mut().clear();
         unsafe { &mut *self.op_to_storage_offset.get() }.clear();
         unsafe { &mut *self.offset_to_op.get() }.clear();
+        self.held_run.set((0, 0));
         unsafe { &mut *self.timestamp_to_op.get() }.clear();
         self.resident_control_ops.set(0);
         self.out_of_order.set(false);
@@ -914,15 +901,25 @@ where
             return floor;
         }
         let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
-        let mut through = floor;
-        for op in op_to_storage_offset
-            .range(floor + 1..=top)
-            .map(|(op, _)| *op)
-        {
-            if op != through + 1 {
-                break;
+        let (run_floor, run_through) = self.held_run.get();
+        let mut through = if run_floor <= floor && run_through > floor {
+            run_through.min(top)
+        } else {
+            floor
+        };
+        if through < top {
+            for op in op_to_storage_offset
+                .range(through + 1..=top)
+                .map(|(op, _)| *op)
+            {
+                if op != through + 1 {
+                    break;
+                }
+                through = op;
             }
-            through = op;
+        }
+        if through > floor && (run_floor > floor || run_through < through) {
+            self.held_run.set((floor, through));
         }
         through
     }

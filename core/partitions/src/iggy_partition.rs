@@ -9293,25 +9293,22 @@ where
         {
             return Some(ViewWindowVerdict::Hole { op: hole });
         }
-        let present = self
-            .log
-            .journal()
-            .inner
-            .walked_headers_in(floor + 1..=fence.through);
+        let journal = &self.log.journal().inner;
         let verdict = view_window_verdict(floor, fence.through, anchor.parent, |op| {
-            present.get(&op).copied()
+            journal.repair_header(op)
         });
         match verdict {
             ViewWindowVerdict::Proven => {
                 // The WAL flush below reads the last append per op; a duplicate
                 // whose last append is not the entry just proven breaks there.
-                if let Some(op) = present.iter().find_map(|(op, header)| {
-                    let flushed = self.log.journal().inner.repair_entry(*op)?;
+                if let Some(op) = (floor + 1..=fence.through).find_map(|op| {
+                    let header = journal.repair_header(op)?;
+                    let flushed = journal.repair_entry(op)?;
                     let flushed = bytemuck::checked::try_from_bytes::<PrepareHeader>(
                         &flushed.as_slice()[..size_of::<PrepareHeader>()],
                     )
                     .ok()?;
-                    (flushed.checksum != header.checksum).then_some(*op)
+                    (flushed.checksum != header.checksum).then_some(op)
                 }) {
                     self.drop_unproven_from(op).await;
                     return Some(ViewWindowVerdict::Break { op });

@@ -50,7 +50,6 @@ type Acked = Arc<Mutex<HashMap<u32, HashSet<String>>>>;
 
 #[derive(Default)]
 struct Counters {
-    acked_batches: AtomicUsize,
     send_errors: AtomicUsize,
     unacked_batches: AtomicUsize,
     max_latency_ms: AtomicU64,
@@ -214,7 +213,6 @@ async fn produce(
                     counters
                         .max_latency_ms
                         .fetch_max(latency, Ordering::Relaxed);
-                    counters.acked_batches.fetch_add(1, Ordering::Relaxed);
                     acked
                         .lock()
                         .await
