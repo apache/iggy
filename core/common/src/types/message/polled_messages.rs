@@ -18,7 +18,9 @@
 use crate::{IggyMessage, IggyMessageHeader, error::IggyError};
 use bytes::Bytes;
 use iggy_binary_protocol::WireDecode;
-use iggy_binary_protocol::batch::{BATCH_HEADER_SIZE, BatchHeader, BatchMessageHeader};
+use iggy_binary_protocol::batch::{
+    BATCH_HEADER_SIZE, BATCH_MESSAGE_HEADER_SIZE, BatchHeader, BatchMessageHeader,
+};
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_binary_protocol::responses::messages::PollMessagesResponseHeader;
 use serde::{Deserialize, Serialize};
@@ -67,7 +69,8 @@ impl PolledMessages {
     ///
     /// # Errors
     /// [`IggyError::InvalidNumberEncoding`] on a short prefix;
-    /// [`IggyError::InvalidMessagePayloadLength`] on a malformed record.
+    /// [`IggyError::InvalidMessagePayloadLength`] on a malformed record;
+    /// [`IggyError::InvalidMessagesCount`] when the records hold another count than the prefix.
     pub fn from_bytes(bytes: Bytes) -> Result<Self, IggyError> {
         let (header, consumed) = PollMessagesResponseHeader::decode(&bytes)
             .map_err(|_| IggyError::InvalidNumberEncoding)?;
@@ -93,9 +96,10 @@ impl PolledMessages {
 /// values. Payload and user-header `Bytes` are zero-copy slices of the
 /// response buffer.
 fn messages_from_batches(buffer: Bytes, count: u32) -> Result<Vec<IggyMessage>, IggyError> {
-    let mut messages = Vec::with_capacity(
-        (count as usize).min(buffer.len() / iggy_binary_protocol::batch::BATCH_MESSAGE_HEADER_SIZE),
-    );
+    if count as usize > buffer.len() / BATCH_MESSAGE_HEADER_SIZE {
+        return Err(IggyError::InvalidMessagesCount);
+    }
+    let mut messages = Vec::with_capacity(count as usize);
     let mut position = 0usize;
     while position < buffer.len() {
         let batch = BatchHeader::decode(&buffer[position..]).map_err(|decode_error| {
@@ -138,6 +142,9 @@ fn messages_from_batches(buffer: Bytes, count: u32) -> Result<Vec<IggyMessage>, 
             } else {
                 None
             };
+            if messages.len() == count as usize {
+                return Err(IggyError::InvalidMessagesCount);
+            }
             messages.push(IggyMessage {
                 header,
                 payload,
@@ -149,7 +156,28 @@ fn messages_from_batches(buffer: Bytes, count: u32) -> Result<Vec<IggyMessage>, 
     }
 
     if messages.len() != count as usize {
-        return Err(IggyError::InvalidMessagePayloadLength);
+        return Err(IggyError::InvalidMessagesCount);
     }
     Ok(messages)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iggy_binary_protocol::WireEncode;
+
+    #[test]
+    fn rejects_impossible_count_before_allocating_messages() {
+        let prefix = PollMessagesResponseHeader {
+            partition_id: 0,
+            current_offset: 0,
+            messages_count: u32::MAX,
+            context: PartitionContext::default(),
+        }
+        .to_bytes();
+        assert!(matches!(
+            PolledMessages::from_bytes(prefix),
+            Err(IggyError::InvalidMessagesCount)
+        ));
+    }
 }

@@ -28,6 +28,7 @@ pub struct BenchmarkConsumerConfig {
     pub messages_per_batch: BenchmarkNumericParameter,
     pub warmup_time: IggyDuration,
     pub polling_kind: PollingKind,
+    pub poll_options: DeferredPollOptions,
     pub origin_timestamp_latency_calculation: bool,
     pub pretty: bool,
 }

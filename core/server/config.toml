@@ -794,6 +794,22 @@ reply_inbox_capacity = 1024
 # separate capacity. This limits operation count, not retained message bytes.
 poll_completion_capacity = 1024
 
+# Longest wait of a deferred poll or readiness wait (at most 10 minutes). A
+# longer requested wait is shortened to it.
+deferred_poll_max_wait = "30 s"
+# Deferred polls and readiness waits parked on one shard, and the part of
+# them that one session may hold. An HTTP request without a binary session
+# counts against its user. A request above either limit is refused with a
+# retryable error.
+deferred_poll_max_pending = 1024
+deferred_poll_max_pending_per_session = 64
+# Disk bytes that one deferred poll reserves for its read, and that the
+# deferred reads of one shard reserve together (at most 1 GiB). A read that
+# finds no room waits for one. A reply carries no more than the first value,
+# unless its first message alone is wider.
+deferred_poll_max_read_bytes = "16 MiB"
+deferred_poll_max_inflight_bytes = "64 MiB"
+
 # Active partition file jobs plus results awaiting owner acceptance per shard (1..=256).
 # Exhausting either limit queues partition file work until capacity is released.
 # Running jobs use [cluster] superblock_wedged_fatal_timeout, counted in pump ticks.

@@ -414,6 +414,67 @@ Current pages need the parent groups of every selected group, for example `TOPIC
 
 A cursor's `toString()` is its `mc1_` text, which `MetadataChangeCursor.parse` reads back, so a mirror can store it. A query the rules refuse fails with an `IggyValidationException` for invalid command before anything is sent, and a record of a kind this SDK does not know arrives as `MetadataChangeBody.Unknown` or `MetadataChangeBody.UnknownJson`.
 
+## Polling
+
+`pollMessages` returns whatever the server already holds. An empty topic answers
+at once, so the caller has to poll again.
+
+`pollMessagesDeferred` lets the server hold the request instead. It waits up to
+`maxWait` for `minCount` messages, caps the encoded response at `maxBytes`, and
+bounds the whole call by `requestTimeout`.
+
+```java
+import org.apache.iggy.message.DeferredPollOptions;
+
+// Defaults: 1 s wait, 1 message, 1 MiB, 11 s budget.
+var options = DeferredPollOptions.defaults()
+    .withMaxWait(Duration.ofSeconds(5))
+    .withMinCount(10);
+
+var polled = client.messages().pollMessagesDeferred(
+    streamId, topicId, Optional.of(0L), Consumer.of(1L),
+    PollingStrategy.next(), 100L, false, options);
+```
+
+If the readiness wait expires, the server still answers, with a partial batch or
+an empty one. If the request timeout expires, the call fails.
+
+The TCP client multiplexes deferred polls with other requests on its shared
+connections and routes them to the partition primary. Up to 64 deferred polls
+can be in flight per client; further polls wait for a slot in arrival order,
+within their original request timeout. A poll that expires before getting a
+slot fails with the retryable `TRANSIENT_NOT_ACCEPTED`. Queued and active
+requests share the client's 4096 pending request limit.
+Each TCP attempt uses the time remaining before the original call deadline,
+including time spent waiting for a slot, routing, or retrying. A server capacity
+refusal (`DEFERRED_POLL_CAPACITY_EXCEEDED`) backs off without discarding the
+cached partition route.
+The HTTP client accepts a plain consumer only,
+because the server refuses a consumer group over HTTP: without a persistent
+connection the client cannot follow the group's partition assignment.
+Deferred HTTP polls use a separate pool of up to 64 connections. A timeout or
+transport failure before the request can be sent reports `IggyServerException`
+with `TRANSIENT_NOT_ACCEPTED` (58). Once sending starts, those failures report
+`TRANSIENT_NOT_COMMITTED` (57), because the server may already have advanced the
+offset. The original failure is available as the cause. The client retries only
+definite non-admission, including `DEFERRED_POLL_CAPACITY_EXCEEDED` (90), within
+the original request timeout.
+
+A parked `Next` or auto-commit poll does not block sends to its partition.
+Polls that advance progress share a separate partition lane with offset reads,
+stores, and deletes. Stores and deletes also take the mutation lane, after their
+progress turn. A retained uncertain store or delete blocks later progress calls
+until it is resolved or abandoned; an active replay keeps its lanes until it
+finishes. Consumers on the same partition share this ordering, including when
+they name a consumer group by different aliases.
+
+Cancelling a TCP deferred poll sends a per-request cancellation on the same
+authenticated connection. This stops a poll still waiting for readiness;
+cancellation can race an offset update that the server has already accepted.
+With auto-commit, a lost or timed-out reply can leave the stored offset advanced
+without delivering its messages to the caller. Use manual offset commits after
+processing when those messages must remain available for another attempt.
+
 ## Exception Handling
 
 The SDK's custom exception types inherit from `IggyException`. When you join a failed future, the cause can come back inside a `CompletionException`. The HTTP client's `close()` method declares `IOException`. Handle these two boundaries as well as the specific SDK errors.

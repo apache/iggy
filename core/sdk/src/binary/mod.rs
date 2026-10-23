@@ -138,6 +138,24 @@ macro_rules! impl_binary_client {
                 self.driver.poll(request, context).await
             }
 
+            async fn send_wait_with_response(
+                &self,
+                request: &iggy_binary_protocol::requests::messages::WaitForMessagesRequest,
+            ) -> Result<bytes::Bytes, iggy_common::IggyError> {
+                self.driver.wait_for_messages(request).await
+            }
+
+            async fn send_poll_with_response_and_options(
+                &self,
+                request: &iggy_binary_protocol::requests::messages::PollMessagesRequest,
+                context: Option<iggy_common::PartitionContext>,
+                options: Option<iggy_common::DeferredPollOptions>,
+            ) -> Result<bytes::Bytes, iggy_common::IggyError> {
+                self.driver
+                    .poll_with_options(request, context, options)
+                    .await
+            }
+
             fn routed_partition_count(
                 &self,
                 stream_id: &iggy_common::Identifier,

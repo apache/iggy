@@ -112,7 +112,15 @@ impl QuicLink {
                 return Err(IggyError::Disconnected);
             }
         }
-        let reply = match timeout_at(deadline, recv.read_to_end(self.response_buffer_size)).await {
+        let response_limit =
+            frame
+                .response_body_limit()
+                .map_or(self.response_buffer_size, |limit| {
+                    limit
+                        .saturating_add(iggy_binary_protocol::HEADER_SIZE)
+                        .min(self.response_buffer_size)
+                });
+        let reply = match timeout_at(deadline, recv.read_to_end(response_limit)).await {
             Ok(Ok(reply)) => reply,
             Ok(Err(error)) => {
                 error!(

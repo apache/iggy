@@ -183,9 +183,10 @@ pub(in crate::http) type HttpState = SendWrapper<Rc<HttpInner>>;
 /// (pinned-cert TLS when the listener serves HTTPS), the scheme it dials, the
 /// request-body buffer bound, the key that proves a relay comes from a node,
 /// the budget of the relays this node sends, and the separate budget of the
-/// relays it serves as their hop target. Built by
-/// `http::forward::build_forward_state`; lives here so the state hub never
-/// imports the forwarding middleware.
+/// relays it serves as their hop target. A relayed deferred poll holds its
+/// slots for its whole wait, so it takes them from a second pair of budgets.
+/// Built by `http::forward::build_forward_state`; lives here so the state hub
+/// never imports the forwarding middleware.
 pub(in crate::http) struct ForwardState {
     /// Derived from the cluster-wide bearer key material, so `None` when none
     /// exists (no configured JWT secret, no cluster PSK). Then forwarding is
@@ -197,7 +198,9 @@ pub(in crate::http) struct ForwardState {
     pub(in crate::http) scheme: &'static str,
     pub(in crate::http) body_limit: usize,
     pub(in crate::http) in_flight: Rc<Cell<u32>>,
+    pub(in crate::http) deferred_in_flight: Rc<Cell<u32>>,
     pub(in crate::http) relay_targets: RelayTargets,
+    pub(in crate::http) deferred_relay_targets: RelayTargets,
     pub(in crate::http) floor_reads: FloorReads,
 }
 

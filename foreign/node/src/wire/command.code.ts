@@ -48,6 +48,9 @@ export const COMMAND_CODE = {
   SendMessages: 101,
   // 103 and 104 are retired and must never be reused.
   GetPartitionRoute: 105,
+  PollMessagesDeferred: 106,
+  WaitForMessages: 107,
+  CancelDeferredRequest: 108,
   GetOffset: 120,
   StoreOffset: 121,
   DeleteConsumerOffset: 122,

@@ -93,7 +93,6 @@ stream = "example_stream"
 topics = ["example_topic"]
 schema = "json"
 batch_length = 100
-poll_interval = "5ms"
 consumer_group = "stdout_sink_connector"
 
 # Custom configuration for the sink connector, deserialized to type T from `plugin_config` field

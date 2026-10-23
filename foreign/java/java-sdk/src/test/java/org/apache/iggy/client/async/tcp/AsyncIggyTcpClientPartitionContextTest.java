@@ -29,18 +29,24 @@ import org.apache.iggy.exception.IggyOperationException;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.DeferredPollOptions;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.message.SendMessagesResponse;
 import org.apache.iggy.partition.PartitionContext;
+import org.apache.iggy.serde.CommandCode;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 import java.io.IOException;
 import java.math.BigInteger;
 import java.net.InetAddress;
 import java.net.ServerSocket;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.time.Duration;
 import java.util.List;
 import java.util.Optional;
@@ -86,6 +92,8 @@ class AsyncIggyTcpClientPartitionContextTest {
     private static final int LIFECYCLE_BUSY = IggyErrorCode.LIFECYCLE_BUSY.getCode();
     private static final int PARTITION_NOT_OWNED = 5009;
     private static final int ASSIGNED_PARTITION = 7;
+    private static final int DEFERRED_PARAMETERS_BYTES = 2 * Long.BYTES + 2 * Integer.BYTES;
+    private static final int RESYNC_REQUIRED_PARTITION = -1;
     // An offset write status of the fake primary: the write is stored.
     private static final int STORED = 0;
     private static final long ROUTE_INCARNATION = 1;
@@ -530,6 +538,149 @@ class AsyncIggyTcpClientPartitionContextTest {
                 assertThat(stamped)
                         .containsExactly(
                                 CALLER_CONTEXT, routeContext(ROUTE_INCARNATION), routeContext(ROUTE_INCARNATION));
+            } finally {
+                client.close().get(5, TimeUnit.SECONDS);
+            }
+            coordinator.get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(
+            value = IggyErrorCode.class,
+            names = {"TRANSIENT_NOT_ACCEPTED", "NOT_PRIMARY", "DEFERRED_POLL_CAPACITY_EXCEEDED"})
+    void shouldReduceDeferredRetryBudgetsWithoutChangingIdentity(IggyErrorCode refusal) throws Exception {
+        for (boolean progress : new boolean[] {false, true}) {
+            InetAddress loopback = InetAddress.getLoopbackAddress();
+            try (ServerSocket coordinatorSocket = new ServerSocket(0, 4, loopback)) {
+                AtomicInteger routes = new AtomicInteger();
+                List<Request> polls = new CopyOnWriteArrayList<>();
+                CompletableFuture<Void> coordinator = serve(coordinatorSocket, request -> {
+                    if (request.operation() == OPERATION_REGISTER) {
+                        return Response.success(OPERATION_REGISTER, registerBody(1));
+                    }
+                    if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                        return Response.success(
+                                OPERATION_NON_REPLICATED, singleNodeMetadata(coordinatorSocket.getLocalPort()));
+                    }
+                    if (request.is(GET_PARTITION_ROUTE_CODE, OPERATION_NON_REPLICATED)) {
+                        routes.incrementAndGet();
+                        return Response.success(
+                                OPERATION_NON_REPLICATED,
+                                pollRoute(request, 1, 1, coordinatorSocket.getLocalPort(), ROUTE_INCARNATION)
+                                        .setIntLE(2 * Long.BYTES, routes.get() - 1));
+                    }
+                    if (request.is(CommandCode.Messages.POLL_DEFERRED.getValue(), OPERATION_NON_REPLICATED)) {
+                        polls.add(request);
+                        return polls.size() == 1
+                                ? Response.error(OPERATION_NON_REPLICATED, refusal.getCode())
+                                : Response.success(OPERATION_NON_REPLICATED, emptyPoll(0));
+                    }
+                    throw new IllegalStateException("Unexpected coordinator request: " + request);
+                });
+                AsyncIggyTcpClient client = client(coordinatorSocket);
+                var options = DeferredPollOptions.defaults();
+                try {
+                    client.connect().get(5, TimeUnit.SECONDS);
+                    client.login().get(5, TimeUnit.SECONDS);
+                    client.messages()
+                            .pollMessagesDeferred(
+                                    StreamId.of(1L),
+                                    TopicId.of(1L),
+                                    Optional.of(0L),
+                                    Consumer.of(7L),
+                                    PollingStrategy.offset(BigInteger.ZERO),
+                                    1L,
+                                    progress,
+                                    options)
+                            .get(5, TimeUnit.SECONDS);
+                    assertThat(polls).hasSize(2);
+                    Request first = polls.get(0);
+                    Request second = polls.get(1);
+                    assertThat(second.requestId()).isEqualTo(first.requestId());
+                    assertThat(second.clientLow()).isEqualTo(first.clientLow());
+                    assertThat(second.clientHigh()).isEqualTo(first.clientHigh());
+                    assertThat(stampedContext(second)).isEqualTo(stampedContext(first));
+                    ByteBuffer firstBody = ByteBuffer.wrap(first.body()).order(ByteOrder.LITTLE_ENDIAN);
+                    ByteBuffer secondBody = ByteBuffer.wrap(second.body()).order(ByteOrder.LITTLE_ENDIAN);
+                    long firstWait = firstBody.getLong(firstBody.limit() - DEFERRED_PARAMETERS_BYTES);
+                    long secondWait = secondBody.getLong(secondBody.limit() - DEFERRED_PARAMETERS_BYTES);
+                    long firstBudget = firstBody.getLong(firstBody.limit() - Long.BYTES);
+                    long secondBudget = secondBody.getLong(secondBody.limit() - Long.BYTES);
+                    assertThat(secondWait).isLessThan(firstWait);
+                    assertThat(secondBudget).isLessThan(firstBudget);
+                    assertThat(secondBudget - secondWait)
+                            .isEqualTo(options.requestTimeoutMicros() - options.maxWaitMicros());
+                    assertThat(routes).hasValue(refusal == IggyErrorCode.DEFERRED_POLL_CAPACITY_EXCEEDED ? 1 : 2);
+                } finally {
+                    client.close().get(5, TimeUnit.SECONDS);
+                }
+                coordinator.get(5, TimeUnit.SECONDS);
+            }
+        }
+    }
+
+    @Test
+    void shouldReduceDeferredPollBudgetsWhenAGroupResyncStartsAnotherAttempt() throws Exception {
+        InetAddress loopback = InetAddress.getLoopbackAddress();
+        try (ServerSocket coordinatorSocket = new ServerSocket(0, 4, loopback)) {
+            AtomicInteger syncs = new AtomicInteger();
+            List<Long> waits = new CopyOnWriteArrayList<>();
+            List<Long> budgets = new CopyOnWriteArrayList<>();
+            CompletableFuture<Void> coordinator = serve(coordinatorSocket, request -> {
+                if (request.operation() == OPERATION_REGISTER) {
+                    return Response.success(OPERATION_REGISTER, registerBody(1));
+                }
+                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(
+                            OPERATION_NON_REPLICATED, singleNodeMetadata(coordinatorSocket.getLocalPort()));
+                }
+                if (request.is(GROUP_SYNC_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(
+                            OPERATION_NON_REPLICATED,
+                            Unpooled.buffer()
+                                    .writeLongLE(syncs.incrementAndGet())
+                                    .writeIntLE(1)
+                                    .writeIntLE(0));
+                }
+                if (request.is(GET_PARTITION_ROUTE_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(
+                            OPERATION_NON_REPLICATED,
+                            pollRoute(request, 1, 1, coordinatorSocket.getLocalPort(), ROUTE_INCARNATION));
+                }
+                if (request.is(CommandCode.Messages.POLL_DEFERRED.getValue(), OPERATION_NON_REPLICATED)) {
+                    ByteBuffer body = ByteBuffer.wrap(request.body()).order(ByteOrder.LITTLE_ENDIAN);
+                    waits.add(body.getLong(body.limit() - DEFERRED_PARAMETERS_BYTES));
+                    budgets.add(body.getLong(body.limit() - Long.BYTES));
+                    return Response.success(
+                            OPERATION_NON_REPLICATED, emptyPoll(waits.size() == 1 ? RESYNC_REQUIRED_PARTITION : 0));
+                }
+                throw new IllegalStateException("Unexpected coordinator request: " + request);
+            });
+            AsyncIggyTcpClient client = client(coordinatorSocket);
+            var options = DeferredPollOptions.defaults();
+            try {
+                client.connect().get(5, TimeUnit.SECONDS);
+                client.login().get(5, TimeUnit.SECONDS);
+                client.messages()
+                        .pollMessagesDeferred(
+                                StreamId.of(1L),
+                                TopicId.of(1L),
+                                Optional.empty(),
+                                Consumer.group(ConsumerId.of(7L)),
+                                PollingStrategy.next(),
+                                1L,
+                                false,
+                                options)
+                        .get(5, TimeUnit.SECONDS);
+                assertThat(syncs).hasValue(2);
+                assertThat(waits).hasSize(2);
+                assertThat(waits.get(0)).isLessThan(options.maxWaitMicros());
+                assertThat(waits.get(1)).isLessThan(waits.get(0));
+                assertThat(budgets.get(1)).isLessThan(budgets.get(0));
+                assertThat(budgets.get(0) - waits.get(0))
+                        .isEqualTo(options.requestTimeoutMicros() - options.maxWaitMicros());
+                assertThat(budgets.get(1) - waits.get(1)).isEqualTo(budgets.get(0) - waits.get(0));
             } finally {
                 client.close().get(5, TimeUnit.SECONDS);
             }

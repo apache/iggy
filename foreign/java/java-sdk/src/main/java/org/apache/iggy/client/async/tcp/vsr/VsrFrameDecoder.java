@@ -25,6 +25,7 @@ import io.netty.handler.codec.ByteToMessageDecoder;
 import io.netty.handler.codec.DecoderException;
 
 import java.util.List;
+import java.util.function.LongUnaryOperator;
 
 /**
  * Decoder for VSR response frames: a 256-byte consensus header whose total
@@ -37,17 +38,32 @@ public class VsrFrameDecoder extends ByteToMessageDecoder {
     public static final int DEFAULT_MAX_FRAME_SIZE = 64 * 1024 * 1024;
 
     private final int maxFrameSize;
+    private final LongUnaryOperator requestLimit;
 
     public VsrFrameDecoder() {
         this(DEFAULT_MAX_FRAME_SIZE);
     }
 
     public VsrFrameDecoder(int maxFrameSize) {
+        this(maxFrameSize, ignored -> maxFrameSize);
+    }
+
+    /**
+     * A deferred poll declares how many response bytes it will accept, and that
+     * bound has to reach the decoder before it accumulates a body, not after.
+     * The limit is looked up per frame by its request id, so one exchange can
+     * tighten it while the connection's other replies keep the ceiling.
+     *
+     * @param maxFrameSize the connection's frame ceiling, never below the header size
+     * @param requestLimit the frame limit of the request a reply answers
+     */
+    public VsrFrameDecoder(int maxFrameSize, LongUnaryOperator requestLimit) {
         if (maxFrameSize < VsrHeaders.HEADER_SIZE) {
             throw new IllegalArgumentException(
                     "Maximum VSR frame size must be at least " + VsrHeaders.HEADER_SIZE + " bytes");
         }
         this.maxFrameSize = maxFrameSize;
+        this.requestLimit = requestLimit;
     }
 
     @Override
@@ -56,7 +72,8 @@ public class VsrFrameDecoder extends ByteToMessageDecoder {
             return;
         }
         long totalSize = VsrHeaders.readSize(in);
-        if (totalSize < VsrHeaders.HEADER_SIZE || totalSize > maxFrameSize) {
+        if (totalSize < VsrHeaders.HEADER_SIZE
+                || totalSize > Math.min(maxFrameSize, requestLimit.applyAsLong(VsrHeaders.readReplyRequestId(in)))) {
             throw new DecoderException("Invalid VSR frame size " + totalSize + ", connection is desynchronized");
         }
         if (in.readableBytes() < totalSize) {

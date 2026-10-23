@@ -238,6 +238,8 @@ final class RawCommandTest extends TestCase
             $arguments = array_replace($methods['consumerGroup'][0], [$field => 4294967296]);
             assert_throws(static fn () => $client->consumerGroup(...$arguments), $field);
         }
+        $arguments = array_replace($methods['consumerGroup'][0], ['poll_interval_micros' => 1_000]);
+        assert_throws(static fn () => $client->consumerGroup(...$arguments), 'poll_interval_micros');
         $arguments = array_replace($methods['createTopic'][0], ['messages_required_to_save' => 4294967296]);
         assert_throws(static fn () => $client->createTopic(...$arguments), 'messages_required_to_save');
     }

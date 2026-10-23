@@ -15,9 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::clients::consumer::{AutoCommit, AutoCommitWhen};
+use crate::clients::consumer::AutoCommit;
+use crate::clients::consumer::deferred::DEFAULT_PREFETCH_BYTES;
 use crate::prelude::{
-    ConsumerKind, EncryptorKind, Identifier, IggyDuration, IggyError, NonZeroIggyDuration,
+    ConsumerKind, DeferredPollOptions, EncryptorKind, Identifier, IggyError, NonZeroIggyDuration,
     PollingStrategy, Validatable,
 };
 use bon::Builder;
@@ -35,10 +36,17 @@ pub struct IggyConsumerConfig {
     /// Name of the topic. Must be unique.
     topic_name: String,
     /// The auto-commit configuration for storing the message offset on the server. See  `AutoCommit` for details.
+    #[builder(default = AutoCommit::Disabled)]
     auto_commit: AutoCommit,
     /// The max number of messages to poll in a batch. The greater the batch length, the higher the throughput for bulk data.
     /// Note, there is a tradeoff between batch size and latency, so you want to benchmark your setup.
     batch_length: u32,
+    /// Maximum encoded bytes reserved for buffered and in-flight batches.
+    #[builder(default = DEFAULT_PREFETCH_BYTES)]
+    prefetch_bytes: u32,
+    /// Maximum messages reserved for buffered and in-flight batches. Defaults to 16,000, or
+    /// `batch_length` when that is larger.
+    prefetch_messages: Option<u32>,
     /// Create the stream if it doesn't exist.
     create_stream_if_not_exists: bool,
     /// Create the topic if it doesn't exist.
@@ -53,9 +61,11 @@ pub struct IggyConsumerConfig {
     /// Partition ID for an ordinary consumer. Defaults to 0 and is ignored by consumer groups.
     #[builder(default = DEFAULT_PARTITION_ID)]
     partition_id: u32,
-    /// The polling interval for messages.
-    polling_interval: IggyDuration,
+    /// Readiness, response size and request timeout limits.
+    #[builder(default)]
+    poll_options: DeferredPollOptions,
     /// `PollingStrategy` specifies from where to start polling messages. See `PollingStrategy` for details.
+    #[builder(default = PollingStrategy::next())]
     polling_strategy: PollingStrategy,
     /// Sets the polling retry interval in case of server disconnection.
     polling_retry_interval: NonZeroIggyDuration,
@@ -73,14 +83,16 @@ impl Default for IggyConsumerConfig {
         Self {
             stream_name: "test_stream".to_string(),
             topic_name: "test_topic".to_string(),
-            auto_commit: AutoCommit::When(AutoCommitWhen::PollingMessages),
+            auto_commit: AutoCommit::Disabled,
             batch_length: 100,
+            prefetch_bytes: DEFAULT_PREFETCH_BYTES,
+            prefetch_messages: None,
             create_stream_if_not_exists: false,
             create_topic_if_not_exists: false,
             consumer_name: "test_consumer".to_string(),
             consumer_kind: ConsumerKind::ConsumerGroup,
-            polling_interval: IggyDuration::from_str("5ms").unwrap(),
-            polling_strategy: PollingStrategy::last(),
+            poll_options: DeferredPollOptions::default(),
+            polling_strategy: PollingStrategy::next(),
             partitions_count: 1,
             partition_id: DEFAULT_PARTITION_ID,
             encryptor: None,
@@ -104,7 +116,7 @@ impl IggyConsumerConfig {
     /// * `create_topic_if_not_exists` - Whether to create the topic if it does not exists.
     /// * `consumer_name` - The consumer name.
     /// * `consumer_kind` - The consumer kind.
-    /// * `polling_interval` - The interval between polling for new messages.
+    /// * `poll_options` - Readiness, response size and request timeout limits.
     /// * `polling_strategy` - The polling strategy.
     /// * `partitions_count` - Topic creation count.
     /// * `encryptor` - The encryptor.
@@ -128,7 +140,7 @@ impl IggyConsumerConfig {
         create_topic_if_not_exists: bool,
         consumer_name: String,
         consumer_kind: ConsumerKind,
-        polling_interval: IggyDuration,
+        poll_options: DeferredPollOptions,
         polling_strategy: PollingStrategy,
         partitions_count: u32,
         encryptor: Option<Arc<EncryptorKind>>,
@@ -141,11 +153,13 @@ impl IggyConsumerConfig {
             topic_name,
             auto_commit,
             batch_length,
+            prefetch_bytes: DEFAULT_PREFETCH_BYTES,
+            prefetch_messages: None,
             create_stream_if_not_exists,
             create_topic_if_not_exists,
             consumer_name,
             consumer_kind,
-            polling_interval,
+            poll_options,
             polling_strategy,
             partitions_count,
             partition_id: DEFAULT_PARTITION_ID,
@@ -163,7 +177,7 @@ impl IggyConsumerConfig {
     /// * `stream` - The stream name.
     /// * `topic` - The topic name.
     /// * `batch_length` - The max number of messages to poll in a batch.
-    /// * `polling_interval` - The interval between polling for new messages.
+    /// * `poll_options` - Readiness, response size and request timeout limits.
     ///
     /// Returns:
     /// A new `IggyConsumerConfig`.
@@ -172,7 +186,7 @@ impl IggyConsumerConfig {
         stream: &str,
         topic: &str,
         batch_length: u32,
-        polling_interval: IggyDuration,
+        poll_options: DeferredPollOptions,
     ) -> Result<Self, IggyError> {
         // Validate stream and topic names. Returns IggyError if names are not allowed.
         Identifier::named(stream)?;
@@ -181,14 +195,16 @@ impl IggyConsumerConfig {
         Ok(Self {
             stream_name: stream.to_string(),
             topic_name: topic.to_string(),
-            auto_commit: AutoCommit::When(AutoCommitWhen::PollingMessages),
+            auto_commit: AutoCommit::Disabled,
             batch_length,
+            prefetch_bytes: DEFAULT_PREFETCH_BYTES,
+            prefetch_messages: None,
             create_stream_if_not_exists: false,
             create_topic_if_not_exists: false,
             consumer_name: format!("consumer-{stream}-{topic}"),
             consumer_kind: ConsumerKind::ConsumerGroup,
-            polling_interval,
-            polling_strategy: PollingStrategy::last(),
+            poll_options,
+            polling_strategy: PollingStrategy::next(),
             partitions_count: 1,
             partition_id: DEFAULT_PARTITION_ID,
             encryptor: None,
@@ -218,6 +234,14 @@ impl IggyConsumerConfig {
         self.auto_commit
     }
 
+    pub fn prefetch_bytes(&self) -> u32 {
+        self.prefetch_bytes
+    }
+
+    pub fn prefetch_messages(&self) -> Option<u32> {
+        self.prefetch_messages
+    }
+
     pub fn batch_length(&self) -> u32 {
         self.batch_length
     }
@@ -237,8 +261,8 @@ impl IggyConsumerConfig {
         self.consumer_kind
     }
 
-    pub fn polling_interval(&self) -> IggyDuration {
-        self.polling_interval
+    pub fn poll_options(&self) -> DeferredPollOptions {
+        self.poll_options
     }
 
     pub fn polling_strategy(&self) -> PollingStrategy {
@@ -315,14 +339,11 @@ mod tests {
         let config = IggyConsumerConfig::builder()
             .stream_name("test_stream".to_string())
             .topic_name("test_topic".to_string())
-            .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
             .batch_length(100)
             .create_stream_if_not_exists(true)
             .create_topic_if_not_exists(true)
             .consumer_name("test_consumer".to_string())
             .consumer_kind(ConsumerKind::ConsumerGroup)
-            .polling_interval(IggyDuration::from_str("5ms").unwrap())
-            .polling_strategy(PollingStrategy::last())
             .polling_retry_interval(NonZeroIggyDuration::ONE_SECOND)
             .partitions_count(1)
             .init_retries(3)
@@ -331,20 +352,14 @@ mod tests {
 
         assert_eq!(config.stream_name(), "test_stream");
         assert_eq!(config.topic_name(), "test_topic");
-        assert_eq!(
-            config.auto_commit(),
-            AutoCommit::When(AutoCommitWhen::PollingMessages)
-        );
+        assert_eq!(config.auto_commit(), AutoCommit::Disabled);
         assert_eq!(config.batch_length(), 100);
         assert!(config.create_stream_if_not_exists());
         assert!(config.create_topic_if_not_exists());
         assert_eq!(config.consumer_name(), "test_consumer");
         assert_eq!(config.consumer_kind(), ConsumerKind::ConsumerGroup);
-        assert_eq!(
-            config.polling_interval(),
-            IggyDuration::from_str("5ms").unwrap()
-        );
-        assert_eq!(config.polling_strategy(), PollingStrategy::last());
+        assert_eq!(config.poll_options(), DeferredPollOptions::default());
+        assert_eq!(config.polling_strategy(), PollingStrategy::next());
         assert_eq!(config.partitions_count(), 1);
 
         assert_eq!(
@@ -364,20 +379,14 @@ mod tests {
         let config = IggyConsumerConfig::default();
         assert_eq!(config.stream_name(), "test_stream");
         assert_eq!(config.topic_name(), "test_topic");
-        assert_eq!(
-            config.auto_commit(),
-            AutoCommit::When(AutoCommitWhen::PollingMessages)
-        );
+        assert_eq!(config.auto_commit(), AutoCommit::Disabled);
         assert_eq!(config.batch_length(), 100);
         assert!(!config.create_stream_if_not_exists());
         assert!(!config.create_topic_if_not_exists());
         assert_eq!(config.consumer_name(), "test_consumer");
         assert_eq!(config.consumer_kind(), ConsumerKind::ConsumerGroup);
-        assert_eq!(
-            config.polling_interval(),
-            IggyDuration::from_str("5ms").unwrap()
-        );
-        assert_eq!(config.polling_strategy(), PollingStrategy::last());
+        assert_eq!(config.poll_options(), DeferredPollOptions::default());
+        assert_eq!(config.polling_strategy(), PollingStrategy::next());
         assert_eq!(config.partitions_count(), 1);
 
         assert_eq!(
@@ -396,13 +405,13 @@ mod tests {
         let config = IggyConsumerConfig::new(
             "test_stream".to_string(),
             "test_topic".to_string(),
-            AutoCommit::When(AutoCommitWhen::PollingMessages),
+            AutoCommit::Disabled,
             100,
             false,
             false,
             "test_consumer".to_string(),
             ConsumerKind::ConsumerGroup,
-            IggyDuration::from_str("5ms").unwrap(),
+            DeferredPollOptions::default(),
             PollingStrategy::last(),
             1,
             None,
@@ -412,19 +421,13 @@ mod tests {
         );
         assert_eq!(config.stream_name(), "test_stream");
         assert_eq!(config.topic_name(), "test_topic");
-        assert_eq!(
-            config.auto_commit(),
-            AutoCommit::When(AutoCommitWhen::PollingMessages)
-        );
+        assert_eq!(config.auto_commit(), AutoCommit::Disabled);
         assert_eq!(config.batch_length(), 100);
         assert!(!config.create_stream_if_not_exists());
         assert!(!config.create_topic_if_not_exists());
         assert_eq!(config.consumer_name(), "test_consumer");
         assert_eq!(config.consumer_kind(), ConsumerKind::ConsumerGroup);
-        assert_eq!(
-            config.polling_interval(),
-            IggyDuration::from_str("5ms").unwrap()
-        );
+        assert_eq!(config.poll_options(), DeferredPollOptions::default());
         assert_eq!(config.polling_strategy(), PollingStrategy::last());
         assert_eq!(config.partitions_count(), 1);
 
@@ -445,7 +448,7 @@ mod tests {
             "test_stream",
             "test_topic",
             100,
-            IggyDuration::from_str("5ms").unwrap(),
+            DeferredPollOptions::default(),
         );
         assert!(res.is_ok());
         let config = res.unwrap();
@@ -457,11 +460,8 @@ mod tests {
         assert!(!config.create_topic_if_not_exists());
         assert_eq!(config.consumer_name(), "consumer-test_stream-test_topic");
         assert_eq!(config.consumer_kind(), ConsumerKind::ConsumerGroup);
-        assert_eq!(
-            config.polling_interval(),
-            IggyDuration::from_str("5ms").unwrap()
-        );
-        assert_eq!(config.polling_strategy(), PollingStrategy::last());
+        assert_eq!(config.poll_options(), DeferredPollOptions::default());
+        assert_eq!(config.polling_strategy(), PollingStrategy::next());
         assert_eq!(config.partitions_count(), 1);
     }
 }

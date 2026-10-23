@@ -211,14 +211,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let mut consumer = client
         .consumer_group(CONSUMER_GROUP, STREAM, TOPIC)?
-        .auto_commit(AutoCommit::IntervalOrWhen(
-            NonZeroIggyDuration::from_str("1s")?,
-            AutoCommitWhen::ConsumingAllMessages,
-        ))
         .create_consumer_group_if_not_exists()
         .auto_join_consumer_group()
         .polling_strategy(PollingStrategy::next())
-        .poll_interval(IggyDuration::from_str("1ms")?)
         .batch_length(1000)
         .build();
     consumer.init().await?;
@@ -239,6 +234,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         println!("  header {key} = {value:?}");
                     }
                 }
+                consumer
+                    .store_offset(message.message.header.offset, Some(message.partition_id))
+                    .await?;
             }
             Err(error) => eprintln!("poll error: {error}"),
         }
@@ -258,6 +256,113 @@ An id that cluster metadata does not name fails with `InvalidIdentifier`. An unr
 HTTP clients return `FeatureUnavailable` for this call, as for `send_binary_request`.
 
 For `IggyConsumerConfig`, `partitions_count` controls topic creation only. An ordinary consumer uses partition `0` unless the builder's `partition_id` or the config's `with_partition_id` selects another partition. Code that previously used `partitions_count` to select an existing partition must set `partition_id` explicitly. Consumer-group assignment ignores `partition_id`.
+
+## Deferred polling
+
+High-level consumers use long polling by default. `DeferredPollOptions` separates
+readiness from batch limits: `min_count = 1`, `max_wait = 1s`, `max_bytes = 1 MiB`
+and `request_timeout = 11s`. `batch_length` remains the maximum message count.
+Use `.poll_options(options)` on either consumer builder, or pass options to the
+low-level `poll_messages_deferred` method. A zero `max_wait` skips readiness
+waiting while preserving the same byte limits and request budget.
+
+The server responds when the minimum is readable, the byte cap is reached, or the
+readiness wait expires. Expiry allows a final bounded read; the separate request
+timeout bounds routing, waiting, I/O and response handling. It returns partial or
+empty data when appropriate. Read failures and exhausted request budgets return
+errors. `max_bytes` covers the binary body, including response metadata and batch
+framing; HTTP applies the same selection limit before JSON encoding. The server
+also stops a reply at `sharding.deferred_poll_max_read_bytes`, unless its first
+record alone is wider. A first record that cannot fit returns `InvalidSizeBytes`,
+without advancing its offset.
+The high-level consumer then fetches that record alone, without the byte limit.
+
+Both builders default to `Next` and manual commits. Process messages in partition order,
+then call `store_offset(offset, Some(partition_id))`. Fetch positions advance
+independently of stored offsets; an initial `Next` is resolved once per partition
+and assignment. Restarting before a commit can replay work. Explicit auto-commit
+policies remain available and can commit messages before processing.
+
+This default is incompatible with earlier releases. The builder used to commit
+with `AutoCommit::IntervalOrWhen(1s, PollingMessages)`, and `IggyConsumerConfig`
+used `AutoCommit::When(PollingMessages)` with `Last`. Code that relied on those
+defaults must set `auto_commit` explicitly, or each restart reads the same
+messages again. A consumer that delivered messages but stored no offset logs a
+warning at shutdown.
+
+Under `PollingMessages` the server commits every batch that it reads, so the
+consumer does not prefetch. It fetches one batch when the application asks for a
+message and its buffer is empty. A group member first waits until one of its
+partitions holds a message. It sends one readiness wait (binary command 107) per
+partition primary, which watches every assigned partition, and then fetches from
+a ready partition.
+
+Prefetch reserves both byte and message capacity before each request and holds
+it through queued and partially consumed batches. Defaults are 16 MiB of encoded
+response bytes and 16,000 messages, or `batch_length` messages when that is
+larger; use `.prefetch_bytes(...)` and
+`.prefetch_messages(...)` to change them. Each must fit at least one maximum
+response. Decoded message metadata and bounded HTTP JSON overhead are additional;
+these limits are not process RSS limits. Memory handed to application code is
+outside the consumer budget. Assignment refresh, reconnection and cancellation
+continue while the application stalls. Revoked generations are discarded before
+delivery. The normal `poll_interval` setting has been removed; error backoff is
+still configurable.
+
+Binary data requests share multiplexed connections with control traffic.
+A client admits at most 64 deferred requests, and each high-level consumer admits
+at most 16 across fetches and readiness waits, including waits split across replicas.
+Requests waiting for admission spend their original request budget. A group member with more
+partitions than prefetch slots fetches only the partitions that hold a message,
+and one readiness wait per partition primary watches the others. Cancellation
+sends command 108 for the original request on the
+same authenticated connection. QUIC stream cancellation is translated into that
+command by the server transport. It stops a poll still waiting for readiness.
+The binary transport retries a poll that does not commit and does not use
+`next` with the same request identity, reducing its wait and timeout before each attempt.
+A poll that can move an offset is not resent after a lost reply: it fails with
+`TransientNotCommitted`, and the high-level worker retries its explicit
+position. With opt-in server auto-commit, a lost reply, timeout or cancellation
+may race an accepted offset update. `TransientNotCommitted` means the offset may
+already have advanced; it does not prove that the server rejected the poll.
+Timing margins cannot remove this uncertainty. Use manual commits after processing
+when a lost response must not skip messages.
+
+Progress polls (`Next` or auto-commit), offset reads, stores and deletes share a
+progress lane per partition. Sends use the separate mutation lane, so a parked
+poll does not delay a producer sharing the client. Offset stores and deletes
+hold both lanes; an unresolved store or delete blocks later progress until it is
+resolved or abandoned. Different consumers on one partition still share the
+progress lane.
+
+HTTP uses `GET /streams/{stream}/topics/{topic}/messages/deferred` with the ordinary
+poll fields plus `wait_us`, `min_count`, `max_bytes` and `request_timeout_us`.
+Omitted options use the SDK defaults. Binary command 106 carries the same
+contract. `wait_for_messages` (binary command 107) waits until any of several
+partitions holds a message and reads nothing. It has no HTTP route. Upgrade
+servers before SDKs; unsupported servers reject these requests.
+SDK retries, server forwarding and the high-level worker deduct the elapsed
+time from the original budgets. Routing and admission waits also spend that
+budget, and the caller keeps its original request timeout. Proxy timeouts
+should exceed the configured request timeout. The low-level immediate poll API retains
+its existing command and route.
+
+The server defaults to a 30-second maximum readiness wait, 1024 pending polls per
+shard, 64 per logical session (or HTTP user), 16 MiB per read reservation and
+64 MiB of in-flight read reservations. A longer requested wait is shortened to
+the server maximum. A disk read stops at its reservation and returns what it
+read, even below `min_count`. Configure
+`sharding.deferred_poll_*` accordingly. The response cap is applied to the selected
+result; it does not cap all storage work. Capacity refusal returns
+`DeferredPollCapacityExceeded` (90); clients back off on the same route. A replica
+that cannot serve a partition still returns `TransientNotAccepted` (58) or
+`NotPrimary` (89), prompting route refresh. Upgrade clients with code 90 support
+before enabling deferred polling against this server. Metrics expose pending polls, read reservations and
+completion outcomes.
+
+Bench exposes `--max-wait`, `--min-count`, `--max-bytes` and `--request-timeout`
+for both consumer APIs and records them in report names. Intentional batching
+waits contribute to measured latency.
 
 ## Metadata changes
 

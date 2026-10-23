@@ -2441,7 +2441,10 @@ async fn start_iggy_consumer(builder: IggyConsumerBuilder) -> IggyConsumer {
             AutoCommitWhen::ConsumingAllMessages,
         ))
         .batch_length(POLL_BATCH)
-        .poll_interval(IggyDuration::from(POLL_PAUSE))
+        .poll_options(DeferredPollOptions {
+            max_wait: IggyDuration::from(POLL_PAUSE),
+            ..Default::default()
+        })
         .build();
     consumer.init().await.expect("init the IggyConsumer");
     consumer

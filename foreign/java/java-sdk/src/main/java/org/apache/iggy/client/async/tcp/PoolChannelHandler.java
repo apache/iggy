@@ -87,7 +87,12 @@ final class PoolChannelHandler extends AbstractChannelPoolHandler {
         pipeline.addLast(
                 "flushConsolidation",
                 new FlushConsolidationHandler(FlushConsolidationHandler.DEFAULT_EXPLICIT_FLUSH_AFTER_FLUSHES, false));
-        pipeline.addLast("frameDecoder", new VsrFrameDecoder(maxVsrFrameSize));
-        pipeline.addLast("responseHandler", new VsrResponseHandler(consensusSession, onEviction));
+        var responseHandler = new VsrResponseHandler(consensusSession, onEviction);
+        pipeline.addLast(
+                "frameDecoder",
+                new VsrFrameDecoder(
+                        maxVsrFrameSize,
+                        requestId -> responseHandler.maxResponseFrameSize(requestId, maxVsrFrameSize)));
+        pipeline.addLast("responseHandler", responseHandler);
     }
 }

@@ -104,7 +104,8 @@ namespace Iggy {
          * Creates and initializes a consumer group consumer.
          *
          * `$partition_id` is ignored for a consumer group: the member reads the partitions
-         * the server assigns to it.
+         * the server assigns to it. `$poll_interval_micros` must be null: the consumer waits
+         * on the server for new messages.
          *
          * @param string $name
          * @param string $stream

@@ -36,9 +36,12 @@ use crate::dispatch::failure::{
     send_non_replicated_deny,
 };
 use crate::dispatch::metadata_changes::metadata_changes_reply;
-use crate::dispatch::partition::{handle_get_consumer_offset, handle_poll_messages};
+use crate::dispatch::partition::{
+    handle_get_consumer_offset, handle_poll_messages, read_deferred_poll, resolve_deferred_poll,
+    resolve_readiness_wait,
+};
 use crate::namespace::resolve_partition_namespace;
-use crate::reply_frame::{build_empty_reply, current_metadata_commit};
+use crate::reply_frame::{build_empty_reply, build_reply_from_bytes, current_metadata_commit};
 use crate::responses::{
     build_get_me_response, build_get_personal_access_tokens_response,
     build_non_replicated_response, connected_client_to_response,
@@ -51,17 +54,20 @@ use bytes::Bytes;
 use configs::server::ServerConfig;
 use consensus::MetadataHandle;
 use consensus::client_table::SessionAttachment;
-use futures::future::{Either, select};
+use futures::future::{Abortable, Either, select};
 use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::codes::{
-    BIND_SESSION_CODE, DESCRIBE_OPTIONS_CODE, GET_CLIENT_CODE, GET_CLIENTS_CODE,
-    GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE, GET_ME_CODE, GET_METADATA_CHANGES_CODE,
-    GET_PARTITION_ROUTE_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE, GET_SNAPSHOT_FILE_CODE,
-    GET_STATS_CODE, PING_CODE, POLL_MESSAGES_CODE, SYNC_CONSUMER_GROUP_CODE,
+    BIND_SESSION_CODE, CANCEL_DEFERRED_REQUEST_CODE, DESCRIBE_OPTIONS_CODE, GET_CLIENT_CODE,
+    GET_CLIENTS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE, GET_ME_CODE,
+    GET_METADATA_CHANGES_CODE, GET_PARTITION_ROUTE_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE,
+    GET_SNAPSHOT_FILE_CODE, GET_STATS_CODE, PING_CODE, POLL_MESSAGES_CODE,
+    POLL_MESSAGES_DEFERRED_CODE, SYNC_CONSUMER_GROUP_CODE, WAIT_FOR_MESSAGES_CODE,
 };
 use iggy_binary_protocol::dispatch::lookup_command;
 use iggy_binary_protocol::requests::consumer_groups::SyncConsumerGroupRequest;
-use iggy_binary_protocol::requests::messages::GetPartitionRouteRequest;
+use iggy_binary_protocol::requests::messages::{
+    DeferredPollMessagesRequest, GetPartitionRouteRequest, WaitForMessagesRequest,
+};
 use iggy_binary_protocol::requests::system::BindSessionRequest;
 use iggy_binary_protocol::requests::system::get_client::GetClientRequest;
 use iggy_binary_protocol::requests::system::get_snapshot::GetSnapshotRequest;
@@ -69,20 +75,21 @@ use iggy_binary_protocol::responses::clients::client_response::ConsumerGroupInfo
 use iggy_binary_protocol::responses::clients::get_client::ClientDetailsResponse;
 use iggy_binary_protocol::responses::clients::get_clients::GetClientsResponse;
 use iggy_binary_protocol::responses::consumer_groups::SyncConsumerGroupResponse;
-use iggy_binary_protocol::responses::messages::PartitionRouteResponse;
+use iggy_binary_protocol::responses::messages::{PartitionRouteResponse, WaitForMessagesResponse};
 use iggy_binary_protocol::responses::system::get_snapshot::GetSnapshotResponse;
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
 use iggy_binary_protocol::{HEADER_SIZE, RoutedRequestHeader, WireDecode, WireEncode};
 use iggy_common::{IggyError, SnapshotCompression, SystemSnapshotType};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
+use message_bus::BusMessage;
 use message_bus::framing::MAX_MESSAGE_SIZE;
 use metadata::AppliedFrontier;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
 use server_common::Message;
 use shard::{PartitionRead, PartitionReadReply};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::net::IpAddr;
 use std::pin::pin;
@@ -191,9 +198,11 @@ pub fn read_frontier_budget(config: &ServerConfig) -> Duration {
 /// - `GetClusterMetadata` answers from the configured roster plus the
 ///   consensus view, and sits on the SDK's leader-discovery path, where the
 ///   wait would be real.
-/// - `PollMessages` and `GetConsumerOffset` are partition-plane reads: their
-///   answer comes from a partition group's own log, not the metadata STM, and
-///   holding them would put metadata lag on the data path.
+/// - `PollMessages`, `PollMessagesDeferred`, `WaitForMessages` and
+///   `GetConsumerOffset` are partition-plane reads: their answer comes from a
+///   partition group's own log, not the metadata STM, and holding them would
+///   put metadata lag on the data path.
+/// - `CancelDeferredRequest` reads nothing and gets no reply.
 /// - `GetSnapshotFile` shells out to system tools off-thread; there is no
 ///   metadata answer to hold.
 /// - A code this build does not know: its only outcome is `InvalidCommand`,
@@ -209,6 +218,9 @@ pub const fn read_needs_metadata_frontier(code: u32) -> bool {
             | DESCRIBE_OPTIONS_CODE
             | GET_CLUSTER_METADATA_CODE
             | POLL_MESSAGES_CODE
+            | POLL_MESSAGES_DEFERRED_CODE
+            | WAIT_FOR_MESSAGES_CODE
+            | CANCEL_DEFERRED_REQUEST_CODE
             | GET_CONSUMER_OFFSET_CODE
             | GET_SNAPSHOT_FILE_CODE
     ) && lookup_command(code).is_some()
@@ -391,6 +403,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
     let watermark = watermark.max(request.header().minimum_metadata_op);
     let code = u32::from_le_bytes(request.header().reserved[CODE_RANGE].try_into().unwrap());
     match code {
+        CANCEL_DEFERRED_REQUEST_CODE => {}
         PING_CODE => {
             // No `record_heartbeat` here: the funnel records one for EVERY
             // frame before classification, so a ping is already covered.
@@ -574,13 +587,27 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
                 }
             }
         }
-        POLL_MESSAGES_CODE => {
+        POLL_MESSAGES_CODE | POLL_MESSAGES_DEFERRED_CODE | WAIT_FOR_MESSAGES_CODE => {
             let consumer_client = bound
                 .zip(attachment)
                 .map(|((client_id, _), attachment)| (client_id, attachment))
                 .ok_or(IggyError::Unauthenticated);
             match consumer_client {
                 Ok((consumer_client_id, attachment)) => {
+                    if code != POLL_MESSAGES_CODE {
+                        handle_deferred_request(
+                            shard,
+                            sessions,
+                            origin,
+                            &request,
+                            code,
+                            user_id,
+                            consumer_client_id,
+                            attachment,
+                        )
+                        .await;
+                        return;
+                    }
                     handle_poll_messages(
                         shard,
                         origin,
@@ -626,6 +653,175 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
             )
             .await;
         }
+    }
+}
+
+#[allow(clippy::future_not_send, clippy::too_many_arguments)]
+async fn handle_deferred_request<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    sessions: &Rc<RefCell<SessionManager>>,
+    origin: ClientOrigin,
+    request: &Message<RoutedRequestHeader>,
+    code: u32,
+    user_id: Option<u32>,
+    consumer_client_id: u128,
+    attachment: &SessionAttachment,
+) where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let decoded = if code == POLL_MESSAGES_DEFERRED_CODE {
+        DeferredPollMessagesRequest::decode_from(request_body(request)).map(Either::Left)
+    } else {
+        WaitForMessagesRequest::decode_from(request_body(request)).map(Either::Right)
+    };
+    let Ok(wire) = decoded else {
+        send_non_replicated_deny(shard, request, origin, IggyError::InvalidCommand.as_code()).await;
+        return;
+    };
+    let timeout_us = match &wire {
+        Either::Left(poll) => poll.request_timeout_us,
+        Either::Right(wait) => wait.request_timeout_us,
+    };
+    serve_deferred_request(
+        shard,
+        sessions,
+        (origin, request),
+        Duration::from_micros(timeout_us),
+        async {
+            let user_id = user_id.ok_or(IggyError::Unauthenticated)?;
+            if !attachment.is_valid() {
+                return Err(IggyError::StaleClient);
+            }
+            if !shard
+                .plane
+                .metadata()
+                .applied_frontier()
+                .partition_requests_allowed(shard.bus.monotonic_now())
+                || request.header().minimum_metadata_op > current_metadata_commit(shard)
+            {
+                return Err(IggyError::TransientNotAccepted);
+            }
+            match wire {
+                Either::Left(poll) => {
+                    let resolved = resolve_deferred_poll(
+                        shard,
+                        &poll,
+                        request.header(),
+                        (consumer_client_id, attachment.clone(), user_id),
+                    )?;
+                    read_deferred_poll(shard, request, resolved, attachment).await
+                }
+                Either::Right(wait) => {
+                    let duration = Duration::from_micros(shard.deferred_wait_us(wait.wait_us));
+                    let targets = resolve_readiness_wait(
+                        shard,
+                        wait,
+                        (consumer_client_id, attachment.clone(), user_id),
+                    )?;
+                    let contexts: Vec<_> = targets
+                        .iter()
+                        .map(|target| {
+                            (
+                                target.namespace,
+                                target
+                                    .context
+                                    .metadata
+                                    .context(current_metadata_commit(shard)),
+                            )
+                        })
+                        .collect();
+                    let partitions = shard.wait_for_messages(targets, duration).await?;
+                    for (namespace, context) in contexts {
+                        authorize_served_partition_read(
+                            shard,
+                            Some(attachment),
+                            namespace,
+                            context.incarnation,
+                            Permissioner::poll_messages,
+                        )?;
+                    }
+                    let header = request.header();
+                    Ok(build_reply_from_bytes(
+                        header,
+                        header.client,
+                        header.session,
+                        current_metadata_commit(shard),
+                        &WaitForMessagesResponse { partitions }.to_bytes(),
+                    )
+                    .into_generic()
+                    .into_frozen()
+                    .into())
+                }
+            }
+        },
+    )
+    .await;
+}
+
+#[allow(clippy::future_not_send)]
+async fn serve_deferred_request<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    sessions: &Rc<RefCell<SessionManager>>,
+    (origin, request): (ClientOrigin, &Message<RoutedRequestHeader>),
+    watchdog: Duration,
+    reply: impl Future<Output = Result<BusMessage, IggyError>>,
+) where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let (guard, cancellation) = match SessionManager::begin_deferred_request(
+        sessions,
+        origin.id,
+        request.header().request,
+        watchdog,
+        shard.bus.monotonic_now(),
+    ) {
+        Ok(active) => active,
+        Err(error) => {
+            send_non_replicated_deny(shard, request, origin, error.as_code()).await;
+            return;
+        }
+    };
+    let response_queued = Cell::new(false);
+    let outcome = {
+        let operation = Abortable::new(
+            async {
+                let mut reply = reply.await?;
+                let written = reply.track_write();
+                // A watchdog expiry while the send waits for room drops the reply
+                // unsent, so only a returned send counts as queued.
+                send_host_frame(shard, origin, reply, FrameChannel::Reply, "deferred_reply").await;
+                response_queued.set(true);
+                written
+                    .await
+                    .map_err(|_| IggyError::ShardCommunicationError)
+            },
+            cancellation,
+        );
+        let operation = pin!(operation);
+        let timeout = pin!(shard.bus.sleep(watchdog));
+        match select(operation, timeout).await {
+            Either::Left((Ok(result), _)) => Some(result),
+            Either::Left((Err(_), _)) => None,
+            Either::Right(_) => Some(Err(IggyError::ShardCommunicationError)),
+        }
+    };
+    if matches!(outcome, Some(Ok(()))) {
+        guard.written(shard.bus.monotonic_now());
+    }
+    drop(guard);
+    // A queued reply can still reach the peer after the write watchdog expires.
+    if let Some(Err(error)) = outcome
+        && !response_queued.get()
+    {
+        send_non_replicated_deny(shard, request, origin, error.as_code()).await;
     }
 }
 
@@ -1039,9 +1235,10 @@ mod tests {
     };
     use configs::server::ServerConfig;
     use iggy_binary_protocol::codes::{
-        DESCRIBE_OPTIONS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE, GET_ME_CODE,
-        GET_SNAPSHOT_FILE_CODE, GET_STREAM_CODE, PING_CODE, POLL_MESSAGES_CODE,
-        SYNC_CONSUMER_GROUP_CODE,
+        CANCEL_DEFERRED_REQUEST_CODE, DESCRIBE_OPTIONS_CODE, GET_CLUSTER_METADATA_CODE,
+        GET_CONSUMER_OFFSET_CODE, GET_ME_CODE, GET_SNAPSHOT_FILE_CODE, GET_STREAM_CODE, PING_CODE,
+        POLL_MESSAGES_CODE, POLL_MESSAGES_DEFERRED_CODE, SYNC_CONSUMER_GROUP_CODE,
+        WAIT_FOR_MESSAGES_CODE,
     };
     use iggy_common::IggyDuration;
     use metadata::AppliedFrontier;
@@ -1161,6 +1358,9 @@ mod tests {
             DESCRIBE_OPTIONS_CODE,
             GET_CLUSTER_METADATA_CODE,
             POLL_MESSAGES_CODE,
+            POLL_MESSAGES_DEFERRED_CODE,
+            WAIT_FOR_MESSAGES_CODE,
+            CANCEL_DEFERRED_REQUEST_CODE,
             GET_CONSUMER_OFFSET_CODE,
             GET_SNAPSHOT_FILE_CODE,
         ] {
