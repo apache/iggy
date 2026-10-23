@@ -24,7 +24,8 @@ use iggy::prelude::{
     IggyDuration as RustIggyDuration, IggyMessage, IggyTimestamp, MessageClient,
     NonZeroIggyDuration as RustNonZeroIggyDuration, OptionsScope as RustOptionsScope,
     PartitionClient, PartitionContext, Partitioning, Permissions as RustPermissions,
-    PollingStrategy, SegmentClient, SnapshotCompression as RustSnapshotCompression, StreamClient,
+    PersonalAccessTokenClient, PollingStrategy, SegmentClient,
+    SnapshotCompression as RustSnapshotCompression, StreamClient,
     StreamCreateOptions as RustStreamCreateOptions, StreamEncryptionKey,
     StreamUpdateOptions as RustStreamUpdateOptions, SystemClient as RustSystemClient,
     SystemSnapshotType as RustSystemSnapshotType, TopicClient,
@@ -1316,6 +1317,31 @@ impl Client {
                 .await
                 .map_err(|error| format!("Could not get cluster metadata: {error}"))?;
             Ok(ffi::ClusterMetadata::from(metadata))
+        })
+    }
+
+    pub fn get_personal_access_tokens(&self) -> Result<Vec<ffi::PersonalAccessTokenInfo>, String> {
+        RUNTIME.block_on(async {
+            let tokens = self
+                .inner
+                .get_personal_access_tokens()
+                .await
+                .map_err(|error| format!("Could not get personal access tokens: {error}"))?;
+            Ok(tokens
+                .into_iter()
+                .map(ffi::PersonalAccessTokenInfo::from)
+                .collect())
+        })
+    }
+
+    pub fn delete_personal_access_token(&self, name: String) -> Result<(), String> {
+        RUNTIME.block_on(async {
+            self.inner
+                .delete_personal_access_token(&name)
+                .await
+                .map_err(|error| {
+                    format!("Could not delete personal access token '{name}': {error}")
+                })
         })
     }
 
