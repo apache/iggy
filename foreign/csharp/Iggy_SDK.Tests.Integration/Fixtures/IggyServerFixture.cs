@@ -89,6 +89,12 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
     }
 
     /// <summary>
+    ///     Server encryption key every node shares. With encryption enabled a stream created without its own key
+    ///     gets one the server generates, so the stream options tests read a server sourced key.
+    /// </summary>
+    public static readonly string ServerEncryptionKey = "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=";
+
+    /// <summary>
     ///     Extra environment variables for every node, layered over the cluster's base configuration.
     ///     Heartbeat verification is on for every fixture so the eviction tests share the general server
     ///     instead of starting their own. Override in subclasses to customize.
@@ -97,7 +103,9 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
     {
         { "IGGY_HEARTBEAT_ENABLED", "true" },
         { "IGGY_HEARTBEAT_INTERVAL", $"{ServerHeartbeatInterval.TotalSeconds}s" },
-        { "IGGY_CONSUMER_GROUP_HEARTBEAT_INTERVAL", $"{SessionReportInterval.TotalMilliseconds}ms" }
+        { "IGGY_CONSUMER_GROUP_HEARTBEAT_INTERVAL", $"{SessionReportInterval.TotalMilliseconds}ms" },
+        { "IGGY_ENCRYPTION_ENABLED", "true" },
+        { "IGGY_ENCRYPTION_KEY", ServerEncryptionKey }
     };
 
     /// <summary>

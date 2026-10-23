@@ -54,6 +54,8 @@ pub(crate) mod responses;
 pub(crate) mod rewrite;
 pub(crate) mod session_manager;
 pub mod shell;
+pub(crate) mod stream_key_rewrapper;
+pub(crate) mod stream_keys;
 
 pub(crate) mod users;
 pub(crate) mod wire;

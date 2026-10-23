@@ -159,7 +159,7 @@ impl IggyCmdTestCase for TestMessageSendCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
         // Create stream and capture its actual ID
         let stream = client
-            .create_stream(&self.stream_name)
+            .create_stream(&self.stream_name, &StreamCreateOptions::default())
             .await
             .expect("Failed to create stream");
         self.actual_stream_id = Some(stream.id);

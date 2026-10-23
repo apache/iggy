@@ -231,8 +231,8 @@ mod tests {
     use crate::http::scripted_server::{Recorded, Reply, ScriptedServer};
     use crate::prelude::{
         Identifier, IggyError, IggyMessage, MessageClient, PartitionClient, PartitionContext,
-        Partitioning, SendMessagesConfirmationResponse, StreamClient, TopicClient,
-        TopicCreateOptions,
+        Partitioning, SendMessagesConfirmationResponse, StreamClient, StreamCreateOptions,
+        TopicClient, TopicCreateOptions,
     };
     use bytes::Bytes;
 
@@ -560,7 +560,10 @@ mod tests {
             let first = send(&client, &partitioning).await;
 
             let changed = match change {
-                Change::CreateStream => client.create_stream("stream").await.map(drop),
+                Change::CreateStream => client
+                    .create_stream("stream", &StreamCreateOptions::default())
+                    .await
+                    .map(drop),
                 Change::CreateTopic => client
                     .create_topic(&stream_id, "topic", &TopicCreateOptions::default())
                     .await

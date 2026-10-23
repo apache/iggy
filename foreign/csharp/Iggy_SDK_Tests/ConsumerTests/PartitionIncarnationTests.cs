@@ -63,7 +63,7 @@ public sealed partial class PartitionIncarnationTests
 
         Assert.DoesNotContain((OriginalOffset, Recreated), stores);
         Assert.Equal(0ul, Assert.IsType<ReceivedMessage>(delivered).CurrentOffset);
-        Assert.Equal([(OriginalOffset, Original)], stores);
+        Assert.Equal([(OriginalOffset, Original)], stores.ToArray());
     }
 
     [Fact]
@@ -90,7 +90,7 @@ public sealed partial class PartitionIncarnationTests
 
         Assert.DoesNotContain((OriginalOffset, Recreated), stores);
         Assert.Equal(0ul, Assert.IsType<ReceivedRentedMessage>(delivered).CurrentOffset);
-        Assert.Equal([(OriginalOffset, Original)], stores);
+        Assert.Equal([(OriginalOffset, Original)], stores.ToArray());
     }
 
     [Fact]
@@ -117,7 +117,7 @@ public sealed partial class PartitionIncarnationTests
         await consumer.StoreOffsetAsync(early.CurrentOffset, early.PartitionId, early.Context,
             TestContext.Current.CancellationToken);
 
-        Assert.Equal([(OriginalOffset, Original)], stores);
+        Assert.Equal([(OriginalOffset, Original)], stores.ToArray());
     }
 
     public enum OffsetMutation

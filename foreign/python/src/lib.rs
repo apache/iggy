@@ -26,6 +26,7 @@ mod partitioning;
 mod permissions;
 mod producer;
 mod receive_message;
+mod resource_options;
 mod send_message;
 mod stats;
 mod stream;
@@ -33,7 +34,7 @@ mod topic;
 mod user;
 mod user_headers;
 
-use client::{IggyClient, PendingOperationError, PyIggyError};
+use client::{IggyClient, OptionError, PendingOperationError, PyIggyError};
 use config::{
     AutoLogin, HttpConfig, PendingOperationsConfig, QuicConfig, QuicReconnectionConfig, TcpConfig,
     TcpReconnectionConfig, WebSocketConfig, WebSocketFramingConfig, WebSocketReconnectionConfig,
@@ -51,6 +52,10 @@ use producer::{
 };
 use pyo3::prelude::*;
 use receive_message::{ConsumerPosition, PartitionContext, PollingStrategy, ReceiveMessage};
+use resource_options::{
+    OptionKey, PartitionResizePolicy, StreamOptions, TopicOptions, UserOptions,
+    encryption_key_fingerprint,
+};
 use send_message::{SendMessage, SendMessagesConfirmation, SendMessagesResponse};
 use stats::{CacheMetrics, CacheMetricsKey, Stats};
 use stream::{Stream, StreamDetails};
@@ -71,6 +76,7 @@ fn apache_iggy(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<IggyClient>()?;
     m.add_class::<PyIggyError>()?;
     m.add_class::<PendingOperationError>()?;
+    m.add_class::<OptionError>()?;
     m.add_class::<IggyProducer>()?;
     m.add_class::<ProducerSendError>()?;
     m.add_class::<DirectProducerConfig>()?;
@@ -97,6 +103,12 @@ fn apache_iggy(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<IggyExpiry>()?;
     m.add_class::<MaxTopicSize>()?;
     m.add_class::<OptionSpec>()?;
+    m.add_class::<OptionKey>()?;
+    m.add_class::<StreamOptions>()?;
+    m.add_class::<TopicOptions>()?;
+    m.add_class::<UserOptions>()?;
+    m.add_class::<PartitionResizePolicy>()?;
+    m.add_function(wrap_pyfunction!(encryption_key_fingerprint, m)?)?;
     m.add_class::<Partitioning>()?;
     m.add_class::<Partition>()?;
     m.add_class::<Consumer>()?;

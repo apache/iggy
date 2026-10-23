@@ -31,6 +31,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -131,6 +132,8 @@ class IggyException : public std::runtime_error {
     }
 
     friend class IggyBlockingClient;
+    friend std::string EncryptionKeyFingerprint(const std::vector<std::uint8_t> &key);
+    friend std::string EncryptionKeyFingerprint(const std::string &key_base64);
 
     std::optional<std::uint32_t> code_;
     // Shared, so that copying the exception cannot throw.
@@ -1104,15 +1107,16 @@ class IggyMessagePolled final {
 };
 
 /**
- * @brief Options recorded for a stream or topic.
+ * @brief Options recorded for a stream, topic, or user.
  *
- * Explicit() contains values supplied when the resource was created. Derived()
- * contains values resolved from the server configuration at that time. Derived
- * values describe the resource's creation settings and can differ when the
- * resource is recreated with a different server configuration.
+ * Explicit() contains values a client supplied at creation or in a later
+ * update. Derived() contains values the server filled in: defaults resolved
+ * at admission, values restored by a reset, and the read-only stream
+ * encryption projections. Key material is never returned.
  *
- * This is a response-only model returned by Options(). Use TopicCreateOptions
- * to configure a new topic. Stream creation currently accepts only a name.
+ * This is a response-only model returned by Options(). Use
+ * TopicCreateOptions, StreamCreateOptions, or UserCreateOptions to configure a
+ * new resource.
  */
 class ResourceOptions final {
   public:
@@ -1123,10 +1127,8 @@ class ResourceOptions final {
     [[nodiscard]] const std::map<std::string, HeaderField> &Explicit() const noexcept { return explicit_; }
 
     /**
-     * @brief Returns entries derived from configured defaults at admission.
+     * @brief Returns entries the server filled in.
      * @return Derived entries as map from option name to typed value.
-     * @note Stream responses currently expose explicit entries only, so this
-     *       collection is empty for Stream and StreamDetails.
      */
     [[nodiscard]] const std::map<std::string, HeaderField> &Derived() const noexcept { return derived_; }
 
@@ -1185,7 +1187,7 @@ class UserInfo final {
     [[nodiscard]] const std::string &Username() const noexcept { return username_; }
 
     /**
-     * @brief Returns explicit user creation options.
+     * @brief Returns user options and their provenance.
      * @return Options owned by this value.
      */
     [[nodiscard]] const ResourceOptions &Options() const noexcept { return options_; }
@@ -1254,7 +1256,7 @@ class UserInfoDetails final {
     [[nodiscard]] const std::optional<::iggy::Permissions> &Permissions() const noexcept { return permissions_; }
 
     /**
-     * @brief Returns explicit user creation options.
+     * @brief Returns user options and their provenance.
      * @return Options owned by this value.
      */
     [[nodiscard]] const ResourceOptions &Options() const noexcept { return options_; }
@@ -1328,19 +1330,21 @@ class Topic final {
     [[nodiscard]] std::uint64_t SizeBytes() const noexcept { return size_bytes_; }
 
     /**
-     * @brief Returns the server-encoded message retention value.
+     * @brief Returns the message retention resolved from the topic options.
      * @return Retention value in microseconds or a protocol sentinel.
      */
     [[nodiscard]] std::uint64_t MessageExpiry() const noexcept { return message_expiry_; }
 
     /**
-     * @brief Returns the server-selected storage compression algorithm.
+     * @brief Returns the storage compression algorithm resolved from the topic
+     *        options.
      * @return Algorithm name owned by this value.
      */
     [[nodiscard]] const std::string &CompressionAlgorithm() const noexcept { return compression_algorithm_; }
 
     /**
-     * @brief Returns the configured maximum retained topic size.
+     * @brief Returns the maximum retained topic size resolved from the topic
+     *        options.
      * @return Maximum size in bytes.
      */
     [[nodiscard]] std::uint64_t MaxTopicSize() const noexcept { return max_topic_size_; }
@@ -1578,19 +1582,20 @@ class TopicDetails final {
     [[nodiscard]] std::uint64_t SizeBytes() const noexcept { return size_bytes_; }
 
     /**
-     * @brief Returns the server-encoded message retention value.
+     * @brief Returns the message retention resolved from the topic options.
      * @return Retention value in microseconds or a protocol sentinel.
      */
     [[nodiscard]] std::uint64_t MessageExpiry() const noexcept { return message_expiry_; }
 
     /**
-     * @brief Returns the storage compression algorithm selected for this topic.
+     * @brief Returns the storage compression algorithm resolved from the topic
+     *        options.
      * @return Algorithm name owned by this value.
      */
     [[nodiscard]] const std::string &CompressionAlgorithm() const noexcept { return compression_algorithm_; }
 
     /**
-     * @brief Returns the maximum retained size configured for this topic.
+     * @brief Returns the maximum retained size resolved from the topic options.
      * @return Maximum size in bytes.
      */
     [[nodiscard]] std::uint64_t MaxTopicSize() const noexcept { return max_topic_size_; }
@@ -1664,6 +1669,30 @@ class TopicDetails final {
 };
 
 /**
+ * @brief Who chose a stream's at-rest data key.
+ *
+ * Reads report the source and fingerprints of a stream's key, never the key
+ * itself.
+ */
+enum class StreamEncryptionSource : std::uint8_t {
+    None   = 0,  ///< The stream is stored as plaintext for life.
+    Stream = 1,  ///< The client supplied the key at creation.
+    Server = 2,  ///< The server generated the key at creation.
+};
+
+constexpr std::string_view to_string(const StreamEncryptionSource source) {
+    switch (source) {
+        case StreamEncryptionSource::None:
+            return "none";
+        case StreamEncryptionSource::Stream:
+            return "stream";
+        case StreamEncryptionSource::Server:
+            return "server";
+    }
+    throw std::invalid_argument("Unknown stream encryption source");
+}
+
+/**
  * @brief Snapshot of one stream's metadata and aggregate statistics.
  *
  * CreateStream() and GetStream() return this value.
@@ -1732,11 +1761,45 @@ class StreamDetails final {
     [[nodiscard]] const std::vector<Topic> &Topics() const noexcept { return topics_; }
 
     /**
-     * @brief Returns explicit stream creation options.
+     * @brief Returns stream options and their provenance.
+     *
+     * Derived() carries the read-only encryption projections. Key material is
+     * never returned.
      * @return Options owned by this value.
-     * @note The current bridge does not return derived stream options.
      */
     [[nodiscard]] const ResourceOptions &Options() const noexcept { return options_; }
+
+    /**
+     * @brief Returns who chose the stream's at-rest key.
+     * @return Key source. A plaintext stream reports
+     *         StreamEncryptionSource::None. `std::nullopt` means the read
+     *         carried no source entry or one this SDK build does not know.
+     */
+    [[nodiscard]] std::optional<StreamEncryptionSource> EncryptionKeySource() const noexcept {
+        return encryption_key_source_;
+    }
+
+    /**
+     * @brief Returns the fingerprint of the stream's key.
+     *
+     * The value is 16 lowercase hex characters. Compare it with
+     * EncryptionKeyFingerprint() of a key you hold to check which key the
+     * stream uses.
+     * @return Fingerprint, or `std::nullopt` for a plaintext stream.
+     */
+    [[nodiscard]] const std::optional<std::string> &EncryptionKeyFingerprint() const noexcept {
+        return encryption_key_fingerprint_;
+    }
+
+    /**
+     * @brief Returns the fingerprints of the server keys that wrap the
+     *        stream's key.
+     * @return One fingerprint outside a server key rotation, empty for a
+     *         plaintext stream.
+     */
+    [[nodiscard]] const std::vector<std::string> &EncryptionKekFingerprints() const noexcept {
+        return encryption_kek_fingerprints_;
+    }
 
   private:
     StreamDetails(std::uint32_t id,
@@ -1746,7 +1809,10 @@ class StreamDetails final {
                   std::uint64_t messages_count,
                   std::uint32_t topics_count,
                   std::vector<Topic> topics,
-                  ResourceOptions options)
+                  ResourceOptions options,
+                  std::optional<StreamEncryptionSource> encryption_key_source,
+                  std::optional<std::string> encryption_key_fingerprint,
+                  std::vector<std::string> encryption_kek_fingerprints)
         : id_(id),
           created_at_(created_at),
           name_(std::move(name)),
@@ -1754,7 +1820,10 @@ class StreamDetails final {
           messages_count_(messages_count),
           topics_count_(topics_count),
           topics_(std::move(topics)),
-          options_(std::move(options)) {}
+          options_(std::move(options)),
+          encryption_key_source_(encryption_key_source),
+          encryption_key_fingerprint_(std::move(encryption_key_fingerprint)),
+          encryption_kek_fingerprints_(std::move(encryption_kek_fingerprints)) {}
 
     static StreamDetails FromFfi(ffi::StreamDetails stream);
 
@@ -1768,6 +1837,9 @@ class StreamDetails final {
     std::uint32_t topics_count_;
     std::vector<Topic> topics_;
     ResourceOptions options_;
+    std::optional<StreamEncryptionSource> encryption_key_source_;
+    std::optional<std::string> encryption_key_fingerprint_;
+    std::vector<std::string> encryption_kek_fingerprints_;
 };
 
 /**
@@ -1821,11 +1893,45 @@ class Stream final {
     [[nodiscard]] std::uint32_t TopicsCount() const noexcept { return topics_count_; }
 
     /**
-     * @brief Returns explicit stream creation options.
+     * @brief Returns stream options and their provenance.
+     *
+     * Derived() carries the read-only encryption projections. Key material is
+     * never returned.
      * @return Options owned by this value.
-     * @note The current bridge does not return derived stream options.
      */
     [[nodiscard]] const ResourceOptions &Options() const noexcept { return options_; }
+
+    /**
+     * @brief Returns who chose the stream's at-rest key.
+     * @return Key source. A plaintext stream reports
+     *         StreamEncryptionSource::None. `std::nullopt` means the read
+     *         carried no source entry or one this SDK build does not know.
+     */
+    [[nodiscard]] std::optional<StreamEncryptionSource> EncryptionKeySource() const noexcept {
+        return encryption_key_source_;
+    }
+
+    /**
+     * @brief Returns the fingerprint of the stream's key.
+     *
+     * The value is 16 lowercase hex characters. Compare it with
+     * EncryptionKeyFingerprint() of a key you hold to check which key the
+     * stream uses.
+     * @return Fingerprint, or `std::nullopt` for a plaintext stream.
+     */
+    [[nodiscard]] const std::optional<std::string> &EncryptionKeyFingerprint() const noexcept {
+        return encryption_key_fingerprint_;
+    }
+
+    /**
+     * @brief Returns the fingerprints of the server keys that wrap the
+     *        stream's key.
+     * @return One fingerprint outside a server key rotation, empty for a
+     *         plaintext stream.
+     */
+    [[nodiscard]] const std::vector<std::string> &EncryptionKekFingerprints() const noexcept {
+        return encryption_kek_fingerprints_;
+    }
 
   private:
     Stream(std::uint32_t id,
@@ -1834,14 +1940,20 @@ class Stream final {
            std::uint64_t size_bytes,
            std::uint64_t messages_count,
            std::uint32_t topics_count,
-           ResourceOptions options)
+           ResourceOptions options,
+           std::optional<StreamEncryptionSource> encryption_key_source,
+           std::optional<std::string> encryption_key_fingerprint,
+           std::vector<std::string> encryption_kek_fingerprints)
         : id_(id),
           created_at_(created_at),
           name_(std::move(name)),
           size_bytes_(size_bytes),
           messages_count_(messages_count),
           topics_count_(topics_count),
-          options_(std::move(options)) {}
+          options_(std::move(options)),
+          encryption_key_source_(encryption_key_source),
+          encryption_key_fingerprint_(std::move(encryption_key_fingerprint)),
+          encryption_kek_fingerprints_(std::move(encryption_kek_fingerprints)) {}
 
     static Stream FromFfi(ffi::Stream stream);
 
@@ -1854,6 +1966,9 @@ class Stream final {
     std::uint64_t messages_count_;
     std::uint32_t topics_count_;
     ResourceOptions options_;
+    std::optional<StreamEncryptionSource> encryption_key_source_;
+    std::optional<std::string> encryption_key_fingerprint_;
+    std::vector<std::string> encryption_kek_fingerprints_;
 };
 
 /**
@@ -2768,15 +2883,128 @@ constexpr std::string_view to_string(const Durability durability) {
 }
 
 /**
+ * @brief Whether a topic's partition set may change after creation.
+ */
+enum class PartitionResizePolicy : std::uint8_t {
+    Mutable,  ///< Partitions may be created and deleted later.
+    Fixed,    ///< The partition set is fixed at topic creation.
+};
+
+constexpr std::string_view to_string(const PartitionResizePolicy policy) {
+    switch (policy) {
+        case PartitionResizePolicy::Mutable:
+            return "mutable";
+        case PartitionResizePolicy::Fixed:
+            return "fixed";
+    }
+    throw std::invalid_argument("Unknown partition resize policy");
+}
+
+/**
+ * @brief Option keys of the stream scope, in catalog order.
+ *
+ * Name is updatable. EncryptionKey is a create-only secret. The fingerprint
+ * and source keys are read-only projections. No stream key is resettable.
+ */
+enum class StreamOptionKey : std::uint8_t {
+    Name,
+    EncryptionKey,
+    EncryptionKeySource,
+    EncryptionKeyFingerprint,
+    EncryptionKekFingerprint,
+};
+
+constexpr std::string_view to_string(const StreamOptionKey key) {
+    switch (key) {
+        case StreamOptionKey::Name:
+            return "name";
+        case StreamOptionKey::EncryptionKey:
+            return "encryption_key";
+        case StreamOptionKey::EncryptionKeySource:
+            return "encryption_key_source";
+        case StreamOptionKey::EncryptionKeyFingerprint:
+            return "encryption_key_fingerprint";
+        case StreamOptionKey::EncryptionKekFingerprint:
+            return "encryption_kek_fingerprint";
+    }
+    throw std::invalid_argument("Unknown stream option key");
+}
+
+/**
+ * @brief Option keys of the topic scope, in catalog order.
+ *
+ * Name, MessageExpiry, and MaxTopicSize are updatable, and MessageExpiry and
+ * MaxTopicSize are also resettable. Every other key is create-only.
+ */
+enum class TopicOptionKey : std::uint8_t {
+    Name,
+    CompressionAlgorithm,
+    MessageExpiry,
+    MaxTopicSize,
+    SegmentSize,
+    Durability,
+    ConsumerOffsetDurability,
+    PartitionResizePolicy,
+    MessagesRequiredToSave,
+    SizeOfMessagesRequiredToSave,
+    PreallocateSegments,
+};
+
+constexpr std::string_view to_string(const TopicOptionKey key) {
+    switch (key) {
+        case TopicOptionKey::Name:
+            return "name";
+        case TopicOptionKey::CompressionAlgorithm:
+            return "compression_algorithm";
+        case TopicOptionKey::MessageExpiry:
+            return "message_expiry";
+        case TopicOptionKey::MaxTopicSize:
+            return "max_topic_size";
+        case TopicOptionKey::SegmentSize:
+            return "segment_size";
+        case TopicOptionKey::Durability:
+            return "durability";
+        case TopicOptionKey::ConsumerOffsetDurability:
+            return "consumer_offset_durability";
+        case TopicOptionKey::PartitionResizePolicy:
+            return "partition_resize_policy";
+        case TopicOptionKey::MessagesRequiredToSave:
+            return "messages_required_to_save";
+        case TopicOptionKey::SizeOfMessagesRequiredToSave:
+            return "size_of_messages_required_to_save";
+        case TopicOptionKey::PreallocateSegments:
+            return "preallocate_segments";
+    }
+    throw std::invalid_argument("Unknown topic option key");
+}
+
+/**
+ * @brief Option keys of the user scope, in catalog order.
+ *
+ * Both keys are updatable. Neither is resettable.
+ */
+enum class UserOptionKey : std::uint8_t {
+    Username,
+    Status,
+};
+
+constexpr std::string_view to_string(const UserOptionKey key) {
+    switch (key) {
+        case UserOptionKey::Username:
+            return "username";
+        case UserOptionKey::Status:
+            return "status";
+    }
+    throw std::invalid_argument("Unknown user option key");
+}
+
+/**
  * @brief Options for creating a topic.
  *
  * Use the typed setters to configure supported topic settings. Leave a setting
  * unset to use the server default. Use SetRawEntries() for supported options
  * that do not yet have a typed setter. When both specify the same option, the
  * typed setting takes precedence.
- *
- * For example, the entry `partition_resize_policy` set to `fixed` makes the
- * server reject later partition creation and deletion on this topic.
  */
 class TopicCreateOptions final {
   public:
@@ -2919,6 +3147,26 @@ class TopicCreateOptions final {
     }
 
     /**
+     * @brief Returns whether the topic's partition set may change later.
+     * @return Configured policy, or `std::nullopt` to use the server default
+     *         (`mutable`).
+     */
+    [[nodiscard]] std::optional<::iggy::PartitionResizePolicy> PartitionResizePolicy() const noexcept {
+        return partition_resize_policy_;
+    }
+
+    /**
+     * @brief Sets whether the topic's partition set may change later.
+     * @param policy PartitionResizePolicy::Fixed makes the server reject later
+     *        partition creation and deletion on this topic.
+     * @return Reference to this options object.
+     */
+    TopicCreateOptions &SetPartitionResizePolicy(::iggy::PartitionResizePolicy policy) noexcept {
+        partition_resize_policy_ = policy;
+        return *this;
+    }
+
+    /**
      * @brief Returns the message-count threshold for flushing the journal.
      * @return Configured threshold, or `std::nullopt` to use the server default.
      */
@@ -3028,6 +3276,7 @@ class TopicCreateOptions final {
     std::optional<std::uint64_t> segment_size_;
     std::optional<::iggy::Durability> durability_;
     std::optional<::iggy::Durability> consumer_offset_durability_;
+    std::optional<::iggy::PartitionResizePolicy> partition_resize_policy_;
     std::optional<std::uint32_t> messages_required_to_save_;
     std::optional<std::uint64_t> size_of_messages_required_to_save_;
     std::optional<bool> preallocate_segments_;
@@ -3040,33 +3289,33 @@ class TopicCreateOptions final {
  * @brief Options for updating a topic.
  *
  * Use this class to change a topic's mutable settings. Leave a setting unset
- * to retain its current value. Topic creation settings, such as the partition
- * count and segment size, cannot be changed after the topic is created.
+ * to retain its current value, or name it in Reset() to return it to the
+ * server default. Topic creation settings, such as the compression
+ * algorithm, partition count, and segment size, cannot be changed after the
+ * topic is created.
  *
  * Use the typed setters for supported settings. SetRawEntries() can configure
  * other supported mutable settings. When both configure the same setting, the
- * typed setting takes precedence.
+ * typed setting takes precedence. An update must change at least one setting,
+ * and must not both set and reset the same one.
  */
 class TopicUpdateOptions final {
   public:
     TopicUpdateOptions() = default;
 
     /**
-     * @brief Returns the requested storage compression update.
-     * @return Compression algorithm to apply, or `std::nullopt` when this
-     *         update leaves compression unchanged.
+     * @brief Returns the requested topic name.
+     * @return New name, or `std::nullopt` when this update keeps the name.
      */
-    [[nodiscard]] const std::optional<::iggy::CompressionAlgorithm> &CompressionAlgorithm() const noexcept {
-        return compression_algorithm_;
-    }
+    [[nodiscard]] const std::optional<std::string> &Name() const noexcept { return name_; }
 
     /**
-     * @brief Sets the storage compression algorithm.
-     * @param compression_algorithm Compression algorithm to apply.
+     * @brief Renames the topic.
+     * @param name New topic name, unique within its stream.
      * @return Reference to this options object.
      */
-    TopicUpdateOptions &SetCompressionAlgorithm(::iggy::CompressionAlgorithm compression_algorithm) {
-        compression_algorithm_ = std::move(compression_algorithm);
+    TopicUpdateOptions &SetName(std::string name) {
+        name_ = std::move(name);
         return *this;
     }
 
@@ -3080,7 +3329,8 @@ class TopicUpdateOptions final {
     /**
      * @brief Sets the message retention policy.
      * @param message_expiry Expiry policy to apply. Expiry::ServerDefault()
-     *        leaves the current policy unchanged.
+     *        leaves the current policy unchanged. Use
+     *        Reset(TopicOptionKey::MessageExpiry) to return to the default.
      * @return Reference to this options object.
      */
     TopicUpdateOptions &SetMessageExpiry(::iggy::Expiry message_expiry) {
@@ -3102,7 +3352,8 @@ class TopicUpdateOptions final {
     /**
      * @brief Sets the maximum retained topic size.
      * @param max_topic_size Maximum size to retain. MaxTopicSize::ServerDefault()
-     *        leaves the current limit unchanged.
+     *        leaves the current limit unchanged. Use
+     *        Reset(TopicOptionKey::MaxTopicSize) to return to the default.
      * @return Reference to this options object.
      */
     TopicUpdateOptions &SetMaxTopicSize(::iggy::MaxTopicSize max_topic_size) {
@@ -3152,10 +3403,146 @@ class TopicUpdateOptions final {
         return *this;
     }
 
+    /**
+     * @brief Returns the settings this update resets to their defaults.
+     * @return Keys to reset, ordered by catalog position.
+     */
+    [[nodiscard]] const std::set<TopicOptionKey> &ResetKeys() const noexcept { return reset_; }
+
+    /**
+     * @brief Resets a setting to its server default.
+     * @param key Setting to reset. Only MessageExpiry and MaxTopicSize are
+     *        resettable. UpdateTopic() refuses any other key before sending
+     *        with the error the server would return.
+     * @return Reference to this options object.
+     */
+    TopicUpdateOptions &Reset(TopicOptionKey key) {
+        reset_.insert(key);
+        return *this;
+    }
+
+    /**
+     * @brief Returns the settings this update resets by name.
+     * @return Names to reset, for keys newer than this SDK build.
+     */
+    [[nodiscard]] const std::set<std::string> &RawResetKeys() const noexcept { return raw_reset_; }
+
+    /**
+     * @brief Resets a setting by name to its server default.
+     *
+     * Use this for keys newer than this SDK build. The server decides whether
+     * the key exists and may be reset.
+     * @param key Setting name to reset.
+     * @return Reference to this options object.
+     */
+    TopicUpdateOptions &RawReset(std::string key) {
+        raw_reset_.insert(std::move(key));
+        return *this;
+    }
+
   private:
-    std::optional<::iggy::CompressionAlgorithm> compression_algorithm_;
+    std::optional<std::string> name_;
     std::optional<::iggy::Expiry> message_expiry_;
     std::optional<::iggy::MaxTopicSize> max_topic_size_;
+    std::map<std::string, std::string> raw_;
+    std::set<TopicOptionKey> reset_;
+    std::set<std::string> raw_reset_;
+
+    friend class IggyBlockingClient;
+};
+
+/**
+ * @brief Options for creating a stream.
+ *
+ * A stream may carry its own 32-byte data encryption key. The key must be 32
+ * random bytes, never derived from a password, because reads expose its
+ * fingerprint. It travels inside the create request over whatever transport
+ * the client uses, so protecting it in transit with TLS is the caller's
+ * responsibility. The server stores the key wrapped and never returns it:
+ * reads report only its source and fingerprints. Without a key, a server with
+ * encryption enabled generates one for the stream.
+ *
+ * An invalid key is refused by CreateStream() before anything is sent. This
+ * type never prints or logs the key.
+ */
+class StreamCreateOptions final {
+  public:
+    StreamCreateOptions() = default;
+
+    /**
+     * @brief Returns whether this create carries an encryption key.
+     * @return `true` after SetEncryptionKey() or SetEncryptionKeyBase64().
+     */
+    [[nodiscard]] bool HasEncryptionKey() const noexcept {
+        return encryption_key_.has_value() || encryption_key_base64_.has_value();
+    }
+
+    /**
+     * @brief Sets the stream's data encryption key from raw bytes.
+     * @param key Exactly 32 random bytes. CreateStream() refuses any other
+     *        length with invalid_encryption_key.
+     * @return Reference to this options object.
+     */
+    StreamCreateOptions &SetEncryptionKey(const std::vector<std::uint8_t> &key) {
+        encryption_key_ = key;
+        encryption_key_base64_.reset();
+        return *this;
+    }
+
+    /**
+     * @brief Sets the stream's data encryption key from its base64 text.
+     * @param key Canonical standard padded base64 of exactly 32 bytes.
+     *        CreateStream() refuses whitespace, the URL-safe alphabet, missing
+     *        padding, and noncanonical trailing bits with
+     *        invalid_encryption_key.
+     * @return Reference to this options object.
+     */
+    StreamCreateOptions &SetEncryptionKeyBase64(std::string key) {
+        encryption_key_base64_ = std::move(key);
+        encryption_key_.reset();
+        return *this;
+    }
+
+    /**
+     * @brief Returns additional stream settings as key-value pairs.
+     * @return Ordered map of setting names and values.
+     * @note A dedicated setter takes precedence when it configures the same
+     *       setting.
+     */
+    [[nodiscard]] const std::map<std::string, std::string> &RawEntries() const noexcept { return raw_; }
+
+    /**
+     * @brief Adds or replaces additional stream settings.
+     *
+     * Use this for keys newer than this SDK build. Unsupported names and
+     * invalid values are rejected when the stream is created.
+     * @param entries Setting names and values to add.
+     * @return Reference to this options object.
+     */
+    StreamCreateOptions &SetRawEntries(const std::map<std::string, std::string> &entries) {
+        for (const auto &entry : entries) {
+            raw_.insert_or_assign(entry.first, entry.second);
+        }
+        return *this;
+    }
+    /**
+     * @brief Adds or replaces additional stream settings.
+     * @param entries Setting names and values to move into this options object.
+     * @return Reference to this options object.
+     * @see SetRawEntries(const std::map<std::string, std::string>&)
+     */
+    StreamCreateOptions &SetRawEntries(std::map<std::string, std::string> &&entries) {
+        while (!entries.empty()) {
+            auto node = entries.extract(entries.begin());
+            raw_.erase(node.key());
+            raw_.insert(std::move(node));
+        }
+        return *this;
+    }
+
+  private:
+    std::optional<std::vector<std::uint8_t>> encryption_key_;
+    std::optional<std::string> encryption_key_base64_;
     std::map<std::string, std::string> raw_;
 
     friend class IggyBlockingClient;
@@ -3164,27 +3551,45 @@ class TopicUpdateOptions final {
 /**
  * @brief Options for updating a stream.
  *
- * Use this class to supply stream settings to UpdateStream(). Currently, Iggy
- * does not support updating stream settings, so the server rejects every
- * supplied setting. The raw entries are retained for compatibility with future
- * server versions that add mutable stream settings.
+ * Leave a setting unset to retain its current value. The name is the only
+ * updatable stream setting, and no stream setting is resettable, so Reset()
+ * exists to refuse a reset before anything is sent, with the error the server
+ * would return. RawReset() names keys newer than this SDK build and leaves the
+ * decision to the server. An update must change at least one setting.
  */
 class StreamUpdateOptions final {
   public:
     StreamUpdateOptions() = default;
 
     /**
+     * @brief Returns the requested stream name.
+     * @return New name, or `std::nullopt` when this update keeps the name.
+     */
+    [[nodiscard]] const std::optional<std::string> &Name() const noexcept { return name_; }
+
+    /**
+     * @brief Renames the stream.
+     * @param name New unique stream name.
+     * @return Reference to this options object.
+     */
+    StreamUpdateOptions &SetName(std::string name) {
+        name_ = std::move(name);
+        return *this;
+    }
+
+    /**
      * @brief Returns the requested stream settings as key-value pairs.
      * @return Ordered map of setting names and values.
-     * @note The server currently rejects all stream settings.
      */
     [[nodiscard]] const std::map<std::string, std::string> &RawEntries() const noexcept { return raw_; }
 
     /**
      * @brief Adds or replaces requested stream settings.
+     *
+     * Use this for updatable keys newer than this SDK build. Unsupported or
+     * immutable settings are rejected when the stream is updated.
      * @param entries Setting names and values to add.
      * @return Reference to this options object.
-     * @note The server currently rejects all stream settings.
      */
     StreamUpdateOptions &SetRawEntries(const std::map<std::string, std::string> &entries) {
         for (const auto &entry : entries) {
@@ -3197,9 +3602,98 @@ class StreamUpdateOptions final {
      * @param entries Setting names and values to move into this options object.
      * @return Reference to this options object.
      * @see SetRawEntries(const std::map<std::string, std::string>&)
-     * @note The server currently rejects all stream settings.
      */
     StreamUpdateOptions &SetRawEntries(std::map<std::string, std::string> &&entries) {
+        while (!entries.empty()) {
+            auto node = entries.extract(entries.begin());
+            raw_.erase(node.key());
+            raw_.insert(std::move(node));
+        }
+        return *this;
+    }
+
+    /**
+     * @brief Returns the settings this update resets to their defaults.
+     * @return Keys to reset, ordered by catalog position.
+     */
+    [[nodiscard]] const std::set<StreamOptionKey> &ResetKeys() const noexcept { return reset_; }
+
+    /**
+     * @brief Requests a reset of a stream setting.
+     * @param key Setting to reset. No stream key is resettable in this
+     *        release, so UpdateStream() refuses every reset before sending.
+     * @return Reference to this options object.
+     */
+    StreamUpdateOptions &Reset(StreamOptionKey key) {
+        reset_.insert(key);
+        return *this;
+    }
+
+    /**
+     * @brief Returns the settings this update resets by name.
+     * @return Names to reset, for keys newer than this SDK build.
+     */
+    [[nodiscard]] const std::set<std::string> &RawResetKeys() const noexcept { return raw_reset_; }
+
+    /**
+     * @brief Resets a setting by name to its server default.
+     *
+     * Use this for keys newer than this SDK build. The server decides whether
+     * the key exists and may be reset.
+     * @param key Setting name to reset.
+     * @return Reference to this options object.
+     */
+    StreamUpdateOptions &RawReset(std::string key) {
+        raw_reset_.insert(std::move(key));
+        return *this;
+    }
+
+  private:
+    std::optional<std::string> name_;
+    std::map<std::string, std::string> raw_;
+    std::set<StreamOptionKey> reset_;
+    std::set<std::string> raw_reset_;
+
+    friend class IggyBlockingClient;
+};
+
+/**
+ * @brief Options for creating a user.
+ *
+ * No typed user setting exists yet. The type exists so a future setting is
+ * a new setter rather than a signature change.
+ */
+class UserCreateOptions final {
+  public:
+    UserCreateOptions() = default;
+
+    /**
+     * @brief Returns additional user settings as key-value pairs.
+     * @return Ordered map of setting names and values.
+     */
+    [[nodiscard]] const std::map<std::string, std::string> &RawEntries() const noexcept { return raw_; }
+
+    /**
+     * @brief Adds or replaces additional user settings.
+     *
+     * Use this for keys newer than this SDK build. Unsupported names and
+     * invalid values are rejected when the user is created.
+     * @param entries Setting names and values to add.
+     * @return Reference to this options object.
+     */
+    UserCreateOptions &SetRawEntries(const std::map<std::string, std::string> &entries) {
+        for (const auto &entry : entries) {
+            raw_.insert_or_assign(entry.first, entry.second);
+        }
+        return *this;
+    }
+    /**
+     * @brief Adds or replaces additional user settings.
+     * @param entries Setting names and values to move into this options object.
+     * @return Reference to this options object.
+     * @see SetRawEntries(const std::map<std::string, std::string>&)
+     */
+    UserCreateOptions &SetRawEntries(std::map<std::string, std::string> &&entries) {
         while (!entries.empty()) {
             auto node = entries.extract(entries.begin());
             raw_.erase(node.key());
@@ -3217,11 +3711,11 @@ class StreamUpdateOptions final {
 /**
  * @brief Options for updating a user.
  *
- * Use this class to supply user settings to UpdateUser(). Updating a user
- * patches only the supplied settings; omitted settings remain unchanged.
- * Currently, Iggy does not support updating user settings, so the server
- * rejects every supplied setting. The raw entries are retained for
- * compatibility with future server versions that add mutable user settings.
+ * Updating a user patches only the supplied settings. Omitted settings remain
+ * unchanged. No user setting is resettable, so Reset() exists to refuse a
+ * reset before anything is sent, with the error the server would return.
+ * RawReset() names keys newer than this SDK build and leaves the decision to
+ * the server. An update must change at least one setting.
  */
 class UserUpdateOptions final {
   public:
@@ -3229,17 +3723,53 @@ class UserUpdateOptions final {
     UserUpdateOptions() = default;
 
     /**
+     * @brief Returns the requested user name.
+     * @return New name, or `std::nullopt` when this update keeps the name.
+     */
+    [[nodiscard]] const std::optional<std::string> &Username() const noexcept { return username_; }
+
+    /**
+     * @brief Renames the user.
+     *
+     * Renaming the authenticated user also updates the credentials the client
+     * uses when it reconnects.
+     * @param username New unique user name, 3 to 50 bytes.
+     * @return Reference to this options object.
+     */
+    UserUpdateOptions &SetUsername(std::string username) {
+        username_ = std::move(username);
+        return *this;
+    }
+
+    /**
+     * @brief Returns the requested authentication status.
+     * @return New status, or `std::nullopt` when this update keeps the status.
+     */
+    [[nodiscard]] std::optional<UserStatus> Status() const noexcept { return status_; }
+
+    /**
+     * @brief Sets the user's authentication status.
+     * @param status New status. Deactivating a user ends its sessions.
+     * @return Reference to this options object.
+     */
+    UserUpdateOptions &SetStatus(UserStatus status) noexcept {
+        status_ = status;
+        return *this;
+    }
+
+    /**
      * @brief Returns the requested user settings as key-value pairs.
      * @return Ordered map of setting names and values.
-     * @note The server currently rejects all user settings.
      */
     [[nodiscard]] const std::map<std::string, std::string> &RawEntries() const noexcept { return raw_; }
 
     /**
      * @brief Adds or replaces requested user settings.
+     *
+     * Use this for updatable keys newer than this SDK build. Unsupported or
+     * immutable settings are rejected when the user is updated.
      * @param entries Setting names and values to add.
      * @return Reference to this options object.
-     * @note The server currently rejects all user settings.
      */
     UserUpdateOptions &SetRawEntries(const std::map<std::string, std::string> &entries) {
         for (const auto &entry : entries) {
@@ -3252,7 +3782,6 @@ class UserUpdateOptions final {
      * @param entries Setting names and values to move into this options object.
      * @return Reference to this options object.
      * @see SetRawEntries(const std::map<std::string, std::string>&)
-     * @note The server currently rejects all user settings.
      */
     UserUpdateOptions &SetRawEntries(std::map<std::string, std::string> &&entries) {
         while (!entries.empty()) {
@@ -3263,11 +3792,182 @@ class UserUpdateOptions final {
         return *this;
     }
 
+    /**
+     * @brief Returns the settings this update resets to their defaults.
+     * @return Keys to reset, ordered by catalog position.
+     */
+    [[nodiscard]] const std::set<UserOptionKey> &ResetKeys() const noexcept { return reset_; }
+
+    /**
+     * @brief Requests a reset of a user setting.
+     * @param key Setting to reset. No user key is resettable in this release,
+     *        so UpdateUser() refuses every reset before sending.
+     * @return Reference to this options object.
+     */
+    UserUpdateOptions &Reset(UserOptionKey key) {
+        reset_.insert(key);
+        return *this;
+    }
+
+    /**
+     * @brief Returns the settings this update resets by name.
+     * @return Names to reset, for keys newer than this SDK build.
+     */
+    [[nodiscard]] const std::set<std::string> &RawResetKeys() const noexcept { return raw_reset_; }
+
+    /**
+     * @brief Resets a setting by name to its server default.
+     *
+     * Use this for keys newer than this SDK build. The server decides whether
+     * the key exists and may be reset.
+     * @param key Setting name to reset.
+     * @return Reference to this options object.
+     */
+    UserUpdateOptions &RawReset(std::string key) {
+        raw_reset_.insert(std::move(key));
+        return *this;
+    }
+
   private:
+    std::optional<std::string> username_;
+    std::optional<UserStatus> status_;
     std::map<std::string, std::string> raw_;
+    std::set<UserOptionKey> reset_;
+    std::set<std::string> raw_reset_;
 
     friend class IggyBlockingClient;
 };
+
+/**
+ * @brief Resource kind whose option catalog DescribeOptions() serves.
+ */
+enum class OptionsScope : std::uint8_t {
+    Topic  = 1,
+    Stream = 2,
+    User   = 3,
+};
+
+constexpr std::string_view to_string(const OptionsScope scope) {
+    switch (scope) {
+        case OptionsScope::Topic:
+            return "topic";
+        case OptionsScope::Stream:
+            return "stream";
+        case OptionsScope::User:
+            return "user";
+    }
+    throw std::invalid_argument("Unknown options scope");
+}
+
+/**
+ * @brief One key of a resource's option catalog.
+ *
+ * DescribeOptions() returns these values. The flags say what a create or an
+ * update accepts for the key: binary transports report a refused key by error
+ * code only, so this is the discovery surface for valid keys.
+ */
+class OptionSpec final {
+  public:
+    /**
+     * @brief Returns the option key.
+     * @return Key name owned by this value.
+     */
+    [[nodiscard]] const std::string &Key() const noexcept { return key_; }
+
+    /**
+     * @brief Returns the kind the value is encoded under.
+     * @return Header kind of the value and of DefaultValue().
+     */
+    [[nodiscard]] HeaderKind Kind() const noexcept { return kind_; }
+
+    /**
+     * @brief Returns the key's default in Kind()'s encoding.
+     * @return Encoded default, empty when the key has no default.
+     */
+    [[nodiscard]] const std::vector<std::uint8_t> &DefaultValue() const noexcept { return default_value_; }
+
+    /**
+     * @brief Returns the human-readable description.
+     * @return Description owned by this value.
+     */
+    [[nodiscard]] const std::string &Description() const noexcept { return description_; }
+
+    /** @brief Returns whether an update may set the key. */
+    [[nodiscard]] bool Updatable() const noexcept { return updatable_; }
+
+    /** @brief Returns whether an update may reset the key to its default. */
+    [[nodiscard]] bool Resettable() const noexcept { return resettable_; }
+
+    /** @brief Returns whether the key is write-only and never returned. */
+    [[nodiscard]] bool Secret() const noexcept { return secret_; }
+
+    /** @brief Returns whether the server computes the key on reads only. */
+    [[nodiscard]] bool ReadOnly() const noexcept { return read_only_; }
+
+    /** @brief Returns whether a node that does not understand the key refuses to serve the resource. */
+    [[nodiscard]] bool Critical() const noexcept { return critical_; }
+
+  private:
+    OptionSpec(std::string key,
+               HeaderKind kind,
+               std::vector<std::uint8_t> default_value,
+               std::string description,
+               bool updatable,
+               bool resettable,
+               bool secret,
+               bool read_only,
+               bool critical)
+        : key_(std::move(key)),
+          kind_(kind),
+          default_value_(std::move(default_value)),
+          description_(std::move(description)),
+          updatable_(updatable),
+          resettable_(resettable),
+          secret_(secret),
+          read_only_(read_only),
+          critical_(critical) {}
+
+    static OptionSpec FromFfi(ffi::OptionSpec spec);
+
+    friend class IggyBlockingClient;
+
+    std::string key_;
+    HeaderKind kind_;
+    std::vector<std::uint8_t> default_value_;
+    std::string description_;
+    bool updatable_;
+    bool resettable_;
+    bool secret_;
+    bool read_only_;
+    bool critical_;
+};
+
+/**
+ * @brief Computes the fingerprint of a stream encryption key.
+ *
+ * The fingerprint is 16 lowercase hex characters, the same value reads
+ * report through StreamDetails::EncryptionKeyFingerprint(). It is computed
+ * locally and identifies a key without revealing it.
+ *
+ * @param key Exactly 32 raw key bytes.
+ * @return Key fingerprint.
+ * @throws IggyException with Kind() invalid_encryption_key when @p key is not
+ *         32 bytes long. The message never contains key material.
+ */
+std::string EncryptionKeyFingerprint(const std::vector<std::uint8_t> &key);
+
+/**
+ * @brief Computes the fingerprint of a stream encryption key given as base64.
+ *
+ * Takes the same form as StreamCreateOptions::SetEncryptionKeyBase64().
+ *
+ * @param key_base64 Canonical standard padded base64 of exactly 32 bytes.
+ * @return Key fingerprint.
+ * @throws IggyException with Kind() invalid_encryption_key when @p key_base64
+ *         is not canonical or does not decode to 32 bytes. The message never
+ *         contains key material.
+ */
+std::string EncryptionKeyFingerprint(const std::string &key_base64);
 
 /**
  * @brief Starting position for polling messages.
@@ -3341,6 +4041,7 @@ class PollingStrategy final {
  *
  * - Login(), Logout(), ResolveOperation(), and AbandonOperation().
  * - CreateUser(), UpdateUser(), and DeleteUser().
+ * - EncryptionKeyFingerprint() and invalid keys passed to CreateStream().
  * - CreateStream(), UpdateStream(), and DeleteStream().
  * - CreateTopic(), UpdateTopic(), and DeleteTopic().
  * - CreatePartitions(), DeletePartitions(), and DeleteSegments().
@@ -3620,16 +4321,18 @@ class IggyBlockingClient final {
      * @param password Initial user password.
      * @param status Initial authentication status.
      * @param permissions Optional permission assignment.
+     * @param options User creation options.
      * @return Details of the newly created user.
-     * @throws IggyException if the client is unavailable or unauthenticated;
-     *         the name, password, status, or permissions are invalid; the name
-     *         is already in use; the caller lacks manage-users permission; or
-     *         the request fails.
+     * @throws IggyException if the client is unavailable or unauthenticated,
+     *         the name, password, status, permissions, or an option are
+     *         invalid, the name is already in use, the caller lacks
+     *         manage-users permission, or the request fails.
      */
     UserInfoDetails CreateUser(std::string username,
                                std::string password,
                                UserStatus status,
-                               const std::optional<Permissions> &permissions = std::nullopt);
+                               const std::optional<Permissions> &permissions = std::nullopt,
+                               const UserCreateOptions &options              = {});
 
     /**
      * @brief Deletes a user account.
@@ -3650,33 +4353,26 @@ class IggyBlockingClient final {
     /**
      * @brief Changes a user's name, status, and mutable settings.
      *
-     * A supplied name must contain between 3 and 50 bytes and remain unique.
-     * Setting the status to inactive prevents subsequent authentication.
-     * Passing `std::nullopt` for the name or status leaves that field
-     * unchanged. The supplied UserUpdateOptions changes only the settings it
-     * contains; settings left unset retain their current values. User settings
-     * are currently not mutable, so the options object must be empty. Passing
-     * `std::nullopt` for both fields and an empty options object is accepted as
-     * a no-op.
+     * The supplied UserUpdateOptions changes only the settings it contains.
+     * Settings left unset retain their current values. A supplied name must
+     * contain between 3 and 50 bytes and remain unique. Setting the status to
+     * inactive prevents subsequent authentication. An update that changes
+     * nothing, sets and resets the same setting, or resets a typed user
+     * setting is refused before anything is sent. Renaming the authenticated user also
+     * updates the credentials the client uses when it reconnects.
      *
      * A failed or unknown transport outcome can leave the update committed.
      * Retrieve the user before retrying with different values.
      *
      * @param user User to update, addressed by numeric ID or name.
-     * @param username New unique name, or `std::nullopt` to retain the name.
-     * @param status New authentication status, or `std::nullopt` to retain the
-     *        status.
-     * @param options User update options.
-     * @throws IggyException if the client is unavailable or unauthenticated;
-     *         an identifier, name, status, or option is invalid; an option is
-     *         unsupported; the user does not exist; the name is already in
-     *         use; the caller lacks manage-users permission; or the request
-     *         fails.
+     * @param options Settings to change.
+     * @throws IggyException if the client is unavailable or unauthenticated,
+     *         an identifier, name, status, or option is invalid, an option is
+     *         unsupported or not resettable, the user does not exist, the name
+     *         is already in use, the caller lacks manage-users permission, or
+     *         the request fails.
      */
-    void UpdateUser(const Identifier &user,
-                    std::optional<std::string> username,
-                    std::optional<UserStatus> status,
-                    const UserUpdateOptions &options = {});
+    void UpdateUser(const Identifier &user, const UserUpdateOptions &options);
 
     /**
      * @brief Creates a top-level stream in the cluster metadata.
@@ -3685,29 +4381,41 @@ class IggyBlockingClient final {
      * partitions, or messages. Its name must be unique, non-empty, and no more
      * than 255 UTF-8 bytes.
      *
+     * StreamCreateOptions may carry the stream's own encryption key. The key
+     * travels in the request, the server stores it wrapped and never returns
+     * it, and the result reports only its source and fingerprints. Without a
+     * key, a server with encryption enabled generates one for the stream. An
+     * invalid key is refused before anything is sent.
+     *
      * A transport failure after submission can leave the stream created. Look
      * it up by name before retrying or choosing another name.
      *
      * @param name Unique stream name.
+     * @param options Stream creation options.
      * @return Details of the newly created, topic-less stream.
-     * @throws IggyException if the client is unavailable or unauthenticated;
-     *         the name is invalid or already in use; the caller lacks
-     *         stream-management permission; or the request fails.
+     * @throws IggyException if the client is unavailable or unauthenticated,
+     *         the name, the key, or an option is invalid, the name is already
+     *         in use, the caller lacks stream-management permission, or the
+     *         request fails.
      */
-    StreamDetails CreateStream(std::string name);
+    StreamDetails CreateStream(std::string name, const StreamCreateOptions &options = {});
 
     /**
-     * @brief Renames a stream.
+     * @brief Renames a stream or changes its mutable settings.
      *
-     * @param stream Stream to rename, addressed by numeric ID or name.
-     * @param name New unique stream name.
-     * @param options Stream update options (currently no updatable keys; `raw`
-     *        carries forward-compatible keys, each rejected until catalogued).
+     * The supplied StreamUpdateOptions changes only the settings it contains.
+     * Renaming keeps the stream's ID, encryption key, and data. An update that
+     * changes nothing or resets any stream setting is refused before anything
+     * is sent.
+     *
+     * @param stream Stream to update, addressed by numeric ID or name.
+     * @param options Settings to change.
      * @throws IggyException if the client is unavailable, the caller lacks
-     *         stream-management permission, either value is invalid, the stream
-     *         does not exist, the name is already taken, or the request fails.
+     *         stream-management permission, a value is invalid, a setting is
+     *         not updatable or resettable, the stream does not exist, the name
+     *         is already taken, or the request fails.
      */
-    void UpdateStream(const Identifier &stream, std::string name, const StreamUpdateOptions &options = {});
+    void UpdateStream(const Identifier &stream, const StreamUpdateOptions &options);
 
     /**
      * @brief Lists stream summaries visible to the authenticated user.
@@ -3768,27 +4476,27 @@ class IggyBlockingClient final {
     TopicDetails CreateTopic(const Identifier &stream, std::string name, const TopicCreateOptions &options = {});
 
     /**
-     * @brief Renames a topic and updates its mutable configuration.
+     * @brief Renames a topic, changes its mutable settings, or resets them.
      *
      * The supplied TopicUpdateOptions changes only the settings it contains;
-     * settings left unset retain their current values. Topic creation settings,
-     * such as the partition count and segment size, cannot be changed after the
-     * topic is created. Use SetRawEntries() for supported mutable settings
-     * without a dedicated setter.
+     * settings left unset retain their current values and their provenance.
+     * Topic creation settings, such as the compression algorithm, partition
+     * count, and segment size, cannot be changed after the topic is created.
+     * Use SetRawEntries() for supported mutable settings without a dedicated
+     * setter. An update that changes nothing, sets and resets the same
+     * setting, or resets a setting that has no default is refused before
+     * anything is sent.
      *
      * @param stream Parent stream, addressed by numeric ID or name.
      * @param topic Topic to update, addressed by numeric ID or name.
-     * @param name New unique topic name within @p stream.
-     * @param options Topic update options.
-     * @throws IggyException if the client is unavailable or unauthenticated;
-     *         an identifier, name, setting, or option is invalid; the stream or
-     *         topic does not exist; the caller lacks permission; or the server
-     *         rejects or cannot commit the write.
+     * @param options Settings to change or reset.
+     * @throws IggyException if the client is unavailable or unauthenticated,
+     *         an identifier, name, setting, or option is invalid, a setting is
+     *         not updatable or resettable, the stream or topic does not exist,
+     *         the caller lacks permission, or the server rejects or cannot
+     *         commit the write.
      */
-    void UpdateTopic(const Identifier &stream,
-                     const Identifier &topic,
-                     std::string name,
-                     const TopicUpdateOptions &options = {});
+    void UpdateTopic(const Identifier &stream, const Identifier &topic, const TopicUpdateOptions &options);
 
     /**
      * @brief Lists topic summaries in a stream.
@@ -4176,6 +4884,20 @@ class IggyBlockingClient final {
      *         the request fails.
      */
     std::vector<ClientInfo> GetClients();
+
+    /**
+     * @brief Returns the option catalog of one resource scope.
+     *
+     * Each entry names a key with its kind, default, description, and whether
+     * an update may set or reset it, whether it is secret, read-only, or
+     * critical. Internal keys are not listed.
+     *
+     * @param scope Resource scope to describe.
+     * @return Catalog entries in catalog order.
+     * @throws IggyException if the client is unavailable or unauthenticated,
+     *         or the request fails.
+     */
+    std::vector<OptionSpec> DescribeOptions(OptionsScope scope);
 
     /**
      * @brief Retrieves server process, storage, and resource statistics.

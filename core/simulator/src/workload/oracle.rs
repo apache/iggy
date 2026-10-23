@@ -52,7 +52,7 @@ use consensus::{Consensus, MetadataHandle, PartitionsHandle, Status};
 use iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner;
 use iggy_binary_protocol::requests::partitions::RetireConsumerGroupOwnersRequest;
 use iggy_binary_protocol::{Operation, WireDecode};
-use iggy_common::ConsumerKind;
+use iggy_common::{ConsumerKind, ResourceOptions, UserStatus};
 use metadata::impls::metadata::StreamsFrontend;
 use server_common::sharding::IggyNamespace;
 use std::collections::{BTreeMap, BTreeSet};
@@ -78,6 +78,9 @@ pub(crate) const QUIESCE_SETTLE_TICKS: u64 = 200;
 /// covers the fence and the completion committing through the view changes that
 /// crashes leave behind.
 pub(crate) const PENDING_REVOCATION_TIMEOUTS_MAX: u64 = 2;
+
+/// Everything [`assert_committed_metadata_agrees`] compares for one replica.
+type ReplicaState = (CommittedMetadata, CommittedSettings);
 
 /// Committed metadata entity sets read from one replica. Stored sorted so
 /// equality is independent of slab / hashmap iteration order, which is not
@@ -113,6 +116,17 @@ impl CommittedMetadata {
         });
         self
     }
+}
+
+/// Committed state the name-keyed shadow does not predict, compared only across
+/// replicas: every value was resolved before its prepare committed.
+#[derive(Debug, PartialEq)]
+struct CommittedSettings {
+    /// Created op and options per stream name.
+    streams: BTreeMap<String, (u64, ResourceOptions)>,
+    topics: BTreeMap<(String, String), ResourceOptions>,
+    /// Status and options per username.
+    users: BTreeMap<String, (UserStatus, ResourceOptions)>,
 }
 
 /// Drain the system after the active workload, then settle.
@@ -780,7 +794,7 @@ fn assert_hosted_incarnations_named(
 /// consensus, so they agree only while the seed runs at the same point on every
 /// replica, and a divergence there is the slab-order bug.
 fn assert_committed_metadata_agrees(sim: &Simulator, live: &[usize], seed: u64) -> usize {
-    let mut by_commit: BTreeMap<u64, (usize, CommittedMetadata)> = BTreeMap::new();
+    let mut by_commit: BTreeMap<u64, (usize, ReplicaState)> = BTreeMap::new();
     let mut compared = 0;
     for &replica_idx in live {
         let Some(consensus) = sim.replicas[replica_idx].shards[0]
@@ -791,7 +805,7 @@ fn assert_committed_metadata_agrees(sim: &Simulator, live: &[usize], seed: u64) 
         else {
             continue;
         };
-        let committed = read_committed_metadata(&sim.replicas[replica_idx].shards[0]);
+        let committed = read_replica_state(&sim.replicas[replica_idx].shards[0]);
         match by_commit.get(&consensus.commit_min()) {
             Some((owner, canonical)) => {
                 assert_eq!(
@@ -1065,6 +1079,13 @@ fn pending_revocation_bound_micros() -> u64 {
 
 /// Read one replica's committed metadata. `read` enters the committed (left)
 /// buffer of the left-right state machine, so uncommitted writes are invisible.
+fn read_replica_state(replica: &Replica) -> ReplicaState {
+    (
+        read_committed_metadata(replica),
+        read_committed_settings(replica),
+    )
+}
+
 fn read_committed_metadata(replica: &Replica) -> CommittedMetadata {
     let stm = &replica.plane.metadata().mux_stm;
 
@@ -1106,6 +1127,42 @@ fn read_committed_metadata(replica: &Replica) -> CommittedMetadata {
     }
 }
 
+fn read_committed_settings(replica: &Replica) -> CommittedSettings {
+    let stm = &replica.plane.metadata().mux_stm;
+    let (streams, topics) = stm.streams().read(|inner| {
+        let mut streams = BTreeMap::new();
+        let mut topics = BTreeMap::new();
+        for (_, stream) in &inner.items {
+            let stream_name = stream.name.to_string();
+            for (_, topic) in &stream.topics {
+                topics.insert(
+                    (stream_name.clone(), topic.name.to_string()),
+                    topic.options.clone(),
+                );
+            }
+            streams.insert(stream_name, (stream.created_op, stream.options.clone()));
+        }
+        (streams, topics)
+    });
+    let users = stm.users().read(|inner| {
+        inner
+            .items
+            .iter()
+            .map(|(_, user)| {
+                (
+                    user.username.to_string(),
+                    (user.status, user.options.clone()),
+                )
+            })
+            .collect()
+    });
+    CommittedSettings {
+        streams,
+        topics,
+        users,
+    }
+}
+
 /// Project the shadow's predicted entity sets into the comparable shape. All
 /// shadow names carry [`WORKLOAD_PREFIX`], so this lines up with
 /// [`CommittedMetadata::workload_owned`].
@@ -1122,15 +1179,18 @@ fn shadow_metadata(shadow: &Shadow) -> CommittedMetadata {
 mod tests {
     use super::*;
     use crate::packet::PacketSimulatorOptions;
-    use crate::tests::commit_sends_everywhere;
+    use crate::partition_repair_driver_tests::cluster;
+    use crate::tests::{commit_sends_everywhere, complete_metadata_op};
     use crate::workload::actions::Action;
     use crate::workload::effect::Effect;
     use crate::workload::options::{ActionWeights, WorkloadOptions};
     use crate::workload::{create_fixture_groups, run_group_lifecycle};
     use iggy_binary_protocol::batch::{BATCH_HEADER_SIZE, BATCH_MESSAGE_HEADER_SIZE};
     use iggy_binary_protocol::{HEADER_SIZE, Operation};
+    use iggy_common::{IggyDuration, IggyExpiry, TopicUpdateOptions};
     use journal::Journal;
     use server_common::iobuf::Owned;
+    use std::time::Duration;
 
     const SEED: u64 = 0x000F_F5E7;
     const CLIENT: u128 = 1;
@@ -1175,6 +1235,58 @@ mod tests {
             .get_by_ns(&namespace())
             .unwrap()
             .seed_recovered_consumer_offset(ConsumerKind::Consumer, CONSUMER, OFFSET, OFFSET);
+    }
+
+    #[test]
+    fn given_committed_setting_changes_when_reading_replica_state_should_see_each() {
+        const STREAM: &str = "wl-settings-stream";
+        const TOPIC: &str = "wl-settings-topic";
+        const USER: &str = "wl-settings-user";
+        let (mut sim, client) = cluster(SEED);
+        sim.register_client_with_primary(&client);
+        let state = |sim: &Simulator| read_replica_state(&sim.replicas[0].shards[0]);
+        complete_metadata_op(&mut sim, &client, client.create_stream(STREAM));
+        complete_metadata_op(&mut sim, &client, client.create_topic(STREAM, TOPIC, 1));
+        complete_metadata_op(
+            &mut sim,
+            &client,
+            client.create_user(USER, "pw-settings", UserStatus::Active.as_code()),
+        );
+        let created = state(&sim);
+
+        let expiry = IggyDuration::from(Duration::from_secs(60));
+        let options = TopicUpdateOptions {
+            message_expiry: Some(IggyExpiry::ExpireDuration(expiry)),
+            ..TopicUpdateOptions::default()
+        };
+        complete_metadata_op(
+            &mut sim,
+            &client,
+            client.update_topic(STREAM, TOPIC, &options),
+        );
+        let expiry_set = state(&sim);
+        assert_ne!(
+            created, expiry_set,
+            "a topic option change must be compared"
+        );
+
+        let deactivate = client.update_user(USER, None, Some(UserStatus::Inactive));
+        complete_metadata_op(&mut sim, &client, deactivate);
+        let deactivated = state(&sim);
+        assert_ne!(
+            expiry_set, deactivated,
+            "a user status change must be compared"
+        );
+
+        complete_metadata_op(&mut sim, &client, client.delete_topic(STREAM, TOPIC));
+        let first_incarnation = state(&sim);
+        complete_metadata_op(&mut sim, &client, client.delete_stream(STREAM));
+        complete_metadata_op(&mut sim, &client, client.create_stream(STREAM));
+        assert_ne!(
+            first_incarnation,
+            state(&sim),
+            "a recreated stream of the same name must be compared"
+        );
     }
 
     #[test]

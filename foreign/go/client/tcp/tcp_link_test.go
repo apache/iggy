@@ -20,6 +20,7 @@ package tcp
 import (
 	"context"
 	"encoding/binary"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -72,6 +73,22 @@ func TestTCPLinkCorrelatesReorderedRepliesAndIsolatesCancellation(t *testing.T) 
 		require.Equal(t, []byte{2}, reply.body)
 	case <-time.After(time.Second):
 		t.Fatal("second exchange was disrupted by another caller's cancellation")
+	}
+}
+
+func TestTCPLinkCancelledCallerNeverSendsItsFrame(t *testing.T) {
+	client, server := net.Pipe()
+	link := newTCPLink(client, "pipe")
+	t.Cleanup(func() { link.close(ierror.ErrClientShutdown); _ = server.Close(); link.done.Wait() })
+	go func() { _, _ = io.Copy(io.Discard, server) }()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for id := uint64(1); id <= 100; id++ {
+		frame := linkTestFrame(id)
+		reply, sent := link.exchange(ctx, frame)
+		frame.release()
+		require.False(t, sent, "a cancelled caller sent request %d", id)
+		require.ErrorIs(t, reply.err, ierror.ErrTransientNotAccepted)
 	}
 }
 

@@ -64,7 +64,14 @@ class IggyValidationExceptionTest {
                 "TOO_MANY_MESSAGES",
                 "EMPTY_MESSAGE_PAYLOAD",
                 "TOO_BIG_MESSAGE_PAYLOAD",
-                "INVALID_MESSAGE_CHECKSUM"
+                "INVALID_MESSAGE_CHECKSUM",
+                "INVALID_ENCRYPTION_KEY",
+                "UNSUPPORTED_OPTION_KEY",
+                "INVALID_OPTION_VALUE",
+                "OPTIONS_BLOCK_TOO_LARGE",
+                "OPTION_NOT_UPDATABLE",
+                "OPTION_NOT_RESETTABLE",
+                "READ_ONLY_OPTION"
             })
     void matchesReturnsTrueForValidationRelatedCodes(IggyErrorCode code) {
         assertThat(IggyValidationException.matches(code)).isTrue();
@@ -92,7 +99,14 @@ class IggyValidationExceptionTest {
                 "TOO_MANY_MESSAGES",
                 "EMPTY_MESSAGE_PAYLOAD",
                 "TOO_BIG_MESSAGE_PAYLOAD",
-                "INVALID_MESSAGE_CHECKSUM"
+                "INVALID_MESSAGE_CHECKSUM",
+                "INVALID_ENCRYPTION_KEY",
+                "UNSUPPORTED_OPTION_KEY",
+                "INVALID_OPTION_VALUE",
+                "OPTIONS_BLOCK_TOO_LARGE",
+                "OPTION_NOT_UPDATABLE",
+                "OPTION_NOT_RESETTABLE",
+                "READ_ONLY_OPTION"
             },
             mode = Mode.EXCLUDE)
     void matchesReturnsFalseForNonValidationRelatedCodes(IggyErrorCode code) {

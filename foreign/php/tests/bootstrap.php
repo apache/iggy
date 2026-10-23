@@ -141,6 +141,34 @@ function new_connection_string_client(): IggyClient
     return $client;
 }
 
+/**
+ * Logged-in client for one transport. QUIC, HTTP and WebSocket addresses default to the
+ * server's default ports on the TCP host.
+ */
+function new_transport_client(string $transport): IggyClient
+{
+    if ($transport === 'tcp') {
+        return new_client();
+    }
+
+    $schemes = ['quic' => 'iggy+quic', 'http' => 'iggy+http', 'websocket' => 'iggy+ws'];
+    $addresses = [
+        'quic' => env_or_default('IGGY_QUIC_ADDRESS', server_host() . ':8080'),
+        'http' => env_or_default('IGGY_HTTP_ADDRESS', server_host() . ':3000'),
+        'websocket' => env_or_default('IGGY_WEBSOCKET_ADDRESS', server_host() . ':8092'),
+    ];
+    $username = rawurlencode(env_or_default('IGGY_ROOT_USERNAME', 'iggy'));
+    $password = rawurlencode(env_or_default('IGGY_ROOT_PASSWORD', 'iggy'));
+
+    $client = IggyClient::fromConnectionString("{$schemes[$transport]}://{$username}:{$password}@{$addresses[$transport]}");
+    $client->connect();
+    if ($transport === 'http') {
+        $client->loginUser(env_or_default('IGGY_ROOT_USERNAME', 'iggy'), env_or_default('IGGY_ROOT_PASSWORD', 'iggy'));
+    }
+
+    return $client;
+}
+
 function create_stream_and_topic(object $client, string $stream, string $topic, int $partitions = 1): void
 {
     $client->createStream($stream);

@@ -31,7 +31,7 @@ import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.stream.StreamBase;
 import org.apache.iggy.stream.StreamDetails;
-import org.apache.iggy.topic.CompressionAlgorithm;
+import org.apache.iggy.stream.StreamUpdate;
 import org.apache.iggy.topic.TopicDetails;
 
 import java.math.BigInteger;
@@ -126,7 +126,11 @@ public class BasicMessagingSteps {
 
     @When("I update the stream name to {string}")
     public void updateStreamName(String streamName) {
-        getClient().streams().updateStream(context.lastStreamId, streamName);
+        getClient()
+                .streams()
+                .updateStream(
+                        context.lastStreamId,
+                        StreamUpdate.builder().name(streamName).build());
     }
 
     @Then("getting the stream by its numeric ID should return name {string}")
@@ -156,15 +160,7 @@ public class BasicMessagingSteps {
 
     @When("I create a topic with name {string} in stream {int} with {int} partitions")
     public void createTopic(String topicName, int streamId, int partitions) {
-        TopicDetails topic = getClient()
-                .topics()
-                .createTopic(
-                        (long) streamId,
-                        (long) partitions,
-                        CompressionAlgorithm.None,
-                        BigInteger.ZERO,
-                        BigInteger.ZERO,
-                        topicName);
+        TopicDetails topic = getClient().topics().createTopic((long) streamId, topicName, (long) partitions);
 
         context.lastTopicId = topic.id();
         context.lastTopicName = topic.name();

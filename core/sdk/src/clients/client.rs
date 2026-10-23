@@ -1112,7 +1112,9 @@ mod tests {
     use iggy_binary_protocol::codes::{
         CREATE_STREAM_CODE, GET_STATS_CODE, SYNC_CONSUMER_GROUP_CODE,
     };
-    use iggy_common::{StreamClient, TcpClientConfig, TcpClientReconnectionConfig};
+    use iggy_common::{
+        StreamClient, StreamCreateOptions, TcpClientConfig, TcpClientReconnectionConfig,
+    };
     use std::iter::repeat_n;
     use std::time::Duration;
     use tokio::net::TcpListener;
@@ -1157,7 +1159,8 @@ mod tests {
         let client_lock = client.client.clone();
         let guard = client_lock.write().await;
         let start = tokio::time::Instant::now();
-        let (result, ()) = tokio::join!(client.create_stream("stream"), async {
+        let options = StreamCreateOptions::default();
+        let (result, ()) = tokio::join!(client.create_stream("stream", &options), async {
             sleep(Duration::from_secs(20)).await;
             drop(guard);
         });

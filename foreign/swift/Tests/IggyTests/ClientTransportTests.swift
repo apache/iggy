@@ -199,7 +199,8 @@ struct ClientTransportTests {
         #expect(requests[0].session == 0 && requests[0].requestID == 0 && requests[0].checksum != 0)
         #expect(requests[1].code == CommandCode.getClusterMetadata.rawValue)
         #expect(requests[2].code == CommandCode.ping.rawValue && requests[2].session == 1)
-        #expect(requests[3].session == 1 && requests[3].checksum == XXH3.hash64(requests[3].payload))
+        #expect(requests[3].session == 1 && requests[3].checksum != XXH3.hash64(requests[3].payload))
+        #expect(requests[3].checksum != requests[4].checksum)
         #expect(requests[5].checksum == 0)
         #expect(requests.allSatisfy { $0.clientID == requests[0].clientID })
         #expect(await client.serverAddress == server.address)
@@ -2102,7 +2103,7 @@ struct ClientTransportTests {
         await Self.forgetSessions(on: server)
         let client = makeClient(server)
         try await client.connect()
-        try await client.updateUser("iggy", username: "renamed")
+        try await client.updateUser("iggy", options: UserUpdateOptions(username: "renamed"))
         await server.closeAllConnections()
         try await Task.sleep(for: .milliseconds(20))
         try await client.ping()
@@ -2119,6 +2120,22 @@ struct ClientTransportTests {
         let latest = await server.requests.filter { $0.operation == .register }.last!
         #expect(Self.username(in: latest.payload) == "renamed")
         #expect(Self.password(in: latest.payload) == "new-secret")
+        await client.shutdown()
+    }
+
+    @Test func rawUsernameRenameUpdatesTheReconnectCredentials() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        await Self.forgetSessions(on: server)
+        let client = makeClient(server)
+        try await client.connect()
+        try await client.updateUser("iggy", options: UserUpdateOptions(raw: [UserOptionKey.username.rawValue: "renamed"]))
+        await server.closeAllConnections()
+        try await Task.sleep(for: .milliseconds(20))
+        try await client.ping()
+        let registers = await server.requests.filter { $0.operation == .register }
+        #expect(registers.count == 2)
+        #expect(Self.username(in: registers[1].payload) == "renamed")
         await client.shutdown()
     }
 
@@ -2145,8 +2162,8 @@ struct ClientTransportTests {
         await Self.forgetSessions(on: server)
         let client = makeClient(server)
         try await client.connect()
-        let rename = try Requests.updateUser(userID: "iggy", username: "renamed", status: nil, options: [])
-        _ = try await client.sendRawRequest(code: CommandCode.updateUser.rawValue, payload: rename)
+        let rename = try Requests.updateResource(.user("iggy"), try UserUpdateOptions(username: "renamed").toPatch())
+        _ = try await client.sendRawRequest(code: CommandCode.updateResource.rawValue, payload: rename)
         await server.closeAllConnections()
         try await Task.sleep(for: .milliseconds(20))
         try await client.ping()

@@ -106,7 +106,7 @@ async fn given_a_follower_when_its_register_binds_a_committed_epoch_should_not_r
     for round in 0..ROUNDS {
         let stream = format!("read-your-writes-{round}");
         seeder
-            .create_stream(&stream)
+            .create_stream(&stream, &StreamCreateOptions::default())
             .await
             .expect("the primary must commit the stream this round reads back");
 

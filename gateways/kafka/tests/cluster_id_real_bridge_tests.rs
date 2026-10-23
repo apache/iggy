@@ -25,8 +25,8 @@ use bytes::Bytes;
 use futures::future::join_all;
 use iggy::prelude::{
     Consumer, Durability, Identifier, IggyExpiry, IggyMessage, MaxTopicSize, MessageClient,
-    Partitioning, Permissions, PollingStrategy, StreamClient, StreamPermissions, TopicClient,
-    TopicCreateOptions, UserClient, UserStatus,
+    Partitioning, Permissions, PollingStrategy, StreamClient, StreamCreateOptions,
+    StreamPermissions, TopicClient, TopicCreateOptions, UserClient, UserCreateOptions, UserStatus,
 };
 use kafka_protocol::messages::{DescribeClusterResponse, MetadataResponse};
 use kafka_protocol::protocol::Decodable;
@@ -70,7 +70,10 @@ async fn connect_scoped(
 ) -> IggyBridge {
     let raw = raw_client(server).await;
     let stream = raw
-        .create_stream(&cluster_id_stream(DEFAULT_STREAM))
+        .create_stream(
+            &cluster_id_stream(DEFAULT_STREAM),
+            &StreamCreateOptions::default(),
+        )
         .await
         .expect("create stream");
     raw.create_user(
@@ -81,6 +84,7 @@ async fn connect_scoped(
             streams: Some(BTreeMap::from([(stream.id as usize, permissions)])),
             ..Permissions::default()
         }),
+        &UserCreateOptions::default(),
     )
     .await
     .expect("create user");
@@ -179,8 +183,9 @@ async fn given_a_new_id_when_stored_should_be_persisted_never_expire_and_have_no
         .expect("get_topic")
         .expect("the id topic exists");
     assert_eq!(topic.partitions_count, 1);
-    assert_eq!(topic.message_expiry, IggyExpiry::NeverExpire);
-    assert_eq!(topic.max_topic_size, MaxTopicSize::Unlimited);
+    let resolved = topic.resolved_options();
+    assert_eq!(resolved.message_expiry, IggyExpiry::NeverExpire);
+    assert_eq!(resolved.max_topic_size, MaxTopicSize::Unlimited);
     assert_eq!(
         TopicCreateOptions::from_resource_options(&topic.options).durability,
         Durability::Persisted
@@ -244,7 +249,7 @@ async fn given_a_stored_message_that_is_not_an_id_when_loaded_should_refuse_it()
     let server = TestServer::spawn(data_dir.path()).await;
     let raw = raw_client(&server).await;
     let stream_name = cluster_id_stream(DEFAULT_STREAM);
-    raw.create_stream(&stream_name)
+    raw.create_stream(&stream_name, &StreamCreateOptions::default())
         .await
         .expect("create stream");
     let stream_id = Identifier::named(&stream_name).expect("stream name");

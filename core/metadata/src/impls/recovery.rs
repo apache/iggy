@@ -912,7 +912,7 @@ mod tests {
     use iggy_binary_protocol::primitives::permissions::{WireGlobalPermissions, WirePermissions};
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
     use iggy_binary_protocol::requests::users::{
-        CreateUserRequest, DeleteUserRequest, UpdateUserRequest,
+        CreateUserRequest, DeleteUserRequest, UpdateUserResolvedRequest,
     };
     use iggy_binary_protocol::{WireEncode, WireIdentifier, WireName, WireOptions, result_code};
     use iggy_common::UserStatus;
@@ -2382,9 +2382,9 @@ mod tests {
         type UserStm = MuxStateMachine<iggy_common::variadic!(Users, Streams)>;
         for (operation, register_first, replace) in [
             (Operation::DeleteUser, true, false),
-            (Operation::UpdateUser, true, false),
+            (Operation::UpdateUserResolved, true, false),
             (Operation::DeleteUser, false, false),
-            (Operation::UpdateUser, false, false),
+            (Operation::UpdateUserResolved, false, false),
             (Operation::DeleteUser, false, true),
         ] {
             let directory = tempdir().unwrap();
@@ -2411,11 +2411,12 @@ mod tests {
                 }
                 .to_bytes()
             } else {
-                UpdateUserRequest {
+                UpdateUserResolvedRequest {
                     user_id: WireIdentifier::numeric(USER),
                     username: None,
                     status: Some(UserStatus::Inactive.as_code()),
-                    options: WireOptions::empty(),
+                    explicit_options: WireOptions::empty(),
+                    derived_options: WireOptions::empty(),
                 }
                 .to_bytes()
             };

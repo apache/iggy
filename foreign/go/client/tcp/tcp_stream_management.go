@@ -54,11 +54,15 @@ func (c *IggyTcpClient) GetStream(ctx context.Context, streamId iggcon.Identifie
 	return stream, nil
 }
 
-func (c *IggyTcpClient) CreateStream(ctx context.Context, name string) (*iggcon.StreamDetails, error) {
+func (c *IggyTcpClient) CreateStream(ctx context.Context, name string, options *iggcon.StreamOptions) (*iggcon.StreamDetails, error) {
 	if len(name) == 0 || MaxStringLength < len(name) {
 		return nil, ierror.ErrInvalidStreamName
 	}
-	buffer, err := c.do(ctx, &command.CreateStream{Name: name})
+	request := &command.CreateStream{Name: name}
+	if options != nil {
+		request.Options = *options
+	}
+	buffer, err := c.do(ctx, request)
 	if err != nil {
 		return nil, err
 	}
@@ -70,11 +74,14 @@ func (c *IggyTcpClient) CreateStream(ctx context.Context, name string) (*iggcon.
 	return stream, err
 }
 
-func (c *IggyTcpClient) UpdateStream(ctx context.Context, streamId iggcon.Identifier, name string) error {
-	if len(name) > MaxStringLength || len(name) == 0 {
-		return ierror.ErrInvalidStreamName
-	}
-	_, err := c.do(ctx, &command.UpdateStream{StreamId: streamId, Name: name})
+func (c *IggyTcpClient) UpdateStream(ctx context.Context, streamId iggcon.Identifier, update iggcon.StreamUpdate) error {
+	_, err := c.do(ctx, &command.UpdateStream{
+		StreamId: streamId,
+		Name:     update.Name,
+		Reset:    update.Reset,
+		RawReset: update.RawReset,
+		Options:  update.Options,
+	})
 	return err
 }
 

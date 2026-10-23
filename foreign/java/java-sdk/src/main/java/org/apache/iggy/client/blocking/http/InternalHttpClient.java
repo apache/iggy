@@ -217,7 +217,7 @@ final class InternalHttpClient implements Closeable {
 
     private ClassicHttpRequest addRequestBody(ClassicRequestBuilder requestBuilder, Object body) {
         var encodedBody = objectMapper.writeValueAsString(body);
-        log.debug("Request body: {}", encodedBody);
+        log.debug("Request body: {} bytes", encodedBody.length());
         return requestBuilder
                 .setHeader("Content-Type", "application/json")
                 .setEntity(encodedBody)

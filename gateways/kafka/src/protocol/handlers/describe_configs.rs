@@ -334,8 +334,8 @@ mod tests {
     use std::str::FromStr;
 
     use iggy::prelude::{
-        CompressionAlgorithm, HeaderKey, HeaderValue, IggyByteSize, IggyExpiry, IggyTimestamp,
-        MaxTopicSize, OptionValue, ResourceOptions, TopicDetails, topic_option_keys,
+        HeaderKey, HeaderValue, IggyByteSize, IggyExpiry, IggyTimestamp, OptionValue,
+        ResourceOptions, TopicDetails, topic_option_keys,
     };
     use kafka_protocol::messages::describe_configs_response::DescribeConfigsResourceResult;
     use kafka_protocol::protocol::StrBytes;
@@ -347,21 +347,19 @@ mod tests {
 
     fn topic_details(expiry: IggyExpiry, explicit: bool) -> TopicDetails {
         let mut options = ResourceOptions::new();
-        if explicit {
-            let key = HeaderKey::from_str(topic_option_keys::MESSAGE_EXPIRY).expect("expiry key");
-            options.insert(
-                key,
-                OptionValue::explicit(HeaderValue::from(u64::from(expiry))),
-            );
-        }
+        let key = HeaderKey::from_str(topic_option_keys::MESSAGE_EXPIRY).expect("expiry key");
+        let value = HeaderValue::from(u64::from(expiry));
+        let option = if explicit {
+            OptionValue::explicit(value)
+        } else {
+            OptionValue::derived(value)
+        };
+        options.insert(key, option);
         TopicDetails {
             id: 1,
             created_at: IggyTimestamp::default(),
             name: "orders".to_string(),
             size: IggyByteSize::default(),
-            message_expiry: expiry,
-            compression_algorithm: CompressionAlgorithm::None,
-            max_topic_size: MaxTopicSize::default(),
             messages_count: 0,
             partitions_count: 1,
             partitions: Vec::new(),
@@ -375,7 +373,7 @@ mod tests {
         include_documentation: bool,
     ) -> (Vec<DescribeConfigsResourceResult>, bool) {
         described_entries(
-            details.message_expiry,
+            details.resolved_options().message_expiry,
             message_expiry_is_explicit(&details.options),
             configuration_keys,
             include_documentation,

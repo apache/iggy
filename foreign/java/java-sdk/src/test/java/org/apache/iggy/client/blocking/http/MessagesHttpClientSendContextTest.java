@@ -30,7 +30,6 @@ import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.partition.PartitionContext;
-import org.apache.iggy.topic.CompressionAlgorithm;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
@@ -208,8 +207,7 @@ class MessagesHttpClientSendContextTest {
             send(client, Partitioning.partitionId(3L));
 
             client.streams().createStream("stream");
-            client.topics()
-                    .createTopic(STREAM, 1L, CompressionAlgorithm.None, BigInteger.ZERO, BigInteger.ZERO, "topic");
+            client.topics().createTopic(STREAM, "topic", 1L);
             send(client, Partitioning.partitionId(3L));
 
             assertThat(server.requests).filteredOn(GET_TOPIC::equals).hasSize(1);

@@ -24,9 +24,13 @@
 //	IGGY_TCP_ADDRESS=127.0.0.1:8090 \
 //	IGGY_HTTP_ENABLED=false IGGY_QUIC_ENABLED=false IGGY_WEBSOCKET_ENABLED=false \
 //	IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy \
+//	IGGY_ENCRYPTION_ENABLED=true IGGY_ENCRYPTION_KEY=<base64 of 32 random bytes> \
 //	target/debug/iggy-server
 //
 //	IGGY_TCP_ADDRESS=127.0.0.1:8090 go test ./tests
+//
+// The stream option cases need the encryption settings: without them a keyless
+// stream reports no generated key and a stream key is refused.
 //
 // Set IGGY_TCP_TLS_ENABLED=true to run the TLS cases against a server started
 // with IGGY_TCP_TLS_ENABLED=true and the certificate pair in core/certs.
@@ -139,14 +143,13 @@ func scratchTopic(t *testing.T, connected iggcon.Client, partitionsCount uint32)
 		name = name[:255]
 	}
 
-	stream, err := connected.CreateStream(ctx, name)
+	stream, err := connected.CreateStream(ctx, name, nil)
 	require.NoError(t, err)
 	streamId, err := iggcon.NewIdentifier(stream.Id)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = connected.DeleteStream(context.Background(), streamId) })
 
-	topic, err := connected.CreateTopic(ctx, streamId, name, partitionsCount,
-		iggcon.CompressionAlgorithmNone, iggcon.Duration(0), 0)
+	topic, err := connected.CreateTopic(ctx, streamId, name, &iggcon.TopicOptions{PartitionsCount: &partitionsCount})
 	require.NoError(t, err)
 	topicId, err := iggcon.NewIdentifier(topic.Id)
 	require.NoError(t, err)

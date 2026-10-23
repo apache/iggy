@@ -16,6 +16,7 @@
 // under the License.
 
 using System.Reflection;
+using System.Buffers.Binary;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Vsr;
 
@@ -122,6 +123,26 @@ public sealed class ConsensusSessionTests
     }
 
     [Fact]
+    public void MetadataRequestIdentifier_IsUniqueAndStableAcrossReencoding()
+    {
+        var session = new ConsensusSession(1);
+        session.Resolve(VsrOperation.Register);
+        session.Bind(10, new byte[LoginRegister.BIND_SECRET_BYTES]);
+        var first = session.Resolve(VsrOperation.CreateStream);
+        var second = session.Resolve(VsrOperation.CreateStream);
+        Assert.NotEqual(UInt128.Zero, first.RequestChecksum);
+        Assert.NotEqual(first.RequestChecksum, second.RequestChecksum);
+
+        var original = new byte[VsrHeader.HEADER_SIZE];
+        var retry = new byte[VsrHeader.HEADER_SIZE];
+        VsrHeader.EncodeRequestHeader(original, session, 202, Array.Empty<byte>(), retainedFrame: first);
+        VsrHeader.EncodeRequestHeader(retry, session, 202, Array.Empty<byte>(), retainedFrame: first);
+        Assert.Equal(first.RequestChecksum,
+            BinaryPrimitives.ReadUInt128LittleEndian(original.AsSpan(VsrHeader.REQUEST_CHECKSUM_OFFSET)));
+        Assert.Equal(original, retry);
+    }
+
+    [Fact]
     public void NextRequestId_BeforeBindThrows()
     {
         var session = new ConsensusSession(1);
@@ -147,7 +168,11 @@ public sealed class ConsensusSessionTests
         counter.SetValue(session, ulong.MaxValue - 1);
 
         var lastFrame = session.Resolve((VsrOperation)operation);
-        Assert.Equal(new SessionFrame(clientId, ulong.MaxValue - 1, 10), lastFrame);
+        Assert.Equal(clientId, lastFrame.ClientId);
+        Assert.Equal(ulong.MaxValue - 1, lastFrame.RequestId);
+        Assert.Equal(10UL, lastFrame.SessionId);
+        Assert.Equal(operation == (byte)VsrOperation.CreateStream,
+            lastFrame.RequestChecksum != UInt128.Zero);
         Assert.Equal(ulong.MaxValue, session.RequestCounter);
 
         for (var attempt = 0; attempt < 2; attempt++)

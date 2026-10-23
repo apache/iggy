@@ -259,8 +259,8 @@ extension IggyClient {
         return body.isEmpty ? [] : try Responses.clients(body[...])
     }
 
-    /// The option catalog of a resource scope: the keys create accepts, their
-    /// kinds, and this server's defaults.
+    /// The option catalog of a resource scope: every key a client can name,
+    /// its kind, what an update may do with it, and this server's default.
     public func describeOptions(scope: OptionsScope) async throws -> [OptionSpec] {
         let lineage = try await requireAuthenticated()
         return try Responses.optionSpecs(try await send(.describeOptions, Requests.describeOptions(scope: scope), lineage: lineage)[...])

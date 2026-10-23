@@ -281,7 +281,7 @@ async fn generate_enough_logs(client: &IggyClient) -> Result<(), String> {
         let topic_name = format!("{TOPIC_NAME}-{i}");
 
         client
-            .create_stream(&stream_name)
+            .create_stream(&stream_name, &StreamCreateOptions::default())
             .await
             .map_err(|e| format!("Failed to create {stream_name}: {e}"))?;
 

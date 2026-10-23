@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use iggy::prelude::StreamCreateOptions;
+use iggy::prelude::UserCreateOptions;
 use std::sync::Arc;
 
 use iggy::http::http_client::HttpClient;
@@ -45,6 +47,7 @@ async fn seed_a2a_user(
             A2A_PASSWORD,
             UserStatus::Active,
             Some(streams_permissions(false)),
+            &UserCreateOptions::default(),
         )
         .await
     {
@@ -569,6 +572,7 @@ async fn test_a2a_jwt_rejected_after_mapped_user_deleted(harness: &TestHarness) 
             A2A_PASSWORD,
             UserStatus::Active,
             Some(streams_permissions(false)),
+            &UserCreateOptions::default(),
         )
         .await
         .expect("create successor");
@@ -607,15 +611,16 @@ async fn test_a2a_jwt_writes_follow_username_after_rename(harness: &TestHarness)
 
     let client = create_client_with_jwt(&http_addr.to_string(), create_valid_jwt(3600)).await;
     client
-        .create_stream("a2a-before-rename")
+        .create_stream("a2a-before-rename", &StreamCreateOptions::default())
         .await
         .expect("A2A token must write as the mapped user");
 
     root.update_user(
         &mapped,
-        Some("a2a-renamed"),
-        None,
-        &UserUpdateOptions::default(),
+        &UserUpdateOptions {
+            username: Some("a2a-renamed".to_owned()),
+            ..UserUpdateOptions::default()
+        },
     )
     .await
     .expect("rename the mapped user");
@@ -624,6 +629,7 @@ async fn test_a2a_jwt_writes_follow_username_after_rename(harness: &TestHarness)
         A2A_PASSWORD,
         UserStatus::Active,
         Some(streams_permissions(false)),
+        &UserCreateOptions::default(),
     )
     .await
     .expect("create a new account under the mapped username");
@@ -633,7 +639,7 @@ async fn test_a2a_jwt_writes_follow_username_after_rename(harness: &TestHarness)
         "reads must act as the account that holds the username now"
     );
     let error = client
-        .create_stream("a2a-after-rename")
+        .create_stream("a2a-after-rename", &StreamCreateOptions::default())
         .await
         .expect_err("writes must not act as the renamed account");
     assert_eq!(error.as_code(), IggyError::Unauthorized.as_code());

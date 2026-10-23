@@ -34,14 +34,6 @@ enum Requests {
         return writer.bytes
     }
 
-    static func updateStream(streamID: Identifier, name: String, options: [UInt8]) throws -> [UInt8] {
-        var writer = ByteWriter()
-        try streamID.encode(into: &writer)
-        try writer.writeName(validatedWireName(name))
-        writer.write(options)
-        return writer.bytes
-    }
-
     // MARK: Topics
 
     static func streamAndTopic(_ streamID: Identifier, _ topicID: Identifier) throws -> [UInt8] {
@@ -60,12 +52,36 @@ enum Requests {
         return writer.bytes
     }
 
-    static func updateTopic(streamID: Identifier, topicID: Identifier, name: String, options: [UInt8]) throws -> [UInt8] {
+    // MARK: Resource updates
+
+    /// What an `UpdateResource` patches, tagged on the wire with its options
+    /// scope.
+    enum ResourceTarget {
+        case topic(stream: Identifier, topic: Identifier)
+        case stream(Identifier)
+        case user(Identifier)
+    }
+
+    /// `[scope:u8][target ids][reset_count:u8][reset_key:name]*[options block]`
+    static func updateResource(_ target: ResourceTarget, _ patch: OptionsPatch) throws -> [UInt8] {
         var writer = ByteWriter()
-        try streamID.encode(into: &writer)
-        try topicID.encode(into: &writer)
-        try writer.writeName(validatedWireName(name))
-        writer.write(options)
+        switch target {
+        case .topic(let stream, let topic):
+            writer.write(OptionsScope.topic.rawValue)
+            try stream.encode(into: &writer)
+            try topic.encode(into: &writer)
+        case .stream(let stream):
+            writer.write(OptionsScope.stream.rawValue)
+            try stream.encode(into: &writer)
+        case .user(let user):
+            writer.write(OptionsScope.user.rawValue)
+            try user.encode(into: &writer)
+        }
+        writer.write(UInt8(patch.reset.count))
+        for key in patch.reset {
+            try writer.writeName(key)
+        }
+        writer.write(try OptionsBlock.encode(patch.set))
         return writer.bytes
     }
 
@@ -216,33 +232,19 @@ enum Requests {
         }
     }
 
-    static func updateUser(userID: Identifier, username: String?, status: UserStatus?, options: [UInt8]) throws -> [UInt8] {
-        var writer = ByteWriter()
-        try userID.encode(into: &writer)
-        if let username {
-            try validateUsername(username)
-            writer.write(UInt8(1))
-            try writer.writeName(username)
-        } else {
-            writer.write(UInt8(0))
+    /// The user a user-scope ``updateResource(_:_:)`` payload names and the
+    /// name it sets, nil when it patches another scope or keeps the name.
+    static func renamedUser(_ payload: [UInt8]) throws -> (userID: Identifier, username: String)? {
+        guard payload.first == OptionsScope.user.rawValue else {
+            return nil
         }
-        if let status {
-            writer.write(UInt8(1))
-            writer.write(status.rawValue)
-        } else {
-            writer.write(UInt8(0))
-        }
-        writer.write(options)
-        return writer.bytes
-    }
-
-    /// The user an ``updateUser(userID:username:status:options:)`` payload
-    /// names and its new name, nil when the name stays.
-    static func renamedUser(_ payload: [UInt8]) throws -> (userID: Identifier, username: String?) {
-        try Responses.decode(payload[...]) { reader in
+        return try Responses.decode(payload.dropFirst()) { reader in
             let userID = try Identifier.decode(from: &reader)
-            let renames = try reader.readUInt8() != 0
-            return (userID, renames ? try reader.readName() : nil)
+            for _ in 0..<(try reader.readUInt8()) {
+                _ = try reader.readName()
+            }
+            let options = try OptionsBlock.decode(try reader.readBytes(reader.remaining), explicit: true)
+            return options[UserOptionKey.username.rawValue]?.value.stringValue.map { (userID, $0) }
         }
     }
 

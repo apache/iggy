@@ -625,7 +625,7 @@ public sealed partial class NativeRecoveryTests
                 ? Reply(request.Operation, [.. new byte[4], .. BinaryFactory.CreateStreamPayload(1, 0, "created", 0, 0, 0)])
                 : Reply(request.Operation, [], VsrError.TRANSIENT_NOT_ACCEPTED);
         };
-        var create = client.CreateStreamAsync("created", cluster.Token);
+        var create = client.CreateStreamAsync("created", token: cluster.Token);
         await metadata.Task.WaitAsync(cluster.Token);
         Assert.Equal(0, Volatile.Read(ref coordinatorMetadata));
         Assert.True(Volatile.Read(ref primaryMetadata) > 0);

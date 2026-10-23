@@ -56,6 +56,9 @@ final class FakeVSRServer: @unchecked Sendable {
         case eviction(VSRFrame.EvictionReason)
         /// A reply that answers some other request id.
         case wrongRequestID(UInt64)
+        /// A committed success under the operation the primary rewrote the
+        /// request into, answering `requestID` or else the request's own id.
+        case resolved(ConsensusOperation, requestID: UInt64? = nil)
         /// Closes the connection instead of answering.
         case close
         /// Never answers.
@@ -448,6 +451,11 @@ final class FakeServerHandler: ChannelInboundHandler {
                     connection: request.connection, operation: operation, code: request.code, requestID: requestID, session: request.session,
                     clientID: request.clientID, checksum: request.checksum, context: request.context, payload: request.payload)
                 write(FakeVSRServer.encodeReply(request: wrong, operation: operation, status: 0, body: framedBody([])))
+            case .resolved(let resolved, let requestID):
+                let answered = FakeVSRServer.Request(
+                    connection: request.connection, operation: resolved, code: request.code, requestID: requestID ?? request.requestID,
+                    session: request.session, clientID: request.clientID, checksum: request.checksum, context: request.context, payload: request.payload)
+                write(FakeVSRServer.encodeReply(request: answered, operation: resolved, status: 0, body: [0, 0, 0, 0]))
             case .close:
                 channel.close(promise: nil)
             case .stall:

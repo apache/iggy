@@ -24,10 +24,11 @@ use crate::{
 use iggy_binary_protocol::WireName;
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::codes::{
-    CREATE_TOPIC_CODE, DELETE_TOPIC_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, UPDATE_TOPIC_CODE,
+    CREATE_TOPIC_CODE, DELETE_TOPIC_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE,
 };
+use iggy_binary_protocol::requests::system::ResourceTarget;
 use iggy_binary_protocol::requests::topics::{
-    CreateTopicRequest, DeleteTopicRequest, GetTopicRequest, GetTopicsRequest, UpdateTopicRequest,
+    CreateTopicRequest, DeleteTopicRequest, GetTopicRequest, GetTopicsRequest,
 };
 use iggy_binary_protocol::responses::topics::get_topic::GetTopicResponse;
 use iggy_binary_protocol::responses::topics::get_topics::GetTopicsResponse;
@@ -107,25 +108,15 @@ impl<B: BinaryClient> TopicClient for B {
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        name: &str,
         options: &TopicUpdateOptions,
     ) -> Result<(), IggyError> {
         fail_if_not_authenticated(self).await?;
-        let wire_stream_id = identifier_to_wire(stream_id)?;
-        let wire_topic_id = identifier_to_wire(topic_id)?;
-        let wire_name = WireName::new(name).map_err(|_| IggyError::InvalidFormat)?;
-        self.send_raw_with_response(
-            UPDATE_TOPIC_CODE,
-            UpdateTopicRequest {
-                stream_id: wire_stream_id,
-                topic_id: wire_topic_id,
-                name: wire_name,
-                options: options.to_wire()?,
-            }
-            .to_bytes(),
-        )
-        .await?;
-        Ok(())
+        let patch = options.to_patch()?;
+        let target = ResourceTarget::Topic {
+            stream_id: identifier_to_wire(stream_id)?,
+            topic_id: identifier_to_wire(topic_id)?,
+        };
+        super::update_resource(self, target, patch).await
     }
 
     async fn delete_topic(

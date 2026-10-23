@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{Identifier, IggyError, Stream, StreamDetails, StreamUpdateOptions};
+use crate::{
+    Identifier, IggyError, Stream, StreamCreateOptions, StreamDetails, StreamUpdateOptions,
+};
 use async_trait::async_trait;
 
 /// This trait defines the methods to interact with the stream module.
@@ -31,15 +33,21 @@ pub trait StreamClient {
     async fn get_streams(&self) -> Result<Vec<Stream>, IggyError>;
     /// Create a new stream.
     ///
-    /// Authentication is required, and the permission to manage the streams.
-    async fn create_stream(&self, name: &str) -> Result<StreamDetails, IggyError>;
-    /// Update a stream by unique ID or name.
+    /// `options` may carry the stream's own encryption key. The server stores
+    /// it wrapped and returns only its source and fingerprint. Authentication
+    /// is required, and the permission to manage the streams.
+    async fn create_stream(
+        &self,
+        name: &str,
+        options: &StreamCreateOptions,
+    ) -> Result<StreamDetails, IggyError>;
+    /// Patch a stream by unique ID or name: rename it or change its options.
+    /// Keys `options` leaves out keep their values.
     ///
     /// Authentication is required, and the permission to manage the streams.
     async fn update_stream(
         &self,
         stream_id: &Identifier,
-        name: &str,
         options: &StreamUpdateOptions,
     ) -> Result<(), IggyError>;
     /// Delete a stream by unique ID or name.

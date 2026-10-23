@@ -156,60 +156,22 @@ internal static class TcpContracts
         return bytes;
     }
 
-    internal static byte[] UpdateUser(Identifier userId, string? userName, UserStatus? status)
+    internal static byte[] UpdateUser(Identifier userId, OptionsPatch patch)
     {
-        if (userName is not null)
-        {
-            CredentialBounds.ValidateUsername(userName);
-        }
-
-        var userNameLength = userName is null ? 0 : Encoding.UTF8.GetByteCount(userName);
-        var length = userId.Length + 2
-                     + (userName is null ? 1 : 2 + userNameLength)
-                     + (status is not null ? 2 : 1);
-        Span<byte> bytes = stackalloc byte[length];
-
-        bytes.WriteBytesFromIdentifier(userId);
-        var position = userId.Length + 2;
-        if (userName is not null)
-        {
-            bytes[position] = 1;
-            position += 1;
-            bytes[position] = (byte)userNameLength;
-            position += 1;
-            Encoding.UTF8.GetBytes(userName,
-                bytes[position..(position + userNameLength)]);
-            position += userNameLength;
-        }
-        else
-        {
-            bytes[position] = 0;
-            position += 1;
-        }
-
-        if (status is not null)
-        {
-            bytes[position++] = 1;
-            bytes[position++] = (byte)status;
-        }
-        else
-        {
-            bytes[position++] = 0;
-        }
-
-        return bytes.ToArray();
+        return UpdateResource(patch, userId);
     }
 
     internal static byte[] CreateUser(string userName, string password, UserStatus status,
-        Permissions? permissions = null)
+        Permissions? permissions = null, IReadOnlyDictionary<string, HeaderValue>? options = null)
     {
         CredentialBounds.ValidateUsername(userName);
         CredentialBounds.ValidatePassword(password);
         var userNameLength = Encoding.UTF8.GetByteCount(userName);
         var passwordLength = Encoding.UTF8.GetByteCount(password);
         var permissionsBytes = permissions is not null ? GetBytesFromPermissions(permissions) : [];
+        var optionsBlock = OptionsBlock(options);
         var bytes = new byte[3 + userNameLength + passwordLength + 1
-                             + (permissions is not null ? 4 + permissionsBytes.Length : 0)];
+                             + (permissions is not null ? 4 + permissionsBytes.Length : 0) + optionsBlock.Length];
         var position = 0;
 
         bytes[position++] = (byte)userNameLength;
@@ -221,6 +183,7 @@ internal static class TcpContracts
         bytes[position++] = (byte)status;
 
         WritePermissionsBlock(bytes.AsSpan(position), permissions, permissionsBytes);
+        optionsBlock.CopyTo(bytes.AsSpan(bytes.Length - optionsBlock.Length));
         return bytes;
     }
 
@@ -566,24 +529,20 @@ internal static class TcpContracts
         }
     }
 
-    internal static byte[] CreateStream(string name)
+    internal static byte[] CreateStream(string name, IReadOnlyDictionary<string, HeaderValue>? options = null)
     {
         var nameLength = WireName.ByteCount(name, nameof(name));
-        Span<byte> bytes = stackalloc byte[nameLength + 1];
+        var optionsBlock = OptionsBlock(options);
+        var bytes = new byte[1 + nameLength + optionsBlock.Length];
         bytes[0] = (byte)nameLength;
-        Encoding.UTF8.GetBytes(name, bytes[1..]);
-        return bytes.ToArray();
+        Encoding.UTF8.GetBytes(name, bytes.AsSpan(1, nameLength));
+        optionsBlock.CopyTo(bytes.AsSpan(1 + nameLength));
+        return bytes;
     }
 
-    internal static byte[] UpdateStream(Identifier streamId, string name)
+    internal static byte[] UpdateStream(Identifier streamId, OptionsPatch patch)
     {
-        var nameLength = WireName.ByteCount(name, nameof(name));
-        Span<byte> bytes = stackalloc byte[streamId.Length + nameLength + 3];
-        bytes.WriteBytesFromIdentifier(streamId);
-        var position = 2 + streamId.Length;
-        bytes[position] = (byte)nameLength;
-        Encoding.UTF8.GetBytes(name, bytes[(position + 1)..]);
-        return bytes.ToArray();
+        return UpdateResource(patch, streamId);
     }
 
     internal static byte[] CreateGroup(Identifier streamId, Identifier topicId, string name)
@@ -640,116 +599,88 @@ internal static class TcpContracts
         return bytes.ToArray();
     }
 
-    internal static byte[] UpdateTopic(Identifier streamId, Identifier topicId, string name,
-        CompressionAlgorithm compressionAlgorithm, ulong maxTopicSize, ulong messageExpiry,
-        IReadOnlyDictionary<string, HeaderValue>? extraOptions = null)
+    internal static byte[] UpdateTopic(Identifier streamId, Identifier topicId, OptionsPatch patch)
     {
-        // Settings ride the options block. A default value means the caller did
-        // not set the key, so it is omitted and the server leaves the topic's
-        // current value alone.
-        var options = new Dictionary<HeaderKey, HeaderValue>();
-        // Caller keys first, so a named argument overwrites one of them.
-        if (extraOptions is not null)
-        {
-            foreach (var (key, value) in extraOptions)
-            {
-                options[HeaderKey.FromString(key)] = value;
-            }
-        }
-
-        if (compressionAlgorithm != CompressionAlgorithm.None)
-        {
-            options[HeaderKey.FromString("compression_algorithm")]
-                = HeaderValue.FromString(compressionAlgorithm.ToString().ToLowerInvariant());
-        }
-
-        if (messageExpiry != 0)
-        {
-            options[HeaderKey.FromString("message_expiry")] = HeaderValue.FromUInt64(messageExpiry);
-        }
-
-        if (maxTopicSize != 0)
-        {
-            options[HeaderKey.FromString("max_topic_size")] = HeaderValue.FromUInt64(maxTopicSize);
-        }
-
-        var optionsLength = HeadersByteLength(options);
-        var nameLength = WireName.ByteCount(name, nameof(name));
-        var length = 4 + streamId.Length + topicId.Length + 1 + nameLength + optionsLength;
-        var rented = length > MaxStackAllocBytes ? ArrayPool<byte>.Shared.Rent(length) : null;
-        try
-        {
-            Span<byte> bytes = rented is null ? stackalloc byte[length] : rented.AsSpan(0, length);
-            bytes.WriteBytesFromStreamAndTopicIdentifiers(streamId, topicId);
-            var position = 4 + streamId.Length + topicId.Length;
-            bytes[position] = (byte)nameLength;
-            Encoding.UTF8.GetBytes(name, bytes[(position + 1)..(position + 1 + nameLength)]);
-            WriteHeadersTo(bytes[(position + 1 + nameLength)..], options);
-            return bytes.ToArray();
-        }
-        finally
-        {
-            if (rented is not null)
-            {
-                ArrayPool<byte>.Shared.Return(rented);
-            }
-        }
+        return UpdateResource(patch, streamId, topicId);
     }
 
     internal static byte[] CreateTopic(Identifier streamId, string name, uint partitionCount,
-        CompressionAlgorithm compressionAlgorithm, ulong messageExpiry,
-        ulong maxTopicSize, IReadOnlyDictionary<string, HeaderValue>? extraOptions = null)
+        IReadOnlyDictionary<string, HeaderValue>? options = null)
     {
-        var options = new Dictionary<HeaderKey, HeaderValue>();
-        // Caller keys go in first so a named argument overwrites one of them: the
-        // block must not carry a key twice, or the server refuses it whole.
-        if (extraOptions is not null)
-        {
-            foreach (var (key, value) in extraOptions)
-            {
-                options[HeaderKey.FromString(key)] = value;
-            }
-        }
-
-        if (compressionAlgorithm != CompressionAlgorithm.None)
-        {
-            options[HeaderKey.FromString("compression_algorithm")]
-                = HeaderValue.FromString(compressionAlgorithm.ToString().ToLowerInvariant());
-        }
-
-        if (messageExpiry != 0)
-        {
-            options[HeaderKey.FromString("message_expiry")] = HeaderValue.FromUInt64(messageExpiry);
-        }
-
-        if (maxTopicSize != 0)
-        {
-            options[HeaderKey.FromString("max_topic_size")] = HeaderValue.FromUInt64(maxTopicSize);
-        }
-
-        var optionsLength = HeadersByteLength(options);
         var nameLength = WireName.ByteCount(name, nameof(name));
-        var length = 2 + streamId.Length + 4 + 1 + nameLength + optionsLength;
-        var rented = length > MaxStackAllocBytes ? ArrayPool<byte>.Shared.Rent(length) : null;
-        try
+        var optionsBlock = OptionsBlock(options);
+        var bytes = new byte[2 + streamId.Length + 4 + 1 + nameLength + optionsBlock.Length];
+        bytes.AsSpan().WriteBytesFromIdentifier(streamId);
+        var position = 2 + streamId.Length;
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(position, 4), partitionCount);
+        position += 4;
+        bytes[position] = (byte)nameLength;
+        Encoding.UTF8.GetBytes(name, bytes.AsSpan(position + 1, nameLength));
+        optionsBlock.CopyTo(bytes.AsSpan(position + 1 + nameLength));
+        return bytes;
+    }
+
+    /// <summary>
+    ///     <c>[scope:u8][identifiers][reset_count:u8][reset_key:u8 len + name]*[options to end of body]</c>, the
+    ///     identifiers being the stream and topic, the stream, or the user the update targets.
+    /// </summary>
+    private static byte[] UpdateResource(OptionsPatch patch, params Identifier[] targets)
+    {
+        var optionsBlock = OptionsBlock(patch.Set);
+        var resetLength = patch.Reset.Sum(key => 1 + WireName.ByteCount(key, nameof(patch.Reset)));
+        var bytes = new byte[1 + targets.Sum(target => 2 + target.Length) + 1 + resetLength + optionsBlock.Length];
+        var position = 0;
+        bytes[position++] = (byte)patch.Scope;
+        foreach (var target in targets)
         {
-            Span<byte> bytes = rented is null ? stackalloc byte[length] : rented.AsSpan(0, length);
-            bytes.WriteBytesFromIdentifier(streamId);
-            var position = 2 + streamId.Length;
-            BinaryPrimitives.WriteUInt32LittleEndian(bytes[position..(position + 4)], partitionCount);
-            position += 4;
-            bytes[position] = (byte)nameLength;
-            Encoding.UTF8.GetBytes(name, bytes[(position + 1)..(position + 1 + nameLength)]);
-            WriteHeadersTo(bytes[(position + 1 + nameLength)..], options);
-            return bytes.ToArray();
+            bytes.AsSpan().WriteBytesFromIdentifier(target, position);
+            position += 2 + target.Length;
         }
-        finally
+
+        bytes[position++] = (byte)patch.Reset.Count;
+        foreach (var key in patch.Reset)
         {
-            if (rented is not null)
-            {
-                ArrayPool<byte>.Shared.Return(rented);
-            }
+            bytes[position] = (byte)Encoding.UTF8.GetBytes(key, bytes.AsSpan(position + 1));
+            position += 1 + bytes[position];
         }
+
+        optionsBlock.CopyTo(bytes.AsSpan(position));
+        return bytes;
+    }
+
+    /// <summary>
+    ///     An options block in ascending key byte order, the order the server writes its own blocks in, so a
+    ///     request is byte-identical to the one any other SDK sends for the same options.
+    /// </summary>
+    private static byte[] OptionsBlock(IReadOnlyDictionary<string, HeaderValue>? options)
+    {
+        if (options is null || options.Count == 0)
+        {
+            return [];
+        }
+
+        List<(HeaderKey Key, HeaderValue Value)> entries = options
+            .Select(option => (HeaderKey.FromString(option.Key), option.Value))
+            .ToList();
+        entries.Sort((left, right) => left.Key.Value.AsSpan().SequenceCompareTo(right.Key.Value));
+
+        var block = new byte[entries.Sum(entry => 1 + 4 + entry.Key.Value.Length + 1 + 4 + entry.Value.Value.Length)];
+        var position = 0;
+        foreach (var (key, value) in entries)
+        {
+            position = WriteOptionField(block, position, key.Kind, key.Value);
+            position = WriteOptionField(block, position, value.Kind, value.Value);
+        }
+
+        return block;
+    }
+
+    private static int WriteOptionField(byte[] block, int position, HeaderKind kind, byte[] value)
+    {
+        block[position] = HeaderKindToByte(kind);
+        BinaryPrimitives.WriteInt32LittleEndian(block.AsSpan(position + 1, 4), value.Length);
+        value.CopyTo(block, position + 5);
+        return position + 5 + value.Length;
     }
 
     internal static byte[] GetTopicById(Identifier streamId, Identifier topicId)

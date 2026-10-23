@@ -82,7 +82,10 @@ pub async fn run(harness: &mut TestHarness, restart_server: bool) {
     client.connect().await.unwrap();
     let data_path = harness.server().data_path().to_path_buf();
 
-    let stream = client.create_stream(STREAM_NAME).await.unwrap();
+    let stream = client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     let stream_id = stream.id;
 
     let topic = client
@@ -366,7 +369,10 @@ pub async fn run_no_consumers(harness: &mut TestHarness, restart_server: bool) {
     client.connect().await.unwrap();
     let data_path = harness.server().data_path().to_path_buf();
 
-    let stream = client.create_stream(STREAM_NAME).await.unwrap();
+    let stream = client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     let stream_id = stream.id;
 
     let topic = client
@@ -457,7 +463,10 @@ pub async fn run_no_consumers(harness: &mut TestHarness, restart_server: bool) {
 ///
 /// No restart_server variant — 25 delete_segments calls would mean 25 restarts.
 pub async fn run_consumer_group_barrier(client: &IggyClient, data_path: &Path) {
-    let stream = client.create_stream(STREAM_NAME).await.unwrap();
+    let stream = client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     let stream_id = stream.id;
 
     let topic = client
@@ -598,7 +607,10 @@ pub async fn run_multi_consumer_barrier(harness: &mut TestHarness, restart_serve
     client.connect().await.unwrap();
     let data_path = harness.server().data_path().to_path_buf();
 
-    let stream = client.create_stream(STREAM_NAME).await.unwrap();
+    let stream = client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     let stream_id = stream.id;
 
     let topic = client

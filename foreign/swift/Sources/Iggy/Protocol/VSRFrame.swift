@@ -106,10 +106,9 @@ enum VSRFrame {
     /// Builds the complete request frame for a command code and its encoded
     /// payload, deriving sequencing from the command code and the session.
     ///
-    /// The request checksum is stamped for the operations the server's client
-    /// table deduplicates, like the Rust SDK does; partition and
-    /// non-replicated operations leave it zero, which the server reads as
-    /// unstamped.
+    /// Metadata and session requests carry a random identifier retained in
+    /// the encoded frame across retries. Partition and non-replicated
+    /// operations leave it zero.
     ///
     /// `partitionContext` is the context captured with the partition the
     /// request targets. The server fences a send or an offset change on it, so
@@ -138,8 +137,14 @@ enum VSRFrame {
             sessionID = bound
             requestID = try session.nextRequestID()
         }
-        let requestChecksum: UInt64 =
-            (operation.isPartition || operation == .nonReplicated) ? 0 : XXH3.hash64(payload)
+        let requestIdentifier: UInt128Value =
+            if operation.isPartition || operation == .nonReplicated {
+                .zero
+            } else if operation == .register {
+                session.registerRequestIdentifier
+            } else {
+                .random()
+            }
 
         var frame = [UInt8]()
         frame.reserveCapacity(totalSize)
@@ -149,7 +154,8 @@ enum VSRFrame {
             buffer[RequestOffset.command] = Command.request.rawValue
             buffer.storeBytes(of: session.clientID.low.littleEndian, toByteOffset: RequestOffset.client, as: UInt64.self)
             buffer.storeBytes(of: session.clientID.high.littleEndian, toByteOffset: RequestOffset.client + 8, as: UInt64.self)
-            buffer.storeBytes(of: requestChecksum.littleEndian, toByteOffset: RequestOffset.requestChecksum, as: UInt64.self)
+            buffer.storeBytes(of: requestIdentifier.low.littleEndian, toByteOffset: RequestOffset.requestChecksum, as: UInt64.self)
+            buffer.storeBytes(of: requestIdentifier.high.littleEndian, toByteOffset: RequestOffset.requestChecksum + 8, as: UInt64.self)
             buffer.storeBytes(of: requestID.littleEndian, toByteOffset: RequestOffset.request, as: UInt64.self)
             buffer[RequestOffset.operation] = operation.rawValue
             buffer.storeBytes(of: sessionID.littleEndian, toByteOffset: RequestOffset.session, as: UInt64.self)
