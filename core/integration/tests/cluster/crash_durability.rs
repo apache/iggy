@@ -251,6 +251,34 @@ async fn wait_until_cluster_serves(
     }
 }
 
+/// Poll until `node`'s partition superblock records the highest view any other
+/// node persisted as its log view, so `node` adopted it instead of still probing.
+async fn wait_until_partition_rejoined(harness: &TestHarness, node: usize, budget: Duration) {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let view = (0..harness.cluster_size())
+            .filter(|other| *other != node)
+            .filter_map(|other| {
+                disk::read_partition_superblock_state(&harness.node(other).data_path())
+            })
+            .map(|state| state.view)
+            .max();
+        let own = disk::read_partition_superblock_state(&harness.node(node).data_path())
+            .map(|state| (state.view, state.log_view));
+        if let (Some(view), Some((_, log_view))) = (view, own)
+            && log_view >= view
+        {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "node {node} did not rejoin the partition's view within {budget:?}: \
+             others at view {view:?}, node {node} at (view, log_view) {own:?}"
+        );
+        sleep(POLL_INTERVAL).await;
+    }
+}
+
 /// Poll until every node's segment files hold all of `payloads`, so a
 /// follow-up SIGKILL provably erases nothing that was flushed. Replaces a
 /// settle sleep: the ack proves quorum COMMIT, but each replica flushes on
@@ -648,7 +676,9 @@ async fn given_persisted_topic_when_backup_misses_writes_should_repair_before_du
 /// missing more ops than one repair chunk. A restarted replica holds back entries
 /// above its recovered commit point until the view's log proves them, so repair has to walk that
 /// window chunk by chunk before the replica can ack again, and the next kill
-/// leaves it as half of the quorum.
+/// leaves it as half of the quorum. The next kill waits for it to rejoin the
+/// partition's view: until then it votes as a log that may lack acked ops, and
+/// with one survivor left no trusted quorum can elect.
 #[iggy_harness(cluster_nodes = 3, server(cluster.repair_chunk_max = 4))]
 async fn given_persisted_topic_when_every_replica_is_killed_in_turn_should_preserve_acked_messages(
     harness: &mut TestHarness,
@@ -694,6 +724,7 @@ async fn given_persisted_topic_when_every_replica_is_killed_in_turn_should_prese
             .await
             .unwrap_or_else(|_| panic!("writes stalled after node {node} restarted")),
         );
+        wait_until_partition_rejoined(harness, node, CONVERGE_TIMEOUT).await;
     }
     let client = wait_until_cluster_serves(harness, &nodes, CONVERGE_TIMEOUT).await;
     wait_for_acked_readable(&client, &acked, CONVERGE_TIMEOUT)
