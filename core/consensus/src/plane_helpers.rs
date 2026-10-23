@@ -16,8 +16,8 @@
 // under the License.
 
 use crate::{
-    Consensus, DvcHeaderKind, IgnoreReason, Pipeline, PipelineEntry, PlaneKind, PrepareOkOutcome,
-    Sequencer, Status, VsrConsensus, dvc_header_kind,
+    Consensus, DvcHeaderKind, IgnoreReason, MergedLog, Pipeline, PipelineEntry, PlaneKind,
+    PrepareOkOutcome, Sequencer, Status, VsrConsensus, dvc_header_kind,
 };
 use iggy_binary_protocol::consensus::{REJECTION_SECTION_LEN, write_rejection_section};
 use iggy_binary_protocol::{
@@ -497,8 +497,7 @@ where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
-    consensus.is_normal()
-        || (consensus.view_log_is_pending() && consensus.is_primary_for_view(consensus.view()))
+    consensus.is_normal() || consensus.is_primary_elect()
 }
 
 /// Header of the pipeline head, iff its op is the next one this replica owes its
@@ -853,7 +852,10 @@ where
         return false;
     }
 
-    if consensus.is_transferring() || consensus.view_log_unproven() {
+    if consensus.is_transferring()
+        || consensus.view_log_unproven()
+        || !consensus.history_certified()
+    {
         return false;
     }
 
@@ -911,11 +913,23 @@ pub enum ViewLogProof {
         op: u64,
         unproven_through: u64,
     },
-    Divergent(u64),
+    /// This replica holds an entry at every op in `first..=last`, and each differs
+    /// from the view; retained entries above `last` match it.
+    Divergent {
+        first: u64,
+        last: u64,
+    },
 }
 
 /// Prove held entries against the view's hash chain. Canonical headers can
 /// bridge missing bodies; a gap with no header leaves its lower prefix unknown.
+///
+/// A canonical header off the chain is no header, so its op is such a gap. It is
+/// no divergence: nothing is held there to remove, and the next proof would name
+/// the same op again.
+///
+/// A divergence spans every contiguous held entry the chain still proves wrong,
+/// so the caller removes it with one rewrite instead of one per op.
 #[must_use]
 pub fn view_log_proof(
     commit_floor: u64,
@@ -931,6 +945,7 @@ pub fn view_log_proof(
         .first()
         .filter(|head| head.op == op_head && dvc_header_kind(head) != DvcHeaderKind::Blank)
     else {
+        // No canonical checksum to test a resident head against, so fetch one.
         return ViewLogProof::Missing {
             op: op_head,
             unproven_through: op_head,
@@ -941,11 +956,12 @@ pub fn view_log_proof(
     for op in (proven + 1..=op_head).rev() {
         let header = if let Some(local) = header_at(op) {
             local
-        } else if let Some(header) = canonical
-            .iter()
-            .find(|header| header.op == op && dvc_header_kind(header) != DvcHeaderKind::Blank)
+        } else if let Some(header) = canonical_header_at(canonical, op)
+            .filter(|header| header.checksum != CHECKSUM_UNSEALED && header.checksum == expected)
         {
-            missing.get_or_insert(op);
+            // The lowest missing body, not the highest: the repair window opens at
+            // it and runs up to the head, so one round fetches every bridged body.
+            missing = Some(op);
             *header
         } else {
             return ViewLogProof::Missing {
@@ -954,7 +970,10 @@ pub fn view_log_proof(
             };
         };
         if header.checksum == CHECKSUM_UNSEALED || header.checksum != expected {
-            return ViewLogProof::Divergent(op);
+            return ViewLogProof::Divergent {
+                first: divergent_run_first(op, expected, proven, canonical, &header_at),
+                last: op,
+            };
         }
         expected = header.parent;
     }
@@ -962,6 +981,43 @@ pub fn view_log_proof(
         op,
         unproven_through: 0,
     })
+}
+
+fn canonical_header_at(canonical: &[PrepareHeader], op: u64) -> Option<&PrepareHeader> {
+    canonical
+        .iter()
+        .find(|header| header.op == op && dvc_header_kind(header) != DvcHeaderKind::Blank)
+}
+
+/// Lowest op of the divergent run ending at `last`, where the view expects `expected`.
+///
+/// A held entry below joins the run when it differs from the parent that the
+/// view's header one op up names, the same test the walk applies. The run ends
+/// where that header is missing or off the chain, so an entry past an unknown op
+/// stays.
+fn divergent_run_first(
+    last: u64,
+    mut expected: u128,
+    proven: u64,
+    canonical: &[PrepareHeader],
+    header_at: &impl Fn(u64) -> Option<PrepareHeader>,
+) -> u64 {
+    let mut first = last;
+    while first - 1 > proven {
+        let Some(named) = canonical_header_at(canonical, first)
+            .filter(|named| named.checksum != CHECKSUM_UNSEALED && named.checksum == expected)
+        else {
+            break;
+        };
+        expected = named.parent;
+        if header_at(first - 1)
+            .is_none_or(|local| local.checksum != CHECKSUM_UNSEALED && local.checksum == expected)
+        {
+            break;
+        }
+        first -= 1;
+    }
+    first
 }
 
 fn locally_proven_commit(
@@ -985,6 +1041,94 @@ fn locally_proven_commit(
         op = next_op;
     }
     proven
+}
+
+/// What a replica's own log says about a repaired prepare before it journals it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepairEvidence {
+    /// The view's log names this prepare.
+    Proven,
+    /// Nothing held names the prepare or rules it out.
+    Unproven,
+    /// The view's log names another prepare at or next to this op, or the frame
+    /// does not chain to a held neighbor.
+    Contradicted,
+}
+
+/// Classify a repaired prepare against the headers this replica already trusts.
+///
+/// A repair body carries no sender, so a stale peer's abandoned prepare at a
+/// committed op passes every integrity check. Only this replica's own log can
+/// vouch for it: `pending` is the adopted view's log, whose suffix and committed
+/// headers it names, and `held_at(op)` returns the journaled header at `op` with
+/// whether the view-log proof covers it.
+///
+/// Three things prove a prepare. A vouched header at its op with its checksum. A
+/// vouched header one op up whose `parent` is its checksum. A `view` stamp at or
+/// above this replica's view: only that view's primary stamps or restamps it, and
+/// that primary's log holds every op committed in an earlier view, so a prepare an
+/// earlier view abandoned never carries it.
+///
+/// A vouched neighbor that does not chain contradicts. A held unvouched neighbor
+/// that does not chain contradicts only an unproven prepare: one of the two comes
+/// from another branch, and journaling it would splice the branches. An unsealed
+/// checksum on either side of a chain link is no evidence.
+#[must_use]
+pub fn repaired_prepare_evidence(
+    header: &PrepareHeader,
+    view: u32,
+    pending: Option<&MergedLog>,
+    held_at: impl Fn(u64) -> Option<(PrepareHeader, bool)>,
+) -> RepairEvidence {
+    let entry_at = |op: u64| {
+        pending
+            .and_then(|pending| {
+                canonical_header_at(&pending.headers, op)
+                    .or_else(|| canonical_header_at(&pending.committed_elsewhere, op))
+            })
+            .map(|named| (*named, true))
+            .or_else(|| held_at(op))
+    };
+    if let Some((named, true)) = entry_at(header.op) {
+        return if named.checksum == header.checksum {
+            RepairEvidence::Proven
+        } else {
+            RepairEvidence::Contradicted
+        };
+    }
+    let links = |child: &PrepareHeader, parent: &PrepareHeader| {
+        (child.checksum != CHECKSUM_UNSEALED && parent.checksum != CHECKSUM_UNSEALED)
+            .then_some(child.parent == parent.checksum)
+    };
+    let mut proven = header.view >= view;
+    let mut splices = false;
+    let below = header
+        .op
+        .checked_sub(1)
+        .filter(|op| *op > 0)
+        .and_then(entry_at);
+    let above = header.op.checked_add(1).and_then(entry_at);
+    for (link, vouched) in [
+        below.map(|(below, vouched)| (links(header, &below), vouched)),
+        above.map(|(above, vouched)| (links(&above, header), vouched)),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        match link {
+            Some(false) if vouched => return RepairEvidence::Contradicted,
+            Some(false) => splices = true,
+            _ => {}
+        }
+    }
+    proven |= above.is_some_and(|(above, vouched)| vouched && links(&above, header) == Some(true));
+    if proven {
+        RepairEvidence::Proven
+    } else if splices {
+        RepairEvidence::Contradicted
+    } else {
+        RepairEvidence::Unproven
+    }
 }
 
 #[cfg(test)]
@@ -1030,7 +1174,6 @@ mod tests {
 
         fn set_connection_lost_fn(&self, _f: message_bus::ConnectionLostFn) {}
         fn set_replica_forward_fn(&self, _f: message_bus::ReplicaForwardFn) {}
-        fn set_client_forward_fn(&self, _f: message_bus::ClientForwardFn) {}
     }
 
     #[allow(clippy::cast_possible_truncation)]
@@ -1275,6 +1418,28 @@ mod tests {
         let malformed: Frozen<MESSAGE_ALIGN> = Owned::<MESSAGE_ALIGN>::copy_from_slice(&[0]).into();
 
         assert!(restamp_prepare_view(malformed, 1).is_none());
+    }
+
+    #[test]
+    fn given_restamped_lower_op_when_rebuilding_pipeline_should_keep_the_chain() {
+        // A backup that missed op 9 journals the copy the view-3 primary
+        // retransmits, restamped to view 3, while op 10 keeps the view-0 stamp it
+        // arrived with. Promoted later, it rebuilds its pipeline from these headers.
+        let retransmitted = restamp_prepare_view(prepare_message(9, 7, 11).into_frozen(), 3)
+            .expect("valid prepare");
+        let lower = *bytemuck::checked::try_from_bytes::<PrepareHeader>(
+            &retransmitted[..size_of::<PrepareHeader>()],
+        )
+        .expect("restamped prepare header");
+        let upper = *prepare_message(10, lower.checksum, 13).header();
+        assert!(upper.view < lower.view);
+
+        let mut pipeline = LocalPipeline::new();
+        pipeline.push(PipelineEntry::new(lower));
+        pipeline.push(PipelineEntry::new(upper));
+
+        assert_eq!(pipeline.prepare_count(), 2);
+        assert!(pipeline.message_by_op_and_checksum(10, 13).is_some());
     }
 
     #[test]
@@ -1647,6 +1812,7 @@ mod tests {
         for op in low.max(1)..=high {
             let mut header = PrepareHeader {
                 command: Command::Prepare,
+                cluster: 1,
                 operation: iggy_binary_protocol::Operation::CreateStream,
                 op,
                 view,
@@ -2021,6 +2187,102 @@ mod tests {
     }
 
     #[test]
+    fn given_parked_view_repair_when_starting_should_rebuild_only_unapplied_ops() {
+        const MERGED_COMMIT: u64 = 2;
+        const HEAD: u64 = 5;
+        const VIEW: u32 = 3;
+
+        for (applied_before, repaired_to, expected_start) in [
+            (2, 3, Some(4)),
+            (2, 5, None),
+            (2, 2, Some(3)),
+            (0, 0, Some(3)),
+        ] {
+            let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
+            consensus.init();
+            consensus.restore_commit_state(applied_before, MERGED_COMMIT);
+            consensus.sequencer().set_sequence(HEAD);
+            install_local_suffix(&consensus, HEAD, MERGED_COMMIT, 0);
+            let _ = consensus.handle_start_view_change(PlaneKind::Metadata, &svc_header(1, VIEW));
+            let (dvc, body) = dvc_with_full_suffix(2, VIEW, 0, HEAD, MERGED_COMMIT);
+            let _ = consensus.handle_do_view_change(PlaneKind::Metadata, &dvc, &body);
+            let merged = consensus.pending_view_log().expect("the view is parked");
+            assert_eq!(merged.commit_max, MERGED_COMMIT);
+
+            // Repair may apply a verified prefix after the DVC quorum is frozen.
+            for op in applied_before + 1..=repaired_to {
+                consensus.advance_commit_max(op);
+                consensus.advance_commit_min(op);
+            }
+            assert_eq!(consensus.log_view(), 0);
+            consensus.settle_view_log_proof();
+            let actions = consensus.start_pending_view(PlaneKind::Metadata);
+            let mut rebuilt_from = None;
+            for action in actions {
+                match action {
+                    VsrAction::CommitJournal => {
+                        for op in consensus.commit_min() + 1..=consensus.commit_max() {
+                            consensus.advance_commit_min(op);
+                        }
+                    }
+                    VsrAction::RebuildPipeline { from_op, to_op } => {
+                        rebuilt_from = Some(from_op);
+                        assert_eq!(to_op, HEAD);
+                        consensus.with_pipeline_mut(|pipeline| {
+                            for op in from_op..=to_op {
+                                let header = *merged
+                                    .headers
+                                    .iter()
+                                    .find(|header| header.op == op)
+                                    .expect("the decided history is available");
+                                let mut entry = PipelineEntry::new(header);
+                                entry.add_ack(consensus.replica());
+                                pipeline.push(entry);
+                            }
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(
+                rebuilt_from, expected_start,
+                "repair applied through {repaired_to}"
+            );
+
+            for header in merged
+                .headers
+                .iter()
+                .rev()
+                .filter(|header| header.op > repaired_to.max(MERGED_COMMIT))
+            {
+                let ack = PrepareOkHeader {
+                    command: Command::PrepareOk,
+                    view: VIEW,
+                    replica: 1,
+                    op: header.op,
+                    prepare_checksum: header.checksum,
+                    ..Default::default()
+                };
+                assert!(ack_quorum_reached(&consensus, PlaneKind::Metadata, &ack));
+                let ready = peek_committable_head(&consensus)
+                    .expect("the next op must commit in this view");
+                assert_eq!(ready.checksum, header.checksum);
+                assert_eq!(consensus.pop_committed_prepare().unwrap().header, ready);
+                consensus.advance_commit_min(ready.op);
+            }
+            assert_eq!(consensus.view(), VIEW);
+            assert_eq!(consensus.status(), Status::Normal);
+            assert_eq!(consensus.commit_min(), HEAD);
+            assert!(consensus.pipeline_is_empty());
+            assert!(consensus.applied_view_start());
+            assert_eq!(
+                consensus.last_prepare_checksum(),
+                merged.headers[0].checksum
+            );
+        }
+    }
+
+    #[test]
     fn loopback_cleared_on_complete_view_change_as_primary() {
         // 3 replicas, replica 0 is primary for view 0 (and view 3: 3 % 3 = 0).
         let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
@@ -2102,7 +2364,7 @@ mod tests {
         let header = StartViewHeader {
             checksum: 0,
             checksum_body: 0,
-            cluster: 0,
+            cluster: 1,
             size: u32::try_from(std::mem::size_of::<StartViewHeader>() + body.len())
                 .expect("synthetic StartView fits u32"),
             view,
@@ -2178,7 +2440,7 @@ mod tests {
     #[test]
     fn given_an_unsealed_suffix_when_decoding_should_be_accepted() {
         // The on-disk sentinel: suffixes are read out of the journal, which may hold
-        // pre-seal entries, and partition-plane prepares are unsealed by construction.
+        // pre-seal entries. Both planes seal newly prepared headers.
         let headers: Vec<PrepareHeader> = suffix_headers(2, 4, 1)
             .into_iter()
             .map(|mut header| {
@@ -2426,7 +2688,6 @@ mod tests {
 
         fn set_connection_lost_fn(&self, _f: message_bus::ConnectionLostFn) {}
         fn set_replica_forward_fn(&self, _f: message_bus::ReplicaForwardFn) {}
-        fn set_client_forward_fn(&self, _f: message_bus::ClientForwardFn) {}
     }
 
     #[test]
@@ -2640,8 +2901,21 @@ mod tests {
             },
             "a canonical header proves the prefix even while its body is missing"
         );
+        let mut off_chain = bridged;
+        off_chain[1].checksum += 10;
+        assert_eq!(
+            proof(2, &gap, &off_chain),
+            ViewLogProof::Missing {
+                op: 5,
+                unproven_through: 5
+            },
+            "a canonical header off the chain is no header, and nothing is held to remove"
+        );
         gap[1].checksum += 10;
-        assert_eq!(proof(2, &gap, &bridged), ViewLogProof::Divergent(4));
+        assert_eq!(
+            proof(2, &gap, &bridged),
+            ViewLogProof::Divergent { first: 4, last: 4 }
+        );
         assert_eq!(
             proof(2, &gap, &canonical),
             ViewLogProof::Missing {
@@ -2651,7 +2925,10 @@ mod tests {
             "a gap cannot prove the held prefix divergent"
         );
         gap.insert(2, local[2]);
-        assert_eq!(proof(2, &gap, &canonical), ViewLogProof::Divergent(4));
+        assert_eq!(
+            proof(2, &gap, &canonical),
+            ViewLogProof::Divergent { first: 4, last: 4 }
+        );
         assert_eq!(
             proof(2, &local, &[]),
             ViewLogProof::Missing {
@@ -2660,6 +2937,109 @@ mod tests {
             }
         );
         assert_eq!(proof(6, &local, &[]), ViewLogProof::Proven);
+    }
+
+    /// A backup that adopted a view holding only the head body proves the rest
+    /// through canonical headers, and repairs from the reported op up to the head.
+    /// Reporting the highest missing body fetched one body per round trip, each
+    /// open to a stall retry, so a full pipeline took hundreds of ticks to commit.
+    #[test]
+    fn given_bridged_bodies_missing_when_proving_history_should_report_the_lowest() {
+        const FLOOR: u64 = 2;
+        const HEAD: u64 = 6;
+        let canonical: Vec<_> = (FLOOR + 1..=HEAD)
+            .rev()
+            .map(|op| PrepareHeader {
+                op,
+                parent: u128::from(op - 1),
+                checksum: u128::from(op),
+                ..Default::default()
+            })
+            .collect();
+        let head = canonical[0];
+
+        assert_eq!(
+            view_log_proof(FLOOR, &canonical, HEAD, |op| (op == HEAD).then_some(head)),
+            ViewLogProof::Missing {
+                op: FLOOR + 1,
+                unproven_through: 0,
+            },
+            "a repair window opened above the lowest missing body leaves it for another round"
+        );
+    }
+
+    #[test]
+    fn given_a_divergent_run_when_proving_history_should_report_the_whole_proven_run() {
+        const FLOOR: u64 = 2;
+        const FIRST: u64 = FLOOR + 1;
+        const DIVERGENT: u64 = 32;
+        const LAST: u64 = FIRST + DIVERGENT - 1;
+        const HEAD: u64 = LAST + 3;
+        const UNKNOWN: u64 = FIRST + 10;
+        const HOLE: u64 = FIRST + 20;
+        const COMMITTED: u64 = FIRST + 4;
+        const STALE: u128 = 1 << 64;
+        let view = |op: u64| PrepareHeader {
+            op,
+            parent: u128::from(op - 1),
+            checksum: u128::from(op),
+            ..Default::default()
+        };
+        let held: BTreeMap<_, _> = (1..=HEAD)
+            .map(|op| {
+                let mut header = view(op);
+                if (FIRST..=LAST).contains(&op) {
+                    header.checksum += STALE;
+                    if op > FIRST {
+                        header.parent += STALE;
+                    }
+                }
+                (op, header)
+            })
+            .collect();
+        let canonical: Vec<_> = (FLOOR + 1..=HEAD).rev().map(view).collect();
+        let proof = |floor, held: &BTreeMap<u64, PrepareHeader>, canonical: &[PrepareHeader]| {
+            view_log_proof(floor, canonical, HEAD, |op| held.get(&op).copied())
+        };
+
+        assert_eq!(
+            proof(FLOOR, &held, &canonical),
+            ViewLogProof::Divergent {
+                first: FIRST,
+                last: LAST
+            }
+        );
+        let unknown: Vec<_> = canonical
+            .iter()
+            .copied()
+            .filter(|header| header.op != UNKNOWN)
+            .collect();
+        assert_eq!(
+            proof(FLOOR, &held, &unknown),
+            ViewLogProof::Divergent {
+                first: UNKNOWN,
+                last: LAST
+            },
+            "the header above an unknown op still proves it, but nothing below it"
+        );
+        let mut holed = held.clone();
+        holed.remove(&HOLE);
+        assert_eq!(
+            proof(FLOOR, &holed, &canonical),
+            ViewLogProof::Divergent {
+                first: HOLE + 1,
+                last: LAST
+            },
+            "a run never spans a held gap"
+        );
+        assert_eq!(
+            proof(COMMITTED, &held, &canonical),
+            ViewLogProof::Divergent {
+                first: COMMITTED + 1,
+                last: LAST
+            },
+            "a run never reaches the commit floor"
+        );
     }
 
     #[test]
@@ -2736,6 +3116,100 @@ mod tests {
                 op: 5,
                 unproven_through: 5
             }
+        );
+    }
+
+    #[test]
+    fn given_a_repaired_prepare_when_classifying_should_require_evidence_from_the_view_log() {
+        const VIEW: u32 = 3;
+        const OP: u64 = 5;
+        let entry = |op: u64, branch: u128, view: u32| PrepareHeader {
+            op,
+            parent: u128::from(op - 1) + branch,
+            checksum: u128::from(op) + branch,
+            view,
+            ..Default::default()
+        };
+        let committed = entry(OP, 0, VIEW - 1);
+        let abandoned = entry(OP, 100, VIEW - 2);
+        let pending =
+            |headers: &[PrepareHeader], committed_elsewhere: &[PrepareHeader]| MergedLog {
+                op_head: OP + 1,
+                commit_max: OP + 1,
+                headers: headers.to_vec(),
+                committed_elsewhere: committed_elsewhere.to_vec(),
+            };
+        let classify =
+            |frame: &PrepareHeader, canonical: &[PrepareHeader], held: &[(PrepareHeader, bool)]| {
+                repaired_prepare_evidence(frame, VIEW, Some(&pending(canonical, &[])), |op| {
+                    held.iter().find(|(header, _)| header.op == op).copied()
+                })
+            };
+        let above = entry(OP + 1, 0, VIEW);
+        let below = entry(OP - 1, 0, VIEW - 1);
+
+        assert_eq!(
+            classify(&committed, &[committed], &[]),
+            RepairEvidence::Proven
+        );
+        assert_eq!(
+            classify(&abandoned, &[committed], &[]),
+            RepairEvidence::Contradicted
+        );
+        let committed_elsewhere = pending(&[], &[committed]);
+        for (frame, evidence) in [
+            (committed, RepairEvidence::Proven),
+            (abandoned, RepairEvidence::Contradicted),
+        ] {
+            assert_eq!(
+                repaired_prepare_evidence(&frame, VIEW, Some(&committed_elsewhere), |_| None),
+                evidence
+            );
+        }
+        assert_eq!(classify(&committed, &[above], &[]), RepairEvidence::Proven);
+        assert_eq!(
+            classify(&committed, &[], &[(above, true)]),
+            RepairEvidence::Proven
+        );
+        assert_eq!(
+            classify(&abandoned, &[], &[(above, true)]),
+            RepairEvidence::Contradicted
+        );
+        assert_eq!(
+            classify(&entry(OP, 0, VIEW), &[], &[]),
+            RepairEvidence::Proven,
+            "only this view's primary stamps a prepare with this view"
+        );
+        assert_eq!(
+            classify(&committed, &[], &[(below, true)]),
+            RepairEvidence::Unproven,
+            "a parent link proves continuity, not identity"
+        );
+        assert_eq!(
+            classify(&committed, &[], &[(above, false)]),
+            RepairEvidence::Unproven,
+            "an unproven neighbor cannot vouch"
+        );
+        let stale_below = entry(OP - 1, 100, VIEW - 2);
+        assert_eq!(
+            classify(&committed, &[], &[(stale_below, true)]),
+            RepairEvidence::Contradicted
+        );
+        assert_eq!(
+            classify(&committed, &[], &[(stale_below, false)]),
+            RepairEvidence::Contradicted,
+            "an unproven frame must not splice onto another branch"
+        );
+        assert_eq!(
+            classify(&committed, &[above], &[(stale_below, false)]),
+            RepairEvidence::Proven,
+            "a proven frame outranks an unproven neighbor"
+        );
+        let mut unsealed_below = stale_below;
+        unsealed_below.checksum = CHECKSUM_UNSEALED;
+        assert_eq!(
+            classify(&committed, &[], &[(unsealed_below, true)]),
+            RepairEvidence::Unproven
         );
     }
 }

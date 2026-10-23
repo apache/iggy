@@ -25,7 +25,7 @@
 //!
 //! ```text
 //! workload-fuzz [--seed N] [--ticks N] [--clients N] [--replicas N]
-//!               [--plane partition|metadata|mixed|uniform|lifecycle]
+//!               [--plane partition|metadata|mixed|uniform|lifecycle|consumer]
 //!               [--faults none|light|heavy|swarm] [--no-quiesce]
 //!               [--crash-prob F] [--restart-prob F] [--crash-primary]
 //!               [network overrides: --packet-loss-prob, --replay-prob, --partition-mode,
@@ -61,7 +61,8 @@ use simulator::workload::actions::Action;
 use simulator::workload::invariants::Invariants;
 use simulator::workload::options::{ActionWeights, WorkloadOptions};
 use simulator::workload::{
-    FaultInjector, Workload, create_fixture_groups, oracle, restore_fixture_topics, run_with_faults,
+    FaultInjector, Workload, create_fixture_groups, oracle, restore_fixture_topics,
+    run_group_lifecycle, run_with_faults,
 };
 use strum::IntoEnumIterator;
 
@@ -155,18 +156,31 @@ struct Args {
     min_ops_compared: usize,
     /// As `--min-ops-compared`, but METADATA ops only.
     ///
-    /// Separate because a partition-only run satisfies the combined floor while the
-    /// metadata oracle compares an empty chain against an empty chain and agrees.
-    /// Defaults to `1`, which is the floor `--min-ops-compared` carried before it
-    /// counted both planes; a campaign that wants no metadata coverage opts out
+    /// Separate because a run that draws metadata ops can satisfy the combined
+    /// floor with partition ops alone while the metadata oracle compares an empty
+    /// chain against an empty chain and agrees. Defaults to `1` on a plane that
+    /// draws metadata ops and to `0` on the partition plane, whose only metadata
+    /// ops are its fixtures; a campaign that wants no metadata coverage opts out
     /// with `0`.
+    #[arg(long)]
+    min_metadata_ops_compared: Option<usize>,
+    /// Committed messages whose applied data must have been compared on two live
+    /// replicas, in a run that committed a send.
+    ///
+    /// The partition op floors cannot stand in for it: a prepare identity leaves the
+    /// message batch out, so a run can compare every identity and no message.
+    /// Ignored below two live replicas. `0` opts out.
     #[arg(long, default_value_t = 1)]
-    min_metadata_ops_compared: usize,
+    min_data_records_compared: usize,
     /// Consumer group owners that the owner oracle must compare in a shell run that
     /// joins fixture groups. The restore before the drain commits a join on every
     /// fixture group, so a run below the floor tested no ownership. `0` opts out.
     #[arg(long, default_value_t = 1)]
     min_owners_compared: usize,
+    /// Served polls whose messages a live committed prefix covered on arrival, in a
+    /// run that polls. `0` opts out.
+    #[arg(long, default_value_t = 1)]
+    min_polls_compared: u64,
     /// End the run as vacuous if crash or restart injection was requested but never
     /// happened.
     /// Off by default, since a short run at low probability may legitimately draw
@@ -359,6 +373,9 @@ enum Plane {
     /// Writes and consumer offsets while fixture topics are deleted and recreated,
     /// and, with `--shell`, while clients join and leave their fixture groups.
     Lifecycle,
+    /// Writes and offset polls, as consumers and as the fixture group, while
+    /// clients join and leave that group. Requires `--shell`.
+    Consumer,
 }
 
 impl Plane {
@@ -369,6 +386,15 @@ impl Plane {
             Self::Mixed => ActionWeights::default(),
             Self::Uniform => ActionWeights::uniform(),
             Self::Lifecycle => ActionWeights::lifecycle(),
+            Self::Consumer => ActionWeights::consumer(),
+        }
+    }
+
+    /// The `--min-metadata-ops-compared` floor when the flag is omitted.
+    const fn default_min_metadata_ops_compared(self) -> usize {
+        match self {
+            Self::Partition => 0,
+            Self::Metadata | Self::Mixed | Self::Uniform | Self::Lifecycle | Self::Consumer => 1,
         }
     }
 }
@@ -539,6 +565,19 @@ fn validate_network_options(options: &PacketSimulatorOptions) -> Result<(), Stri
     Ok(())
 }
 
+/// Exit 2 when the network options contradict each other or the plane needs the
+/// shell and the run does not use it.
+fn exit_on_unusable_configuration(args: &Args, network: &PacketSimulatorOptions) {
+    if let Err(error) = validate_network_options(network) {
+        eprintln!("workload-fuzz: invalid network configuration: {error}");
+        std::process::exit(2);
+    }
+    if args.plane == Plane::Consumer && !args.shell {
+        eprintln!("workload-fuzz: --plane consumer polls, and a poll needs --shell");
+        std::process::exit(2);
+    }
+}
+
 /// The liveness phase: drain every outstanding request, settle on one view, and
 /// compare the replicas against each other and against the oracle.
 ///
@@ -546,6 +585,7 @@ fn validate_network_options(options: &PacketSimulatorOptions) -> Result<(), Stri
 /// design, and the individual comments say why each one is not a warning. The
 /// vacuity floors are the exception: they end the run at [`EXIT_VACUOUS`], since a
 /// run that compared nothing has disproved nothing either.
+#[allow(clippy::too_many_lines)]
 fn run_quiesce_phase(
     args: &Args,
     sim: &mut Simulator,
@@ -586,6 +626,8 @@ fn run_quiesce_phase(
         "{}",
         oracle::quiesce_failure_report(sim, workload),
     );
+    // After the drain, so no client has a request in flight.
+    let lifecycle = run_group_lifecycle(sim, workload, clients, invariants);
     // Then wait for one agreed view before asserting. `assert_converged` resolves
     // the leader as whichever live replica claims to be primary, so asserting
     // mid-view-change finds none or finds a deposed one, both false failures.
@@ -608,12 +650,14 @@ fn run_quiesce_phase(
     };
     println!(
         "quiesced and converged (leader-relative; entity oracle: {entity_oracle}; \
-         evictions={}; ops_compared={} partition_ops_compared={} \
-         deleted_partition_ops_compared={} replicas_compared={} namespaces_checked={} \
+         evictions={}; ops_compared={} partition_ops_compared={} data_namespaces_compared={} \
+         data_records_compared={} deleted_partition_ops_compared={} replicas_compared={} namespaces_checked={} \
          owners_compared={} offsets_compared_with_shadow={} stale_owner_stores={} owner_fence_refusals={})",
         workload.evictions(),
         convergence.ops_compared,
         convergence.partition_ops_compared,
+        convergence.data_namespaces_compared,
+        convergence.data_records_compared,
         workload.deleted_partition_ops_compared(),
         convergence.replicas_compared,
         convergence.namespaces_checked,
@@ -640,19 +684,23 @@ fn run_quiesce_phase(
             args.min_ops_compared, convergence.ops_compared, convergence.partition_ops_compared,
         ));
     }
-    // The metadata half on its own: summing the planes above lets a partition-only
-    // run clear that floor while the metadata oracle compares nothing.
-    if args.min_metadata_ops_compared > 0
+    // The metadata half on its own: summing the planes above lets a run clear that
+    // floor with partition ops while the metadata oracle compares nothing.
+    let min_metadata_ops_compared = args
+        .min_metadata_ops_compared
+        .unwrap_or_else(|| args.plane.default_min_metadata_ops_compared());
+    if min_metadata_ops_compared > 0
         && live >= 2
-        && convergence.ops_compared < args.min_metadata_ops_compared
+        && convergence.ops_compared < min_metadata_ops_compared
     {
         vacuous(format_args!(
-            "--min-metadata-ops-compared {}: {live} replicas live but only {} committed metadata \
-             op(s) witnessed by more than one, so the metadata oracle compared an empty chain \
-             (seed={seed:#x})",
-            args.min_metadata_ops_compared, convergence.ops_compared,
+            "--min-metadata-ops-compared {min_metadata_ops_compared}: {live} replicas live but \
+             only {} committed metadata op(s) witnessed by more than one, so the metadata \
+             oracle compared an empty chain (seed={seed:#x})",
+            convergence.ops_compared,
         ));
     }
+    require_data_records(args, workload, &convergence, live);
     if sim.is_shell()
         && workload.options.weights.draws_fixture_groups()
         && convergence.owners_compared < args.min_owners_compared
@@ -663,9 +711,13 @@ fn run_quiesce_phase(
             args.min_owners_compared, convergence.owners_compared,
         ));
     }
-    if sim.is_shell() && args.plane == Plane::Lifecycle && workload.owner_fence_refusals() == 0 {
+    require_group_lifecycle(workload, invariants, &convergence, lifecycle);
+    if sim.is_shell()
+        && matches!(args.plane, Plane::Lifecycle | Plane::Consumer)
+        && workload.owner_fence_refusals() == 0
+    {
         vacuous(format_args!(
-            "lifecycle --shell requires an owner-fence refusal, but observed none \
+            "consumer/lifecycle --shell requires an owner-fence refusal, but observed none \
              (stale_owner_stores={}, seed={seed:#x})",
             workload.stale_owner_stores(),
         ));
@@ -673,6 +725,107 @@ fn run_quiesce_phase(
     // Again after the drain: the drain both answers outstanding requests and
     // issues its own resends, so the pre-drain numbers are not the final ones.
     print_coverage(workload);
+}
+
+/// Exit 3 when a run that committed a send, with two replicas live, compared the
+/// applied data of fewer messages than `--min-data-records-compared`.
+fn require_data_records(
+    args: &Args,
+    workload: &Workload,
+    convergence: &oracle::ConvergenceReport,
+    live: usize,
+) {
+    let sends = workload.auditor.stats().commits(Action::SendMessages);
+    if args.min_data_records_compared == 0
+        || live < 2
+        || sends == 0
+        || convergence.data_records_compared >= args.min_data_records_compared
+    {
+        return;
+    }
+    vacuous(format_args!(
+        "--min-data-records-compared {}: {live} replicas live and {sends} send(s) committed, \
+         but only {} message(s) had their applied data compared on two replicas (seed={:#x})",
+        args.min_data_records_compared, convergence.data_records_compared, workload.options.seed,
+    ));
+}
+
+/// Print the poll readback counts, and exit 3 when a run that polls compared
+/// fewer served polls than `--min-polls-compared`.
+fn require_polls(args: &Args, workload: &Workload) {
+    if workload.options.weights.weight(Action::PollMessages) == 0 {
+        return;
+    }
+    let polls = workload.readback.stats();
+    println!(
+        "poll readback: polls_served={} messages_served={} polls_compared={} \
+         polls_deferred={} messages_compared_at_quiesce={} group_polls_served={} \
+         group_polls_fenced={} owner_changes={} messages_unverifiable_at_quiesce={}",
+        polls.polls_served,
+        polls.messages_served,
+        polls.polls_compared,
+        polls.polls_deferred,
+        polls.messages_compared_at_quiesce,
+        polls.group_polls_served,
+        polls.group_polls_fenced,
+        polls.owner_changes,
+        polls.messages_unverifiable_at_quiesce,
+    );
+    if args.shell && args.plane == Plane::Consumer && polls.group_polls_served == 0 {
+        vacuous(format_args!(
+            "consumer --shell requires a served group poll (seed={:#x})",
+            workload.options.seed
+        ));
+    }
+    if polls.polls_compared < args.min_polls_compared {
+        vacuous(format_args!(
+            "--min-polls-compared {}: the run polls, but only {} served poll(s) were \
+             compared with a committed prefix (seed={:#x})",
+            args.min_polls_compared, polls.polls_compared, workload.options.seed,
+        ));
+    }
+}
+
+/// When the scripted group lifecycle ran, exit 3 unless it completed, its owner
+/// stored a group offset, and a retirement committed that the quiesce oracle
+/// compared. Revocation and owner-fence counts are separate coverage: only a
+/// compared retirement proves the retirement path.
+fn require_group_lifecycle(
+    workload: &Workload,
+    invariants: &Invariants,
+    convergence: &oracle::ConvergenceReport,
+    lifecycle: Option<bool>,
+) {
+    let Some(completed) = lifecycle else {
+        return;
+    };
+    let seed = workload.options.seed;
+    let retirements = invariants.state_checker().owner_retirements_committed();
+    println!(
+        "group lifecycle: completed={completed} valid_owner_stores={} \
+         owner_retirements_committed={retirements} retirements_compared={}",
+        workload.valid_owner_stores(),
+        convergence.retirements_compared,
+    );
+    if !completed {
+        vacuous(format_args!(
+            "fixture groups require the scripted group lifecycle to complete, but a step did \
+             not (seed={seed:#x})"
+        ));
+    }
+    if workload.valid_owner_stores() == 0 {
+        vacuous(format_args!(
+            "fixture groups require a group offset stored by its owner, but none committed \
+             (seed={seed:#x})"
+        ));
+    }
+    if retirements == 0 || convergence.retirements_compared == 0 {
+        vacuous(format_args!(
+            "fixture groups require a retired group owner, but {retirements} retirement(s) \
+             committed and {} retired group(s) were compared (seed={seed:#x})",
+            convergence.retirements_compared,
+        ));
+    }
 }
 
 fn main() {
@@ -710,10 +863,7 @@ fn main() {
     }));
 
     let network_opts = network_options(&args, replicas, clients, seed);
-    if let Err(error) = validate_network_options(&network_opts) {
-        eprintln!("workload-fuzz: invalid network configuration: {error}");
-        std::process::exit(2);
-    }
+    exit_on_unusable_configuration(&args, &network_opts);
     print_run_banner(&args, seed, &network_opts);
 
     // poll_messages / reply paths panic without an initialized pool; disabled
@@ -775,6 +925,7 @@ fn main() {
             &mut invariants,
         );
     }
+    require_polls(&args, &workload);
 
     // After the quiesce block, so the drain's own commits count. Rejections are added
     // to the per-action counter, which tracks committed SUCCESSES: a business

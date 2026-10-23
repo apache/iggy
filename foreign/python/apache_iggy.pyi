@@ -45,8 +45,10 @@ __all__ = [
     "HeaderKey",
     "HeaderValue",
     "HttpConfig",
+    "IdentityInfo",
     "IggyClient",
     "IggyConsumer",
+    "IggyError",
     "IggyExpiry",
     "IggyProducer",
     "MaxTopicSize",
@@ -72,6 +74,7 @@ __all__ = [
     "StreamPermissions",
     "TcpConfig",
     "TcpReconnectionConfig",
+    "TokenInfo",
     "Topic",
     "TopicDetails",
     "TopicPermissions",
@@ -1136,6 +1139,23 @@ class HttpConfig:
     def __repr__(self) -> builtins.str: ...
 
 @typing.final
+class IdentityInfo:
+    r"""
+    Identity returned by username/password login and PAT login.
+    """
+    @property
+    def user_id(self) -> builtins.int:
+        r"""
+        The unique identifier (numeric) of the authenticated user.
+        """
+    @property
+    def access_token(self) -> TokenInfo | None:
+        r"""
+        HTTP access token, or `None` on TCP/QUIC/WebSocket.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
 class IggyClient:
     r"""
     A Python class representing the Iggy client.
@@ -1219,10 +1239,31 @@ class IggyClient:
         """
     def login_user(
         self, username: builtins.str, password: builtins.str
-    ) -> collections.abc.Awaitable[None]:
+    ) -> collections.abc.Awaitable[IdentityInfo]:
         r"""
         Logs in the user with the given credentials.
-        Raises `RuntimeError` on failure.
+
+        Returns:
+            An awaitable that resolves to `IdentityInfo`.
+            `access_token` is set only on HTTP; binary transports leave it `None`.
+
+        Raises:
+            RuntimeError: If the request fails.
+        """
+    def login_with_personal_access_token(
+        self, token: builtins.str
+    ) -> collections.abc.Awaitable[IdentityInfo]:
+        r"""
+        Logs in with a personal access token created separately.
+
+        Args:
+            token: Raw PAT string.
+
+        Returns:
+            An awaitable that resolves to `IdentityInfo`.
+
+        Raises:
+            RuntimeError: If the request fails.
         """
     def get_user(
         self, user_id: builtins.str | builtins.int
@@ -2095,6 +2136,14 @@ class IggyConsumer:
         next poll routes again.
         """
 
+class IggyError(builtins.RuntimeError):
+    r"""
+    An error of the Iggy SDK. `code` is the numeric Iggy error code, the same
+    code that every other Iggy SDK reports for it.
+    """
+    @property
+    def code(self) -> builtins.int: ...
+
 class IggyExpiry:
     r"""
     The expiry of the messages in a topic.
@@ -2394,14 +2443,12 @@ class Partitioning:
         """
 
 @typing.final
-class PendingOperationError(builtins.RuntimeError):
+class PendingOperationError(IggyError):
     r"""
     An operation whose retained identity is needed to recover or release its lane.
     """
     @property
     def operation_id(self) -> builtins.int: ...
-    @property
-    def code(self) -> builtins.int: ...
     @property
     def kind(self) -> builtins.str: ...
 
@@ -2486,9 +2533,10 @@ class PollingStrategy:
     ...
 
 @typing.final
-class ProducerSendError(builtins.RuntimeError):
+class ProducerSendError(IggyError):
     r"""
-    A direct producer error that preserves partial-send recovery state.
+    A direct producer error that preserves partial-send recovery state. Its
+    `__cause__` is the `IggyError` that ended the send.
     """
     @property
     def operation_id(self) -> builtins.int | None:
@@ -2504,11 +2552,18 @@ class ProducerSendError(builtins.RuntimeError):
     def failed(self) -> builtins.list[SendMessage]:
         r"""
         Messages without a usable confirmation after the failure.
-        For an `uncertain` cause, the first chunk may already have committed:
-        resolve its operation ID without resubmitting the payload as a new send.
+        For an `uncertain` cause, the first `uncertain` messages may already have
+        committed: resolve its operation ID without resubmitting them as a new send.
         For `lane_blocked`, none of these messages was sent; resolve the earlier
         blocker before retrying. `not_retained` does not prove non-commit.
         Before any safe resubmission, restore payloads changed by encryption.
+        """
+    @property
+    def uncertain(self) -> builtins.int:
+        r"""
+        How many messages at the head of `failed` may have committed: those the
+        operation of an `uncertain` cause carried, or those of an HTTP send whose
+        outcome is unknown (code 57). Zero for any other cause.
         """
     @property
     def committed(self) -> builtins.list[SendMessagesConfirmation]:
@@ -3258,6 +3313,23 @@ class TcpReconnectionConfig:
                 range of an unsigned 32-bit integer, or if `interval` is zero.
             OverflowError: If `max_retries` does not fit a signed 64-bit integer,
                 raised by the underlying conversion before this constructor runs.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class TokenInfo:
+    r"""
+    HTTP session token returned by login. Binary transports leave this unset.
+    """
+    @property
+    def token(self) -> builtins.str:
+        r"""
+        The access token value. Present only after HTTP login.
+        """
+    @property
+    def expiry(self) -> builtins.int:
+        r"""
+        Unix-seconds expiry of the HTTP access token.
         """
     def __repr__(self) -> builtins.str: ...
 

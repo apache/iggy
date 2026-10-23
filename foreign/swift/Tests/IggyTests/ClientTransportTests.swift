@@ -20,9 +20,17 @@ import Testing
 @testable import Iggy
 
 private let rootLogin = Credentials.usernamePassword(username: "iggy", password: "iggy")
+private let tokenLogin = Credentials.personalAccessToken("iggy-token")
 
 /// A request timeout short enough for a test to wait it out.
 private let shortTimeout: Duration = .milliseconds(500)
+
+private let sessionEnds = FakeVSRServer.sessionEndingEvictions.map { FakeVSRServer.Reply.eviction($0) }
+
+/// The replicated writes a client sends over its own connection: a metadata
+/// write, a batch, an offset store, and a segment deletion, which is neither
+/// a metadata nor a partition operation.
+private let replicatedWrites: [CommandCode] = [.deleteStream, .sendMessages, .storeConsumerOffset, .deleteSegments]
 
 /// A client on the fake server with fast reconnection. The request timeout is
 /// generous unless the test is about running into it, so a slow machine does
@@ -52,6 +60,47 @@ private struct GatedConnector: IggyConnector {
     }
 }
 
+/// Holds the first connection's close after the socket is closed, so a new
+/// sign-in can finish before an older failure finishes its cleanup.
+private struct GatedCloseConnector: IggyConnector {
+    let closed = Locked(false)
+    let released = Locked(false)
+    private let used = Locked(false)
+
+    func connect(to endpoint: Endpoint, tls: TLSOptions?, timeout: Duration, noDelay: Bool) async throws -> any IggyConnection {
+        let connection = try await NIOConnector().connect(to: endpoint, tls: tls, timeout: timeout, noDelay: noDelay)
+        let first = used.withLock { used in
+            let first = !used
+            used = true
+            return first
+        }
+        return first ? Connection(connection, closed: closed, released: released) : connection
+    }
+
+    private final class Connection: IggyConnection {
+        let underlying: any IggyConnection
+        let closed: Locked<Bool>
+        let released: Locked<Bool>
+        var localAddress: String? { underlying.localAddress }
+
+        init(_ underlying: any IggyConnection, closed: Locked<Bool>, released: Locked<Bool>) {
+            self.underlying = underlying
+            self.closed = closed
+            self.released = released
+        }
+
+        func exchange(_ frame: [UInt8], timeout: Duration) async throws -> RawFrame {
+            try await underlying.exchange(frame, timeout: timeout)
+        }
+
+        func close() async {
+            await underlying.close()
+            closed.withLock { $0 = true }
+            while !released.withLock({ $0 }) { try? await Task.sleep(for: .milliseconds(2)) }
+        }
+    }
+}
+
 private func operations(_ server: FakeVSRServer) async -> [ConsensusOperation] {
     await server.requests.map(\.operation)
 }
@@ -66,6 +115,74 @@ private func pingCount(_ server: FakeVSRServer) async -> Int {
 
 @Suite("Client transport", .serialized)
 struct ClientTransportTests {
+    @Test(arguments: [false, true])
+    func aCallStartedBeforeDisconnectEndsUnauthenticated(singleAttempt: Bool) async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let client = makeClient(server)
+        defer { Task { await client.shutdown() } }
+        try await client.connect()
+        let lineage = await client.core.lineage
+        await client.disconnect()
+
+        await expectCode(.unauthenticated) {
+            if singleAttempt {
+                _ = try await client.core.exchangeOnce(code: CommandCode.ping.rawValue, payload: [], context: .empty, lineage: lineage)
+            } else {
+                _ = try await client.core.exchange(code: CommandCode.ping.rawValue, payload: [], lineage: lineage)
+            }
+        }
+        await expectCode(.notConnected) { try await client.ping() }
+        await expectCode(.notConnected) { _ = try await client.getMe() }
+        #expect(await pingCount(server) == 0)
+    }
+
+    @Test func aCallWaitingForReconnectEndsUnauthenticatedWhenTheCallerDisconnects() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let client = makeClient(server)
+        defer { Task { await client.shutdown() } }
+        try await client.connect()
+        await client.core.disconnectTransport()
+        let signingIn = Locked(false)
+        let released = Locked(false)
+        await server.respond { request in
+            if request.code == CommandCode.bindSession.rawValue { return .status(IggyErrorCode.unauthenticated.rawValue) }
+            if request.operation == .register {
+                signingIn.withLock { $0 = true }
+                _ = await eventually { released.withLock { $0 } }
+            }
+            return FakeVSRServer.defaultReply(request, address: server.address)
+        }
+        let call = Task { try await client.getStreams() }
+        #expect(await eventually { signingIn.withLock { $0 } })
+        await client.disconnect()
+        released.withLock { $0 = true }
+
+        await expectCode(.unauthenticated) { _ = try await call.value }
+        #expect(await server.requests.allSatisfy { $0.code != CommandCode.getStreams.rawValue })
+    }
+
+    @Test func aDisconnectDuringAStalledReconnectEndsTheRequestUnauthenticated() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let connector = GatedConnector()
+        connector.released.withLock { $0 = true }
+        let client = makeClient(server, requestTimeout: shortTimeout, connector: connector)
+        defer { Task { await client.shutdown() } }
+        try await client.connect()
+        connector.released.withLock { $0 = false }
+        await client.core.disconnectTransport()
+        let call = Task { try await client.ping() }
+        #expect(await eventually { await client.state == .connecting })
+        await client.disconnect()
+
+        // The dial is still held when the deadline ends the wait for it.
+        await expectCode(.unauthenticated) { try await call.value }
+        connector.released.withLock { $0 = true }
+        #expect(await pingCount(server) == 0)
+    }
+
     @Test func loginBindsTheSessionAndSequencesRequests() async throws {
         let server = try await FakeVSRServer.started()
         defer { Task { await server.stop() } }
@@ -111,6 +228,278 @@ struct ClientTransportTests {
         try await client.logout()
         #expect(await client.state == .connected)
         await client.shutdown()
+    }
+
+    @Test(
+        arguments: [
+            (FakeVSRServer.Reply.status(IggyErrorCode.invalidCredentials.rawValue), IggyErrorCode.invalidCredentials),
+            (.status(IggyErrorCode.invalidPersonalAccessToken.rawValue), .invalidPersonalAccessToken),
+            (.status(IggyErrorCode.personalAccessTokenExpired.rawValue), .personalAccessTokenExpired),
+            (.status(IggyErrorCode.userInactive.rawValue), .userInactive),
+            (.stall, .transientNotAccepted),
+        ], [false, true])
+    func aFailedExplicitSignInDisablesAutomaticFallback(_ failure: (FakeVSRServer.Reply, IggyErrorCode), token: Bool) async throws {
+        let (reply, code) = failure
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let client = makeClient(server, requestTimeout: shortTimeout)
+        defer { Task { await client.shutdown() } }
+        try await client.connect()
+        await client.core.disconnectTransport()
+        await server.respond { request in
+            request.operation == .register ? reply : FakeVSRServer.defaultReply(request, address: server.address)
+        }
+
+        await expectCode(code) {
+            if token {
+                _ = try await client.login(personalAccessToken: "caller-token")
+            } else {
+                _ = try await client.login(username: "other", password: "secret")
+            }
+        }
+        let before = await server.requests.filter { $0.operation == .register }
+        #expect(before.count == 2)
+        #expect(before.last.flatMap { Self.username(in: $0.payload) } == (token ? "caller-token" : "other"))
+        if !token { #expect(before.last.flatMap { Self.password(in: $0.payload) } == "secret") }
+        await server.respond { FakeVSRServer.defaultReply($0, address: server.address) }
+        await client.core.disconnectTransport()
+
+        try await client.connect()
+        await expectCode(.unauthenticated) { _ = try await client.getStreams() }
+        #expect(await server.requests.filter { $0.operation == .register }.count == before.count)
+        await client.disconnect()
+        try await client.connect()
+        await expectCode(.unauthenticated) { _ = try await client.getStreams() }
+        #expect(await server.requests.filter { $0.operation == .register }.count == before.count)
+        _ = try await client.login(username: "recovered", password: "secret")
+        await Self.forgetSessions(on: server)
+        await client.core.disconnectTransport()
+        try await client.ping()
+        let after = await server.requests.filter { $0.operation == .register }
+        #expect(after.suffix(2).map { Self.username(in: $0.payload) } == ["recovered", "recovered"])
+    }
+
+    @Test func aValidationFailureWithdrawsConfiguredAndRememberedSignIn() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let client = makeClient(server)
+        defer { Task { await client.shutdown() } }
+        try await client.connect()
+        _ = try await client.login(username: "remembered", password: "secret")
+
+        await expectCode(.invalidUsername) { _ = try await client.login(username: "", password: "secret") }
+        await client.core.disconnectTransport()
+        try await client.connect()
+
+        await expectCode(.unauthenticated) { _ = try await client.getStreams() }
+        #expect(await server.requests.filter { $0.operation == .register }.count == 2)
+    }
+
+    @Test func anExplicitSignInSupersedesAnAutomaticIdentity() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let received = Locked(false)
+        let released = Locked(false)
+        let bound = Locked<[Int: UInt32]>([:])
+        let explicitUser: UInt32 = 7
+        await server.respond { request in
+            if request.operation == .logout {
+                bound.withLock { $0[request.connection] = nil }
+            }
+            if request.code == CommandCode.bindSession.rawValue { return .status(IggyErrorCode.unauthenticated.rawValue) }
+            if request.operation == .register {
+                let automatic = Self.username(in: request.payload) == "iggy"
+                if automatic {
+                    received.withLock { $0 = true }
+                    while !released.withLock({ $0 }) { try? await Task.sleep(for: .milliseconds(2)) }
+                }
+                let user = bound.withLock { users in
+                    if let user = users[request.connection] { return user }
+                    let user: UInt32 = automatic ? 0 : explicitUser
+                    users[request.connection] = user
+                    return user
+                }
+                return .ok(FakeVSRServer.registerBody(userID: user))
+            }
+            return FakeVSRServer.defaultReply(request, address: server.address)
+        }
+        let client = makeClient(server)
+        defer { Task { await client.shutdown() } }
+        let automatic = Task { try await client.connect() }
+        #expect(await eventually { received.withLock { $0 } })
+        let started = await client.core.lineage
+        let explicit = Task { try await client.login(username: "other", password: "secret") }
+        #expect(await eventually { await client.core.lineage != started })
+        released.withLock { $0 = true }
+
+        await expectCode(.unauthenticated) { try await automatic.value }
+        #expect(try await explicit.value.userID == explicitUser)
+        await client.core.disconnectTransport()
+        try await client.ping()
+        let registers = await server.requests.filter { $0.operation == .register }
+        #expect(registers.map { Self.username(in: $0.payload) } == ["iggy", "other", "other"])
+    }
+
+    @Test(arguments: [false, true])
+    func olderAndQueuedSignInsCannotRestoreCredentialsAfterANewerFailure(automatic: Bool) async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let client = makeClient(server, autoLogin: automatic ? rootLogin : nil)
+        defer { Task { await client.shutdown() } }
+        if !automatic { try await client.connect() }
+        let received = Locked(false)
+        let released = Locked(false)
+        await server.respond { request in
+            if request.operation == .register {
+                let username = Self.username(in: request.payload)
+                if username == "iggy" || username == "older" {
+                    received.withLock { $0 = true }
+                    while !released.withLock({ $0 }) { try? await Task.sleep(for: .milliseconds(2)) }
+                }
+            }
+            return FakeVSRServer.defaultReply(request, address: server.address)
+        }
+        let older = Task {
+            if automatic { try await client.connect() } else { _ = try await client.login(username: "older", password: "secret") }
+        }
+        #expect(await eventually { received.withLock { $0 } })
+        let started = await client.core.lineage
+        let queued = Task { _ = try await client.login(username: "queued", password: "secret") }
+        #expect(await eventually { await client.core.lineage != started })
+
+        await expectCode(.invalidPassword) { _ = try await client.login(username: "newest", password: "") }
+        released.withLock { $0 = true }
+        await expectCode(.unauthenticated) { try await older.value }
+        await expectCode(.unauthenticated) { try await queued.value }
+        await client.core.disconnectTransport()
+        try await client.connect()
+
+        await expectCode(.unauthenticated) { _ = try await client.getStreams() }
+        let registers = await server.requests.filter { $0.operation == .register }
+        #expect(registers.count == 1)
+        #expect(!registers.contains { Self.username(in: $0.payload) == "queued" })
+    }
+
+    @Test(
+        arguments: [
+            (FakeVSRServer.Reply.status(IggyErrorCode.invalidCredentials.rawValue), Optional(IggyErrorCode.invalidCredentials)),
+            (.close, .disconnected),
+            (.stall, .disconnected),
+            (.stall, nil),
+        ])
+    func aFailedExplicitLeaderSettlementDiscardsTheRegisteredSession(_ failure: (FakeVSRServer.Reply, IggyErrorCode?)) async throws {
+        let (reply, code) = failure
+        let follower = try await FakeVSRServer.started()
+        let leader = try await FakeVSRServer.started()
+        defer {
+            Task {
+                await follower.stop()
+                await leader.stop()
+            }
+        }
+        let binding = Locked(false)
+        let roster = FakeVSRServer.rosterBody([follower.address, leader.address], leaderIndex: 1)
+        for server in [follower, leader] {
+            await server.respond { request in
+                if request.code == CommandCode.bindSession.rawValue {
+                    binding.withLock { $0 = true }
+                    return reply
+                }
+                if request.code == CommandCode.getClusterMetadata.rawValue { return .ok(roster) }
+                return FakeVSRServer.defaultReply(request, address: server.address)
+            }
+        }
+        let client = makeClient(follower, autoLogin: nil, reconnection: false, requestTimeout: shortTimeout)
+        defer { Task { await client.shutdown() } }
+        try await client.connect()
+        let login = Task { try await client.login(username: "caller", password: "secret") }
+        #expect(await eventually { binding.withLock { $0 } })
+        if let code {
+            await expectCode(code) { _ = try await login.value }
+        } else {
+            login.cancel()
+            await #expect(throws: CancellationError.self) { _ = try await login.value }
+        }
+        #expect(await client.core.sessionIdentity(at: 0) == nil)
+        #expect(await eventually { await follower.openConnectionCount + leader.openConnectionCount == 0 })
+        let before = await follower.requests + leader.requests
+        #expect(before.filter { $0.operation == .register }.count == 1)
+        #expect(before.contains { $0.code == CommandCode.bindSession.rawValue })
+        for server in [follower, leader] {
+            await server.respond { FakeVSRServer.defaultReply($0, address: server.address) }
+        }
+
+        try await client.connect()
+        await expectCode(.unauthenticated) { _ = try await client.getStreams() }
+        try await client.ping()
+        let after = await follower.requests + leader.requests
+        #expect(after.filter { $0.operation == .register }.count == 1)
+        #expect(after.filter { $0.code == CommandCode.bindSession.rawValue }.count == before.filter { $0.code == CommandCode.bindSession.rawValue }.count)
+        #expect(after.filter { $0.code == CommandCode.ping.rawValue }.allSatisfy { $0.session == 0 })
+        _ = try await client.login(username: "recovered", password: "secret")
+        try await client.deleteStream(1)
+    }
+
+    @Test func aFailedExplicitSignInClosesTheOldSessionWithoutClaimingAnInflightWriteFailed() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let client = makeClient(server)
+        defer { Task { await client.shutdown() } }
+        try await client.connect()
+        await server.respond { request in
+            request.operation == .deleteStream ? .stall : FakeVSRServer.defaultReply(request, address: server.address)
+        }
+        let write = Task { try await client.deleteStream(1) }
+        #expect(await eventually { await operations(server).contains(.deleteStream) })
+
+        await expectCode(.invalidPassword) { _ = try await client.login(username: "other", password: "") }
+        #expect(await client.core.sessionIdentity(at: 0) == nil)
+        #expect(await eventually { await server.openConnectionCount == 0 })
+        await expectCode(.transientNotCommitted) { try await write.value }
+        try await client.connect()
+        await expectCode(.unauthenticated) { _ = try await client.getStreams() }
+        #expect(await operations(server).filter { $0 == .register }.count == 1)
+        #expect(await codes(server).contains(CommandCode.bindSession.rawValue) == false)
+    }
+
+    @Test func anOlderExplicitFailureCannotDiscardANewerSuccessfulSession() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let connector = GatedCloseConnector()
+        defer { connector.released.withLock { $0 = true } }
+        let client = makeClient(server, connector: connector)
+        defer { Task { await client.shutdown() } }
+        try await client.connect()
+        let failed = Task { try await client.login(username: "invalid", password: "") }
+        #expect(await eventually { connector.closed.withLock { $0 } })
+
+        _ = try await client.login(username: "newer", password: "secret")
+        let newer = await client.core.sessionIdentity(at: 0)
+        #expect(newer != nil)
+        connector.released.withLock { $0 = true }
+        await expectCode(.invalidPassword) { _ = try await failed.value }
+        #expect(await client.state == .authenticated)
+        #expect(await client.core.sessionIdentity(at: 0)?.clientID == newer?.clientID)
+        try await client.deleteStream(1)
+        #expect(await server.requests.last?.clientID == newer?.clientID)
+        #expect(await server.requests.filter { $0.operation == .register }.last.flatMap { Self.username(in: $0.payload) } == "newer")
+    }
+
+    @Test func aBestEffortRosterRefusalStillLeavesExplicitSignInSuccessful() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        await server.respond { request in
+            request.code == CommandCode.getClusterMetadata.rawValue
+                ? .status(IggyErrorCode.featureUnavailable.rawValue) : FakeVSRServer.defaultReply(request, address: server.address)
+        }
+        let client = makeClient(server, autoLogin: nil)
+        defer { Task { await client.shutdown() } }
+        try await client.connect()
+        _ = try await client.login(username: "caller", password: "secret")
+        #expect(await client.state == .authenticated)
+        #expect(await client.core.sessionIdentity(at: 0) != nil)
+        try await client.deleteStream(1)
+        #expect(await operations(server).filter { $0 == .register }.count == 1)
     }
 
     @Test func rejectedCredentialsAreNotRetried() async throws {
@@ -161,6 +550,155 @@ struct ClientTransportTests {
         await client.shutdown()
     }
 
+    /// A read carries the newest metadata commit the client saw, as
+    /// `read_context` in the Rust SDK stamps it, so a backup that lags holds
+    /// the read until it applied the client's own write.
+    @Test func aReadCarriesTheMetadataWatermark() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let commit: UInt64 = 42
+        await server.respond { request in
+            request.operation == .deleteStream ? .committed([], commit: commit) : FakeVSRServer.defaultReply(request, address: server.address)
+        }
+        let client = makeClient(server)
+        try await client.connect()
+        _ = try await client.getStreams()
+        try await client.deleteStream(1)
+        _ = try await client.getStreams()
+        let reads = await server.requests.filter { $0.code == CommandCode.getStreams.rawValue }
+        #expect(reads.map(\.context.metadataOp) == [0, commit])
+        #expect(await server.requests.first { $0.operation == .deleteStream }?.context == .empty)
+        await client.shutdown()
+    }
+
+    @Test func anUncommittedMetadataWriteFollowsTheNewPrimaryWithItsFrame() async throws {
+        let first = try await FakeVSRServer.started()
+        let second = try await FakeVSRServer.started()
+        defer {
+            Task {
+                await first.stop(); await second.stop()
+            }
+        }
+        let attempted = Locked(false)
+        let moved = Locked(false)
+        let addresses = [first.address, second.address]
+        await first.respond { request in
+            if request.code == CommandCode.getClusterMetadata.rawValue {
+                return .ok(FakeVSRServer.rosterBody(addresses, leaderIndex: moved.withLock { $0 } ? 1 : 0))
+            }
+            if request.operation == .deleteStream {
+                if !attempted.exchange(true) { return .status(IggyErrorCode.transientNotCommitted.rawValue) }
+                moved.withLock { $0 = true }
+                return .status(IggyErrorCode.notPrimary.rawValue)
+            }
+            return FakeVSRServer.defaultReply(request, address: first.address)
+        }
+        await second.respond { request in
+            request.code == CommandCode.getClusterMetadata.rawValue
+                ? .ok(FakeVSRServer.rosterBody(addresses, leaderIndex: 1))
+                : FakeVSRServer.defaultReply(request, address: second.address)
+        }
+        let client = makeClient(first, requestTimeout: .seconds(2))
+        defer { Task { await client.shutdown() } }
+        try await client.connect()
+
+        try await client.deleteStream(1)
+
+        let previous = await first.requests.filter { $0.operation == .deleteStream }
+        let next = await second.requests.filter { $0.operation == .deleteStream }
+        #expect(previous.count == 2)
+        #expect(next.count == 1)
+        #expect(Set((previous + next).map(\.requestID)).count == 1)
+        #expect(Set((previous + next).map(\.clientID)).count == 1)
+        #expect(Set((previous + next).map(\.session)).count == 1)
+        #expect(Set((previous + next).map(\.checksum)).count == 1)
+    }
+
+    @Test func internalSessionAndRosterFramesKeepTheirEmptyContext() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let commit: UInt64 = 42
+        await server.respond { request in
+            request.operation == .deleteStream ? .committed([], commit: commit) : FakeVSRServer.defaultReply(request, address: server.address)
+        }
+        let client = makeClient(server)
+        defer { Task { await client.shutdown() } }
+        try await client.connect()
+        try await client.deleteStream(1)
+        await client.core.disconnectTransport()
+        try await client.ping()
+        _ = try await client.getStreams()
+
+        let frames = await server.requests
+        let internalFrames = frames.filter { $0.code == CommandCode.bindSession.rawValue || $0.code == CommandCode.getClusterMetadata.rawValue }
+        #expect(internalFrames.contains { $0.code == CommandCode.bindSession.rawValue })
+        #expect(internalFrames.allSatisfy { $0.context == .empty })
+        #expect(frames.last { $0.code == CommandCode.getStreams.rawValue }?.context.metadataOp == commit)
+    }
+
+    @Test(arguments: [CommandCode.ping, .getStreams])
+    func aCallerInterruptedSignInIsNotReportedAsAServerRefusal(_ waiting: CommandCode) async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let client = makeClient(server)
+        defer { Task { await client.shutdown() } }
+        try await client.connect()
+        await client.core.disconnectTransport()
+        let signingIn = Locked(false)
+        let released = Locked(false)
+        await server.respond { request in
+            if request.code == CommandCode.bindSession.rawValue { return .status(IggyErrorCode.unauthenticated.rawValue) }
+            if request.operation == .register, Self.username(in: request.payload) == "iggy" {
+                signingIn.withLock { $0 = true }
+                while !released.withLock({ $0 }) { try? await Task.sleep(for: .milliseconds(2)) }
+                return .status(IggyErrorCode.transientNotAccepted.rawValue)
+            }
+            return FakeVSRServer.defaultReply(request, address: server.address)
+        }
+        let lineage = await client.core.lineage
+        let call = Task {
+            if waiting == .ping { try await client.ping() } else { _ = try await client.getStreams() }
+        }
+        #expect(await eventually { signingIn.withLock { $0 } })
+        let login = Task { _ = try await client.login(username: "other", password: "secret") }
+        #expect(await eventually { await client.core.lineage != lineage })
+        released.withLock { $0 = true }
+        do {
+            try await call.value
+            Issue.record("the call continued after the caller signed in")
+        } catch let error as IggyError {
+            #expect(error.code == .unauthenticated)
+            #expect(error.context?.contains("automatic sign-in was refused") == false)
+            #expect(error.context?.contains("caller signed in or out") == true)
+        }
+        try await login.value
+    }
+
+    @Test func aRepeatedlyDetachedReadWaitsBetweenReconnects() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let attempts = Locked<[ContinuousClock.Instant]>([])
+        await server.respond { request in
+            if request.code == CommandCode.getStreams.rawValue {
+                let count = attempts.withLock {
+                    $0.append(.now); return $0.count
+                }
+                if count < 3 { return .eviction(.noSession) }
+            }
+            return FakeVSRServer.defaultReply(request, address: server.address)
+        }
+        let client = makeClient(server)
+        defer { Task { await client.shutdown() } }
+        try await client.connect()
+
+        _ = try await client.getStreams()
+
+        let times = attempts.withLock { $0 }
+        #expect(times.count == 3)
+        #expect(times[1] - times[0] >= PollRouter.retryInterval)
+        #expect(times[2] - times[1] >= PollRouter.retryInterval * 2)
+    }
+
     @Test func transientNotCommittedReplaysTheSameRequestID() async throws {
         let server = try await FakeVSRServer.started()
         defer { Task { await server.stop() } }
@@ -183,6 +721,41 @@ struct ClientTransportTests {
         #expect(Set(creates.map(\.requestID)).count == 1)
         #expect(Set(creates.map(\.connection)).count == 1)
         #expect(await server.connectionCount == 1)
+        await client.shutdown()
+    }
+
+    /// A write answered "not committed" may still commit. When a replay then
+    /// loses its connection, the client reconnects, binds the same session,
+    /// and replays the write under its own request id until the deadline, as
+    /// the Rust SDK does, instead of ending it as unknown at once.
+    @Test(arguments: [1, 2])
+    func anUncommittedWriteReplaysAcrossLostConnections(_ losses: Int) async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let attempts = Locked(0)
+        await server.respond { request in
+            guard request.operation == .deleteStream else {
+                return FakeVSRServer.defaultReply(request, address: server.address)
+            }
+            let attempt = attempts.withLock {
+                $0 += 1; return $0
+            }
+            if attempt == 1 {
+                return .status(IggyErrorCode.transientNotCommitted.rawValue)
+            }
+            return attempt <= losses + 1 ? .close : .ok([])
+        }
+        let client = makeClient(server)
+        try await client.connect()
+
+        try await client.deleteStream(1)
+
+        let deletes = await server.requests.filter { $0.operation == .deleteStream }
+        #expect(deletes.count == losses + 2)
+        #expect(Set(deletes.map(\.requestID)).count == 1)
+        #expect(Set(deletes.map(\.clientID)).count == 1)
+        #expect(await codes(server).filter { $0 == CommandCode.bindSession.rawValue }.count == losses)
+        #expect(await operations(server).filter { $0 == .register }.count == 1)
         await client.shutdown()
     }
 
@@ -352,7 +925,7 @@ struct ClientTransportTests {
         try await client.connect()
         let clock = ContinuousClock()
         let elapsed = await clock.measure {
-            await expectCode(.disconnected) { _ = try await client.getStats() }
+            await expectCode(.transientNotAccepted) { _ = try await client.getStats() }
         }
         #expect(elapsed >= .milliseconds(450) && elapsed < .seconds(10))
         #expect(await client.state == .disconnected)
@@ -367,7 +940,8 @@ struct ClientTransportTests {
     }
 
     /// With unlimited retries a reconnect to a server that is gone never
-    /// ends. The request that started it still has to return at its deadline.
+    /// ends. The request that started it still has to return at its deadline,
+    /// refused as not accepted since it was never sent.
     @Test func requestDeadlineCoversTheReconnect() async throws {
         let server = try await FakeVSRServer.started()
         let client = makeClient(server, requestTimeout: shortTimeout)
@@ -377,7 +951,7 @@ struct ClientTransportTests {
         let elapsed = await clock.measure {
             // The server closed the connection first, so the ping was never
             // written.
-            await expectCode(.notConnected) { try await client.ping() }
+            await expectCode(.transientNotAccepted) { try await client.ping() }
         }
         #expect(elapsed >= .milliseconds(450) && elapsed < .seconds(10))
         // No caller waits for the sweep any more, so it ends too.
@@ -448,32 +1022,97 @@ struct ClientTransportTests {
         await client.shutdown()
     }
 
-    @Test func evictionRestoresTheSessionAndReplaysSafeRequests() async throws {
+    /// A write can commit before an eviction ends its session, as the Rust
+    /// SDK assumes. When the session cannot be bound again, a new session
+    /// cannot replay the write safely: the call ends with the unknown outcome
+    /// after one send, and the next write signs in again.
+    @Test(arguments: FakeVSRServer.sessionEndingEvictions, replicatedWrites)
+    func aWriteEvictedWithItsSessionIsSentOnceAndStaysUnknown(_ reason: VSRFrame.EvictionReason, _ write: CommandCode) async throws {
         let server = try await FakeVSRServer.started()
         defer { Task { await server.stop() } }
-        let once = Locked(true)
+        let evicted = Locked(false)
         await server.respond { request in
             if request.code == CommandCode.bindSession.rawValue { return .status(IggyErrorCode.unauthenticated.rawValue) }
-            if let reply = FakeVSRServer.sessionReply(request) { return reply }
-            if request.operation == .deleteStream,
-                once.withLock({
-                    let first = $0; $0 = false; return first
-                })
-            {
-                return .eviction(.noSession)
+            if request.code == write.rawValue, !evicted.exchange(true) {
+                return .eviction(reason)
             }
-            return .ok([])
+            return FakeVSRServer.defaultReply(request, address: server.address)
         }
         let client = makeClient(server)
         try await client.connect()
-        // The evicted session cannot be resumed. An unauthenticated eviction
-        // means the request never reached the log, so the delete is replayed
-        // under the new session.
+
+        await expectCode(.transientNotCommitted) { try await Self.issue(write, on: client) }
+
+        #expect(await server.requests.filter { $0.code == write.rawValue }.count == 1)
+        try await Self.issue(write, on: client)
+        #expect(await operations(server).filter { $0 == .register }.count == 2)
+        await client.shutdown()
+    }
+
+    /// The session of an evicted write that the client binds again answers
+    /// the same request from its reply cache, so the write goes again as it
+    /// was stamped, as the Rust SDK replays it after a rebind.
+    @Test func aWriteEvictedWithItsSessionIsReplayedWhenTheSessionIsBoundAgain() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let evicted = Locked(false)
+        await server.respond { request in
+            if request.operation == .deleteStream, !evicted.exchange(true) {
+                return .eviction(.noSession)
+            }
+            return FakeVSRServer.defaultReply(request, address: server.address)
+        }
+        let client = makeClient(server)
+        try await client.connect()
+
         try await client.deleteStream(1)
-        let ops = await operations(server)
-        #expect(ops.filter { $0 == .register }.count == 2)
-        #expect(ops.filter { $0 == .deleteStream }.count == 2)
-        #expect(await server.connectionCount == 2)
+
+        let deletes = await server.requests.filter { $0.operation == .deleteStream }
+        #expect(deletes.count == 2)
+        #expect(Set(deletes.map(\.requestID)).count == 1)
+        #expect(Set(deletes.map(\.clientID)).count == 1)
+        #expect(await operations(server).filter { $0 == .register }.count == 1)
+        await client.shutdown()
+    }
+
+    /// A call made before the caller signs out and in as another user
+    /// belongs to the old session. Between two refused attempts it learns
+    /// that the caller did so: it ends unauthenticated and never reaches the
+    /// server under the new session.
+    @Test(arguments: [CommandCode.getStreams, .pollMessages])
+    func aCallParkedWhileTheCallerSignsInAsAnotherUserEndsUnauthenticated(_ parked: CommandCode) async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let other = Locked<UInt128Value?>(nil)
+        await server.respond { request in
+            if request.operation == .register, Self.username(in: request.payload) == "other" {
+                other.withLock { $0 = request.clientID }
+            }
+            if request.code == parked.rawValue, request.clientID != other.withLock({ $0 }) {
+                return .status(IggyErrorCode.notPrimary.rawValue)
+            }
+            return FakeVSRServer.defaultReply(request, address: server.address)
+        }
+        let client = makeClient(server)
+        try await client.connect()
+        let call = Task {
+            if parked == .pollMessages {
+                _ = try await client.pollMessages(streamID: 1, topicID: 2, partitionID: 0, strategy: .first, count: 1, autoCommit: false)
+            } else {
+                _ = try await client.getStreams()
+            }
+        }
+        #expect(await eventually { await server.requests.contains { $0.code == parked.rawValue } })
+
+        try await client.logout()
+        _ = try await client.login(username: "other", password: "secret")
+
+        await expectCode(.unauthenticated) { try await call.value }
+        let otherClientID = try #require(other.withLock { $0 })
+        let underOther = await server.requests.filter {
+            $0.clientID == otherClientID && ($0.code == parked.rawValue || $0.code == CommandCode.getPartitionRoute.rawValue)
+        }
+        #expect(underOther.isEmpty)
         await client.shutdown()
     }
 
@@ -482,7 +1121,6 @@ struct ClientTransportTests {
         defer { Task { await server.stop() } }
         let once = Locked(true)
         await server.respond { request in
-            if request.code == CommandCode.bindSession.rawValue { return .status(IggyErrorCode.unauthenticated.rawValue) }
             if let reply = FakeVSRServer.sessionReply(request) { return reply }
             if request.code == CommandCode.ping.rawValue,
                 once.withLock({
@@ -497,6 +1135,8 @@ struct ClientTransportTests {
         try await client.connect()
         try await client.ping()
         #expect(await server.connectionCount == 2)
+        #expect(await operations(server).filter { $0 == .register }.count == 1)
+        #expect(await codes(server).filter { $0 == CommandCode.bindSession.rawValue }.count == 1)
         await client.shutdown()
     }
 
@@ -625,9 +1265,286 @@ struct ClientTransportTests {
         await client.shutdown()
     }
 
+    /// A send whose reply was lost may have committed. A replay that finds
+    /// the session ended, refused as a stale client or evicted, proves
+    /// nothing about the lost attempt: the outcome stays unknown, and no new
+    /// session sends the batch again. No replay can reach the ended session,
+    /// so the call ends at once instead of replaying until its deadline.
+    @Test(arguments: sessionEnds)
+    func aLostSendStaysUnknownWhenItsReplayFindsTheSessionEnded(_ sessionEnd: FakeVSRServer.Reply) async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let lost = Locked(false)
+        let ended = Locked(false)
+        await server.respond { request in
+            if request.code == CommandCode.bindSession.rawValue, ended.withLock({ $0 }) {
+                return .status(IggyErrorCode.unauthenticated.rawValue)
+            }
+            if request.code == CommandCode.sendMessages.rawValue {
+                guard lost.exchange(true) else {
+                    return .close
+                }
+                ended.withLock { $0 = true }
+                return sessionEnd
+            }
+            return FakeVSRServer.defaultReply(request, address: server.address)
+        }
+        let client = makeClient(server, requestTimeout: .seconds(1))
+        try await client.connect()
+
+        await expectCode(.transientNotCommitted) {
+            try await client.sendBatch(streamID: 1, topicID: 2, partitioning: .partition(1), messages: ["a"])
+        }
+
+        let sends = await server.requests.filter { $0.code == CommandCode.sendMessages.rawValue }
+        #expect(sends.count == 2)
+        #expect(Set(sends.map(\.requestID)).count == 1)
+        #expect(Set(sends.map(\.clientID)).count == 1)
+        await client.shutdown()
+    }
+
+    /// A send answered "not committed" may still commit. Only another "not
+    /// committed" keeps its replay going on the connection, as in the Rust
+    /// SDK: a replay that finds the session ended ends the call at once with
+    /// the unknown outcome.
+    @Test(arguments: sessionEnds)
+    func anUncommittedSendStaysUnknownWhenItsReplayFindsTheSessionEnded(_ sessionEnd: FakeVSRServer.Reply) async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let uncommitted = Locked(true)
+        let ended = Locked(false)
+        await server.respond { request in
+            if request.code == CommandCode.bindSession.rawValue, ended.withLock({ $0 }) {
+                return .status(IggyErrorCode.unauthenticated.rawValue)
+            }
+            if request.code == CommandCode.sendMessages.rawValue {
+                if uncommitted.exchange(false) {
+                    return .status(IggyErrorCode.transientNotCommitted.rawValue)
+                }
+                ended.withLock { $0 = true }
+                return sessionEnd
+            }
+            return FakeVSRServer.defaultReply(request, address: server.address)
+        }
+        let client = makeClient(server, requestTimeout: .seconds(1))
+        try await client.connect()
+
+        await expectCode(.transientNotCommitted) {
+            try await client.sendBatch(streamID: 1, topicID: 2, partitioning: .partition(1), messages: ["a"])
+        }
+
+        let sends = await server.requests.filter { $0.code == CommandCode.sendMessages.rawValue }
+        #expect(sends.count == 2)
+        #expect(Set(sends.map(\.requestID)).count == 1)
+        await client.shutdown()
+    }
+
+    /// Once a send was answered "not committed", only a transient answer
+    /// keeps its replay going until the deadline, as in the Rust SDK: "not
+    /// committed", "not accepted" or "not primary". Any other refusal ends
+    /// the call at once with the unknown outcome, since every replay of the
+    /// same request id gets the same answer.
+    @Test(arguments: [
+        (IggyErrorCode.transientNotAccepted, true), (.notPrimary, true), (.requestTooOld, false), (.lifecycleBusy, false),
+        (.historyUnavailable, false), (.consumerGroupPartitionNotOwned, false), (.invalidCredentials, false),
+    ])
+    func anUncommittedSendReplaysOnlyWhileItsReplayIsAnsweredTransiently(_ refusal: IggyErrorCode, _ keepsReplaying: Bool) async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let uncommitted = Locked(true)
+        await server.respond { request in
+            if request.code == CommandCode.sendMessages.rawValue {
+                return .status(uncommitted.exchange(false) ? IggyErrorCode.transientNotCommitted.rawValue : refusal.rawValue)
+            }
+            return FakeVSRServer.defaultReply(request, address: server.address)
+        }
+        let client = makeClient(server, requestTimeout: .seconds(1))
+        try await client.connect()
+
+        await expectCode(.transientNotCommitted) {
+            try await client.sendBatch(streamID: 1, topicID: 2, partitioning: .partition(1), messages: ["a"])
+        }
+
+        let sends = await server.requests.filter { $0.code == CommandCode.sendMessages.rawValue }
+        #expect(keepsReplaying ? sends.count > 2 : sends.count == 2, "\(sends.count) sends")
+        #expect(Set(sends.map(\.requestID)).count == 1)
+        await client.shutdown()
+    }
+
+    /// A connection whose session ended serves no request any more. The
+    /// client closes it, so the next request dials again and signs in under
+    /// a new session, as the Rust SDK signs in again after such an answer.
+    @Test(arguments: sessionEnds)
+    func aSessionEndAfterALostSendClosesTheConnectionAndTheNextRequestSignsInAgain(_ sessionEnd: FakeVSRServer.Reply) async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let sends = Locked(0)
+        await server.respond { request in
+            if request.code == CommandCode.bindSession.rawValue, sends.withLock({ $0 }) > 1 {
+                return .status(IggyErrorCode.unauthenticated.rawValue)
+            }
+            if request.code == CommandCode.sendMessages.rawValue {
+                let sent = sends.withLock {
+                    $0 += 1; return $0
+                }
+                return sent == 1 ? .close : sessionEnd
+            }
+            return FakeVSRServer.defaultReply(request, address: server.address)
+        }
+        let client = makeClient(server, requestTimeout: .seconds(1))
+        try await client.connect()
+        await expectCode(.transientNotCommitted) {
+            try await client.sendBatch(streamID: 1, topicID: 2, partitioning: .partition(1), messages: ["a"])
+        }
+
+        try await client.ping()
+
+        #expect(await server.connectionCount == 3)
+        #expect(await operations(server).filter { $0 == .register }.count == 2)
+        await client.shutdown()
+    }
+
+    @Test(arguments: [false, true])
+    func aStaleClientAnswerAfter57BindsTheRetainedSession(evicted: Bool) async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let attempts = Locked(0)
+        await server.respond { request in
+            if request.code == CommandCode.sendMessages.rawValue {
+                switch attempts.withLock({
+                    $0 += 1; return $0
+                }) {
+                case 1: return .status(IggyErrorCode.transientNotCommitted.rawValue)
+                case 2: return evicted ? .eviction(.staleClient) : .status(IggyErrorCode.staleClient.rawValue)
+                default: break
+                }
+            }
+            return FakeVSRServer.defaultReply(request, address: server.address)
+        }
+        let client = makeClient(server)
+        defer { Task { await client.shutdown() } }
+        try await client.connect()
+        let send = { _ = try await client.sendBatch(streamID: 1, topicID: 2, partitioning: .partition(1), messages: ["a"]) }
+
+        if evicted {
+            try await send()
+        } else {
+            await expectCode(.transientNotCommitted) { try await send() }
+            try await send()
+        }
+
+        let sends = await server.requests.filter { $0.code == CommandCode.sendMessages.rawValue }
+        #expect(sends.count == 3)
+        #expect(Set(sends.map(\.clientID)).count == 1)
+        #expect(Set(sends.map(\.session)).count == 1)
+        #expect(Set(sends.prefix(2).map(\.requestID)).count == 1)
+        if evicted { #expect(Set(sends.map(\.requestID)).count == 1) }
+        #expect(await operations(server).filter { $0 == .register }.count == 1)
+        #expect(await codes(server).filter { $0 == CommandCode.bindSession.rawValue }.count == 1)
+    }
+
+    /// A reply that refuses the first attempt of a send as a stale client
+    /// proves the send never committed. As in the Rust SDK, the call ends
+    /// with that refusal, not with an unknown outcome, and the next request
+    /// binds the same session again.
+    @Test func aStaleClientRefusalOfAFirstSendIsFinalAndTheNextSendBindsAgain() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let refused = Locked(false)
+        await server.respond { request in
+            if request.code == CommandCode.sendMessages.rawValue, !refused.exchange(true) {
+                return .status(IggyErrorCode.staleClient.rawValue)
+            }
+            return FakeVSRServer.defaultReply(request, address: server.address)
+        }
+        let client = makeClient(server)
+        try await client.connect()
+
+        await expectCode(.staleClient) {
+            try await client.sendBatch(streamID: 1, topicID: 2, partitioning: .partition(1), messages: ["a"])
+        }
+        #expect(await server.requests.filter { $0.code == CommandCode.sendMessages.rawValue }.count == 1)
+
+        try await client.sendBatch(streamID: 1, topicID: 2, partitioning: .partition(1), messages: ["b"])
+        #expect(await server.requests.filter { $0.code == CommandCode.sendMessages.rawValue }.count == 2)
+        #expect(await operations(server).filter { $0 == .register }.count == 1)
+        let sends = await server.requests.filter { $0.code == CommandCode.sendMessages.rawValue }
+        #expect(Set(sends.map(\.clientID)).count == 1)
+        #expect(Set(sends.map(\.session)).count == 1)
+        #expect(await codes(server).filter { $0 == CommandCode.bindSession.rawValue }.count == 1)
+        await client.shutdown()
+    }
+
+    /// A stale client refusal ends a read too, as the Rust SDK ends any call
+    /// with it, instead of reconnecting and reading again. The server
+    /// attaches the connection to no session any more, so the client reports
+    /// itself disconnected, and the next call signs in again.
+    @Test func aStaleClientRefusalOfAFirstReadEndsTheRead() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let refused = Locked(false)
+        await server.respond { request in
+            if request.code == CommandCode.bindSession.rawValue {
+                return .status(IggyErrorCode.unauthenticated.rawValue)
+            }
+            if request.code == CommandCode.getStreams.rawValue, !refused.exchange(true) {
+                return .status(IggyErrorCode.staleClient.rawValue)
+            }
+            return FakeVSRServer.defaultReply(request, address: server.address)
+        }
+        let client = makeClient(server)
+        let events = await client.events
+        try await client.connect()
+
+        await expectCode(.staleClient) { _ = try await client.getStreams() }
+        #expect(await codes(server).filter { $0 == CommandCode.getStreams.rawValue }.count == 1)
+        #expect(await client.state == .disconnected)
+
+        _ = try await client.getStreams()
+        #expect(await operations(server).filter { $0 == .register }.count == 2)
+        await client.shutdown()
+        var seen: [DiagnosticEvent] = []
+        for await event in events {
+            seen.append(event)
+        }
+        #expect(seen == [.connected, .signedIn, .disconnected, .connected, .signedIn, .shutdown])
+    }
+
+    /// A stale-client eviction ends only the connection, as the Rust SDK
+    /// reads it: the session goes on over a new connection, where the send
+    /// goes again under its own request id.
+    @Test func aStaleClientEvictionOfASendResumesTheSessionAndReplaysTheSend() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let evicted = Locked(false)
+        await server.respond { request in
+            if request.code == CommandCode.sendMessages.rawValue, !evicted.exchange(true) {
+                return .eviction(.staleClient)
+            }
+            return FakeVSRServer.defaultReply(request, address: server.address)
+        }
+        let client = makeClient(server)
+        try await client.connect()
+
+        try await client.sendBatch(streamID: 1, topicID: 2, partitioning: .partition(1), messages: ["a"])
+
+        let sends = await server.requests.filter { $0.code == CommandCode.sendMessages.rawValue }
+        #expect(sends.count == 2)
+        #expect(Set(sends.map(\.requestID)).count == 1)
+        #expect(await operations(server).filter { $0 == .register }.count == 1)
+        await client.shutdown()
+    }
+
     /// A reconnect that fails after the request was written leaves its
-    /// outcome unknown; the reconnect's own error must not hide that.
-    @Test func aFailedReconnectKeepsTheUnknownOutcome() async throws {
+    /// outcome unknown; the reconnect's own error must not hide that. The
+    /// server evicts the sign-in of a deleted or deactivated user: with a
+    /// password as invalid credentials, with a token as an invalid token or
+    /// an inactive user.
+    @Test(arguments: [
+        (rootLogin, FakeVSRServer.Reply.status(IggyErrorCode.invalidCredentials.rawValue)), (rootLogin, .eviction(.invalidCredentials)),
+        (tokenLogin, .eviction(.invalidToken)), (tokenLogin, .eviction(.userInactive)),
+    ])
+    func aFailedReconnectKeepsTheUnknownOutcome(_ credentials: Credentials, _ signInRefusal: FakeVSRServer.Reply) async throws {
         let server = try await FakeVSRServer.started()
         defer { Task { await server.stop() } }
         let registers = Locked(0)
@@ -637,14 +1554,15 @@ struct ClientTransportTests {
                 let first = registers.withLock {
                     $0 += 1; return $0 == 1
                 }
-                return first ? .ok(FakeVSRServer.registerBody()) : .status(IggyErrorCode.invalidCredentials.rawValue)
+                return first ? .ok(FakeVSRServer.registerBody()) : signInRefusal
             }
             return request.operation == .deleteStream ? .close : .ok([])
         }
-        let client = makeClient(server)
+        let client = makeClient(server, autoLogin: credentials)
         try await client.connect()
         await expectCode(.transientNotCommitted) { try await client.deleteStream(1) }
         #expect(await server.requests.filter { $0.operation == .deleteStream }.count == 1)
+        #expect(registers.withLock { $0 } == 2)
         await client.shutdown()
     }
 
@@ -832,6 +1750,137 @@ struct ClientTransportTests {
         #expect(seen == [.connected, .signedIn, .disconnected, .connected, .signedIn, .shutdown])
     }
 
+    /// After the caller logs out, the client does not sign in by itself, not
+    /// even with the configured auto-login, until the caller signs in again.
+    @Test func aReconnectAfterALogoutDoesNotSignIn() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let client = makeClient(server)
+        try await client.connect()
+        try await client.logout()
+        await server.closeAllConnections()
+        try await Task.sleep(for: .milliseconds(20))
+
+        await #expect(throws: IggyError.self) { try await client.ping() }
+
+        #expect(await operations(server).filter { $0 == .register }.count == 1)
+        #expect(await client.state != .authenticated)
+        _ = try await client.login(username: "iggy", password: "iggy")
+        #expect(await operations(server).filter { $0 == .register }.count == 2)
+        await client.shutdown()
+    }
+
+    /// A logout after a lost connection finds no session to end, yet the
+    /// client signs out: no reconnect binds the old session or signs in.
+    @Test func aLogoutWhileDisconnectedSignsOut() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        await server.respond { request in
+            if let reply = FakeVSRServer.sessionReply(request) { return reply }
+            return request.code == CommandCode.getStats.rawValue ? .stall : .ok([])
+        }
+        let client = makeClient(server, requestTimeout: shortTimeout)
+        try await client.connect()
+        _ = try? await client.getStats()
+        #expect(await client.state == .disconnected)
+
+        await expectCode(.unauthenticated) { try await client.logout() }
+
+        await #expect(throws: IggyError.self) { try await client.ping() }
+        #expect(await codes(server).filter { $0 == CommandCode.bindSession.rawValue }.isEmpty)
+        #expect(await operations(server).filter { $0 == .register }.count == 1)
+        await client.shutdown()
+    }
+
+    /// A call that waits for a reconnect whose sign-in the server refuses
+    /// ends unauthenticated, with the refusal as its cause, whether it waited
+    /// in the exchange or before a typed call. The client forgets the refused
+    /// sign-in and does not fall back to the configured auto-login, since
+    /// the caller signed in as another user.
+    @Test(arguments: [CommandCode.ping, .getStreams])
+    func aRefusedAutomaticSignInEndsTheWaitingCallUnauthenticated(_ waiting: CommandCode) async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let refusing = Locked(false)
+        await server.respond { request in
+            if request.code == CommandCode.bindSession.rawValue { return .status(IggyErrorCode.unauthenticated.rawValue) }
+            if request.operation == .register, refusing.withLock({ $0 }) {
+                return .status(IggyErrorCode.invalidCredentials.rawValue)
+            }
+            return FakeVSRServer.defaultReply(request, address: server.address)
+        }
+        let client = makeClient(server)
+        try await client.connect()
+        _ = try await client.login(username: "other", password: "secret")
+        refusing.withLock { $0 = true }
+        await server.closeAllConnections()
+        try await Task.sleep(for: .milliseconds(20))
+
+        do {
+            if waiting == .ping {
+                try await client.ping()
+            } else {
+                _ = try await client.getStreams()
+            }
+            Issue.record("the call ran although the sign-in was refused")
+        } catch let error as IggyError {
+            #expect(error.code == .unauthenticated, "\(error)")
+            #expect(error.context?.contains(IggyError(.invalidCredentials).description) == true, "\(error)")
+        }
+
+        await server.closeAllConnections()
+        try await Task.sleep(for: .milliseconds(20))
+        try? await client.ping()
+        let registers = await server.requests.filter { $0.operation == .register }
+        #expect(registers.map { Self.username(in: $0.payload) } == ["iggy", "other", "other"])
+        #expect(await client.state != .authenticated)
+        await client.shutdown()
+    }
+
+    /// A sign-in refusal that the Rust SDK treats as lasting, such as an
+    /// invalid or expired personal access token, makes the client forget the
+    /// token: the waiting call ends unauthenticated with the refusal as its
+    /// cause, and no later reconnect signs in with that token again.
+    @Test(
+        arguments: [IggyErrorCode.invalidPersonalAccessToken, .personalAccessTokenExpired, .userInactive, .invalidFormat],
+        [CommandCode.ping, .getStreams])
+    func aTokenRefusedForGoodIsNotSentAgain(_ refusal: IggyErrorCode, _ waiting: CommandCode) async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let refusing = Locked(false)
+        await server.respond { request in
+            if request.code == CommandCode.bindSession.rawValue { return .status(IggyErrorCode.unauthenticated.rawValue) }
+            if request.operation == .register, refusing.withLock({ $0 }) {
+                return .status(refusal.rawValue)
+            }
+            return FakeVSRServer.defaultReply(request, address: server.address)
+        }
+        let client = makeClient(server, autoLogin: tokenLogin)
+        try await client.connect()
+        refusing.withLock { $0 = true }
+        await server.closeAllConnections()
+        try await Task.sleep(for: .milliseconds(20))
+
+        do {
+            if waiting == .ping {
+                try await client.ping()
+            } else {
+                _ = try await client.getStreams()
+            }
+            Issue.record("the call ran although the sign-in was refused")
+        } catch let error as IggyError {
+            #expect(error.code == .unauthenticated, "\(error)")
+            #expect(error.context?.contains(IggyError(refusal).description) == true, "\(error)")
+        }
+
+        await server.closeAllConnections()
+        try await Task.sleep(for: .milliseconds(20))
+        try? await client.ping()
+        #expect(await operations(server).filter { $0 == .register }.count == 2)
+        #expect(await client.state != .authenticated)
+        await client.shutdown()
+    }
+
     @Test func connectRetriesUntilTheServerIsUp() async throws {
         let server = FakeVSRServer()
         try await server.start()
@@ -864,6 +1913,165 @@ struct ClientTransportTests {
             if request.code == CommandCode.bindSession.rawValue { return .status(IggyErrorCode.unauthenticated.rawValue) }
             return FakeVSRServer.defaultReply(request, address: server.address)
         }
+    }
+
+    @Test(arguments: [false, true])
+    func aQueuedPasswordChangeCannotCommitDuringAutomaticSignIn(eviction: Bool) async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let client = makeClient(server)
+        defer { Task { await client.shutdown() } }
+        try await client.connect()
+        let registered = Locked(false)
+        let released = Locked(false)
+        defer { released.withLock { $0 = true } }
+        await server.respond { request in
+            if request.code == CommandCode.bindSession.rawValue { return .status(IggyErrorCode.unauthenticated.rawValue) }
+            if request.operation == .register {
+                registered.withLock { $0 = true }
+                while !released.withLock({ $0 }) { try? await Task.sleep(for: .milliseconds(2)) }
+                return eviction ? .eviction(.invalidCredentials) : .status(IggyErrorCode.invalidCredentials.rawValue)
+            }
+            return FakeVSRServer.defaultReply(request, address: server.address)
+        }
+        await server.closeAllConnections()
+        let recovering = Task { try await client.ping() }
+        try #require(await eventually { registered.withLock { $0 } })
+        let entered = Locked(false)
+        let changing = Task {
+            entered.withLock { $0 = true }
+            try await client.changePassword("iggy", currentPassword: "iggy", newPassword: "new-secret")
+        }
+        try #require(await eventually { entered.withLock { $0 } })
+        #expect(await operations(server).contains(.changePassword) == false)
+        released.withLock { $0 = true }
+        await expectCode(.unauthenticated) { try await recovering.value }
+        await expectCode(.unauthenticated) { try await changing.value }
+        try await client.connect()
+        await expectCode(.unauthenticated) { _ = try await client.getStreams() }
+        #expect(await operations(server).contains(.changePassword) == false)
+        #expect(await operations(server).filter { $0 == .register }.count == 2)
+    }
+
+    @Test(arguments: [false, true])
+    func aPasswordChangeAfterAutomaticSignInKeepsItsCredentials(roster: Bool) async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let client = makeClient(server)
+        defer { Task { await client.shutdown() } }
+        try await client.connect()
+        let held = Locked(false)
+        let released = Locked(false)
+        defer { released.withLock { $0 = true } }
+        await server.respond { request in
+            if request.code == CommandCode.bindSession.rawValue { return .status(IggyErrorCode.unauthenticated.rawValue) }
+            if !released.withLock({ $0 }), roster ? request.code == CommandCode.getClusterMetadata.rawValue : request.operation == .register {
+                held.withLock { $0 = true }
+                while !released.withLock({ $0 }) { try? await Task.sleep(for: .milliseconds(2)) }
+            }
+            if request.operation == .changePassword { return .committed([], commit: 10) }
+            return FakeVSRServer.defaultReply(request, address: server.address)
+        }
+        await server.closeAllConnections()
+        let recovering = Task { try await client.ping() }
+        try #require(await eventually { held.withLock { $0 } })
+        let entered = Locked(false)
+        let changing = Task {
+            entered.withLock { $0 = true }
+            try await client.changePassword("iggy", currentPassword: "iggy", newPassword: "new-secret")
+        }
+        try #require(await eventually { entered.withLock { $0 } })
+        #expect(await operations(server).contains(.changePassword) == false)
+        released.withLock { $0 = true }
+        try await changing.value
+        try await recovering.value
+        await server.closeAllConnections()
+        try await client.ping()
+        let registers = await server.requests.filter { $0.operation == .register }
+        #expect(registers.map { Self.password(in: $0.payload) } == ["iggy", "iggy", "new-secret"])
+    }
+
+    @Test func aCommittedPasswordReplyPrecedesQueuedAutomaticRecovery() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let client = makeClient(server)
+        defer { Task { await client.shutdown() } }
+        try await client.connect()
+        let changing = Locked(false)
+        let releaseChange = Locked(false)
+        let registered = Locked(false)
+        let releaseRegister = Locked(false)
+        let evicted = Locked(false)
+        defer {
+            releaseChange.withLock { $0 = true }
+            releaseRegister.withLock { $0 = true }
+        }
+        await server.respond { request in
+            if request.operation == .changePassword {
+                changing.withLock { $0 = true }
+                while !releaseChange.withLock({ $0 }) { try? await Task.sleep(for: .milliseconds(2)) }
+                return .committed([], commit: 10)
+            }
+            if request.code == CommandCode.ping.rawValue, !evicted.exchange(true) { return .eviction(.sessionError) }
+            if request.code == CommandCode.bindSession.rawValue { return .status(IggyErrorCode.unauthenticated.rawValue) }
+            if request.operation == .register {
+                registered.withLock { $0 = true }
+                while !releaseRegister.withLock({ $0 }) { try? await Task.sleep(for: .milliseconds(2)) }
+            }
+            return FakeVSRServer.defaultReply(request, address: server.address)
+        }
+        let change = Task { try await client.changePassword("iggy", currentPassword: "iggy", newPassword: "new-secret") }
+        try #require(await eventually { changing.withLock { $0 } })
+        let entered = Locked(false)
+        let recovering = Task {
+            entered.withLock { $0 = true }
+            try await client.ping()
+        }
+        try #require(await eventually { entered.withLock { $0 } })
+        #expect(registered.withLock { $0 } == false)
+        releaseChange.withLock { $0 = true }
+        try await change.value
+        try #require(await eventually { registered.withLock { $0 } })
+        #expect(await server.requests.filter { $0.operation == .register }.map { Self.password(in: $0.payload) } == ["iggy", "new-secret"])
+        releaseRegister.withLock { $0 = true }
+        try await recovering.value
+        await server.closeAllConnections()
+        try await client.ping()
+        #expect(await server.requests.filter { $0.operation == .register }.map { Self.password(in: $0.payload) } == ["iggy", "new-secret", "new-secret"])
+    }
+
+    @Test func anOlderPasswordReplyCannotChangeANewerExplicitIdentity() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let client = makeClient(server)
+        defer { Task { await client.shutdown() } }
+        try await client.connect()
+        let changing = Locked(false)
+        let released = Locked(false)
+        defer { released.withLock { $0 = true } }
+        await server.respond { request in
+            if request.operation == .changePassword {
+                changing.withLock { $0 = true }
+                while !released.withLock({ $0 }) { try? await Task.sleep(for: .milliseconds(2)) }
+                return .committed([], commit: 10)
+            }
+            if request.code == CommandCode.bindSession.rawValue { return .status(IggyErrorCode.unauthenticated.rawValue) }
+            return FakeVSRServer.defaultReply(request, address: server.address)
+        }
+        let change = Task { try await client.changePassword("iggy", currentPassword: "iggy", newPassword: "new-secret") }
+        try #require(await eventually { changing.withLock { $0 } })
+        let lineage = await client.core.lineage
+        let signIn = Task { try await client.login(username: "other", password: "own-secret") }
+        try #require(await eventually { await client.core.lineage != lineage })
+        #expect(await operations(server).filter { $0 == .register }.count == 1)
+        released.withLock { $0 = true }
+        try await change.value
+        _ = try await signIn.value
+        await server.closeAllConnections()
+        try await client.ping()
+        let registers = await server.requests.filter { $0.operation == .register }
+        #expect(registers.map { Self.username(in: $0.payload) } == ["iggy", "other", "other"])
+        #expect(registers.map { Self.password(in: $0.payload) } == ["iggy", "own-secret", "own-secret"])
     }
 
     @Test func passwordChangeUpdatesTheReconnectCredentials() async throws {
@@ -911,6 +2119,40 @@ struct ClientTransportTests {
         let latest = await server.requests.filter { $0.operation == .register }.last!
         #expect(Self.username(in: latest.payload) == "renamed")
         #expect(Self.password(in: latest.payload) == "new-secret")
+        await client.shutdown()
+    }
+
+    @Test func rawPasswordChangeUpdatesTheReconnectCredentials() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        await Self.forgetSessions(on: server)
+        let client = makeClient(server)
+        try await client.connect()
+        let change = try Requests.changePassword(userID: "iggy", currentPassword: "iggy", newPassword: "new-secret")
+        _ = try await client.sendRawRequest(code: CommandCode.changePassword.rawValue, payload: change)
+        await server.closeAllConnections()
+        try await Task.sleep(for: .milliseconds(20))
+        try await client.ping()
+        let registers = await server.requests.filter { $0.operation == .register }
+        #expect(registers.count == 2)
+        #expect(registers.map { Self.password(in: $0.payload) } == ["iggy", "new-secret"])
+        await client.shutdown()
+    }
+
+    @Test func rawUserRenameUpdatesTheReconnectCredentials() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        await Self.forgetSessions(on: server)
+        let client = makeClient(server)
+        try await client.connect()
+        let rename = try Requests.updateUser(userID: "iggy", username: "renamed", status: nil, options: [])
+        _ = try await client.sendRawRequest(code: CommandCode.updateUser.rawValue, payload: rename)
+        await server.closeAllConnections()
+        try await Task.sleep(for: .milliseconds(20))
+        try await client.ping()
+        let registers = await server.requests.filter { $0.operation == .register }
+        #expect(registers.count == 2)
+        #expect(registers.map { Self.username(in: $0.payload) } == ["iggy", "renamed"])
         await client.shutdown()
     }
 
@@ -970,8 +2212,10 @@ struct ClientTransportTests {
         let client = makeClient(server, requestTimeout: shortTimeout)
         try await client.connect()
         await server.stop()
-        await expectCode(.notConnected) { try await client.ping() }
+        await expectCode(.transientNotAccepted) { try await client.ping() }
         #expect(await eventually { await client.state == .disconnected })
+        // A typed call waits for the reconnect up to its timeout first.
+        await expectCode(.transientNotAccepted) { _ = try await client.getStreams() }
 
         let revived = FakeVSRServer()
         try await revived.startOn(port: port)
@@ -1327,6 +2571,22 @@ struct ClientTransportTests {
         await expectCode(.invalidCommand) { _ = try await client.sendRawRequest(code: CommandCode.loginRegister.rawValue, payload: []) }
         await expectCode(.invalidCommand) { _ = try await client.sendRawRequest(code: CommandCode.logoutUser.rawValue, payload: []) }
         await client.shutdown()
+    }
+
+    /// Issues one of the replicated writes through its typed call.
+    private static func issue(_ write: CommandCode, on client: IggyClient) async throws {
+        switch write {
+        case .deleteStream:
+            try await client.deleteStream(1)
+        case .sendMessages:
+            try await client.sendBatch(streamID: 1, topicID: 2, partitioning: .partition(1), messages: ["a"])
+        case .storeConsumerOffset:
+            try await client.storeConsumerOffset(streamID: 1, topicID: 2, partitionID: 1, offset: 5)
+        case .deleteSegments:
+            try await client.deleteSegments(streamID: 1, topicID: 2, partitionID: 1, count: 1)
+        default:
+            Issue.record("no typed call issues command \(write)")
+        }
     }
 
     /// A reader placed after the version info of a register payload, with the

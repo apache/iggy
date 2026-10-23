@@ -63,6 +63,9 @@ under the License.
         <ReqnrollFeatureFile Include="..\..\..\bdd\scenarios\raw_command.feature">
             <Link>Features\raw_command.feature</Link>
         </ReqnrollFeatureFile>
+        <ReqnrollFeatureFile Include="..\..\..\bdd\scenarios\session_contract.feature">
+            <Link>Features\session_contract.feature</Link>
+        </ReqnrollFeatureFile>
     </ItemGroup>
 
     <ItemGroup>

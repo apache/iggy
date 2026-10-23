@@ -288,22 +288,25 @@ public sealed class ConsensusSessionTests
     }
 
     [Fact]
-    public void Generation_AdvancesOnEveryReArmAndNotOnBind()
+    public void Generation_AdvancesOnEveryReArmAndOnEveryBindTheCallerSignedInFor()
     {
         var session = new ConsensusSession(1);
         var initialGeneration = session.Generation;
 
         session.Resolve(VsrOperation.Register);
         session.Bind(10, new byte[LoginRegister.BIND_SECRET_BYTES]);
-        Assert.Equal(initialGeneration, session.Generation);
-
-        session.Reset();
         Assert.Equal(initialGeneration + 1, session.Generation);
+
+        session.Reset(continues: true);
+        Assert.Equal(initialGeneration + 2, session.Generation);
+
+        // The client's own sign-in goes on in the generation that its re-arm opened.
+        session.Resolve(VsrOperation.Register);
+        session.Bind(11, new byte[LoginRegister.BIND_SECRET_BYTES], continues: true);
+        Assert.Equal(initialGeneration + 2, session.Generation);
 
         // A register on a previously bound session re-arms the identity, which is a new generation too.
         session.Resolve(VsrOperation.Register);
-        session.Bind(11, new byte[LoginRegister.BIND_SECRET_BYTES]);
-        session.Resolve(VsrOperation.Register);
-        Assert.Equal(initialGeneration + 2, session.Generation);
+        Assert.Equal(initialGeneration + 3, session.Generation);
     }
 }

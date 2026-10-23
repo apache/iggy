@@ -20,13 +20,20 @@
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <optional>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 #include <gtest/gtest.h>
 
 #include "iggy.hpp"
+
+static_assert(!std::is_constructible_v<iggy::IggyException, const std::string &, const iggy::ffi::ErrorInfo &>,
+              "Only IggyBlockingClient may turn bridge error details into an IggyException");
+static_assert(std::is_nothrow_copy_constructible_v<iggy::IggyException>,
+              "Copying an exception while it propagates must not throw");
 
 TEST(ConnectionStringTest, ConstructsQuicClient) {
     iggy::ffi::Client *client = nullptr;
@@ -353,6 +360,21 @@ TEST(IggyExceptionTest, StoresMessage) {
     EXPECT_FALSE(from_string.Code().has_value());
     EXPECT_TRUE(from_string.Kind().empty());
     EXPECT_FALSE(from_string.OperationId().has_value());
+}
+
+TEST(IggyExceptionTest, CopyKeepsKindAfterOriginalIsDestroyed) {
+    auto client = iggy::IggyBlockingClient::Builder().Build();
+    std::optional<iggy::IggyException> original;
+    try {
+        client.ResolveOperation(1);
+    } catch (const iggy::IggyException &error) {
+        original.emplace(error);
+    }
+    ASSERT_TRUE(original.has_value());
+
+    const iggy::IggyException copy = *original;
+    original.reset();
+    EXPECT_EQ(copy.Kind(), "operation_not_retained");
 }
 
 TEST(IggyBlockingClientTest, RecoveryErrorsPreserveFullWidthOperationIds) {

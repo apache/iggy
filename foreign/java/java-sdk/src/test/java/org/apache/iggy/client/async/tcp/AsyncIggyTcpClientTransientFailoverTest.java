@@ -71,6 +71,8 @@ class AsyncIggyTcpClientTransientFailoverTest {
     static final int BIND_SESSION_CODE = 15;
     static final int GROUP_SYNC_CODE = 606;
     static final int EVICTION_STALE_CLIENT = 13;
+    static final int OPERATION_CREATE_STREAM = 128;
+    static final int CREATE_STREAM_CODE = 202;
 
     private static final int HEADER_SIZE = 256;
     private static final int SIZE_OFFSET = 48;
@@ -91,8 +93,6 @@ class AsyncIggyTcpClientTransientFailoverTest {
     private static final int COMMAND_REPLY = 8;
     private static final int COMMAND_EVICTION = 13;
     private static final int OPERATION_LOGOUT = 3;
-    private static final int OPERATION_CREATE_STREAM = 128;
-    private static final int CREATE_STREAM_CODE = 202;
     private static final int GROUP_JOIN_OPERATION = 148;
     private static final int UPDATE_USER_OPERATION = 142;
     private static final int CHANGE_PASSWORD_OPERATION = 144;
@@ -1223,9 +1223,13 @@ class AsyncIggyTcpClientTransientFailoverTest {
     }
 
     static AsyncIggyTcpClient client(ServerSocket coordinator) {
+        return client(coordinator.getInetAddress().getHostAddress(), coordinator.getLocalPort());
+    }
+
+    static AsyncIggyTcpClient client(String host, int port) {
         return AsyncIggyTcpClient.builder()
-                .host(coordinator.getInetAddress().getHostAddress())
-                .port(coordinator.getLocalPort())
+                .host(host)
+                .port(port)
                 .credentials("configured-user", "configured-password")
                 .requestTimeout(Duration.ofSeconds(2))
                 .heartbeatInterval(Duration.ofMinutes(1))
@@ -1848,12 +1852,16 @@ class AsyncIggyTcpClientTransientFailoverTest {
     }
 
     private static ByteBuf threeNodeMetadata(int firstPort, int secondPort, int thirdPort) {
+        return threeNodeMetadata(firstPort, secondPort, thirdPort, firstPort);
+    }
+
+    static ByteBuf threeNodeMetadata(int firstPort, int secondPort, int thirdPort, int leaderPort) {
         ByteBuf body = Unpooled.buffer();
         writeString(body, "test-cluster");
         body.writeIntLE(3);
-        writeNode(body, 0, "metadata-leader", firstPort, true);
-        writeNode(body, 1, "follower", secondPort, false);
-        writeNode(body, 2, "partition-primary", thirdPort, false);
+        writeNode(body, 0, "first-node", firstPort, firstPort == leaderPort);
+        writeNode(body, 1, "second-node", secondPort, secondPort == leaderPort);
+        writeNode(body, 2, "third-node", thirdPort, thirdPort == leaderPort);
         return body;
     }
 
@@ -1972,6 +1980,10 @@ class AsyncIggyTcpClientTransientFailoverTest {
 
         static Response successAndDisconnect(int operation, ByteBuf body) {
             return new Response(COMMAND_REPLY, operation, 0, 0, 0, body, true);
+        }
+
+        static Response errorAndDisconnect(int operation, int status) {
+            return new Response(COMMAND_REPLY, operation, status, 0, 0, Unpooled.EMPTY_BUFFER, true);
         }
 
         /** A committed reply whose proof names another request. */

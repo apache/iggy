@@ -112,7 +112,7 @@ struct ConsensusSessionTests {
 @Suite("Command codes and operations")
 struct CommandCodeTests {
     @Test func retiredCodesStayUnknown() {
-        for code: UInt32 in [14, 102, 103, 104, 123, 205, 305] {
+        for code: UInt32 in [14, 102, 103, 104, 123, 124, 205, 305] {
             #expect(CommandCode(rawValue: code) == nil)
             #expect(ConsensusOperation.forCode(code) == .nonReplicated)
         }
@@ -175,10 +175,10 @@ struct ReplyDecodingTests {
 
     @Test func committedRejectionRequiresExactProofMarker() {
         let body = rejectionBody(IggyErrorCode.streamIdNotFound.rawValue)
-        for marker: UInt8 in [0, 1, 2] {
+        for marker in UInt8.min...UInt8.max {
             var header = replyHeader(operation: .deleteStream, bodyLength: body.count)
             header[VSRFrame.ReplyOffset.committedResult] = marker
-            #expect(VSRFrame.hasCommittedResult(header[...]) == (marker == 1))
+            #expect(VSRFrame.hasCommittedResult(header[...]) == (marker == VSRFrame.committedResultMarker))
             #expect(throws: IggyError(.streamIdNotFound)) {
                 try VSRFrame.decodeReply(header: header[...], body: body[...])
             }

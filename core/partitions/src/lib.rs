@@ -43,6 +43,14 @@ pub mod segment_anchor;
 mod segment_recovery;
 pub mod state_transfer;
 mod types;
+#[cfg(feature = "simulator")]
+mod wal_storage;
+#[cfg(feature = "simulator")]
+pub use wal_storage::{InjectedFile, InjectedStorage, WalFile, WalStorage};
+
+/// The storage under every partition WAL.
+#[cfg(not(feature = "simulator"))]
+pub type WalStorage = ::journal::durable_storage::DiskStorage;
 
 pub use consumer_offset_capacity::{AutoCommitReservation, ConsumerOffsetCapacityError};
 use iggy_binary_protocol::PrepareHeader;
@@ -57,7 +65,8 @@ pub use io::{
     CapturedPartitionIo, MaterializationIoJob, MaterializationIoResult, PARTITION_IO_DRAIN_TIMEOUT,
     PartitionIncarnation, PartitionIoContinuation, PartitionIoIdentity, PartitionIoJob,
     PartitionIoNotifier, PartitionIoPlan, PartitionIoQuiescence, PartitionIoResources,
-    PartitionIoResult, PartitionIoStep, PartitionTeardown, largest_legal_job_charge,
+    PartitionIoResult, PartitionIoStep, PartitionTeardown, PreparedPrimaryTransfer,
+    largest_legal_job_charge,
 };
 pub use journal::{EVICTED_RING_BYTES_MAX, EVICTED_RING_CAPACITY};
 
@@ -101,8 +110,8 @@ pub use state_transfer::CONSUMER_OFFSETS_ENTRIES_MAX;
 pub use types::{
     AppendResult, COMMIT_WALK_OPS_MAX, FatalCommit, Fragment, PartitionOffsets,
     PartitionPathLayout, PartitionsConfig, PollFragments, PollQueryResult, PollingArgs,
-    PollingConsumer, REPAIR_MAX_STALL_RETRIES, REPAIR_RETRY_TICKS, RepairConclusion, RepairSession,
-    SendMessagesResult,
+    PollingConsumer, REPAIR_MAX_STALL_RETRIES, REPAIR_RETRY_TICKS, RepairConclusion, RepairIngest,
+    RepairSession, SendMessagesResult,
 };
 
 /// A partition's message log, named so a caller can carry one across a rebuild.

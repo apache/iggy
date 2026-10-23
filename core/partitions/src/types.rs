@@ -334,6 +334,17 @@ pub enum RepairConclusion {
     FloorRefused { floor: u64, to_op: u64 },
 }
 
+/// How `IggyPartition::apply_repaired_prepare` disposed of a repaired prepare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepairIngest {
+    /// Journaled, already held, or not the session's to take.
+    Handled,
+    /// Refused: the view's log names another prepare at or next to this op, or
+    /// nothing this replica holds vouches for it while its log is proven. The
+    /// view's primary serves the log that does.
+    Unvouched,
+}
+
 /// Where partition directories live on disk, mirroring the server's
 /// `ServerConfig` path scheme so segment files created by the partition plane
 /// land next to the ones the server bootstrap created.

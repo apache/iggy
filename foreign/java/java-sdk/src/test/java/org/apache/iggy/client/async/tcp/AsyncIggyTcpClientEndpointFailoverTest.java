@@ -22,6 +22,9 @@ package org.apache.iggy.client.async.tcp;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufUtil;
 import io.netty.buffer.Unpooled;
+import io.netty.channel.IoEventLoopGroup;
+import io.netty.channel.MultiThreadIoEventLoopGroup;
+import io.netty.channel.nio.NioIoHandler;
 import org.apache.iggy.client.ConnectionInfo;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.Request;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.Response;
@@ -29,11 +32,13 @@ import org.apache.iggy.client.async.tcp.vsr.VsrOperation;
 import org.apache.iggy.config.RetryPolicy;
 import org.apache.iggy.exception.IggyConnectionException;
 import org.apache.iggy.exception.IggyErrorCode;
+import org.apache.iggy.exception.IggyNotConnectedException;
 import org.apache.iggy.exception.IggyOperationException;
 import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.identifier.UserId;
 import org.apache.iggy.serde.BytesSerializer;
 import org.apache.iggy.serde.CommandCode;
+import org.apache.iggy.user.IdentityInfo;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
@@ -84,6 +89,7 @@ class AsyncIggyTcpClientEndpointFailoverTest {
     private static final RetryPolicy ONE_RETRY = RetryPolicy.fixedDelay(1, Duration.ofMillis(50));
     private static final Duration OUTAGE = Duration.ofSeconds(1);
     private static final Duration RECOVERY = Duration.ofSeconds(5);
+    private static final int LOGIN_CODE = CommandCode.User.LOGIN.getValue();
     private static final int CHANGE_PASSWORD_CODE = CommandCode.User.CHANGE_PASSWORD.getValue();
     private static final int UPDATE_USER_CODE = CommandCode.User.UPDATE.getValue();
     // The user that registerBody signs in.
@@ -651,6 +657,105 @@ class AsyncIggyTcpClientEndpointFailoverTest {
     }
 
     /**
+     * The redial gives the node that refused to bind the session one more try,
+     * and that dial fails. The connection the client keeps still counts as
+     * signed in, so no heartbeat signs in again, and the next request signs in
+     * before it is sent instead of failing.
+     */
+    @Test
+    void shouldSignInOnTheNextRequestWhenTheRetryAfterARefusedBindFails() throws Exception {
+        try (ServerSocket nodeSocket = new ServerSocket(0, 4, InetAddress.getLoopbackAddress())) {
+            AtomicBoolean endSession = new AtomicBoolean();
+            AtomicInteger signIns = new AtomicInteger();
+            AtomicInteger pings = new AtomicInteger();
+            MockNode node = MockNode.serve(nodeSocket, request -> {
+                if (request.operation() == OPERATION_REGISTER) {
+                    return Response.success(OPERATION_REGISTER, registerBody(signIns.incrementAndGet()));
+                }
+                if (request.is(PING_CODE, OPERATION_NON_REPLICATED)) {
+                    pings.incrementAndGet();
+                }
+                if (request.is(GET_STATS_CODE, OPERATION_NON_REPLICATED) && endSession.getAndSet(false)) {
+                    return Response.disconnect();
+                }
+                return Response.success(request.operation(), Unpooled.EMPTY_BUFFER);
+            });
+            AsyncIggyTcpClient client = limitedClient(nodeSocket.getLocalPort());
+            try {
+                client.connect().get(5, TimeUnit.SECONDS);
+                client.users().login("iggy", "iggy").get(5, TimeUnit.SECONDS);
+
+                node.bindingHold = new CompletableFuture<>();
+                node.rejectBindings = true;
+                endSession.set(true);
+                assertThatThrownBy(() -> client.sendBinaryRequest(GET_STATS_CODE, new byte[0])
+                                .get(5, TimeUnit.SECONDS))
+                        .isInstanceOf(ExecutionException.class);
+                AsyncIggyTcpClientEventLoopGroupTest.await(() -> node.bindings.get() > 0, "the redial bind", RECOVERY);
+                // The held bind blocks its own link, so a ping now comes from the kept connection on a new link.
+                int pingsAtBind = pings.get();
+                AsyncIggyTcpClientEventLoopGroupTest.await(
+                        () -> pings.get() > pingsAtBind, "a heartbeat of the kept connection", RECOVERY);
+                // The node stops accepting, so the retry after the refused bind fails to dial.
+                nodeSocket.close();
+                node.bindingHold.complete(null);
+                Thread.sleep(OUTAGE.toMillis());
+                assertThat(signIns).as("sign-ins without a request").hasValue(1);
+
+                client.sendBinaryRequest(GET_STATS_CODE, new byte[0]).get(5, TimeUnit.SECONDS);
+                assertThat(signIns).as("sign-ins once a request ran").hasValue(2);
+            } finally {
+                node.bindingHold.complete(null);
+                client.close().get(5, TimeUnit.SECONDS);
+                node.close();
+            }
+        }
+    }
+
+    /**
+     * A poll link to the node of the client's own connection is not that
+     * connection. When the router closes it on purpose while it carries a
+     * request, the client keeps its connection and starts no redial.
+     */
+    @Test
+    void shouldNotRedialWhenTheRouterClosesAPollLinkToTheSameNode() throws Exception {
+        try (ServerSocket nodeSocket = new ServerSocket(0, 4, InetAddress.getLoopbackAddress())) {
+            AtomicInteger signIns = new AtomicInteger();
+            MockNode node = MockNode.serve(nodeSocket, request -> {
+                if (request.operation() == OPERATION_REGISTER) {
+                    return Response.success(OPERATION_REGISTER, registerBody(signIns.incrementAndGet()));
+                }
+                return Response.success(request.operation(), Unpooled.EMPTY_BUFFER);
+            });
+            AsyncIggyTcpClient client = limitedClient(nodeSocket.getLocalPort());
+            try {
+                client.connect().get(5, TimeUnit.SECONDS);
+                client.users().login("iggy", "iggy").get(5, TimeUnit.SECONDS);
+
+                // A move with a bound session opens a poll link and binds the session there before it moves.
+                node.bindingHold = new CompletableFuture<>();
+                client.retarget(client.getConnectionInfo());
+                AsyncIggyTcpClientEventLoopGroupTest.await(
+                        () -> node.bindings.get() > 0, "the bind on the poll link", RECOVERY);
+                int dials = node.dials.get();
+
+                // Signing out closes every poll link while the bind is still in flight.
+                client.users().logout().get(5, TimeUnit.SECONDS);
+                Thread.sleep(OUTAGE.toMillis());
+                assertThat(node.dials).as("dials after the poll link closed").hasValue(dials);
+                client.sendBinaryRequest(PING_CODE, new byte[0]).get(5, TimeUnit.SECONDS);
+                assertThat(node.dials)
+                        .as("dials once the kept connection served a request")
+                        .hasValue(dials);
+            } finally {
+                node.bindingHold.complete(null);
+                client.close().get(5, TimeUnit.SECONDS);
+                node.close();
+            }
+        }
+    }
+
+    /**
      * An explicit sign-in ends the automatic one as it starts. When the server
      * rejects it, the client stays signed out: a heartbeat that signed in as
      * the user before would undo the switch. A sign-in queued behind another
@@ -661,11 +766,19 @@ class AsyncIggyTcpClientEndpointFailoverTest {
     void shouldNotSignInAsThePreviousUserAfterARejectedSignIn(boolean queued) throws Exception {
         try (ServerSocket nodeSocket = new ServerSocket(0, 4, InetAddress.getLoopbackAddress())) {
             AtomicInteger signIns = new AtomicInteger();
+            CompletableFuture<Void> registered = new CompletableFuture<>();
+            CompletableFuture<Void> release = new CompletableFuture<>();
             MockNode node = MockNode.serve(nodeSocket, request -> {
                 if (request.operation() == OPERATION_REGISTER) {
-                    return request.bodyAsText().contains("other")
-                            ? Response.eviction(EVICTION_INVALID_CREDENTIALS)
-                            : Response.success(OPERATION_REGISTER, registerBody(signIns.incrementAndGet()));
+                    if (request.bodyAsText().contains("other")) {
+                        return Response.eviction(EVICTION_INVALID_CREDENTIALS);
+                    }
+                    int epoch = signIns.incrementAndGet();
+                    registered.complete(null);
+                    if (queued) {
+                        release.join();
+                    }
+                    return Response.success(OPERATION_REGISTER, registerBody(epoch));
                 }
                 return Response.success(request.operation(), Unpooled.EMPTY_BUFFER);
             });
@@ -673,11 +786,20 @@ class AsyncIggyTcpClientEndpointFailoverTest {
             try {
                 client.connect().get(5, TimeUnit.SECONDS);
                 var signedIn = client.users().login("iggy", "iggy");
+                registered.get(5, TimeUnit.SECONDS);
                 if (!queued) {
                     signedIn.get(5, TimeUnit.SECONDS);
                 }
                 var rejected = client.users().login("other", "secret");
-                signedIn.get(5, TimeUnit.SECONDS);
+                release.complete(null);
+                if (queued) {
+                    assertThatThrownBy(() -> signedIn.get(5, TimeUnit.SECONDS))
+                            .cause()
+                            .isInstanceOfSatisfying(
+                                    IggyServerException.class,
+                                    error -> assertThat(error.getRawErrorCode())
+                                            .isEqualTo(IggyErrorCode.UNAUTHENTICATED.getCode()));
+                }
                 assertThatThrownBy(() -> rejected.get(5, TimeUnit.SECONDS))
                         .cause()
                         .isInstanceOfSatisfying(
@@ -689,6 +811,7 @@ class AsyncIggyTcpClientEndpointFailoverTest {
 
                 assertThat(signIns).as("sign-ins as the previous user").hasValue(1);
             } finally {
+                release.complete(null);
                 client.close().get(5, TimeUnit.SECONDS);
                 node.close();
             }
@@ -802,8 +925,8 @@ class AsyncIggyTcpClientEndpointFailoverTest {
                 node.rejectBindings = true;
                 lost.set(true);
                 node.dropConnections();
-                assertThatThrownBy(() -> client.sendBinaryRequest(GET_STATS_CODE, new byte[0])
-                                .get(5, TimeUnit.SECONDS))
+                // A roster read never waits for a session, so it ends when the sign-in on the next link hangs up.
+                assertThatThrownBy(() -> client.system().getClusterMetadata().get(5, TimeUnit.SECONDS))
                         .isInstanceOf(ExecutionException.class);
                 held.get(RECOVERY.toMillis(), TimeUnit.MILLISECONDS);
                 node.rejectBindings = false;
@@ -830,6 +953,162 @@ class AsyncIggyTcpClientEndpointFailoverTest {
                 release.complete(null);
                 client.close().get(5, TimeUnit.SECONDS);
                 node.close();
+            }
+        }
+    }
+
+    /**
+     * A password change that commits during a reconnect burst survives a lost link, a refusal of the old
+     * password, and an accepted older Register followed by another recovery.
+     */
+    @ParameterizedTest(name = "rejected={0}, accepted={1}")
+    @CsvSource({"false,false", "true,false", "false,true"})
+    @SuppressWarnings({"checkstyle:CyclomaticComplexity", "checkstyle:NPathComplexity"})
+    void shouldContinueTheBurstWithTheLoginThatARefreshReplaced(boolean rejected, boolean accepted) throws Exception {
+        InetAddress loopback = InetAddress.getLoopbackAddress();
+        try (ServerSocket nodeSocket = new ServerSocket(0, 4, loopback);
+                ServerSocket changeSocket = new ServerSocket(0, 4, loopback)) {
+            AtomicBoolean lost = new AtomicBoolean();
+            AtomicInteger owedSignIns = new AtomicInteger();
+            CompletableFuture<Void> held = new CompletableFuture<>();
+            CompletableFuture<Void> release = new CompletableFuture<>();
+            CompletableFuture<Void> settled = new CompletableFuture<>();
+            List<Request> registers = new CopyOnWriteArrayList<>();
+            List<String> signInsAfterRelease = new CopyOnWriteArrayList<>();
+            MockNode node = MockNode.serve(nodeSocket, request -> {
+                if (request.operation() != OPERATION_REGISTER) {
+                    if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED) && release.isDone()) {
+                        settled.complete(null);
+                    }
+                    return Response.success(request.operation(), Unpooled.EMPTY_BUFFER);
+                }
+                registers.add(request);
+                if (release.isDone()) {
+                    signInsAfterRelease.add(request.bodyAsText());
+                }
+                if (!lost.get() || request.bodyAsText().contains(SECOND_PASSWORD)) {
+                    return Response.success(OPERATION_REGISTER, registerBody(registers.size()));
+                }
+                // The sign-in on the next link hangs up, and the one that the redial replays waits for the change.
+                int owed = owedSignIns.incrementAndGet();
+                if (owed == 1) {
+                    return Response.disconnect();
+                }
+                if (owed == 2) {
+                    held.complete(null);
+                    release.join();
+                    if (accepted) {
+                        return Response.success(OPERATION_REGISTER, registerBody(registers.size()));
+                    }
+                }
+                return rejected ? Response.eviction(EVICTION_INVALID_CREDENTIALS) : Response.disconnect();
+            });
+            MockNode change = MockNode.serve(
+                    changeSocket,
+                    request -> request.operation() == OPERATION_REGISTER
+                            ? Response.success(OPERATION_REGISTER, registerBody(1))
+                            : Response.success(request.operation(), Unpooled.EMPTY_BUFFER));
+            AsyncIggyTcpClient client = AsyncIggyTcpClient.builder()
+                    .host(loopback.getHostAddress())
+                    .port(nodeSocket.getLocalPort())
+                    .requestTimeout(Duration.ofSeconds(1))
+                    // No heartbeat in the test, so only the burst signs the client in again.
+                    .heartbeatInterval(Duration.ofMinutes(1))
+                    .retryPolicy(RetryPolicy.fixedDelay(4, Duration.ofMillis(50)))
+                    .build();
+            // Holds the changed login, as the connection that saw the change commit does.
+            AsyncTcpConnection changed = AsyncIggyTcpClientTransientFailoverTest.connection(changeSocket);
+            try {
+                client.connect().get(5, TimeUnit.SECONDS);
+                client.users().login(USERNAME, FIRST_PASSWORD).get(5, TimeUnit.SECONDS);
+                node.rejectBindings = true;
+                lost.set(true);
+                node.dropConnections();
+                // A roster read never waits for a session, so it ends when the sign-in on the next link hangs up.
+                assertThatThrownBy(() -> client.system().getClusterMetadata().get(5, TimeUnit.SECONDS))
+                        .isInstanceOf(ExecutionException.class);
+                held.get(RECOVERY.toMillis(), TimeUnit.MILLISECONDS);
+                node.rejectBindings = false;
+
+                changed.connect().get(5, TimeUnit.SECONDS);
+                changed.send(LOGIN_CODE, Unpooled.wrappedBuffer(loginBody(USERNAME, SECOND_PASSWORD)))
+                        .get(5, TimeUnit.SECONDS)
+                        .release();
+                client.refreshLogin(changed, USERNAME, Optional.empty(), Optional.of(SECOND_PASSWORD));
+                release.complete(null);
+                if (accepted) {
+                    settled.get(RECOVERY.toMillis(), TimeUnit.MILLISECONDS);
+                    node.rejectBindings = true;
+                    node.dropConnections();
+                    client.sendBinaryRequest(GET_STATS_CODE, new byte[0])
+                            .handle((response, error) -> null)
+                            .get(5, TimeUnit.SECONDS);
+                }
+
+                AsyncIggyTcpClientEventLoopGroupTest.await(
+                        () -> !signInsAfterRelease.isEmpty(), "a sign-in after the change", RECOVERY);
+                assertThat(signInsAfterRelease.get(0)).contains(SECOND_PASSWORD);
+                client.sendBinaryRequest(GET_STATS_CODE, new byte[0]).get(5, TimeUnit.SECONDS);
+            } finally {
+                release.complete(null);
+                changed.close().get(5, TimeUnit.SECONDS);
+                client.close().get(5, TimeUnit.SECONDS);
+                node.close();
+                change.close();
+            }
+        }
+    }
+
+    /**
+     * An explicit sign-in ends a waiting automatic sign-in on the connection that carries its Register. After
+     * connect() replaced that connection, the new connection keeps its channels.
+     */
+    @Test
+    void shouldKeepTheNewConnectionWhenAnAutomaticSignInWaitsOnTheReplacedOne() throws Exception {
+        IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+        try (ServerSocket nodeSocket = new ServerSocket(0, 4, InetAddress.getLoopbackAddress())) {
+            MockNode node = MockNode.serve(
+                    nodeSocket,
+                    request -> request.operation() == OPERATION_REGISTER
+                            ? Response.success(OPERATION_REGISTER, registerBody(1))
+                            : Response.success(request.operation(), Unpooled.EMPTY_BUFFER));
+            AtomicInteger attempts = new AtomicInteger();
+            CompletableFuture<Void> replaying = new CompletableFuture<>();
+            CompletableFuture<IdentityInfo> replay = new CompletableFuture<>();
+            AsyncIggyTcpClient client = AsyncIggyTcpClient.builder()
+                    .host(InetAddress.getLoopbackAddress().getHostAddress())
+                    .port(nodeSocket.getLocalPort())
+                    .heartbeatInterval(HEARTBEAT)
+                    .eventLoopGroup(group)
+                    .build();
+            try {
+                client.connect().get(5, TimeUnit.SECONDS);
+                // The first attempt sends no Register, so the heartbeat finds a sign-in owed and replays the attempt.
+                client.loginOnLeader(deadline -> {
+                            if (attempts.incrementAndGet() == 1) {
+                                return CompletableFuture.completedFuture(new IdentityInfo(1L, Optional.empty()));
+                            }
+                            replaying.complete(null);
+                            return replay;
+                        })
+                        .get(5, TimeUnit.SECONDS);
+                replaying.get(RECOVERY.toMillis(), TimeUnit.MILLISECONDS);
+                client.connect().get(5, TimeUnit.SECONDS);
+                client.system().ping().get(5, TimeUnit.SECONDS);
+                int dials = node.dials.get();
+
+                var signIn = client.users().login(USERNAME, FIRST_PASSWORD);
+                // Every task queued on the only event loop ran, so an abort on the new connection took effect.
+                group.submit(() -> {}).get(5, TimeUnit.SECONDS);
+                // The close of the replaced connection ends the Register that the automatic sign-in waits for.
+                replay.completeExceptionally(new IggyNotConnectedException("The connection was replaced"));
+
+                assertThat(signIn.get(5, TimeUnit.SECONDS).userId()).isEqualTo(SIGNED_IN_USER_ID);
+                assertThat(node.dials).as("dials after connect()").hasValue(dials);
+            } finally {
+                client.close().get(5, TimeUnit.SECONDS);
+                node.close();
+                group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
             }
         }
     }
@@ -1112,6 +1391,191 @@ class AsyncIggyTcpClientEndpointFailoverTest {
     }
 
     /**
+     * A password change that commits while a link waits for the reply to its BindSession reaches the Register
+     * that follows when the server refuses that bind. The link that waits is on the survivor, and the change
+     * commits on the primary, where the coordinator moved meanwhile.
+     */
+    @Test
+    void shouldRegisterWithThePasswordThatCommittedWhileTheBindWaited() throws Exception {
+        InetAddress loopback = InetAddress.getLoopbackAddress();
+        try (ServerSocket primarySocket = new ServerSocket(0, 4, loopback);
+                ServerSocket survivorSocket = new ServerSocket(0, 4, loopback)) {
+            int primaryPort = primarySocket.getLocalPort();
+            int survivorPort = survivorSocket.getLocalPort();
+            AtomicInteger registrations = new AtomicInteger();
+            AtomicBoolean endSession = new AtomicBoolean();
+            List<String> survivorSignIns = new CopyOnWriteArrayList<>();
+            CompletableFuture<Void> releaseBinding = new CompletableFuture<>();
+            MockNode primary = MockNode.serve(primarySocket, request -> {
+                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(
+                            OPERATION_NON_REPLICATED, clusterMetadata(primaryPort, survivorPort, primaryPort));
+                }
+                if (request.operation() == OPERATION_REGISTER) {
+                    return Response.success(OPERATION_REGISTER, registerBody(registrations.incrementAndGet()));
+                }
+                if (request.operation() == VsrOperation.CHANGE_PASSWORD) {
+                    return Response.committed(
+                            request.operation(), 2, Unpooled.buffer().writeIntLE(0));
+                }
+                return Response.success(request.operation(), Unpooled.EMPTY_BUFFER);
+            });
+            MockNode survivor = MockNode.serve(survivorSocket, request -> {
+                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                    return endSession.compareAndSet(true, false)
+                            ? Response.eviction(EVICTION_SESSION_ERROR)
+                            : Response.success(
+                                    OPERATION_NON_REPLICATED, clusterMetadata(primaryPort, survivorPort, primaryPort));
+                }
+                if (request.operation() == OPERATION_REGISTER) {
+                    survivorSignIns.add(request.bodyAsText());
+                    return request.bodyAsText().contains(SECOND_PASSWORD)
+                            ? Response.success(OPERATION_REGISTER, registerBody(registrations.incrementAndGet()))
+                            : Response.eviction(EVICTION_INVALID_CREDENTIALS);
+                }
+                return Response.success(request.operation(), Unpooled.EMPTY_BUFFER);
+            });
+            AsyncIggyTcpClient client = AsyncIggyTcpClient.builder()
+                    .host(loopback.getHostAddress())
+                    .port(primaryPort)
+                    .requestTimeout(Duration.ofSeconds(5))
+                    .heartbeatInterval(Duration.ofMinutes(1))
+                    .build();
+            try {
+                client.connect().get(5, TimeUnit.SECONDS);
+                client.users().login(USERNAME, FIRST_PASSWORD).get(5, TimeUnit.SECONDS);
+                client.retarget(new ConnectionInfo(loopback.getHostAddress(), survivorPort))
+                        .get(5, TimeUnit.SECONDS);
+
+                // The survivor ends the session, so the next request on its link binds the session again and
+                // waits for the reply.
+                survivor.rejectBindings = true;
+                survivor.bindingHold = releaseBinding;
+                endSession.set(true);
+                assertThatThrownBy(() -> client.system().getClusterMetadata().get(5, TimeUnit.SECONDS))
+                        .hasCauseInstanceOf(IggyServerException.class);
+                int bindings = survivor.bindings.get();
+                var waiting = client.system().getClusterMetadata();
+                AsyncIggyTcpClientEventLoopGroupTest.await(
+                        () -> survivor.bindings.get() > bindings, "the held bind", RECOVERY);
+
+                client.retarget(new ConnectionInfo(loopback.getHostAddress(), primaryPort))
+                        .get(5, TimeUnit.SECONDS);
+                client.users()
+                        .changePassword(UserId.of(SIGNED_IN_USER_ID), FIRST_PASSWORD, SECOND_PASSWORD)
+                        .get(5, TimeUnit.SECONDS);
+                releaseBinding.complete(null);
+
+                waiting.get(5, TimeUnit.SECONDS);
+                assertThat(survivorSignIns)
+                        .singleElement()
+                        .asString()
+                        .contains(USERNAME, SECOND_PASSWORD)
+                        .doesNotContain(FIRST_PASSWORD);
+            } finally {
+                releaseBinding.complete(null);
+                client.close().get(5, TimeUnit.SECONDS);
+                primary.close();
+                survivor.close();
+            }
+        }
+    }
+
+    @ParameterizedTest(name = "evicted={0}")
+    @ValueSource(booleans = {false, true})
+    void shouldRetryTheRefreshedPasswordWhenAnOlderAutomaticRegisterIsRejected(boolean evicted) throws Exception {
+        InetAddress loopback = InetAddress.getLoopbackAddress();
+        try (ServerSocket primarySocket = new ServerSocket(0, 4, loopback);
+                ServerSocket survivorSocket = new ServerSocket(0, 4, loopback)) {
+            int primaryPort = primarySocket.getLocalPort();
+            int survivorPort = survivorSocket.getLocalPort();
+            CompletableFuture<Void> changing = new CompletableFuture<>();
+            CompletableFuture<Void> releaseChange = new CompletableFuture<>();
+            CompletableFuture<Void> registering = new CompletableFuture<>();
+            CompletableFuture<Void> releaseRegister = new CompletableFuture<>();
+            AtomicBoolean endSession = new AtomicBoolean();
+            List<Request> registers = new CopyOnWriteArrayList<>();
+            MockNode primary = MockNode.serve(primarySocket, request -> {
+                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(
+                            OPERATION_NON_REPLICATED, clusterMetadata(primaryPort, survivorPort, primaryPort));
+                }
+                if (request.operation() == OPERATION_REGISTER) {
+                    return Response.success(OPERATION_REGISTER, registerBody(1));
+                }
+                if (request.operation() == VsrOperation.CHANGE_PASSWORD) {
+                    changing.complete(null);
+                    releaseChange.join();
+                    return Response.committed(
+                            request.operation(), 2, Unpooled.buffer().writeIntLE(0));
+                }
+                return Response.success(request.operation(), Unpooled.EMPTY_BUFFER);
+            });
+            MockNode survivor = MockNode.serve(survivorSocket, request -> {
+                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                    return endSession.getAndSet(false)
+                            ? Response.eviction(EVICTION_SESSION_ERROR)
+                            : Response.success(
+                                    OPERATION_NON_REPLICATED, clusterMetadata(primaryPort, survivorPort, primaryPort));
+                }
+                if (request.operation() == OPERATION_REGISTER) {
+                    registers.add(request);
+                    if (request.bodyAsText().contains(FIRST_PASSWORD)) {
+                        registering.complete(null);
+                        releaseRegister.join();
+                        return evicted
+                                ? Response.eviction(EVICTION_INVALID_CREDENTIALS)
+                                : Response.error(OPERATION_REGISTER, IggyErrorCode.INVALID_CREDENTIALS.getCode());
+                    }
+                    return Response.success(OPERATION_REGISTER, registerBody(2));
+                }
+                return Response.success(request.operation(), Unpooled.EMPTY_BUFFER);
+            });
+            AsyncIggyTcpClient client = AsyncIggyTcpClient.builder()
+                    .host(loopback.getHostAddress())
+                    .port(primaryPort)
+                    .requestTimeout(Duration.ofSeconds(5))
+                    .heartbeatInterval(Duration.ofMinutes(1))
+                    .build();
+            try {
+                client.connect().get(5, TimeUnit.SECONDS);
+                client.users().login(USERNAME, FIRST_PASSWORD).get(5, TimeUnit.SECONDS);
+                var change =
+                        client.users().changePassword(UserId.of(SIGNED_IN_USER_ID), FIRST_PASSWORD, SECOND_PASSWORD);
+                changing.get(5, TimeUnit.SECONDS);
+                client.retarget(new ConnectionInfo(loopback.getHostAddress(), survivorPort))
+                        .get(5, TimeUnit.SECONDS);
+                survivor.rejectBindings = true;
+                endSession.set(true);
+                assertThatThrownBy(() -> client.system().getClusterMetadata().get(5, TimeUnit.SECONDS))
+                        .hasCauseInstanceOf(IggyServerException.class);
+                var waiting = client.system().getClusterMetadata();
+                registering.get(5, TimeUnit.SECONDS);
+                releaseChange.complete(null);
+                change.get(5, TimeUnit.SECONDS);
+                releaseRegister.complete(null);
+
+                waiting.get(5, TimeUnit.SECONDS);
+                assertThat(client.hasRememberedLogin()).isTrue();
+                assertThat(registers).hasSize(2);
+                assertThat(registers.get(1).bodyAsText())
+                        .contains(USERNAME, SECOND_PASSWORD)
+                        .doesNotContain(FIRST_PASSWORD);
+                assertThat(List.of(
+                                registers.get(1).clientLow(), registers.get(1).clientHigh()))
+                        .isEqualTo(List.of(
+                                registers.get(0).clientLow(), registers.get(0).clientHigh()));
+            } finally {
+                releaseChange.complete(null);
+                releaseRegister.complete(null);
+                client.close().get(5, TimeUnit.SECONDS);
+                primary.close();
+                survivor.close();
+            }
+        }
+    }
+
+    /**
      * Records every Register and hangs up on the first one after {@code hangUpOnRegister} is set. A password
      * change or a rename gets the reply of {@code change}.
      */
@@ -1134,7 +1598,8 @@ class AsyncIggyTcpClientEndpointFailoverTest {
 
     /**
      * Ends the session and returns the sign-ins that restore it: the one on the next link of the connection,
-     * which hangs up, and the one that the redial replays.
+     * which hangs up, and the one that the redial replays. A roster read never waits for a session, so it ends
+     * when that sign-in hangs up.
      */
     private static List<String> signInsAfterTheSessionIsLost(
             AsyncIggyTcpClient client, MockNode node, AtomicBoolean hangUpOnRegister, List<String> signIns)
@@ -1143,8 +1608,7 @@ class AsyncIggyTcpClientEndpointFailoverTest {
         node.rejectBindings = true;
         hangUpOnRegister.set(true);
         node.dropConnections();
-        assertThatThrownBy(() ->
-                        client.sendBinaryRequest(GET_STATS_CODE, new byte[0]).get(5, TimeUnit.SECONDS))
+        assertThatThrownBy(() -> client.system().getClusterMetadata().get(5, TimeUnit.SECONDS))
                 .isInstanceOf(ExecutionException.class);
         AsyncIggyTcpClientEventLoopGroupTest.await(() -> signIns.size() >= before + 2, "the redial sign-in", RECOVERY);
         List<String> all = List.copyOf(signIns);
@@ -1160,6 +1624,12 @@ class AsyncIggyTcpClientEndpointFailoverTest {
                     operation.set(uncertain.getOperationId());
                 });
         return operation.get();
+    }
+
+    /** The body that {@code UsersClient.login} writes. */
+    private static byte[] loginBody(String username, String password) {
+        return ByteBufUtil.getBytes(BytesSerializer.toBytes(username, "username")
+                .writeBytes(BytesSerializer.toBytes(password, "password")));
     }
 
     /** The body that {@code UsersClient.changePassword} writes. */
@@ -1249,14 +1719,16 @@ class AsyncIggyTcpClientEndpointFailoverTest {
      * is cores minus one), which stalls the client's own async continuations
      * and times the login out before the test does anything.
      */
-    private static final class MockNode {
+    static final class MockNode {
+        volatile boolean rejectBindings;
+        // A BindSession waits for this before its reply, which follows rejectBindings as it is then.
+        volatile CompletableFuture<Void> bindingHold = CompletableFuture.completedFuture(null);
+        final AtomicInteger bindings = new AtomicInteger();
         private final ServerSocket server;
         private final List<Socket> accepted = new CopyOnWriteArrayList<>();
         private volatile boolean killed;
         private volatile boolean down;
         private volatile boolean silent;
-        private volatile boolean rejectBindings;
-        private final AtomicInteger bindings = new AtomicInteger();
         private final AtomicInteger dials = new AtomicInteger();
 
         private MockNode(ServerSocket server) {
@@ -1303,6 +1775,7 @@ class AsyncIggyTcpClientEndpointFailoverTest {
                     if (request.is(
                             AsyncIggyTcpClientTransientFailoverTest.BIND_SESSION_CODE, OPERATION_NON_REPLICATED)) {
                         bindings.incrementAndGet();
+                        bindingHold.join();
                         response = rejectBindings
                                 ? Response.error(OPERATION_NON_REPLICATED, IggyErrorCode.UNAUTHENTICATED.getCode())
                                 : Response.success(
@@ -1352,7 +1825,7 @@ class AsyncIggyTcpClientEndpointFailoverTest {
     }
 
     @FunctionalInterface
-    private interface RequestHandler {
+    interface RequestHandler {
         Response handle(Request request);
     }
 
@@ -1488,16 +1961,28 @@ class AsyncIggyTcpClientEndpointFailoverTest {
     }
 
     /**
-     * Only the server answering "no" ends a redial. A channel that closed
-     * before the reply, or a node that refuses because it is not the primary,
-     * says nothing about the credentials -- treated as a rejection, they are
-     * dropped and the client is published on a node that is already gone.
+     * Only the server refusing the credentials, with a code of the Rust SDK,
+     * ends a redial. A channel that closed before the reply, or a node that
+     * refuses because it is not the primary, says nothing about the
+     * credentials -- treated as a rejection, they are dropped and the client
+     * is published on a node that is already gone.
      */
     @Test
-    void shouldTreatOnlyANonTransientServerVerdictAsASignInRejection() {
+    void shouldTreatOnlyACredentialRefusalAsASignInRejection() {
+        for (IggyErrorCode refusal : List.of(
+                IggyErrorCode.INVALID_CREDENTIALS,
+                IggyErrorCode.INVALID_FORMAT,
+                IggyErrorCode.INVALID_PERSONAL_ACCESS_TOKEN,
+                IggyErrorCode.PERSONAL_ACCESS_TOKEN_EXPIRED)) {
+            assertThat(AsyncIggyTcpClient.isSignInRejection(
+                            IggyServerException.fromTcpResponse(refusal.getCode(), new byte[0])))
+                    .as(refusal.name())
+                    .isTrue();
+        }
         assertThat(AsyncIggyTcpClient.isSignInRejection(
-                        IggyServerException.fromTcpResponse(IggyErrorCode.INVALID_CREDENTIALS.getCode(), new byte[0])))
-                .isTrue();
+                        IggyServerException.fromTcpResponse(AsyncTcpConnection.NOT_PRIMARY, new byte[0])))
+                .as("a node that is not the primary says nothing about the credentials")
+                .isFalse();
         assertThat(AsyncIggyTcpClient.isSignInRejection(new IggyConnectionException("channel closed")))
                 .as("a channel that died mid sign-in is not a rejected credential")
                 .isFalse();

@@ -49,15 +49,36 @@ Disable the ones you do not need so they cannot race with another process.
 
 ## Delivery semantics
 
+Receipt access follows the server's [session and revocation policy](../../core/server/README.md#sessions-and-retry-receipts).
+An unresolved operation cannot recover its receipt after its original session
+ends, even after a new login or account reactivation. A fresh send can duplicate
+that operation.
+
+Each node counts the messages in its stream, topic and system stats. After a
+successful send, a node that is not the partition primary shows the new count
+only after the next prepare or commit broadcast. When no other write follows,
+this delay is at most `cluster.commit_broadcast_interval` (500 ms by default).
+See [metadata freshness and counters](../../core/server/README.md#metadata-freshness-and-counters).
+
 `SendMessages` returns any placements the server reports. Replicated mutations
 replay the same frozen request, client identity, and request ID after an uncertain
 reply. Once uncertain, only a matching final committed-result proof can settle
 the operation. A reconnect binds the existing session, also after a stale client
 eviction; a terminal session refusal ends its retained operations and permits a
 new registration. While the client registers that new session by itself, a call
-that it did not send fails with 58 instead of waiting for the session. The caller
-can retry that call. If the registration fails, these calls fail with 40 and the
-application must sign in.
+that it did not send waits for the session. So does a call that starts while
+`Connect` signs in. Then the call goes out under the new session. If no session
+comes before the call deadline, the call fails with 58, and the caller can retry
+it.
+
+If the server refuses the current credentials of that registration, with code 4, 40, 42, 43, 44, 47, 53 or 54, every call that waits for it fails with 40 and the refusal as its cause. Such a refusal blocks automatic sign-in until another explicit sign-in. `Connect`, including after `Disconnect`, cannot unblock it. If a committed password change already updated the same owner's credentials, refusal of the older password retries the updated credentials.
+
+Other refusals keep the last sign-in and leave the session owed. After a session loss the client keeps registering, and a call that waits for the session fails with 58 at its deadline. A call that waits for a `Connect` fails with 58 and the refusal as its cause, and a later `Connect` can retry the sign-in. A `Connect` whose own sign-in is refused returns the refusal itself. The client also logs every refusal.
+
+A sign-in, a logout or a disconnect by the application ends every call that
+started before it. A call that did not change server state fails with 40. A
+mutation that possibly changed server state ends uncertain. No call goes out
+under a session that the application opened after the call started.
 
 A reply with status 30 (`StaleClient`) can deny one attempt, because the server
 no longer attaches the link to the session. Usually the session ended, for
@@ -73,14 +94,18 @@ A committed 30 means that the replicated metadata ended the session, so the
 client drops the session at once. A committed 30 still settles an uncertain
 operation, like any other committed rejection.
 
-The client registers a new session with the `WithAutoLogin` credentials, or
-else with those of the last explicit sign-in. When a password change or a rename
-of the user behind those credentials commits, the client updates them. This holds
-for typed calls, `SendBinaryRequest` and `ResolveOperation`. A rejected change
-leaves the credentials unchanged.
+The client registers a new session with the credentials of the last explicit
+sign-in. After a successful session, `Disconnect` makes the client forget that
+sign-in. If automatic sign-in is allowed and the client has no remembered
+sign-in, it uses the `WithAutoLogin` credentials. After `LogoutUser`,
+only a new sign-in by the application, or a `Connect` after `Disconnect`,
+registers a session. When a password change or a rename of the user behind
+those credentials commits, the client updates them. This holds for typed calls,
+`SendBinaryRequest` and `ResolveOperation`. A rejected change leaves the
+credentials unchanged.
 
 If a mutation remains uncertain when its call ends, `errors.As` exposes
-`errors.UncertainOutcome` with an exact `uint64` `OperationID`. The SDK retains
+`errors.OperationUncertain` with an exact `uint64` `OperationID`. The SDK retains
 that request and blocks later mutations on its lane with `errors.LaneBlocked`
 carrying the same ID. Other partitions and pure reads can continue. Metadata
 mutations share one lane; partition mutations use the partition incarnation
@@ -125,11 +150,12 @@ nonpositive interval disables it. Logout, disconnect, and close stop the tasks.
 
 After a session loss, the client registers a new session by itself. A
 registration that loses its link or reaches no endpoint goes again after the
-reconnect backoff. A refusal by the server, a disconnect or a close stops it.
-A sign-in by the application also stops it. If that sign-in fails, the client
-signs in again only when the application does. The sign-in does not wait for a
-pending automatic registration, and the late reply cannot replace the new
-session.
+reconnect backoff. A terminal refusal, a disconnect or a close stops it.
+A sign-in by the application also stops it and uses the supplied credentials.
+Any failed explicit attempt, including invalid input, cancellation, timeout or
+roster discovery failure after Register succeeds, discards its tentative session
+and requires another explicit sign-in. The sign-in does not wait for a pending
+automatic registration, and late completion cannot replace a newer session.
 
 An established session has its own lifetime. Password or PAT changes and PAT
 expiry do not end it. Logout, session lease expiry, or user deactivation end the

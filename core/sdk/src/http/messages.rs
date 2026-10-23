@@ -407,14 +407,13 @@ mod tests {
         );
     }
 
-    /// The timed out attempt may have committed, and the resend is a new request, so its
-    /// refusal cannot tell whether the batch landed.
+    /// The timed out attempt may have committed, and a resend would be a new request that
+    /// lands the batch twice, so the send reports the unknown outcome without a resend.
     #[tokio::test(start_paused = true)]
-    async fn given_resend_after_timeout_when_history_unavailable_should_report_not_committed() {
+    async fn given_timeout_when_sending_should_report_not_committed_without_resend() {
         let server = ScriptedServer::start(vec![
             Reply::topic(&[(PARTITION_ID, CURRENT)]),
             Reply::empty(504),
-            Reply::error(400, &IggyError::HistoryUnavailable),
             Reply::empty(201),
         ])
         .await;
@@ -426,10 +425,7 @@ mod tests {
         let sent = send(&client, &partitioning).await;
 
         let requests = server.requests();
-        assert_eq!(
-            lines(&requests),
-            [TOPIC_LINE, SEND_LINE, SEND_LINE, SEND_LINE]
-        );
+        assert_eq!(lines(&requests), [TOPIC_LINE, SEND_LINE, SEND_LINE]);
         assert!(
             requests[1..]
                 .iter()

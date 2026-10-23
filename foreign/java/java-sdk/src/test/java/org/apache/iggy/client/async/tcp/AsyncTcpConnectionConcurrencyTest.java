@@ -21,10 +21,14 @@ package org.apache.iggy.client.async.tcp;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
+import io.netty.buffer.UnpooledByteBufAllocator;
+import io.netty.buffer.UnpooledHeapByteBuf;
 import org.apache.iggy.client.async.tcp.vsr.ConsensusSession;
 import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.exception.IggyOperationException;
+import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.partition.PartitionContext;
+import org.apache.iggy.serde.CommandCode;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -42,6 +46,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.Arrays;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -56,6 +61,8 @@ class AsyncTcpConnectionConcurrencyTest {
     private static final int SIZE_OFFSET = 48;
     private static final int COMMAND_OFFSET = 60;
     private static final int REQUEST_ID_OFFSET = 168;
+    private static final int REQUEST_CLIENT_OFFSET = 128;
+    private static final int CLIENT_ID_BYTES = 2 * Long.BYTES;
     private static final int REQUEST_OPERATION_OFFSET = 176;
     private static final int REQUEST_CODE_OFFSET = 196;
     private static final int REPLY_REQUEST_ID_OFFSET = 200;
@@ -651,6 +658,89 @@ class AsyncTcpConnectionConcurrencyTest {
                 connection.close().get(5, TimeUnit.SECONDS);
             }
             server.get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void shouldKeepATicketlessReadOnTheIdentityItStartedEncoding() throws Exception {
+        try (ServerSocket socket = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
+            CompletableFuture<Request> observed = new CompletableFuture<>();
+            CompletableFuture<Request> registered = new CompletableFuture<>();
+            CompletableFuture<Void> releaseReply = new CompletableFuture<>();
+            var serving = CompletableFuture.runAsync(() -> {
+                try (Socket peer = socket.accept()) {
+                    Request register = readRequest(peer.getInputStream());
+                    registered.complete(register);
+                    writeResponse(peer.getOutputStream(), register, registerBody());
+                    Request read = readRequest(peer.getInputStream());
+                    observed.complete(read);
+                    releaseReply.join();
+                    writeResponse(peer.getOutputStream(), read, new byte[0]);
+                } catch (IOException error) {
+                    throw new IllegalStateException("Mock VSR server failed", error);
+                }
+            });
+            AsyncTcpConnection connection = newConnection(socket, Duration.ofHours(1), 50);
+            HeldPayload payload = new HeldPayload();
+            try {
+                connection.connect().get(5, TimeUnit.SECONDS);
+                connection
+                        .send(LOGIN_CODE, loginPayload())
+                        .get(5, TimeUnit.SECONDS)
+                        .release();
+                var read = connection.send(CommandCode.System.GET_STATS, payload);
+                payload.encoding.get(5, TimeUnit.SECONDS);
+                CompletableFuture<Void> changed = new CompletableFuture<>();
+                Thread caller = new Thread(
+                        () -> {
+                            connection.sessionOwner().endLineage();
+                            connection.sessionOwner().reset();
+                            changed.complete(null);
+                        },
+                        "ticketless-caller-change");
+                caller.setDaemon(true);
+                caller.start();
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                while (!changed.isDone() && caller.getState() != Thread.State.BLOCKED) {
+                    assertThat(deadline - System.nanoTime()).isPositive();
+                    TimeUnit.MILLISECONDS.sleep(1);
+                }
+                payload.releaseEncoding.complete(null);
+                changed.get(5, TimeUnit.SECONDS);
+                releaseReply.complete(null);
+                assertThatThrownBy(() -> read.get(5, TimeUnit.SECONDS))
+                        .hasCauseInstanceOf(IggyServerException.class)
+                        .satisfies(error -> assertThat(((IggyServerException) error.getCause()).getRawErrorCode())
+                                .isEqualTo(IggyErrorCode.UNAUTHENTICATED.getCode()));
+                Request request = observed.get(5, TimeUnit.SECONDS);
+                Request register = registered.get(5, TimeUnit.SECONDS);
+                assertThat(Arrays.copyOfRange(
+                                request.header(), REQUEST_CLIENT_OFFSET, REQUEST_CLIENT_OFFSET + CLIENT_ID_BYTES))
+                        .as("the read's client id before the caller replaced it")
+                        .containsExactly(Arrays.copyOfRange(
+                                register.header(), REQUEST_CLIENT_OFFSET, REQUEST_CLIENT_OFFSET + CLIENT_ID_BYTES));
+                serving.get(5, TimeUnit.SECONDS);
+            } finally {
+                releaseReply.complete(null);
+                payload.releaseEncoding.complete(null);
+                connection.close().get(5, TimeUnit.SECONDS);
+            }
+        }
+    }
+
+    private static final class HeldPayload extends UnpooledHeapByteBuf {
+        private final CompletableFuture<Void> encoding = new CompletableFuture<>();
+        private final CompletableFuture<Void> releaseEncoding = new CompletableFuture<>();
+
+        private HeldPayload() {
+            super(UnpooledByteBufAllocator.DEFAULT, 0, 0);
+        }
+
+        @Override
+        public int readableBytes() {
+            encoding.complete(null);
+            releaseEncoding.join();
+            return super.readableBytes();
         }
     }
 

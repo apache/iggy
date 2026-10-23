@@ -34,7 +34,9 @@ use crate::segment::Segment;
 use crate::state_transfer::{
     PartitionTransferSession, PartitionTransferUnavailable, PendingTransferRearm, TransferPlanSlot,
 };
-use crate::types::{COMMIT_WALK_OPS_MAX, FatalCommit, RepairConclusion, RepairSession};
+use crate::types::{
+    COMMIT_WALK_OPS_MAX, FatalCommit, RepairConclusion, RepairIngest, RepairSession,
+};
 use crate::{
     AppendResult, Partition, PartitionOffsets, PartitionsConfig, PollFragments, PollQueryResult,
     PollingArgs, PollingConsumer,
@@ -43,13 +45,14 @@ use consensus::Pipeline;
 use consensus::client_table::{CachedReply, ClientTableWireError};
 use consensus::{
     AutoCommitRequestContext, ClientTable, ClientTableMode, CommitLogEvent, Consensus,
-    DvcHeaderKind, LocalRequestOrder, PartitionDiagEvent, PipelineEntry, PlaneKind, Project,
-    ReplicaLogContext, RequestLogEvent, Sequencer, SimEventKind, VsrConsensus, ack_preflight,
-    ack_quorum_reached, build_deny_reply_from_request, build_reply_from_request,
-    build_reply_message, dvc_header_kind, emit_namespace_progress_event, emit_partition_diag,
-    emit_sim_event, fence_old_prepare_by_commit, repair_session_live, repaired_frontier_update,
-    replicate_frozen_to_next_in_chain, replicate_preflight, restamp_prepare_view,
-    send_prepare_ok as send_prepare_ok_common, verify_prepare_integrity,
+    ContradictionSource, DvcHeaderKind, LocalRequestOrder, PartitionDiagEvent, PipelineEntry,
+    PlaneKind, Project, RepairEvidence, ReplicaLogContext, RequestLogEvent, Sequencer,
+    SimEventKind, VsrConsensus, ack_preflight, ack_quorum_reached, build_deny_reply_from_request,
+    build_reply_from_request, build_reply_message, dvc_header_kind, emit_namespace_progress_event,
+    emit_partition_diag, emit_sim_event, fence_old_prepare_by_commit, repair_session_live,
+    repaired_frontier_update, repaired_prepare_evidence, replicate_frozen_to_next_in_chain,
+    replicate_preflight, restamp_prepare_view, send_prepare_ok as send_prepare_ok_common,
+    verify_prepare_integrity,
 };
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner;
@@ -285,8 +288,6 @@ where
     #[cfg(test)]
     offset_dir_sync_count: Cell<usize>,
     pub(crate) required_metadata_frontier: u64,
-    #[cfg(feature = "simulator")]
-    ideal_storage: bool,
     /// Durable superblock for this partition's consensus group, recording
     /// `(view, log_view)` across a crash so this replica can never
     /// re-participate in a view older than one it advertised. `None` for
@@ -525,6 +526,10 @@ enum NoAckStep {
 
 pub enum PendingPartitionTransition {
     View {
+        drain: Option<crate::PersistenceDrain>,
+    },
+    PrimaryTransfer {
+        request: crate::PreparedPrimaryTransfer,
         drain: Option<crate::PersistenceDrain>,
     },
     Truncate {
@@ -903,8 +908,6 @@ where
             #[cfg(test)]
             offset_dir_sync_count: Cell::new(0),
             required_metadata_frontier: 0,
-            #[cfg(feature = "simulator")]
-            ideal_storage: false,
             superblock: None,
             superblock_lock: Rc::new(LocalGate::new()),
             superblock_intent: Cell::new(None),
@@ -1381,13 +1384,6 @@ where
         }
     }
 
-    /// The consensus simulator retains every journal write across crashes.
-    /// This does not model filesystem barriers or physical storage failures.
-    #[cfg(feature = "simulator")]
-    pub const fn enable_ideal_storage(&mut self) {
-        self.ideal_storage = true;
-    }
-
     #[must_use]
     pub fn with_in_memory_storage(
         stats: Arc<PartitionStats>,
@@ -1431,6 +1427,7 @@ where
     }
 
     pub fn begin_quarantine(&mut self, frontier: u64) {
+        self.cancel_primary_transfer();
         if self
             .superblock_intent
             .get()
@@ -1599,7 +1596,7 @@ where
                 &directory,
                 self.namespace().inner(),
                 self.created_revision(),
-                journal::durable_storage::DiskStorage,
+                crate::WalStorage::default(),
                 capacity,
                 self.runtime_options
                     .preallocate_segments
@@ -1641,10 +1638,13 @@ where
                     .message_bus()
                     .spawn(Rc::clone(&persistence).run());
             }
-            persistence.drain_with_timeout().await.map_err(|error| {
-                warn!(%error, "cannot enable partition segment persistence");
-                IggyError::CannotSyncFile
-            })?;
+            persistence
+                .drain_with_timeout(|timeout| self.consensus.message_bus().sleep(timeout))
+                .await
+                .map_err(|error| {
+                    warn!(%error, "cannot enable partition segment persistence");
+                    IggyError::CannotSyncFile
+                })?;
         }
         self.restore_certified_log_view(&persistence).await?;
         if !self.materialization_missing && persistence.recovered_frontier() {
@@ -1653,6 +1653,7 @@ where
         self.workerless_offset_files.clear();
         if self.materialization_missing {
             self.persistence = Some(persistence);
+            self.consensus.resume_adopted_view();
             return Ok(());
         }
         let checkpoint = persistence.checkpoint_op();
@@ -1697,6 +1698,7 @@ where
             });
         }
         self.persistence = Some(persistence);
+        self.consensus.resume_adopted_view();
         Ok(())
     }
 
@@ -1717,7 +1719,7 @@ where
                     .spawn(Rc::clone(persistence).run());
             }
             persistence
-                .drain_with_timeout()
+                .drain_with_timeout(|timeout| self.consensus.message_bus().sleep(timeout))
                 .await
                 .map_err(|_| IggyError::CannotSyncFile)?;
         }
@@ -1788,48 +1790,48 @@ where
     }
 
     pub fn needs_persistence_checkpoint(&self) -> bool {
-        self.maintenance.checkpoint.is_none()
+        self.persistence_checkpoint_through().is_some()
+    }
+
+    /// The op a checkpoint started now would cover. The shard tick starts one
+    /// whenever this holds, so a checkpoint that declined where this says yes
+    /// would spend every tick on a no-op.
+    ///
+    /// Receipts are captured at `commit_min`, so the checkpoint covers exactly
+    /// that op, and only once the WAL holds it.
+    fn persistence_checkpoint_through(&self) -> Option<u64> {
+        let persistence = self.persistence.as_ref()?;
+        let through_op = self.consensus.commit_min();
+        (self.fatal.is_none()
+            && self.maintenance.checkpoint.is_none()
             && !self.checkpoint_waits_for_commit()
-            && self.persistence.as_ref().is_some_and(|persistence| {
-                persistence.needs_checkpoint()
-                    && self.consensus.commit_min().min(persistence.head())
-                        > persistence.checkpoint_op()
-            })
+            && persistence.needs_checkpoint()
+            && through_op > persistence.checkpoint_op()
+            && through_op <= persistence.head())
+        .then_some(through_op)
     }
 
     pub async fn checkpoint_persistence(&mut self, config: &PartitionsConfig) {
-        if self.fatal.is_some() || self.checkpoint_waits_for_commit() {
-            return;
-        }
-        let Some(persistence) = self
-            .persistence
-            .as_ref()
-            .filter(|persistence| persistence.needs_checkpoint())
-            .cloned()
-        else {
+        let (Some(through_op), Some(persistence)) = (
+            self.persistence_checkpoint_through(),
+            self.persistence.clone(),
+        ) else {
             return;
         };
-        let through_op = self.consensus.commit_min();
-        let previous_checkpoint = persistence.checkpoint_op();
-        if through_op <= previous_checkpoint || through_op > persistence.head() {
-            return;
-        }
         if self.has_io_dispatcher() {
-            if self.maintenance.checkpoint.is_none() {
-                match self.encode_retry_checkpoint(through_op) {
-                    Ok(receipts) => {
-                        self.maintenance.checkpoint =
-                            Some(PendingCheckpoint::Receipts(through_op, receipts));
-                        self.notify_io();
-                    }
-                    Err(error) => {
-                        error!(%error, namespace_raw = self.namespace().inner(), "partition receipt checkpoint failed");
-                        self.fatal = Some(FatalCommit {
-                            namespace_raw: self.namespace().inner(),
-                            op: through_op,
-                            operation: None,
-                        });
-                    }
+            match self.encode_retry_checkpoint(through_op) {
+                Ok(receipts) => {
+                    self.maintenance.checkpoint =
+                        Some(PendingCheckpoint::Receipts(through_op, receipts));
+                    self.notify_io();
+                }
+                Err(error) => {
+                    error!(%error, namespace_raw = self.namespace().inner(), "partition receipt checkpoint failed");
+                    self.fatal = Some(FatalCommit {
+                        namespace_raw: self.namespace().inner(),
+                        op: through_op,
+                        operation: None,
+                    });
                 }
             }
             return;
@@ -2255,6 +2257,26 @@ where
         }
     }
 
+    /// Whether the WAL still certifies `log_view` over this journal. A truncation
+    /// clears the certificate at once. An entry of a later view clears it when
+    /// the WAL writes that entry, and before that the journal already holds a log
+    /// that `log_view` does not name.
+    #[must_use]
+    pub fn wal_keeps_log_view(&self) -> bool {
+        let Some(persistence) = &self.persistence else {
+            return true;
+        };
+        let log_view = self.consensus.log_view();
+        let journal = &self.log.journal().inner;
+        let floor = self.consensus.commit_min().max(journal.evicted_through());
+        persistence.certified_log_view() == Some(log_view)
+            && journal.last_op().is_none_or(|last| {
+                (floor.saturating_add(1)..=last)
+                    .filter_map(|op| journal.header_by_op(op))
+                    .all(|header| header.view <= log_view)
+            })
+    }
+
     fn ensure_wal_view(&self) -> bool {
         let Some(persistence) = &self.persistence else {
             return true;
@@ -2262,10 +2284,17 @@ where
         if persistence.certified_log_view() == Some(self.consensus.log_view()) {
             return true;
         }
+        // Outside `Normal` the journal stays the log of `log_view` once that log is
+        // proven, unless it is a primary-elect's merge, which `log_view` names only
+        // once the view starts.
+        if !self.consensus.is_normal()
+            && (self.consensus.view_log_unproven() || self.consensus.view_log_merged())
+        {
+            return false;
+        }
         // An install certifies the WAL it reset. Until it publishes its consensus,
         // the sequencer still names the history that the install replaces.
         if self.materialization_missing
-            || !self.consensus.is_normal()
             || matches!(
                 self.transition,
                 Some(PendingPartitionTransition::Install(_))
@@ -2284,10 +2313,6 @@ where
     }
 
     pub fn register_rebuilt_ack(&self, header: &PrepareHeader) -> bool {
-        #[cfg(feature = "simulator")]
-        if self.ideal_storage {
-            return true;
-        }
         // State-transfer admission uses the accepted WAL head to protect every
         // acknowledged op, including replicated prepares adopted in a new view.
         let accepted = self
@@ -2401,6 +2426,8 @@ where
     /// sites dropped it.
     pub fn set_superblock(&mut self, superblock: Rc<SB>, recovered: Option<&consensus::VsrState>) {
         self.recovered_log_view = recovered.map(|state| state.log_view);
+        self.consensus
+            .restore_adopted_view(recovered.and_then(|state| state.adopted_view.as_ref()));
         self.superblock = Some(superblock);
         self.durable_offset_frontier
             .set(recovered.map_or(0, |state| state.offset_frontier));
@@ -2429,12 +2456,18 @@ where
     #[allow(clippy::future_not_send)]
     #[must_use = "the bool is the durability verdict; dropping it silently ignores a failed write"]
     pub async fn persist_superblock_if_needed(&self) -> bool {
-        if !self.materialization_missing && !self.ensure_wal_view() {
+        if !self.materialization_missing
+            && !self.consensus.view_log_unproven()
+            && !self.ensure_wal_view()
+        {
             return false;
         }
         if self.superblock.is_none() {
+            let state = self.consensus.vsr_state(0, 0);
             self.consensus
-                .mark_superblock_durable(self.consensus.view(), self.consensus.log_view());
+                .mark_superblock_durable(state.view, state.log_view);
+            self.consensus
+                .mark_adopted_view_durable(state.adopted_view.as_ref());
             return true;
         }
         if !self.consensus.needs_superblock_persist() {
@@ -2468,10 +2501,18 @@ where
         for action in actions {
             // Timers keep firing during a held write. Retain only their latest snapshot.
             let previous = match action {
+                // A `Commit` to one backup must not displace the heartbeat to all.
+                consensus::VsrAction::SendCommit { target, .. } => {
+                    pending.actions.iter_mut().find(|pending| {
+                        matches!(
+                            pending,
+                            consensus::VsrAction::SendCommit { target: held, .. } if *held == target
+                        )
+                    })
+                }
                 consensus::VsrAction::SendStartViewChange { .. }
                 | consensus::VsrAction::SendDoViewChange { .. }
                 | consensus::VsrAction::SendRequestStartView { .. }
-                | consensus::VsrAction::SendCommit { .. }
                 | consensus::VsrAction::RetransmitPrepares { .. } => {
                     pending.actions.iter_mut().find(|pending| {
                         std::mem::discriminant(*pending) == std::mem::discriminant(&action)
@@ -2617,6 +2658,8 @@ where
             Ok(()) => {
                 self.consensus
                     .mark_superblock_durable(state.view, state.log_view);
+                self.consensus
+                    .mark_adopted_view_durable(state.adopted_view.as_ref());
                 self.durable_offset_frontier.set(state.offset_frontier);
                 self.durable_offset_reserved.set(state.offset_reserved);
                 self.superblock_write_failures.set(0);
@@ -2926,6 +2969,39 @@ where
         self.dirty_offset.store(dirty, Ordering::Relaxed);
         self.offset_space = offset_space;
         self.recovered_durable_offset = offset_space.committed_seeded.then_some(durable);
+    }
+
+    /// Attach the WAL the simulator reopened from its filesystem model, as
+    /// [`Self::open_persistence_with_recovered`] attaches one after segment
+    /// recovery. The adopted log stands in for the replayed prepares, so it must
+    /// hold exactly what the WAL holds above the applied prefix.
+    #[cfg(feature = "simulator")]
+    pub fn attach_simulated_persistence(&mut self, persistence: Rc<PartitionPersistence>) {
+        // New empty WALs carry view zero; positive certificates belong to recovered history.
+        if self.recovered_log_view.is_none()
+            && persistence.head() == 0
+            && matches!(persistence.certified_log_view(), None | Some(0))
+        {
+            persistence.certify_log_view(self.consensus.log_view(), 0, 0);
+        } else {
+            match persistence.certified_log_view() {
+                Some(view) if view >= self.consensus.log_view() => {
+                    if view > self.consensus.view() {
+                        self.consensus.set_view(view);
+                    }
+                    self.consensus.set_log_view(view);
+                }
+                _ => {
+                    self.materialization_missing = true;
+                    self.ensure_materialization_recovery();
+                }
+            }
+        }
+        if !self.materialization_missing && persistence.recovered_frontier() {
+            self.consensus.set_recovery_election_allowed(true);
+        }
+        self.persistence = Some(persistence);
+        self.start_persistence();
     }
 
     #[cfg(any(test, feature = "simulator"))]
@@ -4013,13 +4089,10 @@ where
         self.resynchronize_consumer_offset_reservations();
         if let PollingConsumer::ConsumerGroup(group_id, _) = result.context.consumer {
             // A store by an unassigned owner fails at apply on every replica.
-            if result
-                .context
-                .owner
-                .is_some_and(ConsumerGroupOwner::is_unassigned)
-            {
+            // The read carries no requester, only the owner it captured.
+            if let Some(owner) = result.context.owner.filter(|owner| owner.is_unassigned()) {
                 return Err(IggyError::ConsumerGroupPartitionNotOwned(
-                    u32::try_from(group_id).unwrap_or(u32::MAX),
+                    owner.client_id,
                     u32::try_from(self.namespace().partition_id()).unwrap_or(u32::MAX),
                 ));
             }
@@ -5547,6 +5620,7 @@ where
     #[must_use]
     pub fn read_history_is_changing(&self) -> bool {
         self.io_active.is_retiring()
+            || !self.deferred_views.is_empty()
             || matches!(
                 self.transition,
                 Some(
@@ -5577,6 +5651,58 @@ where
             || self.transition.is_some()
     }
 
+    /// Fence new admission while accepted history work drains for this grant.
+    /// Refusal leaves the current history owner unchanged.
+    pub fn defer_primary_transfer(&mut self, request: crate::PreparedPrimaryTransfer) -> bool {
+        if self.transition.is_some()
+            || !self.deferred_views.is_empty()
+            || !self.primary_transfer_is_current(&request)
+        {
+            return false;
+        }
+        self.transition = Some(PendingPartitionTransition::PrimaryTransfer {
+            request,
+            drain: None,
+        });
+        self.notify_io();
+        true
+    }
+
+    fn primary_transfer_is_current(&self, request: &crate::PreparedPrimaryTransfer) -> bool {
+        request.is_active_at(self.consensus.message_bus().monotonic_now())
+            && request.created_revision == self.created_revision()
+            && request.expected_view == self.consensus.view()
+            // A fenced backup refuses prepares while the primary keeps
+            // committing, so its drain stalls until the grant expires.
+            && self.consensus.is_primary()
+            && request.target < self.consensus.replica_count()
+            && request.target != self.consensus.primary_index(self.consensus.view())
+            && self.consensus.is_normal()
+            && !self.consensus.has_ceded_primaryship()
+            && !self.consensus.is_transferring()
+            && !self.consensus.view_log_unproven()
+            && self.fatal.is_none()
+            && !self.materialization_missing
+            && !self.io_active.is_retiring()
+            && !self.is_shutting_down()
+    }
+
+    pub(crate) fn cancel_primary_transfer(&mut self) {
+        if !matches!(
+            self.transition,
+            Some(PendingPartitionTransition::PrimaryTransfer { .. })
+        ) {
+            return;
+        }
+        if let Some(PendingPartitionTransition::PrimaryTransfer { drain, .. }) =
+            self.transition.take()
+            && let (Some(persistence), Some(drain)) = (&self.persistence, drain)
+        {
+            persistence.finish_drain(&drain);
+        }
+        self.notify_io();
+    }
+
     /// Keep the newest frame per phase and sender until history writes drain.
     pub fn defer_view_transition(&mut self, message: server_common::MessageBag) {
         let Some((view, phase, sender)) = deferred_view_order(&message) else {
@@ -5585,6 +5711,7 @@ where
         if sender >= self.consensus.replica_count() {
             return;
         }
+        self.cancel_primary_transfer();
         if let Some(pending) = self.deferred_views.iter_mut().find(|pending| {
             deferred_view_order(pending).is_some_and(|(_, pending_phase, pending_sender)| {
                 pending_phase == phase && pending_sender == sender
@@ -5614,6 +5741,7 @@ where
         actions: Vec<consensus::VsrAction>,
         peer: Option<u8>,
     ) {
+        self.cancel_primary_transfer();
         self.transition = Some(PendingPartitionTransition::Truncate {
             ops,
             drain: None,
@@ -5647,6 +5775,7 @@ where
         match self.resume_io_inner(config).await {
             Ok(step) => step,
             Err(error) => {
+                self.cancel_primary_transfer();
                 self.fail_io_work(&error, false);
                 if self.maintenance.shutdown.is_some() {
                     self.maintenance.shutdown = Some(PartitionShutdownPhase::Complete);
@@ -5661,6 +5790,11 @@ where
         &mut self,
         config: &PartitionsConfig,
     ) -> Result<crate::PartitionIoStep, IggyError> {
+        if let Some(PendingPartitionTransition::PrimaryTransfer { request, .. }) = &self.transition
+            && !self.primary_transfer_is_current(request)
+        {
+            self.cancel_primary_transfer();
+        }
         if self.transition.is_none() && !self.deferred_views.is_empty() {
             self.transition = Some(PendingPartitionTransition::View { drain: None });
         }
@@ -5799,7 +5933,43 @@ where
                 return Ok(crate::PartitionIoStep::Progress);
             }
         }
-        if let Some(PendingPartitionTransition::View { drain, .. }) = &mut self.transition {
+        if matches!(
+            self.transition,
+            Some(PendingPartitionTransition::PrimaryTransfer { .. })
+        ) && self.consensus.request_queue_len() > 0
+        {
+            self.deny_queued_requests("primary transfer queued request reply failed")
+                .await;
+            return Ok(crate::PartitionIoStep::Progress);
+        }
+        if matches!(
+            self.transition,
+            Some(PendingPartitionTransition::PrimaryTransfer { .. })
+        ) && (self.consensus.commit_min() < self.consensus.commit_max()
+            || !self.consensus.pipeline_is_empty())
+        {
+            // Commit selection refuses history transitions. This synchronous
+            // window keeps admission fenced between pump events while draining
+            // the already committed prefix before handing leadership away.
+            let transition = self.transition.take();
+            let mut headers = self.select_persistable_commits(config);
+            let reply = !headers.is_empty();
+            if headers.is_empty() {
+                headers = self.collect_committable_from_journal(COMMIT_WALK_OPS_MAX, config);
+            }
+            let selected = self.select_commit(headers, config, reply);
+            self.transition = transition;
+            return Ok(if selected {
+                crate::PartitionIoStep::Progress
+            } else {
+                crate::PartitionIoStep::Pending
+            });
+        }
+        if let Some(
+            PendingPartitionTransition::View { drain }
+            | PendingPartitionTransition::PrimaryTransfer { drain, .. },
+        ) = &mut self.transition
+        {
             if let Some(persistence) = &self.persistence {
                 let drain = drain.get_or_insert_with(|| persistence.begin_drain());
                 if !persistence
@@ -5810,7 +5980,11 @@ where
                 }
                 persistence.finish_drain(drain);
             }
-            self.transition = None;
+            if let Some(PendingPartitionTransition::PrimaryTransfer { request, .. }) =
+                self.transition.take()
+            {
+                return Ok(crate::PartitionIoStep::PrimaryTransfer(request));
+            }
             let next = self
                 .deferred_views
                 .iter()
@@ -5895,7 +6069,8 @@ where
             return self.io_plan(crate::PartitionIoContinuation::Retention);
         }
         if self.maintenance.shutdown.is_some() && self.consensus.request_queue_len() > 0 {
-            self.deny_queued_requests_at_shutdown().await;
+            self.deny_queued_requests("shutdown queued request reply failed")
+                .await;
             return Ok(crate::PartitionIoStep::Progress);
         }
         if self.queued_requests_ready() {
@@ -7312,7 +7487,7 @@ where
                     consensus,
                     message.header(),
                     IggyError::ConsumerGroupPartitionNotOwned(
-                        consumer_id,
+                        message.header().client,
                         u32::try_from(namespace.partition_id()).unwrap_or(u32::MAX),
                     )
                     .as_code(),
@@ -7574,12 +7749,7 @@ where
             };
             // A refusal below drops the queued install, so its latch goes with
             // it; promotion re-arms the latch.
-            let queued_install = (header.operation == Operation::InstallConsumerGroupOwner)
-                .then(|| InstallConsumerGroupOwnerRequest::decode_from(request.message.body()).ok())
-                .flatten();
-            if queued_install.is_some() && queued_install == self.pending_owner_install.get() {
-                self.pending_owner_install.set(None);
-            }
+            let queued_install = self.release_queued_install(&request);
             let context = request.take_auto_commit();
             if context.as_ref().is_some_and(|context| {
                 !self
@@ -7629,7 +7799,7 @@ where
                     .deny_queued_request(
                         &header,
                         IggyError::ConsumerGroupPartitionNotOwned(
-                            consumer_id,
+                            header.client,
                             u32::try_from(self.namespace().partition_id()).unwrap_or(u32::MAX),
                         )
                         .as_code(),
@@ -7712,6 +7882,13 @@ where
                             &self.consensus,
                             &header,
                             committed_reply_body(header.operation),
+                        )
+                        .transmute_header(
+                            |mut reply, output: &mut ReplyHeader| {
+                                reply.reserved[0] = ReplyHeader::COMMITTED_RESULT;
+                                reply.partition_incarnation = header.partition_incarnation;
+                                *output = reply;
+                            },
                         );
                         let _ = sender.send(reply);
                     }
@@ -7820,20 +7997,37 @@ where
         .then_some(IggyError::TransientNotAccepted)
     }
 
-    /// Shutdown promotes nothing, so answer every queued request now. None
-    /// holds an op yet, so its client can safely retry it.
-    async fn deny_queued_requests_at_shutdown(&self) {
+    /// Nothing promotes a queued request during shutdown or a primary transfer,
+    /// so answer every one now. None holds an op yet, so its client can safely
+    /// retry it.
+    async fn deny_queued_requests(&self, send_fail_label: &'static str) {
         while let Some(mut request) = self.consensus.pop_queued_request() {
+            self.release_queued_install(&request);
             let waiter = request.take_reply_sender();
             Self::send_partition_deny_or_log(
                 &self.consensus,
                 request.message.header(),
                 IggyError::TransientNotAccepted.as_code(),
-                "shutdown queued request reply failed",
+                send_fail_label,
                 waiter,
             )
             .await;
         }
+    }
+
+    /// A queued install leaves the queue with its latch. A refused install never
+    /// publishes, so its latch would refuse every later copy as already pending.
+    fn release_queued_install(
+        &self,
+        request: &consensus::RequestEntry,
+    ) -> Option<InstallConsumerGroupOwnerRequest> {
+        let install = (request.message.header().operation == Operation::InstallConsumerGroupOwner)
+            .then(|| InstallConsumerGroupOwnerRequest::decode_from(request.message.body()).ok())
+            .flatten();
+        if install.is_some() && install == self.pending_owner_install.get() {
+            self.pending_owner_install.set(None);
+        }
+        install
     }
 
     /// Resume a bounded promotion turn without waiting for another commit.
@@ -7935,6 +8129,15 @@ where
         #[allow(clippy::cast_possible_truncation)]
         let fenced_by_commit = fence_old_prepare_by_commit(self.consensus(), &header);
         if fenced_by_commit {
+            if self.consensus().contradicts_applied_log(
+                PlaneKind::Partitions,
+                ContradictionSource::Prepare,
+                header.view,
+                [&header],
+                |op| self.applied_header(op),
+            ) {
+                return;
+            }
             emit_partition_diag(
                 tracing::Level::DEBUG,
                 &PartitionDiagEvent::new(
@@ -8289,6 +8492,7 @@ where
             }
 
             if !consensus.pipeline_holds_entry(header.op, header.prepare_checksum) {
+                consensus.handle_late_prepare_ok(&header);
                 emit_partition_diag(
                     tracing::Level::DEBUG,
                     &PartitionDiagEvent::new(
@@ -8761,7 +8965,7 @@ where
             persistence.truncate_from(from_op);
             self.start_persistence();
             persistence
-                .drain_with_timeout()
+                .drain_with_timeout(|timeout| self.consensus.message_bus().sleep(timeout))
                 .await
                 .map_err(|_| IggyError::CannotSyncFile)?;
         }
@@ -8772,12 +8976,15 @@ where
         self.remove_resident_range(from_op..=u64::MAX).await
     }
 
-    /// Replace a proven mismatch while retaining the canonical tail across gaps.
+    /// Replace a proven divergent run while retaining the canonical tail across gaps.
     ///
     /// # Errors
     /// Returns an error if the WAL or resident indexes cannot be rewritten.
-    pub async fn remove_divergent_prepare(&mut self, op: u64) -> Result<(), IggyError> {
-        if op
+    pub async fn remove_divergent_prepares(
+        &mut self,
+        ops: std::ops::RangeInclusive<u64>,
+    ) -> Result<(), IggyError> {
+        if *ops.start()
             <= self
                 .consensus
                 .commit_min()
@@ -8790,14 +8997,14 @@ where
             // entry is repair-held and must be persisted again after the gap fills.
             // Truncation invalidates the head certificate. A crash before refill
             // requires state transfer; the old certificate cannot vouch for a prefix.
-            persistence.truncate_from(op);
+            persistence.truncate_from(*ops.start());
             self.start_persistence();
             persistence
-                .drain_with_timeout()
+                .drain_with_timeout(|timeout| self.consensus.message_bus().sleep(timeout))
                 .await
                 .map_err(|_| IggyError::CannotSyncFile)?;
         }
-        self.remove_resident_range(op..=op).await?;
+        self.remove_resident_range(ops).await?;
         Ok(())
     }
 
@@ -8952,10 +9159,13 @@ where
             self.start_persistence();
             // Shutdown and transfer must finish the flush, but never drain while
             // holding the lock used to append new messages.
-            persistence.drain_with_timeout().await.map_err(|error| {
-                warn!(%error, "cannot flush committed partition messages");
-                IggyError::CannotSyncFile
-            })?;
+            persistence
+                .drain_with_timeout(|timeout| self.consensus.message_bus().sleep(timeout))
+                .await
+                .map_err(|error| {
+                    warn!(%error, "cannot flush committed partition messages");
+                    IggyError::CannotSyncFile
+                })?;
         }
         if self
             .commit_messages_inner(config, true, self.consensus.commit_max())
@@ -10289,6 +10499,12 @@ where
                 }
             };
             self.consensus.advance_commit_min(header.op);
+            // A lifecycle completion counts only once the reporter commits the
+            // fence locally, so the backups must not wait for the heartbeat.
+            // Data commits are too frequent to announce one by one.
+            if header.operation.is_partition_lifecycle() {
+                self.consensus.request_eager_commit();
+            }
             let event = CommitLogEvent {
                 replica: ReplicaLogContext::from_consensus(&self.consensus, PlaneKind::Partitions),
                 op: header.op,
@@ -10462,7 +10678,7 @@ where
                 debug!(
                     namespace_raw = self.namespace().inner(),
                     client = header.client, op = header.op, %error,
-                    "client reply not routable by the bus; client will time out"
+                    "client reply has no route by client id"
                 );
             }
         }
@@ -11350,7 +11566,7 @@ where
             persistence.request_checkpoint();
             self.checkpoint_persistence(config).await;
             persistence
-                .drain_with_timeout()
+                .drain_with_timeout(|timeout| self.consensus.message_bus().sleep(timeout))
                 .await
                 .map_err(|_| IggyError::CannotSyncFile)?;
             if self.fatal.is_some() || persistence.checkpoint_op() != persistence.head() {
@@ -11497,10 +11713,13 @@ where
         {
             persistence.reanchor_segments(self.log.active_segment().start_offset);
             self.start_persistence();
-            persistence.drain_with_timeout().await.map_err(|error| {
-                warn!(%error, "cannot reanchor the partition WAL at its reserved offset");
-                IggyError::CannotSyncFile
-            })?;
+            persistence
+                .drain_with_timeout(|timeout| self.consensus.message_bus().sleep(timeout))
+                .await
+                .map_err(|error| {
+                    warn!(%error, "cannot reanchor the partition WAL at its reserved offset");
+                    IggyError::CannotSyncFile
+                })?;
         }
         Ok(())
     }
@@ -11628,13 +11847,16 @@ where
     /// replicated op, minus the view fence, the gap check, and the ack (the
     /// op is already committed cluster-wide; there is nobody to ack to). The
     /// commit walk runs at `RepairDone`, after the floor is known.
-    pub async fn apply_repaired_prepare(&mut self, message: Message<PrepareHeader>) {
+    pub async fn apply_repaired_prepare(
+        &mut self,
+        message: Message<PrepareHeader>,
+    ) -> RepairIngest {
         let header = *message.header();
         if self.view_truncation_pending() || !self.prepare_history_available(&header) {
-            return;
+            return RepairIngest::Handled;
         }
         let Some(session) = self.repair else {
-            return;
+            return RepairIngest::Handled;
         };
         let consensus = self.consensus();
         // NOT `is_normal` alone: a primary-elect repairing toward its parked
@@ -11643,36 +11865,51 @@ where
         // a stream it can never keep.
         if !repair_session_live(consensus) || consensus.view() != session.view {
             self.repair = None;
-            return;
+            return RepairIngest::Handled;
         }
         if header.op <= consensus.commit_min() || header.op > session.fetch_to_op {
-            return;
+            return RepairIngest::Handled;
         }
-        let canonical_checksum = consensus
+        // Bodies name no sender or request, so only this replica's view log can vouch.
+        let journal = &self.log.journal().inner;
+        let held_at = |op| {
+            journal
+                .header_by_op(op)
+                .map(|held| (held, consensus.view_log_entry_proven(op)))
+        };
+        let (named, evidence) = consensus
             .with_pending_view_log(|pending| {
-                pending
-                    .headers
-                    .iter()
-                    .find(|expected| {
+                (
+                    pending.headers.iter().any(|expected| {
                         expected.op == header.op
                             && dvc_header_kind(expected) != DvcHeaderKind::Blank
-                    })
-                    .map(|expected| expected.checksum)
+                    }),
+                    repaired_prepare_evidence(&header, consensus.view(), Some(pending), held_at),
+                )
             })
-            .flatten();
-        if canonical_checksum.is_some_and(|expected| expected != header.checksum)
-            || (header.op > session.commit_to_op && canonical_checksum.is_none())
+            .unwrap_or_else(|| {
+                (
+                    false,
+                    repaired_prepare_evidence(&header, consensus.view(), None, held_at),
+                )
+            });
+        if header.op > session.commit_to_op && !named {
+            return RepairIngest::Handled;
+        }
+        // An unproven frame may wait for `view_log_proof` only where the walk
+        // still covers its op: nothing journaled there is committed, served or
+        // reported before the walk proves it against the view's hash chain.
+        if evidence == RepairEvidence::Contradicted
+            || (evidence == RepairEvidence::Unproven && !consensus.view_log_proof_covers(header.op))
         {
-            return;
+            return RepairIngest::Unvouched;
         }
         // A held frame is no progress: a peer that re-serves the same chunk
         // every round must still spend the budget, or it cannot be rotated
         // away from.
-        if let Some(held) = self.log.journal().inner.header_by_op(header.op) {
-            if held.checksum == header.checksum {
-                self.consensus.note_repaired_view_header(header);
-            }
-            return;
+        if journal.header_by_op(header.op).is_some() {
+            self.consensus.note_repaired_view_header(header, evidence);
+            return RepairIngest::Handled;
         }
         // Any other in-window frame proves the stream is alive; only silence
         // should age the stall counter.
@@ -11689,7 +11926,7 @@ where
             // The pause keeps this frame out of the journal, not a fault in
             // the frame, so it still refunds the budget.
             self.restart_repair_budget();
-            return;
+            return RepairIngest::Handled;
         }
         let applied = if header.operation == Operation::SendMessages {
             self.append_repaired_send_messages(message).await
@@ -11705,13 +11942,13 @@ where
                 %error,
                 "failed to journal repaired prepare"
             );
-            return;
+            return RepairIngest::Handled;
         }
         // A frame the journal refuses is no progress: it stays not held, so
         // its peer serves it again every round, and a refund per serve would
         // pin the session to that peer.
         self.restart_repair_budget();
-        self.consensus.note_repaired_view_header(header);
+        self.consensus.note_repaired_view_header(header, evidence);
         self.persist_repaired_prefix();
         // Advance the sequencer only along the CONTIGUOUS journaled
         // frontier. DVC advertises `op = sequencer.current_sequence()` and
@@ -11733,6 +11970,7 @@ where
             consensus.set_last_prepare_checksum(frontier_checksum);
         }
         self.offset_reservations_need_resync.set(true);
+        RepairIngest::Handled
     }
 
     /// Conclude a repair stream: settle the commit floor at the serving
@@ -12046,6 +12284,23 @@ where
         // to that journal before `send_prepare_ok` fires, so every op
         // that reaches here is journal-backed and ACKs as durable.
         send_prepare_ok_common(self.consensus(), header, true).await
+    }
+
+    /// The header of the prepare this replica applied at `op`, while the journal
+    /// still holds it: the `applied_at` of
+    /// [`VsrConsensus::contradicts_applied_log`].
+    ///
+    /// This journal keeps no snapshot floor. At or below `commit_min` it holds
+    /// what the walk applied, resident until a flush and then in the repair ring
+    /// until retention drops it, and the checkpoint prepare a boot or a state
+    /// transfer restored at its commit point (a transfer clears every older
+    /// entry). A repair floor jump, possible only without a prepare WAL, leaves
+    /// entries the walk skipped below the floor; the view log was proven before
+    /// the jump, so they are the committed ones. Ingest refuses every op at or
+    /// below `commit_min`, so nothing replaces an entry there.
+    #[must_use]
+    pub fn applied_header(&self, op: u64) -> Option<PrepareHeader> {
+        self.log.journal().inner.repair_header(op)
     }
 }
 
@@ -12577,6 +12832,20 @@ mod tests {
             header.size = u32::try_from(total).unwrap();
             header.checksum = header.identity_checksum();
         })
+    }
+
+    /// The `parent` of each [`checksummed_segment_prepare`] for ops `1..=last`,
+    /// indexed by `op - 1`, chained as a primary links them.
+    pub(super) fn segment_chain_parents(last: u64, payload: &[u8]) -> Vec<u128> {
+        let mut parents = Vec::new();
+        let mut parent = 0;
+        for op in 1..=last {
+            parents.push(parent);
+            parent = checksummed_segment_prepare(op, parent, 0, payload)
+                .header()
+                .checksum;
+        }
+        parents
     }
 
     #[compio::test]
@@ -13193,6 +13462,45 @@ mod tests {
         ));
         assert_eq!(partition.consensus().commit_min(), 0);
         assert!(!directory.path().join("prepares-0").exists());
+    }
+
+    #[compio::test]
+    async fn given_commit_min_above_the_wal_head_when_checkpointing_should_not_report_one_due() {
+        const WAL_HEAD: u64 = 1;
+        for commit_min in [WAL_HEAD, WAL_HEAD + 1] {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut partition, _) = recording_partition_at(0, 3);
+            partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
+            partition.open_persistence().await.unwrap();
+            partition.set_io_notifier(
+                Rc::new(|_, _| {}),
+                crate::largest_legal_job_charge().unwrap(),
+            );
+            let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+            let prepare = checksummed_segment_prepare(WAL_HEAD, 0, 0, b"durable");
+            persistence.append(prepare.into_frozen(), true).unwrap();
+            assert!(persistence.start());
+            Rc::clone(&persistence).run().await;
+            partition
+                .consensus
+                .restore_commit_state(commit_min, commit_min);
+            persistence.request_checkpoint();
+
+            let due = partition.needs_persistence_checkpoint();
+            partition.checkpoint_persistence(&repair_config()).await;
+
+            assert!(partition.fatal().is_none(), "{:?}", partition.fatal());
+            let started = partition.maintenance.checkpoint.is_some();
+            assert_eq!(
+                due, started,
+                "commit_min {commit_min}: the tick starts a checkpoint whenever one is due"
+            );
+            assert_eq!(
+                started,
+                commit_min <= WAL_HEAD,
+                "commit_min {commit_min}: receipts at commit_min need the WAL to hold it"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -14012,6 +14320,457 @@ mod tests {
         Rc::clone(persistence).run()
     }
 
+    fn primary_transfer_grant<B: MessageBus, SB: SuperblockStore>(
+        partition: &IggyPartition<B, SB>,
+    ) -> crate::PreparedPrimaryTransfer {
+        const TEST_GRANT_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+        crate::PreparedPrimaryTransfer {
+            created_revision: partition.created_revision(),
+            expected_view: partition.consensus.view(),
+            target: 1,
+            expires_at: std::time::Instant::now() + TEST_GRANT_TTL,
+        }
+    }
+
+    #[compio::test]
+    async fn given_busy_wal_when_primary_transfer_drains_should_fence_admission_and_release_pause()
+    {
+        for expire in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut partition, replies) = recording_partition_at(0, 3);
+            partition.set_created_revision(7);
+            partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
+            partition.open_persistence().await.unwrap();
+            let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+            let writer = hold_wal_writer(&persistence);
+            let request = primary_transfer_grant(&partition);
+            for (created_revision, expected_view, expires_at) in [
+                (
+                    request.created_revision + 1,
+                    request.expected_view,
+                    request.expires_at,
+                ),
+                (
+                    request.created_revision,
+                    request.expected_view + 1,
+                    request.expires_at,
+                ),
+                (
+                    request.created_revision,
+                    request.expected_view,
+                    std::time::Instant::now(),
+                ),
+            ] {
+                assert!(
+                    !partition.defer_primary_transfer(crate::PreparedPrimaryTransfer {
+                        created_revision,
+                        expected_view,
+                        target: request.target,
+                        expires_at,
+                    })
+                );
+                assert!(partition.transition.is_none());
+                assert!(persistence.has_capacity(size_of::<PrepareHeader>()));
+            }
+            assert!(partition.defer_primary_transfer(request));
+            let config = repair_config();
+            assert!(matches!(
+                partition.resume_io(&config).await,
+                crate::PartitionIoStep::Pending
+            ));
+            assert!(!persistence.has_capacity(size_of::<PrepareHeader>()));
+            partition
+                .on_request(
+                    store_offset_request(42, 1, ConsumerKind::Consumer, 7, 0, AckLevel::NoAck),
+                    None,
+                )
+                .await;
+            let status = bytemuck::checked::from_bytes::<ReplyHeader>(
+                &replies.borrow()[0].1.as_slice()[..size_of::<ReplyHeader>()],
+            )
+            .status;
+            assert_eq!(status, IggyError::TransientNotAccepted.as_code());
+            assert_eq!(partition.consensus.sequencer().current_sequence(), 0);
+            assert!(!partition.defer_primary_transfer(primary_transfer_grant(&partition)));
+
+            if expire {
+                let Some(PendingPartitionTransition::PrimaryTransfer { request, .. }) =
+                    &mut partition.transition
+                else {
+                    panic!("the held writer must keep its grant");
+                };
+                request.expires_at = std::time::Instant::now();
+                assert!(matches!(
+                    partition.resume_io(&config).await,
+                    crate::PartitionIoStep::Pending
+                ));
+                assert!(partition.transition.is_none());
+                assert!(persistence.has_capacity(size_of::<PrepareHeader>()));
+            }
+            writer.await;
+            let step = partition.resume_io(&config).await;
+            if expire {
+                assert!(matches!(step, crate::PartitionIoStep::Pending));
+            } else {
+                let crate::PartitionIoStep::PrimaryTransfer(request) = step else {
+                    panic!("settled WAL must release the transfer continuation");
+                };
+                assert_eq!(request.created_revision, 7);
+                assert_eq!(request.expected_view, 0);
+                assert_eq!(request.target, 1);
+            }
+            assert!(persistence.has_capacity(size_of::<PrepareHeader>()));
+            assert_eq!(partition.consensus.view(), 0);
+            assert!(partition.transition.is_none());
+            assert!(partition.fatal().is_none());
+        }
+    }
+
+    #[compio::test]
+    async fn given_accepted_no_ack_write_when_primary_transfer_drains_should_finish_its_reply() {
+        const CLIENT: u128 = 42;
+        const CONSUMER: u32 = 7;
+        const STEPS_MAX: usize = 32;
+        let directory = tempfile::tempdir().unwrap();
+        let (mut partition, replies) = recording_partition_at(0, 3);
+        set_offset_dirs_under(&mut partition, directory.path());
+        partition.stats.increment_messages_count(1);
+        partition.set_io_notifier(
+            Rc::new(|_, _| {}),
+            crate::largest_legal_job_charge().unwrap(),
+        );
+        let store = store_offset_request(
+            CLIENT,
+            1,
+            ConsumerKind::Consumer,
+            CONSUMER,
+            0,
+            AckLevel::NoAck,
+        );
+        partition
+            .apply_consumer_offset_no_ack(
+                Box::new(*store.header()),
+                ConsumerKind::Consumer,
+                CONSUMER,
+                Some(0),
+                None,
+            )
+            .await;
+        let config = repair_config();
+        let captured = loop {
+            match partition.resume_io(&config).await {
+                crate::PartitionIoStep::Progress => {}
+                crate::PartitionIoStep::Ready(plan) => {
+                    break partition.capture_io(plan, &config).unwrap().unwrap();
+                }
+                _ => panic!("accepted store must reach its file write"),
+            }
+        };
+        assert_eq!(
+            captured.identity.continuation,
+            crate::PartitionIoContinuation::NoAck
+        );
+        assert!(partition.defer_primary_transfer(primary_transfer_grant(&partition)));
+        assert!(matches!(
+            partition.resume_io(&config).await,
+            crate::PartitionIoStep::Pending
+        ));
+        assert!(replies.borrow().is_empty());
+        let result = captured.job.execute().await;
+        assert!(matches!(
+            partition.resume_io(&config).await,
+            crate::PartitionIoStep::Pending
+        ));
+        partition.accept_io(captured.identity, result).unwrap();
+        if let Some(gate) = captured.gate {
+            gate.release();
+        }
+        let mut finished = false;
+        for _ in 0..STEPS_MAX {
+            match partition.resume_io(&config).await {
+                crate::PartitionIoStep::Progress => {}
+                crate::PartitionIoStep::Ready(plan) => {
+                    execute_partition_io_plan(&mut partition, &config, plan).await;
+                }
+                crate::PartitionIoStep::PrimaryTransfer(_) => {
+                    finished = true;
+                    break;
+                }
+                _ => panic!("accepted store must settle before transfer"),
+            }
+        }
+        assert!(finished);
+        assert_eq!(
+            partition.get_consumer_offset(PollingConsumer::Consumer(
+                usize::try_from(CONSUMER).unwrap(),
+                0,
+            )),
+            Some(0)
+        );
+        assert_eq!(replies.borrow().len(), 1);
+        assert_eq!(
+            bytemuck::checked::from_bytes::<ReplyHeader>(
+                &replies.borrow()[0].1.as_slice()[..size_of::<ReplyHeader>()],
+            )
+            .status,
+            0
+        );
+        assert!(
+            !bytemuck::checked::from_bytes::<ReplyHeader>(
+                &replies.borrow()[0].1.as_slice()[..size_of::<ReplyHeader>()],
+            )
+            .has_committed_result()
+        );
+        assert!(partition.no_ack.is_empty());
+        assert_eq!(partition.consensus.view(), 0);
+    }
+
+    #[compio::test]
+    async fn given_unapplied_commit_when_primary_transfer_drains_should_apply_before_handoff() {
+        const STEPS_MAX: usize = 64;
+        let directory = tempfile::tempdir().unwrap();
+        let (mut partition, _replies, config, parent) =
+            partition_with_committed_send(directory.path(), iggy_common::Durability::Replicated, 3)
+                .await;
+        partition.set_io_notifier(
+            Rc::new(|_, _| {}),
+            crate::largest_legal_job_charge().unwrap(),
+        );
+        let prepare = checksummed_segment_prepare(2, parent, 1, b"committed-before-transfer");
+        let header = *prepare.header();
+        let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+        persistence
+            .append(prepare.clone().into_frozen(), false)
+            .unwrap();
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        partition
+            .consensus
+            .with_pipeline_mut(|pipeline| pipeline.push(PipelineEntry::new(header)));
+        partition
+            .append_repaired_send_messages(prepare)
+            .await
+            .unwrap();
+        partition.consensus.sequencer().set_sequence(header.op);
+        partition
+            .consensus
+            .set_last_prepare_checksum(header.checksum);
+        assert_eq!(partition.consensus.commit_min(), 1);
+        assert!(partition.defer_primary_transfer(primary_transfer_grant(&partition)));
+        assert!(
+            matches!(
+                partition.resume_io(&config).await,
+                crate::PartitionIoStep::Pending
+            ),
+            "an accepted prepare must finish before the primary hands off"
+        );
+        partition.consensus.advance_commit_max(header.op);
+        let mut finished = false;
+        for _ in 0..STEPS_MAX {
+            match partition.resume_io(&config).await {
+                crate::PartitionIoStep::Progress => {}
+                crate::PartitionIoStep::Ready(plan) => {
+                    execute_partition_io_plan(&mut partition, &config, plan).await;
+                }
+                crate::PartitionIoStep::PrimaryTransfer(request) => {
+                    assert_eq!(partition.consensus.commit_min(), header.op);
+                    assert!(
+                        !partition
+                            .consensus
+                            .request_primary_transfer(request.expected_view, request.target)
+                            .is_empty()
+                    );
+                    finished = true;
+                    break;
+                }
+                _ => panic!("committed prefix must drain under the admission fence"),
+            }
+        }
+        assert!(finished);
+        assert_eq!(partition.stats.messages_count_inconsistent(), 2);
+        assert!(partition.fatal().is_none());
+    }
+
+    #[compio::test]
+    async fn given_queued_requests_when_primary_transfer_drains_should_refuse_them_and_hand_off() {
+        const GROUP_ID: u64 = 8;
+        const OWNER_ID: u128 = 42;
+        const ADMITTED_CLIENT: u128 = 100;
+        const QUEUED_CLIENT: u128 = 101;
+        const STEPS_MAX: usize = 64;
+        let directory = tempfile::tempdir().unwrap();
+        let (mut partition, replies) =
+            recording_partition_with_pipeline(0, 3, LocalPipeline::with_capacities(1, 2));
+        install_test_owner(&mut partition, GROUP_ID, OWNER_ID).await;
+        set_offset_dirs_under(&mut partition, directory.path());
+        partition.set_io_notifier(
+            Rc::new(|_, _| {}),
+            crate::largest_legal_job_charge().unwrap(),
+        );
+        partition.stats.increment_messages_count(1);
+        for (client_id, consumer_id) in [(ADMITTED_CLIENT, 7), (QUEUED_CLIENT, 9)] {
+            let store = store_offset_request(
+                client_id,
+                1,
+                ConsumerKind::Consumer,
+                consumer_id,
+                0,
+                AckLevel::Quorum,
+            )
+            .transmute_header(|mut header, next: &mut RoutedRequestHeader| {
+                header.metadata_watermark = partition.required_metadata_frontier;
+                *next = header;
+            });
+            partition.on_request(store, None).await;
+        }
+        let installation = next_test_installation(&partition, GROUP_ID, OWNER_ID + 1);
+        let (sender, receiver) = consensus::oneshot_channel();
+        partition
+            .on_request(
+                owner_install_request(&partition, &installation),
+                Some(sender),
+            )
+            .await;
+        assert_eq!(partition.consensus.pipeline_len(), 1);
+        assert_eq!(partition.consensus.request_queue_len(), 2);
+        assert_eq!(partition.pending_owner_install.get(), Some(installation));
+
+        assert!(partition.defer_primary_transfer(primary_transfer_grant(&partition)));
+        partition
+            .consensus
+            .advance_commit_max(partition.consensus.sequencer().current_sequence());
+        let config = repair_config();
+        let mut transfer = None;
+        for _ in 0..STEPS_MAX {
+            match partition.resume_io(&config).await {
+                crate::PartitionIoStep::Progress => {}
+                crate::PartitionIoStep::Ready(plan) => {
+                    execute_partition_io_plan(&mut partition, &config, plan).await;
+                }
+                crate::PartitionIoStep::PrimaryTransfer(request) => {
+                    transfer = Some(request);
+                    break;
+                }
+                crate::PartitionIoStep::Pending => break,
+                _ => panic!("the drain must only commit and hand off"),
+            }
+        }
+        let Some(request) = transfer else {
+            panic!(
+                "a queued request must not hold the handoff: {} queued, {} prepared, commit {}/{}",
+                partition.consensus.request_queue_len(),
+                partition.consensus.pipeline_len(),
+                partition.consensus.commit_min(),
+                partition.consensus.commit_max(),
+            );
+        };
+        assert!(
+            !partition
+                .consensus
+                .request_primary_transfer(request.expected_view, request.target)
+                .is_empty()
+        );
+        assert_eq!(
+            receiver.await.unwrap().header().status,
+            IggyError::TransientNotAccepted.as_code()
+        );
+        let statuses = |client_id| {
+            replies
+                .borrow()
+                .iter()
+                .filter(|(client, _)| *client == client_id)
+                .map(|(_, frame)| {
+                    bytemuck::checked::from_bytes::<ReplyHeader>(
+                        &frame.as_slice()[..size_of::<ReplyHeader>()],
+                    )
+                    .status
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(statuses(ADMITTED_CLIENT), [0]);
+        assert_eq!(
+            statuses(QUEUED_CLIENT),
+            [IggyError::TransientNotAccepted.as_code()]
+        );
+        assert!(
+            partition.pending_owner_install.get().is_none(),
+            "a refused install must release its latch"
+        );
+        assert!(partition.fatal().is_none());
+    }
+
+    #[compio::test]
+    async fn given_planned_primary_transfer_when_a_view_frame_arrives_should_preserve_real_transition()
+     {
+        let (mut partition, _) = recording_partition_at(0, 3);
+        assert!(partition.defer_primary_transfer(primary_transfer_grant(&partition)));
+        let message = Message::<StartViewHeader>::new(size_of::<StartViewHeader>())
+            .transmute_header(|_, header: &mut StartViewHeader| {
+                header.command = Command::StartView;
+                header.size = u32::try_from(size_of::<StartViewHeader>()).unwrap();
+                header.view = 1;
+                header.replica = 1;
+            });
+        partition.defer_view_transition(server_common::MessageBag::StartView(message));
+        partition.cancel_primary_transfer();
+        assert!(matches!(
+            partition.transition,
+            Some(PendingPartitionTransition::View { .. })
+        ));
+        assert!(matches!(partition.resume_io(&repair_config()).await,
+            crate::PartitionIoStep::Transition(server_common::MessageBag::StartView(message))
+            if message.header().view == 1));
+    }
+
+    #[compio::test]
+    async fn given_backup_replica_when_granted_a_primary_transfer_should_refuse_and_keep_committing()
+     {
+        const BACKUP: u8 = 2;
+        for target in [1, BACKUP] {
+            let root = tempfile::tempdir().unwrap();
+            let mut config = repair_config();
+            config.path_layout.streams_root = root.path().to_string_lossy().into_owned();
+            let directory = std::path::PathBuf::from(config.get_partition_path(1, 1, 0));
+            std::fs::create_dir_all(&directory).unwrap();
+            let (mut backup, _) = recording_partition_at(BACKUP, 3);
+            backup.set_partition_dir(directory.to_string_lossy().into_owned());
+            set_offset_dirs_under(&mut backup, &directory);
+            backup.open_persistence().await.unwrap();
+            backup.log.retire_front().unwrap();
+            backup.install_empty_segment(&config, 0).await.unwrap();
+            backup.set_io_notifier(
+                Rc::new(|_, _| {}),
+                crate::largest_legal_job_charge().unwrap(),
+            );
+            let persistence = Rc::clone(backup.persistence.as_ref().unwrap());
+            let writer = hold_wal_writer(&persistence);
+            let first = checksummed_segment_prepare(1, 0, 0, b"before-grant");
+            let parent = first.header().checksum;
+            backup.on_replicate(first).await;
+            assert!(
+                !backup.defer_primary_transfer(crate::PreparedPrimaryTransfer {
+                    target,
+                    ..primary_transfer_grant(&backup)
+                }),
+                "backup {BACKUP} accepted a grant for target {target}"
+            );
+            assert!(backup.transition.is_none());
+            assert!(persistence.has_capacity(size_of::<PrepareHeader>()));
+
+            // Replica 1 acks op 2, so the primary commits it. An unfenced
+            // backup journals the forwarded prepare and commits it as well.
+            backup
+                .on_replicate(checksummed_segment_prepare(2, parent, 1, b"after-grant"))
+                .await;
+            writer.await;
+            commit_on_heartbeat(&mut backup, &config, 2).await;
+            settle_partition_io(&mut backup, &config).await;
+            assert_eq!(backup.consensus.sequencer().current_sequence(), 2);
+            assert_eq!(persistence.written_op(), 2);
+            assert_eq!(backup.consensus.commit_min(), 2);
+        }
+    }
+
     /// The primary's Commit heartbeat, handled as the shard's `on_commit` does.
     async fn commit_on_heartbeat(
         partition: &mut IggyPartition<RecordingBus>,
@@ -14486,7 +15245,10 @@ mod tests {
         assert_eq!(batch.iter().next().unwrap().payload, b"replacement");
         persistence.request_checkpoint();
         partition.checkpoint_persistence(&config).await;
-        persistence.drain_with_timeout().await.unwrap();
+        persistence
+            .drain_with_timeout(compio::runtime::time::sleep)
+            .await
+            .unwrap();
         assert!(persistence.failure().is_none());
         assert_eq!(persistence.checkpoint_op(), 2);
     }
@@ -14674,7 +15436,10 @@ mod tests {
                 persistence.append(prepare.into_frozen(), true).unwrap();
             }
             partition.start_persistence();
-            persistence.drain_with_timeout().await.unwrap();
+            persistence
+                .drain_with_timeout(compio::runtime::time::sleep)
+                .await
+                .unwrap();
 
             let rotated = directory.path().join("00000000000000000001.log");
             let metadata = std::fs::metadata(&rotated).unwrap();
@@ -14872,6 +15637,7 @@ mod tests {
             replies.borrow()
         );
 
+        let retry = first.deep_copy();
         let second = first.transmute_header(|header, next: &mut RoutedRequestHeader| {
             *next = header;
             next.client = 2;
@@ -14886,6 +15652,21 @@ mod tests {
         assert_eq!(partition.consensus.commit_min(), 2);
         assert_eq!(partition.dedup.count(), 2);
         assert!(partition.fatal.is_none(), "{:?}", partition.fatal);
+        assert_eq!(replies.borrow().len(), 2);
+        partition.on_request(retry, None).await;
+        let replies = replies.borrow();
+        assert_eq!(replies.len(), 3);
+        for (_, bytes) in replies.iter() {
+            let header = bytemuck::checked::from_bytes::<ReplyHeader>(
+                &bytes.as_slice()[..size_of::<ReplyHeader>()],
+            );
+            assert!(header.has_committed_result());
+        }
+        assert_eq!(
+            replies[2].1.as_slice(),
+            replies[0].1.as_slice(),
+            "a live retry keeps the original proof"
+        );
     }
 
     fn retire_session_request(
@@ -15116,6 +15897,81 @@ mod tests {
                 metadata_watermark: ENDING_FRONTIER + u64::try_from(client_id).unwrap(),
             }));
         }
+    }
+
+    /// Pins the barrier count of a burst of ended sessions: the sweep sends the
+    /// oldest `MAX_SESSIONS_PER_RETIREMENT` identities in one barrier, so one
+    /// partition commits `ceil(K / MAX_SESSIONS_PER_RETIREMENT)` barriers for K
+    /// sessions, and each commit releases the dedup slots of its whole batch.
+    #[compio::test]
+    async fn given_more_ended_sessions_than_one_batch_when_retiring_should_commit_one_barrier_per_batch()
+     {
+        const BATCH: usize = iggy_binary_protocol::requests::system::MAX_SESSIONS_PER_RETIREMENT;
+        const SESSIONS: usize = BATCH + 1;
+        const ENDING_FRONTIER: u64 = 10;
+        let (mut partition, _replies) = recording_partition_at(0, 3);
+        partition.set_dedup_clients_max(SESSIONS);
+        let mut op = 0;
+        let identities: Vec<SessionIdentity> = (1..=SESSIONS)
+            .map(|index| SessionIdentity {
+                client_id: u128::try_from(index).unwrap(),
+                session: 1,
+                metadata_watermark: ENDING_FRONTIER + u64::try_from(index).unwrap(),
+            })
+            .collect();
+        for identity in &identities {
+            let mut send = checksumless_send_request(partition.namespace(), 1).transmute_header(
+                |header, next: &mut RoutedRequestHeader| {
+                    *next = header;
+                    next.client = identity.client_id;
+                },
+            );
+            send.as_mut_slice()[size_of::<RoutedRequestHeader>()..]
+                .copy_from_slice(&build_segment_record(partition.namespace(), 0));
+            partition.on_request(send, None).await;
+            op += 1;
+            partition.consensus.advance_commit_max(op);
+            partition.commit_journal(&repair_config()).await;
+        }
+        assert!(partition.fatal.is_none(), "{:?}", partition.fatal);
+        assert_eq!(partition.dedup.count(), SESSIONS);
+
+        let mut barriers = 0;
+        for batch in identities.chunks(BATCH) {
+            let held = partition.dedup.count();
+            partition
+                .on_request(retire_sessions_request(partition.namespace(), batch), None)
+                .await;
+            assert_eq!(
+                partition.dedup.count(),
+                held,
+                "a prepared barrier must not release capacity"
+            );
+            assert!(
+                batch
+                    .iter()
+                    .all(|identity| !partition.session_retired(*identity))
+            );
+            op += 1;
+            partition.consensus.advance_commit_max(op);
+            partition.commit_journal(&repair_config()).await;
+            barriers += 1;
+            assert_eq!(partition.consensus.commit_min(), op);
+            assert_eq!(partition.dedup.count(), held - batch.len());
+            assert!(
+                batch
+                    .iter()
+                    .all(|identity| partition.session_retired(*identity))
+            );
+            assert!(
+                identities[(barriers * BATCH).min(SESSIONS)..]
+                    .iter()
+                    .all(|identity| !partition.session_retired(*identity)),
+                "a barrier must not retire a session outside its batch"
+            );
+        }
+        assert_eq!(barriers, SESSIONS.div_ceil(BATCH));
+        assert_eq!(partition.dedup.count(), 0);
     }
 
     #[compio::test]
@@ -15723,7 +16579,7 @@ mod tests {
             .persistence
             .as_ref()
             .unwrap()
-            .drain_with_timeout()
+            .drain_with_timeout(compio::runtime::time::sleep)
             .await
             .unwrap();
         backup.drive_persistence().await;
@@ -15926,7 +16782,7 @@ mod tests {
             .persistence
             .as_ref()
             .unwrap()
-            .drain_with_timeout()
+            .drain_with_timeout(compio::runtime::time::sleep)
             .await
             .unwrap();
         backup.drive_persistence().await;
@@ -15952,7 +16808,7 @@ mod tests {
             .persistence
             .as_ref()
             .unwrap()
-            .drain_with_timeout()
+            .drain_with_timeout(compio::runtime::time::sleep)
             .await
             .unwrap();
         backup.drive_persistence().await;
@@ -16023,7 +16879,10 @@ mod tests {
         assert!(!partition.register_rebuilt_ack(&header));
         assert!(partition.pending_persisted_acks.borrow().contains_key(&1));
         partition.start_persistence();
-        persistence.drain_with_timeout().await.unwrap();
+        persistence
+            .drain_with_timeout(compio::runtime::time::sleep)
+            .await
+            .unwrap();
         assert!(partition.register_rebuilt_ack(&header));
     }
 
@@ -16067,7 +16926,7 @@ mod tests {
                 .persistence
                 .as_ref()
                 .unwrap()
-                .drain_with_timeout()
+                .drain_with_timeout(compio::runtime::time::sleep)
                 .await
                 .unwrap();
             partition.drive_persistence().await;
@@ -16096,6 +16955,7 @@ mod tests {
             );
             assert_eq!(partition.offset.load(Ordering::Acquire), offset);
             assert_eq!(partition.consensus.commit_min(), prepare.header().op);
+            assert_eq!(partition.consensus.applied_log_contradictions(), 0);
             sent.borrow_mut().clear();
 
             partition.on_replicate(prepares[1].clone()).await;
@@ -16104,6 +16964,11 @@ mod tests {
                 "a conflicting committed prepare must never be acknowledged"
             );
             assert_eq!(partition.offset.load(Ordering::Acquire), offset);
+            assert_eq!(
+                partition.consensus.applied_log_contradictions(),
+                1,
+                "a different prepare at an applied op is a contradiction, not an old retransmit"
+            );
         }
     }
 
@@ -16166,7 +17031,10 @@ mod tests {
             assert_eq!(partition.consensus().sequencer().current_sequence(), 3);
             partition.on_replicate(third.clone()).await;
             if let Some(persistence) = &partition.persistence {
-                persistence.drain_with_timeout().await.unwrap();
+                persistence
+                    .drain_with_timeout(compio::runtime::time::sleep)
+                    .await
+                    .unwrap();
             }
             partition.drive_persistence().await;
             assert_eq!(
@@ -16242,7 +17110,10 @@ mod tests {
         persistence.append(prepare.into_frozen(), true).unwrap();
         assert!(!partition.register_rebuilt_ack(&header));
         partition.start_persistence();
-        persistence.drain_with_timeout().await.unwrap();
+        persistence
+            .drain_with_timeout(compio::runtime::time::sleep)
+            .await
+            .unwrap();
 
         (directory, partition, header)
     }
@@ -16278,7 +17149,10 @@ mod tests {
         assert!(!partition.register_rebuilt_ack(&header));
         persistence.certify_log_view(3, header.op, header.checksum);
         partition.start_persistence();
-        persistence.drain_with_timeout().await.unwrap();
+        persistence
+            .drain_with_timeout(compio::runtime::time::sleep)
+            .await
+            .unwrap();
         let store = Rc::new(RecordingSuperblock::default());
         partition.set_superblock(store.clone(), None);
         assert!(partition.consensus().needs_superblock_persist());
@@ -17111,8 +17985,8 @@ mod tests {
         assert!(
             matches!(
                 refusal,
-                Some(IggyError::ConsumerGroupPartitionNotOwned(group, 0))
-                    if u64::from(group) == GROUP_ID
+                Some(IggyError::ConsumerGroupPartitionNotOwned(client, 0))
+                    if client == unassigned.owner.client_id
             ),
             "{refusal:?}"
         );
@@ -17251,7 +18125,7 @@ mod tests {
     async fn given_owner_zero_store_when_admitted_should_bind_only_the_installed_owner_it_routed_by()
      {
         const GROUP_ID: u64 = 7;
-        const CLIENT_ID: u128 = 42;
+        const CLIENT_ID: u128 = (1 << 64) + 42;
         const STORED_OFFSET: u64 = 0;
         let group = u32::try_from(GROUP_ID).unwrap();
         let mut partition = test_partition();
@@ -17288,7 +18162,7 @@ mod tests {
                 .await;
             assert_eq!(
                 receiver.await.unwrap().header().status,
-                IggyError::ConsumerGroupPartitionNotOwned(group, 0).as_code(),
+                IggyError::ConsumerGroupPartitionNotOwned(CLIENT_ID, 0).as_code(),
                 "session {session} routed by op {minimum_metadata_op} must not bind"
             );
         }
@@ -19237,6 +20111,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn given_held_commits_when_more_are_deferred_should_keep_the_latest_per_target() {
+        let (partition, _) = recording_partition();
+        partition.set_io_notifier(
+            Rc::new(|_, _| {}),
+            crate::largest_legal_job_charge().unwrap(),
+        );
+        let commit =
+            |target: Option<u8>, timestamp_monotonic: u64| consensus::VsrAction::SendCommit {
+                view: 0,
+                commit: 1,
+                group: partition.namespace().inner(),
+                timestamp_monotonic,
+                target,
+            };
+
+        partition.defer_wire_actions(vec![commit(None, 1), commit(Some(1), 2)]);
+        partition.defer_wire_actions(vec![commit(Some(2), 3), commit(Some(1), 4)]);
+        partition.defer_wire_actions(vec![commit(None, 5)]);
+
+        let held: Vec<_> = partition
+            .pending_wire_actions
+            .borrow()
+            .as_ref()
+            .expect("the commits are held")
+            .actions
+            .iter()
+            .map(|action| match action {
+                consensus::VsrAction::SendCommit {
+                    target,
+                    timestamp_monotonic,
+                    ..
+                } => (*target, *timestamp_monotonic),
+                other => panic!("held a non-commit action: {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            held,
+            [(None, 5), (Some(1), 4), (Some(2), 3)],
+            "a Commit to one backup must neither displace the heartbeat to all nor \
+             another backup's Commit"
+        );
+    }
+
     #[compio::test]
     async fn given_advanced_view_when_persist_gate_runs_should_write_vsr_state_once() {
         for (view, log_view) in [(3, 2), (2, 0)] {
@@ -19306,6 +20224,7 @@ mod tests {
             checkpoint_checksum: 0,
             offset_frontier,
             offset_reserved,
+            adopted_view: None,
         }
     }
 
@@ -20300,6 +21219,7 @@ mod tests {
             checkpoint_checksum: 0,
             offset_frontier: 4_200,
             offset_reserved: 0,
+            adopted_view: None,
         };
         partition.set_superblock(store.clone(), Some(&recovered));
         assert_eq!(partition.offset_frontier(), 0, "nothing minted locally");
@@ -20495,7 +21415,6 @@ mod tests {
 
         fn set_connection_lost_fn(&self, _f: message_bus::ConnectionLostFn) {}
         fn set_replica_forward_fn(&self, _f: message_bus::ReplicaForwardFn) {}
-        fn set_client_forward_fn(&self, _f: message_bus::ClientForwardFn) {}
     }
 
     pub(super) type SentFrames = Rc<RefCell<Vec<(u128, Frozen<MESSAGE_ALIGN>)>>>;
@@ -20765,7 +21684,10 @@ mod tests {
         let mut conclusion = RepairConclusion::InProgress;
         for _ in 0..COMPLETION_STEPS_MAX {
             conclusion = replica.complete_repair(&config).await;
-            persistence.drain_with_timeout().await.unwrap();
+            persistence
+                .drain_with_timeout(compio::runtime::time::sleep)
+                .await
+                .unwrap();
             replica.drive_persistence().await;
             if conclusion == RepairConclusion::Done {
                 break;
@@ -21229,7 +22151,10 @@ mod tests {
                                 );
                             }
                             if let Some(persistence) = &persistence {
-                                persistence.drain_with_timeout().await.unwrap();
+                                persistence
+                                    .drain_with_timeout(compio::runtime::time::sleep)
+                                    .await
+                                    .unwrap();
                                 assert!(partition.send_prepare_ok(&header).await);
                             }
                             partition.consensus().advance_commit_max(op);
@@ -21477,7 +22402,10 @@ mod tests {
         assert_eq!(persistence.head(), 2);
         assert_eq!(backup.consensus().sequencer().current_sequence(), 2);
         assert!(persistence.failure().is_none());
-        persistence.drain_with_timeout().await.unwrap();
+        persistence
+            .drain_with_timeout(compio::runtime::time::sleep)
+            .await
+            .unwrap();
         assert!(persistence.is_durable_through(2));
         backup.drive_persistence().await;
         assert!(
@@ -21495,6 +22423,133 @@ mod tests {
                 }),
             "the parked ack must be delivered without a prepare retransmit"
         );
+    }
+
+    /// The primary sends prepares before it commits any, so this backup's WAL
+    /// fills and refuses the last two, which stay journaled. The cluster then
+    /// commits past the WAL head. The backup must not commit past its WAL
+    /// head, and its own maintenance must reclaim the WAL so the refused
+    /// prepares persist and commit, with no capacity released from outside.
+    #[compio::test]
+    async fn given_full_backup_wal_when_cluster_commits_past_its_head_should_reclaim_and_catch_up()
+    {
+        // Four bodies of this size fit the smallest WAL, and a fifth does not.
+        const PAYLOAD_BYTES: usize = 30 * 1024 * 1024;
+        const WAL_HEAD: u64 = 4;
+        const OPS: u64 = WAL_HEAD + 2;
+        const ROUNDS_MAX: usize = 16;
+        let payload = vec![0; PAYLOAD_BYTES];
+        for durability in [
+            iggy_common::Durability::Replicated,
+            iggy_common::Durability::Persisted,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            // Checkpoints sync the segment paths the layout names.
+            let mut config = repair_config();
+            config.path_layout.streams_root = directory.path().to_string_lossy().into_owned();
+            let partition_dir = config.get_partition_path(1, 1, 0);
+            std::fs::create_dir_all(&partition_dir).unwrap();
+            let (mut backup, _) = recording_partition_at(1, 3);
+            set_offset_dirs_under(&mut backup, std::path::Path::new(&partition_dir));
+            backup.set_partition_dir(partition_dir);
+            backup.runtime_options.durability = durability;
+            backup.log.retire_front().unwrap();
+            backup.install_empty_segment(&config, 0).await.unwrap();
+            backup
+                .open_persistence_with_capacity(
+                    journal::partition_journal::PARTITION_WAL_CAPACITY_MIN,
+                    std::time::Duration::ZERO,
+                )
+                .await
+                .unwrap();
+            backup.set_io_notifier(
+                Rc::new(|_, _| {}),
+                crate::largest_legal_job_charge().unwrap(),
+            );
+            let completions = Rc::new(RefCell::new(Vec::new()));
+            let captured = Rc::clone(&completions);
+            backup.set_persistence_notifier(Rc::new(move |completion| {
+                captured.borrow_mut().push(completion);
+            }));
+            let persistence = Rc::clone(backup.persistence.as_ref().unwrap());
+
+            let mut parent = 0;
+            let mut frame_bytes = 0;
+            for op in 1..=OPS {
+                let prepare = checksummed_segment_prepare(op, parent, op - 1, &payload);
+                parent = prepare.header().checksum;
+                frame_bytes = prepare.as_slice().len();
+                backup.on_replicate(prepare).await;
+                backup.commit_journal(&config).await;
+                run_shard_round(&mut backup, &completions, &config).await;
+            }
+            assert_eq!(
+                backup.consensus().sequencer().current_sequence(),
+                OPS,
+                "{durability:?}: the backup journals every prepare"
+            );
+            assert_eq!(
+                persistence.head(),
+                WAL_HEAD,
+                "{durability:?}: the WAL refuses prepares past its capacity"
+            );
+            assert!(!persistence.has_capacity(frame_bytes), "{durability:?}");
+
+            // A commit heartbeat: the other backup's acks committed every op.
+            backup.consensus().advance_commit_max(OPS);
+            backup.commit_journal(&config).await;
+
+            for _ in 0..ROUNDS_MAX {
+                assert!(
+                    backup.consensus().commit_min() <= persistence.head(),
+                    "{durability:?}: commit {} passed the WAL head {}",
+                    backup.consensus().commit_min(),
+                    persistence.head()
+                );
+                if backup.consensus().commit_min() == OPS {
+                    break;
+                }
+                run_shard_round(&mut backup, &completions, &config).await;
+                assert!(
+                    backup.fatal().is_none(),
+                    "{durability:?}: {:?}",
+                    backup.fatal()
+                );
+            }
+            assert_eq!(
+                (backup.consensus().commit_min(), persistence.head()),
+                (OPS, OPS),
+                "{durability:?}: wedged with checkpoint {}, WAL capacity {}, checkpoint due {}",
+                persistence.checkpoint_op(),
+                persistence.has_capacity(frame_bytes),
+                backup.needs_persistence_checkpoint()
+            );
+            assert!(
+                persistence.checkpoint_op() >= WAL_HEAD,
+                "{durability:?}: only a checkpoint can free the full WAL"
+            );
+        }
+    }
+
+    /// One pass of the shard loop over a mounted partition: the maintenance
+    /// tick, the I/O lane, the WAL writer and its completion frames.
+    async fn run_shard_round(
+        partition: &mut IggyPartition<RecordingBus>,
+        completions: &RefCell<Vec<PersistenceCompletion>>,
+        config: &PartitionsConfig,
+    ) {
+        if partition.needs_persistence_checkpoint() {
+            partition.checkpoint_persistence(config).await;
+        }
+        settle_partition_io(partition, config).await;
+        let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+        persistence
+            .drain_with_timeout(compio::runtime::time::sleep)
+            .await
+            .unwrap();
+        for completion in completions.take() {
+            partition.on_persistence_completed(completion, config).await;
+        }
     }
 
     #[compio::test]
@@ -21789,7 +22844,10 @@ mod tests {
                 crate::PartitionIoStep::Progress => {}
                 crate::PartitionIoStep::Pending => {
                     if let Some(persistence) = &partition.persistence {
-                        persistence.drain_with_timeout().await.unwrap();
+                        persistence
+                            .drain_with_timeout(compio::runtime::time::sleep)
+                            .await
+                            .unwrap();
                     } else {
                         compio::time::sleep(std::time::Duration::from_millis(1)).await;
                     }
@@ -22018,7 +23076,7 @@ mod tests {
                         .persistence
                         .as_ref()
                         .unwrap()
-                        .drain_with_timeout()
+                        .drain_with_timeout(compio::runtime::time::sleep)
                         .await
                         .unwrap();
                 }
@@ -23922,6 +24980,262 @@ mod tests {
         );
     }
 
+    #[compio::test]
+    async fn given_durable_adopted_partition_headers_when_reopening_should_keep_body_certification_separate()
+     {
+        const BACKUP: u8 = 1;
+        const ADOPTED: u32 = 2;
+        const HELD: u64 = 1;
+        const HEAD: u64 = 3;
+        let directory = tempfile::tempdir().unwrap();
+        let (config, mut partition) = replica_with_prepare_history(directory.path(), BACKUP).await;
+        let partition_dir = config.get_partition_path(1, 1, 0);
+        let store = Rc::new(PingPongSuperblock::open(&partition_dir).await.unwrap());
+        partition.set_superblock(store.clone(), None);
+        let held = checksummed_segment_prepare(HELD, 0, 0, b"retained");
+        partition.on_replicate(held.clone()).await;
+        let persistence = partition.persistence.as_ref().unwrap().clone();
+        persistence
+            .drain_with_timeout(compio::runtime::time::sleep)
+            .await
+            .unwrap();
+        assert_eq!(persistence.head(), HELD);
+        assert_eq!(persistence.certified_log_view(), Some(0));
+        assert!(
+            partition
+                .complete_superblock_intent(SuperblockIntent::Advance {
+                    frontier: partition.offset_frontier(),
+                    reserved: 0
+                })
+                .await
+        );
+        let mut parent = *held.header();
+        let mut headers = Vec::new();
+        for op in HELD + 1..=HEAD {
+            let mut header = PrepareHeader {
+                op,
+                request: op,
+                timestamp: op,
+                view: ADOPTED,
+                parent: parent.checksum,
+                ..parent
+            };
+            header.checksum = header.identity_checksum();
+            parent = header;
+            headers.push(header);
+        }
+        headers.reverse();
+        let start_view = Message::<iggy_binary_protocol::StartViewHeader>::new(size_of::<
+            iggy_binary_protocol::StartViewHeader,
+        >())
+        .transmute_header(|_, header: &mut iggy_binary_protocol::StartViewHeader| {
+            header.command = Command::StartView;
+            header.cluster = TEST_CLUSTER;
+            header.group = partition.namespace().inner();
+            header.view = ADOPTED;
+            header.replica = 2;
+            header.op = HEAD;
+            header.commit = HEAD - 1;
+            header.size =
+                u32::try_from(size_of::<iggy_binary_protocol::StartViewHeader>()).unwrap();
+        });
+        partition.consensus().handle_start_view(
+            consensus::PlaneKind::Partitions,
+            start_view.header(),
+            bytemuck::cast_slice(&headers),
+        );
+        assert!(partition.consensus().view_log_unproven());
+        assert!(
+            partition.persist_superblock_if_needed().await,
+            "DVC identity can persist while the adopted bodies are missing"
+        );
+        assert_eq!(persistence.certified_log_view(), Some(0));
+        assert!(!partition.register_rebuilt_ack(&headers[0]));
+        let segment_size = partition.log.active_segment().max_size;
+        drop(persistence);
+        drop(partition);
+        drop(store);
+
+        let (store, latest) = PingPongSuperblock::open_with_latest(&partition_dir)
+            .await
+            .unwrap();
+        let journal::superblock::SuperblockContents::Present(bytes) = latest else {
+            panic!("adopted record must be durable");
+        };
+        let state = consensus::VsrState::try_from(bytes.as_slice()).unwrap();
+        assert_eq!(state.log_view, 0);
+        state
+            .validate_group(IggyNamespace::new(1, 1, 0).inner(), 0)
+            .unwrap();
+        let (mut reopened, _) = recording_partition_at(BACKUP, 3);
+        reopened.consensus.set_view(state.view);
+        reopened.consensus.set_log_view(state.log_view);
+        reopened
+            .consensus
+            .mark_superblock_durable(state.view, state.log_view);
+        reopened.set_superblock(Rc::new(store), Some(&state));
+        reopened.set_partition_dir(partition_dir);
+        reopened.log.active_segment_mut().max_size = segment_size;
+        // Open the files already referenced by the WAL; creating an empty segment
+        // would erase the retained body this restart is meant to preserve.
+        reopened.open_persistence().await.unwrap();
+        assert!(!reopened.requires_state_transfer());
+        let persistence = reopened.persistence.as_ref().unwrap();
+        assert_eq!(persistence.head(), HELD);
+        assert_eq!(persistence.checksum(HELD), Some(held.header().checksum));
+        assert_eq!(persistence.certified_log_view(), Some(0));
+        assert_eq!(
+            reopened.consensus().adopted_view_head(),
+            Some((ADOPTED, HEAD))
+        );
+        assert_eq!(reopened.consensus().log_view_claim(), ADOPTED);
+        assert_eq!(reopened.consensus().sequencer().current_sequence(), HEAD);
+        assert!(reopened.consensus().view_log_unproven());
+        assert!(!reopened.consensus().view_log_entry_proven(HEAD));
+        assert!(!reopened.register_rebuilt_ack(&headers[0]));
+    }
+
+    /// The WAL drops a divergent run before the journal does. The canonical
+    /// tail cannot extend that WAL branch and exists only in the journal.
+    /// A crash before refill leaves the committed prefix uncertified,
+    /// so the replica claims no commit point and waits for a state transfer.
+    #[compio::test]
+    async fn given_a_crash_after_a_divergent_run_truncation_when_reopening_should_keep_the_committed_prefix_and_await_a_transfer()
+     {
+        const BACKUP: u8 = 1;
+        const APPLIED: u64 = 2;
+        const FIRST: u64 = APPLIED + 1;
+        const LAST: u64 = FIRST + 1;
+        const HEAD: u64 = LAST + 2;
+        const TRUNCATION_STEPS_MAX: usize = 8;
+        const COMMIT_ROUNDS_MAX: usize = 8;
+        let parents = segment_chain_parents(HEAD, b"canonical");
+        let canonical: Vec<_> = (1..=HEAD)
+            .map(|op| {
+                let parent = parents[usize::try_from(op - 1).unwrap()];
+                checksummed_segment_prepare(op, parent, op - 1, b"canonical")
+            })
+            .collect();
+        let mut parent = canonical[usize::try_from(APPLIED - 1).unwrap()]
+            .header()
+            .checksum;
+        let stale: Vec<_> = (FIRST..=LAST)
+            .map(|op| {
+                let prepare = checksummed_segment_prepare(op, parent, op - 1, b"stale");
+                parent = prepare.header().checksum;
+                prepare
+            })
+            .collect();
+
+        for deferred in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let (config, mut partition) =
+                replica_with_prepare_history(directory.path(), BACKUP).await;
+            let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+            for prepare in canonical
+                .iter()
+                .take(usize::try_from(APPLIED).unwrap())
+                .chain(&stale)
+            {
+                partition.on_replicate(prepare.clone()).await;
+            }
+            partition.consensus().advance_commit_max(APPLIED);
+            for _ in 0..COMMIT_ROUNDS_MAX {
+                partition.commit_journal(&config).await;
+                persistence
+                    .drain_with_timeout(compio::runtime::time::sleep)
+                    .await
+                    .unwrap();
+                partition.drive_persistence().await;
+                if partition.consensus().commit_min() == APPLIED {
+                    break;
+                }
+            }
+            assert_eq!(partition.consensus().commit_min(), APPLIED);
+            assert_eq!(persistence.head(), LAST, "the WAL holds the stale run");
+            for prepare in canonical.iter().skip(usize::try_from(LAST).unwrap()) {
+                partition
+                    .log
+                    .journal()
+                    .inner
+                    .append(prepare.clone().into_frozen())
+                    .await
+                    .unwrap();
+            }
+            let segment_size = partition.log.active_segment().max_size;
+            // Fails the resident removal after the WAL truncation is durable.
+            partition.log.active_segment_mut().size = IggyByteSize::from(u64::MAX);
+
+            if deferred {
+                partition.defer_view_truncation(FIRST..=LAST, Vec::new(), None);
+                for _ in 0..TRUNCATION_STEPS_MAX {
+                    if !partition.view_truncation_pending() {
+                        break;
+                    }
+                    partition.resume_io(&config).await;
+                    persistence
+                        .drain_with_timeout(compio::runtime::time::sleep)
+                        .await
+                        .unwrap();
+                }
+                assert!(!partition.view_truncation_pending());
+            } else {
+                assert!(
+                    partition
+                        .remove_divergent_prepares(FIRST..=LAST)
+                        .await
+                        .is_err()
+                );
+            }
+            assert_eq!(persistence.head(), APPLIED, "deferred {deferred}");
+            assert!(
+                (FIRST..=HEAD).all(|op| partition.log.journal().inner.holds_op(op)),
+                "deferred {deferred}: the crash comes before the journal removed anything"
+            );
+            drop(persistence);
+            drop(partition);
+
+            let (mut reopened, _) = recording_partition_at(BACKUP, 3);
+            reopened.set_partition_dir(config.get_partition_path(1, 1, 0));
+            reopened.log.active_segment_mut().max_size = segment_size;
+            // Reuse the files the WAL references; installing an empty segment
+            // here would truncate the committed message bodies before recovery.
+            reopened.open_persistence().await.unwrap();
+            let wal = reopened.persistence.as_ref().unwrap();
+            assert_eq!(
+                wal.head(),
+                APPLIED,
+                "deferred {deferred}: no op above the committed prefix"
+            );
+            for prepare in canonical.iter().take(usize::try_from(APPLIED).unwrap()) {
+                let header = prepare.header();
+                assert_eq!(
+                    wal.checksum(header.op),
+                    Some(header.checksum),
+                    "deferred {deferred}: committed op {} must stay in the WAL",
+                    header.op
+                );
+            }
+            assert!(reopened.requires_state_transfer(), "deferred {deferred}");
+            assert_eq!(
+                (
+                    reopened.consensus().status(),
+                    reopened.consensus().state_transfer_stage(),
+                ),
+                (
+                    consensus::Status::Recovering,
+                    consensus::StateTransferStage::AwaitingTarget,
+                ),
+                "deferred {deferred}"
+            );
+            assert_eq!(
+                reopened.consensus().commit_min(),
+                0,
+                "deferred {deferred}: the old certificate cannot vouch for the prefix"
+            );
+        }
+    }
+
     /// Replicate `origin`'s ops through `commit_op` to a replica that keeps
     /// prepare history under `root`, checkpoint them, and restart that replica.
     async fn restarted_replica_of(
@@ -23935,7 +25249,10 @@ mod tests {
         let persistence = Rc::clone(donor.persistence.as_ref().unwrap());
         persistence.request_checkpoint();
         donor.checkpoint_persistence(&config).await;
-        persistence.drain_with_timeout().await.unwrap();
+        persistence
+            .drain_with_timeout(compio::runtime::time::sleep)
+            .await
+            .unwrap();
         assert!(donor.fatal().is_none(), "{:?}", donor.fatal());
         assert_eq!(persistence.checkpoint_op(), commit_op);
         drop(persistence);
@@ -23963,7 +25280,10 @@ mod tests {
         // Each applied op waits on persistence, so drive it between commits.
         for _ in 0..COMMIT_ROUNDS_MAX {
             replica.commit_journal(config).await;
-            persistence.drain_with_timeout().await.unwrap();
+            persistence
+                .drain_with_timeout(compio::runtime::time::sleep)
+                .await
+                .unwrap();
             replica.drive_persistence().await;
             if replica.consensus().commit_min() == commit_op {
                 break;
@@ -24092,7 +25412,10 @@ mod tests {
 
         persistence.request_checkpoint();
         partition.checkpoint_persistence(&config).await;
-        persistence.drain_with_timeout().await.unwrap();
+        persistence
+            .drain_with_timeout(compio::runtime::time::sleep)
+            .await
+            .unwrap();
 
         assert!(partition.fatal().is_none());
         assert!(persistence.failure().is_none());
@@ -24216,7 +25539,7 @@ mod tests {
     #[compio::test]
     async fn given_queued_group_store_when_its_owner_is_replaced_should_refuse_it_at_promotion() {
         const GROUP_ID: u32 = 7;
-        const CLIENT_ID: u128 = 42;
+        const CLIENT_ID: u128 = (1 << 64) + 42;
         let mut partition = test_partition();
         partition.stats.increment_messages_count(1);
         install_test_owner(&mut partition, u64::from(GROUP_ID), CLIENT_ID).await;
@@ -24253,9 +25576,36 @@ mod tests {
         );
         assert_eq!(
             receiver.await.unwrap().header().status,
-            IggyError::ConsumerGroupPartitionNotOwned(GROUP_ID, 0).as_code()
+            IggyError::ConsumerGroupPartitionNotOwned(replaced.client_id, 0).as_code()
         );
         assert!(partition.fatal().is_none(), "{:?}", partition.fatal());
+    }
+
+    #[compio::test]
+    async fn given_queued_auto_commit_when_already_covered_should_reply_with_committed_proof() {
+        const CONSUMER_ID: u32 = 7;
+        let mut partition = test_partition();
+        partition.stats.increment_messages_count(1);
+        let store = partition
+            .build_poll_auto_commit_request(ConsumerKind::Consumer, CONSUMER_ID, 0)
+            .unwrap();
+        let (sender, receiver) = consensus::oneshot_channel();
+        assert!(
+            partition
+                .consensus
+                .push_queued_request(consensus::RequestEntry::with_sender(store, Some(sender)))
+                .is_ok()
+        );
+        partition.seed_recovered_consumer_offset(ConsumerKind::Consumer, CONSUMER_ID, 0, 0);
+        let head = partition.consensus.sequencer().current_sequence();
+
+        partition.drain_request_queue_into_prepares(1).await;
+
+        let reply = receiver.await.unwrap();
+        assert_eq!(reply.header().status, 0);
+        assert!(reply.header().has_committed_result());
+        assert_eq!(partition.consensus.sequencer().current_sequence(), head);
+        assert!(partition.consensus.pop_queued_request().is_none());
     }
 
     #[compio::test]
@@ -25243,7 +26593,10 @@ mod tests {
                 if partition.shutdown_io_complete() {
                     break;
                 }
-                persistence.drain_with_timeout().await.unwrap();
+                persistence
+                    .drain_with_timeout(compio::runtime::time::sleep)
+                    .await
+                    .unwrap();
             }
             assert!(
                 partition.shutdown_io_complete(),
@@ -26726,6 +28079,97 @@ mod tests {
         ));
     }
 
+    #[compio::test]
+    async fn given_no_reply_owner_when_partition_commits_should_not_fire_http_slot() {
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let consensus = VsrConsensus::new(
+            TEST_CLUSTER,
+            0,
+            1,
+            namespace.inner(),
+            Rc::clone(&bus),
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let mut partition: IggyPartition<Rc<IggyMessageBus>> =
+            IggyPartition::with_in_memory_storage(
+                Arc::new(PartitionStats::default()),
+                consensus,
+                IggyByteSize::from(1024 * 1024),
+            );
+        let mut request = checksumless_send_request(namespace, 1);
+        request.as_mut_slice()[size_of::<RoutedRequestHeader>()..]
+            .copy_from_slice(&build_segment_record(namespace, 0));
+        let header = *request.header();
+        bus.clients().insert_in_process(header.client).unwrap();
+        let (_slot, mut receiver) = bus
+            .clients()
+            .install_reply_slot(header.client, header.request)
+            .unwrap();
+        partition.on_request(request.clone(), None).await;
+        assert_eq!(partition.consensus.pipeline_len(), 1);
+        partition.consensus.advance_commit_max(1);
+        partition.commit_journal(&repair_config()).await;
+        assert!(partition.fatal.is_none(), "{:?}", partition.fatal);
+        assert_eq!(partition.consensus.commit_min(), 1);
+        assert!(
+            matches!(receiver.try_recv(), Ok(None)),
+            "a committed reply without its owner must not fill an HTTP slot"
+        );
+        let (reply, answered) = consensus::oneshot_channel();
+        partition.on_request(request, Some(reply)).await;
+        let replay = answered.await.unwrap();
+        assert_eq!(replay.header().status, 0);
+        assert_eq!(replay.header().op, 1);
+        assert!(
+            matches!(receiver.try_recv(), Ok(None)),
+            "the legitimate replay answers its carried receiver"
+        );
+    }
+
+    #[compio::test]
+    async fn given_no_reply_owner_when_partition_denies_should_not_fire_http_slot() {
+        const CLIENT: u128 = 42;
+        const REQUEST: u64 = 7;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let consensus = VsrConsensus::new(
+            TEST_CLUSTER,
+            0,
+            1,
+            namespace.inner(),
+            Rc::clone(&bus),
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let mut partition: IggyPartition<Rc<IggyMessageBus>> =
+            IggyPartition::with_in_memory_storage(
+                Arc::new(PartitionStats::default()),
+                consensus,
+                IggyByteSize::from(1024 * 1024),
+            );
+        bus.clients().insert_in_process(CLIENT).unwrap();
+        let (_slot, mut receiver) = bus.clients().install_reply_slot(CLIENT, REQUEST).unwrap();
+        partition
+            .on_request(delete_offset_request(CLIENT, REQUEST, 5), None)
+            .await;
+        assert_eq!(partition.consensus().pipeline_len(), 0);
+        assert!(
+            matches!(receiver.try_recv(), Ok(None)),
+            "an originless denial must not take another request's slot"
+        );
+        let (reply, answered) = consensus::oneshot_channel();
+        partition
+            .on_request(delete_offset_request(CLIENT, REQUEST, 5), Some(reply))
+            .await;
+        assert_eq!(
+            answered.await.unwrap().header().status,
+            IggyError::ConsumerOffsetNotFound(0).as_code()
+        );
+        assert!(matches!(receiver.try_recv(), Ok(None)));
+    }
+
     /// Deleting a consumer offset that was never stored must answer with a
     /// typed deny reply (empty body, `status` = `ConsumerOffsetNotFound`,
     /// `op` 0) before consensus: nothing may enter the pipeline, and an
@@ -27854,18 +29298,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A simulated (file-less) partition has no segment files by design, so a
-    /// disk poll with no dir must stay `Empty`: the caller then serves the
-    /// resident journal tier, the sim's only tier.
-    #[compio::test]
-    async fn read_disk_serves_journal_when_partition_has_no_files() {
-        let plan = DiskReadPlan {
+    /// A disk plan over one segment of a simulated (file-less) partition that
+    /// persisted `persisted` bytes.
+    fn file_less_plan(persisted: u64) -> DiskReadPlan {
+        DiskReadPlan {
             partition_dir: PartitionDirResolution::NoFiles,
             bytes_per_message: None,
             widest_batch_bytes: 0,
             segments: vec![DiskSegment {
                 start_offset: 0,
-                persisted: 512,
+                persisted,
                 read_state: SealedSegmentHandle::default(),
                 sealed: false,
             }],
@@ -27873,9 +29315,15 @@ mod tests {
             start_index_offset: None,
             namespace_raw: IggyNamespace::new(1, 1, 0).inner(),
             validate_checksum: true,
-        };
+        }
+    }
 
-        let outcome = plan
+    /// A simulated (file-less) partition has no segment files by design. Until
+    /// a flush persists anything, the journal is its only tier, so a disk poll
+    /// must stay `Empty` and the caller serves the journal.
+    #[compio::test]
+    async fn read_disk_serves_journal_when_partition_has_no_files() {
+        let outcome = file_less_plan(0)
             .read_disk(MessageLookup::Offset {
                 offset: 0,
                 count: 10,
@@ -27886,6 +29334,26 @@ mod tests {
         assert!(
             matches!(outcome, DiskReadOutcome::Empty),
             "file-less (simulated) storage must serve the journal tier, not fault",
+        );
+    }
+
+    /// A flush evicts what it persisted from the journal, and a file-less
+    /// partition cannot read those bytes back. Serving the journal forward
+    /// would answer a poll below the resident tail with that tail and skip the
+    /// flushed offsets, so the poll must fail closed.
+    #[compio::test]
+    async fn read_disk_faults_closed_when_file_less_partition_flushed() {
+        let outcome = file_less_plan(512)
+            .read_disk(MessageLookup::Offset {
+                offset: 0,
+                count: 10,
+                ceiling: u64::MAX,
+            })
+            .await;
+
+        assert!(
+            matches!(outcome, DiskReadOutcome::Faulted),
+            "flushed offsets of a file-less partition must fault-close, not serve the journal",
         );
     }
 
@@ -28615,11 +30083,18 @@ mod tests {
             ..armed_session(COMMIT_TO_OP, 0)
         });
         let config = repair_config();
+        let parents = segment_chain_parents(COMMIT_TO_OP, b"repaired");
 
         for round in 0..ROUNDS {
             for op in backup.consensus().commit_min() + 1..=COMMIT_TO_OP {
+                let parent = parents[usize::try_from(op - 1).unwrap()];
                 backup
-                    .apply_repaired_prepare(checksummed_segment_prepare(op, 0, op - 1, b"repaired"))
+                    .apply_repaired_prepare(checksummed_segment_prepare(
+                        op,
+                        parent,
+                        op - 1,
+                        b"repaired",
+                    ))
                     .await;
             }
             backup.commit_journal(&config).await;
@@ -29426,9 +30901,16 @@ mod tests {
         ops: std::ops::RangeInclusive<u64>,
         first_offset: u64,
     ) {
+        let parents = segment_chain_parents(*ops.end(), b"repaired");
         for (op, offset) in ops.zip(first_offset..) {
+            let parent = parents[usize::try_from(op - 1).unwrap()];
             backup
-                .apply_repaired_prepare(checksummed_segment_prepare(op, 0, offset, b"repaired"))
+                .apply_repaired_prepare(checksummed_segment_prepare(
+                    op,
+                    parent,
+                    offset,
+                    b"repaired",
+                ))
                 .await;
         }
     }
@@ -30023,7 +31505,10 @@ mod tests {
             let persistence = backup.persistence.as_ref().unwrap();
             persistence.sync();
             backup.start_persistence();
-            persistence.drain_with_timeout().await.unwrap();
+            persistence
+                .drain_with_timeout(compio::runtime::time::sleep)
+                .await
+                .unwrap();
             assert!(persistence.is_durable_through(1), "{durability:?}");
             drop(backup);
 
@@ -30688,7 +32173,7 @@ mod tests {
         partition.log.journal().inner.set_repair_retention(true);
         partition.repair = Some(armed_session(4, 0));
         let prepares: Vec<_> = (1..=4)
-            .map(|op| repaired_send_prepare(op, 0, u128::from(op)).into_frozen())
+            .map(|op| repaired_send_prepare(op, u128::from(op - 1), u128::from(op)).into_frozen())
             .collect();
         let replay = |op: usize| {
             let bytes = prepares[op - 1].as_slice();
@@ -30768,7 +32253,11 @@ mod tests {
         partition.repair = Some(armed_session(6, 0));
         for op in [1, 2, 3, 6] {
             partition
-                .apply_repaired_prepare(repaired_send_prepare(op, 0, u128::from(op)))
+                .apply_repaired_prepare(repaired_send_prepare(
+                    op,
+                    u128::from(op - 1),
+                    u128::from(op),
+                ))
                 .await;
         }
         partition.consensus().advance_commit_max(6);
@@ -30786,7 +32275,11 @@ mod tests {
 
         for op in [4, 5] {
             partition
-                .apply_repaired_prepare(repaired_send_prepare(op, 0, u128::from(op)))
+                .apply_repaired_prepare(repaired_send_prepare(
+                    op,
+                    u128::from(op - 1),
+                    u128::from(op),
+                ))
                 .await;
         }
         partition
@@ -30814,7 +32307,11 @@ mod tests {
         partition.repair = Some(armed_session(6, 0));
         for op in [1, 2, 3, 6, 4, 5] {
             partition
-                .apply_repaired_prepare(repaired_send_prepare(op, 0, u128::from(op)))
+                .apply_repaired_prepare(repaired_send_prepare(
+                    op,
+                    u128::from(op - 1),
+                    u128::from(op),
+                ))
                 .await;
         }
         partition.consensus().advance_commit_max(6);
@@ -31069,11 +32566,12 @@ mod tests {
         const OPS: u64 = COMMIT_WALK_OPS_MAX as u64 + 1;
         let mut partition = test_partition();
         let record_len = build_segment_record(IggyNamespace::new(1, 1, 0), 1).len() as u64;
+        let chained = |op: u64| if op == 1 { 0 } else { CHECKSUM };
         partition.repair = Some(armed_session(OPS, 0));
 
         for op in 1..=OPS {
             partition
-                .apply_repaired_prepare(repaired_send_prepare(op, 0, CHECKSUM))
+                .apply_repaired_prepare(repaired_send_prepare(op, chained(op), CHECKSUM))
                 .await;
         }
         partition.consensus().advance_commit_max(OPS);
@@ -31108,7 +32606,7 @@ mod tests {
 
         partition.repair = Some(armed_session(OPS, 0));
         partition
-            .apply_repaired_prepare(repaired_send_prepare(OPS, 0, CHECKSUM))
+            .apply_repaired_prepare(repaired_send_prepare(OPS, chained(OPS), CHECKSUM))
             .await;
         partition.commit_journal(&repair_config()).await;
         assert_eq!(

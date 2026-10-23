@@ -21,15 +21,14 @@ use crate::clients::MAX_BATCH_LENGTH;
 use crate::clients::producer_builder::SendMode;
 use crate::clients::producer_config::DirectConfig;
 use crate::clients::producer_dispatcher::ProducerDispatcher;
-use crate::driver::{operation_deadline, with_deadline};
-use crate::links::OPERATION_TIMEOUT;
+use crate::driver::operation_deadline;
 use bytes::Bytes;
 use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::{BinarySendPartitioning, Client, StreamClient, TopicClient, TopicCreateOptions};
 use iggy_common::{
     Durability, EncryptorKind, IdKind, Identifier, IggyError, IggyExpiry, IggyMessage,
     IggyTimestamp, MaxTopicSize, Partitioner, Partitioning, SendMessagesConfirmationResponse,
-    SendMessagesResponse,
+    SendMessagesResponse, with_binary_lineage,
 };
 use std::collections::HashSet;
 use std::num::NonZeroU32;
@@ -37,7 +36,7 @@ use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
-use tokio::time::{Instant, sleep, timeout_at};
+use tokio::time::{sleep, timeout_at};
 use tracing::{error, info, trace};
 
 #[cfg(test)]
@@ -66,7 +65,7 @@ pub(crate) fn no_confirmations() -> SendMessagesResponse {
 
 pub struct ProducerCore {
     initialized: AtomicBool,
-    client: Arc<IggyRwLock<ClientWrapper>>,
+    client: IggyRwLock<ClientWrapper>,
     stream_id: Arc<Identifier>,
     stream_name: String,
     topic_id: Arc<Identifier>,
@@ -95,72 +94,74 @@ impl ProducerCore {
         let stream_id = self.stream_id.clone();
         let topic_id = self.topic_id.clone();
         info!("Initializing producer for stream: {stream_id} and topic: {topic_id}...");
-        let client = self.client.clone();
-        let client = client.read().await;
-        if client.get_stream(&stream_id).await?.is_none() {
-            let name = match stream_id.kind {
-                IdKind::String => stream_id.get_string_value()?,
-                IdKind::Numeric => {
-                    error!(
-                        "Stream: {stream_id} does not exist and cannot be created from a numeric identifier."
-                    );
-                    return Err(IggyError::StreamIdNotFound(Identifier::from_identifier(
+        let client = self.client.read().await;
+        with_binary_lineage(client.operation_lineage().await, async {
+            if client.get_stream(&stream_id).await?.is_none() {
+                let name = match stream_id.kind {
+                    IdKind::String => stream_id.get_string_value()?,
+                    IdKind::Numeric => {
+                        error!(
+                            "Stream: {stream_id} does not exist and cannot be created from a numeric identifier."
+                        );
+                        return Err(IggyError::StreamIdNotFound(Identifier::from_identifier(
+                            &stream_id,
+                        )));
+                    }
+                };
+
+                if !self.create_stream_if_not_exists {
+                    error!("Stream does not exist and auto-creation is disabled.");
+                    return Err(IggyError::StreamNameNotFound(name));
+                }
+
+                info!("Creating stream: {name}");
+                client.create_stream(&name).await?;
+            }
+
+            if client.get_topic(&stream_id, &topic_id).await?.is_none() {
+                let name = match topic_id.kind {
+                    IdKind::String => topic_id.get_string_value()?,
+                    IdKind::Numeric => {
+                        error!(
+                            "Topic: {topic_id} does not exist and cannot be created from a numeric identifier."
+                        );
+                        return Err(IggyError::TopicIdNotFound(
+                            Identifier::from_identifier(&topic_id),
+                            Identifier::from_identifier(&stream_id),
+                        ));
+                    }
+                };
+
+                if !self.create_topic_if_not_exists {
+                    error!("Topic does not exist and auto-creation is disabled.");
+                    return Err(IggyError::TopicNameNotFound(name, stream_id.to_string()));
+                }
+
+                info!("Creating topic: {name} for stream: {stream_id}");
+                client
+                    .create_topic(
                         &stream_id,
-                    )));
-                }
-            };
-
-            if !self.create_stream_if_not_exists {
-                error!("Stream does not exist and auto-creation is disabled.");
-                return Err(IggyError::StreamNameNotFound(name));
+                        &name,
+                        &TopicCreateOptions {
+                            partitions_count: Some(self.topic_partitions_count),
+                            message_expiry: (self.topic_message_expiry != IggyExpiry::ServerDefault)
+                                .then_some(self.topic_message_expiry),
+                            max_topic_size: (self.topic_max_size != MaxTopicSize::ServerDefault)
+                                .then_some(self.topic_max_size),
+                            durability: self.topic_durability,
+                            ..TopicCreateOptions::default()
+                        },
+                    )
+                    .await?;
             }
 
-            info!("Creating stream: {name}");
-            client.create_stream(&name).await?;
-        }
-
-        if client.get_topic(&stream_id, &topic_id).await?.is_none() {
-            let name = match topic_id.kind {
-                IdKind::String => topic_id.get_string_value()?,
-                IdKind::Numeric => {
-                    error!(
-                        "Topic: {topic_id} does not exist and cannot be created from a numeric identifier."
-                    );
-                    return Err(IggyError::TopicIdNotFound(
-                        Identifier::from_identifier(&topic_id),
-                        Identifier::from_identifier(&stream_id),
-                    ));
-                }
-            };
-
-            if !self.create_topic_if_not_exists {
-                error!("Topic does not exist and auto-creation is disabled.");
-                return Err(IggyError::TopicNameNotFound(name, stream_id.to_string()));
-            }
-
-            info!("Creating topic: {name} for stream: {stream_id}");
-            client
-                .create_topic(
-                    &stream_id,
-                    &name,
-                    &TopicCreateOptions {
-                        partitions_count: Some(self.topic_partitions_count),
-                        message_expiry: (self.topic_message_expiry != IggyExpiry::ServerDefault)
-                            .then_some(self.topic_message_expiry),
-                        max_topic_size: (self.topic_max_size != MaxTopicSize::ServerDefault)
-                            .then_some(self.topic_max_size),
-                        durability: self.topic_durability,
-                        ..TopicCreateOptions::default()
-                    },
-                )
-                .await?;
-        }
-
-        let _ = self
-            .initialized
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst);
-        info!("Producer has been initialized for stream: {stream_id} and topic: {topic_id}.");
-        Ok(())
+            let _ = self
+                .initialized
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst);
+            info!("Producer has been initialized for stream: {stream_id} and topic: {topic_id}.");
+            Ok(())
+        })
+        .await
     }
 
     async fn try_send_messages(
@@ -170,11 +171,8 @@ impl ProducerCore {
         partitioning: &Arc<Partitioning>,
         messages: &mut [IggyMessage],
     ) -> Result<SendMessagesResponse, IggyError> {
-        with_deadline(Instant::now() + OPERATION_TIMEOUT, async {
+        super::with_client!(self, client => {
             let deadline = operation_deadline();
-            let client = timeout_at(deadline, self.client.read())
-                .await
-                .map_err(|_| IggyError::TransientNotAccepted)?;
             timeout_at(deadline, self.prune_uncertain_operations(&client))
                 .await
                 .map_err(|_| IggyError::TransientNotAccepted)?;
@@ -206,7 +204,6 @@ impl ProducerCore {
             }
             result
         })
-        .await
     }
 
     fn uncertain_operations(&self) -> MutexGuard<'_, HashSet<u64>> {
@@ -280,18 +277,29 @@ impl ProducerCore {
         sleep(Duration::from_micros(remaining)).await;
     }
 
+    /// `sent` is the number of messages at the head of `failed` that the failed request carried.
     fn make_failed_error(
         &self,
         cause: IggyError,
         failed: Vec<IggyMessage>,
+        sent: usize,
         committed: Vec<SendMessagesConfirmationResponse>,
     ) -> IggyError {
+        let uncertain = if matches!(
+            cause,
+            IggyError::OperationUncertain(_) | IggyError::TransientNotCommitted
+        ) {
+            sent
+        } else {
+            0
+        };
         IggyError::ProducerSendFailed {
             cause: Box::new(cause),
             failed: Arc::new(failed),
+            uncertain,
             committed: Arc::new(committed),
-            stream_name: self.stream_name.clone(),
-            topic_name: self.topic_name.clone(),
+            stream_name: self.stream_name.as_str().into(),
+            topic_name: self.topic_name.as_str().into(),
         }
     }
 }
@@ -304,62 +312,77 @@ impl ProducerCoreBackend for ProducerCore {
         mut msgs: Vec<IggyMessage>,
         partitioning: Option<Arc<Partitioning>>,
     ) -> Result<SendMessagesResponse, IggyError> {
-        if msgs.is_empty() {
-            return Ok(no_confirmations());
-        }
-
-        if let Err(err) = self.encrypt_messages(&mut msgs) {
-            return Err(self.make_failed_error(err, msgs, Vec::new()));
-        }
-
-        let part = match self.get_partitioning(stream, topic, &msgs, partitioning.clone()) {
-            Ok(p) => p,
-            Err(err) => {
-                return Err(self.make_failed_error(err, msgs, Vec::new()));
+        let lineage = self.client.read().await.operation_lineage().await;
+        with_binary_lineage(lineage, async {
+            if msgs.is_empty() {
+                return Ok(no_confirmations());
             }
-        };
 
-        match &self.direct_config {
-            Some(cfg) => {
-                let linger_time_micros = cfg.linger_time.as_micros();
-                if linger_time_micros > 0 {
-                    Self::wait_before_sending(linger_time_micros, self.last_sent_at.load(ORDERING))
-                        .await;
+            if let Err(err) = self.encrypt_messages(&mut msgs) {
+                return Err(self.make_failed_error(err, msgs, 0, Vec::new()));
+            }
+
+            let part = match self.get_partitioning(stream, topic, &msgs, partitioning.clone()) {
+                Ok(p) => p,
+                Err(err) => {
+                    return Err(self.make_failed_error(err, msgs, 0, Vec::new()));
                 }
+            };
 
-                let max = NonZeroU32::new(cfg.batch_length)
-                    .unwrap_or(MAX_BATCH_LENGTH)
-                    .get() as usize;
-                let mut index = 0;
-                let mut confirmations = Vec::with_capacity(msgs.len().div_ceil(max));
-                while index < msgs.len() {
-                    let end = (index + max).min(msgs.len());
-                    let chunk = &mut msgs[index..end];
-
-                    match self.try_send_messages(stream, topic, &part, chunk).await {
-                        Ok(response) => confirmations.extend(response.confirmations),
-                        Err(err) => {
-                            let failed_tail = msgs.split_off(index);
-                            return Err(self.make_failed_error(err, failed_tail, confirmations));
-                        }
+            match &self.direct_config {
+                Some(cfg) => {
+                    let linger_time_micros = cfg.linger_time.as_micros();
+                    if linger_time_micros > 0 {
+                        Self::wait_before_sending(
+                            linger_time_micros,
+                            self.last_sent_at.load(ORDERING),
+                        )
+                        .await;
                     }
+
+                    let max = NonZeroU32::new(cfg.batch_length)
+                        .unwrap_or(MAX_BATCH_LENGTH)
+                        .get() as usize;
+                    let mut index = 0;
+                    let mut confirmations = Vec::with_capacity(msgs.len().div_ceil(max));
+                    while index < msgs.len() {
+                        let end = (index + max).min(msgs.len());
+                        let chunk = &mut msgs[index..end];
+
+                        match self.try_send_messages(stream, topic, &part, chunk).await {
+                            Ok(response) => confirmations.extend(response.confirmations),
+                            Err(err) => {
+                                let failed_tail = msgs.split_off(index);
+                                return Err(self.make_failed_error(
+                                    err,
+                                    failed_tail,
+                                    end - index,
+                                    confirmations,
+                                ));
+                            }
+                        }
+                        self.last_sent_at
+                            .store(IggyTimestamp::now().into(), ORDERING);
+                        index = end;
+                    }
+                    Ok(SendMessagesResponse { confirmations })
+                }
+                // background send on
+                _ => {
+                    let response = self
+                        .try_send_messages(stream, topic, &part, &mut msgs)
+                        .await
+                        .map_err(|err| {
+                            let sent = msgs.len();
+                            self.make_failed_error(err, msgs, sent, Vec::new())
+                        })?;
                     self.last_sent_at
                         .store(IggyTimestamp::now().into(), ORDERING);
-                    index = end;
+                    Ok(response)
                 }
-                Ok(SendMessagesResponse { confirmations })
             }
-            // background send on
-            _ => {
-                let response = self
-                    .try_send_messages(stream, topic, &part, &mut msgs)
-                    .await
-                    .map_err(|err| self.make_failed_error(err, msgs, Vec::new()))?;
-                self.last_sent_at
-                    .store(IggyTimestamp::now().into(), ORDERING);
-                Ok(response)
-            }
-        }
+        })
+        .await
     }
 }
 
@@ -575,15 +598,18 @@ unsafe impl Sync for IggyProducer {}
 /// An [`IggyConsumer`](crate::clients::consumer::IggyConsumer) on the same client
 /// resolves any blocker, including an uncertain chunk owned by this producer.
 ///
-/// `OperationUncertain(op)` identifies the first chunk of `failed`; it may
-/// already have committed. `LaneBlocked(op)` means none of `failed` was sent.
+/// `OperationUncertain(op)` identifies the first chunk of `failed`, its first
+/// `uncertain` messages; it may already have committed. `LaneBlocked(op)` means
+/// none of `failed` was sent. HTTP retains no operation, so its unknown outcome is
+/// [`IggyError::TransientNotCommitted`]: the first `uncertain` messages of `failed`
+/// may already have committed, and only a read of the partition tells.
 /// Resolving the blocker never resubmits the earlier failed chunk as a new write.
 /// [`Client::resolve_operation`] tells the caller that got `OperationUncertain(op)`
 /// the outcome of that chunk, also after a later producer or consumer call
 /// resolved `op` first. That call only frees the lane, and the client keeps the
 /// proved outcome for its owner. A chunk carries no committed rejection, so
-/// `Ok(())` is its only proved outcome, and then only the messages after that
-/// chunk still need a send.
+/// `Ok(())` is its only proved outcome, and then only the messages after the
+/// first `uncertain` still need a send.
 /// A session reset or explicit abandonment can destroy the retained result
 /// before a replay proves it.
 /// [`IggyError::OperationNotRetained`] does not prove the earlier chunk failed,
@@ -714,7 +740,7 @@ impl IggyProducer {
     ) -> Self {
         let core = Arc::new(ProducerCore {
             initialized: AtomicBool::new(false),
-            client: Arc::new(client),
+            client,
             stream_id: Arc::new(stream),
             stream_name,
             topic_id: Arc::new(topic),
@@ -793,6 +819,12 @@ impl IggyProducer {
     ///
     /// An empty `messages` vector is a no-op in both modes and returns an empty confirmation list.
     ///
+    /// A binary send keeps the caller sign-in it started with across every chunk. Background
+    /// sends capture it before waiting for buffer capacity. A later caller sign-in, sign-out, or
+    /// disconnect fails unsent work with [`IggyError::Unauthenticated`], through the error callback
+    /// for queued batches. Automatic session recovery keeps that work eligible to send. A request
+    /// that may already have applied keeps its uncertain outcome.
+    ///
     /// # Confirmations
     ///
     /// A [`SendMessagesConfirmationResponse`] names the partition a chunk of the batch landed in and
@@ -839,25 +871,7 @@ impl IggyProducer {
         &self,
         messages: Vec<IggyMessage>,
     ) -> Result<SendMessagesResponse, IggyError> {
-        if messages.is_empty() {
-            trace!("No messages to send.");
-            return Ok(no_confirmations());
-        }
-
-        let stream_id = self.core.stream_id.clone();
-        let topic_id = self.core.topic_id.clone();
-
-        match &self.dispatcher {
-            Some(disp) => disp
-                .dispatch(messages, stream_id, topic_id, None)
-                .await
-                .map(|()| no_confirmations()),
-            None => {
-                self.core
-                    .send_internal(&stream_id, &topic_id, messages, None)
-                    .await
-            }
-        }
+        self.send_with_partitioning(messages, None).await
     }
 
     /// Sends one message.
@@ -879,25 +893,13 @@ impl IggyProducer {
         messages: Vec<IggyMessage>,
         partitioning: Option<Arc<Partitioning>>,
     ) -> Result<SendMessagesResponse, IggyError> {
-        if messages.is_empty() {
-            trace!("No messages to send.");
-            return Ok(no_confirmations());
-        }
-
-        let stream_id = self.core.stream_id.clone();
-        let topic_id = self.core.topic_id.clone();
-
-        match &self.dispatcher {
-            Some(disp) => disp
-                .dispatch(messages, stream_id, topic_id, partitioning)
-                .await
-                .map(|()| no_confirmations()),
-            None => {
-                self.core
-                    .send_internal(&stream_id, &topic_id, messages, partitioning)
-                    .await
-            }
-        }
+        self.send_to(
+            self.core.stream_id.clone(),
+            self.core.topic_id.clone(),
+            messages,
+            partitioning,
+        )
+        .await
     }
 
     /// Sends `messages` to any stream and topic, not only the pair this producer was built for.
@@ -919,17 +921,21 @@ impl IggyProducer {
             return Ok(no_confirmations());
         }
 
-        match &self.dispatcher {
-            Some(disp) => disp
-                .dispatch(messages, stream, topic, partitioning)
-                .await
-                .map(|()| no_confirmations()),
-            None => {
-                self.core
-                    .send_internal(&stream, &topic, messages, partitioning)
+        let lineage = self.core.client.read().await.operation_lineage().await;
+        with_binary_lineage(lineage, async {
+            match &self.dispatcher {
+                Some(disp) => disp
+                    .dispatch(messages, stream, topic, partitioning)
                     .await
+                    .map(|()| no_confirmations()),
+                None => {
+                    self.core
+                        .send_internal(&stream, &topic, messages, partitioning)
+                        .await
+                }
             }
-        }
+        })
+        .await
     }
 
     /// Shuts the producer down.
@@ -953,7 +959,10 @@ mod tests {
     use super::IggyProducer;
     use crate::client_wrappers::client_wrapper::ClientWrapper;
     use crate::clients::producer_builder::IggyProducerBuilder;
-    use crate::clients::producer_config::DirectConfig;
+    use crate::clients::producer_config::{BackgroundConfig, DirectConfig};
+    use crate::clients::producer_error_callback::{ErrorCallback, ErrorCtx};
+    use crate::clients::producer_sharding::ShardMessage;
+    use crate::driver::with_deadline;
     use crate::http::http_client::HttpClient;
     use crate::links::OPERATION_TIMEOUT;
     use crate::links::fake_cluster::{
@@ -961,15 +970,23 @@ mod tests {
     };
     use crate::tcp::tcp_client::TcpClient;
     use bytes::Bytes;
-    use iggy_binary_protocol::codes::{GET_TOPIC_CODE, SEND_MESSAGES_CODE};
+    use iggy_binary_protocol::codes::{
+        CREATE_STREAM_CODE, GET_STREAM_CODE, GET_TOPIC_CODE, LOGIN_REGISTER_CODE,
+        SEND_MESSAGES_CODE,
+    };
     use iggy_binary_protocol::requests::messages::SendMessagesHeader;
     use iggy_binary_protocol::responses::messages::{
         PartitionRouteResponse, SendMessagesConfirmationResponse,
         SendMessagesResponse as WireSendMessagesResponse,
     };
-    use iggy_binary_protocol::{WireDecode, WireEncode, WirePartitioning};
+    use iggy_binary_protocol::responses::streams::StreamResponse;
+    use iggy_binary_protocol::{WireDecode, WireEncode, WireName, WireOptions, WirePartitioning};
     use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
-    use iggy_common::{Client, HttpClientConfig, Identifier, IggyError, IggyMessage, Partitioning};
+    use iggy_common::{
+        Client, HttpClientConfig, Identifier, IggyDuration, IggyError, IggyMessage, Partitioning,
+        Sizeable, UserClient,
+    };
+    use std::pin::Pin;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -991,6 +1008,10 @@ mod tests {
     }
 
     fn producer_on(client: IggyRwLock<ClientWrapper>) -> IggyProducer {
+        producer_batching(client, 1)
+    }
+
+    fn producer_batching(client: IggyRwLock<ClientWrapper>, batch_length: u32) -> IggyProducer {
         IggyProducerBuilder::new(
             client,
             Identifier::numeric(1).unwrap(),
@@ -1001,7 +1022,7 @@ mod tests {
             None,
         )
         .partitioning(Partitioning::partition_id(0))
-        .direct(DirectConfig::builder().batch_length(1).build())
+        .direct(DirectConfig::builder().batch_length(batch_length).build())
         .build()
     }
 
@@ -1039,6 +1060,293 @@ mod tests {
             .await
             .resolve_operation(op, (Instant::now() + OPERATION_TIMEOUT).into_std())
             .await
+    }
+
+    #[derive(Debug)]
+    struct FailedBatches(flume::Sender<ErrorCtx>);
+
+    impl ErrorCallback for FailedBatches {
+        fn call(&self, ctx: ErrorCtx) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+            let sender = self.0.clone();
+            Box::pin(async move {
+                sender.send(ctx).unwrap();
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_confirmed_chunk_when_signing_in_should_end_the_unsent_tail_lineage() {
+        let (cluster, producer) = connected_producer().await;
+        let producer = Arc::new(producer);
+        cluster.script(
+            &endpoint(0),
+            SEND_MESSAGES_CODE,
+            [confirmation(0), confirmation(1)],
+        );
+        cluster.hold(SEND_MESSAGES_CODE);
+        let pending = tokio::spawn({
+            let producer = Arc::clone(&producer);
+            async move {
+                producer
+                    .send(vec![message(b"first"), message(b"tail")])
+                    .await
+            }
+        });
+        eventually("the first chunk arrives", || {
+            cluster.count(SEND_MESSAGES_CODE) == 1
+        })
+        .await;
+        producer
+            .core
+            .client
+            .read()
+            .await
+            .login_user("iggy", "iggy")
+            .await
+            .unwrap();
+        cluster.release(SEND_MESSAGES_CODE);
+
+        let Err(IggyError::ProducerSendFailed {
+            cause,
+            failed,
+            uncertain,
+            committed,
+            ..
+        }) = pending.await.unwrap()
+        else {
+            panic!("the old operation must return its unsent tail");
+        };
+        assert_eq!(*cause, IggyError::Unauthenticated);
+        assert_eq!(uncertain, 0);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].payload, Bytes::from_static(b"tail"));
+        assert_eq!(committed.len(), 1);
+        assert_eq!(committed[0].base_offset, 0);
+        assert_eq!(cluster.count(SEND_MESSAGES_CODE), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_initialization_when_signing_in_should_end_the_creation_lineage() {
+        let (cluster, mut producer) = connected_producer().await;
+        Arc::get_mut(&mut producer.core).unwrap().stream_id =
+            Arc::new(Identifier::named("stream").unwrap());
+        cluster.script(
+            &endpoint(0),
+            CREATE_STREAM_CODE,
+            [Answer::CommitBody(
+                1,
+                StreamResponse {
+                    id: 1,
+                    created_at: 0,
+                    topics_count: 0,
+                    size_bytes: 0,
+                    messages_count: 0,
+                    name: WireName::new("stream").unwrap(),
+                    options: WireOptions::empty(),
+                }
+                .to_bytes()
+                .to_vec(),
+            )],
+        );
+        cluster.script(&endpoint(0), GET_TOPIC_CODE, [Answer::Body(topic_body(1))]);
+        cluster.hold(GET_STREAM_CODE);
+        let producer = Arc::new(producer);
+        let pending = tokio::spawn({
+            let producer = Arc::clone(&producer);
+            async move { producer.init().await }
+        });
+        eventually("the stream lookup arrives", || {
+            cluster.count(GET_STREAM_CODE) == 1
+        })
+        .await;
+        producer
+            .core
+            .client
+            .read()
+            .await
+            .login_user("iggy", "iggy")
+            .await
+            .unwrap();
+        cluster.release(GET_STREAM_CODE);
+
+        assert_eq!(
+            pending.await.unwrap().unwrap_err(),
+            IggyError::Unauthenticated
+        );
+        assert_eq!(cluster.count(CREATE_STREAM_CODE), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_queued_batches_when_signing_in_should_never_merge_different_lineages() {
+        let (cluster, mut producer) = connected_producer().await;
+        Arc::get_mut(&mut producer.core).unwrap().direct_config = None;
+        let (failures, received) = flume::unbounded();
+        producer.dispatcher = Some(super::ProducerDispatcher::new(
+            Arc::clone(&producer.core),
+            BackgroundConfig::builder()
+                .batch_length(2)
+                .batch_size(0)
+                .linger_time(IggyDuration::new(Duration::from_secs(60)))
+                .error_callback(Arc::new(Box::new(FailedBatches(failures))))
+                .build(),
+        ));
+        cluster.script(&endpoint(0), SEND_MESSAGES_CODE, [confirmation(0)]);
+        producer.send(vec![message(b"old")]).await.unwrap();
+        producer
+            .core
+            .client
+            .read()
+            .await
+            .login_user("iggy", "iggy")
+            .await
+            .unwrap();
+        producer.send(vec![message(b"new")]).await.unwrap();
+        producer.shutdown().await;
+
+        let failure = received.try_recv().expect("the old queued batch must fail");
+        assert_eq!(*failure.cause, IggyError::Unauthenticated);
+        assert_eq!(failure.messages.len(), 1);
+        assert_eq!(failure.messages[0].payload, Bytes::from_static(b"old"));
+        assert!(received.try_recv().is_err());
+        let sends = cluster.received(SEND_MESSAGES_CODE);
+        assert_eq!(sends.len(), 1);
+        let (size, body) = sends[0].body.split_first_chunk().unwrap();
+        assert_eq!(
+            SendMessagesHeader::decode_from(&body[..u32::from_le_bytes(*size) as usize])
+                .unwrap()
+                .messages_count,
+            1
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_backpressure_when_signing_in_should_keep_the_waiting_batch_lineage() {
+        let (cluster, mut producer) = connected_producer().await;
+        Arc::get_mut(&mut producer.core).unwrap().direct_config = None;
+        let batch = ShardMessage {
+            stream: Arc::clone(&producer.core.stream_id),
+            topic: Arc::clone(&producer.core.topic_id),
+            messages: vec![message(b"old")],
+            partitioning: None,
+        };
+        let (failures, received) = flume::unbounded();
+        producer.dispatcher = Some(super::ProducerDispatcher::new(
+            Arc::clone(&producer.core),
+            BackgroundConfig::builder()
+                .batch_length(1)
+                .max_buffer_size(batch.get_size_bytes())
+                .error_callback(Arc::new(Box::new(FailedBatches(failures))))
+                .build(),
+        ));
+        cluster.script(
+            &endpoint(0),
+            SEND_MESSAGES_CODE,
+            [confirmation(0), confirmation(1)],
+        );
+        cluster.hold(SEND_MESSAGES_CODE);
+        producer.send(vec![message(b"old")]).await.unwrap();
+        eventually("the charged batch arrives", || {
+            cluster.count(SEND_MESSAGES_CODE) == 1
+        })
+        .await;
+        let waiting = producer.send(vec![message(b"old")]);
+        tokio::pin!(waiting);
+        assert!(futures::poll!(&mut waiting).is_pending());
+        producer
+            .core
+            .client
+            .read()
+            .await
+            .login_user("iggy", "iggy")
+            .await
+            .unwrap();
+        cluster.release(SEND_MESSAGES_CODE);
+        waiting.await.unwrap();
+        let failure = tokio::time::timeout(
+            crate::links::fake_cluster::TEST_BUDGET,
+            received.recv_async(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(*failure.cause, IggyError::Unauthenticated);
+        assert_eq!(failure.messages.len(), 1);
+        assert_eq!(cluster.count(SEND_MESSAGES_CODE), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_queued_batches_when_recovering_should_preserve_their_lineage() {
+        let (cluster, mut producer) = connected_producer().await;
+        Arc::get_mut(&mut producer.core).unwrap().direct_config = None;
+        let (failures, received) = flume::unbounded();
+        producer.dispatcher = Some(super::ProducerDispatcher::new(
+            Arc::clone(&producer.core),
+            BackgroundConfig::builder()
+                .batch_length(2)
+                .batch_size(0)
+                .linger_time(IggyDuration::new(crate::links::fake_cluster::TEST_BUDGET))
+                .error_callback(Arc::new(Box::new(FailedBatches(failures))))
+                .build(),
+        ));
+        producer.send(vec![message(b"old")]).await.unwrap();
+        *cluster.session.lock().unwrap() = None;
+        cluster.drop_connections(&endpoint(0));
+        eventually("automatic sign-in restores the session", || {
+            cluster.count(LOGIN_REGISTER_CODE) == 2
+        })
+        .await;
+        producer.send(vec![message(b"new")]).await.unwrap();
+        producer.shutdown().await;
+
+        assert!(received.try_recv().is_err());
+        let sends = cluster.received(SEND_MESSAGES_CODE);
+        assert_eq!(sends.len(), 1);
+        let (size, body) = sends[0].body.split_first_chunk().unwrap();
+        assert_eq!(
+            SendMessagesHeader::decode_from(&body[..u32::from_le_bytes(*size) as usize])
+                .unwrap()
+                .messages_count,
+            2
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_an_unanswered_background_batch_when_signing_in_should_keep_its_lineage_uncertain()
+     {
+        let (cluster, mut producer) = connected_producer().await;
+        Arc::get_mut(&mut producer.core).unwrap().direct_config = None;
+        let (failures, received) = flume::unbounded();
+        producer.dispatcher = Some(super::ProducerDispatcher::new(
+            Arc::clone(&producer.core),
+            BackgroundConfig::builder()
+                .batch_length(1)
+                .error_callback(Arc::new(Box::new(FailedBatches(failures))))
+                .build(),
+        ));
+        cluster.script(&endpoint(0), SEND_MESSAGES_CODE, [Answer::Silence]);
+        producer.send(vec![message(b"old")]).await.unwrap();
+        eventually("the batch may have applied", || {
+            cluster.count(SEND_MESSAGES_CODE) == 1
+        })
+        .await;
+        producer
+            .core
+            .client
+            .read()
+            .await
+            .login_user("iggy", "iggy")
+            .await
+            .unwrap();
+        producer.shutdown().await;
+
+        let failure = received.try_recv().unwrap();
+        assert!(
+            matches!(*failure.cause, IggyError::OperationUncertain(_)),
+            "{failure:?}"
+        );
+        assert_eq!(failure.messages.len(), 1);
+        assert_eq!(cluster.count(SEND_MESSAGES_CODE), 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1169,15 +1477,81 @@ mod tests {
             [Answer::Refuse(IggyError::RequestTooOld)],
         );
 
-        let Err(IggyError::ProducerSendFailed { cause, failed, .. }) =
-            producer.send(vec![message(b"old")]).await
+        let Err(IggyError::ProducerSendFailed {
+            cause,
+            failed,
+            uncertain,
+            ..
+        }) = producer.send(vec![message(b"old")]).await
         else {
             panic!("the producer must return the unconfirmed chunk");
         };
 
         assert_eq!(*cause, IggyError::RequestTooOld);
         assert_eq!(failed.len(), 1);
+        assert_eq!(uncertain, 0);
         assert_eq!(cluster.count(SEND_MESSAGES_CODE), 1);
+    }
+
+    /// HTTP reports a send that may have committed as `TransientNotCommitted`.
+    #[tokio::test(start_paused = true)]
+    async fn given_a_chunk_with_an_unknown_outcome_when_it_fails_should_count_it_as_uncertain() {
+        let (_cluster, producer) = connected_producer().await;
+
+        let IggyError::ProducerSendFailed { uncertain, .. } = producer.core.make_failed_error(
+            IggyError::TransientNotCommitted,
+            vec![message(b"sent"), message(b"sent"), message(b"unsent")],
+            2,
+            Vec::new(),
+        ) else {
+            panic!("the producer must return the failed messages");
+        };
+
+        assert_eq!(uncertain, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_an_uncertain_tail_chunk_when_a_send_fails_should_count_only_that_chunk_as_uncertain()
+     {
+        const BATCH_LENGTH: u32 = 3;
+        let (cluster, producer) = connected_producer().await;
+        let producer = producer_batching(producer.core.client.clone(), BATCH_LENGTH);
+        cluster.script(
+            &endpoint(0),
+            SEND_MESSAGES_CODE,
+            [confirmation(0), Answer::Silence],
+        );
+
+        let Err(IggyError::ProducerSendFailed {
+            cause,
+            failed,
+            uncertain,
+            committed,
+            stream_name,
+            topic_name,
+        }) = producer
+            .send(vec![
+                message(b"1"),
+                message(b"2"),
+                message(b"3"),
+                message(b"4"),
+                message(b"5"),
+            ])
+            .await
+        else {
+            panic!("the producer must return the uncertain tail chunk");
+        };
+
+        assert!(
+            matches!(*cause, IggyError::OperationUncertain(_)),
+            "{cause:?}"
+        );
+        assert_eq!(failed.len(), 2);
+        assert_eq!(uncertain, 2);
+        assert_eq!(committed.len(), 1);
+        assert_eq!(committed[0].base_offset, 0);
+        assert_eq!(stream_name.as_ref(), "stream");
+        assert_eq!(topic_name.as_ref(), "topic");
     }
 
     #[tokio::test(start_paused = true)]
@@ -1197,6 +1571,7 @@ mod tests {
         let Err(IggyError::ProducerSendFailed {
             cause,
             failed,
+            uncertain,
             committed,
             ..
         }) = producer
@@ -1214,6 +1589,7 @@ mod tests {
         assert_eq!(committed.len(), 1);
         assert_eq!(committed[0].base_offset, 0);
         assert_eq!(failed.len(), 2);
+        assert_eq!(uncertain, 1);
         assert_eq!(failed[0].payload, Bytes::from_static(b"uncertain"));
         assert_eq!(failed[1].payload, Bytes::from_static(b"unsent"));
 
@@ -1259,7 +1635,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn given_another_producers_blocker_when_sending_should_return_it_without_resolving() {
         let (cluster, producer) = connected_producer().await;
-        let other = producer_on((*producer.core.client).clone());
+        let other = producer_on(producer.core.client.clone());
         cluster.script(&endpoint(0), SEND_MESSAGES_CODE, [Answer::Silence]);
         assert!(producer.send(vec![message(b"old")]).await.is_err());
         let op = cluster.received(SEND_MESSAGES_CODE)[0].header.request;
@@ -1278,7 +1654,7 @@ mod tests {
     async fn given_a_stopped_producer_when_rebuilt_should_recover_its_previous_operation() {
         for abort_send in [false, true] {
             let (cluster, producer) = connected_producer().await;
-            let client = (*producer.core.client).clone();
+            let client = producer.core.client.clone();
             cluster.script(
                 &endpoint(0),
                 SEND_MESSAGES_CODE,
@@ -1357,6 +1733,28 @@ mod tests {
         assert_eq!(sends.len(), 2);
         assert_eq!(sends[0].body, sends[1].body);
         assert!(producer.core.uncertain_operations().contains(&op));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_an_outer_deadline_past_the_default_budget_when_a_send_is_unanswered_should_end_at_the_outer_deadline()
+     {
+        const OUTER_DEADLINE: Duration = OPERATION_TIMEOUT.saturating_mul(2);
+        let (cluster, producer) = connected_producer().await;
+        cluster.script(&endpoint(0), SEND_MESSAGES_CODE, [Answer::Silence]);
+        let started = Instant::now();
+
+        let result = with_deadline(
+            started + OUTER_DEADLINE,
+            producer.send(vec![message(b"unanswered")]),
+        )
+        .await;
+
+        let Err(IggyError::ProducerSendFailed { cause, .. }) = result else {
+            panic!("an unanswered send must fail");
+        };
+        let op = cluster.received(SEND_MESSAGES_CODE)[0].header.request;
+        assert_eq!(*cause, IggyError::OperationUncertain(op));
+        assert_eq!(started.elapsed(), OUTER_DEADLINE);
     }
 
     #[tokio::test(start_paused = true)]

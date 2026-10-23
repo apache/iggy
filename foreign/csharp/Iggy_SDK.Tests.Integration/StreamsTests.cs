@@ -153,7 +153,9 @@ public class StreamsTests
                 new Message(Guid.NewGuid(), "Test message 7"u8.ToArray())
             ]);
 
-        var response = await client.GetStreamByIdAsync(Identifier.String(streamName));
+        var response = await IggyServerFixture.ReadConvergedStatsAsync(
+            () => client.GetStreamByIdAsync(Identifier.String(streamName)),
+            stream => stream?.MessagesCount == 7);
         response.ShouldNotBeNull();
         response.Name.ShouldBe(streamName);
         response.Size.ShouldBeGreaterThan(0u);

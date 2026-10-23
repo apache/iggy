@@ -45,7 +45,7 @@ use shard::Receiver;
 use tracing::{info, trace};
 
 use crate::consumer_group::lease::ConsumerGroupLiveness;
-use crate::shell::{ServerShard, ShellBus, ShellShard};
+use crate::shell::{ShellBus, ShellShard};
 
 const MAX_LOGOUTS_PER_PASS: usize = 256;
 const MAX_RETIREMENTS_PER_PASS: usize = 128;
@@ -59,16 +59,22 @@ enum Pass {
     Drained,
 }
 
-pub async fn run(
-    shard: Rc<ServerShard>,
+pub async fn run<B, MJ, S, SB>(
+    shard: Rc<ShellShard<B, MJ, S, SB>>,
     liveness: Rc<RefCell<ConsumerGroupLiveness>>,
     stop: Receiver<()>,
+    shutdown: ShutdownToken,
     interval: Duration,
     timeout: Duration,
     system_path: String,
-) {
-    let shutdown = shard.bus.token();
-    let mut next_report = Instant::now() + interval;
+) where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let mut next_report = shard.bus.monotonic_now() + interval;
     'running: loop {
         let pending_retirement = shard
             .plane
@@ -78,16 +84,20 @@ pub async fn run(
             .ended_sessions()
             .next()
             .is_some();
-        let report_wait = next_report.saturating_duration_since(Instant::now());
+        let report_wait = next_report.saturating_duration_since(shard.bus.monotonic_now());
         let wait = if pending_retirement {
             report_wait.min(RETIREMENT_SWEEP_INTERVAL)
         } else {
             report_wait
         };
-        if compio::time::timeout(wait, stop.recv()).await.is_ok() || shutdown.is_triggered() {
+        if shard::bus_timeout(&shard.bus, wait, stop.recv())
+            .await
+            .is_some()
+            || shutdown.is_triggered()
+        {
             break;
         }
-        if Instant::now() >= next_report {
+        if shard.bus.monotonic_now() >= next_report {
             loop {
                 match report_and_expire(
                     &shard,
@@ -105,7 +115,7 @@ pub async fn run(
                     Pass::Drained => break,
                 }
             }
-            next_report = Instant::now() + interval;
+            next_report = shard.bus.monotonic_now() + interval;
         } else {
             retire_sessions(&shard, &liveness, &stop, &shutdown, interval, &system_path).await;
         }
@@ -133,7 +143,7 @@ where
         return Pass::Drained;
     };
     let clients = shard.gather_consumer_sessions().await;
-    let now = Instant::now();
+    let now = shard.bus.monotonic_now();
     let view = consensus.view();
     let serving = consensus.is_normal() && !consensus.is_transferring();
     let primary_view = (consensus.is_primary() && serving).then_some(view);
@@ -602,7 +612,7 @@ async fn retire_session<B, MJ, S, SB>(
             .is_some_and(|progress| {
                 // The primary can receive this report before it starts the sweep.
                 progress.report_due(
-                    Instant::now(),
+                    shard.bus.monotonic_now(),
                     report_interval.min(RETIREMENT_SWEEP_INTERVAL),
                 )
             })
@@ -917,9 +927,9 @@ mod tests {
                 name: WireName::new("legacy").unwrap(),
                 options: WireOptions::empty(),
             },
-            created_view: 0,
             derived_options: WireOptions::empty(),
             partitions: vec![CreatedPartitionAssignment {
+                initial_view: 0,
                 partition_id: 0,
                 consensus_group_id: 2,
             }],
@@ -1159,6 +1169,13 @@ mod tests {
     }
 
     async fn shard_with_members(count: usize) -> (tempfile::TempDir, Rc<TestShard>) {
+        shard_with_members_on_partitions(count, 1).await
+    }
+
+    async fn shard_with_members_on_partitions(
+        count: usize,
+        partitions_count: u32,
+    ) -> (tempfile::TempDir, Rc<TestShard>) {
         let dir = tempfile::tempdir().unwrap();
         let mut shard = Rc::try_unwrap(super::super::tests::partition_read_shard(1))
             .ok()
@@ -1180,16 +1197,18 @@ mod tests {
         let create_topic = CreateTopicWithAssignmentsRequest {
             request: CreateTopicRequest {
                 stream_id: WireIdentifier::numeric(0),
-                partitions_count: 1,
+                partitions_count,
                 name: WireName::new("topic").unwrap(),
                 options: WireOptions::empty(),
             },
-            created_view: 0,
             derived_options: WireOptions::empty(),
-            partitions: vec![CreatedPartitionAssignment {
-                partition_id: 0,
-                consensus_group_id: 1,
-            }],
+            partitions: (0..partitions_count)
+                .map(|partition_id| CreatedPartitionAssignment {
+                    initial_view: 0,
+                    partition_id,
+                    consensus_group_id: u64::from(partition_id) + 1,
+                })
+                .collect(),
         };
         let create_group = CreateConsumerGroupRequest {
             stream_id: WireIdentifier::numeric(0),
@@ -1644,16 +1663,19 @@ mod tests {
     async fn given_failed_partition_when_retiring_should_allow_new_sessions() {
         let (directory, shard) = shard_with_members(1).await;
         let metadata = shard.plane.metadata();
+        let namespace = server_common::sharding::IggyNamespace::new(0, 0, 0);
+        let created_revision = metadata
+            .mux_stm
+            .streams()
+            .created_revision_for_namespace(namespace)
+            .unwrap();
         assert!(
             metadata
                 .client_table
                 .borrow_mut()
                 .end_session(CLIENT, 0, SESSION, SESSION)
         );
-        shard
-            .plane
-            .partitions()
-            .fence(server_common::sharding::IggyNamespace::new(0, 0, 0), 1);
+        shard.plane.partitions().fence(namespace, created_revision);
         let tracker = RefCell::new(ConsumerGroupLiveness::default());
         let (_stop, receiver) = shard::channel(1);
         let (_signal, shutdown) = Shutdown::new();
@@ -1677,11 +1699,11 @@ mod tests {
         assert_eq!(
             crate::partition_helpers::partition_retirement_fence(
                 directory.path().to_str().unwrap(),
-                server_common::sharding::IggyNamespace::new(0, 0, 0),
+                namespace,
             )
             .await
             .unwrap(),
-            Some(1)
+            Some(created_revision)
         );
         metadata
             .client_table
@@ -1707,7 +1729,12 @@ mod tests {
                 .end_session(CLIENT, 0, SESSION, SESSION)
         );
         let namespace = server_common::sharding::IggyNamespace::new(0, 0, 0);
-        shard.plane.partitions().fence(namespace, 1);
+        let created_revision = metadata
+            .mux_stm
+            .streams()
+            .created_revision_for_namespace(namespace)
+            .unwrap();
+        shard.plane.partitions().fence(namespace, created_revision);
         let obstruction = directory.path().join("partition-initialization");
         std::fs::write(&obstruction, b"not a directory").unwrap();
         let tracker = RefCell::new(ConsumerGroupLiveness::default());
@@ -1838,6 +1865,83 @@ mod tests {
                 "segment deletion must not restart session retirement"
             );
             assert!(progress.reporters.contains(&1));
+        }
+    }
+
+    /// Pins the release pace of the registry capacity of ended sessions. Every
+    /// session takes its own sweep over all allocated partitions, at most
+    /// `MAX_RETIREMENTS_PER_PASS` per pass, so above that many partitions each
+    /// further session costs `ceil(P / MAX_RETIREMENTS_PER_PASS) - 1` passes.
+    /// Failed partitions report through their fence and need no barrier, so the
+    /// count covers only the sweep and the finalization.
+    #[compio::test]
+    async fn given_ended_sessions_across_partitions_when_sweeping_should_release_one_session_per_sweep()
+     {
+        const SESSIONS: usize = 3;
+        const MANY_PARTITIONS: u32 = 1000;
+        const PASSES_MAX: usize = 64;
+        let one_pass = u32::try_from(MAX_RETIREMENTS_PER_PASS).unwrap();
+        for partitions_count in [one_pass, MANY_PARTITIONS] {
+            let sweep_passes = partitions_count.div_ceil(one_pass) as usize;
+            let (directory, shard) =
+                shard_with_members_on_partitions(SESSIONS, partitions_count).await;
+            // A real budget ends a pass by the clock, so the disk speed of the
+            // fence writes would move every release.
+            shard.bus.frozen_timers.set(true);
+            let system_path = directory.path().to_str().unwrap();
+            let metadata = shard.plane.metadata();
+            let streams = metadata.mux_stm.streams();
+            for partition_id in 0..partitions_count {
+                let namespace =
+                    server_common::sharding::IggyNamespace::new(0, 0, partition_id as usize);
+                let created_revision = streams.created_revision_for_namespace(namespace).unwrap();
+                shard.plane.partitions().fence(namespace, created_revision);
+            }
+            for index in 0..SESSIONS {
+                assert!(metadata.client_table.borrow_mut().end_session(
+                    CLIENT + index as u128,
+                    0,
+                    SESSION,
+                    SESSION
+                ));
+            }
+            let tracker = RefCell::new(ConsumerGroupLiveness::default());
+            let (_stop, receiver) = shard::channel(1);
+            let (_signal, shutdown) = Shutdown::new();
+            let mut release_passes = Vec::with_capacity(SESSIONS);
+            for pass in 1..=PASSES_MAX {
+                let before = metadata.client_table.borrow().count();
+                compio::time::timeout(
+                    Duration::from_secs(30),
+                    super::super::tests::run_with_partition_message_pump(
+                        &shard,
+                        retire_sessions(
+                            &shard,
+                            &tracker,
+                            &receiver,
+                            &shutdown,
+                            TIMEOUT,
+                            system_path,
+                        ),
+                    ),
+                )
+                .await
+                .expect("a frozen virtual budget must still obey the external test deadline");
+                let after = metadata.client_table.borrow().count();
+                release_passes.extend(std::iter::repeat_n(pass, before - after));
+                if after == 0 {
+                    break;
+                }
+            }
+            // A sweep starts in the pass that released the session before it.
+            let expected: Vec<usize> = (0..SESSIONS)
+                .map(|released| sweep_passes + released * (sweep_passes - 1))
+                .collect();
+            assert_eq!(
+                release_passes, expected,
+                "P={partitions_count}: each slot must be released in the pass where its sweep \
+                 covers every partition"
+            );
         }
     }
 

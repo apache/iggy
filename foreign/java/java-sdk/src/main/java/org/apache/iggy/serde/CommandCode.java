@@ -114,7 +114,7 @@ public interface CommandCode {
         GET(120),
         STORE(121),
         DELETE(122);
-        // 123 is retired and must never be reused.
+        // 123 and 124 are retired and must never be reused.
 
         private final int value;
 

@@ -496,7 +496,7 @@ func (e InvalidPersonalAccessTokenExpiry) Is(target error) bool {
 
 type TransientNotCommitted struct{}
 
-func (e TransientNotCommitted) Error() string { return "request transiently not committed; retry" }
+func (e TransientNotCommitted) Error() string { return "request outcome unknown; it may have applied" }
 func (e TransientNotCommitted) Code() Code    { return 57 }
 func (e TransientNotCommitted) Is(target error) bool {
 	_, ok := target.(TransientNotCommitted)
@@ -2378,12 +2378,11 @@ func (e CannotDeleteConsumerGroupInfo) Is(target error) bool {
 }
 
 type ConsumerGroupPartitionNotOwned struct {
-	ClientId    uint32
 	PartitionId uint32
 }
 
 func (e ConsumerGroupPartitionNotOwned) Error() string {
-	return fmt.Sprintf("consumer group member with client id: %d does not own partition: %d at the current generation (rebalance in progress).", e.ClientId, e.PartitionId)
+	return fmt.Sprintf("consumer group member does not own partition: %d at the current generation (rebalance in progress).", e.PartitionId)
 }
 func (e ConsumerGroupPartitionNotOwned) Code() Code { return 5009 }
 func (e ConsumerGroupPartitionNotOwned) Is(target error) bool {
@@ -2761,16 +2760,16 @@ func (e RequestIdExhausted) Is(target error) bool {
 	return ok
 }
 
-type UncertainOutcome struct {
+type OperationUncertain struct {
 	OperationID uint64
 }
 
-func (e UncertainOutcome) Error() string {
+func (e OperationUncertain) Error() string {
 	return fmt.Sprintf("operation %d has an uncertain outcome", e.OperationID)
 }
-func (e UncertainOutcome) Code() Code { return 14006 }
-func (e UncertainOutcome) Is(target error) bool {
-	_, ok := target.(UncertainOutcome)
+func (e OperationUncertain) Code() Code { return 14006 }
+func (e OperationUncertain) Is(target error) bool {
+	_, ok := target.(OperationUncertain)
 	return ok
 }
 
@@ -3050,7 +3049,7 @@ var (
 	ErrIncompatibleProtocolVersion                = IncompatibleProtocolVersion{}
 	ErrSessionMismatch                            = SessionMismatch{}
 	ErrRequestIdExhausted                         = RequestIdExhausted{}
-	ErrUncertainOutcome                           = UncertainOutcome{}
+	ErrOperationUncertain                         = OperationUncertain{}
 	ErrLaneBlocked                                = LaneBlocked{}
 	ErrOperationNotRetained                       = OperationNotRetained{}
 )
@@ -3307,7 +3306,7 @@ const (
 	IncompatibleProtocolVersionCode                Code = 14003
 	SessionMismatchCode                            Code = 14004
 	RequestIdExhaustedCode                         Code = 14005
-	UncertainOutcomeCode                           Code = 14006
+	OperationUncertainCode                         Code = 14006
 	LaneBlockedCode                                Code = 14007
 	OperationNotRetainedCode                       Code = 14008
 )
@@ -3812,8 +3811,8 @@ func (c Code) String() string {
 		return "SessionMismatch"
 	case RequestIdExhaustedCode:
 		return "RequestIdExhausted"
-	case UncertainOutcomeCode:
-		return "UncertainOutcome"
+	case OperationUncertainCode:
+		return "OperationUncertain"
 	case LaneBlockedCode:
 		return "LaneBlocked"
 	case OperationNotRetainedCode:
@@ -4323,8 +4322,8 @@ func FromCode(code Code) IggyError {
 		return ErrSessionMismatch
 	case RequestIdExhaustedCode:
 		return ErrRequestIdExhausted
-	case UncertainOutcomeCode:
-		return ErrUncertainOutcome
+	case OperationUncertainCode:
+		return ErrOperationUncertain
 	case LaneBlockedCode:
 		return ErrLaneBlocked
 	case OperationNotRetainedCode:

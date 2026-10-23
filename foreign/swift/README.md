@@ -96,14 +96,45 @@ set, and against the host of the address unless `TLSOptions.domain` names anothe
 
 ### Reconnection
 
-A request that hits a dropped connection reconnects, signs in again, and is replayed,
-all within its `requestTimeout`, and only when it provably never reached the log:
-reads, pings, and requests the server never admitted. A replicated write whose outcome
-is unknown fails with `transientNotCommitted` instead of being applied twice. A client
-left disconnected by a timeout or an outage reconnects on its next call or heartbeat
-when it has credentials to sign in with. In a cluster the client reads the roster after
-signing in, moves to the leader, and moves on when a node answers that it is not the
-primary.
+If a request hits a dropped connection, the client reconnects and signs in again within
+the `requestTimeout` of the request. Only a request that provably never reached the log
+goes again: a read, a ping, or a request that the server never admitted. If the server
+refuses a request as a stale client, the request fails with `staleClient` (30). The
+next call binds the same session again, and signs in only if the server no longer holds it.
+
+If the connection of a sent replicated write drops, or an eviction ends its session, the
+outcome of the write is unknown. Only a reconnect that binds the same session sends the
+write again. Otherwise the write fails with `transientNotCommitted`, so that it is never
+applied twice. If a request that was never sent still waits for the reconnect at its
+deadline, it fails with `transientNotAccepted`.
+
+If a timeout or an outage leaves the client disconnected, the next call or heartbeat
+reconnects it. The reconnect needs credentials to sign in with. It signs in as the caller
+last signed in. Before the caller signs in, it uses the configured `autoLogin`. After
+`logout()`, the client does not sign in by itself. Only the next `login`, or the first
+`connect()` after `disconnect()`, ends this. In a cluster, the client signs in, reads the
+roster, and moves to the leader. If a node answers that it is not the primary, the client
+moves to the next node.
+
+A call made before a `login`, `logout`, or `disconnect` never runs under a session that
+opened after it. This holds for every request of the call. A send with balanced or key
+partitioning reads the topic first, and a consumer group poll syncs its assignment first.
+If the caller signs in or out between two requests of a call, the next request is not
+sent. If the outcome of the call is unknown, it fails with `transientNotCommitted`.
+Otherwise it fails with `unauthenticated`.
+
+If the server refuses the credentials of the automatic sign-in, a call that waits for it
+fails with `unauthenticated`. The error has the refusal as its context. For example, the
+server refuses a wrong password, or a personal access token that is invalid or expired.
+Then the client stays signed out, and only a sign-in by the caller ends this.
+
+An explicit `login` supersedes automatic sign-in and uses the credentials supplied by
+the caller. Any failed explicit attempt, including invalid input or a timeout, disables
+automatic sign-in until another explicit sign-in succeeds. A disconnect followed by a
+connect does not lift that restriction. Older or queued sign-ins cannot restore credentials
+after a newer attempt has failed. A public sign-in failure also discards any session
+that Register already created and closes its connection, so reconnect cannot bind that
+session. Best-effort roster discovery does not turn a successful sign-in into a failure.
 
 ### Messages
 
@@ -170,6 +201,29 @@ func handle(_ error: IggyError) {
     }
 }
 ```
+
+Three codes tell what happened to a request that did not complete:
+
+- `transientNotAccepted` (58): the server did not admit the request, so a retry is
+  safe.
+- `transientNotCommitted` (57): the outcome is unknown, and the server possibly applied
+  the write. Read the state before you write it again.
+- `unauthenticated` (40): the request needs a session. Sign in, then retry.
+
+The Rust SDK and the other native SDKs keep a write with an unknown outcome in a
+retained-operation registry and fail it with `operationUncertain` (14006). Swift has no
+such registry, so it reports the same case as `transientNotCommitted` (57).
+
+A lost reply followed by session end remains uncertain, including after account
+reactivation or a new login. Swift has no resolver for that receipt; a fresh send
+can duplicate the earlier write. See the server's
+[session and revocation policy](../../core/server/README.md#sessions-and-retry-receipts).
+
+Each node counts the messages in its stream, topic and system stats. After a
+successful send, a node that is not the partition primary shows the new count
+only after the next prepare or commit broadcast. When no other write follows,
+this delay is at most `cluster.commit_broadcast_interval` (500 ms by default).
+See [metadata freshness and counters](../../core/server/README.md#metadata-freshness-and-counters).
 
 ## Testing
 

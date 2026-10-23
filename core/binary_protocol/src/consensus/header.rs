@@ -789,6 +789,12 @@ impl ReplyHeader {
             && self.status == 0
             && self.reserved[0] == Self::COMMITTED_RESULT
     }
+
+    /// Withdraw the committed-result marker and keep every other byte, for a
+    /// reply to a committed prepare whose final result is still pending.
+    pub const fn clear_committed_result(&mut self) {
+        self.reserved[0] = 0;
+    }
 }
 
 impl ConsensusHeader for ReplyHeader {
@@ -3583,6 +3589,39 @@ mod tests {
         reply.status = 0;
         reply.command = Command::Eviction;
         assert!(!reply.has_committed_result());
+    }
+
+    #[test]
+    fn given_committed_result_when_cleared_should_change_only_the_marker_byte() {
+        let committed = ReplyHeader::from_prepare(
+            &PrepareHeader {
+                cluster: 3,
+                view: 5,
+                release: 6,
+                replica: 7,
+                client: 9,
+                request_checksum: 11,
+                op: 12,
+                timestamp: 14,
+                request: 15,
+                operation: Operation::CreateStream,
+                partition_incarnation: 19,
+                ..PrepareHeader::default()
+            },
+            u32::try_from(HEADER_SIZE).unwrap(),
+        );
+        assert!(committed.has_committed_result());
+        let mut cleared = committed;
+        cleared.clear_committed_result();
+        assert!(!cleared.has_committed_result());
+        let changed: Vec<usize> = bytemuck::bytes_of(&committed)
+            .iter()
+            .zip(bytemuck::bytes_of(&cleared))
+            .enumerate()
+            .filter(|(_, (before, after))| before != after)
+            .map(|(offset, _)| offset)
+            .collect();
+        assert_eq!(changed, [offset_of!(ReplyHeader, reserved)]);
     }
 
     #[test]

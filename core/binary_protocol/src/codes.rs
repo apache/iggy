@@ -66,6 +66,7 @@ pub const GET_CONSUMER_OFFSET_CODE: u32 = 120;
 pub const STORE_CONSUMER_OFFSET_CODE: u32 = 121;
 pub const DELETE_CONSUMER_OFFSET_CODE: u32 = 122;
 // 123 was GET_CONSUMER_OFFSET_ROUTING. Never reuse it: released clients still send it.
+// 124 was DELETE_CONSUMER_OFFSET_2. Never reuse it.
 
 // -- Streams --
 pub const GET_STREAM_CODE: u32 = 200;
@@ -114,7 +115,7 @@ pub const fn command_name(code: u32) -> Result<&'static str, WireError> {
 mod tests {
     use super::*;
 
-    const RETIRED_CODES: &[u32] = &[14, 102, 103, 104, 123, 205, 305];
+    const RETIRED_CODES: &[u32] = &[14, 102, 103, 104, 123, 124, 205, 305];
 
     const ALL_CODES: &[u32] = &[
         PING_CODE,

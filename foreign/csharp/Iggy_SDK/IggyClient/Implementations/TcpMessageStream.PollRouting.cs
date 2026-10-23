@@ -170,12 +170,13 @@ public sealed partial class TcpMessageStream
     }
 
     private Task<IMemoryOwner<byte>> SendRoutedAsync(int code, SendTarget target,
-        ReadOnlyMemory<byte> payload, PartitionContext? context, CancellationToken token, TimeSpan? timeout = null) =>
-        RunClientOperationAsync(code, payload, context, target, token, timeout: timeout);
+        ReadOnlyMemory<byte> payload, PartitionContext? context, CancellationToken token, TimeSpan? timeout = null,
+        ulong? startedUnder = null) =>
+        RunClientOperationAsync(code, payload, context, target, token, timeout: timeout, startedUnder: startedUnder);
 
     private async Task<IMemoryOwner<byte>> RunClientOperationAsync(int code, ReadOnlyMemory<byte> payload,
         PartitionContext? context, SendTarget? target, CancellationToken token, ClientOperation? retained = null,
-        TimeSpan? timeout = null)
+        TimeSpan? timeout = null, ulong? startedUnder = null)
     {
         using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(token, _clientLifetime.Token);
         var budget = timeout ?? TimeSpan.FromMilliseconds(VsrRequestTimeoutMs);
@@ -188,15 +189,19 @@ public sealed partial class TcpMessageStream
         var captured = retained?.Context ?? context;
         var operation = retained;
         SessionFrame? frame = retained?.Identity;
-        var generation = retained?.Generation ?? _consensusSession.Generation;
+        // A call that started before its request was encoded keeps the generation it started under, so a sign-in or
+        // sign-out by the caller meanwhile ends it.
+        var generation = retained?.Generation ?? startedUnder ?? _consensusSession.Generation;
         var retainable = VsrOperations.ForCode(code) is not (VsrOperation.NonReplicated or VsrOperation.Register or VsrOperation.Logout);
         var progress = IsProgressPoll(code, payload.Span);
         var refreshHistory = code == CommandCodes.SEND_MESSAGES_CODE && context is null && retained is null;
         var retryDelay = LifecycleRetryIntervalMs;
         var routingRetries = 0;
         var lastWasNotPrimary = false;
+        var askMetadataPrimaryFirst = false;
         var terminal = false;
         var frameAcquired = false;
+        var startOver = false;
         IggyInvalidStatusCodeException? refusal = null;
         IggyInvalidStatusCodeException? rejection = null;
         CancellationTokenRegistration operationCancellation = default;
@@ -205,8 +210,43 @@ public sealed partial class TcpMessageStream
             while (true)
             {
                 CachedRoute? route = null;
+                var sending = false;
                 try
                 {
+                    if (retained is null && operation is not { Uncertain: true })
+                    {
+                        // A call that cannot have been applied yet waits for a session recovery, and starts over
+                        // under the session that continues its own, in the lane it holds.
+                        while (SignInRecovery() is { } recovery)
+                        {
+                            await recovery.WaitAsync(cancellation.Token);
+                        }
+                        startOver |= _consensusSession.Successor(generation) is { } successor && successor != generation;
+                    }
+                    if (_consensusSession.Ended(generation) is { } ended)
+                    {
+                        throw ended;
+                    }
+                    if (startOver)
+                    {
+                        startOver = false;
+                        if (operation is not null)
+                        {
+                            var restartBody = operation.Body.ToArray();
+                            operationCancellation.Dispose();
+                            if (frameAcquired)
+                            {
+                                operation.Frame.Release();
+                                frameAcquired = false;
+                            }
+                            operation = await _mutations.RestartAsync(operation, restartBody, cancellation.Token);
+                            _mutations.Acquire(operation);
+                            frameAcquired = true;
+                            operationCancellation = operation.Lifetime.Token.Register(cancellation.Cancel);
+                        }
+                        frame = operation?.Identity;
+                        generation = operation?.Generation ?? _consensusSession.Successor(generation) ?? generation;
+                    }
                     if (target is { } partition)
                     {
                         if (operation is null && (retainable || progress))
@@ -225,23 +265,27 @@ public sealed partial class TcpMessageStream
                                 _mutations.ThrowIfRetained(new MutationLane(knownContext.Incarnation, partition.Key.PartitionId));
                             }
                         }
-                        route = await GetPartitionRouteAsync(partition.Key, partition.Query, deadline, cancellation.Token);
+                        route = await GetPartitionRouteAsync(partition.Key, partition.Query, deadline, cancellation.Token,
+                            askMetadataPrimaryFirst);
+                        askMetadataPrimaryFirst = false;
                         captured ??= route.Route.Context;
                     }
                     else
                     {
                         captured ??= new PartitionContext(0, 0, _metadataWatermark);
                     }
-                    EnsureOperationSession(generation);
+                    EnsureOperationSession(code, generation);
                     if (operation is null && (retainable || progress))
                     {
                         var lane = target is { } selected
                             ? new MutationLane(captured.Value.Incarnation, selected.Key.PartitionId) : MutationLane.Metadata;
-                        operation = await _mutations.EnterAsync(lane, code, payload, captured.Value, retainable, cancellation.Token);
+                        operation = await _mutations.EnterAsync(lane, code, payload, captured.Value, retainable, generation,
+                            cancellation.Token);
                         _mutations.Acquire(operation);
                         frameAcquired = true;
                         operationCancellation = operation.Lifetime.Token.Register(cancellation.Cancel);
                         frame = operation.Identity;
+                        generation = operation.Generation;
                     }
                     frame ??= _consensusSession.Resolve(VsrOperations.ForCode(code));
                     VsrConnection connection;
@@ -272,7 +316,7 @@ public sealed partial class TcpMessageStream
                     {
                         connection = ReadyReplicaLinks().FirstOrDefault() ?? throw new NotConnectedException();
                     }
-                    EnsureOperationSession(generation);
+                    EnsureOperationSession(code, generation);
                     if (operation is not null && !_mutations.Owns(operation))
                     {
                         throw PollNotAccepted();
@@ -283,6 +327,7 @@ public sealed partial class TcpMessageStream
                         ExceptionDispatchInfo.Throw(refusal);
                     }
                     refusal = null;
+                    sending = true;
                     var attempt = operation is null
                         ? await connection.SendAttemptAsync(code, payload, deadline, deadline, HasSensitiveReply(code),
                             cancellation.Token, retryTransient: false, context: captured.Value, retainedFrame: frame)
@@ -297,7 +342,7 @@ public sealed partial class TcpMessageStream
                                 operation.Identity.RequestId);
                         }
                         terminal = true;
-                        RefreshCommittedCredentials(code, (operation?.Body ?? payload).Span);
+                        RefreshCommittedCredentials(code, (operation?.Body ?? payload).Span, generation);
                         return attempt.Response!;
                     }
                     if (IsSessionFailure(attempt.Error))
@@ -307,6 +352,17 @@ public sealed partial class TcpMessageStream
                     if (attempt.Error is IggyInvalidStatusCodeException status)
                     {
                         status.CommandCode = code;
+                        if (route is not null
+                            && await IsBackupNamespaceMissAsync(status, connection, deadline, cancellation.Token))
+                        {
+                            // The backup refused the frame before admission, so the same frame goes out again. A
+                            // lookup asks the primary of the stale route first, which is this backup, so the next
+                            // one starts at the metadata primary.
+                            askMetadataPrimaryFirst = true;
+                            status = VsrError.FromServer(VsrError.TRANSIENT_NOT_ACCEPTED,
+                                "A backup replica does not know the stream, topic or partition yet.");
+                            status.CommandCode = code;
+                        }
                         if (operation is not null
                             && (status.StatusCode == VsrError.TRANSIENT_NOT_COMMITTED
                                 || attempt.RequestStarted && (!status.FromServer || status.StatusCode == VsrError.REQUEST_TOO_OLD)))
@@ -338,7 +394,7 @@ public sealed partial class TcpMessageStream
                         }
                         ExceptionDispatchInfo.Throw(status);
                     }
-                    if (attempt.RequestStarted && (retainable || progress || !VsrOperations.IsReplaySafeRead(code, false, payload.Span)))
+                    if (attempt.RequestStarted && (retainable || progress || !VsrOperations.IsReplaySafeRead(code, payload.Span)))
                     {
                         if (operation is { Retainable: true })
                         {
@@ -369,9 +425,21 @@ public sealed partial class TcpMessageStream
                 catch (IggyInvalidStatusCodeException error) when (error.StatusCode is
                     VsrError.TRANSIENT_NOT_ACCEPTED or VsrError.NOT_PRIMARY or VsrError.TRANSIENT_NOT_COMMITTED)
                 {
+                    if (generation != _consensusSession.Generation && retained is null
+                        && operation is not { Uncertain: true } && ResumesUnderNewSession(generation))
+                    {
+                        continue;
+                    }
                     if (error.FromServer && error.CommandCode == code)
                     {
                         refusal = error;
+                        if (error.StatusCode == VsrError.NOT_PRIMARY)
+                        {
+                            // Neither 58 nor 89 admitted the call, so the deadline reports both as 58.
+                            refusal = VsrError.FromServer(VsrError.TRANSIENT_NOT_ACCEPTED,
+                                "No replica admitted the call as its primary.");
+                            refusal.CommandCode = code;
+                        }
                     }
                     var retryImmediately = error.StatusCode == VsrError.NOT_PRIMARY && !lastWasNotPrimary;
                     lastWasNotPrimary = error.StatusCode == VsrError.NOT_PRIMARY;
@@ -384,6 +452,10 @@ public sealed partial class TcpMessageStream
                         {
                             ExceptionDispatchInfo.Throw(refusal);
                         }
+                        if (_consensusSession.Ended(generation) is { } ended)
+                        {
+                            throw ended;
+                        }
                         throw;
                     }
                     if (target is { } failed)
@@ -393,7 +465,32 @@ public sealed partial class TcpMessageStream
                     await Task.Delay(pause, cancellation.Token);
                     if (target is null)
                     {
-                        await RefreshPartitionRosterAsync(deadline, cancellation.Token);
+                        try
+                        {
+                            await RefreshPartitionRosterAsync(deadline, cancellation.Token);
+                        }
+                        catch (Exception refreshError) when (retained is null && operation is not { Uncertain: true }
+                            && (refreshError is NotConnectedException || IsSessionFailure(refreshError))
+                            && ResumesUnderNewSession(generation))
+                        {
+                            // The refused call was never admitted, so the next pass waits for the new session.
+                        }
+                    }
+                }
+                catch (Exception error) when (!sending && retained is null && operation is not { Uncertain: true }
+                    && (error is NotConnectedException || IsSessionFailure(error))
+                    && (ResumesUnderNewSession(generation) || _consensusSession.Ended(generation) is not null))
+                {
+                    // The session ended before the call was sent. The next pass waits for the new one. A call that no
+                    // session can take ends here: the check that ends it on the next pass throws into this catch, and
+                    // a not connected end would come back to it with no wait.
+                    if (_consensusSession.Ended(generation) is { } ended)
+                    {
+                        if (ended is NotConnectedException && IsSessionFailure(error))
+                        {
+                            ExceptionDispatchInfo.Throw(CallerError(error));
+                        }
+                        throw ended;
                     }
                 }
                 catch (IggyInvalidStatusCodeException error) when (retained is null
@@ -425,29 +522,14 @@ public sealed partial class TcpMessageStream
                     && error.FromServer && error.CommandCode == code
                     && error.StatusCode == VsrError.LIFECYCLE_BUSY)
                 {
-                    EnsureOperationSession(generation);
+                    if (!ResumesUnderNewSession(generation))
+                    {
+                        EnsureOperationSession(code, generation);
+                    }
                     lastWasNotPrimary = false;
                     terminal = false;
                     refusal = error;
-                    if (operation is not null)
-                    {
-                        var retryBody = operation.Body.ToArray();
-                        operationCancellation.Dispose();
-                        if (frameAcquired)
-                        {
-                            operation.Frame.Release();
-                            frameAcquired = false;
-                        }
-                        operation = await _mutations.RestartAsync(operation, retryBody, cancellation.Token);
-                        _mutations.Acquire(operation);
-                        frameAcquired = true;
-                        operationCancellation = operation.Lifetime.Token.Register(cancellation.Cancel);
-                        frame = operation.Identity;
-                    }
-                    else
-                    {
-                        frame = null;
-                    }
+                    startOver = true;
                     await Task.Delay(retryDelay, cancellation.Token);
                     retryDelay = Math.Min(retryDelay * 2, LifecycleRetryMaxIntervalMs);
                 }
@@ -462,11 +544,12 @@ public sealed partial class TcpMessageStream
         }
         catch (OperationCanceledException) when (!token.IsCancellationRequested)
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             if (generation == _consensusSession.Generation && refusal is not null)
             {
                 ExceptionDispatchInfo.Throw(refusal);
             }
-            throw PollNotAccepted();
+            throw _consensusSession.Ended(generation) ?? PollNotAccepted();
         }
         catch (Exception error) when (error is IOException or SocketException
             && refusal is not null
@@ -557,11 +640,19 @@ public sealed partial class TcpMessageStream
         return Task.CompletedTask;
     }
 
-    private void EnsureOperationSession(ulong generation)
+    private void EnsureOperationSession(int code, ulong generation)
     {
+        lock (_pollRoutingGate)
+        {
+            if (_signInWithdrawn && code != CommandCodes.PING_CODE)
+            {
+                throw _consensusSession.Ended(generation)
+                    ?? VsrError.Exception(VsrError.UNAUTHENTICATED, "An explicit sign-in is required.");
+            }
+        }
         if (generation != _consensusSession.Generation)
         {
-            throw PollNotAccepted();
+            throw _consensusSession.Ended(generation) ?? PollNotAccepted();
         }
     }
 
@@ -574,7 +665,7 @@ public sealed partial class TcpMessageStream
     }
 
     private async Task<CachedRoute> GetPartitionRouteAsync(PartitionRouteKey key, ReadOnlyMemory<byte> query,
-        long deadline, CancellationToken token)
+        long deadline, CancellationToken token, bool askMetadataPrimaryFirst = false)
     {
         CachedRoute? previous;
         lock (_pollRoutingGate)
@@ -593,7 +684,7 @@ public sealed partial class TcpMessageStream
         var links = ReadyReplicaLinksOrThrow().ToList();
         lock (_pollRoutingGate)
         {
-            var preferred = previous?.Route.PrimaryReplica ?? _metadataReplica;
+            var preferred = askMetadataPrimaryFirst ? _metadataReplica : previous?.Route.PrimaryReplica ?? _metadataReplica;
             if (preferred is { } replica && _replicaLinks.TryGetValue(replica, out var slot)
                 && slot.Connection is { IsReady: true } connection)
             {
@@ -618,21 +709,10 @@ public sealed partial class TcpMessageStream
                 {
                     continue;
                 }
-                if (attempt.Error is IggyInvalidStatusCodeException
-                    {
-                        StatusCode: VsrError.STREAM_ID_NOT_FOUND or VsrError.STREAM_NAME_NOT_FOUND
-                        or VsrError.TOPIC_ID_NOT_FOUND or VsrError.TOPIC_NAME_NOT_FOUND or VsrError.PARTITION_NOT_FOUND
-                    })
+                if (attempt.Error is IggyInvalidStatusCodeException lookupError && IsNamespaceMiss(lookupError.StatusCode)
+                    && !await IsMetadataPrimaryAsync(connection, deadline, token))
                 {
-                    lock (_pollRoutingGate)
-                    {
-                        if (_metadataReplica is not { } metadataPrimary
-                            || !_replicaLinks.TryGetValue(metadataPrimary, out var metadataSlot)
-                            || !ReferenceEquals(metadataSlot.Connection, connection))
-                        {
-                            continue;
-                        }
-                    }
+                    continue;
                 }
                 ExceptionDispatchInfo.Throw(CallerError(attempt.Error));
             }
@@ -691,6 +771,52 @@ public sealed partial class TcpMessageStream
         throw PollNotAccepted();
     }
 
+    /// <summary>
+    ///     Whether a replica that is not the metadata primary answered that it has no such stream, topic or
+    ///     partition. A backup applies metadata commits after the metadata primary, so only the metadata
+    ///     primary's miss is final.
+    /// </summary>
+    private async Task<bool> IsBackupNamespaceMissAsync(IggyInvalidStatusCodeException status,
+        VsrConnection connection, long deadline, CancellationToken token) =>
+        status.FromServer && !status.Committed && IsNamespaceMiss(status.StatusCode)
+        && !await IsMetadataPrimaryAsync(connection, deadline, token);
+
+    /// <summary>
+    ///     Whether <paramref name="connection" /> is the link of the metadata primary. The belief can predate a view
+    ///     change, so the roster that <paramref name="connection" /> reads must still name its replica. No call
+    ///     reaches a believed metadata primary without a ready link, so then that roster read also moves the belief.
+    /// </summary>
+    private async Task<bool> IsMetadataPrimaryAsync(VsrConnection connection, long deadline, CancellationToken token)
+    {
+        lock (_pollRoutingGate)
+        {
+            if (MetadataPrimaryLinkLocked() is { IsReady: true } believed && !ReferenceEquals(believed, connection))
+            {
+                return false;
+            }
+        }
+        var attempt = await connection.SendAttemptAsync(CommandCodes.GET_CLUSTER_METADATA_CODE,
+            ReadOnlyMemory<byte>.Empty, deadline, deadline, false, token, retryTransient: false,
+            context: new PartitionContext(0, 0, _metadataWatermark));
+        if (attempt.Error is not null)
+        {
+            return false;
+        }
+        using var response = attempt.Response!;
+        RememberRoster(BinaryMapper.MapClusterMetadata(response.Memory.Span));
+        lock (_pollRoutingGate)
+        {
+            return ReferenceEquals(MetadataPrimaryLinkLocked(), connection);
+        }
+    }
+
+    private VsrConnection? MetadataPrimaryLinkLocked() =>
+        _metadataReplica is { } replica && _replicaLinks.TryGetValue(replica, out var slot) ? slot.Connection : null;
+
+    private static bool IsNamespaceMiss(int status) => status is VsrError.STREAM_ID_NOT_FOUND
+        or VsrError.STREAM_NAME_NOT_FOUND or VsrError.TOPIC_ID_NOT_FOUND or VsrError.TOPIC_NAME_NOT_FOUND
+        or VsrError.PARTITION_NOT_FOUND;
+
     private async Task RefreshPartitionRosterAsync(long deadline, CancellationToken token)
     {
         using var response = await SendPollControlAsync(CommandCodes.GET_CLUSTER_METADATA_CODE,
@@ -739,11 +865,11 @@ public sealed partial class TcpMessageStream
         return TimeSpan.FromMilliseconds(ceiling * sample);
     }
 
-    private void ObserveMetadataCommit(ulong commit, ulong generation)
+    private void ObserveMetadataCommit(ulong commit, ulong dialedUnder)
     {
         lock (_pollRoutingGate)
         {
-            if (generation == _consensusSession.Generation)
+            if (_consensusSession.LinkGeneration(dialedUnder) is not null)
             {
                 _metadataWatermark = Math.Max(_metadataWatermark, commit);
             }
@@ -786,7 +912,7 @@ public sealed partial class TcpMessageStream
     }
 
     // Typed, raw and replayed calls share this success path, and only the request body carries the new credentials.
-    private void RefreshCommittedCredentials(int code, ReadOnlySpan<byte> body)
+    private void RefreshCommittedCredentials(int code, ReadOnlySpan<byte> body, ulong generation)
     {
         if (code is not (CommandCodes.CHANGE_PASSWORD_CODE or CommandCodes.UPDATE_USER_CODE))
         {
@@ -798,23 +924,24 @@ public sealed partial class TcpMessageStream
         if (code == CommandCodes.CHANGE_PASSWORD_CODE)
         {
             var currentPasswordLength = body[position];
-            RefreshRememberedCredentials(user, null, ReadName(body, position + 1 + currentPasswordLength));
+            RefreshRememberedCredentials(user, null, ReadName(body, position + 1 + currentPasswordLength), generation);
         }
         else if (body[position] == 1)
         {
-            RefreshRememberedCredentials(user, ReadName(body, position + 1), null);
+            RefreshRememberedCredentials(user, ReadName(body, position + 1), null, generation);
         }
 
         static string ReadName(ReadOnlySpan<byte> body, int position) =>
             Encoding.UTF8.GetString(body.Slice(position + 1, body[position]));
     }
 
-    private void RefreshRememberedCredentials(Identifier user, string? username, string? password)
+    private void RefreshRememberedCredentials(Identifier user, string? username, string? password, ulong generation)
     {
         lock (_pollRoutingGate)
         {
             var remembered = _rememberedLogin;
-            if (remembered is null || !string.IsNullOrEmpty(remembered.PersonalAccessToken)
+            if (_consensusSession.Ended(generation) is not null || remembered is null
+                || !string.IsNullOrEmpty(remembered.PersonalAccessToken)
                 || !(user.Kind == IdKind.Numeric ? user.GetUInt32() == _rememberedUserId
                     : user.GetString() == remembered.Username))
             {

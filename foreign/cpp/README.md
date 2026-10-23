@@ -25,6 +25,17 @@ bazel test //:unit
 bazel test //:e2e
 ```
 
+Receipt access follows the server's [session and revocation policy](../../core/server/README.md#sessions-and-retry-receipts).
+An unresolved operation cannot recover its receipt after its original session
+ends, even after a new login or account reactivation. A fresh send can duplicate
+that operation.
+
+Each node counts the messages in its stream, topic and system stats. After a
+successful send, a node that is not the partition primary shows the new count
+only after the next prepare or commit broadcast. When no other write follows,
+this delay is at most `cluster.commit_broadcast_interval` (500 ms by default).
+See [metadata freshness and counters](../../core/server/README.md#metadata-freshness-and-counters).
+
 Binary mutations retain an uncertain operation until it is resolved or abandoned.
 `IggyException::OperationId()` carries an exact `std::uint64_t` for
 `operation_uncertain`, `lane_blocked`, and `operation_not_retained`.
@@ -82,6 +93,10 @@ It is reset at entry and populated only when the Rust SDK returns an `IggyError`
 Bridge-local argument errors leave it empty. Inspect `kind`, `code`, and, when
 `has_operation_id` is true, `operation_id`. Use separate values for concurrent
 calls; error state is never stored globally or on the client.
+
+The `IggyException(const std::string &, const ffi::ErrorInfo &)` constructor is
+private. Only `IggyBlockingClient` builds an exception with a code. Other code
+builds an `IggyException` from its message.
 
 Concurrent calls on one client are safe. Moving, assigning, or destroying the
 client while any call is in progress is undefined behavior.

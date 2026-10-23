@@ -32,6 +32,7 @@ pub mod invariants;
 pub mod ops;
 pub mod options;
 pub mod oracle;
+pub mod readback;
 pub mod shadow;
 pub mod state_checker;
 
@@ -43,22 +44,25 @@ use crate::workload::ops::{
 };
 use actions::Action;
 use auditor::{OnReply, ServerAuditor};
-use consensus::MetadataHandle;
+use consensus::{MetadataHandle, PartitionsHandle};
 use effect::{Effect, SimCommand};
-use iggy_binary_protocol::primitives::partition_history::PartitionContext;
+use iggy_binary_protocol::primitives::partition_history::{ConsumerGroupOwner, PartitionContext};
 use iggy_binary_protocol::{
-    KIND_CONSUMER_GROUP, Operation, ReplyHeader, RoutedRequestHeader, result_code,
+    AckLevel, GenericHeader, KIND_CONSUMER_GROUP, Operation, ReplyHeader, RoutedRequestHeader,
+    result_code,
 };
 use iggy_common::IggyError;
 use invariants::Invariants;
+use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::result::result_code_recognized;
-use options::WorkloadOptions;
+use options::{ActionWeights, WorkloadOptions};
 use rand::RngExt;
 use rand_xoshiro::Xoshiro256PlusPlus;
 use rand_xoshiro::rand_core::SeedableRng;
+use readback::PollReadback;
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
-use shadow::{Shadow, ToggleFate};
+use shadow::{CapturedOwner, Shadow, ToggleFate};
 use std::collections::{BTreeMap, HashSet};
 
 /// Max in-flight requests per client. Must stay under the consensus
@@ -140,6 +144,7 @@ pub struct Workload {
     pub auditor: ServerAuditor,
     pub shadow: Shadow,
     pub options: WorkloadOptions,
+    pub readback: PollReadback,
     /// Outstanding requests, keyed as the auditor keys its expectations so the two
     /// are removed together.
     ///
@@ -165,6 +170,8 @@ pub struct Workload {
     deleted_partition_ops_compared: usize,
     stale_owner_stores: u64,
     owner_fence_refusals: u64,
+    /// Group offset stores that the installed owner committed.
+    valid_owner_stores: u64,
     /// Clients whose recovery or redirect handshake is in flight, with the replica
     /// and the tick it last went out on. Such a client submits nothing: its session
     /// is gone or moving, so anything it sent would be refused.
@@ -205,6 +212,7 @@ impl Workload {
             auditor: ServerAuditor::new(),
             shadow,
             options,
+            readback: PollReadback::default(),
             outstanding: BTreeMap::new(),
             now: 0,
             resends: 0,
@@ -213,6 +221,7 @@ impl Workload {
             deleted_partition_ops_compared: 0,
             stale_owner_stores: 0,
             owner_fence_refusals: 0,
+            valid_owner_stores: 0,
             pending_handshakes: BTreeMap::new(),
             homes: BTreeMap::new(),
             samples_none: 0,
@@ -281,6 +290,7 @@ impl Workload {
     pub fn forget_evicted_client(&mut self, client_id: u128) -> usize {
         self.strict_outcome_oracle = false;
         self.outstanding.retain(|&(owner, _), _| owner != client_id);
+        self.readback.forget_client(client_id);
         let forgotten = self.auditor.forget_client(client_id);
         for entry in &forgotten {
             self.finish_fixture_request(client_id, entry, ToggleFate::Unknown);
@@ -585,6 +595,9 @@ impl Workload {
                 replacements,
             },
         );
+        if action == Action::PollMessages {
+            self.readback.note_built(key);
+        }
         self.outstanding.insert(
             key,
             Outstanding {
@@ -609,30 +622,22 @@ impl Workload {
         self.owner_fence_refusals
     }
 
+    #[must_use]
+    pub const fn valid_owner_stores(&self) -> u64 {
+        self.valid_owner_stores
+    }
+
     fn observe_fixture_owners(&mut self, sim: &Simulator) {
         if self.options.weights.weight(Action::StoreStaleOwnerOffset) == 0 {
             return;
         }
         for &namespace in &self.options.namespaces {
-            let Some(primary) = sim.primary_index(namespace).map(usize::from) else {
+            let Some(captured) = primary_owner(sim, namespace, u64::from(shadow::FIXTURE_GROUP_ID))
+            else {
                 continue;
             };
-            let Some(incarnation) = sim.partition_incarnation(primary, namespace) else {
-                continue;
-            };
-            let owner = sim
-                .installed_group_owner(primary, namespace, u64::from(shadow::FIXTURE_GROUP_ID))
-                .unwrap_or_default();
-            let context = PartitionContext {
-                incarnation,
-                owner_generation: owner.generation,
-                metadata_op: sim.replicas[primary].shards[0]
-                    .plane
-                    .metadata()
-                    .applied_frontier()
-                    .get(),
-            };
-            self.shadow.observe_owner(namespace, owner, context);
+            self.shadow
+                .observe_owner(namespace, captured.owner, captured.context);
         }
     }
 
@@ -665,6 +670,11 @@ impl Workload {
             }
             OnReply::Unknown => return Vec::new(),
         };
+        if let InFlightInput::PollMessages(input) = &entry.input {
+            let input = input.clone();
+            self.on_poll_reply(key, entry, &input, reply);
+            return Vec::new();
+        }
         let namespace = IggyNamespace::from_raw(entry.request_namespace);
         if entry.action == Action::StoreStaleOwnerOffset {
             assert_ne!(
@@ -673,7 +683,7 @@ impl Workload {
                 entry.input, header.request, self.options.seed,
             );
             if header.status
-                == IggyError::ConsumerGroupPartitionNotOwned(shadow::FIXTURE_GROUP_ID, 0).as_code()
+                == IggyError::ConsumerGroupPartitionNotOwned(header.client, 0).as_code()
             {
                 self.owner_fence_refusals += 1;
             }
@@ -863,6 +873,12 @@ impl Workload {
         };
         self.finish_fixture_request(header.client, &entry, fate);
         self.assert_group_writer_joined(&entry, header);
+        if committed_code == 0
+            && matches!(&entry.input, InFlightInput::StoreConsumerOffset(input)
+                if input.consumer_kind == KIND_CONSUMER_GROUP)
+        {
+            self.valid_owner_stores += 1;
+        }
 
         // Count a commit only on a success that mutated the shadow, so
         // `commits_per_action` tracks net shadow state (rejections and no-op
@@ -878,6 +894,42 @@ impl Workload {
 
     /// Move the fixture topic that `entry` toggles, or the fixture group that it
     /// joins for `client_id`, by `fate`. No-op for any other request.
+    /// A poll moves no shadow state: the readback oracle checks what it served.
+    fn on_poll_reply(
+        &mut self,
+        key: (u128, u64),
+        entry: InFlight,
+        input: &ops::poll_messages::Input,
+        reply: &Message<ReplyHeader>,
+    ) {
+        let header = reply.header();
+        if header.status != 0 {
+            if TransientRejection::from_code(header.status).is_some() {
+                self.auditor
+                    .note_transient_rejection(entry.action, header.status);
+                self.auditor.record_in_flight(key, entry);
+            } else {
+                self.auditor.note_denial(entry.action, header.status);
+                self.readback.forget(key);
+                self.release_outstanding(key);
+            }
+            return;
+        }
+        let body = &reply.as_slice()[size_of::<ReplyHeader>()..header.size as usize];
+        self.readback.on_served(
+            key,
+            input.ns,
+            (
+                input.offset,
+                input.count,
+                input.consumer_kind == KIND_CONSUMER_GROUP,
+            ),
+            body,
+            self.options.seed,
+        );
+        self.release_outstanding(key);
+    }
+
     fn finish_fixture_request(&mut self, client_id: u128, entry: &InFlight, fate: ToggleFate) {
         match &entry.input {
             InFlightInput::ReplaceFixtureTopic(input) => {
@@ -1161,6 +1213,430 @@ pub fn restore_fixture_topics(
     workload.shadow.fixtures_restored()
 }
 
+/// Name of the group that [`run_group_lifecycle`] creates, retires and
+/// recreates. Outside the `wl-` prefix, so the entity oracle leaves it out.
+const LIFECYCLE_GROUP_NAME: &str = "sim-lifecycle-group";
+
+/// Creates and deletes of the lifecycle group per run. Each round waits for its
+/// retirement, so the second create gives the name a new id and its retirement
+/// supersedes one already committed.
+const LIFECYCLE_GROUP_ROUNDS: usize = 2;
+
+/// Ticks one wait of [`run_group_lifecycle`] may take.
+const LIFECYCLE_GROUP_WAIT_TICKS: u64 = 20_000;
+
+/// Sends of one store of [`run_group_lifecycle`] that may end in a transient
+/// refusal.
+const LIFECYCLE_GROUP_STORE_ATTEMPTS: usize = 8;
+
+/// Ticks between two sends of one store, for a fault behind a transient
+/// refusal to clear.
+const LIFECYCLE_GROUP_RETRY_TICKS: u64 = 500;
+
+/// Drive one consumer group through its whole life on the first fixture topic.
+///
+/// Runs after the drain and before the views settle. The first client creates
+/// the group, joins it, stores an offset, leaves, joins again, replays the
+/// owner token from before the leave, stores again and deletes the group. Then
+/// it creates, joins and deletes the group again.
+///
+/// The partition must refuse the replayed token on its generation alone, since
+/// the same client and session own the partition again. Each delete leaves an
+/// owner, and the first one an offset, that only the reconciler removes, so the
+/// owner retirement runs end to end. Random draws reach neither path in every
+/// run: only a client that regains ownership passes the membership fence.
+///
+/// Returns `None` unless the run joins fixture groups on the shell path, and
+/// otherwise whether every step completed. A step that does not stops the
+/// schedule.
+pub fn run_group_lifecycle(
+    sim: &mut Simulator,
+    workload: &mut Workload,
+    clients: &[SimClient],
+    invariants: &mut Invariants,
+) -> Option<bool> {
+    if !sim.is_shell() || !workload.options.weights.draws_fixture_groups() {
+        return None;
+    }
+    let (Some(client), Some(&namespace)) = (clients.first(), workload.options.namespaces.first())
+    else {
+        return Some(false);
+    };
+    // Fixture 0 is the topic of the first workload namespace.
+    let (stream, topic) = workload.shadow.fixture_names(0);
+    let mut lifecycle = GroupLifecycle {
+        sim,
+        workload,
+        invariants,
+        client,
+        namespace,
+        stream,
+        topic,
+    };
+    let completed = (0..LIFECYCLE_GROUP_ROUNDS).all(|round| lifecycle.round(round == 0).is_some());
+    // A round ends once the partition primary retired the group. The settle
+    // window lets the backups apply the retirement before the quiesce oracle
+    // compares them.
+    step_until(
+        lifecycle.sim,
+        lifecycle.workload,
+        lifecycle.invariants,
+        oracle::QUIESCE_SETTLE_TICKS,
+        |_| false,
+    );
+    Some(completed)
+}
+
+#[derive(Clone, Copy)]
+enum GroupStep {
+    Create,
+    Join,
+    Leave,
+    Delete,
+}
+
+struct GroupLifecycle<'a> {
+    sim: &'a mut Simulator,
+    workload: &'a mut Workload,
+    invariants: &'a mut Invariants,
+    client: &'a SimClient,
+    namespace: IggyNamespace,
+    stream: String,
+    topic: String,
+}
+
+impl GroupLifecycle<'_> {
+    /// One life of the group, from its create to its delete. `None` when a step
+    /// does not complete.
+    fn round(&mut self, replay: bool) -> Option<()> {
+        self.step(GroupStep::Create)?;
+        let group_id = lifecycle_group_id(self.sim, self.namespace)?;
+        self.step(GroupStep::Join)?;
+        let first = self.await_owner(group_id, |owner| !owner.is_unassigned())?;
+        if replay {
+            self.ensure_messages()?;
+            self.store(group_id, None)?;
+            self.step(GroupStep::Leave)?;
+            self.await_owner(group_id, |owner| {
+                owner.is_unassigned() && owner.generation > first.owner.generation
+            })?;
+            self.step(GroupStep::Join)?;
+            self.await_owner(group_id, |owner| {
+                !owner.is_unassigned() && owner.generation > first.owner.generation
+            })?;
+            self.store(group_id, Some(first))?;
+            self.store(group_id, None)?;
+        }
+        self.step(GroupStep::Delete)?;
+        let namespace = self.namespace;
+        step_until(
+            self.sim,
+            self.workload,
+            self.invariants,
+            LIFECYCLE_GROUP_WAIT_TICKS,
+            |sim| {
+                lifecycle_group_id(sim, namespace).is_none()
+                    && group_retired(sim, namespace, group_id)
+            },
+        )
+        .then_some(())
+    }
+
+    /// Send one metadata request and require it to commit successfully.
+    fn step(&mut self, step: GroupStep) -> Option<()> {
+        let (stream, topic) = (self.stream.as_str(), self.topic.as_str());
+        let request = match step {
+            GroupStep::Create => {
+                self.client
+                    .create_consumer_group(stream, topic, LIFECYCLE_GROUP_NAME)
+            }
+            GroupStep::Join => self
+                .client
+                .join_consumer_group(stream, topic, LIFECYCLE_GROUP_NAME),
+            GroupStep::Leave => {
+                self.client
+                    .leave_consumer_group(stream, topic, LIFECYCLE_GROUP_NAME)
+            }
+            GroupStep::Delete => {
+                self.client
+                    .delete_consumer_group(stream, topic, LIFECYCLE_GROUP_NAME)
+            }
+        };
+        let operation = request.header().operation;
+        let target = self.sim.metadata_leader().unwrap_or_default();
+        let reply = self.send(target, &request.into_generic(), operation)?;
+        (result_code(reply.body()) == Some(0)).then_some(())
+    }
+
+    /// Await the reply to `request`. The await steps the cluster without the
+    /// invariants, so they check what committed meanwhile.
+    fn send(
+        &mut self,
+        target: u8,
+        request: &Message<GenericHeader>,
+        operation: Operation,
+    ) -> Option<Message<ReplyHeader>> {
+        let reply = self
+            .sim
+            .try_await_setup_reply(self.client, target, request, operation);
+        self.invariants.check(self.sim, self.workload);
+        reply
+    }
+
+    /// Wait until the partition installed an owner that `wanted` accepts, and
+    /// every live replica committed it in metadata, so the membership fence of
+    /// any replica the next request reaches agrees with the partition. A
+    /// joined owner is this client's.
+    fn await_owner(
+        &mut self,
+        group_id: u64,
+        wanted: impl Fn(ConsumerGroupOwner) -> bool,
+    ) -> Option<CapturedOwner> {
+        let (namespace, client_id, session) = (
+            self.namespace,
+            self.client.client_id(),
+            self.client.session_id(),
+        );
+        let mut settled = None;
+        step_until(
+            self.sim,
+            self.workload,
+            self.invariants,
+            LIFECYCLE_GROUP_WAIT_TICKS,
+            |sim| {
+                settled = settled_owner(sim, namespace, group_id).filter(|captured| {
+                    wanted(captured.owner)
+                        && (captured.owner.is_unassigned()
+                            || (captured.owner.client_id, captured.owner.session)
+                                == (client_id, session))
+                });
+                settled.is_some()
+            },
+        );
+        settled
+    }
+
+    /// A store refuses an empty partition with `InvalidOffset` before its owner
+    /// check, so send until one message is acknowledged.
+    fn ensure_messages(&mut self) -> Option<()> {
+        if self.workload.shadow.sends_committed(self.namespace) > 0 {
+            return Some(());
+        }
+        let weights = std::mem::replace(
+            &mut self.workload.options.weights,
+            ActionWeights::new(&[(Action::SendMessages, 100)]),
+        );
+        let clients = std::slice::from_ref(self.client);
+        let mut sent = false;
+        for _ in 0..LIFECYCLE_GROUP_WAIT_TICKS {
+            sent = self.workload.shadow.sends_committed(self.namespace) > 0
+                && self.workload.total_in_flight() == 0;
+            if sent {
+                break;
+            }
+            self.workload.tick();
+            drive_tick(self.sim, self.workload, clients, self.invariants);
+        }
+        self.workload.options.weights = weights;
+        sent.then_some(())
+    }
+
+    /// Store the newest acknowledged offset as the installed owner, or with the
+    /// token of `stale`, which the partition must refuse. A transient refusal,
+    /// such as a backup's `NotPrimary`, comes before any owner check, so the
+    /// store is sent again after a pause.
+    fn store(&mut self, group_id: u64, stale: Option<CapturedOwner>) -> Option<()> {
+        let consumer_id = u32::try_from(group_id).ok()?;
+        let offset = self
+            .workload
+            .shadow
+            .sends_committed(self.namespace)
+            .checked_sub(1)?;
+        let mut status = self.send_store(consumer_id, offset, stale)?;
+        for _ in 1..LIFECYCLE_GROUP_STORE_ATTEMPTS {
+            if TransientRejection::from_code(status).is_none() {
+                break;
+            }
+            step_until(
+                self.sim,
+                self.workload,
+                self.invariants,
+                LIFECYCLE_GROUP_RETRY_TICKS,
+                |_| false,
+            );
+            status = self.send_store(consumer_id, offset, stale)?;
+        }
+        let Some(captured) = stale else {
+            self.workload.valid_owner_stores += u64::from(status == 0);
+            return (status == 0).then_some(());
+        };
+        assert_ne!(
+            status, 0,
+            "a replayed owner token committed an offset: captured={captured:?}, seed={:#x}",
+            self.workload.options.seed,
+        );
+        self.workload.stale_owner_stores += 1;
+        if status == IggyError::ConsumerGroupPartitionNotOwned(0, 0).as_code() {
+            self.workload.owner_fence_refusals += 1;
+        }
+        Some(())
+    }
+
+    /// Send one store to the partition primary and return the reply status.
+    fn send_store(
+        &mut self,
+        consumer_id: u32,
+        offset: u64,
+        stale: Option<CapturedOwner>,
+    ) -> Option<u32> {
+        let request = if let Some(captured) = stale {
+            ops::store_stale_owner_offset::build_message(
+                self.client,
+                &ops::store_stale_owner_offset::Input {
+                    captured,
+                    group_id: consumer_id,
+                    offset,
+                },
+            )
+        } else {
+            self.sim.discover_partition_contexts(self.client);
+            self.client.store_consumer_offset(
+                self.namespace,
+                KIND_CONSUMER_GROUP,
+                consumer_id,
+                offset,
+                AckLevel::Quorum,
+            )
+        };
+        let target = self.sim.primary_index(self.namespace).unwrap_or_default();
+        let reply = self.send(
+            target,
+            &request.into_generic(),
+            Operation::StoreConsumerOffset,
+        )?;
+        Some(reply.header().status)
+    }
+}
+
+/// Step until `done`, answering every other reply, for at most `max_ticks`.
+fn step_until(
+    sim: &mut Simulator,
+    workload: &mut Workload,
+    invariants: &mut Invariants,
+    max_ticks: u64,
+    mut done: impl FnMut(&Simulator) -> bool,
+) -> bool {
+    for _ in 0..max_ticks {
+        if done(sim) {
+            return true;
+        }
+        workload.tick();
+        for reply in sim.step() {
+            let cmds = workload.on_reply(&reply);
+            apply_sim_commands(sim, &cmds);
+        }
+        invariants.check(sim, workload);
+    }
+    done(sim)
+}
+
+/// The id of [`LIFECYCLE_GROUP_NAME`] in the metadata of the leader.
+fn lifecycle_group_id(sim: &Simulator, namespace: IggyNamespace) -> Option<u64> {
+    let leader = sim.metadata_leader()?;
+    sim.replicas[usize::from(leader)].shards[0]
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .read(|inner| {
+            inner
+                .items
+                .get(namespace.stream_id())?
+                .topics
+                .get(namespace.topic_id())?
+                .consumer_groups
+                .iter()
+                .find(|(_, group)| group.name.as_ref() == LIFECYCLE_GROUP_NAME)
+                .map(|(&group_id, _)| group_id)
+        })
+}
+
+/// Whether the partition primary of `namespace` retired `group_id`.
+fn group_retired(sim: &Simulator, namespace: IggyNamespace, group_id: u64) -> bool {
+    sim.primary_index(namespace).is_some_and(|primary| {
+        sim.replicas[usize::from(primary)]
+            .partition_shard(namespace)
+            .plane
+            .partitions()
+            .get_by_ns(&namespace)
+            .is_some_and(|partition| partition.consumer_group_retired(group_id))
+    })
+}
+
+/// The owner the partition primary installed for `group_id`, once every live
+/// replica committed it in metadata with no successor pending.
+fn settled_owner(
+    sim: &Simulator,
+    namespace: IggyNamespace,
+    group_id: u64,
+) -> Option<CapturedOwner> {
+    let captured = primary_owner(sim, namespace, group_id)?;
+    let owner = captured.owner;
+    (0..sim.replica_count)
+        .filter(|&replica| !sim.is_crashed(replica))
+        .all(|replica| {
+            sim.replicas[usize::from(replica)].shards[0]
+                .plane
+                .metadata()
+                .mux_stm
+                .streams()
+                .read(|inner| {
+                    inner
+                        .items
+                        .get(namespace.stream_id())
+                        .and_then(|stream| stream.topics.get(namespace.topic_id()))
+                        .and_then(|topic| topic.consumer_groups.get(&group_id))
+                        .and_then(|group| group.assignments.get(&namespace.partition_id()))
+                        .is_some_and(|assignment| {
+                            assignment.pending.is_none()
+                                && assignment.owner.map_or_else(
+                                    || owner.is_unassigned(),
+                                    |committed| committed == owner,
+                                )
+                        })
+                })
+        })
+        .then_some(captured)
+}
+
+/// The owner the partition primary of `namespace` installed for `group_id`, or
+/// the default owner when it installed none, with the context that a store by
+/// that owner carries.
+fn primary_owner(
+    sim: &Simulator,
+    namespace: IggyNamespace,
+    group_id: u64,
+) -> Option<CapturedOwner> {
+    let primary = usize::from(sim.primary_index(namespace)?);
+    let incarnation = sim.partition_incarnation(primary, namespace)?;
+    let owner = sim
+        .installed_group_owner(primary, namespace, group_id)
+        .unwrap_or_default();
+    Some(CapturedOwner {
+        namespace,
+        owner,
+        context: PartitionContext {
+            incarnation,
+            owner_generation: owner.generation,
+            metadata_op: sim.replicas[primary].shards[0]
+                .plane
+                .metadata()
+                .applied_frontier()
+                .get(),
+        },
+    })
+}
+
 /// One driver tick after the clock and the fault injector moved: resends, a new
 /// request from each idle client, the replies, the logs of deleted fixtures,
 /// evicted clients, settled fixture replacements and the invariants. Returns the
@@ -1176,6 +1652,7 @@ fn drive_tick(
     resubmit_due(sim, workload);
     resubmit_due_handshakes(sim, workload, clients);
     workload.observe_fixture_owners(sim);
+    workload.readback.observe_liveness(sim);
     for client in clients {
         // A client whose session is gone submits nothing: the request would be
         // refused and evict it again, and the eviction would look like a fresh
@@ -1201,6 +1678,7 @@ fn drive_tick(
         let cmds = workload.on_reply(&reply);
         apply_sim_commands(sim, &cmds);
     }
+    workload.readback.check_served(sim, workload.options.seed);
     workload.compare_deleted_fixture_logs(sim);
     recover_evicted_clients(sim, workload, clients);
     workload.settle_fixture_replacements(sim);
@@ -1513,9 +1991,7 @@ mod tests {
     use iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner;
     use iggy_binary_protocol::requests::consumer_offsets::StoreConsumerOffsetRequest;
     use iggy_binary_protocol::{Command, WireDecode};
-    use metadata::impls::metadata::StreamsFrontend;
     use metadata::stm::result::{ApplyReply, CreateTopicResult, DeleteTopicResult};
-    use options::ActionWeights;
     use server_common::sharding::IggyNamespace;
     use std::rc::Rc;
 

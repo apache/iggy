@@ -72,6 +72,22 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
     /// </summary>
     public static readonly TimeSpan SessionReportInterval = TimeSpan.FromMilliseconds(500);
 
+    private static readonly TimeSpan StatsConvergenceTimeout = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan StatsPollInterval = TimeSpan.FromMilliseconds(100);
+
+    /// <summary>Node-local counters catch up after partition commit broadcasts.</summary>
+    public static async Task<T> ReadConvergedStatsAsync<T>(Func<Task<T>> read, Func<T, bool> converged)
+    {
+        var deadline = Environment.TickCount64 + (long)StatsConvergenceTimeout.TotalMilliseconds;
+        var result = await read();
+        while (!converged(result) && Environment.TickCount64 < deadline)
+        {
+            await Task.Delay(StatsPollInterval);
+            result = await read();
+        }
+        return result;
+    }
+
     /// <summary>
     ///     Extra environment variables for every node, layered over the cluster's base configuration.
     ///     Heartbeat verification is on for every fixture so the eviction tests share the general server

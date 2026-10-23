@@ -46,7 +46,6 @@ use state::StateStorage;
 use std::{
     collections::HashMap,
     env,
-    num::NonZeroU32,
     sync::{Arc, atomic::AtomicU32},
 };
 use system_stats::capture_allowed_cpus;
@@ -186,7 +185,6 @@ fn print_config_env_vars() -> std::io::Result<()> {
         let plugin_config = format!("{prefix}{PLUGIN_CONFIG_ENV_SEGMENT}<FIELD>");
         templates
             .iter()
-            .filter(|template| !matches!(template.env_name, "KEY" | "VERSION"))
             .map(move |template| format!("{prefix}{}", template.env_name))
             .chain(std::iter::once(plugin_config))
     });
@@ -585,7 +583,6 @@ struct SourceConnectorPlugin {
 struct SourceConnectorProducer {
     encoder: Arc<dyn StreamEncoder>,
     producer: IggyProducer,
-    batch_length: NonZeroU32,
 }
 
 struct SourceConnectorWrapper {

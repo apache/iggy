@@ -64,7 +64,7 @@ permissions:
 
 jobs:
   triage:
-    runs-on: ubuntu-26.04-arm
+    runs-on: ubuntu-slim
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7.0.1

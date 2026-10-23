@@ -73,8 +73,13 @@ struct SessionE2ETests {
             await #expect(throws: IggyError.self) {
                 try await client.login(username: "nobody", password: "wrong-password")
             }
+            #expect(await client.state == .disconnected)
+            try await client.connect()
             #expect(await client.state == .connected)
             try await client.ping()
+            await #expect(throws: IggyError(.unauthenticated)) {
+                try await client.getStreams()
+            }
         }
     }
 
@@ -604,8 +609,16 @@ struct MessagingE2ETests {
             // Only closed segments can be deleted; a fresh partition has one open
             // segment, so the request is accepted and removes nothing.
             try await client.deleteSegments(streamID: scratch.stream, topicID: scratch.topic, partitionID: 0, count: 1)
-            let topic = try #require(try await client.getTopic(streamID: scratch.stream, topicID: scratch.topic))
-            #expect(topic.partitions[0].messagesCount == 3)
+            let polled = try await client.pollMessages(
+                streamID: scratch.stream, topicID: scratch.topic, partitionID: 0, consumer: .default, strategy: .first, count: 10, autoCommit: false)
+            #expect(polled.messages.map(\.offset) == [0, 1, 2])
+            // Topic stats come from the replica that answers, which can trail
+            // the partition primary until it applies the commit.
+            let counted = try await E2EEnvironment.eventually {
+                let topic = try await client.getTopic(streamID: scratch.stream, topicID: scratch.topic)
+                return topic?.partitions.first?.messagesCount == 3
+            }
+            #expect(counted)
         }
     }
 

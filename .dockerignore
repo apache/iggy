@@ -11,6 +11,14 @@
 /licenses
 /local_data
 /performance_results
+/test_logs
+/foreign/swift/.build
+/bdd/java/build
+/examples/java/**/build
+/foreign/java/**/build
+/web/build
+**/.gradle
+**/node_modules
 # Selectively exclude scripts/ subdirs not needed in container builds.
 # scripts/ci/third-party-licenses.sh + render-node-licenses.mjs are
 # required by the convenience-binary Dockerfiles to render LICENSE-binary

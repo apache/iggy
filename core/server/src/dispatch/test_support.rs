@@ -19,12 +19,14 @@
 //! client- and replica-bound frames instead of writing to sockets, and the
 //! builders below assemble minimal shards and wire frames.
 
+use bytes::Bytes;
 use consensus::{LocalPipeline, MetadataHandle, VsrConsensus};
 use futures::channel::oneshot;
 use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
+use iggy_binary_protocol::requests::consumer_groups::CreateConsumerGroupRequest;
 use iggy_binary_protocol::requests::streams::CreateStreamRequest;
 use iggy_binary_protocol::requests::topics::{
-    CreateTopicRequest, CreateTopicWithAssignmentsRequest,
+    CreateTopicRequest, CreateTopicWithAssignmentsRequest, DeleteTopicRequest,
 };
 use iggy_binary_protocol::requests::users::CreateUserRequest;
 use iggy_binary_protocol::{
@@ -39,12 +41,13 @@ use message_bus::installer::ConnectionInstaller;
 use message_bus::installer::conn_info::ClientConnMeta;
 use message_bus::replica::listener::MessageHandler;
 use message_bus::{
-    BusMessage, ClientConnectionLostFn, ClientForwardFn, ConnectionLostFn, ConnectionPermit,
-    JoinHandle, MessageBus, ReplicaForwardFn, ReplicaHandshakeDoneFn, SendError,
+    BusMessage, ClientConnectionLostFn, ConnectionLostFn, ConnectionPermit, ConnectionRegistry,
+    InstanceToken, JoinHandle, MessageBus, ReplicaForwardFn, ReplicaHandshakeDoneFn, SendError,
     SharedTlsServerConfig,
 };
 use metadata::impls::metadata::{IggySnapshot, StreamsFrontend};
 use metadata::stm::StateMachine as _;
+use metadata::stm::lifecycle::{CompleteLifecycleRequest, LifecycleCompletion};
 use metadata::stm::stream::Streams;
 use metadata::stm::user::Users;
 use metadata::{IggyMetadata, MuxStateMachine};
@@ -55,12 +58,13 @@ use server_common::{MESSAGE_ALIGN, Message};
 use shard::shards_table::PapayaShardsTable;
 use shard::{IggyShard, PartitionConsensusConfig, ReplicaTopology, ShardIdentity};
 use std::cell::{Cell, RefCell};
+use std::future::Future;
 use std::mem::size_of;
 use std::rc::Rc;
 
 pub type TestMux = MuxStateMachine<variadic!(Users, Streams)>;
 pub type TestShard = IggyShard<SpyBus, PrepareJournal, IggySnapshot, TestMux, PapayaShardsTable>;
-/// `(target client id, reply frame bytes)` per `send_to_client` call.
+/// `(target client id, reply frame bytes)` per accepted instance-addressed send.
 pub type RecordedReplies = Rc<RefCell<Vec<(u128, Vec<u8>)>>>;
 /// `(target replica id, frame bytes)` per `send_to_replica` call.
 pub type RecordedReplicaSends = Rc<RefCell<Vec<(u8, Vec<u8>)>>>;
@@ -74,6 +78,7 @@ pub struct SpyBus {
     pub client_replies: RecordedReplies,
     pub replica_sends: RecordedReplicaSends,
     pub replica_send_capacity: Rc<Cell<Option<usize>>>,
+    pub spawned: Rc<Cell<usize>>,
     /// Installs of the client connection-lost hook, one per handler built
     /// on this bus.
     pub connection_lost_hooks: Rc<Cell<usize>>,
@@ -85,13 +90,33 @@ pub struct SpyBus {
     /// Holds the next [`MessageBus::sleep`], whatever its duration, until the
     /// test sends on or drops the paired sender. Wins over `instant_timers`.
     pub held_timer: Rc<RefCell<Option<oneshot::Receiver<()>>>>,
+    /// Never resolve [`MessageBus::sleep`], so a wall-clock budget raced
+    /// against it never cuts the work short and only its own bounds end it.
+    /// Wins over `instant_timers`.
+    pub frozen_timers: Rc<Cell<bool>>,
     /// Every [`MessageBus::sleep`] duration, in call order.
     pub sleeps: Rc<RefCell<Vec<std::time::Duration>>>,
     /// Pins [`MessageBus::realtime_micros`]. `None` reads the system clock.
     pub realtime: Rc<Cell<Option<u64>>>,
+    /// One installation per client connection, as the production registry
+    /// keeps them. [`ConnectionInstaller::client_instance`] opens one on
+    /// first sight, so every client is connected until
+    /// [`Self::reconnect_client`] replaces its connection.
+    pub client_installs: Rc<ConnectionRegistry<u128>>,
 }
 
 impl SpyBus {
+    /// Replace the connection installed under `client_id`, as when a client
+    /// reconnects under the same id: replies addressed to the previous
+    /// installation are refused from now on.
+    pub fn reconnect_client(&self, client_id: u128) {
+        self.client_installs.remove(client_id);
+        assert!(
+            self.client_installs.insert_in_process(client_id).is_some(),
+            "the removed client id is free"
+        );
+    }
+
     /// Decode the single frame this bus sent to a replica.
     pub fn sole_replica_send<H: iggy_binary_protocol::ConsensusHeader>(&self) -> (u8, H) {
         let sends = self.replica_sends.borrow();
@@ -107,16 +132,18 @@ impl SpyBus {
 
 #[allow(clippy::future_not_send)]
 impl MessageBus for SpyBus {
+    fn spawn(&self, future: impl Future<Output = ()> + 'static) {
+        self.spawned.set(self.spawned.get() + 1);
+        compio::runtime::spawn(future).detach();
+    }
+
     fn track_background(&self, _handle: JoinHandle<()>) {}
     async fn send_to_client(
         &self,
         client_id: u128,
-        data: impl Into<BusMessage>,
+        _data: impl Into<BusMessage>,
     ) -> Result<(), SendError> {
-        self.client_replies
-            .borrow_mut()
-            .push((client_id, data.into().into_contiguous().as_slice().to_vec()));
-        Ok(())
+        Err(SendError::ClientNotFound(client_id))
     }
     async fn send_to_replica(
         &self,
@@ -140,6 +167,8 @@ impl MessageBus for SpyBus {
         let held = self.held_timer.borrow_mut().take();
         if let Some(release) = held {
             let _ = release.await;
+        } else if self.frozen_timers.get() {
+            std::future::pending::<()>().await;
         } else if !self.instant_timers.get() {
             compio::time::sleep(duration).await;
         }
@@ -151,7 +180,6 @@ impl MessageBus for SpyBus {
     }
     fn set_connection_lost_fn(&self, _f: ConnectionLostFn) {}
     fn set_replica_forward_fn(&self, _f: ReplicaForwardFn) {}
-    fn set_client_forward_fn(&self, _f: ClientForwardFn) {}
 }
 
 impl ConnectionInstaller for SpyBus {
@@ -213,6 +241,26 @@ impl ConnectionInstaller for SpyBus {
         self.connection_lost_hooks
             .set(self.connection_lost_hooks.get() + 1);
     }
+    fn client_instance(&self, client_id: u128) -> Option<InstanceToken> {
+        self.client_installs
+            .instance(client_id)
+            .or_else(|| self.client_installs.insert_in_process(client_id))
+    }
+    #[allow(clippy::future_not_send)]
+    async fn send_to_client_instance(
+        &self,
+        client_id: u128,
+        instance: Option<InstanceToken>,
+        message: BusMessage,
+    ) -> Result<(), SendError> {
+        if instance.is_none() || self.client_installs.instance(client_id) != instance {
+            return Err(SendError::ClientNotFound(client_id));
+        }
+        self.client_replies
+            .borrow_mut()
+            .push((client_id, message.into_contiguous().as_slice().to_vec()));
+        Ok(())
+    }
 }
 
 /// Consensus incarnations standing for two successive boots of one node, as
@@ -232,6 +280,22 @@ pub const UNDECLARED_OPERATION: u8 = 131;
 /// forward-nonce counter from it, so passing a different value models a
 /// restart.
 pub fn test_shard(bus: &SpyBus, replica: u8, replica_count: u8, incarnation: u128) -> TestShard {
+    test_shard_with_frontier(
+        bus,
+        replica,
+        replica_count,
+        incarnation,
+        std::sync::Arc::default(),
+    )
+}
+
+pub fn test_shard_with_frontier(
+    bus: &SpyBus,
+    replica: u8,
+    replica_count: u8,
+    incarnation: u128,
+    frontier: std::sync::Arc<metadata::AppliedFrontier>,
+) -> TestShard {
     let consensus = VsrConsensus::new(
         1,
         replica,
@@ -243,7 +307,8 @@ pub fn test_shard(bus: &SpyBus, replica: u8, replica_count: u8, incarnation: u12
     consensus.set_incarnation(incarnation);
     consensus.init();
     let metadata: IggyMetadata<_, PrepareJournal, IggySnapshot, TestMux> =
-        IggyMetadata::new(Some(consensus), None, None, None, TestMux::default(), None);
+        IggyMetadata::new(Some(consensus), None, None, None, TestMux::default(), None)
+            .with_applied_frontier(frontier);
     let partitions = IggyPartitions::new(
         ShardId::new(0),
         PartitionsConfig {
@@ -352,6 +417,9 @@ pub fn prepare_message(
     consensus::seal_prepare_checksum(message)
 }
 
+/// The client that issues the setup operations below.
+const VSR_CLIENT_ID: u128 = 1;
+
 /// Creates one stream with one single-partition topic, and returns the
 /// namespace of its partition. No route names the partition yet.
 pub fn create_one_partition(shard: &TestShard) -> IggyNamespace {
@@ -360,7 +428,6 @@ pub fn create_one_partition(shard: &TestShard) -> IggyNamespace {
 
 /// [`create_one_partition`] on the metadata state machine of any shard.
 pub fn create_one_partition_in(mux_stm: &TestMux) -> IggyNamespace {
-    const VSR_CLIENT_ID: u128 = 1;
     mux_stm.users().ensure_root_user("iggy", "hash");
     mux_stm
         .update(prepare_message(
@@ -388,10 +455,10 @@ pub fn create_one_partition_in(mux_stm: &TestMux) -> IggyNamespace {
                 },
                 derived_options: WireOptions::empty(),
                 partitions: vec![CreatedPartitionAssignment {
+                    initial_view: 0,
                     partition_id: 0,
                     consensus_group_id: 1,
                 }],
-                created_view: 0,
             }
             .to_bytes(),
         ))
@@ -400,6 +467,83 @@ pub fn create_one_partition_in(mux_stm: &TestMux) -> IggyNamespace {
         .streams()
         .namespace_from_partition(&WireIdentifier::numeric(0), &WireIdentifier::numeric(0), 0)
         .unwrap()
+}
+
+/// Delete and recreate the topic at the same slab ids through committed metadata operations.
+pub fn recreate_topic_in(mux_stm: &TestMux, namespace: IggyNamespace) {
+    let apply = |op, operation, body: Bytes| {
+        mux_stm
+            .update(prepare_message(operation, 0, op, &body).transmute_header(
+                |old, header: &mut iggy_binary_protocol::PrepareHeader| {
+                    *header = old;
+                    header.op = op;
+                },
+            ))
+            .unwrap()
+    };
+    let deleted = apply(
+        4,
+        Operation::DeleteTopic,
+        DeleteTopicRequest {
+            stream_id: WireIdentifier::numeric(namespace.stream_id().try_into().unwrap()),
+            topic_id: WireIdentifier::numeric(namespace.topic_id().try_into().unwrap()),
+        }
+        .to_bytes(),
+    );
+    assert_eq!(deleted.code, 0);
+    let completion = CompleteLifecycleRequest::new(
+        4,
+        namespace.stream_id().try_into().unwrap(),
+        vec![LifecycleCompletion {
+            topic_id: namespace.topic_id().try_into().unwrap(),
+            partition_id: namespace.partition_id().try_into().unwrap(),
+            partition_op: 1,
+        }],
+    )
+    .unwrap();
+    let completed = apply(5, Operation::CompleteLifecycle, completion.to_bytes());
+    assert_eq!(completed.code, 0);
+    let created = apply(
+        6,
+        Operation::CreateTopicWithAssignments,
+        CreateTopicWithAssignmentsRequest {
+            request: CreateTopicRequest {
+                stream_id: WireIdentifier::numeric(namespace.stream_id().try_into().unwrap()),
+                partitions_count: 1,
+                name: WireName::new("topic").unwrap(),
+                options: WireOptions::empty(),
+            },
+            derived_options: WireOptions::empty(),
+            partitions: vec![CreatedPartitionAssignment {
+                partition_id: namespace.partition_id().try_into().unwrap(),
+                consensus_group_id: 2,
+                initial_view: 0,
+            }],
+        }
+        .to_bytes(),
+    );
+    assert_eq!(created.code, 0);
+}
+
+/// Creates consumer group 0, with no members, in the topic of
+/// [`create_one_partition`].
+pub fn create_consumer_group(shard: &TestShard) {
+    shard
+        .plane
+        .metadata()
+        .mux_stm
+        .update(prepare_message(
+            Operation::CreateConsumerGroup,
+            VSR_CLIENT_ID,
+            3,
+            &CreateConsumerGroupRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                name: WireName::new("group").unwrap(),
+            }
+            .to_bytes(),
+        ))
+        .unwrap();
 }
 
 /// A `CreateUser` request for a user that may read server state and poll

@@ -39,6 +39,7 @@ use crate::auth::{
     AuthError, AuthenticatedPrincipal, FailedLoginThrottle, PrincipalResolver, SaslAuthenticator,
 };
 use crate::bridge::IggyBridge;
+use crate::cluster_id::ClusterId;
 use crate::error::{KafkaProtocolError, Result};
 use crate::group::{GroupCoordinator, GroupCoordinatorConfig};
 use crate::listener::{ListenerConfig, SecurityProtocol};
@@ -51,6 +52,7 @@ use crate::protocol::api::{
     decode_sasl_mechanism, describe_acls_outcome, encode_error_for_key, handle_connection_request,
     respond_describe_acls_error, sasl_authenticate_outcome, sasl_handshake_outcome,
 };
+use crate::protocol::auto_topic_creation::{self, AutoTopicCreationConfig};
 use crate::protocol::handlers::api_versions::Advertisement;
 use crate::protocol::header::{request_header_version, response_header_version};
 use crate::protocol::sasl::{
@@ -160,6 +162,9 @@ pub struct GatewayConfig {
     ///
     /// Client certificate user lookups get the same number of slots again, separate from these.
     pub max_concurrent_authentications: usize,
+    /// Whether a `Metadata` lookup of a missing topic creates it, and with how many partitions
+    /// (`IGGY_KAFKA_AUTO_CREATE_TOPICS_*`). Off by default.
+    pub auto_topic_creation: AutoTopicCreationConfig,
 }
 
 impl Default for GatewayConfig {
@@ -180,6 +185,7 @@ impl Default for GatewayConfig {
             instance_id: 0,
             pre_auth_timeout: Duration::from_secs(15),
             max_concurrent_authentications: 4,
+            auto_topic_creation: AutoTopicCreationConfig::default(),
         }
     }
 }
@@ -309,6 +315,7 @@ pub struct KafkaGateway {
     authenticator: Option<Arc<dyn SaslAuthenticator>>,
     bridge: Option<Arc<IggyBridge>>,
     principal_resolver: Option<Arc<dyn PrincipalResolver>>,
+    cluster_id: Option<ClusterId>,
 }
 
 /// Owned by [`KafkaGateway::run`] and shared by every connection it serves.
@@ -377,6 +384,7 @@ impl KafkaGateway {
             authenticator: None,
             bridge: None,
             principal_resolver: None,
+            cluster_id: None,
         }
     }
 
@@ -388,6 +396,17 @@ impl KafkaGateway {
     #[must_use]
     pub fn with_bridge(mut self, bridge: Option<Arc<IggyBridge>>) -> Self {
         self.bridge = bridge;
+        self
+    }
+
+    /// Reports `cluster_id`, already loaded from Iggy, instead of loading it in [`Self::run`].
+    ///
+    /// `main` loads it before it binds the listeners, so a client is never queued behind the
+    /// calls to Iggy. Without a bridge or this, the id is random and lasts as long as the
+    /// process.
+    #[must_use]
+    pub fn with_cluster_id(mut self, cluster_id: ClusterId) -> Self {
+        self.cluster_id = Some(cluster_id);
         self
     }
 
@@ -421,7 +440,8 @@ impl KafkaGateway {
     /// # Errors
     ///
     /// Returns an error on invalid config, unusable TLS material, or a non-transient `accept()`
-    /// error on any listener.
+    /// error on any listener. With a bridge and no [`Self::with_cluster_id`], also returns the
+    /// bridge's error when it cannot load the cluster id from Iggy.
     pub async fn run(
         self,
         listeners: Vec<BoundListener>,
@@ -478,12 +498,8 @@ impl KafkaGateway {
         // coordinator can take a child token: a parked JoinGroup or SyncGroup waiter would
         // otherwise hold the drain open for a full rebalance timeout.
         let cancel = CancellationToken::new();
-        let state = Arc::new(GatewayState::new(
-            self.bridge.clone(),
-            self.config.max_frame_size,
-            self.config.instance_id,
-            GroupCoordinator::new(self.config.group.clone(), cancel.child_token()),
-        ));
+        let cluster_id = self.cluster_id().await?;
+        let state = Arc::new(self.shared_state(cluster_id, &cancel)?);
         let shared_auth = Arc::new(SharedAuth::new(
             self.authenticator.clone(),
             resolver,
@@ -536,7 +552,42 @@ impl KafkaGateway {
         cancel.cancel();
         accept_loops.shutdown().await;
         drain(&tracker, &cancel, drain_timeout).await;
+        // After the drain, so no connection starts one after it, and before `run` returns, so
+        // none still runs when the bridge signs out.
+        state
+            .shutdown_auto_topic_creation(auto_topic_creation::SHUTDOWN_WAIT)
+            .await;
         outcome
+    }
+
+    /// The state every connection of [`Self::run`] shares. The group coordinator stops with
+    /// `cancel`.
+    fn shared_state(
+        &self,
+        cluster_id: ClusterId,
+        cancel: &CancellationToken,
+    ) -> Result<GatewayState> {
+        GatewayState::new(
+            self.bridge.clone(),
+            self.config.max_frame_size,
+            self.config.instance_id,
+            GroupCoordinator::new(self.config.group.clone(), cancel.child_token()),
+        )
+        .with_cluster_id(cluster_id)
+        .with_auto_topic_creation(self.config.auto_topic_creation)
+    }
+
+    /// The id set by [`Self::with_cluster_id`], else the one stored in Iggy, else a random one.
+    async fn cluster_id(&self) -> Result<ClusterId> {
+        if let Some(cluster_id) = &self.cluster_id {
+            return Ok(cluster_id.clone());
+        }
+        let Some(bridge) = &self.bridge else {
+            let cluster_id = ClusterId::random();
+            info!("no Iggy bridge, so cluster id {cluster_id} lasts only as long as this process");
+            return Ok(cluster_id);
+        };
+        Ok(bridge.load_cluster_id().await?)
     }
 
     /// Refuses to start when the SASL listeners and the configured authenticator disagree.

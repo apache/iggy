@@ -21,7 +21,7 @@
 //! applies a request twice.
 
 use crate::links::{Frame, Link, ReplicaLinks, Target, lost_link, pause_before_retry, read_reply};
-use crate::session_owner::{LaneKey, LaneTicket, RetainedOperation, SessionOwner};
+use crate::session_owner::{LaneKey, LaneTicket, RetainedOperation, SessionEpoch, SessionOwner};
 use crate::vsr::decode_reply_for;
 use bytes::Bytes;
 use iggy_binary_protocol::codes::{
@@ -41,7 +41,9 @@ use iggy_binary_protocol::requests::users::{ChangePasswordRequest, UpdateUserReq
 use iggy_binary_protocol::responses::messages::PartitionRouteResponse;
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
 use iggy_binary_protocol::{WireDecode, WireEncode, WirePartitioning, WirePollingStrategy};
-use iggy_common::{ClientState, Credentials, Identifier, IggyError};
+use iggy_common::{
+    BinaryOperationLineage, ClientState, Credentials, DiagnosticEvent, Identifier, IggyError,
+};
 use route_cache::RouteCache;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use tokio::time::{Instant, timeout_at};
@@ -111,15 +113,35 @@ impl OperationDriver {
         )
     }
 
-    pub(crate) async fn remember(&self, credentials: Credentials, user_id: u32) {
-        if self
-            .session
-            .remember_unless(|| self.stopped().is_some(), credentials, user_id)
-            && let Ok(link) = self.links.link(Target::MetadataPrimary)
+    pub(crate) fn begin_sign_in(&self) -> Result<ExplicitSignIn<'_>, IggyError> {
+        let (lineage, owed) = self.session.begin_sign_in()?;
+        if owed {
+            self.session
+                .in_lineage(lineage.lineage(), || self.links.disconnect());
+        }
+        Ok(ExplicitSignIn {
+            driver: self,
+            lineage,
+            complete: false,
+        })
+    }
+
+    pub(crate) async fn finish_sign_in(
+        &self,
+        credentials: Credentials,
+        user_id: u32,
+    ) -> Result<(), IggyError> {
+        let lineage = self.session.operation_lineage().lineage();
+        if let Ok(link) = self.links.link(Target::MetadataPrimary)
             && let Err(error) = self.links.refresh_roster(&link).await
         {
             debug!("Failed to refresh replicas after sign-in: {error}");
         }
+        self.session
+            .finish_sign_in(lineage, credentials, user_id, || {
+                self.links.set_state(ClientState::Authenticated);
+                self.links.publish(DiagnosticEvent::SignedIn);
+            })
     }
 
     pub(crate) async fn poll(
@@ -138,7 +160,7 @@ impl OperationDriver {
             }
             None => return Err(IggyError::InvalidIdentifier),
         };
-        self.send(
+        let call = Call::new(
             POLL_MESSAGES_CODE,
             request.to_bytes(),
             RequestTarget::Partition(PartitionTarget {
@@ -147,7 +169,13 @@ impl OperationDriver {
                 partition_id,
                 context,
             }),
-        )
+            operation_deadline(),
+        );
+        self.drive(Call {
+            progress_poll: request.auto_commit
+                || request.strategy.kind == WirePollingStrategy::next().kind,
+            ..call
+        })
         .await
     }
 
@@ -220,13 +248,15 @@ impl OperationDriver {
         .await
     }
 
-    /// Sends one request and returns the body of its reply.
+    /// Sends one request and returns the body of its reply. A poll goes
+    /// through [`Self::poll`], which knows whether the poll moves its consumer.
     pub(crate) async fn send(
         &self,
         code: u32,
         payload: Bytes,
         target: RequestTarget<'_>,
     ) -> Result<Bytes, IggyError> {
+        debug_assert_ne!(code, POLL_MESSAGES_CODE, "a poll goes through Self::poll");
         let deadline = operation_deadline();
         self.drive(Call::new(code, payload, target, deadline)).await
     }
@@ -251,10 +281,13 @@ impl OperationDriver {
     }
 
     async fn drive(&self, mut call: Call) -> Result<Bytes, IggyError> {
-        let epoch = self.session.epoch();
-        let requires_session = epoch.bound || epoch.sign_in_owed;
+        let lineage = self.session.operation_lineage().lineage();
+        let started = SessionEpoch {
+            lineage,
+            ..self.session.epoch()
+        };
         loop {
-            let next = match self.attempt(&mut call, requires_session).await {
+            let next = match self.attempt(&mut call, started).await {
                 Ok(body) => {
                     self.refresh_sign_in(&call);
                     call.complete(Ok(()));
@@ -312,9 +345,17 @@ impl OperationDriver {
     }
 
     /// One attempt of `call`, from the choice of its replica to its reply.
-    async fn attempt(&self, call: &mut Call, requires_session: bool) -> Result<Bytes, Next> {
-        if let Some(error) = self.stopped() {
-            return Err(Next::Fail(error));
+    /// The call started in the session epoch `started`.
+    async fn attempt(&self, call: &mut Call, started: SessionEpoch) -> Result<Bytes, Next> {
+        match self.stopped() {
+            Some(IggyError::ClientShutdown) => return Err(Next::Fail(IggyError::ClientShutdown)),
+            // The caller signed in, signed out or disconnected since the call
+            // started, and only a recovery by the client continues a call.
+            _ if self.session.epoch().lineage != started.lineage => {
+                return Err(Next::Fail(IggyError::Unauthenticated));
+            }
+            Some(error) => return Err(Next::Fail(error)),
+            None => {}
         }
         if call.frame.is_some() && call.fence() != Some(self.session.fence()) {
             // A replaced session can never apply the frame. An uncertain call
@@ -325,9 +366,9 @@ impl OperationDriver {
             call.frame = None;
         }
         if call.frame.is_none() {
-            self.wait_for_session(call, requires_session).await?;
+            self.wait_for_session(call, started).await?;
         }
-        let route = self.route_for(call).await?;
+        let route = self.route_for(call, started.lineage).await?;
         let context = self.context(call, route.as_ref());
         // The lane comes first, so a blocked lane ends the call at once, also
         // while no link is ready.
@@ -336,10 +377,10 @@ impl OperationDriver {
             .frame
             .as_ref()
             .map_or(call.payload.len(), |frame| frame.body.len());
-        ticket
-            .reserve(call.code, body_len, call.deadline)
-            .await
-            .map_err(Next::Fail)?;
+        if let Err(error) = ticket.reserve(call.code, body_len, call.deadline).await {
+            call.ticket = Some(ticket);
+            return Err(Next::Fail(error));
+        }
         let hop = match self.hop(call, route).await {
             Ok(hop) => hop,
             Err(next) => {
@@ -348,13 +389,24 @@ impl OperationDriver {
             }
         };
         let deadline = call.deadline;
-        let (frame, ticket) = call.frame(ticket, context)?;
+        let (frame, ticket) = call.frame(ticket, context, started.lineage)?;
         let request = frame.header;
         let result = hop.link.send(frame, deadline, ticket.sent_flag()).await;
         let sent = *ticket.sent_flag();
         let result = match result {
             Ok(reply) => match decode_reply_for(&request, &reply.header, reply.body) {
                 Ok(outcome) => {
+                    if request.operation == Operation::NonReplicated
+                        && self.session.epoch().lineage != started.lineage
+                    {
+                        // Progress polls can move a cursor without a replayable receipt.
+                        call.uncertain |= call.progress_poll
+                            && matches!(
+                                &outcome.result,
+                                Ok(_) | Err(IggyError::TransientNotCommitted)
+                            );
+                        return Err(Next::Fail(IggyError::Unauthenticated));
+                    }
                     self.session.observe_metadata_reply(&reply.header);
                     let bound = self.session.epoch().bound;
                     close_if_detached(&hop.link, &outcome.result, bound);
@@ -417,11 +469,18 @@ impl OperationDriver {
     }
 
     /// A call that started with a session must not continue unbound after
-    /// automatic sign-in is rejected.
-    async fn wait_for_session(&self, call: &Call, requires_session: bool) -> Result<(), Next> {
+    /// automatic sign-in is rejected, and no call continues in a session
+    /// that the caller signed in to after the call started. A wait that
+    /// reaches the deadline sent nothing, and the sign-in can still finish,
+    /// so it ends with `TransientNotAccepted`.
+    async fn wait_for_session(&self, call: &Call, started: SessionEpoch) -> Result<(), Next> {
         if is_sign_in(call.code) || self.session.epoch().bound {
             return Ok(());
         }
+        if self.session.sign_in_blocked() {
+            return Err(Next::Fail(IggyError::Unauthenticated));
+        }
+        let requires_session = started.bound || started.sign_in_owed;
         if self.session.sign_in_credentials().is_none() {
             return if requires_session {
                 Err(Next::Fail(IggyError::Unauthenticated))
@@ -429,25 +488,43 @@ impl OperationDriver {
                 Ok(())
             };
         }
+        if !requires_session
+            && !matches!(
+                self.links.state(),
+                ClientState::Connecting | ClientState::Authenticating
+            )
+        {
+            return Err(Next::Fail(IggyError::Unauthenticated));
+        }
         let mut epoch = self.session.subscribe_epoch();
-        let ready =
-            epoch.wait_for(|epoch| epoch.bound || (requires_session && !epoch.sign_in_owed));
+        let ready = epoch.wait_for(|epoch| {
+            epoch.lineage != started.lineage
+                || epoch.bound
+                || (requires_session && !epoch.sign_in_owed)
+        });
         match timeout_at(call.deadline, ready).await {
-            Ok(Ok(epoch)) if epoch.bound => Ok(()),
-            _ => Err(Next::Fail(IggyError::Unauthenticated)),
+            Ok(Ok(epoch)) if epoch.bound && epoch.lineage == started.lineage => Ok(()),
+            // The old caller lineage ended or its automatic sign-in was refused.
+            Ok(_) => Err(Next::Fail(IggyError::Unauthenticated)),
+            Err(_) => Err(Next::Fail(IggyError::TransientNotAccepted)),
         }
     }
 
     /// The route of a partition call, `None` for any other call. A partition
-    /// call looks up its route unless the cached one is usable.
-    async fn route_for(&self, call: &mut Call) -> Result<Option<PartitionRouteResponse>, Next> {
+    /// call looks up its route unless the cached one is usable. The lookup
+    /// belongs to the call, so it runs only in the call's `lineage`.
+    async fn route_for(
+        &self,
+        call: &mut Call,
+        lineage: u64,
+    ) -> Result<Option<PartitionRouteResponse>, Next> {
         let Some(partition) = &call.partition else {
             return Ok(None);
         };
-        match self.route(&partition.key, call.deadline).await {
+        match self.route(&partition.key, lineage, call.deadline).await {
             Ok(route) => Ok(Some(route)),
             Err(error) if retries_lookup(&error) => {
-                call.refusal = error;
+                call.refusal = IggyError::TransientNotAccepted;
                 Err(Next::Pause)
             }
             Err(error) => Err(Next::Fail(error)),
@@ -483,12 +560,8 @@ impl OperationDriver {
         match call.ticket.take() {
             Some(ticket) => Ok(ticket),
             None => {
-                let key = if call.code == POLL_MESSAGES_CODE {
-                    let poll = PollMessagesRequest::decode_from(&call.payload)
-                        .map_err(|_| Next::Fail(IggyError::InvalidCommand))?;
-                    call.progress_poll =
-                        poll.auto_commit || poll.strategy.kind == WirePollingStrategy::next().kind;
-                    call.progress_poll.then_some(LaneKey::Partition {
+                let key = if call.progress_poll {
+                    Some(LaneKey::Partition {
                         incarnation: context.incarnation,
                         partition_id: call.partition_id(),
                     })
@@ -513,11 +586,10 @@ impl OperationDriver {
         let target = route.map_or(Target::MetadataPrimary, |route| {
             Target::Replica(route.primary_replica)
         });
-        let error = match self.links.link(target) {
-            Ok(link) => return Ok(Hop { link, route }),
-            Err(error) => error,
-        };
-        call.refusal = error;
+        if let Ok(link) = self.links.link(target) {
+            return Ok(Hop { link, route });
+        }
+        call.refusal = IggyError::TransientNotAccepted;
         match (&call.partition, route) {
             (Some(partition), Some(route)) => {
                 self.routes()
@@ -571,7 +643,7 @@ impl OperationDriver {
             }
             error if lost_link(&error) => {
                 call.uncertain |= sent;
-                call.refusal = error;
+                call.refusal = IggyError::TransientNotAccepted;
                 self.refresh(call, hop, Failure::LostLink).await;
                 Err(Next::Pause)
             }
@@ -590,9 +662,27 @@ impl OperationDriver {
                 }
                 Err(Next::Fail(error))
             }
-            IggyError::ConsumerGroupPartitionNotOwned(..) | IggyError::PartitionNotFound(..) => {
+            IggyError::ConsumerGroupPartitionNotOwned(..) => {
                 self.invalidate(call, hop);
                 Err(Next::Fail(error))
+            }
+            error if is_namespace_miss(&error) => {
+                call.settle_sent();
+                self.invalidate(call, hop);
+                let Some(route) = hop.route else {
+                    return Err(Next::Fail(error));
+                };
+                if self
+                    .is_metadata_primary(&hop.link, route.primary_replica, call.deadline)
+                    .await
+                {
+                    return Err(Next::Fail(error));
+                }
+                // A backup can miss metadata that the metadata primary
+                // committed. It denied the frame before admission, so the
+                // frame goes out again.
+                call.refusal = IggyError::TransientNotAccepted;
+                Err(Next::Pause)
             }
             error => Err(Next::Fail(error)),
         }
@@ -648,6 +738,7 @@ impl OperationDriver {
     async fn route(
         &self,
         key: &PartitionKey,
+        lineage: u64,
         deadline: Instant,
     ) -> Result<PartitionRouteResponse, IggyError> {
         let fence = self.session.fence();
@@ -656,17 +747,20 @@ impl OperationDriver {
             .usable(key, fence, self.session.metadata_watermark());
         match cached {
             Some(route) => Ok(route),
-            None => self.lookup(key, fence, deadline).await,
+            None => self.lookup(key, fence, lineage, deadline).await,
         }
     }
 
     /// Asks one ready replica at a time for the route of `key`, in id order.
     /// The first one is the replica that a refusal named, else the metadata
     /// primary. An answer older than the cached route goes to the next one.
+    /// A lookup that no replica answers usably ends with 58, which the caller
+    /// retries until its deadline.
     async fn lookup(
         &self,
         key: &PartitionKey,
         fence: u64,
+        lineage: u64,
         deadline: Instant,
     ) -> Result<PartitionRouteResponse, IggyError> {
         let body = GetPartitionRouteRequest::try_from(key)?.to_bytes();
@@ -676,54 +770,67 @@ impl OperationDriver {
         let mut replicas = self.links.ready_replicas();
         let start = first.map_or(0, |first| replicas.partition_point(|id| *id < first));
         replicas.rotate_left(start);
-        let mut refusal = IggyError::NotConnected;
         for replica in replicas {
-            let answer = match self.links.link(Target::Replica(replica)) {
-                Ok(link) => {
-                    self.read(&link, GET_PARTITION_ROUTE_CODE, body.clone(), deadline)
-                        .await
-                }
-                Err(error) => Err(error),
+            let Ok(link) = self.links.link(Target::Replica(replica)) else {
+                continue;
             };
-            let answer = answer.and_then(|answer| {
-                PartitionRouteResponse::decode_from(&answer).map_err(|_| IggyError::InvalidFormat)
-            });
+            let answer = self
+                .read(
+                    &link,
+                    GET_PARTITION_ROUTE_CODE,
+                    body.clone(),
+                    lineage,
+                    deadline,
+                )
+                .await
+                .and_then(|answer| {
+                    PartitionRouteResponse::decode_from(&answer)
+                        .map_err(|_| IggyError::InvalidFormat)
+                });
             match answer {
                 Ok(answer) => {
-                    let merged = self.routes().merge(key, answer, fence);
-                    match merged {
-                        Some(route) => return Ok(route),
-                        None => refusal = IggyError::TransientNotAccepted,
+                    if let Some(route) = self.routes().merge(key, answer, fence) {
+                        return Ok(route);
                     }
                 }
-                Err(error) if retries_lookup(&error) => refusal = error,
-                Err(
-                    IggyError::StreamIdNotFound(_)
-                    | IggyError::StreamNameNotFound(_)
-                    | IggyError::TopicIdNotFound(_, _)
-                    | IggyError::TopicNameNotFound(_, _)
-                    | IggyError::PartitionNotFound(_, _, _),
-                ) if Some(replica) != metadata_primary => {
+                Err(error) if retries_lookup(&error) => {}
+                Err(error) if is_namespace_miss(&error) => {
                     // A backup can miss metadata that another client just created.
                     // Only the metadata primary can make this miss terminal.
-                    refusal = IggyError::TransientNotAccepted;
+                    if self.is_metadata_primary(&link, replica, deadline).await {
+                        return Err(error);
+                    }
                 }
                 Err(error) => return Err(error),
             }
         }
-        Err(refusal)
+        Err(IggyError::TransientNotAccepted)
     }
 
-    /// One read on `link`, without a retry.
+    /// Whether `replica` is the metadata primary. The belief can predate a
+    /// view change, so the roster read on `link` of that replica must still
+    /// name it. No lookup reaches a believed metadata primary without a
+    /// link, so then the roster of `replica` is read to update the belief.
+    async fn is_metadata_primary(&self, link: &Arc<Link>, replica: u8, deadline: Instant) -> bool {
+        let believed = self.links.metadata_primary();
+        let unreachable =
+            believed.is_none_or(|primary| self.links.link(Target::Replica(primary)).is_err());
+        (believed == Some(replica) || unreachable)
+            && self.read_roster(link, deadline).await
+            && self.links.metadata_primary() == Some(replica)
+    }
+
+    /// One read on `link` in `lineage`, without a retry.
     async fn read(
         &self,
         link: &Link,
         code: u32,
         body: Bytes,
+        lineage: u64,
         deadline: Instant,
     ) -> Result<Bytes, IggyError> {
         let mut ticket = self.session.enter_lane(None, deadline).await?;
-        let frame = ticket.freeze(code, body, self.read_context(), None)?;
+        let frame = ticket.freeze_in(lineage, code, body, self.read_context(), None)?;
         let reply = link.send(frame, deadline, ticket.sent_flag()).await?;
         let result = read_reply(&self.session, reply);
         let bound = self.session.epoch().bound;
@@ -750,10 +857,15 @@ impl OperationDriver {
     }
 
     /// Reads the roster on `link`, so the next attempt finds the metadata
-    /// primary that the roster names.
-    async fn read_roster(&self, link: &Arc<Link>, deadline: Instant) {
-        if let Ok(Err(error)) = timeout_at(deadline, self.links.refresh_roster(link)).await {
-            debug!("A roster read failed: {error}");
+    /// primary that the roster names. Returns whether the read succeeded.
+    async fn read_roster(&self, link: &Arc<Link>, deadline: Instant) -> bool {
+        match timeout_at(deadline, self.links.refresh_roster(link)).await {
+            Ok(Ok(())) => true,
+            Ok(Err(error)) => {
+                debug!("A roster read failed: {error}");
+                false
+            }
+            Err(_) => false,
         }
     }
 
@@ -776,6 +888,7 @@ struct Call {
     /// freezes again.
     uncertain: bool,
     /// The error at the deadline, unless an attempt can have taken effect.
+    /// A call that waited for a link or a primary until then ends with 58.
     refusal: IggyError,
     retries: u32,
     /// The last attempt got `NotPrimary`. Another one in a row pauses first.
@@ -796,6 +909,33 @@ struct Hop {
     link: Arc<Link>,
     /// The route that chose the replica, `None` for the metadata primary.
     route: Option<PartitionRouteResponse>,
+}
+
+/// Cancellation discards only the session owned by this explicit attempt.
+pub(crate) struct ExplicitSignIn<'a> {
+    driver: &'a OperationDriver,
+    lineage: BinaryOperationLineage,
+    complete: bool,
+}
+
+impl ExplicitSignIn<'_> {
+    pub(crate) fn lineage(&self) -> BinaryOperationLineage {
+        self.lineage
+    }
+
+    pub(crate) fn complete(mut self) {
+        self.complete = true;
+    }
+}
+
+impl Drop for ExplicitSignIn<'_> {
+    fn drop(&mut self) {
+        if !self.complete {
+            self.driver
+                .session
+                .fail_sign_in(self.lineage.lineage(), || self.driver.links.disconnect());
+        }
+    }
 }
 
 /// What a call does after an attempt that did not end it.
@@ -867,22 +1007,28 @@ impl Call {
     }
 
     /// The frame of the call and its ticket. The call freezes again only
-    /// after it started over.
+    /// after it started over, and only in the `lineage` that it started in.
     fn frame(
         &mut self,
         ticket: LaneTicket,
         context: PartitionContext,
+        lineage: u64,
     ) -> Result<(Frame, &mut LaneTicket), Next> {
         let ticket = self.ticket.insert(ticket);
         let frame = match &self.frame {
-            Some(frame) => frame.clone(),
+            Some(frame) => {
+                if !ticket.revalidate(lineage).map_err(Next::Fail)? {
+                    return Err(Next::Again);
+                }
+                frame.clone()
+            }
             None => {
                 let partition = self
                     .partition
                     .as_ref()
                     .map(|partition| partition.key.clone());
                 let frame = ticket
-                    .freeze(self.code, self.payload.clone(), context, partition)
+                    .freeze_in(lineage, self.code, self.payload.clone(), context, partition)
                     .map_err(Next::Fail)?;
                 self.frame = Some(frame.clone());
                 frame
@@ -952,9 +1098,13 @@ impl Call {
         }
     }
 
-    /// Ends the call at its deadline with its last refusal.
+    /// Ends the call at its deadline with its last refusal. A sign-in that no
+    /// primary answered was not accepted, also after it was sent.
     fn expire(mut self) -> IggyError {
         let refusal = std::mem::replace(&mut self.refusal, IggyError::TransientNotAccepted);
+        if is_sign_in(self.code) {
+            self.uncertain = false;
+        }
         self.end(refusal)
     }
 }
@@ -970,6 +1120,19 @@ fn retries_lookup(error: &IggyError) -> bool {
         error,
         IggyError::TransientNotAccepted | IggyError::NotPrimary
     ) || lost_link(error)
+}
+
+/// Whether `error` tells that the metadata of the replica has no such
+/// stream, topic or partition.
+fn is_namespace_miss(error: &IggyError) -> bool {
+    matches!(
+        error,
+        IggyError::StreamIdNotFound(_)
+            | IggyError::StreamNameNotFound(_)
+            | IggyError::TopicIdNotFound(_, _)
+            | IggyError::TopicNameNotFound(_, _)
+            | IggyError::PartitionNotFound(_, _, _)
+    )
 }
 
 /// State transfer can detach a link while its session remains live.
@@ -989,7 +1152,7 @@ mod tests {
     use crate::links::RETRY_BACKOFF_MAX;
     use crate::links::fake_cluster::{
         Answer, FIRST_SESSION, FakeCluster, Received, TEST_BUDGET, UNANSWERED_CODE, connected,
-        endpoint, eventually, policy, topic_body,
+        endpoint, eventually, links, policy, topic_body,
     };
     use crate::tcp::tcp_client::TcpClient;
     use bytes::BytesMut;
@@ -1001,8 +1164,8 @@ mod tests {
     use iggy_binary_protocol::requests::messages::{RawMessage, SendMessagesEncoder};
     use iggy_binary_protocol::{WireConsumer, WireIdentifier};
     use iggy_common::{
-        AutoLogin, Credentials, DiagnosticEvent, IggyMessage, MessageClient, Partitioning,
-        PendingOperationsConfig,
+        AutoLogin, Client, Credentials, DiagnosticEvent, IggyMessage, MessageClient, Partitioning,
+        PendingOperationsConfig, UserClient,
     };
     use secrecy::SecretString;
     use std::iter::repeat_n;
@@ -1022,6 +1185,14 @@ mod tests {
     const ENDLESS: usize = 1_000;
     /// The second call starts while the first one holds the lane.
     const SECOND_CALL_DELAY: Duration = Duration::from_secs(10);
+    /// A user that the caller signs in as instead of the configured one.
+    const OTHER_USER: &str = "other";
+    const OTHER_PASSWORD: &str = "password";
+    /// The user id of a remembered sign-in.
+    const USER_ID: u32 = 1;
+    /// Far below the deadline, so a call that waits for the deadline fails
+    /// the test.
+    const RECOVERY_TIMEOUT: Duration = Duration::from_secs(5);
     const ROUTE: PartitionRouteResponse = PartitionRouteResponse {
         incarnation: 7,
         metadata_op: 10,
@@ -1072,12 +1243,9 @@ mod tests {
         }
 
         async fn call(&self, code: u32, target: RequestTarget<'_>) -> Result<Bytes, IggyError> {
-            let payload = if code == POLL_MESSAGES_CODE {
-                self.poll(false, WirePollingStrategy::first()).to_bytes()
-            } else {
-                Bytes::from_static(PAYLOAD)
-            };
-            self.driver.send(code, payload, target).await
+            self.driver
+                .send(code, Bytes::from_static(PAYLOAD), target)
+                .await
         }
 
         fn poll(&self, auto_commit: bool, strategy: WirePollingStrategy) -> PollMessagesRequest {
@@ -1124,9 +1292,8 @@ mod tests {
             match code {
                 SEND_MESSAGES_CODE => self.send_messages().await,
                 POLL_MESSAGES_CODE => {
-                    let poll = self.poll(true, WirePollingStrategy::first());
                     self.driver
-                        .send(code, poll.to_bytes(), self.partition(None))
+                        .poll(&self.poll(true, WirePollingStrategy::first()), None)
                         .await
                 }
                 _ => self.call(code, RequestTarget::Metadata).await,
@@ -1141,6 +1308,21 @@ mod tests {
                     && self.driver.links.ready_replicas().len() == usize::from(REPLICAS)
             })
             .await;
+        }
+
+        /// Routes the partition to the replica that the client believes is
+        /// the metadata primary, and returns that replica.
+        fn route_to_metadata_primary(&self) -> u8 {
+            let metadata_primary = self.driver.links.metadata_primary().unwrap();
+            *self.cluster.route.lock().unwrap() = Some(PartitionRouteResponse {
+                primary_replica: metadata_primary,
+                ..ROUTE
+            });
+            metadata_primary
+        }
+
+        fn missing_topic(&self) -> IggyError {
+            IggyError::TopicIdNotFound(self.topic_id.clone(), self.stream_id.clone())
         }
     }
 
@@ -1191,16 +1373,28 @@ mod tests {
      {
         for rejected_again in [false, true] {
             let f = Fixture::new().await;
-            *f.cluster.route.lock().unwrap() = Some(PartitionRouteResponse {
+            let route = PartitionRouteResponse {
                 partitions_count: 2,
                 ..ROUTE
-            });
+            };
+            *f.cluster.route.lock().unwrap() = Some(route);
             f.cluster.script(
                 &endpoint(0),
                 GET_TOPIC_CODE,
                 [Answer::Body(topic_body(2)), Answer::Body(topic_body(1))],
             );
             let missing = IggyError::PartitionNotFound(1, f.topic_id.clone(), f.stream_id.clone());
+            // The metadata primary confirms each miss of the partition primary.
+            f.cluster.script(
+                &endpoint(0),
+                GET_PARTITION_ROUTE_CODE,
+                [
+                    route_body(route),
+                    route_body(route),
+                    Answer::Refuse(missing.clone()),
+                    Answer::Refuse(missing.clone()),
+                ],
+            );
             let final_answer = if rejected_again {
                 Answer::Refuse(missing.clone())
             } else {
@@ -1259,6 +1453,12 @@ mod tests {
             }
             answers.push(Answer::Refuse(missing.clone()));
             f.script_sends(answers);
+            // The metadata primary confirms the miss of the partition primary.
+            f.cluster.script(
+                &endpoint(0),
+                GET_PARTITION_ROUTE_CODE,
+                [route_body(ROUTE), Answer::Refuse(missing.clone())],
+            );
             let client = TcpClient::from_links(f.driver.links);
             let partitioning = if uncertain {
                 Partitioning::balanced()
@@ -1287,6 +1487,43 @@ mod tests {
                 assert_eq!(f.cluster.count(GET_TOPIC_CODE), 0);
             }
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_balanced_send_when_its_topic_is_gone_at_the_refresh_should_fail_with_topic_not_found()
+     {
+        let f = Fixture::new().await;
+        f.cluster.script(
+            &endpoint(0),
+            GET_TOPIC_CODE,
+            [Answer::Body(topic_body(2)), Answer::Body(Vec::new())],
+        );
+        let missing = IggyError::PartitionNotFound(0, f.topic_id.clone(), f.stream_id.clone());
+        // The metadata primary confirms the miss of the partition primary.
+        f.cluster.script(
+            &endpoint(0),
+            GET_PARTITION_ROUTE_CODE,
+            [route_body(ROUTE), Answer::Refuse(missing.clone())],
+        );
+        f.script_sends([Answer::Refuse(missing)]);
+        let client = TcpClient::from_links(f.driver.links);
+        let mut messages = [IggyMessage::from_str("payload").unwrap()];
+
+        let result = client
+            .send_messages(
+                &f.stream_id,
+                &f.topic_id,
+                &Partitioning::balanced(),
+                &mut messages,
+            )
+            .await;
+
+        assert_eq!(
+            result.unwrap_err(),
+            IggyError::TopicIdNotFound(f.topic_id.clone(), f.stream_id.clone())
+        );
+        assert_eq!(f.cluster.count(GET_TOPIC_CODE), 2);
+        assert_eq!(f.cluster.count(SEND_MESSAGES_CODE), 1);
     }
 
     fn sent_partition(sent: &Received) -> u32 {
@@ -1341,6 +1578,103 @@ mod tests {
             owner_generation: request.header.owner_generation,
             metadata_op: request.header.minimum_metadata_op,
         }
+    }
+
+    async fn given_a_frozen_retry_when_session_changes_during_lookup_should_fence_the_frame_and_keep_its_id(
+        caller_changed: bool,
+        uncertain: bool,
+    ) {
+        let fixture = Fixture::new().await;
+        fixture.cluster.hold(SEND_MESSAGES_CODE);
+        fixture.script_sends([
+            Answer::Refuse(if uncertain {
+                IggyError::TransientNotCommitted
+            } else {
+                IggyError::TransientNotAccepted
+            }),
+            Answer::Refuse(IggyError::RequestTooOld),
+        ]);
+        let (result, ()) = tokio::join!(fixture.send_messages(), async {
+            eventually("first send freezes the retry", || {
+                fixture.cluster.count(SEND_MESSAGES_CODE) == 1
+            })
+            .await;
+            fixture.driver.routes().invalidate(&ROUTE, PARTITION_ID);
+            fixture.cluster.hold(GET_PARTITION_ROUTE_CODE);
+            fixture.cluster.release(SEND_MESSAGES_CODE);
+            eventually("retry waits for a fresh route", || {
+                fixture.cluster.count(GET_PARTITION_ROUTE_CODE) == 2
+            })
+            .await;
+            let links: Vec<_> = fixture
+                .driver
+                .links
+                .ready_replicas()
+                .into_iter()
+                .map(|replica| fixture.driver.links.link(Target::Replica(replica)).unwrap())
+                .collect();
+            let fence = fixture.driver.session.fence();
+            fixture
+                .driver
+                .session
+                .reset_if_fence(fence, !caller_changed)
+                .unwrap();
+            fixture.driver.session.bind(FIRST_SESSION + 1).unwrap();
+            *fixture.cluster.session.lock().unwrap() = Some(FIRST_SESSION + 1);
+            for link in links {
+                fixture
+                    .driver
+                    .links
+                    .mark_bound(&link, fixture.driver.session.fence());
+            }
+            fixture.cluster.release(GET_PARTITION_ROUTE_CODE);
+        });
+        let sends = fixture.sends();
+        let operation = sends[0].header.request;
+        if uncertain {
+            assert_eq!(
+                result,
+                Err(IggyError::OperationUncertain(operation)),
+                "caller_changed={caller_changed}"
+            );
+            assert_eq!(
+                sends.len(),
+                1,
+                "an uncertain old frame cannot enter the new session"
+            );
+        } else if caller_changed {
+            assert_eq!(result, Err(IggyError::Unauthenticated));
+            assert_eq!(sends.len(), 1);
+        } else {
+            assert_eq!(result, Err(IggyError::RequestTooOld));
+            assert_eq!(sends.len(), 2);
+            assert_eq!(sends[1].header.session, FIRST_SESSION + 1);
+            assert_ne!(sends[1].header.request, operation);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_frozen_retry_when_session_changes_during_lookup_should_fence_the_frame_and_keep_its_id_recovery_unsent()
+     {
+        given_a_frozen_retry_when_session_changes_during_lookup_should_fence_the_frame_and_keep_its_id(false, false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_frozen_retry_when_session_changes_during_lookup_should_fence_the_frame_and_keep_its_id_recovery_uncertain()
+     {
+        given_a_frozen_retry_when_session_changes_during_lookup_should_fence_the_frame_and_keep_its_id(false, true).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_frozen_retry_when_session_changes_during_lookup_should_fence_the_frame_and_keep_its_id_caller_unsent()
+     {
+        given_a_frozen_retry_when_session_changes_during_lookup_should_fence_the_frame_and_keep_its_id(true, false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_frozen_retry_when_session_changes_during_lookup_should_fence_the_frame_and_keep_its_id_caller_uncertain()
+     {
+        given_a_frozen_retry_when_session_changes_during_lookup_should_fence_the_frame_and_keep_its_id(true, true).await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -1463,7 +1797,7 @@ mod tests {
 
         let result = f.send_messages().await;
 
-        assert_eq!(result.unwrap_err(), IggyError::NotConnected);
+        assert_eq!(result.unwrap_err(), IggyError::TransientNotAccepted);
         // Lets a frame that left after the deadline reach its replica.
         sleep(CALLER_TIMEOUT).await;
         assert_eq!(f.cluster.count(GET_PARTITION_ROUTE_CODE), 1);
@@ -1652,7 +1986,10 @@ mod tests {
             ..ROUTE.context()
         };
 
-        f.call(POLL_MESSAGES_CODE, f.partition(None)).await.unwrap();
+        f.driver
+            .poll(&f.poll(false, WirePollingStrategy::first()), None)
+            .await
+            .unwrap();
         f.call(STORE_CONSUMER_OFFSET_CODE, f.partition(Some(polled)))
             .await
             .unwrap();
@@ -1802,11 +2139,7 @@ mod tests {
                 );
                 let result = f
                     .driver
-                    .send(
-                        POLL_MESSAGES_CODE,
-                        f.poll(auto_commit, strategy.clone()).to_bytes(),
-                        f.partition(None),
-                    )
+                    .poll(&f.poll(auto_commit, strategy.clone()), None)
                     .await;
                 let polls = f.cluster.received(POLL_MESSAGES_CODE);
                 if progress && uncertain {
@@ -1837,11 +2170,8 @@ mod tests {
             let f = Fixture::new().await;
             f.cluster
                 .script(&endpoint(PRIMARY), POLL_MESSAGES_CODE, [Answer::Silence]);
-            let poll = f.driver.send(
-                POLL_MESSAGES_CODE,
-                f.poll(auto_commit, strategy).to_bytes(),
-                f.partition(None),
-            );
+            let request = f.poll(auto_commit, strategy);
+            let poll = f.driver.poll(&request, None);
             let store = f.call(STORE_CONSUMER_OFFSET_CODE, f.partition(None));
             tokio::pin!(store);
             let expired = timeout(CALLER_TIMEOUT, async {
@@ -1875,15 +2205,16 @@ mod tests {
 
         let polled = f
             .driver
-            .send(
-                POLL_MESSAGES_CODE,
-                f.poll(false, WirePollingStrategy::next()).to_bytes(),
-                f.partition(None),
-            )
+            .poll(&f.poll(false, WirePollingStrategy::next()), None)
             .await;
 
         assert_eq!(polled, Err(IggyError::LaneBlocked(op)));
         assert_eq!(f.cluster.count(POLL_MESSAGES_CODE), 0);
+        f.driver
+            .poll(&f.poll(false, WirePollingStrategy::first()), None)
+            .await
+            .expect("a poll that moves no consumer takes no lane");
+        assert_eq!(f.cluster.count(POLL_MESSAGES_CODE), 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1984,22 +2315,34 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn given_replicas_that_refuse_every_lookup_when_the_deadline_passes_should_fail_with_the_last_refusal()
-     {
-        let f = Fixture::new().await;
-        *f.cluster.route.lock().unwrap() = None;
-        let started = Instant::now();
+    async fn given_replicas_that_refuse_every_lookup_when_the_deadline_passes_should_fail_with_58()
+    {
+        for refusal in [IggyError::TransientNotAccepted, IggyError::NotPrimary] {
+            let f = Fixture::new().await;
+            for replica in 0..REPLICAS {
+                f.cluster.script(
+                    &endpoint(replica),
+                    GET_PARTITION_ROUTE_CODE,
+                    repeat_n(Answer::Refuse(refusal.clone()), ENDLESS),
+                );
+            }
+            let started = Instant::now();
 
-        let result = f.send_messages().await;
+            let result = f.send_messages().await;
 
-        assert_eq!(result.unwrap_err(), IggyError::TransientNotAccepted);
-        let elapsed = started.elapsed();
-        assert!(elapsed <= OPERATION_TIMEOUT, "{elapsed:?}");
-        assert!(
-            elapsed >= OPERATION_TIMEOUT - RETRY_BACKOFF_MAX,
-            "{elapsed:?}"
-        );
-        assert!(f.sends().is_empty());
+            assert_eq!(
+                result.unwrap_err(),
+                IggyError::TransientNotAccepted,
+                "{refusal}"
+            );
+            let elapsed = started.elapsed();
+            assert!(elapsed <= OPERATION_TIMEOUT, "{refusal}: {elapsed:?}");
+            assert!(
+                elapsed >= OPERATION_TIMEOUT - RETRY_BACKOFF_MAX,
+                "{refusal}: {elapsed:?}"
+            );
+            assert!(f.sends().is_empty(), "{refusal}");
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -2032,6 +2375,53 @@ mod tests {
         assert_eq!(stamped_context(&f.sends()[1]), current.context());
         let reads = f.cluster.received(GET_STREAMS_CODE);
         assert_eq!(reads[0].header.minimum_metadata_op, COMMIT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_many_cached_routes_when_an_unrelated_metadata_write_commits_should_look_up_each_route_once_more()
+     {
+        const TOPICS: u32 = 4;
+        const PARTITIONS_PER_TOPIC: u32 = 16;
+        let routes = usize::try_from(TOPICS * PARTITIONS_PER_TOPIC).unwrap();
+        let f = Fixture::new().await;
+        let topics: Vec<Identifier> = (1..=TOPICS)
+            .map(|topic_id| Identifier::numeric(topic_id).unwrap())
+            .collect();
+        let send_to_each_partition = async || {
+            for topic_id in &topics {
+                for partition_id in 0..PARTITIONS_PER_TOPIC {
+                    let target = RequestTarget::Partition(PartitionTarget {
+                        stream_id: &f.stream_id,
+                        topic_id,
+                        partition_id,
+                        context: None,
+                    });
+                    f.call(SEND_MESSAGES_CODE, target).await.unwrap();
+                }
+            }
+        };
+        let lookups = || f.cluster.count(GET_PARTITION_ROUTE_CODE);
+        send_to_each_partition().await;
+        assert_eq!(lookups(), routes);
+
+        f.cluster
+            .script(&endpoint(0), CREATE_STREAM_CODE, [Answer::Commit(COMMIT)]);
+        f.call(CREATE_STREAM_CODE, RequestTarget::Metadata)
+            .await
+            .unwrap();
+        *f.cluster.route.lock().unwrap() = Some(PartitionRouteResponse {
+            metadata_op: COMMIT,
+            ..ROUTE
+        });
+        send_to_each_partition().await;
+        assert_eq!(lookups(), 2 * routes, "one lookup more per cached route");
+
+        send_to_each_partition().await;
+        assert_eq!(
+            lookups(),
+            2 * routes,
+            "the routes looked up again serve later sends"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -2090,6 +2480,166 @@ mod tests {
             [endpoint(metadata_primary)]
         );
         assert!(fixture.sends().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_namespace_miss_from_a_backup_primary_when_the_metadata_primary_refuses_the_lookup_should_end_with_that_refusal()
+     {
+        let f = Fixture::new().await;
+        let metadata_primary = f.driver.links.metadata_primary().unwrap();
+        f.script_sends([Answer::Refuse(f.missing_topic())]);
+        f.cluster.script(
+            &endpoint(metadata_primary),
+            GET_PARTITION_ROUTE_CODE,
+            [route_body(ROUTE), Answer::Refuse(IggyError::Unauthorized)],
+        );
+
+        let result = f.send_messages().await;
+
+        assert_eq!(result.unwrap_err(), IggyError::Unauthorized);
+        assert_eq!(endpoints(&f.sends()), [endpoint(PRIMARY)]);
+        assert_eq!(
+            endpoints(&f.cluster.received(GET_PARTITION_ROUTE_CODE)),
+            vec![endpoint(metadata_primary); 2]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_namespace_miss_from_the_metadata_primary_when_its_roster_still_names_it_should_fail_at_once()
+     {
+        let f = Fixture::new().await;
+        let metadata_primary = f.route_to_metadata_primary();
+        f.cluster.script(
+            &endpoint(metadata_primary),
+            SEND_MESSAGES_CODE,
+            [Answer::Refuse(f.missing_topic())],
+        );
+
+        let result = f.send_messages().await;
+
+        assert_eq!(result.unwrap_err(), f.missing_topic());
+        assert_eq!(f.sends().len(), 1);
+        assert_eq!(f.cluster.count(GET_PARTITION_ROUTE_CODE), 1);
+        assert!(
+            f.cluster
+                .codes(&endpoint(metadata_primary))
+                .ends_with(&[SEND_MESSAGES_CODE, GET_CLUSTER_METADATA_CODE])
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_namespace_miss_from_a_deposed_metadata_primary_when_its_roster_names_another_should_ask_another_replica()
+     {
+        for code in [GET_PARTITION_ROUTE_CODE, SEND_MESSAGES_CODE] {
+            let f = Fixture::new().await;
+            let deposed = f.route_to_metadata_primary();
+            let elected = PRIMARY;
+            f.cluster.elect(elected);
+            f.cluster.script(
+                &endpoint(deposed),
+                code,
+                [Answer::Refuse(f.missing_topic())],
+            );
+
+            f.send_messages().await.unwrap();
+
+            assert_eq!(f.driver.links.metadata_primary(), Some(elected), "{code}");
+            assert_eq!(
+                endpoints(&f.cluster.received(GET_PARTITION_ROUTE_CODE)),
+                [endpoint(deposed), endpoint(elected)],
+                "{code}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_backup_primary_that_keeps_missing_the_namespace_when_the_deadline_passes_should_return_58()
+     {
+        let f = Fixture::new().await;
+        f.script_sends(repeat_n(Answer::Refuse(f.missing_topic()), ENDLESS));
+        let started = Instant::now();
+
+        let result = f.send_messages().await;
+
+        assert_eq!(result.unwrap_err(), IggyError::TransientNotAccepted);
+        assert!(started.elapsed() <= OPERATION_TIMEOUT);
+        let sends = f.sends();
+        assert!(sends.len() > 1);
+        for send in &sends {
+            assert_eq!(
+                bytemuck::bytes_of(&send.header),
+                bytemuck::bytes_of(&sends[0].header)
+            );
+        }
+        let op = sends[0].header.request;
+        assert_eq!(
+            f.driver.abandon(op),
+            Err(IggyError::OperationNotRetained(op))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_namespace_miss_when_cancelled_during_its_roster_read_should_retain_no_operation()
+     {
+        let f = Fixture::new().await;
+        let metadata_primary = f.route_to_metadata_primary();
+        f.cluster.script(
+            &endpoint(metadata_primary),
+            SEND_MESSAGES_CODE,
+            [Answer::Refuse(f.missing_topic())],
+        );
+        f.cluster.script(
+            &endpoint(metadata_primary),
+            GET_CLUSTER_METADATA_CODE,
+            [Answer::Silence],
+        );
+
+        assert!(timeout(CALLER_TIMEOUT, f.send_messages()).await.is_err());
+
+        let op = f.sends()[0].header.request;
+        assert!(!f.driver.session.retains_operation(op));
+        assert_eq!(
+            f.cluster.codes(&endpoint(metadata_primary)).last(),
+            Some(&GET_CLUSTER_METADATA_CODE)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_believed_metadata_primary_without_a_link_when_the_elected_one_misses_the_namespace_should_fail_with_that_miss()
+     {
+        for cached in [false, true] {
+            let f = Fixture::new().await;
+            if cached {
+                f.send_messages().await.unwrap();
+            }
+            let deposed = f.driver.links.metadata_primary().unwrap();
+            f.cluster.down.lock().unwrap().insert(endpoint(deposed));
+            f.cluster.drop_connections(&endpoint(deposed));
+            eventually("the deposed metadata primary has no link", || {
+                !f.driver.links.ready_replicas().contains(&deposed)
+            })
+            .await;
+            f.cluster.elect(PRIMARY);
+            f.script_sends(repeat_n(Answer::Refuse(f.missing_topic()), ENDLESS));
+            for replica in (0..REPLICAS).filter(|replica| *replica != deposed) {
+                f.cluster.script(
+                    &endpoint(replica),
+                    GET_PARTITION_ROUTE_CODE,
+                    repeat_n(Answer::Refuse(f.missing_topic()), ENDLESS),
+                );
+            }
+            let started = Instant::now();
+
+            let result = f.send_messages().await;
+
+            assert_eq!(result.unwrap_err(), f.missing_topic(), "cached {cached}");
+            assert!(
+                started.elapsed() < RETRY_BACKOFF_MAX,
+                "cached {cached}: {:?}",
+                started.elapsed()
+            );
+            assert_eq!(f.driver.links.metadata_primary(), Some(PRIMARY));
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -2172,6 +2722,55 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn given_no_link_to_the_primary_when_the_deadline_passes_should_fail_with_58_without_sending()
+     {
+        // The partition primary, then the metadata primary of the fixture.
+        for (code, primary) in [(SEND_MESSAGES_CODE, PRIMARY), (CREATE_STREAM_CODE, 0)] {
+            let f = Fixture::new().await;
+            f.cluster.down.lock().unwrap().insert(endpoint(primary));
+            f.cluster.drop_connections(&endpoint(primary));
+            eventually("the link to the primary is gone", || {
+                !f.driver.links.ready_replicas().contains(&primary)
+            })
+            .await;
+
+            let result = f.call_to(code).await;
+
+            assert_eq!(
+                result.unwrap_err(),
+                IggyError::TransientNotAccepted,
+                "{code}"
+            );
+            assert_eq!(f.cluster.count(code), 0, "{code}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_sign_in_that_outlasts_the_call_when_the_call_waits_for_the_session_should_fail_with_58_without_sending()
+     {
+        let f = Fixture::new().await;
+        f.cluster
+            .held_registers
+            .lock()
+            .unwrap()
+            .insert("iggy".to_owned());
+        *f.cluster.session.lock().unwrap() = None;
+        f.cluster.drop_connections(&endpoint(0));
+        eventually("the client signs in again", || {
+            f.cluster.count(LOGIN_REGISTER_CODE) == 2
+        })
+        .await;
+
+        let read = f
+            .driver
+            .send(GET_STREAMS_CODE, Bytes::new(), RequestTarget::Metadata)
+            .await;
+
+        assert_eq!(read, Err(IggyError::TransientNotAccepted));
+        assert_eq!(f.cluster.count(GET_STREAMS_CODE), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn given_a_sent_mutation_when_an_eviction_ends_the_session_should_return_operation_uncertain()
      {
         // The reasons that the client reads as `Unauthenticated`.
@@ -2249,6 +2848,130 @@ mod tests {
             assert_eq!(sent[0].body, sent[1].body);
             assert_eq!(fixture.driver.session.fence(), fence);
             assert_eq!(fixture.cluster.count(LOGIN_REGISTER_CODE), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_sends_between_attempts_or_in_a_lane_wait_when_the_caller_signs_in_as_another_user_should_fail_with_40_without_sending_under_the_new_session()
+     {
+        let f = Fixture::new().await;
+        f.script_sends(repeat_n(
+            Answer::Refuse(IggyError::TransientNotAccepted),
+            ENDLESS,
+        ));
+        let client = TcpClient::from_links(f.driver.links);
+        let target = RequestTarget::Partition(PartitionTarget {
+            stream_id: &f.stream_id,
+            topic_id: &f.topic_id,
+            partition_id: PARTITION_ID,
+            context: None,
+        });
+        let send = || {
+            client
+                .driver
+                .send(SEND_MESSAGES_CODE, Bytes::from_static(PAYLOAD), target)
+        };
+        let refused = || f.cluster.count(SEND_MESSAGES_CODE) > 0;
+
+        // The first send pauses between refused attempts, and the second one
+        // waits for the lane that the first one holds.
+        let (between_attempts, in_lane_wait, ()) = tokio::join!(
+            send(),
+            async {
+                eventually("the first send holds the lane", refused).await;
+                send().await
+            },
+            async {
+                eventually("the first send holds the lane", refused).await;
+                sleep(CALLER_TIMEOUT).await;
+                client.logout_user().await.unwrap();
+                client.login_user(OTHER_USER, OTHER_PASSWORD).await.unwrap();
+            }
+        );
+
+        assert_eq!(between_attempts, Err(IggyError::Unauthenticated));
+        assert_eq!(in_lane_wait, Err(IggyError::Unauthenticated));
+        let sessions: Vec<u64> = f
+            .cluster
+            .received(SEND_MESSAGES_CODE)
+            .iter()
+            .map(|send| send.header.session)
+            .collect();
+        assert!(
+            sessions.iter().all(|session| *session == FIRST_SESSION),
+            "sent under the sessions {sessions:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_raw_call_waiting_for_a_session_when_the_caller_signs_in_should_fail_with_40_without_sending()
+     {
+        let f = Fixture::new().await;
+        let client = TcpClient::from_links(f.driver.links);
+        client.logout_user().await.unwrap();
+
+        // The configured sign-in is known, so the call waits for a session
+        // instead of going out without one.
+        let (read, ()) = tokio::join!(
+            client
+                .driver
+                .send(GET_STREAMS_CODE, Bytes::new(), RequestTarget::Metadata),
+            async {
+                client.login_user(OTHER_USER, OTHER_PASSWORD).await.unwrap();
+            }
+        );
+
+        assert_eq!(read, Err(IggyError::Unauthenticated));
+        assert_eq!(f.cluster.count(GET_STREAMS_CODE), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_sends_between_attempts_or_in_a_lane_wait_when_the_caller_disconnects_should_fail_with_40_unless_the_client_shut_down()
+     {
+        for shutdown in [false, true] {
+            let f = Fixture::new().await;
+            f.script_sends(repeat_n(
+                Answer::Refuse(IggyError::TransientNotAccepted),
+                ENDLESS,
+            ));
+            let client = TcpClient::from_links(f.driver.links);
+            let target = RequestTarget::Partition(PartitionTarget {
+                stream_id: &f.stream_id,
+                topic_id: &f.topic_id,
+                partition_id: PARTITION_ID,
+                context: None,
+            });
+            let send = || {
+                client
+                    .driver
+                    .send(SEND_MESSAGES_CODE, Bytes::from_static(PAYLOAD), target)
+            };
+            let refused = || f.cluster.count(SEND_MESSAGES_CODE) > 0;
+
+            let (between_attempts, in_lane_wait, ()) = tokio::join!(
+                send(),
+                async {
+                    eventually("the first send holds the lane", refused).await;
+                    send().await
+                },
+                async {
+                    eventually("the first send holds the lane", refused).await;
+                    sleep(CALLER_TIMEOUT).await;
+                    if shutdown {
+                        client.shutdown().await.unwrap();
+                    } else {
+                        client.disconnect().await.unwrap();
+                    }
+                }
+            );
+
+            let ended = if shutdown {
+                IggyError::ClientShutdown
+            } else {
+                IggyError::Unauthenticated
+            };
+            assert_eq!(between_attempts, Err(ended.clone()), "shutdown={shutdown}");
+            assert_eq!(in_lane_wait, Err(ended), "shutdown={shutdown}");
         }
     }
 
@@ -2334,9 +3057,6 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn given_a_deleted_user_when_a_read_reauthenticates_should_fail_before_the_deadline() {
-        const USER_ID: u32 = 1;
-        const RECOVERY_TIMEOUT: Duration = Duration::from_secs(5);
-
         for configured in [false, true] {
             for delayed in [false, true] {
                 let cluster = FakeCluster::new(REPLICAS);
@@ -2346,31 +3066,8 @@ mod tests {
                 } else {
                     AutoLogin::Disabled
                 };
-                let session = Arc::new(SessionOwner::new(auto_login));
-                session.remember(credentials, USER_ID);
-                let links = ReplicaLinks::new(
-                    cluster.dialer(),
-                    endpoint(0),
-                    policy(),
-                    Arc::clone(&session),
-                );
-                links.connect().await.unwrap();
-                eventually("every replica is bound", || {
-                    links.ready_replicas().len() == usize::from(REPLICAS)
-                })
-                .await;
-                let driver = OperationDriver::new(links);
-                *cluster.session.lock().unwrap() = None;
+                let driver = driver_after_a_lost_session(&cluster, auto_login, credentials).await;
                 *cluster.reject_credentials.lock().unwrap() = true;
-                for replica in 0..REPLICAS {
-                    for code in [GET_STREAMS_CODE, GET_CLUSTER_METADATA_CODE] {
-                        cluster.script(
-                            &endpoint(replica),
-                            code,
-                            repeat_n(Answer::Refuse(IggyError::Unauthenticated), ENDLESS),
-                        );
-                    }
-                }
                 if delayed {
                     cluster.held_registers.lock().unwrap().insert("iggy".into());
                 }
@@ -2396,9 +3093,101 @@ mod tests {
                     "configured={configured}, delayed={delayed}"
                 );
                 assert_eq!(cluster.count(LOGIN_REGISTER_CODE), 2);
-                assert!(!session.epoch().bound);
+                assert!(!driver.session.epoch().bound);
             }
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_rejected_token_when_a_read_reauthenticates_should_fail_before_the_deadline_and_forget_the_token()
+     {
+        let cluster = FakeCluster::new(REPLICAS);
+        let token = Credentials::PersonalAccessToken("token".into());
+        let driver = driver_after_a_lost_session(&cluster, AutoLogin::Disabled, token).await;
+        for replica in 0..REPLICAS {
+            cluster.script(
+                &endpoint(replica),
+                LOGIN_REGISTER_CODE,
+                repeat_n(Answer::Evict(EvictionReason::InvalidToken), ENDLESS),
+            );
+        }
+
+        let read = timeout(
+            RECOVERY_TIMEOUT,
+            driver.send(GET_STREAMS_CODE, Bytes::new(), RequestTarget::Metadata),
+        )
+        .await
+        .expect("a rejected token must end the read before its deadline");
+
+        assert_eq!(read, Err(IggyError::Unauthenticated));
+        assert_eq!(cluster.count(LOGIN_REGISTER_CODE), 2);
+        assert!(driver.session.sign_in_credentials().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_raw_call_waiting_for_the_first_sign_in_when_the_server_rejects_it_should_fail_with_40_without_sending()
+     {
+        let cluster = FakeCluster::new(REPLICAS);
+        *cluster.reject_credentials.lock().unwrap() = true;
+        cluster
+            .held_registers
+            .lock()
+            .unwrap()
+            .insert("iggy".to_owned());
+        let driver = OperationDriver::new(links(&cluster, &endpoint(0), policy()));
+        let registering = || cluster.count(LOGIN_REGISTER_CODE) == 1;
+
+        let (connect, read, ()) = timeout(RECOVERY_TIMEOUT, async {
+            tokio::join!(
+                driver.links.connect(),
+                async {
+                    eventually("the sign-in reaches the server", registering).await;
+                    driver
+                        .send(GET_STREAMS_CODE, Bytes::new(), RequestTarget::Metadata)
+                        .await
+                },
+                async {
+                    eventually("the sign-in reaches the server", registering).await;
+                    sleep(CALLER_TIMEOUT).await;
+                    cluster.held_registers.lock().unwrap().clear();
+                }
+            )
+        })
+        .await
+        .expect("a rejected sign-in must end the waiting read before its deadline");
+
+        assert_eq!(connect, Err(IggyError::InvalidCredentials));
+        assert_eq!(read, Err(IggyError::Unauthenticated));
+        assert_eq!(cluster.count(GET_STREAMS_CODE), 0);
+    }
+
+    /// A driver signed in with `credentials` on every replica, after the
+    /// server lost the session. Every replica refuses each later read of the
+    /// streams or the roster as unauthenticated.
+    async fn driver_after_a_lost_session(
+        cluster: &Arc<FakeCluster>,
+        auto_login: AutoLogin,
+        credentials: Credentials,
+    ) -> OperationDriver {
+        let session = Arc::new(SessionOwner::new(auto_login));
+        session.remember(credentials, USER_ID);
+        let links = ReplicaLinks::new(cluster.dialer(), endpoint(0), policy(), session);
+        links.connect().await.unwrap();
+        eventually("every replica is bound", || {
+            links.ready_replicas().len() == usize::from(REPLICAS)
+        })
+        .await;
+        *cluster.session.lock().unwrap() = None;
+        for replica in 0..REPLICAS {
+            for code in [GET_STREAMS_CODE, GET_CLUSTER_METADATA_CODE] {
+                cluster.script(
+                    &endpoint(replica),
+                    code,
+                    repeat_n(Answer::Refuse(IggyError::Unauthenticated), ENDLESS),
+                );
+            }
+        }
+        OperationDriver::new(links)
     }
 
     #[tokio::test(start_paused = true)]
@@ -2494,6 +3283,76 @@ mod tests {
             Err(IggyError::OperationNotRetained(op))
         );
         f.send_messages().await.unwrap();
+    }
+
+    /// An admin deletes or deactivates the user while the reply of its
+    /// mutation is lost. However the client learns that the session ended, the
+    /// call ends uncertain and never with a final error. The sign-in after it
+    /// fails, and the operation is not retained.
+    #[tokio::test(start_paused = true)]
+    async fn given_a_lost_reply_when_a_revocation_ends_the_session_should_end_uncertain_without_retaining_it()
+     {
+        // The answers to the mutation, and whether the session already ended
+        // when its link binds again.
+        let endings = [
+            // The retry on a new link is refused with status 30.
+            (
+                vec![Answer::HangUp, Answer::Refuse(IggyError::StaleClient)],
+                false,
+            ),
+            // The new link cannot bind, so no retry leaves the client.
+            (vec![Answer::HangUp], true),
+            // The retry on the same link is evicted, and the link cannot bind.
+            (
+                vec![
+                    Answer::Refuse(IggyError::TransientNotCommitted),
+                    Answer::Evict(EvictionReason::NoSession),
+                ],
+                true,
+            ),
+        ];
+        // The sign-in of a deleted user, then of a deactivated one.
+        let refusals = [
+            EvictionReason::InvalidCredentials,
+            EvictionReason::UserInactive,
+        ];
+        for (code, replica) in [(SEND_MESSAGES_CODE, PRIMARY), (CREATE_STREAM_CODE, 0)] {
+            for (answers, ended) in &endings {
+                for refusal in refusals {
+                    let f = Fixture::new().await;
+                    let fence = f.driver.session.fence();
+                    let case = format!("{code} {answers:?} {refusal:?}");
+                    for node in 0..REPLICAS {
+                        f.cluster.script(
+                            &endpoint(node),
+                            LOGIN_REGISTER_CODE,
+                            repeat_n(Answer::Evict(refusal), ENDLESS),
+                        );
+                    }
+                    if *ended {
+                        *f.cluster.session.lock().unwrap() = None;
+                    }
+                    f.cluster.script(&endpoint(replica), code, answers.clone());
+
+                    let result = f.call_to(code).await;
+
+                    let sent = f.cluster.received(code);
+                    let op = sent[0].header.request;
+                    assert_eq!(result, Err(IggyError::OperationUncertain(op)), "{case}");
+                    assert_eq!(sent.len(), answers.len(), "{case}");
+                    eventually("the sign-in after the session ended fails", || {
+                        f.driver.session.fence() > fence && f.cluster.count(LOGIN_REGISTER_CODE) > 1
+                    })
+                    .await;
+                    assert!(!f.driver.session.epoch().bound, "{case}");
+                    assert_eq!(
+                        f.driver.abandon(op),
+                        Err(IggyError::OperationNotRetained(op)),
+                        "{case}"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -2613,14 +3472,7 @@ mod tests {
                 [Answer::Evict(EvictionReason::NoSession)],
             );
 
-            let result = f
-                .driver
-                .send(
-                    POLL_MESSAGES_CODE,
-                    f.poll(auto_commit, strategy).to_bytes(),
-                    f.partition(None),
-                )
-                .await;
+            let result = f.driver.poll(&f.poll(auto_commit, strategy), None).await;
 
             let polls = f.cluster.received(POLL_MESSAGES_CODE);
             if progress {
@@ -2643,7 +3495,8 @@ mod tests {
         let f = Fixture::new().await;
         f.cluster
             .script(&endpoint(PRIMARY), POLL_MESSAGES_CODE, [Answer::Silence]);
-        let poll = f.call(POLL_MESSAGES_CODE, f.partition(None));
+        let request = f.poll(false, WirePollingStrategy::first());
+        let poll = f.driver.poll(&request, None);
         tokio::pin!(poll);
         let arrived = tokio::select! {
             _ = &mut poll => false,

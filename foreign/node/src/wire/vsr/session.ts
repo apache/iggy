@@ -103,11 +103,6 @@ export class ConsensusSession {
     this.requestCounter += 1n;
     return id;
   }
-
-  /** Current counter value without advancing it. */
-  currentRequestId(): bigint {
-    return this.requestCounter;
-  }
 }
 
 /** Keep the top bit clear so generated IDs cannot enter the server-only range. */

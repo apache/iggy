@@ -58,6 +58,7 @@ tags=()
 case "${BDD_FEATURE:-all}" in
     basic_messaging) tags=(--tags @basic-messaging) ;;
     raw_command) tags=(--tags @raw-command) ;;
+    session_contract) tags=(--tags @session-contract) ;;
 esac
 
 # --strict fails the run on undefined steps; without it a feature step with no matching C++

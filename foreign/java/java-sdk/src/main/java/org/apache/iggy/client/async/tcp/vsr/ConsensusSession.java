@@ -36,6 +36,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 
@@ -51,7 +52,11 @@ import java.util.concurrent.TimeUnit;
  */
 public final class ConsensusSession {
 
+    public static final int DEFAULT_MAX_PENDING_OPERATIONS = 256;
+    public static final long DEFAULT_MAX_PENDING_OPERATION_BYTES = 64L * 1024 * 1024;
     static final int BIND_SECRET_BYTES = 32;
+    // No lineage is negative, see signingIn().
+    private static final long NO_SIGN_IN = -1;
     private static final SecureRandom RANDOM = new SecureRandom();
     private final byte[] bindSecret = new byte[BIND_SECRET_BYTES];
 
@@ -60,9 +65,18 @@ public final class ConsensusSession {
     private Long session;
     private long requestCounter = 1;
     private long generation;
+    // See lineage().
+    private long lineage;
+    // The lineage in which a sign-in of the caller runs, see signingIn().
+    private long signInLineage = NO_SIGN_IN;
+    // See beganSignIn().
+    private boolean signInBegun;
+    // The automatic sign-in that the server refused, and the lineage that the refusal ended.
+    private Throwable signInRefusal;
+    private long refusedLineage;
     private long metadataWatermark;
     private boolean shared;
-    private ConsensusSession parent;
+    private volatile ConsensusSession parent;
     private final Map<LaneKey, Ticket> lanes = new HashMap<>();
     private final Map<LaneKey, ArrayDeque<CompletableFuture<Ticket>>> laneAdmissions = new HashMap<>();
     private final Map<Long, Ticket> retained = new HashMap<>();
@@ -70,8 +84,8 @@ public final class ConsensusSession {
     // request ids never repeat within a client.
     private final ArrayDeque<ProvedOutcome> proved = new ArrayDeque<>();
     private CompletableFuture<Void> admissionChanged = new CompletableFuture<>();
-    private int maxPendingOperations = 256;
-    private long maxPendingBytes = 64L * 1024 * 1024;
+    private int maxPendingOperations = DEFAULT_MAX_PENDING_OPERATIONS;
+    private long maxPendingBytes = DEFAULT_MAX_PENDING_OPERATION_BYTES;
     private int pendingOperations;
     private long pendingBytes;
 
@@ -91,19 +105,30 @@ public final class ConsensusSession {
     }
 
     /** Binds the fence epoch returned by a committed Register reply. */
-    synchronized void bind(long sessionEpoch) {
-        if (parent != null) {
-            parent.bind(sessionEpoch);
-            return;
+    void bind(long sessionEpoch) {
+        bindWithoutSignal(sessionEpoch);
+        owner().changed();
+    }
+
+    /** The reply handler signals after releasing the identity-check monitor. */
+    void bindWithoutSignal(long sessionEpoch) {
+        ConsensusSession owner;
+        synchronized (this) {
+            owner = parent;
+            if (owner == null) {
+                if (sessionEpoch == 0) {
+                    throw new IllegalStateException("Register reply carried a zero session epoch");
+                }
+                if (session != null && session != sessionEpoch) {
+                    throw new IllegalStateException("Register reply changed the bound session epoch");
+                }
+                this.session = sessionEpoch;
+                generation++;
+            }
         }
-        if (sessionEpoch == 0) {
-            throw new IllegalStateException("Register reply carried a zero session epoch");
+        if (owner != null) {
+            owner.bindWithoutSignal(sessionEpoch);
         }
-        if (session != null && session != sessionEpoch) {
-            throw new IllegalStateException("Register reply changed the bound session epoch");
-        }
-        this.session = sessionEpoch;
-        generation++;
     }
 
     /**
@@ -188,30 +213,63 @@ public final class ConsensusSession {
         ConsensusSession owner = owner();
         List<Ticket> active;
         synchronized (owner) {
-            active = owner.clearIdentity();
+            active = owner.clearIdentity(false);
         }
         active.forEach(Ticket::complete);
     }
 
-    /** Ends the local identity unless a reset already replaced this client id, and says whether it did. */
+    /**
+     * Ends the local identity after a logout unless a reset already replaced this client id, and says whether it
+     * did. The caller signed out, so the lineage ends too.
+     */
     public boolean resetIfCurrent(long clientLow, long clientHigh) {
+        return clearIdentityIfCurrent(clientLow, clientHigh, false, true);
+    }
+
+    /**
+     * {@link #resetIfCurrent} for the logout that a sign-in of the caller sends first. The lineage stays, as in Rust,
+     * because that sign-in ended it as it began.
+     */
+    boolean resetForSignIn(long clientLow, long clientHigh) {
+        return clearIdentityIfCurrent(clientLow, clientHigh, false, false);
+    }
+
+    /**
+     * Ends the local identity of a session that the server lost, unless a reset already replaced this client id,
+     * and says whether it did. Unlike {@link #resetIfCurrent}, the calls that hold or wait for a lane keep it, so
+     * they keep their order: a call that has not sent its frame starts again under the next session, see
+     * {@link Ticket#prepareWrite}. The retained operations end, as in Rust, because the next session cannot replay
+     * them.
+     */
+    public boolean replaceLostSession(long clientLow, long clientHigh) {
+        return clearIdentityIfCurrent(clientLow, clientHigh, true, false);
+    }
+
+    /**
+     * A lost session keeps the live lanes and the lineage, because the client recovers it. A logout ends both. The
+     * logout that a sign-in sends first ends the lanes and keeps the lineage, because that sign-in ended it.
+     */
+    private boolean clearIdentityIfCurrent(long clientLow, long clientHigh, boolean keepLiveLanes, boolean endLineage) {
         ConsensusSession owner = owner();
-        List<Ticket> active;
+        List<Ticket> ended;
         synchronized (owner) {
             if (owner.clientIdLow != clientLow || owner.clientIdHigh != clientHigh) {
                 return false;
             }
-            active = owner.clearIdentity();
+            ended = owner.clearIdentity(keepLiveLanes);
+            if (endLineage) {
+                owner.lineage++;
+            }
         }
-        active.forEach(Ticket::complete);
+        ended.forEach(Ticket::complete);
         return true;
     }
 
-    private List<Ticket> clearIdentity() {
+    private List<Ticket> clearIdentity(boolean keepLiveLanes) {
         session = null;
         regenerateClientId();
         generation++;
-        return List.copyOf(lanes.values());
+        return List.copyOf(keepLiveLanes ? retained.values() : lanes.values());
     }
 
     public synchronized byte[] bindSecret() {
@@ -271,6 +329,108 @@ public final class ConsensusSession {
         return generation;
     }
 
+    /**
+     * The sign-in lineage of the caller, as in Rust. It rises when the caller signs in or out and when the server
+     * refuses an automatic sign-in, and a recovery by the client keeps it. A call continues only in the lineage that
+     * it started in, so it never runs under a session that the caller opened after it started.
+     */
+    public long lineage() {
+        ConsensusSession owner = owner();
+        synchronized (owner) {
+            return owner.lineage;
+        }
+    }
+
+    /** Ends the lineage as a sign-in or a sign-out of the caller starts, and wakes the calls that wait for a session. */
+    public void endLineage() {
+        ConsensusSession owner = owner();
+        synchronized (owner) {
+            owner.lineage++;
+        }
+        owner.changed();
+    }
+
+    /** {@link #endLineage} for a sign-in of the caller, which then runs in the new lineage, see {@link #signingIn}. */
+    public void beginSignIn() {
+        ConsensusSession owner = owner();
+        synchronized (owner) {
+            owner.signInLineage = ++owner.lineage;
+            owner.signInBegun = true;
+        }
+        owner.changed();
+    }
+
+    /**
+     * Whether the caller ever began a sign-in. From then on, a call that finds no session and none on its way ends
+     * with 40, as in Rust, instead of asking for a first sign-in.
+     */
+    public boolean beganSignIn() {
+        ConsensusSession owner = owner();
+        synchronized (owner) {
+            return owner.signInBegun;
+        }
+    }
+
+    public void finishSignIn() {
+        ConsensusSession owner = owner();
+        synchronized (owner) {
+            owner.signInLineage = NO_SIGN_IN;
+        }
+    }
+
+    /**
+     * Whether a sign-in of the caller runs. Like {@code sign_in_blocked} in Rust, a call that needs a session then
+     * ends with 40 at once and does not wait for the session of that sign-in. The sign-in stops running at
+     * {@link #finishSignIn} or at the next end of the lineage, such as a failed sign-in or a close.
+     */
+    public boolean signingIn() {
+        ConsensusSession owner = owner();
+        synchronized (owner) {
+            return owner.signInLineage == owner.lineage;
+        }
+    }
+
+    /**
+     * Ends the lineage for an automatic sign-in that the server refused with {@code refusal}, and says whether it
+     * did. No session comes without the caller then. A reset or a bind since that sign-in started at the owner
+     * generation {@code generation} belongs to a newer sign-in, which keeps its lineage.
+     */
+    public boolean refuseSignIn(long generation, Throwable refusal) {
+        ConsensusSession owner = owner();
+        synchronized (owner) {
+            if (owner.generation != generation) {
+                return false;
+            }
+            owner.signInRefusal = unwrap(refusal);
+            owner.refusedLineage = owner.lineage;
+            owner.lineage++;
+        }
+        owner.changed();
+        return true;
+    }
+
+    /**
+     * The error of a call that started in {@code lineage} and that the end of that lineage stopped before it sent
+     * its frame: 40. Its cause is the sign-in refusal that ended the lineage, else {@code cause} when there is one.
+     */
+    public IggyServerException lineageEnded(long lineage, Throwable cause) {
+        ConsensusSession owner = owner();
+        Throwable refusal;
+        synchronized (owner) {
+            refusal = owner.refusedLineage == lineage ? owner.signInRefusal : null;
+        }
+        Throwable reason = refusal != null ? refusal : unwrap(cause);
+        IggyServerException unauthenticated = new IggyServerException(IggyErrorCode.UNAUTHENTICATED.getCode());
+        if (reason != null) {
+            unauthenticated.initCause(reason);
+        }
+        return unauthenticated;
+    }
+
+    private static Throwable unwrap(Throwable error) {
+        return error instanceof CompletionException && error.getCause() != null ? error.getCause() : error;
+    }
+
     public synchronized long metadataWatermark() {
         return parent == null ? metadataWatermark : parent.metadataWatermark();
     }
@@ -293,11 +453,12 @@ public final class ConsensusSession {
         return parent == null ? clientIdHigh : parent.clientIdHigh();
     }
 
+    /**
+     * Takes no monitor. A link that holds its session waits for the owner, so a caller that holds the owner and
+     * resolves the owner of another link, for the lineage of a call that started there, must not wait for that link.
+     */
     public ConsensusSession owner() {
-        ConsensusSession numbering;
-        synchronized (this) {
-            numbering = parent;
-        }
+        ConsensusSession numbering = parent;
         return numbering == null ? this : numbering.owner();
     }
 
@@ -501,7 +662,56 @@ public final class ConsensusSession {
         }
     }
 
-    private void changed() {
+    /** Waits for an owed automatic sign-in without reserving a mutation lane. */
+    public CompletableFuture<Void> awaitSession(long lineage, long deadline, EventExecutor executor) {
+        return owner().awaitSession(lineage, deadline, executor, null);
+    }
+
+    private CompletableFuture<Void> awaitSession(long lineage, long deadline, EventExecutor executor, Ticket ticket) {
+        CompletableFuture<Void> result = new CompletableFuture<>();
+        awaitSession(lineage, result, ticket);
+        if (result.isDone()) {
+            return result;
+        }
+        try {
+            var timer = executor.schedule(
+                    () -> result.completeExceptionally(
+                            new IggyServerException(IggyErrorCode.TRANSIENT_NOT_ACCEPTED.getCode())),
+                    Math.max(0, deadline - System.nanoTime()),
+                    TimeUnit.NANOSECONDS);
+            result.whenComplete((ignored, error) -> timer.cancel(false));
+        } catch (RejectedExecutionException stopped) {
+            result.completeExceptionally(stopped);
+        }
+        return result;
+    }
+
+    private void awaitSession(long lineage, CompletableFuture<Void> result, Ticket ticket) {
+        CompletableFuture<Void> changed = null;
+        boolean signedOut;
+        boolean ended;
+        synchronized (this) {
+            if (result.isDone()) {
+                return;
+            }
+            signedOut = this.lineage != lineage;
+            ended = ticket != null && ticket.completed;
+            if (!signedOut && !ended && session == null) {
+                changed = admissionChanged;
+            }
+        }
+        if (signedOut) {
+            result.completeExceptionally(this.lineageEnded(lineage, null));
+        } else if (ended) {
+            result.completeExceptionally(ticket.closedWaitError());
+        } else if (changed != null) {
+            changed.thenRun(() -> awaitSession(lineage, result, ticket));
+        } else {
+            result.complete(null);
+        }
+    }
+
+    void changed() {
         CompletableFuture<Void> signal;
         synchronized (this) {
             signal = admissionChanged;
@@ -532,7 +742,7 @@ public final class ConsensusSession {
         private final LaneKey lane;
         private final boolean mutation;
         private final long bytes;
-        private final long generation;
+        private long generation;
         private ByteBuf frame;
         private long operationId;
         private int commandCode;
@@ -545,6 +755,7 @@ public final class ConsensusSession {
         private boolean abandoned;
         private boolean sent;
         private boolean bytesReleased;
+        private boolean restarting;
 
         private Ticket(ConsensusSession owner, LaneKey lane, boolean mutation, long bytes, long generation) {
             this.owner = owner;
@@ -630,13 +841,90 @@ public final class ConsensusSession {
             return operationId;
         }
 
+        /**
+         * Prepares the next write of the call that holds this ticket and started in {@code lineage}, and says
+         * whether the ticket moved to a new session, so that the call draws a new request id. A frame that went out
+         * under a replaced session, or before the lineage ended, never goes out again, so this throws the
+         * uncertainty of its call. A call that has not sent its frame ends with 40 once its lineage ended, also when
+         * a sign-out ended its ticket. Else it keeps its lane, and while no session is bound or its link is down,
+         * this throws {@code TRANSIENT_NOT_ACCEPTED} and the call starts again, see {@link #takeRestart}. An ended
+         * ticket leaves the refusal to the write.
+         */
+        @SuppressWarnings("checkstyle:CyclomaticComplexity")
+        public boolean prepareWrite(boolean linkActive, long lineage) {
+            boolean ended;
+            boolean signedOut;
+            synchronized (owner) {
+                restarting = false;
+                signedOut = owner.lineage != lineage;
+                boolean current = generation == owner.generation && owner.session != null;
+                if (!signedOut && (completed || (current && (sent || linkActive)))) {
+                    return false;
+                }
+                ended = sent;
+                if (!ended && !signedOut && owner.session != null && linkActive) {
+                    generation = owner.generation;
+                    releaseFrame();
+                    return true;
+                }
+                restarting = !ended && !signedOut;
+            }
+            if (ended) {
+                throw retain();
+            }
+            throw signedOut
+                    ? owner.lineageEnded(lineage, null)
+                    : new IggyServerException(IggyErrorCode.TRANSIENT_NOT_ACCEPTED.getCode());
+        }
+
+        /**
+         * Whether the last {@link #prepareWrite} asked the call to start again once a session is bound, see
+         * {@link #awaitSession}. Only the first ask after that refusal gets the answer, so an attempt that the
+         * restart started and that fails before its write is not taken for another restart.
+         */
+        public boolean takeRestart() {
+            synchronized (owner) {
+                boolean restart = restarting;
+                restarting = false;
+                return restart;
+            }
+        }
+
+        /**
+         * Completes once a session is bound in {@code lineage}, so that a call that has not sent its frame can start
+         * again under it. The end of the lineage fails the wait with 40, so the call never runs under a session that
+         * the caller opened after it started. A wait still running at {@code deadline} fails with
+         * {@code TRANSIENT_NOT_ACCEPTED}, like a lane wait. A ticket that a close ended fails the wait at once.
+         */
+        public CompletableFuture<Void> awaitSession(long lineage, long deadline, EventExecutor executor) {
+            return owner.awaitSession(lineage, deadline, executor, this);
+        }
+
+        private RuntimeException closedWaitError() {
+            return sent
+                    ? new IggyOperationException(IggyErrorCode.OPERATION_NOT_RETAINED, operationId)
+                    : new IggyNotConnectedException("The connection closed before the request was sent");
+        }
+
         public void startWrite() {
             synchronized (owner) {
-                if (completed) {
+                // A frame of a replaced session never goes out, see prepareWrite.
+                if (completed || generation != owner.generation) {
                     throw new IggyOperationException(IggyErrorCode.OPERATION_NOT_RETAINED, operationId);
                 }
                 sent = true;
                 writers++;
+            }
+        }
+
+        /**
+         * After a 58 or 89 refusal, an 88 lifecycle refusal or a namespace miss, counts the frame as sent only while
+         * an earlier attempt can have taken effect, as in Rust. So a call that no node admitted starts again under a
+         * new session instead of ending uncertain.
+         */
+        public void settleSent(boolean uncertain) {
+            synchronized (owner) {
+                sent = uncertain;
             }
         }
 
@@ -704,13 +992,17 @@ public final class ConsensusSession {
                 if (mutation && !abandoned) {
                     owner.pendingOperations--;
                 }
-                if (frame != null) {
-                    frame.release();
-                    frame = null;
-                }
+                releaseFrame();
                 releaseBytesIfUnused();
             }
             owner.changed();
+        }
+
+        private void releaseFrame() {
+            if (frame != null) {
+                frame.release();
+                frame = null;
+            }
         }
 
         private void releaseBytesIfUnused() {

@@ -738,10 +738,15 @@ where
     /// Read `(end_offset, lagging, created_revision)` in one partition access.
     /// The caller compares this local history with committed metadata before
     /// submitting the resolved watermark.
-    /// No sealed segment permits a no-op on a converged history; a lagging
-    /// replica must retry because it may be missing whole sealed segments.
-    /// `None` means no local partition. The caller can record that no-op with
-    /// a zero watermark and no history guard.
+    /// A replica that is not a normal primary that applied the view it
+    /// started, or that installs a transfer, may miss whole sealed segments,
+    /// so it lags for every answer. That primary's commits above `commit_min`
+    /// only seal its active segment and append after it: they leave a sealed
+    /// offset settled and make only a no-op lag. A `count` above the sealed
+    /// segments resolves to the newest one even though those commits may seal
+    /// another, so the delete can remove fewer segments than `count`. Lagging
+    /// there would answer `TransientNotAccepted` for as long as disk-bound load
+    /// keeps commits waiting. `None` means no local partition.
     pub fn segment_delete_resolution(
         &self,
         namespace: &IggyNamespace,
@@ -749,15 +754,13 @@ where
     ) -> Option<(Option<u64>, bool, u64)> {
         self.with_partition(namespace, |partition| {
             let consensus = partition.consensus();
-            let lagging = consensus.is_follower()
+            let up_to_offset = partition.nth_oldest_sealed_end_offset(count);
+            let lagging = !consensus.applied_view_start()
+                || consensus.is_follower()
                 || !consensus.is_normal()
                 || consensus.is_transferring()
-                || consensus.commit_min() < consensus.commit_max();
-            (
-                partition.nth_oldest_sealed_end_offset(count),
-                lagging,
-                partition.created_revision(),
-            )
+                || (up_to_offset.is_none() && consensus.commit_min() < consensus.commit_max());
+            (up_to_offset, lagging, partition.created_revision())
         })
     }
 }
@@ -940,6 +943,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Segment;
     use crate::journal::MessageLookup;
     use bytes::Bytes;
     use consensus::LocalPipeline;
@@ -952,7 +956,7 @@ mod tests {
         stamp_prepare_for_persistence,
     };
     use server_common::{
-        Message,
+        Message, SegmentStorage,
         iobuf::{Frozen, Owned},
     };
     use std::sync::Arc;
@@ -1374,5 +1378,65 @@ mod tests {
         partitions
             .replicate_poll_completion(&namespace, replication)
             .await;
+    }
+
+    /// Under disk-bound load a primary's quorum commits wait for the writer,
+    /// so `commit_min` stays below `commit_max`. Those commits can seal the
+    /// active segment but never change a sealed one.
+    #[test]
+    fn given_commits_waiting_for_the_writer_when_resolving_segment_delete_should_settle_sealed_offsets()
+     {
+        const SEALED_END: u64 = 9;
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let segment_size = IggyByteSize::from(1024 * 1024);
+        let config = PartitionsConfig {
+            messages_required_to_save: 1,
+            size_of_messages_required_to_save: segment_size,
+            validate_checksum: false,
+            segment_size,
+            preallocate_segments: false,
+            encryptor: None,
+            path_layout: crate::PartitionPathLayout::default(),
+        };
+        let partitions = IggyPartitions::new(ShardId::new(0), config);
+        partitions.insert(namespace, build_replicated_partition());
+        let resolve = |count| {
+            partitions
+                .segment_delete_resolution(&namespace, count)
+                .map(|(up_to_offset, lagging, _)| (up_to_offset, lagging))
+        };
+        assert_eq!(
+            resolve(1),
+            Some((None, false)),
+            "a converged primary settles the no-op"
+        );
+
+        {
+            let consensus = partitions.get_by_ns(&namespace).unwrap().consensus();
+            consensus.advance_commit_max(consensus.commit_min() + 1);
+        }
+        assert_eq!(
+            resolve(1),
+            Some((None, true)),
+            "the waiting commits can still seal the first segment"
+        );
+
+        let partition = partitions.get_mut_by_ns(&namespace).unwrap();
+        let first = &mut partition.log.segments_mut()[0];
+        first.end_offset = SEALED_END;
+        first.sealed = true;
+        partition.log.add_persisted_segment(
+            Segment::new(SEALED_END + 1, segment_size),
+            SegmentStorage::default(),
+            None,
+            None,
+        );
+        for count in [1, 2] {
+            assert_eq!(
+                resolve(count),
+                Some((Some(SEALED_END), false)),
+                "count {count} resolves to a sealed segment, which the waiting commits cannot change"
+            );
+        }
     }
 }

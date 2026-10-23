@@ -427,12 +427,16 @@ enum SliceRequestStatus {
 
 /// Result of retaining a committed metadata receipt.
 ///
-/// Real client operations fail closed on a non-`Cached` outcome;
+/// Real client operations fail closed on `NoEntry` and `SkippedRegression`;
 /// server-originated operations have no registered entry or receipt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitReply {
     /// Reply cached and the watermark advanced (or refreshed in place).
     Cached,
+    /// The op committed after its session ended at `ended_op`. Nothing is
+    /// retained, so its outcome stays uncertain and the end marker still
+    /// bounds the latest receipt.
+    SessionEnded { ended_op: u64 },
     /// No registered entry, including for server-originated operations.
     NoEntry,
     /// A replayed op is older than the restored protection frontier.
@@ -1074,7 +1078,8 @@ impl ClientTable {
 
     /// Retain a committed metadata result before advancing the applied frontier.
     /// Missing ownership or regressing protection is a commit failure.
-    /// Server-originated operations return [`CommitReply::NoEntry`].
+    /// Server-originated operations return [`CommitReply::NoEntry`]. An op
+    /// committed after its session ended returns [`CommitReply::SessionEnded`].
     /// # Panics
     /// If the client id differs from the reply or the private index is inconsistent.
     pub fn commit_reply(
@@ -1120,6 +1125,12 @@ impl ClientTable {
                 stored: entry.watermark,
                 received: new_request,
             };
+        }
+        // A request admitted before its session ended can commit after the end.
+        // Decoders refuse a receipt above the end marker, so that op stays
+        // uncertain. The op that ended the session commits at the marker.
+        if let Some(ended_op) = entry.ended_op.filter(|&ended_op| new_commit > ended_op) {
+            return CommitReply::SessionEnded { ended_op };
         }
 
         // Freeze once; later dedup-hit clones Arc-bump.
@@ -2281,6 +2292,80 @@ mod tests {
                 ));
                 assert!(restored.finalize_session(ended[0]));
                 assert_eq!(restored.count(), 0);
+            }
+        }
+    }
+
+    /// A request admitted before its user's revocation committed commits
+    /// right behind it. Its session already ended, so the op stays uncertain.
+    #[test]
+    fn given_revoked_user_when_a_pipelined_request_commits_should_keep_the_tombstone() {
+        const REVOKER: u128 = 7;
+        const PIPELINED: u128 = 8;
+        const REVOKER_EPOCH: u64 = 10;
+        const PIPELINED_EPOCH: u64 = 11;
+        const END: u64 = 40;
+        let secret = [0x5a; BIND_SECRET_BYTES];
+        for self_revocation in [
+            None,
+            Some(Operation::UpdateUser),
+            Some(Operation::DeleteUser),
+        ] {
+            let mut table = ClientTable::new(2);
+            for (client, epoch) in [(REVOKER, REVOKER_EPOCH), (PIPELINED, PIPELINED_EPOCH)] {
+                table
+                    .commit_register(
+                        client,
+                        TEST_USER_ID,
+                        bind_verifier(client, TEST_USER_ID, &secret),
+                        make_register_reply(client, epoch),
+                    )
+                    .unwrap();
+            }
+            let ended = table.end_user_sessions(TEST_USER_ID, END);
+            if let Some(operation) = self_revocation {
+                let revocation = make_reply_for(REVOKER, 1, END).transmute_header(|old, header| {
+                    *header = old;
+                    header.operation = operation;
+                });
+                assert_eq!(
+                    table.commit_reply(REVOKER, TEST_USER_ID, revocation),
+                    CommitReply::Cached,
+                    "the revoking op commits at the end marker itself"
+                );
+            }
+            let at_end = table.encode();
+            assert_eq!(
+                table.commit_reply(
+                    PIPELINED,
+                    TEST_USER_ID,
+                    make_reply_for(PIPELINED, 1, END + 1)
+                ),
+                CommitReply::SessionEnded { ended_op: END },
+                "{self_revocation:?}"
+            );
+            let transferred = table.encode();
+            assert!(
+                transferred == at_end,
+                "{self_revocation:?}: an op after the end must leave the table unchanged"
+            );
+            let revoker_receipt = if self_revocation.is_some() {
+                END
+            } else {
+                REVOKER_EPOCH
+            };
+            for restored in [
+                ClientTable::from_snapshot(table.to_snapshot()).expect("checkpoint must restore"),
+                ClientTable::decode(&transferred).expect("state transfer must decode"),
+            ] {
+                assert_eq!(restored.ended_sessions().collect::<Vec<_>>(), ended);
+                assert_eq!(
+                    restored
+                        .get_reply(REVOKER)
+                        .map(|receipt| receipt.header().commit),
+                    Some(revoker_receipt)
+                );
+                assert_eq!(restored.get_watermark(PIPELINED), Some(REGISTER_REQUEST_ID));
             }
         }
     }
