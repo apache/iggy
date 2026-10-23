@@ -354,6 +354,28 @@ impl MqttSink {
         self.publish_errors.fetch_add(unfinished, Ordering::Relaxed);
     }
 
+    fn mark_window_confirmed(
+        confirmed: &mut [bool],
+        window_indices: &[usize],
+        confirmed_indexes: &[usize],
+    ) -> usize {
+        let mut newly_confirmed = 0;
+        for &local_index in confirmed_indexes {
+            let index = window_indices[local_index];
+            if !confirmed[index] {
+                confirmed[index] = true;
+                newly_confirmed += 1;
+            }
+        }
+        newly_confirmed
+    }
+
+    fn publish_window_deadline(&self) -> Result<Instant, Error> {
+        Instant::now()
+            .checked_add(self.publish_timeout)
+            .ok_or_else(|| Error::InvalidConfigValue("publish_timeout is too large".to_string()))
+    }
+
     fn prepare_publications(
         &self,
         topic_metadata: &TopicMetadata,
@@ -385,13 +407,14 @@ impl MqttSink {
                 self.config.fallback_topic.as_deref(),
                 self.config.protocol,
             ) {
-                Ok(publication) => {
+                Ok(mut publication) => {
                     let packet_size = driver::publication_packet_size(
                         &publication,
                         self.config.protocol,
                         self.config.qos,
                         self.config.retain,
                     );
+                    publication.packet_size = packet_size;
                     if packet_size > self.max_packet_size {
                         warn!(
                             "Skipping oversized MQTT record for connector with ID {}: stream: {}, topic: {}, offset: {}, packet_size: {}, max_packet_size: {}",
@@ -439,23 +462,29 @@ impl MqttSink {
             .fetch_add(publications.len() as u64, Ordering::Relaxed);
         let mut driver = self.driver.lock().await.take();
 
-        let mut retries = 0;
-        loop {
+        let mut connection_retries = 0;
+        // Driver recreation restarts window enumeration, so retain the current window's state.
+        let mut requeued_window_retries = None;
+        let mut requeued_window_deadline = None;
+        'publish: loop {
             let mut active_driver = match driver.take() {
                 Some(driver) => driver,
                 None => match self.connect_driver().await {
                     Ok(reconnected) => reconnected,
-                    Err(Error::Connection(error)) if retries < self.max_retries => {
+                    Err(Error::Connection(error)) if connection_retries < self.max_retries => {
                         warn!(
                             "Retrying MQTT connection for connector with ID {} (retry {}/{}): {error}",
                             self.id,
-                            retries + 1,
+                            connection_retries + 1,
                             self.max_retries
                         );
-                        let delay =
-                            retry_backoff(self.retry_delay, retries + 1, self.max_retry_delay);
+                        let delay = retry_backoff(
+                            self.retry_delay,
+                            connection_retries + 1,
+                            self.max_retry_delay,
+                        );
                         tokio::time::sleep(delay).await;
-                        retries += 1;
+                        connection_retries += 1;
                         continue;
                     }
                     Err(error) => {
@@ -464,50 +493,68 @@ impl MqttSink {
                     }
                 },
             };
-            for (index, publication) in publications.iter().enumerate() {
-                if confirmed[index]
-                    || driver::publication_packet_size(
-                        publication,
-                        self.config.protocol,
-                        self.config.qos,
-                        self.config.retain,
-                    ) <= active_driver.max_packet_size()
-                {
-                    continue;
-                }
-                let packet_size = driver::publication_packet_size(
-                    publication,
-                    self.config.protocol,
-                    self.config.qos,
-                    self.config.retain,
-                );
-                warn!(
-                    "Skipping oversized MQTT record for connector with ID {}: stream: {}, topic: {}, offset: {}, packet_size: {}, max_packet_size: {}",
-                    self.id,
-                    topic_metadata.stream,
-                    topic_metadata.topic,
-                    publication.offset,
-                    packet_size,
-                    active_driver.max_packet_size()
-                );
-                confirmed[index] = true;
-                skipped += 1;
-                self.in_flight_publications.fetch_sub(1, Ordering::Relaxed);
-                self.publish_errors.fetch_add(1, Ordering::Relaxed);
+            connection_retries = 0;
+            if let Err(error) = active_driver.discard_queued_events().await {
+                self.finish_unconfirmed_publications(&confirmed);
+                return Err(error);
             }
-            let pending_indices: Vec<usize> = confirmed
-                .iter()
-                .enumerate()
-                .filter_map(|(index, is_confirmed)| (!is_confirmed).then_some(index))
-                .collect();
-            for window_indices in pending_indices.chunks(self.max_in_flight) {
+            let max_packet_size = active_driver.max_packet_size();
+            if max_packet_size < self.max_packet_size {
+                for (index, publication) in publications.iter().enumerate() {
+                    if confirmed[index] || publication.packet_size <= max_packet_size {
+                        continue;
+                    }
+                    warn!(
+                        "Skipping oversized MQTT record for connector with ID {}: stream: {}, topic: {}, offset: {}, packet_size: {}, max_packet_size: {}",
+                        self.id,
+                        topic_metadata.stream,
+                        topic_metadata.topic,
+                        publication.offset,
+                        publication.packet_size,
+                        max_packet_size
+                    );
+                    confirmed[index] = true;
+                    skipped += 1;
+                    self.in_flight_publications.fetch_sub(1, Ordering::Relaxed);
+                    self.publish_errors.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            let pending_indices = unconfirmed_publication_indexes(&confirmed);
+            for (window_number, window_indices) in
+                pending_indices.chunks(self.max_in_flight).enumerate()
+            {
+                let mut window_retries = if window_number == 0 {
+                    requeued_window_retries.take().unwrap_or(0)
+                } else {
+                    0
+                };
+                let window_deadline = if window_number == 0 {
+                    match requeued_window_deadline.take() {
+                        Some(deadline) => deadline,
+                        None => match self.publish_window_deadline() {
+                            Ok(deadline) => deadline,
+                            Err(error) => {
+                                self.finish_unconfirmed_publications(&confirmed);
+                                return Err(error);
+                            }
+                        },
+                    }
+                } else {
+                    match self.publish_window_deadline() {
+                        Ok(deadline) => deadline,
+                        Err(error) => {
+                            self.finish_unconfirmed_publications(&confirmed);
+                            return Err(error);
+                        }
+                    }
+                };
                 let window: Vec<_> = window_indices
                     .iter()
                     .map(|&index| &publications[index])
                     .collect();
                 let mut window_state = active_driver.new_publish_window(window.len(), qos);
                 let initial_indexes: Vec<_> = (0..window.len()).collect();
-                if let Err(window_error) = active_driver
+                if let Err(error) = active_driver
                     .enqueue_window(
                         &window,
                         &initial_indexes,
@@ -518,12 +565,11 @@ impl MqttSink {
                     .await
                 {
                     self.finish_unconfirmed_publications(&confirmed);
-                    return Err(window_error.error);
+                    return Err(error);
                 }
-
                 loop {
                     match active_driver
-                        .drive_window(&mut window_state, self.publish_timeout)
+                        .drive_window(&mut window_state, window_deadline)
                         .await
                     {
                         Ok(PublishWindowProgress::Complete) => {
@@ -535,13 +581,54 @@ impl MqttSink {
                             }
                             break;
                         }
-                        // rumqttc::EventLoop::clean retains unacknowledged requests for the
-                        // next connection. Keep their packet mappings for both CONNACK results.
-                        Ok(PublishWindowProgress::SessionPresent(session_present)) => {
+                        // rumqttc retains unacknowledged requests only when the broker resumes
+                        // the previous session. A fresh session clears its pending queue.
+                        Ok(PublishWindowProgress::SessionPresent(true)) => {
+                            if window_retries >= self.max_retries {
+                                self.finish_unconfirmed_publications(&confirmed);
+                                return Err(Error::Connection(
+                                    "MQTT reconnect retry limit reached before unconfirmed publications were acknowledged".to_string(),
+                                ));
+                            }
+                            window_retries += 1;
                             debug!(
-                                "MQTT reconnect for connector with ID {} reported session_present={session_present}; keeping sink packet mappings for rumqttc retransmission",
-                                self.id
+                                "MQTT reconnect for connector with ID {} resumed the previous session; keeping sink packet mappings for rumqttc retransmission (retry {}/{})",
+                                self.id, window_retries, self.max_retries,
                             );
+                        }
+                        Ok(PublishWindowProgress::SessionPresent(false)) => {
+                            let confirmed_indexes = window_state.confirmed_indexes();
+                            let newly_confirmed = Self::mark_window_confirmed(
+                                &mut confirmed,
+                                window_indices,
+                                &confirmed_indexes,
+                            );
+                            self.in_flight_publications
+                                .fetch_sub(newly_confirmed as u64, Ordering::Relaxed);
+                            let unconfirmed = window.len() - confirmed_indexes.len();
+                            if window_retries >= self.max_retries {
+                                self.finish_unconfirmed_publications(&confirmed);
+                                return Err(Error::Connection(
+                                    "MQTT session was not resumed before unconfirmed publications could be requeued".to_string(),
+                                ));
+                            }
+                            warn!(
+                                "MQTT reconnect for connector with ID {} did not resume the previous session; recreating the driver and requeuing {unconfirmed} unconfirmed publications (retry {}/{})",
+                                self.id,
+                                window_retries + 1,
+                                self.max_retries,
+                            );
+                            let delay = retry_backoff(
+                                self.retry_delay,
+                                window_retries + 1,
+                                self.max_retry_delay,
+                            );
+                            tokio::time::sleep(delay).await;
+                            window_retries += 1;
+                            requeued_window_retries = Some(window_retries);
+                            requeued_window_deadline = Some(window_deadline);
+                            // Leaving this scope drops the driver and its stale event loop.
+                            continue 'publish;
                         }
                         Err(window_error) => {
                             for local_index in window_state.confirmed_indexes() {
@@ -551,9 +638,31 @@ impl MqttSink {
                                     self.in_flight_publications.fetch_sub(1, Ordering::Relaxed);
                                 }
                             }
-                            if !window_error.retryable || retries >= self.max_retries {
+                            if !window_error.retryable
+                                || window_retries >= self.max_retries
+                                || Instant::now() >= window_deadline
+                            {
                                 self.finish_unconfirmed_publications(&confirmed);
                                 return Err(window_error.error);
+                            }
+                            if window_error.requires_requeue {
+                                warn!(
+                                    "Retrying MQTT publication for connector with ID {} with a new driver (retry {}/{}): {}",
+                                    self.id,
+                                    window_retries + 1,
+                                    self.max_retries,
+                                    window_error.error
+                                );
+                                let delay = retry_backoff(
+                                    self.retry_delay,
+                                    window_retries + 1,
+                                    self.max_retry_delay,
+                                );
+                                tokio::time::sleep(delay).await;
+                                window_retries += 1;
+                                requeued_window_retries = Some(window_retries);
+                                requeued_window_deadline = Some(window_deadline);
+                                continue 'publish;
                             }
                             if window_error.requires_clean
                                 && let Err(error) = active_driver.clean().await
@@ -564,32 +673,17 @@ impl MqttSink {
                             warn!(
                                 "Retrying MQTT publication for connector with ID {} (retry {}/{}): {}",
                                 self.id,
-                                retries + 1,
+                                window_retries + 1,
                                 self.max_retries,
                                 window_error.error
                             );
-                            let delay =
-                                retry_backoff(self.retry_delay, retries + 1, self.max_retry_delay);
+                            let delay = retry_backoff(
+                                self.retry_delay,
+                                window_retries + 1,
+                                self.max_retry_delay,
+                            );
                             tokio::time::sleep(delay).await;
-                            retries += 1;
-                            if window_error.requires_requeue {
-                                let replay_indexes = window_state.reset_from_first_unconfirmed();
-                                let replay: Vec<_> =
-                                    replay_indexes.iter().map(|&index| window[index]).collect();
-                                if let Err(requeue_error) = active_driver
-                                    .enqueue_window(
-                                        &replay,
-                                        &replay_indexes,
-                                        qos,
-                                        self.config.retain,
-                                        &mut window_state,
-                                    )
-                                    .await
-                                {
-                                    self.finish_unconfirmed_publications(&confirmed);
-                                    return Err(requeue_error.error);
-                                }
-                            }
+                            window_retries += 1;
                         }
                     }
                 }
@@ -752,6 +846,14 @@ fn generated_client_id() -> String {
     let suffix = Uuid::new_v4().simple().to_string();
     let suffix_length = GENERATED_CLIENT_ID_LENGTH - GENERATED_CLIENT_ID_PREFIX.len();
     format!("{GENERATED_CLIENT_ID_PREFIX}{}", &suffix[..suffix_length])
+}
+
+fn unconfirmed_publication_indexes(confirmed: &[bool]) -> Vec<usize> {
+    confirmed
+        .iter()
+        .enumerate()
+        .filter_map(|(index, is_confirmed)| (!is_confirmed).then_some(index))
+        .collect()
 }
 
 fn parse_duration(value: Option<&str>, default: &str, field: &str) -> Result<Duration, Error> {
@@ -1197,6 +1299,18 @@ mod tests {
     }
 
     #[test]
+    fn given_session_reset_with_partially_confirmed_window_should_requeue_only_unconfirmed() {
+        let mut confirmed = vec![false; 3];
+        let window_indices = [0, 1, 2];
+
+        let newly_confirmed =
+            MqttSink::mark_window_confirmed(&mut confirmed, &window_indices, &[1]);
+
+        assert_eq!(newly_confirmed, 1);
+        assert_eq!(unconfirmed_publication_indexes(&confirmed), vec![0, 2]);
+    }
+
+    #[test]
     fn given_unreachable_broker_when_reconnecting_should_stop_at_max_retries() {
         let mut config = test_config();
         config.broker_url = "mqtt://127.0.0.1:1".to_string();
@@ -1247,6 +1361,15 @@ mod tests {
                 .as_shared()
                 .expect("static topics must be shared"),
         ));
+        assert_eq!(
+            publications[0].packet_size,
+            driver::publication_packet_size(
+                &publications[0],
+                sink.config.protocol,
+                sink.config.qos,
+                sink.config.retain,
+            )
+        );
     }
 
     #[test]

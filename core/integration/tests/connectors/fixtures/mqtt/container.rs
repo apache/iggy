@@ -280,53 +280,61 @@ async fn create_mqtt_user(dashboard_url: &str, token: &str) -> Result<(), TestBi
     let user_url =
         format!("{dashboard_url}/api/v5/authentication/password_based%3Abuilt_in_database/users");
 
-    let mut last_failure = "EMQX did not return a response".to_string();
-    for _ in 0..EMQX_START_ATTEMPTS {
-        match client
-            .post(&user_url)
-            .bearer_auth(token)
-            .json(&json!({
-                "user_id": MQTT_USERNAME,
-                "password": MQTT_PASSWORD,
-            }))
-            .send()
-            .await
-        {
-            Ok(response) if response.status().is_success() => return Ok(()),
-            Ok(response) => {
-                let status = response.status();
-                let body = response
-                    .text()
-                    .await
-                    .unwrap_or_else(|error| format!("failed to read EMQX response body: {error}"));
-                let message = format!(
-                    "EMQX did not accept the MQTT test user: HTTP {status}: {}",
-                    truncate_response_body(&body)
-                );
-
-                let authenticator_is_initializing =
-                    status == StatusCode::BAD_REQUEST && body.contains("not_initialized");
-                if status.is_client_error() && !authenticator_is_initializing {
-                    return Err(TestBinaryError::FixtureSetup {
-                        fixture_type: "MqttBrokerContainer".to_string(),
-                        message,
+    timeout(EMQX_START_INTERVAL * EMQX_START_ATTEMPTS as u32, async {
+        let mut last_failure = "EMQX did not return a response".to_string();
+        for _ in 0..EMQX_START_ATTEMPTS {
+            match client
+                .post(&user_url)
+                .bearer_auth(token)
+                .json(&json!({
+                    "user_id": MQTT_USERNAME,
+                    "password": MQTT_PASSWORD,
+                }))
+                .send()
+                .await
+            {
+                Ok(response) if response.status().is_success() => return Ok(()),
+                Ok(response) => {
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_else(|error| {
+                        format!("failed to read EMQX response body: {error}")
                     });
-                }
+                    let message = format!(
+                        "EMQX did not accept the MQTT test user: HTTP {status}: {}",
+                        truncate_response_body(&body)
+                    );
 
-                last_failure = message;
+                    let authenticator_is_initializing =
+                        status == StatusCode::BAD_REQUEST && body.contains("not_initialized");
+                    if status.is_client_error() && !authenticator_is_initializing {
+                        return Err(TestBinaryError::FixtureSetup {
+                            fixture_type: "MqttBrokerContainer".to_string(),
+                            message,
+                        });
+                    }
+
+                    last_failure = message;
+                }
+                Err(error) => {
+                    last_failure = format!("EMQX did not accept the MQTT test user: {error}");
+                }
             }
-            Err(error) => {
-                last_failure = format!("EMQX did not accept the MQTT test user: {error}");
-            }
+
+            sleep(EMQX_START_INTERVAL).await;
         }
 
-        sleep(EMQX_START_INTERVAL).await;
-    }
-
-    Err(TestBinaryError::FixtureSetup {
-        fixture_type: "MqttBrokerContainer".to_string(),
-        message: last_failure,
+        Err(TestBinaryError::FixtureSetup {
+            fixture_type: "MqttBrokerContainer".to_string(),
+            message: last_failure,
+        })
     })
+    .await
+    .map_err(|_| TestBinaryError::FixtureSetup {
+        fixture_type: "MqttBrokerContainer".to_string(),
+        message: format!("Timed out creating the MQTT test user at {dashboard_url}"),
+    })??;
+
+    Ok(())
 }
 
 fn truncate_response_body(body: &str) -> String {
