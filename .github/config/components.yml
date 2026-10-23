@@ -110,6 +110,7 @@ components:
     paths:
       - "core/binary_protocol/**"
       - "core/consensus/**"
+      - ".config/nextest.toml"
     tasks:
       - "miri"
 
@@ -204,7 +205,7 @@ components:
       - "ci-infrastructure"
     paths:
       - "Dockerfile*"
-      - ".config/**" # nextest + cargo-rail config, read only by the test-* tasks
+      - ".config/**" # nextest and cargo-rail configuration
       - "!foreign/**" # Exclude foreign SDKs
       - "!web/**" # Exclude web UI
     tasks:

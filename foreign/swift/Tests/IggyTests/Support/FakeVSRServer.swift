@@ -61,6 +61,8 @@ final class FakeVSRServer: @unchecked Sendable {
         case resolved(ConsensusOperation, requestID: UInt64? = nil)
         /// Closes the connection instead of answering.
         case close
+        /// Answers with status zero and this body, then closes the connection.
+        case okThenClose([UInt8])
         /// Never answers.
         case stall
         /// A status-zero reply written in two TCP chunks with a pause between.
@@ -205,6 +207,17 @@ final class FakeVSRServer: @unchecked Sendable {
         for partition in partitions {
             writer.write(partition)
         }
+        return writer.bytes
+    }
+
+    /// A send reply confirming one request at `baseOffset`.
+    static func confirmationBody(partitionID: UInt32, baseOffset: UInt64) -> [UInt8] {
+        var writer = ByteWriter()
+        writer.write(UInt32(1))
+        writer.write(UInt32(1))
+        writer.write(UInt32(2))
+        writer.write(partitionID)
+        writer.write(baseOffset)
         return writer.bytes
     }
 
@@ -457,6 +470,9 @@ final class FakeServerHandler: ChannelInboundHandler {
                     session: request.session, clientID: request.clientID, checksum: request.checksum, context: request.context, payload: request.payload)
                 write(FakeVSRServer.encodeReply(request: answered, operation: resolved, status: 0, body: [0, 0, 0, 0]))
             case .close:
+                channel.close(promise: nil)
+            case .okThenClose(let body):
+                write(FakeVSRServer.encodeReply(request: request, operation: operation, status: 0, body: framedBody(body)))
                 channel.close(promise: nil)
             case .stall:
                 break

@@ -4027,6 +4027,7 @@ mod tests {
                 floor: None,
                 peer: PEER,
                 idle_ticks: 0,
+                requested_from: Some(1),
             });
             for op in 1..=8 {
                 let parent = partition.consensus().last_prepare_checksum();
