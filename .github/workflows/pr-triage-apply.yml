@@ -116,29 +116,13 @@ permissions:
   actions: read
 
 concurrency:
-  # cancel-in-progress: false keeps the active run, but GH still replaces
-  # any pending run with the latest arrival on burst commands. Net effect
-  # under N rapid commands: the active run plus the latest arrival land,
-  # everything queued in between is dropped. Acceptable because /ready
-  # and /author are idempotent (state is reflected in the final label)
-  # and /request-review is the only non-idempotent command; a 3-command
-  # /request-review burst in <1s lands at most 2 reviewers, larger bursts
-  # lose proportionally more. Pending-queue retention key (queue:) is not
-  # yet in the GH Actions schema; revisit when available.
-  #
-  # workflow_run leg cannot key on PR number until after artifact parse,
-  # so it falls back to the upstream run id. Each collect run is unique,
-  # so this widens the group to one-run-per-upstream-collect and same-PR
-  # bursts on this leg do NOT serialize. Correctness does not depend on
-  # serialization: the setLabels helper performs an atomic replace-all
-  # (list current labels, drop the S-* sibling, push target, single
-  # setLabels call), so two interleaved label flips converge on the
-  # last-finishing run's target instead of fabricating a both-labels
-  # state. Per-PR serialization on this leg is a noise/cost
-  # optimization, blocked on GH adding job-level concurrency so the
-  # parsed PR number can re-key.
-  group: pr-triage-apply-${{ github.event.pull_request.number || github.event.workflow_run.id }}
+  # Shared with PR Skill Review Post: neither whole-label replacement may
+  # overwrite an addition made by the other workflow. The PR number is not
+  # available on workflow_run until the artifact has been resolved.
+  group: pr-label-writes-${{ github.repository }}
   cancel-in-progress: false
+  # Retain pending open events and commands instead of replacing them.
+  queue: max
 
 jobs:
   apply:
@@ -470,30 +454,10 @@ jobs:
               }
             };
 
-            // Atomic replace-all on the S-* slot: list current labels,
-            // drop both S-* siblings, optionally push the target, single
-            // setLabels PUT. Used by both the command leg (add = the
-            // target state) and the lifecycle close/converted_to_draft
-            // path (add = null -> just clear both S-*). One primitive
-            // for both legs so the lifecycle DELETE pair cannot race the
-            // command-leg PUT and resurrect a cleared S-* on a closed PR.
-            //
-            // Per-PR concurrency is NOT guaranteed on the workflow_run
-            // leg (see concurrency: comment above), so two command runs
-            // can land in parallel. The PUT-style setLabels makes
-            // interleaved flips converge on the last-finishing run's
-            // target instead of fabricating a both-labels state (which
-            // the lifecycle hasState gate would then treat as terminal
-            // and never clean up).
-            //
-            // The list+setLabels pair is not atomic against unrelated
-            // mutators, so a racing /label add by another workflow
-            // between our list and our setLabels would be overwritten.
-            // Acceptable: iggy's other workflows do not touch labels.
-            //
-            // Pagination is mandatory: an unpaginated per_page: 100 fetch
-            // on a PR carrying more than 100 labels would silently drop
-            // every label beyond page 1 on the setLabels PUT.
+            // The shared workflow queue serializes this snapshot and PUT
+            // with other triage runs, review posting and prolific labeling.
+            // Replace both S-* labels together; null clears the state.
+            // Pagination preserves unrelated labels beyond the first page.
             const replaceStateLabel = async (add) => {
               const live = await withRetry(() => github.paginate(
                 github.rest.issues.listLabelsOnIssue,
@@ -804,13 +768,6 @@ jobs:
               core.info(`lifecycle event=${action} draft=${pr.draft}`);
 
               if (action === 'closed' || action === 'converted_to_draft') {
-                // Atomic clear via replaceStateLabel(null): a single
-                // setLabels PUT that drops both S-* in one call. Using
-                // the same primitive as the command leg closes the
-                // cross-leg TOCTOU where two independent removeLabel
-                // calls here could be interleaved with a command-leg
-                // list+PUT and let S-waiting-on-review resurrect on a
-                // closed PR.
                 await replaceStateLabel(null);
                 core.info(`lifecycle: cleared S-* labels (${action})`);
                 return;
@@ -1181,3 +1138,87 @@ jobs:
             } else if (applied) {
               await react('+1');
             }
+
+      - name: Label prolific author on open
+        if: github.event_name == 'pull_request_target' && github.event.action == 'opened'
+        uses: actions/github-script@v9
+        with:
+          script: |
+            // Criteria from https://github.com/apache/arrow-rs/issues/11808
+            // and its attached label_prolific.py. This label is add-only.
+            const LABEL_NAME = 'Prolific Author';
+            const LABEL_COLOR = '5319E7';
+            const LABEL_DESCRIPTION = 'author has opened PRs in many repositories in the last month';
+            const LOOKBACK_DAYS = 30;
+            const REPOSITORY_THRESHOLD = 20;
+            const EXEMPT_MERGED_PRS = 10;
+            const MAX_REPOSITORIES = 100;
+            const author = context.payload.pull_request.user;
+            if (author?.type !== 'User') return;
+
+            const until = new Date();
+            const since = new Date(until);
+            since.setUTCDate(since.getUTCDate() - LOOKBACK_DAYS);
+
+            // A failed lookup must not turn an unknown merged count into
+            // a missing exemption. GraphQL errors fail before any writes.
+            const { user, search } = await github.graphql(`
+              query($login: String!, $since: DateTime!, $until: DateTime!,
+                    $maxRepositories: Int!, $mergedQuery: String!) {
+                user(login: $login) {
+                  contributionsCollection(from: $since, to: $until) {
+                    pullRequestContributionsByRepository(maxRepositories: $maxRepositories) {
+                      repository { nameWithOwner }
+                    }
+                  }
+                }
+                search(type: ISSUE, first: 0, query: $mergedQuery) { issueCount }
+              }
+            `, {
+              login: author.login,
+              since: since.toISOString(),
+              until: until.toISOString(),
+              maxRepositories: MAX_REPOSITORIES,
+              mergedQuery: `repo:${context.repo.owner}/${context.repo.repo} is:pr is:merged author:${author.login}`,
+            });
+            if (!user) {
+              core.warning(`Skipping unavailable author ${author.login}`);
+              return;
+            }
+            const repositories = user.contributionsCollection.pullRequestContributionsByRepository.length;
+            const merged = search.issueCount;
+            core.info(`${author.login}: ${repositories} repositories, ${merged} merged PRs`);
+            const isProlific = repositories > REPOSITORY_THRESHOLD && merged < EXEMPT_MERGED_PRS;
+            if (!isProlific) return;
+
+            // The issue check above may have closed the PR, and a rerun may
+            // find the label already applied.
+            const { data: pr } = await github.rest.pulls.get({
+              ...context.repo,
+              pull_number: context.payload.pull_request.number,
+            });
+            if (pr.state !== 'open' || pr.labels.some(label => label.name === LABEL_NAME)) return;
+
+            try {
+              await github.rest.issues.getLabel({ ...context.repo, name: LABEL_NAME });
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              try {
+                await github.rest.issues.createLabel({
+                  ...context.repo,
+                  name: LABEL_NAME,
+                  color: LABEL_COLOR,
+                  description: LABEL_DESCRIPTION,
+                });
+              } catch (error) {
+                if (error.status !== 422) throw error;
+                // Accept a concurrent creation only if the label exists.
+                await github.rest.issues.getLabel({ ...context.repo, name: LABEL_NAME });
+              }
+            }
+            await github.rest.issues.addLabels({
+              ...context.repo,
+              issue_number: pr.number,
+              labels: [LABEL_NAME],
+            });
+            core.info(`Labeled #${pr.number} (${author.login})`);
