@@ -47,7 +47,8 @@ use iggy_common::{
     ConsumerGroupMember as RustConsumerGroupMember, ConsumerOffsetInfo as RustConsumerOffsetInfo,
     GlobalPermissions as RustGlobalPermissions, HeaderEntry as RustHeaderEntry,
     HeaderField as RustHeaderField, HeaderKind as RustHeaderKind, IdentityInfo as RustIdentityInfo,
-    IggyError, Permissions as RustPermissions, Stats as RustStats,
+    IggyError, Permissions as RustPermissions, PersonalAccessTokenInfo as RustPersonalAccessTokenInfo,
+    Stats as RustStats,
     StreamPermissions as RustStreamPermissions, TopicPermissions as RustTopicPermissions,
     TransportEndpoints as RustTransportEndpoints, UserInfo as RustUserInfo,
     UserInfoDetails as RustUserInfoDetails, UserStatus as RustUserStatus,
@@ -185,6 +186,17 @@ impl From<RustUserInfoDetails> for ffi::UserInfoDetails {
             permissions: ffi::Permissions::from(user.permissions.unwrap_or_default()),
             options: resource_options_to_ffi(&user.options, true),
             derived_options: resource_options_to_ffi(&user.options, false),
+        }
+    }
+}
+
+impl From<RustPersonalAccessTokenInfo> for ffi::PersonalAccessTokenInfo {
+    fn from(token: RustPersonalAccessTokenInfo) -> Self {
+        let has_expiry = token.expiry_at.is_some();
+        ffi::PersonalAccessTokenInfo {
+            name: token.name,
+            has_expiry,
+            expiry_at: token.expiry_at.map_or(0, |expiry_at| expiry_at.as_micros()),
         }
     }
 }
