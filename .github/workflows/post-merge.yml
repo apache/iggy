@@ -38,14 +38,10 @@ env:
 
 jobs:
   check-auto-publish:
-    name: Check auto-publish
+    name: Auto-publish
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     if: ${{ !github.event.repository.fork }}
-    outputs:
-      docker_components: ${{ steps.check.outputs.docker_components }}
-      crates_to_publish: ${{ steps.check.outputs.crates_to_publish }}
-      sdks_to_publish: ${{ steps.check.outputs.sdks_to_publish }}
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -180,24 +176,19 @@ jobs:
           echo "sdks_to_publish=$SDKS_TO_PUBLISH" >> "$GITHUB_OUTPUT"
           echo "SDKs to publish: ${SDKS_TO_PUBLISH:-<none>}"
 
-  dispatch-publish:
-    name: Dispatch publisher
-    needs: check-auto-publish
-    if: >-
-      needs.check-auto-publish.outputs.crates_to_publish != '' ||
-      needs.check-auto-publish.outputs.docker_components != '' ||
-      needs.check-auto-publish.outputs.sdks_to_publish != ''
-    runs-on: ubuntu-26.04
-    steps:
       # Trusted publishers validate the top-level workflow identity. Dispatching
       # publish.yml keeps automatic and manual releases on the same identity.
-      - name: Dispatch and wait for publish workflow
+      - name: Dispatch publisher
+        if: >-
+          steps.check.outputs.crates_to_publish != '' ||
+          steps.check.outputs.docker_components != '' ||
+          steps.check.outputs.sdks_to_publish != ''
         uses: actions/github-script@v9
         env:
           COMMIT: ${{ github.sha }}
-          PUBLISH_CRATES: ${{ needs.check-auto-publish.outputs.crates_to_publish }}
-          PUBLISH_DOCKERHUB: ${{ needs.check-auto-publish.outputs.docker_components }}
-          PUBLISH_OTHER: ${{ needs.check-auto-publish.outputs.sdks_to_publish }}
+          PUBLISH_CRATES: ${{ steps.check.outputs.crates_to_publish }}
+          PUBLISH_DOCKERHUB: ${{ steps.check.outputs.docker_components }}
+          PUBLISH_OTHER: ${{ steps.check.outputs.sdks_to_publish }}
         with:
           script: |
             const dispatch = await github.request('POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches', {
@@ -226,20 +217,6 @@ jobs:
             }
 
             core.info(`Publish run: ${dispatch.data.html_url}`);
-            while (true) {
-              const { data: run } = await github.rest.actions.getWorkflowRun({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                run_id: runId
-              });
-
-              if (run.status === 'completed') {
-                if (run.conclusion !== 'success') {
-                  throw new Error(`Publish workflow concluded with ${run.conclusion}: ${run.html_url}`);
-                }
-                core.info(`Publish workflow succeeded: ${run.html_url}`);
-                break;
-              }
-
-              await new Promise(resolve => setTimeout(resolve, 30000));
-            }
+            await core.summary
+              .addLink(`Publish run #${runId}`, dispatch.data.html_url)
+              .write();

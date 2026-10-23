@@ -26,30 +26,53 @@ import org.apache.commons.lang3.ArrayUtils;
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.identifier.Identifier;
+import org.apache.iggy.identifier.StreamId;
+import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.identifier.UserId;
 import org.apache.iggy.message.HeaderKey;
+import org.apache.iggy.message.HeaderKind;
 import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.MessageHeader;
 import org.apache.iggy.message.MessageId;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PollingStrategy;
+import org.apache.iggy.stream.StreamUpdate;
+import org.apache.iggy.system.OptionsScope;
+import org.apache.iggy.topic.TopicUpdate;
 import org.apache.iggy.user.GlobalPermissions;
 import org.apache.iggy.user.Permissions;
 import org.apache.iggy.user.StreamPermissions;
 import org.apache.iggy.user.TopicPermissions;
+import org.apache.iggy.user.UserStatus;
+import org.apache.iggy.user.UserUpdate;
 
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.TreeMap;
 
 /**
  * Unified serializer for both blocking and async clients.
  * Provides serialization of domain objects to ByteBuf according to Iggy wire protocol.
  */
 public final class BytesSerializer {
+
+    /**
+     * Credential bounds the server enforces, in UTF-8 bytes. Checked before the round trip so a bad value
+     * fails here instead of as an opaque server error.
+     */
+    public static final int MIN_USERNAME_LENGTH = 3;
+
+    public static final int MAX_USERNAME_LENGTH = 50;
+
+    public static final int MIN_PASSWORD_LENGTH = 3;
+
+    public static final int MAX_PASSWORD_LENGTH = 100;
 
     /** Size of the batch header on the wire; bytes past the stamped fields stay zero. */
     static final int BATCH_HEADER_SIZE = 256;
@@ -218,6 +241,106 @@ public final class BytesSerializer {
         buffer.writeByte(stringBytes.length);
         buffer.writeBytes(stringBytes);
         return buffer;
+    }
+
+    /**
+     * An options block: the user-headers TLV with string keys, written in ascending key byte order so one
+     * set of options has one encoding. A request carries it to the end of its payload.
+     */
+    public static ByteBuf toOptionsBlock(Map<String, HeaderValue> options) {
+        if (options.isEmpty()) {
+            return Unpooled.buffer(0);
+        }
+        Map<byte[], HeaderValue> sorted = new TreeMap<>(Arrays::compareUnsigned);
+        options.forEach((key, value) -> sorted.put(key.getBytes(StandardCharsets.UTF_8), value));
+        var buffer = Unpooled.buffer();
+        for (Map.Entry<byte[], HeaderValue> entry : sorted.entrySet()) {
+            HeaderKey key = new HeaderKey(HeaderKind.String, entry.getKey());
+            checkFieldLength(key.value().length, "key", key);
+            buffer.writeByte(HeaderKind.String.asCode());
+            buffer.writeIntLE(key.value().length);
+            buffer.writeBytes(key.value());
+
+            HeaderValue value = entry.getValue();
+            checkFieldLength(value.value().length, "value for key", key);
+            buffer.writeByte(value.kind().asCode());
+            buffer.writeIntLE(value.value().length);
+            buffer.writeBytes(value.value());
+        }
+        return buffer;
+    }
+
+    /** {@code CreateStream}: {@code [name][options to end]}. */
+    public static ByteBuf toCreateStream(String name, Map<String, HeaderValue> options) {
+        var payload = toBytes(name, "name");
+        writeAndRelease(payload, toOptionsBlock(options));
+        return payload;
+    }
+
+    /**
+     * {@code CreateTopic}: {@code [stream_id][partitions_count:u32][name][options to end]}.
+     * {@code partitions_count} is an argument of the command, never an option: admission consumes it to
+     * compute partition assignments.
+     */
+    public static ByteBuf toCreateTopic(
+            StreamId streamId, String name, long partitionsCount, Map<String, HeaderValue> options) {
+        var payload = Unpooled.buffer();
+        writeAndRelease(payload, toBytes(streamId));
+        payload.writeIntLE((int) partitionsCount);
+        writeAndRelease(payload, toBytes(name, "name"));
+        writeAndRelease(payload, toOptionsBlock(options));
+        return payload;
+    }
+
+    /**
+     * {@code CreateUser}: {@code [username][password][status:u8][has_permissions:u8]
+     * [permissions_len:u32 permissions]?[options to end]}.
+     */
+    public static ByteBuf toCreateUser(
+            String username,
+            String password,
+            UserStatus status,
+            Optional<Permissions> permissions,
+            Map<String, HeaderValue> options) {
+        var payload = Unpooled.buffer();
+        writeAndRelease(payload, toBytes(username, "username", MIN_USERNAME_LENGTH, MAX_USERNAME_LENGTH));
+        writeAndRelease(payload, toBytes(password, "password", MIN_PASSWORD_LENGTH, MAX_PASSWORD_LENGTH));
+        payload.writeByte(status.asCode());
+        permissions.ifPresentOrElse(
+                granted -> {
+                    payload.writeByte(1);
+                    var permissionBytes = toBytes(granted);
+                    payload.writeIntLE(permissionBytes.readableBytes());
+                    writeAndRelease(payload, permissionBytes);
+                },
+                () -> payload.writeByte(0));
+        writeAndRelease(payload, toOptionsBlock(options));
+        return payload;
+    }
+
+    /** {@code UpdateResource} on a stream. */
+    public static ByteBuf toUpdateResource(StreamId streamId, StreamUpdate update) {
+        var target = Unpooled.buffer();
+        target.writeByte(OptionsScope.Stream.asCode());
+        writeAndRelease(target, toBytes(streamId));
+        return updateResource(target, update.resetKeys(), update.entries());
+    }
+
+    /** {@code UpdateResource} on a topic. */
+    public static ByteBuf toUpdateResource(StreamId streamId, TopicId topicId, TopicUpdate update) {
+        var target = Unpooled.buffer();
+        target.writeByte(OptionsScope.Topic.asCode());
+        writeAndRelease(target, toBytes(streamId));
+        writeAndRelease(target, toBytes(topicId));
+        return updateResource(target, update.resetKeys(), update.entries());
+    }
+
+    /** {@code UpdateResource} on a user. */
+    public static ByteBuf toUpdateResource(UserId userId, UserUpdate update) {
+        var target = Unpooled.buffer();
+        target.writeByte(OptionsScope.User.asCode());
+        writeAndRelease(target, toBytes(userId));
+        return updateResource(target, update.resetKeys(), update.entries());
     }
 
     public static ByteBuf toBytesAsU64(BigInteger value) {
@@ -439,6 +562,27 @@ public final class BytesSerializer {
             return EMPTY_USER_HEADERS;
         }
         return readAllBytes(toBytes(userHeaders));
+    }
+
+    /**
+     * Completes an {@code UpdateResource} body after its scope and identifiers:
+     * {@code [reset_count:u8][reset_key]*[options to end]}.
+     */
+    private static ByteBuf updateResource(ByteBuf payload, List<String> reset, Map<String, HeaderValue> set) {
+        payload.writeByte(reset.size());
+        for (String key : reset) {
+            writeAndRelease(payload, toBytes(key, "reset key"));
+        }
+        writeAndRelease(payload, toOptionsBlock(set));
+        return payload;
+    }
+
+    private static void writeAndRelease(ByteBuf payload, ByteBuf part) {
+        try {
+            payload.writeBytes(part);
+        } finally {
+            part.release();
+        }
     }
 
     private static byte[] readAllBytes(ByteBuf buffer) {

@@ -19,49 +19,46 @@ use crate::commands::cli_command::{CliCommand, PRINT_TARGET};
 use anyhow::Context;
 use async_trait::async_trait;
 use core::fmt;
-use iggy_common::Client;
-use iggy_common::update_topic::UpdateTopic;
-use iggy_common::{CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize, TopicUpdateOptions};
-use std::collections::BTreeMap;
+use iggy_common::{Client, Identifier, TopicUpdateOptions};
 use tracing::{Level, event};
 
 pub struct UpdateTopicCmd {
-    update_topic: UpdateTopic,
-    compression_algorithm: CompressionAlgorithm,
-    message_expiry: IggyExpiry,
-    max_topic_size: MaxTopicSize,
+    stream_id: Identifier,
+    topic_id: Identifier,
     options: TopicUpdateOptions,
 }
 
 impl UpdateTopicCmd {
-    pub fn new(
-        stream_id: Identifier,
-        topic_id: Identifier,
-        compression_algorithm: CompressionAlgorithm,
-        name: String,
-        message_expiry: IggyExpiry,
-        max_topic_size: MaxTopicSize,
-    ) -> Self {
+    pub fn new(stream_id: Identifier, topic_id: Identifier, options: TopicUpdateOptions) -> Self {
         Self {
-            update_topic: UpdateTopic {
-                stream_id,
-                topic_id,
-                name,
-                compression_algorithm: Some(compression_algorithm),
-                message_expiry: Some(message_expiry),
-                max_topic_size: Some(max_topic_size),
-                options: BTreeMap::new(),
-            },
-            compression_algorithm,
-            message_expiry,
-            max_topic_size,
-            options: TopicUpdateOptions {
-                compression_algorithm: Some(compression_algorithm),
-                message_expiry: Some(message_expiry),
-                max_topic_size: Some(max_topic_size),
-                ..TopicUpdateOptions::default()
-            },
+            stream_id,
+            topic_id,
+            options,
         }
+    }
+
+    /// The changes this command asks for, in a fixed order.
+    fn changes(&self) -> String {
+        let mut changes = Vec::new();
+        if let Some(name) = &self.options.name {
+            changes.push(format!("name: {name}"));
+        }
+        if let Some(message_expiry) = &self.options.message_expiry {
+            changes.push(format!("message expiry: {message_expiry}"));
+        }
+        if let Some(max_topic_size) = &self.options.max_topic_size {
+            changes.push(format!("max topic size: {max_topic_size}"));
+        }
+        for (key, value) in &self.options.raw {
+            changes.push(format!("{key}: {value}"));
+        }
+        for key in &self.options.reset {
+            changes.push(format!("reset: {key}"));
+        }
+        for key in &self.options.raw_reset {
+            changes.push(format!("reset: {key}"));
+        }
+        changes.join(", ")
     }
 }
 
@@ -73,26 +70,22 @@ impl CliCommand for UpdateTopicCmd {
 
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
         client
-            .update_topic(&self.update_topic.stream_id, &self.update_topic.topic_id, &self.update_topic.name, &self.options)
+            .update_topic(&self.stream_id, &self.topic_id, &self.options)
             .await
             .with_context(|| {
                 format!(
-                    "Problem updating topic (ID: {}, name: {}, message expiry: {}) in stream with ID: {}",
-                    self.update_topic.topic_id,
-                    self.update_topic.name,
-                    self.message_expiry,
-                    self.update_topic.stream_id
+                    "Problem updating topic with ID: {} ({}) in stream with ID: {}",
+                    self.topic_id,
+                    self.changes(),
+                    self.stream_id
                 )
             })?;
 
         event!(target: PRINT_TARGET, Level::INFO,
-            "Topic with ID: {} updated name: {}, updated message expiry: {}, updated compression algorithm: {}, updated max topic size: {} in stream with ID: {}",
-            self.update_topic.topic_id,
-            self.update_topic.name,
-            self.message_expiry,
-            self.compression_algorithm,
-            self.max_topic_size,
-            self.update_topic.stream_id,
+            "Topic with ID: {} updated ({}) in stream with ID: {}",
+            self.topic_id,
+            self.changes(),
+            self.stream_id,
         );
 
         Ok(())
@@ -101,18 +94,12 @@ impl CliCommand for UpdateTopicCmd {
 
 impl fmt::Display for UpdateTopicCmd {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let topic_id = &self.update_topic.topic_id;
-        let topic_name = &self.update_topic.name;
-        let compression_algorithm = &self.compression_algorithm;
-        let message_expiry = &self.message_expiry;
-        let max_topic_size = &self.max_topic_size;
-        let stream_id = &self.update_topic.stream_id;
-
         write!(
             f,
-            "update topic with ID: {topic_id}, name: {topic_name}, message expiry: \
-            {message_expiry}, compression algorithm: {compression_algorithm}, max topic size: \
-            {max_topic_size}, in stream with ID: {stream_id}",
+            "update topic with ID: {} ({}) in stream with ID: {}",
+            self.topic_id,
+            self.changes(),
+            self.stream_id
         )
     }
 }

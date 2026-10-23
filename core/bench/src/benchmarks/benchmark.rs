@@ -116,7 +116,9 @@ pub trait Benchmarkable: Send {
             }
 
             info!("Creating the test stream '{}'", stream_name);
-            client.create_stream(&stream_name).await?;
+            client
+                .create_stream(&stream_name, &StreamCreateOptions::default())
+                .await?;
             let topic_name = "topic-1".to_string();
             let max_topic_size = self
                 .args()

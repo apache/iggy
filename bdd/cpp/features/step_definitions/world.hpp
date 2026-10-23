@@ -20,9 +20,13 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdlib>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
+#include "iggy.hpp"
 #include "lib.rs.h"
 
 namespace bdd {
@@ -47,6 +51,15 @@ struct GlobalContext {
     PolledData polled;
     std::vector<std::uint8_t> raw_response;
     std::string raw_error;
+    // Public client for the option steps, connected on first use.
+    std::optional<iggy::IggyBlockingClient> sdk;
+    std::optional<std::uint32_t> last_stream_id;
+    std::optional<std::uint32_t> last_topic_id;
+    std::optional<std::uint32_t> last_user_id;
+    std::optional<std::vector<std::uint8_t>> last_stream_key;
+    bool last_update_rejected = false;
+    std::vector<iggy::OptionSpec> last_option_specs;
+    std::string call_error;
 
     GlobalContext()                                 = default;
     GlobalContext(const GlobalContext &)            = delete;
@@ -62,6 +75,14 @@ struct GlobalContext {
         }
     }
 };
+
+inline std::string required_env(const char *name) {
+    const char *value = std::getenv(name);
+    if (value == nullptr || *value == '\0') {
+        throw std::runtime_error(std::string(name) + " must be set. Run the suite via scripts/run-bdd-tests.sh");
+    }
+    return std::string(value);
+}
 
 inline iggy::ffi::Identifier make_string_identifier(const std::string &value) {
     iggy::ffi::Identifier identifier;

@@ -55,7 +55,10 @@ async fn concurrent_produce_consume_no_offset_skip(harness: &TestHarness) {
     let topic_id = Identifier::named(TOPIC_NAME).unwrap();
 
     let setup = harness.tcp_root_client().await.unwrap();
-    setup.create_stream(STREAM_NAME).await.unwrap();
+    setup
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     setup
         .create_topic(
             &stream_id,

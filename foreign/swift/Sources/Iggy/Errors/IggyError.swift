@@ -76,3 +76,45 @@ public struct IggyError: Error, Sendable, Hashable, CustomStringConvertible {
         hasher.combine(rawCode)
     }
 }
+
+extension IggyError {
+    /// Whether the failure means the connection itself is gone.
+    var isConnectionLoss: Bool {
+        switch code {
+        case .disconnected, .emptyResponse, .notConnected, .cannotEstablishConnection, .tcpError, .staleClient:
+            true
+        default:
+            false
+        }
+    }
+
+    /// Whether a fresh connection and sign-in can recover from this failure.
+    var isReconnectable: Bool {
+        isConnectionLoss || code == .unauthenticated
+    }
+
+    /// Whether the replica found no stream, topic, or partition for the
+    /// request. A replica that has not applied the commit creating one
+    /// answers this too.
+    var isNamespaceMiss: Bool {
+        switch code {
+        case .streamIdNotFound, .streamNameNotFound, .topicIdNotFound, .topicNameNotFound, .partitionNotFound:
+            true
+        default:
+            false
+        }
+    }
+
+    /// Whether a sign-in that failed this way would fail the same way on a
+    /// retry, so the remembered credentials are dropped. The same refusals
+    /// as `rejects_credentials` in the Rust SDK.
+    var isCredentialRejection: Bool {
+        switch code {
+        case .invalidCredentials, .invalidUsername, .invalidPassword, .invalidPersonalAccessToken, .personalAccessTokenExpired, .userInactive,
+            .unauthenticated, .invalidFormat:
+            true
+        default:
+            false
+        }
+    }
+}

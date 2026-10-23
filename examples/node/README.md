@@ -100,7 +100,7 @@ Creating a stream and topic, then sending and consuming messages:
 npm run test:stream-builder
 ```
 
-Uses the standard client API to send and consume three messages, then deletes the resources it created.
+Uses the standard client API to send and consume three messages, then deletes the resources it created. It also logs who chose the new stream's at-rest key: `server` when the server runs with encryption enabled, `none` for a plaintext stream.
 
 ### Sink Data Producer
 

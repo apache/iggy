@@ -33,7 +33,6 @@ func TestOperationForCode_ResolvesTheReplicatedTable(t *testing.T) {
 	}{
 		{code: command.CreateUserCode, want: OperationCreateUser},
 		{code: command.DeleteUserCode, want: OperationDeleteUser},
-		{code: command.UpdateUserCode, want: OperationUpdateUser},
 		{code: command.UpdatePermissionsCode, want: OperationUpdatePermissions},
 		{code: command.ChangePasswordCode, want: OperationChangePassword},
 		{code: command.CreateAccessTokenCode, want: OperationCreatePersonalAccessToken},
@@ -43,10 +42,8 @@ func TestOperationForCode_ResolvesTheReplicatedTable(t *testing.T) {
 		{code: command.DeleteConsumerOffsetCode, want: OperationDeleteConsumerOffset},
 		{code: command.CreateStreamCode, want: OperationCreateStream},
 		{code: command.DeleteStreamCode, want: OperationDeleteStream},
-		{code: command.UpdateStreamCode, want: OperationUpdateStream},
 		{code: command.CreateTopicCode, want: OperationCreateTopic},
 		{code: command.DeleteTopicCode, want: OperationDeleteTopic},
-		{code: command.UpdateTopicCode, want: OperationUpdateTopic},
 		{code: command.CreatePartitionsCode, want: OperationCreatePartitions},
 		{code: command.DeletePartitionsCode, want: OperationDeletePartitions},
 		{code: command.DeleteSegmentsCode, want: OperationDeleteSegments},
@@ -54,6 +51,7 @@ func TestOperationForCode_ResolvesTheReplicatedTable(t *testing.T) {
 		{code: command.DeleteGroupCode, want: OperationDeleteConsumerGroup},
 		{code: command.JoinGroupCode, want: OperationJoinConsumerGroup},
 		{code: command.LeaveGroupCode, want: OperationLeaveConsumerGroup},
+		{code: command.UpdateResourceCode, want: OperationUpdateResource},
 	}
 	require.Len(t, tests, len(replicatedOperation), "every replicated entry is covered")
 	for _, test := range tests {
@@ -85,6 +83,9 @@ func TestOperationForCode_FallsBackToNonReplicated(t *testing.T) {
 		command.SyncGroupCode,
 		command.LoginUserCode,
 		command.LoginWithAccessTokenCode,
+		35,
+		204,
+		304,
 	}
 	for _, code := range codes {
 		assert.Equal(t, OperationNonReplicated, OperationForCode(uint32(code)), "code %d", code)
@@ -110,7 +111,7 @@ func TestIsKnownOperation_RejectsUndeclaredDiscriminants(t *testing.T) {
 		assert.True(t, IsKnownOperation(operation), "operation %d", operation)
 	}
 
-	undeclared := []Operation{4, 63, 69, 127, 131, 135, 150, 159, 163, 164, 165, 255}
+	undeclared := []Operation{4, 63, 69, 76, 127, 129, 131, 133, 135, 142, 151, 159, 163, 164, 165, 255}
 	for _, operation := range undeclared {
 		assert.False(t, IsKnownOperation(operation), "operation %d", operation)
 	}
@@ -119,6 +120,9 @@ func TestIsKnownOperation_RejectsUndeclaredDiscriminants(t *testing.T) {
 func TestIsInternal_CoversTheInternalBandOnly(t *testing.T) {
 	assert.True(t, IsInternal(OperationCreateTopicWithAssignments))
 	assert.True(t, IsInternal(OperationTruncatePartition))
+	assert.True(t, IsInternal(OperationUpdateTopicResolved))
+	assert.True(t, IsInternal(OperationRewrapStreamKeys))
+	assert.False(t, IsInternal(OperationUpdateResource))
 	assert.False(t, IsInternal(OperationLogout))
 	assert.False(t, IsInternal(OperationCreateStream))
 	assert.False(t, IsInternal(OperationSendMessages))
@@ -135,6 +139,9 @@ func TestIsMetadata_ExcludesDeleteSegments(t *testing.T) {
 		OperationCreateConsumerGroup,
 		OperationCreatePersonalAccessToken,
 		OperationLeaveConsumerGroup,
+		OperationUpdateResource,
+		OperationUpdateStreamResolved,
+		OperationUpdateUserResolved,
 	}
 	for _, operation := range metadata {
 		assert.True(t, IsMetadata(operation), "operation %d", operation)
@@ -161,6 +168,8 @@ func TestIsResultFramed_ExcludesSendMessages(t *testing.T) {
 	framed := []Operation{
 		OperationCreateStream,
 		OperationLeaveConsumerGroup,
+		OperationUpdateResource,
+		OperationUpdateTopicResolved,
 		OperationStoreConsumerOffset,
 		OperationDeleteConsumerOffset,
 	}
