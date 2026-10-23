@@ -723,7 +723,7 @@ impl MqttEventLoopTask {
                 command = self.commands.recv() => match command {
                     Some(DriverCommand::Clean) => self.connection.clean(),
                     Some(DriverCommand::DiscardQueuedEvents { result_sender }) => {
-                        discard_pending_event(&mut pending_event);
+                        pending_event = None;
                         let _ = result_sender.send(());
                     }
                     Some(DriverCommand::Shutdown {
@@ -767,10 +767,6 @@ impl MqttEventLoopTask {
 
 fn discard_queued_events(events: &mut mpsc::Receiver<DriverEvent>) {
     while events.try_recv().is_ok() {}
-}
-
-fn discard_pending_event(pending_event: &mut Option<DriverEvent>) {
-    *pending_event = None;
 }
 
 async fn poll_connection_event(
@@ -1647,7 +1643,6 @@ mod tests {
             .unwrap_err();
 
         assert!(error.retryable());
-        assert!(error.retryable());
         assert!(matches!(
             error.error(),
             iggy_connector_sdk::Error::Connection(message)
@@ -1694,7 +1689,6 @@ mod tests {
             })
             .unwrap_err();
 
-        assert!(error.retryable());
         assert!(error.retryable());
         assert!(matches!(
             error.error(),
@@ -1839,14 +1833,5 @@ mod tests {
             events.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         ));
-    }
-
-    #[test]
-    fn given_pending_idle_event_when_starting_window_should_discard_it() {
-        let mut pending_event = Some(DriverEvent::SessionPresent(false));
-
-        super::discard_pending_event(&mut pending_event);
-
-        assert!(pending_event.is_none());
     }
 }

@@ -273,61 +273,69 @@ async fn wait_for_dashboard_token(dashboard_url: &str) -> Result<String, TestBin
 
 /// EMQX answers dashboard logins before its authenticator chain accepts user
 /// writes, so a single POST races the broker and fails with HTTP 400. Retry on
-/// the same budget as the dashboard wait, and accept 409 from a prior attempt
-/// whose reply was lost.
+/// the same budget as the dashboard wait, with one extra interval for the
+/// final diagnostic, and accept 409 from a prior attempt whose reply was lost.
 async fn create_mqtt_user(dashboard_url: &str, token: &str) -> Result<(), TestBinaryError> {
     let client = reqwest::Client::new();
     let user_url =
         format!("{dashboard_url}/api/v5/authentication/password_based%3Abuilt_in_database/users");
 
-    timeout(EMQX_START_INTERVAL * EMQX_START_ATTEMPTS as u32, async {
-        let mut last_failure = "EMQX did not return a response".to_string();
-        for _ in 0..EMQX_START_ATTEMPTS {
-            match client
-                .post(&user_url)
-                .bearer_auth(token)
-                .json(&json!({
-                    "user_id": MQTT_USERNAME,
-                    "password": MQTT_PASSWORD,
-                }))
-                .send()
-                .await
-            {
-                Ok(response) if response.status().is_success() => return Ok(()),
-                Ok(response) => {
-                    let status = response.status();
-                    let body = response.text().await.unwrap_or_else(|error| {
-                        format!("failed to read EMQX response body: {error}")
-                    });
-                    let message = format!(
-                        "EMQX did not accept the MQTT test user: HTTP {status}: {}",
-                        truncate_response_body(&body)
-                    );
-
-                    let authenticator_is_initializing =
-                        status == StatusCode::BAD_REQUEST && body.contains("not_initialized");
-                    if status.is_client_error() && !authenticator_is_initializing {
-                        return Err(TestBinaryError::FixtureSetup {
-                            fixture_type: "MqttBrokerContainer".to_string(),
-                            message,
-                        });
+    timeout(
+        EMQX_START_INTERVAL * (EMQX_START_ATTEMPTS as u32 + 1),
+        async {
+            let mut last_failure = "EMQX did not return a response".to_string();
+            for _ in 0..EMQX_START_ATTEMPTS {
+                match client
+                    .post(&user_url)
+                    .bearer_auth(token)
+                    .json(&json!({
+                        "user_id": MQTT_USERNAME,
+                        "password": MQTT_PASSWORD,
+                    }))
+                    .send()
+                    .await
+                {
+                    Ok(response)
+                        if response.status().is_success()
+                            || response.status() == StatusCode::CONFLICT =>
+                    {
+                        return Ok(());
                     }
+                    Ok(response) => {
+                        let status = response.status();
+                        let body = response.text().await.unwrap_or_else(|error| {
+                            format!("failed to read EMQX response body: {error}")
+                        });
+                        let message = format!(
+                            "EMQX did not accept the MQTT test user: HTTP {status}: {}",
+                            truncate_response_body(&body)
+                        );
 
-                    last_failure = message;
+                        let authenticator_is_initializing =
+                            status == StatusCode::BAD_REQUEST && body.contains("not_initialized");
+                        if status.is_client_error() && !authenticator_is_initializing {
+                            return Err(TestBinaryError::FixtureSetup {
+                                fixture_type: "MqttBrokerContainer".to_string(),
+                                message,
+                            });
+                        }
+
+                        last_failure = message;
+                    }
+                    Err(error) => {
+                        last_failure = format!("EMQX did not accept the MQTT test user: {error}");
+                    }
                 }
-                Err(error) => {
-                    last_failure = format!("EMQX did not accept the MQTT test user: {error}");
-                }
+
+                sleep(EMQX_START_INTERVAL).await;
             }
 
-            sleep(EMQX_START_INTERVAL).await;
-        }
-
-        Err(TestBinaryError::FixtureSetup {
-            fixture_type: "MqttBrokerContainer".to_string(),
-            message: last_failure,
-        })
-    })
+            Err(TestBinaryError::FixtureSetup {
+                fixture_type: "MqttBrokerContainer".to_string(),
+                message: last_failure,
+            })
+        },
+    )
     .await
     .map_err(|_| TestBinaryError::FixtureSetup {
         fixture_type: "MqttBrokerContainer".to_string(),
