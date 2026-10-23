@@ -71,11 +71,17 @@ runs:
 
     - name: Install cargo-sort
       if: inputs.task == 'sort'
-      uses: taiki-e/install-action@v2
-      with:
-        # The 2.1.4 release assets were re-uploaded after install-action
-        # recorded their checksum, so 2.1.4 fails verification.
-        tool: cargo-sort@2.1.3
+      shell: bash
+      env:
+        CARGO_SORT_VERSION: "2.1.4"
+        CARGO_SORT_SHA256: c35c3df1f2e512890ee2ffd6151aa265fbfe06accbea0d9226e0bb14d821845b
+      run: |
+        cargo_sort_archive="${RUNNER_TEMP}/cargo-sort.tar.gz"
+        curl -fsSL --retry 5 --retry-all-errors -o "$cargo_sort_archive" \
+          "https://github.com/DevinR528/cargo-sort/releases/download/v${CARGO_SORT_VERSION}/cargo-sort-x86_64-unknown-linux-gnu.tar.gz"
+        echo "${CARGO_SORT_SHA256}  ${cargo_sort_archive}" | sha256sum -c -
+        tar -xzf "$cargo_sort_archive" -C "$HOME/.cargo/bin" cargo-sort
+        cargo sort --version
 
     - name: Install cargo-machete
       if: inputs.task == 'machete'
