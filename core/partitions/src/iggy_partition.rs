@@ -33375,7 +33375,11 @@ mod tests {
         partition.repair = Some(armed_session(3, 0));
         for op in 1..=3 {
             partition
-                .apply_repaired_prepare(repaired_send_prepare(op, 0, u128::from(op)))
+                .apply_repaired_prepare(repaired_send_prepare(
+                    op,
+                    u128::from(op - 1),
+                    u128::from(op),
+                ))
                 .await;
         }
         partition.consensus().advance_commit_max(3);
