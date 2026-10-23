@@ -42,6 +42,7 @@ type resourceOptionsCtxKey struct{}
 type resourceOptionsCtx struct {
 	client         iggcon.Client
 	streamId       *uint32
+	streamName     string
 	streamKey      []byte
 	topicId        *uint32
 	userId         *uint32
@@ -100,6 +101,7 @@ func (resourceOptionsSteps) createStream(ctx context.Context, name string, optio
 		return fmt.Errorf("create stream %s: %w", name, err)
 	}
 	state.streamId = &stream.Id
+	state.streamName = name
 	state.createdStreams = append(state.createdStreams, stream.Id)
 	return nil
 }

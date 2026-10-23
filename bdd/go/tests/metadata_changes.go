@@ -102,7 +102,10 @@ func (metadataChangesSteps) whenChurnStreams(ctx context.Context, count int, pre
 
 func (s metadataChangesSteps) thenFollowedKinds(ctx context.Context, kinds string) error {
 	state := getMetadataChangesCtx(ctx)
-	streamID := *getResourceOptionsCtx(ctx).streamId
+	streamKey, err := s.createdStreamKey(ctx)
+	if err != nil {
+		return err
+	}
 	var want []iggcon.MetadataChangeKind
 	for _, name := range strings.Split(kinds, ",") {
 		kind, err := iggcon.ParseMetadataChangeKind(strings.TrimSpace(name))
@@ -128,8 +131,8 @@ func (s metadataChangesSteps) thenFollowedKinds(ctx context.Context, kinds strin
 			continue
 		}
 		mine = slices.DeleteFunc(slices.Clone(records), func(record iggcon.MetadataChangeRecord) bool {
-			id, ok := changeStreamID(record)
-			return !ok || id != streamID
+			key, ok := changeStreamKey(record)
+			return !ok || key != streamKey
 		})
 		if len(mine) >= len(want) {
 			break
@@ -334,6 +337,38 @@ func (metadataChangesSteps) read(ctx context.Context, start iggcon.MetadataChang
 	return getResourceOptionsCtx(ctx).client.GetMetadataChanges(ctx, query)
 }
 
+// createdStreamKey reads the key of the scenario's stream from its creation
+// record. Ids are reused after a delete, so a stream id alone can match a
+// stream another test created and deleted meanwhile.
+func (metadataChangesSteps) createdStreamKey(ctx context.Context) (iggcon.MetadataStreamKey, error) {
+	options := getResourceOptionsCtx(ctx)
+	query := iggcon.NewMetadataChangesQuery(
+		iggcon.AfterMetadataChangeStart(*getMetadataChangesCtx(ctx).cursor),
+		iggcon.MetadataChangeGroupStreams,
+	)
+	query.Limit = iggcon.MaxMetadataChangesLimit
+	for {
+		changes, err := options.client.GetMetadataChanges(ctx, query)
+		if err != nil {
+			return iggcon.MetadataStreamKey{}, fmt.Errorf("read stream changes: %w", err)
+		}
+		if changes.Status != iggcon.MetadataChangeStatusOk || changes.Next == nil {
+			return iggcon.MetadataStreamKey{}, fmt.Errorf("stream changes answered %s with cursor %v", changes.Status, changes.Next)
+		}
+		for _, record := range changes.Records {
+			created, ok := record.Body.(*iggcon.MetadataStreamChange)
+			if ok && record.Kind == iggcon.MetadataChangeKindStreamCreated &&
+				created.StreamID == *options.streamId && created.Name == options.streamName {
+				return created.MetadataStreamKey, nil
+			}
+		}
+		if !changes.HasMore {
+			return iggcon.MetadataStreamKey{}, fmt.Errorf("no stream_created change for stream %d %q", *options.streamId, options.streamName)
+		}
+		query.Start = iggcon.AfterMetadataChangeStart(*changes.Next)
+	}
+}
+
 func (metadataChangesSteps) followedRecord(ctx context.Context, kind string) (iggcon.MetadataChangeRecord, error) {
 	want, err := iggcon.ParseMetadataChangeKind(kind)
 	if err != nil {
@@ -416,21 +451,21 @@ func parseMetadataChangeGroups(names string) ([]iggcon.MetadataChangeGroup, erro
 	return groups, nil
 }
 
-// changeStreamID names the stream a stream, topic or partitions record
+// changeStreamKey names the stream a stream, topic or partitions record
 // belongs to.
-func changeStreamID(record iggcon.MetadataChangeRecord) (uint32, bool) {
+func changeStreamKey(record iggcon.MetadataChangeRecord) (iggcon.MetadataStreamKey, bool) {
 	switch body := record.Body.(type) {
 	case *iggcon.MetadataStreamChange:
-		return body.StreamID, true
+		return body.MetadataStreamKey, true
 	case *iggcon.MetadataStreamDeleted:
-		return body.StreamID, true
+		return body.MetadataStreamKey, true
 	case *iggcon.MetadataTopicChange:
-		return body.StreamID, true
+		return body.MetadataStreamKey, true
 	case *iggcon.MetadataTopicDeleted:
-		return body.StreamID, true
+		return body.MetadataStreamKey, true
 	case *iggcon.MetadataPartitionsChanged:
-		return body.StreamID, true
+		return body.MetadataStreamKey, true
 	default:
-		return 0, false
+		return iggcon.MetadataStreamKey{}, false
 	}
 }
