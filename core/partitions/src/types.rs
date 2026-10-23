@@ -398,7 +398,7 @@ pub struct PartitionsConfig {
 
 /// Directory names under a partition's root; fixed, because existing data
 /// directories were written with them.
-const OFFSETS_DIR: &str = "offsets";
+pub const OFFSETS_DIR: &str = "offsets";
 const CONSUMER_OFFSETS_DIR: &str = "consumers";
 const CONSUMER_GROUP_OFFSETS_DIR: &str = "groups";
 const EXTERNAL_GROUP_OFFSETS_DIR: &str = "external_groups";
