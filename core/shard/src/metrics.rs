@@ -283,6 +283,8 @@ pub struct ShardMetrics {
     partitions_reconcile_failures_total: Counter,
     partitions_duplicate_builds_discarded_total: Counter,
     partition_transfer_refusals_total: Counter,
+    partition_applied_divergences_total: Counter,
+    partitions_untrusted_log: Gauge,
     partition_frames_rejected_stale_total: Counter,
     partition_frames_rejected_ahead_total: Counter,
     partition_frames_incarnation_mismatch_total: Family<FrameCommandLabel, Counter>,
@@ -362,6 +364,8 @@ impl ShardMetrics {
             partitions_reconcile_failures_total: Counter::default(),
             partitions_duplicate_builds_discarded_total: Counter::default(),
             partition_transfer_refusals_total: Counter::default(),
+            partition_applied_divergences_total: Counter::default(),
+            partitions_untrusted_log: Gauge::default(),
             partition_frames_rejected_stale_total: Counter::default(),
             partition_frames_rejected_ahead_total: Counter::default(),
             partition_frames_incarnation_mismatch_total: Family::default(),
@@ -649,6 +653,39 @@ impl ShardMetrics {
     #[must_use]
     pub fn partition_transfer_refusals_value(&self) -> u64 {
         self.partition_transfer_refusals_total.get()
+    }
+
+    /// Bumped when a view this replica adopts contradicts a partition op it
+    /// already applied, and the partition is set aside for a resync.
+    ///
+    /// Any non-zero value means committed history diverged between replicas:
+    /// the resync keeps the node serving, but the local copy it quarantined
+    /// into `.fenced.N` holds an op the group did not keep.
+    pub fn record_partition_applied_divergence(&self) {
+        self.partition_applied_divergences_total.inc();
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn partition_applied_divergences_value(&self) -> u64 {
+        self.partition_applied_divergences_total.get()
+    }
+
+    /// Republished by every partition sweep: how many of this shard's
+    /// partitions elected on a log that may lack acknowledged ops and are
+    /// waiting for a trusted quorum or every replica to report before they
+    /// serve again.
+    pub fn set_partitions_untrusted_log(&self, count: usize) {
+        self.partitions_untrusted_log
+            .set(i64::try_from(count).unwrap_or(i64::MAX));
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn partitions_untrusted_log_value(&self) -> i64 {
+        self.partitions_untrusted_log.get()
     }
 
     /// Bumped when a parked partition frame is answered instead of served
@@ -990,6 +1027,18 @@ impl ShardMetrics {
             "partition_transfer_refusals",
             "partition state transfers refused by the serving peer",
             self.partition_transfer_refusals_total.clone(),
+        );
+        registry.register(
+            "partition_applied_divergences",
+            "adopted views that contradicted an applied partition op; non-zero means committed \
+             history diverged",
+            self.partition_applied_divergences_total.clone(),
+        );
+        registry.register(
+            "partitions_untrusted_log",
+            "partitions electing on a log that may lack acknowledged ops; a view starts only \
+             once a trusted quorum or every replica reports",
+            self.partitions_untrusted_log.clone(),
         );
         registry.register(
             "partition_frames_rejected_stale",
