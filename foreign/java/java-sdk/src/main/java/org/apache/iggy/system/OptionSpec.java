@@ -24,13 +24,50 @@ import org.apache.iggy.message.HeaderValue;
 /**
  * One entry of a resource's option catalog.
  *
- * <p>This is the discovery surface for the option keys a create command accepts: a key outside the
- * catalog is refused at create, and the binary transports carry only the error code back, so there
- * is no other way to learn which keys a given server knows.
+ * <p>This is the discovery surface for the option keys a create or update command accepts: a key outside
+ * the catalog is refused, and the binary transports carry only the error code back, so there is no other
+ * way to learn which keys a given server knows.
  *
- * @param key the option key the create command accepts
+ * @param key the option key
  * @param defaultValue the key's default, carrying the kind the server encodes it under, or empty for
  *     a key with no default. Reuses {@link HeaderValue} because options ride the user-headers codec.
  * @param description what the option does, including the bounds its value is checked against
+ * @param flags what an update may do with the key, as {@code FLAG_*} bits
  */
-public record OptionSpec(String key, HeaderValue defaultValue, String description) {}
+public record OptionSpec(String key, HeaderValue defaultValue, String description, int flags) {
+
+    /** An update may set the key. */
+    public static final int FLAG_UPDATABLE = 1;
+
+    /** An update may reset the key to its default. */
+    public static final int FLAG_RESETTABLE = 1 << 1;
+
+    /** Write-only: accepted, never returned. */
+    public static final int FLAG_SECRET = 1 << 2;
+
+    /** Computed by the server and returned on reads, never accepted. */
+    public static final int FLAG_READ_ONLY = 1 << 3;
+
+    /** A node that does not understand the key refuses to serve the resource. */
+    public static final int FLAG_CRITICAL = 1 << 4;
+
+    public boolean updatable() {
+        return (flags & FLAG_UPDATABLE) != 0;
+    }
+
+    public boolean resettable() {
+        return (flags & FLAG_RESETTABLE) != 0;
+    }
+
+    public boolean secret() {
+        return (flags & FLAG_SECRET) != 0;
+    }
+
+    public boolean readOnly() {
+        return (flags & FLAG_READ_ONLY) != 0;
+    }
+
+    public boolean critical() {
+        return (flags & FLAG_CRITICAL) != 0;
+    }
+}

@@ -594,10 +594,10 @@ pub(in crate::http) mod tests {
     use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
     use iggy_binary_protocol::requests::messages::SendMessagesHeader;
     use iggy_binary_protocol::requests::streams::{
-        CreateStreamRequest, DeleteStreamRequest, UpdateStreamRequest,
+        CreateStreamRequest, DeleteStreamRequest, UpdateStreamResolvedRequest,
     };
     use iggy_binary_protocol::requests::topics::{
-        CreateTopicRequest, CreateTopicWithAssignmentsRequest, UpdateTopicRequest,
+        CreateTopicRequest, CreateTopicWithAssignmentsRequest, UpdateTopicResolvedRequest,
     };
     use iggy_binary_protocol::requests::users::{
         CreateUserRequest, DeleteUserRequest, UpdatePermissionsRequest,
@@ -838,8 +838,8 @@ pub(in crate::http) mod tests {
                 (true, true, None),
                 (false, true, None),
                 (false, true, Some(Operation::DeleteStream)),
-                (false, true, Some(Operation::UpdateStream)),
-                (false, true, Some(Operation::UpdateTopic)),
+                (false, true, Some(Operation::UpdateStreamResolved)),
+                (false, true, Some(Operation::UpdateTopicResolved)),
             ] {
                 let (sender, shard_inbox, _shard_replies) = shard_channel(0, 1, 1);
                 let state = read_state_on(Some(sender), None);
@@ -885,6 +885,7 @@ pub(in crate::http) mod tests {
                                 context: metadata.context(0),
                                 fragments: Vec::new().into(),
                                 current_offset: 0,
+                                encryptor: None,
                             }
                         }
                         PartitionRead::ConsumerOffsetOnPrimary { .. } => {
@@ -923,17 +924,19 @@ pub(in crate::http) mod tests {
                             stream_id: WireIdentifier::numeric(0),
                         }
                         .to_bytes(),
-                        Operation::UpdateStream => UpdateStreamRequest {
+                        Operation::UpdateStreamResolved => UpdateStreamResolvedRequest {
                             stream_id: WireIdentifier::numeric(0),
-                            name: WireName::new("renamed").unwrap(),
-                            options: WireOptions::empty(),
+                            name: Some(WireName::new("renamed").unwrap()),
+                            explicit_options: WireOptions::empty(),
+                            derived_options: WireOptions::empty(),
                         }
                         .to_bytes(),
-                        Operation::UpdateTopic => UpdateTopicRequest {
+                        Operation::UpdateTopicResolved => UpdateTopicResolvedRequest {
                             stream_id: WireIdentifier::numeric(0),
                             topic_id: WireIdentifier::numeric(0),
-                            name: WireName::new("renamed").unwrap(),
-                            options: WireOptions::empty(),
+                            name: Some(WireName::new("renamed").unwrap()),
+                            explicit_options: WireOptions::empty(),
+                            derived_options: WireOptions::empty(),
                         }
                         .to_bytes(),
                         _ => unreachable!(),
@@ -1107,6 +1110,7 @@ pub(in crate::http) mod tests {
                 context: metadata.context(0),
                 fragments: Vec::new().into(),
                 current_offset: 0,
+                encryptor: None,
             },
             PartitionRead::ConsumerOffsetOnPrimary { .. } => PartitionReadReply::ConsumerOffset {
                 stored: Some(0),
@@ -1228,11 +1232,12 @@ pub(in crate::http) mod tests {
 
             commit(
                 &mut inner,
-                &UpdateTopicRequest {
+                &UpdateTopicResolvedRequest {
                     stream_id: WireIdentifier::named("events").unwrap(),
                     topic_id: WireIdentifier::named("orders").unwrap(),
-                    name: WireName::new("renamed").unwrap(),
-                    options: WireOptions::empty(),
+                    name: Some(WireName::new("renamed").unwrap()),
+                    explicit_options: WireOptions::empty(),
+                    derived_options: WireOptions::empty(),
                 },
             );
             let replacement_topic = create_topic(&mut inner, "events", "orders", 2);
@@ -1243,10 +1248,11 @@ pub(in crate::http) mod tests {
             if rename_stream {
                 commit(
                     &mut inner,
-                    &UpdateStreamRequest {
+                    &UpdateStreamResolvedRequest {
                         stream_id: WireIdentifier::named("events").unwrap(),
-                        name: WireName::new("renamed-stream").unwrap(),
-                        options: WireOptions::empty(),
+                        name: Some(WireName::new("renamed-stream").unwrap()),
+                        explicit_options: WireOptions::empty(),
+                        derived_options: WireOptions::empty(),
                     },
                 );
                 let replacement_stream = create_stream(&mut inner, "events");
@@ -1629,7 +1635,7 @@ pub(in crate::http) mod tests {
                 validate_checksum: config.partition.validate_checksum,
                 segment_size: IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
                 preallocate_segments: iggy_common::DEFAULT_PREALLOCATE_SEGMENTS,
-                encryptor: None,
+                key_context: Arc::default(),
                 path_layout: PartitionPathLayout::default(),
             },
         );

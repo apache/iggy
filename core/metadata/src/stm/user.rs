@@ -23,6 +23,7 @@ use crate::stm::result::{
     UpdateUserResult,
 };
 use crate::stm::snapshot::Snapshotable;
+use crate::stm::stream::{PatchError, patched_options, public_reply_options};
 use crate::stm::{ApplyContext, StateHandler};
 use crate::{collect_handlers, define_state, impl_fill_restore};
 use ahash::AHashMap;
@@ -35,7 +36,7 @@ use iggy_binary_protocol::codec::{WireDecode, WireEncode, read_u32_le, read_u64_
 use iggy_binary_protocol::primitives::permissions::{WireGlobalPermissions, WirePermissions};
 use iggy_binary_protocol::requests::users::{
     ChangePasswordRequest, CreateUserRequest, DeleteUserRequest, UpdatePermissionsRequest,
-    UpdateUserRequest,
+    UpdateUserResolvedRequest,
 };
 use iggy_binary_protocol::responses::users::get_user::UserDetailsResponse;
 use iggy_binary_protocol::responses::users::user_response::UserResponse;
@@ -43,8 +44,8 @@ use iggy_binary_protocol::{WireIdentifier, WireName};
 use iggy_common::defaults::{DEFAULT_ROOT_USER_ID, MAX_USERNAME_LENGTH, MIN_USERNAME_LENGTH};
 use iggy_common::wire_conversions::resource_options_from_wire;
 use iggy_common::{
-    GlobalPermissions, IggyError, IggyExpiry, IggyTimestamp, Permissions, PersonalAccessToken,
-    ResourceOptions, StreamPermissions, UserId, UserStatus,
+    GlobalPermissions, IggyError, IggyExpiry, IggyTimestamp, OptionsScope, Permissions,
+    PersonalAccessToken, ResourceOptions, StreamPermissions, UserId, UserStatus,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -127,7 +128,7 @@ define_state! {
 collect_handlers! {
     Users {
         CreateUser,
-        UpdateUser,
+        UpdateUserResolved,
         DeleteUser,
         ChangePassword,
         UpdatePermissions,
@@ -182,13 +183,13 @@ impl UsersInner {
             .and_then(|&id| self.items.get(id as usize))
     }
 
-    /// Stored password hash of the user named by `identifier`, `None` when
-    /// the user does not resolve.
+    /// Id and stored password hash of the user named by `identifier`, `None`
+    /// when the user does not resolve.
     #[must_use]
-    pub fn password_hash_of(&self, identifier: &WireIdentifier) -> Option<Arc<str>> {
+    pub fn resolve_password_hash(&self, identifier: &WireIdentifier) -> Option<(UserId, Arc<str>)> {
         self.resolve_user_id(identifier)
             .and_then(|user_id| self.items.get(user_id))
-            .map(|user| Arc::clone(&user.password_hash))
+            .map(|user| (user.id, Arc::clone(&user.password_hash)))
     }
 
     /// Clone the committed permissions of the user at slab `id`, if any.
@@ -540,6 +541,8 @@ impl StateHandler for CreateUserRequest {
             Ok(options) => options,
             Err(result) => return ApplyReply::err(result),
         };
+        // The reply is cached for retries, so it is projected before caching.
+        let reply_options = public_reply_options(OptionsScope::User, &options);
 
         let username_arc: Arc<str> = Arc::from(self.username.as_str());
         let status = UserStatus::from_code(self.status).unwrap_or_default();
@@ -584,7 +587,8 @@ impl StateHandler for CreateUserRequest {
                     created_at: timestamp.as_micros(),
                     status: self.status,
                     username: self.username.clone(),
-                    options: self.options.clone(),
+                    options: reply_options.0,
+                    derived_options: reply_options.1,
                 },
                 permissions: self.permissions.clone(),
             }
@@ -593,51 +597,67 @@ impl StateHandler for CreateUserRequest {
     }
 }
 
-impl StateHandler for UpdateUserRequest {
+impl StateHandler for UpdateUserResolvedRequest {
     type State = UsersInner;
     #[allow(clippy::cast_possible_truncation)]
     fn apply(&self, state: &mut UsersInner, _timestamp: IggyTimestamp) -> ApplyReply {
         let Some(user_id) = state.resolve_user_id(&self.user_id) else {
             return ApplyReply::err(UpdateUserResult::UserNotFound);
         };
-
-        let Some(user) = state.items.get_mut(user_id) else {
+        let Some(user) = state.items.get(user_id) else {
             return ApplyReply::err(UpdateUserResult::UserNotFound);
         };
 
-        // Decoded before any mutation: a malformed block must leave the user
-        // untouched rather than half-renamed.
-        let Ok(updated_options) = resource_options_from_wire(&self.options, true) else {
-            return ApplyReply::err(UpdateUserResult::InvalidOptionValue);
-        };
+        if user_id as u32 == DEFAULT_ROOT_USER_ID
+            && (self.username.is_some() || self.status.is_some())
+            && (state.apply_context.user_id != DEFAULT_ROOT_USER_ID
+                || self.status == Some(UserStatus::Inactive.as_code()))
+        {
+            return ApplyReply::err(UpdateUserResult::CannotModifyRootUser);
+        }
 
-        if let Some(new_username) = &self.username {
+        // Every check runs before any mutation, so a refused patch leaves the
+        // user exactly as it was: no half-applied rename or status change.
+        let new_username: Option<Arc<str>> =
+            self.username.as_ref().map(|name| Arc::from(name.as_str()));
+        if let Some(new_username) = &new_username {
             // Same bound as CreateUser apply: a rename must not smuggle in a
-            // username the edges reject. Rejected before any mutation.
-            if !(MIN_USERNAME_LENGTH..=MAX_USERNAME_LENGTH).contains(&new_username.as_str().len()) {
+            // username the edges reject.
+            if !(MIN_USERNAME_LENGTH..=MAX_USERNAME_LENGTH).contains(&new_username.len()) {
                 return ApplyReply::err(UpdateUserResult::InvalidUsername);
             }
-
-            let new_username_arc: Arc<str> = Arc::from(new_username.as_str());
-            if let Some(&existing_id) = state.index.get(&new_username_arc)
+            if let Some(&existing_id) = state.index.get(new_username)
                 && existing_id != user_id as UserId
             {
                 return ApplyReply::err(UpdateUserResult::UsernameAlreadyExists);
             }
-
-            state.index.remove(&user.username);
-            user.username = new_username_arc.clone();
-            state.index.insert(new_username_arc, user_id as UserId);
         }
+        let Ok(new_status) = self.status.map(UserStatus::from_code).transpose() else {
+            return ApplyReply::err(UpdateUserResult::InvalidUserStatus);
+        };
+        let options =
+            match patched_options(&user.options, &self.explicit_options, &self.derived_options) {
+                Ok(options) => options,
+                Err(PatchError::InvalidValue) => {
+                    return ApplyReply::err(UpdateUserResult::InvalidOptionValue);
+                }
+                Err(PatchError::TooLarge) => {
+                    return ApplyReply::err(UpdateUserResult::OptionsBlockTooLarge);
+                }
+            };
 
-        if let Some(status_code) = self.status
-            && let Ok(new_status) = UserStatus::from_code(status_code)
-        {
+        let Some(user) = state.items.get_mut(user_id) else {
+            return ApplyReply::err(UpdateUserResult::UserNotFound);
+        };
+        if let Some(new_username) = new_username {
+            state.index.remove(&user.username);
+            user.username = new_username.clone();
+            state.index.insert(new_username, user_id as UserId);
+        }
+        if let Some(new_status) = new_status {
             user.status = new_status;
         }
-        // Patch, never replace: keys the client did not send keep their
-        // current value, so a client that predates a key cannot erase it.
-        user.options.extend(updated_options);
+        user.options = options;
         ApplyReply {
             revoked_user: (user.status != UserStatus::Active).then_some(user_id as UserId),
             ..ApplyReply::ok(Bytes::new())
@@ -686,11 +706,12 @@ impl StateHandler for ChangePasswordRequest {
         };
 
         // An empty `new_password` is the primary's signal that the caller's
-        // current password did not match (see the server
-        // `verify_and_rewrite_change_password`): the accept path always
-        // replicates a non-empty Argon2 hash, so this is unambiguous. Rejecting
-        // here (rather than denying pre-consensus) commits the op as a no-op,
-        // recording the request id in the ClientTable so a retry of it dedups.
+        // current password did not match or that the target did not resolve
+        // there (see the server `verify_and_rewrite_change_password`). The
+        // accept path always replicates a non-empty Argon2 hash, so this is
+        // unambiguous. Rejecting here (rather than denying pre-consensus)
+        // commits the op as a no-op, recording the request id in the
+        // ClientTable so a retry of it dedups.
         if self.new_password.is_empty() {
             return ApplyReply::err(ChangePasswordResult::InvalidCredentials);
         }
@@ -852,7 +873,9 @@ impl StateHandler for CreatePersonalAccessTokenRequest {
             return ApplyReply::err(CreatePersonalAccessTokenResult::AlreadyExists);
         }
 
-        let expiry_at = PersonalAccessToken::calculate_expiry_at(timestamp, expiry);
+        let Ok(expiry_at) = PersonalAccessToken::calculate_expiry_at(timestamp, expiry) else {
+            return ApplyReply::err(CreatePersonalAccessTokenResult::InvalidExpiry);
+        };
         if let Some(expiry_at) = expiry_at
             && expiry_at.as_micros() <= timestamp.as_micros()
         {
@@ -1143,7 +1166,10 @@ mod tests {
     use iggy_binary_protocol::primitives::permissions::{
         WireStreamPermissions, WireTopicPermissions,
     };
-    use iggy_common::IggyError;
+    use iggy_common::wire_conversions::resource_options_to_wire;
+    use iggy_common::{
+        HeaderKey, HeaderValue, IggyError, OptionKey, OptionValue, OptionsProvenance,
+    };
 
     #[test]
     fn create_pat_request_roundtrip_preserves_user_id() {
@@ -1229,6 +1255,29 @@ mod tests {
         }
         .apply(&mut users, IggyTimestamp::now());
         assert_eq!(users.pat_count_of(9), 1);
+    }
+
+    #[test]
+    fn given_expiry_past_the_end_of_the_clock_when_creating_token_should_refuse_it() {
+        let mut users = UsersInner::new();
+        let now = IggyTimestamp::now();
+        for expiry in [u64::MAX - now.as_micros() + 1, 0xFFFF_FFFF_0000_0000] {
+            let reply = CreatePersonalAccessTokenRequest {
+                user_id: 4,
+                name: WireName::new("far").unwrap(),
+                expiry,
+                token_hash: [b'a'; PAT_TOKEN_HASH_BYTES],
+            }
+            .apply(&mut users, now);
+
+            assert_eq!(
+                reply.code,
+                u32::from(CreatePersonalAccessTokenResult::InvalidExpiry)
+            );
+        }
+        assert_eq!(users.pat_count_of(4), 0);
+        assert!(users.personal_access_token_index.is_empty());
+        assert!(users.personal_access_token_expiry_index.is_empty());
     }
 
     #[test]
@@ -1406,6 +1455,37 @@ mod tests {
         };
         let apply = StateHandler::apply(&request, users, IggyTimestamp::now());
         assert_eq!(apply.code, 0);
+    }
+
+    #[test]
+    fn given_unknown_critical_key_when_apply_create_user_should_store_it_without_echoing_options() {
+        let mut options = ResourceOptions::new();
+        options.insert(
+            HeaderKey::from(OptionKey::CriticalKeys),
+            OptionValue::explicit(HeaderValue::try_from("a_future_key").unwrap()),
+        );
+        options.insert(
+            HeaderKey::try_from("a_future_key").unwrap(),
+            OptionValue::explicit(HeaderValue::from(7u64)),
+        );
+        let request = CreateUserRequest {
+            username: WireName::new("alice").unwrap(),
+            password: "hash".to_owned(),
+            status: 1,
+            permissions: None,
+            options: resource_options_to_wire(&options, OptionsProvenance::All).unwrap(),
+        };
+        let mut users = UsersInner::new();
+
+        let apply = StateHandler::apply(&request, &mut users, IggyTimestamp::now());
+
+        assert_eq!(apply.code, 0);
+        assert_eq!(users.items.get(0).unwrap().options, options);
+        let (reply, _) = UserDetailsResponse::decode(&apply.body).unwrap();
+        assert_eq!(
+            (reply.user.options, reply.user.derived_options),
+            (WireOptions::empty(), WireOptions::empty())
+        );
     }
 
     #[test]
@@ -1986,11 +2066,12 @@ mod tests {
         let alice_id = create_user_with(&mut users, "alice", None);
 
         let short = "a".repeat(MIN_USERNAME_LENGTH - 1);
-        let rename = UpdateUserRequest {
+        let rename = UpdateUserResolvedRequest {
             user_id: WireIdentifier::numeric(alice_id),
             username: Some(WireName::new(&short).unwrap()),
             status: None,
-            options: WireOptions::empty(),
+            explicit_options: WireOptions::empty(),
+            derived_options: WireOptions::empty(),
         };
         let reply = StateHandler::apply(&rename, &mut users, IggyTimestamp::now());
         assert_eq!(reply.code, u32::from(UpdateUserResult::InvalidUsername));
@@ -2005,5 +2086,114 @@ mod tests {
         );
         assert_eq!(users.index.get("alice"), Some(&alice_id));
         assert!(!users.index.contains_key(short.as_str()));
+    }
+
+    #[test]
+    fn given_user_status_patch_when_applying_should_revoke_inactive_sessions() {
+        let mut users = UsersInner::new();
+        create_user_with(&mut users, "iggy", None);
+        let alice_id = create_user_with(&mut users, "alice", None);
+        let patch =
+            |username: Option<&str>, status: Option<UserStatus>| UpdateUserResolvedRequest {
+                user_id: WireIdentifier::numeric(alice_id),
+                username: username.map(|name| WireName::new(name).unwrap()),
+                status: status.map(|status| status.as_code()),
+                explicit_options: WireOptions::empty(),
+                derived_options: WireOptions::empty(),
+            };
+
+        let rename = StateHandler::apply(
+            &patch(Some("alicia"), None),
+            &mut users,
+            IggyTimestamp::now(),
+        );
+        assert_eq!(rename.code, 0);
+        assert_eq!(rename.revoked_user, None);
+        assert_eq!(users.index.get("alicia"), Some(&alice_id));
+        assert!(!users.index.contains_key("alice"));
+
+        let deactivate = StateHandler::apply(
+            &patch(None, Some(UserStatus::Inactive)),
+            &mut users,
+            IggyTimestamp::now(),
+        );
+        assert_eq!(deactivate.code, 0);
+        assert_eq!(deactivate.revoked_user, Some(alice_id));
+        assert_eq!(
+            users.items.get(alice_id as usize).map(|user| user.status),
+            Some(UserStatus::Inactive)
+        );
+
+        let taken =
+            StateHandler::apply(&patch(Some("iggy"), None), &mut users, IggyTimestamp::now());
+        assert_eq!(
+            taken.code,
+            u32::from(UpdateUserResult::UsernameAlreadyExists)
+        );
+        assert_eq!(taken.revoked_user, None);
+
+        let invalid_status = UpdateUserResolvedRequest {
+            status: Some(9),
+            ..patch(None, None)
+        };
+        assert_eq!(
+            StateHandler::apply(&invalid_status, &mut users, IggyTimestamp::now()).code,
+            u32::from(UpdateUserResult::InvalidUserStatus)
+        );
+    }
+
+    #[test]
+    fn given_root_patch_when_applying_should_enforce_root_identity_and_active_status() {
+        let mut users = UsersInner::new();
+        create_user_with(&mut users, "iggy", None);
+        let manager_id = create_user_with(&mut users, "manager", None);
+        let patch =
+            |username: Option<&str>, status: Option<UserStatus>| UpdateUserResolvedRequest {
+                user_id: WireIdentifier::numeric(DEFAULT_ROOT_USER_ID),
+                username: username.map(|name| WireName::new(name).unwrap()),
+                status: status.map(|value| value.as_code()),
+                explicit_options: WireOptions::empty(),
+                derived_options: WireOptions::empty(),
+            };
+
+        users.apply_context.user_id = manager_id;
+        for request in [
+            patch(Some("root-renamed"), None),
+            patch(None, Some(UserStatus::Inactive)),
+        ] {
+            let reply = StateHandler::apply(&request, &mut users, IggyTimestamp::zero());
+            assert_eq!(reply.code, IggyError::CannotModifyRootUser.as_code());
+            assert_eq!(
+                users.items.get(0).map(|user| user.username.as_ref()),
+                Some("iggy")
+            );
+            assert_eq!(
+                users.items.get(0).map(|user| user.status),
+                Some(UserStatus::Active)
+            );
+        }
+
+        users.apply_context.user_id = DEFAULT_ROOT_USER_ID;
+        let renamed = StateHandler::apply(
+            &patch(Some("root-renamed"), None),
+            &mut users,
+            IggyTimestamp::zero(),
+        );
+        assert_eq!(renamed.code, 0);
+        assert_eq!(
+            users.items.get(0).map(|user| user.username.as_ref()),
+            Some("root-renamed")
+        );
+
+        let deactivated = StateHandler::apply(
+            &patch(None, Some(UserStatus::Inactive)),
+            &mut users,
+            IggyTimestamp::zero(),
+        );
+        assert_eq!(deactivated.code, IggyError::CannotModifyRootUser.as_code());
+        assert_eq!(
+            users.items.get(0).map(|user| user.status),
+            Some(UserStatus::Active)
+        );
     }
 }

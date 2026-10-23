@@ -98,7 +98,7 @@ const PARTITION_WAL_REFUSAL_MARKER: &str = "prepare WAL at";
 
 async fn create_stream_and_topic(client: &IggyClient, durability: Durability) {
     client
-        .create_stream(STREAM_NAME)
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
         .await
         .expect("create stream");
     // Eager flush makes committed batches visible to the on-disk oracles.
@@ -465,7 +465,7 @@ async fn given_a_graceful_stop_when_the_cluster_restarts_should_not_report_segme
 ) {
     let client = harness.tcp_root_client().await.unwrap();
     client
-        .create_stream(STREAM_NAME)
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
         .await
         .expect("create stream");
     // Not `create_stream_and_topic`: its eager flush indexes every batch at
@@ -964,7 +964,10 @@ async fn given_interior_wal_corruption_when_a_node_boots_should_refuse_and_heal_
     // provably precedes many complete entries.
     for index in 0..WAL_FODDER_STREAMS {
         client
-            .create_stream(&format!("wal-fodder-{index:02}"))
+            .create_stream(
+                &format!("wal-fodder-{index:02}"),
+                &StreamCreateOptions::default(),
+            )
             .await
             .expect("create fodder stream");
     }

@@ -26,6 +26,7 @@ pub mod get_snapshot;
 pub mod get_stats;
 pub mod ping;
 pub mod retire_sessions;
+pub mod update_resource;
 
 pub use bind_session::{BindSessionRequest, SessionIdentity};
 pub use describe_options::{
@@ -40,3 +41,4 @@ pub use get_snapshot::GetSnapshotRequest;
 pub use get_stats::GetStatsRequest;
 pub use ping::PingRequest;
 pub use retire_sessions::{MAX_SESSIONS_PER_RETIREMENT, RetireSessionsRequest};
+pub use update_resource::{MAX_RESET_KEYS, ResourceTarget, UpdateResourceRequest, WireResetKeys};

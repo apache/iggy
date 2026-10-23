@@ -17,7 +17,7 @@
 
 import type { Stream } from '../wire/stream/stream.utils.js';
 import type { Topic } from '../wire/topic/topic.utils.js';
-import type { CreateMessage, Message } from 'src/wire/index.js';
+import type { CreateMessage, Message, OptionSpec } from 'src/wire/index.js';
 import type { Client } from '../client/index.js';
 
 export interface TestWorld {
@@ -28,5 +28,10 @@ export interface TestWorld {
   polledMessages: Message[],
   rawResponse?: Buffer,
   rawError?: Error,
+  /** Key the last stream was created with, absent for a keyless stream */
+  streamKey?: Buffer,
+  updateError?: unknown,
+  optionSpecs?: OptionSpec[],
+  userId?: number,
   callError?: Error
 };

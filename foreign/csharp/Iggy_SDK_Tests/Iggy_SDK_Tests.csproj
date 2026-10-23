@@ -48,4 +48,10 @@ under the License.
         <Compile Include="../../../examples/csharp/src/Iggy_SDK.Examples.Shared/ExampleHelpers.cs" Link="Examples/ExampleHelpers.cs" />
     </ItemGroup>
 
+    <ItemGroup>
+        <None Include="Fixtures/resource_options.json">
+            <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+        </None>
+    </ItemGroup>
+
 </Project>

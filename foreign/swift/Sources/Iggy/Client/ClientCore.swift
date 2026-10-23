@@ -1386,10 +1386,9 @@ actor ClientCore {
             case .changePassword:
                 let change = try Requests.changedPassword(payload)
                 refreshSessionPassword(user: change.userID, newPassword: change.newPassword)
-            case .updateUser:
-                let update = try Requests.renamedUser(payload)
-                if let username = update.username {
-                    refreshSessionUsername(user: update.userID, newUsername: username)
+            case .updateResource:
+                if let rename = try Requests.renamedUser(payload) {
+                    refreshSessionUsername(user: rename.userID, newUsername: rename.username)
                 }
             default:
                 break

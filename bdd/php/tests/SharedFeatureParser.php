@@ -20,7 +20,7 @@ declare(strict_types=1);
 
 final class SharedFeatureParser
 {
-    public static function load(string $featureFile): array
+    public static function load(string $featureFile, array $excludedTags = []): array
     {
         if (!is_file($featureFile)) {
             throw new RuntimeException("feature file not found at {$featureFile}");
@@ -35,10 +35,22 @@ final class SharedFeatureParser
         $scenarios = [];
         $currentScenario = null;
         $currentSteps = [];
+        $currentTags = [];
+        $pendingTags = [];
         $section = null;
         foreach ($lines as $line) {
             $line = trim($line);
-            if ($line === '' || str_starts_with($line, '#') || str_starts_with($line, '@')) {
+            if ($line === '' || str_starts_with($line, '#')) {
+                continue;
+            }
+
+            if (str_starts_with($line, '@')) {
+                array_push($pendingTags, ...preg_split('/\s+/', $line));
+                continue;
+            }
+
+            if (str_starts_with($line, 'Feature:')) {
+                $pendingTags = [];
                 continue;
             }
 
@@ -48,11 +60,13 @@ final class SharedFeatureParser
             }
 
             if (str_starts_with($line, 'Scenario:')) {
-                if ($currentScenario !== null) {
+                if ($currentScenario !== null && array_intersect($currentTags, $excludedTags) === []) {
                     $scenarios[$currentScenario] = $currentSteps;
                 }
                 $currentScenario = trim(substr($line, strlen('Scenario:')));
                 $currentSteps = [];
+                $currentTags = $pendingTags;
+                $pendingTags = [];
                 $section = 'scenario';
                 continue;
             }
@@ -74,7 +88,7 @@ final class SharedFeatureParser
             }
         }
 
-        if ($currentScenario !== null) {
+        if ($currentScenario !== null && array_intersect($currentTags, $excludedTags) === []) {
             $scenarios[$currentScenario] = $currentSteps;
         }
         if ($scenarios === []) {

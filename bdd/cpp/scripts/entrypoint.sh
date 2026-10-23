@@ -58,6 +58,8 @@ tags=()
 case "${BDD_FEATURE:-all}" in
     basic_messaging) tags=(--tags @basic-messaging) ;;
     raw_command) tags=(--tags @raw-command) ;;
+    stream_options) tags=(--tags @stream-options) ;;
+    resource_options_patch) tags=(--tags @resource-options-patch) ;;
     session_contract) tags=(--tags @session-contract) ;;
 esac
 

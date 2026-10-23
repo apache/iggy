@@ -28,6 +28,7 @@ use iggy_binary_protocol::requests::partitions::{
     DeletePartitionsRequest, InstallConsumerGroupOwnerRequest, TransitionPartitionHistoryRequest,
 };
 use iggy_binary_protocol::requests::streams::DeleteStreamRequest;
+use iggy_binary_protocol::requests::system::{OPTIONS_SCOPE_STREAM, OPTIONS_SCOPE_TOPIC};
 use iggy_binary_protocol::requests::topics::DeleteTopicRequest;
 use iggy_binary_protocol::{
     LIFECYCLE_BATCH_HEADER_SIZE, LIFECYCLE_COMPLETION_SIZE, Operation, WireDecode, WireEncode,
@@ -235,16 +236,23 @@ impl Streams {
     }
 
     pub fn request_lifecycle_blocked(&self, operation: Operation, body: &[u8]) -> bool {
-        let topic_scoped = match operation {
-            Operation::UpdateStream | Operation::DeleteStream | Operation::CreateTopic => false,
-            Operation::UpdateTopic
-            | Operation::DeleteTopic
+        // The generic patch names its scope in the first byte. A user patch
+        // touches no stream, a stream or topic patch is gated like the
+        // per-resource update it replaces.
+        let (topic_scoped, body) = match operation {
+            Operation::UpdateResource => match body.split_first() {
+                Some((&OPTIONS_SCOPE_STREAM, identifiers)) => (false, identifiers),
+                Some((&OPTIONS_SCOPE_TOPIC, identifiers)) => (true, identifiers),
+                _ => return false,
+            },
+            Operation::DeleteStream | Operation::CreateTopic => (false, body),
+            Operation::DeleteTopic
             | Operation::CreatePartitions
             | Operation::DeletePartitions
             | Operation::CreateConsumerGroup
             | Operation::DeleteConsumerGroup
             | Operation::JoinConsumerGroup
-            | Operation::LeaveConsumerGroup => true,
+            | Operation::LeaveConsumerGroup => (true, body),
             _ => return false,
         };
         let Ok((stream, consumed)) = WireIdentifier::decode(body) else {
@@ -781,6 +789,9 @@ mod tests {
     use iggy_binary_protocol::requests::consumer_groups::{
         CreateConsumerGroupRequest, JoinConsumerGroupRequest,
     };
+    use iggy_binary_protocol::requests::system::{
+        ResourceTarget, UpdateResourceRequest, WireResetKeys,
+    };
     use iggy_binary_protocol::requests::topics::{
         CreateTopicRequest, CreateTopicWithAssignmentsRequest,
     };
@@ -804,6 +815,7 @@ mod tests {
             client_id: 17,
             session: 5,
             request: 8,
+            user_id: 0,
         }
     }
 
@@ -1374,6 +1386,56 @@ mod tests {
             "generation {} must outrank the installed owner from op {LOGOUT_OP}",
             decided[0].installation.owner.generation
         );
+    }
+
+    #[test]
+    fn given_pending_lifecycle_when_preflighting_generic_patch_should_gate_like_the_scope() {
+        let streams = streams();
+        streams.seed_namespace(IggyNamespace::new(0, 1, 0), 3, 0);
+        streams.seed_namespace(IggyNamespace::new(1, 0, 0), 4, 0);
+        assert_eq!(
+            apply(
+                &streams,
+                Operation::DeleteTopic,
+                &DeleteTopicRequest {
+                    stream_id: WireIdentifier::numeric(0),
+                    topic_id: WireIdentifier::numeric(0),
+                },
+                context()
+            )
+            .code,
+            0
+        );
+        assert!(streams.lifecycle_pending(INTENT_OP));
+        let blocked = |target| {
+            let body = UpdateResourceRequest {
+                target,
+                reset: WireResetKeys::try_from(vec![WireName::new("message_expiry").unwrap()])
+                    .unwrap(),
+                options: WireOptions::empty(),
+            }
+            .to_bytes();
+            streams.request_lifecycle_blocked(Operation::UpdateResource, &body)
+        };
+        let topic = |topic_id| ResourceTarget::Topic {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(topic_id),
+        };
+        let stream = |stream_id| ResourceTarget::Stream {
+            stream_id: WireIdentifier::numeric(stream_id),
+        };
+
+        assert!(blocked(topic(0)));
+        assert!(!blocked(topic(1)));
+        // A stream patch waits for every intent in its stream, as the
+        // per-stream update it replaces did.
+        assert!(blocked(stream(0)));
+        assert!(!blocked(stream(1)));
+        // A user identifier that names stream 0 if the gate read an identifier
+        // at byte 0 instead of the scope.
+        assert!(!blocked(ResourceTarget::User {
+            user_id: WireIdentifier::numeric(0),
+        }));
     }
 
     #[test]

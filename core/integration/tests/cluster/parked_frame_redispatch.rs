@@ -124,7 +124,10 @@ async fn given_a_produce_burst_right_after_create_topic_when_backups_park_the_pr
         .root_client_for_node(leader)
         .await
         .expect("root client on the metadata leader");
-    setup.create_stream(STREAM).await.expect("create stream");
+    setup
+        .create_stream(STREAM, &StreamCreateOptions::default())
+        .await
+        .expect("create stream");
     let stream = Identifier::named(STREAM).expect("stream identifier");
 
     // Connected and logged in before the first `create_topic`, so the burst

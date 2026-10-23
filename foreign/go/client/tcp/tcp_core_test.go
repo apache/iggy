@@ -865,7 +865,7 @@ func TestSendMessages_RejectsAnEmptyBatch(t *testing.T) {
 func topicDetailsBody(t *testing.T, partitionsCount uint32) []byte {
 	t.Helper()
 
-	const nameLenOffset = 49
+	const nameLenOffset = 32
 	name := "orders"
 	body := make([]byte, nameLenOffset+1+len(name)+4+4)
 	binary.LittleEndian.PutUint32(body[0:4], 1)

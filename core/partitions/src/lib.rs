@@ -42,6 +42,7 @@ mod segment;
 pub mod segment_anchor;
 mod segment_recovery;
 pub mod state_transfer;
+mod stream_keyring;
 mod types;
 #[cfg(feature = "simulator")]
 mod wal_storage;
@@ -107,6 +108,7 @@ pub use segment_recovery::{
 use server_common::Message;
 pub use server_common::send_messages::{IggyMessage, IggyMessageHeader, IggyMessages};
 pub use state_transfer::CONSUMER_OFFSETS_ENTRIES_MAX;
+pub use stream_keyring::{StreamKeyIdentity, StreamKeyring};
 pub use types::{
     AppendResult, COMMIT_WALK_OPS_MAX, FatalCommit, Fragment, PartitionOffsets,
     PartitionPathLayout, PartitionsConfig, PollFragments, PollQueryResult, PollingArgs,

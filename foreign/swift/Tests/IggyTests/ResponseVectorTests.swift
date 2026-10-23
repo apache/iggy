@@ -35,13 +35,16 @@ struct ResponseVectorTests {
         #expect(topic.name == name)
         #expect(topic.createdAt == createdAt)
         #expect(topic.partitionsCount == 3)
+        // The three settings the header used to carry come from the blocks.
         #expect(topic.messageExpiry == .after(.seconds(604_800)))
         #expect(topic.compressionAlgorithm == CompressionAlgorithm.none)
-        #expect(topic.maxTopicSize == .bytes(1_073_741_824))
+        #expect(topic.maxTopicSize == .unlimited)
         #expect(topic.sizeBytes == 4096)
         #expect(topic.messagesCount == 100)
         #expect(topic.options["durability"] == .explicit("persisted"))
+        #expect(topic.options["message_expiry"] == .explicit(.uint64(604_800_000_000)))
         #expect(topic.options["segment_size"] == .explicit(.uint64(1_073_741_824)))
+        #expect(topic.options["compression_algorithm"] == .derived("none"))
         #expect(topic.options["max_topic_size"] == .derived(.uint64(UInt64.max)))
     }
 
@@ -53,6 +56,10 @@ struct ResponseVectorTests {
         #expect(details.topicsCount == 2)
         #expect(details.sizeBytes == 2048)
         #expect(details.messagesCount == 200)
+        #expect(details.options.values.allSatisfy { !$0.explicit })
+        #expect(details.encryptionKeySource == .stream)
+        #expect(details.encryptionKeyFingerprint == golden.vectors["stream_key.fingerprint"])
+        #expect(details.encryptionKekFingerprints == ["39e4f0f95c3693c7", "d55d479829bc2936"])
         #expect(details.topics.count == 2)
         expectSampleTopic(details.topics[0], id: 1, name: "topic-a")
         expectSampleTopic(details.topics[1], id: 2, name: "topic-b")
@@ -60,7 +67,7 @@ struct ResponseVectorTests {
         let streams = try Responses.streams(body("response.get_streams"))
         #expect(streams.map(\.id) == [1, 2])
         #expect(streams.map(\.topicsCount) == [2, 0])
-        #expect(streams.allSatisfy { $0.options.isEmpty })
+        #expect(streams.allSatisfy { $0.options == details.options && $0.encryptionKeySource == .stream })
         #expect(try Responses.streams([]).isEmpty)
     }
 
@@ -68,9 +75,10 @@ struct ResponseVectorTests {
         let details = try Responses.topicDetails(body("response.get_topic"))
         expectSampleTopic(
             Topic(
-                id: details.id, createdAt: details.createdAt, name: details.name, sizeBytes: details.sizeBytes, messageExpiry: details.messageExpiry,
-                compressionAlgorithm: details.compressionAlgorithm, maxTopicSize: details.maxTopicSize, messagesCount: details.messagesCount,
+                id: details.id, createdAt: details.createdAt, name: details.name, sizeBytes: details.sizeBytes, messagesCount: details.messagesCount,
                 partitionsCount: details.partitionsCount, options: details.options), id: 1, name: "my-topic")
+        #expect(details.messageExpiry == .after(.seconds(604_800)))
+        #expect(details.maxTopicSize == .unlimited)
         #expect(details.partitions.map(\.id) == [0, 1, 2])
         #expect(details.partitions[0].currentOffset == 99)
         #expect(details.partitions[0].segmentsCount == 2)
@@ -146,6 +154,7 @@ struct ResponseVectorTests {
         let users = try Responses.users(body("response.get_users"))
         #expect(users.map(\.username) == ["admin", "alice"])
         #expect(users.map(\.status) == [.active, .inactive])
+        #expect(users.allSatisfy { $0.options.isEmpty })
     }
 
     @Test func loginAndIdentity() throws {
@@ -222,7 +231,10 @@ struct ResponseVectorTests {
 
     @Test func optionSpecs() throws {
         let specs = try Responses.optionSpecs(body("response.describe_options"))
-        #expect(specs.map(\.key) == ["segment_size", "durability"])
+        #expect(specs.map(\.key) == ["segment_size", "durability", "message_expiry", "encryption_key"])
+        #expect(specs.map(\.flags) == [[], [], [.updatable, .resettable], [.secret, .critical]])
+        #expect(specs[3].kind == .raw)
+        #expect(specs[3].defaultValue.isEmpty)
         #expect(specs[0].kind == .uint64)
         #expect(specs[0].defaultValue == UInt64(1_073_741_824).littleEndianBytes)
         #expect(specs[0].description == "Segment size")

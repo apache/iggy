@@ -298,13 +298,10 @@ pub struct RequestHeader {
     pub reserved_frame: [u8; 66],
 
     pub client: u128,
-    /// Optional XXH3 integrity stamp over the client's request payload. Zero
-    /// means unstamped; the server verifies a nonzero stamp before routing or
-    /// rewriting the body. The Rust SDK stamps metadata/session operations
-    /// and `DeleteSegments`; partition and non-replicated operations leave it
-    /// zero. Retry identity uses the client, session, request, group and
-    /// operation, so matching retries replay the first receipt without
-    /// comparing stamps.
+    /// Random identifier for a logical metadata or session request. The client
+    /// keeps it across retries and reconnect resends. Partition and
+    /// non-replicated operations leave it zero. The server seals the prepared
+    /// body separately with `checksum_body`.
     pub request_checksum: u128,
     pub timestamp: u64,
     pub request: u64,

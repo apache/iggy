@@ -52,9 +52,12 @@ __all__ = [
     "IggyExpiry",
     "IggyProducer",
     "MaxTopicSize",
+    "OptionError",
+    "OptionKey",
     "OptionSpec",
     "Partition",
     "PartitionContext",
+    "PartitionResizePolicy",
     "Partitioning",
     "PendingOperationError",
     "PendingOperationsConfig",
@@ -71,20 +74,24 @@ __all__ = [
     "Stats",
     "Stream",
     "StreamDetails",
+    "StreamOptions",
     "StreamPermissions",
     "TcpConfig",
     "TcpReconnectionConfig",
     "TokenInfo",
     "Topic",
     "TopicDetails",
+    "TopicOptions",
     "TopicPermissions",
     "UserHeaders",
     "UserInfo",
     "UserInfoDetails",
+    "UserOptions",
     "UserStatus",
     "WebSocketConfig",
     "WebSocketFramingConfig",
     "WebSocketReconnectionConfig",
+    "encryption_key_fingerprint",
 ]
 
 class AutoCommit:
@@ -1298,6 +1305,7 @@ class IggyClient:
         password: builtins.str,
         status: UserStatus | None = None,
         permissions: Permissions | None = None,
+        options: UserOptions | None = None,
     ) -> collections.abc.Awaitable[UserInfoDetails]:
         r"""
         Create a new user.
@@ -1307,6 +1315,7 @@ class IggyClient:
             password: Password as `str`.
             status: User status as `UserStatus | None`; defaults to `UserStatus.Active`.
             permissions: Permissions as `Permissions | None`; the user has none when `None`.
+            options: User options as `UserOptions | None`.
 
         Returns:
             An awaitable that resolves to the created `UserInfoDetails`.
@@ -1319,25 +1328,41 @@ class IggyClient:
         user_id: builtins.str | builtins.int,
         username: builtins.str | None = None,
         status: UserStatus | None = None,
+        reset: builtins.list[OptionKey] | None = None,
         options: builtins.dict[builtins.str, builtins.str] | None = None,
+        raw_reset: builtins.list[builtins.str] | None = None,
     ) -> collections.abc.Awaitable[None]:
         r"""
         Update a user by unique ID or username.
+
+        A patch: only the fields passed change, every other setting keeps its
+        value. Renaming the user this client is signed in as also updates the
+        credentials a reconnect replays.
 
         Args:
             user_id: User identifier as `str | int`.
             username: New username as `str | None`; unchanged when `None`.
             status: New status as `UserStatus | None`; unchanged when `None`.
-            options: Reserved for future use. Additional option keys as
-                `dict[str, str] | None`, forwarded to the server. No user update
-                option key exists yet, so a current server rejects every key.
+                Deactivating a user ends its sessions.
+            reset: Keys to return to their defaults as `list[OptionKey] | None`.
+                No user key is resettable yet, so any key is refused.
+            options: Additional option keys as `dict[str, str] | None`,
+                forwarded to the server. No other user key exists yet, so a
+                current server rejects every key.
+            raw_reset: Additional reset names as `list[str] | None`, sent
+                verbatim so a key newer than this build can be reset. The
+                server decides them.
 
         Returns:
             An awaitable that resolves to `None` when the user is updated.
 
         Raises:
             ValueError: If a string identifier is invalid.
-            RuntimeError: If the request fails.
+            OptionError: A `RuntimeError` carrying the error `code` and
+                `kind` when the client or the server refuses an option.
+            RuntimeError: Before anything is sent, if the update changes
+                nothing, names a key both set and reset, or resets a key that
+                cannot be reset. Otherwise if the request fails.
         """
     def delete_user(
         self, user_id: builtins.str | builtins.int
@@ -1456,10 +1481,26 @@ class IggyClient:
         Raises:
             RuntimeError: If the client cannot be shut down.
         """
-    def create_stream(self, name: builtins.str) -> collections.abc.Awaitable[None]:
+    def create_stream(
+        self, name: builtins.str, options: StreamOptions | None = None
+    ) -> collections.abc.Awaitable[StreamDetails]:
         r"""
-        Creates a new stream with the provided ID and name.
-        Raises `RuntimeError` if the stream cannot be created.
+        Create a new stream.
+
+        On a server with encryption enabled every stream is stored under its
+        own key: the one `options` carries, or one the server generates. The
+        returned details report only the key's source and fingerprints.
+
+        Args:
+            name: Stream name as `str`, between 1 and 255 UTF-8 bytes.
+            options: Stream options as `StreamOptions | None`.
+
+        Returns:
+            An awaitable that resolves to the created `StreamDetails`.
+
+        Raises:
+            RuntimeError: If the stream cannot be created, for example when
+                `options` carries a key and the server has no encryption key.
         """
     def get_stream(
         self, stream_id: builtins.str | builtins.int
@@ -1483,23 +1524,32 @@ class IggyClient:
     def update_stream(
         self,
         stream_id: builtins.str | builtins.int,
-        name: builtins.str,
+        name: builtins.str | None = None,
+        reset: builtins.list[OptionKey] | None = None,
         options: builtins.dict[builtins.str, builtins.str] | None = None,
+        raw_reset: builtins.list[builtins.str] | None = None,
     ) -> collections.abc.Awaitable[None]:
         r"""
-        Rename a stream selected by name or numeric ID.
+        Update a stream selected by name or numeric ID.
 
-        `stream_id` accepts a stream name as `str` or numeric ID as `int`. A
-        decimal-only string is interpreted as a numeric ID. `name` must be unique
-        and contain between 1 and 255 UTF-8 bytes. Renaming a stream to its current
-        name succeeds without changing it.
+        A patch: only the fields passed change. The stream keeps its id, its
+        encryption key and its data. `stream_id` accepts a stream name as `str`
+        or numeric ID as `int`. A decimal-only string is interpreted as a
+        numeric ID. Renaming a stream to its current name succeeds without
+        changing it.
 
         Args:
             stream_id: Stream identifier as `str | int`.
-            name: New stream name as `str`.
+            name: New stream name as `str | None`, unique and between 1 and 255
+                UTF-8 bytes, unchanged when `None`.
+            reset: Keys to return to their defaults as `list[OptionKey] | None`.
+                No stream key is resettable, so any key is refused.
             options: Additional option keys as `dict[str, str] | None`, forwarded
                 to the server. Current server versions reject all stream update
                 option keys.
+            raw_reset: Additional reset names as `list[str] | None`, sent
+                verbatim so a key newer than this build can be reset. The
+                server decides them.
 
         Returns:
             None.
@@ -1508,10 +1558,14 @@ class IggyClient:
             TypeError: If `stream_id` is not `str` or an integer in
                 `0..=2**32 - 1`, or `name` is not `str`.
             ValueError: If a string identifier is empty or exceeds 255 UTF-8 bytes.
-            RuntimeError: If the client is not authenticated, the user lacks global
-                `manage_streams` or per-stream `manage_stream` permission, the
-                stream does not exist, the new name is invalid or already used, or
-                the request fails.
+            OptionError: A `RuntimeError` carrying the error `code` and
+                `kind` when the client or the server refuses an option.
+            RuntimeError: Before anything is sent, if the update changes
+                nothing, the name does not fit, or a reset key cannot be reset.
+                Otherwise if the client is not authenticated, the user lacks
+                global `manage_streams` or per-stream `manage_stream` permission,
+                the stream does not exist, the new name is already used, or the
+                request fails.
         """
     def delete_stream(
         self, stream_id: builtins.str | builtins.int
@@ -1538,48 +1592,23 @@ class IggyClient:
         self,
         stream: builtins.str | builtins.int,
         name: builtins.str,
-        partitions_count: builtins.int,
-        compression_algorithm: builtins.str | None = None,
-        message_expiry: IggyExpiry | None = None,
-        max_topic_size: MaxTopicSize | None = None,
-        segment_size: builtins.int | None = None,
-        durability: Durability | None = None,
-        consumer_offset_durability: Durability | None = None,
-        messages_required_to_save: builtins.int | None = None,
-        size_of_messages_required_to_save: builtins.int | None = None,
-        preallocate_segments: builtins.bool | None = None,
-        options: builtins.dict[builtins.str, builtins.str] | None = None,
+        options: TopicOptions | None = None,
     ) -> collections.abc.Awaitable[None]:
         r"""
-        Creates a new topic with the given parameters.
+        Creates a new topic.
 
         Args:
             stream: Stream identifier as `str | int`.
             name: Topic name as `str`.
-            partitions_count: Number of partitions as `int`, at most 1000.
-            compression_algorithm: Compression algorithm as `str | None`.
-            message_expiry: Message expiry as `IggyExpiry | None`.
-            max_topic_size: Maximum topic size as `MaxTopicSize | None`.
-            segment_size: Per-topic segment size in bytes as `int | None`.
-            durability: Message completion policy, defaulting to replicated.
-            consumer_offset_durability: Independent offset policy, defaulting to replicated.
-            messages_required_to_save: Message-count flush threshold as `int | None`.
-            size_of_messages_required_to_save: Byte flush threshold as `int | None`.
-            preallocate_segments: Reserve segment bytes on open as `bool | None`.
-            options: Additional option keys as `dict[str, str] | None`, sent
-                verbatim so a newer server key can be set from this build.
-                `{"partition_resize_policy": "fixed"}` makes the server reject
-                later partition creation and deletion on this topic.
-
-        Every option left as `None` resolves against the server default at
-        admission.
+            options: Topic options as `TopicOptions | None`. Without options the
+                topic gets one partition and every setting resolves against the
+                server default at admission.
 
         Returns:
             An awaitable that resolves to `None` when the topic is created.
 
         Raises:
-            ValueError: If `message_expiry` or `max_topic_size` is out of range.
-            PyRuntimeError: If another argument is invalid or the request fails.
+            RuntimeError: If an argument is invalid or the request fails.
         """
     def get_topic(
         self,
@@ -1610,36 +1639,50 @@ class IggyClient:
         self,
         stream_id: builtins.str | builtins.int,
         topic_id: builtins.str | builtins.int,
-        name: builtins.str,
-        compression_algorithm: builtins.str | None = None,
+        name: builtins.str | None = None,
         message_expiry: IggyExpiry | None = None,
         max_topic_size: MaxTopicSize | None = None,
+        reset: builtins.list[OptionKey] | None = None,
         options: builtins.dict[builtins.str, builtins.str] | None = None,
+        raw_reset: builtins.list[builtins.str] | None = None,
     ) -> collections.abc.Awaitable[None]:
         r"""
         Update an existing topic.
 
-        A patch, not a replacement: every setting rides the options block, so a
-        field left unset keeps the topic's current value rather than resetting
-        it to a server default.
+        A patch, not a replacement: only the fields passed change, every other
+        setting keeps its value. Settings fixed at creation, such as the
+        compression algorithm, have no field here.
 
         Args:
             stream_id: Stream identifier as `str | int`.
             topic_id: Topic identifier as `str | int`.
-            name: New topic name as `str`.
-            compression_algorithm: Compression algorithm as `str | None`.
-            message_expiry: Message expiry as `IggyExpiry | None`.
-            max_topic_size: Maximum topic size as `MaxTopicSize | None`.
+            name: New topic name as `str | None`, unchanged when `None`.
+            message_expiry: Message expiry as `IggyExpiry | None`, unchanged
+                when `None`. `IggyExpiry.ServerDefault()` changes nothing either,
+                reset `OptionKey.MessageExpiry` to return to the default.
+            max_topic_size: Maximum topic size as `MaxTopicSize | None`,
+                unchanged when `None`. `MaxTopicSize.ServerDefault()` changes
+                nothing either, reset `OptionKey.MaxTopicSize` to return to the
+                default.
+            reset: Keys to return to their defaults as `list[OptionKey] | None`:
+                `OptionKey.MessageExpiry` or `OptionKey.MaxTopicSize`.
             options: Additional option keys as `dict[str, str] | None`, sent
                 verbatim so an updatable server key can be set from this build.
                 A create-only key is refused by name.
+            raw_reset: Additional reset names as `list[str] | None`, sent
+                verbatim so a key newer than this build can be reset. The
+                server decides them.
 
         Returns:
             An awaitable that resolves to `None` when the topic is updated.
 
         Raises:
             ValueError: If `message_expiry` or `max_topic_size` is out of range.
-            PyRuntimeError: If another argument is invalid or the request fails.
+            OptionError: A `RuntimeError` carrying the error `code` and
+                `kind` when the client or the server refuses an option.
+            RuntimeError: Before anything is sent, if the update changes
+                nothing, names a key both set and reset, the name does not fit,
+                or a reset key cannot be reset. Otherwise if the request fails.
         """
     def delete_topic(
         self,
@@ -2169,7 +2212,7 @@ class IggyExpiry:
         microsecond count a `u64` can hold (about 584,542 years): those two
         values are reserved on the wire for `ServerDefault` and `NeverExpire`
         respectively, so a `duration` at either boundary raises `ValueError`
-        when passed to `create_topic`/`update_topic`. A negative `timedelta`
+        when passed to `TopicOptions`/`update_topic`. A negative `timedelta`
         also raises `ValueError`.
         """
 
@@ -2275,7 +2318,7 @@ class MaxTopicSize:
         an unsigned 64-bit integer: those two values are reserved on the wire
         for `ServerDefault` and `Unlimited` respectively, so a `Custom` size
         at either boundary raises `ValueError` when passed to
-        `create_topic`/`update_topic`.
+        `TopicOptions`/`update_topic`.
         """
 
         __match_args__ = ("bytes",)
@@ -2297,6 +2340,14 @@ class MaxTopicSize:
     ...
 
 @typing.final
+class OptionError(IggyError):
+    r"""
+    An option refusal, with the server error code and its snake_case name as `kind`.
+    """
+    @property
+    def kind(self) -> builtins.str: ...
+
+@typing.final
 class OptionSpec:
     r"""
     One entry of a resource's option catalog, as served by `describe_options`.
@@ -2310,10 +2361,9 @@ class OptionSpec:
     def kind(self) -> builtins.str:
         r"""
         Name of this key's canonical kind: what the server encodes its default
-        under, and what a value set by `create_topic` is stored as whatever kind
-        it was sent in, since create admission re-encodes the block from its own
-        parse. `update_topic` stores what the client sent verbatim and is the
-        exception.
+        under, and what a value set by a create or an update is stored as
+        whatever kind it was sent in, since admission re-encodes the block from
+        its own parse.
         """
     @property
     def default_value(self) -> HeaderValue | None:
@@ -2328,6 +2378,33 @@ class OptionSpec:
     def description(self) -> builtins.str:
         r"""
         What the option does, including the bounds its value is checked against.
+        """
+    @property
+    def updatable(self) -> builtins.bool:
+        r"""
+        Whether an update may set the key.
+        """
+    @property
+    def resettable(self) -> builtins.bool:
+        r"""
+        Whether an update may reset the key to its default.
+        """
+    @property
+    def secret(self) -> builtins.bool:
+        r"""
+        Whether the key is write-only: accepted on create, never returned.
+        """
+    @property
+    def read_only(self) -> builtins.bool:
+        r"""
+        Whether the server computes the key and returns it on reads, never
+        accepting it.
+        """
+    @property
+    def critical(self) -> builtins.bool:
+        r"""
+        Whether a node that does not understand the key must refuse to serve
+        the resource.
         """
     def __repr__(self) -> builtins.str: ...
 
@@ -3088,6 +3165,43 @@ class Stream:
         r"""
         Number of topics in the stream.
         """
+    @property
+    def options(self) -> UserHeaders:
+        r"""
+        Options the creating client set explicitly. The stream's encryption
+        key is write-only and never appears here.
+
+        The same `dict[HeaderKey, HeaderValue]` that `ReceiveMessage.user_headers`
+        returns, since options ride that codec. `to_scalar_dict()` gives the
+        plain-scalar form.
+        """
+    @property
+    def derived_options(self) -> UserHeaders:
+        r"""
+        Options the server resolved or computed, including the encryption key
+        projections. Same shape as `options`.
+        """
+    @property
+    def encryption_key_source(self) -> builtins.str | None:
+        r"""
+        Who chose the key the stream's data is stored under: `"stream"` for a
+        key the client sent, `"server"` for a key the server generated, or
+        `"none"` for a plaintext stream. `None` when the server reported no
+        source.
+        """
+    @property
+    def encryption_key_fingerprint(self) -> builtins.str | None:
+        r"""
+        Fingerprint of the stream's key, 16 lowercase hex characters. `None`
+        for a plaintext stream. Compare it with `encryption_key_fingerprint()`
+        of the key the stream was created with.
+        """
+    @property
+    def encryption_kek_fingerprints(self) -> builtins.list[builtins.str]:
+        r"""
+        Fingerprints of the server keys that wrap the stream's key: one outside
+        a key rotation, empty for a plaintext stream.
+        """
 
 @typing.final
 class StreamDetails:
@@ -3114,6 +3228,85 @@ class StreamDetails:
         r"""
         Returns the topics in the stream.
         """
+    @property
+    def options(self) -> UserHeaders:
+        r"""
+        Options the creating client set explicitly. The stream's encryption
+        key is write-only and never appears here.
+
+        The same `dict[HeaderKey, HeaderValue]` that `ReceiveMessage.user_headers`
+        returns, since options ride that codec. `to_scalar_dict()` gives the
+        plain-scalar form.
+        """
+    @property
+    def derived_options(self) -> UserHeaders:
+        r"""
+        Options the server resolved or computed, including the encryption key
+        projections. Same shape as `options`.
+        """
+    @property
+    def encryption_key_source(self) -> builtins.str | None:
+        r"""
+        Who chose the key the stream's data is stored under: `"stream"` for a
+        key the client sent, `"server"` for a key the server generated, or
+        `"none"` for a plaintext stream. `None` when the server reported no
+        source.
+        """
+    @property
+    def encryption_key_fingerprint(self) -> builtins.str | None:
+        r"""
+        Fingerprint of the stream's key, 16 lowercase hex characters. `None`
+        for a plaintext stream. Compare it with `encryption_key_fingerprint()`
+        of the key the stream was created with.
+        """
+    @property
+    def encryption_kek_fingerprints(self) -> builtins.list[builtins.str]:
+        r"""
+        Fingerprints of the server keys that wrap the stream's key: one outside
+        a key rotation, empty for a plaintext stream.
+        """
+
+@typing.final
+class StreamOptions:
+    r"""
+    Options for `create_stream`.
+
+    The encryption key is write-only: the server stores it wrapped and returns
+    only its source and fingerprints, and this object never shows it.
+    """
+    @property
+    def has_encryption_key(self) -> builtins.bool:
+        r"""
+        Whether an encryption key is set, without exposing the key itself.
+        """
+    def __new__(
+        cls,
+        *,
+        encryption_key: builtins.bytes | builtins.str | None = None,
+        raw: builtins.dict[builtins.str, builtins.str] | None = None,
+    ) -> StreamOptions:
+        r"""
+        Constructs stream create options.
+
+        Args:
+            encryption_key: The stream's own data key: exactly 32 bytes, or
+                their canonical standard padded base64 text. Use 32 random
+                bytes, for example `secrets.token_bytes(32)`. The key travels
+                inside the create request over whatever transport the client
+                uses, so protecting it in transit (TLS) is the caller's
+                responsibility. The server never returns it, only its source
+                and fingerprints. Without a key, a server with encryption
+                enabled generates one for the stream.
+            raw: Additional option keys as `dict[str, str]`, sent as string
+                values so a key newer than this build can be set. A typed field
+                wins on collision.
+
+        Raises:
+            ValueError: If `encryption_key` is not exactly 32 bytes or their
+                canonical base64 text. The message never contains the key.
+            TypeError: If `encryption_key` is neither `bytes` nor `str`.
+        """
+    def __repr__(self) -> builtins.str: ...
 
 @typing.final
 class StreamPermissions:
@@ -3368,17 +3561,19 @@ class Topic:
     @property
     def message_expiry(self) -> IggyExpiry:
         r"""
-        The expiry of the messages in the topic.
+        The expiry of the messages in the topic, the server default when the
+        topic does not set one.
         """
     @property
     def compression_algorithm(self) -> builtins.str:
         r"""
-        Compression algorithm for the topic.
+        Compression algorithm for the topic, fixed at creation.
         """
     @property
     def max_topic_size(self) -> MaxTopicSize:
         r"""
-        The maximum size of the topic.
+        The maximum size of the topic, the server default when the topic does
+        not set one.
         """
     @property
     def options(self) -> UserHeaders:
@@ -3433,17 +3628,19 @@ class TopicDetails:
     @property
     def message_expiry(self) -> IggyExpiry:
         r"""
-        The expiry of the messages in the topic.
+        The expiry of the messages in the topic, the server default when the
+        topic does not set one.
         """
     @property
     def compression_algorithm(self) -> builtins.str:
         r"""
-        Compression algorithm for the topic.
+        Compression algorithm for the topic, fixed at creation.
         """
     @property
     def max_topic_size(self) -> MaxTopicSize:
         r"""
-        The maximum size of the topic.
+        The maximum size of the topic, the server default when the topic does
+        not set one.
         """
     @property
     def options(self) -> UserHeaders:
@@ -3469,6 +3666,64 @@ class TopicDetails:
 
         Rebuilds the list from scratch on every access; cache the result
         rather than reading this repeatedly in a loop.
+        """
+
+@typing.final
+class TopicOptions:
+    r"""
+    Options for `create_topic`.
+    """
+    def __new__(
+        cls,
+        *,
+        partitions_count: builtins.int = 1,
+        compression_algorithm: builtins.str | None = None,
+        message_expiry: IggyExpiry | None = None,
+        max_topic_size: MaxTopicSize | None = None,
+        segment_size: builtins.int | None = None,
+        durability: Durability | None = None,
+        consumer_offset_durability: Durability | None = None,
+        partition_resize_policy: PartitionResizePolicy | None = None,
+        messages_required_to_save: builtins.int | None = None,
+        size_of_messages_required_to_save: builtins.int | None = None,
+        preallocate_segments: builtins.bool | None = None,
+        raw: builtins.dict[builtins.str, builtins.str] | None = None,
+    ) -> TopicOptions:
+        r"""
+        Constructs topic create options.
+
+        Every setting left as `None` resolves against the server default at
+        admission. Only `message_expiry`, `max_topic_size` and the name can
+        change after creation, through `update_topic`.
+
+        Args:
+            partitions_count: Number of partitions as `int`, at most 1000.
+                Defaults to 1.
+            compression_algorithm: Compression algorithm as `str | None`.
+            message_expiry: Message expiry as `IggyExpiry | None`.
+                `IggyExpiry.ServerDefault()` is the same as `None`.
+            max_topic_size: Maximum topic size as `MaxTopicSize | None`.
+                `MaxTopicSize.ServerDefault()` is the same as `None`.
+            segment_size: Per-topic segment size in bytes as `int | None`.
+            durability: Message completion policy, defaulting to replicated.
+            consumer_offset_durability: Independent offset policy, defaulting
+                to replicated.
+            partition_resize_policy: `PartitionResizePolicy.Fixed` makes the
+                server reject later partition creation and deletion on this
+                topic.
+            messages_required_to_save: Message-count flush threshold as
+                `int | None`.
+            size_of_messages_required_to_save: Byte flush threshold as
+                `int | None`.
+            preallocate_segments: Reserve segment bytes on open as `bool | None`.
+            raw: Additional option keys as `dict[str, str]`, sent as string
+                values so a key newer than this build can be set. A typed field
+                wins on collision.
+
+        Raises:
+            ValueError: If `message_expiry` or `max_topic_size` is out of range.
+            RuntimeError: If `compression_algorithm` names no known algorithm.
+            TypeError: If a durability is not a `Durability`.
         """
 
 @typing.final
@@ -3579,6 +3834,21 @@ class UserInfo:
         r"""
         The username of the user.
         """
+    @property
+    def options(self) -> UserHeaders:
+        r"""
+        Options the creating client set explicitly. No user key exists yet,
+        so this is empty unless a newer server added one.
+
+        The same `dict[HeaderKey, HeaderValue]` that `ReceiveMessage.user_headers`
+        returns, since options ride that codec.
+        """
+    @property
+    def derived_options(self) -> UserHeaders:
+        r"""
+        Options the server resolved for the keys the client did not send.
+        Same shape as `options`.
+        """
 
 @typing.final
 class UserInfoDetails:
@@ -3606,6 +3876,39 @@ class UserInfoDetails:
     def permissions(self) -> Permissions | None:
         r"""
         The permissions of the user, or `None` when the user has none assigned.
+        """
+    @property
+    def options(self) -> UserHeaders:
+        r"""
+        Options the creating client set explicitly. No user key exists yet,
+        so this is empty unless a newer server added one.
+
+        The same `dict[HeaderKey, HeaderValue]` that `ReceiveMessage.user_headers`
+        returns, since options ride that codec.
+        """
+    @property
+    def derived_options(self) -> UserHeaders:
+        r"""
+        Options the server resolved for the keys the client did not send.
+        Same shape as `options`.
+        """
+
+@typing.final
+class UserOptions:
+    r"""
+    Options for `create_user`. No user key exists yet, so only the raw escape
+    hatch is available.
+    """
+    def __new__(
+        cls, *, raw: builtins.dict[builtins.str, builtins.str] | None = None
+    ) -> UserOptions:
+        r"""
+        Constructs user create options.
+
+        Args:
+            raw: Option keys as `dict[str, str]`, sent as string values so a
+                key newer than this build can be set. A current server rejects
+                every key.
         """
 
 @typing.final
@@ -3791,6 +4094,100 @@ class WebSocketReconnectionConfig:
     def __repr__(self) -> builtins.str: ...
 
 @typing.final
+class OptionKey(enum.Enum):
+    r"""
+    A catalog option key, as `update_stream`, `update_topic` and `update_user`
+    take it in `reset`. `str()` gives the key as it travels on the wire.
+    """
+
+    Name = ...
+    r"""
+    Stream or topic name.
+    """
+    Username = ...
+    r"""
+    User name.
+    """
+    Status = ...
+    r"""
+    User status.
+    """
+    CompressionAlgorithm = ...
+    r"""
+    Topic compression algorithm, fixed at creation.
+    """
+    MessageExpiry = ...
+    r"""
+    Topic message expiry, resettable to never expire.
+    """
+    MaxTopicSize = ...
+    r"""
+    Topic size cap, resettable to unlimited.
+    """
+    SegmentSize = ...
+    r"""
+    Topic segment size, fixed at creation.
+    """
+    Durability = ...
+    r"""
+    Topic message durability, fixed at creation.
+    """
+    ConsumerOffsetDurability = ...
+    r"""
+    Topic consumer offset durability, fixed at creation.
+    """
+    PartitionResizePolicy = ...
+    r"""
+    Topic partition resize policy, fixed at creation.
+    """
+    MessagesRequiredToSave = ...
+    r"""
+    Topic message-count flush threshold, fixed at creation.
+    """
+    SizeOfMessagesRequiredToSave = ...
+    r"""
+    Topic byte flush threshold, fixed at creation.
+    """
+    PreallocateSegments = ...
+    r"""
+    Topic segment preallocation, fixed at creation.
+    """
+    EncryptionKey = ...
+    r"""
+    Stream encryption key, write-only and fixed at creation.
+    """
+    EncryptionKeySource = ...
+    r"""
+    Who chose the stream's key, computed by the server.
+    """
+    EncryptionKeyFingerprint = ...
+    r"""
+    Fingerprint of the stream's key, computed by the server.
+    """
+    EncryptionKekFingerprint = ...
+    r"""
+    Fingerprints of the server keys wrapping the stream's key, computed by
+    the server.
+    """
+
+    def __str__(self) -> builtins.str: ...
+
+@typing.final
+class PartitionResizePolicy(enum.Enum):
+    r"""
+    Whether partitions can be added to or deleted from a topic after creation.
+    """
+
+    Mutable = ...
+    r"""
+    Partitions can be added and deleted.
+    """
+    Fixed = ...
+    r"""
+    The partition set is fixed at topic creation.
+    """
+
+@typing.final
 class ProducerSharding(enum.Enum):
     r"""
     How a background producer distributes sends among its workers.
@@ -3812,6 +4209,23 @@ class UserStatus(enum.Enum):
     Inactive = ...
     r"""
     The user account is inactive and cannot be used.
+    """
+
+def encryption_key_fingerprint(key: builtins.bytes | builtins.str) -> builtins.str:
+    r"""
+    Fingerprint of a stream encryption key: the first 8 bytes of SHA-256 over
+    the label `iggy/stream-key-fingerprint/v1` followed by the key, as 16
+    lowercase hex characters. Streams report the same value in
+    `encryption_key_fingerprint`, so a caller can match a key to its stream
+    without the server ever returning the key.
+
+    Args:
+        key: Exactly 32 bytes, or their canonical standard padded base64 text.
+
+    Raises:
+        ValueError: If `key` is not exactly 32 bytes or their canonical base64
+            text. The message never contains the key.
+        TypeError: If `key` is neither `bytes` nor `str`.
     """
 
 class Durability(str, enum.Enum):  # noqa: UP042

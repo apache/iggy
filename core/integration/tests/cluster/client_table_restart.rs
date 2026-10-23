@@ -186,8 +186,10 @@ async fn given_lost_login_reply_when_binding_should_resolve_the_original_epoch(
         Exchange::Reply { status, .. } if status == IggyError::Unauthenticated.as_code()));
 
     let payload = create_stream_payload("lost-login-shared-binding");
-    let original_result = commit_request(&mut bound, session, 1, &payload).await;
-    let replay = commit_request(&mut retried, session, 1, &payload).await;
+    let header =
+        RequestHeader::for_request(CREATE_STREAM_CODE, CLIENT_ID, 1, session, &payload).unwrap();
+    let original_result = commit_request_header(&mut bound, &header, &payload).await;
+    let replay = commit_request_header(&mut retried, &header, &payload).await;
     assert_eq!(replay.header, original_result.header);
     assert_eq!(replay.payload, original_result.payload);
 }
@@ -622,6 +624,13 @@ async fn resume_request_header(
     let mut last_failure = "the listener never came back".to_string();
     let mut attempt = 0usize;
     let mut authenticated_attempts = Vec::new();
+    let mut header = *header;
+    if let Some(original) = expect_replay_of {
+        let receipt =
+            bytemuck::checked::try_pod_read_unaligned::<ReplyHeader>(original.header.as_ref())
+                .unwrap();
+        header.request_checksum = receipt.request_checksum;
+    }
     while Instant::now() < deadline {
         let addr = addrs[attempt % addrs.len()];
         attempt += 1;
@@ -644,7 +653,7 @@ async fn resume_request_header(
                 continue;
             }
         };
-        match exchange(&mut stream, header, body).await.verdict() {
+        match exchange(&mut stream, &header, body).await.verdict() {
             Verdict::Success(reply) => {
                 if let Some(original) = expect_replay_of {
                     assert_replayed_from_cache(original, &reply, request);
@@ -1313,7 +1322,10 @@ async fn given_a_cut_metadata_link_when_partition_links_stay_up_should_keep_send
 ) {
     let observer = harness.root_client_for_node(0).await.unwrap();
     let partitions_count = u32::try_from(harness.cluster_size()).unwrap();
-    observer.create_stream(LIVENESS_STREAM).await.unwrap();
+    observer
+        .create_stream(LIVENESS_STREAM, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     observer
         .create_topic(
             &Identifier::named(LIVENESS_STREAM).unwrap(),
@@ -1463,7 +1475,10 @@ async fn primary_index(harness: &TestHarness, observer: &IggyClient) -> usize {
 }
 
 async fn create_liveness_group(observer: &IggyClient) {
-    observer.create_stream(LIVENESS_STREAM).await.unwrap();
+    observer
+        .create_stream(LIVENESS_STREAM, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     let stream = Identifier::named(LIVENESS_STREAM).unwrap();
     let topic = Identifier::named(LIVENESS_TOPIC).unwrap();
     observer

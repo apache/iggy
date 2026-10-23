@@ -41,6 +41,7 @@ public sealed partial class TcpMessageStream
     private const int ConsumerSessionWatermarkOffset = 24;
     private const int IdentifierPrefixSize = 2;
     private const byte ConsumerGroupWireKind = 2;
+    private const byte StringKind = 2;
 
     private readonly object _pollRoutingGate = new();
     private readonly Dictionary<PartitionRouteKey, CachedRoute> _partitionRoutes = [];
@@ -914,25 +915,54 @@ public sealed partial class TcpMessageStream
     // Typed, raw and replayed calls share this success path, and only the request body carries the new credentials.
     private void RefreshCommittedCredentials(int code, ReadOnlySpan<byte> body, ulong generation)
     {
-        if (code is not (CommandCodes.CHANGE_PASSWORD_CODE or CommandCodes.UPDATE_USER_CODE))
-        {
-            return;
-        }
-
-        var position = 0;
-        var user = ReadIdentifier(body, ref position);
         if (code == CommandCodes.CHANGE_PASSWORD_CODE)
         {
+            var position = 0;
+            var user = ReadIdentifier(body, ref position);
             var currentPasswordLength = body[position];
             RefreshRememberedCredentials(user, null, ReadName(body, position + 1 + currentPasswordLength), generation);
         }
-        else if (body[position] == 1)
+        else if (code == CommandCodes.UPDATE_RESOURCE_CODE && body.Length > 0 && body[0] == (byte)OptionsScope.User)
         {
-            RefreshRememberedCredentials(user, ReadName(body, position + 1), null, generation);
+            var position = 1;
+            var user = ReadIdentifier(body, ref position);
+            var resetCount = body[position++];
+            for (var reset = 0; reset < resetCount; reset++)
+            {
+                position += 1 + body[position];
+            }
+
+            if (PatchedUsername(body[position..]) is { } username)
+            {
+                RefreshRememberedCredentials(user, username, null, generation);
+            }
         }
 
         static string ReadName(ReadOnlySpan<byte> body, int position) =>
             Encoding.UTF8.GetString(body.Slice(position + 1, body[position]));
+    }
+
+    /// <summary>The username a user update sets, read from the options block that ends its body.</summary>
+    private static string? PatchedUsername(ReadOnlySpan<byte> options)
+    {
+        var position = 0;
+        while (position < options.Length)
+        {
+            var keyKind = options[position];
+            var keyLength = BinaryPrimitives.ReadInt32LittleEndian(options[(position + 1)..]);
+            var key = options.Slice(position + 5, keyLength);
+            position += 5 + keyLength;
+            var valueKind = options[position];
+            var valueLength = BinaryPrimitives.ReadInt32LittleEndian(options[(position + 1)..]);
+            var value = options.Slice(position + 5, valueLength);
+            position += 5 + valueLength;
+            if (keyKind == StringKind && valueKind == StringKind && key.SequenceEqual("username"u8))
+            {
+                return Encoding.UTF8.GetString(value);
+            }
+        }
+
+        return null;
     }
 
     private void RefreshRememberedCredentials(Identifier user, string? username, string? password, ulong generation)

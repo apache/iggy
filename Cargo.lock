@@ -250,6 +250,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aead-stream"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a901e5bcd15b4a9555a8f17a608d28ef92cf77bc4aa3b4a0c1a3fce1a9cc0bac"
+dependencies = [
+ "aead 0.6.1",
+]
+
+[[package]]
 name = "aes"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -269,6 +278,7 @@ dependencies = [
  "cipher 0.5.2",
  "cpubits",
  "cpufeatures 0.3.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -297,6 +307,22 @@ dependencies = [
  "ctr 0.10.1",
  "ctutils",
  "ghash 0.6.0",
+ "zeroize",
+]
+
+[[package]]
+name = "aes-gcm-siv"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c32325128cb24de2a2d14d92da7569dae7073f9e47334521d494747fa94d902"
+dependencies = [
+ "aead 0.6.1",
+ "aes 0.9.3",
+ "cipher 0.5.2",
+ "ctr 0.10.1",
+ "ctutils",
+ "polyval 0.7.3",
+ "zeroize",
 ]
 
 [[package]]
@@ -1431,6 +1457,10 @@ dependencies = [
  "futures-util",
  "log",
  "pin-project-lite",
+ "rustls-native-certs",
+ "rustls-pki-types",
+ "tokio",
+ "tokio-rustls",
  "tungstenite 0.29.0",
 ]
 
@@ -3203,7 +3233,7 @@ dependencies = [
  "compio-log",
  "compio-send-wrapper",
  "crossbeam-queue",
- "flume 0.12.0",
+ "flume",
  "futures-util",
  "io-uring",
  "libc",
@@ -3324,7 +3354,7 @@ dependencies = [
  "compio-log",
  "compio-net",
  "compio-runtime",
- "flume 0.12.0",
+ "flume",
  "futures-util",
  "libc",
  "quinn-proto",
@@ -5331,17 +5361,6 @@ dependencies = [
 
 [[package]]
 name = "flume"
-version = "0.11.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da0e4dd2a88388a1f4ccc7c9ce104604dab68d9f408dc34cd45823d5a9069095"
-dependencies = [
- "futures-core",
- "futures-sink",
- "spin",
-]
-
-[[package]]
-name = "flume"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e139bc46ca777eb5efaf62df0ab8cc5fd400866427e56c68b22e414e53bd3be"
@@ -5759,6 +5778,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2eecf2d5dc9b66b732b97707a0210906b1d30523eb773193ab777c0c84b3e8d5"
 dependencies = [
  "polyval 0.7.3",
+ "zeroize",
 ]
 
 [[package]]
@@ -7069,7 +7089,7 @@ checksum = "cd62e6b5e86ea8eeeb8db1de02880a6abc01a397b2ebb64b5d74ac255318f5cb"
 
 [[package]]
 name = "iggy"
-version = "0.11.1-edge.1"
+version = "0.11.1-edge.2"
 dependencies = [
  "async-broadcast",
  "async-dropper",
@@ -7078,7 +7098,7 @@ dependencies = [
  "bytemuck",
  "bytes",
  "dashmap",
- "flume 0.12.0",
+ "flume",
  "futures",
  "futures-util",
  "iggy_binary_protocol",
@@ -7092,6 +7112,7 @@ dependencies = [
  "reqwest-middleware",
  "reqwest-retry",
  "reqwest-tracing",
+ "ring",
  "rustls",
  "secrecy",
  "serde",
@@ -7106,7 +7127,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-bench"
-version = "0.6.1-edge.1"
+version = "0.6.1-edge.2"
 dependencies = [
  "async-trait",
  "bench-report",
@@ -7164,7 +7185,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-cli"
-version = "0.14.1-edge.1"
+version = "0.14.1-edge.2"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",
@@ -7198,7 +7219,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-connectors"
-version = "0.5.1-edge.1"
+version = "0.5.1-edge.2"
 dependencies = [
  "apache-avro 0.22.0",
  "async-trait",
@@ -7215,7 +7236,7 @@ dependencies = [
  "dotenvy",
  "figlet-rs",
  "figment",
- "flume 0.12.0",
+ "flume",
  "futures",
  "iggy",
  "iggy_common",
@@ -7298,7 +7319,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-mcp"
-version = "0.5.1-edge.1"
+version = "0.5.1-edge.2"
 dependencies = [
  "axum",
  "axum-server",
@@ -7333,12 +7354,13 @@ dependencies = [
 
 [[package]]
 name = "iggy_binary_protocol"
-version = "0.11.1-edge.1"
+version = "0.11.1-edge.2"
 dependencies = [
  "aligned-vec",
  "bytemuck",
  "bytes",
  "enumset",
+ "ring",
  "secrecy",
  "serde",
  "thiserror 2.0.21",
@@ -7347,9 +7369,10 @@ dependencies = [
 
 [[package]]
 name = "iggy_common"
-version = "0.11.1-edge.1"
+version = "0.11.1-edge.2"
 dependencies = [
  "aes-gcm 0.11.1",
+ "aes-gcm-siv",
  "async-broadcast",
  "async-trait",
  "base64 0.23.1",
@@ -7361,6 +7384,7 @@ dependencies = [
  "clap",
  "comfy-table",
  "derive_more",
+ "hex",
  "humantime",
  "iggy_binary_protocol",
  "papaya",
@@ -7378,6 +7402,7 @@ dependencies = [
  "ulid",
  "url",
  "uuid",
+ "xaes-256-gcm",
 ]
 
 [[package]]
@@ -7666,7 +7691,8 @@ dependencies = [
  "humantime",
  "iggy_common",
  "iggy_connector_sdk",
- "rumqttc",
+ "rumqttc-v4-next",
+ "rumqttc-v5-next",
  "rustls-native-certs",
  "rustls-pemfile",
  "secrecy",
@@ -8120,7 +8146,8 @@ dependencies = [
  "reqwest-retry",
  "ring",
  "rmcp",
- "rumqttc",
+ "rumqttc-v4-next",
+ "rumqttc-v5-next",
  "rust-s3",
  "secrecy",
  "serde",
@@ -8532,7 +8559,7 @@ dependencies = [
  "backon",
  "cfg-if",
  "event-listener",
- "flume 0.12.0",
+ "flume",
  "futures-core",
  "futures-io",
  "tracing",
@@ -9407,6 +9434,16 @@ checksum = "bb85c154ba489f01b25c0d36ae69a87e4a1c73a72631fc6c0eb6dde34a73e44b"
 dependencies = [
  "num-traits",
  "pxfm",
+]
+
+[[package]]
+name = "mqttbytes-core-next"
+version = "0.34.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "366b6ba2b4209ca4bc5ac731ccddf570d09831981eed07e5fbd63564cf0cf1aa"
+dependencies = [
+ "bytes",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -10872,6 +10909,7 @@ dependencies = [
  "cpubits",
  "cpufeatures 0.3.1",
  "universal-hash 0.6.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -12138,23 +12176,66 @@ dependencies = [
 ]
 
 [[package]]
-name = "rumqttc"
-version = "0.25.1"
+name = "rumqttc-core-next"
+version = "0.34.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0feff8d882bff0b2fddaf99355a10336d43dd3ed44204f85ece28cf9626ab519"
+checksum = "249896ab27ed630590971738264baa8f722f18965d2e387c706c40a3c2a572cc"
 dependencies = [
- "bytes",
- "fixedbitset",
- "flume 0.11.1",
- "futures-util",
- "log",
+ "async-tungstenite",
  "rustls-native-certs",
- "rustls-pemfile",
- "rustls-webpki 0.102.8",
+ "rustls-pki-types",
+ "rustls-webpki",
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
- "tokio-stream",
+]
+
+[[package]]
+name = "rumqttc-v4-next"
+version = "0.34.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b3767dde22a804ea806107d0f4331e33cb794d1b8468b11c86fb0c1366f07054"
+dependencies = [
+ "async-tungstenite",
+ "bytes",
+ "fixedbitset",
+ "flume",
+ "futures-util",
+ "log",
+ "mqttbytes-core-next",
+ "percent-encoding",
+ "rumqttc-core-next",
+ "rustls-native-certs",
+ "rustls-pki-types",
+ "rustls-webpki",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "url",
+]
+
+[[package]]
+name = "rumqttc-v5-next"
+version = "0.34.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3dfa6ddcc7a7dd5688f9bf78d8f81cb94f367bce56c055d8d94cf81ecb0518bf"
+dependencies = [
+ "async-tungstenite",
+ "bytes",
+ "fixedbitset",
+ "flume",
+ "futures-util",
+ "log",
+ "mqttbytes-core-next",
+ "percent-encoding",
+ "rumqttc-core-next",
+ "rustls-native-certs",
+ "rustls-pki-types",
+ "rustls-webpki",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
  "tokio-util",
  "url",
 ]
@@ -12328,7 +12409,7 @@ dependencies = [
  "once_cell",
  "ring",
  "rustls-pki-types",
- "rustls-webpki 0.103.15",
+ "rustls-webpki",
  "subtle",
  "zeroize",
 ]
@@ -12345,7 +12426,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "rustls-platform-verifier",
- "rustls-webpki 0.103.15",
+ "rustls-webpki",
 ]
 
 [[package]]
@@ -12393,7 +12474,7 @@ dependencies = [
  "rustls",
  "rustls-native-certs",
  "rustls-platform-verifier-android",
- "rustls-webpki 0.103.15",
+ "rustls-webpki",
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
@@ -12405,17 +12486,6 @@ name = "rustls-platform-verifier-android"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eec689c0bc40ff2458a5977b6619cb718087084a18e02a131c599b62d05e1a5f"
-
-[[package]]
-name = "rustls-webpki"
-version = "0.102.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64ca1bc8749bd4cf37b5ce386cc146580777b4e8572c7b97baf22c83f444bee9"
-dependencies = [
- "ring",
- "rustls-pki-types",
- "untrusted 0.9.0",
-]
 
 [[package]]
 name = "rustls-webpki"
@@ -12912,7 +12982,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.9.1-edge.1"
+version = "0.9.1-edge.2"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -13607,7 +13677,7 @@ checksum = "488e99c397a62007e4229aec669a179816339afc6d2620ca6fa420dbee2e982c"
 dependencies = [
  "atoi",
  "chrono",
- "flume 0.12.0",
+ "flume",
  "form_urlencoded",
  "futures-channel",
  "futures-core",
@@ -16201,6 +16271,19 @@ dependencies = [
  "rusticata-macros",
  "thiserror 2.0.21",
  "time",
+]
+
+[[package]]
+name = "xaes-256-gcm"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc0e35bc669c7ce781caf52f51a1e672237825014c7a8cbb1292e194800d97fe"
+dependencies = [
+ "aead 0.6.1",
+ "aead-stream",
+ "aes 0.9.3",
+ "aes-gcm 0.11.1",
+ "cipher 0.5.2",
 ]
 
 [[package]]

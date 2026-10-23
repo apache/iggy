@@ -15,21 +15,32 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Bearer-credential extractor for protected shard-0 HTTP routes.
+//! Bearer-credential and JSON body extractors for protected shard-0 HTTP
+//! routes.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Formatter;
 use std::net::IpAddr;
 use std::rc::Rc;
 
-use axum::extract::{ConnectInfo, FromRequestParts};
+use axum::Json;
+use axum::body::{Body, Bytes};
+use axum::extract::{ConnectInfo, FromRequest, FromRequestParts, Request};
 use axum::http::HeaderMap;
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
-use iggy_common::{IggyError, IggyTimestamp, PersonalAccessToken};
+use axum::response::{IntoResponse, Response};
+use iggy_common::{
+    IggyError, IggyTimestamp, OptionInputValue, OptionsUpdate, PersonalAccessToken, RESET_FIELD,
+    erase_buffer,
+};
 use send_wrapper::SendWrapper;
+use serde::Deserializer as _;
+use serde::de::{DeserializeOwned, Error as _, IgnoredAny, MapAccess, Visitor};
 use tracing::debug;
 
 use super::HttpState;
-use super::error::AuthError;
+use super::error::{AuthError, WriteError};
 use super::jwt::TokenSubject;
 use super::session::HttpSession;
 use super::state::HttpInner;
@@ -69,6 +80,26 @@ pub struct Authenticated {
     pub session: SendWrapper<Rc<HttpSession>>,
 }
 
+/// A JSON body with the names of its top-level members, so a create handler
+/// can refuse an option sent beside `options` instead of silently dropping it.
+pub struct JsonMembers<T> {
+    pub value: T,
+    pub members: BTreeSet<String>,
+}
+
+/// An update body. A body the update shape refuses is `InvalidCommand`, the
+/// category the binary decoder gives the same patch, naming the first member
+/// at fault where one is.
+pub(in crate::http) struct JsonUpdate(pub OptionsUpdate);
+
+/// Walks an update body with the member types [`OptionsUpdate`] parses and
+/// records the first member that does not parse: a repeated name, a `reset`
+/// that is not a list of distinct names, or another member that is not a
+/// scalar or `null`.
+struct RefusedMemberVisitor<'a> {
+    refused: &'a mut Option<String>,
+}
+
 impl FromRequestParts<HttpState> for Authenticated {
     type Rejection = AuthError;
 
@@ -88,6 +119,90 @@ impl FromRequestParts<HttpState> for Authenticated {
         Ok(Self {
             session: SendWrapper::new(session),
         })
+    }
+}
+
+impl<T, S> FromRequest<S> for JsonMembers<T>
+where
+    T: DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    /// Runs axum's own `Json` extraction, so content type checks, body limits
+    /// and rejections stay what every other route answers.
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let (parts, body) = request.into_parts();
+        let bytes = Bytes::from_request(Request::from_parts(parts.clone(), body), state)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        let value =
+            Json::<T>::from_request(Request::from_parts(parts, Body::from(bytes.clone())), state)
+                .await;
+        let members = Json::<BTreeMap<String, IgnoredAny>>::from_bytes(&bytes);
+        erase_buffer(bytes);
+        let Json(value) = value.map_err(IntoResponse::into_response)?;
+        let Json(members) = members.map_err(IntoResponse::into_response)?;
+        Ok(Self {
+            value,
+            members: members.into_keys().collect(),
+        })
+    }
+}
+
+impl<S> FromRequest<S> for JsonUpdate
+where
+    S: Send + Sync,
+{
+    type Rejection = WriteError;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let (parts, body) = request.into_parts();
+        let bytes = Bytes::from_request(Request::from_parts(parts.clone(), body), state)
+            .await
+            .map_err(|_| WriteError::Rejected(IggyError::InvalidCommand))?;
+        let update = match Json::<OptionsUpdate>::from_request(
+            Request::from_parts(parts, Body::from(bytes.clone())),
+            state,
+        )
+        .await
+        {
+            Ok(Json(update)) => Ok(Self(update)),
+            Err(_) => Err(refused_member(&bytes).map_or(
+                WriteError::Rejected(IggyError::InvalidCommand),
+                WriteError::MalformedMember,
+            )),
+        };
+        erase_buffer(bytes);
+        update
+    }
+}
+
+impl<'de> Visitor<'de> for RefusedMemberVisitor<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("an update body object")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut access: A) -> Result<Self::Value, A::Error> {
+        let mut seen = BTreeSet::new();
+        while let Some(key) = access.next_key::<String>()? {
+            let fits = seen.insert(key.clone())
+                && if key == RESET_FIELD {
+                    access.next_value::<Vec<String>>().is_ok_and(|names| {
+                        let mut distinct = BTreeSet::new();
+                        names.into_iter().all(|name| distinct.insert(name))
+                    })
+                } else {
+                    access.next_value::<Option<OptionInputValue>>().is_ok()
+                };
+            if !fits {
+                *self.refused = Some(key);
+                return Err(A::Error::custom("refused update member"));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -317,6 +432,20 @@ pub(in crate::http) fn credential_key(
     )
 }
 
+/// The member [`RefusedMemberVisitor`] finds in `bytes`, `None` for a body that
+/// is not a JSON object or has no member at fault.
+fn refused_member(bytes: &[u8]) -> Option<String> {
+    let mut refused = None;
+    let walked =
+        serde_json::Deserializer::from_slice(bytes).deserialize_map(RefusedMemberVisitor {
+            refused: &mut refused,
+        });
+    match walked {
+        Ok(()) => None,
+        Err(_) => refused,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,6 +494,38 @@ mod tests {
                 .is_err(),
             "without a layer the extractor still verifies the bearer"
         );
+    }
+
+    #[test]
+    fn given_update_bodies_when_finding_refused_member_should_name_the_first_misfit() {
+        let cases = [
+            (r#"{"name":"orders","reset":["message_expiry"]}"#, None),
+            (r#"{"name":"orders","message_expiry":null}"#, None),
+            (r#"{"name":["orders"]}"#, Some("name")),
+            (
+                r#"{"name":"a","message_expiry":{"value":"1 day"}}"#,
+                Some("message_expiry"),
+            ),
+            (r#"{"reset":null}"#, Some("reset")),
+            (
+                r#"{"message_expiry":1.5,"name":"a","name":"b"}"#,
+                Some("message_expiry"),
+            ),
+            (r#"{"name":"a","name":"b"}"#, Some("name")),
+            (
+                r#"{"reset":["message_expiry","message_expiry"]}"#,
+                Some("reset"),
+            ),
+            (r#"["name"]"#, None),
+            (r#"{"name":"a""#, None),
+        ];
+        for (body, expected) in cases {
+            assert_eq!(
+                refused_member(body.as_bytes()).as_deref(),
+                expected,
+                "{body}"
+            );
+        }
     }
 
     fn unverifiable_bearer_parts() -> Parts {

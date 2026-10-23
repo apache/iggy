@@ -28,7 +28,6 @@ import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.SendMessagesResponse;
-import org.apache.iggy.topic.CompressionAlgorithm;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -36,7 +35,6 @@ import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -156,14 +154,7 @@ class AsyncConnectionPoolAuthTest extends BaseIntegrationTest {
 
         client.streams().createStream(streamName).get(5, TimeUnit.SECONDS);
         client.topics()
-                .createTopic(
-                        StreamId.of(streamName),
-                        1L,
-                        CompressionAlgorithm.None,
-                        BigInteger.ZERO,
-                        BigInteger.ZERO,
-                        "test-topic",
-                        PERSISTED_TOPIC_OPTIONS)
+                .createTopic(StreamId.of(streamName), "test-topic", 1L, PERSISTED_TOPIC_OPTIONS)
                 .get(5, TimeUnit.SECONDS);
 
         // when - fire a burst of concurrent requests to exercise lazy
@@ -197,14 +188,7 @@ class AsyncConnectionPoolAuthTest extends BaseIntegrationTest {
 
         client.streams().createStream(streamName).get(5, TimeUnit.SECONDS);
         client.topics()
-                .createTopic(
-                        StreamId.of(streamName),
-                        1L,
-                        CompressionAlgorithm.None,
-                        BigInteger.ZERO,
-                        BigInteger.ZERO,
-                        "test-topic",
-                        PERSISTED_TOPIC_OPTIONS)
+                .createTopic(StreamId.of(streamName), "test-topic", 1L, PERSISTED_TOPIC_OPTIONS)
                 .get(5, TimeUnit.SECONDS);
 
         List<CompletableFuture<SendMessagesResponse>> warmupFutures = new ArrayList<>();

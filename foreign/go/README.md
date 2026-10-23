@@ -41,11 +41,60 @@ IGGY_PATH=/tmp/iggy-go \
 IGGY_TCP_ADDRESS=127.0.0.1:8090 \
 IGGY_HTTP_ENABLED=false IGGY_QUIC_ENABLED=false IGGY_WEBSOCKET_ENABLED=false \
 IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy \
+IGGY_ENCRYPTION_ENABLED=true IGGY_ENCRYPTION_KEY="$(head -c 32 /dev/urandom | base64)" \
 target/debug/iggy-server
 ```
 
 QUIC, WebSocket and HTTP are enabled by default on ports 8080, 8092 and 3000.
 Disable the ones you do not need so they cannot race with another process.
+The encryption variables enable at-rest encryption with a server key. Leave
+them out for a plaintext server. The stream option end-to-end tests need them.
+
+## Resource options
+
+Streams, topics and users carry options from one server catalog. `CreateStream`, `CreateTopic` and `CreateUser` take typed option structs, and `UpdateStream`, `UpdateTopic` and `UpdateUser` take sparse patches: a nil field keeps its stored value, `Reset` returns a key to its default. `DescribeOptions` lists the catalog the server serves. `Raw`, `Options` and `RawReset` carry keys newer than this build, and the server decides whether such a patch is valid.
+
+```go
+key := make([]byte, iggcon.StreamEncryptionKeyLength)
+if _, err := rand.Read(key); err != nil {
+    log.Fatal(err)
+}
+stream, err := cli.CreateStream(ctx, "orders", &iggcon.StreamOptions{EncryptionKey: key})
+if err != nil {
+    log.Fatal(err)
+}
+source, _ := stream.EncryptionKeySource()
+fingerprint, _ := stream.EncryptionKeyFingerprint()
+log.Printf("key source %s, fingerprint %s", source, fingerprint)
+
+streamId, _ := iggcon.NewIdentifier(stream.Id)
+partitions := uint32(3)
+expiry := iggcon.Duration(time.Hour.Microseconds())
+durability := iggcon.DurabilityPersisted
+topic, err := cli.CreateTopic(ctx, streamId, "events", &iggcon.TopicOptions{
+    PartitionsCount: &partitions,
+    MessageExpiry:   &expiry,
+    Durability:      &durability,
+})
+if err != nil {
+    log.Fatal(err)
+}
+
+topicId, _ := iggcon.NewIdentifier(topic.Id)
+size := uint64(10 << 30)
+if err := cli.UpdateTopic(ctx, streamId, topicId, iggcon.TopicUpdate{
+    MaxTopicSize: &size,
+    Reset:        []iggcon.TopicOptionKey{iggcon.TopicOptionMessageExpiry},
+}); err != nil {
+    log.Fatal(err)
+}
+```
+
+The sample is `Example_resourceOptions` in `client/example_resource_options_test.go`.
+
+A stream encryption key is exactly 32 random bytes. Never derive it from a password: the fingerprint reads would then be an offline guessing oracle. The key travels inside the create request over the client's transport, so use TLS when the network between client and server is not trusted.
+
+The server stores the key wrapped under its own key and never returns it. Reads report only its source and fingerprints. Without a key, a server with encryption enabled generates one for the stream, and a server without it keeps the stream plaintext and refuses a client key.
 
 ## Delivery semantics
 
@@ -193,7 +242,9 @@ go test ./...
 ```
 
 The end-to-end suite runs against a server at the address in
-`IGGY_TCP_ADDRESS` and skips when that variable is unset:
+`IGGY_TCP_ADDRESS` and skips when that variable is unset. Start the server
+with the encryption variables shown above, the stream option cases fail
+without them:
 
 ```bash
 IGGY_TCP_ADDRESS=127.0.0.1:8090 go test ./tests

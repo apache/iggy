@@ -424,14 +424,38 @@ sysinfo_print_interval = "10 s"
 # Encryption configuration
 [encryption]
 # Encrypt message payloads and user headers. Metadata and structural headers remain unencrypted.
-# `true` enables encryption for stored data using AES-256-GCM.
+# `true` enables encryption for stored payloads and user headers using AES-256-GCM-SIV.
 # `false` means data is stored without encryption.
 enabled = false
 
-# The encryption key used when encryption is enabled (string).
-# Should be a 32 bytes length key, provided as a base64 encoded string.
-# This key is required and used only if encryption is enabled.
+# The server encryption key (string), 32 bytes as standard base64.
+# Every encrypted stream has its own data key, stored wrapped under a key derived from this one.
+# Required when encryption is enabled. With encryption disabled a key may still be set:
+# streams created with their own key are then encrypted, keyless streams stay plaintext.
+# A stream created without encryption stays plaintext for life.
 key = ""
+
+# Earlier server keys (list of strings) a key rotation still needs, at most two.
+# A node unwraps stream keys with them and wraps every new stream key under them too.
+# Rotation runs in two phases:
+# 1. Set `key` to the new key and `previous_keys` to the old one on every node. The metadata
+#    primary adds a wrap under the new key to every encrypted stream and keeps the old wraps,
+#    so nodes still on the old key keep serving and booting, new streams included.
+# 2. Once every node runs the phase 1 config and every encrypted stream reports the new
+#    key's fingerprint in `encryption_kek_fingerprint`, empty `previous_keys` and put the
+#    old key's fingerprint in `retired_kek_fingerprints`. The primary drops the wraps under it.
+# 3. Once every stream has dropped the old wrap, clear `retired_kek_fingerprints` on every node.
+# A stream holds at most three wraps. Retire an old fingerprint before adding a fourth key.
+# Messages are never re-encrypted. Losing a key that still wraps a stream makes it unreadable.
+# As an environment variable: IGGY_ENCRYPTION_PREVIOUS_KEYS='["<old base64 key>"]', a single key may also be given bare.
+previous_keys = []
+
+# Fingerprints of retired server keys (list of strings), 16 lowercase hex characters each, as
+# `encryption_kek_fingerprint` reports them. The metadata primary drops stream key wraps under
+# these keys and never drops a wrap under a key that is not listed, even one this node lacks.
+# Needs `key`, and may not name `key` or a key in `previous_keys`. Not secret.
+# As an environment variable: IGGY_ENCRYPTION_RETIRED_KEK_FINGERPRINTS='["<fingerprint>"]'.
+retired_kek_fingerprints = []
 
 # Memory pool configuration
 [memory_pool]

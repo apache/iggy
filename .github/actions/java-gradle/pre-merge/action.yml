@@ -86,6 +86,8 @@ runs:
       uses: ./.github/actions/utils/server-start
       with:
         bin: target/debug/iggy-server
+        encryption-enabled: "true"
+        encryption-key: "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE="
         wait-timeout-seconds: "90"
       env:
         IGGY_PATH: ${{ runner.temp }}/iggy-java-data
@@ -156,6 +158,8 @@ runs:
         pid-file: ${{ steps.iggy.outputs.pid_file }}
         log-file: ${{ steps.iggy.outputs.log_file }}
 
+    # No encryption key, the shipped default, so this lane also covers a server
+    # that keeps streams plaintext and refuses client stream keys.
     - name: Start Iggy server (TLS)
       id: iggy-tls
       if: inputs.task == 'test'

@@ -16,6 +16,7 @@
 // under the License.
 
 use std::{
+    collections::BTreeMap,
     num::NonZeroUsize,
     str::FromStr,
     sync::Arc,
@@ -35,6 +36,7 @@ use crate::consumer::{AutoCommit, IggyConsumer};
 use crate::durability::Durability as PhpDurability;
 use crate::error::to_php_exception;
 use crate::identifier::PhpIdentifier;
+use crate::options::{OptionSpec, OptionsScope, StreamOptionKey, TopicOptionKey, reset_names};
 use crate::receive_message::{PollingStrategy, ReceiveMessage};
 use crate::runtime::runtime;
 use crate::send_message::{SendMessage, SendMessagesResponse};
@@ -119,6 +121,8 @@ impl IggyClient {
     }
 
     /// Constructs a new IggyClient from a connection string.
+    ///
+    /// The string is marked `#[\SensitiveParameter]`, so exception traces never hold it.
     pub fn from_connection_string(connection_string: String) -> PhpResult<Self> {
         let client =
             RustIggyClient::from_connection_string(&connection_string).map_err(to_php_exception)?;
@@ -135,6 +139,8 @@ impl IggyClient {
     }
 
     /// Logs in the user with the given credentials.
+    ///
+    /// The password is marked `#[\SensitiveParameter]`, so exception traces never hold it.
     pub fn login_user(&self, username: String, password: String) -> PhpResult {
         let inner = self.inner.clone();
 
@@ -188,16 +194,77 @@ impl IggyClient {
     }
 
     /// Creates a new stream.
-    pub fn create_stream(&self, name: String) -> PhpResult {
+    ///
+    /// `encryption_key` is the stream's own data key: 32 random bytes as canonical padded
+    /// standard base64, for example `base64_encode(random_bytes(32))`. Raw bytes or any other
+    /// text are refused before anything is sent. The key travels in the request, so protecting
+    /// it in transit with TLS is the caller's responsibility. It is marked
+    /// `#[\SensitiveParameter]`, so exception traces never hold it. The server stores it wrapped
+    /// and never returns it, reads report only its source and fingerprints. Without a key, a
+    /// server with encryption enabled generates one. `raw` sends string-valued keys this
+    /// build does not know, and the server decides whether to accept them. It is marked
+    /// `#[\SensitiveParameter]` too, because an unknown key may hold a secret.
+    pub fn create_stream(
+        &self,
+        name: String,
+        encryption_key: Option<Binary<u8>>,
+        raw: Option<BTreeMap<String, String>>,
+    ) -> PhpResult {
+        let options = StreamCreateOptions {
+            encryption_key: encryption_key.map(stream_key).transpose()?,
+            raw: raw.unwrap_or_default(),
+        };
         let inner = self.inner.clone();
 
         runtime().block_on(async move {
             inner
-                .create_stream(&name)
+                .create_stream(&name, &options)
                 .await
                 .map(|_| ())
                 .map_err(to_php_exception)
         })
+    }
+
+    /// Renames a stream.
+    ///
+    /// A null name keeps the current one. No stream option is resettable, so a non-empty
+    /// `reset` list, or an update that changes nothing, is refused before anything is sent.
+    /// `raw` and `raw_reset` reach keys this build does not know, and the server decides
+    /// whether each one may be set or reset. `raw` is marked `#[\SensitiveParameter]`,
+    /// because an unknown key may hold a secret. Renaming keeps the stream's id, key and
+    /// messages.
+    #[php(defaults(reset = Vec::<StreamOptionKey>::new()))]
+    pub fn update_stream(
+        &self,
+        stream: PhpIdentifier,
+        name: Option<String>,
+        reset: Vec<StreamOptionKey>,
+        raw: Option<BTreeMap<String, String>>,
+        raw_reset: Option<Vec<String>>,
+    ) -> PhpResult {
+        let stream: Identifier = stream.try_into()?;
+        let (reset, raw_reset) = reset_names(reset, raw_reset)?;
+        let options = StreamUpdateOptions {
+            name,
+            reset,
+            raw_reset,
+            raw: raw.unwrap_or_default(),
+        };
+        let inner = self.inner.clone();
+
+        runtime().block_on(async move {
+            inner
+                .update_stream(&stream, &options)
+                .await
+                .map_err(to_php_exception)
+        })
+    }
+
+    /// Fingerprint of a stream key given as canonical padded standard base64 of 32 bytes, the
+    /// value `StreamDetails::$encryption_key_fingerprint` reports for a stream created with it.
+    /// The key is marked `#[\SensitiveParameter]`, so exception traces never hold it.
+    pub fn encryption_key_fingerprint(key: Binary<u8>) -> PhpResult<String> {
+        stream_key(key).map(|key| key.fingerprint())
     }
 
     /// Gets a stream by id or name.
@@ -216,7 +283,11 @@ impl IggyClient {
 
     /// Creates a topic.
     ///
-    /// Every option left null resolves against the server default at admission.
+    /// Every option left null resolves against the server default at admission. The 64-bit
+    /// sizes and durations take an int or a decimal string, so never-expire and unlimited
+    /// (18446744073709551615) can be sent. `raw` sends string-valued keys this build does not
+    /// know, and the server decides whether to accept them. It is marked
+    /// `#[\SensitiveParameter]`, because an unknown key may hold a secret.
     #[allow(clippy::too_many_arguments)]
     pub fn create_topic(
         &self,
@@ -232,14 +303,15 @@ impl IggyClient {
         messages_required_to_save: Option<&Zval>,
         size_of_messages_required_to_save: Option<&Zval>,
         preallocate_segments: Option<bool>,
+        partition_resize_policy: Option<String>,
+        raw: Option<BTreeMap<String, String>>,
     ) -> PhpResult {
-        let message_expiry_micros =
-            optional_unsigned::<u64>(message_expiry_micros, "message_expiry_micros")?;
-        let max_topic_size = optional_unsigned::<u64>(max_topic_size, "max_topic_size")?;
-        let segment_size = optional_unsigned::<u64>(segment_size, "segment_size")?;
+        let message_expiry_micros = optional_u64(message_expiry_micros, "message_expiry_micros")?;
+        let max_topic_size = optional_u64(max_topic_size, "max_topic_size")?;
+        let segment_size = optional_u64(segment_size, "segment_size")?;
         let messages_required_to_save =
             optional_unsigned::<u32>(messages_required_to_save, "messages_required_to_save")?;
-        let size_of_messages_required_to_save = optional_unsigned::<u64>(
+        let size_of_messages_required_to_save = optional_u64(
             size_of_messages_required_to_save,
             "size_of_messages_required_to_save",
         )?;
@@ -247,9 +319,14 @@ impl IggyClient {
             Some(value) => CompressionAlgorithm::from_str(&value).map_err(to_php_exception)?,
             None => CompressionAlgorithm::default(),
         };
-        let expiry = message_expiry_micros.map_or(IggyExpiry::ServerDefault, |micros| {
-            IggyExpiry::ExpireDuration(IggyDuration::from(micros))
-        });
+        let partition_resize_policy = partition_resize_policy
+            .as_deref()
+            .map(PartitionResizePolicy::from_str)
+            .transpose()
+            .map_err(|_| {
+                to_php_exception("'partition_resize_policy' must be 'mutable' or 'fixed'")
+            })?;
+        let expiry = message_expiry_micros.map_or(IggyExpiry::ServerDefault, IggyExpiry::from);
         let max_size = max_topic_size.map_or(MaxTopicSize::ServerDefault, MaxTopicSize::from);
         let stream: Identifier = stream.try_into()?;
         let inner = self.inner.clone();
@@ -265,11 +342,12 @@ impl IggyClient {
             segment_size: segment_size.map(IggyByteSize::from),
             durability: durability.unwrap_or_default().into(),
             consumer_offset_durability: consumer_offset_durability.unwrap_or_default().into(),
+            partition_resize_policy,
             messages_required_to_save,
             size_of_messages_required_to_save: size_of_messages_required_to_save
                 .map(IggyByteSize::from),
             preallocate_segments,
-            ..TopicCreateOptions::default()
+            raw: raw.unwrap_or_default(),
         };
 
         runtime().block_on(async move {
@@ -277,6 +355,68 @@ impl IggyClient {
                 .create_topic(&stream, &name, &options)
                 .await
                 .map(|_| ())
+                .map_err(to_php_exception)
+        })
+    }
+
+    /// Renames a topic or changes its message expiry and size cap.
+    ///
+    /// Null arguments keep the stored values. `message_expiry_micros` and `max_topic_size`
+    /// take an int or a decimal string, 18446744073709551615 meaning never expire and
+    /// unlimited, and 0 is refused: list the key in `reset` to return it to the server
+    /// default. `raw` and `raw_reset` reach keys this build does not know, and the server
+    /// decides whether each one may be set or reset. `raw` is marked
+    /// `#[\SensitiveParameter]`, because an unknown key may hold a secret.
+    #[allow(clippy::too_many_arguments)]
+    #[php(defaults(reset = Vec::<TopicOptionKey>::new()))]
+    pub fn update_topic(
+        &self,
+        stream: PhpIdentifier,
+        topic: PhpIdentifier,
+        name: Option<String>,
+        message_expiry_micros: Option<&Zval>,
+        max_topic_size: Option<&Zval>,
+        reset: Vec<TopicOptionKey>,
+        raw: Option<BTreeMap<String, String>>,
+        raw_reset: Option<Vec<String>>,
+    ) -> PhpResult {
+        let message_expiry = optional_u64(message_expiry_micros, "message_expiry_micros")?
+            .map(|micros| positive_update(micros, "message_expiry_micros").map(IggyExpiry::from))
+            .transpose()?;
+        let max_topic_size = optional_u64(max_topic_size, "max_topic_size")?
+            .map(|bytes| positive_update(bytes, "max_topic_size").map(MaxTopicSize::from))
+            .transpose()?;
+        let stream: Identifier = stream.try_into()?;
+        let topic: Identifier = topic.try_into()?;
+        let (reset, raw_reset) = reset_names(reset, raw_reset)?;
+        let options = TopicUpdateOptions {
+            name,
+            message_expiry,
+            max_topic_size,
+            reset,
+            raw_reset,
+            raw: raw.unwrap_or_default(),
+        };
+        let inner = self.inner.clone();
+
+        runtime().block_on(async move {
+            inner
+                .update_topic(&stream, &topic, &options)
+                .await
+                .map_err(to_php_exception)
+        })
+    }
+
+    /// The server's option catalog for one resource: each key's kind and whether an update
+    /// may set or reset it, whether it is secret, read-only or critical.
+    pub fn describe_options(&self, scope: OptionsScope) -> PhpResult<Vec<OptionSpec>> {
+        let inner = self.inner.clone();
+
+        runtime().block_on(async move {
+            inner
+                .describe_options(scope.into())
+                .await
+                .map(|specs| specs.into_iter().map(OptionSpec::from).collect())
                 .map_err(to_php_exception)
         })
     }
@@ -553,6 +693,44 @@ fn pending_limit(
                 "'{field}' must be a positive platform-sized integer"
             ))
         })
+}
+
+// u64 values above PHP_INT_MAX, such as the never-expire sentinel, only fit a decimal string.
+fn optional_u64(value: Option<&Zval>, field: &str) -> PhpResult<Option<u64>> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let number = match (value.long(), value.str()) {
+        (Some(number), _) => u64::try_from(number).ok(),
+        (None, Some(text))
+            if !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            text.parse::<u64>().ok()
+        }
+        _ => None,
+    };
+    number.map(Some).ok_or_else(|| {
+        to_php_exception(format!(
+            "'{field}' must be a non-negative integer, a decimal string or null"
+        ))
+    })
+}
+
+fn positive_update(value: u64, field: &str) -> PhpResult<u64> {
+    if value == 0 {
+        return Err(to_php_exception(format!(
+            "'{field}' must be greater than 0, reset it to return to the server default"
+        )));
+    }
+    Ok(value)
+}
+
+fn stream_key(key: Binary<u8>) -> PhpResult<StreamEncryptionKey> {
+    let bytes: Vec<u8> = key.into();
+    str::from_utf8(&bytes)
+        .map_err(|_| IggyError::InvalidEncryptionKey)
+        .and_then(StreamEncryptionKey::from_str)
+        .map_err(to_php_exception)
 }
 
 fn optional_unsigned<T: TryFrom<i64>>(value: Option<&Zval>, field: &str) -> PhpResult<Option<T>> {

@@ -76,6 +76,29 @@ func TestFeatures(t *testing.T) {
 		})
 	}
 
+	if feature == "all" || feature == "stream_options" {
+		suites = append(suites, godog.TestSuite{
+			ScenarioInitializer: initResourceOptionsScenario,
+			Options: &godog.Options{
+				Format:   "pretty",
+				Paths:    []string{"../../scenarios/stream_options.feature"},
+				Strict:   true,
+				TestingT: t,
+			},
+		})
+	}
+	if feature == "all" || feature == "resource_options_patch" {
+		suites = append(suites, godog.TestSuite{
+			ScenarioInitializer: initResourceOptionsScenario,
+			Options: &godog.Options{
+				Format:   "pretty",
+				Paths:    []string{"../../scenarios/resource_options_patch.feature"},
+				Strict:   true,
+				TestingT: t,
+			},
+		})
+	}
+
 	if len(suites) == 0 {
 		t.Fatalf("unknown BDD_FEATURE=%q", feature)
 	}

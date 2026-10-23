@@ -16,7 +16,7 @@
 // under the License.
 
 use iggy_binary_protocol::Operation;
-use iggy_common::{EncryptorKind, IggyByteSize, PollingKind, PollingStrategy};
+use iggy_common::{IggyByteSize, PollingKind, PollingStrategy, ServerKeyContext};
 use server_common::iobuf::Frozen;
 use smallvec::SmallVec;
 use std::sync::Arc;
@@ -387,13 +387,11 @@ pub struct PartitionsConfig {
     pub segment_size: IggyByteSize,
     /// Whether local message files reserve the configured segment size on open.
     pub preallocate_segments: bool,
-    /// Server-side at-rest encryption. Applied ONCE, on the primary at
-    /// ingestion, so the ciphertext replicates verbatim: every replica
-    /// journals, acks, and persists identical bytes (checksums and the
-    /// deterministic segment rolls both depend on that), and the poll path
-    /// decrypts uniformly whether a fragment came from the resident journal
-    /// or from disk.
-    pub encryptor: Option<Arc<EncryptorKind>>,
+    /// This node's key-encryption keys. Each stream's own key is opened from
+    /// its committed wrap set and pinned to its partitions. Encryption runs
+    /// once, on the primary at ingestion, so every replica journals, acks and
+    /// persists identical ciphertext.
+    pub key_context: Arc<ServerKeyContext>,
     /// On-disk location scheme for partition directories.
     pub path_layout: PartitionPathLayout,
 }

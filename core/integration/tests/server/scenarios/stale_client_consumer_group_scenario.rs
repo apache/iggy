@@ -358,7 +358,10 @@ async fn setup_resources(client: &IggyClient, durability: Durability) {
         .await
         .unwrap();
 
-    client.create_stream(STREAM_NAME).await.unwrap();
+    client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
 
     client
         .create_topic(

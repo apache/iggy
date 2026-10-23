@@ -30,13 +30,17 @@ mod users;
 pub use messages::{BinarySendPartitioning, decode_send_confirmations, send_binary_messages};
 
 use crate::IggyError;
+use crate::OptionsPatch;
 use crate::http::users::defaults::{
     MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH, MIN_PASSWORD_LENGTH, MIN_USERNAME_LENGTH,
 };
 use crate::{BinaryClient, ClientState, Credentials, IdentityInfo};
 use bytes::Bytes;
 use iggy_binary_protocol::codec::WireEncode;
-use iggy_binary_protocol::codes::{LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE};
+use iggy_binary_protocol::codes::{
+    LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE, UPDATE_RESOURCE_CODE,
+};
+use iggy_binary_protocol::requests::system::{ResourceTarget, UpdateResourceRequest};
 use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::requests::users::{LoginRegisterRequest, LoginRegisterWithPatRequest};
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
@@ -45,6 +49,26 @@ use iggy_binary_protocol::{
 };
 use secrecy::ExposeSecret;
 use tokio::time::timeout_at;
+
+/// Send one `UpdateResource` patch for `target`.
+async fn update_resource<B: BinaryClient + ?Sized>(
+    client: &B,
+    target: ResourceTarget,
+    patch: OptionsPatch,
+) -> Result<(), IggyError> {
+    client
+        .send_raw_with_response(
+            UPDATE_RESOURCE_CODE,
+            UpdateResourceRequest {
+                target,
+                reset: patch.reset,
+                options: patch.set,
+            }
+            .to_bytes(),
+        )
+        .await?;
+    Ok(())
+}
 
 /// SDK identifier sent in the login-register version prefix. Foreign SDKs
 /// send their own (e.g. `go-sdk`) once they adopt VSR framing.

@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::harness::{TestBinary, TestHarness};
+use iggy::prelude::UserCreateOptions;
 use iggy::prelude::{
     ConsumerGroupClient, ConsumerGroupDetails, DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME,
     GlobalPermissions, Identifier, IdentityInfo, Permissions, StreamClient, TopicClient,
@@ -173,6 +174,7 @@ pub async fn create_user(client: &impl UserClient, username: &str) {
             USER_PASSWORD,
             UserStatus::Active,
             Some(full_permissions()),
+            &UserCreateOptions::default(),
         )
         .await
         .expect("Failed to create user");

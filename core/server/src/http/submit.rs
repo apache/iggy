@@ -170,15 +170,19 @@ pub(in crate::http) async fn submit_committed(
 /// [`submit_committed`] then forgets the entry so the caller's retry
 /// re-registers cleanly.
 ///
-/// Both shard-0 request rewrites run here before consensus, mirroring the TCP
+/// The [`http_chain`] stages run here before consensus, mirroring the TCP
 /// dispatch path: the PAT rewrite mints a raw token and replicates only its hash
-/// (`CreatePersonalAccessToken`), and the user-password rewrite hashes the new
+/// (`CreatePersonalAccessToken`), the user-password rewrite hashes the new
 /// password and, for `ChangePassword`, strips the current one and verifies it
-/// against the stored hash (`CreateUser` / `ChangePassword`). Both are no-ops
-/// for every other operation, so plaintext secrets never enter consensus on any
-/// write. A third resolution handles `DeleteSegments`, which is not itself a
-/// consensus op: it is rewritten to the metadata `TruncatePartition` that commits
-/// the trim (see [`resolve_delete_segments_truncate`]), so the truncate rides
+/// against the stored hash (`CreateUser` / `ChangePassword`), the static bounds
+/// admit every options block through the catalog, and the secret options
+/// rewrite replaces a stream key with its wrap set (`CreateStream`). The
+/// header this gateway builds leaves `request_checksum` zero, so no digest of
+/// the original body rides the prepare either, and no plaintext secret from
+/// an HTTP write enters consensus. A further resolution handles
+/// `DeleteSegments`, which is not itself a consensus op: it is rewritten to the
+/// metadata `TruncatePartition` that commits the trim (see
+/// [`resolve_delete_segments_truncate`]), so the truncate rides
 /// this session's gate id. A rejection (a malformed body or an unresolved
 /// delete-segments namespace) still spends the id like any other exit. A failed
 /// current-password check is not a rejection here: the op still commits with an

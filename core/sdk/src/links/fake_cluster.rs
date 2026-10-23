@@ -38,9 +38,7 @@ use iggy_binary_protocol::responses::system::{ClusterMetadataResponse, ClusterNo
 use iggy_binary_protocol::responses::topics::{GetTopicResponse, PartitionResponse};
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
 use iggy_binary_protocol::{PartitionContext, WireDecode, WireEncode, WireName, WireOptions};
-use iggy_common::{
-    AutoLogin, ClusterNodeRole, ClusterNodeStatus, CompressionAlgorithm, Credentials, IggyError,
-};
+use iggy_common::{AutoLogin, ClusterNodeRole, ClusterNodeStatus, Credentials, IggyError};
 use secrecy::SecretString;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -458,9 +456,6 @@ pub(crate) fn topic_body(partitions_count: u32) -> Vec<u8> {
             id: 1,
             created_at: 0,
             partitions_count,
-            message_expiry: 0,
-            compression_algorithm: CompressionAlgorithm::None.as_code(),
-            max_topic_size: 0,
             size_bytes: 0,
             messages_count: 0,
             name: WireName::new("topic").unwrap(),

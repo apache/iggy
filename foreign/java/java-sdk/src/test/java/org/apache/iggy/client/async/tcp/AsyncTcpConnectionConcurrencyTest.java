@@ -829,7 +829,7 @@ class AsyncTcpConnectionConcurrencyTest {
                 .putInt(0)
                 .putInt(1)
                 .putLong(42)
-                .putInt((11 << 10) | 1)
+                .putInt(12 << 10)
                 .put((byte) 0)
                 .array();
     }

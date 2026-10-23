@@ -47,13 +47,14 @@ Command-line arguments include `--replica-id`, `--fresh` (`-f`), `--with-default
 Deploy matching server and SDK releases together. Rolling upgrades and mixed
 server versions are unsupported. Partition control frames from older servers
 carry incarnation zero and are rejected, so a mixed-version cluster cannot
-complete partition view changes. The `IGGY-BOUND-GRANTS-5` storage gate
+complete partition view changes. The `IGGY-RESOURCE-OPTIONS-1` storage gate
 requires fresh storage and rejects older data directories without modifying them.
 Cached replies now preserve a committed-result marker, which older receipts lack.
 Partition creation records carry an initial view in each 16-byte assignment,
 replacing the 12-byte assignments and single request-wide view in older metadata
-WAL entries. This boundary also rejects `IGGY-BOUND-GRANTS-4` directories from
-upstream and earlier development builds, unchanged before replay.
+WAL entries. This boundary also rejects `IGGY-BOUND-GRANTS-4` and
+`IGGY-BOUND-GRANTS-5` directories from upstream and earlier development builds,
+unchanged before replay.
 No in-place upgrade, storage conversion tool or retained-data migration is
 provided. Use an offline cutover with logical re-ingestion:
 
@@ -223,7 +224,7 @@ cluster is idle, its counters can lag by up to `cluster.commit_broadcast_interva
 
 ### Sessions and retry receipts
 
-Protocol 0.11.1 uses client-owned registration proofs and `BindSession` (15) to
+Protocol 0.11.1 and later use client-owned registration proofs and `BindSession` (15) to
 share a logical session across connections. Commands 14, 103, 104, 123 and 124 are
 retired. Partition routing uses 105, polling uses 100 and offset reads use 120. Disconnecting a
 connection does not log out its logical session. Server-observed activity renews
@@ -306,6 +307,50 @@ partitions. Neither policy prevents retention or deletion of the topic.
 Set the option through `TopicCreateOptions::partition_resize_policy`, HTTP's
 `options` map, or the CLI's `--set partition_resize_policy=fixed`.
 
+## Resource options
+
+Streams, topics and users take their settings from one option catalog. The binary `DescribeOptions` command (13), `GET /options/{scope}` over HTTP (`stream`, `topic` or `user`) and `iggy options <scope>` list every key a client can see with its kind, default, description and five flags: updatable, resettable, secret, read-only and critical.
+
+Most keys are fixed at create. A topic's `compression_algorithm`, `segment_size`, `durability`, `consumer_offset_durability`, `partition_resize_policy` and save thresholds, and a stream's `encryption_key`, are refused by an update with `OptionNotUpdatable` (4103). `compression_algorithm` is create-only because the server never applies it and stored batches carry no codec marker.
+
+The updatable keys are `name` for streams and topics, `username` and `status` for users, and a topic's `message_expiry` and `max_topic_size`. Only those two topic keys can be reset to their default, any other reset is refused with `OptionNotResettable` (4104). Read-only keys, such as the stream key projections below, are refused with `ReadOnlyOption` (4105).
+
+Only root may rename the root user or change its status. Root cannot deactivate itself. These requests return `CannotModifyRootUser` (4108), and a rejected update leaves root active with its existing username.
+
+`UpdateResource` (16) replaces `UpdateStream` (204), `UpdateTopic` (304) and `UpdateUser` (35). It names a scope and a target, sets the keys it carries, resets the keys it lists and keeps every other key as stored. A key may not be both set and reset.
+
+Reads return every option with its provenance: explicit when a client set it, derived when the server filled it in at create. Topic responses no longer carry fixed `message_expiry`, `compression_algorithm` and `max_topic_size` fields, those values are in the option blocks.
+
+Over HTTP, `POST /streams`, `POST /streams/{stream_id}/topics` and `POST /users` take an optional nested `options` object. `PUT` on the stream, topic and user paths takes one flat JSON object: members other than `reset` are option keys of the scope, `name`, `username` and `status` included. A value sets the key, an absent key or a `null` value leaves it unchanged, and `reset` is an optional array of key names that return to their defaults.
+
+`null` never resets a key. The body is not JSON Merge Patch and there is no `PATCH` route. Request values are strings in the config-file syntax (`"7 days"`, `"1 GiB"`, `"gzip"`), or numbers and booleans where the kind allows. See [server-api.http](../../web/docs/server-api.http) for examples.
+
+## Stream encryption
+
+With encryption, every encrypted stream has its own 32-byte data key. The server `[encryption] key` never encrypts messages: HKDF-SHA256 derives a key-encryption key from it, and each stream key is stored in the stream's options wrapped under that key with AES-256-GCM. Messages and user headers of a stream are encrypted with that stream's key using AES-256-GCM-SIV. The stored form is a 12-byte random nonce, ciphertext and a 16-byte tag. Client-side payload encryption remains AES-256-GCM.
+
+A client may give a stream its own key at create, as `encryption_key` (32 random bytes, base64 over HTTP). The key travels inside the create request, so protecting it in transit with TLS is the caller's job. Never derive it from a password, because the reported fingerprint would then allow offline guessing. Without a client key, a server with `enabled = true` generates one for the stream.
+
+With `enabled = false` and a valid `key`, client keys are accepted and keyless streams stay plaintext. Without a server `key`, a client key is refused with `StreamEncryptionUnavailable` (4106). The choice is made once at create: a stream created without a key stays plaintext for life, and enabling encryption later affects only new streams.
+
+The server never returns a stream key. Stream reads report `encryption_key_source` (`stream` for a client key, `server` for a generated one, `none` for a plaintext stream), `encryption_key_fingerprint` and `encryption_kek_fingerprint`, the fingerprints of the server keys that wrap it, comma-separated during a rotation. Every SDK has a helper that computes the fingerprint of a key the caller holds.
+
+Boot opens every stored stream key. A standalone node whose `key` and `previous_keys` open none of a stream's wraps refuses to start and names the stream and both sets of fingerprints. A node without a `key` refuses the same way over any encrypted stream, in a cluster too.
+
+A cluster node holding a key may have metadata that trails the cluster until it catches up, so it starts, logs the stream and both sets of fingerprints, and builds that stream's partitions once a wrap it can open has committed. Every node of a cluster must hold the same `[encryption]` section. Losing a server key that still wraps a stream makes that stream unreadable.
+
+Rotating the server key takes two phases, and messages are never re-encrypted:
+
+1. Set `key` to the new key and `previous_keys` to the old one on every node (`IGGY_ENCRYPTION_PREVIOUS_KEYS`). The metadata primary adds a wrap under the new key to every encrypted stream, and a stream created on a phase 1 node is wrapped under both keys. Old wraps stay, so nodes still on the old key keep serving and booting during the rollout, whichever node is primary.
+2. Once every node runs the phase 1 config and every encrypted stream reports the new fingerprint in `encryption_kek_fingerprint`, empty `previous_keys` and set `retired_kek_fingerprints` to the old key's fingerprint (`IGGY_ENCRYPTION_RETIRED_KEK_FINGERPRINTS`). The primary then drops the wraps under it.
+3. Once every encrypted stream has dropped the old fingerprint, clear `retired_kek_fingerprints` on every node.
+
+   A node given only the new key before phase 1 finished serves none of the streams still wrapped only under the old key, and a standalone node refuses to boot. Without the retired fingerprint a node never drops a wrap.
+
+The primary logs each sweep that rewraps streams, each stream it cannot rewrap, and once that every set is settled. `previous_keys` holds at most two keys, and a stream holds at most three wraps. Retire an old fingerprint before adding a fourth key.
+
+A stream created during phase 1 also carries a wrap under the old key until phase 2 drops it. Rotation changes only the wraps, so whoever already holds a stream's data key, or an old wrap together with the old server key, can still read that stream. Changing a stream's own data key is not supported.
+
 ## Upgrade recovery
 
 This release changes protocol and storage formats. Servers and compatible
@@ -314,11 +359,11 @@ Peers verify protocol, release and storage-format identity before admission.
 Executable packaging does not affect that identity, so stripping or rebuilding
 the same compatible release does not by itself prevent a replica from joining.
 
-This checkout uses development protocol 0.11.1. Finalize its version and minimum
-before the next stable release. Released `server-0.9.0` uses protocol 0.11.0 and
-accepts every 0.11.x patch. An incompatible release therefore needs a new minor
-protocol version, such as 0.12.0, for that released server to reject new clients
-before decoding their login.
+This checkout uses protocol 0.12.0, and 0.12.0 is also its minimum. It is a breaking change: released `server-0.9.0` uses protocol 0.11.0 and accepts every 0.11.x patch, so it rejects 0.12.0 clients before decoding their login, and this server rejects 0.11.x clients the same way. The retired update commands and the removed fixed topic fields mean older clients cannot work against it in any case.
+
+REST has no version handshake, so a 0.11 HTTP client is not refused at login. A create body that sends an option beside `options`, such as a top-level `message_expiry`, and an update body with a nested member, such as the `{"name": ..., "options": {}}` stream update older SDKs send, are refused with `InvalidCommand` (3), and the error's `field` names the member.
+
+Metadata snapshot format 13 is both the current and the oldest readable format. A data directory holding an older snapshot is refused, and journals written by older builds hold operations this build no longer knows. Start this release from fresh storage on every replica.
 
 The protocol number is independent of server and SDK package versions. Its
 current and minimum values are maintained manually for stable releases. The
@@ -332,7 +377,7 @@ Replacing the binary does not migrate old data. Use the offline re-ingestion
 procedure above for an upgrade. A recovery from a backup must use a separately
 verified, compatible backup; copying a format marker is not a migration.
 
-Within compatible `IGGY-BOUND-GRANTS-5` storage, this release reads superblock
+Within compatible `IGGY-RESOURCE-OPTIONS-1` storage, this release reads superblock
 envelope versions 1 and 2 and writes version 2. Legacy 66- and 74-byte consensus
 records remain readable. New records atomically retain an adopted view, its
 advertised head and exact prepare headers alongside the existing consensus state.
@@ -405,7 +450,7 @@ Before a partition can serve, initialization publishes its incarnation in
 `partition-initialization/<namespace>/created.revision` under the system data
 directory. This atomic record remains outside the partition directory, including
 after that directory is lost. Preserve it with metadata and partition backups.
-Storage format `IGGY-BOUND-GRANTS-5` requires this initialization contract;
+Storage format `IGGY-RESOURCE-OPTIONS-1` requires this initialization contract;
 older data directories are refused before mutation.
 
 Retirement also writes `retirement.fence` in that external namespace directory

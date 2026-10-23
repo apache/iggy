@@ -18,6 +18,7 @@
 use std::ptr;
 
 use ext_php_rs::{
+    class::RegisteredClass,
     convert::IntoZval,
     error::Error,
     exception::PhpException,
@@ -66,7 +67,6 @@ pub struct PendingOperationException {
     operation_id: String,
     kind: String,
 }
-
 #[php_impl]
 impl PendingOperationException {
     /// Exact unsigned 64-bit operation ID, represented as a decimal string.
@@ -138,17 +138,14 @@ impl IntoPhpException for IggyError {
             };
         }
 
-        match PhpExceptionKind::from(&self) {
-            PhpExceptionKind::Connection => {
-                PhpException::from_class::<ConnectionException>(message)
-            }
-            PhpExceptionKind::Authentication => {
-                PhpException::from_class::<AuthenticationException>(message)
-            }
-            PhpExceptionKind::NotFound => PhpException::from_class::<NotFoundException>(message),
-            PhpExceptionKind::Transient => PhpException::from_class::<TransientException>(message),
-            PhpExceptionKind::Base => PhpException::from_class::<IggyException>(message),
-        }
+        let class = match PhpExceptionKind::from(&self) {
+            PhpExceptionKind::Connection => ConnectionException::get_metadata().ce(),
+            PhpExceptionKind::Authentication => AuthenticationException::get_metadata().ce(),
+            PhpExceptionKind::NotFound => NotFoundException::get_metadata().ce(),
+            PhpExceptionKind::Transient => TransientException::get_metadata().ce(),
+            PhpExceptionKind::Base => IggyException::get_metadata().ce(),
+        };
+        PhpException::new(message, self.as_code() as i32, class)
     }
 }
 
@@ -216,6 +213,7 @@ impl From<&IggyError> for PhpExceptionKind {
             | IggyError::InvalidUsername
             | IggyError::InvalidPassword
             | IggyError::InvalidUserStatus
+            | IggyError::CannotModifyRootUser
             | IggyError::UserInactive
             | IggyError::InvalidPersonalAccessToken
             | IggyError::PersonalAccessTokenExpired(_, _)

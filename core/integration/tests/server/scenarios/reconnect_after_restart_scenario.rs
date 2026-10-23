@@ -41,7 +41,10 @@ fn eager_flush_options() -> TopicCreateOptions {
 pub async fn run_producer(harness: &mut TestHarness) {
     let client = create_client(harness);
     Client::connect(&client).await.expect("Failed to connect");
-    client.create_stream(STREAM_NAME).await.unwrap();
+    client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     client
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
@@ -133,7 +136,7 @@ pub async fn run_consumer(harness: &mut TestHarness) {
         .expect("Failed to create setup client");
 
     setup_client
-        .create_stream(STREAM_NAME)
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
         .await
         .expect("Failed to create stream");
     setup_client
@@ -290,7 +293,10 @@ pub async fn run_single_message_offset_zero_restart(harness: &mut TestHarness) {
         .await
         .expect("Failed to create client");
 
-    client.create_stream(STREAM).await.unwrap();
+    client
+        .create_stream(STREAM, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     client
         .create_topic(
             &Identifier::named(STREAM).unwrap(),
@@ -405,7 +411,10 @@ pub async fn run_consumer_offset_ahead_after_crash(harness: &mut TestHarness) {
         .await
         .expect("Failed to create client");
 
-    let stream = client.create_stream(STREAM).await.unwrap();
+    let stream = client
+        .create_stream(STREAM, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     let stream_id = stream.id;
 
     let topic = client
@@ -541,7 +550,7 @@ pub async fn run_full_cluster_restart(harness: &mut TestHarness) {
         .expect("Failed to create setup client");
 
     setup_client
-        .create_stream(STREAM_NAME)
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
         .await
         .expect("Failed to create stream");
     setup_client
@@ -645,7 +654,7 @@ pub async fn run_ring_overflow_rejoin(harness: &mut TestHarness) {
         .await
         .expect("Failed to create setup client");
     setup_client
-        .create_stream(STREAM_NAME)
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
         .await
         .expect("Failed to create stream");
     setup_client

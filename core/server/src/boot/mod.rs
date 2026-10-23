@@ -87,7 +87,7 @@ use tracing::{error, info, warn};
 
 const STORAGE_FORMAT_FILE: &str = "storage-format";
 const STORAGE_FORMAT_TEMP_FILE: &str = "storage-format.tmp";
-const STORAGE_FORMAT: &[u8] = b"IGGY-BOUND-GRANTS-5\n";
+const STORAGE_FORMAT: &[u8] = b"IGGY-RESOURCE-OPTIONS-1\n";
 
 /// Load the server configuration from the active config provider.
 ///
@@ -740,6 +740,7 @@ async fn shard_main(
         sessions,
         consumer_group_liveness,
         shard_handle,
+        unbuilt,
     } = Box::pin(build_shard_for_thread(
         shard_id,
         total_shards,
@@ -858,6 +859,7 @@ async fn shard_main(
         topology.self_replica_id,
         topology.replica_count,
     ));
+    reconciler_ctx.mark_unbuilt(unbuilt);
     let reconcile_periodic = config.sharding.reconcile_periodic_interval.get_duration();
     let reconciler_handle = compio::runtime::spawn({
         let ctx = Rc::clone(&reconciler_ctx);
@@ -919,6 +921,39 @@ async fn shard_main(
         None
     };
 
+    // Stream key rewrapper: shard 0 only, and only while this node's keys call
+    // for a rotation, since otherwise no stored set can differ from its target.
+    // Retired fingerprints matter only to the rewrapper, so only its context
+    // holds them. Each sweep no-ops unless this node is the caught-up metadata
+    // primary, so a rotation is replicated once to every replica.
+    let rewrap_context = if shard_id == 0 {
+        Some(
+            (*shard.plane.partitions().key_context())
+                .clone()
+                .with_retired_kek_fingerprints(&config.encryption.retired_kek_fingerprints)
+                .map_err(|error| ServerError::Iggy(Box::new(error)))?,
+        )
+    } else {
+        None
+    };
+    let stream_key_rewrapper_stop = match rewrap_context {
+        Some(rewrap_context) if rewrap_context.rotating() => {
+            let (rewrapper_stop_tx, rewrapper_stop_rx) = channel(1);
+            let rewrapper_shard = Rc::clone(&shard);
+            let rewrapper_handle = compio::runtime::spawn(async move {
+                crate::stream_key_rewrapper::run_stream_key_rewrapper(
+                    rewrapper_shard,
+                    rewrap_context,
+                    rewrapper_stop_rx,
+                )
+                .await;
+            });
+            bus.track_background(rewrapper_handle);
+            Some(rewrapper_stop_tx)
+        }
+        _ => None,
+    };
+
     // Segment cleaner: runs on every shard (each replica trims its own log,
     // primary and backup alike). Local and unreplicated; gated by the shared
     // data-maintenance config.
@@ -939,6 +974,7 @@ async fn shard_main(
         reconciler: reconcile_stop_tx,
         heartbeat: heartbeat_stop_tx,
         pat_cleaner: pat_cleaner_stop,
+        stream_key_rewrapper: stream_key_rewrapper_stop,
         segment_cleaner: segment_cleaner_stop,
         sysinfo_printer: None,
         consumer_group_liveness: None,
@@ -1251,6 +1287,7 @@ mod tests {
             b"IGGY-BOUND-GRANTS-2\n",
             b"IGGY-BOUND-GRANTS-3\n",
             b"IGGY-BOUND-GRANTS-4\n",
+            b"IGGY-BOUND-GRANTS-5\n",
             b"IGGY-DURABLE-SESSIONS-3\n",
             &STORAGE_FORMAT[..STORAGE_FORMAT.len() - 1],
         ] {
@@ -1281,7 +1318,11 @@ mod tests {
 
     #[test]
     fn given_different_storage_formats_when_identifying_replicas_should_reject_mixing() {
-        for older_format in [b"IGGY-BOUND-GRANTS-3\n", b"IGGY-BOUND-GRANTS-4\n"] {
+        for older_format in [
+            b"IGGY-BOUND-GRANTS-3\n".as_slice(),
+            b"IGGY-BOUND-GRANTS-4\n",
+            b"IGGY-BOUND-GRANTS-5\n",
+        ] {
             assert_ne!(
                 message_bus::replica::handshake::binary_identity(crate::VERSION, STORAGE_FORMAT),
                 message_bus::replica::handshake::binary_identity(crate::VERSION, older_format),

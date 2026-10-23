@@ -58,7 +58,7 @@ use iggy_binary_protocol::{
 #[cfg(feature = "simulator")]
 use iggy_common::PartitionStats;
 use iggy_common::variadic;
-use iggy_common::{ConsumerKind, IggyError, IggyExpiry, IggyTimestamp};
+use iggy_common::{ConsumerKind, EncryptorKind, IggyError, IggyExpiry, IggyTimestamp};
 use journal::superblock::{PingPongSuperblock, SuperblockStore};
 use journal::{Journal, JournalHandle};
 use message_bus::client_listener::RequestHandler;
@@ -84,7 +84,6 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::rc::Rc;
-#[cfg(feature = "simulator")]
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -486,6 +485,8 @@ pub enum PartitionReadReply {
         context: iggy_binary_protocol::primitives::partition_history::PartitionContext,
         fragments: PollFragments,
         current_offset: u64,
+        /// The owning partition's encryptor, captured with the fragments.
+        encryptor: Option<Arc<EncryptorKind>>,
     },
     ConsumerOffset {
         stored: Option<u64>,
@@ -1941,6 +1942,8 @@ where
                 count: senders.len(),
             })?;
         let nonce_seed = boot_nonce(metadata.consensus.as_ref());
+        // Metadata admits a stream's wrap set with the keys its partitions open.
+        let metadata = metadata.with_stream_key_context(partitions.key_context());
         let plane = MuxPlane::new(variadic!(metadata, partitions));
         let ShardIdentity { id, name } = identity;
         let poll_completions =
@@ -2545,6 +2548,8 @@ where
         let (_reply_tx, reply_inbox) = channel(1);
         let metrics = crate::metrics::ShardMetrics::for_shard();
         let nonce_seed = boot_nonce(metadata.consensus.as_ref());
+        // Metadata admits a stream's wrap set with the keys its partitions open.
+        let metadata = metadata.with_stream_key_context(partitions.key_context());
         let plane = MuxPlane::new(variadic!(metadata, partitions));
         let ShardIdentity { id, name } = identity;
         let host: Rc<dyn ShardHost> = Rc::new(NoopHost);
@@ -15408,7 +15413,7 @@ mod partition_placement_tests {
                 validate_checksum: true,
                 segment_size,
                 preallocate_segments: false,
-                encryptor: None,
+                key_context: Arc::default(),
                 path_layout: PartitionPathLayout::default(),
             },
         );

@@ -54,7 +54,7 @@ use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::requests::streams::*;
 use iggy_binary_protocol::requests::system::*;
 use iggy_binary_protocol::requests::topics::{
-    CreateTopicRequest, DeleteTopicRequest, GetTopicRequest, GetTopicsRequest, UpdateTopicRequest,
+    CreateTopicRequest, DeleteTopicRequest, GetTopicRequest, GetTopicsRequest,
 };
 use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::requests::users::*;
@@ -92,12 +92,14 @@ use iggy_binary_protocol::{
 };
 use iggy_common::{
     CompressionAlgorithm, Durability, IggyByteSize, IggyDuration, IggyError, IggyExpiry,
-    MaxTopicSize, NO_ASSIGNED_PARTITION, RESYNC_REQUIRED_PARTITION_SENTINEL, TopicCreateOptions,
-    TopicUpdateOptions,
+    MaxTopicSize, NO_ASSIGNED_PARTITION, OptionKey, OptionsPatch,
+    RESYNC_REQUIRED_PARTITION_SENTINEL, StreamCreateOptions, StreamEncryptionKey,
+    StreamUpdateOptions, TopicCreateOptions, TopicUpdateOptions, UserStatus, UserUpdateOptions,
+    stream_key_fingerprint,
 };
 use secrecy::SecretString;
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use twox_hash::{XxHash3_64, XxHash32};
 
 /// Hash and error tables are maps keyed by length and code, so each entry is
@@ -149,11 +151,50 @@ fn sample_options() -> WireOptions {
     ])
 }
 
+/// The cross-SDK block `core/binary_protocol/src/primitives/options.rs` pins by
+/// hand, in its insertion order rather than key order.
+fn golden_options_block() -> WireOptions {
+    options(&[
+        (2, b"preallocate_segments", 3, &[1]),
+        (2, b"segment_size", 12, &1_073_741_824u64.to_le_bytes()),
+        (2, b"durability", 2, b"persisted"),
+    ])
+}
+
+/// Key bytes 0 to 31, the key of the shared fingerprint vector.
+fn sample_key() -> [u8; 32] {
+    std::array::from_fn(|index| index as u8)
+}
+
+/// The read-only projections of a stream whose key the client chose, wrapped
+/// under two KEKs during a rotation.
+fn stream_projections() -> WireOptions {
+    let fingerprint = stream_key_fingerprint(&sample_key()).expect("32-byte key");
+    options(&[
+        (
+            2,
+            b"encryption_kek_fingerprint",
+            2,
+            b"39e4f0f95c3693c7,d55d479829bc2936",
+        ),
+        (2, b"encryption_key_fingerprint", 2, fingerprint.as_bytes()),
+        (2, b"encryption_key_source", 2, b"stream"),
+    ])
+}
+
+fn update_resource(target: ResourceTarget, patch: OptionsPatch) -> UpdateResourceRequest {
+    UpdateResourceRequest {
+        target,
+        reset: patch.reset,
+        options: patch.set,
+    }
+}
+
 fn version_info() -> ClientVersionInfo {
     ClientVersionInfo {
         protocol_version: IGGY_PROTOCOL_VERSION,
         sdk_name: name("swift-sdk"),
-        sdk_version: name("0.1.0"),
+        sdk_version: name("0.1.1"),
     }
 }
 
@@ -259,14 +300,18 @@ fn topic_header(id: u32, name_value: &str) -> TopicHeader {
         id,
         created_at: 1_710_000_000_000_000,
         partitions_count: 3,
-        message_expiry: 604_800_000_000,
-        compression_algorithm: 1,
-        max_topic_size: 1_073_741_824,
         size_bytes: 4096,
         messages_count: 100,
         name: name(name_value),
-        options: sample_options(),
-        derived_options: options(&[(2, b"max_topic_size", 12, &u64::MAX.to_le_bytes())]),
+        options: options(&[
+            (2, b"durability", 2, b"persisted"),
+            (2, b"message_expiry", 12, &604_800_000_000u64.to_le_bytes()),
+            (2, b"segment_size", 12, &1_073_741_824u64.to_le_bytes()),
+        ]),
+        derived_options: options(&[
+            (2, b"compression_algorithm", 2, b"none"),
+            (2, b"max_topic_size", 12, &u64::MAX.to_le_bytes()),
+        ]),
     }
 }
 
@@ -279,6 +324,7 @@ fn stream_response(id: u32, topics_count: u32) -> StreamResponse {
         messages_count: 200,
         name: name("my-stream"),
         options: WireOptions::empty(),
+        derived_options: stream_projections(),
     }
 }
 
@@ -294,8 +340,10 @@ fn request_header(
     session: u64,
     payload: &[u8],
 ) -> RequestHeader {
-    RequestHeader::for_request(code, client, request, session, payload)
-        .expect("fixture payloads fit a request frame")
+    let mut header = RequestHeader::for_request(code, client, request, session, payload)
+        .expect("fixture payloads fit a request frame");
+    header.request_checksum = 0;
+    header
 }
 
 fn main() {
@@ -378,6 +426,11 @@ fn main() {
     add(&mut vectors, "polling.last", &WirePollingStrategy::last());
     add(&mut vectors, "polling.next", &WirePollingStrategy::next());
     add(&mut vectors, "options.golden", &sample_options());
+    add(
+        &mut vectors,
+        "options.golden_block",
+        &golden_options_block(),
+    );
     add(&mut vectors, "permissions.sample", &sample_permissions());
     add(&mut vectors, "version_info", &version_info());
 
@@ -398,6 +451,21 @@ fn main() {
             options: sample_options(),
         },
     );
+    let key_options = StreamCreateOptions {
+        encryption_key: Some(StreamEncryptionKey::try_from(sample_key().as_slice()).expect("key")),
+        raw: BTreeMap::new(),
+    }
+    .to_wire()
+    .expect("encodes");
+    add(&mut vectors, "options.stream_create.key", &key_options);
+    add(
+        &mut vectors,
+        "request.create_stream.key",
+        &CreateStreamRequest {
+            name: name("test-stream"),
+            options: key_options,
+        },
+    );
     add(
         &mut vectors,
         "request.delete_stream",
@@ -415,12 +483,18 @@ fn main() {
     add(&mut vectors, "request.get_streams", &GetStreamsRequest);
     add(
         &mut vectors,
-        "request.update_stream",
-        &UpdateStreamRequest {
-            stream_id: named("old-name"),
-            name: name("new-name"),
-            options: WireOptions::empty(),
-        },
+        "request.update_resource.stream",
+        &update_resource(
+            ResourceTarget::Stream {
+                stream_id: named("old-name"),
+            },
+            StreamUpdateOptions {
+                name: Some("new-name".to_owned()),
+                ..Default::default()
+            }
+            .to_patch()
+            .expect("encodes"),
+        ),
     );
     add(
         &mut vectors,
@@ -455,15 +529,38 @@ fn main() {
             stream_id: numeric(42),
         },
     );
-    add(
-        &mut vectors,
-        "request.update_topic",
-        &UpdateTopicRequest {
+    let topic_update = update_resource(
+        ResourceTarget::Topic {
             stream_id: numeric(1),
             topic_id: numeric(2),
-            name: name("updated-topic"),
-            options: options(&[(2, b"message_expiry", 12, &604_800_000_000u64.to_le_bytes())]),
         },
+        TopicUpdateOptions {
+            name: Some("updated-topic".to_owned()),
+            message_expiry: Some(IggyExpiry::ExpireDuration(IggyDuration::new_from_secs(
+                604_800,
+            ))),
+            reset: BTreeSet::from([OptionKey::MaxTopicSize]),
+            ..Default::default()
+        }
+        .to_patch()
+        .expect("encodes"),
+    );
+    add(&mut vectors, "request.update_resource.topic", &topic_update);
+    add(
+        &mut vectors,
+        "request.update_resource.topic.reset_only",
+        &update_resource(
+            ResourceTarget::Topic {
+                stream_id: named("stream"),
+                topic_id: named("topic"),
+            },
+            TopicUpdateOptions {
+                reset: BTreeSet::from([OptionKey::MaxTopicSize, OptionKey::MessageExpiry]),
+                ..Default::default()
+            }
+            .to_patch()
+            .expect("encodes"),
+        ),
     );
     add(
         &mut vectors,
@@ -674,23 +771,34 @@ fn main() {
     add(&mut vectors, "request.get_users", &GetUsersRequest);
     add(
         &mut vectors,
-        "request.update_user",
-        &UpdateUserRequest {
-            user_id: numeric(1),
-            username: Some(name("new-name")),
-            status: Some(2),
-            options: WireOptions::empty(),
-        },
+        "request.update_resource.user",
+        &update_resource(
+            ResourceTarget::User {
+                user_id: numeric(1),
+            },
+            UserUpdateOptions {
+                username: Some("new-name".to_owned()),
+                status: Some(UserStatus::Inactive),
+                ..Default::default()
+            }
+            .to_patch()
+            .expect("encodes"),
+        ),
     );
     add(
         &mut vectors,
-        "request.update_user.none",
-        &UpdateUserRequest {
-            user_id: numeric(5),
-            username: None,
-            status: None,
-            options: WireOptions::empty(),
-        },
+        "request.update_resource.user.status",
+        &update_resource(
+            ResourceTarget::User {
+                user_id: named("admin"),
+            },
+            UserUpdateOptions {
+                status: Some(UserStatus::Active),
+                ..Default::default()
+            }
+            .to_patch()
+            .expect("encodes"),
+        ),
     );
     add(
         &mut vectors,
@@ -936,6 +1044,22 @@ fn main() {
         ))),
     );
 
+    let update_resource_payload = topic_update.to_bytes();
+    vectors.insert(
+        "payload.update_resource".to_owned(),
+        hex(&update_resource_payload),
+    );
+    vectors.insert(
+        "vsr.request.update_resource".to_owned(),
+        hex(bytemuck::bytes_of(&request_header(
+            UPDATE_RESOURCE_CODE,
+            client_id,
+            1,
+            99,
+            &update_resource_payload,
+        ))),
+    );
+
     let reply = ReplyHeader {
         command: Command::Reply,
         operation: Operation::CreateStream,
@@ -952,6 +1076,15 @@ fn main() {
     vectors.insert(
         "vsr.reply.committed".to_owned(),
         hex(bytemuck::bytes_of(&committed)),
+    );
+    // The primary commits an `UpdateResource` under its scope's resolved
+    // operation, so the reply names that operation, not the request's.
+    let mut resolved = committed;
+    resolved.operation = Operation::UpdateTopicResolved;
+    resolved.size = (HEADER_SIZE + 4) as u32;
+    vectors.insert(
+        "vsr.reply.update_topic_resolved".to_owned(),
+        hex(bytemuck::bytes_of(&resolved)),
     );
     let denied = ReplyHeader {
         command: Command::Reply,
@@ -1188,6 +1321,7 @@ fn main() {
         status: 1,
         username: name("admin"),
         options: WireOptions::empty(),
+        derived_options: WireOptions::empty(),
     };
     add(&mut vectors, "response.user", &user);
     add(
@@ -1218,6 +1352,7 @@ fn main() {
                     status: 2,
                     username: name("alice"),
                     options: WireOptions::empty(),
+                    derived_options: WireOptions::empty(),
                 },
             ],
         },
@@ -1342,13 +1477,29 @@ fn main() {
                 OptionDescriptor {
                     key: name("segment_size"),
                     kind: 12,
+                    flags: 0,
                     default_value: Bytes::copy_from_slice(&1_073_741_824u64.to_le_bytes()),
                     description: "Segment size".to_owned(),
                 },
                 OptionDescriptor {
                     key: name("durability"),
                     kind: 2,
+                    flags: 0,
                     default_value: Bytes::from_static(b"replicated"),
+                    description: String::new(),
+                },
+                OptionDescriptor {
+                    key: name("message_expiry"),
+                    kind: 12,
+                    flags: 0b11,
+                    default_value: Bytes::copy_from_slice(&u64::MAX.to_le_bytes()),
+                    description: String::new(),
+                },
+                OptionDescriptor {
+                    key: name("encryption_key"),
+                    kind: 1,
+                    flags: 0b1_0100,
+                    default_value: Bytes::new(),
                     description: String::new(),
                 },
             ],
@@ -1451,15 +1602,14 @@ fn main() {
         &create_options.to_wire().expect("encodes"),
     );
     let update_options = TopicUpdateOptions {
-        compression_algorithm: Some(CompressionAlgorithm::None),
         message_expiry: Some(IggyExpiry::NeverExpire),
         max_topic_size: Some(MaxTopicSize::Unlimited),
-        raw: BTreeMap::new(),
+        ..Default::default()
     };
     add(
         &mut vectors,
         "options.topic_update.full",
-        &update_options.to_wire().expect("encodes"),
+        &update_options.to_patch().expect("encodes").set,
     );
     let mut raw = BTreeMap::new();
     raw.insert("durability".to_owned(), "persisted".to_owned());
@@ -1471,6 +1621,11 @@ fn main() {
         &mut vectors,
         "options.topic_create.raw",
         &raw_options.to_wire().expect("encodes"),
+    );
+
+    vectors.insert(
+        "stream_key.fingerprint".to_owned(),
+        stream_key_fingerprint(&sample_key()).expect("32-byte key"),
     );
 
     let golden = Golden {

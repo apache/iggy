@@ -496,6 +496,25 @@ pub enum IggyError {
     /// open fails instead. Field order: `(on_disk, expected)`.
     #[error("Segment file size on disk: {0} does not match expected size: {1}")]
     SegmentSizeMismatchAtOpen(u64, u64) = 4102,
+    /// A create-only option key in an update's set or reset list.
+    #[error("Option cannot be updated after creation: {0}")]
+    OptionNotUpdatable(String) = 4103,
+    /// A reset of a key without a default, or of a fixed resource column.
+    #[error("Option cannot be reset: {0}")]
+    OptionNotResettable(String) = 4104,
+    /// A client sent a server-maintained or read-only option key.
+    #[error("Option is read-only: {0}")]
+    ReadOnlyOption(String) = 4105,
+    /// A stream brought its own encryption key but the server has no
+    /// encryption key configured to wrap it with.
+    #[error("Stream encryption key requires a server encryption key")]
+    StreamEncryptionUnavailable = 4106,
+    /// A resource holds a critical option this build does not understand, so
+    /// serving it could ignore a security setting.
+    #[error("Unsupported critical option: {0}")]
+    UnsupportedCriticalOption(String) = 4107,
+    #[error("Cannot modify root user")]
+    CannotModifyRootUser = 4108,
     #[error("Consumer group with ID: {0} for topic with ID: {1} was not found.")]
     ConsumerGroupIdNotFound(Identifier, Identifier) = 5000,
     #[error("Invalid consumer group ID")]

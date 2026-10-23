@@ -17,8 +17,9 @@
 
 [package]
 name = "iggy-cpp"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
+license = "Apache-2.0"
 
 [package.metadata.cargo-machete]
 ignored = ["cxx-build"]
@@ -32,6 +33,8 @@ cxx = "1.0.205"
 iggy = { path = "../../core/sdk" }
 iggy_binary_protocol = { path = "../../core/binary_protocol" }
 iggy_common = { path = "../../core/common" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
 # Explicitly enable the runtime + I/O drivers required by `Runtime::enable_all()` in lib.rs.
 # Listing the features here insulates this crate from upstream SDK feature changes.
 tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }

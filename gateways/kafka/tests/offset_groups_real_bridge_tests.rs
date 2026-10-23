@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use iggy::prelude::{
     Consumer, ConsumerGroupClient, ConsumerOffsetClient, Identifier, Permissions, StreamClient,
-    StreamPermissions, TopicClient, UserClient, UserStatus,
+    StreamPermissions, TopicClient, UserClient, UserCreateOptions, UserStatus,
 };
 use secrecy::SecretString;
 use serial_test::serial;
@@ -1338,6 +1338,7 @@ async fn given_an_override_topic_the_bridge_user_may_not_read_delete_should_refu
             )])),
             ..Permissions::default()
         }),
+        &UserCreateOptions::default(),
     )
     .await
     .expect("create a bridge user that may read only the stream kafka");

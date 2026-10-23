@@ -346,12 +346,7 @@ internal sealed class VsrConnection : IDisposable
                         continue;
                     }
                     var operation = VsrHeader.ReadReplyOperation(header);
-                    var expected = VsrOperations.ForCode(request.Code);
-                    var alias = (expected, operation) is
-                        (VsrOperation.CreateTopic, VsrOperation.CreateTopicWithAssignments)
-                        or (VsrOperation.CreatePartitions, VsrOperation.CreatePartitionsWithAssignments)
-                        or (VsrOperation.DeleteSegments, VsrOperation.TruncatePartition);
-                    if (operation != expected && !alias)
+                    if (operation.RequestOperation() != VsrOperations.ForCode(request.Code))
                     {
                         throw VsrError.Exception(VsrError.INVALID_COMMAND, "Reply operation does not match its request.");
                     }

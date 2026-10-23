@@ -36,6 +36,7 @@ export class ConsensusSession {
   private registerConsumed: boolean;
   private sessionRequestStart = 1n;
   readonly bindSecret: Buffer;
+  readonly registerRequestIdentifier: Buffer;
 
   constructor(clientId?: bigint) {
     this._clientId = clientId ?? generateClientId();
@@ -43,6 +44,7 @@ export class ConsensusSession {
     this.requestCounter = 1n;
     this.registerConsumed = false;
     this.bindSecret = randomBytes(BIND_SECRET_BYTES);
+    this.registerRequestIdentifier = nonzeroIdentifier();
   }
 
   reset(): void {
@@ -51,6 +53,7 @@ export class ConsensusSession {
     this.registerConsumed = false;
     this.sessionRequestStart = this.requestCounter;
     randomBytes(BIND_SECRET_BYTES).copy(this.bindSecret);
+    nonzeroIdentifier().copy(this.registerRequestIdentifier);
   }
 
   get clientId(): bigint {
@@ -103,6 +106,14 @@ export class ConsensusSession {
     this.requestCounter += 1n;
     return id;
   }
+}
+
+function nonzeroIdentifier(): Buffer {
+  let identifier: Buffer;
+  do {
+    identifier = randomBytes(16);
+  } while (identifier.every(byte => byte === 0));
+  return identifier;
 }
 
 /** Keep the top bit clear so generated IDs cannot enter the server-only range. */
