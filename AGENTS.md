@@ -161,6 +161,7 @@ in Codex.
 - [connector-review](.claude/skills/connector-review/SKILL.md) - adversarial connectors PR/branch review with validation
 - [team-review](.claude/skills/team-review/SKILL.md) - adversarial 4-expert PR/branch review, ~10 subagents per run
 - [team-review-slim](.claude/skills/team-review-slim/SKILL.md) - four-expert review without independent validation rounds
+- [fix-review-comments](.claude/skills/fix-review-comments/SKILL.md) - walk through a PR's review comments one at a time, fixes run in background agents
 
 Review skills share [execution instructions](.claude/skills/team-review/references/execution.md)
 for target preparation and client-specific agent tools. Run
