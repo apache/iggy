@@ -37,7 +37,16 @@ extension IggyClient {
     public func sendMessages(
         streamID: Identifier, topicID: Identifier, partitioning: Partitioning = .balanced, messages: inout [IggyMessage]
     ) async throws -> SendMessagesResponse {
-        let lineage = try await requireAuthenticated()
+        try await sendMessages(streamID: streamID, topicID: topicID, partitioning: partitioning, messages: &messages, lineage: nil)
+    }
+
+    /// ``sendMessages(streamID:topicID:partitioning:messages:)`` for a send
+    /// pinned to `captured`, so a retry after the caller signed in or out is
+    /// never written under the new session.
+    func sendMessages(
+        streamID: Identifier, topicID: Identifier, partitioning: Partitioning = .balanced, messages: inout [IggyMessage], lineage captured: UInt64?
+    ) async throws -> SendMessagesResponse {
+        let lineage = try await requireAuthenticated(under: captured)
         // Checked before a balanced or keyed send reads the topic.
         guard !messages.isEmpty else {
             throw IggyError(.invalidMessagesCount, context: "a batch needs at least one message")

@@ -134,6 +134,27 @@ class RuntimeBuildSelection(unittest.TestCase):
         git = self.root / "git"
         git.write_text(f"#!/bin/sh\ncase $1 in\n  rev-parse) echo {self.revision} ;;\n  cat-file) echo 'parent fixture' ;;\n  *) exit 1 ;;\nesac\n")
         git.chmod(0o755)
+        self.runtime_files = {
+            "iggy-connectors": ("bin", "target/debug/iggy-connectors"),
+            "iggy_connector_stdout_sink": ("cdylib", "target/debug/libiggy_connector_stdout_sink.so"),
+            "iggy-bench-dashboard-server": ("bin", "target/debug/iggy-bench-dashboard-server"),
+        }
+        packages = []
+        artifacts = []
+        for package, (kind, filename) in self.runtime_files.items():
+            package_id = f"path+file://{self.root}/{package}#0.1.0"
+            packages.append({"name": package, "id": package_id})
+            binary = self.root / filename
+            binary.parent.mkdir(parents=True, exist_ok=True)
+            binary.write_text(package)
+            artifacts.append({
+                "reason": "compiler-artifact", "package_id": package_id,
+                "target": {"name": binary.stem, "kind": [kind], "crate_types": [kind]},
+                "executable": str(binary) if kind == "bin" else None,
+                "filenames": [str(binary)],
+            })
+        (self.root / "metadata.json").write_text(json.dumps({"packages": packages}))
+        (self.root / "build.jsonl").write_text("\n".join(json.dumps(artifact) for artifact in artifacts))
         cargo = self.root / "cargo"
         cargo.write_text("""#!/usr/bin/env python3
 import json
@@ -144,6 +165,9 @@ with (Path(os.environ['RUNNER_TEMP']) / 'cargo-calls').open('a') as calls:
     calls.write(json.dumps(sys.argv[1:]) + '\\n')
 if sys.argv[1:3] == ['nextest', 'archive']:
     Path(sys.argv[sys.argv.index('--archive-file') + 1]).touch()
+elif sys.argv[1] in ('build', 'metadata'):
+    output = 'build.jsonl' if sys.argv[1] == 'build' else 'metadata.json'
+    print((Path(os.environ['RUNNER_TEMP']) / output).read_text())
 """)
         cargo.chmod(0o755)
         generator = self.root / "gateways/kafka/scripts/ci-wire-fixtures.sh"
@@ -161,9 +185,15 @@ if sys.argv[1:3] == ['nextest', 'archive']:
         self.assertEqual(calls[0], ["build", "--locked", "--workspace", "--exclude", "server",
                                    "--exclude", "iggy-cli", "--message-format=json-render-diagnostics"])
         self.assertEqual(calls[1], ["nextest", "archive", "--locked", "--profile", "ci",
+                                   "--workspace",
                                    "--archive-file", str(artifact / "nextest.tar.zst")])
-        self.assertTrue((artifact / "runtime.tar.zst").is_file())
+        self.assert_runtime_archive([filename for _, filename in self.runtime_files.values()])
         self.assertEqual((artifact / "kafka-fixtures").read_text(), "true\n")
+
+    def assert_runtime_archive(self, files):
+        result = run("tar", "--zstd", "-tf", str(self.root / "rust-test-build/runtime.tar.zst"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(sorted(result.stdout.splitlines()), sorted(files))
 
     def test_planner_failure_builds_all_test_extras_and_tests(self):
         self.assert_workspace_fallback()
@@ -172,13 +202,65 @@ if sys.argv[1:3] == ['nextest', 'archive']:
         self.env["TEST_SELECTION"] = "workspace"
         self.assert_workspace_fallback()
 
+    def select(self, packages, *, tests=(), runtime_packages=()):
+        outputs = {
+            "cargo-scope:cargo.test": "packages\n" if packages else "skipped\n",
+            "cargo-scope:runtime-artifacts": "packages\n" if runtime_packages else "skipped\n",
+            "package-names:cargo.test": "".join(package + "\0" for package in packages),
+            "package-names:runtime-artifacts": "".join(package + "\0" for package in runtime_packages),
+            "target-args:cargo.test": "".join("--test\0" + test + "\0" for test in tests),
+        }
+        selector = self.root / "cargo-rail-action"
+        selector.write_text("#!/usr/bin/env python3\nimport sys\n"
+                            f"outputs = {outputs!r}\n"
+                            "sys.stdout.write(outputs[f'{sys.argv[2]}:{sys.argv[4]}'])\n")
+        selector.chmod(0o755)
+        self.env["PLAN_STATUS"] = "success"
+        result = run("bash", "-euo", "pipefail", "-c", self.script, cwd=self.root, env=self.env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.root / "cargo-calls"
+        return [json.loads(line) for line in calls.read_text().splitlines()] if calls.exists() else []
+
+    def test_affected_packages_keep_workspace_builds_and_filter_only_the_archive(self):
+        calls = self.select(["integration", "iggy"],
+                            runtime_packages=["iggy-connectors", "iggy_connector_stdout_sink"])
+        self.assertEqual(calls[0], ["build", "--locked", "--workspace", "--exclude", "server",
+                                   "--exclude", "iggy-cli", "--message-format=json-render-diagnostics"])
+        self.assertEqual(calls[-1], ["nextest", "archive", "--locked", "--profile", "ci",
+                                   "--workspace", "-E", "package(=integration) | package(=iggy)",
+                                   "--archive-file", str(self.root / "rust-test-build/nextest.tar.zst")])
+        self.assert_runtime_archive(["target/debug/iggy-connectors",
+                                     "target/debug/libiggy_connector_stdout_sink.so"])
+        self.assertEqual((self.root / "rust-test-build/scope").read_text(), "packages\n")
+        self.assertEqual((self.root / "rust-test-build/kafka-fixtures").read_text(), "false\n")
+
+    def test_selected_integration_targets_filter_by_package_kind_and_name(self):
+        calls = self.select(["integration", "iggy"], tests=["round_trip", "protocol"])
+        self.assertEqual(len(calls), 1)
+        self.assertIn("--workspace", calls[0])
+        self.assertNotIn("--test", calls[0])
+        self.assertEqual(calls[0][calls[0].index("-E") + 1],
+                         "(package(=integration) | package(=iggy)) & kind(test) & "
+                         "(binary(=round_trip) | binary(=protocol))")
+
+    def test_server_and_cli_prerequisites_use_the_shared_runtime(self):
+        calls = self.select(["iggy-gateway-kafka"], runtime_packages=["server", "iggy-cli"])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][:2], ["nextest", "archive"])
+        self.assert_runtime_archive([])
+        self.assertEqual((self.root / "rust-test-build/kafka-fixtures").read_text(), "true\n")
+
+    def test_skipped_scope_does_not_compile_or_archive(self):
+        self.assertEqual(self.select([]), [])
+        self.assertEqual((self.root / "rust-test-build/scope").read_text(), "skipped\n")
+        self.assertFalse((self.root / "rust-test-build/nextest.tar.zst").exists())
+
     def test_selector_failure_discards_partial_package_selection(self):
         selector = self.root / "cargo-rail-action"
         selector.write_text("""#!/usr/bin/env bash
 case "$2:$4" in
   cargo-scope:*) printf 'packages\\n' ;;
-  cargo-args:*) printf '%s\\0' '-p' 'selected-test-package' ;;
-  target-args:*) printf '%s\\0' '--lib' ;;
+  target-args:*) printf '%s\\0' '--test' 'selected-test' ;;
   package-names:cargo.test) printf '%s\\0' 'selected-test-package' ;;
   *) exit 1 ;;
 esac
@@ -208,6 +290,11 @@ class RuntimeSelection(unittest.TestCase):
         self.assertIn(("ci-workflows", "validate"),
                       [(entry["component"], entry["task"])
                        for entry in json.loads(outputs["other_matrix"])["include"]])
+
+    def test_nextest_config_change_runs_miri(self):
+        outputs = self.select([".config/nextest.toml"])
+        plan = json.loads(outputs["rust_plan"])
+        self.assertIn("miri", [entry["task"] for entry in plan["checks"]])
 
     def test_runtime_restore_change_exercises_real_consumers(self):
         outputs = self.select(["scripts/ci/restore-runtime.sh"])
