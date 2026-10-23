@@ -15,24 +15,26 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use rumqttc::tokio_rustls::rustls;
-use rumqttc::tokio_rustls::rustls::{
+use rumqttc_v4::tokio_rustls::rustls;
+use rumqttc_v4::tokio_rustls::rustls::{
     ClientConfig, RootCertStore,
     pki_types::{CertificateDer, PrivateKeyDer},
 };
-use rumqttc::v5::{
+use rumqttc_v4::{
+    AsyncClient as Mqtt311Client, ConnectionError as Mqtt311ConnectionError, Event as Mqtt311Event,
+    EventLoop as Mqtt311EventLoop, Incoming as Mqtt311Incoming, MqttOptions as Mqtt311Options,
+    Outgoing as Mqtt311Outgoing, PublishOptions as Mqtt311PublishOptions,
+    TlsConfiguration as Mqtt311TlsConfiguration, Transport as Mqtt311Transport,
+};
+use rumqttc_v5::{
     AsyncClient as Mqtt5Client, ConnectionError as Mqtt5ConnectionError, Event as Mqtt5Event,
     EventLoop as Mqtt5EventLoop, Incoming as Mqtt5Incoming, MqttOptions as Mqtt5Options,
+    Outgoing as Mqtt5Outgoing, PublishOptions as Mqtt5PublishOptions,
     StateError as Mqtt5StateError,
     mqttbytes::v5::{
         ConnectReturnCode as Mqtt5ConnectReturnCode, DisconnectReasonCode, PubAckReason,
         PubCompReason, PubRecReason,
     },
-};
-use rumqttc::{
-    AsyncClient as Mqtt311Client, ConnectionError as Mqtt311ConnectionError, Event as Mqtt311Event,
-    EventLoop as Mqtt311EventLoop, Incoming as Mqtt311Incoming, MqttOptions as Mqtt311Options,
-    Outgoing, TlsConfiguration, Transport,
 };
 use rustls_native_certs::load_native_certs;
 use rustls_pemfile::{certs, private_key};
@@ -55,6 +57,11 @@ use tokio::{
 };
 
 use crate::{MqttSinkConfig, routing::PreparedPublication};
+
+mod rumqttc {
+    pub use rumqttc_v4::*;
+    pub use rumqttc_v5 as v5;
+}
 
 /// MQTT protocol selection is kept in the plugin because rumqttc exposes
 /// separate client/event-loop types for MQTT 3.1.1 and MQTT 5.
@@ -390,6 +397,11 @@ impl MqttDriver {
                 "max_in_flight must fit into an MQTT packet identifier window".to_string(),
             )
         })?;
+        let keep_alive = u16::try_from(keep_alive.as_secs()).map_err(|_| {
+            iggy_connector_sdk::Error::InvalidConfigValue(
+                "keep_alive must be at most 65535s".to_string(),
+            )
+        })?;
         let max_packet_size = config
             .max_packet_size
             .unwrap_or(crate::DEFAULT_MAX_PACKET_SIZE);
@@ -411,12 +423,16 @@ impl MqttDriver {
                 if let (Some(username), Some(password)) =
                     (config.username.as_deref(), config.password.as_ref())
                 {
-                    options.set_credentials(username, password.expose_secret());
+                    options.set_credentials(username, password.expose_secret().to_string());
                 }
-                if let Some(transport) = tls_transport(config)? {
+                if let Some(transport) = tls_transport_v4(config)? {
                     options.set_transport(transport);
                 }
-                let (client, mut event_loop) = Mqtt311Client::new(options, request_capacity);
+                let (client, mut event_loop) = Mqtt311Client::builder(options)
+                    .try_build()
+                    .map_err(|error| {
+                        iggy_connector_sdk::Error::InvalidConfigValue(error.to_string())
+                    })?;
                 wait_for_connack(&mut event_loop, id, connect_timeout).await?;
                 (
                     MqttConnection::Mqtt311 {
@@ -446,12 +462,15 @@ impl MqttDriver {
                 if let (Some(username), Some(password)) =
                     (config.username.as_deref(), config.password.as_ref())
                 {
-                    options.set_credentials(username, password.expose_secret());
+                    options.set_credentials(username, password.expose_secret().to_string());
                 }
-                if let Some(transport) = tls_transport(config)? {
+                if let Some(transport) = tls_transport_v5(config)? {
                     options.set_transport(transport);
                 }
-                let (client, mut event_loop) = Mqtt5Client::new(options, request_capacity);
+                let (client, mut event_loop) =
+                    Mqtt5Client::builder(options).try_build().map_err(|error| {
+                        iggy_connector_sdk::Error::InvalidConfigValue(error.to_string())
+                    })?;
                 let broker_max_packet_size = wait_for_connack_v5(
                     &mut event_loop,
                     id,
@@ -639,34 +658,24 @@ impl MqttDriver {
             MqttClient::Mqtt311(client) => client
                 .publish(
                     publication.topic.as_str(),
-                    qos,
-                    retain,
                     publication.payload.clone(),
+                    Mqtt311PublishOptions::new(qos).retain(retain),
                 )
                 .await
                 .map_err(|error| iggy_connector_sdk::Error::Connection(error.to_string())),
             MqttClient::Mqtt5(client) => {
-                let result = if let Some(properties) = publication.properties.clone() {
-                    client
-                        .publish_with_properties(
-                            publication.topic.as_str(),
-                            mqtt5_qos(qos),
-                            retain,
-                            publication.payload.clone(),
-                            properties,
-                        )
-                        .await
-                } else {
-                    client
-                        .publish(
-                            publication.topic.as_str(),
-                            mqtt5_qos(qos),
-                            retain,
-                            publication.payload.clone(),
-                        )
-                        .await
-                };
-                result.map_err(|error| iggy_connector_sdk::Error::Connection(error.to_string()))
+                let mut options = Mqtt5PublishOptions::new(mqtt5_qos(qos)).retain(retain);
+                if let Some(properties) = publication.properties.clone() {
+                    options = options.properties(properties);
+                }
+                client
+                    .publish(
+                        publication.topic.as_str(),
+                        publication.payload.clone(),
+                        options,
+                    )
+                    .await
+                    .map_err(|error| iggy_connector_sdk::Error::Connection(error.to_string()))
             }
         }
     }
@@ -778,7 +787,7 @@ async fn poll_connection_event(
             .await
             .map_err(|error| iggy_connector_sdk::Error::Connection(error.to_string()))?
         {
-            Mqtt311Event::Outgoing(Outgoing::Publish(packet_id)) => {
+            Mqtt311Event::Outgoing(Mqtt311Outgoing::Publish(packet_id)) => {
                 Ok(DriverEvent::OutgoingPublish(packet_id))
             }
             Mqtt311Event::Incoming(Mqtt311Incoming::ConnAck(connack)) => {
@@ -797,7 +806,7 @@ async fn poll_connection_event(
             .await
             .map_err(|error| mqtt5_connection_error(error, id))?
         {
-            Mqtt5Event::Outgoing(Outgoing::Publish(packet_id)) => {
+            Mqtt5Event::Outgoing(Mqtt5Outgoing::Publish(packet_id)) => {
                 Ok(DriverEvent::OutgoingPublish(packet_id))
             }
             Mqtt5Event::Incoming(Mqtt5Incoming::ConnAck(connack)) => {
@@ -823,7 +832,9 @@ async fn poll_connection_event(
                 packet_id: comp.pkid,
                 reason: comp.reason,
             }),
-            Mqtt5Event::Incoming(_) | Mqtt5Event::Outgoing(_) => Ok(DriverEvent::Other),
+            Mqtt5Event::Auth(_) | Mqtt5Event::Incoming(_) | Mqtt5Event::Outgoing(_) => {
+                Ok(DriverEvent::Other)
+            }
         },
     }
 }
@@ -894,7 +905,9 @@ pub(crate) fn validate_tls_config(
     Ok(())
 }
 
-fn tls_transport(config: &MqttSinkConfig) -> Result<Option<Transport>, iggy_connector_sdk::Error> {
+fn tls_config(
+    config: &MqttSinkConfig,
+) -> Result<Option<Arc<ClientConfig>>, iggy_connector_sdk::Error> {
     let broker_url = url::Url::parse(&config.broker_url).map_err(|error| {
         iggy_connector_sdk::Error::InvalidConfigValue(format!("broker_url: {error}"))
     })?;
@@ -916,8 +929,27 @@ fn tls_transport(config: &MqttSinkConfig) -> Result<Option<Transport>, iggy_conn
         _ => unreachable!("TLS configuration was validated before loading files"),
     };
 
-    let tls_config = TlsConfiguration::Rustls(Arc::new(build_tls_config(ca, client_auth)?));
-    Ok(Some(Transport::tls_with_config(tls_config)))
+    Ok(Some(Arc::new(build_tls_config(ca, client_auth)?)))
+}
+
+fn tls_transport_v4(
+    config: &MqttSinkConfig,
+) -> Result<Option<Mqtt311Transport>, iggy_connector_sdk::Error> {
+    tls_config(config).map(|config| {
+        config.map(|config| {
+            Mqtt311Transport::tls_with_config(Mqtt311TlsConfiguration::Rustls(config))
+        })
+    })
+}
+
+fn tls_transport_v5(
+    config: &MqttSinkConfig,
+) -> Result<Option<rumqttc_v5::Transport>, iggy_connector_sdk::Error> {
+    tls_config(config).map(|config| {
+        config.map(|config| {
+            rumqttc_v5::Transport::tls_with_config(rumqttc_v5::TlsConfiguration::Rustls(config))
+        })
+    })
 }
 
 fn broker_url_with_client_id(
@@ -1099,7 +1131,7 @@ async fn wait_for_mqtt311_disconnect(
     timeout(disconnect_timeout, async {
         loop {
             match event_loop.poll().await {
-                Ok(Mqtt311Event::Outgoing(Outgoing::Disconnect)) => return Ok(()),
+                Ok(Mqtt311Event::Outgoing(Mqtt311Outgoing::Disconnect)) => return Ok(()),
                 Ok(_) => {}
                 Err(error) => {
                     return Err(iggy_connector_sdk::Error::Connection(error.to_string()));
@@ -1122,7 +1154,7 @@ async fn wait_for_mqtt5_disconnect(
     timeout(disconnect_timeout, async {
         loop {
             match event_loop.poll().await {
-                Ok(Mqtt5Event::Outgoing(Outgoing::Disconnect)) => return Ok(()),
+                Ok(Mqtt5Event::Outgoing(Mqtt5Outgoing::Disconnect)) => return Ok(()),
                 Ok(_) => {}
                 Err(error) => {
                     return Err(iggy_connector_sdk::Error::Connection(error.to_string()));
@@ -1373,7 +1405,7 @@ mod tests {
     use super::{
         DriverEvent, Mqtt311Options, PublishWindowFailure, PublishWindowState,
         broker_url_with_client_id, mqtt5_connack_error, mqtt5_connection_error,
-        mqtt311_connection_error, read_certificate_file, read_private_key_file,
+        mqtt311_connection_error, read_certificate_file, read_private_key_file, rumqttc,
         validate_mqtt5_broker_capabilities,
     };
 
@@ -1781,12 +1813,11 @@ mod tests {
         let broker_url = broker_url_with_client_id("mqtts://broker.example", "sink-client")
             .expect("broker URL must accept a client identifier");
 
-        let options =
-            Mqtt311Options::parse_url(broker_url).expect("driver options must parse broker URL");
-
         assert_eq!(
-            options.broker_address(),
-            ("broker.example".to_string(), 8883)
+            url::Url::parse(&broker_url)
+                .expect("broker URL must parse")
+                .port(),
+            Some(8883)
         );
     }
 

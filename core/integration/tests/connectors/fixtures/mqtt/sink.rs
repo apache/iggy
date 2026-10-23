@@ -22,14 +22,15 @@ use super::container::{
 use async_trait::async_trait;
 use iggy_connector_sdk::Schema;
 use integration::harness::{TestBinaryError, TestFixture};
-use rumqttc::v5::{
-    AsyncClient as Mqtt5Client, Event as Mqtt5Event, EventLoop as Mqtt5EventLoop,
-    Incoming as Mqtt5Incoming, MqttOptions as Mqtt5Options,
-    mqttbytes::{QoS as Mqtt5Qos, v5::PublishProperties},
+use rumqttc_v4::{
+    AsyncClient as Mqtt311Client, Broker as Mqtt311Broker, Event as Mqtt311Event,
+    EventLoop as Mqtt311EventLoop, Incoming as Mqtt311Incoming, MqttOptions as Mqtt311Options,
+    mqttbytes::QoS as Mqtt311Qos,
 };
-use rumqttc::{
-    AsyncClient as Mqtt311Client, Event as Mqtt311Event, EventLoop as Mqtt311EventLoop,
-    Incoming as Mqtt311Incoming, MqttOptions as Mqtt311Options, mqttbytes::QoS as Mqtt311Qos,
+use rumqttc_v5::{
+    AsyncClient as Mqtt5Client, Broker as Mqtt5Broker, Event as Mqtt5Event,
+    EventLoop as Mqtt5EventLoop, Incoming as Mqtt5Incoming, MqttOptions as Mqtt5Options,
+    mqttbytes::{QoS as Mqtt5Qos, v5::PublishProperties},
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -662,7 +663,7 @@ impl MqttSubscriber {
                     Self::Mqtt311 { event_loop, .. } => match event_loop.poll().await {
                         Ok(Mqtt311Event::Incoming(Mqtt311Incoming::Publish(publish))) => {
                             messages.push(ReceivedMqttPublication {
-                                topic: publish.topic,
+                                topic: String::from_utf8_lossy(&publish.topic).into_owned(),
                                 payload: publish.payload.to_vec(),
                                 qos: publish.qos as u8,
                                 retain: publish.retain,
@@ -750,10 +751,16 @@ impl MqttSubscriber {
                 fixture_type: "MqttSubscriber".to_string(),
                 message: "MQTT broker URL has no port".to_string(),
             })?;
-        let mut options = Mqtt311Options::new(SUBSCRIBER_CLIENT_ID, host, port);
+        let mut options = Mqtt311Options::new(SUBSCRIBER_CLIENT_ID, Mqtt311Broker::tcp(host, port));
         options.set_credentials(MQTT_USERNAME, MQTT_PASSWORD);
         options.set_max_packet_size(MAXIMUM_TEST_PACKET_SIZE, MAXIMUM_TEST_PACKET_SIZE);
-        let (client, mut event_loop) = Mqtt311Client::new(options, 16);
+        let (client, mut event_loop) = Mqtt311Client::builder(options)
+            .capacity(16)
+            .try_build()
+            .map_err(|error| TestBinaryError::FixtureSetup {
+                fixture_type: "MqttSubscriber".to_string(),
+                message: format!("Failed to build MQTT client: {error}"),
+            })?;
         for subscription_filter in subscription_filters {
             client
                 .subscribe(subscription_filter, Mqtt311Qos::AtLeastOnce)
@@ -812,10 +819,16 @@ impl MqttSubscriber {
                 fixture_type: "MqttSubscriber".to_string(),
                 message: "MQTT broker URL has no port".to_string(),
             })?;
-        let mut options = Mqtt5Options::new(SUBSCRIBER_CLIENT_ID, host, port);
+        let mut options = Mqtt5Options::new(SUBSCRIBER_CLIENT_ID, Mqtt5Broker::tcp(host, port));
         options.set_credentials(MQTT_USERNAME, MQTT_PASSWORD);
         options.set_max_packet_size(Some(MAXIMUM_TEST_PACKET_SIZE as u32));
-        let (client, mut event_loop) = Mqtt5Client::new(options, 16);
+        let (client, mut event_loop) = Mqtt5Client::builder(options)
+            .capacity(16)
+            .try_build()
+            .map_err(|error| TestBinaryError::FixtureSetup {
+                fixture_type: "MqttSubscriber".to_string(),
+                message: format!("Failed to build MQTT client: {error}"),
+            })?;
         for subscription_filter in subscription_filters {
             client
                 .subscribe(subscription_filter, Mqtt5Qos::AtLeastOnce)
