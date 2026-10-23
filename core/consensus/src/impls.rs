@@ -4526,9 +4526,12 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.status.set(Status::Normal);
         self.rejoined_on_recovered_log.set(false);
         self.ceded_primaryship.set(false);
-        // The view's log now comes from a settled primary, and repair fills this
-        // replica's holes from it.
-        self.untrusted_log.set(false);
+        // The view's log comes from a settled primary, but until repair fills this
+        // replica's holes from it the log can still lack acknowledged ops, so a
+        // later view change must not count it as trusted.
+        if !needs_reconciliation {
+            self.untrusted_log.set(false);
+        }
         self.advance_commit_max(msg_commit);
         self.reset_view_change_state();
 
@@ -4905,6 +4908,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
     pub fn settle_view_log_proof(&self) {
         self.view_log_unproven.set(false);
+        self.untrusted_log.set(false);
         self.view_log_merged.set(self.is_primary_elect());
         self.view_log_merge_uncertified.set(false);
         if self.group != METADATA_GROUP {
@@ -8728,11 +8732,16 @@ mod recovery_election_tests {
                         header.group = *group;
                     });
                     encode_prepare_headers(suffix, &mut start_view.as_mut_slice()[HEADER_SIZE..]);
-                    receiver.handle_start_view(
+                    let actions = receiver.handle_start_view(
                         plane,
                         start_view.header(),
                         &start_view.as_slice()[HEADER_SIZE..],
-                    )
+                    );
+                    // No journal here to repair from: the adopted log stands in
+                    // for the bodies a real backup would fetch before it
+                    // settles its proof and trusts its log again.
+                    receiver.untrusted_log.set(false);
+                    actions
                 }
                 // Heartbeats keep a settled view settled; nothing else in this
                 // harness carries them.

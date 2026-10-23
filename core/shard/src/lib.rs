@@ -5182,9 +5182,8 @@ where
         if !actions.is_empty()
             && let Some((diverged_op, agreed_op)) = partition
                 .consensus()
-                .pending_view_log()
-                .as_ref()
-                .and_then(|pending| partition_applied_divergence(partition, pending))
+                .with_pending_view_log(|pending| partition_applied_divergence(partition, pending))
+                .flatten()
         {
             self.resync_diverged_partition(
                 IggyNamespace::from_raw(header.group),
