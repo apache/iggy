@@ -198,15 +198,16 @@ async fn test_all_commands_require_auth(client: &IggyClient, binding_identity: S
             GET_USER_CODE => client.get_user(&ctx.user_id).await.map(|_| ()),
             GET_USERS_CODE => client.get_users().await.map(|_| ()),
             CREATE_USER_CODE => client
-                .create_user("test", "test", UserStatus::Active, None)
+                .create_user(
+                    "test",
+                    "test",
+                    UserStatus::Active,
+                    None,
+                    &UserCreateOptions::default(),
+                )
                 .await
                 .map(|_| ()),
             DELETE_USER_CODE => client.delete_user(&ctx.user_id).await,
-            UPDATE_USER_CODE => {
-                client
-                    .update_user(&ctx.user_id, Some("x"), None, &UserUpdateOptions::default())
-                    .await
-            }
             UPDATE_PERMISSIONS_CODE => client.update_permissions(&ctx.user_id, None).await,
             CHANGE_PASSWORD_CODE => client.change_password(&ctx.user_id, "old", "new").await,
 
@@ -223,11 +224,20 @@ async fn test_all_commands_require_auth(client: &IggyClient, binding_identity: S
             // Streams
             GET_STREAM_CODE => client.get_stream(&ctx.stream_id).await.map(|_| ()),
             GET_STREAMS_CODE => client.get_streams().await.map(|_| ()),
-            CREATE_STREAM_CODE => client.create_stream("x").await.map(|_| ()),
+            CREATE_STREAM_CODE => client
+                .create_stream("x", &StreamCreateOptions::default())
+                .await
+                .map(|_| ()),
             DELETE_STREAM_CODE => client.delete_stream(&ctx.stream_id).await,
-            UPDATE_STREAM_CODE => {
+            UPDATE_RESOURCE_CODE => {
                 client
-                    .update_stream(&ctx.stream_id, "x", &StreamUpdateOptions::default())
+                    .update_stream(
+                        &ctx.stream_id,
+                        &StreamUpdateOptions {
+                            name: Some("x".to_owned()),
+                            ..StreamUpdateOptions::default()
+                        },
+                    )
                     .await
             }
 
@@ -250,16 +260,6 @@ async fn test_all_commands_require_auth(client: &IggyClient, binding_identity: S
                 .await
                 .map(|_| ()),
             DELETE_TOPIC_CODE => client.delete_topic(&ctx.stream_id, &ctx.topic_id).await,
-            UPDATE_TOPIC_CODE => {
-                client
-                    .update_topic(
-                        &ctx.stream_id,
-                        &ctx.topic_id,
-                        "x",
-                        &TopicUpdateOptions::default(),
-                    )
-                    .await
-            }
 
             // Partitions
             CREATE_PARTITIONS_CODE => {
@@ -429,7 +429,7 @@ async fn verify_auth_works(client: &IggyClient) {
 
 async fn setup_test_resources(client: &IggyClient) {
     client
-        .create_stream(STREAM_NAME)
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
         .await
         .expect("create stream");
     client

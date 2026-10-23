@@ -1817,7 +1817,6 @@ mod tests {
             IggyTimestamp::now(),
         );
         let create_topic = CreateTopicWithAssignmentsRequest {
-            created_view: 0,
             request: CreateTopicRequest {
                 stream_id: WireIdentifier::numeric(0),
                 partitions_count: 1,
@@ -1826,6 +1825,7 @@ mod tests {
             },
             derived_options: WireOptions::empty(),
             partitions: vec![CreatedPartitionAssignment {
+                initial_view: 0,
                 partition_id: 0,
                 consensus_group_id: 1,
             }],
@@ -1891,7 +1891,6 @@ mod tests {
         state.apply_context.metadata_op += 1;
         StateHandler::apply(
             &CreatePartitionsWithAssignmentsRequest {
-                created_view: 0,
                 request: CreatePartitionsRequest {
                     stream_id: WireIdentifier::numeric(0),
                     topic_id: WireIdentifier::numeric(0),
@@ -1899,6 +1898,7 @@ mod tests {
                 },
                 partitions: (0..count)
                     .map(|partition_id| CreatedPartitionAssignment {
+                        initial_view: 0,
                         partition_id,
                         consensus_group_id: u64::from(partition_id) + 2,
                     })

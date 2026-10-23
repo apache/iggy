@@ -122,9 +122,8 @@ pub struct MetadataConfig {
     /// `PartitionsLimitReached` before it enters consensus. Zero is no cap.
     ///
     /// The metadata primary checks it with its own value, so every node needs
-    /// the same value. A soft cap: the check counts committed partitions only.
-    /// Up to 3 x `prepare_queue_depth` creates can be in flight, with up to
-    /// 1000 partitions each, and each one passes the check on its own.
+    /// the same value. The check counts the committed partitions and those of
+    /// the creates still in flight, so creates never take the count past it.
     #[serde(default)]
     pub partitions_max: u32,
 }

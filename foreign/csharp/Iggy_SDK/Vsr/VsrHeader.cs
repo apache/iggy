@@ -22,10 +22,8 @@ namespace Apache.Iggy.Vsr;
 
 /// <summary>
 ///     The 256-byte consensus header, read and written by wire offset. Offsets mirror
-///     <c>core/binary_protocol/src/consensus/header.rs</c>. Checksums stay zero: the frame and body checksums
-///     are not read on the client request path, and a zero <c>request_checksum</c> is unstamped, which skips
-///     the server's payload verification. Stamping it is optional. The Rust SDK stamps metadata, session and
-///     DeleteSegments operations. This SDK does not stamp it yet.
+///     <c>core/binary_protocol/src/consensus/header.rs</c>. Metadata and session requests carry a random
+///     per-request identifier in <c>request_checksum</c>, retained across retries. Partition operations leave it zero.
 /// </summary>
 internal static class VsrHeader
 {
@@ -98,6 +96,7 @@ internal static class VsrHeader
         BinaryPrimitives.WriteUInt32LittleEndian(header[SIZE_OFFSET..], (uint)totalSize);
         header[COMMAND_OFFSET] = (byte)Command.Request;
         WriteUInt128(header[REQUEST_CLIENT_OFFSET..], frame.ClientId);
+        WriteUInt128(header[REQUEST_CHECKSUM_OFFSET..], frame.RequestChecksum);
         BinaryPrimitives.WriteUInt64LittleEndian(header[REQUEST_TIMESTAMP_OFFSET..], 0);
         BinaryPrimitives.WriteUInt64LittleEndian(header[REQUEST_ID_OFFSET..], frame.RequestId);
         header[REQUEST_OPERATION_OFFSET] = (byte)operation;

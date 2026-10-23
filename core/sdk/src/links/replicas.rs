@@ -59,6 +59,12 @@ use tracing::{info, warn};
 /// Dials that run at once, for one client.
 const MAX_CONCURRENT_DIALS: usize = 4;
 
+/// A replica holds a bind for at most two metadata read budgets, one for its
+/// frontier and one for the forward to shard 0: 6 s at the default
+/// `commit_broadcast_interval`. A bind without a reply by this deadline means
+/// a dead link, so the client drops it and dials again.
+const BIND_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The longest pause before a slot or a sweep tries again.
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(10);
 
@@ -263,64 +269,32 @@ impl ReplicaLinks {
         }
         shared
             .coordinator
-            .run(|abandoned| shared.sweep(abandoned, true))
+            .run(|abandoned| shared.sweep_in(shared.session.epoch().lineage, abandoned, true))
             .await
     }
 
-    /// Reuses the sweep and its coordinator, but leaves a new session for the
-    /// caller's explicit credentials. An existing session resumes for logout.
-    /// The caller signs in next, maybe as another user, so a sign-in owed
-    /// with the credentials of the last one gives way. This replaces the
-    /// session, and the sweep closes every link first, which stops a slot
-    /// that still waits for the reply to the owed sign-in.
+    /// An explicit attempt supersedes an automatic sweep, then reuses its connection machinery.
     pub(crate) async fn prepare_sign_in(&self) -> Result<(), IggyError> {
         let shared = &self.shared;
-        let owed = shared.session.reset_if_sign_in_owed()?;
-        let fence = shared.session.fence();
-        let mut retry = false;
+        let lineage = shared.session.operation_lineage().lineage();
         loop {
+            if shared.session.epoch().lineage != lineage {
+                return Err(IggyError::Unauthenticated);
+            }
             let mut owner = false;
             let result = shared
                 .coordinator
                 .run(|abandoned| {
                     owner = true;
-                    async move {
-                        if retry && shared.session.fence() != fence {
-                            return Err(IggyError::NotConnected);
-                        }
-                        shared.sweep(abandoned || retry || owed, false).await
-                    }
+                    shared.sweep_in(lineage, abandoned, false)
                 })
                 .await;
-            // A concurrent Connect owns its credentials and result. Its
-            // rejection cannot reject different explicit credentials, and its
-            // sweep can keep a slot that still signs in as the last user.
-            if !owner
-                && (owed
-                    || result.as_ref().is_err_and(|error| {
-                        matches!(
-                            error,
-                            IggyError::InvalidCredentials
-                                | IggyError::InvalidUsername
-                                | IggyError::InvalidPassword
-                                | IggyError::InvalidPersonalAccessToken
-                                | IggyError::PersonalAccessTokenExpired(..)
-                                | IggyError::UserInactive
-                                | IggyError::Unauthenticated
-                                | IggyError::InvalidFormat
-                        )
-                    }))
-                && shared.session.fence() == fence
-            {
-                retry = true;
-                continue;
+            if owner {
+                return result;
             }
-            return result;
         }
     }
 
-    /// Aborts every task and closes every link, which fails each pending
-    /// request. The roster stays for the next sweep.
     pub(crate) fn disconnect(&self) {
         self.shared.disconnect();
     }
@@ -360,8 +334,7 @@ impl ReplicaLinks {
         let stopped = {
             let epoch = self.shared.session.epoch();
             let table = self.shared.table();
-            self.shared.policy.enabled
-                && (epoch.bound || epoch.sign_in_owed)
+            self.shared.keepalive_restarts(epoch)
                 && (table.state == ClientState::Disconnected
                     || table.slots.values().any(|slot| slot.task.is_none()))
         };
@@ -401,6 +374,18 @@ impl ReplicaLinks {
             }
         }
         Ok(succeeded)
+    }
+
+    /// Whether the client is up or comes back without the caller. A
+    /// disconnected client comes back only when a keepalive restarts it, and
+    /// a shutdown is final.
+    pub(crate) fn can_recover(&self) -> bool {
+        let epoch = self.shared.session.epoch();
+        match self.shared.table().state {
+            ClientState::Shutdown => false,
+            ClientState::Disconnected => self.shared.keepalive_restarts(epoch),
+            _ => true,
+        }
     }
 
     /// The link for `target`. A request never dials, so a target without a
@@ -517,6 +502,12 @@ impl LinksShared {
         let _ = self.events.try_broadcast(event);
     }
 
+    /// Whether a keepalive restarts the links that stopped, see
+    /// [`ReplicaLinks::keepalive`].
+    fn keepalive_restarts(&self, epoch: SessionEpoch) -> bool {
+        self.policy.enabled && (epoch.bound || epoch.sign_in_owed)
+    }
+
     fn disconnect(&self) {
         let links = {
             let mut table = self.table();
@@ -532,6 +523,23 @@ impl LinksShared {
             links
         };
         links.iter().for_each(|link| link.close());
+    }
+
+    async fn sweep_in(
+        self: &Arc<Self>,
+        lineage: u64,
+        abandoned: bool,
+        automatic_sign_in: bool,
+    ) -> Result<(), IggyError> {
+        let mut epoch = self.session.subscribe_epoch();
+        tokio::select! {
+            biased;
+            _ = epoch.wait_for(|epoch| epoch.lineage != lineage) => {
+                self.disconnect();
+                Err(IggyError::Unauthenticated)
+            }
+            result = self.sweep(abandoned, automatic_sign_in) => result,
+        }
     }
 
     async fn sweep(
@@ -783,8 +791,11 @@ impl LinksShared {
                 }
                 Err(error) if session_lost(&error) => {
                     info!("The session ended ({error}). Signing in again.");
-                    self.session
-                        .reset_if_fence(epoch.fence, automatic_sign_in)?;
+                    if automatic_sign_in {
+                        self.session.reset_if_fence(epoch.fence, true)?;
+                    } else {
+                        self.session.reset_for_sign_in(epoch.lineage)?;
+                    }
                 }
                 // A replica that cannot bind inside its read budget is behind
                 // the session, and another one can be further ahead.
@@ -807,46 +818,52 @@ impl LinksShared {
     /// Signs in on `link` with the known credentials, if any. A failure that
     /// leaves the link up leaves the client connected without a session. A
     /// rejected credential is forgotten, because it stays rejected, and each
-    /// replay costs the server a password hash.
+    /// replay costs the server a password hash. The calls that wait for the
+    /// session fail with `Unauthenticated`, so the log keeps the rejection.
     async fn sign_in(&self, link: &Arc<Link>) -> Result<(), SignInFailure> {
-        let fence = self.session.fence();
-        let Some(credentials) = self.session.sign_in_credentials() else {
-            info!("No credentials to sign in with.");
-            return Ok(());
-        };
-        self.set_state_on(link, ClientState::Authenticating);
-        let error = match self.register(link, &credentials).await {
-            Ok(user_id) => {
-                self.finish_sign_in(link, fence, credentials, user_id)?;
-                info!("Signed in.");
-                return Ok(());
+        let started = self.session.epoch();
+        loop {
+            let epoch = self.session.epoch();
+            if epoch.fence != started.fence || epoch.lineage != started.lineage {
+                return Err(IggyError::Unauthenticated.into());
             }
-            Err(error) => error,
-        };
-        let failure = SignInFailure::from(error);
-        if !failure.link_lost {
-            self.set_state_on(link, ClientState::Connected);
+            let Some(credentials) = self.session.sign_in_credentials() else {
+                info!("No credentials to sign in with.");
+                return Ok(());
+            };
+            self.set_state_on(link, ClientState::Authenticating);
+            let error = match self.register(link, &credentials).await {
+                Ok(user_id) => {
+                    self.finish_sign_in(link, started.fence, user_id)?;
+                    info!("Signed in.");
+                    return Ok(());
+                }
+                Err(error) => error,
+            };
+            let failure = SignInFailure::from(error);
+            if !failure.link_lost {
+                self.set_state_on(link, ClientState::Connected);
+            }
+            if rejects_credentials(&failure.error) {
+                if self.session.refuse_sign_in(started, &credentials) {
+                    continue;
+                }
+                warn!(
+                    "The server rejected the attempted sign-in ({}).",
+                    failure.error
+                );
+            }
+            return Err(failure);
         }
-        if matches!(
-            failure.error,
-            IggyError::InvalidCredentials
-                | IggyError::InvalidUsername
-                | IggyError::InvalidPassword
-                | IggyError::Unauthenticated
-        ) {
-            self.session.forget();
-        }
-        Err(failure)
     }
 
     fn finish_sign_in(
         &self,
         link: &Arc<Link>,
         fence: u64,
-        credentials: Credentials,
         user_id: u32,
     ) -> Result<(), SignInFailure> {
-        let remembered = self.session.remember_unless(
+        let remembered = self.session.remember_recovered_unless(
             || {
                 let current_fence = self.session.fence();
                 let mut table = self.table();
@@ -857,7 +874,6 @@ impl LinksShared {
                 self.publish(DiagnosticEvent::SignedIn);
                 false
             },
-            credentials,
             user_id,
         );
         if remembered {
@@ -918,7 +934,7 @@ impl LinksShared {
             link,
             BIND_SESSION_CODE,
             request.to_bytes(),
-            Instant::now() + OPERATION_TIMEOUT,
+            Instant::now() + BIND_TIMEOUT,
         )
         .await?;
         decode_session_binding(&identity, &reply).map(drop)
@@ -1231,7 +1247,12 @@ impl LinksShared {
             return;
         };
         slot.task = None;
-        table.settle();
+        // Subscribers read the state on each event, and the Disconnected of
+        // the last close came while a slot still tried again. Only this one
+        // shows that the client stopped.
+        if table.settle() {
+            self.publish(DiagnosticEvent::Disconnected);
+        }
         drop(table);
         warn!("Replica {id} stays down until a keepalive or a connect restarts it.");
     }
@@ -1361,18 +1382,19 @@ impl Table {
 
     /// Without a link and without a slot task that tries again, only a
     /// keepalive or a connect brings the client back, so it counts as
-    /// disconnected.
-    fn settle(&mut self) {
+    /// disconnected. Returns whether this changed the state.
+    fn settle(&mut self) -> bool {
         let retrying = self.slots.values().any(|slot| slot.task.is_some());
-        if self.ready_count() == 0
+        let stopped = self.ready_count() == 0
             && !retrying
             && matches!(
                 self.state,
                 ClientState::Connected | ClientState::Authenticating | ClientState::Authenticated
-            )
-        {
+            );
+        if stopped {
             self.state = ClientState::Disconnected;
         }
+        stopped
     }
 }
 
@@ -1392,10 +1414,27 @@ fn sweeping(state: ClientState) -> Result<(), IggyError> {
 }
 
 /// Whether a bind failed because the server no longer knows the session.
+/// `StaleClient` is left out because no server path answers a BindSession with it.
 fn session_lost(error: &IggyError) -> bool {
     matches!(
         error,
         IggyError::Unauthenticated | IggyError::TransientNotCommitted
+    )
+}
+
+/// Whether the server rejected the credentials of a sign-in for good, so a
+/// replay gets the same answer.
+fn rejects_credentials(error: &IggyError) -> bool {
+    matches!(
+        error,
+        IggyError::InvalidCredentials
+            | IggyError::InvalidUsername
+            | IggyError::InvalidPassword
+            | IggyError::InvalidPersonalAccessToken
+            | IggyError::PersonalAccessTokenExpired(..)
+            | IggyError::UserInactive
+            | IggyError::Unauthenticated
+            | IggyError::InvalidFormat
     )
 }
 
@@ -1571,6 +1610,25 @@ mod tests {
         for id in 1..3 {
             assert_eq!(cluster.codes(&endpoint(id)), [BIND_SESSION_CODE]);
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_replica_that_never_answers_a_bind_when_its_deadline_passes_should_redial_and_bind()
+     {
+        let cluster = FakeCluster::new(2);
+        cluster.script(&endpoint(1), BIND_SESSION_CODE, [Answer::Silence]);
+
+        let links = connected(&cluster, 2).await;
+
+        let dials = cluster.dials_to(&endpoint(1));
+        let pause = backoff(1, INTERVAL, RECONNECT_BACKOFF_MAX, TEST_JITTER_DRAW);
+        assert_eq!(dials.len(), 2);
+        assert_eq!(dials[1], dials[0] + BIND_TIMEOUT + pause);
+        assert_eq!(
+            cluster.codes(&endpoint(1)),
+            [BIND_SESSION_CODE, BIND_SESSION_CODE]
+        );
+        assert_eq!(links.state(), ClientState::Authenticated);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1983,12 +2041,7 @@ mod tests {
         session.forget();
         session.reset().unwrap();
 
-        assert!(
-            links
-                .shared
-                .finish_sign_in(&link, fence, credentials, 1)
-                .is_err()
-        );
+        assert!(links.shared.finish_sign_in(&link, fence, 1).is_err());
 
         assert!(session.sign_in_credentials().is_none());
         assert_eq!(events.try_recv().unwrap(), DiagnosticEvent::Disconnected);

@@ -48,9 +48,9 @@ use iggy_binary_protocol::requests::consumer_groups::{
 use iggy_binary_protocol::requests::partitions::{
     CreatePartitionsWithAssignmentsRequest, DeletePartitionsRequest,
 };
-use iggy_binary_protocol::requests::streams::{DeleteStreamRequest, UpdateStreamRequest};
+use iggy_binary_protocol::requests::streams::{DeleteStreamRequest, UpdateStreamResolvedRequest};
 use iggy_binary_protocol::requests::topics::{
-    CreateTopicWithAssignmentsRequest, DeleteTopicRequest, UpdateTopicRequest,
+    CreateTopicWithAssignmentsRequest, DeleteTopicRequest, UpdateTopicResolvedRequest,
 };
 use iggy_binary_protocol::requests::users::{
     ChangePasswordRequest, CreateUserRequest, UpdatePermissionsRequest,
@@ -156,10 +156,8 @@ impl GatedApply for MuxStateMachine<variadic!(Users, Streams)> {
 
 /// The root user is always the first user created (slab id 0) and holds every
 /// grant. Short-circuited below rather than checked against the permissioner:
-/// server-originated ops carry `user_id` 0 with no session, and WAL replay
-/// gates committed ops before the unreplicated root bootstrap
-/// (`ensure_root_user`) has populated the permissioner, so the gate must not
-/// depend on permissioner contents.
+/// server-originated ops carry `user_id` 0 with no session. Initial root
+/// creation is one such operation and precedes permissioner population.
 const ROOT_USER_ID: u32 = 0;
 
 /// Decides whether the acting user may run this committed op.
@@ -190,8 +188,10 @@ pub(crate) fn authorize(
     match header.operation {
         // Streams. `create_stream` is unscoped; the rest resolve the stream id.
         Operation::CreateStream => check(users, |perm| perm.create_stream(user_id)),
-        Operation::UpdateStream => {
-            let Ok(request) = UpdateStreamRequest::decode_from(body) else {
+        // The generic patch reaches apply only in its resolved form, which
+        // keeps the permission of the scope it patches.
+        Operation::UpdateStreamResolved => {
+            let Ok(request) = UpdateStreamResolvedRequest::decode_from(body) else {
                 return None;
             };
             stream_scoped(users, streams, &request.stream_id, |perm, sid| {
@@ -218,8 +218,8 @@ pub(crate) fn authorize(
                 perm.create_topic(user_id, sid)
             })
         }
-        Operation::UpdateTopic => {
-            let Ok(request) = UpdateTopicRequest::decode_from(body) else {
+        Operation::UpdateTopicResolved => {
+            let Ok(request) = UpdateTopicResolvedRequest::decode_from(body) else {
                 return None;
             };
             topic_scoped(
@@ -338,7 +338,7 @@ pub(crate) fn authorize(
         // legacy execution layer exempts when the target is the acting user.
         Operation::CreateUser => check(users, |perm| perm.create_user(user_id)),
         Operation::DeleteUser => check(users, |perm| perm.delete_user(user_id)),
-        Operation::UpdateUser => check(users, |perm| perm.update_user(user_id)),
+        Operation::UpdateUserResolved => check(users, |perm| perm.update_user(user_id)),
         Operation::UpdatePermissions => check(users, |perm| perm.update_permissions(user_id)),
         Operation::ChangePassword => {
             let Ok(request) = ChangePasswordRequest::decode_from(body) else {
@@ -367,6 +367,7 @@ pub(crate) fn authorize(
         | Operation::RetireSession
         | Operation::CreateTopic
         | Operation::CreatePartitions
+        | Operation::UpdateResource
         | Operation::DeleteSegments
         | Operation::CreatePersonalAccessToken
         | Operation::DeletePersonalAccessToken
@@ -374,6 +375,7 @@ pub(crate) fn authorize(
         | Operation::StoreConsumerOffset
         | Operation::DeleteConsumerOffset
         | Operation::CompleteLifecycle
+        | Operation::RewrapStreamKeys
         | Operation::TransitionPartitionHistory
         | Operation::InstallConsumerGroupOwner
         | Operation::RetireConsumerGroupOwners => None,
@@ -550,7 +552,7 @@ mod tests {
     };
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
     use iggy_binary_protocol::requests::topics::CreateTopicRequest;
-    use iggy_binary_protocol::requests::users::CreateUserRequest;
+    use iggy_binary_protocol::requests::users::{CreateUserRequest, UpdateUserResolvedRequest};
     use iggy_binary_protocol::{Command, WireEncode, WireName, WireOptions};
     use iggy_common::{StreamPermissions, UserStatus};
     use server_common::iobuf::Owned;
@@ -631,7 +633,6 @@ mod tests {
 
     fn create_topic_body(stream_id: u32, name: &str) -> bytes::Bytes {
         CreateTopicWithAssignmentsRequest {
-            created_view: 0,
             request: CreateTopicRequest {
                 stream_id: WireIdentifier::numeric(stream_id),
                 partitions_count: 1,
@@ -640,6 +641,7 @@ mod tests {
             },
             derived_options: WireOptions::empty(),
             partitions: vec![CreatedPartitionAssignment {
+                initial_view: 0,
                 partition_id: 0,
                 consensus_group_id: 1,
             }],
@@ -785,6 +787,91 @@ mod tests {
             mux.streams().read(|inner| inner.items.len()),
             0,
             "denied op must not mutate stream state"
+        );
+    }
+
+    #[test]
+    fn given_unprivileged_user_when_applying_resolved_patch_should_deny_all_scopes() {
+        let mux = mux();
+        commit_as_root(
+            &mux,
+            1,
+            Operation::CreateUser,
+            &create_user_body("alice", no_grants(), Vec::new()),
+        );
+        commit_as_root(&mux, 2, Operation::CreateStream, &create_stream_body("s0"));
+        commit_as_root(
+            &mux,
+            3,
+            Operation::CreateTopicWithAssignments,
+            &create_topic_body(0, "t0"),
+        );
+        let patches = [
+            (
+                Operation::UpdateStreamResolved,
+                UpdateStreamResolvedRequest {
+                    stream_id: WireIdentifier::numeric(0),
+                    name: Some(WireName::new("s0-renamed").unwrap()),
+                    explicit_options: WireOptions::empty(),
+                    derived_options: WireOptions::empty(),
+                }
+                .to_bytes(),
+            ),
+            (
+                Operation::UpdateTopicResolved,
+                UpdateTopicResolvedRequest {
+                    stream_id: WireIdentifier::numeric(0),
+                    topic_id: WireIdentifier::numeric(0),
+                    name: Some(WireName::new("t0-renamed").unwrap()),
+                    explicit_options: WireOptions::empty(),
+                    derived_options: WireOptions::empty(),
+                }
+                .to_bytes(),
+            ),
+            (
+                Operation::UpdateUserResolved,
+                UpdateUserResolvedRequest {
+                    user_id: WireIdentifier::numeric(ALICE),
+                    username: Some(WireName::new("alice-renamed").unwrap()),
+                    status: None,
+                    explicit_options: WireOptions::empty(),
+                    derived_options: WireOptions::empty(),
+                }
+                .to_bytes(),
+            ),
+        ];
+        let names = |mux: &MuxStateMachine<variadic!(Users, Streams)>| {
+            let stream_and_topic = mux.streams().read(|inner| {
+                let stream = &inner.items[0];
+                (stream.name.to_string(), stream.topics[0].name.to_string())
+            });
+            let user = mux.users().read(|inner| {
+                inner
+                    .items
+                    .get(ALICE as usize)
+                    .map(|user| user.username.to_string())
+            });
+            (stream_and_topic, user)
+        };
+        let before = names(&mux);
+
+        for (index, (operation, body)) in patches.iter().enumerate() {
+            let reply = mux
+                .gated_update(make_prepare(4 + index as u64, *operation, ALICE, body))
+                .unwrap();
+            assert_eq!(reply.code, UNAUTHORIZED, "{operation:?} must be denied");
+        }
+        assert_eq!(names(&mux), before);
+
+        for (index, (operation, body)) in patches.iter().enumerate() {
+            commit_as_root(&mux, 7 + index as u64, *operation, body);
+        }
+        assert_eq!(
+            names(&mux),
+            (
+                ("s0-renamed".to_owned(), "t0-renamed".to_owned()),
+                Some("alice-renamed".to_owned())
+            )
         );
     }
 

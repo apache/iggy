@@ -17,7 +17,7 @@
 
 module(
     name = "iggy_cpp",
-    version = "0.1.3",
+    version = "0.1.4",
 )
 
 bazel_dep(name = "rules_cc", version = "0.2.26")
@@ -26,6 +26,7 @@ bazel_dep(name = "googletest", version = "1.18.0.bcr.1")
 bazel_dep(name = "cucumber-cpp", version = "0.9.0")
 bazel_dep(name = "rules_rust", version = "0.74.0")
 bazel_dep(name = "abseil-cpp", version = "20260526.0")
+bazel_dep(name = "nlohmann_json", version = "3.12.0.bcr.1", dev_dependency = True)
 
 iggy_source = use_repo_rule("@bazel_tools//tools/build_defs/repo:local.bzl", "new_local_repository")
 iggy_source(

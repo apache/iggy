@@ -24,9 +24,13 @@
 //	IGGY_TCP_ADDRESS=127.0.0.1:8090 \
 //	IGGY_HTTP_ENABLED=false IGGY_QUIC_ENABLED=false IGGY_WEBSOCKET_ENABLED=false \
 //	IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy \
+//	IGGY_ENCRYPTION_ENABLED=true IGGY_ENCRYPTION_KEY=<base64 of 32 random bytes> \
 //	target/debug/iggy-server
 //
 //	IGGY_TCP_ADDRESS=127.0.0.1:8090 go test ./tests
+//
+// The stream option cases need the encryption settings: without them a keyless
+// stream reports no generated key and a stream key is refused.
 //
 // Set IGGY_TCP_TLS_ENABLED=true to run the TLS cases against a server started
 // with IGGY_TCP_TLS_ENABLED=true and the certificate pair in core/certs.
@@ -36,14 +40,18 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/apache/iggy/foreign/go/client"
 	"github.com/apache/iggy/foreign/go/client/tcp"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	"github.com/apache/iggy/foreign/go/internal/command"
 	"github.com/stretchr/testify/require"
 )
 
@@ -135,14 +143,13 @@ func scratchTopic(t *testing.T, connected iggcon.Client, partitionsCount uint32)
 		name = name[:255]
 	}
 
-	stream, err := connected.CreateStream(ctx, name)
+	stream, err := connected.CreateStream(ctx, name, nil)
 	require.NoError(t, err)
 	streamId, err := iggcon.NewIdentifier(stream.Id)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = connected.DeleteStream(context.Background(), streamId) })
 
-	topic, err := connected.CreateTopic(ctx, streamId, name, partitionsCount,
-		iggcon.CompressionAlgorithmNone, iggcon.Duration(0), 0)
+	topic, err := connected.CreateTopic(ctx, streamId, name, &iggcon.TopicOptions{PartitionsCount: &partitionsCount})
 	require.NoError(t, err)
 	topicId, err := iggcon.NewIdentifier(topic.Id)
 	require.NoError(t, err)
@@ -176,6 +183,45 @@ func waitForGroupAssignment(
 		}
 		time.Sleep(groupAssignmentPollInterval)
 	}
+}
+
+// requireSplitPrimaries fails unless the primary of partition 0 of the topic
+// is another node than the metadata primary that the roster names. It returns
+// the address of that partition primary.
+func requireSplitPrimaries(
+	t *testing.T,
+	ctx context.Context,
+	connected iggcon.Client,
+	streamId, topicId iggcon.Identifier,
+) string {
+	t.Helper()
+
+	stream, err := streamId.MarshalBinary()
+	require.NoError(t, err)
+	topic, err := topicId.MarshalBinary()
+	require.NoError(t, err)
+	payload := binary.LittleEndian.AppendUint32(append(stream, topic...), 0)
+	body, err := connected.SendBinaryRequest(ctx, uint32(command.GetPartitionRouteCode), payload)
+	require.NoError(t, err)
+	var route iggcon.PartitionRoute
+	require.NoError(t, route.UnmarshalBinary(body))
+	metadata, err := connected.GetClusterMetadata(ctx)
+	require.NoError(t, err)
+	var primary, metadataPrimary *iggcon.ClusterNode
+	for index := range metadata.Nodes {
+		node := &metadata.Nodes[index]
+		if node.ReplicaID == route.PrimaryReplica {
+			primary = node
+		}
+		if node.Role == iggcon.RoleLeader {
+			metadataPrimary = node
+		}
+	}
+	require.NotNil(t, primary, "route primary must be a configured replica")
+	require.NotNil(t, metadataPrimary, "the roster must name a metadata primary")
+	require.NotEqual(t, metadataPrimary.ReplicaID, primary.ReplicaID,
+		"the fixture must separate metadata and partition primaries")
+	return net.JoinHostPort(strings.Trim(primary.IP, "[]"), strconv.Itoa(int(primary.Endpoints.Tcp)))
 }
 
 // testMessages builds count messages with predictable payloads.

@@ -312,14 +312,17 @@ impl LaneTicket {
         {
             return Ok(());
         }
+        if (self.sent || self.resumed) && self.operation.is_some() {
+            return Err(IggyError::Unauthenticated);
+        }
         self.operation = None;
         self.reservation = None;
         self.reservation = Some(self.owner.pending.reserve(bytes, deadline).await?);
         Ok(())
     }
 
-    /// Takes the next request id and freezes the frame of the call. A call
-    /// that starts a new operation in the same lane freezes again.
+    /// [`Self::freeze_in`] in the current lineage.
+    #[cfg(test)]
     pub(crate) fn freeze(
         &mut self,
         code: u32,
@@ -327,7 +330,27 @@ impl LaneTicket {
         context: PartitionContext,
         partition: Option<PartitionKey>,
     ) -> Result<Frame, IggyError> {
+        let lineage = self.owner.epoch().lineage;
+        self.freeze_in(lineage, code, body, context, partition)
+    }
+
+    /// Takes the next request id and freezes the frame of the call, but only
+    /// while the lineage is `lineage`. So no call freezes under a session that
+    /// the caller signed in to after the call started. A call that starts a
+    /// new operation in the same lane freezes again.
+    pub(crate) fn freeze_in(
+        &mut self,
+        lineage: u64,
+        code: u32,
+        body: Bytes,
+        context: PartitionContext,
+        partition: Option<PartitionKey>,
+    ) -> Result<Frame, IggyError> {
         let mut session = self.owner.session()?;
+        // The lineage changes only under the session lock.
+        if self.owner.epoch().lineage != lineage {
+            return Err(IggyError::Unauthenticated);
+        }
         let reservation = if self.is_mutation(code) {
             let bytes = HEADER_SIZE
                 .checked_add(body.len())
@@ -360,6 +383,15 @@ impl LaneTicket {
         });
         self.sent = false;
         Ok(frame)
+    }
+
+    pub(crate) fn revalidate(&self, lineage: u64) -> Result<bool, IggyError> {
+        let _session = self.owner.session()?;
+        let epoch = self.owner.epoch();
+        if epoch.lineage != lineage {
+            return Err(IggyError::Unauthenticated);
+        }
+        Ok(epoch.fence == self.fence)
     }
 
     pub(crate) fn fence(&self) -> u64 {
@@ -1153,6 +1185,24 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_resumed_write_when_reset_during_routing_should_preserve_its_unknown_outcome() {
+        let owner = bound_owner();
+        let op = retain_write(&owner, partition_lane()).await;
+        let (mut replay, _retained) = owner.resume(op, deadline()).await.unwrap();
+        owner.reset().unwrap();
+
+        assert_eq!(
+            replay.reserve(SEND_MESSAGES_CODE, 0, deadline()).await,
+            Err(IggyError::Unauthenticated)
+        );
+        assert_eq!(replay.retain(), IggyError::OperationUncertain(op));
+        assert!(matches!(
+            owner.resume(op, deadline()).await,
+            Err(IggyError::OperationNotRetained(missing)) if missing == op
+        ));
     }
 
     #[tokio::test(start_paused = true)]

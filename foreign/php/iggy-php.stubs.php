@@ -127,15 +127,31 @@ namespace Iggy {
         /**
          * Creates a new stream.
          *
+         * `encryption_key` is the stream's own data key: 32 random bytes as canonical padded
+         * standard base64, for example `base64_encode(random_bytes(32))`. Raw bytes or any other
+         * text are refused before anything is sent. The key travels in the request, so protecting
+         * it in transit with TLS is the caller's responsibility. It is marked
+         * `#[\SensitiveParameter]`, so exception traces never hold it. The server stores it wrapped
+         * and never returns it, reads report only its source and fingerprints. Without a key, a
+         * server with encryption enabled generates one. `raw` sends string-valued keys this
+         * build does not know, and the server decides whether to accept them. It is marked
+         * `#[\SensitiveParameter]` too, because an unknown key may hold a secret.
+         *
          * @param string $name
+         * @param string|null $encryption_key
+         * @param array|null $raw
          * @return void
          */
-        public function createStream(string $name): void {}
+        public function createStream(string $name, ?string $encryption_key = null, ?array $raw = null): void {}
 
         /**
          * Creates a topic.
          *
-         * Every option left null resolves against the server default at admission.
+         * Every option left null resolves against the server default at admission. The 64-bit
+         * sizes and durations take an int or a decimal string, so never-expire and unlimited
+         * (18446744073709551615) can be sent. `raw` sends string-valued keys this build does not
+         * know, and the server decides whether to accept them. It is marked
+         * `#[\SensitiveParameter]`, because an unknown key may hold a secret.
          *
          * @param mixed $stream
          * @param string $name
@@ -149,9 +165,11 @@ namespace Iggy {
          * @param mixed $messages_required_to_save
          * @param mixed $size_of_messages_required_to_save
          * @param bool|null $preallocate_segments
+         * @param string|null $partition_resize_policy
+         * @param array|null $raw
          * @return void
          */
-        public function createTopic(mixed $stream, string $name, int $partitions_count, ?string $compression_algorithm = null, mixed $message_expiry_micros = null, mixed $max_topic_size = null, mixed $segment_size = null, ?\Iggy\Durability $durability = null, ?\Iggy\Durability $consumer_offset_durability = null, mixed $messages_required_to_save = null, mixed $size_of_messages_required_to_save = null, ?bool $preallocate_segments = null): void {}
+        public function createTopic(mixed $stream, string $name, int $partitions_count, ?string $compression_algorithm = null, mixed $message_expiry_micros = null, mixed $max_topic_size = null, mixed $segment_size = null, ?\Iggy\Durability $durability = null, ?\Iggy\Durability $consumer_offset_durability = null, mixed $messages_required_to_save = null, mixed $size_of_messages_required_to_save = null, ?bool $preallocate_segments = null, ?string $partition_resize_policy = null, ?array $raw = null): void {}
 
         /**
          * Deletes a stream by id or name.
@@ -171,7 +189,28 @@ namespace Iggy {
         public function deleteTopic(mixed $stream_id, mixed $topic_id): void {}
 
         /**
+         * The server's option catalog for one resource: each key's kind and whether an update
+         * may set or reset it, whether it is secret, read-only or critical.
+         *
+         * @param \Iggy\OptionsScope $scope
+         * @return array
+         */
+        public function describeOptions(\Iggy\OptionsScope $scope): array {}
+
+        /**
+         * Fingerprint of a stream key given as canonical padded standard base64 of 32 bytes, the
+         * value `StreamDetails::$encryption_key_fingerprint` reports for a stream created with it.
+         * The key is marked `#[\SensitiveParameter]`, so exception traces never hold it.
+         *
+         * @param string $key
+         * @return string
+         */
+        public static function encryptionKeyFingerprint(string $key): string {}
+
+        /**
          * Constructs a new IggyClient from a connection string.
+         *
+         * The string is marked `#[\SensitiveParameter]`, so exception traces never hold it.
          *
          * @param string $connection_string
          * @return \Iggy\Client
@@ -197,6 +236,8 @@ namespace Iggy {
 
         /**
          * Logs in the user with the given credentials.
+         *
+         * The password is marked `#[\SensitiveParameter]`, so exception traces never hold it.
          *
          * @param string $username
          * @param string $password
@@ -264,6 +305,47 @@ namespace Iggy {
          * @return \Iggy\SendMessagesResponse
          */
         public function sendMessages(mixed $stream, mixed $topic, int $partition_id, array $messages): \Iggy\SendMessagesResponse {}
+
+        /**
+         * Renames a stream.
+         *
+         * A null name keeps the current one. No stream option is resettable, so a non-empty
+         * `reset` list, or an update that changes nothing, is refused before anything is sent.
+         * `raw` and `raw_reset` reach keys this build does not know, and the server decides
+         * whether each one may be set or reset. `raw` is marked `#[\SensitiveParameter]`,
+         * because an unknown key may hold a secret. Renaming keeps the stream's id, key and
+         * messages.
+         *
+         * @param mixed $stream
+         * @param string|null $name
+         * @param array $reset
+         * @param array|null $raw
+         * @param array|null $raw_reset
+         * @return void
+         */
+        public function updateStream(mixed $stream, ?string $name = null, array $reset = [], ?array $raw = null, ?array $raw_reset = null): void {}
+
+        /**
+         * Renames a topic or changes its message expiry and size cap.
+         *
+         * Null arguments keep the stored values. `message_expiry_micros` and `max_topic_size`
+         * take an int or a decimal string, 18446744073709551615 meaning never expire and
+         * unlimited, and 0 is refused: list the key in `reset` to return it to the server
+         * default. `raw` and `raw_reset` reach keys this build does not know, and the server
+         * decides whether each one may be set or reset. `raw` is marked
+         * `#[\SensitiveParameter]`, because an unknown key may hold a secret.
+         *
+         * @param mixed $stream
+         * @param mixed $topic
+         * @param string|null $name
+         * @param mixed $message_expiry_micros
+         * @param mixed $max_topic_size
+         * @param array $reset
+         * @param array|null $raw
+         * @param array|null $raw_reset
+         * @return void
+         */
+        public function updateTopic(mixed $stream, mixed $topic, ?string $name = null, mixed $message_expiry_micros = null, mixed $max_topic_size = null, array $reset = [], ?array $raw = null, ?array $raw_reset = null): void {}
     }
 
     /**
@@ -461,6 +543,75 @@ namespace Iggy {
          * @return bool
          */
         public function valid(): bool {}
+    }
+
+    /**
+     * One option key as the server's catalog describes it.
+     */
+    class OptionSpec {
+        /**
+         * A node that does not understand the key must not serve the resource.
+         *
+         * @var bool
+         */
+        public readonly bool $critical;
+
+        /**
+         * The default in the kind's binary encoding, an empty string when the key has none.
+         *
+         * @var string
+         */
+        public readonly string $default_value;
+
+        public readonly string $description;
+
+        public readonly string $key;
+
+        /**
+         * The value kind, for example `string`, `uint64` or `raw`.
+         *
+         * @var string
+         */
+        public readonly string $kind;
+
+        /**
+         * Computed by the server and returned on reads, never accepted.
+         *
+         * @var bool
+         */
+        public readonly bool $read_only;
+
+        /**
+         * An update may reset the key to its default.
+         *
+         * @var bool
+         */
+        public readonly bool $resettable;
+
+        /**
+         * Accepted on create, never returned by a read.
+         *
+         * @var bool
+         */
+        public readonly bool $secret;
+
+        /**
+         * An update may set the key.
+         *
+         * @var bool
+         */
+        public readonly bool $updatable;
+
+        public function __construct() {}
+    }
+
+    /**
+     * The resource whose option catalog `Client::describeOptions()` reads.
+     */
+    enum OptionsScope: string {
+      case Topic = 'topic';
+      case Stream = 'stream';
+      case User = 'user';
     }
 
     /**
@@ -743,27 +894,116 @@ namespace Iggy {
     }
 
     class StreamDetails {
+        /**
+         * Options the server filled in, including the read-only encryption projections.
+         *
+         * @var array
+         */
+        public readonly array $derived_options;
+
+        /**
+         * Fingerprints of the server keys that wrap the stream's key, comma-separated: one
+         * outside a server key rotation. Null for a plaintext stream.
+         *
+         * @var string|null
+         */
+        public readonly ?string $encryption_kek_fingerprint;
+
+        /**
+         * Fingerprint of the stream's key, 16 lowercase hex characters. Compare it with
+         * `Client::encryptionKeyFingerprint()` of a key you hold. Null for a plaintext stream.
+         *
+         * @var string|null
+         */
+        public readonly ?string $encryption_key_fingerprint;
+
+        /**
+         * Who chose the stream's at-rest key: `stream`, `server`, or `none` for a plaintext
+         * stream. A source a newer server reports is returned as its text.
+         *
+         * @var string|null
+         */
+        public readonly ?string $encryption_key_source;
+
         public readonly int $id;
 
         public readonly int $messages_count;
 
         public readonly string $name;
+
+        /**
+         * Options the creating client set, as option name to scalar value. Key material is
+         * never returned.
+         *
+         * @var array
+         */
+        public readonly array $options;
 
         public readonly int $topics_count;
 
         public function __construct() {}
     }
 
+    /**
+     * Stream option keys, as the cases an update's reset list takes.
+     *
+     * No stream option is resettable in this release, so `Client::updateStream()` refuses every
+     * case with the error the server would return.
+     */
+    enum StreamOptionKey: string {
+      case Name = 'name';
+      case EncryptionKey = 'encryption_key';
+      case EncryptionKeySource = 'encryption_key_source';
+      case EncryptionKeyFingerprint = 'encryption_key_fingerprint';
+      case EncryptionKekFingerprint = 'encryption_kek_fingerprint';
+    }
+
     class TopicDetails {
+        /**
+         * Options the server filled in from its catalog defaults.
+         *
+         * @var array
+         */
+        public readonly array $derived_options;
+
         public readonly int $id;
 
         public readonly int $messages_count;
 
         public readonly string $name;
 
+        /**
+         * Options the creating or updating client set, as option name to scalar value.
+         * Integers above `PHP_INT_MAX`, such as never-expire and unlimited
+         * (18446744073709551615), are decimal strings.
+         *
+         * @var array
+         */
+        public readonly array $options;
+
         public readonly int $partitions_count;
 
         public function __construct() {}
+    }
+
+    /**
+     * Topic option keys, as the cases an update's reset list takes.
+     *
+     * Only `MessageExpiry` and `MaxTopicSize` are resettable in this release. The server refuses
+     * every other case with its own category.
+     */
+    enum TopicOptionKey: string {
+      case Name = 'name';
+      case CompressionAlgorithm = 'compression_algorithm';
+      case MessageExpiry = 'message_expiry';
+      case MaxTopicSize = 'max_topic_size';
+      case SegmentSize = 'segment_size';
+      case Durability = 'durability';
+      case ConsumerOffsetDurability = 'consumer_offset_durability';
+      case PartitionResizePolicy = 'partition_resize_policy';
+      case MessagesRequiredToSave = 'messages_required_to_save';
+      case SizeOfMessagesRequiredToSave = 'size_of_messages_required_to_save';
+      case PreallocateSegments = 'preallocate_segments';
     }
 }
 

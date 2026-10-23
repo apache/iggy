@@ -711,6 +711,12 @@ fn validate_keep_alive(
             minimum_keep_alive, protocol
         )));
     }
+    if keep_alive.as_secs() > u64::from(u16::MAX) {
+        return Err(Error::InvalidConfigValue(format!(
+            "{field} must be at most {}s, the MQTT keep alive limit",
+            u16::MAX
+        )));
+    }
     Ok(())
 }
 
@@ -829,9 +835,9 @@ mod tests {
         let source = MqttSource::new(7, test_config(), None);
         let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
         runtime.block_on(async {
-            let publish = rumqttc::v5::mqttbytes::v5::Publish::new(
+            let publish = rumqttc_v5::mqttbytes::v5::Publish::new(
                 "devices/test",
-                rumqttc::v5::mqttbytes::QoS::AtLeastOnce,
+                rumqttc_v5::mqttbytes::QoS::AtLeastOnce,
                 b"payload".as_slice(),
                 None,
             );
@@ -955,13 +961,13 @@ mod tests {
 
     #[test]
     fn given_mqtt5_metadata_enabled_should_serialize_payload_and_properties() {
-        let properties = rumqttc::v5::mqttbytes::v5::PublishProperties {
+        let properties = rumqttc_v5::mqttbytes::v5::PublishProperties {
             correlation_data: Some(vec![0, 255].into()),
             ..Default::default()
         };
-        let publish = rumqttc::v5::mqttbytes::v5::Publish::new(
+        let publish = rumqttc_v5::mqttbytes::v5::Publish::new(
             "devices/test",
-            rumqttc::v5::mqttbytes::QoS::AtMostOnce,
+            rumqttc_v5::mqttbytes::QoS::AtMostOnce,
             vec![0, 255],
             Some(properties),
         );
@@ -983,9 +989,9 @@ mod tests {
     #[test]
     fn given_oversized_topic_should_be_preserved_by_mqtt5_envelope() {
         let topic = format!("devices/{}/telemetry", "x".repeat(280));
-        let publish = rumqttc::v5::mqttbytes::v5::Publish::new(
+        let publish = rumqttc_v5::mqttbytes::v5::Publish::new(
             topic.clone(),
-            rumqttc::v5::mqttbytes::QoS::AtMostOnce,
+            rumqttc_v5::mqttbytes::QoS::AtMostOnce,
             b"payload".to_vec(),
             None,
         );
@@ -1314,6 +1320,36 @@ mod tests {
     fn given_mqtt5_url_zero_keep_alive_should_reject_configuration() {
         let mut config = test_config();
         config.broker_url = "mqtt://localhost:1883?keep_alive_secs=0".to_string();
+        let source = MqttSource::new(7, config, None);
+
+        assert!(source.validate_config().is_err());
+    }
+
+    #[test]
+    fn given_keep_alive_above_the_mqtt_maximum_should_reject_configuration() {
+        for protocol in [MqttProtocol::Mqtt311, MqttProtocol::Mqtt5] {
+            let mut config = test_config();
+            config.protocol = protocol;
+            config.keep_alive = Some("65536s".to_string());
+            let source = MqttSource::new(7, config, None);
+
+            assert!(source.validate_config().is_err(), "{protocol:?}");
+        }
+    }
+
+    #[test]
+    fn given_keep_alive_at_the_mqtt_maximum_should_accept_configuration() {
+        let mut config = test_config();
+        config.keep_alive = Some("65535s".to_string());
+        let source = MqttSource::new(7, config, None);
+
+        assert!(source.validate_config().is_ok());
+    }
+
+    #[test]
+    fn given_url_keep_alive_above_the_mqtt_maximum_should_reject_configuration() {
+        let mut config = test_config();
+        config.broker_url = "mqtt://localhost:1883?keep_alive_secs=65536".to_string();
         let source = MqttSource::new(7, config, None);
 
         assert!(source.validate_config().is_err());

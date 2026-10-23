@@ -42,6 +42,7 @@ from apache_iggy import (
     QuicConfig,
     TcpConfig,
     TcpReconnectionConfig,
+    TopicOptions,
     WebSocketConfig,
 )
 
@@ -311,8 +312,9 @@ class TestClientConstruction:
             client.create_topic(
                 stream="stream",
                 name="topic",
-                partitions_count=1,
-                message_expiry=IggyExpiry.ExpireDuration(timedelta(seconds=-1)),
+                options=TopicOptions(
+                    message_expiry=IggyExpiry.ExpireDuration(timedelta(seconds=-1))
+                ),
             )
 
     @pytest.mark.parametrize(

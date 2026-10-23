@@ -28,6 +28,7 @@ from apache_iggy import (
     IggyClient,
     PollingStrategy,
     ReceiveMessage,
+    TopicOptions,
 )
 from apache_iggy import SendMessage as Message
 
@@ -52,11 +53,7 @@ async def _create_consumer_group_with_numeric_ids(
     assert stream is not None
     assert isinstance(stream.id, int)
 
-    await iggy_client.create_topic(
-        stream=stream.id,
-        name=topic_name,
-        partitions_count=1,
-    )
+    await iggy_client.create_topic(stream=stream.id, name=topic_name)
     topic = await iggy_client.get_topic(stream.id, topic_name)
     assert topic is not None
     assert isinstance(topic.id, int)
@@ -85,7 +82,7 @@ class TestCreateConsumerGroup:
         await iggy_client.create_topic(
             stream=stream_name,
             name=topic_name,
-            partitions_count=2,
+            options=TopicOptions(partitions_count=2),
         )
         await iggy_client.create_consumer_group(
             stream_name,
@@ -119,11 +116,7 @@ class TestCreateConsumerGroup:
         stream_id = stream.id
         assert isinstance(stream_id, int)
 
-        await iggy_client.create_topic(
-            stream=stream_id,
-            name=topic_name,
-            partitions_count=1,
-        )
+        await iggy_client.create_topic(stream=stream_id, name=topic_name)
         topic = await iggy_client.get_topic(stream_id, topic_name)
         assert topic is not None
         topic_id = topic.id
@@ -156,11 +149,7 @@ class TestCreateConsumerGroup:
         group_name = unique_name()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1,
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
         await iggy_client.create_consumer_group(
             stream_name,
             topic_name,
@@ -212,11 +201,7 @@ class TestGetConsumerGroup:
         group_name = unique_name()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1,
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
         await iggy_client.create_consumer_group(
             stream_name,
             topic_name,
@@ -255,11 +240,7 @@ class TestGetConsumerGroup:
         topic_name = unique_name()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1,
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         group_by_name = await iggy_client.get_consumer_group(
             stream_name,
@@ -286,11 +267,7 @@ class TestGetConsumerGroup:
         partition_id = 0
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1,
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         await iggy_client.consumer_group(
             consumer_name,
@@ -354,11 +331,7 @@ class TestGetConsumerGroups:
         topic_name = unique_name()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1,
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         groups = await iggy_client.get_consumer_groups(stream_name, topic_name)
         assert groups == []
@@ -374,11 +347,7 @@ class TestGetConsumerGroups:
         second_group_name = unique_name()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1,
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
         await iggy_client.create_consumer_group(
             stream_name,
             topic_name,
@@ -412,11 +381,7 @@ class TestGetConsumerGroups:
         stream_id = stream.id
         assert isinstance(stream_id, int)
 
-        await iggy_client.create_topic(
-            stream=stream_id,
-            name=topic_name,
-            partitions_count=1,
-        )
+        await iggy_client.create_topic(stream=stream_id, name=topic_name)
         topic = await iggy_client.get_topic(stream_id, topic_name)
         assert topic is not None
         topic_id = topic.id
@@ -440,11 +405,7 @@ class TestGetConsumerGroups:
         group_names = [unique_name() for _ in range(2)]
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1,
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
         for group_name in group_names:
             await iggy_client.create_consumer_group(
                 stream_name,
@@ -488,11 +449,7 @@ class TestDeleteConsumerGroup:
         group_to_keep = unique_name()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1,
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
         await iggy_client.create_consumer_group(
             stream_name,
             topic_name,
@@ -553,11 +510,7 @@ class TestDeleteConsumerGroup:
         topic_name = unique_name()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1,
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         with pytest.raises(RuntimeError, match="Consumer group with ID:"):
             await iggy_client.delete_consumer_group(
@@ -615,11 +568,7 @@ class TestJoinConsumerGroup:
         group_name = unique_name()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1,
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
         await iggy_client.create_consumer_group(stream_name, topic_name, group_name)
 
         await iggy_client.join_consumer_group(stream_name, topic_name, group_name)
@@ -682,11 +631,7 @@ class TestJoinConsumerGroup:
         topic_name = unique_name()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1,
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         with pytest.raises(RuntimeError, match="Consumer group with ID:"):
             await iggy_client.join_consumer_group(
@@ -709,11 +654,7 @@ class TestLeaveConsumerGroup:
         group_name = unique_name()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1,
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
         await iggy_client.create_consumer_group(stream_name, topic_name, group_name)
         await iggy_client.join_consumer_group(stream_name, topic_name, group_name)
 
@@ -768,11 +709,7 @@ class TestLeaveConsumerGroup:
         group_name = unique_name()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1,
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
         await iggy_client.create_consumer_group(stream_name, topic_name, group_name)
         await iggy_client.join_consumer_group(stream_name, topic_name, group_name)
 
@@ -792,11 +729,7 @@ class TestLeaveConsumerGroup:
         topic_name = unique_name()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1,
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         with pytest.raises(RuntimeError, match="Consumer group with ID:"):
             await iggy_client.leave_consumer_group(
@@ -846,11 +779,7 @@ class TestConsumerGroup:
         partition_id = 0
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1,
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         consumer = await iggy_client.consumer_group(
             consumer_name,
@@ -885,11 +814,7 @@ class TestConsumerGroup:
         shutdown_event = asyncio.Event()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1,
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         consumer = await iggy_client.consumer_group(
             consumer_name,
@@ -946,11 +871,7 @@ class TestConsumerGroup:
         shutdown_event = asyncio.Event()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1,
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         consumer = await iggy_client.consumer_group(
             consumer_name,
@@ -1004,11 +925,7 @@ class TestConsumerGroup:
         second_shutdown = asyncio.Event()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1,
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         consumer = await iggy_client.consumer_group(
             consumer_name,
@@ -1080,11 +997,7 @@ class TestConsumerGroup:
         second_shutdown = asyncio.Event()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1,
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         consumer = await iggy_client.consumer_group(
             consumer_name,
@@ -1151,11 +1064,7 @@ class TestConsumerGroup:
         received_messages = []
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1,
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         consumer = await iggy_client.consumer_group(
             consumer_name,
@@ -1211,11 +1120,7 @@ class TestConsumerGroup:
         shutdown_event = asyncio.Event()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1,
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         consumer = await iggy_client.consumer_group(
             consumer_name,
@@ -1262,11 +1167,7 @@ class TestConsumerGroup:
         shutdown_event = asyncio.Event()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1,
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         consumer = await iggy_client.consumer_group(
             consumer_name,
@@ -1308,11 +1209,7 @@ class TestConsumerGroup:
         received_messages = []
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1,
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         consumer = await iggy_client.consumer_group(
             consumer_name,
@@ -1354,11 +1251,7 @@ class TestConsumerGroup:
         }
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1,
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         consumer = await iggy_client.consumer_group(
             consumer_name,
@@ -1400,11 +1293,7 @@ class TestConsumerGroup:
         received_messages = []
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1,
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         await iggy_client.send_messages(
             stream_name,
@@ -1444,11 +1333,7 @@ class TestConsumerGroup:
         received_messages = []
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1,
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         await iggy_client.send_messages(
             stream_name,
@@ -1493,11 +1378,7 @@ class TestConsumerGroup:
         received_messages = []
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1,
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         await iggy_client.send_messages(
             stream_name,
@@ -1538,11 +1419,7 @@ class TestConsumerGroup:
         shutdown_event = asyncio.Event()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1,
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         await iggy_client.send_messages(
             stream_name,
@@ -1589,11 +1466,7 @@ class TestConsumerGroup:
         offset_messages = []
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1,
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         await iggy_client.send_messages(
             stream_name,
@@ -1659,11 +1532,7 @@ class TestConsumerGroup:
         shutdown_event = asyncio.Event()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1,
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         await iggy_client.send_messages(
             stream_name,
@@ -1732,11 +1601,7 @@ class TestConsumerGroup:
         timestamp_messages = []
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1,
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         for message in test_messages:
             await iggy_client.send_messages(
@@ -1806,11 +1671,7 @@ class TestConsumerGroup:
         shutdown_event = asyncio.Event()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1,
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         for message in test_messages:
             await iggy_client.send_messages(
@@ -1879,11 +1740,7 @@ class TestConsumerGroup:
         received_messages = []
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1,
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         consumer = await iggy_client.consumer_group(
             consumer_name,
@@ -1937,11 +1794,7 @@ class TestConsumerGroup:
         received_messages = []
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1,
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         await iggy_client.send_messages(
             stream_name,
@@ -1986,11 +1839,7 @@ class TestConsumerGroup:
         replayed_messages = []
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1,
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         consumer = await iggy_client.consumer_group(
             consumer_name,
@@ -2075,11 +1924,7 @@ class TestConsumerGroup:
         await asyncio.sleep(timedelta(milliseconds=50).total_seconds() * 2)
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1,
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         consumer = await consumer_task
 
@@ -2098,11 +1943,7 @@ class TestConsumerGroup:
         partition_id = 0
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1,
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         consumer = await iggy_client.consumer_group(
             consumer_name,
@@ -2131,11 +1972,7 @@ class TestConsumerGroup:
         topic_name = unique_name()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1,
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         await iggy_client.consumer_group(
             consumer_name,
@@ -2206,11 +2043,7 @@ class TestConsumerGroup:
         topic_name = unique_name()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1,
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         with pytest.raises(RuntimeError, match="Consumer group with name:"):
             await iggy_client.consumer_group(
@@ -2247,11 +2080,7 @@ class TestConsumerGroup:
         topic_name = unique_name()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1,
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         with pytest.raises(RuntimeError, match=expected_error):
             await iggy_client.consumer_group(
@@ -2316,11 +2145,7 @@ class TestConsumerGroup:
         shutdown_event = asyncio.Event()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1,
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         consumer = await iggy_client.consumer_group(
             consumer_name,

@@ -75,9 +75,11 @@ public class HttpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public async Task<StreamResponse?> CreateStreamAsync(string name, CancellationToken token = default)
+    public async Task<StreamResponse?> CreateStreamAsync(string name, StreamOptions? options = null,
+        CancellationToken token = default)
     {
-        var json = JsonSerializer.Serialize(new CreateStreamRequest(name), _jsonSerializerOptions);
+        var json = JsonSerializer.Serialize(new CreateStreamRequest(name, CreateOptions(options?.ToDictionary())),
+            _jsonSerializerOptions);
 
         var data = new StringContent(json, Encoding.UTF8, "application/json");
 
@@ -121,16 +123,10 @@ public class HttpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public async Task UpdateStreamAsync(Identifier streamId, string name, CancellationToken token = default)
+    public async Task UpdateStreamAsync(Identifier streamId, StreamUpdate update, CancellationToken token = default)
     {
-        var json = JsonSerializer.Serialize(new UpdateStreamRequest(name), _jsonSerializerOptions);
-
-        var data = new StringContent(json, Encoding.UTF8, "application/json");
-        var response = await _httpClient.PutAsync($"/streams/{streamId}", data, token);
-        if (!response.IsSuccessStatusCode)
-        {
-            await HandleResponseAsync(response);
-        }
+        ArgumentNullException.ThrowIfNull(update);
+        await PutUpdateAsync($"/streams/{streamId}", update.ToPatch(), token);
     }
 
     /// <inheritdoc />
@@ -150,21 +146,10 @@ public class HttpMessageStream : IIggyClient
 
     /// <inheritdoc />
     public async Task<TopicResponse?> CreateTopicAsync(Identifier streamId, string name, uint partitionsCount,
-        CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None,
-        TimeSpan? messageExpiry = null, ulong maxTopicSize = 0,
-        IReadOnlyDictionary<string, HeaderValue>? options = null, CancellationToken token = default)
+        TopicOptions? options = null, CancellationToken token = default)
     {
-
-        options = TopicOptions.WithDurabilityDefaults(options);
-        var json = JsonSerializer.Serialize(new CreateTopicRequest
-        {
-            Name = name,
-            CompressionAlgorithm = compressionAlgorithm,
-            MaxTopicSize = maxTopicSize,
-            MessageExpiry = DurationHelpers.ToDuration(messageExpiry),
-            PartitionsCount = partitionsCount,
-            Options = ToStringOptions(options)
-        }, _jsonSerializerOptions);
+        var json = JsonSerializer.Serialize(new CreateTopicRequest(name, partitionsCount,
+            CreateOptions((options ?? new TopicOptions()).ToDictionary())), _jsonSerializerOptions);
         var data = new StringContent(json, Encoding.UTF8, "application/json");
 
         var response = await _httpClient.PostAsync($"/streams/{streamId}/topics", data, token);
@@ -180,22 +165,11 @@ public class HttpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public async Task UpdateTopicAsync(Identifier streamId, Identifier topicId, string name,
-        CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None,
-        ulong maxTopicSize = 0, TimeSpan? messageExpiry = null,
-        IReadOnlyDictionary<string, HeaderValue>? options = null,
+    public async Task UpdateTopicAsync(Identifier streamId, Identifier topicId, TopicUpdate update,
         CancellationToken token = default)
     {
-        var json = JsonSerializer.Serialize(
-            new UpdateTopicRequest(name, compressionAlgorithm, maxTopicSize,
-                DurationHelpers.ToDuration(messageExpiry), ToStringOptions(options)),
-            _jsonSerializerOptions);
-        var data = new StringContent(json, Encoding.UTF8, "application/json");
-        var response = await _httpClient.PutAsync($"/streams/{streamId}/topics/{topicId}", data, token);
-        if (!response.IsSuccessStatusCode)
-        {
-            await HandleResponseAsync(response);
-        }
+        ArgumentNullException.ThrowIfNull(update);
+        await PutUpdateAsync($"/streams/{streamId}/topics/{topicId}", update.ToPatch(), token);
     }
 
     /// <inheritdoc />
@@ -513,7 +487,7 @@ public class HttpMessageStream : IIggyClient
     ///     catalog straight from its own byte vector.
     /// </summary>
     private sealed record HttpOptionSpec(string Key, string Kind, IReadOnlyList<byte>? DefaultValue,
-        string? Description)
+        string? Description, bool Updatable, bool Resettable, bool Secret, bool ReadOnly, bool Critical)
     {
         internal OptionSpec ToOptionSpec()
         {
@@ -521,39 +495,36 @@ public class HttpMessageStream : IIggyClient
             {
                 Key = Key,
                 Kind = UserHeadersConverter.ParseHeaderKind(Kind),
+                Updatable = Updatable,
+                Resettable = Resettable,
+                Secret = Secret,
+                ReadOnly = ReadOnly,
+                Critical = Critical,
                 DefaultValue = DefaultValue is null ? [] : [.. DefaultValue],
                 Description = Description ?? string.Empty
             };
         }
     }
 
-    /// <summary>
-    ///     Renders option values as the strings the REST body carries them in.
-    ///
-    ///     The binary transports send a typed TLV block, but the JSON body takes a plain string map the
-    ///     server parses by the same rules a config file value goes through, so a typed value handed in
-    ///     here is rendered rather than passed through.
-    /// </summary>
-    private static Dictionary<string, string> ToStringOptions(IReadOnlyDictionary<string, HeaderValue>? options)
+    /// <summary>The <c>options</c> member of a create body, left out when there is nothing to send.</summary>
+    private static Dictionary<string, object>? CreateOptions(IReadOnlyDictionary<string, HeaderValue>? options)
     {
-        if (options is null)
-        {
-            return new Dictionary<string, string>();
-        }
-
-        return options.ToDictionary(entry => entry.Key, entry => ToStringValue(entry.Value));
+        return options is { Count: > 0 } ? OptionInputs.From(options) : null;
     }
 
-    private static string ToStringValue(HeaderValue value)
+    /// <summary>
+    ///     PUT of the flat update body. A key the body leaves out keeps its value, a key in <c>reset</c> returns to
+    ///     its default.
+    /// </summary>
+    private async Task PutUpdateAsync(string path, OptionsPatch patch, CancellationToken token)
     {
-        // A Bool header renders as "1" or "0", which the server's option parser refuses. It takes
-        // the words a config file would carry.
-        if (value.Kind is HeaderKind.Bool)
+        var json = JsonSerializer.Serialize(patch.ToHttpBody(), _jsonSerializerOptions);
+        var data = new StringContent(json, Encoding.UTF8, "application/json");
+        var response = await _httpClient.PutAsync(path, data, token);
+        if (!response.IsSuccessStatusCode)
         {
-            return value.ToBool() ? "true" : "false";
+            await HandleResponseAsync(response);
         }
-
-        return value.ToString();
     }
 
     /// <inheritdoc />
@@ -776,10 +747,10 @@ public class HttpMessageStream : IIggyClient
 
     /// <inheritdoc />
     public async Task<UserResponse?> CreateUserAsync(string userName, string password, UserStatus status,
-        Permissions? permissions = null, CancellationToken token = default)
+        Permissions? permissions = null, UserOptions? options = null, CancellationToken token = default)
     {
-        var json = JsonSerializer.Serialize(new CreateUserRequest(userName, password, status, permissions),
-            _jsonSerializerOptions);
+        var json = JsonSerializer.Serialize(new CreateUserRequest(userName, password, status, permissions,
+            CreateOptions(options?.ToDictionary())), _jsonSerializerOptions);
 
         var content = new StringContent(json, Encoding.UTF8, "application/json");
         var response = await _httpClient.PostAsync("/users", content, token);
@@ -803,16 +774,10 @@ public class HttpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public async Task UpdateUserAsync(Identifier userId, string? userName = null, UserStatus? status = null,
-        CancellationToken token = default)
+    public async Task UpdateUserAsync(Identifier userId, UserUpdate update, CancellationToken token = default)
     {
-        var json = JsonSerializer.Serialize(new UpdateUserRequest(userName, status), _jsonSerializerOptions);
-        var content = new StringContent(json, Encoding.UTF8, "application/json");
-        var response = await _httpClient.PutAsync($"/users/{userId}", content, token);
-        if (!response.IsSuccessStatusCode)
-        {
-            await HandleResponseAsync(response);
-        }
+        ArgumentNullException.ThrowIfNull(update);
+        await PutUpdateAsync($"/users/{userId}", update.ToPatch(), token);
     }
 
     /// <inheritdoc />

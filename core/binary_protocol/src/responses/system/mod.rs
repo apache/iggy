@@ -21,6 +21,7 @@ pub mod get_me;
 pub mod get_snapshot;
 pub mod get_stats;
 mod ping;
+mod update_resource;
 
 pub use super::EmptyResponse;
 pub use describe_options::{DescribeOptionsResponse, OptionDescriptor};
@@ -29,3 +30,4 @@ pub use get_me::GetMeResponse;
 pub use get_snapshot::GetSnapshotResponse;
 pub use get_stats::StatsResponse;
 pub use ping::PingResponse;
+pub use update_resource::UpdateResourceResponse;

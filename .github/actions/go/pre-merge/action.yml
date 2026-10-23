@@ -129,6 +129,8 @@ runs:
       uses: ./.github/actions/utils/server-start
       with:
         bin: target/debug/iggy-server
+        encryption-enabled: "true"
+        encryption-key: "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE="
         replica-id: "0"
         pid-file: ${{ runner.temp }}/iggy-go-e2e.pid
         log-file: ${{ runner.temp }}/iggy-go-e2e.log
@@ -179,12 +181,45 @@ runs:
         pid-file: ${{ steps.iggy.outputs.pid_file }}
         log-file: ${{ steps.iggy.outputs.log_file }}
 
+    - name: Start Iggy server (shipped default)
+      id: iggy-default
+      if: inputs.task == 'e2e'
+      uses: ./.github/actions/utils/server-start
+      with:
+        bin: target/debug/iggy-server
+        replica-id: "0"
+        pid-file: ${{ runner.temp }}/iggy-go-e2e-default.pid
+        log-file: ${{ runner.temp }}/iggy-go-e2e-default.log
+        wait-timeout-seconds: "90"
+      env:
+        IGGY_PATH: ${{ runner.temp }}/iggy-go-e2e-default-data
+
+    # The resource options cases need a server key, so they run on the other lanes.
+    - name: Run e2e tests (shipped default)
+      shell: bash
+      if: inputs.task == 'e2e'
+      env:
+        IGGY_TCP_ADDRESS: 127.0.0.1:8090
+      run: |
+        cd foreign/go
+        go test -v -race ./tests/... \
+          -skip '^TestE2E_(StreamKeyProjection|KeylessStream|StreamRename|TopicReset|UserOptions)$'
+
+    - name: Stop Iggy server (shipped default)
+      if: always() && inputs.task == 'e2e'
+      uses: ./.github/actions/utils/server-stop
+      with:
+        pid-file: ${{ steps.iggy-default.outputs.pid_file }}
+        log-file: ${{ steps.iggy-default.outputs.log_file }}
+
     - name: Start Iggy server (TLS)
       id: iggy-tls
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/server-start
       with:
         bin: target/debug/iggy-server
+        encryption-enabled: "true"
+        encryption-key: "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE="
         replica-id: "0"
         pid-file: ${{ runner.temp }}/iggy-go-e2e-tls.pid
         log-file: ${{ runner.temp }}/iggy-go-e2e-tls.log
@@ -223,6 +258,8 @@ runs:
       uses: ./.github/actions/utils/server-start
       with:
         bin: target/debug/iggy-server
+        encryption-enabled: "true"
+        encryption-key: "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE="
         replica-id: "0"
         pid-file: ${{ runner.temp }}/iggy-go-cluster-0.pid
         log-file: ${{ runner.temp }}/iggy-go-cluster-0.log
@@ -237,6 +274,8 @@ runs:
       uses: ./.github/actions/utils/server-start
       with:
         bin: target/debug/iggy-server
+        encryption-enabled: "true"
+        encryption-key: "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE="
         replica-id: "1"
         tcp_address: 127.0.0.1:8091
         http_address: 127.0.0.1:3001

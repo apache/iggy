@@ -44,7 +44,7 @@ use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 use tokio::time;
-use tokio::time::{Instant, sleep, timeout_at};
+use tokio::time::{Instant, sleep};
 use tracing::{debug, error, info, trace, warn};
 
 const ORDERING: std::sync::atomic::Ordering = std::sync::atomic::Ordering::SeqCst;
@@ -252,11 +252,8 @@ impl IggyConsumerState {
     }
 
     async fn mutate_offset(&self, mutation: OffsetMutation) -> Result<(), IggyError> {
-        with_deadline(Instant::now() + OPERATION_TIMEOUT, async {
+        super::with_client!(self, client => {
             let deadline = operation_deadline();
-            let client = timeout_at(deadline, self.client.read())
-                .await
-                .map_err(|_| IggyError::TransientNotAccepted)?;
             match self.send_offset_mutation(&client, mutation).await {
                 Err(IggyError::LaneBlocked(op)) => {
                     if matches!(
@@ -272,7 +269,6 @@ impl IggyConsumerState {
                 result => result,
             }
         })
-        .await
     }
 
     async fn send_offset_mutation(
@@ -565,11 +561,16 @@ unsafe impl Sync for IggyConsumer {}
 ///
 /// A failed poll request waits [`polling_retry_interval()`] before yielding `Some(Err(..))` and leaves
 /// the consumer usable for the next call. This delay also applies to terminal server errors, to a lost
-/// link, and when the ordinary poll interval is disabled. An authentication failure is yielded at once
-/// and pauses polling until the client has signed in again. A disconnect of the whole client also
-/// pauses polling, until the client has reconnected and signed in again. The consumer handles both
-/// automatically; the next call parks for [`polling_retry_interval()`] while polling is paused. Hence,
+/// link, to an authentication failure, and when the ordinary poll interval is disabled. Hence,
 /// deciding when to give up on repeated errors is up to you.
+///
+/// Polling pauses while the client is not signed in, for example after a sign-out, or once every
+/// replica link has used up its reconnect retries, until it has signed in again. The heartbeat of the
+/// [`IggyClient`] restarts such links. The consumer handles this automatically; the next call parks
+/// for [`polling_retry_interval()`] while polling is paused. Polling does not pause for a client that
+/// only the caller can bring back: one shut down or disconnected by the caller, or one that lost every
+/// link with reconnection disabled. Each call then fails after [`polling_retry_interval()`], and
+/// [`IggyConsumerMessageExt::consume_messages`] returns the error.
 ///
 /// After another client deletes and recreates a partition, one poll of it can fail with
 /// [`IggyError::HistoryUnavailable`], or [`IggyError::ConsumerGroupPartitionNotOwned`] for a group
@@ -660,7 +661,7 @@ unsafe impl Sync for IggyConsumer {}
 /// | [`allow_replay()`] | off | whether a message can be handed over again |
 /// | [`auto_join_consumer_group()`] | on | joining the group during [`init()`](Self::init) and again whenever the membership is lost. With [`do_not_auto_join_consumer_group()`] joining is up to the caller, and a poll without a membership fails with [`IggyError::ConsumerGroupMemberNotFound`] |
 /// | [`create_consumer_group_if_not_exists()`] | on | creating the group when it is missing |
-/// | [`polling_retry_interval()`] | one second | delay before yielding poll errors other than connection and authentication failures, and between attempts while polling is blocked or the member holds no partitions |
+/// | [`polling_retry_interval()`] | one second | delay before yielding a failed poll request, and between attempts while polling is paused or the member holds no partitions |
 /// | [`init_retries()`] | none, one second apart | retries when the stream or topic is missing at [`init()`](Self::init) |
 /// | [`offset_drain_timeout()`] | five seconds | how long [`shutdown()`](Self::shutdown) waits for pending commits |
 /// | [`encryptor()`] | inherited from the client | decrypting payloads and user headers, see [Encryption](#encryption) |
@@ -895,6 +896,11 @@ impl IggyConsumer {
         self.auto_commit
     }
 
+    /// Whether the client is up or comes back without the caller.
+    pub(crate) async fn client_can_recover(&self) -> bool {
+        self.client.read().await.can_recover().await
+    }
+
     /// Returns the name of the consumer.
     ///
     /// For a consumer group this is also the name of the group.
@@ -1040,17 +1046,16 @@ impl IggyConsumer {
     ///
     /// Calling init spawns a background task that listens for lifecycle changes ([`DiagnosticEvent`]s) of the
     /// client connection. It runs until [`shutdown()`](Self::shutdown) or until the client shuts
-    /// down.
-    /// - [`DiagnosticEvent::Connected`]: a fresh connection has not joined anything yet.
-    ///   Polling resumes immediately only for a consumer that is not a group member.
-    /// - [`DiagnosticEvent::SignedIn`]: re-enables polling. A group member whose membership is
-    ///   gone rejoins its group on the next poll, before the request goes out. A failed rejoin is
-    ///   yielded as a poll error and tried again on the poll after.
-    /// - [`DiagnosticEvent::Disconnected`] and [`DiagnosticEvent::SignedOut`] disable polling and
-    ///   forget the group membership.
-    /// - [`DiagnosticEvent::Shutdown`] disables polling and terminates the background task listening
-    ///   for lifecycle changes. It does not flush in-flight commits; that only happens when
-    ///   [`shutdown()`](Self::shutdown) itself is called.
+    /// down. After every other event, polling is enabled only while the client is signed in at
+    /// that moment, because an event can arrive after one that reports a later state. A client
+    /// that only the caller can bring back is polled anyway, so each poll fails with the reason.
+    /// - [`DiagnosticEvent::Connected`], [`DiagnosticEvent::Disconnected`] and
+    ///   [`DiagnosticEvent::SignedOut`] forget the group membership. A group member whose
+    ///   membership is gone rejoins its group on the next poll, before the request goes out. A
+    ///   failed rejoin is yielded as a poll error and tried again on the poll after.
+    /// - [`DiagnosticEvent::Shutdown`] terminates the background task listening for lifecycle
+    ///   changes, and every later poll fails with [`IggyError::ClientShutdown`]. It does not flush
+    ///   in-flight commits; that only happens when [`shutdown()`](Self::shutdown) itself is called.
     ///
     /// # Storing offsets
     ///
@@ -1314,7 +1319,7 @@ impl IggyConsumer {
             receiver = client.subscribe_events().await;
         }
 
-        let is_consumer_group = self.is_consumer_group;
+        let client = self.client.clone();
         let can_poll = self.can_poll.clone();
         let joined_consumer_group = self.joined_consumer_group.clone();
 
@@ -1331,23 +1336,20 @@ impl IggyConsumer {
                     DiagnosticEvent::Connected => {
                         trace!("Connected to the server");
                         joined_consumer_group.store(false, ORDERING);
-                        if !is_consumer_group {
-                            can_poll.store(true, ORDERING);
-                        }
                     }
                     DiagnosticEvent::Disconnected => {
                         joined_consumer_group.store(false, ORDERING);
-                        can_poll.store(false, ORDERING);
                         warn!("Disconnected from the server");
                     }
-                    DiagnosticEvent::SignedIn => {
-                        can_poll.store(true, ORDERING);
-                    }
+                    DiagnosticEvent::SignedIn => {}
                     DiagnosticEvent::SignedOut => {
                         joined_consumer_group.store(false, ORDERING);
-                        can_poll.store(false, ORDERING);
                     }
                 }
+                // Links publish from several tasks, so an event can arrive after one that
+                // reports a later state. The state of the client decides instead.
+                let authenticated = client.read().await.is_authenticated().await;
+                can_poll.store(authenticated, ORDERING);
             }
         })
     }
@@ -1383,6 +1385,11 @@ impl IggyConsumer {
             }
 
             while !can_poll.load(ORDERING) {
+                // Polling of a client that only the caller brings back never resumes, so the
+                // poll goes on and fails with the reason instead of parking for good.
+                if !client.read().await.can_recover().await {
+                    break;
+                }
                 trace!("Cannot poll yet, waiting {retry_interval}...");
                 sleep(retry_interval.get_duration()).await;
             }
@@ -1505,9 +1512,8 @@ impl IggyConsumer {
             {
                 joined_consumer_group.store(false, ORDERING);
             }
-            if matches!(error, IggyError::Unauthenticated) {
-                return Err(error);
-            }
+            // Unauthenticated waits too: only a lifecycle event pauses polling, and a sign-out that
+            // this consumer missed sends none, so an error yielded at once lets a caller spin.
             trace!("Retrying to poll messages in {retry_interval}...");
             sleep(retry_interval.get_duration()).await;
             Err(error)
@@ -2018,10 +2024,12 @@ mod tests {
     use crate::client_wrappers::client_wrapper::ClientWrapper;
     use crate::clients::consumer_builder::IggyConsumerBuilder;
     use crate::consumer_ext::{IggyConsumerMessageExt, MessageConsumer};
+    use crate::links::ReconnectPolicy;
     use crate::links::fake_cluster::{
-        Answer, FakeCluster, TEST_BUDGET, connected, endpoint, eventually,
+        Answer, FakeCluster, TEST_BUDGET, connected, connected_with, endpoint, eventually, policy,
     };
     use crate::tcp::tcp_client::TcpClient;
+    use iggy_binary_protocol::batch::{BATCH_HEADER_SIZE, BATCH_MESSAGE_HEADER_SIZE, BatchHeader};
     use iggy_binary_protocol::codes::{
         CREATE_CONSUMER_GROUP_CODE, DELETE_CONSUMER_OFFSET_CODE, GET_CONSUMER_GROUP_CODE,
         JOIN_CONSUMER_GROUP_CODE, LOGIN_REGISTER_CODE, POLL_MESSAGES_CODE,
@@ -2039,8 +2047,10 @@ mod tests {
         PartitionRouteResponse, PollMessagesResponseHeader,
     };
     use iggy_binary_protocol::{PartitionContext, WireDecode, WireEncode, WireName};
-    use iggy_common::Aes256GcmEncryptor;
     use iggy_common::locking::IggyRwLockFn;
+    use iggy_common::{
+        Aes256GcmEncryptor, BinaryTransport, TcpClientReconnectionConfig, UserClient,
+    };
     use std::iter::repeat_n;
     use std::str::FromStr;
     use std::task::Waker;
@@ -2057,6 +2067,25 @@ mod tests {
     impl MessageConsumer for RejectMessages {
         async fn consume(&self, _message: ReceivedMessage) -> Result<(), IggyError> {
             panic!("a blocked poll must not deliver a message")
+        }
+    }
+
+    /// Records the offset of each message and stops the consumption after the first one.
+    struct RecordMessages {
+        offsets: std::sync::Mutex<Vec<u64>>,
+        shutdown: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    impl MessageConsumer for RecordMessages {
+        async fn consume(&self, message: ReceivedMessage) -> Result<(), IggyError> {
+            self.offsets
+                .lock()
+                .unwrap()
+                .push(message.message.header.offset);
+            if let Some(shutdown) = self.shutdown.lock().unwrap().take() {
+                shutdown.send(()).unwrap();
+            }
+            Ok(())
         }
     }
 
@@ -2768,6 +2797,33 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn given_an_outer_deadline_past_the_default_budget_when_a_store_is_unanswered_should_end_at_the_outer_deadline()
+     {
+        const OUTER_DEADLINE: Duration = OPERATION_TIMEOUT.saturating_mul(2);
+        let (client, served) = connect_to_test_server(vec![1], IggyError::HistoryUnavailable).await;
+        let consumer = builder_on(client, Consumer::new(Identifier::numeric(1).unwrap()))
+            .partition(Some(1))
+            .auto_commit(AutoCommit::Disabled)
+            .build();
+        served
+            .0
+            .script(&endpoint(0), STORE_CONSUMER_OFFSET_CODE, [Answer::Silence]);
+        let started = Instant::now();
+
+        let result = with_deadline(
+            started + OUTER_DEADLINE,
+            consumer.store_position(captured_position_at(STORED_OFFSET)),
+        )
+        .await;
+
+        let op = served.0.received(STORE_CONSUMER_OFFSET_CODE)[0]
+            .header
+            .request;
+        assert_eq!(result, Err(IggyError::OperationUncertain(op)));
+        assert_eq!(started.elapsed(), OUTER_DEADLINE);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn given_multiple_final_positions_when_shutdown_times_out_should_share_one_deadline() {
         let (client, served) =
             connect_to_test_server(vec![1, 2], IggyError::HistoryUnavailable).await;
@@ -3052,6 +3108,12 @@ mod tests {
     /// A signed-in client of three ready replicas. Replica 0 is the metadata
     /// primary, and `PARTITION_PRIMARY` leads every partition.
     async fn connect_to_three_replicas() -> (TcpClient, Arc<FakeCluster>) {
+        connect_to_three_replicas_with(policy()).await
+    }
+
+    async fn connect_to_three_replicas_with(
+        policy: ReconnectPolicy,
+    ) -> (TcpClient, Arc<FakeCluster>) {
         let cluster = FakeCluster::new(3);
         *cluster.route.lock().unwrap() = Some(PartitionRouteResponse {
             incarnation: 1,
@@ -3060,8 +3122,23 @@ mod tests {
             partitions_count: POLLED_PARTITION + 1,
             primary_replica: PARTITION_PRIMARY,
         });
-        let links = connected(&cluster, 3).await;
+        let links = connected_with(&cluster, 3, policy).await;
         (TcpClient::from_links(links), cluster)
+    }
+
+    /// Takes every replica of `cluster` down, which closes the links to them.
+    fn take_every_replica_down(cluster: &FakeCluster) {
+        let endpoints: Vec<String> = cluster
+            .nodes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|node| endpoint(node.replica_id))
+            .collect();
+        for endpoint in endpoints {
+            cluster.down.lock().unwrap().insert(endpoint.clone());
+            cluster.drop_connections(&endpoint);
+        }
     }
 
     /// A consumer of `POLLED_PARTITION` whose polling follows the client
@@ -3077,14 +3154,42 @@ mod tests {
         consumer
     }
 
-    fn empty_poll() -> Answer {
+    /// Publishes `events` in order on the client of `consumer`.
+    async fn publish(consumer: &IggyConsumer, events: &[DiagnosticEvent]) {
+        let client = consumer.client.read().await;
+        let ClientWrapper::Tcp(client) = &*client else {
+            panic!("a test consumer runs on a TCP client");
+        };
+        for event in events {
+            client.publish_event(*event).await;
+        }
+    }
+
+    /// A poll reply of `POLLED_PARTITION` with `messages_count` messages in `batches`.
+    fn poll_answer(current_offset: u64, messages_count: u32, batches: &[u8]) -> Answer {
         let header = PollMessagesResponseHeader {
             partition_id: POLLED_PARTITION,
-            current_offset: 0,
-            messages_count: 0,
+            current_offset,
+            messages_count,
             context: PartitionContext::default(),
         };
-        Answer::CommitBody(1, header.to_bytes().to_vec())
+        let mut body = header.to_bytes().to_vec();
+        body.extend_from_slice(batches);
+        Answer::CommitBody(1, body)
+    }
+
+    fn empty_poll() -> Answer {
+        poll_answer(0, 0, &[])
+    }
+
+    /// A poll reply with one empty message at `offset`. A zeroed frame is such a message, and the
+    /// client does not check its checksum.
+    fn poll_of_one_message(offset: u64) -> Answer {
+        let mut batch = vec![0; BATCH_HEADER_SIZE + BATCH_MESSAGE_HEADER_SIZE];
+        let mut header = BatchHeader::new(0, 0, batch.len() as u64, 1);
+        header.base_offset = offset;
+        header.encode_into(&mut batch);
+        poll_answer(offset, 1, &batch)
     }
 
     fn existing_consumer_group() -> Answer {
@@ -3317,7 +3422,10 @@ mod tests {
 
         let lost = consumer.create_poll_messages_future().await;
 
-        assert!(matches!(lost, Err(IggyError::NotConnected)), "{lost:?}");
+        assert!(
+            matches!(lost, Err(IggyError::TransientNotAccepted)),
+            "{lost:?}"
+        );
         cluster.down.lock().unwrap().clear();
         cluster.script(&primary, POLL_MESSAGES_CODE, [empty_poll()]);
         assert!(poll_until_success(&consumer).await.is_some());
@@ -3371,6 +3479,77 @@ mod tests {
 
         assert!(consumer.can_poll.load(ORDERING));
         assert!(poll_until_success(&consumer).await.is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_poll_lost_to_a_disconnect_when_consuming_callbacks_should_deliver_the_next_poll()
+     {
+        const OFFSET: u64 = 5;
+        let (client, cluster) = connect_to_three_replicas().await;
+        let mut consumer =
+            polling_consumer(client, Consumer::new(Identifier::numeric(1).unwrap())).await;
+        consumer.poll_future = Some(Box::pin(async { Err(IggyError::Disconnected) }));
+        cluster.script(
+            &endpoint(PARTITION_PRIMARY),
+            POLL_MESSAGES_CODE,
+            [poll_of_one_message(OFFSET)],
+        );
+        let (shutdown, receiver) = tokio::sync::oneshot::channel();
+        let handler = RecordMessages {
+            offsets: std::sync::Mutex::default(),
+            shutdown: std::sync::Mutex::new(Some(shutdown)),
+        };
+
+        let result = timeout(POLL_TIMEOUT, consumer.consume_messages(&handler, receiver)).await;
+
+        assert_eq!(result, Ok(Ok(())));
+        assert_eq!(*handler.offsets.lock().unwrap(), [OFFSET]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_signed_out_client_when_a_poll_fails_with_unauthenticated_should_wait_before_yielding_it()
+     {
+        let (client, cluster) = connect_to_three_replicas().await;
+        client.logout_user().await.unwrap();
+        // No lifecycle task, as for a sign-out that `init` did not see yet.
+        let consumer = builder_on(client, Consumer::new(Identifier::numeric(1).unwrap()))
+            .partition(Some(POLLED_PARTITION))
+            .auto_commit(AutoCommit::Disabled)
+            .polling_retry_interval(NonZeroIggyDuration::new(POLL_RETRY_INTERVAL).unwrap())
+            .build();
+        let started = Instant::now();
+
+        let polled = consumer.create_poll_messages_future().await;
+
+        assert!(
+            matches!(polled, Err(IggyError::Unauthenticated)),
+            "{polled:?}"
+        );
+        assert!(started.elapsed() >= POLL_RETRY_INTERVAL);
+        assert_eq!(cluster.count(POLL_MESSAGES_CODE), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_signed_in_client_when_a_late_disconnected_event_arrives_should_keep_polling() {
+        let (client, cluster) = connect_to_three_replicas().await;
+        let consumer =
+            polling_consumer(client, Consumer::new(Identifier::numeric(1).unwrap())).await;
+        cluster.script(
+            &endpoint(PARTITION_PRIMARY),
+            POLL_MESSAGES_CODE,
+            [empty_poll()],
+        );
+
+        publish(
+            &consumer,
+            &[DiagnosticEvent::SignedIn, DiagnosticEvent::Disconnected],
+        )
+        .await;
+        sleep(POLL_RETRY_INTERVAL).await;
+        let polled = timeout(POLL_TIMEOUT, consumer.create_poll_messages_future()).await;
+
+        assert!(matches!(polled, Ok(Ok(_))), "{polled:?}");
+        assert_eq!(cluster.count(POLL_MESSAGES_CODE), 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -3451,5 +3630,97 @@ mod tests {
         assert!(poll_until_success(&consumer).await.is_some());
         assert_eq!(cluster.count(LOGIN_REGISTER_CODE), 2);
         assert_eq!(cluster.count(JOIN_CONSUMER_GROUP_CODE), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_last_replica_link_that_gives_up_when_a_keepalive_restarts_the_links_should_pause_polling_and_keep_consuming_callbacks()
+     {
+        const OFFSET: u64 = 5;
+        let one_retry = TcpClientReconnectionConfig {
+            max_retries: Some(1),
+            ..TcpClientReconnectionConfig::default()
+        };
+        let (client, cluster) =
+            connect_to_three_replicas_with(ReconnectPolicy::from(&one_retry)).await;
+        let mut consumer =
+            polling_consumer(client, Consumer::new(Identifier::numeric(1).unwrap())).await;
+        take_every_replica_down(&cluster);
+        eventually("polling pauses once the last replica link gives up", || {
+            !consumer.can_poll.load(ORDERING)
+        })
+        .await;
+        cluster.down.lock().unwrap().clear();
+        cluster.script(
+            &endpoint(PARTITION_PRIMARY),
+            POLL_MESSAGES_CODE,
+            [poll_of_one_message(OFFSET)],
+        );
+        let (shutdown, receiver) = tokio::sync::oneshot::channel();
+        let handler = RecordMessages {
+            offsets: std::sync::Mutex::default(),
+            shutdown: std::sync::Mutex::new(Some(shutdown)),
+        };
+        let client = consumer.client.clone();
+        let heartbeat = async {
+            sleep(POLL_TIMEOUT).await;
+            client.read().await.keepalive().await
+        };
+
+        let (consumed, keepalive) = tokio::join!(
+            timeout(TEST_BUDGET, consumer.consume_messages(&handler, receiver)),
+            heartbeat
+        );
+
+        assert_eq!(keepalive, Ok(true));
+        assert_eq!(consumed, Ok(Ok(())));
+        assert_eq!(*handler.offsets.lock().unwrap(), [OFFSET]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_reconnection_disabled_when_every_replica_link_is_lost_should_end_consuming_callbacks()
+     {
+        let disabled = TcpClientReconnectionConfig {
+            enabled: false,
+            ..TcpClientReconnectionConfig::default()
+        };
+        let (client, cluster) =
+            connect_to_three_replicas_with(ReconnectPolicy::from(&disabled)).await;
+        let mut consumer =
+            polling_consumer(client, Consumer::new(Identifier::numeric(1).unwrap())).await;
+        take_every_replica_down(&cluster);
+        eventually("polling pauses once the client is disconnected", || {
+            !consumer.can_poll.load(ORDERING)
+        })
+        .await;
+        let (_shutdown, receiver) = tokio::sync::oneshot::channel();
+
+        let result = timeout(
+            POLL_TIMEOUT,
+            consumer.consume_messages(&RejectMessages, receiver),
+        )
+        .await;
+
+        assert_eq!(result, Ok(Err(IggyError::Disconnected)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_shut_down_client_when_consuming_callbacks_should_end_with_client_shutdown() {
+        let (client, _cluster) = connect_to_three_replicas().await;
+        let mut consumer =
+            polling_consumer(client, Consumer::new(Identifier::numeric(1).unwrap())).await;
+        consumer.client.read().await.shutdown().await.unwrap();
+        eventually("polling stops once the client shuts down", || {
+            !consumer.can_poll.load(ORDERING)
+        })
+        .await;
+        let (_shutdown, receiver) = tokio::sync::oneshot::channel();
+
+        let result = timeout(
+            POLL_TIMEOUT,
+            consumer.consume_messages(&RejectMessages, receiver),
+        )
+        .await;
+
+        assert_eq!(result, Ok(Err(IggyError::ClientShutdown)));
     }
 }

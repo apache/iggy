@@ -18,8 +18,11 @@
 //! In-flight admission for partition writes, including detached `NoAck` replies: the per-session /
 //! shard-global budget guard. Coupled to the router body cap because the shard
 //! inbox is one shared bounded channel, so admission is correctness-adjacent.
+//! Also the per-credential / node-wide budget of the relayed partition requests
+//! this node serves as their hop target.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 
 use crate::http::error::PartitionWriteError;
 
@@ -81,6 +84,85 @@ pub(in crate::http) fn admit_partition_write<'a>(
         session_in_flight,
         global_in_flight,
     })
+}
+
+/// Node-wide budget for the relayed partition requests this node serves as
+/// their hop target, held from the request head to the answer: the body read,
+/// the metadata hold and the handler. Apart from the budget of the relays this
+/// node sends, so held targets never leave this node without a slot to relay
+/// its own callers' requests, and two nodes relaying to each other never
+/// starve each other.
+const MAX_IN_FLIGHT_RELAY_TARGETS: u32 = 128;
+
+/// Per-credential share of [`MAX_IN_FLIGHT_RELAY_TARGETS`], equal to the
+/// per-session write cap, so one caller relayed through every peer cannot
+/// occupy the whole budget.
+const MAX_IN_FLIGHT_RELAY_TARGETS_PER_CREDENTIAL: u32 = 32;
+
+/// Why a relayed partition request found no hop-target slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::http) enum RelayTargetRefusal {
+    /// The credential holds its whole share: the caller's own concurrency.
+    CredentialSaturated,
+    /// Every slot is held: node-wide pressure.
+    BudgetSaturated,
+}
+
+/// Hop-target slots in use, node-wide and per credential.
+#[derive(Debug, Default)]
+pub(in crate::http) struct RelayTargets {
+    in_flight: Cell<u32>,
+    /// Only credentials holding a slot have an entry, so the map never
+    /// outgrows [`MAX_IN_FLIGHT_RELAY_TARGETS`].
+    per_credential: RefCell<HashMap<String, u32>>,
+}
+
+/// One hop-target slot. Released on drop, so an answer, a refusal, an expired
+/// body read and a caller hanging up mid-request all free it through one path.
+pub(in crate::http) struct RelayTargetGuard<'a> {
+    targets: &'a RelayTargets,
+    credential: String,
+}
+
+impl RelayTargets {
+    /// Admit one relayed request of `credential` against its share and the
+    /// node-wide budget, taking a slot only when both pass. The share is
+    /// checked first, so a saturated credential reads its own refusal rather
+    /// than node-wide pressure.
+    pub(in crate::http) fn admit(
+        &self,
+        credential: String,
+    ) -> Result<RelayTargetGuard<'_>, RelayTargetRefusal> {
+        let mut per_credential = self.per_credential.borrow_mut();
+        let held = per_credential.get(&credential).copied().unwrap_or(0);
+        if held >= MAX_IN_FLIGHT_RELAY_TARGETS_PER_CREDENTIAL {
+            return Err(RelayTargetRefusal::CredentialSaturated);
+        }
+        if self.in_flight.get() >= MAX_IN_FLIGHT_RELAY_TARGETS {
+            return Err(RelayTargetRefusal::BudgetSaturated);
+        }
+        per_credential.insert(credential.clone(), held + 1);
+        drop(per_credential);
+        self.in_flight.set(self.in_flight.get() + 1);
+        Ok(RelayTargetGuard {
+            targets: self,
+            credential,
+        })
+    }
+}
+
+impl Drop for RelayTargetGuard<'_> {
+    fn drop(&mut self) {
+        let mut per_credential = self.targets.per_credential.borrow_mut();
+        if let Some(held) = per_credential.get_mut(&self.credential) {
+            *held -= 1;
+            if *held == 0 {
+                per_credential.remove(&self.credential);
+            }
+        }
+        drop(per_credential);
+        self.targets.in_flight.set(self.targets.in_flight.get() - 1);
+    }
 }
 
 #[cfg(test)]
@@ -181,5 +263,60 @@ mod tests {
         assert_eq!(fresh.get(), 1);
         assert_eq!(global.get(), MAX_IN_FLIGHT_WRITES_GLOBAL);
         drop(readmitted);
+    }
+
+    #[test]
+    fn given_saturated_credential_when_admitting_relay_targets_should_refuse_only_that_credential()
+    {
+        let targets = RelayTargets::default();
+        let held: Vec<_> = (0..MAX_IN_FLIGHT_RELAY_TARGETS_PER_CREDENTIAL)
+            .map(|_| targets.admit("busy".to_owned()).expect("within the share"))
+            .collect();
+        assert_eq!(
+            targets.admit("busy".to_owned()).err(),
+            Some(RelayTargetRefusal::CredentialSaturated)
+        );
+        let other = targets
+            .admit("other".to_owned())
+            .expect("another credential");
+        drop(held);
+        drop(other);
+        assert_eq!(targets.in_flight.get(), 0);
+        assert!(targets.per_credential.borrow().is_empty());
+    }
+
+    #[test]
+    fn given_full_relay_target_budget_when_admitting_should_refuse_and_reopen_on_release() {
+        let targets = RelayTargets::default();
+        let credentials = MAX_IN_FLIGHT_RELAY_TARGETS / MAX_IN_FLIGHT_RELAY_TARGETS_PER_CREDENTIAL;
+        let mut held: Vec<_> = (0..credentials)
+            .flat_map(|credential| {
+                (0..MAX_IN_FLIGHT_RELAY_TARGETS_PER_CREDENTIAL).map(move |_| credential)
+            })
+            .map(|credential| {
+                targets
+                    .admit(credential.to_string())
+                    .expect("within the budget")
+            })
+            .collect();
+        assert_eq!(targets.in_flight.get(), MAX_IN_FLIGHT_RELAY_TARGETS);
+        assert_eq!(
+            targets.admit("fresh".to_owned()).err(),
+            Some(RelayTargetRefusal::BudgetSaturated)
+        );
+        // A refusal takes nothing, so the fresh credential holds no entry.
+        assert!(!targets.per_credential.borrow().contains_key("fresh"));
+        assert_eq!(
+            targets.admit("0".to_owned()).err(),
+            Some(RelayTargetRefusal::CredentialSaturated)
+        );
+        drop(held.pop());
+        let readmitted = targets
+            .admit("fresh".to_owned())
+            .expect("a slot was released");
+        drop(readmitted);
+        drop(held);
+        assert_eq!(targets.in_flight.get(), 0);
+        assert!(targets.per_credential.borrow().is_empty());
     }
 }

@@ -277,9 +277,18 @@ async fn should_handle_resource_deletion_and_restart() {
     let client = harness.tcp_root_client().await.unwrap();
 
     // Create 3 streams
-    let stream_0 = client.create_stream("stream-0").await.unwrap();
-    let stream_1 = client.create_stream("stream-1").await.unwrap();
-    let stream_2 = client.create_stream("stream-2").await.unwrap();
+    let stream_0 = client
+        .create_stream("stream-0", &StreamCreateOptions::default())
+        .await
+        .unwrap();
+    let stream_1 = client
+        .create_stream("stream-1", &StreamCreateOptions::default())
+        .await
+        .unwrap();
+    let stream_2 = client
+        .create_stream("stream-2", &StreamCreateOptions::default())
+        .await
+        .unwrap();
 
     assert_eq!(stream_0.id, 0);
     assert_eq!(stream_1.id, 1);
@@ -372,7 +381,10 @@ async fn should_handle_resource_deletion_and_restart() {
     // was used instead of vacant_key() to predict the assigned ID.
     // After deletion: streams are [0, 2], len=2, but vacant_key=1
     // Bug: code used len (2) to create directory, but metadata assigned ID 1
-    let stream_reused = client.create_stream("stream-reused").await.unwrap();
+    let stream_reused = client
+        .create_stream("stream-reused", &StreamCreateOptions::default())
+        .await
+        .unwrap();
     assert_eq!(
         stream_reused.id, 1,
         "New stream should reuse deleted ID 1, got {}",
