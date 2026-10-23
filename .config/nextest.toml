@@ -101,13 +101,5 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 # Keep Miri bounded by the CI job timeout instead of the native-test limit.
 slow-timeout = { period = "60s" }
 
-[[profile.default-miri.overrides]]
-# Start the options boundary test early so other work overlaps it.
-filter = '''
-    package(=iggy_binary_protocol)
-    & test(=primitives::options::tests::entry_count_over_limit_is_rejected)
-'''
-priority = 100
-
 [profile.ci]
 retries = 3
