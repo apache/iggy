@@ -31,7 +31,10 @@ use rumqttc::{
     AsyncClient as Mqtt311Client, Event as Mqtt311Event, EventLoop as Mqtt311EventLoop,
     Incoming as Mqtt311Incoming, MqttOptions as Mqtt311Options, mqttbytes::QoS as Mqtt311Qos,
 };
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 use tokio::{sync::Mutex, time::timeout};
 use url::Url;
 
@@ -39,10 +42,13 @@ const DEFAULT_SINK_TOPIC: &str = "iggy.messages";
 const SINK_CLIENT_ID: &str = "iggy-mqtt-integration-sink";
 const SUBSCRIBER_CLIENT_ID: &str = "iggy-mqtt-integration-sink-subscriber";
 const RECEIVE_TIMEOUT: Duration = Duration::from_secs(10);
+const MAXIMUM_TEST_PACKET_SIZE: usize = 1024 * 1024;
 
 const ENV_SINK_BROKER_URL: &str = "IGGY_CONNECTORS_SINK_MQTT_PLUGIN_CONFIG_BROKER_URL";
 const ENV_SINK_CLIENT_ID: &str = "IGGY_CONNECTORS_SINK_MQTT_PLUGIN_CONFIG_CLIENT_ID";
+const ENV_SINK_KEEP_ALIVE: &str = "IGGY_CONNECTORS_SINK_MQTT_PLUGIN_CONFIG_KEEP_ALIVE";
 const ENV_SINK_MAX_IN_FLIGHT: &str = "IGGY_CONNECTORS_SINK_MQTT_PLUGIN_CONFIG_MAX_IN_FLIGHT";
+const ENV_SINK_MAX_RETRIES: &str = "IGGY_CONNECTORS_SINK_MQTT_PLUGIN_CONFIG_MAX_RETRIES";
 const ENV_SINK_PASSWORD: &str = "IGGY_CONNECTORS_SINK_MQTT_PLUGIN_CONFIG_PASSWORD";
 const ENV_SINK_PROTOCOL: &str = "IGGY_CONNECTORS_SINK_MQTT_PLUGIN_CONFIG_PROTOCOL";
 const ENV_SINK_QOS: &str = "IGGY_CONNECTORS_SINK_MQTT_PLUGIN_CONFIG_QOS";
@@ -65,6 +71,8 @@ pub struct MqttSinkFixture {
     qos: u8,
     schema: Schema,
     max_in_flight: usize,
+    keep_alive: Duration,
+    max_retries: usize,
     password: String,
     topic: Option<String>,
     topic_mode: MqttTopicMode,
@@ -158,12 +166,27 @@ impl MqttSinkFixture {
             qos,
             schema,
             max_in_flight,
+            keep_alive: Duration::from_secs(30),
+            max_retries: 5,
             password: MQTT_PASSWORD.to_string(),
             topic,
             topic_mode,
             topic_template,
             fallback_topic,
         })
+    }
+
+    async fn start_with_keep_alive(
+        protocol: MqttProtocol,
+        qos: u8,
+        schema: Schema,
+        keep_alive: Duration,
+        max_retries: usize,
+    ) -> Result<Self, TestBinaryError> {
+        let mut fixture = Self::start(protocol, qos, schema, 1).await?;
+        fixture.keep_alive = keep_alive;
+        fixture.max_retries = max_retries;
+        Ok(fixture)
     }
 
     pub async fn receive_messages(&self, count: usize) -> Result<Vec<Vec<u8>>, TestBinaryError> {
@@ -186,14 +209,14 @@ impl MqttSinkFixture {
             .await
     }
 
-    pub async fn receive_until_payload(
+    pub async fn receive_until_payloads(
         &self,
-        expected_payload: &[u8],
-    ) -> Result<ReceivedMqttPublication, TestBinaryError> {
+        expected_payloads: &[Vec<u8>],
+    ) -> Result<(), TestBinaryError> {
         self.subscriber
             .lock()
             .await
-            .receive_until_payload(expected_payload)
+            .receive_until_payloads(expected_payloads)
             .await
     }
 
@@ -225,6 +248,10 @@ impl TestFixture for MqttSinkFixture {
                 self.broker.broker_url.clone(),
             ),
             (ENV_SINK_CLIENT_ID.to_string(), SINK_CLIENT_ID.to_string()),
+            (
+                ENV_SINK_KEEP_ALIVE.to_string(),
+                format!("{}s", self.keep_alive.as_secs()),
+            ),
             (ENV_SINK_PASSWORD.to_string(), self.password.clone()),
             (
                 ENV_SINK_PROTOCOL.to_string(),
@@ -242,6 +269,10 @@ impl TestFixture for MqttSinkFixture {
             (
                 ENV_SINK_MAX_IN_FLIGHT.to_string(),
                 self.max_in_flight.to_string(),
+            ),
+            (
+                ENV_SINK_MAX_RETRIES.to_string(),
+                self.max_retries.to_string(),
             ),
             (ENV_SINK_USERNAME.to_string(), MQTT_USERNAME.to_string()),
             (
@@ -285,6 +316,38 @@ impl TestFixture for MqttSinkFixture {
     }
 }
 
+pub struct MqttSinkIdleFixture {
+    inner: MqttSinkFixture,
+}
+
+impl std::ops::Deref for MqttSinkIdleFixture {
+    type Target = MqttSinkFixture;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+#[async_trait]
+impl TestFixture for MqttSinkIdleFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        Ok(Self {
+            inner: MqttSinkFixture::start_with_keep_alive(
+                MqttProtocol::Mqtt5,
+                1,
+                Schema::Json,
+                Duration::from_secs(5),
+                0,
+            )
+            .await?,
+        })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        self.inner.connectors_runtime_envs()
+    }
+}
+
 pub struct MqttSinkQosTwoFixture {
     inner: MqttSinkFixture,
 }
@@ -307,7 +370,7 @@ impl std::ops::DerefMut for MqttSinkQosTwoFixture {
 impl TestFixture for MqttSinkQosTwoFixture {
     async fn setup() -> Result<Self, TestBinaryError> {
         Ok(Self {
-            inner: MqttSinkFixture::start(MqttProtocol::Mqtt5, 2, Schema::Json, 1).await?,
+            inner: MqttSinkFixture::start(MqttProtocol::Mqtt5, 2, Schema::Json, 3).await?,
         })
     }
 
@@ -643,25 +706,27 @@ impl MqttSubscriber {
         })?
     }
 
-    async fn receive_until_payload(
+    async fn receive_until_payloads(
         &mut self,
-        expected_payload: &[u8],
-    ) -> Result<ReceivedMqttPublication, TestBinaryError> {
+        expected_payloads: &[Vec<u8>],
+    ) -> Result<(), TestBinaryError> {
+        let mut remaining = expected_payloads.iter().cloned().collect::<HashSet<_>>();
+
         timeout(RECEIVE_TIMEOUT, async {
-            loop {
-                let mut publications = self.receive_publications(1).await?;
-                let publication = publications
+            while !remaining.is_empty() {
+                let publication = self
+                    .receive_publications(1)
+                    .await?
                     .pop()
                     .expect("one requested MQTT publication must be returned");
-                if publication.payload == expected_payload {
-                    return Ok(publication);
-                }
+                remaining.remove(&publication.payload);
             }
+            Ok(())
         })
         .await
         .map_err(|_| TestBinaryError::FixtureSetup {
             fixture_type: "MqttSubscriber".to_string(),
-            message: "Timed out waiting for the expected MQTT publication".to_string(),
+            message: "Timed out waiting for all expected MQTT publications".to_string(),
         })?
     }
 
@@ -687,6 +752,7 @@ impl MqttSubscriber {
             })?;
         let mut options = Mqtt311Options::new(SUBSCRIBER_CLIENT_ID, host, port);
         options.set_credentials(MQTT_USERNAME, MQTT_PASSWORD);
+        options.set_max_packet_size(MAXIMUM_TEST_PACKET_SIZE, MAXIMUM_TEST_PACKET_SIZE);
         let (client, mut event_loop) = Mqtt311Client::new(options, 16);
         for subscription_filter in subscription_filters {
             client
@@ -748,6 +814,7 @@ impl MqttSubscriber {
             })?;
         let mut options = Mqtt5Options::new(SUBSCRIBER_CLIENT_ID, host, port);
         options.set_credentials(MQTT_USERNAME, MQTT_PASSWORD);
+        options.set_max_packet_size(Some(MAXIMUM_TEST_PACKET_SIZE as u32));
         let (client, mut event_loop) = Mqtt5Client::new(options, 16);
         for subscription_filter in subscription_filters {
             client

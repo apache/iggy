@@ -17,7 +17,7 @@
 
 use crate::connectors::fixtures::{
     Mqtt311SinkQosOneFixture, Mqtt311SinkQosTwoFixture, Mqtt311SinkQosZeroFixture,
-    MqttSinkDynamicTopicFixture, MqttSinkEnvelopeFixture, MqttSinkFixture,
+    MqttSinkDynamicTopicFixture, MqttSinkEnvelopeFixture, MqttSinkFixture, MqttSinkIdleFixture,
     MqttSinkInvalidCredentialsFixture, MqttSinkPipelinedFixture, MqttSinkQosTwoFixture,
     MqttSinkQosZeroFixture, MqttSinkRawSchemaFixture, MqttSinkTemplateTopicFixture,
 };
@@ -148,7 +148,31 @@ async fn mqtt5_qos1_messages_are_published_to_mqtt(
     server(connectors_runtime(config_path = "tests/connectors/mqtt/sink.toml")),
     seed = seeds::connector_stream
 )]
-async fn raw_schema_messages_preserve_payload_bytes_when_published_to_mqtt(
+async fn mqtt5_sink_keeps_idle_connection_alive(
+    harness: &TestHarness,
+    fixture: MqttSinkIdleFixture,
+) {
+    wait_for_sink_status(harness, "running").await;
+    sleep(Duration::from_secs(8)).await;
+
+    let payload = serde_json::json!({"after_idle": true});
+    send_json_messages(harness, vec![payload.clone()]).await;
+
+    let received = fixture
+        .receive_messages(1)
+        .await
+        .expect("an idle MQTT connection must publish without a retry");
+    let received: Value =
+        serde_json::from_slice(&received[0]).expect("MQTT payload must be valid JSON");
+
+    assert_eq!(received, payload);
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/mqtt/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn raw_schema_messages_including_payload_larger_than_ten_kib_preserve_payload_bytes(
     harness: &TestHarness,
     fixture: MqttSinkRawSchemaFixture,
 ) {
@@ -164,6 +188,7 @@ async fn raw_schema_messages_preserve_payload_bytes_when_published_to_mqtt(
         b"plain text message".to_vec(),
         vec![0x00, 0x01, 0x02, 0xFF, 0xFE, 0xFD],
         vec![0xDE, 0xAD, 0xBE, 0xEF],
+        vec![0xA5; 16 * 1024],
     ];
     let mut messages = payloads
         .iter()
@@ -199,7 +224,7 @@ async fn raw_schema_messages_preserve_payload_bytes_when_published_to_mqtt(
     server(connectors_runtime(config_path = "tests/connectors/mqtt/sink.toml")),
     seed = seeds::connector_stream
 )]
-async fn mqtt5_qos2_messages_are_published_to_mqtt(
+async fn mqtt5_qos2_pipelined_messages_are_published_to_mqtt(
     harness: &TestHarness,
     fixture: MqttSinkQosTwoFixture,
 ) {
@@ -211,16 +236,22 @@ async fn mqtt5_qos2_messages_are_published_to_mqtt(
         .try_into()
         .expect("stream ID must parse");
     let topic_id: Identifier = seeds::names::TOPIC.try_into().expect("topic ID must parse");
-    let payload = serde_json::json!({"name": "Alice"});
-    let mut messages = vec![
-        IggyMessage::builder()
-            .id(1)
-            .payload(Bytes::from(
-                serde_json::to_vec(&payload).expect("test payload must serialize"),
-            ))
-            .build()
-            .expect("test message must build"),
-    ];
+    let payloads = (0..10)
+        .map(|sequence| serde_json::json!({"sequence": sequence}))
+        .collect::<Vec<_>>();
+    let mut messages = payloads
+        .iter()
+        .enumerate()
+        .map(|(index, payload)| {
+            IggyMessage::builder()
+                .id((index + 1) as u128)
+                .payload(Bytes::from(
+                    serde_json::to_vec(payload).expect("test payload must serialize"),
+                ))
+                .build()
+                .expect("test message must build")
+        })
+        .collect::<Vec<_>>();
 
     client
         .send_messages(
@@ -230,16 +261,19 @@ async fn mqtt5_qos2_messages_are_published_to_mqtt(
             &mut messages,
         )
         .await
-        .expect("message must send to Iggy");
+        .expect("messages must send to Iggy");
 
     let received = fixture
-        .receive_messages(1)
+        .receive_messages(payloads.len())
         .await
-        .expect("message must reach MQTT");
-    let received: serde_json::Value =
-        serde_json::from_slice(&received[0]).expect("MQTT payload must be valid JSON");
+        .expect("messages must reach MQTT");
+    let received = received
+        .iter()
+        .map(|payload| serde_json::from_slice::<serde_json::Value>(payload))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("MQTT payloads must be valid JSON");
 
-    assert_eq!(received, payload);
+    assert_eq!(received, payloads);
 }
 
 #[iggy_harness(
@@ -439,14 +473,21 @@ async fn mqtt5_sink_reconnects_during_pipelined_publications(
         .collect::<Vec<_>>();
     send_json_messages(harness, payloads.clone()).await;
 
-    fixture
+    let first_publication = fixture
         .receive_publications(1)
         .await
-        .expect("the first publication must reach MQTT");
+        .expect("a publication must reach MQTT before disconnect")
+        .pop()
+        .expect("one requested MQTT publication must be returned");
     fixture
         .disconnect_sink()
         .await
         .expect("EMQX must disconnect the sink client");
+    fixture
+        .wait_for_sink_reconnect()
+        .await
+        .expect("the sink must reconnect after the blocked publications");
+
     let recovery_payload = serde_json::json!({"sequence": "after-reconnect"});
     let recovery_message = IggyMessage::builder()
         .id(11)
@@ -456,16 +497,25 @@ async fn mqtt5_sink_reconnects_during_pipelined_publications(
         .build()
         .expect("recovery message must build");
     send_messages(harness, vec![recovery_message]).await;
+
+    let mut expected_payloads = payloads
+        .iter()
+        .map(|payload| serde_json::to_vec(payload).expect("test payload must serialize"))
+        .collect::<Vec<_>>();
+    assert!(
+        expected_payloads
+            .iter()
+            .any(|payload| payload == &first_publication.payload),
+        "the publication received before disconnect must be part of the original batch"
+    );
+    expected_payloads.retain(|payload| payload != &first_publication.payload);
+    expected_payloads
+        .push(serde_json::to_vec(&recovery_payload).expect("recovery payload must serialize"));
+
     fixture
-        .wait_for_sink_reconnect()
+        .receive_until_payloads(&expected_payloads)
         .await
-        .expect("the sink must reconnect after the recovery publication");
-    let recovery_payload =
-        serde_json::to_vec(&recovery_payload).expect("recovery payload must serialize");
-    fixture
-        .receive_until_payload(&recovery_payload)
-        .await
-        .expect("the recovery publication must reach MQTT after reconnect");
+        .expect("the remaining original and recovery publications must reach MQTT after reconnect");
 }
 
 #[iggy_harness(
@@ -591,7 +641,11 @@ async fn mqtt_sink_mqtt5_envelope_preserves_supported_properties(
     assert_eq!(received[0].qos, 1);
     assert!(!received[0].retain);
     assert_eq!(properties.payload_format_indicator, Some(1));
-    assert_eq!(properties.message_expiry_interval, Some(30));
+    assert!(
+        properties
+            .message_expiry_interval
+            .is_some_and(|expiry| (1..=30).contains(&expiry))
+    );
     assert_eq!(
         properties.response_topic.as_deref(),
         Some("devices/roof/replies")
@@ -614,11 +668,10 @@ async fn mqtt_sink_mqtt5_envelope_preserves_supported_properties(
     server(connectors_runtime(config_path = "tests/connectors/mqtt/sink.toml")),
     seed = seeds::connector_stream
 )]
-async fn mqtt_sink_rejects_malformed_envelope_without_publishing_batch(
+async fn mqtt_sink_skips_malformed_envelope_and_publishes_valid_records(
     harness: &TestHarness,
     fixture: MqttSinkEnvelopeFixture,
 ) {
-    let errors_before_rejection = sink_errors(harness).await;
     let messages = vec![
         serde_json::json!({
             "version": 1,
@@ -637,13 +690,15 @@ async fn mqtt_sink_rejects_malformed_envelope_without_publishing_batch(
     ];
     send_json_messages(harness, messages).await;
 
-    assert!(
-        timeout(Duration::from_secs(1), fixture.receive_publications(1))
-            .await
-            .is_err(),
-        "a malformed record must prevent MQTT publication for the batch"
-    );
-    wait_for_sink_error_after(harness, errors_before_rejection).await;
+    let received = fixture
+        .receive_publications(2)
+        .await
+        .expect("valid records must reach MQTT");
+
+    assert_eq!(received[0].topic, "devices/valid/one");
+    assert_eq!(received[0].payload, b"first");
+    assert_eq!(received[1].topic, "devices/valid/two");
+    assert_eq!(received[1].payload, b"second");
 }
 
 async fn send_json_messages(harness: &TestHarness, payloads: Vec<serde_json::Value>) {

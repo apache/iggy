@@ -32,6 +32,7 @@ const EMQX_MQTT_PORT: u16 = 1883;
 const EMQX_DASHBOARD_PORT: u16 = 18083;
 const EMQX_START_ATTEMPTS: usize = 240;
 const EMQX_START_INTERVAL: Duration = Duration::from_millis(250);
+const EMQX_RESPONSE_BODY_LIMIT: usize = 1024;
 pub(super) const MQTT_USERNAME: &str = "iggy-mqtt-user";
 pub(super) const MQTT_PASSWORD: &str = "iggy-mqtt-password";
 pub(super) const INVALID_MQTT_PASSWORD: &str = "invalid-mqtt-password";
@@ -69,7 +70,7 @@ impl MqttBrokerContainer {
     pub(super) async fn start() -> Result<Self, TestBinaryError> {
         // EMQX is configured through its environment so the fixture exercises
         // the same password-based authentication used by the source connector.
-        let container = GenericImage::new(EMQX_IMAGE, EMQX_TAG)
+        let image = GenericImage::new(EMQX_IMAGE, EMQX_TAG)
             .with_wait_for(WaitFor::Nothing)
             .with_exposed_port(EMQX_MQTT_PORT.tcp())
             .with_exposed_port(EMQX_DASHBOARD_PORT.tcp())
@@ -81,7 +82,8 @@ impl MqttBrokerContainer {
             .with_env_var("EMQX_AUTHENTICATION__1__MECHANISM", "password_based")
             .with_env_var("EMQX_AUTHENTICATION__1__BACKEND", "built_in_database")
             .with_env_var("EMQX_AUTHENTICATION__1__USER_ID_TYPE", "username")
-            .with_container_name(fixtures::unique_container_name("emqx"))
+            .with_container_name(fixtures::unique_container_name("emqx"));
+        let container = image
             .start()
             .await
             .map_err(|error| TestBinaryError::FixtureSetup {
@@ -278,33 +280,63 @@ async fn create_mqtt_user(dashboard_url: &str, token: &str) -> Result<(), TestBi
     let user_url =
         format!("{dashboard_url}/api/v5/authentication/password_based%3Abuilt_in_database/users");
 
-    timeout(EMQX_START_INTERVAL * EMQX_START_ATTEMPTS as u32, async {
-        for _ in 0..EMQX_START_ATTEMPTS {
-            if let Ok(response) = client
-                .post(&user_url)
-                .bearer_auth(token)
-                .json(&json!({
-                    "user_id": MQTT_USERNAME,
-                    "password": MQTT_PASSWORD,
-                }))
-                .send()
-                .await
-                && response.status().is_success()
-            {
-                return Ok(());
+    let mut last_failure = "EMQX did not return a response".to_string();
+    for _ in 0..EMQX_START_ATTEMPTS {
+        match client
+            .post(&user_url)
+            .bearer_auth(token)
+            .json(&json!({
+                "user_id": MQTT_USERNAME,
+                "password": MQTT_PASSWORD,
+            }))
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => return Ok(()),
+            Ok(response) => {
+                let status = response.status();
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|error| format!("failed to read EMQX response body: {error}"));
+                let message = format!(
+                    "EMQX did not accept the MQTT test user: HTTP {status}: {}",
+                    truncate_response_body(&body)
+                );
+
+                let authenticator_is_initializing =
+                    status == StatusCode::BAD_REQUEST && body.contains("not_initialized");
+                if status.is_client_error() && !authenticator_is_initializing {
+                    return Err(TestBinaryError::FixtureSetup {
+                        fixture_type: "MqttBrokerContainer".to_string(),
+                        message,
+                    });
+                }
+
+                last_failure = message;
             }
-            sleep(EMQX_START_INTERVAL).await;
+            Err(error) => {
+                last_failure = format!("EMQX did not accept the MQTT test user: {error}");
+            }
         }
-        Err(TestBinaryError::FixtureSetup {
-            fixture_type: "MqttBrokerContainer".to_string(),
-            message: "EMQX did not accept the MQTT test user".to_string(),
-        })
-    })
-    .await
-    .map_err(|_| TestBinaryError::FixtureSetup {
+
+        sleep(EMQX_START_INTERVAL).await;
+    }
+
+    Err(TestBinaryError::FixtureSetup {
         fixture_type: "MqttBrokerContainer".to_string(),
-        message: "Timed out creating the EMQX MQTT test user".to_string(),
-    })?
+        message: last_failure,
+    })
+}
+
+fn truncate_response_body(body: &str) -> String {
+    let mut characters = body.chars();
+    let truncated: String = characters.by_ref().take(EMQX_RESPONSE_BODY_LIMIT).collect();
+    if characters.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
 }
 
 async fn wait_for_mqtt(
