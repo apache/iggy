@@ -716,6 +716,7 @@
     "87": "history_unavailable",
     "88": "lifecycle_busy",
     "89": "not_primary",
+    "90": "deferred_poll_capacity_exceeded",
     "100": "client_not_found",
     "101": "invalid_client_id",
     "206": "connection_closed",

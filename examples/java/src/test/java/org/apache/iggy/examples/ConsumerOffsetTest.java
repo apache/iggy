@@ -103,8 +103,8 @@ class ConsumerOffsetTest {
             if (failFirstProcessing && requestedOffsets.size() == 1) {
                 var message = retained.retained.get(0);
                 var invalid = new Message(message.header(), null, message.userHeaders());
-                return CompletableFuture.completedFuture(
-                        new PolledMessages(0L, message.header().offset(), 1L, List.of(invalid)));
+                return CompletableFuture.completedFuture(new PolledMessages(
+                        0L, message.header().offset(), 1L, List.of(invalid), PartitionContext.EMPTY));
             }
             return CompletableFuture.completedFuture(retained.poll(strategy, count));
         });
@@ -131,7 +131,8 @@ class ConsumerOffsetTest {
             // Two quiet replies before every batch: an empty deferred reply
             // advances nothing, so the next poll repeats the same offset.
             if (emptyPolls.incrementAndGet() % 3 != 0) {
-                return CompletableFuture.completedFuture(new PolledMessages(0L, BigInteger.ZERO, 0L, List.of()));
+                return CompletableFuture.completedFuture(
+                        new PolledMessages(0L, BigInteger.ZERO, 0L, List.of(), PartitionContext.EMPTY));
             }
             return CompletableFuture.completedFuture(retained.poll(strategy, count));
         });
@@ -148,7 +149,7 @@ class ConsumerOffsetTest {
         var messages = new DeferredMessages((strategy, count, options) -> {
             polls.incrementAndGet();
             return CompletableFuture.supplyAsync(
-                    () -> new PolledMessages(0L, BigInteger.ZERO, 0L, List.of()),
+                    () -> new PolledMessages(0L, BigInteger.ZERO, 0L, List.of(), PartitionContext.EMPTY),
                     CompletableFuture.delayedExecutor(IDLE_POLL_MILLIS, TimeUnit.MILLISECONDS));
         });
         runConsumer(messages);
