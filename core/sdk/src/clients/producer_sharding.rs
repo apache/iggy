@@ -20,6 +20,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use iggy_common::{BinaryOperationLineage, binary_operation_lineage, with_binary_lineage};
 use iggy_common::{Identifier, IggyByteSize, IggyError, IggyMessage, Partitioning, Sizeable};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast};
 use tokio::task::JoinHandle;
@@ -135,6 +136,7 @@ pub struct ShardMessageWithPermit {
     /// Routed send and destination metadata.
     pub inner: ShardMessage,
     size_bytes: u64,
+    lineage: Option<BinaryOperationLineage>,
     bytes_permit: Option<OwnedSemaphorePermit>,
     merged_bytes_permits: Vec<OwnedSemaphorePermit>,
 }
@@ -148,6 +150,7 @@ impl ShardMessageWithPermit {
         Self {
             inner: msg,
             size_bytes,
+            lineage: binary_operation_lineage(),
             bytes_permit,
             merged_bytes_permits: Vec::new(),
         }
@@ -284,6 +287,7 @@ impl Shard {
         let mut merged_batches: Vec<ShardMessageWithPermit> = Vec::with_capacity(buffer.len());
         for message in buffer.drain(..) {
             if let Some(last) = merged_batches.last_mut()
+                && last.lineage == message.lineage
                 && Self::same_destination(&last.inner, &message.inner)
                 && last
                     .size_bytes
@@ -312,14 +316,16 @@ impl Shard {
         for msg in Self::merge_batches(buffer) {
             let _slot_permit = slots_permit.acquire().await;
 
-            let result = core
-                .send_internal(
+            let result = with_binary_lineage(
+                msg.lineage,
+                core.send_internal(
                     &msg.inner.stream,
                     &msg.inner.topic,
                     msg.inner.messages,
                     msg.inner.partitioning.clone(),
-                )
-                .await;
+                ),
+            )
+            .await;
 
             if let Err(error) = result {
                 if let IggyError::ProducerSendFailed {
@@ -328,14 +334,15 @@ impl Shard {
                     cause,
                     stream_name,
                     topic_name,
+                    ..
                 } = &error
                 {
                     let ctx = ErrorCtx {
                         cause: cause.to_owned(),
                         stream: msg.inner.stream,
-                        stream_name: stream_name.clone(),
+                        stream_name: stream_name.to_string(),
                         topic: msg.inner.topic,
-                        topic_name: topic_name.clone(),
+                        topic_name: topic_name.to_string(),
                         partitioning: msg.inner.partitioning,
                         messages: failed.clone(),
                         committed: committed.clone(),
@@ -762,10 +769,11 @@ mod tests {
         let mut mock = MockProducerCoreBackend::new();
         let error = IggyError::ProducerSendFailed {
             failed: Arc::new(vec![dummy_message(1)]),
+            uncertain: 0,
             committed: Arc::new(Vec::new()),
             cause: Box::new(IggyError::Error),
-            stream_name: "1".to_string(),
-            topic_name: "1".to_string(),
+            stream_name: "orders-europe".into(),
+            topic_name: "failed-payments".into(),
         };
 
         mock.expect_send_internal().returning(move |_, _, _, _| {
@@ -798,6 +806,8 @@ mod tests {
         let err_ctx = err_rx.recv_async().await.unwrap();
         assert_eq!(err_ctx.cause, Box::new(IggyError::Error));
         assert_eq!(err_ctx.messages.len(), 1);
+        assert_eq!(err_ctx.stream_name, "orders-europe");
+        assert_eq!(err_ctx.topic_name, "failed-payments");
     }
 
     #[tokio::test]

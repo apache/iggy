@@ -1,0 +1,62 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: setup-node
+description: Setup Node.js toolchain and install dependencies
+inputs:
+  node-version:
+    description: "Node.js version to use"
+    required: false
+    default: "23"
+  workspace:
+    description: "Workspace directory"
+    required: false
+    default: "."
+runs:
+  using: "composite"
+  steps:
+    - name: Setup Node.js
+      uses: actions/setup-node@v6
+      with:
+        node-version: ${{ inputs.node-version }}
+        package-manager-cache: false
+
+    - name: Pin npm to 11 to match Dependabot lockfile format
+      run: npm install -g npm@11
+      shell: bash
+
+    - name: Install dependencies
+      run: |
+        echo "📦 Installing Node.js dependencies..."
+        if [ "${{ inputs.workspace }}" != "." ]; then
+          echo "Changing to workspace directory: ${{ inputs.workspace }}"
+          cd "${{ inputs.workspace }}"
+          pwd # Print working directory to verify
+        fi
+
+        find . -maxdepth 1 -type f -name "package*.json" -exec echo "Found package.json in workspace: {}" \;
+        npm ci --ignore-scripts
+      shell: bash
+      continue-on-error: true
+
+    - name: Verify npm installation
+      run: |
+        echo "✅ Node.js setup complete"
+        node --version
+        npm --version
+      shell: bash
+

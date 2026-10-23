@@ -26,15 +26,19 @@ namespace Apache.Iggy.IggyClient;
 public interface IIggyStream
 {
     /// <summary>
-    ///     Creates a new stream with the specified name.
+    ///     Creates a new stream with the specified name and options.
     /// </summary>
     /// <remarks>
     ///     The stream name must be unique within the Iggy instance and has a maximum length of 255 UTF-8 bytes.
+    ///     An encryption key in <paramref name="options" /> is checked before anything is sent. Without one, a
+    ///     server with encryption enabled generates a key for the stream.
     /// </remarks>
     /// <param name="name">The unique name of the stream to create.</param>
+    /// <param name="options">The stream's options, such as its own encryption key. Null uses the server defaults.</param>
     /// <param name="token">The cancellation token to cancel the operation.</param>
     /// <returns>A task that represents the asynchronous operation and returns the created stream information.</returns>
-    Task<StreamResponse?> CreateStreamAsync(string name, CancellationToken token = default);
+    Task<StreamResponse?> CreateStreamAsync(string name, StreamOptions? options = null,
+        CancellationToken token = default);
 
     /// <summary>
     ///     Retrieves detailed information about a specific stream by its identifier.
@@ -48,16 +52,17 @@ public interface IIggyStream
     Task<StreamResponse?> GetStreamByIdAsync(Identifier streamId, CancellationToken token = default);
 
     /// <summary>
-    ///     Updates the name of an existing stream.
+    ///     Applies the changes in <paramref name="update" /> to an existing stream, leaving every other setting as is.
     /// </summary>
     /// <remarks>
-    ///     The new stream name must be unique within the Iggy instance.
+    ///     The new stream name must be unique within the Iggy instance. The encryption key is fixed at creation:
+    ///     a reset is refused before anything is sent.
     /// </remarks>
     /// <param name="streamId">The identifier of the stream to update (numeric ID or name).</param>
-    /// <param name="name">The new name for the stream.</param>
+    /// <param name="update">The keys to set and reset. At least one is required.</param>
     /// <param name="token">The cancellation token to cancel the operation.</param>
     /// <returns>A task that represents the asynchronous operation.</returns>
-    Task UpdateStreamAsync(Identifier streamId, string name, CancellationToken token = default);
+    Task UpdateStreamAsync(Identifier streamId, StreamUpdate update, CancellationToken token = default);
 
     /// <summary>
     ///     Retrieves information about all streams.

@@ -20,6 +20,7 @@ package tcp
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"net"
 	"sync"
 	"testing"
@@ -59,7 +60,7 @@ func TestExchange_DoesNotReconnectOnALocalStampFailure(t *testing.T) {
 	_, err := client.do(context.Background(), &command.CreateStream{Name: "orders"})
 
 	assert.ErrorIs(t, err, ierror.ErrUnauthenticated)
-	assert.Equal(t, iggcon.TransportStateConnected, client.transportState,
+	assert.True(t, linkReady(client.links.any()),
 		"a healthy connection survives a purely local failure")
 	assert.Empty(t, server.recorded(), "nothing reached the wire")
 }
@@ -130,27 +131,6 @@ func TestLoginUser_ClearsTheExplicitLogoutSuppression(t *testing.T) {
 	require.NoError(t, client.Ping(context.Background()))
 }
 
-func TestConnect_SuppressedSignInSendsNothing(t *testing.T) {
-	var server *testListener
-	server = listenVSR(t, nil, singleNodeHandler(t, func() string { return server.address() }))
-
-	client := newDialingClient(t, server.address(),
-		WithAutoLogin(NewUsernamePasswordCredentials("iggy", "iggy")))
-
-	// The context a replayed login drives its reconnect with.
-	require.NoError(t, client.Connect(suppressAutoLogin(context.Background())))
-
-	assert.Empty(t, server.recorded(),
-		"the replayed login owns the sign-in; Connect must not preempt it")
-
-	// And it is that context, not the client, that carries the suppression:
-	// a Connect without it signs in.
-	require.NoError(t, client.disconnect())
-	require.NoError(t, client.Connect(context.Background()))
-	assert.NotEmpty(t, server.recorded(),
-		"the suppression outlived the call that meant it")
-}
-
 func TestClose_InterruptsAnInFlightReplayWait(t *testing.T) {
 	client, serverConn := newPipeClient(t)
 	serve(serverConn, func(_ int, _ request) []byte {
@@ -172,30 +152,31 @@ func TestClose_InterruptsAnInFlightReplayWait(t *testing.T) {
 
 	select {
 	case err := <-done:
-		assert.ErrorIs(t, err, ierror.ErrClientShutdown)
+		assert.ErrorIs(t, err, ierror.ErrOperationUncertain)
 	case <-time.After(5 * time.Second):
 		t.Fatal("the in-flight request never returned after Close")
 	}
 }
 
-func TestExchange_DropsTheConnectionOnAMismatchedReplyEcho(t *testing.T) {
+func TestExchange_IgnoresAnUnmatchedReplyAndKeepsThePendingRequest(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	client.config.reconnection.enabled = false
 	go func() {
 		read, err := readRequest(serverConn)
 		if err != nil {
 			return
 		}
-		answer := replyFrame(vsr.OperationCreateStream, resultSection())
-		binary.LittleEndian.PutUint64(answer[replyFrameOffsetRequest:],
-			read.requestID()+7)
+		answer := committedReply(read, 0)
+		echoReplyRequest(answer, read)
+		binary.LittleEndian.PutUint64(answer[replyFrameOffsetRequest:], read.requestID()+7)
+		if _, err = serverConn.Write(answer); err != nil {
+			return
+		}
+		binary.LittleEndian.PutUint64(answer[replyFrameOffsetRequest:], read.requestID())
 		_, _ = serverConn.Write(answer)
 	}()
-
 	_, err := client.do(context.Background(), &command.CreateStream{Name: "orders"})
-	assert.ErrorIs(t, err, ierror.ErrDisconnected,
-		"a reply for some other request means the stream is desynced")
-	assert.Equal(t, iggcon.TransportStateDisconnected, client.transportState)
+	require.NoError(t, err)
+	require.True(t, linkReady(client.links.any()))
 }
 
 func TestExchange_NormalizesAWriteFailure(t *testing.T) {
@@ -204,9 +185,8 @@ func TestExchange_NormalizesAWriteFailure(t *testing.T) {
 	_ = serverConn.Close()
 
 	_, err := client.SendBinaryRequest(context.Background(), uint32(command.PingCode), nil)
-	assert.ErrorIs(t, err, ierror.ErrDisconnected,
-		"a write failure classifies like a read failure")
-	assert.Equal(t, iggcon.TransportStateDisconnected, client.transportState)
+	assert.True(t, errors.Is(err, ierror.ErrNotConnected) || errors.Is(err, ierror.ErrTransientNotCommitted), "a failure is classified by whether writer admission occurred: %v", err)
+	assert.False(t, linkReady(client.links.any()))
 }
 
 func TestLoginUser_ConcurrentSignInsAreSingleFlight(t *testing.T) {
@@ -244,8 +224,12 @@ func TestLoginUser_ConcurrentSignInsAreSingleFlight(t *testing.T) {
 	}
 	group.Wait()
 
-	assert.NoError(t, errs[0])
-	assert.NoError(t, errs[1])
+	assert.True(t, errs[0] == nil || errs[1] == nil, "the newest sign-in must succeed: %v", errs)
+	for _, err := range errs {
+		if err != nil {
+			assert.ErrorIs(t, err, ierror.ErrUnauthenticated)
+		}
+	}
 	assert.True(t, client.session.Bound(),
 		"the surviving sign-in leaves one bound session, not an orphaned register")
 }
@@ -265,7 +249,7 @@ func TestLoginUser_DropsTheConnectionWhenTheBindFails(t *testing.T) {
 
 	_, err := client.LoginUser(context.Background(), "iggy", "iggy")
 	require.Error(t, err)
-	assert.Equal(t, iggcon.TransportStateDisconnected, client.transportState,
+	assert.False(t, linkReady(client.links.any()),
 		"the server committed a Register this client cannot adopt; the connection is unusable")
 }
 
@@ -285,8 +269,11 @@ func TestTopicCache_ClearCountsKeepsTheBalancedCursors(t *testing.T) {
 }
 
 func TestSendMessages_InvalidatesTheCountWhenThePartitionVanished(t *testing.T) {
-	client, serverConn := newPipeClient(t)
+	client, serverConn := newRosterPipeClient(t)
 	servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
+		if read.code() == uint32(command.GetClusterMetadataCode) {
+			return clusterMetadataFrame(t, 0, "127.0.0.1:8090")
+		}
 		if read.operation() == vsr.OperationSendMessages {
 			return statusReplyFrame(vsr.OperationSendMessages,
 				uint32(ierror.PartitionNotFoundCode), nil)
@@ -308,13 +295,15 @@ func TestSendMessages_InvalidatesTheCountWhenThePartitionVanished(t *testing.T) 
 		"the topic was likely recreated smaller; the count must be reread")
 }
 
+// A namespace miss marks the route stale, so the first send fails with 41,
+// which leaves the route and its context.
 func TestSendMessages_KeepsTheContextAfterAFailureThatIsNotARefusal(t *testing.T) {
 	client, serverConn := newPipeClient(t)
 	sends := 0
 	server := servePartitionOperations(t, serverConn, func(_ int, _ request) []byte {
 		sends++
 		if sends == 1 {
-			return statusReplyFrame(vsr.OperationSendMessages, uint32(ierror.PartitionNotFoundCode), nil)
+			return statusReplyFrame(vsr.OperationSendMessages, uint32(ierror.UnauthorizedCode), nil)
 		}
 		return replyFrame(vsr.OperationSendMessages, zeroConfirmations())
 	})
@@ -327,7 +316,7 @@ func TestSendMessages_KeepsTheContextAfterAFailureThatIsNotARefusal(t *testing.T
 		return err
 	}
 
-	require.ErrorIs(t, send(), ierror.ErrPartitionNotFound)
+	require.ErrorIs(t, send(), ierror.ErrUnauthorized)
 	require.NoError(t, send())
 
 	assert.Equal(t, 1, requestCount(server.recorded(), command.GetPartitionRouteCode),

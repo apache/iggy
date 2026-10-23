@@ -19,6 +19,8 @@ pub mod auth;
 pub mod leader_redirection;
 pub mod messages;
 pub mod raw_command;
+pub mod resource_options;
 pub mod server;
+pub mod session;
 pub mod streams;
 pub mod topics;

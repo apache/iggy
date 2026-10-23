@@ -38,6 +38,7 @@ public class TestHooks
         _context.LastStreamId = null;
         _context.LastRawResponse = null;
         _context.LastRawError = null;
+        _context.LastCallError = null;
     }
 
     [AfterScenario]

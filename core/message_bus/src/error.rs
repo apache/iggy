@@ -23,9 +23,9 @@ use thiserror::Error;
 /// All variants are non-fatal from the consensus perspective.
 /// VSR handles message loss via timeout-driven retransmission from the WAL.
 ///
-/// The client- and replica-keyed variants separate three physically
-/// distinct failure modes so operators can tell apart routing bugs from
-/// transient disconnects:
+/// The replica-keyed variants separate three physically distinct failure
+/// modes so operators can tell apart routing bugs from transient
+/// disconnects:
 /// - `*NotFound` / `*NotConnected` - the key is unknown to this shard's
 ///   local registry (genuine peer state, often recoverable by reconnect).
 /// - `*RouteMissing` - the bus cannot forward to the owning shard
@@ -33,35 +33,15 @@ use thiserror::Error;
 /// - `*ForwardFailed` - the forward fn rejected the frame (inter-shard
 ///   queue full, shutdown, etc.).
 ///
-/// Recovery asymmetry between forward variants:
-/// - `ReplicaForwardFailed` is recoverable in-protocol. The dropped frame
-///   is a consensus message (`Prepare` / `PrepareOk` / view-change /
-///   `Commit`); VSR's WAL-driven retransmit re-sends it once the inbox
-///   drains.
-/// - `ClientForwardFailed` is terminal. Client Reply payloads live above
-///   the bus and have no retransmit path. A reply lost on full inbox is
-///   gone, the client times out, and request / response semantics break.
-///   Operators must size `inbox_capacity` for the worst-case cross-shard
-///   reply burst and alert on the drop-site `tracing` logs. The
-///   `frame_drops_total` `{variant="forward_client_send"}` counter is
-///   the structured complement, scrape-able once a per-shard exporter
-///   lands.
+/// `ReplicaForwardFailed` is recoverable in-protocol. The dropped frame is a
+/// consensus message (`Prepare` / `PrepareOk` / view-change / `Commit`), and
+/// VSR's WAL-driven retransmit re-sends it once the inbox drains. A client
+/// frame is never forwarded between shards.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum SendError {
     #[error("client {0} not found in local registry")]
     ClientNotFound(u128),
-
-    #[error("client {0}: no inter-shard forward fn installed")]
-    ClientRouteMissing(u128),
-
-    /// The owning shard's inter-shard inbox rejected the forward frame
-    /// (full or disconnected). Unlike `ReplicaForwardFailed`, no VSR
-    /// retransmit covers this drop: the client Reply payload was moved
-    /// into the frame and is now gone. Callers must treat this as a
-    /// final failure for the affected request; the client will time out.
-    #[error("client {0}: inter-shard forward failed")]
-    ClientForwardFailed(u128),
 
     #[error("replica {0} not connected on this shard")]
     ReplicaNotConnected(u8),

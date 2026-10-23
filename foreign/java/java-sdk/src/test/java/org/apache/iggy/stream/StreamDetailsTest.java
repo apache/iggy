@@ -19,7 +19,7 @@
 
 package org.apache.iggy.stream;
 
-import org.apache.iggy.topic.CompressionAlgorithm;
+import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.topic.Topic;
 import org.junit.jupiter.api.Test;
 
@@ -32,19 +32,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 class StreamDetailsTest {
     @Test
     void constructorWithStreamBaseCreatesExpectedStreamDetails() {
-        var base = new StreamBase(10L, BigInteger.valueOf(500L), "name", "size", BigInteger.ZERO, 1L, Map.of());
-        var topics = List.of(new Topic(
-                1L,
-                BigInteger.ZERO,
-                "name",
-                "size",
-                BigInteger.TEN,
-                CompressionAlgorithm.None,
-                BigInteger.ONE,
-                BigInteger.ZERO,
-                2L,
-                Map.of(),
-                Map.of()));
+        var derived = Map.of("encryption_key_source", HeaderValue.fromString("server"));
+        var base =
+                new StreamBase(10L, BigInteger.valueOf(500L), "name", "size", BigInteger.ZERO, 1L, Map.of(), derived);
+        var topics = List.of(new Topic(1L, BigInteger.ZERO, "name", "size", BigInteger.ZERO, 2L, Map.of(), Map.of()));
 
         var streamDetails = new StreamDetails(base, topics);
 
@@ -55,5 +46,7 @@ class StreamDetailsTest {
         assertThat(streamDetails.messagesCount()).isEqualTo(BigInteger.ZERO);
         assertThat(streamDetails.topicsCount()).isEqualTo(1L);
         assertThat(streamDetails.topics()).isEqualTo(topics);
+        assertThat(streamDetails.derivedOptions()).isEqualTo(derived);
+        assertThat(streamDetails.encryptionKeySource()).contains(EncryptionKeySource.SERVER);
     }
 }

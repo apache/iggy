@@ -29,10 +29,6 @@ fn usize_to_u32(value: usize, context: &str) -> u32 {
 pub struct CreatePartitionsWithAssignmentsRequest {
     pub request: CreatePartitionsRequest,
     pub partitions: Vec<CreatedPartitionAssignment>,
-    /// View the admitting primary minted this create in. Rides the body, which
-    /// `checksum_body` seals, so unlike the header's `view` it is never restamped
-    /// by a post-view-change retransmit: every replica decodes the same value.
-    pub created_view: u32,
 }
 
 impl WireEncode for CreatePartitionsWithAssignmentsRequest {
@@ -44,7 +40,6 @@ impl WireEncode for CreatePartitionsWithAssignmentsRequest {
                 .iter()
                 .map(WireEncode::encoded_size)
                 .sum::<usize>()
-            + 4
     }
 
     fn encode(&self, buf: &mut BytesMut) {
@@ -60,15 +55,31 @@ impl WireEncode for CreatePartitionsWithAssignmentsRequest {
         for partition in &self.partitions {
             partition.encode(buf);
         }
-        buf.put_u32_le(self.created_view);
     }
 }
 
 impl WireDecode for CreatePartitionsWithAssignmentsRequest {
+    fn decode_from(buf: &[u8]) -> Result<Self, WireError> {
+        let (request, consumed) = Self::decode(buf)?;
+        if consumed != buf.len() {
+            return Err(WireError::Validation(
+                "trailing create partitions assignment bytes".into(),
+            ));
+        }
+        Ok(request)
+    }
+
     fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
         let request_size = read_u32_le(buf, 0)? as usize;
-        let request_start = 4;
-        let request_end = request_start + request_size;
+        let request_start: usize = 4;
+        let request_end =
+            request_start
+                .checked_add(request_size)
+                .ok_or_else(|| WireError::UnexpectedEof {
+                    offset: request_start,
+                    need: request_size,
+                    have: buf.len().saturating_sub(request_start),
+                })?;
         if buf.len() < request_end {
             return Err(WireError::UnexpectedEof {
                 offset: request_start,
@@ -77,32 +88,35 @@ impl WireDecode for CreatePartitionsWithAssignmentsRequest {
             });
         }
 
-        let request = CreatePartitionsRequest::decode_from(&buf[request_start..request_end])?;
+        let (request, consumed) =
+            CreatePartitionsRequest::decode(&buf[request_start..request_end])?;
+        if consumed != request_size {
+            return Err(WireError::Validation(
+                "trailing create partitions request bytes".into(),
+            ));
+        }
         let partitions_count = read_u32_le(buf, request_end)? as usize;
+        if partitions_count != request.partitions_count as usize {
+            return Err(WireError::Validation(
+                "partition assignment count mismatch".into(),
+            ));
+        }
         let mut offset = request_end + 4;
-        let mut partitions = Vec::with_capacity(partitions_count);
+        let mut partitions = Vec::with_capacity(crate::codec::bounded_capacity(
+            partitions_count,
+            buf.len().saturating_sub(offset),
+            CreatedPartitionAssignment::ENCODED_SIZE,
+        ));
         for _ in 0..partitions_count {
             let (partition, consumed) = CreatedPartitionAssignment::decode(&buf[offset..])?;
             offset += consumed;
             partitions.push(partition);
         }
 
-        // Trailing field: entries journaled before it existed end here and read
-        // 0, the view every plane starts in. 1-3 leftover bytes are corruption,
-        // not an old shape, so they still error.
-        let created_view = if offset < buf.len() {
-            let view = read_u32_le(buf, offset)?;
-            offset += 4;
-            view
-        } else {
-            0
-        };
-
         Ok((
             Self {
                 request,
                 partitions,
-                created_view,
             },
             offset,
         ))
@@ -112,10 +126,10 @@ impl WireDecode for CreatePartitionsWithAssignmentsRequest {
 #[cfg(test)]
 mod tests {
     use super::CreatePartitionsWithAssignmentsRequest;
-    use crate::WireIdentifier;
     use crate::codec::{WireDecode, WireEncode};
     use crate::primitives::partition_assignment::CreatedPartitionAssignment;
     use crate::requests::partitions::CreatePartitionsRequest;
+    use crate::{WireError, WireIdentifier};
 
     #[test]
     fn roundtrip() {
@@ -127,44 +141,74 @@ mod tests {
             },
             partitions: vec![
                 CreatedPartitionAssignment {
+                    initial_view: 9,
                     partition_id: 3,
                     consensus_group_id: 11,
                 },
                 CreatedPartitionAssignment {
+                    initial_view: 10,
                     partition_id: 4,
                     consensus_group_id: 12,
                 },
             ],
-            created_view: 9,
         };
         let bytes = request.to_bytes();
         let (decoded, consumed) = CreatePartitionsWithAssignmentsRequest::decode(&bytes).unwrap();
         assert_eq!(consumed, bytes.len());
         assert_eq!(decoded, request);
+        assert_eq!(bytes.len(), request.encoded_size());
     }
 
     #[test]
-    fn decode_without_trailing_view_reads_zero() {
-        let request = CreatePartitionsWithAssignmentsRequest {
+    fn given_malformed_assignments_when_decoding_should_reject() {
+        let mut request = CreatePartitionsWithAssignmentsRequest {
             request: CreatePartitionsRequest {
                 stream_id: WireIdentifier::numeric(1),
                 topic_id: WireIdentifier::numeric(2),
                 partitions_count: 1,
             },
             partitions: vec![CreatedPartitionAssignment {
+                initial_view: 9,
                 partition_id: 3,
                 consensus_group_id: 11,
             }],
-            created_view: 9,
         };
-        // Bytes journaled before the field existed: same shape, no trailing u32.
         let bytes = request.to_bytes();
-        let old_bytes = &bytes[..bytes.len() - 4];
-        let (decoded, consumed) =
-            CreatePartitionsWithAssignmentsRequest::decode(old_bytes).unwrap();
-        assert_eq!(consumed, old_bytes.len());
-        assert_eq!(decoded.created_view, 0);
-        assert_eq!(decoded.partitions, request.partitions);
-        assert_eq!(decoded.request, request.request);
+        for truncated in 0..bytes.len() {
+            assert!(
+                CreatePartitionsWithAssignmentsRequest::decode_from(&bytes[..truncated]).is_err()
+            );
+        }
+        let mut trailing = bytes.to_vec();
+        trailing.push(0);
+        assert!(CreatePartitionsWithAssignmentsRequest::decode_from(&trailing).is_err());
+
+        let request_end = size_of::<u32>() + request.request.encoded_size();
+        let mut embedded_trailing = bytes.to_vec();
+        embedded_trailing.insert(request_end, 0);
+        embedded_trailing[..4].copy_from_slice(
+            &u32::try_from(request.request.encoded_size() + 1)
+                .unwrap()
+                .to_le_bytes(),
+        );
+        assert!(CreatePartitionsWithAssignmentsRequest::decode_from(&embedded_trailing).is_err());
+        assert!(matches!(
+            CreatePartitionsWithAssignmentsRequest::decode_from(&u32::MAX.to_le_bytes()),
+            Err(WireError::UnexpectedEof { .. })
+        ));
+
+        for count in [0, 2, u32::MAX] {
+            request.request.partitions_count = count;
+            assert!(matches!(
+                CreatePartitionsWithAssignmentsRequest::decode_from(&request.to_bytes()),
+                Err(WireError::Validation(_))
+            ));
+        }
+        let mut huge_count = request.to_bytes().to_vec();
+        huge_count[request_end..request_end + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            CreatePartitionsWithAssignmentsRequest::decode_from(&huge_count),
+            Err(WireError::UnexpectedEof { .. })
+        ));
     }
 }

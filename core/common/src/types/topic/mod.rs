@@ -15,13 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::CompressionAlgorithm;
 use crate::Partition;
 use crate::ResourceOptions;
+use crate::TopicResolvedOptions;
 use crate::utils::byte_size::IggyByteSize;
-use crate::utils::expiry::IggyExpiry;
 use crate::utils::timestamp::IggyTimestamp;
-use crate::utils::topic_size::MaxTopicSize;
 use serde::{Deserialize, Serialize};
 
 /// `Topic` represents the medium level of logical separation of data as it's a part of the stream.
@@ -30,8 +28,6 @@ use serde::{Deserialize, Serialize};
 /// - `created_at`: the timestamp when the topic was created.
 /// - `name`: the unique name of the topic.
 /// - `size`: the total size of the topic in bytes.
-/// - `message_expiry`: the expiry of the messages in the topic.
-/// - `max_topic_size`: the maximum size of the topic.
 /// - `messages_count`: the total number of messages in the topic.
 /// - `partitions_count`: the total number of partitions in the topic.
 #[derive(Debug, Serialize, Deserialize)]
@@ -44,19 +40,14 @@ pub struct Topic {
     pub name: String,
     /// The total size of the topic in bytes.
     pub size: IggyByteSize,
-    /// The expiry of the messages in the topic.
-    pub message_expiry: IggyExpiry,
-    /// Compression algorithm for the topic.
-    pub compression_algorithm: CompressionAlgorithm,
-    /// The optional maximum size of the topic.
-    /// Can't be lower than segment size in the config.
-    pub max_topic_size: MaxTopicSize,
     /// The total number of messages in the topic.
     pub messages_count: u64,
     /// The total number of partitions in the topic.
     pub partitions_count: u32,
-    /// Creation options: client-explicit keys plus admission-derived
-    /// defaults, distinguished by each entry's `explicit` flag.
+    /// Settings: client-explicit keys plus admission-derived defaults,
+    /// distinguished by each entry's `explicit` flag. Message expiry,
+    /// compression and the size cap live here, read them typed through
+    /// `resolved_options`.
     #[serde(default, with = "crate::resource_options_json")]
     pub options: ResourceOptions,
 }
@@ -67,8 +58,6 @@ pub struct Topic {
 /// - `created_at`: the timestamp when the topic was created.
 /// - `name`: the unique name of the topic.
 /// - `size`: the total size of the topic.
-/// - `message_expiry`: the expiry of the messages in the topic.
-/// - `max_topic_size`: the maximum size of the topic.
 /// - `messages_count`: the total number of messages in the topic.
 /// - `partitions_count`: the total number of partitions in the topic.
 /// - `partitions`: the collection of partitions in the topic.
@@ -82,21 +71,34 @@ pub struct TopicDetails {
     pub name: String,
     /// The total size of the topic.
     pub size: IggyByteSize,
-    /// The expiry of the messages in the topic.
-    pub message_expiry: IggyExpiry,
-    /// Compression algorithm for the topic.
-    pub compression_algorithm: CompressionAlgorithm,
-    /// The optional maximum size of the topic.
-    /// Can't be lower than segment size in the config.
-    pub max_topic_size: MaxTopicSize,
     /// The total number of messages in the topic.
     pub messages_count: u64,
     /// The total number of partitions in the topic.
     pub partitions_count: u32,
     /// The collection of partitions in the topic.
     pub partitions: Vec<Partition>,
-    /// Creation options: client-explicit keys plus admission-derived
-    /// defaults, distinguished by each entry's `explicit` flag.
+    /// Settings: client-explicit keys plus admission-derived defaults,
+    /// distinguished by each entry's `explicit` flag. Message expiry,
+    /// compression and the size cap live here, read them typed through
+    /// `resolved_options`.
     #[serde(default, with = "crate::resource_options_json")]
     pub options: ResourceOptions,
+}
+
+impl Topic {
+    /// Every setting of the topic, typed and resolved against the catalog
+    /// defaults.
+    #[must_use]
+    pub fn resolved_options(&self) -> TopicResolvedOptions {
+        TopicResolvedOptions::from(&self.options)
+    }
+}
+
+impl TopicDetails {
+    /// Every setting of the topic, typed and resolved against the catalog
+    /// defaults.
+    #[must_use]
+    pub fn resolved_options(&self) -> TopicResolvedOptions {
+        TopicResolvedOptions::from(&self.options)
+    }
 }

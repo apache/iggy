@@ -50,10 +50,12 @@
 //! to speak it -- but it must stay credential-bearing.
 
 use crate::server::raw_tcp::TEST_BIND_SECRET;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use iggy::prelude::*;
 use iggy_binary_protocol::codec::{WireDecode, WireEncode};
-use iggy_binary_protocol::codes::{GET_POLL_ROUTING_CODE, PING_CODE, POLL_MESSAGES_CODE};
+use iggy_binary_protocol::codes::{
+    CREATE_STREAM_CODE, GET_PARTITION_ROUTE_CODE, PING_CODE, POLL_MESSAGES_CODE,
+};
 use iggy_binary_protocol::consensus::{
     Command, Operation, ReplyHeader, RequestHeader, read_size_field, result_code,
     result_section_len,
@@ -61,21 +63,25 @@ use iggy_binary_protocol::consensus::{
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::primitives::polling_strategy::WirePollingStrategy;
 use iggy_binary_protocol::requests::consumer_groups::JoinConsumerGroupRequest;
-use iggy_binary_protocol::requests::messages::PollMessagesRequest;
+use iggy_binary_protocol::requests::messages::send_messages::{RawMessage, SendMessagesEncoder};
+use iggy_binary_protocol::requests::messages::{GetPartitionRouteRequest, PollMessagesRequest};
 use iggy_binary_protocol::requests::streams::CreateStreamRequest;
 use iggy_binary_protocol::requests::system::{BindSessionRequest, SessionIdentity};
+use iggy_binary_protocol::requests::topics::CreateTopicRequest;
 use iggy_binary_protocol::requests::users::LoginRegisterRequest;
 use iggy_binary_protocol::requests::users::login_register::BindSecret;
-use iggy_binary_protocol::responses::messages::{PollMessagesResponse, PollRoutingResponse};
+use iggy_binary_protocol::responses::messages::{PartitionRouteResponse, PollMessagesResponse};
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
 use iggy_binary_protocol::{
     ClientVersionInfo, HEADER_SIZE, IGGY_PROTOCOL_VERSION, WireIdentifier, WireName, WireOptions,
+    WirePartitioning,
 };
 use integration::harness::TestHarness;
 use integration::iggy_harness;
 use secrecy::SecretString;
 use std::mem::offset_of;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -180,8 +186,10 @@ async fn given_lost_login_reply_when_binding_should_resolve_the_original_epoch(
         Exchange::Reply { status, .. } if status == IggyError::Unauthenticated.as_code()));
 
     let payload = create_stream_payload("lost-login-shared-binding");
-    let original_result = commit_request(&mut bound, session, 1, &payload).await;
-    let replay = commit_request(&mut retried, session, 1, &payload).await;
+    let header =
+        RequestHeader::for_request(CREATE_STREAM_CODE, CLIENT_ID, 1, session, &payload).unwrap();
+    let original_result = commit_request_header(&mut bound, &header, &payload).await;
+    let replay = commit_request_header(&mut retried, &header, &payload).await;
     assert_eq!(replay.header, original_result.header);
     assert_eq!(replay.payload, original_result.payload);
 }
@@ -205,6 +213,136 @@ async fn given_committed_request_when_node_restarts_should_dedup_same_id_retry(
     // rather than inferred from a duplicate-name rejection.
     let addrs = tcp_addrs(harness);
     resume_request(&addrs, session, 1, &create_stream, Some(&committed)).await;
+}
+
+#[iggy_harness(cluster_nodes = 3, server(metadata.partitions_max = "4"))]
+async fn given_inherited_create_when_cluster_bootstraps_from_wal_should_count_it_once(
+    harness: &mut TestHarness,
+) {
+    const STREAM: &str = "bootstrap-admission";
+    let (mut connection, session) = register(tcp_addr(harness)).await;
+    commit_request(&mut connection, session, 1, &create_stream_payload(STREAM)).await;
+    let topic_body = |name: &str, partitions_count| {
+        CreateTopicRequest {
+            stream_id: WireIdentifier::named(STREAM).unwrap(),
+            partitions_count,
+            name: WireName::new(name).unwrap(),
+            options: WireOptions::empty(),
+        }
+        .to_bytes()
+    };
+    let inherited = topic_body("inherited", 1);
+    let inherited_header = RequestHeader::for_request(
+        iggy_binary_protocol::codes::CREATE_TOPIC_CODE,
+        CLIENT_ID,
+        2,
+        session,
+        &inherited,
+    )
+    .unwrap();
+    let committed = commit_request_header(&mut connection, &inherited_header, &inherited).await;
+    let receipt =
+        bytemuck::checked::try_pod_read_unaligned::<ReplyHeader>(committed.header.as_ref())
+            .unwrap();
+    harness.kill_cluster().unwrap();
+    drop(connection);
+    let paths: Vec<_> = (0..harness.cluster_size())
+        .map(|node| harness.node(node).data_path())
+        .collect();
+    let mut copies = 0;
+    for path in &paths {
+        let headers = metadata_wal_headers(path.clone());
+        if let Some(header) = headers
+            .iter()
+            .find(|header| header.client == CLIENT_ID && header.request == 2)
+        {
+            copies += 1;
+            assert_eq!(header.op, receipt.op);
+            assert_eq!(header.operation, Operation::CreateTopicWithAssignments);
+            assert!(
+                headers.iter().map(|header| header.commit).max().unwrap() < header.op,
+                "bootstrap must inherit the create above the WAL's provable commit floor"
+            );
+        }
+    }
+    assert!(
+        copies >= 2,
+        "the acknowledged create must be retained by a quorum"
+    );
+
+    harness.restart_cluster().await.unwrap();
+    let mut connection = resume_request_header(
+        &tcp_addrs(harness),
+        &inherited_header,
+        &inherited,
+        Some(&committed),
+    )
+    .await;
+    let remaining = topic_body("remaining", 3);
+    let remaining_header = RequestHeader::for_request(
+        iggy_binary_protocol::codes::CREATE_TOPIC_CODE,
+        CLIENT_ID,
+        3,
+        session,
+        &remaining,
+    )
+    .unwrap();
+    commit_request_header(&mut connection, &remaining_header, &remaining).await;
+    let extra = topic_body("over-cap", 1);
+    let extra_header = RequestHeader::for_request(
+        iggy_binary_protocol::codes::CREATE_TOPIC_CODE,
+        CLIENT_ID,
+        4,
+        session,
+        &extra,
+    )
+    .unwrap();
+    let deadline = Instant::now() + COMMIT_BUDGET;
+    loop {
+        match exchange(&mut connection, &extra_header, &extra)
+            .await
+            .verdict()
+        {
+            Verdict::Rejected(code) if code == IggyError::PartitionsLimitReached.as_code() => break,
+            Verdict::Rejected(code) if is_transient(code) && Instant::now() < deadline => {
+                sleep(RETRY_PAUSE).await
+            }
+            other => panic!("the inherited partition must consume exactly one cap slot: {other:?}"),
+        }
+    }
+    harness.kill_cluster().unwrap();
+    for path in paths {
+        let headers = metadata_wal_headers(path);
+        assert_eq!(
+            headers
+                .iter()
+                .filter(|header| header.client == CLIENT_ID && header.request == 2)
+                .count(),
+            1,
+            "bootstrap and receipt replay must retain one prepare for the inherited create"
+        );
+    }
+}
+
+fn metadata_wal_headers(data_path: PathBuf) -> Vec<iggy_binary_protocol::PrepareHeader> {
+    let bytes = std::fs::read(data_path.join("metadata/journal.wal")).unwrap();
+    let mut position = 0;
+    let mut headers = Vec::new();
+    while let Some(raw) = bytes.get(position..position + HEADER_SIZE) {
+        let header =
+            bytemuck::checked::try_pod_read_unaligned::<iggy_binary_protocol::PrepareHeader>(raw)
+                .unwrap();
+        assert_eq!(header.command, Command::Prepare);
+        let size = usize::try_from(header.size).unwrap();
+        assert!(size >= HEADER_SIZE);
+        if bytes.get(position..position + size).is_none() {
+            break;
+        }
+        assert_eq!(header.checksum, header.identity_checksum());
+        headers.push(header);
+        position += size;
+    }
+    headers
 }
 
 #[iggy_harness(cluster_nodes = [1, 3])]
@@ -412,7 +550,9 @@ pub(super) async fn commit_request(
     request: u64,
     body: &Bytes,
 ) -> CommittedReply {
-    let header = request_header(Operation::CreateStream, session, request, body.len());
+    let header =
+        RequestHeader::for_request(CREATE_STREAM_CODE, CLIENT_ID, request, session, body).unwrap();
+    assert_ne!(header.request_checksum, header.checksum);
     commit_request_header(stream, &header, body).await
 }
 
@@ -424,7 +564,20 @@ async fn commit_request_header(
     let deadline = Instant::now() + COMMIT_BUDGET;
     loop {
         match exchange(stream, header, body).await.verdict() {
-            Verdict::Success(reply) => return reply,
+            Verdict::Success(reply) => {
+                let receipt =
+                    bytemuck::checked::try_pod_read_unaligned::<ReplyHeader>(reply.header.as_ref())
+                        .unwrap();
+                assert!(receipt.has_committed_result());
+                assert_eq!(receipt.client, header.client);
+                assert_eq!(receipt.request, header.request);
+                assert_eq!(receipt.request_checksum, header.request_checksum);
+                assert_eq!(receipt.operation.request_operation(), header.operation);
+                assert_eq!(receipt.partition_incarnation, header.partition_incarnation);
+                assert_ne!(receipt.op, 0);
+                assert_eq!(receipt.op, receipt.commit);
+                return reply;
+            }
             Verdict::Rejected(code) if is_transient(code) && Instant::now() < deadline => {
                 sleep(RETRY_PAUSE).await;
             }
@@ -454,10 +607,30 @@ pub(super) async fn resume_request(
     body: &Bytes,
     expect_replay_of: Option<&CommittedReply>,
 ) {
+    let header =
+        RequestHeader::for_request(CREATE_STREAM_CODE, CLIENT_ID, request, session, body).unwrap();
+    drop(resume_request_header(addrs, &header, body, expect_replay_of).await);
+}
+
+async fn resume_request_header(
+    addrs: &[SocketAddr],
+    header: &RequestHeader,
+    body: &Bytes,
+    expect_replay_of: Option<&CommittedReply>,
+) -> TcpStream {
+    let session = header.session;
+    let request = header.request;
     let deadline = Instant::now() + RESUME_BUDGET;
     let mut last_failure = "the listener never came back".to_string();
     let mut attempt = 0usize;
     let mut authenticated_attempts = Vec::new();
+    let mut header = *header;
+    if let Some(original) = expect_replay_of {
+        let receipt =
+            bytemuck::checked::try_pod_read_unaligned::<ReplyHeader>(original.header.as_ref())
+                .unwrap();
+        header.request_checksum = receipt.request_checksum;
+    }
     while Instant::now() < deadline {
         let addr = addrs[attempt % addrs.len()];
         attempt += 1;
@@ -466,14 +639,13 @@ pub(super) async fn resume_request(
             continue;
         };
         // Keep the epoch so continuation retries use the recovered receipt identity.
-        let resumed = match login_on(&mut stream, CLIENT_ID).await {
+        match login_on(&mut stream, CLIENT_ID).await {
             Some(resumed) => {
                 assert!(
                     resumed == session,
                     "rebind must preserve the recovered session \
                      (old {session}, got {resumed})"
                 );
-                resumed
             }
             None => {
                 last_failure = "re-login did not commit".to_string();
@@ -481,13 +653,12 @@ pub(super) async fn resume_request(
                 continue;
             }
         };
-        let header = request_header(Operation::CreateStream, resumed, request, body.len());
         match exchange(&mut stream, &header, body).await.verdict() {
             Verdict::Success(reply) => {
                 if let Some(original) = expect_replay_of {
                     assert_replayed_from_cache(original, &reply, request);
                 }
-                return;
+                return stream;
             }
             Verdict::Rejected(code) if is_transient(code) => {
                 last_failure = format!("still transient (code {code})");
@@ -690,12 +861,13 @@ const LIVENESS_STREAM: &str = "session-liveness";
 const LIVENESS_TOPIC: &str = "events";
 const LIVENESS_GROUP: &str = "readers";
 const LIVENESS_OBSERVATION: Duration = Duration::from_secs(12);
+const LIVENESS_CONSUMER: u32 = 1;
 
 #[iggy_harness(server(
     metadata.clients_table_max = 4,
     heartbeat.enabled = false,
+    heartbeat.interval = "7s",
     consumer_group.heartbeat_interval = "500ms",
-    consumer_group.session_timeout = "8s",
     sharding.cpu_allocation = "0..1",
 ))]
 async fn given_full_registry_when_new_clients_arrive_should_preserve_live_members_until_expiry(
@@ -753,16 +925,25 @@ async fn given_full_registry_when_new_clients_arrive_should_preserve_live_member
         auto_commit: true,
     };
     let first_poll = poll_request.to_bytes();
-    let mut routing_header = request_header(Operation::NonReplicated, session, 0, first_poll.len());
+    let route_request = GetPartitionRouteRequest {
+        stream_id: poll_request.stream_id.clone(),
+        topic_id: poll_request.topic_id.clone(),
+        partition_id: 0,
+    }
+    .to_bytes();
+    let mut routing_header =
+        request_header(Operation::NonReplicated, session, 0, route_request.len());
     routing_header.reserved[..size_of::<u32>()]
-        .copy_from_slice(&GET_POLL_ROUTING_CODE.to_le_bytes());
+        .copy_from_slice(&GET_PARTITION_ROUTE_CODE.to_le_bytes());
     let Exchange::Reply {
         status: 0, body, ..
-    } = exchange(&mut member, &routing_header, &first_poll).await
+    } = exchange(&mut member, &routing_header, &route_request).await
     else {
         panic!("the installed owner must discover its poll context");
     };
-    let context = PollRoutingResponse::decode_from(&body).unwrap().context;
+    let context = PartitionRouteResponse::decode_from(&body)
+        .unwrap()
+        .context();
     let mut first_header = request_header(Operation::NonReplicated, session, 0, first_poll.len());
     first_header.reserved[..size_of::<u32>()].copy_from_slice(&POLL_MESSAGES_CODE.to_le_bytes());
     context.stamp(&mut first_header);
@@ -904,7 +1085,6 @@ async fn given_full_registry_when_new_clients_arrive_should_preserve_live_member
 #[iggy_harness(server(
     metadata.clients_table_max = "18",
     consumer_group.heartbeat_interval = "5s",
-    consumer_group.session_timeout = "30s",
     sharding.cpu_allocation = "0..1",
 ))]
 async fn given_ended_sessions_when_registry_is_full_should_retire_more_than_one_per_heartbeat(
@@ -938,8 +1118,8 @@ async fn given_ended_sessions_when_registry_is_full_should_retire_more_than_one_
 
 #[iggy_harness(server(
     heartbeat.enabled = false,
+    heartbeat.interval = "18s",
     consumer_group.heartbeat_interval = "5s",
-    consumer_group.session_timeout = "22s",
     sharding.cpu_allocation = "0..1",
 ))]
 async fn given_many_recovered_members_when_expiring_should_drain_without_another_interval(
@@ -1004,8 +1184,8 @@ async fn given_many_recovered_members_when_expiring_should_drain_without_another
 
 #[iggy_harness(cluster_nodes = 3, server(
     heartbeat.enabled = false,
+    heartbeat.interval = "7s",
     consumer_group.heartbeat_interval = "500ms",
-    consumer_group.session_timeout = "8s",
     sharding.cpu_allocation = "0..1",
 ))]
 async fn given_backup_member_when_primary_restarts_should_preserve_membership(
@@ -1036,8 +1216,8 @@ async fn given_backup_member_when_primary_restarts_should_preserve_membership(
 
 #[iggy_harness(cluster_nodes = 3, server(
     heartbeat.enabled = false,
+    heartbeat.interval = "7s",
     consumer_group.heartbeat_interval = "500ms",
-    consumer_group.session_timeout = "8s",
     sharding.cpu_allocation = "0..1",
 ))]
 async fn given_backup_member_when_host_crashes_should_expire_membership(harness: &mut TestHarness) {
@@ -1058,8 +1238,8 @@ async fn given_backup_member_when_host_crashes_should_expire_membership(harness:
 
 #[iggy_harness(cluster_nodes = 3, server(
     heartbeat.enabled = false,
+    heartbeat.interval = "7s",
     consumer_group.heartbeat_interval = "500ms",
-    consumer_group.session_timeout = "8s",
     sharding.cpu_allocation = "0..1",
 ))]
 async fn given_primary_member_when_host_crashes_should_expire_membership(
@@ -1127,6 +1307,88 @@ async fn given_primary_member_when_host_crashes_should_expire_membership(
         "restarting the crashed host restored its member"
     );
     assert_eq!(after.members[0].id, expired.members[0].id);
+}
+
+/// A session needs no socket to the metadata primary. The partition primary
+/// it still talks to reports its activity, which renews the lease.
+#[iggy_harness(cluster_nodes = 3, server(
+    heartbeat.enabled = true,
+    heartbeat.interval = "7s",
+    consumer_group.heartbeat_interval = "500ms",
+    sharding.cpu_allocation = "0..1",
+))]
+async fn given_a_cut_metadata_link_when_partition_links_stay_up_should_keep_sending_and_polling(
+    harness: &mut TestHarness,
+) {
+    let observer = harness.root_client_for_node(0).await.unwrap();
+    let partitions_count = u32::try_from(harness.cluster_size()).unwrap();
+    observer
+        .create_stream(LIVENESS_STREAM, &StreamCreateOptions::default())
+        .await
+        .unwrap();
+    observer
+        .create_topic(
+            &Identifier::named(LIVENESS_STREAM).unwrap(),
+            LIVENESS_TOPIC,
+            &TopicCreateOptions {
+                partitions_count: Some(partitions_count),
+                durability: Durability::Persisted,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let metadata_primary = primary_index(harness, &observer).await;
+    let metadata_address = harness.node(metadata_primary).tcp_addr().unwrap();
+    let (mut metadata_link, session) = register(metadata_address).await;
+    let mut backup_route = None;
+    for partition_id in 0..partitions_count {
+        let route = partition_route(&mut metadata_link, session, partition_id).await;
+        if usize::from(route.primary_replica) != metadata_primary {
+            backup_route = Some((partition_id, route));
+            break;
+        }
+    }
+    let (partition_id, route) =
+        backup_route.expect("spread placement must give a metadata backup a partition primary");
+    let partition_address = harness
+        .node(usize::from(route.primary_replica))
+        .tcp_addr()
+        .unwrap();
+    let (mut partition_link, rebound) = register(partition_address).await;
+    assert_eq!(
+        rebound, session,
+        "the partition link must join the same logical session"
+    );
+    drop(metadata_link);
+
+    let context = route.context();
+    let deadline = Instant::now() + LIVENESS_OBSERVATION;
+    let mut offset = 0;
+    while Instant::now() < deadline {
+        let payload = format!("activity-{offset}");
+        send_payload(
+            &mut partition_link,
+            session,
+            context,
+            partition_id,
+            offset + 1,
+            payload.as_bytes(),
+        )
+        .await;
+        assert_eq!(
+            poll_payload(&mut partition_link, session, context, partition_id, offset).await,
+            payload.as_bytes(),
+            "the poll at offset {offset} must read the message just sent"
+        );
+        offset += 1;
+        sleep(RETRY_PAUSE).await;
+    }
+    let (_, resumed) = register(metadata_address).await;
+    assert_eq!(
+        resumed, session,
+        "the metadata primary must keep the session its partition link kept active"
+    );
 }
 
 async fn liveness_group(observer: &IggyClient) -> ConsumerGroupDetails {
@@ -1213,7 +1475,10 @@ async fn primary_index(harness: &TestHarness, observer: &IggyClient) -> usize {
 }
 
 async fn create_liveness_group(observer: &IggyClient) {
-    observer.create_stream(LIVENESS_STREAM).await.unwrap();
+    observer
+        .create_stream(LIVENESS_STREAM, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     let stream = Identifier::named(LIVENESS_STREAM).unwrap();
     let topic = Identifier::named(LIVENESS_TOPIC).unwrap();
     observer
@@ -1233,4 +1498,123 @@ async fn create_liveness_group(observer: &IggyClient) {
         .create_consumer_group(&stream, &topic, LIVENESS_GROUP)
         .await
         .unwrap();
+}
+
+/// The route of a liveness partition, replayed while the partition is not yet
+/// routable.
+async fn partition_route(
+    connection: &mut TcpStream,
+    session: u64,
+    partition_id: u32,
+) -> PartitionRouteResponse {
+    let route = GetPartitionRouteRequest {
+        stream_id: WireIdentifier::named(LIVENESS_STREAM).unwrap(),
+        topic_id: WireIdentifier::named(LIVENESS_TOPIC).unwrap(),
+        partition_id,
+    }
+    .to_bytes();
+    let mut header = request_header(Operation::NonReplicated, session, 0, route.len());
+    header.reserved[..size_of::<u32>()].copy_from_slice(&GET_PARTITION_ROUTE_CODE.to_le_bytes());
+    let deadline = Instant::now() + COMMIT_BUDGET;
+    loop {
+        match exchange(connection, &header, &route).await {
+            Exchange::Reply {
+                status: 0, body, ..
+            } => return PartitionRouteResponse::decode_from(&body).unwrap(),
+            Exchange::Reply { status, .. } if is_transient(status) && Instant::now() < deadline => {
+                sleep(RETRY_PAUSE).await;
+            }
+            other => panic!("partition {partition_id} never became routable: {other:?}"),
+        }
+    }
+}
+
+/// Send one message to a liveness partition, replayed while its primary
+/// refuses it transiently.
+async fn send_payload(
+    connection: &mut TcpStream,
+    session: u64,
+    context: PartitionContext,
+    partition_id: u32,
+    request: u64,
+    payload: &[u8],
+) {
+    let body = send_messages_body(partition_id, payload);
+    let mut header = request_header(Operation::SendMessages, session, request, body.len());
+    context.stamp(&mut header);
+    let deadline = Instant::now() + COMMIT_BUDGET;
+    loop {
+        match exchange(connection, &header, &body).await {
+            Exchange::Reply { status: 0, .. } => return,
+            Exchange::Reply { status, .. } if is_transient(status) && Instant::now() < deadline => {
+                sleep(RETRY_PAUSE).await;
+            }
+            other => panic!("send request {request} did not commit: {other:?}"),
+        }
+    }
+}
+
+fn send_messages_body(partition_id: u32, payload: &[u8]) -> Bytes {
+    let stream_id = WireIdentifier::named(LIVENESS_STREAM).unwrap();
+    let topic_id = WireIdentifier::named(LIVENESS_TOPIC).unwrap();
+    let partitioning = WirePartitioning::PartitionId(partition_id);
+    let messages = [RawMessage {
+        id: 0,
+        origin_timestamp: 0,
+        headers: None,
+        payload,
+    }];
+    let mut body = BytesMut::with_capacity(SendMessagesEncoder::encoded_size(
+        &stream_id,
+        &topic_id,
+        &partitioning,
+        &messages,
+    ));
+    SendMessagesEncoder::encode(&mut body, &stream_id, &topic_id, &partitioning, &messages)
+        .unwrap();
+    body.freeze()
+}
+
+/// The payload at `offset` of a liveness partition, polled until the committed
+/// message is readable.
+async fn poll_payload(
+    connection: &mut TcpStream,
+    session: u64,
+    context: PartitionContext,
+    partition_id: u32,
+    offset: u64,
+) -> Vec<u8> {
+    let poll = PollMessagesRequest {
+        consumer: WireConsumer::consumer(WireIdentifier::numeric(LIVENESS_CONSUMER)),
+        stream_id: WireIdentifier::named(LIVENESS_STREAM).unwrap(),
+        topic_id: WireIdentifier::named(LIVENESS_TOPIC).unwrap(),
+        partition_id: Some(partition_id),
+        strategy: WirePollingStrategy::offset(offset),
+        count: 1,
+        auto_commit: false,
+    }
+    .to_bytes();
+    let mut header = request_header(Operation::NonReplicated, session, 0, poll.len());
+    header.reserved[..size_of::<u32>()].copy_from_slice(&POLL_MESSAGES_CODE.to_le_bytes());
+    context.stamp(&mut header);
+    let deadline = Instant::now() + COMMIT_BUDGET;
+    loop {
+        let polled = match exchange(connection, &header, &poll).await {
+            Exchange::Reply {
+                status: 0, body, ..
+            } => body,
+            other => panic!("the poll at offset {offset} was refused: {other:?}"),
+        };
+        let mut response = PollMessagesResponse::decode(&polled).unwrap();
+        if let Some(message) = response.messages.next() {
+            let message = message.unwrap();
+            assert_eq!(message.offset, offset);
+            return message.payload.to_vec();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the message at offset {offset} never became readable"
+        );
+        sleep(RETRY_PAUSE).await;
+    }
 }
