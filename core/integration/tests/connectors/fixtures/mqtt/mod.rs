@@ -34,7 +34,7 @@ use container::{
 
 pub use sink::{
     Mqtt311SinkQosOneFixture, Mqtt311SinkQosTwoFixture, Mqtt311SinkQosZeroFixture,
-    MqttSinkDynamicTopicFixture, MqttSinkEnvelopeFixture, MqttSinkFixture,
+    MqttSinkDynamicTopicFixture, MqttSinkEnvelopeFixture, MqttSinkFixture, MqttSinkIdleFixture,
     MqttSinkInvalidCredentialsFixture, MqttSinkPipelinedFixture, MqttSinkQosTwoFixture,
     MqttSinkQosZeroFixture, MqttSinkRawSchemaFixture, MqttSinkTemplateTopicFixture,
 };
