@@ -661,6 +661,9 @@ async fn given_all_replicas_checkpointed_when_restarted_should_elect_and_extend_
             &TopicCreateOptions {
                 partitions_count: Some(1),
                 durability: Durability::Persisted,
+                // The donor never returns after the full restart, which only
+                // a partition persisting every acknowledged prepare survives.
+                consumer_offset_durability: Durability::Persisted,
                 ..TopicCreateOptions::default()
             },
         )
