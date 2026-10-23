@@ -46,6 +46,7 @@ pub struct PreparedPublication {
     pub offset: u64,
     pub topic: PublicationTopic,
     pub payload: Bytes,
+    pub packet_size: usize,
     pub properties: Option<PublishProperties>,
 }
 
@@ -100,7 +101,7 @@ struct MqttUserProperty {
 }
 
 pub fn validate_topic(topic: &str, field: &str) -> Result<(), Error> {
-    validate_topic_value(topic, field).map_err(Error::InvalidConfigValue)
+    validate_publish_topic_value(topic, field).map_err(Error::InvalidConfigValue)
 }
 
 pub fn validate_topic_template(template: &str, field: &str) -> Result<(), Error> {
@@ -156,12 +157,21 @@ pub fn validate_topic_template(template: &str, field: &str) -> Result<(), Error>
     Ok(())
 }
 
+fn validate_publish_topic_value(topic: &str, field: &str) -> Result<(), String> {
+    validate_topic_value(topic, field)?;
+    if topic.starts_with('$') {
+        return Err(format!("{field} must not start with '$'"));
+    }
+    Ok(())
+}
+
+fn validate_response_topic_value(topic: &str, field: &str) -> Result<(), String> {
+    validate_topic_value(topic, field)
+}
+
 fn validate_topic_value(topic: &str, field: &str) -> Result<(), String> {
     if topic.trim().is_empty() {
         return Err(format!("{field} must not be empty"));
-    }
-    if topic.starts_with('$') {
-        return Err(format!("{field} must not start with '$'"));
     }
     validate_mqtt_string(topic, field)?;
     if topic
@@ -260,6 +270,7 @@ pub fn prepare_publication_with_batch_topic(
                 offset,
                 topic: PublicationTopic::Shared(Arc::clone(topic)),
                 payload: message.payload.try_into_vec()?.into(),
+                packet_size: 0,
                 properties: None,
             })
         }
@@ -272,6 +283,7 @@ pub fn prepare_publication_with_batch_topic(
                 offset,
                 topic: PublicationTopic::Owned(topic),
                 payload,
+                packet_size: 0,
                 properties,
             })
         }
@@ -372,7 +384,7 @@ fn prepare_publish_properties(
         ));
     }
     if let Some(response_topic) = properties.response_topic.as_deref() {
-        validate_topic_value(response_topic, "MQTT envelope response_topic")
+        validate_response_topic_value(response_topic, "MQTT envelope response_topic")
             .map_err(Error::InvalidRecordValue)?;
     }
     if let Some(content_type) = properties.content_type.as_deref() {
@@ -414,11 +426,14 @@ fn prepare_publish_properties(
 
     Ok(PublishProperties {
         payload_format_indicator: properties.payload_format_indicator,
-        message_expiry_interval: remaining_message_expiry_interval(
-            properties.message_expiry_interval,
-            message_timestamp,
-            IggyTimestamp::now().as_micros(),
-        )?,
+        message_expiry_interval: match properties.message_expiry_interval {
+            Some(message_expiry_interval) => remaining_message_expiry_interval(
+                Some(message_expiry_interval),
+                message_timestamp,
+                IggyTimestamp::now().as_micros(),
+            )?,
+            None => None,
+        },
         // Topic aliases are scoped to the MQTT connection that created them.
         // The sink creates a different connection, so it must publish the
         // complete topic instead of forwarding the old alias.
@@ -921,5 +936,36 @@ mod tests {
 
             assert!(matches!(error, Error::InvalidRecordValue(_)));
         }
+    }
+
+    #[test]
+    fn dynamic_json_envelope_with_system_response_topic_should_prepare_publication() {
+        let payload = serde_json::json!({
+            "version": 1,
+            "payload_base64": "AQID",
+            "properties": {"response_topic": "$reply/device-42"},
+        });
+        let mut bytes = serde_json::to_vec(&payload).unwrap();
+        let json = simd_json::to_owned_value(&mut bytes).unwrap();
+
+        let publication = prepare_publication(
+            message(Payload::Json(json)),
+            &metadata(),
+            TopicMode::Dynamic,
+            None,
+            None,
+            None,
+            MqttProtocol::Mqtt5,
+        )
+        .unwrap();
+
+        assert_eq!(
+            publication
+                .properties
+                .expect("response topic must produce MQTT 5 properties")
+                .response_topic
+                .as_deref(),
+            Some("$reply/device-42")
+        );
     }
 }
