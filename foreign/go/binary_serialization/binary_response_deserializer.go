@@ -21,6 +21,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"time"
 
@@ -123,20 +124,28 @@ func DeserializeToStream(payload []byte, position int) (iggcon.Stream, int, erro
 
 	name := string(payload[position+33 : position+33+nameLength])
 
-	options, optionsSize, err := deserializeOptions(payload, position+streamFixedSize+nameLength)
+	readBytes := streamFixedSize + nameLength
+	options, optionsSize, err := deserializeOptions(payload, position+readBytes)
 	if err != nil {
 		return iggcon.Stream{}, 0, fmt.Errorf("failed to read stream options: %w", err)
 	}
+	readBytes += optionsSize
+	derivedOptions, derivedSize, err := deserializeOptions(payload, position+readBytes)
+	if err != nil {
+		return iggcon.Stream{}, 0, fmt.Errorf("failed to read stream derived options: %w", err)
+	}
+	readBytes += derivedSize
 
 	return iggcon.Stream{
-		Id:            id,
-		TopicsCount:   topicsCount,
-		Name:          name,
-		SizeBytes:     sizeBytes,
-		MessagesCount: messagesCount,
-		CreatedAt:     createdAt,
-		Options:       options,
-	}, streamFixedSize + nameLength + optionsSize, nil
+		Id:             id,
+		TopicsCount:    topicsCount,
+		Name:           name,
+		SizeBytes:      sizeBytes,
+		MessagesCount:  messagesCount,
+		CreatedAt:      createdAt,
+		Options:        options,
+		DerivedOptions: derivedOptions,
+	}, readBytes, nil
 }
 
 // deserializeOptions reads a u32-length-prefixed options TLV block at
@@ -277,14 +286,23 @@ func DeserializeFetchMessagesResponse(payload []byte, compression iggcon.IggyMes
 }
 
 // optionSpecMinimumSize is the smallest catalog entry: a one-character name
-// (a length byte plus at least one byte), a kind byte, and empty
+// (a length byte plus at least one byte), kind and flags bytes, and empty
 // length-prefixed default and description.
-const optionSpecMinimumSize = 2 + 1 + 4 + 4
+const optionSpecMinimumSize = 2 + 1 + 1 + 4 + 4
+
+// Option flag bits of a DescribeOptions entry. Higher bits are ignored.
+const (
+	optionFlagUpdatable  = 1 << 0
+	optionFlagResettable = 1 << 1
+	optionFlagSecret     = 1 << 2
+	optionFlagReadOnly   = 1 << 3
+	optionFlagCritical   = 1 << 4
+)
 
 // DeserializeOptionSpecs reads a DescribeOptions response.
 //
-// Wire format: [count:u32][ [key_len:u8][key][kind:u8][default_len:u32][default]
-// [description_len:u32][description] ]*
+// Wire format: [count:u32][ [key_len:u8][key][kind:u8][flags:u8]
+// [default_len:u32][default][description_len:u32][description] ]*
 func DeserializeOptionSpecs(payload []byte) ([]iggcon.OptionSpec, error) {
 	if len(payload) < 4 {
 		return nil, fmt.Errorf(
@@ -301,14 +319,15 @@ func DeserializeOptionSpecs(payload []byte) ([]iggcon.OptionSpec, error) {
 		}
 		keyLength := int(payload[position])
 		position++
-		if len(payload)-position < keyLength+1 {
+		if len(payload)-position < keyLength+2 {
 			return nil, fmt.Errorf("truncated option key at offset %d", position)
 		}
 		key := string(payload[position : position+keyLength])
 		position += keyLength
 
 		kind := payload[position]
-		position++
+		flags := payload[position+1]
+		position += 2
 
 		defaultValue, read, err := readLengthPrefixed(payload, position, "option default value")
 		if err != nil {
@@ -325,6 +344,11 @@ func DeserializeOptionSpecs(payload []byte) ([]iggcon.OptionSpec, error) {
 		specs = append(specs, iggcon.OptionSpec{
 			Key:          key,
 			DefaultValue: iggcon.HeaderValue{Kind: iggcon.HeaderKind(kind), Value: defaultValue},
+			Updatable:    flags&optionFlagUpdatable != 0,
+			Resettable:   flags&optionFlagResettable != 0,
+			Secret:       flags&optionFlagSecret != 0,
+			ReadOnly:     flags&optionFlagReadOnly != 0,
+			Critical:     flags&optionFlagCritical != 0,
 			Description:  string(description),
 		})
 	}
@@ -394,9 +418,9 @@ func DeserializeTopic(payload []byte) (*iggcon.TopicDetails, error) {
 }
 
 // topicFixedSize covers the fields before the name:
-// id + created_at + partitions_count + message_expiry + compression +
-// max_topic_size + size_bytes + messages_count + name_len.
-const topicFixedSize = 4 + 8 + 4 + 8 + 1 + 8 + 8 + 8 + 1 // 50 bytes
+// id + created_at + partitions_count + size_bytes + messages_count + name_len.
+// Message expiry, compression and the size cap live in the options blocks.
+const topicFixedSize = 4 + 8 + 4 + 8 + 8 + 1 // 33 bytes
 
 // topicMinimumSize is the smallest possible topic element: fixed fields, a
 // one-character name (the server rejects an empty one), and the two u32
@@ -431,21 +455,16 @@ func DeserializeToTopic(payload []byte, position int) (iggcon.Topic, int, error)
 	topic.Id = binary.LittleEndian.Uint32(payload[position : position+4])
 	topic.CreatedAt = binary.LittleEndian.Uint64(payload[position+4 : position+12])
 	topic.PartitionsCount = binary.LittleEndian.Uint32(payload[position+12 : position+16])
-	topic.MessageExpiry = iggcon.Duration(binary.LittleEndian.Uint64(payload[position+16 : position+24]))
-	topic.CompressionAlgorithm = payload[position+24]
-	topic.MaxTopicSize = binary.LittleEndian.Uint64(payload[position+25 : position+33])
-	topic.Size = binary.LittleEndian.Uint64(payload[position+33 : position+41])
-	topic.MessagesCount = binary.LittleEndian.Uint64(payload[position+41 : position+49])
-	// Replication factor left the wire protocol together with the old fixed
-	// layout; every topic reports the single-copy default.
+	topic.Size = binary.LittleEndian.Uint64(payload[position+16 : position+24])
+	topic.MessagesCount = binary.LittleEndian.Uint64(payload[position+24 : position+32])
 
-	nameLength := int(payload[position+49])
+	nameLength := int(payload[position+32])
 	if remaining < topicFixedSize+nameLength {
 		return iggcon.Topic{}, 0, fmt.Errorf(
 			"not enough data to read topic name: need %d bytes, got %d",
 			topicFixedSize+nameLength, remaining)
 	}
-	topic.Name = string(payload[position+50 : position+50+nameLength])
+	topic.Name = string(payload[position+33 : position+33+nameLength])
 
 	readBytes := topicFixedSize + nameLength
 	options, optionsSize, err := deserializeOptions(payload, position+readBytes)
@@ -462,7 +481,43 @@ func DeserializeToTopic(payload []byte, position int) (iggcon.Topic, int, error)
 	topic.DerivedOptions = derivedOptions
 	readBytes += derivedSize
 
+	topic.MessageExpiry = iggcon.Duration(topicUint64Option(topic, iggcon.TopicOptionMessageExpiry, uint64(iggcon.IggyExpiryNeverExpire)))
+	topic.MaxTopicSize = topicUint64Option(topic, iggcon.TopicOptionMaxTopicSize, math.MaxUint64)
+	topic.CompressionAlgorithm = uint8(iggcon.CompressionAlgorithmNone)
+	if value, ok := topicOption(topic, iggcon.TopicOptionCompressionAlgorithm); ok && value.Kind == iggcon.String {
+		if algorithm, known := compressionAlgorithms[string(value.Value)]; known {
+			topic.CompressionAlgorithm = uint8(algorithm)
+		}
+	}
+
 	return topic, readBytes, nil
+}
+
+// compressionAlgorithms maps the catalog spelling of compression_algorithm to
+// its code.
+var compressionAlgorithms = map[string]iggcon.CompressionAlgorithm{
+	"none": iggcon.CompressionAlgorithmNone,
+	"gzip": iggcon.CompressionAlgorithmGzip,
+}
+
+// topicOption looks a key up in both blocks: a key is explicit or derived,
+// never both.
+func topicOption(topic iggcon.Topic, key iggcon.TopicOptionKey) (iggcon.HeaderValue, bool) {
+	if value, ok := topic.Options[string(key)]; ok {
+		return value, true
+	}
+	value, ok := topic.DerivedOptions[string(key)]
+	return value, ok
+}
+
+// topicUint64Option reads a Uint64 option, or the catalog default when the
+// server reported none.
+func topicUint64Option(topic iggcon.Topic, key iggcon.TopicOptionKey, fallback uint64) uint64 {
+	value, ok := topicOption(topic, key)
+	if !ok || value.Kind != iggcon.Uint64 || len(value.Value) != 8 {
+		return fallback
+	}
+	return binary.LittleEndian.Uint64(value.Value)
 }
 
 func DeserializePartition(payload []byte, position int) (iggcon.PartitionContract, int, error) {
@@ -590,11 +645,12 @@ func DeserializeUser(payload []byte) (*iggcon.UserInfoDetails, error) {
 	}
 	hasPermissions := payload[position]
 	userInfo := iggcon.UserInfo{
-		Id:        response.Id,
-		CreatedAt: response.CreatedAt,
-		Username:  response.Username,
-		Status:    response.Status,
-		Options:   response.Options,
+		Id:             response.Id,
+		CreatedAt:      response.CreatedAt,
+		Username:       response.Username,
+		Status:         response.Status,
+		Options:        response.Options,
+		DerivedOptions: response.DerivedOptions,
 	}
 	if hasPermissions == 1 {
 		permissionLength := binary.LittleEndian.Uint32(payload[position+1 : position+5])
@@ -726,13 +782,19 @@ func deserializeToUser(payload []byte, position int) (*iggcon.UserInfo, int, err
 		return nil, 0, fmt.Errorf("failed to read user options: %w", err)
 	}
 	readBytes += optionsSize
+	derivedOptions, derivedSize, err := deserializeOptions(payload, position+readBytes)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to read user derived options: %w", err)
+	}
+	readBytes += derivedSize
 
 	return &iggcon.UserInfo{
-		Id:        id,
-		CreatedAt: createdAt,
-		Status:    userStatus,
-		Username:  username,
-		Options:   options,
+		Id:             id,
+		CreatedAt:      createdAt,
+		Status:         userStatus,
+		Username:       username,
+		Options:        options,
+		DerivedOptions: derivedOptions,
 	}, readBytes, nil
 }
 
@@ -818,7 +880,7 @@ func DeserializeAccessToken(payload []byte) (*iggcon.RawPersonalAccessToken, err
 
 func DeserializeAccessTokens(payload []byte) ([]iggcon.PersonalAccessTokenInfo, error) {
 	if len(payload) == 0 {
-		return []iggcon.PersonalAccessTokenInfo{}, ierror.ErrEmptyMessagePayload
+		return []iggcon.PersonalAccessTokenInfo{}, nil
 	}
 
 	var result []iggcon.PersonalAccessTokenInfo
@@ -841,9 +903,10 @@ func deserializeToPersonalAccessTokenResponse(payload []byte, position int) (igg
 	var expiry *time.Time
 
 	if len(expiryBytes) >= 8 {
-		unixMicroSeconds := binary.LittleEndian.Uint64(expiryBytes)
-		expiryTime := time.Unix(0, int64(unixMicroSeconds))
-		expiry = &expiryTime
+		if unixMicroSeconds := binary.LittleEndian.Uint64(expiryBytes); unixMicroSeconds != 0 {
+			expiryTime := time.UnixMicro(int64(unixMicroSeconds))
+			expiry = &expiryTime
+		}
 	}
 
 	readBytes := 1 + nameLength + 8

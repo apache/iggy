@@ -50,7 +50,7 @@ fn batch(count: u32) -> Vec<IggyMessage> {
 /// Returns the numeric ids the server assigned to the created stream and topic.
 async fn create_stream_and_topic(client: &IggyClient, partitions_count: u32) -> (u32, u32) {
     let stream = client
-        .create_stream(STREAM_NAME)
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
         .await
         .expect("create_stream");
     let topic = client

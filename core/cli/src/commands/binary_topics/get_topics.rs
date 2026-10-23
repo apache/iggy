@@ -83,14 +83,15 @@ impl CliCommand for GetTopicsCmd {
                 ]);
 
                 topics.iter().for_each(|topic| {
+                    let resolved = topic.resolved_options();
                     table.add_row(vec![
                         format!("{}", topic.id),
                         topic.created_at.to_utc_string("%Y-%m-%d %H:%M:%S"),
                         topic.name.clone(),
                         format!("{}", topic.size),
-                        format!("{}", topic.max_topic_size),
-                        topic.compression_algorithm.to_string(),
-                        match topic.message_expiry {
+                        format!("{}", resolved.max_topic_size),
+                        resolved.compression_algorithm.to_string(),
+                        match resolved.message_expiry {
                             IggyExpiry::NeverExpire => String::from("unlimited"),
                             IggyExpiry::ServerDefault => String::from("server_default"),
                             IggyExpiry::ExpireDuration(value) => format!("{value}"),
@@ -104,15 +105,16 @@ impl CliCommand for GetTopicsCmd {
             }
             GetTopicsOutput::List => {
                 topics.iter().for_each(|topic| {
+                    let resolved = topic.resolved_options();
                     event!(target: PRINT_TARGET, Level::INFO,
                             "{}|{}|{}|{}|{}|{}|{}|{}|{}",
                             topic.id,
                             topic.created_at.to_utc_string("%Y-%m-%d %H:%M:%S"),
                             topic.name,
                             topic.size,
-                            topic.max_topic_size,
-                            topic.compression_algorithm.to_string(),
-                            match topic.message_expiry {
+                            resolved.max_topic_size,
+                            resolved.compression_algorithm.to_string(),
+                            match resolved.message_expiry {
                     IggyExpiry::NeverExpire => String::from("unlimited"),
                     IggyExpiry::ServerDefault => String::from("server_default"),
                     IggyExpiry::ExpireDuration(value) => format!("{value}"),

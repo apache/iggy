@@ -65,12 +65,14 @@ it knows the server supports flexible encoding.
 | 12 | Heartbeat | 0 | 4 | 0, 1, 2, 3, 4 | Refreshes a session; `REBALANCE_IN_PROGRESS` (27) drives a rejoin; flexible encoding at v4+ |
 | 13 | LeaveGroup | 0 | 5 | 0, 1, 2, 3, 4, 5 | Removes members, per-member errors from v3; flexible encoding at v4+ |
 | 14 | SyncGroup | 0 | 5 | 0, 1, 2, 3, 4, 5 | Relays the leader's assignment blobs; flexible encoding at v4+ |
-| 15 | DescribeGroups | 0 | 6 | 0, 1, 2, 3, 4, 5, 6 | Members, assignment and state of groups on this coordinator; a missing group is `Dead`, and v6 also returns `GROUP_ID_NOT_FOUND` (69); flexible encoding at v5+ |
-| 16 | ListGroups | 0 | 5 | 0, 1, 2, 3, 4, 5 | Groups on this coordinator; v4+ state filter and v5 type filter; flexible encoding at v3+ |
+| 15 | DescribeGroups | 0 | 6 | 0, 1, 2, 3, 4, 5, 6 | Members, assignment and state of groups on this coordinator. A group that is not there but holds offsets in Iggy is `Empty`. Any other missing group is `Dead`, and v6 also returns `GROUP_ID_NOT_FOUND` (69). Flexible encoding at v5+ |
+| 16 | ListGroups | 0 | 5 | 0, 1, 2, 3, 4, 5 | Groups on this coordinator, plus the groups that hold offsets in Iggy as `Empty` (see [`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md)). v4+ state filter and v5 type filter. Flexible encoding at v3+ |
 | 22 | InitProducerId | 0 | 5 | 0, 1, 2, 3, 4, 5 | Allocate a producer id (epoch 0); a `transactional_id` gets `UNSUPPORTED_VERSION` (35); flexible encoding at v2+ |
 | 32 | DescribeConfigs | 1 | 4 | 1, 2, 3, 4 | Topic resources only. Returns `retention.ms` and leaves out `cleanup.policy`. Flexible encoding at v4. See [`CONFIGS.md`](CONFIGS.md) |
 | 33 | AlterConfigs | 0 | 2 | 0, 1, 2 | Persists `retention.ms` only. Flexible encoding at v2. See [`CONFIGS.md`](CONFIGS.md) |
+| 42 | DeleteGroups | 0 | 2 | 0, 1, 2 | With a bridge: deletes a group without members, with its offsets in Iggy. While it has members: `NON_EMPTY_GROUP` (68). When it does not exist: `GROUP_ID_NOT_FOUND` (69). Flexible encoding at v2. v3 adds an error message that `kafka-protocol` cannot encode yet |
 | 44 | IncrementalAlterConfigs | 0 | 1 | 0, 1 | Persists `retention.ms` only, one operation per entry; `APPEND` and `SUBTRACT` are refused. Flexible encoding at v1. See [`CONFIGS.md`](CONFIGS.md) |
+| 47 | OffsetDelete | 0 | 0 | 0 | With a bridge: deletes offsets of a group. `GROUP_SUBSCRIBED_TO_TOPIC` (86) for a topic that a member subscribes to. See [`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md). v1 is not in a Kafka release |
 | 60 | DescribeCluster | 0 | 2 | 0, 1, 2 | The [cluster id](#cluster-id) and the broker Metadata advertises on the same listener. The controller endpoint type gets `MISMATCHED_ENDPOINT_TYPE` (114) and an unknown one `UNSUPPORTED_ENDPOINT_TYPE` (115). `cluster_authorized_operations` stays unset, so a Java client reads it as null. Flexible encoding at every version |
 
 A request is accepted when `min_version ≤ api_version ≤ max_version` for that API key. Any other version for a listed key closes the connection (ApiVersions excepted - see Governance model above).
@@ -103,7 +105,9 @@ Use this table when configuring clients or generating wire fixtures with `kafka-
 | 32 | DescribeConfigs | 1–4 | v4 |
 | 33 | AlterConfigs | 0–2 | v2 |
 | 37 | CreatePartitions | 0–3 | v2 |
+| 42 | DeleteGroups | 0–2 | v2 |
 | 44 | IncrementalAlterConfigs | 0–1 | v1 |
+| 47 | OffsetDelete | 0 | never |
 | 60 | DescribeCluster | 0–2 | v0 |
 
 ### Cluster id
@@ -156,7 +160,7 @@ All API keys not listed above close the connection (see Governance model above) 
 | 29 | DescribeAcls | Implemented on listeners that name a principal: the SASL ones, and `SSL` with client certificates; advertised only there ([`ACL_MAPPING.md`](ACL_MAPPING.md)) |
 | 36 | SaslAuthenticate | Implemented on `SASL_PLAINTEXT` and `SASL_SSL` listeners, advertised only there ([`AUTHENTICATION.md`](AUTHENTICATION.md)) |
 | 24, 25, 26, 28 | AddPartitionsToTxn, AddOffsetsToTxn, EndTxn, TxnOffsetCommit | Transactions - not supported, see below |
-| 23, 27, 30, 31, 34, 35, 38 to 43, 45 to 59, 61+ | `OffsetForLeaderEpoch`, `WriteTxnMarkers`, `CreateAcls`/`DeleteAcls`, etc. | Later issues |
+| 23, 27, 30, 31, 34, 35, 38 to 41, 43, 45, 46, 48 to 59, 61+ | `OffsetForLeaderEpoch`, `WriteTxnMarkers`, `CreateAcls`/`DeleteAcls`, etc. | Later issues |
 | 21 | DeleteRecords | Not advertised on purpose, see below |
 | 68 | ConsumerGroupHeartbeat | KIP-848 protocol, opt-in via `group.protocol=consumer`; the 4.0 default is still `classic` |
 
@@ -219,7 +223,7 @@ nor moved by retention. That is the same core change the ListOffsets `EARLIEST` 
 | Layer | #3421 | Description |
 | ------- | ------- | ------------- |
 | **1 — Wire framing** | In scope | `server.rs` — custom, zero-copy frame I/O; `header.rs` delegates version selection to `kafka_protocol::messages::ApiKey` |
-| **2 — Request/response codecs** | Partial | Decode/encode via the `kafka_protocol` crate (broker feature only) for 22 keys; `bounds_guard.rs` pre-validates against unbounded allocation before handing a frame to the crate; stub responses except InitProducerId and the consumer-group keys, and Produce, Fetch, ListOffsets, Metadata, CreateTopics, DeleteTopics, CreatePartitions, DescribeConfigs, AlterConfigs and IncrementalAlterConfigs with a bridge |
+| **2 — Request/response codecs** | Partial | Decode/encode via the `kafka_protocol` crate (broker feature only) for 24 keys; `bounds_guard.rs` pre-validates against unbounded allocation before handing a frame to the crate; stub responses except InitProducerId and the consumer-group keys, and Produce, Fetch, ListOffsets, Metadata, CreateTopics, DeleteTopics, CreatePartitions, DescribeConfigs, AlterConfigs and IncrementalAlterConfigs with a bridge |
 | **3 — Iggy bridge** | Produce, Fetch, ListOffsets, Metadata, CreateTopics, DeleteTopics, CreatePartitions, DescribeConfigs, AlterConfigs and IncrementalAlterConfigs wired | `bridge/` module (connection, topic mapping, provisioning, high watermark, `topic_target` + `send_records`, `probe` + `poll`). Produce ([#3535](https://github.com/apache/iggy/issues/3535)), Fetch ([#3536](https://github.com/apache/iggy/issues/3536)), ListOffsets ([#3537](https://github.com/apache/iggy/issues/3537)), Metadata ([#3534](https://github.com/apache/iggy/issues/3534)), CreateTopics ([#3538](https://github.com/apache/iggy/issues/3538)), DeleteTopics ([#3546](https://github.com/apache/iggy/issues/3546)), CreatePartitions ([#4520](https://github.com/apache/iggy/issues/4520)), DescribeConfigs and AlterConfigs call it |
 
 ---
@@ -512,6 +516,8 @@ Offset persistence design ([#3540](https://github.com/apache/iggy/issues/3540)):
       [#3548](https://github.com/apache/iggy/issues/3548); see [`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md)
 - [x] OffsetCommit (8), OffsetFetch (9) - [#3542](https://github.com/apache/iggy/issues/3542);
       offsets live in Iggy, see [`OFFSET_STORAGE.md`](OFFSET_STORAGE.md)
+- [x] DeleteGroups (42), OffsetDelete (47) - [#4511](https://github.com/apache/iggy/issues/4511);
+      see [`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md)
 
 ### Phase 3+ — Auth, admin, tuning
 

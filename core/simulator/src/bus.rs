@@ -26,8 +26,8 @@ use message_bus::fd_transfer::DupedFd;
 use message_bus::installer::conn_info::ClientConnMeta;
 use message_bus::replica::listener::MessageHandler;
 use message_bus::{
-    BusMessage, ClientConnectionLostFn, ConnectionInstaller, ConnectionPermit, MessageBus,
-    ReplicaHandshakeDoneFn, SendError, SharedTlsServerConfig,
+    BusMessage, ClientConnectionLostFn, ConnectionInstaller, ConnectionPermit, ConnectionRegistry,
+    InstanceToken, MessageBus, ReplicaHandshakeDoneFn, SendError, SharedTlsServerConfig,
 };
 use server_common::{
     MESSAGE_ALIGN, Message,
@@ -38,7 +38,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::ops::Deref;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Convert an inbound Frozen (bus trait payload) into a `Message` for the
 /// simulator's packet layer. The sim keeps `Message<GenericHeader>` in its
@@ -72,7 +72,10 @@ pub struct Envelope {
 pub struct SimOutbox {
     /// Replica id that owns this outbox. Populated as `from_replica` on every envelope.
     self_id: u8,
-    clients: RefCell<HashSet<u128>>,
+    shell: bool,
+    /// One installation per connected client, so a reply captured for an
+    /// earlier connection is refused after a reconnect, as on the real bus.
+    clients: ConnectionRegistry<u128>,
     replicas: RefCell<HashSet<u8>>,
     pending_messages: RefCell<VecDeque<Envelope>>,
     /// Virtual clock backing [`MessageBus::sleep`], so the shard pump's
@@ -101,6 +104,7 @@ impl std::fmt::Debug for SimOutbox {
         // written and omits it.
         f.debug_struct("SimOutbox")
             .field("self_id", &self.self_id)
+            .field("shell", &self.shell)
             .field("clients", &self.clients)
             .field("replicas", &self.replicas)
             .field("pending_messages", &self.pending_messages)
@@ -113,10 +117,11 @@ impl std::fmt::Debug for SimOutbox {
 
 impl SimOutbox {
     #[must_use]
-    pub fn new(self_id: u8, timer: TimerHandle, spawns: Rc<PendingSpawns>) -> Self {
+    pub fn new(self_id: u8, timer: TimerHandle, spawns: Rc<PendingSpawns>, shell: bool) -> Self {
         Self {
             self_id,
-            clients: RefCell::new(HashSet::new()),
+            shell,
+            clients: ConnectionRegistry::new(),
             replicas: RefCell::new(HashSet::new()),
             pending_messages: RefCell::new(VecDeque::new()),
             timer,
@@ -142,7 +147,7 @@ impl SimOutbox {
     }
 
     pub fn add_client(&mut self, client: u128) -> bool {
-        self.clients.borrow_mut().insert(client)
+        self.clients.insert_in_process(client).is_some()
     }
 
     pub fn add_replica(&mut self, replica: u8) -> bool {
@@ -150,7 +155,7 @@ impl SimOutbox {
     }
 
     pub fn remove_client(&mut self, client: u128) -> bool {
-        self.clients.borrow_mut().remove(&client)
+        self.clients.remove(client)
     }
 
     pub fn remove_replica(&mut self, replica: u8) -> bool {
@@ -206,7 +211,7 @@ impl MessageBus for SimOutbox {
         client_id: u128,
         data: impl Into<BusMessage>,
     ) -> Result<(), SendError> {
-        if !self.clients.borrow().contains(&client_id) {
+        if !self.clients.contains(client_id) {
             return Err(SendError::ClientNotFound(client_id));
         }
 
@@ -249,7 +254,6 @@ impl MessageBus for SimOutbox {
 
     fn set_connection_lost_fn(&self, _f: message_bus::ConnectionLostFn) {}
     fn set_replica_forward_fn(&self, _f: message_bus::ReplicaForwardFn) {}
-    fn set_client_forward_fn(&self, _f: message_bus::ClientForwardFn) {}
 
     fn sleep(&self, duration: Duration) -> impl Future<Output = ()> {
         self.timer.sleep(duration)
@@ -264,6 +268,10 @@ impl MessageBus for SimOutbox {
         // group, so the bus clock a shard-side handler reads and the
         // prepare-timestamp clock agree to the microsecond.
         SimClock::new(self.timer.clone()).realtime().as_micros()
+    }
+
+    fn monotonic_now(&self) -> Instant {
+        self.timer.monotonic_now()
     }
 }
 
@@ -289,6 +297,10 @@ impl MessageBus for SharedSimOutbox {
         client_id: u128,
         data: impl Into<BusMessage>,
     ) -> Result<(), SendError> {
+        if self.0.shell {
+            return Err(SendError::ClientNotFound(client_id));
+        }
+        // Raw mode dispatches client packets with no installation to reply to.
         self.0.send_to_client(client_id, data).await
     }
 
@@ -308,10 +320,6 @@ impl MessageBus for SharedSimOutbox {
         self.0.set_replica_forward_fn(f);
     }
 
-    fn set_client_forward_fn(&self, f: message_bus::ClientForwardFn) {
-        self.0.set_client_forward_fn(f);
-    }
-
     fn sleep(&self, duration: Duration) -> impl Future<Output = ()> {
         self.0.sleep(duration)
     }
@@ -322,6 +330,10 @@ impl MessageBus for SharedSimOutbox {
 
     fn realtime_micros(&self) -> u64 {
         self.0.realtime_micros()
+    }
+
+    fn monotonic_now(&self) -> Instant {
+        self.0.monotonic_now()
     }
 }
 
@@ -407,17 +419,73 @@ impl ConnectionInstaller for SharedSimOutbox {
     fn set_client_connection_lost_fn(&self, f: ClientConnectionLostFn) {
         self.0.set_client_connection_lost_fn(f);
     }
+
+    fn client_instance(&self, client_id: u128) -> Option<InstanceToken> {
+        self.0.clients.instance(client_id)
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn send_to_client_instance(
+        &self,
+        client_id: u128,
+        instance: Option<InstanceToken>,
+        message: BusMessage,
+    ) -> Result<(), SendError> {
+        if instance.is_none() || self.0.clients.instance(client_id) != instance {
+            return Err(SendError::ClientNotFound(client_id));
+        }
+        self.0.send_to_client(client_id, message).await
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::FutureExt;
     use message_bus::installer::conn_info::ClientTransportKind;
+    use partitions::PreparedPrimaryTransfer;
     use std::cell::Cell;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     fn test_outbox() -> SimOutbox {
-        SimOutbox::new(0, TimerHandle::new(), Rc::new(PendingSpawns::default()))
+        SimOutbox::new(
+            0,
+            TimerHandle::new(),
+            Rc::new(PendingSpawns::default()),
+            false,
+        )
+    }
+
+    #[test]
+    fn given_shared_virtual_clock_when_time_advances_should_expire_grants_without_pump_ticks() {
+        let timer = TimerHandle::new();
+        let spawns = Rc::new(PendingSpawns::default());
+        let bus = Rc::new(SharedSimOutbox(Rc::new(SimOutbox::new(
+            0,
+            timer.clone(),
+            Rc::clone(&spawns),
+            false,
+        ))));
+        let start = MessageBus::monotonic_now(&bus);
+        let timeout = Duration::from_secs(1);
+        let grant = PreparedPrimaryTransfer {
+            created_revision: 1,
+            expected_view: 0,
+            target: 1,
+            expires_at: start + timeout,
+        };
+        assert!(grant.is_active_at(MessageBus::monotonic_now(&bus)));
+        assert_eq!(MessageBus::monotonic_now(&bus), start);
+
+        assert_eq!(timer.advance(timeout / 2), [] as [u64; 0]);
+        let restarted = SharedSimOutbox(Rc::new(SimOutbox::new(0, timer.clone(), spawns, false)));
+        assert_eq!(restarted.monotonic_now(), start + timeout / 2);
+        assert_eq!(MessageBus::monotonic_now(&bus), restarted.monotonic_now());
+        assert!(grant.is_active_at(restarted.monotonic_now()));
+
+        assert_eq!(timer.advance(timeout / 2), [] as [u64; 0]);
+        assert_eq!(MessageBus::monotonic_now(&bus), start + timeout);
+        assert!(!grant.is_active_at(MessageBus::monotonic_now(&bus)));
     }
 
     #[test]
@@ -439,5 +507,47 @@ mod tests {
 
         bus.remove_client_meta(42);
         assert!(bus.client_meta(42).is_none(), "removed client meta is gone");
+    }
+
+    /// A reply captured for an earlier connection never reaches the client that
+    /// reconnected under its id, as on the real bus.
+    #[test]
+    fn given_reconnected_client_when_replying_to_earlier_installation_should_refuse() {
+        const CLIENT: u128 = 7;
+        let reply = || {
+            let size = std::mem::size_of::<GenericHeader>();
+            Message::<GenericHeader>::new(size)
+                .transmute_header(|_, header: &mut GenericHeader| {
+                    header.size = u32::try_from(size).expect("header size fits u32");
+                })
+                .into_frozen()
+                .into()
+        };
+        let mut outbox = test_outbox();
+        outbox.shell = true;
+        assert!(outbox.add_client(CLIENT));
+        let earlier = outbox.clients.instance(CLIENT);
+        assert!(outbox.remove_client(CLIENT));
+        assert!(outbox.add_client(CLIENT));
+        let bus = SharedSimOutbox(Rc::new(outbox));
+
+        let stale = bus
+            .send_to_client_instance(CLIENT, earlier, reply())
+            .now_or_never();
+        assert!(matches!(
+            stale,
+            Some(Err(SendError::ClientNotFound(CLIENT)))
+        ));
+        assert!(
+            bus.0.drain().is_empty(),
+            "a stale reply must not reach the reconnected client"
+        );
+
+        let current = bus.client_instance(CLIENT);
+        let delivered = bus
+            .send_to_client_instance(CLIENT, current, reply())
+            .now_or_never();
+        assert!(matches!(delivered, Some(Ok(()))));
+        assert_eq!(bus.0.drain().len(), 1);
     }
 }

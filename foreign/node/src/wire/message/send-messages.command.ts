@@ -20,7 +20,7 @@ import { xxh32 } from '@node-rs/xxhash';
 import { serializeIdentifier, type Id } from '../identifier.utils.js';
 import { serializeSendMessages, type CreateMessage } from './message.utils.js';
 import { Partitioning, PartitionKind, serializeMessageKey } from './partitioning.utils.js';
-import type { ClientProvider, CommandResponse, RawClient } from '../../client/client.type.js';
+import type { ClientProvider, CommandResponse, RawClient, SendCommandOptions } from '../../client/client.type.js';
 import { DeserializeError, ResponseError, responseError } from '../error.utils.js';
 import { COMMAND_CODE } from '../command.code.js';
 import { deserializePartitionRoute, serializePartitionRoute } from '../partition/partition-route.js';
@@ -170,7 +170,7 @@ const getTopicPartitions = (client: RawClient, streamId: Id, topicId: Id): Topic
 const resolvePartitioning = async (
   client: RawClient,
   { streamId, topicId, partition }: SendMessages,
-  deadline: number
+  call: SendCommandOptions & { deadline: number }
 ): Promise<Partitioning> => {
   if (partition?.kind === PartitionKind.PartitionId)
     return partition;
@@ -179,13 +179,13 @@ const resolvePartitioning = async (
     for (;;) {
       try {
         const response = await client.sendCommand(COMMAND_CODE.GetPartitionRoute,
-          serializePartitionRoute(streamId, topicId, 0), { deadline, followsLeaderMoves: false });
+          serializePartitionRoute(streamId, topicId, 0), call);
         topic.count = deserializePartitionRoute(response.data).partitionsCount;
         break;
       } catch (error) {
         if (!(error instanceof ResponseError) ||
             (error.errorCode !== TRANSIENT_NOT_ACCEPTED && error.errorCode !== NOT_PRIMARY) ||
-            deadline - Date.now() <= ROUTE_RETRY_INTERVAL_MS)
+            call.deadline - Date.now() <= ROUTE_RETRY_INTERVAL_MS)
           throw error;
         await delay(ROUTE_RETRY_INTERVAL_MS);
       }
@@ -210,12 +210,13 @@ export const sendMessages = (getClient: ClientProvider) =>
     const client = await getClient();
     const release = client.hold?.();
     try {
-      const deadline = Date.now() + SEND_TIMEOUT_MS;
+      // No command of the call runs under a session that the caller opened after it started.
+      const call = { deadline: Date.now() + SEND_TIMEOUT_MS, lineage: client.lineage };
       for (let attempt = 0; ; attempt += 1) {
-        const partition = await resolvePartitioning(client, request, deadline);
+        const partition = await resolvePartitioning(client, request, call);
         try {
           return SEND_MESSAGES.deserialize(await client.sendCommand(
-            SEND_MESSAGES.code, SEND_MESSAGES.serialize({ ...request, partition }), { deadline }));
+            SEND_MESSAGES.code, SEND_MESSAGES.serialize({ ...request, partition }), call));
         } catch (error) {
           if (attempt !== 0 || request.partition?.kind === PartitionKind.PartitionId ||
               !(error instanceof ResponseError) || error.errorCode !== PARTITION_NOT_FOUND)

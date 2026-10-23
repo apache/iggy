@@ -27,6 +27,7 @@ public static class TestEnvironment
     public static string TcpAddress => Require("IGGY_TCP_ADDRESS");
     public static string LeaderTcpAddress => Require("IGGY_TCP_ADDRESS_LEADER");
     public static string FollowerTcpAddress => Require("IGGY_TCP_ADDRESS_FOLLOWER");
+    public static string NoQuorumTcpAddress => Require("IGGY_TCP_ADDRESS_NO_QUORUM");
     public static string RootUsername => Require("IGGY_ROOT_USERNAME");
     public static string RootPassword => Require("IGGY_ROOT_PASSWORD");
 

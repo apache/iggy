@@ -18,10 +18,10 @@
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 use async_trait::async_trait;
 use iggy_common::UserClient;
-use iggy_common::UserUpdateOptions;
 use iggy_common::{
     Identifier, IdentityInfo, IggyError, Permissions, UserInfo, UserInfoDetails, UserStatus,
 };
+use iggy_common::{UserCreateOptions, UserUpdateOptions};
 
 #[async_trait]
 impl UserClient for ClientWrapper {
@@ -51,31 +51,32 @@ impl UserClient for ClientWrapper {
         password: &str,
         status: UserStatus,
         permissions: Option<Permissions>,
+        options: &UserCreateOptions,
     ) -> Result<UserInfoDetails, IggyError> {
         match self {
             ClientWrapper::Http(client) => {
                 client
-                    .create_user(username, password, status, permissions)
+                    .create_user(username, password, status, permissions, options)
                     .await
             }
             ClientWrapper::Tcp(client) => {
                 client
-                    .create_user(username, password, status, permissions)
+                    .create_user(username, password, status, permissions, options)
                     .await
             }
             ClientWrapper::Quic(client) => {
                 client
-                    .create_user(username, password, status, permissions)
+                    .create_user(username, password, status, permissions, options)
                     .await
             }
             ClientWrapper::Iggy(client) => {
                 client
-                    .create_user(username, password, status, permissions)
+                    .create_user(username, password, status, permissions, options)
                     .await
             }
             ClientWrapper::WebSocket(client) => {
                 client
-                    .create_user(username, password, status, permissions)
+                    .create_user(username, password, status, permissions, options)
                     .await
             }
         }
@@ -94,26 +95,14 @@ impl UserClient for ClientWrapper {
     async fn update_user(
         &self,
         user_id: &Identifier,
-        username: Option<&str>,
-        status: Option<UserStatus>,
         options: &UserUpdateOptions,
     ) -> Result<(), IggyError> {
         match self {
-            ClientWrapper::Http(client) => {
-                client.update_user(user_id, username, status, options).await
-            }
-            ClientWrapper::Tcp(client) => {
-                client.update_user(user_id, username, status, options).await
-            }
-            ClientWrapper::Quic(client) => {
-                client.update_user(user_id, username, status, options).await
-            }
-            ClientWrapper::Iggy(client) => {
-                client.update_user(user_id, username, status, options).await
-            }
-            ClientWrapper::WebSocket(client) => {
-                client.update_user(user_id, username, status, options).await
-            }
+            ClientWrapper::Http(client) => client.update_user(user_id, options).await,
+            ClientWrapper::Tcp(client) => client.update_user(user_id, options).await,
+            ClientWrapper::Quic(client) => client.update_user(user_id, options).await,
+            ClientWrapper::Iggy(client) => client.update_user(user_id, options).await,
+            ClientWrapper::WebSocket(client) => client.update_user(user_id, options).await,
         }
     }
 

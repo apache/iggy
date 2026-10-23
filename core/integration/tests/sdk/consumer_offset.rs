@@ -53,7 +53,10 @@ async fn given_consumer_and_group_offsets_when_managed_over_any_transport_should
     let topic_id = Identifier::named(TOPIC_NAME).unwrap();
     let group_id = Identifier::named(CONSUMER_GROUP_NAME).unwrap();
 
-    client.create_stream(STREAM_NAME).await.unwrap();
+    client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     client
         .create_topic(&stream_id, TOPIC_NAME, &TopicCreateOptions::default())
         .await
@@ -209,7 +212,10 @@ async fn given_external_group_offset_when_managed_over_http_should_store_read_de
     let stream_id = Identifier::named(STREAM_NAME).unwrap();
     let topic_id = Identifier::named(TOPIC_NAME).unwrap();
 
-    client.create_stream(STREAM_NAME).await.unwrap();
+    client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     client
         .create_topic(&stream_id, TOPIC_NAME, &TopicCreateOptions::default())
         .await
@@ -321,7 +327,10 @@ async fn standalone_consumer_deletes_partition_zero_on_none_in_delete_offset(
     let stream_id = Identifier::named(STREAM_NAME).unwrap();
     let topic_id = Identifier::named(TOPIC_NAME).unwrap();
 
-    client.create_stream(STREAM_NAME).await.unwrap();
+    client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     client
         .create_topic(
             &stream_id,

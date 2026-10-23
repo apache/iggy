@@ -44,7 +44,7 @@ pub(super) fn partitions_config() -> PartitionsConfig {
         validate_checksum: true,
         segment_size,
         preallocate_segments: false,
-        encryptor: None,
+        key_context: Arc::default(),
         path_layout: PartitionPathLayout::default(),
     }
 }

@@ -36,17 +36,24 @@ pub struct GetStream {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateStream {
     #[schemars(description = "stream name (required, must be unique)")]
     pub name: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateStream {
     #[schemars(description = "stream identifier (name or number)")]
     pub stream_id: String,
-    #[schemars(description = "stream name (required, must be unique)")]
-    pub name: String,
+    #[schemars(description = "new name, must be unique (optional)")]
+    pub name: Option<String>,
+    #[schemars(
+        description = "setting names to return to their defaults, checked by the Iggy server (optional)"
+    )]
+    #[serde(default)]
+    pub reset: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -99,6 +106,7 @@ pub struct CreateTopic {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateTopic {
     #[schemars(description = "stream identifier (name or number)")]
     pub stream_id: String,
@@ -106,22 +114,25 @@ pub struct UpdateTopic {
     #[schemars(description = "topic identifier (name or number)")]
     pub topic_id: String,
 
-    #[schemars(description = "name (required, must be unique)")]
-    pub name: String,
+    #[schemars(description = "new name, must be unique in the stream (optional)")]
+    pub name: Option<String>,
 
-    #[schemars(description = "compression algorithm (optional, can be one of 'none', 'gzip')")]
-    pub compression_algorithm: Option<String>,
-
-    #[schemars(description = "message expiry (optional)")]
+    #[schemars(description = "message expiry like '7 days' or 'unlimited' (optional)")]
     pub message_expiry: Option<String>,
 
-    #[schemars(description = "maximum size (optional)")]
+    #[schemars(description = "maximum size like '15 GB' or 'unlimited' (optional)")]
     pub max_size: Option<String>,
 
     #[schemars(
-        description = "options to change, as string key-values; only compression_algorithm, \
-                       message_expiry and max_topic_size may be updated, and a key left out \
-                       keeps its current value (optional)"
+        description = "setting names to return to their defaults, e.g. message_expiry. Keys are \
+                       validated by the Iggy server (optional)"
+    )]
+    #[serde(default)]
+    pub reset: Vec<String>,
+
+    #[schemars(
+        description = "other updatable settings as string key-values, a key left out keeps its \
+                       current value (optional)"
     )]
     #[serde(default)]
     pub options: BTreeMap<String, String>,
@@ -377,6 +388,19 @@ pub struct UpdateUser {
 
     #[schemars(description = "active (optional)")]
     pub active: Option<bool>,
+
+    #[schemars(
+        description = "setting names to return to their defaults, checked by the Iggy server (optional)"
+    )]
+    #[serde(default)]
+    pub reset: Vec<String>,
+
+    #[schemars(
+        description = "other updatable settings as string key-values, a key left out keeps its \
+                       current value (optional)"
+    )]
+    #[serde(default)]
+    pub options: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -548,5 +572,49 @@ impl From<TopicPermissions> for prelude::TopicPermissions {
             poll_messages: permissions.poll_messages.unwrap_or_default(),
             send_messages: permissions.send_messages.unwrap_or_default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmcp::schemars::schema_for;
+
+    #[test]
+    fn given_stream_tool_schema_when_describing_should_exclude_encryption_key() {
+        for schema in [schema_for!(CreateStream), schema_for!(UpdateStream)] {
+            let properties = schema
+                .get("properties")
+                .and_then(|properties| properties.as_object())
+                .expect("object schema");
+            for secret_route in ["encryption_key", "options", "raw"] {
+                assert!(
+                    !properties.contains_key(secret_route),
+                    "stream tools must not accept {secret_route}"
+                );
+            }
+        }
+
+        let smuggled = [
+            r#"{"name":"orders","encryption_key":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="}"#,
+            r#"{"name":"orders","options":{"encryption_key":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="}}"#,
+        ];
+        for body in smuggled {
+            assert!(
+                serde_json::from_str::<CreateStream>(body).is_err(),
+                "{body}"
+            );
+        }
+        let rename: UpdateStream =
+            serde_json::from_str(r#"{"stream_id":"orders","name":"orders-v2"}"#)
+                .expect("a rename still parses");
+        assert_eq!(rename.name.as_deref(), Some("orders-v2"));
+    }
+
+    #[test]
+    fn given_update_topic_with_retired_compression_when_parsing_should_refuse() {
+        let body = r#"{"stream_id":"orders","topic_id":"events","name":"events-v2","compression_algorithm":"gzip"}"#;
+
+        assert!(serde_json::from_str::<UpdateTopic>(body).is_err());
     }
 }

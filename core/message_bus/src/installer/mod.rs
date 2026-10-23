@@ -51,8 +51,8 @@ use crate::fd_transfer::{self, DupedFd};
 use crate::installer::conn_info::ClientConnMeta;
 use crate::replica::listener::MessageHandler;
 use crate::{
-    ClientConnectionLostFn, ConnectionPermit, IggyMessageBus, ReplicaHandshakeDoneFn,
-    SharedTlsServerConfig,
+    BusMessage, ClientConnectionLostFn, ConnectionPermit, IggyMessageBus, InstanceToken,
+    ReplicaHandshakeDoneFn, SendError, SharedTlsServerConfig,
 };
 use std::rc::Rc;
 use tracing::warn;
@@ -158,6 +158,33 @@ pub trait ConnectionInstaller {
     /// Register the callback fired when a client connection is lost, so
     /// dispatch can drive session removal + logout on disconnect.
     fn set_client_connection_lost_fn(&self, f: ClientConnectionLostFn);
+
+    /// The installation serving `client_id` on this shard, captured when its
+    /// request arrives. `None` when no connection is installed under it here.
+    fn client_instance(&self, client_id: u128) -> Option<InstanceToken>;
+
+    /// Deliver a reply to the installation [`Self::client_instance`] captured
+    /// on this bus. A stale or missing installation refuses it with
+    /// `ClientNotFound`, so the reply never reaches, or closes on refusal, a
+    /// later connection under the same id.
+    fn send_to_client_instance(
+        &self,
+        client_id: u128,
+        instance: Option<InstanceToken>,
+        message: BusMessage,
+    ) -> impl Future<Output = Result<(), SendError>>;
+
+    /// [`Self::send_to_client_instance`] that waits for room in a full queue
+    /// instead of closing the connection, until the bus's write stall timeout
+    /// closes it. A bus whose queues never fill sends at once.
+    fn send_to_client_instance_waiting(
+        &self,
+        client_id: u128,
+        instance: Option<InstanceToken>,
+        message: BusMessage,
+    ) -> impl Future<Output = Result<(), SendError>> {
+        self.send_to_client_instance(client_id, instance, message)
+    }
 }
 
 impl ConnectionInstaller for Rc<IggyMessageBus> {
@@ -268,5 +295,29 @@ impl ConnectionInstaller for Rc<IggyMessageBus> {
 
     fn set_client_connection_lost_fn(&self, f: ClientConnectionLostFn) {
         IggyMessageBus::set_client_connection_lost_fn(self, f);
+    }
+
+    fn client_instance(&self, client_id: u128) -> Option<InstanceToken> {
+        IggyMessageBus::client_instance(self, client_id)
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn send_to_client_instance(
+        &self,
+        client_id: u128,
+        instance: Option<InstanceToken>,
+        message: BusMessage,
+    ) -> Result<(), SendError> {
+        IggyMessageBus::send_to_client_instance(self, client_id, instance, message)
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn send_to_client_instance_waiting(
+        &self,
+        client_id: u128,
+        instance: Option<InstanceToken>,
+        message: BusMessage,
+    ) -> Result<(), SendError> {
+        IggyMessageBus::send_to_client_instance_waiting(self, client_id, instance, message).await
     }
 }

@@ -27,7 +27,6 @@ import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.stream.StreamDetails;
-import org.apache.iggy.topic.CompressionAlgorithm;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 import org.slf4j.Logger;
@@ -129,8 +128,7 @@ class TlsConnectionTest extends BaseIntegrationTest {
             StreamDetails stream = client.streams().createStream(streamName);
             assertThat(stream).isNotNull();
 
-            client.topics()
-                    .createTopic(streamId, 1L, CompressionAlgorithm.None, BigInteger.ZERO, BigInteger.ZERO, topicName);
+            client.topics().createTopic(streamId, topicName, 1L);
 
             List<Message> messages =
                     List.of(Message.of("tls-message-1"), Message.of("tls-message-2"), Message.of("tls-message-3"));

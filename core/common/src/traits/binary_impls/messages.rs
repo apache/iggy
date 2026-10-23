@@ -26,7 +26,7 @@ use crate::{
 };
 use crate::{
     ConsumerKind, PartitioningKind, TopicClient, binary_operation_deadline, calculate_32,
-    with_binary_deadline,
+    with_binary_deadline, with_binary_lineage,
 };
 use bytes::{Bytes, BytesMut};
 use iggy_binary_protocol::codec::WireDecode;
@@ -56,45 +56,46 @@ async fn sync_group_assignment<B: BinaryClient>(
     topic_id: &Identifier,
     group_id: &Identifier,
 ) -> Result<(), IggyError> {
-    let request = SyncConsumerGroupRequest {
-        stream_id: identifier_to_wire(stream_id)?,
-        topic_id: identifier_to_wire(topic_id)?,
-        group_id: identifier_to_wire(group_id)?,
-    };
-    let response = client
-        .send_raw_with_response(SYNC_CONSUMER_GROUP_CODE, request.to_bytes())
-        .await?;
-    let key = group_cache_key(stream_id, topic_id, group_id);
-    if response.is_empty() {
-        // Empty reply = not a member: the coordinator sends an assignment
-        // header for any member, including one holding zero partitions.
-        // Registering only on a non-empty reply keeps a non-member group from
-        // leaking a `joined_groups` entry, and the deregister is the only thing
-        // that observes a server-side removal (group deleted, member evicted):
-        // without it `is_registered` latches true and every later poll returns
-        // empty instead of surfacing 5006.
-        client.consumer_group_state().invalidate_assignment(&key);
-        client.consumer_group_state().deregister_group(&key);
-        return Ok(());
-    }
-    let (assignment, _) =
-        SyncConsumerGroupResponse::decode(&response).map_err(|_| IggyError::InvalidCommand)?;
-    client.consumer_group_state().register_group(
-        key.clone(),
-        stream_id.clone(),
-        topic_id.clone(),
-        group_id.clone(),
-    );
-    client
-        .consumer_group_state()
-        .set_assignment(key, assignment.generation, assignment.partitions);
-    Ok(())
+    with_binary_lineage(client.operation_lineage(), async {
+        let state = client.consumer_group_state();
+        let request = SyncConsumerGroupRequest {
+            stream_id: identifier_to_wire(stream_id)?,
+            topic_id: identifier_to_wire(topic_id)?,
+            group_id: identifier_to_wire(group_id)?,
+        };
+        let deadline = crate::binary_operation_deadline();
+        loop {
+            let generation = state.session_generation();
+            let response = client
+                .send_raw_with_response(SYNC_CONSUMER_GROUP_CODE, request.to_bytes())
+                .await?;
+            let assignment = if response.is_empty() {
+                None
+            } else {
+                let (assignment, _) = SyncConsumerGroupResponse::decode(&response)
+                    .map_err(|_| IggyError::InvalidCommand)?;
+                Some((assignment.generation, assignment.partitions))
+            };
+            let applied = state.apply_group_assignment(
+                generation,
+                group_cache_key(stream_id, topic_id, group_id),
+                (stream_id.clone(), topic_id.clone(), group_id.clone()),
+                assignment,
+            );
+            match applied {
+                // A successful read from the replaced session cannot publish its old membership.
+                Err(IggyError::TransientNotAccepted) if tokio::time::Instant::now() < deadline => {}
+                outcome => return outcome,
+            }
+        }
+    })
+    .await
 }
 
 /// Re-sync every joined group's assignment from the coordinator. Heartbeat
 /// driven so a member picks up a widened assignment (e.g. after a
 /// partition-count change) without first hitting an ownership fence. A failed
-/// per-group sync is logged and skipped so one bad group can't stall the rest.
+/// per-group sync is logged. Sequential refreshes share the heartbeat's deadline.
 pub(crate) async fn refresh_group_assignments<B: BinaryClient>(client: &B) {
     for (stream_id, topic_id, group_id) in client.consumer_group_state().registered_groups() {
         if let Err(error) = sync_group_assignment(client, &stream_id, &topic_id, &group_id).await {
@@ -105,16 +106,27 @@ pub(crate) async fn refresh_group_assignments<B: BinaryClient>(client: &B) {
     }
 }
 
-/// Resolve (and cache) the topic's partition count for client-side produce
-/// partitioning.
+/// The topic's partition count for client-side produce partitioning: the
+/// count of a usable cached route, else a fresh one.
 async fn topic_partition_count<B: BinaryClient>(
     client: &B,
     stream_id: &Identifier,
     topic_id: &Identifier,
 ) -> Result<u32, IggyError> {
-    if let Some(count) = client.routed_partition_count(stream_id, topic_id) {
-        return Ok(count);
+    match client.routed_partition_count(stream_id, topic_id) {
+        Some(count) => Ok(count),
+        None => fresh_topic_partition_count(client, stream_id, topic_id).await,
     }
+}
+
+/// The partition count from a fresh read of the topic details. A send that
+/// found its partition missing refreshes through it, because a cached route
+/// can still count the partitions from before the change.
+async fn fresh_topic_partition_count<B: BinaryClient>(
+    client: &B,
+    stream_id: &Identifier,
+    topic_id: &Identifier,
+) -> Result<u32, IggyError> {
     let details = TopicClient::get_topic(client, stream_id, topic_id)
         .await?
         .ok_or_else(|| IggyError::TopicIdNotFound(topic_id.clone(), stream_id.clone()))?;
@@ -156,59 +168,61 @@ pub async fn send_binary_messages<B: BinaryClient>(
     partitioning: &mut BinarySendPartitioning<'_>,
     messages: &mut [IggyMessage],
 ) -> Result<SendMessagesResponse, IggyError> {
-    with_binary_deadline(binary_operation_deadline(), async {
-        fail_if_not_authenticated(client).await?;
-        if partitioning.selected.is_none() {
-            partitioning.selected = Some(match partitioning.original.kind {
-                PartitioningKind::PartitionId => Cow::Borrowed(partitioning.original),
-                _ => {
-                    let count = topic_partition_count(client, stream_id, topic_id).await?;
-                    Cow::Owned(select_partition(
-                        client,
-                        stream_id,
-                        topic_id,
-                        partitioning.original,
-                        count,
-                    )?)
-                }
-            });
-        }
-        loop {
-            let selected = partitioning
-                .selected
-                .as_deref()
-                .ok_or(IggyError::InvalidCommand)?;
-            let payload = encode_messages(stream_id, topic_id, selected, messages)?;
-            match client
-                .send_raw_with_context(
-                    SEND_MESSAGES_CODE,
-                    payload,
-                    crate::PartitionContext::default(),
-                )
-                .await
-            {
-                Err(IggyError::PartitionNotFound(..))
-                    if !partitioning.refreshed
-                        && partitioning.original.kind != PartitioningKind::PartitionId =>
-                {
-                    partitioning.refreshed = true;
-                    let details = TopicClient::get_topic(client, stream_id, topic_id)
-                        .await?
-                        .ok_or_else(|| {
-                            IggyError::TopicIdNotFound(topic_id.clone(), stream_id.clone())
-                        })?;
-                    partitioning.selected = Some(Cow::Owned(select_partition(
-                        client,
-                        stream_id,
-                        topic_id,
-                        partitioning.original,
-                        details.partitions_count,
-                    )?));
-                }
-                result => return result.map(|response| committed_send_confirmations(&response)),
+    with_binary_lineage(
+        client.operation_lineage(),
+        with_binary_deadline(binary_operation_deadline(), async {
+            fail_if_not_authenticated(client).await?;
+            if partitioning.selected.is_none() {
+                partitioning.selected = Some(match partitioning.original.kind {
+                    PartitioningKind::PartitionId => Cow::Borrowed(partitioning.original),
+                    _ => {
+                        let count = topic_partition_count(client, stream_id, topic_id).await?;
+                        Cow::Owned(select_partition(
+                            client,
+                            stream_id,
+                            topic_id,
+                            partitioning.original,
+                            count,
+                        )?)
+                    }
+                });
             }
-        }
-    })
+            loop {
+                let selected = partitioning
+                    .selected
+                    .as_deref()
+                    .ok_or(IggyError::InvalidCommand)?;
+                let payload = encode_messages(stream_id, topic_id, selected, messages)?;
+                match client
+                    .send_raw_with_context(
+                        SEND_MESSAGES_CODE,
+                        payload,
+                        crate::PartitionContext::default(),
+                    )
+                    .await
+                {
+                    Err(IggyError::PartitionNotFound(..))
+                        if !partitioning.refreshed
+                            && partitioning.original.kind != PartitioningKind::PartitionId =>
+                    {
+                        partitioning.refreshed = true;
+                        let count =
+                            fresh_topic_partition_count(client, stream_id, topic_id).await?;
+                        partitioning.selected = Some(Cow::Owned(select_partition(
+                            client,
+                            stream_id,
+                            topic_id,
+                            partitioning.original,
+                            count,
+                        )?));
+                    }
+                    result => {
+                        return result.map(|response| committed_send_confirmations(&response));
+                    }
+                }
+            }
+        }),
+    )
     .await
 }
 
@@ -384,36 +398,39 @@ impl<B: BinaryClient> MessageClient for B {
         count: u32,
         auto_commit: bool,
     ) -> Result<PolledMessages, IggyError> {
-        with_binary_deadline(binary_operation_deadline(), async {
-            fail_if_not_authenticated(self).await?;
-            // VSR: a consumer-group poll without an explicit partition is resolved
-            // client-side from the member's cached assignment (the broker routes
-            // explicit partitions only).
-            if consumer.kind == ConsumerKind::ConsumerGroup && partition_id.is_none() {
-                return poll_group_messages(
-                    self,
-                    stream_id,
-                    topic_id,
-                    consumer,
-                    strategy_for,
+        with_binary_lineage(
+            self.operation_lineage(),
+            with_binary_deadline(binary_operation_deadline(), async {
+                fail_if_not_authenticated(self).await?;
+                // VSR: a consumer-group poll without an explicit partition is resolved
+                // client-side from the member's cached assignment (the broker routes
+                // explicit partitions only).
+                if consumer.kind == ConsumerKind::ConsumerGroup && partition_id.is_none() {
+                    return poll_group_messages(
+                        self,
+                        stream_id,
+                        topic_id,
+                        consumer,
+                        strategy_for,
+                        count,
+                        auto_commit,
+                    )
+                    .await;
+                }
+                let strategy = strategy_for(partition_id.unwrap_or(0));
+                let req = PollMessagesRequest {
+                    consumer: consumer_to_wire(consumer)?,
+                    stream_id: identifier_to_wire(stream_id)?,
+                    topic_id: identifier_to_wire(topic_id)?,
+                    partition_id,
+                    strategy: polling_strategy_to_wire(&strategy),
                     count,
                     auto_commit,
-                )
-                .await;
-            }
-            let strategy = strategy_for(partition_id.unwrap_or(0));
-            let req = PollMessagesRequest {
-                consumer: consumer_to_wire(consumer)?,
-                stream_id: identifier_to_wire(stream_id)?,
-                topic_id: identifier_to_wire(topic_id)?,
-                partition_id,
-                strategy: polling_strategy_to_wire(&strategy),
-                count,
-                auto_commit,
-            };
-            let response = self.send_poll_with_response(&req, strategy.context).await?;
-            PolledMessages::from_bytes(response)
-        })
+                };
+                let response = self.send_poll_with_response(&req, strategy.context).await?;
+                PolledMessages::from_bytes(response)
+            }),
+        )
         .await
     }
 

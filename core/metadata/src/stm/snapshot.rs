@@ -59,7 +59,11 @@ use crate::stm::user::UsersSnapshot;
 ///
 /// Version 12: pending consumer group owner generations equal their metadata
 /// operation, replacing independently incremented generations.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 12;
+///
+/// Version 13: `TopicSnapshot` dropped its typed expiry, compression and size
+/// fields, which the options map already holds, and `StreamSnapshot` gained
+/// `created_op`, the identity of a stream incarnation.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 13;
 
 /// Oldest format version [`MetadataSnapshot::decode`] still reads.
 ///
@@ -135,6 +139,13 @@ pub enum SnapshotError {
         commit_op: u64,
         table_frontier: u64,
     },
+    /// A state transfer moved the history certificate off the WAL suffix above
+    /// `snapshot_seq` and could not make that binding durable. The suffix stays: a
+    /// restart after removing it would find the recorded binding gone and certify
+    /// no view.
+    HistoryBindingNotDurable {
+        snapshot_seq: u64,
+    },
 }
 
 /// Stage at which snapshot persistence failed.
@@ -197,6 +208,13 @@ impl fmt::Display for SnapshotError {
                      commit_op {commit_op}, table frontier {table_frontier}"
                 )
             }
+            Self::HistoryBindingNotDurable { snapshot_seq } => {
+                write!(
+                    f,
+                    "state transfer to op {snapshot_seq} could not persist its history \
+                     binding; the WAL suffix above it was kept"
+                )
+            }
         }
     }
 }
@@ -214,7 +232,8 @@ impl std::error::Error for SnapshotError {
             | Self::InvalidTrailer
             | Self::Truncated { .. }
             | Self::UnsupportedFormatVersion { .. }
-            | Self::IncoherentManifest { .. } => None,
+            | Self::IncoherentManifest { .. }
+            | Self::HistoryBindingNotDurable { .. } => None,
         }
     }
 }
@@ -577,10 +596,12 @@ macro_rules! impl_fill_restore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stm::stream::{PartitionSnapshot, StatsSnapshot, StreamSnapshot, TopicSnapshot};
+    use crate::stm::stream::{
+        PartitionSnapshot, StatsSnapshot, StreamSnapshot, StreamsSnapshot, TopicSnapshot,
+    };
     use crate::stm::user::UserSnapshot;
     use iggy_common::{
-        CompressionAlgorithm, IggyExpiry, IggyTimestamp, MaxTopicSize, ResourceOptions,
+        HeaderKey, HeaderValue, IggyTimestamp, OptionKey, OptionValue, ResourceOptions,
     };
 
     #[test]
@@ -607,7 +628,7 @@ mod tests {
         // operator's boot reading one field's bytes as another's. Changing either
         // number is the reminder to change the other.
         const FIELD_COUNT: u32 = 7;
-        const PINNED_VERSION: u32 = 12;
+        const PINNED_VERSION: u32 = 13;
 
         let encoded = MetadataSnapshot::new(0).encode().unwrap();
         let mut cursor = encoded.as_slice();
@@ -629,8 +650,8 @@ mod tests {
         // the same element count: a version 2 file then decoded field-by-field
         // one position out of place instead of failing. The types the STM
         // actually grows need their own pins.
-        const TOPIC_FIELD_COUNT: u32 = 12;
-        const STREAM_FIELD_COUNT: u32 = 6;
+        const TOPIC_FIELD_COUNT: u32 = 9;
+        const STREAM_FIELD_COUNT: u32 = 7;
         const STREAMS_FIELD_COUNT: u32 = 4;
         const USER_FIELD_COUNT: u32 = 7;
         // Version 4 appended `fences`; it is defaulted on read, which is what
@@ -657,9 +678,6 @@ mod tests {
             id: 0,
             name: String::new(),
             created_at: IggyTimestamp::default(),
-            message_expiry: IggyExpiry::default(),
-            compression_algorithm: CompressionAlgorithm::default(),
-            max_topic_size: MaxTopicSize::default(),
             stats: StatsSnapshot {
                 size_bytes: 0,
                 messages_count: 0,
@@ -704,6 +722,7 @@ mod tests {
             },
             topics: Vec::new(),
             options: ResourceOptions::new(),
+            created_op: 0,
         };
         let encoded = rmp_serde::to_vec(&stream).unwrap();
         assert_eq!(
@@ -814,6 +833,49 @@ mod tests {
     }
 
     #[test]
+    fn given_format_thirteen_snapshot_when_restoring_should_preserve_options_and_created_op() {
+        const PREVIOUS_FORMAT: u32 = 12;
+        let mut options = ResourceOptions::new();
+        options.insert(
+            HeaderKey::from(OptionKey::MessageExpiry),
+            OptionValue::explicit(HeaderValue::from(60_000_000u64)),
+        );
+        options.insert(
+            HeaderKey::from(OptionKey::MaxTopicSize),
+            OptionValue::derived(HeaderValue::from(u64::MAX)),
+        );
+        let mut stream = stream_snapshot_fixture(
+            3,
+            "orders",
+            StatsSnapshot {
+                size_bytes: 0,
+                messages_count: 0,
+                segments_count: 0,
+            },
+        );
+        stream.created_op = 41;
+        stream.options = options.clone();
+        let mut snapshot = MetadataSnapshot::new(50);
+        snapshot.streams = Some(StreamsSnapshot {
+            lifecycle_intents: std::collections::BTreeMap::default(),
+            revision: 0,
+            namespace_revision: 0,
+            items: vec![(3, stream)],
+        });
+
+        let decoded = MetadataSnapshot::decode(&snapshot.encode().unwrap()).unwrap();
+        let (_, restored) = &decoded.streams.as_ref().unwrap().items[0];
+        assert_eq!(restored.created_op, 41);
+        assert_eq!(restored.options, options);
+
+        snapshot.version = PREVIOUS_FORMAT;
+        assert!(matches!(
+            MetadataSnapshot::decode(&snapshot.encode().unwrap()),
+            Err(SnapshotError::UnsupportedFormatVersion { found, .. }) if found == PREVIOUS_FORMAT
+        ));
+    }
+
+    #[test]
     fn decode_refuses_any_other_format_version() {
         // Newer and older alike: there is no accepted window, so both directions are
         // the same refusal. Version 0 is what a zeroed or absent stamp reads as.
@@ -891,9 +953,6 @@ mod tests {
                             id: 0,
                             name: "topic".to_string(),
                             created_at: ts,
-                            message_expiry: IggyExpiry::default(),
-                            compression_algorithm: CompressionAlgorithm::default(),
-                            max_topic_size: MaxTopicSize::default(),
                             stats: StatsSnapshot {
                                 size_bytes: 256,
                                 messages_count: 12,
@@ -917,6 +976,7 @@ mod tests {
                         },
                     )],
                     options: ResourceOptions::default(),
+                    created_op: 9,
                 },
             )],
         });
@@ -968,6 +1028,7 @@ mod tests {
             stats,
             topics: vec![],
             options: ResourceOptions::default(),
+            created_op: 0,
         }
     }
 

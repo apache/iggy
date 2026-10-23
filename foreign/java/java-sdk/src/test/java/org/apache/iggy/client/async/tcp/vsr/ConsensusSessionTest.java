@@ -24,6 +24,7 @@ import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.embedded.EmbeddedChannel;
 import org.apache.iggy.exception.IggyErrorCode;
+import org.apache.iggy.exception.IggyNotConnectedException;
 import org.apache.iggy.exception.IggyOperationException;
 import org.apache.iggy.exception.IggyServerException;
 import org.junit.jupiter.api.Test;
@@ -36,6 +37,66 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class ConsensusSessionTest {
     private static final long DEADLINE = TimeUnit.MINUTES.toNanos(1);
+    private static final int TIMEOUT_SECONDS = 5;
+
+    /**
+     * One link holds its session and waits for the owner, as a reply or a frame on that link does. Another link holds
+     * the owner and reads the lineage of a call that started on the first link. Neither waits for the other.
+     */
+    @Test
+    void shouldReadTheLineageOfACallFromAnotherLinkWhileThatLinkWaitsForTheOwner() throws Exception {
+        ConsensusSession owner = new ConsensusSession();
+        ConsensusSession started = new ConsensusSession();
+        started.follow(owner);
+        CompletableFuture<Void> linkHeld = new CompletableFuture<>();
+        CompletableFuture<Void> ownerHeld = new CompletableFuture<>();
+        CompletableFuture<Void> linkDone = new CompletableFuture<>();
+        CompletableFuture<Long> lineage = new CompletableFuture<>();
+        startDaemon(() -> {
+            synchronized (started) {
+                linkHeld.complete(null);
+                ownerHeld.join();
+                synchronized (started.owner()) {
+                    linkDone.complete(null);
+                }
+            }
+        });
+        linkHeld.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        startDaemon(() -> {
+            synchronized (owner) {
+                ownerHeld.complete(null);
+                lineage.complete(started.lineage());
+            }
+        });
+
+        assertThat(lineage.get(TIMEOUT_SECONDS, TimeUnit.SECONDS)).isEqualTo(owner.lineage());
+        linkDone.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+    }
+
+    @Test
+    void shouldReportAnUnsentSessionWaitAsDisconnectedAfterReset() {
+        ConsensusSession session = new ConsensusSession();
+        EmbeddedChannel channel = new EmbeddedChannel();
+        long deadline = System.nanoTime() + DEADLINE;
+        try {
+            var ticket = session.acquire(
+                            ConsensusSession.LaneKey.METADATA,
+                            true,
+                            VsrHeaders.HEADER_SIZE,
+                            deadline,
+                            channel.eventLoop())
+                    .join();
+            var waiting = ticket.awaitSession(session.lineage(), deadline, channel.eventLoop());
+            assertThat(waiting).isNotDone();
+
+            session.reset();
+
+            assertThatThrownBy(waiting::join).hasCauseInstanceOf(IggyNotConnectedException.class);
+        } finally {
+            session.reset();
+            channel.finishAndReleaseAll();
+        }
+    }
 
     @Test
     void shouldAdmitLaneWaitersInOrderAfterThreeAdmissionChanges() {
@@ -397,5 +458,12 @@ class ConsensusSessionTest {
         ticket.finishWrite();
         ticket.startWrite();
         ticket.finishWrite();
+    }
+
+    private static void startDaemon(Runnable task) {
+        Thread thread = new Thread(task);
+        // A deadlocked thread must not keep the test JVM alive.
+        thread.setDaemon(true);
+        thread.start();
     }
 }
