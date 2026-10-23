@@ -15,21 +15,28 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{collections::BTreeMap, str::FromStr};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    str::FromStr,
+};
 
 use bytes::Bytes;
 use iggy::prelude::{
     CompressionAlgorithm as RustCompressionAlgorithm,
     ConsumerGroupDetails as RustConsumerGroupDetails, Durability as RustDurability, IdKind,
     Identifier as RustIdentifier, IggyByteSize as RustIggyByteSize, IggyExpiry as RustIggyExpiry,
-    IggyMessage as RustIggyMessage, MaxTopicSize as RustMaxTopicSize, OptionSpec as RustOptionSpec,
-    Partition as RustPartition, PartitionContext as RustPartitionContext,
+    IggyMessage as RustIggyMessage, MaxTopicSize as RustMaxTopicSize, OptionKey,
+    OptionSpec as RustOptionSpec, Partition as RustPartition,
+    PartitionContext as RustPartitionContext, PartitionResizePolicy as RustPartitionResizePolicy,
     PolledMessages as RustPolledMessages,
     SendMessagesConfirmationResponse as RustSendMessagesConfirmationResponse,
     SendMessagesResponse as RustSendMessagesResponse, Stream as RustStream,
-    StreamDetails as RustStreamDetails, Topic as RustTopic,
+    StreamDetails as RustStreamDetails, StreamEncryptionKey,
+    StreamEncryptionSource as RustStreamEncryptionSource,
+    StreamUpdateOptions as RustStreamUpdateOptions, Topic as RustTopic,
     TopicCreateOptions as RustTopicCreateOptions, TopicDetails as RustTopicDetails,
-    TopicUpdateOptions as RustTopicUpdateOptions, Validatable,
+    TopicUpdateOptions as RustTopicUpdateOptions, UserCreateOptions as RustUserCreateOptions,
+    UserUpdateOptions as RustUserUpdateOptions, Validatable,
 };
 use iggy_binary_protocol::WireUserHeaders;
 use iggy_common::{
@@ -40,9 +47,10 @@ use iggy_common::{
     ConsumerGroupMember as RustConsumerGroupMember, ConsumerOffsetInfo as RustConsumerOffsetInfo,
     GlobalPermissions as RustGlobalPermissions, HeaderEntry as RustHeaderEntry,
     HeaderField as RustHeaderField, HeaderKind as RustHeaderKind, IdentityInfo as RustIdentityInfo,
-    Permissions as RustPermissions, Stats as RustStats, StreamPermissions as RustStreamPermissions,
-    TopicPermissions as RustTopicPermissions, TransportEndpoints as RustTransportEndpoints,
-    UserInfo as RustUserInfo, UserInfoDetails as RustUserInfoDetails, UserStatus as RustUserStatus,
+    IggyError, Permissions as RustPermissions, Stats as RustStats,
+    StreamPermissions as RustStreamPermissions, TopicPermissions as RustTopicPermissions,
+    TransportEndpoints as RustTransportEndpoints, UserInfo as RustUserInfo,
+    UserInfoDetails as RustUserInfoDetails, UserStatus as RustUserStatus,
 };
 
 use crate::ffi;
@@ -160,6 +168,7 @@ impl From<RustUserInfo> for ffi::UserInfo {
             status: ffi::UserStatus::from(user.status),
             username: user.username,
             options: resource_options_to_ffi(&user.options, true),
+            derived_options: resource_options_to_ffi(&user.options, false),
         }
     }
 }
@@ -175,6 +184,7 @@ impl From<RustUserInfoDetails> for ffi::UserInfoDetails {
             has_permissions,
             permissions: ffi::Permissions::from(user.permissions.unwrap_or_default()),
             options: resource_options_to_ffi(&user.options, true),
+            derived_options: resource_options_to_ffi(&user.options, false),
         }
     }
 }
@@ -529,21 +539,58 @@ fn resource_options_to_ffi(
 /// handed in here is rendered rather than passed through: sending `Uint64`
 /// 134217728 for `segment_size` and sending `"134217728"` land the same stored
 /// value. A key this build cannot read at all is dropped rather than guessed.
+/// String entries skip the header codec so the Rust SDK reports length bounds
+/// with the same error categories it uses for its own raw entries.
 pub(crate) fn ffi_options_to_raw(
     options: Vec<ffi::HeaderEntry>,
 ) -> Result<BTreeMap<String, String>, String> {
+    let string_kind = RustHeaderKind::String.as_code();
     let mut raw = BTreeMap::new();
     for entry in options {
-        let RustHeaderEntry { key, value } = RustHeaderEntry::try_from(entry)?;
-        let key = key
-            .as_str()
-            .map_err(|error| format!("Option key is not a string: {error}"))?
-            .to_owned();
-        if raw.insert(key.clone(), value.to_string_value()).is_some() {
+        let (key, value) = if entry.key.kind == string_kind && entry.value.kind == string_kind {
+            let key = String::from_utf8(entry.key.value)
+                .map_err(|error| format!("Option key is not a string: {error}"))?;
+            let value = String::from_utf8(entry.value.value)
+                .map_err(|error| format!("Option value of '{key}' is not a string: {error}"))?;
+            (key, value)
+        } else {
+            let RustHeaderEntry { key, value } = RustHeaderEntry::try_from(entry)?;
+            let key = key
+                .as_str()
+                .map_err(|error| format!("Option key is not a string: {error}"))?
+                .to_owned();
+            (key, value.to_string_value())
+        };
+        if raw.insert(key.clone(), value).is_some() {
             return Err(format!("Duplicate option key: {key}"));
         }
     }
     Ok(raw)
+}
+
+/// Resolve reset key names into the typed set the Rust SDK validates against
+/// the scope's catalog. The C++ wrapper sends only catalog names.
+pub(crate) fn ffi_reset_keys(names: Vec<String>) -> Result<BTreeSet<OptionKey>, String> {
+    names
+        .into_iter()
+        .map(|name| {
+            OptionKey::from_str(&name).map_err(|_| format!("Unknown option key to reset: {name}"))
+        })
+        .collect()
+}
+
+impl ffi::StreamCreateOptions {
+    /// The typed key, refused with `InvalidEncryptionKey` before anything is
+    /// sent. The error never carries key material.
+    pub(crate) fn encryption_key(&self) -> Result<Option<StreamEncryptionKey>, IggyError> {
+        if self.has_encryption_key {
+            return StreamEncryptionKey::try_from(self.encryption_key.as_slice()).map(Some);
+        }
+        if self.has_encryption_key_base64 {
+            return StreamEncryptionKey::from_str(&self.encryption_key_base64).map(Some);
+        }
+        Ok(None)
+    }
 }
 
 fn parse_message_expiry(kind: &str, value: u64) -> Result<RustIggyExpiry, String> {
@@ -565,6 +612,15 @@ fn parse_compression_algorithm(value: &str) -> Result<RustCompressionAlgorithm, 
         .map_err(|error| format!("invalid compression algorithm '{value}': {error}"))
 }
 
+fn parse_user_status(
+    has_status: bool,
+    status: ffi::UserStatus,
+) -> Result<Option<RustUserStatus>, String> {
+    has_status
+        .then(|| RustUserStatus::try_from(status))
+        .transpose()
+}
+
 fn parse_max_topic_size(value: &str) -> Result<RustMaxTopicSize, String> {
     RustMaxTopicSize::from_str(value)
         .map_err(|error| format!("invalid max topic size '{value}': {error}"))
@@ -577,6 +633,11 @@ impl From<RustOptionSpec> for ffi::OptionSpec {
             kind: spec.kind.as_code(),
             default_value: spec.default_value,
             description: spec.description,
+            updatable: spec.updatable,
+            resettable: spec.resettable,
+            secret: spec.secret,
+            read_only: spec.read_only,
+            critical: spec.critical,
         }
     }
 }
@@ -619,6 +680,20 @@ impl TryFrom<ffi::TopicCreateOptions> for RustTopicCreateOptions {
         } else {
             RustDurability::default()
         };
+        let partition_resize_policy = if options.has_partition_resize_policy {
+            Some(
+                RustPartitionResizePolicy::from_str(&options.partition_resize_policy).map_err(
+                    |error| {
+                        format!(
+                            "invalid partition resize policy '{}': {error}",
+                            options.partition_resize_policy
+                        )
+                    },
+                )?,
+            )
+        } else {
+            None
+        };
         let mut raw = ffi_options_to_raw(options.raw_options)?;
         if options.has_durability {
             raw.remove("durability");
@@ -642,7 +717,7 @@ impl TryFrom<ffi::TopicCreateOptions> for RustTopicCreateOptions {
             },
             durability,
             consumer_offset_durability,
-            partition_resize_policy: None,
+            partition_resize_policy,
             messages_required_to_save: if options.has_messages_required_to_save {
                 Some(options.messages_required_to_save)
             } else {
@@ -669,11 +744,6 @@ impl TryFrom<ffi::TopicUpdateOptions> for RustTopicUpdateOptions {
     type Error = String;
 
     fn try_from(options: ffi::TopicUpdateOptions) -> Result<Self, Self::Error> {
-        let compression_algorithm = if options.has_compression_algorithm {
-            Some(parse_compression_algorithm(&options.compression_algorithm)?)
-        } else {
-            None
-        };
         let message_expiry = if options.has_message_expiry {
             Some(parse_message_expiry(
                 &options.message_expiry_kind,
@@ -687,26 +757,75 @@ impl TryFrom<ffi::TopicUpdateOptions> for RustTopicUpdateOptions {
         } else {
             None
         };
-        let raw = ffi_options_to_raw(options.raw_options)?;
         Ok(RustTopicUpdateOptions {
-            compression_algorithm,
+            name: options.has_name.then_some(options.name),
             message_expiry,
             max_topic_size,
-            raw,
+            reset: ffi_reset_keys(options.reset)?,
+            raw_reset: options.raw_reset.into_iter().collect(),
+            raw: ffi_options_to_raw(options.raw_options)?,
         })
+    }
+}
+
+impl TryFrom<ffi::StreamUpdateOptions> for RustStreamUpdateOptions {
+    type Error = String;
+
+    fn try_from(options: ffi::StreamUpdateOptions) -> Result<Self, Self::Error> {
+        Ok(RustStreamUpdateOptions {
+            name: options.has_name.then_some(options.name),
+            reset: ffi_reset_keys(options.reset)?,
+            raw_reset: options.raw_reset.into_iter().collect(),
+            raw: ffi_options_to_raw(options.raw_options)?,
+        })
+    }
+}
+
+impl TryFrom<ffi::UserCreateOptions> for RustUserCreateOptions {
+    type Error = String;
+
+    fn try_from(options: ffi::UserCreateOptions) -> Result<Self, Self::Error> {
+        Ok(RustUserCreateOptions {
+            raw: ffi_options_to_raw(options.raw_options)?,
+        })
+    }
+}
+
+impl TryFrom<ffi::UserUpdateOptions> for RustUserUpdateOptions {
+    type Error = String;
+
+    fn try_from(options: ffi::UserUpdateOptions) -> Result<Self, Self::Error> {
+        Ok(RustUserUpdateOptions {
+            username: options.has_username.then_some(options.username),
+            status: parse_user_status(options.has_status, options.status)?,
+            reset: ffi_reset_keys(options.reset)?,
+            raw_reset: options.raw_reset.into_iter().collect(),
+            raw: ffi_options_to_raw(options.raw_options)?,
+        })
+    }
+}
+
+impl From<RustStreamEncryptionSource> for ffi::StreamEncryptionSource {
+    fn from(source: RustStreamEncryptionSource) -> Self {
+        match source {
+            RustStreamEncryptionSource::None => ffi::StreamEncryptionSource::None,
+            RustStreamEncryptionSource::Stream => ffi::StreamEncryptionSource::Stream,
+            RustStreamEncryptionSource::Server => ffi::StreamEncryptionSource::Server,
+        }
     }
 }
 
 impl From<RustTopic> for ffi::Topic {
     fn from(topic: RustTopic) -> Self {
+        let resolved = topic.resolved_options();
         ffi::Topic {
             id: topic.id,
             created_at: topic.created_at.as_micros(),
             name: topic.name,
             size_bytes: topic.size.as_bytes_u64(),
-            message_expiry: u64::from(topic.message_expiry),
-            compression_algorithm: topic.compression_algorithm.to_string(),
-            max_topic_size: u64::from(topic.max_topic_size),
+            message_expiry: u64::from(resolved.message_expiry),
+            compression_algorithm: resolved.compression_algorithm.to_string(),
+            max_topic_size: u64::from(resolved.max_topic_size),
             messages_count: topic.messages_count,
             partitions_count: topic.partitions_count,
             options: resource_options_to_ffi(&topic.options, true),
@@ -717,14 +836,15 @@ impl From<RustTopic> for ffi::Topic {
 
 impl From<RustTopicDetails> for ffi::TopicDetails {
     fn from(topic: RustTopicDetails) -> Self {
+        let resolved = topic.resolved_options();
         ffi::TopicDetails {
             id: topic.id,
             created_at: topic.created_at.as_micros(),
             name: topic.name,
             size_bytes: topic.size.as_bytes_u64(),
-            message_expiry: u64::from(topic.message_expiry),
-            compression_algorithm: topic.compression_algorithm.to_string(),
-            max_topic_size: u64::from(topic.max_topic_size),
+            message_expiry: u64::from(resolved.message_expiry),
+            compression_algorithm: resolved.compression_algorithm.to_string(),
+            max_topic_size: u64::from(resolved.max_topic_size),
             messages_count: topic.messages_count,
             partitions_count: topic.partitions_count,
             partitions: topic
@@ -740,6 +860,9 @@ impl From<RustTopicDetails> for ffi::TopicDetails {
 
 impl From<RustStream> for ffi::Stream {
     fn from(stream: RustStream) -> Self {
+        let source = stream.encryption_key_source();
+        let fingerprint = stream.encryption_key_fingerprint();
+        let kek_fingerprints = stream.encryption_kek_fingerprints();
         ffi::Stream {
             id: stream.id,
             created_at: stream.created_at.as_micros(),
@@ -748,12 +871,21 @@ impl From<RustStream> for ffi::Stream {
             messages_count: stream.messages_count,
             topics_count: stream.topics_count,
             options: resource_options_to_ffi(&stream.options, true),
+            derived_options: resource_options_to_ffi(&stream.options, false),
+            has_encryption_key_source: source.is_some(),
+            encryption_key_source: source.map_or(ffi::StreamEncryptionSource::None, Into::into),
+            has_encryption_key_fingerprint: fingerprint.is_some(),
+            encryption_key_fingerprint: fingerprint.unwrap_or_default(),
+            encryption_kek_fingerprints: kek_fingerprints,
         }
     }
 }
 
 impl From<RustStreamDetails> for ffi::StreamDetails {
     fn from(stream: RustStreamDetails) -> Self {
+        let source = stream.encryption_key_source();
+        let fingerprint = stream.encryption_key_fingerprint();
+        let kek_fingerprints = stream.encryption_kek_fingerprints();
         ffi::StreamDetails {
             id: stream.id,
             created_at: stream.created_at.as_micros(),
@@ -763,6 +895,12 @@ impl From<RustStreamDetails> for ffi::StreamDetails {
             topics_count: stream.topics_count,
             topics: stream.topics.into_iter().map(ffi::Topic::from).collect(),
             options: resource_options_to_ffi(&stream.options, true),
+            derived_options: resource_options_to_ffi(&stream.options, false),
+            has_encryption_key_source: source.is_some(),
+            encryption_key_source: source.map_or(ffi::StreamEncryptionSource::None, Into::into),
+            has_encryption_key_fingerprint: fingerprint.is_some(),
+            encryption_key_fingerprint: fingerprint.unwrap_or_default(),
+            encryption_kek_fingerprints: kek_fingerprints,
         }
     }
 }
@@ -1052,7 +1190,7 @@ impl From<RustSendMessagesResponse> for ffi::SendMessagesResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iggy::prelude::IggyTimestamp;
+    use iggy::prelude::{HeaderKey, HeaderValue, IggyTimestamp, OptionValue, ResourceOptions};
 
     // Distinct values so a swapped field fails the comparison.
     const CONTEXT: RustPartitionContext = RustPartitionContext {
@@ -1067,6 +1205,195 @@ mod tests {
             context.owner_generation,
             context.metadata_op,
         )
+    }
+
+    #[test]
+    fn given_optional_bridge_fields_when_converting_should_preserve_presence() {
+        let unnamed = RustStreamUpdateOptions::try_from(ffi::StreamUpdateOptions {
+            has_name: false,
+            name: "ignored".to_owned(),
+            reset: vec!["name".to_owned()],
+            raw_reset: Vec::new(),
+            raw_options: Vec::new(),
+        })
+        .expect("stream update");
+        assert_eq!(
+            unnamed,
+            RustStreamUpdateOptions {
+                reset: BTreeSet::from([OptionKey::Name]),
+                ..RustStreamUpdateOptions::default()
+            }
+        );
+        let empty_name = RustStreamUpdateOptions::try_from(ffi::StreamUpdateOptions {
+            has_name: true,
+            name: String::new(),
+            reset: Vec::new(),
+            raw_reset: Vec::new(),
+            raw_options: Vec::new(),
+        })
+        .expect("stream update");
+        assert_eq!(empty_name.name, Some(String::new()));
+
+        let topic = RustTopicUpdateOptions::try_from(ffi::TopicUpdateOptions {
+            has_name: false,
+            name: "ignored".to_owned(),
+            has_message_expiry: false,
+            message_expiry_kind: "duration".to_owned(),
+            message_expiry_value: 5,
+            has_max_topic_size: false,
+            max_topic_size: "unlimited".to_owned(),
+            reset: vec!["max_topic_size".to_owned()],
+            raw_reset: Vec::new(),
+            raw_options: Vec::new(),
+        })
+        .expect("topic update");
+        assert_eq!(
+            topic,
+            RustTopicUpdateOptions {
+                reset: BTreeSet::from([OptionKey::MaxTopicSize]),
+                ..RustTopicUpdateOptions::default()
+            }
+        );
+
+        let user = RustUserUpdateOptions::try_from(ffi::UserUpdateOptions {
+            has_username: false,
+            username: "ignored".to_owned(),
+            has_status: true,
+            status: ffi::UserStatus::Inactive,
+            reset: Vec::new(),
+            raw_reset: Vec::new(),
+            raw_options: Vec::new(),
+        })
+        .expect("user update");
+        assert_eq!(
+            user,
+            RustUserUpdateOptions {
+                status: Some(RustUserStatus::Inactive),
+                ..RustUserUpdateOptions::default()
+            }
+        );
+        assert!(
+            RustUserUpdateOptions::try_from(ffi::UserUpdateOptions {
+                has_username: false,
+                username: String::new(),
+                has_status: false,
+                status: ffi::UserStatus { repr: 0 },
+                reset: vec!["not_a_catalog_key".to_owned()],
+                raw_reset: Vec::new(),
+                raw_options: Vec::new(),
+            })
+            .is_err()
+        );
+
+        let key: Vec<u8> = (0..32).collect();
+        let keyless = ffi::StreamCreateOptions {
+            has_encryption_key: false,
+            encryption_key: key.clone(),
+            has_encryption_key_base64: false,
+            encryption_key_base64: String::new(),
+            raw_options: Vec::new(),
+        };
+        assert_eq!(keyless.encryption_key(), Ok(None));
+        let keyed = ffi::StreamCreateOptions {
+            has_encryption_key: true,
+            ..keyless
+        };
+        assert_eq!(
+            keyed
+                .encryption_key()
+                .map(|key| key.map(|key| key.fingerprint())),
+            Ok(Some("8441e38538cbfa57".to_owned()))
+        );
+        let short = ffi::StreamCreateOptions {
+            encryption_key: key[..31].to_vec(),
+            ..keyed
+        };
+        assert_eq!(short.encryption_key(), Err(IggyError::InvalidEncryptionKey));
+    }
+
+    #[test]
+    fn given_raw_reset_names_when_converting_should_leave_them_to_the_server() {
+        let topic = RustTopicUpdateOptions::try_from(ffi::TopicUpdateOptions {
+            has_name: false,
+            name: String::new(),
+            has_message_expiry: false,
+            message_expiry_kind: String::new(),
+            message_expiry_value: 0,
+            has_max_topic_size: false,
+            max_topic_size: String::new(),
+            reset: vec!["max_topic_size".to_owned()],
+            raw_reset: vec!["future_key".to_owned()],
+            raw_options: Vec::new(),
+        })
+        .expect("topic update");
+        assert_eq!(
+            topic,
+            RustTopicUpdateOptions {
+                reset: BTreeSet::from([OptionKey::MaxTopicSize]),
+                raw_reset: BTreeSet::from(["future_key".to_owned()]),
+                ..RustTopicUpdateOptions::default()
+            }
+        );
+    }
+
+    #[test]
+    fn given_raw_entry_outside_codec_bounds_when_converting_should_keep_the_sdk_error_category() {
+        let entry = |key: &str, value: &str| ffi::HeaderEntry {
+            key: ffi::HeaderField {
+                kind: RustHeaderKind::String.as_code(),
+                value: key.as_bytes().to_vec(),
+            },
+            value: ffi::HeaderField {
+                kind: RustHeaderKind::String.as_code(),
+                value: value.as_bytes().to_vec(),
+            },
+        };
+        let patch = |raw_options: Vec<ffi::HeaderEntry>| {
+            RustStreamUpdateOptions::try_from(ffi::StreamUpdateOptions {
+                has_name: false,
+                name: String::new(),
+                reset: Vec::new(),
+                raw_reset: Vec::new(),
+                raw_options,
+            })
+            .map(|options| options.to_patch().map(|_| ()))
+        };
+        let long_key = "k".repeat(256);
+
+        assert!(matches!(
+            patch(vec![entry("future_key", "")]),
+            Ok(Err(IggyError::InvalidOptionValue(_)))
+        ));
+        assert!(matches!(
+            patch(vec![entry(&long_key, "value")]),
+            Ok(Err(IggyError::UnsupportedOptionKey(_)))
+        ));
+    }
+
+    #[test]
+    fn given_stream_projection_when_converting_should_split_provenance() {
+        let mut options = ResourceOptions::new();
+        options.insert(
+            HeaderKey::from(OptionKey::EncryptionKeySource),
+            OptionValue::derived(HeaderValue::from_str("none").expect("source")),
+        );
+        let stream = ffi::StreamDetails::from(RustStreamDetails {
+            id: 1,
+            created_at: IggyTimestamp::from(2),
+            name: "plain".to_owned(),
+            size: RustIggyByteSize::from(0),
+            messages_count: 0,
+            topics_count: 0,
+            topics: Vec::new(),
+            options,
+        });
+
+        assert!(stream.options.is_empty());
+        assert_eq!(stream.derived_options.len(), 1);
+        assert!(stream.has_encryption_key_source);
+        assert!(stream.encryption_key_source == ffi::StreamEncryptionSource::None);
+        assert!(!stream.has_encryption_key_fingerprint);
+        assert!(stream.encryption_kek_fingerprints.is_empty());
     }
 
     #[test]

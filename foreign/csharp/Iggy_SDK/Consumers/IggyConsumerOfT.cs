@@ -54,13 +54,17 @@ public class IggyConsumer<T> : IggyConsumer
     ///     Receives and deserializes messages via the rented poll path. Each polled batch is deserialized
     ///     in full before any message is yielded — the rented buffer is returned immediately after
     ///     deserialization, independently of how fast the caller iterates. The caller does not need to
-    ///     dispose anything.
+    ///     dispose anything. The stream ends once the consumer is disposed.
     /// </summary>
     /// <param name="ct">Cancellation token.</param>
     /// <returns>Async enumerable of deserialized messages with status.</returns>
     public async IAsyncEnumerable<ReceivedMessage<T>> ReceiveDeserializedAsync(
         [EnumeratorCancellation] CancellationToken ct = default)
     {
+        if (IsDisposed)
+        {
+            yield break;
+        }
         if (!IsInitialized)
         {
             throw new ConsumerNotInitializedException();
@@ -70,17 +74,28 @@ public class IggyConsumer<T> : IggyConsumer
         {
             if (!_deserializedChannel.Reader.TryRead(out ReceivedMessage<T>? message))
             {
-                await PollRentedMessagesAsync(ct);
+                await PollRentedMessagesCoreAsync(ct);
                 continue;
             }
 
+            if (!BeginDelivery(message.Header.Offset, message.PartitionId, message.Context))
+            {
+                yield break;
+            }
             yield return message;
 
             if (_typedConfig.AutoCommitMode == AutoCommitMode.AfterReceive)
             {
-                await StoreOffsetAsync(message.Header.Offset, message.PartitionId, message.Context, ct);
+                await CommitDeliveredAsync(message.Header.Offset, message.PartitionId, message.Context, ct);
             }
-        } while (!ct.IsCancellationRequested);
+        } while (!ct.IsCancellationRequested && !IsDisposed);
+    }
+
+    private protected override void CompleteReceiveChannels()
+    {
+        base.CompleteReceiveChannels();
+        _deserializedChannel.Writer.TryComplete();
+        while (_deserializedChannel.Reader.TryRead(out _)) { }
     }
 
     /// <summary>

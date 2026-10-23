@@ -221,7 +221,13 @@ async fn create_user(
         ..Default::default()
     };
     let user = client
-        .create_user(username, PASSWORD, UserStatus::Active, Some(permissions))
+        .create_user(
+            username,
+            PASSWORD,
+            UserStatus::Active,
+            Some(permissions),
+            &UserCreateOptions::default(),
+        )
         .await?;
     info!(
         "Created user: {username} with ID: {}, with permissions for topics: {:?} in stream: {stream_name}",

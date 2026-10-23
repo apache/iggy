@@ -36,8 +36,7 @@ var _ = ginkgo.Describe("UPDATE USER:", func() {
 			err := client.UpdateUser(
 				context.Background(),
 				identifier,
-				&username,
-				nil,
+				iggcon.UserUpdate{Username: &username},
 			)
 
 			itShouldNotReturnError(err)
@@ -53,8 +52,7 @@ var _ = ginkgo.Describe("UPDATE USER:", func() {
 			err := client.UpdateUser(
 				context.Background(),
 				randomU32Identifier(),
-				&username,
-				nil,
+				iggcon.UserUpdate{Username: &username},
 			)
 			itShouldReturnUnauthenticatedError(err)
 		})

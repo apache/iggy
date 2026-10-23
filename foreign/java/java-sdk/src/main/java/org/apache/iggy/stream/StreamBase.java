@@ -22,14 +22,16 @@ package org.apache.iggy.stream;
 import org.apache.iggy.message.HeaderValue;
 
 import java.math.BigInteger;
+import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 /**
  * A stream as the server reports it.
  *
- * <p>{@code options} carries the creation options, keyed by option name. Streams have no
- * catalog keys yet, so it is empty until one lands; the field is read rather than skipped
- * so the first key needs no client change.
+ * <p>{@code options} carries the keys the creating client set, {@code derivedOptions} the values the
+ * server filled or computes, such as the encryption key source and fingerprints. Both are keyed by option
+ * name and keep the kind the server reports, on every transport. The stream key itself is never returned.
  */
 public record StreamBase(
         Long id,
@@ -38,4 +40,25 @@ public record StreamBase(
         String size,
         BigInteger messagesCount,
         Long topicsCount,
-        Map<String, HeaderValue> options) {}
+        Map<String, HeaderValue> options,
+        Map<String, HeaderValue> derivedOptions) {
+    public StreamBase {
+        options = options == null ? Map.of() : options;
+        derivedOptions = derivedOptions == null ? Map.of() : derivedOptions;
+    }
+
+    /** Who chose the stream's data key, empty when the server reported no source. */
+    public Optional<EncryptionKeySource> encryptionKeySource() {
+        return EncryptionProjection.source(options, derivedOptions);
+    }
+
+    /** Fingerprint of the stream's data key, empty for a plaintext stream. */
+    public Optional<String> encryptionKeyFingerprint() {
+        return EncryptionProjection.keyFingerprint(options, derivedOptions);
+    }
+
+    /** Fingerprints of the server keys that wrap the stream's key, empty for a plaintext stream. */
+    public List<String> encryptionKekFingerprints() {
+        return EncryptionProjection.kekFingerprints(options, derivedOptions);
+    }
+}

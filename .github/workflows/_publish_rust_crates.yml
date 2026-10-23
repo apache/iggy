@@ -112,8 +112,8 @@ jobs:
 
           /tmp/copy-latest-from-master.sh apply
 
-      - name: Setup Rust with cache
-        uses: ./.github/actions/utils/setup-rust-with-cache
+      - name: Setup Rust
+        uses: ./.github/actions/utils/setup-rust
 
       # Normalize the inbound commit to a canonical full SHA. Caller (publish.yml)
       # already does this; a direct workflow_call caller must pass an explicit

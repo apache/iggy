@@ -36,6 +36,8 @@ services:
       - IGGY_WEBSOCKET_ADDRESS=0.0.0.0:8092
       - IGGY_ROOT_USERNAME=iggy
       - IGGY_ROOT_PASSWORD=iggy
+      - IGGY_ENCRYPTION_ENABLED=true
+      - IGGY_ENCRYPTION_KEY=/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=
     networks:
       - php-test-network
     ports:
@@ -65,6 +67,8 @@ services:
       - IGGY_TCP_ADDRESS=iggy-server:8090
       - IGGY_ROOT_USERNAME=iggy
       - IGGY_ROOT_PASSWORD=iggy
+      - IGGY_ENCRYPTION_ENABLED=true
+      - IGGY_ENCRYPTION_KEY=/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=
     volumes:
       - ./test-results:/workspace/foreign/php/test-results
 

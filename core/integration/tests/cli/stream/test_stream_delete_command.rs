@@ -22,6 +22,7 @@ use crate::cli::common::{
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::Client;
+use iggy::prelude::StreamCreateOptions;
 use predicates::str::diff;
 use serial_test::parallel;
 
@@ -51,7 +52,9 @@ impl TestStreamDeleteCmd {
 #[async_trait]
 impl IggyCmdTestCase for TestStreamDeleteCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
-        let stream = client.create_stream(&self.stream_name).await;
+        let stream = client
+            .create_stream(&self.stream_name, &StreamCreateOptions::default())
+            .await;
         assert!(stream.is_ok());
     }
 

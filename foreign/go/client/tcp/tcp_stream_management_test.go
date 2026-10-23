@@ -23,6 +23,7 @@ import (
 	"strings"
 	"testing"
 
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/apache/iggy/foreign/go/internal/vsr"
 	"github.com/stretchr/testify/assert"
@@ -31,7 +32,7 @@ import (
 
 // streamDetailsBody builds a stream reply with no topics:
 // [id u32][created_at u64][topics u32][size u64][messages u64][name_len u8][name]
-// [options_len u32 = 0].
+// [options_len u32 = 0][derived_options_len u32 = 0].
 func streamDetailsBody(id uint32, name string) []byte {
 	body := binary.LittleEndian.AppendUint32(nil, id)
 	body = binary.LittleEndian.AppendUint64(body, 1700000000)
@@ -40,6 +41,7 @@ func streamDetailsBody(id uint32, name string) []byte {
 	body = binary.LittleEndian.AppendUint64(body, 0)
 	body = append(body, byte(len(name)))
 	body = append(body, name...)
+	body = binary.LittleEndian.AppendUint32(body, 0)
 	return binary.LittleEndian.AppendUint32(body, 0)
 }
 
@@ -50,7 +52,7 @@ func TestCreateStream_DecodesTheCreatedStream(t *testing.T) {
 			append(resultSection(), streamDetailsBody(9, "orders")...))
 	})
 
-	stream, err := client.CreateStream(context.Background(), "orders")
+	stream, err := client.CreateStream(context.Background(), "orders", nil)
 	require.NoError(t, err)
 	assert.Equal(t, uint32(9), stream.Id)
 	assert.Equal(t, "orders", stream.Name)
@@ -63,10 +65,25 @@ func TestCreateStream_RejectsAnInvalidNameWithoutWriting(t *testing.T) {
 	})
 
 	for _, name := range []string{"", strings.Repeat("x", MaxStringLength+1)} {
-		_, err := client.CreateStream(context.Background(), name)
+		_, err := client.CreateStream(context.Background(), name, nil)
 		assert.ErrorIs(t, err, ierror.ErrInvalidStreamName, "name %q", name)
 	}
 	assert.Empty(t, server.recorded())
+}
+
+func TestCreateStream_RejectsAnInvalidKeyWithoutWriting(t *testing.T) {
+	t.Run("given_invalid_key_when_encoding_should_reject_before_network_io", func(t *testing.T) {
+		client, serverConn := newPipeClient(t)
+		server := serve(serverConn, func(_ int, _ request) []byte {
+			return replyFrame(vsr.OperationCreateStream, resultSection())
+		})
+
+		for _, key := range [][]byte{{}, make([]byte, 31), make([]byte, 33)} {
+			_, err := client.CreateStream(context.Background(), "orders", &iggcon.StreamOptions{EncryptionKey: key})
+			assert.ErrorIs(t, err, ierror.ErrInvalidEncryptionKey, "%d bytes", len(key))
+		}
+		assert.Empty(t, server.recorded())
+	})
 }
 
 func TestGetStream_ReportsAMissingStreamAsATypedError(t *testing.T) {
@@ -96,24 +113,31 @@ func TestGetStreams_DecodesTheRoster(t *testing.T) {
 func TestUpdateStream_RejectsAnInvalidNameWithoutWriting(t *testing.T) {
 	client, serverConn := newPipeClient(t)
 	server := serve(serverConn, func(_ int, _ request) []byte {
-		return replyFrame(vsr.OperationUpdateStream, resultSection())
+		return replyFrame(vsr.OperationUpdateStreamResolved, resultSection())
 	})
 
 	for _, name := range []string{"", strings.Repeat("x", MaxStringLength+1)} {
-		err := client.UpdateStream(context.Background(), numericIdentifier(t, 1), name)
+		err := client.UpdateStream(context.Background(), numericIdentifier(t, 1), iggcon.StreamUpdate{Name: &name})
 		assert.ErrorIs(t, err, ierror.ErrInvalidStreamName, "name %q", name)
 	}
+	err := client.UpdateStream(context.Background(), numericIdentifier(t, 1),
+		iggcon.StreamUpdate{Reset: []iggcon.StreamOptionKey{iggcon.StreamOptionName}})
+	assert.ErrorIs(t, err, ierror.ErrOptionNotResettable)
 	assert.Empty(t, server.recorded())
 }
 
 func TestUpdateStream_AcceptsACommittedRename(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	serve(serverConn, func(_ int, _ request) []byte {
-		return replyFrame(vsr.OperationUpdateStream, resultSection())
+	server := serve(serverConn, func(_ int, read request) []byte {
+		reply := committedReply(read, 0)
+		reply[replyFrameOffsetOperation] = byte(vsr.OperationUpdateStreamResolved)
+		return reply
 	})
 
+	name := "renamed"
 	assert.NoError(t, client.UpdateStream(
-		context.Background(), numericIdentifier(t, 1), "renamed"))
+		context.Background(), numericIdentifier(t, 1), iggcon.StreamUpdate{Name: &name}))
+	assert.Len(t, requestsFor(server.recorded(), vsr.OperationUpdateResource), 1)
 }
 
 func TestCreatePartitions_InvalidatesTheCachedPartitionCount(t *testing.T) {

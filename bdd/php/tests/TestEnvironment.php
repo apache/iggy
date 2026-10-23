@@ -30,6 +30,11 @@ final class TestEnvironment
         return self::env('IGGY_TCP_ADDRESS');
     }
 
+    public static function noQuorumAddress(): string
+    {
+        return self::env('IGGY_TCP_ADDRESS_NO_QUORUM');
+    }
+
     public static function rootUsername(): string
     {
         return self::env('IGGY_ROOT_USERNAME');

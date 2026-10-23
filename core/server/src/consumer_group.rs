@@ -302,11 +302,11 @@ mod tests {
                 derived_options: WireOptions::empty(),
                 partitions: (0..PARTITION_COUNT)
                     .map(|partition_id| CreatedPartitionAssignment {
+                        initial_view: 0,
                         partition_id,
                         consensus_group_id: u64::from(partition_id) + 1,
                     })
                     .collect(),
-                created_view: 0,
             }
             .to_bytes(),
         ))
@@ -359,7 +359,7 @@ mod tests {
                 validate_checksum: true,
                 segment_size: IggyByteSize::from(1_048_576_u64),
                 preallocate_segments: false,
-                encryptor: None,
+                key_context: Arc::default(),
                 path_layout: PartitionPathLayout::default(),
             },
         );

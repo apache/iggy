@@ -18,60 +18,75 @@
 use crate::commands::cli_command::{CliCommand, PRINT_TARGET};
 use anyhow::Context;
 use async_trait::async_trait;
-use iggy_common::Client;
-use iggy_common::Identifier;
-use iggy_common::StreamUpdateOptions;
-use iggy_common::update_stream::UpdateStream;
-use std::collections::BTreeMap;
+use core::fmt;
+use iggy_common::{Client, Identifier, StreamUpdateOptions};
 use tracing::{Level, event};
 
 pub struct UpdateStreamCmd {
-    update_stream: UpdateStream,
+    stream_id: Identifier,
     options: StreamUpdateOptions,
 }
 
 impl UpdateStreamCmd {
-    pub fn new(stream_id: Identifier, name: String) -> Self {
-        UpdateStreamCmd {
-            update_stream: UpdateStream {
-                stream_id,
-                name,
-                options: BTreeMap::new(),
-            },
-            options: StreamUpdateOptions::default(),
+    pub fn new(stream_id: Identifier, options: StreamUpdateOptions) -> Self {
+        Self { stream_id, options }
+    }
+
+    /// The changes this command asks for, in a fixed order.
+    fn changes(&self) -> String {
+        let mut changes = Vec::new();
+        if let Some(name) = &self.options.name {
+            changes.push(format!("name: {name}"));
         }
+        // A stream option value may be key material, so only the key is shown.
+        for key in self.options.raw.keys() {
+            changes.push(format!("set: {key}"));
+        }
+        for key in &self.options.reset {
+            changes.push(format!("reset: {key}"));
+        }
+        for key in &self.options.raw_reset {
+            changes.push(format!("reset: {key}"));
+        }
+        changes.join(", ")
     }
 }
 
 #[async_trait]
 impl CliCommand for UpdateStreamCmd {
     fn explain(&self) -> String {
-        format!(
-            "update stream with ID: {} and name: {}",
-            self.update_stream.stream_id, self.update_stream.name
-        )
+        format!("{self}")
     }
 
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
         client
-            .update_stream(
-                &self.update_stream.stream_id,
-                &self.update_stream.name,
-                &self.options,
-            )
+            .update_stream(&self.stream_id, &self.options)
             .await
             .with_context(|| {
                 format!(
-                    "Problem updating stream with ID: {} and name: {}",
-                    self.update_stream.stream_id, self.update_stream.name
+                    "Problem updating stream with ID: {} ({})",
+                    self.stream_id,
+                    self.changes()
                 )
             })?;
 
         event!(target: PRINT_TARGET, Level::INFO,
-            "Stream with ID: {} updated name: {}",
-            self.update_stream.stream_id, self.update_stream.name
+            "Stream with ID: {} updated ({})",
+            self.stream_id,
+            self.changes(),
         );
 
         Ok(())
+    }
+}
+
+impl fmt::Display for UpdateStreamCmd {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "update stream with ID: {} ({})",
+            self.stream_id,
+            self.changes()
+        )
     }
 }

@@ -59,7 +59,10 @@ async fn given_topic_with_messages_when_scraping_metrics_should_report_its_size_
     harness: &TestHarness,
 ) {
     let client = harness.tcp_root_client().await.expect("tcp root client");
-    client.create_stream(STREAM).await.expect("create stream");
+    client
+        .create_stream(STREAM, &StreamCreateOptions::default())
+        .await
+        .expect("create stream");
     let stream_id = Identifier::from_str_value(STREAM).expect("stream identifier");
     let topic_id = Identifier::from_str_value(TOPIC).expect("topic identifier");
     client
@@ -196,6 +199,7 @@ async fn given_user_without_server_read_when_scraping_metrics_should_omit_topic_
             METRICS_PASSWORD,
             UserStatus::Active,
             Some(permissions),
+            &UserCreateOptions::default(),
         )
         .await
         .expect("create metrics user");
@@ -242,7 +246,10 @@ async fn given_user_without_server_read_when_scraping_metrics_should_omit_topic_
 }
 
 async fn create_topic(client: &IggyClient, max_topic_size: MaxTopicSize) {
-    client.create_stream(STREAM).await.expect("create stream");
+    client
+        .create_stream(STREAM, &StreamCreateOptions::default())
+        .await
+        .expect("create stream");
     let stream_id = Identifier::from_str_value(STREAM).expect("stream identifier");
     client
         .create_topic(

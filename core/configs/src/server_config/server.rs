@@ -153,6 +153,14 @@ const RELOCATED_CONFIG_KEYS: &[RelocatedKey] = &[
         path: "extra",
         replacement: RelocatedTarget::Removed,
     },
+    // Refusing the old key keeps an operator's timeout from changing without
+    // notice.
+    RelocatedKey {
+        path: "consumer_group.session_timeout",
+        replacement: RelocatedTarget::Superseded(
+            "the session timeout is now 1.2 x heartbeat.interval",
+        ),
+    },
 ];
 
 /// Top-level on-disk config schema for the `iggy-server` binary.

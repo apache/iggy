@@ -100,10 +100,8 @@ async fn init_producer_id(
 
 fn stub_state(instance_id: u16) -> GatewayState {
     GatewayState::new(
-        default_broker(),
         None,
         MAX_FRAME_SIZE,
-        false,
         instance_id,
         GroupCoordinator::new(GroupCoordinatorConfig::default(), CancellationToken::new()),
     )
@@ -375,9 +373,6 @@ async fn given_a_live_server_when_a_transactional_request_is_refused_should_keep
 async fn given_a_server_configured_with_an_instance_id_when_init_producer_id_should_reflect_it() {
     let instance_id = 0x0042u16;
     let (addr, _shutdown) = spawn_test_server_with_config(GatewayConfig {
-        bind_addr: String::new(),
-        advertised_host: None,
-        advertised_port: None,
         max_frame_size: MAX_FRAME_SIZE,
         max_connections: 1024,
         idle_timeout: Duration::from_secs(5),

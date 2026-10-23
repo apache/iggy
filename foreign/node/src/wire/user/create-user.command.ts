@@ -21,7 +21,19 @@ import { COMMAND_CODE } from '../command.code.js';
 import { deserializeUser, type User, type UserStatus } from './user.utils.js';
 import { uint8ToBuf, uint32ToBuf, boolToBuf } from '../number.utils.js';
 import { serializePermissions, type UserPermissions } from './permissions.utils.js';
+import {
+  dedupeOptions, serializeOptions, sortOptions, type OptionEntry
+} from '../options.utils.js';
 
+
+/**
+ * Options a user takes at create. The server catalog has no user key yet, so
+ * only keys newer than this build can ride here.
+ */
+export type UserOptions = {
+  /** Option keys with no field of their own */
+  options?: OptionEntry[]
+};
 
 /**
  * Parameters for the create user command.
@@ -35,16 +47,17 @@ export type CreateUser = {
   status: UserStatus
   /** Optional user permissions */
   permissions?: UserPermissions
-};
+} & UserOptions;
 
 /**
  * Create user command definition.
  * Creates a new user with the specified credentials and permissions.
+ * The options block runs to the end of the payload.
  */
 export const CREATE_USER = {
   code: COMMAND_CODE.CreateUser,
 
-  serialize: ({ username, password, status, permissions }: CreateUser) => {
+  serialize: ({ username, password, status, permissions, options = [] }: CreateUser) => {
     const bUsername = Buffer.from(username);
     const bPassword = Buffer.from(password);
 
@@ -62,15 +75,17 @@ export const CREATE_USER = {
       uint8ToBuf(status),
     ]);
 
+    const bOptions = serializeOptions(sortOptions(dedupeOptions(options)));
     if (!permissions)
-      return Buffer.concat([bUser, boolToBuf(false)]);
+      return Buffer.concat([bUser, boolToBuf(false), bOptions]);
 
     const bPermissions = serializePermissions(permissions);
     return Buffer.concat([
       bUser,
       boolToBuf(true),
       uint32ToBuf(bPermissions.length),
-      bPermissions
+      bPermissions,
+      bOptions
     ]);
   },
 

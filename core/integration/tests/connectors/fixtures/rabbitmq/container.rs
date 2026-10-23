@@ -187,7 +187,7 @@ impl RabbitMqContainer {
         };
         channel
             .exchange_declare(
-                DEFAULT_EXCHANGE,
+                DEFAULT_EXCHANGE.into(),
                 exchange_kind,
                 ExchangeDeclareOptions {
                     durable: true,
@@ -204,7 +204,7 @@ impl RabbitMqContainer {
         for queue_name in &self.queue_names {
             channel
                 .queue_declare(
-                    queue_name,
+                    queue_name.as_str().into(),
                     QueueDeclareOptions {
                         auto_delete: true,
                         ..Default::default()
@@ -224,9 +224,9 @@ impl RabbitMqContainer {
             }
             channel
                 .queue_bind(
-                    queue_name,
-                    DEFAULT_EXCHANGE,
-                    DEFAULT_ROUTING_KEY,
+                    queue_name.as_str().into(),
+                    DEFAULT_EXCHANGE.into(),
+                    DEFAULT_ROUTING_KEY.into(),
                     QueueBindOptions::default(),
                     bind_arguments,
                 )
@@ -290,8 +290,8 @@ pub trait RabbitMqOps: Sync {
 
         let mut consumer = channel
             .basic_consume(
-                queue_name,
-                "",
+                queue_name.into(),
+                "".into(),
                 BasicConsumeOptions::default(),
                 FieldTable::default(),
             )

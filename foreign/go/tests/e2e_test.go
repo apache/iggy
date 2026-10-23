@@ -21,17 +21,14 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
-	"net"
 	"os"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/apache/iggy/foreign/go/client/tcp"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
-	"github.com/apache/iggy/foreign/go/internal/command"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -218,33 +215,8 @@ func TestE2E_SplitPrimaryPollsPreserveCoordinatorMembership(t *testing.T) {
 	require.NoError(t, connected.JoinConsumerGroup(ctx, stream, topic, groupID))
 	waitForGroupAssignment(t, connected, stream, topic, groupID)
 	consumer := iggcon.NewGroupConsumer(groupID)
-	streamBytes, err := stream.MarshalBinary()
-	require.NoError(t, err)
-	topicBytes, err := topic.MarshalBinary()
-	require.NoError(t, err)
-	payload := binary.LittleEndian.AppendUint32(append(streamBytes, topicBytes...), 0)
-	body, err := connected.SendBinaryRequest(ctx, uint32(command.GetPartitionRouteCode), payload)
-	require.NoError(t, err)
-	var route iggcon.PartitionRoute
-	require.NoError(t, route.UnmarshalBinary(body))
-	metadata, err := connected.GetClusterMetadata(ctx)
-	require.NoError(t, err)
-	var primary *iggcon.ClusterNode
-	for index := range metadata.Nodes {
-		if metadata.Nodes[index].ReplicaID == route.PrimaryReplica {
-			primary = &metadata.Nodes[index]
-			break
-		}
-	}
-	require.NotNil(t, primary, "route primary must be a configured replica")
+	primaryAddress := requireSplitPrimaries(t, ctx, connected, stream, topic)
 	coordinator := connected.GetConnectionInfo().ServerAddress
-	primaryAddress := net.JoinHostPort(strings.Trim(primary.IP, "[]"), strconv.Itoa(int(primary.Endpoints.Tcp)))
-	coordinatorEndpoint, err := net.ResolveTCPAddr("tcp", coordinator)
-	require.NoError(t, err)
-	primaryEndpoint, err := net.ResolveTCPAddr("tcp", primaryAddress)
-	require.NoError(t, err)
-	require.False(t, coordinatorEndpoint.Port == primaryEndpoint.Port && coordinatorEndpoint.IP.Equal(primaryEndpoint.IP),
-		"the fixture must separate metadata and partition primaries")
 	beforeClient, err := connected.GetMe(ctx)
 	require.NoError(t, err)
 	require.Equal(t, uint32(1), beforeClient.ConsumerGroupsCount)
@@ -303,6 +275,7 @@ func TestE2E_SplitPrimaryManualCommitPreservesMembership(t *testing.T) {
 	require.NoError(t, connected.JoinConsumerGroup(ctx, stream, topic, groupID))
 	waitForGroupAssignment(t, connected, stream, topic, groupID)
 	consumer := iggcon.NewGroupConsumer(groupID)
+	requireSplitPrimaries(t, ctx, connected, stream, topic)
 	coordinator := connected.GetConnectionInfo().ServerAddress
 	beforeClient, err := connected.GetMe(ctx)
 	require.NoError(t, err)
@@ -497,25 +470,32 @@ func TestE2E_TopicOptionsRoundTripAndCatalog(t *testing.T) {
 	assert.NotEmpty(t, byKey["segment_size"].Description)
 	assert.Equal(t, iggcon.Uint64, byKey["segment_size"].DefaultValue.Kind)
 
-	// Scopes with no catalog keys answer with an empty list rather than failing.
+	// Every scope has a catalog, and each entry says what an update may do.
 	streamSpecs, err := connected.DescribeOptions(ctx, iggcon.OptionsScopeStream)
 	require.NoError(t, err)
-	assert.Empty(t, streamSpecs)
+	streamByKey := map[string]iggcon.OptionSpec{}
+	for _, spec := range streamSpecs {
+		streamByKey[spec.Key] = spec
+	}
+	require.Contains(t, streamByKey, "encryption_key")
+	assert.True(t, streamByKey["encryption_key"].Secret)
+	assert.False(t, streamByKey["encryption_key"].Updatable)
+	assert.True(t, streamByKey["name"].Updatable)
+	assert.True(t, byKey["message_expiry"].Resettable)
+	assert.False(t, byKey["compression_algorithm"].Updatable)
 
 	name := fmt.Sprintf("go-e2e-options-%d", time.Now().UnixNano())
-	stream, err := connected.CreateStream(ctx, name)
+	stream, err := connected.CreateStream(ctx, name, nil)
 	require.NoError(t, err)
 	streamId, err := iggcon.NewIdentifier(stream.Id)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = connected.DeleteStream(context.Background(), streamId) })
 
-	// A key with no parameter of its own rides the variadic options block.
-	created, err := connected.CreateTopic(ctx, streamId, name, 1,
-		iggcon.CompressionAlgorithmNone, iggcon.Duration(0), 0,
-		iggcon.HeaderEntry{
-			Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte("durability")},
-			Value: iggcon.HeaderValue{Kind: iggcon.String, Value: []byte("persisted")},
-		})
+	// A key with no field of its own rides the raw options.
+	created, err := connected.CreateTopic(ctx, streamId, name, &iggcon.TopicOptions{Raw: []iggcon.HeaderEntry{{
+		Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte("durability")},
+		Value: iggcon.HeaderValue{Kind: iggcon.String, Value: []byte("persisted")},
+	}}})
 	require.NoError(t, err)
 
 	topicId, err := iggcon.NewIdentifier(created.Id)
@@ -535,12 +515,10 @@ func TestE2E_TopicOptionsRoundTripAndCatalog(t *testing.T) {
 	assert.NotContains(t, topic.DerivedOptions, "durability")
 
 	// A key outside the catalog is refused by name.
-	_, err = connected.CreateTopic(ctx, streamId, name+"-bad", 1,
-		iggcon.CompressionAlgorithmNone, iggcon.Duration(0), 0,
-		iggcon.HeaderEntry{
-			Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte("not_a_real_option")},
-			Value: iggcon.HeaderValue{Kind: iggcon.String, Value: []byte("1")},
-		})
+	_, err = connected.CreateTopic(ctx, streamId, name+"-bad", &iggcon.TopicOptions{Raw: []iggcon.HeaderEntry{{
+		Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte("not_a_real_option")},
+		Value: iggcon.HeaderValue{Kind: iggcon.String, Value: []byte("1")},
+	}}})
 	require.Error(t, err)
 }
 
@@ -574,14 +552,13 @@ func TestE2E_TypedTopicOptionsMatchTheCatalog(t *testing.T) {
 	}
 
 	name := fmt.Sprintf("go-e2e-typed-options-%d", time.Now().UnixNano())
-	stream, err := connected.CreateStream(ctx, name)
+	stream, err := connected.CreateStream(ctx, name, nil)
 	require.NoError(t, err)
 	streamId, err := iggcon.NewIdentifier(stream.Id)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = connected.DeleteStream(context.Background(), streamId) })
 
-	created, err := connected.CreateTopic(ctx, streamId, name, 1,
-		iggcon.CompressionAlgorithmNone, iggcon.Duration(0), 0, typed...)
+	created, err := connected.CreateTopic(ctx, streamId, name, &iggcon.TopicOptions{Raw: typed})
 	require.NoError(t, err)
 
 	topicId, err := iggcon.NewIdentifier(created.Id)
@@ -601,21 +578,22 @@ func TestE2E_TypedTopicOptionsMatchTheCatalog(t *testing.T) {
 	}
 
 	// A flush threshold of zero messages can never trip, so it is refused.
-	_, err = connected.CreateTopic(ctx, streamId, name+"-zero-flush", 1,
-		iggcon.CompressionAlgorithmNone, iggcon.Duration(0), 0,
-		iggcon.MessagesRequiredToSaveOption(0))
+	_, err = connected.CreateTopic(ctx, streamId, name+"-zero-flush", &iggcon.TopicOptions{
+		Raw: []iggcon.HeaderEntry{iggcon.MessagesRequiredToSaveOption(0)},
+	})
 	require.Error(t, err)
 
 	// A segment size off the 512-byte grid is refused, but zero is not: it
 	// leaves the key derived.
-	_, err = connected.CreateTopic(ctx, streamId, name+"-odd-segment", 1,
-		iggcon.CompressionAlgorithmNone, iggcon.Duration(0), 0,
-		iggcon.SegmentSizeOption(1024*1024+1))
+	_, err = connected.CreateTopic(ctx, streamId, name+"-odd-segment", &iggcon.TopicOptions{
+		Raw: []iggcon.HeaderEntry{iggcon.SegmentSizeOption(1024*1024 + 1)},
+	})
 	require.Error(t, err)
 
 	zeroSegment := iggcon.SegmentSizeOption(0)
-	derived, err := connected.CreateTopic(ctx, streamId, name+"-zero-segment", 1,
-		iggcon.CompressionAlgorithmNone, iggcon.Duration(0), 0, zeroSegment)
+	derived, err := connected.CreateTopic(ctx, streamId, name+"-zero-segment", &iggcon.TopicOptions{
+		Raw: []iggcon.HeaderEntry{zeroSegment},
+	})
 	require.NoError(t, err)
 	segmentSizeKey := string(zeroSegment.Key.Value)
 	assert.NotContains(t, derived.Options, segmentSizeKey)

@@ -37,6 +37,17 @@ use iggy_binary_protocol::consensus::{
 /// via `binary_protocol`. Re-exported so server-side callers keep one import.
 pub use iggy_binary_protocol::consensus::result_code;
 
+/// A stream or topic removed by a committed delete, named by slab id.
+///
+/// Grants name streams and topics by slab id, and the slab gives a freed id to
+/// the next create. So the grants on a deleted id must go in the same apply, or
+/// they reach the stream or topic that reuses it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeletedResource {
+    Stream(usize),
+    Topic { stream_id: usize, topic_id: usize },
+}
+
 /// Outcome of applying one committed metadata op.
 ///
 /// `code == 0` is success, `body` the typed reply payload. Nonzero `code` is a
@@ -50,6 +61,8 @@ pub struct ApplyReply {
     /// Local apply effect, recomputed from the committed operation on every replay.
     /// It is not part of the client reply or persisted receipt.
     pub(crate) revoked_user: Option<u32>,
+    /// Local apply effect, like `revoked_user`: the grants on this resource must go.
+    pub(crate) deleted_resource: Option<DeletedResource>,
 }
 
 impl ApplyReply {
@@ -60,6 +73,7 @@ impl ApplyReply {
             code: 0,
             body,
             revoked_user: None,
+            deleted_resource: None,
         }
     }
 
@@ -71,6 +85,7 @@ impl ApplyReply {
             code: code.into(),
             body: Bytes::new(),
             revoked_user: None,
+            deleted_resource: None,
         }
     }
 
@@ -160,6 +175,7 @@ result_enum!(UpdateStreamResult {
     StreamNotFound = 1009,
     NameAlreadyExists = 1012,
     InvalidOptionValue = 4042,
+    OptionsBlockTooLarge = 4043,
 });
 result_enum!(DeleteStreamResult { StreamNotFound = 1009 });
 
@@ -174,10 +190,11 @@ result_enum!(CreateTopicResult {
 });
 result_enum!(UpdateTopicResult {
     StreamNotFound = 1009,
+    InvalidTopicSize = 1019,
     TopicNotFound = 2010,
     NameAlreadyExists = 2013,
-    UnsupportedOptionKey = 4041,
     InvalidOptionValue = 4042,
+    OptionsBlockTooLarge = 4043,
 });
 result_enum!(DeleteTopicResult {
     StreamNotFound = 1009,
@@ -216,13 +233,18 @@ result_enum!(TruncatePartitionResult {
 result_enum!(CreateUserResult {
     InvalidUsername = 43,
     UserAlreadyExists = 46,
+    StreamNotFound = 1009,
+    TopicNotFound = 2010,
     InvalidOptionValue = 4042,
 });
 result_enum!(UpdateUserResult {
     UserNotFound = 20,
     InvalidUsername = 43,
+    InvalidUserStatus = 45,
     UsernameAlreadyExists = 46,
     InvalidOptionValue = 4042,
+    OptionsBlockTooLarge = 4043,
+    CannotModifyRootUser = 4108,
 });
 result_enum!(DeleteUserResult {
     UserNotFound = 20,
@@ -235,6 +257,8 @@ result_enum!(ChangePasswordResult {
 result_enum!(UpdatePermissionsResult {
     UserNotFound = 20,
     CannotChangePermissions = 49,
+    StreamNotFound = 1009,
+    TopicNotFound = 2010,
 });
 
 // Personal access tokens.
@@ -309,12 +333,19 @@ pub const fn result_code_recognized(operation: Operation, code: u32) -> bool {
     }
     match operation {
         Operation::CreateStream => CreateStreamResult::from_u32(code).is_some(),
-        Operation::UpdateStream => UpdateStreamResult::from_u32(code).is_some(),
+        Operation::UpdateStreamResolved => UpdateStreamResult::from_u32(code).is_some(),
         Operation::DeleteStream => DeleteStreamResult::from_u32(code).is_some(),
         Operation::CreateTopic | Operation::CreateTopicWithAssignments => {
             CreateTopicResult::from_u32(code).is_some()
         }
-        Operation::UpdateTopic => UpdateTopicResult::from_u32(code).is_some(),
+        Operation::UpdateTopicResolved => UpdateTopicResult::from_u32(code).is_some(),
+        // A client resend can carry the generic code before the reply names
+        // the resolved operation, so accept a result of any scope.
+        Operation::UpdateResource => {
+            UpdateStreamResult::from_u32(code).is_some()
+                || UpdateTopicResult::from_u32(code).is_some()
+                || UpdateUserResult::from_u32(code).is_some()
+        }
         Operation::DeleteTopic => DeleteTopicResult::from_u32(code).is_some(),
         Operation::CreatePartitions | Operation::CreatePartitionsWithAssignments => {
             CreatePartitionsResult::from_u32(code).is_some()
@@ -322,7 +353,7 @@ pub const fn result_code_recognized(operation: Operation, code: u32) -> bool {
         Operation::DeletePartitions => DeletePartitionsResult::from_u32(code).is_some(),
         Operation::TruncatePartition => TruncatePartitionResult::from_u32(code).is_some(),
         Operation::CreateUser => CreateUserResult::from_u32(code).is_some(),
-        Operation::UpdateUser => UpdateUserResult::from_u32(code).is_some(),
+        Operation::UpdateUserResolved => UpdateUserResult::from_u32(code).is_some(),
         Operation::DeleteUser => DeleteUserResult::from_u32(code).is_some(),
         Operation::ChangePassword => ChangePasswordResult::from_u32(code).is_some(),
         Operation::UpdatePermissions => UpdatePermissionsResult::from_u32(code).is_some(),
@@ -345,11 +376,12 @@ pub const fn result_code_recognized(operation: Operation, code: u32) -> bool {
 const fn lifecycle_gated(operation: Operation) -> bool {
     matches!(
         operation,
-        Operation::UpdateStream
+        Operation::UpdateResource
+            | Operation::UpdateStreamResolved
             | Operation::DeleteStream
             | Operation::CreateTopic
             | Operation::CreateTopicWithAssignments
-            | Operation::UpdateTopic
+            | Operation::UpdateTopicResolved
             | Operation::DeleteTopic
             | Operation::CreatePartitions
             | Operation::CreatePartitionsWithAssignments
@@ -377,7 +409,7 @@ const fn begins_lifecycle(operation: Operation) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iggy_common::{Identifier, IggyError};
+    use iggy_common::{Identifier, IggyByteSize, IggyError, MaxTopicSize};
 
     #[test]
     fn from_u32_round_trips_known_codes_and_rejects_unknown() {
@@ -497,7 +529,7 @@ mod tests {
         for operation in [
             Operation::CreateUser,
             Operation::CreateStream,
-            Operation::UpdateTopic,
+            Operation::UpdateTopicResolved,
             Operation::JoinConsumerGroup,
         ] {
             assert!(
@@ -561,6 +593,14 @@ mod tests {
             u32::from(CreateConsumerGroupResult::StreamNotFound),
             stream_not_found
         );
+        assert_eq!(
+            u32::from(CreateUserResult::StreamNotFound),
+            stream_not_found
+        );
+        assert_eq!(
+            u32::from(UpdatePermissionsResult::StreamNotFound),
+            stream_not_found
+        );
 
         // StreamNameAlreadyExists (1012).
         let stream_name_exists = IggyError::StreamNameAlreadyExists(String::new()).as_code();
@@ -593,6 +633,11 @@ mod tests {
             u32::from(CreateConsumerGroupResult::TopicNotFound),
             topic_not_found
         );
+        assert_eq!(u32::from(CreateUserResult::TopicNotFound), topic_not_found);
+        assert_eq!(
+            u32::from(UpdatePermissionsResult::TopicNotFound),
+            topic_not_found
+        );
 
         // TopicNameAlreadyExists (2013).
         let topic_name_exists = IggyError::TopicNameAlreadyExists(String::new(), id()).as_code();
@@ -603,6 +648,12 @@ mod tests {
         assert_eq!(
             u32::from(UpdateTopicResult::NameAlreadyExists),
             topic_name_exists
+        );
+
+        // InvalidTopicSize (1019).
+        assert_eq!(
+            u32::from(UpdateTopicResult::InvalidTopicSize),
+            IggyError::InvalidTopicSize(MaxTopicSize::default(), IggyByteSize::default()).as_code(),
         );
 
         // InvalidPartitionsCount (2019).
@@ -636,10 +687,24 @@ mod tests {
             IggyError::PartitionNotFound(0, id(), id()).as_code(),
         );
 
-        // UnsupportedOptionKey (4041) / InvalidOptionValue (4042).
+        // InvalidOptionValue (4042) / OptionsBlockTooLarge (4043).
+        let too_large = IggyError::OptionsBlockTooLarge(String::new()).as_code();
         assert_eq!(
-            u32::from(UpdateTopicResult::UnsupportedOptionKey),
-            IggyError::UnsupportedOptionKey(String::new()).as_code(),
+            u32::from(UpdateStreamResult::OptionsBlockTooLarge),
+            too_large
+        );
+        assert_eq!(
+            u32::from(UpdateTopicResult::OptionsBlockTooLarge),
+            too_large
+        );
+        assert_eq!(u32::from(UpdateUserResult::OptionsBlockTooLarge), too_large);
+        assert_eq!(
+            u32::from(UpdateUserResult::InvalidUserStatus),
+            IggyError::InvalidUserStatus.as_code()
+        );
+        assert_eq!(
+            u32::from(UpdateUserResult::CannotModifyRootUser),
+            IggyError::CannotModifyRootUser.as_code()
         );
         let invalid_option_value = IggyError::InvalidOptionValue(String::new()).as_code();
         assert_eq!(

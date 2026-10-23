@@ -59,30 +59,98 @@ use iggy_binary_protocol::responses::streams::get_stream::{
     GetStreamResponse, TopicHeader as StreamTopicHeader,
 };
 use iggy_binary_protocol::responses::streams::get_streams::GetStreamsResponse;
+use iggy_binary_protocol::responses::system::DescribeOptionsResponse;
 use iggy_binary_protocol::responses::system::get_cluster_metadata::{
     ClusterMetadataResponse, ClusterNodeResponse,
 };
 use iggy_binary_protocol::responses::system::get_stats::StatsResponse;
-use iggy_binary_protocol::responses::system::{DescribeOptionsResponse, OptionDescriptor};
 use iggy_binary_protocol::responses::topics::get_topic::{GetTopicResponse, PartitionResponse};
 use iggy_binary_protocol::responses::topics::get_topics::GetTopicsResponse;
 use iggy_binary_protocol::responses::users::get_user::UserDetailsResponse;
 use iggy_binary_protocol::responses::users::get_users::GetUsersResponse;
 use iggy_binary_protocol::responses::users::user_response::UserResponse;
 use iggy_binary_protocol::{
-    ReplyHeader, RoutedRequestHeader, WireDecode, WireEncode, WireIdentifier, WireName,
+    ReplyHeader, RoutedRequestHeader, WireDecode, WireEncode, WireIdentifier, WireName, WireOptions,
 };
-use iggy_common::wire_conversions::{resource_options_to_wire, resource_options_to_wire_split};
-use iggy_common::{HeaderKind, IggyError, IggyTimestamp, OptionsProvenance, topic_option_keys};
+use iggy_common::wire_conversions::{describe_options_response, resource_options_to_wire_split};
+use iggy_common::{
+    IggyError, IggyTimestamp, OptionsScope, ResourceOptions, UserStatus, public_options,
+};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use metadata::impls::metadata::StreamsFrontend;
+use metadata::stm::stream::{Stream, StreamsInner, Topic};
+use metadata::stm::user::User;
 use server_common::Message;
 use shard::ConnectedClientInfo;
 use std::cell::RefCell;
 use std::net::IpAddr;
 use std::rc::Rc;
 use std::sync::Arc;
+use tracing::warn;
+
+/// The stored fields a stream or topic read returns. Reads copy them under the
+/// metadata read guard and project the options after it, because the writer
+/// publishing the next apply waits for every reader to leave.
+struct StoredEntry {
+    id: usize,
+    created_at: IggyTimestamp,
+    /// Topics of a stream, partitions of a topic.
+    children_count: usize,
+    size_bytes: u64,
+    messages_count: u64,
+    name: Arc<str>,
+    options: ResourceOptions,
+}
+
+/// The stored fields a user read returns, copied like [`StoredEntry`].
+struct StoredUser {
+    id: u32,
+    created_at: IggyTimestamp,
+    status: UserStatus,
+    username: Arc<str>,
+    options: ResourceOptions,
+}
+
+impl From<&Stream> for StoredEntry {
+    fn from(stream: &Stream) -> Self {
+        Self {
+            id: stream.id,
+            created_at: stream.created_at,
+            children_count: stream.topics.len(),
+            size_bytes: stream.stats.size_bytes_inconsistent(),
+            messages_count: stream.stats.messages_count_inconsistent(),
+            name: Arc::clone(&stream.name),
+            options: stream.options.clone(),
+        }
+    }
+}
+
+impl From<&Topic> for StoredEntry {
+    fn from(topic: &Topic) -> Self {
+        Self {
+            id: topic.id,
+            created_at: topic.created_at,
+            children_count: topic.partitions.len(),
+            size_bytes: topic.stats.size_bytes_inconsistent(),
+            messages_count: topic.stats.messages_count_inconsistent(),
+            name: Arc::clone(&topic.name),
+            options: topic.options.clone(),
+        }
+    }
+}
+
+impl From<&User> for StoredUser {
+    fn from(user: &User) -> Self {
+        Self {
+            id: user.id,
+            created_at: user.created_at,
+            status: user.status,
+            username: Arc::clone(&user.username),
+            options: user.options.clone(),
+        }
+    }
+}
 
 /// Build the `get_me` reply for the requesting connection. Identity
 /// (`user_id`, transport kind, peer address) comes from the per-shard
@@ -560,23 +628,29 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    shard.plane.metadata().mux_stm.streams().read(|streams| {
-        let Some(stream_id) = streams.resolve_stream_id(stream_id) else {
-            return Ok(None);
-        };
-        let stream = streams
-            .items
-            .get(stream_id)
-            .ok_or(IggyError::InvalidIdentifier)?;
-        Ok(Some(GetStreamResponse {
-            stream: stream_response(stream)?,
-            topics: stream
-                .topics
-                .iter()
-                .map(|(_, topic)| topic_header(topic))
-                .collect::<Result<Vec<_>, _>>()?,
-        }))
-    })
+    let stored =
+        shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .read(|streams| -> Result<_, IggyError> {
+                let Some(stream_id) = streams.resolve_stream_id(stream_id) else {
+                    return Ok(None);
+                };
+                let stream = streams
+                    .items
+                    .get(stream_id)
+                    .ok_or(IggyError::InvalidIdentifier)?;
+                Ok(Some((StoredEntry::from(stream), stored_topics(stream))))
+            })?;
+    let Some((stream, topics)) = stored else {
+        return Ok(None);
+    };
+    Ok(Some(GetStreamResponse {
+        stream: stream_response(&stream)?,
+        topics: listed_topics(stream.id, &topics)?,
+    }))
 }
 
 fn build_get_streams_response<B, MJ, S, SB>(
@@ -589,155 +663,120 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    shard.plane.metadata().mux_stm.streams().read(|streams| {
-        streams
-            .items
-            .iter()
-            .map(|(_, stream)| stream_response(stream))
-            .collect::<Result<Vec<_>, _>>()
-            .map(|streams| GetStreamsResponse { streams })
-    })
+    let streams = shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .read(stored_streams);
+    listed_streams(&streams).map(|streams| GetStreamsResponse { streams })
 }
 
-/// Every key `CreateTopic` accepts, with the kind, default and bounds of each.
-///
-/// Split out of [`build_describe_options_response`] so the descriptions have room
-/// to state the bounds each value is checked against: this catalog is the only
-/// place an operator learns them.
-///
-/// Every default is a build constant: these knobs stopped being config-derived
-/// when the `[system.*]` keys became topic options, so the catalog reads them
-/// straight from `iggy_common`.
-#[allow(clippy::too_many_lines)]
-fn topic_option_descriptors() -> Result<Vec<OptionDescriptor>, IggyError> {
-    Ok(vec![
-        OptionDescriptor {
-            key: WireName::new(topic_option_keys::COMPRESSION_ALGORITHM)
-                .map_err(|_| IggyError::InvalidFormat)?,
-            kind: HeaderKind::String.as_code(),
-            default_value: Bytes::from_static(b"none"),
-            description: "Compression algorithm (none, gzip); stored and reported, not applied to messages".to_string(),
-        },
-        OptionDescriptor {
-            key: WireName::new(topic_option_keys::MESSAGE_EXPIRY)
-                .map_err(|_| IggyError::InvalidFormat)?,
-            kind: HeaderKind::Uint64.as_code(),
-            default_value: Bytes::copy_from_slice(
-                &iggy_common::DEFAULT_MESSAGE_EXPIRY.to_le_bytes(),
-            ),
-            description: "Message expiry in microseconds, or a humantime string \
-                              (e.g. 7 days)"
-                .to_string(),
-        },
-        OptionDescriptor {
-            key: WireName::new(topic_option_keys::MAX_TOPIC_SIZE)
-                .map_err(|_| IggyError::InvalidFormat)?,
-            kind: HeaderKind::Uint64.as_code(),
-            default_value: Bytes::copy_from_slice(
-                &iggy_common::DEFAULT_MAX_TOPIC_SIZE.to_le_bytes(),
-            ),
-            description: "Topic-wide sealed-segment size cap, split across all partitions, in bytes \
-                              or a byte-size string (e.g. 1 GiB); finite values must be at least the segment size"
-                .to_string(),
-        },
-        OptionDescriptor {
-            key: WireName::new(topic_option_keys::SEGMENT_SIZE)
-                .map_err(|_| IggyError::InvalidFormat)?,
-            kind: HeaderKind::Uint64.as_code(),
-            default_value: Bytes::copy_from_slice(&iggy_common::DEFAULT_SEGMENT_SIZE.to_le_bytes()),
-            description: format!(
-                "Segment size in bytes, or a byte-size string (e.g. 128 MiB); a 512-byte \
-                     multiple within {}..={}",
-                iggy_common::MIN_TOPIC_SEGMENT_SIZE,
-                iggy_common::MAX_TOPIC_SEGMENT_SIZE
-            ),
-        },
-        OptionDescriptor {
-            key: WireName::new(topic_option_keys::DURABILITY).map_err(|_| IggyError::InvalidFormat)?,
-            kind: HeaderKind::String.as_code(),
-            default_value: Bytes::from_static(b"replicated"),
-            description: "Message completion: replicated or persisted. Independently defaults to replicated. A singleton quorum has one copy. In replicated groups, persisted messages use WAL references to segment bodies, retaining their inodes by hard link until WAL reclamation. The full body size still counts against partition.wal_bytes_max.".to_string(),
-        },
-        OptionDescriptor {
-            key: WireName::new(topic_option_keys::CONSUMER_OFFSET_DURABILITY).map_err(|_| IggyError::InvalidFormat)?,
-            kind: HeaderKind::String.as_code(),
-            default_value: Bytes::from_static(b"replicated"),
-            description: "Explicit offset completion: replicated or persisted. Independently defaults to replicated. Poll auto-commit remains asynchronous. In replicated groups, persisted offsets also enable WAL references to segment bodies, retaining their inodes by hard link until reclamation, even with replicated message durability. Full body sizes count against partition.wal_bytes_max.".to_string(),
-        },
-        OptionDescriptor {
-            key: WireName::new(topic_option_keys::PARTITION_RESIZE_POLICY)
-                .map_err(|_| IggyError::InvalidFormat)?,
-            kind: HeaderKind::String.as_code(),
-            default_value: Bytes::from_static(b"mutable"),
-            description: "Immutable after creation: mutable permits partition addition/deletion without a bounded cutover or per-key ordering across layouts; fixed rejects both. Retention and topic deletion remain destructive.".to_string(),
-        },
-        OptionDescriptor {
-            key: WireName::new(topic_option_keys::MESSAGES_REQUIRED_TO_SAVE)
-                .map_err(|_| IggyError::InvalidFormat)?,
-            kind: HeaderKind::Uint32.as_code(),
-            default_value: Bytes::copy_from_slice(
-                &iggy_common::DEFAULT_MESSAGES_REQUIRED_TO_SAVE.to_le_bytes(),
-            ),
-            description: format!(
-                "Ordinary message-count flush trigger; 1..={}. Required persistence, \
-                     capacity pressure, and lifecycle operations can flush earlier",
-                iggy_common::MAX_MESSAGES_REQUIRED_TO_SAVE
-            ),
-        },
-        OptionDescriptor {
-            key: WireName::new(topic_option_keys::SIZE_OF_MESSAGES_REQUIRED_TO_SAVE)
-                .map_err(|_| IggyError::InvalidFormat)?,
-            kind: HeaderKind::Uint64.as_code(),
-            default_value: Bytes::copy_from_slice(
-                &iggy_common::DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE.to_le_bytes(),
-            ),
-            description: format!(
-                "Flush the journal once it holds this many bytes, or a byte-size \
-                     string; whichever threshold trips first flushes. At most {}",
-                iggy_common::MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE
-            ),
-        },
-        OptionDescriptor {
-            key: WireName::new(topic_option_keys::PREALLOCATE_SEGMENTS)
-                .map_err(|_| IggyError::InvalidFormat)?,
-            kind: HeaderKind::Bool.as_code(),
-            default_value: Bytes::copy_from_slice(&[u8::from(
-                iggy_common::DEFAULT_PREALLOCATE_SEGMENTS,
-            )]),
-            description: format!(
-                "Request segment_size bytes of disk reservation when each segment opens. \
-                     Unsupported or failed reservations fall back to ordinary allocation \
-                     with a warning. Reservation runs inline on the owning shard. \
-                     segment_size * partitions_count is capped at {} bytes per create",
-                iggy_common::MAX_PREALLOCATED_TOPIC_BYTES
-            ),
-        },
-    ])
+fn stored_streams(streams: &StreamsInner) -> Vec<StoredEntry> {
+    streams
+        .items
+        .iter()
+        .map(|(_, stream)| StoredEntry::from(stream))
+        .collect()
+}
+
+fn stored_topics(stream: &Stream) -> Vec<StoredEntry> {
+    stream
+        .topics
+        .iter()
+        .map(|(_, topic)| StoredEntry::from(topic))
+        .collect()
+}
+
+/// Every stream a list read serves, see [`servable`].
+fn listed_streams(streams: &[StoredEntry]) -> Result<Vec<StreamResponse>, IggyError> {
+    streams
+        .iter()
+        .filter_map(|stream| {
+            servable(
+                stream_response(stream),
+                OptionsScope::Stream,
+                stream.id,
+                None,
+            )
+            .transpose()
+        })
+        .collect()
+}
+
+/// Every topic of stream `stream_id` a list read serves, see [`servable`].
+fn listed_topics(
+    stream_id: usize,
+    topics: &[StoredEntry],
+) -> Result<Vec<StreamTopicHeader>, IggyError> {
+    topics
+        .iter()
+        .filter_map(|topic| {
+            servable(
+                topic_header(topic),
+                OptionsScope::Topic,
+                topic.id,
+                Some(stream_id),
+            )
+            .transpose()
+        })
+        .collect()
+}
+
+/// A list entry, or `None` for a resource whose stored critical state this
+/// build cannot read. That resource still fails its own read, but it must not
+/// fail the list every other resource is served in.
+fn servable<T>(
+    entry: Result<T, IggyError>,
+    scope: OptionsScope,
+    resource_id: usize,
+    stream_id: Option<usize>,
+) -> Result<Option<T>, IggyError> {
+    match entry {
+        Ok(entry) => Ok(Some(entry)),
+        Err(IggyError::UnsupportedCriticalOption(key)) => {
+            warn!(
+                scope = %scope,
+                resource_id,
+                stream_id,
+                "Leaving {scope} {resource_id} out of the list, its critical option {key} is not readable by this build."
+            );
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Serve the option catalog for one resource scope.
-///
-/// Streams and users have no catalog keys yet, so their scopes return empty
-/// (every key is rejected at create until one lands).
 fn build_describe_options_response(body: &[u8]) -> Result<DescribeOptionsResponse, IggyError> {
     let request =
         DescribeOptionsRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
-    let entries = match request.scope {
-        OPTIONS_SCOPE_TOPIC => topic_option_descriptors()?,
-        OPTIONS_SCOPE_STREAM | OPTIONS_SCOPE_USER => Vec::new(),
+    let scope = match request.scope {
+        OPTIONS_SCOPE_TOPIC | OPTIONS_SCOPE_STREAM | OPTIONS_SCOPE_USER => {
+            OptionsScope::from_code(request.scope)?
+        }
         _ => return Err(IggyError::InvalidCommand),
     };
-    Ok(DescribeOptionsResponse { entries })
+    describe_options_response(scope)
 }
 
-#[allow(clippy::cast_possible_truncation)]
-fn user_response(user: &metadata::stm::user::User) -> Result<UserResponse, IggyError> {
+/// The explicit and derived blocks a read returns for `stored`.
+fn public_blocks(
+    scope: OptionsScope,
+    stored: &ResourceOptions,
+) -> Result<(WireOptions, WireOptions), IggyError> {
+    resource_options_to_wire_split(&public_options(scope, stored)?)
+}
+
+fn user_response(user: &StoredUser) -> Result<UserResponse, IggyError> {
+    let (options, derived_options) = public_blocks(OptionsScope::User, &user.options)?;
     Ok(UserResponse {
         id: user.id,
         created_at: user.created_at.as_micros(),
         status: user.status.as_code(),
         username: WireName::new(user.username.as_ref()).map_err(|_| IggyError::InvalidFormat)?,
-        options: resource_options_to_wire(&user.options, OptionsProvenance::Explicit)?,
+        options,
+        derived_options,
     })
 }
 
@@ -751,14 +790,26 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    shard.plane.metadata().mux_stm.users().read(|users| {
+    let users = shard.plane.metadata().mux_stm.users().read(|users| {
         users
             .items
             .iter()
-            .map(|(_, user)| user_response(user))
-            .collect::<Result<Vec<_>, _>>()
-            .map(|users| GetUsersResponse { users })
-    })
+            .map(|(_, user)| StoredUser::from(user))
+            .collect::<Vec<_>>()
+    });
+    users
+        .iter()
+        .filter_map(|user| {
+            servable(
+                user_response(user),
+                OptionsScope::User,
+                user.id as usize,
+                None,
+            )
+            .transpose()
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(|users| GetUsersResponse { users })
 }
 
 fn build_get_user_response<B, MJ, S, SB>(
@@ -772,19 +823,27 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    shard.plane.metadata().mux_stm.users().read(|users| {
-        let Some(id) = users.resolve_user_id(user_id) else {
-            return Ok(None);
-        };
-        let user = users.items.get(id).ok_or(IggyError::InvalidIdentifier)?;
-        Ok(Some(UserDetailsResponse {
-            user: user_response(user)?,
-            permissions: user
-                .permissions
-                .as_ref()
-                .map(|p| iggy_common::wire_conversions::permissions_to_wire(p)),
-        }))
-    })
+    let stored = shard
+        .plane
+        .metadata()
+        .mux_stm
+        .users()
+        .read(|users| -> Result<_, IggyError> {
+            let Some(id) = users.resolve_user_id(user_id) else {
+                return Ok(None);
+            };
+            let user = users.items.get(id).ok_or(IggyError::InvalidIdentifier)?;
+            Ok(Some((StoredUser::from(user), user.permissions.clone())))
+        })?;
+    let Some((user, permissions)) = stored else {
+        return Ok(None);
+    };
+    Ok(Some(UserDetailsResponse {
+        user: user_response(&user)?,
+        permissions: permissions
+            .as_deref()
+            .map(iggy_common::wire_conversions::permissions_to_wire),
+    }))
 }
 
 fn personal_access_tokens_response(
@@ -816,38 +875,49 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    shard.plane.metadata().mux_stm.streams().read(|streams| {
-        let Some(stream_id) = streams.resolve_stream_id(stream_id) else {
-            return Ok(None);
-        };
-        let Some(topic_id) = streams.resolve_topic_id(stream_id, topic_id) else {
-            return Ok(None);
-        };
-        let stream = streams
-            .items
-            .get(stream_id)
-            .ok_or(IggyError::InvalidIdentifier)?;
-        let topic = stream
-            .topics
-            .get(topic_id)
-            .ok_or(IggyError::InvalidIdentifier)?;
-        Ok(Some(GetTopicResponse {
-            topic: topic_header(topic)?,
-            partitions: topic
-                .partitions
-                .iter()
-                .map(|partition| {
-                    partition_response(
-                        streams,
-                        stream_id,
-                        topic_id,
-                        partition,
-                        shard.plane.metadata().applied_frontier().get(),
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        }))
-    })
+    let stored =
+        shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .read(|streams| -> Result<_, IggyError> {
+                let Some(stream_id) = streams.resolve_stream_id(stream_id) else {
+                    return Ok(None);
+                };
+                let Some(topic_id) = streams.resolve_topic_id(stream_id, topic_id) else {
+                    return Ok(None);
+                };
+                let stream = streams
+                    .items
+                    .get(stream_id)
+                    .ok_or(IggyError::InvalidIdentifier)?;
+                let topic = stream
+                    .topics
+                    .get(topic_id)
+                    .ok_or(IggyError::InvalidIdentifier)?;
+                let partitions = topic
+                    .partitions
+                    .iter()
+                    .map(|partition| {
+                        partition_response(
+                            streams,
+                            stream_id,
+                            topic_id,
+                            partition,
+                            shard.plane.metadata().applied_frontier().get(),
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Some((StoredEntry::from(topic), partitions)))
+            })?;
+    let Some((topic, partitions)) = stored else {
+        return Ok(None);
+    };
+    Ok(Some(GetTopicResponse {
+        topic: topic_header(&topic)?,
+        partitions,
+    }))
 }
 
 fn build_get_topics_response<B, MJ, S, SB>(
@@ -861,52 +931,51 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    shard.plane.metadata().mux_stm.streams().read(|streams| {
-        // Legacy parity: a missing stream lists as empty, not StreamNotFound.
-        let Some(resolved_stream) = streams.resolve_stream_id(stream_id) else {
-            return Ok(GetTopicsResponse { topics: Vec::new() });
-        };
-        let stream = streams
-            .items
-            .get(resolved_stream)
-            .ok_or(IggyError::InvalidIdentifier)?;
-        stream
-            .topics
-            .iter()
-            .map(|(_, topic)| topic_header(topic))
-            .collect::<Result<Vec<_>, _>>()
-            .map(|topics| GetTopicsResponse { topics })
-    })
+    let stored =
+        shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .read(|streams| -> Result<_, IggyError> {
+                // Legacy parity: a missing stream lists as empty, not StreamNotFound.
+                let Some(resolved_stream) = streams.resolve_stream_id(stream_id) else {
+                    return Ok(None);
+                };
+                let stream = streams
+                    .items
+                    .get(resolved_stream)
+                    .ok_or(IggyError::InvalidIdentifier)?;
+                Ok(Some((stream.id, stored_topics(stream))))
+            })?;
+    let Some((stream_id, topics)) = stored else {
+        return Ok(GetTopicsResponse { topics: Vec::new() });
+    };
+    listed_topics(stream_id, &topics).map(|topics| GetTopicsResponse { topics })
 }
 
-fn stream_response(stream: &metadata::stm::stream::Stream) -> Result<StreamResponse, IggyError> {
+fn stream_response(stream: &StoredEntry) -> Result<StreamResponse, IggyError> {
+    let (options, derived_options) = public_blocks(OptionsScope::Stream, &stream.options)?;
     Ok(StreamResponse {
         id: usize_to_u32(stream.id)?,
         created_at: stream.created_at.as_micros(),
-        topics_count: usize_to_u32(stream.topics.len())?,
-        size_bytes: stream.stats.size_bytes_inconsistent(),
-        messages_count: stream.stats.messages_count_inconsistent(),
+        topics_count: usize_to_u32(stream.children_count)?,
+        size_bytes: stream.size_bytes,
+        messages_count: stream.messages_count,
         name: WireName::new(stream.name.as_ref()).map_err(|_| IggyError::InvalidFormat)?,
-        options: resource_options_to_wire(&stream.options, OptionsProvenance::Explicit)?,
+        options,
+        derived_options,
     })
 }
 
-/// Stored `message_expiry` and `max_topic_size` echo verbatim, `ServerDefault`
-/// as the wire sentinel (0), matching legacy: create admission resolves the
-/// sentinels against server config before replication, so a stored sentinel
-/// came from an update and must read back as `ServerDefault`, not as the node
-/// default frozen at read time.
-fn topic_header(topic: &metadata::stm::stream::Topic) -> Result<StreamTopicHeader, IggyError> {
-    let (options, derived_options) = resource_options_to_wire_split(&topic.options)?;
+fn topic_header(topic: &StoredEntry) -> Result<StreamTopicHeader, IggyError> {
+    let (options, derived_options) = public_blocks(OptionsScope::Topic, &topic.options)?;
     Ok(StreamTopicHeader {
         id: usize_to_u32(topic.id)?,
         created_at: topic.created_at.as_micros(),
-        partitions_count: usize_to_u32(topic.partitions.len())?,
-        message_expiry: u64::from(topic.message_expiry),
-        compression_algorithm: topic.compression_algorithm.as_code(),
-        max_topic_size: topic.max_topic_size.as_bytes_u64(),
-        size_bytes: topic.stats.size_bytes_inconsistent(),
-        messages_count: topic.stats.messages_count_inconsistent(),
+        partitions_count: usize_to_u32(topic.children_count)?,
+        size_bytes: topic.size_bytes,
+        messages_count: topic.messages_count,
         name: WireName::new(topic.name.as_ref()).map_err(|_| IggyError::InvalidFormat)?,
         options,
         derived_options,
@@ -1013,6 +1082,57 @@ impl NonReplicatedResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iggy_common::{HeaderKey, HeaderValue, OptionKey, OptionValue};
+    use std::str::FromStr;
+
+    #[test]
+    fn given_one_unreadable_stream_and_topic_when_listing_should_serve_the_rest() {
+        let unreadable = || {
+            ResourceOptions::from([
+                (
+                    HeaderKey::from(OptionKey::CriticalKeys),
+                    OptionValue::explicit(HeaderValue::try_from("future_key").unwrap()),
+                ),
+                (
+                    HeaderKey::from_str("future_key").unwrap(),
+                    OptionValue::explicit(HeaderValue::from(true)),
+                ),
+            ])
+        };
+        let created_at = IggyTimestamp::from(1u64);
+        let mut streams = StreamsInner::new();
+        let mut readable = Stream::new(Arc::from("readable"), created_at);
+        for (name, options) in [("kept", ResourceOptions::new()), ("hidden", unreadable())] {
+            let mut topic = Topic::new(Arc::from(name), created_at, readable.stats.clone());
+            topic.set_options(options);
+            readable.topics.insert(topic);
+        }
+        let mut hidden = Stream::new(Arc::from("hidden"), created_at);
+        hidden.options = unreadable();
+        let readable_slot = streams.items.insert(readable);
+        let hidden_slot = streams.items.insert(hidden);
+
+        let names = |names: Vec<&WireName>| -> Vec<String> {
+            names.iter().map(|name| name.as_str().to_owned()).collect()
+        };
+        let listed = listed_streams(&stored_streams(&streams)).expect("the stream list builds");
+        assert_eq!(
+            names(listed.iter().map(|stream| &stream.name).collect()),
+            ["readable"]
+        );
+        let readable = streams.items.get(readable_slot).expect("stream stored");
+        let topics =
+            listed_topics(readable.id, &stored_topics(readable)).expect("the topic list builds");
+        assert_eq!(
+            names(topics.iter().map(|topic| &topic.name).collect()),
+            ["kept"]
+        );
+        let hidden = streams.items.get(hidden_slot).expect("stream stored");
+        assert!(matches!(
+            stream_response(&StoredEntry::from(hidden)),
+            Err(IggyError::UnsupportedCriticalOption(_))
+        ));
+    }
 
     #[test]
     fn personal_access_tokens_response_preserves_order_and_encodes_never_as_zero() {
@@ -1086,10 +1206,10 @@ mod tests {
             id: 0,
             name: Arc::from("topic"),
             created_at,
-            message_expiry: iggy_common::IggyExpiry::NeverExpire,
-            compression_algorithm: iggy_common::CompressionAlgorithm::None,
-            max_topic_size: iggy_common::MaxTopicSize::Unlimited,
             options: iggy_common::ResourceOptions::default(),
+            resolved: iggy_common::TopicResolvedOptions::from(
+                &iggy_common::ResourceOptions::default(),
+            ),
             stats: topic_stats.clone(),
             partitions: vec![
                 Partition::new(0, 1, created_at, 0, 0),
@@ -1138,56 +1258,32 @@ mod tests {
     }
 
     #[test]
-    fn topic_header_echoes_stored_size_and_expiry_verbatim() {
-        use iggy_common::{
-            CompressionAlgorithm, IggyDuration, IggyExpiry, MaxTopicSize, ResourceOptions,
-            StreamStats, TopicStats,
-        };
-        use std::sync::atomic::AtomicUsize;
+    fn given_topic_options_when_projecting_header_should_split_blocks_by_provenance() {
+        use iggy_common::wire_conversions::resource_options_from_wire;
+        use iggy_common::{HeaderKey, HeaderValue, OptionKey, OptionValue, StreamStats};
 
-        let parent = Arc::new(StreamStats::default());
-        let topic_with = |max_topic_size, message_expiry| metadata::stm::stream::Topic {
-            id: 0,
-            name: Arc::from("topic"),
-            created_at: IggyTimestamp::from(1u64),
-            message_expiry,
-            compression_algorithm: CompressionAlgorithm::None,
-            max_topic_size,
-            options: ResourceOptions::default(),
-            stats: Arc::new(TopicStats::new(parent.clone())),
-            partitions: Vec::new(),
-            round_robin_counter: Arc::new(AtomicUsize::new(0)),
-            consumer_groups: ahash::AHashMap::default(),
-            consumer_group_index: ahash::AHashMap::default(),
-            next_consumer_group_id: 0,
-            consumer_group_catalog_op: 0,
-        };
+        let mut options = ResourceOptions::new();
+        options.insert(
+            HeaderKey::from(OptionKey::MessageExpiry),
+            OptionValue::explicit(HeaderValue::from(5_000_000u64)),
+        );
+        options.insert(
+            HeaderKey::from(OptionKey::MaxTopicSize),
+            OptionValue::derived(HeaderValue::from(u64::MAX)),
+        );
+        let mut topic = metadata::stm::stream::Topic::new(
+            Arc::from("topic"),
+            IggyTimestamp::from(1u64),
+            Arc::new(StreamStats::default()),
+        );
+        topic.set_options(options.clone());
 
-        // Stored `ServerDefault` sentinels echo the wire sentinel (0)
-        // verbatim, so an update to `ServerDefault` reads back as
-        // `ServerDefault` instead of the node default frozen at read time.
-        let sentinel = topic_header(&topic_with(
-            MaxTopicSize::ServerDefault,
-            IggyExpiry::ServerDefault,
-        ))
-        .expect("topic header builds");
-        assert_eq!(sentinel.max_topic_size, 0);
-        assert_eq!(sentinel.message_expiry, 0);
+        let header = topic_header(&StoredEntry::from(&topic)).expect("topic header builds");
 
-        // Explicit values round-trip unchanged.
-        let custom = topic_header(&topic_with(
-            MaxTopicSize::from(1024u64),
-            IggyExpiry::ExpireDuration(IggyDuration::from(5_000_000u64)),
-        ))
-        .expect("topic header builds");
-        assert_eq!(custom.max_topic_size, 1024);
-        assert_eq!(custom.message_expiry, 5_000_000);
-        let unlimited = topic_header(&topic_with(
-            MaxTopicSize::Unlimited,
-            IggyExpiry::NeverExpire,
-        ))
-        .expect("topic header builds");
-        assert_eq!(unlimited.max_topic_size, u64::MAX);
-        assert_eq!(unlimited.message_expiry, u64::MAX);
+        let mut explicit = resource_options_from_wire(&header.options, true).unwrap();
+        explicit.extend(resource_options_from_wire(&header.derived_options, false).unwrap());
+        assert_eq!(explicit, options);
+        assert_eq!((&header.options).into_iter().count(), 1);
+        assert_eq!((&header.derived_options).into_iter().count(), 1);
     }
 }

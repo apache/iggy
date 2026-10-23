@@ -147,7 +147,10 @@ async fn init_system(
     topic_name: &str,
     topic_options: &TopicCreateOptions,
 ) {
-    client.create_stream(stream_name).await.unwrap();
+    client
+        .create_stream(stream_name, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     client
         .create_topic(
             &Identifier::named(stream_name).unwrap(),

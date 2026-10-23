@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+import Foundation
 import Testing
 
 @testable import Iggy
@@ -100,6 +101,30 @@ struct ModelVectorTests {
         #expect(try OptionsBlock.encode(options) == golden.bytes("options.golden"))
     }
 
+    /// The cross-SDK block Rust pins by hand in
+    /// `core/binary_protocol/src/primitives/options.rs`, as do the Node,
+    /// Java, Go and C# SDKs. It is in insertion order, not key order, and
+    /// decoders accept either.
+    @Test func goldenOptionsBlock() throws {
+        let preallocate: [UInt8] = [2, 20, 0, 0, 0] + [UInt8]("preallocate_segments".utf8) + [3, 1, 0, 0, 0, 1]
+        let segmentSize: [UInt8] = [2, 12, 0, 0, 0] + [UInt8]("segment_size".utf8) + [12, 8, 0, 0, 0, 0, 0, 0, 64, 0, 0, 0, 0]
+        let durabilityKey: [UInt8] = [2, 10, 0, 0, 0] + [UInt8]("durability".utf8)
+        let durabilityValue: [UInt8] = [2, 9, 0, 0, 0] + [UInt8]("persisted".utf8)
+        let block: [UInt8] = preallocate + segmentSize + durabilityKey + durabilityValue
+        #expect(block == golden.bytes("options.golden_block"))
+        let options = try OptionsBlock.decode(block[...], explicit: true)
+        #expect(
+            options == [
+                "preallocate_segments": .explicit(.bool(true)), "segment_size": .explicit(.uint64(1_073_741_824)), "durability": .explicit("persisted"),
+            ])
+    }
+
+    @Test func streamKey() throws {
+        let key = Data((0..<UInt8(EncryptionKey.length)).map { $0 })
+        #expect(try StreamCreateOptions(encryptionKey: key).encode() == golden.bytes("options.stream_create.key"))
+        #expect(try EncryptionKey.fingerprint(key) == golden.vectors["stream_key.fingerprint"])
+    }
+
     @Test func topicOptions() throws {
         let create = TopicCreateOptions(
             partitionsCount: 3, compressionAlgorithm: .gzip, messageExpiry: .after(.seconds(604_800)),
@@ -107,8 +132,8 @@ struct ModelVectorTests {
             consumerOffsetDurability: .replicated, messagesRequiredToSave: 7, sizeOfMessagesRequiredToSaveBytes: 4096,
             preallocateSegments: false)
         #expect(try create.encode() == golden.bytes("options.topic_create.full"))
-        let update = TopicUpdateOptions(compressionAlgorithm: CompressionAlgorithm.none, messageExpiry: .never, maxTopicSize: .unlimited)
-        #expect(try update.encode() == golden.bytes("options.topic_update.full"))
+        let update = TopicUpdateOptions(messageExpiry: .never, maxTopicSize: .unlimited)
+        #expect(try OptionsBlock.encode(update.toPatch().set) == golden.bytes("options.topic_update.full"))
         let raw = TopicCreateOptions(raw: ["durability": "persisted"])
         #expect(try raw.encode() == golden.bytes("options.topic_create.raw"))
     }

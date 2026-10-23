@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-ARG RUST_VERSION=1.99
+ARG RUST_VERSION=1.99.1
 FROM rust:${RUST_VERSION}-slim-trixie AS rust-toolchain
 
 FROM ubuntu:24.04
@@ -48,7 +48,7 @@ ENV PHP_CONFIG=/usr/bin/php-config8.3
 ENV BDD_FEATURE_FILE=/workspace/bdd/scenarios/basic_messaging.feature
 
 RUN rustup component add llvm-tools-preview \
-    && cargo install cargo-php --locked --version 0.1.21 \
+    && cargo install cargo-php --locked --version 0.2.1 \
     && cargo install cargo-llvm-cov --locked
 
 WORKDIR /workspace

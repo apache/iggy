@@ -62,7 +62,7 @@ const PRE_KILL_ACKS: usize = 50;
 
 async fn create_stream_and_topic(client: &IggyClient, eager_flush: bool) {
     client
-        .create_stream(STREAM_NAME)
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
         .await
         .expect("create stream");
     // `eager_flush` persists and fsyncs every committed batch on every
@@ -548,7 +548,10 @@ async fn given_mixed_durability_when_killed_below_flush_threshold_should_recover
 
 async fn verify_persisted_restart(harness: &mut TestHarness, durability: Durability) {
     let client = harness.tcp_root_client().await.unwrap();
-    client.create_stream(STREAM_NAME).await.unwrap();
+    client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     let stream = Identifier::named(STREAM_NAME).unwrap();
     client
         .create_topic(
@@ -609,7 +612,10 @@ async fn given_persisted_topic_when_backup_misses_writes_should_repair_before_du
     harness: &mut TestHarness,
 ) {
     let client = harness.tcp_root_client().await.unwrap();
-    client.create_stream(STREAM_NAME).await.unwrap();
+    client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     client
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
@@ -643,7 +649,10 @@ async fn given_all_replicas_checkpointed_when_restarted_should_elect_and_extend_
     harness: &mut TestHarness,
 ) {
     let client = harness.tcp_root_client().await.unwrap();
-    let stream_details = client.create_stream(STREAM_NAME).await.unwrap();
+    let stream_details = client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     let stream = Identifier::numeric(stream_details.id).unwrap();
     let topic_details = client
         .create_topic(

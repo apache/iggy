@@ -509,11 +509,18 @@ impl DiskReadPlan {
         }
         let partition_dir = match &self.partition_dir {
             PartitionDirResolution::Resolved(dir) => dir.as_str(),
-            // Simulated in-memory persistence: no files exist, so this is not
-            // an IO fault on present data. `Empty` lets the caller serve the
-            // resident journal tier (the sim's only tier) without skipping
-            // anything.
-            PartitionDirResolution::NoFiles => return DiskReadOutcome::Empty,
+            // Simulated in-memory persistence: no files exist. Until a flush
+            // persists anything, the journal is the only tier and `Empty` lets
+            // the caller serve it without skipping anything. A flush evicts
+            // what it persisted from the journal, and those bytes cannot be
+            // read back, so the journal-forward would skip them: fail closed.
+            PartitionDirResolution::NoFiles => {
+                return if self.segments.iter().any(|segment| segment.persisted > 0) {
+                    DiskReadOutcome::Faulted
+                } else {
+                    DiskReadOutcome::Empty
+                };
+            }
             // File-backed data exists but the dir was unresolvable at plan
             // time (mid-rotation). Fail-closed like an IO fault: the
             // journal-forward would splice resident ops over the hidden

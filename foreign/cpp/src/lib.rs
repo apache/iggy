@@ -22,7 +22,10 @@ mod messages;
 mod producer;
 mod type_conversion;
 
-use client::{Client, delete_connection as delete_client, from_connection_string, new_connection};
+use client::{
+    Client, delete_connection as delete_client, encryption_key_fingerprint,
+    encryption_key_fingerprint_base64, from_connection_string, new_connection,
+};
 use consumer::Consumer;
 use messages::make_message;
 use producer::Producer;
@@ -37,6 +40,15 @@ static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
 
 #[cxx::bridge(namespace = "iggy::ffi")]
 mod ffi {
+    /// Local to one call. Read after a bridge exception; IDs remain exact u64 values.
+    #[derive(Default)]
+    struct ErrorInfo {
+        code: u32,
+        kind: String,
+        has_operation_id: bool,
+        operation_id: u64,
+    }
+
     struct Identifier {
         kind: String,
         length: u8,
@@ -108,9 +120,27 @@ mod ffi {
         size_bytes: u64,
         messages_count: u64,
         topics_count: u32,
-        /// Creation options. Streams have no catalog keys yet, so this is
-        /// empty until one lands.
+        /// Options the creating client set explicitly. Key material is never
+        /// returned.
         options: Vec<HeaderEntry>,
+        /// Options the server filled in, including the read-only encryption
+        /// projections.
+        derived_options: Vec<HeaderEntry>,
+        has_encryption_key_source: bool,
+        encryption_key_source: StreamEncryptionSource,
+        has_encryption_key_fingerprint: bool,
+        encryption_key_fingerprint: String,
+        /// One per server key that wraps the stream's key, empty for a
+        /// plaintext stream.
+        encryption_kek_fingerprints: Vec<String>,
+    }
+
+    /// Who chose a stream's at-rest data key.
+    #[repr(u8)]
+    enum StreamEncryptionSource {
+        None = 0,
+        Stream = 1,
+        Server = 2,
     }
 
     #[repr(u8)]
@@ -142,13 +172,13 @@ mod ffi {
         value: HeaderField,
     }
 
-    /// One key a resource's create command accepts, as served by
+    /// One key of a resource's option catalog, as served by
     /// `describe_options`.
     ///
-    /// This is the discovery surface for the keys `create_topic` takes. A key
-    /// outside the server catalog is refused at create, and the binary
-    /// transports carry back only an error code, so nothing in the rejection
-    /// names the keys that would have worked.
+    /// This is the discovery surface for the keys a create or an update takes.
+    /// A key outside the server catalog is refused, and the binary transports
+    /// carry back only an error code, so nothing in the rejection names the
+    /// keys that would have worked.
     struct OptionSpec {
         key: String,
         /// Wire kind code the value is encoded under, the same encoding
@@ -157,6 +187,15 @@ mod ffi {
         /// The default in `kind`'s encoding. Empty when the key has no default.
         default_value: Vec<u8>,
         description: String,
+        updatable: bool,
+        resettable: bool,
+        /// Write-only: accepted at create, never returned.
+        secret: bool,
+        /// Computed by the server and returned on reads, never accepted.
+        read_only: bool,
+        /// A node that does not understand the key refuses to serve the
+        /// resource.
+        critical: bool,
     }
 
     struct IggyMessageToSend {
@@ -225,6 +264,13 @@ mod ffi {
         topics: Vec<Topic>,
         /// See [`Stream::options`].
         options: Vec<HeaderEntry>,
+        /// See [`Stream::derived_options`].
+        derived_options: Vec<HeaderEntry>,
+        has_encryption_key_source: bool,
+        encryption_key_source: StreamEncryptionSource,
+        has_encryption_key_fingerprint: bool,
+        encryption_key_fingerprint: String,
+        encryption_kek_fingerprints: Vec<String>,
     }
 
     struct ConsumerGroupMember {
@@ -405,6 +451,7 @@ mod ffi {
         status: UserStatus,
         username: String,
         options: Vec<HeaderEntry>,
+        derived_options: Vec<HeaderEntry>,
     }
 
     struct UserInfoDetails {
@@ -415,6 +462,7 @@ mod ffi {
         has_permissions: bool,
         permissions: Permissions,
         options: Vec<HeaderEntry>,
+        derived_options: Vec<HeaderEntry>,
     }
 
     struct LoginInfo {
@@ -449,6 +497,9 @@ mod ffi {
         has_tls_validate_certificate: bool,
         tls_validate_certificate: bool,
         no_delay: bool,
+        has_pending_operations: bool,
+        pending_max_operations: u64,
+        pending_max_bytes: u64,
     }
 
     struct TopicCreateOptions {
@@ -473,17 +524,56 @@ mod ffi {
         size_of_messages_required_to_save: u64,
         has_preallocate_segments: bool,
         preallocate_segments: bool,
+        has_partition_resize_policy: bool,
+        partition_resize_policy: String,
         raw_options: Vec<HeaderEntry>,
     }
 
+    /// Reset keys travel as catalog names and are validated against the
+    /// scope's catalog before anything is sent. Raw reset names are left to
+    /// the server.
     struct TopicUpdateOptions {
-        has_compression_algorithm: bool,
-        compression_algorithm: String,
+        has_name: bool,
+        name: String,
         has_message_expiry: bool,
         message_expiry_kind: String,
         message_expiry_value: u64,
         has_max_topic_size: bool,
         max_topic_size: String,
+        reset: Vec<String>,
+        raw_reset: Vec<String>,
+        raw_options: Vec<HeaderEntry>,
+    }
+
+    /// The key is either 32 raw bytes or their canonical padded base64, never
+    /// both. An invalid key is refused before anything is sent.
+    struct StreamCreateOptions {
+        has_encryption_key: bool,
+        encryption_key: Vec<u8>,
+        has_encryption_key_base64: bool,
+        encryption_key_base64: String,
+        raw_options: Vec<HeaderEntry>,
+    }
+
+    struct StreamUpdateOptions {
+        has_name: bool,
+        name: String,
+        reset: Vec<String>,
+        raw_reset: Vec<String>,
+        raw_options: Vec<HeaderEntry>,
+    }
+
+    struct UserCreateOptions {
+        raw_options: Vec<HeaderEntry>,
+    }
+
+    struct UserUpdateOptions {
+        has_username: bool,
+        username: String,
+        has_status: bool,
+        status: UserStatus,
+        reset: Vec<String>,
+        raw_reset: Vec<String>,
         raw_options: Vec<HeaderEntry>,
     }
 
@@ -495,24 +585,46 @@ mod ffi {
         // Client functions
         fn new_connection(config: IggyClientConfig) -> Result<*mut Client>;
         fn from_connection_string(connection_string: String) -> Result<*mut Client>;
-        fn login_user(self: &Client, username: String, password: String) -> Result<LoginInfo>;
-        fn logout_user(self: &Client) -> Result<()>;
+        fn login_user(
+            self: &Client,
+            username: String,
+            password: String,
+            error_info: &mut ErrorInfo,
+        ) -> Result<LoginInfo>;
+        fn logout_user(self: &Client, error_info: &mut ErrorInfo) -> Result<()>;
         fn connect(self: &Client) -> Result<()>;
-        fn create_stream(self: &Client, stream_name: String) -> Result<StreamDetails>;
+        fn resolve_operation(
+            self: &Client,
+            op: u64,
+            timeout_micros: u64,
+            error_info: &mut ErrorInfo,
+        ) -> Result<()>;
+        fn abandon_operation(self: &Client, op: u64, error_info: &mut ErrorInfo) -> Result<()>;
+        fn create_stream(
+            self: &Client,
+            stream_name: String,
+            options: StreamCreateOptions,
+            error_info: &mut ErrorInfo,
+        ) -> Result<StreamDetails>;
         fn update_stream(
             self: &Client,
             stream_id: Identifier,
-            stream_name: String,
-            options: Vec<HeaderEntry>,
+            options: StreamUpdateOptions,
+            error_info: &mut ErrorInfo,
         ) -> Result<()>;
         fn get_streams(self: &Client) -> Result<Vec<Stream>>;
         fn get_stream(self: &Client, stream_id: Identifier) -> Result<StreamDetails>;
-        fn delete_stream(self: &Client, stream_id: Identifier) -> Result<()>;
+        fn delete_stream(
+            self: &Client,
+            stream_id: Identifier,
+            error_info: &mut ErrorInfo,
+        ) -> Result<()>;
         fn create_topic(
             self: &Client,
             stream_id: Identifier,
             topic_name: String,
             options: TopicCreateOptions,
+            error_info: &mut ErrorInfo,
         ) -> Result<TopicDetails>;
         fn get_topic(
             self: &Client,
@@ -524,27 +636,35 @@ mod ffi {
             self: &Client,
             stream_id: Identifier,
             topic_id: Identifier,
-            topic_name: String,
             options: TopicUpdateOptions,
+            error_info: &mut ErrorInfo,
         ) -> Result<()>;
-        fn delete_topic(self: &Client, stream_id: Identifier, topic_id: Identifier) -> Result<()>;
+        fn delete_topic(
+            self: &Client,
+            stream_id: Identifier,
+            topic_id: Identifier,
+            error_info: &mut ErrorInfo,
+        ) -> Result<()>;
         fn create_partitions(
             self: &Client,
             stream_id: Identifier,
             topic_id: Identifier,
             partitions_count: u32,
+            error_info: &mut ErrorInfo,
         ) -> Result<()>;
         fn delete_partitions(
             self: &Client,
             stream_id: Identifier,
             topic_id: Identifier,
             partitions_count: u32,
+            error_info: &mut ErrorInfo,
         ) -> Result<()>;
         fn create_consumer_group(
             self: &Client,
             stream_id: Identifier,
             topic_id: Identifier,
             name: String,
+            error_info: &mut ErrorInfo,
         ) -> Result<ConsumerGroupDetails>;
         fn get_consumer_group(
             self: &Client,
@@ -562,19 +682,23 @@ mod ffi {
             stream_id: Identifier,
             topic_id: Identifier,
             group_id: Identifier,
+            error_info: &mut ErrorInfo,
         ) -> Result<()>;
         fn join_consumer_group(
             self: &Client,
             stream_id: Identifier,
             topic_id: Identifier,
             group_id: Identifier,
+            error_info: &mut ErrorInfo,
         ) -> Result<()>;
         fn leave_consumer_group(
             self: &Client,
             stream_id: Identifier,
             topic_id: Identifier,
             group_id: Identifier,
+            error_info: &mut ErrorInfo,
         ) -> Result<()>;
+        #[allow(clippy::too_many_arguments)]
         fn store_consumer_offset(
             self: &Client,
             stream_id: Identifier,
@@ -583,6 +707,7 @@ mod ffi {
             consumer_kind: String,
             consumer_id: Identifier,
             offset: u64,
+            error_info: &mut ErrorInfo,
         ) -> Result<()>;
         fn get_consumer_offset(
             self: &Client,
@@ -599,6 +724,7 @@ mod ffi {
             partition_id: u32,
             consumer_kind: String,
             consumer_id: Identifier,
+            error_info: &mut ErrorInfo,
         ) -> Result<()>;
         /// Stores `offset` under `context`, normally the one returned with the
         /// polled batch. Every retry keeps it, so a deleted or recreated
@@ -614,6 +740,7 @@ mod ffi {
             consumer_id: Identifier,
             offset: u64,
             context: PartitionContext,
+            error_info: &mut ErrorInfo,
         ) -> Result<()>;
 
         /// The poll takes the context its cached route reports. After another
@@ -633,6 +760,7 @@ mod ffi {
             polling_strategy_value: u64,
             count: u32,
             auto_commit: bool,
+            error_info: &mut ErrorInfo,
         ) -> Result<PolledMessages>;
         /// Polls under `context`, normally the one returned with the offset the
         /// poll continues from. Every retry keeps it.
@@ -649,6 +777,7 @@ mod ffi {
             count: u32,
             auto_commit: bool,
             context: PartitionContext,
+            error_info: &mut ErrorInfo,
         ) -> Result<PolledMessages>;
 
         fn make_message(payload: Vec<u8>, user_headers: Vec<HeaderEntry>) -> IggyMessageToSend;
@@ -661,6 +790,7 @@ mod ffi {
             partitioning_kind: String,
             partitioning_value: Vec<u8>,
             messages: Vec<IggyMessageToSend>,
+            error_info: &mut ErrorInfo,
         ) -> Result<SendMessagesResponse>;
         fn get_stats(self: &Client) -> Result<Stats>;
         fn get_me(self: &Client) -> Result<ClientInfoDetails>;
@@ -670,6 +800,13 @@ mod ffi {
         /// "user". A scope with no keys yet answers with an empty vector, which
         /// is an empty catalog rather than a failure.
         fn describe_options(self: &Client, scope: String) -> Result<Vec<OptionSpec>>;
+        /// Fingerprint of a 32-byte stream key, computed locally.
+        fn encryption_key_fingerprint(key: &[u8], error_info: &mut ErrorInfo) -> Result<String>;
+        /// Fingerprint of a stream key given as canonical padded base64.
+        fn encryption_key_fingerprint_base64(
+            key: &str,
+            error_info: &mut ErrorInfo,
+        ) -> Result<String>;
         fn ping(self: &Client) -> Result<()>;
         fn heartbeat_interval(self: &Client) -> u64;
         fn snapshot(
@@ -677,7 +814,12 @@ mod ffi {
             snapshot_compression: String,
             snapshot_types: Vec<String>,
         ) -> Result<Vec<u8>>;
-        fn send_binary_request(self: &Client, code: u32, payload: Vec<u8>) -> Result<Vec<u8>>;
+        fn send_binary_request(
+            self: &Client,
+            code: u32,
+            payload: Vec<u8>,
+            error_info: &mut ErrorInfo,
+        ) -> Result<Vec<u8>>;
 
         fn disconnect(self: &Client) -> Result<()>;
         fn shutdown(self: &Client) -> Result<()>;
@@ -688,9 +830,11 @@ mod ffi {
             topic_id: Identifier,
             partition_id: u32,
             segments_count: u32,
+            error_info: &mut ErrorInfo,
         ) -> Result<()>;
         fn get_user(self: &Client, user_id: Identifier) -> Result<UserInfoDetails>;
         fn get_users(self: &Client) -> Result<Vec<UserInfo>>;
+        #[allow(clippy::too_many_arguments)]
         fn create_user(
             self: &Client,
             username: String,
@@ -698,28 +842,33 @@ mod ffi {
             status: UserStatus,
             has_permissions: bool,
             permissions: Permissions,
+            options: UserCreateOptions,
+            error_info: &mut ErrorInfo,
         ) -> Result<UserInfoDetails>;
-        fn delete_user(self: &Client, user_id: Identifier) -> Result<()>;
+        fn delete_user(
+            self: &Client,
+            user_id: Identifier,
+            error_info: &mut ErrorInfo,
+        ) -> Result<()>;
         fn update_user(
             self: &Client,
             user_id: Identifier,
-            has_username: bool,
-            username: String,
-            has_status: bool,
-            status: UserStatus,
-            options: Vec<HeaderEntry>,
+            options: UserUpdateOptions,
+            error_info: &mut ErrorInfo,
         ) -> Result<()>;
         fn update_permissions(
             self: &Client,
             user_id: Identifier,
             has_permissions: bool,
             permissions: Permissions,
+            error_info: &mut ErrorInfo,
         ) -> Result<()>;
         fn change_password(
             self: &Client,
             user_id: Identifier,
             current_password: String,
             new_password: String,
+            error_info: &mut ErrorInfo,
         ) -> Result<()>;
         fn get_cluster_metadata(self: &Client) -> Result<ClusterMetadata>;
         // fn get_personal_access_tokens(self: &Client) -> Result<Vec<PersonalAccessTokenInfo>>;
