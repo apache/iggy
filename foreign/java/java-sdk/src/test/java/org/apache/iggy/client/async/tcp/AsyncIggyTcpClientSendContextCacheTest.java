@@ -23,6 +23,7 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.Request;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.Response;
+import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.Message;
@@ -34,6 +35,7 @@ import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -86,7 +88,7 @@ class AsyncIggyTcpClientSendContextCacheTest {
             send(client, 1, 0).get(5, TimeUnit.SECONDS);
 
             assertThat(fake.discoveries).hasValue(1);
-            assertThat(fake.sentIncarnations).containsExactly(1L, 1L, 1L);
+            assertThat(fake.sends).extracting(Request::incarnation).containsExactly(1L, 1L, 1L);
         });
     }
 
@@ -105,8 +107,67 @@ class AsyncIggyTcpClientSendContextCacheTest {
 
             assertThat(fake.historyRefusals).hasValue(1);
             assertThat(fake.discoveries).hasValue(5);
-            assertThat(fake.sentIncarnations).containsExactly(1L, 1L, 1L, 1L, 2L, 2L, 1L);
+            assertThat(fake.sends).extracting(Request::incarnation).containsExactly(1L, 1L, 1L, 1L, 2L, 2L, 1L);
+            assertThat(fake.sends).extracting(Request::requestId).doesNotHaveDuplicates();
+            assertThat(fake.sends.get(4).body()).isEqualTo(fake.sends.get(3).body());
         });
+    }
+
+    @Test
+    void shouldReturnTheSecondHistoryRefusalWithoutRestartingAgain() throws Exception {
+        assertSendContexts(new AtomicBoolean(), (client, fake) -> {
+            fake.refuseHistory = true;
+            assertServerError(send(client, 1, 0), HISTORY_UNAVAILABLE);
+            assertThat(fake.historyRefusals).hasValue(2);
+            assertThat(fake.discoveries).hasValue(2);
+            assertThat(fake.sends).hasSize(2).extracting(Request::requestId).doesNotHaveDuplicates();
+
+            fake.refuseHistory = false;
+            send(client, 1, 0).get(5, TimeUnit.SECONDS);
+            assertThat(fake.discoveries).hasValue(3);
+        });
+    }
+
+    @Test
+    void shouldKeepTheUncertainSendIdentityAfterHistoryRefusal() throws Exception {
+        try (ServerSocket socket = new ServerSocket(0, 4, InetAddress.getLoopbackAddress())) {
+            List<Request> sends = new CopyOnWriteArrayList<>();
+            AtomicInteger routes = new AtomicInteger();
+            CompletableFuture<Void> server = serve(socket, request -> {
+                if (request.operation() == OPERATION_REGISTER) {
+                    return Response.success(OPERATION_REGISTER, registerBody(1));
+                }
+                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(OPERATION_NON_REPLICATED, singleNodeMetadata(socket.getLocalPort()));
+                }
+                if (request.is(GET_PARTITION_ROUTE_CODE, OPERATION_NON_REPLICATED)) {
+                    routes.incrementAndGet();
+                    return Response.success(OPERATION_NON_REPLICATED, partitionRoute(Unpooled.buffer(), 1));
+                }
+                if (request.operation() == OPERATION_SEND_MESSAGES) {
+                    sends.add(request);
+                    return Response.error(
+                            OPERATION_SEND_MESSAGES,
+                            sends.size() == 1 ? AsyncTcpConnection.TRANSIENT_NOT_COMMITTED : HISTORY_UNAVAILABLE);
+                }
+                throw new IllegalStateException("Unexpected request: " + request);
+            });
+            AsyncIggyTcpClient client = client(socket);
+            try {
+                client.connect().get(5, TimeUnit.SECONDS);
+                client.login().get(5, TimeUnit.SECONDS);
+                assertServerError(send(client, 1, 0), IggyErrorCode.OPERATION_UNCERTAIN.getCode());
+                assertThat(routes).hasValue(1);
+                assertThat(sends).hasSizeGreaterThanOrEqualTo(2);
+                assertThat(sends)
+                        .extracting(Request::requestId)
+                        .containsOnly(sends.get(0).requestId());
+                assertServerError(send(client, 1, 0), IggyErrorCode.LANE_BLOCKED.getCode());
+            } finally {
+                client.close().get(5, TimeUnit.SECONDS);
+            }
+            server.get(5, TimeUnit.SECONDS);
+        }
     }
 
     @Test
@@ -185,6 +246,139 @@ class AsyncIggyTcpClientSendContextCacheTest {
     }
 
     @Test
+    void shouldFreezeMessagesAndKeyBeforeRefreshingAMissingPartition() throws Exception {
+        for (Partitioning partitioning : List.of(Partitioning.balanced(), Partitioning.messagesKey("frozen-key"))) {
+            try (ServerSocket socket = new ServerSocket(0, 4, InetAddress.getLoopbackAddress())) {
+                Message message = Message.of("original");
+                List<Message> messages = new CopyOnWriteArrayList<>(List.of(message));
+                List<Request> sends = new CopyOnWriteArrayList<>();
+                byte[] originalKey = partitioning.value().clone();
+                CompletableFuture<Void> server = serve(socket, request -> {
+                    if (request.operation() == OPERATION_REGISTER) {
+                        return Response.success(OPERATION_REGISTER, registerBody(1));
+                    }
+                    if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                        return Response.success(OPERATION_NON_REPLICATED, singleNodeMetadata(socket.getLocalPort()));
+                    }
+                    if (request.is(GET_PARTITION_ROUTE_CODE, OPERATION_NON_REPLICATED)) {
+                        return Response.success(
+                                OPERATION_NON_REPLICATED,
+                                Unpooled.buffer()
+                                        .writeLongLE(1)
+                                        .writeLongLE(0)
+                                        .writeIntLE(0)
+                                        .writeIntLE(4)
+                                        .writeByte(0));
+                    }
+                    if (request.operation() == OPERATION_SEND_MESSAGES) {
+                        sends.add(request);
+                        if (sends.size() == 1) {
+                            Arrays.fill(message.payload(), (byte) 0);
+                            Arrays.fill(partitioning.value(), (byte) 0);
+                            messages.clear();
+                            return Response.error(OPERATION_SEND_MESSAGES, IggyErrorCode.PARTITION_NOT_FOUND.getCode());
+                        }
+                        return Response.success(OPERATION_SEND_MESSAGES, Unpooled.EMPTY_BUFFER);
+                    }
+                    throw new IllegalStateException("Unexpected request: " + request);
+                });
+                AsyncIggyTcpClient client = client(socket);
+                try {
+                    client.connect().get(5, TimeUnit.SECONDS);
+                    client.login().get(5, TimeUnit.SECONDS);
+                    client.messages()
+                            .sendMessages(STREAM, TopicId.of(1L), partitioning, messages)
+                            .get(5, TimeUnit.SECONDS);
+                    assertThat(sends).hasSize(2);
+                    byte[] first = sends.get(0).body();
+                    byte[] retried = sends.get(1).body();
+                    int batchOffset = ByteBuffer.wrap(first)
+                            .order(ByteOrder.LITTLE_ENDIAN)
+                            .getInt();
+                    assertThat(Arrays.copyOfRange(retried, batchOffset, retried.length))
+                            .containsExactly(Arrays.copyOfRange(first, batchOffset, first.length));
+                    if (originalKey.length > 0) {
+                        long expected = org.apache.iggy.hash.XxHash32.hashUnsigned(originalKey) % 4;
+                        assertThat(Integer.toUnsignedLong(ByteBuffer.wrap(retried)
+                                        .order(ByteOrder.LITTLE_ENDIAN)
+                                        .getInt(18)))
+                                .isEqualTo(expected);
+                    }
+                } finally {
+                    client.close().get(5, TimeUnit.SECONDS);
+                }
+                server.get(5, TimeUnit.SECONDS);
+            }
+        }
+    }
+
+    @Test
+    void shouldRefreshSdkChosenPartitionOnlyOnceAfterDefinitePartitionNotFound() throws Exception {
+        assertPartitionNotFound(Partitioning.balanced(), false, 2);
+    }
+
+    @Test
+    void shouldPreserveExplicitPartitionOnPartitionNotFound() throws Exception {
+        assertPartitionNotFound(Partitioning.partitionId(0L), false, 1);
+    }
+
+    @Test
+    void shouldKeepTheUncertainIdentityInsteadOfReselectingAfterPartitionNotFound() throws Exception {
+        assertPartitionNotFound(Partitioning.balanced(), true, 1);
+    }
+
+    private static void assertPartitionNotFound(Partitioning partitioning, boolean uncertain, int identities)
+            throws Exception {
+        try (ServerSocket socket = new ServerSocket(0, 4, InetAddress.getLoopbackAddress())) {
+            List<Request> sends = new CopyOnWriteArrayList<>();
+            AtomicInteger routes = new AtomicInteger();
+            CompletableFuture<Void> server = serve(socket, request -> {
+                if (request.operation() == OPERATION_REGISTER) {
+                    return Response.success(OPERATION_REGISTER, registerBody(1));
+                }
+                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(OPERATION_NON_REPLICATED, singleNodeMetadata(socket.getLocalPort()));
+                }
+                if (request.is(GET_PARTITION_ROUTE_CODE, OPERATION_NON_REPLICATED)) {
+                    routes.incrementAndGet();
+                    return Response.success(OPERATION_NON_REPLICATED, partitionRoute(Unpooled.buffer(), 1));
+                }
+                if (request.operation() == OPERATION_SEND_MESSAGES) {
+                    sends.add(request);
+                    int status = uncertain && sends.size() == 1
+                            ? AsyncTcpConnection.TRANSIENT_NOT_COMMITTED
+                            : IggyErrorCode.PARTITION_NOT_FOUND.getCode();
+                    return Response.error(OPERATION_SEND_MESSAGES, status);
+                }
+                throw new IllegalStateException("Unexpected request: " + request);
+            });
+            AsyncIggyTcpClient client = client(socket);
+            try {
+                client.connect().get(5, TimeUnit.SECONDS);
+                client.login().get(5, TimeUnit.SECONDS);
+                assertServerError(
+                        client.messages().sendMessages(STREAM, TopicId.of(1L), partitioning, List.of(Message.of("m"))),
+                        uncertain
+                                ? IggyErrorCode.OPERATION_UNCERTAIN.getCode()
+                                : IggyErrorCode.PARTITION_NOT_FOUND.getCode());
+                assertThat(sends.stream().map(Request::requestId).distinct()).hasSize(identities);
+                assertThat(routes).hasValue(identities);
+                if (uncertain) {
+                    assertServerError(
+                            client.messages()
+                                    .sendMessages(STREAM, TopicId.of(1L), partitioning, List.of(Message.of("next"))),
+                            IggyErrorCode.LANE_BLOCKED.getCode());
+                    assertThat(sends.stream().map(Request::requestId).distinct())
+                            .hasSize(1);
+                }
+            } finally {
+                client.close().get(5, TimeUnit.SECONDS);
+            }
+            server.get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
     void shouldBoundTheSharedRouteCache() {
         // Thousands of round trips through a fake server take longer than the
         // client's heartbeat interval, so this runs in memory.
@@ -222,11 +416,12 @@ class AsyncIggyTcpClientSendContextCacheTest {
                     return Response.success(OPERATION_NON_REPLICATED, partitionRoute(Unpooled.buffer(), incarnation));
                 }
                 if (request.operation() == OPERATION_SEND_MESSAGES) {
-                    fake.sentIncarnations.add(request.incarnation());
+                    fake.sends.add(request);
                     if (refuseNextSend.getAndSet(false)) {
                         return Response.error(OPERATION_SEND_MESSAGES, TOO_BIG_MESSAGE_PAYLOAD);
                     }
-                    if (request.incarnation() != fake.incarnation(request, SEND_MESSAGES_TOPIC_OFFSET)) {
+                    if (fake.refuseHistory
+                            || request.incarnation() != fake.incarnation(request, SEND_MESSAGES_TOPIC_OFFSET)) {
                         fake.historyRefusals.incrementAndGet();
                         return Response.error(OPERATION_SEND_MESSAGES, HISTORY_UNAVAILABLE);
                     }
@@ -265,7 +460,8 @@ class AsyncIggyTcpClientSendContextCacheTest {
         private final Map<Long, Long> incarnations = new ConcurrentHashMap<>();
         private final AtomicInteger discoveries = new AtomicInteger();
         private final AtomicInteger historyRefusals = new AtomicInteger();
-        private final List<Long> sentIncarnations = new CopyOnWriteArrayList<>();
+        private final List<Request> sends = new CopyOnWriteArrayList<>();
+        private volatile boolean refuseHistory;
 
         private long incarnation(Request request, int topicOffset) {
             long topic = ByteBuffer.wrap(request.body())

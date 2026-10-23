@@ -188,18 +188,14 @@ public sealed class BinaryMapper
         var topicsCount = 1u;
         var streamPayload
             = BinaryFactory.CreateStreamPayload(id, topicsCount, name, sizeBytes, messagesCount, createdAt);
-        var (topicId1, partitionsCount1, topicName1, messageExpiry1, topicSizeBytes1, messagesCountTopic1,
-                createdAtTopic, maxTopicSize) =
+        var (topicId1, partitionsCount1, topicName1, _, topicSizeBytes1, messagesCountTopic1, _, _) =
             TopicFactory.CreateTopicResponseFields();
         var topicPayload1 = BinaryFactory.CreateTopicPayload(topicId1,
             partitionsCount1,
-            messageExpiry1,
             topicName1,
             topicSizeBytes1,
             messagesCountTopic1,
-            createdAt,
-            maxTopicSize,
-            1);
+            createdAt);
 
         var topicCombinedPayload = new byte[topicPayload1.Length];
         topicPayload1.CopyTo(topicCombinedPayload.AsSpan());
@@ -233,16 +229,15 @@ public sealed class BinaryMapper
     public void MapTopics_ReturnsValidTopicsResponses()
     {
         // Arrange
-        var (id1, partitionsCount1, name1, messageExpiry1, sizeBytesTopic1, messagesCountTopic1, createdAt,
-                maxTopicSize1) =
+        var (id1, partitionsCount1, name1, _, sizeBytesTopic1, messagesCountTopic1, createdAt, _) =
             TopicFactory.CreateTopicResponseFields();
-        var payload1 = BinaryFactory.CreateTopicPayload(id1, partitionsCount1, messageExpiry1, name1,
-            sizeBytesTopic1, messagesCountTopic1, createdAt, maxTopicSize1, 1);
-        var (id2, partitionsCount2, name2, messageExpiry2, sizeBytesTopic2, messagesCountTopic2, createdAt2,
-                maxTopicSize2) =
+        var payload1 = BinaryFactory.CreateTopicPayload(id1, partitionsCount1, name1,
+            sizeBytesTopic1, messagesCountTopic1, createdAt);
+        var (id2, partitionsCount2, name2, _, sizeBytesTopic2, messagesCountTopic2, createdAt2, _) =
             TopicFactory.CreateTopicResponseFields();
-        var payload2 = BinaryFactory.CreateTopicPayload(id2, partitionsCount2, messageExpiry2, name2,
-            sizeBytesTopic2, messagesCountTopic2, createdAt2, maxTopicSize2, 2);
+        var payload2 = BinaryFactory.CreateTopicPayload(id2, partitionsCount2, name2,
+            sizeBytesTopic2, messagesCountTopic2, createdAt2,
+            BinaryFactory.CreateOptionEntry(2, "compression_algorithm", 2, "gzip"u8.ToArray()));
 
         // GetTopics replies start with the topics count.
         var combinedPayload = new byte[4 + payload1.Length + payload2.Length];
@@ -280,8 +275,10 @@ public sealed class BinaryMapper
         // Arrange
         var (topicId, partitionsCount, topicName, messageExpiry, sizeBytes, messagesCount, createdAt2,
             maxTopicSize) = TopicFactory.CreateTopicResponseFields();
-        var topicPayload = BinaryFactory.CreateTopicPayload(topicId, partitionsCount, messageExpiry, topicName,
-            sizeBytes, messagesCount, createdAt2, maxTopicSize, 1);
+        var topicPayload = BinaryFactory.CreateTopicPayload(topicId, partitionsCount, topicName,
+            sizeBytes, messagesCount, createdAt2,
+            BinaryFactory.CreateOptionEntry(2, "message_expiry", 12, BitConverter.GetBytes((ulong)messageExpiry)),
+            BinaryFactory.CreateOptionEntry(2, "max_topic_size", 12, BitConverter.GetBytes(maxTopicSize)));
 
         var combinedPayload = new byte[topicPayload.Length];
         topicPayload.CopyTo(combinedPayload.AsSpan());
@@ -297,18 +294,20 @@ public sealed class BinaryMapper
         Assert.Equal(topicId, response.Id);
         Assert.Equal(topicName, response.Name);
         Assert.Equal(CompressionAlgorithm.None, response.CompressionAlgorithm);
+        Assert.Equal(TimeSpan.FromMicroseconds(messageExpiry), response.MessageExpiry);
+        Assert.Equal(maxTopicSize, response.MaxTopicSize);
     }
 
     [Fact]
     public void MapTopic_ReadsAPartitionRecordWithItsContext()
     {
-        var (topicId, partitionsCount, topicName, messageExpiry, sizeBytes, messagesCount, createdAt,
-            maxTopicSize) = TopicFactory.CreateTopicResponseFields();
+        var (topicId, partitionsCount, topicName, _, sizeBytes, messagesCount, createdAt, _) =
+            TopicFactory.CreateTopicResponseFields();
         var context = new PartitionContext(17, 9, 52);
         byte[] payload =
         [
-            ..BinaryFactory.CreateTopicPayload(topicId, partitionsCount, messageExpiry, topicName, sizeBytes,
-                messagesCount, createdAt, maxTopicSize, 1),
+            ..BinaryFactory.CreateTopicPayload(topicId, partitionsCount, topicName, sizeBytes, messagesCount,
+                createdAt),
             ..BinaryFactory.CreatePartitionPayload(3, createdAt, 7, 101, 2048, 102, context)
         ];
 
@@ -330,14 +329,14 @@ public sealed class BinaryMapper
         // Arrange: an option kind a newer server may introduce, between two this build knows.
         const byte stringKind = 2;
         const byte unknownKind = 200;
-        var (topicId, partitionsCount, topicName, messageExpiry, sizeBytes, messagesCount, createdAt,
-            maxTopicSize) = TopicFactory.CreateTopicResponseFields();
+        var (topicId, partitionsCount, topicName, _, sizeBytes, messagesCount, createdAt, _) =
+            TopicFactory.CreateTopicResponseFields();
         var options = new List<byte>();
         options.AddRange(BinaryFactory.CreateOptionEntry(stringKind, "segment_size", stringKind, "1GB"u8.ToArray()));
         options.AddRange(BinaryFactory.CreateOptionEntry(stringKind, "future_option", unknownKind, [0xAA, 0xBB]));
         options.AddRange(BinaryFactory.CreateOptionEntry(stringKind, "preallocate_segments", 3, [1]));
-        var topicPayload = BinaryFactory.CreateTopicPayload(topicId, partitionsCount, messageExpiry, topicName,
-            sizeBytes, messagesCount, createdAt, maxTopicSize, 1, options.ToArray());
+        var topicPayload = BinaryFactory.CreateTopicPayload(topicId, partitionsCount, topicName,
+            sizeBytes, messagesCount, createdAt, options.ToArray());
 
         // Act
         var response = Mappers.BinaryMapper.MapTopic(topicPayload);
@@ -359,11 +358,11 @@ public sealed class BinaryMapper
         // Arrange: a Uint64 value carrying three bytes, which the Rust decoder rejects too.
         const byte stringKind = 2;
         const byte uint64Kind = 12;
-        var (topicId, partitionsCount, topicName, messageExpiry, sizeBytes, messagesCount, createdAt,
-            maxTopicSize) = TopicFactory.CreateTopicResponseFields();
+        var (topicId, partitionsCount, topicName, _, sizeBytes, messagesCount, createdAt, _) =
+            TopicFactory.CreateTopicResponseFields();
         var options = BinaryFactory.CreateOptionEntry(stringKind, "segment_size", uint64Kind, [1, 2, 3]);
-        var topicPayload = BinaryFactory.CreateTopicPayload(topicId, partitionsCount, messageExpiry, topicName,
-            sizeBytes, messagesCount, createdAt, maxTopicSize, 1, options);
+        var topicPayload = BinaryFactory.CreateTopicPayload(topicId, partitionsCount, topicName,
+            sizeBytes, messagesCount, createdAt, options);
 
         // Act + Assert
         Assert.Throws<MalformedResponseException>(() => Mappers.BinaryMapper.MapTopic(topicPayload));
@@ -372,7 +371,7 @@ public sealed class BinaryMapper
     [Fact]
     public void MapOptionSpecs_ReturnsTheCatalogWithKindsAndDefaults()
     {
-        // Arrange: [count][key_len][key][kind][default_len][default][description_len][description]
+        // Arrange: [count][key_len][key][kind][flags][default_len][default][description_len][description]
         const string key = "segment_size";
         const string description = "Segment size in bytes";
         var defaultValue = new byte[8];
@@ -383,6 +382,7 @@ public sealed class BinaryMapper
         payload.Add((byte)key.Length);
         payload.AddRange(Encoding.UTF8.GetBytes(key));
         payload.Add(12); // Uint64 wire code
+        payload.Add(0b11); // updatable and resettable
         payload.AddRange(BitConverter.GetBytes((uint)defaultValue.Length));
         payload.AddRange(defaultValue);
         payload.AddRange(BitConverter.GetBytes((uint)description.Length));
@@ -395,6 +395,11 @@ public sealed class BinaryMapper
         var spec = Assert.Single(specs);
         Assert.Equal(key, spec.Key);
         Assert.Equal(HeaderKind.Uint64, spec.Kind);
+        Assert.True(spec.Updatable);
+        Assert.True(spec.Resettable);
+        Assert.False(spec.Secret);
+        Assert.False(spec.ReadOnly);
+        Assert.False(spec.Critical);
         Assert.Equal(defaultValue, spec.DefaultValue);
         Assert.Equal(description, spec.Description);
     }
@@ -408,6 +413,7 @@ public sealed class BinaryMapper
         payload.Add(4);
         payload.AddRange(Encoding.UTF8.GetBytes("size"));
         payload.Add(12);
+        payload.Add(0);
         payload.AddRange(BitConverter.GetBytes(64u)); // claims 64 bytes that are not there
 
         Assert.Throws<MalformedResponseException>(() =>

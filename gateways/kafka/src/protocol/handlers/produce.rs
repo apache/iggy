@@ -694,7 +694,6 @@ mod tests {
 
     use crate::group::{GroupCoordinator, GroupCoordinatorConfig};
     use crate::protocol::acl::PrincipalPermissions;
-    use crate::protocol::api::BrokerAdvertise;
     use crate::records::encode_batch;
 
     const CREATE_TIME: i64 = 1_700_000_000_123;
@@ -845,7 +844,7 @@ mod tests {
 
     #[test]
     fn given_a_producer_id_this_gateway_gave_out_when_keyed_should_take_it_with_its_user() {
-        let state = GatewayState::stub(BrokerAdvertise::default(), FRAME);
+        let state = GatewayState::stub(FRAME);
         let id = state.producer_ids.allocate().expect("an id");
         let request = request_of(vec![entry(0, Some(batch_of(id)))]);
         let connection = ConnectionState::default();
@@ -866,7 +865,7 @@ mod tests {
 
     #[test]
     fn given_a_producer_id_a_client_made_up_when_keyed_should_take_the_connection() {
-        let state = GatewayState::stub(BrokerAdvertise::default(), FRAME);
+        let state = GatewayState::stub(FRAME);
         let connection = ConnectionState::default();
         let issued = state.producer_ids.allocate().expect("an id");
 
@@ -882,7 +881,7 @@ mod tests {
 
     #[test]
     fn given_a_batch_without_a_producer_id_when_keyed_should_take_the_connection() {
-        let state = GatewayState::stub(BrokerAdvertise::default(), FRAME);
+        let state = GatewayState::stub(FRAME);
         let batch = compressed_batch(&[record(0, b"v")], Compression::None);
         let request = request_of(vec![entry(0, Some(batch))]);
         let connection = ConnectionState::default();
@@ -992,7 +991,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn given_the_large_slots_taken_when_a_small_request_comes_should_admit_it() {
-        let state = GatewayState::stub(BrokerAdvertise::default(), FRAME);
+        let state = GatewayState::stub(FRAME);
         let _large = large_slots_taken(&state, FRAME).await;
 
         let fifth = admit(&state, CODEC_OFF_WORKER_BYTES);
@@ -1009,7 +1008,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn given_the_large_slots_taken_when_a_large_request_waits_should_hold_no_memory() {
-        let state = GatewayState::stub(BrokerAdvertise::default(), FRAME);
+        let state = GatewayState::stub(FRAME);
         let _large = large_slots_taken(&state, CODEC_OFF_WORKER_BYTES).await;
         let free = state.produce_memory.available_permits();
 
@@ -1027,10 +1026,8 @@ mod tests {
     /// server.
     fn offline_state() -> GatewayState {
         GatewayState::new(
-            BrokerAdvertise::default(),
             Some(Arc::new(IggyBridge::offline())),
             FRAME,
-            false,
             0,
             GroupCoordinator::new(GroupCoordinatorConfig::default(), CancellationToken::new()),
         )

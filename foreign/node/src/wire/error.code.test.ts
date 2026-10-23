@@ -85,3 +85,12 @@ it('translates the consumer-group error range', () => {
   assert.equal(translateErrorCode(5010), 'Too many consumer groups');
   assert.equal(translateErrorCode(5011), 'error');
 });
+
+it('translates the resource option refusals', () => {
+  assert.equal(translateErrorCode(4103), 'Option cannot be updated after creation: {0}');
+  assert.equal(translateErrorCode(4104), 'Option cannot be reset: {0}');
+  assert.equal(translateErrorCode(4105), 'Option is read-only: {0}');
+  assert.equal(translateErrorCode(4106), 'Stream encryption key requires a server encryption key');
+  assert.equal(translateErrorCode(4107), 'Unsupported critical option: {0}');
+  assert.equal(translateErrorCode(4108), 'Cannot modify root user');
+});

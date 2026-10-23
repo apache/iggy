@@ -173,11 +173,13 @@ pub(crate) enum Command {
     /// client address as seen by the server and protocol type.
     #[clap(verbatim_doc_comment)]
     Me,
-    /// list the options a resource's create command accepts
+    /// list the option catalog of a resource scope
     ///
     /// Prints the server's option catalog for one scope (topic, stream, user):
-    /// every key, the kind its default is reported in, that default, and the
-    /// bounds each value is checked against. These are the keys `--set` takes.
+    /// every key, the kind its default is reported in, that default, and what a
+    /// client may do with it (create only, updatable, resettable, read only,
+    /// secret, critical). Create-only keys go to `--set` on topic create,
+    /// updatable keys to `--set` and `--reset` on topic and stream update.
     #[clap(verbatim_doc_comment)]
     Options(OptionsArgs),
     /// get iggy server statistics

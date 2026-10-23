@@ -19,31 +19,42 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use iggy::prelude::{
     AutoLogin, Client, Credentials, Identifier, IggyClient, IggyClientBuilder, IggyError,
     UserClient,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::time::{Instant, timeout_at};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
+use crate::auth::{AuthError, AuthenticatedPrincipal, PrincipalResolver, resolve_principal};
 use crate::bridge::config::IggyBridgeConfig;
 use crate::bridge::error::BridgeError;
 use crate::bridge::topic_map::validate_kafka_topic_name;
 
+mod cluster_id;
 mod fetch;
+mod group_index;
 mod group_offsets;
 mod offsets;
 mod produce;
 mod topics;
 
+pub use cluster_id::{CLUSTER_ID_TOPIC, ClusterIdCall, cluster_id_stream};
 use fetch::{FetchPool, LazyClient};
 pub(crate) use fetch::{FetchSlot, PartitionProbe, TopicProbe};
+use group_index::GroupIndex;
+pub use group_index::{OffsetGroups, ScannedGroups};
 use group_offsets::OffsetPool;
 pub use group_offsets::{OFFSET_GROUP_PREFIX, OffsetCalls};
+pub(crate) use offsets::{LocatedRecord, RecordLookup};
 use produce::ProducePool;
 pub use produce::{ProduceTurn, Producer};
-pub use topics::{KafkaTopicMetadata, StreamTopicCache, TopicCreationOutcome, TopicLoad};
+pub use topics::{
+    DEFAULT_TOPIC_PARTITIONS, KafkaTopicMetadata, MAX_TOPIC_PARTITIONS, StreamTopicCache,
+    TopicCreationOutcome, TopicLoad,
+};
 
 /// Passes attempted, after the first, before [`IggyBridge::connect`] gives up and returns `Err`.
 ///
@@ -72,8 +83,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Wraps a single Iggy client call in [`REQUEST_TIMEOUT`].
 ///
-/// On expiry, maps to [`BridgeError::Timeout`], not `IggyError::CannotEstablishConnection`: the
-/// SDK's write/read run in a detached task this timeout cannot abort, so the call may still land.
+/// On expiry, a sent mutation can still commit and remains retained by the SDK.
+/// Metadata writes recover such blockers through [`IggyBridge::metadata_write`].
 async fn with_request_timeout<T>(
     op: impl Future<Output = Result<T, IggyError>>,
 ) -> Result<T, BridgeError> {
@@ -106,7 +117,7 @@ const SLOT_LIMIT: Duration = Duration::from_secs(45);
 /// its connection. A Fetch poll then drops that connection (`LazyClient::until`). An offset
 /// commit keeps it, so the next commit waits behind it in the SDK and commits stay in order. A
 /// Produce send closes it before the slot frees (`LazyClient::retire`).
-async fn in_slot<S: Send + 'static, T: Send + 'static>(
+pub(crate) async fn in_slot<S: Send + 'static, T: Send + 'static>(
     slot: S,
     deadline: Instant,
     call: impl Future<Output = T> + Send + 'static,
@@ -131,15 +142,16 @@ async fn permit_by(turn: &Arc<Semaphore>, deadline: Instant) -> Option<OwnedSema
 /// Owns the connected `IggyClient`s and resolves Kafka topics against them.
 ///
 /// Each producer sends on a client of its own, one request at a time. Producers past the session
-/// limit share one more. Metadata, `CreateTopics`, `DeleteTopics`, `DescribeConfigs` and
-/// `AlterConfigs` share another. Topic probes use a client of their own, Fetch polls one per read
-/// slot, and offset calls two per offset slot.
+/// limit share one more. Metadata, `CreateTopics`, `DeleteTopics`, `CreatePartitions`,
+/// `DescribeConfigs` and `AlterConfigs` share another. Topic probes, certificate user lookups and
+/// `Metadata`'s auto topic creations each use a client of their own, Fetch polls one per read
+/// slot, offset calls two per offset slot, and the scan for the groups that hold offsets one more.
 ///
 /// Each client signs in at the metadata leader, and a view change or a refused call can move it to
 /// another node. So in a cluster, two clients can read replicas that are not at the same offset.
 pub struct IggyBridge {
-    /// The client of Metadata, `CreateTopics`, `DeleteTopics`, `DescribeConfigs` and
-    /// `AlterConfigs`.
+    /// The client of Metadata, `CreateTopics`, `DeleteTopics`, `CreatePartitions`,
+    /// `DescribeConfigs` and `AlterConfigs`.
     client: Arc<IggyClient>,
     config: IggyBridgeConfig,
     /// One Iggy session per producer. See `produce_turn`.
@@ -148,11 +160,20 @@ pub struct IggyBridge {
     fetch_pool: Arc<FetchPool>,
     /// The client of every topic probe, Fetch's and `ListOffsets`'. See `probe`.
     probe_client: LazyClient,
+    /// The client of every certificate user lookup. See `resolve`.
+    lookup_client: LazyClient,
+    /// The client of every auto topic creation. See `auto_create_kafka_topic`.
+    auto_create_client: LazyClient,
     /// Group offset slots, each with a commit client and a read client. See `OffsetPool`.
     offset_pool: OffsetPool,
+    /// The Kafka groups that hold offsets. See `offset_groups`.
+    group_index: GroupIndex,
+    /// The client of the scan that finds those groups, so no offset call waits behind it.
+    scan_client: LazyClient,
 }
 
 /// The Iggy stream and topic one Kafka topic maps to. Resolve once per topic, use many times.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TopicTarget {
     stream_id: Identifier,
     topic_id: Identifier,
@@ -189,7 +210,11 @@ impl IggyBridge {
             produce_pool,
             fetch_pool: Arc::new(FetchPool::new()),
             probe_client: LazyClient::default(),
+            lookup_client: LazyClient::default(),
+            auto_create_client: LazyClient::default(),
             offset_pool: OffsetPool::new(),
+            group_index: GroupIndex::new(),
+            scan_client: LazyClient::default(),
         })
     }
 
@@ -220,6 +245,25 @@ impl IggyBridge {
         (stream.to_string(), topic.to_string())
     }
 
+    /// Whether `kafka_topic` is no override's key yet resolves to an override's Iggy topic. See
+    /// [`TopicMapping::aliases_an_override`](crate::bridge::TopicMapping::aliases_an_override).
+    #[must_use]
+    pub(crate) fn aliases_an_override(&self, kafka_topic: &str) -> bool {
+        self.config.topic_mapping.aliases_an_override(kafka_topic)
+    }
+
+    /// Drops the auto topic creation client without signing it out, so [`Self::close`] does not
+    /// wait behind a creation still running on it. Iggy ends its session when the lease runs out.
+    pub(crate) fn discard_auto_create_client(&self) {
+        self.auto_create_client.discard();
+    }
+
+    /// Whether the auto topic creation client is in its slot.
+    #[cfg(test)]
+    pub(crate) async fn holds_auto_create_client(&self) -> bool {
+        self.auto_create_client.held().await.is_some()
+    }
+
     /// Signs out and tears down every Iggy client, including its background heartbeat task.
     ///
     /// Not `IggyClient::disconnect`: that only tears down the transport
@@ -245,18 +289,81 @@ impl IggyBridge {
     /// one fails, and the error is the first one.
     pub async fn close(&self) -> Result<(), BridgeError> {
         // At once, so a client that is slow to close does not use up the time of the others.
-        let (produce_clients, fetch_clients, probe_client, offset_clients, shared_client) = tokio::join!(
+        let (
+            produce_clients,
+            fetch_clients,
+            probe_client,
+            lookup_client,
+            auto_create_client,
+            offset_clients,
+            scan_client,
+            shared_client,
+        ) = tokio::join!(
             self.produce_pool.close(),
             self.fetch_pool.close(),
             self.probe_client.close(),
+            self.lookup_client.close(),
+            self.auto_create_client.close(),
             self.offset_pool.close(),
+            self.scan_client.close(),
             sign_out_and_shut_down(&self.client),
         );
         produce_clients
             .and(fetch_clients)
             .and(probe_client)
+            .and(lookup_client)
+            .and(auto_create_client)
             .and(offset_clients)
+            .and(scan_client)
             .and(shared_client)
+    }
+
+    /// Recovers a canceled metadata write before submitting a later, unsent one.
+    /// A timeout keeps the SDK's retained request and never retries it as a new mutation.
+    async fn metadata_write<T, F: Future<Output = Result<T, IggyError>>>(
+        &self,
+        write: impl FnMut() -> F,
+    ) -> Result<T, BridgeError> {
+        metadata_write_on(&self.client, write).await
+    }
+}
+
+/// [`IggyBridge::metadata_write`] on `client`, for the writes that run on the admin client or on
+/// the auto topic creation client.
+async fn metadata_write_on<T, F: Future<Output = Result<T, IggyError>>>(
+    client: &IggyClient,
+    mut write: impl FnMut() -> F,
+) -> Result<T, BridgeError> {
+    let deadline = (Instant::now() + REQUEST_TIMEOUT).into_std();
+    with_request_timeout(write_with_recovery(client, deadline, &mut write)).await
+}
+
+async fn write_with_recovery<T, F: Future<Output = Result<T, IggyError>>>(
+    client: &IggyClient,
+    deadline: std::time::Instant,
+    mut write: impl FnMut() -> F,
+) -> Result<T, IggyError> {
+    loop {
+        match write().await {
+            Err(IggyError::LaneBlocked(operation)) => {
+                resolve_blocker(client, operation, deadline).await?;
+            }
+            result => return result,
+        }
+    }
+}
+
+async fn resolve_blocker(
+    client: &IggyClient,
+    operation: u64,
+    deadline: std::time::Instant,
+) -> Result<(), IggyError> {
+    match client.resolve_operation(operation, deadline).await {
+        Err(error @ (IggyError::OperationUncertain(_) | IggyError::OperationNotRetained(_))) => {
+            Err(error)
+        }
+        // A proved rejection belongs to the earlier call and releases its lane too.
+        _ => Ok(()),
     }
 }
 
@@ -281,14 +388,22 @@ impl IggyBridge {
             .expect("a valid mapping"),
             max_message_size: crate::bridge::DEFAULT_MAX_MESSAGE_SIZE,
             produce_sessions: crate::bridge::ProduceSessionLimits::default(),
+            tls: crate::bridge::IggyTls::default(),
         };
+        let client = Arc::new(client);
         Self {
-            client: Arc::new(client),
+            // Held rather than lazy, so an auto topic creation fails at once instead of dialing.
+            auto_create_client: LazyClient::holding(Arc::clone(&client)),
+            // Held for the same reason, so a scan of the groups that hold offsets fails at once.
+            scan_client: LazyClient::holding(Arc::clone(&client)),
+            client,
             produce_pool: Arc::new(ProducePool::new(config.produce_sessions)),
             config,
             fetch_pool: Arc::new(FetchPool::new()),
             probe_client: LazyClient::default(),
+            lookup_client: LazyClient::default(),
             offset_pool: OffsetPool::new(),
+            group_index: GroupIndex::new(),
         }
     }
 }
@@ -305,14 +420,60 @@ async fn connect_client(config: &IggyBridgeConfig) -> Result<IggyClient, BridgeE
         Credentials::UsernamePassword(config.username.clone(), config.password.clone());
     // A send over the SDK's 8 KiB write buffer leaves as two writes, header then payload. With
     // Nagle on, the payload waits for the server's delayed ACK of the header: about 40 ms a send.
-    let client = IggyClientBuilder::new()
+    let mut builder = IggyClientBuilder::new()
         .with_tcp()
         .with_server_address(config.address.clone())
         .with_no_delay()
         .with_auto_sign_in(AutoLogin::Enabled(credentials))
-        .with_reconnection_max_retries(Some(RECONNECTION_RETRIES))
-        .build()
-        .map_err(BridgeError::Iggy)?;
+        .with_reconnection_max_retries(Some(RECONNECTION_RETRIES));
+    if config.tls.enabled {
+        builder = builder.with_tls_enabled(true);
+        if !config.tls.domain.is_empty() {
+            builder = builder.with_tls_domain(config.tls.domain.clone());
+        }
+        if let Some(ref ca_file) = config.tls.ca_file {
+            builder = builder.with_tls_ca_file(ca_file.clone());
+        }
+    }
+    let client = builder.build().map_err(BridgeError::Iggy)?;
     with_request_timeout(client.connect()).await?;
     Ok(client)
+}
+
+impl std::fmt::Debug for IggyBridge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IggyBridge").finish_non_exhaustive()
+    }
+}
+
+/// A session of the bridge's own answers for the users client certificates name. It runs as the
+/// bridge's Iggy user, so that account needs `read_users` for any certificate to be admitted.
+///
+/// Not the lockstep client: a stuck Produce send would hold every new mTLS connection past its
+/// handshake budget, and a burst of handshakes would queue ahead of Produce.
+///
+/// Detached because the caller's `pre_auth_timeout` can be shorter than `REQUEST_TIMEOUT`:
+/// cancelling the lookup there would also cancel the deadline that drops a stuck client, and
+/// every later lookup would queue behind it.
+#[async_trait]
+impl PrincipalResolver for IggyBridge {
+    async fn resolve(&self, username: &str) -> Result<AuthenticatedPrincipal, AuthError> {
+        let username = username.to_owned();
+        let lookup = |connected: Arc<IggyClient>| async move {
+            Ok(resolve_principal(connected.as_ref(), &username).await)
+        };
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        let config = self.config.clone();
+        match self
+            .lookup_client
+            .until_detached(config, deadline, lookup)
+            .await
+        {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                warn!(%error, "could not reach Iggy to look up the certificate's user");
+                Err(AuthError::Unavailable)
+            }
+        }
+    }
 }

@@ -24,7 +24,6 @@ use iggy::prelude::{
     IggyProducer as RustIggyProducer, OrderedSharding,
     SendMessagesConfirmationResponse as RustSendMessagesConfirmationResponse, Sharding,
 };
-use pyo3::IntoPyObjectExt;
 use pyo3::conversion::FromPyObject;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -34,6 +33,7 @@ use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_enum, gen_stub_py
 use pyo3_stub_gen::{PyStubType, TypeInfo};
 use tokio::sync::{RwLock, Semaphore};
 
+use crate::client::{PyIggyError, to_runtime_error};
 use crate::duration::{duration_repr, iggy_duration_to_py_delta, py_delta_to_iggy_duration};
 use crate::partitioning::Partitioning;
 use crate::send_message::{SendMessage, SendMessagesConfirmation, SendMessagesResponse};
@@ -388,18 +388,27 @@ impl BackgroundProducerConfig {
     }
 }
 
-/// A direct producer error that preserves partial-send recovery state.
+/// A direct producer error that preserves partial-send recovery state. Its
+/// `__cause__` is the `IggyError` that ended the send.
 #[gen_stub_pyclass]
-#[pyclass(frozen, extends=PyRuntimeError)]
+#[pyclass(frozen, extends=PyIggyError)]
 pub struct ProducerSendError {
     cause: String,
+    operation_id: Option<u64>,
     failed: Arc<Vec<RustIggyMessage>>,
+    uncertain: usize,
     committed: Arc<Vec<RustSendMessagesConfirmationResponse>>,
 }
 
 #[gen_stub_pymethods]
 #[pymethods]
 impl ProducerSendError {
+    /// The retained operation to resolve or abandon, when the send is uncertain or blocked.
+    #[getter]
+    fn operation_id(&self) -> Option<u64> {
+        self.operation_id
+    }
+
     /// The underlying Iggy error message.
     #[getter]
     fn cause(&self) -> &str {
@@ -407,14 +416,25 @@ impl ProducerSendError {
     }
 
     /// Messages without a usable confirmation after the failure.
-    /// An encryptor can leave these messages encrypted, so do not submit them
-    /// to the same producer without restoring their original payloads.
+    /// For an `uncertain` cause, the first `uncertain` messages may already have
+    /// committed: resolve its operation ID without resubmitting them as a new send.
+    /// For `lane_blocked`, none of these messages was sent; resolve the earlier
+    /// blocker before retrying. `not_retained` does not prove non-commit.
+    /// Before any safe resubmission, restore payloads changed by encryption.
     #[getter]
     fn failed(&self) -> Vec<SendMessage> {
         self.failed
             .iter()
             .map(SendMessage::clone_from_rust)
             .collect()
+    }
+
+    /// How many messages at the head of `failed` may have committed: those the
+    /// operation of an `uncertain` cause carried, or those of an HTTP send whose
+    /// outcome is unknown (code 57). Zero for any other cause.
+    #[getter]
+    fn uncertain(&self) -> usize {
+        self.uncertain
     }
 
     /// Confirmations returned for chunks committed before the failure.
@@ -429,21 +449,26 @@ impl ProducerSendError {
 
 impl ProducerSendError {
     fn new_err(
+        coded: PyIggyError,
         cause: IggyError,
         failed: Arc<Vec<RustIggyMessage>>,
+        uncertain: usize,
         committed: Arc<Vec<RustSendMessagesConfirmationResponse>>,
     ) -> PyErr {
         Python::attach(|py| {
-            let cause = cause.to_string();
+            let operation_id = cause.operation_id();
             let message = format!("Producer send failed: {cause}");
-            let cause_error = PyRuntimeError::new_err(cause.clone());
+            let cause_message = cause.to_string();
+            let cause_error = to_runtime_error(cause);
             let instance = match Bound::new(
                 py,
-                Self {
-                    cause,
+                PyClassInitializer::from(coded).add_subclass(Self {
+                    cause: cause_message,
+                    operation_id,
                     failed,
+                    uncertain,
                     committed,
-                },
+                }),
             ) {
                 Ok(instance) => instance,
                 Err(error) => return error,
@@ -725,64 +750,6 @@ impl<'py> IntoPyObject<'py> for DefaultProducerSharding {
 }
 
 #[derive(Default)]
-pub(crate) enum RetryInterval {
-    #[default]
-    Omitted,
-    Disabled,
-    Duration(Py<PyDelta>),
-}
-
-impl<'a, 'py> FromPyObject<'a, 'py> for RetryInterval {
-    type Error = PyErr;
-
-    fn extract(object: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
-        if object.is_none() {
-            Ok(Self::Disabled)
-        } else {
-            Ok(Self::Duration(object.extract::<Py<PyDelta>>()?))
-        }
-    }
-}
-
-impl PyStubType for RetryInterval {
-    fn type_output() -> TypeInfo {
-        <std::time::Duration>::type_output() | TypeInfo::none()
-    }
-
-    fn type_input() -> TypeInfo {
-        <std::time::Duration>::type_input() | TypeInfo::none()
-    }
-}
-
-impl<'py> IntoPyObject<'py> for RetryInterval {
-    type Target = PyAny;
-    type Output = Bound<'py, PyAny>;
-    type Error = PyErr;
-
-    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
-        match self {
-            Self::Omitted => std::time::Duration::from_secs(1).into_bound_py_any(py),
-            Self::Disabled => Ok(py.None().into_bound(py)),
-            Self::Duration(duration) => Ok(duration.into_bound(py).into_any()),
-        }
-    }
-}
-
-impl RetryInterval {
-    pub(crate) fn resolve(self) -> PyResult<Option<iggy::prelude::NonZeroIggyDuration>> {
-        match self {
-            Self::Omitted => Ok(Some(iggy::prelude::NonZeroIggyDuration::ONE_SECOND)),
-            Self::Disabled => Ok(None),
-            Self::Duration(duration) => py_delta_to_iggy_duration(&duration).and_then(|duration| {
-                iggy::prelude::NonZeroIggyDuration::try_from(duration)
-                    .map(Some)
-                    .map_err(|_| PyValueError::new_err("'send_retry_interval' must not be zero"))
-            }),
-        }
-    }
-}
-
-#[derive(Default)]
 enum DefaultDuration {
     #[default]
     Zero,
@@ -890,14 +857,16 @@ fn clone_rust_message(message: &SendMessage) -> RustIggyMessage {
 }
 
 fn to_send_error(error: IggyError) -> PyErr {
+    let coded = PyIggyError::from(&error);
     match error {
         IggyError::ProducerSendFailed {
             cause,
             failed,
+            uncertain,
             committed,
             ..
-        } => ProducerSendError::new_err(*cause, failed, committed),
-        error => PyRuntimeError::new_err(error.to_string()),
+        } => ProducerSendError::new_err(coded, *cause, failed, uncertain, committed),
+        error => to_runtime_error(error),
     }
 }
 
@@ -928,6 +897,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
+    use crate::client::PendingOperationError;
     use iggy::clients::producer::ProducerCoreBackend;
     use iggy::clients::producer_dispatcher::ProducerDispatcher;
     use pyo3::exceptions::{PyOverflowError, PyRuntimeError, PyTypeError, PyValueError};
@@ -990,57 +960,124 @@ mod tests {
     fn producer_send_error_preserves_recovery_state() {
         Python::initialize();
         Python::attach(|py| {
-            let cause = IggyError::CannotSendMessagesDueToClientDisconnection;
-            let cause_message = cause.to_string();
-            let error = to_send_error(IggyError::ProducerSendFailed {
-                cause: Box::new(cause),
-                failed: Arc::new(vec![RustIggyMessage::from_str("failed").unwrap()]),
-                committed: Arc::new(vec![RustSendMessagesConfirmationResponse {
-                    stream_id: 1,
-                    topic_id: 2,
-                    partition_id: 3,
-                    base_offset: 4,
-                }]),
-                stream_name: "stream".to_owned(),
-                topic_name: "topic".to_owned(),
-            });
+            for cause in [
+                IggyError::CannotSendMessagesDueToClientDisconnection,
+                IggyError::OperationUncertain(u64::MAX),
+                IggyError::LaneBlocked((1u64 << 53) + 17),
+            ] {
+                let operation_id = match cause {
+                    IggyError::OperationUncertain(op) | IggyError::LaneBlocked(op) => Some(op),
+                    _ => None,
+                };
+                let cause_message = cause.to_string();
+                let cause_code = cause.as_code();
+                let uncertain = usize::from(matches!(cause, IggyError::OperationUncertain(_)));
+                let send_failed = IggyError::ProducerSendFailed {
+                    cause: Box::new(cause),
+                    failed: Arc::new(vec![RustIggyMessage::from_str("failed").unwrap()]),
+                    uncertain,
+                    committed: Arc::new(vec![RustSendMessagesConfirmationResponse {
+                        stream_id: 1,
+                        topic_id: 2,
+                        partition_id: 3,
+                        base_offset: 4,
+                    }]),
+                    stream_name: "stream".into(),
+                    topic_name: "topic".into(),
+                };
+                let code = send_failed.as_code();
+                let error = to_send_error(send_failed);
 
-            assert!(error.is_instance_of::<ProducerSendError>(py));
-            assert!(error.is_instance_of::<PyRuntimeError>(py));
-            assert_eq!(
-                error
+                assert!(error.is_instance_of::<ProducerSendError>(py));
+                assert!(error.is_instance_of::<PyIggyError>(py));
+                assert!(error.is_instance_of::<PyRuntimeError>(py));
+                assert_eq!(
+                    error
+                        .value(py)
+                        .getattr("code")
+                        .unwrap()
+                        .extract::<u32>()
+                        .unwrap(),
+                    code
+                );
+                assert_eq!(
+                    error
+                        .value(py)
+                        .getattr("cause")
+                        .unwrap()
+                        .extract::<String>()
+                        .unwrap(),
+                    cause_message
+                );
+
+                let failed = error
                     .value(py)
-                    .getattr("cause")
+                    .getattr("failed")
                     .unwrap()
-                    .extract::<String>()
-                    .unwrap(),
-                cause_message
-            );
+                    .extract::<Vec<Py<SendMessage>>>()
+                    .unwrap();
+                assert_eq!(failed.len(), 1);
+                assert_eq!(failed[0].borrow(py).inner.payload.as_ref(), b"failed");
+                assert_eq!(
+                    error
+                        .value(py)
+                        .getattr("uncertain")
+                        .unwrap()
+                        .extract::<usize>()
+                        .unwrap(),
+                    uncertain
+                );
 
-            let failed = error
-                .value(py)
-                .getattr("failed")
-                .unwrap()
-                .extract::<Vec<Py<SendMessage>>>()
-                .unwrap();
-            assert_eq!(failed.len(), 1);
-            assert_eq!(failed[0].borrow(py).inner.payload.as_ref(), b"failed");
+                let committed = error
+                    .value(py)
+                    .getattr("committed")
+                    .unwrap()
+                    .extract::<Vec<Py<SendMessagesConfirmation>>>()
+                    .unwrap();
+                assert_eq!(committed.len(), 1);
+                assert_eq!(committed[0].borrow(py).inner.base_offset, 4);
 
-            let committed = error
-                .value(py)
-                .getattr("committed")
-                .unwrap()
-                .extract::<Vec<Py<SendMessagesConfirmation>>>()
-                .unwrap();
-            assert_eq!(committed.len(), 1);
-            assert_eq!(committed[0].borrow(py).inner.base_offset, 4);
-
-            let source = error.cause(py).unwrap();
-            assert!(source.is_instance_of::<PyRuntimeError>(py));
-            assert_eq!(
-                source.value(py).str().unwrap().to_str().unwrap(),
-                cause_message
-            );
+                assert_eq!(
+                    error
+                        .value(py)
+                        .getattr("operation_id")
+                        .unwrap()
+                        .extract::<Option<u64>>()
+                        .unwrap(),
+                    operation_id
+                );
+                let source = error.cause(py).unwrap();
+                assert_eq!(
+                    source.is_instance_of::<PendingOperationError>(py),
+                    operation_id.is_some()
+                );
+                if let Some(operation_id) = operation_id {
+                    assert_eq!(
+                        source
+                            .value(py)
+                            .getattr("operation_id")
+                            .unwrap()
+                            .extract::<u64>()
+                            .unwrap(),
+                        operation_id
+                    );
+                }
+                assert!(source.is_instance_of::<PyIggyError>(py));
+                assert!(source.is_instance_of::<PyRuntimeError>(py));
+                assert_eq!(
+                    source
+                        .value(py)
+                        .getattr("code")
+                        .unwrap()
+                        .extract::<u32>()
+                        .unwrap(),
+                    cause_code
+                );
+                assert_eq!(
+                    source.value(py).str().unwrap().to_str().unwrap(),
+                    cause_message
+                );
+            }
         });
     }
 

@@ -100,13 +100,16 @@ impl Display for MessageBusConfig {
         write!(
             f,
             "{{ max_batch: {}, max_message_size: {}, replica_read_buffer_size: {}, \
-             peer_queue_capacity: {}, client_queue_capacity: {}, reconnect_period: {}, \
-             close_peer_timeout: {}, close_grace: {}, handshake_grace: {}, connections_max: {} }}",
+             peer_queue_capacity: {}, client_queue_capacity: {}, client_write_stall_timeout: {}, \
+             client_request_queue_bytes_max: {}, reconnect_period: {}, close_peer_timeout: {}, \
+             close_grace: {}, handshake_grace: {}, connections_max: {} }}",
             self.max_batch,
             self.max_message_size,
             self.replica_read_buffer_size,
             self.peer_queue_capacity,
             self.client_queue_capacity,
+            self.client_write_stall_timeout,
+            self.client_request_queue_bytes_max,
             self.reconnect_period,
             self.close_peer_timeout,
             self.close_grace,

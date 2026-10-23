@@ -49,6 +49,11 @@ func FollowerAddress() string {
 	return required("IGGY_TCP_ADDRESS_FOLLOWER")
 }
 
+// NoQuorumAddress returns the address of the cluster node that cannot reach quorum.
+func NoQuorumAddress() string {
+	return required("IGGY_TCP_ADDRESS_NO_QUORUM")
+}
+
 // RootCredentials returns the root username and password.
 func RootCredentials() (string, string) {
 	return required("IGGY_ROOT_USERNAME"), required("IGGY_ROOT_PASSWORD")

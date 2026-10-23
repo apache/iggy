@@ -49,7 +49,7 @@ Commands:
   segment          segments operations [alias: seg]
   ping             ping iggy server
   me               get current client info
-  options          list the options a resource's create command accepts
+  options          list the option catalog of a resource scope
   stats            get iggy server statistics
   snapshot         collect iggy server troubleshooting data
   pat              personal access token operations

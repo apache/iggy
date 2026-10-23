@@ -32,7 +32,7 @@ import (
 func successfullyCreateStream(prefix string, client iggcon.Client) (uint32, string) {
 	name := createRandomStringWithPrefix(prefix, 128)
 
-	stream, err := client.CreateStream(context.Background(), name)
+	stream, err := client.CreateStream(context.Background(), name, nil)
 
 	itShouldNotReturnError(err)
 	itShouldSuccessfullyCreateStream(stream.Id, name, client)

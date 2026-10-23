@@ -28,4 +28,8 @@ export * from './topic/index.js';
 export * from './user/index.js';
 export * from './command-set.js';
 export { type Id } from './identifier.utils.js';
+export {
+  StreamOptionKey, TopicOptionKey, UserOptionKey,
+  type OptionEntry, type ParsedOptions
+} from './options.utils.js';
 

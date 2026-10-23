@@ -23,22 +23,26 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, Wake};
 
 use consensus::{
-    ClientTable, LocalPipeline, MetadataHandle, PartitionsHandle,
+    ClientTable, Consensus, LocalPipeline, MetadataHandle, PartitionsHandle,
     STATE_TRANSFER_MAX_DECODE_RETRIES, STATE_TRANSFER_MAX_STALL_RETRIES, Sequencer, StateArtifact,
     StateTransferStage, VsrConsensus, artifact_kind, build_reply_message_with,
     encode_state_manifest,
 };
+use iggy_binary_protocol::primitives::permissions::{WireGlobalPermissions, WirePermissions};
 use iggy_binary_protocol::requests::consumer_offsets::StoreConsumerOffsetRequest;
 use iggy_binary_protocol::requests::system::SessionIdentity;
 use iggy_binary_protocol::requests::topics::DeleteTopicRequest;
+use iggy_binary_protocol::requests::users::{CreateUserRequest, UpdatePermissionsRequest};
 use iggy_binary_protocol::{
     AckLevel, ReplyHeader, RequestPreparesHeader, RequestStateChunkHeader,
-    RequestStateTransferHeader, RoutedRequestHeader, StateTransferTargetHeader, WireConsumer,
+    RequestStateTransferHeader, RoutedRequestHeader, StartViewChangeHeader,
+    StateTransferTargetHeader, WireConsumer,
 };
 use iggy_binary_protocol::{
-    Command, ConsensusHeader, Operation, PrepareHeader, WireEncode, WireIdentifier,
+    Command, ConsensusHeader, Operation, PrepareHeader, WireEncode, WireIdentifier, WireName,
+    WireOptions,
 };
-use iggy_common::{IggyError, IggyTimestamp, PartitionStats, PollingStrategy};
+use iggy_common::{IggyError, IggyTimestamp, PartitionStats, PollingStrategy, UserStatus};
 use journal::prepare_journal::PrepareJournal;
 use message_bus::IggyMessageBus;
 use metadata::IggyMetadata;
@@ -66,6 +70,50 @@ use crate::{
 };
 use iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner;
 use iggy_binary_protocol::requests::partitions::InstallConsumerGroupOwnerRequest;
+
+#[compio::test]
+async fn given_a_primary_with_a_deferred_view_change_when_reading_should_refuse_old_history() {
+    let (mut fixture, _) = BoundPoll::activated().await;
+    let partition = fixture.partition.as_mut().unwrap();
+    let message = Message::<StartViewChangeHeader>::new(size_of::<StartViewChangeHeader>())
+        .transmute_header(|_, header: &mut StartViewChangeHeader| {
+            header.command = Command::StartViewChange;
+            header.size = u32::try_from(size_of::<StartViewChangeHeader>()).unwrap();
+            header.view = 1;
+            header.replica = 1;
+        });
+    partition.defer_view_transition(server_common::MessageBag::StartViewChange(message));
+    assert!(partition.consensus().is_primary());
+    assert!(partition.consensus().is_normal());
+    assert!(matches!(
+        fixture.poll().await,
+        PartitionReadReply::Rejected(IggyError::TransientNotAccepted)
+    ));
+    assert_eq!(fixture.group_offsets(), (None, None));
+    let (owner, ..) = fixture.served.as_ref().unwrap();
+    let metadata = owner
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .poll_metadata(fixture.namespace, None, BOUND_CLIENT)
+        .unwrap();
+    let (reply, replies) = channel(1);
+    owner
+        .on_partition_read(
+            fixture.namespace,
+            PartitionRead::ConsumerOffsetOnPrimary {
+                consumer: None,
+                metadata,
+            },
+            reply,
+        )
+        .await;
+    assert!(matches!(
+        replies.try_recv().unwrap(),
+        PartitionReadReply::Rejected(IggyError::TransientNotAccepted)
+    ));
+}
 
 #[compio::test]
 async fn given_deleted_history_when_retirement_read_names_old_incarnation_should_refuse_replacement()
@@ -121,15 +169,20 @@ async fn given_pending_attached_poll_when_metadata_changes_should_fence_only_aff
         MissingLeave,
         Rejoin,
         Delete,
+        RevokePermissions,
     }
-    for change in [
+    for (change, unbound) in [
         Change::Logout,
         Change::Leave,
         Change::OtherLeave,
         Change::MissingLeave,
         Change::Rejoin,
         Change::Delete,
-    ] {
+        Change::RevokePermissions,
+    ]
+    .into_iter()
+    .flat_map(|change| [(change, false), (change, true)])
+    {
         let namespace = IggyNamespace::new(0, 0, 0);
         let bus = Rc::new(IggyMessageBus::new(0));
         let (mut partition, config) = partition_with_messages(&bus, namespace, &["message"]).await;
@@ -193,10 +246,22 @@ async fn given_pending_attached_poll_when_metadata_changes_should_fence_only_aff
         let session = table.attach_session(CLIENT, header.op, USER).unwrap();
         let streams = owner.plane.metadata().mux_stm.streams();
         let mut completions = Vec::new();
-        for group in [None, Some(GROUP)] {
+        for group in [None, Some(GROUP)]
+            .into_iter()
+            .filter(|group| !unbound || group.is_none())
+        {
             let attachment = ConsumerAttachment {
                 session: session.clone(),
                 metadata: streams.poll_metadata(namespace, group, CLIENT).unwrap(),
+            };
+            let attachment = if unbound {
+                super::PollAttachment::Unbound {
+                    user_id: USER,
+                    user_created_at: 0,
+                    metadata: attachment.metadata,
+                }
+            } else {
+                super::PollAttachment::Bound(attachment)
             };
             let (reply, replies) = channel(1);
             let completion = owner
@@ -250,9 +315,19 @@ async fn given_pending_attached_poll_when_metadata_changes_should_fence_only_aff
                 }
                 .to_bytes(),
             ),
+            Change::RevokePermissions => apply_poll_metadata(
+                &owner,
+                Operation::UpdatePermissions,
+                UpdatePermissionsRequest {
+                    user_id: WireIdentifier::numeric(USER),
+                    permissions: None,
+                }
+                .to_bytes(),
+            ),
         }
         for (group, completion, replies, result) in completions {
-            let stale = matches!(change, Change::Logout | Change::Delete)
+            let stale = matches!(change, Change::Delete | Change::RevokePermissions)
+                || (matches!(change, Change::Logout) && !unbound)
                 || (matches!(change, Change::Leave) && group.is_some());
             completion.complete(result);
             assert!(futures::poll!(pump.as_mut()).is_pending());
@@ -260,10 +335,15 @@ async fn given_pending_attached_poll_when_metadata_changes_should_fence_only_aff
                 .try_recv()
                 .expect("the owner must validate the completion");
             if stale {
+                let expected = if matches!(change, Change::RevokePermissions) {
+                    IggyError::Unauthorized
+                } else {
+                    IggyError::TransientNotAccepted
+                };
                 assert!(
                     matches!(
                         reply,
-                        PartitionReadReply::Rejected(IggyError::TransientNotAccepted)
+                        PartitionReadReply::Rejected(ref error) if *error == expected
                     ),
                     "{change:?}, group {group:?}: stale authorization must reject, got {reply:?}"
                 );
@@ -290,6 +370,15 @@ async fn given_pending_attached_poll_when_metadata_changes_should_fence_only_aff
                     expected,
                     "{change:?}: completion must preserve group progress"
                 );
+            } else {
+                let (stored, _) = partitions
+                    .consumer_offset_read(&namespace, PollingConsumer::Consumer(USER as usize, 0))
+                    .unwrap();
+                assert_eq!(
+                    stored,
+                    (!stale).then_some(0),
+                    "{change:?}: completion must preserve consumer progress"
+                );
             }
         }
     }
@@ -314,7 +403,8 @@ fn apply_poll_metadata(owner: &CompletionTestShard, operation: Operation, body: 
     );
 }
 
-const BOUND_CLIENT: u128 = 41;
+// Wider than u64, so a refusal that truncated it would name another client.
+const BOUND_CLIENT: u128 = (1 << 64) + 41;
 const OTHER_CLIENT: u128 = 42;
 const BOUND_USER: u32 = 7;
 const BOUND_GROUP: u64 = 7;
@@ -405,6 +495,83 @@ async fn given_installed_owner_when_it_polls_on_primary_should_serve_its_generat
     fixture.commit().await;
     assert_served(&reply, activated.owner.generation);
     assert_eq!(fixture.group_offsets(), (Some(0), Some(0)));
+}
+
+#[compio::test]
+async fn given_a_captured_offset_read_when_partition_is_replaced_should_not_read_new_history() {
+    const REPLACEMENT_REVISION: u64 = 2;
+    let (mut fixture, _) = BoundPoll::activated().await;
+    fixture.poll().await;
+    fixture.commit().await;
+    let (owner, ..) = fixture.served.as_ref().unwrap();
+    let namespace = fixture.namespace;
+    let metadata = owner
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .consumer_offset_metadata(namespace, None, BOUND_CLIENT)
+        .unwrap();
+
+    for replaced in [false, true] {
+        if replaced {
+            let (replacement, _) = partition_with_messages_at_revision(
+                &fixture.bus,
+                namespace,
+                &["new history"],
+                REPLACEMENT_REVISION,
+            )
+            .await;
+            owner.plane.partitions().remove(&namespace).unwrap();
+            owner.plane.partitions().insert(namespace, replacement);
+            owner.shards_table.insert(
+                namespace,
+                PartitionLocation::new(ShardId::new(0), REPLACEMENT_REVISION),
+            );
+        }
+        for read in [
+            PartitionRead::ConsumerOffsetOnPrimary {
+                consumer: Some(PollingConsumer::ConsumerGroup(
+                    usize::try_from(BOUND_GROUP).unwrap(),
+                    0,
+                )),
+                metadata,
+            },
+            PartitionRead::ConsumerOffsetOnPrimary {
+                consumer: None,
+                metadata,
+            },
+            PartitionRead::ExternalGroupOffsetOnPrimary {
+                group_id: u32::try_from(BOUND_GROUP).unwrap(),
+                metadata,
+            },
+        ] {
+            let has_offset = matches!(
+                &read,
+                PartitionRead::ConsumerOffsetOnPrimary {
+                    consumer: Some(_),
+                    ..
+                }
+            );
+            let (reply, replies) = channel(1);
+            owner.on_partition_read(namespace, read, reply).await;
+            let reply = replies.try_recv().unwrap();
+            if replaced {
+                assert!(
+                    matches!(
+                        reply,
+                        PartitionReadReply::Rejected(IggyError::TransientNotAccepted)
+                    ),
+                    "captured read must not read the replacement, got {reply:?}"
+                );
+            } else {
+                let PartitionReadReply::ConsumerOffset { stored, .. } = reply else {
+                    panic!("the original history should answer the read, got {reply:?}");
+                };
+                assert_eq!(stored, has_offset.then_some(0));
+            }
+        }
+    }
 }
 
 /// Equal generations alone must not bind the poller: the partition's owner
@@ -540,12 +707,22 @@ async fn given_backup_when_polled_on_primary_should_name_the_primary_unless_tran
             PartitionRead::UnboundPollOnPrimary {
                 consumer: PollingConsumer::Consumer(1, 0),
                 args: PollingArgs::new(PollingStrategy::next(), 1, false),
+                user_id: BOUND_USER,
+                user_created_at: 1,
                 metadata,
             },
             PartitionRead::ConsumerOffsetOnPrimary {
-                consumer: PollingConsumer::Consumer(1, 0),
+                consumer: Some(PollingConsumer::Consumer(1, 0)),
+                metadata,
             },
-            PartitionRead::ExternalGroupOffsetOnPrimary { group_id: 1 },
+            PartitionRead::ConsumerOffsetOnPrimary {
+                consumer: None,
+                metadata,
+            },
+            PartitionRead::ExternalGroupOffsetOnPrimary {
+                group_id: 1,
+                metadata,
+            },
         ] {
             let (reply, replies) = channel(1);
             owner.on_partition_read(namespace, read, reply).await;
@@ -605,8 +782,10 @@ fn assert_not_owned(reply: &PartitionReadReply) {
     assert!(
         matches!(
             reply,
-            PartitionReadReply::Rejected(IggyError::ConsumerGroupPartitionNotOwned(client, 0))
-                if u128::from(*client) == BOUND_CLIENT
+            PartitionReadReply::Rejected(IggyError::ConsumerGroupPartitionNotOwned(
+                BOUND_CLIENT,
+                0
+            ))
         ),
         "the poller, client {BOUND_CLIENT}, is not the installed owner, got {reply:?}"
     );
@@ -936,6 +1115,27 @@ async fn given_deleted_history_when_metadata_still_lists_the_partition_should_re
                             session: table.attach_session(CLIENT, 1, USER).unwrap(),
                             metadata,
                         },
+                    },
+                ),
+                (
+                    "ConsumerOffsetOnPrimary",
+                    PartitionRead::ConsumerOffsetOnPrimary {
+                        consumer: Some(consumer),
+                        metadata,
+                    },
+                ),
+                (
+                    "MissingGroupOffsetOnPrimary",
+                    PartitionRead::ConsumerOffsetOnPrimary {
+                        consumer: None,
+                        metadata,
+                    },
+                ),
+                (
+                    "ExternalGroupOffsetOnPrimary",
+                    PartitionRead::ExternalGroupOffsetOnPrimary {
+                        group_id: 1,
+                        metadata,
                     },
                 ),
             ];
@@ -1684,6 +1884,10 @@ async fn given_metadata_transfer_when_target_is_unavailable_should_retry_only_un
                 });
 
         if transient && !target_accepted {
+            // One stall round short of the budget. A busy reply is no progress,
+            // so it must not refill this: the next stall round still spends it.
+            let charged = STATE_TRANSFER_MAX_STALL_RETRIES - 1;
+            owner.metadata_transfer_attempts.set(charged);
             for _ in 0..=STATE_TRANSFER_MAX_STALL_RETRIES {
                 owner
                     .metadata_transfer
@@ -1691,9 +1895,6 @@ async fn given_metadata_transfer_when_target_is_unavailable_should_retry_only_un
                     .as_mut()
                     .unwrap()
                     .idle_ticks = RETRY_TICKS - 1;
-                owner
-                    .metadata_transfer_attempts
-                    .set(STATE_TRANSFER_MAX_STALL_RETRIES);
 
                 owner.on_state_transfer_target(&unavailable).await;
 
@@ -1706,7 +1907,7 @@ async fn given_metadata_transfer_when_target_is_unavailable_should_retry_only_un
                 assert_eq!(session.idle_ticks, 0);
                 assert!(!session.target_accepted);
                 assert!(session.artifacts.is_empty());
-                assert_eq!(owner.metadata_transfer_attempts.get(), 0);
+                assert_eq!(owner.metadata_transfer_attempts.get(), charged);
                 assert_eq!(
                     consensus.state_transfer_stage(),
                     StateTransferStage::AwaitingTarget
@@ -1732,6 +1933,10 @@ async fn given_metadata_transfer_when_target_is_unavailable_should_retry_only_un
             assert_eq!(peer, PEER);
             assert_eq!(request.header().command, Command::RequestStateTransfer);
             assert_eq!(request.header().nonce, nonce);
+            assert_eq!(
+                owner.metadata_transfer_attempts.get(),
+                STATE_TRANSFER_MAX_STALL_RETRIES
+            );
 
             owner.on_state_transfer_target(&descriptor).await;
 
@@ -1969,6 +2174,40 @@ fn owner_with_metadata_plane(
         ShardMetrics::for_shard(),
     )
     .expect("valid owner inbox wiring");
+    owner
+        .plane
+        .metadata()
+        .mux_stm
+        .users()
+        .ensure_root_user("root", "hash");
+    for user_id in 1..=BOUND_USER {
+        apply_poll_metadata(
+            &owner,
+            Operation::CreateUser,
+            CreateUserRequest {
+                username: WireName::new(format!("reader-{user_id}")).unwrap(),
+                password: "hash".to_owned(),
+                status: UserStatus::Active.as_code(),
+                permissions: Some(WirePermissions {
+                    global: WireGlobalPermissions {
+                        manage_servers: false,
+                        read_servers: false,
+                        manage_users: false,
+                        read_users: false,
+                        manage_streams: false,
+                        read_streams: false,
+                        manage_topics: false,
+                        read_topics: false,
+                        poll_messages: true,
+                        send_messages: false,
+                    },
+                    streams: Vec::new(),
+                }),
+                options: WireOptions::empty(),
+            }
+            .to_bytes(),
+        );
+    }
     (owner, sender)
 }
 

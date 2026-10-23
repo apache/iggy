@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::IggyError;
 use crate::IggyExpiry;
 use crate::IggyTimestamp;
 use crate::UserId;
@@ -40,17 +41,18 @@ impl PersonalAccessToken {
         name: &str,
         now: IggyTimestamp,
         expiry: IggyExpiry,
-    ) -> (Self, String) {
+    ) -> Result<(Self, String), IggyError> {
+        let expiry_at = Self::calculate_expiry_at(now, expiry)?;
         let (token, token_hash) = Self::mint_raw_and_hash();
-        (
+        Ok((
             Self {
                 user_id,
                 name: Arc::from(name),
                 token: Arc::from(token_hash),
-                expiry_at: Self::calculate_expiry_at(now, expiry),
+                expiry_at,
             },
             token,
-        )
+        ))
     }
 
     /// Mint a fresh raw token and its hash without constructing a
@@ -94,13 +96,18 @@ impl PersonalAccessToken {
         hash::calculate_256(token.as_bytes())
     }
 
-    pub fn calculate_expiry_at(now: IggyTimestamp, expiry: IggyExpiry) -> Option<IggyTimestamp> {
+    /// `InvalidPersonalAccessTokenExpiry` when the expiry ends past the last representable timestamp.
+    pub fn calculate_expiry_at(
+        now: IggyTimestamp,
+        expiry: IggyExpiry,
+    ) -> Result<Option<IggyTimestamp>, IggyError> {
         match expiry {
-            IggyExpiry::ExpireDuration(expiry) => {
-                Some(IggyTimestamp::from(now.as_micros() + expiry.as_micros()))
-            }
-            IggyExpiry::NeverExpire => None,
-            IggyExpiry::ServerDefault => None, // This will
+            IggyExpiry::ExpireDuration(expiry) => now
+                .as_micros()
+                .checked_add(expiry.as_micros())
+                .map(|expiry_at| Some(IggyTimestamp::from(expiry_at)))
+                .ok_or(IggyError::InvalidPersonalAccessTokenExpiry),
+            IggyExpiry::NeverExpire | IggyExpiry::ServerDefault => Ok(None),
         }
     }
 }
@@ -117,7 +124,8 @@ mod tests {
         let now = IggyTimestamp::now();
         let name = "test_token";
         let (personal_access_token, raw_token) =
-            PersonalAccessToken::new(user_id, name, now, IggyExpiry::NeverExpire);
+            PersonalAccessToken::new(user_id, name, now, IggyExpiry::NeverExpire)
+                .expect("a never-expiring token has no expiry to overflow");
         assert_eq!(&*personal_access_token.name, name);
         assert!(!personal_access_token.token.is_empty());
         assert!(!raw_token.is_empty());
@@ -135,8 +143,25 @@ mod tests {
         let expiry_ms = 10;
         let expiry = IggyExpiry::ExpireDuration(IggyDuration::from(expiry_ms));
         let name = "test_token";
-        let (personal_access_token, _) = PersonalAccessToken::new(user_id, name, now, expiry);
+        let (personal_access_token, _) = PersonalAccessToken::new(user_id, name, now, expiry)
+            .expect("a 10 microsecond expiry fits the clock");
         let later = IggyTimestamp::from(now.as_micros() + expiry_ms + 1);
         assert!(personal_access_token.is_expired(later));
+    }
+
+    #[test]
+    fn expiry_at_should_be_refused_given_expiry_past_the_end_of_the_clock() {
+        let now = IggyTimestamp::from(1_000);
+        let last = IggyExpiry::ExpireDuration(IggyDuration::from(u64::MAX - 1_000));
+        let past = IggyExpiry::ExpireDuration(IggyDuration::from(u64::MAX - 999));
+
+        assert_eq!(
+            PersonalAccessToken::calculate_expiry_at(now, last),
+            Ok(Some(IggyTimestamp::from(u64::MAX)))
+        );
+        assert_eq!(
+            PersonalAccessToken::calculate_expiry_at(now, past),
+            Err(IggyError::InvalidPersonalAccessTokenExpiry)
+        );
     }
 }
