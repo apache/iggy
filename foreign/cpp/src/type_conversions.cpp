@@ -161,6 +161,14 @@ Permissions Permissions::FromFfi(const ffi::Permissions &permissions) {
     return result;
 }
 
+PersonalAccessTokenInfo PersonalAccessTokenInfo::FromFfi(ffi::PersonalAccessTokenInfo token) {
+    std::optional<std::uint64_t> expires_at;
+    if (token.has_expiry) {
+        expires_at = token.expiry_at;
+    }
+    return PersonalAccessTokenInfo(std::string(token.name.c_str(), token.name.size()), expires_at);
+}
+
 UserInfo UserInfo::FromFfi(ffi::UserInfo user) {
     return UserInfo(user.id, user.created_at, static_cast<UserStatus>(user.status),
                     std::string(user.username.c_str(), user.username.size()),

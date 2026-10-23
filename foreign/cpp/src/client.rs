@@ -1340,6 +1340,31 @@ impl Client {
         })
     }
 
+    pub fn get_personal_access_tokens(&self) -> Result<Vec<ffi::PersonalAccessTokenInfo>, String> {
+        RUNTIME.block_on(async {
+            let tokens = self
+                .inner
+                .get_personal_access_tokens()
+                .await
+                .map_err(|error| format!("Could not get personal access tokens: {error}"))?;
+            Ok(tokens
+                .into_iter()
+                .map(ffi::PersonalAccessTokenInfo::from)
+                .collect())
+        })
+    }
+
+    pub fn delete_personal_access_token(&self, name: String) -> Result<(), String> {
+        RUNTIME.block_on(async {
+            self.inner
+                .delete_personal_access_token(&name)
+                .await
+                .map_err(|error| {
+                    format!("Could not delete personal access token '{name}': {error}")
+                })
+        })
+    }
+
     pub fn get_user(&self, user_id: ffi::Identifier) -> Result<ffi::UserInfoDetails, String> {
         let rust_user_id = RustIdentifier::try_from(user_id)
             .map_err(|error| format!("Could not get user: invalid user identifier: {error}"))?;

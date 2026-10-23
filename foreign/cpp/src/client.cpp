@@ -162,6 +162,22 @@ std::vector<UserInfo> IggyBlockingClient::GetUsers() {
     });
 }
 
+std::vector<PersonalAccessTokenInfo> IggyBlockingClient::GetPersonalAccessTokens() {
+    return RethrowAsIggyException([this] {
+        std::vector<PersonalAccessTokenInfo> tokens;
+        auto ffi_tokens = Handle()->get_personal_access_tokens();
+        tokens.reserve(ffi_tokens.size());
+        for (auto &token : ffi_tokens) {
+            tokens.push_back(PersonalAccessTokenInfo::FromFfi(std::move(token)));
+        }
+        return tokens;
+    });
+}
+
+void IggyBlockingClient::DeletePersonalAccessToken(const std::string &name) {
+    RethrowAsIggyException([this, &name] { Handle()->delete_personal_access_token(name); });
+}
+
 UserInfoDetails IggyBlockingClient::CreateUser(std::string username,
                                                std::string password,
                                                UserStatus status,

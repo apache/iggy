@@ -468,6 +468,12 @@ mod ffi {
         derived_options: Vec<HeaderEntry>,
     }
 
+    struct PersonalAccessTokenInfo {
+        name: String,
+        has_expiry: bool,
+        expiry_at: u64,
+    }
+
     struct LoginInfo {
         user_id: u32,
         has_access_token: bool,
@@ -1063,14 +1069,14 @@ mod ffi {
             error_info: &mut ErrorInfo,
         ) -> Result<()>;
         fn get_cluster_metadata(self: &Client) -> Result<ClusterMetadata>;
-        // fn get_personal_access_tokens(self: &Client) -> Result<Vec<PersonalAccessTokenInfo>>;
+        fn get_personal_access_tokens(self: &Client) -> Result<Vec<PersonalAccessTokenInfo>>;
         fn create_personal_access_token(
             self: &Client,
             name: String,
             expiry_kind: String,
             expiry_value: u64,
         ) -> Result<String>;
-        // fn delete_personal_access_token(self: &Client, name: String) -> Result<()>;
+        fn delete_personal_access_token(self: &Client, name: String) -> Result<()>;
         // fn login_with_personal_access_token(self: &Client, token: String) -> Result<IdentityInfo>;
 
         unsafe fn delete_client(client: *mut Client);
