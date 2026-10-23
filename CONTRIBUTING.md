@@ -218,7 +218,9 @@ A returning contributor is anyone who has had a commit merged into apache/iggy.
 Some labels move on their own. Opening a non-draft PR, or marking a draft
 ready, sets `S-waiting-on-review`. A "Request changes" review sets
 `S-waiting-on-author`, and so does a `/skill` bot review with findings for the
-author. Closing a PR, or converting it to a draft, clears both.
+author. Closing a PR, or converting it to a draft, clears both. GitHub skips
+the lifecycle workflow on a PR with merge conflicts, so there these labels
+catch up on a schedule instead of straight away.
 
 Commands take up to ~90s. A 👍 reaction means applied, 😕 means you lacked
 permission; if neither shows up, check the `PR Triage Apply` run in the
