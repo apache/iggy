@@ -33,7 +33,7 @@ mod topic;
 mod user;
 mod user_headers;
 
-use client::{IggyClient, PendingOperationError};
+use client::{IggyClient, PendingOperationError, PyIggyError};
 use config::{
     AutoLogin, HttpConfig, PendingOperationsConfig, QuicConfig, QuicReconnectionConfig, TcpConfig,
     TcpReconnectionConfig, WebSocketConfig, WebSocketFramingConfig, WebSocketReconnectionConfig,
@@ -69,6 +69,7 @@ fn apache_iggy(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PartitionContext>()?;
     m.add_class::<ConsumerPosition>()?;
     m.add_class::<IggyClient>()?;
+    m.add_class::<PyIggyError>()?;
     m.add_class::<PendingOperationError>()?;
     m.add_class::<IggyProducer>()?;
     m.add_class::<ProducerSendError>()?;

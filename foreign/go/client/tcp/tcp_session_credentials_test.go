@@ -24,7 +24,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
@@ -85,7 +84,7 @@ func (change credentialChange) send(t *testing.T, client *IggyTcpClient, raw boo
 	} else {
 		err = change.typed(ctx, client)
 	}
-	var uncertain ierror.UncertainOutcome
+	var uncertain ierror.OperationUncertain
 	if errors.As(err, &uncertain) {
 		return client.ResolveOperation(ctx, uncertain.OperationID)
 	}
@@ -147,8 +146,8 @@ func requireSignInAgain(t *testing.T, client *IggyTcpClient, server *testListene
 	registers := func() []request { return requestsFor(server.recorded(), vsr.OperationRegister) }
 	before := len(registers())
 	evict.Store(true)
-	require.ErrorIs(t, client.Ping(context.Background()), ierror.ErrUnauthenticated)
-	require.Eventually(t, func() bool { return len(registers()) > before }, time.Second, time.Millisecond)
+	require.NoError(t, client.Ping(context.Background()), "the ping completes under the session of the new sign-in")
+	require.Greater(t, len(registers()), before)
 	body := registers()[before].payload
 	offset := versionInfoEnd(t, body) + vsr.BindSecretBytes
 	var names []string
@@ -241,7 +240,7 @@ func TestSignInCredentials_AreAbsentUntilSomethingSignsIn(t *testing.T) {
 func TestSignInCredentials_ComeFromAManualSignInWithoutAutoLogin(t *testing.T) {
 	client := newCredentialClient(AutoLogin{})
 
-	client.rememberLogin(NewUsernamePasswordCredentials("iggy", "secret"))
+	client.rememberedLogin = NewAutoLogin(NewUsernamePasswordCredentials("iggy", "secret"))
 
 	credentials, ok := client.signInCredentials()
 	require.True(t, ok)
@@ -255,13 +254,156 @@ func TestSignInCredentials_ComeFromAManualSignInWithoutAutoLogin(t *testing.T) {
 	assert.False(t, ok)
 }
 
-func TestSignInCredentials_PreferTheConfiguredOnes(t *testing.T) {
+func TestSignInCredentials_PreferTheLastSignIn(t *testing.T) {
 	client := newCredentialClient(NewAutoLogin(NewUsernamePasswordCredentials("configured", "secret")))
 
-	client.rememberLogin(NewPersonalAccessTokenCredentials("signed-in-token"))
+	client.rememberedLogin = NewAutoLogin(NewPersonalAccessTokenCredentials("signed-in-token"))
 
 	credentials, ok := client.signInCredentials()
 	require.True(t, ok)
-	assert.Equal(t, "configured", credentials.username)
-	assert.Empty(t, credentials.personalAccessToken)
+	assert.Equal(t, "signed-in-token", credentials.personalAccessToken)
+	assert.Empty(t, credentials.username)
+}
+
+// readPasswordReply stops at the driver's validated-reply boundary. Acceptance
+// publishes credentials atomically, so there is no separate publication step.
+func readPasswordReply(t *testing.T, ctx context.Context, client *IggyTcpClient) (*signInEpoch, *pendingOperation, linkReply) {
+	t.Helper()
+	body, err := passwordChange(t, signInPassword).request.MarshalBinary()
+	require.NoError(t, err)
+	frame := append(reserveHeader(nil), body...)
+	client.mtx.Lock()
+	epoch := client.callEpoch(ctx)
+	fence := client.sessionFence
+	err = vsr.StampRequestHeader(client.session, uint32(command.ChangePasswordCode), frame)
+	client.mtx.Unlock()
+	require.NoError(t, err)
+	operation := &pendingOperation{code: command.ChangePasswordCode, fence: fence, frame: newOperationFrame(frame, nil)}
+	t.Cleanup(operation.frame.release)
+	reply, _ := client.links.any().exchange(ctx, operation.frame)
+	require.NoError(t, reply.err)
+	outcome, err := vsr.DecodeReplyFor((*[vsr.HeaderSize]byte)(frame), &reply.header, reply.body)
+	require.NoError(t, err)
+	require.NoError(t, outcome.Err)
+	require.True(t, outcome.Committed)
+	return epoch, operation, reply
+}
+
+// Automatic sign-in selects credentials before signIn resets the fence. This
+// component proof carries that snapshot through a real Register after the
+// accepted password change publishes, then checks the next wire credentials.
+func TestRecoveryRegisterKeepsCredentialsPublishedByTheSameOwner(t *testing.T) {
+	for _, refused := range []bool{false, true} {
+		for _, autoLogin := range []bool{false, true} {
+			t.Run(fmt.Sprintf("refused_%t/auto_login_%t", refused, autoLogin), func(t *testing.T) {
+				registered, release := make(chan struct{}), make(chan struct{})
+				unblock := sync.OnceFunc(func() { close(release) })
+				defer unblock()
+				var registrations atomic.Uint32
+				var evict atomic.Bool
+				var server *testListener
+				server = listenVSR(t, nil, func(_, _ int, read request) []byte {
+					switch {
+					case read.operation() == vsr.OperationRegister:
+						number := registrations.Add(1)
+						if number == 2 {
+							close(registered)
+							<-release
+							if refused {
+								return statusReplyFrame(read.operation(), uint32(ierror.InvalidCredentialsCode), nil)
+							}
+						}
+						return registerReplyFrame(signedInUserID, managedLinkSession+uint64(number))
+					case read.operation() == vsr.OperationChangePassword:
+						return committedReply(read, 0)
+					case read.code() == uint32(command.PingCode) && evict.CompareAndSwap(true, false):
+						return evictionFrame(vsr.EvictionSessionError, 0, 0)
+					default:
+						return singleNodeHandler(t, func() string { return server.address() })(0, 0, read)
+					}
+				})
+				client := signedInClient(t, server, autoLogin)
+				ctx, cancel := context.WithTimeout(context.Background(), managedLinkTestBudget)
+				defer cancel()
+				attempted, enabled := client.signInCredentials()
+				require.True(t, enabled)
+				secret := vsr.NewBindSecret()
+				body, err := vsr.SerializeLoginRegister(attempted.username, attempted.password, iggcon.Version, secret)
+				require.NoError(t, err)
+				epoch, operation, reply := readPasswordReply(t, ctx, client)
+				require.True(t, client.acceptOperationReply(epoch, operation, &reply.header, true))
+				done := make(chan error, 1)
+				go func() {
+					_, err := client.signIn(ctx, client.links.any(), uint32(command.LoginRegisterCode), body, secret, attempted, true)
+					done <- err
+				}()
+				select {
+				case <-registered:
+				case <-ctx.Done():
+					t.Fatal("the automatic attempt did not send its selected credentials")
+				}
+				unblock()
+				err = <-done
+				if refused {
+					var refusal *signInRefusal
+					require.ErrorAs(t, err, &refusal)
+					retry, _ := client.endRefusedSignIn(epoch, attempted, refusal.err)
+					require.True(t, retry, "the new credential was never refused")
+					require.Same(t, epoch, client.epoch.Load())
+					require.NoError(t, client.Connect(ctx))
+					require.Len(t, registerRequests(server), 3)
+					read := registerRequests(server)[2]
+					offset := versionInfoEnd(t, read.payload) + vsr.BindSecretBytes
+					_, rest, ok := splitName(read.payload[offset:])
+					require.True(t, ok)
+					password, _, ok := splitName(rest)
+					require.True(t, ok)
+					require.Equal(t, rotatedPassword, password)
+				} else {
+					require.NoError(t, err)
+					require.Len(t, registerRequests(server), 2, "an accepted Register must not be restarted")
+				}
+				credentials, enabled := client.signInCredentials()
+				require.True(t, enabled)
+				require.Equal(t, rotatedPassword, credentials.password)
+				requireSignInAgain(t, client, server, &evict, signInUsername, rotatedPassword)
+			})
+		}
+	}
+}
+
+func TestCredentialAcceptanceCannotChangeANewerExplicitOwner(t *testing.T) {
+	server, evict := credentialServer(t, func(_ int, read request) []byte { return committedReply(read, 0) })
+	client := signedInClient(t, server, true)
+	ctx, cancel := context.WithTimeout(context.Background(), managedLinkTestBudget)
+	defer cancel()
+	epoch, operation, reply := readPasswordReply(t, ctx, client)
+	const newerPassword = "newer-owner-password"
+	_, err := client.LoginUser(ctx, signInUsername, newerPassword)
+	require.NoError(t, err)
+	require.False(t, client.acceptOperationReply(epoch, operation, &reply.header, true))
+	retry, ended := client.endRefusedSignIn(epoch, NewUsernamePasswordCredentials(signInUsername, signInPassword), ierror.ErrInvalidCredentials)
+	require.False(t, retry || ended, "old refusal cannot end the newer owner")
+	requireSignInAgain(t, client, server, evict, signInUsername, newerPassword)
+	client.mtx.Lock()
+	configuredPassword := client.config.autoLogin.credentials.password
+	client.mtx.Unlock()
+	require.Equal(t, signInPassword, configuredPassword, "old publication must not change the newer owner's configured fallback")
+}
+
+func TestAcceptedLogoutCompletionCannotClearANewerExplicitOwner(t *testing.T) {
+	server, evict := credentialServer(t, func(_ int, read request) []byte { return committedReply(read, 0) })
+	client := signedInClient(t, server, true)
+	ctx, cancel := client.operationContext(context.Background())
+	defer cancel()
+	epoch := client.callEpoch(ctx)
+	_, err := client.do(ctx, &command.LogoutUser{})
+	require.NoError(t, err)
+	_, err = client.LoginUser(context.Background(), "newer", signInPassword)
+	require.NoError(t, err)
+	newerEpoch := client.epoch.Load()
+	client.finishLogout(epoch)
+	require.Same(t, newerEpoch, client.epoch.Load(), "accepted Logout cleanup must retain the newer caller owner")
+	require.True(t, sessionBound(client))
+	requireSignInAgain(t, client, server, evict, "newer", signInPassword)
 }

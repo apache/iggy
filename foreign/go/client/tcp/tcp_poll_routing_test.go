@@ -21,9 +21,13 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"io"
+	"log/slog"
+	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
@@ -68,7 +72,7 @@ func newPrimaryPollFixture(t *testing.T,
 						return reply
 					}
 				}
-				return pollRoutingReply(t, read, uint8(primary+1), max(1, binary.LittleEndian.Uint64(read.header[frameOffsetContext+16:])))
+				return routeReply(t, read, uint8(primary+1))
 			case read.code() == uint32(command.PollMessagesCode):
 				partition := routedPollPartition(t, read)
 				require.Equal(t, primary, int(partition), "poll must reach its own partition primary")
@@ -93,12 +97,11 @@ func newPrimaryPollFixture(t *testing.T,
 		case read.sessionID() == 0:
 			return evictionFrame(vsr.EvictionNoSession, 0, 0)
 		case read.code() == uint32(command.GetClusterMetadataCode):
-			return clusterMetadataFrame(t, 0, fixture.coordinator.address(), fixture.primaries[0].address(), fixture.primaries[1].address())
+			return fixture.roster(t, 0)
 		case read.code() == uint32(command.SyncGroupCode):
 			return replyFrame(vsr.OperationNonReplicated, assignmentBody(7, 0, 1))
 		case read.code() == uint32(command.GetPartitionRouteCode):
-			partition := routedPollPartition(t, read)
-			return pollRoutingReply(t, read, uint8(partition+1), max(1, binary.LittleEndian.Uint64(read.header[frameOffsetContext+16:])))
+			return routeReply(t, read, uint8(routedPollPartition(t, read)+1))
 		case read.code() == uint32(command.PollMessagesCode):
 			return replyFrame(vsr.OperationNonReplicated, emptyBatchBody(polledPartition(t, read)))
 		case read.code() == uint32(command.PingCode):
@@ -120,7 +123,28 @@ func newPrimaryPollFixture(t *testing.T,
 	return fixture
 }
 
-func pollRoutingReply(t *testing.T, read request, replica uint8, watermark uint64) []byte {
+func awaitReplicaLinks(t *testing.T, fixture *primaryPollFixture) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		return fixture.client.links.replica(1) != nil && fixture.client.links.replica(2) != nil
+	}, managedLinkTestBudget, managedLinkPoll)
+}
+
+// roster is the cluster metadata of the fixture that names the replica at
+// leader the metadata primary.
+func (f *primaryPollFixture) roster(t *testing.T, leader int) []byte {
+	t.Helper()
+	return clusterMetadataFrame(t, leader, f.coordinator.address(), f.primaries[0].address(), f.primaries[1].address())
+}
+
+// routeReply routes the partition of a lookup to replica at the metadata
+// floor that the lookup names.
+func routeReply(t testing.TB, read request, replica uint8) []byte {
+	t.Helper()
+	return pollRoutingReply(t, read, replica, max(1, binary.LittleEndian.Uint64(read.header[frameOffsetContext+16:])))
+}
+
+func pollRoutingReply(t testing.TB, read request, replica uint8, watermark uint64) []byte {
 	t.Helper()
 	body := binary.LittleEndian.AppendUint64(nil, 0)
 	body = binary.LittleEndian.AppendUint64(body, watermark)
@@ -157,6 +181,14 @@ func bindIdentity(t *testing.T, payload []byte) []byte {
 	return payload[offset : offset+vsr.SessionIdentityBytes]
 }
 
+// bindWatermark returns the metadata watermark that a BindSession payload
+// names, the last field of its identity.
+func bindWatermark(t *testing.T, payload []byte) uint64 {
+	t.Helper()
+	const watermarkOffset = consumerSessionSize - 8
+	return binary.LittleEndian.Uint64(bindIdentity(t, payload)[watermarkOffset:])
+}
+
 func requestCount(reads []request, code command.Code) int {
 	count := 0
 	for _, read := range reads {
@@ -187,21 +219,20 @@ func TestPrimaryPoll_SplitPrimariesKeepCoordinatorMembershipAndReuseConnections(
 	assert.Zero(t, requestCount(fixture.coordinator.recorded(), command.PollMessagesCode))
 	for _, primary := range fixture.primaries {
 		assert.Equal(t, 1, primary.connections())
-		assert.GreaterOrEqual(t, requestCount(primary.recorded(), command.BindSessionCode), 1)
-		var lastBind request
+		assert.Equal(t, 1, requestCount(primary.recorded(), command.BindSessionCode))
 		assert.Equal(t, 2, requestCount(primary.recorded(), command.PollMessagesCode))
 		for _, read := range primary.recorded() {
 			if read.code() == uint32(command.BindSessionCode) {
 				assert.Equal(t, parent, read.clientID(), "the data connection shares the coordinator identity")
-				lastBind = read
-				assert.Equal(t, fixture.client.session.BindSecret(), [vsr.BindSecretBytes]byte(read.payload[len(read.payload)-vsr.BindSecretBytes:]))
 			}
 		}
-		assert.Equal(t, (consumerSession{client: parent, session: session, watermark: 11}).bytes(), bindIdentity(t, lastBind.payload))
+		requireLastBindNamesTheSession(t, fixture.client, primary.recorded())
 	}
 }
 
-func TestPrimaryPoll_MetadataReplyRefreshesRouteAndAttachment(t *testing.T) {
+// A link binds once per session, as in Rust. Each request carries the metadata
+// floor it needs, so a reply that raises the watermark rebinds no link.
+func TestPrimaryPoll_MetadataReplyRefreshesTheRouteAndKeepsTheBinding(t *testing.T) {
 	fixture := newPrimaryPollFixture(t, nil, nil)
 	_, err := pollPrimaryPartition(context.Background(), fixture.client, 0)
 	require.NoError(t, err)
@@ -211,13 +242,19 @@ func TestPrimaryPoll_MetadataReplyRefreshesRouteAndAttachment(t *testing.T) {
 		_, err = pollPrimaryPartition(context.Background(), fixture.client, 0)
 		require.NoError(t, err)
 	}
-	var floors []uint64
+	var binds, polls []uint64
 	for _, read := range fixture.primaries[0].recorded() {
-		if read.code() == uint32(command.BindSessionCode) {
-			floors = append(floors, binary.LittleEndian.Uint64(bindIdentity(t, read.payload)[24:]))
+		switch read.code() {
+		case uint32(command.BindSessionCode):
+			binds = append(binds, bindWatermark(t, read.payload))
+		case uint32(command.PollMessagesCode):
+			polls = append(polls, stampedContext(t, read).MetadataOp)
 		}
 	}
-	assert.Equal(t, []uint64{1, 11}, floors)
+	assert.Equal(t, []uint64{1}, binds)
+	assert.Equal(t, []uint64{1, 11, 11}, polls, "a poll carries the floor of the reply before it")
+	assert.Zero(t, requestCount(fixture.coordinator.recorded(), command.BindSessionCode),
+		"the sign-in bound the coordinator link")
 	assert.Equal(t, 1, fixture.primaries[0].connections())
 	assert.Equal(t, 2, requestCount(fixture.coordinator.recorded(), command.GetPartitionRouteCode))
 }
@@ -433,13 +470,17 @@ func TestPrimaryPoll_ForwardedTruncateReplyRefreshesMetadataFence(t *testing.T) 
 	require.NoError(t, err)
 	_, err = pollPrimaryPartition(context.Background(), fixture.client, 0)
 	require.NoError(t, err)
-	var floors []uint64
+	var binds, polls []uint64
 	for _, read := range fixture.primaries[0].recorded() {
-		if read.code() == uint32(command.BindSessionCode) {
-			floors = append(floors, binary.LittleEndian.Uint64(bindIdentity(t, read.payload)[24:]))
+		switch read.code() {
+		case uint32(command.BindSessionCode):
+			binds = append(binds, bindWatermark(t, read.payload))
+		case uint32(command.PollMessagesCode):
+			polls = append(polls, stampedContext(t, read).MetadataOp)
 		}
 	}
-	assert.Equal(t, []uint64{1, 42}, floors)
+	assert.Equal(t, []uint64{1}, binds)
+	assert.Equal(t, []uint64{1, 42}, polls)
 	assert.Equal(t, 1, fixture.primaries[0].connections())
 }
 
@@ -602,21 +643,14 @@ func TestPrimaryPoll_ManualIdentityAndChangedCredentialsBindNewDataConnections(t
 	for index, primary := range fixture.primaries {
 		_, err = pollPrimaryPartition(context.Background(), fixture.client, uint32(index))
 		require.NoError(t, err)
-		payload, err := vsr.SerializeBindSession(
-			(consumerSession{client: fixture.client.session.ClientID(), session: fixture.client.session.SessionID(), watermark: 11}).bytes(), iggcon.Version, fixture.client.session.BindSecret())
-		require.NoError(t, err)
-		var lastBind []byte
-		for _, read := range primary.recorded() {
-			if read.code() == uint32(command.BindSessionCode) {
-				lastBind = read.payload
-			}
-		}
-		assert.Equal(t, payload, lastBind)
+		requireLastBindNamesTheSession(t, fixture.client, primary.recorded())
 	}
-	configured, ok := fixture.client.signInCredentials()
+	assert.Equal(t, NewUsernamePasswordCredentials("iggy", "secret"), fixture.client.config.autoLogin.credentials,
+		"a manual user's update must not change the configured identity")
+	recovery, ok := fixture.client.signInCredentials()
 	require.True(t, ok)
-	assert.Equal(t, NewUsernamePasswordCredentials("iggy", "secret"), configured,
-		"a manual user's update must not change the configured reconnect identity")
+	assert.Equal(t, NewUsernamePasswordCredentials(newName, "changed-secret"), recovery,
+		"a recovery signs in as the updated manual user")
 }
 
 func TestPrimaryPoll_ConfiguredCredentialsFollowSuccessfulSelfUpdates(t *testing.T) {
@@ -632,15 +666,26 @@ func TestPrimaryPoll_ConfiguredCredentialsFollowSuccessfulSelfUpdates(t *testing
 	configured, ok := fixture.client.signInCredentials()
 	require.True(t, ok)
 	assert.Equal(t, expected, configured)
-	payload, err := vsr.SerializeBindSession((consumerSession{client: fixture.client.session.ClientID(), session: fixture.client.session.SessionID(), watermark: 11}).bytes(),
-		iggcon.Version, fixture.client.session.BindSecret())
-	require.NoError(t, err)
+	requireLastBindNamesTheSession(t, fixture.client, fixture.primaries[0].recorded())
+}
+
+// requireLastBindNamesTheSession checks that the last BindSession in reads
+// names the session and the secret of client. Its watermark is the one the
+// client had seen when the link bound, at most the current one.
+func requireLastBindNamesTheSession(t *testing.T, client *IggyTcpClient, reads []request) {
+	t.Helper()
 	var lastBind []byte
-	for _, read := range fixture.primaries[0].recorded() {
+	for _, read := range reads {
 		if read.code() == uint32(command.BindSessionCode) {
 			lastBind = read.payload
 		}
 	}
+	require.NotNil(t, lastBind)
+	watermark := bindWatermark(t, lastBind)
+	assert.LessOrEqual(t, watermark, client.metadataWatermark.Load())
+	identity := consumerSession{client: client.session.ClientID(), session: client.session.SessionID(), watermark: watermark}
+	payload, err := vsr.SerializeBindSession(identity.bytes(), iggcon.Version, client.session.BindSecret())
+	require.NoError(t, err)
 	assert.Equal(t, payload, lastBind)
 }
 
@@ -847,6 +892,32 @@ func TestStoreConsumerPosition_StampsTheContextOfThePoll(t *testing.T) {
 		Offset: position.Offset, PartitionId: &position.PartitionId}).MarshalBinary()
 	require.NoError(t, err)
 	assert.Equal(t, want, recorded[1].payload)
+}
+
+// A refused store goes again as a new request, which still carries the context
+// of the poll and not the one its route names.
+func TestStoreConsumerPosition_KeepsTheContextOfThePollAcrossARetry(t *testing.T) {
+	client, serverConn := newPipeClient(t)
+	stores := 0
+	server := servePartitionOperations(t, serverConn, func(_ int, _ request) []byte {
+		stores++
+		if stores == 1 {
+			return statusReplyFrame(vsr.OperationStoreConsumerOffset, uint32(ierror.LifecycleBusyCode), nil)
+		}
+		return replyFrame(vsr.OperationStoreConsumerOffset, resultSection())
+	})
+	stream, topic, consumer := groupConsumer(t)
+	polled := iggcon.PartitionContext{Incarnation: 5, OwnerGeneration: 3, MetadataOp: 9}
+	position := iggcon.ConsumerPosition{PartitionId: 4, Offset: 42, Context: polled}
+
+	require.NoError(t, client.StoreConsumerPosition(context.Background(), consumer, stream, topic, position))
+
+	stored := requestsFor(server.recorded(), vsr.OperationStoreConsumerOffset)
+	require.Len(t, stored, 2)
+	assert.NotEqual(t, stored[0].requestID(), stored[1].requestID())
+	for _, read := range stored {
+		assert.Equal(t, polled, stampedContext(t, read))
+	}
 }
 
 func stampedContext(t *testing.T, read request) iggcon.PartitionContext {
@@ -1180,8 +1251,8 @@ func TestPartitionMutationReplays57OnTheSameLinkAndPreservesUncertainty(t *testi
 			if finalStatus == 0 {
 				require.NoError(t, err)
 			} else {
-				require.ErrorIs(t, err, ierror.ErrUncertainOutcome)
-				var uncertain ierror.UncertainOutcome
+				require.ErrorIs(t, err, ierror.ErrOperationUncertain)
+				var uncertain ierror.OperationUncertain
 				require.ErrorAs(t, err, &uncertain)
 				require.NotZero(t, uncertain.OperationID)
 				nextCtx, nextCancel := context.WithTimeout(context.Background(), watchdogTimeout)
@@ -1204,6 +1275,70 @@ func TestPartitionMutationReplays57OnTheSameLinkAndPreservesUncertainty(t *testi
 			assert.Equal(t, sent[0].payload, sent[1].payload)
 			assert.Equal(t, 1, fixture.primaries[0].connections())
 		})
+	}
+}
+
+// A partition write that the server answers with 57 goes again with the same
+// request ID. A replay that commits ends the call with success, and 57 until
+// the deadline ends the call uncertain under that ID.
+func TestPartitionWriteReplays57UntilItCommitsOrTheDeadline(t *testing.T) {
+	const writeDeadline = 300 * time.Millisecond
+	stream, topic, group := groupConsumer(t)
+	consumer := iggcon.NewSingleConsumer(group.Id)
+	partition := uint32(0)
+	message, err := iggcon.NewIggyMessage([]byte("payload"))
+	require.NoError(t, err)
+	for _, write := range []struct {
+		name      string
+		operation vsr.Operation
+		committed []byte
+		call      func(ctx context.Context, client *IggyTcpClient) error
+	}{
+		{"send_messages", vsr.OperationSendMessages, zeroConfirmations(), func(ctx context.Context, client *IggyTcpClient) error {
+			_, err := client.SendMessages(ctx, stream, topic, iggcon.PartitionId(partition), []iggcon.IggyMessage{message})
+			return err
+		}},
+		{"store_consumer_offset", vsr.OperationStoreConsumerOffset, resultSection(), func(ctx context.Context, client *IggyTcpClient) error {
+			return client.StoreConsumerOffset(ctx, consumer, stream, topic, 7, &partition)
+		}},
+	} {
+		for _, commits := range []bool{true, false} {
+			outcome := "57_until_the_deadline"
+			if commits {
+				outcome = "57_then_committed"
+			}
+			t.Run(write.name+"/"+outcome, func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					client, serverConn := newPipeClient(t)
+					var attempts atomic.Uint32
+					server := servePartitionOperations(t, serverConn, func(_ int, _ request) []byte {
+						if commits && attempts.Add(1) > 1 {
+							return replyFrame(write.operation, write.committed)
+						}
+						return statusReplyFrame(write.operation, uint32(ierror.TransientNotCommittedCode), nil)
+					})
+					ctx, cancel := context.WithTimeout(context.Background(), writeDeadline)
+					defer cancel()
+
+					err := write.call(ctx, client)
+
+					sent := requestsFor(server.recorded(), write.operation)
+					if commits {
+						require.NoError(t, err)
+						require.Len(t, sent, 2)
+					} else {
+						var uncertain ierror.OperationUncertain
+						require.ErrorAs(t, err, &uncertain)
+						require.GreaterOrEqual(t, len(sent), 2, "the write went again before the deadline")
+						require.Equal(t, sent[0].requestID(), uncertain.OperationID)
+					}
+					for _, replay := range sent[1:] {
+						require.Equal(t, sent[0].header, replay.header, "a replay carries the request ID of the write")
+						require.Equal(t, sent[0].payload, replay.payload)
+					}
+				})
+			})
+		}
 	}
 }
 
@@ -1286,6 +1421,34 @@ func TestPartitionRoutingSharesOneRouteAcrossSendsPollsAndOffsets(t *testing.T) 
 			assert.Zero(t, stampedContext(t, read).OwnerGeneration)
 		}
 	}
+}
+
+// A lookup reads the roster first when none is known. The route it accepts is
+// cached under its query, so the next lookup sends nothing.
+func TestPartitionRouteLookupReadsAMissingRosterAndCachesTheRoute(t *testing.T) {
+	client, serverConn := newPipeClient(t)
+	// A one-node roster names the configured endpoint, so the pipe keeps its slot.
+	client.config.serverAddress = "pipe"
+	client.links.bootstrap = nil
+	client.links.hasRoster.Store(false)
+	server := servePartitionOperations(t, serverConn, func(_ int, _ request) []byte {
+		return clusterMetadataFrame(t, 0, "127.0.0.1:8090")
+	})
+	query := newRouteCacheProbe(t, client).query(0)
+
+	first, err := client.consumerRoute(context.Background(), query)
+	require.NoError(t, err)
+	cached, err := client.consumerRoute(context.Background(), query)
+	require.NoError(t, err)
+
+	assert.Equal(t, first, cached)
+	assert.Contains(t, client.polls.routes, string(query))
+	assert.True(t, client.links.hasRoster.Load())
+	recorded := server.recorded()
+	require.Len(t, recorded, 2)
+	assert.Equal(t, uint32(command.GetClusterMetadataCode), recorded[0].code())
+	assert.Equal(t, uint32(command.GetPartitionRouteCode), recorded[1].code())
+	assert.Equal(t, query, recorded[1].payload)
 }
 
 func TestPartitionRouteUnknownReplicaRefreshesRosterOncePerLookup(t *testing.T) {
@@ -1431,6 +1594,43 @@ func TestPartitionRouteAliasesHonorHighestViewAndRefusalFloor(t *testing.T) {
 	require.Equal(t, uint32(2), current.view)
 }
 
+// An invalidation of a route marks every alias of its partition history
+// stale, and a lookup of one alias leaves the others stale.
+func TestPartitionRouteInvalidationMarksEveryAliasOfTheHistoryStale(t *testing.T) {
+	client, peer := newPipeClient(t)
+	server := serve(peer, func(_ int, read request) []byte {
+		return pollRoutingReply(t, read, 0, 1)
+	})
+	stream, topic, _ := groupConsumer(t)
+	name, err := iggcon.NewIdentifier("orders")
+	require.NoError(t, err)
+	var aliases [][]byte
+	for _, alias := range []iggcon.Identifier{topic, name} {
+		key := newTopicKey(stream, alias)
+		aliases = append(aliases, binary.LittleEndian.AppendUint32([]byte(key.stream+key.topic), 0))
+	}
+	lookups := func() int { return requestCount(server.recorded(), command.GetPartitionRouteCode) }
+	routeAll := func() pollRoute {
+		t.Helper()
+		var route pollRoute
+		for _, query := range aliases {
+			var err error
+			route, err = client.consumerRoute(context.Background(), query)
+			require.NoError(t, err)
+		}
+		return route
+	}
+	route := routeAll()
+	routeAll()
+	require.Equal(t, len(aliases), lookups(), "each alias caches its route")
+
+	client.polls.invalidate(route, false)
+	routeAll()
+	routeAll()
+
+	require.Equal(t, 2*len(aliases), lookups(), "each alias looks its route up once more")
+}
+
 func TestPartitionRouteCacheRemainsBoundedAcrossGroupChurn(t *testing.T) {
 	client, peer := newPipeClient(t)
 	serve(peer, func(_ int, read request) []byte {
@@ -1448,6 +1648,268 @@ func TestPartitionRouteCacheRemainsBoundedAcrossGroupChurn(t *testing.T) {
 	}
 	require.Len(t, client.polls.routes, maxPollRoutes)
 	require.Len(t, client.polls.hints, maxPollRoutes)
+}
+
+// routeCacheProbe accepts routes for the partitions of one topic straight
+// into the route cache of client.
+type routeCacheProbe struct {
+	client *IggyTcpClient
+	topic  []byte
+}
+
+func newRouteCacheProbe(t *testing.T, client *IggyTcpClient) routeCacheProbe {
+	t.Helper()
+	stream, topic, _ := groupConsumer(t)
+	key := newTopicKey(stream, topic)
+	return routeCacheProbe{client: client, topic: []byte(key.stream + key.topic)}
+}
+
+func (p routeCacheProbe) query(partition uint32) []byte {
+	return binary.LittleEndian.AppendUint32(append([]byte(nil), p.topic...), partition)
+}
+
+func (p routeCacheProbe) accept(partition uint32, incarnation uint64) error {
+	query := p.query(partition)
+	_, err := p.client.acceptRoute(p.client.sessionFence, string(query), query,
+		iggcon.PartitionRoute{Incarnation: incarnation, PartitionsCount: 1})
+	return err
+}
+
+func (p routeCacheProbe) cached(partition uint32) bool {
+	_, cached := p.client.polls.routes[string(p.query(partition))]
+	return cached
+}
+
+// requireRouteAccounting checks the alias counts and the idle hints against
+// the cached routes.
+func requireRouteAccounting(t *testing.T, client *IggyTcpClient) {
+	t.Helper()
+	polls := &client.polls
+	polls.mu.Lock()
+	defer polls.mu.Unlock()
+	aliases := make(map[laneKey]int)
+	for _, route := range polls.routes {
+		_, hinted := polls.hints[route.key]
+		require.True(t, hinted, "a cached route keeps its hint")
+		aliases[route.key]++
+	}
+	require.Equal(t, aliases, polls.aliases)
+	for group := range polls.idle {
+		_, hinted := polls.hints[group]
+		require.True(t, hinted, "an idle history keeps its hint until eviction")
+	}
+	for group := range polls.hints {
+		_, idle := polls.idle[group]
+		require.Equal(t, aliases[group] == 0, idle, "history %+v", group)
+	}
+}
+
+// A route that moves to another partition history takes its count along, so
+// the history it left is the idle one that makes room for a new history.
+func TestPartitionRouteAliasOverwriteToAnotherHistoryMovesItsCount(t *testing.T) {
+	client, _ := newPipeClient(t)
+	cache := newRouteCacheProbe(t, client)
+	left, joined := laneKey{incarnation: 1}, laneKey{incarnation: 2}
+	require.NoError(t, cache.accept(0, left.incarnation))
+	require.NoError(t, cache.accept(0, joined.incarnation))
+	for partition := uint32(1); partition < maxPollRoutes-1; partition++ {
+		require.NoError(t, cache.accept(partition, left.incarnation))
+	}
+	require.Len(t, client.polls.hints, maxPollRoutes)
+	requireRouteAccounting(t, client)
+
+	require.NoError(t, cache.accept(maxPollRoutes-1, left.incarnation))
+
+	require.NotContains(t, client.polls.hints, left, "the history that the route left")
+	require.Contains(t, client.polls.hints, joined)
+	require.Len(t, client.polls.hints, maxPollRoutes)
+	require.Len(t, client.polls.routes, maxPollRoutes)
+	requireRouteAccounting(t, client)
+}
+
+// Eviction takes the route accepted first. A route accepted again counts from
+// its new acceptance, and a dropped route leaves nothing to evict.
+func TestPartitionRouteCacheEvictsTheOldestAcceptedRoute(t *testing.T) {
+	client, _ := newPipeClient(t)
+	cache := newRouteCacheProbe(t, client)
+	const (
+		incarnation  = 1
+		refreshed    = 0
+		dropped      = 1
+		firstEvicted = 2
+		seeded       = 10
+	)
+	for partition := range uint32(seeded) {
+		require.NoError(t, cache.accept(partition, incarnation))
+	}
+	require.NoError(t, cache.accept(refreshed, incarnation))
+	client.polls.dropRoute(string(cache.query(dropped)))
+	next := uint32(seeded)
+	for len(client.polls.routes) < maxPollRoutes {
+		require.NoError(t, cache.accept(next, incarnation))
+		next++
+	}
+
+	for partition := uint32(firstEvicted); partition < seeded; partition++ {
+		require.True(t, cache.cached(partition))
+		require.NoError(t, cache.accept(next, incarnation))
+		next++
+		require.False(t, cache.cached(partition), "partition %d holds the oldest route", partition)
+	}
+	require.True(t, cache.cached(refreshed))
+	require.NoError(t, cache.accept(next, incarnation))
+	next++
+	require.False(t, cache.cached(refreshed), "the route accepted again is now the oldest")
+
+	// The same at a full cache, where the oldest route is accepted again right
+	// before the eviction. Dropping the newest route first keeps that accept
+	// from evicting.
+	oldest := uint32(seeded)
+	for range 2 {
+		next--
+		client.polls.dropRoute(string(cache.query(next)))
+		require.NoError(t, cache.accept(oldest, incarnation))
+		for range 2 {
+			require.NoError(t, cache.accept(next, incarnation))
+			next++
+		}
+		require.True(t, cache.cached(oldest), "partition %d was accepted again", oldest)
+		require.False(t, cache.cached(oldest+1), "partition %d holds the oldest route", oldest+1)
+		oldest += 2
+	}
+	requireRouteAccounting(t, client)
+}
+
+// Accepting the same route again and again leaves no unbounded age record.
+func TestPartitionRouteAgesStayBoundedUnderRepeatedAccepts(t *testing.T) {
+	client, _ := newPipeClient(t)
+	cache := newRouteCacheProbe(t, client)
+	for range 8 * maxPollRoutes {
+		require.NoError(t, cache.accept(0, 1))
+	}
+	require.Len(t, client.polls.routes, 1)
+	require.LessOrEqual(t, cap(client.polls.ages), 2*maxPollRoutes)
+	requireRouteAccounting(t, client)
+}
+
+// BenchmarkAcceptRouteFullCache accepts the route of a new partition history
+// while the routes and the hints are full. Each accept evicts the oldest route
+// and the hint that this eviction leaves without a route.
+func BenchmarkAcceptRouteFullCache(b *testing.B) {
+	client := NewIggyTcpClient(slog.New(slog.DiscardHandler), WithHeartbeatInterval(0))
+	b.Cleanup(func() { _ = client.Close() })
+	stream, _ := iggcon.NewIdentifier(uint32(1))
+	topic, _ := iggcon.NewIdentifier(uint32(2))
+	key := newTopicKey(stream, topic)
+	// Twice the bound, so a query comes back only after its route was evicted.
+	queries := make([][]byte, 2*maxPollRoutes)
+	keys := make([]string, len(queries))
+	for partition := range queries {
+		queries[partition] = binary.LittleEndian.AppendUint32([]byte(key.stream+key.topic), uint32(partition))
+		keys[partition] = string(queries[partition])
+	}
+	accept := func(history int) {
+		slot := history % len(queries)
+		route := iggcon.PartitionRoute{Incarnation: uint64(history), PartitionsCount: 1}
+		if _, err := client.acceptRoute(client.sessionFence, keys[slot], queries[slot], route); err != nil {
+			b.Fatal(err)
+		}
+	}
+	for history := range maxPollRoutes {
+		accept(history)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for history := maxPollRoutes; history < maxPollRoutes+b.N; history++ {
+		accept(history)
+	}
+}
+
+// BenchmarkRoutedOperation runs routed calls one after another on a pipe,
+// with their route cached. The server reads into one buffer and answers with
+// fixed replies, so allocs/op counts the client.
+func BenchmarkRoutedOperation(b *testing.B) {
+	stream, _ := iggcon.NewIdentifier(uint32(1))
+	topic, _ := iggcon.NewIdentifier(uint32(2))
+	member, _ := iggcon.NewIdentifier(uint32(3))
+	consumer := iggcon.NewSingleConsumer(member)
+	partition := uint32(0)
+	position := iggcon.ConsumerPosition{PartitionId: partition, Offset: 1, Context: iggcon.PartitionContext{Incarnation: 1, MetadataOp: 1}}
+	ctx := context.Background()
+	for _, bench := range []struct {
+		name string
+		call func(client *IggyTcpClient) error
+	}{
+		{"poll", func(client *IggyTcpClient) error {
+			_, err := client.PollMessages(ctx, stream, topic, consumer, iggcon.OffsetPollingStrategy(0), 1, false, &partition)
+			return err
+		}},
+		{"store_offset", func(client *IggyTcpClient) error {
+			return client.StoreConsumerOffset(ctx, consumer, stream, topic, 1, &partition)
+		}},
+		{"store_position", func(client *IggyTcpClient) error {
+			return client.StoreConsumerPosition(ctx, consumer, stream, topic, position)
+		}},
+	} {
+		b.Run(bench.name, func(b *testing.B) {
+			client, serverConn := newPipeClient(b)
+			route := pollRoutingReply(b, request{}, 0, 1)
+			polled := replyFrame(vsr.OperationNonReplicated, emptyBatchBody(partition))
+			stored := replyFrame(vsr.OperationStoreConsumerOffset, resultSection())
+			go answerInPlace(serverConn, func(read request) []byte {
+				switch {
+				case read.code() == uint32(command.GetPartitionRouteCode):
+					return route
+				case read.code() == uint32(command.PollMessagesCode):
+					return polled
+				case read.operation() == vsr.OperationStoreConsumerOffset:
+					return stored
+				default:
+					return nil
+				}
+			})
+			if err := bench.call(client); err != nil {
+				b.Fatal(err)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				if err := bench.call(client); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// answerInPlace answers each frame read off conn with the frame that reply
+// returns for it, stamped in place, and closes conn on a nil one. Every frame
+// is read into one buffer.
+func answerInPlace(conn net.Conn, reply func(read request) []byte) {
+	defer func() { _ = conn.Close() }()
+	var read request
+	var buffer []byte
+	for {
+		if _, err := io.ReadFull(conn, read.header[:]); err != nil {
+			return
+		}
+		size := int(binary.LittleEndian.Uint32(read.header[frameOffsetSize:])) - vsr.HeaderSize
+		if cap(buffer) < size {
+			buffer = make([]byte, size)
+		}
+		read.payload = buffer[:size]
+		if _, err := io.ReadFull(conn, read.payload); err != nil {
+			return
+		}
+		answer := reply(read)
+		if answer == nil {
+			return
+		}
+		echoReplyRequest(answer, read)
+		if _, err := conn.Write(answer); err != nil {
+			return
+		}
+	}
 }
 
 func TestPartitionRouteFromRetiredSessionCannotPopulateCachesOrWatermark(t *testing.T) {
@@ -1589,6 +2051,283 @@ func TestPartitionLookupDistinguishesLaggingReplicasFromMissingNamespaces(t *tes
 	}
 }
 
+// A partition primary that is a metadata backup can lag the namespace of a
+// request. Its miss sends the call back to a lookup at the metadata primary,
+// whose own miss or refusal ends the call. A final miss leaves the route
+// stale, so the next call looks the partition up there again. The belief about
+// the metadata primary can predate a view change, so its miss is final only
+// while a roster read on its link still names it.
+func TestPartitionRequestRetriesANamespaceMissOnlyFromAMetadataBackup(t *testing.T) {
+	missStatus := func(read request, missing ierror.IggyError) []byte {
+		return statusReplyFrame(read.operation(), uint32(missing.Code()), nil)
+	}
+	send := func(t *testing.T, ctx context.Context, fixture *primaryPollFixture) error {
+		stream, topic, _ := groupConsumer(t)
+		_, err := fixture.client.SendBinaryRequest(ctx, uint32(command.SendMessagesCode),
+			rawSendPayload(t, stream, topic, iggcon.PartitionId(0)))
+		return err
+	}
+	sends := func(server *testListener) int {
+		return len(requestsFor(server.recorded(), vsr.OperationSendMessages))
+	}
+	missingTopic := func(_, _ int, read request) ([]byte, bool) {
+		if read.operation() != vsr.OperationSendMessages {
+			return nil, false
+		}
+		return missStatus(read, ierror.ErrTopicIdNotFound), true
+	}
+	assertLookupsOnlyAtMetadataPrimary := func(t *testing.T, fixture *primaryPollFixture, lookups int) {
+		assert.Equal(t, lookups, requestCount(fixture.coordinator.recorded(), command.GetPartitionRouteCode))
+		for _, replica := range fixture.primaries {
+			assert.Zero(t, requestCount(replica.recorded(), command.GetPartitionRouteCode))
+		}
+	}
+	for _, missing := range []ierror.IggyError{ierror.ErrStreamIdNotFound, ierror.ErrStreamNameNotFound,
+		ierror.ErrTopicIdNotFound, ierror.ErrTopicNameNotFound, ierror.ErrPartitionNotFound} {
+		t.Run(fmt.Sprint(missing.Code()), func(t *testing.T) {
+			t.Run("backup_then_success", func(t *testing.T) {
+				var attempts atomic.Uint32
+				fixture := newPrimaryPollFixture(t, func(_, _ int, read request) ([]byte, bool) {
+					if read.operation() != vsr.OperationSendMessages {
+						return nil, false
+					}
+					if attempts.Add(1) == 1 {
+						return missStatus(read, missing), true
+					}
+					return replyFrame(read.operation(), zeroConfirmations()), true
+				}, nil)
+				awaitReplicaLinks(t, fixture)
+				ctx, cancel := context.WithTimeout(context.Background(), managedLinkTestBudget)
+				defer cancel()
+
+				require.NoError(t, send(t, ctx, fixture))
+
+				assertLookupsOnlyAtMetadataPrimary(t, fixture, 2)
+				assert.Equal(t, 2, sends(fixture.primaries[0]))
+				assert.Zero(t, sends(fixture.primaries[1]))
+			})
+			t.Run("metadata_primary", func(t *testing.T) {
+				fixture := newPrimaryPollFixture(t, nil, func(_ int, read request) ([]byte, bool) {
+					switch {
+					case read.code() == uint32(command.GetPartitionRouteCode):
+						return routeReply(t, read, 0), true
+					case read.operation() == vsr.OperationSendMessages:
+						return missStatus(read, missing), true
+					}
+					return nil, false
+				})
+				ctx, cancel := context.WithTimeout(context.Background(), managedLinkTestBudget)
+				defer cancel()
+
+				require.ErrorIs(t, send(t, ctx, fixture), missing)
+				require.ErrorIs(t, send(t, ctx, fixture), missing)
+
+				assertLookupsOnlyAtMetadataPrimary(t, fixture, 2)
+				assert.Equal(t, 2, sends(fixture.coordinator))
+				for _, replica := range fixture.primaries {
+					assert.Zero(t, sends(replica))
+				}
+			})
+		})
+	}
+	t.Run("metadata_primary_refuses_the_lookup", func(t *testing.T) {
+		var lookups atomic.Uint32
+		fixture := newPrimaryPollFixture(t, missingTopic, func(_ int, read request) ([]byte, bool) {
+			if read.code() == uint32(command.GetPartitionRouteCode) && lookups.Add(1) > 1 {
+				return statusReplyFrame(read.operation(), uint32(ierror.UnauthorizedCode), nil), true
+			}
+			return nil, false
+		})
+		awaitReplicaLinks(t, fixture)
+		ctx, cancel := context.WithTimeout(context.Background(), managedLinkTestBudget)
+		defer cancel()
+
+		require.ErrorIs(t, send(t, ctx, fixture), ierror.ErrUnauthorized)
+
+		assertLookupsOnlyAtMetadataPrimary(t, fixture, 2)
+		assert.Equal(t, 1, sends(fixture.primaries[0]))
+		assert.Zero(t, sends(fixture.primaries[1]))
+	})
+	// The partition primary is a deposed metadata primary that lags. It misses
+	// the lookup or the send once, and the roster on its link names the
+	// elected one, where the next lookup starts.
+	for _, missed := range []struct {
+		name    string
+		request func(read request) bool
+	}{
+		{"lookup", func(read request) bool { return read.code() == uint32(command.GetPartitionRouteCode) }},
+		{"send", func(read request) bool { return read.operation() == vsr.OperationSendMessages }},
+	} {
+		t.Run("deposed_metadata_primary/"+missed.name, func(t *testing.T) {
+			const elected = 1
+			var deposed atomic.Bool
+			var misses atomic.Uint32
+			var fixture *primaryPollFixture
+			afterElection := func(read request) ([]byte, bool) {
+				switch {
+				case !deposed.Load():
+					return nil, false
+				case read.code() == uint32(command.GetClusterMetadataCode):
+					return fixture.roster(t, elected), true
+				case read.code() == uint32(command.GetPartitionRouteCode):
+					return routeReply(t, read, 0), true
+				case read.operation() == vsr.OperationSendMessages:
+					return replyFrame(read.operation(), zeroConfirmations()), true
+				}
+				return nil, false
+			}
+			fixture = newPrimaryPollFixture(t, func(_, _ int, read request) ([]byte, bool) {
+				return afterElection(read)
+			}, func(_ int, read request) ([]byte, bool) {
+				if deposed.Load() && missed.request(read) && misses.Add(1) == 1 {
+					return missStatus(read, ierror.ErrTopicIdNotFound), true
+				}
+				return afterElection(read)
+			})
+			awaitReplicaLinks(t, fixture)
+			deposed.Store(true)
+			ctx, cancel := context.WithTimeout(context.Background(), managedLinkTestBudget)
+			defer cancel()
+
+			require.NoError(t, send(t, ctx, fixture))
+
+			believed, named := fixture.client.links.metadataPrimary()
+			require.True(t, named)
+			assert.Equal(t, uint8(elected), believed)
+			assert.Equal(t, 1, requestCount(fixture.coordinator.recorded(), command.GetPartitionRouteCode))
+			assert.Equal(t, 1, requestCount(fixture.primaries[0].recorded(), command.GetPartitionRouteCode))
+			assert.Zero(t, requestCount(fixture.primaries[1].recorded(), command.GetPartitionRouteCode))
+		})
+	}
+	// The believed metadata primary lost its link, so no lookup reaches it,
+	// and every other replica misses the namespace. The roster on the link of
+	// the elected one names it, so its miss ends the call at once, with a
+	// route cached before the loss and without one.
+	for _, cached := range []bool{false, true} {
+		t.Run(fmt.Sprintf("metadata_primary_without_a_link/cached_%t", cached), func(t *testing.T) {
+			const elected = 1
+			var down atomic.Bool
+			var fixture *primaryPollFixture
+			fixture = newPrimaryPollFixture(t, func(_, _ int, read request) ([]byte, bool) {
+				switch {
+				case !down.Load() && read.operation() == vsr.OperationSendMessages:
+					return replyFrame(read.operation(), zeroConfirmations()), true
+				case !down.Load():
+					return nil, false
+				case read.code() == uint32(command.GetClusterMetadataCode):
+					return fixture.roster(t, elected), true
+				case read.code() == uint32(command.GetPartitionRouteCode), read.operation() == vsr.OperationSendMessages:
+					return missStatus(read, ierror.ErrTopicIdNotFound), true
+				}
+				return nil, false
+			}, nil)
+			awaitReplicaLinks(t, fixture)
+			ctx, cancel := context.WithTimeout(context.Background(), managedLinkTestBudget)
+			defer cancel()
+			if cached {
+				require.NoError(t, send(t, ctx, fixture))
+			}
+			deposed := fixture.client.links.replica(0)
+			require.NotNil(t, deposed)
+			require.NoError(t, fixture.coordinator.listener.Close())
+			deposed.close(ierror.ErrDisconnected)
+			down.Store(true)
+
+			require.ErrorIs(t, send(t, ctx, fixture), ierror.ErrTopicIdNotFound)
+
+			believed, named := fixture.client.links.metadataPrimary()
+			require.True(t, named)
+			assert.Equal(t, uint8(elected), believed)
+		})
+	}
+	t.Run("deadline", func(t *testing.T) {
+		const missesBeforeDeadline = 2
+		ctx, cancel := context.WithTimeout(context.Background(), managedLinkTestBudget)
+		defer cancel()
+		var lookups atomic.Uint32
+		fixture := newPrimaryPollFixture(t, missingTopic, func(_ int, read request) ([]byte, bool) {
+			if read.code() != uint32(command.GetPartitionRouteCode) || lookups.Add(1) <= missesBeforeDeadline {
+				return nil, false
+			}
+			// The deadline falls while this lookup goes unanswered, so no send is in flight.
+			cancel()
+			return nil, true
+		})
+		awaitReplicaLinks(t, fixture)
+
+		require.ErrorIs(t, send(t, ctx, fixture), ierror.ErrTransientNotAccepted)
+
+		assertLookupsOnlyAtMetadataPrimary(t, fixture, missesBeforeDeadline+1)
+		assert.Equal(t, missesBeforeDeadline, sends(fixture.primaries[0]))
+		assert.Zero(t, sends(fixture.primaries[1]))
+	})
+}
+
+// A call keeps the sign-in epoch that it started in. A sign-in of the caller
+// ends the route lookup of an earlier call with 40. A lookup that starts after
+// the sign-in reads nothing under the new session, and a lookup with a read in
+// flight ends with 40 whatever the server answers to that read.
+func TestPartitionLookupOfAnEarlierSignInEndsWith40(t *testing.T) {
+	stream, topic, _ := groupConsumer(t)
+	key := newTopicKey(stream, topic)
+	query := binary.LittleEndian.AppendUint32([]byte(key.stream+key.topic), 0)
+	for _, inFlight := range []bool{false, true} {
+		name := "lookup_after_the_sign_in"
+		if inFlight {
+			name = "lookup_in_flight"
+		}
+		t.Run(name, func(t *testing.T) {
+			asked, answered := make(chan struct{}), make(chan struct{})
+			ask, answer := sync.OnceFunc(func() { close(asked) }), sync.OnceFunc(func() { close(answered) })
+			t.Cleanup(answer)
+			var server *testListener
+			node := singleNodeHandler(t, func() string { return server.address() })
+			server = listenVSR(t, nil, func(connection, index int, read request) []byte {
+				if read.code() != uint32(command.GetPartitionRouteCode) {
+					return node(connection, index, read)
+				}
+				ask()
+				<-answered
+				return statusReplyFrame(read.operation(), uint32(ierror.UnauthorizedCode), nil)
+			})
+			client := newDialingClient(t, server.address(), WithAutoLogin(NewUsernamePasswordCredentials("iggy", "iggy")))
+			ctx, cancel := context.WithTimeout(context.Background(), managedLinkTestBudget)
+			defer cancel()
+			require.NoError(t, client.Connect(ctx))
+			callCtx, endCall := client.operationContext(ctx)
+			defer endCall()
+			await := func(event <-chan struct{}, failure string) {
+				select {
+				case <-event:
+				case <-ctx.Done():
+					t.Fatal(failure)
+				}
+			}
+			signedIn, routed := make(chan error, 1), make(chan error, 1)
+			signIn := func() { _, err := client.LoginUser(ctx, "other", "password"); signedIn <- err }
+			lookUp := func() { _, err := client.consumerRoute(callCtx, query); routed <- err }
+			lookups := 0
+			if inFlight {
+				lookups = 1
+				go lookUp()
+				await(asked, "the lookup never reached the server")
+				go signIn()
+				await(client.callEpoch(callCtx).ended, "the sign-in did not end the epoch of the call")
+				answer()
+			} else {
+				answer()
+				signIn()
+				go lookUp()
+			}
+
+			require.NoError(t, <-signedIn)
+			require.ErrorIs(t, <-routed, ierror.ErrUnauthenticated)
+			require.Equal(t, lookups, requestCount(server.recorded(), command.GetPartitionRouteCode),
+				"no lookup went out under the new session")
+		})
+	}
+}
+
 func TestPartitionRouteCannotReplaceANewerMetadataFloorOrPartitionCount(t *testing.T) {
 	client, peer := newPipeClient(t)
 	received, release := make(chan struct{}), make(chan struct{})
@@ -1661,4 +2400,84 @@ func TestPartitionLookupRotatesRosterOrderAndPrefersRefusingReplicaOnce(t *testi
 	mutex.Lock()
 	require.Equal(t, []uint8{0, 1, 2, 1, 0, 2}, visited)
 	mutex.Unlock()
+}
+
+func TestPartitionRefusalsRestartLookupAtMetadataPrimary(t *testing.T) {
+	for _, refusal := range []ierror.IggyError{ierror.ErrHistoryUnavailable, ierror.ErrConsumerGroupPartitionNotOwned} {
+		t.Run(fmt.Sprint(refusal.Code()), func(t *testing.T) {
+			var refused atomic.Bool
+			fixture := newPrimaryPollFixture(t, func(_ int, _ int, read request) ([]byte, bool) {
+				if read.code() == uint32(command.PollMessagesCode) && refused.CompareAndSwap(false, true) {
+					return statusReplyFrame(read.operation(), uint32(refusal.Code()), nil), true
+				}
+				return nil, false
+			}, nil)
+			awaitReplicaLinks(t, fixture)
+
+			_, err := pollPrimaryPartition(context.Background(), fixture.client, 0)
+			require.ErrorIs(t, err, refusal)
+			_, err = pollPrimaryPartition(context.Background(), fixture.client, 0)
+			require.NoError(t, err)
+
+			assert.Equal(t, 2, requestCount(fixture.coordinator.recorded(), command.GetPartitionRouteCode),
+				"the next call must ask the metadata primary")
+			for _, replica := range fixture.primaries {
+				assert.Zero(t, requestCount(replica.recorded(), command.GetPartitionRouteCode))
+			}
+		})
+	}
+}
+
+func TestPartitionLifecycleBusyKeepsTheRouteForItsNewRequest(t *testing.T) {
+	var attempts atomic.Uint32
+	fixture := newPrimaryPollFixture(t, func(_ int, _ int, read request) ([]byte, bool) {
+		if read.operation() != vsr.OperationStoreConsumerOffset {
+			return nil, false
+		}
+		if attempts.Add(1) == 1 {
+			return replyFrame(read.operation(), resultSection(uint32(ierror.LifecycleBusyCode))), true
+		}
+		return replyFrame(read.operation(), resultSection()), true
+	}, nil)
+	awaitReplicaLinks(t, fixture)
+	stream, topic, group := groupConsumer(t)
+	partition := uint32(0)
+
+	err := fixture.client.StoreConsumerOffset(context.Background(), iggcon.NewSingleConsumer(group.Id), stream, topic, 7, &partition)
+	require.NoError(t, err)
+
+	require.Equal(t, uint32(2), attempts.Load())
+	require.Equal(t, 1, requestCount(fixture.coordinator.recorded(), command.GetPartitionRouteCode))
+	for _, replica := range fixture.primaries {
+		require.Zero(t, requestCount(replica.recorded(), command.GetPartitionRouteCode), "LifecycleBusy does not invalidate the route")
+	}
+	sent := requestsFor(fixture.primaries[0].recorded(), vsr.OperationStoreConsumerOffset)
+	require.Len(t, sent, 2)
+	require.NotEqual(t, sent[0].requestID(), sent[1].requestID(), "the committed refusal spent its request ID")
+}
+
+func TestSendHistoryRefreshStartsAtMetadataPrimary(t *testing.T) {
+	var attempts atomic.Uint32
+	fixture := newPrimaryPollFixture(t, func(_ int, _ int, read request) ([]byte, bool) {
+		if read.operation() != vsr.OperationSendMessages {
+			return nil, false
+		}
+		if attempts.Add(1) == 1 {
+			return statusReplyFrame(read.operation(), uint32(ierror.HistoryUnavailableCode), nil), true
+		}
+		return replyFrame(read.operation(), zeroConfirmations()), true
+	}, nil)
+	awaitReplicaLinks(t, fixture)
+	stream, topic, _ := groupConsumer(t)
+	message, err := iggcon.NewIggyMessage([]byte("payload"))
+	require.NoError(t, err)
+
+	_, err = fixture.client.SendMessages(context.Background(), stream, topic, iggcon.PartitionId(0), []iggcon.IggyMessage{message})
+	require.NoError(t, err)
+
+	require.Equal(t, uint32(2), attempts.Load())
+	require.Equal(t, 2, requestCount(fixture.coordinator.recorded(), command.GetPartitionRouteCode))
+	for _, replica := range fixture.primaries {
+		require.Zero(t, requestCount(replica.recorded(), command.GetPartitionRouteCode))
+	}
 }

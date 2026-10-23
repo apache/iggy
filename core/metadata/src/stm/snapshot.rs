@@ -135,6 +135,13 @@ pub enum SnapshotError {
         commit_op: u64,
         table_frontier: u64,
     },
+    /// A state transfer moved the history certificate off the WAL suffix above
+    /// `snapshot_seq` and could not make that binding durable. The suffix stays: a
+    /// restart after removing it would find the recorded binding gone and certify
+    /// no view.
+    HistoryBindingNotDurable {
+        snapshot_seq: u64,
+    },
 }
 
 /// Stage at which snapshot persistence failed.
@@ -197,6 +204,13 @@ impl fmt::Display for SnapshotError {
                      commit_op {commit_op}, table frontier {table_frontier}"
                 )
             }
+            Self::HistoryBindingNotDurable { snapshot_seq } => {
+                write!(
+                    f,
+                    "state transfer to op {snapshot_seq} could not persist its history \
+                     binding; the WAL suffix above it was kept"
+                )
+            }
         }
     }
 }
@@ -214,7 +228,8 @@ impl std::error::Error for SnapshotError {
             | Self::InvalidTrailer
             | Self::Truncated { .. }
             | Self::UnsupportedFormatVersion { .. }
-            | Self::IncoherentManifest { .. } => None,
+            | Self::IncoherentManifest { .. }
+            | Self::HistoryBindingNotDurable { .. } => None,
         }
     }
 }

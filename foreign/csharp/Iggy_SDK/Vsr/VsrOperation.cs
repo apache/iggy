@@ -149,17 +149,8 @@ internal static class VsrOperations
     ///     Whether losing the connection mid-request leaves nothing for the server to deduplicate, so the request
     ///     can be re-issued on a fresh session by the reconnect path instead of failing the caller.
     /// </summary>
-    internal static bool IsReplaySafeRead(int code, bool isLoginRegister, ReadOnlySpan<byte> body)
+    internal static bool IsReplaySafeRead(int code, ReadOnlySpan<byte> body)
     {
-        // A register lost mid-flight is replayable: the retry re-arms the session under a fresh client id, so
-        // it cannot be mistaken for the first one. At worst the server keeps an entry nobody binds, which it
-        // ages out. Reporting an unknown outcome here instead would deny the caller the retry that is in fact
-        // the only correct response.
-        if (isLoginRegister)
-        {
-            return true;
-        }
-
         var operation = ForCode(code);
 
         if (operation != VsrOperation.NonReplicated)

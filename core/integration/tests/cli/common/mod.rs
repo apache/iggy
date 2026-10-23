@@ -29,10 +29,12 @@ use async_trait::async_trait;
 use iggy::prelude::Client;
 use integration::harness::{
     ServerHandle, TestBinary, TestHarness, TestHarnessBuilder, TestServerConfig,
+    backup_commit_budget,
 };
 use std::fmt::{Display, Formatter, Result};
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 pub(crate) enum TestIdentifier {
     Numeric,
@@ -155,6 +157,11 @@ impl IggyCmdTest {
                 .expect("Failed to start test harness");
         }
         self.clear_session_keyring();
+    }
+
+    /// See [`backup_commit_budget`]. Needs the servers that [`Self::setup`] starts.
+    pub(crate) fn backup_commit_budget(&self) -> Duration {
+        backup_commit_budget(&self.harness)
     }
 
     /// Drop any CLI session token the OS keyring holds for this server's

@@ -19,9 +19,9 @@
 
 use bytes::Bytes;
 use kafka_protocol::messages::{
-    AlterConfigsResponse, ApiKey, ApiVersionsResponse, CreateTopicsResponse,
+    AlterConfigsResponse, ApiKey, ApiVersionsResponse, CreateTopicsResponse, DeleteGroupsResponse,
     DescribeConfigsResponse, FetchResponse, InitProducerIdResponse, ListOffsetsResponse,
-    MetadataResponse, ProduceResponse,
+    MetadataResponse, OffsetDeleteResponse, ProduceResponse,
 };
 use kafka_protocol::protocol::Decodable;
 
@@ -109,6 +109,7 @@ fn is_acceptable_verify_error(api_key: i16, error_code: i16) -> bool {
         3 => error_code == 3,     // Metadata stub: UNKNOWN_TOPIC_OR_PARTITION
         // CreateTopics / DeleteTopics / DescribeConfigs / AlterConfigs / CreatePartitions stub
         19 | 20 | 32 | 33 | 37 => error_code == 41,
+        42 | 47 => error_code == 69, // DeleteGroups / OffsetDelete: `test-group` does not exist
         _ => false,
     }
 }
@@ -388,6 +389,47 @@ fn decode_body(
                 ));
             }
         }
+        42 => {
+            let resp = DeleteGroupsResponse::decode(&mut buf, api_version)?;
+            details.push(format!("throttle_time_ms={}", resp.throttle_time_ms));
+            details.push(format!("results={}", resp.results.len()));
+            for (i, result) in resp.results.iter().enumerate().take(4) {
+                codes.push(result.error_code);
+                details.push(format!(
+                    "results[{i}]: group={} ec={} ({})",
+                    result.group_id.0,
+                    result.error_code,
+                    format_error_code(result.error_code)
+                ));
+            }
+        }
+        47 => {
+            let resp = OffsetDeleteResponse::decode(&mut buf, api_version)?;
+            codes.push(resp.error_code);
+            details.push(format!(
+                "top_level.error_code={} ({})",
+                resp.error_code,
+                format_error_code(resp.error_code)
+            ));
+            details.push(format!("throttle_time_ms={}", resp.throttle_time_ms));
+            details.push(format!("topics={}", resp.topics.len()));
+            for (ti, topic) in resp.topics.iter().enumerate().take(4) {
+                details.push(format!(
+                    "topics[{ti}]: name={} partitions={}",
+                    topic_name(&topic.name),
+                    topic.partitions.len()
+                ));
+                for (pi, p) in topic.partitions.iter().enumerate().take(4) {
+                    codes.push(p.error_code);
+                    details.push(format!(
+                        "  partitions[{pi}]: index={} ec={} ({})",
+                        p.partition_index,
+                        p.error_code,
+                        format_error_code(p.error_code)
+                    ));
+                }
+            }
+        }
         22 => {
             let resp = InitProducerIdResponse::decode(&mut buf, api_version)?;
             codes.push(resp.error_code);
@@ -430,6 +472,8 @@ fn format_error_code(code: i16) -> &'static str {
         38 => "INVALID_REPLICATION_FACTOR",
         41 => "NOT_CONTROLLER",
         42 => "INVALID_REQUEST",
+        68 => "NON_EMPTY_GROUP",
+        69 => "GROUP_ID_NOT_FOUND",
         -1 => "UNKNOWN",
         _ => "OTHER",
     }

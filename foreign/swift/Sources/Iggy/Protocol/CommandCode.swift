@@ -51,7 +51,7 @@ public enum CommandCode: UInt32, Sendable, Hashable, CaseIterable {
     case getConsumerOffset = 120
     case storeConsumerOffset = 121
     case deleteConsumerOffset = 122
-    // 123 is retired and must never be reused.
+    // 123 and 124 are retired and must never be reused.
     case getStream = 200
     case getStreams = 201
     case createStream = 202

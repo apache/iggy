@@ -33,12 +33,13 @@ use crate::IggyError;
 use crate::http::users::defaults::{
     MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH, MIN_PASSWORD_LENGTH, MIN_USERNAME_LENGTH,
 };
-use crate::{BinaryClient, ClientState, Credentials};
+use crate::{BinaryClient, ClientState, Credentials, IdentityInfo};
 use bytes::Bytes;
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::codes::{LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE};
 use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::requests::users::{LoginRegisterRequest, LoginRegisterWithPatRequest};
+use iggy_binary_protocol::responses::users::LoginRegisterResponse;
 use iggy_binary_protocol::{
     ClientVersionInfo, IGGY_PROTOCOL_VERSION, MAX_WIRE_NAME_LENGTH, WireDecode, WireName,
 };
@@ -95,6 +96,38 @@ pub fn sign_in_request(
     }
 }
 
+/// Signs in with `credentials` once any session of the connection is
+/// released. The caller validates them first, so invalid credentials leave
+/// the live session alone.
+#[doc(hidden)]
+pub async fn binary_sign_in<B: BinaryClient>(
+    client: &B,
+    credentials: Credentials,
+) -> Result<IdentityInfo, IggyError> {
+    logout_before_relogin(client).await?;
+    let fence = client.session_fence();
+    let (code, payload) = sign_in_request(
+        &credentials,
+        rust_sdk_version_info(client.sdk_version())?,
+        client.session_bind_secret().await?,
+    )?;
+    let response = client.send_raw_with_response(code, payload).await?;
+    let wire_resp = decode_response::<LoginRegisterResponse>(&response)?;
+    client.bind_vsr_session_at(fence, wire_resp.session).await?;
+    tracing::debug!(
+        server_version = %wire_resp.server_version,
+        server_protocol_version = wire_resp.server_protocol_version,
+        "authenticated against iggy server"
+    );
+    client
+        .finish_sign_in(credentials, wire_resp.user_id)
+        .await?;
+    Ok(IdentityInfo {
+        user_id: wire_resp.user_id,
+        access_token: None,
+    })
+}
+
 /// Prepare the connection before login, then release any existing session.
 ///
 /// The server binds a connection to one `(client, session)` and resolves the
@@ -109,8 +142,10 @@ pub(crate) async fn logout_before_relogin<B: BinaryClient>(client: &B) -> Result
     timeout_at(crate::binary_operation_deadline(), client.prepare_sign_in())
         .await
         .map_err(|_| IggyError::TransientNotAccepted)??;
-    if client.get_state().await == ClientState::Authenticated {
-        client.logout_user().await?;
+    if client.get_state().await == ClientState::Authenticated
+        || client.session_identity().await.is_ok()
+    {
+        users::logout(client, true).await?;
     }
     Ok(())
 }

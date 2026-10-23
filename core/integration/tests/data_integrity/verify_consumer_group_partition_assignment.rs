@@ -36,7 +36,7 @@
 //! silent sockets lose their sessions.
 
 use iggy::prelude::*;
-use integration::harness::wait_for_consumer_group_assignment;
+use integration::harness::{backup_commit_budget, wait_for_consumer_group_assignment};
 use integration::iggy_harness;
 use std::collections::HashSet;
 use std::str::FromStr;
@@ -354,7 +354,6 @@ async fn should_not_reshuffle_partitions_when_new_member_joins(harness: &TestHar
 }
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
-    consumer_group.rebalancing_timeout = "1s",
     heartbeat.enabled = true,
     heartbeat.interval = "60s",
 ))]
@@ -390,6 +389,7 @@ async fn should_skip_revoked_partitions_in_round_robin(harness: &TestHarness) {
         assert!(polled_before.insert(polled.partition_id));
     }
     assert_eq!(polled_before.len(), PARTITIONS_COUNT as usize);
+    let member1_id = get_consumer_group(&client1).await.members[0].id;
 
     let client2 = harness.new_client().await.unwrap();
     client2
@@ -397,36 +397,61 @@ async fn should_skip_revoked_partitions_in_round_robin(harness: &TestHarness) {
         .await
         .unwrap();
     join_cg(&client2).await;
-    sleep(Duration::from_millis(100)).await;
 
-    // Consumer1 polls again — round-robin skips revoked partitions
-    let mut polled_after = HashSet::new();
-    for _ in 0..PARTITIONS_COUNT {
-        let polled = client1
-            .poll_messages(
-                &Identifier::named(STREAM_NAME).unwrap(),
-                &Identifier::named(TOPIC_NAME).unwrap(),
-                None,
-                &consumer,
-                &PollingStrategy::next(),
-                1,
-                false,
-            )
-            .await
-            .unwrap();
-        if !polled.messages.is_empty() {
-            polled_after.insert(polled.partition_id);
+    // A partition primary that is a metadata backup fences polls on its own
+    // applied metadata, so it can learn client2's join after the join returns.
+    let deadline = Instant::now() + backup_commit_budget(harness);
+    let polled_after = loop {
+        let mut polled_after = HashSet::new();
+        for _ in 0..PARTITIONS_COUNT {
+            let polled = client1
+                .poll_messages(
+                    &Identifier::named(STREAM_NAME).unwrap(),
+                    &Identifier::named(TOPIC_NAME).unwrap(),
+                    None,
+                    &consumer,
+                    &PollingStrategy::next(),
+                    1,
+                    false,
+                )
+                .await
+                .unwrap();
+            if !polled.messages.is_empty() {
+                polled_after.insert(polled.partition_id);
+            }
         }
-    }
-
-    assert!(
-        polled_after.len() < PARTITIONS_COUNT as usize,
-        "Consumer1 should skip revoked partitions but got all {PARTITIONS_COUNT}: {polled_after:?}"
-    );
+        if polled_after.len() < PARTITIONS_COUNT as usize {
+            break polled_after;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Consumer1 should skip revoked partitions but got all {PARTITIONS_COUNT}: {polled_after:?}"
+        );
+        sleep(MEMBER_POLL_INTERVAL).await;
+    };
     assert!(
         !polled_after.is_empty(),
         "Consumer1 must keep at least 1 partition"
     );
+
+    // Client1 never commits and the default rebalancing_timeout outlasts the
+    // wait, so only the pending-revocation fence can explain the skip. Read
+    // through client2: whichever node answers holds the read until it applied
+    // client2's join, and a node without the join shows client1 owning all.
+    let cg = get_consumer_group(&client2).await;
+    let member1 = cg
+        .members
+        .iter()
+        .find(|member| member.id == member1_id)
+        .expect("Consumer1 is still a member");
+    for skipped in polled_before.difference(&polled_after) {
+        assert!(
+            member1.partitions.contains(skipped),
+            "Consumer1 skipped partition {skipped} after its revocation completed. \
+             Members: {:?}",
+            cg.members
+        );
+    }
 
     root_client
         .delete_stream(&Identifier::named(STREAM_NAME).unwrap())

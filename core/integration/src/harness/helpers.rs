@@ -15,9 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::harness::{TestBinary, TestHarness};
 use iggy::prelude::{
     ConsumerGroupClient, ConsumerGroupDetails, DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME,
-    GlobalPermissions, Identifier, IdentityInfo, Permissions, StreamClient, UserClient, UserStatus,
+    GlobalPermissions, Identifier, IdentityInfo, Permissions, StreamClient, TopicClient,
+    TopicDetails, UserClient, UserStatus,
 };
 use std::collections::HashSet;
 use std::time::Duration;
@@ -25,6 +27,10 @@ use tokio::time::{Instant, sleep};
 
 pub const USER_PASSWORD: &str = "secret";
 const ASSIGNMENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const TOPIC_STATS_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// On an idle cluster a backup learns a commit only from the commit broadcast.
+/// Several broadcasts cover a late one.
+const BACKUP_COMMIT_BROADCASTS: u32 = 6;
 
 /// Wait for the expected assignment distribution, checking uniqueness during convergence.
 pub async fn wait_for_consumer_group_assignment(
@@ -75,6 +81,73 @@ pub async fn wait_for_consumer_group_assignment(
         );
         sleep(ASSIGNMENT_POLL_INTERVAL).await;
     }
+}
+
+/// Wait until `get_topic` counts `expected` messages in the topic.
+pub async fn wait_for_topic_messages_count(
+    client: &(impl TopicClient + ?Sized),
+    stream_id: &Identifier,
+    topic_id: &Identifier,
+    expected: u64,
+    budget: Duration,
+) {
+    let messages_count = wait_for_topic(client, stream_id, topic_id, budget, |details| {
+        details.messages_count == expected
+    })
+    .await
+    .messages_count;
+    assert_eq!(
+        messages_count, expected,
+        "topic messages_count is {messages_count} after {budget:?}, expected {expected}"
+    );
+}
+
+/// Wait until `get_topic` returns details that satisfy `ready` or `budget`
+/// runs out, and return the last details read.
+///
+/// Topic stats are per node. A node that is not the partition primary counts a
+/// message only after it learns the commit, so its stats can trail the send by
+/// up to [`backup_commit_budget`].
+pub async fn wait_for_topic(
+    client: &(impl TopicClient + ?Sized),
+    stream_id: &Identifier,
+    topic_id: &Identifier,
+    budget: Duration,
+    ready: impl Fn(&TopicDetails) -> bool,
+) -> TopicDetails {
+    let deadline = Instant::now() + budget;
+    loop {
+        let details = client
+            .get_topic(stream_id, topic_id)
+            .await
+            .expect("read topic")
+            .expect("topic exists");
+        if ready(&details) || Instant::now() >= deadline {
+            return details;
+        }
+        sleep(TOPIC_STATS_POLL_INTERVAL).await;
+    }
+}
+
+/// How long a backup can take to learn a commit at the longest
+/// `cluster.commit_broadcast_interval` the running servers of `harness` use.
+///
+/// # Panics
+///
+/// If no server runs, or a running server's config dump holds no valid interval.
+pub fn backup_commit_budget(harness: &TestHarness) -> Duration {
+    harness
+        .all_servers()
+        .iter()
+        .filter(|server| server.is_running())
+        .map(|server| {
+            server
+                .commit_broadcast_interval()
+                .expect("the commit broadcast interval of a running server")
+        })
+        .max()
+        .expect("a running server")
+        .saturating_mul(BACKUP_COMMIT_BROADCASTS)
 }
 
 /// Login as root user.

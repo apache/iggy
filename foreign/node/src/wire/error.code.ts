@@ -61,7 +61,7 @@ export const translateErrorCode = (code: number): string => {
     case '54': return "Personal access token: {0} for user with ID: {1} has expired.";
     case '55': return "Users limit reached.";
     case '56': return "Invalid personal access token expiry";
-    case '57': return "Request transiently not committed; retry";
+    case '57': return "Request outcome unknown; it may have applied";
     case '58': return "Request transiently not accepted; retry, on any replica";
     case '59': return "Request already applied; its reply is no longer available";
     case '61': return "Not connected";

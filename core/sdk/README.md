@@ -50,7 +50,7 @@ directories are refused without modification; `--fresh` deletes existing data
 in the configured directory. See the [server recovery guide](../server/README.md#upgrade-recovery).
 Mixed versions and rolling upgrades are unsupported. Binary clients share one
 logical session across replica links using BindSession (15) and discover
-partition primaries with GetPartitionRoute (105). Commands 14, 103, 104 and 123
+partition primaries with GetPartitionRoute (105). Commands 14, 103, 104, 123 and 124
 are retired. HTTP clients use server-side forwarding.
 
 ```bash
@@ -68,6 +68,13 @@ credential for internal session control and must never be logged or exposed.
 `refresh_session_password` and `refresh_session_username` are removed. A
 transport that signs in again applies a committed credential change where its
 calls complete.
+
+`IggyError::ProducerSendFailed` changes its public `stream_name` and `topic_name`
+fields from `String` to `Box<str>`. Existing constructors must convert their names
+with `.into()`; the callback's `ErrorCtx` fields remain `String`. It also adds a
+public `uncertain: usize` field, so struct literals and exhaustive patterns must
+name it. `ConsumerGroupClientState` no longer has its public `partition_count` and
+`set_partition_context` methods.
 
 An established session has its own lifetime. Password or PAT changes and PAT
 expiry do not end it. Logout, session lease expiry, or user deactivation end the
@@ -94,6 +101,43 @@ the outcome unknown. A session reset drops retained requests. An
 `OperationNotRetained` error does not establish the outcome. A reset or an
 abandon came before a proved outcome, or the proved outcome aged out.
 Recovery is unavailable over HTTP.
+
+Receipt access follows the server's [session and revocation policy](../server/README.md#sessions-and-retry-receipts).
+An unresolved operation cannot recover its receipt after its original session
+ends, even after a new login or account reactivation. With a live session,
+partition permission revocation prevents resolution with 41 until a re-grant;
+metadata can replay the user's own committed cached result without a new
+permission check. A fresh application send can duplicate an uncertain operation.
+
+Each node counts the messages in its stream, topic and system stats. After a
+successful send, a node that is not the partition primary shows the new count
+only after the next prepare or commit broadcast. When no other write follows,
+this delay is at most `cluster.commit_broadcast_interval` (500 ms by default).
+See [metadata freshness and counters](../server/README.md#metadata-freshness-and-counters).
+
+An explicit sign-in or logout ends earlier calls: unsent calls fail with 40,
+and possibly applied mutations remain uncertain. SDK-managed recovery can keep
+an unsent call waiting for a session or a primary within its original deadline.
+Expiry returns 58. A refused automatic sign-in ends each unsent call that waits
+for it with 40. Until the caller signs in, later calls also fail with 40.
+`IggyError` carries no cause, so the client logs the refusal as a warning. If
+the sign-in of a `connect()` call is refused, that call returns the refusal.
+Recovery uses the caller's last explicit sign-in, or configured automatic
+credentials only if the caller never signed in. Logout disables automatic sign-in.
+
+HTTP 503 `relay_refused` uses the configured HTTP retry policy, regardless of
+its body code. Rust's HTTP retry schedule does not use the server's `Retry-After`
+header. This retry support does not provide retained-operation recovery.
+If the last 503 body carries code 58, the call returns `TransientNotAccepted`.
+A write that possibly committed, for example after a 504 or a lost reply, is
+not sent again and returns `TransientNotCommitted`.
+
+On a multi-node cluster, an HTTP call often reaches a node that is not the
+partition primary. For message sends, polls and consumer offset calls, that
+node relays the call to the primary. The relay needs identical `http.jwt`
+secrets or `cluster.auth` on every node. Without that key material, these calls
+answer 503 with code 58. See
+[HTTP routing and backpressure](../server/README.md#http-routing-and-backpressure).
 
 A committed password change or rename of the signed-in user updates the
 credentials that the client signs in with again. This holds for a typed call, a

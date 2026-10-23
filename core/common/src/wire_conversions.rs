@@ -25,11 +25,11 @@ use crate::{
     CacheMetrics, CacheMetricsKey, ClientInfo, ClientInfoDetails, ClusterMetadata, ClusterNode,
     ClusterNodeRole, ClusterNodeStatus, CompressionAlgorithm, Consumer, ConsumerGroup,
     ConsumerGroupDetails, ConsumerGroupInfo, ConsumerGroupMember, ConsumerOffsetInfo,
-    GlobalPermissions, HeaderKey, HeaderKind, HeaderValue, IdKind, IdentityInfo, IggyByteSize,
-    IggyError, IggyExpiry, MaxTopicSize, OptionSpec, OptionValue, OptionsProvenance, Partition,
-    Permissions, PersonalAccessTokenInfo, RawPersonalAccessToken, ResourceOptions, Stats, Stream,
-    StreamDetails, StreamPermissions, Topic, TopicDetails, TopicPermissions, TransportEndpoints,
-    UserInfo, UserInfoDetails, UserStatus,
+    GlobalPermissions, HeaderKey, HeaderKind, HeaderValue, IdKind, Identifier, IdentityInfo,
+    IggyByteSize, IggyError, IggyExpiry, MaxTopicSize, OptionSpec, OptionValue, OptionsProvenance,
+    Partition, Permissions, PersonalAccessTokenInfo, RawPersonalAccessToken, ResourceOptions,
+    Stats, Stream, StreamDetails, StreamPermissions, Topic, TopicDetails, TopicPermissions,
+    TransportEndpoints, UserInfo, UserInfoDetails, UserStatus,
 };
 use bytes::{BufMut, BytesMut};
 use iggy_binary_protocol::primitives::options::{MAX_OPTIONS, MAX_OPTIONS_BYTES, WireOptions};
@@ -63,7 +63,7 @@ use iggy_binary_protocol::responses::topics::get_topics::GetTopicsResponse;
 use iggy_binary_protocol::responses::users::login_user::IdentityResponse;
 use iggy_binary_protocol::responses::users::user_response::UserResponse;
 use iggy_binary_protocol::responses::users::{GetUsersResponse, UserDetailsResponse};
-use iggy_binary_protocol::{WireConsumer, WireUserHeaderIterator};
+use iggy_binary_protocol::{WireConsumer, WireIdentifier, WireUserHeaderIterator};
 use std::collections::{BTreeMap, HashMap};
 
 /// Sentinel value in the wire protocol indicating no authenticated user.
@@ -541,6 +541,21 @@ pub fn cluster_metadata_from_wire(
     w: ClusterMetadataResponse,
 ) -> Result<ClusterMetadata, IggyError> {
     ClusterMetadata::try_from(w)
+}
+
+// ---------------------------------------------------------------------------
+// Identifier (wire -> domain)
+// ---------------------------------------------------------------------------
+
+impl TryFrom<&WireIdentifier> for Identifier {
+    type Error = IggyError;
+
+    fn try_from(value: &WireIdentifier) -> Result<Self, Self::Error> {
+        match value {
+            WireIdentifier::Numeric(id) => Self::numeric(*id),
+            WireIdentifier::String(name) => Self::named(name),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

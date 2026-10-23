@@ -52,6 +52,7 @@ pub enum Action {
     JoinFixtureGroup,
     LeaveFixtureGroup,
     StoreStaleOwnerOffset,
+    PollMessages,
 }
 
 // Lock the discriminants of the first three variants. Inserting a new variant before

@@ -66,42 +66,61 @@ pub struct IggyClient {
     inner: Arc<RustIggyClient>,
 }
 
+/// An error of the Iggy SDK. `code` is the numeric Iggy error code, the same
+/// code that every other Iggy SDK reports for it.
+#[gen_stub_pyclass]
+#[pyclass(frozen, subclass, name = "IggyError", extends=PyRuntimeError)]
+pub struct PyIggyError {
+    #[pyo3(get)]
+    code: u32,
+}
+
+impl From<&IggyError> for PyIggyError {
+    fn from(error: &IggyError) -> Self {
+        Self {
+            code: error.as_code(),
+        }
+    }
+}
+
 /// An operation whose retained identity is needed to recover or release its lane.
 #[gen_stub_pyclass]
-#[pyclass(frozen, extends=PyRuntimeError)]
+#[pyclass(frozen, extends=PyIggyError)]
 pub struct PendingOperationError {
     #[pyo3(get)]
     operation_id: u64,
     #[pyo3(get)]
-    code: u32,
-    #[pyo3(get)]
     kind: &'static str,
 }
 
-/// Preserves recovery identity rather than requiring callers to parse an error message.
+/// Raises every SDK error with its code, and an operation with its recovery
+/// identity, rather than requiring callers to parse an error message.
 pub(crate) fn to_runtime_error(error: IggyError) -> PyErr {
-    let (operation_id, kind) = match error {
-        IggyError::OperationUncertain(operation_id) => (operation_id, "uncertain"),
-        IggyError::LaneBlocked(operation_id) => (operation_id, "lane_blocked"),
-        IggyError::OperationNotRetained(operation_id) => (operation_id, "not_retained"),
-        _ => return PyRuntimeError::new_err(error.to_string()),
+    let pending = match error {
+        IggyError::OperationUncertain(operation_id) => Some((operation_id, "uncertain")),
+        IggyError::LaneBlocked(operation_id) => Some((operation_id, "lane_blocked")),
+        IggyError::OperationNotRetained(operation_id) => Some((operation_id, "not_retained")),
+        _ => None,
     };
     Python::attach(|py| {
-        let instance = match Bound::new(
-            py,
-            PendingOperationError {
-                operation_id,
-                code: error.as_code(),
-                kind,
-            },
-        ) {
+        let coded = PyIggyError::from(&error);
+        let instance = match pending {
+            Some((operation_id, kind)) => Bound::new(
+                py,
+                PyClassInitializer::from(coded)
+                    .add_subclass(PendingOperationError { operation_id, kind }),
+            )
+            .map(Bound::into_any),
+            None => Bound::new(py, coded).map(Bound::into_any),
+        };
+        let instance = match instance {
             Ok(instance) => instance,
             Err(error) => return error,
         };
         if let Err(error) = instance.setattr("args", (error.to_string(),)) {
             return error;
         }
-        PyErr::from_value(instance.into_any())
+        PyErr::from_value(instance)
     })
 }
 
@@ -176,17 +195,9 @@ impl IggyClient {
                 );
                 ClientWrapper::Tcp(TcpClient::create(config).map_err(to_runtime_error)?)
             }
-            Some(PyClientConfig::Quic(config)) => {
-                // `quinn::Endpoint::client` (invoked eagerly by `QuicClient::create`) looks
-                // up the current Tokio runtime via `Handle::try_current()` and fails with
-                // `CannotCreateEndpoint` if none is active. This method runs synchronously
-                // from Python without one, so enter the runtime pyo3-async-runtimes uses
-                // for our own async methods before building the endpoint.
-                let _guard = pyo3_async_runtimes::tokio::get_runtime().enter();
-                ClientWrapper::Quic(
-                    QuicClient::create(config.client_config()).map_err(to_runtime_error)?,
-                )
-            }
+            Some(PyClientConfig::Quic(config)) => ClientWrapper::Quic(
+                QuicClient::create(config.client_config()).map_err(to_runtime_error)?,
+            ),
             Some(PyClientConfig::Http(config)) => ClientWrapper::Http(
                 HttpClient::create(config.client_config()).map_err(to_runtime_error)?,
             ),
@@ -213,11 +224,6 @@ impl IggyClient {
         _cls: &Bound<'_, PyType>,
         connection_string: String,
     ) -> PyResult<Self> {
-        // The QUIC transport builds its endpoint eagerly and needs a Tokio runtime context
-        // to do so (see the `QuicConfig` arm of `new()` above for details); entering it here
-        // is a no-op for the other transports since the protocol isn't known until the
-        // connection string is parsed.
-        let _guard = pyo3_async_runtimes::tokio::get_runtime().enter();
         let client =
             RustIggyClient::from_connection_string(&connection_string).map_err(to_runtime_error)?;
         Ok(Self {
@@ -1836,6 +1842,7 @@ mod tests {
                     let code = error.as_code();
                     let error = to_runtime_error(error);
                     assert!(error.is_instance_of::<PendingOperationError>(py));
+                    assert!(error.is_instance_of::<PyIggyError>(py));
                     assert!(error.is_instance_of::<PyRuntimeError>(py));
                     let value = error.value(py);
                     assert_eq!(
@@ -1865,11 +1872,18 @@ mod tests {
         Python::initialize();
         Python::attach(|py| {
             let rejection = IggyError::UserAlreadyExists;
+            let code = rejection.as_code();
             let message = rejection.to_string();
             let error = to_runtime_error(rejection);
+            assert!(error.is_instance_of::<PyIggyError>(py));
             assert!(error.is_instance_of::<PyRuntimeError>(py));
             assert!(!error.is_instance_of::<PendingOperationError>(py));
-            assert_eq!(error.value(py).str().unwrap().to_str().unwrap(), message);
+            let value = error.value(py);
+            assert_eq!(
+                value.getattr("code").unwrap().extract::<u32>().unwrap(),
+                code
+            );
+            assert_eq!(value.str().unwrap().to_str().unwrap(), message);
         });
     }
 }

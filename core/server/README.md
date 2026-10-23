@@ -47,11 +47,35 @@ Command-line arguments include `--replica-id`, `--fresh` (`-f`), `--with-default
 Deploy matching server and SDK releases together. Rolling upgrades and mixed
 server versions are unsupported. Partition control frames from older servers
 carry incarnation zero and are rejected, so a mixed-version cluster cannot
-complete partition view changes. The `IGGY-BOUND-GRANTS-4` storage gate
+complete partition view changes. The `IGGY-BOUND-GRANTS-5` storage gate
 requires fresh storage and rejects older data directories without modifying them.
 Cached replies now preserve a committed-result marker, which older receipts lack.
-No in-place upgrade or implicit migration is supported. A separately validated
-offline migration or restore procedure would be required to reuse existing data.
+Partition creation records carry an initial view in each 16-byte assignment,
+replacing the 12-byte assignments and single request-wide view in older metadata
+WAL entries. This boundary also rejects `IGGY-BOUND-GRANTS-4` directories from
+upstream and earlier development builds, unchanged before replay.
+No in-place upgrade, storage conversion tool or retained-data migration is
+provided. Use an offline cutover with logical re-ingestion:
+
+1. Stop application writes, consumers that advance offsets, and administrative
+   changes. While the old cluster is still readable, export the required messages
+   with an application-specific reader using its compatible SDK. Record payloads,
+   headers and per-partition order, topic policies, permissions, and the intended
+   consumer restart positions. Check the export against the source before stopping it.
+2. Stop every old replica. Preserve a consistent backup of all metadata, partition
+   superblocks, WALs, segments and initialization records, with the old binary and
+   configuration. Keep these originals unchanged for rollback.
+3. Deploy matching new servers and SDKs with separate, empty storage paths on every
+   replica. Recreate the required accounts, permissions, streams, topics and groups,
+   then re-ingest through the new SDK. New sessions, receipts, partition incarnations
+   and offsets do not continue the old ones. Map consumer progress to the re-ingested
+   data or choose an explicit new starting position.
+4. Verify the restored configuration, permissions, message counts and contents
+   before resuming applications. Rollback uses the old binary and its consistent
+   backup; it excludes writes accepted by the new cluster unless reconciled separately.
+
+This procedure copies logical application data. It does not convert old storage
+files or recover data that is absent from both the source and its backups.
 
 The server no longer generates a root password when `IGGY_ROOT_USERNAME` and `IGGY_ROOT_PASSWORD` are unset. Supply both variables on every replica before the first cluster start so any promoted node can initialize root. Use `--with-default-root-credentials` only in development. A cluster node without credentials waits for root to be replicated. Once root is persisted, restarts need neither.
 
@@ -94,8 +118,113 @@ IGGY_TCP_ADDRESS=127.0.0.1:8090 IGGY_HTTP_ENABLED=false cargo run --bin iggy-ser
 
 Cluster membership, quorum and replica addressing live under `[cluster]`.
 
+New partition primaries are spread across the configured replicas using each
+partition's last observed primary, or its committed initial view before an
+observation arrives. Concurrent creates count pending assignments too. Once
+readiness probes identify responsive replicas, new primaries are assigned only
+to those replicas. Before readiness is known, all configured replicas remain
+eligible. After the responsive replica set
+has been stable for five seconds, the metadata primary balances existing primary
+counts one partition at a time. It confirms the source's committed frontier and
+the target's applied history, then grants the move to the source primary. The
+source finishes its accepted writes before it requests a persisted consensus
+view change.
+Recovering partitions are skipped without delaying transfers of other partitions.
+Every replica still stores every partition.
+Balancing primary counts does not balance bytes, throughput or CPU load. A hot
+partition still has one ordering primary.
+
+A create whose namespace is invalid can receive 58 (`TransientNotAccepted`) while
+any metadata write is pending, even an unrelated one. Under steady unrelated
+traffic its retries can reach the deadline with 58 instead of the namespace
+error. A valid create that exceeds its configured capacity with the committed
+partitions alone still gets the capacity error. If only the creates in flight
+leave no room, it gets 58, and under steady create traffic its retries can reach
+the deadline with 58. A personal access token create follows the same rule for
+the user's tokens and `max_tokens_per_user`.
+
+### HTTP routing and backpressure
+
+An HTTP client therefore often calls a node that is not the partition primary.
+If every node accepts the caller's bearer, that node relays message sends, polls
+and consumer offset calls to the primary. This needs identical `http.jwt`
+secrets on every node, or `cluster.auth`. Without that key material, these calls
+answer a transient 503 with code 58 (`TransientNotAccepted`).
+
+A partition relay carries an HMAC-SHA256 proof over its method, path and query,
+route, and expiry. The target still authenticates and authorizes the caller.
+The relay key derives from the first configured `http.jwt.encoding_secret` or
+`http.jwt.decoding_secret`, otherwise from `cluster.auth.shared_secret`.
+Keep that material identical on every node. Rotating the material used for
+bearers also changes the relay key, so nodes with different keys refuse each
+other's relays. Keep node wall clocks synchronized within a few seconds: a proof
+has a 10-second lifetime. Relay numeric fields use unsigned decimal with no
+leading zeros, and proof tags use lowercase hexadecimal; noncanonical fields
+are refused. Proxies must preserve these internal headers unchanged.
+
+A target refuses a missing, invalid or expired proof with 403. When a node's own
+relay proof is refused, that node logs a warning and answers the application with
+503, code `relay_refused`, and `Retry-After: 1`. Nothing was admitted by that
+attempt. Check shared keys and clocks; this response is not a denial of the
+application's permission. SDKs with HTTP transports use their ordinary 503 retry
+policy. Rust and Python use their configured retry schedule rather than
+`Retry-After`; C# honors its delta value; Java uses Apache HttpClient's ordinary
+429/503 retry strategy.
+
+A 503 answer to a write means that nothing was admitted, so the write can be sent
+again. A 502 or 504 answer to a write means that its outcome is unknown, and the
+write can still commit. The body `id` 57 (`TransientNotCommitted`) or the body
+`code`, such as `produce_timeout`, names the cause. Read the state before writing
+again, because a resend is a new request that can apply twice. The Rust, C# and
+Java SDKs never resend such a write, and the Rust SDK reports it as 57.
+
+Metadata forwards and partition relays share a limit of
+128 concurrent forwards per node. New forwards at capacity return 503 `forward_busy` with
+`Retry-After: 1`. Metadata forwarding has one 30-second retry budget beginning
+before the request body is buffered, so a slow upload leaves less time for
+forwarding. Partition requests share a 10-second deadline across their metadata
+wait, local attempts, relays and reply waits.
+
+A node sends one metadata-floor read at a time and holds no forward slot for it. The read serves every linearizable read that arrived before it was sent, and the reads that arrive while it is in flight share the next one.
+
+Socket replies use `message_bus.client_queue_capacity` per connection. A reply that cannot enter the non-waiting queue closes that connection, leaving the caller to recover any uncertain operation. Paths that wait for reply space hold their bounded permit until delivery or connection teardown.
+
+A reply that waits longer than `message_bus.client_write_stall_timeout` (30 seconds by default) closes the connection, so a client that stops reading its socket, an administrative one included, holds its queue and request tasks for at most that long.
+
+Requests queued behind the ones a connection runs are capped at 1024 frames and at `message_bus.client_request_queue_bytes_max` (256 MiB by default). A request past either cap gets 58 (`TransientNotAccepted`), unless the queue is empty.
+
+### Metadata freshness and counters
+
+On a multi-replica node, client partition requests require recent metadata quorum
+evidence before namespace lookup and authorization. The evidence lasts
+`K = cluster.heartbeat_timeout + 3 seconds` (8 seconds by default); expired or
+absent evidence yields 58. A primary credits answered probes while ready. A
+backup credits only a probe from its current metadata primary whose advertised
+commit covers the adopted view's head and is already applied locally. Commit
+messages alone do not renew this evidence.
+
+The gate uses elapsed time, so a brief view or role change preserves existing
+credit without restarting its lifetime. A restarted node has no credit until
+fresh evidence arrives. Single-replica nodes do not require network evidence.
+A primary advertises evidence to a backup only after that backup answered its
+previous probe. The backup ages the evidence from the arrival of that previous
+probe. A delayed probe therefore cannot extend backup credit past K. The one
+exception is a primary restart in the same view: a late probe of the old
+incarnation can then add its own transit time. The aging costs up to one probe
+interval of credit. If the primary stops probing, a backup therefore stops
+admitting up to one probe interval before the primary does.
+K is a lease, not an instantaneous revocation guarantee.
+
+Message and size counters in stream, topic and system stats (`get_stream`,
+`get_topic`, `get_stats` and the list forms) are counted per node. A node that
+is not the partition primary learns of a commit from the next prepare or from
+the periodic commit broadcast. It counts the message only then. While the
+cluster is idle, its counters can lag by up to `cluster.commit_broadcast_interval`.
+
+### Sessions and retry receipts
+
 Protocol 0.11.1 uses client-owned registration proofs and `BindSession` (15) to
-share a logical session across connections. Commands 14, 103, 104 and 123 are
+share a logical session across connections. Commands 14, 103, 104, 123 and 124 are
 retired. Partition routing uses 105, polling uses 100 and offset reads use 120. Disconnecting a
 connection does not log out its logical session. Server-observed activity renews
 the session lease, and expiry or explicit logout retires it before capacity is
@@ -108,7 +237,41 @@ message-offset range.
 The bind proof is an independent session credential. Password changes and PAT
 revocation or expiry do not end an established session. Binding checks that the
 owner still exists and is active; current permissions still govern each request.
-Explicit logout, lease expiry and user deactivation end session access.
+Explicit logout, lease expiry, user deactivation and user deletion end session
+access.
+
+If a committed reply is lost and that session ends before the caller proves the
+outcome, the operation remains uncertain. Signing in again, including after
+reactivation, cannot recover the old session's receipt. Reconcile application
+state before submitting a new operation; a fresh send can duplicate the old one.
+A result already proved and cached by an SDK remains subject to that SDK's local
+outcome-cache lifetime.
+
+Permission revocation alone keeps the session alive. Partition retries check
+current permissions before receipt lookup and return 41 (`Unauthorized`) until
+a re-grant. A retained operation can then resolve its original receipt under the
+same session. Metadata retries may replay that user's own committed cached reply
+without checking the revoked permission again; a new metadata mutation still
+requires authorization. An uncommitted refusal does not settle an earlier
+uncertain attempt.
+
+An explicit SDK sign-in or logout ends earlier calls: an unsent call fails with
+40 (`Unauthenticated`), while a possibly applied mutation remains uncertain.
+Only SDK-managed recovery can continue an unsent waiting call under a replacement
+session. It never replays an uncertain mutation under a new identity. A session
+wait reaching its deadline fails with 58, and a refused automatic sign-in fails
+with 40. The Rust SDK, and the C++, PHP and Python bindings built on it, log the
+refusal as a warning. The other SDKs attach it as the cause of that 40. Recovery
+uses the caller's last explicit sign-in, falling back to configured automatic
+credentials only before
+any explicit sign-in. Logout disables automatic sign-in; consult the SDK's
+connect/disconnect contract before opening a new session. Swift reports an
+unknown mutation as 57 and has no retained-operation resolver.
+
+Error 5009 (`ConsumerGroupPartitionNotOwned`) names the full 128-bit VSR client
+ID. `GetClient` and `GetClients` expose the low 32 bits of a transport connection
+ID, which is a different identity. Their client IDs cannot be used to look up the
+VSR identity in a 5009 diagnostic.
 
 `clients_table_max` and `dedup_clients_max` nominate immutable limits when the
 first operation commits in each metadata or partition group. Recovery and state
@@ -165,9 +328,25 @@ explicitly supported. Edge builds require matching clients and servers, even
 when their protocol numbers match.
 
 An unsupported data directory is refused before WAL scanning or file changes.
-Replacing the binary does not migrate old data. Restore or migrate retained data
-only through a separately verified procedure; copying a format marker is not
-a migration.
+Replacing the binary does not migrate old data. Use the offline re-ingestion
+procedure above for an upgrade. A recovery from a backup must use a separately
+verified, compatible backup; copying a format marker is not a migration.
+
+Within compatible `IGGY-BOUND-GRANTS-5` storage, this release reads superblock
+envelope versions 1 and 2 and writes version 2. Legacy 66- and 74-byte consensus
+records remain readable. New records atomically retain an adopted view, its
+advertised head and exact prepare headers alongside the existing consensus state.
+These headers preserve log identity across restart; they do not prove that a
+message body is present or safe to acknowledge. Recovery still repairs missing
+bodies before serving them.
+
+A binary that only understands version 1 refuses a version-2 slot, even if the
+other slot still has version 1. After the first new superblock write, replacing
+the binary with an older one is not a supported rollback. Restore a consistent
+pre-upgrade backup with its matching binary, or use fresh storage and the logical
+re-ingestion procedure. Never remove one slot, edit a version or view, or combine
+superblocks from different backups to bypass the refusal. This boundary applies
+to both metadata and partition superblocks and does not relax the storage gate.
 
 Partition recovery refuses a superblock whose nonzero `log_view`
 is below the partition's committed `created_view`. It also refuses a WAL
@@ -226,7 +405,7 @@ Before a partition can serve, initialization publishes its incarnation in
 `partition-initialization/<namespace>/created.revision` under the system data
 directory. This atomic record remains outside the partition directory, including
 after that directory is lost. Preserve it with metadata and partition backups.
-Storage format `IGGY-BOUND-GRANTS-4` requires this initialization contract;
+Storage format `IGGY-BOUND-GRANTS-5` requires this initialization contract;
 older data directories are refused before mutation.
 
 Retirement also writes `retirement.fence` in that external namespace directory
@@ -256,6 +435,15 @@ data may be discarded, delete and recreate it through the metadata API. This
 creates a new partition incarnation and removes the old data. Missing files
 alone are not evidence that discarding that data is safe. Do not create a WAL
 frontier or remove initialization records or recovery fences manually.
+
+## Validation limits
+
+Deterministic simulator evidence applies to its recorded head, seed, plane,
+fault settings and enabled oracles. A run that never exercises an acceptance
+condition does not prove that condition. In-memory simulator partitions do not
+serve file-based partition state transfer; that path requires separate storage
+and integration coverage. Simulator convergence alone does not establish
+production disk, network or performance behavior.
 
 ## Systemd integration
 

@@ -30,7 +30,7 @@ use message_bus::client_listener::wss::{bind, run};
 use message_bus::transports::tls::{install_default_crypto_provider, self_signed_for_loopback};
 use message_bus::transports::wss::WssTransportConn;
 use message_bus::transports::{ActorContext, TransportConn};
-use message_bus::{FusedShutdown, IggyMessageBus, MessageBus, MessageBusConfig, Shutdown, framing};
+use message_bus::{FusedShutdown, IggyMessageBus, MessageBusConfig, Shutdown, framing};
 use rustls::RootCertStore;
 use rustls::pki_types::ServerName;
 use server_common::Message;
@@ -48,14 +48,11 @@ async fn wss_client_listener_accepts_and_round_trips() {
     let bus_for_handler = Rc::clone(&bus);
     let on_request: RequestHandler = Rc::new(move |client_id, msg| {
         assert_eq!(msg.header().command, Command::Request);
-        let bus = Rc::clone(&bus_for_handler);
-        compio::runtime::spawn(async move {
-            let reply = header_only(Command::Reply, 7, 0).into_frozen();
-            bus.send_to_client(client_id, reply)
-                .await
-                .expect("server send_to_client");
-        })
-        .detach();
+        let instance = bus_for_handler.client_instance(client_id);
+        let reply = header_only(Command::Reply, 7, 0).into_frozen();
+        bus_for_handler
+            .send_to_client_instance(client_id, instance, reply.into())
+            .expect("server send_to_client_instance");
     });
 
     let creds = self_signed_for_loopback();

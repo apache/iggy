@@ -113,7 +113,7 @@ internal sealed class VsrConnection : IDisposable
         }
         catch (Exception error)
         {
-            return VsrAttempt.Failed(false, error, false, this);
+            return VsrAttempt.Failed(false, error, false);
         }
 
         var uncertain = false;
@@ -151,7 +151,7 @@ internal sealed class VsrConnection : IDisposable
             }
             catch (OperationCanceledException cancellation)
             {
-                return VsrAttempt.Failed(true, cancellation, attempt.RequestStarted, this);
+                return VsrAttempt.Failed(true, cancellation, attempt.RequestStarted);
             }
         }
     }
@@ -179,12 +179,12 @@ internal sealed class VsrConnection : IDisposable
             {
                 if (_failure is { } failure)
                 {
-                    return VsrAttempt.Failed(true, failure, false, this);
+                    return VsrAttempt.Failed(true, failure, false);
                 }
                 if (!_pending.TryAdd(frame.RequestId, request))
                 {
                     return VsrAttempt.Failed(true, VsrError.Exception(VsrError.INVALID_COMMAND,
-                        "The request id already has an active exchange."), false, this);
+                        "The request id already has an active exchange."), false);
                 }
                 if (!_started)
                 {
@@ -241,7 +241,7 @@ internal sealed class VsrConnection : IDisposable
             {
                 error = _failure ?? new IOException($"Timed out after {_requestTimeoutMs} ms waiting for a consensus reply.");
             }
-            return VsrAttempt.Failed(request is not null, error, request?.Started ?? false, this);
+            return VsrAttempt.Failed(request is not null, error, request?.Started ?? false);
         }
         finally
         {
@@ -262,7 +262,7 @@ internal sealed class VsrConnection : IDisposable
             }
             var error = token.IsCancellationRequested ? new OperationCanceledException(token)
                 : _failure ?? new IOException($"Timed out after {_requestTimeoutMs} ms waiting for a consensus reply.");
-            request.Completion.TrySetResult(VsrAttempt.Failed(true, error, request.Started, this));
+            request.Completion.TrySetResult(VsrAttempt.Failed(true, error, request.Started));
         }
     }
 
@@ -359,13 +359,14 @@ internal sealed class VsrConnection : IDisposable
                     IggyInvalidStatusCodeException? detached = null;
                     try
                     {
-                        if (VsrHeader.ReadCommitted(header) && !MatchesCommittedRequest(header, request))
+                        var committed = VsrHeader.ReadCommitted(header);
+                        if (committed && !MatchesCommittedRequest(header, request))
                         {
                             throw VsrError.Exception(VsrError.INVALID_COMMAND, "Committed reply does not match the original request.");
                         }
                         var payload = VsrReplyDecoder.Decode(header, buffer.AsMemory(0, bodySize));
-                        var committed = VsrHeader.ReadCommitted(header);
-                        if (committed && (operation.IsMetadata() || operation == VsrOperation.DeleteSegments))
+                        if (committed && (operation.IsMetadata() || operation == VsrOperation.DeleteSegments)
+                            || request.Code is CommandCodes.GET_CONSUMER_GROUP_CODE or CommandCodes.SYNC_CONSUMER_GROUP_CODE)
                         {
                             _observeMetadataCommit?.Invoke(BinaryPrimitives.ReadUInt64LittleEndian(
                                 header.AsSpan(VsrHeader.REPLY_COMMIT_OFFSET)));
@@ -376,7 +377,7 @@ internal sealed class VsrConnection : IDisposable
                         {
                             buffer = null;
                         }
-                        result = VsrAttempt.Ok(response, this, committed);
+                        result = VsrAttempt.Ok(response, committed);
                     }
                     catch (IggyInvalidStatusCodeException error)
                     {
@@ -394,11 +395,11 @@ internal sealed class VsrConnection : IDisposable
                             var refusal = VsrError.FromServer(VsrError.TRANSIENT_NOT_ACCEPTED,
                                 "The server detached this connection from its session.");
                             refusal.CommandCode = request.Code;
-                            result = VsrAttempt.Failed(true, refusal, true, this);
+                            result = VsrAttempt.Failed(true, refusal, true);
                         }
                         else
                         {
-                            result = VsrAttempt.Failed(true, error, true, this);
+                            result = VsrAttempt.Failed(true, error, true);
                         }
                     }
                     lock (_gate)
@@ -500,7 +501,7 @@ internal sealed class VsrConnection : IDisposable
             _writes.Writer.TryComplete(error);
             foreach (var request in _pending.Values)
             {
-                request.Completion.TrySetResult(VsrAttempt.Failed(true, error, request.Started, this));
+                request.Completion.TrySetResult(VsrAttempt.Failed(true, error, request.Started));
             }
             _pending.Clear();
         }
@@ -520,15 +521,13 @@ internal readonly record struct VsrAttempt(
     IMemoryOwner<byte>? Response,
     Exception? Error,
     bool RequestStarted,
-    VsrConnection? Connection,
     bool Committed = false)
 {
-    public static VsrAttempt Ok(IMemoryOwner<byte> response, VsrConnection connection, bool committed = false) =>
-        new(true, response, null, true, connection, committed);
+    public static VsrAttempt Ok(IMemoryOwner<byte> response, bool committed = false) =>
+        new(true, response, null, true, committed);
 
-    public static VsrAttempt Failed(bool encoded, Exception error, bool requestStarted, VsrConnection? connection) =>
-        new(encoded, null, error, requestStarted, connection,
-            error is IggyInvalidStatusCodeException { Committed: true });
+    public static VsrAttempt Failed(bool encoded, Exception error, bool requestStarted) =>
+        new(encoded, null, error, requestStarted, error is IggyInvalidStatusCodeException { Committed: true });
 }
 
 /// <summary>Shared empty reply payload; disposes to nothing, so it is safe to hand out repeatedly.</summary>

@@ -819,7 +819,7 @@ pub(in crate::boot) async fn await_pump_drain(
 /// The caller owns the returned handle and must await it on the exit paths
 /// where shutdown is in progress (flag set or bus token triggered):
 /// dropping it there cancels the watchdog mid-`bus.shutdown()`, truncating
-/// in-flight `ClientForwardFailed` replies (terminal per `SendError` docs).
+/// in-flight client replies.
 /// It cannot go through `bus.track_background` instead: the watchdog itself
 /// drives `bus.shutdown()`, and the bg-drain loop in `shutdown()` would
 /// re-enter awaiting the watchdog's own pending shutdown call

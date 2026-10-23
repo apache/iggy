@@ -36,7 +36,7 @@ using static Apache.Iggy.Tests.VsrTests.MockFrames;
 
 namespace Apache.Iggy.Tests.VsrTests;
 
-public sealed class NativeRecoveryTests
+public sealed partial class NativeRecoveryTests
 {
     private const int ZeroCommittedOperation = -1;
     private static readonly Identifier Stream = Identifier.Numeric(1);
@@ -552,6 +552,367 @@ public sealed class NativeRecoveryTests
     }
 
     [Theory]
+    [InlineData("stale client")]
+    [InlineData("eviction")]
+    [InlineData("failed sign-in")]
+    public async Task given_a_lost_reply_when_the_session_then_ends_should_end_uncertain(string end)
+    {
+        using var cluster = new RecoveryCluster();
+        using var client = await cluster.ConnectAsync();
+        // A partition read waits until the primary link has bound, so OnBind sees only binds after the lost reply.
+        await client.GetOffsetAsync(Consumer.New(3), Stream, Topic, 0, cluster.Token);
+        // The session ends the way it ends for a deactivated or deleted user: every later bind and sign-in is refused.
+        cluster.OnBind = request => Volatile.Read(ref cluster.RejectRegister)
+            ? Reply(request.Operation, [], VsrError.UNAUTHENTICATED) : Answer(request);
+        cluster.OnWrite = request =>
+        {
+            var replay = cluster.Writes.Count > 1;
+            if (replay || end == "failed sign-in")
+            {
+                Volatile.Write(ref cluster.RejectRegister, true);
+            }
+            if (!replay)
+            {
+                throw new IOException("The reply is lost.");
+            }
+            return end == "stale client"
+                ? Reply(request.Operation, [], VsrError.STALE_CLIENT) : Eviction(EvictionReason.UserInactive);
+        };
+
+        var error = await Assert.ThrowsAsync<VsrRequestOutcomeUnknownException>(() => StoreAsync(client, cluster.Token));
+
+        var written = cluster.Writes.First();
+        Assert.Equal(written.RequestId, error.OperationId);
+        Assert.Equal(end == "failed sign-in" ? 1 : 2, cluster.Writes.Count);
+        Assert.All(cluster.Writes, write => Assert.Equal((written.ClientId, written.RequestId),
+            (write.ClientId, write.RequestId)));
+        await cluster.UntilAsync(() => cluster.Coordinator.Registrations == 2);
+        await Assert.ThrowsAsync<VsrOperationNotRetainedException>(() =>
+            client.ResolveOperationAsync(written.RequestId, TimeSpan.FromSeconds(1), cluster.Token));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task given_a_call_waiting_for_an_operation_slot_when_the_session_ends_should_wait_for_the_next_one(
+        bool signsIn)
+    {
+        const int DeadlineMs = 3_000;
+        using var cluster = new RecoveryCluster();
+        using var client = await cluster.ConnectAsync(maxOperations: 1);
+        // Both routes are known, so the second write only waits for the slot that the first one holds.
+        await client.GetOffsetAsync(Consumer.New(3), Stream, Topic, 0, cluster.Token);
+        await client.GetOffsetAsync(Consumer.New(3), Stream, Topic, 1, cluster.Token);
+        var sent = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var evict = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var signIn = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (signsIn)
+        {
+            signIn.SetResult();
+        }
+        cluster.OnWrite = request =>
+        {
+            if (cluster.Writes.Count > 1)
+            {
+                return Result(request);
+            }
+            sent.SetResult();
+            return Eviction(EvictionReason.SessionError);
+        };
+        cluster.HoldReply = request => request.Operation switch
+        {
+            (byte)VsrOperation.StoreConsumerOffset => evict.Task,
+            (byte)VsrOperation.Register => signIn.Task,
+            _ => Task.CompletedTask
+        };
+        try
+        {
+            var first = StoreAsync(client, cluster.Token);
+            await sent.Task.WaitAsync(cluster.Token);
+            // The recovery sign-in that never ends has a 30 s deadline of its own, so only a call deadline far
+            // below it ends the call while that sign-in still runs.
+            var second = signsIn
+                ? StoreAsync(client, cluster.Token, partition: 1)
+                : SendWithinAsync(client, CommandCodes.STORE_CONSUMER_OFFSET_CODE,
+                    TcpContracts.UpdateOffset(Stream, Topic, Consumer.New(3), 10, 1),
+                    TimeSpan.FromMilliseconds(DeadlineMs), cluster.Token);
+            await cluster.UntilAsync(() => client.Mutations.BudgetWaiterCount == 1);
+            evict.SetResult();
+
+            var error = await Assert.ThrowsAsync<VsrRequestOutcomeUnknownException>(() => first);
+            Assert.Equal(cluster.Writes.First().RequestId, error.OperationId);
+            if (signsIn)
+            {
+                await second;
+                var writes = cluster.Writes.ToArray();
+                Assert.Equal(2, writes.Length);
+                Assert.NotEqual(writes[0].ClientId, writes[1].ClientId);
+                Assert.Equal(2, cluster.Coordinator.Registrations);
+            }
+            else
+            {
+                var refusal = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() => second);
+                Assert.Equal(VsrError.TRANSIENT_NOT_ACCEPTED, refusal.StatusCode);
+                Assert.False(refusal.FromServer);
+                Assert.Single(cluster.Writes);
+            }
+        }
+        finally
+        {
+            evict.TrySetResult();
+            signIn.TrySetResult();
+        }
+    }
+
+    [Fact]
+    public async Task given_an_admitted_mutation_when_the_session_recovers_before_it_is_sent_should_send_it_once_under_the_new_session()
+    {
+        using var cluster = new RecoveryCluster();
+        var refuse = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var binds = 0;
+        UInt128 replaced = default;
+        // The link of the partition primary binds only after the write holds its lane, and the refused bind ends
+        // the session.
+        cluster.OnBind = request =>
+        {
+            if (Interlocked.Increment(ref binds) > 1)
+            {
+                return Answer(request);
+            }
+            replaced = request.ClientId;
+            return Reply(request.Operation, [], VsrError.UNAUTHENTICATED);
+        };
+        cluster.HoldReply = request =>
+            request.Code == CommandCodes.BIND_SESSION_CODE ? refuse.Task : Task.CompletedTask;
+        using var client = await cluster.ConnectAsync();
+        try
+        {
+            var store = StoreAsync(client, cluster.Token);
+            await cluster.UntilAsync(() => client.Mutations.OperationCount == 1);
+            refuse.SetResult();
+
+            await store;
+        }
+        finally
+        {
+            refuse.TrySetResult();
+        }
+
+        var write = Assert.Single(cluster.Writes);
+        Assert.NotEqual(replaced, write.ClientId);
+        Assert.Equal(2, cluster.Coordinator.Registrations);
+        Assert.Equal(0, client.Mutations.OperationCount);
+    }
+
+    [Fact]
+    public async Task given_reconnection_off_when_the_session_ends_before_an_admitted_mutation_is_sent_should_end_it_at_once()
+    {
+        using var cluster = new RecoveryCluster();
+        var binding = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        // The link of the partition primary does not bind, so the write holds its lane and waits for that link.
+        cluster.OnBind = request =>
+        {
+            binding.TrySetResult();
+            return Answer(request);
+        };
+        cluster.HoldReply = request =>
+            request.Code == CommandCodes.BIND_SESSION_CODE ? release.Task : Task.CompletedTask;
+        using var client = await cluster.ConnectAsync(reconnect: false);
+        try
+        {
+            var store = StoreAsync(client, cluster.Token);
+            await binding.Task.WaitAsync(cluster.Token);
+            await cluster.UntilAsync(() => client.Mutations.OperationCount == 1);
+            cluster.PingEviction = EvictionReason.SessionError;
+
+            // No sign-in follows the eviction, so the client stops and the write ends at once as not connected,
+            // like any call that nothing reconnects for.
+            await Assert.ThrowsAnyAsync<Exception>(() => client.PingAsync(cluster.Token));
+            await Assert.ThrowsAsync<NotConnectedException>(() => store);
+        }
+        finally
+        {
+            release.TrySetResult();
+        }
+
+        Assert.Empty(cluster.Writes);
+        Assert.Equal(0, client.Mutations.OperationCount);
+    }
+
+    [Fact]
+    public async Task given_reconnection_off_when_the_session_ends_while_a_read_waits_for_its_link_should_end_it_at_once()
+    {
+        using var cluster = new RecoveryCluster();
+        var binding = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        // The link of the partition primary does not bind, so the read waits for that link.
+        cluster.OnBind = request =>
+        {
+            binding.TrySetResult();
+            return Answer(request);
+        };
+        cluster.HoldReply = request =>
+            request.Code == CommandCodes.BIND_SESSION_CODE ? release.Task : Task.CompletedTask;
+        using var client = await cluster.ConnectAsync(reconnect: false);
+        try
+        {
+            var poll = PollAsync(client, cluster.Token);
+            await binding.Task.WaitAsync(cluster.Token);
+            await cluster.UntilAsync(() => cluster.Coordinator.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE) > 0);
+            cluster.PingEviction = EvictionReason.SessionError;
+
+            await Assert.ThrowsAnyAsync<Exception>(() => client.PingAsync(cluster.Token));
+            await Assert.ThrowsAsync<NotConnectedException>(() => poll).WaitAsync(cluster.Token);
+        }
+        finally
+        {
+            release.TrySetResult();
+        }
+
+        Assert.Empty(cluster.Polls);
+    }
+
+    [Fact]
+    public async Task given_a_read_waiting_for_a_session_recovery_when_the_client_is_disposed_should_end_it_as_disposed()
+    {
+        using var cluster = new RecoveryCluster();
+        using var client = await cluster.ConnectAsync();
+        var registering = Signal();
+        var release = Signal();
+        // The recovery register gets no reply, so the read waits for the recovery.
+        cluster.HoldReply = request => request.Operation == (byte)VsrOperation.Register
+            ? Hold(registering, release) : Task.CompletedTask;
+        cluster.PingEviction = EvictionReason.SessionError;
+        await Assert.ThrowsAnyAsync<Exception>(() => client.PingAsync(cluster.Token));
+        await registering.Task.WaitAsync(cluster.Token);
+        try
+        {
+            var poll = PollAsync(client, cluster.Token);
+
+            client.Dispose();
+
+            await Assert.ThrowsAsync<ObjectDisposedException>(() => poll).WaitAsync(cluster.Token);
+        }
+        finally
+        {
+            release.TrySetResult();
+        }
+
+        Assert.Empty(cluster.Polls);
+    }
+
+    [Theory]
+    [InlineData("invalid credentials")]
+    [InlineData("malformed login")]
+    [InlineData("eviction after the bind")]
+    public async Task given_a_failed_recovery_sign_in_when_a_mutation_waits_should_end_it_and_forget_only_a_refused_credential(
+        string failure)
+    {
+        using var cluster = new RecoveryCluster();
+        var malformed = failure == "malformed login";
+        var refused = malformed || failure == "invalid credentials";
+        var binding = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        // The link of the partition primary does not bind, so the write holds its lane and waits for that link.
+        cluster.OnBind = request =>
+        {
+            binding.TrySetResult();
+            return Answer(request);
+        };
+        cluster.HoldReply = request =>
+            request.Code == CommandCodes.BIND_SESSION_CODE ? release.Task : Task.CompletedTask;
+        using var client = await cluster.ConnectAsync();
+        try
+        {
+            var store = StoreAsync(client, cluster.Token);
+            await binding.Task.WaitAsync(cluster.Token);
+            await cluster.UntilAsync(() => client.Mutations.OperationCount == 1);
+            if (refused)
+            {
+                cluster.RegisterRefusal = malformed ? EvictionReason.MalformedLogin : EvictionReason.InvalidCredentials;
+                cluster.RejectRegister = true;
+            }
+            else
+            {
+                // The server accepts the sign-in and ends the new session at the next read, which refuses no
+                // credential.
+                cluster.RosterEviction = EvictionReason.SessionError;
+            }
+            cluster.PingEviction = EvictionReason.SessionError;
+
+            await Assert.ThrowsAnyAsync<Exception>(() => client.PingAsync(cluster.Token));
+
+            if (refused)
+            {
+                var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() => store);
+                Assert.Equal(VsrError.UNAUTHENTICATED, error.StatusCode);
+                Assert.False(error.FromServer);
+                var refusal = Assert.IsType<IggyInvalidStatusCodeException>(error.InnerException);
+                Assert.Equal(malformed ? VsrError.INVALID_FORMAT : VsrError.INVALID_CREDENTIALS, refusal.StatusCode);
+                Assert.True(refusal.FromServer);
+            }
+            else
+            {
+                await Assert.ThrowsAsync<NotConnectedException>(() => store);
+            }
+        }
+        finally
+        {
+            release.TrySetResult();
+        }
+
+        Assert.Empty(cluster.Writes);
+        Assert.Equal(2, cluster.Coordinator.Registrations);
+        // Only a refused credential is forgotten, so a connect signs in again with any other.
+        await client.ConnectAsync(cluster.Token);
+        Assert.Equal(refused ? 2 : 3, cluster.Coordinator.Registrations);
+    }
+
+    [Fact]
+    public async Task given_auto_login_when_the_caller_signed_in_as_another_user_should_recover_as_that_user()
+    {
+        using var cluster = new RecoveryCluster();
+        using var client = new TcpMessageStream(new IggyClientConfigurator
+        {
+            BaseAddress = $"127.0.0.1:{cluster.Coordinator.Port}",
+            Protocol = Protocol.Tcp,
+            HeartbeatInterval = TimeSpan.FromMilliseconds(25),
+            AutoLoginSettings = AutoLoginSettings.For("user", "secret"),
+            ReconnectionSettings = new ReconnectionSettings
+            {
+                Enabled = true,
+                InitialDelay = TimeSpan.FromMilliseconds(1),
+                WaitAfterReconnect = TimeSpan.Zero
+            }
+        }, NullLoggerFactory.Instance);
+        await client.ConnectAsync(cluster.Token);
+        await client.LoginUserAsync("other", "secret", cluster.Token);
+        var registrations = new ConcurrentQueue<MockRequest>();
+        cluster.BeforeReply = (request, _) =>
+        {
+            if (request.Operation == (byte)VsrOperation.Register)
+            {
+                registrations.Enqueue(request);
+            }
+        };
+
+        cluster.PingEviction = EvictionReason.SessionError;
+        await cluster.UntilAsync(() => !registrations.IsEmpty);
+        await StoreAsync(client, cluster.Token);
+
+        var registration = Assert.Single(registrations);
+        Assert.Equal(LoginRegister.Serialize("other", "secret", LoginRegister.ReadBindSecret(registration.Body)),
+            registration.Body);
+        Assert.Equal(registration.ClientId, Assert.Single(cluster.Writes).ClientId);
+        // An explicit sign-out leaves the client nothing to sign in as by itself, auto login included.
+        await client.LogoutUserAsync(cluster.Token);
+        var signedIn = cluster.Coordinator.Registrations;
+        await client.ConnectAsync(cluster.Token);
+        Assert.Equal(signedIn, cluster.Coordinator.Registrations);
+    }
+
+    [Theory]
     [InlineData(true)]
     [InlineData(false)]
     public async Task given_an_unbound_mutation_when_the_bind_succeeds_should_replay_the_same_request(bool send)
@@ -933,7 +1294,8 @@ public sealed class NativeRecoveryTests
     public async Task given_a_selected_partition_when_not_found_should_reselect_once_only_before_uncertainty(
         bool messageKey, bool uncertain)
     {
-        using var cluster = new RecoveryCluster();
+        // Only a miss from the metadata primary is final, so the roster names the partition primary the leader.
+        using var cluster = new RecoveryCluster { PrimaryLeads = true };
         cluster.PartitionCount = 1;
         cluster.OnSend = request =>
         {
@@ -956,7 +1318,7 @@ public sealed class NativeRecoveryTests
             Assert.Equal(2, attempts.Length);
             Assert.Equal(attempts[0].RequestId, attempts[1].RequestId);
             Assert.Equal(attempts[0].Body, attempts[1].Body);
-            Assert.Equal(1, cluster.Coordinator.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
+            Assert.Equal(2, cluster.RouteLookups);
             await client.AbandonOperationAsync(Assert.IsType<ulong>(error.OperationId));
         }
         else
@@ -965,26 +1327,255 @@ public sealed class NativeRecoveryTests
             var attempts = cluster.Sends.ToArray();
             Assert.Equal(2, attempts.Length);
             Assert.True(attempts[1].RequestId > attempts[0].RequestId);
-            Assert.True(cluster.Coordinator.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE)
-                + cluster.Primary.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE) >= 2);
+            Assert.True(cluster.RouteLookups >= 2);
         }
     }
 
     [Fact]
     public async Task given_an_explicit_partition_when_not_found_should_return_the_original_error_without_reselection()
     {
-        using var cluster = new RecoveryCluster();
+        // Only a miss from the metadata primary is final, so the roster names the partition primary the leader.
+        using var cluster = new RecoveryCluster { PrimaryLeads = true };
         cluster.OnSend = request => Reply(request.Operation, [], VsrError.PARTITION_NOT_FOUND);
         using var client = await cluster.ConnectAsync();
         var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() => client.SendMessagesAsync(
             Stream, Topic, Partitioning.PartitionId(0), new Message(Guid.NewGuid(), "payload"u8.ToArray()), cluster.Token));
         Assert.Equal(VsrError.PARTITION_NOT_FOUND, error.StatusCode);
         Assert.Single(cluster.Sends);
-        Assert.Equal(1, cluster.Coordinator.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
+        Assert.Equal(1, cluster.RouteLookups);
+    }
+
+    [Theory]
+    [InlineData(VsrError.STREAM_ID_NOT_FOUND)]
+    [InlineData(VsrError.STREAM_NAME_NOT_FOUND)]
+    [InlineData(VsrError.TOPIC_ID_NOT_FOUND)]
+    [InlineData(VsrError.TOPIC_NAME_NOT_FOUND)]
+    [InlineData(VsrError.PARTITION_NOT_FOUND)]
+    public async Task given_a_backup_namespace_miss_when_sending_should_resend_after_a_lookup_at_the_metadata_primary(
+        int status)
+    {
+        using var cluster = new RecoveryCluster();
+        cluster.OnSend = request => cluster.Sends.Count == 1
+            ? Reply(request.Operation, [], (uint)status) : Reply(request.Operation, new byte[4]);
+        using var client = await cluster.ConnectAsync();
+
+        await client.SendMessagesAsync(Stream, Topic, Partitioning.PartitionId(0),
+            new Message(Guid.NewGuid(), "payload"u8.ToArray()), cluster.Token);
+
+        var attempts = cluster.Sends.ToArray();
+        Assert.Equal(2, attempts.Length);
+        Assert.Equal(attempts[0].RequestId, attempts[1].RequestId);
+        Assert.Equal(2, cluster.Coordinator.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
+        Assert.Equal(0, cluster.Primary.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
+    }
+
+    [Fact]
+    public async Task given_a_backup_namespace_miss_when_storing_an_offset_should_resend_after_a_lookup_at_the_metadata_primary()
+    {
+        using var cluster = new RecoveryCluster();
+        cluster.OnWrite = request => cluster.Writes.Count == 1
+            ? Reply(request.Operation, [], VsrError.TOPIC_ID_NOT_FOUND) : Result(request);
+        using var client = await cluster.ConnectAsync();
+
+        await StoreAsync(client, cluster.Token);
+
+        var attempts = cluster.Writes.ToArray();
+        Assert.Equal(2, attempts.Length);
+        Assert.Equal(attempts[0].RequestId, attempts[1].RequestId);
+        Assert.Equal(2, cluster.Coordinator.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
+        Assert.Equal(0, cluster.Primary.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
+    }
+
+    [Fact]
+    public async Task given_an_uncertain_send_when_a_backup_misses_the_namespace_should_resend_until_it_settles()
+    {
+        using var cluster = new RecoveryCluster();
+        cluster.OnSend = request => cluster.Sends.Count switch
+        {
+            1 => Reply(request.Operation, [], VsrError.TRANSIENT_NOT_COMMITTED),
+            2 => Reply(request.Operation, [], VsrError.STREAM_ID_NOT_FOUND),
+            _ => Reply(request.Operation, new byte[4])
+        };
+        using var client = await cluster.ConnectAsync();
+
+        await client.SendMessagesAsync(Stream, Topic, Partitioning.PartitionId(0),
+            new Message(Guid.NewGuid(), "payload"u8.ToArray()), cluster.Token);
+
+        var attempts = cluster.Sends.ToArray();
+        Assert.Equal(3, attempts.Length);
+        Assert.All(attempts, attempt => Assert.Equal(attempts[0].RequestId, attempt.RequestId));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task given_a_partition_write_answered_not_committed_when_its_replay_commits_should_succeed_with_the_same_request(
+        bool send)
+    {
+        using var cluster = new RecoveryCluster();
+        var attempts = AnswerPartitionWrites(cluster, send, (request, count) => count == 1
+            ? Reply(request.Operation, [], VsrError.TRANSIENT_NOT_COMMITTED) : Result(request));
+        using var client = await cluster.ConnectAsync();
+
+        await PartitionWriteAsync(client, send, cluster.Token);
+
+        var sent = attempts.ToArray();
+        Assert.Equal(2, sent.Length);
+        Assert.Equal(sent[0].ClientId, sent[1].ClientId);
+        Assert.Equal(sent[0].RequestId, sent[1].RequestId);
+        Assert.Equal(sent[0].Body, sent[1].Body);
+        Assert.Equal(0, client.Mutations.OperationCount);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task given_a_partition_write_answered_not_committed_until_the_deadline_should_end_uncertain(bool send)
+    {
+        const int DeadlineMs = 2_000;
+        using var cluster = new RecoveryCluster();
+        using var client = await cluster.ConnectAsync();
+        // A public write gives the body that the call with the earlier deadline sends.
+        await PartitionWriteAsync(client, send, cluster.Token);
+        var attempts = AnswerPartitionWrites(cluster, send,
+            (request, _) => Reply(request.Operation, [], VsrError.TRANSIENT_NOT_COMMITTED));
+        var body = Assert.Single(attempts).Body;
+
+        var error = await Assert.ThrowsAsync<VsrRequestOutcomeUnknownException>(() => SendWithinAsync(client,
+            send ? CommandCodes.SEND_MESSAGES_CODE : CommandCodes.STORE_CONSUMER_OFFSET_CODE, body,
+            TimeSpan.FromMilliseconds(DeadlineMs), cluster.Token));
+
+        var operationId = Assert.IsType<ulong>(error.OperationId);
+        var replays = attempts.Skip(1).ToArray();
+        Assert.True(replays.Length > 1);
+        Assert.All(replays, replay => Assert.Equal(operationId, replay.RequestId));
+        Assert.True(client.RetainsOperation(operationId));
+    }
+
+    [Fact]
+    public async Task given_a_backup_namespace_miss_when_polling_should_poll_again_after_a_lookup_at_the_metadata_primary()
+    {
+        using var cluster = new RecoveryCluster();
+        var poll = cluster.OnPoll;
+        cluster.OnPoll = request => cluster.Polls.Count == 1
+            ? Reply(request.Operation, [], VsrError.TOPIC_ID_NOT_FOUND) : poll(request);
+        using var client = await cluster.ConnectAsync();
+
+        await PollAsync(client, cluster.Token);
+
+        Assert.Equal(2, cluster.Polls.Count);
+        Assert.Equal(2, cluster.Coordinator.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
+        Assert.Equal(0, cluster.Primary.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
+    }
+
+    [Fact]
+    public async Task given_a_backup_namespace_miss_until_the_deadline_when_polling_should_report_not_accepted()
+    {
+        const int DeadlineMs = 1_000;
+        using var cluster = new RecoveryCluster();
+        using var client = await cluster.ConnectAsync();
+        // A public poll gives the body that the call with the earlier deadline sends.
+        await PollAsync(client, cluster.Token);
+        var poll = Assert.Single(cluster.Polls).Body;
+        cluster.OnPoll = request => Reply(request.Operation, [], VsrError.TOPIC_ID_NOT_FOUND);
+
+        var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() => SendWithinAsync(client,
+            CommandCodes.POLL_MESSAGES_CODE, poll, TimeSpan.FromMilliseconds(DeadlineMs), cluster.Token));
+
+        Assert.Equal(VsrError.TRANSIENT_NOT_ACCEPTED, error.StatusCode);
+        Assert.True(cluster.Polls.Count > 2);
+        Assert.Equal(0, cluster.Primary.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
+    }
+
+    [Fact]
+    public async Task given_not_primary_until_the_deadline_when_polling_should_report_not_accepted()
+    {
+        const int DeadlineMs = 1_000;
+        using var cluster = new RecoveryCluster();
+        using var client = await cluster.ConnectAsync();
+        // A public poll gives the body that the call with the earlier deadline sends.
+        await PollAsync(client, cluster.Token);
+        var poll = Assert.Single(cluster.Polls).Body;
+        cluster.OnPoll = request => Reply(request.Operation, [], VsrError.NOT_PRIMARY);
+
+        var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() => SendWithinAsync(client,
+            CommandCodes.POLL_MESSAGES_CODE, poll, TimeSpan.FromMilliseconds(DeadlineMs), cluster.Token));
+
+        Assert.Equal(VsrError.TRANSIENT_NOT_ACCEPTED, error.StatusCode);
+        Assert.True(error.FromServer);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task given_a_believed_metadata_primary_without_a_link_when_the_elected_one_misses_the_namespace_should_fail_with_that_miss(
+        bool cached)
+    {
+        using var cluster = new RecoveryCluster();
+        using var client = await cluster.ConnectAsync();
+        // The send binds the link of the partition primary and caches the route of its partition only.
+        await client.SendMessagesAsync(Stream, Topic, Partitioning.PartitionId(cached ? 0u : 1u),
+            new Message(Guid.NewGuid(), "payload"u8.ToArray()), cluster.Token);
+        cluster.Coordinator.Kill();
+        cluster.PrimaryLeads = true;
+        cluster.OnRoute = request => Reply(request.Operation, [], VsrError.TOPIC_ID_NOT_FOUND);
+        cluster.OnSend = request => Reply(request.Operation, [], VsrError.TOPIC_ID_NOT_FOUND);
+
+        var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() => client.SendMessagesAsync(Stream,
+            Topic, Partitioning.PartitionId(0), new Message(Guid.NewGuid(), "payload"u8.ToArray()), cluster.Token));
+
+        Assert.Equal(VsrError.TOPIC_ID_NOT_FOUND, error.StatusCode);
+        Assert.Equal(cached ? 2 : 1, cluster.Sends.Count);
+    }
+
+    [Theory]
+    [InlineData(CommandCodes.GET_PARTITION_ROUTE_CODE)]
+    [InlineData(CommandCodes.SEND_MESSAGES_CODE)]
+    public async Task given_a_namespace_miss_from_a_deposed_metadata_primary_when_its_roster_names_another_should_ask_another_replica(
+        int code)
+    {
+        using var cluster = new RecoveryCluster { PrimaryLeads = true };
+        using var client = await cluster.ConnectAsync();
+        // The send binds the link of the partition primary, which the client believes is the metadata primary.
+        await client.SendMessagesAsync(Stream, Topic, Partitioning.PartitionId(0),
+            new Message(Guid.NewGuid(), "payload"u8.ToArray()), cluster.Token);
+        cluster.PrimaryLeads = false;
+        var missed = 0;
+        byte[]? MissOnce(MockRequest request) => Interlocked.Exchange(ref missed, 1) == 0
+            ? Reply(request.Operation, [], VsrError.TOPIC_ID_NOT_FOUND) : null;
+        if (code == CommandCodes.GET_PARTITION_ROUTE_CODE)
+        {
+            cluster.OnRoute = MissOnce;
+        }
+        else
+        {
+            var send = cluster.OnSend;
+            cluster.OnSend = request => MissOnce(request) ?? send(request);
+        }
+        var deposedLookups = cluster.Primary.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE);
+        var electedLookups = cluster.Coordinator.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE);
+
+        await client.SendMessagesAsync(Stream, Topic, Partitioning.PartitionId(1),
+            new Message(Guid.NewGuid(), "payload"u8.ToArray()), cluster.Token);
+
+        Assert.Equal(1, Volatile.Read(ref missed));
+        Assert.Equal(deposedLookups + 1, cluster.Primary.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
+        Assert.Equal(electedLookups + 1, cluster.Coordinator.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
     }
 
     private static Task StoreAsync(TcpMessageStream client, CancellationToken token, uint partition = 0) =>
         client.StoreOffsetAsync(Consumer.New(3), Stream, Topic, 10, partition, token);
+
+    private static Task PollAsync(TcpMessageStream client, CancellationToken token) =>
+        client.PollMessagesAsync(Stream, Topic, 0, Consumer.New(3), PollingStrategy.Offset(0), 10, false, token);
+
+    // The public calls run until the fixed 30 s call deadline. The entry point under them takes an earlier one.
+    private static async Task SendWithinAsync(TcpMessageStream client, int code, byte[] body, TimeSpan budget,
+        CancellationToken token)
+    {
+        using var reply = await client.SendWithResponseAsync(code, body, token,
+            deadline: Environment.TickCount64 + (long)budget.TotalMilliseconds);
+    }
 
     private static IggyConsumer PartitionConsumer(TcpMessageStream client) => new(client, new IggyConsumerConfig
     {
@@ -1039,6 +1630,30 @@ public sealed class NativeRecoveryTests
             new Message(Guid.NewGuid(), "payload"u8.ToArray()), token)
         : client.CreateStreamAsync("created", token);
 
+    private static Task PartitionWriteAsync(TcpMessageStream client, bool send, CancellationToken token) => send
+        ? WriteAsync(client, send: true, token)
+        : StoreAsync(client, token);
+
+    /// <summary>
+    ///     Answers every SendMessages, or every StoreConsumerOffset, with <paramref name="answer" />, which also takes
+    ///     how many of them the cluster recorded so far, and returns those records.
+    /// </summary>
+    private static ConcurrentQueue<MockRequest> AnswerPartitionWrites(RecoveryCluster cluster, bool send,
+        Func<MockRequest, int, byte[]> answer)
+    {
+        var attempts = send ? cluster.Sends : cluster.Writes;
+        Func<MockRequest, byte[]> handler = request => answer(request, attempts.Count);
+        if (send)
+        {
+            cluster.OnSend = handler;
+        }
+        else
+        {
+            cluster.OnWrite = handler;
+        }
+        return attempts;
+    }
+
     /// <summary>
     ///     Answers the first SendMessages, or the first CreateStream, with <paramref name="first" /> and every later
     ///     one with a proved success, and records them.
@@ -1085,11 +1700,17 @@ public sealed class NativeRecoveryTests
         private readonly MockNode _primary = new();
         internal MockNode Coordinator => _coordinator;
         internal MockNode Primary => _primary;
+        internal int RouteLookups => _coordinator.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE)
+            + _primary.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE);
         internal volatile bool PrimaryLeads;
         internal ushort PrimaryEndpoint;
         internal EvictionReason? PingEviction;
+        /// <summary>Evicts the next cluster metadata read once.</summary>
+        internal EvictionReason? RosterEviction;
         internal bool RejectRegister;
+        internal EvictionReason RegisterRefusal = EvictionReason.InvalidCredentials;
         private int _evicted;
+        private int _rosterEvicted;
         private readonly CancellationTokenSource _timeout = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
         internal readonly ConcurrentQueue<MockRequest> Writes = new();
         internal readonly ConcurrentQueue<MockRequest> Polls = new();
@@ -1097,34 +1718,61 @@ public sealed class NativeRecoveryTests
         internal readonly ConcurrentQueue<MockRequest> Syncs = new();
         internal uint PartitionCount = 2;
         internal Func<MockRequest, byte[]> OnBind = Answer;
+        internal Func<MockRequest, byte[]> OnRegister = Answer;
+        internal Func<MockRequest, byte[]?>? OnCoordinator;
+        internal Func<MockRequest, byte[]?>? OnPrimary;
+        internal Func<MockRequest, byte[]?>? OnRoster;
+        /// <summary>Answers a route lookup, or returns null for the default route.</summary>
+        internal Func<MockRequest, byte[]?>? OnRoute;
         internal Func<MockRequest, byte[]> OnSend = request => Reply(request.Operation, new byte[4]);
         internal Func<MockRequest, byte[]> OnWrite = request => Result(request);
         internal Action<MockRequest, byte[]>? BeforeReply;
+        /// <summary>Holds the reply to a request until the returned task ends, without blocking the node.</summary>
+        internal Func<MockRequest, Task>? HoldReply;
         internal Func<MockRequest, byte[]> OnPoll = request => Reply(request.Operation, new byte[40]);
         internal Func<MockRequest, byte[]> OnMetadata = request => Result(request);
         internal CancellationToken Token => _timeout.Token;
 
-        internal RecoveryCluster()
+        internal RecoveryCluster(TimeSpan? timeout = null)
         {
-            _timeout.CancelAfter(TimeSpan.FromSeconds(10));
+            _timeout.CancelAfter(timeout ?? TimeSpan.FromSeconds(10));
             PrimaryEndpoint = _primary.Port;
-            _coordinator.Serve(Handle, (request, reply) => BeforeReply?.Invoke(request, reply));
-            _primary.Serve(Handle, (request, reply) => BeforeReply?.Invoke(request, reply));
+            _coordinator.Serve(request => OnCoordinator?.Invoke(request) ?? Handle(request), BeforeReplyAsync);
+            _primary.Serve(request => OnPrimary?.Invoke(request) ?? Handle(request), BeforeReplyAsync);
+        }
+
+        private Task BeforeReplyAsync(MockRequest request, byte[] reply)
+        {
+            BeforeReply?.Invoke(request, reply);
+            return (HoldReply?.Invoke(request) ?? Task.CompletedTask).WaitAsync(Token);
         }
 
         internal byte[] Handle(MockRequest request)
         {
             if (request.Operation == (byte)VsrOperation.Register && RejectRegister)
             {
-                return Eviction(EvictionReason.InvalidCredentials);
+                return Eviction(RegisterRefusal);
             }
             if (request.Code == CommandCodes.PING_CODE && PingEviction is { } reason
                 && Interlocked.Exchange(ref _evicted, 1) == 0)
             {
                 return Eviction(reason);
             }
+            if (request.Code == CommandCodes.GET_CLUSTER_METADATA_CODE && RosterEviction is { } rosterReason
+                && Interlocked.Exchange(ref _rosterEvicted, 1) == 0)
+            {
+                return Eviction(rosterReason);
+            }
+            if (request.Operation == (byte)VsrOperation.Register)
+            {
+                return OnRegister(request);
+            }
             if (request.Code == CommandCodes.GET_CLUSTER_METADATA_CODE)
             {
+                if (OnRoster?.Invoke(request) is { } roster)
+                {
+                    return roster;
+                }
                 var body = new List<byte>();
                 WriteString(body, "recovery");
                 body.AddRange(BitConverter.GetBytes(2u));
@@ -1134,7 +1782,7 @@ public sealed class NativeRecoveryTests
             }
             if (request.Code == CommandCodes.GET_PARTITION_ROUTE_CODE)
             {
-                return RouteReply(request, new PartitionContext(17, 0, 1), 1, PartitionCount);
+                return OnRoute?.Invoke(request) ?? RouteReply(request, new PartitionContext(17, 0, 1), 1, PartitionCount);
             }
             if (request.Code == CommandCodes.BIND_SESSION_CODE)
             {
@@ -1179,7 +1827,8 @@ public sealed class NativeRecoveryTests
             }
         }
 
-        internal async Task<TcpMessageStream> ConnectAsync(int maxOperations = 256, TimeSpan? heartbeat = null)
+        internal async Task<TcpMessageStream> ConnectAsync(int maxOperations = 256, TimeSpan? heartbeat = null,
+            bool reconnect = true)
         {
             var client = new TcpMessageStream(new IggyClientConfigurator
             {
@@ -1189,6 +1838,7 @@ public sealed class NativeRecoveryTests
                 MaxPendingOperations = maxOperations,
                 ReconnectionSettings = new ReconnectionSettings
                 {
+                    Enabled = reconnect,
                     InitialDelay = TimeSpan.FromMilliseconds(1),
                     WaitAfterReconnect = TimeSpan.Zero
                 }

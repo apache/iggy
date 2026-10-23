@@ -22,7 +22,7 @@ note: previous works on node.js http client has been moved to [iggy-node-http-cl
 npm i --save apache-iggy@edge
 ```
 
-Use matching SDK and server builds from the coordinated VSR release. Older builds are incompatible. This release requires fresh server storage (`IGGY-BOUND-GRANTS-4`). Existing incompatible data is refused unchanged. For a local server with the example credentials, follow the [example setup](../../examples/node/README.md#running-examples).
+Use matching SDK and server builds from the coordinated VSR release. Older builds are incompatible. This release requires fresh server storage (`IGGY-BOUND-GRANTS-5`). Existing incompatible data is refused unchanged. For a local server with the example credentials, follow the [example setup](../../examples/node/README.md#running-examples).
 
 ## basic usage
 
@@ -80,6 +80,17 @@ accepts only one logical client; it does not limit replica links or concurrency.
 The public `Client._pool` property has been removed. Applications should use the
 client methods directly; the client owns its replica connections.
 
+A backup replica can miss a stream, topic or partition that the metadata primary
+already created. When such a replica replies "not found" (error 1009, 1010,
+2010, 2011 or 3007) to a route lookup or a partition command, the call looks up
+the route again and retries. If the deadline ends the call first, it fails with
+error 58. Only a "not found" reply from the metadata primary is final. A leader
+change can make the client's view of the metadata primary out of date. If the
+client believes that the replica that replied is the metadata primary, it reads
+the cluster roster from that replica. If the client has no link to the metadata
+primary, it also reads that roster. If that roster names this replica as the
+metadata primary, the reply is final.
+
 VSR authentication translates password and personal-access-token login into the
 Register handshake. Replacement links bind the existing session. Confirmed
 session expiry requires a new Register; an uncertain mutation is never replayed
@@ -89,6 +100,19 @@ outcome of a mutation that the client already wrote. That call ends with
 the server keeps the session. The client binds the same session on a new link,
 as after any lost link, so retained operations and group membership stay.
 Explicit relogin logs out the previous session first.
+
+The client signs in by itself as the last sign-in of the caller, or with the
+configured `credentials` while the caller never signed in. After a logout, or
+after the server refuses those credentials, it does not sign in by itself, and
+a call fails with status 40 until the caller signs in again. A sign-in or
+logout of the caller ends each earlier call that has to wait for a new session:
+with status 40 if it sent nothing, or with `OperationUncertainError` if its
+outcome is unknown. An auto-commit or Next poll, which has no operation ID, ends with status 57 instead. A typed send and a group poll can send more than one
+command. If the caller signs in or logs out before the next command of such a
+call, the call fails with status 40. Only a call that waits for the client's own sign-in goes on
+under the new session. If the server refuses that sign-in, the call fails with
+status 40, and its `cause` holds the refusal. A call whose deadline ends while
+it waits for a session fails with status 58. So does a call that replicas refuse with 89 until its deadline.
 
 A reply with status 30 (`StaleClient`) says that the server no longer attaches
 the link to the session. This happens, for example, after the user was deleted
@@ -105,6 +129,17 @@ It is a proved outcome, like any other committed rejection, and the client
 drops the session at once and signs in again.
 
 ### Mutation recovery and limits
+
+Receipt access follows the server's [session and revocation policy](../../core/server/README.md#sessions-and-retry-receipts).
+An unresolved operation cannot recover its receipt after its original session
+ends, even after a new login or account reactivation. A fresh send can duplicate
+that operation.
+
+Each node counts the messages in its stream, topic and system stats. After a
+successful send, a node that is not the partition primary shows the new count
+only after the next prepare or commit broadcast. When no other write follows,
+this delay is at most `cluster.commit_broadcast_interval` (500 ms by default).
+See [metadata freshness and counters](../../core/server/README.md#metadata-freshness-and-counters).
 
 Mutations share one FIFO lane per partition history, with a separate metadata
 lane. An uncertain mutation remains retained and blocks later mutations in its
@@ -135,7 +170,7 @@ discards retained operations. It does not wait for outstanding calls to finish.
 Await those calls before destroying the client when their results are needed.
 
 Auto-commit and Next polls hold their partition lane only during the active call.
-Error 57 or a lost reply ends the call immediately with unknown progress and no
+Error 57, a lost reply or another unknown outcome ends the call immediately with status 57 and no
 retained operation ID. These polls never replay after uncertainty. Known
 non-admission errors 58/89 remain retryable; pure reads may retry lost replies.
 Before uncertainty, lifecycle error 88 retries with a fresh ID within the same
@@ -150,6 +185,13 @@ Completion, abandonment and reset release the operation slot. Writer aliases kee
 the frame. These limits cover admitted active/retained frames, not caller buffers,
 queued API input snapshots, or read/control bodies. `sendBinaryRequest` preserves
 its immediate payload snapshot before awaiting a custom provider.
+
+An explicit sign-in uses its caller's credentials and supersedes automatic or
+queued sign-ins. A failed explicit attempt, including invalid input, timeout or
+cancellation, withdraws credentials from automatic sign-in until another explicit
+sign-in succeeds. This also discards a session whose Register succeeded when a
+later step of the explicit sign-in fails. Earlier calls keep their original
+lineage; only SDK recovery continues them under a replacement session.
 
 An established session has its own lifetime. Password or PAT changes and PAT
 expiry do not end it. Logout, session lease expiry, or user deactivation end the
@@ -172,32 +214,40 @@ A replica link redials on its own after it drops, with jittered exponential
 backoff. `reconnect.maxRetries` limits one burst of redials, not the life of
 the client. While the client stays signed in, each heartbeat restarts a link
 that used its budget, with a fresh budget. A request does not redial a link. It
-retries within its deadline until the link returns. `destroy()` and logout stop
-the restarts.
+retries within its deadline until the link returns. If the deadline ends before
+the request was sent and no replica refused it, it fails with status 58.
+`destroy()` and logout stop the restarts.
 
-When every link used its budget, a request can fail before its deadline with
-`NotConnectedError`. When no endpoint accepts a dial within its retry budget, a
-sign-in also fails with `NotConnectedError`, and its `cause` holds the last dial
-error. In both cases a later call can succeed, because the heartbeat restarts
-the links and each sign-in dials again. If reconnection or heartbeats are
-disabled, nothing restarts a link that used its budget, so the request fails
-with a plain `Error` instead.
+When every link used its budget, a request fails with `NotConnectedError` and
+does not wait for its deadline. When no endpoint accepts a dial before its retry
+budget or its deadline ends, a sign-in also fails with `NotConnectedError`, and
+its `cause` holds the last dial error. In both cases a later call can succeed,
+because the heartbeat restarts the links and each sign-in dials again. If
+reconnection or heartbeats are disabled, nothing restarts a link that used its
+budget, so the request fails with a plain `Error` instead.
 
 When a poll fails with status 30, 40, 57, 58 or 89, `singleConsumerStream` and
 `groupConsumerStream` poll again after `interval`. They also poll again after a
-poll deadline, after a poll with unknown progress and after
-`NotConnectedError`. The client binds the session again, signs in again,
+poll deadline, after a poll with unknown progress, after `NotConnectedError` and
+after `ConnectionClosedError`. That error reports a lost connected socket. The
+client binds the session again, signs in again,
 reconnects or routes again after these on its own. Any other error ends the
-stream. If the reply of an auto-commit poll is lost, the stream can skip that
-batch.
+stream. The server can also refuse a sign-in with status 40, for example for an
+inactive user. So after a 40 the stream waits for the next sign-in, and a
+refused sign-in ends the stream. If the reply of an auto-commit poll is lost,
+the stream can skip that batch.
 
 `singleConsumerStream` and `groupConsumerStream` sign in before they return the
 stream, and `groupConsumerStream` also joins its group. If the sign-in or the
 join fails, the call destroys its client and rejects with that error. If no
-endpoint accepts a dial within the retry budget, the error is
-`NotConnectedError`. If the 30 second sign-in deadline ends first, the error is
-`VsrResponseTimeoutError`. With the default `reconnect` values, the deadline
-usually ends first. When a stream closes, it destroys its client.
+endpoint accepts a dial before the retry budget or the 30 second sign-in
+deadline ends, the error is `NotConnectedError`. When a stream closes, it
+destroys its client. A group stream that is still signed in first leaves its
+group, so that the server gives its partitions to the other members at once. If
+the leave fails or takes more than 5 seconds, the membership ends when the
+session lease expires. If the client of a destroyed stream has no session, or
+loses it, the stream destroys the client at once. It does not wait for a poll
+or a sign-in that still runs.
 
 `sendBinaryRequest(code, payload)` sends an arbitrary command code. Known replicated commands use their registered operation, while unknown codes reach the server as non-replicated requests and are rejected by servers that do not register them.
 

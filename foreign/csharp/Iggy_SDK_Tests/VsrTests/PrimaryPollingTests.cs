@@ -24,6 +24,7 @@ using Apache.Iggy.Configuration;
 using Apache.Iggy.Consumers;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Contracts.Tcp;
+using Apache.Iggy.Encryption;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.IggyClient.Implementations;
@@ -241,6 +242,28 @@ public sealed class PrimaryPollingTests
 
         Assert.Equal(new ulong[] { 0, MetadataCommit }, cluster.RouteRequests.Select(request => request.Context.MetadataOp));
         Assert.Equal(1, cluster.Primaries[0].Connections);
+    }
+
+    [Fact]
+    public async Task given_group_assignment_read_when_polling_should_refresh_at_its_metadata_floor()
+    {
+        using var cluster = new PollCluster();
+        cluster.OnCoordinator = request =>
+        {
+            if (request.Code != CommandCodes.GET_CONSUMER_GROUP_CODE)
+            {
+                return null;
+            }
+            var reply = Reply(request.Operation, []);
+            BinaryPrimitives.WriteUInt64LittleEndian(reply.AsSpan(VsrHeader.REPLY_COMMIT_OFFSET), MetadataCommit);
+            return reply;
+        };
+        using var client = await cluster.ConnectAsync();
+        await PollAsync(client);
+        _ = await client.GetConsumerGroupByIdAsync(Stream, Topic, Group, TestContext.Current.CancellationToken);
+        await PollAsync(client);
+
+        Assert.Equal(new ulong[] { 0, MetadataCommit }, cluster.RouteRequests.Select(request => request.Context.MetadataOp));
     }
 
     [Fact]
@@ -812,7 +835,8 @@ public sealed class PrimaryPollingTests
             Assert.NotEqual(generation, ((ISessionGenerationProvider)client).SessionGeneration);
             release.TrySetResult();
             var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() => pending);
-            Assert.Equal(VsrError.TRANSIENT_NOT_ACCEPTED, error.StatusCode);
+            Assert.Equal(VsrError.UNAUTHENTICATED, error.StatusCode);
+            Assert.False(error.FromServer);
             Assert.Equal(1, cluster.Coordinator.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
             Assert.Equal(2, cluster.Coordinator.Registrations);
             Assert.Equal(2, cluster.Primaries[0].Requests(CommandCodes.POLL_MESSAGES_CODE));
@@ -880,10 +904,11 @@ public sealed class PrimaryPollingTests
             release.SetResult();
 
             var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() => pending);
-            Assert.Equal(VsrError.TRANSIENT_NOT_ACCEPTED, error.StatusCode);
+            Assert.Equal(VsrError.UNAUTHENTICATED, error.StatusCode);
+            Assert.False(error.FromServer);
             Assert.Single(sends);
-            Assert.Equal(status == VsrError.HISTORY_UNAVAILABLE ? 3 : 2, cluster.RouteRequests.Length);
-            Assert.Equal(counter + (ulong)(cluster.RouteRequests.Length - routes), session.RequestCounter);
+            Assert.Equal(routes, cluster.RouteRequests.Length);
+            Assert.Equal(counter, session.RequestCounter);
             Assert.Equal(2, cluster.Coordinator.Registrations);
 
             await client.SendMessagesAsync(Stream, Topic, Partitioning.PartitionId(0),
@@ -900,6 +925,71 @@ public sealed class PrimaryPollingTests
         {
             AppDomain.CurrentDomain.FirstChanceException -= HoldRefusal;
             release.TrySetResult();
+        }
+    }
+
+    [Fact]
+    public async Task given_a_balanced_send_when_relogin_completes_before_its_partition_resolves_should_not_send_it()
+    {
+        using var cluster = new PollCluster(primaryCount: 1);
+        var refuseRoutes = true;
+        cluster.OnCoordinator = RefuseRoute;
+        cluster.OnPrimaryControl = RefuseRoute;
+        var sends = new ConcurrentQueue<MockRequest>();
+        cluster.OnPrimarySend = request =>
+        {
+            sends.Enqueue(request);
+            return Reply(request.Operation, new byte[4]);
+        };
+        using var client = await cluster.ConnectAsync();
+
+        var pending = client.SendMessagesAsync(Stream, Topic, Partitioning.None(),
+            new Message(Guid.NewGuid(), "payload"u8.ToArray()), TestContext.Current.CancellationToken);
+        await cluster.UntilAsync(() => cluster.RouteRequests.Length > 0);
+        await client.LogoutUserAsync(TestContext.Current.CancellationToken);
+        await client.LoginUserAsync("other", "secret", TestContext.Current.CancellationToken);
+        Volatile.Write(ref refuseRoutes, false);
+
+        var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() => pending);
+        Assert.Equal(VsrError.UNAUTHENTICATED, error.StatusCode);
+        Assert.False(error.FromServer);
+        Assert.Empty(sends);
+
+        byte[]? RefuseRoute(MockRequest request) =>
+            request.Code == CommandCodes.GET_PARTITION_ROUTE_CODE && Volatile.Read(ref refuseRoutes)
+                ? Reply(request.Operation, [], VsrError.TRANSIENT_NOT_ACCEPTED) : null;
+    }
+
+    [Fact]
+    public async Task given_a_balanced_send_when_relogin_completes_while_its_messages_encode_should_not_send_it()
+    {
+        using var cluster = new PollCluster(primaryCount: 1);
+        var sends = new ConcurrentQueue<MockRequest>();
+        cluster.OnPrimarySend = request =>
+        {
+            sends.Enqueue(request);
+            return Reply(request.Operation, new byte[4]);
+        };
+        using var encryptor = new HeldEncryptor(TestContext.Current.CancellationToken);
+        using var client = await cluster.ConnectAsync(encryptor: encryptor);
+        try
+        {
+            // The partition resolves first, so the send then holds a pool thread while its messages encode.
+            var pending = Task.Run(() => client.SendMessagesAsync(Stream, Topic, Partitioning.None(),
+                new Message(Guid.NewGuid(), "payload"u8.ToArray()), TestContext.Current.CancellationToken));
+            await encryptor.Entered.Task.WaitAsync(TestContext.Current.CancellationToken);
+            await client.LogoutUserAsync(TestContext.Current.CancellationToken);
+            await client.LoginUserAsync("other", "secret", TestContext.Current.CancellationToken);
+            encryptor.Release();
+
+            var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() => pending);
+            Assert.Equal(VsrError.UNAUTHENTICATED, error.StatusCode);
+            Assert.False(error.FromServer);
+            Assert.Empty(sends);
+        }
+        finally
+        {
+            encryptor.Release();
         }
     }
 
@@ -973,7 +1063,8 @@ public sealed class PrimaryPollingTests
             continuation.Release.TrySetResult();
 
             var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() => pending);
-            Assert.Equal(VsrError.TRANSIENT_NOT_ACCEPTED, error.StatusCode);
+            Assert.Equal(VsrError.UNAUTHENTICATED, error.StatusCode);
+            Assert.False(error.FromServer);
             Assert.Equal(1, replacement.Requests(CommandCodes.POLL_MESSAGES_CODE));
         }
         finally
@@ -1809,6 +1900,35 @@ public sealed class PrimaryPollingTests
         Assert.IsType<ConsensusSession>(typeof(TcpMessageStream)
             .GetField("_consensusSession", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(client));
 
+    /// <summary>Copies each message as is, and holds the first encryption until <see cref="Release" />.</summary>
+    private sealed class HeldEncryptor(CancellationToken token) : IMessageEncryptor, IDisposable
+    {
+        private readonly ManualResetEventSlim _released = new();
+        internal readonly TaskCompletionSource Entered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        internal void Release() => _released.Set();
+
+        public int GetMaxEncryptedLength(int plaintextLength) => plaintextLength;
+
+        public int GetMaxDecryptedLength(int encryptedLength) => encryptedLength;
+
+        public int Encrypt(ReadOnlySpan<byte> plaintext, Span<byte> destination)
+        {
+            Entered.TrySetResult();
+            _released.Wait(token);
+            plaintext.CopyTo(destination);
+            return plaintext.Length;
+        }
+
+        public int Decrypt(ReadOnlySpan<byte> encryptedData, Span<byte> destination)
+        {
+            encryptedData.CopyTo(destination);
+            return encryptedData.Length;
+        }
+
+        public void Dispose() => _released.Dispose();
+    }
+
     private sealed class PausedContinuationContext : SynchronizationContext
     {
         internal readonly TaskCompletionSource Posted = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -2013,13 +2133,15 @@ public sealed class PrimaryPollingTests
             }
         }
 
-        internal async Task<TcpMessageStream> ConnectAsync(int? maxResponseFrameSize = null)
+        internal async Task<TcpMessageStream> ConnectAsync(int? maxResponseFrameSize = null,
+            IMessageEncryptor? encryptor = null)
         {
             var configuration = new IggyClientConfigurator
             {
                 BaseAddress = $"127.0.0.1:{Coordinator.Port}",
                 Protocol = Protocol.Tcp,
                 HeartbeatInterval = TimeSpan.FromHours(1),
+                MessageEncryptor = encryptor,
                 ReconnectionSettings = new ReconnectionSettings
                 {
                     InitialDelay = TimeSpan.Zero,

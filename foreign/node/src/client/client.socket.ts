@@ -121,6 +121,13 @@ type Attempt = {
   started: boolean
 };
 
+/** A replica link used its retry budget, and nothing restarts it. */
+class ReconnectExhaustedError extends Error {
+  constructor() {
+    super('replica reconnect attempts exhausted');
+  }
+}
+
 /** One logical session owns every link, mutation lane and retained operation. */
 export class CommandResponseStream extends EventEmitter {
   private readonly options: ClientConfig;
@@ -133,11 +140,27 @@ export class CommandResponseStream extends EventEmitter {
   private sessionLifetime = new AbortController();
   private bootstrap?: IggyConnection;
   private bootstrapPromise?: Promise<IggyConnection>;
+  /**
+   * What the running bootstrap reports when it gives up: the bind failure of
+   * the last endpoint that accepted a dial, else NotConnectedError with the
+   * last dial failure.
+   */
+  private bootstrapFailure?: unknown;
   private authenticationPromise?: Promise<boolean>;
   private sessionAction: Promise<unknown> = Promise.resolve();
   private recoveryPromise?: Promise<void>;
   private rosterPromise?: Promise<void>;
-  private rememberedCredentials?: ClientCredentials;
+  /**
+   * Whom the client signs in as by itself: the caller's last sign-in, else the
+   * configured credentials while the caller never signed in. A logout, a
+   * sign-in of the caller that fails and a refused sign-in clear it.
+   */
+  private signInCredentials?: ClientCredentials;
+  /**
+   * Raised by each sign-in and sign-out of the caller. A call continues under
+   * a new session only while the lineage it started with is unchanged.
+   */
+  private sessionLineage = 0;
   private knownEndpoints: Endpoint[] = [];
   private readonly configuredEndpoint: Endpoint;
   private metadataReplica?: number;
@@ -152,37 +175,55 @@ export class CommandResponseStream extends EventEmitter {
   constructor(config: ClientConfigOrString) {
     super();
     this.options = normalizeClientConfig(config);
+    this.signInCredentials = this.options.credentials;
     this.configuredEndpoint = { host: this.options.options.host ?? '127.0.0.1', port: this.options.options.port };
     this.lanes = new MutationLanes(this.options.maxPendingOperations!, this.options.maxPendingOperationBytes!);
   }
 
+  get lineage(): number { return this.sessionLineage; }
+
   get busy(): boolean { return this.pendingSubmissions > 0; }
 
   async sendCommand(command: number, payload: Buffer, options: SendCommandOptions = {}): Promise<CommandResponse> {
+    if (isLoginCommand(command)) return this.loginByCaller(command, () => Buffer.from(payload), options);
+    const lineage = options.lineage ?? this.lineage;
     payload = Buffer.from(payload);
     const release = this.hold();
     const deadline = options.deadline ?? Date.now() + OPERATION_TIMEOUT_MS;
     const signal = AbortSignal.any([this.lifetime.signal, ...(options.signal ? [options.signal] : [])]);
     try {
-      if (isLoginCommand(command))
-        return await this.serializeSession(() => this.login(command, payload, deadline, signal));
-      if (command === LOGOUT.code)
+      if (command === LOGOUT.code) {
+        const signedOut = ++this.sessionLineage;
+        this.signInCredentials = undefined;
         return await this.serializeSession(async () => {
+          this.ensureLineage(signedOut, command);
           try {
             if (!this.isAuthenticated)
               throw responseError(command, UNAUTHENTICATED);
-            return await this.drive(command, payload, options, deadline, signal);
+            return await this.drive(command, payload, options, deadline, signal, signedOut);
           } finally {
-            this.rememberedCredentials = undefined;
-            this.resetSession();
+            if (signedOut === this.lineage) {
+              this.signInCredentials = undefined;
+              this.resetSession();
+            }
           }
         });
-      if (!this.isAuthenticated && command !== PING.code)
-        await waitWithin(this.authenticate(this._signInCredentials()), deadline, signal);
-      const sessionSignal = AbortSignal.any([signal, this.sessionLifetime.signal]);
-      if (this.isAuthenticated && this.replicas.size === 0)
-        await this.refreshRoster(deadline, sessionSignal);
-      return await this.drive(command, payload, options, deadline, sessionSignal);
+      }
+      if (lineage !== this.lineage) throw responseError(command, UNAUTHENTICATED);
+      if (!this.isAuthenticated && command !== PING.code) {
+        void this.signIn();
+        await this.nextSession(command, lineage, deadline, signal);
+      }
+      if (this.isAuthenticated && this.replicas.size === 0) {
+        const generation = this.routingGeneration;
+        // The call waits for a session lost meanwhile itself.
+        await this.refreshRoster(deadline, signal).catch((error: unknown) => {
+          if (generation !== this.routingGeneration) return;
+          // The call sent nothing yet, so a deadline leaves it not accepted.
+          throw error instanceof VsrResponseTimeoutError ? responseError(command, TRANSIENT_NOT_ACCEPTED) : error;
+        });
+      }
+      return await this.drive(command, payload, options, deadline, signal, lineage);
     } finally {
       release();
     }
@@ -203,6 +244,7 @@ export class CommandResponseStream extends EventEmitter {
   }
 
   private async replay(operation: ClientOperation, options: SendCommandOptions): Promise<void> {
+    const lineage = options.lineage ?? this.lineage;
     operation.frame.retain();
     const release = this.hold();
     const deadline = options.deadline ?? Date.now() + OPERATION_TIMEOUT_MS;
@@ -212,7 +254,7 @@ export class CommandResponseStream extends EventEmitter {
     try {
       unlock = await this.lanes.acquireResolution(operation, deadline, signal);
       await this.drive(operation.command, operation.frame.buffer.subarray(HEADER_SIZE),
-        { context: operation.context }, deadline, signal, operation);
+        { context: operation.context }, deadline, signal, lineage, operation);
     } finally {
       unlock?.();
       operation.frame.release();
@@ -221,15 +263,21 @@ export class CommandResponseStream extends EventEmitter {
   }
 
   private async drive(command: number, body: Buffer, options: SendCommandOptions,
-    deadline: number, signal: AbortSignal, retained?: ClientOperation): Promise<CommandResponse> {
-    const generation = this.routingGeneration;
+    deadline: number, signal: AbortSignal, lineage: number, retained?: ClientOperation): Promise<CommandResponse> {
+    /** The session that the frame of the call belongs to. */
+    let generation = this.routingGeneration;
     const target = partitionRoute(command, body);
     const replicated = command !== LOGOUT.code && operationForCode(command) !== Operation.NonReplicated;
     const progress = command === COMMAND_CODE.PollMessages &&
       (body[body.length - 1] !== 0 || body[body.length - POLL_OPTIONS_SIZE] === PollingStrategyKind.Next);
     const safeRead = READ_COMMANDS.has(command) || (command === COMMAND_CODE.PollMessages && !progress);
+    // A replay and a logout belong to their session. Any other call that
+    // needs a session waits for the one that replaces a lost one.
+    const restartable = !retained && command !== LOGOUT.code && (command !== PING.code || this.isAuthenticated);
     let operation = retained;
     let frameLease = false;
+    /** The frame of the operation belongs to a replaced session, or an 88 spent its request id. */
+    let staleFrame = false;
     let frame: Buffer | undefined;
     let context = options.context ? { ...options.context } : undefined;
     let selected: CachedRoute | undefined;
@@ -240,29 +288,84 @@ export class CommandResponseStream extends EventEmitter {
     let refresh = false;
     let lastRefusal: ResponseError | undefined;
     let previousLink: IggyConnection | undefined;
+    let sent = false;
     try {
-      if (target) {
-        selected = await this.routeFor(target, deadline, signal, generation);
-        context ??= { ...selected.route.context };
-      }
-      context ??= { ...EMPTY_PARTITION_CONTEXT, metadataOp: this.metadataWatermark };
       for (;;) {
-        this.ensureGeneration(generation, command);
+        this.ensureLineage(lineage, command);
         signal.throwIfAborted();
         if (Date.now() >= deadline)
           throw new VsrResponseTimeoutError(0);
-        if (!operation && (replicated || progress)) {
-          const lane = target ? groupKey(context, target) : 'metadata';
-          operation = await this.lanes.enter(lane, command, body, context, generation,
-            replicated, this.vsrSession, deadline, signal);
+        if (generation !== this.routingGeneration || (restartable && !this.isAuthenticated)) {
+          // No session but the one of a frame can apply it. A frame that can
+          // have taken effect ends uncertain and never goes out again.
+          if (operation?.uncertain)
+            throw new OperationUncertainError(operation.id, responseError(command, TRANSIENT_NOT_ACCEPTED));
+          if (!restartable)
+            throw responseError(command, TRANSIENT_NOT_ACCEPTED);
+          await this.nextSession(command, lineage, deadline, signal);
+          generation = this.routingGeneration;
+          selected = undefined;
+          previousLink = undefined;
+          refresh = false;
+          frame = undefined;
+          // A frame of the new session carries the context of the route that
+          // the new session looks up.
+          context = options.context ? { ...options.context } : undefined;
+          if (operation) {
+            if (frameLease) operation.frame.release();
+            frameLease = false;
+            staleFrame = true;
+          }
+        }
+        const sessionSignal = AbortSignal.any([signal, this.sessionLifetime.signal]);
+        if (target && !selected) {
+          try {
+            selected = await this.routeFor(target, deadline, sessionSignal, generation);
+          } catch (error) {
+            // A session failure answered the lookup of the call itself.
+            if (restartable && generation !== this.routingGeneration && !isSessionFailure(error)) continue;
+            throw error;
+          }
+          context ??= { ...selected.route.context };
+        }
+        context ??= { ...EMPTY_PARTITION_CONTEXT, metadataOp: this.metadataWatermark };
+        this.ensureLineage(lineage, command);
+        const lane = target ? groupKey(context, target) : 'metadata';
+        if (operation && staleFrame && operation.lane !== lane) {
+          // A definitive refusal released the old history. The replacement
+          // must enter the lane that orders writes to its current incarnation.
+          this.lanes.complete(operation);
+          operation = undefined;
+        }
+        if (operation && staleFrame) {
+          staleFrame = false;
+          try {
+            await this.lanes.restart(operation, body, context, this.vsrSession, deadline, signal);
+          } catch (error) {
+            if (generation === this.routingGeneration) throw error;
+            this.lanes.complete(operation);
+            operation = undefined;
+            continue;
+          }
+        } else if (!operation && (replicated || progress)) {
+          try {
+            operation = await this.lanes.enter(lane, command, body, context, replicated,
+              this.vsrSession, deadline, signal);
+            staleFrame = false;
+          } catch (error) {
+            // A lane can free while no session is bound to encode the frame.
+            if (restartable && generation !== this.routingGeneration) continue;
+            throw error;
+          }
         }
         if (operation && !frameLease) {
           operation.frame.retain();
           frameLease = true;
         }
         const attemptSignal = operation
-          ? AbortSignal.any([signal, operation.lifetime.signal]) : signal;
+          ? AbortSignal.any([sessionSignal, operation.lifetime.signal]) : sessionSignal;
         let attempt: Attempt;
+        let exchanged = false;
         try {
           if (refresh && target)
             selected = await this.routeFor(target, deadline, attemptSignal, generation, true);
@@ -276,14 +379,16 @@ export class CommandResponseStream extends EventEmitter {
           this.ensureGeneration(generation, command);
           attempt = await this.exchange(link, command, () => {
             this.ensureGeneration(generation, command);
+            this.ensureLineage(lineage, command);
             return operation?.frame.buffer ?? (frame ??= this.vsrSession.encode(command, body, context));
           }, deadline, attemptSignal, operation);
+          exchanged = true;
         } catch (error) {
           attempt = { error, committed: false, started: false };
         }
+        sent ||= attempt.started;
         if (generation !== this.routingGeneration && attempt.started && (replicated || progress))
-          throw new OperationUncertainError(operation?.retainable ? operation.id : undefined,
-            attempt.error ?? responseError(command, TRANSIENT_NOT_ACCEPTED));
+          throw uncertainOutcome(command, operation, attempt.error ?? responseError(command, TRANSIENT_NOT_ACCEPTED));
         // A committed rejection proves the outcome even when it also ends the session.
         if (operation?.uncertain && attempt.committed && attempt.error) {
           operation.uncertain = false;
@@ -298,10 +403,15 @@ export class CommandResponseStream extends EventEmitter {
             (attempt.started && (replicated || progress) && attempt.error instanceof VsrEvictionError);
           this.recoverSession(generation);
           if (uncertain)
-            throw new OperationUncertainError(operation?.retainable ? operation.id : undefined, attempt.error);
+            throw uncertainOutcome(command, operation, attempt.error);
+          // An eviction fails every exchange of its link, also one never written.
+          if (restartable && exchanged && !attempt.started && generation !== this.routingGeneration) continue;
           throw attempt.error;
         }
-        this.ensureGeneration(generation, command);
+        if (generation !== this.routingGeneration) {
+          if (restartable && (!attempt.started || safeRead)) continue;
+          throw responseError(command, TRANSIENT_NOT_ACCEPTED);
+        }
         if (!attempt.error) {
           if (operation?.uncertain && !attempt.committed)
             throw new OperationUncertainError(operation.id, new Error('reply does not prove the retained result'));
@@ -311,7 +421,7 @@ export class CommandResponseStream extends EventEmitter {
             retryDelay = Math.min(retryDelay * 2, MAX_RETRY_INTERVAL_MS);
             continue;
           }
-          this._rememberCredentials(command, body);
+          if (lineage === this.lineage) this._rememberCredentials(command, body);
           if (command === GET_CLUSTER_METADATA.code)
             this.installRoster(attempt.response!);
           if (TOPIC_DISCOVERY_RESETS.has(command)) {
@@ -328,13 +438,18 @@ export class CommandResponseStream extends EventEmitter {
         notPrimary = code === NOT_PRIMARY;
         if (code === TRANSIENT_NOT_COMMITTED) {
           if (operation?.retainable) operation.uncertain = true;
-          else if (!safeRead) throw new OperationUncertainError(undefined, error);
+          else if (!safeRead) throw error;
         } else if (code === OPERATION_NOT_RETAINED) {
           if (operation?.retainable) operation.uncertain = true;
-          throw new OperationUncertainError(operation?.retainable ? operation.id : undefined, error);
+          throw uncertainOutcome(command, operation, error);
         } else if (code === NOT_PRIMARY || code === TRANSIENT_NOT_ACCEPTED) {
           if (selected) this.invalidateRoute(selected, code === NOT_PRIMARY);
           refresh = true;
+          if (code === NOT_PRIMARY) {
+            // Neither 58 nor 89 admitted the call, so the deadline reports both as 58.
+            lastRefusal = responseError(command, TRANSIENT_NOT_ACCEPTED);
+            lastRefusal.fromServer = true;
+          }
           if (code === NOT_PRIMARY && !repeatedNotPrimary) continue;
         } else if (code === HISTORY_UNAVAILABLE && !operation?.uncertain) {
           if (selected) this.invalidateRoute(selected, false);
@@ -346,22 +461,38 @@ export class CommandResponseStream extends EventEmitter {
               frameLease = false;
               operation = undefined;
             }
-            selected = await this.routeFor(target, deadline, signal, generation, true);
-            context = { ...selected.route.context };
+            selected = undefined;
+            context = undefined;
             continue;
           }
           throw error;
         } else if (code === LIFECYCLE_BUSY && !operation?.uncertain) {
+          // The refusal spent the request id, so the call goes out again as a
+          // new operation in its lane, with the context of its route by then.
           if (operation) {
-            const retryBody = Buffer.from(operation.frame.buffer.subarray(HEADER_SIZE));
             operation.frame.release();
             frameLease = false;
-            await this.lanes.restart(operation, retryBody, this.vsrSession, deadline, signal);
+            staleFrame = true;
           }
           frame = undefined;
+          selected = undefined;
+          context = options.context ? { ...options.context } : undefined;
           await waitWithin(pause(lifecycleDelay, signal), deadline, signal);
           lifecycleDelay = Math.min(lifecycleDelay * 2, MAX_LIFECYCLE_INTERVAL_MS);
           continue;
+        } else if (code !== undefined && ROUTE_NAMESPACE_MISSING.has(code) && attempt.started &&
+            (selected || command === COMMAND_CODE.GetPartitionRoute) &&
+            !(await this.isMetadataPrimary(previousLink!, generation, deadline, attemptSignal))) {
+          // A backup can lag the metadata create that the metadata primary
+          // committed. A partition call retries with a new route, and a route
+          // lookup asks the next replica. A miss of the lookup that routes a
+          // partition call came before the request started and stays final.
+          if (selected) {
+            this.invalidateRoute(selected, false);
+            refresh = true;
+          }
+          lastRefusal = responseError(command, TRANSIENT_NOT_ACCEPTED);
+          lastRefusal.fromServer = true;
         } else if (code !== undefined) {
           if (operation?.uncertain)
             throw new OperationUncertainError(operation.id, error);
@@ -369,10 +500,12 @@ export class CommandResponseStream extends EventEmitter {
         } else {
           if (attempt.started) {
             if (operation?.retainable) operation.uncertain = true;
-            else if (!safeRead) throw new OperationUncertainError(undefined, error);
+            else if (!safeRead) throw uncertainOutcome(command, operation, error);
           }
-          if (error instanceof TypeError || error instanceof ResponseError ||
-              error instanceof VsrEvictionError || signal.aborted)
+          // NotConnectedError and an exhausted link leave no link up or
+          // redialing, so the call fails now instead of at its deadline.
+          if (error instanceof TypeError || error instanceof ResponseError || error instanceof VsrEvictionError ||
+              signal.aborted || error instanceof NotConnectedError || error instanceof ReconnectExhaustedError)
             throw error;
           refresh = true;
         }
@@ -380,9 +513,12 @@ export class CommandResponseStream extends EventEmitter {
         retryDelay = Math.min(retryDelay * 2, MAX_RETRY_INTERVAL_MS);
       }
     } catch (error) {
-      if (error instanceof VsrResponseTimeoutError && lastRefusal) error = lastRefusal;
+      // A call that sent nothing and saw no refusal was not accepted either.
+      if (error instanceof VsrResponseTimeoutError && (lastRefusal || !sent))
+        error = lastRefusal ?? responseError(command, TRANSIENT_NOT_ACCEPTED);
       if (operation?.uncertain) {
-        if (this.lanes.owns(operation)) this.lanes.retain(operation);
+        // A frame of a replaced session must not block the lane of the new one.
+        if (generation === this.routingGeneration && this.lanes.owns(operation)) this.lanes.retain(operation);
         throw error instanceof OperationUncertainError ? error : new OperationUncertainError(operation.id, error);
       }
       if (retained && !this.lanes.owns(retained))
@@ -467,6 +603,9 @@ export class CommandResponseStream extends EventEmitter {
       const link = await this.readyLink(deadline, signal, previous);
       if (visited.has(link)) {
         visited.clear();
+        // Each pass starts at the metadata primary, which a roster read after
+        // a namespace miss can have moved.
+        previous = undefined;
         try { await waitWithin(pause(Math.floor(Math.random() * (retryDelay + 1)), signal), deadline, signal); }
         catch (error) { throw error instanceof VsrResponseTimeoutError && lastRefusal ? lastRefusal : error; }
         retryDelay = Math.min(retryDelay * 2, MAX_RETRY_INTERVAL_MS);
@@ -498,7 +637,7 @@ export class CommandResponseStream extends EventEmitter {
         }
         this.ensureGeneration(generation, COMMAND_CODE.GetPartitionRoute);
         if (error instanceof ResponseError && ROUTE_NAMESPACE_MISSING.has(error.errorCode) &&
-            (this.metadataReplica === undefined || this.replicas.get(this.metadataReplica)?.connection !== link)) {
+            !(await this.isMetadataPrimary(link, generation, deadline, signal))) {
           // A backup can lag a metadata create while the primary materializes the route.
           lastRefusal = responseError(COMMAND_CODE.GetPartitionRoute, TRANSIENT_NOT_ACCEPTED);
           lastRefusal.fromServer = error.fromServer;
@@ -508,6 +647,33 @@ export class CommandResponseStream extends EventEmitter {
         if (error instanceof ResponseError) lastRefusal = error;
       }
     }
+  }
+
+  /**
+   * Whether the replica that answered a namespace miss on `link` is the
+   * metadata primary. The belief can predate a view change, so one roster read
+   * on `link`, without a retry or another link, must still name that replica.
+   * No lookup reaches a believed metadata primary without a link, so then that
+   * roster also moves the belief.
+   */
+  private async isMetadataPrimary(link: IggyConnection, generation: number, deadline: number,
+    signal: AbortSignal): Promise<boolean> {
+    const replica = [...this.replicas.values()].find((slot) => slot.connection === link)?.replica;
+    const believed = this.metadataReplica === undefined ? undefined : this.replicas.get(this.metadataReplica);
+    if (replica !== this.metadataReplica && believed?.attached && believed.connection?.connected)
+      return false;
+    try {
+      const attempt = await this.exchange(link, GET_CLUSTER_METADATA.code, () => this.vsrSession.encode(
+        GET_CLUSTER_METADATA.code, GET_CLUSTER_METADATA.serialize(),
+        { ...EMPTY_PARTITION_CONTEXT, metadataOp: this.metadataWatermark }), deadline, signal);
+      if (attempt.error) throw attempt.error;
+      this.ensureGeneration(generation, GET_CLUSTER_METADATA.code);
+      this.installRoster(attempt.response!);
+    } catch (error) {
+      debug('roster read after a namespace miss failed', error);
+      return false;
+    }
+    return replica !== undefined && replica === this.metadataReplica;
   }
 
   private rememberRoute(target: PartitionTarget, response: CommandResponse): CachedRoute | undefined {
@@ -711,10 +877,7 @@ export class CommandResponseStream extends EventEmitter {
         this.changed.pulse();
         if (!reconnect.enabled || failures >= reconnect.maxRetries) {
           slot.restartable = reconnect.enabled;
-          // Only a heartbeat restarts a link that used its budget, so without
-          // one the link stays down for good.
-          slot.failure = slot.restartable && this.heartbeatIntervalHandler
-            ? new NotConnectedError() : new Error('replica reconnect attempts exhausted');
+          slot.failure = this.budgetFailure(slot);
           return;
         }
         const base = Math.min(reconnect.interval * 2 ** Math.min(failures, 16), MAX_RECONNECT_INTERVAL_MS);
@@ -730,6 +893,14 @@ export class CommandResponseStream extends EventEmitter {
     }
   }
 
+  /**
+   * Only a heartbeat restarts a link that used its budget, so without one the
+   * link stays down for good.
+   */
+  private budgetFailure(slot: ReplicaSlot): Error {
+    return slot.restartable && this.heartbeatIntervalHandler ? new NotConnectedError() : new ReconnectExhaustedError();
+  }
+
   private connectionFor(endpoint: Endpoint): IggyConnection {
     const connection = new IggyConnection({ ...this.options, options: { ...this.options.options, ...endpoint } });
     connection.on('eviction', (error) => this.emit('eviction', error));
@@ -741,16 +912,20 @@ export class CommandResponseStream extends EventEmitter {
     if (!this.bootstrapPromise) {
       const generation = this.routingGeneration;
       const ownerSignal = AbortSignal.any([this.lifetime.signal, this.sessionLifetime.signal]);
+      this.bootstrapFailure = undefined;
       const pending = (async () => {
         const endpoints = [...new Map([this.configuredEndpoint, ...this.knownEndpoints].map((endpoint) => [endpointKey(endpoint), endpoint])).values()];
         const reconnect = this.options.reconnect ?? { enabled: true, interval: 5_000, maxRetries: 12 };
-        let last: unknown;
+        let dialed = false;
         for (let pass = 0; ; pass += 1) {
           for (const endpoint of endpoints) {
             const link = this.connectionFor(endpoint);
             this.bootstrap = link;
+            let accepted = false;
             try {
               await link.connect(ownerSignal);
+              accepted = dialed = true;
+              this.bootstrapFailure = undefined;
               if (this.isAuthenticated) {
                 const body = this.vsrSession.resumePayload(this.metadataWatermark);
                 if (!body) throw responseError(COMMAND_CODE.BindSession, UNAUTHENTICATED);
@@ -762,24 +937,32 @@ export class CommandResponseStream extends EventEmitter {
               return link;
             } catch (error) {
               link._destroy();
-              last = error;
               if (this.isAuthenticated && isSessionFailure(error, true)) {
                 this.recoverSession(generation);
                 throw error;
               }
               if (error instanceof TypeError || ownerSignal.aborted) throw error;
+              if (accepted) this.bootstrapFailure = error;
+              else if (!dialed) this.bootstrapFailure = new NotConnectedError(error);
             }
           }
-          // A refusal keeps its own error, so that a 40 still ends the session.
           if (!reconnect.enabled || pass >= reconnect.maxRetries)
-            throw last instanceof ResponseError ? last : new NotConnectedError(last);
+            throw this.bootstrapFailure;
           const base = Math.min(reconnect.interval * 2 ** Math.min(pass, 16), MAX_RECONNECT_INTERVAL_MS);
           await pause(Math.floor(Math.random() * (base + 1)), ownerSignal, true);
         }
       })().finally(() => { if (this.bootstrapPromise === pending) this.bootstrapPromise = undefined; });
       this.bootstrapPromise = pending;
     }
-    return await waitWithin(this.bootstrapPromise, deadline, signal);
+    try {
+      return await waitWithin(this.bootstrapPromise, deadline, signal);
+    } catch (error) {
+      // With the default reconnect values the deadline usually ends the dials
+      // before the retry budget does, so it reports the last failure the same way.
+      if (error instanceof VsrResponseTimeoutError && this.bootstrapFailure !== undefined)
+        throw this.bootstrapFailure;
+      throw error;
+    }
   }
 
   private serializeSession<T>(action: () => Promise<T>): Promise<T> {
@@ -788,10 +971,13 @@ export class CommandResponseStream extends EventEmitter {
     return pending;
   }
 
-  private async login(command: number, body: Buffer, deadline: number, signal: AbortSignal): Promise<CommandResponse> {
+  private async login(command: number, body: Buffer, deadline: number, signal: AbortSignal, lineage: number): Promise<CommandResponse> {
+    this.ensureLineage(lineage, command);
+    signal.throwIfAborted();
     if (this.isAuthenticated)
       await this.drive(LOGOUT.code, LOGOUT.serialize(), {}, deadline,
-        AbortSignal.any([signal, this.sessionLifetime.signal]));
+        AbortSignal.any([signal, this.sessionLifetime.signal]), lineage);
+    this.ensureLineage(lineage, command);
     this.resetSession();
     const generation = this.routingGeneration;
     const sessionSignal = AbortSignal.any([signal, this.sessionLifetime.signal]);
@@ -800,19 +986,24 @@ export class CommandResponseStream extends EventEmitter {
     let retryDelay = RETRY_INTERVAL_MS;
     for (;;) {
       const link = await this.connectBootstrap(deadline, sessionSignal);
+      this.ensureLineage(lineage, command);
       const attempt = await this.exchange(link, prepared.command,
         () => frame ??= this.vsrSession.encode(prepared.command, prepared.payload), deadline, sessionSignal);
+      this.ensureLineage(lineage, command);
       this.ensureGeneration(generation, command);
       if (!attempt.error) {
         this.vsrSession.bind(readRegisteredSession(attempt.response!));
         this.userId = attempt.response!.data.readUInt32LE(0);
         this.isAuthenticated = true;
-        this._rememberCredentials(command, body);
         this.heartbeat(this.options.heartbeatInterval);
         await this.refreshRoster(deadline, sessionSignal);
+        this.ensureLineage(lineage, command);
+        this._rememberCredentials(command, body);
         return attempt.response!;
       }
-      if (attempt.error instanceof ResponseError && !isTransient(attempt.error.errorCode)) throw attempt.error;
+      if (attempt.error instanceof ResponseError && !isTransient(attempt.error.errorCode)) {
+        throw attempt.error;
+      }
       if (attempt.error instanceof VsrEvictionError || attempt.error instanceof TypeError) throw attempt.error;
       await waitWithin(pause(Math.floor(Math.random() * (retryDelay + 1)), sessionSignal), deadline, sessionSignal);
       retryDelay = Math.min(retryDelay * 2, MAX_RETRY_INTERVAL_MS);
@@ -821,16 +1012,44 @@ export class CommandResponseStream extends EventEmitter {
 
   private recoverSession(generation: number): void {
     if (generation !== this.routingGeneration || this.recoveryPromise || this.lifetime.signal.aborted) return;
-    const credentials = this._signInCredentials();
     this.resetSession();
     this.authenticationPromise = undefined;
-    this.recoveryPromise = this.authenticate(credentials).then(() => undefined)
+    this.recoveryPromise = this.signIn().then(() => undefined)
       .catch((error) => { debug('session recovery failed', error); })
       .finally(() => { this.recoveryPromise = undefined; });
   }
 
+  /**
+   * Waits for the sign-in that runs or is queued now, and fails unless it binds
+   * a session of the call's lineage. Only the client's own sign-in continues a
+   * call: after a sign-in or sign-out of the caller, or a refused sign-in, the
+   * call ends with 40, and at its deadline with 58.
+   */
+  private async nextSession(command: number, lineage: number, deadline: number, signal: AbortSignal): Promise<void> {
+    let failure: unknown;
+    if (lineage === this.lineage) {
+      try {
+        await waitWithin(this.authenticationPromise ?? this.sessionAction, deadline, signal);
+      } catch (error) {
+        signal.throwIfAborted();
+        failure = error;
+      }
+    }
+    if (lineage !== this.lineage) throw unauthenticated(command, failure);
+    if (failure instanceof VsrResponseTimeoutError) throw responseError(command, TRANSIENT_NOT_ACCEPTED);
+    if (!this.isAuthenticated && !this.signInCredentials) throw unauthenticated(command, failure);
+    if (failure !== undefined) throw failure;
+    if (!this.isAuthenticated)
+      throw responseError(command, TRANSIENT_NOT_ACCEPTED);
+  }
+
+  /**
+   * The `sessionReset` event says whether the reset ended a signed-in session.
+   * A reset after a refused sign-in ends none.
+   */
   private resetSession(): void {
-    const hadActivity = this.isAuthenticated || this.vsrSession.hasActivity;
+    const signedIn = this.isAuthenticated;
+    const hadActivity = signedIn || this.vsrSession.hasActivity;
     this.routingGeneration += 1;
     this.sessionLifetime.abort(responseError(0, TRANSIENT_NOT_ACCEPTED));
     this.sessionLifetime = new AbortController();
@@ -852,7 +1071,11 @@ export class CommandResponseStream extends EventEmitter {
     clearInterval(this.heartbeatIntervalHandler);
     this.heartbeatIntervalHandler = undefined;
     this.changed.pulse();
-    if (hadActivity) this.emit('sessionReset');
+    if (hadActivity) this.emit('sessionReset', signedIn);
+  }
+
+  private ensureLineage(lineage: number, command: number): void {
+    if (lineage !== this.lineage) throw responseError(command, UNAUTHENTICATED);
   }
 
   private ensureGeneration(generation: number, command: number): void {
@@ -870,15 +1093,15 @@ export class CommandResponseStream extends EventEmitter {
   private _rememberCredentials(command: number, payload: Buffer): void {
     if (command === LOGIN.code) {
       const username = readWireName(payload, 0);
-      this.rememberedCredentials = {
+      this.signInCredentials = {
         username: username.value, password: readWireName(payload, username.next).value
       };
     } else if (command === LOGIN_WITH_TOKEN.code) {
-      this.rememberedCredentials = { token: readWireName(payload, 0).value };
+      this.signInCredentials = { token: readWireName(payload, 0).value };
     } else if ((command === COMMAND_CODE.ChangePassword || command === COMMAND_CODE.UpdateUser) &&
-        this.userId !== undefined && this.rememberedCredentials &&
-        'username' in this.rememberedCredentials) {
-      const credentials = this.rememberedCredentials;
+        this.userId !== undefined && this.signInCredentials &&
+        'username' in this.signInCredentials) {
+      const credentials = this.signInCredentials;
       const identifier = [serializeIdentifier(this.userId), serializeIdentifier(credentials.username)]
         .find((encoded) => payload.subarray(0, encoded.length).equals(encoded));
       if (!identifier)
@@ -886,20 +1109,12 @@ export class CommandResponseStream extends EventEmitter {
       if (command === COMMAND_CODE.ChangePassword) {
         const currentPassword = readWireName(payload, identifier.length);
         const password = readWireName(payload, currentPassword.next).value;
-        this.rememberedCredentials = { ...credentials, password };
-        if ('username' in this.options.credentials && this.options.credentials.username === credentials.username)
-          this.options.credentials = { ...this.options.credentials, password };
+        this.signInCredentials = { ...credentials, password };
       } else if (payload[identifier.length] === 1) {
         const username = readWireName(payload, identifier.length + 1).value;
-        this.rememberedCredentials = { ...credentials, username };
-        if ('username' in this.options.credentials && this.options.credentials.username === credentials.username)
-          this.options.credentials = { ...this.options.credentials, username };
+        this.signInCredentials = { ...credentials, username };
       }
     }
-  }
-
-  private _signInCredentials(): ClientCredentials {
-    return this.rememberedCredentials ?? this.options.credentials;
   }
 
   hold(): () => void {
@@ -914,13 +1129,66 @@ export class CommandResponseStream extends EventEmitter {
   }
 
   async authenticate(credentials: ClientCredentials): Promise<boolean> {
-    if (this.isAuthenticated) return true;
+    if (credentials && typeof credentials === 'object' && 'token' in credentials)
+      await this._authWithToken(credentials);
+    else await this._authWithPassword(credentials as PasswordCredentials);
+    return true;
+  }
+
+  private async loginByCaller(command: number, payload: () => Buffer, options: SendCommandOptions = {}): Promise<CommandResponse> {
+    const lineage = ++this.sessionLineage;
+    this.signInCredentials = undefined;
+    const release = this.hold();
+    const deadline = options.deadline ?? Date.now() + OPERATION_TIMEOUT_MS;
+    const signal = AbortSignal.any([this.lifetime.signal, ...(options.signal ? [options.signal] : [])]);
+    try {
+      const body = payload();
+      let admit!: () => void;
+      const admitted = new Promise<void>((resolve) => { admit = resolve; });
+      const pending = this.serializeSession(() => {
+        admit();
+        return this.login(command, body, deadline, signal, lineage);
+      });
+      const authentication = pending.then(() => true)
+        .finally(() => { if (this.authenticationPromise === authentication) this.authenticationPromise = undefined; });
+      this.authenticationPromise = authentication;
+      void authentication.catch(() => undefined);
+      // Bound the queue wait separately so dial timeouts keep their last transport error.
+      await waitWithin(admitted, deadline, signal);
+      return await pending;
+    } catch (error) {
+      if (lineage === this.lineage) {
+        this.sessionLineage += 1;
+        this.signInCredentials = undefined;
+        this.resetSession();
+      }
+      if (error instanceof VsrResponseTimeoutError)
+        throw responseError(command, TRANSIENT_NOT_ACCEPTED);
+      throw error;
+    } finally { release(); }
+  }
+
+  /** Only SDK recovery shares a sign-in; callers always own a fresh attempt. */
+  private signIn(): Promise<boolean> {
+    if (this.isAuthenticated) return Promise.resolve(true);
     if (!this.authenticationPromise) {
+      const lineage = this.lineage;
+      const identity = this.signInCredentials;
       const pending = this.serializeSession(async () => {
-        const command = 'token' in credentials ? LOGIN_WITH_TOKEN : LOGIN;
-        const body = 'token' in credentials ? LOGIN_WITH_TOKEN.serialize(credentials) : LOGIN.serialize(credentials);
-        await this.login(command.code, body, Date.now() + OPERATION_TIMEOUT_MS, this.lifetime.signal);
-        return this.isAuthenticated;
+        this.ensureLineage(lineage, LOGIN.code);
+        if (this.isAuthenticated) return true;
+        if (!identity) return false;
+        const command = 'token' in identity ? LOGIN_WITH_TOKEN : LOGIN;
+        try {
+          const body = 'token' in identity ? LOGIN_WITH_TOKEN.serialize(identity) : LOGIN.serialize(identity);
+          await this.login(command.code, body, Date.now() + OPERATION_TIMEOUT_MS, this.lifetime.signal, lineage);
+          return this.isAuthenticated;
+        } catch (error) {
+          if (lineage === this.lineage && (error instanceof TypeError || error instanceof VsrEvictionError ||
+              (error instanceof ResponseError && !isTransient(error.errorCode))))
+            this.signInCredentials = undefined;
+          throw error;
+        }
       }).finally(() => { if (this.authenticationPromise === pending) this.authenticationPromise = undefined; });
       this.authenticationPromise = pending;
     }
@@ -928,11 +1196,11 @@ export class CommandResponseStream extends EventEmitter {
   }
 
   async _authWithPassword(credentials: PasswordCredentials) {
-    return LOGIN.deserialize(await this.sendCommand(LOGIN.code, LOGIN.serialize(credentials)));
+    return LOGIN.deserialize(await this.loginByCaller(LOGIN.code, () => LOGIN.serialize(credentials)));
   }
 
   async _authWithToken(credentials: TokenCredentials) {
-    return LOGIN_WITH_TOKEN.deserialize(await this.sendCommand(LOGIN_WITH_TOKEN.code, LOGIN_WITH_TOKEN.serialize(credentials)));
+    return LOGIN_WITH_TOKEN.deserialize(await this.loginByCaller(LOGIN_WITH_TOKEN.code, () => LOGIN_WITH_TOKEN.serialize(credentials)));
   }
 
   async ping() {
@@ -941,28 +1209,33 @@ export class CommandResponseStream extends EventEmitter {
 
   heartbeat(interval?: number): void {
     clearInterval(this.heartbeatIntervalHandler);
-    if (!interval || !this.isAuthenticated) return;
-    this.heartbeatIntervalHandler = setInterval(() => {
-      for (const slot of this.replicas.values()) {
-        // A retry budget limits one reconnect burst, not the life of the
-        // session, so a long outage cannot leave the client down for good.
-        if (slot.restartable) {
-          slot.restartable = false;
-          slot.failure = undefined;
-          void this.runReplica(slot);
+    this.heartbeatIntervalHandler = undefined;
+    if (interval && this.isAuthenticated) {
+      this.heartbeatIntervalHandler = setInterval(() => {
+        for (const slot of this.replicas.values()) {
+          // A retry budget limits one reconnect burst, not the life of the
+          // session, so a long outage cannot leave the client down for good.
+          if (slot.restartable) {
+            slot.restartable = false;
+            slot.failure = undefined;
+            void this.runReplica(slot);
+          }
+          if (!slot.attached || !slot.connection?.connected || slot.heartbeat) continue;
+          slot.heartbeat = true;
+          const signal = AbortSignal.any([this.lifetime.signal, this.sessionLifetime.signal, slot.lifetime.signal]);
+          void this.control(slot.connection, PING.code, PING.serialize(), Date.now() + OPERATION_TIMEOUT_MS, signal)
+            .then(() => { this.emit('heartbeat'); })
+            .catch((error) => {
+              if (isSessionFailure(error)) this.recoverSession(slot.generation);
+              debug('replica heartbeat failed', error);
+            }).finally(() => { slot.heartbeat = false; });
         }
-        if (!slot.attached || !slot.connection?.connected || slot.heartbeat) continue;
-        slot.heartbeat = true;
-        const signal = AbortSignal.any([this.lifetime.signal, this.sessionLifetime.signal, slot.lifetime.signal]);
-        void this.control(slot.connection, PING.code, PING.serialize(), Date.now() + OPERATION_TIMEOUT_MS, signal)
-          .then(() => { this.emit('heartbeat'); })
-          .catch((error) => {
-            if (isSessionFailure(error)) this.recoverSession(slot.generation);
-            debug('replica heartbeat failed', error);
-          }).finally(() => { slot.heartbeat = false; });
-      }
-    }, interval);
-    this.heartbeatIntervalHandler.unref();
+      }, interval);
+      this.heartbeatIntervalHandler.unref();
+    }
+    // A link that used its budget reports whether a heartbeat restarts it.
+    for (const slot of this.replicas.values())
+      if (slot.restartable) slot.failure = this.budgetFailure(slot);
   }
 
   getReadStream() {
@@ -972,7 +1245,7 @@ export class CommandResponseStream extends EventEmitter {
   }
 
   destroy(): void {
-    this.rememberedCredentials = undefined;
+    this.signInCredentials = undefined;
     this.lifetime.abort(new Error('client destroyed'));
     this.resetSession();
   }
@@ -986,6 +1259,19 @@ const isLoginCommand = (command: number): boolean =>
   command === COMMAND_CODE.LoginUser || command === COMMAND_CODE.LoginWithAccessToken;
 const isTransient = (code: number): boolean =>
   code === TRANSIENT_NOT_COMMITTED || code === TRANSIENT_NOT_ACCEPTED || code === NOT_PRIMARY;
+/** A 40 that keeps why the call has no session, such as a refused sign-in. */
+const unauthenticated = (command: number, cause: unknown): ResponseError => {
+  const error = responseError(command, UNAUTHENTICATED);
+  if (cause !== undefined) error.cause = cause;
+  return error;
+};
+/** An unknown outcome. Only a retainable operation has an ID to resolve, any other call ends with 57. */
+const uncertainOutcome = (command: number, operation: ClientOperation | undefined, cause: unknown): Error => {
+  if (operation?.retainable) return new OperationUncertainError(operation.id, cause);
+  const error = responseError(command, TRANSIENT_NOT_COMMITTED);
+  error.cause = cause;
+  return error;
+};
 const isDetachedFailure = (error: unknown): boolean =>
   error instanceof VsrEvictionError
     ? error.reason === EvictionReason.NoSession || error.reason === EvictionReason.StaleClient

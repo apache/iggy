@@ -33,4 +33,5 @@ pub struct GlobalContext {
     pub last_polled_messages: Option<PolledMessages>,
     pub last_sent_message: Option<IggyMessage>,
     pub last_raw_result: Option<Result<Bytes, IggyError>>,
+    pub last_call_result: Option<Result<(), IggyError>>,
 }

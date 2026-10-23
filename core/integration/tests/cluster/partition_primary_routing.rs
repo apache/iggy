@@ -16,32 +16,40 @@
 // under the License.
 
 //! Metadata and partition consensus groups choose primaries independently.
-//! New partitions must inherit the metadata view, while existing partitions
+//! New partitions use their committed placement views, while existing partitions
 //! can retain a different primary after a metadata-only election. SDK clients
 //! settle on the metadata leader, so both writes to new partitions and group
 //! polls of existing partitions must reach an owner that can commit progress.
 
+use std::collections::HashSet;
+use std::net::SocketAddr;
 use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use super::register_forwarding::connect_without_login;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
+use futures::future::join_all;
 use iggy::prelude::*;
 use iggy_binary_protocol::codes::{
     BIND_SESSION_CODE, GET_CONSUMER_GROUP_CODE, GET_PARTITION_ROUTE_CODE, POLL_MESSAGES_CODE,
-    STORE_CONSUMER_OFFSET_CODE,
+    SEND_MESSAGES_CODE, STORE_CONSUMER_OFFSET_CODE,
 };
 use iggy_binary_protocol::consensus::{RequestHeader, result_code, result_section_len};
 use iggy_binary_protocol::requests::consumer_groups::GetConsumerGroupRequest;
 use iggy_binary_protocol::requests::consumer_offsets::StoreConsumerOffsetRequest;
+use iggy_binary_protocol::requests::messages::send_messages::{RawMessage, SendMessagesEncoder};
 use iggy_binary_protocol::requests::messages::{GetPartitionRouteRequest, PollMessagesRequest};
 use iggy_binary_protocol::requests::system::BindSessionRequest;
 use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::responses::consumer_groups::ConsumerGroupDetailsResponse;
 use iggy_binary_protocol::responses::messages::PartitionRouteResponse;
 use iggy_binary_protocol::{
-    ClientVersionInfo, IGGY_PROTOCOL_VERSION, WireDecode, WireEncode, WireName,
+    ClientVersionInfo, IGGY_PROTOCOL_VERSION, WireDecode, WireEncode, WireIdentifier, WireName,
+    WirePartitioning,
 };
 use iggy_common::locking::IggyRwLockFn;
 use iggy_common::store_consumer_offset::StoreConsumerOffset;
@@ -60,10 +68,14 @@ use integration::iggy_harness;
 use journal::superblock::{PingPongSuperblock, SuperblockStore};
 use reqwest::StatusCode;
 use reqwest::header::RETRY_AFTER;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::runtime;
 use tokio::time::{Instant, sleep, timeout};
 
-use crate::server::http_client::{HttpClient, applied_op, node_url, until_primary_resolved};
+use crate::server::http_client::{
+    HttpClient, access_token, applied_op, node_url, until_primary_resolved,
+};
 use crate::server::raw_tcp;
 
 const STREAM_NAME: &str = "partition-routing-stream";
@@ -77,9 +89,53 @@ const RELAYED_PAYLOADS: [&str; 2] = ["relayed-acked", "relayed-unacked"];
 /// The marker and the route of an HTTP request that one node relays to another.
 const FORWARDED_HEADER: &str = "iggy-forwarded";
 const PARTITION_ROUTE_HEADER: &str = "iggy-partition-route";
+/// The `<view>,<replica>` a hop target's `NotPrimary` names as its primary.
+const PARTITION_PRIMARY_HEADER: &str = "iggy-partition-primary";
 /// Partition 0 at incarnation 1, owner generation 0 and metadata op 0, with
 /// 5 s left. Every replica applied op 0, so the metadata hold ends at once.
 const ROUTE_AT_FIRST_OP: &str = "0,1,0,0,5000";
+/// The hop target's budget for the relays it serves, and each credential's
+/// share of it, as the server sizes them.
+const RELAY_TARGET_BUDGET: usize = 128;
+const RELAY_TARGET_SHARE: usize = 32;
+const SPREAD_PARTITIONS: u32 = 3;
+const RELAY_TARGET_NODE: usize = 1;
+const RELAY_TARGET_PARTITION: u32 = 1;
+/// The longest budget a hop target grants a relay: its own request deadline.
+const RELAY_BUDGET: Duration = Duration::from_secs(10);
+/// Declared by a stalled upload, which never sends it in full.
+const STALLED_BODY_LENGTH: usize = 1024;
+/// How late a stalled upload may end on a loaded machine.
+const DEADLINE_SLACK: Duration = Duration::from_secs(10);
+/// A node's outbound relay slots, shared by its metadata and partition relays,
+/// and the longest it relays a metadata request, as the server sizes them.
+const FORWARD_SLOTS: u64 = 128;
+const FORWARD_DEADLINE: Duration = Duration::from_secs(30);
+const REQUESTS_METRIC: &str = "http_requests_total";
+const RELAY_PROBE_INTERVAL: Duration = Duration::from_millis(100);
+/// A node proves its relay fields under a key derived from the cluster key
+/// material, here the `http.jwt` secret, with the context the server freezes.
+const RELAY_PROOF_HEADER: &str = "iggy-relay-proof";
+const RELAY_KEY_MATERIAL: &str = "0123456789abcdef0123456789abcdef";
+const RELAY_KEY_CONTEXT: &str = "apache-iggy server http-relay v1 key->hmac-sha256-key";
+const RELAY_PROOF_LIFETIME_MICROS: u64 = 10_000_000;
+const RELAY_FORGER: &str = "relay-forger";
+const RELAY_FORGER_PASSWORD: &str = "relay-forger-password";
+/// The node that relays the caller's request to the hop target.
+const RELAY_ENTRY_NODE: usize = 2;
+/// Lets forged relays reach the hop target before the genuine ones.
+const FORGED_HEAD_START: Duration = Duration::from_secs(1);
+/// How long a relay for an op the cluster has not committed must stay held.
+const HOLD_PROBE: Duration = Duration::from_secs(1);
+const HELD_PAYLOAD: &str = "held-for-a-fresh-op";
+const PROBES_METRIC: &str = "http_partition_primary_probes_total";
+const RELAYS_METRIC: &str = "http_partition_relays_total";
+const FLOOR_READS_METRIC: &str = "http_metadata_floor_reads_total";
+const SESSION_REGISTERS_METRIC: &str = "http_session_registers_total";
+const METADATA_FLOOR_PATH: &str = "/cluster/metadata-floor";
+const FLOOR_STREAM: &str = "moves-the-commit-floor";
+/// Created to commit the op a held relay waits for.
+const FRONTIER_STREAM: &str = "moves-the-metadata-frontier";
 const GROUP_POLL_BUDGET: Duration = Duration::from_secs(20);
 // QUIC may use the full 30-second response budget before a dead data connection
 // reports an uncertain outcome; recovery then needs a fresh routing attempt.
@@ -102,6 +158,31 @@ const SEND_BUDGET: Duration = Duration::from_secs(20);
 /// the state this test needs before it can observe anything.
 const PRECONDITION_BUDGET: Duration = Duration::from_secs(20);
 const PRECONDITION_POLL: Duration = Duration::from_millis(500);
+const REBALANCE_BUDGET: Duration = Duration::from_secs(120);
+/// `cluster.heartbeat_timeout` at its default.
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long quorum evidence keeps partition admission open past
+/// `HEARTBEAT_TIMEOUT`, as the server sets it.
+const FRESHNESS_MARGIN: Duration = Duration::from_secs(3);
+/// How long a source primary drains a granted move before it gives the grant
+/// up, as the server sets it.
+const GRANT_TIMEOUT: Duration = Duration::from_secs(1);
+/// The longest pause the SDK takes between two attempts of one call.
+const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(1);
+/// A send that meets a move waits out the source's drain and a retry pause. A
+/// handover that stalls ends in an election after a heartbeat timeout.
+const MOVE_STALL_BOUND: Duration = GRANT_TIMEOUT
+    .saturating_add(HEARTBEAT_TIMEOUT)
+    .saturating_add(RETRY_BACKOFF_MAX);
+/// Logged by a source primary when it hands its partition to the move target.
+const TRANSFER_MARKER: &str = "rebalancing partition primary after target readiness confirmation";
+const READBACK_BATCH: u32 = 1_000;
+/// How late an isolated primary may close admission on a loaded machine.
+const FENCE_SLACK: Duration = Duration::from_secs(2);
+const FENCE_BOUND: Duration = HEARTBEAT_TIMEOUT
+    .saturating_add(FRESHNESS_MARGIN)
+    .saturating_add(FENCE_SLACK);
+const FENCE_PROBE_INTERVAL: Duration = Duration::from_millis(100);
 
 fn message(payload: &str) -> IggyMessage {
     IggyMessage::from_str(payload).expect("build message")
@@ -119,8 +200,864 @@ fn send_body(payload: &str) -> SendMessages {
     }
 }
 
+pub(super) async fn partition_route(
+    client: &TcpClient,
+    stream: &Identifier,
+    topic: &Identifier,
+    partition_id: u32,
+) -> PartitionRouteResponse {
+    let request = GetPartitionRouteRequest {
+        stream_id: identifier_to_wire(stream).unwrap(),
+        topic_id: identifier_to_wire(topic).unwrap(),
+        partition_id,
+    }
+    .to_bytes();
+    timeout(PRECONDITION_BUDGET, async {
+        loop {
+            match client
+                .send_raw_with_response(GET_PARTITION_ROUTE_CODE, request.clone())
+                .await
+            {
+                Ok(reply) => break PartitionRouteResponse::decode_from(&reply).unwrap(),
+                Err(IggyError::TransientNotAccepted) => sleep(PRECONDITION_POLL).await,
+                Err(error) => panic!("route {stream}/{topic}/{partition_id}: {error}"),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("partition {stream}/{topic}/{partition_id} never became routable"))
+}
+
+#[iggy_harness(cluster_nodes = 3, server(sharding.cpu_allocation = "2"))]
+async fn given_concurrent_creates_when_growing_partitions_should_spread_and_serve_every_partition(
+    harness: &mut TestHarness,
+) {
+    const FIRST_TOPIC: &str = "spread-first";
+    const SECOND_TOPIC: &str = "spread-second";
+    const THIRD_TOPIC: &str = "spread-third";
+    const INITIAL_PARTITIONS: u32 = 3;
+    const ADDED_PARTITIONS: u32 = 3;
+    const SECOND_PARTITIONS: u32 = 2;
+    const THIRD_PARTITIONS: u32 = 4;
+
+    let first = connect_without_login(harness.node(0).tcp_addr().unwrap()).await;
+    first
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    let second = connect_without_login(harness.node(0).tcp_addr().unwrap()).await;
+    second
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    first.create_stream(STREAM_NAME).await.unwrap();
+    let stream = Identifier::named(STREAM_NAME).unwrap();
+    let options = TopicCreateOptions {
+        partitions_count: Some(INITIAL_PARTITIONS),
+        durability: Durability::Persisted,
+        message_expiry: Some(IggyExpiry::NeverExpire),
+        ..TopicCreateOptions::default()
+    };
+    first
+        .create_topic(&stream, FIRST_TOPIC, &options)
+        .await
+        .unwrap();
+    let first_topic = Identifier::named(FIRST_TOPIC).unwrap();
+    for partition_id in 0..INITIAL_PARTITIONS {
+        let route = partition_route(&first, &stream, &first_topic, partition_id).await;
+        assert_eq!(u32::from(route.primary_replica), partition_id);
+        assert_eq!(route.view, partition_id);
+    }
+
+    let second_options = TopicCreateOptions {
+        partitions_count: Some(SECOND_PARTITIONS),
+        ..options.clone()
+    };
+    let third_options = TopicCreateOptions {
+        partitions_count: Some(THIRD_PARTITIONS),
+        ..options
+    };
+    let (second_result, third_result) = futures::join!(
+        first.create_topic(&stream, SECOND_TOPIC, &second_options),
+        second.create_topic(&stream, THIRD_TOPIC, &third_options),
+    );
+    second_result.unwrap();
+    third_result.unwrap();
+    let mut topics = [
+        (FIRST_TOPIC, INITIAL_PARTITIONS),
+        (SECOND_TOPIC, SECOND_PARTITIONS),
+        (THIRD_TOPIC, THIRD_PARTITIONS),
+    ];
+    assert_initial_spread(&first, &stream, &topics, harness.cluster_size()).await;
+    first
+        .create_partitions(&stream, &first_topic, ADDED_PARTITIONS)
+        .await
+        .unwrap();
+    topics[0].1 += ADDED_PARTITIONS;
+    assert_initial_spread(&first, &stream, &topics, harness.cluster_size()).await;
+
+    let mut original_routes = Vec::new();
+    for (name, count) in topics {
+        let topic = Identifier::named(name).unwrap();
+        for partition_id in 0..count {
+            let route = partition_route(&first, &stream, &topic, partition_id).await;
+            original_routes.push((name, partition_id, route));
+            let payload = format!("{name}-{partition_id}");
+            let mut messages = vec![message(&payload)];
+            first
+                .send_messages(
+                    &stream,
+                    &topic,
+                    &Partitioning::partition_id(partition_id),
+                    &mut messages,
+                )
+                .await
+                .unwrap();
+            assert_partition_payload(&second, &stream, &topic, partition_id, &payload).await;
+        }
+    }
+    drop(first);
+    drop(second);
+    for node in 0..harness.cluster_size() {
+        harness.stop_node(node).unwrap();
+    }
+    for node in 0..harness.cluster_size() {
+        harness.restart_node(node).unwrap();
+    }
+    let recovered = connect_without_login(harness.node(0).tcp_addr().unwrap()).await;
+    recovered
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    for (name, partition_id, original) in original_routes {
+        let topic = Identifier::named(name).unwrap();
+        let route = partition_route(&recovered, &stream, &topic, partition_id).await;
+        assert_eq!(route.incarnation, original.incarnation);
+        assert_eq!(route.partitions_count, original.partitions_count);
+        assert!(route.view >= original.view, "{name}/{partition_id}");
+        let payload = format!("{name}-{partition_id}");
+        assert_partition_payload(&recovered, &stream, &topic, partition_id, &payload).await;
+    }
+}
+
+async fn assert_initial_spread(
+    client: &TcpClient,
+    stream: &Identifier,
+    topics: &[(&str, u32)],
+    replicas: usize,
+) {
+    let mut primary_counts = vec![0_u32; replicas];
+    for &(name, count) in topics {
+        let topic = Identifier::named(name).unwrap();
+        for partition_id in 0..count {
+            let route = partition_route(client, stream, &topic, partition_id).await;
+            assert_eq!(route.view, u32::from(route.primary_replica));
+            primary_counts[usize::from(route.primary_replica)] += 1;
+        }
+    }
+    let total: u32 = topics.iter().map(|(_, count)| count).sum();
+    assert_eq!(
+        primary_counts,
+        vec![total / u32::try_from(replicas).unwrap(); replicas],
+        "create batches and growth must count already admitted assignments"
+    );
+}
+
+async fn assert_partition_payload(
+    client: &TcpClient,
+    stream: &Identifier,
+    topic: &Identifier,
+    partition_id: u32,
+    expected: &str,
+) {
+    let polled = client
+        .poll_messages(
+            stream,
+            topic,
+            Some(partition_id),
+            &Consumer::default(),
+            &PollingStrategy::offset(0),
+            1,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(polled.messages.len(), 1, "{topic}/{partition_id}");
+    assert_eq!(polled.messages[0].payload.as_ref(), expected.as_bytes());
+}
+
+#[iggy_harness(cluster_nodes = 5, server(sharding.cpu_allocation = "2"))]
+async fn given_balanced_primaries_when_a_replica_fails_and_returns_should_rebalance_without_data_loss(
+    harness: &mut TestHarness,
+) {
+    const TOPIC_COUNT: usize = 100;
+    const PHASES: [&str; 3] = ["before-failure", "while-absent", "after-return"];
+
+    let client = connect_without_login(harness.node(1).tcp_addr().unwrap()).await;
+    client
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    let identity = client.session_identity().await.unwrap();
+    client.create_stream(STREAM_NAME).await.unwrap();
+    let stream = Identifier::named(STREAM_NAME).unwrap();
+    let options = TopicCreateOptions {
+        partitions_count: Some(1),
+        durability: Durability::Persisted,
+        message_expiry: Some(IggyExpiry::NeverExpire),
+        ..TopicCreateOptions::default()
+    };
+    let mut topics = Vec::with_capacity(TOPIC_COUNT);
+    for index in 0..TOPIC_COUNT {
+        let name = format!("rebalance-{index}");
+        client.create_topic(&stream, &name, &options).await.unwrap();
+        topics.push(Identifier::named(&name).unwrap());
+    }
+    let mut request = RequestHeader {
+        client: identity.client_id,
+        session: identity.session,
+        request: RAW_REQUEST_START,
+        ..Default::default()
+    };
+    let initial =
+        wait_for_balanced_routes(harness, &client, &stream, &topics, &[20; 5], &mut request).await;
+    append_and_assert_partition_sentinels(&client, &stream, &topics, &PHASES[..1]).await;
+
+    harness.kill_node(0).unwrap();
+    let surviving = wait_for_balanced_routes(
+        harness,
+        &client,
+        &stream,
+        &topics,
+        &[0, 25, 25, 25, 25],
+        &mut request,
+    )
+    .await;
+    append_and_assert_partition_sentinels(&client, &stream, &topics, &PHASES[..2]).await;
+
+    harness.restart_node(0).unwrap();
+    let returned =
+        wait_for_balanced_routes(harness, &client, &stream, &topics, &[20; 5], &mut request).await;
+    for (index, original) in initial.iter().enumerate() {
+        assert_ne!(original.incarnation, 0);
+        for current in [&surviving[index], &returned[index]] {
+            assert_eq!(
+                current.incarnation, original.incarnation,
+                "{}",
+                topics[index]
+            );
+            assert_eq!(current.partitions_count, 1, "{}", topics[index]);
+            assert!(current.view >= original.view, "{}", topics[index]);
+        }
+        assert!(
+            returned[index].view >= surviving[index].view,
+            "{}",
+            topics[index]
+        );
+    }
+    append_and_assert_partition_sentinels(&client, &stream, &topics, &PHASES).await;
+    let current_identity = client.session_identity().await.unwrap();
+    assert_eq!(current_identity.client_id, identity.client_id);
+    assert_eq!(current_identity.session, identity.session);
+}
+
+async fn wait_for_balanced_routes(
+    harness: &TestHarness,
+    client: &TcpClient,
+    stream: &Identifier,
+    topics: &[Identifier],
+    expected_counts: &[usize],
+    request: &mut RequestHeader,
+) -> Vec<PartitionRouteResponse> {
+    let mut last_counts = vec![vec![0; expected_counts.len()]; expected_counts.len()];
+    timeout(REBALANCE_BUDGET, async {
+        let binding = BindSessionRequest {
+            version_info: ClientVersionInfo {
+                protocol_version: IGGY_PROTOCOL_VERSION,
+                sdk_name: WireName::new("routing-test").unwrap(),
+                sdk_version: WireName::new("1.0.0").unwrap(),
+            },
+            identity: client.session_identity().await.unwrap(),
+            bind_secret: client.session_bind_secret().await.unwrap(),
+        }
+        .to_bytes();
+        let route_requests: Vec<_> = topics
+            .iter()
+            .map(|topic| {
+                GetPartitionRouteRequest {
+                    stream_id: identifier_to_wire(stream).unwrap(),
+                    topic_id: identifier_to_wire(topic).unwrap(),
+                    partition_id: PARTITION_ID,
+                }
+                .to_bytes()
+            })
+            .collect();
+        let mut observers = Vec::with_capacity(expected_counts.len());
+        for (node, count) in expected_counts.iter().enumerate() {
+            if *count == 0 {
+                continue;
+            }
+            let address = harness.node(node).tcp_addr().unwrap();
+            let mut socket = raw_tcp::connect_to(address).await;
+            loop {
+                match data_request(&mut socket, request, BIND_SESSION_CODE, &binding, None).await {
+                    Ok(_) => break,
+                    Err(IggyError::TransientNotAccepted) => sleep(PRECONDITION_POLL).await,
+                    Err(error) => panic!("node {node} refused the existing session: {error:?}"),
+                }
+            }
+            assert_eq!(socket.peer_addr().unwrap(), address);
+            observers.push((node, socket));
+        }
+        loop {
+            let mut snapshots = Vec::with_capacity(observers.len());
+            for (node, socket) in &mut observers {
+                let mut routes = Vec::with_capacity(topics.len());
+                for body in &route_requests {
+                    match data_request(socket, request, GET_PARTITION_ROUTE_CODE, body, None).await {
+                        Ok(body) => routes.push(PartitionRouteResponse::decode_from(&body).unwrap()),
+                        Err(IggyError::TransientNotAccepted) => break,
+                        Err(error) => panic!("node {node} refused a partition route: {error:?}"),
+                    }
+                }
+                if routes.len() != topics.len() {
+                    break;
+                }
+                let mut counts = vec![0; expected_counts.len()];
+                for route in &routes {
+                    counts[usize::from(route.primary_replica)] += 1;
+                }
+                last_counts[*node].clone_from(&counts);
+                if counts != expected_counts {
+                    break;
+                }
+                snapshots.push(routes);
+            }
+            if snapshots.len() == observers.len()
+                && snapshots.windows(2).all(|pair| {
+                    pair[0].iter().zip(&pair[1]).all(|(left, right)| {
+                        (left.incarnation, left.partitions_count, left.view, left.primary_replica)
+                            == (right.incarnation, right.partitions_count, right.view, right.primary_replica)
+                    })
+                })
+            {
+                return snapshots.remove(0);
+            }
+            sleep(PRECONDITION_POLL).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "partition primaries did not converge to {expected_counts:?} within {REBALANCE_BUDGET:?}; \
+             physical-node observations: {last_counts:?}"
+        )
+    })
+}
+
+async fn append_and_assert_partition_sentinels(
+    client: &TcpClient,
+    stream: &Identifier,
+    topics: &[Identifier],
+    phases: &[&str],
+) {
+    timeout(REBALANCE_BUDGET, async {
+        for topic in topics {
+            let payload = format!("{topic}:{}", phases.last().unwrap());
+            client
+                .send_messages(
+                    stream,
+                    topic,
+                    &Partitioning::partition_id(PARTITION_ID),
+                    &mut [message(&payload)],
+                )
+                .await
+                .unwrap();
+            let polled = client
+                .poll_messages(
+                    stream,
+                    topic,
+                    Some(PARTITION_ID),
+                    &Consumer::default(),
+                    &PollingStrategy::offset(0),
+                    u32::try_from(phases.len() + 1).unwrap(),
+                    false,
+                )
+                .await
+                .unwrap();
+            assert_eq!(polled.messages.len(), phases.len(), "{topic}");
+            for (message, phase) in polled.messages.iter().zip(phases) {
+                assert_eq!(
+                    message.payload.as_ref(),
+                    format!("{topic}:{phase}").as_bytes()
+                );
+            }
+        }
+    })
+    .await
+    .expect("every partition must preserve and serve its history across rebalancing");
+}
+
+/// Producers write every partition back to back while the rebalancer moves
+/// primaries to a returning replica. Every acknowledged send stays readable in
+/// send order. A send that ends uncertain is never sent again, so no message
+/// may appear twice. Each send ends acknowledged, uncertain or with the refusal
+/// the SDK retries, and none waits longer than a move can fence its partition.
+#[iggy_harness(cluster_nodes = 3, server(sharding.cpu_allocation = "2"))]
+async fn given_producers_on_every_partition_when_primaries_move_should_keep_acknowledged_order_without_stalls(
+    harness: &mut TestHarness,
+) {
+    const TOPIC_COUNT: usize = 12;
+    const RETURNING_MOVES: usize = 4;
+
+    let client = connect_without_login(harness.node(1).tcp_addr().unwrap()).await;
+    client
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    let identity = client.session_identity().await.unwrap();
+    client.create_stream(STREAM_NAME).await.unwrap();
+    let stream = Identifier::named(STREAM_NAME).unwrap();
+    let options = TopicCreateOptions {
+        partitions_count: Some(1),
+        durability: Durability::Persisted,
+        message_expiry: Some(IggyExpiry::NeverExpire),
+        ..TopicCreateOptions::default()
+    };
+    let mut topics = Vec::with_capacity(TOPIC_COUNT);
+    for index in 0..TOPIC_COUNT {
+        let name = format!("moving-{index}");
+        client.create_topic(&stream, &name, &options).await.unwrap();
+        topics.push(Identifier::named(&name).unwrap());
+    }
+    let mut request = RequestHeader {
+        client: identity.client_id,
+        session: identity.session,
+        request: RAW_REQUEST_START,
+        ..Default::default()
+    };
+    wait_for_balanced_routes(harness, &client, &stream, &topics, &[4; 3], &mut request).await;
+    harness.kill_node(0).unwrap();
+    wait_for_balanced_routes(harness, &client, &stream, &topics, &[0, 6, 6], &mut request).await;
+
+    let producing = Arc::new(AtomicUsize::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let producers = spawn_producers(
+        harness.node(1).tcp_addr().unwrap(),
+        topics.clone(),
+        Arc::clone(&producing),
+        Arc::clone(&stop),
+    );
+    timeout(PRECONDITION_BUDGET, async {
+        while producing.load(Ordering::Acquire) < topics.len() {
+            sleep(PRECONDITION_POLL).await;
+        }
+    })
+    .await
+    .expect("every producer must acknowledge a send before the replica returns");
+    let transfers_before = transfers_started(harness);
+    harness.restart_node(0).unwrap();
+    wait_for_balanced_routes(harness, &client, &stream, &topics, &[4; 3], &mut request).await;
+    let transfers = transfers_started(harness) - transfers_before;
+    stop.store(true, Ordering::Release);
+    let logs = producers.join().expect("producer thread");
+
+    let mut latencies: Vec<Duration> = logs
+        .iter()
+        .flat_map(|log| log.latencies.iter().copied())
+        .collect();
+    latencies.sort_unstable();
+    println!(
+        "{} sends across {transfers} primary moves: {} acknowledged, {} uncertain, {} refused, \
+         {} unexpected; latency p50 {:?}, p99 {:?}, max {:?}",
+        latencies.len(),
+        logs.iter().map(|log| log.acknowledged.len()).sum::<usize>(),
+        logs.iter().map(|log| log.uncertain.len()).sum::<usize>(),
+        logs.iter().map(|log| log.refused.len()).sum::<usize>(),
+        logs.iter().map(|log| log.unexpected.len()).sum::<usize>(),
+        latencies[latencies.len() / 2],
+        latencies[latencies.len() * 99 / 100],
+        latencies[latencies.len() - 1],
+    );
+    assert!(
+        transfers >= RETURNING_MOVES,
+        "the producers ran across {transfers} moves, expected at least {RETURNING_MOVES}"
+    );
+    for (topic, log) in topics.iter().zip(&logs) {
+        let sequences = read_sequences(&client, &stream, topic).await;
+        assert_produced_history(topic, log, &sequences);
+    }
+}
+
+/// What one producer saw of its sends. Sequence `n` is the `n`th send.
+#[derive(Default)]
+struct ProducerLog {
+    acknowledged: Vec<u64>,
+    uncertain: Vec<u64>,
+    refused: Vec<u64>,
+    unexpected: Vec<(u64, IggyError)>,
+    latencies: Vec<Duration>,
+}
+
+/// The producers run on a thread of their own, so a blocking harness call on
+/// the test thread does not stretch their latencies.
+fn spawn_producers(
+    address: SocketAddr,
+    topics: Vec<Identifier>,
+    producing: Arc<AtomicUsize>,
+    stop: Arc<AtomicBool>,
+) -> JoinHandle<Vec<ProducerLog>> {
+    thread::spawn(move || {
+        runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("producer runtime")
+            .block_on(join_all(topics.iter().map(|topic| {
+                produce_until_stopped(address, topic, &producing, &stop)
+            })))
+    })
+}
+
+async fn produce_until_stopped(
+    address: SocketAddr,
+    topic: &Identifier,
+    producing: &AtomicUsize,
+    stop: &AtomicBool,
+) -> ProducerLog {
+    let client = connect_without_login(address).await;
+    client
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    let stream = Identifier::named(STREAM_NAME).unwrap();
+    let partitioning = Partitioning::partition_id(PARTITION_ID);
+    let mut log = ProducerLog::default();
+    let mut sequence = 0;
+    while !stop.load(Ordering::Acquire) {
+        let payload = format!("{topic}:{sequence}");
+        let started = Instant::now();
+        let outcome = client
+            .send_messages(&stream, topic, &partitioning, &mut [message(&payload)])
+            .await;
+        log.latencies.push(started.elapsed());
+        match outcome {
+            Ok(_) => {
+                if log.acknowledged.is_empty() {
+                    producing.fetch_add(1, Ordering::Release);
+                }
+                log.acknowledged.push(sequence);
+            }
+            Err(IggyError::OperationUncertain(operation)) => {
+                client
+                    .abandon_operation(operation)
+                    .await
+                    .expect("free the lane of an uncertain send");
+                log.uncertain.push(sequence);
+            }
+            Err(IggyError::TransientNotAccepted) => log.refused.push(sequence),
+            Err(error) => log.unexpected.push((sequence, error)),
+        }
+        sequence += 1;
+    }
+    log
+}
+
+fn transfers_started(harness: &TestHarness) -> usize {
+    // Node 0 restarts, which truncates its log, and it never moves a primary away.
+    (1..harness.cluster_size())
+        .map(|node| harness.node(node).stdout_occurrences(TRANSFER_MARKER))
+        .sum()
+}
+
+async fn read_sequences(client: &TcpClient, stream: &Identifier, topic: &Identifier) -> Vec<u64> {
+    let mut sequences = Vec::new();
+    let mut offset = 0;
+    loop {
+        let polled = client
+            .poll_messages(
+                stream,
+                topic,
+                Some(PARTITION_ID),
+                &Consumer::default(),
+                &PollingStrategy::offset(offset),
+                READBACK_BATCH,
+                false,
+            )
+            .await
+            .unwrap();
+        let Some(last) = polled.messages.last() else {
+            return sequences;
+        };
+        offset = last.header.offset + 1;
+        for message in &polled.messages {
+            let payload = std::str::from_utf8(&message.payload).expect("a produced payload");
+            let (name, sequence) = payload.rsplit_once(':').expect("a produced payload");
+            assert_eq!(name, topic.to_string());
+            sequences.push(sequence.parse().expect("a produced sequence"));
+        }
+    }
+}
+
+fn assert_produced_history(topic: &Identifier, log: &ProducerLog, sequences: &[u64]) {
+    assert!(
+        log.unexpected.is_empty(),
+        "{topic}: sends ended with errors the SDK does not retry: {:?}",
+        log.unexpected
+    );
+    let stalled: Vec<_> = log
+        .latencies
+        .iter()
+        .enumerate()
+        .filter(|(_, latency)| **latency > MOVE_STALL_BOUND)
+        .collect();
+    assert!(
+        stalled.is_empty(),
+        "{topic}: sends stalled past {MOVE_STALL_BOUND:?}: {stalled:?}"
+    );
+    if let Some(pair) = sequences.windows(2).find(|pair| pair[0] >= pair[1]) {
+        panic!(
+            "{topic}: sequence {} follows {} in the log",
+            pair[1], pair[0]
+        );
+    }
+    let read: HashSet<u64> = sequences.iter().copied().collect();
+    let lost: Vec<_> = log
+        .acknowledged
+        .iter()
+        .filter(|sequence| !read.contains(sequence))
+        .collect();
+    assert!(
+        lost.is_empty(),
+        "{topic}: acknowledged sends lost: {lost:?}"
+    );
+    let sent: HashSet<u64> = log
+        .acknowledged
+        .iter()
+        .chain(&log.uncertain)
+        .copied()
+        .collect();
+    let refused: Vec<_> = sequences
+        .iter()
+        .filter(|sequence| !sent.contains(sequence))
+        .collect();
+    assert!(
+        refused.is_empty(),
+        "{topic}: refused sends reached the log: {refused:?}"
+    );
+}
+
 #[iggy_harness(cluster_nodes = 3)]
-async fn given_metadata_view_moved_when_producing_to_a_fresh_topic_should_reach_the_advertised_leader(
+async fn given_a_partition_primary_leading_metadata_when_its_quorum_freezes_should_refuse_writes_until_it_resumes(
+    harness: &mut TestHarness,
+) {
+    assert_isolated_primary_fence(harness, true).await;
+}
+
+#[iggy_harness(cluster_nodes = 3)]
+async fn given_a_partition_primary_backing_up_metadata_when_its_quorum_freezes_should_refuse_writes_until_it_resumes(
+    harness: &mut TestHarness,
+) {
+    assert_isolated_primary_fence(harness, false).await;
+}
+
+/// A partition primary whose quorum peers are frozen gets no fresh metadata
+/// quorum evidence, whether it credits answered probes as the metadata primary
+/// or probes as a backup. It must refuse partition writes with 58 once that
+/// evidence is `heartbeat_timeout + 3s` old, admit nothing it refused, and
+/// serve the partition again after the peers resume.
+async fn assert_isolated_primary_fence(harness: &TestHarness, leads_metadata: bool) {
+    const ADMITTED: [&str; 2] = ["before-isolation", "after-resume"];
+    const REFUSED: &str = "refused-while-isolated";
+
+    let client = connect_without_login(harness.node(0).tcp_addr().unwrap()).await;
+    client
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    client.create_stream(STREAM_NAME).await.unwrap();
+    let stream = Identifier::named(STREAM_NAME).unwrap();
+    let topic = Identifier::named(TOPIC_NAME).unwrap();
+    let partitions = u32::try_from(harness.cluster_size()).unwrap();
+    let options = TopicCreateOptions {
+        partitions_count: Some(partitions),
+        ..TopicCreateOptions::default()
+    };
+    client
+        .create_topic(&stream, TOPIC_NAME, &options)
+        .await
+        .unwrap();
+    let leader = leader_node_index_via(harness, 0).await;
+    let mut routes = Vec::with_capacity(harness.cluster_size());
+    for partition_id in 0..partitions {
+        routes.push(partition_route(&client, &stream, &topic, partition_id).await);
+    }
+    let (partition_id, route) = (0..partitions)
+        .zip(routes)
+        .find(|(_, route)| (usize::from(route.primary_replica) == leader) == leads_metadata)
+        .expect("one partition primary on every node, the metadata primary among them");
+    let primary = usize::from(route.primary_replica);
+    let address = harness.node(primary).tcp_addr().unwrap();
+    let partitioning = Partitioning::partition_id(partition_id);
+    client
+        .send_messages(&stream, &topic, &partitioning, &mut [message(ADMITTED[0])])
+        .await
+        .unwrap();
+
+    let probe = connect_without_login(address).await;
+    probe
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    let identity = probe.session_identity().await.unwrap();
+    let binding = BindSessionRequest {
+        version_info: ClientVersionInfo {
+            protocol_version: IGGY_PROTOCOL_VERSION,
+            sdk_name: WireName::new("routing-test").unwrap(),
+            sdk_version: WireName::new("1.0.0").unwrap(),
+        },
+        identity,
+        bind_secret: probe.session_bind_secret().await.unwrap(),
+    }
+    .to_bytes();
+    let mut request = RequestHeader {
+        client: identity.client_id,
+        session: identity.session,
+        request: RAW_REQUEST_START,
+        ..Default::default()
+    };
+    let mut socket = raw_tcp::connect_to(address).await;
+    data_request(&mut socket, &mut request, BIND_SESSION_CODE, &binding, None)
+        .await
+        .expect("bind the probe session on the partition primary");
+    let poll = PollMessagesRequest {
+        consumer: consumer_to_wire(&Consumer::default()).unwrap(),
+        stream_id: identifier_to_wire(&stream).unwrap(),
+        topic_id: identifier_to_wire(&topic).unwrap(),
+        partition_id: Some(partition_id),
+        strategy: polling_strategy_to_wire(&PollingStrategy::offset(0)),
+        count: 1,
+        auto_commit: false,
+    }
+    .to_bytes();
+    data_request(
+        &mut socket,
+        &mut request,
+        POLL_MESSAGES_CODE,
+        &poll,
+        Some(route.context()),
+    )
+    .await
+    .expect("a primary with its quorum must serve the partition");
+
+    let peers: Vec<usize> = (0..harness.cluster_size())
+        .filter(|node| *node != primary)
+        .collect();
+    let isolated_at = Instant::now();
+    for &peer in &peers {
+        pause_node(harness, peer, true);
+    }
+    let fenced = timeout(FENCE_BOUND, async {
+        loop {
+            match data_request(
+                &mut socket,
+                &mut request,
+                POLL_MESSAGES_CODE,
+                &poll,
+                Some(route.context()),
+            )
+            .await
+            {
+                Ok(_) => sleep(FENCE_PROBE_INTERVAL).await,
+                Err(error) => break error,
+            }
+        }
+    })
+    .await;
+    let write = data_request(
+        &mut socket,
+        &mut request,
+        SEND_MESSAGES_CODE,
+        &raw_send_body(partition_id, REFUSED),
+        Some(route.context()),
+    )
+    .await;
+    let refused_after = isolated_at.elapsed();
+    for &peer in &peers {
+        pause_node(harness, peer, false);
+    }
+    println!(
+        "node {primary}, metadata leader {leader}, refused a write to partition {partition_id} \
+         {refused_after:?} after isolation"
+    );
+    assert_eq!(
+        fenced,
+        Ok(IggyError::TransientNotAccepted),
+        "the isolated primary must close partition admission within {FENCE_BOUND:?}"
+    );
+    assert_eq!(
+        write.err(),
+        Some(IggyError::TransientNotAccepted),
+        "the isolated primary must refuse a write with 58"
+    );
+    assert!(
+        refused_after <= FENCE_BOUND,
+        "the write was refused {refused_after:?} after isolation, past {FENCE_BOUND:?}"
+    );
+
+    timeout(
+        DATA_FAILOVER_BUDGET,
+        client.send_messages(&stream, &topic, &partitioning, &mut [message(ADMITTED[1])]),
+    )
+    .await
+    .expect("the cluster must answer a write after the peers resume")
+    .expect("the cluster must accept a write after the peers resume");
+    let polled = client
+        .poll_messages(
+            &stream,
+            &topic,
+            Some(partition_id),
+            &Consumer::default(),
+            &PollingStrategy::offset(0),
+            u32::try_from(ADMITTED.len() + 1).unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+    let payloads: Vec<&[u8]> = polled
+        .messages
+        .iter()
+        .map(|message| message.payload.as_ref())
+        .collect();
+    assert_eq!(
+        payloads,
+        ADMITTED.map(str::as_bytes),
+        "a write refused with 58 must not reach the log"
+    );
+}
+
+fn raw_send_body(partition_id: u32, payload: &str) -> Bytes {
+    let stream_id = WireIdentifier::named(STREAM_NAME).unwrap();
+    let topic_id = WireIdentifier::named(TOPIC_NAME).unwrap();
+    let partitioning = WirePartitioning::PartitionId(partition_id);
+    let messages = [RawMessage {
+        id: 0,
+        origin_timestamp: 0,
+        headers: None,
+        payload: payload.as_bytes(),
+    }];
+    let mut body = BytesMut::with_capacity(SendMessagesEncoder::encoded_size(
+        &stream_id,
+        &topic_id,
+        &partitioning,
+        &messages,
+    ));
+    SendMessagesEncoder::encode(&mut body, &stream_id, &topic_id, &partitioning, &messages)
+        .unwrap();
+    body.freeze()
+}
+
+#[iggy_harness(cluster_nodes = 3)]
+async fn given_metadata_view_moved_when_creating_topic_should_route_to_its_assigned_primary(
     harness: &mut TestHarness,
 ) {
     // Kill node 0: it is the view-0 primary of BOTH planes, so the metadata
@@ -159,9 +1096,8 @@ async fn given_metadata_view_moved_when_producing_to_a_fresh_topic_should_reach_
         }
     };
 
-    // A brand-new topic. Its partition group is seeded from the metadata view,
-    // so its primary is the advertised leader; left at view 0 it would be
-    // replica 0, the node that was just killed and restarted.
+    // With no existing partitions, the placement tie goes to replica 0,
+    // independently of the metadata primary elected above.
     let setup = harness
         .root_client_for_node(leader)
         .await
@@ -186,6 +1122,14 @@ async fn given_metadata_view_moved_when_producing_to_a_fresh_topic_should_reach_
         .expect("create topic");
     let topic_id = Identifier::named(TOPIC_NAME).expect("topic identifier");
     let partitioning = Partitioning::partition_id(PARTITION_ID);
+    let route_client = connect_without_login(harness.node(leader).tcp_addr().unwrap()).await;
+    route_client
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    let route = partition_route(&route_client, &stream_id, &topic_id, PARTITION_ID).await;
+    assert_eq!(route.primary_replica, 0);
+    assert_eq!(route.view, INITIAL_VIEW);
 
     // Where a client asking for node 0 actually ends up.
     let leader_address = harness
@@ -211,10 +1155,8 @@ async fn given_metadata_view_moved_when_producing_to_a_fresh_topic_should_reach_
          is testing a different node than this test claims"
     );
 
-    // The contract: the node the roster advertises accepts a partition write.
-    // Seeded from the metadata view the group's primary IS that node; left at
-    // view 0 it would be replica 0, and every client would be steered away
-    // from the only node that could accept.
+    // The session connection follows metadata leadership, while the write
+    // must reach the independently assigned partition primary.
     let accepted_by_leader = send_once(&on_node_zero, &stream_id, &topic_id, &partitioning).await;
     assert!(
         accepted_by_leader.is_ok(),
@@ -600,9 +1542,294 @@ async fn given_split_primaries_when_http_calls_a_partition_backup_should_serve_o
     assert_eq!(response.status(), StatusCode::NOT_FOUND, "deleted offset");
 }
 
-/// A relayed request carries the partition the contacted node chose. A backup
-/// refuses it with `NotPrimary` instead of relaying it again, a malformed route
-/// is the caller's error, and a route without the relay marker is ignored.
+/// The node that receives a partition request serves it through its owner's
+/// primary gate first. The partition primary serves every request without a
+/// relay, and looks itself up only once, before the caller's first write
+/// Registers a session there. A backup looks the primary up and relays once,
+/// a read after its owner refused and a write before it Registers anything,
+/// and the hop target serves the relay without a lookup, under the one
+/// session it Registers for the caller.
+#[iggy_harness(cluster_nodes = 3, server(
+    metadata.journal_slots = "256",
+    http.jwt.encoding_secret = "0123456789abcdef0123456789abcdef",
+    http.jwt.decoding_secret = "0123456789abcdef0123456789abcdef"
+))]
+async fn given_split_primaries_when_http_calls_each_node_should_relay_only_from_a_backup(
+    harness: &mut TestHarness,
+) {
+    let (partition_primary, backup, _) = seed_split_primaries(harness).await;
+    assert_ne!(partition_primary, backup);
+    let primary_http =
+        HttpClient::login_root_no_redirect(node_url(harness, partition_primary)).await;
+    let backup_http = HttpClient::login_root_no_redirect(node_url(harness, backup)).await;
+
+    let before = RoutingCost::of(&primary_http).await;
+    let requests = call_every_partition_route(&primary_http).await;
+    assert_eq!(
+        RoutingCost::of(&primary_http).await.since(before),
+        RoutingCost {
+            probes: 1,
+            session_registers: 1,
+            ..RoutingCost::default()
+        },
+        "{requests} requests on the partition primary"
+    );
+
+    let target_before = RoutingCost::of(&primary_http).await;
+    let before = RoutingCost::of(&backup_http).await;
+    let requests = call_every_partition_route(&backup_http).await;
+    assert_eq!(
+        RoutingCost::of(&backup_http).await.since(before),
+        RoutingCost {
+            probes: requests,
+            relays: requests,
+            ..RoutingCost::default()
+        },
+        "{requests} requests on a backup: one lookup and one relay each, and no Register"
+    );
+    assert_eq!(
+        RoutingCost::of(&primary_http).await.since(target_before),
+        RoutingCost {
+            session_registers: 1,
+            ..RoutingCost::default()
+        },
+        "the hop target serves each relay without a lookup"
+    );
+}
+
+/// A linearizable poll on a node that is not the metadata primary is served at
+/// or above the metadata primary's commit floor instead of redirected to it.
+/// The node misses the commit while it is paused, so only its hold for the
+/// floor makes the answer cover the commit. The partition primary serves the
+/// poll itself and another backup relays it once. Only a cluster node reads
+/// the floor.
+#[iggy_harness(cluster_nodes = 3, server(
+    metadata.journal_slots = "256",
+    http.jwt.encoding_secret = "0123456789abcdef0123456789abcdef",
+    http.jwt.decoding_secret = "0123456789abcdef0123456789abcdef"
+))]
+async fn given_split_primaries_when_polling_linearizable_off_the_metadata_primary_should_serve_at_the_commit_floor(
+    harness: &mut TestHarness,
+) {
+    let (partition_primary, metadata_primary, _) = seed_split_primaries(harness).await;
+    let other_backup = (0..harness.cluster_size())
+        .find(|node| ![partition_primary, metadata_primary].contains(node))
+        .expect("a node that is neither primary");
+    let leader = HttpClient::login_root_no_redirect(node_url(harness, metadata_primary)).await;
+    let poll = format!(
+        "/streams/{STREAM_NAME}/topics/{TOPIC_NAME}/messages?consumer_id={RELAY_CONSUMER_ID}\
+         &partition_id={PARTITION_ID}&kind=offset&value=0&count={}&auto_commit=false\
+         &consistency=linearizable",
+        GROUP_PAYLOADS.len()
+    );
+    let mut committed = 0;
+    for (node, relays) in [(partition_primary, 0), (other_backup, 1)] {
+        let http = HttpClient::login_root_no_redirect(node_url(harness, node)).await;
+        let before = RoutingCost::of(&http).await;
+        pause_node(harness, node, true);
+        let response = leader
+            .post_json(
+                "/streams",
+                &serde_json::json!({ "name": format!("{FLOOR_STREAM}-{node}") }),
+            )
+            .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "commit an op node {node} has not applied"
+        );
+        committed = applied_op(&response);
+        let (response, ()) = tokio::join!(
+            http.client
+                .get(http.url(&poll))
+                .bearer_auth(&http.token)
+                .send(),
+            async {
+                wait_for_queued_relays(harness, node, 1).await;
+                pause_node(harness, node, false);
+            },
+        );
+        let (status, body) = status_and_body(response.expect("linearizable poll")).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "linearizable poll on node {node}: {body}"
+        );
+        let polled: PolledMessages = serde_json::from_str(&body).expect("decode PolledMessages");
+        assert_eq!(polled.messages.len(), GROUP_PAYLOADS.len());
+        assert!(
+            polled.context.metadata_op >= committed,
+            "the poll on node {node} served at {:?}, below the committed op {committed}",
+            polled.context
+        );
+        assert_eq!(
+            RoutingCost::of(&http).await.since(before),
+            RoutingCost {
+                probes: relays,
+                relays,
+                floor_reads: 1,
+                session_registers: 0,
+            },
+            "linearizable poll on node {node}"
+        );
+    }
+
+    let before = RoutingCost::of(&leader).await;
+    let response = leader.get(&poll).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "linearizable poll on the leader"
+    );
+    assert_eq!(
+        RoutingCost::of(&leader).await.since(before),
+        RoutingCost {
+            probes: 1,
+            relays: 1,
+            ..RoutingCost::default()
+        },
+        "the metadata primary reads no floor"
+    );
+
+    let floor = leader.url(METADATA_FLOOR_PATH);
+    let response = leader
+        .client
+        .get(&floor)
+        .bearer_auth(&leader.token)
+        .send()
+        .await
+        .expect("unproven floor read");
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "unproven floor read"
+    );
+    let response = leader
+        .client
+        .get(&floor)
+        .header(
+            RELAY_PROOF_HEADER,
+            fresh_relay_proof("GET", METADATA_FLOOR_PATH, ""),
+        )
+        .send()
+        .await
+        .expect("proven floor read");
+    assert_eq!(
+        response.status(),
+        StatusCode::NO_CONTENT,
+        "proven floor read"
+    );
+    assert!(applied_op(&response) >= committed);
+}
+
+/// What routing its HTTP partition requests cost one node, from its counters.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct RoutingCost {
+    probes: u64,
+    relays: u64,
+    floor_reads: u64,
+    session_registers: u64,
+}
+
+impl RoutingCost {
+    async fn of(http: &HttpClient) -> Self {
+        let metrics = metrics(http).await;
+        Self {
+            probes: counter(&metrics, PROBES_METRIC),
+            relays: counter(&metrics, RELAYS_METRIC),
+            floor_reads: counter(&metrics, FLOOR_READS_METRIC),
+            session_registers: counter(&metrics, SESSION_REGISTERS_METRIC),
+        }
+    }
+
+    fn since(self, earlier: Self) -> Self {
+        Self {
+            probes: self.probes - earlier.probes,
+            relays: self.relays - earlier.relays,
+            floor_reads: self.floor_reads - earlier.floor_reads,
+            session_registers: self.session_registers - earlier.session_registers,
+        }
+    }
+}
+
+async fn metrics(http: &HttpClient) -> String {
+    let response = http.get("/metrics").await;
+    assert_eq!(response.status(), StatusCode::OK, "metrics scrape");
+    response.text().await.expect("metrics text")
+}
+
+fn counter(metrics: &str, name: &str) -> u64 {
+    metrics
+        .lines()
+        .find_map(|line| line.strip_prefix(name)?.strip_prefix(' ')?.parse().ok())
+        .unwrap_or_else(|| panic!("{name} missing from the exposition:\n{metrics}"))
+}
+
+/// Send, poll, and store, read and delete an offset through `http`, each
+/// answered as the partition primary answers it. Returns the request count.
+async fn call_every_partition_route(http: &HttpClient) -> u64 {
+    let messages = http.url(&format!(
+        "/streams/{STREAM_NAME}/topics/{TOPIC_NAME}/messages"
+    ));
+    let offsets = http.url(&format!(
+        "/streams/{STREAM_NAME}/topics/{TOPIC_NAME}/consumer-offsets"
+    ));
+    let store = StoreConsumerOffset {
+        context: None,
+        consumer: Consumer::new(Identifier::numeric(RELAY_CONSUMER_ID).unwrap()),
+        partition_id: Some(PARTITION_ID),
+        offset: 0,
+    };
+    let requests = [
+        (
+            http.client
+                .post(&messages)
+                .json(&send_body(RELAYED_PAYLOADS[0])),
+            StatusCode::CREATED,
+        ),
+        (
+            http.client.get(format!(
+                "{messages}?consumer_id={RELAY_CONSUMER_ID}&partition_id={PARTITION_ID}\
+                 &kind=offset&value=0&count=1&auto_commit=false"
+            )),
+            StatusCode::OK,
+        ),
+        (
+            http.client.put(&offsets).json(&store),
+            StatusCode::NO_CONTENT,
+        ),
+        (
+            http.client.get(format!(
+                "{offsets}?consumer_id={RELAY_CONSUMER_ID}&partition_id={PARTITION_ID}"
+            )),
+            StatusCode::OK,
+        ),
+        (
+            http.client.delete(format!(
+                "{offsets}/{RELAY_CONSUMER_ID}?partition_id={PARTITION_ID}"
+            )),
+            StatusCode::NO_CONTENT,
+        ),
+    ];
+    let count = requests.len() as u64;
+    for (request, expected) in requests {
+        let response = request
+            .bearer_auth(&http.token)
+            .send()
+            .await
+            .expect("partition request");
+        let (status, body) = status_and_body(response).await;
+        assert_eq!(status, expected, "partition request: {body}");
+    }
+    count
+}
+
+/// A relayed request carries the partition the contacted node chose and the
+/// node's proof of it. A backup refuses a proven relay with `NotPrimary`
+/// instead of relaying it again, naming the primary of its view so that a
+/// contacted node with an older view reaches it in one more hop. It refuses
+/// relay fields without a valid, unexpired proof, takes a malformed proven
+/// route as the caller's error, and ignores a route without the relay marker.
 #[iggy_harness(cluster_nodes = 3, server(
     metadata.journal_slots = "256",
     http.jwt.encoding_secret = "0123456789abcdef0123456789abcdef",
@@ -611,35 +1838,45 @@ async fn given_split_primaries_when_http_calls_a_partition_backup_should_serve_o
 async fn given_split_primaries_when_a_relayed_request_reaches_a_backup_should_refuse_not_primary(
     harness: &mut TestHarness,
 ) {
-    let (partition_primary, backup, _) = seed_split_primaries(harness).await;
+    let (partition_primary, backup, partition_view) = seed_split_primaries(harness).await;
     assert_ne!(partition_primary, backup);
     let http = HttpClient::login_root_no_redirect(node_url(harness, backup)).await;
-    let messages = http.url(&format!(
-        "/streams/{STREAM_NAME}/topics/{TOPIC_NAME}/messages"
-    ));
-    let poll = format!(
-        "{messages}?consumer_id={RELAY_CONSUMER_ID}&partition_id={PARTITION_ID}\
+    let send_path = format!("/streams/{STREAM_NAME}/topics/{TOPIC_NAME}/messages");
+    let poll_path = format!(
+        "{send_path}?consumer_id={RELAY_CONSUMER_ID}&partition_id={PARTITION_ID}\
          &kind=offset&value=0&count=1&auto_commit=false"
     );
-    let send = |route: &'static str| {
+    let send = |route: &str| {
         http.client
-            .post(&messages)
+            .post(http.url(&send_path))
             .bearer_auth(&http.token)
             .header(PARTITION_ROUTE_HEADER, route)
             .json(&send_body(RELAYED_PAYLOADS[0]))
     };
+    let relayed_send = |route: &str, proof: String| {
+        send(route)
+            .header(FORWARDED_HEADER, "1")
+            .header(RELAY_PROOF_HEADER, proof)
+    };
 
     for (request, name) in [
         (
-            send(ROUTE_AT_FIRST_OP).header(FORWARDED_HEADER, "1"),
+            relayed_send(
+                ROUTE_AT_FIRST_OP,
+                fresh_relay_proof("POST", &send_path, ROUTE_AT_FIRST_OP),
+            ),
             "send",
         ),
         (
             http.client
-                .get(&poll)
+                .get(http.url(&poll_path))
                 .bearer_auth(&http.token)
                 .header(FORWARDED_HEADER, "1")
-                .header(PARTITION_ROUTE_HEADER, ROUTE_AT_FIRST_OP),
+                .header(PARTITION_ROUTE_HEADER, ROUTE_AT_FIRST_OP)
+                .header(
+                    RELAY_PROOF_HEADER,
+                    fresh_relay_proof("GET", &poll_path, ROUTE_AT_FIRST_OP),
+                ),
             "poll",
         ),
     ] {
@@ -650,6 +1887,14 @@ async fn given_split_primaries_when_a_relayed_request_reaches_a_backup_should_re
             "relayed {name} on a backup"
         );
         assert!(response.headers().contains_key(RETRY_AFTER));
+        assert_eq!(
+            response
+                .headers()
+                .get(PARTITION_PRIMARY_HEADER)
+                .map(|value| value.to_str().expect("an ASCII primary")),
+            Some(format!("{partition_view},{partition_primary}").as_str()),
+            "relayed {name} names the primary of the backup's view"
+        );
         let body: serde_json::Value = response.json().await.expect("decode the error body");
         assert_eq!(
             body["id"],
@@ -658,8 +1903,36 @@ async fn given_split_primaries_when_a_relayed_request_reaches_a_backup_should_re
         );
     }
 
-    let response = send("0,1")
-        .header(FORWARDED_HEADER, "1")
+    let unreachable_frontier = format!("0,1,0,{},5000", u64::MAX);
+    let expired = relay_proof(
+        "POST",
+        &send_path,
+        ROUTE_AT_FIRST_OP,
+        IggyTimestamp::now().as_micros() - RELAY_PROOF_LIFETIME_MICROS,
+    );
+    for (request, name) in [
+        (
+            send(ROUTE_AT_FIRST_OP).header(FORWARDED_HEADER, "1"),
+            "no proof",
+        ),
+        (
+            relayed_send(
+                &unreachable_frontier,
+                fresh_relay_proof("POST", &send_path, ROUTE_AT_FIRST_OP),
+            ),
+            "a forged frontier",
+        ),
+        (relayed_send(ROUTE_AT_FIRST_OP, expired), "an expired proof"),
+    ] {
+        let response = request.send().await.expect("unproven relay");
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "relay with {name}"
+        );
+    }
+
+    let response = relayed_send("0,1", fresh_relay_proof("POST", &send_path, "0,1"))
         .send()
         .await
         .expect("malformed relayed send");
@@ -767,7 +2040,7 @@ async fn given_split_primaries_when_a_relayed_read_loses_its_primary_should_rese
     assert_eq!(info.stored_offset, store.offset);
 }
 
-fn pause_node(harness: &TestHarness, node: usize, paused: bool) {
+pub(super) fn pause_node(harness: &TestHarness, node: usize, paused: bool) {
     let pid = harness.node(node).pid().expect("the node is running");
     let signal = if paused { libc::SIGSTOP } else { libc::SIGCONT };
     // SAFETY: the signal targets a child this harness owns and has not reaped.
@@ -833,7 +2106,7 @@ async fn given_split_primaries_when_go_group_auto_commits_should_preserve_member
 ) {
     run_go_split_primary_test(
         harness,
-        "^TestE2E_SplitPrimaryPollsPreserveCoordinatorMembership$",
+        "TestE2E_SplitPrimaryPollsPreserveCoordinatorMembership",
     )
     .await;
 }
@@ -845,7 +2118,7 @@ async fn given_split_primaries_when_go_group_commits_manually_should_preserve_me
 ) {
     run_go_split_primary_test(
         harness,
-        "^TestE2E_SplitPrimaryManualCommitPreservesMembership$",
+        "TestE2E_SplitPrimaryManualCommitPreservesMembership",
     )
     .await;
 }
@@ -853,7 +2126,14 @@ async fn given_split_primaries_when_go_group_commits_manually_should_preserve_me
 async fn run_go_split_primary_test(harness: &mut TestHarness, test: &str) {
     let (_, metadata_primary, _) = seed_split_primaries(harness).await;
     let output = tokio::process::Command::new("go")
-        .args(["test", "./tests", "-run", test, "-count=1", "-v"])
+        .args([
+            "test",
+            "./tests",
+            "-run",
+            &format!("^{test}$"),
+            "-count=1",
+            "-v",
+        ])
         .current_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../foreign/go"))
         .env(
             "IGGY_TCP_ADDRESS",
@@ -873,10 +2153,11 @@ async fn run_go_split_primary_test(harness: &mut TestHarness, test: &str) {
         .output()
         .await
         .expect("run Go SDK test with the seeded cluster");
+    // `go test` also succeeds when the test skips or no test matches.
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        output.status.success(),
-        "Go SDK routing regression failed:\n{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
+        output.status.success() && stdout.contains(&format!("--- PASS: {test} (")),
+        "Go SDK routing regression {test} failed or did not run:\n{stdout}\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
 }
@@ -1088,6 +2369,15 @@ async fn seed_split_primaries(harness: &mut TestHarness) -> (usize, usize, u32) 
     })
     .await
     .expect("the metadata-only election must move leadership off the live partition primary");
+    // The restarted backup refuses partition requests with 58 until a probe of
+    // the new metadata primary credits it, and callers send it raw requests.
+    timeout(PRECONDITION_BUDGET, async {
+        while !harness.node(backup).partition_admission_open() {
+            sleep(PRECONDITION_POLL).await;
+        }
+    })
+    .await
+    .expect("the restarted backup must admit partition requests");
 
     (partition_primary, metadata_primary, partition_view)
 }
@@ -1750,4 +3040,579 @@ async fn data_request(
     } else {
         Ok(body)
     }
+}
+
+/// A hop target serves relays from a budget of their own. Stalled relayed
+/// uploads that hold every slot leave the node's own relays flowing, a caller
+/// that hangs up frees its slots at once, and the rest end at the deadline.
+#[iggy_harness(cluster_nodes = 3, server(
+    http.jwt.encoding_secret = "0123456789abcdef0123456789abcdef",
+    http.jwt.decoding_secret = "0123456789abcdef0123456789abcdef"
+))]
+async fn given_stalled_http_relay_uploads_when_every_target_slot_is_held_should_keep_relaying_and_free_them(
+    harness: &mut TestHarness,
+) {
+    let route = relay_route(spread_relay_target(harness).await, 0);
+    let http = HttpClient::login_root_no_redirect(node_url(harness, RELAY_TARGET_NODE)).await;
+    let mut tokens = Vec::new();
+    for _ in 0..=RELAY_TARGET_BUDGET / RELAY_TARGET_SHARE {
+        let session = http
+            .login(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+            .await;
+        tokens.push(session.token);
+    }
+    let (fresh, stalling) = tokens
+        .split_last()
+        .expect("one credential per share, plus one");
+    let (cancelled, waiting) = stalling.split_last().expect("credentials that stall");
+    let address = harness
+        .node(RELAY_TARGET_NODE)
+        .http_addr()
+        .expect("hop target HTTP address");
+    // The credential that hangs up opens last, so its deadline comes last too.
+    let opened = Instant::now();
+    let mut uploads = Vec::with_capacity(RELAY_TARGET_BUDGET);
+    for token in waiting.iter().chain([cancelled]) {
+        for _ in 0..RELAY_TARGET_SHARE {
+            uploads.push(stalled_relay_upload(address, token, &route).await);
+        }
+    }
+
+    timeout(PRECONDITION_BUDGET, async {
+        loop {
+            let (status, body) = relayed_poll(&http, fresh, &route).await;
+            if status == StatusCode::SERVICE_UNAVAILABLE && body.contains("relay_target_busy") {
+                break;
+            }
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "relayed poll before the budget fills: {body}"
+            );
+            sleep(RELAY_PROBE_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("the stalled uploads must hold every hop-target slot");
+    let (status, body) = relayed_poll(&http, cancelled, &route).await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "saturated credential: {body}"
+    );
+    assert!(body.contains("too_many_relayed_requests"), "{body}");
+
+    let response = http
+        .post_json(
+            "/streams",
+            &serde_json::json!({ "name": "created-while-every-target-slot-is-held" }),
+        )
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "control-plane relay from the hop target"
+    );
+    let response = http
+        .client
+        .post(http.url(&format!(
+            "/streams/{STREAM_NAME}/topics/{TOPIC_NAME}/messages"
+        )))
+        .bearer_auth(&http.token)
+        .json(&send_body(RELAYED_PAYLOADS[0]))
+        .send()
+        .await
+        .expect("partition relay from the hop target");
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "partition relay from the hop target"
+    );
+
+    drop(uploads.split_off(uploads.len() - RELAY_TARGET_SHARE));
+    timeout(PRECONDITION_BUDGET, async {
+        loop {
+            let (status, body) = relayed_poll(&http, cancelled, &route).await;
+            if status == StatusCode::OK {
+                break;
+            }
+            assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+            sleep(RELAY_PROBE_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("a caller hanging up mid-body must free its slots");
+    let mut unread = [0; 1];
+    assert!(
+        matches!(
+            uploads[0].try_read(&mut unread),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ),
+        "the slots must be freed by the hang-up, before any deadline"
+    );
+
+    for upload in uploads {
+        let answer = timeout(
+            (opened + RELAY_BUDGET + DEADLINE_SLACK).saturating_duration_since(Instant::now()),
+            stalled_answer(upload),
+        )
+        .await
+        .expect("a stalled upload must end at its deadline");
+        assert!(answer.starts_with("HTTP/1.1 503"), "{answer}");
+        assert!(
+            answer.contains(&format!(
+                "\"id\":{}",
+                IggyError::TransientNotAccepted.as_code()
+            )),
+            "{answer}"
+        );
+    }
+    let (status, body) = relayed_poll(&http, fresh, &route).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "every slot must be free again: {body}"
+    );
+}
+
+/// A metadata backup relays control-plane writes and partition requests from
+/// one pool of outbound slots. Control-plane uploads that stall mid-body take
+/// no slot, so the node's partition relays keep flowing, and each stalled
+/// upload ends at the relay deadline.
+#[iggy_harness(cluster_nodes = 3, server(
+    http.jwt.encoding_secret = "0123456789abcdef0123456789abcdef",
+    http.jwt.decoding_secret = "0123456789abcdef0123456789abcdef"
+))]
+async fn given_stalled_http_metadata_uploads_when_they_match_the_forward_slots_should_keep_relaying_and_end_them(
+    harness: &mut TestHarness,
+) {
+    spread_relay_target(harness).await;
+    let http = HttpClient::login_root_no_redirect(node_url(harness, RELAY_TARGET_NODE)).await;
+    let address = harness
+        .node(RELAY_TARGET_NODE)
+        .http_addr()
+        .expect("metadata backup HTTP address");
+    let counted = counter(&metrics(&http).await, REQUESTS_METRIC);
+    let opened = Instant::now();
+    let mut uploads = Vec::new();
+    for _ in 0..FORWARD_SLOTS {
+        uploads.push(
+            stalled_upload(
+                address,
+                "/streams",
+                &format!("authorization: Bearer {}\r\n", http.token),
+            )
+            .await,
+        );
+    }
+    // Each scrape counts itself too.
+    timeout(PRECONDITION_BUDGET, async {
+        for scrapes in 1.. {
+            if counter(&metrics(&http).await, REQUESTS_METRIC) >= counted + FORWARD_SLOTS + scrapes
+            {
+                break;
+            }
+            sleep(RELAY_PROBE_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("the metadata backup must take the head of every stalled upload");
+
+    let response = http
+        .client
+        .post(http.url(&format!(
+            "/streams/{STREAM_NAME}/topics/{TOPIC_NAME}/messages"
+        )))
+        .bearer_auth(&http.token)
+        .json(&send_body(RELAYED_PAYLOADS[0]))
+        .send()
+        .await
+        .expect("partition relay from the metadata backup");
+    let (status, body) = status_and_body(response).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "partition relay while control-plane uploads stall: {body}"
+    );
+
+    for upload in uploads {
+        let answer = timeout(
+            (opened + FORWARD_DEADLINE + DEADLINE_SLACK).saturating_duration_since(Instant::now()),
+            stalled_answer(upload),
+        )
+        .await
+        .expect("a stalled upload must end at its deadline");
+        assert!(answer.starts_with("HTTP/1.1 503"), "{answer}");
+        assert!(
+            answer.contains(&format!(
+                "\"id\":{}",
+                IggyError::TransientNotAccepted.as_code()
+            )),
+            "{answer}"
+        );
+    }
+}
+
+/// A client cannot pose as a relay. Forged relay fields that ask the hop
+/// target to hold for a metadata op the cluster never reaches take no slot and
+/// no hold, so the relays to and from the node keep flowing. A genuine relay
+/// for an op the cluster has not committed yet still holds until the hop
+/// target applies it, then is served.
+#[iggy_harness(cluster_nodes = 3, server(
+    http.jwt.encoding_secret = "0123456789abcdef0123456789abcdef",
+    http.jwt.decoding_secret = "0123456789abcdef0123456789abcdef"
+))]
+async fn given_forged_http_relays_when_flooding_a_partition_primary_should_refuse_them_without_a_hold(
+    harness: &mut TestHarness,
+) {
+    let incarnation = spread_relay_target(harness).await;
+    let admin = connect_without_login(harness.node(0).tcp_addr().unwrap()).await;
+    admin
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    admin
+        .create_user(
+            RELAY_FORGER,
+            RELAY_FORGER_PASSWORD,
+            UserStatus::Active,
+            None,
+        )
+        .await
+        .expect("create a user without permissions");
+    let root = HttpClient::login_root_no_redirect(node_url(harness, RELAY_TARGET_NODE)).await;
+    // The hop target verifies the forger's bearer only once it applied the user.
+    let forger = timeout(PRECONDITION_BUDGET, async {
+        loop {
+            let response = root
+                .client
+                .post(root.url("/users/login"))
+                .json(&serde_json::json!({
+                    "username": RELAY_FORGER,
+                    "password": RELAY_FORGER_PASSWORD,
+                }))
+                .send()
+                .await
+                .expect("login request");
+            if response.status().is_success() {
+                break root.with_token(access_token(response).await);
+            }
+            sleep(PRECONDITION_POLL).await;
+        }
+    })
+    .await
+    .expect("the hop target must apply the new user");
+    let entry = HttpClient::login_root_no_redirect(node_url(harness, RELAY_ENTRY_NODE)).await;
+    let send_path = format!("/streams/{STREAM_NAME}/topics/{TOPIC_NAME}/messages");
+    let unreachable_frontier = relay_route(incarnation, u64::MAX);
+    let proof_of_another_route =
+        fresh_relay_proof("POST", &send_path, &relay_route(incarnation, 0));
+    let forged = (0..RELAY_TARGET_BUDGET).map(|index| {
+        let request = forger
+            .client
+            .post(forger.url(&send_path))
+            .bearer_auth(&forger.token)
+            .header(FORWARDED_HEADER, "1")
+            .header(PARTITION_ROUTE_HEADER, &unreachable_frontier)
+            .json(&send_body_to(RELAY_TARGET_PARTITION, "forged"));
+        if index % 2 == 0 {
+            request.send()
+        } else {
+            request
+                .header(RELAY_PROOF_HEADER, &proof_of_another_route)
+                .send()
+        }
+    });
+
+    let started = Instant::now();
+    let (forged, (to_target, from_target)) =
+        tokio::join!(futures::future::join_all(forged), async {
+            sleep(FORGED_HEAD_START).await;
+            let to_target = entry
+                .client
+                .post(entry.url(&send_path))
+                .bearer_auth(&entry.token)
+                .json(&send_body_to(RELAY_TARGET_PARTITION, RELAYED_PAYLOADS[0]))
+                .send()
+                .await
+                .expect("relay to the hop target");
+            let from_target = root
+                .client
+                .post(root.url(&send_path))
+                .bearer_auth(&root.token)
+                .json(&send_body(RELAYED_PAYLOADS[1]))
+                .send()
+                .await
+                .expect("relay from the hop target");
+            (to_target, from_target)
+        },);
+    for response in forged {
+        let (status, body) = status_and_body(response.expect("forged relay")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "forged relay: {body}");
+    }
+    assert!(
+        started.elapsed() < RELAY_BUDGET,
+        "no forged relay may hold for its metadata op"
+    );
+    let (status, body) = status_and_body(to_target).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "relay to the hop target: {body}"
+    );
+    let (status, body) = status_and_body(from_target).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "relay from the hop target: {body}"
+    );
+
+    let leader = leader_node_index_via(harness, RELAY_TARGET_NODE).await;
+    let leader_http = HttpClient::login_root_no_redirect(node_url(harness, leader)).await;
+    let committed = applied_op(&leader_http.get("/streams").await);
+    let next_op = relay_route(incarnation, committed + 1);
+    let held = tokio::spawn(
+        root.client
+            .post(root.url(&send_path))
+            .bearer_auth(&root.token)
+            .header(FORWARDED_HEADER, "1")
+            .header(PARTITION_ROUTE_HEADER, &next_op)
+            .header(
+                RELAY_PROOF_HEADER,
+                fresh_relay_proof("POST", &send_path, &next_op),
+            )
+            .json(&send_body_to(RELAY_TARGET_PARTITION, HELD_PAYLOAD))
+            .send(),
+    );
+    sleep(HOLD_PROBE).await;
+    assert!(
+        !held.is_finished(),
+        "a genuine relay must hold for an op the cluster has not committed"
+    );
+    let response = leader_http
+        .post_json("/streams", &serde_json::json!({ "name": FRONTIER_STREAM }))
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "commit the op the held relay waits for"
+    );
+    let response = held.await.expect("held relay task").expect("held relay");
+    let served_at = response
+        .status()
+        .is_success()
+        .then(|| applied_op(&response));
+    let (status, body) = status_and_body(response).await;
+    assert_eq!(status, StatusCode::CREATED, "held relay: {body}");
+    assert!(
+        served_at > Some(committed),
+        "the hop target must serve the held relay only after applying its op"
+    );
+}
+
+/// A caller can name any metadata op in the context of its request, and a hop
+/// target holds a relay until it applied the op of its route. The contacted
+/// node relays only an op it applied, so requests that name an op the cluster
+/// never reaches wait there, relay nothing and take no hop-target slot: the
+/// hop target still admits a relay of the same credential.
+#[iggy_harness(cluster_nodes = 3, server(
+    http.jwt.encoding_secret = "0123456789abcdef0123456789abcdef",
+    http.jwt.decoding_secret = "0123456789abcdef0123456789abcdef"
+))]
+async fn given_contexts_naming_an_unreached_op_when_relaying_should_hold_them_on_the_contacted_node(
+    harness: &mut TestHarness,
+) {
+    let incarnation = spread_relay_target(harness).await;
+    let entry = HttpClient::login_root_no_redirect(node_url(harness, RELAY_ENTRY_NODE)).await;
+    let send_url = entry.url(&format!(
+        "/streams/{STREAM_NAME}/topics/{TOPIC_NAME}/messages"
+    ));
+    let unreached_body = SendMessages {
+        context: Some(PartitionContext {
+            incarnation,
+            owner_generation: 0,
+            metadata_op: u64::MAX,
+        }),
+        ..send_body_to(RELAY_TARGET_PARTITION, "names-an-unreached-op")
+    };
+    let send = |body: &SendMessages| {
+        entry
+            .client
+            .post(&send_url)
+            .bearer_auth(&entry.token)
+            .json(body)
+            .send()
+    };
+
+    let before = RoutingCost::of(&entry).await;
+    let (unreached, admitted) = tokio::join!(
+        futures::future::join_all((0..RELAY_TARGET_SHARE).map(|_| send(&unreached_body))),
+        async {
+            sleep(FORGED_HEAD_START).await;
+            send(&send_body_to(RELAY_TARGET_PARTITION, RELAYED_PAYLOADS[0]))
+                .await
+                .expect("relay of the same credential")
+        },
+    );
+    let (status, body) = status_and_body(admitted).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "relay of the same credential: {body}"
+    );
+    for response in unreached {
+        let (status, body) = status_and_body(response.expect("send naming an unreached op")).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "send naming an unreached op: {body}"
+        );
+        let error: serde_json::Value = serde_json::from_str(&body).expect("decode the error body");
+        assert_eq!(error["id"], IggyError::TransientNotAccepted.as_code());
+    }
+    assert_eq!(
+        RoutingCost::of(&entry).await.since(before).relays,
+        1,
+        "the contacted node must not relay an op it has not applied"
+    );
+}
+
+/// A three-partition topic places partition N on node N while node 0 stays
+/// the metadata primary, so node 1 serves partition 1 and relays partition 0
+/// and every control-plane write. Returns the incarnation of partition 1.
+async fn spread_relay_target(harness: &TestHarness) -> u64 {
+    let client = connect_without_login(harness.node(0).tcp_addr().unwrap()).await;
+    client
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    client.create_stream(STREAM_NAME).await.unwrap();
+    let stream = Identifier::named(STREAM_NAME).unwrap();
+    let topic = Identifier::named(TOPIC_NAME).unwrap();
+    let options = TopicCreateOptions {
+        partitions_count: Some(SPREAD_PARTITIONS),
+        message_expiry: Some(IggyExpiry::NeverExpire),
+        ..TopicCreateOptions::default()
+    };
+    client
+        .create_topic(&stream, TOPIC_NAME, &options)
+        .await
+        .unwrap();
+    let relayed = partition_route(&client, &stream, &topic, PARTITION_ID).await;
+    assert_eq!(relayed.primary_replica, 0);
+    let served = partition_route(&client, &stream, &topic, RELAY_TARGET_PARTITION).await;
+    assert_eq!(usize::from(served.primary_replica), RELAY_TARGET_NODE);
+    assert_ne!(
+        leader_node_index_via(harness, RELAY_TARGET_NODE).await,
+        RELAY_TARGET_NODE
+    );
+    served.incarnation
+}
+
+/// The route a relay of partition 1 carries, with the longest budget a hop
+/// target grants.
+fn relay_route(incarnation: u64, metadata_op: u64) -> String {
+    format!(
+        "{RELAY_TARGET_PARTITION},{incarnation},0,{metadata_op},{}",
+        RELAY_BUDGET.as_millis()
+    )
+}
+
+fn send_body_to(partition_id: u32, payload: &str) -> SendMessages {
+    SendMessages {
+        partitioning: Partitioning::partition_id(partition_id),
+        ..send_body(payload)
+    }
+}
+
+/// Prove relay fields the way a cluster node does: HMAC-SHA256 under the key
+/// BLAKE3 derives from the cluster key material, over the length-prefixed
+/// method, path and query, and route, then the expiry in unix microseconds.
+fn relay_proof(method: &str, path_and_query: &str, route: &str, expires_at: u64) -> String {
+    let key = ring::hmac::Key::new(
+        ring::hmac::HMAC_SHA256,
+        &blake3::derive_key(RELAY_KEY_CONTEXT, RELAY_KEY_MATERIAL.as_bytes()),
+    );
+    let mut signed = Vec::new();
+    for field in [method, path_and_query, route] {
+        signed.extend_from_slice(&(field.len() as u64).to_le_bytes());
+        signed.extend_from_slice(field.as_bytes());
+    }
+    signed.extend_from_slice(&expires_at.to_le_bytes());
+    format!(
+        "{expires_at},{}",
+        hex::encode(ring::hmac::sign(&key, &signed))
+    )
+}
+
+fn fresh_relay_proof(method: &str, path_and_query: &str, route: &str) -> String {
+    relay_proof(
+        method,
+        path_and_query,
+        route,
+        IggyTimestamp::now().as_micros() + RELAY_PROOF_LIFETIME_MICROS,
+    )
+}
+
+/// Poll partition 1 on node 1 as a relay carrying `route`.
+async fn relayed_poll(http: &HttpClient, token: &str, route: &str) -> (StatusCode, String) {
+    let path_and_query = format!(
+        "/streams/{STREAM_NAME}/topics/{TOPIC_NAME}/messages?consumer_id={RELAY_CONSUMER_ID}\
+         &partition_id={RELAY_TARGET_PARTITION}&kind=offset&value=0&count=1&auto_commit=false"
+    );
+    let response = http
+        .client
+        .get(http.url(&path_and_query))
+        .bearer_auth(token)
+        .header(FORWARDED_HEADER, "1")
+        .header(PARTITION_ROUTE_HEADER, route)
+        .header(
+            RELAY_PROOF_HEADER,
+            fresh_relay_proof("GET", &path_and_query, route),
+        )
+        .send()
+        .await
+        .expect("relayed poll");
+    status_and_body(response).await
+}
+
+/// Send the head of a relayed send and the first byte of its body, then stall.
+async fn stalled_relay_upload(address: SocketAddr, token: &str, route: &str) -> TcpStream {
+    let path = format!("/streams/{STREAM_NAME}/topics/{TOPIC_NAME}/messages");
+    let proof = fresh_relay_proof("POST", &path, route);
+    stalled_upload(
+        address,
+        &path,
+        &format!(
+            "authorization: Bearer {token}\r\n{FORWARDED_HEADER}: 1\r\n\
+             {PARTITION_ROUTE_HEADER}: {route}\r\n{RELAY_PROOF_HEADER}: {proof}\r\n"
+        ),
+    )
+    .await
+}
+
+/// Send the head of a POST to `path` with `headers`, each line ended by CRLF,
+/// and the first byte of its body, then stall.
+async fn stalled_upload(address: SocketAddr, path: &str, headers: &str) -> TcpStream {
+    let mut upload = TcpStream::connect(address)
+        .await
+        .expect("connect to the node");
+    let head = format!(
+        "POST {path} HTTP/1.1\r\nhost: {address}\r\n{headers}\
+         content-type: application/json\r\ncontent-length: {STALLED_BODY_LENGTH}\r\n\r\n{{"
+    );
+    upload
+        .write_all(head.as_bytes())
+        .await
+        .expect("send the head of an upload");
+    upload
+}
+
+/// The hop target's answer to a stalled upload. It closes the connection after
+/// answering, because the rest of the body never comes; a reset after the
+/// answer leaves what was read.
+async fn stalled_answer(mut upload: TcpStream) -> String {
+    let mut answer = Vec::new();
+    let _ = upload.read_to_end(&mut answer).await;
+    String::from_utf8_lossy(&answer).into_owned()
 }

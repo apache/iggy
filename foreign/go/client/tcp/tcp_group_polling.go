@@ -251,44 +251,55 @@ func (c *IggyTcpClient) ensureAssignment(
 	key groupKey,
 	streamId, topicId, groupId iggcon.Identifier,
 ) (groupAssignment, error) {
-	c.mtx.Lock()
-	fence := c.sessionFence
-	c.mtx.Unlock()
-	// As in Rust, an empty assignment is synced again on every poll: a member
-	// gets its partitions only as each one installs it as the owner.
-	if cached, ok := c.groups.get(key); ok && len(cached.partitions) > 0 &&
-		time.Since(cached.fetchedAt) < assignmentRefreshInterval {
-		return cached, nil
-	}
-
-	synced, err := c.SyncConsumerGroup(ctx, streamId, topicId, groupId)
-	if errors.Is(err, ierror.ErrConsumerGroupMemberNotFound) && !c.groups.hasLeft(key) {
-		// The first poll may run before the caller joined, so the membership
-		// is established on its behalf. A group the caller explicitly left
-		// stays left, and the poll reports the membership error instead.
-		if err = c.JoinConsumerGroup(ctx, streamId, topicId, groupId); err != nil {
+	for {
+		// The fence refuses a sync that a session change overtook, so it is
+		// taken only after a running recovery, and a recovery that overtakes
+		// the sync starts it again under the new session.
+		if err := c.waitForRecovery(ctx); err != nil {
 			return groupAssignment{}, err
 		}
-		synced, err = c.SyncConsumerGroup(ctx, streamId, topicId, groupId)
-	}
-	if err != nil {
-		return groupAssignment{}, err
-	}
-
-	assignment := groupAssignment{
-		generation: synced.Generation,
-		partitions: synced.Partitions,
-		fetchedAt:  time.Now(),
-	}
-	c.logger.Debug("Synced the consumer group assignment",
-		slog.Uint64("generation", assignment.generation),
-		slog.Int("partitions", len(assignment.partitions)))
-	c.mtx.Lock()
-	if c.sessionFence != fence {
+		c.mtx.Lock()
+		fence := c.sessionFence
 		c.mtx.Unlock()
-		return groupAssignment{}, c.sessionLossError(ierror.ErrUnauthenticated)
+		// As in Rust, an empty assignment is synced again on every poll: a
+		// member gets its partitions only as each one installs it as the owner.
+		if cached, ok := c.groups.get(key); ok && len(cached.partitions) > 0 &&
+			time.Since(cached.fetchedAt) < assignmentRefreshInterval {
+			return cached, nil
+		}
+
+		synced, err := c.SyncConsumerGroup(ctx, streamId, topicId, groupId)
+		if errors.Is(err, ierror.ErrConsumerGroupMemberNotFound) && !c.groups.hasLeft(key) {
+			// The first poll may run before the caller joined, so the
+			// membership is established on its behalf. A group the caller
+			// explicitly left stays left, and the poll reports the membership
+			// error instead.
+			if err = c.JoinConsumerGroup(ctx, streamId, topicId, groupId); err != nil {
+				return groupAssignment{}, err
+			}
+			synced, err = c.SyncConsumerGroup(ctx, streamId, topicId, groupId)
+		}
+		if err != nil {
+			return groupAssignment{}, err
+		}
+
+		assignment := groupAssignment{
+			generation: synced.Generation,
+			partitions: synced.Partitions,
+			fetchedAt:  time.Now(),
+		}
+		c.logger.Debug("Synced the consumer group assignment",
+			slog.Uint64("generation", assignment.generation),
+			slog.Int("partitions", len(assignment.partitions)))
+		c.mtx.Lock()
+		if c.sessionFence == fence {
+			c.groups.putSynced(key, assignment)
+			c.mtx.Unlock()
+			return assignment, nil
+		}
+		c.mtx.Unlock()
+		if !c.sessionRecovers(ctx, ierror.ErrUnauthenticated) {
+			return groupAssignment{}, ierror.ErrUnauthenticated
+		}
 	}
-	c.groups.putSynced(key, assignment)
-	c.mtx.Unlock()
-	return assignment, nil
 }

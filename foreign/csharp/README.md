@@ -153,6 +153,14 @@ await client.ConnectAsync();
 TCP applies the connection, heartbeat, TLS, and auto-login settings. HTTP `ConnectAsync` does no
 network work and requires explicit login. For TLS configuration, see the [TcpTls example](../../examples/csharp/README.md#tcptls).
 
+A public TCP sign-in uses the supplied credentials and supersedes any automatic sign-in in progress.
+If that call fails, including validation, cancellation, timeout, or discovery after registration,
+the tentative session is discarded and automatic sign-in stays disabled until another explicit
+sign-in succeeds. Logout also withdraws configured auto-login. Calls that had not been sent under
+the previous caller session fail as unauthenticated; possibly applied writes retain their uncertainty.
+An automatic sign-in rejected with an older password snapshot retries a newer password committed
+by the same caller session.
+
 ### Connection String
 
 A TCP client can also be created from the connection string format shared with the other SDKs. The
@@ -262,6 +270,28 @@ await client.ConnectAsync();
 
 ### Retries and failed requests
 
+HTTP retries 429 and 503 responses, including `relay_refused`, within its existing
+30-second retry budget. It uses the delta value of `Retry-After`, or 50 ms when
+that value is absent. Retained-operation recovery below applies to TCP.
+
+On a multi-node cluster, an HTTP call often reaches a node that is not the
+partition primary. For message sends, polls and consumer offset calls, that
+node relays the call to the primary. The relay needs identical `http.jwt`
+secrets or `cluster.auth` on every node. Without that key material, these calls
+answer 503 with code 58. See
+[HTTP routing and backpressure](../../core/server/README.md#http-routing-and-backpressure).
+
+Receipt access follows the server's [session and revocation policy](../../core/server/README.md#sessions-and-retry-receipts).
+An unresolved operation cannot recover its receipt after its original session
+ends, even after a new login or account reactivation. A fresh send can duplicate
+that operation.
+
+Each node counts the messages in its stream, topic and system stats. After a
+successful send, a node that is not the partition primary shows the new count
+only after the next prepare or commit broadcast. When no other write follows,
+this delay is at most `cluster.commit_broadcast_interval` (500 ms by default).
+See [metadata freshness and counters](../../core/server/README.md#metadata-freshness-and-counters).
+
 Within one call deadline, the SDK retries an unresolved replicated mutation using its original session,
 request id, context, and frozen frame. Metadata mutations share one lane; partition mutations share a lane
 by incarnation and partition id, including requests using different names for the same partition.
@@ -304,6 +334,18 @@ Smaller positive limits are valid but reject mutations that cannot fit; reads an
 Reads and control requests have a separate per-link limit of 256 pending calls and a 32-frame write queue.
 Their bodies, including unknown raw non-replicated commands, are outside the mutation byte budget.
 
+Partition primaries are spread over the replicas, so many of them are metadata backups. A backup applies metadata
+commits after the metadata primary, so it can miss a stream, topic or partition that the metadata primary already
+created. A replica can answer a route lookup, a send, a poll or an offset request with "not found". The status is
+1009, 1010, 2010, 2011 or 3007. If that replica is not the metadata primary, the call looks up the route again and
+retries. If the 30-second call deadline ends first, the call fails with `IggyInvalidStatusCodeException` and
+status 58. A mutation with an unknown earlier outcome ends with `VsrRequestOutcomeUnknownException` instead.
+
+Only a "not found" reply from the metadata primary is final. A leader change can leave the client with an old view
+of the metadata primary. When the client believes that the replica that replied is the metadata primary, it reads
+the cluster roster from that replica. When it has no ready link to the metadata primary, it does the same. If that
+roster names this replica as the metadata primary, the reply is final. Otherwise the call retries.
+
 ### Limitations
 
 - TCP uses VSR framing; HTTP uses the separate REST API. Join/leave, `GetMeAsync`, segment deletion,
@@ -331,8 +373,9 @@ Their bodies, including unknown raw non-replicated commands, are outside the mut
   Logout and `Dispose` stop the restarts. Invalid local CA configuration and rejected credentials surface as
   errors. A caller's cancellation stops that call while the link owner continues reconnecting. Request replay
   has its own deadline.
-  Configured auto-login credentials take precedence over credentials remembered from successful
-  username/password or PAT login. Without either, reconnecting cannot restore the authenticated session.
+  Reconnecting signs in with the last successful username/password or PAT login, or with the configured
+  auto-login credentials if the caller never signed in. Without either, reconnecting cannot restore the
+  authenticated session.
   A committed password change or rename of the signed-in user updates these credentials. This includes a
   change that `ResolveOperationAsync` proves. A committed rejection leaves them unchanged.
 - `AutoLoginSettings` properties are now `init`-only, as is `IggyClientConfigurator.HeartbeatInterval`. Build
@@ -839,6 +882,14 @@ await foreach (var message in consumer.ReceiveAsync())
     Console.WriteLine($"Partition {message.PartitionId}: {payload}");
 }
 ```
+
+Disposal cancels and drains pending offset stores, then checkpoints the last message delivered
+from each partition before leaving the group. Buffered messages are excluded, and each checkpoint
+keeps the delivered message's partition context. `AutoCommitMode.Disabled` skips this final
+checkpoint. The final stores share one 30-second budget; failures are logged and cleanup continues.
+Disposing from inside a receive loop is supported, including rented and deserialized messages.
+
+Under `AutoCommitMode.AfterReceive` a message counts as delivered once its loop body completes. A message whose body threw, broke or was still running when the consumer was disposed is not checkpointed and is delivered again.
 
 For automatic deserialization:
 

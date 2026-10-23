@@ -82,12 +82,7 @@ impl ffi::ErrorInfo {
     fn record(&mut self, error: &IggyError) {
         self.code = error.as_code();
         self.kind = error.as_string().to_owned();
-        let operation = match error {
-            IggyError::OperationUncertain(op)
-            | IggyError::LaneBlocked(op)
-            | IggyError::OperationNotRetained(op) => Some(*op),
-            _ => None,
-        };
+        let operation = error.operation_id();
         self.has_operation_id = operation.is_some();
         self.operation_id = operation.unwrap_or_default();
     }
@@ -465,7 +460,6 @@ impl Client {
         auto_commit: bool,
         error_info: &mut ffi::ErrorInfo,
     ) -> Result<ffi::PolledMessages, String> {
-        *error_info = ffi::ErrorInfo::default();
         self.poll(
             stream_id,
             topic_id,
@@ -496,7 +490,6 @@ impl Client {
         context: ffi::PartitionContext,
         error_info: &mut ffi::ErrorInfo,
     ) -> Result<ffi::PolledMessages, String> {
-        *error_info = ffi::ErrorInfo::default();
         self.poll(
             stream_id,
             topic_id,
@@ -575,7 +568,8 @@ impl Client {
             let topic_details = self
                 .inner
                 .create_topic(&rust_stream_id, &topic_name, &options)
-                .await.inspect_err(|error| error_info.record(error))
+                .await
+                .inspect_err(|error| error_info.record(error))
                 .map_err(|error| {
                     format!(
                         "Could not create topic '{topic_name}' on stream '{rust_stream_id}': {error}"
@@ -649,7 +643,8 @@ impl Client {
         RUNTIME.block_on(async {
             self.inner
                 .update_topic(&rust_stream_id, &rust_topic_id, &topic_name, &update_options)
-                .await.inspect_err(|error| error_info.record(error))
+                .await
+                .inspect_err(|error| error_info.record(error))
                 .map_err(|error| {
                     format!(
                         "Could not update topic '{rust_topic_id}' on stream '{rust_stream_id}': {error}"
@@ -676,7 +671,8 @@ impl Client {
         RUNTIME.block_on(async {
             self.inner
                 .delete_topic(&rust_stream_id, &rust_topic_id)
-                .await.inspect_err(|error| error_info.record(error))
+                .await
+                .inspect_err(|error| error_info.record(error))
                 .map_err(|error| {
                     format!(
                         "Could not delete topic '{rust_topic_id}' on stream '{rust_stream_id}': {error}"
@@ -704,7 +700,8 @@ impl Client {
         RUNTIME.block_on(async {
             self.inner
                 .create_partitions(&rust_stream_id, &rust_topic_id, partitions_count)
-                .await.inspect_err(|error| error_info.record(error))
+                .await
+                .inspect_err(|error| error_info.record(error))
                 .map_err(|error| {
                     format!(
                         "Could not create {partitions_count} partitions for topic '{rust_topic_id}' on stream '{rust_stream_id}': {error}"
@@ -732,7 +729,8 @@ impl Client {
         RUNTIME.block_on(async {
             self.inner
                 .delete_partitions(&rust_stream_id, &rust_topic_id, partitions_count)
-                .await.inspect_err(|error| error_info.record(error))
+                .await
+                .inspect_err(|error| error_info.record(error))
                 .map_err(|error| {
                     format!(
                         "Could not delete {partitions_count} partitions for topic '{rust_topic_id}' on stream '{rust_stream_id}': {error}"
@@ -761,7 +759,8 @@ impl Client {
         RUNTIME.block_on(async {
             self.inner
                 .delete_segments(&rust_stream_id, &rust_topic_id, partition_id, segments_count)
-                .await.inspect_err(|error| error_info.record(error))
+                .await
+                .inspect_err(|error| error_info.record(error))
                 .map_err(|error| {
                     format!(
                         "Could not delete {segments_count} segments for topic '{rust_topic_id}' on stream '{rust_stream_id}', partition '{partition_id}': {error}"
@@ -790,7 +789,8 @@ impl Client {
             let group = self
                 .inner
                 .create_consumer_group(&rust_stream_id, &rust_topic_id, &name)
-                .await.inspect_err(|error| error_info.record(error))
+                .await
+                .inspect_err(|error| error_info.record(error))
                 .map_err(|error| {
                     format!(
                         "Could not create consumer group '{name}' for topic '{rust_topic_id}' on stream '{rust_stream_id}': {error}"
@@ -882,7 +882,8 @@ impl Client {
         RUNTIME.block_on(async {
             self.inner
                 .delete_consumer_group(&rust_stream_id, &rust_topic_id, &rust_group_id)
-                .await.inspect_err(|error| error_info.record(error))
+                .await
+                .inspect_err(|error| error_info.record(error))
                 .map_err(|error| {
                     format!(
                         "Could not delete consumer group '{rust_group_id}' for topic '{rust_topic_id}' on stream '{rust_stream_id}': {error}"
@@ -913,7 +914,8 @@ impl Client {
         RUNTIME.block_on(async {
             self.inner
                 .join_consumer_group(&rust_stream_id, &rust_topic_id, &rust_group_id)
-                .await.inspect_err(|error| error_info.record(error))
+                .await
+                .inspect_err(|error| error_info.record(error))
                 .map_err(|error| {
                     format!(
                         "Could not join consumer group '{rust_group_id}' for topic '{rust_topic_id}' on stream '{rust_stream_id}': {error}"
@@ -953,7 +955,8 @@ impl Client {
                     opt_partition(partition_id),
                     offset,
                 )
-                .await.inspect_err(|error| error_info.record(error))
+                .await
+                .inspect_err(|error| error_info.record(error))
                 .map_err(|error| {
                     format!(
                         "Could not store consumer offset for stream '{rust_stream_id}', topic '{rust_topic_id}': {error}"
@@ -993,7 +996,8 @@ impl Client {
         RUNTIME.block_on(async {
             self.inner
                 .store_consumer_position(&consumer, &rust_stream_id, &rust_topic_id, position)
-                .await.inspect_err(|error| error_info.record(error))
+                .await
+                .inspect_err(|error| error_info.record(error))
                 .map_err(|error| {
                     format!(
                         "Could not store consumer position for stream '{rust_stream_id}', topic '{rust_topic_id}': {error}"
@@ -1069,7 +1073,8 @@ impl Client {
                     &rust_topic_id,
                     opt_partition(partition_id),
                 )
-                .await.inspect_err(|error| error_info.record(error))
+                .await
+                .inspect_err(|error| error_info.record(error))
                 .map_err(|error| {
                     format!(
                         "Could not delete consumer offset for stream '{rust_stream_id}', topic '{rust_topic_id}': {error}"
@@ -1183,7 +1188,8 @@ impl Client {
         RUNTIME.block_on(async {
             self.inner
                 .leave_consumer_group(&rust_stream_id, &rust_topic_id, &rust_group_id)
-                .await.inspect_err(|error| error_info.record(error))
+                .await
+                .inspect_err(|error| error_info.record(error))
                 .map_err(|error| {
                     format!(
                         "Could not leave consumer group '{rust_group_id}' for topic '{rust_topic_id}' on stream '{rust_stream_id}': {error}"
@@ -1458,7 +1464,7 @@ mod tests {
     };
 
     #[test]
-    fn concurrent_recovery_preserves_each_calls_exact_operation_identity() {
+    fn should_preserve_each_calls_exact_operation_identity_under_concurrent_recovery() {
         let client = Arc::new(Client {
             inner: Arc::new(RustIggyClient::default()),
         });
@@ -1482,7 +1488,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_details_distinguish_uncertain_blocked_and_missing_operations() {
+    fn should_distinguish_uncertain_blocked_and_missing_operations_in_recovery_details() {
         let mut info = ffi::ErrorInfo::default();
         for error in [
             IggyError::OperationUncertain(u64::MAX),
@@ -1530,5 +1536,54 @@ mod tests {
                 .as_deref(),
             Some("invalid polling strategy: latest")
         );
+    }
+
+    #[test]
+    fn should_clear_the_previous_error_info_when_a_poll_rejects_its_arguments() {
+        let client = Client {
+            inner: Arc::new(RustIggyClient::default()),
+        };
+        let invalid_identifier = || ffi::Identifier {
+            kind: String::new(),
+            length: 0,
+            value: Vec::new(),
+        };
+        for with_context in [false, true] {
+            let mut info = ffi::ErrorInfo::default();
+            info.record(&IggyError::OperationUncertain(u64::MAX));
+            let polled = if with_context {
+                client.poll_messages_with_context(
+                    invalid_identifier(),
+                    invalid_identifier(),
+                    ANY_PARTITION_ID,
+                    "consumer".to_owned(),
+                    invalid_identifier(),
+                    "next".to_owned(),
+                    0,
+                    1,
+                    false,
+                    ffi::PartitionContext::from(CONTEXT),
+                    &mut info,
+                )
+            } else {
+                client.poll_messages(
+                    invalid_identifier(),
+                    invalid_identifier(),
+                    ANY_PARTITION_ID,
+                    "consumer".to_owned(),
+                    invalid_identifier(),
+                    "next".to_owned(),
+                    0,
+                    1,
+                    false,
+                    &mut info,
+                )
+            };
+            assert!(polled.is_err(), "with_context: {with_context}");
+            assert_eq!(info.code, 0, "with_context: {with_context}");
+            assert!(info.kind.is_empty(), "with_context: {with_context}");
+            assert!(!info.has_operation_id, "with_context: {with_context}");
+            assert_eq!(info.operation_id, 0, "with_context: {with_context}");
+        }
     }
 }

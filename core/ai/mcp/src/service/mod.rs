@@ -785,14 +785,9 @@ fn id(id: &str) -> Result<Identifier, ErrorData> {
 
 fn request(result: Result<impl Sized + Serialize, IggyError>) -> Result<CallToolResult, ErrorData> {
     let result = result.map_err(|e| {
-        let data = match &e {
-            IggyError::OperationUncertain(op)
-            | IggyError::LaneBlocked(op)
-            | IggyError::OperationNotRetained(op) => {
-                Some(serde_json::json!({ "operation_id": op.to_string() }))
-            }
-            _ => None,
-        };
+        let data = e
+            .operation_id()
+            .map(|op| serde_json::json!({ "operation_id": op.to_string() }));
         let message = format!("There was an error when invoking the method. {e}");
         error!(message);
         ErrorData::invalid_request(message, data)

@@ -44,7 +44,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 use tokio::spawn;
 use tokio::task::JoinHandle;
-use tokio::time::sleep;
+use tokio::time::{sleep_until, timeout_at};
 use tracing::log::warn;
 use tracing::{debug, error, info};
 
@@ -999,6 +999,7 @@ impl IggyClient {
             loop {
                 debug!("Sending the heartbeat...");
                 let keepalive = client.read().await.keepalive().await;
+                let next_tick = tokio::time::Instant::now() + heartbeat_interval.get_duration();
                 match keepalive {
                     Err(error) => {
                         error!("There was an error when sending a heartbeat. {error}");
@@ -1010,15 +1011,25 @@ impl IggyClient {
                     Ok(true) => {
                         debug!("Heartbeat was sent successfully.");
                         // Picks up a widened assignment without waiting for an ownership-fence rejection.
-                        client
-                            .read()
-                            .await
-                            .refresh_consumer_group_assignments()
-                            .await;
+                        // All groups share the time until the next tick, so syncs that the
+                        // coordinator leaves unanswered never delay the keepalive, which
+                        // restarts the stopped links.
+                        let refresh = async {
+                            client
+                                .read()
+                                .await
+                                .refresh_consumer_group_assignments()
+                                .await;
+                        };
+                        if timeout_at(next_tick, refresh).await.is_err() {
+                            warn!(
+                                "The consumer group assignments were not refreshed before the next heartbeat."
+                            );
+                        }
                     }
                     Ok(false) => {}
                 }
-                sleep(heartbeat_interval.get_duration()).await
+                sleep_until(next_tick).await
             }
         }));
     }
@@ -1093,13 +1104,19 @@ impl Client for IggyClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::links::OPERATION_TIMEOUT;
-    use crate::links::fake_cluster::{Answer, FakeCluster, connected, endpoint};
+    use crate::links::fake_cluster::{
+        Answer, FakeCluster, connected, connected_with, endpoint, eventually,
+    };
     use crate::links::test_support::LOCALHOST;
-    use iggy_binary_protocol::codes::{CREATE_STREAM_CODE, GET_STATS_CODE};
-    use iggy_common::{StreamClient, TcpClientConfig};
+    use crate::links::{OPERATION_TIMEOUT, ReconnectPolicy};
+    use iggy_binary_protocol::codes::{
+        CREATE_STREAM_CODE, GET_STATS_CODE, SYNC_CONSUMER_GROUP_CODE,
+    };
+    use iggy_common::{StreamClient, TcpClientConfig, TcpClientReconnectionConfig};
+    use std::iter::repeat_n;
     use std::time::Duration;
     use tokio::net::TcpListener;
+    use tokio::time::sleep;
 
     #[tokio::test(start_paused = true)]
     async fn given_nested_client_locks_when_reading_should_share_one_deadline() {
@@ -1423,6 +1440,54 @@ mod tests {
             !runs_after_disconnect && runs_after_connect,
             "heartbeat after disconnect() {runs_after_disconnect}, \
              after connect() {runs_after_connect}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_coordinator_that_never_answers_syncs_when_the_heartbeat_refreshes_three_groups_should_restart_links_every_tick()
+     {
+        const GROUPS: u32 = 3;
+        const TICKS: u32 = 4;
+        let cluster = FakeCluster::new(2);
+        let stopped = endpoint(1);
+        cluster.down.lock().unwrap().insert(stopped.clone());
+        cluster.script(
+            &endpoint(0),
+            SYNC_CONSUMER_GROUP_CODE,
+            repeat_n(Answer::Silence, (GROUPS * TICKS) as usize),
+        );
+        let no_retry = TcpClientReconnectionConfig {
+            max_retries: Some(0),
+            ..TcpClientReconnectionConfig::default()
+        };
+        let links = connected_with(&cluster, 1, ReconnectPolicy::from(&no_retry)).await;
+        eventually("the link to replica 1 gives up", || {
+            !cluster.dials_to(&stopped).is_empty()
+        })
+        .await;
+        let first_dials = cluster.dials_to(&stopped).len();
+        let tcp = TcpClient::from_links(links);
+        let stream = Identifier::numeric(1).unwrap();
+        let topic = Identifier::numeric(1).unwrap();
+        for group in 1..=GROUPS {
+            let group = Identifier::numeric(group).unwrap();
+            tcp.consumer_group_state().register_group(
+                group.to_string(),
+                stream.clone(),
+                topic.clone(),
+                group,
+            );
+        }
+        let client = IggyClient::new(ClientWrapper::Tcp(tcp));
+        let interval = TcpClientConfig::default().heartbeat_interval.get_duration();
+
+        client.start_heartbeat().await;
+        sleep(interval * TICKS).await;
+
+        let restarts = cluster.dials_to(&stopped).len() - first_dials;
+        assert!(
+            restarts >= TICKS as usize,
+            "{restarts} link restarts in {TICKS} heartbeat ticks"
         );
     }
 

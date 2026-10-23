@@ -143,6 +143,9 @@ not_before = "0 s"
 # secrets take precedence over the PSK. Identical keys on every node make bearers
 # valid cluster-wide and activate follower-to-primary HTTP forwarding. Without
 # configured JWT secrets or a cluster PSK, tokens are node-local and forwarding stays disabled.
+# HTTP message sends, polls and consumer offset calls that reach a node that is
+# not the partition primary then answer a transient 503 (code 58). Partition
+# primaries are spread over the nodes, which makes that the common case.
 encoding_secret = ""
 
 # Secret key for decoding JWTs.
@@ -557,10 +560,11 @@ repair_chunk_max = 128
 # a transient disk hiccup cannot kill the process.
 superblock_wedged_fatal_timeout = "2m"
 
-# Superblock compatibility: 74-byte records include the partition offset
-# reservation frontier; legacy 66-byte records remain readable. Every server
-# writes a metadata superblock, including standalone deployments. Builds
-# without this field reject the larger record and cannot boot from it.
+# Superblock compatibility: version 2 atomically records adopted view/head/header
+# identity separately from WAL body certification. Legacy version 1 records with
+# 66/74-byte payloads remain readable. After a version 2 write, an older binary
+# refuses boot; rollback needs a consistent pre-upgrade data backup or a deliberate
+# clean rejoin. Do not remove individual superblock slots to force a downgrade.
 
 # Replica-to-replica authentication (PSK + BLAKE3 keyed-MAC handshake).
 [cluster.auth]
@@ -883,10 +887,11 @@ clients_table_max = 8192
 # Cap on the partitions of all streams and topics. A request to create a
 # topic or partitions that would exceed it fails with PartitionsLimitReached.
 # The metadata primary checks it with its own value, so give every node the
-# same value. The check counts committed partitions only and does not add up
-# the creates in flight. Up to 3 x prepare_queue_depth creates (96 at the
-# default) can be in flight, with up to 1000 partitions each, so the count
-# can exceed the cap by that much. 0 means no cap.
+# same value. The check counts the committed partitions and those of the
+# creates still in flight, so creates never take the count past the cap. A
+# create that will fail holds its partitions until it commits. If only the
+# creates in flight leave no room, the request gets 58 (TransientNotAccepted)
+# instead, and the client retries it until its deadline. 0 means no cap.
 partitions_max = 0
 
 # Per-partition consensus plane tunables. Unlike [metadata] (one shard-0
@@ -1134,7 +1139,28 @@ peer_queue_capacity = 4096
 
 # Each SDK connection allocates separate inbound and outbound queues.
 # Keep their capacity independent of replica repair bursts.
+# The capacity is also the most requests the server runs at once for one
+# connection. A reply waits for room in the outbound queue, so a client that
+# reads its replies keeps its connection. Requests past the cap wait in a
+# queue of 1024 per connection. A request that finds that queue full gets the
+# retryable error 58 (TransientNotAccepted), and if the outbound queue is full
+# too, the server closes the connection. A heartbeat eviction also closes a
+# connection whose outbound queue is full.
 client_queue_capacity = 256
+
+# How long a reply waits for room in a connection's outbound queue before the
+# server closes that connection. The queue stays full only while the client
+# leaves its socket unread, so this bounds how long such a client pins its
+# queued replies and request tasks. The client then reconnects and recovers
+# its session. Must be > 0.
+client_write_stall_timeout = "30 s"
+
+# Bytes of requests that wait in the per-connection queue of 1024 described
+# above. A request that would take the queue past it gets the same retryable
+# error 58, unless the queue is empty, so one request of any legal size always
+# fits. The default holds the 256 requests one connection runs at once at
+# 1 MiB each. Must be > 0.
+client_request_queue_bytes_max = "256 MiB"
 
 # Interval between outbound reconnect attempts to peers with peer_id > self_id.
 # Also bounds each dial, so a peer that drops SYNs cannot stall the sweep.

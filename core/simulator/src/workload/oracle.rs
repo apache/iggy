@@ -19,13 +19,15 @@
 //!
 //! The per-tick invariants in [`super::invariants`] catch a regression on a
 //! single replica. This adds the post-drain checks. [`assert_converged`]
-//! asserts two things that must hold:
+//! asserts that:
 //!
 //! - no live replica is ahead of the leader on any namespace (a backup ahead of
 //!   the leader is a split-brain / divergence bug),
 //! - every live replica agrees with every other on each committed metadata op
 //!   they both hold, the real consensus property (see
 //!   [`super::state_checker`]),
+//! - live replicas that committed the same `SendMessages` prepare hold the same
+//!   applied message data for it, which the prepare identity leaves out,
 //! - on a serial run, the workload's predicted [`Shadow`] equals the metadata
 //!   committed on the leader, the payoff of the name-keyed shadow,
 //! - every consumer group owner the leader settled on a workload namespace is
@@ -48,6 +50,8 @@ use crate::workload::{
 use crate::{Simulator, rebalancing_timeout_micros};
 use consensus::{Consensus, MetadataHandle, PartitionsHandle, Status};
 use iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner;
+use iggy_binary_protocol::requests::partitions::RetireConsumerGroupOwnersRequest;
+use iggy_binary_protocol::{Operation, WireDecode};
 use iggy_common::ConsumerKind;
 use metadata::impls::metadata::StreamsFrontend;
 use server_common::sharding::IggyNamespace;
@@ -67,7 +71,7 @@ const WORKLOAD_PREFIX: &str = "wl-";
 /// next such broadcast, not at the moment the client reply is sent. The window
 /// must span more than one interval; idle heartbeats never break convergence
 /// because commit offsets and committed state only advance monotonically.
-const QUIESCE_SETTLE_TICKS: u64 = 200;
+pub(crate) const QUIESCE_SETTLE_TICKS: u64 = 200;
 
 /// How many rebalancing timeouts a pending revocation may age before the quiesce
 /// check fails. The reconciler forces the handoff after one, and the second
@@ -154,6 +158,7 @@ pub fn drive_to_quiesce(
             let cmds = workload.on_reply(&reply);
             apply_sim_commands(sim, &cmds);
         }
+        workload.readback.check_served(sim, workload.options.seed);
         recover_evicted_clients(sim, workload, clients);
         invariants.check(sim, workload);
         if workload.total_in_flight() == 0 {
@@ -377,6 +382,28 @@ fn owner_install_pending(sim: &Simulator, workload: &Workload) -> bool {
         })
 }
 
+/// Ids that the topic holding `namespace` allocated and no longer holds in the
+/// committed metadata of replica `leader`. Group ids are never reused.
+fn deleted_group_ids(sim: &Simulator, leader: u8, namespace: IggyNamespace) -> Vec<u64> {
+    sim.replicas[usize::from(leader)].shards[0]
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .read(|inner| {
+            inner
+                .items
+                .get(namespace.stream_id())
+                .and_then(|stream| stream.topics.get(namespace.topic_id()))
+                .map(|topic| {
+                    (0..topic.next_consumer_group_id)
+                        .filter(|group_id| !topic.consumer_groups.contains_key(group_id))
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+}
+
 /// Both planes settled: the metadata group and every tracked partition group.
 ///
 /// The partition half matters for the leader-relative check in
@@ -477,9 +504,9 @@ fn partition_view_is_settled(sim: &Simulator, ns: server_common::sharding::IggyN
 /// primary mid-view-change. Both are false failures.
 ///
 /// # Panics
-/// If a replica is ahead of the leader, two replicas disagree on a committed op,
-/// or the shadow mismatches the leader. The workload seed is in the message so the
-/// failing run replays deterministically.
+/// If a replica is ahead of the leader, two replicas disagree on a committed op or
+/// on the message data it applied, or the shadow mismatches the leader. The
+/// workload seed is in the message so the failing run replays deterministically.
 pub fn assert_converged(sim: &Simulator, workload: &mut Workload) -> ConvergenceReport {
     let seed = workload.options.seed;
     let live: Vec<usize> = (0..sim.replica_count)
@@ -559,20 +586,26 @@ pub fn assert_converged(sim: &Simulator, workload: &mut Workload) -> Convergence
         partition_ops_compared,
         "committed partition entries agree across every live replica"
     );
+    let data = state_checker::assert_applied_data_agrees(sim, &workload.options.namespaces, seed);
+    workload.readback.assert_served_committed(sim, seed);
 
     let replicas_compared = assert_committed_metadata_agrees(sim, &live, seed);
 
     let owners_compared = assert_settled_owners_installed(sim, workload, leader, seed);
+    let retirements_compared = assert_retired_owners_removed(sim, workload, leader, &live, seed);
     let offsets_compared_with_shadow = assert_partition_offsets_agree(sim, workload, &live, seed);
     assert_no_stale_revocations(sim, leader, seed);
 
     let report = ConvergenceReport {
         ops_compared,
         partition_ops_compared,
+        data_namespaces_compared: data.namespaces,
+        data_records_compared: data.records,
         replicas_compared,
         namespaces_checked,
         owners_compared,
         offsets_compared_with_shadow,
+        retirements_compared,
     };
 
     // Entity oracle: on a serial run the shadow must equal the committed
@@ -627,6 +660,12 @@ pub struct ConvergenceReport {
     /// every namespace. Separate from `ops_compared`: a partition-plane run commits
     /// almost no metadata and would otherwise read as having compared nothing.
     pub partition_ops_compared: usize,
+    /// Namespaces in which live replicas' applied message data was compared.
+    pub data_namespaces_compared: usize,
+    /// Committed messages whose applied bytes were compared between live replicas.
+    /// Separate from `partition_ops_compared`, which compares prepare identities
+    /// and cannot see the message batch.
+    pub data_records_compared: usize,
     /// Live replicas whose committed metadata CONTENT was compared against a peer
     /// sharing its commit point. Zero on a solo cluster.
     pub replicas_compared: usize,
@@ -638,6 +677,9 @@ pub struct ConvergenceReport {
     pub owners_compared: usize,
     /// Partition offset tables compared with the serial acknowledged shadow.
     pub offsets_compared_with_shadow: usize,
+    /// Retired groups, counted per live replica, whose owner and offsets the
+    /// replica was required to have removed.
+    pub retirements_compared: usize,
 }
 
 /// Require a host and exactly one primary for every workload namespace committed
@@ -851,6 +893,92 @@ fn assert_settled_owners_installed(
     compared
 }
 
+/// Require every live replica that hosts the primary's incarnation of a workload
+/// namespace, and committed its retirement operation, to
+/// have retired it and to hold neither an owner nor an offset for it.
+///
+/// A retirement stays in force along the committed prefix, so a replica past that
+/// commit point without it applied other state than it committed. Judging each
+/// replica by its own retirement would pass one that never applied any.
+/// Returns how many retired groups that covered, counted per replica.
+fn assert_retired_owners_removed(
+    sim: &Simulator,
+    workload: &Workload,
+    leader: usize,
+    live: &[usize],
+    seed: u64,
+) -> usize {
+    let Ok(leader) = u8::try_from(leader) else {
+        return 0;
+    };
+    let mut compared = 0;
+    for &namespace in &workload.options.namespaces {
+        let Some(primary) = sim.primary_index(namespace) else {
+            continue;
+        };
+        let incarnation = sim.partition_incarnation(usize::from(primary), namespace);
+        let hosts: Vec<_> = live
+            .iter()
+            .filter(|&&replica| sim.partition_incarnation(replica, namespace) == incarnation)
+            .filter_map(|&replica| {
+                sim.replicas[replica]
+                    .partition_shard(namespace)
+                    .plane
+                    .partitions()
+                    .get_by_ns(&namespace)
+                    .map(|partition| (replica, partition))
+            })
+            .collect();
+        for group_id in deleted_group_ids(sim, leader, namespace) {
+            let Some(retired_at) = hosts
+                .iter()
+                .filter(|(_, partition)| partition.consumer_group_retired(group_id))
+                .filter_map(|(_, partition)| {
+                    let journal = &partition.log.journal().inner;
+                    journal
+                        .repair_headers_in(1..=partition.consensus().commit_min())
+                        .into_iter()
+                        .find_map(|(op, header)| {
+                            if header.operation != Operation::RetireConsumerGroupOwners {
+                                return None;
+                            }
+                            let entry = journal.repair_entry(op)?;
+                            let catalog = RetireConsumerGroupOwnersRequest::decode_from(
+                                &entry.as_slice()
+                                    [size_of::<iggy_binary_protocol::PrepareHeader>()..],
+                            )
+                            .expect("committed retirement catalog decodes");
+                            catalog.retires(group_id).then_some(op)
+                        })
+                })
+                .min()
+            else {
+                continue;
+            };
+            for &(replica, partition) in &hosts {
+                let committed = partition.consensus().commit_min();
+                if committed < retired_at {
+                    continue;
+                }
+                let retired = partition.consumer_group_retired(group_id);
+                let owner = partition.consumer_group_owner(group_id);
+                let offset = partition
+                    .retained_consumer_offsets(ConsumerKind::ConsumerGroup)
+                    .into_iter()
+                    .find(|&(consumer, _)| u64::from(consumer) == group_id);
+                assert!(
+                    retired && owner.is_none() && offset.is_none(),
+                    "replica {replica} committed ns {namespace:?} through op {committed}, at or \
+                     past op {retired_at} of a replica that retired consumer group {group_id}, \
+                     but has retired={retired} owner={owner:?} offset={offset:?} (seed={seed:#x})",
+                );
+                compared += 1;
+            }
+        }
+    }
+    compared
+}
+
 fn assert_partition_offsets_agree(
     sim: &Simulator,
     workload: &Workload,
@@ -994,12 +1122,25 @@ fn shadow_metadata(shadow: &Shadow) -> CommittedMetadata {
 mod tests {
     use super::*;
     use crate::packet::PacketSimulatorOptions;
+    use crate::tests::commit_sends_everywhere;
+    use crate::workload::actions::Action;
     use crate::workload::effect::Effect;
-    use crate::workload::options::WorkloadOptions;
+    use crate::workload::options::{ActionWeights, WorkloadOptions};
+    use crate::workload::{create_fixture_groups, run_group_lifecycle};
+    use iggy_binary_protocol::batch::{BATCH_HEADER_SIZE, BATCH_MESSAGE_HEADER_SIZE};
+    use iggy_binary_protocol::{HEADER_SIZE, Operation};
+    use journal::Journal;
+    use server_common::iobuf::Owned;
 
     const SEED: u64 = 0x000F_F5E7;
+    const CLIENT: u128 = 1;
     const CONSUMER: u32 = 7;
     const OFFSET: u64 = 9;
+    /// Batches the data fixture commits, one message each.
+    const SENDS: usize = 3;
+    /// First payload byte of a `SendMessages` prepare: past the prepare header,
+    /// the batch header and the frame header of its first message.
+    const FIRST_PAYLOAD_BYTE: usize = HEADER_SIZE + BATCH_HEADER_SIZE + BATCH_MESSAGE_HEADER_SIZE;
 
     fn namespace() -> IggyNamespace {
         IggyNamespace::new(1, 1, 0)
@@ -1013,7 +1154,7 @@ mod tests {
         });
         let mut sim = Simulator::new(
             3,
-            std::iter::once(1),
+            std::iter::once(CLIENT),
             PacketSimulatorOptions {
                 node_count: 3,
                 client_count: 1,
@@ -1067,5 +1208,346 @@ mod tests {
             value: OFFSET,
         });
         assert_partition_offsets_agree(&sim, &workload, &[0, 1, 2], SEED);
+    }
+
+    /// [`offset_fixture`] with [`SENDS`] batches committed on every replica.
+    fn data_fixture() -> (Simulator, Workload) {
+        let (mut sim, workload) = offset_fixture();
+        let client = SimClient::new(CLIENT);
+        sim.register_client_with_primary(&client);
+        commit_sends_everywhere(&mut sim, &client, namespace(), SENDS);
+        (sim, workload)
+    }
+
+    /// The partition primary and its two backups.
+    fn replica_roles(sim: &Simulator) -> (u8, u8, u8) {
+        let primary = sim
+            .primary_index(namespace())
+            .expect("the group has a primary");
+        let mut backups = (0..sim.replica_count).filter(|&replica| replica != primary);
+        match (backups.next(), backups.next()) {
+            (Some(first), Some(second)) => (primary, first, second),
+            _ => panic!("a three-replica group has two backups"),
+        }
+    }
+
+    /// The test-only fault: flip one payload byte of the newest committed batch
+    /// `replica` holds. Its header, the partition offsets and every journal index
+    /// stay as they were, so only the applied data differs.
+    fn flip_applied_payload_byte(sim: &Simulator, replica: u8) {
+        let partition = sim.replicas[usize::from(replica)]
+            .partition_shard(namespace())
+            .plane
+            .partitions()
+            .get_by_ns(&namespace())
+            .expect("the replica hosts the partition");
+        let journal = &partition.log.journal().inner;
+        let (op, _) = journal
+            .repair_headers_in(1..=partition.consensus().commit_min())
+            .into_iter()
+            .rev()
+            .find(|(_, header)| header.operation == Operation::SendMessages)
+            .expect("the replica holds a committed batch");
+        let mut entry = journal
+            .repair_entry(op)
+            .expect("a retained header has its entry")
+            .as_slice()
+            .to_vec();
+        entry[FIRST_PAYLOAD_BYTE] ^= u8::MAX;
+        assert_eq!(
+            futures::executor::block_on(journal.remove_range(op..=op))
+                .expect("the in-memory journal removes the entry"),
+            1,
+            "the flipped batch must replace a resident entry, not shadow a retained one"
+        );
+        futures::executor::block_on(journal.append(Owned::copy_from_slice(&entry).into()))
+            .expect("the in-memory journal appends the entry");
+    }
+
+    #[test]
+    fn given_equal_applied_data_when_converged_should_compare_every_committed_record() {
+        let (sim, mut workload) = data_fixture();
+
+        let report = assert_converged(&sim, &mut workload);
+
+        assert_eq!(report.data_namespaces_compared, 1);
+        assert_eq!(report.data_records_compared, SENDS);
+    }
+
+    /// The negative control. Every prepare identity and offset still agrees, so
+    /// no check but the applied data comparison can fail the run.
+    #[test]
+    #[should_panic(expected = "different applied message data")]
+    fn given_a_flipped_payload_byte_on_a_backup_when_converged_should_fail_the_run() {
+        let (sim, mut workload) = data_fixture();
+        let (primary, backup, _) = replica_roles(&sim);
+        flip_applied_payload_byte(&sim, backup);
+        assert_eq!(
+            sim.offsets(usize::from(backup), namespace()),
+            sim.offsets(usize::from(primary), namespace()),
+            "the fault must leave the partition offsets agreeing"
+        );
+        assert_partition_offsets_agree(&sim, &workload, &[0, 1, 2], SEED);
+        assert!(
+            state_checker::assert_partition_prefixes_agree(&sim, &[namespace()], SEED) > 0,
+            "the fault must leave the prepare identities agreeing"
+        );
+
+        let _ = assert_converged(&sim, &mut workload);
+    }
+
+    /// A backup restarted from its retained log is compared on the batches it
+    /// rebuilt. The other backup is down at the check, so every comparison
+    /// involves the rebuilt one.
+    #[test]
+    fn given_a_rebuilt_backup_when_quiesced_should_compare_its_applied_data() {
+        let (mut sim, _) = data_fixture();
+        let (_, rebuilt, other) = replica_roles(&sim);
+        sim.replica_crash(rebuilt);
+        sim.replica_restart(rebuilt);
+        sim.replica_crash(other);
+
+        let report = state_checker::assert_applied_data_agrees(&sim, &[namespace()], SEED);
+
+        assert_eq!(
+            report,
+            state_checker::AppliedDataReport {
+                namespaces: 1,
+                records: SENDS,
+            }
+        );
+    }
+
+    /// A shell cluster hosting [`namespace`] with one logged-in client, and a
+    /// workload drawing `weights`.
+    fn shell_fixture(weights: ActionWeights) -> (Simulator, Workload, [SimClient; 1]) {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+        let mut sim = Simulator::with_shards_shell(
+            3,
+            1,
+            std::iter::once(CLIENT),
+            PacketSimulatorOptions {
+                node_count: 3,
+                client_count: 1,
+                seed: SEED,
+                ..Default::default()
+            },
+        );
+        sim.init_partition(namespace());
+        sim.seed_stream_topic_partition(namespace());
+        let clients = [SimClient::new(CLIENT)];
+        sim.shell_login(&clients[0]);
+        let mut options = WorkloadOptions::new(SEED, 3, vec![namespace()]);
+        options.weights = weights;
+        (sim, Workload::new(options), clients)
+    }
+
+    /// A poll answered while the drain runs is checked on arrival there, not
+    /// passed at quiesce, by when every offset it served has long committed.
+    #[test]
+    fn given_a_poll_answered_during_the_drain_when_drained_should_check_it_on_arrival() {
+        const SEND_TICKS: u64 = 500;
+        const DRAIN_TICKS: u64 = 20_000;
+        let (mut sim, mut workload, clients) =
+            shell_fixture(ActionWeights::new(&[(Action::SendMessages, 100)]));
+        let mut invariants = Invariants::new();
+        crate::workload::run(
+            &mut sim,
+            &mut workload,
+            &clients,
+            SEND_TICKS,
+            u64::MAX,
+            &mut invariants,
+        );
+        assert!(drive_to_quiesce(
+            &mut sim,
+            &mut workload,
+            &clients,
+            DRAIN_TICKS,
+            &mut invariants
+        ));
+        workload.options.weights = ActionWeights::new(&[(Action::PollMessages, 100)]);
+        sim.discover_partition_contexts(&clients[0]);
+        let (target, poll) = workload
+            .build_request(&clients[0])
+            .expect("an idle client polls");
+        sim.submit_request(clients[0].client_id(), target, poll.into_generic());
+
+        assert!(drive_to_quiesce(
+            &mut sim,
+            &mut workload,
+            &clients,
+            DRAIN_TICKS,
+            &mut invariants
+        ));
+
+        workload.readback.assert_served_committed(&sim, SEED);
+        assert_eq!(
+            workload.readback.stats().messages_unverifiable_at_quiesce,
+            0
+        );
+        let (_, backup, _) = replica_roles(&sim);
+        let journal = &sim.replicas[usize::from(backup)]
+            .partition_shard(namespace())
+            .plane
+            .partitions()
+            .get_by_ns(&namespace())
+            .unwrap()
+            .log
+            .journal()
+            .inner;
+        let sends: Vec<_> = journal
+            .repair_headers_in(1..=u64::MAX)
+            .into_iter()
+            .filter_map(|(op, header)| (header.operation == Operation::SendMessages).then_some(op))
+            .collect();
+        assert_ne!(sends, [] as [u64; 0]);
+        for op in sends {
+            futures::executor::block_on(journal.remove_range(op..=op)).unwrap();
+        }
+        workload.readback.assert_served_committed(&sim, SEED);
+        assert!(
+            workload.readback.stats().messages_unverifiable_at_quiesce > 0,
+            "a missing retained journal body must not count as a full comparison"
+        );
+
+        let polls = workload.readback.stats();
+        assert_eq!(polls.polls_served, 1, "the poll must serve a message");
+        assert_eq!(
+            polls.polls_compared + polls.polls_deferred,
+            polls.polls_served,
+            "the drain must check the served poll on arrival"
+        );
+    }
+
+    /// A shell cluster in which the scripted group lifecycle retired its groups on
+    /// every replica of [`namespace`].
+    fn retirement_fixture() -> (Simulator, Workload) {
+        let (mut sim, mut workload, clients) = shell_fixture(ActionWeights::lifecycle());
+        create_fixture_groups(&mut sim, &mut workload, &clients[0]);
+        assert_eq!(
+            run_group_lifecycle(&mut sim, &mut workload, &clients, &mut Invariants::new()),
+            Some(true),
+            "the scripted group lifecycle must complete"
+        );
+        (sim, workload)
+    }
+
+    fn retired_owners_removed(sim: &Simulator, workload: &Workload) -> usize {
+        let leader = sim
+            .metadata_leader()
+            .expect("the metadata group has a primary");
+        assert_retired_owners_removed(sim, workload, usize::from(leader), &[0, 1, 2], SEED)
+    }
+
+    #[test]
+    fn given_retired_groups_when_each_replica_restarts_should_keep_owners_removed() {
+        let (mut sim, workload) = retirement_fixture();
+        for replica in 0..sim.replica_count {
+            sim.replica_crash(replica);
+            sim.replica_restart(replica);
+            assert!((0..5_000).any(|_| {
+                sim.step();
+                sim.metadata_leader().is_some()
+            }));
+            assert_eq!(
+                retired_owners_removed(&sim, &workload),
+                crate::workload::LIFECYCLE_GROUP_ROUNDS * usize::from(sim.replica_count),
+                "replica {replica} must reopen with its committed retirement"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "of a replica that retired consumer group")]
+    fn given_backup_at_retirement_op_below_peer_head_when_retirement_is_lost_should_fail() {
+        let (sim, workload) = retirement_fixture();
+        let (_, backup, _) = replica_roles(&sim);
+        let partition = sim.replicas[0]
+            .partition_shard(namespace())
+            .plane
+            .partitions()
+            .get_by_ns(&namespace())
+            .unwrap();
+        let retirement_op = partition
+            .log
+            .journal()
+            .inner
+            .repair_headers_in(1..=partition.consensus().commit_min())
+            .into_iter()
+            .find(|(_, header)| header.operation == Operation::RetireConsumerGroupOwners)
+            .map(|(op, _)| op)
+            .expect("fixture must commit retirement");
+        for replica in &sim.replicas {
+            let partition = replica
+                .partition_shard(namespace())
+                .plane
+                .partitions()
+                .get_by_ns(&namespace())
+                .unwrap();
+            let later = partition.consensus().commit_min() + 1;
+            partition.consensus().advance_commit_max(later);
+            partition.consensus().advance_commit_min(later);
+        }
+        let replica = &sim.replicas[usize::from(backup)];
+        let partitions = replica.partition_shard(namespace()).plane.partitions();
+        partitions.remove(&namespace());
+        assert!(crate::materialise_partition(
+            replica,
+            namespace(),
+            sim.consumer_offsets_max
+        ));
+        partitions
+            .get_by_ns(&namespace())
+            .unwrap()
+            .consensus()
+            .restore_commit_state(retirement_op, retirement_op);
+        retired_owners_removed(&sim, &workload);
+    }
+
+    #[test]
+    fn given_groups_retired_everywhere_when_quiesced_should_compare_every_replica() {
+        let (sim, workload) = retirement_fixture();
+
+        assert_eq!(
+            retired_owners_removed(&sim, &workload),
+            crate::workload::LIFECYCLE_GROUP_ROUNDS * usize::from(sim.replica_count)
+        );
+    }
+
+    /// The negative control: a backup whose commit point covers the retirements
+    /// while its partition state holds none, as a recovery that restored the
+    /// commit point but lost the retirement would leave it.
+    #[test]
+    #[should_panic(expected = "of a replica that retired consumer group")]
+    fn given_a_backup_past_the_retirement_without_it_when_quiesced_should_fail_the_oracle() {
+        let (sim, workload) = retirement_fixture();
+        // Not replica 0, whose view `primary_index` reads.
+        let (_, first, second) = replica_roles(&sim);
+        let backup = if first == 0 { second } else { first };
+        let committed = (0..sim.replica_count)
+            .filter_map(|replica| sim.partition_consensus_state(usize::from(replica), namespace()))
+            .map(|state| state.commit_min)
+            .max()
+            .expect("the group has replicas");
+        let replica = &sim.replicas[usize::from(backup)];
+        let partitions = replica.partition_shard(namespace()).plane.partitions();
+        partitions.remove(&namespace());
+        assert!(crate::materialise_partition(
+            replica,
+            namespace(),
+            sim.consumer_offsets_max
+        ));
+        partitions
+            .get_by_ns(&namespace())
+            .expect("the backup hosts the rebuilt partition")
+            .consensus()
+            .restore_commit_state(committed, committed);
+
+        let _ = retired_owners_removed(&sim, &workload);
     }
 }

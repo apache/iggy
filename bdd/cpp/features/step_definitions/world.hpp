@@ -20,6 +20,8 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdlib>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -47,6 +49,7 @@ struct GlobalContext {
     PolledData polled;
     std::vector<std::uint8_t> raw_response;
     std::string raw_error;
+    std::string call_error;
 
     GlobalContext()                                 = default;
     GlobalContext(const GlobalContext &)            = delete;
@@ -62,6 +65,14 @@ struct GlobalContext {
         }
     }
 };
+
+inline std::string required_env(const char *name) {
+    const char *value = std::getenv(name);
+    if (value == nullptr || *value == '\0') {
+        throw std::runtime_error(std::string(name) + " must be set; run the suite via scripts/run-bdd-tests.sh");
+    }
+    return std::string(value);
+}
 
 inline iggy::ffi::Identifier make_string_identifier(const std::string &value) {
     iggy::ffi::Identifier identifier;

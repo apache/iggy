@@ -20,10 +20,14 @@ use crate::deps::SimSuperblock;
 use crate::deps::{MemStorage, SimJournal, SimMuxStateMachine, SimSnapshot};
 use configs::server::PersonalAccessTokenConfig;
 use configs::server::ServerConfig;
-use consensus::{ClientTable, ConsensusClock, LocalPipeline, Sequencer, VsrConsensus, VsrState};
+use consensus::{
+    ClientTable, ConsensusClock, HistoryRecovery, LocalPipeline, Sequencer, VsrConsensus, VsrState,
+};
+use futures::FutureExt;
 use iggy_common::IggyByteSize;
 use iggy_common::variadic;
 use journal::Journal;
+use message_bus::MessageBus;
 use metadata::impls::metadata::IggySnapshot;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::mux::WithFactory;
@@ -153,12 +157,17 @@ pub fn new_shard(
     reader_bundle: Option<SimMetadataBundle>,
     superblock: Option<Rc<SimSuperblock>>,
     metadata_journal: Option<Rc<SimJournal<MemStorage>>>,
-    recovered_state: Option<VsrState>,
+    recovered_state: Option<&VsrState>,
     incarnation: u128,
     data_dir: Option<std::path::PathBuf>,
+    system_path: &std::path::Path,
     seed_namespaces: &[(server_common::sharding::IggyNamespace, u32)],
     applied_frontier: Arc<AppliedFrontier>,
-) -> (Rc<Replica>, Option<SimMetadataBundle>) {
+) -> (
+    Rc<Replica>,
+    Option<SimMetadataBundle>,
+    Vec<shard::Sender<()>>,
+) {
     // Metadata is single-writer, mirroring the server bootstrap. Shard 0 owns
     // the only writable STM; every peer shard rebuilds a reader-mode mirror from
     // shard 0's factory bundle and sees committed metadata through the shared
@@ -175,6 +184,35 @@ pub fn new_shard(
     // consensus op/commit restore, so a restart recovers committed metadata from its
     // own disk instead of an empty state.
     let solo = replica_count == 1;
+    // Before anything reads the WAL, as production's `metadata::recover` does.
+    let history = HistoryRecovery::new(recovered_state, solo, |op| {
+        let slot = usize::try_from(op).ok()?;
+        metadata_journal
+            .as_ref()
+            .and_then(|journal| journal.header(slot))
+            .map(|header| header.checksum)
+    });
+    let history = recovered_state
+        .and_then(|state| state.adopted_view.as_ref())
+        .zip(metadata_journal.as_ref())
+        .map_or(history, |(adopted, journal)| {
+            history.retain_adopted_suffix(adopted, journal.iter_headers_from(0))
+        });
+    if let (
+        Some(journal),
+        HistoryRecovery::Certified {
+            truncate_from: Some(from),
+            ..
+        },
+    ) = (metadata_journal.as_ref(), history)
+        && journal.last_op().is_some_and(|last| last >= from)
+    {
+        journal
+            .truncate_from(from)
+            .now_or_never()
+            .expect("the in-memory journal never suspends")
+            .expect("the in-memory journal removes any 1-based range");
+    }
     // Read before the state machine is built: it REPLACES the seeded default rather
     // than layering onto it, so without it a checkpointed replica recovers an empty
     // baseline and loses every op the drain reclaimed.
@@ -255,8 +293,8 @@ pub fn new_shard(
             .and_then(|journal| journal.last_header());
         if let Some(state) = recovered_state {
             consensus.set_view(state.view);
-            consensus.set_log_view(state.log_view);
-            consensus.mark_superblock_durable(state.view, state.log_view);
+            consensus.set_log_view(history.log_view());
+            consensus.mark_superblock_durable(state.view, history.log_view());
         } else if let Some(header) = last_header {
             // No superblock: a fresh node, one that never changed view, or the
             // first boot after an upgrade. Production infers the view from the
@@ -295,6 +333,14 @@ pub fn new_shard(
                 consensus.set_recovery_barrier(head);
             }
         }
+        consensus.restore_history(
+            history,
+            last_header.map_or((checkpoint_seq, 0), |header| (header.op, header.checksum)),
+            recovered_state,
+        );
+        consensus
+            .restore_adopted_view(recovered_state.and_then(|state| state.adopted_view.as_ref()));
+        consensus.resume_adopted_view();
         consensus
     });
     let metadata_snapshot = (shard_idx == 0).then(SimSnapshot::default);
@@ -411,22 +457,18 @@ pub fn new_shard(
         SimSnapshot,
         SimSuperblock,
     > = Rc::new(RefCell::new(None));
-    // TODO: Model automatic consumer liveness in shell-mode simulations:
-    // - Retain the host's sessions and consumer_group_liveness handles. Run heartbeat
-    //   verification on every shard and consumer_group::liveness::run on shard 0 of
-    //   every replica for session heartbeat reporting and expiry. Support simulated
-    //   shard/bus types.
-    // - Drive client heartbeats, task timers, and connection/lease timestamps
-    //   with virtual time instead of compio timers and Instant::now().
-    // - Stop these tasks on replica shutdown/crash and recreate them on restart.
-    // - Test missed heartbeats and failed disconnect Logout by advancing virtual
-    //   time, without calling expiry cleanup directly. Verify partition reassignment,
-    //   saved offsets, and preservation of live or reconnected consumers.
-    let host: Rc<dyn ShardHost> = Rc::new(ServerHost::new(
+    let config = Arc::new(ServerConfig {
+        path: system_path.to_string_lossy().into_owned(),
+        ..ServerConfig::default()
+    });
+    let host = ServerHost::new(
         &SharedSimOutbox(Rc::clone(bus)),
         &shard_handle,
-        Arc::new(ServerConfig::default()),
-    ));
+        Arc::clone(&config),
+    );
+    let sessions = Rc::clone(host.sessions());
+    let liveness = Rc::clone(host.consumer_group_liveness());
+    let host: Rc<dyn ShardHost> = Rc::new(host);
 
     let shard = Rc::new(
         shard::IggyShard::new(
@@ -455,5 +497,30 @@ pub fn new_shard(
 
     // The host needs the finished shard for internal completion submissions.
     *shard_handle.borrow_mut() = Some(Rc::downgrade(&shard));
-    (shard, metadata_bundle)
+    let mut stop_txs = Vec::new();
+    if shell {
+        let (stop_tx, stop_rx) = shard::channel(1);
+        bus.spawn(server::run_heartbeat_verifier(
+            Rc::clone(&shard),
+            sessions,
+            config.heartbeat.interval.get_duration(),
+            config.heartbeat.session_timeout(),
+            stop_rx,
+        ));
+        stop_txs.push(stop_tx);
+        if shard_idx == 0 {
+            let (stop_tx, stop_rx) = shard::channel(1);
+            bus.spawn(server::run_consumer_group_liveness(
+                Rc::clone(&shard),
+                liveness,
+                stop_rx,
+                message_bus::lifecycle::Shutdown::new().1,
+                config.consumer_group.heartbeat_interval.get_duration(),
+                config.heartbeat.session_timeout(),
+                config.get_system_path(),
+            ));
+            stop_txs.push(stop_tx);
+        }
+    }
+    (shard, metadata_bundle, stop_txs)
 }

@@ -46,8 +46,10 @@ public static class IggyClientFactory
     ///     supported.
     /// </exception>
     /// <exception cref="ArgumentOutOfRangeException">
-    ///     Thrown when <see cref="IggyClientConfigurator.MaxResponseFrameSize" /> is below the 256-byte header or a
-    ///     configured socket buffer size is not positive.
+    ///     Thrown when <see cref="IggyClientConfigurator.MaxResponseFrameSize" /> is below the 256-byte header, a
+    ///     configured socket buffer size is not positive, or, over <see cref="Protocol.Tcp" />,
+    ///     <see cref="IggyClientConfigurator.MaxPendingOperations" /> or
+    ///     <see cref="IggyClientConfigurator.MaxPendingOperationBytes" /> is not positive.
     /// </exception>
     public static IIggyClient CreateClient(IggyClientConfigurator options)
     {
@@ -80,6 +82,11 @@ public static class IggyClientFactory
         {
             throw new ArgumentOutOfRangeException(nameof(options), options.MaxResponseFrameSize,
                 $"MaxResponseFrameSize must be at least {VsrHeader.HEADER_SIZE} bytes.");
+        }
+
+        if (options.Protocol == Protocol.Tcp)
+        {
+            MutationLanes.ValidateLimits(options);
         }
 
         if (options.ReceiveBufferSize is <= 0)

@@ -46,6 +46,7 @@ pub mod delete_topic;
 pub mod delete_user;
 pub mod join_fixture_group;
 pub mod leave_fixture_group;
+pub mod poll_messages;
 pub mod replace_fixture_topic;
 pub mod send_messages;
 pub mod store_consumer_offset;
@@ -215,4 +216,5 @@ op_dispatch! {
     JoinFixtureGroup          => join_fixture_group,
     LeaveFixtureGroup         => leave_fixture_group,
     StoreStaleOwnerOffset      => store_stale_owner_offset,
+    PollMessages              => poll_messages,
 }

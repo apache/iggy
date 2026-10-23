@@ -161,12 +161,21 @@ public class UsersTcpClient implements UsersClient {
         return routingHook.loginOnLeader(deadline -> loginWithoutRedirect(username, password, deadline));
     }
 
-    private CompletableFuture<IdentityInfo> loginWithoutRedirect(String username, String password, long deadline) {
+    CompletableFuture<IdentityInfo> loginWithoutRedirect(String username, String password, long deadline) {
         // The VSR codec re-frames this into a Register and carries the SDK
         // version itself, so the payload is only the two credentials.
-        var payload = Unpooled.buffer();
-        payload.writeBytes(toBytes(username, "username", MIN_USERNAME_LENGTH, MAX_USERNAME_LENGTH));
-        payload.writeBytes(toBytes(password, "password", MIN_PASSWORD_LENGTH, MAX_PASSWORD_LENGTH));
+        var payload = toBytes(username, "username", MIN_USERNAME_LENGTH, MAX_USERNAME_LENGTH);
+        try {
+            var encodedPassword = toBytes(password, "password", MIN_PASSWORD_LENGTH, MAX_PASSWORD_LENGTH);
+            try {
+                payload.writeBytes(encodedPassword);
+            } finally {
+                encodedPassword.release();
+            }
+        } catch (RuntimeException invalidCredentials) {
+            payload.release();
+            throw invalidCredentials;
+        }
 
         log.debug("Logging in user: {}", username);
 
@@ -183,13 +192,14 @@ public class UsersTcpClient implements UsersClient {
 
     @Override
     public CompletableFuture<Void> logout() {
+        Runnable forgetLogin = routingHook.logoutCompletion();
         var payload = Unpooled.buffer(0); // Empty payload for logout
 
         log.debug("Logging out");
 
         return AsyncTcpConnection.mapResponse(connection().send(CommandCode.User.LOGOUT, payload), response -> {
             response.release();
-            routingHook.forgetLogin();
+            forgetLogin.run();
             log.debug("Logged out successfully");
             return null;
         });

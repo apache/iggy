@@ -36,14 +36,18 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/apache/iggy/foreign/go/client"
 	"github.com/apache/iggy/foreign/go/client/tcp"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	"github.com/apache/iggy/foreign/go/internal/command"
 	"github.com/stretchr/testify/require"
 )
 
@@ -176,6 +180,45 @@ func waitForGroupAssignment(
 		}
 		time.Sleep(groupAssignmentPollInterval)
 	}
+}
+
+// requireSplitPrimaries fails unless the primary of partition 0 of the topic
+// is another node than the metadata primary that the roster names. It returns
+// the address of that partition primary.
+func requireSplitPrimaries(
+	t *testing.T,
+	ctx context.Context,
+	connected iggcon.Client,
+	streamId, topicId iggcon.Identifier,
+) string {
+	t.Helper()
+
+	stream, err := streamId.MarshalBinary()
+	require.NoError(t, err)
+	topic, err := topicId.MarshalBinary()
+	require.NoError(t, err)
+	payload := binary.LittleEndian.AppendUint32(append(stream, topic...), 0)
+	body, err := connected.SendBinaryRequest(ctx, uint32(command.GetPartitionRouteCode), payload)
+	require.NoError(t, err)
+	var route iggcon.PartitionRoute
+	require.NoError(t, route.UnmarshalBinary(body))
+	metadata, err := connected.GetClusterMetadata(ctx)
+	require.NoError(t, err)
+	var primary, metadataPrimary *iggcon.ClusterNode
+	for index := range metadata.Nodes {
+		node := &metadata.Nodes[index]
+		if node.ReplicaID == route.PrimaryReplica {
+			primary = node
+		}
+		if node.Role == iggcon.RoleLeader {
+			metadataPrimary = node
+		}
+	}
+	require.NotNil(t, primary, "route primary must be a configured replica")
+	require.NotNil(t, metadataPrimary, "the roster must name a metadata primary")
+	require.NotEqual(t, metadataPrimary.ReplicaID, primary.ReplicaID,
+		"the fixture must separate metadata and partition primaries")
+	return net.JoinHostPort(strings.Trim(primary.IP, "[]"), strconv.Itoa(int(primary.Endpoints.Tcp)))
 }
 
 // testMessages builds count messages with predictable payloads.
