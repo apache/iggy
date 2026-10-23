@@ -96,6 +96,7 @@ public enum IggyErrorCode: UInt32, Sendable, Hashable, CaseIterable, Codable {
     case historyUnavailable = 87
     case lifecycleBusy = 88
     case notPrimary = 89
+    case deferredPollCapacityExceeded = 90
     case clientNotFound = 100
     case invalidClientId = 101
     case connectionClosed = 206
@@ -361,6 +362,7 @@ extension IggyErrorCode {
         case .historyUnavailable: "history_unavailable"
         case .lifecycleBusy: "lifecycle_busy"
         case .notPrimary: "not_primary"
+        case .deferredPollCapacityExceeded: "deferred_poll_capacity_exceeded"
         case .clientNotFound: "client_not_found"
         case .invalidClientId: "invalid_client_id"
         case .connectionClosed: "connection_closed"

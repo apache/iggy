@@ -759,7 +759,6 @@ final class IggySdkTest extends TestCase
                 micros(1),
                 null,
                 null,
-                null,
                 false,
             );
             $received = [];
