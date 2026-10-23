@@ -260,14 +260,14 @@ struct ProducerTests {
     }
 
     /// A send that found the connection closed before writing is replayed by
-    /// the client after the reconnect. When that replay is written and lost,
-    /// the client reports `disconnected`, and the producer must not send it
-    /// again: the server does not deduplicate a new request id.
-    @Test func aLostReplayIsNotSentAgain() async throws {
+    /// the client after the reconnect. When the replay is written and lost,
+    /// its outcome is unknown, so the producer must not send it again: the
+    /// server deduplicates only the client's own replays, which keep the
+    /// request id, never a retry under a new one.
+    @Test func aLostWriteIsNeverSentUnderANewRequestID() async throws {
         let server = try await FakeVSRServer.started()
         defer { Task { await server.stop() } }
         let routeReads = Locked(0)
-        let sendAttempts = Locked(0)
         await server.respond { request in
             switch request.code.flatMap(CommandCode.init(rawValue:)) {
             case .getPartitionRoute:
@@ -280,25 +280,24 @@ struct ProducerTests {
                     ? .okThenClose(FakeVSRServer.partitionRouteBody(FakeVSRServer.routeContext))
                     : FakeVSRServer.defaultReply(request, address: server.address)
             case .sendMessages:
-                let first = sendAttempts.withLock {
-                    $0 += 1; return $0 == 1
-                }
-                return first ? .close : .ok([])
+                return .close
             default:
                 return FakeVSRServer.defaultReply(request, address: server.address)
             }
         }
-        let client = try await signedInClient(server)
+        let client = try await signedInClient(server, requestTimeout: .milliseconds(500))
         let configuration = ProducerConfiguration(partitioning: .partition(1), sendRetries: 3, sendRetryInterval: nil)
         let producer = try client.producer(streamID: 1, topicID: 2, configuration: configuration)
         do {
             try await producer.send(["once"])
             Issue.record("the send did not fail")
         } catch let error as ProducerSendError {
-            #expect(error.cause.code == .disconnected)
+            #expect(ProducerCore.stopsSendRetries(error.cause))
             #expect(error.failed.map(\.payloadString) == ["once"])
         }
-        #expect(await sends(server).count == 1)
+        let writes = await sends(server)
+        #expect(!writes.isEmpty)
+        #expect(Set(writes.map { "\($0.session)/\($0.requestID)" }).count == 1)
         await client.shutdown()
     }
 

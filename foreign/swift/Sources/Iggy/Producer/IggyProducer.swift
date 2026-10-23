@@ -393,7 +393,7 @@ actor ProducerCore: ProducerCoreBackend {
         while await !canSend {
             try Task.checkCancellation()
             do {
-                try await client.requireAuthenticated()
+                _ = try await client.requireAuthenticated()
                 await openGate()
                 return
             } catch let error as IggyError where error.code == .clientShutdown {
