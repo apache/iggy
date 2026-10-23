@@ -1415,7 +1415,7 @@ extension ByteReader {
 
     /// `[count:u32][id:u32]*`, refusing ids that are not strictly ascending.
     mutating func readPartitionIDs() throws -> [UInt32] {
-        let count = Int(try readUInt32())
+        let count = try readCount()
         var ids: [UInt32] = []
         ids.reserveCapacity(min(count, remaining / 4))
         for _ in 0..<count {
@@ -1426,6 +1426,16 @@ extension ByteReader {
             ids.append(id)
         }
         return ids
+    }
+
+    /// `[count:u32]`, refusing a count a 32-bit `Int` cannot hold instead of trapping.
+    mutating func readCount() throws -> Int {
+        let offset = position
+        let declared = try readUInt32()
+        guard let count = Int(exactly: declared) else {
+            throw WireError.validation("count \(declared) at offset \(offset) does not fit the platform Int")
+        }
+        return count
     }
 
     mutating func readReason<Reason: RawRepresentable>(_: Reason.Type) throws -> Reason where Reason.RawValue == UInt8 {

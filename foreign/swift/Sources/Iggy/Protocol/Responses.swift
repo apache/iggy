@@ -448,13 +448,13 @@ enum Responses {
                 next = try MetadataChangeCursor.decode(from: &reader)
             }
             let hasMore = try reader.readFlag()
-            let recordsCount = Int(try reader.readUInt32())
+            let recordsCount = try reader.readCount()
             var records: [MetadataChangeRecord] = []
             records.reserveCapacity(min(recordsCount, reader.remaining / metadataChangeRecordMinimumSize))
             for _ in 0..<recordsCount {
                 records.append(try metadataChangeRecord(from: &reader))
             }
-            let itemsCount = Int(try reader.readUInt32())
+            let itemsCount = try reader.readCount()
             var items: [MetadataCurrentItem] = []
             items.reserveCapacity(min(itemsCount, reader.remaining / metadataItemMinimumSize))
             for _ in 0..<itemsCount {

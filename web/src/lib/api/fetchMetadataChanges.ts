@@ -15,11 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { goto } from '$app/navigation';
-import { resolve } from '$app/paths';
 import { PUBLIC_IGGY_API_URL } from '$app/env/public';
 import { authStore } from '#lib/auth/authStore.svelte.js';
-import { typedRoute } from '#lib/types/appRoutes.js';
 import { getJson } from './getJson';
 import type { MetadataChangesPage } from './metadataChanges';
 
@@ -44,19 +41,19 @@ export async function fetchMetadataChanges(
   }
   const url = `${PUBLIC_IGGY_API_URL || ''}/metadata/changes?${new URLSearchParams(Object.entries(query))}`;
   let response: Response;
+  let data: { reason?: string } | null;
   try {
     response = await fetch(url, { headers, signal });
+    data = (await getJson(response)) as { reason?: string } | null;
   } catch {
     return { kind: 'failed', reason: 'The server did not answer' };
   }
-  const data = (await getJson(response)) as { reason?: string } | null;
   if (response.ok) {
     return { kind: 'page', page: data as MetadataChangesPage };
   }
   switch (response.status) {
     case 401:
       authStore.logout();
-      await goto(resolve(typedRoute('auth/sign-in')));
       return { kind: 'failed', reason: 'The session ended' };
     case 403:
       return { kind: 'forbidden' };

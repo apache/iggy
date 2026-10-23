@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::change_log::store::{ChangeEntry, ChangeLog, Ring};
+use iggy_binary_protocol::WireEncode;
 use iggy_binary_protocol::primitives::metadata_changes::{
     WireMetadataChangeCursor, WireMetadataChangePhase, WireMetadataChangeStatus,
 };
@@ -29,6 +30,9 @@ use iggy_common::{
 
 /// Entries one change page examines at most, returned or skipped.
 pub const MAX_SCANNED_ENTRIES: usize = 65_536;
+
+/// Encoded record or item bytes one page carries at most, unless its first alone is larger.
+pub const MAX_PAGE_BYTES: usize = 1024 * 1024;
 
 const CLASSES: [MetadataChangeClass; 2] =
     [MetadataChangeClass::Resource, MetadataChangeClass::Activity];
@@ -269,19 +273,26 @@ impl<'a> LogView<'a> {
             has_more: false,
         };
         let mut examined = 0;
+        let mut bytes = 0;
         while let Some((head, entry)) = next_entry(&heads) {
-            if examined == MAX_SCANNED_ENTRIES || page.records.len() == limit {
+            let record = self
+                .groups
+                .contains(MetadataChangeGroup::from(entry.group()))
+                .then(|| WireMetadataChangeRecord::from(entry));
+            let size = record.as_ref().map_or(0, WireEncode::encoded_size);
+            if examined == MAX_SCANNED_ENTRIES
+                || page.records.len() == limit
+                || (!page.records.is_empty() && bytes + size > MAX_PAGE_BYTES)
+            {
                 page.has_more = true;
                 break;
             }
             examined += 1;
             heads[head].1 += 1;
             page.last_examined = Some(entry);
-            if self
-                .groups
-                .contains(MetadataChangeGroup::from(entry.group()))
-            {
-                page.records.push(WireMetadataChangeRecord::from(entry));
+            if let Some(record) = record {
+                bytes += size;
+                page.records.push(record);
             }
         }
         page
@@ -497,6 +508,32 @@ mod tests {
     }
 
     #[test]
+    fn given_records_past_the_byte_budget_when_paging_should_stop_before_the_overflow() {
+        let log = MetadataChangeLog::new(ChangeLogCapacities::default());
+        append_body(&log, 1, Bytes::from(vec![0; MAX_PAGE_BYTES]));
+        append_body(&log, 2, Bytes::from(vec![0; MAX_PAGE_BYTES / 2]));
+        append_body(&log, 3, Bytes::from(vec![0; MAX_PAGE_BYTES / 2]));
+
+        let mut pages = Vec::new();
+        let mut start = MetadataChangeStart::Earliest;
+        loop {
+            let answer = page(&log, 3, start, &[], 10);
+            let next = answer.next.expect("ok pages carry a cursor");
+            start = MetadataChangeStart::After(MetadataChangeCursor::from(next));
+            pages.push(positions(&answer));
+            if !answer.has_more {
+                break;
+            }
+        }
+
+        assert_eq!(
+            pages,
+            [vec![(1, 0)], vec![(2, 0)], vec![(3, 0)]],
+            "a record larger than the budget still makes progress"
+        );
+    }
+
+    #[test]
     fn given_time_bounds_when_paging_should_keep_the_inclusive_range_with_saturated_timestamps() {
         let log = MetadataChangeLog::new(ChangeLogCapacities::default());
         // A runaway clock saturates: ops 3 to 5 share one timestamp.
@@ -608,6 +645,21 @@ mod tests {
 
     fn append(log: &MetadataChangeLog, op: u64, kinds: &[Kind]) {
         append_at(log, op, op, kinds);
+    }
+
+    fn append_body(log: &MetadataChangeLog, op: u64, body: Bytes) {
+        let header = PrepareHeader {
+            op,
+            checksum: if op == 1 { LOG_ID } else { u128::from(op) },
+            timestamp: op,
+            ..PrepareHeader::default()
+        };
+        let change = AppliedChange {
+            kind: Kind::StreamCreated,
+            actor_user_id: None,
+            body,
+        };
+        log.append(&header, vec![change]).expect("append");
     }
 
     fn append_at(log: &MetadataChangeLog, op: u64, timestamp: u64, kinds: &[Kind]) {

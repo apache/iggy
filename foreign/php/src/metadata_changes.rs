@@ -36,8 +36,12 @@ use iggy::prelude::{
     MetadataChangeStart as RustMetadataChangeStart,
     MetadataChangeStatus as RustMetadataChangeStatus, MetadataChanges as RustMetadataChanges,
     MetadataCurrentItem as RustMetadataCurrentItem,
-    MetadataCurrentPageToken as RustMetadataCurrentPageToken, MetadataOptions, Permissions,
-    ResourceOptions, StreamPermissions, UserStatus,
+    MetadataCurrentPageToken as RustMetadataCurrentPageToken,
+    MetadataMemberLeftReason as RustMetadataMemberLeftReason, MetadataOptions,
+    MetadataPermissionsUpdatedReason as RustMetadataPermissionsUpdatedReason,
+    MetadataSessionClosedReason as RustMetadataSessionClosedReason,
+    MetadataTokenDeletedReason as RustMetadataTokenDeletedReason, Permissions, ResourceOptions,
+    StreamPermissions, UserStatus,
 };
 use iggy_binary_protocol::WireDecode;
 use iggy_binary_protocol::responses::system::GetMetadataChangesResponse;
@@ -1595,51 +1599,38 @@ impl From<RustMetadataChangePhase> for MetadataChangePhase {
     }
 }
 
-// The SDK prelude does not export the reason enums, so they map by their wire names.
-impl FromStr for MetadataMemberLeftReason {
-    type Err = IggyError;
-
-    fn from_str(name: &str) -> Result<Self, IggyError> {
-        match name {
-            "left" => Ok(Self::Left),
-            "session_ended" => Ok(Self::SessionEnded),
-            _ => Err(IggyError::InvalidFormat),
+impl From<RustMetadataMemberLeftReason> for MetadataMemberLeftReason {
+    fn from(reason: RustMetadataMemberLeftReason) -> Self {
+        match reason {
+            RustMetadataMemberLeftReason::Left => Self::Left,
+            RustMetadataMemberLeftReason::SessionEnded => Self::SessionEnded,
         }
     }
 }
 
-impl FromStr for MetadataTokenDeletedReason {
-    type Err = IggyError;
-
-    fn from_str(name: &str) -> Result<Self, IggyError> {
-        match name {
-            "deleted" => Ok(Self::Deleted),
-            "expired" => Ok(Self::Expired),
-            _ => Err(IggyError::InvalidFormat),
+impl From<RustMetadataTokenDeletedReason> for MetadataTokenDeletedReason {
+    fn from(reason: RustMetadataTokenDeletedReason) -> Self {
+        match reason {
+            RustMetadataTokenDeletedReason::Deleted => Self::Deleted,
+            RustMetadataTokenDeletedReason::Expired => Self::Expired,
         }
     }
 }
 
-impl FromStr for MetadataSessionClosedReason {
-    type Err = IggyError;
-
-    fn from_str(name: &str) -> Result<Self, IggyError> {
-        match name {
-            "logout" => Ok(Self::Logout),
-            "expired" => Ok(Self::Expired),
-            _ => Err(IggyError::InvalidFormat),
+impl From<RustMetadataSessionClosedReason> for MetadataSessionClosedReason {
+    fn from(reason: RustMetadataSessionClosedReason) -> Self {
+        match reason {
+            RustMetadataSessionClosedReason::Logout => Self::Logout,
+            RustMetadataSessionClosedReason::Expired => Self::Expired,
         }
     }
 }
 
-impl FromStr for MetadataPermissionsUpdatedReason {
-    type Err = IggyError;
-
-    fn from_str(name: &str) -> Result<Self, IggyError> {
-        match name {
-            "updated" => Ok(Self::Updated),
-            "resource_deleted" => Ok(Self::ResourceDeleted),
-            _ => Err(IggyError::InvalidFormat),
+impl From<RustMetadataPermissionsUpdatedReason> for MetadataPermissionsUpdatedReason {
+    fn from(reason: RustMetadataPermissionsUpdatedReason) -> Self {
+        match reason {
+            RustMetadataPermissionsUpdatedReason::Updated => Self::Updated,
+            RustMetadataPermissionsUpdatedReason::ResourceDeleted => Self::ResourceDeleted,
         }
     }
 }
@@ -1759,8 +1750,7 @@ fn change_body(change: &RustMetadataChange) -> PhpResult<Zval> {
             member_id: body.member_id,
             client_id: body.client_id,
             members_count: body.members_count,
-            reason: MetadataMemberLeftReason::from_str(body.reason.into())
-                .map_err(to_php_exception)?,
+            reason: body.reason.into(),
         }
         .into_zval(false),
         RustMetadataChange::ConsumerGroupPartitionHandedOver(body) => MetadataPartitionHandedOver {
@@ -1797,8 +1787,7 @@ fn change_body(change: &RustMetadataChange) -> PhpResult<Zval> {
             user_created_at: body.user_created_at,
             username: body.username.clone(),
             permissions: body.permissions.clone(),
-            reason: MetadataPermissionsUpdatedReason::from_str(body.reason.into())
-                .map_err(to_php_exception)?,
+            reason: body.reason.into(),
         }
         .into_zval(false),
         RustMetadataChange::PersonalAccessTokenCreated(body) => MetadataTokenChange {
@@ -1812,8 +1801,7 @@ fn change_body(change: &RustMetadataChange) -> PhpResult<Zval> {
             user_id: body.user_id,
             user_created_at: body.user_created_at,
             name: body.name.clone(),
-            reason: MetadataTokenDeletedReason::from_str(body.reason.into())
-                .map_err(to_php_exception)?,
+            reason: body.reason.into(),
         }
         .into_zval(false),
         RustMetadataChange::SessionRegistered(body) => MetadataSession {
@@ -1828,8 +1816,7 @@ fn change_body(change: &RustMetadataChange) -> PhpResult<Zval> {
             user_created_at: body.user_created_at,
             client_id: body.client_id,
             session: body.session,
-            reason: MetadataSessionClosedReason::from_str(body.reason.into())
-                .map_err(to_php_exception)?,
+            reason: body.reason.into(),
         }
         .into_zval(false),
         RustMetadataChange::Unknown { group, kind, body } => MetadataUnknownChange {

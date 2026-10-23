@@ -41,7 +41,6 @@ import tools.jackson.databind.ObjectMapper;
 
 import java.math.BigInteger;
 import java.util.ArrayList;
-import java.util.EnumMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -60,9 +59,6 @@ final class MetadataChangesJson {
     private static final Pattern HEX_U128 = Pattern.compile("[0-9a-f]{32}");
     private static final TypeReference<Map<String, HttpOptionValue>> OPTIONS = new TypeReference<>() {};
     private static final ObjectMapper OBJECT_MAPPER = ObjectMapperFactory.getInstance();
-    private static final Map<MetadataChangeKind, Function<JsonNode, MetadataChangeBody>> CHANGE_READERS =
-            changeReaders();
-    private static final Map<MetadataChangeGroup, Function<JsonNode, MetadataChangeBody>> ITEM_READERS = itemReaders();
 
     private MetadataChangesJson() {}
 
@@ -94,7 +90,7 @@ final class MetadataChangesJson {
         String groupName = text(record, "group");
         String kindName = text(record, "kind");
         Optional<MetadataChangeKind> kind = knownKind(groupName, kindName);
-        MetadataChangeBody body = kind.map(known -> CHANGE_READERS.get(known).apply(record))
+        MetadataChangeBody body = kind.map(known -> changeBody(known, record))
                 .orElseGet(
                         () -> new MetadataChangeBody.UnknownJson(groupName, Optional.of(kindName), record.toString()));
         Optional<Long> actorUserId =
@@ -112,7 +108,7 @@ final class MetadataChangesJson {
     static MetadataCurrentItem item(JsonNode item) {
         String groupName = text(item, "group");
         Optional<MetadataChangeGroup> group = MetadataChangeGroup.fromValue(groupName);
-        MetadataChangeBody body = group.map(known -> ITEM_READERS.get(known).apply(item))
+        MetadataChangeBody body = group.map(known -> itemBody(known, item))
                 .orElseGet(() -> new MetadataChangeBody.UnknownJson(groupName, Optional.empty(), item.toString()));
         return new MetadataCurrentItem(group, body);
     }
@@ -129,45 +125,40 @@ final class MetadataChangesJson {
         return kind;
     }
 
-    private static Map<MetadataChangeKind, Function<JsonNode, MetadataChangeBody>> changeReaders() {
-        Map<MetadataChangeKind, Function<JsonNode, MetadataChangeBody>> readers =
-                new EnumMap<>(MetadataChangeKind.class);
-        readers.put(MetadataChangeKind.STREAM_CREATED, MetadataChangesJson::stream);
-        readers.put(MetadataChangeKind.STREAM_UPDATED, MetadataChangesJson::stream);
-        readers.put(MetadataChangeKind.STREAM_DELETED, MetadataChangesJson::streamDeleted);
-        readers.put(MetadataChangeKind.TOPIC_CREATED, MetadataChangesJson::topic);
-        readers.put(MetadataChangeKind.TOPIC_UPDATED, MetadataChangesJson::topic);
-        readers.put(MetadataChangeKind.TOPIC_DELETED, MetadataChangesJson::topicDeleted);
-        readers.put(MetadataChangeKind.PARTITIONS_CHANGED, MetadataChangesJson::partitionsChanged);
-        readers.put(MetadataChangeKind.CONSUMER_GROUP_CREATED, MetadataChangesJson::consumerGroupCreated);
-        readers.put(MetadataChangeKind.CONSUMER_GROUP_DELETED, MetadataChangesJson::consumerGroupDeleted);
-        readers.put(MetadataChangeKind.CONSUMER_GROUP_MEMBER_JOINED, MetadataChangesJson::memberJoined);
-        readers.put(MetadataChangeKind.CONSUMER_GROUP_MEMBER_LEFT, MetadataChangesJson::memberLeft);
-        readers.put(MetadataChangeKind.CONSUMER_GROUP_PARTITION_HANDED_OVER, MetadataChangesJson::handedOver);
-        readers.put(MetadataChangeKind.USER_CREATED, MetadataChangesJson::user);
-        readers.put(MetadataChangeKind.USER_UPDATED, MetadataChangesJson::user);
-        readers.put(MetadataChangeKind.USER_DELETED, MetadataChangesJson::userIdentity);
-        readers.put(MetadataChangeKind.USER_PASSWORD_CHANGED, MetadataChangesJson::userIdentity);
-        readers.put(MetadataChangeKind.USER_PERMISSIONS_UPDATED, MetadataChangesJson::userPermissions);
-        readers.put(MetadataChangeKind.PERSONAL_ACCESS_TOKEN_CREATED, MetadataChangesJson::token);
-        readers.put(MetadataChangeKind.PERSONAL_ACCESS_TOKEN_DELETED, MetadataChangesJson::tokenDeleted);
-        readers.put(MetadataChangeKind.SESSION_REGISTERED, MetadataChangesJson::session);
-        readers.put(MetadataChangeKind.SESSION_CLOSED, MetadataChangesJson::sessionClosed);
-        return readers;
+    @SuppressWarnings("checkstyle:CyclomaticComplexity")
+    private static MetadataChangeBody changeBody(MetadataChangeKind kind, JsonNode body) {
+        return switch (kind) {
+            case STREAM_CREATED, STREAM_UPDATED -> stream(body);
+            case STREAM_DELETED -> streamDeleted(body);
+            case TOPIC_CREATED, TOPIC_UPDATED -> topic(body);
+            case TOPIC_DELETED -> topicDeleted(body);
+            case PARTITIONS_CHANGED -> partitionsChanged(body);
+            case CONSUMER_GROUP_CREATED -> consumerGroupCreated(body);
+            case CONSUMER_GROUP_DELETED -> consumerGroupDeleted(body);
+            case CONSUMER_GROUP_MEMBER_JOINED -> memberJoined(body);
+            case CONSUMER_GROUP_MEMBER_LEFT -> memberLeft(body);
+            case CONSUMER_GROUP_PARTITION_HANDED_OVER -> handedOver(body);
+            case USER_CREATED, USER_UPDATED -> user(body);
+            case USER_DELETED, USER_PASSWORD_CHANGED -> userIdentity(body);
+            case USER_PERMISSIONS_UPDATED -> userPermissions(body);
+            case PERSONAL_ACCESS_TOKEN_CREATED -> token(body);
+            case PERSONAL_ACCESS_TOKEN_DELETED -> tokenDeleted(body);
+            case SESSION_REGISTERED -> session(body);
+            case SESSION_CLOSED -> sessionClosed(body);
+        };
     }
 
-    private static Map<MetadataChangeGroup, Function<JsonNode, MetadataChangeBody>> itemReaders() {
-        Map<MetadataChangeGroup, Function<JsonNode, MetadataChangeBody>> readers =
-                new EnumMap<>(MetadataChangeGroup.class);
-        readers.put(MetadataChangeGroup.STREAMS, MetadataChangesJson::stream);
-        readers.put(MetadataChangeGroup.TOPICS, MetadataChangesJson::topicItem);
-        readers.put(MetadataChangeGroup.PARTITIONS, MetadataChangesJson::partitionsItem);
-        readers.put(MetadataChangeGroup.CONSUMER_GROUPS, MetadataChangesJson::consumerGroupItem);
-        readers.put(MetadataChangeGroup.CONSUMER_GROUP_MEMBERS, MetadataChangesJson::memberItem);
-        readers.put(MetadataChangeGroup.USERS, MetadataChangesJson::user);
-        readers.put(MetadataChangeGroup.PERSONAL_ACCESS_TOKENS, MetadataChangesJson::token);
-        readers.put(MetadataChangeGroup.SESSIONS, MetadataChangesJson::session);
-        return readers;
+    private static MetadataChangeBody itemBody(MetadataChangeGroup group, JsonNode body) {
+        return switch (group) {
+            case STREAMS -> stream(body);
+            case TOPICS -> topicItem(body);
+            case PARTITIONS -> partitionsItem(body);
+            case CONSUMER_GROUPS -> consumerGroupItem(body);
+            case CONSUMER_GROUP_MEMBERS -> memberItem(body);
+            case USERS -> user(body);
+            case PERSONAL_ACCESS_TOKENS -> token(body);
+            case SESSIONS -> session(body);
+        };
     }
 
     private static MetadataChangeBody stream(JsonNode body) {

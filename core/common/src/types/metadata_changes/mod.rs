@@ -376,96 +376,6 @@ impl MetadataChangeGroups {
     }
 }
 
-impl From<MetadataChangeGroup> for WireMetadataChangeGroup {
-    fn from(group: MetadataChangeGroup) -> Self {
-        match group {
-            MetadataChangeGroup::Streams => Self::Streams,
-            MetadataChangeGroup::Topics => Self::Topics,
-            MetadataChangeGroup::Partitions => Self::Partitions,
-            MetadataChangeGroup::ConsumerGroups => Self::ConsumerGroups,
-            MetadataChangeGroup::ConsumerGroupMembers => Self::ConsumerGroupMembers,
-            MetadataChangeGroup::Users => Self::Users,
-            MetadataChangeGroup::PersonalAccessTokens => Self::PersonalAccessTokens,
-            MetadataChangeGroup::Sessions => Self::Sessions,
-        }
-    }
-}
-
-impl From<WireMetadataChangeGroup> for MetadataChangeGroup {
-    fn from(group: WireMetadataChangeGroup) -> Self {
-        match group {
-            WireMetadataChangeGroup::Streams => Self::Streams,
-            WireMetadataChangeGroup::Topics => Self::Topics,
-            WireMetadataChangeGroup::Partitions => Self::Partitions,
-            WireMetadataChangeGroup::ConsumerGroups => Self::ConsumerGroups,
-            WireMetadataChangeGroup::ConsumerGroupMembers => Self::ConsumerGroupMembers,
-            WireMetadataChangeGroup::Users => Self::Users,
-            WireMetadataChangeGroup::PersonalAccessTokens => Self::PersonalAccessTokens,
-            WireMetadataChangeGroup::Sessions => Self::Sessions,
-        }
-    }
-}
-
-impl From<MetadataChangeKind> for WireMetadataChangeKind {
-    fn from(kind: MetadataChangeKind) -> Self {
-        match kind {
-            MetadataChangeKind::StreamCreated => Self::StreamCreated,
-            MetadataChangeKind::StreamUpdated => Self::StreamUpdated,
-            MetadataChangeKind::StreamDeleted => Self::StreamDeleted,
-            MetadataChangeKind::TopicCreated => Self::TopicCreated,
-            MetadataChangeKind::TopicUpdated => Self::TopicUpdated,
-            MetadataChangeKind::TopicDeleted => Self::TopicDeleted,
-            MetadataChangeKind::PartitionsChanged => Self::PartitionsChanged,
-            MetadataChangeKind::ConsumerGroupCreated => Self::ConsumerGroupCreated,
-            MetadataChangeKind::ConsumerGroupDeleted => Self::ConsumerGroupDeleted,
-            MetadataChangeKind::ConsumerGroupMemberJoined => Self::ConsumerGroupMemberJoined,
-            MetadataChangeKind::ConsumerGroupMemberLeft => Self::ConsumerGroupMemberLeft,
-            MetadataChangeKind::ConsumerGroupPartitionHandedOver => {
-                Self::ConsumerGroupPartitionHandedOver
-            }
-            MetadataChangeKind::UserCreated => Self::UserCreated,
-            MetadataChangeKind::UserUpdated => Self::UserUpdated,
-            MetadataChangeKind::UserDeleted => Self::UserDeleted,
-            MetadataChangeKind::UserPasswordChanged => Self::UserPasswordChanged,
-            MetadataChangeKind::UserPermissionsUpdated => Self::UserPermissionsUpdated,
-            MetadataChangeKind::PersonalAccessTokenCreated => Self::PersonalAccessTokenCreated,
-            MetadataChangeKind::PersonalAccessTokenDeleted => Self::PersonalAccessTokenDeleted,
-            MetadataChangeKind::SessionRegistered => Self::SessionRegistered,
-            MetadataChangeKind::SessionClosed => Self::SessionClosed,
-        }
-    }
-}
-
-impl From<WireMetadataChangeKind> for MetadataChangeKind {
-    fn from(kind: WireMetadataChangeKind) -> Self {
-        match kind {
-            WireMetadataChangeKind::StreamCreated => Self::StreamCreated,
-            WireMetadataChangeKind::StreamUpdated => Self::StreamUpdated,
-            WireMetadataChangeKind::StreamDeleted => Self::StreamDeleted,
-            WireMetadataChangeKind::TopicCreated => Self::TopicCreated,
-            WireMetadataChangeKind::TopicUpdated => Self::TopicUpdated,
-            WireMetadataChangeKind::TopicDeleted => Self::TopicDeleted,
-            WireMetadataChangeKind::PartitionsChanged => Self::PartitionsChanged,
-            WireMetadataChangeKind::ConsumerGroupCreated => Self::ConsumerGroupCreated,
-            WireMetadataChangeKind::ConsumerGroupDeleted => Self::ConsumerGroupDeleted,
-            WireMetadataChangeKind::ConsumerGroupMemberJoined => Self::ConsumerGroupMemberJoined,
-            WireMetadataChangeKind::ConsumerGroupMemberLeft => Self::ConsumerGroupMemberLeft,
-            WireMetadataChangeKind::ConsumerGroupPartitionHandedOver => {
-                Self::ConsumerGroupPartitionHandedOver
-            }
-            WireMetadataChangeKind::UserCreated => Self::UserCreated,
-            WireMetadataChangeKind::UserUpdated => Self::UserUpdated,
-            WireMetadataChangeKind::UserDeleted => Self::UserDeleted,
-            WireMetadataChangeKind::UserPasswordChanged => Self::UserPasswordChanged,
-            WireMetadataChangeKind::UserPermissionsUpdated => Self::UserPermissionsUpdated,
-            WireMetadataChangeKind::PersonalAccessTokenCreated => Self::PersonalAccessTokenCreated,
-            WireMetadataChangeKind::PersonalAccessTokenDeleted => Self::PersonalAccessTokenDeleted,
-            WireMetadataChangeKind::SessionRegistered => Self::SessionRegistered,
-            WireMetadataChangeKind::SessionClosed => Self::SessionClosed,
-        }
-    }
-}
-
 macro_rules! mirror_wire_enum {
     ($domain:ident, $wire:ident, $($variant:ident),+) => {
         impl From<$domain> for $wire {
@@ -486,6 +396,43 @@ macro_rules! mirror_wire_enum {
     };
 }
 
+mirror_wire_enum!(
+    MetadataChangeGroup,
+    WireMetadataChangeGroup,
+    Streams,
+    Topics,
+    Partitions,
+    ConsumerGroups,
+    ConsumerGroupMembers,
+    Users,
+    PersonalAccessTokens,
+    Sessions
+);
+mirror_wire_enum!(
+    MetadataChangeKind,
+    WireMetadataChangeKind,
+    StreamCreated,
+    StreamUpdated,
+    StreamDeleted,
+    TopicCreated,
+    TopicUpdated,
+    TopicDeleted,
+    PartitionsChanged,
+    ConsumerGroupCreated,
+    ConsumerGroupDeleted,
+    ConsumerGroupMemberJoined,
+    ConsumerGroupMemberLeft,
+    ConsumerGroupPartitionHandedOver,
+    UserCreated,
+    UserUpdated,
+    UserDeleted,
+    UserPasswordChanged,
+    UserPermissionsUpdated,
+    PersonalAccessTokenCreated,
+    PersonalAccessTokenDeleted,
+    SessionRegistered,
+    SessionClosed
+);
 mirror_wire_enum!(
     MetadataChangeStatus,
     WireMetadataChangeStatus,

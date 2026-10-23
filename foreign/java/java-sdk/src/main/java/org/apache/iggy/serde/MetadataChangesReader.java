@@ -42,7 +42,6 @@ import java.nio.charset.CharacterCodingException;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
-import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -59,9 +58,6 @@ final class MetadataChangesReader {
     private static final int RECORD_MIN_BYTES = 8 + 4 + 16 + 8 + 1 + 1 + 1 + 4;
     private static final int ITEM_MIN_BYTES = 1 + 4;
     private static final int U128_BYTES = 16;
-    private static final Map<MetadataChangeKind, Function<ByteBuf, MetadataChangeBody>> CHANGE_READERS =
-            changeReaders();
-    private static final Map<MetadataChangeGroup, Function<ByteBuf, MetadataChangeBody>> ITEM_READERS = itemReaders();
 
     private MetadataChangesReader() {}
 
@@ -102,7 +98,7 @@ final class MetadataChangesReader {
         ByteBuf body = buffer.readSlice(length(buffer));
         Optional<MetadataChangeKind> knownKind = knownKind(group, kind);
         MetadataChangeBody change = knownKind
-                .map(known -> exact(body, CHANGE_READERS.get(known)))
+                .map(known -> exact(body, changeBody(known, body)))
                 .orElseGet(() -> new MetadataChangeBody.Unknown(group, Optional.of(kind), bytes(body)));
         return new MetadataChangeRecord(op, ordinal, checksum, timestamp, actorUserId, knownKind, change);
     }
@@ -112,20 +108,20 @@ final class MetadataChangesReader {
         ByteBuf body = buffer.readSlice(length(buffer));
         Optional<MetadataChangeGroup> knownGroup = MetadataChangeGroup.fromCode(group);
         MetadataChangeBody item = knownGroup
-                .map(known -> exact(body, ITEM_READERS.get(known)))
+                .map(known -> exact(body, itemBody(known, body)))
                 .orElseGet(() -> new MetadataChangeBody.Unknown(group, Optional.empty(), bytes(body)));
         return new MetadataCurrentItem(knownGroup, item);
     }
 
     static MetadataChangeBody readChangeBody(int group, int kind, ByteBuf body) {
         return knownKind(group, kind)
-                .map(known -> exact(body, CHANGE_READERS.get(known)))
+                .map(known -> exact(body, changeBody(known, body)))
                 .orElseGet(() -> new MetadataChangeBody.Unknown(group, Optional.of(kind), bytes(body)));
     }
 
     static MetadataChangeBody readItemBody(int group, ByteBuf body) {
         return MetadataChangeGroup.fromCode(group)
-                .map(known -> exact(body, ITEM_READERS.get(known)))
+                .map(known -> exact(body, itemBody(known, body)))
                 .orElseGet(() -> new MetadataChangeBody.Unknown(group, Optional.empty(), bytes(body)));
     }
 
@@ -141,8 +137,7 @@ final class MetadataChangesReader {
         return knownKind;
     }
 
-    private static MetadataChangeBody exact(ByteBuf body, Function<ByteBuf, MetadataChangeBody> reader) {
-        MetadataChangeBody decoded = reader.apply(body);
+    private static MetadataChangeBody exact(ByteBuf body, MetadataChangeBody decoded) {
         if (body.isReadable()) {
             throw malformed(body.readableBytes() + " trailing bytes after a body");
         }
@@ -170,45 +165,40 @@ final class MetadataChangesReader {
                 .orElseThrow(() -> malformed("the page token is malformed")));
     }
 
-    private static Map<MetadataChangeKind, Function<ByteBuf, MetadataChangeBody>> changeReaders() {
-        Map<MetadataChangeKind, Function<ByteBuf, MetadataChangeBody>> readers =
-                new EnumMap<>(MetadataChangeKind.class);
-        readers.put(MetadataChangeKind.STREAM_CREATED, MetadataChangesReader::stream);
-        readers.put(MetadataChangeKind.STREAM_UPDATED, MetadataChangesReader::stream);
-        readers.put(MetadataChangeKind.STREAM_DELETED, MetadataChangesReader::streamDeleted);
-        readers.put(MetadataChangeKind.TOPIC_CREATED, MetadataChangesReader::topic);
-        readers.put(MetadataChangeKind.TOPIC_UPDATED, MetadataChangesReader::topic);
-        readers.put(MetadataChangeKind.TOPIC_DELETED, MetadataChangesReader::topicDeleted);
-        readers.put(MetadataChangeKind.PARTITIONS_CHANGED, MetadataChangesReader::partitionsChanged);
-        readers.put(MetadataChangeKind.CONSUMER_GROUP_CREATED, MetadataChangesReader::consumerGroupCreated);
-        readers.put(MetadataChangeKind.CONSUMER_GROUP_DELETED, MetadataChangesReader::consumerGroupDeleted);
-        readers.put(MetadataChangeKind.CONSUMER_GROUP_MEMBER_JOINED, MetadataChangesReader::memberJoined);
-        readers.put(MetadataChangeKind.CONSUMER_GROUP_MEMBER_LEFT, MetadataChangesReader::memberLeft);
-        readers.put(MetadataChangeKind.CONSUMER_GROUP_PARTITION_HANDED_OVER, MetadataChangesReader::handedOver);
-        readers.put(MetadataChangeKind.USER_CREATED, MetadataChangesReader::user);
-        readers.put(MetadataChangeKind.USER_UPDATED, MetadataChangesReader::user);
-        readers.put(MetadataChangeKind.USER_DELETED, MetadataChangesReader::userIdentity);
-        readers.put(MetadataChangeKind.USER_PASSWORD_CHANGED, MetadataChangesReader::userIdentity);
-        readers.put(MetadataChangeKind.USER_PERMISSIONS_UPDATED, MetadataChangesReader::userPermissions);
-        readers.put(MetadataChangeKind.PERSONAL_ACCESS_TOKEN_CREATED, MetadataChangesReader::token);
-        readers.put(MetadataChangeKind.PERSONAL_ACCESS_TOKEN_DELETED, MetadataChangesReader::tokenDeleted);
-        readers.put(MetadataChangeKind.SESSION_REGISTERED, MetadataChangesReader::session);
-        readers.put(MetadataChangeKind.SESSION_CLOSED, MetadataChangesReader::sessionClosed);
-        return readers;
+    @SuppressWarnings("checkstyle:CyclomaticComplexity")
+    private static MetadataChangeBody changeBody(MetadataChangeKind kind, ByteBuf body) {
+        return switch (kind) {
+            case STREAM_CREATED, STREAM_UPDATED -> stream(body);
+            case STREAM_DELETED -> streamDeleted(body);
+            case TOPIC_CREATED, TOPIC_UPDATED -> topic(body);
+            case TOPIC_DELETED -> topicDeleted(body);
+            case PARTITIONS_CHANGED -> partitionsChanged(body);
+            case CONSUMER_GROUP_CREATED -> consumerGroupCreated(body);
+            case CONSUMER_GROUP_DELETED -> consumerGroupDeleted(body);
+            case CONSUMER_GROUP_MEMBER_JOINED -> memberJoined(body);
+            case CONSUMER_GROUP_MEMBER_LEFT -> memberLeft(body);
+            case CONSUMER_GROUP_PARTITION_HANDED_OVER -> handedOver(body);
+            case USER_CREATED, USER_UPDATED -> user(body);
+            case USER_DELETED, USER_PASSWORD_CHANGED -> userIdentity(body);
+            case USER_PERMISSIONS_UPDATED -> userPermissions(body);
+            case PERSONAL_ACCESS_TOKEN_CREATED -> token(body);
+            case PERSONAL_ACCESS_TOKEN_DELETED -> tokenDeleted(body);
+            case SESSION_REGISTERED -> session(body);
+            case SESSION_CLOSED -> sessionClosed(body);
+        };
     }
 
-    private static Map<MetadataChangeGroup, Function<ByteBuf, MetadataChangeBody>> itemReaders() {
-        Map<MetadataChangeGroup, Function<ByteBuf, MetadataChangeBody>> readers =
-                new EnumMap<>(MetadataChangeGroup.class);
-        readers.put(MetadataChangeGroup.STREAMS, MetadataChangesReader::stream);
-        readers.put(MetadataChangeGroup.TOPICS, MetadataChangesReader::topicItem);
-        readers.put(MetadataChangeGroup.PARTITIONS, MetadataChangesReader::partitionsItem);
-        readers.put(MetadataChangeGroup.CONSUMER_GROUPS, MetadataChangesReader::consumerGroupItem);
-        readers.put(MetadataChangeGroup.CONSUMER_GROUP_MEMBERS, MetadataChangesReader::memberItem);
-        readers.put(MetadataChangeGroup.USERS, MetadataChangesReader::user);
-        readers.put(MetadataChangeGroup.PERSONAL_ACCESS_TOKENS, MetadataChangesReader::token);
-        readers.put(MetadataChangeGroup.SESSIONS, MetadataChangesReader::session);
-        return readers;
+    private static MetadataChangeBody itemBody(MetadataChangeGroup group, ByteBuf body) {
+        return switch (group) {
+            case STREAMS -> stream(body);
+            case TOPICS -> topicItem(body);
+            case PARTITIONS -> partitionsItem(body);
+            case CONSUMER_GROUPS -> consumerGroupItem(body);
+            case CONSUMER_GROUP_MEMBERS -> memberItem(body);
+            case USERS -> user(body);
+            case PERSONAL_ACCESS_TOKENS -> token(body);
+            case SESSIONS -> session(body);
+        };
     }
 
     private static MetadataChangeBody stream(ByteBuf body) {

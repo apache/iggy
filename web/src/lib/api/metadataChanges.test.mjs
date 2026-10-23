@@ -202,6 +202,24 @@ test('given_empty_filtered_pages_when_scanning_recent_should_stop_at_the_capture
   assert.equal(result.page.next, position(large, 2));
 });
 
+test('given_node_behind_the_captured_head_when_scanning_recent_should_continue_from_its_own_position', async () => {
+  const pages = [
+    changesPage([], position(10)),
+    { ...changesPage([change(4)], position(4)), head_op: '6' }
+  ];
+  const result = await scanRecentMetadataChanges(
+    filter,
+    async () => pages.shift() ?? assert.fail('unexpected page request')
+  );
+  assert.deepEqual(
+    result.page.records.map((record) => record.op),
+    ['4']
+  );
+  assert.equal(result.page.next, position(4));
+  assert.equal(result.page.head_op, '6');
+  assert.equal(result.page.has_more, false);
+});
+
 test('given_expiry_or_changed_history_during_recent_scan_should_discard_partial_results', async () => {
   for (const status of /** @type {const} */ (['expired', 'reset', 'behind', 'changed_history'])) {
     /** @type {import('./metadataChanges.ts').MetadataChangesPage[]} */

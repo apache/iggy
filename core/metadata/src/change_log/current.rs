@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::change_log::query::{CursorCheck, LogView};
+use crate::change_log::query::{CursorCheck, LogView, MAX_PAGE_BYTES};
 use crate::change_log::store::ChangeLog;
 use crate::change_log::{change_options, stream_body, user_body};
 use crate::stm::stream::StreamsInner;
@@ -98,6 +98,7 @@ pub fn current_page(
         state,
         limit: limit as usize,
         items: Vec::new(),
+        bytes: 0,
         last: None,
         more: false,
     };
@@ -136,6 +137,7 @@ struct Projection<'a> {
     state: &'a CurrentState<'a>,
     limit: usize,
     items: Vec<WireMetadataItem>,
+    bytes: usize,
     last: Option<(WireMetadataChangeGroup, Bytes)>,
     more: bool,
 }
@@ -387,16 +389,79 @@ impl Projection<'_> {
         key: Bytes,
         item: &WireMetadataCurrentItem,
     ) -> bool {
-        if self.items.len() == self.limit {
+        let group = WireMetadataChangeGroup::from(group);
+        let item = WireMetadataItem {
+            group: group.as_u8(),
+            body: Bytes::from(item.body_bytes()),
+        };
+        let bytes = self.bytes + item.encoded_size();
+        if self.items.len() == self.limit || (!self.items.is_empty() && bytes > MAX_PAGE_BYTES) {
             self.more = true;
             return false;
         }
-        let group = WireMetadataChangeGroup::from(group);
-        self.items.push(WireMetadataItem {
-            group: group.as_u8(),
-            body: Bytes::from(item.body_bytes()),
-        });
+        self.bytes = bytes;
+        self.items.push(item);
         self.last = Some((group, key));
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stm::stream::StreamsInner;
+    use crate::stm::user::UsersInner;
+    use iggy_binary_protocol::primitives::metadata_changes::{WireStreamKey, WireTopicKey};
+
+    #[test]
+    fn given_items_past_the_byte_budget_when_projecting_should_stop_before_the_overflow() {
+        let streams = StreamsInner::new();
+        let users = UsersInner::new();
+        let state = CurrentState {
+            streams: &streams,
+            users: &users,
+            sessions: None,
+        };
+        let mut projection = Projection {
+            state: &state,
+            limit: 1000,
+            items: Vec::new(),
+            bytes: 0,
+            last: None,
+            more: false,
+        };
+        let member = |member_id: u32, partitions: usize| {
+            WireMetadataCurrentItem::ConsumerGroupMember(WireMemberItemBody {
+                topic: WireTopicKey {
+                    stream: WireStreamKey {
+                        stream_id: 0,
+                        stream_created_op: 1,
+                    },
+                    topic_id: 0,
+                    topic_created_op: 2,
+                },
+                group_id: 0,
+                member_id,
+                client_id: 7,
+                partition_ids: vec![0; partitions],
+            })
+        };
+        let group = MetadataChangeGroup::ConsumerGroupMembers;
+
+        assert!(
+            projection.push(group, &[0, 0, 0, 0], &member(0, MAX_PAGE_BYTES / 4)),
+            "an item larger than the budget still makes progress"
+        );
+        assert!(!projection.push(group, &[0, 0, 0, 1], &member(1, 0)));
+
+        assert_eq!(projection.items.len(), 1);
+        assert!(projection.more);
+        assert_eq!(
+            projection.last,
+            Some((
+                WireMetadataChangeGroup::ConsumerGroupMembers,
+                Bytes::from_static(&[0; 16])
+            ))
+        );
     }
 }

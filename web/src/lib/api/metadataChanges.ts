@@ -204,9 +204,14 @@ export async function scanRecentMetadataChanges(
     const matching = page.records.filter((record) => comparePosition(record, end) <= 0);
     trimmed ||= records.length + matching.length > capacity;
     records = [...records, ...matching].slice(-capacity);
-    if (!page.has_more || (page.next && comparePosition(cursorPosition(page.next), end) >= 0)) {
+    const passedEnd = page.next !== null && comparePosition(cursorPosition(page.next), end) >= 0;
+    if (!page.has_more || passedEnd) {
+      // A node that has not applied the captured head stops short of it, so keep its own position.
+      const reachedEnd = passedEnd || BigInt(page.head_op) >= BigInt(end.op);
       return {
-        page: { ...page, head_op: boundary.head_op, records, next: boundary.next, has_more: false },
+        page: reachedEnd
+          ? { ...page, head_op: boundary.head_op, records, next: boundary.next, has_more: false }
+          : { ...page, records, has_more: false },
         trimmed
       };
     }

@@ -448,7 +448,11 @@ async fn run() -> Result<(), IggyCmdError> {
     credentials.set_iggy_client(&client);
     credentials.login_user().await?;
 
-    if command.use_tracing() {
+    if command.stdout_is_data() {
+        if !cli_options.quiet {
+            eprintln!("Executing {}", command.explain());
+        }
+    } else if command.use_tracing() {
         event!(target: PRINT_TARGET, Level::INFO, "Executing {}", command.explain());
     } else {
         println!("Executing {}", command.explain());

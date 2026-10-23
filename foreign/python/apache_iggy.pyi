@@ -2461,6 +2461,62 @@ class MetadataChangeCursor:
     def __repr__(self) -> builtins.str: ...
 
 @typing.final
+class MetadataChangeGroup:
+    r"""
+    Family of change records and the unit of filtering. `str()` gives the
+    name the HTTP API uses.
+    """
+
+    Streams: typing.ClassVar[MetadataChangeGroup]
+    Topics: typing.ClassVar[MetadataChangeGroup]
+    Partitions: typing.ClassVar[MetadataChangeGroup]
+    ConsumerGroups: typing.ClassVar[MetadataChangeGroup]
+    ConsumerGroupMembers: typing.ClassVar[MetadataChangeGroup]
+    Users: typing.ClassVar[MetadataChangeGroup]
+    PersonalAccessTokens: typing.ClassVar[MetadataChangeGroup]
+    Sessions: typing.ClassVar[MetadataChangeGroup]
+    def __str__(self) -> builtins.str: ...
+
+@typing.final
+class MetadataChangeKind:
+    r"""
+    Kind of a change record. `str()` gives the name the HTTP API uses.
+    """
+
+    StreamCreated: typing.ClassVar[MetadataChangeKind]
+    StreamUpdated: typing.ClassVar[MetadataChangeKind]
+    StreamDeleted: typing.ClassVar[MetadataChangeKind]
+    TopicCreated: typing.ClassVar[MetadataChangeKind]
+    TopicUpdated: typing.ClassVar[MetadataChangeKind]
+    TopicDeleted: typing.ClassVar[MetadataChangeKind]
+    PartitionsChanged: typing.ClassVar[MetadataChangeKind]
+    ConsumerGroupCreated: typing.ClassVar[MetadataChangeKind]
+    ConsumerGroupDeleted: typing.ClassVar[MetadataChangeKind]
+    ConsumerGroupMemberJoined: typing.ClassVar[MetadataChangeKind]
+    ConsumerGroupMemberLeft: typing.ClassVar[MetadataChangeKind]
+    ConsumerGroupPartitionHandedOver: typing.ClassVar[MetadataChangeKind]
+    UserCreated: typing.ClassVar[MetadataChangeKind]
+    UserUpdated: typing.ClassVar[MetadataChangeKind]
+    UserDeleted: typing.ClassVar[MetadataChangeKind]
+    UserPasswordChanged: typing.ClassVar[MetadataChangeKind]
+    UserPermissionsUpdated: typing.ClassVar[MetadataChangeKind]
+    PersonalAccessTokenCreated: typing.ClassVar[MetadataChangeKind]
+    PersonalAccessTokenDeleted: typing.ClassVar[MetadataChangeKind]
+    SessionRegistered: typing.ClassVar[MetadataChangeKind]
+    SessionClosed: typing.ClassVar[MetadataChangeKind]
+    def __str__(self) -> builtins.str: ...
+
+@typing.final
+class MetadataChangePhase:
+    r"""
+    Whether a page carries change records or current state items.
+    """
+
+    Changes: typing.ClassVar[MetadataChangePhase]
+    Current: typing.ClassVar[MetadataChangePhase]
+    def __str__(self) -> builtins.str: ...
+
+@typing.final
 class MetadataChangeRecord:
     r"""
     One change record: the committed operation that produced it, its position
@@ -2580,6 +2636,33 @@ class MetadataChangeStart:
         ) -> MetadataChangeStart.Current: ...
 
     ...
+
+@typing.final
+class MetadataChangeStatus:
+    r"""
+    Outcome of a change log query.
+    """
+
+    Ok: typing.ClassVar[MetadataChangeStatus]
+    r"""
+    Records or items after the requested position. Apply them and keep
+    `next`.
+    """
+    Behind: typing.ClassVar[MetadataChangeStatus]
+    r"""
+    The answering node has not applied the requested position yet. Ask
+    again later or ask another node.
+    """
+    Expired: typing.ClassVar[MetadataChangeStatus]
+    r"""
+    The node no longer holds every record after the position. Rebuild
+    from current state.
+    """
+    Reset: typing.ClassVar[MetadataChangeStatus]
+    r"""
+    The position belongs to another history. Rebuild from current state.
+    """
+    def __str__(self) -> builtins.str: ...
 
 @typing.final
 class MetadataChanges:
@@ -2868,6 +2951,16 @@ class MetadataMemberLeft:
     def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
 
 @typing.final
+class MetadataMemberLeftReason:
+    r"""
+    Why a consumer group member was removed.
+    """
+
+    Left: typing.ClassVar[MetadataMemberLeftReason]
+    SessionEnded: typing.ClassVar[MetadataMemberLeftReason]
+    def __str__(self) -> builtins.str: ...
+
+@typing.final
 class MetadataPartitionHandedOver:
     r"""
     A completed partition handover.
@@ -2939,6 +3032,22 @@ class MetadataPartitionsItem:
     def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
 
 @typing.final
+class MetadataPermissionsUpdatedReason:
+    r"""
+    Why a user's public permission set changed.
+    """
+
+    Updated: typing.ClassVar[MetadataPermissionsUpdatedReason]
+    r"""
+    An `update_permissions` call replaced the set.
+    """
+    ResourceDeleted: typing.ClassVar[MetadataPermissionsUpdatedReason]
+    r"""
+    A stream or topic delete pruned the user's grants on it.
+    """
+    def __str__(self) -> builtins.str: ...
+
+@typing.final
 class MetadataSession:
     r"""
     A registered session, and a `sessions` current state item.
@@ -2972,6 +3081,16 @@ class MetadataSessionClosed:
     @property
     def reason(self) -> MetadataSessionClosedReason: ...
     def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+
+@typing.final
+class MetadataSessionClosedReason:
+    r"""
+    Why a session was closed.
+    """
+
+    Logout: typing.ClassVar[MetadataSessionClosedReason]
+    Expired: typing.ClassVar[MetadataSessionClosedReason]
+    def __str__(self) -> builtins.str: ...
 
 @typing.final
 class MetadataStreamChange:
@@ -3070,6 +3189,16 @@ class MetadataTokenDeleted:
     @property
     def reason(self) -> MetadataTokenDeletedReason: ...
     def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+
+@typing.final
+class MetadataTokenDeletedReason:
+    r"""
+    Why a personal access token was removed.
+    """
+
+    Deleted: typing.ClassVar[MetadataTokenDeletedReason]
+    Expired: typing.ClassVar[MetadataTokenDeletedReason]
+    def __str__(self) -> builtins.str: ...
 
 @typing.final
 class MetadataTopicChange:
@@ -3299,6 +3428,84 @@ class OptionError(IggyError):
     def kind(self) -> builtins.str: ...
 
 @typing.final
+class OptionKey:
+    r"""
+    A catalog option key, as `update_stream`, `update_topic` and `update_user`
+    take it in `reset`. `str()` gives the key as it travels on the wire.
+    """
+
+    Name: typing.ClassVar[OptionKey]
+    r"""
+    Stream or topic name.
+    """
+    Username: typing.ClassVar[OptionKey]
+    r"""
+    User name.
+    """
+    Status: typing.ClassVar[OptionKey]
+    r"""
+    User status.
+    """
+    CompressionAlgorithm: typing.ClassVar[OptionKey]
+    r"""
+    Topic compression algorithm, fixed at creation.
+    """
+    MessageExpiry: typing.ClassVar[OptionKey]
+    r"""
+    Topic message expiry, resettable to never expire.
+    """
+    MaxTopicSize: typing.ClassVar[OptionKey]
+    r"""
+    Topic size cap, resettable to unlimited.
+    """
+    SegmentSize: typing.ClassVar[OptionKey]
+    r"""
+    Topic segment size, fixed at creation.
+    """
+    Durability: typing.ClassVar[OptionKey]
+    r"""
+    Topic message durability, fixed at creation.
+    """
+    ConsumerOffsetDurability: typing.ClassVar[OptionKey]
+    r"""
+    Topic consumer offset durability, fixed at creation.
+    """
+    PartitionResizePolicy: typing.ClassVar[OptionKey]
+    r"""
+    Topic partition resize policy, fixed at creation.
+    """
+    MessagesRequiredToSave: typing.ClassVar[OptionKey]
+    r"""
+    Topic message-count flush threshold, fixed at creation.
+    """
+    SizeOfMessagesRequiredToSave: typing.ClassVar[OptionKey]
+    r"""
+    Topic byte flush threshold, fixed at creation.
+    """
+    PreallocateSegments: typing.ClassVar[OptionKey]
+    r"""
+    Topic segment preallocation, fixed at creation.
+    """
+    EncryptionKey: typing.ClassVar[OptionKey]
+    r"""
+    Stream encryption key, write-only and fixed at creation.
+    """
+    EncryptionKeySource: typing.ClassVar[OptionKey]
+    r"""
+    Who chose the stream's key, computed by the server.
+    """
+    EncryptionKeyFingerprint: typing.ClassVar[OptionKey]
+    r"""
+    Fingerprint of the stream's key, computed by the server.
+    """
+    EncryptionKekFingerprint: typing.ClassVar[OptionKey]
+    r"""
+    Fingerprints of the server keys wrapping the stream's key, computed by
+    the server.
+    """
+    def __str__(self) -> builtins.str: ...
+
+@typing.final
 class OptionSpec:
     r"""
     One entry of a resource's option catalog, as served by `describe_options`.
@@ -3433,6 +3640,21 @@ class PartitionContext:
         metadata_op: builtins.int,
     ) -> PartitionContext: ...
     def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class PartitionResizePolicy:
+    r"""
+    Whether partitions can be added to or deleted from a topic after creation.
+    """
+
+    Mutable: typing.ClassVar[PartitionResizePolicy]
+    r"""
+    Partitions can be added and deleted.
+    """
+    Fixed: typing.ClassVar[PartitionResizePolicy]
+    r"""
+    The partition set is fixed at topic creation.
+    """
 
 @typing.final
 class Partitioning:
@@ -3598,6 +3820,15 @@ class ProducerSendError(IggyError):
         r"""
         Confirmations returned for chunks committed before the failure.
         """
+
+@typing.final
+class ProducerSharding:
+    r"""
+    How a background producer distributes sends among its workers.
+    """
+
+    ORDERED: typing.ClassVar[ProducerSharding]
+    BALANCED: typing.ClassVar[ProducerSharding]
 
 @typing.final
 class QuicConfig:
@@ -4863,6 +5094,21 @@ class UserOptions:
         """
 
 @typing.final
+class UserStatus:
+    r"""
+    The status of a user account.
+    """
+
+    Active: typing.ClassVar[UserStatus]
+    r"""
+    The user account is active and can be used.
+    """
+    Inactive: typing.ClassVar[UserStatus]
+    r"""
+    The user account is inactive and cannot be used.
+    """
+
+@typing.final
 class WebSocketConfig:
     r"""
     Configuration for the WebSocket transport, accepted by `IggyClient(...)`.
@@ -5043,261 +5289,6 @@ class WebSocketReconnectionConfig:
                 raised by the underlying conversion before this constructor runs.
         """
     def __repr__(self) -> builtins.str: ...
-
-@typing.final
-class MetadataChangeGroup(enum.Enum):
-    r"""
-    Family of change records and the unit of filtering. `str()` gives the
-    name the HTTP API uses.
-    """
-
-    Streams = ...
-    Topics = ...
-    Partitions = ...
-    ConsumerGroups = ...
-    ConsumerGroupMembers = ...
-    Users = ...
-    PersonalAccessTokens = ...
-    Sessions = ...
-
-    def __str__(self) -> builtins.str: ...
-
-@typing.final
-class MetadataChangeKind(enum.Enum):
-    r"""
-    Kind of a change record. `str()` gives the name the HTTP API uses.
-    """
-
-    StreamCreated = ...
-    StreamUpdated = ...
-    StreamDeleted = ...
-    TopicCreated = ...
-    TopicUpdated = ...
-    TopicDeleted = ...
-    PartitionsChanged = ...
-    ConsumerGroupCreated = ...
-    ConsumerGroupDeleted = ...
-    ConsumerGroupMemberJoined = ...
-    ConsumerGroupMemberLeft = ...
-    ConsumerGroupPartitionHandedOver = ...
-    UserCreated = ...
-    UserUpdated = ...
-    UserDeleted = ...
-    UserPasswordChanged = ...
-    UserPermissionsUpdated = ...
-    PersonalAccessTokenCreated = ...
-    PersonalAccessTokenDeleted = ...
-    SessionRegistered = ...
-    SessionClosed = ...
-
-    def __str__(self) -> builtins.str: ...
-
-@typing.final
-class MetadataChangePhase(enum.Enum):
-    r"""
-    Whether a page carries change records or current state items.
-    """
-
-    Changes = ...
-    Current = ...
-
-    def __str__(self) -> builtins.str: ...
-
-@typing.final
-class MetadataChangeStatus(enum.Enum):
-    r"""
-    Outcome of a change log query.
-    """
-
-    Ok = ...
-    r"""
-    Records or items after the requested position. Apply them and keep
-    `next`.
-    """
-    Behind = ...
-    r"""
-    The answering node has not applied the requested position yet. Ask
-    again later or ask another node.
-    """
-    Expired = ...
-    r"""
-    The node no longer holds every record after the position. Rebuild
-    from current state.
-    """
-    Reset = ...
-    r"""
-    The position belongs to another history. Rebuild from current state.
-    """
-
-    def __str__(self) -> builtins.str: ...
-
-@typing.final
-class MetadataMemberLeftReason(enum.Enum):
-    r"""
-    Why a consumer group member was removed.
-    """
-
-    Left = ...
-    SessionEnded = ...
-
-    def __str__(self) -> builtins.str: ...
-
-@typing.final
-class MetadataPermissionsUpdatedReason(enum.Enum):
-    r"""
-    Why a user's public permission set changed.
-    """
-
-    Updated = ...
-    r"""
-    An `update_permissions` call replaced the set.
-    """
-    ResourceDeleted = ...
-    r"""
-    A stream or topic delete pruned the user's grants on it.
-    """
-
-    def __str__(self) -> builtins.str: ...
-
-@typing.final
-class MetadataSessionClosedReason(enum.Enum):
-    r"""
-    Why a session was closed.
-    """
-
-    Logout = ...
-    Expired = ...
-
-    def __str__(self) -> builtins.str: ...
-
-@typing.final
-class MetadataTokenDeletedReason(enum.Enum):
-    r"""
-    Why a personal access token was removed.
-    """
-
-    Deleted = ...
-    Expired = ...
-
-    def __str__(self) -> builtins.str: ...
-
-@typing.final
-class OptionKey(enum.Enum):
-    r"""
-    A catalog option key, as `update_stream`, `update_topic` and `update_user`
-    take it in `reset`. `str()` gives the key as it travels on the wire.
-    """
-
-    Name = ...
-    r"""
-    Stream or topic name.
-    """
-    Username = ...
-    r"""
-    User name.
-    """
-    Status = ...
-    r"""
-    User status.
-    """
-    CompressionAlgorithm = ...
-    r"""
-    Topic compression algorithm, fixed at creation.
-    """
-    MessageExpiry = ...
-    r"""
-    Topic message expiry, resettable to never expire.
-    """
-    MaxTopicSize = ...
-    r"""
-    Topic size cap, resettable to unlimited.
-    """
-    SegmentSize = ...
-    r"""
-    Topic segment size, fixed at creation.
-    """
-    Durability = ...
-    r"""
-    Topic message durability, fixed at creation.
-    """
-    ConsumerOffsetDurability = ...
-    r"""
-    Topic consumer offset durability, fixed at creation.
-    """
-    PartitionResizePolicy = ...
-    r"""
-    Topic partition resize policy, fixed at creation.
-    """
-    MessagesRequiredToSave = ...
-    r"""
-    Topic message-count flush threshold, fixed at creation.
-    """
-    SizeOfMessagesRequiredToSave = ...
-    r"""
-    Topic byte flush threshold, fixed at creation.
-    """
-    PreallocateSegments = ...
-    r"""
-    Topic segment preallocation, fixed at creation.
-    """
-    EncryptionKey = ...
-    r"""
-    Stream encryption key, write-only and fixed at creation.
-    """
-    EncryptionKeySource = ...
-    r"""
-    Who chose the stream's key, computed by the server.
-    """
-    EncryptionKeyFingerprint = ...
-    r"""
-    Fingerprint of the stream's key, computed by the server.
-    """
-    EncryptionKekFingerprint = ...
-    r"""
-    Fingerprints of the server keys wrapping the stream's key, computed by
-    the server.
-    """
-
-    def __str__(self) -> builtins.str: ...
-
-@typing.final
-class PartitionResizePolicy(enum.Enum):
-    r"""
-    Whether partitions can be added to or deleted from a topic after creation.
-    """
-
-    Mutable = ...
-    r"""
-    Partitions can be added and deleted.
-    """
-    Fixed = ...
-    r"""
-    The partition set is fixed at topic creation.
-    """
-
-@typing.final
-class ProducerSharding(enum.Enum):
-    r"""
-    How a background producer distributes sends among its workers.
-    """
-
-    ORDERED = ...
-    BALANCED = ...
-
-@typing.final
-class UserStatus(enum.Enum):
-    r"""
-    The status of a user account.
-    """
-
-    Active = ...
-    r"""
-    The user account is active and can be used.
-    """
-    Inactive = ...
-    r"""
-    The user account is inactive and cannot be used.
-    """
 
 def encryption_key_fingerprint(key: builtins.bytes | builtins.str) -> builtins.str:
     r"""

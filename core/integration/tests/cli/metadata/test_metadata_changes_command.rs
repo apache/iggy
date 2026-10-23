@@ -71,8 +71,8 @@ impl IggyCmdTestCase for TestMetadataChangesCmd {
             Read::Changes => {
                 command_state
                     .success()
-                    .stdout(starts_with("Executing metadata changes command\n"))
-                    .stdout(contains(r#""status":"ok""#))
+                    .stderr(starts_with("Executing metadata changes command\n"))
+                    .stdout(starts_with(r#"{"status":"ok""#))
                     .stdout(contains(r#""kind":"stream_created""#))
                     .stdout(contains(format!(r#""name":"{STREAM}""#)));
             }

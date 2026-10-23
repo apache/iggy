@@ -25,11 +25,15 @@ use iggy::prelude::{
     MetadataChangeStart as RustMetadataChangeStart,
     MetadataChangeStatus as RustMetadataChangeStatus, MetadataChanges as RustMetadataChanges,
     MetadataChangesQuery, MetadataCurrentItem as RustMetadataCurrentItem,
-    MetadataCurrentPageToken as RustMetadataCurrentPageToken, MetadataOptions,
-    Permissions as RustPermissions, ResourceOptions,
+    MetadataCurrentPageToken as RustMetadataCurrentPageToken,
+    MetadataMemberLeftReason as RustMetadataMemberLeftReason, MetadataOptions,
+    MetadataPermissionsUpdatedReason as RustMetadataPermissionsUpdatedReason,
+    MetadataSessionClosedReason as RustMetadataSessionClosedReason,
+    MetadataTokenDeletedReason as RustMetadataTokenDeletedReason, Permissions as RustPermissions,
+    ResourceOptions,
 };
 use pyo3::IntoPyObjectExt;
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
 use pyo3_stub_gen::derive::{
@@ -950,10 +954,7 @@ impl MetadataChangePhase {
 #[pymethods]
 impl MetadataMemberLeftReason {
     fn __str__(&self) -> &'static str {
-        match self {
-            Self::Left => "left",
-            Self::SessionEnded => "session_ended",
-        }
+        RustMetadataMemberLeftReason::from(*self).into()
     }
 }
 
@@ -961,10 +962,7 @@ impl MetadataMemberLeftReason {
 #[pymethods]
 impl MetadataTokenDeletedReason {
     fn __str__(&self) -> &'static str {
-        match self {
-            Self::Deleted => "deleted",
-            Self::Expired => "expired",
-        }
+        RustMetadataTokenDeletedReason::from(*self).into()
     }
 }
 
@@ -972,10 +970,7 @@ impl MetadataTokenDeletedReason {
 #[pymethods]
 impl MetadataSessionClosedReason {
     fn __str__(&self) -> &'static str {
-        match self {
-            Self::Logout => "logout",
-            Self::Expired => "expired",
-        }
+        RustMetadataSessionClosedReason::from(*self).into()
     }
 }
 
@@ -983,10 +978,7 @@ impl MetadataSessionClosedReason {
 #[pymethods]
 impl MetadataPermissionsUpdatedReason {
     fn __str__(&self) -> &'static str {
-        match self {
-            Self::Updated => "updated",
-            Self::ResourceDeleted => "resource_deleted",
-        }
+        RustMetadataPermissionsUpdatedReason::from(*self).into()
     }
 }
 
@@ -1333,55 +1325,30 @@ mirror_enum!(
     Changes,
     Current
 );
-
-// The SDK prelude does not export the reason enums, so they map by their wire names.
-impl FromStr for MetadataMemberLeftReason {
-    type Err = PyErr;
-
-    fn from_str(name: &str) -> PyResult<Self> {
-        match name {
-            "left" => Ok(Self::Left),
-            "session_ended" => Ok(Self::SessionEnded),
-            _ => Err(unknown_reason(name)),
-        }
-    }
-}
-
-impl FromStr for MetadataTokenDeletedReason {
-    type Err = PyErr;
-
-    fn from_str(name: &str) -> PyResult<Self> {
-        match name {
-            "deleted" => Ok(Self::Deleted),
-            "expired" => Ok(Self::Expired),
-            _ => Err(unknown_reason(name)),
-        }
-    }
-}
-
-impl FromStr for MetadataSessionClosedReason {
-    type Err = PyErr;
-
-    fn from_str(name: &str) -> PyResult<Self> {
-        match name {
-            "logout" => Ok(Self::Logout),
-            "expired" => Ok(Self::Expired),
-            _ => Err(unknown_reason(name)),
-        }
-    }
-}
-
-impl FromStr for MetadataPermissionsUpdatedReason {
-    type Err = PyErr;
-
-    fn from_str(name: &str) -> PyResult<Self> {
-        match name {
-            "updated" => Ok(Self::Updated),
-            "resource_deleted" => Ok(Self::ResourceDeleted),
-            _ => Err(unknown_reason(name)),
-        }
-    }
-}
+mirror_enum!(
+    MetadataMemberLeftReason,
+    RustMetadataMemberLeftReason,
+    Left,
+    SessionEnded
+);
+mirror_enum!(
+    MetadataTokenDeletedReason,
+    RustMetadataTokenDeletedReason,
+    Deleted,
+    Expired
+);
+mirror_enum!(
+    MetadataSessionClosedReason,
+    RustMetadataSessionClosedReason,
+    Logout,
+    Expired
+);
+mirror_enum!(
+    MetadataPermissionsUpdatedReason,
+    RustMetadataPermissionsUpdatedReason,
+    Updated,
+    ResourceDeleted
+);
 
 /// A group or kind as the transport carried it.
 enum UnknownCode {
@@ -1576,7 +1543,7 @@ fn change_body(py: Python<'_>, change: RustMetadataChange) -> PyResult<Py<PyAny>
             member_id: body.member_id,
             client_id: body.client_id,
             members_count: body.members_count,
-            reason: MetadataMemberLeftReason::from_str(body.reason.into())?,
+            reason: body.reason.into(),
         }
         .into_py_any(py),
         RustMetadataChange::ConsumerGroupPartitionHandedOver(body) => MetadataPartitionHandedOver {
@@ -1613,7 +1580,7 @@ fn change_body(py: Python<'_>, change: RustMetadataChange) -> PyResult<Py<PyAny>
             user_created_at: body.user_created_at,
             username: body.username,
             permissions: body.permissions,
-            reason: MetadataPermissionsUpdatedReason::from_str(body.reason.into())?,
+            reason: body.reason.into(),
         }
         .into_py_any(py),
         RustMetadataChange::PersonalAccessTokenCreated(body) => MetadataTokenChange {
@@ -1627,7 +1594,7 @@ fn change_body(py: Python<'_>, change: RustMetadataChange) -> PyResult<Py<PyAny>
             user_id: body.user_id,
             user_created_at: body.user_created_at,
             name: body.name,
-            reason: MetadataTokenDeletedReason::from_str(body.reason.into())?,
+            reason: body.reason.into(),
         }
         .into_py_any(py),
         RustMetadataChange::SessionRegistered(body) => MetadataSession {
@@ -1642,7 +1609,7 @@ fn change_body(py: Python<'_>, change: RustMetadataChange) -> PyResult<Py<PyAny>
             user_created_at: body.user_created_at,
             client_id: body.client_id,
             session: body.session,
-            reason: MetadataSessionClosedReason::from_str(body.reason.into())?,
+            reason: body.reason.into(),
         }
         .into_py_any(py),
         RustMetadataChange::Unknown { group, kind, body } => MetadataUnknownChange {
@@ -1759,10 +1726,6 @@ fn options_view<'a>(
     options
         .map(|options| options_by_provenance(py, options, explicit))
         .transpose()
-}
-
-fn unknown_reason(name: &str) -> PyErr {
-    PyRuntimeError::new_err(format!("unknown metadata change reason '{name}'"))
 }
 
 #[cfg(test)]

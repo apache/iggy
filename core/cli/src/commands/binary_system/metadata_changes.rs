@@ -15,13 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::commands::cli_command::{CliCommand, PRINT_TARGET};
+use crate::commands::cli_command::CliCommand;
 use anyhow::{Context, bail};
 use async_trait::async_trait;
 use iggy_common::{
-    Client, IggyDuration, MetadataChangeStart, MetadataChangeStatus, MetadataChangesQuery,
+    Client, IggyDuration, MetadataChangeStart, MetadataChangeStatus, MetadataChanges,
+    MetadataChangesQuery,
 };
-use tracing::{Level, event};
+use std::io::{Write, stdout};
 
 /// Reads metadata change pages and prints each as one JSON line.
 pub struct GetMetadataChangesCmd {
@@ -38,12 +39,70 @@ impl GetMetadataChangesCmd {
             interval,
         }
     }
+
+    /// What to read after `page` answered `query`.
+    fn step(&self, mut query: MetadataChangesQuery, page: MetadataChanges) -> anyhow::Result<Step> {
+        match page.status {
+            MetadataChangeStatus::Ok => {}
+            MetadataChangeStatus::Behind if self.follow => return Ok(Step::Wait(query)),
+            MetadataChangeStatus::Behind => return Ok(Step::Stop),
+            MetadataChangeStatus::Expired | MetadataChangeStatus::Reset if self.follow => {
+                return Ok(Step::Read(self.current_state_query()));
+            }
+            MetadataChangeStatus::Expired | MetadataChangeStatus::Reset => {
+                bail!(
+                    "The history after the cursor is not available ({}), read it again with --from current",
+                    serde_json::to_string(&page.status)?
+                );
+            }
+        }
+        if let MetadataChangeStart::Current(_) = query.start {
+            return Ok(match (page.current_page_token, page.next) {
+                (Some(token), _) => {
+                    query.start = MetadataChangeStart::Current(Some(token));
+                    Step::Read(query)
+                }
+                (None, Some(anchor)) if self.follow => Step::Read(MetadataChangesQuery {
+                    start: MetadataChangeStart::After(anchor),
+                    ..self.query.clone()
+                }),
+                _ => Step::Stop,
+            });
+        }
+        if let Some(next) = page.next {
+            query.start = MetadataChangeStart::After(next);
+        }
+        Ok(if page.has_more {
+            Step::Read(query)
+        } else if self.follow {
+            Step::Wait(query)
+        } else {
+            Step::Stop
+        })
+    }
+
+    /// The rebuild scan, with the parent groups and no time bounds the server requires.
+    fn current_state_query(&self) -> MetadataChangesQuery {
+        let mut groups = self.query.groups.clone();
+        groups.extend(self.query.groups.iter().flat_map(|group| group.parents()));
+        MetadataChangesQuery {
+            start: MetadataChangeStart::Current(None),
+            groups,
+            since: None,
+            until: None,
+            limit: self.query.limit,
+        }
+    }
 }
 
 #[async_trait]
 impl CliCommand for GetMetadataChangesCmd {
     fn explain(&self) -> String {
         "metadata changes command".to_owned()
+    }
+
+    fn stdout_is_data(&self) -> bool {
+        true
     }
 
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
@@ -58,51 +117,124 @@ impl CliCommand for GetMetadataChangesCmd {
                 && page.records.is_empty()
                 && page.items.is_empty();
             if !quiet_follow_page {
-                event!(target: PRINT_TARGET, Level::INFO, "{}", serde_json::to_string(&page)?);
+                let line = serde_json::to_string(&page)?;
+                let mut output = stdout().lock();
+                writeln!(output, "{line}")
+                    .and_then(|()| output.flush())
+                    .with_context(|| "Problem writing metadata changes page".to_owned())?;
             }
-            match page.status {
-                MetadataChangeStatus::Ok => {}
-                MetadataChangeStatus::Behind if self.follow => {
+            query = match self.step(query, page)? {
+                Step::Read(next) => next,
+                Step::Wait(next) => {
                     tokio::time::sleep(self.interval.get_duration()).await;
-                    continue;
+                    next
                 }
-                MetadataChangeStatus::Behind => return Ok(()),
-                MetadataChangeStatus::Expired | MetadataChangeStatus::Reset if self.follow => {
-                    query.start = MetadataChangeStart::Current(None);
-                    query.since = None;
-                    query.until = None;
-                    continue;
-                }
-                MetadataChangeStatus::Expired | MetadataChangeStatus::Reset => {
-                    bail!(
-                        "The history after the cursor is not available ({}), read it again with --from current",
-                        serde_json::to_string(&page.status)?
-                    );
-                }
-            }
-            if let MetadataChangeStart::Current(_) = query.start {
-                match (page.current_page_token, page.next) {
-                    (Some(token), _) => {
-                        query.start = MetadataChangeStart::Current(Some(token));
-                        continue;
-                    }
-                    (None, Some(anchor)) if self.follow => {
-                        query.start = MetadataChangeStart::After(anchor);
-                    }
-                    _ => return Ok(()),
-                }
-                continue;
-            }
-            if let Some(next) = page.next {
-                query.start = MetadataChangeStart::After(next);
-            }
-            if page.has_more {
-                continue;
-            }
-            if !self.follow {
-                return Ok(());
-            }
-            tokio::time::sleep(self.interval.get_duration()).await;
+                Step::Stop => return Ok(()),
+            };
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum Step {
+    Read(MetadataChangesQuery),
+    Wait(MetadataChangesQuery),
+    Stop,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iggy_common::{
+        IggyTimestamp, MetadataChangeCursor, MetadataChangeGroup, MetadataChangeGroups,
+        MetadataChangePhase,
+    };
+
+    #[test]
+    fn given_expired_cursor_when_following_topics_should_rebuild_with_their_parent_groups() {
+        let command = following(vec![MetadataChangeGroup::Topics]);
+        let step = command
+            .step(
+                command.query.clone(),
+                page(MetadataChangeStatus::Expired, None),
+            )
+            .expect("recovery step");
+        let Step::Read(recovery) = step else {
+            panic!("expected an immediate read, got {step:?}");
+        };
+        assert_eq!(recovery.start, MetadataChangeStart::Current(None));
+        assert_eq!(
+            recovery.validate(),
+            Ok(MetadataChangeGroups::requested(&[
+                MetadataChangeGroup::Streams,
+                MetadataChangeGroup::Topics
+            ]))
+        );
+    }
+
+    #[test]
+    fn given_finished_recovery_scan_when_following_should_restore_requested_groups_and_bounds() {
+        let command = following(vec![MetadataChangeGroup::Topics]);
+        let Step::Read(recovery) = command
+            .step(
+                command.query.clone(),
+                page(MetadataChangeStatus::Reset, None),
+            )
+            .expect("recovery step")
+        else {
+            panic!("expected an immediate read");
+        };
+        let anchor = MetadataChangeCursor {
+            log_id: 7,
+            op: 42,
+            checksum: 9,
+            ordinal: 0,
+        };
+        let step = command
+            .step(
+                recovery,
+                MetadataChanges {
+                    phase: MetadataChangePhase::Current,
+                    ..page(MetadataChangeStatus::Ok, Some(anchor))
+                },
+            )
+            .expect("hand over step");
+        assert_eq!(
+            step,
+            Step::Read(MetadataChangesQuery {
+                start: MetadataChangeStart::After(anchor),
+                ..command.query.clone()
+            })
+        );
+    }
+
+    fn following(groups: Vec<MetadataChangeGroup>) -> GetMetadataChangesCmd {
+        GetMetadataChangesCmd::new(
+            MetadataChangesQuery {
+                start: MetadataChangeStart::Earliest,
+                groups,
+                since: Some(IggyTimestamp::from(1_000)),
+                until: Some(IggyTimestamp::from(9_000)),
+                limit: 50,
+            },
+            true,
+            IggyDuration::ONE_SECOND,
+        )
+    }
+
+    fn page(status: MetadataChangeStatus, next: Option<MetadataChangeCursor>) -> MetadataChanges {
+        MetadataChanges {
+            status,
+            phase: MetadataChangePhase::Changes,
+            log_id: Some(7),
+            oldest_op: 1,
+            retained_since: 0,
+            head_op: 42,
+            next,
+            has_more: false,
+            records: vec![],
+            items: vec![],
+            current_page_token: None,
         }
     }
 }
