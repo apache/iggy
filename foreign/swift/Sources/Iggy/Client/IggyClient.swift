@@ -224,6 +224,30 @@ public final class IggyClient: Sendable {
     func requireAuthenticated() async throws -> UInt64 {
         try await core.requireAuthenticated()
     }
+
+    /// As ``requireAuthenticated()`` for a call pinned to `captured`, such as
+    /// a producer send: once the caller signed in or out since, the call is
+    /// refused as unauthenticated before anything of it is written.
+    func requireAuthenticated(under captured: UInt64?) async throws -> UInt64 {
+        let started = try await requireAuthenticated()
+        guard let captured else {
+            return started
+        }
+        if let refusal = await core.lineageRefusal(captured) {
+            throw refusal
+        }
+        return captured
+    }
+
+    /// The lineage a call that starts now runs under.
+    var operationLineage: UInt64 {
+        get async { await core.lineage }
+    }
+
+    /// The refusal of a call pinned to `captured`, nil while it may go on.
+    func lineageRefusal(_ captured: UInt64) async -> IggyError? {
+        await core.lineageRefusal(captured)
+    }
 }
 
 // MARK: - System

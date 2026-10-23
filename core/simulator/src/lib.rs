@@ -15809,6 +15809,120 @@ mod probe_answer_divergence_tests {
 }
 
 #[cfg(test)]
+mod metadata_walk_stuck_detector_tests {
+    //! The metadata walk-stall detector in `tick_metadata` must keep the
+    //! pipeline head journaled.
+    //!
+    //! `commit_journal` stops at the op the pipeline holds and reports
+    //! `CommitWalkStop::PipelineHead`, and the detector truncates only on
+    //! `BodyMissing`. Truncating from the head would leave the primary's
+    //! pipeline with a committed header whose prepare is gone, and the next
+    //! commit driver would panic with `committed prepare ... must be in journal`.
+
+    use consensus::Consensus;
+
+    use super::*;
+
+    /// Swarm seed whose network elects replica 1 primary of view 1 with a
+    /// committed pipeline head it has not yet walked.
+    const SEED: u64 = 1723;
+    const REPLICAS: u8 = 3;
+    const CLIENTS: [u128; 3] = [1, 2, 3];
+
+    const VIEW_0_PRIMARY: u8 = 0;
+    /// The replica the faults leave to win view 1.
+    const PRIMARY_ELECT: usize = 1;
+
+    /// Replica faults as `(step, replica, crash)`. The view-0 primary goes
+    /// down, which puts the view-1 change on the primary-elect, and comes back
+    /// before the primary-elect holds the inherited head.
+    const FAULTS: [(usize, u8, bool); 2] =
+        [(130, VIEW_0_PRIMARY, true), (250, VIEW_0_PRIMARY, false)];
+
+    /// Past the inherited-head window, then the drain heals the cluster.
+    const FAULT_STEPS: usize = 800;
+    const DRAIN_STEPS: usize = 4_000;
+
+    /// Only the three `Register`s go through the metadata plane: no client
+    /// traffic, no metadata workload. Op 3 is the last of them.
+    const REGISTERED_OPS: u64 = 3;
+
+    #[test]
+    fn given_primary_elect_inheriting_a_committed_head_when_the_tick_probes_the_walk_should_keep_its_prepare()
+     {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+        let mut network = packet::PacketSimulatorOptions::swarm(SEED);
+        network.node_count = REPLICAS;
+        network.client_count = u8::try_from(CLIENTS.len()).expect("few clients");
+        let mut sim = Simulator::new(usize::from(REPLICAS), CLIENTS.iter().copied(), network);
+        sim.init_partition(IggyNamespace::new(1, 1, 0));
+        for id in CLIENTS {
+            sim.register_client_with_primary(&SimClient::new(id));
+        }
+
+        let mut inherited_head_seen = false;
+        for step in 0..FAULT_STEPS {
+            for &(at, replica, crash) in &FAULTS {
+                if at == step {
+                    if crash {
+                        sim.replica_crash(replica);
+                    } else {
+                        sim.replica_restart(replica);
+                    }
+                }
+            }
+            sim.step();
+            inherited_head_seen |= primary_elect_holds_inherited_head(&sim);
+        }
+        // Without this a drifted seed that never builds the shape passes the
+        // drain assertion below without testing anything.
+        assert!(
+            inherited_head_seen,
+            "replica {PRIMARY_ELECT} never led view 1 with a committed pipeline head at \
+             commit_min + 1; the seed no longer reaches the shape under test"
+        );
+        for _ in 0..DRAIN_STEPS {
+            sim.step();
+        }
+
+        // Every replica applies every registration: a dropped pipeline prepare
+        // must neither panic the primary nor leave any replica short of it.
+        for replica in 0..usize::from(REPLICAS) {
+            let consensus = sim
+                .metadata_consensus(replica)
+                .expect("shard 0 hosts the metadata plane");
+            assert!(
+                consensus.commit_min() >= REGISTERED_OPS,
+                "replica {replica} applied metadata only through op {}, short of the \
+                 {REGISTERED_OPS} registrations",
+                consensus.commit_min()
+            );
+        }
+    }
+
+    /// Whether the primary-elect is a normal primary of view 1 or later whose
+    /// pipeline head is committed and is the very next op it owes the state
+    /// machine. Gated like `group_is_walk_stalled`, so a view-change window
+    /// does not count.
+    fn primary_elect_holds_inherited_head(sim: &Simulator) -> bool {
+        let consensus = sim
+            .metadata_consensus(PRIMARY_ELECT)
+            .expect("shard 0 hosts the metadata plane");
+        consensus.is_primary()
+            && consensus.is_normal()
+            && !consensus.is_transferring()
+            && consensus.view() >= 1
+            && consensus.pipeline_head_header().is_some_and(|head| {
+                head.op == consensus.commit_min() + 1 && head.op <= consensus.commit_max()
+            })
+    }
+}
+
+#[cfg(test)]
 mod primary_transfer_crash_tests {
     //! Crash each replica at each handoff message of a planned primary transfer.
     //!
