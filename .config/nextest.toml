@@ -106,8 +106,8 @@ slow-timeout = { period = "60s" }
 filter = '''
     package(=iggy_binary_protocol) & (
         test(=primitives::options::tests::entry_count_over_limit_is_rejected)
-        | test(=requests::messages::poll_messages::tests::given_poll_encodings_when_peeking_progress_should_match_full_decode)
-        | test(=requests::messages::poll_messages::tests::given_mutated_poll_fields_when_peeking_progress_should_match_full_decode)
+        | test(~requests::messages::poll_messages::tests::progress_peek_encodings::)
+        | test(~requests::messages::poll_messages::tests::progress_peek_mutations::)
     )
 '''
 priority = 100

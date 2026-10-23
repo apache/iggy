@@ -147,51 +147,88 @@ impl WireDecode for PollMessagesRequest {
 mod tests {
     use super::*;
 
-    #[test]
-    fn given_poll_encodings_when_peeking_progress_should_match_full_decode() {
-        let identifiers = [
-            WireIdentifier::numeric(u32::MAX),
-            WireIdentifier::named("named-é").unwrap(),
-        ];
-        for consumer_id in &identifiers {
-            for consumer in [
-                WireConsumer::consumer(consumer_id.clone()),
-                WireConsumer::consumer_group(consumer_id.clone()),
-                WireConsumer::external_group(consumer_id.clone()),
-            ] {
-                for stream_id in &identifiers {
-                    for topic_id in &identifiers {
-                        for strategy in [
-                            WirePollingStrategy::offset(0),
-                            WirePollingStrategy::offset(u64::MAX),
-                            WirePollingStrategy::timestamp(u64::MAX),
-                            WirePollingStrategy::first(),
-                            WirePollingStrategy::last(),
-                            WirePollingStrategy::next(),
-                        ] {
-                            for partition_id in [None, Some(u32::MAX)] {
-                                for auto_commit in [false, true] {
-                                    for count in [0, u32::MAX] {
-                                        let request = PollMessagesRequest {
-                                            consumer: consumer.clone(),
-                                            stream_id: stream_id.clone(),
-                                            topic_id: topic_id.clone(),
-                                            partition_id,
-                                            strategy: strategy.clone(),
-                                            count,
-                                            auto_commit,
-                                        };
-                                        let mut bytes = request.to_bytes().to_vec();
-                                        assert_eq!(
-                                            PollMessagesRequest::decode_from(&bytes).unwrap(),
-                                            request
-                                        );
-                                        for end in 0..=bytes.len() {
-                                            assert_progress_peek_matches(&bytes[..end]);
-                                        }
-                                        bytes.extend_from_slice(b"trailing\0\xff");
-                                        assert_progress_peek_matches(&bytes);
+    mod progress_peek_encodings {
+        use super::*;
+
+        #[test]
+        fn given_numeric_consumer_when_peeking_progress_should_match_full_decode() {
+            assert_poll_encodings_peek_matches(&WireConsumer::consumer(WireIdentifier::numeric(
+                u32::MAX,
+            )));
+        }
+
+        #[test]
+        fn given_named_consumer_when_peeking_progress_should_match_full_decode() {
+            assert_poll_encodings_peek_matches(&WireConsumer::consumer(
+                WireIdentifier::named("named-é").unwrap(),
+            ));
+        }
+
+        #[test]
+        fn given_numeric_consumer_group_when_peeking_progress_should_match_full_decode() {
+            assert_poll_encodings_peek_matches(&WireConsumer::consumer_group(
+                WireIdentifier::numeric(u32::MAX),
+            ));
+        }
+
+        #[test]
+        fn given_named_consumer_group_when_peeking_progress_should_match_full_decode() {
+            assert_poll_encodings_peek_matches(&WireConsumer::consumer_group(
+                WireIdentifier::named("named-é").unwrap(),
+            ));
+        }
+
+        #[test]
+        fn given_numeric_external_group_when_peeking_progress_should_match_full_decode() {
+            assert_poll_encodings_peek_matches(&WireConsumer::external_group(
+                WireIdentifier::numeric(u32::MAX),
+            ));
+        }
+
+        #[test]
+        fn given_named_external_group_when_peeking_progress_should_match_full_decode() {
+            assert_poll_encodings_peek_matches(&WireConsumer::external_group(
+                WireIdentifier::named("named-é").unwrap(),
+            ));
+        }
+
+        fn assert_poll_encodings_peek_matches(consumer: &WireConsumer) {
+            let identifiers = [
+                WireIdentifier::numeric(u32::MAX),
+                WireIdentifier::named("named-é").unwrap(),
+            ];
+            for stream_id in &identifiers {
+                for topic_id in &identifiers {
+                    for strategy in [
+                        WirePollingStrategy::offset(0),
+                        WirePollingStrategy::offset(u64::MAX),
+                        WirePollingStrategy::timestamp(u64::MAX),
+                        WirePollingStrategy::first(),
+                        WirePollingStrategy::last(),
+                        WirePollingStrategy::next(),
+                    ] {
+                        for partition_id in [None, Some(u32::MAX)] {
+                            for auto_commit in [false, true] {
+                                for count in [0, u32::MAX] {
+                                    let request = PollMessagesRequest {
+                                        consumer: consumer.clone(),
+                                        stream_id: stream_id.clone(),
+                                        topic_id: topic_id.clone(),
+                                        partition_id,
+                                        strategy: strategy.clone(),
+                                        count,
+                                        auto_commit,
+                                    };
+                                    let mut bytes = request.to_bytes().to_vec();
+                                    assert_eq!(
+                                        PollMessagesRequest::decode_from(&bytes).unwrap(),
+                                        request
+                                    );
+                                    for end in 0..=bytes.len() {
+                                        assert_progress_peek_matches(&bytes[..end]);
                                     }
+                                    bytes.extend_from_slice(b"trailing\0\xff");
+                                    assert_progress_peek_matches(&bytes);
                                 }
                             }
                         }
@@ -201,29 +238,93 @@ mod tests {
         }
     }
 
-    #[test]
-    fn given_mutated_poll_fields_when_peeking_progress_should_match_full_decode() {
-        for identifier in [
-            WireIdentifier::numeric(1),
-            WireIdentifier::named("café").unwrap(),
-        ] {
-            let request = PollMessagesRequest {
-                consumer: WireConsumer::consumer(identifier.clone()),
-                stream_id: identifier.clone(),
-                topic_id: identifier,
-                partition_id: Some(0),
-                strategy: WirePollingStrategy::offset(0),
-                count: 0,
-                auto_commit: false,
-            };
-            let mut bytes = request.to_bytes().to_vec();
-            for offset in 0..bytes.len() {
-                let original = bytes[offset];
-                for value in u8::MIN..=u8::MAX {
-                    bytes[offset] = value;
-                    assert_progress_peek_matches(&bytes);
+    mod progress_peek_mutations {
+        use super::*;
+
+        #[test]
+        fn given_mutated_consumer_when_peeking_progress_should_match_full_decode() {
+            assert_mutated_poll_field_peek_matches(PollField::Consumer);
+        }
+
+        #[test]
+        fn given_mutated_stream_when_peeking_progress_should_match_full_decode() {
+            assert_mutated_poll_field_peek_matches(PollField::Stream);
+        }
+
+        #[test]
+        fn given_mutated_topic_when_peeking_progress_should_match_full_decode() {
+            assert_mutated_poll_field_peek_matches(PollField::Topic);
+        }
+
+        #[test]
+        fn given_mutated_partition_when_peeking_progress_should_match_full_decode() {
+            assert_mutated_poll_field_peek_matches(PollField::Partition);
+        }
+
+        #[test]
+        fn given_mutated_strategy_when_peeking_progress_should_match_full_decode() {
+            assert_mutated_poll_field_peek_matches(PollField::Strategy);
+        }
+
+        #[test]
+        fn given_mutated_count_when_peeking_progress_should_match_full_decode() {
+            assert_mutated_poll_field_peek_matches(PollField::Count);
+        }
+
+        #[test]
+        fn given_mutated_auto_commit_when_peeking_progress_should_match_full_decode() {
+            assert_mutated_poll_field_peek_matches(PollField::AutoCommit);
+        }
+
+        #[derive(Clone, Copy)]
+        enum PollField {
+            Consumer,
+            Stream,
+            Topic,
+            Partition,
+            Strategy,
+            Count,
+            AutoCommit,
+        }
+
+        fn assert_mutated_poll_field_peek_matches(field: PollField) {
+            for identifier in [
+                WireIdentifier::numeric(1),
+                WireIdentifier::named("café").unwrap(),
+            ] {
+                let request = PollMessagesRequest {
+                    consumer: WireConsumer::consumer(identifier.clone()),
+                    stream_id: identifier.clone(),
+                    topic_id: identifier,
+                    partition_id: Some(0),
+                    strategy: WirePollingStrategy::offset(0),
+                    count: 0,
+                    auto_commit: false,
+                };
+                let mut bytes = request.to_bytes().to_vec();
+                let consumer_end = request.consumer.encoded_size();
+                let stream_end = consumer_end + request.stream_id.encoded_size();
+                let topic_end = stream_end + request.topic_id.encoded_size();
+                let partition_end = topic_end + PARTITION_FLAG_SIZE + PARTITION_VALUE_SIZE;
+                let strategy_end = partition_end + STRATEGY_SIZE;
+                let count_end = strategy_end + COUNT_SIZE;
+                let offsets = match field {
+                    PollField::Consumer => 0..consumer_end,
+                    PollField::Stream => consumer_end..stream_end,
+                    PollField::Topic => stream_end..topic_end,
+                    PollField::Partition => topic_end..partition_end,
+                    PollField::Strategy => partition_end..strategy_end,
+                    PollField::Count => strategy_end..count_end,
+                    PollField::AutoCommit => count_end..bytes.len(),
+                };
+                for offset in offsets {
+                    let original = bytes[offset];
+                    for value in u8::MIN..=u8::MAX {
+                        bytes[offset] = value;
+                        assert_progress_peek_matches(&bytes);
+                    }
+                    bytes[offset] = original;
                 }
-                bytes[offset] = original;
             }
         }
     }
