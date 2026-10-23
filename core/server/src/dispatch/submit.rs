@@ -51,7 +51,7 @@ use server_common::Message;
 use server_common::sharding::IggyNamespace;
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tracing::{trace, warn};
 
 /// In normal operation the primary commits a completion itself, and a backup
@@ -90,6 +90,16 @@ pub(in crate::dispatch) fn handle_metadata_submit<B, MJ, S, SB>(
     let bus = shard.bus.clone();
     bus.spawn(async move {
         match submit {
+            shard::MetadataSubmit::ResolveSegmentDelete {
+                namespace, count, created_revision, minimum_metadata_op, reply,
+            } => {
+                let result = super::segment_delete::resolve(&shard, namespace, count, created_revision, minimum_metadata_op).await;
+                let _ = reply.try_send(result);
+            }
+            shard::MetadataSubmit::ForwardedSegmentDelete(query) => {
+                super::segment_delete::answer(&shard, *query.header()).await;
+            }
+
             shard::MetadataSubmit::ConsumerSessionHeartbeat(message) => {
                 let metadata = shard.plane.metadata();
                 if let Some(consensus) = metadata.consensus.as_ref() {
@@ -103,7 +113,7 @@ pub(in crate::dispatch) fn handle_metadata_submit<B, MJ, S, SB>(
                             && !consensus.is_transferring())
                         .then_some(consensus.view()),
                         &message,
-                        Instant::now(),
+                        shard.bus.monotonic_now(),
                         session_timeout,
                     );
                 }

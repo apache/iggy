@@ -31,77 +31,147 @@ internal readonly record struct MutationLane(ulong Incarnation, uint PartitionId
 ///     One client-wide mutation budget and FIFO lane table. Retention keeps the original reservation;
 ///     queue references keep bytes charged until the writer releases them, even after abandon or reset.
 ///     The outcomes that the last replays proved stay readable, also after a reset, because request ids never
-///     repeat within a client.
+///     repeat within a client. A waiter keeps its place while <paramref name="signInRecovery" /> returns the
+///     running recovery that signs in again, and enters under the session that continues its own.
 /// </summary>
-internal sealed class MutationLanes(ConsensusSession session, IggyClientConfigurator configuration)
+/// <remarks>
+///     Only the first waiter of a free lane takes budget, and the waiters take it in the order they queued for it,
+///     so a release wakes only a waiter it can admit. Restarts take bytes ahead of the enters, because a restart
+///     keeps its slot and an enter can wait for exactly that slot. An admission reserves its budget and request id
+///     under the gate and builds its frame outside it. A failed build, a cancellation or a session change in
+///     between gives the reservation back, so no request id is kept without a frame.
+/// </remarks>
+internal sealed class MutationLanes(ConsensusSession session, IggyClientConfigurator configuration,
+    Func<Task?>? signInRecovery = null)
 {
-    private sealed class Waiting(MutationLane lane)
+    private sealed class Waiter(MutationLane lane, int size, bool retainable, bool restart)
     {
         internal readonly MutationLane Lane = lane;
+        internal readonly int Size = size;
+        internal readonly bool Retainable = retainable;
+        internal readonly bool Restart = restart;
+        internal LinkedListNode<Waiter>? LaneNode;
+        internal LinkedListNode<Waiter>? BudgetNode;
+        private TaskCompletionSource? _signal;
+
+        // Armed under the gate after a failed admission check, so a wake that comes later reaches the wait.
+        internal Task Arm()
+        {
+            _signal = NewSignal();
+            return _signal.Task;
+        }
+
+        internal void Wake() => _signal?.TrySetResult();
     }
-    private readonly int _maxOperations = configuration.MaxPendingOperations > 0 ? configuration.MaxPendingOperations
-        : throw new ArgumentOutOfRangeException(nameof(configuration.MaxPendingOperations));
-    private readonly long _maxBytes = configuration.MaxPendingOperationBytes > 0
-        ? configuration.MaxPendingOperationBytes : throw new ArgumentOutOfRangeException(nameof(configuration.MaxPendingOperationBytes));
+
+    private readonly int _maxOperations = ValidateLimits(configuration).MaxPendingOperations;
+    private readonly long _maxBytes = configuration.MaxPendingOperationBytes;
     private readonly object _gate = new();
-    private readonly List<Waiting> _waiting = [];
+    private readonly Dictionary<MutationLane, LinkedList<Waiter>> _laneWaiters = [];
+    private readonly LinkedList<Waiter> _restartWaiters = new();
+    private readonly LinkedList<Waiter> _budgetWaiters = new();
     private readonly Dictionary<MutationLane, ClientOperation> _lanes = [];
     private readonly Dictionary<ulong, ClientOperation> _operations = [];
     private readonly Queue<(ulong OperationId, IggyInvalidStatusCodeException? Rejection)> _proved = new();
-    private TaskCompletionSource _changed = NewSignal();
     private int _admitted;
     private long _bytes;
 
-    internal async Task<ClientOperation> EnterAsync(MutationLane lane, int code, ReadOnlyMemory<byte> body,
-        PartitionContext context, bool retainable, CancellationToken token)
+    /// <summary>Rejects pending limits that admit no mutation, so the client factory can fail before construction.</summary>
+    internal static IggyClientConfigurator ValidateLimits(IggyClientConfigurator configuration)
     {
-        var size = FrameSize(body, retainable);
-        var generation = session.Generation;
-        var waiter = new Waiting(lane);
-        lock (_gate)
+        if (configuration.MaxPendingOperations <= 0)
         {
-            _waiting.Add(waiter);
+            throw new ArgumentOutOfRangeException(nameof(IggyClientConfigurator.MaxPendingOperations),
+                configuration.MaxPendingOperations, "MaxPendingOperations must be greater than 0.");
         }
+
+        if (configuration.MaxPendingOperationBytes <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(IggyClientConfigurator.MaxPendingOperationBytes),
+                configuration.MaxPendingOperationBytes, "MaxPendingOperationBytes must be greater than 0.");
+        }
+
+        return configuration;
+    }
+
+    /// <summary>The waiters whose lane is free and that wait for an operation slot or for bytes.</summary>
+    internal int BudgetWaiterCount
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _budgetWaiters.Count;
+            }
+        }
+    }
+
+    /// <summary>The operations that hold a request identity, sent or not.</summary>
+    internal int OperationCount
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _operations.Count;
+            }
+        }
+    }
+
+    internal async Task<ClientOperation> EnterAsync(MutationLane lane, int code, ReadOnlyMemory<byte> body,
+        PartitionContext context, bool retainable, ulong generation, CancellationToken token)
+    {
+        var waiter = new Waiter(lane, FrameSize(body, retainable), retainable, restart: false);
         try
         {
             while (true)
             {
                 Task changed;
+                Task? recovery;
+                SessionFrame? identity = null;
                 lock (_gate)
                 {
+                    waiter.LaneNode ??= JoinLane(waiter);
                     token.ThrowIfCancellationRequested();
-                    if (generation != session.Generation)
+                    if (AdmissionGeneration(generation, out recovery) is { } admission)
                     {
-                        throw new NotConnectedException();
-                    }
-                    if (_lanes.TryGetValue(lane, out var active) && active.Retained)
-                    {
-                        throw new VsrLaneBlockedException(active.Identity.RequestId);
-                    }
-                    if (active is null && ReferenceEquals(_waiting.First(waiting => waiting.Lane == lane), waiter)
-                        && (!retainable || _admitted < _maxOperations && size <= _maxBytes - _bytes))
-                    {
-                        var operation = CreateOperation(lane, code, body, context, generation, retainable, size);
-                        _lanes.Add(lane, operation);
-                        _operations.Add(operation.Identity.RequestId, operation);
-                        if (retainable)
+                        generation = admission;
+                        if (_lanes.TryGetValue(lane, out var active) && active.Retained)
                         {
-                            _admitted++;
+                            throw new VsrLaneBlockedException(active.Identity.RequestId);
                         }
-                        return operation;
+                        if (active is null && waiter.LaneNode.Previous is null)
+                        {
+                            identity = TryReserve(waiter, code);
+                        }
                     }
-                    changed = _changed.Task;
+                    changed = identity is null ? waiter.Arm() : Task.CompletedTask;
                 }
-                await changed.WaitAsync(token);
+                if (identity is { } reserved)
+                {
+                    var operation = Build(waiter, code, body, context, generation, reserved);
+                    lock (_gate)
+                    {
+                        if (Keep(waiter, operation, token))
+                        {
+                            _lanes.Add(lane, operation);
+                            _operations.Add(reserved.RequestId, operation);
+                            Leave(waiter);
+                            return operation;
+                        }
+                    }
+                    continue;
+                }
+                await WaitForChangeAsync(changed, recovery, token);
             }
         }
-        finally
+        catch
         {
             lock (_gate)
             {
-                _waiting.Remove(waiter);
-                Pulse();
+                Leave(waiter);
             }
+            throw;
         }
     }
 
@@ -117,16 +187,19 @@ internal sealed class MutationLanes(ConsensusSession session, IggyClientConfigur
     }
 
     // The caller detaches its lifetime registration and frame alias, and supplies a body independent of the old frame.
-    // Queued writers keep the old bytes charged until their aliases are released.
+    // Queued writers keep the old bytes charged until their aliases are released. The new identity comes from the
+    // session that continues the one the previous operation was created under.
     internal async Task<ClientOperation> RestartAsync(ClientOperation previous, ReadOnlyMemory<byte> body,
         CancellationToken token)
     {
-        var size = FrameSize(body, previous.Retainable);
+        var waiter = new Waiter(previous.Lane, FrameSize(body, previous.Retainable), previous.Retainable,
+            restart: true);
         lock (_gate)
         {
             if (!Owns(previous))
             {
-                throw new VsrOperationNotRetainedException(previous.Identity.RequestId);
+                throw session.Ended(previous.Generation)
+                    ?? new VsrOperationNotRetainedException(previous.Identity.RequestId);
             }
             if (previous.Uncertain || previous.Retained)
             {
@@ -135,32 +208,58 @@ internal sealed class MutationLanes(ConsensusSession session, IggyClientConfigur
         }
         previous.Lifetime.Cancel();
         previous.ReleaseRegistryFrame();
-        while (true)
+        try
         {
-            Task changed;
+            while (true)
+            {
+                Task changed;
+                Task? recovery;
+                ulong? admission;
+                SessionFrame? identity = null;
+                lock (_gate)
+                {
+                    token.ThrowIfCancellationRequested();
+                    admission = AdmissionGeneration(previous.Generation, out recovery);
+                    if (!Owns(previous))
+                    {
+                        throw new VsrOperationNotRetainedException(previous.Identity.RequestId);
+                    }
+                    if (admission is not null)
+                    {
+                        identity = TryReserve(waiter, previous.Code);
+                    }
+                    changed = identity is null ? waiter.Arm() : Task.CompletedTask;
+                }
+                if (identity is { } reserved && admission is { } generation)
+                {
+                    var operation = Build(waiter, previous.Code, body, previous.Context, generation, reserved);
+                    lock (_gate)
+                    {
+                        if (Keep(waiter, operation, token))
+                        {
+                            if (!Owns(previous))
+                            {
+                                Unreserve(waiter);
+                                throw new VsrOperationNotRetainedException(previous.Identity.RequestId);
+                            }
+                            _operations.Remove(previous.Identity.RequestId);
+                            _operations.Add(reserved.RequestId, operation);
+                            _lanes[previous.Lane] = operation;
+                            return operation;
+                        }
+                    }
+                    continue;
+                }
+                await WaitForChangeAsync(changed, recovery, token);
+            }
+        }
+        catch
+        {
             lock (_gate)
             {
-                token.ThrowIfCancellationRequested();
-                if (previous.Generation != session.Generation)
-                {
-                    throw new NotConnectedException();
-                }
-                if (!Owns(previous))
-                {
-                    throw new VsrOperationNotRetainedException(previous.Identity.RequestId);
-                }
-                if (!previous.Retainable || size <= _maxBytes - _bytes)
-                {
-                    var operation = CreateOperation(previous.Lane, previous.Code, body, previous.Context,
-                        previous.Generation, previous.Retainable, size);
-                    _operations.Remove(previous.Identity.RequestId);
-                    _operations.Add(operation.Identity.RequestId, operation);
-                    _lanes[previous.Lane] = operation;
-                    return operation;
-                }
-                changed = _changed.Task;
+                Leave(waiter);
             }
-            await changed.WaitAsync(token);
+            throw;
         }
     }
 
@@ -233,11 +332,13 @@ internal sealed class MutationLanes(ConsensusSession session, IggyClientConfigur
     {
         lock (_gate)
         {
-            // A replay keeps the state it has, which an abandon can have dropped.
-            if (operation.Retainable && !operation.Replaying && Owns(operation))
+            // A replay keeps the state it has, which an abandon can have dropped. An operation of a replaced session
+            // can never replay, so it must not block the lane of the new one.
+            if (operation.Retainable && !operation.Replaying && Owns(operation)
+                && operation.Generation == session.Generation)
             {
                 operation.Retained = true;
-                Pulse();
+                WakeLane(operation.Lane);
             }
         }
     }
@@ -288,7 +389,6 @@ internal sealed class MutationLanes(ConsensusSession session, IggyClientConfigur
             if (operation.Replaying)
             {
                 ReleaseSlot(operation);
-                Pulse();
                 return;
             }
         }
@@ -324,24 +424,59 @@ internal sealed class MutationLanes(ConsensusSession session, IggyClientConfigur
             _operations.Remove(operation.Identity.RequestId);
             _lanes.Remove(operation.Lane);
             ReleaseSlot(operation);
-            Pulse();
+            WakeLane(operation.Lane);
         }
         operation.Lifetime.Cancel();
         operation.ReleaseRegistryFrame();
     }
 
-    internal void Reset()
+    internal void Reset() => CompleteWhere(_ => true);
+
+    /// <summary>
+    ///     Drops the retained operations of a replaced session, which can never replay. The live operations and the
+    ///     waiters keep their lanes and slots: their calls go on under the session the client signs in again, or
+    ///     end uncertain.
+    /// </summary>
+    internal void DropRetained() => CompleteWhere(operation => operation.Retained);
+
+    private void CompleteWhere(Func<ClientOperation, bool> selected)
     {
         ClientOperation[] operations;
         lock (_gate)
         {
-            operations = _operations.Values.ToArray();
+            operations = _operations.Values.Where(selected).ToArray();
+            WakeAll();
         }
         foreach (var operation in operations)
         {
             Complete(operation);
         }
     }
+
+    /// <summary>
+    ///     The generation that an operation made under <paramref name="generation" /> is admitted under, as
+    ///     <see cref="ConsensusSession.Successor" /> gives it. Null while <paramref name="recovery" /> signs in again.
+    /// </summary>
+    /// <exception cref="IggyInvalidStatusCodeException">
+    ///     The caller signed in or out since, or the server refused a sign-in, as <see cref="ConsensusSession.Ended" />
+    ///     gives it.
+    /// </exception>
+    /// <exception cref="NotConnectedException">
+    ///     No session that continues the operation's own is bound or coming, or the client stopped.
+    /// </exception>
+    private ulong? AdmissionGeneration(ulong generation, out Task? recovery)
+    {
+        recovery = null;
+        if (session.Successor(generation) is { } admission)
+        {
+            return admission;
+        }
+        recovery = signInRecovery?.Invoke();
+        return recovery is null ? throw session.Ended(generation) ?? new NotConnectedException() : null;
+    }
+
+    private static Task WaitForChangeAsync(Task changed, Task? recovery, CancellationToken token) =>
+        (recovery is null ? changed : Task.WhenAny(changed, recovery)).WaitAsync(token);
 
     private int FrameSize(ReadOnlyMemory<byte> body, bool retainable)
     {
@@ -353,32 +488,176 @@ internal sealed class MutationLanes(ConsensusSession session, IggyClientConfigur
         return (int)size;
     }
 
-    private ClientOperation CreateOperation(MutationLane lane, int code, ReadOnlyMemory<byte> body,
-        PartitionContext context, ulong generation, bool retainable, int size)
+    private LinkedListNode<Waiter> JoinLane(Waiter waiter)
     {
-        if (retainable)
+        if (!_laneWaiters.TryGetValue(waiter.Lane, out var queue))
         {
-            _bytes += size;
+            queue = new LinkedList<Waiter>();
+            _laneWaiters.Add(waiter.Lane, queue);
+        }
+        return queue.AddLast(waiter);
+    }
+
+    /// <summary>
+    ///     Reserves the budget of a waiter whose lane is ready and takes its request id, or queues the waiter for the
+    ///     budget. A waiter reserves only at the head of its queue, and an enter only while no restart waits.
+    /// </summary>
+    /// <remarks>
+    ///     The strict order is on purpose. A small frame that passed a larger head could starve it, because small
+    ///     frames can keep taking the bytes that each release frees. Restarts queue ahead of the enters, because an
+    ///     enter at the head can wait for the slot that a waiting restart keeps, and the restart could never pass it.
+    /// </remarks>
+    private SessionFrame? TryReserve(Waiter waiter, int code)
+    {
+        if (waiter.Retainable)
+        {
+            var queue = waiter.Restart ? _restartWaiters : _budgetWaiters;
+            var turn = queue.First is null || queue.First == waiter.BudgetNode;
+            if (!turn || !waiter.Restart && _restartWaiters.Count > 0 || !Fits(waiter))
+            {
+                waiter.BudgetNode ??= queue.AddLast(waiter);
+                return null;
+            }
+            if (waiter.BudgetNode is { } node)
+            {
+                queue.Remove(node);
+                waiter.BudgetNode = null;
+            }
+            _bytes += waiter.Size;
+            if (!waiter.Restart)
+            {
+                _admitted++;
+            }
+            WakeBudget();
         }
         try
         {
-            var bytes = new byte[size];
-            var identity = session.Resolve(VsrOperations.ForCode(code));
-            VsrHeader.EncodeRequestHeader(bytes, session, code, body.Span, context, identity);
-            body.CopyTo(bytes.AsMemory(VsrHeader.HEADER_SIZE));
-            var frame = new SharedRequestFrame(bytes, retainable ? () => ReleaseBudget(size) : null);
-            return new ClientOperation(lane, code, identity, context, generation, frame, retainable);
+            return session.Resolve(VsrOperations.ForCode(code));
         }
         catch
         {
-            if (retainable)
+            Unreserve(waiter);
+            throw;
+        }
+    }
+
+    // Outside the gate, so a large body never holds back the admissions of the other lanes.
+    private ClientOperation Build(Waiter waiter, int code, ReadOnlyMemory<byte> body, PartitionContext context,
+        ulong generation, SessionFrame identity)
+    {
+        try
+        {
+            var size = waiter.Size;
+            var bytes = new byte[size];
+            VsrHeader.EncodeRequestHeader(bytes, session, code, body.Span, context, identity);
+            body.CopyTo(bytes.AsMemory(VsrHeader.HEADER_SIZE));
+            var frame = new SharedRequestFrame(bytes, waiter.Retainable ? () => ReleaseBudget(size) : null);
+            return new ClientOperation(waiter.Lane, code, identity, context, generation, frame, waiter.Retainable);
+        }
+        catch
+        {
+            lock (_gate)
             {
-                _bytes -= size;
-                Pulse();
+                Unreserve(waiter);
             }
             throw;
         }
     }
+
+    /// <summary>
+    ///     Whether a built operation keeps its reservation. A cancellation or a session change during the build gives
+    ///     it back, and after a session change the waiter checks its admission again.
+    /// </summary>
+    private bool Keep(Waiter waiter, ClientOperation operation, CancellationToken token)
+    {
+        if (!token.IsCancellationRequested && operation.Generation == session.Generation)
+        {
+            return true;
+        }
+        Unreserve(waiter);
+        token.ThrowIfCancellationRequested();
+        return false;
+    }
+
+    private void Unreserve(Waiter waiter)
+    {
+        if (!waiter.Retainable)
+        {
+            return;
+        }
+        _bytes -= waiter.Size;
+        if (!waiter.Restart)
+        {
+            _admitted--;
+        }
+        WakeBudget();
+    }
+
+    private void Leave(Waiter waiter)
+    {
+        if (waiter.BudgetNode is { } budget)
+        {
+            var first = budget.Previous is null;
+            (waiter.Restart ? _restartWaiters : _budgetWaiters).Remove(budget);
+            waiter.BudgetNode = null;
+            if (first)
+            {
+                WakeBudget();
+            }
+        }
+        if (waiter.LaneNode is { } node)
+        {
+            var queue = _laneWaiters[waiter.Lane];
+            var first = node.Previous is null;
+            queue.Remove(node);
+            waiter.LaneNode = null;
+            if (queue.Count == 0)
+            {
+                _laneWaiters.Remove(waiter.Lane);
+            }
+            else if (first)
+            {
+                WakeLane(waiter.Lane);
+            }
+        }
+    }
+
+    // The first waiter of a lane enters once the lane is free, and fails at once when the lane is retained.
+    private void WakeLane(MutationLane lane)
+    {
+        if (_laneWaiters.TryGetValue(lane, out var queue)
+            && (!_lanes.TryGetValue(lane, out var active) || active.Retained))
+        {
+            queue.First?.Value.Wake();
+        }
+    }
+
+    private void WakeBudget()
+    {
+        if ((_restartWaiters.First ?? _budgetWaiters.First)?.Value is { } next && Fits(next))
+        {
+            next.Wake();
+        }
+    }
+
+    // A reset ends or replaces the session of every waiter, so each one checks its admission again.
+    private void WakeAll()
+    {
+        foreach (var queue in _laneWaiters.Values)
+        {
+            foreach (var waiter in queue)
+            {
+                waiter.Wake();
+            }
+        }
+        foreach (var waiter in _restartWaiters)
+        {
+            waiter.Wake();
+        }
+    }
+
+    private bool Fits(Waiter waiter) =>
+        waiter.Size <= _maxBytes - _bytes && (waiter.Restart || _admitted < _maxOperations);
 
     // An abandon frees the slot of a running replay, so the completion of that replay must not free it again.
     private void ReleaseSlot(ClientOperation operation)
@@ -387,6 +666,7 @@ internal sealed class MutationLanes(ConsensusSession session, IggyClientConfigur
         {
             operation.SlotReleased = true;
             _admitted--;
+            WakeBudget();
         }
     }
 
@@ -395,15 +675,8 @@ internal sealed class MutationLanes(ConsensusSession session, IggyClientConfigur
         lock (_gate)
         {
             _bytes -= size;
-            Pulse();
+            WakeBudget();
         }
-    }
-
-    private void Pulse()
-    {
-        var changed = _changed;
-        _changed = NewSignal();
-        changed.TrySetResult();
     }
 
     private static TaskCompletionSource NewSignal() => new(TaskCreationOptions.RunContinuationsAsynchronously);

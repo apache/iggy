@@ -30,7 +30,9 @@ import {
 import {
   Command, EvictionReason, peekCommand, readEviction, readStatus, REQUEST_OFFSET, REPLY_OFFSET
 } from '../wire/vsr/header.js';
-import { ChangeSignal, PermitPool, type FrozenFrame, OPERATION_TIMEOUT_MS, waitWithin } from './client.operation.js';
+import {
+  ChangeSignal, PermitPool, type FrozenFrame, OPERATION_TIMEOUT_MS, VsrResponseTimeoutError, waitWithin
+} from './client.operation.js';
 import { evictionError } from '../wire/vsr/reply.js';
 
 
@@ -95,6 +97,14 @@ export const LINK_WRITE_QUEUE = 32;
 export const MAX_PENDING_PER_LINK = 256;
 const STALE_CLIENT = 30;
 
+/** A connected socket was lost; a later bootstrap can bind it again. */
+export class ConnectionClosedError extends Error {
+  constructor(cause?: Error) {
+    super(cause?.message ?? 'replica connection closed', { cause });
+    this.name = 'ConnectionClosedError';
+  }
+}
+
 export type LinkAttempt = { response?: Buffer, error?: unknown, started: boolean };
 type Pending = {
   readonly id: bigint,
@@ -109,7 +119,6 @@ type Pending = {
 export class IggyConnection extends EventEmitter {
   socket!: Socket;
   connected = false;
-  connecting = false;
   ending = false;
   failure?: unknown;
   readonly closed: Promise<void>;
@@ -141,7 +150,6 @@ export class IggyConnection extends EventEmitter {
       return Promise.resolve(this);
     if (this.connectPromise)
       return this.connectPromise;
-    this.connecting = true;
     this.connectPromise = this.dial(signal);
     return this.connectPromise;
   }
@@ -157,10 +165,10 @@ export class IggyConnection extends EventEmitter {
       });
       const ready = this.config.transport === 'TLS' ? 'secureConnect' : 'connect';
       socket.on('data', (data) => this.onData(data));
-      socket.on('error', (error) => this.fail(error));
+      socket.on('error', (error) => this.fail(this.connected ? new ConnectionClosedError(error) : error));
       socket.once('close', () => {
         this.closeSocket();
-        this.fail(this.failure ?? new Error('replica connection closed'));
+        this.fail(this.failure ?? new ConnectionClosedError());
       });
       await waitWithin(new Promise<void>((resolve, reject) => {
         const cleanup = () => {
@@ -178,7 +186,6 @@ export class IggyConnection extends EventEmitter {
       if (this.failed || this.ending)
         throw this.failure ?? new Error('connection is closed');
       this.connected = true;
-      this.connecting = false;
       this.emit('connect');
       return this;
     } catch (error) {
@@ -194,7 +201,7 @@ export class IggyConnection extends EventEmitter {
       release = await this.admissions.acquire(deadline, signal);
       signal.throwIfAborted();
       if (Date.now() >= deadline)
-        await waitWithin(Promise.resolve(), deadline, signal);
+        throw new VsrResponseTimeoutError(0);
       if (!this.connected || this.failed)
         throw this.failure ?? new Error('replica connection is not ready');
       const bytes = frame();
@@ -237,7 +244,7 @@ export class IggyConnection extends EventEmitter {
             continue;
           pending.started = true;
           const written = new Promise<void>((resolve, reject) => {
-            this.socket.write(pending.frame, (error?: Error | null) => error ? reject(error) : resolve());
+            this.socket.write(pending.frame, (error?: Error | null) => error ? reject(new ConnectionClosedError(error)) : resolve());
           });
           try {
             await waitWithin(written, Date.now() + OPERATION_TIMEOUT_MS);
@@ -314,7 +321,6 @@ export class IggyConnection extends EventEmitter {
     this.failed = true;
     this.failure = error;
     this.connected = false;
-    this.connecting = false;
     clearTimeout(this.frameTimer);
     this.decoder.clear();
     for (const pending of this.pending.values())
@@ -329,10 +335,6 @@ export class IggyConnection extends EventEmitter {
       this.emit('error', error);
     this.emit('disconnected');
     debug('replica link closed', error);
-  }
-
-  abort(): void {
-    this.fail(new Error('replica link aborted'));
   }
 
   isConnectedTo(host: string, port: number): boolean {

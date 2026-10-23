@@ -48,12 +48,26 @@ public partial class IggyConsumer : IAsyncDisposable
     ///     member holding zero partitions re-polls in a hot loop whenever <c>PollingIntervalMs</c> is zero.
     /// </summary>
     private const int NoAssignedPartitionBackoffMs = 100;
+
+    /// <summary>
+    ///     Delay after a failed poll, the default polling retry interval of the Rust consumer. Without it a client
+    ///     that keeps failing, for example while it is disconnected, is polled in a hot loop whenever
+    ///     <c>PollingIntervalMs</c> is zero.
+    /// </summary>
+    private const int PollRetryDelayMs = 1_000;
     private const int OperationTimeoutMs = 30_000;
 
     private readonly Channel<ReceivedMessage> _channel;
     private readonly IIggyClient _client;
     private readonly IggyConsumerConfig _config;
+
+    /// <summary>
+    ///     Never disposed, like <see cref="_pollingSemaphore" />: a group rejoin that runs during
+    ///     <see cref="DisposeAsync" />, from a poll or from a state event, still releases it. A poll or a state event
+    ///     that takes it after the dispose started skips the rejoin.
+    /// </summary>
     private readonly SemaphoreSlim _connectionStateSemaphore = new(1, 1);
+
     private readonly EventAggregator<ConsumerErrorEventArgs> _consumerErrorEvents;
     private readonly ConcurrentDictionary<uint, PartitionContext> _lastPolledContext = new();
     private readonly ConcurrentDictionary<uint, ulong> _lastPolledOffset = new();
@@ -67,9 +81,19 @@ public partial class IggyConsumer : IAsyncDisposable
     /// </summary>
     private readonly ConcurrentDictionary<uint, PollingStrategy> _nextPollingStrategies = new();
 
+    /// <summary>
+    ///     Never disposed: a poll in flight during <see cref="DisposeAsync" /> still releases it, and a semaphore whose
+    ///     wait handle is never used holds nothing to free.
+    /// </summary>
     private readonly SemaphoreSlim _pollingSemaphore = new(1, 1);
+
     private readonly Channel<ReceivedRentedMessage> _rentedChannel;
     private string? _consumerGroupName;
+    private readonly object _deliveryGate = new();
+    private readonly Dictionary<uint, (ulong Offset, PartitionContext Context)> _deliveredOffsets = [];
+    private readonly Dictionary<uint, (ulong Offset, PartitionContext Context)> _storedOffsets = [];
+    private readonly SemaphoreSlim _offsetSemaphore = new(1, 1);
+    private readonly CancellationTokenSource _lifetime = new();
     private int _disposeState;
     private volatile bool _isInitialized;
     private volatile bool _joinedConsumerGroup;
@@ -84,6 +108,9 @@ public partial class IggyConsumer : IAsyncDisposable
 
     /// <summary>Whether this consumer has been initialized via <see cref="InitAsync" />.</summary>
     protected bool IsInitialized => _isInitialized;
+
+    /// <summary>Whether <see cref="DisposeAsync" /> has started. The receive loops end once it has.</summary>
+    private protected bool IsDisposed => Volatile.Read(ref _disposeState) == 1;
 
     /// <summary>
     ///     Initializes a new instance of the <see cref="IggyConsumer" /> class
@@ -108,65 +135,133 @@ public partial class IggyConsumer : IAsyncDisposable
     /// </summary>
     public async ValueTask DisposeAsync()
     {
-        if (Interlocked.Exchange(ref _disposeState, 1) == 1)
+        lock (_deliveryGate)
         {
-            return;
+            if (IsDisposed)
+            {
+                return;
+            }
+            Volatile.Write(ref _disposeState, 1);
         }
+        _lifetime.Cancel();
+        CompleteReceiveChannels();
+        await _connectionStateSemaphore.WaitAsync();
+        try
+        {
+            if (_isInitialized)
+            {
+                _client.UnsubscribeConnectionEvents(OnClientConnectionStateChangedAsync);
+            }
+            // Cancellation drains stores already in flight before the final checkpoint and leave.
+            await _offsetSemaphore.WaitAsync();
+            try
+            {
+                using var checkpoint = new CancellationTokenSource(OperationTimeoutMs);
+                if (_config.AutoCommitMode != AutoCommitMode.Disabled)
+                {
+                    foreach (var (partition, position) in _deliveredOffsets)
+                    {
+                        if (checkpoint.IsCancellationRequested)
+                        {
+                            break;
+                        }
+                        if (_storedOffsets.TryGetValue(partition, out var stored)
+                            && SamePartition(stored.Context, position.Context) && stored.Offset >= position.Offset)
+                        {
+                            continue;
+                        }
+                        try
+                        {
+                            await WithLaneRecoveryAsync(token => _client.StoreOffsetAsync(_config.Consumer,
+                                _config.StreamId, _config.TopicId, position.Offset, partition, position.Context, token),
+                                checkpoint.Token);
+                        }
+                        catch (Exception error)
+                        {
+                            _logger.LogWarning(error, "Failed to checkpoint consumed offset {Offset} for partition {PartitionId}",
+                                position.Offset, partition);
+                        }
+                    }
+                }
+            }
+            finally
+            {
+                _offsetSemaphore.Release();
+            }
+            if (!string.IsNullOrEmpty(_consumerGroupName) && _joinedConsumerGroup)
+            {
+                await LeaveConsumerGroupAsync(_consumerGroupName);
+                _joinedConsumerGroup = false;
+            }
+            if (_config.CreateIggyClient)
+            {
+                try
+                {
+                    try
+                    {
+                        if (_isInitialized)
+                        {
+                            await _client.LogoutUserAsync();
+                        }
+                    }
+                    finally
+                    {
+                        _client.Dispose();
+                    }
+                }
+                catch (Exception error)
+                {
+                    LogFailedToLogoutOrDispose(error);
+                }
+            }
+            _isInitialized = false;
+            _consumerErrorEvents.Clear();
+        }
+        finally
+        {
+            _connectionStateSemaphore.Release();
+        }
+    }
 
+    private protected virtual void CompleteReceiveChannels()
+    {
         _channel.Writer.TryComplete();
         _rentedChannel.Writer.TryComplete();
-
+        while (_channel.Reader.TryRead(out _)) { }
         while (_rentedChannel.Reader.TryRead(out var queued))
         {
             queued.Dispose();
         }
-
-        if (_isInitialized)
-        {
-            _client.UnsubscribeConnectionEvents(OnClientConnectionStateChangedAsync);
-        }
-
-        if (!string.IsNullOrEmpty(_consumerGroupName) && _isInitialized)
-        {
-            try
-            {
-                await _client.LeaveConsumerGroupAsync(_config.StreamId, _config.TopicId,
-                    Identifier.String(_consumerGroupName));
-
-                LogLeftConsumerGroup(_consumerGroupName);
-            }
-            catch (Exception e)
-            {
-                LogFailedToLeaveConsumerGroup(e, _consumerGroupName);
-            }
-        }
-
-        if (_config.CreateIggyClient)
-        {
-            try
-            {
-                try
-                {
-                    if (_isInitialized)
-                    {
-                        await _client.LogoutUserAsync();
-                    }
-                }
-                finally
-                {
-                    _client.Dispose();
-                }
-            }
-            catch (Exception e)
-            {
-                LogFailedToLogoutOrDispose(e);
-            }
-        }
-
-        _consumerErrorEvents.Clear();
-        _pollingSemaphore.Dispose();
-        _connectionStateSemaphore.Dispose();
     }
+
+    // Under AfterReceive a message counts as delivered once its loop body completes, in CommitDeliveredAsync.
+    private protected bool BeginDelivery(ulong offset, uint partition, PartitionContext context) =>
+        _config.AutoCommitMode == AutoCommitMode.AfterReceive ? !IsDisposed : RecordDelivery(offset, partition, context);
+
+    private bool RecordDelivery(ulong offset, uint partition, PartitionContext context)
+    {
+        lock (_deliveryGate)
+        {
+            if (IsDisposed)
+            {
+                return false;
+            }
+            if (!_deliveredOffsets.TryGetValue(partition, out var previous)
+                || !SamePartition(previous.Context, context) || previous.Offset < offset)
+            {
+                _deliveredOffsets[partition] = (offset, context);
+            }
+            return true;
+        }
+    }
+
+    private static bool SamePartition(PartitionContext first, PartitionContext second) =>
+        first.Incarnation == second.Incarnation && first.OwnerGeneration == second.OwnerGeneration;
+
+    private protected Task CommitDeliveredAsync(ulong offset, uint partition, PartitionContext context, CancellationToken ct) =>
+        RecordDelivery(offset, partition, context)
+            ? StoreOffsetCoreAsync(offset, partition, context, ct, afterReceive: true)
+            : Task.CompletedTask;
 
     /// <summary>
     ///     Initializes the consumer by logging in (if needed) and setting up consumer groups
@@ -174,16 +269,20 @@ public partial class IggyConsumer : IAsyncDisposable
     /// <param name="ct">Cancellation token</param>
     /// <exception cref="InvalidConsumerGroupNameException">Thrown when consumer group name is invalid</exception>
     /// <exception cref="ConsumerGroupNotFoundException">Thrown when consumer group doesn't exist and auto-creation is disabled</exception>
+    /// <exception cref="ObjectDisposedException">The consumer is disposed before it was initialized.</exception>
     public async Task InitAsync(CancellationToken ct = default)
     {
+        ObjectDisposedException.ThrowIf(IsDisposed, this);
         if (_isInitialized)
         {
             return;
         }
-
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(ct, _lifetime.Token);
+        ct = cancellation.Token;
         await _connectionStateSemaphore.WaitAsync(ct);
         try
         {
+            ObjectDisposedException.ThrowIf(IsDisposed, this);
             if (_isInitialized)
             {
                 return;
@@ -203,10 +302,12 @@ public partial class IggyConsumer : IAsyncDisposable
             }
 
             await InitializeConsumerGroupAsync(ct);
-
-            _client.SubscribeConnectionEvents(OnClientConnectionStateChangedAsync);
-
-            _isInitialized = true;
+            lock (_deliveryGate)
+            {
+                ObjectDisposedException.ThrowIf(IsDisposed, this);
+                _client.SubscribeConnectionEvents(OnClientConnectionStateChangedAsync);
+                _isInitialized = true;
+            }
         }
         finally
         {
@@ -217,12 +318,17 @@ public partial class IggyConsumer : IAsyncDisposable
     /// <summary>
     ///     Receives messages asynchronously from the consumer as an async stream.
     ///     Messages are automatically polled from the server and buffered in a bounded channel.
+    ///     The stream ends once the consumer is disposed.
     /// </summary>
     /// <param name="ct">Cancellation token to stop receiving messages</param>
     /// <returns>An async enumerable of received messages</returns>
     /// <exception cref="ConsumerNotInitializedException">Thrown when InitAsync has not been called</exception>
     public async IAsyncEnumerable<ReceivedMessage> ReceiveAsync([EnumeratorCancellation] CancellationToken ct = default)
     {
+        if (IsDisposed)
+        {
+            yield break;
+        }
         if (!_isInitialized)
         {
             throw new ConsumerNotInitializedException();
@@ -236,13 +342,17 @@ public partial class IggyConsumer : IAsyncDisposable
                 continue;
             }
 
+            if (!BeginDelivery(message.CurrentOffset, message.PartitionId, message.Context))
+            {
+                yield break;
+            }
             yield return message;
 
             if (_config.AutoCommitMode == AutoCommitMode.AfterReceive)
             {
-                await StoreOffsetAsync(message.CurrentOffset, message.PartitionId, message.Context, ct);
+                await CommitDeliveredAsync(message.CurrentOffset, message.PartitionId, message.Context, ct);
             }
-        } while (!ct.IsCancellationRequested);
+        } while (!ct.IsCancellationRequested && !IsDisposed);
     }
 
     /// <summary>
@@ -266,16 +376,8 @@ public partial class IggyConsumer : IAsyncDisposable
     public async Task StoreOffsetAsync(ulong offset, uint partitionId, bool resetLastPolled = false,
         CancellationToken ct = default)
     {
-        if (_lastPolledContext.TryGetValue(partitionId, out var context))
-        {
-            await WithLaneRecoveryAsync(token => _client.StoreOffsetAsync(_config.Consumer, _config.StreamId,
-                _config.TopicId, offset, partitionId, context, token), ct);
-        }
-        else
-        {
-            await WithLaneRecoveryAsync(token => _client.StoreOffsetAsync(_config.Consumer, _config.StreamId,
-                _config.TopicId, offset, partitionId, token), ct);
-        }
+        PartitionContext? context = _lastPolledContext.TryGetValue(partitionId, out var polled) ? polled : null;
+        await StoreOffsetCoreAsync(offset, partitionId, context, ct);
 
         if (resetLastPolled)
         {
@@ -296,8 +398,41 @@ public partial class IggyConsumer : IAsyncDisposable
     public async Task StoreOffsetAsync(ulong offset, uint partitionId, PartitionContext context,
         CancellationToken ct = default)
     {
-        await WithLaneRecoveryAsync(token => _client.StoreOffsetAsync(_config.Consumer, _config.StreamId,
-            _config.TopicId, offset, partitionId, context, token), ct);
+        await StoreOffsetCoreAsync(offset, partitionId, context, ct);
+    }
+
+    private async Task StoreOffsetCoreAsync(ulong offset, uint partitionId, PartitionContext? context,
+        CancellationToken ct, bool afterReceive = false)
+    {
+        if (afterReceive && IsDisposed) { return; }
+        ObjectDisposedException.ThrowIf(IsDisposed, this);
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(ct, _lifetime.Token);
+        try
+        {
+            await _offsetSemaphore.WaitAsync(cancellation.Token);
+            try
+            {
+                if (afterReceive && IsDisposed) { return; }
+                ObjectDisposedException.ThrowIf(IsDisposed, this);
+                await WithLaneRecoveryAsync(token => context is { } captured
+                    ? _client.StoreOffsetAsync(_config.Consumer, _config.StreamId, _config.TopicId,
+                        offset, partitionId, captured, token)
+                    : _client.StoreOffsetAsync(_config.Consumer, _config.StreamId, _config.TopicId,
+                        offset, partitionId, token), cancellation.Token);
+                if (context is { } stored && (!_storedOffsets.TryGetValue(partitionId, out var previous)
+                    || !SamePartition(previous.Context, stored) || previous.Offset < offset))
+                {
+                    _storedOffsets[partitionId] = (offset, stored);
+                }
+            }
+            finally { _offsetSemaphore.Release(); }
+        }
+        catch (OperationCanceledException) when (afterReceive && IsDisposed && !ct.IsCancellationRequested)
+        {
+        }
+        catch (VsrRequestOutcomeUnknownException) when (afterReceive && IsDisposed && !ct.IsCancellationRequested)
+        {
+        }
     }
 
     /// <summary>
@@ -338,7 +473,9 @@ public partial class IggyConsumer : IAsyncDisposable
     /// </summary>
     private async Task InitializeConsumerGroupAsync(CancellationToken ct = default)
     {
-        if (_joinedConsumerGroup)
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(ct, _lifetime.Token);
+        ct = cancellation.Token;
+        if (IsDisposed || _joinedConsumerGroup)
         {
             return;
         }
@@ -384,7 +521,7 @@ public partial class IggyConsumer : IAsyncDisposable
                 throw new ConsumerGroupNotFoundException(_consumerGroupName);
             }
 
-            if (_config.JoinConsumerGroup)
+            if (_config.JoinConsumerGroup && !IsDisposed)
             {
                 LogJoiningConsumerGroup(_consumerGroupName, _config.StreamId, _config.TopicId);
 
@@ -400,6 +537,19 @@ public partial class IggyConsumer : IAsyncDisposable
         {
             LogFailedToInitializeConsumerGroup(ex, _consumerGroupName);
             throw;
+        }
+    }
+
+    private async Task LeaveConsumerGroupAsync(string groupName)
+    {
+        try
+        {
+            await _client.LeaveConsumerGroupAsync(_config.StreamId, _config.TopicId, Identifier.String(groupName));
+            LogLeftConsumerGroup(groupName);
+        }
+        catch (Exception e)
+        {
+            LogFailedToLeaveConsumerGroup(e, groupName);
         }
     }
 
@@ -447,9 +597,15 @@ public partial class IggyConsumer : IAsyncDisposable
     ///     Polls messages from the server and writes them to the internal channel.
     ///     Handles offset tracking and auto-commit logic.
     ///     Uses semaphore to ensure single concurrent polling operation.
+    ///     Once the consumer is disposed it returns without polling.
     /// </summary>
     private async Task PollMessagesAsync(CancellationToken ct)
     {
+        if (IsDisposed)
+        {
+            return;
+        }
+
         if (!_joinedConsumerGroup || !IsGroupMembershipCurrent())
         {
             LogConsumerGroupNotJoinedYetSkippingPolling();
@@ -545,14 +701,36 @@ public partial class IggyConsumer : IAsyncDisposable
         catch (Exception ex) when (ex is not (MalformedResponseException
             or VsrRequestOutcomeUnknownException { OperationId: not null } or VsrLaneBlockedException))
         {
-            ForgetRefusedPollingStrategy(ex, polledPartition);
-            LogFailedToPollMessages(ex);
-            _consumerErrorEvents.Publish(new ConsumerErrorEventArgs(ex, "Failed to poll messages"));
+            await ReportPollFailureAsync(ex, polledPartition, ct);
         }
         finally
         {
             _pollingSemaphore.Release();
         }
+    }
+
+    /// <summary>
+    ///     Publishes a failed poll as an error event and waits <see cref="PollRetryDelayMs" /> before the next poll.
+    ///     A cancellation can interrupt an in-flight poll with another exception, so after a cancellation the failure
+    ///     ends the receive loop as a cancellation instead. A dispose can fail an in-flight poll too, and no poll
+    ///     follows it, so then the failure is neither reported nor waited out.
+    /// </summary>
+    private async Task ReportPollFailureAsync(Exception error, uint polledPartition, CancellationToken ct)
+    {
+        ForgetRefusedPollingStrategy(error, polledPartition);
+        if (ct.IsCancellationRequested)
+        {
+            throw new OperationCanceledException("The poll was canceled.", error, ct);
+        }
+
+        if (IsDisposed)
+        {
+            return;
+        }
+
+        LogFailedToPollMessages(error);
+        _consumerErrorEvents.Publish(new ConsumerErrorEventArgs(error, "Failed to poll messages"));
+        await Task.Delay(PollRetryDelayMs, ct);
     }
 
     private async Task WithLaneRecoveryAsync(Func<CancellationToken, Task> operation, CancellationToken ct)
@@ -698,6 +876,12 @@ public partial class IggyConsumer : IAsyncDisposable
             await _connectionStateSemaphore.WaitAsync(ct);
             try
             {
+                // The dispose left the group, so a rejoin now would add a member that never polls.
+                if (IsDisposed)
+                {
+                    return;
+                }
+
                 if (!_joinedConsumerGroup || !IsGroupMembershipCurrent())
                 {
                     _joinedConsumerGroup = false;
@@ -776,6 +960,11 @@ public partial class IggyConsumer : IAsyncDisposable
         await _connectionStateSemaphore.WaitAsync();
         try
         {
+            if (IsDisposed)
+            {
+                return;
+            }
+
             if (_client is ISessionGenerationProvider generationProvider)
             {
                 if (e.CurrentState != ConnectionState.Authenticated)

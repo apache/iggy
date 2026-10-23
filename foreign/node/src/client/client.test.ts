@@ -192,8 +192,7 @@ describe('Client lifecycle events', () => {
     const events = record(client);
     try {
       const ping = client.system.ping();
-      const rejected = assert.rejects(ping,
-        (error: unknown) => error instanceof ResponseError && error.errorCode === 58);
+      const rejected = assert.rejects(ping, { message: 'client destroyed' });
       await client.destroy();
       await rejected;
       await nextTick();
@@ -284,28 +283,22 @@ describe('Client lifecycle events', () => {
     assert.equal(result.status, 0, result.stderr || String(result.error));
   });
 
-  it('announces one connecting phase across command retries until a link succeeds', async () => {
+  it('announces one connecting phase across retry bursts until a link succeeds', async () => {
     const server = await startServer();
     const config = clientConfig(server.server);
     await server.close();
+    config.reconnect = { enabled: true, interval: 1, maxRetries: 2 };
     const client = new CommandResponseStream(config);
     let connecting = 0;
     let failures = 0;
     client.on('connecting', () => { connecting += 1; });
     client.on('connectionError', () => { failures += 1; });
     const failThreeDials = async () => {
-      const signal = new AbortController();
       const target = failures + 3;
-      const cancel = () => { if (failures === target) signal.abort(); };
-      client.on('connectionError', cancel);
-      try {
-        await assert.rejects(client.sendCommand(COMMAND_CODE.Ping, Buffer.alloc(0), {
-          signal: signal.signal, deadline: Date.now() + 5000
-        }));
-        assert.equal(failures, target, 'drive must retry the failed dial');
-      } finally {
-        client.off('connectionError', cancel);
-      }
+      await assert.rejects(client.sendCommand(COMMAND_CODE.Ping, Buffer.alloc(0), {
+        deadline: Date.now() + 5000
+      }), NotConnectedError);
+      assert.equal(failures, target, 'bootstrap must use its configured retry budget');
     };
     try {
       await failThreeDials();

@@ -405,8 +405,7 @@ pub fn dvc_suffix_decode(
             // transit becomes a canonical header no replica holds, honest senders
             // read as disagreeing, and a corrupted frame turns into a nack quorum
             // against a committed op. The on-disk sentinel is skipped: a suffix is read
-            // out of the journal, which may hold entries a pre-seal build wrote, and
-            // partition-plane prepares are unsealed by construction.
+            // out of the journal, which may hold entries a pre-seal build wrote.
             if header.checksum != CHECKSUM_UNSEALED && header.identity_checksum() != header.checksum
             {
                 return Err(DvcSuffixError::ChecksumMismatch { index });

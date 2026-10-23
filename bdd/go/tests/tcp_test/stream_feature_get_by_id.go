@@ -58,21 +58,13 @@ var _ = ginkgo.Describe("GET STREAM BY ID:", func() {
 			// create two topics
 			t1Name := createRandomString(32)
 			t2Name := createRandomString(32)
-			t1, err := client.CreateTopic(context.Background(), streamIdentifier,
-				t1Name,
-				2,
-				iggcon.CompressionAlgorithmNone,
-				iggcon.Millisecond,
-				math.MaxUint64)
+			partitions := uint32(2)
+			expiry := iggcon.Millisecond
+			maxTopicSize := uint64(math.MaxUint64)
+			options := &iggcon.TopicOptions{PartitionsCount: &partitions, MessageExpiry: &expiry, MaxTopicSize: &maxTopicSize}
+			t1, err := client.CreateTopic(context.Background(), streamIdentifier, t1Name, options)
 			itShouldNotReturnError(err)
-			t2, err := client.CreateTopic(
-				context.Background(),
-				streamIdentifier,
-				t2Name,
-				2,
-				iggcon.CompressionAlgorithmNone,
-				iggcon.Millisecond,
-				math.MaxUint64)
+			t2, err := client.CreateTopic(context.Background(), streamIdentifier, t2Name, options)
 			itShouldNotReturnError(err)
 			itShouldSuccessfullyCreateTopic(streamId, t1.Id, t1Name, client)
 			itShouldSuccessfullyCreateTopic(streamId, t2.Id, t2Name, client)

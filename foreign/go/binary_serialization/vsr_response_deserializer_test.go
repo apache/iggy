@@ -20,6 +20,7 @@ package binaryserialization
 import (
 	"encoding/binary"
 	"encoding/hex"
+	"math"
 	"testing"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
@@ -329,28 +330,32 @@ func TestDeserializeFetchMessagesResponse_DecodesTheGoldenVector(t *testing.T) {
 }
 
 func TestDeserializeToTopic_PinsTheFieldOrderOfTheWireLayout(t *testing.T) {
-	const nameLenOffset = 49
+	const nameLenOffset = 32
 	name := "orders"
 
-	partitionsValue := binary.LittleEndian.AppendUint32(nil, 3)
-	explicitOptions := iggcon.GetHeadersBytes([]iggcon.HeaderEntry{{
-		Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte("partitions_count")},
-		Value: iggcon.HeaderValue{Kind: iggcon.Uint32, Value: partitionsValue},
-	}})
+	expiryValue := binary.LittleEndian.AppendUint64(nil, 60_000_000)
+	explicitOptions := iggcon.GetHeadersBytes([]iggcon.HeaderEntry{
+		{
+			Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte("compression_algorithm")},
+			Value: iggcon.HeaderValue{Kind: iggcon.String, Value: []byte("gzip")},
+		},
+		{
+			Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte("message_expiry")},
+			Value: iggcon.HeaderValue{Kind: iggcon.Uint64, Value: expiryValue},
+		},
+	})
+	sizeValue := binary.LittleEndian.AppendUint64(nil, 1<<30)
 	derivedOptions := iggcon.GetHeadersBytes([]iggcon.HeaderEntry{{
-		Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte("compression_algorithm")},
-		Value: iggcon.HeaderValue{Kind: iggcon.String, Value: []byte("none")},
+		Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte("max_topic_size")},
+		Value: iggcon.HeaderValue{Kind: iggcon.Uint64, Value: sizeValue},
 	}})
 
 	payload := make([]byte, nameLenOffset+1+len(name))
 	binary.LittleEndian.PutUint32(payload[0:4], 11)
 	binary.LittleEndian.PutUint64(payload[4:12], 1700000000)
 	binary.LittleEndian.PutUint32(payload[12:16], 3)
-	binary.LittleEndian.PutUint64(payload[16:24], 60_000_000)
-	payload[24] = 2
-	binary.LittleEndian.PutUint64(payload[25:33], 1<<30)
-	binary.LittleEndian.PutUint64(payload[33:41], 4096)
-	binary.LittleEndian.PutUint64(payload[41:49], 12)
+	binary.LittleEndian.PutUint64(payload[16:24], 4096)
+	binary.LittleEndian.PutUint64(payload[24:32], 12)
 	payload[nameLenOffset] = byte(len(name))
 	copy(payload[nameLenOffset+1:], name)
 	payload = binary.LittleEndian.AppendUint32(payload, uint32(len(explicitOptions)))
@@ -364,25 +369,40 @@ func TestDeserializeToTopic_PinsTheFieldOrderOfTheWireLayout(t *testing.T) {
 	assert.Equal(t, uint32(11), topic.Id)
 	assert.Equal(t, uint64(1700000000), topic.CreatedAt)
 	assert.Equal(t, uint32(3), topic.PartitionsCount)
-	assert.Equal(t, iggcon.Duration(60_000_000), topic.MessageExpiry,
-		"message expiry is the u64 at +16")
-	assert.Equal(t, uint8(2), topic.CompressionAlgorithm,
-		"compression is the u8 at +24")
-	assert.Equal(t, uint64(1<<30), topic.MaxTopicSize)
-	assert.Equal(t, uint64(4096), topic.Size)
-	assert.Equal(t, uint64(12), topic.MessagesCount)
+	assert.Equal(t, uint64(4096), topic.Size, "size is the u64 at +16")
+	assert.Equal(t, uint64(12), topic.MessagesCount, "messages count is the u64 at +24")
 	assert.Equal(t, name, topic.Name)
+	assert.Equal(t, iggcon.Duration(60_000_000), topic.MessageExpiry,
+		"message expiry is read from the explicit block")
+	assert.Equal(t, uint8(iggcon.CompressionAlgorithmGzip), topic.CompressionAlgorithm)
+	assert.Equal(t, uint64(1<<30), topic.MaxTopicSize, "the size cap is read from the derived block")
 	assert.Equal(t, map[string]iggcon.HeaderValue{
-		"partitions_count": {Kind: iggcon.Uint32, Value: partitionsValue},
+		"compression_algorithm": {Kind: iggcon.String, Value: []byte("gzip")},
+		"message_expiry":        {Kind: iggcon.Uint64, Value: expiryValue},
 	}, topic.Options)
 	assert.Equal(t, map[string]iggcon.HeaderValue{
-		"compression_algorithm": {Kind: iggcon.String, Value: []byte("none")},
+		"max_topic_size": {Kind: iggcon.Uint64, Value: sizeValue},
 	}, topic.DerivedOptions)
 	assert.Equal(t, len(payload), readBytes)
 }
 
+func TestDeserializeToTopic_ResolvesMissingSettingsToTheCatalogDefaults(t *testing.T) {
+	const nameLenOffset = 32
+	payload := make([]byte, nameLenOffset+2)
+	payload[nameLenOffset] = 1
+	payload[nameLenOffset+1] = 't'
+	payload = binary.LittleEndian.AppendUint32(payload, 0)
+	payload = binary.LittleEndian.AppendUint32(payload, 0)
+
+	topic, _, err := DeserializeToTopic(payload, 0)
+	require.NoError(t, err)
+	assert.Equal(t, iggcon.IggyExpiryNeverExpire, topic.MessageExpiry)
+	assert.Equal(t, uint64(math.MaxUint64), topic.MaxTopicSize)
+	assert.Equal(t, uint8(iggcon.CompressionAlgorithmNone), topic.CompressionAlgorithm)
+}
+
 func TestDeserializeToTopic_RejectsEveryTruncationOfTheOptionsBlocks(t *testing.T) {
-	const nameLenOffset = 49
+	const nameLenOffset = 32
 	name := "t"
 	fixed := make([]byte, nameLenOffset+1+len(name))
 	fixed[nameLenOffset] = byte(len(name))
@@ -407,7 +427,7 @@ func TestDeserializeToTopic_RejectsEveryTruncationOfTheOptionsBlocks(t *testing.
 }
 
 func TestDeserializeToTopic_RejectsAnOptionsLengthPastTheBuffer(t *testing.T) {
-	const nameLenOffset = 49
+	const nameLenOffset = 32
 	name := "t"
 	fixed := make([]byte, nameLenOffset+1+len(name))
 	fixed[nameLenOffset] = byte(len(name))

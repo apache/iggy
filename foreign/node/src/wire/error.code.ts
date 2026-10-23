@@ -61,7 +61,7 @@ export const translateErrorCode = (code: number): string => {
     case '54': return "Personal access token: {0} for user with ID: {1} has expired.";
     case '55': return "Users limit reached.";
     case '56': return "Invalid personal access token expiry";
-    case '57': return "Request transiently not committed; retry";
+    case '57': return "Request outcome unknown; it may have applied";
     case '58': return "Request transiently not accepted; retry, on any replica";
     case '59': return "Request already applied; its reply is no longer available";
     case '61': return "Not connected";
@@ -231,6 +231,12 @@ export const translateErrorCode = (code: number): string => {
     case '4100': return "Invalid offset: {0}";
     case '4101': return "Invalid reserved field value: {0}, expected: 0";
     case '4102': return "Segment file size on disk: {0} does not match expected size: {1}";
+    case '4103': return "Option cannot be updated after creation: {0}";
+    case '4104': return "Option cannot be reset: {0}";
+    case '4105': return "Option is read-only: {0}";
+    case '4106': return "Stream encryption key requires a server encryption key";
+    case '4107': return "Unsupported critical option: {0}";
+    case '4108': return "Cannot modify root user";
 
     // CONSUMER GROUP
     case '5000': return "Consumer group with ID: {0} for topic with ID: {1} was not found.";

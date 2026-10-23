@@ -144,9 +144,13 @@ struct CanonicalAt<'a> {
     header: Option<&'a PrepareHeader>,
     /// Two senders at the canonical `log_view` disagree here.
     conflict: bool,
+    /// A sender at the canonical `log_view` reported the op blank without a nack:
+    /// it cannot describe the op, which is no proof that it never prepared it.
+    abstained: bool,
 }
 
-/// The canonical header at `op`, and whether the canonical senders agree.
+/// The canonical header at `op`, whether the canonical senders agree, and whether
+/// one of them abstained.
 ///
 /// Every canonical sender is consulted, not just the first: they were all in
 /// normal status in that view and a primary prepares one thing per op, so a
@@ -155,11 +159,13 @@ struct CanonicalAt<'a> {
 fn canonical_header_at<'a>(canonical_senders: &[&'a StoredDvc], op: u64) -> CanonicalAt<'a> {
     let mut header: Option<&'a PrepareHeader> = None;
     let mut conflict = false;
+    let mut abstained = false;
     for dvc in canonical_senders {
         let Some(index) = dvc.suffix.index_of(dvc.op, op) else {
             continue;
         };
         let Some(candidate) = dvc.suffix.valid_header_at(index) else {
+            abstained |= !dvc.suffix.nacks(index);
             continue;
         };
         match header {
@@ -168,7 +174,11 @@ fn canonical_header_at<'a>(canonical_senders: &[&'a StoredDvc], op: u64) -> Cano
             None => header = Some(candidate),
         }
     }
-    CanonicalAt { header, conflict }
+    CanonicalAt {
+        header,
+        conflict,
+        abstained,
+    }
 }
 
 /// Tally every sender's position on `op`.
@@ -181,6 +191,7 @@ fn tally_op<'a>(
     let CanonicalAt {
         header: canonical,
         conflict,
+        abstained,
     } = canonical_header_at(canonical_senders, op);
     let mut copies = 0;
     let mut nacks = 0;
@@ -244,7 +255,9 @@ fn tally_op<'a>(
                     }
                     // Implicit: no canonical sender holds anything here, so a newer
                     // view already truncated this op and the sender holds a corpse.
-                    None if may_nack_implicitly => nacks += 1,
+                    // Not when a canonical sender abstained: it may hold this very
+                    // prepare, and then the sender's copy is no corpse.
+                    None if may_nack_implicitly && !abstained => nacks += 1,
                     _ => {}
                 }
             }
@@ -793,6 +806,52 @@ mod tests {
         assert!(
             log.headers.iter().all(|header| header.view == 2),
             "installed headers must come from the canonical log_view"
+        );
+    }
+
+    #[test]
+    fn given_an_abstaining_canonical_sender_when_lower_senders_hold_the_op_should_not_count_them_as_nacks()
+     {
+        // Seven replicas: replication 4, nack 4. Replica 1 alone is at the newest
+        // log_view and reports op 5 blank without a nack: it holds the op but cannot
+        // vouch for it, as while it awaits a state transfer. Replicas 3 to 5 hold
+        // op 5 with a body and replica 6 only its header. Reading the three copies
+        // as corpses of a truncated op makes four nacks against an op that four
+        // replicas, replica 1 among them, may have acked.
+        let quorums = MergeQuorums {
+            view_change: 4,
+            nack_prepare: 4,
+            replica_count: 7,
+            prepare_queue_ceiling: 32,
+        };
+        let mut quorum = dvc_quorum_array_empty();
+        let mut abstaining = suffix_headers(4, 5, 7);
+        abstaining[0] = dvc_blank(5);
+        dvc_record(
+            &mut quorum,
+            dvc(1, 8, 5, 4, DvcSuffix::new(abstaining, 0, 0b10)),
+        );
+        for replica in 3..=5 {
+            dvc_record(
+                &mut quorum,
+                dvc(
+                    replica,
+                    7,
+                    5,
+                    4,
+                    suffix_all_present(suffix_headers(4, 5, 7)),
+                ),
+            );
+        }
+        dvc_record(
+            &mut quorum,
+            dvc(6, 7, 5, 4, DvcSuffix::new(suffix_headers(4, 5, 7), 0, 0b10)),
+        );
+
+        let outcome = merge_dvc_quorum(&quorum, quorums);
+        assert!(
+            matches!(outcome, MergeOutcome::AwaitingRepair { undecided_op: 5 }),
+            "op 5 waits for a replica that can describe it, got {outcome:?}"
         );
     }
 

@@ -26,6 +26,7 @@
 //! admission.
 
 use std::borrow::Cow;
+use std::fmt::{Debug, Formatter, Result as FmtResult};
 
 use bytes::{BufMut, Bytes, BytesMut};
 
@@ -176,8 +177,17 @@ pub fn decode_options_prefixed(buf: &[u8], pos: usize) -> Result<(WireOptions, u
 ///
 /// Like `WireUserHeaders`, this type is opaque at the wire layer. Domain
 /// interpretation of value kind codes happens in `iggy_common`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct WireOptions(Bytes);
+
+impl Debug for WireOptions {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
+        formatter
+            .debug_struct("WireOptions")
+            .field("bytes_len", &self.0.len())
+            .finish()
+    }
+}
 
 impl WireOptions {
     /// Validate and wrap a borrowed byte slice (copies into new `Bytes`).
@@ -268,6 +278,19 @@ mod tests {
         let mut buf = BytesMut::new();
         encode_user_headers(entries, &mut buf);
         buf
+    }
+
+    #[test]
+    fn given_stream_key_when_debugging_options_should_hide_key_bytes_and_keep_the_block() {
+        let key = [b'k'; 32];
+        let buf = encode(&[(STRING, b"encryption_key", 1, &key)]);
+        let options = WireOptions::from_slice(&buf).expect("valid stream options");
+
+        let debugged = format!("{options:?}");
+
+        assert!(!debugged.contains("kkkkkkkk"));
+        assert!(!debugged.contains("encryption_key"));
+        assert_eq!(options.iter().next().expect("key entry").value, key);
     }
 
     #[test]
