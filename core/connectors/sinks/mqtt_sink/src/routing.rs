@@ -17,7 +17,7 @@
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use bytes::Bytes;
-use iggy_common::HeaderKey;
+use iggy_common::{HeaderKey, IggyTimestamp};
 use iggy_connector_sdk::{ConsumedMessage, Error, Payload, TopicMetadata};
 use rumqttc::v5::mqttbytes::v5::PublishProperties;
 use serde::Deserialize;
@@ -30,6 +30,7 @@ const MQTT_TOPIC_HEADER: &str = "mqtt.topic";
 pub const DEFAULT_TOPIC_TEMPLATE: &str = "{stream}/{topic}";
 const MAX_MQTT_STRING_BYTES: usize = u16::MAX as usize;
 const MAX_MQTT_PROPERTIES_BYTES: usize = 268_435_455;
+const MICROS_PER_SECOND: u64 = 1_000_000;
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -42,6 +43,7 @@ pub enum TopicMode {
 
 #[derive(Debug)]
 pub struct PreparedPublication {
+    pub offset: u64,
     pub topic: PublicationTopic,
     pub payload: Bytes,
     pub properties: Option<PublishProperties>,
@@ -82,7 +84,6 @@ struct MqttEnvelope {
 struct MqttEnvelopeProperties {
     payload_format_indicator: Option<u8>,
     message_expiry_interval: Option<u32>,
-    topic_alias: Option<u16>,
     response_topic: Option<String>,
     correlation_data_base64: Option<String>,
     #[serde(default)]
@@ -106,6 +107,11 @@ pub fn validate_topic_template(template: &str, field: &str) -> Result<(), Error>
     if template.trim().is_empty() {
         return Err(Error::InvalidConfigValue(format!(
             "{field} must not be empty"
+        )));
+    }
+    if template.starts_with('$') {
+        return Err(Error::InvalidConfigValue(format!(
+            "{field} must not start with '$'"
         )));
     }
     validate_mqtt_string(template, field).map_err(Error::InvalidConfigValue)?;
@@ -153,6 +159,9 @@ pub fn validate_topic_template(template: &str, field: &str) -> Result<(), Error>
 fn validate_topic_value(topic: &str, field: &str) -> Result<(), String> {
     if topic.trim().is_empty() {
         return Err(format!("{field} must not be empty"));
+    }
+    if topic.starts_with('$') {
+        return Err(format!("{field} must not start with '$'"));
     }
     validate_mqtt_string(topic, field)?;
     if topic
@@ -241,12 +250,14 @@ pub fn prepare_publication_with_batch_topic(
     // source-topic/header and MQTT 5 envelope interpretation.
     let template = topic_template.unwrap_or(DEFAULT_TOPIC_TEMPLATE);
     let fallback = fallback_topic.unwrap_or(template);
+    let offset = message.offset;
     match mode {
         TopicMode::Static | TopicMode::Template => {
             let topic = batch_topic.ok_or_else(|| {
                 Error::InvalidConfigValue("missing static or template batch topic".to_string())
             })?;
             Ok(PreparedPublication {
+                offset,
                 topic: PublicationTopic::Shared(Arc::clone(topic)),
                 payload: message.payload.try_into_vec()?.into(),
                 properties: None,
@@ -258,6 +269,7 @@ pub fn prepare_publication_with_batch_topic(
             validate_topic(&topic, "resolved topic")
                 .map_err(|error| Error::InvalidRecordValue(error.to_string()))?;
             Ok(PreparedPublication {
+                offset,
                 topic: PublicationTopic::Owned(topic),
                 payload,
                 properties,
@@ -275,7 +287,10 @@ fn prepare_dynamic(
     // Raw messages can carry only the source topic header. JSON messages may
     // additionally contain the versioned MQTT 5 envelope used by mqtt_source.
     let ConsumedMessage {
-        headers, payload, ..
+        headers,
+        timestamp,
+        payload,
+        ..
     } = message;
     match payload {
         payload @ Payload::Raw(_) => {
@@ -327,7 +342,7 @@ fn prepare_dynamic(
                 })?);
             let properties = envelope
                 .properties
-                .map(prepare_publish_properties)
+                .map(|properties| prepare_publish_properties(properties, timestamp))
                 .transpose()?;
             Ok((topic, payload, properties))
         }
@@ -341,17 +356,13 @@ fn prepare_dynamic(
 
 fn prepare_publish_properties(
     properties: MqttEnvelopeProperties,
+    message_timestamp: u64,
 ) -> Result<PublishProperties, Error> {
     if let Some(value) = properties.payload_format_indicator
         && !matches!(value, 0 | 1)
     {
         return Err(Error::InvalidRecordValue(
             "MQTT envelope payload_format_indicator must be 0 or 1".to_string(),
-        ));
-    }
-    if properties.topic_alias == Some(0) {
-        return Err(Error::InvalidRecordValue(
-            "MQTT envelope topic_alias must be greater than zero".to_string(),
         ));
     }
     if !properties.subscription_identifiers.is_empty() {
@@ -403,8 +414,15 @@ fn prepare_publish_properties(
 
     Ok(PublishProperties {
         payload_format_indicator: properties.payload_format_indicator,
-        message_expiry_interval: properties.message_expiry_interval,
-        topic_alias: properties.topic_alias,
+        message_expiry_interval: remaining_message_expiry_interval(
+            properties.message_expiry_interval,
+            message_timestamp,
+            IggyTimestamp::now().as_micros(),
+        )?,
+        // Topic aliases are scoped to the MQTT connection that created them.
+        // The sink creates a different connection, so it must publish the
+        // complete topic instead of forwarding the old alias.
+        topic_alias: None,
         response_topic: properties.response_topic,
         correlation_data: correlation_data.map(Into::into),
         user_properties: properties
@@ -417,6 +435,28 @@ fn prepare_publish_properties(
     })
 }
 
+fn remaining_message_expiry_interval(
+    message_expiry_interval: Option<u32>,
+    message_timestamp: u64,
+    now_timestamp: u64,
+) -> Result<Option<u32>, Error> {
+    let Some(message_expiry_interval) = message_expiry_interval else {
+        return Ok(None);
+    };
+
+    let elapsed_micros = now_timestamp.saturating_sub(message_timestamp);
+    let elapsed_seconds = elapsed_micros / MICROS_PER_SECOND
+        + u64::from(!elapsed_micros.is_multiple_of(MICROS_PER_SECOND));
+    let remaining = u64::from(message_expiry_interval).saturating_sub(elapsed_seconds);
+    if remaining == 0 {
+        return Err(Error::InvalidRecordValue(
+            "MQTT message expired before sink publication".to_string(),
+        ));
+    }
+
+    Ok(Some(remaining as u32))
+}
+
 fn mqtt_properties_length(
     properties: &MqttEnvelopeProperties,
     correlation_data: Option<&[u8]>,
@@ -427,9 +467,6 @@ fn mqtt_properties_length(
     }
     if properties.message_expiry_interval.is_some() {
         length += 5;
-    }
-    if properties.topic_alias.is_some() {
-        length += 3;
     }
     if let Some(response_topic) = &properties.response_topic {
         length += 3 + response_topic.len();
@@ -533,11 +570,54 @@ mod tests {
     }
 
     #[test]
+    fn given_reserved_dynamic_header_when_preparing_should_return_record_error() {
+        let key = HeaderKey::try_from(MQTT_TOPIC_HEADER).unwrap();
+        let mut headers = BTreeMap::new();
+        headers.insert(key, HeaderValue::try_from("$SYS/broker/uptime").unwrap());
+        let mut message = message(Payload::Raw(vec![1]));
+        message.headers = Some(headers);
+
+        let error = prepare_publication(
+            message,
+            &metadata(),
+            TopicMode::Dynamic,
+            None,
+            None,
+            Some("fallback/{stream}/{topic}"),
+            MqttProtocol::Mqtt5,
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(error, Error::InvalidRecordValue(reason) if reason.contains("must not start"))
+        );
+    }
+
+    #[test]
+    fn given_wildcard_in_template_value_when_preparing_batch_should_return_record_error() {
+        let metadata = TopicMetadata {
+            stream: "sensors+".into(),
+            topic: "telemetry".into(),
+        };
+
+        let error = prepare_batch_topic(
+            &metadata,
+            TopicMode::Template,
+            None,
+            Some("{stream}/{topic}"),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidRecordValue(reason) if reason.contains("wildcards")));
+    }
+
+    #[test]
     fn dynamic_json_envelope_decodes_payload_and_properties() {
         let payload = serde_json::json!({
             "version": 1,
             "topic": "devices/test/telemetry",
             "properties": {
+                "topic_alias": 7,
                 "content_type": "application/json",
                 "user_properties": [{"key": "device-type", "value": "sensor"}]
             },
@@ -561,6 +641,76 @@ mod tests {
             publication.properties.unwrap().user_properties[0],
             ("device-type".into(), "sensor".into())
         );
+    }
+
+    #[test]
+    fn given_topic_alias_when_preparing_envelope_should_strip_alias() {
+        let payload = serde_json::json!({
+            "version": 1,
+            "payload_base64": "AQID",
+            "properties": {"topic_alias": 7}
+        });
+        let mut bytes = serde_json::to_vec(&payload).unwrap();
+        let json = simd_json::to_owned_value(&mut bytes).unwrap();
+
+        let publication = prepare_publication(
+            message(Payload::Json(json)),
+            &metadata(),
+            TopicMode::Dynamic,
+            None,
+            None,
+            None,
+            MqttProtocol::Mqtt5,
+        )
+        .unwrap();
+
+        assert_eq!(publication.properties.unwrap().topic_alias, None);
+    }
+
+    #[test]
+    fn given_unexpired_message_when_calculating_expiry_should_return_remaining_interval() {
+        let now = 100 * MICROS_PER_SECOND;
+        let timestamp = 60 * MICROS_PER_SECOND;
+
+        let remaining = remaining_message_expiry_interval(Some(60), timestamp, now).unwrap();
+
+        assert_eq!(remaining, Some(20));
+    }
+
+    #[test]
+    fn given_expired_message_when_calculating_expiry_should_return_record_error() {
+        let now = 100 * MICROS_PER_SECOND;
+        let timestamp = 39 * MICROS_PER_SECOND;
+
+        let error = remaining_message_expiry_interval(Some(60), timestamp, now).unwrap_err();
+
+        assert!(matches!(error, Error::InvalidRecordValue(reason) if reason.contains("expired")));
+    }
+
+    #[test]
+    fn given_expired_envelope_when_preparing_should_return_record_error() {
+        let payload = serde_json::json!({
+            "version": 1,
+            "payload_base64": "AQID",
+            "properties": {"message_expiry_interval": 1}
+        });
+        let mut bytes = serde_json::to_vec(&payload).unwrap();
+        let json = simd_json::to_owned_value(&mut bytes).unwrap();
+        let mut message = message(Payload::Json(json));
+        message.timestamp = 1;
+
+        let error = prepare_publication(
+            message,
+            &metadata(),
+            TopicMode::Dynamic,
+            None,
+            None,
+            None,
+            MqttProtocol::Mqtt5,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidRecordValue(reason) if reason.contains("expired")));
     }
 
     #[test]
@@ -718,6 +868,24 @@ mod tests {
     }
 
     #[test]
+    fn topic_starting_with_dollar_should_return_configuration_error() {
+        let error = validate_topic("$SYS/broker/uptime", "topic").unwrap_err();
+
+        assert!(
+            matches!(error, Error::InvalidConfigValue(message) if message.contains("must not start"))
+        );
+    }
+
+    #[test]
+    fn topic_template_starting_with_dollar_should_return_configuration_error() {
+        let error = validate_topic_template("$SYS/{stream}", "topic_template").unwrap_err();
+
+        assert!(
+            matches!(error, Error::InvalidConfigValue(message) if message.contains("must not start"))
+        );
+    }
+
+    #[test]
     fn topic_exceeding_mqtt_string_limit_should_return_configuration_error() {
         let topic = "a".repeat(MAX_MQTT_STRING_BYTES + 1);
         let error = validate_topic(&topic, "topic").unwrap_err();
@@ -729,7 +897,6 @@ mod tests {
     fn dynamic_json_envelope_with_invalid_properties_should_return_record_error() {
         for properties in [
             serde_json::json!({"payload_format_indicator": 2}),
-            serde_json::json!({"topic_alias": 0}),
             serde_json::json!({"response_topic": "devices/#"}),
             serde_json::json!({"subscription_identifiers": [1]}),
         ] {

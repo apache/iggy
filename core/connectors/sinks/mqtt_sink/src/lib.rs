@@ -44,8 +44,9 @@ use tokio::sync::Mutex;
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 use url::Url;
+use uuid::Uuid;
 
-use driver::{MqttDriver, MqttProtocol, validate_tls_config};
+use driver::{MqttDriver, MqttProtocol, PublishWindowProgress, validate_tls_config};
 use routing::{
     DEFAULT_TOPIC_TEMPLATE, PreparedPublication, TopicMode, prepare_batch_topic,
     prepare_publication_with_batch_topic, validate_topic, validate_topic_template,
@@ -62,21 +63,28 @@ const DEFAULT_MAX_RETRY_DELAY: &str = "30s";
 const DEFAULT_TOPIC: &str = "iggy.messages";
 const DEFAULT_MAX_RETRIES: u32 = 5;
 const DEFAULT_REQUEST_CAPACITY: usize = 32;
+const DEFAULT_MAX_IN_FLIGHT: usize = 10;
 const DEFAULT_SESSION_EXPIRY_INTERVAL: u32 = 3600;
+const DEFAULT_MAX_PACKET_SIZE: usize = 1024 * 1024;
+const MAX_PUBLISH_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+const MAX_KEEP_ALIVE: Duration = Duration::from_secs(u16::MAX as u64);
+const GENERATED_CLIENT_ID_PREFIX: &str = "iggymqttsink";
+const GENERATED_CLIENT_ID_LENGTH: usize = 23;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MqttSinkConfig {
-    // Credentials are kept secret so logging a deserialized config cannot
-    // accidentally expose the broker password.
     pub broker_url: String,
     #[serde(default)]
     pub protocol: MqttProtocol,
     pub client_id: Option<String>,
     pub username: Option<String>,
+    // Credentials are kept secret so logging a deserialized config cannot
+    // accidentally expose the broker password.
     pub password: Option<SecretString>,
     #[serde(default)]
     pub tls: Option<MqttTlsConfig>,
-    #[serde(default)]
+    #[serde(default = "default_clean_start")]
     pub clean_start: bool,
     #[serde(default = "default_session_expiry_interval")]
     pub session_expiry_interval: Option<u32>,
@@ -98,6 +106,7 @@ pub struct MqttSinkConfig {
     pub retry_delay: Option<String>,
     pub max_retry_delay: Option<String>,
     pub max_in_flight: Option<usize>,
+    pub max_packet_size: Option<usize>,
     pub verbose_logging: Option<bool>,
 }
 
@@ -120,6 +129,10 @@ fn default_qos() -> u8 {
     1
 }
 
+fn default_clean_start() -> bool {
+    true
+}
+
 fn validate_broker_url(config: &MqttSinkConfig) -> Result<(), Error> {
     let url = Url::parse(&config.broker_url)
         .map_err(|error| Error::InvalidConfigValue(format!("broker_url: {error}")))?;
@@ -138,6 +151,8 @@ fn validate_broker_url(config: &MqttSinkConfig) -> Result<(), Error> {
         ("clean_start", "clean_start"),
         ("request_channel_capacity_num", "request_capacity"),
         ("client_id", "client_id"),
+        ("max_incoming_packet_size_bytes", "max_packet_size"),
+        ("max_outgoing_packet_size_bytes", "max_packet_size"),
     ] {
         if url.query_pairs().any(|(key, _)| key == option) {
             return Err(Error::InvalidConfigValue(format!(
@@ -153,6 +168,7 @@ fn validate_broker_url(config: &MqttSinkConfig) -> Result<(), Error> {
 pub struct MqttSink {
     id: u32,
     config: MqttSinkConfig,
+    client_id: String,
     keep_alive: Duration,
     publish_timeout: Duration,
     shutdown_timeout: Duration,
@@ -160,6 +176,7 @@ pub struct MqttSink {
     max_retry_delay: Duration,
     max_retries: u32,
     max_in_flight: usize,
+    max_packet_size: usize,
     verbose: bool,
     driver: Mutex<Option<MqttDriver>>,
     publish_lock: Arc<Mutex<()>>,
@@ -170,13 +187,16 @@ pub struct MqttSink {
 
 impl MqttSink {
     pub fn new(id: u32, config: MqttSinkConfig) -> Self {
-        let max_retries = config.max_retries.unwrap_or(DEFAULT_MAX_RETRIES).max(1);
-        let max_in_flight = config.max_in_flight.unwrap_or(1).max(1);
+        let max_retries = config.max_retries.unwrap_or(DEFAULT_MAX_RETRIES);
+        let max_in_flight = config.max_in_flight.unwrap_or(DEFAULT_MAX_IN_FLIGHT);
+        let max_packet_size = config.max_packet_size.unwrap_or(DEFAULT_MAX_PACKET_SIZE);
+        let client_id = config.client_id.clone().unwrap_or_else(generated_client_id);
 
         Self {
             id,
             verbose: config.verbose_logging.unwrap_or(false),
             config,
+            client_id,
             keep_alive: Duration::from_secs(30),
             publish_timeout: Duration::from_secs(30),
             shutdown_timeout: Duration::from_secs(30),
@@ -184,6 +204,7 @@ impl MqttSink {
             max_retry_delay: Duration::from_secs(30),
             max_retries,
             max_in_flight,
+            max_packet_size,
             driver: Mutex::new(None),
             publish_lock: Arc::new(Mutex::new(())),
             messages_published: AtomicU64::new(0),
@@ -229,6 +250,7 @@ impl MqttSink {
             DEFAULT_PUBLISH_TIMEOUT,
             "publish_timeout",
         )?;
+        validate_max_duration(publish_timeout, MAX_PUBLISH_TIMEOUT, "publish_timeout")?;
         let shutdown_timeout = parse_duration(
             self.config.shutdown_timeout.as_deref(),
             DEFAULT_SHUTDOWN_TIMEOUT,
@@ -265,11 +287,21 @@ impl MqttSink {
                 "request_capacity must be greater than zero".to_string(),
             ));
         }
+        if self.max_packet_size == 0 {
+            return Err(Error::InvalidConfigValue(
+                "max_packet_size must be greater than zero".to_string(),
+            ));
+        }
         let request_capacity = self
             .config
             .request_capacity
             .unwrap_or(DEFAULT_REQUEST_CAPACITY);
-        let max_in_flight = self.config.max_in_flight.unwrap_or(1);
+        let max_in_flight = self.config.max_in_flight.unwrap_or(DEFAULT_MAX_IN_FLIGHT);
+        if max_in_flight == 0 {
+            return Err(Error::InvalidConfigValue(
+                "max_in_flight must be greater than zero".to_string(),
+            ));
+        }
         if max_in_flight > request_capacity {
             return Err(Error::InvalidConfigValue(
                 "max_in_flight must not exceed request_capacity".to_string(),
@@ -292,22 +324,19 @@ impl MqttSink {
             shutdown_timeout,
             retry_delay,
             max_retry_delay.max(retry_delay),
-            max_in_flight.max(1),
+            max_in_flight,
         ))
     }
 
-    fn client_id(&self) -> String {
-        self.config
-            .client_id
-            .clone()
-            .unwrap_or_else(|| format!("iggy-mqtt-sink-{}", self.id))
+    fn client_id(&self) -> &str {
+        &self.client_id
     }
 
     async fn connect_driver(&self) -> Result<MqttDriver, Error> {
         MqttDriver::connect(
             self.id,
             &self.config,
-            self.client_id(),
+            self.client_id().to_owned(),
             self.keep_alive,
             self.publish_timeout,
             self.config
@@ -356,14 +385,34 @@ impl MqttSink {
                 self.config.fallback_topic.as_deref(),
                 self.config.protocol,
             ) {
-                Ok(publication) => publications.push(publication),
+                Ok(publication) => {
+                    let packet_size = driver::publication_packet_size(
+                        &publication,
+                        self.config.protocol,
+                        self.config.qos,
+                        self.config.retain,
+                    );
+                    if packet_size > self.max_packet_size {
+                        warn!(
+                            "Skipping oversized MQTT record for connector with ID {}: stream: {}, topic: {}, offset: {}, packet_size: {}, max_packet_size: {}",
+                            self.id,
+                            topic_metadata.stream,
+                            topic_metadata.topic,
+                            offset,
+                            packet_size,
+                            self.max_packet_size
+                        );
+                        self.publish_errors.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        publications.push(publication);
+                    }
+                }
                 Err(error) => {
                     warn!(
-                        "Rejecting MQTT batch for connector with ID {} because record is invalid, stream: {}, topic: {}, offset: {}: {error}",
+                        "Skipping invalid MQTT record for connector with ID {}: stream: {}, topic: {}, offset: {}: {error}",
                         self.id, topic_metadata.stream, topic_metadata.topic, offset
                     );
                     self.publish_errors.fetch_add(1, Ordering::Relaxed);
-                    return Err(error);
                 }
             }
         }
@@ -385,98 +434,168 @@ impl MqttSink {
         // with the publication that caused them.
         let _publish_guard = self.publish_lock.lock().await;
         let mut confirmed = vec![false; publications.len()];
+        let mut skipped = 0_u64;
         self.in_flight_publications
             .fetch_add(publications.len() as u64, Ordering::Relaxed);
         let mut driver = self.driver.lock().await.take();
 
-        let mut attempts = 1;
+        let mut retries = 0;
         loop {
             let mut active_driver = match driver.take() {
                 Some(driver) => driver,
                 None => match self.connect_driver().await {
                     Ok(reconnected) => reconnected,
-                    Err(error) if attempts == self.max_retries => {
+                    Err(Error::Connection(error)) if retries < self.max_retries => {
+                        warn!(
+                            "Retrying MQTT connection for connector with ID {} (retry {}/{}): {error}",
+                            self.id,
+                            retries + 1,
+                            self.max_retries
+                        );
+                        let delay =
+                            retry_backoff(self.retry_delay, retries + 1, self.max_retry_delay);
+                        tokio::time::sleep(delay).await;
+                        retries += 1;
+                        continue;
+                    }
+                    Err(error) => {
                         self.finish_unconfirmed_publications(&confirmed);
                         return Err(error);
                     }
-                    Err(error) => {
-                        warn!(
-                            "Retrying MQTT connection for connector with ID {} (attempt {attempts}/{}): {error}",
-                            self.id, self.max_retries
-                        );
-                        let delay = retry_backoff(self.retry_delay, attempts, self.max_retry_delay);
-                        tokio::time::sleep(delay).await;
-                        continue;
-                    }
                 },
             };
+            for (index, publication) in publications.iter().enumerate() {
+                if confirmed[index]
+                    || driver::publication_packet_size(
+                        publication,
+                        self.config.protocol,
+                        self.config.qos,
+                        self.config.retain,
+                    ) <= active_driver.max_packet_size()
+                {
+                    continue;
+                }
+                let packet_size = driver::publication_packet_size(
+                    publication,
+                    self.config.protocol,
+                    self.config.qos,
+                    self.config.retain,
+                );
+                warn!(
+                    "Skipping oversized MQTT record for connector with ID {}: stream: {}, topic: {}, offset: {}, packet_size: {}, max_packet_size: {}",
+                    self.id,
+                    topic_metadata.stream,
+                    topic_metadata.topic,
+                    publication.offset,
+                    packet_size,
+                    active_driver.max_packet_size()
+                );
+                confirmed[index] = true;
+                skipped += 1;
+                self.in_flight_publications.fetch_sub(1, Ordering::Relaxed);
+                self.publish_errors.fetch_add(1, Ordering::Relaxed);
+            }
             let pending_indices: Vec<usize> = confirmed
                 .iter()
                 .enumerate()
                 .filter_map(|(index, is_confirmed)| (!is_confirmed).then_some(index))
                 .collect();
-            let mut failure = None;
-
             for window_indices in pending_indices.chunks(self.max_in_flight) {
                 let window: Vec<_> = window_indices
                     .iter()
                     .map(|&index| &publications[index])
                     .collect();
-                match active_driver
-                    .publish_window(&window, qos, self.config.retain, self.publish_timeout)
+                let mut window_state = active_driver.new_publish_window(window.len(), qos);
+                let initial_indexes: Vec<_> = (0..window.len()).collect();
+                if let Err(window_error) = active_driver
+                    .enqueue_window(
+                        &window,
+                        &initial_indexes,
+                        qos,
+                        self.config.retain,
+                        &mut window_state,
+                    )
                     .await
                 {
-                    Ok(()) => {
-                        for &index in window_indices {
-                            if !confirmed[index] {
-                                confirmed[index] = true;
-                                self.in_flight_publications.fetch_sub(1, Ordering::Relaxed);
+                    self.finish_unconfirmed_publications(&confirmed);
+                    return Err(window_error.error);
+                }
+
+                loop {
+                    match active_driver
+                        .drive_window(&mut window_state, self.publish_timeout)
+                        .await
+                    {
+                        Ok(PublishWindowProgress::Complete) => {
+                            for &index in window_indices {
+                                if !confirmed[index] {
+                                    confirmed[index] = true;
+                                    self.in_flight_publications.fetch_sub(1, Ordering::Relaxed);
+                                }
+                            }
+                            break;
+                        }
+                        // rumqttc::EventLoop::clean retains unacknowledged requests for the
+                        // next connection. Keep their packet mappings for both CONNACK results.
+                        Ok(PublishWindowProgress::SessionPresent(session_present)) => {
+                            debug!(
+                                "MQTT reconnect for connector with ID {} reported session_present={session_present}; keeping sink packet mappings for rumqttc retransmission",
+                                self.id
+                            );
+                        }
+                        Err(window_error) => {
+                            for local_index in window_state.confirmed_indexes() {
+                                let index = window_indices[local_index];
+                                if !confirmed[index] {
+                                    confirmed[index] = true;
+                                    self.in_flight_publications.fetch_sub(1, Ordering::Relaxed);
+                                }
+                            }
+                            if !window_error.retryable || retries >= self.max_retries {
+                                self.finish_unconfirmed_publications(&confirmed);
+                                return Err(window_error.error);
+                            }
+                            if window_error.requires_clean
+                                && let Err(error) = active_driver.clean().await
+                            {
+                                self.finish_unconfirmed_publications(&confirmed);
+                                return Err(error);
+                            }
+                            warn!(
+                                "Retrying MQTT publication for connector with ID {} (retry {}/{}): {}",
+                                self.id,
+                                retries + 1,
+                                self.max_retries,
+                                window_error.error
+                            );
+                            let delay =
+                                retry_backoff(self.retry_delay, retries + 1, self.max_retry_delay);
+                            tokio::time::sleep(delay).await;
+                            retries += 1;
+                            if window_error.requires_requeue {
+                                let replay_indexes = window_state.reset_from_first_unconfirmed();
+                                let replay: Vec<_> =
+                                    replay_indexes.iter().map(|&index| window[index]).collect();
+                                if let Err(requeue_error) = active_driver
+                                    .enqueue_window(
+                                        &replay,
+                                        &replay_indexes,
+                                        qos,
+                                        self.config.retain,
+                                        &mut window_state,
+                                    )
+                                    .await
+                                {
+                                    self.finish_unconfirmed_publications(&confirmed);
+                                    return Err(requeue_error.error);
+                                }
                             }
                         }
                     }
-                    Err(window_error) => {
-                        for local_index in &window_error.confirmed {
-                            let index = window_indices[*local_index];
-                            if !confirmed[index] {
-                                confirmed[index] = true;
-                                self.in_flight_publications.fetch_sub(1, Ordering::Relaxed);
-                            }
-                        }
-                        failure = Some(window_error);
-                        break;
-                    }
                 }
             }
-
-            let window_error = match failure {
-                Some(window_error) => window_error,
-                None => {
-                    *self.driver.lock().await = Some(active_driver);
-                    return Ok(confirmed.iter().filter(|confirmed| **confirmed).count() as u64);
-                }
-            };
-            // A failed QoS 2 handshake can leave rumqttc's outgoing window
-            // full. Do not reuse the event loop after any window failure.
-            drop(active_driver);
-            if !window_error.retryable {
-                self.finish_unconfirmed_publications(&confirmed);
-                return Err(window_error.error);
-            }
-            if attempts >= self.max_retries {
-                self.finish_unconfirmed_publications(&confirmed);
-                return Err(window_error.error);
-            }
-
-            warn!(
-                "Discarding uncertain MQTT connection for connector with ID {} before retry {}/{}: {}",
-                self.id,
-                attempts + 1,
-                self.max_retries,
-                window_error.error
-            );
-            let delay = retry_backoff(self.retry_delay, attempts, self.max_retry_delay);
-            tokio::time::sleep(delay).await;
-            attempts += 1;
+            *self.driver.lock().await = Some(active_driver);
+            return Ok(confirmed.iter().filter(|confirmed| **confirmed).count() as u64 - skipped);
         }
     }
 }
@@ -491,31 +610,57 @@ impl Sink for MqttSink {
             retry_delay,
             max_retry_delay,
             max_in_flight,
-        ) = self.validate_config()?;
+        ) = match self.validate_config() {
+            Ok(values) => values,
+            Err(error) => {
+                error!(
+                    "Failed to validate MQTT sink connector with ID {}: {error}",
+                    self.id
+                );
+                return Err(error);
+            }
+        };
         self.keep_alive = keep_alive;
         self.publish_timeout = publish_timeout;
         self.shutdown_timeout = shutdown_timeout;
         self.retry_delay = retry_delay;
         self.max_retry_delay = max_retry_delay;
         self.max_in_flight = max_in_flight;
-        let qos = self.qos()?;
+        let qos = match self.qos() {
+            Ok(qos) => qos,
+            Err(error) => {
+                error!(
+                    "Failed to validate MQTT sink connector with ID {}: {error}",
+                    self.id
+                );
+                return Err(error);
+            }
+        };
         // Connection establishment waits for CONNACK, so a successful open
         // means the broker accepted the session rather than only queueing a
         // local rumqttc request.
-        let mut attempt = 1;
+        let mut retries = 0;
         let driver = loop {
             match self.connect_driver().await {
                 Ok(driver) => break driver,
-                Err(Error::Connection(error)) if attempt < self.max_retries => {
+                Err(Error::Connection(error)) if retries < self.max_retries => {
                     warn!(
-                        "Retrying MQTT connection for connector with ID {} (attempt {attempt}/{}): {error}",
-                        self.id, self.max_retries
+                        "Retrying MQTT connection for connector with ID {} (retry {}/{}): {error}",
+                        self.id,
+                        retries + 1,
+                        self.max_retries
                     );
-                    let delay = retry_backoff(self.retry_delay, attempt, self.max_retry_delay);
+                    let delay = retry_backoff(self.retry_delay, retries + 1, self.max_retry_delay);
                     tokio::time::sleep(delay).await;
-                    attempt += 1;
+                    retries += 1;
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    error!(
+                        "Failed to open MQTT sink connector with ID {}: {error}",
+                        self.id
+                    );
+                    return Err(error);
+                }
             }
         };
         *self.driver.get_mut() = Some(driver);
@@ -603,6 +748,12 @@ impl Sink for MqttSink {
     }
 }
 
+fn generated_client_id() -> String {
+    let suffix = Uuid::new_v4().simple().to_string();
+    let suffix_length = GENERATED_CLIENT_ID_LENGTH - GENERATED_CLIENT_ID_PREFIX.len();
+    format!("{GENERATED_CLIENT_ID_PREFIX}{}", &suffix[..suffix_length])
+}
+
 fn parse_duration(value: Option<&str>, default: &str, field: &str) -> Result<Duration, Error> {
     let value = value.unwrap_or(default);
     HumanDuration::from_str(value)
@@ -610,11 +761,27 @@ fn parse_duration(value: Option<&str>, default: &str, field: &str) -> Result<Dur
         .map_err(|error| Error::InvalidConfigValue(format!("{field}: {error}")))
 }
 
+fn validate_max_duration(duration: Duration, maximum: Duration, field: &str) -> Result<(), Error> {
+    if duration > maximum {
+        return Err(Error::InvalidConfigValue(format!(
+            "{field} must not exceed {}s",
+            maximum.as_secs()
+        )));
+    }
+    Ok(())
+}
+
 fn validate_keep_alive(
     protocol: MqttProtocol,
     keep_alive: Duration,
     field: &str,
 ) -> Result<(), Error> {
+    if keep_alive > MAX_KEEP_ALIVE {
+        return Err(Error::InvalidConfigValue(format!(
+            "{field} must not exceed {}s",
+            MAX_KEEP_ALIVE.as_secs()
+        )));
+    }
     let minimum_keep_alive = match protocol {
         MqttProtocol::Mqtt311 => Duration::from_secs(1),
         MqttProtocol::Mqtt5 => Duration::from_secs(5),
@@ -661,6 +828,7 @@ mod tests {
             retry_delay: Some("1s".to_string()),
             max_retry_delay: Some("30s".to_string()),
             max_in_flight: Some(1),
+            max_packet_size: None,
             verbose_logging: Some(false),
         }
     }
@@ -689,10 +857,12 @@ mod tests {
     }
 
     #[test]
-    fn given_qos_one_when_new_should_keep_default_delivery_mode() {
-        let sink = MqttSink::new(1, test_config());
+    fn given_no_max_in_flight_when_new_should_use_pipelining_default() {
+        let mut config = test_config();
+        config.max_in_flight = None;
+        let sink = MqttSink::new(1, config);
         assert_eq!(sink.config.qos, 1);
-        assert_eq!(sink.max_in_flight, 1);
+        assert_eq!(sink.max_in_flight, DEFAULT_MAX_IN_FLIGHT);
     }
 
     #[test]
@@ -702,6 +872,15 @@ mod tests {
         let sink = MqttSink::new(1, config);
 
         assert_eq!(sink.max_retries, DEFAULT_MAX_RETRIES);
+    }
+
+    #[test]
+    fn given_zero_max_retries_should_not_retry_after_initial_attempt() {
+        let mut config = test_config();
+        config.max_retries = Some(0);
+        let sink = MqttSink::new(1, config);
+
+        assert_eq!(sink.max_retries, 0);
     }
 
     #[test]
@@ -743,6 +922,41 @@ mod tests {
         assert!(matches!(
             sink.validate_config(),
             Err(Error::InvalidConfigValue(message)) if message.contains("keep_alive")
+        ));
+    }
+
+    #[test]
+    fn given_keep_alive_above_rumqttc_limit_should_reject_configuration() {
+        let mut config = test_config();
+        config.keep_alive = Some("65536s".to_string());
+        let sink = MqttSink::new(1, config);
+
+        assert!(matches!(
+            sink.validate_config(),
+            Err(Error::InvalidConfigValue(message)) if message == "keep_alive must not exceed 65535s"
+        ));
+    }
+
+    #[test]
+    fn given_unknown_sink_config_field_should_reject_configuration() {
+        let error = serde_json::from_str::<MqttSinkConfig>(
+            r#"{"broker_url":"mqtt://localhost:1883","clean_session":true}"#,
+        )
+        .expect_err("unknown fields must reject the configuration");
+
+        assert!(error.to_string().contains("unknown field `clean_session`"));
+    }
+
+    #[test]
+    fn given_publish_timeout_above_one_hour_when_validating_should_return_configuration_error() {
+        let mut config = test_config();
+        config.publish_timeout = Some("1h1s".to_string());
+        let sink = MqttSink::new(1, config);
+
+        assert!(matches!(
+            sink.validate_config(),
+            Err(Error::InvalidConfigValue(message))
+                if message == "publish_timeout must not exceed 3600s"
         ));
     }
 
@@ -791,6 +1005,19 @@ mod tests {
     }
 
     #[test]
+    fn given_zero_max_in_flight_when_validating_should_return_configuration_error() {
+        let mut config = test_config();
+        config.max_in_flight = Some(0);
+        let sink = MqttSink::new(1, config);
+
+        assert_eq!(sink.max_in_flight, 0);
+        assert!(matches!(
+            sink.validate_config(),
+            Err(Error::InvalidConfigValue(message)) if message.contains("max_in_flight")
+        ));
+    }
+
+    #[test]
     fn given_unknown_topic_template_placeholder_when_validating_should_return_configuration_error()
     {
         let mut config = test_config();
@@ -800,6 +1027,30 @@ mod tests {
         assert!(matches!(
             sink.validate_config(),
             Err(Error::InvalidConfigValue(message)) if message.contains("unsupported placeholder")
+        ));
+    }
+
+    #[test]
+    fn given_reserved_static_topic_when_validating_should_return_configuration_error() {
+        let mut config = test_config();
+        config.topic = Some("$SYS/broker/uptime".to_string());
+        let sink = MqttSink::new(1, config);
+
+        assert!(matches!(
+            sink.validate_config(),
+            Err(Error::InvalidConfigValue(message)) if message.contains("must not start")
+        ));
+    }
+
+    #[test]
+    fn given_reserved_fallback_topic_when_validating_should_return_configuration_error() {
+        let mut config = test_config();
+        config.fallback_topic = Some("$SYS/{stream}/{topic}".to_string());
+        let sink = MqttSink::new(1, config);
+
+        assert!(matches!(
+            sink.validate_config(),
+            Err(Error::InvalidConfigValue(message)) if message.contains("must not start")
         ));
     }
 
@@ -834,6 +1085,8 @@ mod tests {
             ("clean_start", "clean_start"),
             ("request_channel_capacity_num", "request_capacity"),
             ("client_id", "client_id"),
+            ("max_incoming_packet_size_bytes", "max_packet_size"),
+            ("max_outgoing_packet_size_bytes", "max_packet_size"),
         ] {
             let mut config = test_config();
             config.broker_url = format!("mqtt://localhost:1883?{option}=value");
@@ -899,11 +1152,24 @@ mod tests {
     }
 
     #[test]
-    fn given_missing_client_id_when_client_id_should_use_connector_id() {
+    fn given_clean_start_without_client_id_when_constructing_should_generate_short_client_id() {
         let mut config = test_config();
         config.client_id = None;
+        config.clean_start = true;
         let sink = MqttSink::new(42, config);
-        assert_eq!(sink.client_id(), "iggy-mqtt-sink-42");
+        let mut other_config = test_config();
+        other_config.client_id = None;
+        other_config.clean_start = true;
+        let other_sink = MqttSink::new(42, other_config);
+
+        assert_eq!(sink.client_id().len(), GENERATED_CLIENT_ID_LENGTH);
+        assert!(
+            sink.client_id()
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric())
+        );
+        assert!(sink.client_id().starts_with(GENERATED_CLIENT_ID_PREFIX));
+        assert_ne!(sink.client_id(), other_sink.client_id());
     }
 
     #[test]
@@ -928,6 +1194,36 @@ mod tests {
 
         assert_eq!(sink.in_flight_publications.load(Ordering::Relaxed), 0);
         assert_eq!(sink.publish_errors.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn given_unreachable_broker_when_reconnecting_should_stop_at_max_retries() {
+        let mut config = test_config();
+        config.broker_url = "mqtt://127.0.0.1:1".to_string();
+        config.max_retries = Some(2);
+        let mut sink = MqttSink::new(1, config);
+        sink.publish_timeout = Duration::from_millis(100);
+        sink.retry_delay = Duration::from_millis(1);
+        sink.max_retry_delay = Duration::from_millis(1);
+        let metadata = TopicMetadata {
+            stream: "devices".to_string(),
+            topic: "telemetry".to_string(),
+        };
+        let runtime = tokio::runtime::Runtime::new().expect("runtime must start");
+
+        let error = runtime.block_on(async {
+            timeout(
+                Duration::from_secs(1),
+                sink.publish_messages(&metadata, test_messages()),
+            )
+            .await
+            .expect("reconnect attempts must finish")
+            .expect_err("unreachable broker must return an error")
+        });
+
+        assert!(matches!(error, Error::Connection(_)));
+        assert_eq!(sink.in_flight_publications.load(Ordering::Relaxed), 0);
+        assert_eq!(sink.publish_errors.load(Ordering::Relaxed), 2);
     }
 
     #[test]
@@ -982,7 +1278,8 @@ mod tests {
     }
 
     #[test]
-    fn given_malformed_dynamic_record_when_preparing_should_reject_batch() {
+    fn given_malformed_dynamic_record_when_preparing_should_skip_record_and_keep_valid_publications()
+     {
         let mut config = test_config();
         config.topic_mode = TopicMode::Dynamic;
         config.fallback_topic = Some("fallback/{stream}/{topic}".to_string());
@@ -1016,13 +1313,63 @@ mod tests {
                 headers: None,
                 payload: Payload::Json(malformed),
             },
+            ConsumedMessage {
+                id: 3,
+                offset: 12,
+                checksum: 1,
+                timestamp: 1,
+                origin_timestamp: 1,
+                headers: None,
+                payload: Payload::Raw(b"also-valid".to_vec()),
+            },
         ];
 
-        let error = sink
+        let publications = sink
             .prepare_publications(&metadata, messages)
-            .expect_err("malformed record must reject the batch");
+            .expect("malformed record must not reject valid records");
 
-        assert!(matches!(error, Error::InvalidRecordValue(_)));
+        assert_eq!(publications.len(), 2);
+        assert_eq!(publications[0].payload.as_ref(), b"valid");
+        assert_eq!(publications[1].payload.as_ref(), b"also-valid");
+        assert_eq!(sink.publish_errors.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn given_oversized_record_when_preparing_should_skip_record_and_keep_valid_publications() {
+        let mut config = test_config();
+        config.max_packet_size = Some(32);
+        let sink = MqttSink::new(1, config);
+        let metadata = TopicMetadata {
+            stream: "devices".to_string(),
+            topic: "telemetry".to_string(),
+        };
+        let messages = vec![
+            ConsumedMessage {
+                id: 1,
+                offset: 10,
+                checksum: 1,
+                timestamp: 1,
+                origin_timestamp: 1,
+                headers: None,
+                payload: Payload::Raw(b"valid".to_vec()),
+            },
+            ConsumedMessage {
+                id: 2,
+                offset: 11,
+                checksum: 1,
+                timestamp: 1,
+                origin_timestamp: 1,
+                headers: None,
+                payload: Payload::Raw(vec![b'x'; 64]),
+            },
+        ];
+
+        let publications = sink
+            .prepare_publications(&metadata, messages)
+            .expect("oversized record must not reject valid records");
+
+        assert_eq!(publications.len(), 1);
+        assert_eq!(publications[0].payload.as_ref(), b"valid");
         assert_eq!(sink.publish_errors.load(Ordering::Relaxed), 1);
     }
 
@@ -1085,8 +1432,9 @@ mod tests {
         .unwrap();
         let sink = MqttSink::new(1, config);
         assert_eq!(sink.config.topic.as_deref(), Some(DEFAULT_TOPIC));
+        assert!(sink.config.clean_start);
         assert_eq!(sink.config.qos, 1);
-        assert_eq!(sink.max_in_flight, 1);
+        assert_eq!(sink.max_in_flight, DEFAULT_MAX_IN_FLIGHT);
         assert_eq!(sink.shutdown_timeout, Duration::from_secs(30));
     }
 }
