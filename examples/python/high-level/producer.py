@@ -79,8 +79,6 @@ async def main() -> None:
         topic_partitions_count=3,
         topic_message_expiry=None,
         topic_max_size=None,
-        send_retries=3,
-        send_retry_interval=timedelta(seconds=1),
     )
 
     async with producer:

@@ -42,6 +42,7 @@ class GlobalContext:
     last_sent_message: str | None = None  # Store message payload as string
     last_raw_response: bytes | None = None
     last_raw_error: RuntimeError | None = None
+    last_call_error: RuntimeError | None = None
 
 
 def required_env(name: str) -> str:
@@ -63,6 +64,12 @@ def required_env(name: str) -> str:
 def root_credentials() -> tuple[str, str]:
     """Root username and password the server was started with."""
     return required_env("IGGY_ROOT_USERNAME"), required_env("IGGY_ROOT_PASSWORD")
+
+
+@pytest.fixture(scope="session")
+def no_quorum_address() -> str:
+    """Address of the cluster node that cannot reach quorum."""
+    return required_env("IGGY_TCP_ADDRESS_NO_QUORUM")
 
 
 @pytest.fixture(scope="session")

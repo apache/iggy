@@ -223,8 +223,9 @@ API. For detailed producer semantics and configuration guidance, see the
 Use `IggyClient.producer()` when an application repeatedly publishes to one
 stream and topic. Producer creation is asynchronous because it initializes the
 destination before returning. By default, it creates a missing stream and topic,
-uses balanced partitioning, sends directly in batches of up to 1,000 messages,
-and retries failed sends up to three times with a one-second retry interval.
+uses balanced partitioning and sends directly in batches of up to 1,000 messages.
+The binary driver retries each chunk within one 30-second deadline, preserving
+its request identity. The producer adds no retry under a new identity.
 
 The default mode is direct. Pass `BackgroundProducerConfig` to queue sends on
 background workers instead.
@@ -253,8 +254,6 @@ async def main():
         topic_partitions_count=3,
         topic_message_expiry=None,
         topic_max_size=None,
-        send_retries=3,
-        send_retry_interval=timedelta(seconds=1),
     )
 
     async with producer:
@@ -277,26 +276,73 @@ exchange. Persisted sends also provide crash-safe retry receipts; weaker topic
 policies can lose data and receipts on a crash. HTTP NoAck confirms dispatch
 only. An application resend creates a new request and can duplicate messages.
 
-Producer retries start a new attempt after an explicit `TransientNotAccepted`
-refusal or a connection failure before submission (`NotConnected` or
-`CannotEstablishConnection`). Missing destinations and other terminal errors
-stop immediately. `send_retries` counts retries after the initial attempt. The
-first permitted retry runs immediately, and `send_retry_interval` delays only
-later retries. Set `send_retries` to `None` or `0` to disable producer retries.
-Set `send_retry_interval` to `None` to run permitted retries without a delay.
-A zero interval raises `ValueError`.
+Mutation retries belong to the shared client driver. The producer no longer accepts
+`send_retries` or `send_retry_interval`; passing either raises `TypeError`. HTTP
+keeps its configured HTTP retry policy and does not support operation recovery.
+HTTP 503 `relay_refused` follows that policy; the Rust-backed HTTP retry schedule
+does not use the server's `Retry-After` header.
 
-HTTP send errors stop producer retries immediately, so `send_retries` does not
-retry a failed HTTP send. Transport retries are separate from producer retries.
-For example, the default
-`HttpConfig(retries=3)` gives each producer attempt up to four HTTP attempts.
+On a multi-node cluster, an HTTP call often reaches a node that is not the
+partition primary. For message sends, polls and consumer offset calls, that
+node relays the call to the primary. The relay needs identical `http.jwt`
+secrets or `cluster.auth` on every node. Without that key material, these calls
+answer 503 with code 58. See
+[HTTP routing and backpressure](../../core/server/README.md#http-routing-and-backpressure).
 
-A failed direct send raises `ProducerSendError`, which is a `RuntimeError`
-subclass. Its `cause` property contains the underlying error text. Its
+Receipt access follows the server's [session and revocation policy](../../core/server/README.md#sessions-and-retry-receipts).
+An unresolved operation cannot recover its receipt after its original session
+ends, even after a new login or account reactivation. A fresh send can duplicate
+that operation.
+
+Each node counts the messages in its stream, topic and system stats. After a
+successful send, a node that is not the partition primary shows the new count
+only after the next prepare or commit broadcast. When no other write follows,
+this delay is at most `cluster.commit_broadcast_interval` (500 ms by default).
+See [metadata freshness and counters](../../core/server/README.md#metadata-freshness-and-counters).
+
+Every error that the Rust SDK reports reaches Python as `IggyError`, a `RuntimeError` subclass. Its `code` is the numeric Iggy error code, the same code that the other SDKs report, and its message is the SDK's error text, so branch on `code` rather than on the message. Three codes tell what happened to a request that did not complete:
+
+- 58 (`TransientNotAccepted`): the server did not admit the request, so a retry is safe.
+- 57 (`TransientNotCommitted`): the outcome is unknown, and the server possibly applied the write. Read the state before you write it again.
+- 40 (`Unauthenticated`): the request needs a session. Sign in, then retry.
+
+`PendingOperationError` and `ProducerSendError` are `IggyError` subclasses. An error that the binding raises itself, such as a `ValueError`, a `TypeError`, or a plain `RuntimeError` for an invalid argument or a shut-down producer, is not an `IggyError` and carries no code.
+
+`PendingOperationError` exposes the exact integer `operation_id`, the numeric
+`code`, and `kind` (`"uncertain"`, `"lane_blocked"`, or `"not_retained"`). On the
+same live client, `await client.resolve_operation(operation_id,
+timeout=timedelta(seconds=30))` replays the original operation. A committed
+business rejection raises its original error and releases the lane; uncertainty
+keeps the operation retained. The default timeout is 30 seconds; it must be a
+positive `timedelta`. `await client.abandon_operation(operation_id)` releases the
+lane without establishing whether the operation committed. A session reset
+forgets retained operations, so recovery must use the original session.
+The client keeps the proved outcomes of its last `max_operations` replays, also
+across a session reset. A later `resolve_operation` of a proved operation
+returns the same outcome without a request.
+
+`TcpConfig`, `QuicConfig`, and `WebSocketConfig` accept `pending_operations=
+PendingOperationsConfig(max_operations=256, max_bytes=64 * 1024 * 1024)`. These
+client-wide defaults bound active and retained mutations across every partition.
+Admission waits before allocating a request ID. Queued writer frames keep their
+bytes charged until their last reference is released, even after abandonment.
+TCP, QUIC and WebSocket connection strings accept `max_pending_operations` and
+`max_pending_operation_bytes` as positive integers, for example
+`iggy+tcp://iggy:iggy@localhost:8090?max_pending_operations=256&max_pending_operation_bytes=67108864`.
+
+A failed direct send raises `ProducerSendError`, an `IggyError` with code 4056 (`ProducerSendFailed`). Its `cause` property contains the underlying error text, and its `__cause__` is the `IggyError` that ended the send, a structured `PendingOperationError` when applicable.
+
+The optional `operation_id` of a `ProducerSendError` identifies the retained send to resolve or abandon. Its
 `committed` property contains confirmations from completed chunks, and `failed`
-contains the remaining unconfirmed messages. If encryption is enabled, the
-failed messages contain encrypted payloads. Restore the original payloads
-before submitting them to the same producer again.
+contains the remaining messages without usable confirmations. For an `uncertain`
+cause, the first `uncertain` messages of `failed` form one chunk that may already
+have committed. Resolve its `operation_id` without submitting that chunk as a new
+send. A cause with code 57 retains no operation, yet its first `uncertain` messages may also have committed. For any other cause, `uncertain` is zero. For `lane_blocked`,
+none of `failed` was sent: the ID names an earlier operation to resolve before
+retrying. Abandonment or a session reset discards retained results, and
+`not_retained` does not prove non-commit. Resubmitting an uncertain chunk can
+duplicate messages. Before any safe resubmission, restore payloads changed by
+encryption.
 
 ### Background Mode
 
@@ -354,10 +400,11 @@ batch larger than the whole budget always fails. A zero byte budget is
 unlimited. `max_in_flight` separately bounds concurrent write requests across
 all shards; zero uses the runtime maximum.
 
-Producer retries and transport reconnection happen inside background workers.
+Binary driver retries and transport reconnection happen inside background workers.
 The Python API does not currently expose a background error callback, so a write
-that still fails after its retries is logged by the Rust SDK and its unconfirmed
-messages are dropped.
+that fails at its operation deadline is logged by the Rust SDK and its messages
+are dropped from the worker queue. An uncertain chunk remains retained by the
+client for recovery; it may already have committed.
 
 See the complete runnable
 [`background_producer.py`](../../examples/python/high-level/background_producer.py)

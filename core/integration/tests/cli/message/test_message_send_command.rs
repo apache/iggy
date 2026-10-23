@@ -22,6 +22,7 @@ use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
 use iggy::prelude::*;
+use integration::harness::wait_for_topic_messages_count;
 use predicates::str::{contains, diff};
 use serial_test::parallel;
 use std::collections::BTreeMap;
@@ -60,12 +61,14 @@ struct TestMessageSendCmd {
     message_input: ProvideMessages,
     partitioning: PartitionSelection,
     header: Option<BTreeMap<HeaderKey, HeaderValue>>,
+    commit_budget: Duration,
     // These will be populated after creating the resources
     actual_stream_id: Option<u32>,
     actual_topic_id: Option<u32>,
 }
 
 impl TestMessageSendCmd {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         stream_name: String,
         topic_name: String,
@@ -74,6 +77,7 @@ impl TestMessageSendCmd {
         message_input: ProvideMessages,
         partitioning: PartitionSelection,
         header: Option<BTreeMap<HeaderKey, HeaderValue>>,
+        commit_budget: Duration,
     ) -> Self {
         Self {
             stream_name,
@@ -83,6 +87,7 @@ impl TestMessageSendCmd {
             message_input,
             partitioning,
             header,
+            commit_budget,
             actual_stream_id: None,
             actual_topic_id: None,
         }
@@ -211,15 +216,14 @@ impl IggyCmdTestCase for TestMessageSendCmd {
     }
 
     async fn verify_server_state(&self, client: &dyn Client) {
-        let topic = client
-            .get_topic(
-                &self.actual_stream_id.unwrap().try_into().unwrap(),
-                &self.actual_topic_id.unwrap().try_into().unwrap(),
-            )
-            .await;
-        assert!(topic.is_ok());
-        let topic_details = topic.unwrap().expect("Failed to get topic");
-        assert_eq!(topic_details.messages_count, self.messages.len() as u64);
+        wait_for_topic_messages_count(
+            client,
+            &self.actual_stream_id.unwrap().try_into().unwrap(),
+            &self.actual_topic_id.unwrap().try_into().unwrap(),
+            self.messages.len() as u64,
+            self.commit_budget,
+        )
+        .await;
 
         // For Balanced partitioning, messages are distributed across all partitions
         // so we need to poll from all partitions and collect messages
@@ -333,6 +337,7 @@ pub async fn should_be_successful() {
     ];
 
     iggy_cmd_test.setup().await;
+    let commit_budget = iggy_cmd_test.backup_commit_budget();
     for (message_input, using_partitioning) in test_parameters {
         iggy_cmd_test
             .execute_test(TestMessageSendCmd::new(
@@ -353,6 +358,7 @@ pub async fn should_be_successful() {
                     ),
                     (HeaderKey::try_from("key2").unwrap(), 42i32.into()),
                 ])),
+                commit_budget,
             ))
             .await;
     }

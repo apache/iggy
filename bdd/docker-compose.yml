@@ -34,6 +34,7 @@ services:
       - ./scenarios/basic_messaging.feature:/app/features/basic_messaging.feature
       - ./scenarios/leader_redirection.feature:/app/features/leader_redirection.feature
       - ./scenarios/raw_command.feature:/app/features/raw_command.feature
+      - ./scenarios/session_contract.feature:/app/features/session_contract.feature
       - ./scenarios/stream_crud.feature:/app/features/stream_crud.feature
     command:
       - sh
@@ -43,6 +44,7 @@ services:
           basic_messaging)    cargo test -p bdd --features "$$BDD_RUST_FEATURES" --test basic_messaging ;;
           leader_redirection) cargo test -p bdd --features "$$BDD_RUST_FEATURES" --test leader_redirection ;;
           raw_command)        cargo test -p bdd --features "$$BDD_RUST_FEATURES" --test raw_command ;;
+          session_contract)   cargo test -p bdd --features "$$BDD_RUST_FEATURES" --test session_contract ;;
           stream_crud)        cargo test -p bdd --features "$$BDD_RUST_FEATURES" --test stream_crud ;;
           *)                  cargo test -p bdd --features "$$BDD_RUST_FEATURES" ;;
         esac
@@ -61,15 +63,17 @@ services:
     volumes:
       - ./scenarios/basic_messaging.feature:/app/features/basic_messaging.feature
       - ./scenarios/raw_command.feature:/app/features/raw_command.feature
+      - ./scenarios/session_contract.feature:/app/features/session_contract.feature
     working_dir: /app
     command:
       - sh
       - -c
       - |
         case "$$BDD_FEATURE" in
-          basic_messaging) TEST_PATH='tests/test_basic_messaging.py' ;;
-          raw_command)     TEST_PATH='tests/test_raw_command.py' ;;
-          *)               TEST_PATH='tests/' ;;
+          basic_messaging)  TEST_PATH='tests/test_basic_messaging.py' ;;
+          raw_command)      TEST_PATH='tests/test_raw_command.py' ;;
+          session_contract) TEST_PATH='tests/test_session_contract.py' ;;
+          *)                TEST_PATH='tests/' ;;
         esac
         uv run --project /workspace/bdd/python pytest $$TEST_PATH -v
     networks:
@@ -86,14 +90,16 @@ services:
     volumes:
       - ./scenarios/basic_messaging.feature:/app/features/basic_messaging.feature
       - ./scenarios/raw_command.feature:/app/features/raw_command.feature
+      - ./scenarios/session_contract.feature:/app/features/session_contract.feature
     command:
       - sh
       - -c
       - |
         case "$$BDD_FEATURE" in
-          basic_messaging) GROUP='--group basic-messaging' ;;
-          raw_command)     GROUP='--group raw-command' ;;
-          *)               GROUP='' ;;
+          basic_messaging)  GROUP='--group basic-messaging' ;;
+          raw_command)      GROUP='--group raw-command' ;;
+          session_contract) GROUP='--group session-contract' ;;
+          *)                GROUP='' ;;
         esac
         ./scripts/test.sh --configuration /workspace/bdd/php/phpunit.xml.dist $$GROUP
     networks:
@@ -127,9 +133,10 @@ services:
       - -c
       - |
         case "$$BDD_FEATURE" in
-          basic_messaging) TAGS='--tags @basic-messaging' ;;
-          raw_command)     TAGS='--tags @raw-command' ;;
-          *)               TAGS='' ;;
+          basic_messaging)  TAGS='--tags @basic-messaging' ;;
+          raw_command)      TAGS='--tags @raw-command' ;;
+          session_contract) TAGS='--tags @session-contract' ;;
+          *)                TAGS='' ;;
         esac
         npm run test:bdd -- $$TAGS
     networks:
@@ -153,6 +160,7 @@ services:
           basic_messaging)    FILTER='--filter-trait Category=basic-messaging' ;;
           leader_redirection) FILTER='--filter-trait Category=requires-leader-awareness' ;;
           raw_command)        FILTER='--filter-trait Category=raw-command' ;;
+          session_contract)   FILTER='--filter-trait Category=session-contract' ;;
         esac
         dotnet test $$FILTER
     networks:
@@ -171,6 +179,7 @@ services:
       - ./scenarios/basic_messaging.feature:/app/features/basic_messaging.feature
       - ./scenarios/leader_redirection.feature:/app/features/leader_redirection.feature
       - ./scenarios/raw_command.feature:/app/features/raw_command.feature
+      - ./scenarios/session_contract.feature:/app/features/session_contract.feature
       - ./scenarios/stream_crud.feature:/app/features/stream_crud.feature
     command:
       - sh
@@ -180,6 +189,7 @@ services:
           basic_messaging)    export CUCUMBER_FILTER_TAGS='@basic-messaging' ;;
           leader_redirection) export CUCUMBER_FILTER_TAGS='@requires-leader-awareness' ;;
           raw_command)        export CUCUMBER_FILTER_TAGS='@raw-command' ;;
+          session_contract)   export CUCUMBER_FILTER_TAGS='@session-contract' ;;
           stream_crud)        export CUCUMBER_FILTER_TAGS='@stream-crud' ;;
         esac
         gradle --no-daemon test
@@ -198,6 +208,7 @@ services:
     volumes:
       - ./scenarios/basic_messaging.feature:/app/features/basic_messaging.feature
       - ./scenarios/raw_command.feature:/app/features/raw_command.feature
+      - ./scenarios/session_contract.feature:/app/features/session_contract.feature
     networks:
       - iggy-bdd-network
 

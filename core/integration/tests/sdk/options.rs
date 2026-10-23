@@ -17,6 +17,7 @@
 
 use iggy::prelude::*;
 use iggy_common::{OptionsScope, TOPIC_OPTION_KEYS, topic_option_keys};
+use integration::harness::{backup_commit_budget, wait_for_topic};
 use integration::iggy_harness;
 use std::collections::BTreeMap;
 use std::str::FromStr;
@@ -207,11 +208,16 @@ async fn given_explicit_segment_size_when_creating_topic_should_roll_at_it(harne
             .await
             .unwrap();
     }
-    let details = client
-        .get_topic(&stream, &topic)
-        .await
-        .unwrap()
-        .expect("topic exists");
+    // A node rolls a segment when it persists committed messages, so the
+    // count can trail the send replies on any node.
+    let details = wait_for_topic(
+        &client,
+        &stream,
+        &topic,
+        backup_commit_budget(harness),
+        |details| details.partitions[0].segments_count > 1,
+    )
+    .await;
     assert!(
         details.partitions[0].segments_count > 1,
         "3 MiB through a 1 MiB segment must roll at least once, got {} segments",

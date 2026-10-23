@@ -33,10 +33,9 @@
 //!
 //! Two independent things are asserted, because they can fail separately:
 //!
-//! - A topic created while replica 0 is absent is writable at the advertised
-//!   leader. This is the routing contract, and it holds only because a fresh
-//!   partition group seeds its view from the metadata plane rather than
-//!   starting at view 0 (which would name replica 0, the node that was late).
+//! - After replica 0 joins, a new topic is writable through a client connected
+//!   to the metadata leader. Partition placement chooses its primary separately,
+//!   so the client must route the write to the assigned owner.
 //! - The late replica converges. It missed the ops committed before it
 //!   arrived, and the harness's usual all-nodes mesh gate is what normally
 //!   guarantees no node is ever in that position.
@@ -122,10 +121,8 @@ async fn given_replica_zero_arrives_late_when_producing_to_a_fresh_topic_should_
     let topic_id = Identifier::named(TOPIC_NAME).expect("topic identifier");
     let partitioning = Partitioning::partition_id(PARTITION_ID);
 
-    // The routing contract. The partition group is brand new, so its view is
-    // whatever it was seeded with: the metadata view, which is not 0 here.
-    // Seeded at 0 instead it would name replica 0, the node that arrived late,
-    // and no client could be told to go there.
+    // The session follows metadata leadership; partition writes must reach
+    // the independently assigned owner.
     let mut messages = vec![message("probe")];
     let accepted = tokio::time::timeout(
         SEND_BUDGET,

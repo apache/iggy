@@ -2694,6 +2694,10 @@ where
         if self.partition_dir.is_none() {
             // Also defuses the in-memory trap where `segment.size` grows with
             // no bytes on disk ("simulated in-memory batch persistence").
+            // TODO: simulator cluster partitions have no directory, so the
+            // simulator never serves or installs a partition state transfer.
+            // A simulated replica that needs one stays behind until the
+            // simulator models partition state transfer.
             return Err(PartitionTransferUnavailable::NoPartitionDir);
         }
         if self.repair.is_some() {
@@ -3346,6 +3350,7 @@ where
         }
         let pending =
             self.prepare_state_transfer_install(commit_op, staged, offsets_bytes, peer)?;
+        self.cancel_primary_transfer();
         self.transition = Some(crate::iggy_partition::PendingPartitionTransition::Install(
             Box::new(pending),
         ));
@@ -4468,6 +4473,7 @@ where
         let peer = self.consensus().primary_index(self.consensus().view());
         let pending =
             self.prepare_state_transfer_install(commit_op, staged, offsets_bytes, peer)?;
+        self.cancel_primary_transfer();
         self.transition = Some(crate::iggy_partition::PendingPartitionTransition::Install(
             Box::new(pending),
         ));
@@ -4480,7 +4486,11 @@ where
                 },
                 crate::PartitionIoStep::Pending => {
                     if let Some(persistence) = &self.persistence {
-                        if let Err(source) = persistence.drain_with_timeout().await
+                        if let Err(source) = persistence
+                            .drain_with_timeout(|timeout| {
+                                self.consensus().message_bus().sleep(timeout)
+                            })
+                            .await
                             && let Some(crate::iggy_partition::PendingPartitionTransition::Install(
                                 mut install,
                             )) = self.transition.take()

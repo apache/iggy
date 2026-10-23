@@ -42,10 +42,10 @@ use std::rc::Rc;
 /// [`compio_quic::TransportConfig::keep_alive_interval`] set at endpoint
 /// construction time. The connection is encrypted end-to-end and there
 /// is no plaintext fd to dup, which is why this never crosses an
-/// inter-shard channel: shard 0 owns the QUIC `Endpoint`, terminates
-/// every connection locally, and uses the existing
-/// `ForwardClientSend` / `Consensus` shard-frame variants for outbound
-/// + inbound traffic respectively.
+/// inter-shard channel: shard 0 owns the QUIC `Endpoint` and terminates
+/// every connection locally. A request bound for another shard returns
+/// its reply over the request's own channel, and shard 0 sends that reply
+/// to this connection's installation.
 #[allow(clippy::future_not_send)]
 pub fn install_client_quic(
     bus: &Rc<IggyMessageBus>,

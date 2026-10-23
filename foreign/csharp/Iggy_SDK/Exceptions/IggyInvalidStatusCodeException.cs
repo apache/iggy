@@ -34,6 +34,9 @@ public sealed class IggyInvalidStatusCodeException : Exception
     /// </summary>
     public bool FromServer { get; }
 
+    /// <summary>Whether a correlated reply proves the server committed this result.</summary>
+    public bool Committed { get; internal set; }
+
     internal int? CommandCode { get; set; }
 
     /// <summary>
@@ -41,7 +44,8 @@ public sealed class IggyInvalidStatusCodeException : Exception
     /// </summary>
     internal bool FromResultSection { get; init; }
 
-    internal IggyInvalidStatusCodeException(int statusCode, string message, bool fromServer = false) : base(message)
+    internal IggyInvalidStatusCodeException(int statusCode, string message, bool fromServer = false,
+        Exception? innerException = null) : base(message, innerException)
     {
         StatusCode = statusCode;
         FromServer = fromServer;

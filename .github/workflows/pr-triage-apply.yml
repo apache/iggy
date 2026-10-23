@@ -140,7 +140,7 @@ permissions:
 jobs:
   resolve:
     if: github.event.workflow_run.conclusion == 'success'
-    runs-on: ubuntu-26.04-arm
+    runs-on: ubuntu-slim
     timeout-minutes: 5
     outputs:
       skip: ${{ steps.resolve.outputs.skip }}
@@ -364,7 +364,7 @@ jobs:
   apply:
     needs: resolve
     if: needs.resolve.outputs.skip != 'true'
-    runs-on: ubuntu-26.04-arm
+    runs-on: ubuntu-slim
     timeout-minutes: 5
     # Serialised per PR. The group is keyed on the PR number the resolve job
     # verified against the collect run's head, so a forged payload cannot

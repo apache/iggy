@@ -496,7 +496,7 @@ func (e InvalidPersonalAccessTokenExpiry) Is(target error) bool {
 
 type TransientNotCommitted struct{}
 
-func (e TransientNotCommitted) Error() string { return "request transiently not committed; retry" }
+func (e TransientNotCommitted) Error() string { return "request outcome unknown; it may have applied" }
 func (e TransientNotCommitted) Code() Code    { return 57 }
 func (e TransientNotCommitted) Is(target error) bool {
 	_, ok := target.(TransientNotCommitted)
@@ -2378,12 +2378,11 @@ func (e CannotDeleteConsumerGroupInfo) Is(target error) bool {
 }
 
 type ConsumerGroupPartitionNotOwned struct {
-	ClientId    uint32
 	PartitionId uint32
 }
 
 func (e ConsumerGroupPartitionNotOwned) Error() string {
-	return fmt.Sprintf("consumer group member with client id: %d does not own partition: %d at the current generation (rebalance in progress).", e.ClientId, e.PartitionId)
+	return fmt.Sprintf("consumer group member does not own partition: %d at the current generation (rebalance in progress).", e.PartitionId)
 }
 func (e ConsumerGroupPartitionNotOwned) Code() Code { return 5009 }
 func (e ConsumerGroupPartitionNotOwned) Is(target error) bool {
@@ -2761,6 +2760,45 @@ func (e RequestIdExhausted) Is(target error) bool {
 	return ok
 }
 
+type OperationUncertain struct {
+	OperationID uint64
+}
+
+func (e OperationUncertain) Error() string {
+	return fmt.Sprintf("operation %d has an uncertain outcome", e.OperationID)
+}
+func (e OperationUncertain) Code() Code { return 14006 }
+func (e OperationUncertain) Is(target error) bool {
+	_, ok := target.(OperationUncertain)
+	return ok
+}
+
+type LaneBlocked struct {
+	OperationID uint64
+}
+
+func (e LaneBlocked) Error() string {
+	return fmt.Sprintf("lane blocked by operation %d", e.OperationID)
+}
+func (e LaneBlocked) Code() Code { return 14007 }
+func (e LaneBlocked) Is(target error) bool {
+	_, ok := target.(LaneBlocked)
+	return ok
+}
+
+type OperationNotRetained struct {
+	OperationID uint64
+}
+
+func (e OperationNotRetained) Error() string {
+	return fmt.Sprintf("operation %d is not retained", e.OperationID)
+}
+func (e OperationNotRetained) Code() Code { return 14008 }
+func (e OperationNotRetained) Is(target error) bool {
+	_, ok := target.(OperationNotRetained)
+	return ok
+}
+
 var (
 	ErrError                                      = Error{}
 	ErrInvalidConfiguration                       = InvalidConfiguration{}
@@ -3011,6 +3049,9 @@ var (
 	ErrIncompatibleProtocolVersion                = IncompatibleProtocolVersion{}
 	ErrSessionMismatch                            = SessionMismatch{}
 	ErrRequestIdExhausted                         = RequestIdExhausted{}
+	ErrOperationUncertain                         = OperationUncertain{}
+	ErrLaneBlocked                                = LaneBlocked{}
+	ErrOperationNotRetained                       = OperationNotRetained{}
 )
 
 type Code uint32
@@ -3265,6 +3306,9 @@ const (
 	IncompatibleProtocolVersionCode                Code = 14003
 	SessionMismatchCode                            Code = 14004
 	RequestIdExhaustedCode                         Code = 14005
+	OperationUncertainCode                         Code = 14006
+	LaneBlockedCode                                Code = 14007
+	OperationNotRetainedCode                       Code = 14008
 )
 
 func (c Code) String() string {
@@ -3767,6 +3811,12 @@ func (c Code) String() string {
 		return "SessionMismatch"
 	case RequestIdExhaustedCode:
 		return "RequestIdExhausted"
+	case OperationUncertainCode:
+		return "OperationUncertain"
+	case LaneBlockedCode:
+		return "LaneBlocked"
+	case OperationNotRetainedCode:
+		return "OperationNotRetained"
 	default:
 		return "Unknown error code"
 	}
@@ -4272,6 +4322,12 @@ func FromCode(code Code) IggyError {
 		return ErrSessionMismatch
 	case RequestIdExhaustedCode:
 		return ErrRequestIdExhausted
+	case OperationUncertainCode:
+		return ErrOperationUncertain
+	case LaneBlockedCode:
+		return ErrLaneBlocked
+	case OperationNotRetainedCode:
+		return ErrOperationNotRetained
 	default:
 		return ErrError
 	}

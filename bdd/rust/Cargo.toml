@@ -51,6 +51,11 @@ harness = false
 required-features = ["bdd"]
 
 [[test]]
+name = "session_contract"
+harness = false
+required-features = ["bdd"]
+
+[[test]]
 name = "stream_crud"
 harness = false
 required-features = ["bdd"]

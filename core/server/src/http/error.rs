@@ -45,9 +45,10 @@ pub(in crate::http) enum CustomError {
 #[derive(Debug, Serialize)]
 pub(in crate::http) struct ErrorResponse {
     /// Two conventions by construction: the `IggyError` numeric code
-    /// (`IggyError::as_code`) when the error wraps one (via [`Self::from_error`]),
-    /// or the HTTP status code for the hand-built HTTP-layer errors (429/503/504
-    /// and the 404 not-found fallback) that carry no underlying `IggyError`.
+    /// (`IggyError::as_code`) when the error wraps one (via [`Self::from_error`])
+    /// or when a hand-built 503 admitted nothing (`TransientNotAccepted`, see
+    /// [`not_accepted_response`]), or the HTTP status code for the other
+    /// hand-built HTTP-layer errors (429/503/504 and the 404 not-found fallback).
     pub id: u32,
     pub code: String,
     pub reason: String,
@@ -76,14 +77,15 @@ impl IntoResponse for CustomError {
                     | IggyError::InvalidPersonalAccessToken => StatusCode::UNAUTHORIZED,
                     IggyError::Unauthorized => StatusCode::FORBIDDEN,
                     IggyError::PartitionHistoryChanged => StatusCode::CONFLICT,
-                    // The pre-consensus retry frame: reaching this render
-                    // means the write path's replay budget is exhausted and
-                    // the op never committed - a transient server condition,
-                    // retryable like the other cannot-commit-right-now 503s
-                    // (see `service_unavailable`), never a caller error.
-                    IggyError::TransientNotCommitted
-                    | IggyError::TransientNotAccepted
-                    | IggyError::NotPrimary => StatusCode::SERVICE_UNAVAILABLE,
+                    // The write path ran out of replays of a request id whose
+                    // op may still commit (see `submit::submit_committed`).
+                    // HTTP mints a new id per request, so a resend could apply
+                    // the op twice: 504, the unknown outcome, never a
+                    // retryable 503.
+                    IggyError::TransientNotCommitted => StatusCode::GATEWAY_TIMEOUT,
+                    IggyError::TransientNotAccepted | IggyError::NotPrimary => {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    }
                     _ => StatusCode::BAD_REQUEST,
                 };
                 let response =
@@ -93,9 +95,7 @@ impl IntoResponse for CustomError {
                 // (`service_unavailable`, `server_busy`).
                 if matches!(
                     error,
-                    IggyError::TransientNotCommitted
-                        | IggyError::TransientNotAccepted
-                        | IggyError::NotPrimary
+                    IggyError::TransientNotAccepted | IggyError::NotPrimary
                 ) {
                     with_retry_after(response)
                 } else {
@@ -154,6 +154,7 @@ impl ErrorResponse {
 /// body every other route error uses), while a VSR session that cannot be
 /// established right now is a transient server condition (503) and must never
 /// masquerade as an auth failure.
+#[derive(Debug)]
 pub(in crate::http) enum AuthError {
     Unauthenticated(IggyError),
     /// The Register provably never entered the consensus pipeline (not
@@ -287,18 +288,30 @@ pub(in crate::http) enum PartitionWriteError {
     /// consensus-unavailable body) so an operator can tell admission shedding
     /// from a consensus outage.
     ServerBusy,
-    /// No committed reply within [`PARTITION_WRITE_REPLY_TIMEOUT`], or the
-    /// session's reply target was torn down mid-wait. 504: the commit may
+    /// No committed reply within [`PARTITION_WRITE_REPLY_TIMEOUT`], the
+    /// session's reply target was torn down mid-wait, or the relay lost the
+    /// write's verdict (`TransientNotCommitted`, see
+    /// [`classify_partition_reply`]). 504: the commit may
     /// still land (at-least-once), so this is a hard "outcome unknown", not a
     /// failure the server may transparently retry. Carries the write's
     /// operation so the 504 body names which write kind timed out.
     Timeout(Operation),
+    /// The caller's VSR session could not be resolved where the write is
+    /// served. Rendered as the session extractor renders it.
+    Session(AuthError),
+}
+
+impl From<AuthError> for PartitionWriteError {
+    fn from(error: AuthError) -> Self {
+        Self::Session(error)
+    }
 }
 
 impl IntoResponse for PartitionWriteError {
     fn into_response(self) -> Response {
         match self {
             Self::Rejected(error) => CustomError::from(error).into_response(),
+            Self::Session(error) => error.into_response(),
             Self::NotFound => CustomError::ResourceNotFound.into_response(),
             Self::Unavailable => service_unavailable(),
             Self::TooManyInFlight => too_many_in_flight_response(),
@@ -344,10 +357,26 @@ pub(in crate::http) fn with_retry_after(mut response: Response) -> Response {
 /// and no field, so every hand-built HTTP error the routes return parses as the
 /// one error schema clients already handle.
 pub(in crate::http) fn error_response(status: StatusCode, code: &str, reason: &str) -> Response {
+    coded_error_response(status, status.as_u16().into(), code, reason)
+}
+
+/// The retryable 503 for a request this node admitted nowhere. Its body id is
+/// `TransientNotAccepted`, as on every other not-admitted refusal, so a client
+/// can tell it from an outcome-unknown `TransientNotCommitted`.
+fn not_accepted_response(code: &str, reason: &str) -> Response {
+    with_retry_after(coded_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        IggyError::TransientNotAccepted.as_code(),
+        code,
+        reason,
+    ))
+}
+
+fn coded_error_response(status: StatusCode, id: u32, code: &str, reason: &str) -> Response {
     (
         status,
         Json(ErrorResponse {
-            id: status.as_u16().into(),
+            id,
             code: code.to_owned(),
             reason: reason.to_owned(),
             field: None,
@@ -396,11 +425,10 @@ fn too_many_in_flight_response() -> Response {
 /// consensus-unavailable 503) so admission shedding is tellable from a
 /// consensus outage; retry with backoff.
 fn server_busy_response() -> Response {
-    with_retry_after(error_response(
-        StatusCode::SERVICE_UNAVAILABLE,
+    not_accepted_response(
         "server_busy",
         "shard is at its in-flight write budget; retry with backoff",
-    ))
+    )
 }
 
 /// Read consistency selected by the `?consistency=` query param.
@@ -410,7 +438,9 @@ fn server_busy_response() -> Response {
 /// delay. `linearizable` demands the freshest committed state and is honored
 /// only on the primary; a follower redirects (307) to the primary when its HTTP
 /// address resolves from the roster, else fails closed to 503 (see
-/// [`read_local`]).
+/// [`read_local`]). A partition read is the exception: a follower that can
+/// relay holds for the metadata primary's commit floor and serves it through
+/// the partition primary instead (see `handlers::partition_read_consistency`).
 #[derive(Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(in crate::http) enum Consistency {
@@ -477,10 +507,10 @@ pub(in crate::http) enum ReadError {
     /// still below the op the caller was told committed. Fail-closed on the
     /// same retryable 503 as [`Self::RecoveryIncomplete`]: the two are the same
     /// hazard (serving state the caller already saw replaced) reached from
-    /// different directions, and 503 is what the binary transports' equivalent
-    /// refusal (`TransientNotCommitted`) already renders as, so an SDK that
-    /// speaks both sees one answer. Never a 2xx with stale state.
+    /// different directions. Never a 2xx with stale state.
     MetadataFrontierUnreached,
+    /// The metadata primary rejected this node's relay proof.
+    RelayRefused,
     /// A partition read got no reply after submission to the owning shard.
     /// Render HTTP 504 with the same Iggy error identity as binary transports.
     /// A missing reply does not prove that the owner rejected the read.
@@ -497,6 +527,7 @@ impl IntoResponse for ReadError {
             Self::NotPrimary => not_primary_response(),
             Self::RedirectToPrimary(location) => primary_redirect_response(&location),
             Self::RecoveryIncomplete | Self::MetadataFrontierUnreached => service_unavailable(),
+            Self::RelayRefused => relay_refused(),
             Self::Timeout => (
                 StatusCode::GATEWAY_TIMEOUT,
                 Json(ErrorResponse::from_error(
@@ -508,6 +539,21 @@ impl IntoResponse for ReadError {
     }
 }
 
+pub(in crate::http) fn forward_busy() -> Response {
+    not_accepted_response(
+        "forward_busy",
+        "node is at its forward budget; retry with backoff",
+    )
+}
+
+/// Nothing was admitted when a primary refused this node's relay proof.
+pub(in crate::http) fn relay_refused() -> Response {
+    not_accepted_response(
+        "relay_refused",
+        "the primary refused this node's relay; node clocks or cluster key material disagree; nothing was admitted",
+    )
+}
+
 /// The 503 fail-closed body for a linearizable read that reached a follower
 /// whose primary HTTP address could not be resolved (absent consensus, a roster
 /// with no node at the primary index, or a port-less node). The resolvable case
@@ -515,11 +561,10 @@ impl IntoResponse for ReadError {
 /// `ErrorResponse` so the body shape matches every other HTTP error; the caller
 /// retries against the leader.
 fn not_primary_response() -> Response {
-    with_retry_after(error_response(
-        StatusCode::SERVICE_UNAVAILABLE,
+    not_accepted_response(
         "not_primary",
         "linearizable read requires the primary; retry against the leader",
-    ))
+    )
 }
 
 /// 307 Temporary Redirect to the current VSR primary for a linearizable read
@@ -767,11 +812,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn transient_not_committed_renders_503_with_retry_after() {
+    #[tokio::test]
+    async fn transient_not_committed_renders_504_without_retry_after() {
         let response = CustomError::from(IggyError::TransientNotCommitted).into_response();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert!(response.headers().contains_key(RETRY_AFTER));
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(!response.headers().contains_key(RETRY_AFTER));
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["id"], IggyError::TransientNotCommitted.as_code());
     }
 
     #[test]
@@ -786,6 +835,30 @@ mod tests {
         let response = CustomError::from(IggyError::NotPrimary).into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(response.headers().contains_key(RETRY_AFTER));
+    }
+
+    #[tokio::test]
+    async fn refusals_that_admitted_nothing_render_503_with_transient_not_accepted() {
+        for (response, code) in [
+            (forward_busy(), "forward_busy"),
+            (relay_refused(), "relay_refused"),
+            (ReadError::NotPrimary.into_response(), "not_primary"),
+            (
+                PartitionWriteError::ServerBusy.into_response(),
+                "server_busy",
+            ),
+        ] {
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{code}");
+            assert!(response.headers().contains_key(RETRY_AFTER), "{code}");
+            let body = to_bytes(response.into_body(), 1024).await.unwrap();
+            let error: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                error["id"],
+                IggyError::TransientNotAccepted.as_code(),
+                "{code}"
+            );
+            assert_eq!(error["code"], code);
+        }
     }
 
     #[tokio::test]

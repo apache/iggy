@@ -40,6 +40,7 @@ Components:
   rust-cli             core/cli + workspace dep
   rust-connector-sdk   core/connectors/sdk + workspace dep
   rust-mcp             core/ai/mcp
+  rust-kafka-gateway   gateways/kafka
   rust-bench           core/bench
   rust-bench-dashboard-frontend   core/bench/dashboard/frontend
   rust-bench-dashboard-server     core/bench/dashboard/server
@@ -86,7 +87,7 @@ Examples:
 EOF
 }
 
-RUST_COMPONENTS="rust-sdk rust-common rust-binary-protocol rust-server rust-cli rust-connector-sdk rust-mcp rust-bench rust-bench-dashboard-frontend rust-bench-dashboard-server rust-bench-report"
+RUST_COMPONENTS="rust-sdk rust-common rust-binary-protocol rust-server rust-cli rust-connector-sdk rust-mcp rust-kafka-gateway rust-bench rust-bench-dashboard-frontend rust-bench-dashboard-server rust-bench-report"
 CONNECTOR_SINK_COMPONENTS="rust-connector-clickhouse-sink rust-connector-delta-sink rust-connector-doris-sink rust-connector-elasticsearch-sink rust-connector-http-sink rust-connector-iceberg-sink rust-connector-influxdb-sink rust-connector-meilisearch-sink rust-connector-mongodb-sink rust-connector-postgres-sink rust-connector-quickwit-sink rust-connector-rabbitmq-sink rust-connector-redshift-sink rust-connector-s3-sink rust-connector-stdout-sink rust-connector-surrealdb-sink"
 CONNECTOR_SOURCE_COMPONENTS="rust-connector-elasticsearch-source rust-connector-http-source rust-connector-influxdb-source rust-connector-postgres-source rust-connector-random-source"
 CONNECTOR_COMPONENTS="rust-connector-runtime ${CONNECTOR_SINK_COMPONENTS} ${CONNECTOR_SOURCE_COMPONENTS}"
@@ -135,6 +136,9 @@ get_version_files() {
             ;;
         rust-mcp)
             echo "core/ai/mcp/Cargo.toml:cargo"
+            ;;
+        rust-kafka-gateway)
+            echo "gateways/kafka/Cargo.toml:cargo"
             ;;
         rust-bench)
             echo "core/bench/Cargo.toml:cargo"

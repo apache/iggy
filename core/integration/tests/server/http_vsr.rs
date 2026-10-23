@@ -74,6 +74,15 @@ trait HttpSessionExt {
         messages: Vec<IggyMessage>,
         query: &str,
     ) -> Response;
+    async fn produce_in_context(
+        &self,
+        stream: &str,
+        topic: &str,
+        partition_id: u32,
+        messages: Vec<IggyMessage>,
+        query: &str,
+        context: Option<PartitionContext>,
+    ) -> Response;
     async fn poll(
         &self,
         stream: &str,
@@ -163,13 +172,26 @@ impl HttpSessionExt for HttpClient {
         messages: Vec<IggyMessage>,
         query: &str,
     ) -> Response {
+        self.produce_in_context(stream, topic, partition_id, messages, query, None)
+            .await
+    }
+
+    async fn produce_in_context(
+        &self,
+        stream: &str,
+        topic: &str,
+        partition_id: u32,
+        messages: Vec<IggyMessage>,
+        query: &str,
+        context: Option<PartitionContext>,
+    ) -> Response {
         let body = SendMessages {
             metadata_length: 0,
             stream_id: Identifier::default(),
             topic_id: Identifier::default(),
             partitioning: Partitioning::partition_id(partition_id),
             batch: IggyMessagesBatch::from(&messages),
-            context: None,
+            context,
         };
         self.client
             .post(self.url(&format!("/streams/{stream}/topics/{topic}/messages{query}")))
@@ -422,7 +444,13 @@ async fn given_fresh_topic_when_polling_over_http_should_serve_a_context_at_or_a
 const CONCURRENT_PRODUCES: usize = 16;
 const CONCURRENT_PARTITIONS: u32 = 4;
 
-#[iggy_harness]
+/// Placement spreads partition primaries over the nodes. The node the HTTP
+/// client calls relays a produce to another node's partition only when every
+/// node verifies its bearer.
+#[iggy_harness(server(
+    http.jwt.encoding_secret = "0123456789abcdef0123456789abcdef",
+    http.jwt.decoding_secret = "0123456789abcdef0123456789abcdef"
+))]
 async fn given_one_session_when_producing_concurrently_should_not_cross_talk(
     harness: &TestHarness,
 ) {
@@ -879,6 +907,55 @@ async fn given_ack_none_when_producing_should_return_202_and_commit(harness: &Te
     }
 }
 
+/// A refusal before the partition must reach an `?ack=none` caller: the batch
+/// was never admitted, so a 202 would report a write that cannot commit. The
+/// route carries a metadata op this node has not applied, as a route learned
+/// from a node further ahead does.
+#[iggy_harness(cluster_nodes = 1)]
+async fn given_ack_none_when_denied_before_the_partition_should_answer_the_deny(
+    harness: &TestHarness,
+) {
+    /// Far past any op this test commits.
+    const UNAPPLIED_METADATA_OPS: u64 = 1_000_000;
+    const STREAM: &str = "http-ack-none-deny";
+    const TOPIC: &str = "deny";
+    let http = HttpClient::login_root(harness).await;
+    http.create_stream_and_topic(STREAM, TOPIC, 1).await;
+    let response = http
+        .produce(
+            STREAM,
+            TOPIC,
+            PARTITION_ID,
+            vec![text_message(1, "admitted".to_string())],
+        )
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "produce must commit"
+    );
+    let mut context = http.poll(STREAM, TOPIC, PARTITION_ID, 0, 1).await.context;
+    context.metadata_op += UNAPPLIED_METADATA_OPS;
+
+    let response = http
+        .produce_in_context(
+            STREAM,
+            TOPIC,
+            PARTITION_ID,
+            vec![text_message(2, "denied".to_string())],
+            "?ack=none",
+            Some(context),
+        )
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "ack=none must answer a refusal before the partition, not 202"
+    );
+    let body: serde_json::Value = response.json().await.expect("decode the error body");
+    assert_eq!(body["id"], IggyError::TransientNotAccepted.as_code());
+}
+
 /// The FIRST send to a partition that has never minted an offset, on both
 /// produce routes, against the only cluster shape where the offset reservation
 /// runs at all.
@@ -1119,7 +1196,13 @@ async fn given_garbage_or_empty_token_when_refreshing_should_reject_401(harness:
     }
 }
 
-#[iggy_harness]
+/// Placement spreads partition primaries over the nodes. The node the HTTP
+/// client calls relays a produce to another node's partition only when every
+/// node verifies its bearer.
+#[iggy_harness(server(
+    http.jwt.encoding_secret = "0123456789abcdef0123456789abcdef",
+    http.jwt.decoding_secret = "0123456789abcdef0123456789abcdef"
+))]
 async fn given_independent_durability_policies_when_producing_should_attest_message_policy(
     harness: &TestHarness,
 ) {

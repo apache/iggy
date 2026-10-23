@@ -27,15 +27,15 @@
 //! its op has quorum, so the backup gap-stops and waits out `tick_partitions`'
 //! repair debounce before anything refetches it.
 //!
-//! What makes the window wide on a backup is the commit broadcast. A backup
-//! learns a metadata commit from the `commit` field of the next prepare on that
-//! plane or from the primary's `CommitMessage` heartbeat, whose interval is
-//! `cluster.commit_broadcast_interval` (500ms by default). Nothing in
-//! `create_topic`'s reply path waits for that, so a produce issued the instant
-//! `create_topic` returns reaches the backups as a partition prepare for a
-//! namespace they have not yet heard of, let alone built. Four producers on
-//! their own connections keep a burst in flight across that gap, so several ops
-//! of one partition park together and the order they leave in is observable.
+//! The window on a backup is the metadata hand-off. A backup learns a metadata
+//! commit from the `commit` field of the next prepare on that plane or from the
+//! `Commit` the primary sends on its next consensus tick, and then still has to
+//! build the namespace. Nothing in `create_topic`'s reply path waits for that,
+//! so a produce issued the instant `create_topic` returns reaches the backups as
+//! a partition prepare for a namespace they have not yet heard of, let alone
+//! built. Four producers on their own connections keep a burst in flight across
+//! that gap, so several ops of one partition park together and the order they
+//! leave in is observable.
 //!
 //! Three things are asserted, and they fail separately:
 //!
@@ -69,8 +69,7 @@ use integration::iggy_harness;
 use tokio::time::{Instant, sleep};
 
 const STREAM: &str = "parked-redispatch-stream";
-/// Each topic is one shot at the race, and each costs about one commit
-/// broadcast interval.
+/// Each topic is one shot at the race.
 const TOPICS: u32 = 6;
 const PARTITIONS: u32 = 4;
 /// The reconciler builds a topic's namespaces in id order, so the last one has

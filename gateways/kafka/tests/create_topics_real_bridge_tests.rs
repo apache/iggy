@@ -40,7 +40,7 @@ use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
 use iggy_gateway_kafka::protocol::api::{
     ERROR_INVALID_CONFIG, ERROR_INVALID_PARTITIONS, ERROR_INVALID_REPLICA_ASSIGNMENT,
     ERROR_INVALID_REQUEST, ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NONE, ERROR_POLICY_VIOLATION,
-    ERROR_TOPIC_ALREADY_EXISTS, GatewayState,
+    ERROR_REQUEST_TIMED_OUT, ERROR_TOPIC_ALREADY_EXISTS, GatewayState,
 };
 use iggy_gateway_kafka::protocol::handlers::create_topics;
 
@@ -580,4 +580,29 @@ async fn create_topics_rejects_more_than_the_topic_cap() {
         streams.is_empty(),
         "an over-cap request must create nothing"
     );
+}
+
+/// A `CreatePartitions` reads a topic and then adds to it by name, so `CreateTopics` waits for its
+/// lock rather than create a topic under that name in between. Held past the request's 5 s
+/// deadline, the create answers retriable `REQUEST_TIMED_OUT` (7) and creates nothing.
+#[tokio::test]
+#[serial]
+async fn create_topics_waits_for_a_create_partitions_in_progress() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let state = connected_state(&server).await;
+
+    let held = state.hold_topic_changes().await;
+    let (error_code, _) = send(&state, &[TopicSpec::new("orders", 3)], false).await;
+    assert_eq!(error_code, ERROR_REQUEST_TIMED_OUT);
+    let raw = raw_client(&server).await;
+    let streams = raw.get_streams().await.expect("get_streams call");
+    assert!(
+        streams.is_empty(),
+        "nothing is created while the lock is held"
+    );
+
+    drop(held);
+    let (error_code, _) = send(&state, &[TopicSpec::new("orders", 3)], false).await;
+    assert_eq!(error_code, ERROR_NONE);
 }

@@ -188,15 +188,30 @@ where
                 if partition.requires_state_transfer() || partition.read_history_is_changing() {
                     return Some(IggyError::TransientNotAccepted);
                 }
-                // The merged log of a new view can hold an offset store that the
-                // old view acknowledged. The new primary applies it only after
-                // the view starts, so until then its stored offset can be older.
-                // The head is current only on the primary that started the view.
-                if read.reads_stored_offset()
+                // The merged log of a new view can hold a message append or an
+                // offset store that the old view acknowledged. The new primary
+                // applies it only after the view starts, so until then a poll
+                // can miss acknowledged messages and a stored offset can be
+                // older. The head is current only on the primary that started
+                // the view.
+                if read.reads_messages_or_offset()
                     && partition.consensus().is_primary()
                     && !partition.consensus().applied_view_start()
                 {
                     return Some(IggyError::TransientNotAccepted);
+                }
+                if let PartitionRead::ConsumerOffsetOnPrimary { metadata, .. }
+                | PartitionRead::ExternalGroupOffsetOnPrimary { metadata, .. } = &read
+                {
+                    if !metadata
+                        .is_valid_for_offset(self.plane.metadata().mux_stm.streams(), namespace)
+                        || !metadata.matches_partition(self.shards_table.epoch_for(namespace))
+                    {
+                        return Some(IggyError::TransientNotAccepted);
+                    }
+                    if partition.history_deleted() {
+                        return Some(IggyError::HistoryUnavailable);
+                    }
                 }
                 if let PartitionRead::PollOnPrimary {
                     consumer,
@@ -376,7 +391,10 @@ where
                 }
             }
             PartitionRead::ConsumerOffset { consumer }
-            | PartitionRead::ConsumerOffsetOnPrimary { consumer } => partitions
+            | PartitionRead::ConsumerOffsetOnPrimary {
+                consumer: Some(consumer),
+                ..
+            } => partitions
                 .consumer_offset_read(&namespace, consumer)
                 .map_or(PartitionReadReply::NotFound, |(stored, current_offset)| {
                     PartitionReadReply::ConsumerOffset {
@@ -384,8 +402,13 @@ where
                         current_offset,
                     }
                 }),
-            PartitionRead::ExternalGroupOffset { group_id }
-            | PartitionRead::ExternalGroupOffsetOnPrimary { group_id } => partitions
+            PartitionRead::ConsumerOffsetOnPrimary { consumer: None, .. } => {
+                PartitionReadReply::ConsumerOffset {
+                    stored: None,
+                    current_offset: 0,
+                }
+            }
+            PartitionRead::ExternalGroupOffsetOnPrimary { group_id, .. } => partitions
                 .external_group_offset_read(&namespace, group_id)
                 .map_or(PartitionReadReply::NotFound, |(stored, current_offset)| {
                     PartitionReadReply::ConsumerOffset {
@@ -523,7 +546,6 @@ where
 /// node's metadata can lag an install the partition already applied, for
 /// example on a new primary after a view change, and the partition commits a
 /// read's progress under the installed owner.
-#[allow(clippy::cast_possible_truncation)]
 fn group_owner_rejection(
     namespace: IggyNamespace,
     group_id: u64,
@@ -540,9 +562,7 @@ fn group_owner_rejection(
         return Some(IggyError::TransientNotAccepted);
     }
     Some(IggyError::ConsumerGroupPartitionNotOwned(
-        // Truncated like the server's poll fences: a minted id carries its boot
-        // nonce from bit 48 up, so saturating would hide which client it is.
-        metadata.client_id() as u32,
+        metadata.client_id(),
         u32::try_from(namespace.partition_id()).unwrap_or(u32::MAX),
     ))
 }

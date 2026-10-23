@@ -32,6 +32,7 @@ use super::HttpState;
 use super::error::AuthError;
 use super::jwt::TokenSubject;
 use super::session::HttpSession;
+use super::state::HttpInner;
 use crate::dispatch::session_ops::verify_pat_credentials_with_expiry;
 use crate::http::ClientAddr;
 
@@ -42,6 +43,17 @@ const BEARER: &str = "Bearer ";
 /// so the two credential kinds can never collide on the same table key.
 const JWT_KEY_PREFIX: &str = "jwt:";
 const PAT_KEY_PREFIX: &str = "pat:";
+
+/// What [`resolve_credential`] proved about a bearer: the JWT id when it is a
+/// JWT, the account behind it and its expiry in seconds. The partition route
+/// layer stores it in the request extensions for the extractor behind it.
+#[derive(Clone)]
+pub(in crate::http) struct VerifiedBearer {
+    pub jwt_id: Option<String>,
+    pub user_id: u32,
+    pub user_created_at: IggyTimestamp,
+    pub expiry: u64,
+}
 
 /// Resolved caller identity for a protected write route: the shared VSR
 /// session established once per presenting credential (it carries the
@@ -64,39 +76,70 @@ impl FromRequestParts<HttpState> for Authenticated {
         parts: &mut Parts,
         state: &HttpState,
     ) -> Result<Self, Self::Rejection> {
-        let bearer = bearer_token(&parts.headers)?;
-
-        // Both `resolve_credential` (its JWT verify may await a `!Send` JWKS
-        // fetch through cyper) and `resolve_session` (`Rc`-based, `!Send`) must
-        // run, yet axum requires this extractor future to be `Send`.
-        // `SendWrapper` bridges each: sound because compio pins the future to
-        // shard 0's thread - the only thread the JWKS client and session table
-        // ever run on (mirrors legacy `HttpSafeShard`). Neither future holds a
-        // `RefCell` borrow or `DashMap` guard across the `.await` (each such
-        // critical section is synchronous), so a cooperatively-scheduled sibling
-        // task on this thread never observes a borrowed session table.
-        let (jwt_id, user_id, user_created_at, expiry) =
-            SendWrapper::new(resolve_credential(state, bearer)).await?;
-        // External issuers choose their own jti, and their configured username
-        // can resolve to another account later. Scope the session to this account.
-        let key = jwt_id.map_or_else(
-            || {
-                format!(
-                    "{PAT_KEY_PREFIX}{}",
-                    PersonalAccessToken::hash_token(bearer)
-                )
-            },
-            |jwt_id| {
-                format!(
-                    "{JWT_KEY_PREFIX}{user_id}:{}:{jwt_id}",
-                    user_created_at.as_micros()
-                )
-            },
-        );
-        let session =
-            SendWrapper::new(state.resolve_session(key, user_id, user_created_at, expiry)).await?;
+        let credential = Credential::from_request_parts(parts, state).await?;
+        // `resolve_session` is `Rc`-based and `!Send`, yet axum requires this
+        // extractor future to be `Send`. `SendWrapper` bridges it: sound because
+        // compio pins the future to shard 0's thread, the only thread the
+        // session table ever runs on (mirrors legacy `HttpSafeShard`). It holds
+        // no `RefCell` borrow across the `.await` (each such critical section is
+        // synchronous), so a cooperatively-scheduled sibling task on this thread
+        // never observes a borrowed session table.
+        let session = SendWrapper::new(credential.session(state)).await?;
         Ok(Self {
             session: SendWrapper::new(session),
+        })
+    }
+}
+
+/// A verified bearer with what its VSR session is keyed and leased by, but no
+/// session yet. A partition write resolves the session only where it is
+/// served ([`Self::session`]): a relayed write runs under the serving node's
+/// own session, and a `Register` on the relaying node would be a metadata
+/// commit spent on nothing.
+pub struct Credential {
+    key: String,
+    pub user_id: u32,
+    user_created_at: IggyTimestamp,
+    expiry: u64,
+}
+
+impl Credential {
+    /// Whether this node holds a live session for the credential, so serving
+    /// here Registers none.
+    pub(in crate::http) fn has_session(&self, state: &HttpInner) -> bool {
+        state.has_live_session(&self.key)
+    }
+
+    /// The credential's VSR session, minted and Registered on first use.
+    pub(in crate::http) async fn session(
+        &self,
+        state: &HttpInner,
+    ) -> Result<Rc<HttpSession>, AuthError> {
+        state
+            .resolve_session(&self.key, self.user_id, self.user_created_at, self.expiry)
+            .await
+    }
+}
+
+impl FromRequestParts<HttpState> for Credential {
+    type Rejection = AuthError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &HttpState,
+    ) -> Result<Self, Self::Rejection> {
+        let bearer = bearer_token(&parts.headers)?;
+        let verified = verified_bearer(parts, state, bearer).await?;
+        Ok(Self {
+            key: credential_key(
+                bearer,
+                verified.jwt_id.as_deref(),
+                verified.user_id,
+                verified.user_created_at,
+            ),
+            user_id: verified.user_id,
+            user_created_at: verified.user_created_at,
+            expiry: verified.expiry,
         })
     }
 }
@@ -140,14 +183,7 @@ impl FromRequestParts<HttpState> for Identity {
         // returns feed the write path's session table; a read discards them -
         // its read-your-writes floor is keyed by user id, not by credential
         // (see `MetadataWatermarks`).
-        // The verify is `!Send` (a trusted-issuer JWT may await a JWKS fetch),
-        // so bridge it with `SendWrapper` - sound only because compio pins this
-        // future to shard 0's single thread, the only thread the JWKS client
-        // ever runs on (mirrors legacy `HttpSafeShard`). It holds no `RefCell`
-        // borrow or `DashMap` guard across the `.await`, so a sibling task
-        // scheduled on this thread meanwhile never observes a borrowed cell.
-        let (_jwt_id, user_id, user_created_at, _expiry) =
-            SendWrapper::new(resolve_credential(state, bearer)).await?;
+        let verified = verified_bearer(parts, state, bearer).await?;
         let path_and_query = parts
             .uri
             .path_and_query()
@@ -164,8 +200,8 @@ impl FromRequestParts<HttpState> for Identity {
             );
         }
         Ok(Self {
-            user_id,
-            user_created_at,
+            user_id: verified.user_id,
+            user_created_at: verified.user_created_at,
             path_and_query,
             client_ip,
         })
@@ -185,8 +221,27 @@ pub(in crate::http) fn bearer_token(headers: &HeaderMap) -> Result<&str, IggyErr
         .ok_or(IggyError::AccessTokenMissing)
 }
 
-/// Map a bearer credential to its `(optional JWT id, user id, user created_at,
-/// expiry secs)`. Only `Authenticated` builds a session key from these facts.
+/// The facts of `bearer`: the ones a route layer stored when it verified the
+/// same bearer, so a request is verified once, or a fresh verify.
+async fn verified_bearer(
+    parts: &Parts,
+    state: &HttpState,
+    bearer: &str,
+) -> Result<VerifiedBearer, AuthError> {
+    if let Some(verified) = parts.extensions.get::<VerifiedBearer>() {
+        return Ok(verified.clone());
+    }
+    // The verify is `!Send` (a trusted-issuer JWT may await a JWKS fetch), so
+    // bridge it with `SendWrapper` - sound only because compio pins this
+    // future to shard 0's single thread, the only thread the JWKS client ever
+    // runs on (mirrors legacy `HttpSafeShard`). It holds no `RefCell` borrow
+    // or `DashMap` guard across the `.await`, so a sibling task scheduled on
+    // this thread meanwhile never observes a borrowed cell.
+    SendWrapper::new(resolve_credential(state, bearer)).await
+}
+
+/// Map a bearer credential to its [`VerifiedBearer`] facts. Only
+/// `Authenticated` builds a session key from them.
 ///
 /// A JWT is the primary credential, keyed by its account and `jti`. A raw PAT
 /// presented as the bearer is the documented fallback, keyed by the same
@@ -205,7 +260,7 @@ pub(in crate::http) fn bearer_token(headers: &HeaderMap) -> Result<&str, IggyErr
 pub(in crate::http) async fn resolve_credential(
     state: &HttpState,
     bearer: &str,
-) -> Result<(Option<String>, u32, IggyTimestamp, u64), AuthError> {
+) -> Result<VerifiedBearer, AuthError> {
     if let Ok(token) = state.jwt.decode(bearer).await {
         let (user_id, user_created_at) = match token.subject {
             TokenSubject::Account {
@@ -217,11 +272,108 @@ pub(in crate::http) async fn resolve_credential(
             ),
             TokenSubject::TrustedIssuer(issuer) => state.trusted_issuer_user(&issuer)?,
         };
-        return Ok((Some(token.jti), user_id, user_created_at, token.exp));
+        return Ok(VerifiedBearer {
+            jwt_id: Some(token.jti),
+            user_id,
+            user_created_at,
+            expiry: token.exp,
+        });
     }
 
     let (user_id, user_created_at, expiry) =
         verify_pat_credentials_with_expiry(&state.shard, bearer)
             .map_err(|_| IggyError::Unauthenticated)?;
-    Ok((None, user_id, user_created_at, expiry))
+    Ok(VerifiedBearer {
+        jwt_id: None,
+        user_id,
+        user_created_at,
+        expiry,
+    })
+}
+
+/// Table key of a credential [`resolve_credential`] resolved: the account and
+/// `jti` of a JWT, or the PAT's hash, so the raw secret never becomes a key.
+pub(in crate::http) fn credential_key(
+    bearer: &str,
+    jwt_id: Option<&str>,
+    user_id: u32,
+    user_created_at: IggyTimestamp,
+) -> String {
+    // External issuers choose their own jti, and their configured username
+    // can resolve to another account later. Scope the key to this account.
+    jwt_id.map_or_else(
+        || {
+            format!(
+                "{PAT_KEY_PREFIX}{}",
+                PersonalAccessToken::hash_token(bearer)
+            )
+        },
+        |jwt_id| {
+            format!(
+                "{JWT_KEY_PREFIX}{user_id}:{}:{jwt_id}",
+                user_created_at.as_micros()
+            )
+        },
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http::reads::tests::read_state;
+    use axum::http::Request;
+
+    const LAYER_USER_ID: u32 = 7;
+
+    /// The partition route layer verifies the bearer before its handler runs,
+    /// so the extractor behind it reuses that proof. A bearer that would not
+    /// verify shows the extractor did not verify it again.
+    #[compio::test]
+    async fn given_a_bearer_the_route_layer_verified_when_extracting_should_not_verify_it_again() {
+        let state = read_state();
+        let verified = VerifiedBearer {
+            jwt_id: Some("layer-jti".to_owned()),
+            user_id: LAYER_USER_ID,
+            user_created_at: IggyTimestamp::from(1),
+            expiry: u64::MAX,
+        };
+
+        let mut parts = unverifiable_bearer_parts();
+        parts.extensions.insert(verified.clone());
+        let credential = Credential::from_request_parts(&mut parts, &state)
+            .await
+            .unwrap_or_else(|_| panic!("a verified bearer must not be verified again"));
+        assert_eq!(credential.user_id, LAYER_USER_ID);
+        assert_eq!(
+            credential.key,
+            credential_key(
+                "not-a-token",
+                verified.jwt_id.as_deref(),
+                LAYER_USER_ID,
+                verified.user_created_at
+            )
+        );
+        let identity = Identity::from_request_parts(&mut parts, &state)
+            .await
+            .unwrap_or_else(|_| panic!("a verified bearer must not be verified again"));
+        assert_eq!(identity.user_id, LAYER_USER_ID);
+
+        let mut unverified = unverifiable_bearer_parts();
+        assert!(
+            Credential::from_request_parts(&mut unverified, &state)
+                .await
+                .is_err(),
+            "without a layer the extractor still verifies the bearer"
+        );
+    }
+
+    fn unverifiable_bearer_parts() -> Parts {
+        Request::builder()
+            .uri("/streams/1/topics/1/messages")
+            .header(AUTHORIZATION, "Bearer not-a-token")
+            .body(())
+            .expect("request builds")
+            .into_parts()
+            .0
+    }
 }

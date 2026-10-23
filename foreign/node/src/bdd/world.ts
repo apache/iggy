@@ -27,5 +27,6 @@ export interface TestWorld {
   sendMessages: CreateMessage[],
   polledMessages: Message[],
   rawResponse?: Buffer,
-  rawError?: Error
+  rawError?: Error,
+  callError?: Error
 };

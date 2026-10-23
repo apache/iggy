@@ -97,9 +97,7 @@ internal static class VsrOperations
         CommandCodes.GET_CONSUMER_GROUP_CODE,
         CommandCodes.GET_CONSUMER_GROUPS_CODE,
         CommandCodes.SYNC_CONSUMER_GROUP_CODE,
-        CommandCodes.GET_POLL_ROUTING_CODE,
         CommandCodes.GET_PARTITION_ROUTE_CODE,
-        CommandCodes.GET_CONSUMER_OFFSET_ROUTING_CODE
     ];
 
     /// <summary>
@@ -151,17 +149,8 @@ internal static class VsrOperations
     ///     Whether losing the connection mid-request leaves nothing for the server to deduplicate, so the request
     ///     can be re-issued on a fresh session by the reconnect path instead of failing the caller.
     /// </summary>
-    internal static bool IsReplaySafeRead(int code, bool isLoginRegister, ReadOnlySpan<byte> body)
+    internal static bool IsReplaySafeRead(int code, ReadOnlySpan<byte> body)
     {
-        // A register lost mid-flight is replayable: the retry re-arms the session under a fresh client id, so
-        // it cannot be mistaken for the first one. At worst the server keeps an entry nobody binds, which it
-        // ages out. Reporting an unknown outcome here instead would deny the caller the retry that is in fact
-        // the only correct response.
-        if (isLoginRegister)
-        {
-            return true;
-        }
-
         var operation = ForCode(code);
 
         if (operation != VsrOperation.NonReplicated)
@@ -171,7 +160,7 @@ internal static class VsrOperations
 
         // A poll that auto-commits moves the consumer offset server-side, so a reply lost after the commit
         // would make the replay start past a batch the caller never saw. auto_commit is the last body byte.
-        if (code is CommandCodes.POLL_MESSAGES_CODE or CommandCodes.POLL_MESSAGES_ON_PRIMARY_CODE)
+        if (code is CommandCodes.POLL_MESSAGES_CODE)
         {
             return body.Length > 0 && body[^1] == 0;
         }

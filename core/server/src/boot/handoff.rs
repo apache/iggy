@@ -18,6 +18,7 @@
 //! Cross-shard boot handoff: the metadata bundle broadcast and the
 //! listener barrier.
 
+use crate::boot::credentials::RootCredentials;
 use crate::server_error::ServerError;
 use crate::shell::ServerMetadataBundle;
 // `try_send` / `try_recv` resolve through these traits on `MAsyncTx` /
@@ -49,6 +50,8 @@ use std::time::Duration;
 pub(in crate::boot) enum MetadataHandoff {
     Owner {
         bundle_tx: crossfire::MAsyncTx<crossfire::mpmc::Array<ServerMetadataBundle>>,
+        /// Only shard 0 can propose root creation.
+        root_credentials: Option<RootCredentials>,
     },
     Waiter {
         bundle_rx: crossfire::MAsyncRx<crossfire::mpmc::Array<ServerMetadataBundle>>,

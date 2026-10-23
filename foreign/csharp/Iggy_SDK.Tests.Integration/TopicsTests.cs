@@ -161,8 +161,9 @@ public class TopicsTests
                 Partitioning.None(), GetMessages(i + 2));
         }
 
-        var response = await client.GetTopicByIdAsync(Identifier.String(streamName),
-            Identifier.String("Parts Topic"));
+        var response = await IggyServerFixture.ReadConvergedStatsAsync(
+            () => client.GetTopicByIdAsync(Identifier.String(streamName), Identifier.String("Parts Topic")),
+            topic => topic?.MessagesCount == 9);
 
         response.ShouldNotBeNull();
         response.Name.ShouldBe("Parts Topic");

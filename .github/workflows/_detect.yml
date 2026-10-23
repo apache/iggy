@@ -446,7 +446,7 @@ jobs:
             }
             groups.other = groups.other.map(entry => ({...entry, name: `${entry.component}/${entry.task}`}));
 
-            setOutput('rust_plan', rustChecks.length ? JSON.stringify({checks: rustChecks, tests: false}) : '');
+            setOutput('rust_plan', rustChecks.length ? JSON.stringify({checks: rustChecks}) : '');
             setOutput('rust_runtime_plan', rustRuntime.length ? JSON.stringify({
               checks: rustRuntime.filter(entry => entry.task !== 'test'),
               tests: rustRuntime.some(entry => entry.task === 'test'),

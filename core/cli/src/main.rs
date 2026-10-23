@@ -89,6 +89,7 @@ use iggy_cli::commands::{
         update_user::{UpdateUserCmd, UpdateUserType},
     },
 };
+use std::error::Error;
 use std::sync::Arc;
 use tracing::{Level, event};
 
@@ -349,7 +350,19 @@ fn get_command(
 }
 
 #[tokio::main]
-async fn main() -> Result<(), IggyCmdError> {
+async fn main() {
+    if let Err(err) = run().await {
+        eprintln!("Error: {}", err);
+        let mut source = err.source();
+        while let Some(cause) = source {
+            eprintln!("Caused by: {}", cause);
+            source = cause.source();
+        }
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), IggyCmdError> {
     let args = IggyConsoleArgs::parse();
 
     if let Some(generator) = args.cli.generator {
