@@ -867,6 +867,55 @@ struct ClientTransportTests {
         await client.shutdown()
     }
 
+    /// A write whose first attempt may have committed stays uncertain when
+    /// the failover after a later "not primary" fails: every node refusing
+    /// the sign-in mid view change must not turn it into "not accepted",
+    /// which a caller may resend under a new request id.
+    @Test func aFailedFailoverKeepsAnUncertainWriteUncertain() async throws {
+        let first = try await FakeVSRServer.started()
+        let second = try await FakeVSRServer.started()
+        defer {
+            Task {
+                await first.stop()
+                await second.stop()
+            }
+        }
+        let addresses = [first.address, second.address]
+        let viewChanging = Locked(false)
+        let attempts = Locked(0)
+        let refuseSignIn: @Sendable (FakeVSRServer.Request) -> FakeVSRServer.Reply? = { request in
+            guard request.operation == .register || request.code == CommandCode.bindSession.rawValue else { return nil }
+            return viewChanging.withLock { $0 } ? .status(IggyErrorCode.transientNotAccepted.rawValue) : FakeVSRServer.sessionReply(request)
+        }
+        await first.respond { request in
+            if let reply = refuseSignIn(request) { return reply }
+            if request.code == CommandCode.getClusterMetadata.rawValue {
+                return .ok(FakeVSRServer.rosterBody(addresses, leaderIndex: viewChanging.withLock { $0 } ? 1 : 0))
+            }
+            guard request.operation == .deleteStream else { return .ok([]) }
+            let attempt = attempts.withLock {
+                $0 += 1; return $0
+            }
+            if attempt == 1 {
+                return .status(IggyErrorCode.transientNotCommitted.rawValue)
+            }
+            viewChanging.withLock { $0 = true }
+            return .status(IggyErrorCode.notPrimary.rawValue)
+        }
+        await second.respond { request in
+            if let reply = refuseSignIn(request) { return reply }
+            if request.code == CommandCode.getClusterMetadata.rawValue { return .ok(FakeVSRServer.rosterBody(addresses, leaderIndex: 1)) }
+            return .ok([])
+        }
+        // One reconnect attempt, so the sweep gives up before the deadline.
+        let client = makeClient(first, maxRetries: 1)
+        try await client.connect()
+        await expectCode(.transientNotCommitted) { try await client.deleteStream(1) }
+        #expect(await first.requests.filter { $0.operation == .deleteStream }.count >= 2)
+        #expect(await second.requests.filter { $0.operation == .deleteStream }.isEmpty)
+        await client.shutdown()
+    }
+
     /// With nowhere to move, "not primary" is reported like "not accepted":
     /// neither was admitted.
     @Test func notPrimaryWithoutAnotherNodeIsReportedAsNotAccepted() async throws {

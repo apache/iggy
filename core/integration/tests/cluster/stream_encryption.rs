@@ -40,7 +40,7 @@ async fn given_encrypted_streams_when_primary_fails_should_read_after_failover(
     harness: &mut TestHarness,
 ) {
     let client = harness.root_client_for_node(0).await.unwrap();
-    seed_streams(&client, "before-failover").await;
+    seed_streams(&client, "before-failover", Durability::Replicated).await;
     drop(client);
 
     let leader = disk::leader_node_index(harness).await;
@@ -72,7 +72,7 @@ async fn given_empty_replacement_node_when_state_transferring_should_unwrap_stre
     harness: &mut TestHarness,
 ) {
     let client = harness.root_client_for_node(0).await.unwrap();
-    seed_streams(&client, "before-rejoin").await;
+    seed_streams(&client, "before-rejoin", Durability::Replicated).await;
     let _seed_client = client;
 
     harness
@@ -179,7 +179,9 @@ async fn given_replica_that_missed_a_rotation_when_booting_with_the_new_key_shou
     harness: &mut TestHarness,
 ) {
     let client = harness.root_client_for_node(0).await.unwrap();
-    seed_streams(&client, "before-rotation").await;
+    // Every quorum below holds a restarted log. A `replicated` one can lack ops
+    // it acknowledged, so such a quorum waits for the stopped node instead.
+    seed_streams(&client, "before-rotation", Durability::Persisted).await;
     drop(client);
     harness.stop_node(2).expect("stop node 2");
     for node in [0, 1] {
@@ -246,7 +248,9 @@ async fn given_encrypted_streams_when_replica_restarts_without_a_key_should_refu
     harness: &mut TestHarness,
 ) {
     let client = harness.root_client_for_node(0).await.unwrap();
-    seed_streams(&client, "before-keyless-restart").await;
+    // Node 1 stops before node 2 rejoins, and a restarted `replicated` log can
+    // lack ops it acknowledged, so nodes 0 and 2 could not elect without node 1.
+    seed_streams(&client, "before-keyless-restart", Durability::Persisted).await;
     drop(client);
     let deadline = Instant::now() + CONVERGE_TIMEOUT;
     loop {
@@ -308,7 +312,7 @@ async fn given_encrypted_streams_when_replica_restarts_without_a_key_should_refu
     }
 }
 
-async fn seed_streams(client: &IggyClient, payload_tag: &str) {
+async fn seed_streams(client: &IggyClient, payload_tag: &str, durability: Durability) {
     for (name, seed) in STREAMS {
         client
             .create_stream(
@@ -328,6 +332,8 @@ async fn seed_streams(client: &IggyClient, payload_tag: &str) {
                     partitions_count: Some(1),
                     message_expiry: Some(IggyExpiry::NeverExpire),
                     messages_required_to_save: Some(1),
+                    durability,
+                    consumer_offset_durability: durability,
                     ..TopicCreateOptions::default()
                 },
             )

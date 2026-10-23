@@ -33,6 +33,7 @@ mod partition_primary_routing;
 mod partition_state_transfer;
 mod register_forwarding;
 mod replica_read_batching;
+mod rolling_sigkill_repro;
 mod root_credentials;
 mod staggered_bootstrap;
 mod stream_encryption;

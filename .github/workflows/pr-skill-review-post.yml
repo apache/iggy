@@ -56,6 +56,13 @@ permissions:
   # Required to fetch the review-out artifact from the run above.
   actions: read
 
+concurrency:
+  # Share PR Triage Apply's queue so replacing review-state labels cannot
+  # overwrite a concurrently added Prolific Author label.
+  group: pr-label-writes-${{ github.repository }}
+  cancel-in-progress: false
+  queue: max
+
 jobs:
   post:
     # workflow_run matches the run workflow by name only. An issue_comment run
@@ -476,9 +483,8 @@ jobs:
             core.info(`posted ${inline.length} inline comments and ` +
               `${unanchored.length} body findings`);
 
-            // The move copies replaceStateLabel in pr-triage-apply.yml: one
-            // setLabels call that drops the other S-* label, so a racing /ready
-            // converges on one state instead of leaving both.
+            // The shared queue serializes this snapshot and PUT with triage
+            // commands and the one-time prolific label addition.
             const LABEL_REVIEW = 'S-waiting-on-review';
             const LABEL_AUTHOR = 'S-waiting-on-author';
             if (payload.flip_author_label === true

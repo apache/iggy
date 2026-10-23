@@ -220,6 +220,12 @@ ready, sets `S-waiting-on-review`. A "Request changes" review sets
 `S-waiting-on-author`, and so does a `/skill` bot review with findings for the
 author. Closing a PR, or converting it to a draft, clears both.
 
+When a PR is opened, including a draft, `PR Triage Apply` checks its author once.
+It adds `Prolific Author` if a human author opened PRs in more than 20 visible
+repositories over the last 30 days, unless they have at least 10 merged PRs in Iggy.
+This follows [Arrow-rs's criteria](https://github.com/apache/arrow-rs/issues/11808).
+The label is informational and is not removed automatically.
+
 Commands take up to ~90s. A 👍 reaction means applied, 😕 means you lacked
 permission; if neither shows up, check the `PR Triage Apply` run in the
 Actions tab.
