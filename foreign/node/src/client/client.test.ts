@@ -355,7 +355,64 @@ describe('Client lifecycle events', () => {
     }
   });
 
-  it('supports node:events.once and removes its temporary listeners', async () => {
+  it('uses the public client as the listener receiver and allows self-removal', async () => {
+    const client = new Client('iggy://iggy:iggy@127.0.0.1:1');
+    let calls = 0;
+    function listener(this: Client) {
+      assert.equal(this, client);
+      calls += 1;
+      this.off('error', listener);
+    }
+    try {
+      client.on('error', listener);
+      client['events'].emit('connectionError', new Error('first'));
+      client['events'].emit('connectionError', new Error('second'));
+      assert.equal(calls, 1);
+      client.once('error', listener);
+      client['events'].emit('connectionError', new Error('third'));
+      client['events'].emit('connectionError', new Error('fourth'));
+      assert.equal(calls, 2);
+      client.on('error', listener).on('error', listener);
+      client.off('error', listener);
+      client['events'].emit('connectionError', new Error('fifth'));
+      assert.equal(calls, 3, 'off removes only the latest duplicate registration');
+      assert.equal(client['events'].listenerCount('connectionError'), 0);
+    } finally {
+      await client.destroy();
+    }
+  });
+
+  it('keeps connected listener exceptions outside transport retry handling', () => {
+    const result = spawnSync(process.execPath, [
+      '--import', '@swc-node/register/esm-register', '--input-type=module', '--eval', `
+        import { createServer } from 'node:net';
+        import { once } from 'node:events';
+        import { CommandResponseStream } from ${JSON.stringify(new URL('./client.socket.ts', import.meta.url).href)};
+        const server = createServer();
+        server.listen(0, '127.0.0.1');
+        await once(server, 'listening');
+        const client = new CommandResponseStream({
+          transport: 'TCP',
+          options: { host: '127.0.0.1', port: server.address().port },
+          reconnect: { enabled: false, interval: 0, maxRetries: 0 },
+          heartbeatInterval: 0
+        });
+        let calls = 0;
+        process.once('uncaughtException', (error, origin) => {
+          const socket = client.getReadStream();
+          process.exit(error.message === 'listener failed' && origin === 'uncaughtException'
+            && calls === 1 && socket && !socket.destroyed ? 0 : 3);
+        });
+        process.on('unhandledRejection', () => process.exit(4));
+        client.on('connected', () => { calls += 1; throw new Error('listener failed'); });
+        client.sendCommand(${COMMAND_CODE.Ping}, Buffer.alloc(0)).catch(() => process.exit(2));
+        setTimeout(() => process.exit(5), 2000);
+      `
+    ], { encoding: 'utf8', timeout: 10_000 });
+    assert.equal(result.status, 0, result.stderr || String(result.error));
+  });
+
+  it('supports JavaScript node:events.once and removes its temporary listeners', async () => {
     const server = await startServer();
     const client = new Client(clientConfig(server.server));
     try {

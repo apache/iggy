@@ -919,7 +919,11 @@ export class CommandResponseStream extends EventEmitter {
     connection.on('connect', () => {
       if (!this.lifetime.signal.aborted) {
         this.connecting = false;
-        this.emit('connected');
+        // Listener exceptions must not enter the dial's transport retry path.
+        process.nextTick(() => {
+          if (!this.lifetime.signal.aborted)
+            this.emit('connected');
+        });
       }
     });
     connection.on('error', (error: Error) => {

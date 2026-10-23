@@ -24,6 +24,7 @@ import { normalizeClientConfig } from './client.config.js';
 export class Client extends CommandAPI {
   readonly _config: ClientConfig;
   private readonly events: CommandResponseStream;
+  private readonly eventListeners = new WeakMap<object, object>();
   private readonly destroyPromise: Promise<void>;
 
   constructor(config: ClientConfigOrString) {
@@ -36,24 +37,25 @@ export class Client extends CommandAPI {
   }
 
   /** Registers a listener for a connection lifecycle event. */
-  on<E extends keyof ClientEventMap>(event: E, listener: (...args: ClientEventMap[E]) => void): this {
-    this.events.on(event === 'error' ? 'connectionError' : event, listener);
+  on<E extends keyof ClientEventMap>(event: E, listener: (this: this, ...args: ClientEventMap[E]) => void): this {
+    this.events.on(event === 'error' ? 'connectionError' : event, this.bindListener(listener));
     return this;
   }
 
   /** Registers a listener for the next occurrence only. */
-  once<E extends keyof ClientEventMap>(event: E, listener: (...args: ClientEventMap[E]) => void): this {
-    this.events.once(event === 'error' ? 'connectionError' : event, listener);
+  once<E extends keyof ClientEventMap>(event: E, listener: (this: this, ...args: ClientEventMap[E]) => void): this {
+    this.events.once(event === 'error' ? 'connectionError' : event, this.bindListener(listener));
     return this;
   }
 
   /** Removes a listener registered with `on` or `once`. */
   off<E extends keyof ClientEventMap>(event: E, listener: (...args: ClientEventMap[E]) => void): this {
-    this.events.off(event === 'error' ? 'connectionError' : event, listener);
+    const bound = this.eventListeners.get(listener);
+    if (bound) this.events.off(event === 'error' ? 'connectionError' : event, bound as typeof listener);
     return this;
   }
 
-  /** Alias used by `node:events` to remove its temporary listeners. */
+  /** Alias for `off`. */
   removeListener<E extends keyof ClientEventMap>(event: E, listener: (...args: ClientEventMap[E]) => void): this {
     return this.off(event, listener);
   }
@@ -62,6 +64,15 @@ export class Client extends CommandAPI {
   destroy(): Promise<void> {
     this.events.destroy();
     return this.destroyPromise;
+  }
+
+  private bindListener<E extends keyof ClientEventMap>(listener: (this: this, ...args: ClientEventMap[E]) => void) {
+    let bound = this.eventListeners.get(listener);
+    if (!bound) {
+      bound = listener.bind(this);
+      this.eventListeners.set(listener, bound);
+    }
+    return bound as typeof listener;
   }
 }
 

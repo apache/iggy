@@ -285,7 +285,8 @@ const stats = await client.system.getStats();
 
 `Client` and `SingleClient` report their connection lifecycle through Node.js-style `on`, `once`,
 `off` and `removeListener` methods. Each method returns the client, so calls
-can be chained. `SimpleClient` wraps an arbitrary raw client and does not expose these methods.
+can be chained. Listeners receive the client as `this`. These four methods do not implement the
+full Node.js `EventEmitter` interface. `SimpleClient` wraps an arbitrary raw client and does not expose these methods.
 The `getClient()` factory returns a `SimpleClient`, so it does not expose them either.
 
 ```ts
