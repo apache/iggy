@@ -98,16 +98,33 @@ slow-timeout = { period = "60s", terminate-after = 60 }
 slow-timeout = { period = "60s", terminate-after = 5 }
 
 [profile.default-miri]
+# Keep consensus logic scenarios and large options boundaries in native CI.
+# Miri retains protocol validation and message ownership checks.
+default-filter = '''
+not (
+    (package(=consensus) & (
+        test(/^client_table::tests::/)
+        | test(/^dvc_merge::tests::/)
+        | test(/^metadata_helpers::tests::/)
+        | test(/^plane_helpers::tests::/)
+        | test(/^impls::adopted_view_claim_tests::/)
+        | test(/^impls::history_certificate_tests::/)
+        | test(/^impls::probe_answer_tests::/)
+        | test(/^impls::quorum_tests::/)
+        | test(/^impls::recovery_barrier_tests::/)
+        | test(/^impls::recovery_election_tests::/)
+        | test(/^impls::timestamp_clamp_tests::/)
+        | test(/^impls::view_source_tests::/)
+        | test(/^impls::vsr_consensus_tests::/)
+    ))
+    | (package(=iggy_binary_protocol) & (
+        test(=primitives::options::tests::entry_count_over_limit_is_rejected)
+        | test(=primitives::options::tests::block_over_byte_limit_is_rejected)
+    ))
+)
+'''
 # Keep Miri bounded by the CI job timeout instead of the native-test limit.
 slow-timeout = { period = "60s" }
-
-[[profile.default-miri.overrides]]
-# Start the options boundary test early so other work overlaps it.
-filter = '''
-    package(=iggy_binary_protocol)
-    & test(=primitives::options::tests::entry_count_over_limit_is_rejected)
-'''
-priority = 100
 
 [profile.ci]
 retries = 3
