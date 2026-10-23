@@ -132,7 +132,7 @@ final class RawPartitionRequests {
         if (payload.length - target != suffix) {
             throw malformed(code, "offset fields", target);
         }
-        return offsets.write(code, Unpooled.copiedBuffer(payload), target, Optional.empty());
+        return offsets.write(code, Unpooled.copiedBuffer(payload), Optional.empty());
     }
 
     /** Where the consumer, stream, topic and optional partition that lead a poll or offset write end. */

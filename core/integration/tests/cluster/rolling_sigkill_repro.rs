@@ -67,7 +67,10 @@ async fn given_load_on_a_persisted_topic_when_every_node_is_sigkilled_in_turn_sh
         .map(|server| server.raw_tcp_addr().expect("tcp address"))
         .collect();
     let setup = connect_any(&addresses).await.expect("cluster serves");
-    setup.create_stream(STREAM_NAME).await.unwrap();
+    setup
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     setup
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),

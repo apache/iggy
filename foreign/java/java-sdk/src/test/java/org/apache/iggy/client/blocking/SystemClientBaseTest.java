@@ -19,16 +19,24 @@
 
 package org.apache.iggy.client.blocking;
 
+import org.apache.commons.lang3.StringUtils;
 import org.apache.iggy.cluster.ClusterNodeRole;
 import org.apache.iggy.cluster.ClusterNodeStatus;
 import org.apache.iggy.message.HeaderKind;
+import org.apache.iggy.stream.StreamOptionKey;
 import org.apache.iggy.system.OptionSpec;
 import org.apache.iggy.system.OptionsScope;
+import org.apache.iggy.user.UserOptionKey;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import tools.jackson.databind.JsonNode;
 
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
 import java.util.stream.Collectors;
 
+import static org.apache.iggy.ResourceOptionsFixture.section;
 import static org.assertj.core.api.Assertions.assertThat;
 
 public abstract class SystemClientBaseTest extends IntegrationTest {
@@ -57,11 +65,36 @@ public abstract class SystemClientBaseTest extends IntegrationTest {
     }
 
     @Test
-    void shouldDescribeEmptyCatalogsForScopesWithoutKeys() {
-        // Streams and users have no catalog keys yet, so the scope answers with
-        // an empty list rather than an error.
-        assertThat(systemClient.describeOptions(OptionsScope.Stream)).isEmpty();
-        assertThat(systemClient.describeOptions(OptionsScope.User)).isEmpty();
+    void shouldDescribeStreamAndUserOptionCatalogs() {
+        var stream = systemClient.describeOptions(OptionsScope.Stream).stream()
+                .collect(Collectors.toMap(OptionSpec::key, spec -> spec));
+        assertThat(stream).containsKeys(StreamOptionKey.NAME.value(), StreamOptionKey.ENCRYPTION_KEY.value());
+        assertThat(stream.get(StreamOptionKey.ENCRYPTION_KEY.value()).secret()).isTrue();
+        assertThat(stream.get(StreamOptionKey.NAME.value()).updatable()).isTrue();
+
+        var user = systemClient.describeOptions(OptionsScope.User).stream()
+                .collect(Collectors.toMap(OptionSpec::key, spec -> spec));
+        assertThat(user).containsKeys(UserOptionKey.USERNAME.value(), UserOptionKey.STATUS.value());
+    }
+
+    @Test
+    void shouldDescribeEveryScopeWithTheFixtureKindsAndFlags() {
+        for (JsonNode vector : section("describe_options")) {
+            var scope = OptionsScope.valueOf(
+                    StringUtils.capitalize(vector.get("scope").asString()));
+            List<String> expected = new ArrayList<>();
+            vector.get("entries")
+                    .forEach(entry -> expected.add(entry.get("key").asString() + " "
+                            + entry.get("kind").asString() + " "
+                            + entry.get("flags").asInt()));
+
+            var described = systemClient.describeOptions(scope).stream()
+                    .map(spec -> spec.key() + " "
+                            + spec.defaultValue().kind().name().toLowerCase(Locale.ROOT) + " " + spec.flags())
+                    .toList();
+
+            assertThat(described).as(scope.name()).isEqualTo(expected);
+        }
     }
 
     @Test

@@ -196,8 +196,7 @@ internal sealed class ConsumerGroupClientState
     }
 
     /// <summary>
-    ///     Forgets a topic after a send to it was refused with status 87: another client deleted and recreated
-    ///     it, so every partition context and the partition count may be stale. Any other failure leaves both.
+    ///     Forgets a topic after a history or partition-not-found refusal, when its contexts and count may be stale.
     /// </summary>
     internal void InvalidateTopic(TopicKey key)
     {

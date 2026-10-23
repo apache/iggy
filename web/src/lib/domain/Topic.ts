@@ -15,6 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+import {
+  UINT64_MAX,
+  UNLIMITED,
+  isOptionExplicit,
+  optionText,
+  optionUint64
+} from '#lib/api/resourceOptions.js';
 import { bytesFormatter } from '#lib/utils/formatters/bytesFormatter.js';
 import { formatDate } from '#lib/utils/formatters/dateFormatter.js';
 import { durationFormatter } from '#lib/utils/formatters/durationFormatter.js';
@@ -27,16 +34,20 @@ export type Topic = {
   messagesCount: number;
   messageExpiry: number;
   messageExpiryFormatted: string;
+  messageExpiryExplicit: boolean;
   partitionsCount: number;
   createdAt: string;
-  compressionAlgorithm: number;
-  maxTopicSize: number;
+  compressionAlgorithm: string;
+  maxTopicSize: string;
+  maxTopicSizeExplicit: boolean;
 };
 
 export function topicMapper(item: any): Topic {
-  const micros: number = item.message_expiry ?? 0;
+  const micros = optionUint64(item.options, 'message_expiry') ?? 0n;
+  const maxTopicSize = optionUint64(item.options, 'max_topic_size') ?? UINT64_MAX;
 
-  const messageExpiry = micros === 0 || micros >= Number.MAX_SAFE_INTEGER ? 0 : micros;
+  const messageExpiry =
+    micros === 0n || micros >= BigInt(Number.MAX_SAFE_INTEGER) ? 0 : Number(micros);
   return {
     id: item.id,
     name: item.name,
@@ -44,11 +55,13 @@ export function topicMapper(item: any): Topic {
     sizeFormatted: bytesFormatter(item.size),
     messageExpiry,
     messageExpiryFormatted: formatExpiry(messageExpiry),
+    messageExpiryExplicit: isOptionExplicit(item.options, 'message_expiry'),
     messagesCount: item.messages_count,
     partitionsCount: item.partitions_count,
     createdAt: formatDate(item.created_at),
-    compressionAlgorithm: item.compression_algorithm ?? 0,
-    maxTopicSize: item.max_topic_size
+    compressionAlgorithm: optionText(item.options, 'compression_algorithm') ?? 'none',
+    maxTopicSize: maxTopicSize === UINT64_MAX ? UNLIMITED : maxTopicSize.toString(),
+    maxTopicSizeExplicit: isOptionExplicit(item.options, 'max_topic_size')
   };
 }
 

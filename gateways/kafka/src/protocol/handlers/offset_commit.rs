@@ -71,17 +71,19 @@ pub async fn handle(
         }
     };
 
-    let error = state
+    let validated = state
         .groups
         .validate_commit(&CommitRequest::from(&request))
         .await;
-    let topics = match (&state.bridge, error) {
-        (Some(bridge), ERROR_NONE) => {
-            let calls = OffsetCalls::new(offset_deadline(state, connection).await);
+    let topics = match (&state.bridge, validated) {
+        (Some(bridge), Ok(commit)) => {
+            // The commit stays counted until none of its Iggy calls can land, also past the
+            // deadline, so a deletion of the group's offsets waits for them.
+            let calls = OffsetCalls::new(offset_deadline(state, connection).await).keeping(commit);
             commit_all(bridge, &request, &calls).await
         }
-        (None, ERROR_NONE) => same_code(&request, ERROR_COORDINATOR_LOAD_IN_PROGRESS),
-        (_, error) => same_code(&request, error),
+        (None, Ok(_)) => same_code(&request, ERROR_COORDINATOR_LOAD_IN_PROGRESS),
+        (_, Err(error)) => same_code(&request, error),
     };
     respond_or_close(encode_response(api_version, topics), "OffsetCommit")
 }
@@ -201,7 +203,7 @@ mod tests {
 
     use super::*;
     use crate::bridge::BridgeError;
-    use crate::protocol::api::{BrokerAdvertise, ERROR_UNKNOWN_MEMBER_ID};
+    use crate::protocol::api::ERROR_UNKNOWN_MEMBER_ID;
 
     fn request(generation_id: i32, member_id: &'static str) -> OffsetCommitRequest {
         OffsetCommitRequest::default()
@@ -229,7 +231,7 @@ mod tests {
     }
 
     async fn codes(version: i16, request: &OffsetCommitRequest) -> Vec<(String, i32, i16)> {
-        let state = GatewayState::stub(BrokerAdvertise::default(), 8 * 1024 * 1024);
+        let state = GatewayState::stub(8 * 1024 * 1024);
         let connection = ConnectionState::default();
         let mut response = handle(&state, &connection, version, body(version, request))
             .await
@@ -283,6 +285,7 @@ mod tests {
             BridgeError::Iggy(IggyError::Disconnected),
             BridgeError::Iggy(IggyError::TransientNotCommitted),
             BridgeError::Iggy(IggyError::RequestTooOld),
+            BridgeError::Iggy(IggyError::LaneBlocked(7)),
         ] {
             assert_eq!(
                 retriable.to_offset_error_code(),
@@ -307,7 +310,7 @@ mod tests {
     /// may go back.
     #[tokio::test]
     async fn given_an_unreadable_request_should_close_rather_than_answer() {
-        let state = GatewayState::stub(BrokerAdvertise::default(), 8 * 1024 * 1024);
+        let state = GatewayState::stub(8 * 1024 * 1024);
         let connection = ConnectionState::default();
 
         let truncated = body(9, &request(-1, "")).slice(..5);

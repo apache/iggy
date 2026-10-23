@@ -29,6 +29,10 @@ namespace Apache.Iggy.Exceptions;
 ///     and either retried or swallowed, which are the two responses this type exists to prevent. The triggering
 ///     exception is preserved as <see cref="Exception.InnerException" />.
 /// </remarks>
-public sealed class VsrRequestOutcomeUnknownException(Exception innerException)
+public sealed class VsrRequestOutcomeUnknownException(Exception innerException, ulong? operationId = null)
     : Exception("The VSR request outcome is unknown because the server did not confirm whether it committed the request.",
-        innerException);
+        innerException)
+{
+    /// <summary>The retained operation to resolve or abandon; null for weak polls and session control.</summary>
+    public ulong? OperationId { get; } = operationId;
+}

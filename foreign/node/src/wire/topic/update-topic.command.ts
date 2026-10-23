@@ -15,22 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { serializeIdentifier, type Id } from '../identifier.utils.js';
-import { dedupeOptions, serializeOptions, type OptionEntry } from '../options.utils.js';
+import type { Id } from '../identifier.utils.js';
+import type { OptionEntry, TopicOptionKey } from '../options.utils.js';
 import { HeaderValue } from '../message/header.utils.js';
-import { deserializeVoidResponse } from '../../client/client.utils.js';
 import { wrapCommand } from '../command.utils.js';
-import { COMMAND_CODE } from '../command.code.js';
-import {
-  type CompressionAlgorithm as CompressionAlgorithmT,
-  CompressionAlgorithm,
-  compressionAlgorithmName,
-  isValidCompressionAlgorithm
-} from './topic.utils.js';
+import { OptionsScope } from '../system/describe-options.command.js';
+import { UPDATE_RESOURCE, columnOption } from '../system/update-resource.command.js';
 
 
 /**
- * Parameters for the update topic command.
+ * Parameters for the update topic command. Keys left out keep their values.
+ * Settings fixed at create, compression among them, have no field here.
  */
 export type UpdateTopic = {
   /** Stream identifier (ID or name) */
@@ -38,62 +33,55 @@ export type UpdateTopic = {
   /** Topic identifier (ID or name) */
   topicId: Id,
   /** New topic name (1-255 bytes) */
-  name: string,
-  /** Compression algorithm (None or Gzip) */
-  compressionAlgorithm?: CompressionAlgorithmT,
+  name?: string,
   /**
    * Message expiry time in microseconds. `0n` is not "unlimited": it omits the
-   * key, so the topic keeps whatever expiry it currently has. Resetting a key
-   * back to the server default is not expressible on an update.
+   * key, so the topic keeps whatever expiry it currently has. Reset the key to
+   * return to the server default.
    */
   messageExpiry?: bigint,
   /**
    * Maximum topic size in bytes. `0n` is not "unlimited": it omits the key, so
-   * the topic keeps whatever cap it currently has. Resetting a key back to the
-   * server default is not expressible on an update.
+   * the topic keeps whatever cap it currently has. Reset the key to return to
+   * the server default.
    */
   maxTopicSize?: bigint,
+  /** Keys to reset to their defaults: `message_expiry` or `max_topic_size` */
+  reset?: TopicOptionKey[],
   /**
-   * Option keys with no field of their own. The server refuses any key an update
-   * may not change, by name; a key left out keeps its current value.
+   * Reset names with no typed member, for a resettable key the server catalog
+   * gained after this build shipped. The server decides on them.
+   */
+  rawReset?: readonly string[],
+  /**
+   * Option keys with no field of their own, for an updatable key the server
+   * catalog gained after this build shipped. A field above wins on collision.
+   * The server decides on them, so a create-only or unknown key comes back as
+   * a server error.
    */
   options?: OptionEntry[]
 };
 
 /**
  * Update topic command definition.
- * Updates a topic's configuration.
+ * Changes only the keys it names, through the generic update command.
  */
 export const UPDATE_TOPIC = {
-  code: COMMAND_CODE.UpdateTopic,
+  code: UPDATE_RESOURCE.code,
 
   serialize: ({
     streamId,
     topicId,
     name,
-    compressionAlgorithm = CompressionAlgorithm.None,
     messageExpiry = 0n,
     maxTopicSize = 0n,
-    options: extraOptions = []
+    reset,
+    rawReset,
+    options: rawOptions
   }: UpdateTopic) => {
-    const streamIdentifier = serializeIdentifier(streamId);
-    const topicIdentifier = serializeIdentifier(topicId);
-    const bName = Buffer.from(name)
-
-    if (bName.length < 1 || bName.length > 255)
-      throw new Error('Topic name should be between 1 and 255 bytes');
-    if(!isValidCompressionAlgorithm(compressionAlgorithm))
-      throw new Error(`updateTopic: invalid compressionAlgorithm (${compressionAlgorithm})`);
-
-    // Settings ride the options block. A default value means the caller did not
-    // set the key, so it is omitted and the server leaves the current value be.
-    // Caller keys first so a typed field below overwrites one of them.
-    const options: OptionEntry[] = [...extraOptions];
-    if (compressionAlgorithm !== CompressionAlgorithm.None)
-      options.push({
-        key: 'compression_algorithm',
-        value: HeaderValue.String(compressionAlgorithmName(compressionAlgorithm))
-      });
+    const options: OptionEntry[] = [];
+    if (name !== undefined)
+      options.push(columnOption('name', name));
     if (messageExpiry !== 0n)
       options.push({
         key: 'message_expiry',
@@ -105,19 +93,12 @@ export const UPDATE_TOPIC = {
         value: HeaderValue.Uint64(maxTopicSize)
       });
 
-    const b = Buffer.allocUnsafe(1);
-    b.writeUInt8(bName.length, 0);
-
-    return Buffer.concat([
-      streamIdentifier,
-      topicIdentifier,
-      b,
-      bName,
-      serializeOptions(dedupeOptions(options)),
-    ]);
+    return UPDATE_RESOURCE.serialize({
+      target: { scope: OptionsScope.Topic, streamId, topicId }, options, reset, rawOptions, rawReset
+    });
   },
 
-  deserialize: deserializeVoidResponse
+  deserialize: UPDATE_RESOURCE.deserialize
 };
 
 

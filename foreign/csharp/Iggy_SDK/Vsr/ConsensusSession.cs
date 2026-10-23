@@ -40,6 +40,10 @@ internal sealed class ConsensusSession
     private UInt128 _clientId;
     private readonly byte[] _bindSecret = new byte[LoginRegister.BIND_SECRET_BYTES];
     private ulong _generation;
+    private ulong _armedAt;
+    private ulong _continuedSince;
+    private ulong _unauthenticatedSince;
+    private Exception? _endCause;
     private bool _registerPending;
     private ulong _requestCounter;
     private ulong? _session;
@@ -114,11 +118,22 @@ internal sealed class ConsensusSession
         }
     }
 
+    internal bool RegisterPending
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _registerPending;
+            }
+        }
+    }
+
     /// <summary>
-    ///     Generation of the identity, bumped on every re-arm. Anything scoped to a server session - a
-    ///     consumer-group membership, say - compares the generation it was established under to detect that the
-    ///     session it lived on is gone, without inferring it from connection-state edges. Distinct from the
-    ///     fence epoch the wire protocol carries in <see cref="Session" />.
+    ///     Generation of the identity, bumped on every re-arm and on every bind the caller signed in for. Anything
+    ///     scoped to a server session - a consumer-group membership, say - compares the generation it was
+    ///     established under to detect that the session it lived on is gone, without inferring it from
+    ///     connection-state edges. Distinct from the fence epoch the wire protocol carries in <see cref="Session" />.
     /// </summary>
     internal ulong Generation
     {
@@ -128,6 +143,67 @@ internal sealed class ConsensusSession
             {
                 return _generation;
             }
+        }
+    }
+
+    /// <summary>
+    ///     The generation a request made under <paramref name="generation" /> goes on under: its own while it is
+    ///     current, or the bound session that replaced it when the client, not the caller, signed in every session
+    ///     since. Null otherwise, so a request never runs for a sign-in it was not made under.
+    /// </summary>
+    internal ulong? Successor(ulong generation)
+    {
+        lock (_gate)
+        {
+            if (generation == _generation)
+            {
+                return generation;
+            }
+            return _session.HasValue && generation >= _continuedSince ? _generation : null;
+        }
+    }
+
+    /// <summary>
+    ///     The error a request made under <paramref name="generation" /> ends with once no session can take it. It is
+    ///     <see cref="VsrError.UNAUTHENTICATED" /> when the caller signed in or out since or the server refused a
+    ///     sign-in, with what ended the session as its cause, and <see cref="NotConnectedException" /> when the
+    ///     client stopped without signing in again. Null while the session the request was made under, or one the
+    ///     client signs in for it, can still take it.
+    /// </summary>
+    internal Exception? Ended(ulong generation)
+    {
+        lock (_gate)
+        {
+            if (generation >= _continuedSince)
+            {
+                return null;
+            }
+            return generation < _unauthenticatedSince
+                ? VsrError.Exception(VsrError.UNAUTHENTICATED, "The session the request was made under ended.", _endCause)
+                : new NotConnectedException();
+        }
+    }
+
+    /// <summary>
+    ///     The generation a connection dialed under <paramref name="dialedUnder" /> serves: the current one until a
+    ///     re-arm replaces the identity. A caller's bind opens a generation on the same identity, so the connection
+    ///     that carried its register stays current. Null once the connection belongs to a replaced identity.
+    /// </summary>
+    internal ulong? LinkGeneration(ulong dialedUnder)
+    {
+        lock (_gate)
+        {
+            return dialedUnder >= _armedAt ? _generation : null;
+        }
+    }
+
+    internal ulong BeginCallerSession()
+    {
+        lock (_gate)
+        {
+            _generation++;
+            EndLineageLocked(null);
+            return _generation;
         }
     }
 
@@ -162,15 +238,18 @@ internal sealed class ConsensusSession
             return operation switch
             {
                 VsrOperation.Register => RegisterFrameLocked(),
-                VsrOperation.NonReplicated => new SessionFrame(_clientId, _requestCounter, _session ?? 0),
-                _ => ReplicatedFrameLocked(operation)
+                _ => RequestFrameLocked(operation)
             };
         }
     }
 
-    /// <summary>Bind the session from a committed register reply.</summary>
+    /// <summary>
+    ///     Bind the session from a committed register reply. A bind the caller signed in for opens a generation, so
+    ///     a request made before it, even while no session was bound, never goes out under the caller's new session.
+    /// </summary>
     /// <param name="session">The session number the register reply carried.</param>
     /// <param name="bindSecret">The private proof sent in the corresponding register.</param>
+    /// <param name="continues">The client signed in again for the requests of the replaced sessions.</param>
     /// <exception cref="NotConnectedException">
     ///     No register is awaiting a binding, so the identity was re-armed while this one was in flight. Binding
     ///     regardless would pair the session with a client id the server never registered, and it would fence
@@ -180,7 +259,7 @@ internal sealed class ConsensusSession
     ///     The register reply carried no session. The value comes off the wire, so a malformed reply has to
     ///     surface as a protocol error rather than as argument validation.
     /// </exception>
-    internal void Bind(ulong session, ReadOnlySpan<byte> bindSecret)
+    internal void Bind(ulong session, ReadOnlySpan<byte> bindSecret, bool continues = false)
     {
         if (session == 0)
         {
@@ -201,15 +280,39 @@ internal sealed class ConsensusSession
             _registerPending = false;
             bindSecret.CopyTo(_bindSecret);
             _session = session;
+            if (!continues)
+            {
+                _generation++;
+                EndLineageLocked(null);
+            }
         }
     }
 
     /// <summary>Forget the binding and client id after logout or a terminal bind refusal.</summary>
-    internal void Reset()
+    /// <param name="continues">The client signs in again for the requests of the replaced session.</param>
+    /// <param name="cause">What ended the session, kept as the cause of the requests it ends.</param>
+    internal void Reset(bool continues = false, Exception? cause = null)
     {
         lock (_gate)
         {
             ReArmLocked();
+            if (!continues)
+            {
+                EndLineageLocked(cause);
+            }
+        }
+    }
+
+    /// <summary>
+    ///     Forget the binding and client id when the client stops without signing in again. The requests of the
+    ///     replaced session end as not connected, unless the caller signs in or out later.
+    /// </summary>
+    internal void Stop()
+    {
+        lock (_gate)
+        {
+            ReArmLocked();
+            _continuedSince = _generation;
         }
     }
 
@@ -235,25 +338,39 @@ internal sealed class ConsensusSession
 
         _registerPending = true;
 
-        return new SessionFrame(_clientId, 0, 0);
+        return new SessionFrame(_clientId, 0, 0, RandomRequestIdentifier());
     }
 
-    private SessionFrame ReplicatedFrameLocked(VsrOperation operation)
+    private SessionFrame RequestFrameLocked(VsrOperation operation)
     {
-        var sessionId = _session ?? throw VsrError.Exception(VsrError.UNAUTHENTICATED,
-            "A replicated request requires a bound consensus session.");
+        var sessionId = _session ?? (operation == VsrOperation.NonReplicated ? 0UL
+            : throw VsrError.Exception(VsrError.UNAUTHENTICATED, "A replicated request requires a bound consensus session."));
 
         if (_requestCounter == ulong.MaxValue)
         {
             throw VsrError.Exception(VsrError.REQUEST_ID_EXHAUSTED, "Request ID counter exhausted.");
         }
 
-        // Partition ops consume an id too: dedup needs each send to carry a distinct number, and the
-        // metadata watermark tolerates the gaps.
         var requestId = _requestCounter;
         _requestCounter = checked(_requestCounter + 1);
 
-        return new SessionFrame(_clientId, requestId, sessionId);
+        var requestChecksum = operation != VsrOperation.NonReplicated
+            && (byte)operation < (byte)VsrOperation.SendMessages
+            ? RandomRequestIdentifier() : UInt128.Zero;
+        return new SessionFrame(_clientId, requestId, sessionId, requestChecksum);
+    }
+
+    private static UInt128 RandomRequestIdentifier()
+    {
+        Span<byte> bytes = stackalloc byte[16];
+        UInt128 identifier;
+        do
+        {
+            RandomNumberGenerator.Fill(bytes);
+            identifier = BinaryPrimitives.ReadUInt128LittleEndian(bytes);
+        } while (identifier == UInt128.Zero);
+
+        return identifier;
     }
 
     private void ReArmLocked()
@@ -261,9 +378,16 @@ internal sealed class ConsensusSession
         _clientId = GenerateClientId();
         Array.Clear(_bindSecret);
         _session = null;
-        _requestCounter = 1;
         _registerPending = false;
         _generation++;
+        _armedAt = _generation;
+    }
+
+    private void EndLineageLocked(Exception? cause)
+    {
+        _continuedSince = _generation;
+        _unauthenticatedSince = _generation;
+        _endCause = cause;
     }
 
     private static UInt128 GenerateClientId()
@@ -271,7 +395,8 @@ internal sealed class ConsensusSession
         Span<byte> bytes = stackalloc byte[16];
         RandomNumberGenerator.Fill(bytes);
         var lower = BinaryPrimitives.ReadUInt64LittleEndian(bytes[..8]);
-        var upper = BinaryPrimitives.ReadUInt64LittleEndian(bytes[8..]);
+        // Keep generated IDs outside the server-only range.
+        var upper = BinaryPrimitives.ReadUInt64LittleEndian(bytes[8..]) & (ulong)long.MaxValue;
         var clientId = new UInt128(upper, lower);
 
         return clientId == UInt128.Zero ? UInt128.One : clientId;
@@ -279,4 +404,5 @@ internal sealed class ConsensusSession
 }
 
 /// <summary>The session identity one request header is encoded from, resolved as a single atomic snapshot.</summary>
-internal readonly record struct SessionFrame(UInt128 ClientId, ulong RequestId, ulong SessionId);
+internal readonly record struct SessionFrame(UInt128 ClientId, ulong RequestId, ulong SessionId,
+    UInt128 RequestChecksum = default);
