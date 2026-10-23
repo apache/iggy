@@ -46,12 +46,13 @@ publishes them to MQTT brokers such as **EMQX** or Mosquitto.
 * **Topic Routing**: Supports static topics, `{stream}` and `{topic}` templates, and dynamic MQTT topics from headers or JSON envelopes.
 * **Bounded Pipelining**: Limits outstanding publications with `max_in_flight`.
 * **Acknowledgement Tracking**: Correlates QoS 1 and QoS 2 acknowledgements by MQTT packet identifier.
-* **Reconnect Recovery**: Discards uncertain connections and retries only unconfirmed publications.
-* **Malformed Record Reporting**: Logs malformed marked envelopes and rejects their MQTT batch.
+* **Reconnect Recovery**: rumqttc retransmits after session resumption. The sink recreates its driver and requeues after a session reset.
+* **Idle Connection Keep-Alive**: A managed MQTT task polls the event loop between batches, so it sends and receives keep-alive packets.
+* **Malformed Record Reporting**: Logs and skips malformed marked envelopes while it publishes valid records in the batch.
 * **MQTT 5 Properties**: Publishes supported envelope properties with the decoded payload.
 * **TLS and Mutual TLS**: Supports system roots, custom CA files, client certificates, and client private keys through Rustls.
 * **Session Control**: Supports `clean_start` and MQTT 5 `session_expiry_interval`.
-* **Shutdown Draining**: Waits for active publication work within `shutdown_timeout` before disconnecting.
+* **Bounded Shutdown Cleanup**: Limits lock acquisition and MQTT disconnect cleanup with `shutdown_timeout` after publication work returns.
 
 ---
 
@@ -86,8 +87,7 @@ consumer_group = "mqtt_telemetry_sink"
 [plugin_config]
 broker_url = "mqtt://127.0.0.1:1883"
 protocol = "mqtt5"
-client_id = "iggy-mqtt-sink"
-clean_start = false
+clean_start = true
 session_expiry_interval = 3600
 
 # Select one routing block. Keep one topic_mode line active.
@@ -96,6 +96,7 @@ topic_mode = "static"
 topic = "iggy.messages"
 qos = 1
 retain = false
+max_packet_size = 1048576
 
 # Template routing creates an MQTT topic from the Iggy stream and topic.
 # To select it, comment the active static topic and topic_mode lines above.
@@ -134,7 +135,7 @@ example uses the same plugin configuration with its own Iggy route.
 | `plugin_config_format` | Set this value to `"json"`. The runtime sends the plugin section as JSON. |
 | `streams[].stream` | Selects an Iggy stream to read. |
 | `streams[].topics` | Selects one or more Iggy topics in that stream. |
-| `streams[].schema` | Selects the decoder for the Iggy record payload. Use `"raw"` for unchanged bytes. |
+| `streams[].schema` | Selects the decoder for the Iggy record payload. Use `"raw"` for unchanged bytes. Use `"json"` for MQTT 5 envelope routing. |
 | `streams[].batch_length` | Limits the number of Iggy records in one runtime batch. |
 | `streams[].poll_interval` | Sets the wait time before the next Iggy poll. |
 | `streams[].consumer_group` | Stores the Iggy read position for this sink route. Use a unique name for each sink instance. |
@@ -171,6 +172,25 @@ fallback_topic = "iggy/fallback"
 Dynamic mode accepts this MQTT 5 envelope. The connector decodes
 `payload_base64` before it publishes the MQTT payload.
 
+MQTT 5 envelope routing has three required rules:
+
+1. Set `topic_mode = "dynamic"`.
+2. Set `protocol = "mqtt5"`.
+3. Set `schema = "json"` for every sink stream that carries envelopes.
+
+If an MQTT source produces the input, set `include_metadata = true` in that
+source and use `schema = "json"` for its destination stream. With
+`schema = "raw"`, the sink treats the envelope as ordinary bytes and publishes
+the JSON envelope instead of its decoded MQTT payload.
+
+Static and template routing treat the Iggy payload as opaque. They do not
+forward Iggy headers to MQTT, including `mqtt.topic`.
+
+For `message_expiry_interval`, the connector subtracts the time that the
+record spent in Iggy. It skips the record when the remaining lifetime is zero.
+The connector ignores `topic_alias` because an alias belongs to the MQTT
+connection that created it.
+
 ```json
 {
   "version": 1,
@@ -190,25 +210,26 @@ Dynamic mode accepts this MQTT 5 envelope. The connector decodes
 | :--- | :--- | :--- | :--- |
 | `broker_url` | Always | None | Sets the MQTT broker URL. Use `mqtt://`, `mqtts://`, or `ssl://`. Do not add credentials or MQTT options to this URL. |
 | `protocol` | All modes | `"mqtt5"` | Selects `"mqtt5"` or `"mqtt311"`. |
-| `client_id` | When `clean_start = false` | None | Identifies the MQTT client. Set a stable, non-empty value for persistent sessions. |
+| `client_id` | All modes | Generated for clean sessions | Identifies the MQTT client. For persistent sessions, set a stable, non-empty value. For clean sessions, the connector generates a unique 23-character alphanumeric value when it is omitted. |
 | `username` | Authenticated brokers | None | Sets the broker user name. Set `password` with this field. |
 | `password` | Authenticated brokers | None | Sets the broker password. The connector does not write it to logs. |
-| `clean_start` | All modes | `false` | Starts a clean MQTT 5 session or MQTT 3.1.1 clean session. |
+| `clean_start` | All modes | `true` | Starts a clean MQTT 5 session or MQTT 3.1.1 clean session. A session reset makes the sink requeue unconfirmed publications. |
 | `session_expiry_interval` | All modes | `3600` | Sets the MQTT 5 session expiry time in seconds. |
 | `topic_mode` | All modes | `"static"` | Selects `"static"`, `"template"`, or `"dynamic"`. |
-| `topic` | Static mode | `"iggy.messages"` | Sets the MQTT output topic for static routing. |
-| `topic_template` | Template mode | `"{stream}/{topic}"` | Sets the template for template routing. It accepts only `{stream}` and `{topic}`. |
-| `fallback_topic` | Dynamic mode | `"{stream}/{topic}"` | Sets the MQTT output topic when dynamic routing has no valid topic. |
+| `topic` | Static mode | `"iggy.messages"` | Sets the MQTT output topic for static routing. It must not begin with `$` or contain `+` or `#`. |
+| `topic_template` | Template mode | `"{stream}/{topic}"` | Sets the template for template routing. It accepts only `{stream}` and `{topic}`. The rendered topic must not begin with `$` or contain `+` or `#`. |
+| `fallback_topic` | Dynamic mode | `"{stream}/{topic}"` | Sets the MQTT output topic when dynamic routing has no valid topic. The rendered topic must not begin with `$` or contain `+` or `#`. |
 | `qos` | All modes | `1` | Sets MQTT publication QoS. Use `0`, `1`, or `2`. |
 | `retain` | All modes | `false` | Sets the MQTT retained-message flag. |
-| `keep_alive` | All modes | `"30s"` | Sets the MQTT ping interval. MQTT 3.1.1 accepts `"0s"` or at least `"1s"`. MQTT 5 needs at least `"5s"`. |
+| `keep_alive` | All modes | `"30s"` | Sets the MQTT ping interval. MQTT 3.1.1 accepts `"0s"` or at least `"1s"`. MQTT 5 needs at least `"5s"`. The maximum is `"65535s"`. |
 | `request_capacity` | All modes | `32` | Limits queued MQTT client requests. Set a value greater than zero. |
-| `publish_timeout` | All modes | `"30s"` | Limits the wait for broker connection and publication acknowledgments. |
-| `shutdown_timeout` | All modes | `"30s"` | Limits the wait while the connector finishes publications during shutdown. |
-| `max_retries` | All modes | `5` | Limits retries after connection or uncertain publication failures. |
+| `publish_timeout` | All modes | `"30s"` | Limits the wait for broker connection and publication acknowledgments. The maximum value is `"1h"`. |
+| `shutdown_timeout` | All modes | `"30s"` | Limits how long `close()` waits for active `consume()` work and MQTT disconnect cleanup. It does not cancel active publication or reconnect work. |
+| `max_retries` | All modes | `5` | Sets the number of retries after the initial connection attempt. Each publish window also gets this many retries after its initial uncertain publication attempt. |
 | `retry_delay` | All modes | `"1s"` | Sets the first retry delay. |
 | `max_retry_delay` | All modes | `"30s"` | Limits the retry delay. |
-| `max_in_flight` | All modes | `1` | Limits publications that wait for acknowledgment. It must not exceed `request_capacity`. |
+| `max_in_flight` | All modes | `10` | Limits publications that wait for acknowledgment. It must be greater than zero and must not exceed `request_capacity`. |
+| `max_packet_size` | All modes | `1048576` | Limits an encoded MQTT PUBLISH packet in bytes. Oversized records are logged and skipped. MQTT 5 also uses a lower limit sent by the broker. |
 | `verbose_logging` | All modes | `false` | Enables extra plugin log records. |
 | `tls.ca_file` | TLS brokers | None | Sets a PEM file that contains custom CA certificates. The system trust store is used when it is omitted. |
 | `tls.client_cert_file` | Mutual TLS | None | Sets the PEM client certificate for mutual TLS. Set `tls.client_key_file` with this field. |
@@ -217,7 +238,8 @@ Dynamic mode accepts this MQTT 5 envelope. The connector decodes
 Use `broker_url` only for the broker address. Set `client_id`, `keep_alive`,
 `clean_start`, and `max_in_flight` as separate fields. The connector rejects
 the URL options `client_id`, `keep_alive_secs`, `clean_session`, and
-`inflight_num`.
+`inflight_num`, `max_incoming_packet_size_bytes`, and
+`max_outgoing_packet_size_bytes`.
 
 ## TLS and Multiple Routes
 
@@ -272,15 +294,18 @@ acknowledgement arrives.
 
 For QoS 0, the sink confirms the publication after it queues the request. For
 QoS 1, it waits for `PUBACK`. For QoS 2, it waits for `PUBCOMP`. When an
-outcome is uncertain, the sink drops the event loop and retries only
-unconfirmed publications. This favors duplicates over loss.
+outcome is uncertain, the sink cleans and reconnects. If the broker resumes
+the session, rumqttc retransmits unconfirmed requests. If the broker resets
+the session, the sink recreates its driver and requeues unconfirmed
+publications. Both paths can duplicate uncertain publications while retries
+remain.
 
 Iggy offset durability depends on the connectors runtime. The current runtime
 commits offsets when it polls messages, before MQTT publication completes.
-The MQTT sink provides QoS-aware broker delivery and retries unconfirmed QoS 1
-and QoS 2 publications, but the current runtime does not provide end-to-end
-at-least-once delivery because it commits the Iggy offset before publication
-completes.
+The sink therefore provides at-most-once delivery from Iggy after a terminal
+failure. If retries end or the broker returns a non-retryable rejection, Iggy
+does not deliver the batch to this sink again. QoS 1 and QoS 2 acknowledge
+broker delivery, but they do not provide end-to-end at-least-once delivery.
 
 ---
 
@@ -289,10 +314,16 @@ completes.
 | Failure Scenario | Current Behavior | Result |
 | :--- | :--- | :--- |
 | Invalid configuration | Validation fails before connection | The connector reports an invalid configuration error. |
-| Malformed record envelope | The connector logs the record and rejects the batch. | The runtime records an error and keeps the sink running. |
-| Transient connection failure | The connection is discarded and retried | Unconfirmed publications can be duplicated. |
-| Publication timeout | The connection is treated as uncertain | Unconfirmed publications are retried. |
-| MQTT 5 broker rejection | The plugin returns a non-retryable publication error. | The runtime records an error and keeps the sink running. |
+| MQTT 5 broker capability mismatch | Connection initialization rejects a configured QoS or retained publication mode that the broker does not support. | The connector does not publish records or retry the mismatch. |
+| QoS 0 publication | The sink confirms after it queues the local request. | A connection failure before broker delivery can lose the record. |
+| Malformed record envelope | The connector logs and skips the malformed record. | The skipped record is lost from this sink. Valid records in the batch are published. |
+| Oversized MQTT record | The connector logs and skips a record that exceeds `max_packet_size` or the broker MQTT 5 limit. | The skipped record is lost from this sink. Valid records in the batch are published. |
+| Expired MQTT 5 envelope | The connector logs and skips the expired record. | The skipped record is lost from this sink. Other valid records in the batch are published. |
+| Invalid dynamic topic | The connector logs and skips the record when the resolved topic begins with `$` or contains `+` or `#`. | The skipped record is lost from this sink. Other valid records in the batch are published. |
+| Raw MQTT 5 envelope | The sink treats the JSON envelope as ordinary bytes. | The broker receives the envelope JSON, not the original MQTT payload. |
+| Transient connection failure | The event loop reconnects. rumqttc retransmits after session resumption. The sink recreates its driver and requeues after a session reset. | Uncertain publications can duplicate while retries remain. |
+| Publication timeout or exhausted retries | The connector cleans and reconnects. It retransmits after session resumption or requeues after a session reset, up to `max_retries`. | After retries end, unconfirmed records are lost from this sink because Iggy already committed the offset. |
+| MQTT 5 non-retryable broker rejection | The connector returns the rejection without retrying. | Unconfirmed records are lost from this sink because Iggy already committed the offset. |
 | Authentication failure | Connection initialization fails | The sink does not publish records. |
 | Shutdown timeout | The sink reports unfinished publications | It returns an error after the timeout. |
 
@@ -300,9 +331,10 @@ completes.
 
 ## Operational Notes
 
-1. **Duplicate tolerance**: QoS 1 and QoS 2 retries can publish duplicates. Downstream consumers must use idempotent processing when duplicates are unacceptable.
+1. **Duplicate tolerance and order**: QoS 1 and QoS 2 retries can publish duplicates. When a publication is uncertain, the sink replays it and later publications in the same window. This preserves order within one Iggy partition and MQTT topic. It does not preserve global order across partitions or topics.
 2. **Credential separation**: Put `username` and `password` in separate fields. The connector rejects credentials embedded in `broker_url`.
-3. **Client identity**: Use a stable, unique `client_id` when `clean_start = false` so the broker can resume the MQTT session.
-4. **Malformed records**: The connector logs malformed records and rejects their batch. It does not provide a dead-letter queue.
-5. **Deferred broker limits**: The current driver does not retain broker-negotiated topic-alias or maximum-packet-size limits.
-6. **Broker rejection classification**: The SDK has no broker-rejection error. The plugin uses `CannotStoreData` with an internal non-retryable flag. The runtime records the error and continues.
+3. **Client identity**: For `clean_start = false`, set a stable, unique `client_id` so the broker can resume the MQTT session. For `clean_start = true`, omit `client_id` to generate a unique client ID for this sink instance.
+4. **Idle connections**: The MQTT task continues polling between batches. It sends keep-alive pings and reads their responses without waiting for another Iggy batch.
+5. **Invalid records**: The connector logs and skips malformed or oversized records. It does not provide a dead-letter queue.
+6. **Broker limits**: MQTT 5 uses the lower of `max_packet_size` and the maximum packet size sent by the broker. The sink removes envelope topic aliases because they are connection-local.
+7. **Broker rejection classification**: The SDK has no broker-rejection error. The plugin uses `CannotStoreData` with an internal non-retryable flag. The runtime records the error and continues.
