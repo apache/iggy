@@ -3042,16 +3042,43 @@ const fn next_repair_peer(self_id: u8, failed_peer: u8, replica_count: u8) -> u8
     }
 }
 
+/// The replica to re-arm journal repair from after `failed_peer` spent its
+/// stall budget, forgetting `failed_peer` as the primary this replica heard.
+///
+/// Steps around the ring ([`next_repair_peer`]) unless the primary hint is new
+/// to the walk: forgetting the quiet peer moved it, or it names a primary the
+/// group moved to after this replica's log view. Returning to the log view's
+/// primary after each backup alternates between two peers.
+fn next_stalled_repair_peer<B, P>(consensus: &VsrConsensus<B, P>, failed_peer: u8) -> u8
+where
+    B: MessageBus,
+    P: Pipeline<Entry = consensus::PipelineEntry>,
+{
+    let failed_was_hint = consensus.primary_hint() == Some(failed_peer);
+    consensus.forget_primary(failed_peer);
+    let self_id = consensus.replica();
+    let log_view_primary = consensus.primary_index(consensus.log_view());
+    consensus
+        .primary_hint()
+        .filter(|&primary| {
+            primary != failed_peer
+                && primary != self_id
+                && (failed_was_hint || primary != log_view_primary)
+        })
+        .unwrap_or_else(|| next_repair_peer(self_id, failed_peer, consensus.replica_count()))
+}
+
 /// The primary to transfer from once journal repair stalled on the whole
 /// ring, or `None` while the spent session rotates as before.
 ///
 /// Called when a session spent its stall budget. The ring is spent once the
 /// rotations since the last progress, with this session, reach the number of
-/// other replicas. Only a rotation that opened a session counts. Each rotation
-/// steps one replica around the ring ([`next_repair_peer`]), so a lap from the
-/// primary asks every other replica once. That still counts sessions, not
-/// peers: when a rotation cannot open its session, the detector re-arms against
-/// the primary and the walk starts over without restarting the count.
+/// other replicas. Only a rotation that opened a session counts. While the
+/// primary hint holds still, each rotation steps one replica around the ring
+/// ([`next_stalled_repair_peer`]), so a lap from the primary asks every other
+/// replica once. That still counts sessions, not peers: when a rotation cannot
+/// open its session, the detector re-arms against the primary and the walk
+/// starts over without restarting the count.
 ///
 /// Only the primary serves a partition transfer, so only a backup in `Normal`
 /// that misses committed ops converts: a primary-elect repairs toward its
@@ -6691,7 +6718,7 @@ where
     ///
     /// Two rings, because two things decide who can serve. A `Normal` backup is
     /// repairing its committed tail and any replica ahead of it will do, so it
-    /// walks the whole cluster ring ([`next_repair_peer`]). A primary-elect is
+    /// walks the whole cluster ring ([`next_stalled_repair_peer`]). A primary-elect is
     /// repairing toward a merged log, and only the `DoViewChange` senders that
     /// named the op can serve it: walking the whole ring lands on a replica that
     /// answers `RangeEvicted` for a range it never held.
@@ -6745,8 +6772,7 @@ where
             return;
         }
 
-        consensus.forget_primary(peer);
-        let next_peer = next_repair_peer(consensus.replica(), peer, consensus.replica_count());
+        let next_peer = next_stalled_repair_peer(consensus, peer);
         if next_peer == peer {
             // The ring had nobody else to offer (a solo group, or a two-replica
             // cluster whose only peer went quiet). Dropping the session is still
@@ -8530,10 +8556,7 @@ where
                     let Some(partition) = partitions.get_mut_by_ns(&namespace) else {
                         continue;
                     };
-                    let consensus = partition.consensus();
-                    consensus.forget_primary(peer);
-                    let next_peer =
-                        next_repair_peer(consensus.replica(), peer, consensus.replica_count());
+                    let next_peer = next_stalled_repair_peer(partition.consensus(), peer);
                     tracing::warn!(
                         shard = self.id,
                         namespace_raw = namespace.inner(),
