@@ -38,7 +38,7 @@ See [Maven Central](https://central.sonatype.com/artifact/org.apache.iggy/iggy) 
 
 ### Snapshot Versions
 
-Development builds of the next release carry the version `0.9.2-SNAPSHOT`. Get them from the ASF snapshot repository:
+Development builds of the next release carry the version `0.9.3-SNAPSHOT`. Get them from the ASF snapshot repository:
 
 **Gradle:**
 
@@ -51,7 +51,7 @@ repositories {
 }
 
 dependencies {
-    implementation 'org.apache.iggy:iggy:0.9.2-SNAPSHOT'
+    implementation 'org.apache.iggy:iggy:0.9.3-SNAPSHOT'
 }
 ```
 
@@ -72,7 +72,7 @@ dependencies {
     <dependency>
         <groupId>org.apache.iggy</groupId>
         <artifactId>iggy</artifactId>
-        <version>0.9.2-SNAPSHOT</version>
+        <version>0.9.3-SNAPSHOT</version>
     </dependency>
 </dependencies>
 ```
@@ -343,6 +343,70 @@ client.system().describeOptions(OptionsScope.Topic);  // keys, kinds, defaults a
 The stream key is 32 random bytes. It travels inside the create request over the client's transport, so protecting it on the network is the job of TLS. The server stores it wrapped under its own key and never returns it, reads report only its source and fingerprints. Without a key, a server with encryption enabled generates one for the stream.
 
 The typed builders refuse an update the server would refuse for its shape before anything is sent, with the server's error code. `raw(key, value)` and `rawReset(key)` reach keys this build has no field for, and the server decides whether they are allowed.
+
+### Metadata Changes
+
+`getMetadataChanges` reads the node's change log: one record per public result of a committed metadata operation, such as a stream created, a topic renamed, a user's permissions changed or a session closed. A mirror keeps a cursor, asks for the records after it, and stores the returned `next` cursor. The call needs root or the global `manageServers` permission and works on blocking TCP, async TCP and HTTP.
+
+```java
+import org.apache.iggy.system.MetadataChangeGroup;
+import org.apache.iggy.system.MetadataChangeStart;
+import org.apache.iggy.system.MetadataChanges;
+import org.apache.iggy.system.MetadataChangesQuery;
+
+var query = MetadataChangesQuery.builder()
+    .groups(MetadataChangeGroup.STREAMS, MetadataChangeGroup.TOPICS)
+    .build();
+while (true) {
+    MetadataChanges page = client.system().getMetadataChanges(query);
+    switch (page.status()) {
+        case OK -> {
+            page.records().forEach(record ->
+                System.out.println("op " + record.op() + " by " + record.actorUserId() + ": " + record.kind()));
+            if (page.next().isPresent()) {
+                query = query.withStart(MetadataChangeStart.after(page.next().get()));
+            }
+            if (!page.hasMore()) {
+                Thread.sleep(1000);
+            }
+        }
+        case BEHIND -> Thread.sleep(100);
+        default -> query = query.withStart(rebuild(client, query.groups()));
+    }
+}
+
+// Pages the current state, then returns the position to follow from.
+static MetadataChangeStart rebuild(IggyBaseClient client, List<MetadataChangeGroup> groups)
+        throws InterruptedException {
+    var query = MetadataChangesQuery.builder()
+        .start(MetadataChangeStart.current())
+        .groups(groups)
+        .build();
+    while (true) {
+        MetadataChanges page = client.system().getMetadataChanges(query);
+        switch (page.status()) {
+            case OK -> {
+                page.items().forEach(item -> System.out.println(item.group() + ": " + item.body()));
+                if (page.currentPageToken().isPresent()) {
+                    query = query.withStart(MetadataChangeStart.current(page.currentPageToken().get()));
+                } else if (page.next().isPresent()) {
+                    return MetadataChangeStart.after(page.next().get());
+                } else {
+                    query = query.withStart(MetadataChangeStart.current());
+                }
+            }
+            case BEHIND -> Thread.sleep(100);
+            default -> query = query.withStart(MetadataChangeStart.current());
+        }
+    }
+}
+```
+
+`EXPIRED` means the log no longer holds the history after the cursor, and `RESET` means the cursor belongs to another history, for example after the data directory was rebuilt. Either way the mirror rebuilds from current state pages and then follows the changes after the anchor they return.
+
+Current pages need the parent groups of every selected group, for example `TOPICS` with `STREAMS`. Keep a rebuilt state private until a change page answers `OK` with `hasMore()` false and a `headOp()` at or above the last current page's.
+
+A cursor's `toString()` is its `mc1_` text, which `MetadataChangeCursor.parse` reads back, so a mirror can store it. A query the rules refuse fails with an `IggyValidationException` for invalid command before anything is sent, and a record of a kind this SDK does not know arrives as `MetadataChangeBody.Unknown` or `MetadataChangeBody.UnknownJson`.
 
 ## Exception Handling
 

@@ -520,6 +520,12 @@ std::vector<OptionSpec> IggyBlockingClient::DescribeOptions(OptionsScope scope) 
     });
 }
 
+MetadataChanges IggyBlockingClient::GetMetadataChanges(const MetadataChangesQuery &query) {
+    return RethrowAsIggyException([this, &query](ffi::ErrorInfo &error_info) {
+        return MetadataChanges::FromFfi(Handle()->get_metadata_changes(query.ToFfi(), error_info));
+    });
+}
+
 Stats IggyBlockingClient::GetStats() {
     return RethrowAsIggyException([this] { return Stats::FromFfi(Handle()->get_stats()); });
 }
@@ -563,6 +569,73 @@ std::string EncryptionKeyFingerprint(const std::string &key_base64) {
         const auto fingerprint =
             ffi::encryption_key_fingerprint_base64(rust::Str(key_base64.data(), key_base64.size()), error_info);
         return std::string(fingerprint.data(), fingerprint.size());
+    } catch (const std::exception &error) {
+        throw IggyException(error.what(), error_info);
+    }
+}
+
+MetadataChangeCursor MetadataChangeCursor::Parse(const std::string &text) {
+    ffi::ErrorInfo error_info{};
+    try {
+        return FromFfi(ffi::parse_metadata_change_cursor(rust::Str(text.data(), text.size()), error_info));
+    } catch (const std::exception &error) {
+        throw IggyException(error.what(), error_info);
+    }
+}
+
+MetadataCurrentPageToken MetadataCurrentPageToken::Parse(const std::string &text) {
+    ffi::ErrorInfo error_info{};
+    try {
+        return FromFfi(ffi::parse_metadata_current_page_token(rust::Str(text.data(), text.size()), error_info));
+    } catch (const std::exception &error) {
+        throw IggyException(error.what(), error_info);
+    }
+}
+
+void MetadataChangesQuery::Validate() const {
+    ffi::ErrorInfo error_info{};
+    try {
+        ffi::validate_metadata_changes_query(ToFfi(), error_info);
+    } catch (const std::exception &error) {
+        throw IggyException(error.what(), error_info);
+    }
+}
+
+std::vector<std::uint8_t> MetadataChangesQuery::ToBytes() const {
+    ffi::ErrorInfo error_info{};
+    try {
+        const auto bytes = ffi::encode_metadata_changes_query(ToFfi(), error_info);
+        return std::vector<std::uint8_t>(bytes.begin(), bytes.end());
+    } catch (const std::exception &error) {
+        throw IggyException(error.what(), error_info);
+    }
+}
+
+MetadataChanges MetadataChanges::FromBytes(const std::vector<std::uint8_t> &payload) {
+    ffi::ErrorInfo error_info{};
+    try {
+        return FromFfi(
+            ffi::decode_metadata_changes(rust::Slice<const std::uint8_t>(payload.data(), payload.size()), error_info));
+    } catch (const std::exception &error) {
+        throw IggyException(error.what(), error_info);
+    }
+}
+
+MetadataChangeRecord MetadataChangeRecord::FromBytes(const std::vector<std::uint8_t> &bytes) {
+    ffi::ErrorInfo error_info{};
+    try {
+        return FromFfi(ffi::decode_metadata_change_record(rust::Slice<const std::uint8_t>(bytes.data(), bytes.size()),
+                                                          error_info));
+    } catch (const std::exception &error) {
+        throw IggyException(error.what(), error_info);
+    }
+}
+
+MetadataCurrentItem MetadataCurrentItem::FromBytes(const std::vector<std::uint8_t> &bytes) {
+    ffi::ErrorInfo error_info{};
+    try {
+        return FromFfi(
+            ffi::decode_metadata_current_item(rust::Slice<const std::uint8_t>(bytes.data(), bytes.size()), error_info));
     } catch (const std::exception &error) {
         throw IggyException(error.what(), error_info);
     }

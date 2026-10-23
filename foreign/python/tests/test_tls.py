@@ -40,10 +40,22 @@ import pytest
 from testcontainers.core.container import DockerContainer
 from testcontainers.core.waiting_utils import wait_for_logs
 
-from apache_iggy import Consumer, IggyClient, PollingStrategy
+from apache_iggy import (
+    Consumer,
+    IggyClient,
+    MetadataChangeGroup,
+    MetadataChangeKind,
+    PollingStrategy,
+)
 from apache_iggy import SendMessage as Message
 
-from .utils import wait_for_ping, wait_for_server
+from .utils import (
+    follow_stream_changes,
+    latest_metadata_cursor,
+    stream_records,
+    wait_for_ping,
+    wait_for_server,
+)
 
 # Paths resolved relative to this file → repo root
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
@@ -156,6 +168,22 @@ class TestTlsConnectivity:
         for i, expected_msg in enumerate(test_messages):
             if i < len(polled):
                 assert polled[i].payload().decode("utf-8") == expected_msg
+
+    @pytest.mark.asyncio
+    async def test_follow_metadata_changes_over_tls(
+        self, tls_client: IggyClient, unique_name
+    ):
+        """Test following the metadata change log over TLS."""
+        streams = [MetadataChangeGroup.Streams]
+        cursor = await latest_metadata_cursor(tls_client, streams)
+
+        stream = await tls_client.create_stream(unique_name())
+
+        followed = await follow_stream_changes(
+            tls_client, cursor, streams, stream.id, 1
+        )
+        records = stream_records(followed, stream.id)
+        assert [record.kind for record in records] == [MetadataChangeKind.StreamCreated]
 
 
 @pytest.mark.integration

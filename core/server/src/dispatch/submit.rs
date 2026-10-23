@@ -132,6 +132,14 @@ pub(in crate::dispatch) fn handle_metadata_submit<B, MJ, S, SB>(
                     .bind_session(vsr_client_id, session, secret.expose_secret());
                 let _ = reply.try_send(attached);
             }
+            shard::MetadataSubmit::MetadataCurrentState {
+                query,
+                user_id,
+                reply,
+            } => {
+                let page = super::metadata_changes::current_state_page(&shard, &query, user_id);
+                let _ = reply.try_send(page);
+            }
             shard::MetadataSubmit::Register {
                 vsr_client_id,
                 user_id,

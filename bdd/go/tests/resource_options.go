@@ -563,21 +563,25 @@ func initResourceOptionsScenario(sc *godog.ScenarioContext) {
 	sc.Step(`^I update the user username to "([^"]+)" and status to "([^"]+)"$`, s.whenUpdateUser)
 	sc.Step(`^the user should have username "([^"]+)"$`, s.thenUserUsername)
 	sc.Step(`^the user should have status "([^"]+)"$`, s.thenUserStatus)
-	sc.After(func(ctx context.Context, _ *godog.Scenario, scenarioError error) (context.Context, error) {
-		state := getResourceOptionsCtx(ctx)
-		if state.client == nil {
-			return ctx, scenarioError
-		}
-		for _, id := range state.createdStreams {
-			streamId, err := iggcon.NewIdentifier(id)
-			scenarioError = errors.Join(scenarioError, err, state.client.DeleteStream(ctx, streamId))
-		}
-		for _, id := range state.createdUsers {
-			userId, err := iggcon.NewIdentifier(id)
-			scenarioError = errors.Join(scenarioError, err, state.client.DeleteUser(ctx, userId))
-		}
-		return ctx, errors.Join(scenarioError, state.client.Close())
-	})
+	sc.After(resourceOptionsCleanup)
+}
+
+// resourceOptionsCleanup deletes the streams and users a scenario created and
+// closes its client.
+func resourceOptionsCleanup(ctx context.Context, _ *godog.Scenario, scenarioError error) (context.Context, error) {
+	state := getResourceOptionsCtx(ctx)
+	if state.client == nil {
+		return ctx, scenarioError
+	}
+	for _, id := range state.createdStreams {
+		streamId, err := iggcon.NewIdentifier(id)
+		scenarioError = errors.Join(scenarioError, err, state.client.DeleteStream(ctx, streamId))
+	}
+	for _, id := range state.createdUsers {
+		userId, err := iggcon.NewIdentifier(id)
+		scenarioError = errors.Join(scenarioError, err, state.client.DeleteUser(ctx, userId))
+	}
+	return ctx, errors.Join(scenarioError, state.client.Close())
 }
 
 func streamIdentifier(state *resourceOptionsCtx) iggcon.Identifier {

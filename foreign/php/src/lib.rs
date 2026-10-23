@@ -21,6 +21,7 @@ pub mod durability;
 pub mod error;
 pub mod identifier;
 pub mod message_iterator;
+pub mod metadata_changes;
 pub mod options;
 pub mod receive_message;
 pub mod runtime;
@@ -38,6 +39,18 @@ use crate::error::{
     PendingOperationException, TransientException,
 };
 use crate::message_iterator::MessageIterator;
+use crate::metadata_changes::{
+    MetadataChangeCursor, MetadataChangeGroup, MetadataChangeKind, MetadataChangePhase,
+    MetadataChangeRecord, MetadataChangeStart, MetadataChangeStatus, MetadataChanges,
+    MetadataConsumerGroupCreated, MetadataConsumerGroupDeleted, MetadataConsumerGroupItem,
+    MetadataCurrentItem, MetadataCurrentPageToken, MetadataMemberItem, MetadataMemberJoined,
+    MetadataMemberLeft, MetadataMemberLeftReason, MetadataPartitionHandedOver,
+    MetadataPartitionsChanged, MetadataPartitionsItem, MetadataPermissionsUpdatedReason,
+    MetadataSession, MetadataSessionClosed, MetadataSessionClosedReason, MetadataStreamChange,
+    MetadataStreamDeleted, MetadataTokenChange, MetadataTokenDeleted, MetadataTokenDeletedReason,
+    MetadataTopicChange, MetadataTopicDeleted, MetadataTopicItem, MetadataUnknownChange,
+    MetadataUnknownItem, MetadataUserChange, MetadataUserIdentity, MetadataUserPermissionsUpdated,
+};
 use crate::options::{OptionSpec, OptionsScope, StreamOptionKey, TopicOptionKey};
 use crate::receive_message::{ConsumerPosition, PartitionContext, PollingStrategy, ReceiveMessage};
 use crate::send_message::{SendMessage, SendMessagesConfirmation, SendMessagesResponse};
@@ -52,6 +65,14 @@ pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
         .enumeration::<StreamOptionKey>()
         .enumeration::<TopicOptionKey>()
         .enumeration::<OptionsScope>()
+        .enumeration::<MetadataChangeGroup>()
+        .enumeration::<MetadataChangeKind>()
+        .enumeration::<MetadataChangeStatus>()
+        .enumeration::<MetadataChangePhase>()
+        .enumeration::<MetadataMemberLeftReason>()
+        .enumeration::<MetadataTokenDeletedReason>()
+        .enumeration::<MetadataSessionClosedReason>()
+        .enumeration::<MetadataPermissionsUpdatedReason>()
         // Parent classes must be registered before subclasses because ext-php-rs resolves
         // the parent ClassEntry during child registration.
         .class::<IggyException>()
@@ -76,4 +97,33 @@ pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
         .class::<StreamDetails>()
         .class::<TopicDetails>()
         .class::<OptionSpec>()
+        .class::<MetadataChanges>()
+        .class::<MetadataChangeRecord>()
+        .class::<MetadataCurrentItem>()
+        .class::<MetadataChangeCursor>()
+        .class::<MetadataCurrentPageToken>()
+        .class::<MetadataChangeStart>()
+        .class::<MetadataStreamChange>()
+        .class::<MetadataStreamDeleted>()
+        .class::<MetadataTopicChange>()
+        .class::<MetadataTopicItem>()
+        .class::<MetadataTopicDeleted>()
+        .class::<MetadataPartitionsChanged>()
+        .class::<MetadataPartitionsItem>()
+        .class::<MetadataConsumerGroupCreated>()
+        .class::<MetadataConsumerGroupDeleted>()
+        .class::<MetadataConsumerGroupItem>()
+        .class::<MetadataMemberJoined>()
+        .class::<MetadataMemberLeft>()
+        .class::<MetadataPartitionHandedOver>()
+        .class::<MetadataMemberItem>()
+        .class::<MetadataUserChange>()
+        .class::<MetadataUserIdentity>()
+        .class::<MetadataUserPermissionsUpdated>()
+        .class::<MetadataTokenChange>()
+        .class::<MetadataTokenDeleted>()
+        .class::<MetadataSession>()
+        .class::<MetadataSessionClosed>()
+        .class::<MetadataUnknownChange>()
+        .class::<MetadataUnknownItem>()
 }

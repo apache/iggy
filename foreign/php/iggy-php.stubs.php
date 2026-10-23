@@ -218,6 +218,25 @@ namespace Iggy {
         public static function fromConnectionString(string $connection_string): \Iggy\Client {}
 
         /**
+         * Reads one page of the metadata change log, or of the current state.
+         *
+         * Needs root or the global `manage_servers` permission. `groups` takes
+         * `Iggy\MetadataChangeGroup` cases, empty for every group, and a current state scan
+         * needs the parent groups of each group. `since` and `until` are microseconds as an int
+         * or a decimal string, and only apply to `earliest` and `after`. `limit` is 1 to 1000,
+         * 100 when null. A query the server would refuse throws `Invalid command` (code 3)
+         * before anything is sent.
+         *
+         * @param \Iggy\MetadataChangeStart $start
+         * @param array $groups
+         * @param mixed $since
+         * @param mixed $until
+         * @param mixed $limit
+         * @return \Iggy\MetadataChanges
+         */
+        public function getMetadataChanges(\Iggy\MetadataChangeStart $start, array $groups = [], mixed $since = null, mixed $until = null, mixed $limit = null): \Iggy\MetadataChanges {}
+
+        /**
          * Gets a stream by id or name.
          *
          * @param mixed $stream_id
@@ -543,6 +562,1416 @@ namespace Iggy {
          * @return bool
          */
         public function valid(): bool {}
+    }
+
+    /**
+     * Position of the last change record a reader consumed or scanned. Send it back in
+     * `MetadataChangeStart::after()` to read the records after it.
+     *
+     * Casting it to string gives its `mc1_` text, which `parse()` reads back.
+     */
+    class MetadataChangeCursor {
+        /**
+         * Builds a cursor from its fields: 128-bit values as decimal strings, `op` as an int or
+         * a decimal string.
+         *
+         * @param string $log_id
+         * @param mixed $op
+         * @param string $checksum
+         * @param int $ordinal
+         */
+        public function __construct(string $log_id, mixed $op, string $checksum, int $ordinal) {}
+
+        /**
+         * @return string
+         */
+        public function __toString(): string {}
+
+        /**
+         * Prepare checksum of `op` as a decimal string.
+         *
+         * @return string
+         */
+        public function checksum(): string {}
+
+        /**
+         * Prepare checksum of op 1 as a decimal string, which names the history the cursor
+         * belongs to.
+         *
+         * @return string
+         */
+        public function logId(): string {}
+
+        /**
+         * The operation of the last record, 0 before the first record.
+         *
+         * @return mixed
+         */
+        public function op(): mixed {}
+
+        /**
+         * Position of the record within `op`.
+         *
+         * @return int
+         */
+        public function ordinal(): int {}
+
+        /**
+         * Reads a cursor from its `mc1_` text. Anything else throws `Invalid command` (code 3).
+         *
+         * @param string $text
+         * @return \Iggy\MetadataChangeCursor
+         */
+        public static function parse(string $text): \Iggy\MetadataChangeCursor {}
+    }
+
+    /**
+     * Family of change records and the unit of filtering. Values are the HTTP API names.
+     */
+    enum MetadataChangeGroup: string {
+      case Streams = 'streams';
+      case Topics = 'topics';
+      case Partitions = 'partitions';
+      case ConsumerGroups = 'consumer_groups';
+      case ConsumerGroupMembers = 'consumer_group_members';
+      case Users = 'users';
+      case PersonalAccessTokens = 'personal_access_tokens';
+      case Sessions = 'sessions';
+    }
+
+    /**
+     * Kind of a change record. Values are the HTTP API names.
+     */
+    enum MetadataChangeKind: string {
+      case StreamCreated = 'stream_created';
+      case StreamUpdated = 'stream_updated';
+      case StreamDeleted = 'stream_deleted';
+      case TopicCreated = 'topic_created';
+      case TopicUpdated = 'topic_updated';
+      case TopicDeleted = 'topic_deleted';
+      case PartitionsChanged = 'partitions_changed';
+      case ConsumerGroupCreated = 'consumer_group_created';
+      case ConsumerGroupDeleted = 'consumer_group_deleted';
+      case ConsumerGroupMemberJoined = 'consumer_group_member_joined';
+      case ConsumerGroupMemberLeft = 'consumer_group_member_left';
+      case ConsumerGroupPartitionHandedOver = 'consumer_group_partition_handed_over';
+      case UserCreated = 'user_created';
+      case UserUpdated = 'user_updated';
+      case UserDeleted = 'user_deleted';
+      case UserPasswordChanged = 'user_password_changed';
+      case UserPermissionsUpdated = 'user_permissions_updated';
+      case PersonalAccessTokenCreated = 'personal_access_token_created';
+      case PersonalAccessTokenDeleted = 'personal_access_token_deleted';
+      case SessionRegistered = 'session_registered';
+      case SessionClosed = 'session_closed';
+    }
+
+    /**
+     * Whether a page carries change records or current state items.
+     */
+    enum MetadataChangePhase: string {
+      case Changes = 'changes';
+      case Current = 'current';
+    }
+
+    /**
+     * One change record: the committed operation that produced it, its position within that
+     * operation and the typed body of what is true after it.
+     */
+    class MetadataChangeRecord {
+        public function __construct() {}
+
+        /**
+         * The acting user, null for server actions.
+         *
+         * @return int|null
+         */
+        public function actorUserId(): ?int {}
+
+        /**
+         * The typed body `kind` names, for example a `MetadataStreamChange` for
+         * `StreamCreated` and `StreamUpdated`, or a `MetadataUnknownChange`.
+         *
+         * @return mixed
+         */
+        public function change(): mixed {}
+
+        /**
+         * Prepare checksum of `op` as a decimal string.
+         *
+         * @return string
+         */
+        public function checksum(): string {}
+
+        /**
+         * The group, null for a record this build does not know.
+         *
+         * @return \Iggy\MetadataChangeGroup|null
+         */
+        public function group(): ?\Iggy\MetadataChangeGroup {}
+
+        /**
+         * The kind, null for a record this build does not know.
+         *
+         * @return \Iggy\MetadataChangeKind|null
+         */
+        public function kind(): ?\Iggy\MetadataChangeKind {}
+
+        /**
+         * The metadata operation that produced the record.
+         *
+         * @return mixed
+         */
+        public function op(): mixed {}
+
+        /**
+         * Position of the record within `op`.
+         *
+         * @return int
+         */
+        public function ordinal(): int {}
+
+        /**
+         * Prepare timestamp of `op` in microseconds.
+         *
+         * @return mixed
+         */
+        public function timestamp(): mixed {}
+    }
+
+    /**
+     * Where `Client::getMetadataChanges()` starts reading.
+     */
+    class MetadataChangeStart {
+        public function __construct() {}
+
+        /**
+         * The records after `cursor`.
+         *
+         * @param \Iggy\MetadataChangeCursor $cursor
+         * @return \Iggy\MetadataChangeStart
+         */
+        public static function after(\Iggy\MetadataChangeCursor $cursor): \Iggy\MetadataChangeStart {}
+
+        /**
+         * Current state pages: null starts a scan, a token continues it.
+         *
+         * @param \Iggy\MetadataCurrentPageToken|null $page_token
+         * @return \Iggy\MetadataChangeStart
+         */
+        public static function current(?\Iggy\MetadataCurrentPageToken $page_token = null): \Iggy\MetadataChangeStart {}
+
+        /**
+         * The oldest operation the requested groups still hold completely.
+         *
+         * @return \Iggy\MetadataChangeStart
+         */
+        public static function earliest(): \Iggy\MetadataChangeStart {}
+
+        /**
+         * No records, only a cursor at the newest retained record.
+         *
+         * @return \Iggy\MetadataChangeStart
+         */
+        public static function latest(): \Iggy\MetadataChangeStart {}
+    }
+
+    /**
+     * Outcome of a change log query.
+     *
+     * `Ok`: apply the records and keep `next`. `Behind`: the node has not applied the position
+     * yet, ask again later or ask another node. `Expired` and `Reset`: rebuild from current state.
+     */
+    enum MetadataChangeStatus: string {
+      case Ok = 'ok';
+      case Behind = 'behind';
+      case Expired = 'expired';
+      case Reset = 'reset';
+    }
+
+    /**
+     * One page of the metadata change log, or of the current state, as
+     * `Client::getMetadataChanges()` returns it.
+     *
+     * Unsigned 64-bit values are ints, or decimal strings above `PHP_INT_MAX`. 128-bit values
+     * (log ids, checksums, client ids) are decimal strings.
+     */
+    class MetadataChanges {
+        public function __construct() {}
+
+        /**
+         * Continuation of a current state scan, null once it is complete.
+         *
+         * @return \Iggy\MetadataCurrentPageToken|null
+         */
+        public function currentPageToken(): ?\Iggy\MetadataCurrentPageToken {}
+
+        /**
+         * Decodes the response payload of the raw `metadata.changes` command (code 17), as
+         * `Client::sendBinaryRequest()` returns it.
+         *
+         * @param string $payload
+         * @return \Iggy\MetadataChanges
+         */
+        public static function decode(string $payload): \Iggy\MetadataChanges {}
+
+        /**
+         * Reads the JSON body `GET /metadata/changes` returns.
+         *
+         * @param string $json
+         * @return \Iggy\MetadataChanges
+         */
+        public static function fromJson(string $json): \Iggy\MetadataChanges {}
+
+        /**
+         * More entries remain after `next`, or another state page exists.
+         *
+         * @return bool
+         */
+        public function hasMore(): bool {}
+
+        /**
+         * Highest metadata operation the answering node applied.
+         *
+         * @return mixed
+         */
+        public function headOp(): mixed {}
+
+        /**
+         * Current state items, empty on change pages.
+         *
+         * @return array
+         */
+        public function items(): array {}
+
+        /**
+         * This node's log id as a decimal string, null before it applied op 1.
+         *
+         * @return string|null
+         */
+        public function logId(): ?string {}
+
+        /**
+         * The cursor to send back. Present on `Ok`, echoed on `Behind`, null on `Expired` and
+         * `Reset`. The last state page returns the anchor to follow from.
+         *
+         * @return \Iggy\MetadataChangeCursor|null
+         */
+        public function next(): ?\Iggy\MetadataChangeCursor {}
+
+        /**
+         * Lowest whole operation from which the requested groups are complete.
+         *
+         * @return mixed
+         */
+        public function oldestOp(): mixed {}
+
+        /**
+         * `Changes` for `earliest`, `latest` and `after`, `Current` for state pages.
+         *
+         * @return \Iggy\MetadataChangePhase
+         */
+        public function phase(): \Iggy\MetadataChangePhase {}
+
+        /**
+         * Change records in `(op, ordinal)` order, empty on state pages.
+         *
+         * @return array
+         */
+        public function records(): array {}
+
+        /**
+         * The requested groups are complete for every timestamp above this value in
+         * microseconds, 0 when nothing was evicted.
+         *
+         * @return mixed
+         */
+        public function retainedSince(): mixed {}
+
+        /**
+         * @return \Iggy\MetadataChangeStatus
+         */
+        public function status(): \Iggy\MetadataChangeStatus {}
+    }
+
+    /**
+     * A created consumer group with the topic's resulting group count.
+     */
+    class MetadataConsumerGroupCreated {
+        public function __construct() {}
+
+        /**
+         * The topic's consumer group count after the change.
+         *
+         * @return int
+         */
+        public function consumerGroupsCount(): int {}
+
+        /**
+         * @return int
+         */
+        public function groupId(): int {}
+
+        /**
+         * @return string
+         */
+        public function name(): string {}
+
+        /**
+         * @return mixed
+         */
+        public function streamCreatedOp(): mixed {}
+
+        /**
+         * @return int
+         */
+        public function streamId(): int {}
+
+        /**
+         * @return mixed
+         */
+        public function topicCreatedOp(): mixed {}
+
+        /**
+         * @return int
+         */
+        public function topicId(): int {}
+    }
+
+    /**
+     * A removed consumer group with the topic's resulting group count.
+     */
+    class MetadataConsumerGroupDeleted {
+        public function __construct() {}
+
+        /**
+         * The topic's consumer group count after the change.
+         *
+         * @return int
+         */
+        public function consumerGroupsCount(): int {}
+
+        /**
+         * @return int
+         */
+        public function groupId(): int {}
+
+        /**
+         * @return string
+         */
+        public function name(): string {}
+
+        /**
+         * The operation of the delete request when the delete completed later, else null.
+         *
+         * @return mixed
+         */
+        public function requestedOp(): mixed {}
+
+        /**
+         * @return mixed
+         */
+        public function streamCreatedOp(): mixed {}
+
+        /**
+         * @return int
+         */
+        public function streamId(): int {}
+
+        /**
+         * @return mixed
+         */
+        public function topicCreatedOp(): mixed {}
+
+        /**
+         * @return int
+         */
+        public function topicId(): int {}
+    }
+
+    /**
+     * A `consumer_groups` current state item.
+     */
+    class MetadataConsumerGroupItem {
+        public function __construct() {}
+
+        /**
+         * @return int
+         */
+        public function groupId(): int {}
+
+        /**
+         * @return string
+         */
+        public function name(): string {}
+
+        /**
+         * @return mixed
+         */
+        public function streamCreatedOp(): mixed {}
+
+        /**
+         * @return int
+         */
+        public function streamId(): int {}
+
+        /**
+         * @return mixed
+         */
+        public function topicCreatedOp(): mixed {}
+
+        /**
+         * @return int
+         */
+        public function topicId(): int {}
+    }
+
+    /**
+     * One current state item of a `MetadataChangeStart::current()` page.
+     */
+    class MetadataCurrentItem {
+        public function __construct() {}
+
+        /**
+         * The typed body `group` names, or a `MetadataUnknownItem`.
+         *
+         * @return mixed
+         */
+        public function body(): mixed {}
+
+        /**
+         * The group, null for an item this build does not know.
+         *
+         * @return \Iggy\MetadataChangeGroup|null
+         */
+        public function group(): ?\Iggy\MetadataChangeGroup {}
+    }
+
+    /**
+     * Opaque continuation of a current state scan. Send it back unchanged in
+     * `MetadataChangeStart::current()` with the same groups.
+     *
+     * Casting it to string gives its `cs1_` text, which `parse()` reads back.
+     */
+    class MetadataCurrentPageToken {
+        public function __construct() {}
+
+        /**
+         * @return string
+         */
+        public function __toString(): string {}
+
+        /**
+         * The cursor captured before the scan's first page.
+         *
+         * @return \Iggy\MetadataChangeCursor
+         */
+        public function anchor(): \Iggy\MetadataChangeCursor {}
+
+        /**
+         * The groups the scan was started with, in code order.
+         *
+         * @return array
+         */
+        public function groups(): array {}
+
+        /**
+         * The group of the last item returned.
+         *
+         * @return \Iggy\MetadataChangeGroup
+         */
+        public function lastGroup(): \Iggy\MetadataChangeGroup {}
+
+        /**
+         * The key of the last item returned, in the page token key layout.
+         *
+         * @return string
+         */
+        public function lastKey(): string {}
+
+        /**
+         * Reads a page token from its `cs1_` text. Anything else throws `Invalid command`
+         * (code 3).
+         *
+         * @param string $text
+         * @return \Iggy\MetadataCurrentPageToken
+         */
+        public static function parse(string $text): \Iggy\MetadataCurrentPageToken {}
+
+        /**
+         * The highest head any page of the scan reported so far.
+         *
+         * @return mixed
+         */
+        public function requiredHead(): mixed {}
+    }
+
+    /**
+     * A `consumer_group_members` current state item.
+     */
+    class MetadataMemberItem {
+        public function __construct() {}
+
+        /**
+         * The member's client id as a decimal string.
+         *
+         * @return string
+         */
+        public function clientId(): string {}
+
+        /**
+         * @return int
+         */
+        public function groupId(): int {}
+
+        /**
+         * @return int
+         */
+        public function memberId(): int {}
+
+        /**
+         * Installed partitions, ascending.
+         *
+         * @return array
+         */
+        public function partitionIds(): array {}
+
+        /**
+         * @return mixed
+         */
+        public function streamCreatedOp(): mixed {}
+
+        /**
+         * @return int
+         */
+        public function streamId(): int {}
+
+        /**
+         * @return mixed
+         */
+        public function topicCreatedOp(): mixed {}
+
+        /**
+         * @return int
+         */
+        public function topicId(): int {}
+    }
+
+    /**
+     * A member that joined a consumer group.
+     */
+    class MetadataMemberJoined {
+        public function __construct() {}
+
+        /**
+         * The member's client id as a decimal string.
+         *
+         * @return string
+         */
+        public function clientId(): string {}
+
+        /**
+         * @return int
+         */
+        public function groupId(): int {}
+
+        /**
+         * @return int
+         */
+        public function memberId(): int {}
+
+        /**
+         * @return int
+         */
+        public function membersCount(): int {}
+
+        /**
+         * Installed partitions, normally none because a handover installs them.
+         *
+         * @return array
+         */
+        public function partitionIds(): array {}
+
+        /**
+         * @return mixed
+         */
+        public function streamCreatedOp(): mixed {}
+
+        /**
+         * @return int
+         */
+        public function streamId(): int {}
+
+        /**
+         * @return mixed
+         */
+        public function topicCreatedOp(): mixed {}
+
+        /**
+         * @return int
+         */
+        public function topicId(): int {}
+    }
+
+    /**
+     * A member that left a consumer group.
+     */
+    class MetadataMemberLeft {
+        public function __construct() {}
+
+        /**
+         * The member's client id as a decimal string.
+         *
+         * @return string
+         */
+        public function clientId(): string {}
+
+        /**
+         * @return int
+         */
+        public function groupId(): int {}
+
+        /**
+         * @return int
+         */
+        public function memberId(): int {}
+
+        /**
+         * @return int
+         */
+        public function membersCount(): int {}
+
+        /**
+         * @return \Iggy\MetadataMemberLeftReason
+         */
+        public function reason(): \Iggy\MetadataMemberLeftReason {}
+
+        /**
+         * @return mixed
+         */
+        public function streamCreatedOp(): mixed {}
+
+        /**
+         * @return int
+         */
+        public function streamId(): int {}
+
+        /**
+         * @return mixed
+         */
+        public function topicCreatedOp(): mixed {}
+
+        /**
+         * @return int
+         */
+        public function topicId(): int {}
+    }
+
+    /**
+     * Why a consumer group member was removed.
+     */
+    enum MetadataMemberLeftReason: string {
+      case Left = 'left';
+      case SessionEnded = 'session_ended';
+    }
+
+    /**
+     * A completed partition handover.
+     */
+    class MetadataPartitionHandedOver {
+        public function __construct() {}
+
+        /**
+         * @return int
+         */
+        public function groupId(): int {}
+
+        /**
+         * The new owner, null when the last member left.
+         *
+         * @return int|null
+         */
+        public function memberId(): ?int {}
+
+        /**
+         * @return int
+         */
+        public function partitionId(): int {}
+
+        /**
+         * @return mixed
+         */
+        public function streamCreatedOp(): mixed {}
+
+        /**
+         * @return int
+         */
+        public function streamId(): int {}
+
+        /**
+         * @return mixed
+         */
+        public function topicCreatedOp(): mixed {}
+
+        /**
+         * @return int
+         */
+        public function topicId(): int {}
+    }
+
+    /**
+     * A partition count change.
+     */
+    class MetadataPartitionsChanged {
+        public function __construct() {}
+
+        /**
+         * The partition count after the change.
+         *
+         * @return int
+         */
+        public function partitionsCount(): int {}
+
+        /**
+         * The deleted partition ids, ascending, empty on create.
+         *
+         * @return array
+         */
+        public function removedPartitionIds(): array {}
+
+        /**
+         * The operation of the delete request when the delete completed later, else null.
+         *
+         * @return mixed
+         */
+        public function requestedOp(): mixed {}
+
+        /**
+         * @return mixed
+         */
+        public function streamCreatedOp(): mixed {}
+
+        /**
+         * @return int
+         */
+        public function streamId(): int {}
+
+        /**
+         * @return mixed
+         */
+        public function topicCreatedOp(): mixed {}
+
+        /**
+         * @return int
+         */
+        public function topicId(): int {}
+    }
+
+    /**
+     * A `partitions` current state item.
+     */
+    class MetadataPartitionsItem {
+        public function __construct() {}
+
+        /**
+         * @return int
+         */
+        public function partitionsCount(): int {}
+
+        /**
+         * @return mixed
+         */
+        public function streamCreatedOp(): mixed {}
+
+        /**
+         * @return int
+         */
+        public function streamId(): int {}
+
+        /**
+         * @return mixed
+         */
+        public function topicCreatedOp(): mixed {}
+
+        /**
+         * @return int
+         */
+        public function topicId(): int {}
+    }
+
+    /**
+     * Why a user's public permission set changed.
+     */
+    enum MetadataPermissionsUpdatedReason: string {
+      case Updated = 'updated';
+      case ResourceDeleted = 'resource_deleted';
+    }
+
+    /**
+     * A registered session, and a `sessions` current state item.
+     */
+    class MetadataSession {
+        public function __construct() {}
+
+        /**
+         * The session's client id as a decimal string.
+         *
+         * @return string
+         */
+        public function clientId(): string {}
+
+        /**
+         * The session epoch.
+         *
+         * @return mixed
+         */
+        public function session(): mixed {}
+
+        /**
+         * @return mixed
+         */
+        public function userCreatedAt(): mixed {}
+
+        /**
+         * @return int
+         */
+        public function userId(): int {}
+    }
+
+    /**
+     * A closed session.
+     */
+    class MetadataSessionClosed {
+        public function __construct() {}
+
+        /**
+         * The session's client id as a decimal string.
+         *
+         * @return string
+         */
+        public function clientId(): string {}
+
+        /**
+         * @return \Iggy\MetadataSessionClosedReason
+         */
+        public function reason(): \Iggy\MetadataSessionClosedReason {}
+
+        /**
+         * The session epoch.
+         *
+         * @return mixed
+         */
+        public function session(): mixed {}
+
+        /**
+         * @return mixed
+         */
+        public function userCreatedAt(): mixed {}
+
+        /**
+         * @return int
+         */
+        public function userId(): int {}
+    }
+
+    /**
+     * Why a session was closed.
+     */
+    enum MetadataSessionClosedReason: string {
+      case Logout = 'logout';
+      case Expired = 'expired';
+    }
+
+    /**
+     * A stream after a create or update, and a `streams` current state item.
+     */
+    class MetadataStreamChange {
+        public function __construct() {}
+
+        /**
+         * Stream creation time in microseconds.
+         *
+         * @return mixed
+         */
+        public function createdAt(): mixed {}
+
+        /**
+         * Options the server filled in, including the key source and fingerprints.
+         *
+         * @return array|null
+         */
+        public function derivedOptions(): ?array {}
+
+        /**
+         * @return string
+         */
+        public function name(): string {}
+
+        /**
+         * Options the creating client set, as `StreamDetails::$options` returns them, or null
+         * when `options_unreadable`. Key material is never returned.
+         *
+         * @return array|null
+         */
+        public function options(): ?array {}
+
+        /**
+         * The server could not read the stream's stored options. Keep the previous values.
+         *
+         * @return bool
+         */
+        public function optionsUnreadable(): bool {}
+
+        /**
+         * The operation that created the stream, which tells it from an earlier stream with
+         * the same id.
+         *
+         * @return mixed
+         */
+        public function streamCreatedOp(): mixed {}
+
+        /**
+         * Stream id. Ids are reused after a delete.
+         *
+         * @return int
+         */
+        public function streamId(): int {}
+    }
+
+    /**
+     * A removed stream.
+     */
+    class MetadataStreamDeleted {
+        public function __construct() {}
+
+        /**
+         * @return mixed
+         */
+        public function createdAt(): mixed {}
+
+        /**
+         * @return string
+         */
+        public function name(): string {}
+
+        /**
+         * The operation of the delete request when the delete completed later, else null.
+         *
+         * @return mixed
+         */
+        public function requestedOp(): mixed {}
+
+        /**
+         * @return mixed
+         */
+        public function streamCreatedOp(): mixed {}
+
+        /**
+         * @return int
+         */
+        public function streamId(): int {}
+    }
+
+    /**
+     * A created personal access token, and a `personal_access_tokens` current state item.
+     * Never the token itself.
+     */
+    class MetadataTokenChange {
+        public function __construct() {}
+
+        /**
+         * Expiry in microseconds, null for a token that never expires.
+         *
+         * @return mixed
+         */
+        public function expiry(): mixed {}
+
+        /**
+         * @return string
+         */
+        public function name(): string {}
+
+        /**
+         * @return mixed
+         */
+        public function userCreatedAt(): mixed {}
+
+        /**
+         * @return int
+         */
+        public function userId(): int {}
+    }
+
+    /**
+     * A removed personal access token.
+     */
+    class MetadataTokenDeleted {
+        public function __construct() {}
+
+        /**
+         * @return string
+         */
+        public function name(): string {}
+
+        /**
+         * @return \Iggy\MetadataTokenDeletedReason
+         */
+        public function reason(): \Iggy\MetadataTokenDeletedReason {}
+
+        /**
+         * @return mixed
+         */
+        public function userCreatedAt(): mixed {}
+
+        /**
+         * @return int
+         */
+        public function userId(): int {}
+    }
+
+    /**
+     * Why a personal access token was removed.
+     */
+    enum MetadataTokenDeletedReason: string {
+      case Deleted = 'deleted';
+      case Expired = 'expired';
+    }
+
+    /**
+     * A topic after a create or update.
+     */
+    class MetadataTopicChange {
+        public function __construct() {}
+
+        /**
+         * @return mixed
+         */
+        public function createdAt(): mixed {}
+
+        /**
+         * Options the server filled in from its catalog defaults.
+         *
+         * @return array|null
+         */
+        public function derivedOptions(): ?array {}
+
+        /**
+         * @return string
+         */
+        public function name(): string {}
+
+        /**
+         * Options the creating or updating client set, or null when `options_unreadable`.
+         *
+         * @return array|null
+         */
+        public function options(): ?array {}
+
+        /**
+         * The server could not read the topic's stored options. Keep the previous values.
+         *
+         * @return bool
+         */
+        public function optionsUnreadable(): bool {}
+
+        /**
+         * @return int
+         */
+        public function partitionsCount(): int {}
+
+        /**
+         * @return mixed
+         */
+        public function streamCreatedOp(): mixed {}
+
+        /**
+         * @return int
+         */
+        public function streamId(): int {}
+
+        /**
+         * The operation that created the topic, which tells it from an earlier topic with the
+         * same id.
+         *
+         * @return mixed
+         */
+        public function topicCreatedOp(): mixed {}
+
+        /**
+         * @return int
+         */
+        public function topicId(): int {}
+    }
+
+    /**
+     * A removed topic.
+     */
+    class MetadataTopicDeleted {
+        public function __construct() {}
+
+        /**
+         * @return mixed
+         */
+        public function createdAt(): mixed {}
+
+        /**
+         * @return string
+         */
+        public function name(): string {}
+
+        /**
+         * The operation of the delete request when the delete completed later, else null.
+         *
+         * @return mixed
+         */
+        public function requestedOp(): mixed {}
+
+        /**
+         * @return mixed
+         */
+        public function streamCreatedOp(): mixed {}
+
+        /**
+         * @return int
+         */
+        public function streamId(): int {}
+
+        /**
+         * @return mixed
+         */
+        public function topicCreatedOp(): mixed {}
+
+        /**
+         * @return int
+         */
+        public function topicId(): int {}
+    }
+
+    /**
+     * A `topics` current state item. Partition counts come as `partitions` items.
+     */
+    class MetadataTopicItem {
+        public function __construct() {}
+
+        /**
+         * @return mixed
+         */
+        public function createdAt(): mixed {}
+
+        /**
+         * Options the server filled in from its catalog defaults.
+         *
+         * @return array|null
+         */
+        public function derivedOptions(): ?array {}
+
+        /**
+         * @return string
+         */
+        public function name(): string {}
+
+        /**
+         * Options the creating or updating client set, or null when `options_unreadable`.
+         *
+         * @return array|null
+         */
+        public function options(): ?array {}
+
+        /**
+         * The server could not read the topic's stored options.
+         *
+         * @return bool
+         */
+        public function optionsUnreadable(): bool {}
+
+        /**
+         * @return mixed
+         */
+        public function streamCreatedOp(): mixed {}
+
+        /**
+         * @return int
+         */
+        public function streamId(): int {}
+
+        /**
+         * @return mixed
+         */
+        public function topicCreatedOp(): mixed {}
+
+        /**
+         * @return int
+         */
+        public function topicId(): int {}
+    }
+
+    /**
+     * A record of a group or kind this build does not know. A mirror stops on it rather than
+     * skip a possible state change.
+     */
+    class MetadataUnknownChange {
+        public function __construct() {}
+
+        /**
+         * The raw body on binary transports, or the record's whole JSON object over HTTP.
+         *
+         * @return string
+         */
+        public function body(): string {}
+
+        /**
+         * The group code on binary transports, or the group name over HTTP.
+         *
+         * @return mixed
+         */
+        public function group(): mixed {}
+
+        /**
+         * The kind code on binary transports, or the kind name over HTTP.
+         *
+         * @return mixed
+         */
+        public function kind(): mixed {}
+    }
+
+    /**
+     * A current state item of a group this build does not know.
+     */
+    class MetadataUnknownItem {
+        public function __construct() {}
+
+        /**
+         * The raw body on binary transports, or the item's whole JSON object over HTTP.
+         *
+         * @return string
+         */
+        public function body(): string {}
+
+        /**
+         * The group code on binary transports, or the group name over HTTP.
+         *
+         * @return mixed
+         */
+        public function group(): mixed {}
+    }
+
+    /**
+     * A user after a create or update, and a `users` current state item.
+     */
+    class MetadataUserChange {
+        public function __construct() {}
+
+        /**
+         * Options the server filled in.
+         *
+         * @return array|null
+         */
+        public function derivedOptions(): ?array {}
+
+        /**
+         * Options the creating client set, or null when `options_unreadable`.
+         *
+         * @return array|null
+         */
+        public function options(): ?array {}
+
+        /**
+         * The server could not read the user's stored options.
+         *
+         * @return bool
+         */
+        public function optionsUnreadable(): bool {}
+
+        /**
+         * The public permission set in the shape `GET /users/{id}` returns, null when the
+         * user has none.
+         *
+         * @return array|null
+         */
+        public function permissions(): ?array {}
+
+        /**
+         * `active` or `inactive`.
+         *
+         * @return string
+         */
+        public function status(): string {}
+
+        /**
+         * User creation time in microseconds, which tells the user from an earlier user with
+         * the same id.
+         *
+         * @return mixed
+         */
+        public function userCreatedAt(): mixed {}
+
+        /**
+         * User id. Ids are reused after a delete.
+         *
+         * @return int
+         */
+        public function userId(): int {}
+
+        /**
+         * @return string
+         */
+        public function username(): string {}
+    }
+
+    /**
+     * A deleted user, or one whose password changed.
+     */
+    class MetadataUserIdentity {
+        public function __construct() {}
+
+        /**
+         * @return mixed
+         */
+        public function userCreatedAt(): mixed {}
+
+        /**
+         * @return int
+         */
+        public function userId(): int {}
+
+        /**
+         * @return string
+         */
+        public function username(): string {}
+    }
+
+    /**
+     * A user's public permission set after a change.
+     */
+    class MetadataUserPermissionsUpdated {
+        public function __construct() {}
+
+        /**
+         * The public permission set after the change, null when the user has none.
+         *
+         * @return array|null
+         */
+        public function permissions(): ?array {}
+
+        /**
+         * @return \Iggy\MetadataPermissionsUpdatedReason
+         */
+        public function reason(): \Iggy\MetadataPermissionsUpdatedReason {}
+
+        /**
+         * @return mixed
+         */
+        public function userCreatedAt(): mixed {}
+
+        /**
+         * @return int
+         */
+        public function userId(): int {}
+
+        /**
+         * @return string
+         */
+        public function username(): string {}
     }
 
     /**

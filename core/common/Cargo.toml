@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy_common"
-version = "0.11.1-edge.2"
+version = "0.11.1-edge.3"
 description = "Iggy is the persistent message streaming platform written in Rust, supporting QUIC, TCP and HTTP transport protocols, capable of processing millions of messages per second."
 edition = "2024"
 rust-version.workspace = true
@@ -49,7 +49,7 @@ papaya = { workspace = true }
 ring = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 serde_with = { workspace = true, features = ["base64", "json"] }
 strum = { workspace = true }
 thiserror = { workspace = true }

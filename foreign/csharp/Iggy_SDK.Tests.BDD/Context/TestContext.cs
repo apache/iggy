@@ -35,6 +35,7 @@ public class TestContext
     public Message? LastSendMessage { get; set; }
     public bool RedirectionOccurred { get; set; }
     public uint? LastStreamId { get; set; }
+    public byte[]? LastStreamKey { get; set; }
     public byte[]? LastRawResponse { get; set; }
     public Exception? LastRawError { get; set; }
     public Exception? LastCallError { get; set; }

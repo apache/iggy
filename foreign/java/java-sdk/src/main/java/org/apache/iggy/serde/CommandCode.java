@@ -34,6 +34,7 @@ public interface CommandCode {
         DESCRIBE_OPTIONS(13),
         BIND_SESSION(15),
         UPDATE_RESOURCE(16),
+        GET_METADATA_CHANGES(17),
         GET_ME(20),
         GET_CLIENT(21),
         GET_ALL_CLIENTS(22);

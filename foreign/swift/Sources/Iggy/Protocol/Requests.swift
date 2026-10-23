@@ -369,6 +369,42 @@ enum Requests {
     static func describeOptions(scope: OptionsScope) -> [UInt8] {
         [scope.rawValue]
     }
+
+    /// `[start:u8][cursor:44][has_since:u8][since:u64][has_until:u8][until:u64][limit:u32][groups_count:u8][group:u8]*[token_len:u16][token]`.
+    /// The cursor is all zero unless the read starts after it, and groups
+    /// travel in the caller's order, at most 255 of them as in the Rust encoder.
+    static func getMetadataChanges(_ query: MetadataChangesQuery) -> [UInt8] {
+        var groups = query.groups
+        if groups.count > Int(UInt8.max) {
+            var seen = Set<MetadataChangeGroup>()
+            groups = groups.filter { seen.insert($0).inserted }
+        }
+        var token: [UInt8] = []
+        if case .current(let pageToken?) = query.start {
+            token = pageToken.encoded()
+        }
+        var writer = ByteWriter(capacity: 1 + MetadataChangeCursor.encodedSize + 9 + 9 + 4 + 1 + groups.count + 2 + token.count)
+        writer.write(query.start.code)
+        if case .after(let cursor) = query.start {
+            cursor.encode(into: &writer)
+        } else {
+            writer.writeZeros(MetadataChangeCursor.encodedSize)
+        }
+        for bound in [query.since, query.until] {
+            writer.write(bound != nil)
+            if let bound {
+                writer.write(bound.microseconds)
+            }
+        }
+        writer.write(query.limit)
+        writer.write(UInt8(groups.count))
+        for group in groups {
+            writer.write(group.rawValue)
+        }
+        writer.write(UInt16(token.count))
+        writer.write(token)
+        return writer.bytes
+    }
 }
 
 /// Validates a wire name and returns it, so the length prefix can never

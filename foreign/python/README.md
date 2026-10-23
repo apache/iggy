@@ -273,6 +273,76 @@ A stream encryption key must be 32 random bytes, given as `bytes` or as their ca
 
 The server never returns the key, only `encryption_key_source`, `encryption_key_fingerprint` and `encryption_kek_fingerprints`. Without a key, a server with encryption enabled generates one for the stream and reports the source `"server"`. An invalid key raises `ValueError` before anything is sent, and no repr or error message contains it.
 
+## Metadata Changes
+
+`get_metadata_changes` reads the node's change log: one record per public result of a committed metadata operation, such as a stream created, a topic renamed, a user's permissions changed or a session closed. A mirror keeps a cursor, asks for the records after it, and stores the returned `next` cursor. The call needs root or the global `manage_servers` permission. A query the server would refuse raises `IggyError` with the invalid command code before anything is sent.
+
+```python
+import asyncio
+
+from apache_iggy import (
+    IggyClient,
+    MetadataChangeGroup,
+    MetadataChangeStart,
+    MetadataChangeStatus,
+)
+
+
+async def follow(client, groups):
+    start = MetadataChangeStart.Earliest()
+    while True:
+        page = await client.get_metadata_changes(start, groups=groups)
+        if page.status == MetadataChangeStatus.Ok:
+            for record in page.records:
+                print(record.op, record.actor_user_id, record.kind, record.change)
+            if page.next is not None:
+                start = MetadataChangeStart.After(page.next)
+            if not page.has_more:
+                await asyncio.sleep(1)
+        elif page.status == MetadataChangeStatus.Behind:
+            await asyncio.sleep(0.1)
+        else:
+            start = await rebuild(client, groups)
+
+
+async def rebuild(client, groups):
+    """Pages the current state, then returns the position to follow from."""
+    start = MetadataChangeStart.Current()
+    while True:
+        page = await client.get_metadata_changes(start, groups=groups)
+        if page.status == MetadataChangeStatus.Behind:
+            await asyncio.sleep(0.1)
+            continue
+        if page.status != MetadataChangeStatus.Ok:
+            start = MetadataChangeStart.Current()
+            continue
+        for item in page.items:
+            print(item.group, item.body)
+        if page.current_page_token is not None:
+            start = MetadataChangeStart.Current(page.current_page_token)
+        elif page.next is not None:
+            return MetadataChangeStart.After(page.next)
+        else:
+            start = MetadataChangeStart.Current()
+
+
+async def main():
+    client = IggyClient.from_connection_string("iggy+tcp://iggy:iggy@127.0.0.1:8090")
+    await client.connect()
+    await follow(client, [MetadataChangeGroup.Streams, MetadataChangeGroup.Topics])
+
+
+asyncio.run(main())
+```
+
+`Expired` means the log no longer holds the history after the cursor, and `Reset` means the cursor belongs to another history, for example after the data directory was rebuilt. Either way the mirror rebuilds from current state pages and then follows the changes after the anchor they return.
+
+Current pages need the parent groups of every selected group, for example `Topics` with `Streams`. Keep a rebuilt state private until a change page answers `Ok` with `has_more` false and a `head_op` at or above the last current page's.
+
+`record.kind` names the body in `record.change`, for example a `MetadataStreamChange` for `StreamCreated` and `StreamUpdated`. A record or item this build does not know has `kind` or `group` set to `None` and a `MetadataUnknownChange` or `MetadataUnknownItem` body with its codes and raw body, so a mirror can stop there rather than skip a change. Stream, topic and user bodies expose `options` and `derived_options` as `StreamDetails` does: a stream's key source and fingerprints, never its key.
+
+`str()` of a cursor gives its `mc1_` text and of a page token its `cs1_` text, and `MetadataChangeCursor.parse` and `MetadataCurrentPageToken.parse` read them back, so a mirror can store its position as a string. Log ids, checksums and client ids are Python ints.
+
 ## High-Level Producer
 
 The Python high-level producer API is a port of the Rust high-level producer

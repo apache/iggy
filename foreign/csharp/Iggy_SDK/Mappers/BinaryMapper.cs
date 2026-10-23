@@ -31,7 +31,7 @@ using Apache.Iggy.Vsr;
 
 namespace Apache.Iggy.Mappers;
 
-internal static class BinaryMapper
+internal static partial class BinaryMapper
 {
     private const int CONSUMER_GROUP_HEADER_SIZE = 13;
     private const int MEMBER_HEADER_SIZE = 8;

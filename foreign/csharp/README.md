@@ -772,6 +772,89 @@ Available compression methods: `Stored`, `Deflated`, `Bzip2`, `Zstd`, `Lzma`, `X
 Available snapshot types: `FilesystemOverview`, `ProcessList`, `ResourceUsage`, `Test`, `ServerLogs`, `ServerConfig`,
 `All`.
 
+### Metadata Changes
+
+`GetMetadataChangesAsync` reads the node's change log: one record per public result of a committed metadata operation, such as a stream created, a topic renamed, a user's permissions changed or a session closed. A mirror keeps a cursor, asks for the records after it, and stores the returned `Next` cursor. The call needs root or the global `ManageServers` permission and works over TCP and HTTP.
+
+```c#
+var query = new MetadataChangesQuery { Groups = [MetadataChangeGroup.Streams, MetadataChangeGroup.Topics] };
+while (true)
+{
+    var page = await client.GetMetadataChangesAsync(query);
+    switch (page.Status)
+    {
+        case MetadataChangeStatus.Ok:
+            foreach (var record in page.Records)
+            {
+                Console.WriteLine($"op {record.Op} by {record.ActorUserId}: {record.Kind}");
+            }
+
+            if (page.Next is { } next)
+            {
+                query = query with { Start = MetadataChangeStart.After(next) };
+            }
+
+            if (!page.HasMore)
+            {
+                await Task.Delay(TimeSpan.FromSeconds(1));
+            }
+
+            break;
+        case MetadataChangeStatus.Behind:
+            await Task.Delay(TimeSpan.FromMilliseconds(100));
+            break;
+        default:
+            query = query with { Start = await RebuildAsync(client, query.Groups) };
+            break;
+    }
+}
+
+// Pages the current state, then returns the position to follow from.
+static async Task<MetadataChangeStart> RebuildAsync(IIggyClient client, IReadOnlyList<MetadataChangeGroup> groups)
+{
+    var query = new MetadataChangesQuery { Start = MetadataChangeStart.Current(), Groups = groups };
+    while (true)
+    {
+        var page = await client.GetMetadataChangesAsync(query);
+        if (page.Status == MetadataChangeStatus.Behind)
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(100));
+            continue;
+        }
+
+        if (page.Status != MetadataChangeStatus.Ok)
+        {
+            query = query with { Start = MetadataChangeStart.Current() };
+            continue;
+        }
+
+        foreach (var item in page.Items)
+        {
+            Console.WriteLine($"{item.Group}: {item.Body.GetType().Name}");
+        }
+
+        if (page.CurrentPageToken is { } token)
+        {
+            query = query with { Start = MetadataChangeStart.Current(token) };
+        }
+        else if (page.Next is { } anchor)
+        {
+            return MetadataChangeStart.After(anchor);
+        }
+        else
+        {
+            query = query with { Start = MetadataChangeStart.Current() };
+        }
+    }
+}
+```
+
+`Expired` means the log no longer holds the history after the cursor, and `Reset` means the cursor belongs to another history, for example after the data directory was rebuilt. Either way the mirror rebuilds from current state pages and then follows the changes after the anchor they return.
+
+Current pages need the parent groups of every selected group, for example `Topics` with `Streams`. Keep a rebuilt state private until a change page answers `Ok` with `HasMore` false and a `HeadOp` at or above the last current page's.
+
+A cursor's `ToString()` is its `mc1_` text, which `MetadataChangeCursor.Parse` reads back, so a mirror can store it. A query the rules refuse fails with code 3 before anything is sent, and a record of a kind this SDK does not know arrives as `MetadataUnknownBody` or `MetadataUnknownJsonBody`.
+
 ### Segment Management
 
 Delete up to N of the oldest sealed segments from a partition; the active segment is retained:

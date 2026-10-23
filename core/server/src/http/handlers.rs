@@ -33,9 +33,10 @@ use chrono::Local;
 use consensus::MetadataHandle;
 use iggy_binary_protocol::codes::{
     DESCRIBE_OPTIONS_CODE, GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_CONSUMER_GROUP_CODE,
-    GET_CONSUMER_GROUPS_CODE, GET_CONSUMER_OFFSET_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE,
-    GET_SNAPSHOT_FILE_CODE, GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE,
-    GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE, POLL_MESSAGES_CODE,
+    GET_CONSUMER_GROUPS_CODE, GET_CONSUMER_OFFSET_CODE, GET_METADATA_CHANGES_CODE,
+    GET_PERSONAL_ACCESS_TOKENS_CODE, GET_SNAPSHOT_FILE_CODE, GET_STATS_CODE, GET_STREAM_CODE,
+    GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE,
+    POLL_MESSAGES_CODE,
 };
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_binary_protocol::requests::consumer_groups::{
@@ -102,10 +103,10 @@ use iggy_common::wire_conversions::{
 use iggy_common::{
     ClientInfo, ClientInfoDetails, ClusterMetadata, Consumer, ConsumerGroup, ConsumerGroupDetails,
     ConsumerOffsetInfo, DEFAULT_MAX_TOPIC_SIZE, Identifier, IdentityInfo, IggyError, IggyTimestamp,
-    OptionSpec, OptionStorage, OptionsScope, Partitioning, PersonalAccessTokenInfo, PollMessages,
-    PolledMessages, RawPersonalAccessToken, SendMessages, SendMessagesConfirmations, Stats, Stream,
-    StreamDetails, TokenInfo, Topic, TopicDetails, UserInfo, UserInfoDetails, Validatable,
-    descriptors_for, erase_buffer,
+    MetadataChanges, MetadataChangesQuery, OptionSpec, OptionStorage, OptionsScope, Partitioning,
+    PersonalAccessTokenInfo, PollMessages, PolledMessages, RawPersonalAccessToken, SendMessages,
+    SendMessagesConfirmations, Stats, Stream, StreamDetails, TokenInfo, Topic, TopicDetails,
+    UserInfo, UserInfoDetails, Validatable, descriptors_for, erase_buffer,
 };
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
@@ -115,6 +116,7 @@ use send_wrapper::SendWrapper;
 use serde::Deserialize;
 use shard::{PartitionRead, PartitionReadReply};
 
+use crate::dispatch::metadata_changes::metadata_changes_page;
 use crate::dispatch::partition::{
     ConsumerOffsetTarget, fence_poll_context, resolve_consumer_offset_request,
     resolve_poll_request, resolve_primary_consumer_offset_request,
@@ -775,6 +777,37 @@ pub(in crate::http) async fn get_snapshot(
         .unwrap_or_else(|_| HeaderValue::from_static("attachment"));
     headers.insert(header::CONTENT_DISPOSITION, disposition);
     Ok((headers, Body::from(archive)))
+}
+
+/// `GET /metadata/changes`: one page of this node's metadata change log, or
+/// of the current state. Local like `/snapshot`: committed records are the
+/// same on every replica of one history, so the page is never redirected.
+/// The query is strict: an unknown, repeated or malformed parameter is a 400.
+pub(in crate::http) async fn get_metadata_changes(
+    State(state): State<HttpState>,
+    identity: Identity,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> Result<Json<MetadataChanges>, ReadError> {
+    SendWrapper::new(gate_local_read(
+        &state,
+        &identity,
+        Consistency::Serializable,
+        GET_METADATA_CHANGES_CODE,
+        Permissioner::get_metadata_changes,
+    ))
+    .await?;
+    let query = MetadataChangesQuery::from_http_query(
+        pairs
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str())),
+    )
+    .map_err(ReadError::Rejected)?;
+    let page = SendWrapper::new(metadata_changes_page(&state.shard, query, identity.user_id))
+        .await
+        .map_err(ReadError::Rejected)?;
+    MetadataChanges::try_from(page)
+        .map(Json)
+        .map_err(ReadError::Rejected)
 }
 
 /// `GET /cluster/metadata`: report the live cluster topology as the same

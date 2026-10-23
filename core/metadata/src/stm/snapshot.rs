@@ -19,6 +19,7 @@ use iggy_binary_protocol::IGGY_PROTOCOL_VERSION;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::fmt;
 
+use crate::change_log::{ChangeLogSnapshot, RingSnapshot};
 use crate::stm::stream::StreamsSnapshot;
 use crate::stm::user::UsersSnapshot;
 
@@ -63,7 +64,10 @@ use crate::stm::user::UsersSnapshot;
 /// Version 13: `TopicSnapshot` dropped its typed expiry, compression and size
 /// fields, which the options map already holds, and `StreamSnapshot` gained
 /// `created_op`, the identity of a stream incarnation.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 13;
+///
+/// Version 14: `TopicSnapshot` gained `created_op`, the identity of a topic
+/// incarnation, and the snapshot carries the metadata change log.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 14;
 
 /// Oldest format version [`MetadataSnapshot::decode`] still reads.
 ///
@@ -278,6 +282,10 @@ pub struct MetadataSnapshot {
     /// op. Not a state machine, but folded in so a restart that drained the WAL
     /// prefix still recovers pre-checkpoint sessions.
     pub client_table: Option<consensus::ClientTableSnapshot>,
+    /// The change log at the checkpoint op. Not a state machine either, it
+    /// is folded in so a restart or a transfer keeps the history readers
+    /// resume from.
+    pub change_log: ChangeLogSnapshot,
     /// The release that wrote this snapshot, as a packed `iggy_binary_protocol`
     /// semver. Provenance only, never a gate. See [`SNAPSHOT_WRITER_RELEASE`].
     pub writer_release: u32,
@@ -305,6 +313,22 @@ impl MetadataSnapshot {
             users: None,
             streams: None,
             client_table: None,
+            change_log: ChangeLogSnapshot {
+                log_id: None,
+                last_record_op: 0,
+                resource: RingSnapshot {
+                    evicted_through_op: 0,
+                    evicted_through_ordinal: 0,
+                    evicted_through_timestamp: 0,
+                    entries: Vec::new(),
+                },
+                activity: RingSnapshot {
+                    evicted_through_op: 0,
+                    evicted_through_ordinal: 0,
+                    evicted_through_timestamp: 0,
+                    entries: Vec::new(),
+                },
+            },
             writer_release: SNAPSHOT_WRITER_RELEASE,
         }
     }
@@ -348,7 +372,7 @@ impl MetadataSnapshot {
         if let Some(streams) = &self.streams {
             streams.validate_ownership_history(self.sequence_number)?;
         }
-        Ok(())
+        self.change_log.validate(self.sequence_number)
     }
 }
 
@@ -627,8 +651,8 @@ mod tests {
         // turns "shape changed, version did not" into a failing test rather than an
         // operator's boot reading one field's bytes as another's. Changing either
         // number is the reminder to change the other.
-        const FIELD_COUNT: u32 = 7;
-        const PINNED_VERSION: u32 = 13;
+        const FIELD_COUNT: u32 = 8;
+        const PINNED_VERSION: u32 = 14;
 
         let encoded = MetadataSnapshot::new(0).encode().unwrap();
         let mut cursor = encoded.as_slice();
@@ -650,7 +674,7 @@ mod tests {
         // the same element count: a version 2 file then decoded field-by-field
         // one position out of place instead of failing. The types the STM
         // actually grows need their own pins.
-        const TOPIC_FIELD_COUNT: u32 = 9;
+        const TOPIC_FIELD_COUNT: u32 = 10;
         const STREAM_FIELD_COUNT: u32 = 7;
         const STREAMS_FIELD_COUNT: u32 = 4;
         const USER_FIELD_COUNT: u32 = 7;
@@ -688,6 +712,7 @@ mod tests {
             next_consumer_group_id: 0,
             options: ResourceOptions::new(),
             consumer_group_catalog_op: 0,
+            created_op: 0,
         };
         let encoded = rmp_serde::to_vec(&topic).unwrap();
         assert_eq!(
@@ -809,6 +834,22 @@ mod tests {
     }
 
     #[test]
+    fn given_change_log_above_the_snapshot_when_decoding_should_refuse_it() {
+        let mut snapshot = MetadataSnapshot::new(9);
+        snapshot.change_log.log_id = Some(1);
+        snapshot.change_log.last_record_op = 10;
+        let encoded = snapshot.encode().unwrap();
+
+        assert!(matches!(
+            MetadataSnapshot::decode(&encoded),
+            Err(SnapshotError::InvalidState(_))
+        ));
+        snapshot.change_log.last_record_op = 9;
+        let decoded = MetadataSnapshot::decode(&snapshot.encode().unwrap()).unwrap();
+        assert_eq!(decoded.change_log, snapshot.change_log);
+    }
+
+    #[test]
     fn decode_refuses_snapshots_without_durable_session_protection() {
         for version in 0..SNAPSHOT_FORMAT_VERSION {
             let mut snapshot = MetadataSnapshot::new(9);
@@ -833,8 +874,8 @@ mod tests {
     }
 
     #[test]
-    fn given_format_thirteen_snapshot_when_restoring_should_preserve_options_and_created_op() {
-        const PREVIOUS_FORMAT: u32 = 12;
+    fn given_format_fourteen_snapshot_when_restoring_should_preserve_options_and_created_op() {
+        const PREVIOUS_FORMAT: u32 = 13;
         let mut options = ResourceOptions::new();
         options.insert(
             HeaderKey::from(OptionKey::MessageExpiry),
@@ -973,6 +1014,7 @@ mod tests {
                             next_consumer_group_id: 5,
                             options: ResourceOptions::default(),
                             consumer_group_catalog_op: 7,
+                            created_op: 8,
                         },
                     )],
                     options: ResourceOptions::default(),
@@ -1005,6 +1047,7 @@ mod tests {
         // the field were dropped from the wire format, so pin its survival.
         assert_eq!(topic.next_consumer_group_id, 5);
         assert_eq!(topic.consumer_group_catalog_op, 7);
+        assert_eq!(topic.created_op, 8);
     }
 
     fn user_snapshot_fixture(id: u32, username: &str, password_hash: &str) -> UserSnapshot {

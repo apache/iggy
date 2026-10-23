@@ -65,6 +65,7 @@ import { deletePartition } from './partition/delete-partition.command.js';
 import { deleteSegments } from './segment/delete-segments.command.js';
 
 import { describeOptions } from './system/describe-options.command.js';
+import { getMetadataChanges } from './system/get-metadata-changes.command.js';
 import { getStats } from './system/get-stats.command.js';
 import { snapshot } from './system/snapshot.command.js';
 import { ping } from './system/ping.command.js';
@@ -187,7 +188,8 @@ const systemAPI = (c: ClientProvider) => ({
   ping: ping(c),
   getStats: getStats(c),
   snapshot: snapshot(c),
-  describeOptions: describeOptions(c)
+  describeOptions: describeOptions(c),
+  getMetadataChanges: getMetadataChanges(c)
 });
 
 type SystemAPI = ReturnType<typeof systemAPI>;

@@ -56,6 +56,8 @@ fn main() -> Result<()> {
     content = content.replacen("__all__ = [", "__all__ = [\n    \"Durability\",", 1);
     // pyo3-stub-gen splits the hyphenated project name around a base class from this module.
     content = content.replace("(apacheIggyError)", "(IggyError)");
+    // The same split hits a pyclass-typed field of a complex enum variant.
+    content = content.replace("apacheMetadataChangeCursor", "MetadataChangeCursor");
     // The runtime creates a str-backed Enum, whose str() differs from StrEnum.
     content.push_str("\nclass Durability(str, enum.Enum):  # noqa: UP042\n    REPLICATED = 'replicated'\n    PERSISTED = 'persisted'\n");
 

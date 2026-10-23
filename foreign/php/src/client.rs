@@ -36,6 +36,7 @@ use crate::consumer::{AutoCommit, IggyConsumer};
 use crate::durability::Durability as PhpDurability;
 use crate::error::to_php_exception;
 use crate::identifier::PhpIdentifier;
+use crate::metadata_changes::{MetadataChangeGroup, MetadataChangeStart, MetadataChanges};
 use crate::options::{OptionSpec, OptionsScope, StreamOptionKey, TopicOptionKey, reset_names};
 use crate::receive_message::{PollingStrategy, ReceiveMessage};
 use crate::runtime::runtime;
@@ -417,6 +418,43 @@ impl IggyClient {
                 .describe_options(scope.into())
                 .await
                 .map(|specs| specs.into_iter().map(OptionSpec::from).collect())
+                .map_err(to_php_exception)
+        })
+    }
+
+    /// Reads one page of the metadata change log, or of the current state.
+    ///
+    /// Needs root or the global `manage_servers` permission. `groups` takes
+    /// `Iggy\MetadataChangeGroup` cases, empty for every group, and a current state scan
+    /// needs the parent groups of each group. `since` and `until` are microseconds as an int
+    /// or a decimal string, and only apply to `earliest` and `after`. `limit` is 1 to 1000,
+    /// 100 when null. A query the server would refuse throws `Invalid command` (code 3)
+    /// before anything is sent.
+    #[php(defaults(groups = Vec::<MetadataChangeGroup>::new()))]
+    pub fn get_metadata_changes(
+        &self,
+        start: &MetadataChangeStart,
+        groups: Vec<MetadataChangeGroup>,
+        since: Option<&Zval>,
+        until: Option<&Zval>,
+        limit: Option<&Zval>,
+    ) -> PhpResult<MetadataChanges> {
+        let query = MetadataChangesQuery {
+            start: start.inner.clone(),
+            groups: groups.into_iter().map(Into::into).collect(),
+            since: optional_u64(since, "since")?.map(IggyTimestamp::from),
+            until: optional_u64(until, "until")?.map(IggyTimestamp::from),
+            limit: optional_unsigned(limit, "limit")?
+                .unwrap_or(MetadataChangesQuery::default().limit),
+        };
+        query.validate().map_err(to_php_exception)?;
+        let inner = self.inner.clone();
+
+        runtime().block_on(async move {
+            inner
+                .get_metadata_changes(&query)
+                .await
+                .map(MetadataChanges::from)
                 .map_err(to_php_exception)
         })
     }
