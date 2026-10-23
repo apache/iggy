@@ -129,7 +129,10 @@ fn assert_received_messages(received: &[IggyMessage], strategy_name: &str) {
 }
 
 async fn init_system(client: &IggyClient) {
-    client.create_stream(STREAM_NAME).await.unwrap();
+    client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
 
     client
         .create_topic(

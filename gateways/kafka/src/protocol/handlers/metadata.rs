@@ -29,6 +29,7 @@ use kafka_protocol::protocol::{Encodable, StrBytes};
 use crate::auth::AuthenticatedPrincipal;
 use crate::bridge::IggyBridge;
 use crate::bridge::topic_map::is_valid_kafka_topic_name;
+use crate::cluster_id::ClusterId;
 use crate::error::{KafkaProtocolError, Result};
 use crate::protocol::api::{
     API_KEY_METADATA, ApiVersionRange, BrokerAdvertise, ConnectionState,
@@ -73,23 +74,7 @@ pub async fn handle(
     }
 
     let Some(bridge) = &state.bridge else {
-        return match decode_topics(api_version, body, state.max_frame_size) {
-            Ok(topics) => respond_or_close(
-                encode_response(api_version, &topics, &connection.broker, ERROR_NONE),
-                "Metadata",
-            ),
-            Err(error) => {
-                // Metadata has no top-level error field; a malformed body cannot carry
-                // INVALID_REQUEST in a version-correct way for every client. Close.
-                // debug!, not warn!: attacker-controlled, not operator-actionable.
-                tracing::debug!(
-                    %error,
-                    api_version,
-                    "Failed to decode Metadata request; closing connection"
-                );
-                HandleOutcome::Close
-            }
-        };
+        return stub_response(state, connection, api_version, body);
     };
 
     let (requested, allow_auto_topic_creation) =
@@ -181,16 +166,51 @@ pub async fn handle(
         // so ordinary requests keep their latency regardless of how large one all-topics response
         // gets.
         let broker = connection.broker.clone();
-        tokio::task::spawn_blocking(move || encode_real_response(api_version, &results, &broker))
-            .await
-            .unwrap_or_else(|join_error| {
-                tracing::error!(%join_error, "Metadata all-topics encode task panicked");
-                Err(KafkaProtocolError::Malformed(join_error.to_string()))
-            })
+        let cluster_id = state.cluster_id.clone();
+        tokio::task::spawn_blocking(move || {
+            encode_real_response(api_version, &results, &broker, &cluster_id)
+        })
+        .await
+        .unwrap_or_else(|join_error| {
+            tracing::error!(%join_error, "Metadata all-topics encode task panicked");
+            Err(KafkaProtocolError::Malformed(join_error.to_string()))
+        })
     } else {
-        encode_real_response(api_version, &results, &connection.broker)
+        encode_real_response(api_version, &results, &connection.broker, &state.cluster_id)
     };
     respond_or_close(encoded, "Metadata")
+}
+
+/// Metadata without a bridge: each requested name, `UNKNOWN_TOPIC_OR_PARTITION`.
+fn stub_response(
+    state: &GatewayState,
+    connection: &ConnectionState,
+    api_version: i16,
+    body: Bytes,
+) -> HandleOutcome {
+    match decode_topics(api_version, body, state.max_frame_size) {
+        Ok(topics) => respond_or_close(
+            encode_response(
+                api_version,
+                &topics,
+                &connection.broker,
+                &state.cluster_id,
+                ERROR_NONE,
+            ),
+            "Metadata",
+        ),
+        Err(error) => {
+            // Metadata has no top-level error field; a malformed body cannot carry
+            // INVALID_REQUEST in a version-correct way for every client. Close.
+            // debug!, not warn!: attacker-controlled, not operator-actionable.
+            tracing::debug!(
+                %error,
+                api_version,
+                "Failed to decode Metadata request; closing connection"
+            );
+            HandleOutcome::Close
+        }
+    }
 }
 
 /// Resolves a named-lookup Metadata request's topics: dedupes first so the response is built from
@@ -436,6 +456,7 @@ pub fn encode_response(
     response_version: i16,
     topics: &[StrBytes],
     broker: &BrokerAdvertise,
+    cluster_id: &ClusterId,
     topic_error_override: i16,
 ) -> Result<Bytes> {
     // Stub has no topic catalog: echo requested names with UNKNOWN_TOPIC_OR_PARTITION,
@@ -462,6 +483,7 @@ pub fn encode_response(
 
     let resp = MetadataResponse::default()
         .with_brokers(vec![broker_entry])
+        .with_cluster_id(Some(StrBytes::from_string(cluster_id.to_string())))
         .with_controller_id(BrokerId(1))
         .with_topics(response_topics);
 
@@ -476,6 +498,7 @@ fn encode_real_response(
     response_version: i16,
     results: &[TopicResult],
     broker: &BrokerAdvertise,
+    cluster_id: &ClusterId,
 ) -> Result<Bytes> {
     let response_topics = results
         .iter()
@@ -507,6 +530,7 @@ fn encode_real_response(
 
     let resp = MetadataResponse::default()
         .with_brokers(vec![broker_entry])
+        .with_cluster_id(Some(StrBytes::from_string(cluster_id.to_string())))
         .with_controller_id(BrokerId(1))
         .with_topics(response_topics);
 
@@ -577,6 +601,7 @@ fn decode_requested_topics(
 
 #[cfg(test)]
 mod tests {
+    use kafka_protocol::protocol::Decodable;
     use tokio_util::sync::CancellationToken;
 
     use super::*;
@@ -781,6 +806,24 @@ mod tests {
                 template_partition_bytes(version) <= RESPONSE_BYTES_PER_PARTITION_FALLBACK,
                 "v{version} exceeded the conservative fallback"
             );
+        }
+    }
+
+    #[test]
+    fn given_a_bridged_response_should_report_the_cluster_id_from_v2() {
+        let cluster_id = ClusterId::random();
+        let broker = BrokerAdvertise {
+            host: "gateway.example".to_string(),
+            port: 9092,
+        };
+        let results = [topic_result("orders", ERROR_NONE, 1)];
+        for version in RANGE.min_version..=RANGE.max_version {
+            let mut body =
+                encode_real_response(version, &results, &broker, &cluster_id).expect("encode");
+            let response =
+                MetadataResponse::decode(&mut body, version).expect("a Metadata response");
+            let expected = (version >= 2).then_some(cluster_id.as_str());
+            assert_eq!(response.cluster_id.as_deref(), expected, "v{version}");
         }
     }
 }

@@ -22,6 +22,7 @@ use crate::cli::common::{
 use crate::cli::user::common::create_grant_targets;
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
+use iggy::prelude::UserCreateOptions;
 use iggy::prelude::{Client, Permissions, StreamPermissions, TopicPermissions, UserId, UserStatus};
 use predicates::str::{is_match, starts_with};
 use serial_test::parallel;
@@ -113,6 +114,7 @@ impl IggyCmdTestCase for TestUserGetCmd {
                     "secret",
                     self.status,
                     self.get_permissions(),
+                    &UserCreateOptions::default(),
                 )
                 .await;
             assert!(create_user.is_ok());

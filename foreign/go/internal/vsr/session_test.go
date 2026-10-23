@@ -165,18 +165,17 @@ func TestNewClientID_NonZeroWithTopBitClear(t *testing.T) {
 	}
 }
 
-func TestSessionForksAllocateOneCounterConcurrentlyAndSurviveParentReset(t *testing.T) {
-	parent := NewSession()
-	require.NoError(t, parent.Bind(42))
-	const links = 4
+func TestSessionNextRequestID_StaysUniqueAcrossGoroutinesAndAReset(t *testing.T) {
+	session := NewSession()
+	require.NoError(t, session.Bind(42))
+	const callers = 4
 	const requests = 128
-	ids := make(chan uint64, links*requests)
+	ids := make(chan uint64, callers*requests)
 	var workers sync.WaitGroup
-	for range links {
-		link := parent.Fork()
+	for range callers {
 		workers.Go(func() {
 			for range requests {
-				id, err := link.NextRequestID()
+				id, err := session.NextRequestID()
 				if err != nil {
 					t.Error(err)
 					return
@@ -187,21 +186,18 @@ func TestSessionForksAllocateOneCounterConcurrentlyAndSurviveParentReset(t *test
 	}
 	workers.Wait()
 	close(ids)
-	seen := make(map[uint64]bool, links*requests)
+	seen := make(map[uint64]bool, callers*requests)
+	previous := uint64(0)
 	for id := range ids {
 		require.False(t, seen[id], "duplicate request id %d", id)
 		seen[id] = true
+		previous = max(previous, id)
 	}
-	require.Len(t, seen, links*requests)
-	old := parent.Fork()
-	parent.Reset()
-	id, err := old.NextRequestID()
+	require.Len(t, seen, callers*requests)
+	require.Equal(t, uint64(callers*requests), previous, "no id is skipped")
+	session.Reset()
+	require.NoError(t, session.Bind(43))
+	id, err := session.NextRequestID()
 	require.NoError(t, err)
-	assert.Equal(t, uint64(links*requests+1), id)
-	assert.Equal(t, uint64(links*requests+2), parent.CurrentRequestID())
-	require.NoError(t, parent.Bind(43))
-	newID, err := parent.NextRequestID()
-	require.NoError(t, err)
-	assert.Equal(t, id+1, newID)
-	assert.NotEqual(t, parent.ClientID(), old.ClientID())
+	assert.Equal(t, previous+1, id)
 }

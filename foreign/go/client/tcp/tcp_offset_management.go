@@ -22,7 +22,6 @@ import (
 
 	binaryserialization "github.com/apache/iggy/foreign/go/binary_serialization"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
-	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/apache/iggy/foreign/go/internal/command"
 )
 
@@ -70,12 +69,6 @@ func (c *IggyTcpClient) DeleteConsumerOffset(ctx context.Context, consumer iggco
 }
 
 func (c *IggyTcpClient) writeOffset(ctx context.Context, cmd command.Command, captured *iggcon.PartitionContext) error {
-	if ctx == nil {
-		return ierror.ErrNilContext
-	}
-	if captured != nil {
-		ctx = context.WithValue(ctx, capturedPartitionContext{}, *captured)
-	}
-	_, err := c.do(ctx, cmd)
+	_, err := c.doCaptured(ctx, cmd, captured)
 	return err
 }

@@ -70,6 +70,9 @@ services:
       - IGGY_HTTP_ADDRESS=0.0.0.0:3000
       - IGGY_QUIC_ADDRESS=0.0.0.0:8080
       - IGGY_WEBSOCKET_ADDRESS=0.0.0.0:8070
+      # Every feature shares this server, and stream_options asserts server-generated stream keys.
+      - IGGY_ENCRYPTION_ENABLED=true
+      - IGGY_ENCRYPTION_KEY=/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=
     volumes:
       - iggy_data:/app/local_data
       - ../target:/profiles

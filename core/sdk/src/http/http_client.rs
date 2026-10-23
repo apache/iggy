@@ -303,15 +303,15 @@ impl HttpClient {
 
     /// Sends one request. Each [`IggyError::LifecycleBusy`] refusal commits, so the request is
     /// sent again as a new one after a pause that doubles up to [`LIFECYCLE_RETRY_MAX_INTERVAL`],
-    /// until a retry would start past [`LIFECYCLE_RETRY_DEADLINE`].
+    /// until a retry would start past [`LIFECYCLE_RETRY_DEADLINE`]. A write whose outcome is
+    /// unknown is never sent again and fails with [`IggyError::TransientNotCommitted`].
     async fn execute<F>(&self, method: Method, url: Url, decorate: F) -> Result<Response, IggyError>
     where
         F: Fn(RequestBuilder) -> RequestBuilder + Send + Sync,
     {
-        let uncertain_attempt = Arc::new(AtomicBool::new(false));
-        let client = self.retrying_client(&uncertain_attempt);
-        // Reads commit nothing, so only a write can leave an uncertain outcome behind.
-        let may_commit = method != Method::GET;
+        let outcome_unknown = Arc::new(AtomicBool::new(false));
+        // Reads commit nothing, so only a write can leave an unknown outcome behind.
+        let client = self.retrying_client(method != Method::GET, &outcome_unknown);
         let deadline = Instant::now() + LIFECYCLE_RETRY_DEADLINE;
         let mut pause = LIFECYCLE_RETRY_INTERVAL;
         loop {
@@ -324,33 +324,38 @@ impl HttpClient {
                         .bearer_auth(token.as_str()),
                 )
             };
-            let response = request
-                .send()
-                .await
-                .map_err(|_| IggyError::InvalidHttpRequest)?;
-            let error = match Self::handle_response(response).await {
+            let response = request.send().await;
+            // The middleware stops at such an attempt, so it was the last one.
+            if outcome_unknown.load(Ordering::Relaxed) {
+                return Err(IggyError::TransientNotCommitted);
+            }
+            let response = response.map_err(|_| IggyError::InvalidHttpRequest)?;
+            match Self::handle_response(response).await {
                 Ok(response) => return Ok(response),
-                Err(error) => error,
-            };
-            let uncertain = may_commit && uncertain_attempt.load(Ordering::Relaxed);
-            match settle(error, uncertain) {
-                IggyError::LifecycleBusy if Instant::now() + pause < deadline => {
+                Err(IggyError::LifecycleBusy) if Instant::now() + pause < deadline => {
                     sleep(pause).await;
                     pause = (pause * 2).min(LIFECYCLE_RETRY_MAX_INTERVAL);
                 }
-                error => return Err(error),
+                Err(error) => return Err(error),
             }
         }
     }
 
-    /// The retry middleware resends transient failures. It reports each of them to
-    /// `uncertain_attempt` unless the server provably never took the request.
-    fn retrying_client(&self, uncertain_attempt: &Arc<AtomicBool>) -> ClientWithMiddleware {
+    /// The retry middleware resends transient failures. It stops at an attempt of a write whose
+    /// outcome is unknown and reports it to `outcome_unknown`.
+    fn retrying_client(
+        &self,
+        may_commit: bool,
+        outcome_unknown: &Arc<AtomicBool>,
+    ) -> ClientWithMiddleware {
         ClientBuilder::new(self.client.clone())
             .with(TracingMiddleware::<SpanBackendWithUrl>::new())
             .with(RetryTransientMiddleware::new_with_policy_and_strategy(
                 self.retry_policy,
-                UncertainAttempts(Arc::clone(uncertain_attempt)),
+                SafeResends {
+                    may_commit,
+                    outcome_unknown: Arc::clone(outcome_unknown),
+                },
             ))
             .build()
     }
@@ -396,47 +401,41 @@ struct RefreshToken {
     token: String,
 }
 
-/// Marks the request uncertain when the middleware treats an attempt as transient and the
-/// attempt may have committed. A 503 can mean either, and only the body tells, so every
-/// transient answer counts except an admission refusal (429) and a failed connection.
-struct UncertainAttempts(Arc<AtomicBool>);
+/// Resends what the default strategy calls transient, but never a write that may have committed.
+struct SafeResends {
+    may_commit: bool,
+    outcome_unknown: Arc<AtomicBool>,
+}
 
-impl RetryableStrategy for UncertainAttempts {
+impl RetryableStrategy for SafeResends {
     fn handle(&self, result: &Result<Response, reqwest_middleware::Error>) -> Option<Retryable> {
-        let retryable = DefaultRetryableStrategy.handle(result);
-        let never_taken = match result {
-            Ok(response) => response.status() == StatusCode::TOO_MANY_REQUESTS,
-            Err(reqwest_middleware::Error::Reqwest(error)) => error.is_connect(),
-            Err(reqwest_middleware::Error::Middleware(_)) => false,
-        };
-        if retryable == Some(Retryable::Transient) && !never_taken {
-            self.0.store(true, Ordering::Relaxed);
+        if self.may_commit && may_have_committed(result) {
+            self.outcome_unknown.store(true, Ordering::Relaxed);
+            return Some(Retryable::Fatal);
         }
-        retryable
+        DefaultRetryableStrategy.handle(result)
     }
 }
 
-/// HTTP has no request dedup: a resend is a new request, so its refusal cannot tell whether an
-/// earlier attempt committed. Such a refusal reports an unknown outcome, which nothing refreshes
-/// or repeats.
-fn settle(error: IggyError, uncertain: bool) -> IggyError {
-    if uncertain
-        && matches!(
-            error,
-            IggyError::HistoryUnavailable
-                | IggyError::LifecycleBusy
-                | IggyError::Unauthorized
-                | IggyError::Unauthenticated
-        )
-    {
-        IggyError::TransientNotCommitted
-    } else {
-        error
+/// HTTP has no request dedup, so a resend is a new request that can apply a write twice. A 503
+/// refuses a request before the server takes it, and a request that was never built or never
+/// connected was never sent.
+fn may_have_committed(result: &Result<Response, reqwest_middleware::Error>) -> bool {
+    match result {
+        Ok(response) => {
+            response.status().is_server_error()
+                && response.status() != StatusCode::SERVICE_UNAVAILABLE
+        }
+        Err(reqwest_middleware::Error::Reqwest(error)) => {
+            !error.is_builder() && !error.is_connect()
+        }
+        Err(reqwest_middleware::Error::Middleware(_)) => false,
     }
 }
 
 /// Decodes the refusals the client acts on: a producer never repeats `RequestTooOld`, a send
-/// refreshes its context once on `HistoryUnavailable`, and `LifecycleBusy` is retried.
+/// refreshes its context once on `HistoryUnavailable`, `LifecycleBusy` is retried, and
+/// `TransientNotAccepted` proves that the last attempt was admitted nowhere.
 fn typed_refusal(body: &str) -> Option<IggyError> {
     #[derive(Deserialize)]
     struct ErrorId {
@@ -447,6 +446,7 @@ fn typed_refusal(body: &str) -> Option<IggyError> {
         IggyError::RequestTooOld,
         IggyError::HistoryUnavailable,
         IggyError::LifecycleBusy,
+        IggyError::TransientNotAccepted,
     ]
     .into_iter()
     .find(|error| error.as_code() == id)
@@ -525,30 +525,54 @@ mod tests {
         );
     }
 
-    /// The first attempt may have committed and the resend is a new request, so the refusal
-    /// of the resend reports an unknown outcome that nothing retries.
+    /// A resend is a new request, so a write that may have committed is never sent again.
     #[tokio::test(start_paused = true)]
-    async fn given_resend_after_uncertain_attempt_when_refused_should_report_not_committed() {
-        for (status, refusal) in [
-            (400, IggyError::LifecycleBusy),
-            (403, IggyError::Unauthorized),
-            (401, IggyError::Unauthenticated),
+    async fn given_write_when_it_may_have_committed_should_report_not_committed_without_resend() {
+        for unknown in [
+            Reply::empty(500),
+            Reply::empty(502),
+            Reply::error(504, &IggyError::TransientNotCommitted),
+            Reply::hang_up(),
         ] {
-            let server = ScriptedServer::start(vec![
-                Reply::empty(503),
-                Reply::error(status, &refusal),
-                Reply::empty(200),
-            ])
-            .await;
+            let server = ScriptedServer::start(vec![unknown, Reply::empty(200)]).await;
 
-            let unknown = server.client().delete_stream(&stream_id()).await;
+            let deleted = server.client().delete_stream(&stream_id()).await;
 
             assert!(
-                matches!(unknown, Err(IggyError::TransientNotCommitted)),
-                "{refusal}: {unknown:?}"
+                matches!(deleted, Err(IggyError::TransientNotCommitted)),
+                "{deleted:?}"
             );
-            assert_eq!(server.requests().len(), 2, "{refusal}");
+            assert_eq!(server.requests().len(), 1);
         }
+    }
+
+    /// A 503 refuses a write before the server takes it, so the refusal of its resend is
+    /// definitive.
+    #[tokio::test(start_paused = true)]
+    async fn given_write_refused_before_taken_when_resend_is_refused_should_report_the_refusal() {
+        let server = ScriptedServer::start(vec![
+            Reply::error(503, &IggyError::TransientNotAccepted),
+            Reply::error(403, &IggyError::Unauthorized),
+        ])
+        .await;
+
+        let refused = server.client().delete_stream(&stream_id()).await;
+
+        assert!(
+            matches!(refused, Err(IggyError::Unauthorized)),
+            "{refused:?}"
+        );
+        assert_eq!(server.requests().len(), 2);
+    }
+
+    /// A read commits nothing, so a timed out read is sent again.
+    #[tokio::test(start_paused = true)]
+    async fn given_read_when_it_times_out_should_resend_it() {
+        let server = ScriptedServer::start(vec![Reply::empty(504), Reply::stream()]).await;
+
+        server.client().get_stream(&stream_id()).await.unwrap();
+
+        assert_eq!(server.requests().len(), 2);
     }
 
     /// A read commits nothing, so the refusal of its resend is definitive.
@@ -574,6 +598,7 @@ mod tests {
             IggyError::RequestTooOld,
             IggyError::HistoryUnavailable,
             IggyError::LifecycleBusy,
+            IggyError::TransientNotAccepted,
         ] {
             let body = format!(r#"{{"id":{},"reason":"unavailable"}}"#, error.as_code());
             assert_eq!(typed_refusal(&body), Some(error));

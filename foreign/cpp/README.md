@@ -25,6 +25,42 @@ bazel test //:unit
 bazel test //:e2e
 ```
 
+The E2E suite expects a local server on the default ports with encryption enabled, because the resource options cases create streams with their own keys and expect a server-generated key for keyless streams. Start it with `IGGY_ENCRYPTION_ENABLED=true` and `IGGY_ENCRYPTION_KEY` set to a base64 encoded 32-byte key, for example `IGGY_ENCRYPTION_ENABLED=true IGGY_ENCRYPTION_KEY=$(head -c 32 /dev/urandom | base64) cargo run --bin iggy-server -- --with-default-root-credentials`.
+
+Receipt access follows the server's [session and revocation policy](../../core/server/README.md#sessions-and-retry-receipts).
+An unresolved operation cannot recover its receipt after its original session
+ends, even after a new login or account reactivation. A fresh send can duplicate
+that operation.
+
+Each node counts the messages in its stream, topic and system stats. After a
+successful send, a node that is not the partition primary shows the new count
+only after the next prepare or commit broadcast. When no other write follows,
+this delay is at most `cluster.commit_broadcast_interval` (500 ms by default).
+See [metadata freshness and counters](../../core/server/README.md#metadata-freshness-and-counters).
+
+## Resource options
+
+Streams, topics and users take typed create and update options. Unset settings use the server default on create and keep their stored value on update. `SetRawEntries()` and `RawReset()` name keys newer than this SDK build and leave the decision to the server. `DescribeOptions()` serves each scope's catalog.
+
+```cpp
+const std::string key_base64 = LoadStreamKey();
+const auto stream = client.CreateStream("payments", iggy::StreamCreateOptions().SetEncryptionKeyBase64(key_base64));
+const bool same_key = stream.EncryptionKeyFingerprint() == iggy::EncryptionKeyFingerprint(key_base64);
+
+const auto stream_id = iggy::Identifier::Numeric(stream.Id());
+const auto topic     = client.CreateTopic(stream_id, "orders",
+                                          iggy::TopicCreateOptions()
+                                              .SetPartitionsCount(3)
+                                              .SetDurability(iggy::Durability::Persisted)
+                                              .SetPartitionResizePolicy(iggy::PartitionResizePolicy::Fixed));
+client.UpdateTopic(stream_id, iggy::Identifier::Numeric(topic.Id()),
+                   iggy::TopicUpdateOptions()
+                       .SetMessageExpiry(iggy::Expiry::Duration(3600000000))
+                       .Reset(iggy::TopicOptionKey::MaxTopicSize));
+```
+
+A stream key must be 32 random bytes, never derived from a password, because reads expose its fingerprint. It travels inside the create request, so protecting it in transit with TLS is the caller's job. The server stores it wrapped and never returns it. Reads report only its source and fingerprints. Without a key, a server with encryption enabled generates one for the stream. An invalid key is refused before anything is sent.
+
 Binary mutations retain an uncertain operation until it is resolved or abandoned.
 `IggyException::OperationId()` carries an exact `std::uint64_t` for
 `operation_uncertain`, `lane_blocked`, and `operation_not_retained`.
@@ -82,6 +118,10 @@ It is reset at entry and populated only when the Rust SDK returns an `IggyError`
 Bridge-local argument errors leave it empty. Inspect `kind`, `code`, and, when
 `has_operation_id` is true, `operation_id`. Use separate values for concurrent
 calls; error state is never stored globally or on the client.
+
+The `IggyException(const std::string &, const ffi::ErrorInfo &)` constructor is
+private. Only `IggyBlockingClient` builds an exception with a code. Other code
+builds an `IggyException` from its message.
 
 Concurrent calls on one client are safe. Moving, assigning, or destroying the
 client while any call is in progress is undefined behavior.

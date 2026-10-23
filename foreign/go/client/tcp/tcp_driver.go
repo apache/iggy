@@ -20,6 +20,7 @@ package tcp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
@@ -34,8 +35,16 @@ func (e *completedResultError) Error() string { return e.err.Error() }
 func (e *completedResultError) Unwrap() error { return e.err }
 
 func (c *IggyTcpClient) drive(ctx context.Context, code command.Code, query, frame []byte, exact *iggcon.PartitionContext) ([]byte, error) {
-	ctx, cancel := operationContext(ctx)
+	ctx, cancel := c.operationContext(ctx)
 	defer cancel()
+	epoch := c.callEpoch(ctx)
+	_, mutation := vsr.ReplicatedOperation(uint32(code))
+	progress := isProgressPoll(code, frame[vsr.HeaderSize:])
+	// A plain read reports a context that is done before its first attempt.
+	// Later, also when a session recovery restarts the call, it ends with 58.
+	if err := ctx.Err(); err != nil && !mutation && !progress {
+		return nil, err
+	}
 	historyRefreshed := false
 	keptContext := exact
 	lifecycleDelay := replayInterval
@@ -48,15 +57,15 @@ func (c *IggyTcpClient) drive(ctx context.Context, code command.Code, query, fra
 	}()
 	for {
 		if ctx.Err() != nil {
-			if _, mutation := vsr.ReplicatedOperation(uint32(code)); !mutation && !isProgressPoll(code, frame[vsr.HeaderSize:]) {
-				return nil, ctx.Err()
-			}
 			return nil, ierror.ErrTransientNotAccepted
 		}
 		select {
 		case <-c.closed:
 			return nil, ierror.ErrClientShutdown
 		default:
+		}
+		if err := c.waitForRecovery(ctx); err != nil {
+			return nil, err
 		}
 		var route pollRoute
 		var captured iggcon.PartitionContext
@@ -70,7 +79,10 @@ func (c *IggyTcpClient) drive(ctx context.Context, code command.Code, query, fra
 					}
 					return nil, ierror.ErrTransientNotAccepted
 				}
-				return nil, c.sessionLossError(err)
+				if c.sessionRecovers(ctx, err) {
+					continue
+				}
+				return nil, err
 			}
 			captured = route.context
 		} else {
@@ -82,8 +94,6 @@ func (c *IggyTcpClient) drive(ctx context.Context, code command.Code, query, fra
 			saved := captured
 			keptContext = &saved
 		}
-		_, mutation := vsr.ReplicatedOperation(uint32(code))
-		progress := isProgressPoll(code, frame[vsr.HeaderSize:])
 		if ticket == nil && (mutation || progress) {
 			key := laneKey{}
 			if query != nil {
@@ -92,32 +102,43 @@ func (c *IggyTcpClient) drive(ctx context.Context, code command.Code, query, fra
 			var err error
 			ticket, err = c.operations.enter(ctx, key)
 			if err != nil {
-				return nil, c.sessionLossError(err)
+				return nil, err
 			}
 		}
 		if mutation {
 			if err := ticket.reserve(ctx, len(frame)); err != nil {
-				return nil, c.sessionLossError(err)
+				if c.sessionRecovers(ctx, err) {
+					continue
+				}
+				return nil, err
 			}
 		}
 		frozen := append([]byte(nil), frame...)
 		c.mtx.Lock()
 		fence := c.sessionFence
-		var err error
-		if ticket != nil && !ticket.current() {
-			err = ierror.ErrUnauthenticated
-		} else {
-			err = vsr.StampRequestHeader(c.session, uint32(code), frozen)
+		err := epoch.err()
+		if err == nil {
+			if ticket != nil && !ticket.renew() {
+				err = ierror.ErrUnauthenticated
+			} else {
+				err = vsr.StampRequestHeader(c.session, uint32(code), frozen)
+			}
 		}
 		if err == nil {
 			vsr.StampPartitionContext((*[vsr.HeaderSize]byte)(frozen), captured)
 		}
 		c.mtx.Unlock()
 		if err != nil {
+			if c.sessionRecovers(ctx, err) {
+				if ticket != nil {
+					ticket.releaseOperation()
+				}
+				continue
+			}
 			if ticket != nil {
 				ticket.finish(false)
 			}
-			return nil, c.sessionLossError(err)
+			return nil, err
 		}
 		var operation *pendingOperation
 		if ticket != nil {
@@ -130,6 +151,9 @@ func (c *IggyTcpClient) drive(ctx context.Context, code command.Code, query, fra
 		if errors.As(err, &completed) {
 			return nil, completed.err
 		}
+		if c.sessionRecovers(ctx, err) {
+			continue
+		}
 		if errors.Is(err, ierror.ErrLifecycleBusy) {
 			if waitErr := c.pause(ctx, lifecycleDelay); waitErr != nil {
 				return nil, ierror.ErrLifecycleBusy
@@ -141,7 +165,6 @@ func (c *IggyTcpClient) drive(ctx context.Context, code command.Code, query, fra
 			ticket = nil
 			historyRefreshed = true
 			keptContext = nil
-			c.polls.invalidate(route, false)
 			continue
 		}
 		return response, err
@@ -171,7 +194,10 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 		// A replay returns nil or a completed result only with a committed proof.
 		var completed *completedResultError
 		switch {
-		case !uncertain && errors.Is(err, ierror.ErrLifecycleBusy):
+		// The call keeps its lane to start a new operation. Unauthenticated
+		// ends only a call that cannot have changed server state, and it can
+		// restart under the session that replaces the lost one.
+		case !uncertain && (errors.Is(err, ierror.ErrLifecycleBusy) || errors.Is(err, ierror.ErrUnauthenticated)):
 			ticket.releaseOperation()
 		case err == nil:
 			ticket.prove(nil)
@@ -186,7 +212,7 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 			ticket.finish(retain)
 		}
 	}()
-	finishUncertain := func() error { retain = mutation; return ierror.UncertainOutcome{OperationID: operation.id} }
+	finishUncertain := func() error { retain = mutation; return ierror.OperationUncertain{OperationID: operation.id} }
 	sessionChanged := func(sent bool) error {
 		if progress && sent {
 			return ierror.ErrTransientNotCommitted
@@ -194,7 +220,7 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 		if mutation && (sent || uncertain) {
 			return finishUncertain()
 		}
-		return c.sessionLossError(ierror.ErrUnauthenticated)
+		return ierror.ErrUnauthenticated
 	}
 	for {
 		c.mtx.Lock()
@@ -251,7 +277,7 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 				if uncertain && mutation {
 					return nil, finishUncertain()
 				}
-				return nil, c.sessionLossError(err)
+				return nil, err
 			}
 			if waitErr := c.pause(ctx, nextLookupBackoff(&lookupDelay)); waitErr != nil {
 				if uncertain && mutation {
@@ -371,7 +397,8 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 			}
 			return nil, ierror.ErrInvalidCommand
 		}
-		if !c.observeMetadataFor(operation.fence, &reply.header) {
+		publishCredentials := outcome.Err == nil && (!uncertain || !mutation || outcome.Committed)
+		if !c.acceptOperationReply(c.callEpoch(ctx), operation, &reply.header, publishCredentials) {
 			return nil, sessionChanged(sent)
 		}
 		if outcome.Err == nil {
@@ -381,7 +408,6 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 				}
 				continue
 			}
-			c.refreshSignIn(operation.code, operation.frame.data[vsr.HeaderSize:])
 			c.refreshMembership(operation.code, operation.frame.data[vsr.HeaderSize:])
 			return outcome.Body, nil
 		}
@@ -418,6 +444,8 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 				return nil, finishUncertain()
 			}
 			return nil, err
+		case operation.query != nil && isNamespaceMiss(err) && !c.isMetadataPrimary(ctx, link):
+			c.polls.relookup(route)
 		default:
 			if closeIfDetached(link, outcome, bound) {
 				if errors.Is(err, ierror.ErrUnauthenticated) {
@@ -427,8 +455,8 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 			} else if isSessionError(err) {
 				c.recoverSession(operation.fence)
 			}
-			if operation.query != nil && (errors.Is(err, ierror.ErrHistoryUnavailable) || errors.Is(err, ierror.ErrLifecycleBusy) || errors.Is(err, ierror.ErrConsumerGroupPartitionNotOwned)) {
-				c.polls.invalidate(route, false)
+			if operation.query != nil && (errors.Is(err, ierror.ErrHistoryUnavailable) || errors.Is(err, ierror.ErrConsumerGroupPartitionNotOwned) || isNamespaceMiss(err)) {
+				c.polls.relookup(route)
 			}
 			if uncertain && mutation {
 				return nil, finishUncertain()
@@ -530,6 +558,21 @@ func isDetachedError(err error) bool {
 	return errors.As(err, &eviction) && (eviction.Reason == vsr.EvictionNoSession || eviction.Reason == vsr.EvictionStaleClient)
 }
 
+// Acceptance and credential publication share a lock: a concurrent refusal
+// must compare the credentials from every successful reply already accepted.
+func (c *IggyTcpClient) acceptOperationReply(epoch *signInEpoch, operation *pendingOperation, header *[vsr.HeaderSize]byte, publishCredentials bool) bool {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	if c.sessionFence != operation.fence {
+		return false
+	}
+	c.observeMetadata(header)
+	if publishCredentials {
+		c.refreshSignInLocked(epoch, operation.code, operation.frame.data[vsr.HeaderSize:])
+	}
+	return true
+}
+
 func (c *IggyTcpClient) observeMetadataFor(fence uint64, header *[vsr.HeaderSize]byte) bool {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
@@ -575,19 +618,64 @@ func (c *IggyTcpClient) stopped() error {
 	return nil
 }
 
-// sessionLossError is the error of a call that ends without a current session
-// and cannot have changed server state. While an automatic recovery runs, or
-// once it bound a new session, that is 58, because a retry is safe and finds
-// a session. After a failed recovery, a logout or a disconnect, and while the
-// application signs in itself, it stays Unauthenticated.
-func (c *IggyTcpClient) sessionLossError(err error) error {
-	if !errors.Is(err, ierror.ErrUnauthenticated) {
-		return err
+// sessionRecovers reports whether err ends a call without a current session
+// while an automatic recovery runs or after it bound a new session. Such a
+// call cannot have changed server state, so it restarts under the new
+// session. After a failed recovery, and once the caller signs in, logs out or
+// disconnects or the server refuses an automatic sign-in after the call
+// started, the call ends with err.
+func (c *IggyTcpClient) sessionRecovers(ctx context.Context, err error) bool {
+	if !errors.Is(err, ierror.ErrUnauthenticated) || c.callEpoch(ctx).over() {
+		return false
 	}
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
-	if c.recovery != nil && !c.loggedOut && (c.recovery.Err() == nil || c.session.Bound()) {
-		return ierror.ErrTransientNotAccepted
+	return c.recovery != nil && !c.loggedOut && (c.recovery.Err() == nil || c.session.Bound())
+}
+
+// waitForRecovery waits while an automatic recovery replaces a lost session,
+// or a Connect signs in, so a call that starts or restarts meanwhile runs
+// under the new session. A sign-in that binds no session by the deadline ends
+// the call with 58, and so does a Connect that the server refuses for a reason
+// other than its credentials. A sign-in, logout or disconnect of the caller,
+// and a refusal of the credentials of an automatic sign-in, end the calls that
+// started before them with 40.
+func (c *IggyTcpClient) waitForRecovery(ctx context.Context) error {
+	epoch := c.callEpoch(ctx)
+	for {
+		c.mtx.Lock()
+		recovery := c.recovery
+		unbound := !c.loggedOut && !c.session.Bound()
+		_, signsIn := c.signInCredentialsLocked()
+		c.mtx.Unlock()
+		if err := epoch.err(); err != nil {
+			return err
+		}
+		var signInEnded <-chan struct{}
+		var attempt *connectAttempt
+		if unbound && recovery != nil && recovery.Err() == nil {
+			signInEnded = recovery.Done()
+		} else if unbound && signsIn {
+			c.connectMu.Lock()
+			if attempt = c.connectionAttempt; attempt != nil {
+				signInEnded = attempt.done
+			}
+			c.connectMu.Unlock()
+		}
+		if signInEnded == nil {
+			return nil
+		}
+		select {
+		case <-signInEnded:
+			var refusal *signInRefusal
+			if attempt != nil && errors.As(attempt.err, &refusal) && !epoch.over() {
+				return fmt.Errorf("%w: %w", ierror.ErrTransientNotAccepted, refusal.err)
+			}
+		case <-epoch.ended:
+		case <-ctx.Done():
+			return ierror.ErrTransientNotAccepted
+		case <-c.closed:
+			return ierror.ErrClientShutdown
+		}
 	}
-	return err
 }

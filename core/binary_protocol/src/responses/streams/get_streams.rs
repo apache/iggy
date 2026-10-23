@@ -85,6 +85,7 @@ mod tests {
                     messages_count: 50,
                     name: WireName::new("s1").unwrap(),
                     options: WireOptions::empty(),
+                    derived_options: WireOptions::empty(),
                 },
                 StreamResponse {
                     id: 2,
@@ -94,6 +95,7 @@ mod tests {
                     messages_count: 0,
                     name: WireName::new("stream-two").unwrap(),
                     options: WireOptions::empty(),
+                    derived_options: WireOptions::empty(),
                 },
             ],
         };

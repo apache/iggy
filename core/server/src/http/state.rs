@@ -21,9 +21,12 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::future::{Future, poll_fn};
 use std::net::IpAddr;
+use std::ops::ControlFlow;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::task::{Poll, Waker};
 
 use axum::http::{HeaderName, HeaderValue};
 use axum::response::Response;
@@ -44,7 +47,9 @@ use tracing::warn;
 use crate::cluster_meta::ClusterRoster;
 use crate::consumer_group::lease::{ConsumerGroupLiveness, SessionActivity};
 use crate::dispatch::session_ops::{submit_logout_on_owner, submit_register_on_owner};
+use crate::http::admission::RelayTargets;
 use crate::http::error::{AuthError, ReadError, primary_redirect_location};
+use crate::http::relay_proof::RelayKey;
 
 use crate::http::jwt::{JwtManager, TrustedIssuer};
 use crate::http::metrics::HttpMetrics;
@@ -176,21 +181,110 @@ pub(in crate::http) type HttpState = SendWrapper<Rc<HttpInner>>;
 
 /// Per-node forwarding context hung off `HttpInner`: the outbound client
 /// (pinned-cert TLS when the listener serves HTTPS), the scheme it dials, the
-/// request-body buffer bound, and the in-flight budget. Built by
+/// request-body buffer bound, the key that proves a relay comes from a node,
+/// the budget of the relays this node sends, and the separate budget of the
+/// relays it serves as their hop target. Built by
 /// `http::forward::build_forward_state`; lives here so the state hub never
 /// imports the forwarding middleware.
 pub(in crate::http) struct ForwardState {
-    /// False when no cluster-wide bearer key material exists (no configured
-    /// JWT secret, no cluster PSK): a forwarded bearer would 401 on the
-    /// primary, so the middleware passes through and followers answer with
-    /// the transient 503 instead.
-    pub(in crate::http) active: bool,
+    /// Derived from the cluster-wide bearer key material, so `None` when none
+    /// exists (no configured JWT secret, no cluster PSK). Then forwarding is
+    /// off and every relay field is refused.
+    pub(in crate::http) relay_key: Option<RelayKey>,
     pub(in crate::http) client: cyper::Client,
     /// Also read by the 307 redirect builder: the primary is assumed to serve
     /// the same scheme as this node (uniform cluster HTTP config).
     pub(in crate::http) scheme: &'static str,
     pub(in crate::http) body_limit: usize,
     pub(in crate::http) in_flight: Rc<Cell<u32>>,
+    pub(in crate::http) relay_targets: RelayTargets,
+    pub(in crate::http) floor_reads: FloorReads,
+}
+
+/// This node's metadata floor reads, single flight. A read already sent can
+/// miss an op acknowledged after it left, so it serves only the waiters that
+/// came before it was sent. The waiters that come while it is in flight share
+/// the next read, which the first of them sends once it ends.
+#[derive(Default)]
+pub(in crate::http) struct FloorReads {
+    /// Reads sent so far, which also numbers each read.
+    sent: Cell<u64>,
+    in_flight: Cell<bool>,
+    /// The number and outcome of the newest read that ended.
+    ended: Cell<Option<(u64, ControlFlow<Option<u64>>)>>,
+    /// Waiters parked until the read in flight ends.
+    parked: RefCell<Vec<Waker>>,
+}
+
+impl FloorReads {
+    /// The outcome of a read sent after this call. A waiter shares the read in
+    /// flight only when it was sent after the waiter came, and otherwise sends
+    /// the next one with `read` unless another waiter sent it first.
+    pub(in crate::http) async fn read<F>(
+        &self,
+        read: impl FnOnce() -> F,
+    ) -> ControlFlow<Option<u64>>
+    where
+        F: Future<Output = ControlFlow<Option<u64>>>,
+    {
+        let sent_before = self.sent.get();
+        loop {
+            if let Some((number, outcome)) = self.ended.get()
+                && number > sent_before
+            {
+                return outcome;
+            }
+            if !self.in_flight.get() {
+                break;
+            }
+            self.park().await;
+        }
+        let number = self.sent.get() + 1;
+        self.sent.set(number);
+        self.in_flight.set(true);
+        let sending = SentFloorRead { reads: self };
+        let outcome = read().await;
+        self.ended.set(Some((number, outcome)));
+        drop(sending);
+        outcome
+    }
+
+    async fn park(&self) {
+        let mut parked = false;
+        poll_fn(|context| {
+            if parked {
+                return Poll::Ready(());
+            }
+            parked = true;
+            self.parked.borrow_mut().push(context.waker().clone());
+            Poll::Pending
+        })
+        .await;
+    }
+}
+
+/// The read in flight. Its drop ends it, also when its waiter is dropped
+/// mid-read, and wakes the parked waiters so one of them sends the next read.
+struct SentFloorRead<'a> {
+    reads: &'a FloorReads,
+}
+
+impl Drop for SentFloorRead<'_> {
+    fn drop(&mut self) {
+        self.reads.in_flight.set(false);
+        for waker in self.reads.parked.take() {
+            waker.wake();
+        }
+    }
+}
+
+impl ForwardState {
+    /// Without cluster-wide bearer key material a forwarded bearer would 401
+    /// on the primary, so the middleware passes through and followers answer
+    /// with the transient 503 instead.
+    pub(in crate::http) const fn active(&self) -> bool {
+        self.relay_key.is_some()
+    }
 }
 
 /// Shared shard-0 HTTP state.
@@ -293,7 +387,7 @@ impl HttpInner {
     /// this one is parked (single-threaded `RefCell` + cooperative scheduling).
     pub(in crate::http) async fn resolve_session(
         &self,
-        key: String,
+        key: &str,
         user_id: u32,
         user_created_at: IggyTimestamp,
         expiry: u64,
@@ -301,7 +395,7 @@ impl HttpInner {
         loop {
             self.ensure_active_user(user_id, Some(user_created_at))?;
             let now = IggyTimestamp::now().to_secs();
-            if let Some(session) = self.live_session(&key, now) {
+            if let Some(session) = self.live_session(key, now) {
                 return Ok(session);
             }
             {
@@ -316,7 +410,7 @@ impl HttpInner {
                     session.reattach(&mut registry);
                 }
             }
-            if let Some(session) = self.live_session(&key, now) {
+            if let Some(session) = self.live_session(key, now) {
                 return Ok(session);
             }
 
@@ -328,7 +422,7 @@ impl HttpInner {
                 (self.max_http_sessions.saturating_sub(table.len()), torn)
             };
             self.teardown_reply_targets(torn);
-            match self.registrations.enter(&key, available_slots) {
+            match self.registrations.enter(key, available_slots) {
                 BarrierEntry::Full => return Err(AuthError::SessionUnavailable),
                 BarrierEntry::Wait(waiter) => {
                     // Another first-request is registering this credential.
@@ -340,11 +434,11 @@ impl HttpInner {
                     // The guard reserves local capacity across Register and
                     // releases it on failure or cancellation, waking waiters.
                     let fresh = self
-                        .register_session(key.clone(), user_id, user_created_at, expiry)
+                        .register_session(key.to_owned(), user_id, user_created_at, expiry)
                         .await?;
                     self.sessions
                         .borrow_mut()
-                        .insert(key.clone(), Rc::clone(&fresh));
+                        .insert(key.to_owned(), Rc::clone(&fresh));
                     return Ok(fresh);
                 }
             }
@@ -403,6 +497,13 @@ impl HttpInner {
     /// the session table.
     pub(in crate::http) fn metadata_watermark(&self, user_id: u32) -> u64 {
         self.metadata_watermarks.get(user_id)
+    }
+
+    /// Whether this node holds a live session for `key`, which
+    /// [`Self::resolve_session`] returns without a `Register`.
+    pub(in crate::http) fn has_live_session(&self, key: &str) -> bool {
+        self.live_session(key, IggyTimestamp::now().to_secs())
+            .is_some()
     }
 
     /// Clone the live (non-expired) entry for `key`, if present. Confines the
@@ -482,6 +583,7 @@ impl HttpInner {
         // `client_seq`, so an HTTP session id can never collide with a TCP
         // virtual client's and the shard-0 tag (top 16 bits == 0) is preserved.
         let client_id = coordinator.mint_shard_zero_client_id();
+        self.metrics.session_registers.inc();
         // Shared Register entry point; on shard 0 (always, for HTTP) it runs
         // `submit_register_in_process` directly on the metadata owner.
         //

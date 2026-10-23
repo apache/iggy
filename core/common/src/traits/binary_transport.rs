@@ -40,6 +40,45 @@ pub const BINARY_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 tokio::task_local! {
     static OPERATION_DEADLINE: Instant;
+    static OPERATION_LINEAGE: Option<BinaryOperationLineage>;
+}
+
+/// The caller sign-in shared by every request of one public operation.
+/// The owner is stable across session recovery and distinguishes nested clients.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BinaryOperationLineage {
+    owner: u128,
+    lineage: u64,
+}
+
+impl BinaryOperationLineage {
+    pub fn new(owner: u128, lineage: u64) -> Self {
+        Self { owner, lineage }
+    }
+
+    pub fn capture(owner: u128, lineage: u64) -> Self {
+        binary_operation_lineage()
+            .filter(|current| current.owner == owner)
+            .unwrap_or(Self { owner, lineage })
+    }
+
+    pub fn lineage(self) -> u64 {
+        self.lineage
+    }
+}
+
+#[doc(hidden)]
+pub fn binary_operation_lineage() -> Option<BinaryOperationLineage> {
+    OPERATION_LINEAGE.try_get().ok().flatten()
+}
+
+#[doc(hidden)]
+pub async fn with_binary_lineage<F: Future>(
+    lineage: Option<BinaryOperationLineage>,
+    future: F,
+) -> F::Output {
+    OPERATION_LINEAGE.scope(lineage, future).await
 }
 
 #[doc(hidden)]
@@ -59,6 +98,11 @@ pub fn binary_operation_deadline() -> Instant {
 
 #[async_trait]
 pub trait BinaryTransport {
+    #[doc(hidden)]
+    fn operation_lineage(&self) -> Option<BinaryOperationLineage> {
+        None
+    }
+
     /// Gets the state of the client.
     async fn get_state(&self) -> ClientState;
     /// Sets the state of the client.
@@ -155,6 +199,41 @@ mod vsr_session_sealed {
 /// mutation corrupts the dedup counter or silently breaks at-most-once.
 #[async_trait]
 pub trait VsrSessionControl: vsr_session_sealed::Sealed + BinaryTransport {
+    /// Runs one explicit attempt, including cleanup if the caller cancels it.
+    #[doc(hidden)]
+    async fn sign_in_with_credentials(
+        &self,
+        credentials: Credentials,
+    ) -> Result<crate::IdentityInfo, IggyError>
+    where
+        Self: crate::BinaryClient + Sized,
+    {
+        crate::binary_sign_in(self, credentials).await
+    }
+
+    #[doc(hidden)]
+    async fn finish_sign_in(
+        &self,
+        credentials: Credentials,
+        user_id: u32,
+    ) -> Result<(), IggyError> {
+        self.set_state(ClientState::Authenticated).await;
+        self.remember_session_credentials(credentials, user_id)
+            .await;
+        self.publish_event(DiagnosticEvent::SignedIn).await;
+        Ok(())
+    }
+
+    /// Completes only the captured caller's Logout. Preparatory Logout keeps its lineage.
+    #[doc(hidden)]
+    async fn finish_sign_out(&self, _signing_in: bool) -> Result<(), IggyError> {
+        self.forget_session_credentials().await;
+        self.reset_vsr_session().await?;
+        self.set_state(ClientState::Connected).await;
+        self.publish_event(DiagnosticEvent::SignedOut).await;
+        Ok(())
+    }
+
     /// Establish a connection for explicit credentials before capturing the
     /// sign-in fence. Binary SDK transports suppress automatic sign-in here.
     #[doc(hidden)]
@@ -261,13 +340,16 @@ pub fn decode_session_binding(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ConsumerGroupClientState;
+    use crate::{Client, Consumer, ConsumerGroupClientState, MessageClient, PollingStrategy};
     use bytes::BytesMut;
+    use iggy_binary_protocol::codes::SYNC_CONSUMER_GROUP_CODE;
     use iggy_binary_protocol::codes::{GET_PARTITION_ROUTE_CODE, PING_CODE, SEND_MESSAGES_CODE};
     use iggy_binary_protocol::requests::consumer_offsets::{
         DeleteConsumerOffsetRequest, StoreConsumerOffsetRequest,
     };
     use iggy_binary_protocol::requests::messages::{RawMessage, SendMessagesEncoder};
+    use iggy_binary_protocol::responses::consumer_groups::SyncConsumerGroupResponse;
+    use iggy_binary_protocol::responses::messages::PollMessagesResponseHeader;
     use iggy_binary_protocol::{
         AckLevel, WireConsumer, WireIdentifier, WirePartitioning, WirePollingStrategy,
     };
@@ -285,10 +367,18 @@ mod tests {
     }
 
     /// Keeps the provided `send_raw_with_response`, the behavior under test.
-    #[derive(Default)]
+    #[derive(Debug, Default)]
     struct Recorder {
         calls: Mutex<Vec<Call>>,
         state: Arc<ConsumerGroupClientState>,
+        sync: Mutex<Option<SyncPublication>>,
+    }
+
+    #[derive(Debug)]
+    struct SyncPublication {
+        caller_changed: bool,
+        empty: bool,
+        replaced: bool,
     }
 
     impl Recorder {
@@ -318,6 +408,43 @@ mod tests {
             context: PartitionContext,
         ) -> Result<Bytes, IggyError> {
             self.record(Call::Raw(code, payload, context));
+            if code == SYNC_CONSUMER_GROUP_CODE {
+                let mut scenario = self.sync.lock().unwrap();
+                let scenario = scenario.as_mut().unwrap();
+                if scenario.replaced {
+                    assert!(self.state.is_registered("1|orders|3"));
+                    assert_eq!(self.state.next_group_partition("1|orders|3"), Some(7));
+                    if scenario.caller_changed {
+                        return Err(IggyError::Unauthenticated);
+                    }
+                } else {
+                    // The transport has accepted the reply; replacement wins before common cache publication.
+                    scenario.replaced = true;
+                    self.state.clear_session_scoped();
+                    self.state.register_group(
+                        "1|orders|3".to_owned(),
+                        Identifier::numeric(STREAM).unwrap(),
+                        Identifier::named(TOPIC).unwrap(),
+                        Identifier::numeric(3).unwrap(),
+                    );
+                    self.state
+                        .set_assignment("1|orders|3".to_owned(), 9, vec![7]);
+                    return Ok(if scenario.empty {
+                        Bytes::new()
+                    } else {
+                        SyncConsumerGroupResponse {
+                            generation: 1,
+                            partitions: vec![2],
+                        }
+                        .to_bytes()
+                    });
+                }
+                return Ok(SyncConsumerGroupResponse {
+                    generation: 9,
+                    partitions: vec![7],
+                }
+                .to_bytes());
+            }
             Ok(Bytes::from_static(RECEIPT))
         }
 
@@ -337,6 +464,15 @@ mod tests {
             context: Option<PartitionContext>,
         ) -> Result<Bytes, IggyError> {
             self.record(Call::Poll(request.clone(), context));
+            if self.sync.lock().unwrap().is_some() {
+                return Ok(PollMessagesResponseHeader {
+                    partition_id: request.partition_id.unwrap(),
+                    current_offset: 0,
+                    messages_count: 0,
+                    context: Default::default(),
+                }
+                .to_bytes());
+            }
             Ok(Bytes::from_static(RECEIPT))
         }
 
@@ -347,6 +483,130 @@ mod tests {
         fn consumer_group_state(&self) -> Arc<ConsumerGroupClientState> {
             Arc::clone(&self.state)
         }
+    }
+
+    impl VsrSessionSealed for Recorder {}
+    impl crate::BinaryClient for Recorder {}
+
+    #[async_trait]
+    impl VsrSessionControl for Recorder {
+        async fn session_bind_secret(&self) -> Result<BindSecret, IggyError> {
+            Err(IggyError::FeatureUnavailable)
+        }
+        async fn session_identity(&self) -> Result<SessionIdentity, IggyError> {
+            Err(IggyError::FeatureUnavailable)
+        }
+        async fn bind_vsr_session(&self, _session: u64) -> Result<(), IggyError> {
+            Err(IggyError::FeatureUnavailable)
+        }
+        async fn reset_vsr_session(&self) -> Result<(), IggyError> {
+            Err(IggyError::FeatureUnavailable)
+        }
+        fn sdk_version(&self) -> &'static str {
+            "0.0.0"
+        }
+    }
+
+    #[async_trait]
+    impl Client for Recorder {
+        async fn connect(&self) -> Result<(), IggyError> {
+            Ok(())
+        }
+        async fn disconnect(&self) -> Result<(), IggyError> {
+            Ok(())
+        }
+        async fn shutdown(&self) -> Result<(), IggyError> {
+            Ok(())
+        }
+        async fn subscribe_events(&self) -> async_broadcast::Receiver<DiagnosticEvent> {
+            async_broadcast::broadcast(1).1
+        }
+    }
+
+    async fn given_a_sync_reply_when_session_changes_before_publication_should_keep_new_membership(
+        caller_changed: bool,
+        empty: bool,
+    ) {
+        let transport = Recorder {
+            sync: Mutex::new(Some(SyncPublication {
+                caller_changed,
+                empty,
+                replaced: false,
+            })),
+            ..Default::default()
+        };
+        let result = transport
+            .poll_messages(
+                &Identifier::numeric(STREAM).unwrap(),
+                &Identifier::named(TOPIC).unwrap(),
+                None,
+                &Consumer::group(Identifier::numeric(3).unwrap()),
+                &PollingStrategy::offset(0),
+                1,
+                false,
+            )
+            .await;
+        if caller_changed {
+            assert_eq!(result.unwrap_err(), IggyError::Unauthenticated);
+        } else {
+            assert!(
+                result.is_ok(),
+                "automatic recovery must re-sync: {result:?}"
+            );
+        }
+        assert!(transport.state.is_registered("1|orders|3"));
+        assert_eq!(transport.state.next_group_partition("1|orders|3"), Some(7));
+        let calls = transport.take_calls();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| matches!(call, Call::Raw(SYNC_CONSUMER_GROUP_CODE, ..)))
+                .count(),
+            2
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| matches!(call, Call::Poll(..)))
+                .count(),
+            usize::from(!caller_changed)
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_sync_reply_when_session_changes_before_publication_should_keep_new_membership_recovery_assignment()
+     {
+        given_a_sync_reply_when_session_changes_before_publication_should_keep_new_membership(
+            false, false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn given_a_sync_reply_when_session_changes_before_publication_should_keep_new_membership_recovery_empty()
+     {
+        given_a_sync_reply_when_session_changes_before_publication_should_keep_new_membership(
+            false, true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn given_a_sync_reply_when_session_changes_before_publication_should_keep_new_membership_caller_assignment()
+     {
+        given_a_sync_reply_when_session_changes_before_publication_should_keep_new_membership(
+            true, false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn given_a_sync_reply_when_session_changes_before_publication_should_keep_new_membership_caller_empty()
+     {
+        given_a_sync_reply_when_session_changes_before_publication_should_keep_new_membership(
+            true, true,
+        )
+        .await;
     }
 
     fn wire_topic() -> WireIdentifier {
@@ -470,10 +730,29 @@ mod tests {
     #[tokio::test]
     async fn given_undecodable_partition_payload_when_sent_should_fail_before_sending() {
         let transport = Recorder::default();
-        for (code, payload) in [(POLL_MESSAGES_CODE, Bytes::from_static(b"lost-poll"))] {
-            let result = transport.send_raw_with_response(code, payload).await;
-            assert_eq!(result, Err(IggyError::InvalidCommand), "code {code}");
-        }
+
+        let result = transport
+            .send_raw_with_response(POLL_MESSAGES_CODE, Bytes::from_static(b"lost-poll"))
+            .await;
+
+        assert_eq!(result, Err(IggyError::InvalidCommand));
         assert!(transport.take_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn given_nested_clients_when_capturing_lineage_should_preserve_each_owner() {
+        let outer = BinaryOperationLineage::capture(1, 10);
+        with_binary_lineage(Some(outer), async {
+            assert_eq!(BinaryOperationLineage::capture(1, 11), outer);
+            let inner = BinaryOperationLineage::capture(2, 20);
+            assert_ne!(inner, outer);
+            with_binary_lineage(Some(inner), async {
+                assert_eq!(BinaryOperationLineage::capture(2, 21), inner);
+            })
+            .await;
+            assert_eq!(BinaryOperationLineage::capture(1, 12), outer);
+        })
+        .await;
+        assert!(binary_operation_lineage().is_none());
     }
 }

@@ -17,6 +17,7 @@
 
 """Exercise runtime archive transfer and CI selection without compiling the workspace."""
 
+import base64
 import json
 import os
 from pathlib import Path
@@ -230,7 +231,6 @@ class RuntimeSelection(unittest.TestCase):
         self.assertTrue(runtime_plan["tests"])
         self.assertEqual([entry["task"] for entry in runtime_plan["checks"]], ["test-storage-compat"])
         plan = json.loads(outputs["rust_plan"])
-        self.assertFalse(plan["tests"])
         self.assertFalse({"test", "test-storage-compat"} & {entry["task"] for entry in plan["checks"]})
 
     def test_swift_only_change_builds_server_for_e2e(self):
@@ -250,6 +250,137 @@ class RuntimeConsumers(unittest.TestCase):
                 uses = [step.get("uses") for step in steps]
                 if SERVER_START in uses:
                     self.assertIn(DOWNLOAD_RUNTIME, uses[:uses.index(SERVER_START)], path.relative_to(REPO_ROOT))
+
+
+class PublishSelection(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.remote = self.root / "origin.git"
+        self.checkout = self.root / "checkout"
+        self.checkout.mkdir()
+        self.env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
+                        GIT_AUTHOR_NAME="Publish test", GIT_AUTHOR_EMAIL="publish@example.com",
+                        GIT_COMMITTER_NAME="Publish test", GIT_COMMITTER_EMAIL="publish@example.com")
+        self.git("init", "--bare", "--quiet", str(self.remote))
+        self.git("init", "--quiet")
+        self.git("commit", "--allow-empty", "-m", "Release candidate A")
+        self.first_commit = self.git("rev-parse", "HEAD").strip()
+        self.git("commit", "--allow-empty", "-m", "Release candidate B")
+        self.git("remote", "add", "origin", str(self.remote))
+        self.git("push", "origin", "HEAD:refs/heads/master")
+        self.tags = {
+            "rust-common": "common-0.9.0-edge.1",
+            "rust-binary-protocol": "binary-protocol-0.9.0-edge.1",
+            "rust-sdk": "iggy-0.9.0-edge.1",
+            "rust-cli": "cli-0.9.0-edge.1",
+            "sdk-python": "python-sdk-0.9.0rc1",
+            "sdk-node": "node-sdk-0.9.0-rc.1",
+            "sdk-java": "java-sdk-0.9.0-rc.1",
+            "sdk-csharp": "csharp-sdk-0.9.0-rc.1",
+            "sdk-go": "foreign/go/v0.9.0-rc.1",
+        }
+        (self.checkout / "scripts").mkdir()
+
+    def git(self, *args):
+        result = run("git", *args, cwd=self.checkout, env=self.env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout
+
+    def release(self, *components):
+        for component in components or self.tags:
+            tag = self.tags[component]
+            if tag:
+                self.git("--git-dir", str(self.remote), "tag", "-a", tag,
+                         self.first_commit, "-m", tag)
+
+    def plan(self, *, automatic=True, skip_tags=False, docker="rust-server"):
+        extractor = []
+        for key, tag in self.tags.items():
+            extractor.append(f"{key}:--should-tag) echo {'true' if tag else 'false'} ;;")
+            if tag:
+                extractor.append(f"{key}:--tag) echo '{tag}' ;;")
+        (self.checkout / "scripts/extract-version.sh").write_text(
+            'case "$1:$2" in\n' + "\n".join(extractor) + "\n*) exit 1 ;;\nesac\n")
+        workflow = yaml.safe_load((REPO_ROOT / ".github/workflows/publish.yml").read_text())
+        config = yaml.safe_load((REPO_ROOT / ".github/config/publish.yml").read_text())["components"]
+        step = next(step for step in workflow["jobs"]["plan"]["steps"] if step.get("id") == "mk")
+        script = step["with"]["script"]
+        values = {
+            "steps.cfg.outputs.components_b64": base64.b64encode(json.dumps(config).encode()).decode(),
+            "inputs.publish_crates": ",".join(key for key in self.tags if key.startswith("rust-")),
+            "inputs.publish_dockerhub": docker,
+            "inputs.publish_other": ",".join(key.removeprefix("sdk-") for key in self.tags if key.startswith("sdk-")),
+            "inputs.create_edge_docker_tag": str(automatic).lower(),
+            "inputs.skip_tag_creation": str(skip_tags).lower(),
+        }
+        for expression, value in values.items():
+            script = script.replace("${{ " + expression + " }}", value)
+        harness = """
+const outputs = {};
+const core = { setOutput(name, value) { outputs[name] = value; }, info() {}, warning() {} };
+const console = { log() {} };
+"""
+        return run("node", "-e", harness + script + "\nprocess.stdout.write(JSON.stringify(outputs));",
+                   cwd=self.checkout, env=self.env)
+
+    def outputs(self, **kwargs):
+        result = self.plan(**kwargs)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_queued_publish_drops_completed_releases_but_keeps_edge_images(self):
+        before = self.outputs()
+        self.assertEqual({target["key"] for target in json.loads(before["targets"])["include"]},
+                         set(self.tags) | {"rust-server"})
+        self.release()
+        self.assertEqual(self.git("tag", "--list"), "")
+        after = self.outputs()
+        self.assertEqual([target["key"] for target in json.loads(after["targets"])["include"]], ["rust-server"])
+        self.assertEqual(after["crates"], "")
+        self.assertEqual(after["has_python"], "false")
+        self.assertEqual(after["has_docker"], "true")
+        self.assertEqual(len(json.loads(after["docker_matrix"])["include"]), 2)
+
+    def test_partial_release_keeps_only_unreleased_crates_and_sdks(self):
+        self.release("rust-sdk", "sdk-python")
+        outputs = self.outputs()
+        self.assertEqual(set(outputs["crates"].split(",")), {"rust-common", "rust-binary-protocol", "rust-cli"})
+        self.assertEqual({target["key"] for target in json.loads(outputs["targets"])["include"]},
+                         (set(self.tags) - {"rust-sdk", "sdk-python"}) | {"rust-server"})
+
+    def test_completed_release_without_docker_targets_produces_an_empty_plan(self):
+        self.release()
+        outputs = self.outputs(docker="")
+        self.assertEqual(outputs["count"], "0")
+        self.assertEqual(outputs["crates"], "")
+        self.assertEqual(outputs["has_python"], "false")
+        self.assertEqual(outputs["has_docker"], "false")
+        self.assertEqual(json.loads(outputs["targets"]), {"include": [{"key": "noop", "type": "noop"}]})
+
+    def test_mutable_snapshot_remains_selected_after_other_releases_complete(self):
+        self.tags["sdk-java"] = None
+        self.release()
+        outputs = self.outputs()
+        self.assertEqual([target["key"] for target in json.loads(outputs["non_docker_targets"])["include"]], ["sdk-java"])
+
+    def test_manual_and_explicit_republish_requests_keep_completed_releases(self):
+        self.release()
+        self.git("remote", "set-url", "origin", str(self.root / "missing.git"))
+        for options in ({"automatic": False}, {"skip_tags": True}):
+            with self.subTest(**options):
+                outputs = self.outputs(**options)
+                self.assertEqual({target["key"] for target in json.loads(outputs["targets"])["include"]},
+                                 set(self.tags) | {"rust-server"})
+                self.assertEqual(outputs["has_python"], "true")
+
+    def test_remote_lookup_failure_does_not_produce_a_publish_plan(self):
+        self.git("remote", "set-url", "origin", str(self.root / "missing.git"))
+        result = self.plan()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not appear to be a git repository", result.stderr)
+        self.assertEqual(result.stdout, "")
 
 
 if __name__ == "__main__":

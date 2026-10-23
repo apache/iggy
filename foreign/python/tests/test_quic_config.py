@@ -416,6 +416,13 @@ class TestQuicClientConstruction:
         """Test that an explicit default `QuicConfig` is accepted."""
         assert IggyClient(QuicConfig()) is not None
 
+    def test_accepts_a_connection_string_without_a_running_loop(self):
+        """QUIC construction opens no endpoint, so it needs no Tokio runtime."""
+        client = IggyClient.from_connection_string(
+            "iggy+quic://iggy:iggy@127.0.0.1:8080"
+        )
+        assert client is not None
+
 
 @pytest.mark.integration
 class TestAutoLoginAgainstServer:

@@ -43,19 +43,18 @@ type linkReply struct {
 type linkPending struct{ reply chan linkReply }
 
 type tcpLink struct {
-	boundFence     uint64
-	boundWatermark uint64
-	bindGate       chan struct{}
-	conn           net.Conn
-	endpoint       string
-	mu             sync.Mutex
-	pending        map[uint64]*linkPending
-	capacity       chan struct{}
-	writes         chan *operationFrame
-	closed         chan struct{}
-	senders        sync.WaitGroup
-	closeOnce      sync.Once
-	done           sync.WaitGroup
+	boundFence uint64
+	bindGate   chan struct{}
+	conn       net.Conn
+	endpoint   string
+	mu         sync.Mutex
+	pending    map[uint64]*linkPending
+	capacity   chan struct{}
+	writes     chan *operationFrame
+	closed     chan struct{}
+	senders    sync.WaitGroup
+	closeOnce  sync.Once
+	done       sync.WaitGroup
 }
 
 func newTCPLink(conn net.Conn, endpoint string) *tcpLink {
@@ -84,7 +83,8 @@ func (l *tcpLink) exchange(ctx context.Context, frame *operationFrame) (linkRepl
 		return linkReply{err: ierror.ErrTransientNotAccepted}, false
 	default:
 	}
-	if l.pending[id] != nil {
+	// A select picks a ready case at random, so a cancelled caller must be refused before its frame is queued.
+	if l.pending[id] != nil || ctx.Err() != nil {
 		l.mu.Unlock()
 		<-l.capacity
 		return linkReply{err: ierror.ErrTransientNotAccepted}, false
@@ -219,14 +219,17 @@ func (l *tcpLink) readLoop() {
 	}
 }
 
-func (l *tcpLink) markBound(fence, watermark uint64) {
+func (l *tcpLink) markBound(fence uint64) {
 	l.mu.Lock()
 	l.boundFence = fence
-	l.boundWatermark = watermark
 	l.mu.Unlock()
 }
-func (l *tcpLink) isBound(fence, watermark uint64) bool {
+
+// isBound reports whether the link carries the session of fence. A link binds
+// once per session: each request carries its own metadata floor, so a rising
+// watermark needs no new bind.
+func (l *tcpLink) isBound(fence uint64) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.boundFence == fence && l.boundWatermark >= watermark
+	return l.boundFence == fence
 }
