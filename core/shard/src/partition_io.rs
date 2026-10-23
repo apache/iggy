@@ -2490,6 +2490,7 @@ mod tests {
                     floor: None,
                     peer: 1,
                     idle_ticks: 0,
+                    requested_from: Some(1),
                 });
                 let reply =
                     Message::<RepairRangeReplyHeader>::new(size_of::<RepairRangeReplyHeader>())
@@ -2562,6 +2563,7 @@ mod tests {
             floor: None,
             peer: 0,
             idle_ticks: 0,
+            requested_from: Some(1),
         });
         assert_eq!(
             partition.complete_repair(partitions.config()).await,
@@ -3209,6 +3211,7 @@ mod tests {
                 floor: None,
                 peer: 0,
                 idle_ticks: 0,
+                requested_from: Some(1),
             });
             owner.plane.partitions().insert(namespace, partition);
 
@@ -5297,6 +5300,7 @@ mod tests {
                 owner.on_repair_prepare(repaired).await;
             }
             let before = partition.consensus().commit_min();
+            let requested = requests.borrow().len();
             for command in [Command::RangeEvicted, Command::RepairDone] {
                 let foreign_reply = reply.clone().transmute_header(
                     |header, foreign: &mut RepairRangeReplyHeader| {
@@ -5309,8 +5313,9 @@ mod tests {
                 owner.on_repair_range_reply(&foreign_reply).await;
                 assert_eq!(partition.consensus().commit_min(), before);
                 assert_eq!(partition.repair.unwrap().floor, None);
-                assert!(
-                    requests.borrow().is_empty(),
+                assert_eq!(
+                    requests.borrow().len(),
+                    requested,
                     "a different peer cannot complete or advance this repair session"
                 );
             }
@@ -7466,6 +7471,173 @@ mod tests {
     }
 
     #[compio::test]
+    async fn given_a_blank_start_view_head_when_repair_arrives_should_preserve_and_prove_history() {
+        const HEAD: u64 = 3;
+        for held in [false, true] {
+            for canonical in [true, false] {
+                let (bus, _probes) = probe_capturing_bus();
+                let (owner, _sender) = test_owner(&bus, None);
+                let namespace = IggyNamespace::new(0, 0, 0);
+                let prepares =
+                    Box::pin(blank_head_backup(&owner, &bus, namespace, HEAD, held)).await;
+                let partition = owner.plane.partitions().get_mut_by_ns(&namespace).unwrap();
+                // Bodies stamped in an older view prove nothing, but stay held.
+                assert!(partition.consensus().view_log_unproven());
+                assert!((1..=HEAD).all(|op| partition.log.journal().inner.holds_op(op)));
+                assert!(partition.view_fence_unanchored());
+                partition
+                    .commit_journal(owner.plane.partitions().config())
+                    .await;
+                assert_eq!(partition.consensus().commit_min(), 0);
+
+                let head = *prepares.last().unwrap().header();
+                let answer = if canonical { head } else { forked(head) };
+                owner
+                    .on_start_view(start_view_suffix(
+                        namespace,
+                        BLANK_HEAD_VIEW,
+                        HEAD,
+                        HEAD,
+                        &[answer],
+                    ))
+                    .await;
+                let partition = owner.plane.partitions().get_mut_by_ns(&namespace).unwrap();
+                partition
+                    .commit_journal(owner.plane.partitions().config())
+                    .await;
+                if canonical {
+                    assert!(!partition.view_fenced());
+                    assert_eq!(partition.consensus().commit_min(), HEAD);
+                } else {
+                    assert!(
+                        partition.consensus().commit_min() < HEAD,
+                        "held={held}: a head the view names differently must not commit"
+                    );
+                }
+            }
+        }
+    }
+
+    #[compio::test]
+    async fn given_a_probe_answer_naming_a_held_entry_differently_when_proving_should_not_commit_it()
+     {
+        const HEAD: u64 = 4;
+        let (bus, _probes) = probe_capturing_bus();
+        let (owner, _sender) = test_owner(&bus, None);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let prepares = Box::pin(blank_head_backup(&owner, &bus, namespace, HEAD, true)).await;
+        let headers: Vec<_> = prepares.iter().map(|prepare| *prepare.header()).collect();
+        // The lowest sealed header anchors the fence below the diverging head.
+        let answer = [forked(headers[3]), headers[2], headers[1]];
+        owner
+            .on_start_view(start_view_suffix(
+                namespace,
+                BLANK_HEAD_VIEW,
+                HEAD,
+                HEAD,
+                &answer,
+            ))
+            .await;
+        let partition = owner.plane.partitions().get_mut_by_ns(&namespace).unwrap();
+        partition
+            .commit_journal(owner.plane.partitions().config())
+            .await;
+        assert!(partition.consensus().commit_min() < HEAD);
+        assert!(
+            partition.view_truncation_pending() || !partition.log.journal().inner.holds_op(HEAD)
+        );
+    }
+
+    const BLANK_HEAD_VIEW: u32 = 3;
+
+    /// A bus that records the `RequestStartView` probes sent to the view's primary.
+    fn probe_capturing_bus() -> (Rc<IggyMessageBus>, Rc<RefCell<Vec<RequestStartViewHeader>>>) {
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let probes = Rc::new(RefCell::new(Vec::new()));
+        let captured = Rc::clone(&probes);
+        bus.set_replica_forward_fn(Box::new(move |_, _, frame| {
+            let message =
+                Message::<GenericHeader>::try_from(Owned::copy_from_slice(frame.as_slice()))
+                    .unwrap();
+            if message.header().command == Command::RequestStartView {
+                let probe = Message::<RequestStartViewHeader>::try_from(Owned::copy_from_slice(
+                    frame.as_slice(),
+                ))
+                .unwrap();
+                captured.borrow_mut().push(*probe.header());
+            }
+            Ok(())
+        }));
+        let primary = u8::try_from(BLANK_HEAD_VIEW % 3).unwrap();
+        assert!(bus.owner_table().try_claim(primary, 1));
+        (bus, probes)
+    }
+
+    /// A backup that adopted [`BLANK_HEAD_VIEW`] from a `StartView` with a blank head
+    /// and then received the history up to `head` through repair, in bodies stamped
+    /// by an older view that the view's log does not vouch for. With `journaled`, it
+    /// held that history before the adoption.
+    #[allow(clippy::future_not_send)]
+    async fn blank_head_backup(
+        owner: &IoTestShard,
+        bus: &Rc<IggyMessageBus>,
+        namespace: IggyNamespace,
+        head: u64,
+        journaled: bool,
+    ) -> Vec<Message<PrepareHeader>> {
+        let prepares = primary_prepares(bus, namespace, head).await;
+        let mut partition =
+            repairing_replica(bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
+        partition.repair = None;
+        if journaled {
+            for prepare in &prepares {
+                partition.on_replicate(prepare.clone()).await;
+            }
+        }
+        owner.plane.partitions().remove(&namespace).unwrap();
+        owner.plane.partitions().insert(namespace, partition);
+        owner
+            .on_start_view(start_view_suffix(
+                namespace,
+                BLANK_HEAD_VIEW,
+                head,
+                head,
+                &[consensus::dvc_blank(head)],
+            ))
+            .await;
+        let partition = owner.plane.partitions().get_by_ns(&namespace).unwrap();
+        assert!(partition.consensus().view_log_unproven());
+        assert!(!partition.view_truncation_pending());
+        assert_eq!(partition.log.journal().inner.holds_op(head), journaled);
+        let repaired: Vec<_> = if journaled {
+            prepares.last().into_iter().cloned().collect()
+        } else {
+            prepares.clone()
+        };
+        for prepare in repaired.into_iter().rev() {
+            owner
+                .on_repair_prepare(prepare.transmute_header(
+                    |header, repaired: &mut iggy_binary_protocol::RepairPrepareHeader| {
+                        repaired.0 = header;
+                        repaired.0.command = Command::RepairPrepare;
+                    },
+                ))
+                .await;
+        }
+        prepares
+    }
+
+    /// A sealed header at the same op and on the same parent as `header`, naming a
+    /// different entry.
+    fn forked(header: PrepareHeader) -> PrepareHeader {
+        let mut fork = header;
+        fork.checksum_body ^= 1;
+        fork.checksum = fork.identity_checksum();
+        assert_ne!(fork.checksum, header.checksum);
+        fork
+    }
+
+    #[compio::test]
     async fn given_a_blank_start_view_head_when_repair_arrives_should_require_vouched_history() {
         const HEAD: u64 = 1;
         const NEW_VIEW: u32 = 3;
@@ -7658,6 +7830,7 @@ mod tests {
             commit_to_op: STALE_SHAPE_OP,
             fetch_to_op: STALE_SHAPE_OP,
             floor: None,
+            requested_from: Some(STALE_SHAPE_OP),
             peer,
             idle_ticks: 0,
         });
@@ -7912,6 +8085,7 @@ mod tests {
             floor: None,
             peer,
             idle_ticks: 0,
+            requested_from: Some(commit_min + 1),
         });
         partition
     }

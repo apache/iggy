@@ -546,6 +546,9 @@ view_probe_attempts_max = 5
 # on a single dropped frame. Paces both the metadata and partition repair loops;
 # must be nonzero. Paces streams that are already OPEN only: how long a hole
 # waits before one is opened for it is repair_gap_debounce_interval below.
+# Also paces the RequestStartView probe a partition backup sends while its
+# entries from before a newer view wait for a header to prove them against;
+# those probes have no attempt cap.
 repair_retry_interval = "1s"
 
 # How long a backup must hold committed ops it cannot walk to before the shard's
@@ -566,7 +569,7 @@ repair_retry_interval = "1s"
 # per node, so its detector is not rate-capped.
 repair_gap_debounce_interval = "1s"
 
-# Prepares a peer serves per repair round before the requester walks to the next
+# Prepares a peer serves per repair round before the requester asks for the next
 # chunk (integer). Each frame rides the per-peer message-bus queue, so this must
 # stay strictly below message_bus.peer_queue_capacity or a full round overruns
 # the queue and drops frames. Must be > 0 and <= 1024.

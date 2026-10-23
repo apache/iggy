@@ -4843,6 +4843,15 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             .flatten()
     }
 
+    /// Whether the accepted `StartView` names `header`'s prepare identity.
+    #[must_use]
+    pub fn adopted_view_vouches_for(&self, header: &PrepareHeader) -> bool {
+        self.adopted_view
+            .borrow()
+            .as_ref()
+            .is_some_and(|adopted| adopted.vouches_for(header))
+    }
+
     /// The accepted `StartView`'s view and advertised head, including after repair.
     #[must_use]
     pub fn adopted_view_head(&self) -> Option<(u32, u64)> {

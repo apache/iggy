@@ -37,6 +37,7 @@ use crate::state_transfer::{
 use crate::types::{
     COMMIT_WALK_OPS_MAX, FatalCommit, RepairConclusion, RepairIngest, RepairSession,
 };
+use crate::view_fence::{ViewFence, ViewWindowVerdict, view_window_verdict};
 use crate::{
     AppendResult, Partition, PartitionOffsets, PartitionsConfig, PollFragments, PollQueryResult,
     PollingArgs, PollingConsumer,
@@ -119,6 +120,7 @@ pub struct OffsetSpace {
 }
 
 // This struct aliases in terms of the code contained the `LocalPartition from `core/server/src/streaming/partitions/local_partition.rs`.
+#[allow(clippy::struct_excessive_bools)]
 pub struct IggyPartition<B = IggyMessageBus, SB = PingPongSuperblock>
 where
     B: MessageBus,
@@ -261,6 +263,18 @@ where
     pub(crate) transition: Option<PendingPartitionTransition>,
     deferred_views: Vec<server_common::MessageBag>,
     pub(crate) pending_consumer_offset_commits: HashMap<u64, PendingConsumerOffsetCommit>,
+    /// Entries journaled before this replica adopted the current view, held back
+    /// from commit and acknowledgement until proven. See [`Self::fence_view_window`].
+    view_fence: Option<ViewFence>,
+    /// Set at boot when the WAL replayed history: the first view adoption after a
+    /// restart fences it even though `log_view` came back unchanged.
+    recovered_unproven: bool,
+    /// Commit point the recovered WAL names. Entries at or below it are
+    /// committed history, so a fence neither holds them back nor proves them.
+    recovered_commit: u64,
+    /// First op of a broken fenced window the I/O lane is truncating. The fence's
+    /// follow-up runs when that truncation lands.
+    unproven_drop_from: Option<u64>,
     /// Identity shared with pending polls and replaced when their history retires.
     poll_history: PollHistoryId,
     incarnation: crate::PartitionIncarnation,
@@ -888,6 +902,10 @@ where
             installed_frontier: None,
             fatal: None,
             pending_consumer_offset_commits: HashMap::new(),
+            view_fence: None,
+            recovered_unproven: false,
+            recovered_commit: 0,
+            unproven_drop_from: None,
             pending_commit: None,
             local_request_order: Cell::new(0),
             no_ack: VecDeque::new(),
@@ -1697,6 +1715,7 @@ where
                 self.consensus.set_last_prepare_checksum(checksum);
             }
             self.consensus.restore_commit_state(checkpoint, commit);
+            self.recovered_commit = commit;
         }
         // Recovery can reuse completed writes whose last barrier was interrupted.
         // Include them once before reclaiming any recovered WAL history.
@@ -1750,6 +1769,7 @@ where
                 }
             }
         }
+        self.recovered_unproven = persistence.head() > 0;
         Ok(())
     }
 
@@ -2316,11 +2336,30 @@ where
             return false;
         }
         self.persist_repaired_prefix();
-        let ready = persistence.certify_log_view(
-            self.consensus.log_view(),
-            self.consensus.sequencer().current_sequence(),
-            self.consensus.last_prepare_checksum(),
-        );
+        let (op, checksum) = if let Some(fence) = self.view_fence.filter(|_| self.view_fenced()) {
+            // The certificate covers the whole WAL, so while fenced it may only
+            // vouch for a WAL holding nothing above `commit_min`, and only when
+            // the window sits below the suffix a `DoViewChange` reports.
+            let floor = self.consensus.commit_min();
+            if persistence.head() != floor || fence.through >= self.consensus.commit_max() {
+                return false;
+            }
+            let checksum = if floor == 0 {
+                0
+            } else {
+                let Some(checksum) = persistence.checksum(floor) else {
+                    return false;
+                };
+                checksum
+            };
+            (floor, checksum)
+        } else {
+            (
+                self.consensus.sequencer().current_sequence(),
+                self.consensus.last_prepare_checksum(),
+            )
+        };
+        let ready = persistence.certify_log_view(self.consensus.log_view(), op, checksum);
         self.start_persistence();
         ready
     }
@@ -2356,6 +2395,13 @@ where
             &prepare.as_slice()[..size_of::<PrepareHeader>()],
         )
         .map_or(u64::MAX, |header| header.op);
+        // Same cap as `persist_repaired_prefix_through`: a held entry can sit at
+        // the WAL head, and a prepare chaining to the view's entry instead would
+        // fail the WAL's parent check. The proof's release writes the journal's
+        // copy once the window is proven.
+        if self.view_fenced() && op > self.consensus.commit_min() {
+            return false;
+        }
         if op > persistence.head().saturating_add(1) {
             self.persist_repaired_prefix_through(op.saturating_sub(1));
             if op > persistence.head().saturating_add(1) {
@@ -2380,6 +2426,13 @@ where
     fn persist_repaired_prefix_through(&self, through: u64) {
         let Some(persistence) = &self.persistence else {
             return;
+        };
+        // A held entry can sit at the WAL head, where a repaired successor that
+        // chains to the view's entry instead would fail the WAL's parent check.
+        let through = if self.view_fenced() {
+            through.min(self.consensus.commit_min())
+        } else {
+            through
         };
         while let Some(op) = persistence.head().checked_add(1) {
             if op > through
@@ -5826,6 +5879,17 @@ where
         self.notify_io();
     }
 
+    /// Run a view adoption's `actions` once the pending truncation lands, so the
+    /// pipeline rebuild reads the journal after the cut.
+    pub fn defer_view_adoption(&mut self, adoption: Vec<consensus::VsrAction>, from: u8) {
+        if let Some(PendingPartitionTransition::Truncate { actions, peer, .. }) =
+            &mut self.transition
+        {
+            actions.extend(adoption);
+            *peer = Some(from);
+        }
+    }
+
     #[must_use]
     pub const fn view_truncation_pending(&self) -> bool {
         matches!(
@@ -6097,7 +6161,19 @@ where
             else {
                 unreachable!("truncate transition exists");
             };
-            self.remove_resident_range(ops).await?;
+            let from_op = *ops.start();
+            // Another cut that lands first leaves the marked entries resident, so the
+            // marker stays for the proof that finds them again.
+            let unproven_drop = self
+                .unproven_drop_from
+                .is_some_and(|marked| from_op <= marked);
+            if unproven_drop {
+                self.unproven_drop_from = None;
+            }
+            let removed = self.remove_resident_range(ops).await?;
+            if unproven_drop {
+                self.note_unproven_dropped(from_op, removed);
+            }
             return Ok(crate::PartitionIoStep::ViewApplied { actions, peer });
         }
         if matches!(
@@ -8240,6 +8316,18 @@ where
             }
             return;
         }
+        // A Break drops the window from the broken op, inline or on the I/O lane
+        // once a mounted partition's other history work settles. Either way this
+        // prepare would sit above the cut on a head that does not chain to it.
+        // The fence keeps its anchor. The primary resends only ops still short
+        // of quorum, so gap repair, not a retransmit, may be what refills it.
+        if self.consensus().is_follower() && self.offer_view_anchor(&header) {
+            let verdict = self.prove_view_window().await;
+            if matches!(verdict, Some(ViewWindowVerdict::Break { .. })) || self.refuses_prepares() {
+                self.notify_io();
+                return;
+            }
+        }
 
         let journal_holds_op = self.log.journal().inner.holds_op(header.op);
         if journal_holds_op {
@@ -8659,6 +8747,15 @@ where
                 .await;
             return;
         }
+        // After the in-flight commit: a proof that breaks truncates the journal.
+        if self.view_fenced() {
+            if !self.view_proof_deferred() {
+                self.prove_view_window().await;
+            }
+            if self.view_fenced() && self.recovered_commit <= self.consensus.commit_min() {
+                return;
+            }
+        }
 
         // The primary commits inline via `on_ack` (it drains its own pipeline).
         // Backups never populate the pipeline - they journal replicated prepares
@@ -8669,7 +8766,13 @@ where
         // tail still finds its headers here (no wedge). Pipeline-first keeps a
         // freshly promoted primary (rebuilt pipeline) draining there, avoiding a
         // double-count against `advance_commit_min`.
-        let mut drained = self.select_persistable_commits(config);
+        // A fenced pipeline holds unproven entries: only the journal walk, capped
+        // at the recovered commit point, may take ops.
+        let mut drained = if self.view_fenced() {
+            Vec::new()
+        } else {
+            self.select_persistable_commits(config)
+        };
         let send_client_replies = !drained.is_empty() && self.consensus.is_primary();
         if drained.is_empty() {
             drained = self.collect_committable_from_journal(COMMIT_WALK_OPS_MAX, config);
@@ -8776,6 +8879,9 @@ where
         }
 
         let from_op = self.consensus.commit_min() + 1;
+        if self.view_fenced() && self.recovered_commit < from_op {
+            return Vec::new();
+        }
         // Stop below the pipeline head. The drain above holds rather than pops
         // when the head is not the op owed next; walking that op out of the
         // journal instead advances `commit_min` past a still-resident entry, and
@@ -8794,6 +8900,11 @@ where
             .pipeline_head_header()
             .filter(|head| head.op >= from_op)
             .map_or(commit_max, |head| commit_max.min(head.op - 1));
+        let commit_max = if self.view_fenced() {
+            commit_max.min(self.recovered_commit)
+        } else {
+            commit_max
+        };
         let materialize = self.should_persist_messages(config);
         self.log
             .journal()
@@ -9037,6 +9148,345 @@ where
         })
     }
 
+    /// Hold `(fence_floor, through]` back from commit and acknowledgement, where
+    /// `fence_floor` is the higher of `commit_min` and the recovered commit point, until
+    /// [`Self::prove_view_window`] links it into `anchor`, the current view's header
+    /// at `through + 1`. Without an anchor the first current-view prepare at that op
+    /// supplies one (`offer_view_anchor`).
+    ///
+    /// For a replica that adopted a newer view: it can hold an entry from a log the
+    /// view discarded under the view's commit point, which nothing else compares
+    /// against the view's log.
+    pub fn fence_view_window(&mut self, through: u64, anchor: Option<PrepareHeader>) {
+        if through <= self.fence_floor() {
+            self.view_fence = None;
+            return;
+        }
+        let view = self.consensus.view();
+        let previous = self
+            .view_fence
+            .filter(|fence| fence.view == view && fence.through == through);
+        let anchor = anchor
+            .filter(PrepareHeader::anchors_chain)
+            .or_else(|| previous.and_then(|fence| fence.anchor));
+        if previous.is_none() {
+            debug!(
+                namespace_raw = self.namespace().inner(),
+                view,
+                commit_min = self.consensus.commit_min(),
+                floor = self.fence_floor(),
+                recovered_commit = self.recovered_commit,
+                through,
+                anchored = anchor.is_some(),
+                "holding partition entries journaled before this view until its log proves them"
+            );
+        }
+        self.view_fence = Some(ViewFence {
+            view,
+            through,
+            anchor,
+            hole: previous.and_then(|fence| fence.hole),
+            unanchored_ticks: previous.map_or(0, |fence| fence.unanchored_ticks),
+        });
+    }
+
+    /// Highest op through which this replica holds every entry above its commit
+    /// point. Repair progress, since a fenced commit point cannot move until the
+    /// whole window is held.
+    #[must_use]
+    pub fn held_through(&self) -> u64 {
+        self.log
+            .journal()
+            .inner
+            .held_through(self.consensus.commit_min())
+    }
+
+    /// Whether an anchored fence holds every entry of its window, so a proof
+    /// now concludes instead of waiting on repair.
+    #[must_use]
+    pub fn view_fence_held(&self) -> bool {
+        self.view_fence.as_ref().is_some_and(|fence| {
+            fence.anchor.is_some()
+                && fence.through > self.consensus.commit_min()
+                && self
+                    .log
+                    .journal()
+                    .inner
+                    .held_through_until(self.consensus.commit_min(), fence.through)
+                    >= fence.through
+        })
+    }
+
+    /// Whether a commit walk would run the proof of a held fence now.
+    #[must_use]
+    pub fn view_fence_provable(&self) -> bool {
+        self.fatal.is_none()
+            && !self.materialization_missing
+            && !self.persistence_checkpoint_pending()
+            // The commit walk returns before the proof while the view's log is unproven.
+            && !self.consensus.view_log_unproven()
+            && !self.view_proof_deferred()
+            && self.view_fence_held()
+    }
+
+    /// Whether a proof now would only find the same `Break` again: a Break found
+    /// while history work runs or a transition is queued cuts nothing
+    /// (`drop_unproven_from`), so walking the window rebuilds its header map for
+    /// nothing.
+    fn view_proof_deferred(&self) -> bool {
+        self.history_is_busy() || self.transition.is_some()
+    }
+
+    /// An installed snapshot replaces the history the recovered commit point named.
+    pub(crate) const fn forget_recovered_commit(&mut self) {
+        self.recovered_commit = 0;
+    }
+
+    /// Whether a fenced walk still has recovered committed ops to take.
+    #[must_use]
+    pub fn recovered_prefix_pending(&self) -> bool {
+        self.view_fenced() && self.recovered_commit > self.consensus.commit_min()
+    }
+
+    /// Bottom of a fenced window: what this replica committed, or the recovered
+    /// commit point when the walk has not reached it yet.
+    #[must_use]
+    pub fn fence_floor(&self) -> u64 {
+        self.consensus.commit_min().max(self.recovered_commit)
+    }
+
+    /// Whether a fenced window is still unproven.
+    #[must_use]
+    pub fn view_fenced(&self) -> bool {
+        self.view_fence
+            .as_ref()
+            .is_some_and(|fence| fence.through > self.consensus.commit_min())
+    }
+
+    /// Whether the fence is still waiting for its anchor.
+    #[must_use]
+    pub fn view_fence_unanchored(&self) -> bool {
+        self.view_fenced()
+            && self
+                .view_fence
+                .as_ref()
+                .is_some_and(|fence| fence.anchor.is_none())
+    }
+
+    /// Count one tick without an anchor; true every `every` ticks, when the caller
+    /// should ask the view's primary for its headers again.
+    pub fn view_fence_probe_due(&mut self, every: u32) -> bool {
+        if !self.view_fence_unanchored() {
+            return false;
+        }
+        let Some(fence) = self.view_fence.as_mut() else {
+            return false;
+        };
+        fence.unanchored_ticks = fence.unanchored_ticks.saturating_add(1);
+        if fence.unanchored_ticks < every.max(1) {
+            return false;
+        }
+        fence.unanchored_ticks = 0;
+        true
+    }
+
+    /// Take `header` as the fence's anchor when it is the op above the window and
+    /// was prepared in the fence's view. Only for a header from that view's primary
+    /// (a prepare that passed `replicate_preflight`, or its `StartView`). Returns
+    /// whether the anchor was taken.
+    pub(crate) const fn offer_view_anchor(&mut self, header: &PrepareHeader) -> bool {
+        if let Some(fence) = self.view_fence.as_mut()
+            && fence.anchor.is_none()
+            && fence.view == header.view
+            && header.op == fence.through + 1
+            && header.anchors_chain()
+        {
+            fence.anchor = Some(*header);
+            fence.hole = None;
+            return true;
+        }
+        false
+    }
+
+    /// Lowest op of the fenced window, at or under `commit_max`, with no entry:
+    /// what repair has to fetch before the chain can reach below it.
+    #[must_use]
+    pub fn view_fence_hole(&self) -> Option<u64> {
+        let fence = self.view_fence.as_ref()?;
+        let floor = self.fence_floor();
+        let top = fence.through.min(self.consensus.commit_max());
+        let held = self.log.journal().inner.held_through_until(floor, top);
+        (held < top).then_some(held + 1)
+    }
+
+    /// Residency of a window op. A forced flush evicts past `commit_min` only on a
+    /// caught-up primary or at shutdown, and the flush is capped while fenced, so
+    /// a window op is never ring-only and the index alone answers.
+    fn holds_view_entry(&self, op: u64) -> bool {
+        self.log.journal().inner.holds_op(op)
+    }
+
+    /// Check the fenced window against its anchor. `Proven` lifts the fence, a
+    /// `Break` drops the entries from the broken op so repair refetches the view's,
+    /// a `Hole` waits for repair. `None` while there is no fence or no anchor.
+    ///
+    /// A `Break` cuts the whole suffix from the broken op, entries the anchor
+    /// already proved and current-view prepares included; none of them was acked.
+    /// Without an I/O dispatcher the cut runs here. With one it is handed to the
+    /// I/O lane, or left for the next proof while other history work holds the
+    /// lane, and the entries stay resident until the lane runs it.
+    pub async fn prove_view_window(&mut self) -> Option<ViewWindowVerdict> {
+        let fence = self.view_fence?;
+        let floor = self.fence_floor();
+        if fence.through <= floor {
+            self.view_fence = None;
+            self.persist_repaired_prefix();
+            return Some(ViewWindowVerdict::Proven);
+        }
+        let anchor = fence.anchor?;
+        // A commit floor raised past the hole (a repair floor, an install) took
+        // it out of the window.
+        if let Some(hole) = fence.hole.filter(|hole| *hole > floor)
+            && !self.holds_view_entry(hole)
+        {
+            return Some(ViewWindowVerdict::Hole { op: hole });
+        }
+        let journal = &self.log.journal().inner;
+        let verdict = view_window_verdict(floor, fence.through, anchor.parent, |op| {
+            journal.repair_header(op)
+        });
+        match verdict {
+            ViewWindowVerdict::Proven => {
+                // The WAL flush below reads the last append per op; a duplicate
+                // whose last append is not the entry just proven breaks there.
+                if let Some(op) = (floor + 1..=fence.through).find_map(|op| {
+                    let header = journal.repair_header(op)?;
+                    let flushed = journal.repair_entry(op)?;
+                    let flushed = bytemuck::checked::try_from_bytes::<PrepareHeader>(
+                        &flushed.as_slice()[..size_of::<PrepareHeader>()],
+                    )
+                    .ok()?;
+                    (flushed.checksum != header.checksum).then_some(op)
+                }) {
+                    self.drop_unproven_from(op).await;
+                    return Some(ViewWindowVerdict::Break { op });
+                }
+                debug!(
+                    namespace_raw = self.namespace().inner(),
+                    through = fence.through,
+                    "the adopted view's log proves the held partition entries"
+                );
+                self.view_fence = None;
+                // A Break earlier in this fence left it naming a dropped entry.
+                let head = self.consensus.sequencer().current_sequence();
+                if let Some(header) = self.log.journal().inner.repair_header(head) {
+                    self.consensus.set_last_prepare_checksum(header.checksum);
+                }
+                self.persist_repaired_prefix();
+                self.queue_acks_withheld_by_fence(fence.through, head);
+            }
+            ViewWindowVerdict::Hole { op } => {
+                if fence.hole != Some(op) {
+                    debug!(
+                        namespace_raw = self.namespace().inner(),
+                        op, "held partition entries wait on op {op} before they can be proven"
+                    );
+                }
+                if let Some(fence) = self.view_fence.as_mut() {
+                    fence.hole = Some(op);
+                }
+            }
+            ViewWindowVerdict::Break { op } => self.drop_unproven_from(op).await,
+        }
+        Some(verdict)
+    }
+
+    async fn drop_unproven_from(&mut self, op: u64) {
+        // The evicted ring holds only the applied prefix, so a broken entry above
+        // `commit_min` is always resident.
+        debug_assert!(self.log.journal().inner.holds_op(op));
+        if !self.log.journal().inner.holds_op(op) {
+            error!(
+                namespace_raw = self.namespace().inner(),
+                op,
+                "partition entry at op {op} is not the adopted view's and is already \
+                 flushed; marking the partition fatal and shutting down"
+            );
+            self.mark_view_fence_fatal(op);
+            return;
+        }
+        if self.has_io_dispatcher() {
+            // The I/O lane owns a mounted partition's WAL. While other history work
+            // is in flight or a transition is queued the fence keeps holding, and
+            // the next proof finds the same break.
+            if !self.view_proof_deferred() {
+                self.unproven_drop_from = Some(op);
+                self.defer_view_truncation(op..=u64::MAX, Vec::new(), None);
+            }
+            return;
+        }
+        match self.truncate_uncommitted_from(op).await {
+            Ok(removed) => self.note_unproven_dropped(op, removed),
+            Err(error) => {
+                error!(
+                    namespace_raw = self.namespace().inner(),
+                    op,
+                    %error,
+                    "cannot drop partition entries from op {op} the adopted view's log does not \
+                     chain to; marking the partition fatal and shutting down"
+                );
+                self.mark_view_fence_fatal(op);
+            }
+        }
+    }
+
+    fn note_unproven_dropped(&mut self, op: u64, removed: usize) {
+        warn!(
+            namespace_raw = self.namespace().inner(),
+            op,
+            removed,
+            view = self.consensus.view(),
+            "dropped {removed} partition entries from op {op}: the adopted view's log does not \
+             chain to them"
+        );
+        if let Some(fence) = self.view_fence.as_mut() {
+            fence.hole = None;
+        }
+        self.persist_repaired_prefix();
+    }
+
+    /// Prepares this view's primary sent while the window was fenced were
+    /// journaled but neither persisted nor acked. The primary resends one only
+    /// while it lacks quorum, after its retransmit timeout. Queue their acks for
+    /// the WAL to release as soon as the fence lifts.
+    fn queue_acks_withheld_by_fence(&self, through: u64, head: u64) {
+        let view = self.consensus.view();
+        let mut pending = self.pending_persisted_acks.borrow_mut();
+        for op in through + 1..=head {
+            if let Some(header) = self.log.journal().inner.repair_header(op)
+                && header.view == view
+            {
+                pending.insert(op, header);
+            }
+        }
+        drop(pending);
+        self.notify_io();
+    }
+
+    fn mark_view_fence_fatal(&mut self, op: u64) {
+        self.fatal = Some(FatalCommit {
+            namespace_raw: self.namespace().inner(),
+            op,
+            operation: None,
+        });
+    }
+
+    /// Whether the WAL replayed history at boot, consumed by the first view
+    /// adoption so it fences that history even with `log_view` unchanged.
+    pub fn take_recovered_unproven(&mut self) -> bool {
+        std::mem::take(&mut self.recovered_unproven)
+    }
+
     /// Drop an uncommitted view-divergent suffix inline and restore append cursors
     /// from the retained prefix. Mounted partitions defer this work to the I/O lane.
     ///
@@ -9171,8 +9621,27 @@ where
             }
         }
         self.consensus.note_journal_mutation();
+        if *ops.start() <= self.recovered_commit {
+            let lowered = ops.start().saturating_sub(1);
+            error!(
+                namespace_raw = self.namespace().inner(),
+                from_op = *ops.start(),
+                recovered_commit = self.recovered_commit,
+                lowered,
+                "cut partition entries the WAL recovered as committed; lowering the recovered \
+                 commit point to {lowered} so repair refetches them"
+            );
+            self.recovered_commit = lowered;
+        }
         self.pending_consumer_offset_commits
             .retain(|op, _| !ops.contains(op));
+        // Nothing is in flight for a cut range, so the next sweep re-requests it
+        // instead of waiting out the retry timer.
+        if removed > 0
+            && let Some(session) = self.repair.as_mut()
+        {
+            session.requested_from = None;
+        }
         self.offset_reservations_need_resync.set(true);
         self.truncated_since_scan.set(true);
         Ok(removed)
@@ -9282,7 +9751,8 @@ where
     }
 
     /// Materialize inline for partitions without a dispatcher. Returns false
-    /// while the captured prefix is pending in the WAL.
+    /// while the captured prefix is pending in the WAL. While a view fence is up
+    /// it flushes no further than `commit_min`.
     async fn commit_messages_inner(
         &mut self,
         config: &PartitionsConfig,
@@ -9328,7 +9798,12 @@ where
         if self.materialization.is_some() {
             return Ok(true);
         }
-        let through_op = self.consensus.commit_max().min(through_op);
+        let mut through_op = self.consensus.commit_max().min(through_op);
+        // Forced flushes (shutdown, transfer offers) reach here without the walk:
+        // nothing above an unproven window may land in a segment.
+        if self.view_fenced() {
+            through_op = through_op.min(self.consensus.commit_min());
+        }
         let prefix_len = self.materializable_prefix_len(through_op);
         if prefix_len == 0 {
             return Ok(true);
@@ -11928,7 +12403,7 @@ where
     }
 
     /// Ingest one repaired prepare: journal + stage it exactly like a live
-    /// replicated op, minus the view fence, the gap check, and the ack (the
+    /// replicated op, minus the view-number check, the gap check, and the ack (the
     /// op is already committed cluster-wide; there is nobody to ack to). The
     /// commit walk runs at `RepairDone`, after the floor is known.
     pub async fn apply_repaired_prepare(
@@ -11937,6 +12412,11 @@ where
     ) -> RepairIngest {
         let header = *message.header();
         if self.view_truncation_pending() || !self.prepare_history_available(&header) {
+            return RepairIngest::Handled;
+        }
+        // The I/O lane already cut the WAL for a broken fenced window; an entry
+        // journaled now would outlive it there. Refetched once the cut lands.
+        if self.unproven_drop_from.is_some() {
             return RepairIngest::Handled;
         }
         let Some(session) = self.repair else {
@@ -12340,6 +12820,11 @@ where
 
     async fn send_prepare_ok(&self, header: &PrepareHeader) -> bool {
         if self.fatal.is_some() || self.materialization_missing {
+            return false;
+        }
+        // An ack above an unproven window can be wiped when the window turns out
+        // to break; the primary's retransmit re-drives it once the fence lifts.
+        if self.view_fenced() {
             return false;
         }
         // Durable-before-send: a PrepareOk implies this replica's
@@ -29949,6 +30434,7 @@ mod tests {
             floor: Some(floor),
             peer: 0,
             idle_ticks: 0,
+            requested_from: Some(1),
         }
     }
 
@@ -29978,6 +30464,686 @@ mod tests {
             .append(prepare.into_frozen())
             .await
             .expect("journal append");
+    }
+
+    /// A sealed prepare at `op` chained to `parent`, journaled. `request` tells two
+    /// entries at the same op apart.
+    async fn journal_sealed(
+        partition: &IggyPartition<IggyMessageBus>,
+        op: u64,
+        parent: u128,
+        request: u64,
+    ) -> PrepareHeader {
+        let prepare = sealed_prepare(op, parent, request);
+        let header = *prepare.header();
+        partition
+            .log
+            .journal()
+            .inner
+            .append(prepare.into_frozen())
+            .await
+            .expect("journal append");
+        header
+    }
+
+    fn sealed_prepare(op: u64, parent: u128, request: u64) -> Message<PrepareHeader> {
+        let size = std::mem::size_of::<PrepareHeader>();
+        Message::<PrepareHeader>::new(size).transmute_header(|_, header: &mut PrepareHeader| {
+            header.command = Command::Prepare;
+            header.client = message_bus::AUTO_COMMIT_CLIENT_ID;
+            header.session = 1;
+            header.request = request;
+            header.op = op;
+            header.parent = parent;
+            header.operation = Operation::CreateStream;
+            header.size = u32::try_from(size).expect("prepare header size fits in u32");
+            header.checksum = header.identity_checksum();
+        })
+    }
+
+    fn walked_ops(partition: &IggyPartition<IggyMessageBus>) -> Vec<u64> {
+        partition
+            .collect_committable_from_journal(COMMIT_WALK_OPS_MAX, &repair_config())
+            .into_iter()
+            .map(|header| header.op)
+            .collect()
+    }
+
+    #[compio::test]
+    async fn given_a_fenced_window_when_the_anchor_proves_it_should_release_the_walk() {
+        let mut partition = test_partition();
+        let first = journal_sealed(&partition, 1, 0, 1).await;
+        let second = journal_sealed(&partition, 2, first.checksum, 2).await;
+        partition.consensus.restore_commit_state(0, 2);
+        partition.fence_view_window(2, None);
+        assert!(
+            walked_ops(&partition).is_empty(),
+            "the walk applied an entry the view has not vouched for"
+        );
+
+        partition.offer_view_anchor(sealed_prepare(3, second.checksum, 3).header());
+        assert_eq!(
+            partition.prove_view_window().await,
+            Some(ViewWindowVerdict::Proven)
+        );
+        assert!(!partition.view_fenced());
+        assert_eq!(walked_ops(&partition), vec![1, 2]);
+    }
+
+    #[compio::test]
+    async fn given_an_old_views_entry_under_the_anchor_when_proving_without_a_dispatcher_should_drop_it_and_stay_fenced()
+     {
+        let mut partition = test_partition();
+        let first = journal_sealed(&partition, 1, 0, 1).await;
+        // The view's op 2, which the anchor chains to, is not what is held.
+        let canonical_second = sealed_prepare(2, first.checksum, 2);
+        journal_sealed(&partition, 2, first.checksum, 99).await;
+        partition.consensus.restore_commit_state(0, 2);
+        partition.fence_view_window(
+            2,
+            Some(*sealed_prepare(3, canonical_second.header().checksum, 3).header()),
+        );
+
+        assert_eq!(
+            partition.prove_view_window().await,
+            Some(ViewWindowVerdict::Break { op: 2 })
+        );
+        assert!(!partition.log.journal().inner.holds_op(2));
+        assert!(partition.log.journal().inner.holds_op(1));
+        assert!(
+            walked_ops(&partition).is_empty(),
+            "op 1 is not proven until op 2 is refetched, so the walk must still hold"
+        );
+        assert!(partition.view_fenced());
+    }
+
+    #[compio::test]
+    async fn given_a_hole_in_the_fenced_window_when_proving_should_truncate_nothing() {
+        let mut partition = test_partition();
+        journal_sealed(&partition, 1, 0, 1).await;
+        let third = journal_sealed(&partition, 3, 7, 3).await;
+        partition.consensus.restore_commit_state(0, 3);
+        partition.fence_view_window(3, Some(*sealed_prepare(4, third.checksum, 4).header()));
+
+        assert_eq!(
+            partition.prove_view_window().await,
+            Some(ViewWindowVerdict::Hole { op: 2 })
+        );
+        assert!(
+            partition.log.journal().inner.holds_op(1) && partition.log.journal().inner.holds_op(3),
+            "a hole is no evidence against the entries around it"
+        );
+        assert_eq!(partition.view_fence_hole(), Some(2));
+        assert!(partition.view_fenced());
+    }
+
+    #[compio::test]
+    async fn given_a_recovered_commit_point_when_fenced_should_walk_the_committed_prefix() {
+        let mut partition = test_partition();
+        let first = journal_sealed(&partition, 1, 0, 1).await;
+        let second = journal_sealed(&partition, 2, first.checksum, 2).await;
+        journal_sealed(&partition, 3, second.checksum, 3).await;
+        partition.consensus.restore_commit_state(0, 3);
+        partition.recovered_commit = 2;
+        partition.fence_view_window(3, None);
+
+        assert!(partition.view_fenced());
+        assert_eq!(
+            walked_ops(&partition),
+            vec![1, 2],
+            "the recovered WAL already named ops 1 and 2 committed"
+        );
+    }
+
+    #[compio::test]
+    async fn given_a_wal_naming_a_commit_point_when_restarted_and_fenced_should_commit_the_recovered_prefix()
+     {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut partition, _) = recording_partition_at(1, 3);
+        partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        partition.log.retire_front().unwrap();
+        partition
+            .install_empty_segment(&repair_config(), 0)
+            .await
+            .unwrap();
+        let mut journal = journal::PartitionPrepareJournal::open(
+            &directory.path().join("prepares-0"),
+            partition.consensus().group(),
+            0,
+        )
+        .await
+        .unwrap();
+        let mut parent = 0;
+        for op in 1..=4u64 {
+            let mut prepare = checksummed_segment_prepare(op, parent, op - 1, b"recovered");
+            prepare = prepare.transmute_header(|old, header: &mut PrepareHeader| {
+                *header = old;
+                header.commit = op - 1;
+                header.checksum = header.identity_checksum();
+            });
+            parent = prepare.header().checksum;
+            journal.append(prepare.into_frozen()).await.unwrap();
+        }
+        drop(journal);
+        partition.open_persistence().await.unwrap();
+        assert_eq!(partition.consensus.commit_min(), 0);
+        assert_eq!(partition.consensus.commit_max(), 3);
+
+        partition.fence_view_window(4, None);
+        assert!(partition.view_fenced());
+        partition.commit_journal(&repair_config()).await;
+
+        assert!(partition.fatal.is_none(), "{:?}", partition.fatal);
+        assert_eq!(
+            partition.consensus.commit_min(),
+            3,
+            "the recovered WAL named ops 1..=3 committed"
+        );
+        assert!(
+            partition.view_fenced(),
+            "op 4 stays held until the view's log proves it"
+        );
+    }
+
+    #[compio::test]
+    async fn given_a_fenced_window_when_its_hole_fills_should_report_it_held() {
+        let mut partition = test_partition();
+        let first = journal_sealed(&partition, 1, 0, 1).await;
+        partition.consensus.restore_commit_state(0, 3);
+        partition.fence_view_window(3, Some(*sealed_prepare(4, 9, 4).header()));
+        assert_eq!(partition.held_through(), 1);
+        assert!(!partition.view_fence_held());
+
+        let second = journal_sealed(&partition, 2, first.checksum, 2).await;
+        assert!(!partition.view_fence_held());
+        journal_sealed(&partition, 3, second.checksum, 3).await;
+        assert_eq!(partition.held_through(), 3);
+        assert!(partition.view_fence_held());
+    }
+
+    #[compio::test]
+    async fn given_an_anchor_from_another_view_when_offered_should_refuse_it() {
+        let mut partition = test_partition();
+        let first = journal_sealed(&partition, 1, 0, 1).await;
+        partition.consensus.restore_commit_state(0, 1);
+        partition.fence_view_window(1, None);
+        let mut other_view = *sealed_prepare(2, first.checksum, 2).header();
+        other_view.view = partition.consensus.view() + 1;
+        assert!(
+            !partition.offer_view_anchor(&other_view),
+            "an anchor from a view the fence was not installed in vouches for the wrong log"
+        );
+        assert!(partition.view_fence_unanchored());
+    }
+
+    #[compio::test]
+    async fn given_an_unsealed_anchor_when_fencing_should_stay_unanchored() {
+        let mut partition = test_partition();
+        journal_sealed(&partition, 1, 0, 1).await;
+        partition.consensus.restore_commit_state(0, 1);
+        // What a `StartView` carries at a commit point the primary holds no
+        // header for: checksum and parent both zero.
+        let blank = PrepareHeader {
+            command: Command::Prepare,
+            op: 2,
+            ..Default::default()
+        };
+        partition.fence_view_window(1, Some(blank));
+        assert!(
+            partition.view_fence_unanchored(),
+            "a blank anchor links any window below it"
+        );
+        assert!(!partition.offer_view_anchor(&blank));
+    }
+
+    /// A Break leaves `last_prepare_checksum` naming the entry it dropped, and the
+    /// refetch fills the op without moving the head; unless the proof refreshes
+    /// it, certification keeps failing on a quiet partition.
+    #[compio::test]
+    async fn given_a_stale_last_prepare_checksum_when_the_window_proves_should_certify() {
+        let (_directory, mut partition, held) = partition_with_pending_durable_ack().await;
+        let persistence = partition.persistence.as_ref().unwrap().clone();
+        let view = partition.consensus().view() + 1;
+        partition.consensus.set_view(view);
+        partition.consensus().set_log_view(view);
+        partition.consensus().restore_commit_state(0, 1);
+        partition
+            .consensus()
+            .set_last_prepare_checksum(held.checksum ^ 1);
+        let anchor = checksummed_segment_prepare(2, held.checksum, 0, b"anchor");
+        partition.fence_view_window(1, Some(*anchor.header()));
+        assert_eq!(
+            partition.prove_view_window().await,
+            Some(ViewWindowVerdict::Proven)
+        );
+        partition.ensure_wal_view();
+        persistence
+            .drain_with_timeout(compio::runtime::time::sleep)
+            .await
+            .unwrap();
+        assert_eq!(persistence.certified_log_view(), Some(view));
+    }
+
+    #[compio::test]
+    async fn given_a_fenced_wal_when_certifying_should_vouch_only_for_the_applied_prefix() {
+        let (_directory, mut partition, held) = partition_with_pending_durable_ack().await;
+        let persistence = partition.persistence.as_ref().unwrap().clone();
+        let view = partition.consensus().view() + 1;
+        partition.consensus.set_view(view);
+        partition.consensus().set_log_view(view);
+        partition.consensus().sequencer().set_sequence(4);
+
+        // A window reaching the suffix the next `DoViewChange` reports: muted.
+        partition.consensus().restore_commit_state(held.op, 3);
+        partition.fence_view_window(3, None);
+        assert!(!partition.ensure_wal_view());
+        persistence
+            .drain_with_timeout(compio::runtime::time::sleep)
+            .await
+            .unwrap();
+        assert_ne!(persistence.certified_log_view(), Some(view));
+
+        // WAL holds nothing above `commit_min`, window below the suffix: certified.
+        partition.consensus().advance_commit_max(4);
+        partition.ensure_wal_view();
+        persistence
+            .drain_with_timeout(compio::runtime::time::sleep)
+            .await
+            .unwrap();
+        assert_eq!(persistence.certified_log_view(), Some(view));
+    }
+
+    #[compio::test]
+    async fn given_an_unanchored_fence_when_ticking_should_ask_for_headers_at_the_pace_given() {
+        let mut partition = test_partition();
+        journal_sealed(&partition, 1, 0, 1).await;
+        partition.consensus.restore_commit_state(0, 1);
+        partition.fence_view_window(1, None);
+        let due: Vec<bool> = (0..6).map(|_| partition.view_fence_probe_due(3)).collect();
+        assert_eq!(due, vec![false, false, true, false, false, true]);
+    }
+
+    #[compio::test]
+    async fn given_a_cached_hole_when_the_missing_op_arrives_should_bypass_the_cache() {
+        let mut partition = test_partition();
+        journal_sealed(&partition, 1, 0, 1).await;
+        let third = journal_sealed(&partition, 3, 7, 3).await;
+        partition.consensus.restore_commit_state(0, 3);
+        partition.fence_view_window(3, Some(*sealed_prepare(4, third.checksum, 4).header()));
+        assert_eq!(
+            partition.prove_view_window().await,
+            Some(ViewWindowVerdict::Hole { op: 2 })
+        );
+        assert_eq!(partition.view_fence.and_then(|fence| fence.hole), Some(2));
+        // Op 3 chains to parent 7, which the arriving op 2 is not.
+        journal_sealed(&partition, 2, 0, 99).await;
+        assert_eq!(
+            partition.prove_view_window().await,
+            Some(ViewWindowVerdict::Break { op: 2 }),
+            "the cache must be bypassed once the missing op arrives"
+        );
+    }
+
+    /// The fence holds entries back from the WAL too: a stale entry can sit at the
+    /// WAL head, and appending the view's successor on top of it fails the WAL's
+    /// parent check, which fences the whole partition.
+    #[compio::test]
+    async fn given_a_stale_wal_head_when_fenced_should_not_persist_repaired_successors() {
+        let (_directory, mut partition, stale) = partition_with_pending_durable_ack().await;
+        let persistence = partition.persistence.as_ref().unwrap().clone();
+        assert_eq!(persistence.head(), stale.op);
+        let canonical = checksummed_segment_prepare(1, 0, 7, b"canonical");
+        let successor =
+            checksummed_segment_prepare(2, canonical.header().checksum, 0, b"successor");
+        partition
+            .log
+            .journal()
+            .inner
+            .append(successor.clone().into_frozen())
+            .await
+            .unwrap();
+        partition.consensus().sequencer().set_sequence(2);
+        partition.consensus().restore_commit_state(0, 2);
+        partition.fence_view_window(1, Some(*successor.header()));
+
+        partition.persist_repaired_prefix();
+        assert_eq!(
+            persistence.head(),
+            stale.op,
+            "a repaired successor reached the WAL above an unproven entry"
+        );
+        assert!(persistence.failure().is_none());
+    }
+
+    /// With an I/O dispatcher the Break is handed to the lane: the stale entry
+    /// stays resident and repair frames are refused until the cut lands, then the
+    /// hole is refetched at once.
+    #[compio::test]
+    async fn given_a_dispatcher_when_the_proof_breaks_should_defer_the_drop_to_the_lane() {
+        let (_directory, mut partition, stale) = partition_with_pending_durable_ack().await;
+        let persistence = partition.persistence.as_ref().unwrap().clone();
+        partition.set_io_notifier(
+            Rc::new(|_, _| {}),
+            crate::largest_legal_job_charge().unwrap(),
+        );
+        let view = partition.consensus().view() + 1;
+        partition.consensus.set_view(view);
+        partition.consensus().set_log_view(view);
+        partition.consensus().restore_commit_state(0, 1);
+        let canonical = checksummed_segment_prepare(1, 0, 7, b"canonical");
+        let anchor = checksummed_segment_prepare(2, canonical.header().checksum, 0, b"anchor");
+        partition.repair = Some(RepairSession {
+            view,
+            ..armed_session(2, 0)
+        });
+        partition.fence_view_window(1, Some(*anchor.header()));
+
+        assert_eq!(
+            partition.prove_view_window().await,
+            Some(ViewWindowVerdict::Break { op: 1 })
+        );
+        assert!(
+            partition.log.journal().inner.holds_op(1),
+            "the lane, not the proof, truncates a mounted partition"
+        );
+        assert_eq!(partition.unproven_drop_from, Some(1));
+        assert!(partition.refuses_prepares());
+        partition.apply_repaired_prepare(canonical.clone()).await;
+        partition.apply_repaired_prepare(anchor.clone()).await;
+        assert!(
+            !partition.log.journal().inner.holds_op(2),
+            "a repaired body landed under a pending cut"
+        );
+        assert_eq!(
+            partition
+                .log
+                .journal()
+                .inner
+                .repair_header(1)
+                .map(|header| header.checksum),
+            Some(stale.checksum),
+            "a repaired body journaled before the cut would outlive it in the WAL"
+        );
+
+        let config = repair_config();
+        let mut applied = false;
+        for _ in 0..64 {
+            match partition.resume_io(&config).await {
+                crate::PartitionIoStep::Ready(plan) => {
+                    execute_partition_io_plan(&mut partition, &config, plan).await;
+                }
+                crate::PartitionIoStep::Progress => {}
+                crate::PartitionIoStep::ViewApplied { .. } => {
+                    applied = true;
+                    break;
+                }
+                crate::PartitionIoStep::Pending => {
+                    persistence
+                        .drain_with_timeout(compio::runtime::time::sleep)
+                        .await
+                        .unwrap();
+                }
+                _ => panic!("unexpected partition I/O continuation"),
+            }
+        }
+        assert!(applied, "the lane never ran the truncation");
+        assert!(!partition.log.journal().inner.holds_op(1));
+        assert_eq!(partition.unproven_drop_from, None);
+        assert_eq!(persistence.head(), 0);
+        assert_eq!(
+            partition.repair.map(|session| session.requested_from),
+            Some(None),
+            "the hole must be refetched without waiting out the retry timer"
+        );
+        assert!(partition.view_fenced());
+        assert!(partition.fatal.is_none());
+    }
+
+    /// A proof that breaks while other history work holds the lane drops
+    /// nothing yet; the anchor that triggered it must not reach the WAL on top
+    /// of the stale head it does not chain to. Its retransmit skips the proof,
+    /// since the fence already holds the anchor, so the WAL itself has to refuse.
+    #[compio::test]
+    async fn given_busy_history_when_an_anchor_breaks_the_window_should_not_append_it_to_the_wal() {
+        let (_directory, mut partition, _stale) = partition_with_pending_durable_ack().await;
+        let persistence = partition.persistence.as_ref().unwrap().clone();
+        partition.set_io_notifier(
+            Rc::new(|_, _| {}),
+            crate::largest_legal_job_charge().unwrap(),
+        );
+        let view = partition.consensus().view() + 1;
+        partition.consensus.set_view(view);
+        partition.consensus().set_log_view(view);
+        partition.consensus().restore_commit_state(0, 1);
+        partition.fence_view_window(1, None);
+        partition.maintenance.flush_through = Some(1);
+        assert!(partition.history_is_busy());
+        let canonical = checksummed_segment_prepare(1, 0, 7, b"canonical");
+        let anchor = checksummed_segment_prepare(2, canonical.header().checksum, 0, b"anchor")
+            .transmute_header(|mut original, header: &mut PrepareHeader| {
+                original.view = view;
+                original.checksum = original.identity_checksum();
+                *header = original;
+            });
+        let sequence = partition.consensus().sequencer().current_sequence();
+        partition.on_replicate(anchor.clone()).await;
+        assert!(!partition.view_fence_unanchored());
+        assert!(partition.view_fenced());
+        assert_eq!(partition.unproven_drop_from, None);
+        assert!(
+            !partition.log.journal().inner.holds_op(2),
+            "the anchor was journaled above a window its proof broke"
+        );
+        assert_eq!(
+            partition.consensus().sequencer().current_sequence(),
+            sequence
+        );
+        partition.on_replicate(anchor).await;
+        let _ = persistence
+            .drain_with_timeout(compio::runtime::time::sleep)
+            .await;
+        assert!(
+            persistence.failure().is_none(),
+            "the anchor was appended on a WAL head it does not chain to: {:?}",
+            persistence.failure()
+        );
+        assert_eq!(persistence.head(), 1);
+        assert!(partition.fatal.is_none());
+    }
+
+    /// The lane's cut is pending but nothing else refuses the frame: the gate
+    /// on the pending drop alone keeps a repaired body out of the journal.
+    #[compio::test]
+    async fn given_a_pending_unproven_drop_when_a_repair_frame_arrives_should_not_journal_it() {
+        let mut partition = test_partition();
+        partition.repair = Some(armed_session(3, 0));
+        partition.unproven_drop_from = Some(1);
+        assert!(!partition.refuses_prepares());
+
+        partition
+            .apply_repaired_prepare(repaired_send_prepare(1, 0, 1))
+            .await;
+        assert_eq!(
+            partition.log.journal().inner.resident_count(),
+            0,
+            "a repaired body was journaled under a pending cut"
+        );
+        assert_eq!(partition.consensus().sequencer().current_sequence(), 0);
+    }
+
+    /// A repair commit floor (`complete_repair` taking the peer's
+    /// `RangeEvicted` floor) can raise the fence floor past the hole the last
+    /// proof stopped at. The cached hole then names an op outside the window
+    /// and must not keep the proof waiting on it.
+    #[compio::test]
+    async fn given_a_cached_hole_under_a_raised_floor_when_proving_should_not_wait_on_it() {
+        let mut partition = test_partition();
+        journal_sealed(&partition, 1, 0, 1).await;
+        let third = journal_sealed(&partition, 3, 7, 3).await;
+        partition.consensus.restore_commit_state(0, 3);
+        partition.fence_view_window(3, Some(*sealed_prepare(4, third.checksum, 4).header()));
+        assert_eq!(
+            partition.prove_view_window().await,
+            Some(ViewWindowVerdict::Hole { op: 2 })
+        );
+
+        partition.consensus.set_commit_floor(2);
+        assert_eq!(partition.view_fence_hole(), None);
+        assert_eq!(
+            partition.prove_view_window().await,
+            Some(ViewWindowVerdict::Proven),
+            "the proof waited on a hole below the raised floor"
+        );
+        assert!(!partition.view_fenced());
+    }
+
+    /// A prepare received while the window was fenced is journaled but neither
+    /// persisted nor acked. The primary resends it only while it lacks quorum,
+    /// after a retransmit timeout, so proving the window releases its ack
+    /// without waiting for one.
+    #[compio::test]
+    async fn given_a_prepare_received_while_fenced_when_the_window_is_proven_should_ack_it_without_a_retransmit()
+     {
+        let (_directory, mut partition, held) = partition_with_pending_durable_ack().await;
+        let persistence = partition.persistence.as_ref().unwrap().clone();
+        let sent = partition.consensus().message_bus().sent_to_replicas.clone();
+        let view = partition.consensus().view() + 1;
+        partition.consensus.set_view(view);
+        partition.consensus().set_log_view(view);
+        partition.consensus().restore_commit_state(0, 1);
+        // The held op 1 was journaled behind the append counter's back; wake
+        // the counter so the live successor continues it at offset 1.
+        partition.offset_space.append_live = true;
+        partition.dirty_offset.store(0, Ordering::Relaxed);
+        let successor = checksummed_segment_prepare(2, held.checksum, 1, b"successor")
+            .transmute_header(|mut original, header: &mut PrepareHeader| {
+                original.view = view;
+                original.checksum = original.identity_checksum();
+                *header = original;
+            });
+        partition.fence_view_window(1, Some(*successor.header()));
+        partition.on_replicate(successor).await;
+        assert!(partition.log.journal().inner.holds_op(2));
+        assert_eq!(
+            persistence.head(),
+            1,
+            "a fenced replica persisted a prepare above the window"
+        );
+        sent.borrow_mut().clear();
+
+        assert_eq!(
+            partition.prove_view_window().await,
+            Some(ViewWindowVerdict::Proven)
+        );
+        for _ in 0..4 {
+            persistence
+                .drain_with_timeout(compio::runtime::time::sleep)
+                .await
+                .unwrap();
+            partition.drive_persistence().await;
+        }
+        let acked: Vec<u64> = sent
+            .borrow()
+            .iter()
+            .filter_map(|(_, frame)| {
+                let header =
+                    bytemuck::checked::try_from_bytes::<PrepareOkHeader>(frame.as_slice()).ok()?;
+                (header.command == Command::PrepareOk).then_some(header.op)
+            })
+            .collect();
+        assert!(
+            acked.contains(&2),
+            "the fence lifted without acking op 2: {acked:?}"
+        );
+        assert_eq!(persistence.head(), 2);
+        assert!(partition.pending_persisted_acks.borrow().is_empty());
+        assert!(partition.fatal.is_none());
+    }
+
+    /// Only a prepare of the view that proved the window was withheld by the
+    /// fence. An older view's entry above it is not the view's, and its ack
+    /// would vouch for a log the view never sent.
+    #[compio::test]
+    async fn given_an_older_views_entry_above_the_window_when_proven_should_not_queue_its_ack() {
+        let mut partition = test_partition();
+        let first = journal_sealed(&partition, 1, 0, 1).await;
+        let view = partition.consensus().view() + 1;
+        partition.consensus.set_view(view);
+        let in_view = |op: u64, parent: u128| {
+            sealed_prepare(op, parent, op).transmute_header(
+                |mut original, header: &mut PrepareHeader| {
+                    original.view = view;
+                    original.checksum = original.identity_checksum();
+                    *header = original;
+                },
+            )
+        };
+        let anchor = in_view(2, first.checksum);
+        let older = journal_sealed(&partition, 2, first.checksum, 2).await;
+        let current = in_view(3, older.checksum);
+        partition
+            .log
+            .journal()
+            .inner
+            .append(current.into_frozen())
+            .await
+            .expect("journal append");
+        partition.consensus().sequencer().set_sequence(3);
+        partition.consensus.restore_commit_state(0, 1);
+        partition.fence_view_window(1, Some(*anchor.header()));
+
+        assert_eq!(
+            partition.prove_view_window().await,
+            Some(ViewWindowVerdict::Proven)
+        );
+        let queued: Vec<u64> = partition
+            .pending_persisted_acks
+            .borrow()
+            .keys()
+            .copied()
+            .collect();
+        assert_eq!(queued, vec![3], "an older view's entry had its ack queued");
+    }
+
+    #[compio::test]
+    async fn given_a_fenced_window_when_acking_should_withhold_the_ack() {
+        let (mut partition, _) = recording_partition_at(1, 3);
+        let prepare = sealed_prepare(1, 0, 1);
+        let first = *prepare.header();
+        partition
+            .log
+            .journal()
+            .inner
+            .append(prepare.into_frozen())
+            .await
+            .expect("journal append");
+        partition.consensus.sequencer().set_sequence(1);
+        partition.consensus.restore_commit_state(0, 1);
+        assert!(
+            partition.send_prepare_ok(&first).await,
+            "an unfenced backup acks what it holds"
+        );
+        partition.fence_view_window(1, None);
+        assert!(
+            !partition.send_prepare_ok(&first).await,
+            "an ack above an unproven window can be wiped when the window breaks"
+        );
+    }
+
+    #[compio::test]
+    async fn given_a_staged_offset_under_commit_max_when_its_entry_is_truncated_should_drop_the_staging()
+     {
+        let mut partition = test_partition();
+        journal_prepare(&partition, 1, Operation::StoreConsumerOffset).await;
+        journal_prepare(&partition, 2, Operation::StoreConsumerOffset).await;
+        partition.consensus.sequencer().set_sequence(2);
+        partition.consensus.restore_commit_state(0, 2);
+        partition.stage_consumer_offset_upsert(2, ConsumerKind::Consumer, 8, 0, false);
+        partition.truncate_uncommitted_from(2).await.unwrap();
+        assert!(
+            !partition.pending_consumer_offset_commits.contains_key(&2),
+            "the stale cursor would be applied in place of the view's op 2"
+        );
     }
 
     /// Walking through the head advances `commit_min` past a resident entry only
@@ -32274,6 +33440,42 @@ mod tests {
             IggyIndex::new(7, 8, FIRST_PAYLOAD.len() as u64),
             "the second entry must address the first chunk's end"
         );
+    }
+
+    #[compio::test]
+    async fn given_a_fenced_window_when_flushing_should_write_nothing_above_commit_min() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log_path = dir.path().join("segment.log");
+        let index_path = dir.path().join("segment.index");
+        let mut fixture = PersistFixture::new(
+            log_path.to_str().expect("utf-8 path"),
+            index_path.to_str().expect("utf-8 path"),
+        )
+        .await;
+        let partition = &mut fixture.partition;
+        partition.log.journal().inner.set_repair_retention(true);
+        partition.repair = Some(armed_session(3, 0));
+        for op in 1..=3 {
+            partition
+                .apply_repaired_prepare(repaired_send_prepare(
+                    op,
+                    u128::from(op - 1),
+                    u128::from(op),
+                ))
+                .await;
+        }
+        partition.consensus().advance_commit_max(3);
+        partition.fence_view_window(3, None);
+
+        partition
+            .flush_committed_messages(&repair_config())
+            .await
+            .expect("flush");
+        assert!(
+            std::fs::read(&log_path).unwrap().is_empty(),
+            "a forced flush wrote unproven entries to the segment"
+        );
+        assert!((1..=3).all(|op| partition.log.journal().inner.holds_op(op)));
     }
 
     #[compio::test]
