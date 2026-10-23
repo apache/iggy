@@ -29,7 +29,7 @@ use iggy_connector_sdk::retry::retry_backoff;
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata, sink_connector,
 };
-use rumqttc::QoS as MqttQos;
+use rumqttc_v4::QoS as MqttQos;
 use secrecy::SecretString;
 use serde::Deserialize;
 use std::sync::{

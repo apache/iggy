@@ -19,7 +19,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use iggy_common::{HeaderKey, IggyTimestamp};
 use iggy_connector_sdk::{ConsumedMessage, Error, Payload, TopicMetadata};
-use rumqttc::v5::mqttbytes::v5::PublishProperties;
+use rumqttc_v5::mqttbytes::v5::PublishProperties;
 use serde::Deserialize;
 use std::sync::Arc;
 
