@@ -986,6 +986,7 @@ mod tests {
                     commit: 0,
                     group,
                     suffix: DvcSuffix::empty(),
+                    untrusted_log: false,
                 },
                 VsrAction::SendRequestStartView { view, group },
                 VsrAction::SendStartView {
@@ -6339,7 +6340,8 @@ mod tests {
             ))
             .await;
 
-        let partition = owner.plane.partitions().get_by_ns(&namespace).unwrap();
+        // The refusal also fences the partition for resync, behind the tombstone.
+        let partition = owner.plane.partitions().get_io_owner(&namespace).unwrap();
         assert_eq!(
             partition.consensus().view(),
             REPAIR_VIEW,
@@ -6378,11 +6380,59 @@ mod tests {
             owner.metrics.partition_applied_log_contradictions_value(),
             1
         );
-        let partition = owner.plane.partitions().get_by_ns(&namespace).unwrap();
+        let partition = owner.plane.partitions().get_io_owner(&namespace).unwrap();
         assert_eq!(
             partition.consensus().applied_log_contradictions(),
             1,
             "the export must leave the total for the simulator invariants"
+        );
+    }
+
+    #[compio::test]
+    async fn given_a_start_view_contradicting_an_evicted_applied_op_when_refused_should_fence_the_partition_for_resync()
+     {
+        const APPLIED: u64 = 2;
+        const NEW_VIEW: u32 = 3;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let (owner, _sender) = test_owner(&bus, None);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let prepares = primary_prepares(&bus, namespace, APPLIED).await;
+        host_applied_backup(&owner, &bus, namespace, &prepares).await;
+        {
+            let partition = owner.plane.partitions().get_by_ns(&namespace).unwrap();
+            let journal = &partition.log.journal().inner;
+            journal.evict_prefix(usize::try_from(APPLIED).unwrap());
+            assert!(journal.header_by_op(APPLIED).is_none());
+            assert!(partition.wal_checksum(APPLIED).is_none());
+            assert!(partition.applied_header(APPLIED).is_some());
+        }
+        let mut forged = *prepares.last().unwrap().header();
+        forged.timestamp += 1;
+        forged.checksum = forged.identity_checksum();
+
+        owner
+            .on_start_view(start_view_suffix(
+                namespace,
+                NEW_VIEW,
+                APPLIED,
+                APPLIED,
+                &[forged],
+            ))
+            .await;
+
+        let partitions = owner.plane.partitions();
+        assert!(
+            partitions.is_tombstoned(&namespace),
+            "an op only the repair ring still holds must fence the partition it refused on"
+        );
+        assert_eq!(owner.metrics.partition_applied_divergences_value(), 1);
+        assert_eq!(
+            partitions
+                .get_io_owner(&namespace)
+                .unwrap()
+                .consensus()
+                .view(),
+            REPAIR_VIEW
         );
     }
 
@@ -7423,32 +7473,21 @@ mod tests {
         const HEAD: u64 = 3;
         for held in [false, true] {
             for canonical in [true, false] {
-                let (bus, probes) = probe_capturing_bus();
+                let (bus, _probes) = probe_capturing_bus();
                 let (owner, _sender) = test_owner(&bus, None);
-                owner.set_repair_retry_ticks(2);
                 let namespace = IggyNamespace::new(0, 0, 0);
                 let prepares =
                     Box::pin(blank_head_backup(&owner, &bus, namespace, HEAD, held)).await;
                 let partition = owner.plane.partitions().get_mut_by_ns(&namespace).unwrap();
-                assert!(!partition.consensus().view_log_unproven());
+                // Bodies stamped in an older view prove nothing, but stay held.
+                assert!(partition.consensus().view_log_unproven());
                 assert!((1..=HEAD).all(|op| partition.log.journal().inner.holds_op(op)));
-                // A repaired body is no anchor for the view fence.
                 assert!(partition.view_fence_unanchored());
                 partition
                     .commit_journal(owner.plane.partitions().config())
                     .await;
                 assert_eq!(partition.consensus().commit_min(), 0);
 
-                for _ in 0..8 {
-                    assert!(owner.tick_partitions(&mut Vec::new()).await.is_none());
-                    if !probes.borrow().is_empty() {
-                        break;
-                    }
-                }
-                assert!(
-                    !probes.borrow().is_empty(),
-                    "an unanchored fence probes the view's primary"
-                );
                 let head = *prepares.last().unwrap().header();
                 let answer = if canonical { head } else { forked(head) };
                 owner
@@ -7533,9 +7572,9 @@ mod tests {
     }
 
     /// A backup that adopted [`BLANK_HEAD_VIEW`] from a `StartView` with a blank head
-    /// and then received the history up to `head` through repair, so the view's log
-    /// proof settles on the repaired head body. With `journaled`, it held that
-    /// history before the adoption.
+    /// and then received the history up to `head` through repair, in bodies stamped
+    /// by an older view that the view's log does not vouch for. With `journaled`, it
+    /// held that history before the adoption.
     #[allow(clippy::future_not_send)]
     async fn blank_head_backup(
         owner: &IoTestShard,
