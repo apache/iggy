@@ -22,11 +22,11 @@ package org.apache.iggy.client.async;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.HeaderValue;
-import org.apache.iggy.topic.CompressionAlgorithm;
 import org.apache.iggy.topic.Topic;
 import org.apache.iggy.topic.TopicDetails;
+import org.apache.iggy.topic.TopicOptions;
+import org.apache.iggy.topic.TopicUpdate;
 
-import java.math.BigInteger;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -36,17 +36,15 @@ import java.util.concurrent.CompletableFuture;
  * Async client interface for topic management operations.
  *
  * <p>Topics exist within streams and contain one or more partitions that hold the actual
- * messages. Each topic has configurable properties including compression, message expiry,
- * maximum size, and replication factor.
+ * messages. Each topic has settings such as message expiry and maximum size, set through
+ * {@link TopicOptions} at create and changed through {@link TopicUpdate}.
  *
  * <p>Usage example:
  * <pre>{@code
  * TopicsClient topics = client.topics();
  *
- * // Create a topic with 3 partitions and no message expiry
- * topics.createTopic(
- *         StreamId.of(1L), 3L, CompressionAlgorithm.none(),
- *         BigInteger.ZERO, BigInteger.ZERO, "events")
+ * // Create a topic with 3 partitions and the server's default settings
+ * topics.createTopic(StreamId.of(1L), "events", 3)
  *     .thenAccept(details -> System.out.println("Topic created: " + details.name()));
  *
  * // List all topics in a stream
@@ -80,99 +78,61 @@ public interface TopicsClient {
     CompletableFuture<List<Topic>> getTopics(StreamId streamId);
 
     /**
-     * Creates a new topic within a stream.
+     * Creates a new topic within a stream with the server's default settings.
      *
-     * <p>The topic is created with the specified number of partitions and configuration.
-     * Partition count cannot be changed after creation, but additional partitions can be
-     * added via the partitions API.
-     *
-     * @param streamId             the stream identifier to create the topic in
-     * @param partitionsCount      the initial number of partitions (must be at least 1)
-     * @param compressionAlgorithm the compression algorithm for stored messages
-     *                             (e.g., {@link CompressionAlgorithm#None})
-     * @param messageExpiry        message expiry time in microseconds; {@link BigInteger#ZERO}
-     *                             means messages never expire
-     * @param maxTopicSize         maximum topic size in bytes; {@link BigInteger#ZERO}
-     *                             means unlimited
-     *                             the server default is used
-     * @param name                 the topic name (must be unique within the stream)
+     * @param streamId        the stream identifier to create the topic in
+     * @param name            the topic name (must be unique within the stream)
+     * @param partitionsCount the initial number of partitions
      * @return a {@link CompletableFuture} that completes with the created {@link TopicDetails}
      * @throws org.apache.iggy.exception.IggyException if the stream does not exist or a
      *         topic with the same name already exists
      */
-    default CompletableFuture<TopicDetails> createTopic(
-            StreamId streamId,
-            Long partitionsCount,
-            CompressionAlgorithm compressionAlgorithm,
-            BigInteger messageExpiry,
-            BigInteger maxTopicSize,
-            String name) {
+    default CompletableFuture<TopicDetails> createTopic(StreamId streamId, String name, long partitionsCount) {
         return createTopic(
-                streamId, partitionsCount, compressionAlgorithm, messageExpiry, maxTopicSize, name, Map.of());
+                streamId, name, partitionsCount, TopicOptions.builder().build());
     }
 
     /**
-     * Creates a topic, carrying option keys that have no parameter of their own.
+     * Creates a new topic within a stream with typed settings.
      *
-     * <p>{@code options} is keyed by option name and reuses {@link HeaderValue} because options ride
-     * the user-headers codec. It reaches keys the server catalog gained after this build shipped; a
-     * parameter above wins on collision, and a key outside the catalog is refused by name. Call
-     * {@code describeOptions} on the server to see which keys it accepts.
+     * <p>Partition count is an argument rather than a setting: additional partitions can be
+     * added later via the partitions API.
      *
-     * @param options option keys with no parameter of their own
+     * @param streamId        the stream identifier to create the topic in
+     * @param name            the topic name (must be unique within the stream)
+     * @param partitionsCount the initial number of partitions
+     * @param options         the topic's settings, unset keys resolve to the server defaults
+     * @return a {@link CompletableFuture} that completes with the created {@link TopicDetails}
+     */
+    default CompletableFuture<TopicDetails> createTopic(
+            StreamId streamId, String name, long partitionsCount, TopicOptions options) {
+        return createTopic(streamId, name, partitionsCount, options.entries());
+    }
+
+    /**
+     * Creates a topic with settings keyed by option name, for keys newer than this build.
+     *
+     * <p>{@code options} reuses {@link HeaderValue} because options ride the user-headers codec. A
+     * key outside the catalog is refused by name. Call {@code describeOptions} on the server to see
+     * which keys it accepts.
+     *
+     * @param options option values keyed by option name
      * @return a {@link CompletableFuture} that completes with the created {@link TopicDetails}
      */
     CompletableFuture<TopicDetails> createTopic(
-            StreamId streamId,
-            Long partitionsCount,
-            CompressionAlgorithm compressionAlgorithm,
-            BigInteger messageExpiry,
-            BigInteger maxTopicSize,
-            String name,
-            Map<String, HeaderValue> options);
+            StreamId streamId, String name, long partitionsCount, Map<String, HeaderValue> options);
 
     /**
-     * Updates the configuration of an existing topic.
+     * Updates an existing topic: its name, message expiry or size cap, or resets the last two
+     * to their defaults. Every key left out keeps its value. Partition count is not affected.
      *
-     * <p>This allows changing the topic's name, compression, expiry, size limit, and
-     * replication factor. Partition count is not affected by this operation.
-     *
-     * @param streamId             the stream identifier containing the topic
-     * @param topicId              the topic identifier to update
-     * @param compressionAlgorithm the new compression algorithm
-     * @param messageExpiry        the new message expiry in microseconds
-     * @param maxTopicSize         the new maximum topic size in bytes
-     * @param name                 the new topic name
+     * @param streamId the stream identifier containing the topic
+     * @param topicId  the topic identifier to update
+     * @param update   what to change
      * @return a {@link CompletableFuture} that completes when the update is done
      * @throws org.apache.iggy.exception.IggyException if the topic does not exist
      */
-    default CompletableFuture<Void> updateTopic(
-            StreamId streamId,
-            TopicId topicId,
-            CompressionAlgorithm compressionAlgorithm,
-            BigInteger messageExpiry,
-            BigInteger maxTopicSize,
-            String name) {
-        return updateTopic(streamId, topicId, compressionAlgorithm, messageExpiry, maxTopicSize, name, Map.of());
-    }
-
-    /**
-     * Updates a topic, carrying option keys that have no parameter of their own.
-     *
-     * <p>The server refuses any key an update may not change, by name. A key left out keeps its
-     * current value.
-     *
-     * @param options option keys with no parameter of their own
-     * @return a {@link CompletableFuture} that completes when the update is done
-     */
-    CompletableFuture<Void> updateTopic(
-            StreamId streamId,
-            TopicId topicId,
-            CompressionAlgorithm compressionAlgorithm,
-            BigInteger messageExpiry,
-            BigInteger maxTopicSize,
-            String name,
-            Map<String, HeaderValue> options);
+    CompletableFuture<Void> updateTopic(StreamId streamId, TopicId topicId, TopicUpdate update);
 
     /**
      * Deletes a topic and all of its partitions and messages.

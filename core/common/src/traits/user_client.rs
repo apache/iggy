@@ -16,8 +16,8 @@
 // under the License.
 
 use crate::{
-    Identifier, IdentityInfo, IggyError, Permissions, UserInfo, UserInfoDetails, UserStatus,
-    UserUpdateOptions,
+    Identifier, IdentityInfo, IggyError, Permissions, UserCreateOptions, UserInfo, UserInfoDetails,
+    UserStatus, UserUpdateOptions,
 };
 use async_trait::async_trait;
 
@@ -35,30 +35,40 @@ pub trait UserClient {
     /// Create a new user.
     ///
     /// Authentication is required, and the permission to manage the users.
+    ///
+    /// Every stream and topic that `permissions` grants on must exist. If one
+    /// does not, a binary transport returns `IggyError::StreamIdNotFound` or
+    /// `IggyError::TopicIdNotFound`, and `HttpClient` returns
+    /// `IggyError::ResourceNotFound`. Binary refusals carry only the error code,
+    /// so their decoded identifier is a placeholder (zero), not the missing
+    /// resource ID. A delete of a stream or topic removes every grant on it.
     async fn create_user(
         &self,
         username: &str,
         password: &str,
         status: UserStatus,
         permissions: Option<Permissions>,
+        options: &UserCreateOptions,
     ) -> Result<UserInfoDetails, IggyError>;
     /// Delete a user by unique ID or username.
     ///
     /// Authentication is required, and the permission to manage the users.
     async fn delete_user(&self, user_id: &Identifier) -> Result<(), IggyError>;
-    /// Update a user by unique ID or username.
+    /// Patch a user by unique ID or username: rename it, change its status or
+    /// its options. Keys `options` leaves out keep their values.
     ///
     /// Authentication is required, and the permission to manage the users.
     async fn update_user(
         &self,
         user_id: &Identifier,
-        username: Option<&str>,
-        status: Option<UserStatus>,
         options: &UserUpdateOptions,
     ) -> Result<(), IggyError>;
     /// Update the permissions of a user by unique ID or username.
     ///
     /// Authentication is required, and the permission to manage the users.
+    ///
+    /// Every stream and topic that `permissions` grants on must exist, with the
+    /// same errors as `create_user`.
     async fn update_permissions(
         &self,
         user_id: &Identifier,

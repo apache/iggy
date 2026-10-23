@@ -48,19 +48,100 @@ public enum OptionsScope: UInt8, Sendable, Hashable {
     case user = 3
 }
 
-/// One entry of the option catalog: a key the create command accepts, its
-/// canonical kind, and the server's current default.
+/// One entry of a scope's option catalog: a key, its canonical kind, what an
+/// update may do with it, and the server's default.
 public struct OptionSpec: Sendable, Hashable {
     public var key: String
     public var kind: HeaderKind
+    public var flags: OptionFlags
     public var defaultValue: [UInt8]
     public var description: String
 
-    public init(key: String, kind: HeaderKind, defaultValue: [UInt8], description: String) {
+    public init(key: String, kind: HeaderKind, flags: OptionFlags = [], defaultValue: [UInt8], description: String) {
         self.key = key
         self.kind = kind
+        self.flags = flags
         self.defaultValue = defaultValue
         self.description = description
+    }
+}
+
+/// What a catalog key allows, as ``IggyClient/describeOptions(scope:)``
+/// reports it. A key with none of the first two flags is create-only.
+public struct OptionFlags: OptionSet, Sendable, Hashable {
+    public let rawValue: UInt8
+
+    public init(rawValue: UInt8) {
+        self.rawValue = rawValue
+    }
+
+    /// An update may set the key.
+    public static let updatable = OptionFlags(rawValue: 1 << 0)
+    /// An update may reset the key to its default.
+    public static let resettable = OptionFlags(rawValue: 1 << 1)
+    /// Write-only: accepted at create and never returned.
+    public static let secret = OptionFlags(rawValue: 1 << 2)
+    /// Computed by the server and returned on reads, never accepted.
+    public static let readOnly = OptionFlags(rawValue: 1 << 3)
+    /// A server that does not understand the key must not serve the resource.
+    public static let critical = OptionFlags(rawValue: 1 << 4)
+}
+
+/// A key of one scope's option catalog, with the flags the server's catalog
+/// gives it. Cases are declared in catalog order.
+protocol CatalogOptionKey: RawRepresentable, CaseIterable, Hashable where RawValue == String {
+    var flags: OptionFlags { get }
+}
+
+/// An update's options: the keys to set and the keys to return to their
+/// defaults. Every other key keeps its stored value.
+struct OptionsPatch {
+    /// Reset names the `u8` count of the request carries at most.
+    static let maxResetKeys = Int(UInt8.max)
+
+    let set: ResourceOptions
+    /// In byte order, as the Rust encoder writes them.
+    let reset: [String]
+
+    /// Refuses the patch as server admission would, in the server's order:
+    /// the request shape, then the key categories, then the values `values`
+    /// encodes. A patch with a raw key or raw reset name gets the shape
+    /// checks only, since the server's catalog may know keys or flags this
+    /// build does not.
+    init<Key: CatalogOptionKey>(
+        typed: [Key], raw: [String: String], reset: Set<Key>, rawReset: Set<String>, values: () throws -> ResourceOptions
+    ) throws {
+        let setKeys = Set(typed.map(\.rawValue)).union(raw.keys)
+        let names = Set(reset.map(\.rawValue)).union(rawReset).sorted { $0.utf8.lexicographicallyPrecedes($1.utf8) }
+        for name in names where name.isEmpty || name.utf8.count > HeaderTLV.maxFieldLength {
+            throw IggyError(.unsupportedOptionKey, context: String(name.prefix(errorKeyPreviewLength)))
+        }
+        if names.count > Self.maxResetKeys {
+            let unknown = names.first { Key(rawValue: $0) == nil }
+            throw unknown.map { IggyError(.unsupportedOptionKey, context: String($0.prefix(errorKeyPreviewLength))) }
+                ?? IggyError(.invalidCommand, context: "more than \(Self.maxResetKeys) reset keys")
+        }
+        if setKeys.isEmpty && names.isEmpty {
+            throw IggyError(.invalidCommand, context: "the update sets and resets nothing")
+        }
+        if let name = names.first(where: setKeys.contains) {
+            throw IggyError(.invalidCommand, context: "\(name) is both set and reset")
+        }
+        if raw.isEmpty && rawReset.isEmpty {
+            let resetKeys = names.compactMap(Key.init(rawValue:))
+            let allKeys = typed.sorted { $0.rawValue.utf8.lexicographicallyPrecedes($1.rawValue.utf8) } + resetKeys
+            if let key = allKeys.first(where: { $0.flags.contains(.readOnly) }) {
+                throw IggyError(.readOnlyOption, context: key.rawValue)
+            }
+            if let key = allKeys.first(where: { !$0.flags.contains(.updatable) }) {
+                throw IggyError(.optionNotUpdatable, context: key.rawValue)
+            }
+            if let key = resetKeys.first(where: { !$0.flags.contains(.resettable) }) {
+                throw IggyError(.optionNotResettable, context: key.rawValue)
+            }
+        }
+        self.set = try values()
+        self.reset = names
     }
 }
 
@@ -153,4 +234,33 @@ enum OptionsBlock {
         options.merge(try decode(explicit, explicit: true)) { _, explicitValue in explicitValue }
         return options
     }
+}
+
+/// Characters of an offending key an error message shows,
+/// `ERROR_KEY_PREVIEW_LEN` in the Rust crate.
+private let errorKeyPreviewLength = 64
+
+/// Keys sent as `String` values, all explicit. Typed fields are inserted
+/// afterwards, so they win on collision.
+func rawOptions(_ raw: [String: String]) throws -> ResourceOptions {
+    var options: ResourceOptions = [:]
+    for (key, value) in raw {
+        guard !key.isEmpty, key.utf8.count <= HeaderTLV.maxFieldLength else {
+            throw IggyError(.unsupportedOptionKey, context: String(key.prefix(errorKeyPreviewLength)))
+        }
+        guard let headerValue = try? HeaderValue.string(value) else {
+            throw IggyError(.invalidOptionValue, context: String(key.prefix(errorKeyPreviewLength)))
+        }
+        options[key] = .explicit(headerValue)
+    }
+    return options
+}
+
+/// The value of a column key such as a name, refused with the scope's own
+/// error when it does not fit an option value.
+func columnValue(_ text: String, refusal: IggyErrorCode) throws -> HeaderValue {
+    guard let value = try? HeaderValue.string(text) else {
+        throw IggyError(refusal, context: "must be 1-\(HeaderTLV.maxFieldLength) bytes, got \(text.utf8.count)")
+    }
+    return value
 }

@@ -335,7 +335,7 @@ pub struct PacketSimulator {
 
 /// One past the highest [`Command`] discriminant, sizing [`COMMAND_LABELS`] and
 /// the delivery counters. Raising it is part of adding a command.
-pub const COMMAND_COUNT_MAX: usize = 33;
+pub const COMMAND_COUNT_MAX: usize = 35;
 
 /// Names for each [`Command`] discriminant, so a coverage report reads as
 /// protocol rather than as integers. Indexed by discriminant; the trailing
@@ -374,6 +374,8 @@ pub const COMMAND_LABELS: [&str; COMMAND_COUNT_MAX] = [
     "ConsumerSessionHeartbeat",
     "SessionRetirementProgress",
     "ForwardCompletion",
+    "PrimaryRebalance",
+    "SegmentDelete",
 ];
 
 const _: () = {
@@ -1033,6 +1035,35 @@ mod tests {
         assert_eq!(delivered.len(), 1);
         assert_eq!(delivered[0].from, ProcessId::Replica(0));
         assert_eq!(delivered[0].to, ProcessId::Replica(1));
+    }
+
+    #[test]
+    fn given_every_command_when_delivered_should_count_it_under_its_protocol_name() {
+        let mut simulator = PacketSimulator::new(PacketSimulatorOptions {
+            one_way_delay_min: 1,
+            one_way_delay_mean: 1,
+            node_count: 2,
+            seed: 42,
+            ..Default::default()
+        });
+        for command in ALLOW_ALL {
+            simulator.submit(
+                ProcessId::Replica(0),
+                ProcessId::Replica(1),
+                create_test_message_with_command(command),
+            );
+        }
+        for _ in 0..20 {
+            simulator.tick();
+        }
+        let delivered = simulator.step();
+        assert_eq!(delivered.len(), COMMAND_COUNT_MAX);
+        for packet in delivered {
+            let command = packet.message.header().command;
+            let index = command as usize;
+            assert_eq!(COMMAND_LABELS[index], format!("{command:?}"));
+            assert_eq!(simulator.command_counts()[index], 1);
+        }
     }
 
     #[test]

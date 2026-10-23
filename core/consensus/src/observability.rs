@@ -56,6 +56,7 @@ impl ReplicaRole {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewChangeReason {
     NormalHeartbeatTimeout,
+    PrimaryTransfer,
     /// The current view's primary sent a `RequestStartView` probe: it
     /// cannot lead (restarted, or abandoned the view mid-view-change), so
     /// peers elect without waiting for its heartbeats to stop arriving
@@ -75,6 +76,7 @@ impl ViewChangeReason {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::NormalHeartbeatTimeout => "normal_heartbeat_timeout",
+            Self::PrimaryTransfer => "primary_transfer",
             Self::PrimaryProbedView => "primary_probed_view",
             Self::ViewProbeUnanswered => "view_probe_unanswered",
             Self::ViewChangeStatusTimeout => "view_change_status_timeout",
@@ -344,10 +346,12 @@ impl ControlActionLogEvent {
                 op: Some(op),
                 commit: Some(commit),
             },
-            VsrAction::SendStartView { op, commit, .. } => Self {
+            VsrAction::SendStartView {
+                op, commit, target, ..
+            } => Self {
                 replica,
                 action: ControlActionKind::SendStartView,
-                target_replica: None,
+                target_replica: target,
                 op: Some(op),
                 commit: Some(commit),
             },
@@ -381,10 +385,10 @@ impl ControlActionLogEvent {
                 op: None,
                 commit: None,
             },
-            VsrAction::SendCommit { commit, .. } => Self {
+            VsrAction::SendCommit { commit, target, .. } => Self {
                 replica,
                 action: ControlActionKind::SendCommit,
-                target_replica: None,
+                target_replica: target,
                 op: None,
                 commit: Some(commit),
             },
@@ -704,14 +708,17 @@ pub const fn operation_as_str(operation: Operation) -> &'static str {
         Operation::FinalizeSession => "finalize_session",
         Operation::RetireSession => "retire_session",
         Operation::CompleteLifecycle => "complete_lifecycle",
+        Operation::RewrapStreamKeys => "rewrap_stream_keys",
         Operation::TransitionPartitionHistory => "transition_partition_history",
         Operation::RetireConsumerGroupOwners => "retire_consumer_group_owners",
         Operation::InstallConsumerGroupOwner => "install_consumer_group_owner",
+        Operation::UpdateStreamResolved => "update_stream_resolved",
+        Operation::UpdateTopicResolved => "update_topic_resolved",
+        Operation::UpdateUserResolved => "update_user_resolved",
+        Operation::UpdateResource => "update_resource",
         Operation::CreateStream => "create_stream",
-        Operation::UpdateStream => "update_stream",
         Operation::DeleteStream => "delete_stream",
         Operation::CreateTopic => "create_topic",
-        Operation::UpdateTopic => "update_topic",
         Operation::DeleteTopic => "delete_topic",
         Operation::CreatePartitions => "create_partitions",
         Operation::DeletePartitions => "delete_partitions",
@@ -721,7 +728,6 @@ pub const fn operation_as_str(operation: Operation) -> &'static str {
         Operation::JoinConsumerGroup => "join_consumer_group",
         Operation::LeaveConsumerGroup => "leave_consumer_group",
         Operation::CreateUser => "create_user",
-        Operation::UpdateUser => "update_user",
         Operation::DeleteUser => "delete_user",
         Operation::ChangePassword => "change_password",
         Operation::UpdatePermissions => "update_permissions",
@@ -963,7 +969,7 @@ impl StructuredSimEvent for ControlActionLogEvent {
             status = status_as_str(ctx.status),
             role = ctx.role.as_str(),
             action = self.action.as_str(),
-            target_replica = self.target_replica.unwrap_or_default(),
+            target_replica = self.target_replica,
             op = self.op.unwrap_or_default(),
             action_commit = self.commit.unwrap_or_default(),
         );

@@ -129,6 +129,11 @@ pub enum WireIdentifier {
     String(WireName),
 }
 
+enum BorrowedIdentifier<'a> {
+    Numeric(u32),
+    String(&'a str),
+}
+
 impl WireIdentifier {
     /// Kind and length bytes, then the `u32` value.
     pub(crate) const NUMERIC_ENCODED_SIZE: usize = 2 * size_of::<u8>() + NUMERIC_VALUE_LEN as usize;
@@ -158,6 +163,48 @@ impl WireIdentifier {
         match self {
             Self::Numeric(_) => None,
             Self::String(s) => Some(s.as_str()),
+        }
+    }
+
+    pub(crate) fn skip(buf: &[u8]) -> Result<usize, WireError> {
+        Self::decode_borrowed(buf).map(|(_, consumed)| consumed)
+    }
+
+    fn decode_borrowed(buf: &[u8]) -> Result<(BorrowedIdentifier<'_>, usize), WireError> {
+        let kind = read_u8(buf, 0)?;
+        let length = read_u8(buf, 1)? as usize;
+        let value = read_bytes(buf, 2, length)?;
+        let consumed = 2 + length;
+
+        match kind {
+            KIND_NUMERIC => {
+                if length != NUMERIC_VALUE_LEN as usize {
+                    return Err(WireError::Validation(Cow::Owned(format!(
+                        "numeric identifier must be {NUMERIC_VALUE_LEN} bytes, got {length}"
+                    ))));
+                }
+                let id = u32::from_le_bytes(
+                    value
+                        .try_into()
+                        .expect("length already validated as 4 bytes"),
+                );
+                Ok((BorrowedIdentifier::Numeric(id), consumed))
+            }
+            KIND_STRING => {
+                if length == 0 {
+                    return Err(WireError::Validation(Cow::Borrowed(
+                        "string identifier cannot be empty",
+                    )));
+                }
+                let s =
+                    std::str::from_utf8(value).map_err(|_| WireError::InvalidUtf8 { offset: 2 })?;
+                Ok((BorrowedIdentifier::String(s), consumed))
+            }
+            _ => Err(WireError::UnknownDiscriminant {
+                type_name: "WireIdentifier",
+                value: kind,
+                offset: 0,
+            }),
         }
     }
 
@@ -195,42 +242,12 @@ impl WireEncode for WireIdentifier {
 
 impl WireDecode for WireIdentifier {
     fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
-        let kind = read_u8(buf, 0)?;
-        let length = read_u8(buf, 1)? as usize;
-        let value = read_bytes(buf, 2, length)?;
-        let consumed = 2 + length;
-
-        match kind {
-            KIND_NUMERIC => {
-                if length != NUMERIC_VALUE_LEN as usize {
-                    return Err(WireError::Validation(Cow::Owned(format!(
-                        "numeric identifier must be {NUMERIC_VALUE_LEN} bytes, got {length}"
-                    ))));
-                }
-                let id = u32::from_le_bytes(
-                    value
-                        .try_into()
-                        .expect("length already validated as 4 bytes"),
-                );
-                Ok((Self::Numeric(id), consumed))
-            }
-            KIND_STRING => {
-                if length == 0 {
-                    return Err(WireError::Validation(Cow::Borrowed(
-                        "string identifier cannot be empty",
-                    )));
-                }
-                let s =
-                    std::str::from_utf8(value).map_err(|_| WireError::InvalidUtf8 { offset: 2 })?;
-                let wire_name = WireName::new(s)?;
-                Ok((Self::String(wire_name), consumed))
-            }
-            _ => Err(WireError::UnknownDiscriminant {
-                type_name: "WireIdentifier",
-                value: kind,
-                offset: 0,
-            }),
-        }
+        let (identifier, consumed) = Self::decode_borrowed(buf)?;
+        let identifier = match identifier {
+            BorrowedIdentifier::Numeric(id) => Self::Numeric(id),
+            BorrowedIdentifier::String(name) => Self::String(WireName(name.to_owned())),
+        };
+        Ok((identifier, consumed))
     }
 }
 

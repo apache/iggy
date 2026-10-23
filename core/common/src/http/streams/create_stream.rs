@@ -16,6 +16,7 @@
 // under the License.
 
 use super::MAX_NAME_LENGTH;
+use crate::OptionInputMap;
 use crate::Validatable;
 use crate::error::IggyError;
 use serde::{Deserialize, Serialize};
@@ -23,16 +24,22 @@ use serde::{Deserialize, Serialize};
 /// `CreateStream` command is used to create a new stream.
 /// It has additional payload:
 /// - `name` - unique stream name (string), max length is 255 characters.
+/// - `options` - stream options, such as the stream's own `encryption_key` as
+///   canonical standard base64.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct CreateStream {
     /// Unique stream name (string), max length is 255 characters.
     pub name: String,
+    /// Stream options keyed by option name. Unknown keys are rejected.
+    #[serde(default, skip_serializing_if = "OptionInputMap::is_empty")]
+    pub options: OptionInputMap,
 }
 
 impl Default for CreateStream {
     fn default() -> Self {
         CreateStream {
             name: "stream".to_string(),
+            options: OptionInputMap::default(),
         }
     }
 }

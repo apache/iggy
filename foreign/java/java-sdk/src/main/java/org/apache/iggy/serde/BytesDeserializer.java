@@ -55,7 +55,6 @@ import org.apache.iggy.system.ClientInfoDetails;
 import org.apache.iggy.system.ConsumerGroupInfo;
 import org.apache.iggy.system.OptionSpec;
 import org.apache.iggy.system.Stats;
-import org.apache.iggy.topic.CompressionAlgorithm;
 import org.apache.iggy.topic.Topic;
 import org.apache.iggy.topic.TopicDetails;
 import org.apache.iggy.user.GlobalPermissions;
@@ -84,12 +83,12 @@ public final class BytesDeserializer {
     private static final int CONSUMER_GROUP_ASSIGNMENT_ENTRY_BYTES = Integer.BYTES;
     private static final int SEND_CONFIRMATION_BYTES = 3 * Integer.BYTES + Long.BYTES;
     private static final int MIN_CLUSTER_NODE_BYTES = 19;
-    // A one-character key (length byte plus a byte of name), a kind byte, and
-    // empty length-prefixed default and description.
-    private static final int MIN_OPTION_SPEC_BYTES = 2 + 1 + 4 + 4;
-    // 50-byte fixed part + a one-character name (the server rejects an empty
+    // A one-character key (length byte plus a byte of name), kind and flags
+    // bytes, and empty length-prefixed default and description.
+    private static final int MIN_OPTION_SPEC_BYTES = 2 + 1 + 1 + 4 + 4;
+    // 33-byte fixed part + a one-character name (the server rejects an empty
     // one) + two u32 options-block length prefixes.
-    private static final int MIN_TOPIC_BYTES = 59;
+    private static final int MIN_TOPIC_BYTES = 42;
     private static final int OPEN_FILES_FIELDS_BYTES = 2 * Long.BYTES;
 
     private BytesDeserializer() {}
@@ -102,9 +101,11 @@ public final class BytesDeserializer {
         var messagesCount = readU64AsBigInteger(response);
         var nameLength = response.readUnsignedByte();
         var name = response.readCharSequence(nameLength, StandardCharsets.UTF_8).toString();
-        var options = readOptionsBlock(response, "stream options");
+        var options = readOptionsBlock(response, "stream explicit options");
+        var derivedOptions = readOptionsBlock(response, "stream derived options");
 
-        return new StreamBase(streamId, createdAt, name, size.toString(), messagesCount, topicsCount, options);
+        return new StreamBase(
+                streamId, createdAt, name, size.toString(), messagesCount, topicsCount, options, derivedOptions);
     }
 
     public static StreamDetails readStreamDetails(ByteBuf response) {
@@ -159,9 +160,6 @@ public final class BytesDeserializer {
         var topicId = response.readUnsignedIntLE();
         var createdAt = readU64AsBigInteger(response);
         var partitionsCount = response.readUnsignedIntLE();
-        var messageExpiry = readU64AsBigInteger(response);
-        var compressionAlgorithmCode = response.readByte();
-        var maxTopicSize = readU64AsBigInteger(response);
         var size = readU64AsBigInteger(response);
         var messagesCount = readU64AsBigInteger(response);
         var nameLength = response.readUnsignedByte();
@@ -169,17 +167,7 @@ public final class BytesDeserializer {
         var options = readOptionsBlock(response, "topic explicit options");
         var derivedOptions = readOptionsBlock(response, "topic derived options");
         return new Topic(
-                topicId,
-                createdAt,
-                name,
-                size.toString(),
-                messageExpiry,
-                CompressionAlgorithm.fromCode(compressionAlgorithmCode),
-                maxTopicSize,
-                messagesCount,
-                partitionsCount,
-                options,
-                derivedOptions);
+                topicId, createdAt, name, size.toString(), messagesCount, partitionsCount, options, derivedOptions);
     }
 
     public static ConsumerGroupDetails readConsumerGroupDetails(ByteBuf response) {
@@ -516,7 +504,7 @@ public final class BytesDeserializer {
     /**
      * Reads a {@code DescribeOptions} response.
      *
-     * <p>Wire format: {@code [count:u32][key_len:u8][key][kind:u8][default_len:u32][default]
+     * <p>Wire format: {@code [count:u32][key_len:u8][key][kind:u8][flags:u8][default_len:u32][default]
      * [description_len:u32][description]}*. A scope with no catalog keys answers with a zero count
      * rather than an error.
      */
@@ -534,10 +522,12 @@ public final class BytesDeserializer {
                     response.readCharSequence(keyLength, StandardCharsets.UTF_8).toString();
 
             var kindCode = response.readUnsignedByte();
+            var flags = response.readUnsignedByte();
             var defaultValue = readU32PrefixedBytes(response, "option default value for '" + key + "'");
             var description = readU32PrefixedString(response, "option description for '" + key + "'");
 
-            specs.add(new OptionSpec(key, new HeaderValue(HeaderKind.fromCode(kindCode), defaultValue), description));
+            specs.add(new OptionSpec(
+                    key, new HeaderValue(HeaderKind.fromCode(kindCode), defaultValue), description, flags));
         }
 
         return specs;
@@ -656,10 +646,9 @@ public final class BytesDeserializer {
         var usernameLength = response.readUnsignedByte();
         var username = response.readCharSequence(usernameLength, StandardCharsets.UTF_8)
                 .toString();
-        // Validated and dropped: users have no catalog keys yet, so the server
-        // refuses every one and the block is always empty.
-        readOptionsBlock(response, "user options");
-        return new UserInfo(userId, createdAt, status, username);
+        var options = readOptionsBlock(response, "user explicit options");
+        var derivedOptions = readOptionsBlock(response, "user derived options");
+        return new UserInfo(userId, createdAt, status, username, options, derivedOptions);
     }
 
     public static RawPersonalAccessToken readRawPersonalAccessToken(ByteBuf response) {

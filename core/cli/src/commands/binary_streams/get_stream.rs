@@ -21,6 +21,7 @@ use async_trait::async_trait;
 use comfy_table::Table;
 use iggy_common::Client;
 use iggy_common::Identifier;
+use iggy_common::StreamEncryptionSource;
 use tracing::{Level, event};
 
 pub struct GetStreamCmd {
@@ -66,9 +67,43 @@ impl CliCommand for GetStreamCmd {
             "Stream topics count",
             format!("{}", stream.topics_count).as_str(),
         ]);
+        table.add_row(vec![
+            "Encryption source",
+            encryption_source(stream.encryption_key_source()),
+        ]);
+        if let Some(fingerprint) = stream.encryption_key_fingerprint() {
+            table.add_row(vec!["Key fingerprint", fingerprint.as_str()]);
+        }
+        let kek_fingerprints = stream.encryption_kek_fingerprints();
+        if !kek_fingerprints.is_empty() {
+            table.add_row(vec![
+                "KEK fingerprints",
+                kek_fingerprints.join(", ").as_str(),
+            ]);
+        }
 
         event!(target: PRINT_TARGET, Level::INFO, "{table}");
 
         Ok(())
+    }
+}
+
+/// The server reports `none` for a plaintext stream, so a missing or unparsed
+/// source is unknown, never plaintext.
+pub(crate) fn encryption_source(source: Option<StreamEncryptionSource>) -> &'static str {
+    source.map_or("unknown", Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn given_missing_or_unparsed_key_source_when_rendering_should_print_unknown() {
+        assert_eq!(encryption_source(None), "unknown");
+        assert_eq!(
+            encryption_source(Some(StreamEncryptionSource::None)),
+            "none"
+        );
     }
 }
