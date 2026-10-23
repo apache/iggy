@@ -5300,6 +5300,7 @@ mod tests {
                 owner.on_repair_prepare(repaired).await;
             }
             let before = partition.consensus().commit_min();
+            let requested = requests.borrow().len();
             for command in [Command::RangeEvicted, Command::RepairDone] {
                 let foreign_reply = reply.clone().transmute_header(
                     |header, foreign: &mut RepairRangeReplyHeader| {
@@ -5312,8 +5313,9 @@ mod tests {
                 owner.on_repair_range_reply(&foreign_reply).await;
                 assert_eq!(partition.consensus().commit_min(), before);
                 assert_eq!(partition.repair.unwrap().floor, None);
-                assert!(
-                    requests.borrow().is_empty(),
+                assert_eq!(
+                    requests.borrow().len(),
+                    requested,
                     "a different peer cannot complete or advance this repair session"
                 );
             }

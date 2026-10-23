@@ -9944,10 +9944,12 @@ where
         true
     }
 
-    /// Request the op the view-log proof names once it moved off the one the live
-    /// session last asked for. `RepairDone` does the same, but a body that lands
-    /// after its `RepairDone` moves the proof when nothing is left to notice, and
-    /// the next op would wait out the retry timer.
+    /// Request the op the view-log proof names once it climbed above the one the
+    /// live session last asked for. The walk runs downward, so it climbs only after
+    /// everything below is held and nothing of that request is still in flight.
+    /// `RepairDone` pulls the same op, but a body that lands after its `RepairDone`
+    /// moves the proof when nothing is left to notice, and the op would wait out
+    /// the retry timer.
     #[allow(clippy::future_not_send)]
     async fn request_moved_proof_op(&self, partition: &mut IggyPartition<B, SB>)
     where
@@ -9959,7 +9961,7 @@ where
         let next = partition
             .repair
             .as_mut()
-            .filter(|live| live.from_op != proof_op)
+            .filter(|live| proof_op > live.from_op)
             .map(|live| {
                 live.from_op = proof_op;
                 live.requested_from = Some(proof_op);
