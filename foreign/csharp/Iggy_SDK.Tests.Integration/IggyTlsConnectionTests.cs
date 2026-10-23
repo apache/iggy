@@ -67,11 +67,12 @@ public class IggyTlsConnectionTests
             ReconnectionSettings = new ReconnectionSettings { Enabled = false }
         });
 
-        // Nothing travels at connect time (the roster read is auth-gated away), so the plaintext client
-        // only dies against the TLS listener on its first request: the server drops the connection
-        // without answering a single byte.
+        // Registration is the first request. The TLS listener closes the plaintext connection
+        // after transmission starts without returning a verdict.
         await client.ConnectAsync();
-        await Should.ThrowAsync<IggyZeroBytesException>(client.LoginUserAsync("iggy", "iggy"));
+        var error = await Should.ThrowAsync<VsrRequestOutcomeUnknownException>(client.LoginUserAsync("iggy", "iggy"));
+        error.InnerException.ShouldBeAssignableTo<IOException>();
+        error.OperationId.ShouldBeNull();
     }
 
     [Test]

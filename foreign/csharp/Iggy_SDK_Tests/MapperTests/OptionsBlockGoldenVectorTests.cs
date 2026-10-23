@@ -84,7 +84,7 @@ public sealed class OptionsBlockGoldenVectorTests
     public void MapTopic_WithOptionsLengthPrefixCutShort_ThrowsMalformedResponse()
     {
         var payload = TopicPayloadWithOptions(GoldenOptionsBlock);
-        var truncated = payload[..(50 + "topic".Length + 2)];
+        var truncated = payload[..(33 + "topic".Length + 2)];
 
         Assert.Throws<MalformedResponseException>(() => Mappers.BinaryMapper.MapTopic(truncated));
     }
@@ -96,20 +96,17 @@ public sealed class OptionsBlockGoldenVectorTests
     private static byte[] TopicPayloadWithOptions(byte[] options)
     {
         var name = Encoding.UTF8.GetBytes("topic");
-        var payload = new byte[50 + name.Length + 4 + options.Length + 4];
+        var payload = new byte[33 + name.Length + 4 + options.Length + 4];
 
         BinaryPrimitives.WriteUInt32LittleEndian(payload, 1);
         BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(4), 1750000000000000);
         BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(12), 1);
         BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(16), 0);
-        payload[24] = 1;
-        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(25), 0);
-        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(33), 0);
-        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(41), 0);
-        payload[49] = (byte)name.Length;
-        name.CopyTo(payload.AsSpan(50));
+        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(24), 0);
+        payload[32] = (byte)name.Length;
+        name.CopyTo(payload.AsSpan(33));
 
-        var position = 50 + name.Length;
+        var position = 33 + name.Length;
         BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(position), (uint)options.Length);
         options.CopyTo(payload.AsSpan(position + 4));
         BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(position + 4 + options.Length), 0);

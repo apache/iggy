@@ -203,6 +203,10 @@ where
     /// A resident op follows a higher one, so the next op to flush can sit
     /// behind the front. Flushes wait for `sort_by_op`.
     out_of_order: Cell<bool>,
+    /// `(floor, through)`: every op in `floor + 1..=through` is resident. Repair
+    /// ticks resume the walk from here instead of rescanning the held prefix, and
+    /// any removal resets it.
+    held_run: Cell<(u64, u64)>,
 }
 
 /// How many evicted entries each partition retains for repair. Sized to
@@ -237,6 +241,7 @@ where
             resident_control_ops: Cell::new(0),
             evicted_through: Cell::new(0),
             out_of_order: Cell::new(false),
+            held_run: Cell::new((0, 0)),
         }
     }
 }
@@ -819,6 +824,7 @@ where
             resident_control_ops: Cell::new(0),
             evicted_through: Cell::new(0),
             out_of_order: Cell::new(false),
+            held_run: Cell::new((0, 0)),
         }
     }
 
@@ -828,6 +834,7 @@ where
         self.first_header_by_op.borrow_mut().clear();
         unsafe { &mut *self.op_to_storage_offset.get() }.clear();
         unsafe { &mut *self.offset_to_op.get() }.clear();
+        self.held_run.set((0, 0));
         unsafe { &mut *self.timestamp_to_op.get() }.clear();
         self.resident_control_ops.set(0);
         self.out_of_order.set(false);
@@ -880,6 +887,41 @@ where
     pub fn holds_op(&self, op: u64) -> bool {
         let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
         op_to_storage_offset.contains_key(&op)
+    }
+
+    /// Highest op `h >= floor` such that every op in `floor + 1..=h` is resident.
+    pub fn held_through(&self, floor: u64) -> u64 {
+        self.held_through_until(floor, u64::MAX)
+    }
+
+    /// [`Self::held_through`] capped at `top`, walking only the resident ops at
+    /// or below it.
+    pub fn held_through_until(&self, floor: u64, top: u64) -> u64 {
+        if floor >= top {
+            return floor;
+        }
+        let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
+        let (run_floor, run_through) = self.held_run.get();
+        let mut through = if run_floor <= floor && run_through > floor {
+            run_through.min(top)
+        } else {
+            floor
+        };
+        if through < top {
+            for op in op_to_storage_offset
+                .range(through + 1..=top)
+                .map(|(op, _)| *op)
+            {
+                if op != through + 1 {
+                    break;
+                }
+                through = op;
+            }
+        }
+        if through > floor && (run_floor > floor || run_through < through) {
+            self.held_run.set((floor, through));
+        }
+        through
     }
 
     /// Whether any op in `ops` is resident, in one pass over the headers: the
@@ -1587,6 +1629,23 @@ mod tests {
         }
 
         assert_eq!(journal.last_op(), Some(3));
+    }
+
+    #[compio::test]
+    async fn given_a_run_past_the_top_when_capping_held_through_should_stop_at_the_top() {
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        for op in [1, 2, 3, 4, 6] {
+            journal
+                .append(build_prepare(op, HEADER_SIZE + 16).into_frozen())
+                .await
+                .expect("append");
+        }
+
+        assert_eq!(journal.held_through(0), 4);
+        assert_eq!(journal.held_through_until(0, 2), 2);
+        assert_eq!(journal.held_through_until(0, 6), 4);
+        assert_eq!(journal.held_through_until(3, 3), 3);
+        assert_eq!(journal.held_through_until(5, 3), 5);
     }
 
     #[compio::test]

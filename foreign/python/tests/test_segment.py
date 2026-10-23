@@ -27,6 +27,7 @@ from apache_iggy import (
     PollingStrategy,
     SendMessage,
     StreamPermissions,
+    TopicOptions,
     TopicPermissions,
 )
 
@@ -55,10 +56,11 @@ class TestSegmentManagement:
         await iggy_client.create_topic(
             stream=stream_name,
             name=topic_name,
-            partitions_count=1,
-            segment_size=SEGMENT_SIZE,
-            durability=Durability.PERSISTED,
-            messages_required_to_save=1,
+            options=TopicOptions(
+                segment_size=SEGMENT_SIZE,
+                durability=Durability.PERSISTED,
+                messages_required_to_save=1,
+            ),
         )
         stream = await iggy_client.get_stream(stream_name)
         assert stream is not None
@@ -102,10 +104,11 @@ class TestSegmentManagement:
         await iggy_client.create_topic(
             stream=stream_name,
             name=topic_name,
-            partitions_count=1,
-            segment_size=SEGMENT_SIZE,
-            durability=Durability.PERSISTED,
-            messages_required_to_save=1,
+            options=TopicOptions(
+                segment_size=SEGMENT_SIZE,
+                durability=Durability.PERSISTED,
+                messages_required_to_save=1,
+            ),
         )
         for _ in range(2 * MESSAGES_PER_SEALED_SEGMENT + 2):
             await iggy_client.send_messages(
@@ -145,10 +148,11 @@ class TestSegmentManagement:
         await iggy_client.create_topic(
             stream=stream_name,
             name=topic_name,
-            partitions_count=1,
-            segment_size=SEGMENT_SIZE,
-            durability=Durability.PERSISTED,
-            messages_required_to_save=1,
+            options=TopicOptions(
+                segment_size=SEGMENT_SIZE,
+                durability=Durability.PERSISTED,
+                messages_required_to_save=1,
+            ),
         )
         for _ in range(2 * MESSAGES_PER_SEALED_SEGMENT + 2):
             await iggy_client.send_messages(
@@ -198,10 +202,11 @@ class TestSegmentManagement:
         await iggy_client.create_topic(
             stream=stream_name,
             name=topic_name,
-            partitions_count=1,
-            segment_size=SEGMENT_SIZE,
-            durability=Durability.PERSISTED,
-            messages_required_to_save=1,
+            options=TopicOptions(
+                segment_size=SEGMENT_SIZE,
+                durability=Durability.PERSISTED,
+                messages_required_to_save=1,
+            ),
         )
         for _ in range(MESSAGES_PER_SEALED_SEGMENT + 1):
             await iggy_client.send_messages(
@@ -235,7 +240,7 @@ class TestSegmentManagement:
         stream_name = unique_name()
         topic_name = unique_name()
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(stream_name, topic_name, partitions_count=1)
+        await iggy_client.create_topic(stream_name, topic_name)
         missing_name = unique_name()
         stream_id = missing_name if missing == "stream" else stream_name
         topic_id = missing_name if missing == "topic" else topic_name
@@ -287,10 +292,8 @@ class TestSegmentManagement:
         topic_name = unique_name()
         other_topic_name = unique_name()
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(stream_name, topic_name, partitions_count=1)
-        await iggy_client.create_topic(
-            stream_name, other_topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream_name, topic_name)
+        await iggy_client.create_topic(stream_name, other_topic_name)
         stream = await iggy_client.get_stream(stream_name)
         assert stream is not None
         topic = await iggy_client.get_topic(stream.id, topic_name)

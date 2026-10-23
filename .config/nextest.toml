@@ -16,10 +16,10 @@
 # under the License.
 
 # Floor for the flags CI and scripts/ci/storage-compat.sh pass: --no-tests
-# (0.9.75), --run-ignored only (0.9.76) and --ignore-default-filter (0.9.77).
-# nextest refuses to run below it, and setup-rust-with-cache replaces a
-# cache-restored binary that fails `cargo nextest show-config version`.
-nextest-version = { required = "0.9.77" }
+# (0.9.75), --run-ignored only (0.9.76), --ignore-default-filter (0.9.77),
+# and archive -E (0.9.109).
+# nextest refuses to run below it; setup-rust installs a pinned version above this floor.
+nextest-version = { required = "0.9.109" }
 
 [[profile.default.overrides]]
 # This is a solution (or actually a workaround) for the problem that nextest does not support
@@ -60,11 +60,14 @@ max-threads = 4
 [[profile.default.overrides]]
 filter = '''
     binary_id(iggy-gateway-kafka::bridge_iggy_integration_tests)
+    + binary_id(iggy-gateway-kafka::cluster_id_real_bridge_tests)
     + binary_id(iggy-gateway-kafka::fetch_real_bridge_tests)
     + binary_id(iggy-gateway-kafka::list_offsets_real_bridge_tests)
     + binary_id(iggy-gateway-kafka::produce_real_bridge_tests)
+    + binary_id(iggy-gateway-kafka::configs_real_bridge_tests)
     + binary_id(iggy-gateway-kafka::create_topics_real_bridge_tests)
     + binary_id(iggy-gateway-kafka::delete_topics_real_bridge_tests)
+    + binary_id(iggy-gateway-kafka::create_partitions_real_bridge_tests)
     + binary_id(iggy-gateway-kafka::metadata_real_bridge_tests)
     + binary_id(iggy-gateway-kafka::offsets_real_bridge_tests)
     + binary_id(iggy-gateway-kafka::phase1_e2e_tests)
@@ -93,6 +96,18 @@ slow-timeout = { period = "60s", terminate-after = 60 }
 
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 5 }
+
+[profile.default-miri]
+# Keep Miri bounded by the CI job timeout instead of the native-test limit.
+slow-timeout = { period = "60s" }
+
+[[profile.default-miri.overrides]]
+# Start the options boundary test early so other work overlaps it.
+filter = '''
+    package(=iggy_binary_protocol)
+    & test(=primitives::options::tests::entry_count_over_limit_is_rejected)
+'''
+priority = 100
 
 [profile.ci]
 retries = 3

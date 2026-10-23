@@ -16,6 +16,7 @@
 // under the License.
 
 using Apache.Iggy.Encryption;
+using Apache.Iggy.Exceptions;
 
 namespace Apache.Iggy.IggyClient;
 
@@ -71,4 +72,29 @@ public interface IIggyClient : IIggyPublisher, IIggyStream, IIggyTopic, IIggyCon
     /// <param name="token">The cancellation token to cancel the operation.</param>
     /// <returns>A task that represents the asynchronous operation and returns the raw response payload bytes.</returns>
     Task<byte[]> SendBinaryRequestAsync(uint code, byte[] payload, CancellationToken token = default);
+
+    /// <summary>
+    ///     Replays a retained operation within one timeout. Success proves commit; a proved business rejection
+    ///     returns its original error and frees the lane. An unknown outcome keeps the operation retained.
+    /// </summary>
+    /// <remarks>
+    ///     The client keeps the proved outcomes of its last
+    ///     <see cref="Configuration.IggyClientConfigurator.MaxPendingOperations" /> replays, also across a session
+    ///     reset. A later resolve of the operation returns the same outcome without a request, also when an
+    ///     <see cref="Consumers.IggyConsumer" /> offset write, a background <see cref="Publishers.IggyPublisher" />
+    ///     send or another caller of this client replayed it first. <see cref="VsrOperationNotRetainedException" />
+    ///     means that the outcome is unknown and this client can no longer recover it: a session reset or an abandon
+    ///     dropped the operation before a replay proved its outcome, or that outcome aged out.
+    /// </remarks>
+    Task ResolveOperationAsync(ulong operationId, TimeSpan timeout, CancellationToken token = default) =>
+        Task.FromException(new FeatureUnavailableException());
+
+    /// <summary>
+    ///     Releases a retained operation without determining whether it committed, and frees its place in
+    ///     <see cref="Configuration.IggyClientConfigurator.MaxPendingOperations" /> at once. A replay of the
+    ///     operation that is already running is not canceled. It keeps the lane until it ends, so later mutations of
+    ///     the lane still wait behind it, and the client keeps the outcome it proves for
+    ///     <see cref="ResolveOperationAsync" />.
+    /// </summary>
+    Task AbandonOperationAsync(ulong operationId) => Task.FromException(new FeatureUnavailableException());
 }

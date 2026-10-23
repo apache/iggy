@@ -29,12 +29,10 @@ import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.stream.StreamDetails;
-import org.apache.iggy.topic.CompressionAlgorithm;
 import org.apache.iggy.topic.TopicDetails;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -77,9 +75,7 @@ public final class MessageHeadersProducer {
             if (topic.isPresent()) {
                 log.warn("Topic already exists and will not be created again.");
             } else {
-                client.topics()
-                        .createTopic(
-                                STREAM_ID, 1L, CompressionAlgorithm.None, BigInteger.ZERO, BigInteger.ZERO, TOPIC_NAME);
+                client.topics().createTopic(STREAM_ID, TOPIC_NAME, 1L);
                 log.info("Topic {} was created.", TOPIC_NAME);
             }
 

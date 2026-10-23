@@ -30,12 +30,38 @@ let package = Package(
     products: [
         .library(name: "Iggy", targets: ["Iggy"])
     ],
+    dependencies: [
+        .package(url: "https://github.com/apple/swift-nio.git", from: "2.80.0"),
+        .package(url: "https://github.com/apple/swift-nio-ssl.git", from: "2.29.0"),
+        .package(url: "https://github.com/apple/swift-log.git", from: "1.6.0"),
+        .package(url: "https://github.com/apple/swift-crypto.git", "3.0.0"..<"4.0.0"),
+    ],
     targets: [
-        .target(name: "Iggy"),
+        .target(
+            name: "Iggy",
+            dependencies: [
+                .product(name: "NIOConcurrencyHelpers", package: "swift-nio"),
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOPosix", package: "swift-nio"),
+                .product(name: "NIOTLS", package: "swift-nio"),
+                .product(name: "NIOSSL", package: "swift-nio-ssl"),
+                .product(name: "Logging", package: "swift-log"),
+                .product(name: "Crypto", package: "swift-crypto"),
+            ]
+        ),
         .testTarget(
             name: "IggyTests",
-            dependencies: ["Iggy"],
+            dependencies: [
+                "Iggy",
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOPosix", package: "swift-nio"),
+                .product(name: "Logging", package: "swift-log"),
+            ],
             resources: [.copy("Fixtures")]
+        ),
+        .testTarget(
+            name: "IggyE2ETests",
+            dependencies: ["Iggy"]
         ),
     ],
     swiftLanguageModes: [.v6]

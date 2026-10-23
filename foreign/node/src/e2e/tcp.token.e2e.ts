@@ -24,15 +24,21 @@ describe('e2e -> token', async () => {
   const c = getTestClient();
 
   const tokenName = 'yolo-token-test';
+  const lifetimeMs = 30 * 60 * 1000;
+  let createdAt = 0;
 
   it('e2e -> token::create', async () => {
-    const tk = await c.token.create({ name: tokenName, expiry: 1800n });
+    createdAt = Date.now();
+    const tk = await c.token.create({ name: tokenName, expiry: BigInt(lifetimeMs) * 1000n });
     assert.ok(tk.token.length > 1);
   });
 
   it('e2e -> token::list', async () => {
     const tks = await c.token.list();
-    assert.ok(tks.length > 0);
+    const listed = tks.find((tk) => tk.name === tokenName);
+    assert.ok(listed?.expiry, 'the token lists its expiry');
+    const remainingMs = listed.expiry.getTime() - createdAt;
+    assert.ok(Math.abs(remainingMs - lifetimeMs) < 5000, `expiry ${remainingMs} ms after create, want ${lifetimeMs}`);
   });
 
   it('e2e -> token::delete', async () => {

@@ -47,7 +47,7 @@ func successfullyCreateUser(name string, client iggcon.Client) uint32 {
 				PollMessages:  true,
 				SendMessages:  true,
 			},
-		})
+		}, nil)
 	itShouldNotReturnError(err)
 	nameIdentifier, _ := iggcon.NewIdentifier(name)
 	user, err := client.GetUser(context.Background(), nameIdentifier)

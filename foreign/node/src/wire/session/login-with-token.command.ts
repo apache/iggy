@@ -15,9 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import type { CommandResponse } from '../../client/client.type.js';
+import type { ClientProvider, CommandResponse } from '../../client/client.type.js';
 import { serializeLoginWithToken, type LoginResponse } from './login.utils.js';
-import { wrapCommand } from '../command.utils.js';
 import { COMMAND_CODE } from '../command.code.js';
 
 /**
@@ -46,4 +45,9 @@ export const LOGIN_WITH_TOKEN = {
 /**
  * Executable login with token command function.
  */
-export const loginWithToken = wrapCommand<LoginWithTokenParam, LoginResponse>(LOGIN_WITH_TOKEN);
+export const loginWithToken = (getClient: ClientProvider) => async (credentials: LoginWithTokenParam): Promise<LoginResponse> => {
+  const snapshot = { ...credentials };
+  const client = await getClient();
+  if (client._authWithToken) return client._authWithToken(snapshot);
+  return LOGIN_WITH_TOKEN.deserialize(await client.sendCommand(LOGIN_WITH_TOKEN.code, LOGIN_WITH_TOKEN.serialize(snapshot)));
+};
