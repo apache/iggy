@@ -459,7 +459,7 @@ async fn mqtt5_sink_restart_publishes_pipelined_messages(
     server(connectors_runtime(config_path = "tests/connectors/mqtt/sink.toml")),
     seed = seeds::connector_stream
 )]
-async fn mqtt5_sink_reconnects_and_publishes_new_messages(
+async fn mqtt5_sink_publishes_new_message_after_reconnect(
     harness: &TestHarness,
     fixture: MqttSinkPipelinedFixture,
 ) {
