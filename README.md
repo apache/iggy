@@ -104,7 +104,7 @@ The name is an abbreviation for the Italian Greyhound - small yet extremely fast
 - **TLS** support for all transport protocols (TCP, WebSocket, QUIC, HTTPS)
 - **[Connectors](https://github.com/apache/iggy/tree/master/core/connectors)** - sinks, sources and data transformations based on the **custom Rust plugins**
 - **[Model Context Protocol](https://github.com/apache/iggy/tree/master/core/ai/mcp)** - provide context to LLM with **MCP server**
-- Optional server-side as well as client-side **data encryption** using AES-256-GCM
+- Optional server-side as well as client-side **data encryption** using AES-256-GCM, server-side with a separate key per stream
 - Optional metadata support in the form of **message headers**
 - Server-side message compression is not supported yet. Topic compression values
   are reserved for future disk/network compression support; use message headers
@@ -145,6 +145,8 @@ The official releases follow semver (for example `server-0.9.0`), and the Docker
 The server, SDKs and CLI are versioned independently. For example, server 0.9.0 ships with Rust SDK 0.11.0 and CLI 0.14.0. The [server compatibility table](https://iggy.apache.org/docs/sdk/introduction#server-compatibility) lists the SDK version for each server release.
 
 We also publish edge releases (versions with an `-edge.N` suffix, and `apache/iggy:edge`) for the SDKs and the Docker images. They track the latest changes, but are not guaranteed to be stable and are not recommended for production use.
+
+This checkout moves the binary protocol to 0.12.0 and the metadata snapshot format to 13. Both are breaking: older clients and servers do not interoperate with it, and data directories written by older releases are refused. See [Upgrade recovery](core/server/README.md#upgrade-recovery).
 
 ---
 
@@ -293,6 +295,8 @@ Segment flush thresholds control scheduling, independently of acknowledgment dur
 Rust HTTP callers can use `HttpClient::send_messages_with_durability` to read the advertised guarantee alongside confirmations.
 
 The CLI exposes `--durability persisted` and `--consumer-offset-durability persisted` on `topic create`. Select either independently. The policy names describe completion guarantees and do not prescribe an I/O syscall.
+
+Streams, topics and users carry options from one catalog, listed by `iggy options <scope>` and changed by one sparse update. Each encrypted stream has its own data key, wrapped under the server's `[encryption] key`, and a stream created without encryption stays plaintext for life. Rotating the server key is a two-phase change through `previous_keys` and `retired_kek_fingerprints`. See [Resource options](core/server/README.md#resource-options) and [Stream encryption](core/server/README.md#stream-encryption).
 
 For the detailed documentation of the configuration file, please refer to the [configuration](https://iggy.apache.org/docs/server/configuration) section.
 

@@ -152,14 +152,21 @@ impl BridgeError {
         }
     }
 
-    /// [`Self::to_kafka_error_code`] for `OffsetCommit` and `OffsetFetch`. A failure that a retry
-    /// can fix becomes `COORDINATOR_LOAD_IN_PROGRESS` (14): the Java client retries 14 in both
-    /// APIs, but fails the call on 6, and on 7 in `OffsetFetch`. Offset calls are idempotent, so
-    /// the unknown outcome behind 7 does no harm on a retry. Nor does `RequestTooOld`'s: the retry
-    /// is a new request, which Iggy runs.
+    /// [`Self::to_kafka_error_code`] for the group offset APIs. A failure that a retry can fix
+    /// becomes `COORDINATOR_LOAD_IN_PROGRESS` (14): the Java client retries 14 in `OffsetCommit`
+    /// and `OffsetFetch`, but fails the call on 6, and on 7 in `OffsetFetch`. Offset calls are
+    /// idempotent, so the unknown outcome behind 7 does no harm on a retry. Nor does
+    /// `RequestTooOld`'s: the retry is a new request, which Iggy runs. `LifecycleBusy` ends when
+    /// the delete of a group on the topic ends. `LaneBlocked` sent nothing: an earlier write of the
+    /// client is still in doubt, and a retry runs once it settles.
     #[must_use]
     pub const fn to_offset_error_code(&self) -> i16 {
-        if matches!(self, Self::Iggy(IggyError::RequestTooOld)) {
+        if matches!(
+            self,
+            Self::Iggy(
+                IggyError::RequestTooOld | IggyError::LifecycleBusy | IggyError::LaneBlocked(_)
+            )
+        ) {
             return ERROR_COORDINATOR_LOAD_IN_PROGRESS;
         }
         match self.to_kafka_error_code() {
@@ -262,9 +269,11 @@ const fn iggy_error_to_kafka_code(err: &IggyError) -> i16 {
         | IggyError::CannotEstablishConnection
         | IggyError::TcpError
         | IggyError::TransientNotAccepted => ERROR_NOT_LEADER_OR_FOLLOWER,
-        IggyError::TransientNotCommitted | IggyError::OperationUncertain(_) => {
-            ERROR_REQUEST_TIMED_OUT
-        }
+        // `OperationNotRetained` comes only from resolving the earlier operation that blocks a
+        // call. That call was not sent, so unlike `RequestTooOld` a retry cannot write it twice.
+        IggyError::TransientNotCommitted
+        | IggyError::OperationUncertain(_)
+        | IggyError::OperationNotRetained(_) => ERROR_REQUEST_TIMED_OUT,
         // The outcome was forgotten; a retry after client eviction could duplicate the write.
         // UNKNOWN_SERVER_ERROR is non-retryable in the Kafka protocol.
         IggyError::RequestTooOld => ERROR_UNKNOWN_SERVER_ERROR,
@@ -518,6 +527,17 @@ mod tests {
     fn uncertain_operation_maps_to_request_timed_out() {
         let err = BridgeError::Iggy(IggyError::OperationUncertain(42));
         assert_eq!(err.to_kafka_error_code(), ERROR_REQUEST_TIMED_OUT);
+    }
+
+    #[test]
+    fn given_an_unretained_blocker_when_mapped_should_answer_a_retriable_timeout() {
+        let err = BridgeError::Iggy(IggyError::OperationNotRetained(42));
+
+        assert_eq!(err.to_kafka_error_code(), ERROR_REQUEST_TIMED_OUT);
+        assert_eq!(
+            err.to_offset_error_code(),
+            ERROR_COORDINATOR_LOAD_IN_PROGRESS
+        );
     }
 
     #[test]

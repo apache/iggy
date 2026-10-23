@@ -17,13 +17,15 @@
 
 use crate::clients::client::IggyClient;
 use crate::http::http_client::HttpClient;
+use crate::http::http_transport::HttpTransport;
 use crate::quic::quic_client::QuicClient;
 use crate::tcp::tcp_client::TcpClient;
 use crate::websocket::websocket_client::WebSocketClient;
 use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{
-    BinarySendPartitioning, Identifier, IggyError, IggyMessage, MessageClient,
-    SendMessagesResponse, SystemClient, send_binary_messages,
+    BinaryOperationLineage, BinarySendPartitioning, BinaryTransport, ClientState, Identifier,
+    IggyError, IggyMessage, MessageClient, SendMessagesResponse, SystemClient,
+    send_binary_messages,
 };
 
 #[allow(clippy::large_enum_variant)]
@@ -37,6 +39,16 @@ pub enum ClientWrapper {
 }
 
 impl ClientWrapper {
+    pub(crate) async fn operation_lineage(&self) -> Option<BinaryOperationLineage> {
+        match self {
+            Self::Iggy(client) => Box::pin(client.client.read().await.operation_lineage()).await,
+            Self::Http(_) => None,
+            Self::Tcp(client) => client.operation_lineage(),
+            Self::Quic(client) => client.operation_lineage(),
+            Self::WebSocket(client) => client.operation_lineage(),
+        }
+    }
+
     pub(crate) async fn send_messages_with_partitioning(
         &self,
         stream: &Identifier,
@@ -88,6 +100,28 @@ impl ClientWrapper {
             Self::Tcp(client) => client.retains_operation(op),
             Self::Quic(client) => client.retains_operation(op),
             Self::WebSocket(client) => client.retains_operation(op),
+        }
+    }
+
+    pub(crate) async fn is_authenticated(&self) -> bool {
+        match self {
+            Self::Iggy(client) => Box::pin(client.client.read().await.is_authenticated()).await,
+            Self::Http(client) => client.is_authenticated().await,
+            Self::Tcp(client) => client.get_state().await == ClientState::Authenticated,
+            Self::Quic(client) => client.get_state().await == ClientState::Authenticated,
+            Self::WebSocket(client) => client.get_state().await == ClientState::Authenticated,
+        }
+    }
+
+    /// Whether the client is up or comes back without the caller.
+    pub(crate) async fn can_recover(&self) -> bool {
+        match self {
+            Self::Iggy(client) => Box::pin(client.client.read().await.can_recover()).await,
+            // HTTP keeps no link state: each request connects on its own.
+            Self::Http(_) => true,
+            Self::Tcp(client) => client.can_recover(),
+            Self::Quic(client) => client.can_recover(),
+            Self::WebSocket(client) => client.can_recover(),
         }
     }
 }

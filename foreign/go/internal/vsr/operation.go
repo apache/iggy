@@ -38,12 +38,15 @@ const (
 	OperationTruncatePartition               Operation = 68
 	OperationFinalizeSession                 Operation = 70
 	OperationCompleteLifecycle               Operation = 71
+	OperationUpdateStreamResolved            Operation = 72
+	OperationUpdateTopicResolved             Operation = 73
+	OperationUpdateUserResolved              Operation = 74
+	OperationRewrapStreamKeys                Operation = 75
 
+	// 129, 133 and 142 were the per-resource updates. Never reuse them.
 	OperationCreateStream              Operation = 128
-	OperationUpdateStream              Operation = 129
 	OperationDeleteStream              Operation = 130
 	OperationCreateTopic               Operation = 132
-	OperationUpdateTopic               Operation = 133
 	OperationDeleteTopic               Operation = 134
 	OperationCreatePartitions          Operation = 136
 	OperationDeletePartitions          Operation = 137
@@ -51,7 +54,6 @@ const (
 	OperationCreateConsumerGroup       Operation = 139
 	OperationDeleteConsumerGroup       Operation = 140
 	OperationCreateUser                Operation = 141
-	OperationUpdateUser                Operation = 142
 	OperationDeleteUser                Operation = 143
 	OperationChangePassword            Operation = 144
 	OperationUpdatePermissions         Operation = 145
@@ -59,6 +61,7 @@ const (
 	OperationDeletePersonalAccessToken Operation = 147
 	OperationJoinConsumerGroup         Operation = 148
 	OperationLeaveConsumerGroup        Operation = 149
+	OperationUpdateResource            Operation = 150
 
 	OperationSendMessages               Operation = 160
 	OperationStoreConsumerOffset        Operation = 161
@@ -89,11 +92,13 @@ var allOperations = []Operation{
 	OperationTruncatePartition,
 	OperationFinalizeSession,
 	OperationCompleteLifecycle,
+	OperationUpdateStreamResolved,
+	OperationUpdateTopicResolved,
+	OperationUpdateUserResolved,
+	OperationRewrapStreamKeys,
 	OperationCreateStream,
-	OperationUpdateStream,
 	OperationDeleteStream,
 	OperationCreateTopic,
-	OperationUpdateTopic,
 	OperationDeleteTopic,
 	OperationCreatePartitions,
 	OperationDeletePartitions,
@@ -101,7 +106,6 @@ var allOperations = []Operation{
 	OperationCreateConsumerGroup,
 	OperationDeleteConsumerGroup,
 	OperationCreateUser,
-	OperationUpdateUser,
 	OperationDeleteUser,
 	OperationChangePassword,
 	OperationUpdatePermissions,
@@ -109,6 +113,7 @@ var allOperations = []Operation{
 	OperationDeletePersonalAccessToken,
 	OperationJoinConsumerGroup,
 	OperationLeaveConsumerGroup,
+	OperationUpdateResource,
 	OperationSendMessages,
 	OperationStoreConsumerOffset,
 	OperationDeleteConsumerOffset,
@@ -127,7 +132,6 @@ var knownOperations = newOperationSet(allOperations)
 var replicatedOperation = map[uint32]Operation{
 	uint32(command.CreateUserCode):           OperationCreateUser,
 	uint32(command.DeleteUserCode):           OperationDeleteUser,
-	uint32(command.UpdateUserCode):           OperationUpdateUser,
 	uint32(command.UpdatePermissionsCode):    OperationUpdatePermissions,
 	uint32(command.ChangePasswordCode):       OperationChangePassword,
 	uint32(command.CreateAccessTokenCode):    OperationCreatePersonalAccessToken,
@@ -137,10 +141,8 @@ var replicatedOperation = map[uint32]Operation{
 	uint32(command.DeleteConsumerOffsetCode): OperationDeleteConsumerOffset,
 	uint32(command.CreateStreamCode):         OperationCreateStream,
 	uint32(command.DeleteStreamCode):         OperationDeleteStream,
-	uint32(command.UpdateStreamCode):         OperationUpdateStream,
 	uint32(command.CreateTopicCode):          OperationCreateTopic,
 	uint32(command.DeleteTopicCode):          OperationDeleteTopic,
-	uint32(command.UpdateTopicCode):          OperationUpdateTopic,
 	uint32(command.CreatePartitionsCode):     OperationCreatePartitions,
 	uint32(command.DeletePartitionsCode):     OperationDeletePartitions,
 	uint32(command.DeleteSegmentsCode):       OperationDeleteSegments,
@@ -148,6 +150,7 @@ var replicatedOperation = map[uint32]Operation{
 	uint32(command.DeleteGroupCode):          OperationDeleteConsumerGroup,
 	uint32(command.JoinGroupCode):            OperationJoinConsumerGroup,
 	uint32(command.LeaveGroupCode):           OperationLeaveConsumerGroup,
+	uint32(command.UpdateResourceCode):       OperationUpdateResource,
 }
 
 func newOperationSet(operations []Operation) map[Operation]struct{} {
@@ -208,7 +211,7 @@ func IsMetadata(operation Operation) bool {
 	if operation == OperationDeleteSegments {
 		return false
 	}
-	return operation >= metadataBandStart && operation <= OperationLeaveConsumerGroup
+	return operation >= metadataBandStart && operation <= OperationUpdateResource
 }
 
 // IsResultFramed reports whether the reply body leads with a committed result

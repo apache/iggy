@@ -20,8 +20,8 @@
 
 use crate::http::http_client::HttpClient;
 use crate::prelude::{
-    CompressionAlgorithm, HttpClientConfig, IggyByteSize, IggyError, IggyExpiry, IggyTimestamp,
-    MaxTopicSize, Partition, PartitionContext, StreamDetails, TopicDetails,
+    HttpClientConfig, IggyByteSize, IggyError, IggyTimestamp, Partition, PartitionContext,
+    StreamDetails, TopicDetails,
 };
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -57,14 +57,23 @@ impl Recorded {
 }
 
 pub(super) struct Reply {
-    status: u16,
+    /// `None` closes the connection without an answer.
+    status: Option<u16>,
     body: String,
 }
 
 impl Reply {
     pub(super) fn empty(status: u16) -> Self {
         Self {
-            status,
+            status: Some(status),
+            body: String::new(),
+        }
+    }
+
+    /// A server that fails after it read the request.
+    pub(super) fn hang_up() -> Self {
+        Self {
+            status: None,
             body: String::new(),
         }
     }
@@ -72,7 +81,7 @@ impl Reply {
     /// The error body the server renders for `error`.
     pub(super) fn error(status: u16, error: &IggyError) -> Self {
         Self {
-            status,
+            status: Some(status),
             body: serde_json::json!({
                 "id": error.as_code(),
                 "code": error.as_string(),
@@ -85,7 +94,7 @@ impl Reply {
 
     pub(super) fn topic(contexts: &[(u32, PartitionContext)]) -> Self {
         Self {
-            status: 200,
+            status: Some(200),
             body: topic_details_json(contexts),
         }
     }
@@ -102,7 +111,7 @@ impl Reply {
             options: Default::default(),
         };
         Self {
-            status: 200,
+            status: Some(200),
             body: serde_json::to_string(&stream).unwrap(),
         }
     }
@@ -134,10 +143,13 @@ impl ScriptedServer {
                 let reply = replies
                     .next()
                     .unwrap_or_else(|| Reply::empty(UNSCRIPTED_STATUS));
+                let Some(status) = reply.status else {
+                    continue;
+                };
                 let response = format!(
                     "HTTP/1.1 {} Scripted\r\ncontent-type: application/json\r\n\
                      content-length: {}\r\nconnection: close\r\n\r\n{}",
-                    reply.status,
+                    status,
                     reply.body.len(),
                     reply.body
                 );
@@ -192,9 +204,6 @@ pub(crate) fn topic_details_json(contexts: &[(u32, PartitionContext)]) -> String
         created_at: IggyTimestamp::zero(),
         name: "topic".to_owned(),
         size: IggyByteSize::default(),
-        message_expiry: IggyExpiry::NeverExpire,
-        compression_algorithm: CompressionAlgorithm::None,
-        max_topic_size: MaxTopicSize::Unlimited,
         messages_count: 0,
         partitions_count: u32::try_from(partitions.len()).unwrap(),
         partitions,

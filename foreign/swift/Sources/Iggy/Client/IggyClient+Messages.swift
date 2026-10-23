@@ -37,7 +37,7 @@ extension IggyClient {
     public func sendMessages(
         streamID: Identifier, topicID: Identifier, partitioning: Partitioning = .balanced, messages: inout [IggyMessage]
     ) async throws -> SendMessagesResponse {
-        try await requireAuthenticated()
+        let lineage = try await requireAuthenticated()
         // Checked before a balanced or keyed send reads the topic.
         guard !messages.isEmpty else {
             throw IggyError(.invalidMessagesCount, context: "a batch needs at least one message")
@@ -45,7 +45,7 @@ extension IggyClient {
         // The key is hashed to a partition before the batch is encoded, so its
         // length is checked first.
         try partitioning.validate()
-        let partitionID = try await resolvePartition(partitioning, streamID: streamID, topicID: topicID)
+        let partitionID = try await resolvePartition(partitioning, streamID: streamID, topicID: topicID, lineage: lineage)
         for index in messages.indices where messages[index].id.isZero {
             messages[index].id = .random()
         }
@@ -54,7 +54,7 @@ extension IggyClient {
                 id: message.id, originTimestamp: message.originTimestamp.microseconds, payload: message.payload, userHeaders: message.rawUserHeaders)
         }
         let payload = try Batch.encodeSend(streamID: streamID, topicID: topicID, partitioning: .partition(partitionID), messages: outgoing)
-        let body = try await sendWithPartitionContext(streamID: streamID, topicID: topicID, partitionID: partitionID, payload: payload)
+        let body = try await sendWithPartitionContext(streamID: streamID, topicID: topicID, partitionID: partitionID, payload: payload, lineage: lineage)
         // The batch committed once the reply arrived. An unreadable
         // confirmation must not make a retrying caller write it twice.
         return (try? Responses.sendConfirmations(body[...])) ?? SendMessagesResponse()
@@ -88,37 +88,45 @@ extension IggyClient {
         streamID: Identifier, topicID: Identifier, partitionID: UInt32?, consumer: Consumer = .default, count: UInt32, autoCommit: Bool,
         strategyFor: @Sendable (UInt32) -> PollingStrategy
     ) async throws -> PolledMessages {
-        try await requireAuthenticated()
+        let lineage = try await requireAuthenticated()
         if consumer.kind == .consumerGroup, partitionID == nil {
-            return try await pollGroup(streamID: streamID, topicID: topicID, consumer: consumer, count: count, autoCommit: autoCommit, strategyFor: strategyFor)
+            return try await pollGroup(
+                streamID: streamID, topicID: topicID, consumer: consumer, count: count, autoCommit: autoCommit, lineage: lineage, strategyFor: strategyFor)
         }
         let strategy = strategyFor(partitionID ?? 0)
         let payload = try Requests.pollMessages(
             consumer: consumer, streamID: streamID, topicID: topicID, partitionID: partitionID, strategy: strategy, count: count, autoCommit: autoCommit)
-        return try Responses.polledMessages(try await routedPartitionRequest(.pollMessages, payload: payload, context: strategy.context)[...])
+        return try Responses.polledMessages(
+            try await routedPartitionRequest(.pollMessages, payload: payload, context: strategy.context, lineage: lineage)[...])
     }
 
     // MARK: Partition contexts
 
     /// Sends under the partition's cached context, or one read from its
     /// route. A history refusal means the context is stale: the topic's
-    /// contexts are dropped and one fresh route is tried.
-    private func sendWithPartitionContext(streamID: Identifier, topicID: Identifier, partitionID: UInt32, payload: [UInt8]) async throws -> [UInt8] {
+    /// contexts are dropped and one fresh route is tried. A refusal, such as
+    /// a namespace miss the metadata primary did not confirm, sends again on
+    /// a fresh route until `requestTimeout` from the call passes.
+    private func sendWithPartitionContext(
+        streamID: Identifier, topicID: Identifier, partitionID: UInt32, payload: [UInt8], lineage: UInt64
+    ) async throws -> [UInt8] {
+        let deadline = ContinuousClock.now + core.configuration.requestTimeout
         let key = ConsumerGroupState.TopicKey(stream: streamID, topic: topicID)
+        let route = PollRouter.RouteKey(stream: streamID, topic: topicID, partitionID: partitionID)
         let state = core.groupState
         var context = state.partitionContext(key, partitionID: partitionID)
         var refreshAvailable = true
+        var backoff = PollRouter.Backoff()
         while true {
-            let captured: PartitionContext
-            if let context {
-                captured = context
-            } else {
-                let body = try await send(.getPartitionRoute, Requests.partitionRoute(streamID: streamID, topicID: topicID, partitionID: partitionID))
-                captured = try Responses.partitionRoute(body[...]).context
-                state.setPartitionContext(key, partitionID: partitionID, captured)
-            }
             do {
-                return try await core.exchange(code: CommandCode.sendMessages.rawValue, payload: payload, context: captured)
+                let captured: PartitionContext
+                if let context {
+                    captured = context
+                } else {
+                    captured = try await core.pollRouter.sendContext(route, lineage: lineage, coordinator: core, deadline: deadline)
+                    state.setPartitionContext(key, partitionID: partitionID, captured)
+                }
+                return try await core.pollRouter.sendMessages(payload, context: captured, lineage: lineage, coordinator: core, deadline: deadline)
             } catch let error as IggyError where error.code == .historyUnavailable {
                 state.invalidateTopic(key)
                 guard refreshAvailable else {
@@ -126,6 +134,9 @@ extension IggyClient {
                 }
                 refreshAvailable = false
                 context = nil
+            } catch let error as IggyError where error.code == .transientNotAccepted {
+                context = nil
+                try await backoff.pause(after: error, before: deadline)
             }
         }
     }
@@ -134,7 +145,7 @@ extension IggyClient {
     /// payload names, as `OperationDriver::send_raw` in the Rust SDK picks
     /// it. A plain consumer's poll and an offset read without a partition go
     /// to partition 0. A group poll, a store, and a delete must name one.
-    func routedPartitionRequest(_ code: CommandCode, payload: [UInt8], context: PartitionContext?) async throws -> [UInt8] {
+    func routedPartitionRequest(_ code: CommandCode, payload: [UInt8], context: PartitionContext?, lineage: UInt64) async throws -> [UInt8] {
         let target = try RawRequest.consumerTarget(payload)
         let partitionID: UInt32
         if let named = target.partitionID {
@@ -145,29 +156,31 @@ extension IggyClient {
             throw IggyError(.invalidIdentifier, context: "command \(code.rawValue) needs a partition id")
         }
         let key = PollRouter.RouteKey(stream: target.stream, topic: target.topic, partitionID: partitionID)
-        return try await core.pollRouter.send(code, payload: payload, key: key, context: context, coordinator: core)
+        return try await core.pollRouter.send(
+            code, payload: payload, key: key, context: context, lineage: lineage, coordinator: core,
+            deadline: ContinuousClock.now + PollRouter.pollTimeout)
     }
 
     // MARK: Client-side partitioning
 
-    private func resolvePartition(_ partitioning: Partitioning, streamID: Identifier, topicID: Identifier) async throws -> UInt32 {
+    private func resolvePartition(_ partitioning: Partitioning, streamID: Identifier, topicID: Identifier, lineage: UInt64) async throws -> UInt32 {
         switch partitioning {
         case .partition(let partitionID):
             return partitionID
         case .balanced:
-            let count = try await partitionCount(streamID: streamID, topicID: topicID)
+            let count = try await partitionCount(streamID: streamID, topicID: topicID, lineage: lineage)
             return core.groupState.nextBalancedPartition(.init(stream: streamID, topic: topicID), partitionCount: count)
         case .messagesKey(let key):
-            return XXH32.hash(key) % (try await partitionCount(streamID: streamID, topicID: topicID))
+            return XXH32.hash(key) % (try await partitionCount(streamID: streamID, topicID: topicID, lineage: lineage))
         }
     }
 
     /// The topic's partition count, cached by the topic read so a send does
     /// not pay a metadata round trip per batch.
-    private func partitionCount(streamID: Identifier, topicID: Identifier) async throws -> UInt32 {
+    private func partitionCount(streamID: Identifier, topicID: Identifier, lineage: UInt64) async throws -> UInt32 {
         var count = core.groupState.partitionCount(.init(stream: streamID, topic: topicID))
         if count == nil {
-            count = try await getTopic(streamID: streamID, topicID: topicID)?.partitionsCount
+            count = try await getTopic(streamID: streamID, topicID: topicID, lineage: lineage)?.partitionsCount
         }
         guard let count, count > 0 else {
             throw IggyError(.topicIdNotFound, context: "topic \(topicID) in stream \(streamID)")
@@ -179,11 +192,12 @@ extension IggyClient {
 
     /// Syncs the member's assignment from the coordinator into the cache. An
     /// empty reply means the client is not a member. A reply that arrives
-    /// after the session was replaced is dropped.
-    func syncGroupAssignment(streamID: Identifier, topicID: Identifier, groupID: Identifier) async throws {
+    /// after the session was replaced is dropped. `lineage` is the one of the
+    /// call the sync belongs to, nil for a sync of its own.
+    func syncGroupAssignment(streamID: Identifier, topicID: Identifier, groupID: Identifier, lineage: UInt64?) async throws {
         let state = core.groupState
         let scope = state.sessionScope
-        let body = try await send(.syncConsumerGroup, Requests.consumerGroup(streamID: streamID, topicID: topicID, groupID: groupID))
+        let body = try await send(.syncConsumerGroup, Requests.consumerGroup(streamID: streamID, topicID: topicID, groupID: groupID), lineage: lineage)
         let key = ConsumerGroupState.GroupKey(stream: streamID, topic: topicID, group: groupID)
         if body.isEmpty {
             // The coordinator answers any member, even one holding no
@@ -203,7 +217,7 @@ extension IggyClient {
     func refreshConsumerGroupAssignments() async {
         for key in core.groupState.registeredGroups {
             do {
-                try await syncGroupAssignment(streamID: key.stream, topicID: key.topic, groupID: key.group)
+                try await syncGroupAssignment(streamID: key.stream, topicID: key.topic, groupID: key.group, lineage: nil)
             } catch {
                 logger.warning("Failed to refresh the consumer group assignment of \(key.stream)|\(key.topic)|\(key.group): \(error)")
             }
@@ -211,12 +225,13 @@ extension IggyClient {
     }
 
     private func pollGroup(
-        streamID: Identifier, topicID: Identifier, consumer: Consumer, count: UInt32, autoCommit: Bool, strategyFor: @Sendable (UInt32) -> PollingStrategy
+        streamID: Identifier, topicID: Identifier, consumer: Consumer, count: UInt32, autoCommit: Bool, lineage: UInt64,
+        strategyFor: @Sendable (UInt32) -> PollingStrategy
     ) async throws -> PolledMessages {
         let key = ConsumerGroupState.GroupKey(stream: streamID, topic: topicID, group: consumer.id)
         let state = core.groupState
         if !state.hasAssignment(key) {
-            try await syncGroupAssignment(streamID: streamID, topicID: topicID, groupID: consumer.id)
+            try await syncGroupAssignment(streamID: streamID, topicID: topicID, groupID: consumer.id, lineage: lineage)
         }
         for _ in 0..<Self.groupPollMaxAttempts {
             guard let partitionID = state.nextGroupPartition(key) else {
@@ -237,18 +252,18 @@ extension IggyClient {
                 consumer: consumer, streamID: streamID, topicID: topicID, partitionID: partitionID, strategy: strategy, count: count, autoCommit: autoCommit)
             do {
                 let polled = try Responses.polledMessages(
-                    try await routedPartitionRequest(.pollMessages, payload: payload, context: strategy.context)[...])
+                    try await routedPartitionRequest(.pollMessages, payload: payload, context: strategy.context, lineage: lineage)[...])
                 if polled.messages.isEmpty, polled.partitionID == PolledMessages.resyncRequiredPartition {
                     // The coordinator fences a stale assignment through the
                     // empty poll, for want of a typed error.
                     state.invalidateAssignment(key)
-                    try await syncGroupAssignment(streamID: streamID, topicID: topicID, groupID: consumer.id)
+                    try await syncGroupAssignment(streamID: streamID, topicID: topicID, groupID: consumer.id, lineage: lineage)
                     continue
                 }
                 return polled
             } catch let error as IggyError where error.code == .consumerGroupPartitionNotOwned {
                 state.invalidateAssignment(key)
-                try await syncGroupAssignment(streamID: streamID, topicID: topicID, groupID: consumer.id)
+                try await syncGroupAssignment(streamID: streamID, topicID: topicID, groupID: consumer.id, lineage: lineage)
                 if strategy.context != nil {
                     // A continuation of the partition the member lost cannot
                     // move to another one.
@@ -274,24 +289,24 @@ extension IggyClient {
     )
         async throws
     {
-        try await requireAuthenticated()
+        let lineage = try await requireAuthenticated()
         _ = try await routedPartitionRequest(
             .storeConsumerOffset,
             payload: Requests.storeConsumerOffset(
                 consumer: consumer, streamID: streamID, topicID: topicID, partitionID: partitionID, offset: offset, ack: .quorum),
-            context: nil)
+            context: nil, lineage: lineage)
     }
 
     /// Stores a checkpoint under the partition context of the poll that
     /// delivered it. It is refused once the partition was recreated or, for a
     /// consumer group, reassigned since.
     public func storeConsumerPosition(consumer: Consumer = .default, streamID: Identifier, topicID: Identifier, position: ConsumerPosition) async throws {
-        try await requireAuthenticated()
+        let lineage = try await requireAuthenticated()
         _ = try await routedPartitionRequest(
             .storeConsumerOffset,
             payload: Requests.storeConsumerOffset(
                 consumer: consumer, streamID: streamID, topicID: topicID, partitionID: position.partitionID, offset: position.offset, ack: .quorum),
-            context: position.context)
+            context: position.context, lineage: lineage)
     }
 
     /// The stored offset of a consumer on a partition, or nil when none is
@@ -301,10 +316,10 @@ extension IggyClient {
     ) async throws
         -> ConsumerOffsetInfo?
     {
-        try await requireAuthenticated()
+        let lineage = try await requireAuthenticated()
         let body = try await routedPartitionRequest(
             .getConsumerOffset, payload: Requests.getConsumerOffset(consumer: consumer, streamID: streamID, topicID: topicID, partitionID: partitionID),
-            context: nil)
+            context: nil, lineage: lineage)
         return body.isEmpty ? nil : try Responses.consumerOffset(body[...])
     }
 
@@ -312,11 +327,11 @@ extension IggyClient {
     /// `partitionID` fails with ``IggyErrorCode/invalidIdentifier`` before
     /// anything is sent.
     public func deleteConsumerOffset(consumer: Consumer = .default, streamID: Identifier, topicID: Identifier, partitionID: UInt32?) async throws {
-        try await requireAuthenticated()
+        let lineage = try await requireAuthenticated()
         _ = try await routedPartitionRequest(
             .deleteConsumerOffset,
             payload: Requests.deleteConsumerOffset(consumer: consumer, streamID: streamID, topicID: topicID, partitionID: partitionID, ack: .quorum),
-            context: nil)
+            context: nil, lineage: lineage)
     }
 }
 
@@ -326,19 +341,20 @@ extension IggyClient {
     /// Sends a raw partition request the way its typed call sends it, so it
     /// carries the partition context the server requires. Nil for any other
     /// code.
-    func sendRawPartitionRequest(code: UInt32, payload: [UInt8]) async throws -> [UInt8]? {
+    func sendRawPartitionRequest(code: UInt32, payload: [UInt8], lineage: UInt64) async throws -> [UInt8]? {
         guard let command = CommandCode(rawValue: code) else {
             return nil
         }
         switch command {
         case .sendMessages:
             let target = try RawRequest.sendTarget(payload)
-            return try await sendWithPartitionContext(streamID: target.stream, topicID: target.topic, partitionID: target.partitionID, payload: payload)
+            return try await sendWithPartitionContext(
+                streamID: target.stream, topicID: target.topic, partitionID: target.partitionID, payload: payload, lineage: lineage)
         case .pollMessages:
             try RawRequest.validatePoll(payload)
-            return try await routedPartitionRequest(.pollMessages, payload: payload, context: nil)
+            return try await routedPartitionRequest(.pollMessages, payload: payload, context: nil, lineage: lineage)
         case .getConsumerOffset, .storeConsumerOffset, .deleteConsumerOffset:
-            return try await routedPartitionRequest(command, payload: payload, context: nil)
+            return try await routedPartitionRequest(command, payload: payload, context: nil, lineage: lineage)
         default:
             return nil
         }

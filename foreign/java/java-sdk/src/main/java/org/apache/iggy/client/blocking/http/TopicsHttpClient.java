@@ -24,13 +24,13 @@ import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.partition.Partition;
-import org.apache.iggy.topic.CompressionAlgorithm;
 import org.apache.iggy.topic.Topic;
 import org.apache.iggy.topic.TopicDetails;
+import org.apache.iggy.topic.TopicOptions;
+import org.apache.iggy.topic.TopicUpdate;
 import tools.jackson.core.type.TypeReference;
 
 import java.math.BigInteger;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -64,37 +64,21 @@ class TopicsHttpClient implements TopicsClient {
 
     @Override
     public TopicDetails createTopic(
-            StreamId streamId,
-            Long partitionsCount,
-            CompressionAlgorithm compressionAlgorithm,
-            BigInteger messageExpiry,
-            BigInteger maxTopicSize,
-            String name,
-            Map<String, HeaderValue> options) {
+            StreamId streamId, String name, long partitionsCount, Map<String, HeaderValue> options) {
         var request = httpClient.preparePostRequest(
                 STREAMS + "/" + streamId + TOPICS,
                 new CreateTopic(
                         partitionsCount,
-                        compressionAlgorithm,
-                        messageExpiry,
-                        maxTopicSize,
                         name,
-                        toStringOptions(org.apache.iggy.topic.TopicOptions.withDurabilityDefaults(options))));
+                        HttpOptionValue.requestValues(TopicOptions.withDurabilityDefaults(options))));
         return httpClient.execute(request, HttpTopicDetails.class).toTopicDetails();
     }
 
     @Override
-    public void updateTopic(
-            StreamId streamId,
-            TopicId topicId,
-            CompressionAlgorithm compressionAlgorithm,
-            BigInteger messageExpiry,
-            BigInteger maxTopicSize,
-            String name,
-            Map<String, HeaderValue> options) {
+    public void updateTopic(StreamId streamId, TopicId topicId, TopicUpdate update) {
         var request = httpClient.preparePutRequest(
                 STREAMS + "/" + streamId + TOPICS + "/" + topicId,
-                new UpdateTopic(compressionAlgorithm, messageExpiry, maxTopicSize, name, toStringOptions(options)));
+                HttpOptionValue.updateBody(update.entries(), update.resetKeys()));
         httpClient.execute(request);
     }
 
@@ -105,53 +89,7 @@ class TopicsHttpClient implements TopicsClient {
         sendContexts.clear();
     }
 
-    /**
-     * Renders option values as the strings the REST body carries them in.
-     *
-     * <p>The binary transports send a typed TLV block, but the JSON body takes a plain string map
-     * that the server parses by the same rules a config file value goes through, so a typed value
-     * handed in here is rendered: sending a {@code Uint64} 134217728 and sending "134217728" land
-     * the same stored value.
-     */
-    private static Map<String, String> toStringOptions(Map<String, HeaderValue> options) {
-        Map<String, String> rendered = new LinkedHashMap<>();
-        options.forEach((key, value) -> rendered.put(key, value.toStringValue()));
-        return rendered;
-    }
-
-    private static Map<String, HeaderValue> optionsOf(Map<String, HttpOptionValue> options, boolean explicit) {
-        if (options == null) {
-            return Map.of();
-        }
-        Map<String, HeaderValue> selected = new LinkedHashMap<>();
-        options.forEach((key, option) -> {
-            if (option.explicit() == explicit) {
-                selected.put(key, HeaderValue.fromString(option.value()));
-            }
-        });
-        return Map.copyOf(selected);
-    }
-
-    record CreateTopic(
-            Long partitionsCount,
-            CompressionAlgorithm compressionAlgorithm,
-            BigInteger messageExpiry,
-            BigInteger maxTopicSize,
-            String name,
-            Map<String, String> options) {}
-
-    record UpdateTopic(
-            CompressionAlgorithm compressionAlgorithm,
-            BigInteger messageExpiry,
-            BigInteger maxTopicSize,
-            String name,
-            Map<String, String> options) {}
-
-    /**
-     * One option entry as REST renders it: the value in the string form the create body takes, plus
-     * the provenance flag that the binary protocol carries as two separate blocks instead.
-     */
-    record HttpOptionValue(String value, boolean explicit) {}
+    record CreateTopic(long partitionsCount, String name, Map<String, Object> options) {}
 
     /**
      * The REST shape of a topic.
@@ -159,17 +97,13 @@ class TopicsHttpClient implements TopicsClient {
      * <p>It differs from {@link Topic} in one place: REST reports every option in a single map with a
      * per-entry {@code explicit} flag, where the binary protocol sends an explicit block and a derived
      * block. Splitting here is what lets a caller read {@code options()} and {@code derivedOptions()}
-     * the same way on either transport. Values arrive in string form, so each is String-kinded rather
-     * than carrying the kind the server stored.
+     * the same way on either transport, each value in the kind the server stored.
      */
     record HttpTopic(
             Long id,
             BigInteger createdAt,
             String name,
             String size,
-            BigInteger messageExpiry,
-            CompressionAlgorithm compressionAlgorithm,
-            BigInteger maxTopicSize,
             BigInteger messagesCount,
             Long partitionsCount,
             Map<String, HttpOptionValue> options) {
@@ -180,13 +114,10 @@ class TopicsHttpClient implements TopicsClient {
                     createdAt,
                     name,
                     size,
-                    messageExpiry,
-                    compressionAlgorithm,
-                    maxTopicSize,
                     messagesCount,
                     partitionsCount,
-                    optionsOf(options, true),
-                    optionsOf(options, false));
+                    HttpOptionValue.select(options, true),
+                    HttpOptionValue.select(options, false));
         }
     }
 
@@ -196,9 +127,6 @@ class TopicsHttpClient implements TopicsClient {
             BigInteger createdAt,
             String name,
             String size,
-            BigInteger messageExpiry,
-            CompressionAlgorithm compressionAlgorithm,
-            BigInteger maxTopicSize,
             BigInteger messagesCount,
             Long partitionsCount,
             List<Partition> partitions,
@@ -210,14 +138,11 @@ class TopicsHttpClient implements TopicsClient {
                     createdAt,
                     name,
                     size,
-                    messageExpiry,
-                    compressionAlgorithm,
-                    maxTopicSize,
                     messagesCount,
                     partitionsCount,
                     partitions == null ? List.of() : partitions,
-                    optionsOf(options, true),
-                    optionsOf(options, false));
+                    HttpOptionValue.select(options, true),
+                    HttpOptionValue.select(options, false));
         }
     }
 }

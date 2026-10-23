@@ -18,19 +18,21 @@
 use super::{MqttProtocol, MqttSourceConfig, Qos, qos_for_subscription};
 use base64::Engine;
 use iggy_common::{HeaderKey, HeaderValue};
-use rumqttc::tokio_rustls::rustls::{
+use rumqttc_v4::tokio_rustls::rustls::{
     self, ClientConfig, RootCertStore,
     pki_types::{CertificateDer, PrivateKeyDer},
 };
-use rumqttc::v5::{
-    AsyncClient as Mqtt5Client, Event as Mqtt5Event, EventLoop as Mqtt5EventLoop,
-    Incoming as Mqtt5Incoming, MqttOptions as Mqtt5Options,
-    mqttbytes::{QoS as Mqtt5Qos, v5::Publish as Mqtt5Publish},
+use rumqttc_v4::{
+    AckMode as Mqtt311AckMode, AsyncClient as Mqtt311Client, Event as Mqtt311Event,
+    EventLoop as Mqtt311EventLoop, Incoming as Mqtt311Incoming, MqttOptions as Mqtt311Options,
+    TlsConfiguration, Transport as Mqtt311Transport,
+    mqttbytes::{QoS as MqttQos, v4::Publish as Mqtt311Publish},
 };
-use rumqttc::{
-    AsyncClient as Mqtt311Client, Event as Mqtt311Event, EventLoop as Mqtt311EventLoop,
-    Incoming as Mqtt311Incoming, MqttOptions as Mqtt311Options, TlsConfiguration, Transport,
-    mqttbytes::{QoS as Mqtt311Qos, v4::Publish as Mqtt311Publish},
+use rumqttc_v5::{
+    AckMode as Mqtt5AckMode, AsyncClient as Mqtt5Client, BrokerSessionResumePolicy,
+    Event as Mqtt5Event, EventLoop as Mqtt5EventLoop, Incoming as Mqtt5Incoming,
+    MqttOptions as Mqtt5Options, Transport as Mqtt5Transport,
+    mqttbytes::v5::Publish as Mqtt5Publish,
 };
 use rustls_native_certs::load_native_certs;
 use rustls_pemfile::{certs, private_key};
@@ -48,6 +50,7 @@ use url::Url;
 
 const MAX_HEADER_VALUE_LENGTH: usize = 255;
 const RECONNECT_RETRY_DELAY: Duration = Duration::from_millis(10);
+const MQTTS_DEFAULT_PORT: u16 = 8883;
 const MQTT_PROTOCOL_HEADER: &str = "mqtt.protocol";
 const MQTT_TOPIC_HEADER: &str = "mqtt.topic";
 
@@ -119,8 +122,8 @@ pub(crate) struct ReceivedMessage {
 
 #[derive(Debug)]
 pub(crate) enum AckToken {
-    Mqtt311 { qos: Mqtt311Qos, packet_id: u16 },
-    Mqtt5 { qos: Mqtt5Qos, packet_id: u16 },
+    Mqtt311 { qos: MqttQos, packet_id: u16 },
+    Mqtt5 { qos: MqttQos, packet_id: u16 },
 }
 
 enum MqttConnection {
@@ -143,6 +146,11 @@ enum PollResult {
     Message(Box<ReceivedMessage>),
     Buffered(VecDeque<ReceivedMessage>),
     None,
+}
+
+struct BrokerUrl {
+    url: String,
+    tls: bool,
 }
 
 /// Protocol-specific MQTT client and event loop behind one common driver API.
@@ -170,11 +178,17 @@ impl MqttDriver {
         max_buffered_messages: usize,
     ) -> Result<Self, iggy_connector_sdk::Error> {
         install_rustls_provider();
+        let keep_alive = u16::try_from(keep_alive.as_secs()).map_err(|_| {
+            iggy_connector_sdk::Error::InvalidConfigValue(format!(
+                "keep_alive must be at most {}s",
+                u16::MAX
+            ))
+        })?;
         let broker_url = broker_url_with_client_id(config, id)?;
         let subscriptions = configured_subscriptions(config, qos)?;
         match config.protocol {
             MqttProtocol::Mqtt311 => {
-                let mut options = Mqtt311Options::parse_url(&broker_url).map_err(|error| {
+                let mut options = Mqtt311Options::parse_url(&broker_url.url).map_err(|error| {
                     iggy_connector_sdk::Error::InvalidConfigValue(format!("broker_url: {error}"))
                 })?;
                 options
@@ -184,13 +198,19 @@ impl MqttDriver {
                     .set_request_channel_capacity(request_capacity)
                     // Manual acknowledgements let Iggy persistence happen before
                     // PUBACK/PUBREC is sent to the broker.
-                    .set_manual_acks(true);
+                    .set_ack_mode(Mqtt311AckMode::Manual);
                 set_mqtt311_credentials(&mut options, config);
-                if let Some(transport) = tls_transport(config)? {
-                    options.set_transport(transport);
+                if broker_url.tls {
+                    options.set_transport(Mqtt311Transport::tls_with_config(tls_configuration(
+                        config,
+                    )?));
                 }
 
-                let (client, mut event_loop) = Mqtt311Client::new(options, request_capacity);
+                let (client, mut event_loop) = Mqtt311Client::builder(options)
+                    .try_build()
+                    .map_err(|error| {
+                        iggy_connector_sdk::Error::InvalidConfigValue(error.to_string())
+                    })?;
                 subscribe_mqtt311(&client, &subscriptions).await?;
                 let buffered_messages = poll_mqtt311(
                     &mut event_loop,
@@ -213,7 +233,7 @@ impl MqttDriver {
                 })
             }
             MqttProtocol::Mqtt5 => {
-                let mut options = Mqtt5Options::parse_url(&broker_url).map_err(|error| {
+                let mut options = Mqtt5Options::parse_url(&broker_url.url).map_err(|error| {
                     iggy_connector_sdk::Error::InvalidConfigValue(format!("broker_url: {error}"))
                 })?;
                 options
@@ -223,23 +243,37 @@ impl MqttDriver {
                     .set_request_channel_capacity(request_capacity)
                     // MQTT 5 uses the same deferred-acknowledgement lifecycle;
                     // rumqttc maps the token to PUBREC/PUBREL/PUBCOMP internally.
-                    .set_manual_acks(true)
+                    .set_ack_mode(Mqtt5AckMode::Manual)
+                    // The source keeps no local session store, so after a restart the
+                    // broker's session is what redelivers unacknowledged publishes.
+                    .set_broker_session_resume_policy(BrokerSessionResumePolicy::AllowBrokerOnly)
                     .set_session_expiry_interval(config.session_expiry_interval);
                 set_mqtt5_credentials(&mut options, config);
-                if let Some(transport) = tls_transport(config)? {
-                    options.set_transport(transport);
+                if broker_url.tls {
+                    options
+                        .set_transport(Mqtt5Transport::tls_with_config(tls_configuration(config)?));
                 }
 
-                let (client, mut event_loop) = Mqtt5Client::new(options, request_capacity);
-                subscribe_mqtt5(&client, &subscriptions).await?;
-                let buffered_messages = poll_mqtt5(
-                    &mut event_loop,
-                    subscriptions.len(),
-                    poll_timeout,
-                    config.include_metadata,
-                    max_buffered_messages,
-                )
-                .await?;
+                let (client, mut event_loop) =
+                    Mqtt5Client::builder(options).try_build().map_err(|error| {
+                        iggy_connector_sdk::Error::InvalidConfigValue(error.to_string())
+                    })?;
+                // A resumed broker session keeps its subscriptions, and broker-only
+                // resume refuses new SUBSCRIBE packets, so only a fresh session subscribes.
+                let buffered_messages =
+                    if mqtt5_session_present(&mut event_loop, poll_timeout).await? {
+                        VecDeque::new()
+                    } else {
+                        subscribe_mqtt5(&client, &subscriptions).await?;
+                        poll_mqtt5(
+                            &mut event_loop,
+                            subscriptions.len(),
+                            poll_timeout,
+                            config.include_metadata,
+                            max_buffered_messages,
+                        )
+                        .await?
+                    };
 
                 Ok(Self {
                     connection: MqttConnection::Mqtt5 {
@@ -544,21 +578,21 @@ fn install_rustls_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-fn tls_transport(
+fn tls_configuration(
     config: &MqttSourceConfig,
-) -> Result<Option<Transport>, iggy_connector_sdk::Error> {
-    // No TLS table means plaintext MQTT. When present, build a complete rustls
-    // transport from either the supplied CA or the system trust store.
-    let Some(tls) = &config.tls else {
-        return Ok(None);
+) -> Result<TlsConfiguration, iggy_connector_sdk::Error> {
+    // A secure broker URL always gets TLS. The optional tls table supplies a
+    // custom CA and client certificate, otherwise the system trust store is used.
+    let (ca_file, client_cert_file, client_key_file) = match &config.tls {
+        Some(tls) => (&tls.ca_file, &tls.client_cert_file, &tls.client_key_file),
+        None => (&None, &None, &None),
     };
 
-    let ca = tls
-        .ca_file
+    let ca = ca_file
         .as_deref()
         .map(|path| read_certificate_file(path, "tls.ca_file"))
         .transpose()?;
-    let client_auth = match (&tls.client_cert_file, &tls.client_key_file) {
+    let client_auth = match (client_cert_file, client_key_file) {
         (Some(cert_path), Some(key_path)) => Some((
             read_certificate_file(cert_path, "tls.client_cert_file")?,
             read_private_key_file(key_path, "tls.client_key_file")?,
@@ -567,9 +601,10 @@ fn tls_transport(
         _ => unreachable!("TLS client certificate and key validation occurs before connect"),
     };
 
-    let tls_config = TlsConfiguration::Rustls(Arc::new(build_tls_config(ca, client_auth)?));
-
-    Ok(Some(Transport::tls_with_config(tls_config)))
+    Ok(TlsConfiguration::Rustls(Arc::new(build_tls_config(
+        ca,
+        client_auth,
+    )?)))
 }
 
 fn read_file(path: &str, field: &str) -> Result<Vec<u8>, iggy_connector_sdk::Error> {
@@ -681,13 +716,28 @@ fn client_id(config: &MqttSourceConfig, id: u32) -> String {
 fn broker_url_with_client_id(
     config: &MqttSourceConfig,
     id: u32,
-) -> Result<String, iggy_connector_sdk::Error> {
+) -> Result<BrokerUrl, iggy_connector_sdk::Error> {
     // rumqttc requires client_id to be present in the URL before parse_url can
     // create MqttOptions. set_client_id below still makes the precedence
     // explicit for both protocol versions.
     let mut url = Url::parse(&config.broker_url).map_err(|error| {
         iggy_connector_sdk::Error::InvalidConfigValue(format!("broker_url: {error}"))
     })?;
+    // parse_url refuses secure schemes, so a secure URL is parsed as mqtt:// on
+    // its secure port and the caller must set the TLS transport itself.
+    let tls = matches!(url.scheme(), "mqtts" | "ssl");
+    if tls {
+        if url.port().is_none() {
+            url.set_port(Some(MQTTS_DEFAULT_PORT)).map_err(|()| {
+                iggy_connector_sdk::Error::InvalidConfigValue("broker_url has no host".to_string())
+            })?;
+        }
+        url.set_scheme("mqtt").map_err(|()| {
+            iggy_connector_sdk::Error::InvalidConfigValue(
+                "broker_url scheme cannot be normalized".to_string(),
+            )
+        })?;
+    }
     let existing_query = url
         .query_pairs()
         .filter(|(key, _)| key != "client_id")
@@ -699,7 +749,10 @@ fn broker_url_with_client_id(
     }
     query.append_pair("client_id", &client_id(config, id));
     url.set_query(Some(&query.finish()));
-    Ok(url.into())
+    Ok(BrokerUrl {
+        url: url.into(),
+        tls,
+    })
 }
 
 fn set_mqtt311_credentials(options: &mut Mqtt311Options, config: &MqttSourceConfig) {
@@ -816,7 +869,9 @@ async fn handle_mqtt5_event(
                 .await?,
             ))
         }
-        Mqtt5Event::Outgoing(_) | Mqtt5Event::Incoming(_) => Ok(PollResult::None),
+        Mqtt5Event::Outgoing(_) | Mqtt5Event::Incoming(_) | Mqtt5Event::Auth(_) => {
+            Ok(PollResult::None)
+        }
     }
 }
 
@@ -844,7 +899,7 @@ async fn poll_mqtt311(
                 if let Some(reason) = suback.return_codes.iter().find(|reason| {
                     !matches!(
                         reason,
-                        rumqttc::mqttbytes::v4::SubscribeReasonCode::Success(_)
+                        rumqttc_v4::mqttbytes::v4::SubscribeReasonCode::Success(_)
                     )
                 }) {
                     return Err(iggy_connector_sdk::Error::Connection(format!(
@@ -868,6 +923,25 @@ async fn poll_mqtt311(
     }
 
     Ok(buffered_messages)
+}
+
+async fn mqtt5_session_present(
+    event_loop: &mut Mqtt5EventLoop,
+    poll_timeout: Duration,
+) -> Result<bool, iggy_connector_sdk::Error> {
+    loop {
+        let event = timeout(poll_timeout, event_loop.poll())
+            .await
+            .map_err(|_| {
+                iggy_connector_sdk::Error::Connection(
+                    "timed out waiting for the MQTT 5 connection acknowledgement".to_string(),
+                )
+            })?
+            .map_err(|error| iggy_connector_sdk::Error::Connection(error.to_string()))?;
+        if let Mqtt5Event::Incoming(Mqtt5Incoming::ConnAck(connack)) = event {
+            return Ok(connack.session_present);
+        }
+    }
 }
 
 async fn poll_mqtt5(
@@ -895,7 +969,7 @@ async fn poll_mqtt5(
                 if let Some(reason) = suback.return_codes.iter().find(|reason| {
                     !matches!(
                         reason,
-                        rumqttc::v5::mqttbytes::v5::SubscribeReasonCode::Success(_)
+                        rumqttc_v5::mqttbytes::v5::SubscribeReasonCode::Success(_)
                     )
                 }) {
                     return Err(iggy_connector_sdk::Error::Connection(format!(
@@ -914,7 +988,7 @@ async fn poll_mqtt5(
                 }
                 buffered_messages.push_back(normalize_mqtt5(publish, include_metadata)?);
             }
-            Mqtt5Event::Outgoing(_) | Mqtt5Event::Incoming(_) => {}
+            Mqtt5Event::Outgoing(_) | Mqtt5Event::Incoming(_) | Mqtt5Event::Auth(_) => {}
         }
     }
 
@@ -933,16 +1007,17 @@ fn normalize_mqtt311(
         dup: publish.dup,
         retain: publish.retain,
     };
-    let headers = metadata_headers("mqtt311", &publish.topic, metadata)?;
+    let topic = topic_string(&publish.topic)?;
+    let headers = metadata_headers("mqtt311", &topic, metadata)?;
     let message = MqttMessage {
         payload: publish.payload.to_vec(),
-        topic: publish.topic.clone(),
+        topic,
         headers,
         metadata,
         mqtt5_properties: None,
     };
     let ack_token = match publish.qos {
-        Mqtt311Qos::AtMostOnce => None,
+        MqttQos::AtMostOnce => None,
         qos => Some(AckToken::Mqtt311 {
             qos,
             packet_id: publish.pkid,
@@ -981,7 +1056,7 @@ pub(crate) fn normalize_mqtt5(
         mqtt5_properties,
     };
     let ack_token = match publish.qos {
-        Mqtt5Qos::AtMostOnce => None,
+        MqttQos::AtMostOnce => None,
         qos => Some(AckToken::Mqtt5 {
             qos,
             packet_id: publish.pkid,
@@ -990,8 +1065,8 @@ pub(crate) fn normalize_mqtt5(
     Ok(ReceivedMessage { message, ack_token })
 }
 
-impl From<&rumqttc::v5::mqttbytes::v5::PublishProperties> for Mqtt5EnvelopeProperties {
-    fn from(properties: &rumqttc::v5::mqttbytes::v5::PublishProperties) -> Self {
+impl From<&rumqttc_v5::mqttbytes::v5::PublishProperties> for Mqtt5EnvelopeProperties {
+    fn from(properties: &rumqttc_v5::mqttbytes::v5::PublishProperties) -> Self {
         Self {
             payload_format_indicator: properties.payload_format_indicator,
             message_expiry_interval: properties.message_expiry_interval,
@@ -1088,7 +1163,7 @@ fn topic_string(topic: &[u8]) -> Result<String, iggy_connector_sdk::Error> {
     String::from_utf8(topic.to_vec()).map_err(|_| iggy_connector_sdk::Error::InvalidTextPayload)
 }
 
-impl From<Qos> for Mqtt311Qos {
+impl From<Qos> for MqttQos {
     fn from(qos: Qos) -> Self {
         match qos {
             Qos::Zero => Self::AtMostOnce,
@@ -1098,32 +1173,12 @@ impl From<Qos> for Mqtt311Qos {
     }
 }
 
-impl From<Qos> for Mqtt5Qos {
-    fn from(qos: Qos) -> Self {
+impl From<MqttQos> for Qos {
+    fn from(qos: MqttQos) -> Self {
         match qos {
-            Qos::Zero => Self::AtMostOnce,
-            Qos::One => Self::AtLeastOnce,
-            Qos::Two => Self::ExactlyOnce,
-        }
-    }
-}
-
-impl From<Mqtt311Qos> for Qos {
-    fn from(qos: Mqtt311Qos) -> Self {
-        match qos {
-            Mqtt311Qos::AtMostOnce => Self::Zero,
-            Mqtt311Qos::AtLeastOnce => Self::One,
-            Mqtt311Qos::ExactlyOnce => Self::Two,
-        }
-    }
-}
-
-impl From<Mqtt5Qos> for Qos {
-    fn from(qos: Mqtt5Qos) -> Self {
-        match qos {
-            Mqtt5Qos::AtMostOnce => Self::Zero,
-            Mqtt5Qos::AtLeastOnce => Self::One,
-            Mqtt5Qos::ExactlyOnce => Self::Two,
+            MqttQos::AtMostOnce => Self::Zero,
+            MqttQos::AtLeastOnce => Self::One,
+            MqttQos::ExactlyOnce => Self::Two,
         }
     }
 }
@@ -1131,25 +1186,23 @@ impl From<Mqtt5Qos> for Qos {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rumqttc::v5::mqttbytes::v5::PublishProperties;
+    use rumqttc_v5::mqttbytes::v5::PublishProperties;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    // First byte of a TLS record carrying a handshake, as opposed to 0x10 for an MQTT CONNECT.
+    const TLS_HANDSHAKE_RECORD: u8 = 0x16;
 
     #[test]
-    fn given_qos_should_convert_to_mqtt311_qos() {
-        assert_eq!(Mqtt311Qos::AtMostOnce, Qos::Zero.into());
-        assert_eq!(Mqtt311Qos::AtLeastOnce, Qos::One.into());
-        assert_eq!(Mqtt311Qos::ExactlyOnce, Qos::Two.into());
-    }
-
-    #[test]
-    fn given_qos_should_convert_to_mqtt5_qos() {
-        assert_eq!(Mqtt5Qos::AtMostOnce, Qos::Zero.into());
-        assert_eq!(Mqtt5Qos::AtLeastOnce, Qos::One.into());
-        assert_eq!(Mqtt5Qos::ExactlyOnce, Qos::Two.into());
+    fn given_qos_should_convert_to_mqtt_qos() {
+        assert_eq!(MqttQos::AtMostOnce, Qos::Zero.into());
+        assert_eq!(MqttQos::AtLeastOnce, Qos::One.into());
+        assert_eq!(MqttQos::ExactlyOnce, Qos::Two.into());
     }
 
     #[test]
     fn given_mqtt311_qos_zero_should_not_create_ack_token() {
-        let publish = Mqtt311Publish::new("devices/test", Mqtt311Qos::AtMostOnce, b"payload");
+        let publish = Mqtt311Publish::new("devices/test", MqttQos::AtMostOnce, b"payload");
         let received = normalize_mqtt311(publish).expect("MQTT 3.1.1 publish should normalize");
 
         assert!(received.ack_token.is_none());
@@ -1159,7 +1212,7 @@ mod tests {
 
     #[test]
     fn given_mqtt311_publish_should_map_metadata_to_headers() {
-        let mut publish = Mqtt311Publish::new("devices/test", Mqtt311Qos::AtLeastOnce, b"payload");
+        let mut publish = Mqtt311Publish::new("devices/test", MqttQos::AtLeastOnce, b"payload");
         publish.dup = true;
         publish.retain = true;
 
@@ -1183,7 +1236,7 @@ mod tests {
     #[test]
     fn given_oversized_topic_should_preserve_message_and_omit_topic_header() {
         let topic = "t".repeat(MAX_HEADER_VALUE_LENGTH + 1);
-        let publish = Mqtt311Publish::new(&topic, Mqtt311Qos::AtMostOnce, b"payload");
+        let publish = Mqtt311Publish::new(&topic, MqttQos::AtMostOnce, b"payload");
 
         let received = normalize_mqtt311(publish).expect("oversized topic should be tolerated");
 
@@ -1210,7 +1263,7 @@ mod tests {
         };
         let publish = Mqtt5Publish::new(
             "devices/test",
-            Mqtt5Qos::AtMostOnce,
+            MqttQos::AtMostOnce,
             b"payload".as_slice(),
             Some(properties),
         );
@@ -1236,7 +1289,7 @@ mod tests {
     fn given_mqtt5_qos_two_should_create_deferred_ack_token() {
         let mut publish = Mqtt5Publish::new(
             "devices/test",
-            Mqtt5Qos::ExactlyOnce,
+            MqttQos::ExactlyOnce,
             b"payload".as_slice(),
             None,
         );
@@ -1246,7 +1299,7 @@ mod tests {
         assert!(matches!(
             received.ack_token,
             Some(AckToken::Mqtt5 {
-                qos: Mqtt5Qos::ExactlyOnce,
+                qos: MqttQos::ExactlyOnce,
                 packet_id: 42,
             })
         ));
@@ -1256,14 +1309,14 @@ mod tests {
 
     #[test]
     fn given_mqtt311_qos_one_should_create_deferred_ack_token() {
-        let mut publish = Mqtt311Publish::new("devices/test", Mqtt311Qos::AtLeastOnce, b"payload");
+        let mut publish = Mqtt311Publish::new("devices/test", MqttQos::AtLeastOnce, b"payload");
         publish.pkid = 17;
         let received = normalize_mqtt311(publish).expect("MQTT 3.1.1 publish should normalize");
 
         assert!(matches!(
             received.ack_token,
             Some(AckToken::Mqtt311 {
-                qos: Mqtt311Qos::AtLeastOnce,
+                qos: MqttQos::AtLeastOnce,
                 packet_id: 17,
             })
         ));
@@ -1273,7 +1326,7 @@ mod tests {
 
     #[test]
     fn given_mqtt311_qos_two_should_create_deferred_ack_token() {
-        let publish = Mqtt311Publish::new("devices/test", Mqtt311Qos::ExactlyOnce, b"payload");
+        let publish = Mqtt311Publish::new("devices/test", MqttQos::ExactlyOnce, b"payload");
         let received = normalize_mqtt311(publish).expect("MQTT 3.1.1 publish should normalize");
 
         assert!(received.ack_token.is_some());
@@ -1284,14 +1337,14 @@ mod tests {
     #[test]
     fn given_unsent_acknowledgements_should_retain_them_in_order() {
         let mut first_publish =
-            Mqtt311Publish::new("devices/first", Mqtt311Qos::AtLeastOnce, b"first");
+            Mqtt311Publish::new("devices/first", MqttQos::AtLeastOnce, b"first");
         first_publish.pkid = 1;
         let first = normalize_mqtt311(first_publish)
             .expect("first MQTT publish should normalize")
             .ack_token
             .expect("QoS 1 publish should have an acknowledgement token");
         let mut second_publish =
-            Mqtt311Publish::new("devices/second", Mqtt311Qos::AtLeastOnce, b"second");
+            Mqtt311Publish::new("devices/second", MqttQos::AtLeastOnce, b"second");
         second_publish.pkid = 2;
         let second = normalize_mqtt311(second_publish)
             .expect("second MQTT publish should normalize")
@@ -1318,7 +1371,7 @@ mod tests {
     fn given_mqtt5_qos_zero_should_not_create_ack_token() {
         let publish = Mqtt5Publish::new(
             "devices/test",
-            Mqtt5Qos::AtMostOnce,
+            MqttQos::AtMostOnce,
             b"payload".as_slice(),
             None,
         );
@@ -1333,7 +1386,7 @@ mod tests {
     fn given_mqtt5_qos_one_should_create_deferred_ack_token() {
         let publish = Mqtt5Publish::new(
             "devices/test",
-            Mqtt5Qos::AtLeastOnce,
+            MqttQos::AtLeastOnce,
             b"payload".as_slice(),
             None,
         );
@@ -1358,7 +1411,7 @@ mod tests {
         };
         let publish = Mqtt5Publish::new(
             "devices/test",
-            Mqtt5Qos::AtLeastOnce,
+            MqttQos::AtLeastOnce,
             b"payload".as_slice(),
             Some(properties),
         );
@@ -1395,7 +1448,7 @@ mod tests {
         };
         let publish = Mqtt5Publish::new(
             "devices/test",
-            Mqtt5Qos::AtLeastOnce,
+            MqttQos::AtLeastOnce,
             b"payload".as_slice(),
             Some(properties),
         );
@@ -1494,6 +1547,72 @@ mod tests {
     }
 
     #[test]
+    fn given_secure_broker_url_without_tls_table_should_open_with_a_tls_handshake() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
+        runtime.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("listener should bind");
+            let port = listener
+                .local_addr()
+                .expect("listener has an address")
+                .port();
+            for (protocol, scheme) in [
+                (MqttProtocol::Mqtt5, "mqtts"),
+                (MqttProtocol::Mqtt311, "ssl"),
+            ] {
+                let config = MqttSourceConfig {
+                    broker_url: format!("{scheme}://127.0.0.1:{port}"),
+                    subscriptions: vec!["devices/test".to_string()],
+                    subscription_qos: BTreeMap::new(),
+                    protocol,
+                    include_metadata: false,
+                    qos: 1,
+                    tls: None,
+                    client_id: Some("test-source".to_string()),
+                    username: None,
+                    password: None,
+                    clean_start: false,
+                    session_expiry_interval: None,
+                    keep_alive: Some("5s".to_string()),
+                    poll_timeout: Some("100ms".to_string()),
+                    request_capacity: Some(4),
+                    batch_size: Some(3),
+                    batch_timeout: Some("10ms".to_string()),
+                    max_retries: None,
+                    verbose_logging: None,
+                };
+                let connecting = tokio::spawn(async move {
+                    MqttDriver::connect(
+                        7,
+                        &config,
+                        Qos::One,
+                        Duration::from_secs(5),
+                        Duration::from_millis(100),
+                        4,
+                        3,
+                    )
+                    .await
+                });
+                let (mut stream, _) = timeout(Duration::from_secs(5), listener.accept())
+                    .await
+                    .expect("the source should dial the broker")
+                    .expect("the connection should be accepted");
+                let mut first_byte = [0u8; 1];
+                stream
+                    .read_exact(&mut first_byte)
+                    .await
+                    .expect("the source should send its first byte");
+                connecting.abort();
+                assert_eq!(
+                    first_byte[0], TLS_HANDSHAKE_RECORD,
+                    "{protocol:?} over {scheme}"
+                );
+            }
+        });
+    }
+
+    #[test]
     fn given_broker_url_without_client_id_should_add_configured_client_id() {
         let config = MqttSourceConfig {
             broker_url: "mqtt://127.0.0.1:1883?keep_alive_secs=30".to_string(),
@@ -1518,10 +1637,51 @@ mod tests {
         };
 
         let broker_url = broker_url_with_client_id(&config, 7).expect("URL should be valid");
-        let parsed = Url::parse(&broker_url).expect("URL should parse");
+        let parsed = Url::parse(&broker_url.url).expect("URL should parse");
         let query = parsed.query_pairs().collect::<Vec<_>>();
 
+        assert!(!broker_url.tls);
         assert!(query.contains(&("keep_alive_secs".into(), "30".into())));
         assert!(query.contains(&("client_id".into(), "configured-client".into())));
+    }
+
+    #[test]
+    fn given_secure_broker_url_should_parse_as_mqtt_on_its_secure_port_with_tls() {
+        for (broker_url, expected_port) in [
+            ("mqtts://broker.example", 8883),
+            ("ssl://broker.example:9883", 9883),
+        ] {
+            let config = MqttSourceConfig {
+                broker_url: broker_url.to_string(),
+                subscriptions: vec!["devices/test".to_string()],
+                subscription_qos: BTreeMap::new(),
+                protocol: MqttProtocol::Mqtt5,
+                include_metadata: false,
+                qos: 1,
+                tls: None,
+                client_id: Some("configured-client".to_string()),
+                username: None,
+                password: None,
+                clean_start: false,
+                session_expiry_interval: None,
+                keep_alive: Some("30s".to_string()),
+                poll_timeout: Some("1s".to_string()),
+                request_capacity: Some(4),
+                batch_size: Some(3),
+                batch_timeout: Some("10ms".to_string()),
+                max_retries: None,
+                verbose_logging: None,
+            };
+
+            let normalized = broker_url_with_client_id(&config, 7).expect("URL should be valid");
+            let parsed = Url::parse(&normalized.url).expect("URL should parse");
+
+            assert!(normalized.tls, "{broker_url}");
+            assert_eq!(
+                (parsed.scheme(), parsed.host_str(), parsed.port()),
+                ("mqtt", Some("broker.example"), Some(expected_port)),
+                "{broker_url}"
+            );
+        }
     }
 }

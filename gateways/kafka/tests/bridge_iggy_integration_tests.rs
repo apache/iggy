@@ -20,6 +20,7 @@
 //! exercises directly: `ensure_stream_and_topic` idempotent on repeated calls, and the bridge
 //! module invoked from a real (non-unit) test rather than only compiled.
 
+use iggy::prelude::StreamCreateOptions;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::time::Duration;
@@ -556,7 +557,7 @@ async fn ensure_topic_targets_the_streams_live_incarnation_after_a_delete_and_re
         .await
         .expect("delete the stream (and its topic with it)");
     let recreated = raw
-        .create_stream("kafka")
+        .create_stream("kafka", &StreamCreateOptions::default())
         .await
         .expect("recreate a stream under the same name");
     if recreated.id == original.id {

@@ -77,6 +77,7 @@ fn topic_table(topic: &TopicDetails) -> Table {
     let mut table = Table::new();
 
     table.set_header(vec!["Property", "Value"]);
+    let resolved = topic.resolved_options();
     table.add_row(vec!["Topic id", format!("{}", topic.id).as_str()]);
     table.add_row(vec![
         "Created",
@@ -86,11 +87,11 @@ fn topic_table(topic: &TopicDetails) -> Table {
     table.add_row(vec!["Topic size", format!("{}", topic.size).as_str()]);
     table.add_row(vec![
         "Compression",
-        topic.compression_algorithm.to_string().as_str(),
+        resolved.compression_algorithm.to_string().as_str(),
     ]);
     table.add_row(vec![
         "Message expiry",
-        match topic.message_expiry {
+        match resolved.message_expiry {
             IggyExpiry::NeverExpire => String::from("unlimited"),
             IggyExpiry::ServerDefault => String::from("server_default"),
             IggyExpiry::ExpireDuration(value) => format!("{value}"),
@@ -99,7 +100,7 @@ fn topic_table(topic: &TopicDetails) -> Table {
     ]);
     table.add_row(vec![
         "Max topic size",
-        format!("{}", topic.max_topic_size).as_str(),
+        format!("{}", resolved.max_topic_size).as_str(),
     ]);
     table.add_row(vec![
         "Topic message count",
@@ -161,8 +162,8 @@ fn topic_table(topic: &TopicDetails) -> Table {
 mod tests {
     use super::topic_table;
     use iggy_common::{
-        CompressionAlgorithm, HeaderKey, HeaderValue, IggyByteSize, IggyExpiry, IggyTimestamp,
-        MaxTopicSize, OptionValue, Partition, PartitionContext, ResourceOptions, TopicDetails,
+        HeaderKey, HeaderValue, IggyByteSize, IggyTimestamp, OptionValue, Partition,
+        PartitionContext, ResourceOptions, TopicDetails,
     };
 
     fn topic() -> TopicDetails {
@@ -171,9 +172,6 @@ mod tests {
             created_at: IggyTimestamp::from(0_u64),
             name: "test-topic".to_owned(),
             size: IggyByteSize::from(0_u64),
-            message_expiry: IggyExpiry::NeverExpire,
-            compression_algorithm: CompressionAlgorithm::None,
-            max_topic_size: MaxTopicSize::Unlimited,
             messages_count: 0,
             partitions_count: 0,
             partitions: Vec::new(),

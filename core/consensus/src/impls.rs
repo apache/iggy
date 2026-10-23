@@ -19,16 +19,17 @@ use crate::oneshot::{self, Receiver, Sender};
 use crate::vsr_timeout::{TimeoutKind, TimeoutManager};
 use crate::{
     AckLogEvent, Consensus, ControlActionLogEvent, DvcHeaderKind, DvcQuorumArray, DvcSuffix,
-    IgnoreReason, MergeOutcome, MergeQuorums, MergedLog, Pipeline, PlaneKind, PrepareLogEvent,
-    Project, ReplicaLogContext, SimEventKind, StoredDvc, ViewChangeLogEvent, ViewChangeReason,
-    VsrState, dvc_count, dvc_header_kind, dvc_iter, dvc_quorum_array_empty, dvc_record, dvc_reset,
-    dvc_suffix_decode, emit_replica_event, emit_sim_event, merge_dvc_quorum, seal_prepare_checksum,
+    HistoryCertificate, HistoryRecovery, IgnoreReason, MergeOutcome, MergeQuorums, MergedLog,
+    Pipeline, PlaneKind, PrepareLogEvent, Project, RepairEvidence, ReplicaLogContext, SimEventKind,
+    StoredDvc, ViewChangeLogEvent, ViewChangeReason, VsrState, dvc_count, dvc_header_kind,
+    dvc_iter, dvc_quorum_array_empty, dvc_record, dvc_reset, dvc_suffix_decode, emit_replica_event,
+    emit_sim_event, merge_dvc_quorum, seal_prepare_checksum,
 };
 use bit_set::BitSet;
 use clock::{Clock, IggySystemClock};
 use iggy_binary_protocol::{
-    Command, ConsensusHeader, DoViewChangeHeader, GenericHeader, Operation, PrepareHeader,
-    PrepareOkHeader, ReplyHeader, RequestStartViewHeader, RoutedRequestHeader,
+    CHECKSUM_UNSEALED, Command, ConsensusHeader, DoViewChangeHeader, GenericHeader, Operation,
+    PrepareHeader, PrepareOkHeader, ReplyHeader, RequestStartViewHeader, RoutedRequestHeader,
     StartViewChangeHeader, StartViewHeader, frame_body,
 };
 use iggy_common::IggyTimestamp;
@@ -685,11 +686,13 @@ impl LocalPipeline {
                 tail_header.op + 1,
                 header.op
             );
+            // No view ordering: `view` is outside the prepare identity and a
+            // retransmit restamps it, so a chain rebuilt from the journal can step
+            // down a view between two linked ops.
             assert_eq!(
                 header.parent, tail_header.checksum,
                 "parent must chain to previous checksum"
             );
-            assert!(header.view >= tail_header.view, "view cannot go backwards");
         }
 
         self.prepare_queue.push_back(entry);
@@ -1136,15 +1139,17 @@ pub enum VsrAction {
     /// journal. Emitted during view change completion so the new primary
     /// is fully caught up before accepting new requests.
     CommitJournal,
-    /// Primary heartbeat: send current commit point to all backups.
+    /// Send a commit point to `target`, or to every backup when `None`.
     ///
-    /// Emitted when the `CommitMessage` timeout fires. Prevents backups
-    /// from starting a view change during idle periods.
+    /// The `CommitMessage` heartbeat goes to every backup and keeps them from
+    /// starting a view change during idle periods. An eager `Commit` goes only
+    /// to a backup known to hold the op it announces.
     SendCommit {
         view: u32,
         commit: u64,
         group: u64,
         timestamp_monotonic: u64,
+        target: Option<u8>,
     },
 }
 
@@ -1166,6 +1171,83 @@ impl PrepareOkOutcome {
             Self::Accepted { quorum_reached, .. } => quorum_reached,
             Self::Ignored { .. } => false,
         }
+    }
+}
+
+/// What the primary of the current view knows of each replica's log and has
+/// told it of the commit point, so an eager `Commit` reaches a backup only once
+/// that backup holds the op it announces.
+///
+/// Chain replication forwards a prepare to the last backups after the quorum
+/// commits it. A `Commit` sent to every backup at once overtakes the prepare
+/// there, and the backup repairs an op that is still on its way to it.
+#[derive(Debug)]
+struct CommitAnnouncements {
+    /// Commit point the planes asked the backups to learn without waiting for
+    /// the heartbeat; see [`VsrConsensus::request_eager_commit`].
+    eager: u64,
+    /// Indexed by replica id. Reset on every view change.
+    replicas: Vec<ReplicaCommitProgress>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ReplicaCommitProgress {
+    /// Highest op the replica acknowledged in this view.
+    acked: u64,
+    /// Highest commit point sent to the replica in this view.
+    sent: u64,
+}
+
+impl ReplicaCommitProgress {
+    /// Whether the replica acked an op up to `eager` that no `Commit` sent to
+    /// it covers.
+    fn owes(self, eager: u64) -> bool {
+        self.sent < eager.min(self.acked)
+    }
+}
+
+impl CommitAnnouncements {
+    fn new(replica_count: u8) -> Self {
+        Self {
+            eager: 0,
+            replicas: vec![ReplicaCommitProgress::default(); usize::from(replica_count)],
+        }
+    }
+
+    fn reset(&mut self) {
+        self.eager = 0;
+        self.replicas.fill(ReplicaCommitProgress::default());
+    }
+
+    fn record_ack(&mut self, replica: u8, op: u64) {
+        if let Some(progress) = self.replicas.get_mut(usize::from(replica)) {
+            progress.acked = progress.acked.max(op);
+        }
+    }
+
+    fn record_broadcast(&mut self, commit: u64) {
+        for progress in &mut self.replicas {
+            progress.sent = progress.sent.max(commit);
+        }
+    }
+
+    fn owes(&self, replica: u8) -> bool {
+        self.replicas
+            .get(usize::from(replica))
+            .is_some_and(|progress| progress.owes(self.eager))
+    }
+
+    /// The commit point to send `replica` if it is owed one, recorded as sent.
+    ///
+    /// Clamped to the replica's acks, so the `Commit` names no op it lacks.
+    fn take_owed(&mut self, replica: u8, commit_min: u64) -> Option<u64> {
+        let eager = self.eager;
+        let progress = self
+            .replicas
+            .get_mut(usize::from(replica))
+            .filter(|progress| progress.owes(eager))?;
+        progress.sent = commit_min.min(progress.acked);
+        Some(progress.sent)
     }
 }
 
@@ -1310,20 +1392,51 @@ where
     /// planes.
     journal_mutations: Cell<u64>,
 
-    /// The log a DVC quorum settled on, parked until this replica's journal can
-    /// serve all of it.
+    /// The log a DVC quorum settled on or an adopted `StartView` announced,
+    /// parked until this replica's journal can serve all of it.
     ///
-    /// Non-`None` means "primary-elect, repairing": decided but not started, so
-    /// this replica prepares and announces nothing. Cleared by
+    /// Under `do_view_change_quorum` it means "primary-elect, repairing": decided
+    /// but not started, so this replica prepares and announces nothing. Otherwise
+    /// it is an adopted `StartView` suffix. Cleared by
     /// [`VsrConsensus::start_pending_view`], or by `reset_view_change_state`.
     pending_view_log: RefCell<Option<MergedLog>>,
+    /// The log the last adopted `StartView` announced, for this replica's
+    /// `DoViewChange` until its journal holds it or a newer view's log replaces
+    /// it.
+    ///
+    /// The parked copy in `pending_view_log` goes at the next view change. Without
+    /// this one, a backup that has not repaired the announced ops reads blanks
+    /// from its journal in every later view change, and at the commit point a
+    /// blank leaves the op undecidable when no other sender reports it. Above the
+    /// commit point the merge counts the kept header as a nack, as it would the
+    /// blank: the journal holds no copy of the op.
+    adopted_view: RefCell<Option<crate::AdoptedView>>,
+    adopted_view_dirty: Cell<bool>,
     /// The installed view must prove the local suffix before it can be applied.
     /// Survives election resets until the plane successfully reconciles its journal.
     view_log_unproven: Cell<bool>,
+    /// Partition-plane claim while an adopted log is unproven. Metadata uses
+    /// `history_certificate`, including its durable WAL binding, instead.
+    log_view_proven: Cell<u32>,
+    /// The proven journal is a primary-elect's merge while `log_view` still names
+    /// an older view. Set when the proof settles, cleared when the view starts.
+    /// If the merge cleared the WAL certificate of a partition, a superseding
+    /// view change clears it too (`unprove_superseded_merge`).
+    view_log_merged: Cell<bool>,
+    /// The settled merge cleared the WAL certificate of `log_view`. Only the
+    /// partition plane reports it. The proof settling resets it, and nothing
+    /// reads it unless `view_log_merged` holds.
+    view_log_merge_uncertified: Cell<bool>,
     /// The prefix below a repair gap is unknown; entries above it can be proven.
     view_log_unproven_through: Cell<u64>,
     /// Set only after adoption has removed the superseded tail.
     view_log_missing_op: Cell<Option<u64>>,
+    /// METADATA plane: the newest view whose log the WAL holds, which lags
+    /// `log_view` until the adopted log is proven. Its binding follows the WAL head
+    /// while the view is proven, and only moves down during a rewrite.
+    history_certificate: Cell<Option<HistoryCertificate>>,
+    /// The certificate the superblock last recorded.
+    history_certificate_durable: Cell<Option<HistoryCertificate>>,
 
     /// Tracks DVC messages received (only used by primary candidate)
     /// Stores metadata; actual log comes from message
@@ -1340,10 +1453,28 @@ where
     /// View and counter of the last emitted or accepted heartbeat. A new
     /// primary's counter can be lower, so freshness is scoped to its view.
     heartbeat_watermark: Cell<(u32, u64)>,
+    /// The next tick looks for backups owed an eager `Commit`; see
+    /// [`Self::request_eager_commit`].
+    eager_commit: Cell<bool>,
+    commit_announcements: RefCell<CommitAnnouncements>,
+    /// Views whose logs were refused for naming a different prepare at an op
+    /// this replica applied; see [`Self::contradicts_applied_log`].
+    applied_log_contradictions: Cell<u64>,
+    /// Part of `applied_log_contradictions` already handed to a metric.
+    applied_log_contradictions_taken: Cell<u64>,
+    /// Newest view counted in `applied_log_contradictions`.
+    contradiction_reported_view: Cell<Option<u32>>,
 
     /// Time source for [`Self::next_monotonic_timestamp`]; see
     /// [`ConsensusClock`].
     clock: ConsensusClock,
+}
+
+/// What carried a log that contradicts an op this replica applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContradictionSource {
+    StartView,
+    Prepare,
 }
 
 /// Boot-time timer set for a consensus group, one struct so every plane's
@@ -1649,6 +1780,9 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         // (SplitMix64) decorrelates the streams of nearby seeds.
         let timeout_seed = u128::from(replica) ^ u128::from(group);
         let prepare_queue_max = pipeline.prepare_queue_max();
+        // A metadata replica with no history holds view 0's empty log until boot
+        // restores what recovery decided. Partitions keep no certificate.
+        let empty_history = (group == METADATA_GROUP).then_some(HistoryCertificate::new(0, 0, 0));
         Self {
             cluster,
             replica,
@@ -1684,15 +1818,27 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             local_dvc_suffix: RefCell::new(None),
             journal_mutations: Cell::new(0),
             pending_view_log: RefCell::new(None),
+            adopted_view: RefCell::new(None),
+            adopted_view_dirty: Cell::new(false),
             view_log_unproven: Cell::new(false),
+            log_view_proven: Cell::new(0),
+            view_log_merged: Cell::new(false),
+            view_log_merge_uncertified: Cell::new(false),
             view_log_unproven_through: Cell::new(u64::MAX),
             view_log_missing_op: Cell::new(None),
+            history_certificate: Cell::new(empty_history),
+            history_certificate_durable: Cell::new(empty_history),
             do_view_change_from_all_replicas: RefCell::new(dvc_quorum_array_empty()),
             do_view_change_quorum: Cell::new(false),
             sent_own_start_view_change: Cell::new(false),
             sent_own_do_view_change: Cell::new(false),
             timeouts: RefCell::new(TimeoutManager::new(timeout_seed)),
             heartbeat_watermark: Cell::new((0, 0)),
+            eager_commit: Cell::new(false),
+            commit_announcements: RefCell::new(CommitAnnouncements::new(replica_count)),
+            applied_log_contradictions: Cell::new(0),
+            applied_log_contradictions_taken: Cell::new(0),
+            contradiction_reported_view: Cell::new(None),
             clock,
         }
     }
@@ -1811,6 +1957,12 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.ceded_primaryship.get()
     }
 
+    /// Normal status can persist while a newer view is being confirmed.
+    #[must_use]
+    pub const fn has_observed_newer_view(&self) -> bool {
+        self.observed_newer_view.get() > self.view.get()
+    }
+
     /// Set the per-boot incarnation nonce, at boot before `init`. Production
     /// supplies a random `u128`; the deterministic simulator supplies a
     /// seed-derived value bumped per restart. See the `incarnation` field.
@@ -1836,6 +1988,49 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     #[must_use]
     pub const fn is_primary(&self) -> bool {
         self.primary_index(self.view.get()) == self.replica
+    }
+
+    /// The primary of a Normal view, unless it ceded at boot
+    /// (`init_as_backup`): then it is a backup by role however the view math
+    /// reads, so it neither retransmits prepares nor announces commits.
+    fn is_acting_primary(&self) -> bool {
+        self.is_primary() && self.status.get() == Status::Normal && !self.ceded_primaryship.get()
+    }
+
+    /// Ask the partition quorum to elect `target` in the next view assigned to it.
+    /// A ready backup may initiate this too. Refusal leaves consensus unchanged.
+    /// The caller fences the incarnation, drains history work, refreshes the DVC
+    /// suffix and persists the new view before dispatching the returned actions.
+    pub fn request_primary_transfer(&self, expected_view: u32, target: u8) -> Vec<VsrAction> {
+        let view = self.view();
+        if self.group == METADATA_GROUP
+            || target >= self.replica_count
+            || view != expected_view
+            || !self.is_normal()
+            || self.has_ceded_primaryship()
+            || self.is_transferring()
+            || self.view_log_unproven()
+            || self.observed_newer_view.get() > view
+            || self.commit_min() != self.commit_max()
+            || self.commit_max() < self.recovery_barrier()
+            || !self.applied_view_start()
+        {
+            return Vec::new();
+        }
+        let primary = self.primary_index(view);
+        if target == primary {
+            return Vec::new();
+        }
+        let replicas = u32::from(self.replica_count);
+        let distance = (u32::from(target) + replicas - u32::from(primary)) % replicas;
+        let Some(next_view) = view.checked_add(distance) else {
+            return Vec::new();
+        };
+        self.enter_view_change(
+            PlaneKind::Partitions,
+            next_view,
+            ViewChangeReason::PrimaryTransfer,
+        )
     }
 
     /// Advance `commit_max` - the highest op known to be committed by the cluster.
@@ -2460,21 +2655,58 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.log_view.get()
     }
 
+    /// Restore or seed `log_view`: a value read back from disk or chosen at
+    /// creation, so the journal already backs it.
     pub fn set_log_view(&self, log_view: u32) {
         self.log_view.set(log_view);
+        if self.group != METADATA_GROUP {
+            self.log_view_proven.set(log_view);
+        }
+    }
+
+    /// The latest log identity this replica can reproduce after a crash.
+    /// Adopted headers name a log independently of the certificate proving its
+    /// bodies. The dispatcher persists both claims before any view-scoped send.
+    #[must_use]
+    pub fn log_view_claim(&self) -> u32 {
+        let proven = if self.group == METADATA_GROUP {
+            self.history_certificate
+                .get()
+                .map_or(0, |certificate| certificate.view)
+        } else if self.view_log_unproven.get() {
+            self.log_view_proven.get()
+        } else {
+            self.log_view.get()
+        };
+        self.adopted_view
+            .borrow()
+            .as_ref()
+            .map_or(proven, |adopted| proven.max(adopted.view))
+    }
+
+    /// Metadata keeps the adopted view beside its bound certificate; partitions
+    /// store their proven claim and bind their history in the partition journal.
+    const fn persisted_log_view(&self) -> u32 {
+        if self.group == METADATA_GROUP {
+            self.log_view.get()
+        } else if self.view_log_unproven.get() {
+            self.log_view_proven.get()
+        } else {
+            self.log_view.get()
+        }
     }
 
     /// Snapshot the durable VSR state for the superblock. `view`, `log_view`,
     /// `commit_max`, and the replica identity come from consensus; the caller
     /// supplies the paired checkpoint, which consensus does not own.
     #[must_use]
-    pub const fn vsr_state(&self, checkpoint_op: u64, checkpoint_checksum: u128) -> VsrState {
+    pub fn vsr_state(&self, checkpoint_op: u64, checkpoint_checksum: u128) -> VsrState {
         VsrState {
             cluster: self.cluster,
             replica_id: self.replica,
             replica_count: self.replica_count,
             view: self.view.get(),
-            log_view: self.log_view.get(),
+            log_view: self.persisted_log_view(),
             commit_max: self.commit_max.get(),
             checkpoint_op,
             checkpoint_checksum,
@@ -2483,6 +2715,143 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             // (`IggyPartition::write_superblock`).
             offset_frontier: 0,
             offset_reserved: 0,
+            adopted_view: self.adopted_view.borrow().clone(),
+        }
+        .with_history_certificate(self.history_certificate.get())
+    }
+
+    /// METADATA plane: the newest view whose log the WAL holds.
+    #[must_use]
+    pub const fn history_certificate(&self) -> Option<HistoryCertificate> {
+        self.history_certificate.get()
+    }
+
+    /// Whether this replica may acknowledge in its `log_view`. On the metadata plane
+    /// only once the WAL holds that view's log, since a restart restores the
+    /// certified view rather than the adopted one, and an ack the restored view does
+    /// not cover is a vote the next view change cannot see.
+    #[must_use]
+    pub fn history_certified(&self) -> bool {
+        self.group != METADATA_GROUP
+            || self
+                .history_certificate
+                .get()
+                .is_some_and(|certificate| certificate.view == self.log_view.get())
+    }
+
+    /// Certify `log_view`: the WAL holds its log, with `checksum` at head `op`.
+    /// A proven log may vote again, so an unproven restart's election ban ends.
+    pub fn certify_view_log(&self, op: u64, checksum: u128) {
+        self.history_certificate.set(Some(HistoryCertificate::new(
+            self.log_view.get(),
+            op,
+            checksum,
+        )));
+        self.recovery_election_allowed.set(true);
+    }
+
+    /// Follow the WAL head while the certified view is the proven normal one, so a
+    /// later view finds the binding above every op this replica acknowledged.
+    pub fn extend_history_certificate(&self, op: u64, checksum: u128) {
+        if let Some(certificate) = self.history_certificate.get()
+            && certificate.view == self.log_view.get()
+            && certificate.op < op
+            && self.status.get() == Status::Normal
+            && !self.view_log_unproven.get()
+        {
+            self.history_certificate.set(Some(HistoryCertificate::new(
+                certificate.view,
+                op,
+                checksum,
+            )));
+        }
+    }
+
+    /// Bind the certificate to `op` when a rewrite is about to remove the entries
+    /// from `from` up and the binding is one of them. The caller persists the
+    /// lowered binding before it removes anything.
+    pub fn lower_history_certificate(&self, from: u64, op: u64, checksum: u128) {
+        if let Some(certificate) = self.history_certificate.get()
+            && certificate.op >= from
+        {
+            self.history_certificate.set(Some(HistoryCertificate::new(
+                certificate.view,
+                op,
+                checksum,
+            )));
+        }
+    }
+
+    /// Record the certificate the superblock now holds, the one the write carried.
+    pub fn mark_history_certificate_durable(&self, certificate: Option<HistoryCertificate>) {
+        self.history_certificate_durable.set(certificate);
+    }
+
+    /// Install what recovery decided about the WAL. `head` is the WAL head after
+    /// recovery truncated it, `record` the durable state it decided from.
+    ///
+    /// An unproven WAL is fenced as a log adopted from a view change is until it is
+    /// proven, but with no adopted headers to stand in for it. Without a record the
+    /// certificate is derived the same way on every boot, so it counts as durable.
+    ///
+    /// An unproven replica also stays out of elections when its view probe goes
+    /// unanswered. It may hold ops a quorum committed in a view it can no longer
+    /// claim, and voting under a lower `log_view` lets a peer's older log replace
+    /// them. A `StartView` gives it a log to prove against instead.
+    pub fn restore_history(
+        &self,
+        recovery: HistoryRecovery,
+        head: (u64, u128),
+        record: Option<&VsrState>,
+    ) {
+        let certificate = match recovery {
+            HistoryRecovery::Certified { view, .. } => {
+                // A retained repaired body belongs to the adopted log, not the
+                // older certificate's prefix. Only whole-log proof may extend it.
+                record
+                    .filter(|state| {
+                        state
+                            .adopted_view
+                            .as_ref()
+                            .is_some_and(|adopted| adopted.view > view)
+                    })
+                    .and_then(VsrState::history_certificate)
+                    .or_else(|| Some(HistoryCertificate::new(view, head.0, head.1)))
+            }
+            HistoryRecovery::Unproven => {
+                tracing::warn!(
+                    replica = self.replica,
+                    view = self.view.get(),
+                    head = head.0,
+                    "metadata WAL has no history certificate that binds it; staying out of \
+                     elections until a StartView proves it"
+                );
+                self.recovery_election_allowed.set(false);
+                self.view_log_unproven.set(true);
+                self.view_log_unproven_through.set(u64::MAX);
+                self.view_log_missing_op.set(None);
+                self.invalidate_local_dvc_suffix();
+                None
+            }
+        };
+        self.history_certificate.set(certificate);
+        self.history_certificate_durable
+            .set(record.map_or(certificate, VsrState::history_certificate));
+    }
+
+    /// Whether the certificate moved to a view, or down to a binding, the superblock
+    /// does not hold yet.
+    #[must_use]
+    pub const fn history_certificate_needs_persist(&self) -> bool {
+        match (
+            self.history_certificate.get(),
+            self.history_certificate_durable.get(),
+        ) {
+            (Some(certificate), Some(durable)) => {
+                certificate.view != durable.view || certificate.op < durable.op
+            }
+            (Some(_), None) => true,
+            (None, _) => false,
         }
     }
 
@@ -2537,9 +2906,10 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     }
 
     /// This replica's suffix snapshot, or an empty one when none matches the log's
-    /// current head and commit point. Empty is the safe direction: it nacks nothing
-    /// and offers no bodies, so it can only stall a view change, never authorise a
-    /// truncation.
+    /// current head and commit point. Empty nacks nothing and offers no bodies,
+    /// but it does not abstain either. From a canonical sender it lets every
+    /// lower-`log_view` copy of an op count as a nack (`tally_op`), which can
+    /// truncate. So the shard refreshes the snapshot before every vote.
     #[must_use]
     pub fn local_dvc_suffix(&self) -> DvcSuffix {
         let tag = self.local_dvc_suffix_tag();
@@ -2567,10 +2937,16 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// gate: the dispatcher persists first when this holds. `commit_max` is
     /// excluded deliberately, since it advances on every commit and rides the
     /// checkpoint write rather than each view change.
+    ///
+    /// A newly certified view counts too, since an ack in it must survive a restart,
+    /// and so does a binding lowered for a rewrite, which must not remove the entry
+    /// the durable certificate still names.
     #[must_use]
     pub const fn needs_superblock_persist(&self) -> bool {
         self.view.get() != self.view_durable.get()
-            || self.log_view.get() != self.log_view_durable.get()
+            || self.persisted_log_view() != self.log_view_durable.get()
+            || self.history_certificate_needs_persist()
+            || self.adopted_view_dirty.get()
     }
 
     /// Record that the superblock now durably holds `(view, log_view)`: the exact
@@ -2648,6 +3024,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         // drop it and let the new attempt re-derive from the DVCs it collects.
         self.pending_view_log.borrow_mut().take();
         self.loopback_queue.borrow_mut().clear();
+        self.commit_announcements.borrow_mut().reset();
         let mut pipeline = self.pipeline.borrow_mut();
         pipeline.cancel_all_subscribers();
         pipeline.clear_request_queue();
@@ -2698,10 +3075,15 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             timeouts = self.timeouts.borrow_mut();
         }
 
+        // The heartbeat carries `commit_min` too, so it also answers a pending
+        // eager request.
+        let eager_commit = self.eager_commit.take();
         if timeouts.fired(TimeoutKind::CommitMessage) {
             drop(timeouts);
             actions.extend(self.handle_commit_message_timeout());
             timeouts = self.timeouts.borrow_mut();
+        } else if eager_commit {
+            actions.extend(self.eager_commit_actions());
         }
 
         if !history_fenced && timeouts.fired(TimeoutKind::RequestStartViewMessage) {
@@ -2870,6 +3252,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.view.set(new_view);
         self.status.set(Status::ViewChange);
         self.reset_view_change_state();
+        self.unprove_superseded_merge();
         self.sent_own_start_view_change.set(true);
         self.start_view_change_from_all_replicas
             .borrow_mut()
@@ -3028,10 +3411,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         // with the fired state intact turns the next pipeline push into
         // an instant spurious retransmit on the following tick (the push
         // sees `is_ticking` and does not restart the timer).
-        // A replica that ceded at boot (`init_as_backup`) is a backup by role however
-        // the view math reads, so it must not retransmit either.
-        if !self.is_primary() || self.status.get() != Status::Normal || self.has_ceded_primaryship()
-        {
+        if !self.is_acting_primary() {
             self.timeouts.borrow_mut().stop(TimeoutKind::Prepare);
             return Vec::new();
         }
@@ -3091,19 +3471,74 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
         self.timeouts.borrow_mut().reset(TimeoutKind::CommitMessage);
 
+        vec![self.commit_heartbeat()]
+    }
+
+    /// Ask the next tick to send `commit_min` to the backups instead of waiting
+    /// for the `CommitMessage` heartbeat.
+    ///
+    /// A backup learns a commit from the next prepare or from that heartbeat,
+    /// so on a quiet group it applies a committed op up to a heartbeat interval
+    /// late. The tick sends a `Commit` to each backup whose `PrepareOk` shows it
+    /// holds the op, and a backup that acks it later gets one on the tick after
+    /// its ack. Requests and acks before a tick share one `Commit` per backup,
+    /// and none is sent while the newest prepare already carries `commit_min`.
+    pub fn request_eager_commit(&self) {
+        if self.replica_count > 1 && self.is_acting_primary() {
+            self.commit_announcements.borrow_mut().eager = self.commit_min.get();
+            self.eager_commit.set(true);
+        }
+    }
+
+    /// The `Commit`s owed since [`Self::request_eager_commit`], unless the
+    /// backups learn `commit_min` from a prepare already sent.
+    fn eager_commit_actions(&self) -> Vec<VsrAction> {
+        // A stale primary leaves the probe to `handle_commit_message_timeout`.
+        if !self.is_acting_primary() || self.has_observed_newer_view() {
+            return Vec::new();
+        }
+        let commit_min = self.commit_min.get();
+        let carried = self
+            .pipeline
+            .borrow()
+            .entry_by_op(self.sequencer.current_sequence())
+            .is_some_and(|entry| entry.header.commit >= commit_min);
+        if carried {
+            return Vec::new();
+        }
+        let mut announcements = self.commit_announcements.borrow_mut();
+        (0..self.replica_count)
+            .filter(|&replica| replica != self.replica)
+            .filter_map(|replica| {
+                let commit = announcements.take_owed(replica, commit_min)?;
+                Some(self.commit_message(Some(replica), commit))
+            })
+            .collect()
+    }
+
+    fn commit_heartbeat(&self) -> VsrAction {
         // Don't advertise a commit point we haven't locally executed yet.
         // After view change the new primary may have commit_min < commit_max
         // until commit_journal catches up. Send commit_min (what we've
         // actually applied) so backups don't advance past us.
+        let commit = self.commit_min.get();
+        self.commit_announcements
+            .borrow_mut()
+            .record_broadcast(commit);
+        self.commit_message(None, commit)
+    }
+
+    fn commit_message(&self, target: Option<u8>, commit: u64) -> VsrAction {
         let ts = self.heartbeat_watermark.get().1 + 1;
         self.heartbeat_watermark.set((self.view.get(), ts));
 
-        vec![VsrAction::SendCommit {
+        VsrAction::SendCommit {
             view: self.view.get(),
-            commit: self.commit_min.get(),
+            commit,
             group: self.group,
             timestamp_monotonic: ts,
-        }]
+            target,
+        }
     }
 
     /// Handle a received `StartViewChange` message.
@@ -3181,7 +3616,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             if primary_candidate == self.replica {
                 let own_dvc = StoredDvc {
                     replica: self.replica,
-                    log_view: self.log_view.get(),
+                    log_view: self.log_view_claim(),
                     op: current_op,
                     commit,
                     suffix: self.local_dvc_suffix(),
@@ -3228,7 +3663,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         VsrAction::SendDoViewChange {
             view: self.view.get(),
             target,
-            log_view: self.log_view.get(),
+            log_view: self.log_view_claim(),
             op: self.sequencer.current_sequence(),
             commit: self.dvc_commit(),
             group: self.group,
@@ -3328,7 +3763,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
             let own_dvc = StoredDvc {
                 replica: self.replica,
-                log_view: self.log_view.get(),
+                log_view: self.log_view_claim(),
                 op: current_op,
                 commit,
                 suffix: self.local_dvc_suffix(),
@@ -3517,6 +3952,20 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             "commit floor {floor} may not rewind commit_min {current}"
         );
         self.commit_min.set(floor);
+        // The view-log proof was taken from the old commit point. A missing op the
+        // floor now covers is applied state that peers have compacted: every repair
+        // window opened at it draws `RangeEvicted`, and the proof it would close
+        // keeps the commit walk fenced. Drop it so the plane re-derives the proof
+        // from the new floor.
+        if self
+            .view_log_missing_op
+            .get()
+            .is_some_and(|missing| missing <= floor)
+        {
+            self.view_log_missing_op.set(None);
+            self.view_log_unproven_through.set(u64::MAX);
+            self.invalidate_local_dvc_suffix();
+        }
     }
 
     fn finish_view_probe(&self) {
@@ -3536,20 +3985,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     ///
     /// Falls back to the announced `op` on an empty body (probe answer, stale-view
     /// correction).
-    fn adopt_start_view_suffix(&self, header: &StartViewHeader, suffix_body: &[u8]) -> u64 {
-        let suffix = match dvc_suffix_decode(suffix_body, header.op, 0, 0) {
-            Ok(suffix) => suffix,
-            Err(error) => {
-                tracing::warn!(
-                    replica = self.replica,
-                    from_replica = header.replica,
-                    view = header.view,
-                    op = header.op,
-                    "start_view suffix did not decode, falling back to the announced op: {error}"
-                );
-                return header.op;
-            }
-        };
+    fn adopt_start_view_suffix(&self, header: &StartViewHeader, suffix: &DvcSuffix) -> u64 {
         let headers = suffix.headers();
         if headers.is_empty() && !self.view_log_unproven() {
             return header.op;
@@ -3561,6 +3997,107 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             committed_elsewhere: Vec::new(),
         });
         header.op
+    }
+
+    /// True when `headers` name a different prepare than this replica applied at
+    /// some op at or below `commit_min`. The caller refuses the log that carried
+    /// them.
+    ///
+    /// Quorum intersection puts every committed op in each later view's log, so a
+    /// mismatch means a quorum decided a log that contradicts a committed op.
+    /// Adopting it, or reading its prepare as an old retransmit, hides the loss.
+    ///
+    /// `applied_at` answers the header of the prepare this replica applied at an
+    /// op, `None` once the journal no longer holds it. Only ops it answers for are
+    /// compared, and an unsealed checksum on either side carries no identity, so
+    /// a healthy replica never trips this.
+    ///
+    /// `view` is the view of the message that carried the log. The first
+    /// contradiction in each newer view is logged with both checksums and
+    /// counted. A redelivered `StartView` or a retransmitted prepare of that view
+    /// is refused without either, so a peer that keeps resending cannot flood
+    /// the log.
+    pub fn contradicts_applied_log<'a>(
+        &self,
+        plane: PlaneKind,
+        source: ContradictionSource,
+        view: u32,
+        headers: impl IntoIterator<Item = &'a PrepareHeader>,
+        applied_at: impl Fn(u64) -> Option<PrepareHeader>,
+    ) -> bool {
+        let commit_min = self.commit_min();
+        let contradiction = headers
+            .into_iter()
+            .filter(|header| {
+                header.op <= commit_min && dvc_header_kind(header) == DvcHeaderKind::Valid
+            })
+            .find_map(|header| {
+                applied_at(header.op)
+                    .filter(|applied| {
+                        applied.checksum != header.checksum
+                            && applied.checksum != CHECKSUM_UNSEALED
+                            && header.checksum != CHECKSUM_UNSEALED
+                    })
+                    .map(|applied| (header, applied))
+            });
+        let Some((header, applied)) = contradiction else {
+            return false;
+        };
+        if self
+            .contradiction_reported_view
+            .get()
+            .is_some_and(|reported| reported >= view)
+        {
+            return true;
+        }
+        self.contradiction_reported_view.set(Some(view));
+        self.applied_log_contradictions
+            .set(self.applied_log_contradictions.get().saturating_add(1));
+        tracing::error!(
+            plane = plane.as_str(),
+            group = self.group,
+            replica = self.replica,
+            view = self.view.get(),
+            message_view = view,
+            ?source,
+            op = header.op,
+            commit_min,
+            applied_checksum = applied.checksum,
+            announced_checksum = header.checksum,
+            "refusing a log that names a different prepare at op {} than this replica \
+             applied: a quorum decided a log that contradicts a committed op",
+            header.op
+        );
+        true
+    }
+
+    /// Views whose logs [`Self::contradicts_applied_log`] refused since boot.
+    #[must_use]
+    pub const fn applied_log_contradictions(&self) -> u64 {
+        self.applied_log_contradictions.get()
+    }
+
+    /// Views counted by [`Self::applied_log_contradictions`] since the last
+    /// call. The total keeps counting, so invariants still read it whole.
+    #[must_use]
+    pub const fn take_applied_log_contradictions(&self) -> u64 {
+        let total = self.applied_log_contradictions.get();
+        total - self.applied_log_contradictions_taken.replace(total)
+    }
+
+    /// [`Self::handle_start_view_guarded`] for a caller that cannot read back the
+    /// prepares it applied.
+    ///
+    /// # Panics
+    /// If `header.group` does not match this replica's namespace.
+    pub fn handle_start_view(
+        &self,
+        plane: PlaneKind,
+        header: &StartViewHeader,
+        suffix_body: &[u8],
+    ) -> Vec<VsrAction> {
+        self.handle_start_view_guarded(plane, header, suffix_body, |_| None)
+            .unwrap_or_default()
     }
 
     /// Handle a received `StartView` message (backups only).
@@ -3583,16 +4120,22 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// `commit_journal` stops at the gap. Requires message repair.
     /// `suffix_body` is the message body: the view's canonical headers, empty
     /// when the announcement carries numbers only.
+    ///
+    /// `None` refuses a `StartView` that would be adopted but whose headers
+    /// contradict a prepare `applied_at` reports (see
+    /// [`Self::contradicts_applied_log`]): nothing changed, and nothing may act
+    /// on it.
     #[expect(
         clippy::too_many_lines,
         reason = "keep StartView validation and both commit paths together"
     )]
-    pub fn handle_start_view(
+    pub fn handle_start_view_guarded(
         &self,
         plane: PlaneKind,
         header: &StartViewHeader,
         suffix_body: &[u8],
-    ) -> Vec<VsrAction> {
+        applied_at: impl Fn(u64) -> Option<PrepareHeader>,
+    ) -> Option<Vec<VsrAction>> {
         assert_eq!(header.group, self.group, "SV routed to wrong group");
         let from_replica = header.replica;
         let msg_view = header.view;
@@ -3601,12 +4144,12 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
         // Verify sender is the primary for this view
         if self.primary_index(msg_view) != from_replica {
-            return Vec::new();
+            return Some(Vec::new());
         }
 
         // Ignore old views
         if msg_view < self.view.get() {
-            return Vec::new();
+            return Some(Vec::new());
         }
 
         // Incarnation guard. While Recovering (probing after a restart), only adopt
@@ -3638,7 +4181,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                 self_incarnation,
                 "ignoring StartView while recovering: stale incarnation"
             );
-            return Vec::new();
+            return Some(Vec::new());
         }
 
         // Within one view the primary's log only grows. A Normal replica already
@@ -3656,9 +4199,9 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         {
             if msg_commit > self.commit_max() {
                 self.advance_commit_max(msg_commit);
-                return vec![VsrAction::CommitJournal];
+                return Some(vec![VsrAction::CommitJournal]);
             }
-            return Vec::new();
+            return Some(Vec::new());
         }
 
         // Adoption may discard an uncommitted WAL suffix, never a committed prefix. A
@@ -3683,12 +4226,41 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                 commit_max = self.commit_max(),
                 "ignoring StartView that omits known committed entries"
             );
-            return Vec::new();
+            return Some(Vec::new());
         }
 
         // We shouldn't process our own StartView
         if from_replica == self.replica {
-            return Vec::new();
+            return Some(Vec::new());
+        }
+
+        let suffix = match dvc_suffix_decode(suffix_body, msg_op, 0, 0) {
+            Ok(suffix) => suffix,
+            Err(error) => {
+                tracing::warn!(view = msg_view, op = msg_op, %error, "refusing malformed StartView evidence");
+                return None;
+            }
+        };
+        let adopted = crate::AdoptedView {
+            view: msg_view,
+            group: self.group,
+            partition_incarnation: self.partition_incarnation.get(),
+            op_head: msg_op,
+            commit_max: msg_commit,
+            headers: suffix.headers().to_vec(),
+        };
+        if let Err(error) = adopted.validate(self.cluster, msg_view) {
+            tracing::warn!(view = msg_view, op = msg_op, %error, "refusing mismatched StartView evidence");
+            return None;
+        }
+        if self.contradicts_applied_log(
+            plane,
+            ContradictionSource::StartView,
+            msg_view,
+            suffix.headers(),
+            applied_at,
+        ) {
+            return None;
         }
 
         // Accept the StartView and transition to normal
@@ -3707,6 +4279,9 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         let needs_reconciliation = self.view_log_unproven.get()
             || self.status.get() != Status::Normal
             || self.log_view.get() != msg_view;
+        if self.group != METADATA_GROUP && !self.view_log_unproven.get() {
+            self.log_view_proven.set(self.log_view.get());
+        }
         self.view.set(msg_view);
         self.log_view.set(msg_view);
         self.status.set(Status::Normal);
@@ -3723,7 +4298,9 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         // Cross-check the announced head against the headers published with it: a
         // suffix head disagreeing with `header.op` means an inconsistently built
         // frame, and either value leaves this replica chasing an unservable head.
-        let announced = self.adopt_start_view_suffix(header, suffix_body);
+        let announced = self.adopt_start_view_suffix(header, &suffix);
+        *self.adopted_view.borrow_mut() = Some(adopted);
+        self.adopted_view_dirty.set(true);
         self.sequencer.set_sequence(announced);
         // Settle a gated suffix's fate as a backup too, so a later election inherits
         // a decided barrier rather than a latched one.
@@ -3770,7 +4347,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             );
             actions.push(send_prepare_ok);
         }
-        actions
+        Some(actions)
     }
 
     /// Handle a `Commit` (heartbeat) message from the primary.
@@ -3938,9 +4515,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         let new_op = merged.op_head;
         self.advance_commit_max(max_commit);
         *self.pending_view_log.borrow_mut() = Some(merged);
-        self.view_log_unproven.set(true);
-        self.view_log_unproven_through.set(u64::MAX);
-        self.view_log_missing_op.set(None);
+        self.reopen_view_log_proof();
 
         // Stale pipeline entries are invalid in new view; reconciliation
         // replays from journal.
@@ -4002,18 +4577,152 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.pending_view_log.borrow().clone()
     }
 
+    /// The log the last adopted `StartView` announced, while this replica's
+    /// journal does not hold it yet. Unlike the parked copy it survives view
+    /// changes, and it is never this replica's own merge. A settled merge that
+    /// cleared the WAL certificate reads as unproven here
+    /// (`uncertified_merge_settled`).
+    #[must_use]
+    pub fn adopted_view_log(&self) -> Option<MergedLog> {
+        (self.view_log_unproven() || self.uncertified_merge_settled())
+            .then(|| {
+                self.adopted_view
+                    .borrow()
+                    .as_ref()
+                    .map(crate::AdoptedView::merged_log)
+            })
+            .flatten()
+    }
+
+    /// The accepted `StartView`'s view and advertised head, including after repair.
+    #[must_use]
+    pub fn adopted_view_head(&self) -> Option<(u32, u64)> {
+        self.adopted_view
+            .borrow()
+            .as_ref()
+            .map(|adopted| (adopted.view, adopted.op_head))
+    }
+
+    /// Mark only the evidence captured by the completed write. Adoption may have
+    /// advanced while the writer awaited disk I/O.
+    pub fn mark_adopted_view_durable(&self, written: Option<&crate::AdoptedView>) {
+        if self.adopted_view.borrow().as_ref() == written {
+            self.adopted_view_dirty.set(false);
+        }
+    }
+
+    /// Load validated evidence before joining the message pump. Body recovery
+    /// follows separately, then `resume_adopted_view` installs its repair fence.
+    pub fn restore_adopted_view(&self, adopted: Option<&crate::AdoptedView>) {
+        *self.adopted_view.borrow_mut() = adopted.cloned();
+        self.adopted_view_dirty.set(false);
+    }
+
+    /// Re-establish the announced head after recovering the physical body log.
+    pub fn resume_adopted_view(&self) {
+        let adopted = self.adopted_view.borrow();
+        let Some(adopted) = adopted.as_ref() else {
+            return;
+        };
+        let proven = if self.group == METADATA_GROUP {
+            self.history_certificate
+                .get()
+                .map_or(0, |certificate| certificate.view)
+        } else {
+            self.log_view_proven.get()
+        };
+        if adopted.view > proven {
+            self.log_view.set(adopted.view);
+            self.view_log_unproven.set(true);
+            self.view_log_unproven_through.set(u64::MAX);
+            self.view_log_missing_op.set(None);
+            self.sequencer.set_sequence(adopted.op_head);
+            *self.pending_view_log.borrow_mut() = Some(adopted.merged_log());
+            self.advance_commit_max(adopted.commit_max);
+            self.invalidate_local_dvc_suffix();
+        }
+    }
+
     #[must_use]
     pub const fn view_log_unproven(&self) -> bool {
         self.view_log_unproven.get()
     }
 
+    /// Whether the proven journal is a primary-elect's merge that `log_view` does
+    /// not name yet. A replica superseded before it starts the view keeps the
+    /// merge under its older `log_view` until a later proof settles. Only a
+    /// partition whose merge cleared the WAL certificate goes back to unproven.
+    #[must_use]
+    pub const fn view_log_merged(&self) -> bool {
+        self.view_log_merged.get()
+    }
+
     pub fn settle_view_log_proof(&self) {
         self.view_log_unproven.set(false);
+        self.view_log_merged.set(self.is_primary_elect());
+        self.view_log_merge_uncertified.set(false);
+        if self.group != METADATA_GROUP {
+            self.log_view_proven.set(self.log_view.get());
+        }
         self.invalidate_local_dvc_suffix();
     }
 
-    pub fn fence_view_log(&self, op: u64, unproven_through: u64) {
+    /// The merge that just settled cleared the WAL certificate of `log_view`, by
+    /// a truncation or by an entry of a later view. A superseding view change
+    /// then makes this replica unproven, so the snapshot follows that rule now.
+    pub fn note_uncertified_merge(&self) {
+        self.view_log_merge_uncertified.set(true);
+        self.invalidate_local_dvc_suffix();
+    }
+
+    /// Enter the unproven state, keeping the current `log_view` as the claim when
+    /// it was proven.
+    fn mark_view_log_unproven(&self) {
+        if self.group != METADATA_GROUP && !self.view_log_unproven.get() {
+            self.log_view_proven.set(self.log_view.get());
+        }
         self.view_log_unproven.set(true);
+    }
+
+    /// Unproven above `commit_min`, with no gap named until the shard runs the
+    /// proof again.
+    fn reopen_view_log_proof(&self) {
+        self.mark_view_log_unproven();
+        self.view_log_unproven_through.set(u64::MAX);
+        self.view_log_missing_op.set(None);
+    }
+
+    /// A partition primary-elect whose proven merge cleared the WAL certificate of
+    /// `log_view`, before the view starts. Its DVC snapshot is built as if
+    /// unproven: a superseding view change makes it unproven and votes with the
+    /// snapshot taken before.
+    const fn uncertified_merge_settled(&self) -> bool {
+        self.group != METADATA_GROUP
+            && self.view_log_merged.get()
+            && self.view_log_merge_uncertified.get()
+            && !self.view_log_unproven.get()
+    }
+
+    /// The journal holds a merge that no view started, and the merge cleared the
+    /// WAL certificate of `log_view`. The superblock gate then refuses every
+    /// write. Go back to the state of an elect superseded before its proof
+    /// settled, whose superblock records the older claim with no certificate.
+    /// An elect whose WAL still certifies `log_view` stays proven and votes with
+    /// its merged journal, which is also what a restart from that WAL restores.
+    ///
+    /// The snapshot stays. It was built over this same range and stitch
+    /// (`uncertified_merge_settled`), and the vote this handler may cast reads it
+    /// before the shard can refresh it. An empty suffix from a canonical sender
+    /// lets every lower-`log_view` copy count as a nack (`tally_op`).
+    fn unprove_superseded_merge(&self) {
+        if self.uncertified_merge_settled() {
+            self.view_log_merged.set(false);
+            self.reopen_view_log_proof();
+        }
+    }
+
+    pub fn fence_view_log(&self, op: u64, unproven_through: u64) {
+        self.mark_view_log_unproven();
         self.view_log_unproven_through.set(unproven_through);
         self.view_log_missing_op.set(Some(op));
         self.invalidate_local_dvc_suffix();
@@ -4026,25 +4735,47 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             || op > self.view_log_unproven_through.get()
     }
 
+    /// Whether `view_log_proof` still has to walk `op` before anything commits,
+    /// serves or reports it: unproven, and at or below the head the walk starts at.
+    #[must_use]
+    pub fn view_log_proof_covers(&self, op: u64) -> bool {
+        !self.view_log_entry_proven(op)
+            && op
+                <= self.pending_view_log.borrow().as_ref().map_or_else(
+                    || self.sequencer.current_sequence(),
+                    |pending| pending.op_head,
+                )
+    }
+
     #[must_use]
     pub const fn view_log_unproven_range(&self) -> std::ops::RangeInclusive<u64> {
         self.commit_min().saturating_add(1)..=if self.view_log_unproven() {
             self.view_log_unproven_through.get()
+        } else if self.uncertified_merge_settled() {
+            u64::MAX
         } else {
             0
         }
     }
 
+    /// The op the view-log proof is waiting on. A bridged proof lets the
+    /// partition commit walk pass a missing body that a live retransmit filled.
+    /// Named at or below `commit_min`, that op opens every repair below the
+    /// peers' retained floor, and the shard re-runs the proof only once no op is
+    /// named. [`Self::set_commit_floor`] clears an op that a floor jump covers.
     #[must_use]
     pub const fn view_log_repair_op(&self) -> Option<u64> {
-        if self.view_log_unproven() {
-            self.view_log_missing_op.get()
-        } else {
-            None
+        match self.view_log_missing_op.get() {
+            Some(op) if self.view_log_unproven() && op > self.commit_min() => Some(op),
+            _ => None,
         }
     }
 
-    pub fn note_repaired_view_header(&self, header: PrepareHeader) {
+    pub fn note_repaired_view_header(&self, header: PrepareHeader, evidence: RepairEvidence) {
+        // A body awaiting proof cannot become the checksum that proves itself.
+        if evidence != RepairEvidence::Proven {
+            return;
+        }
         if let Some(pending) = self.pending_view_log.borrow_mut().as_mut()
             && pending.op_head == header.op
             && pending
@@ -4065,6 +4796,17 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     #[must_use]
     pub fn view_log_is_pending(&self) -> bool {
         self.pending_view_log.borrow().is_some()
+    }
+
+    /// Whether the parked log is the merge a `DoViewChange` quorum of this view
+    /// decided, which this replica starts once its journal covers it.
+    ///
+    /// Primary by index is not enough. A replica that restarts as primary of its
+    /// recovered view parks its adopted `StartView` suffix, and the quorum it may
+    /// have collected before the crash is gone.
+    #[must_use]
+    pub fn is_primary_elect(&self) -> bool {
+        self.do_view_change_quorum.get() && self.view_log_is_pending()
     }
 
     /// Read the parked merge in place. The closure must not re-enter consensus: the
@@ -4123,23 +4865,30 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// Finish the parked view change: this replica's journal now covers the merged
     /// log, so it can serve any op it is about to announce.
     ///
-    /// Called by the shard after repair progress. No-op when nothing is parked.
+    /// Called by the shard after repair progress. No-op unless
+    /// [`Self::is_primary_elect`].
     ///
     /// # Panics
     /// If the merged uncommitted range exceeds pipeline capacity, which needs a head
     /// more than one pipeline depth above the proven commit point.
     pub fn start_pending_view(&self, plane: PlaneKind) -> Vec<VsrAction> {
-        // A backup's parked log (the `StartView` suffix) is only what its ingest
-        // verifies bodies against. It must never take this path: starting the view
-        // claims the primaryship of a view this replica did not win.
-        if !self.is_primary_for_view(self.view.get()) {
+        // A parked `StartView` suffix is only what the repair ingest verifies
+        // bodies against, also on a replica restarted as primary by index. It must
+        // never take this path: starting the view claims the primaryship of a view
+        // this replica did not win.
+        if !self.is_primary_elect() {
             return Vec::new();
         }
         let Some(merged) = self.pending_view_log.borrow_mut().take() else {
             return Vec::new();
         };
+        if self.adopted_view.borrow_mut().take().is_some() {
+            self.adopted_view_dirty.set(true);
+        }
         let new_op = merged.op_head;
         let max_commit = merged.commit_max;
+        // Repair can apply beyond the commit point frozen in the DVC merge.
+        let rebuild_after = self.commit_min().max(max_commit);
 
         // The one view-change exit that skips `reset_view_change_state`, so the DVCs
         // (a suffix `Vec` per sender, per group led) would be held for the whole
@@ -4178,6 +4927,16 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         // header is installed there; parking installs nothing and the repair ingest
         // only fills holes, so a parked replica still holds its old view's log.
         self.log_view.set(self.view.get());
+        self.view_log_merged.set(false);
+        // The view starts only once the merged log is proven against the WAL.
+        if self.group == METADATA_GROUP {
+            self.certify_view_log(
+                new_op,
+                merged.headers.first().map_or(0, |head| head.checksum),
+            );
+        } else {
+            self.log_view_proven.set(self.view.get());
+        }
 
         // Update timeouts for normal primary operation
         {
@@ -4189,7 +4948,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             timeouts.start(TimeoutKind::CommitMessage);
             // If there are uncommitted ops in the rebuilt pipeline, start the
             // Prepare timeout so that lost PrepareOks trigger retransmission.
-            if max_commit < new_op {
+            if rebuild_after < new_op {
                 timeouts.start(TimeoutKind::Prepare);
             }
         }
@@ -4226,20 +4985,20 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         actions.push(VsrAction::CommitJournal);
         // The new primary must rebuild its pipeline from the journal so that
         // incoming PrepareOk messages can be matched and commits can proceed.
-        if max_commit < new_op {
+        if rebuild_after < new_op {
             // `complete_view_change_as_primary` already refused a non-fitting
             // range. Asserted so the sites cannot drift; this one cannot decline.
             debug_assert!(
-                (new_op - max_commit) <= self.prepare_queue_max as u64,
+                (new_op - rebuild_after) <= self.prepare_queue_max as u64,
                 "view change: uncommitted range {}..={} ({} ops) exceeds pipeline capacity ({}); \
                  the merged log claims more in-flight ops than the pipeline can hold",
-                max_commit + 1,
+                rebuild_after + 1,
                 new_op,
-                new_op - max_commit,
+                new_op - rebuild_after,
                 self.prepare_queue_max,
             );
             actions.push(VsrAction::RebuildPipeline {
-                from_op: max_commit + 1,
+                from_op: rebuild_after + 1,
                 to_op: new_op,
             });
         }
@@ -4322,6 +5081,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         }
 
         drop(pipeline);
+        self.note_backup_ack(header.replica, header.op);
 
         emit_sim_event(
             SimEventKind::PrepareAcked,
@@ -4339,6 +5099,33 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         PrepareOkOutcome::Accepted {
             ack_count,
             quorum_reached,
+        }
+    }
+
+    /// Handle a `PrepareOk` for an op this primary already committed.
+    ///
+    /// It counts toward no quorum, but it shows the backup holds the op, so a
+    /// `Commit` withheld from it until then goes out on the next tick. The
+    /// caller ran `ack_preflight`; the pipeline no longer holds the op.
+    pub fn handle_late_prepare_ok(&self, header: &PrepareOkHeader) {
+        if header.view == self.view()
+            && header.op <= self.commit_min.get()
+            && !self.is_transferring()
+        {
+            self.note_backup_ack(header.replica, header.op);
+        }
+    }
+
+    /// Record that `replica` holds `op`, and wake the next tick if that makes
+    /// it owed a `Commit`.
+    fn note_backup_ack(&self, replica: u8, op: u64) {
+        if replica == self.replica {
+            return;
+        }
+        let mut announcements = self.commit_announcements.borrow_mut();
+        announcements.record_ack(replica, op);
+        if announcements.owes(replica) {
+            self.eager_commit.set(true);
         }
     }
 
@@ -4632,9 +5419,8 @@ mod fresh_group_start_tests {
 
     const CREATED_VIEW: u32 = 4;
 
-    /// The case the seed exists for: a group created after the metadata plane
-    /// elected must not start at view 0, or it names a replica the roster does
-    /// not advertise and no client can be routed to it.
+    /// Fresh replicas must agree on the committed assignment's initial view,
+    /// including a chosen view above zero, before the group starts serving.
     #[test]
     fn given_a_fresh_group_when_created_after_an_election_should_seed_the_creation_view() {
         let start = fresh_group_start(false, None, CREATED_VIEW);
@@ -5155,7 +5941,6 @@ pub mod test_bus {
 
         fn set_connection_lost_fn(&self, _f: message_bus::ConnectionLostFn) {}
         fn set_replica_forward_fn(&self, _f: message_bus::ReplicaForwardFn) {}
-        fn set_client_forward_fn(&self, _f: message_bus::ClientForwardFn) {}
         fn track_background(&self, _handle: message_bus::JoinHandle<()>) {}
     }
 }
@@ -5170,6 +5955,7 @@ mod timestamp_clamp_tests {
     use crate::LocalPipeline;
 
     use crate::test_bus::{NoopBus, make_commit, make_start_view};
+    use aligned_vec::{AVec, ConstAlign};
     use iggy_binary_protocol::CommitHeader;
 
     #[test]
@@ -5332,8 +6118,8 @@ mod timestamp_clamp_tests {
         assert_eq!(
             seal(1, Operation::SendMessages),
             0,
-            "a partition prepare must be left unsealed, since its sealed region is \
-             rewritten before it is journaled"
+            "a produce body checksum stays zero because persistence rewrites the body; \
+             its prepare header identity is still sealed"
         );
     }
 
@@ -5526,6 +6312,8 @@ mod timestamp_clamp_tests {
         assert!(consensus.view_log_unproven());
         let mut canonical = PrepareHeader {
             command: Command::Prepare,
+            cluster: 1,
+            group: METADATA_GROUP,
             operation: Operation::CreateStream,
             size: u32::try_from(size_of::<PrepareHeader>()).unwrap(),
             op: HEAD,
@@ -5547,6 +6335,126 @@ mod timestamp_clamp_tests {
         assert!(consensus.view_log_unproven());
         assert!(!consensus.view_log_entry_proven(1));
         assert_eq!(consensus.commit_min(), 0);
+    }
+
+    /// A state-transfer install jumps `commit_min` past the op a view-log fence
+    /// named. Peers answer a repair for that op with `RangeEvicted` at an op the
+    /// receiver already applied, and the proof re-runs only once no repair op is
+    /// named, so the receiver withholds acks for good. Here the floor lands on the
+    /// missing op itself, the boundary the test below steps over.
+    #[test]
+    fn given_fenced_missing_op_when_transfer_floor_covers_it_should_stop_naming_it() {
+        const MISSING: u64 = 5;
+        let consensus = VsrConsensus::with_clock(
+            1,
+            0,
+            3,
+            METADATA_GROUP,
+            NoopBus,
+            LocalPipeline::new(),
+            ConsensusClock::system(),
+        );
+        consensus.fence_view_log(MISSING, MISSING);
+        assert_eq!(consensus.view_log_repair_op(), Some(MISSING));
+
+        consensus.set_commit_floor(MISSING);
+        assert_eq!(
+            consensus.view_log_repair_op(),
+            None,
+            "an op at the commit floor is applied, so no repair can still need it"
+        );
+        assert!(
+            consensus.view_log_unproven(),
+            "the floor jump proves nothing above it; the proof has to re-run"
+        );
+    }
+
+    /// A state-transfer install jumps `commit_min` past the op the view-log proof
+    /// was fetching. Kept, that op opens every tail repair below the peers'
+    /// retained floor: they answer `RangeEvicted`, the requester reads that as a
+    /// peer behind it, and the session rotates between replicas forever.
+    #[test]
+    fn given_fenced_view_log_when_commit_floor_covers_missing_op_should_rederive_proof() {
+        const VIEW: u32 = 4;
+        const HEAD: u64 = 51;
+        const FLOOR: u64 = 46;
+        let fenced_backup = |missing: u64| {
+            let consensus = VsrConsensus::with_clock(
+                1,
+                0,
+                3,
+                METADATA_GROUP,
+                NoopBus,
+                LocalPipeline::new(),
+                ConsensusClock::system(),
+            );
+            let primary = u8::try_from(VIEW % 3).unwrap();
+            consensus.handle_start_view(
+                PlaneKind::Metadata,
+                make_start_view(VIEW, HEAD, HEAD - 1, primary, 0).header(),
+                &[],
+            );
+            consensus.fence_view_log(missing, 0);
+            consensus
+        };
+
+        let covered = fenced_backup(FLOOR - 1);
+        covered.set_commit_floor(FLOOR);
+        assert_eq!(
+            covered.view_log_repair_op(),
+            None,
+            "a missing op the floor covers opens repair below every peer's retained floor"
+        );
+        assert!(
+            covered.view_log_unproven(),
+            "the ops above the floor still need proving against the view"
+        );
+        assert!(!covered.view_log_entry_proven(FLOOR + 1));
+
+        let above = fenced_backup(FLOOR + 1);
+        above.set_commit_floor(FLOOR);
+        assert_eq!(
+            above.view_log_repair_op(),
+            Some(FLOOR + 1),
+            "a missing op above the floor is still the one to fetch"
+        );
+    }
+
+    /// A bridged proof vouches for every held entry, so the partition commit walk
+    /// applies the missing body once a live retransmit fills it, while the fence
+    /// still names that op. Named, it opens every repair at an op the peers may
+    /// have evicted, and the shard re-runs the proof only once no op is named.
+    #[test]
+    fn given_bridged_fence_when_commit_walks_past_missing_op_should_stop_naming_it() {
+        const BACKUP: u8 = 1;
+        const MISSING: u64 = 5;
+        // What `view_log_proof` reports for a body behind a canonical header.
+        const BRIDGED_UNPROVEN_THROUGH: u64 = 0;
+        let consensus = VsrConsensus::with_clock(
+            1,
+            BACKUP,
+            3,
+            IggyNamespace::new(0, 0, 0).inner(),
+            NoopBus,
+            LocalPipeline::new(),
+            ConsensusClock::system(),
+        );
+        consensus.restore_commit_state(MISSING - 1, MISSING);
+        consensus.fence_view_log(MISSING, BRIDGED_UNPROVEN_THROUGH);
+        assert_eq!(consensus.view_log_repair_op(), Some(MISSING));
+        assert!(
+            consensus.view_log_entry_proven(MISSING),
+            "the commit walk may apply a bridged op as soon as its body arrives"
+        );
+
+        consensus.advance_commit_min(MISSING);
+        assert_eq!(
+            consensus.view_log_repair_op(),
+            None,
+            "a repair opened at an applied op draws `RangeEvicted` once the peers \
+             evict it, and the proof re-runs only once no op is named"
+        );
+        assert!(consensus.view_log_unproven());
     }
 
     #[test]
@@ -5590,6 +6498,53 @@ mod timestamp_clamp_tests {
         assert!(!consensus.view_log_unproven());
     }
 
+    #[test]
+    fn given_a_new_adoption_during_a_write_when_the_old_write_completes_should_keep_the_gate_closed()
+     {
+        for group in [METADATA_GROUP, IggyNamespace::new(1, 1, 1).inner()] {
+            let consensus = VsrConsensus::new(1, 0, 3, group, NoopBus, LocalPipeline::new());
+            let start_view = |head| {
+                let message = make_start_view(4, head, 0, 1, 0);
+                let original = *message.header();
+                message.transmute_header(|_, header: &mut StartViewHeader| {
+                    *header = StartViewHeader { group, ..original };
+                })
+            };
+            consensus.handle_start_view(PlaneKind::Metadata, start_view(2).header(), &[]);
+            let first = consensus.vsr_state(0, 0);
+            consensus.handle_start_view(PlaneKind::Metadata, start_view(3).header(), &[]);
+            consensus.mark_superblock_durable(first.view, first.log_view);
+            consensus.mark_history_certificate_durable(first.history_certificate());
+            consensus.mark_adopted_view_durable(first.adopted_view.as_ref());
+            assert!(consensus.needs_superblock_persist());
+            let latest = consensus.vsr_state(0, 0);
+            consensus.mark_superblock_durable(latest.view, latest.log_view);
+            consensus.mark_history_certificate_durable(latest.history_certificate());
+            consensus.mark_adopted_view_durable(latest.adopted_view.as_ref());
+            assert!(!consensus.needs_superblock_persist());
+            assert_eq!(consensus.adopted_view_head(), Some((4, 3)));
+            assert!(consensus.view_log_unproven());
+            assert!(!consensus.view_log_entry_proven(3));
+        }
+    }
+
+    #[test]
+    fn given_malformed_start_view_evidence_when_adopting_should_leave_the_old_identity_intact() {
+        const BODY_ALIGN: usize = align_of::<PrepareHeader>();
+        let consensus = VsrConsensus::new(1, 0, 3, METADATA_GROUP, NoopBus, LocalPipeline::new());
+        let header = make_start_view(4, 2, 0, 1, 0);
+        let mut body: AVec<u8, ConstAlign<BODY_ALIGN>> = AVec::new(BODY_ALIGN);
+        body.push(0);
+        assert!(
+            consensus
+                .handle_start_view_guarded(PlaneKind::Metadata, header.header(), &body, |_| None)
+                .is_none()
+        );
+        assert_eq!(consensus.view(), 0);
+        assert_eq!(consensus.adopted_view_head(), None);
+        assert!(!consensus.needs_superblock_persist());
+    }
+
     /// The split-brain gate's predicate: `view` and `log_view` each independently
     /// make the superblock stale, and only a matching `mark_superblock_durable`
     /// clears it. The simulator proves the withheld-send behavior end to end; this
@@ -5629,6 +6584,7 @@ mod timestamp_clamp_tests {
 #[cfg(test)]
 mod vsr_consensus_tests {
     use super::*;
+    use futures::FutureExt;
     use message_bus::BusMessage;
 
     #[test]
@@ -5688,7 +6644,6 @@ mod vsr_consensus_tests {
         fn track_background(&self, _handle: message_bus::JoinHandle<()>) {}
         fn set_connection_lost_fn(&self, _f: message_bus::ConnectionLostFn) {}
         fn set_replica_forward_fn(&self, _f: message_bus::ReplicaForwardFn) {}
-        fn set_client_forward_fn(&self, _f: message_bus::ClientForwardFn) {}
     }
 
     #[test]
@@ -5703,6 +6658,237 @@ mod vsr_consensus_tests {
         assert!(consensus.is_transferring());
         consensus.set_state_transfer_stage(StateTransferStage::Idle);
         assert!(!consensus.is_transferring());
+    }
+
+    #[test]
+    fn given_ready_replica_when_requesting_primary_transfer_should_select_next_target_view() {
+        const REPLICAS: u8 = 5;
+        const INCARNATION: u64 = 17;
+        for (replica, view, target, next_view) in [
+            (1, 0, 3, 3),
+            (3, 6, 3, 8),
+            (1, 6, 4, 9),
+            (2, 9, 1, 11),
+            (2, 4, 0, 5),
+            (2, u32::MAX - 1, 0, u32::MAX),
+        ] {
+            let mut consensus =
+                VsrConsensus::new(1, replica, REPLICAS, 0, StageNoopBus, LocalPipeline::new());
+            consensus.set_view(view);
+            consensus.set_log_view(view);
+            consensus.set_partition_incarnation(INCARNATION);
+            consensus.mark_superblock_durable(view, view);
+            consensus.init();
+
+            let actions = consensus.request_primary_transfer(view, target);
+
+            assert!(matches!(
+                actions.as_slice(),
+                [VsrAction::SendStartViewChange { view, group: 0 }] if *view == next_view
+            ));
+            assert_eq!(consensus.view(), next_view);
+            assert_eq!(consensus.primary_index(next_view), target);
+            assert_eq!(consensus.status(), Status::ViewChange);
+            assert_eq!(consensus.log_view(), view);
+            assert_eq!(consensus.partition_incarnation(), INCARNATION);
+            assert!(consensus.needs_superblock_persist());
+            assert_eq!(consensus.svc_count_excluding_self(), 0);
+            assert!(consensus.sent_own_start_view_change.get());
+        }
+    }
+
+    #[test]
+    fn given_backup_transfer_when_primary_receives_svc_should_join_the_target_election() {
+        const TARGET: u8 = 2;
+        let backup = VsrConsensus::new(1, 1, 3, 0, StageNoopBus, LocalPipeline::new());
+        let primary = VsrConsensus::new(1, 0, 3, 0, StageNoopBus, LocalPipeline::new());
+        backup.init();
+        primary.init();
+        assert!(!backup.request_primary_transfer(0, TARGET).is_empty());
+        assert_eq!(primary.status(), Status::Normal);
+
+        let message = Message::<StartViewChangeHeader>::new(size_of::<StartViewChangeHeader>())
+            .transmute_header(|_, header: &mut StartViewChangeHeader| {
+                header.command = Command::StartViewChange;
+                header.cluster = 1;
+                header.replica = backup.replica();
+                header.view = backup.view();
+                header.group = backup.group();
+                header.size = u32::try_from(size_of::<StartViewChangeHeader>()).unwrap();
+                header.seal();
+            });
+        let actions = primary.handle_start_view_change(PlaneKind::Partitions, message.header());
+
+        assert_eq!(primary.view(), u32::from(TARGET));
+        assert_eq!(primary.status(), Status::ViewChange);
+        assert_eq!(primary.log_view(), 0);
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                VsrAction::SendStartViewChange { view: 2, group: 0 }
+            ))
+        );
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            VsrAction::SendDoViewChange {
+                target: TARGET,
+                view: 2,
+                ..
+            }
+        )));
+        assert!(primary.pending_view_log().is_none());
+    }
+
+    #[test]
+    fn given_pending_mutation_when_requesting_primary_transfer_should_preserve_identity_and_wake_waiter()
+     {
+        const COMMITTED: u64 = 7;
+        const INCARNATION: u64 = 17;
+        let consensus = VsrConsensus::new(1, 0, 3, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.set_partition_incarnation(INCARNATION);
+        consensus.sequencer().set_sequence(COMMITTED);
+        consensus.restore_commit_state(COMMITTED, COMMITTED);
+        let message = projected_prepare(COMMITTED + 1, 0xfeed).transmute_header(
+            |previous, header: &mut PrepareHeader| {
+                *header = previous;
+                header.operation = Operation::SendMessages;
+                header.client = 31;
+                header.session = 37;
+                header.request = 41;
+                header.partition_incarnation = INCARNATION;
+            },
+        );
+        let receiver = consensus.pipeline_message_with_subscriber(PlaneKind::Partitions, &message);
+        let pending = *message.header();
+        let checksum = consensus.last_prepare_checksum();
+
+        assert!(!consensus.request_primary_transfer(0, 2).is_empty());
+
+        assert_eq!(consensus.commit_min(), COMMITTED);
+        assert_eq!(consensus.commit_max(), COMMITTED);
+        assert_eq!(consensus.sequencer().current_sequence(), pending.op);
+        assert_eq!(consensus.last_prepare_checksum(), checksum);
+        consensus.with_pipeline(|pipeline| {
+            let entry = pipeline.entry_by_op(pending.op).unwrap();
+            assert_eq!(
+                bytemuck::bytes_of(&entry.header),
+                bytemuck::bytes_of(&pending)
+            );
+            assert!(!entry.has_reply_sender());
+        });
+        assert!(matches!(
+            receiver.now_or_never(),
+            Some(Err(crate::oneshot::Canceled))
+        ));
+        assert_eq!(consensus.log_view(), 0);
+    }
+
+    #[test]
+    fn given_unready_or_stale_transfer_when_requested_should_leave_consensus_unchanged() {
+        const VIEW: u32 = 6;
+        for reason in [
+            "stale view",
+            "existing primary",
+            "unknown target",
+            "recovering",
+            "view change",
+            "ceded",
+            "state transfer",
+            "unproved history",
+            "newer view observed",
+            "unapplied commit",
+            "recovery barrier",
+            "view start head",
+        ] {
+            let mut consensus = VsrConsensus::new(1, 2, 5, 0, StageNoopBus, LocalPipeline::new());
+            consensus.set_view(VIEW);
+            consensus.set_log_view(VIEW);
+            consensus.mark_superblock_durable(VIEW, VIEW);
+            consensus.init();
+            let mut expected_view = VIEW;
+            let mut target = 3;
+            match reason {
+                "stale view" => expected_view -= 1,
+                "existing primary" => target = consensus.primary_index(VIEW),
+                "unknown target" => target = consensus.replica_count(),
+                "recovering" => consensus.begin_view_probe(),
+                "view change" => {
+                    let _ = consensus.enter_view_change(
+                        PlaneKind::Partitions,
+                        VIEW,
+                        ViewChangeReason::ReceivedStartViewChange,
+                    );
+                }
+                "ceded" => consensus.init_as_backup(),
+                "state transfer" => consensus.begin_state_transfer_await(),
+                "unproved history" => consensus.fence_view_log(1, 1),
+                "newer view observed" => consensus.observe_newer_view(VIEW + 1),
+                "unapplied commit" => consensus.advance_commit_max(1),
+                "recovery barrier" => consensus.set_recovery_barrier(1),
+                "view start head" => consensus.view_start_head.set(1),
+                _ => unreachable!(),
+            }
+            let before = (
+                consensus.view(),
+                consensus.log_view(),
+                consensus.status(),
+                consensus.commit_min(),
+                consensus.commit_max(),
+                consensus.sequencer().current_sequence(),
+                consensus.svc_count_excluding_self(),
+                consensus.sent_own_start_view_change.get(),
+                consensus.needs_superblock_persist(),
+            );
+            let timers = format!("{:?}", consensus.timeouts.borrow());
+
+            assert!(
+                consensus
+                    .request_primary_transfer(expected_view, target)
+                    .is_empty(),
+                "accepted {reason}"
+            );
+
+            assert_eq!(
+                before,
+                (
+                    consensus.view(),
+                    consensus.log_view(),
+                    consensus.status(),
+                    consensus.commit_min(),
+                    consensus.commit_max(),
+                    consensus.sequencer().current_sequence(),
+                    consensus.svc_count_excluding_self(),
+                    consensus.sent_own_start_view_change.get(),
+                    consensus.needs_superblock_persist(),
+                ),
+                "mutated {reason}"
+            );
+            assert_eq!(
+                timers,
+                format!("{:?}", consensus.timeouts.borrow()),
+                "rearmed {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_metadata_or_exhausted_view_when_requesting_primary_transfer_should_refuse() {
+        for (group, view) in [(METADATA_GROUP, 0), (0, u32::MAX)] {
+            let mut consensus =
+                VsrConsensus::new(1, 0, 5, group, StageNoopBus, LocalPipeline::new());
+            consensus.set_view(view);
+            consensus.set_log_view(view);
+            consensus.mark_superblock_durable(view, view);
+            consensus.init();
+
+            assert!(consensus.request_primary_transfer(view, 1).is_empty());
+            assert_eq!(consensus.view(), view);
+            assert_eq!(consensus.log_view(), view);
+            assert_eq!(consensus.status(), Status::Normal);
+            assert!(!consensus.needs_superblock_persist());
+            assert!(!consensus.sent_own_start_view_change.get());
+        }
     }
 
     // A backup left behind on VIEW (partition healed across an election, or a
@@ -5936,6 +7122,183 @@ mod vsr_consensus_tests {
     }
 
     #[test]
+    fn given_a_commit_advance_when_the_next_tick_runs_should_announce_it_once_unless_a_prepare_carries_it()
+     {
+        let consensus = VsrConsensus::new(1, 0, 3, 0, StageNoopBus, LocalPipeline::new());
+        consensus.set_commit_message_ticks(u64::MAX);
+        consensus.init();
+        let announced = || -> Vec<u64> {
+            tick_commits(&consensus)
+                .into_iter()
+                .map(|(_, commit)| commit)
+                .collect()
+        };
+        let commit_head = |op: u64| commit_acked_head(&consensus, op);
+        let stamped = |op: u64, commit: u64| {
+            projected_prepare(op, 0).transmute_header(|mut header, stamped: &mut PrepareHeader| {
+                header.commit = commit;
+                *stamped = header;
+            })
+        };
+
+        pipeline(&consensus, &projected_prepare(1, 0));
+        commit_head(1);
+        consensus.request_eager_commit();
+        assert_eq!(announced(), [1], "requests before a tick share one Commit");
+        assert!(announced().is_empty(), "one Commit per commit advance");
+
+        pipeline(&consensus, &projected_prepare(2, 0));
+        commit_head(2);
+        // A queued request promoted by the commit, stamped with the new commit point.
+        pipeline(&consensus, &stamped(3, 2));
+        assert!(
+            announced().is_empty(),
+            "the promoted prepare already tells the backups"
+        );
+
+        commit_head(3);
+        assert_eq!(announced(), [3]);
+
+        // Prepared while op 4 was in flight, so it carries the older commit point.
+        pipeline(&consensus, &projected_prepare(4, 0));
+        pipeline(&consensus, &stamped(5, 3));
+        commit_head(4);
+        assert_eq!(
+            announced(),
+            [4],
+            "a prepare stamped before the commit does not tell the backups"
+        );
+
+        // Op 6 is prepared before the commit of op 5 and op 7 after it.
+        pipeline(&consensus, &stamped(6, 4));
+        commit_head(5);
+        pipeline(&consensus, &stamped(7, 5));
+        assert!(
+            announced().is_empty(),
+            "the newest prepare tells the backups, though an older one does not"
+        );
+    }
+
+    #[test]
+    fn given_a_requested_commit_when_the_heartbeat_fires_on_that_tick_should_send_one_commit() {
+        const HEARTBEAT_TICKS: u64 = 2;
+        let consensus = VsrConsensus::new(1, 0, 3, 0, StageNoopBus, LocalPipeline::new());
+        consensus.set_commit_message_ticks(HEARTBEAT_TICKS);
+        consensus.init();
+        let commits = || tick_commits(&consensus).len();
+
+        assert_eq!(commits(), 0, "the heartbeat is not due yet");
+        pipeline(&consensus, &projected_prepare(1, 0));
+        commit_acked_head(&consensus, 1);
+        assert_eq!(commits(), 1, "the heartbeat answers the request");
+        assert_eq!(commits(), 0, "the heartbeat consumed the request");
+    }
+
+    #[test]
+    fn given_a_backup_that_acks_a_committed_op_late_when_the_next_tick_runs_should_send_it_a_commit_covering_the_op()
+     {
+        let consensus =
+            VsrConsensus::new(1, 0, 3, METADATA_GROUP, StageNoopBus, LocalPipeline::new());
+        consensus.set_commit_message_ticks(u64::MAX);
+        consensus.init();
+        let late_ack = |op: u64| {
+            consensus.handle_late_prepare_ok(&prepare_ok(&consensus, LATE_BACKUP, op));
+        };
+
+        pipeline(&consensus, &projected_prepare(1, 0));
+        pipeline(&consensus, &projected_prepare(2, 0));
+        commit_acked_head(&consensus, 1);
+        commit_acked_head(&consensus, 2);
+        assert_eq!(
+            tick_commits(&consensus),
+            [(Some(ACKING_BACKUP), 2)],
+            "only a backup that acked the op holds it"
+        );
+
+        late_ack(1);
+        assert_eq!(
+            tick_commits(&consensus),
+            [(Some(LATE_BACKUP), 1)],
+            "a late ack gets a Commit at once, naming no op the backup lacks"
+        );
+        late_ack(2);
+        assert_eq!(tick_commits(&consensus), [(Some(LATE_BACKUP), 2)]);
+        late_ack(2);
+        assert!(
+            tick_commits(&consensus).is_empty(),
+            "a Commit already covers a repeated ack"
+        );
+    }
+
+    #[test]
+    fn given_a_backup_that_never_acks_when_the_heartbeat_fires_should_still_send_it_the_commit() {
+        const HEARTBEAT_TICKS: u64 = 4;
+        let consensus =
+            VsrConsensus::new(1, 0, 3, METADATA_GROUP, StageNoopBus, LocalPipeline::new());
+        consensus.set_commit_message_ticks(HEARTBEAT_TICKS);
+        consensus.init();
+
+        pipeline(&consensus, &projected_prepare(1, 0));
+        commit_acked_head(&consensus, 1);
+        assert_eq!(
+            tick_commits(&consensus),
+            [(Some(ACKING_BACKUP), 1)],
+            "the eager Commit skips a backup that never acked"
+        );
+        let heartbeats: Vec<_> = (1..HEARTBEAT_TICKS)
+            .flat_map(|_| tick_commits(&consensus))
+            .collect();
+        assert_eq!(
+            heartbeats,
+            [(None, 1)],
+            "the heartbeat still goes to every backup"
+        );
+
+        consensus.handle_late_prepare_ok(&prepare_ok(&consensus, LATE_BACKUP, 1));
+        assert!(
+            tick_commits(&consensus).is_empty(),
+            "the heartbeat already covered the op"
+        );
+    }
+
+    #[test]
+    fn given_a_requested_commit_when_the_replica_stops_leading_before_the_tick_should_not_announce_it()
+     {
+        for reason in ["demoted", "view change", "newer view observed"] {
+            let consensus =
+                VsrConsensus::new(1, 0, 3, METADATA_GROUP, StageNoopBus, LocalPipeline::new());
+            consensus.set_commit_message_ticks(u64::MAX);
+            consensus.init();
+            pipeline(&consensus, &projected_prepare(1, 0));
+            commit_acked_head(&consensus, 1);
+            match reason {
+                "demoted" => {
+                    let start_view = test_bus::make_start_view(1, 1, 1, 1, 0);
+                    let _ =
+                        consensus.handle_start_view(PlaneKind::Metadata, start_view.header(), &[]);
+                }
+                // Replica 0 leads view 3 too, so only its status holds the Commit back.
+                "view change" => {
+                    let _ = consensus.enter_view_change(
+                        PlaneKind::Metadata,
+                        3,
+                        ViewChangeReason::ReceivedStartViewChange,
+                    );
+                }
+                "newer view observed" => consensus.observe_newer_view(1),
+                _ => unreachable!(),
+            }
+            assert!(
+                !consensus
+                    .tick(PlaneKind::Metadata)
+                    .iter()
+                    .any(|action| matches!(action, VsrAction::SendCommit { .. })),
+                "announced a commit after {reason}"
+            );
+        }
+    }
+
+    #[test]
     fn given_an_old_primary_when_the_new_primary_heartbeats_should_remain_in_the_new_view() {
         for enters_election in [false, true] {
             let consensus =
@@ -6075,6 +7438,50 @@ mod vsr_consensus_tests {
     /// and the parent chain ahead of the journal append.
     fn pipeline(consensus: &VsrConsensus<StageNoopBus>, message: &Message<PrepareHeader>) {
         consensus.pipeline_message(PlaneKind::Metadata, message);
+    }
+
+    /// The backup whose ack the eager `Commit` tests record for each op they
+    /// commit, in a 3-replica group led by replica 0.
+    const ACKING_BACKUP: u8 = 1;
+    /// The backup those tests withhold acks from, as the chain tail's arrive
+    /// after the quorum.
+    const LATE_BACKUP: u8 = 2;
+
+    /// The `PrepareOk` `replica` sends in the current view for an op pipelined
+    /// from [`projected_prepare`].
+    fn prepare_ok(consensus: &VsrConsensus<StageNoopBus>, replica: u8, op: u64) -> PrepareOkHeader {
+        PrepareOkHeader {
+            command: Command::PrepareOk,
+            replica,
+            view: consensus.view(),
+            op,
+            ..Default::default()
+        }
+    }
+
+    /// Commit the pipeline head `op` the way the metadata plane does, after an
+    /// ack from [`ACKING_BACKUP`].
+    fn commit_acked_head(consensus: &VsrConsensus<StageNoopBus>, op: u64) {
+        let _ = consensus.handle_prepare_ok(
+            PlaneKind::Metadata,
+            &prepare_ok(consensus, ACKING_BACKUP, op),
+        );
+        consensus.advance_commit_max(op);
+        assert_eq!(consensus.pop_committed_prepare().unwrap().header.op, op);
+        consensus.advance_commit_min(op);
+        consensus.request_eager_commit();
+    }
+
+    /// The `Commit`s the next tick sends, as `(target, commit)`.
+    fn tick_commits(consensus: &VsrConsensus<StageNoopBus>) -> Vec<(Option<u8>, u64)> {
+        consensus
+            .tick(PlaneKind::Metadata)
+            .into_iter()
+            .filter_map(|action| match action {
+                VsrAction::SendCommit { target, commit, .. } => Some((target, commit)),
+                _ => None,
+            })
+            .collect()
     }
 
     use iggy_binary_protocol::Operation;
@@ -6762,6 +8169,720 @@ mod probe_answer_tests {
             commit <= op,
             "announced commit {commit} exceeds head {op}, which StartViewHeader::validate \
              rejects and the dispatcher panics on"
+        );
+    }
+}
+
+#[cfg(test)]
+mod history_certificate_tests {
+    use super::*;
+    use crate::LocalPipeline;
+    use crate::test_bus::NoopBus;
+
+    #[test]
+    fn given_a_metadata_replica_when_its_history_moves_should_gate_acks_and_persistence() {
+        const ADOPTED_VIEW: u32 = 2;
+        let mut consensus =
+            VsrConsensus::new(1, 0, 3, METADATA_GROUP, NoopBus, LocalPipeline::new());
+        consensus.init();
+        let current = |consensus: &VsrConsensus<NoopBus, LocalPipeline>| {
+            consensus.vsr_state(0, 0).history_certificate()
+        };
+        assert!(consensus.history_certified());
+        assert!(!consensus.needs_superblock_persist());
+
+        // Following the WAL head forces no write.
+        consensus.extend_history_certificate(5, 55);
+        assert_eq!(current(&consensus), Some(HistoryCertificate::new(0, 5, 55)));
+        assert!(!consensus.needs_superblock_persist());
+        consensus.mark_history_certificate_durable(current(&consensus));
+
+        // An adopted view whose log is unproven: no acks, and nothing it journals
+        // moves the binding.
+        consensus.set_view(ADOPTED_VIEW);
+        consensus.set_log_view(ADOPTED_VIEW);
+        consensus.mark_superblock_durable(ADOPTED_VIEW, ADOPTED_VIEW);
+        assert!(!consensus.history_certified());
+        consensus.extend_history_certificate(6, 66);
+        assert_eq!(current(&consensus), Some(HistoryCertificate::new(0, 5, 55)));
+
+        // A rewrite off the bound entry: the lowered binding must be durable before
+        // the entry goes.
+        consensus.lower_history_certificate(5, 4, 44);
+        assert_eq!(current(&consensus), Some(HistoryCertificate::new(0, 4, 44)));
+        assert!(consensus.needs_superblock_persist());
+        consensus.mark_history_certificate_durable(current(&consensus));
+        assert!(!consensus.needs_superblock_persist());
+        consensus.lower_history_certificate(6, 3, 33);
+        assert_eq!(
+            current(&consensus),
+            Some(HistoryCertificate::new(0, 4, 44)),
+            "a rewrite above the binding leaves it"
+        );
+
+        // Proven: the view is certified, and recorded before the first ack.
+        consensus.certify_view_log(7, 77);
+        assert!(consensus.history_certified());
+        assert!(consensus.needs_superblock_persist());
+        consensus.mark_history_certificate_durable(current(&consensus));
+        consensus.extend_history_certificate(8, 88);
+        assert_eq!(
+            current(&consensus),
+            Some(HistoryCertificate::new(ADOPTED_VIEW, 8, 88))
+        );
+        assert!(!consensus.needs_superblock_persist());
+    }
+
+    #[test]
+    fn given_a_restart_with_an_unproven_wal_when_restored_should_fence_it_and_stay_out_of_elections()
+     {
+        let consensus = VsrConsensus::new(1, 0, 3, METADATA_GROUP, NoopBus, LocalPipeline::new());
+        consensus.init_as_backup();
+        let legacy = VsrState {
+            cluster: 1,
+            replica_id: 0,
+            replica_count: 3,
+            view: 4,
+            log_view: 4,
+            commit_max: 0,
+            checkpoint_op: 0,
+            checkpoint_checksum: 0,
+            offset_frontier: 0,
+            offset_reserved: 0,
+            adopted_view: None,
+        };
+        consensus.restore_history(HistoryRecovery::Unproven, (9, 99), Some(&legacy));
+        assert!(consensus.view_log_unproven());
+        assert!(!consensus.view_log_entry_proven(consensus.commit_min() + 1));
+        assert!(!consensus.history_certified());
+        assert!(!consensus.needs_superblock_persist());
+        assert!(
+            !consensus.recovery_election_allowed(),
+            "an unanswered probe must not let an unproven log vote"
+        );
+
+        consensus.certify_view_log(9, 99);
+        assert!(consensus.history_certified());
+        assert!(consensus.recovery_election_allowed());
+    }
+
+    #[test]
+    fn given_a_partition_group_when_recording_should_keep_its_offset_words() {
+        let group = IggyNamespace::new(0, 0, 0).inner();
+        let mut consensus = VsrConsensus::new(1, 0, 3, group, NoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.set_view(1);
+        consensus.set_log_view(1);
+        assert!(consensus.history_certified());
+        let state = consensus.vsr_state(0, 0);
+        assert_eq!((state.offset_frontier, state.offset_reserved), (0, 0));
+    }
+}
+
+#[cfg(test)]
+mod adopted_view_claim_tests {
+    //! An adopted claim must retain its announced head and exact identity across
+    //! elections and recovery. A body certificate alone does not preserve them;
+    //! advertising the adopted view with the shorter WAL head loses committed ops.
+    //!
+    //! A backup that already applied an op must refuse a `StartView` naming a
+    //! different prepare there: adopting it would hide the loss.
+
+    use super::*;
+    use crate::LocalPipeline;
+    use crate::test_bus::{NoopBus, make_start_view};
+    use crate::view_change_quorum::{DvcSuffix, StoredDvc, dvc_quorum_array_empty, dvc_record};
+
+    /// The view the cluster committed `HEAD` in.
+    const OLD_VIEW: u32 = 10;
+    /// The view whose `StartView` announced `HEAD` to the backup.
+    const ADOPTED_VIEW: u32 = 11;
+    const ADOPTED_VIEW_PRIMARY: u8 = 2;
+    const BACKUP: u8 = 0;
+    /// The view-10 primary, which committed `HEAD` and then restarted.
+    const OLD_PRIMARY: u8 = 1;
+    /// Committed in `OLD_VIEW`; the backup never receives its body.
+    const HEAD: u64 = 26;
+    /// The view whose primary-elect the backup becomes.
+    const MERGED_VIEW: u32 = ADOPTED_VIEW + 1;
+    /// Every group but metadata's runs the partition rules.
+    const PARTITION_GROUP: u64 = 0;
+
+    /// Hash-chained metadata prepare headers for ops `1..=HEAD`, indexed by op.
+    fn history() -> Vec<PrepareHeader> {
+        history_in(METADATA_GROUP)
+    }
+
+    /// [`history`] in `group`.
+    fn history_in(group: u64) -> Vec<PrepareHeader> {
+        let mut headers = vec![PrepareHeader::default()];
+        for op in 1..=HEAD {
+            let mut header = PrepareHeader {
+                command: Command::Prepare,
+                cluster: 1,
+                group,
+                timestamp: op,
+                operation: Operation::CreateStream,
+                size: u32::try_from(size_of::<PrepareHeader>()).unwrap(),
+                op,
+                commit: op - 1,
+                parent: headers[usize::try_from(op - 1).unwrap()].checksum,
+                view: OLD_VIEW,
+                ..PrepareHeader::default()
+            };
+            header.checksum = header.identity_checksum();
+            headers.push(header);
+        }
+        headers
+    }
+
+    fn at(history: &[PrepareHeader], op: u64) -> PrepareHeader {
+        history[usize::try_from(op).unwrap()]
+    }
+
+    /// A suffix for `low..=high` holding every body, high-to-low.
+    fn held(history: &[PrepareHeader], low: u64, high: u64) -> DvcSuffix {
+        let headers: Vec<PrepareHeader> = (low..=high).rev().map(|op| at(history, op)).collect();
+        let present = (1u128 << headers.len()) - 1;
+        DvcSuffix::new(headers, 0, present)
+    }
+
+    fn plane_of(group: u64) -> PlaneKind {
+        if group == METADATA_GROUP {
+            PlaneKind::Metadata
+        } else {
+            PlaneKind::Partitions
+        }
+    }
+
+    /// A metadata backup in normal status at `OLD_VIEW` whose journal ends at `head`.
+    fn backup_at(log_view: u32, view: u32, head: u64, commit: u64) -> VsrConsensus<NoopBus> {
+        backup_in(METADATA_GROUP, log_view, view, head, commit)
+    }
+
+    /// [`backup_at`] in `group`.
+    fn backup_in(
+        group: u64,
+        log_view: u32,
+        view: u32,
+        head: u64,
+        commit: u64,
+    ) -> VsrConsensus<NoopBus> {
+        let mut consensus = VsrConsensus::new(1, BACKUP, 3, group, NoopBus, LocalPipeline::new());
+        consensus.restore_view(ViewRestore {
+            durable_view: Some((view, log_view)),
+            view_fallback: None,
+            seed_view: None,
+        });
+        // A partition binds its history in the partition journal instead.
+        if group == METADATA_GROUP {
+            consensus.restore_history(
+                HistoryRecovery::Certified {
+                    view: log_view,
+                    truncate_from: None,
+                },
+                (head, 0),
+                None,
+            );
+        }
+        consensus.init_as_backup();
+        consensus.sequencer().set_sequence(head);
+        consensus.restore_commit_state(commit, commit);
+        consensus
+    }
+
+    /// Adopt the view-11 `StartView` (head `HEAD`, commit `HEAD - 1`) in the group
+    /// of `history`, with the journal still ending at op 23.
+    fn adopt_unrepaired(history: &[PrepareHeader]) -> VsrConsensus<NoopBus> {
+        let group = at(history, HEAD).group;
+        let backup = backup_in(group, OLD_VIEW, OLD_VIEW, 23, 22);
+        let suffix = [at(history, HEAD), at(history, HEAD - 1)];
+        let start_view = make_start_view(ADOPTED_VIEW, HEAD, HEAD - 1, ADOPTED_VIEW_PRIMARY, 0);
+        let original = *start_view.header();
+        let start_view = start_view.transmute_header(|_, header: &mut StartViewHeader| {
+            *header = StartViewHeader { group, ..original };
+        });
+        backup.handle_start_view(
+            plane_of(group),
+            start_view.header(),
+            bytemuck::cast_slice(&suffix),
+        );
+        assert_eq!(backup.log_view(), ADOPTED_VIEW);
+        assert!(
+            backup.view_log_unproven(),
+            "the journal does not hold the head yet"
+        );
+        backup
+    }
+
+    fn dvc_of(consensus: &VsrConsensus<NoopBus>) -> StoredDvc {
+        let VsrAction::SendDoViewChange {
+            log_view,
+            op,
+            commit,
+            suffix,
+            ..
+        } = consensus.build_do_view_change(BACKUP)
+        else {
+            unreachable!("build_do_view_change builds a DoViewChange");
+        };
+        StoredDvc {
+            replica: consensus.replica(),
+            log_view,
+            op,
+            commit,
+            suffix,
+        }
+    }
+
+    /// The view-10 primary after its restart: `HEAD` journaled, commit point one
+    /// below it because nothing it journaled stamps the commit of `HEAD`.
+    fn old_primary(history: &[PrepareHeader]) -> StoredDvc {
+        StoredDvc {
+            replica: OLD_PRIMARY,
+            log_view: OLD_VIEW,
+            op: HEAD,
+            commit: HEAD - 1,
+            suffix: held(history, HEAD - 1, HEAD),
+        }
+    }
+
+    fn merged_head(consensus: &VsrConsensus<NoopBus>, senders: [StoredDvc; 2]) -> u64 {
+        let mut quorum = dvc_quorum_array_empty();
+        for dvc in senders {
+            assert!(dvc_record(&mut quorum, dvc));
+        }
+        match merge_dvc_quorum(&quorum, consensus.merge_quorums()) {
+            MergeOutcome::Ready(merged) => merged.op_head,
+            outcome => panic!("the quorum holds every body it needs, got {outcome:?}"),
+        }
+    }
+
+    #[test]
+    fn given_an_unrepaired_start_view_head_when_the_backup_restarts_should_keep_the_committed_head()
+    {
+        let history = history();
+        let adopted = adopt_unrepaired(&history);
+        // Persisted before any view-scoped send, so this is what survives the crash.
+        let durable = adopted.vsr_state(0, 0);
+
+        // Repair reached op 25 before the crash; op 26 never arrived.
+        let claimed_view = durable.history_certificate().unwrap().view;
+        let restarted = backup_at(claimed_view, durable.view, HEAD - 1, HEAD - 2);
+        restarted.restore_adopted_view(durable.adopted_view.as_ref());
+        restarted.resume_adopted_view();
+        restarted.fence_view_log(HEAD, 0);
+        let adopted_headers = restarted.adopted_view_log().unwrap().headers;
+        restarted.set_local_dvc_suffix(DvcSuffix::new(adopted_headers, 0, 0b10));
+        assert_eq!(restarted.sequencer().current_sequence(), HEAD);
+        assert_eq!(restarted.log_view_claim(), ADOPTED_VIEW);
+
+        assert_eq!(
+            merged_head(&restarted, [dvc_of(&restarted), old_primary(&history)]),
+            HEAD,
+            "the restarted backup claimed log_view {} with head {}, so the merge never \
+             scanned op {HEAD}, which view {OLD_VIEW} committed",
+            durable.log_view,
+            HEAD - 1,
+        );
+    }
+
+    #[test]
+    fn given_repaired_adopted_bodies_when_restoring_should_keep_the_older_certificate_binding() {
+        const CERTIFIED_HEAD: u64 = HEAD - 3;
+        let history = history();
+        let adopted = adopt_unrepaired(&history);
+        let certificate = HistoryCertificate::new(
+            OLD_VIEW,
+            CERTIFIED_HEAD,
+            at(&history, CERTIFIED_HEAD).checksum,
+        );
+        let durable = adopted
+            .vsr_state(0, 0)
+            .with_history_certificate(Some(certificate));
+        let recovery =
+            HistoryRecovery::new(Some(&durable), false, |op| Some(at(&history, op).checksum));
+        let restarted = backup_at(OLD_VIEW, durable.view, HEAD - 1, HEAD - 2);
+        restarted.restore_history(
+            recovery,
+            (HEAD - 1, at(&history, HEAD - 1).checksum),
+            Some(&durable),
+        );
+        restarted.restore_adopted_view(durable.adopted_view.as_ref());
+        restarted.resume_adopted_view();
+        assert_eq!(
+            restarted.vsr_state(0, 0).history_certificate(),
+            Some(certificate)
+        );
+        assert!(restarted.view_log_unproven());
+        assert!(!restarted.history_certified());
+    }
+
+    #[test]
+    fn given_an_unrepaired_start_view_head_when_a_view_change_drops_the_parked_headers_should_keep_the_committed_head()
+     {
+        let history = history();
+        let backup = adopt_unrepaired(&history);
+        // Reconcile found op 26 missing; repair brought ops 24 and 25.
+        backup.fence_view_log(HEAD, 0);
+        backup.enter_view_change(
+            PlaneKind::Metadata,
+            ADOPTED_VIEW + 1,
+            ViewChangeReason::NormalHeartbeatTimeout,
+        );
+        assert!(backup.pending_view_log().is_none());
+        // The accepted header distinguishes a missing body from a truncated op.
+        backup.set_local_dvc_suffix(DvcSuffix::new(
+            backup.adopted_view_log().unwrap().headers,
+            0,
+            0b10,
+        ));
+
+        assert_eq!(
+            merged_head(&backup, [dvc_of(&backup), old_primary(&history)]),
+            HEAD,
+            "the backup nacked op {HEAD} as a canonical sender of view {ADOPTED_VIEW}, so the \
+             view-{OLD_VIEW} primary's copy counted as a second nack",
+        );
+    }
+
+    #[test]
+    fn given_a_restart_as_primary_of_the_recovered_view_when_the_adopted_log_is_proven_should_not_start_the_view()
+     {
+        const RECOVERED_VIEW: u32 = ADOPTED_VIEW + 1;
+        // Acked `COMMITTED` in `ADOPTED_VIEW`, then never learned its commit.
+        const PEER: u8 = 1;
+        const COMMITTED: u64 = HEAD + 1;
+        let history = history();
+        let backup = adopt_unrepaired(&history);
+        assert!(backup.is_primary_for_view(RECOVERED_VIEW));
+
+        // The view-11 primary committed op 27 with the peer's ack and crashed.
+        let mut committed = at(&history, HEAD);
+        committed.op = COMMITTED;
+        committed.view = ADOPTED_VIEW;
+        committed.parent = at(&history, HEAD).checksum;
+        committed.commit = HEAD;
+        committed.timestamp = COMMITTED;
+        committed.checksum = committed.identity_checksum();
+        let peer = StoredDvc {
+            replica: PEER,
+            log_view: ADOPTED_VIEW,
+            op: COMMITTED,
+            commit: HEAD,
+            suffix: DvcSuffix::new(vec![committed, at(&history, HEAD)], 0, 0b11),
+        };
+        backup.enter_view_change(
+            PlaneKind::Metadata,
+            RECOVERED_VIEW,
+            ViewChangeReason::ReceivedStartViewChange,
+        );
+        for dvc in [dvc_of(&backup), peer] {
+            assert!(dvc_record(
+                &mut backup.do_view_change_from_all_replicas.borrow_mut(),
+                dvc
+            ));
+        }
+        assert!(
+            backup
+                .complete_view_change_as_primary(PlaneKind::Metadata)
+                .is_empty()
+        );
+        assert_eq!(
+            backup.pending_view_log().map(|merged| merged.op_head),
+            Some(COMMITTED)
+        );
+        assert!(backup.is_primary_elect());
+
+        // Repair brought ops 24 to 26 before the crash. The view never started.
+        let durable = backup.vsr_state(0, 0);
+        let restarted = backup_at(
+            durable.history_certificate().unwrap().view,
+            durable.view,
+            HEAD,
+            HEAD - 1,
+        );
+        restarted.begin_view_probe();
+        restarted.restore_adopted_view(durable.adopted_view.as_ref());
+        restarted.resume_adopted_view();
+        assert_eq!(
+            restarted.with_pending_view_log(|merged| merged.op_head),
+            Some(HEAD),
+            "the restart did not park the view-{ADOPTED_VIEW} log, so nothing below tests the gate"
+        );
+        // What the plane's reconcile does once the journal matches the parked headers.
+        restarted.settle_view_log_proof();
+        assert!(
+            !restarted.is_primary_elect(),
+            "the planes would drive repair and the view start from the adopted log"
+        );
+
+        let actions = restarted.start_pending_view(PlaneKind::Metadata);
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, VsrAction::SendStartView { .. })),
+            "the restarted replica announced view {RECOVERED_VIEW} from the view-{ADOPTED_VIEW} \
+             log with no DoViewChange quorum, so its peer adopts head {HEAD} and drops op \
+             {COMMITTED}, which view {ADOPTED_VIEW} committed",
+        );
+        assert_eq!(restarted.status(), Status::Recovering);
+    }
+
+    /// The `MERGED_VIEW` primary-elect once its journal holds the merge of its own
+    /// and the view-10 primary's logs, in the group of `history`. The view has
+    /// not started.
+    fn proven_merge_elect(history: &[PrepareHeader]) -> VsrConsensus<NoopBus> {
+        let plane = plane_of(at(history, HEAD).group);
+        let backup = adopt_unrepaired(history);
+        // What the plane's reconcile does once the journal matches the parked headers.
+        backup.settle_view_log_proof();
+        assert!(
+            !backup.view_log_merged(),
+            "a backup proves the log its log_view names"
+        );
+        backup.enter_view_change(
+            plane,
+            MERGED_VIEW,
+            ViewChangeReason::ReceivedStartViewChange,
+        );
+        let peer = StoredDvc {
+            replica: OLD_PRIMARY,
+            log_view: ADOPTED_VIEW,
+            op: HEAD,
+            commit: HEAD - 1,
+            suffix: held(history, HEAD - 1, HEAD),
+        };
+        for dvc in [dvc_of(&backup), peer] {
+            assert!(dvc_record(
+                &mut backup.do_view_change_from_all_replicas.borrow_mut(),
+                dvc
+            ));
+        }
+        assert!(backup.complete_view_change_as_primary(plane).is_empty());
+        assert!(backup.is_primary_elect());
+        backup.settle_view_log_proof();
+        assert!(backup.view_log_merged());
+        backup
+    }
+
+    #[test]
+    fn given_a_proven_merge_when_the_elect_is_superseded_should_unprove_only_an_uncertified_partition_merge()
+     {
+        const SUPERSEDING_VIEW: u32 = MERGED_VIEW + 1;
+        let partition = proven_merge_elect(&history_in(PARTITION_GROUP));
+        // What the partition reconcile reports once the merge cleared the WAL certificate.
+        partition.note_uncertified_merge();
+        partition.enter_view_change(
+            PlaneKind::Partitions,
+            SUPERSEDING_VIEW,
+            ViewChangeReason::ReceivedStartViewChange,
+        );
+        assert!(!partition.is_primary_elect());
+        assert!(!partition.view_log_merged());
+        assert!(
+            partition.view_log_unproven(),
+            "log_view {ADOPTED_VIEW} would name a journal that holds the view-{MERGED_VIEW} merge"
+        );
+        assert_eq!(partition.log_view_claim(), ADOPTED_VIEW);
+        assert_eq!(
+            partition.view_log_unproven_range(),
+            partition.commit_min() + 1..=u64::MAX
+        );
+        assert_eq!(
+            partition.view_log_repair_op(),
+            None,
+            "the proven merge has no gap to repair"
+        );
+
+        // A partition whose WAL still certifies log_view votes with its merged
+        // journal, as a restart from that WAL restores it. Metadata claims through
+        // its history certificate, whatever the WAL reports.
+        for (group, uncertified) in [(PARTITION_GROUP, false), (METADATA_GROUP, true)] {
+            let elect = proven_merge_elect(&history_in(group));
+            if uncertified {
+                elect.note_uncertified_merge();
+            }
+            elect.enter_view_change(
+                plane_of(group),
+                SUPERSEDING_VIEW,
+                ViewChangeReason::ReceivedStartViewChange,
+            );
+            assert!(!elect.is_primary_elect());
+            assert!(elect.view_log_merged(), "group {group}");
+            assert!(!elect.view_log_unproven(), "group {group}");
+            assert!(elect.view_log_unproven_range().is_empty(), "group {group}");
+        }
+
+        for group in [PARTITION_GROUP, METADATA_GROUP] {
+            let started = proven_merge_elect(&history_in(group));
+            started.start_pending_view(plane_of(group));
+            assert_eq!(started.log_view(), MERGED_VIEW);
+            assert!(!started.view_log_merged());
+        }
+    }
+
+    #[test]
+    fn given_an_uncertified_partition_merge_when_a_start_view_change_supersedes_it_should_vote_with_the_snapshot_taken_before()
+     {
+        const SUPERSEDING_VIEW: u32 = MERGED_VIEW + 1;
+        let elect = proven_merge_elect(&history_in(PARTITION_GROUP));
+        assert!(
+            elect.view_log_unproven_range().is_empty() && elect.adopted_view_log().is_none(),
+            "a merge that kept the WAL certificate offers its journal in the snapshot"
+        );
+        elect.note_uncertified_merge();
+        // The shard reads both to snapshot the suffix this replica will vote with.
+        assert_eq!(
+            elect.view_log_unproven_range(),
+            elect.commit_min() + 1..=u64::MAX,
+            "the snapshot must not offer the merge under log_view {ADOPTED_VIEW}"
+        );
+        let stitched = elect
+            .adopted_view_log()
+            .expect("the snapshot must stitch the adopted log, as once superseded")
+            .headers;
+        elect.set_local_dvc_suffix(DvcSuffix::new(stitched.clone(), 0, 0));
+
+        let start_view_change =
+            Message::<StartViewChangeHeader>::new(size_of::<StartViewChangeHeader>())
+                .transmute_header(|_, header: &mut StartViewChangeHeader| {
+                    header.command = Command::StartViewChange;
+                    header.cluster = 1;
+                    header.replica = OLD_PRIMARY;
+                    header.view = SUPERSEDING_VIEW;
+                    header.group = PARTITION_GROUP;
+                    header.size = u32::try_from(size_of::<StartViewChangeHeader>()).unwrap();
+                    header.seal();
+                });
+        let actions =
+            elect.handle_start_view_change(PlaneKind::Partitions, start_view_change.header());
+
+        let vote = actions.iter().find_map(|action| match action {
+            VsrAction::SendDoViewChange {
+                view: SUPERSEDING_VIEW,
+                log_view,
+                suffix,
+                ..
+            } => Some((*log_view, suffix.headers().to_vec())),
+            _ => None,
+        });
+        assert_eq!(
+            vote,
+            Some((ADOPTED_VIEW, stitched)),
+            "an empty suffix from a canonical sender lets every lower log_view copy count as a nack"
+        );
+    }
+
+    #[test]
+    fn given_an_unrepaired_start_view_head_when_the_proof_settles_should_persist_the_adopted_log_view()
+     {
+        let history = history();
+        let backup = adopt_unrepaired(&history);
+        assert_eq!(
+            backup.vsr_state(0, 0).history_certificate().unwrap().view,
+            OLD_VIEW,
+            "the superblock must not record a view whose log the journal does not hold"
+        );
+        let durable = backup.vsr_state(0, 0);
+        backup.mark_superblock_durable(durable.view, durable.log_view);
+        backup.mark_adopted_view_durable(durable.adopted_view.as_ref());
+        assert!(!backup.needs_superblock_persist());
+
+        backup.settle_view_log_proof();
+        backup.certify_view_log(HEAD, at(&history, HEAD).checksum);
+        assert!(
+            backup.needs_superblock_persist(),
+            "the proven view must reach the superblock before the next view-scoped send"
+        );
+        assert_eq!(
+            backup.vsr_state(0, 0).history_certificate().unwrap().view,
+            ADOPTED_VIEW
+        );
+    }
+
+    /// A backup that applied every op through `HEAD` receives the view-11
+    /// `StartView` with `suffix` as its log at `HEAD`.
+    fn offer_applied_backup(
+        history: &[PrepareHeader],
+        suffix: PrepareHeader,
+    ) -> (VsrConsensus<NoopBus>, Option<Vec<VsrAction>>) {
+        let backup = backup_at(OLD_VIEW, OLD_VIEW, HEAD, HEAD);
+        let outcome = backup.handle_start_view_guarded(
+            PlaneKind::Metadata,
+            make_start_view(ADOPTED_VIEW, HEAD, HEAD, ADOPTED_VIEW_PRIMARY, 0).header(),
+            bytemuck::bytes_of(&suffix),
+            |op| (op <= HEAD).then(|| at(history, op)),
+        );
+        (backup, outcome)
+    }
+
+    #[test]
+    fn given_a_start_view_that_contradicts_an_applied_op_when_adopting_should_refuse_it() {
+        let history = history();
+        let mut forged = at(&history, HEAD);
+        forged.timestamp += 1;
+        forged.checksum = forged.identity_checksum();
+
+        let (backup, outcome) = offer_applied_backup(&history, forged);
+
+        assert!(
+            outcome.is_none(),
+            "a log naming another prepare at applied op {HEAD} must be refused, not adopted"
+        );
+        assert_eq!(
+            (
+                backup.view(),
+                backup.log_view(),
+                backup.sequencer().current_sequence()
+            ),
+            (OLD_VIEW, OLD_VIEW, HEAD),
+            "a refused StartView changes nothing"
+        );
+        assert_eq!(backup.applied_log_contradictions(), 1);
+    }
+
+    #[test]
+    fn given_a_start_view_that_matches_the_applied_ops_when_adopting_should_adopt_it() {
+        let history = history();
+
+        let (backup, outcome) = offer_applied_backup(&history, at(&history, HEAD));
+
+        assert!(outcome.is_some());
+        assert_eq!(backup.view(), ADOPTED_VIEW);
+        assert_eq!(backup.applied_log_contradictions(), 0);
+    }
+
+    #[test]
+    fn given_a_contradicting_start_view_when_redelivered_should_report_it_once_per_view() {
+        let history = history();
+        let mut forged = at(&history, HEAD);
+        forged.timestamp += 1;
+        forged.checksum = forged.identity_checksum();
+        let (backup, _) = offer_applied_backup(&history, forged);
+        let offer = |view| {
+            backup.handle_start_view_guarded(
+                PlaneKind::Metadata,
+                make_start_view(view, HEAD, HEAD, backup.primary_index(view), 0).header(),
+                bytemuck::bytes_of(&forged),
+                |op| (op <= HEAD).then(|| at(&history, op)),
+            )
+        };
+
+        assert!(offer(ADOPTED_VIEW).is_none(), "a redelivery is refused too");
+        assert_eq!(
+            backup.applied_log_contradictions(),
+            1,
+            "a redelivered StartView must not be reported again"
+        );
+        let next_view = (ADOPTED_VIEW + 1..=ADOPTED_VIEW + u32::from(backup.replica_count()))
+            .find(|view| backup.primary_index(*view) != BACKUP)
+            .expect("primaryship rotates through every replica");
+        assert!(offer(next_view).is_none());
+        assert_eq!(
+            backup.applied_log_contradictions(),
+            2,
+            "a contradiction in a newer view is reported"
         );
     }
 }

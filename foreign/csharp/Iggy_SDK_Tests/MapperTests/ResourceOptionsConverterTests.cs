@@ -46,17 +46,14 @@ public sealed class ResourceOptionsConverterTests
                               "created_at": 1750000000000000,
                               "name": "topic",
                               "size": "0 B",
-                              "message_expiry": 0,
-                              "compression_algorithm": "none",
-                              "max_topic_size": 0,
                               "messages_count": 0,
                               "partitions_count": 1,
                               "partitions": [],
                               "options": {
-                                "preallocate_segments": { "value": "true", "explicit": true },
-                                "segment_size": { "value": "134217728", "explicit": true },
-                                "messages_required_to_save": { "value": "1024", "explicit": false },
-                                "preallocate_segments": { "value": "false", "explicit": false }
+                                "preallocate_segments": { "value": "true", "kind": "bool", "explicit": true },
+                                "segment_size": { "value": "134217728", "kind": "uint64", "explicit": true },
+                                "messages_required_to_save": { "value": "1024", "kind": "uint32", "explicit": false },
+                                "durability": { "value": "replicated", "kind": "string", "explicit": false }
                               }
                             }
                             """;
@@ -70,36 +67,34 @@ public sealed class ResourceOptionsConverterTests
         Assert.NotNull(topic.DerivedOptions);
 
         Assert.Equal(2, topic.Options.Count);
-        Assert.Equal("true", topic.Options[HeaderKey.FromString("preallocate_segments")].ToString());
-        Assert.Equal("134217728", topic.Options[HeaderKey.FromString("segment_size")].ToString());
+        Assert.True(topic.Options[HeaderKey.FromString("preallocate_segments")].ToBool());
+        Assert.Equal(134217728UL, topic.Options[HeaderKey.FromString("segment_size")].ToUInt64());
 
         Assert.Equal(2, topic.DerivedOptions.Count);
-        Assert.Equal("1024", topic.DerivedOptions[HeaderKey.FromString("messages_required_to_save")].ToString());
-        Assert.Equal("false", topic.DerivedOptions[HeaderKey.FromString("preallocate_segments")].ToString());
+        Assert.Equal(1024U, topic.DerivedOptions[HeaderKey.FromString("messages_required_to_save")].ToUInt32());
+        Assert.Equal("replicated", topic.DerivedOptions[HeaderKey.FromString("durability")].ToString());
     }
 
     [Fact]
-    public void DeserializeTopic_ReadsEveryValueAsAString()
+    public void given_uint64_http_option_when_reading_should_keep_kind()
     {
-        // A byte count arrives rendered, so its canonical Uint64 kind is not recoverable over REST.
         const string json = """
                             {
                               "id": 1,
                               "created_at": 1750000000000000,
                               "name": "topic",
                               "size": "0 B",
-                              "max_topic_size": 0,
                               "messages_count": 0,
                               "partitions_count": 1,
-                              "options": { "segment_size": { "value": "134217728", "explicit": true } }
+                              "options": { "segment_size": { "value": "134217728", "kind": "uint64", "explicit": true } }
                             }
                             """;
 
         var topic = JsonSerializer.Deserialize<TopicResponse>(json, HttpOptions);
 
         var value = Assert.Single(topic!.Options!).Value;
-        Assert.Equal(HeaderKind.String, value.Kind);
-        Assert.Throws<InvalidOperationException>(() => value.ToUInt64());
+        Assert.Equal(HeaderKind.Uint64, value.Kind);
+        Assert.Equal(134217728UL, value.ToUInt64());
     }
 
     [Fact]
@@ -135,7 +130,7 @@ public sealed class ResourceOptionsConverterTests
     [Fact]
     public void Read_RejectsAnEntryWithoutProvenance()
     {
-        const string json = """{ "segment_size": { "value": "134217728" } }""";
+        const string json = """{ "segment_size": { "value": "134217728", "kind": "uint64" } }""";
 
         Assert.Throws<JsonException>(() => JsonSerializer.Deserialize<ResourceOptions>(json, ConverterOptions));
     }
@@ -158,20 +153,18 @@ public sealed class ResourceOptionsConverterTests
                                 "created_at": 1750000000000000,
                                 "name": "first",
                                 "size": "0 B",
-                                "max_topic_size": 0,
                                 "messages_count": 0,
                                 "partitions_count": 1,
-                                "options": { "preallocate_segments": { "value": "true", "explicit": true } }
+                                "options": { "preallocate_segments": { "value": "true", "kind": "bool", "explicit": true } }
                               },
                               {
                                 "id": 2,
                                 "created_at": 1750000000000000,
                                 "name": "second",
                                 "size": "0 B",
-                                "max_topic_size": 0,
                                 "messages_count": 0,
                                 "partitions_count": 1,
-                                "options": { "preallocate_segments": { "value": "false", "explicit": false } }
+                                "options": { "preallocate_segments": { "value": "false", "kind": "bool", "explicit": false } }
                               }
                             ]
                             """;

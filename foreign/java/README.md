@@ -38,7 +38,7 @@ See [Maven Central](https://central.sonatype.com/artifact/org.apache.iggy/iggy) 
 
 ### Snapshot Versions
 
-Development builds of the next release carry the version `0.9.1-SNAPSHOT`. Get them from the ASF snapshot repository:
+Development builds of the next release carry the version `0.9.2-SNAPSHOT`. Get them from the ASF snapshot repository:
 
 **Gradle:**
 
@@ -51,7 +51,7 @@ repositories {
 }
 
 dependencies {
-    implementation 'org.apache.iggy:iggy:0.9.1-SNAPSHOT'
+    implementation 'org.apache.iggy:iggy:0.9.2-SNAPSHOT'
 }
 ```
 
@@ -72,7 +72,7 @@ dependencies {
     <dependency>
         <groupId>org.apache.iggy</groupId>
         <artifactId>iggy</artifactId>
-        <version>0.9.1-SNAPSHOT</version>
+        <version>0.9.2-SNAPSHOT</version>
     </dependency>
 </dependencies>
 ```
@@ -112,7 +112,10 @@ An explicit sign-in ends the automatic sign-in as soon as it starts. It does not
 wait for an automatic Register whose reply is late, and that reply cannot
 replace the new session. If the explicit sign-in succeeds, it becomes the
 automatic sign-in. If it fails, the client does not sign in again as the
-previous user.
+previous user. While the explicit sign-in runs, a call that finds no signed-in
+connection ends with 40 (`UNAUTHENTICATED`) at once.
+
+After a logout, a refused automatic sign-in or a failed explicit sign-in, a call that needs a session fails with 40 (`UNAUTHENTICATED`) until the caller signs in again. Before the first sign-in, such a call fails with `IggyNotConnectedException`.
 
 A committed password change or rename of the signed-in user updates the
 credentials of the automatic sign-in. It also updates the builder credentials
@@ -301,11 +304,73 @@ info.getGitCommit();   // Git commit hash
 info.getUserAgent();   // User-Agent string for HTTP
 ```
 
+### Resource Options
+
+Streams, topics and users carry typed options. Create calls take an options value, updates send only the keys they change, and `reset` returns an updatable key to its server default.
+
+```java
+import org.apache.iggy.identifier.StreamId;
+import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.stream.StreamOptions;
+import org.apache.iggy.system.OptionsScope;
+import org.apache.iggy.topic.CompressionAlgorithm;
+import org.apache.iggy.topic.TopicOptionKey;
+import org.apache.iggy.topic.TopicOptions;
+import org.apache.iggy.topic.TopicUpdate;
+
+import java.math.BigInteger;
+import java.security.SecureRandom;
+
+byte[] key = new byte[32];
+new SecureRandom().nextBytes(key);
+var stream = client.streams().createStream("payments", StreamOptions.builder().encryptionKey(key).build());
+stream.encryptionKeyFingerprint();  // the key itself is never returned
+
+var streamId = StreamId.of(stream.id());
+var topic = client.topics().createTopic(streamId, "orders", 1L, TopicOptions.builder()
+    .compressionAlgorithm(CompressionAlgorithm.Gzip)
+    .messageExpiry(BigInteger.valueOf(3_600_000_000L))
+    .build());
+
+client.topics().updateTopic(streamId, TopicId.of(topic.id()), TopicUpdate.builder()
+    .name("orders-v2")
+    .reset(TopicOptionKey.MESSAGE_EXPIRY)
+    .build());
+
+client.system().describeOptions(OptionsScope.Topic);  // keys, kinds, defaults and flags
+```
+
+The stream key is 32 random bytes. It travels inside the create request over the client's transport, so protecting it on the network is the job of TLS. The server stores it wrapped under its own key and never returns it, reads report only its source and fingerprints. Without a key, a server with encryption enabled generates one for the stream.
+
+The typed builders refuse an update the server would refuse for its shape before anything is sent, with the server's error code. `raw(key, value)` and `rawReset(key)` reach keys this build has no field for, and the server decides whether they are allowed.
+
 ## Exception Handling
 
 The SDK's custom exception types inherit from `IggyException`. When you join a failed future, the cause can come back inside a `CompletionException`. The HTTP client's `close()` method declares `IOException`. Handle these two boundaries as well as the specific SDK errors.
 
+The HTTP client treats 503 `relay_refused` through Apache HttpClient's ordinary
+429/503 retry strategy. That behavior does not provide retained-operation
+recovery over HTTP.
+
+On a multi-node cluster, an HTTP call often reaches a node that is not the
+partition primary. For message sends, polls and consumer offset calls, that
+node relays the call to the primary. The relay needs identical `http.jwt`
+secrets or `cluster.auth` on every node. Without that key material, these calls
+answer 503 with code 58. See
+[HTTP routing and backpressure](../../core/server/README.md#http-routing-and-backpressure).
+
 ### Retained TCP operations
+
+Receipt access follows the server's [session and revocation policy](../../core/server/README.md#sessions-and-retry-receipts).
+An unresolved operation cannot recover its receipt after its original session
+ends, even after a new login or account reactivation. A fresh send can duplicate
+that operation.
+
+Each node counts the messages in its stream, topic and system stats. After a
+successful send, a node that is not the partition primary shows the new count
+only after the next prepare or commit broadcast. When no other write follows,
+this delay is at most `cluster.commit_broadcast_interval` (500 ms by default).
+See [metadata freshness and counters](../../core/server/README.md#metadata-freshness-and-counters).
 
 Replicated mutations serialize within their metadata or partition lane. If a sent mutation's
 outcome cannot be established, `IggyOperationException` carries
@@ -317,6 +382,8 @@ connection, an eviction or a malformed reply leaves it uncertain. After a lost c
 stale-client eviction or a malformed reply, the call replays the same request on a new
 connection within its deadline. If the server refuses to bind the session again, the client
 registers a new session and drops the operation.
+
+A call that loses its connection before it sends its request, or that cannot open one, waits for a connection within its deadline. If no connection carries it by then, the call ends with 58 (`TRANSIENT_NOT_ACCEPTED`).
 
 An eviction and a reply can carry the same status, for example 30 (`STALE_CLIENT`) or 40
 (`UNAUTHENTICATED`). Only the eviction is a lost connection, so the call does not replay a

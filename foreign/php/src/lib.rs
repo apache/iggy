@@ -21,9 +21,11 @@ pub mod durability;
 pub mod error;
 pub mod identifier;
 pub mod message_iterator;
+pub mod options;
 pub mod receive_message;
 pub mod runtime;
 pub mod send_message;
+pub mod sensitive_parameters;
 pub mod stream;
 pub mod topic;
 
@@ -36,6 +38,7 @@ use crate::error::{
     PendingOperationException, TransientException,
 };
 use crate::message_iterator::MessageIterator;
+use crate::options::{OptionSpec, OptionsScope, StreamOptionKey, TopicOptionKey};
 use crate::receive_message::{ConsumerPosition, PartitionContext, PollingStrategy, ReceiveMessage};
 use crate::send_message::{SendMessage, SendMessagesConfirmation, SendMessagesResponse};
 use crate::stream::StreamDetails;
@@ -44,7 +47,11 @@ use crate::topic::TopicDetails;
 #[php_module]
 pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
     module
+        .request_startup_function(sensitive_parameters::mark_sensitive_parameters)
         .enumeration::<durability::Durability>()
+        .enumeration::<StreamOptionKey>()
+        .enumeration::<TopicOptionKey>()
+        .enumeration::<OptionsScope>()
         // Parent classes must be registered before subclasses because ext-php-rs resolves
         // the parent ClassEntry during child registration.
         .class::<IggyException>()
@@ -68,4 +75,5 @@ pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
         .class::<SendMessagesResponse>()
         .class::<StreamDetails>()
         .class::<TopicDetails>()
+        .class::<OptionSpec>()
 }

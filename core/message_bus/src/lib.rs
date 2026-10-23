@@ -271,20 +271,6 @@ impl Default for ReplicaOwnerTable {
 /// that outlive the caller and need independent ownership.
 pub type ReplicaForwardFn = Box<dyn Fn(u8, u16, Frozen<MESSAGE_ALIGN>) -> Result<(), SendError>>;
 
-/// Callback for forwarding a client-bound message to the owning shard.
-///
-/// Provided by the shard layer at bus construction and installed via
-/// [`IggyMessageBus::set_client_forward_fn`]. Arguments:
-/// `(client_id, owning_shard_id, message)`. Returns `Ok(())` on successful
-/// enqueue into the inter-shard channel.
-///
-/// `owning_shard_id` is the value returned by [`client_id_owning_shard`];
-/// the slow path passes it pre-resolved so the closure does not redo the
-/// shift. `client_id` is carried so the receiver can rebuild the
-/// `ShardFrame::Lifecycle`'s `ForwardClientSend { client_id, msg }`
-/// payload.
-pub type ClientForwardFn = Box<dyn Fn(u128, u16, BusMessage) -> Result<(), SendError>>;
-
 /// Callback invoked when a client connection metadata entry is removed.
 pub type ClientConnectionLostFn = std::rc::Rc<dyn Fn(u128)>;
 
@@ -515,31 +501,38 @@ pub struct ReplicaReadMetrics {
 /// / view-change / `Commit`). A `ReplicaForwardFailed` on full
 /// inter-shard inbox is recovered by VSR retransmit and is
 /// informational.
-/// `send_to_client` carries the final Reply payload to the originating
-/// client; it has no in-protocol retransmit. A `ClientForwardFailed` is
-/// terminal: the client never receives the reply and times out.
-/// Operators must size `inbox_capacity` for the worst-case cross-shard
-/// reply burst. Each drop is logged at the drop site via `tracing`;
-/// alert on those logs today. The `frame_drops_total`
-/// `{variant="forward_client_send"}` counter is the structured
-/// complement and becomes scrape-able once a per-shard exporter lands.
-/// The symmetric `{variant="forward_replica_send"}` counter stays
-/// informational only.
+/// `send_to_client` carries a Reply by client id; it has no in-protocol
+/// retransmit. Real socket and HTTP targets require the installation
+/// captured when dispatch admitted the request
+/// ([`ConnectionInstaller::send_to_client_instance`]); a client id alone
+/// cannot prove reply ownership, so [`IggyMessageBus`] refuses every frame
+/// sent by id with `ClientNotFound`, and never forwards it to another shard.
+/// A `Backpressure` from the client's own queue closes that connection, so
+/// the client fails the pending request at once and recovers on a new
+/// connection. A reply sent with
+/// [`ConnectionInstaller::send_to_client_instance_waiting`] waits for room
+/// instead, up to `client_write_stall_timeout`, and then closes the
+/// connection the same way. A request the dispatch host relays to another
+/// shard gets its reply back over the request's own channel, and the shard
+/// holding the connection sends it as above. The
+/// `{variant="forward_replica_send"}` drop counter stays informational
+/// only.
 ///
 /// # Setter install contract
 ///
-/// The three setters below do NOT share one install rule:
+/// The two setters below do NOT share one install rule:
 /// - [`Self::set_connection_lost_fn`] is re-installable (`RefCell`
 ///   slot); it is a test observation hook some setups swap mid-test.
-/// - [`Self::set_replica_forward_fn`] and [`Self::set_client_forward_fn`]
-///   are one-shot (`OnceCell` slot) and panic on a second install;
-///   they are bootstrap-only wiring invariants.
+/// - [`Self::set_replica_forward_fn`] is one-shot (`OnceCell` slot) and
+///   panics on a second install, as a bootstrap-only wiring invariant.
 ///
 /// A bus impl must preserve this divergence - see each method.
 pub trait MessageBus {
     /// Queue one frame for `client_id`. Takes anything that converts into a
     /// [`BusMessage`]: a single `Frozen<MESSAGE_ALIGN>` buffer or an
-    /// already fragmented frame.
+    /// already fragmented frame. [`IggyMessageBus`] refuses every such frame
+    /// with `ClientNotFound`, because socket and HTTP targets need the
+    /// installation captured at admission (see the recovery asymmetry above).
     fn send_to_client(
         &self,
         client_id: u128,
@@ -567,7 +560,7 @@ pub trait MessageBus {
     /// Re-installing is allowed by design - the backing slot is a
     /// `RefCell`, so a second call overwrites the first. This is the
     /// deliberate exception to the install rules of
-    /// [`Self::set_replica_forward_fn`] / [`Self::set_client_forward_fn`]:
+    /// [`Self::set_replica_forward_fn`]:
     /// the notifier is a test observation hook some setups swap
     /// mid-test, not a one-shot bootstrap invariant.
     fn set_connection_lost_fn(&self, f: ConnectionLostFn);
@@ -586,17 +579,6 @@ pub trait MessageBus {
     /// one-shot bootstrap invariant backed by a `OnceCell`, so a
     /// double-install is a wiring bug rather than a supported re-bind.
     fn set_replica_forward_fn(&self, f: ReplicaForwardFn);
-
-    /// Install the client-plane inter-shard forward closure.
-    ///
-    /// No default: every bus must explicitly opt in or stub. Same
-    /// rationale as [`Self::set_replica_forward_fn`].
-    ///
-    /// # Panics
-    ///
-    /// Panics on a second install on the same bus, same one-shot
-    /// `OnceCell` invariant as [`Self::set_replica_forward_fn`].
-    fn set_client_forward_fn(&self, f: ClientForwardFn);
 
     /// Register a detached `compio::runtime::spawn` handle so
     /// [`shutdown`](IggyMessageBus::shutdown) can await it before the
@@ -684,6 +666,12 @@ pub trait MessageBus {
         iggy_common::IggyTimestamp::now().as_micros()
     }
 
+    /// Monotonic time for local deadlines, independent of message-pump progress.
+    /// Simulator overrides must share one timeline across replicas and restarts.
+    fn monotonic_now(&self) -> Instant {
+        Instant::now()
+    }
+
     /// Drain this bus's plaintext replica socket-read counters.
     ///
     /// The provided default returns zeros so the simulator bus and the
@@ -709,10 +697,13 @@ pub trait MessageBus {
 /// - `send_to_*` clones the per-peer `Sender` out of the registry, calls
 ///   `try_send` on it, and returns. No `.await` happens in the body. Drops
 ///   on `Full` (returned as [`SendError::Backpressure`]) are recovered by
-///   VSR retransmission for replica-bound consensus traffic. Client Reply
-///   drops returned as [`SendError::ClientForwardFailed`] have no
-///   retransmit and are terminal; see the trait-level "Recovery
-///   asymmetry" section on [`MessageBus`].
+///   VSR retransmission for replica-bound consensus traffic. A client
+///   reply refused on `Full` also closes that client's connection (see
+///   [`ConnectionRegistry::try_send_to_instance`]). The one exception is
+///   [`Self::send_to_client_instance_waiting`], which waits for room in the
+///   client's queue for up to `client_write_stall_timeout`. A client reply
+///   sent by id alone is refused, as the trait-level "Recovery asymmetry"
+///   section on [`MessageBus`] explains.
 /// - The per-connection writer task batches up to `config.max_batch` messages into
 ///   a single `writev` syscall on the plaintext TCP plane (see
 ///   [`transports::tcp`]).
@@ -732,12 +723,6 @@ pub struct IggyMessageBus {
     /// once at bootstrap via [`Self::set_replica_forward_fn`]; the slow
     /// path reads through [`OnceCell::get`] without a runtime borrow.
     replica_forward_fn: OnceCell<ReplicaForwardFn>,
-    /// Forwards a client-bound message to the shard that owns the client's
-    /// TCP connection (the owning shard is encoded in the top 16 bits of
-    /// the client id). Empty on single-shard setups and tests. Installed
-    /// once at bootstrap via [`Self::set_client_forward_fn`]; the slow
-    /// path reads through [`OnceCell::get`] without a runtime borrow.
-    client_forward_fn: OnceCell<ClientForwardFn>,
     /// Optional disconnect notifier invoked by
     /// `Self::notify_connection_lost` after it CAS-clears the owner
     /// table. Production leaves this unset; tests install a callback to
@@ -747,9 +732,10 @@ pub struct IggyMessageBus {
     /// connection teardown.
     client_connection_lost_fn: RefCell<Option<ClientConnectionLostFn>>,
     /// Per-connection metadata exposed to the caller via
-    /// [`Self::client_meta`]. Populated by the install path on
-    /// successful registry insert; removed on connection teardown.
-    client_meta: RefCell<ahash::AHashMap<u128, Rc<ClientConnMeta>>>,
+    /// [`Self::client_meta`], with the installation it belongs to. Populated
+    /// by the install path on successful registry insert; removed on that
+    /// installation's teardown only, so a late teardown spares a reinstall.
+    client_meta: RefCell<ahash::AHashMap<u128, (InstanceToken, Rc<ClientConnMeta>)>>,
     /// Shard-shared atomic owner table. Stamped by the install path
     /// after a successful registry insert; CAS-cleared by
     /// `Self::notify_connection_lost`. See [`ReplicaOwnerTable`].
@@ -881,7 +867,6 @@ impl IggyMessageBus {
             background_tasks: RefCell::new(Vec::new()),
             config,
             replica_forward_fn: OnceCell::new(),
-            client_forward_fn: OnceCell::new(),
             connection_lost_fn: RefCell::new(None),
             client_connection_lost_fn: RefCell::new(None),
             client_meta: RefCell::new(ahash::AHashMap::new()),
@@ -1029,15 +1014,121 @@ impl IggyMessageBus {
     /// its connection has already been torn down.
     #[must_use]
     pub fn client_meta(&self, client_id: u128) -> Option<Rc<ClientConnMeta>> {
-        self.client_meta.borrow().get(&client_id).map(Rc::clone)
+        self.client_meta
+            .borrow()
+            .get(&client_id)
+            .map(|(_, meta)| Rc::clone(meta))
     }
 
-    pub(crate) fn insert_client_meta(&self, meta: Rc<ClientConnMeta>) {
-        self.client_meta.borrow_mut().insert(meta.client_id, meta);
+    /// The installation currently serving `client_id` on this shard, or
+    /// `None` when no connection is installed under it here.
+    #[must_use]
+    pub fn client_instance(&self, client_id: u128) -> Option<InstanceToken> {
+        self.clients.instance(client_id)
     }
 
-    pub(crate) fn remove_client_meta(&self, client_id: u128) {
-        if self.client_meta.borrow_mut().remove(&client_id).is_some() {
+    /// [`MessageBus::send_to_client`] for the installation `instance` names,
+    /// as [`Self::client_instance`] captured it on this bus.
+    ///
+    /// A reply that outlived its connection reports `ClientNotFound` instead
+    /// of reaching a later connection under the same id, and a full queue
+    /// closes only the installation the reply belongs to. `None` means no
+    /// connection was installed at capture, so nothing can take the reply.
+    /// Never forwarded: an installation exists only on the shard that owns
+    /// the connection.
+    ///
+    /// # Errors
+    ///
+    /// The local-path errors of [`MessageBus::send_to_client`].
+    pub fn send_to_client_instance(
+        &self,
+        client_id: u128,
+        instance: Option<InstanceToken>,
+        message: BusMessage,
+    ) -> Result<(), SendError> {
+        let instance = self.reply_instance(client_id, instance)?;
+        let route = self
+            .clients
+            .try_send_to_instance(client_id, instance, message);
+        self.finish_local_reply(client_id, route)
+    }
+
+    /// [`Self::send_to_client_instance`] that waits for room in a full queue
+    /// instead of closing the connection. Unlike every other send, it yields.
+    /// A queue that stays full for `client_write_stall_timeout` closes the
+    /// connection, because its client stopped reading.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::send_to_client_instance`]. `Backpressure` means
+    /// the wait stalled and the connection was closed.
+    #[allow(clippy::future_not_send)]
+    pub async fn send_to_client_instance_waiting(
+        &self,
+        client_id: u128,
+        instance: Option<InstanceToken>,
+        message: BusMessage,
+    ) -> Result<(), SendError> {
+        let instance = self.reply_instance(client_id, instance)?;
+        let route = self
+            .clients
+            .send_to_instance(
+                client_id,
+                instance,
+                message,
+                self.config.client_write_stall_timeout,
+            )
+            .await;
+        self.finish_local_reply(client_id, route)
+    }
+
+    /// The installation a reply goes to, while the bus still sends.
+    fn reply_instance(
+        &self,
+        client_id: u128,
+        instance: Option<InstanceToken>,
+    ) -> Result<InstanceToken, SendError> {
+        if self.is_shutting_down() {
+            return Err(SendError::BusShuttingDown);
+        }
+        instance.ok_or(SendError::ClientNotFound(client_id))
+    }
+
+    /// Map a socket send onto the bus error, or fire the in-process waiter
+    /// of the reply's request.
+    fn finish_local_reply(&self, client_id: u128, route: ReplyRoute) -> Result<(), SendError> {
+        match route {
+            ReplyRoute::Delivered(send_result) => send_result.map_err(map_try_send_err),
+            ReplyRoute::InProcess(message) => {
+                let request = reply_request_id(&message);
+                self.clients
+                    .fire_in_process(client_id, request, message)
+                    .map_err(|_| SendError::ClientNotFound(client_id))
+            }
+            ReplyRoute::NoSlot(_message) => Err(SendError::ClientNotFound(client_id)),
+            ReplyRoute::Stalled => Err(SendError::Backpressure),
+        }
+    }
+
+    pub(crate) fn insert_client_meta(&self, meta: Rc<ClientConnMeta>, instance: InstanceToken) {
+        self.client_meta
+            .borrow_mut()
+            .insert(meta.client_id, (instance, meta));
+    }
+
+    /// Remove the metadata of the installation `instance` names and report
+    /// its connection lost. A no-op once a reinstall holds `client_id`: the
+    /// metadata, and the session the dispatch host keys by that id, belong
+    /// to the reinstall.
+    pub(crate) fn remove_client_meta(&self, client_id: u128, instance: InstanceToken) {
+        let removed = {
+            let mut metas = self.client_meta.borrow_mut();
+            let owned = metas
+                .get(&client_id)
+                .is_some_and(|(token, _)| *token == instance);
+            owned && metas.remove(&client_id).is_some()
+        };
+        if removed {
             self.notify_client_connection_lost(client_id);
         }
     }
@@ -1133,25 +1224,6 @@ impl IggyMessageBus {
             .set(f)
             .ok()
             .expect("replica_forward_fn installed twice (bootstrap invariant)");
-    }
-
-    /// Install the client-plane inter-shard forward closure.
-    ///
-    /// Shards invoke this from `send_to_client`'s slow path when the client
-    /// connection lives on a different shard (top 16 bits of `client_id`).
-    ///
-    /// Takes `&self` so it can be called through an `Rc<IggyMessageBus>`
-    /// wrapper. Call sites are bootstrap only.
-    ///
-    /// # Panics
-    ///
-    /// Panics if called more than once on the same bus. Same rationale as
-    /// [`Self::set_replica_forward_fn`].
-    pub fn set_client_forward_fn(&self, f: ClientForwardFn) {
-        self.client_forward_fn
-            .set(f)
-            .ok()
-            .expect("client_forward_fn installed twice (bootstrap invariant)");
     }
 
     /// Get the owning shard for a replica, if any.
@@ -1350,16 +1422,12 @@ impl<T: MessageBus + ?Sized> MessageBus for std::rc::Rc<T> {
         (**self).set_replica_forward_fn(f);
     }
 
-    fn set_client_forward_fn(&self, f: ClientForwardFn) {
-        (**self).set_client_forward_fn(f);
-    }
-
     fn track_background(&self, handle: JoinHandle<()>) {
         (**self).track_background(handle);
     }
 
     // Forward the defaulted methods too. Without this, a `Rc`-wrapped bus that
-    // overrides `sleep`/`spawn`/`realtime_micros` (the simulator's virtual timer,
+    // overrides `sleep`/`spawn`/clock reads (the simulator's virtual timer,
     // spawn queue, and virtual clock) would be silently reverted to the defaults
     // through the wrapper. No-op for production, whose `IggyMessageBus` uses those
     // defaults anyway.
@@ -1375,6 +1443,10 @@ impl<T: MessageBus + ?Sized> MessageBus for std::rc::Rc<T> {
         (**self).realtime_micros()
     }
 
+    fn monotonic_now(&self) -> Instant {
+        (**self).monotonic_now()
+    }
+
     fn take_replica_read_stats(&self) -> ReplicaReadMetrics {
         (**self).take_replica_read_stats()
     }
@@ -1385,38 +1457,12 @@ impl MessageBus for IggyMessageBus {
     async fn send_to_client(
         &self,
         client_id: u128,
-        message: impl Into<BusMessage>,
+        _message: impl Into<BusMessage>,
     ) -> Result<(), SendError> {
         if self.is_shutting_down() {
             return Err(SendError::BusShuttingDown);
         }
-        let message = message.into();
-        // Owning shard is encoded in the top 16 bits of client_id.
-        let owning_shard = client_id_owning_shard(client_id);
-        if owning_shard == self.shard_id {
-            // Route by the entry's reply target. Socket is the unchanged
-            // fast path and never decodes. InProcess resolves the waiting
-            // request id from the reply header and fires its oneshot; that
-            // decode stays off the socket path. No slot surfaces
-            // ClientNotFound (prior behaviour: SendError did not preserve
-            // the payload either).
-            return match self.clients.try_send_or_return(client_id, message) {
-                ReplyRoute::Delivered(send_result) => send_result.map_err(map_try_send_err),
-                ReplyRoute::InProcess(message) => {
-                    let request = reply_request_id(&message);
-                    self.clients
-                        .fire_in_process(client_id, request, message)
-                        .map_err(|_| SendError::ClientNotFound(client_id))
-                }
-                ReplyRoute::NoSlot(_message) => Err(SendError::ClientNotFound(client_id)),
-            };
-        }
-        let forward = self
-            .client_forward_fn
-            .get()
-            .ok_or(SendError::ClientRouteMissing(client_id))?;
-        forward(client_id, owning_shard, message)
-            .map_err(|_| SendError::ClientForwardFailed(client_id))
+        Err(SendError::ClientNotFound(client_id))
     }
 
     async fn send_to_replica(
@@ -1467,10 +1513,6 @@ impl MessageBus for IggyMessageBus {
 
     fn set_replica_forward_fn(&self, f: ReplicaForwardFn) {
         Self::set_replica_forward_fn(self, f);
-    }
-
-    fn set_client_forward_fn(&self, f: ClientForwardFn) {
-        Self::set_client_forward_fn(self, f);
     }
 
     fn track_background(&self, handle: JoinHandle<()>) {
@@ -1581,29 +1623,6 @@ mod tests {
 
     #[compio::test]
     #[allow(clippy::future_not_send)]
-    async fn send_to_client_slow_path_forwards_to_owning_shard() {
-        // Bus on shard 5; client id encodes owning shard = 7.
-        let bus = IggyMessageBus::new(5);
-        let captured: std::rc::Rc<RefCell<Option<u16>>> = std::rc::Rc::new(RefCell::new(None));
-        let captured_clone = captured.clone();
-        let client_id = (7u128 << 112) | 0x2a;
-        let captured_id: std::rc::Rc<RefCell<Option<u128>>> = std::rc::Rc::new(RefCell::new(None));
-        let captured_id_clone = captured_id.clone();
-        bus.set_client_forward_fn(Box::new(move |id, target, _msg| {
-            *captured_id_clone.borrow_mut() = Some(id);
-            *captured_clone.borrow_mut() = Some(target);
-            Ok(())
-        }));
-
-        bus.send_to_client(client_id, dummy_message().into_frozen())
-            .await
-            .expect("forward_fn should accept");
-        assert_eq!(*captured.borrow(), Some(7));
-        assert_eq!(*captured_id.borrow(), Some(client_id));
-    }
-
-    #[compio::test]
-    #[allow(clippy::future_not_send)]
     async fn send_to_client_fast_path_hits_local_when_owning_shard_matches() {
         // shard_id == top-16-bits => fast path, registry miss => ClientNotFound
         let bus = IggyMessageBus::new(3);
@@ -1624,11 +1643,11 @@ mod tests {
         })
     }
 
-    /// Full in-process seam: entry + slot installed, `send_to_client`
-    /// resolves the request id from the reply header and fires the oneshot.
+    /// An HTTP reply needs its captured installation as well as the request
+    /// id. A raw client id must leave the legitimate waiter untouched.
     #[compio::test]
     #[allow(clippy::future_not_send)]
-    async fn send_to_client_in_process_fires_matching_reply_slot() {
+    async fn send_to_client_instance_in_process_fires_matching_reply_slot() {
         let bus = IggyMessageBus::new(0);
         let client_id = 1u128;
         bus.clients()
@@ -1639,8 +1658,12 @@ mod tests {
             .install_reply_slot(client_id, 42)
             .expect("slot installs");
 
-        bus.send_to_client(client_id, reply_message(42).into_generic().into_frozen())
-            .await
+        let message = reply_message(42).into_generic().into_frozen();
+        assert!(matches!(
+            bus.send_to_client(client_id, message.clone()).await,
+            Err(SendError::ClientNotFound(_))
+        ));
+        bus.send_to_client_instance(client_id, bus.client_instance(client_id), message.into())
             .expect("in-process delivery");
 
         let received = reply_rx.await.expect("reply delivered");
@@ -1651,7 +1674,7 @@ mod tests {
     /// removed its slot): shed as `ClientNotFound`, nothing panics.
     #[compio::test]
     #[allow(clippy::future_not_send)]
-    async fn send_to_client_in_process_sheds_reply_without_waiter() {
+    async fn send_to_client_instance_in_process_sheds_reply_without_waiter() {
         let bus = IggyMessageBus::new(0);
         let client_id = 1u128;
         bus.clients()
@@ -1659,23 +1682,82 @@ mod tests {
             .expect("fresh key");
 
         let err = bus
-            .send_to_client(client_id, reply_message(42).into_generic().into_frozen())
-            .await
+            .send_to_client_instance(
+                client_id,
+                bus.client_instance(client_id),
+                reply_message(42).into_generic().into_frozen().into(),
+            )
             .unwrap_err();
         assert!(matches!(err, SendError::ClientNotFound(_)));
     }
 
+    /// A socket takes only replies addressed to its installation. A reply by
+    /// client id carries the id a request header names, which a client picks
+    /// when it registers, so it must neither reach a socket installed under
+    /// that id nor close it on a full queue.
     #[compio::test]
     #[allow(clippy::future_not_send)]
-    async fn send_to_client_returns_route_missing_when_remote_and_no_forward_fn() {
-        // shard_id != top-16-bits and no forward_fn installed.
+    async fn given_socket_client_when_replying_by_client_id_should_neither_deliver_nor_close() {
+        const STALLED_QUEUE_CAPACITY: usize = 1;
+        let bus = IggyMessageBus::new(0);
+        let client_id = 0x2a_u128;
+        let (sender, queue) = async_channel::bounded(STALLED_QUEUE_CAPACITY);
+        let (conn_shutdown, conn_token) = Shutdown::new();
+        let writer_token = conn_token.clone();
+        let writer = compio::runtime::spawn(async move { writer_token.wait().await });
+        let reader_token = conn_token.clone();
+        let reader = compio::runtime::spawn(async move { reader_token.wait().await });
+        let instance = bus
+            .clients()
+            .insert(client_id, sender, writer, reader, conn_shutdown)
+            .expect("the client id is free");
+
+        let by_id = bus
+            .send_to_client(client_id, dummy_message().into_frozen())
+            .await;
+        assert!(matches!(by_id, Err(SendError::ClientNotFound(_))));
+        assert!(queue.is_empty(), "a reply by id must not reach a socket");
+
+        bus.send_to_client_instance(
+            client_id,
+            Some(instance),
+            dummy_message().into_frozen().into(),
+        )
+        .expect("a reply addressed to the installation is delivered");
+        let by_id = bus
+            .send_to_client(client_id, dummy_message().into_frozen())
+            .await;
+        assert!(matches!(by_id, Err(SendError::ClientNotFound(_))));
+        assert!(
+            !conn_token.is_triggered(),
+            "a reply by id must not close a socket whose queue is full"
+        );
+
+        let refused = bus.send_to_client_instance(
+            client_id,
+            Some(instance),
+            dummy_message().into_frozen().into(),
+        );
+        assert!(matches!(refused, Err(SendError::Backpressure)));
+        assert!(
+            conn_token.is_triggered(),
+            "a full queue still closes the installation the reply belongs to"
+        );
+    }
+
+    /// The owning shard refuses a frame without its installation too, so a
+    /// by-id frame for a client homed elsewhere is refused here, not forwarded.
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
+    async fn given_client_homed_on_another_shard_when_sending_by_id_should_refuse_without_forwarding()
+     {
         let bus = IggyMessageBus::new(0);
         let client_id = (9u128 << 112) | 1;
         let err = bus
             .send_to_client(client_id, dummy_message().into_frozen())
             .await
             .unwrap_err();
-        assert!(matches!(err, SendError::ClientRouteMissing(_)));
+        assert!(matches!(err, SendError::ClientNotFound(id) if id == client_id));
     }
 
     #[compio::test]
