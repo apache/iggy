@@ -23,7 +23,7 @@ use rumqttc_v5::mqttbytes::v5::PublishProperties;
 use serde::Deserialize;
 use std::sync::Arc;
 
-use crate::MqttProtocol;
+use crate::{MqttProtocol, driver};
 
 /// Header used by the MQTT source to preserve the original broker topic.
 const MQTT_TOPIC_HEADER: &str = "mqtt.topic";
@@ -48,6 +48,13 @@ pub struct PreparedPublication {
     pub payload: Bytes,
     pub packet_size: usize,
     pub properties: Option<PublishProperties>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PublicationOptions {
+    pub(crate) protocol: MqttProtocol,
+    pub(crate) qos: u8,
+    pub(crate) retain: bool,
 }
 
 #[derive(Debug)]
@@ -165,10 +172,6 @@ fn validate_publish_topic_value(topic: &str, field: &str) -> Result<(), String> 
     Ok(())
 }
 
-fn validate_response_topic_value(topic: &str, field: &str) -> Result<(), String> {
-    validate_topic_value(topic, field)
-}
-
 fn validate_topic_value(topic: &str, field: &str) -> Result<(), String> {
     if topic.trim().is_empty() {
         return Err(format!("{field} must not be empty"));
@@ -242,7 +245,11 @@ pub fn prepare_publication(
         batch_topic.as_ref(),
         topic_template,
         fallback_topic,
-        protocol,
+        PublicationOptions {
+            protocol,
+            qos: 1,
+            retain: false,
+        },
     )
 }
 
@@ -253,7 +260,7 @@ pub fn prepare_publication_with_batch_topic(
     batch_topic: Option<&Arc<String>>,
     topic_template: Option<&str>,
     fallback_topic: Option<&str>,
-    protocol: MqttProtocol,
+    options: PublicationOptions,
 ) -> Result<PreparedPublication, Error> {
     // Routing is explicit rather than a precedence chain: static and template
     // modes treat the Iggy message as opaque, while dynamic mode opts into
@@ -266,26 +273,40 @@ pub fn prepare_publication_with_batch_topic(
             let topic = batch_topic.ok_or_else(|| {
                 Error::InvalidConfigValue("missing static or template batch topic".to_string())
             })?;
-            Ok(PreparedPublication {
+            let mut publication = PreparedPublication {
                 offset,
                 topic: PublicationTopic::Shared(Arc::clone(topic)),
                 payload: message.payload.try_into_vec()?.into(),
                 packet_size: 0,
                 properties: None,
-            })
+            };
+            publication.packet_size = driver::publication_packet_size(
+                &publication,
+                options.protocol,
+                options.qos,
+                options.retain,
+            );
+            Ok(publication)
         }
         TopicMode::Dynamic => {
             let (topic, payload, properties) =
-                prepare_dynamic(message, metadata, fallback, protocol)?;
+                prepare_dynamic(message, metadata, fallback, options.protocol)?;
             validate_topic(&topic, "resolved topic")
                 .map_err(|error| Error::InvalidRecordValue(error.to_string()))?;
-            Ok(PreparedPublication {
+            let mut publication = PreparedPublication {
                 offset,
                 topic: PublicationTopic::Owned(topic),
                 payload,
                 packet_size: 0,
                 properties,
-            })
+            };
+            publication.packet_size = driver::publication_packet_size(
+                &publication,
+                options.protocol,
+                options.qos,
+                options.retain,
+            );
+            Ok(publication)
         }
     }
 }
@@ -384,7 +405,7 @@ fn prepare_publish_properties(
         ));
     }
     if let Some(response_topic) = properties.response_topic.as_deref() {
-        validate_response_topic_value(response_topic, "MQTT envelope response_topic")
+        validate_topic_value(response_topic, "MQTT envelope response_topic")
             .map_err(Error::InvalidRecordValue)?;
     }
     if let Some(content_type) = properties.content_type.as_deref() {
