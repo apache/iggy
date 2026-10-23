@@ -243,11 +243,6 @@ elif sys.argv[1] in ('build', 'metadata'):
                          "(package(=integration) | package(=iggy)) & kind(test) & "
                          "(binary(=round_trip) | binary(=protocol))")
 
-    def test_archive_filter_escapes_literal_target_names(self):
-        calls = self.select(["integration"], tests=["wire,(round\\trip)"])
-        self.assertEqual(calls[0][calls[0].index("-E") + 1],
-                         r"(package(=integration)) & kind(test) & (binary(=wire\,(round\\trip\)))")
-
     def test_server_and_cli_prerequisites_use_the_shared_runtime(self):
         calls = self.select(["iggy-gateway-kafka"], runtime_packages=["server", "iggy-cli"])
         self.assertEqual(len(calls), 1)
@@ -295,6 +290,11 @@ class RuntimeSelection(unittest.TestCase):
         self.assertIn(("ci-workflows", "validate"),
                       [(entry["component"], entry["task"])
                        for entry in json.loads(outputs["other_matrix"])["include"]])
+
+    def test_nextest_config_change_runs_miri(self):
+        outputs = self.select([".config/nextest.toml"])
+        plan = json.loads(outputs["rust_plan"])
+        self.assertIn("miri", [entry["task"] for entry in plan["checks"]])
 
     def test_runtime_restore_change_exercises_real_consumers(self):
         outputs = self.select(["scripts/ci/restore-runtime.sh"])

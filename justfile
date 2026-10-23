@@ -73,7 +73,7 @@ clean-test-containers:
   {{reap_test_containers}}
 
 # Run Miri (UB detector) on the unsafe-heavy crates that don't pull
-# tokio/compio. Mirrors the `miri` task in CI. Pinned to the same nightly
+# tokio/compio. Uses the same crates, flags and pinned nightly
 # as `.github/actions/rust/pre-merge/action.yml` so local runs don't drift
 # from CI on the next nightly bump - keep these two dates in sync.
 # Requires:

@@ -68,17 +68,9 @@ runs:
       run: |
         TIMEFORMAT='Java build: %3R seconds'
         time ./gradlew build -x test -x checkstyleMain -x checkstyleTest -x spotlessCheck
-        BUILD_EXIT_CODE=$?
-
-        # List artifacts only if build succeeded
-        if [ $BUILD_EXIT_CODE -eq 0 ]; then
-          echo ""
-          echo "Build artifacts:"
-          find . -path "*/build/libs/*.jar" -type f 2>/dev/null | head -20 || echo "No jar artifacts found in build/libs directories"
-        fi
-
-        # Exit with build exit code
-        exit $BUILD_EXIT_CODE
+        echo ""
+        echo "Build artifacts:"
+        find . -path "*/build/libs/*.jar" -type f 2>/dev/null | head -20 || echo "No jar artifacts found in build/libs directories"
 
     - name: Download runtime binaries
       if: inputs.task == 'test'

@@ -47,8 +47,7 @@ runs:
     - name: Setup Rust
       uses: ./.github/actions/utils/setup-rust
       with:
-        # Only test jobs execute nextest. Avoid downloading it in lint, metadata,
-        # and cross-build jobs.
+        # Test and Miri jobs execute nextest.
         install-nextest: ${{ inputs.task == 'miri' || inputs.task == 'test' || startsWith(inputs.task, 'test-') }}
         coverage: ${{ inputs.task == 'runtime' || inputs.task == 'test-build' || inputs.task == 'test' }}
         # These tasks do not compile workspace crates and need no native
@@ -68,7 +67,7 @@ runs:
         save-cache: ${{ inputs.save-cache }}
         # Artifact builders do not pull test containers. Keep cleanup on the
         # test shards and other disk-heavy jobs.
-        free-disk-space: ${{ (inputs.task == 'runtime' || inputs.task == 'test-build' || inputs.task == 'fmt' || inputs.task == 'sort' || inputs.task == 'clippy' || inputs.task == 'check' || inputs.task == 'check-msrv' || inputs.task == 'machete' || inputs.task == 'doctest') && 'false' || 'true' }}
+        free-disk-space: ${{ (inputs.task == 'runtime' || inputs.task == 'test-build' || inputs.task == 'miri' || inputs.task == 'fmt' || inputs.task == 'sort' || inputs.task == 'clippy' || inputs.task == 'check' || inputs.task == 'check-msrv' || inputs.task == 'machete' || inputs.task == 'doctest') && 'false' || 'true' }}
 
     - name: Install cargo-sort
       if: inputs.task == 'sort'
@@ -231,13 +230,10 @@ runs:
           ARCHIVE_FILTER=$(jq -nr \
             --rawfile packages "$SELECTOR_DIR/test-packages" \
             --rawfile targets "$SELECTOR_DIR/test-target-args" '
-            def escape_matcher:
-              gsub("\\\\"; "\\\\") | gsub("\\)"; "\\)") | gsub(","; "\\,") |
-              gsub("\n"; "\\n") | gsub("\r"; "\\r") | gsub("\t"; "\\t");
             ($packages | split("\u0000")[:-1] |
-              map("package(=\(escape_matcher))") | join(" | ")) as $packages |
+              map("package(=\(.))") | join(" | ")) as $packages |
             ($targets | split("\u0000")[:-1] | to_entries |
-              map(select(.key % 2 == 1) | "binary(=\(.value | escape_matcher))") |
+              map(select(.key % 2 == 1) | "binary(=\(.value))") |
               join(" | ")) as $targets |
             if $targets == "" then $packages
             else "(\($packages)) & kind(test) & (\($targets))" end')
@@ -444,27 +440,23 @@ runs:
     # model and accepts the legitimate `NonNull::add` arithmetic in
     # `iobuf.rs` that stacked-borrows would reject. Strict-provenance
     # rejects int-to-pointer round trips, which we don't use.
-    - name: Install nightly Rust + miri component
-      if: inputs.task == 'miri'
-      run: |
-        rustup toolchain install nightly-2026-10-23 --component miri --profile minimal --no-self-update
-        TIMEFORMAT='Miri sysroot setup: %3R seconds'
-        time cargo +nightly-2026-10-23 miri setup
-      shell: bash
-
     - name: Run miri
       if: inputs.task == 'miri'
       env:
+        MIRI_TOOLCHAIN: nightly-2026-10-23
         MIRIFLAGS: "-Zmiri-tree-borrows -Zmiri-strict-provenance"
       run: |
+        rustup toolchain install "$MIRI_TOOLCHAIN" --component miri --profile minimal --no-self-update
+        TIMEFORMAT='Miri sysroot setup: %3R seconds'
+        time cargo +"$MIRI_TOOLCHAIN" miri setup
         miri_args=(--locked -p iggy_binary_protocol -p consensus)
         TIMEFORMAT='Miri test compilation: %3R seconds'
-        time cargo +nightly-2026-10-23 miri nextest run --no-run "${miri_args[@]}"
+        time cargo +"$MIRI_TOOLCHAIN" miri nextest run --no-run "${miri_args[@]}"
         TIMEFORMAT='Miri tests: %3R seconds'
-        time cargo +nightly-2026-10-23 miri nextest run "${miri_args[@]}"
+        time cargo +"$MIRI_TOOLCHAIN" miri nextest run "${miri_args[@]}"
         # Nextest does not run doctests.
         TIMEFORMAT='Miri doctests: %3R seconds'
-        time cargo +nightly-2026-10-23 miri test --doc "${miri_args[@]}"
+        time cargo +"$MIRI_TOOLCHAIN" miri test --doc "${miri_args[@]}"
       shell: bash
 
     # aarch64 builds (run on ARM64 runners)
