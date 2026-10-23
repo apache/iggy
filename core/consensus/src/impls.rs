@@ -8191,6 +8191,8 @@ mod recovery_election_tests {
     use iggy_binary_protocol::{HEADER_SIZE, Operation};
 
     const REPLICA_COUNT: u8 = 3;
+    /// Backups reject a `StartView` whose prepares carry any other cluster.
+    const CLUSTER: u128 = 1;
     /// Primary of `OLD_VIEW`, crashed holding only part of what it committed.
     const RESTARTED_PRIMARY: u8 = 0;
     /// Crashed earlier, behind the committed tail.
@@ -8221,6 +8223,7 @@ mod recovery_election_tests {
         let mut header = PrepareHeader::default();
         for at in 1..=op {
             header = PrepareHeader {
+                cluster: CLUSTER,
                 command: Command::Prepare,
                 operation: Operation::SendMessages,
                 op: at,
@@ -8242,7 +8245,7 @@ mod recovery_election_tests {
     fn restarted(replica: u8, head: u64) -> VsrConsensus<NoopBus, LocalPipeline> {
         let commit = prepare(head).commit;
         let mut consensus = VsrConsensus::new(
-            1,
+            CLUSTER,
             replica,
             REPLICA_COUNT,
             group(),
@@ -8271,7 +8274,7 @@ mod recovery_election_tests {
     /// change its primary's crash started and escalated while nobody else was up.
     fn survivor_in_view_change(plane: PlaneKind) -> VsrConsensus<NoopBus, LocalPipeline> {
         let mut consensus = VsrConsensus::new(
-            1,
+            CLUSTER,
             SURVIVOR,
             REPLICA_COUNT,
             group(),
@@ -8346,7 +8349,7 @@ mod recovery_election_tests {
                 VsrAction::SendStartViewChange { view, group } => {
                     let svc = message(0, |header: &mut StartViewChangeHeader| {
                         header.command = Command::StartViewChange;
-                        header.cluster = 1;
+                        header.cluster = CLUSTER;
                         header.size = u32::try_from(HEADER_SIZE).unwrap();
                         header.replica = from;
                         header.view = *view;
@@ -8366,7 +8369,7 @@ mod recovery_election_tests {
                     let mut dvc =
                         message(suffix.encoded_len(), |header: &mut DoViewChangeHeader| {
                             header.command = Command::DoViewChange;
-                            header.cluster = 1;
+                            header.cluster = CLUSTER;
                             header.size =
                                 u32::try_from(HEADER_SIZE + suffix.encoded_len()).unwrap();
                             header.replica = from;
@@ -8389,7 +8392,7 @@ mod recovery_election_tests {
                 VsrAction::SendRequestStartView { view, group } => {
                     let probe = message(0, |header: &mut RequestStartViewHeader| {
                         header.command = Command::RequestStartView;
-                        header.cluster = 1;
+                        header.cluster = CLUSTER;
                         header.size = u32::try_from(HEADER_SIZE).unwrap();
                         header.replica = from;
                         header.view = *view;
@@ -8409,7 +8412,7 @@ mod recovery_election_tests {
                     let body = suffix.len() * size_of::<PrepareHeader>();
                     let mut start_view = message(body, |header: &mut StartViewHeader| {
                         header.command = Command::StartView;
-                        header.cluster = 1;
+                        header.cluster = CLUSTER;
                         header.size = u32::try_from(HEADER_SIZE + body).unwrap();
                         header.replica = from;
                         header.view = *view;
