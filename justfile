@@ -78,11 +78,11 @@ clean-test-containers:
 # from CI on the next nightly bump - keep these two dates in sync.
 # Requires:
 #
-#   rustup toolchain install nightly-2026-10-02 --component miri
+#   rustup toolchain install nightly-2026-10-23 --component miri
 #
 miri:
   MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-strict-provenance" \
-    cargo +nightly-2026-10-02 miri test -p iggy_binary_protocol -p consensus
+    cargo +nightly-2026-10-23 miri test -p iggy_binary_protocol -p consensus
 
 server *ARGS:
   cargo run --bin iggy-server {{ARGS}}
