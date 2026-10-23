@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::codes::{LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE, LOGOUT_USER_CODE};
+use crate::codes::{
+    CANCEL_DEFERRED_REQUEST_CODE, LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE,
+    LOGOUT_USER_CODE, POLL_MESSAGES_DEFERRED_CODE, WAIT_FOR_MESSAGES_CODE,
+};
 use crate::consensus::{Command, HEADER_SIZE, Operation, RequestHeader};
 use crate::error::WireError;
 use ring::rand::{SecureRandom, SystemRandom};
@@ -42,6 +45,29 @@ pub fn operation_for_code(code: u32) -> Operation {
 }
 
 impl RequestHeader {
+    /// A fire-and-forget cancellation for this deferred request. It must follow
+    /// the original frame on the same connection, so the server sees the request
+    /// queued or admitted when the cancellation arrives.
+    #[must_use]
+    pub fn deferred_cancellation(&self) -> Option<Self> {
+        if self.operation != Operation::NonReplicated
+            || !matches!(
+                u32::from_le_bytes(self.reserved),
+                POLL_MESSAGES_DEFERRED_CODE | WAIT_FOR_MESSAGES_CODE
+            )
+        {
+            return None;
+        }
+        Self::for_request(
+            CANCEL_DEFERRED_REQUEST_CODE,
+            self.client,
+            self.request,
+            self.session,
+            &[],
+        )
+        .ok()
+    }
+
     /// Builds the header a client sends for `code` with `payload`, given the
     /// identity the session assigned: `client`, `request` and `session`.
     ///

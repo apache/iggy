@@ -40,8 +40,8 @@ use bench_report::{
 use iggy::prelude::*;
 
 pub enum TypedBenchmarkProducingConsumer {
-    High(BenchmarkProducingConsumer<HighLevelProducerClient, HighLevelConsumerClient>),
-    Low(BenchmarkProducingConsumer<LowLevelProducerClient, LowLevelConsumerClient>),
+    High(Box<BenchmarkProducingConsumer<HighLevelProducerClient, HighLevelConsumerClient>>),
+    Low(Box<BenchmarkProducingConsumer<LowLevelProducerClient, LowLevelConsumerClient>>),
 }
 impl TypedBenchmarkProducingConsumer {
     #[allow(clippy::too_many_arguments)]
@@ -62,6 +62,7 @@ impl TypedBenchmarkProducingConsumer {
         moving_average_window: u32,
         limit_bytes_per_second: Option<IggyByteSize>,
         polling_kind: PollingKind,
+        poll_options: DeferredPollOptions,
         origin_timestamp_latency_calculation: bool,
         pretty: bool,
     ) -> Self {
@@ -82,6 +83,7 @@ impl TypedBenchmarkProducingConsumer {
             messages_per_batch,
             warmup_time,
             polling_kind,
+            poll_options,
             origin_timestamp_latency_calculation,
             pretty,
         };
@@ -90,7 +92,7 @@ impl TypedBenchmarkProducingConsumer {
             let producer =
                 HighLevelProducerClient::new(client_factory.clone(), producer_config.clone());
             let consumer = HighLevelConsumerClient::new(client_factory, consumer_config.clone());
-            Self::High(BenchmarkProducingConsumer::new(
+            Self::High(Box::new(BenchmarkProducingConsumer::new(
                 producer,
                 consumer,
                 benchmark_kind,
@@ -101,12 +103,12 @@ impl TypedBenchmarkProducingConsumer {
                 limit_bytes_per_second,
                 producer_config,
                 consumer_config,
-            ))
+            )))
         } else {
             let producer =
                 LowLevelProducerClient::new(client_factory.clone(), producer_config.clone());
             let consumer = LowLevelConsumerClient::new(client_factory, consumer_config.clone());
-            Self::Low(BenchmarkProducingConsumer::new(
+            Self::Low(Box::new(BenchmarkProducingConsumer::new(
                 producer,
                 consumer,
                 benchmark_kind,
@@ -117,7 +119,7 @@ impl TypedBenchmarkProducingConsumer {
                 limit_bytes_per_second,
                 producer_config,
                 consumer_config,
-            ))
+            )))
         }
     }
 

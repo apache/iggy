@@ -174,7 +174,7 @@ The source sends 100 records, then continues polling without new messages. Stdou
 
 The format-conversion transforms define no per-key defaults. Every non-optional key shown above must be present, or the configuration fails to deserialize (`schema_path`, `message_type`, `field_mappings`, and `descriptor_set` are optional).
 
-The two `[[streams]]` shapes differ: a source produces to a single `topic` and can tune batching via `batch_length` and `linger_time`, while a sink consumes from a list of `topics` and can additionally set `batch_length`, `poll_interval`, and `consumer_group`.
+The two `[[streams]]` shapes differ. A source produces to a single `topic` and can tune batching with `batch_length` and `linger_time`. A sink consumes from a list of `topics` and can set `batch_length` and `consumer_group`.
 
 Transforms are keyed by type, so one connector configures at most one `proto_convert`.
 

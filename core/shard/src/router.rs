@@ -324,6 +324,7 @@ where
         SB: 'static,
     {
         let _completion_pump = self.poll_completions.pump_guard();
+        let _deferred_pump = self.deferred_polls.pump_guard();
         self.plane.partitions().set_io_notifier(
             self.partition_io.notifier(),
             self.partition_io.limits.bytes_max(),
@@ -367,7 +368,29 @@ where
         // backoff on every pump turn while the shutdown channel is empty.
         let mut stop_signal = std::pin::pin!(stop.recv().fuse());
         let mut fatal: Option<FatalCommit> = None;
+        let deadline_timer = |deadline: Option<u64>| {
+            async move {
+                if let Some(deadline) = deadline {
+                    self.bus
+                        .sleep(std::time::Duration::from_micros(
+                            deadline.saturating_sub(self.bus.monotonic_micros()),
+                        ))
+                        .await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            }
+            .fuse()
+        };
+        let mut armed_deadline = None;
+        let mut deferred_deadline = std::pin::pin!(deadline_timer(None));
         loop {
+            self.service_deferred_polls().await;
+            let next_deadline = self.deferred_polls.earliest_deadline();
+            if next_deadline != armed_deadline {
+                armed_deadline = next_deadline;
+                deferred_deadline.set(deadline_timer(next_deadline));
+            }
             // `select_biased!`, not `select!`: the unbiased macro draws its
             // arm order from a process-random thread-local PRNG, which the
             // deterministic simulator cannot seed. The listed order is the
@@ -408,8 +431,13 @@ where
                     // a quiet shard until the next inbound frame's tail
                     // drain; parked partition frames then never re-dispatch.
                     self.apply_reconcile_ops();
+                    self.deferred_polls.maintenance();
                     consensus_tick.set(rearm_tick());
                     self.process_loopback(&mut loopback_buf).await;
+                }
+                () = deferred_deadline.as_mut() => {
+                    armed_deadline = None;
+                    deferred_deadline.set(deadline_timer(None));
                 }
                 frame = poll_fn(|_| {
                     self.pop_redispatched_frame().map_or(Poll::Pending, Poll::Ready)
@@ -492,6 +520,7 @@ where
                         Err(_) => break,
                     }
                 }
+                () = poll_fn(|context| self.deferred_polls.poll_ready(context)).fuse() => {}
                 () = poll_fn(|context| {
                     self.plane.partitions().register_loopback_waker(context.waker());
                     self.partition_io.register_waker(context.waker());
@@ -509,6 +538,7 @@ where
         }
 
         self.poll_completions.close();
+        self.deferred_polls.close();
 
         // A stop can win the select immediately after a frame fenced a
         // partition, before the next tick observes it. Preserve that fault so
@@ -982,6 +1012,12 @@ where
                 reply,
             } => {
                 self.on_partition_read(namespace, read, reply).await;
+            }
+            LifecycleFrame::ReadinessWait { wait, reply } => {
+                self.admit_readiness_wait(wait, &reply);
+            }
+            LifecycleFrame::ReadinessCancel { waiter } => {
+                self.cancel_readiness_wait(waiter);
             }
             LifecycleFrame::PartitionSubmit {
                 request,

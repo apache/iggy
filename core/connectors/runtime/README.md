@@ -53,6 +53,17 @@ Run `iggy-connectors --list-config-env-vars` to print the supported names and te
 
 Source destination topics must persist every acknowledged batch before the runtime checkpoints the source or invokes its Ack hook. Missing topics are therefore created with `durability = "persisted"` and `messages_required_to_save = 1`. An existing topic must use `durability = "persisted"`; its save threshold may differ because persisted acknowledgments already wait for durable storage.
 
+Sink consumers use long polling. A poll returns when `min_count` messages are
+ready (default 1), when its reply reaches 1 MiB, or when `max_wait` expires
+(default `1s`). Set both on a sink `[[streams]]` entry to batch messages, for
+example `max_wait = "3s"` with `min_count` equal to `batch_length`. `min_count`
+must not exceed `batch_length`. `max_wait` must be above zero and at most 10
+minutes, and the server shortens a wait above its `deferred_poll_max_wait`.
+A configured `poll_interval` is deprecated: the runtime logs a warning and
+ignores it. The server commits the offset of each sink poll when it answers
+the poll, before the plugin consumes the messages. Sinks need a server that
+supports deferred polls (binary commands 106 and 107).
+
 ## State storage
 
 Source plugins can supply optional checkpoint bytes. The runtime stores these opaque bytes using the backend selected by `state.storage`:

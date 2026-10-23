@@ -187,6 +187,10 @@ pub const COMMAND_TABLE: &[CommandMeta] = &[
         "resource.update",
         Operation::UpdateResource,
     ),
+    // Deferred messages
+    CommandMeta::non_replicated(POLL_MESSAGES_DEFERRED_CODE, "message.poll_deferred"),
+    CommandMeta::non_replicated(WAIT_FOR_MESSAGES_CODE, "message.wait"),
+    CommandMeta::non_replicated(CANCEL_DEFERRED_REQUEST_CODE, "message.cancel_deferred"),
 ];
 
 /// Lookup command metadata by command code.
@@ -246,6 +250,9 @@ pub const fn lookup_command(code: u32) -> Option<&'static CommandMeta> {
         BIND_SESSION_CODE => 45,
         GET_PARTITION_ROUTE_CODE => 46,
         UPDATE_RESOURCE_CODE => 47,
+        POLL_MESSAGES_DEFERRED_CODE => 48,
+        WAIT_FOR_MESSAGES_CODE => 49,
+        CANCEL_DEFERRED_REQUEST_CODE => 50,
         _ => return None,
     };
     Some(&COMMAND_TABLE[idx])

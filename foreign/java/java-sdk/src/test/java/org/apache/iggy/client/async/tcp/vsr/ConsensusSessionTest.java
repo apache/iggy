@@ -260,6 +260,138 @@ class ConsensusSessionTest {
     }
 
     @Test
+    void shouldAdmitProducersWhileAnOffsetStoreWaitsForProgressAndRemoveBothCancelledAdmissions() {
+        ConsensusSession session = new ConsensusSession();
+        session.configurePendingOperations(1, VsrHeaders.HEADER_SIZE);
+        session.bind(42);
+        EmbeddedChannel channel = new EmbeddedChannel();
+        var mutation = new ConsensusSession.LaneKey(7, 1);
+        var progress = new ConsensusSession.LaneKey(7, 1, true);
+        long deadline = System.nanoTime() + DEADLINE;
+        try {
+            var poll = session.acquire(progress, false, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop())
+                    .join();
+            var store = session.acquire(progress, true, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop());
+            assertThat(store).isNotDone();
+            var producer = session.acquire(mutation, true, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop());
+            assertThat(producer).isDone();
+
+            poll.complete();
+            var laterProducer = session.acquire(mutation, true, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop());
+            var offsetRead = session.acquire(progress, false, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop());
+            assertThat(store).isNotDone();
+            assertThat(laterProducer).isNotDone();
+            assertThat(offsetRead).isNotDone();
+            producer.join().complete();
+            assertThat(store).isDone();
+            assertThat(laterProducer).isNotDone();
+            assertThat(offsetRead).isNotDone();
+            store.join().complete();
+            laterProducer.join().complete();
+            offsetRead.join().complete();
+
+            var blockedMutation = session.acquire(mutation, true, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop())
+                    .join();
+            var cancelledStore = session.acquire(progress, true, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop());
+            var queuedRead = session.acquire(progress, false, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop());
+            var queuedProducer = session.acquire(mutation, true, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop());
+            assertThat(queuedRead).isNotDone();
+            assertThat(queuedProducer).isNotDone();
+            cancelledStore.cancel(false);
+            assertThat(queuedRead).isDone();
+            queuedRead.join().complete();
+            blockedMutation.complete();
+            queuedProducer.join().complete();
+        } finally {
+            session.reset();
+            channel.finishAndReleaseAll();
+        }
+    }
+
+    @Test
+    void shouldKeepBothOffsetLanesUntilAnAbandonedReplayEnds() {
+        ConsensusSession session = new ConsensusSession();
+        session.configurePendingOperations(1, 2L * VsrHeaders.HEADER_SIZE);
+        session.bind(42);
+        EmbeddedChannel channel = new EmbeddedChannel();
+        var mutation = new ConsensusSession.LaneKey(7, 1);
+        var progress = new ConsensusSession.LaneKey(7, 1, true);
+        long deadline = System.nanoTime() + DEADLINE;
+        try {
+            var store = session.acquire(progress, true, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop())
+                    .join();
+            freezeAndSend(store, 9);
+            store.retain();
+            for (var lane : new ConsensusSession.LaneKey[] {mutation, progress}) {
+                assertOperationError(
+                        session.acquire(lane, lane == mutation, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop()),
+                        IggyErrorCode.LANE_BLOCKED);
+            }
+            assertThat(session.resume(9, deadline, channel.eventLoop()).join()).isSameAs(store);
+            ByteBuf alias = store.frame();
+            session.abandon(9);
+            var poll = session.acquire(progress, false, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop());
+            var send = session.acquire(mutation, true, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop());
+            assertThat(poll).isNotDone();
+            assertThat(send).isNotDone();
+            var independent = session.acquire(
+                    new ConsensusSession.LaneKey(8, 1), true, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop());
+            assertThat(independent).isDone();
+            independent.join().complete();
+            store.complete();
+            poll.join().complete();
+            send.join().complete();
+            assertThat(alias.refCnt()).isPositive();
+            alias.release();
+            store.finishWrite();
+            session.acquire(mutation, true, 2L * VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop())
+                    .join()
+                    .complete();
+        } finally {
+            session.reset();
+            channel.finishAndReleaseAll();
+        }
+    }
+
+    @Test
+    void shouldAllowProgressPastARetainedSendAndReleaseBothOffsetLanesOnReset() {
+        ConsensusSession session = new ConsensusSession();
+        session.bind(42);
+        EmbeddedChannel channel = new EmbeddedChannel();
+        var mutation = new ConsensusSession.LaneKey(7, 1);
+        var progress = new ConsensusSession.LaneKey(7, 1, true);
+        long deadline = System.nanoTime() + DEADLINE;
+        try {
+            var send = session.acquire(mutation, true, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop())
+                    .join();
+            freezeAndSend(send, 9);
+            send.retain();
+            var poll = session.acquire(progress, false, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop());
+            assertThat(poll).isDone();
+            poll.join().complete();
+            assertOperationError(
+                    session.acquire(progress, true, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop()),
+                    IggyErrorCode.LANE_BLOCKED);
+            session.abandon(9);
+            var store = session.acquire(progress, true, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop())
+                    .join();
+            freezeAndSend(store, 10);
+            store.retain();
+            session.reset();
+            session.bind(43);
+            session.acquire(progress, true, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop())
+                    .join()
+                    .complete();
+            session.acquire(mutation, true, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop())
+                    .join()
+                    .complete();
+        } finally {
+            session.reset();
+            channel.finishAndReleaseAll();
+        }
+    }
+
+    @Test
     void shouldPreserveAllUnsignedRequestBitsAndRefuseCounterReuseAcrossReset() throws Exception {
         ConsensusSession session = new ConsensusSession();
         session.bind(42);

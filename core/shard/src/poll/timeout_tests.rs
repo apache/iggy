@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::time::Duration;
@@ -503,12 +503,17 @@ pub type CapturedTask = Pin<Box<dyn Future<Output = ()>>>;
 /// executing their synthetic disk plans.
 #[derive(Clone, Default)]
 pub struct PollTestBus {
+    pub(super) now: Rc<Cell<u64>>,
     next_timeout: Rc<RefCell<Option<oneshot::Receiver<()>>>>,
     pub(crate) spawned_tasks: Rc<RefCell<Vec<CapturedTask>>>,
 }
 
 #[allow(clippy::future_not_send)]
 impl MessageBus for PollTestBus {
+    fn monotonic_micros(&self) -> u64 {
+        self.now.get()
+    }
+
     fn spawn(&self, future: impl Future<Output = ()> + 'static) {
         self.spawned_tasks.borrow_mut().push(Box::pin(future));
     }

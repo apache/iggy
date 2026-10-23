@@ -1,0 +1,867 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+#![allow(clippy::future_not_send)]
+
+use std::time::Duration;
+
+use super::*;
+use consensus::PartitionsHandle;
+use iggy_binary_protocol::requests::partitions::InstallConsumerGroupOwnerRequest;
+use iggy_common::IggyTimestamp;
+use metadata::IggyMetadata;
+use metadata::stm::consumer_group::{ConsumerGroup, ConsumerGroupMember};
+use metadata::stm::stream::{Partition as MetadataPartition, Stream, StreamsInner, Topic};
+use metadata::stm::user::Users;
+use partitions::IggyPartitions;
+use server_common::send_messages::decode_batch_slice;
+use server_common::sharding::{PartitionLocation, ShardId};
+
+use crate::poll::completion::PollCompletionLane;
+use crate::poll::test_support::{PollTestMetadata, install_group_owner, partition_with_messages};
+use crate::poll::timeout_tests::PollTestBus;
+use crate::shards_table::PapayaShardsTable;
+use crate::{
+    LifecycleFrame, PARTITION_READ_TIMEOUT, PartitionConsensusConfig, Receiver, ReplicaTopology,
+    ShardFrame, ShardIdentity, channel, shard_channel,
+};
+
+const DEADLINE: u64 = 100;
+const REQUEST_DEADLINE: u64 = DEADLINE + iggy_common::MIN_DEFERRED_POLL_REPLY_MARGIN_US;
+const CLIENT: u128 = 41;
+fn namespace() -> IggyNamespace {
+    partition_namespace(0)
+}
+
+fn partition_namespace(partition: usize) -> IggyNamespace {
+    IggyNamespace::new(0, 0, partition)
+}
+type TestShard = IggyShard<PollTestBus, (), (), PollTestMetadata, PapayaShardsTable>;
+
+async fn owner(payloads: &[&str]) -> TestShard {
+    owner_of(&[payloads]).await
+}
+
+/// One owner shard with a partition for each entry of `partitions`.
+async fn owner_of(partitions: &[&[&str]]) -> TestShard {
+    let bus = PollTestBus::default();
+    let mut plane = None;
+    let mut topic = Topic::default();
+    let routes = PapayaShardsTable::new();
+    for (id, payloads) in partitions.iter().enumerate() {
+        let namespace = partition_namespace(id);
+        let (partition, config) = partition_with_messages(&bus, namespace, payloads).await;
+        plane
+            .get_or_insert_with(|| IggyPartitions::new(ShardId::new(0), config))
+            .insert(namespace, partition);
+        topic.partitions.push(MetadataPartition::new(
+            id,
+            namespace.inner(),
+            IggyTimestamp::default(),
+            1,
+            0,
+        ));
+        routes.insert(namespace, PartitionLocation::new(ShardId::new(0), 1));
+    }
+    let partitions_plane = plane.expect("fixture requires a partition");
+    let mut inner = StreamsInner::default();
+    let mut stream = Stream::default();
+    let mut group = ConsumerGroup::new(0, Arc::from("group"));
+    let mut member = ConsumerGroupMember::new(0, CLIENT);
+    member.session = Some(1);
+    group.members.insert(member);
+    group.rebalance_members(&topic.partitions, 1, 1);
+    let config = partitions_plane.config().clone();
+    for id in 0..partitions.len() {
+        let assignment = &group.assignments[&id];
+        let pending = assignment.pending.unwrap();
+        let installation = InstallConsumerGroupOwnerRequest {
+            incarnation: assignment.incarnation,
+            group_id: 0,
+            owner: pending.owner,
+            metadata_op: pending.metadata_op,
+        };
+        let partition = partitions_plane
+            .get_mut_by_ns(&partition_namespace(id))
+            .unwrap();
+        let op = install_group_owner(partition, &config, installation).await;
+        assert!(group.complete_revocation(id, &installation, op));
+    }
+    topic.consumer_groups.insert(0, group);
+    stream.topics.insert(topic);
+    inner.items.insert(stream);
+    let users = Users::default();
+    users.ensure_root_user("iggy", "password-hash");
+    let metadata = IggyMetadata::new(
+        None,
+        None,
+        None,
+        None,
+        PollTestMetadata::new((users, (inner.into(), ()))),
+        None,
+    );
+    TestShard::without_inbox(
+        ShardIdentity::new(0, "deferred-test".to_string()),
+        bus.clone(),
+        metadata,
+        partitions_plane,
+        routes,
+        PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 3), bus),
+    )
+}
+
+fn request(owner: &TestShard, count: u32, group: bool, auto_commit: bool) -> DeferredPollRequest {
+    let metadata = owner
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .poll_metadata(namespace(), group.then_some(0), CLIENT)
+        .unwrap();
+    let mut request = DeferredPollRequest::new(
+        if group {
+            PollingConsumer::ConsumerGroup(0, 0)
+        } else {
+            PollingConsumer::Consumer(0, 0)
+        },
+        PollingArgs {
+            kind: PollingKind::Next,
+            value: 0,
+            count,
+            auto_commit,
+        },
+        DeferredPollContext {
+            session: None,
+            metadata,
+            user_id: 0,
+            user_created_at: None,
+            quota: PollQuotaIdentity::Session(CLIENT),
+            primary: false,
+        },
+        iggy_common::DeferredPollOptions {
+            max_wait: DEADLINE.into(),
+            min_count: count,
+            request_timeout: REQUEST_DEADLINE.into(),
+            ..Default::default()
+        },
+    );
+    request.deadline = DEADLINE;
+    request.request_deadline = REQUEST_DEADLINE;
+    request
+}
+
+async fn submit(owner: &TestShard, request: DeferredPollRequest) -> Receiver<PartitionReadReply> {
+    let (reply, replies) = channel(1);
+    owner.admit_deferred_poll(namespace(), request, &reply);
+    owner.service_deferred_polls().await;
+    replies
+}
+
+fn offsets(replies: &Receiver<PartitionReadReply>) -> Vec<u64> {
+    let PartitionReadReply::Poll { fragments, .. } = replies.try_recv().expect("poll completed")
+    else {
+        panic!("poll was rejected");
+    };
+    let bytes: Vec<u8> = fragments
+        .iter()
+        .flat_map(|fragment| fragment.as_slice().iter().copied())
+        .collect();
+    let mut bytes = bytes.as_slice();
+    let mut offsets = Vec::new();
+    while !bytes.is_empty() {
+        let batch = decode_batch_slice(bytes).unwrap();
+        offsets.extend(
+            batch
+                .iter()
+                .map(|message| batch.header.base_offset + u64::from(message.header.offset_delta)),
+        );
+        bytes = &bytes[batch.header.total_size()..];
+    }
+    offsets
+}
+
+fn pending(replies: &Receiver<PartitionReadReply>) {
+    assert!(matches!(
+        replies.try_recv(),
+        Err(crossfire::TryRecvError::Empty)
+    ));
+}
+
+#[compio::test]
+async fn deferred_completion_capacity_is_distinct_from_a_closed_lane() {
+    let owner = owner(&["first"]).await;
+    let lane = PollCompletionLane::new(1, &owner.metrics);
+    let active = lane
+        .try_reserve_deferred(namespace(), 1, owner.deferred_polls.reserve_read().unwrap())
+        .unwrap();
+    assert!(matches!(
+        lane.try_reserve_deferred(namespace(), 2, owner.deferred_polls.reserve_read().unwrap()),
+        Err(IggyError::DeferredPollCapacityExceeded)
+    ));
+    lane.close();
+    assert!(matches!(
+        lane.try_reserve_deferred(namespace(), 3, owner.deferred_polls.reserve_read().unwrap()),
+        Err(IggyError::TransientNotAccepted)
+    ));
+    drop(active);
+    assert_eq!(
+        owner.deferred_polls.inflight_bytes.load(Ordering::Relaxed),
+        0
+    );
+}
+
+#[compio::test]
+async fn resident_poll_completes_while_disk_reads_hold_the_whole_read_budget() {
+    let owner = owner(&["first", "second"]).await;
+    let held: Vec<_> = std::iter::from_fn(|| owner.deferred_polls.reserve_read().ok()).collect();
+    assert!(!held.is_empty());
+    assert!(matches!(
+        owner.deferred_polls.reserve_read(),
+        Err(IggyError::DeferredPollCapacityExceeded)
+    ));
+    let replies = submit(&owner, request(&owner, 2, false, false)).await;
+    assert_eq!(offsets(&replies), [0, 1]);
+}
+
+#[compio::test]
+async fn read_budget_caps_a_resident_reply_after_its_first_message() {
+    let owner = owner(&["first", "second"]).await;
+    owner.set_deferred_poll_config(DeferredPollConfig {
+        max_read_bytes: 1,
+        ..Default::default()
+    });
+    let replies = submit(&owner, request(&owner, 2, false, false)).await;
+    assert_eq!(offsets(&replies), [0]);
+}
+
+#[compio::test]
+async fn full_result_completes_before_deadline() {
+    let owner = owner(&["first", "second"]).await;
+    let replies = submit(&owner, request(&owner, 2, false, false)).await;
+    assert_eq!(offsets(&replies), [0, 1]);
+    assert!(owner.deferred_polls.state.borrow().waiters.is_empty());
+    assert_eq!(
+        owner.deferred_polls.inflight_bytes.load(Ordering::Relaxed),
+        0
+    );
+}
+
+#[compio::test]
+async fn partial_result_waits_until_deadline_without_progress() {
+    for group in [false, true] {
+        let owner = owner(&["first", "second"]).await;
+        let request = request(&owner, 3, group, false);
+        let consumer = request.consumer;
+        let replies = submit(&owner, request).await;
+        pending(&replies);
+        assert_eq!(
+            owner
+                .plane
+                .partitions()
+                .consumer_offset_read(&namespace(), consumer)
+                .unwrap()
+                .0,
+            None
+        );
+        owner.bus.now.set(DEADLINE - 1);
+        owner.service_deferred_polls().await;
+        pending(&replies);
+        owner.bus.now.set(DEADLINE);
+        owner.service_deferred_polls().await;
+        assert_eq!(offsets(&replies), [0, 1]);
+        assert!(
+            owner.bus.spawned_tasks.borrow().is_empty(),
+            "resident expiry does not require IO"
+        );
+        assert!(owner.deferred_polls.state.borrow().deadlines.is_empty());
+    }
+}
+
+#[compio::test]
+async fn readiness_expiry_returns_committed_data_even_after_the_wait() {
+    for arrival in [DEADLINE - 1, DEADLINE, DEADLINE + 1] {
+        let owner = owner(&["first"]).await;
+        owner
+            .plane
+            .partitions()
+            .get_mut_by_ns(&namespace())
+            .unwrap()
+            .set_offset_space_used(false);
+        let replies = submit(&owner, request(&owner, 1, false, true)).await;
+        pending(&replies);
+        owner.bus.now.set(arrival);
+        owner
+            .plane
+            .partitions()
+            .get_mut_by_ns(&namespace())
+            .unwrap()
+            .set_offset_space_used(true);
+        owner.service_deferred_polls().await;
+        assert_eq!(offsets(&replies), vec![0]);
+    }
+}
+
+#[compio::test]
+async fn expired_or_cancelled_waiter_discards_queued_read_without_progress() {
+    for cancel in [false, true] {
+        let owner = owner(&["first"]).await;
+        let request = request(&owner, 2, false, true);
+        let consumer = request.consumer;
+        let replies = submit(&owner, request).await;
+        let id = *owner
+            .deferred_polls
+            .state
+            .borrow()
+            .waiters
+            .keys()
+            .next()
+            .unwrap();
+        let result = owner
+            .plane
+            .partitions()
+            .build_poll_snapshot(
+                &namespace(),
+                consumer,
+                &PollingArgs {
+                    kind: PollingKind::First,
+                    value: 0,
+                    count: 1,
+                    auto_commit: true,
+                },
+            )
+            .unwrap()
+            .execute_resident();
+        // A read dispatched before expiry still owns its byte reservation after cancellation.
+        let reservation = owner.deferred_polls.reserve_read().unwrap();
+        owner
+            .poll_completions
+            .try_reserve_deferred(namespace(), id, reservation)
+            .unwrap()
+            .complete(result);
+        owner.bus.now.set(DEADLINE);
+        if cancel {
+            drop(replies);
+        } else {
+            owner.service_deferred_polls().await;
+            assert_eq!(offsets(&replies), [0]);
+        }
+        assert!(owner.deferred_polls.inflight_bytes.load(Ordering::Relaxed) > 0);
+        let completion = owner.poll_completions.try_recv().unwrap();
+        assert!(owner.deferred_polls.inflight_bytes.load(Ordering::Relaxed) > 0);
+        owner.on_poll_completed(*completion).await;
+        assert!(owner.deferred_polls.state.borrow().waiters.is_empty());
+        assert_eq!(
+            owner.deferred_polls.inflight_bytes.load(Ordering::Relaxed),
+            0
+        );
+        if cancel {
+            assert_eq!(
+                owner
+                    .plane
+                    .partitions()
+                    .consumer_offset_read(&namespace(), consumer)
+                    .unwrap()
+                    .0,
+                None
+            );
+        }
+    }
+}
+
+#[compio::test]
+async fn replacement_history_invalidates_pending_manual_poll() {
+    let owner = owner(&["old"]).await;
+    let replies = submit(&owner, request(&owner, 2, false, false)).await;
+    let (replacement, _) = partition_with_messages(&owner.bus, namespace(), &["new"]).await;
+    owner.plane.partitions().insert(namespace(), replacement);
+    owner.bus.now.set(DEADLINE);
+    owner.service_deferred_polls().await;
+    assert!(matches!(
+        replies.try_recv(),
+        Ok(PartitionReadReply::Rejected(
+            IggyError::TransientNotAccepted
+        ))
+    ));
+}
+
+#[compio::test]
+async fn full_shard_quota_rejects_another_session_without_poll_progress() {
+    let owner = owner(&["first"]).await;
+    owner.set_deferred_poll_config(DeferredPollConfig {
+        max_pending: 1,
+        max_pending_per_session: 1,
+        ..Default::default()
+    });
+    let first = submit(&owner, request(&owner, 2, false, false)).await;
+    let mut other = request(&owner, 2, false, true);
+    other.context.quota = PollQuotaIdentity::Session(CLIENT + 1);
+    let consumer = other.consumer;
+    let refused = submit(&owner, other).await;
+    assert!(matches!(
+        refused.try_recv(),
+        Ok(PartitionReadReply::Rejected(
+            IggyError::DeferredPollCapacityExceeded
+        ))
+    ));
+    assert_eq!(
+        owner
+            .plane
+            .partitions()
+            .consumer_offset_read(&namespace(), consumer)
+            .unwrap()
+            .0,
+        None
+    );
+    drop(first);
+    owner.deferred_polls.maintenance();
+    owner.service_deferred_polls().await;
+    assert_released(&owner);
+}
+
+#[compio::test]
+async fn session_quota_and_cancellation_release_all_indices() {
+    let owner = owner(&["first"]).await;
+    owner.set_deferred_poll_config(DeferredPollConfig {
+        max_pending_per_session: 1,
+        ..Default::default()
+    });
+    let first = submit(&owner, request(&owner, 2, false, false)).await;
+    let second = submit(&owner, request(&owner, 2, false, false)).await;
+    assert!(matches!(
+        second.try_recv(),
+        Ok(PartitionReadReply::Rejected(
+            IggyError::DeferredPollCapacityExceeded
+        ))
+    ));
+    drop(first);
+    owner.deferred_polls.maintenance();
+    owner.service_deferred_polls().await;
+    let state = owner.deferred_polls.state.borrow();
+    assert!(state.waiters.is_empty());
+    assert!(state.sessions.is_empty());
+    assert!(state.partitions.is_empty());
+    assert!(state.deadlines.is_empty());
+    assert!(state.ready.is_empty());
+}
+
+#[compio::test]
+async fn readiness_minimum_is_independent_of_batch_count() {
+    let owner = owner(&["available"]).await;
+    let mut request = request(&owner, 100, false, false);
+    request.options.min_count = 1;
+    let replies = submit(&owner, request).await;
+    assert_eq!(offsets(&replies), [0]);
+}
+
+#[compio::test]
+async fn read_crossing_readiness_deadline_finishes_within_request_budget() {
+    for completed_at in [DEADLINE + 1, REQUEST_DEADLINE] {
+        let owner = owner(&["read-from-snapshot"]).await;
+        let request = request(&owner, 2, false, true);
+        let consumer = request.consumer;
+        let replies = submit(&owner, request).await;
+        let id = *owner
+            .deferred_polls
+            .state
+            .borrow()
+            .waiters
+            .keys()
+            .next()
+            .unwrap();
+        owner
+            .deferred_polls
+            .state
+            .borrow_mut()
+            .waiters
+            .get_mut(&id)
+            .unwrap()
+            .running = true;
+        let result = owner
+            .plane
+            .partitions()
+            .build_poll_snapshot(
+                &namespace(),
+                consumer,
+                &PollingArgs {
+                    kind: PollingKind::First,
+                    value: 0,
+                    count: 1,
+                    auto_commit: true,
+                },
+            )
+            .unwrap()
+            .execute_resident();
+        let reservation = owner.deferred_polls.reserve_read().unwrap();
+        let completion = owner
+            .poll_completions
+            .try_reserve_deferred(namespace(), id, reservation)
+            .unwrap();
+        owner.bus.now.set(DEADLINE);
+        owner.service_deferred_polls().await;
+        pending(&replies);
+        owner.bus.now.set(completed_at);
+        completion.complete(result);
+        let completion = owner.poll_completions.try_recv().unwrap();
+        owner.on_poll_completed(*completion).await;
+        if completed_at < REQUEST_DEADLINE {
+            assert_eq!(offsets(&replies), [0]);
+        } else {
+            assert!(matches!(
+                replies.try_recv(),
+                Ok(PartitionReadReply::Rejected(
+                    IggyError::TransientNotCommitted
+                ))
+            ));
+            assert_eq!(
+                owner
+                    .plane
+                    .partitions()
+                    .consumer_offset_read(&namespace(), consumer)
+                    .unwrap()
+                    .0,
+                None
+            );
+        }
+        assert!(owner.deferred_polls.state.borrow().waiters.is_empty());
+        assert_eq!(
+            owner.deferred_polls.inflight_bytes.load(Ordering::Relaxed),
+            0
+        );
+    }
+}
+
+#[compio::test]
+async fn poll_admission_is_independent_of_resident_journal_size() {
+    // 1.5 MiB resident, one message polled: the read budget bounds the reply,
+    // not how much the partition holds.
+    let payload = "x".repeat(768 * 1024);
+    let owner = owner(&[payload.as_str(); 2]).await;
+    let replies = submit(&owner, request(&owner, 1, false, false)).await;
+    assert_eq!(offsets(&replies), [0]);
+}
+
+fn readiness_target(
+    owner: &TestShard,
+    partition: usize,
+    strategy: PollingStrategy,
+) -> ReadinessTarget {
+    let namespace = partition_namespace(partition);
+    let metadata = owner
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .poll_metadata(namespace, None, CLIENT)
+        .unwrap();
+    ReadinessTarget {
+        namespace,
+        partition_id: u32::try_from(partition).unwrap(),
+        consumer: PollingConsumer::Consumer(0, partition),
+        strategy,
+        context: DeferredPollContext {
+            session: None,
+            metadata,
+            user_id: 0,
+            user_created_at: None,
+            quota: PollQuotaIdentity::Session(CLIENT),
+            primary: true,
+        },
+    }
+}
+
+fn wait(owner: &TestShard, targets: Vec<ReadinessTarget>) -> Receiver<PartitionReadReply> {
+    let (reply, replies) = channel(2);
+    owner.admit_readiness_wait(
+        ReadinessWait {
+            targets,
+            deadline: DEADLINE,
+        },
+        &reply,
+    );
+    replies
+}
+
+/// The parked waiter and the ready partitions of the next answer.
+fn answer(replies: &Receiver<PartitionReadReply>) -> (Option<u64>, Vec<u32>) {
+    let Ok(PartitionReadReply::Ready {
+        shard: 0,
+        parked,
+        partitions,
+    }) = replies.try_recv()
+    else {
+        panic!("expected a readiness answer from shard 0");
+    };
+    (parked, partitions)
+}
+
+fn set_committed(owner: &TestShard, partition: usize, committed: bool) {
+    owner
+        .plane
+        .partitions()
+        .get_mut_by_ns(&partition_namespace(partition))
+        .unwrap()
+        .set_offset_space_used(committed);
+}
+
+fn assert_released(owner: &TestShard) {
+    let state = owner.deferred_polls.state.borrow();
+    assert!(state.readiness.is_empty());
+    assert!(state.sessions.is_empty());
+    assert!(state.partitions.is_empty());
+    assert!(state.deadlines.is_empty());
+    assert!(state.ready.is_empty());
+}
+
+#[compio::test]
+async fn readiness_answers_ready_targets_at_admission_without_parking() {
+    let owner = owner_of(&[&["first"], &["first", "second"]]).await;
+    let replies = wait(
+        &owner,
+        vec![
+            readiness_target(&owner, 0, PollingStrategy::offset(1)),
+            readiness_target(&owner, 1, PollingStrategy::offset(1)),
+        ],
+    );
+    assert_eq!(answer(&replies), (None, vec![1]));
+    assert_released(&owner);
+}
+
+#[compio::test]
+async fn expired_readiness_answers_at_admission_without_parking() {
+    let owner = owner(&["first"]).await;
+    owner.bus.now.set(DEADLINE);
+    let replies = wait(
+        &owner,
+        vec![readiness_target(&owner, 0, PollingStrategy::offset(1))],
+    );
+    assert_eq!(answer(&replies), (None, Vec::new()));
+    assert_released(&owner);
+}
+
+#[compio::test]
+async fn parked_readiness_reports_every_ready_target_once() {
+    let owner = owner_of(&[&["first"], &["first"]]).await;
+    set_committed(&owner, 0, false);
+    set_committed(&owner, 1, false);
+    let replies = wait(
+        &owner,
+        vec![
+            readiness_target(&owner, 0, PollingStrategy::offset(0)),
+            readiness_target(&owner, 1, PollingStrategy::offset(0)),
+        ],
+    );
+    let (parked, partitions) = answer(&replies);
+    assert!(parked.is_some() && partitions.is_empty());
+    owner.service_deferred_polls().await;
+    pending(&replies);
+    set_committed(&owner, 0, true);
+    set_committed(&owner, 1, true);
+    owner.service_deferred_polls().await;
+    assert_eq!(answer(&replies), (None, vec![0, 1]));
+    assert!(
+        matches!(
+            replies.try_recv(),
+            Err(crossfire::TryRecvError::Disconnected)
+        ),
+        "a waiter answers once"
+    );
+    assert_released(&owner);
+}
+
+#[compio::test]
+async fn next_readiness_starts_after_the_stored_offset() {
+    let owner = owner(&["first"]).await;
+    let before = wait(
+        &owner,
+        vec![readiness_target(&owner, 0, PollingStrategy::next())],
+    );
+    assert_eq!(answer(&before), (None, vec![0]));
+    assert_eq!(
+        offsets(&submit(&owner, request(&owner, 1, false, true)).await),
+        [0]
+    );
+    let after = wait(
+        &owner,
+        vec![readiness_target(&owner, 0, PollingStrategy::next())],
+    );
+    let (parked, partitions) = answer(&after);
+    assert!(parked.is_some() && partitions.is_empty());
+}
+
+#[compio::test]
+async fn readiness_waiter_leaves_on_cancel_disconnect_or_deadline() {
+    for exit in ["cancel", "disconnect", "deadline"] {
+        let owner = owner(&["first"]).await;
+        let replies = wait(
+            &owner,
+            vec![readiness_target(&owner, 0, PollingStrategy::offset(1))],
+        );
+        let (Some(id), _) = answer(&replies) else {
+            panic!("nothing is ready, so the waiter parks");
+        };
+        match exit {
+            "cancel" => owner.cancel_readiness_wait(id),
+            "disconnect" => {
+                drop(replies);
+                owner.deferred_polls.maintenance();
+                owner.service_deferred_polls().await;
+            }
+            _ => {
+                owner.bus.now.set(DEADLINE);
+                owner.service_deferred_polls().await;
+                assert!(
+                    matches!(
+                        replies.try_recv(),
+                        Err(crossfire::TryRecvError::Disconnected)
+                    ),
+                    "the origin answers an expired wait"
+                );
+            }
+        }
+        assert_released(&owner);
+    }
+}
+
+#[compio::test]
+async fn replacement_history_rejects_parked_readiness() {
+    let owner = owner(&["old"]).await;
+    let replies = wait(
+        &owner,
+        vec![readiness_target(&owner, 0, PollingStrategy::offset(1))],
+    );
+    assert!(answer(&replies).0.is_some());
+    let (replacement, _) =
+        partition_with_messages(&owner.bus, namespace(), &["new", "newer"]).await;
+    owner.plane.partitions().insert(namespace(), replacement);
+    owner.deferred_polls.maintenance();
+    owner.service_deferred_polls().await;
+    assert!(matches!(
+        replies.try_recv(),
+        Ok(PartitionReadReply::Rejected(
+            IggyError::TransientNotAccepted
+        ))
+    ));
+    assert_released(&owner);
+}
+
+#[compio::test]
+async fn readiness_quota_counts_parked_waiters_only() {
+    let owner = owner(&["first"]).await;
+    owner.set_deferred_poll_config(DeferredPollConfig {
+        max_pending_per_session: 1,
+        ..Default::default()
+    });
+    let parked = wait(
+        &owner,
+        vec![readiness_target(&owner, 0, PollingStrategy::offset(1))],
+    );
+    assert!(answer(&parked).0.is_some());
+    for refused in [
+        wait(
+            &owner,
+            vec![readiness_target(&owner, 0, PollingStrategy::offset(1))],
+        ),
+        submit(&owner, request(&owner, 2, false, false)).await,
+    ] {
+        assert!(matches!(
+            refused.try_recv(),
+            Ok(PartitionReadReply::Rejected(
+                IggyError::DeferredPollCapacityExceeded
+            ))
+        ));
+    }
+    let ready = wait(
+        &owner,
+        vec![readiness_target(&owner, 0, PollingStrategy::offset(0))],
+    );
+    assert_eq!(answer(&ready), (None, vec![0]));
+}
+
+#[compio::test]
+async fn fan_out_merges_admissions_and_cancels_what_stays_parked() {
+    for (later, duration) in [
+        (false, PARTITION_READ_TIMEOUT),
+        // A zero wait still collects every admission answer.
+        (false, Duration::ZERO),
+        (true, PARTITION_READ_TIMEOUT),
+    ] {
+        let mut owner = owner_of(&[&["first"], &["first"]]).await;
+        let (local, local_inbox, _) = shard_channel(0, 4, 1);
+        let (remote, remote_inbox, _) = shard_channel(1, 4, 1);
+        owner.attach_senders(vec![local, remote]);
+        owner.shards_table.insert(
+            partition_namespace(1),
+            PartitionLocation::new(ShardId::new(1), 1),
+        );
+        // Partition 0 is ready now unless the remote shard answers later.
+        let start = u64::from(later);
+        let targets = vec![
+            readiness_target(&owner, 0, PollingStrategy::offset(start)),
+            readiness_target(&owner, 1, PollingStrategy::offset(0)),
+        ];
+        let owners = async {
+            let Ok(ShardFrame::Lifecycle(LifecycleFrame::ReadinessWait { wait, reply })) =
+                local_inbox.recv().await
+            else {
+                panic!("shard 0 holds partition 0");
+            };
+            owner.admit_readiness_wait(wait, &reply);
+            let Ok(ShardFrame::Lifecycle(LifecycleFrame::ReadinessWait { wait, reply })) =
+                remote_inbox.recv().await
+            else {
+                panic!("shard 1 holds partition 1");
+            };
+            assert_eq!(wait.targets.len(), 1);
+            for answer in [Some((Some(7), Vec::new())), later.then(|| (None, vec![1]))]
+                .into_iter()
+                .flatten()
+            {
+                reply
+                    .try_send(PartitionReadReply::Ready {
+                        shard: 1,
+                        parked: answer.0,
+                        partitions: answer.1,
+                    })
+                    .unwrap();
+            }
+        };
+        let (ready, ()) = futures::join!(owner.wait_for_messages(targets, duration), owners);
+        if later {
+            assert_eq!(ready.unwrap(), [1]);
+            let Ok(ShardFrame::Lifecycle(LifecycleFrame::ReadinessCancel { waiter })) =
+                local_inbox.try_recv()
+            else {
+                panic!("the local waiter stays parked and is cancelled");
+            };
+            owner.cancel_readiness_wait(waiter);
+            assert!(
+                remote_inbox.try_recv().is_err(),
+                "the remote waiter answered"
+            );
+        } else {
+            assert_eq!(ready.unwrap(), [0]);
+            assert!(local_inbox.try_recv().is_err(), "nothing parked locally");
+            assert!(matches!(
+                remote_inbox.try_recv(),
+                Ok(ShardFrame::Lifecycle(LifecycleFrame::ReadinessCancel {
+                    waiter: 7
+                }))
+            ));
+        }
+        assert_released(&owner);
+    }
+}

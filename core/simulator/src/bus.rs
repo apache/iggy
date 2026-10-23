@@ -273,6 +273,11 @@ impl MessageBus for SimOutbox {
     fn monotonic_now(&self) -> Instant {
         self.timer.monotonic_now()
     }
+
+    fn monotonic_micros(&self) -> u64 {
+        u64::try_from(Duration::from_nanos(self.timer.now().as_nanos()).as_micros())
+            .unwrap_or(u64::MAX)
+    }
 }
 
 /// Newtype wrapper for shared [`SimOutbox`] that implements [`MessageBus`]
@@ -334,6 +339,10 @@ impl MessageBus for SharedSimOutbox {
 
     fn monotonic_now(&self) -> Instant {
         self.0.monotonic_now()
+    }
+
+    fn monotonic_micros(&self) -> u64 {
+        self.0.monotonic_micros()
     }
 }
 

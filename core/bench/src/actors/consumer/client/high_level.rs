@@ -26,11 +26,12 @@ use crate::actors::{
 use crate::utils::ClientFactory;
 use futures_util::StreamExt;
 use iggy::prelude::*;
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 use tokio::time::{Instant, timeout};
 use tracing::{error, warn};
 
 const TOPIC_ID: &str = "topic-1";
+const PREFETCH_BATCHES: u32 = 16;
 
 pub struct HighLevelConsumerClient {
     client_factory: Arc<dyn ClientFactory>,
@@ -81,21 +82,41 @@ impl HighLevelConsumerClient {
         };
         Ok(builder
             .batch_length(self.config.messages_per_batch.get())
+            .poll_options(self.config.poll_options)
+            .prefetch_messages(
+                self.config
+                    .messages_per_batch
+                    .get()
+                    .saturating_mul(PREFETCH_BATCHES),
+            )
+            .prefetch_bytes(
+                self.config
+                    .poll_options
+                    .max_bytes
+                    .saturating_mul(PREFETCH_BATCHES),
+            )
             .build())
     }
 }
 
 impl ConsumerClient for HighLevelConsumerClient {
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "The borrowed consumer retains reservations until its buffered messages are drained."
+    )]
     async fn consume_batch(&mut self) -> Result<Option<BatchMetrics>, IggyError> {
         let consumer = self.consumer.as_mut().expect("Consumer not initialized");
 
+        // One poll can wait up to its request timeout, so a shorter timeout would restart the
+        // batch clock in the middle of a deliberate wait.
+        let poll_timeout = self.config.poll_options.request_timeout.get_duration();
         let batch_start = Instant::now();
         let mut batch_messages = 0;
         let mut batch_user_bytes = 0;
         let mut batch_total_bytes = 0;
 
         while batch_messages < self.config.messages_per_batch.get() {
-            let timeout_result = timeout(Duration::from_secs(1), consumer.next()).await;
+            let timeout_result = timeout(poll_timeout, consumer.next()).await;
 
             match timeout_result {
                 Ok(Some(message_result)) => match message_result {
@@ -141,6 +162,10 @@ impl ConsumerClient for HighLevelConsumerClient {
         }
     }
 
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "The replacement must finish initialization before taking over the consumer slot"
+    )]
     async fn reset_offsets(&mut self) -> Result<(), IggyError> {
         let client = self.client.as_deref().expect("Client not initialized");
 
@@ -157,6 +182,10 @@ impl ConsumerClient for HighLevelConsumerClient {
 }
 
 impl BenchmarkInit for HighLevelConsumerClient {
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "The initialized consumer moves into self and must retain its prefetch reservations."
+    )]
     async fn setup(&mut self) -> Result<(), IggyError> {
         let client = self.client_factory.create_authenticated_client().await?;
         let mut consumer = self.build_consumer(&client, PollingStrategy::next())?;

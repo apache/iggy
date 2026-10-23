@@ -371,22 +371,27 @@ class TestClientConstruction:
                 auto_commit=auto_commit,
             )
 
-    def test_zero_poll_interval_is_allowed(self):
-        """Test that a zero poll interval passes validation.
+    def test_arguments_after_auto_join_are_keyword_only(self):
+        """Test that a positional argument after auto_join_consumer_group fails.
 
-        Zero there means "do not wait before polling" and is short-circuited
-        before the sleep, unlike the retry intervals. Reaching the awaitable is
-        what proves it: building one without a running loop is the next failure,
-        and a rejected value would have raised ValueError first.
+        The removed poll_interval was the tenth argument. A positional call
+        written for it would otherwise set polling_retry_interval.
         """
         client = IggyClient()
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(TypeError, match="positional arguments"):
             client.consumer_group(
-                name="group",
-                stream="stream",
-                topic="topic",
-                poll_interval=timedelta(0),
+                "group",
+                "stream",
+                "topic",
+                None,
+                None,
+                None,
+                None,
+                True,
+                True,
+                # pyrefly: ignore  # bad-argument-count
+                timedelta(seconds=1),
             )
 
 

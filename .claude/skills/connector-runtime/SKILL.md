@@ -133,7 +133,7 @@ Per `[[streams]]` entry per sink:
 
 1. Build / ensure consumer group `iggy-connect-sink-{key}` (`connect` matches the docker image name `apache/iggy-connect` - see `runtime/src/sink.rs::default_consumer_group`). Overridable via the stream config's `consumer_group`.
 2. Spawn one task per topic (`spawn_consume_tasks`).
-3. Poll Iggy → batch messages (default `batch_length = 1000`, `poll_interval = 5ms`). A `consumer.next()` `Err` (transport/decode at the Iggy client boundary) bumps `errors` and `continue`s - offset already auto-committed via `AutoCommit::When(AutoCommitWhen::PollingMessages)`, message effectively dropped.
+3. Poll Iggy → batch messages (default `batch_length = 1000`). A `consumer.next()` `Err` (transport/decode at the Iggy client boundary) bumps `errors` and `continue`s. A rejected poll committed nothing, so the consumer retries the same offset. Polls commit via `AutoCommit::When(AutoCommitWhen::PollingMessages)`, so only a reply lost after the server committed can skip its batch.
 4. Decode via `Schema::decoder()`. Decode failure logs + bumps `errors`. `messages_filtered` is reserved for the transform filter contract (`Ok(None)`).
 5. Apply transforms (chain). A transform `Err` is logged, bumps `errors`, and drops only that message (drop-and-continue, mirroring the source) - one bad payload never kills the batch. `Ok(None)` filters the message - bumps `messages_filtered{connector_type="sink"}`.
 6. Postcard-encode batch as `RawMessages`. Headers as a separate postcard blob. Per-message failures (missing field, payload conversion, header serialization) bump `errors` + skip. Batch-level failures (postcard serialization of metadata / `RawMessages`) propagate `Err` -> `spawn_consume_tasks` wrapper bumps `errors` + `set_error`. The total histogram and benchmark emit still fire for the failed batch before the `Err` propagates.
@@ -146,8 +146,8 @@ Stages (both labels snake_case): `decode` (schema decode loop), `prepare` (trans
 
 Gotchas:
 
-- Batch flushes on `current_offset != message_offset` (gap) OR batch full - higher latency for low-volume topics.
-- Auto-commit happens on poll - idempotency at the sink protects against re-delivery on crash before plugin write.
+- Batch flushes when a message is the last one in its partition (`message_offset == current_offset`), when the batch is full, OR before a message of another partition, because the plugin gets one partition id per batch. `max_wait` and `min_count` on the stream make the server collect larger replies.
+- Auto-commit happens on poll, so sink delivery is at-most-once: a crash after the poll and before the plugin write loses that batch.
 
 ## Logging format
 
