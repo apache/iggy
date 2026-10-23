@@ -371,7 +371,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "large options-count boundary; covered by native tests")]
     fn entry_count_over_limit_is_rejected() {
         let keys: Vec<String> = (0..=MAX_OPTIONS).map(|i| format!("key_{i}")).collect();
         let entries: Vec<(u8, &[u8], u8, &[u8])> = keys

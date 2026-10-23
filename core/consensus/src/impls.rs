@@ -8853,7 +8853,6 @@ mod recovery_election_tests {
     /// their fallback election, which an asynchronous network permits. Whatever
     /// the restarted pair decide without it must still contain the committed ops.
     #[test]
-    #[cfg_attr(miri, ignore = "slow recovery simulation; covered by native tests")]
     fn given_survivor_in_view_change_when_restarted_pair_elects_should_keep_committed_ops() {
         let plane = PlaneKind::Partitions;
         let mut cluster = Cluster {
@@ -8892,7 +8891,6 @@ mod recovery_election_tests {
     /// restarted pair may not settle a view without it, and once it reports
     /// the cluster settles holding every committed op.
     #[test]
-    #[cfg_attr(miri, ignore = "slow recovery simulation; covered by native tests")]
     fn given_survivor_in_view_change_when_it_stays_reachable_should_settle_with_committed_ops() {
         let plane = PlaneKind::Partitions;
         let mut cluster = Cluster {
@@ -8916,7 +8914,6 @@ mod recovery_election_tests {
     /// count, must stay unavailable rather than settle on their short logs, and
     /// recover as soon as the survivor is back.
     #[test]
-    #[cfg_attr(miri, ignore = "slow recovery simulation; covered by native tests")]
     fn given_survivor_partitioned_when_restarted_pair_elects_should_halt_until_it_returns() {
         let plane = PlaneKind::Partitions;
         let mut cluster = Cluster {
@@ -8953,7 +8950,6 @@ mod recovery_election_tests {
     /// `replicated` durability an op the shorter logs lack may have been
     /// acknowledged by them before their crash.
     #[test]
-    #[cfg_attr(miri, ignore = "slow recovery simulation; covered by native tests")]
     fn given_full_cluster_restart_when_every_replica_reports_should_settle_on_the_longest_log() {
         let plane = PlaneKind::Partitions;
         let mut cluster = Cluster {
@@ -8979,7 +8975,6 @@ mod recovery_election_tests {
     /// empty vote: the view starts on the logs that elected, and the barred
     /// replica joins it through the `StartView`.
     #[test]
-    #[cfg_attr(miri, ignore = "slow recovery simulation; covered by native tests")]
     fn given_full_restart_with_one_replica_barred_from_election_when_logs_are_untrusted_should_settle_on_its_empty_vote_without_dropping_ops()
      {
         let plane = PlaneKind::Partitions;
@@ -9020,7 +9015,6 @@ mod recovery_election_tests {
     /// It may vote but never lead: it stays `Recovering` until a `StartView`
     /// from another primary, so the others move past its view and settle.
     #[test]
-    #[cfg_attr(miri, ignore = "slow recovery simulation; covered by native tests")]
     fn given_barred_replica_is_the_next_primary_candidate_when_others_elect_should_never_lead() {
         let plane = PlaneKind::Partitions;
         let barred = restarted(LAGGING_BACKUP, COMMITTED, false);
@@ -9065,7 +9059,6 @@ mod recovery_election_tests {
     /// an empty voter stays `Recovering` and in its own view: voting is not
     /// joining.
     #[test]
-    #[cfg_attr(miri, ignore = "slow recovery simulation; covered by native tests")]
     fn given_barred_replica_when_it_only_hears_a_view_change_should_stay_recovering() {
         let plane = PlaneKind::Partitions;
         let barred = restarted(SURVIVOR, COMMITTED, false);
@@ -9105,7 +9098,6 @@ mod recovery_election_tests {
     /// hold ops nobody else has. It must not cast an empty vote that would let
     /// the others start a view without that log.
     #[test]
-    #[cfg_attr(miri, ignore = "slow recovery simulation; covered by native tests")]
     fn given_full_restart_when_a_replica_still_probes_should_wait_for_its_log() {
         let plane = PlaneKind::Partitions;
         let slow = restarted(SURVIVOR, COMMITTED, false);
@@ -9130,7 +9122,6 @@ mod recovery_election_tests {
     /// Persisted recovery never needs the barred replica, so it stays silent
     /// and the trusted pair settle as a plain quorum.
     #[test]
-    #[cfg_attr(miri, ignore = "slow recovery simulation; covered by native tests")]
     fn given_complete_logs_when_a_replica_is_barred_should_send_no_empty_vote() {
         let plane = PlaneKind::Partitions;
         let barred = restarted(SURVIVOR, COMMITTED, true);
@@ -9162,7 +9153,6 @@ mod recovery_election_tests {
     /// holds every op it acknowledged and the restarted pair keep the fast
     /// fallback: they settle without waiting for the survivor.
     #[test]
-    #[cfg_attr(miri, ignore = "slow recovery simulation; covered by native tests")]
     fn given_complete_recovered_logs_when_survivor_is_silent_should_elect_without_it() {
         let plane = PlaneKind::Partitions;
         let mut cluster = Cluster {
@@ -9264,7 +9254,6 @@ mod recovery_election_tests {
     /// is cut off. Flagged untrusted, it does not complete a trusted one, so the
     /// candidate waits for the survivor rather than dropping the tail.
     #[test]
-    #[cfg_attr(miri, ignore = "slow recovery simulation; covered by native tests")]
     fn given_trusted_lagging_primary_when_restarted_replica_completes_its_quorum_should_keep_committed_ops()
      {
         let plane = PlaneKind::Partitions;
@@ -9420,7 +9409,6 @@ mod recovery_election_tests {
     /// third replica's view change cannot complete they stay quiet and
     /// `Recovering`; once it can, the group settles.
     #[test]
-    #[cfg_attr(miri, ignore = "slow recovery simulation; covered by native tests")]
     fn given_two_barred_replicas_when_do_view_changes_are_broadcast_should_not_answer_each_other() {
         let plane = PlaneKind::Partitions;
         let mut cluster = Cluster {
@@ -9466,7 +9454,6 @@ mod recovery_election_tests {
     /// fallback election must treat their logs as the intact ones they are:
     /// marking them untrusted would halt a group that lost only one replica.
     #[test]
-    #[cfg_attr(miri, ignore = "slow recovery simulation; covered by native tests")]
     fn given_replicas_that_never_restarted_when_a_runtime_probe_exhausts_should_elect_trusted_without_the_third()
      {
         let plane = PlaneKind::Partitions;
@@ -9551,7 +9538,6 @@ mod recovery_election_tests {
     /// `StartView`, which vouches for their logs. A later runtime probe that
     /// exhausts with that primary gone must elect them trusted.
     #[test]
-    #[cfg_attr(miri, ignore = "slow recovery simulation; covered by native tests")]
     fn given_restarted_replicas_that_adopted_a_start_view_when_a_runtime_probe_exhausts_should_elect_trusted_without_the_third()
      {
         const SETTLED_VIEW: u32 = OLD_VIEW + 2;
@@ -9602,7 +9588,6 @@ mod recovery_election_tests {
     /// `StartView`. A later runtime probe that exhausts with the third gone must
     /// elect both trusted.
     #[test]
-    #[cfg_attr(miri, ignore = "slow recovery simulation; covered by native tests")]
     fn given_full_restart_that_settled_when_a_runtime_probe_exhausts_should_elect_trusted_without_the_third()
      {
         let plane = PlaneKind::Partitions;
