@@ -79,6 +79,10 @@ public final class IggyProducer: Sendable {
     /// ``IggyErrorCode/backgroundSendError``, or `CancellationError` with
     /// nothing queued. Both throw ``IggyErrorCode/producerClosed`` after
     /// ``shutdown()``.
+    ///
+    /// A send belongs to the client session it started in: once the caller
+    /// signs in or out, its requests not written yet fail with
+    /// ``IggyErrorCode/unauthenticated``, in either mode.
     @discardableResult
     public func send(_ messages: [IggyMessage]) async throws -> SendMessagesResponse {
         try await send(messages, streamID: streamID, topicID: topicID, partitioning: nil)
@@ -107,11 +111,14 @@ public final class IggyProducer: Sendable {
         guard !messages.isEmpty else {
             return SendMessagesResponse()
         }
+        // Pinned before any wait, so a caller who signs in or out meanwhile
+        // never has this send written under the new session.
+        let lineage = await core.currentLineage()
         if let dispatcher {
-            try await dispatcher.dispatch(messages, streamID: streamID, topicID: topicID, partitioning: partitioning)
+            try await dispatcher.dispatch(messages, streamID: streamID, topicID: topicID, partitioning: partitioning, lineage: lineage)
             return SendMessagesResponse()
         }
-        return try await core.sendInternal(streamID: streamID, topicID: topicID, messages: messages, partitioning: partitioning)
+        return try await core.sendInternal(streamID: streamID, topicID: topicID, messages: messages, partitioning: partitioning, lineage: lineage)
     }
 
     /// Flushes what a background producer still holds and waits for its
@@ -149,8 +156,11 @@ extension IggyClient {
 /// What a background worker writes through: the producer core, or a test
 /// double.
 protocol ProducerCoreBackend: Sendable {
-    /// Sends `messages`, throwing ``ProducerSendError`` when a request fails.
-    func sendInternal(streamID: Identifier, topicID: Identifier, messages: [IggyMessage], partitioning: Partitioning?) async throws -> SendMessagesResponse
+    /// Sends `messages` under the client `lineage` the send started in,
+    /// throwing ``ProducerSendError`` when a request fails.
+    func sendInternal(
+        streamID: Identifier, topicID: Identifier, messages: [IggyMessage], partitioning: Partitioning?, lineage: UInt64
+    ) async throws -> SendMessagesResponse
 }
 
 /// The state both send modes share: readiness, retries, chunking, and the
@@ -199,8 +209,11 @@ actor ProducerCore: ProducerCoreBackend {
             return
         }
         logger.info("Initializing the producer", metadata: ["stream": "\(streamID)", "topic": "\(topicID)"])
+        // A sign-in or sign-out by the caller ends the bootstrap, so nothing
+        // is created under another user's session.
+        let lineage = await client.operationLineage
         await subscribeEvents()
-        if try await client.getStream(streamID) == nil {
+        if try await client.getStream(streamID, lineage: lineage) == nil {
             guard let name = streamID.name else {
                 throw IggyError(.streamIdNotFound, context: "stream \(streamID) does not exist and cannot be created from a numeric id")
             }
@@ -209,12 +222,13 @@ actor ProducerCore: ProducerCoreBackend {
             }
             logger.info("Creating the stream", metadata: ["stream": "\(name)"])
             do {
-                _ = try await client.createStream(name: name)
+                _ = try await client.createStream(name: name, lineage: lineage)
             } catch let error as IggyError where error.code == .streamNameAlreadyExists {
                 logger.info("The stream was created by someone else", metadata: ["stream": "\(name)"])
             }
         }
-        if try await client.getTopic(streamID: streamID, topicID: topicID) == nil {
+        _ = try await client.requireAuthenticated(under: lineage)
+        if try await client.getTopic(streamID: streamID, topicID: topicID, lineage: lineage) == nil {
             guard let name = topicID.name else {
                 throw IggyError(.topicIdNotFound, context: "topic \(topicID) does not exist and cannot be created from a numeric id")
             }
@@ -228,7 +242,7 @@ actor ProducerCore: ProducerCoreBackend {
                 maxTopicSize: configuration.topicMaxSize == .serverDefault ? nil : configuration.topicMaxSize,
                 durability: configuration.topicDurability)
             do {
-                _ = try await client.createTopic(streamID: streamID, name: name, options: options)
+                _ = try await client.createTopic(streamID: streamID, name: name, options: options, lineage: lineage)
             } catch let error as IggyError where error.code == .topicNameAlreadyExists {
                 logger.info("The topic was created by someone else", metadata: ["stream": "\(streamID)", "topic": "\(name)"])
             }
@@ -242,12 +256,18 @@ actor ProducerCore: ProducerCoreBackend {
         eventsTask = nil
     }
 
+    nonisolated func currentLineage() async -> UInt64 {
+        await client.operationLineage
+    }
+
     /// Sends `messages`. A direct producer splits them into requests and
     /// returns every request's confirmations in order; a background worker
     /// sends them as one. Throws ``ProducerSendError`` naming the unconfirmed
     /// tail, with the ids the client minted for it, whatever stopped the send.
+    /// Every request and retry goes under `lineage`, so a caller who signed
+    /// in or out since ends the send as unauthenticated.
     nonisolated func sendInternal(
-        streamID: Identifier, topicID: Identifier, messages: [IggyMessage], partitioning: Partitioning?
+        streamID: Identifier, topicID: Identifier, messages: [IggyMessage], partitioning: Partitioning?, lineage: UInt64
     ) async throws -> SendMessagesResponse {
         guard !messages.isEmpty else {
             return SendMessagesResponse()
@@ -261,7 +281,7 @@ actor ProducerCore: ProducerCoreBackend {
         }
         guard let directOptions else {
             do {
-                return try await trySend(streamID: streamID, topicID: topicID, partitioning: resolved, messages: &messages)
+                return try await trySend(streamID: streamID, topicID: topicID, partitioning: resolved, messages: &messages, lineage: lineage)
             } catch {
                 throw Self.failure(error, failed: messages, committed: [], streamID: streamID, topicID: topicID)
             }
@@ -286,7 +306,7 @@ actor ProducerCore: ProducerCoreBackend {
             let end = Self.chunkEnd(messages, from: index, length: chunkLength, budget: requestBudget)
             var chunk = Array(messages[index..<end])
             do {
-                let response = try await trySend(streamID: streamID, topicID: topicID, partitioning: resolved, messages: &chunk)
+                let response = try await trySend(streamID: streamID, topicID: topicID, partitioning: resolved, messages: &chunk, lineage: lineage)
                 confirmations.append(contentsOf: response.confirmations)
             } catch {
                 messages.replaceSubrange(index..<end, with: chunk)
@@ -353,17 +373,19 @@ actor ProducerCore: ProducerCoreBackend {
     /// One request with the producer's retry budget. The ids the client mints
     /// on the first attempt stay in `messages`, so every retry carries them.
     private nonisolated func trySend(
-        streamID: Identifier, topicID: Identifier, partitioning: Partitioning, messages: inout [IggyMessage]
+        streamID: Identifier, topicID: Identifier, partitioning: Partitioning, messages: inout [IggyMessage], lineage: UInt64
     ) async throws -> SendMessagesResponse {
         guard let maxRetries = configuration.sendRetries, maxRetries > 0 else {
-            return try await client.sendMessages(streamID: streamID, topicID: topicID, partitioning: partitioning, messages: &messages)
+            return try await client.sendMessages(
+                streamID: streamID, topicID: topicID, partitioning: partitioning, messages: &messages, lineage: lineage)
         }
-        try await waitUntilConnected(maxRetries: maxRetries, streamID: streamID, topicID: topicID)
+        try await waitUntilConnected(maxRetries: maxRetries, streamID: streamID, topicID: topicID, lineage: lineage)
         var retries: UInt32 = 0
         var ticker = RetryTicker(interval: configuration.sendRetryInterval)
         while true {
             do {
-                return try await client.sendMessages(streamID: streamID, topicID: topicID, partitioning: partitioning, messages: &messages)
+                return try await client.sendMessages(
+                    streamID: streamID, topicID: topicID, partitioning: partitioning, messages: &messages, lineage: lineage)
             } catch let error as IggyError {
                 if Self.stopsSendRetries(error) {
                     logger.error("Send stopped", metadata: ["stream": "\(streamID)", "topic": "\(topicID)", "error": "\(error)"])
@@ -386,14 +408,15 @@ actor ProducerCore: ProducerCoreBackend {
 
     /// Each check asks the client to sign in again, since a client whose
     /// heartbeat is off or that was never connected does not reconnect on
-    /// its own.
-    private nonisolated func waitUntilConnected(maxRetries: UInt32, streamID: Identifier, topicID: Identifier) async throws {
+    /// its own. Only the session of `lineage` counts: once the caller signed
+    /// in or out, the wait ends as unauthenticated.
+    private nonisolated func waitUntilConnected(maxRetries: UInt32, streamID: Identifier, topicID: Identifier, lineage: UInt64) async throws {
         var retries: UInt32 = 0
         var ticker = RetryTicker(interval: configuration.sendRetryInterval)
         while await !canSend {
             try Task.checkCancellation()
             do {
-                _ = try await client.requireAuthenticated()
+                _ = try await client.requireAuthenticated(under: lineage)
                 await openGate()
                 return
             } catch let error as IggyError where error.code == .clientShutdown {
@@ -401,6 +424,9 @@ actor ProducerCore: ProducerCoreBackend {
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
+                if let refusal = await client.lineageRefusal(lineage) {
+                    throw refusal
+                }
                 // Still signed out; the budget below decides how long to wait.
             }
             retries += 1

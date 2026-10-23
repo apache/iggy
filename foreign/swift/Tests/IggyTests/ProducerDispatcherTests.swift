@@ -28,6 +28,7 @@ private actor RecordingBackend: ProducerCoreBackend {
         let topicID: Identifier
         let partitioning: Partitioning?
         let payloads: [String]
+        let lineage: UInt64
     }
 
     private(set) var writes: [Write] = []
@@ -45,7 +46,9 @@ private actor RecordingBackend: ProducerCoreBackend {
         self.failure = failure
     }
 
-    func sendInternal(streamID: Identifier, topicID: Identifier, messages: [IggyMessage], partitioning: Partitioning?) async throws -> SendMessagesResponse {
+    func sendInternal(
+        streamID: Identifier, topicID: Identifier, messages: [IggyMessage], partitioning: Partitioning?, lineage: UInt64
+    ) async throws -> SendMessagesResponse {
         started += 1
         inFlight += 1
         mostInFlight = max(mostInFlight, inFlight)
@@ -56,7 +59,7 @@ private actor RecordingBackend: ProducerCoreBackend {
         if delay > .zero {
             try? await Task.sleep(for: delay)
         }
-        writes.append(Write(streamID: streamID, topicID: topicID, partitioning: partitioning, payloads: messages.map(\.payloadString)))
+        writes.append(Write(streamID: streamID, topicID: topicID, partitioning: partitioning, payloads: messages.map(\.payloadString), lineage: lineage))
         if let error = failure?(messages) {
             throw error
         }
@@ -159,6 +162,10 @@ struct ProducerDispatcherTests {
         }
         #expect(ShardWorker.merge(spread).map { $0.messages.map(\.payloadString) } == [["a", "b"], ["c"]])
         #expect(ShardWorker.merge(spread).map(\.earliestTimestamp) == [hour, 3 * hour])
+
+        // A send pinned to another lineage goes in its own request.
+        let lineages = [1, 1, 2, 1].map { QueuedBatch(streamID: 1, topicID: 2, messages: [message("\($0)")], partitioning: nil, lineage: UInt64($0)) }
+        #expect(ShardWorker.merge(lineages).map { $0.messages.map(\.payloadString) } == [["1", "1"], ["2"], ["1"]])
 
         var half = QueuedBatch(streamID: 1, topicID: 2, messages: ["a"], partitioning: nil)
         half.sizeBytes = QueuedBatch.maxRequestBytes / 2 + 1

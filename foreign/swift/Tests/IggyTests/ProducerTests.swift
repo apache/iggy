@@ -329,6 +329,105 @@ struct ProducerTests {
         await client.shutdown()
     }
 
+    /// A direct send is pinned to the session it started in: once the caller
+    /// signs in again, the requests not written yet fail as unauthenticated
+    /// instead of going under the new session.
+    @Test func aSignInEndsTheUnsentTailOfADirectSend() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        await server.respond { request in
+            guard request.code == CommandCode.sendMessages.rawValue else { return FakeVSRServer.defaultReply(request, address: server.address) }
+            try? await Task.sleep(for: .milliseconds(200))
+            return .ok(FakeVSRServer.confirmationBody(partitionID: 1, baseOffset: 0))
+        }
+        let client = try await signedInClient(server)
+        let configuration = ProducerConfiguration(partitioning: .partition(1), mode: .direct(DirectSendOptions(batchLength: 1)))
+        let producer = try client.producer(streamID: 1, topicID: 2, configuration: configuration)
+        let send = Task { try await producer.send(["head", "tail"]) }
+        #expect(await eventually { await sends(server).count == 1 })
+        _ = try await client.login(username: "iggy", password: "iggy")
+        do {
+            _ = try await send.value
+            Issue.record("the send did not fail")
+        } catch let error as ProducerSendError {
+            #expect(error.cause.code == .unauthenticated)
+            #expect(error.committed.count == 1)
+            #expect(error.failed.map(\.payloadString) == ["tail"])
+        }
+        #expect(await sends(server).count == 1)
+        await client.shutdown()
+    }
+
+    /// A retry waiting out its interval when the caller signs in again is
+    /// not written under the new session.
+    @Test func aSignInDuringTheRetryWaitEndsTheSend() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        await server.respond { request in
+            request.code == CommandCode.sendMessages.rawValue
+                ? .status(IggyErrorCode.transientNotAccepted.rawValue) : FakeVSRServer.defaultReply(request, address: server.address)
+        }
+        let client = try await signedInClient(server, requestTimeout: .milliseconds(200))
+        let configuration = ProducerConfiguration(partitioning: .partition(1), sendRetries: 3, sendRetryInterval: .seconds(1))
+        let producer = try client.producer(streamID: 1, topicID: 2, configuration: configuration)
+        let send = Task { try await producer.send(["once"]) }
+        // The first retry goes at once; the second waits out the interval.
+        try await Task.sleep(for: .milliseconds(600))
+        _ = try await client.login(username: "iggy", password: "iggy")
+        let writtenBefore = await sends(server).count
+        do {
+            _ = try await send.value
+            Issue.record("the send did not fail")
+        } catch let error as ProducerSendError {
+            #expect(error.cause.code == .unauthenticated)
+        }
+        #expect(writtenBefore > 0)
+        #expect(await sends(server).count == writtenBefore)
+        await client.shutdown()
+    }
+
+    /// Batches queued before a sign-in keep their session and are never
+    /// merged with the ones queued after it.
+    @Test func aBackgroundBatchQueuedBeforeASignInKeepsItsSession() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let client = try await signedInClient(server)
+        let reported = Locked<[ProducerSendFailure]>([])
+        let options = BackgroundSendOptions(lingerTime: .seconds(60), errorHandler: { failure in reported.withLock { $0.append(failure) } })
+        let producer = try client.producer(
+            streamID: 1, topicID: 2, configuration: ProducerConfiguration(partitioning: .partition(1), mode: .background(options)))
+        try await producer.send(["old"])
+        _ = try await client.login(username: "iggy", password: "iggy")
+        try await producer.send(["new"])
+        await producer.shutdown()
+        let failures = reported.withLock { $0 }
+        #expect(failures.map(\.cause.code) == [.unauthenticated])
+        #expect(failures.first?.messages.map(\.payloadString) == ["old"])
+        #expect(await sends(server).map(sentCount) == [1])
+        await client.shutdown()
+    }
+
+    /// The bootstrap is pinned too: a sign-in while it runs creates nothing
+    /// under the new session.
+    @Test func aSignInEndsTheInitialization() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        await server.respond { request in
+            if request.code == CommandCode.getStream.rawValue {
+                try? await Task.sleep(for: .milliseconds(200))
+            }
+            return FakeVSRServer.defaultReply(request, address: server.address)
+        }
+        let client = try await signedInClient(server)
+        let producer = try client.producer(streamID: "orders", topicID: "created")
+        let initialization = Task { try await producer.initialize() }
+        #expect(await eventually { await server.requests.contains { $0.code == CommandCode.getStream.rawValue } })
+        _ = try await client.login(username: "iggy", password: "iggy")
+        await expectCode(.unauthenticated) { try await initialization.value }
+        #expect(await server.requests.filter { $0.code == CommandCode.createStream.rawValue }.isEmpty)
+        await client.shutdown()
+    }
+
     /// A request carries at most `batchLength` messages and stays within the
     /// server's frame limit; a message too large for one goes alone.
     @Test func aDirectSendIsChunkedByLengthAndBytes() throws {

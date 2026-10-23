@@ -35,17 +35,20 @@ struct QueuedBatch: Sendable {
     let topicID: Identifier
     var messages: [IggyMessage]
     let partitioning: Partitioning?
+    /// The client lineage the send started in, which its write keeps.
+    let lineage: UInt64
     var sizeBytes: Int
     /// The span of origin timestamps, in microseconds, which one request
     /// may not stretch past ``Batch/maxTimestampDelta``.
     var earliestTimestamp: UInt64
     var latestTimestamp: UInt64
 
-    init(streamID: Identifier, topicID: Identifier, messages: [IggyMessage], partitioning: Partitioning?) {
+    init(streamID: Identifier, topicID: Identifier, messages: [IggyMessage], partitioning: Partitioning?, lineage: UInt64 = 0) {
         self.streamID = streamID
         self.topicID = topicID
         self.messages = messages
         self.partitioning = partitioning
+        self.lineage = lineage
         var size = streamID.encodedSize + topicID.encodedSize
         size += partitioning?.encodedSize ?? 0
         var earliest = UInt64.max
@@ -66,10 +69,10 @@ struct QueuedBatch: Sendable {
     }
 
     /// Whether `other` can join this batch in one request: the same
-    /// destination, within the request size, and within the timestamp span
-    /// the client accepts.
+    /// destination and lineage, within the request size, and within the
+    /// timestamp span the client accepts.
     func canMerge(_ other: QueuedBatch) -> Bool {
-        guard sameDestination(as: other), sizeBytes + other.sizeBytes <= Self.maxRequestBytes else {
+        guard sameDestination(as: other), lineage == other.lineage, sizeBytes + other.sizeBytes <= Self.maxRequestBytes else {
             return false
         }
         let latest = max(latestTimestamp, other.latestTimestamp)
@@ -128,11 +131,11 @@ final class ProducerDispatcher: Sendable {
 
     /// Charges the batch against the byte budget and queues it on a worker.
     /// Returns once it is queued, not once it is written.
-    func dispatch(_ messages: [IggyMessage], streamID: Identifier, topicID: Identifier, partitioning: Partitioning?) async throws {
+    func dispatch(_ messages: [IggyMessage], streamID: Identifier, topicID: Identifier, partitioning: Partitioning?, lineage: UInt64 = 0) async throws {
         guard state.withLockedValue({ $0.drain == nil }) else {
             throw IggyError(.producerClosed)
         }
-        let batch = QueuedBatch(streamID: streamID, topicID: topicID, messages: messages, partitioning: partitioning)
+        let batch = QueuedBatch(streamID: streamID, topicID: topicID, messages: messages, partitioning: partitioning, lineage: lineage)
         // A merged request is at most this large, so no single batch may be.
         guard batch.sizeBytes <= QueuedBatch.maxRequestBytes else {
             throw IggyError(.backgroundSendBufferOverflow, context: "a batch of \(batch.sizeBytes) bytes exceeds a request")
@@ -395,7 +398,7 @@ actor ShardWorker {
             }
             do {
                 _ = try await backend.sendInternal(
-                    streamID: batch.streamID, topicID: batch.topicID, messages: batch.messages, partitioning: batch.partitioning)
+                    streamID: batch.streamID, topicID: batch.topicID, messages: batch.messages, partitioning: batch.partitioning, lineage: batch.lineage)
             } catch let error as ProducerSendError {
                 failures.yield(
                     ProducerSendFailure(

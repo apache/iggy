@@ -20,7 +20,12 @@
 extension IggyClient {
     /// A stream by id or name, with its topics, or nil if it does not exist.
     public func getStream(_ streamID: Identifier) async throws -> StreamDetails? {
-        let lineage = try await requireAuthenticated()
+        try await getStream(streamID, lineage: nil)
+    }
+
+    /// ``getStream(_:)`` for a call pinned to `captured`.
+    func getStream(_ streamID: Identifier, lineage captured: UInt64?) async throws -> StreamDetails? {
+        let lineage = try await requireAuthenticated(under: captured)
         let body = try await send(.getStream, Requests.identifierOnly(streamID), lineage: lineage)
         return body.isEmpty ? nil : try Responses.streamDetails(body[...])
     }
@@ -35,8 +40,13 @@ extension IggyClient {
     /// Creates a stream and returns it. A key in ``StreamCreateOptions/encryptionKey``
     /// is refused before anything is sent unless it is exactly 32 bytes.
     public func createStream(name: String, options: StreamCreateOptions = StreamCreateOptions()) async throws -> StreamDetails {
+        try await createStream(name: name, options: options, lineage: nil)
+    }
+
+    /// ``createStream(name:options:)`` for a call pinned to `captured`.
+    func createStream(name: String, options: StreamCreateOptions = StreamCreateOptions(), lineage captured: UInt64?) async throws -> StreamDetails {
         let payload = try Requests.createStream(name: name, options: try options.encode())
-        let lineage = try await requireAuthenticated()
+        let lineage = try await requireAuthenticated(under: captured)
         return try Responses.streamDetails(try await send(.createStream, payload, lineage: lineage)[...])
     }
 
@@ -88,7 +98,14 @@ extension IggyClient {
     /// Creates a topic and returns it. Every knob rides `options`; an absent
     /// key resolves against the server's defaults.
     public func createTopic(streamID: Identifier, name: String, options: TopicCreateOptions = TopicCreateOptions()) async throws -> TopicDetails {
-        let lineage = try await requireAuthenticated()
+        try await createTopic(streamID: streamID, name: name, options: options, lineage: nil)
+    }
+
+    /// ``createTopic(streamID:name:options:)`` for a call pinned to `captured`.
+    func createTopic(
+        streamID: Identifier, name: String, options: TopicCreateOptions = TopicCreateOptions(), lineage captured: UInt64?
+    ) async throws -> TopicDetails {
+        let lineage = try await requireAuthenticated(under: captured)
         let payload = try Requests.createTopic(
             streamID: streamID, partitionsCount: options.partitionsCount ?? TopicCreateOptions.defaultPartitionsCount,
             name: name, options: try options.encode())

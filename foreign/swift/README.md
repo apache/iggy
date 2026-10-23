@@ -251,6 +251,11 @@ request never committed; `ProducerSendError` lists those causes. The Rust produc
 since handed these retries to its client's operation lanes, which the Swift client does
 not have yet.
 
+A send belongs to the session it started in. Once the caller signs in or out, what it
+has not written yet, a background batch still queued, or a retry still waiting, fails
+with `unauthenticated` instead of going under the new session, and a queued batch is
+never merged with one from another session.
+
 With the default ordered sharding, the sends to one stream and topic identifier are
 written in order. A topic addressed by name and by numeric id counts as two, and a
 failed request does not hold back the ones after it, so a resend from `errorHandler`
