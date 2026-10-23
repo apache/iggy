@@ -68,7 +68,7 @@ pub enum MqttProtocol {
     Mqtt5,
 }
 
-pub struct MqttDriver {
+pub(crate) struct MqttDriver {
     client: MqttClient,
     events: mpsc::Receiver<DriverEvent>,
     commands: mpsc::Sender<DriverCommand>,
@@ -76,14 +76,14 @@ pub struct MqttDriver {
     max_packet_size: Arc<AtomicUsize>,
 }
 
-pub struct PublishWindowError {
-    pub error: iggy_connector_sdk::Error,
-    pub retryable: bool,
-    pub requires_clean: bool,
-    pub requires_requeue: bool,
+pub(crate) struct PublishWindowError {
+    pub(crate) error: iggy_connector_sdk::Error,
+    pub(crate) retryable: bool,
+    pub(crate) requires_clean: bool,
+    pub(crate) requires_requeue: bool,
 }
 
-pub enum PublishWindowProgress {
+pub(crate) enum PublishWindowProgress {
     Complete,
     SessionPresent(bool),
 }
@@ -130,17 +130,14 @@ impl PublishWindowFailure {
     fn retryable(&self) -> bool {
         matches!(self, Self::TransientBrokerRejected(_))
     }
-
-    fn requires_requeue(&self) -> bool {
-        self.retryable()
-    }
 }
 
-pub struct PublishWindowState {
+pub(crate) struct PublishWindowState {
     qos: rumqttc::QoS,
     submitted_indexes: VecDeque<usize>,
     packet_to_index: HashMap<u16, usize>,
     confirmed: Vec<bool>,
+    confirmed_count: usize,
 }
 
 impl PublishWindowState {
@@ -150,27 +147,23 @@ impl PublishWindowState {
             submitted_indexes: VecDeque::with_capacity(length),
             packet_to_index: HashMap::with_capacity(length),
             confirmed: vec![false; length],
+            confirmed_count: 0,
         }
     }
 
     fn is_complete(&self) -> bool {
-        self.confirmed.iter().all(|confirmed| *confirmed)
+        self.confirmed_count == self.confirmed.len()
     }
 
     fn submitted(&mut self, index: usize) {
         self.submitted_indexes.push_back(index);
     }
 
-    pub fn reset_from_first_unconfirmed(&mut self) -> Vec<usize> {
-        let Some(first_unconfirmed) = self.confirmed.iter().position(|confirmed| !confirmed) else {
-            return Vec::new();
-        };
-
-        self.submitted_indexes.clear();
-        self.packet_to_index.clear();
-        self.confirmed[first_unconfirmed..].fill(false);
-
-        (first_unconfirmed..self.confirmed.len()).collect()
+    fn confirm(&mut self, index: usize) {
+        if !self.confirmed[index] {
+            self.confirmed[index] = true;
+            self.confirmed_count += 1;
+        }
     }
 
     fn apply(&mut self, event: DriverEvent) -> Result<(), PublishWindowFailure> {
@@ -185,19 +178,19 @@ impl PublishWindowState {
                     ));
                 };
                 if self.qos == rumqttc::QoS::AtMostOnce {
-                    self.confirmed[index] = true;
+                    self.confirm(index);
                 } else {
                     self.packet_to_index.insert(packet_id, index);
                 }
             }
             DriverEvent::PubAck(packet_id) if self.qos == rumqttc::QoS::AtLeastOnce => {
                 if let Some(index) = self.packet_to_index.remove(&packet_id) {
-                    self.confirmed[index] = true;
+                    self.confirm(index);
                 }
             }
             DriverEvent::PubComp(packet_id) if self.qos == rumqttc::QoS::ExactlyOnce => {
                 if let Some(index) = self.packet_to_index.remove(&packet_id) {
-                    self.confirmed[index] = true;
+                    self.confirm(index);
                 }
             }
             DriverEvent::Mqtt5PubAck { packet_id, reason }
@@ -208,7 +201,7 @@ impl PublishWindowState {
                         reason,
                         PubAckReason::Success | PubAckReason::NoMatchingSubscribers
                     ) {
-                        self.confirmed[index] = true;
+                        self.confirm(index);
                     } else {
                         return Err(mqtt5_puback_rejection(packet_id, reason));
                     }
@@ -230,7 +223,7 @@ impl PublishWindowState {
             {
                 if let Some(index) = self.packet_to_index.remove(&packet_id) {
                     if reason == PubCompReason::Success {
-                        self.confirmed[index] = true;
+                        self.confirm(index);
                     } else {
                         return Err(PublishWindowFailure::BrokerRejected(format!(
                             "MQTT 5 PUBCOMP rejected packet ID {packet_id}: {reason:?}"
@@ -250,7 +243,7 @@ impl PublishWindowState {
         Ok(())
     }
 
-    pub fn confirmed_indexes(&self) -> Vec<usize> {
+    pub(crate) fn confirmed_indexes(&self) -> Vec<usize> {
         confirmed_indexes(&self.confirmed)
     }
 }
@@ -274,6 +267,9 @@ enum MqttClient {
 
 enum DriverCommand {
     Clean,
+    DiscardQueuedEvents {
+        result_sender: oneshot::Sender<()>,
+    },
     Shutdown {
         disconnect_timeout: Duration,
         result_sender: oneshot::Sender<Result<(), iggy_connector_sdk::Error>>,
@@ -373,7 +369,7 @@ impl Drop for MqttDriver {
 }
 
 impl MqttDriver {
-    pub async fn connect(
+    pub(crate) async fn connect(
         id: u32,
         config: &MqttSinkConfig,
         client_id: String,
@@ -506,31 +502,28 @@ impl MqttDriver {
         })
     }
 
-    pub fn max_packet_size(&self) -> usize {
+    pub(crate) fn max_packet_size(&self) -> usize {
         self.max_packet_size.load(Ordering::Relaxed)
     }
 
-    pub fn new_publish_window(&self, length: usize, qos: rumqttc::QoS) -> PublishWindowState {
+    pub(crate) fn new_publish_window(
+        &self,
+        length: usize,
+        qos: rumqttc::QoS,
+    ) -> PublishWindowState {
         PublishWindowState::new(length, qos)
     }
 
-    pub async fn enqueue_window(
+    pub(crate) async fn enqueue_window(
         &mut self,
         publications: &[&PreparedPublication],
         indexes: &[usize],
         qos: rumqttc::QoS,
         retain: bool,
         state: &mut PublishWindowState,
-    ) -> Result<(), PublishWindowError> {
+    ) -> Result<(), iggy_connector_sdk::Error> {
         for (&publication, &index) in publications.iter().zip(indexes) {
-            if let Err(error) = self.enqueue_publication(publication, qos, retain).await {
-                return Err(PublishWindowError {
-                    error,
-                    retryable: true,
-                    requires_clean: false,
-                    requires_requeue: false,
-                });
-            }
+            self.enqueue_publication(publication, qos, retain).await?;
             // AsyncClient queues requests in order but does not return packet
             // identifiers. The matching Outgoing::Publish event uses this order.
             state.submitted(index);
@@ -538,21 +531,11 @@ impl MqttDriver {
         Ok(())
     }
 
-    pub async fn drive_window(
+    pub(crate) async fn drive_window(
         &mut self,
         state: &mut PublishWindowState,
-        publish_timeout: Duration,
+        deadline: Instant,
     ) -> Result<PublishWindowProgress, PublishWindowError> {
-        let Some(deadline) = Instant::now().checked_add(publish_timeout) else {
-            return Err(PublishWindowError {
-                error: iggy_connector_sdk::Error::InvalidConfigValue(
-                    "publish_timeout is too large".to_string(),
-                ),
-                retryable: false,
-                requires_clean: false,
-                requires_requeue: false,
-            });
-        };
         while !state.is_complete() {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -606,12 +589,11 @@ impl MqttDriver {
 
             if let Err(error) = state.apply(event) {
                 let retryable = error.retryable();
-                let requires_requeue = error.requires_requeue();
                 return Err(PublishWindowError {
                     error: error.error(),
                     retryable,
                     requires_clean: false,
-                    requires_requeue,
+                    requires_requeue: retryable,
                 });
             }
         }
@@ -619,12 +601,32 @@ impl MqttDriver {
         Ok(PublishWindowProgress::Complete)
     }
 
-    pub async fn clean(&mut self) -> Result<(), iggy_connector_sdk::Error> {
+    pub(crate) async fn clean(&mut self) -> Result<(), iggy_connector_sdk::Error> {
         self.commands.send(DriverCommand::Clean).await.map_err(|_| {
             iggy_connector_sdk::Error::Connection(
                 "MQTT event loop stopped before it could reconnect".to_string(),
             )
         })
+    }
+
+    pub(crate) async fn discard_queued_events(&mut self) -> Result<(), iggy_connector_sdk::Error> {
+        discard_queued_events(&mut self.events);
+        let (result_sender, result_receiver) = oneshot::channel();
+        self.commands
+            .send(DriverCommand::DiscardQueuedEvents { result_sender })
+            .await
+            .map_err(|_| {
+                iggy_connector_sdk::Error::Connection(
+                    "MQTT event loop stopped before it could discard queued events".to_string(),
+                )
+            })?;
+        result_receiver.await.map_err(|_| {
+            iggy_connector_sdk::Error::Connection(
+                "MQTT event loop stopped before it could discard queued events".to_string(),
+            )
+        })?;
+        discard_queued_events(&mut self.events);
+        Ok(())
     }
 
     async fn enqueue_publication(
@@ -669,7 +671,7 @@ impl MqttDriver {
         }
     }
 
-    pub async fn disconnect(
+    pub(crate) async fn disconnect(
         &mut self,
         disconnect_timeout: Duration,
     ) -> Result<(), iggy_connector_sdk::Error> {
@@ -705,10 +707,16 @@ impl MqttDriver {
 
 impl MqttEventLoopTask {
     async fn run(mut self) {
+        let mut pending_event = None;
         loop {
             tokio::select! {
+                biased;
                 command = self.commands.recv() => match command {
                     Some(DriverCommand::Clean) => self.connection.clean(),
+                    Some(DriverCommand::DiscardQueuedEvents { result_sender }) => {
+                        discard_pending_event(&mut pending_event);
+                        let _ = result_sender.send(());
+                    }
                     Some(DriverCommand::Shutdown {
                         disconnect_timeout,
                         result_sender,
@@ -718,6 +726,14 @@ impl MqttEventLoopTask {
                     }
                     None => return,
                 },
+                permit = self.event_sender.reserve(), if pending_event.is_some() => match permit {
+                    Ok(permit) => {
+                        if let Some(event) = pending_event.take() {
+                            permit.send(event);
+                        }
+                    }
+                    Err(_) => return,
+                },
                 result = poll_connection_event(
                     &mut self.connection,
                     self.id,
@@ -725,23 +741,27 @@ impl MqttEventLoopTask {
                     self.retain,
                     self.configured_max_packet_size,
                     &self.max_packet_size,
-                ) => match result {
+                ), if pending_event.is_none() => match result {
                     Ok(DriverEvent::Other) => {}
                     Ok(event) => {
-                        if self.event_sender.send(event).await.is_err() {
-                            return;
-                        }
+                        pending_event = Some(event);
                     }
                     Err(error) => {
                         self.connection.clean();
-                        if self.event_sender.send(DriverEvent::ConnectionError(error)).await.is_err() {
-                            return;
-                        }
+                        pending_event = Some(DriverEvent::ConnectionError(error));
                     }
                 },
             }
         }
     }
+}
+
+fn discard_queued_events(events: &mut mpsc::Receiver<DriverEvent>) {
+    while events.try_recv().is_ok() {}
+}
+
+fn discard_pending_event(pending_event: &mut Option<DriverEvent>) {
+    *pending_event = None;
 }
 
 async fn poll_connection_event(
@@ -808,7 +828,7 @@ async fn poll_connection_event(
     }
 }
 
-pub fn publication_packet_size(
+pub(crate) fn publication_packet_size(
     publication: &PreparedPublication,
     protocol: MqttProtocol,
     qos: u8,
@@ -1514,6 +1534,20 @@ mod tests {
     }
 
     #[test]
+    fn given_duplicate_confirmation_should_count_each_publication_once() {
+        let mut state = PublishWindowState::new(2, rumqttc::QoS::AtLeastOnce);
+
+        state.confirm(0);
+        state.confirm(0);
+
+        assert!(!state.is_complete());
+
+        state.confirm(1);
+
+        assert!(state.is_complete());
+    }
+
+    #[test]
     fn given_session_reset_when_rumqttc_replays_publish_should_keep_its_packet_mapping() {
         let mut state = PublishWindowState::new(1, rumqttc::QoS::ExactlyOnce);
         state.submitted(0);
@@ -1521,31 +1555,6 @@ mod tests {
 
         state.apply(DriverEvent::OutgoingPublish(81)).unwrap();
         state.apply(DriverEvent::PubComp(81)).unwrap();
-
-        assert!(state.is_complete());
-    }
-
-    #[test]
-    fn given_session_reset_when_window_is_requeued_should_replay_from_first_unconfirmed_publication()
-     {
-        let mut state = PublishWindowState::new(2, rumqttc::QoS::AtLeastOnce);
-        state.submitted(0);
-        state.submitted(1);
-        state.apply(DriverEvent::OutgoingPublish(91)).unwrap();
-        state.apply(DriverEvent::OutgoingPublish(92)).unwrap();
-        state.apply(DriverEvent::PubAck(92)).unwrap();
-
-        let replay_indexes = state.reset_from_first_unconfirmed();
-
-        assert_eq!(replay_indexes, vec![0, 1]);
-        assert_eq!(state.confirmed_indexes(), Vec::<usize>::new());
-
-        state.submitted(0);
-        state.submitted(1);
-        state.apply(DriverEvent::OutgoingPublish(93)).unwrap();
-        state.apply(DriverEvent::OutgoingPublish(94)).unwrap();
-        state.apply(DriverEvent::PubAck(93)).unwrap();
-        state.apply(DriverEvent::PubAck(94)).unwrap();
 
         assert!(state.is_complete());
     }
@@ -1606,7 +1615,7 @@ mod tests {
             .unwrap_err();
 
         assert!(error.retryable());
-        assert!(error.requires_requeue());
+        assert!(error.retryable());
         assert!(matches!(
             error.error(),
             iggy_connector_sdk::Error::Connection(message)
@@ -1654,7 +1663,7 @@ mod tests {
             .unwrap_err();
 
         assert!(error.retryable());
-        assert!(error.requires_requeue());
+        assert!(error.retryable());
         assert!(matches!(
             error.error(),
             iggy_connector_sdk::Error::Connection(message)
@@ -1779,5 +1788,34 @@ mod tests {
             options.broker_address(),
             ("broker.example".to_string(), 8883)
         );
+    }
+
+    #[test]
+    fn given_idle_reconnect_events_when_starting_window_should_discard_them() {
+        let (sender, mut events) = tokio::sync::mpsc::channel(2);
+        sender
+            .try_send(DriverEvent::ConnectionError(
+                iggy_connector_sdk::Error::Connection("idle reconnect".to_string()),
+            ))
+            .expect("idle connection error must queue");
+        sender
+            .try_send(DriverEvent::SessionPresent(false))
+            .expect("idle session event must queue");
+
+        super::discard_queued_events(&mut events);
+
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn given_pending_idle_event_when_starting_window_should_discard_it() {
+        let mut pending_event = Some(DriverEvent::SessionPresent(false));
+
+        super::discard_pending_event(&mut pending_event);
+
+        assert!(pending_event.is_none());
     }
 }
