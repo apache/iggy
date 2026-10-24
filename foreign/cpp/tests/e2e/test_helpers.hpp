@@ -214,10 +214,10 @@ class E2ETestFixture : public ::testing::Test {
 
     void CleanupStreams(iggy::IggyBlockingClient &client) {
         for (const auto &stream_name : tracked_stream_names_) {
-            EXPECT_NO_THROW(client.DeleteStream(iggy::Identifier::String(stream_name)));
+            EXPECT_NO_THROW(DeleteStreamForCleanup(client, iggy::Identifier::String(stream_name)));
         }
         for (const auto stream_id : tracked_stream_ids_) {
-            EXPECT_NO_THROW(client.DeleteStream(iggy::Identifier::Numeric(stream_id)));
+            EXPECT_NO_THROW(DeleteStreamForCleanup(client, iggy::Identifier::Numeric(stream_id)));
         }
         tracked_stream_names_.clear();
         tracked_stream_ids_.clear();
@@ -226,16 +226,33 @@ class E2ETestFixture : public ::testing::Test {
     void CleanupStreamsBestEffort(iggy::IggyBlockingClient &client) noexcept {
         try {
             for (const auto &stream_name : tracked_stream_names_) {
-                client.DeleteStream(iggy::Identifier::String(stream_name));
+                DeleteStreamForCleanup(client, iggy::Identifier::String(stream_name));
             }
             for (const auto stream_id : tracked_stream_ids_) {
-                client.DeleteStream(iggy::Identifier::Numeric(stream_id));
+                DeleteStreamForCleanup(client, iggy::Identifier::Numeric(stream_id));
             }
         } catch (...) {
         }
 
         tracked_stream_names_.clear();
         tracked_stream_ids_.clear();
+    }
+
+    void DeleteStreamForCleanup(iggy::IggyBlockingClient &client, const iggy::Identifier &stream) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(40);
+        try {
+            client.DeleteStream(stream);
+        } catch (const iggy::IggyException &error) {
+            if (error.Kind() != "operation_uncertain" || !error.OperationId().has_value()) {
+                throw;
+            }
+            const auto remaining =
+                std::chrono::duration_cast<std::chrono::microseconds>(deadline - std::chrono::steady_clock::now());
+            if (remaining.count() <= 0) {
+                throw;
+            }
+            client.ResolveOperation(*error.OperationId(), remaining);
+        }
     }
 
     void CleanupConsumerGroups(iggy::IggyBlockingClient &client) {

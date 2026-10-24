@@ -1728,7 +1728,7 @@ TEST_F(E2E_ConsumerGroup, GetConsumerGroupOffsetCanBeReadByNonMember) {
     ASSERT_NO_THROW(owner_client.JoinConsumerGroup(iggy::Identifier::String(stream_name),
                                                    iggy::Identifier::String(topic_name),
                                                    iggy::Identifier::String(group_name)));
-    ASSERT_TRUE(wait_for_consumer_group_assignment(client, iggy::Identifier::String(stream_name),
+    ASSERT_TRUE(wait_for_consumer_group_assignment(owner_client, iggy::Identifier::String(stream_name),
                                                    iggy::Identifier::String(topic_name),
                                                    iggy::Identifier::String(group_name), 1));
     const auto named_group = iggy::Consumer::Group(iggy::Identifier::String(group_name));
@@ -2035,7 +2035,7 @@ TEST_F(E2E_ConsumerGroup, DeleteConsumerGroupOffsetForUnownedPartitionThrowsWith
     ASSERT_NO_THROW(owner_client.JoinConsumerGroup(iggy::Identifier::String(stream_name),
                                                    iggy::Identifier::String(topic_name),
                                                    iggy::Identifier::String(group_name)));
-    ASSERT_TRUE(wait_for_consumer_group_assignment(client, iggy::Identifier::String(stream_name),
+    ASSERT_TRUE(wait_for_consumer_group_assignment(owner_client, iggy::Identifier::String(stream_name),
                                                    iggy::Identifier::String(topic_name),
                                                    iggy::Identifier::String(group_name), 1));
     const auto consumer_group = iggy::Consumer::Group(iggy::Identifier::String(group_name));
