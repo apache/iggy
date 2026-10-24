@@ -12632,13 +12632,10 @@ where
                 .map(|durable| durable.saturating_add(1))
                 .max(self.installed_frontier);
             let committed_shape = journal.repaired_window_shape(floor, session.commit_to_op);
-            // Read at check time, not collected per frame: the journal keeps
-            // each batch's own stamps, so a batch journaled before this floor
-            // settled anchors it as well as one served after.
-            let first_batch_offset = journal.first_batch_offset(floor, session.commit_to_op);
-            let connected = match (first_batch_offset, stand_in) {
-                (Some(first), Some(bound)) => first <= bound,
-                (Some(first), None) => first == 0,
+            let anchor = self.repair_window_anchor(floor, session.commit_to_op);
+            let connected = match (anchor, stand_in) {
+                (Some(anchor), Some(bound)) => anchor.base_offset <= bound,
+                (Some(anchor), None) => anchor.base_offset == 0,
                 // No batch above the floor, so nothing ties the floor to this
                 // replica's offsets. The floor stands only while this journal
                 // lacks an op up to the reported floor, and no shape of the
@@ -12646,40 +12643,22 @@ where
                 // messages. Refused, the window goes to state transfer.
                 (None, _) => false,
             };
-            if !connected {
-                tracing::error!(
-                    target: "iggy.partitions.diag",
-                    plane = "partitions",
-                    namespace_raw = self.namespace().inner(),
-                    floor,
-                    first_batch_offset = ?first_batch_offset,
-                    recovered_durable_offset = ?durable_end,
-                    "refusing commit floor: repaired window does not connect \
-                     to recovered durable state (needs state transfer)"
-                );
-                self.commit_journal(config).await;
-                // A refusal is DEFINITIVE only once the window itself is
-                // fully present (or provably empty): until then a frame can
-                // still land a lower first batch that connects, so the
-                // session stays armed and the stall retry re-requests.
-                // A complete window that still cannot connect will never
-                // improve -- the peer retains nothing below the floor and
-                // this replica holds nothing either -- and an EMPTY window
-                // (everything evicted) re-raises identically every round.
-                // Both are the state-transfer trigger; the session is
-                // dropped here so the caller's arming funnel starts clean,
-                // and a transfer-unavailable fallback re-arms repair fresh.
-                if committed_shape.complete {
-                    self.repair = None;
-                    return RepairConclusion::FloorRefused {
-                        floor,
-                        to_op: session.commit_to_op,
-                    };
+            if connected {
+                if floor > self.consensus().commit_min() {
+                    self.consensus().set_commit_floor(floor);
                 }
-                return RepairConclusion::InProgress;
-            }
-            if floor > self.consensus().commit_min() {
-                self.consensus().set_commit_floor(floor);
+            } else if let Some(conclusion) = self
+                .refuse_disconnected_floor(
+                    config,
+                    session,
+                    floor,
+                    durable_end,
+                    anchor,
+                    committed_shape.complete,
+                )
+                .await
+            {
+                return conclusion;
             }
         }
         if self
@@ -12743,6 +12722,178 @@ where
         } else {
             RepairConclusion::InProgress
         }
+    }
+
+    /// Judge a floor whose window may not connect to recovered durable state.
+    ///
+    /// `Some(FloorRefused)` once the refusal is final, `Some(InProgress)` while
+    /// a frame still to come can land below the anchor and connect, or `None`
+    /// when the walk below makes the floor moot and completion proceeds as
+    /// without one.
+    async fn refuse_disconnected_floor(
+        &mut self,
+        config: &PartitionsConfig,
+        session: RepairSession,
+        floor: u64,
+        durable_end: Option<u64>,
+        anchor: Option<RepairAnchor>,
+        window_complete: bool,
+    ) -> Option<RepairConclusion> {
+        self.commit_journal(config).await;
+        // Ops this replica already held can carry the walk past the floor.
+        // Under lazy flush their headers stay resident, so the leading edge
+        // below would read as resident and refuse a floor that no longer
+        // moves `commit_min`, spending a state transfer on nothing. Judged by
+        // the peer's unclamped floor: one clamped down to `commit_max` still
+        // names ops the peer evicted.
+        if session
+            .floor
+            .is_some_and(|raw_floor| self.consensus().commit_min() >= raw_floor)
+        {
+            return None;
+        }
+        let leading_edge_resident = self.repair_leading_edge_resident(floor, anchor);
+        // Definitive once the window, or its leading edge `(floor, anchor.op)`,
+        // is resident: until then a frame still to come can land below the
+        // anchor and connect. The leading edge suffices because the primary
+        // assigns offsets in op order.
+        if window_complete || leading_edge_resident {
+            let reason = if window_complete {
+                "whole_window"
+            } else {
+                "leading_edge"
+            };
+            tracing::error!(
+                target: "iggy.partitions.diag",
+                plane = "partitions",
+                namespace_raw = self.namespace().inner(),
+                floor,
+                reported_floor = ?session.floor,
+                commit_to_op = session.commit_to_op,
+                anchor_op = ?anchor.map(|anchor| anchor.op),
+                anchor_base_offset = ?anchor.map(|anchor| anchor.base_offset),
+                reason,
+                recovered_durable_offset = ?durable_end,
+                "refusing commit floor: repaired window does not connect \
+                 to recovered durable state (needs state transfer)"
+            );
+            self.repair = None;
+            return Some(RepairConclusion::FloorRefused {
+                floor,
+                to_op: session.commit_to_op,
+            });
+        }
+        tracing::warn!(
+            target: "iggy.partitions.diag",
+            plane = "partitions",
+            namespace_raw = self.namespace().inner(),
+            floor,
+            commit_to_op = session.commit_to_op,
+            anchor_op = ?anchor.map(|anchor| anchor.op),
+            anchor_base_offset = ?anchor.map(|anchor| anchor.base_offset),
+            recovered_durable_offset = ?durable_end,
+            "commit floor does not connect yet; repairing below the anchor"
+        );
+        Some(RepairConclusion::InProgress)
+    }
+
+    /// Where the next pull of the repair window starts: past the resident
+    /// prefix above a floor that still holds the walk, else past the held run
+    /// above `commit_min`. `None` without a session.
+    ///
+    /// A held walk never moves `commit_min`, so pulling from it re-serves the
+    /// same first chunk forever while the rest of the window stays absent.
+    #[must_use]
+    pub fn repair_pull_from(&self) -> Option<u64> {
+        let session = self.repair.as_ref()?;
+        let commit_min = self.consensus().commit_min();
+        let journal = &self.log.journal().inner;
+        let Some(floor) = session.floor.filter(|&floor| floor > commit_min) else {
+            return Some(journal.held_through(commit_min).saturating_add(1));
+        };
+        let mut op = floor.saturating_add(1);
+        while op <= session.fetch_to_op && journal.holds_op(op) {
+            op += 1;
+        }
+        Some(op)
+    }
+
+    /// The next chunk to pull right after a `RepairDone` while a floor holds
+    /// the walk, or `None` when the resident prefix has not grown since the
+    /// last such pull or reaches past `fetch_to_op`. A returned chunk is
+    /// recorded in the session's `floor_pulled_from`, so the same start is
+    /// never returned twice.
+    #[must_use]
+    pub fn next_floor_pull(&mut self) -> Option<u64> {
+        let commit_min = self.consensus().commit_min();
+        let from_op = self.repair_pull_from()?;
+        let session = self.repair.as_mut()?;
+        let floor_pending = session.floor.is_some_and(|floor| floor > commit_min);
+        if !floor_pending || from_op > session.fetch_to_op || from_op <= session.floor_pulled_from {
+            return None;
+        }
+        session.floor_pulled_from = from_op;
+        Some(from_op)
+    }
+
+    /// The lowest resident `SendMessages` batch in `(floor, commit_to_op]`:
+    /// where the repair window begins in offset space.
+    ///
+    /// Read from the journal rather than tracked per session. A batch at or
+    /// below the floor is not what the floor claims recovered state stands in
+    /// for, and a batch resident from an earlier session or the boot WAL
+    /// counts as much as one repaired now.
+    fn repair_window_anchor(&self, floor: u64, commit_to_op: u64) -> Option<RepairAnchor> {
+        let from = floor.checked_add(1)?;
+        let (op, entry) = self
+            .log
+            .journal()
+            .inner
+            .lowest_resident_send_in(from..=commit_to_op)?;
+        // The batch checksum covers `base_offset` and hashes only each frame's
+        // stored checksum, so a corrupt header still yields no anchor and the
+        // floor is refused, without hashing every message body.
+        let batch = decode_prepare_slice_trusted(entry.as_slice())
+            .inspect_err(|error| {
+                tracing::warn!(
+                    target: "iggy.partitions.diag",
+                    plane = "partitions",
+                    namespace_raw = self.namespace().inner(),
+                    op,
+                    %error,
+                    "resident repair batch does not decode; the window has no anchor"
+                );
+            })
+            .ok()?;
+        let batch_checksum = batch.header.checksum_for_blob(batch.blob());
+        if batch_checksum != batch.header.batch_checksum {
+            tracing::warn!(
+                target: "iggy.partitions.diag",
+                plane = "partitions",
+                namespace_raw = self.namespace().inner(),
+                op,
+                stored = batch.header.batch_checksum,
+                computed = batch_checksum,
+                "resident repair batch fails its batch checksum; the window has no anchor"
+            );
+            return None;
+        }
+        Some(RepairAnchor {
+            op,
+            base_offset: batch.header.base_offset,
+        })
+    }
+
+    /// Whether every op in `(floor, anchor.op)` is resident, so no frame still
+    /// to come can land below the anchor.
+    fn repair_leading_edge_resident(&self, floor: u64, anchor: Option<RepairAnchor>) -> bool {
+        anchor.is_some_and(|anchor| {
+            self.log
+                .journal()
+                .inner
+                .repaired_window_shape(floor, anchor.op.saturating_sub(1))
+                .complete
+        })
     }
 
     /// Journal a repaired `SendMessages` prepare, preserving its embedded
@@ -12886,6 +13037,13 @@ where
     pub fn applied_header(&self, op: u64) -> Option<PrepareHeader> {
         self.log.journal().inner.repair_header(op)
     }
+}
+
+/// The batch a repair window's floor-connect check is judged by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RepairAnchor {
+    op: u64,
+    base_offset: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -13859,6 +14017,81 @@ mod tests {
         receiver.set_partition_dir(directory.path().to_string_lossy().into_owned());
         set_offset_dirs_under(&mut receiver, directory.path());
         (directory, receiver)
+    }
+
+    /// A replica that needs state transfer while producers keep writing. The
+    /// serving primary builds its offer at its `commit_min`. The pull takes
+    /// seconds for a large active segment, and meanwhile the primary's commit
+    /// heartbeats raise the receiver's `commit_max` past the offer. The
+    /// receiver's journal stopped at the gap, so its sequencer is below the
+    /// offer and the install erases nothing it journaled. The committed tail
+    /// above the offer is what journal repair fetches after the install.
+    ///
+    /// Pins `install_state_transfer`, not the repair floor check. Refusing
+    /// such an offer is a livelock: under sustained load every offer
+    /// is below `commit_max` by the time it lands, every round is refused with
+    /// "transfer frontier X is below the local commit frontier Y", and the
+    /// replica keeps serving reads from its stale prefix.
+    #[compio::test]
+    async fn given_commit_max_advanced_during_the_pull_when_installing_should_land_and_leave_the_tail_to_repair()
+     {
+        let origin_directory = tempfile::tempdir().unwrap();
+        let receiver_directory = tempfile::tempdir().unwrap();
+        let (mut origin, _) = recording_partition_at(0, 3);
+        origin.set_partition_dir(origin_directory.path().to_string_lossy().into_owned());
+        let committed = checksummed_segment_prepare(1, 0, 0, b"committed");
+        origin
+            .log
+            .journal()
+            .inner
+            .append(committed.clone().into_frozen())
+            .await
+            .unwrap();
+        origin.consensus().sequencer().set_sequence(1);
+        origin
+            .consensus()
+            .set_last_prepare_checksum(committed.header().checksum);
+        origin.consensus().advance_commit_max(1);
+        origin.consensus().advance_commit_min(1);
+        origin
+            .dedup_mut()
+            .commit_capacity(usize::try_from(committed.header().retry_capacity).unwrap())
+            .unwrap();
+        origin.offset_space.committed_seeded = true;
+        origin.offset.store(0, Ordering::Relaxed);
+        origin.log.journal().inner.evict_prefix(1);
+        let offer = origin.state_transfer_offer(&repair_config()).await.unwrap();
+        assert_eq!(offer.commit_op, 1);
+
+        let (mut receiver, _) = recording_partition_at(1, 3);
+        receiver.set_partition_dir(receiver_directory.path().to_string_lossy().into_owned());
+        set_offset_dirs_under(&mut receiver, receiver_directory.path());
+        // Learned from the primary's commit heartbeats while the pull ran. The
+        // journal never got past the gap, so nothing above the offer is
+        // journaled here.
+        receiver.consensus().advance_commit_max(4);
+        assert_eq!(receiver.consensus().sequencer().current_sequence(), 0);
+
+        let installed = receiver
+            .install_state_transfer(
+                &repair_config(),
+                offer.commit_op,
+                Vec::new(),
+                &offer.offsets.1,
+            )
+            .await;
+
+        assert!(
+            installed.is_ok(),
+            "an offer that erases no journaled op must install, got {installed:?}"
+        );
+        assert_eq!(receiver.consensus().commit_min(), 1);
+        assert_eq!(receiver.consensus().sequencer().current_sequence(), 1);
+        assert_eq!(
+            receiver.consensus().commit_max(),
+            4,
+            "the committed tail above the offer stays known for journal repair to fetch"
+        );
     }
 
     #[compio::test]
@@ -30694,14 +30927,23 @@ mod tests {
 
     fn armed_fetch_session(to_op: u64, fetch_to_op: u64, floor: u64) -> RepairSession {
         RepairSession {
+            floor: Some(floor),
+            ..floorless_session(to_op, fetch_to_op)
+        }
+    }
+
+    /// A session at view 0 against peer 0 that has not learned a floor yet.
+    fn floorless_session(commit_to_op: u64, fetch_to_op: u64) -> RepairSession {
+        RepairSession {
             nonce: 1,
             view: 0,
             from_op: 1,
-            commit_to_op: to_op,
+            commit_to_op,
             fetch_to_op,
-            floor: Some(floor),
+            floor: None,
             peer: 0,
             idle_ticks: 0,
+            floor_pulled_from: 0,
             requested_from: Some(1),
         }
     }
@@ -31532,8 +31774,18 @@ mod tests {
     /// A repaired `SendMessages` prepare with an explicit chain identity, as a
     /// serving peer ships it.
     fn repaired_send_prepare(op: u64, parent: u128, checksum: u128) -> Message<PrepareHeader> {
+        repaired_send_prepare_at(op, op, parent, checksum)
+    }
+
+    /// [`repaired_send_prepare`] with its batch stamped at `base_offset`.
+    fn repaired_send_prepare_at(
+        op: u64,
+        base_offset: u64,
+        parent: u128,
+        checksum: u128,
+    ) -> Message<PrepareHeader> {
         let namespace = IggyNamespace::new(1, 1, 0);
-        let record = build_segment_record(namespace, op);
+        let record = build_segment_record(namespace, base_offset);
         let header_size = std::mem::size_of::<PrepareHeader>();
         let total = header_size + record.len();
         let mut message = Message::<PrepareHeader>::new(total);
@@ -31630,10 +31882,12 @@ mod tests {
     }
 
     /// Without a prepare WAL a refused floor stays in progress while the
-    /// window is incomplete, and every re-request gets the same chunk back.
-    /// Those frames are held, so the budget must run out and rotate the peer.
-    /// Above a committed prefix, so the walk mark that the first round records
-    /// must not pass for progress in the rounds after it.
+    /// window is incomplete. Every round loses op `FLOOR + 1`, so the leading
+    /// edge below the anchor stays open and the refusal never turns final,
+    /// while the rest of each round re-serves frames this journal already
+    /// holds. Held frames are no progress, so the budget must run out and
+    /// rotate the peer. Above a committed prefix, so the walk mark that the
+    /// first round records must not pass for progress in the rounds after it.
     #[compio::test]
     async fn given_walless_refused_floor_when_peer_re_serves_held_frames_should_rotate_session() {
         const COMMIT_MIN: u64 = 5;
@@ -31650,7 +31904,7 @@ mod tests {
 
         let mut verdicts = Vec::new();
         for _ in 0..=crate::types::REPAIR_MAX_STALL_RETRIES {
-            for op in FLOOR + 1..=SERVED_THROUGH {
+            for op in FLOOR + 2..=SERVED_THROUGH {
                 backup
                     .apply_repaired_prepare(checksummed_segment_prepare(op, 0, op - 1, b"repaired"))
                     .await;
@@ -32458,11 +32712,11 @@ mod tests {
         let mut partition = test_partition();
         partition.consensus().advance_commit_max(8);
         // No recovered segments (durable end None) and the served window's
-        // first batch starts at offset 3: ops below the floor are neither
+        // first batch starts at offset 8: ops below the floor are neither
         // locally durable nor repaired.
         partition.repair = Some(armed_session(8, 5));
         partition
-            .apply_repaired_prepare(checksummed_segment_prepare(6, 0, 3, b"repaired"))
+            .apply_repaired_prepare(repaired_send_prepare(8, 0, 0x88))
             .await;
 
         let conclusion = partition.complete_repair(&repair_config()).await;
@@ -32470,11 +32724,444 @@ mod tests {
         assert_eq!(
             conclusion,
             RepairConclusion::InProgress,
-            "with the window incomplete, later frames can still land a lower \
-             first batch that connects"
+            "with the window incomplete, later frames can still land below \
+             the anchor and connect"
         );
         assert_eq!(partition.consensus().commit_min(), 0);
         assert!(partition.repair.is_some());
+    }
+
+    /// The repair window `(floor, to_op]` is longer than one repair chunk and
+    /// only its first chunk arrived. The anchor (op 7, offset 7) starts above
+    /// the recovered durable end (offset 3) and every op between the floor and
+    /// it is resident, so the refusal is final and must hand recovery to state
+    /// transfer.
+    #[compio::test]
+    async fn given_a_resident_leading_edge_above_durable_end_when_the_window_is_longer_than_a_chunk_should_refuse_commit_floor()
+     {
+        let mut partition = test_partition();
+        partition.consensus().advance_commit_max(300);
+        partition.recovered_durable_offset = Some(3);
+        partition.repair = Some(armed_session(300, 5));
+        journal_prepare(&partition, 6, Operation::CreateStream).await;
+        partition
+            .apply_repaired_prepare(repaired_send_prepare(7, 0, 0x77))
+            .await;
+        for op in 8..=133 {
+            journal_prepare(&partition, op, Operation::CreateStream).await;
+        }
+
+        let conclusion = partition.complete_repair(&repair_config()).await;
+
+        assert_eq!(
+            conclusion,
+            RepairConclusion::FloorRefused {
+                floor: 5,
+                to_op: 300
+            },
+            "a resident leading edge fixes where the window starts, so the \
+             refusal is final"
+        );
+        assert!(
+            partition.repair.is_none(),
+            "a definitive refusal hands recovery to state transfer"
+        );
+    }
+
+    /// A stall rotation drops the session that repaired ops 6 and 7, and the
+    /// next session learns the floor. The batches are resident whichever
+    /// session journaled them, so they anchor the check.
+    #[compio::test]
+    async fn given_a_connecting_batch_from_an_earlier_session_when_the_floor_arrives_should_accept_it()
+     {
+        let mut partition = test_partition();
+        partition.consensus().advance_commit_max(300);
+        partition.recovered_durable_offset = Some(3);
+        partition.repair = Some(floorless_session(300, 300));
+        partition
+            .apply_repaired_prepare(repaired_send_prepare_at(6, 4, 0, 0x66))
+            .await;
+        partition
+            .apply_repaired_prepare(repaired_send_prepare_at(7, 5, 0x66, 0x77))
+            .await;
+        partition.repair = None;
+        partition.repair = Some(armed_session(300, 5));
+
+        let conclusion = partition.complete_repair(&repair_config()).await;
+
+        assert_eq!(conclusion, RepairConclusion::InProgress);
+        assert_eq!(
+            partition.consensus().commit_min(),
+            7,
+            "the window connects at offset 4, so the floor stands and the walk \
+             commits the resident batches above it"
+        );
+        assert!(partition.repair.is_some());
+    }
+
+    /// The same shape as above with batches that start past the durable end:
+    /// resident from an earlier session or not, nothing below them is
+    /// missing, so the refusal is final.
+    #[compio::test]
+    async fn given_a_disconnected_batch_from_an_earlier_session_when_the_floor_arrives_should_refuse_commit_floor()
+     {
+        let mut partition = test_partition();
+        partition.consensus().advance_commit_max(300);
+        partition.recovered_durable_offset = Some(3);
+        partition.repair = Some(floorless_session(300, 300));
+        partition
+            .apply_repaired_prepare(repaired_send_prepare(6, 0, 0x66))
+            .await;
+        partition
+            .apply_repaired_prepare(repaired_send_prepare(7, 0x66, 0x77))
+            .await;
+        partition.repair = None;
+        partition.repair = Some(armed_session(300, 5));
+
+        let conclusion = partition.complete_repair(&repair_config()).await;
+
+        assert_eq!(
+            conclusion,
+            RepairConclusion::FloorRefused {
+                floor: 5,
+                to_op: 300
+            }
+        );
+        assert_eq!(partition.consensus().commit_min(), 0);
+        assert!(partition.repair.is_none());
+    }
+
+    /// The anchor sits directly above the floor, so the leading edge is empty
+    /// and the refusal is final at once.
+    #[compio::test]
+    async fn given_the_anchor_directly_above_the_floor_when_it_does_not_connect_should_refuse_commit_floor()
+     {
+        let mut partition = test_partition();
+        partition.consensus().advance_commit_max(300);
+        partition.recovered_durable_offset = Some(3);
+        partition.repair = Some(armed_session(300, 5));
+        partition
+            .apply_repaired_prepare(repaired_send_prepare(6, 0, 0x66))
+            .await;
+
+        let conclusion = partition.complete_repair(&repair_config()).await;
+
+        assert_eq!(
+            conclusion,
+            RepairConclusion::FloorRefused {
+                floor: 5,
+                to_op: 300
+            }
+        );
+        assert!(partition.repair.is_none());
+    }
+
+    /// A resident batch whose stamped `base_offset` no longer matches its batch
+    /// checksum says nothing about where the window begins, so it must not
+    /// anchor the floor however well the forged offset would connect.
+    #[compio::test]
+    async fn given_a_resident_batch_with_a_corrupt_base_offset_when_anchoring_should_yield_no_anchor()
+     {
+        const FLOOR: u64 = 5;
+        const OP: u64 = FLOOR + 1;
+        let partition = test_partition();
+        let mut prepare = repaired_send_prepare_at(OP, OP, 0, 0x66);
+        let base_offset_at = std::mem::size_of::<PrepareHeader>() + 8;
+        prepare.as_mut_slice()[base_offset_at..base_offset_at + 8]
+            .copy_from_slice(&0u64.to_le_bytes());
+        partition
+            .log
+            .journal()
+            .inner
+            .append(prepare.into_frozen())
+            .await
+            .expect("journal append");
+
+        assert_eq!(partition.repair_window_anchor(FLOOR, 300), None);
+    }
+
+    #[compio::test]
+    async fn given_a_resident_batch_with_an_intact_checksum_when_anchoring_should_read_its_base_offset()
+     {
+        const FLOOR: u64 = 5;
+        const OP: u64 = FLOOR + 1;
+        let partition = test_partition();
+        partition
+            .log
+            .journal()
+            .inner
+            .append(repaired_send_prepare_at(OP, OP, 0, 0x66).into_frozen())
+            .await
+            .expect("journal append");
+
+        assert_eq!(
+            partition.repair_window_anchor(FLOOR, 300),
+            Some(RepairAnchor {
+                op: OP,
+                base_offset: OP
+            })
+        );
+    }
+
+    /// An op below the anchor is still missing, so a frame for it may yet
+    /// connect the window.
+    #[compio::test]
+    async fn given_a_hole_below_the_anchor_when_the_window_is_incomplete_should_keep_repairing() {
+        let mut partition = test_partition();
+        partition.consensus().advance_commit_max(300);
+        partition.recovered_durable_offset = Some(3);
+        partition.repair = Some(armed_session(300, 5));
+        journal_prepare(&partition, 6, Operation::CreateStream).await;
+        partition
+            .apply_repaired_prepare(repaired_send_prepare(8, 0, 0x88))
+            .await;
+
+        let conclusion = partition.complete_repair(&repair_config()).await;
+
+        assert_eq!(conclusion, RepairConclusion::InProgress);
+        assert!(partition.repair.is_some());
+    }
+
+    /// Round one repaired op 4 and lost op 5. Before the stall retry the peer
+    /// evicted through op 5, so the floor lands at 5 and the retry serves only
+    /// ops 6 to 10. Op 4 connects to the durable end, but the floor claims
+    /// recovered state stands in for op 5, which this replica holds nowhere.
+    /// Accepting that floor commits and serves a log missing offset 5.
+    #[compio::test]
+    async fn given_a_connecting_batch_below_a_raised_floor_when_the_floor_arrives_should_refuse_it()
+    {
+        let mut partition = test_partition();
+        partition.consensus().advance_commit_max(10);
+        partition.recovered_durable_offset = Some(3);
+        partition.repair = Some(armed_session(10, 5));
+        partition
+            .apply_repaired_prepare(repaired_send_prepare(4, 0, 0x44))
+            .await;
+        for op in 6..=10u64 {
+            partition
+                .apply_repaired_prepare(repaired_send_prepare(op, 0, 0x100 + u128::from(op)))
+                .await;
+        }
+
+        let conclusion = partition.complete_repair(&repair_config()).await;
+
+        assert_eq!(
+            conclusion,
+            RepairConclusion::FloorRefused {
+                floor: 5,
+                to_op: 10
+            },
+            "a batch at or below the floor must not anchor the connect check"
+        );
+        assert!(
+            partition.consensus().commit_min() < 5,
+            "the floor must not skip op 5"
+        );
+    }
+
+    /// The first stream repaired op 4 and the walk committed through it. The
+    /// stall retry then learns a floor at 6, above the still-missing op 5.
+    /// The committed op 4 must not stand in for the window above the floor.
+    #[compio::test]
+    async fn given_a_committed_batch_below_the_floor_when_the_floor_arrives_should_keep_repairing()
+    {
+        let mut partition = test_partition();
+        partition.consensus().advance_commit_max(300);
+        partition.recovered_durable_offset = Some(3);
+        partition.repair = Some(armed_session(300, 6));
+        for op in 1..=3 {
+            journal_prepare(&partition, op, Operation::CreateStream).await;
+        }
+        partition
+            .apply_repaired_prepare(repaired_send_prepare(4, 0, 0x44))
+            .await;
+        partition.commit_journal(&repair_config()).await;
+        assert_eq!(partition.consensus().commit_min(), 4);
+
+        let conclusion = partition.complete_repair(&repair_config()).await;
+
+        assert_eq!(conclusion, RepairConclusion::InProgress);
+        assert_eq!(
+            partition.consensus().commit_min(),
+            4,
+            "the floor must not skip op 5"
+        );
+        assert!(partition.repair.is_some());
+    }
+
+    /// Ops up to the floor were resident but uncommitted, so the walk inside
+    /// the refusal passes the floor. With lazy flush their headers stay
+    /// resident and the leading edge reads as complete, but a floor below
+    /// `commit_min` moves nothing and is no reason for a state transfer.
+    #[compio::test]
+    async fn given_lazy_flush_when_the_walk_passes_a_disconnected_floor_should_keep_repairing() {
+        let mut partition = test_partition();
+        partition.consensus().advance_commit_max(300);
+        partition.recovered_durable_offset = Some(3);
+        partition.repair = Some(armed_session(300, 5));
+        for op in 1..=6 {
+            journal_prepare(&partition, op, Operation::CreateStream).await;
+        }
+        partition
+            .apply_repaired_prepare(repaired_send_prepare(7, 0, 0x77))
+            .await;
+        let lazy = PartitionsConfig {
+            messages_required_to_save: 10_000,
+            size_of_messages_required_to_save: IggyByteSize::from(512 * 1024 * 1024),
+            ..repair_config()
+        };
+
+        let conclusion = partition.complete_repair(&lazy).await;
+
+        assert_eq!(conclusion, RepairConclusion::InProgress);
+        assert_eq!(partition.consensus().commit_min(), 7);
+        assert!(
+            partition.log.journal().inner.holds_op(6),
+            "lazy flush keeps the committed headers resident"
+        );
+        assert!(partition.repair.is_some());
+    }
+
+    /// The resident run past the floor is longer than one capped commit walk.
+    /// The floor is moot from the start, because this journal holds every op
+    /// up to it. One walk stops below the floor, and a floor judged there
+    /// reads as disconnected and spends a state transfer on ops already held.
+    #[compio::test]
+    async fn given_resident_run_longer_than_one_walk_when_it_passes_a_disconnected_floor_should_keep_repairing()
+     {
+        const FLOOR: u64 = COMMIT_WALK_OPS_MAX as u64 + 6;
+        let mut partition = test_partition();
+        partition.consensus().advance_commit_max(300);
+        partition.recovered_durable_offset = Some(3);
+        partition.repair = Some(armed_session(300, FLOOR));
+        for op in 1..=FLOOR + 1 {
+            journal_prepare(&partition, op, Operation::CreateStream).await;
+        }
+        partition
+            .apply_repaired_prepare(repaired_send_prepare(FLOOR + 2, 0, 0x77))
+            .await;
+
+        let conclusion = partition.complete_repair(&repair_config()).await;
+
+        assert_eq!(conclusion, RepairConclusion::InProgress);
+        assert_eq!(
+            partition.consensus().commit_min(),
+            COMMIT_WALK_OPS_MAX as u64,
+            "one capped walk, the rest resumes on the next"
+        );
+        assert!(partition.repair.is_some());
+    }
+
+    /// As above, with the whole repaired window resident, which would make a
+    /// refusal final. A resident run that reaches the floor drops the floor
+    /// before any capped walk, so the walk cap cannot turn it into a refusal.
+    #[compio::test]
+    async fn given_resident_run_longer_than_one_walk_when_the_window_is_complete_should_keep_repairing()
+     {
+        const FLOOR: u64 = COMMIT_WALK_OPS_MAX as u64 + 6;
+        let mut partition = test_partition();
+        partition.consensus().advance_commit_max(FLOOR + 2);
+        partition.recovered_durable_offset = Some(3);
+        partition.repair = Some(armed_session(FLOOR + 2, FLOOR));
+        for op in 1..=FLOOR {
+            journal_prepare(&partition, op, Operation::CreateStream).await;
+        }
+        for op in FLOOR + 1..=FLOOR + 2 {
+            partition
+                .apply_repaired_prepare(repaired_send_prepare(op, 0, u128::from(op)))
+                .await;
+        }
+
+        let conclusion = partition.complete_repair(&repair_config()).await;
+
+        assert_eq!(conclusion, RepairConclusion::InProgress);
+        assert!(partition.repair.is_some(), "no state transfer for held ops");
+    }
+
+    /// Repair frames arrive out of order. Op 7 connects at offset 4, op 9 does
+    /// not, and the window is judged by the lower one whichever lands first.
+    #[compio::test]
+    async fn given_batches_applied_out_of_order_when_the_floor_arrives_should_anchor_on_the_lowest()
+    {
+        for ops in [[9, 7], [7, 9]] {
+            let mut partition = test_partition();
+            partition.consensus().advance_commit_max(300);
+            partition.recovered_durable_offset = Some(3);
+            partition.repair = Some(armed_session(300, 5));
+            for op in ops {
+                let base_offset = if op == 7 { 4 } else { 6 };
+                partition
+                    .apply_repaired_prepare(repaired_send_prepare_at(
+                        op,
+                        base_offset,
+                        0,
+                        u128::from(op),
+                    ))
+                    .await;
+            }
+
+            let conclusion = partition.complete_repair(&repair_config()).await;
+
+            assert_eq!(conclusion, RepairConclusion::InProgress, "order {ops:?}");
+            assert_eq!(
+                partition.consensus().commit_min(),
+                5,
+                "order {ops:?}: the lowest batch connects, so the floor stands"
+            );
+        }
+    }
+
+    /// A floor holds the walk and the first served chunk carries no message,
+    /// so nothing anchors the window yet. Pulling again from `commit_min + 1`
+    /// re-serves that same chunk forever; the pull must start past it.
+    #[compio::test]
+    async fn given_a_floor_holding_the_walk_when_the_first_chunk_has_no_batch_should_pull_past_it()
+    {
+        const FLOOR: u64 = 5;
+        // One full shard repair chunk above the floor.
+        const FIRST_CHUNK_LAST: u64 = FLOOR + 128;
+        const TO_OP: u64 = FIRST_CHUNK_LAST + 10;
+        const SEND_OP: u64 = FIRST_CHUNK_LAST + 7;
+        let mut partition = test_partition();
+        partition.consensus().advance_commit_max(TO_OP);
+        partition.recovered_durable_offset = Some(3);
+        partition.repair = Some(armed_session(TO_OP, FLOOR));
+        for op in FLOOR + 1..=FIRST_CHUNK_LAST {
+            journal_prepare(&partition, op, Operation::CreateStream).await;
+        }
+
+        for _ in 0..2 {
+            assert_eq!(
+                partition.complete_repair(&repair_config()).await,
+                RepairConclusion::InProgress
+            );
+            assert_eq!(partition.consensus().commit_min(), 0);
+        }
+        assert_eq!(partition.repair_pull_from(), Some(FIRST_CHUNK_LAST + 1));
+        assert_eq!(partition.next_floor_pull(), Some(FIRST_CHUNK_LAST + 1));
+        assert_eq!(
+            partition.next_floor_pull(),
+            None,
+            "nothing new is resident, so the next pull waits for the stall retry"
+        );
+
+        for op in FIRST_CHUNK_LAST + 1..=TO_OP {
+            if op == SEND_OP {
+                partition
+                    .apply_repaired_prepare(repaired_send_prepare_at(op, 200, 0, u128::from(op)))
+                    .await;
+            } else {
+                journal_prepare(&partition, op, Operation::CreateStream).await;
+            }
+        }
+
+        assert_eq!(
+            partition.complete_repair(&repair_config()).await,
+            RepairConclusion::FloorRefused {
+                floor: FLOOR,
+                to_op: TO_OP
+            }
+        );
     }
 
     /// A backup without a WAL that repairs `(0, to_op]` and has walked ops
