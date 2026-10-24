@@ -860,10 +860,10 @@ SendMessagesConfirmation SendMessagesConfirmation::FromFfi(ffi::SendMessagesConf
                                     confirmation.base_offset);
 }
 
-SendMessagesResponse SendMessagesResponse::FromFfi(ffi::SendMessagesResponse response) {
+SendMessagesResponse SendMessagesResponse::FromFfi(const ffi::SendMessagesResponse &response) {
     std::vector<SendMessagesConfirmation> confirmations;
     confirmations.reserve(response.confirmations.size());
-    for (auto &confirmation : response.confirmations) {
+    for (const auto &confirmation : response.confirmations) {
         confirmations.push_back(SendMessagesConfirmation::FromFfi(confirmation));
     }
     return SendMessagesResponse(std::move(confirmations));
