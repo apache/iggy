@@ -42,9 +42,13 @@ RUN apt-get update && apt-get install -y \
 COPY --from=builder /build/target/release/iggy .
 COPY --from=builder /build/target/release/iggy-server .
 
-ENV IGGY_HTTP_ADDRESS=0.0.0.0:3000
-ENV IGGY_QUIC_ADDRESS=0.0.0.0:8080
-ENV IGGY_TCP_ADDRESS=0.0.0.0:8090
-ENV IGGY_WEBSOCKET_ADDRESS=0.0.0.0:8092
+# Listeners default to the loopback addresses from the shipped config.toml, so a
+# bare `docker run` boots and listens on 127.0.0.1 inside the container. Binding
+# a wildcard here would make the image unbootable with cluster mode disabled:
+# an unspecified bind names no address a client can dial, so the server refuses
+# to start unless node.advertised_address is also set. To make the server
+# reachable from the host, override the listener(s) together with the
+# client-facing address, for example:
+#   -e IGGY_TCP_ADDRESS=0.0.0.0:8090 -e IGGY_NODE_ADVERTISED_ADDRESS=localhost
 
 CMD ["/iggy-server"]
