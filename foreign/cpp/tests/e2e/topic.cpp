@@ -339,15 +339,15 @@ TEST_F(E2E_Topic, DescribeOptionsServesTopicCatalogAndRejectsUnknownScope) {
                    "Serves the topic option catalog with each key's kind, default and description, serves the "
                    "stream catalog, and rejects an unknown scope name.");
 
-    iggy::ffi::Client *client = GetLoggedInClient();
+    auto client = GetLoggedInHighLevelClient();
 
-    rust::Vec<iggy::ffi::OptionSpec> topic_options;
-    ASSERT_NO_THROW({ topic_options = client->describe_options("topic"); });
+    std::vector<iggy::OptionSpec> topic_options;
+    ASSERT_NO_THROW({ topic_options = client.DescribeOptions("topic"); });
 
-    const iggy::ffi::OptionSpec *segment_size = nullptr;
-    bool found_durability                     = false;
+    const iggy::OptionSpec *segment_size = nullptr;
+    bool found_durability                = false;
     for (const auto &option : topic_options) {
-        const std::string key = static_cast<std::string>(option.key);
+        const std::string key = option.Key();
         if (key == "segment_size") {
             segment_size = &option;
         } else if (key == "durability") {
@@ -357,18 +357,18 @@ TEST_F(E2E_Topic, DescribeOptionsServesTopicCatalogAndRejectsUnknownScope) {
 
     ASSERT_NE(segment_size, nullptr) << "Topic catalog is missing segment_size";
     EXPECT_TRUE(found_durability) << "Topic catalog is missing durability";
-    EXPECT_EQ(segment_size->kind, static_cast<std::uint8_t>(iggy::ffi::HeaderKind::Uint64));
-    EXPECT_FALSE(segment_size->default_value.empty());
-    EXPECT_FALSE(segment_size->description.empty());
+    EXPECT_EQ(segment_size->Kind(), iggy::HeaderKind::Uint64);
+    EXPECT_FALSE(segment_size->DefaultValue().empty());
+    EXPECT_FALSE(segment_size->Description().empty());
 
     ASSERT_NO_THROW({
-        const auto stream_options = client->describe_options("stream");
+        const auto stream_options = client.DescribeOptions("stream");
         ASSERT_FALSE(stream_options.empty());
-        EXPECT_EQ(static_cast<std::string>(stream_options[0].key), "name");
-        EXPECT_TRUE(stream_options[0].updatable);
+        EXPECT_EQ(stream_options[0].Key(), "name");
+        EXPECT_TRUE(stream_options[0].Updatable());
     });
 
-    ASSERT_THROW(client->describe_options("not_a_scope"), std::exception);
+    ASSERT_THROW(client.DescribeOptions("not_a_scope"), std::exception);
 }
 
 TEST_F(E2E_Topic, CreateTopicWithMaxTopicSizeBelowSegmentSizeThrows) {
@@ -979,13 +979,10 @@ TEST_F(E2E_Topic, UpdateTopicDoesNotChangePartitionsCount) {
 }
 
 TEST_F(E2E_Topic, UpdateTopicDoesNotChangeMessages) {
-    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description", "Keeps existing messages readable after updating topic metadata.");
     const std::string stream_name        = GetRandomName();
     const std::string original_topic     = GetRandomName();
     const std::string updated_topic_name = GetRandomName();
-
-    iggy::ffi::Client *message_client = GetLoggedInClient();
 
     auto client = GetLoggedInHighLevelClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
@@ -997,12 +994,11 @@ TEST_F(E2E_Topic, UpdateTopicDoesNotChangeMessages) {
     ASSERT_EQ(created_stream.Topics().size(), 1u);
     const auto topic_id = created_stream.Topics().front().Id();
 
-    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
-    messages.push_back(
-        iggy::ffi::make_message(to_payload("message-before-topic-update"), rust::Vec<iggy::ffi::HeaderEntry>()));
-    ASSERT_NO_THROW(message_client->send_messages(make_numeric_identifier(created_stream.Id()),
-                                                  make_numeric_identifier(topic_id), "partition_id",
-                                                  partition_id_bytes(0), std::move(messages), error_info));
+    std::vector<iggy::IggyMessageToSend> messages;
+    messages.push_back(iggy::IggyMessageToSend::Create("message-before-topic-update", {}));
+    ASSERT_NO_THROW(client.SendMessages(iggy::Identifier::Numeric(created_stream.Id()),
+                                        iggy::Identifier::Numeric(topic_id), iggy::Partitioning::PartitionId(0),
+                                        messages));
 
     ASSERT_NO_THROW(client.UpdateTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(original_topic),
                                        iggy::TopicUpdateOptions()
@@ -1011,13 +1007,12 @@ TEST_F(E2E_Topic, UpdateTopicDoesNotChangeMessages) {
                                            .SetName(updated_topic_name)));
 
     ASSERT_NO_THROW({
-        iggy::ffi::ErrorInfo error_info{};
-        const auto polled = message_client->poll_messages(
-            make_numeric_identifier(created_stream.Id()), make_string_identifier(updated_topic_name), 0, "consumer",
-            make_numeric_identifier(1), "offset", 0, 10, false, error_info);
-        ASSERT_EQ(polled.count, 1u);
-        ASSERT_EQ(polled.messages.size(), 1u);
-        const std::string actual(polled.messages[0].payload.begin(), polled.messages[0].payload.end());
+        const auto polled = client.PollMessages(
+            iggy::Identifier::Numeric(created_stream.Id()), iggy::Identifier::String(updated_topic_name), 0,
+            iggy::Consumer::Single(iggy::Identifier::Numeric(1)), iggy::PollingStrategy::Offset(0), 10, false);
+        ASSERT_EQ(polled.Count(), 1u);
+        ASSERT_EQ(polled.Messages().size(), 1u);
+        const std::string actual(polled.Messages()[0].Payload().begin(), polled.Messages()[0].Payload().end());
         EXPECT_EQ(actual, "message-before-topic-update");
     });
 }

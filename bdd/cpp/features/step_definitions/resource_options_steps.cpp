@@ -121,32 +121,24 @@ void CreateTopic(bdd::GlobalContext &context, const std::string &name, iggy::Top
     context.last_topic_id = topic.Id();
 }
 
-iggy::ffi::HeaderField StringField(const std::string &text) {
-    iggy::ffi::HeaderField field;
-    field.kind  = static_cast<std::uint8_t>(iggy::ffi::HeaderKind::String);
-    field.value = bdd::to_payload(text);
-    return field;
+iggy::HeaderField StringField(const std::string &text) {
+    return iggy::HeaderField::Create(iggy::HeaderKind::String, text);
 }
 
-void SendMessage(bdd::GlobalContext &context, const std::string &payload, rust::Vec<iggy::ffi::HeaderEntry> headers) {
-    iggy::ffi::ErrorInfo error_info{};
-    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
-    messages.push_back(iggy::ffi::make_message(bdd::to_payload(payload), std::move(headers)));
-    context.client->send_messages(bdd::make_numeric_identifier(context.last_stream_id.value()),
-                                  bdd::make_numeric_identifier(context.last_topic_id.value()), "partition_id",
-                                  bdd::partition_id_bytes(kPartitionId), std::move(messages), error_info);
+void SendMessage(bdd::GlobalContext &context, const std::string &payload, std::vector<iggy::HeaderEntry> headers) {
+    const std::vector<iggy::IggyMessageToSend> messages{iggy::IggyMessageToSend::Create(payload, std::move(headers))};
+    bdd::sdk_client(context).SendMessages(StreamIdentifier(context), TopicIdentifier(context),
+                                          iggy::Partitioning::PartitionId(kPartitionId), messages);
 }
 
-iggy::ffi::IggyMessagePolled PollFirst(bdd::GlobalContext &context) {
-    iggy::ffi::ErrorInfo error_info{};
-    auto polled =
-        context.client->poll_messages(bdd::make_numeric_identifier(context.last_stream_id.value()),
-                                      bdd::make_numeric_identifier(context.last_topic_id.value()), kPartitionId,
-                                      "consumer", bdd::make_numeric_identifier(1), "offset", 0, 1, false, error_info);
-    if (polled.messages.empty()) {
+iggy::IggyMessagePolled PollFirst(bdd::GlobalContext &context) {
+    const auto polled = bdd::sdk_client(context).PollMessages(
+        StreamIdentifier(context), TopicIdentifier(context), kPartitionId,
+        iggy::Consumer::Single(iggy::Identifier::Numeric(1)), iggy::PollingStrategy::Offset(0), 1, false);
+    if (polled.Messages().empty()) {
         throw std::runtime_error("No message was polled");
     }
-    return std::move(polled.messages[0]);
+    return polled.Messages()[0];
 }
 
 const iggy::OptionSpec &StreamOptionSpec(const bdd::GlobalContext &context, const std::string &key) {
@@ -250,7 +242,7 @@ WHEN("^I send a message with payload \"([^\"]+)\" to the topic$") {
     REGEX_PARAM(std::string, payload);
     cucumber::ScenarioScope<bdd::GlobalContext> context;
 
-    SendMessage(*context, payload, rust::Vec<iggy::ffi::HeaderEntry>());
+    SendMessage(*context, payload, {});
 }
 
 WHEN("^I send a message with payload \"([^\"]+)\" and header \"([^\"]+)\" set to \"([^\"]+)\" to the topic$") {
@@ -259,11 +251,8 @@ WHEN("^I send a message with payload \"([^\"]+)\" and header \"([^\"]+)\" set to
     REGEX_PARAM(std::string, value);
     cucumber::ScenarioScope<bdd::GlobalContext> context;
 
-    rust::Vec<iggy::ffi::HeaderEntry> headers;
-    iggy::ffi::HeaderEntry entry;
-    entry.key   = StringField(header);
-    entry.value = StringField(value);
-    headers.push_back(std::move(entry));
+    std::vector<iggy::HeaderEntry> headers;
+    headers.push_back(iggy::HeaderEntry::Create(StringField(header), StringField(value)));
     SendMessage(*context, payload, std::move(headers));
 }
 
@@ -271,7 +260,8 @@ THEN("^polling the topic should return the payload \"([^\"]+)\"$") {
     REGEX_PARAM(std::string, payload);
     cucumber::ScenarioScope<bdd::GlobalContext> context;
 
-    EXPECT_EQ(bdd::payload_to_string(PollFirst(*context).payload), payload);
+    const auto message = PollFirst(*context);
+    EXPECT_EQ(std::string(message.Payload().begin(), message.Payload().end()), payload);
 }
 
 THEN("^polling the topic should return the payload \"([^\"]+)\" and header \"([^\"]+)\" set to \"([^\"]+)\"$") {
@@ -281,14 +271,14 @@ THEN("^polling the topic should return the payload \"([^\"]+)\" and header \"([^
     cucumber::ScenarioScope<bdd::GlobalContext> context;
 
     const auto message = PollFirst(*context);
-    EXPECT_EQ(bdd::payload_to_string(message.payload), payload);
+    EXPECT_EQ(std::string(message.Payload().begin(), message.Payload().end()), payload);
     bool found = false;
-    for (const auto &entry : message.user_headers) {
-        if (entry.key.kind == static_cast<std::uint8_t>(iggy::ffi::HeaderKind::String) &&
-            bdd::payload_to_string(entry.key.value) == header) {
+    for (const auto &entry : message.UserHeaders()) {
+        if (entry.Key().Kind() == iggy::HeaderKind::String &&
+            std::string(entry.Key().Value().begin(), entry.Key().Value().end()) == header) {
             found = true;
-            EXPECT_EQ(entry.value.kind, static_cast<std::uint8_t>(iggy::ffi::HeaderKind::String));
-            EXPECT_EQ(bdd::payload_to_string(entry.value.value), value);
+            EXPECT_EQ(entry.Value().Kind(), iggy::HeaderKind::String);
+            EXPECT_EQ(std::string(entry.Value().Value().begin(), entry.Value().Value().end()), value);
         }
     }
     EXPECT_TRUE(found) << "header " << header << " is missing";

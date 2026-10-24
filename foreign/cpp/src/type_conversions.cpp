@@ -855,4 +855,47 @@ MetadataChanges MetadataChanges::FromFfi(ffi::MetadataChanges changes) {
     return result;
 }
 
+SendMessagesConfirmation SendMessagesConfirmation::FromFfi(ffi::SendMessagesConfirmation confirmation) {
+    return SendMessagesConfirmation(confirmation.stream_id, confirmation.topic_id, confirmation.partition_id,
+                                    confirmation.base_offset);
+}
+
+SendMessagesResponse SendMessagesResponse::FromFfi(const ffi::SendMessagesResponse &response) {
+    std::vector<SendMessagesConfirmation> confirmations;
+    confirmations.reserve(response.confirmations.size());
+    for (const auto &confirmation : response.confirmations) {
+        confirmations.push_back(SendMessagesConfirmation::FromFfi(confirmation));
+    }
+    return SendMessagesResponse(std::move(confirmations));
+}
+
+PolledMessages PolledMessages::FromFfi(ffi::PolledMessages polled) {
+    std::vector<IggyMessagePolled> messages;
+    messages.reserve(polled.messages.size());
+    for (auto &message : polled.messages) {
+        messages.push_back(IggyMessagePolled::FromFfi(std::move(message)));
+    }
+    return PolledMessages(polled.partition_id, polled.current_offset, polled.count, std::move(messages),
+                          PartitionContext::FromFfi(polled.context));
+}
+
+TransportEndpoints TransportEndpoints::FromFfi(ffi::TransportEndpoints endpoints) {
+    return TransportEndpoints(endpoints.tcp, endpoints.quic, endpoints.http, endpoints.websocket);
+}
+
+ClusterNode ClusterNode::FromFfi(ffi::ClusterNode node) {
+    return ClusterNode(std::string(node.name.c_str(), node.name.size()), std::string(node.ip.c_str(), node.ip.size()),
+                       TransportEndpoints::FromFfi(node.endpoints), std::string(node.role.c_str(), node.role.size()),
+                       std::string(node.status.c_str(), node.status.size()));
+}
+
+ClusterMetadata ClusterMetadata::FromFfi(ffi::ClusterMetadata metadata) {
+    std::vector<ClusterNode> nodes;
+    nodes.reserve(metadata.nodes.size());
+    for (auto &node : metadata.nodes) {
+        nodes.push_back(ClusterNode::FromFfi(std::move(node)));
+    }
+    return ClusterMetadata(std::string(metadata.name.c_str(), metadata.name.size()), std::move(nodes));
+}
+
 }  // namespace iggy
