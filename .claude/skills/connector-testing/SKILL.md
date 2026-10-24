@@ -101,9 +101,10 @@ fn test_config() -> RandomSourceConfig {
 ### Async testing pattern
 
 The trait methods are `async`. Prefer `#[tokio::test]` directly on the test fn - `#[cfg(test)]`
-gates the whole module out of a plain `cargo build`, and resolver v2 (default since edition 2021,
-which this workspace uses) keeps `tokio`'s `test-util`/`macros` dev-dependency features out of that
-build too, so there's no prod-build leak to avoid. This is also the dominant pattern in-tree
+gates the whole module out of a plain `cargo build`, and this workspace's resolver (`resolver = "3"`
+in the root `Cargo.toml`, tied to the edition-2024 crates here) keeps `tokio`'s `test-util`/`macros`
+dev-dependency features out of that build too, so there's no prod-build leak to avoid. This is also
+the dominant pattern in-tree
 (`postgres_source::tests` uses `#[tokio::test]` throughout, no manual runtime):
 
 ```rust

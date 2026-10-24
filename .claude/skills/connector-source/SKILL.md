@@ -172,7 +172,7 @@ Match `ProducedMessages.schema` to the bytes in `messages[i].payload`:
 ### Concurrency
 
 - Runtime spawns ONE `poll()` task per source. No concurrent `poll()`.
-- Only one batch is ever in flight: the SDK does not call `poll()` again until `on_batch_result()` has returned for the previous batch (up to a 30s result timeout, after which the SDK treats it as a Nack).
+- Only one batch is ever in flight: the SDK does not call `poll()` again until the runtime has reported `Ack`/`Nack` and `on_batch_result()` has returned for the previous batch. Past 30s without a result the SDK only warns and keeps waiting - it does not synthesize a Nack or move on.
 - Don't spawn your own long-running Tokio tasks: the runtime owns lifecycle. The exception is a source that listens rather than polls, which has to own its listener; `http_source` is the worked example, and it shuts its tasks down in the last `close()` rather than leaving them to outlive the connector.
 
 ### Errors

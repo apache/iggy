@@ -180,30 +180,40 @@ server-side. Confirmed independently on two unrelated backends:
       `.timeout()` on the `reqwest::Client` itself rather than wrapping calls
       — copy that pattern, don't wrap instead of it.
 
-### B11. Ack-path work must fit inside the SDK's fixed batch-result window
+### B11. Ack-path work has no SDK deadline, but it blocks every later poll
 
-If `on_batch_result` (or any post-ack cleanup) does real I/O — not just an
-in-memory state swap — that I/O runs inside the SDK's ~30s batch-result
-timeout, and a NACK from that timeout is often **fatal** (stops the source
-for good after repeated consecutive NACKs), not a retry signal.
+`on_batch_result` has no SDK-enforced time limit, and a NACK does **not**
+come from a timeout — the SDK (since #4269) only warns past ~30s without a
+runtime result and keeps waiting; it never synthesizes a Nack or moves on.
+The real risk is different: the SDK allows exactly one batch in flight, so
+`poll()` is not called again until `on_batch_result` returns. Real I/O in
+there — not just an in-memory state swap — silently stalls the whole source
+for as long as it takes, with nothing visibly "failing."
 
-- [ ] Any retry/timeout budget inside `on_batch_result` must be sized well
-      under the SDK's window, and **multiplied by how many operations run
-      inside it** — not assumed to be one shared budget. Postgres (#3957,
+- [ ] A retry/timeout budget inside `on_batch_result` must account for
+      **every operation it runs, not one op's worth** — a per-table or
+      per-item budget multiplies with the item count. Postgres (#3957,
       critical): "10s is per operation, not per batch... N tables burn
-      N\*10s inside the SDK's 30s window."
-- [ ] User-configurable `max_retries`/`retry_delay` can produce a wait time
-      that exceeds a hardcoded internal deadline — validate the combination
-      in `open()` and reject configs that cannot fit, rather than letting
-      the ack path blow its budget at runtime. Same PR: "`max_retries=3`
-      with `retry_delay=\"2s\"`, both straight from the readme, needs 12s
-      and fails startup."
+      N\*10s" serially inside one `on_batch_result` call, stalling every
+      later poll by that much.
+- [ ] User-configurable `max_retries`/`retry_delay` can combine into a wait
+      time nobody sized on purpose — validate the combination in `open()`
+      and reject configs that blow an internal budget, rather than letting
+      the ack path stall at runtime. Same PR: "`max_retries=3` with
+      `retry_delay=\"2s\"`, both straight from the readme, needs 12s and
+      fails startup" once a sane cap was added.
 - [ ] A failed destructive/cleanup op inside `on_batch_result` must not be
       silently logged and ignored while the batch is still ACKed — count
       consecutive failures and return `Err` past a threshold so the SDK
       stops the source, rather than resending the same broken operation
       forever. Same PR: "a failed slot advance only logs. the batch is
       already ACKed, so nothing stops it."
+- [ ] A source whose input genuinely cannot be replayed after a restart
+      (so repeated-Nack-triggered stop would be the wrong failure mode) can
+      override `Source::batch_policy()` and call
+      `BatchPolicy::with_max_consecutive_nacks(None)` (SDK 0.5.1-edge.2+) —
+      prefer that over working around the default 5-consecutive-Nack stop
+      inside plugin code.
 
 ## High-frequency convention nits
 
@@ -261,6 +271,11 @@ These are "cheap" but burn full review rounds when missed.
 - [ ] Helper modules stay crate-private (no `pub mod`) unless genuinely part
       of the plugin's public API — S3 (#3103) exposed `buffer`/`client`/etc.
       as public on a cdylib plugin where every sibling keeps them private.
+- [ ] Crate-level doc comment doesn't use `[module]` intra-doc links to a
+      private module — rustdoc warns on the dead link and the doctest CI job
+      (`-D warnings`) fails the build. BigQuery (#4394): the crate doc linked
+      five private modules this way. Use a plain code span (`` `module` ``)
+      instead when the target isn't `pub`.
 
 ### C4. Hot path
 
