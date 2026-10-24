@@ -128,13 +128,13 @@ iggy::HeaderField StringField(const std::string &text) {
 void SendMessage(bdd::GlobalContext &context, const std::string &payload, std::vector<iggy::HeaderEntry> headers) {
     const std::vector<iggy::IggyMessageToSend> messages{iggy::IggyMessageToSend::Create(payload, std::move(headers))};
     Sdk(context).SendMessages(StreamIdentifier(context), TopicIdentifier(context),
-                             iggy::Partitioning::PartitionId(kPartitionId), messages);
+                              iggy::Partitioning::PartitionId(kPartitionId), messages);
 }
 
 iggy::IggyMessagePolled PollFirst(bdd::GlobalContext &context) {
     const auto polled = Sdk(context).PollMessages(StreamIdentifier(context), TopicIdentifier(context), kPartitionId,
-                                               iggy::Consumer::Single(iggy::Identifier::Numeric(1)),
-                                               iggy::PollingStrategy::Offset(0), 1, false);
+                                                  iggy::Consumer::Single(iggy::Identifier::Numeric(1)),
+                                                  iggy::PollingStrategy::Offset(0), 1, false);
     if (polled.Messages().empty()) {
         throw std::runtime_error("No message was polled");
     }
