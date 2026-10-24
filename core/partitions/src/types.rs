@@ -312,6 +312,13 @@ pub struct RepairSession {
     /// or at once while [`Self::requested_from`] is `None`, the remaining
     /// window is re-requested and the count restarts.
     pub idle_ticks: u32,
+    /// Start of the last chunk a `RepairDone` pulled above a pending
+    /// [`Self::floor`], or 0 before the first such pull. Only that pull
+    /// writes it, the stall retry moves just [`Self::from_op`] and
+    /// [`Self::requested_from`]. A `RepairDone` pulls again only past it, so a
+    /// peer that serves nothing is left to the stall retry instead of
+    /// answering an unthrottled loop.
+    pub floor_pulled_from: u64,
     /// First op of the latest request. The next chunk is pulled once the held
     /// run reaches it, which works while a fenced commit point cannot move.
     ///
