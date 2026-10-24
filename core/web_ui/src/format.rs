@@ -40,10 +40,7 @@ pub fn timestamp_precise(micros: u64) -> String {
 /// Renders the `message_expiry` option (microseconds, 0 or `u64::MAX` means
 /// never) as a short duration.
 pub fn message_expiry(options: &ResourceOptions) -> String {
-    let micros = options
-        .get("message_expiry")
-        .and_then(|option| option.value.parse::<u64>().ok())
-        .unwrap_or(0);
+    let micros = option_u64(options, "message_expiry").unwrap_or(0);
     if micros == 0 || micros == u64::MAX {
         return "never".to_owned();
     }
@@ -55,14 +52,37 @@ pub fn elapsed(micros: u64) -> String {
     duration(micros / MICROS_PER_SECOND)
 }
 
+/// The text the topic form starts from for `message_expiry`. Unlike
+/// [`message_expiry`] it never says "never", which the server does not parse.
+pub fn message_expiry_input(options: &ResourceOptions) -> String {
+    match message_expiry(options).as_str() {
+        "never" => "unlimited".to_owned(),
+        text => text.to_owned(),
+    }
+}
+
+/// Renders the `max_topic_size` option (bytes, `u64::MAX` means unlimited).
+pub fn max_topic_size(options: &ResourceOptions) -> String {
+    match option_u64(options, "max_topic_size") {
+        None | Some(u64::MAX) => "unlimited".to_owned(),
+        Some(bytes) => binary_size(bytes as f64),
+    }
+}
+
+pub fn option_text<'a>(options: &'a ResourceOptions, key: &str) -> Option<&'a str> {
+    options.get(key).map(|option| option.value.as_str())
+}
+
 /// Re-renders a server byte size such as `"8615888 KiB"` in the largest
 /// binary unit that keeps it at or above 1, falling back to the server's text
 /// when it does not parse.
 pub fn byte_size(server_text: &str) -> String {
+    parse_byte_size(server_text).map_or_else(|| server_text.to_owned(), binary_size)
+}
+
+fn binary_size(bytes: f64) -> String {
     const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
-    let Some(mut amount) = parse_byte_size(server_text) else {
-        return server_text.to_owned();
-    };
+    let mut amount = bytes;
     let mut unit = 0;
     while amount >= 1024.0 && unit < UNITS.len() - 1 {
         amount /= 1024.0;
@@ -178,6 +198,10 @@ pub fn truncate(text: &str, max_chars: usize) -> String {
     }
 }
 
+fn option_u64(options: &ResourceOptions, key: &str) -> Option<u64> {
+    option_text(options, key)?.parse().ok()
+}
+
 fn parse_byte_size(text: &str) -> Option<f64> {
     let (amount, unit) = text.trim().split_once(' ')?;
     let amount: f64 = amount.parse().ok()?;
@@ -229,13 +253,37 @@ mod tests {
     use super::*;
     use crate::models::OptionValue;
 
-    fn expiry_options(micros: u64) -> ResourceOptions {
+    fn uint64_option(key: &str, value: u64) -> ResourceOptions {
         ResourceOptions::from([(
-            "message_expiry".to_owned(),
+            key.to_owned(),
             OptionValue {
-                value: micros.to_string(),
+                value: value.to_string(),
             },
         )])
+    }
+
+    fn expiry_options(micros: u64) -> ResourceOptions {
+        uint64_option("message_expiry", micros)
+    }
+
+    #[test]
+    fn given_unlimited_expiry_should_prefill_form_with_parsable_text() {
+        assert_eq!(message_expiry_input(&expiry_options(u64::MAX)), "unlimited");
+        let micros = 7 * 86_400 * MICROS_PER_SECOND;
+        assert_eq!(message_expiry_input(&expiry_options(micros)), "7d");
+    }
+
+    #[test]
+    fn given_max_topic_size_should_render_unlimited_or_binary_size() {
+        assert_eq!(
+            max_topic_size(&uint64_option("max_topic_size", u64::MAX)),
+            "unlimited"
+        );
+        assert_eq!(max_topic_size(&ResourceOptions::new()), "unlimited");
+        assert_eq!(
+            max_topic_size(&uint64_option("max_topic_size", 1 << 30)),
+            "1.00 GiB"
+        );
     }
 
     #[test]

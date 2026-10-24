@@ -20,21 +20,64 @@ use dioxus::prelude::*;
 use crate::Route;
 use crate::components::{Crumb, ErrorView, Loading, PageHeader, Stat, api_client, use_session};
 use crate::format;
+use crate::forms::{AddPartitionsForm, DeletePartitionsForm, TopicSettingsForm};
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TopicDialog {
+    Settings,
+    AddPartitions,
+    DeletePartitions,
+}
 
 #[component]
 pub fn TopicPage(stream_id: u32, topic_id: u32) -> Element {
     let session = use_session();
-    let topic = use_resource(use_reactive!(|(stream_id, topic_id)| async move {
+    let mut dialog = use_signal(|| None::<TopicDialog>);
+    let mut topic = use_resource(use_reactive!(|(stream_id, topic_id)| async move {
         api_client(session).topic(stream_id, topic_id).await
     }));
+    let close = move |_| dialog.set(None);
+    let saved = move |_| {
+        dialog.set(None);
+        topic.restart();
+    };
 
     let body = match &*topic.read() {
         None => rsx! { Loading {} },
         Some(Err(error)) => rsx! { ErrorView { error: error.clone() } },
         Some(Ok(topic)) => rsx! {
-            PageHeader { title: topic.name.clone(),
+            PageHeader {
+                title: topic.name.clone(),
+                actions: rsx! {
+                    button {
+                        class: "secondary",
+                        onclick: move |_| dialog.set(Some(TopicDialog::Settings)),
+                        "Settings"
+                    }
+                    button {
+                        class: "secondary",
+                        onclick: move |_| dialog.set(Some(TopicDialog::DeletePartitions)),
+                        "Delete partitions"
+                    }
+                    button {
+                        onclick: move |_| dialog.set(Some(TopicDialog::AddPartitions)),
+                        "Add partitions"
+                    }
+                },
                 Crumb { to: Route::Streams {}, label: "Streams" }
                 Crumb { to: Route::StreamPage { stream_id }, label: format!("Stream {stream_id}") }
+            }
+            match dialog() {
+                Some(TopicDialog::Settings) => rsx! {
+                    TopicSettingsForm { stream_id, topic: topic.clone(), on_close: close, on_saved: saved }
+                },
+                Some(TopicDialog::AddPartitions) => rsx! {
+                    AddPartitionsForm { stream_id, topic_id, on_close: close, on_saved: saved }
+                },
+                Some(TopicDialog::DeletePartitions) => rsx! {
+                    DeletePartitionsForm { stream_id, topic: topic.clone(), on_close: close, on_saved: saved }
+                },
+                None => rsx! {},
             }
             div { class: "stats",
                 Stat { label: "ID", value: topic.id.to_string() }
@@ -42,6 +85,11 @@ pub fn TopicPage(stream_id: u32, topic_id: u32) -> Element {
                 Stat { label: "Messages", value: topic.messages_count.to_string() }
                 Stat { label: "Size", value: topic.size.clone() }
                 Stat { label: "Message expiry", value: format::message_expiry(&topic.options) }
+                Stat { label: "Max size", value: format::max_topic_size(&topic.options) }
+                Stat {
+                    label: "Compression",
+                    value: format::option_text(&topic.options, "compression_algorithm").unwrap_or("none").to_owned(),
+                }
                 Stat { label: "Created", value: format::timestamp(topic.created_at) }
             }
             h2 { "Partitions" }

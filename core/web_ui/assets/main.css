@@ -94,7 +94,16 @@ button.secondary:hover:not(:disabled) {
   background: var(--border);
 }
 
-input {
+button.danger {
+  background: var(--danger);
+}
+
+button.danger:hover:not(:disabled) {
+  background: #d83236;
+}
+
+input,
+select {
   width: 100%;
   margin-top: 0.35rem;
   padding: 0.55rem 0.7rem;
@@ -105,7 +114,12 @@ input {
   font: inherit;
 }
 
-input:focus {
+input:disabled {
+  opacity: 0.5;
+}
+
+input:focus,
+select:focus {
   outline: 2px solid var(--accent);
   outline-offset: -1px;
 }
@@ -217,6 +231,19 @@ input:focus {
   margin-bottom: 1.5rem;
 }
 
+.title-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
 .breadcrumbs {
   display: flex;
   gap: 0.4rem;
@@ -315,4 +342,94 @@ details pre {
   background: var(--bg);
   white-space: pre-wrap;
   word-break: break-all;
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+  background: rgb(0 0 0 / 60%);
+}
+
+.modal {
+  width: min(460px, 100%);
+  max-height: calc(100vh - 2rem);
+  overflow: auto;
+  padding: 1.5rem;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+}
+
+.modal h2 {
+  margin: 0 0 1.25rem;
+}
+
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.form p {
+  margin: 0;
+}
+
+.form label {
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+
+.form label.checkbox {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: -0.5rem;
+}
+
+.form label.checkbox input {
+  width: auto;
+  margin: 0;
+}
+
+.form-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+}
+
+.details {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.35rem 1rem;
+  margin: 0;
+  font-size: 0.85rem;
+}
+
+.details dt {
+  color: var(--text-muted);
+}
+
+.details dd {
+  margin: 0;
+  word-break: break-all;
+}
+
+.danger-zone {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-top: 1.5rem;
+  padding-top: 1.25rem;
+  border-top: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+
+.danger-zone button {
+  flex-shrink: 0;
 }

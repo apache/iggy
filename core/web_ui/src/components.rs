@@ -29,12 +29,18 @@ pub fn api_client(session: Signal<Option<Session>>) -> ApiClient {
     ApiClient::new(session.read().as_ref())
 }
 
+/// Breadcrumbs go in `children`, buttons for the page in `actions`.
 #[component]
-pub fn PageHeader(title: String, children: Element) -> Element {
+pub fn PageHeader(title: String, children: Element, actions: Option<Element>) -> Element {
     rsx! {
         header { class: "page-header",
             nav { class: "breadcrumbs", {children} }
-            h1 { "{title}" }
+            div { class: "title-row",
+                h1 { "{title}" }
+                if let Some(actions) = actions {
+                    div { class: "actions", {actions} }
+                }
+            }
         }
     }
 }
@@ -61,6 +67,107 @@ pub fn Stat(label: String, value: String) -> Element {
 pub fn Loading() -> Element {
     rsx! {
         p { class: "muted", "Loading…" }
+    }
+}
+
+/// A dialog over the page. Clicking the backdrop or pressing Escape closes it.
+#[component]
+pub fn Modal(title: String, on_close: EventHandler<()>, children: Element) -> Element {
+    rsx! {
+        div {
+            class: "modal-backdrop",
+            onclick: move |_| on_close.call(()),
+            onkeydown: move |event: KeyboardEvent| {
+                if event.key() == Key::Escape {
+                    on_close.call(());
+                }
+            },
+            div {
+                class: "modal",
+                role: "dialog",
+                aria_modal: "true",
+                onclick: move |event| event.stop_propagation(),
+                h2 { "{title}" }
+                {children}
+            }
+        }
+    }
+}
+
+/// Cancel and submit buttons plus the last error, shared by every form.
+#[component]
+pub fn FormActions(
+    submit_label: String,
+    busy: bool,
+    error: Option<String>,
+    on_cancel: EventHandler<()>,
+    #[props(default)] danger: bool,
+    #[props(default)] disabled: bool,
+) -> Element {
+    rsx! {
+        if let Some(message) = error {
+            p { class: "form-error", "{message}" }
+        }
+        div { class: "form-actions",
+            button {
+                class: "secondary",
+                r#type: "button",
+                onclick: move |_| on_cancel.call(()),
+                "Cancel"
+            }
+            button {
+                class: if danger { "danger" },
+                r#type: "submit",
+                disabled: busy || disabled,
+                "{submit_label}"
+            }
+        }
+    }
+}
+
+/// Asks the user to retype `confirm_text` before a destructive action runs.
+#[component]
+pub fn ConfirmDelete(
+    title: String,
+    confirm_text: String,
+    on_confirm: EventHandler<()>,
+    on_cancel: EventHandler<()>,
+    busy: bool,
+    error: Option<String>,
+) -> Element {
+    let mut typed = use_signal(String::new);
+    let matches = typed() == confirm_text;
+
+    rsx! {
+        form {
+            class: "form",
+            onsubmit: move |event: FormEvent| {
+                event.prevent_default();
+                if matches {
+                    on_confirm.call(());
+                }
+            },
+            p { class: "muted",
+                "This cannot be undone. Type "
+                code { "{confirm_text}" }
+                " to confirm."
+            }
+            input {
+                aria_label: "Confirmation",
+                autocomplete: "off",
+                autofocus: true,
+                value: typed,
+                oninput: move |event| typed.set(event.value()),
+            }
+            FormActions {
+                submit_label: title,
+                busy,
+                error,
+                on_cancel,
+                danger: true,
+                disabled: !matches,
+            }
+        }
     }
 }
 

@@ -19,6 +19,7 @@ mod api;
 mod auth;
 mod components;
 mod format;
+mod forms;
 mod models;
 mod pages;
 

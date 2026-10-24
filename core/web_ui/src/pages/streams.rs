@@ -21,11 +21,19 @@ use crate::Route;
 use crate::api::ApiError;
 use crate::components::{Crumb, ErrorView, Loading, PageHeader, Stat, api_client, use_session};
 use crate::format;
+use crate::forms::{NewStreamForm, NewTopicForm, StreamSettingsForm};
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum StreamDialog {
+    NewTopic,
+    Settings,
+}
 
 #[component]
 pub fn Streams() -> Element {
     let session = use_session();
-    let streams = use_resource(move || async move {
+    let mut creating = use_signal(|| false);
+    let mut streams = use_resource(move || async move {
         let mut streams = api_client(session).streams().await?;
         streams.sort_by_key(|stream| stream.id);
         Ok::<_, ApiError>(streams)
@@ -66,24 +74,62 @@ pub fn Streams() -> Element {
     };
 
     rsx! {
-        PageHeader { title: "Streams" }
+        PageHeader {
+            title: "Streams",
+            actions: rsx! {
+                button { onclick: move |_| creating.set(true), "New stream" }
+            },
+        }
         {body}
+        if creating() {
+            NewStreamForm {
+                on_close: move |_| creating.set(false),
+                on_created: move |_| {
+                    creating.set(false);
+                    streams.restart();
+                },
+            }
+        }
     }
 }
 
 #[component]
 pub fn StreamPage(stream_id: u32) -> Element {
     let session = use_session();
-    let stream = use_resource(use_reactive!(|(stream_id,)| async move {
+    let mut dialog = use_signal(|| None::<StreamDialog>);
+    let mut stream = use_resource(use_reactive!(|(stream_id,)| async move {
         api_client(session).stream(stream_id).await
     }));
+    let close = move |_| dialog.set(None);
+    let saved = move |_| {
+        dialog.set(None);
+        stream.restart();
+    };
 
     let body = match &*stream.read() {
         None => rsx! { Loading {} },
         Some(Err(error)) => rsx! { ErrorView { error: error.clone() } },
         Some(Ok(stream)) => rsx! {
-            PageHeader { title: stream.name.clone(),
+            PageHeader {
+                title: stream.name.clone(),
+                actions: rsx! {
+                    button {
+                        class: "secondary",
+                        onclick: move |_| dialog.set(Some(StreamDialog::Settings)),
+                        "Settings"
+                    }
+                    button { onclick: move |_| dialog.set(Some(StreamDialog::NewTopic)), "New topic" }
+                },
                 Crumb { to: Route::Streams {}, label: "Streams" }
+            }
+            match dialog() {
+                Some(StreamDialog::NewTopic) => rsx! {
+                    NewTopicForm { stream_id, on_close: close, on_created: saved }
+                },
+                Some(StreamDialog::Settings) => rsx! {
+                    StreamSettingsForm { stream: stream.clone(), on_close: close, on_saved: saved }
+                },
+                None => rsx! {},
             }
             div { class: "stats",
                 Stat { label: "ID", value: stream.id.to_string() }

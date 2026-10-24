@@ -16,13 +16,13 @@
 // under the License.
 
 use gloo_net::http::{Request, RequestBuilder, Response};
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 
 use crate::auth::Session;
 use crate::models::{
-    IdentityInfo, LoginUser, PolledMessages, Stats, Stream, StreamDetails, TopicDetails,
-    UserInfoDetails,
+    CreatePartitions, CreateStream, CreateTopic, IdentityInfo, LoginUser, PolledMessages, Stats,
+    Stream, StreamDetails, TopicDetails, TopicUpdate, UserInfoDetails,
 };
 
 /// Empty by default so requests go to the server that served the UI. Set at
@@ -68,23 +68,14 @@ impl ApiClient {
     }
 
     pub async fn login(&self, credentials: &LoginUser) -> Result<IdentityInfo, ApiError> {
-        let request = self
-            .builder(Request::post(&url("/users/login")))
-            .json(credentials)
-            .map_err(|error| ApiError::Network(error.to_string()))?;
-        let response = request
-            .send()
-            .await
-            .map_err(|error| ApiError::Network(error.to_string()))?;
+        let response = self
+            .send_json(Request::post(&url("/users/login")), credentials)
+            .await?;
         decode(response).await
     }
 
     pub async fn logout(&self) -> Result<(), ApiError> {
-        let response = self
-            .builder(Request::delete(&url("/users/logout")))
-            .send()
-            .await
-            .map_err(|error| ApiError::Network(error.to_string()))?;
+        let response = self.send(Request::delete(&url("/users/logout"))).await?;
         check_status(response).await.map(drop)
     }
 
@@ -107,6 +98,85 @@ impl ApiClient {
     pub async fn topic(&self, stream_id: u32, topic_id: u32) -> Result<TopicDetails, ApiError> {
         self.get(&format!("/streams/{stream_id}/topics/{topic_id}"), &[])
             .await
+    }
+
+    pub async fn create_stream(&self, stream: &CreateStream) -> Result<StreamDetails, ApiError> {
+        let response = self
+            .send_json(Request::post(&url("/streams")), stream)
+            .await?;
+        decode(response).await
+    }
+
+    pub async fn rename_stream(&self, stream_id: u32, name: &str) -> Result<(), ApiError> {
+        #[derive(Serialize)]
+        struct Rename<'a> {
+            name: &'a str,
+        }
+        let path = format!("/streams/{stream_id}");
+        let response = self
+            .send_json(Request::put(&url(&path)), &Rename { name })
+            .await?;
+        check_status(response).await.map(drop)
+    }
+
+    pub async fn delete_stream(&self, stream_id: u32) -> Result<(), ApiError> {
+        self.delete(&format!("/streams/{stream_id}"), &[]).await
+    }
+
+    pub async fn create_topic(
+        &self,
+        stream_id: u32,
+        topic: &CreateTopic,
+    ) -> Result<TopicDetails, ApiError> {
+        let path = format!("/streams/{stream_id}/topics");
+        let response = self.send_json(Request::post(&url(&path)), topic).await?;
+        decode(response).await
+    }
+
+    pub async fn update_topic(
+        &self,
+        stream_id: u32,
+        topic_id: u32,
+        update: &TopicUpdate,
+    ) -> Result<(), ApiError> {
+        let path = format!("/streams/{stream_id}/topics/{topic_id}");
+        let response = self.send_json(Request::put(&url(&path)), update).await?;
+        check_status(response).await.map(drop)
+    }
+
+    pub async fn delete_topic(&self, stream_id: u32, topic_id: u32) -> Result<(), ApiError> {
+        self.delete(&format!("/streams/{stream_id}/topics/{topic_id}"), &[])
+            .await
+    }
+
+    pub async fn create_partitions(
+        &self,
+        stream_id: u32,
+        topic_id: u32,
+        partitions_count: u32,
+    ) -> Result<(), ApiError> {
+        let path = format!("/streams/{stream_id}/topics/{topic_id}/partitions");
+        let response = self
+            .send_json(
+                Request::post(&url(&path)),
+                &CreatePartitions { partitions_count },
+            )
+            .await?;
+        check_status(response).await.map(drop)
+    }
+
+    /// The server removes the newest partitions, so only a count is sent.
+    pub async fn delete_partitions(
+        &self,
+        stream_id: u32,
+        topic_id: u32,
+        partitions_count: u32,
+    ) -> Result<(), ApiError> {
+        self.delete(
+            &format!("/streams/{stream_id}/topics/{topic_id}/partitions"),
+            &[("partitions_count", partitions_count.to_string())],
+        )
+        .await
     }
 
     /// Reads without committing, so browsing never moves a consumer offset.
@@ -139,15 +209,36 @@ impl ApiClient {
     ) -> Result<T, ApiError> {
         let builder =
             Request::get(&url(path)).query(query.iter().map(|(key, value)| (*key, value.as_str())));
-        let response = self
-            .builder(builder)
-            .send()
-            .await
-            .map_err(|error| ApiError::Network(error.to_string()))?;
-        decode(response).await
+        decode(self.send(builder).await?).await
     }
 
-    fn builder(&self, builder: RequestBuilder) -> RequestBuilder {
+    async fn delete(&self, path: &str, query: &[(&str, String)]) -> Result<(), ApiError> {
+        let builder = Request::delete(&url(path))
+            .query(query.iter().map(|(key, value)| (*key, value.as_str())));
+        check_status(self.send(builder).await?).await.map(drop)
+    }
+
+    async fn send(&self, builder: RequestBuilder) -> Result<Response, ApiError> {
+        self.authorize(builder)
+            .send()
+            .await
+            .map_err(|error| ApiError::Network(error.to_string()))
+    }
+
+    async fn send_json<B: Serialize>(
+        &self,
+        builder: RequestBuilder,
+        body: &B,
+    ) -> Result<Response, ApiError> {
+        self.authorize(builder)
+            .json(body)
+            .map_err(|error| ApiError::Network(error.to_string()))?
+            .send()
+            .await
+            .map_err(|error| ApiError::Network(error.to_string()))
+    }
+
+    fn authorize(&self, builder: RequestBuilder) -> RequestBuilder {
         match &self.access_token {
             Some(token) => builder.header("Authorization", &format!("Bearer {token}")),
             None => builder,
