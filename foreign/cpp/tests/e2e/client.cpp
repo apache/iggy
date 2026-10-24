@@ -1256,7 +1256,15 @@ TEST_F(E2E_Client, DeleteUnknownPersonalAccessTokenThrows) {
     RecordProperty("description", "Rejects deleting a personal access token that does not exist.");
     auto client = GetLoggedInHighLevelClient();
 
-    ASSERT_THROW(client.DeletePersonalAccessToken(GetRandomName(50)), std::exception);
+    try {
+        client.DeletePersonalAccessToken(GetRandomName(50));
+        FAIL() << "Deleting an unknown personal access token must be rejected";
+    } catch (const iggy::IggyException &error) {
+        constexpr std::uint32_t resource_not_found_code = 20;
+        EXPECT_EQ(error.Code(), resource_not_found_code);
+        EXPECT_EQ(error.Kind(), "resource_not_found");
+        EXPECT_FALSE(error.OperationId().has_value());
+    }
 }
 
 TEST_F(E2E_Client, GetUserAllowsSelfLookupWithoutReadUsersPermission) {

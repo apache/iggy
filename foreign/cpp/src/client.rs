@@ -1354,11 +1354,17 @@ impl Client {
         })
     }
 
-    pub fn delete_personal_access_token(&self, name: String) -> Result<(), String> {
+    pub fn delete_personal_access_token(
+        &self,
+        name: String,
+        error_info: &mut ffi::ErrorInfo,
+    ) -> Result<(), String> {
+        *error_info = ffi::ErrorInfo::default();
         RUNTIME.block_on(async {
             self.inner
                 .delete_personal_access_token(&name)
                 .await
+                .inspect_err(|error| error_info.record(error))
                 .map_err(|error| {
                     format!("Could not delete personal access token '{name}': {error}")
                 })

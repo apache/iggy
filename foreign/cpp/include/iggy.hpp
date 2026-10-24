@@ -5728,6 +5728,7 @@ class PollingStrategy final {
  *
  * - Login(), Logout(), ResolveOperation(), and AbandonOperation().
  * - CreateUser(), UpdateUser(), and DeleteUser().
+ * - DeletePersonalAccessToken().
  * - EncryptionKeyFingerprint() and invalid keys passed to CreateStream().
  * - CreateStream(), UpdateStream(), and DeleteStream().
  * - CreateTopic(), UpdateTopic(), and DeleteTopic().
@@ -5998,8 +5999,8 @@ class IggyBlockingClient final {
     /**
      * @brief Lists the personal access tokens owned by the authenticated caller.
      *
-     * The result carries token names and expiry only. The secret token strings
-     * are returned once, when a token is created.
+     * The result carries token names and expiry only. The server shows a
+     * secret token string only when the token is created.
      *
      * @return One entry per token, empty when the caller has none.
      * @throws IggyException if the client is unavailable or unauthenticated, or
@@ -6011,8 +6012,9 @@ class IggyBlockingClient final {
      * @brief Deletes one of the caller's personal access tokens.
      *
      * @param name Name of the token to delete.
-     * @throws IggyException if the client is unavailable or unauthenticated;
-     *         the token does not exist; or the request fails.
+     * @throws IggyException if @p name is empty or exceeds 255 bytes; the
+     *         client is unavailable or unauthenticated; the token does not
+     *         exist; or the request fails.
      */
     void DeletePersonalAccessToken(const std::string &name);
 
