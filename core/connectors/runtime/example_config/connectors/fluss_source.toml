@@ -1,0 +1,45 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+type = "source"
+key = "fluss"
+enabled = true
+version = 0
+name = "Apache Fluss source"
+path = "<BASE_DIR>/target/release/libiggy_connector_fluss_source"
+plugin_config_format = "toml"
+verbose = false
+
+[[streams]]
+stream = "events"
+topic = "fluss_events"
+schema = "json"
+batch_length = 100
+linger_time = "5ms"
+
+[plugin_config]
+bootstrap_servers = "localhost:9123"
+database = "mydb"
+table = "events"
+table_type = "log"
+starting_offset = "earliest"
+poll_interval = "1s"
+poll_timeout = "5s"
+batch_size = 500
+payload_format = "json"
+include_metadata = false
+verbose_logging = false
