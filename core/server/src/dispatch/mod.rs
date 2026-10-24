@@ -915,7 +915,7 @@ async fn handle_client_request<B, MJ, S, SB>(
         }
         RequestClass::LoginRegister => {
             let _in_flight = drain.admit(Admission::MetadataLane).await;
-            handle_login_register_request(shard, sessions, origin, request).await;
+            handle_login_register_request(shard, sessions, server_config, origin, request).await;
         }
         RequestClass::Logout => {
             let _in_flight = drain.admit(Admission::MetadataLane).await;
@@ -1450,10 +1450,12 @@ mod tests {
                 message_bus::server_internal_client_id(0),
                 message_bus::AUTO_COMMIT_CLIENT_ID,
             ] {
+                let test_config = std::sync::Arc::new(configs::server::ServerConfig::default());
                 for body in &bodies {
                     handle_login_register_request(
                         &shard,
                         &sessions,
+                        &test_config,
                         ClientOrigin::capture(&shard.bus, TRANSPORT),
                         request_message(Operation::Register, client, 0, 0, body),
                     )
@@ -1783,14 +1785,24 @@ mod tests {
     #[compio::test]
     async fn given_a_read_waiting_on_a_shard_when_the_session_ends_should_refuse_stale_client() {
         for (code, body) in shard_waiting_reads() {
-            assert_read_refused_after_shard_wait(code, &body, ReadRevocation::Session).await;
+            Box::pin(assert_read_refused_after_shard_wait(
+                code,
+                &body,
+                ReadRevocation::Session,
+            ))
+            .await;
         }
     }
 
     #[compio::test]
     async fn given_a_read_waiting_on_a_shard_when_grants_are_revoked_should_refuse_unauthorized() {
         for (code, body) in shard_waiting_reads() {
-            assert_read_refused_after_shard_wait(code, &body, ReadRevocation::Grants(None)).await;
+            Box::pin(assert_read_refused_after_shard_wait(
+                code,
+                &body,
+                ReadRevocation::Grants(None),
+            ))
+            .await;
         }
     }
 
@@ -1806,11 +1818,11 @@ mod tests {
                 Operation::UpdateStreamResolved,
                 Operation::UpdateTopicResolved,
             ] {
-                assert_read_refused_after_shard_wait(
+                Box::pin(assert_read_refused_after_shard_wait(
                     code,
                     &body,
                     ReadRevocation::Grants(Some(rename)),
-                )
+                ))
                 .await;
             }
         }
@@ -1822,7 +1834,12 @@ mod tests {
     async fn given_a_read_waiting_on_a_shard_when_the_connection_is_replaced_should_not_answer_the_new_one()
      {
         for (code, body) in shard_waiting_reads() {
-            assert_read_refused_after_shard_wait(code, &body, ReadRevocation::Connection).await;
+            Box::pin(assert_read_refused_after_shard_wait(
+                code,
+                &body,
+                ReadRevocation::Connection,
+            ))
+            .await;
         }
     }
 
@@ -1835,7 +1852,12 @@ mod tests {
                 GET_PARTITION_ROUTE_CODE | POLL_MESSAGES_CODE | GET_CONSUMER_OFFSET_CODE
             )
         }) {
-            assert_read_refused_after_shard_wait(code, &body, ReadRevocation::Topic).await;
+            Box::pin(assert_read_refused_after_shard_wait(
+                code,
+                &body,
+                ReadRevocation::Topic,
+            ))
+            .await;
         }
     }
 
@@ -1844,11 +1866,11 @@ mod tests {
         let (_, body) =
             partition_namespace_reads(&WireIdentifier::numeric(0), &WireIdentifier::numeric(0))[2]
                 .clone();
-        assert_read_refused_after_shard_wait(
+        Box::pin(assert_read_refused_after_shard_wait(
             GET_PARTITION_ROUTE_CODE,
             &body,
             ReadRevocation::TopicDeleting,
-        )
+        ))
         .await;
     }
 

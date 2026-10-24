@@ -90,6 +90,13 @@ pub fn warm_dummy_password_hash() {
     LazyLock::force(&DUMMY_PASSWORD_HASH);
 }
 
+/// The pre-warmed dummy hash, for callers that need to equalize timing
+/// outside of `verify_login_credentials` (e.g. the HTTP login handler's
+/// fast-reject path).
+pub fn dummy_password_hash() -> &'static str {
+    DUMMY_PASSWORD_HASH.as_str()
+}
+
 pub fn verify_login_credentials<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     username: &str,
@@ -378,7 +385,9 @@ const fn transient_login_code(error: &LoginRegisterError) -> IggyError {
 /// `SessionError`; the SDK maps it to `Unauthenticated`.
 const fn eviction_reason_for(error: &LoginRegisterError) -> EvictionReason {
     match error {
-        LoginRegisterError::InvalidCredentials => EvictionReason::InvalidCredentials,
+        LoginRegisterError::InvalidCredentials | LoginRegisterError::ExternalAuthDenied(_) => {
+            EvictionReason::InvalidCredentials
+        }
         LoginRegisterError::InvalidToken => EvictionReason::InvalidToken,
         LoginRegisterError::UserInactive => EvictionReason::UserInactive,
         _ => EvictionReason::SessionError,
@@ -1099,6 +1108,7 @@ const fn logout_deny_code(error: &MetadataSubmitError) -> IggyError {
 pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
+    server_config: &std::sync::Arc<configs::server::ServerConfig>,
     origin: ClientOrigin,
     request: Message<RoutedRequestHeader>,
 ) where
@@ -1166,47 +1176,106 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
     }
 
     let body_tail = &body[prefix_len..];
-    let mut credentials_rejected = false;
+
+    // Route by user existence: if the username resolves to a local Iggy user,
+    // local credential verification handles the login. If it does not and
+    // ext-auth is enabled, the callout handles it. The two pools never
+    // overlap, so there is no fallback from one to the other.
     if let Ok((wire_request, _)) =
         LoginRegisterRequest::decode_after_prefix(version_info.clone(), body_tail)
     {
-        match verify_login_credentials(
-            shard,
-            wire_request.username.as_str(),
-            wire_request.password.expose_secret(),
-        ) {
-            Ok(account) => {
-                if let Err(error) = complete_login_register(
-                    shard,
-                    sessions,
-                    origin,
-                    vsr_client_id,
-                    request.header(),
-                    account,
-                    &wire_request.version_info,
-                    &wire_request.bind_secret,
-                )
-                .await
-                {
+        // Guard: a replica that has not yet replayed its WAL has an empty
+        // user store. Return a retryable error so the SDK replays after the
+        // node catches up, matching the behaviour of verify_login_credentials.
+        let not_caught_up = shard
+            .plane
+            .metadata()
+            .mux_stm
+            .users()
+            .read(|users| users.items.is_empty());
+        if not_caught_up {
+            surface_login_failure(
+                shard,
+                origin,
+                request.header(),
+                &LoginRegisterError::Transient(MetadataSubmitError::NotCaughtUp),
+            )
+            .await;
+            return;
+        }
+
+        let user_exists_locally = shard
+            .plane
+            .metadata()
+            .mux_stm
+            .users()
+            .read(|users| users.user_by_name(wire_request.username.as_str()).is_some());
+
+        if user_exists_locally {
+            match verify_login_credentials(
+                shard,
+                wire_request.username.as_str(),
+                wire_request.password.expose_secret(),
+            ) {
+                Ok(account) => {
+                    if let Err(error) = complete_login_register(
+                        shard,
+                        sessions,
+                        origin,
+                        vsr_client_id,
+                        request.header(),
+                        account,
+                        &wire_request.version_info,
+                        &wire_request.bind_secret,
+                    )
+                    .await
+                    {
+                        warn!(transport_client_id, error = %error, "login/register failed");
+                        surface_login_failure(shard, origin, request.header(), &error).await;
+                    }
+                }
+                Err(error) => {
                     warn!(transport_client_id, error = %error, "login/register failed");
                     surface_login_failure(shard, origin, request.header(), &error).await;
                 }
-                return;
             }
-            Err(LoginRegisterError::InvalidCredentials) => {
-                // Fall through to PAT attempt so a credential payload that
-                // collides with a valid PAT payload shape still gets a
-                // chance. A password-shaped body rarely parses as a PAT
-                // body, so remember the rejection: the final fall-through
-                // must surface InvalidCredentials, not MalformedLogin.
-                credentials_rejected = true;
-            }
-            Err(error) => {
-                warn!(transport_client_id, error = %error, "login/register failed");
-                surface_login_failure(shard, origin, request.header(), &error).await;
-                return;
-            }
+            return;
         }
+
+        if server_config.external_auth.enabled {
+            try_external_auth_login(
+                shard,
+                sessions,
+                server_config,
+                origin,
+                vsr_client_id,
+                request.header(),
+                &wire_request,
+            )
+            .await;
+            return;
+        }
+
+        // No local user, no ext-auth: reject. Run the dummy Argon2 hash
+        // so the response timing is indistinguishable from a wrong password
+        // for a real local user.
+        let _ = crypto::verify_password(
+            wire_request.password.expose_secret(),
+            DUMMY_PASSWORD_HASH.as_str(),
+        );
+        warn!(
+            transport_client_id,
+            "rejecting register request: invalid credentials"
+        );
+        send_eviction(
+            shard,
+            origin,
+            request.header().client,
+            EvictionReason::InvalidCredentials,
+            "login_rejection",
+        )
+        .await;
+        return;
     }
 
     if let Ok((wire_request, _)) =
@@ -1247,22 +1316,6 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
         }
     }
 
-    if credentials_rejected {
-        warn!(
-            transport_client_id,
-            "rejecting register request: invalid credentials"
-        );
-        send_eviction(
-            shard,
-            origin,
-            request.header().client,
-            EvictionReason::InvalidCredentials,
-            "login_rejection",
-        )
-        .await;
-        return;
-    }
-
     warn!(
         transport_client_id,
         "rejecting register request with unsupported payload shape"
@@ -1275,6 +1328,169 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
         "login_rejection",
     )
     .await;
+}
+
+/// Attempt external auth callout and, on success, resolve the returned
+/// username to a pre-provisioned Iggy user and complete the login.
+/// Build the ext-auth callout request from the wire login and session state.
+fn build_ext_auth_request(
+    sessions: &RefCell<SessionManager>,
+    transport_client_id: u128,
+    wire_request: &LoginRegisterRequest,
+) -> crate::external_auth::ExternalAuthRequest {
+    use crate::external_auth::{CredentialType, ExternalAuthRequest};
+    use message_bus::installer::conn_info::ClientTransportKind;
+
+    let (transport, client_address) = sessions
+        .borrow()
+        .client_record(transport_client_id)
+        .map_or_else(
+            || ("unknown", "unknown".to_owned()),
+            |r| {
+                let transport = match r.transport {
+                    ClientTransportKind::Tcp => "tcp",
+                    ClientTransportKind::TcpTls => "tcp_tls",
+                    ClientTransportKind::Ws => "ws",
+                    ClientTransportKind::Wss => "wss",
+                    ClientTransportKind::Quic => "quic",
+                    _ => "unknown",
+                };
+                (transport, r.address.to_string())
+            },
+        );
+
+    ExternalAuthRequest {
+        credential_type: CredentialType::Password,
+        credential: Some(wire_request.password.expose_secret().to_owned()),
+        username: wire_request.username.to_string(),
+        transport: transport.to_owned(),
+        client_address,
+    }
+}
+
+/// Attempt external auth callout and, on success, resolve the returned
+/// username to a pre-provisioned Iggy user and complete the login.
+async fn try_external_auth_login<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    sessions: &Rc<RefCell<SessionManager>>,
+    server_config: &std::sync::Arc<configs::server::ServerConfig>,
+    origin: ClientOrigin,
+    vsr_client_id: u128,
+    header: &RoutedRequestHeader,
+    wire_request: &LoginRegisterRequest,
+) where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    use crate::external_auth::{ExternalAuthDecision, callout_external_auth};
+
+    let transport_client_id = origin.id;
+    let ext_request = build_ext_auth_request(sessions, transport_client_id, wire_request);
+
+    let decision = match callout_external_auth(&server_config.external_auth, ext_request).await {
+        Ok(decision) => decision,
+        Err(error) => {
+            warn!(transport_client_id, error = %error, "external auth callout failed");
+            send_eviction(
+                shard,
+                origin,
+                vsr_client_id,
+                EvictionReason::InvalidCredentials,
+                "login_rejection",
+            )
+            .await;
+            return;
+        }
+    };
+
+    match decision {
+        ExternalAuthDecision::Allow { username } => {
+            match resolve_external_username(shard, &username) {
+                Ok(account) => {
+                    if let Err(error) = complete_login_register(
+                        shard,
+                        sessions,
+                        origin,
+                        vsr_client_id,
+                        header,
+                        account,
+                        &wire_request.version_info,
+                        &wire_request.bind_secret,
+                    )
+                    .await
+                    {
+                        warn!(
+                            transport_client_id,
+                            error = %error,
+                            "ext-auth login/register failed"
+                        );
+                        surface_login_failure(shard, origin, header, &error).await;
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        transport_client_id,
+                        ext_username = %username,
+                        error = %error,
+                        "ext-auth user resolution failed"
+                    );
+                    send_eviction(
+                        shard,
+                        origin,
+                        vsr_client_id,
+                        EvictionReason::InvalidCredentials,
+                        "login_rejection",
+                    )
+                    .await;
+                }
+            }
+        }
+        ExternalAuthDecision::Deny { reason } => {
+            warn!(
+                transport_client_id,
+                reason = %reason,
+                "external auth denied login"
+            );
+            send_eviction(
+                shard,
+                origin,
+                vsr_client_id,
+                EvictionReason::InvalidCredentials,
+                "login_rejection",
+            )
+            .await;
+        }
+    }
+}
+
+/// Resolve an externally authenticated username to a pre-provisioned Iggy
+/// user. Delegates to [`crate::external_auth::resolve_username`] and maps
+/// the error to the TCP login taxonomy.
+fn resolve_external_username<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    username: &str,
+) -> Result<(u32, IggyTimestamp), LoginRegisterError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    shard
+        .plane
+        .metadata()
+        .mux_stm
+        .users()
+        .read(|users| crate::external_auth::resolve_username(users, username))
+        .map_err(|_| {
+            LoginRegisterError::ExternalAuthDenied(format!(
+                "ext-auth username '{username}' could not be resolved"
+            ))
+        })
 }
 
 #[cfg(test)]

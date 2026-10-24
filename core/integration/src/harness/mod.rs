@@ -44,6 +44,7 @@ pub mod config;
 mod context;
 pub mod disk;
 mod error;
+pub mod ext_auth_server;
 mod fixture;
 pub mod handle;
 mod helpers;
