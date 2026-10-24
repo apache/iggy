@@ -35,6 +35,7 @@ use crate::dispatch::failure::{
     ClientOrigin, FrameChannel, send_host_frame, send_non_replicated_bytes,
     send_non_replicated_deny,
 };
+use crate::dispatch::metadata_changes::metadata_changes_reply;
 use crate::dispatch::partition::{handle_get_consumer_offset, handle_poll_messages};
 use crate::namespace::resolve_partition_namespace;
 use crate::reply_frame::{build_empty_reply, current_metadata_commit};
@@ -54,9 +55,9 @@ use futures::future::{Either, select};
 use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::codes::{
     BIND_SESSION_CODE, DESCRIBE_OPTIONS_CODE, GET_CLIENT_CODE, GET_CLIENTS_CODE,
-    GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE, GET_ME_CODE, GET_PARTITION_ROUTE_CODE,
-    GET_PERSONAL_ACCESS_TOKENS_CODE, GET_SNAPSHOT_FILE_CODE, GET_STATS_CODE, PING_CODE,
-    POLL_MESSAGES_CODE, SYNC_CONSUMER_GROUP_CODE,
+    GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE, GET_ME_CODE, GET_METADATA_CHANGES_CODE,
+    GET_PARTITION_ROUTE_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE, GET_SNAPSHOT_FILE_CODE,
+    GET_STATS_CODE, PING_CODE, POLL_MESSAGES_CODE, SYNC_CONSUMER_GROUP_CODE,
 };
 use iggy_binary_protocol::dispatch::lookup_command;
 use iggy_binary_protocol::requests::consumer_groups::SyncConsumerGroupRequest;
@@ -519,6 +520,36 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
         }
         GET_SNAPSHOT_FILE_CODE => {
             handle_get_snapshot(shard, server_config, origin, &request, user_id, attachment).await;
+        }
+        GET_METADATA_CHANGES_CODE => {
+            let authorize = || authorize_uid(shard, user_id, Permissioner::get_metadata_changes);
+            if let Err(error) =
+                authorize_and_hold_read(shard, attachment, code, watermark, &authorize).await
+            {
+                send_non_replicated_deny(shard, &request, origin, error.as_code()).await;
+                return;
+            }
+            // A current state page hops to shard 0, and the session can end
+            // during the hop.
+            let reply = metadata_changes_reply(shard, request_body(&request), user_id)
+                .await
+                .and_then(|bytes| authorize_attached(attachment, authorize).map(|()| bytes));
+            match reply {
+                Ok(bytes) => {
+                    send_non_replicated_bytes(
+                        shard,
+                        &request,
+                        origin,
+                        bytes,
+                        FrameChannel::Reply,
+                        "metadata_changes",
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    send_non_replicated_deny(shard, &request, origin, error.as_code()).await;
+                }
+            }
         }
         BIND_SESSION_CODE | GET_PARTITION_ROUTE_CODE => {
             let result = if code == BIND_SESSION_CODE {

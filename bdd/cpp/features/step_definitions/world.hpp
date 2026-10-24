@@ -24,6 +24,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "iggy.hpp"
@@ -51,7 +52,7 @@ struct GlobalContext {
     PolledData polled;
     std::vector<std::uint8_t> raw_response;
     std::string raw_error;
-    // Public client for the option steps, connected on first use.
+    // Public client for the option and metadata change steps, see sdk_client().
     std::optional<iggy::IggyBlockingClient> sdk;
     std::optional<std::uint32_t> last_stream_id;
     std::optional<std::uint32_t> last_topic_id;
@@ -60,6 +61,10 @@ struct GlobalContext {
     bool last_update_rejected = false;
     std::vector<iggy::OptionSpec> last_option_specs;
     std::string call_error;
+    std::vector<iggy::MetadataChangeGroup> last_change_groups;
+    std::optional<iggy::MetadataChangeCursor> last_change_cursor;
+    std::vector<iggy::MetadataChangeRecord> last_changes;
+    std::vector<iggy::MetadataCurrentItem> last_current_items;
 
     GlobalContext()                                 = default;
     GlobalContext(const GlobalContext &)            = delete;
@@ -82,6 +87,19 @@ inline std::string required_env(const char *name) {
         throw std::runtime_error(std::string(name) + " must be set. Run the suite via scripts/run-bdd-tests.sh");
     }
     return std::string(value);
+}
+
+// Public client for the option and metadata change steps, connected as root on first use.
+inline iggy::IggyBlockingClient &sdk_client(GlobalContext &context) {
+    if (!context.sdk) {
+        auto client = iggy::IggyBlockingClient::Builder()
+                          .WithServerAddress(required_env("IGGY_TCP_ADDRESS"))
+                          .WithAutoLogin(required_env("IGGY_ROOT_USERNAME"), required_env("IGGY_ROOT_PASSWORD"))
+                          .Build();
+        client.Connect();
+        context.sdk.emplace(std::move(client));
+    }
+    return *context.sdk;
 }
 
 inline iggy::ffi::Identifier make_string_identifier(const std::string &value) {

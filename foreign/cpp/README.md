@@ -25,7 +25,7 @@ bazel test //:unit
 bazel test //:e2e
 ```
 
-The E2E suite expects a local server on the default ports with encryption enabled, because the resource options cases create streams with their own keys and expect a server-generated key for keyless streams. Start it with `IGGY_ENCRYPTION_ENABLED=true` and `IGGY_ENCRYPTION_KEY` set to a base64 encoded 32-byte key, for example `IGGY_ENCRYPTION_ENABLED=true IGGY_ENCRYPTION_KEY=$(head -c 32 /dev/urandom | base64) cargo run --bin iggy-server -- --with-default-root-credentials`.
+The E2E suite expects a local server on the default ports with encryption enabled, because the resource options cases and the keyed metadata change cases create streams with their own keys and expect a server-generated key for keyless streams. Start it with `IGGY_ENCRYPTION_ENABLED=true` and `IGGY_ENCRYPTION_KEY` set to a base64 encoded 32-byte key, for example `IGGY_ENCRYPTION_ENABLED=true IGGY_ENCRYPTION_KEY=$(head -c 32 /dev/urandom | base64) cargo run --bin iggy-server -- --with-default-root-credentials`.
 
 Receipt access follows the server's [session and revocation policy](../../core/server/README.md#sessions-and-retry-receipts).
 An unresolved operation cannot recover its receipt after its original session
@@ -106,22 +106,15 @@ errors from these methods:
 - `CreatePartitions`, `DeletePartitions`, and `DeleteSegments`.
 - `CreateConsumerGroup`, `DeleteConsumerGroup`, `JoinConsumerGroup`, and `LeaveConsumerGroup`.
 - `StoreConsumerOffset`, `StoreConsumerPosition`, and `DeleteConsumerOffset`.
+- `GetMetadataChanges`.
 
-Other methods, including reads and `Connect`, `Disconnect`, and `Shutdown`, report
-errors through the exception message only. C++ and bridge-local argument errors
-also leave `Code()` and `OperationId()` empty and `Kind()` empty, including for the
-methods listed above.
+Other methods, including reads and `Connect`, `Disconnect`, and `Shutdown`, report errors through the exception message only. C++ and bridge-local argument errors also leave `Code()` and `OperationId()` empty and `Kind()` empty, including for the methods listed above. `GetMetadataChanges` is the exception: it reports every invalid query as `invalid_command`, including one the bridge refuses.
 
-Direct generated-bridge callers pass a local `iggy::ffi::ErrorInfo` as the last
-argument to login/logout, mutations, polls, raw commands, and recovery calls.
-It is reset at entry and populated only when the Rust SDK returns an `IggyError`.
-Bridge-local argument errors leave it empty. Inspect `kind`, `code`, and, when
-`has_operation_id` is true, `operation_id`. Use separate values for concurrent
-calls; error state is never stored globally or on the client.
+Direct generated-bridge callers pass a local `iggy::ffi::ErrorInfo` as the last argument to login/logout, mutations, polls, raw commands, recovery calls, and the metadata change functions. It is reset at entry and populated only when the Rust SDK returns an `IggyError`. Bridge-local argument errors leave it empty, except in the metadata change functions, which record invalid input as `invalid_command`.
 
-The `IggyException(const std::string &, const ffi::ErrorInfo &)` constructor is
-private. Only `IggyBlockingClient` builds an exception with a code. Other code
-builds an `IggyException` from its message.
+Inspect `kind`, `code`, and, when `has_operation_id` is true, `operation_id`. Use separate values for concurrent calls. Error state is never stored globally or on the client.
+
+The `IggyException(const std::string &, const ffi::ErrorInfo &)` constructor is private. Only the SDK builds an exception with a code. Other code builds an `IggyException` from its message.
 
 Concurrent calls on one client are safe. Moving, assigning, or destroying the
 client while any call is in progress is undefined behavior.
@@ -138,3 +131,70 @@ frozen request bytes. Configure both limits with
 `max_pending_operation_bytes` query parameters for TCP, QUIC, and WebSocket.
 HTTP continues to use its configured transport behavior and has no retained
 operation recovery.
+
+## Metadata changes
+
+`GetMetadataChanges()` reads the node's change log: one record per public result of a committed metadata operation, such as a stream created, a topic renamed, a user's permissions changed or a session closed. A mirror keeps a cursor, asks for the records after it, and stores the returned `Next()` cursor. The call needs root or the global `manage_servers` permission and works on every transport.
+
+```cpp
+// Pages the current state into a private staged copy, then returns the query that follows the changes after it.
+iggy::MetadataChangesQuery Rebuild(iggy::IggyBlockingClient &client, const std::vector<iggy::MetadataChangeGroup> &groups) {
+    ClearStaged();
+    auto query = iggy::MetadataChangesQuery::Current().SetGroups(groups);
+    while (true) {
+        const auto page = client.GetMetadataChanges(query);
+        switch (page.Status()) {
+            case iggy::MetadataChangeStatus::Ok:
+                break;
+            case iggy::MetadataChangeStatus::Behind:
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            case iggy::MetadataChangeStatus::Expired:
+            case iggy::MetadataChangeStatus::Reset:
+                ClearStaged();
+                query = iggy::MetadataChangesQuery::Current().SetGroups(groups);
+                continue;
+        }
+        for (const auto &item : page.Items()) {
+            StageItem(item);
+        }
+        if (!page.CurrentPageToken()) {
+            return iggy::MetadataChangesQuery::After(*page.Next()).SetGroups(groups);
+        }
+        query = iggy::MetadataChangesQuery::Current(*page.CurrentPageToken()).SetGroups(groups);
+    }
+}
+
+void Follow(iggy::IggyBlockingClient &client, const std::vector<iggy::MetadataChangeGroup> &groups) {
+    auto query = Rebuild(client, groups);
+    while (true) {
+        const auto page = client.GetMetadataChanges(query);
+        switch (page.Status()) {
+            case iggy::MetadataChangeStatus::Ok:
+                for (const auto &record : page.Records()) {
+                    if (const auto *stream = std::get_if<iggy::MetadataStreamChange>(&record.Change())) {
+                        ApplyStream(*record.Kind(), *stream);
+                    }
+                }
+                query = iggy::MetadataChangesQuery::After(*page.Next()).SetGroups(groups);
+                if (!page.HasMore()) {
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                }
+                break;
+            case iggy::MetadataChangeStatus::Behind:
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                break;
+            case iggy::MetadataChangeStatus::Expired:
+            case iggy::MetadataChangeStatus::Reset:
+                query = Rebuild(client, groups);
+                break;
+        }
+    }
+}
+```
+
+`Expired` means the log no longer holds the history after the cursor, and `Reset` means the cursor belongs to another history, for example after the data directory was rebuilt. Either way the mirror rebuilds from current state pages, as it does on start, and then follows the changes after the anchor they return. Each scan begins from an empty staged state, so nothing an abandoned scan staged survives. Persist a cursor with `MetadataChangeCursor::ToString()` and restore it with `MetadataChangeCursor::Parse()`.
+
+Current pages need the parent groups of every selected group, for example `topics` with `streams`. Keep a rebuilt state private until a change page answers `Ok` with `HasMore()` false and a `HeadOp()` at or above the last current page's. An invalid query is refused with `invalid_command` before anything is sent.
+
+A record or item this build does not know arrives as `MetadataUnknownChange` or `MetadataUnknownItem` with its codes and raw body on TCP, QUIC and WebSocket, and as `MetadataUnknownJsonChange` or `MetadataUnknownJsonItem` with its names and whole JSON object on HTTP. Records carry option values as the read routes return them, never key material.

@@ -462,6 +462,17 @@ const _: () = assert!(
 );
 const _: () =
     assert!(configs::metadata::DEFAULT_METADATA_CLIENTS_TABLE_MAX == consensus::CLIENTS_TABLE_MAX);
+const _: () = assert!(
+    configs::metadata::DEFAULT_METADATA_CHANGE_LOG_RESOURCE_CAPACITY
+        == metadata::change_log::DEFAULT_RESOURCE_CAPACITY
+);
+const _: () = assert!(
+    configs::metadata::DEFAULT_METADATA_CHANGE_LOG_ACTIVITY_CAPACITY
+        == metadata::change_log::DEFAULT_ACTIVITY_CAPACITY
+);
+const _: () = assert!(
+    configs::metadata::MAX_METADATA_CHANGE_LOG_CAPACITY == metadata::change_log::MAX_CAPACITY
+);
 const _: () =
     assert!(configs::cluster::DEFAULT_VIEW_PROBE_ATTEMPTS_MAX == consensus::PROBE_ATTEMPTS_MAX);
 const _: () =

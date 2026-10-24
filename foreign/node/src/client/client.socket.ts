@@ -88,8 +88,8 @@ const TOPIC_DISCOVERY_RESETS = new Set<number>([
 ]);
 const READ_COMMANDS = new Set<number>([
   COMMAND_CODE.Ping, COMMAND_CODE.GetStats, COMMAND_CODE.GetClusterMetadata,
-  COMMAND_CODE.DescribeOptions, COMMAND_CODE.GetMe, COMMAND_CODE.GetClient,
-  COMMAND_CODE.GetClients, COMMAND_CODE.GetUser, COMMAND_CODE.GetUsers,
+  COMMAND_CODE.DescribeOptions, COMMAND_CODE.GetMetadataChanges, COMMAND_CODE.GetMe,
+  COMMAND_CODE.GetClient, COMMAND_CODE.GetClients, COMMAND_CODE.GetUser, COMMAND_CODE.GetUsers,
   COMMAND_CODE.GetAccessTokens, COMMAND_CODE.GetPartitionRoute, COMMAND_CODE.GetOffset,
   COMMAND_CODE.GetStream, COMMAND_CODE.GetStreams, COMMAND_CODE.GetTopic,
   COMMAND_CODE.GetTopics, COMMAND_CODE.GetGroup, COMMAND_CODE.GetGroups, COMMAND_CODE.SyncGroup

@@ -251,6 +251,82 @@ For lower-level control over individual commands (login, stream/topic management
 
 For `IggyConsumerConfig`, `partitions_count` controls topic creation only. An ordinary consumer uses partition `0` unless the builder's `partition_id` or the config's `with_partition_id` selects another partition. Code that previously used `partitions_count` to select an existing partition must set `partition_id` explicitly. Consumer-group assignment ignores `partition_id`.
 
+## Metadata changes
+
+`get_metadata_changes` reads the node's change log: one record per public result of a committed metadata operation, such as a stream created, a topic renamed, a user's permissions changed or a session closed. A mirror keeps a cursor, asks for the records after it, and stores the returned `next` cursor. The call needs root or the global `manage_servers` permission.
+
+```rust
+use iggy::prelude::*;
+use std::time::Duration;
+
+async fn follow(client: &IggyClient, groups: Vec<MetadataChangeGroup>) -> Result<(), IggyError> {
+    let mut query = MetadataChangesQuery {
+        groups,
+        ..MetadataChangesQuery::default()
+    };
+    loop {
+        let page = client.get_metadata_changes(&query).await?;
+        match page.status {
+            MetadataChangeStatus::Ok => {
+                for record in &page.records {
+                    println!("op {} by {:?}: {:?}", record.op, record.actor_user_id, record.change);
+                }
+                if let Some(next) = page.next {
+                    query.start = MetadataChangeStart::After(next);
+                }
+                if !page.has_more {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+            MetadataChangeStatus::Behind => tokio::time::sleep(Duration::from_millis(100)).await,
+            MetadataChangeStatus::Expired | MetadataChangeStatus::Reset => {
+                query.start = rebuild(client, &query.groups).await?;
+            }
+        }
+    }
+}
+
+/// Pages the current state, then returns the position to follow from.
+async fn rebuild(
+    client: &IggyClient,
+    groups: &[MetadataChangeGroup],
+) -> Result<MetadataChangeStart, IggyError> {
+    let mut scan_groups = groups.to_vec();
+    scan_groups.extend(groups.iter().flat_map(|group| group.parents()));
+    let mut query = MetadataChangesQuery {
+        start: MetadataChangeStart::Current(None),
+        groups: scan_groups,
+        ..MetadataChangesQuery::default()
+    };
+    loop {
+        let page = client.get_metadata_changes(&query).await?;
+        match page.status {
+            MetadataChangeStatus::Ok => {}
+            MetadataChangeStatus::Behind => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            MetadataChangeStatus::Expired | MetadataChangeStatus::Reset => {
+                query.start = MetadataChangeStart::Current(None);
+                continue;
+            }
+        }
+        for item in &page.items {
+            println!("{item:?}");
+        }
+        match (page.current_page_token, page.next) {
+            (Some(token), _) => query.start = MetadataChangeStart::Current(Some(token)),
+            (None, Some(anchor)) => return Ok(MetadataChangeStart::After(anchor)),
+            (None, None) => query.start = MetadataChangeStart::Current(None),
+        }
+    }
+}
+```
+
+`Expired` means the log no longer holds the history after the cursor, and `Reset` means the cursor belongs to another history, for example after the data directory was rebuilt. Either way the mirror rebuilds from current state pages and then follows the changes after the anchor they return.
+
+Current pages need the parent groups of every selected group, for example `topics` with `streams`, so `rebuild` adds them through `MetadataChangeGroup::parents()`. Keep a rebuilt state private until a change page answers `Ok` with `has_more == false` and a `head_op` at or above the last current page's.
+
 ## Versioning
 
 Stable releases follow semver (`x.y.z`). Edge releases (`x.y.z-edge.N`) are cut from `master` between stable versions and may include unreleased fixes; pin to a stable version for production.

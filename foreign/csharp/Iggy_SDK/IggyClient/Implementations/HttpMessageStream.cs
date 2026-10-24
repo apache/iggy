@@ -555,6 +555,23 @@ public class HttpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
+    public async Task<MetadataChanges> GetMetadataChangesAsync(MetadataChangesQuery query,
+        CancellationToken token = default)
+    {
+        ArgumentNullException.ThrowIfNull(query);
+        query.Validate();
+        var response = await _httpClient.GetAsync($"/metadata/changes?{query.ToHttpQuery()}", token);
+        if (!response.IsSuccessStatusCode)
+        {
+            // A 404 is a server without the route, not an empty answer.
+            await HandleResponseAsync(response, shouldThrowOnGetNotFound: true);
+        }
+
+        return await response.Content.ReadFromJsonAsync<MetadataChanges>(_jsonSerializerOptions, token)
+               ?? throw new InvalidResponseException("The metadata changes answer is empty.");
+    }
+
+    /// <inheritdoc />
     public async Task PingAsync(CancellationToken token = default)
     {
         var response = await _httpClient.GetAsync("/ping", token);

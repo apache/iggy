@@ -19,8 +19,9 @@ use crate::client_wrappers::client_wrapper::ClientWrapper;
 use async_trait::async_trait;
 use iggy_common::SystemClient;
 use iggy_common::{
-    ClientInfo, ClientInfoDetails, IggyError, NonZeroIggyDuration, OptionSpec, OptionsScope,
-    Snapshot, SnapshotCompression, Stats, SystemSnapshotType,
+    ClientInfo, ClientInfoDetails, IggyError, MetadataChanges, MetadataChangesQuery,
+    NonZeroIggyDuration, OptionSpec, OptionsScope, Snapshot, SnapshotCompression, Stats,
+    SystemSnapshotType,
 };
 
 #[async_trait]
@@ -118,6 +119,19 @@ impl SystemClient for ClientWrapper {
             ClientWrapper::Tcp(client) => client.snapshot(compression, snapshot_types).await,
             ClientWrapper::Quic(client) => client.snapshot(compression, snapshot_types).await,
             ClientWrapper::WebSocket(client) => client.snapshot(compression, snapshot_types).await,
+        }
+    }
+
+    async fn get_metadata_changes(
+        &self,
+        query: &MetadataChangesQuery,
+    ) -> Result<MetadataChanges, IggyError> {
+        match self {
+            ClientWrapper::Iggy(client) => client.get_metadata_changes(query).await,
+            ClientWrapper::Http(client) => client.get_metadata_changes(query).await,
+            ClientWrapper::Tcp(client) => client.get_metadata_changes(query).await,
+            ClientWrapper::Quic(client) => client.get_metadata_changes(query).await,
+            ClientWrapper::WebSocket(client) => client.get_metadata_changes(query).await,
         }
     }
 }

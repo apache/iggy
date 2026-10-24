@@ -238,6 +238,79 @@ foreach ($client->describeOptions(Iggy\OptionsScope::Topic) as $spec) {
 - `describeOptions(Iggy\OptionsScope)` returns the server catalog as `Iggy\OptionSpec` objects with `key`, `kind`, `updatable`, `resettable`, `secret`, `read_only`, `critical`, `default_value` and `description`.
 - SDK exceptions carry the server error code in `getCode()`, for example 4103 (option cannot be updated), 4104 (option cannot be reset), 4105 (read-only option), 4108 (root user cannot be changed by this caller) and 4041 (unsupported option key).
 
+## Metadata Changes
+
+`getMetadataChanges()` reads the node's change log: one record per public result of a committed metadata operation, such as a stream created, a topic renamed, a user's permissions changed or a session closed. A mirror keeps a cursor, asks for the records after it, and stores the returned `next` cursor. The call needs root or the global `manage_servers` permission, and a query the server would refuse throws `Invalid command` (code 3) before anything is sent.
+
+```php
+use Iggy\MetadataChangeGroup;
+use Iggy\MetadataChangeStart;
+use Iggy\MetadataChangeStatus;
+
+function follow(Iggy\Client $client, array $groups): void
+{
+    $start = MetadataChangeStart::earliest();
+    while (true) {
+        $page = $client->getMetadataChanges($start, $groups);
+        switch ($page->status) {
+            case MetadataChangeStatus::Ok:
+                foreach ($page->records as $record) {
+                    echo $record->op, ' ', $record->kind?->value ?? 'unknown', PHP_EOL;
+                }
+                if ($page->next !== null) {
+                    $start = MetadataChangeStart::after($page->next);
+                }
+                if (!$page->has_more) {
+                    sleep(1);
+                }
+                break;
+            case MetadataChangeStatus::Behind:
+                usleep(100_000);
+                break;
+            default:
+                $start = rebuild($client, $groups);
+        }
+    }
+}
+
+// Pages the current state, then returns the position to follow from.
+function rebuild(Iggy\Client $client, array $groups): MetadataChangeStart
+{
+    $start = MetadataChangeStart::current();
+    while (true) {
+        $page = $client->getMetadataChanges($start, $groups);
+        if ($page->status === MetadataChangeStatus::Behind) {
+            usleep(100_000);
+            continue;
+        }
+        if ($page->status !== MetadataChangeStatus::Ok) {
+            $start = MetadataChangeStart::current();
+            continue;
+        }
+        foreach ($page->items as $item) {
+            echo $item->group?->value ?? 'unknown', PHP_EOL;
+        }
+        if ($page->current_page_token !== null) {
+            $start = MetadataChangeStart::current($page->current_page_token);
+        } elseif ($page->next !== null) {
+            return MetadataChangeStart::after($page->next);
+        } else {
+            $start = MetadataChangeStart::current();
+        }
+    }
+}
+
+follow($client, [MetadataChangeGroup::Streams, MetadataChangeGroup::Topics]);
+```
+
+- `Expired` means the log no longer holds the history after the cursor, and `Reset` means the cursor belongs to another history, for example after the data directory was rebuilt. Either way the mirror rebuilds from current state pages and then follows the changes after the anchor they return.
+- Current pages need the parent groups of every selected group, for example `Topics` with `Streams`. Keep a rebuilt state private until a change page answers `Ok` with `has_more` false and a `head_op` at or above the last current page's.
+- Pages, cursors, page tokens, records, items and bodies expose their values as readonly snake_case properties, like `StreamDetails`, for example `$record->change->stream_created_op`, so `==` compares their contents. `$record->kind` names the body class in `$record->change`, for example `Iggy\MetadataStreamChange` for `StreamCreated` and `StreamUpdated`.
+- A record or item this build does not know has a null `kind` or `group` and a `MetadataUnknownChange` or `MetadataUnknownItem` body with its codes and raw body, so a mirror can stop there rather than skip a change.
+- Stream, topic and user bodies return `options` and `derived_options` arrays like `StreamDetails`: a stream's key source and fingerprints, never its key.
+- Unsigned 64-bit values such as ops and timestamps are ints, or decimal strings above `PHP_INT_MAX`. Log ids, checksums and client ids are 128-bit decimal strings. A cursor cast to string gives its `mc1_` text and a page token its `cs1_` text, and `MetadataChangeCursor::parse()` and `MetadataCurrentPageToken::parse()` read them back, so a mirror can store its position as a string.
+- `MetadataChanges::decode()` reads the payload `sendBinaryRequest(17, ...)` returns, and `MetadataChanges::fromJson()` the body of `GET /metadata/changes`.
+
 ## API Notes
 
 - `new Iggy\Client($address, new Iggy\PendingOperationsConfig(256, 64 * 1024 * 1024))`

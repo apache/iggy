@@ -110,7 +110,7 @@
 //! nobody to answer, so the counter is the only record it existed.
 //!
 //! A shed or discarded *prepare* is not recovered by retransmit once its op has
-//! reached quorum (`consensus::retransmit_targets` skips entries with
+//! reached quorum (`consensus::prepare_timeout_targets` skips entries with
 //! `ok_quorum_received`), so the backup gap-stops. `tick_partitions` opens a
 //! repair session for it: its level-triggered detector arms once a partition has
 //! been gap-stopped for `[cluster] repair_gap_debounce_interval`, independently of the
@@ -4027,6 +4027,8 @@ mod tests {
                 floor: None,
                 peer: PEER,
                 idle_ticks: 0,
+                floor_pulled_from: 0,
+                requested_from: Some(1),
             });
             for op in 1..=8 {
                 let parent = partition.consensus().last_prepare_checksum();
@@ -4865,8 +4867,13 @@ mod tests {
         let stm = &shard.plane.metadata().mux_stm;
         seed_consumer_group_deletion_intent(stm, 5, 0, 0, 0);
         let now = iggy_common::IggyTimestamp::now();
-        stm.streams()
-            .refresh_consumer_group_session(CLIENT_ID, NEW_SESSION, REGISTER_OP, now);
+        stm.streams().refresh_consumer_group_session(
+            CLIENT_ID,
+            NEW_SESSION,
+            REGISTER_OP,
+            now,
+            None,
+        );
         assert_eq!(
             stm.streams().consumer_group_pending_revocations().len(),
             1,
@@ -5745,8 +5752,12 @@ mod tests {
         assert_eq!(assigned(200).map(|p| p.len()), Some(1));
 
         // Client 100 disconnects.
-        mux.streams()
-            .remove_consumer_group_member(100, iggy_common::IggyTimestamp::default(), 6);
+        mux.streams().remove_consumer_group_member(
+            100,
+            iggy_common::IggyTimestamp::default(),
+            6,
+            None,
+        );
         assert_eq!(assigned(200), Some(vec![1]));
         seed_installed_owners(&mux);
 

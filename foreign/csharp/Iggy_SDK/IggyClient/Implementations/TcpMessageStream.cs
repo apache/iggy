@@ -575,6 +575,19 @@ public sealed partial class TcpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
+    public async Task<MetadataChanges> GetMetadataChangesAsync(MetadataChangesQuery query,
+        CancellationToken token = default)
+    {
+        ArgumentNullException.ThrowIfNull(query);
+        query.Validate();
+        var message = TcpContracts.GetMetadataChanges(query);
+        using IMemoryOwner<byte> responseBuffer
+            = await SendWithResponseAsync(CommandCodes.GET_METADATA_CHANGES_CODE, message, token: token);
+
+        return BinaryMapper.MapMetadataChanges(responseBuffer.Memory.Span);
+    }
+
+    /// <inheritdoc />
     public async Task PingAsync(CancellationToken token = default)
     {
         var message = Array.Empty<byte>();

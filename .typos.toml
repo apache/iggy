@@ -164,5 +164,7 @@ extend-exclude = [
     "foreign/swift/Tests/IggyTests/Fixtures/golden.json",
     # Resource options fixture copies in every SDK test tree (hex payloads)
     "**/resource_options.json",
+    # Metadata change fixture copies in every SDK test tree (hex and base64url payloads)
+    "**/metadata_changes.json",
     "**/.python-version",
 ]

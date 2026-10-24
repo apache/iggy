@@ -18,21 +18,23 @@
 use crate::traits::binary_auth::fail_if_not_authenticated;
 use crate::wire_conversions::clients_from_wire;
 use crate::{
-    BinaryClient, ClientInfo, ClientInfoDetails, IggyError, NonZeroIggyDuration, OptionSpec,
-    OptionsScope, Snapshot, SnapshotCompression, Stats, SystemClient, SystemSnapshotType,
+    BinaryClient, ClientInfo, ClientInfoDetails, IggyError, MetadataChanges, MetadataChangesQuery,
+    NonZeroIggyDuration, OptionSpec, OptionsScope, Snapshot, SnapshotCompression, Stats,
+    SystemClient, SystemSnapshotType,
 };
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::codes::{
-    DESCRIBE_OPTIONS_CODE, GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_ME_CODE, GET_SNAPSHOT_FILE_CODE,
-    GET_STATS_CODE, PING_CODE,
+    DESCRIBE_OPTIONS_CODE, GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_ME_CODE,
+    GET_METADATA_CHANGES_CODE, GET_SNAPSHOT_FILE_CODE, GET_STATS_CODE, PING_CODE,
 };
 use iggy_binary_protocol::requests::system::{
-    DescribeOptionsRequest, GetClientRequest, GetClientsRequest, GetMeRequest, GetSnapshotRequest,
-    GetStatsRequest, PingRequest,
+    DescribeOptionsRequest, GetClientRequest, GetClientsRequest, GetMeRequest,
+    GetMetadataChangesRequest, GetSnapshotRequest, GetStatsRequest, PingRequest,
 };
 use iggy_binary_protocol::responses::clients::get_client::ClientDetailsResponse;
 use iggy_binary_protocol::responses::clients::get_clients::GetClientsResponse;
 use iggy_binary_protocol::responses::system::DescribeOptionsResponse;
+use iggy_binary_protocol::responses::system::GetMetadataChangesResponse;
 use iggy_binary_protocol::responses::system::get_stats::StatsResponse;
 
 #[async_trait::async_trait]
@@ -129,4 +131,229 @@ impl<B: BinaryClient> SystemClient for B {
         let snapshot = Snapshot::new(response.to_vec());
         Ok(snapshot)
     }
+
+    async fn get_metadata_changes(
+        &self,
+        query: &MetadataChangesQuery,
+    ) -> Result<MetadataChanges, IggyError> {
+        fail_if_not_authenticated(self).await?;
+        query.validate()?;
+        let response = self
+            .send_raw_with_response(
+                GET_METADATA_CHANGES_CODE,
+                GetMetadataChangesRequest::from(query).to_bytes(),
+            )
+            .await?;
+        let wire_resp = super::decode_response::<GetMetadataChangesResponse>(&response)?;
+        MetadataChanges::try_from(wire_resp)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        BinaryTransport, Client, ClientState, ConsumerGroupClientState, DiagnosticEvent,
+        MetadataChangeStart, MetadataChangeStatus, PartitionContext, VsrSessionControl,
+        VsrSessionSealed,
+    };
+    use async_broadcast::Receiver;
+    use bytes::Bytes;
+    use iggy_binary_protocol::WireName;
+    use iggy_binary_protocol::primitives::metadata_changes::{
+        WireChangeOptions, WireMetadataChange, WireMetadataChangeCursor, WireMetadataChangePhase,
+        WireMetadataChangeStatus, WireStreamBody, WireStreamKey,
+    };
+    use iggy_binary_protocol::requests::messages::PollMessagesRequest;
+    use iggy_binary_protocol::requests::system::SessionIdentity;
+    use iggy_binary_protocol::requests::users::login_register::BindSecret;
+    use iggy_binary_protocol::responses::system::WireMetadataChangeRecord;
+    use iggy_binary_protocol::{WireDecode, WireOptions};
+    use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn given_query_the_rules_refuse_when_reading_changes_should_not_send_it() {
+        let client = ReplyingClient::default();
+
+        let refused = client
+            .get_metadata_changes(&MetadataChangesQuery {
+                limit: 0,
+                ..MetadataChangesQuery::default()
+            })
+            .await;
+
+        assert_eq!(refused, Err(IggyError::InvalidCommand));
+        assert!(client.sent.lock().expect("lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn given_change_page_when_reading_changes_should_send_code_17_and_decode_the_page() {
+        let body = WireMetadataChange::StreamCreated(WireStreamBody {
+            key: WireStreamKey {
+                stream_id: 3,
+                stream_created_op: 41,
+            },
+            created_at: 7,
+            name: WireName::new("orders").expect("valid name"),
+            options: WireChangeOptions::Readable {
+                explicit: WireOptions::empty(),
+                derived: WireOptions::empty(),
+            },
+        })
+        .body_bytes();
+        let page = GetMetadataChangesResponse {
+            status: WireMetadataChangeStatus::Ok,
+            phase: WireMetadataChangePhase::Changes,
+            log_id: Some(0x0d4b),
+            oldest_op: 1,
+            retained_since: 0,
+            head_op: 41,
+            next: Some(WireMetadataChangeCursor {
+                log_id: 0x0d4b,
+                op: 41,
+                checksum: 0x41,
+                ordinal: 0,
+            }),
+            has_more: false,
+            records: vec![WireMetadataChangeRecord {
+                op: 41,
+                ordinal: 0,
+                checksum: 0x41,
+                timestamp: 7,
+                actor_user_id: Some(0),
+                group: 1,
+                kind: 1,
+                body,
+            }],
+            items: Vec::new(),
+            current_page_token: None,
+        };
+        let client = ReplyingClient {
+            reply: page.to_bytes(),
+            ..ReplyingClient::default()
+        };
+        let query = MetadataChangesQuery {
+            start: MetadataChangeStart::Latest,
+            ..MetadataChangesQuery::default()
+        };
+
+        let changes = client
+            .get_metadata_changes(&query)
+            .await
+            .expect("a decoded page");
+
+        let sent = client.sent.lock().expect("lock").clone();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, GET_METADATA_CHANGES_CODE);
+        assert_eq!(
+            GetMetadataChangesRequest::decode_from(&sent[0].1).expect("a request"),
+            GetMetadataChangesRequest::from(&query)
+        );
+        assert_eq!(changes.status, MetadataChangeStatus::Ok);
+        assert_eq!(
+            changes,
+            MetadataChanges::try_from(page).expect("valid page")
+        );
+    }
+
+    /// An authenticated binary client that records each request and answers
+    /// with `reply`.
+    #[derive(Debug, Default)]
+    struct ReplyingClient {
+        sent: Mutex<Vec<(u32, Bytes)>>,
+        reply: Bytes,
+        consumer_groups: Arc<ConsumerGroupClientState>,
+    }
+
+    #[async_trait::async_trait]
+    impl BinaryTransport for ReplyingClient {
+        async fn get_state(&self) -> ClientState {
+            ClientState::Authenticated
+        }
+
+        async fn set_state(&self, _state: ClientState) {}
+
+        async fn publish_event(&self, _event: DiagnosticEvent) {}
+
+        async fn send_raw_with_context(
+            &self,
+            code: u32,
+            payload: Bytes,
+            _context: PartitionContext,
+        ) -> Result<Bytes, IggyError> {
+            self.sent.lock().expect("lock").push((code, payload));
+            Ok(self.reply.clone())
+        }
+
+        async fn send_offset_write_with_response(
+            &self,
+            _code: u32,
+            _payload: Bytes,
+            _context: Option<PartitionContext>,
+        ) -> Result<Bytes, IggyError> {
+            Err(IggyError::FeatureUnavailable)
+        }
+
+        async fn send_poll_with_response(
+            &self,
+            _request: &PollMessagesRequest,
+            _context: Option<PartitionContext>,
+        ) -> Result<Bytes, IggyError> {
+            Err(IggyError::FeatureUnavailable)
+        }
+
+        fn get_heartbeat_interval(&self) -> NonZeroIggyDuration {
+            NonZeroIggyDuration::ONE_SECOND
+        }
+
+        fn consumer_group_state(&self) -> Arc<ConsumerGroupClientState> {
+            Arc::clone(&self.consumer_groups)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Client for ReplyingClient {
+        async fn connect(&self) -> Result<(), IggyError> {
+            Ok(())
+        }
+
+        async fn disconnect(&self) -> Result<(), IggyError> {
+            Ok(())
+        }
+
+        async fn shutdown(&self) -> Result<(), IggyError> {
+            Ok(())
+        }
+
+        async fn subscribe_events(&self) -> Receiver<DiagnosticEvent> {
+            async_broadcast::broadcast(1).1
+        }
+    }
+
+    impl VsrSessionSealed for ReplyingClient {}
+
+    #[async_trait::async_trait]
+    impl VsrSessionControl for ReplyingClient {
+        async fn session_bind_secret(&self) -> Result<BindSecret, IggyError> {
+            Err(IggyError::FeatureUnavailable)
+        }
+
+        async fn session_identity(&self) -> Result<SessionIdentity, IggyError> {
+            Err(IggyError::FeatureUnavailable)
+        }
+
+        async fn bind_vsr_session(&self, _session: u64) -> Result<(), IggyError> {
+            Ok(())
+        }
+
+        async fn reset_vsr_session(&self) -> Result<(), IggyError> {
+            Ok(())
+        }
+
+        fn sdk_version(&self) -> &'static str {
+            env!("CARGO_PKG_VERSION")
+        }
+    }
+
+    impl BinaryClient for ReplyingClient {}
 }

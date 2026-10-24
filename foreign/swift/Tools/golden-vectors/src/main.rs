@@ -35,6 +35,10 @@ use iggy_binary_protocol::codes::*;
 use iggy_binary_protocol::consensus::{
     Command, EvictionHeader, EvictionReason, HEADER_SIZE, Operation, ReplyHeader, RequestHeader,
 };
+use iggy_binary_protocol::primitives::metadata_changes::{
+    WireChangeOptions, WireMetadataChange, WireMetadataChangeCursor, WireMetadataChangeGroup,
+    WireMetadataChangePhase, WireMetadataChangeStatus, WireStreamBody, WireStreamKey,
+};
 use iggy_binary_protocol::primitives::options::WireOptions;
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_binary_protocol::primitives::permissions::{
@@ -78,7 +82,8 @@ use iggy_binary_protocol::responses::streams::{
 };
 use iggy_binary_protocol::responses::system::get_stats::{CacheMetricEntry, StatsResponse};
 use iggy_binary_protocol::responses::system::{
-    ClusterMetadataResponse, ClusterNodeResponse, DescribeOptionsResponse, OptionDescriptor,
+    ClusterMetadataResponse, ClusterNodeResponse, DescribeOptionsResponse,
+    GetMetadataChangesResponse, OptionDescriptor, WireMetadataChangeRecord,
 };
 use iggy_binary_protocol::responses::topics::{
     GetTopicResponse, GetTopicsResponse, PartitionResponse,
@@ -138,6 +143,15 @@ fn name(value: &str) -> WireName {
     WireName::new(value).expect("valid name")
 }
 
+fn metadata_cursor() -> WireMetadataChangeCursor {
+    WireMetadataChangeCursor {
+        log_id: 0x0d4b_8f2a_6e1c_93d7,
+        op: 4187,
+        checksum: 0xf2a4_c6e8_b0d1_f359,
+        ordinal: 1,
+    }
+}
+
 fn options(entries: &[(u8, &[u8], u8, &[u8])]) -> WireOptions {
     let mut buf = BytesMut::new();
     encode_user_headers(entries, &mut buf);
@@ -194,7 +208,7 @@ fn version_info() -> ClientVersionInfo {
     ClientVersionInfo {
         protocol_version: IGGY_PROTOCOL_VERSION,
         sdk_name: name("swift-sdk"),
-        sdk_version: name("0.1.1"),
+        sdk_version: name("0.1.2"),
     }
 }
 
@@ -907,6 +921,20 @@ fn main() {
         "request.describe_options",
         &DescribeOptionsRequest { scope: 1 },
     );
+    add(
+        &mut vectors,
+        "request.get_metadata_changes",
+        &GetMetadataChangesRequest {
+            start: WireMetadataChangeStart::After(metadata_cursor()),
+            since: Some(1_760_356_800_000_000),
+            until: None,
+            limit: 500,
+            groups: vec![
+                WireMetadataChangeGroup::Topics.as_u8(),
+                WireMetadataChangeGroup::Streams.as_u8(),
+            ],
+        },
+    );
 
     // Send messages: the full body a producer writes.
     {
@@ -1467,6 +1495,44 @@ fn main() {
                     status: 3,
                 },
             ],
+        },
+    );
+    let stream_created = WireMetadataChange::StreamCreated(WireStreamBody {
+        key: WireStreamKey {
+            stream_id: 3,
+            stream_created_op: 4121,
+        },
+        created_at: 1_760_356_800_123_456,
+        name: name("telemetry"),
+        options: WireChangeOptions::Readable {
+            explicit: WireOptions::empty(),
+            derived: WireOptions::empty(),
+        },
+    });
+    add(
+        &mut vectors,
+        "response.get_metadata_changes",
+        &GetMetadataChangesResponse {
+            status: WireMetadataChangeStatus::Ok,
+            phase: WireMetadataChangePhase::Changes,
+            log_id: Some(metadata_cursor().log_id),
+            oldest_op: 3871,
+            retained_since: 0,
+            head_op: 4190,
+            next: Some(metadata_cursor()),
+            has_more: false,
+            records: vec![WireMetadataChangeRecord {
+                op: 4121,
+                ordinal: 0,
+                checksum: 0xa5c1_f703_8b9e_3d65,
+                timestamp: 1_760_356_800_004_121,
+                actor_user_id: Some(0),
+                group: stream_created.group().as_u8(),
+                kind: stream_created.kind().as_u8(),
+                body: stream_created.body_bytes(),
+            }],
+            items: Vec::new(),
+            current_page_token: None,
         },
     );
     add(

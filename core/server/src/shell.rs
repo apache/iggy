@@ -31,7 +31,9 @@ use journal::superblock::PingPongSuperblock;
 use message_bus::{ConnectionInstaller, IggyMessageBus, MessageBus};
 use metadata::IggyMetadata;
 use metadata::MuxStateMachine;
+use metadata::change_log::ChangeLog;
 use metadata::impls::metadata::IggySnapshot;
+use metadata::stm::LeftRightFactory;
 use metadata::stm::mux::WithFactory;
 use metadata::stm::stream::Streams;
 use metadata::stm::user::Users;
@@ -44,10 +46,15 @@ use std::time::Duration;
 pub(crate) type ServerMuxStateMachine = MuxStateMachine<variadic!(Users, Streams)>;
 
 /// Cross-thread bundle carrying one `ReadHandleFactory` per metadata
-/// state. Shard 0 mints one after `recover()` and broadcasts a clone to
-/// every peer shard; each peer rebuilds a reader-mode
-/// [`ServerMuxStateMachine`] on its own runtime, skipping the WAL.
-pub(crate) type ServerMetadataBundle = <variadic!(Users, Streams) as WithFactory>::Bundle;
+/// state and one for the change log. Shard 0 mints one after `recover()`
+/// and broadcasts a clone to every peer shard. Each peer rebuilds a
+/// reader-mode [`ServerMuxStateMachine`] and change log on its own runtime,
+/// skipping the WAL.
+#[derive(Clone, Debug)]
+pub(crate) struct ServerMetadataBundle {
+    pub(crate) states: <variadic!(Users, Streams) as WithFactory>::Bundle,
+    pub(crate) change_log: LeftRightFactory<ChangeLog>,
+}
 
 pub(crate) type ServerMetadata = IggyMetadata<
     VsrConsensus<Rc<IggyMessageBus>>,

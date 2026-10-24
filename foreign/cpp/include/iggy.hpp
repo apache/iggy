@@ -78,6 +78,12 @@ class ConsumerGroupDetails;
 class ConsumerGroupMember;
 class IggyMessagePolled;
 class IggyMessageToSend;
+class MetadataChangeCursor;
+class MetadataChangeRecord;
+class MetadataChanges;
+class MetadataChangesQuery;
+class MetadataCurrentItem;
+class MetadataCurrentPageToken;
 
 namespace detail {
 /** @brief Internal base for string-backed option types. */
@@ -97,6 +103,10 @@ class StringTag {
     std::string value_;
 };
 
+/** @brief Runs a bridge call and rethrows its failure as IggyException with the call's ErrorInfo. */
+template <typename Operation>
+decltype(auto) RethrowAsIggyException(Operation &&operation);
+
 }  // namespace detail
 
 /**
@@ -104,7 +114,9 @@ class StringTag {
  *
  * Code() and Kind() are available only when a call forwards a typed Rust SDK
  * error. IggyBlockingClient documents the covered methods. Other calls and
- * C++ or bridge-local argument errors leave Code() empty and Kind() empty.
+ * C++ or bridge-local argument errors leave Code() empty and Kind() empty,
+ * except the metadata change calls, which report invalid input with the kind
+ * each one documents.
  * OperationId() is present only for operation_uncertain, lane_blocked, and
  * operation_not_retained errors and preserves the full unsigned 64-bit ID.
  */
@@ -131,15 +143,34 @@ class IggyException : public std::runtime_error {
         }
     }
 
-    friend class IggyBlockingClient;
-    friend std::string EncryptionKeyFingerprint(const std::vector<std::uint8_t> &key);
-    friend std::string EncryptionKeyFingerprint(const std::string &key_base64);
+    template <typename Operation>
+    friend decltype(auto) detail::RethrowAsIggyException(Operation &&operation);
 
     std::optional<std::uint32_t> code_;
     // Shared, so that copying the exception cannot throw.
     std::shared_ptr<const std::string> kind_;
     std::optional<std::uint64_t> operation_id_;
 };
+
+namespace detail {
+
+template <typename Operation>
+decltype(auto) RethrowAsIggyException(Operation &&operation) {
+    ffi::ErrorInfo error_info{};
+    try {
+        if constexpr (std::is_invocable_v<Operation, ffi::ErrorInfo &>) {
+            return std::forward<Operation>(operation)(error_info);
+        } else {
+            return std::forward<Operation>(operation)();
+        }
+    } catch (const IggyException &) {
+        throw;
+    } catch (const std::exception &error) {
+        throw IggyException(error.what(), error_info);
+    }
+}
+
+}  // namespace detail
 
 /**
  * @brief Details returned after a successful login.
@@ -728,6 +759,8 @@ class Permissions final {
 
     friend class IggyBlockingClient;
     friend class UserInfoDetails;
+    friend class MetadataUserChange;
+    friend class MetadataUserPermissionsUpdated;
 
     GlobalPermissions global_;
     std::map<std::uint32_t, StreamPermissions> streams_;
@@ -1147,6 +1180,10 @@ class ResourceOptions final {
     friend class StreamDetails;
     friend class UserInfo;
     friend class UserInfoDetails;
+    friend class MetadataStreamChange;
+    friend class MetadataTopicChange;
+    friend class MetadataTopicItem;
+    friend class MetadataUserChange;
 
     std::map<std::string, HeaderField> explicit_;
     std::map<std::string, HeaderField> derived_;
@@ -3970,6 +4007,1621 @@ std::string EncryptionKeyFingerprint(const std::vector<std::uint8_t> &key);
 std::string EncryptionKeyFingerprint(const std::string &key_base64);
 
 /**
+ * @brief Family of metadata change records and the unit of filtering.
+ *
+ * The values are the wire codes. A query without groups selects every group.
+ */
+enum class MetadataChangeGroup : std::uint8_t {
+    Streams              = 1,
+    Topics               = 2,
+    Partitions           = 3,
+    ConsumerGroups       = 4,
+    ConsumerGroupMembers = 5,
+    Users                = 6,
+    PersonalAccessTokens = 7,
+    Sessions             = 8,
+};
+
+constexpr std::string_view to_string(const MetadataChangeGroup group) {
+    switch (group) {
+        case MetadataChangeGroup::Streams:
+            return "streams";
+        case MetadataChangeGroup::Topics:
+            return "topics";
+        case MetadataChangeGroup::Partitions:
+            return "partitions";
+        case MetadataChangeGroup::ConsumerGroups:
+            return "consumer_groups";
+        case MetadataChangeGroup::ConsumerGroupMembers:
+            return "consumer_group_members";
+        case MetadataChangeGroup::Users:
+            return "users";
+        case MetadataChangeGroup::PersonalAccessTokens:
+            return "personal_access_tokens";
+        case MetadataChangeGroup::Sessions:
+            return "sessions";
+    }
+    throw std::invalid_argument("Unknown metadata change group");
+}
+
+/**
+ * @brief Kind of a metadata change record. The values are the wire codes.
+ */
+enum class MetadataChangeKind : std::uint8_t {
+    StreamCreated                    = 1,
+    StreamUpdated                    = 2,
+    StreamDeleted                    = 3,
+    TopicCreated                     = 10,
+    TopicUpdated                     = 11,
+    TopicDeleted                     = 12,
+    PartitionsChanged                = 20,
+    ConsumerGroupCreated             = 30,
+    ConsumerGroupDeleted             = 31,
+    ConsumerGroupMemberJoined        = 40,
+    ConsumerGroupMemberLeft          = 41,
+    ConsumerGroupPartitionHandedOver = 42,
+    UserCreated                      = 50,
+    UserUpdated                      = 51,
+    UserDeleted                      = 52,
+    UserPasswordChanged              = 53,
+    UserPermissionsUpdated           = 54,
+    PersonalAccessTokenCreated       = 60,
+    PersonalAccessTokenDeleted       = 61,
+    SessionRegistered                = 70,
+    SessionClosed                    = 71,
+};
+
+constexpr std::string_view to_string(const MetadataChangeKind kind) {
+    switch (kind) {
+        case MetadataChangeKind::StreamCreated:
+            return "stream_created";
+        case MetadataChangeKind::StreamUpdated:
+            return "stream_updated";
+        case MetadataChangeKind::StreamDeleted:
+            return "stream_deleted";
+        case MetadataChangeKind::TopicCreated:
+            return "topic_created";
+        case MetadataChangeKind::TopicUpdated:
+            return "topic_updated";
+        case MetadataChangeKind::TopicDeleted:
+            return "topic_deleted";
+        case MetadataChangeKind::PartitionsChanged:
+            return "partitions_changed";
+        case MetadataChangeKind::ConsumerGroupCreated:
+            return "consumer_group_created";
+        case MetadataChangeKind::ConsumerGroupDeleted:
+            return "consumer_group_deleted";
+        case MetadataChangeKind::ConsumerGroupMemberJoined:
+            return "consumer_group_member_joined";
+        case MetadataChangeKind::ConsumerGroupMemberLeft:
+            return "consumer_group_member_left";
+        case MetadataChangeKind::ConsumerGroupPartitionHandedOver:
+            return "consumer_group_partition_handed_over";
+        case MetadataChangeKind::UserCreated:
+            return "user_created";
+        case MetadataChangeKind::UserUpdated:
+            return "user_updated";
+        case MetadataChangeKind::UserDeleted:
+            return "user_deleted";
+        case MetadataChangeKind::UserPasswordChanged:
+            return "user_password_changed";
+        case MetadataChangeKind::UserPermissionsUpdated:
+            return "user_permissions_updated";
+        case MetadataChangeKind::PersonalAccessTokenCreated:
+            return "personal_access_token_created";
+        case MetadataChangeKind::PersonalAccessTokenDeleted:
+            return "personal_access_token_deleted";
+        case MetadataChangeKind::SessionRegistered:
+            return "session_registered";
+        case MetadataChangeKind::SessionClosed:
+            return "session_closed";
+    }
+    throw std::invalid_argument("Unknown metadata change kind");
+}
+
+/**
+ * @brief Outcome of a metadata change query.
+ */
+enum class MetadataChangeStatus : std::uint8_t {
+    Ok      = 0,  ///< Records or items after the requested position.
+    Behind  = 1,  ///< The answering node has not applied the requested position yet. Retry later.
+    Expired = 2,  ///< The node no longer holds every record after the position. Rebuild from current state.
+    Reset   = 3,  ///< The position belongs to another history. Rebuild from current state.
+};
+
+constexpr std::string_view to_string(const MetadataChangeStatus status) {
+    switch (status) {
+        case MetadataChangeStatus::Ok:
+            return "ok";
+        case MetadataChangeStatus::Behind:
+            return "behind";
+        case MetadataChangeStatus::Expired:
+            return "expired";
+        case MetadataChangeStatus::Reset:
+            return "reset";
+    }
+    throw std::invalid_argument("Unknown metadata change status");
+}
+
+/**
+ * @brief Whether an answer pages change records or current state items.
+ */
+enum class MetadataChangePhase : std::uint8_t {
+    Changes = 0,
+    Current = 1,
+};
+
+constexpr std::string_view to_string(const MetadataChangePhase phase) {
+    switch (phase) {
+        case MetadataChangePhase::Changes:
+            return "changes";
+        case MetadataChangePhase::Current:
+            return "current";
+    }
+    throw std::invalid_argument("Unknown metadata change phase");
+}
+
+/** @brief Why a consumer group member was removed. */
+enum class MetadataMemberLeftReason : std::uint8_t {
+    Left         = 0,
+    SessionEnded = 1,
+};
+
+constexpr std::string_view to_string(const MetadataMemberLeftReason reason) {
+    switch (reason) {
+        case MetadataMemberLeftReason::Left:
+            return "left";
+        case MetadataMemberLeftReason::SessionEnded:
+            return "session_ended";
+    }
+    throw std::invalid_argument("Unknown member left reason");
+}
+
+/** @brief Why a personal access token was removed. */
+enum class MetadataTokenDeletedReason : std::uint8_t {
+    Deleted = 0,
+    Expired = 1,
+};
+
+constexpr std::string_view to_string(const MetadataTokenDeletedReason reason) {
+    switch (reason) {
+        case MetadataTokenDeletedReason::Deleted:
+            return "deleted";
+        case MetadataTokenDeletedReason::Expired:
+            return "expired";
+    }
+    throw std::invalid_argument("Unknown token deleted reason");
+}
+
+/** @brief Why a session was closed. */
+enum class MetadataSessionClosedReason : std::uint8_t {
+    Logout  = 0,
+    Expired = 1,
+    Revoked = 2,  ///< The user was deactivated or deleted.
+};
+
+constexpr std::string_view to_string(const MetadataSessionClosedReason reason) {
+    switch (reason) {
+        case MetadataSessionClosedReason::Logout:
+            return "logout";
+        case MetadataSessionClosedReason::Expired:
+            return "expired";
+        case MetadataSessionClosedReason::Revoked:
+            return "revoked";
+    }
+    throw std::invalid_argument("Unknown session closed reason");
+}
+
+/** @brief Why a user's public permission set changed. */
+enum class MetadataPermissionsUpdatedReason : std::uint8_t {
+    Updated         = 0,  ///< UpdatePermissions() replaced the set.
+    ResourceDeleted = 1,  ///< A stream or topic delete pruned the user's grants on it.
+};
+
+constexpr std::string_view to_string(const MetadataPermissionsUpdatedReason reason) {
+    switch (reason) {
+        case MetadataPermissionsUpdatedReason::Updated:
+            return "updated";
+        case MetadataPermissionsUpdatedReason::ResourceDeleted:
+            return "resource_deleted";
+    }
+    throw std::invalid_argument("Unknown permissions updated reason");
+}
+
+/**
+ * @brief Position of the last metadata change record a caller consumed.
+ *
+ * Persist ToString() and pass the cursor back through
+ * MetadataChangesQuery::After() to read the records after it. Op() zero names
+ * the beginning of the history LogId() identifies.
+ */
+class MetadataChangeCursor final {
+  public:
+    /**
+     * @brief Parses the `mc1_` text form ToString() returns.
+     * @param text Cursor text.
+     * @return Parsed cursor.
+     * @throws IggyException with Kind() invalid_command when @p text is not a
+     *         canonical cursor. The message never contains the text.
+     */
+    static MetadataChangeCursor Parse(const std::string &text);
+
+    /** @brief Returns the prepare checksum of op 1 of this history. */
+    [[nodiscard]] absl::uint128 LogId() const noexcept { return log_id_; }
+
+    /** @brief Returns the metadata operation of the consumed record. */
+    [[nodiscard]] std::uint64_t Op() const noexcept { return op_; }
+
+    /** @brief Returns the prepare checksum of Op(). */
+    [[nodiscard]] absl::uint128 Checksum() const noexcept { return checksum_; }
+
+    /** @brief Returns the position of the consumed record within Op(). */
+    [[nodiscard]] std::uint32_t Ordinal() const noexcept { return ordinal_; }
+
+    /** @brief Returns whether the cursor names the beginning of its history. */
+    [[nodiscard]] bool IsZero() const noexcept { return op_ == 0; }
+
+    /** @brief Returns the `mc1_` text form, `mc1_` and 59 characters of unpadded base64url. */
+    [[nodiscard]] const std::string &ToString() const noexcept { return text_; }
+
+    friend bool operator==(const MetadataChangeCursor &left, const MetadataChangeCursor &right) noexcept {
+        return left.text_ == right.text_;
+    }
+
+    friend bool operator!=(const MetadataChangeCursor &left, const MetadataChangeCursor &right) noexcept {
+        return !(left == right);
+    }
+
+  private:
+    MetadataChangeCursor() = default;
+
+    static MetadataChangeCursor FromFfi(ffi::MetadataChangeCursor cursor);
+
+    friend class MetadataChanges;
+    friend class MetadataCurrentPageToken;
+
+    absl::uint128 log_id_{};
+    std::uint64_t op_{};
+    absl::uint128 checksum_{};
+    std::uint32_t ordinal_{};
+    std::string text_;
+};
+
+/**
+ * @brief Continuation of a current state scan.
+ *
+ * Pass it back unchanged through MetadataChangesQuery::Current() with the
+ * same groups to read the next page.
+ */
+class MetadataCurrentPageToken final {
+  public:
+    /**
+     * @brief Parses the `cs1_` text form ToString() returns.
+     * @param text Page token text.
+     * @return Parsed page token.
+     * @throws IggyException with Kind() invalid_command when @p text is not a
+     *         canonical page token. The message never contains the text.
+     */
+    static MetadataCurrentPageToken Parse(const std::string &text);
+
+    /** @brief Returns the `cs1_` text form. */
+    [[nodiscard]] const std::string &ToString() const noexcept { return text_; }
+
+    /** @brief Returns the position captured before the scan's first page. */
+    [[nodiscard]] const MetadataChangeCursor &Anchor() const noexcept { return anchor_; }
+
+    /** @brief Returns the highest head any page of the scan reported so far. */
+    [[nodiscard]] std::uint64_t RequiredHead() const noexcept { return required_head_; }
+
+    /** @brief Returns the groups the scan was started with, in code order. */
+    [[nodiscard]] std::vector<MetadataChangeGroup> Groups() const {
+        std::vector<MetadataChangeGroup> groups;
+        for (std::uint8_t code = 1; code <= 8; ++code) {
+            if ((groups_mask_ & (1U << (code - 1))) != 0) {
+                groups.push_back(static_cast<MetadataChangeGroup>(code));
+            }
+        }
+        return groups;
+    }
+
+    /** @brief Returns the group of the last item returned. */
+    [[nodiscard]] MetadataChangeGroup LastGroup() const noexcept { return last_group_; }
+
+    /** @brief Returns the key of the last item returned, in the page token key layout. */
+    [[nodiscard]] const std::vector<std::uint8_t> &LastKey() const noexcept { return last_key_; }
+
+  private:
+    MetadataCurrentPageToken() = default;
+
+    static MetadataCurrentPageToken FromFfi(ffi::MetadataCurrentPageToken token);
+
+    friend class MetadataChanges;
+
+    std::string text_;
+    MetadataChangeCursor anchor_;
+    std::uint64_t required_head_{};
+    std::uint8_t groups_mask_{};
+    MetadataChangeGroup last_group_{MetadataChangeGroup::Streams};
+    std::vector<std::uint8_t> last_key_;
+};
+
+/**
+ * @brief One read of the metadata change log or of the current state.
+ *
+ * Start with Earliest(), Latest(), After(), or Current(), then narrow the
+ * read with the setters. IggyBlockingClient::GetMetadataChanges() refuses an
+ * invalid query with Kind() invalid_command before anything is sent.
+ */
+class MetadataChangesQuery final {
+  public:
+    /** @brief Where the read starts. The values are the wire codes. */
+    enum class Start : std::uint8_t {
+        Earliest = 0,  ///< The oldest operation the requested groups still hold completely.
+        Latest   = 1,  ///< No records, only a cursor at the newest retained record.
+        After    = 2,  ///< The records after Cursor().
+        Current  = 3,  ///< Current state pages, continuing after PageToken() when set.
+    };
+
+    static constexpr std::uint32_t kDefaultLimit = 100;
+    static constexpr std::uint32_t kMaxLimit     = 1000;
+
+    /** @brief Reads from the oldest operation the requested groups still hold completely. */
+    static MetadataChangesQuery Earliest() { return MetadataChangesQuery(Start::Earliest); }
+
+    /** @brief Reads no records and returns a cursor at the newest retained record to follow from. */
+    static MetadataChangesQuery Latest() { return MetadataChangesQuery(Start::Latest); }
+
+    /** @brief Reads the records after @p cursor. */
+    static MetadataChangesQuery After(MetadataChangeCursor cursor) {
+        MetadataChangesQuery query(Start::After);
+        query.cursor_ = std::move(cursor);
+        return query;
+    }
+
+    /** @brief Reads the first page of a current state scan. */
+    static MetadataChangesQuery Current() { return MetadataChangesQuery(Start::Current); }
+
+    /** @brief Reads the page of a current state scan after @p token. Keep the scan's groups. */
+    static MetadataChangesQuery Current(MetadataCurrentPageToken token) {
+        MetadataChangesQuery query(Start::Current);
+        query.page_token_ = std::move(token);
+        return query;
+    }
+
+    /** @brief Returns where the read starts. */
+    [[nodiscard]] Start StartMode() const noexcept { return start_; }
+
+    /** @brief Returns the cursor of an After() read. */
+    [[nodiscard]] const std::optional<MetadataChangeCursor> &Cursor() const noexcept { return cursor_; }
+
+    /** @brief Returns the page token of a continued Current() read. */
+    [[nodiscard]] const std::optional<MetadataCurrentPageToken> &PageToken() const noexcept { return page_token_; }
+
+    /** @brief Returns the requested groups. Empty means every group. */
+    [[nodiscard]] const std::vector<MetadataChangeGroup> &Groups() const noexcept { return groups_; }
+
+    /** @brief Returns the inclusive lower bound on record timestamps, in microseconds. */
+    [[nodiscard]] std::optional<std::uint64_t> Since() const noexcept { return since_; }
+
+    /** @brief Returns the inclusive upper bound on record timestamps, in microseconds. */
+    [[nodiscard]] std::optional<std::uint64_t> Until() const noexcept { return until_; }
+
+    /** @brief Returns the most records or items one page returns. */
+    [[nodiscard]] std::uint32_t Limit() const noexcept { return limit_; }
+
+    /**
+     * @brief Selects the groups to read.
+     *
+     * A current state scan must include each selected group's parents, so a
+     * mirror can apply the cascades of their deletes.
+     * @param groups Requested groups. Empty selects every group.
+     * @return Reference to this query.
+     */
+    MetadataChangesQuery &SetGroups(std::vector<MetadataChangeGroup> groups) {
+        groups_ = std::move(groups);
+        return *this;
+    }
+
+    /**
+     * @brief Keeps records with a timestamp at or after @p micros.
+     *
+     * Time bounds apply to Earliest() and After() reads only.
+     * @param micros Microseconds since the Unix epoch.
+     * @return Reference to this query.
+     */
+    MetadataChangesQuery &SetSince(std::uint64_t micros) {
+        since_ = micros;
+        return *this;
+    }
+
+    /**
+     * @brief Keeps records with a timestamp at or before @p micros.
+     *
+     * Time bounds apply to Earliest() and After() reads only.
+     * @param micros Microseconds since the Unix epoch.
+     * @return Reference to this query.
+     */
+    MetadataChangesQuery &SetUntil(std::uint64_t micros) {
+        until_ = micros;
+        return *this;
+    }
+
+    /**
+     * @brief Sets the most records or items one page returns.
+     * @param limit From 1 to kMaxLimit. The default is kDefaultLimit.
+     * @return Reference to this query.
+     */
+    MetadataChangesQuery &SetLimit(std::uint32_t limit) {
+        limit_ = limit;
+        return *this;
+    }
+
+    /**
+     * @brief Applies the checks GetMetadataChanges() runs before sending.
+     * @throws IggyException with Kind() invalid_command when the limit is
+     *         outside 1 to kMaxLimit, Since() is above Until(), a time bound
+     *         accompanies Latest() or Current() or lies past what the
+     *         platform clock holds, a current state scan misses a parent
+     *         group, or the page token was issued for other groups.
+     */
+    void Validate() const;
+
+    /**
+     * @brief Encodes the query as the binary transports send it, without
+     *        validating it.
+     * @return Request payload without framing.
+     * @throws IggyException with Kind() invalid_command for a group this build
+     *         does not know or a time bound past what the platform clock holds.
+     */
+    [[nodiscard]] std::vector<std::uint8_t> ToBytes() const;
+
+  private:
+    explicit MetadataChangesQuery(Start start) : start_(start) {}
+
+    [[nodiscard]] ffi::MetadataChangesQuery ToFfi() const;
+
+    friend class IggyBlockingClient;
+
+    Start start_;
+    std::optional<MetadataChangeCursor> cursor_;
+    std::optional<MetadataCurrentPageToken> page_token_;
+    std::vector<MetadataChangeGroup> groups_;
+    std::optional<std::uint64_t> since_;
+    std::optional<std::uint64_t> until_;
+    std::uint32_t limit_{kDefaultLimit};
+};
+
+/**
+ * @brief A stream after a create or update, and a current state streams item.
+ */
+class MetadataStreamChange final {
+  public:
+    /** @brief Returns the numeric stream ID. */
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+
+    /** @brief Returns the op that created the stream. A recreated stream with a reused ID has another. */
+    [[nodiscard]] std::uint64_t StreamCreatedOp() const noexcept { return stream_created_op_; }
+
+    /** @brief Returns the creation timestamp in microseconds. */
+    [[nodiscard]] std::uint64_t CreatedAt() const noexcept { return created_at_; }
+
+    /** @brief Returns the stream name after the change. */
+    [[nodiscard]] const std::string &Name() const noexcept { return name_; }
+
+    /**
+     * @brief Returns the public options after the change, as the read routes return them.
+     * @return `std::nullopt` when the server holds option state this build
+     *         cannot read. Keep the previous values then.
+     */
+    [[nodiscard]] const std::optional<ResourceOptions> &Options() const noexcept { return options_; }
+
+  private:
+    MetadataStreamChange() = default;
+
+    static MetadataStreamChange FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+    friend class MetadataCurrentItem;
+
+    std::uint32_t stream_id_{};
+    std::uint64_t stream_created_op_{};
+    std::uint64_t created_at_{};
+    std::string name_;
+    std::optional<ResourceOptions> options_;
+};
+
+/**
+ * @brief A removed stream.
+ */
+class MetadataStreamDeleted final {
+  public:
+    /** @brief Returns the numeric stream ID. */
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+
+    /** @brief Returns the op that created the stream. */
+    [[nodiscard]] std::uint64_t StreamCreatedOp() const noexcept { return stream_created_op_; }
+
+    /** @brief Returns the creation timestamp in microseconds. */
+    [[nodiscard]] std::uint64_t CreatedAt() const noexcept { return created_at_; }
+
+    /** @brief Returns the stream name. */
+    [[nodiscard]] const std::string &Name() const noexcept { return name_; }
+
+    /** @brief Returns the op of a deferred delete's request, absent for an immediate delete. */
+    [[nodiscard]] std::optional<std::uint64_t> RequestedOp() const noexcept { return requested_op_; }
+
+  private:
+    MetadataStreamDeleted() = default;
+
+    static MetadataStreamDeleted FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+
+    std::uint32_t stream_id_{};
+    std::uint64_t stream_created_op_{};
+    std::uint64_t created_at_{};
+    std::string name_;
+    std::optional<std::uint64_t> requested_op_;
+};
+
+/**
+ * @brief A topic after a create or update.
+ */
+class MetadataTopicChange final {
+  public:
+    /** @brief Returns the numeric stream ID. */
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+
+    /** @brief Returns the op that created the stream. */
+    [[nodiscard]] std::uint64_t StreamCreatedOp() const noexcept { return stream_created_op_; }
+
+    /** @brief Returns the numeric topic ID. */
+    [[nodiscard]] std::uint32_t TopicId() const noexcept { return topic_id_; }
+
+    /** @brief Returns the op that created the topic. */
+    [[nodiscard]] std::uint64_t TopicCreatedOp() const noexcept { return topic_created_op_; }
+
+    /** @brief Returns the creation timestamp in microseconds. */
+    [[nodiscard]] std::uint64_t CreatedAt() const noexcept { return created_at_; }
+
+    /** @brief Returns the topic name after the change. */
+    [[nodiscard]] const std::string &Name() const noexcept { return name_; }
+
+    /** @brief Returns the partition count after the change. */
+    [[nodiscard]] std::uint32_t PartitionsCount() const noexcept { return partitions_count_; }
+
+    /** @brief Returns the public options, `std::nullopt` when this build cannot read them. */
+    [[nodiscard]] const std::optional<ResourceOptions> &Options() const noexcept { return options_; }
+
+  private:
+    MetadataTopicChange() = default;
+
+    static MetadataTopicChange FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+
+    std::uint32_t stream_id_{};
+    std::uint64_t stream_created_op_{};
+    std::uint32_t topic_id_{};
+    std::uint64_t topic_created_op_{};
+    std::uint64_t created_at_{};
+    std::string name_;
+    std::uint32_t partitions_count_{};
+    std::optional<ResourceOptions> options_;
+};
+
+/**
+ * @brief A current state topics item. Partition counts travel as partitions items.
+ */
+class MetadataTopicItem final {
+  public:
+    /** @brief Returns the numeric stream ID. */
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+
+    /** @brief Returns the op that created the stream. */
+    [[nodiscard]] std::uint64_t StreamCreatedOp() const noexcept { return stream_created_op_; }
+
+    /** @brief Returns the numeric topic ID. */
+    [[nodiscard]] std::uint32_t TopicId() const noexcept { return topic_id_; }
+
+    /** @brief Returns the op that created the topic. */
+    [[nodiscard]] std::uint64_t TopicCreatedOp() const noexcept { return topic_created_op_; }
+
+    /** @brief Returns the creation timestamp in microseconds. */
+    [[nodiscard]] std::uint64_t CreatedAt() const noexcept { return created_at_; }
+
+    /** @brief Returns the topic name. */
+    [[nodiscard]] const std::string &Name() const noexcept { return name_; }
+
+    /** @brief Returns the public options, `std::nullopt` when this build cannot read them. */
+    [[nodiscard]] const std::optional<ResourceOptions> &Options() const noexcept { return options_; }
+
+  private:
+    MetadataTopicItem() = default;
+
+    static MetadataTopicItem FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataCurrentItem;
+
+    std::uint32_t stream_id_{};
+    std::uint64_t stream_created_op_{};
+    std::uint32_t topic_id_{};
+    std::uint64_t topic_created_op_{};
+    std::uint64_t created_at_{};
+    std::string name_;
+    std::optional<ResourceOptions> options_;
+};
+
+/**
+ * @brief A removed topic.
+ */
+class MetadataTopicDeleted final {
+  public:
+    /** @brief Returns the numeric stream ID. */
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+
+    /** @brief Returns the op that created the stream. */
+    [[nodiscard]] std::uint64_t StreamCreatedOp() const noexcept { return stream_created_op_; }
+
+    /** @brief Returns the numeric topic ID. */
+    [[nodiscard]] std::uint32_t TopicId() const noexcept { return topic_id_; }
+
+    /** @brief Returns the op that created the topic. */
+    [[nodiscard]] std::uint64_t TopicCreatedOp() const noexcept { return topic_created_op_; }
+
+    /** @brief Returns the creation timestamp in microseconds. */
+    [[nodiscard]] std::uint64_t CreatedAt() const noexcept { return created_at_; }
+
+    /** @brief Returns the topic name. */
+    [[nodiscard]] const std::string &Name() const noexcept { return name_; }
+
+    /** @brief Returns the op of a deferred delete's request, absent for an immediate delete. */
+    [[nodiscard]] std::optional<std::uint64_t> RequestedOp() const noexcept { return requested_op_; }
+
+  private:
+    MetadataTopicDeleted() = default;
+
+    static MetadataTopicDeleted FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+
+    std::uint32_t stream_id_{};
+    std::uint64_t stream_created_op_{};
+    std::uint32_t topic_id_{};
+    std::uint64_t topic_created_op_{};
+    std::uint64_t created_at_{};
+    std::string name_;
+    std::optional<std::uint64_t> requested_op_;
+};
+
+/**
+ * @brief A partition count change.
+ */
+class MetadataPartitionsChanged final {
+  public:
+    /** @brief Returns the numeric stream ID. */
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+
+    /** @brief Returns the op that created the stream. */
+    [[nodiscard]] std::uint64_t StreamCreatedOp() const noexcept { return stream_created_op_; }
+
+    /** @brief Returns the numeric topic ID. */
+    [[nodiscard]] std::uint32_t TopicId() const noexcept { return topic_id_; }
+
+    /** @brief Returns the op that created the topic. */
+    [[nodiscard]] std::uint64_t TopicCreatedOp() const noexcept { return topic_created_op_; }
+
+    /** @brief Returns the partition count after the change. */
+    [[nodiscard]] std::uint32_t PartitionsCount() const noexcept { return partitions_count_; }
+
+    /** @brief Returns the deleted partition IDs in ascending order, empty on create. */
+    [[nodiscard]] const std::vector<std::uint32_t> &RemovedPartitionIds() const noexcept {
+        return removed_partition_ids_;
+    }
+
+    /** @brief Returns the op of a deferred delete's request, absent for an immediate change. */
+    [[nodiscard]] std::optional<std::uint64_t> RequestedOp() const noexcept { return requested_op_; }
+
+  private:
+    MetadataPartitionsChanged() = default;
+
+    static MetadataPartitionsChanged FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+
+    std::uint32_t stream_id_{};
+    std::uint64_t stream_created_op_{};
+    std::uint32_t topic_id_{};
+    std::uint64_t topic_created_op_{};
+    std::uint32_t partitions_count_{};
+    std::vector<std::uint32_t> removed_partition_ids_;
+    std::optional<std::uint64_t> requested_op_;
+};
+
+/**
+ * @brief A current state partitions item.
+ */
+class MetadataPartitionsItem final {
+  public:
+    /** @brief Returns the numeric stream ID. */
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+
+    /** @brief Returns the op that created the stream. */
+    [[nodiscard]] std::uint64_t StreamCreatedOp() const noexcept { return stream_created_op_; }
+
+    /** @brief Returns the numeric topic ID. */
+    [[nodiscard]] std::uint32_t TopicId() const noexcept { return topic_id_; }
+
+    /** @brief Returns the op that created the topic. */
+    [[nodiscard]] std::uint64_t TopicCreatedOp() const noexcept { return topic_created_op_; }
+
+    /** @brief Returns the partition count. */
+    [[nodiscard]] std::uint32_t PartitionsCount() const noexcept { return partitions_count_; }
+
+  private:
+    MetadataPartitionsItem() = default;
+
+    static MetadataPartitionsItem FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataCurrentItem;
+
+    std::uint32_t stream_id_{};
+    std::uint64_t stream_created_op_{};
+    std::uint32_t topic_id_{};
+    std::uint64_t topic_created_op_{};
+    std::uint32_t partitions_count_{};
+};
+
+/**
+ * @brief A created consumer group with the topic's resulting group count.
+ */
+class MetadataConsumerGroupCreated final {
+  public:
+    /** @brief Returns the numeric stream ID. */
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+
+    /** @brief Returns the op that created the stream. */
+    [[nodiscard]] std::uint64_t StreamCreatedOp() const noexcept { return stream_created_op_; }
+
+    /** @brief Returns the numeric topic ID. */
+    [[nodiscard]] std::uint32_t TopicId() const noexcept { return topic_id_; }
+
+    /** @brief Returns the op that created the topic. */
+    [[nodiscard]] std::uint64_t TopicCreatedOp() const noexcept { return topic_created_op_; }
+
+    /** @brief Returns the numeric consumer group ID. */
+    [[nodiscard]] std::uint32_t GroupId() const noexcept { return group_id_; }
+
+    /** @brief Returns the consumer group name. */
+    [[nodiscard]] const std::string &Name() const noexcept { return name_; }
+
+    /** @brief Returns the topic's consumer group count after the change. */
+    [[nodiscard]] std::uint32_t ConsumerGroupsCount() const noexcept { return consumer_groups_count_; }
+
+  private:
+    MetadataConsumerGroupCreated() = default;
+
+    static MetadataConsumerGroupCreated FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+
+    std::uint32_t stream_id_{};
+    std::uint64_t stream_created_op_{};
+    std::uint32_t topic_id_{};
+    std::uint64_t topic_created_op_{};
+    std::uint32_t group_id_{};
+    std::string name_;
+    std::uint32_t consumer_groups_count_{};
+};
+
+/**
+ * @brief A removed consumer group with the topic's resulting group count.
+ */
+class MetadataConsumerGroupDeleted final {
+  public:
+    /** @brief Returns the numeric stream ID. */
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+
+    /** @brief Returns the op that created the stream. */
+    [[nodiscard]] std::uint64_t StreamCreatedOp() const noexcept { return stream_created_op_; }
+
+    /** @brief Returns the numeric topic ID. */
+    [[nodiscard]] std::uint32_t TopicId() const noexcept { return topic_id_; }
+
+    /** @brief Returns the op that created the topic. */
+    [[nodiscard]] std::uint64_t TopicCreatedOp() const noexcept { return topic_created_op_; }
+
+    /** @brief Returns the numeric consumer group ID. */
+    [[nodiscard]] std::uint32_t GroupId() const noexcept { return group_id_; }
+
+    /** @brief Returns the consumer group name. */
+    [[nodiscard]] const std::string &Name() const noexcept { return name_; }
+
+    /** @brief Returns the topic's consumer group count after the change. */
+    [[nodiscard]] std::uint32_t ConsumerGroupsCount() const noexcept { return consumer_groups_count_; }
+
+    /** @brief Returns the op of a deferred delete's request, absent for an immediate delete. */
+    [[nodiscard]] std::optional<std::uint64_t> RequestedOp() const noexcept { return requested_op_; }
+
+  private:
+    MetadataConsumerGroupDeleted() = default;
+
+    static MetadataConsumerGroupDeleted FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+
+    std::uint32_t stream_id_{};
+    std::uint64_t stream_created_op_{};
+    std::uint32_t topic_id_{};
+    std::uint64_t topic_created_op_{};
+    std::uint32_t group_id_{};
+    std::string name_;
+    std::uint32_t consumer_groups_count_{};
+    std::optional<std::uint64_t> requested_op_;
+};
+
+/**
+ * @brief A current state consumer groups item.
+ */
+class MetadataConsumerGroupItem final {
+  public:
+    /** @brief Returns the numeric stream ID. */
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+
+    /** @brief Returns the op that created the stream. */
+    [[nodiscard]] std::uint64_t StreamCreatedOp() const noexcept { return stream_created_op_; }
+
+    /** @brief Returns the numeric topic ID. */
+    [[nodiscard]] std::uint32_t TopicId() const noexcept { return topic_id_; }
+
+    /** @brief Returns the op that created the topic. */
+    [[nodiscard]] std::uint64_t TopicCreatedOp() const noexcept { return topic_created_op_; }
+
+    /** @brief Returns the numeric consumer group ID. */
+    [[nodiscard]] std::uint32_t GroupId() const noexcept { return group_id_; }
+
+    /** @brief Returns the consumer group name. */
+    [[nodiscard]] const std::string &Name() const noexcept { return name_; }
+
+  private:
+    MetadataConsumerGroupItem() = default;
+
+    static MetadataConsumerGroupItem FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataCurrentItem;
+
+    std::uint32_t stream_id_{};
+    std::uint64_t stream_created_op_{};
+    std::uint32_t topic_id_{};
+    std::uint64_t topic_created_op_{};
+    std::uint32_t group_id_{};
+    std::string name_;
+};
+
+/**
+ * @brief A member that joined a consumer group.
+ */
+class MetadataMemberJoined final {
+  public:
+    /** @brief Returns the numeric stream ID. */
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+
+    /** @brief Returns the op that created the stream. */
+    [[nodiscard]] std::uint64_t StreamCreatedOp() const noexcept { return stream_created_op_; }
+
+    /** @brief Returns the numeric topic ID. */
+    [[nodiscard]] std::uint32_t TopicId() const noexcept { return topic_id_; }
+
+    /** @brief Returns the op that created the topic. */
+    [[nodiscard]] std::uint64_t TopicCreatedOp() const noexcept { return topic_created_op_; }
+
+    /** @brief Returns the numeric consumer group ID. */
+    [[nodiscard]] std::uint32_t GroupId() const noexcept { return group_id_; }
+
+    /** @brief Returns the member ID within the group. */
+    [[nodiscard]] std::uint32_t MemberId() const noexcept { return member_id_; }
+
+    /** @brief Returns the session's client ID. */
+    [[nodiscard]] absl::uint128 ClientId() const noexcept { return client_id_; }
+
+    /** @brief Returns the group's member count after the change. */
+    [[nodiscard]] std::uint32_t MembersCount() const noexcept { return members_count_; }
+
+    /** @brief Returns the installed partition IDs, normally empty because a handover installs them. */
+    [[nodiscard]] const std::vector<std::uint32_t> &PartitionIds() const noexcept { return partition_ids_; }
+
+  private:
+    MetadataMemberJoined() = default;
+
+    static MetadataMemberJoined FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+
+    std::uint32_t stream_id_{};
+    std::uint64_t stream_created_op_{};
+    std::uint32_t topic_id_{};
+    std::uint64_t topic_created_op_{};
+    std::uint32_t group_id_{};
+    std::uint32_t member_id_{};
+    absl::uint128 client_id_{};
+    std::uint32_t members_count_{};
+    std::vector<std::uint32_t> partition_ids_;
+};
+
+/**
+ * @brief A member that left a consumer group.
+ */
+class MetadataMemberLeft final {
+  public:
+    /** @brief Returns the numeric stream ID. */
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+
+    /** @brief Returns the op that created the stream. */
+    [[nodiscard]] std::uint64_t StreamCreatedOp() const noexcept { return stream_created_op_; }
+
+    /** @brief Returns the numeric topic ID. */
+    [[nodiscard]] std::uint32_t TopicId() const noexcept { return topic_id_; }
+
+    /** @brief Returns the op that created the topic. */
+    [[nodiscard]] std::uint64_t TopicCreatedOp() const noexcept { return topic_created_op_; }
+
+    /** @brief Returns the numeric consumer group ID. */
+    [[nodiscard]] std::uint32_t GroupId() const noexcept { return group_id_; }
+
+    /** @brief Returns the member ID within the group. */
+    [[nodiscard]] std::uint32_t MemberId() const noexcept { return member_id_; }
+
+    /** @brief Returns the session's client ID. */
+    [[nodiscard]] absl::uint128 ClientId() const noexcept { return client_id_; }
+
+    /** @brief Returns the group's member count after the change. */
+    [[nodiscard]] std::uint32_t MembersCount() const noexcept { return members_count_; }
+
+    /** @brief Returns why the member was removed. */
+    [[nodiscard]] MetadataMemberLeftReason Reason() const noexcept { return reason_; }
+
+  private:
+    MetadataMemberLeft() = default;
+
+    static MetadataMemberLeft FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+
+    std::uint32_t stream_id_{};
+    std::uint64_t stream_created_op_{};
+    std::uint32_t topic_id_{};
+    std::uint64_t topic_created_op_{};
+    std::uint32_t group_id_{};
+    std::uint32_t member_id_{};
+    absl::uint128 client_id_{};
+    std::uint32_t members_count_{};
+    MetadataMemberLeftReason reason_{MetadataMemberLeftReason::Left};
+};
+
+/**
+ * @brief A completed partition handover within a consumer group.
+ */
+class MetadataPartitionHandedOver final {
+  public:
+    /** @brief Returns the numeric stream ID. */
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+
+    /** @brief Returns the op that created the stream. */
+    [[nodiscard]] std::uint64_t StreamCreatedOp() const noexcept { return stream_created_op_; }
+
+    /** @brief Returns the numeric topic ID. */
+    [[nodiscard]] std::uint32_t TopicId() const noexcept { return topic_id_; }
+
+    /** @brief Returns the op that created the topic. */
+    [[nodiscard]] std::uint64_t TopicCreatedOp() const noexcept { return topic_created_op_; }
+
+    /** @brief Returns the numeric consumer group ID. */
+    [[nodiscard]] std::uint32_t GroupId() const noexcept { return group_id_; }
+
+    /** @brief Returns the partition that changed owner. */
+    [[nodiscard]] std::uint32_t PartitionId() const noexcept { return partition_id_; }
+
+    /** @brief Returns the new owner, absent when the last member left. */
+    [[nodiscard]] std::optional<std::uint32_t> MemberId() const noexcept { return member_id_; }
+
+  private:
+    MetadataPartitionHandedOver() = default;
+
+    static MetadataPartitionHandedOver FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+
+    std::uint32_t stream_id_{};
+    std::uint64_t stream_created_op_{};
+    std::uint32_t topic_id_{};
+    std::uint64_t topic_created_op_{};
+    std::uint32_t group_id_{};
+    std::uint32_t partition_id_{};
+    std::optional<std::uint32_t> member_id_;
+};
+
+/**
+ * @brief A current state consumer group members item.
+ */
+class MetadataMemberItem final {
+  public:
+    /** @brief Returns the numeric stream ID. */
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+
+    /** @brief Returns the op that created the stream. */
+    [[nodiscard]] std::uint64_t StreamCreatedOp() const noexcept { return stream_created_op_; }
+
+    /** @brief Returns the numeric topic ID. */
+    [[nodiscard]] std::uint32_t TopicId() const noexcept { return topic_id_; }
+
+    /** @brief Returns the op that created the topic. */
+    [[nodiscard]] std::uint64_t TopicCreatedOp() const noexcept { return topic_created_op_; }
+
+    /** @brief Returns the numeric consumer group ID. */
+    [[nodiscard]] std::uint32_t GroupId() const noexcept { return group_id_; }
+
+    /** @brief Returns the member ID within the group. */
+    [[nodiscard]] std::uint32_t MemberId() const noexcept { return member_id_; }
+
+    /** @brief Returns the session's client ID. */
+    [[nodiscard]] absl::uint128 ClientId() const noexcept { return client_id_; }
+
+    /** @brief Returns the installed partition IDs in ascending order. */
+    [[nodiscard]] const std::vector<std::uint32_t> &PartitionIds() const noexcept { return partition_ids_; }
+
+  private:
+    MetadataMemberItem() = default;
+
+    static MetadataMemberItem FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataCurrentItem;
+
+    std::uint32_t stream_id_{};
+    std::uint64_t stream_created_op_{};
+    std::uint32_t topic_id_{};
+    std::uint64_t topic_created_op_{};
+    std::uint32_t group_id_{};
+    std::uint32_t member_id_{};
+    absl::uint128 client_id_{};
+    std::vector<std::uint32_t> partition_ids_;
+};
+
+/**
+ * @brief A user after a create or update, and a current state users item.
+ */
+class MetadataUserChange final {
+  public:
+    /** @brief Returns the numeric user ID. */
+    [[nodiscard]] std::uint32_t UserId() const noexcept { return user_id_; }
+
+    /** @brief Returns the creation timestamp in microseconds. A recreated user with a reused ID has another. */
+    [[nodiscard]] std::uint64_t UserCreatedAt() const noexcept { return user_created_at_; }
+
+    /** @brief Returns the username after the change. */
+    [[nodiscard]] const std::string &Username() const noexcept { return username_; }
+
+    /** @brief Returns the user status after the change. */
+    [[nodiscard]] UserStatus Status() const noexcept { return status_; }
+
+    /** @brief Returns the complete public permission set, empty when the user has none. */
+    [[nodiscard]] const std::optional<::iggy::Permissions> &Permissions() const noexcept { return permissions_; }
+
+    /** @brief Returns the public options, `std::nullopt` when this build cannot read them. */
+    [[nodiscard]] const std::optional<ResourceOptions> &Options() const noexcept { return options_; }
+
+  private:
+    MetadataUserChange() = default;
+
+    static MetadataUserChange FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+    friend class MetadataCurrentItem;
+
+    std::uint32_t user_id_{};
+    std::uint64_t user_created_at_{};
+    std::string username_;
+    UserStatus status_{UserStatus::Active};
+    std::optional<::iggy::Permissions> permissions_;
+    std::optional<ResourceOptions> options_;
+};
+
+/**
+ * @brief A deleted user, or one whose password changed.
+ */
+class MetadataUserIdentity final {
+  public:
+    /** @brief Returns the numeric user ID. */
+    [[nodiscard]] std::uint32_t UserId() const noexcept { return user_id_; }
+
+    /** @brief Returns the creation timestamp in microseconds. */
+    [[nodiscard]] std::uint64_t UserCreatedAt() const noexcept { return user_created_at_; }
+
+    /** @brief Returns the username. */
+    [[nodiscard]] const std::string &Username() const noexcept { return username_; }
+
+  private:
+    MetadataUserIdentity() = default;
+
+    static MetadataUserIdentity FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+
+    std::uint32_t user_id_{};
+    std::uint64_t user_created_at_{};
+    std::string username_;
+};
+
+/**
+ * @brief A user's public permission set after a change.
+ */
+class MetadataUserPermissionsUpdated final {
+  public:
+    /** @brief Returns the numeric user ID. */
+    [[nodiscard]] std::uint32_t UserId() const noexcept { return user_id_; }
+
+    /** @brief Returns the creation timestamp in microseconds. */
+    [[nodiscard]] std::uint64_t UserCreatedAt() const noexcept { return user_created_at_; }
+
+    /** @brief Returns the username. */
+    [[nodiscard]] const std::string &Username() const noexcept { return username_; }
+
+    /** @brief Returns the complete permission set after the change, empty when the user has none. */
+    [[nodiscard]] const std::optional<::iggy::Permissions> &Permissions() const noexcept { return permissions_; }
+
+    /** @brief Returns why the set changed. */
+    [[nodiscard]] MetadataPermissionsUpdatedReason Reason() const noexcept { return reason_; }
+
+  private:
+    MetadataUserPermissionsUpdated() = default;
+
+    static MetadataUserPermissionsUpdated FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+
+    std::uint32_t user_id_{};
+    std::uint64_t user_created_at_{};
+    std::string username_;
+    std::optional<::iggy::Permissions> permissions_;
+    MetadataPermissionsUpdatedReason reason_{MetadataPermissionsUpdatedReason::Updated};
+};
+
+/**
+ * @brief A created personal access token, and a current state personal access tokens item.
+ */
+class MetadataTokenChange final {
+  public:
+    /** @brief Returns the owner's numeric user ID. */
+    [[nodiscard]] std::uint32_t UserId() const noexcept { return user_id_; }
+
+    /** @brief Returns the owner's creation timestamp in microseconds. */
+    [[nodiscard]] std::uint64_t UserCreatedAt() const noexcept { return user_created_at_; }
+
+    /** @brief Returns the token name. */
+    [[nodiscard]] const std::string &Name() const noexcept { return name_; }
+
+    /** @brief Returns the expiry in microseconds, absent for a token that never expires. */
+    [[nodiscard]] std::optional<std::uint64_t> Expiry() const noexcept { return expiry_; }
+
+  private:
+    MetadataTokenChange() = default;
+
+    static MetadataTokenChange FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+    friend class MetadataCurrentItem;
+
+    std::uint32_t user_id_{};
+    std::uint64_t user_created_at_{};
+    std::string name_;
+    std::optional<std::uint64_t> expiry_;
+};
+
+/**
+ * @brief A removed personal access token.
+ */
+class MetadataTokenDeleted final {
+  public:
+    /** @brief Returns the owner's numeric user ID. */
+    [[nodiscard]] std::uint32_t UserId() const noexcept { return user_id_; }
+
+    /** @brief Returns the owner's creation timestamp in microseconds. */
+    [[nodiscard]] std::uint64_t UserCreatedAt() const noexcept { return user_created_at_; }
+
+    /** @brief Returns the token name. */
+    [[nodiscard]] const std::string &Name() const noexcept { return name_; }
+
+    /** @brief Returns why the token was removed. */
+    [[nodiscard]] MetadataTokenDeletedReason Reason() const noexcept { return reason_; }
+
+  private:
+    MetadataTokenDeleted() = default;
+
+    static MetadataTokenDeleted FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+
+    std::uint32_t user_id_{};
+    std::uint64_t user_created_at_{};
+    std::string name_;
+    MetadataTokenDeletedReason reason_{MetadataTokenDeletedReason::Deleted};
+};
+
+/**
+ * @brief A registered session, and a current state sessions item.
+ */
+class MetadataSession final {
+  public:
+    /** @brief Returns the session user's numeric ID. */
+    [[nodiscard]] std::uint32_t UserId() const noexcept { return user_id_; }
+
+    /** @brief Returns the session user's creation timestamp in microseconds. */
+    [[nodiscard]] std::uint64_t UserCreatedAt() const noexcept { return user_created_at_; }
+
+    /** @brief Returns the session's client ID. */
+    [[nodiscard]] absl::uint128 ClientId() const noexcept { return client_id_; }
+
+    /** @brief Returns the session epoch. */
+    [[nodiscard]] std::uint64_t Session() const noexcept { return session_; }
+
+  private:
+    MetadataSession() = default;
+
+    static MetadataSession FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+    friend class MetadataCurrentItem;
+
+    std::uint32_t user_id_{};
+    std::uint64_t user_created_at_{};
+    absl::uint128 client_id_{};
+    std::uint64_t session_{};
+};
+
+/**
+ * @brief A closed session.
+ */
+class MetadataSessionClosed final {
+  public:
+    /** @brief Returns the session user's numeric ID. */
+    [[nodiscard]] std::uint32_t UserId() const noexcept { return user_id_; }
+
+    /** @brief Returns the session user's creation timestamp in microseconds. */
+    [[nodiscard]] std::uint64_t UserCreatedAt() const noexcept { return user_created_at_; }
+
+    /** @brief Returns the session's client ID. */
+    [[nodiscard]] absl::uint128 ClientId() const noexcept { return client_id_; }
+
+    /** @brief Returns the session epoch. */
+    [[nodiscard]] std::uint64_t Session() const noexcept { return session_; }
+
+    /** @brief Returns why the session was closed. */
+    [[nodiscard]] MetadataSessionClosedReason Reason() const noexcept { return reason_; }
+
+  private:
+    MetadataSessionClosed() = default;
+
+    static MetadataSessionClosed FromFfi(ffi::MetadataChangeBody &body);
+
+    friend class MetadataChangeRecord;
+
+    std::uint32_t user_id_{};
+    std::uint64_t user_created_at_{};
+    absl::uint128 client_id_{};
+    std::uint64_t session_{};
+    MetadataSessionClosedReason reason_{MetadataSessionClosedReason::Logout};
+};
+
+/**
+ * @brief A binary record of a group or kind this build does not know, kept
+ *        with its codes and raw body.
+ */
+class MetadataUnknownChange final {
+  public:
+    /** @brief Returns the group's wire code. */
+    [[nodiscard]] std::uint8_t GroupCode() const noexcept { return group_code_; }
+
+    /** @brief Returns the kind's wire code. */
+    [[nodiscard]] std::uint8_t KindCode() const noexcept { return kind_code_; }
+
+    /** @brief Returns the raw record body. */
+    [[nodiscard]] const std::vector<std::uint8_t> &Body() const noexcept { return body_; }
+
+  private:
+    MetadataUnknownChange() = default;
+
+    friend class MetadataChangeRecord;
+
+    std::uint8_t group_code_{};
+    std::uint8_t kind_code_{};
+    std::vector<std::uint8_t> body_;
+};
+
+/**
+ * @brief A JSON record of a group or kind this build does not know, kept whole.
+ */
+class MetadataUnknownJsonChange final {
+  public:
+    /** @brief Returns the group name the server sent. */
+    [[nodiscard]] const std::string &Group() const noexcept { return group_; }
+
+    /** @brief Returns the kind name the server sent. */
+    [[nodiscard]] const std::string &Kind() const noexcept { return kind_; }
+
+    /** @brief Returns the whole record object as JSON text. */
+    [[nodiscard]] const std::string &Json() const noexcept { return json_; }
+
+  private:
+    MetadataUnknownJsonChange() = default;
+
+    friend class MetadataChangeRecord;
+
+    std::string group_;
+    std::string kind_;
+    std::string json_;
+};
+
+/**
+ * @brief A binary current state item of a group this build does not know.
+ */
+class MetadataUnknownItem final {
+  public:
+    /** @brief Returns the group's wire code. */
+    [[nodiscard]] std::uint8_t GroupCode() const noexcept { return group_code_; }
+
+    /** @brief Returns the raw item body. */
+    [[nodiscard]] const std::vector<std::uint8_t> &Body() const noexcept { return body_; }
+
+  private:
+    MetadataUnknownItem() = default;
+
+    friend class MetadataCurrentItem;
+
+    std::uint8_t group_code_{};
+    std::vector<std::uint8_t> body_;
+};
+
+/**
+ * @brief A JSON current state item of a group this build does not know, kept whole.
+ */
+class MetadataUnknownJsonItem final {
+  public:
+    /** @brief Returns the group name the server sent. */
+    [[nodiscard]] const std::string &Group() const noexcept { return group_; }
+
+    /** @brief Returns the whole item object as JSON text. */
+    [[nodiscard]] const std::string &Json() const noexcept { return json_; }
+
+  private:
+    MetadataUnknownJsonItem() = default;
+
+    friend class MetadataCurrentItem;
+
+    std::string group_;
+    std::string json_;
+};
+
+/**
+ * @brief One metadata change record: the committed operation that produced
+ *        it, its position within that operation, and what is true after it.
+ *
+ * Change() holds the typed body. Kind() tells apart kinds that share a body
+ * type, such as stream_created and stream_updated.
+ */
+class MetadataChangeRecord final {
+  public:
+    /** @brief The typed body of a record. */
+    using Body = std::variant<MetadataStreamChange,
+                              MetadataStreamDeleted,
+                              MetadataTopicChange,
+                              MetadataTopicDeleted,
+                              MetadataPartitionsChanged,
+                              MetadataConsumerGroupCreated,
+                              MetadataConsumerGroupDeleted,
+                              MetadataMemberJoined,
+                              MetadataMemberLeft,
+                              MetadataPartitionHandedOver,
+                              MetadataUserChange,
+                              MetadataUserIdentity,
+                              MetadataUserPermissionsUpdated,
+                              MetadataTokenChange,
+                              MetadataTokenDeleted,
+                              MetadataSession,
+                              MetadataSessionClosed,
+                              MetadataUnknownChange,
+                              MetadataUnknownJsonChange>;
+
+    /**
+     * @brief Decodes one record envelope as a binary response carries it.
+     * @param bytes Record envelope and body.
+     * @return Decoded record. A group or kind this build does not know is
+     *         kept as MetadataUnknownChange.
+     * @throws IggyException with Kind() invalid_format when @p bytes are malformed.
+     */
+    static MetadataChangeRecord FromBytes(const std::vector<std::uint8_t> &bytes);
+
+    /** @brief Returns the metadata operation that produced the record. */
+    [[nodiscard]] std::uint64_t Op() const noexcept { return op_; }
+
+    /** @brief Returns the record's position within Op(). */
+    [[nodiscard]] std::uint32_t Ordinal() const noexcept { return ordinal_; }
+
+    /** @brief Returns the prepare checksum of Op(). */
+    [[nodiscard]] absl::uint128 Checksum() const noexcept { return checksum_; }
+
+    /** @brief Returns the prepare timestamp of Op() in microseconds. */
+    [[nodiscard]] std::uint64_t Timestamp() const noexcept { return timestamp_; }
+
+    /** @brief Returns the acting user, absent for server actions. */
+    [[nodiscard]] std::optional<std::uint32_t> ActorUserId() const noexcept { return actor_user_id_; }
+
+    /** @brief Returns the kind, absent for a record this build does not know. */
+    [[nodiscard]] std::optional<MetadataChangeKind> Kind() const noexcept { return kind_; }
+
+    /** @brief Returns the group, absent for a record this build does not know. */
+    [[nodiscard]] std::optional<MetadataChangeGroup> Group() const noexcept { return group_; }
+
+    /** @brief Returns the typed body. */
+    [[nodiscard]] const Body &Change() const noexcept { return change_; }
+
+  private:
+    MetadataChangeRecord(std::uint64_t op,
+                         std::uint32_t ordinal,
+                         absl::uint128 checksum,
+                         std::uint64_t timestamp,
+                         std::optional<std::uint32_t> actor_user_id,
+                         std::optional<MetadataChangeKind> kind,
+                         std::optional<MetadataChangeGroup> group,
+                         Body change)
+        : op_(op),
+          ordinal_(ordinal),
+          checksum_(checksum),
+          timestamp_(timestamp),
+          actor_user_id_(actor_user_id),
+          kind_(kind),
+          group_(group),
+          change_(std::move(change)) {}
+
+    static MetadataChangeRecord FromFfi(ffi::MetadataChangeRecord record);
+    static Body BodyFromFfi(MetadataChangeKind kind, ffi::MetadataChangeBody &body);
+
+    friend class MetadataChanges;
+
+    std::uint64_t op_;
+    std::uint32_t ordinal_;
+    absl::uint128 checksum_;
+    std::uint64_t timestamp_;
+    std::optional<std::uint32_t> actor_user_id_;
+    std::optional<MetadataChangeKind> kind_;
+    std::optional<MetadataChangeGroup> group_;
+    Body change_;
+};
+
+/**
+ * @brief One current state item: a resource or session as it is now.
+ */
+class MetadataCurrentItem final {
+  public:
+    /** @brief The typed body of an item. Each group has its own type. */
+    using Body = std::variant<MetadataStreamChange,
+                              MetadataTopicItem,
+                              MetadataPartitionsItem,
+                              MetadataConsumerGroupItem,
+                              MetadataMemberItem,
+                              MetadataUserChange,
+                              MetadataTokenChange,
+                              MetadataSession,
+                              MetadataUnknownItem,
+                              MetadataUnknownJsonItem>;
+
+    /**
+     * @brief Decodes one item as a binary response carries it.
+     * @param bytes Item envelope and body.
+     * @return Decoded item. A group this build does not know is kept as
+     *         MetadataUnknownItem.
+     * @throws IggyException with Kind() invalid_format when @p bytes are malformed.
+     */
+    static MetadataCurrentItem FromBytes(const std::vector<std::uint8_t> &bytes);
+
+    /** @brief Returns the group, absent for an item this build does not know. */
+    [[nodiscard]] std::optional<MetadataChangeGroup> Group() const noexcept { return group_; }
+
+    /** @brief Returns the typed body. */
+    [[nodiscard]] const Body &Value() const noexcept { return value_; }
+
+  private:
+    MetadataCurrentItem(std::optional<MetadataChangeGroup> group, Body value)
+        : group_(group), value_(std::move(value)) {}
+
+    static MetadataCurrentItem FromFfi(ffi::MetadataCurrentItem item);
+    static Body BodyFromFfi(MetadataChangeGroup group, ffi::MetadataChangeBody &body);
+
+    friend class MetadataChanges;
+
+    std::optional<MetadataChangeGroup> group_;
+    Body value_;
+};
+
+/**
+ * @brief One page of the metadata change log, or of the current state.
+ *
+ * IggyBlockingClient::GetMetadataChanges() returns this value. On
+ * MetadataChangeStatus::Ok keep Next() and pass it to the following read. On
+ * Behind retry later, on Expired or Reset rebuild from the current state.
+ */
+class MetadataChanges final {
+  public:
+    /**
+     * @brief Decodes a response payload as the binary transports carry it.
+     * @param payload Response payload without framing.
+     * @return Decoded page.
+     * @throws IggyException with Kind() invalid_format when @p payload is malformed.
+     */
+    static MetadataChanges FromBytes(const std::vector<std::uint8_t> &payload);
+
+    /** @brief Returns the outcome of the query. */
+    [[nodiscard]] MetadataChangeStatus Status() const noexcept { return status_; }
+
+    /** @brief Returns whether the page carries records or current state items. */
+    [[nodiscard]] MetadataChangePhase Phase() const noexcept { return phase_; }
+
+    /** @brief Returns the node's log ID, absent before it applied op 1. */
+    [[nodiscard]] std::optional<absl::uint128> LogId() const noexcept { return log_id_; }
+
+    /** @brief Returns the lowest whole operation from which the requested groups are complete. */
+    [[nodiscard]] std::uint64_t OldestOp() const noexcept { return oldest_op_; }
+
+    /**
+     * @brief Returns the timestamp above which the requested groups are complete.
+     * @return Microseconds, zero when nothing was evicted.
+     */
+    [[nodiscard]] std::uint64_t RetainedSince() const noexcept { return retained_since_; }
+
+    /** @brief Returns the highest metadata operation the node applied. */
+    [[nodiscard]] std::uint64_t HeadOp() const noexcept { return head_op_; }
+
+    /**
+     * @brief Returns the cursor to send back.
+     * @return Present on MetadataChangeStatus::Ok, echoed on Behind, absent on
+     *         Expired and Reset. The last current state page carries the
+     *         anchor to follow the change log from.
+     */
+    [[nodiscard]] const std::optional<MetadataChangeCursor> &Next() const noexcept { return next_; }
+
+    /** @brief Returns whether more records remain after Next(), or another state page exists. */
+    [[nodiscard]] bool HasMore() const noexcept { return has_more_; }
+
+    /** @brief Returns the change records of a changes page. */
+    [[nodiscard]] const std::vector<MetadataChangeRecord> &Records() const noexcept { return records_; }
+
+    /** @brief Returns the items of a current state page. */
+    [[nodiscard]] const std::vector<MetadataCurrentItem> &Items() const noexcept { return items_; }
+
+    /** @brief Returns the continuation of a current state scan, absent once it is complete. */
+    [[nodiscard]] const std::optional<MetadataCurrentPageToken> &CurrentPageToken() const noexcept {
+        return current_page_token_;
+    }
+
+  private:
+    MetadataChanges() = default;
+
+    static MetadataChanges FromFfi(ffi::MetadataChanges changes);
+
+    friend class IggyBlockingClient;
+
+    MetadataChangeStatus status_{MetadataChangeStatus::Ok};
+    MetadataChangePhase phase_{MetadataChangePhase::Changes};
+    std::optional<absl::uint128> log_id_;
+    std::uint64_t oldest_op_{};
+    std::uint64_t retained_since_{};
+    std::uint64_t head_op_{};
+    std::optional<MetadataChangeCursor> next_;
+    bool has_more_{};
+    std::vector<MetadataChangeRecord> records_;
+    std::vector<MetadataCurrentItem> items_;
+    std::optional<MetadataCurrentPageToken> current_page_token_;
+};
+
+/**
  * @brief Starting position for polling messages.
  *
  * @note The strategy kind and value are passed across the Rust FFI as a pair.
@@ -4048,10 +5700,13 @@ class PollingStrategy final {
  * - CreateConsumerGroup(), DeleteConsumerGroup(), JoinConsumerGroup(), and
  *   LeaveConsumerGroup().
  * - StoreConsumerOffset(), StoreConsumerPosition(), and DeleteConsumerOffset().
+ * - GetMetadataChanges().
  *
  * Other methods report errors through the exception message only. C++ and
  * bridge-local argument validation failures also have no structured error
- * details, even for the methods listed above.
+ * details, even for the methods listed above. GetMetadataChanges() is the
+ * exception: it reports every invalid query as invalid_command, including one
+ * the bridge refuses.
  *
  * @code{.cpp}
  * auto client{iggy::IggyBlockingClient::Builder()
@@ -4900,6 +6555,25 @@ class IggyBlockingClient final {
     std::vector<OptionSpec> DescribeOptions(OptionsScope scope);
 
     /**
+     * @brief Reads one page of the metadata change log or of the current state.
+     *
+     * The node records one change per public result of a committed metadata
+     * operation, such as a stream created, a topic renamed, a user's
+     * permissions changed, or a session closed. A mirror keeps a cursor, reads
+     * the records after it, and stores the returned MetadataChanges::Next().
+     * Records carry option values as the read routes return them and never
+     * key material.
+     *
+     * @param query Start position, groups, time bounds, and page size.
+     * @return One page of records or current state items.
+     * @throws IggyException with Kind() invalid_command when @p query is
+     *         invalid, before anything is sent; with Kind() unauthorized when
+     *         the caller is neither root nor holds the global manage_servers
+     *         permission; or when the request fails.
+     */
+    MetadataChanges GetMetadataChanges(const MetadataChangesQuery &query);
+
+    /**
      * @brief Retrieves server process, storage, and resource statistics.
      *
      * The returned fields are an observed snapshot and can change immediately.
@@ -4951,22 +6625,6 @@ class IggyBlockingClient final {
 
   private:
     explicit IggyBlockingClient(ffi::Client *client);
-
-    template <typename Operation>
-    static decltype(auto) RethrowAsIggyException(Operation &&operation) {
-        ffi::ErrorInfo error_info{};
-        try {
-            if constexpr (std::is_invocable_v<Operation, ffi::ErrorInfo &>) {
-                return std::forward<Operation>(operation)(error_info);
-            } else {
-                return std::forward<Operation>(operation)();
-            }
-        } catch (const IggyException &) {
-            throw;
-        } catch (const std::exception &error) {
-            throw IggyException(error.what(), error_info);
-        }
-    }
 
     [[nodiscard]] ffi::Client *Handle() const;
     void Reset() noexcept;

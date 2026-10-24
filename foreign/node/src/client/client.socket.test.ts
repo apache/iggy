@@ -32,6 +32,7 @@ import { UPDATE_USER } from '../wire/user/update-user.command.js';
 import { UPDATE_TOPIC } from '../wire/topic/update-topic.command.js';
 import { UPDATE_STREAM } from '../wire/stream/update-stream.command.js';
 import { OptionsScope } from '../wire/system/describe-options.command.js';
+import { MetadataChangeStart, getMetadataChanges } from '../wire/system/get-metadata-changes.command.js';
 import { CHANGE_PASSWORD } from '../wire/user/change-password.command.js';
 import { POLL_MESSAGES, pollMessages } from '../wire/message/poll-messages.command.js';
 import { SEND_MESSAGES, sendMessages } from '../wire/message/send-messages.command.js';
@@ -1400,6 +1401,39 @@ describe('VSR client socket', () => {
       assert.deepEqual(response.data, Buffer.from('done'));
       const sent = server.frames.filter(
         (frame) => frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.GetStats
+      );
+      assert.equal(sent.length, 2);
+      assert.deepEqual(sent[0], sent[1]);
+    } finally {
+      client.destroy();
+      await server.close();
+    }
+  });
+
+  it('resends a metadata changes read after an uncommitted response', async () => {
+    // A behind answer before op 1: status 1, phase 0, no log id, zero ops, no cursor.
+    const behind = Buffer.concat([Buffer.from([1, 0, 0]), Buffer.alloc(24), Buffer.alloc(2 + 4 + 4 + 2)]);
+    let attempts = 0;
+    const server = await startVsrServer((frame, socket) => {
+      const operation = frame.readUInt8(REQUEST_OFFSET.operation);
+      if (operation !== Operation.NonReplicated ||
+          frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.GetMetadataChanges)
+        return singleNodeHandler(server.port)(frame, socket);
+      attempts += 1;
+      socket.write(
+        attempts === 1
+          ? replyFrame(frame, operation, Buffer.alloc(0), 57)
+          : replyFrame(frame, operation, behind)
+      );
+    });
+    const client = new CommandResponseStream(vsrConfig(server.port));
+    try {
+      const changes = await getMetadataChanges(async () => client)({ start: MetadataChangeStart.Latest });
+      assert.equal(attempts, 2);
+      assert.equal(changes.status, 'behind');
+      assert.equal(changes.next, null);
+      const sent = server.frames.filter(
+        (frame) => frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.GetMetadataChanges
       );
       assert.equal(sent.length, 2);
       assert.deepEqual(sent[0], sent[1]);

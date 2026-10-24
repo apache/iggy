@@ -145,6 +145,7 @@ pub use types::either::Either;
 pub use types::http::HttpMethod;
 pub use types::identifier::*;
 pub use types::message::*;
+pub use types::metadata_changes::*;
 pub use types::options::*;
 pub use types::partition::*;
 pub use types::permissions::permissions_global::*;

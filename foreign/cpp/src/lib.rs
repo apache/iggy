@@ -23,8 +23,11 @@ mod producer;
 mod type_conversion;
 
 use client::{
-    Client, delete_connection as delete_client, encryption_key_fingerprint,
+    Client, decode_metadata_change_record, decode_metadata_changes, decode_metadata_current_item,
+    delete_connection as delete_client, encode_metadata_changes_query, encryption_key_fingerprint,
     encryption_key_fingerprint_base64, from_connection_string, new_connection,
+    parse_metadata_change_cursor, parse_metadata_current_page_token,
+    validate_metadata_changes_query,
 };
 use consumer::Consumer;
 use messages::make_message;
@@ -577,6 +580,150 @@ mod ffi {
         raw_options: Vec<HeaderEntry>,
     }
 
+    /// Where a metadata change query starts. The values are the wire codes.
+    #[repr(u8)]
+    enum MetadataChangeStart {
+        Earliest = 0,
+        Latest = 1,
+        After = 2,
+        Current = 3,
+    }
+
+    /// Position of the last change record a caller consumed, with its `mc1_`
+    /// text form.
+    #[derive(Default)]
+    struct MetadataChangeCursor {
+        log_id_lo: u64,
+        log_id_hi: u64,
+        op: u64,
+        checksum_lo: u64,
+        checksum_hi: u64,
+        ordinal: u32,
+        text: String,
+    }
+
+    /// Continuation of a current state scan, with its `cs1_` text form.
+    #[derive(Default)]
+    struct MetadataCurrentPageToken {
+        text: String,
+        anchor: MetadataChangeCursor,
+        required_head: u64,
+        groups_mask: u8,
+        last_group: u8,
+        last_key: Vec<u8>,
+    }
+
+    /// A metadata change query. Cursor and page token travel as their text
+    /// forms, an empty page token starts a current state scan.
+    struct MetadataChangesQuery {
+        start: MetadataChangeStart,
+        cursor: String,
+        page_token: String,
+        groups: Vec<u8>,
+        has_since: bool,
+        since: u64,
+        has_until: bool,
+        until: u64,
+        limit: u32,
+    }
+
+    /// Whether this build knows a record's or item's group and kind.
+    #[repr(u8)]
+    enum MetadataChangeForm {
+        Known = 0,
+        /// A binary body this build does not know, kept in `unknown_body`.
+        Unknown = 1,
+        /// A JSON object this build does not know, kept whole in `unknown_body`.
+        UnknownJson = 2,
+    }
+
+    /// Every field a record or item body can carry. A body fills the fields
+    /// its kind carries and leaves the rest at zero.
+    struct MetadataChangeBody {
+        stream_id: u32,
+        stream_created_op: u64,
+        topic_id: u32,
+        topic_created_op: u64,
+        group_id: u32,
+        has_member_id: bool,
+        member_id: u32,
+        partition_id: u32,
+        created_at: u64,
+        /// The stream, topic, consumer group or token name, or the username.
+        name: String,
+        partitions_count: u32,
+        consumer_groups_count: u32,
+        members_count: u32,
+        client_id_lo: u64,
+        client_id_hi: u64,
+        /// Removed ids of a partition count change, installed ids of a member.
+        partition_ids: Vec<u32>,
+        has_requested_op: bool,
+        requested_op: u64,
+        /// Wire code of a removal or permission change reason.
+        reason: u8,
+        user_id: u32,
+        user_created_at: u64,
+        status: UserStatus,
+        has_permissions: bool,
+        permissions: Permissions,
+        /// False when the server holds option state this build cannot read.
+        options_readable: bool,
+        options: Vec<HeaderEntry>,
+        derived_options: Vec<HeaderEntry>,
+        has_expiry: bool,
+        expiry: u64,
+        session: u64,
+        unknown_body: Vec<u8>,
+    }
+
+    /// One change record. `group` and `kind` are wire codes, the names of a
+    /// JSON record this build does not know are in `group_name` and
+    /// `kind_name`.
+    struct MetadataChangeRecord {
+        op: u64,
+        ordinal: u32,
+        checksum_lo: u64,
+        checksum_hi: u64,
+        timestamp: u64,
+        has_actor_user_id: bool,
+        actor_user_id: u32,
+        form: MetadataChangeForm,
+        group: u8,
+        kind: u8,
+        group_name: String,
+        kind_name: String,
+        body: MetadataChangeBody,
+    }
+
+    /// One current state item. See [`MetadataChangeRecord`] for the codes.
+    struct MetadataCurrentItem {
+        form: MetadataChangeForm,
+        group: u8,
+        group_name: String,
+        body: MetadataChangeBody,
+    }
+
+    /// One page of the change log or of the current state. `status` and
+    /// `phase` are wire codes.
+    struct MetadataChanges {
+        status: u8,
+        phase: u8,
+        has_log_id: bool,
+        log_id_lo: u64,
+        log_id_hi: u64,
+        oldest_op: u64,
+        retained_since: u64,
+        head_op: u64,
+        has_next: bool,
+        next: MetadataChangeCursor,
+        has_more: bool,
+        records: Vec<MetadataChangeRecord>,
+        items: Vec<MetadataCurrentItem>,
+        has_current_page_token: bool,
+        current_page_token: MetadataCurrentPageToken,
+    }
+
     extern "Rust" {
         type Client;
         type Consumer;
@@ -800,6 +947,14 @@ mod ffi {
         /// "user". A scope with no keys yet answers with an empty vector, which
         /// is an empty catalog rather than a failure.
         fn describe_options(self: &Client, scope: String) -> Result<Vec<OptionSpec>>;
+        /// Reads one page of the metadata change log or of the current state.
+        /// Needs root or the global manage_servers permission. An invalid
+        /// query fails with InvalidCommand (3) before anything is sent.
+        fn get_metadata_changes(
+            self: &Client,
+            query: MetadataChangesQuery,
+            error_info: &mut ErrorInfo,
+        ) -> Result<MetadataChanges>;
         /// Fingerprint of a 32-byte stream key, computed locally.
         fn encryption_key_fingerprint(key: &[u8], error_info: &mut ErrorInfo) -> Result<String>;
         /// Fingerprint of a stream key given as canonical padded base64.
@@ -807,6 +962,36 @@ mod ffi {
             key: &str,
             error_info: &mut ErrorInfo,
         ) -> Result<String>;
+        fn parse_metadata_change_cursor(
+            text: &[u8],
+            error_info: &mut ErrorInfo,
+        ) -> Result<MetadataChangeCursor>;
+        fn parse_metadata_current_page_token(
+            text: &[u8],
+            error_info: &mut ErrorInfo,
+        ) -> Result<MetadataCurrentPageToken>;
+        fn validate_metadata_changes_query(
+            query: MetadataChangesQuery,
+            error_info: &mut ErrorInfo,
+        ) -> Result<()>;
+        /// The binary request payload of a query, without validating it.
+        fn encode_metadata_changes_query(
+            query: MetadataChangesQuery,
+            error_info: &mut ErrorInfo,
+        ) -> Result<Vec<u8>>;
+        /// Decodes a response payload as the binary transports carry it.
+        fn decode_metadata_changes(
+            payload: &[u8],
+            error_info: &mut ErrorInfo,
+        ) -> Result<MetadataChanges>;
+        fn decode_metadata_change_record(
+            bytes: &[u8],
+            error_info: &mut ErrorInfo,
+        ) -> Result<MetadataChangeRecord>;
+        fn decode_metadata_current_item(
+            bytes: &[u8],
+            error_info: &mut ErrorInfo,
+        ) -> Result<MetadataCurrentItem>;
         fn ping(self: &Client) -> Result<()>;
         fn heartbeat_interval(self: &Client) -> u64;
         fn snapshot(

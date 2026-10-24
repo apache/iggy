@@ -42,6 +42,9 @@ use crate::consumer::{
 };
 use crate::duration::{py_delta_to_iggy_duration, reject_zero};
 use crate::identifier::PyIdentifier;
+use crate::metadata_changes::{
+    MetadataChangeGroup, MetadataChangeStart, MetadataChanges, validated_query,
+};
 use crate::options::OptionSpec as PyOptionSpec;
 use crate::partitioning::PyPartitioning;
 use crate::permissions::Permissions as PyPermissions;
@@ -342,6 +345,54 @@ impl IggyClient {
                 .into_iter()
                 .map(PyOptionSpec::from)
                 .collect::<Vec<_>>())
+        })
+    }
+
+    /// Reads one page of the metadata change log, or of the current state.
+    ///
+    /// Requires root or the global `manage_servers` permission. Keep the
+    /// page's `next` cursor and send it back in `MetadataChangeStart.After`.
+    ///
+    /// Args:
+    ///     start: Where to start, as `MetadataChangeStart`.
+    ///     groups: The groups to read as `list[MetadataChangeGroup] | None`.
+    ///         `None` or an empty list reads every group. A current state scan
+    ///         needs the parent groups of each group, for example `Topics`
+    ///         with `Streams`.
+    ///     since: Keep records prepared at or after this Unix time in
+    ///         microseconds. Only with `Earliest` and `After`.
+    ///     until: Keep records prepared at or before this Unix time in
+    ///         microseconds. Only with `Earliest` and `After`.
+    ///     limit: Records or items per page, 1 to 1000. Defaults to 100.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `MetadataChanges`.
+    ///
+    /// Raises:
+    ///     IggyError: With the invalid command code before anything is sent
+    ///         when the query is refused, or when the request fails. A user
+    ///         without the permission gets the unauthorized code.
+    #[pyo3(signature = (start, *, groups=None, since=None, until=None, limit=None))]
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[MetadataChanges]", imports=("collections.abc")))]
+    fn get_metadata_changes<'a>(
+        &self,
+        py: Python<'a>,
+        start: &MetadataChangeStart,
+        #[gen_stub(override_type(type_repr = "builtins.list[MetadataChangeGroup] | None"))]
+        groups: Option<Vec<MetadataChangeGroup>>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] since: Option<u64>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] until: Option<u64>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] limit: Option<u32>,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let query = validated_query(start, groups, since, until, limit)?;
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            let changes = inner
+                .get_metadata_changes(&query)
+                .await
+                .map_err(to_runtime_error)?;
+            MetadataChanges::try_from(changes)
         })
     }
 

@@ -7089,7 +7089,7 @@ checksum = "cd62e6b5e86ea8eeeb8db1de02880a6abc01a397b2ebb64b5d74ac255318f5cb"
 
 [[package]]
 name = "iggy"
-version = "0.11.1-edge.2"
+version = "0.11.1-edge.3"
 dependencies = [
  "async-broadcast",
  "async-dropper",
@@ -7127,7 +7127,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-bench"
-version = "0.6.1-edge.2"
+version = "0.6.1-edge.3"
 dependencies = [
  "async-trait",
  "bench-report",
@@ -7185,7 +7185,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-cli"
-version = "0.14.1-edge.2"
+version = "0.14.1-edge.3"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",
@@ -7219,7 +7219,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-connectors"
-version = "0.5.1-edge.2"
+version = "0.5.1-edge.3"
 dependencies = [
  "apache-avro 0.22.0",
  "async-trait",
@@ -7319,7 +7319,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-mcp"
-version = "0.5.1-edge.2"
+version = "0.5.1-edge.3"
 dependencies = [
  "axum",
  "axum-server",
@@ -7354,7 +7354,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_binary_protocol"
-version = "0.11.1-edge.2"
+version = "0.11.1-edge.3"
 dependencies = [
  "aligned-vec",
  "bytemuck",
@@ -7369,7 +7369,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_common"
-version = "0.11.1-edge.2"
+version = "0.11.1-edge.3"
 dependencies = [
  "aes-gcm 0.11.1",
  "aes-gcm-siv",
@@ -12982,7 +12982,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.9.1-edge.2"
+version = "0.9.1-edge.3"
 dependencies = [
  "ahash",
  "arc-swap",

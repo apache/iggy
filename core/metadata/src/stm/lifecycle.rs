@@ -363,7 +363,7 @@ impl StreamsInner {
         topic_id: Option<usize>,
         action: LifecycleAction,
     ) -> Option<ApplyReply> {
-        if self.finalizing_lifecycle {
+        if self.finalizing_lifecycle.is_some() {
             return None;
         }
         if self.lifecycle_blocks(stream_id, topic_id) {
@@ -492,7 +492,7 @@ impl StateHandler for CompleteLifecycleRequest {
         let topic_id = WireIdentifier::numeric(intent.topic_id.unwrap_or_default());
         // The deferred request applies at this op, not at the intent op: an
         // owner its rebalance decides must outrank every owner decided since.
-        state.finalizing_lifecycle = true;
+        state.finalizing_lifecycle = Some(intent.context);
         let reply = match intent.action {
             LifecycleAction::DeleteStream => {
                 DeleteStreamRequest { stream_id }.apply(state, timestamp)
@@ -515,7 +515,7 @@ impl StateHandler for CompleteLifecycleRequest {
             }
             .apply(state, timestamp),
         };
-        state.finalizing_lifecycle = false;
+        state.finalizing_lifecycle = None;
         if reply.code != 0 {
             // Keep the final report pending so reconciliation can retry finalization.
             for &(index, _) in &recorded {
@@ -984,6 +984,7 @@ mod tests {
             NEW_SESSION,
             REGISTER_OP,
             IggyTimestamp::default(),
+            None,
         );
         let decided = streams.consumer_group_pending_revocations();
         assert_eq!(decided.len(), 2);
@@ -1348,7 +1349,7 @@ mod tests {
         );
         assert!(streams.lifecycle_pending(INTENT_OP));
 
-        streams.remove_consumer_group_member(18, IggyTimestamp::default(), LOGOUT_OP);
+        streams.remove_consumer_group_member(18, IggyTimestamp::default(), LOGOUT_OP, None);
         let moved = streams.consumer_group_pending_revocations();
         assert_eq!(moved.len(), 1);
         assert_eq!(moved[0].partition_id, 1);

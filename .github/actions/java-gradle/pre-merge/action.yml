@@ -37,7 +37,8 @@ runs:
       working-directory: foreign/java
       run: |
         echo "::group::Linting foreign/java"
-        ./gradlew check -x test
+        TIMEFORMAT='Java SDK lint: %3R seconds'
+        time ./gradlew check -x test
         echo "::endgroup::"
 
     - name: Lint examples
@@ -46,7 +47,8 @@ runs:
       working-directory: examples/java
       run: |
         echo "::group::Linting examples/java"
-        ./gradlew check -x test
+        TIMEFORMAT='Java examples lint: %3R seconds'
+        time ./gradlew check -x test
         echo "::endgroup::"
 
     - name: Lint BDD
@@ -55,7 +57,8 @@ runs:
       working-directory: bdd/java
       run: |
         echo "::group::Linting bdd/java"
-        ./gradlew check -x test
+        TIMEFORMAT='Java BDD lint: %3R seconds'
+        time ./gradlew check -x test
         echo "::endgroup::"
 
     - name: Build
@@ -63,18 +66,11 @@ runs:
       if: inputs.task == 'build'
       working-directory: foreign/java
       run: |
-        ./gradlew build -x test -x checkstyleMain -x checkstyleTest -x spotlessCheck
-        BUILD_EXIT_CODE=$?
-
-        # List artifacts only if build succeeded
-        if [ $BUILD_EXIT_CODE -eq 0 ]; then
-          echo ""
-          echo "Build artifacts:"
-          find . -path "*/build/libs/*.jar" -type f 2>/dev/null | head -20 || echo "No jar artifacts found in build/libs directories"
-        fi
-
-        # Exit with build exit code
-        exit $BUILD_EXIT_CODE
+        TIMEFORMAT='Java build: %3R seconds'
+        time ./gradlew build -x test -x checkstyleMain -x checkstyleTest -x spotlessCheck
+        echo ""
+        echo "Build artifacts:"
+        find . -path "*/build/libs/*.jar" -type f 2>/dev/null | head -20 || echo "No jar artifacts found in build/libs directories"
 
     - name: Download runtime binaries
       if: inputs.task == 'test'
@@ -98,7 +94,11 @@ runs:
       working-directory: foreign/java
       env:
         USE_EXTERNAL_SERVER: true
-      run: ./gradlew test
+      run: |
+        TIMEFORMAT='Java test compilation: %3R seconds'
+        time ./gradlew testClasses
+        TIMEFORMAT='Java tests: %3R seconds'
+        time ./gradlew test
 
     - name: Check for ByteBuf leaks
       if: ${{ !cancelled() && inputs.task == 'test' }}
@@ -116,7 +116,9 @@ runs:
       working-directory: foreign/java
       env:
         USE_EXTERNAL_SERVER: true
-      run: ./gradlew jacocoAggregatedReport
+      run: |
+        TIMEFORMAT='Java coverage report: %3R seconds'
+        time ./gradlew jacocoAggregatedReport
 
     - name: Copy coverage reports
       if: ${{ !cancelled() && inputs.task == 'test' }}
@@ -182,7 +184,9 @@ runs:
       env:
         USE_EXTERNAL_SERVER: true
         IGGY_TCP_TLS_ENABLED: "true"
-      run: ./gradlew :iggy:test --tests "*TlsConnectionTest*"
+      run: |
+        TIMEFORMAT='Java TLS tests: %3R seconds'
+        time ./gradlew :iggy:test --tests "*TlsConnectionTest*"
 
     - name: Stop Iggy server (TLS)
       if: always() && inputs.task == 'test'

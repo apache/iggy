@@ -20,6 +20,7 @@
 package org.apache.iggy.bdd;
 
 import io.cucumber.java.After;
+import io.cucumber.java.Before;
 import io.cucumber.java.en.Given;
 import io.cucumber.java.en.Then;
 import io.cucumber.java.en.When;
@@ -63,13 +64,22 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public final class ResourceOptionsSteps {
 
+    // Cucumber builds glue classes without injection, so other steps read this scenario's stream through it.
+    private static ResourceOptionsSteps current;
+
     private IggyTcpClient client;
     private Long streamId;
+    private Long createdStreamId;
     private Long topicId;
     private Long userId;
     private String streamName;
     private byte[] streamKey;
     private boolean updateRejected;
+
+    @Before
+    public void begin() {
+        current = this;
+    }
 
     @After
     public void close() {
@@ -96,6 +106,7 @@ public final class ResourceOptionsSteps {
                 .createStream(
                         name, StreamOptions.builder().encryptionKey(streamKey).build());
         streamId = created.id();
+        createdStreamId = streamId;
         streamName = name;
     }
 
@@ -108,6 +119,7 @@ public final class ResourceOptionsSteps {
     public void createKeylessStream(String name) {
         var created = client().streams().createStream(name);
         streamId = created.id();
+        createdStreamId = streamId;
         streamName = name;
     }
 
@@ -193,6 +205,12 @@ public final class ResourceOptionsSteps {
         assertEquals(expected, new String(messages.get(0).payload(), StandardCharsets.UTF_8));
         assertEquals(
                 HeaderValue.fromString(value), messages.get(0).userHeaders().get(HeaderKey.fromString(key)));
+    }
+
+    @When("I delete the stream")
+    public void deleteStream() {
+        client().streams().deleteStream(requireStreamId());
+        streamId = null;
     }
 
     @When("I rename the stream to {string}")
@@ -353,6 +371,21 @@ public final class ResourceOptionsSteps {
                         .status()
                         .name()
                         .toLowerCase());
+    }
+
+    static ResourceOptionsSteps current() {
+        return current;
+    }
+
+    /** The stream this scenario created, still known after a step deleted it. */
+    Long createdStreamId() {
+        assertNotNull(createdStreamId);
+        return createdStreamId;
+    }
+
+    byte[] streamKey() {
+        assertNotNull(streamKey);
+        return streamKey;
     }
 
     private IggyTcpClient client() {

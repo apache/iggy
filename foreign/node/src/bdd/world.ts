@@ -17,7 +17,10 @@
 
 import type { Stream } from '../wire/stream/stream.utils.js';
 import type { Topic } from '../wire/topic/topic.utils.js';
-import type { CreateMessage, Message, OptionSpec } from 'src/wire/index.js';
+import type {
+  CreateMessage, Message, MetadataChangeCursor, MetadataChangeGroup, MetadataChangeRecord,
+  MetadataCurrentItem, OptionSpec
+} from 'src/wire/index.js';
 import type { Client } from '../client/index.js';
 
 export interface TestWorld {
@@ -33,5 +36,13 @@ export interface TestWorld {
   updateError?: unknown,
   optionSpecs?: OptionSpec[],
   userId?: number,
-  callError?: Error
+  callError?: Error,
+  /** Groups the metadata change steps read */
+  changeGroups?: MetadataChangeGroup[],
+  /** Cursor the metadata change steps follow from */
+  changeCursor?: MetadataChangeCursor,
+  /** Records of the last stream that the follow step returned */
+  followedChanges?: MetadataChangeRecord[],
+  /** Items of the last current state scan */
+  currentItems?: MetadataCurrentItem[]
 };

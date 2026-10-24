@@ -24,7 +24,14 @@ import os
 import socket
 import time
 
-from apache_iggy import IggyClient
+from apache_iggy import (
+    IggyClient,
+    MetadataChangeCursor,
+    MetadataChangeGroup,
+    MetadataChangeRecord,
+    MetadataChangeStart,
+    MetadataChangeStatus,
+)
 
 # Server-side limits: usernames are 3-50 bytes, passwords 3-100 bytes.
 MIN_USERNAME_BYTES = 3
@@ -36,6 +43,11 @@ DEFAULT_TCP_PORT = 8090
 DEFAULT_QUIC_PORT = 8080
 DEFAULT_HTTP_PORT = 3000
 DEFAULT_WEBSOCKET_PORT = 8092
+
+METADATA_CHANGES_PAGE_LIMIT = 1000
+# A two phase delete commits its record after the call returns.
+METADATA_FOLLOW_ATTEMPTS = 100
+METADATA_FOLLOW_INTERVAL_SECONDS = 0.1
 
 
 def get_transport_config(port_env_var: str, default_port: int) -> tuple[str, int]:
@@ -234,3 +246,58 @@ async def login_fresh_client(username: str, password: str) -> IggyClient:
     await wait_for_ping(client)
     await client.login_user(username, password)
     return client
+
+
+async def latest_metadata_cursor(
+    client: IggyClient, groups: list[MetadataChangeGroup]
+) -> MetadataChangeCursor:
+    """Return the cursor at the newest retained change of the groups."""
+    page = await client.get_metadata_changes(
+        MetadataChangeStart.Latest(), groups=groups
+    )
+    assert page.status == MetadataChangeStatus.Ok, page
+    assert page.next is not None
+    return page.next
+
+
+async def follow_stream_changes(
+    client: IggyClient,
+    cursor: MetadataChangeCursor,
+    groups: list[MetadataChangeGroup],
+    stream_id: int,
+    count: int,
+) -> list[MetadataChangeRecord]:
+    """
+    Follow the changes after `cursor` until `count` of them name the stream.
+
+    Returns every followed record, so callers can check the ones of other
+    streams too.
+    """
+    records: list[MetadataChangeRecord] = []
+    for _ in range(METADATA_FOLLOW_ATTEMPTS):
+        page = await client.get_metadata_changes(
+            MetadataChangeStart.After(cursor),
+            groups=groups,
+            limit=METADATA_CHANGES_PAGE_LIMIT,
+        )
+        assert page.status == MetadataChangeStatus.Ok, page
+        assert page.next is not None
+        cursor = page.next
+        records.extend(page.records)
+        if page.has_more:
+            continue
+        if len(stream_records(records, stream_id)) >= count:
+            break
+        await asyncio.sleep(METADATA_FOLLOW_INTERVAL_SECONDS)
+    return records
+
+
+def stream_records(
+    records: list[MetadataChangeRecord], stream_id: int
+) -> list[MetadataChangeRecord]:
+    """The records whose body names the stream."""
+    return [
+        record
+        for record in records
+        if getattr(record.change, "stream_id", None) == stream_id
+    ]
