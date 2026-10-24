@@ -802,18 +802,19 @@ pub(in crate::http) mod tests {
 
         for refused in [
             &[("from", "latest"), ("from", "latest")][..],
-            &[("cursor", "mc1_")],
-            &[("since", "5"), ("until", "4")],
+            &[("from", "earliest"), ("cursor", "mc1_")],
+            &[("from", "earliest"), ("since", "5"), ("until", "4")],
             &[("from", "latest"), ("since", "1")],
             &[("from", "current"), ("until", "1")],
             &[("from", "current"), ("groups", "topics")],
             &[("after", "mc1_not-a-cursor")],
             &[("current_after", "cs1_AAAA")],
-            &[("limit", "0")],
-            &[("limit", "1001")],
-            &[("limit", "01")],
-            &[("groups", "streams,,users")],
-            &[("groups", "nope")],
+            &[("from", "earliest"), ("limit", "0")],
+            &[("from", "earliest"), ("limit", "1001")],
+            &[("from", "earliest"), ("limit", "01")],
+            &[("from", "earliest"), ("limit", "+5")],
+            &[("from", "earliest"), ("groups", "streams,,users")],
+            &[("from", "earliest"), ("groups", "nope")],
         ] {
             let root =
                 authenticated_identity(&state, ROOT_USER_ID, ROOT_USER_CREATED_AT_MICROS).await;

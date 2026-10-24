@@ -102,6 +102,7 @@ use std::mem::size_of;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::thread;
 use tracing::{debug, error, info, warn};
 
 // The writer retains this gate after caller cancellation, until the rename is durable.
@@ -491,6 +492,29 @@ pub fn checkpoint_checksum(encoded: &[u8]) -> u128 {
     u128::from(calculate_checksum(encoded))
 }
 
+/// The encoded snapshot and the checksum over exactly those bytes.
+fn encode_with_checksum(snapshot: &IggySnapshot) -> Result<(Vec<u8>, u128), SnapshotError> {
+    let encoded = snapshot.encode()?;
+    let checksum = checkpoint_checksum(&encoded);
+    Ok((encoded, checksum))
+}
+
+/// [`encode_with_checksum`] on a dedicated thread. The runtime has no blocking
+/// pool, and a full change log alone keeps a core busy for milliseconds.
+async fn encode_on_own_thread(snapshot: IggySnapshot) -> Result<(Vec<u8>, u128), SnapshotError> {
+    let (sender, receiver) = oneshot::channel();
+    thread::Builder::new()
+        .name("iggy-checkpoint-encode".to_owned())
+        .spawn(move || {
+            // The receiver is gone only with its checkpoint, which then needs no result.
+            let _ = sender.send(encode_with_checksum(&snapshot));
+        })
+        .map_err(SnapshotError::Io)?;
+    receiver.await.map_err(|_| {
+        SnapshotError::InvalidState("checkpoint encode thread ended without a result")
+    })?
+}
+
 /// The highest resident WAL entry at or above the snapshot floor and below
 /// `bound`, or the snapshot floor with no checksum when no such entry remains.
 #[must_use]
@@ -651,8 +675,10 @@ impl<M> SnapshotCoordinator<M> {
     /// Create and durably persist a snapshot at `commit_op`, record the pairing, and
     /// return its checksum. Does NOT drain the WAL: the caller must durably record
     /// the pairing in the superblock first, so a crash between persist and drain
-    /// recovers a consistent checkpoint with the WAL intact. Snapshot creation and
-    /// encoding finish before the first await, preserving the captured frontier.
+    /// recovers a consistent checkpoint with the WAL intact. Snapshot creation
+    /// finishes before the first await, preserving the captured frontier. The owned
+    /// capture is then encoded on its own thread, so a large catalog or change log
+    /// does not stall this core.
     #[allow(clippy::future_not_send)]
     async fn persist_snapshot(
         &self,
@@ -669,10 +695,12 @@ impl<M> SnapshotCoordinator<M> {
         snapshot.snapshot.client_table = client_table;
         snapshot.snapshot.change_log = change_log;
         // Encode once: the checksum and the on-disk record share one buffer, so the
-        // snapshot is not serialized twice while the checkpoint lock freezes this
-        // core, and the pairing is provably over the bytes that reach the file.
-        let encoded = snapshot.encode()?;
-        let checksum = checkpoint_checksum(&encoded);
+        // pairing is provably over the bytes that reach the file.
+        let (encoded, checksum) = match self.io {
+            SnapshotIo::Compio => encode_on_own_thread(snapshot).await?,
+            #[cfg(feature = "simulator")]
+            SnapshotIo::Synchronous => encode_with_checksum(&snapshot)?,
+        };
         self.write_snapshot(encoded).await?;
         self.last_checkpoint.set((commit_op, checksum));
         Ok(checksum)

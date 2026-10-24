@@ -370,7 +370,7 @@ A request starts at `earliest`, at `latest` (a cursor and no records), after a c
 
 A time range only goes with `earliest` or a cursor. A `current` request must also name the parent groups of every selected group, for example `streams` with `topics`. A request that breaks either rule is refused with `InvalidCommand` (3).
 
-A page also ends before its encoded records or items pass 1 MiB, so it can hold fewer than the limit with `has_more` set. A single larger record or item still comes alone.
+A page also ends before its encoded records or items pass 1 MiB, so it can hold fewer than the limit with `has_more` set. A single larger record or item still comes alone. A current page also ends after it walks 65536 streams and topics, so it can carry a page token and no items.
 
 Each answer has a status. `ok` carries records and the `next` cursor. `behind` means this node has not applied the cursor's operation yet, so ask again or ask another node. `expired` means the node no longer holds every record after the cursor for those groups, and `reset` means the cursor belongs to another history, for example a rebuilt data directory. Neither carries a cursor: page `current` again and follow from the anchor its pages return.
 

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::change_log::query::{CursorCheck, LogView, MAX_PAGE_BYTES};
+use crate::change_log::query::{CursorCheck, LogView, MAX_PAGE_BYTES, MAX_SCANNED_ENTRIES};
 use crate::change_log::store::ChangeLog;
 use crate::change_log::{change_options, stream_body, user_body};
 use crate::stm::stream::StreamsInner;
@@ -32,8 +32,13 @@ use iggy_binary_protocol::primitives::metadata_changes::{
 };
 use iggy_binary_protocol::responses::system::{GetMetadataChangesResponse, WireMetadataItem};
 use iggy_common::{IggyError, MetadataChangeGroup, MetadataChangeGroups, OptionsScope};
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::ops::Bound;
 use std::sync::Arc;
+
+/// A resume key id past every id of its level, since wire ids are `u32`.
+const PAST_EVERY_ID: usize = u32::MAX as usize;
 
 /// The applied state a current page projects, all of one image.
 pub struct CurrentState<'a> {
@@ -57,6 +62,28 @@ pub fn current_page(
     token: Option<&WireMetadataCurrentPageToken>,
     limit: u32,
     state: &CurrentState<'_>,
+) -> Result<GetMetadataChangesResponse, IggyError> {
+    current_page_within(
+        log,
+        head_op,
+        groups,
+        token,
+        limit,
+        state,
+        MAX_SCANNED_ENTRIES,
+    )
+}
+
+/// [`current_page`] that walks at most `scan_budget` streams and topics, so a
+/// catalog with few items to emit still ends the page.
+fn current_page_within(
+    log: &ChangeLog,
+    head_op: u64,
+    groups: MetadataChangeGroups,
+    token: Option<&WireMetadataCurrentPageToken>,
+    limit: u32,
+    state: &CurrentState<'_>,
+    scan_budget: usize,
 ) -> Result<GetMetadataChangesResponse, IggyError> {
     let view = LogView::new(log, groups, head_op);
     let answer = |status, next| GetMetadataChangesResponse {
@@ -99,6 +126,8 @@ pub fn current_page(
         limit: limit as usize,
         items: Vec::new(),
         bytes: 0,
+        examined: 0,
+        scan_budget,
         last: None,
         more: false,
     };
@@ -138,6 +167,8 @@ struct Projection<'a> {
     limit: usize,
     items: Vec<WireMetadataItem>,
     bytes: usize,
+    examined: usize,
+    scan_budget: usize,
     last: Option<(WireMetadataChangeGroup, Bytes)>,
     more: bool,
 }
@@ -201,14 +232,17 @@ impl Projection<'_> {
                             return Ok(false);
                         }
                     }
+                    if !self.examine(group, &[stream_id, PAST_EVERY_ID]) {
+                        return Ok(false);
+                    }
                 }
             }
             MetadataChangeGroup::ConsumerGroups | MetadataChangeGroup::ConsumerGroupMembers => {
                 let (after_stream, after_topic, after_group) = (key(0)?, key(1)?, key(2)?);
-                let after_member = if group == MetadataChangeGroup::ConsumerGroupMembers {
-                    key(3)?
+                let (after_member, width) = if group == MetadataChangeGroup::ConsumerGroupMembers {
+                    (key(3)?, 4)
                 } else {
-                    None
+                    (None, 3)
                 };
                 for (stream_id, stream) in streams.items.iter_from(after_stream.unwrap_or(0)) {
                     let same_stream = after_stream == Some(stream_id);
@@ -284,6 +318,14 @@ impl Projection<'_> {
                                 }
                             }
                         }
+                        let past_topic = [stream_id, topic_id, PAST_EVERY_ID, PAST_EVERY_ID];
+                        if !self.examine(group, &past_topic[..width]) {
+                            return Ok(false);
+                        }
+                    }
+                    let past_stream = [stream_id, PAST_EVERY_ID, PAST_EVERY_ID, PAST_EVERY_ID];
+                    if !self.examine(group, &past_stream[..width]) {
+                        return Ok(false);
                     }
                 }
             }
@@ -342,13 +384,13 @@ impl Projection<'_> {
                 let after = after
                     .map(|key| read_u64_le(key, 0).map_err(|_| IggyError::InvalidCommand))
                     .transpose()?;
-                let mut sessions: Vec<(u64, u128, u32)> = table
+                // A heap pops only what the page takes, a full sort would order every session.
+                let mut sessions: BinaryHeap<Reverse<(u64, u128, u32)>> = table
                     .active_sessions()
                     .filter(|(_, _, epoch)| after.is_none_or(|after| *epoch > after))
-                    .map(|(client_id, user_id, epoch)| (epoch, client_id, user_id))
+                    .map(|(client_id, user_id, epoch)| Reverse((epoch, client_id, user_id)))
                     .collect();
-                sessions.sort_unstable();
-                for (epoch, client_id, user_id) in sessions {
+                while let Some(Reverse((epoch, client_id, user_id))) = sessions.pop() {
                     let Some(user) = users.items.get(user_id as usize) else {
                         continue;
                     };
@@ -369,18 +411,25 @@ impl Projection<'_> {
 
     /// Adds an item keyed by little-endian `u32` ids, `false` when the page
     /// was already full.
-    #[allow(clippy::cast_possible_truncation)]
     fn push(
         &mut self,
         group: MetadataChangeGroup,
         ids: &[usize],
         item: &WireMetadataCurrentItem,
     ) -> bool {
-        let mut key = BytesMut::with_capacity(ids.len() * 4);
-        for id in ids {
-            key.put_u32_le(*id as u32);
+        self.push_keyed(group, id_key(ids), item)
+    }
+
+    /// Counts a walked stream or topic, `false` once the page walked its budget. The
+    /// next page then continues after `resume`.
+    fn examine(&mut self, group: MetadataChangeGroup, resume: &[usize]) -> bool {
+        self.examined += 1;
+        if self.examined < self.scan_budget {
+            return true;
         }
-        self.push_keyed(group, key.freeze(), item)
+        self.more = true;
+        self.last = Some((WireMetadataChangeGroup::from(group), id_key(resume)));
+        false
     }
 
     fn push_keyed(
@@ -406,12 +455,112 @@ impl Projection<'_> {
     }
 }
 
+/// A key of little-endian `u32` ids.
+#[allow(clippy::cast_possible_truncation)]
+fn id_key(ids: &[usize]) -> Bytes {
+    let mut key = BytesMut::with_capacity(ids.len() * 4);
+    for id in ids {
+        key.put_u32_le(*id as u32);
+    }
+    key.freeze()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::change_log::{ChangeLogCapacities, MetadataChangeLog};
+    use crate::stm::StateHandler;
     use crate::stm::stream::StreamsInner;
     use crate::stm::user::UsersInner;
     use iggy_binary_protocol::primitives::metadata_changes::{WireStreamKey, WireTopicKey};
+    use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
+    use iggy_binary_protocol::requests::consumer_groups::CreateConsumerGroupRequest;
+    use iggy_binary_protocol::requests::streams::CreateStreamRequest;
+    use iggy_binary_protocol::requests::topics::{
+        CreateTopicRequest, CreateTopicWithAssignmentsRequest,
+    };
+    use iggy_binary_protocol::{PrepareHeader, WireIdentifier, WireOptions};
+    use iggy_common::IggyTimestamp;
+
+    #[test]
+    fn given_sparse_catalog_when_paging_with_small_scan_budget_should_return_every_item_once() {
+        let mut streams = StreamsInner::new();
+        let now = IggyTimestamp::now();
+        for name in ["empty", "orders", "audit"] {
+            let request = CreateStreamRequest {
+                name: WireName::new(name).expect("name"),
+                options: WireOptions::empty(),
+            };
+            assert_eq!(StateHandler::apply(&request, &mut streams, now).code, 0);
+        }
+        for (partition_group, name) in [(1, "events"), (2, "alerts")] {
+            let request = CreateTopicWithAssignmentsRequest {
+                request: CreateTopicRequest {
+                    stream_id: WireIdentifier::numeric(1),
+                    partitions_count: 1,
+                    name: WireName::new(name).expect("name"),
+                    options: WireOptions::empty(),
+                },
+                derived_options: WireOptions::empty(),
+                partitions: vec![CreatedPartitionAssignment {
+                    partition_id: 0,
+                    consensus_group_id: partition_group,
+                    initial_view: 0,
+                }],
+            };
+            assert_eq!(StateHandler::apply(&request, &mut streams, now).code, 0);
+        }
+        let group = CreateConsumerGroupRequest {
+            stream_id: WireIdentifier::numeric(1),
+            topic_id: WireIdentifier::numeric(1),
+            name: WireName::new("shipping").expect("name"),
+        };
+        assert_eq!(StateHandler::apply(&group, &mut streams, now).code, 0);
+        let users = UsersInner::new();
+        let state = CurrentState {
+            streams: &streams,
+            users: &users,
+            sessions: None,
+        };
+        let log = MetadataChangeLog::new(ChangeLogCapacities::default());
+        let first_op = PrepareHeader {
+            op: 1,
+            checksum: 7,
+            ..PrepareHeader::default()
+        };
+        log.append(&first_op, Vec::new()).expect("append");
+        let groups = MetadataChangeGroups::requested(&[
+            MetadataChangeGroup::Streams,
+            MetadataChangeGroup::Topics,
+            MetadataChangeGroup::Partitions,
+            MetadataChangeGroup::ConsumerGroups,
+            MetadataChangeGroup::ConsumerGroupMembers,
+        ]);
+        let page = |token: Option<&WireMetadataCurrentPageToken>, scan_budget| {
+            log.read(|log| current_page_within(log, 1, groups, token, 1000, &state, scan_budget))
+                .expect("readable")
+                .expect("page")
+        };
+
+        let whole = page(None, usize::MAX);
+        let mut items = Vec::new();
+        let mut token = None;
+        let mut pages = 0;
+        loop {
+            let answer = page(token.as_ref(), 2);
+            pages += 1;
+            items.extend(answer.items);
+            match answer.current_page_token {
+                Some(next) => token = Some(next),
+                None => break,
+            }
+        }
+
+        assert_eq!(whole.current_page_token, None);
+        assert_eq!(whole.items.len(), 8);
+        assert!(pages > 1, "a scan budget of 2 ends a page early");
+        assert_eq!(items, whole.items);
+    }
 
     #[test]
     fn given_items_past_the_byte_budget_when_projecting_should_stop_before_the_overflow() {
@@ -427,6 +576,8 @@ mod tests {
             limit: 1000,
             items: Vec::new(),
             bytes: 0,
+            examined: 0,
+            scan_budget: MAX_SCANNED_ENTRIES,
             last: None,
             more: false,
         };

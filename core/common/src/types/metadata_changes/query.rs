@@ -186,7 +186,7 @@ impl MetadataChangesQuery {
                 GROUPS_KEY => query.groups = parse_groups(value)?,
                 SINCE_KEY => query.since = Some(parse_micros(value)?),
                 UNTIL_KEY => query.until = Some(parse_micros(value)?),
-                LIMIT_KEY => query.limit = value.parse().map_err(|_| IggyError::InvalidCommand)?,
+                LIMIT_KEY => query.limit = parse_canonical(value)?,
                 _ => return Err(IggyError::InvalidCommand),
             }
         }
@@ -212,17 +212,18 @@ fn parse_groups(value: &str) -> Result<Vec<MetadataChangeGroup>, IggyError> {
 }
 
 fn parse_micros(value: &str) -> Result<IggyTimestamp, IggyError> {
+    IggyTimestamp::checked_from_micros(parse_canonical(value)?).ok_or(IggyError::InvalidCommand)
+}
+
+/// A decimal integer without a sign, padding or leading zeros.
+fn parse_canonical<T: FromStr>(value: &str) -> Result<T, IggyError> {
     let canonical = !value.is_empty()
         && value.bytes().all(|byte| byte.is_ascii_digit())
         && (value == "0" || !value.starts_with('0'));
     if !canonical {
         return Err(IggyError::InvalidCommand);
     }
-    value
-        .parse::<u64>()
-        .ok()
-        .and_then(IggyTimestamp::checked_from_micros)
-        .ok_or(IggyError::InvalidCommand)
+    value.parse().map_err(|_| IggyError::InvalidCommand)
 }
 
 #[cfg(test)]
@@ -404,6 +405,8 @@ mod tests {
             vec![("from", "earliest"), ("since", "-1")],
             vec![("from", "earliest"), ("since", "01")],
             vec![("from", "earliest"), ("limit", "ten")],
+            vec![("from", "earliest"), ("limit", "01")],
+            vec![("from", "earliest"), ("limit", "+5")],
             vec![("from", "latest"), ("current_after", "cs1_AAAA")],
             vec![("after", "mc1_short")],
         ];
