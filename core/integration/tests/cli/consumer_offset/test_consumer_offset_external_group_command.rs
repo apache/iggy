@@ -102,7 +102,14 @@ impl IggyCmdTestCase for TestExternalGroupOffsetCmd {
     fn verify_command(&self, command_state: Assert) {
         match self.step {
             Step::Set => {
-                command_state.success();
+                command_state
+                    .success()
+                    .stdout(starts_with(format!(
+                        "Executing set consumer offset for external group with ID: {GROUP_NAME}"
+                    )))
+                    .stdout(contains(format!(
+                        "Consumer offset for external group with ID: {GROUP_NAME}"
+                    )));
             }
             Step::Get => {
                 command_state
