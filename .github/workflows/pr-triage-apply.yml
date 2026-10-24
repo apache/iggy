@@ -369,6 +369,8 @@ jobs:
               WELCOME_MARKER,
               'Thanks for the PR. It is labeled `S-waiting-on-review` and queued for review.',
               '',
+              'If AI was used to create this PR, you must run the [`team-review` skill](https://github.com/apache/iggy/blob/master/.claude/skills/team-review/SKILL.md) before opening it.',
+              '',
               'Slash commands (own line, regular comment) move it around the queue:',
               '',
               '- `/ready` - back to `S-waiting-on-review` after addressing feedback',

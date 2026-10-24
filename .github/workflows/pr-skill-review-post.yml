@@ -404,7 +404,7 @@ jobs:
               .splice(MAX_INLINE)
               .map((c) => ({ path: c.path, line: c.line, text: c.body }));
 
-            // team-review and team-review-slim end on a `Verdict: APPROVE |
+            // team-review ends on a `Verdict: APPROVE |
             // REQUEST CHANGES` line. The prompt keeps it out of the summary,
             // and a copy that opens a line or a sentence loses the verdict
             // here, because the review states counts, not the word of the
