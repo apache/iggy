@@ -1068,7 +1068,11 @@ mod ffi {
         //     name: String,
         //     expiry: u64,
         // ) -> Result<RawPersonalAccessToken>;
-        fn delete_personal_access_token(self: &Client, name: String) -> Result<()>;
+        fn delete_personal_access_token(
+            self: &Client,
+            name: String,
+            error_info: &mut ErrorInfo,
+        ) -> Result<()>;
         // fn login_with_personal_access_token(self: &Client, token: String) -> Result<IdentityInfo>;
 
         unsafe fn delete_client(client: *mut Client);
