@@ -1472,6 +1472,10 @@ TEST_F(E2E_Message, ConsumerGroupCreateJoinAndPollMessages) {
     ASSERT_NO_THROW(client.JoinConsumerGroup(iggy::Identifier::Numeric(stream.Id()), iggy::Identifier::Numeric(0),
                                              iggy::Identifier::Numeric(group.Id())));
 
+    ASSERT_TRUE(wait_for_consumer_group_assignment(client, iggy::Identifier::Numeric(stream.Id()),
+                                                   iggy::Identifier::Numeric(0), iggy::Identifier::Numeric(group.Id()),
+                                                   1));
+
     const auto group_after_join = client.GetConsumerGroup(
         iggy::Identifier::Numeric(stream.Id()), iggy::Identifier::Numeric(0), iggy::Identifier::Numeric(group.Id()));
     ASSERT_EQ(group_after_join.MembersCount(), 1u);
@@ -1589,6 +1593,10 @@ TEST_F(E2E_Message, PollMessagesWithConsumerGroupReadsAssignedPartitions) {
     TrackConsumerGroup(stream_name, topic_name, group_name);
     client.JoinConsumerGroup(iggy::Identifier::Numeric(stream.Id()), iggy::Identifier::Numeric(0),
                              iggy::Identifier::String(group_name));
+
+    ASSERT_TRUE(wait_for_consumer_group_assignment(client, iggy::Identifier::Numeric(stream.Id()),
+                                                   iggy::Identifier::Numeric(0), iggy::Identifier::String(group_name),
+                                                   1));
 
     for (std::uint32_t partition_id = 0; partition_id < 2; partition_id++) {
         std::vector<iggy::IggyMessageToSend> messages;
