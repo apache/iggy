@@ -79,7 +79,6 @@ struct GlobalContext {
     // later polls of the scenario run on it.
     iggy::IggyBlockingClient *poll_owner = nullptr;
     std::optional<std::uint64_t> lost_operation_id;
-
 };
 
 inline std::string required_env(const char *name) {
