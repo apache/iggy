@@ -508,10 +508,10 @@ TEST_F(E2E_Client, CreateUserDuplicateStreamPermissionIdsCollapseToSingleEntry) 
     RecordProperty("description",
                    "Assigns two permission entries for one stream ID, then verifies the second entry wins and the "
                    "user is stored with a single stream entry.");
-    auto client                = GetLoggedInHighLevelClient();
-    const std::string username = GetRandomName(50);
+    auto client                   = GetLoggedInHighLevelClient();
+    const std::string username    = GetRandomName(50);
     const std::string stream_name = GetRandomName();
-    const auto stream_id = client.CreateStream(stream_name).Id();
+    const auto stream_id          = client.CreateStream(stream_name).Id();
     TrackStream(stream_name);
     iggy::StreamPermissions first_stream;
     iggy::StreamPermissions second_stream;
@@ -533,10 +533,10 @@ TEST_F(E2E_Client, CreateUserDuplicateTopicPermissionIdsCollapseToSingleEntry) {
     RecordProperty("description",
                    "Assigns two permission entries for one topic ID in the same stream, then verifies the second "
                    "entry wins and the user is stored with a single topic entry.");
-    auto client                = GetLoggedInHighLevelClient();
-    const std::string username = GetRandomName(50);
+    auto client                   = GetLoggedInHighLevelClient();
+    const std::string username    = GetRandomName(50);
     const std::string stream_name = GetRandomName();
-    const auto stream_id = client.CreateStream(stream_name).Id();
+    const auto stream_id          = client.CreateStream(stream_name).Id();
     TrackStream(stream_name);
     const auto topic_id = client.CreateTopic(iggy::Identifier::Numeric(stream_id), GetRandomName()).Id();
     iggy::TopicPermissions first_topic;
