@@ -108,11 +108,13 @@ __all__ = [
     "SendMessage",
     "SendMessagesConfirmation",
     "SendMessagesResponse",
+    "SnapshotCompression",
     "Stats",
     "Stream",
     "StreamDetails",
     "StreamOptions",
     "StreamPermissions",
+    "SystemSnapshotType",
     "TcpConfig",
     "TcpReconnectionConfig",
     "TokenInfo",
@@ -1262,8 +1264,8 @@ class IggyClient:
         """
     def snapshot(
         self,
-        snapshot_compression: builtins.str,
-        snapshot_types: typing.Sequence[builtins.str],
+        snapshot_compression: SnapshotCompression,
+        snapshot_types: typing.Sequence[SystemSnapshotType],
     ) -> collections.abc.Awaitable[bytes]:
         r"""
         Capture a diagnostic snapshot of the server as a compressed ZIP archive.
@@ -1272,21 +1274,21 @@ class IggyClient:
         global permission.
 
         Args:
-            snapshot_compression: Archive compression method. One of `"stored"`,
-                `"deflated"`, `"bzip2"`, `"zstd"`, `"lzma"`, `"xz"`.
-            snapshot_types: Data to include in the snapshot. Each entry is one
-                of `"filesystem_overview"`, `"process_list"`, `"resource_usage"`,
-                `"test"`, `"server_logs"`, `"server_config"`, `"all"`. `"all"`
-                cannot be combined with any other snapshot type.
+            snapshot_compression: Archive compression method as a
+                `SnapshotCompression` enum.
+            snapshot_types: Data to include in the snapshot as a list of
+                `SystemSnapshotType` enums. `SystemSnapshotType.All` cannot be
+                combined with any other snapshot type.
 
         Returns:
             An awaitable that resolves to the ZIP archive `bytes`.
 
         Raises:
-            ValueError: If `snapshot_compression` is empty or unknown, `snapshot_types`
-                is empty, or any entry in `snapshot_types` is unknown.
+            TypeError: If `snapshot_compression` is not a `SnapshotCompression`
+                or `snapshot_types` contains elements other than `SystemSnapshotType`.
+            ValueError: If `snapshot_types` is empty.
             RuntimeError: If the client is not connected, the session is not
-                authenticated, the user lacks the permission, `"all"` is
+                authenticated, the user lacks the permission, `SystemSnapshotType.All` is
                 combined with another snapshot type, the 30-second binary
                 operation deadline expires, or the request fails.
         """
@@ -4152,6 +4154,37 @@ class SendMessagesResponse:
         """
 
 @typing.final
+class SnapshotCompression:
+    r"""
+    Compression method for server snapshots.
+    """
+
+    Stored: typing.ClassVar[SnapshotCompression]
+    r"""
+    Store the file as is without compression.
+    """
+    Deflated: typing.ClassVar[SnapshotCompression]
+    r"""
+    Compress the file using Deflate.
+    """
+    Bzip2: typing.ClassVar[SnapshotCompression]
+    r"""
+    Compress the file using BZIP2.
+    """
+    Zstd: typing.ClassVar[SnapshotCompression]
+    r"""
+    Compress the file using ZStandard.
+    """
+    Lzma: typing.ClassVar[SnapshotCompression]
+    r"""
+    Compress the file using LZMA.
+    """
+    Xz: typing.ClassVar[SnapshotCompression]
+    r"""
+    Compress the file using XZ.
+    """
+
+@typing.final
 class Stats:
     r"""
     The statistics and details of the server and its running process.
@@ -4605,6 +4638,41 @@ class StreamPermissions:
                 `dict[int, TopicPermissions] | None`; an empty dict is
                 treated as `None`.
         """
+
+@typing.final
+class SystemSnapshotType:
+    r"""
+    Type of system data to include in a snapshot.
+    """
+
+    FilesystemOverview: typing.ClassVar[SystemSnapshotType]
+    r"""
+    Overview of the filesystem.
+    """
+    ProcessList: typing.ClassVar[SystemSnapshotType]
+    r"""
+    List of currently running processes.
+    """
+    ResourceUsage: typing.ClassVar[SystemSnapshotType]
+    r"""
+    Resource usage statistics of the system.
+    """
+    Test: typing.ClassVar[SystemSnapshotType]
+    r"""
+    Test snapshot type for development purposes.
+    """
+    ServerLogs: typing.ClassVar[SystemSnapshotType]
+    r"""
+    Server logs.
+    """
+    ServerConfig: typing.ClassVar[SystemSnapshotType]
+    r"""
+    Server configuration.
+    """
+    All: typing.ClassVar[SystemSnapshotType]
+    r"""
+    Everything.
+    """
 
 @typing.final
 class TcpConfig:

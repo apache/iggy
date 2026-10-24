@@ -20,7 +20,11 @@ import zipfile
 
 import pytest
 
-from apache_iggy import IggyClient
+from apache_iggy import (
+    IggyClient,
+    SnapshotCompression,
+    SystemSnapshotType,
+)
 
 
 class TestSnapshot:
@@ -29,35 +33,35 @@ class TestSnapshot:
     @pytest.mark.asyncio
     async def test_snapshot_returns_zip_bytes(self, iggy_client: IggyClient):
         """Capturing a snapshot returns a non-empty ZIP archive as bytes."""
-        data = await iggy_client.snapshot("deflated", ["all"])
+        data = await iggy_client.snapshot(
+            SnapshotCompression.Deflated, [SystemSnapshotType.All]
+        )
 
         assert isinstance(data, bytes)
         assert len(data) > 0
         assert zipfile.is_zipfile(io.BytesIO(data))
 
     @pytest.mark.unit
-    @pytest.mark.parametrize("snapshot_compression", ["", "   ", "invalid-compression"])
-    def test_snapshot_rejects_invalid_snapshot_compression(
-        self, snapshot_compression: str
-    ):
-        """Empty or unknown snapshot_compression raises ValueError before sending."""
+    @pytest.mark.parametrize("invalid_compression", ["deflated", "", 123, None])
+    def test_snapshot_rejects_invalid_snapshot_compression(self, invalid_compression):
+        """Passing non-enum snapshot_compression raises TypeError before sending."""
         client = IggyClient("127.0.0.1:1")
-        with pytest.raises(ValueError):
-            client.snapshot(snapshot_compression, ["test"])
+        with pytest.raises(TypeError):
+            client.snapshot(invalid_compression, [SystemSnapshotType.Test])
 
     @pytest.mark.unit
     def test_snapshot_rejects_invalid_snapshot_type(self):
-        """An unknown snapshot type raises ValueError before sending."""
+        """An unknown or non-enum snapshot type raises TypeError before sending."""
         client = IggyClient("127.0.0.1:1")
-        with pytest.raises(ValueError):
-            client.snapshot("deflated", ["not-a-real-type"])
+        with pytest.raises(TypeError):
+            client.snapshot(SnapshotCompression.Deflated, ["test"])
 
     @pytest.mark.unit
     def test_snapshot_rejects_empty_snapshot_types(self):
         """An empty snapshot_types list raises ValueError before sending."""
         client = IggyClient("127.0.0.1:1")
         with pytest.raises(ValueError):
-            client.snapshot("deflated", [])
+            client.snapshot(SnapshotCompression.Deflated, [])
 
     @pytest.mark.asyncio
     async def test_snapshot_rejects_all_combined_with_other_type(
@@ -65,13 +69,25 @@ class TestSnapshot:
     ):
         """Combining 'all' with another snapshot type is rejected."""
         with pytest.raises(RuntimeError, match="(?i)invalid command"):
-            await iggy_client.snapshot("deflated", ["all", "test"])
+            await iggy_client.snapshot(
+                SnapshotCompression.Deflated,
+                [SystemSnapshotType.All, SystemSnapshotType.Test],
+            )
 
     @pytest.mark.asyncio
     async def test_snapshot_deduplicates_snapshot_types(self, iggy_client: IggyClient):
         """Duplicate snapshot types are deduplicated before encoding."""
-        data = await iggy_client.snapshot("deflated", ["test"] * 255 + [" TEST "])
+        data = await iggy_client.snapshot(
+            SnapshotCompression.Deflated, [SystemSnapshotType.Test] * 255
+        )
 
         assert isinstance(data, bytes)
         assert len(data) > 0
         assert zipfile.is_zipfile(io.BytesIO(data))
+
+    @pytest.mark.unit
+    def test_snapshot_enums(self):
+        """Snapshot compression and type enums expose expected variants."""
+        assert SnapshotCompression.Deflated == SnapshotCompression.Deflated
+        assert SnapshotCompression.Deflated != SnapshotCompression.Stored
+        assert SystemSnapshotType.All == SystemSnapshotType.All

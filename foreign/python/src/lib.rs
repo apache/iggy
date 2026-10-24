@@ -29,6 +29,7 @@ mod producer;
 mod receive_message;
 mod resource_options;
 mod send_message;
+mod snapshot;
 mod stats;
 mod stream;
 mod topic;
@@ -70,6 +71,7 @@ use resource_options::{
     encryption_key_fingerprint,
 };
 use send_message::{SendMessage, SendMessagesConfirmation, SendMessagesResponse};
+use snapshot::{SnapshotCompression, SystemSnapshotType};
 use stats::{CacheMetrics, CacheMetricsKey, Stats};
 use stream::{Stream, StreamDetails};
 use topic::{IggyExpiry, MaxTopicSize, Partition, Topic, TopicDetails};
@@ -146,6 +148,8 @@ fn apache_iggy(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<GlobalPermissions>()?;
     m.add_class::<StreamPermissions>()?;
     m.add_class::<TopicPermissions>()?;
+    m.add_class::<SnapshotCompression>()?;
+    m.add_class::<SystemSnapshotType>()?;
     m.add_class::<MetadataChanges>()?;
     m.add_class::<MetadataChangeRecord>()?;
     m.add_class::<MetadataCurrentItem>()?;
