@@ -17,9 +17,9 @@
 
 # Floor for the flags CI and scripts/ci/storage-compat.sh pass: --no-tests
 # (0.9.75), --run-ignored only (0.9.76), --ignore-default-filter (0.9.77),
-# and archive -E (0.9.109).
+# archive -E (0.9.109), and --partition slice (0.9.127).
 # nextest refuses to run below it; setup-rust installs a pinned version above this floor.
-nextest-version = { required = "0.9.109" }
+nextest-version = { required = "0.9.127" }
 
 [[profile.default.overrides]]
 # This is a solution (or actually a workaround) for the problem that nextest does not support

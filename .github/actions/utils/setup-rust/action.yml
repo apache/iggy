@@ -46,8 +46,8 @@ inputs:
   free-disk-space:
     description: >-
       Whether to reclaim runner disk before the build. Default "true".
-      Artifact builders, Miri and lightweight checks disable cleanup when
-      they fit within the runner's available disk space.
+      Artifact builders, Rust test shards, Miri and lightweight checks
+      disable cleanup when they fit within the runner's available disk space.
     required: false
     default: "true"
 
@@ -142,7 +142,7 @@ runs:
       if: inputs.install-nextest == 'true'
       uses: taiki-e/install-action@v2
       with:
-        tool: cargo-nextest@0.9.148
+        tool: cargo-nextest@0.9.149
 
     - name: Install cargo-llvm-cov
       if: inputs.coverage == 'true'
