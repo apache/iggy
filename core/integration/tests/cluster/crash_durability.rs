@@ -551,6 +551,65 @@ async fn given_eager_flush_topic_when_the_whole_cluster_is_killed_should_recover
         });
 }
 
+/// The `replicated` twin of the eager-flush test above. The README lets a
+/// crash of `q` or more replicas lose only the writes "not yet handed to the
+/// OS"; here every acked batch is already in every node's segment files before
+/// the SIGKILL, so the page cache holds all of it and recovery must serve it.
+///
+/// TODO(#4631): buffered appends never publish the WAL frontier, so on reopen
+/// `recover_segment_files` truncates every segment byte past the last published
+/// frontier ("discarding unpublished segment bytes beyond the durable WAL
+/// frontier"). Suggested fix: on reopen, let a `replicated` partition adopt the
+/// WAL records past the frontier that `read_record` verifies as an unbroken
+/// chain, stopping at the first one that does not. If that loss is intended
+/// instead, the README must say so and this test must go.
+#[iggy_harness(cluster_nodes = 3)]
+#[ignore = "#4631: a whole-cluster SIGKILL discards replicated acks already in every node's segments"]
+async fn given_replicated_eager_flush_topic_when_the_whole_cluster_is_killed_should_recover_flushed_data(
+    harness: &mut TestHarness,
+) {
+    let client = harness.tcp_root_client().await.unwrap();
+    client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .expect("create stream");
+    client
+        .create_topic(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            TOPIC_NAME,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                messages_required_to_save: Some(1),
+                durability: Durability::Replicated,
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .expect("create topic");
+    let acked = produce_acked(&client, "flushed", 30).await;
+    let payloads: Vec<String> = acked.iter().map(|(_, payload)| payload.clone()).collect();
+    wait_until_payloads_installed(harness, &payloads, FLUSH_INSTALL_TIMEOUT).await;
+
+    // Same reason as above for keeping the producer's connection open.
+    harness.kill_cluster().expect("SIGKILL every node");
+    harness
+        .restart_cluster()
+        .await
+        .expect("restart the whole cluster");
+
+    let nodes: Vec<usize> = (0..harness.cluster_size()).collect();
+    let client = wait_until_cluster_serves(harness, &nodes, CONVERGE_TIMEOUT).await;
+    wait_for_acked_readable(&client, &acked, CONVERGE_TIMEOUT)
+        .await
+        .unwrap_or_else(|state| {
+            panic!(
+                "replicated acked data already in every node's segments must survive a \
+                 whole-cluster SIGKILL: {state}"
+            )
+        });
+}
+
 /// The kill follows the confirmation without waiting for segment installation.
 /// This exercises the prepare WAL rather than graceful shutdown or page-cache flushes.
 #[iggy_harness(cluster_nodes = 3)]
