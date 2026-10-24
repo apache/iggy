@@ -274,4 +274,35 @@ export abstract class CommandAPI extends AbstractAPI {
     );
     return response.length <= 1 ? Buffer.alloc(0) : response.data;
   }
+
+  /**
+   * Sends a command code with a payload to the replica with the given id, as
+   * the cluster metadata names it, and returns the raw response payload. Every
+   * node answers non-replicated commands such as GetStats from its own state.
+   * Replicated commands, polls and session-control codes are rejected with an
+   * invalid-command error, and a replica id the cluster metadata does not name
+   * with an invalid-identifier error. A `NotPrimary` refusal is returned and
+   * not retried on another replica.
+   *
+   * @param code - Command code to send
+   * @param payload - Raw command payload
+   * @param replica - Replica id, as the cluster metadata names it
+   * @returns Raw response payload
+   */
+  async sendBinaryRequestToReplica(
+    code: number,
+    payload: Buffer,
+    replica: number
+  ): Promise<Buffer> {
+    if (SESSION_CONTROL_CODES.has(code))
+      throw responseError(code, INVALID_COMMAND_ERROR_CODE);
+
+    const snapshot = Buffer.from(payload);
+    const response = await (await this.clientProvider()).sendCommand(
+      code,
+      snapshot,
+      { replica }
+    );
+    return response.length <= 1 ? Buffer.alloc(0) : response.data;
+  }
 }

@@ -314,6 +314,20 @@ namespace Iggy {
         public function sendBinaryRequest(int $code, string $payload): string {}
 
         /**
+         * Sends a command code with a payload to the replica with the given id, as
+         * cluster metadata names it, and returns the raw response bytes.
+         * Replicated commands, polls and session-control codes return an
+         * invalid-command exception, and a replica that cluster metadata does not
+         * name returns an invalid-identifier exception.
+         *
+         * @param int $code
+         * @param string $payload
+         * @param int $replica_id
+         * @return string
+         */
+        public function sendBinaryRequestToReplica(int $code, string $payload, int $replica_id): string {}
+
+        /**
          * Sends messages to a topic and returns the commit confirmations, one per
          * partition the batch landed in.
          *

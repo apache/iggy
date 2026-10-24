@@ -404,6 +404,11 @@ impl ReplicaLinks {
             .ok_or(IggyError::NotConnected)
     }
 
+    /// Whether the last roster names replica `id`.
+    pub(crate) fn has_replica(&self, id: u8) -> bool {
+        self.shared.table().slots.contains_key(&id)
+    }
+
     /// The replicas with a link that serves the session, in id order.
     pub(crate) fn ready_replicas(&self) -> Vec<u8> {
         let epoch = self.shared.session.epoch();

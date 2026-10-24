@@ -112,6 +112,12 @@ public class IggyTcpClient implements IggyBaseClient, Closeable {
         return FutureUtil.resolve(asyncClient.sendBinaryRequest(code, payload));
     }
 
+    /** {@inheritDoc} */
+    @Override
+    public byte[] sendBinaryRequestToReplica(int replicaId, int code, byte[] payload) {
+        return FutureUtil.resolve(asyncClient.sendBinaryRequestToReplica(replicaId, code, payload));
+    }
+
     /**
      * Resolves the retained operation under its original identity and returns its response body. A later resolve
      * returns the same outcome without a request, see {@link AsyncIggyTcpClient#resolveOperation(long, Duration)}.

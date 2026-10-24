@@ -352,9 +352,9 @@ func (c *IggyTcpClient) doCaptured(ctx context.Context, cmd command.Command, cap
 		if poll, ok := cmd.(*command.PollMessages); ok && poll.Strategy.Context != nil {
 			captured = poll.Strategy.Context
 		}
-		return c.drive(ctx, cmd.Code(), query, frame, captured)
+		return c.drive(ctx, cmd.Code(), query, frame, captured, nil)
 	}
-	return c.drive(ctx, cmd.Code(), nil, frame, nil)
+	return c.drive(ctx, cmd.Code(), nil, frame, nil, nil)
 }
 
 // rawRequest carries a SendBinaryRequest through do, so a raw partition
@@ -381,6 +381,33 @@ func (c *IggyTcpClient) SendBinaryRequest(ctx context.Context, code uint32, payl
 		return nil, ierror.ErrInvalidCommand
 	}
 	return c.do(ctx, rawRequest{code: command.Code(code), payload: payload})
+}
+
+// SendBinaryRequestToReplica sends a command code and payload to the replica with id
+// replicaID and returns that replica's raw response body. Session-control codes,
+// replicated commands and polls return ierror.ErrInvalidCommand without writing to the
+// connection. A replica the roster does not name, after one roster read, returns
+// ierror.ErrInvalidIdentifier. The replica's own refusal, such as ierror.ErrNotPrimary,
+// is returned as it is.
+func (c *IggyTcpClient) SendBinaryRequestToReplica(ctx context.Context, replicaID uint8, code uint32, payload []byte) ([]byte, error) {
+	if _, replicated := vsr.ReplicatedOperation(code); replicated || isSessionControlCode(code) || command.Code(code) == command.PollMessagesCode {
+		return nil, ierror.ErrInvalidCommand
+	}
+	if ctx == nil {
+		return nil, ierror.ErrNilContext
+	}
+	ctx, cancel := c.operationContext(ctx)
+	defer cancel()
+	bp := acquireRequestBuf()
+	defer releaseRequestBuf(bp)
+	frame, err := appendCommandFrame(*bp, rawRequest{code: command.Code(code), payload: payload})
+	if frame != nil {
+		*bp = frame
+	}
+	if err != nil {
+		return nil, err
+	}
+	return c.drive(ctx, command.Code(code), nil, frame, nil, &replicaID)
 }
 
 // reserveHeader returns buf truncated to exactly the header prologue, growing

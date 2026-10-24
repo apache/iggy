@@ -149,6 +149,24 @@ pub trait BinaryTransport {
         payload: Bytes,
         context: PartitionContext,
     ) -> Result<Bytes, IggyError>;
+    /// Send a non-replicated command `code` with an encoded `payload` to the
+    /// replica `replica_id` and return its raw reply body.
+    ///
+    /// The request carries the session's metadata watermark, so the replica
+    /// answers once it applied the metadata the session saw. The reply is the
+    /// chosen replica's own: a refusal such as [`IggyError::NotPrimary`] is
+    /// returned, never retried on another replica. A replicated command or a
+    /// poll returns [`IggyError::InvalidCommand`] before anything is sent, and a
+    /// replica the roster does not name returns [`IggyError::InvalidIdentifier`].
+    /// Transports without replica links return [`IggyError::FeatureUnavailable`].
+    async fn send_raw_to_replica(
+        &self,
+        _code: u32,
+        _payload: Bytes,
+        _replica_id: u8,
+    ) -> Result<Bytes, IggyError> {
+        Err(IggyError::FeatureUnavailable)
+    }
     /// Route a store or delete offset request while retaining the membership connection.
     /// Every retry keeps a captured `context`. Without one, the request takes the context
     /// its route reports.

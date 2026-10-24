@@ -66,6 +66,8 @@ pub(crate) use iggy_common::{
 pub(crate) enum RequestTarget<'a> {
     Metadata,
     Partition(PartitionTarget<'a>),
+    /// The replica the caller chose.
+    Replica(u8),
 }
 
 /// A partition request as its caller spelled the partition.
@@ -250,6 +252,21 @@ impl OperationDriver {
             }),
         )
         .await
+    }
+
+    /// Sends a non-replicated request to replica `replica_id` and returns its
+    /// reply. Writes and polls go through the routing of their own kind.
+    pub(crate) async fn send_to_replica(
+        &self,
+        code: u32,
+        payload: Bytes,
+        replica_id: u8,
+    ) -> Result<Bytes, IggyError> {
+        if operation_for_code(code) != Operation::NonReplicated || code == POLL_MESSAGES_CODE {
+            return Err(IggyError::InvalidCommand);
+        }
+        self.send(code, payload, RequestTarget::Replica(replica_id))
+            .await
     }
 
     /// Sends one request and returns the body of its reply. A poll goes
@@ -581,13 +598,16 @@ impl OperationDriver {
         }
     }
 
-    /// The link of the next attempt: to the primary of the route, else to
-    /// the metadata primary.
+    /// The link of the next attempt: to the replica the caller chose, to the
+    /// primary of the route, else to the metadata primary.
     async fn hop(
         &self,
         call: &mut Call,
         route: Option<PartitionRouteResponse>,
     ) -> Result<Hop, Next> {
+        if let Some(replica) = call.replica {
+            return self.replica_hop(call, replica).await;
+        }
         let target = route.map_or(Target::MetadataPrimary, |route| {
             Target::Replica(route.primary_replica)
         });
@@ -603,6 +623,31 @@ impl OperationDriver {
             _ => self.find_metadata_primary(call.deadline).await,
         }
         Err(Next::Pause)
+    }
+
+    /// The link of the replica the caller chose. A replica without a ready
+    /// link is waited for. One the roster does not name is looked up in a
+    /// fresh roster once, and then refused.
+    async fn replica_hop(&self, call: &mut Call, replica: u8) -> Result<Hop, Next> {
+        if let Ok(link) = self.links.link(Target::Replica(replica)) {
+            return Ok(Hop { link, route: None });
+        }
+        call.refusal = IggyError::TransientNotAccepted;
+        if self.links.has_replica(replica) {
+            return Err(Next::Pause);
+        }
+        if call.roster_read {
+            return Err(Next::Fail(IggyError::InvalidIdentifier));
+        }
+        call.roster_read = match self.links.link(Target::MetadataPrimary) {
+            Ok(link) => self.read_roster(&link, call.deadline).await,
+            Err(_) => false,
+        };
+        Err(if call.roster_read {
+            Next::Again
+        } else {
+            Next::Pause
+        })
     }
 
     /// Reads the outcome of one attempt. `sent` tells that this or an
@@ -639,6 +684,8 @@ impl OperationDriver {
                 self.refresh(call, hop, Failure::Refused).await;
                 Err(Next::Pause)
             }
+            // The caller chose the replica, so its refusal is the answer.
+            IggyError::NotPrimary if call.replica.is_some() => Err(Next::Fail(error)),
             IggyError::NotPrimary => {
                 // Neither was admitted, so the deadline reports both as 58.
                 call.refusal = IggyError::TransientNotAccepted;
@@ -714,8 +761,12 @@ impl OperationDriver {
         Ok(body)
     }
 
-    /// Learns where the next attempt goes after `hop` failed one.
+    /// Learns where the next attempt goes after `hop` failed one. A call to a
+    /// chosen replica goes there again.
     async fn refresh(&self, call: &Call, hop: &Hop, failure: Failure) {
+        if call.replica.is_some() {
+            return;
+        }
         if let (Some(partition), Some(route)) = (&call.partition, &hop.route) {
             let partition_id = partition.key.partition_id;
             let replica = route.primary_replica;
@@ -884,6 +935,10 @@ struct Call {
     code: u32,
     payload: Bytes,
     partition: Option<PartitionCall>,
+    /// The replica the caller chose, `None` when the driver routes the call.
+    replica: Option<u8>,
+    /// A call to a replica the roster did not name read the roster once.
+    roster_read: bool,
     deadline: Instant,
     ticket: Option<LaneTicket>,
     frame: Option<Frame>,
@@ -960,17 +1015,23 @@ enum Failure {
 
 impl Call {
     fn new(code: u32, payload: Bytes, target: RequestTarget<'_>, deadline: Instant) -> Self {
-        let partition = match target {
-            RequestTarget::Metadata => None,
-            RequestTarget::Partition(target) => Some(PartitionCall {
-                key: PartitionKey::from(&target),
-                context: target.context,
-            }),
+        let (partition, replica) = match target {
+            RequestTarget::Metadata => (None, None),
+            RequestTarget::Partition(target) => (
+                Some(PartitionCall {
+                    key: PartitionKey::from(&target),
+                    context: target.context,
+                }),
+                None,
+            ),
+            RequestTarget::Replica(replica) => (None, Some(replica)),
         };
         Self {
             code,
             payload,
             partition,
+            replica,
+            roster_read: false,
             deadline,
             ticket: None,
             frame: None,
@@ -1872,6 +1933,110 @@ mod tests {
         let lookups = f.cluster.received(GET_PARTITION_ROUTE_CODE);
         assert_eq!(endpoints(&lookups), [endpoint(0), endpoint(1), endpoint(2)]);
         assert_eq!(endpoints(&f.sends()), [endpoint(1), endpoint(2)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_chosen_replica_when_a_read_is_sent_should_reach_only_that_replica_with_the_metadata_watermark()
+     {
+        let f = Fixture::new().await;
+
+        f.driver
+            .send_to_replica(GET_STREAMS_CODE, Bytes::from_static(PAYLOAD), 2)
+            .await
+            .unwrap();
+
+        let reads = f.cluster.received(GET_STREAMS_CODE);
+        assert_eq!(endpoints(&reads), [endpoint(2)]);
+        assert_eq!(reads[0].body, PAYLOAD);
+        assert_eq!(
+            stamped_context(&reads[0]).metadata_op,
+            f.driver.session.metadata_watermark()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_89_from_a_chosen_replica_when_reading_should_return_it_without_another_replica()
+    {
+        let f = Fixture::new().await;
+        f.cluster.script(
+            &endpoint(2),
+            GET_STREAMS_CODE,
+            [Answer::Refuse(IggyError::NotPrimary)],
+        );
+
+        let result = f
+            .driver
+            .send_to_replica(GET_STREAMS_CODE, Bytes::from_static(PAYLOAD), 2)
+            .await;
+
+        assert_eq!(result, Err(IggyError::NotPrimary));
+        assert_eq!(
+            endpoints(&f.cluster.received(GET_STREAMS_CODE)),
+            [endpoint(2)]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_58_and_a_dropped_link_from_a_chosen_replica_when_reading_should_retry_that_replica()
+     {
+        let f = Fixture::new().await;
+        f.cluster.script(
+            &endpoint(2),
+            GET_STREAMS_CODE,
+            [
+                Answer::Refuse(IggyError::TransientNotAccepted),
+                Answer::HangUp,
+            ],
+        );
+
+        f.driver
+            .send_to_replica(GET_STREAMS_CODE, Bytes::from_static(PAYLOAD), 2)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            endpoints(&f.cluster.received(GET_STREAMS_CODE)),
+            [endpoint(2), endpoint(2), endpoint(2)]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_replica_the_roster_does_not_name_when_reading_should_fail_after_one_roster_read()
+     {
+        let f = Fixture::new().await;
+        let rosters = f.cluster.count(GET_CLUSTER_METADATA_CODE);
+
+        let result = f
+            .driver
+            .send_to_replica(GET_STREAMS_CODE, Bytes::from_static(PAYLOAD), REPLICAS)
+            .await;
+
+        assert_eq!(result, Err(IggyError::InvalidIdentifier));
+        assert_eq!(f.cluster.count(GET_CLUSTER_METADATA_CODE), rosters + 1);
+        assert!(f.cluster.received(GET_STREAMS_CODE).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_replicated_command_or_a_poll_when_sent_to_a_replica_should_refuse_before_the_wire()
+     {
+        let f = Fixture::new().await;
+        let rosters = f.cluster.count(GET_CLUSTER_METADATA_CODE);
+
+        for code in [
+            CREATE_STREAM_CODE,
+            SEND_MESSAGES_CODE,
+            STORE_CONSUMER_OFFSET_CODE,
+            POLL_MESSAGES_CODE,
+        ] {
+            assert_eq!(
+                f.driver
+                    .send_to_replica(code, Bytes::from_static(PAYLOAD), 1)
+                    .await,
+                Err(IggyError::InvalidCommand)
+            );
+            assert!(f.cluster.received(code).is_empty());
+        }
+        assert_eq!(f.cluster.count(GET_CLUSTER_METADATA_CODE), rosters);
     }
 
     #[tokio::test(start_paused = true)]

@@ -2141,6 +2141,30 @@ class IggyClient:
         Raises:
             RuntimeError: If the command cannot be sent or the server returns an error.
         """
+    def send_binary_request_to_replica(
+        self, code: builtins.int, payload: builtins.bytes, replica_id: builtins.int
+    ) -> collections.abc.Awaitable[bytes]:
+        r"""
+        Send a command code with a payload to the replica with the given id and
+        return the raw response bytes.
+
+        The replica id is the one cluster metadata names for the node. Every
+        node answers non-replicated commands such as GetStats from its own
+        state. Replicated commands, polls and session-control codes are
+        rejected client-side, and a replica id that cluster metadata does not
+        name fails. HTTP transport does not support raw binary commands.
+
+        Args:
+            code: Command code as `int`.
+            payload: Request payload as `bytes`.
+            replica_id: Replica id as `int`, as cluster metadata names it.
+
+        Returns:
+            An awaitable that resolves to the raw response `bytes`.
+
+        Raises:
+            RuntimeError: If the command cannot be sent or the replica returns an error.
+        """
 
 @typing.final
 class IggyConsumer:

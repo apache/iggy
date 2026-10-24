@@ -1005,6 +1005,13 @@ mod ffi {
             payload: Vec<u8>,
             error_info: &mut ErrorInfo,
         ) -> Result<Vec<u8>>;
+        fn send_binary_request_to_replica(
+            self: &Client,
+            code: u32,
+            payload: Vec<u8>,
+            replica_id: u8,
+            error_info: &mut ErrorInfo,
+        ) -> Result<Vec<u8>>;
 
         fn disconnect(self: &Client) -> Result<()>;
         fn shutdown(self: &Client) -> Result<()>;

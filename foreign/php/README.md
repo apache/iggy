@@ -389,6 +389,7 @@ follow($client, [MetadataChangeGroup::Streams, MetadataChangeGroup::Topics]);
   getters return PHP integers and are limited to `PHP_INT_MAX`.
 - `Iggy\Client::sendBinaryRequest(int $code, string $payload): string` sends a
   command code and payload and returns the raw response body.
+- `Iggy\Client::sendBinaryRequestToReplica(int $code, string $payload, int $replica_id): string` sends a raw command to one node of a cluster, named by the replica id that cluster metadata returns, for example to read that node's `GetStats`. Replicated commands, polls and session-control codes throw an invalid-command exception before anything is sent. An unknown id throws an invalid-identifier exception, and a `NotPrimary` reply is thrown, never sent to another node.
 - `Iggy\Client` is synchronous and blocks the current PHP thread.
 - The extension owns a lazy global Tokio runtime. Do not call `pcntl_fork()` after
   the first Iggy SDK call; the child process inherits file descriptors but not

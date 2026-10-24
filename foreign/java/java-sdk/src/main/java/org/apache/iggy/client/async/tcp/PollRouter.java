@@ -319,6 +319,18 @@ final class PollRouter {
         return send(poll);
     }
 
+    /**
+     * Sends a non-replicated request to the replica with {@code replicaId} on its link, stamped with the session's
+     * metadata watermark. An id that the roster does not name after a roster read fails with code 6. A lost link or a
+     * refusal with code 58 goes to the same replica again until the deadline, which ends the call with code 58. Any
+     * other reply, code 89 included, is the caller's, because the caller chose the node.
+     */
+    CompletableFuture<ByteBuf> replicaRequest(int replicaId, int code, byte[] payload) {
+        CompletableFuture<ByteBuf> result = new CompletableFuture<>();
+        replicaAttempt(replicaId, code, payload, operationDeadline(), result);
+        return result;
+    }
+
     CompletableFuture<Long> partitionCount(
             StreamId stream, TopicId topic, long deadline, AsyncTcpConnection.TransientFailoverState state) {
         if (state.signedOut()) {
@@ -623,6 +635,71 @@ final class PollRouter {
             poll.fail(error);
         }
         return poll.result;
+    }
+
+    private void replicaAttempt(
+            int replicaId, int code, byte[] payload, long deadline, CompletableFuture<ByteBuf> result) {
+        replicaLink(replicaId, deadline)
+                .thenCompose(link -> link.sendRouted(
+                        code,
+                        Unpooled.wrappedBuffer(payload),
+                        0,
+                        deadline,
+                        new AsyncTcpConnection.TransientFailoverState()))
+                .whenComplete((response, error) -> {
+                    if (error == null) {
+                        if (!result.complete(response)) {
+                            response.release();
+                        }
+                        return;
+                    }
+                    if (!connectionFailed(error) && !isNotAccepted(error)) {
+                        result.completeExceptionally(unwrap(error));
+                        return;
+                    }
+                    if (result.isDone()
+                            || deadline - System.nanoTime() <= TimeUnit.MILLISECONDS.toNanos(RETRY_INTERVAL_MILLIS)) {
+                        result.completeExceptionally(notAccepted());
+                        return;
+                    }
+                    try {
+                        coordinator
+                                .get()
+                                .eventLoop()
+                                .schedule(
+                                        () -> replicaAttempt(replicaId, code, payload, deadline, result),
+                                        RETRY_INTERVAL_MILLIS,
+                                        TimeUnit.MILLISECONDS);
+                    } catch (RejectedExecutionException loopGone) {
+                        result.completeExceptionally(notAccepted());
+                    }
+                });
+    }
+
+    private CompletableFuture<AsyncTcpConnection> replicaLink(int replicaId, long deadline) {
+        AsyncTcpConnection parent = coordinator.get();
+        if (!parent.isAuthenticated()) {
+            return parent.awaitAuthentication(deadline, new AsyncTcpConnection.TransientFailoverState())
+                    .thenComposeAsync(ignored -> replicaLink(replicaId, deadline), parent.eventLoop());
+        }
+        ConnectionInfo known = replicaEndpoint(replicaId);
+        CompletableFuture<ConnectionInfo> endpoint = known != null
+                ? CompletableFuture.completedFuture(known)
+                : refreshRoster(parent, deadline).thenApply(ignored -> replicaEndpoint(replicaId));
+        return endpoint.thenCompose(target -> {
+            if (target == null) {
+                return CompletableFuture.failedFuture(
+                        IggyServerException.fromTcpResponse(IggyErrorCode.INVALID_IDENTIFIER.getCode(), new byte[0]));
+            }
+            if (coordinatorEndpoint != null && LeaderAwareness.isSameSpelling(target, coordinatorEndpoint.get())) {
+                return CompletableFuture.completedFuture(parent);
+            }
+            return connectionFor(target, deadline);
+        });
+    }
+
+    private synchronized ConnectionInfo replicaEndpoint(int replicaId) {
+        return replicas.get(replicaId);
     }
 
     CompletableFuture<Void> clearSession() {

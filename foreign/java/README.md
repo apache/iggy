@@ -38,7 +38,7 @@ See [Maven Central](https://central.sonatype.com/artifact/org.apache.iggy/iggy) 
 
 ### Snapshot Versions
 
-Development builds of the next release carry the version `0.9.3-SNAPSHOT`. Get them from the ASF snapshot repository:
+Development builds of the next release carry the version `0.9.4-SNAPSHOT`. Get them from the ASF snapshot repository:
 
 **Gradle:**
 
@@ -51,7 +51,7 @@ repositories {
 }
 
 dependencies {
-    implementation 'org.apache.iggy:iggy:0.9.3-SNAPSHOT'
+    implementation 'org.apache.iggy:iggy:0.9.4-SNAPSHOT'
 }
 ```
 
@@ -72,7 +72,7 @@ dependencies {
     <dependency>
         <groupId>org.apache.iggy</groupId>
         <artifactId>iggy</artifactId>
-        <version>0.9.3-SNAPSHOT</version>
+        <version>0.9.4-SNAPSHOT</version>
     </dependency>
 </dependencies>
 ```
@@ -122,6 +122,10 @@ credentials of the automatic sign-in. It also updates the builder credentials
 that `login()` uses when they name that user. This holds for typed calls,
 `sendBinaryRequest` and `resolveOperation`. A rejected change leaves the
 credentials unchanged.
+
+`sendBinaryRequestToReplica(replicaId, code, payload)` sends a raw command to one node of a cluster, named by the replica id that cluster metadata returns.
+
+Each node answers non-replicated commands such as `GetStats` from its own state, so this reads the state of that node. Replicated commands, polls and session-control codes fail with `INVALID_COMMAND` before anything is sent. An id that cluster metadata does not name fails with `INVALID_IDENTIFIER`. An unreachable node is retried until the request timeout, and a `NOT_PRIMARY` reply is returned rather than sent to another node. The HTTP client throws `IggyOperationNotSupportedException`.
 
 ## Quick Start
 
