@@ -20,7 +20,12 @@ package iggcon
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
+
+	ierror "github.com/apache/iggy/foreign/go/errors"
 )
+
+const maxHeaderFieldLength = 255
 
 type HeaderValue struct {
 	Kind  HeaderKind
@@ -38,15 +43,15 @@ type HeaderEntry struct {
 }
 
 func NewHeaderKeyString(val string) (HeaderKey, error) {
-	if len(val) == 0 || len(val) > 255 {
-		return HeaderKey{}, errors.New("value has incorrect size, must be between 1 and 255")
+	if len(val) == 0 || len(val) > maxHeaderFieldLength {
+		return HeaderKey{}, fmt.Errorf("%w: length must be between 1 and %d", ierror.ErrInvalidHeaderKey, maxHeaderFieldLength)
 	}
 	return HeaderKey{Kind: String, Value: []byte(val)}, nil
 }
 
 func NewHeaderKeyRaw(val []byte) (HeaderKey, error) {
-	if len(val) == 0 || len(val) > 255 {
-		return HeaderKey{}, errors.New("value has incorrect size, must be between 1 and 255")
+	if len(val) == 0 || len(val) > maxHeaderFieldLength {
+		return HeaderKey{}, fmt.Errorf("%w: length must be between 1 and %d", ierror.ErrInvalidHeaderKey, maxHeaderFieldLength)
 	}
 	return HeaderKey{Kind: Raw, Value: val}, nil
 }
@@ -94,6 +99,20 @@ func (k HeaderKind) ExpectedSize() int {
 	}
 }
 
+// The defined range must move together with WireHeaderKind::KNOWN_MAX in
+// core/binary_protocol/src/primitives/user_headers.rs.
+func (k HeaderKind) valid() bool {
+	return k >= Raw && k <= Double
+}
+
+// Out-of-byte kinds would alias a defined kind once truncated, so they encode as the reserved 0 that the Rust reader and the server reject.
+func (k HeaderKind) wireByte() byte {
+	if k < 0 || k > 255 {
+		return 0
+	}
+	return byte(k)
+}
+
 func GetHeadersBytes(headers []HeaderEntry) []byte {
 	headersLength := 0
 	for _, entry := range headers {
@@ -114,7 +133,7 @@ func getBytesFromHeader(key HeaderKey, value HeaderValue) []byte {
 	headerBytes := make([]byte, headerBytesLength)
 	pos := 0
 
-	headerBytes[pos] = byte(key.Kind)
+	headerBytes[pos] = key.Kind.wireByte()
 	pos++
 
 	binary.LittleEndian.PutUint32(headerBytes[pos:pos+4], uint32(len(key.Value)))
@@ -122,7 +141,7 @@ func getBytesFromHeader(key HeaderKey, value HeaderValue) []byte {
 	copy(headerBytes[pos:pos+len(key.Value)], key.Value)
 	pos += len(key.Value)
 
-	headerBytes[pos] = byte(value.Kind)
+	headerBytes[pos] = value.Kind.wireByte()
 	pos++
 
 	binary.LittleEndian.PutUint32(headerBytes[pos:pos+4], uint32(len(value.Value)))
@@ -201,6 +220,63 @@ func DeserializeHeaders(userHeadersBytes []byte) ([]HeaderEntry, error) {
 	}
 
 	return headers, nil
+}
+
+const (
+	headerFieldTruncated        = "truncated"
+	headerFieldUnknownKind      = "unknown kind"
+	headerFieldLengthOutOfRange = "length out of range"
+	headerFieldWrongWidth       = "wrong width for kind"
+)
+
+// validateUserHeaders rejects any field some reader refuses to decode.
+func validateUserHeaders(userHeadersBytes []byte) error {
+	position := 0
+	entry := 0
+	isKey := true
+	for position < len(userHeadersBytes) {
+		next, reason := headerFieldEnd(userHeadersBytes, position)
+		if reason != "" {
+			if isKey {
+				return fmt.Errorf("header entry %d: %w: %s", entry, ierror.ErrInvalidHeaderKey, reason)
+			}
+			return fmt.Errorf("header entry %d: %w: %s", entry, ierror.ErrInvalidHeaderValue, reason)
+		}
+		position = next
+		if !isKey {
+			entry++
+		}
+		isKey = !isKey
+	}
+	if !isKey {
+		return fmt.Errorf("header entry %d: %w: %s", entry, ierror.ErrInvalidHeaderValue, headerFieldTruncated)
+	}
+	return nil
+}
+
+// headerFieldEnd returns the position after the kind-length-data field at position, or the reason a reader would reject it.
+func headerFieldEnd(userHeadersBytes []byte, position int) (int, string) {
+	if len(userHeadersBytes)-position < 5 {
+		return 0, headerFieldTruncated
+	}
+	field := userHeadersBytes[position : position+5]
+	kind := HeaderKind(field[0])
+	fieldLength := binary.LittleEndian.Uint32(field[1:5])
+	position += 5
+	if !kind.valid() {
+		return 0, headerFieldUnknownKind
+	}
+	if fieldLength == 0 || fieldLength > maxHeaderFieldLength {
+		return 0, headerFieldLengthOutOfRange
+	}
+	length := int(fieldLength)
+	if len(userHeadersBytes)-position < length {
+		return 0, headerFieldTruncated
+	}
+	if expected := kind.ExpectedSize(); expected != -1 && length != expected {
+		return 0, headerFieldWrongWidth
+	}
+	return position + length, ""
 }
 
 func deserializeHeaderKind(payload []byte, position int) (HeaderKind, error) {
