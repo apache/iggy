@@ -27,7 +27,7 @@ New sink/source authors: start with [`core/connectors/docs/authoring-sinks-and-s
 
 ## STOP and ask the user before
 
-- Bumping `iggy_connector_sdk` MAJOR version or changing any FFI signature in `sdk/src/{sink,source}.rs` - breaks every pre-built plugin `.so`. Source FFI is `iggy_source_handle_v2` (batch ID carried to the runtime callback) + `iggy_source_batch_result` (plugin-exported ACK/NACK, #3855).
+- Bumping `iggy_connector_sdk` MAJOR version or changing any FFI signature in `sdk/src/{sink,source}.rs` - breaks every pre-built plugin `.so`. Source FFI is `iggy_source_handle_v2` (batch ID carried to the runtime callback) + `iggy_source_batch_result` (plugin-exported ACK/NACK, #3855) + the optional `iggy_source_register_stop_callback` (SDK 0.5.1-edge.2+, #4269) that lets the runtime learn why a source's poll task exited; older plugins simply don't export it.
 - Changing the runtime's wire conventions (postcard FFI payload structs, default consumer group naming, plugin path resolution).
 - Modifying `runtime/src/state.rs` save protocol (atomic rename + fsync ordering) - corruption risk.
 - Renaming or repurposing a `Schema` variant - decoders/encoders pinned to wire bytes.

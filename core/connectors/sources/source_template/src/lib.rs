@@ -462,29 +462,34 @@ impl Source for TemplateSource {
     }
 
     /// The staged cursor from `poll()` is only committed here, and only on
-    /// an ACK. A NACK (delivery failed, batch timed out, runtime is
+    /// an ACK. A NACK (delivery failed, state-save failed, runtime is
     /// shutting down) discards the candidate so the same range is re-polled
     /// next time — the cursor never moves past data that wasn't confirmed
     /// delivered. If `fetch_records()` ever needs to perform a destructive
     /// read against the source (delete-after-read, mark-as-processed),
     /// stage that side effect the same way and only apply it here on `Ack`.
+    /// A missing runtime result does not produce a synthetic NACK — the SDK
+    /// just keeps waiting (warning past ~30s) rather than guessing.
     ///
     /// If you add real I/O here (an external ack call, a delete, a mark-
     /// processed update), two things from a real connector's review history
     /// apply directly:
     ///
-    /// 1. This runs inside the SDK's fixed ~30s batch-result window, and a
-    ///    size-your-own-timeout mistake here is fatal, not just slow — a
-    ///    NACK from that window stops the source for good after repeated
-    ///    consecutive NACKs. If you stage more than one operation, budget
-    ///    for *all* of them inside the window, not one op's worth, and
-    ///    reject `max_retries`/`retry_delay` combinations in `open()` that
-    ///    could blow it. See `connector-pr-review` B11.
+    /// 1. `on_batch_result` has no SDK-enforced deadline, but the SDK will
+    ///    not call `poll()` again until it returns — slow I/O here silently
+    ///    stalls the whole source, it doesn't fail loudly. If you stage more
+    ///    than one operation, budget for *all* of them (a per-item retry
+    ///    budget multiplies with the item count), and reject
+    ///    `max_retries`/`retry_delay` combinations in `open()` that would
+    ///    make that stall unbounded. See `connector-pr-review` B11.
     /// 2. A failed op must not be silently logged while the batch is still
     ///    ACKed — the cursor has already committed past it by the time you
     ///    find out. Count consecutive failures and return `Err` past a
     ///    threshold so the SDK stops the source, instead of resending the
-    ///    same broken operation forever.
+    ///    same broken operation forever. A source whose input genuinely
+    ///    cannot be replayed after restart should instead override
+    ///    `batch_policy()` with `BatchPolicy::with_max_consecutive_nacks(None)`
+    ///    rather than relying on the default 5-consecutive-Nack stop.
     async fn on_batch_result(&self, result: SourceBatchResult) -> Result<(), Error> {
         let candidate_state = self.pending_state.lock().await.take();
         if result == SourceBatchResult::Ack
