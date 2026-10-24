@@ -6,12 +6,13 @@ built with the Dioxus CLI, `dx`.
 
 ## Prerequisites
 
+`dx` must match the `dioxus` version in `Cargo.lock`. On Linux,
+`scripts/ci/install-dx.sh` downloads the pinned build. Elsewhere:
+
 ```bash
 rustup target add wasm32-unknown-unknown
 cargo install dioxus-cli --version 0.7.10 --locked
 ```
-
-Keep the `dx` version equal to the `dioxus` version in `Cargo.lock`.
 
 ## Release bundle
 
