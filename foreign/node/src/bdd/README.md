@@ -29,6 +29,8 @@ sdk and feature matrix.
 for iterating against a server you started yourself. note: bdd test expect an
 iggy-server started with the same root credentials
 
+The stream options feature also needs the server to run with encryption enabled and a config key (`IGGY_ENCRYPTION_ENABLED=true`, `IGGY_ENCRYPTION_KEY`), as `scripts/run-bdd-tests.sh` starts it.
+
 from [/foreign/node](../../) run
 
 ```bash

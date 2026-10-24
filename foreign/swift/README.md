@@ -14,8 +14,8 @@ The SDK is built up in stages. The client is a TCP connection with optional TLS 
 speaks the consensus protocol, signs in, keeps the session alive with a heartbeat,
 reconnects, and follows the cluster leader. It manages streams, topics, partitions,
 segments, users, personal access tokens, and consumer groups, sends and polls messages,
-and stores consumer offsets. The producer and consumer, examples, and BDD scenarios
-follow in later changes.
+stores consumer offsets, and produces with a batching producer. The consumer, examples,
+and BDD scenarios follow in later changes.
 
 Swift supports the consensus wire protocol and checks commitment proof during
 automatic retries. It does not yet expose retained-operation resolve/abandon APIs,
@@ -29,8 +29,9 @@ and other native SDKs are outside the current Swift implementation.
 - An Iggy server that speaks the consensus protocol (`iggy-server` from this repository)
 
 The SDK depends on [SwiftNIO](https://github.com/apple/swift-nio),
-[swift-nio-ssl](https://github.com/apple/swift-nio-ssl), and
-[swift-log](https://github.com/apple/swift-log).
+[swift-nio-ssl](https://github.com/apple/swift-nio-ssl),
+[swift-log](https://github.com/apple/swift-log), and
+[swift-crypto](https://github.com/apple/swift-crypto) for the SHA-256 behind stream key fingerprints.
 
 ## Installation
 
@@ -41,7 +42,7 @@ package mirror, which carries every release as a `v<version>` tag:
 ```swift
 // Package.swift
 dependencies: [
-    .package(url: "https://github.com/apache/iggy-swift.git", from: "0.1.0")
+    .package(url: "https://github.com/apache/iggy-swift.git", from: "0.1.1")
 ],
 targets: [
     .target(name: "MyApp", dependencies: [.product(name: "Iggy", package: "iggy-swift")])
@@ -93,6 +94,36 @@ let client = IggyClient(configuration: configuration)
 
 The server certificate is verified against the system roots, or against `caFile` when
 set, and against the host of the address unless `TLSOptions.domain` names another one.
+
+### Resource options
+
+Streams, topics, and users carry options. A create call takes a typed options value, and an update names only the keys it changes, plus the keys to return to their defaults. Every other key keeps its stored value:
+
+```swift
+let key = try EncryptionKey.decode(base64: base64Key)
+let stream = try await client.createStream(name: "payments", options: StreamCreateOptions(encryptionKey: key))
+let topic = try await client.createTopic(
+    streamID: "payments", name: "orders",
+    options: TopicCreateOptions(partitionsCount: 3, messageExpiry: .after(.seconds(604_800)), partitionResizePolicy: .fixed))
+try await client.updateStream("payments", options: StreamUpdateOptions(name: "payments-v2"))
+try await client.updateTopic(
+    streamID: "payments-v2", topicID: "orders", options: TopicUpdateOptions(messageExpiry: .after(.seconds(86_400)), reset: [.maxTopicSize]))
+try await client.updateUser("alice", options: UserUpdateOptions(status: .inactive))
+```
+
+Only `message_expiry` and `max_topic_size` can be reset. Compression and the other topic settings are fixed at create, and no stream or user key is resettable yet. A typed update that breaks these rules fails before anything is sent, with the error the server would return.
+
+Everything else, such as a taken name or a missing resource, is refused by the server. `describeOptions(scope:)` lists every key of a scope with flags saying what an update may do with it. Renaming the signed-in user, through `username` or a raw `username` entry, moves the credentials later reconnects use.
+
+Keys this SDK has no typed member for go in `raw`, values as strings the server parses, and reset names in `rawReset`. The server alone decides on a patch that carries either, since it may know keys this SDK does not:
+
+```swift
+try await client.updateTopic(streamID: "payments-v2", topicID: "orders", options: TopicUpdateOptions(rawReset: ["future_retention"]))
+```
+
+`StreamCreateOptions.encryptionKey` gives the stream its own data key. It must be 32 random bytes, never derived from a password. It travels inside the create request over whatever transport the client uses, so protecting it in transit with TLS is the caller's choice.
+
+The server stores it wrapped and never returns it: reads report `encryptionKeySource`, `encryptionKeyFingerprint`, and `encryptionKekFingerprints`, and `EncryptionKey.fingerprint(_:)` computes the fingerprint of a key to compare. Without a key, a server with encryption enabled generates one for the stream.
 
 ### Reconnection
 
@@ -185,11 +216,60 @@ group poll fails with `consumerGroupMemberNotFound` until it does. In a cluster,
 and offset writes go to the partition's primary over a second connection bound to the
 same session.
 
+### Producer
+
+`IggyProducer` appends to one topic. `initialize()` creates the stream and topic when
+they are named and missing, then a send either writes from the calling task (`direct`,
+the default) or queues the batch for a background worker (`background`):
+
+```swift
+let producer = try client.producer(streamID: "orders", topicID: "created")
+try await producer.initialize()
+let response = try await producer.send(["placed", "paid"])
+
+let background = try client.producer(
+    streamID: "orders", topicID: "created",
+    configuration: ProducerConfiguration(mode: .background(BackgroundSendOptions(lingerTime: .milliseconds(5)))))
+try await background.initialize()
+try await background.send(["queued"])
+await background.shutdown()
+```
+
+A direct send splits a batch into requests of at most `batchLength` messages, each
+within the server's 64 MiB frame limit, and returns their confirmations; a failure,
+cancellation included, throws `ProducerSendError` with the confirmations so far and the
+unconfirmed tail. A background send returns once queued and reports write failures to
+`errorHandler`; `shutdown()` writes what is still buffered, and the producer is closed
+by then, so a resend from `errorHandler` during that final flush fails with
+`producerClosed`.
+
+The producer retries only a request the server refused to admit or that found no
+connection, since a retry is a new request: anything that may have committed, such as
+`transientNotCommitted` or `disconnected`, is left to the caller, and the server does
+not deduplicate a resend. Resend a failed tail only when its `cause` proves the first
+request never committed; `ProducerSendError` lists those causes. The Rust producer has
+since handed these retries to its client's operation lanes, which the Swift client does
+not have yet.
+
+A send belongs to the session it started in. Once the caller signs in or out, what it
+has not written yet, a background batch still queued, or a retry still waiting, fails
+with `unauthenticated` instead of going under the new session, and a queued batch is
+never merged with one from another session.
+
+With the default ordered sharding, the sends to one stream and topic identifier are
+written in order. A topic addressed by name and by numeric id counts as two, and a
+failed request does not hold back the ones after it, so a resend from `errorHandler`
+lands behind them.
+
 ### Errors
 
-Every operation throws `IggyError`, a value carrying the typed `code`
+Every client operation throws `IggyError`, a value carrying the typed `code`
 (`IggyErrorCode`, one case per server error code), the raw wire code, and optional
-context. A cancelled task gets `CancellationError`:
+context. A cancelled task gets `CancellationError`. A direct producer send is the
+exception: a failure while sending, cancellation included, throws `ProducerSendError`,
+carrying the `IggyError` as `cause`, the confirmations so far, and the unconfirmed
+`failed` tail. A send refused before it starts, such as with `producerClosed` after
+`shutdown()`, throws a plain `IggyError`:
 
 ```swift
 func handle(_ error: IggyError) {
@@ -240,8 +320,12 @@ skips when that variable is unset. Start one from the repository root:
 
 ```bash
 cargo build --bin iggy-server
-IGGY_PATH=/tmp/iggy-swift IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy target/debug/iggy-server
+IGGY_PATH=/tmp/iggy-swift IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy \
+IGGY_ENCRYPTION_ENABLED=true IGGY_ENCRYPTION_KEY=/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE= \
+target/debug/iggy-server
 ```
+
+The resource options scenarios need encryption enabled, so a stream created without a key gets one the server generates.
 
 Then, from `foreign/swift`:
 
@@ -259,6 +343,8 @@ The hash, error-code, model, request, reply, and consensus header tests compare 
 ```bash
 cargo run --manifest-path Tools/golden-vectors/Cargo.toml -- Tests/IggyTests/Fixtures/golden.json
 ```
+
+The resource options tests compare against `Tests/IggyTests/Fixtures/resource_options.json`, the fixture every SDK shares, generated by `core/common/examples/resource_options_fixtures.rs`. Never edit the copy.
 
 ## Contributing
 

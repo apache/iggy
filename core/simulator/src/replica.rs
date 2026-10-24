@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::bus::{SharedSimOutbox, SimOutbox};
+use crate::client::SIM_STREAM_KEK;
 use crate::deps::SimSuperblock;
 use crate::deps::{MemStorage, SimJournal, SimMuxStateMachine, SimSnapshot};
 use configs::server::PersonalAccessTokenConfig;
@@ -24,8 +25,8 @@ use consensus::{
     ClientTable, ConsensusClock, HistoryRecovery, LocalPipeline, Sequencer, VsrConsensus, VsrState,
 };
 use futures::FutureExt;
-use iggy_common::IggyByteSize;
 use iggy_common::variadic;
+use iggy_common::{IggyByteSize, ServerKeyContext};
 use journal::Journal;
 use message_bus::MessageBus;
 use metadata::impls::metadata::IggySnapshot;
@@ -161,7 +162,11 @@ pub fn new_shard(
     incarnation: u128,
     data_dir: Option<std::path::PathBuf>,
     system_path: &std::path::Path,
-    seed_namespaces: &[(server_common::sharding::IggyNamespace, u32)],
+    seed_namespaces: &[(
+        server_common::sharding::IggyNamespace,
+        u32,
+        iggy_common::Durability,
+    )],
     applied_frontier: Arc<AppliedFrontier>,
 ) -> (
     Rc<Replica>,
@@ -386,8 +391,13 @@ pub fn new_shard(
     // seeding again would bring back a fixture topic a committed delete removed.
     if shard_idx == 0 && !has_checkpoint {
         let streams = metadata.mux_stm.streams();
-        for &(namespace, created_view) in seed_namespaces {
-            streams.seed_namespace(namespace, namespace.inner(), created_view);
+        for &(namespace, created_view, durability) in seed_namespaces {
+            streams.seed_namespace_with_durability(
+                namespace,
+                namespace.inner(),
+                created_view,
+                durability,
+            );
         }
     }
 
@@ -438,7 +448,12 @@ pub fn new_shard(
         validate_checksum: true,
         segment_size: IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
         preallocate_segments: false,
-        encryptor: None,
+        // Opens the fixed wrap set keyed creates carry, so metadata admits them.
+        // Partitions stay plaintext: the simulator never resolves an encryptor.
+        key_context: Arc::new(
+            ServerKeyContext::from_config(SIM_STREAM_KEK, &[], false)
+                .expect("the simulator key-encryption key is valid"),
+        ),
         path_layout: PartitionPathLayout::default(),
     };
 

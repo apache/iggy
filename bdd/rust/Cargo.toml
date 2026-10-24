@@ -60,5 +60,15 @@ name = "stream_crud"
 harness = false
 required-features = ["bdd"]
 
+[[test]]
+name = "stream_options"
+harness = false
+required-features = ["bdd"]
+
+[[test]]
+name = "resource_options_patch"
+harness = false
+required-features = ["bdd"]
+
 [lints]
 workspace = true

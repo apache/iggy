@@ -28,11 +28,12 @@ use bytes::{BufMut, BytesMut};
 /// Wire format (13 + `username_len` + options bytes):
 /// ```text
 /// [id:4][created_at:8][status:1][username_len:1][username:N]
-/// [options_len:4][options TLV]
+/// [explicit_options_len:4][explicit options TLV]
+/// [derived_options_len:4][derived options TLV]
 /// ```
 ///
-/// Users have no server-derived options (no catalog keys resolve against
-/// config yet), so a single client-explicit block suffices.
+/// `options` are the keys the client set, `derived_options` the values the
+/// server filled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserResponse {
     pub id: u32,
@@ -40,6 +41,7 @@ pub struct UserResponse {
     pub status: u8,
     pub username: WireName,
     pub options: WireOptions,
+    pub derived_options: WireOptions,
 }
 
 impl UserResponse {
@@ -48,7 +50,10 @@ impl UserResponse {
 
 impl WireEncode for UserResponse {
     fn encoded_size(&self) -> usize {
-        Self::FIXED_SIZE + self.username.encoded_size() + options_prefixed_size(&self.options)
+        Self::FIXED_SIZE
+            + self.username.encoded_size()
+            + options_prefixed_size(&self.options)
+            + options_prefixed_size(&self.derived_options)
     }
 
     fn encode(&self, buf: &mut BytesMut) {
@@ -57,6 +62,7 @@ impl WireEncode for UserResponse {
         buf.put_u8(self.status);
         self.username.encode(buf);
         encode_options_prefixed(&self.options, buf);
+        encode_options_prefixed(&self.derived_options, buf);
     }
 }
 
@@ -69,6 +75,8 @@ impl WireDecode for UserResponse {
         let mut consumed = 13 + name_consumed;
         let (options, options_consumed) = decode_options_prefixed(buf, consumed)?;
         consumed += options_consumed;
+        let (derived_options, derived_consumed) = decode_options_prefixed(buf, consumed)?;
+        consumed += derived_consumed;
 
         Ok((
             Self {
@@ -77,6 +85,7 @@ impl WireDecode for UserResponse {
                 status,
                 username,
                 options,
+                derived_options,
             },
             consumed,
         ))
@@ -94,6 +103,7 @@ mod tests {
             status: 1,
             username: WireName::new("admin").unwrap(),
             options: WireOptions::empty(),
+            derived_options: WireOptions::empty(),
         }
     }
 
@@ -101,7 +111,7 @@ mod tests {
     fn roundtrip() {
         let resp = sample();
         let bytes = resp.to_bytes();
-        assert_eq!(bytes.len(), UserResponse::FIXED_SIZE + 1 + 5 + 4);
+        assert_eq!(bytes.len(), UserResponse::FIXED_SIZE + 1 + 5 + 4 + 4);
         let (decoded, consumed) = UserResponse::decode(&bytes).unwrap();
         assert_eq!(consumed, bytes.len());
         assert_eq!(decoded, resp);

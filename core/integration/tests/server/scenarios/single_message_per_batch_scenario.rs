@@ -45,7 +45,10 @@ pub async fn run(harness: &TestHarness, duration_secs: u64) {
         .await
         .expect("Failed to get root client");
 
-    producer.create_stream(STREAM_NAME).await.unwrap();
+    producer
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     producer
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),

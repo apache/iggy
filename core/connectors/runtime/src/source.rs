@@ -18,6 +18,7 @@
 use dashmap::DashMap;
 use dlopen2::wrapper::Container;
 use flume::{Receiver, Sender};
+use iggy::prelude::StreamCreateOptions;
 use iggy::prelude::{
     Client, DirectConfig, HeaderKey, HeaderValue, Identifier, IggyClient, IggyDuration, IggyError,
     IggyMessage, StreamClient, TopicClient, TopicCreateOptions,
@@ -516,7 +517,9 @@ async fn ensure_durable_source_topic(
 ) -> Result<(), RuntimeError> {
     let stream_id = Identifier::named(stream_name)?;
     if client.get_stream(&stream_id).await?.is_none() {
-        client.create_stream(stream_name).await?;
+        client
+            .create_stream(stream_name, &StreamCreateOptions::default())
+            .await?;
     }
 
     let topic_id = Identifier::named(topic_name)?;

@@ -37,10 +37,14 @@ cargo build
 cargo php stubs target/debug/libiggy_php.so -o /tmp/iggy-php.stubs.php
 ```
 
-Stub generation requires a debug build. On macOS, use `libiggy_php.dylib`.
-Preserve the existing Apache license header when updating `iggy-php.stubs.php`.
-The CI lint job regenerates this file and fails if the checked-in stubs drift
-from the Rust signatures.
+Stub generation requires a debug build and cargo-php 0.2.1, the version CI installs. Older
+cargo-php releases cannot load the extension. On macOS, use `libiggy_php.dylib`.
+The checked-in `iggy-php.stubs.php` is the generated file with the Apache license header
+in place of its first line and the `= null` default removed from every `public readonly
+?string` property, which PHP refuses on readonly properties. The CI lint job
+(`.github/actions/php/pre-merge/action.yml`) applies the same post-processing and fails
+if the checked-in stubs drift from the Rust signatures, so copy its commands when
+regenerating locally.
 
 ## Install
 
@@ -203,6 +207,36 @@ TLS connection strings use the Rust SDK connection-string format, for example:
 ```text
 iggy+tcp://iggy:iggy@127.0.0.1:8090?tls=true&tls_domain=localhost&tls_ca_file=/path/to/ca.pem
 ```
+
+## Resource Options
+
+Streams and topics carry options. A read returns two arrays of option name to value: `options` holds what the creating or updating client set, `derived_options` what the server filled in. Integers above `PHP_INT_MAX`, such as the never-expire and unlimited value 18446744073709551615, are decimal strings, and the 64-bit topic arguments take an int or a decimal string.
+
+```php
+$client->createStream('orders', base64_encode(random_bytes(32)));
+$stream = $client->getStream('orders');
+echo $stream->encryption_key_source, ' ', $stream->encryption_key_fingerprint, PHP_EOL;
+
+$client->createTopic('orders', 'events', 1, 'gzip', 3_600_000_000, null, null,
+    partition_resize_policy: 'fixed');
+$client->updateTopic('orders', 'events', message_expiry_micros: '18446744073709551615',
+    reset: [Iggy\TopicOptionKey::MaxTopicSize]);
+print_r($client->getTopic('orders', 'events')->options);
+
+foreach ($client->describeOptions(Iggy\OptionsScope::Topic) as $spec) {
+    echo $spec->key, $spec->updatable ? ' updatable' : '', $spec->resettable ? ' resettable' : '', PHP_EOL;
+}
+```
+
+- The stream encryption key is the stream's own data key: 32 random bytes, passed as canonical padded standard base64. Raw bytes or any other text are refused as `Invalid encryption key` (code 70) before anything is sent. The key travels in the create request, so protecting it in transit with TLS is the caller's job. The server stores it wrapped and never returns it.
+
+  The key, the `loginUser()` password and the `fromConnectionString()` string are marked `#[\SensitiveParameter]`, so exception traces hold a `SensitiveParameterValue` in their place. The `raw` arrays of `createStream()`, `updateStream()`, `createTopic()` and `updateTopic()` are marked as well, because an unknown key may hold a secret.
+
+  Reads report only `encryption_key_source` (`stream`, `server`, or `none` for a plaintext stream), `encryption_key_fingerprint` and `encryption_kek_fingerprint`, comma-separated during a server key rotation. `Iggy\Client::encryptionKeyFingerprint($key)` computes the fingerprint of a key you hold. Without a key, a server with encryption enabled generates one.
+- `updateStream()` renames a stream and `updateTopic()` renames a topic or changes `message_expiry_micros` and `max_topic_size`. Null arguments keep stored values. `reset` takes `Iggy\StreamOptionKey` or `Iggy\TopicOptionKey` cases and returns keys to their server defaults. Only the topic's message expiry and size cap are resettable, every other case is refused with the server's error.
+- `raw` on create and update sends string-valued keys this build does not know, and `raw_reset` resets keys by name. The server decides whether each one is accepted. A name listed twice across `reset` and `raw_reset` is refused as `Invalid command`.
+- `describeOptions(Iggy\OptionsScope)` returns the server catalog as `Iggy\OptionSpec` objects with `key`, `kind`, `updatable`, `resettable`, `secret`, `read_only`, `critical`, `default_value` and `description`.
+- SDK exceptions carry the server error code in `getCode()`, for example 4103 (option cannot be updated), 4104 (option cannot be reset), 4105 (read-only option), 4108 (root user cannot be changed by this caller) and 4041 (unsupported option key).
 
 ## API Notes
 

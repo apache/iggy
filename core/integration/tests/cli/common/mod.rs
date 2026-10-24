@@ -145,6 +145,18 @@ impl IggyCmdTest {
         }
     }
 
+    pub(crate) fn with_server(config: TestServerConfig) -> Self {
+        let harness = TestHarnessBuilder::default()
+            .server(config)
+            .build()
+            .unwrap();
+
+        Self {
+            harness,
+            start_server: true,
+        }
+    }
+
     pub(crate) fn help_message() -> Self {
         Self::new(false)
     }

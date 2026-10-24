@@ -28,6 +28,7 @@ pub const GET_CLUSTER_METADATA_CODE: u32 = 12;
 pub const DESCRIBE_OPTIONS_CODE: u32 = 13;
 // Code 14 is retired.
 pub const BIND_SESSION_CODE: u32 = 15;
+pub const UPDATE_RESOURCE_CODE: u32 = 16;
 pub const GET_ME_CODE: u32 = 20;
 pub const GET_CLIENT_CODE: u32 = 21;
 pub const GET_CLIENTS_CODE: u32 = 22;
@@ -37,7 +38,6 @@ pub const GET_USER_CODE: u32 = 31;
 pub const GET_USERS_CODE: u32 = 32;
 pub const CREATE_USER_CODE: u32 = 33;
 pub const DELETE_USER_CODE: u32 = 34;
-pub const UPDATE_USER_CODE: u32 = 35;
 pub const UPDATE_PERMISSIONS_CODE: u32 = 36;
 pub const CHANGE_PASSWORD_CODE: u32 = 37;
 pub const LOGIN_USER_CODE: u32 = 38;
@@ -73,7 +73,6 @@ pub const GET_STREAM_CODE: u32 = 200;
 pub const GET_STREAMS_CODE: u32 = 201;
 pub const CREATE_STREAM_CODE: u32 = 202;
 pub const DELETE_STREAM_CODE: u32 = 203;
-pub const UPDATE_STREAM_CODE: u32 = 204;
 // 205 was PURGE_STREAM. Never reuse it.
 
 // -- Topics --
@@ -81,7 +80,6 @@ pub const GET_TOPIC_CODE: u32 = 300;
 pub const GET_TOPICS_CODE: u32 = 301;
 pub const CREATE_TOPIC_CODE: u32 = 302;
 pub const DELETE_TOPIC_CODE: u32 = 303;
-pub const UPDATE_TOPIC_CODE: u32 = 304;
 // 305 was PURGE_TOPIC. Never reuse it.
 
 // -- Partitions --
@@ -115,7 +113,7 @@ pub const fn command_name(code: u32) -> Result<&'static str, WireError> {
 mod tests {
     use super::*;
 
-    const RETIRED_CODES: &[u32] = &[14, 102, 103, 104, 123, 124, 205, 305];
+    const RETIRED_CODES: &[u32] = &[14, 35, 102, 103, 104, 123, 124, 204, 205, 304, 305];
 
     const ALL_CODES: &[u32] = &[
         PING_CODE,
@@ -124,6 +122,7 @@ mod tests {
         GET_CLUSTER_METADATA_CODE,
         DESCRIBE_OPTIONS_CODE,
         BIND_SESSION_CODE,
+        UPDATE_RESOURCE_CODE,
         GET_ME_CODE,
         GET_CLIENT_CODE,
         GET_CLIENTS_CODE,
@@ -131,7 +130,6 @@ mod tests {
         GET_USERS_CODE,
         CREATE_USER_CODE,
         DELETE_USER_CODE,
-        UPDATE_USER_CODE,
         UPDATE_PERMISSIONS_CODE,
         CHANGE_PASSWORD_CODE,
         LOGIN_USER_CODE,
@@ -152,12 +150,10 @@ mod tests {
         GET_STREAMS_CODE,
         CREATE_STREAM_CODE,
         DELETE_STREAM_CODE,
-        UPDATE_STREAM_CODE,
         GET_TOPIC_CODE,
         GET_TOPICS_CODE,
         CREATE_TOPIC_CODE,
         DELETE_TOPIC_CODE,
-        UPDATE_TOPIC_CODE,
         CREATE_PARTITIONS_CODE,
         DELETE_PARTITIONS_CODE,
         DELETE_SEGMENTS_CODE,

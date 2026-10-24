@@ -46,7 +46,7 @@ WHEN("^I create a stream with name \"([^\"]{1,255})\"$") {
     REGEX_PARAM(std::string, name);
     cucumber::ScenarioScope<bdd::GlobalContext> context;
 
-    context->client->create_stream(name, error_info);
+    context->client->create_stream(name, {}, error_info);
 }
 
 THEN("^the stream should be created successfully$") {

@@ -16,28 +16,94 @@
 // under the License.
 
 use iggy::prelude::*;
-use iggy_common::{OptionsScope, TOPIC_OPTION_KEYS, topic_option_keys};
+use iggy_common::{OptionsScope, descriptors_for, topic_option_keys};
 use integration::harness::{backup_commit_budget, wait_for_topic};
 use integration::iggy_harness;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
+
+#[iggy_harness(test_client_transport = [Tcp, Http])]
+async fn given_manage_users_caller_when_updating_root_should_return_4108_and_keep_root_active(
+    harness: &TestHarness,
+) {
+    let root = harness.root_client().await.expect("root client");
+    let root_id = Identifier::numeric(0).expect("root id");
+    root.create_user(
+        "manager",
+        "secret123",
+        UserStatus::Active,
+        Some(Permissions {
+            global: GlobalPermissions {
+                manage_users: true,
+                ..GlobalPermissions::default()
+            },
+            streams: None,
+        }),
+        &UserCreateOptions::default(),
+    )
+    .await
+    .expect("create manager");
+    let manager = harness.new_client().await.expect("manager client");
+    manager
+        .login_user("manager", "secret123")
+        .await
+        .expect("manager login");
+
+    for patch in [
+        UserUpdateOptions {
+            username: Some("root-renamed".to_owned()),
+            ..UserUpdateOptions::default()
+        },
+        UserUpdateOptions {
+            status: Some(UserStatus::Inactive),
+            ..UserUpdateOptions::default()
+        },
+    ] {
+        let error = manager
+            .update_user(&root_id, &patch)
+            .await
+            .expect_err("manager cannot rename or deactivate root");
+        assert_policy_error(error, IggyError::CannotModifyRootUser);
+    }
+
+    let unchanged = root
+        .get_user(&root_id)
+        .await
+        .expect("read root")
+        .expect("root exists");
+    assert_eq!(unchanged.username, "iggy");
+    assert_eq!(unchanged.status, UserStatus::Active);
+}
 
 #[iggy_harness]
 async fn given_topic_scope_when_describing_options_should_list_the_catalog(harness: &TestHarness) {
     let client = harness.root_client().await.unwrap();
     let specs = client.describe_options(OptionsScope::Topic).await.unwrap();
-    let mut served: Vec<&str> = specs.iter().map(|spec| spec.key.as_str()).collect();
-    served.sort_unstable();
-    let mut accepted: Vec<&str> = TOPIC_OPTION_KEYS.to_vec();
-    accepted.sort_unstable();
+    let served: BTreeSet<&str> = specs.iter().map(|spec| spec.key.as_str()).collect();
+    let catalog: BTreeSet<String> = descriptors_for(OptionsScope::Topic)
+        .filter(|descriptor| descriptor.is_described())
+        .map(|descriptor| descriptor.key.to_string())
+        .collect();
     // Exact equality, not per-key contains: the catalog is the only way a
-    // client discovers a key, and create rejects anything outside it, so a key
-    // accepted but unlisted is undiscoverable and one listed but unaccepted is
-    // a lie.
-    assert_eq!(served, accepted, "catalog must match the accepted key set");
-    // `partitions_count` is deliberately absent: it is a fixed field of the
-    // CreateTopic command, not a topic setting.
-    assert!(!served.contains(&"partitions_count"));
+    // client discovers a key, so a key accepted but unlisted is undiscoverable
+    // and one listed but unaccepted is a lie.
+    assert_eq!(
+        served,
+        catalog.iter().map(String::as_str).collect::<BTreeSet<_>>()
+    );
+    // `partitions_count` is a fixed field of the CreateTopic command, not a
+    // topic setting, and internal bookkeeping keys are never described.
+    assert!(!served.contains("partitions_count"));
+    assert!(!served.contains("critical_keys"));
+    let flags = |key: &str| {
+        let spec = specs.iter().find(|spec| spec.key == key).unwrap();
+        (spec.updatable, spec.resettable, spec.secret, spec.read_only)
+    };
+    assert_eq!(flags("name"), (true, false, false, false));
+    assert_eq!(flags("message_expiry"), (true, true, false, false));
+    assert_eq!(flags("max_topic_size"), (true, true, false, false));
+    assert_eq!(flags("compression_algorithm"), (false, false, false, false));
+    assert_eq!(flags("segment_size"), (false, false, false, false));
 }
 
 #[iggy_harness]
@@ -45,7 +111,10 @@ async fn given_runtime_knobs_when_creating_topic_should_persist_them_per_topic(
     harness: &TestHarness,
 ) {
     let client = harness.root_client().await.unwrap();
-    client.create_stream("knob-stream").await.unwrap();
+    client
+        .create_stream("knob-stream", &StreamCreateOptions::default())
+        .await
+        .unwrap();
     let stream = Identifier::named("knob-stream").unwrap();
 
     // Zero is rejected: a flush threshold of zero never trips.
@@ -133,16 +202,40 @@ async fn given_runtime_knobs_when_creating_topic_should_persist_them_per_topic(
 }
 
 #[iggy_harness]
-async fn given_stream_scope_when_describing_options_should_be_empty(harness: &TestHarness) {
+async fn given_stream_and_user_scopes_when_describing_options_should_report_mutability(
+    harness: &TestHarness,
+) {
     let client = harness.root_client().await.unwrap();
-    let specs = client.describe_options(OptionsScope::Stream).await.unwrap();
-    assert!(specs.is_empty(), "streams have no catalog keys yet");
+    for scope in [OptionsScope::Stream, OptionsScope::User] {
+        let specs = client.describe_options(scope).await.unwrap();
+        let served: BTreeSet<String> = specs.iter().map(|spec| spec.key.clone()).collect();
+        let catalog: BTreeSet<String> = descriptors_for(scope)
+            .filter(|descriptor| descriptor.is_described())
+            .map(|descriptor| descriptor.key.to_string())
+            .collect();
+        assert_eq!(served, catalog, "{scope}");
+    }
+    let stream_specs = client.describe_options(OptionsScope::Stream).await.unwrap();
+    let flags = |key: &str| {
+        let spec = stream_specs.iter().find(|spec| spec.key == key).unwrap();
+        (spec.updatable, spec.resettable, spec.secret, spec.read_only)
+    };
+    assert_eq!(flags("name"), (true, false, false, false));
+    assert_eq!(flags("encryption_key"), (false, false, true, false));
+    assert_eq!(flags("encryption_key_source"), (false, false, false, true));
+    assert_eq!(
+        flags("encryption_key_fingerprint"),
+        (false, false, false, true)
+    );
 }
 
 #[iggy_harness]
 async fn given_explicit_segment_size_when_creating_topic_should_roll_at_it(harness: &TestHarness) {
     let client = harness.root_client().await.unwrap();
-    client.create_stream("seg-stream").await.unwrap();
+    client
+        .create_stream("seg-stream", &StreamCreateOptions::default())
+        .await
+        .unwrap();
     let stream = Identifier::named("seg-stream").unwrap();
 
     // Below the floor: denied with the key name before consensus.
@@ -228,7 +321,10 @@ async fn given_explicit_segment_size_when_creating_topic_should_roll_at_it(harne
 #[iggy_harness]
 async fn given_explicit_expiry_when_creating_topic_should_echo_provenance(harness: &TestHarness) {
     let client = harness.root_client().await.unwrap();
-    client.create_stream("options-stream").await.unwrap();
+    client
+        .create_stream("options-stream", &StreamCreateOptions::default())
+        .await
+        .unwrap();
     client
         .create_topic(
             &Identifier::named("options-stream").unwrap(),
@@ -275,7 +371,10 @@ async fn given_explicit_expiry_when_creating_topic_should_echo_provenance(harnes
 #[iggy_harness]
 async fn given_update_options_when_updating_topic_should_patch_not_replace(harness: &TestHarness) {
     let client = harness.root_client().await.unwrap();
-    client.create_stream("update-stream").await.unwrap();
+    client
+        .create_stream("update-stream", &StreamCreateOptions::default())
+        .await
+        .unwrap();
     let stream = Identifier::named("update-stream").unwrap();
     let topic = Identifier::named("update-topic").unwrap();
 
@@ -299,8 +398,8 @@ async fn given_update_options_when_updating_topic_should_patch_not_replace(harne
         .update_topic(
             &stream,
             &topic,
-            "update-topic",
             &TopicUpdateOptions {
+                name: Some("update-topic".to_owned()),
                 raw: BTreeMap::from([(
                     topic_option_keys::SEGMENT_SIZE.to_string(),
                     "2MiB".to_string(),
@@ -315,8 +414,10 @@ async fn given_update_options_when_updating_topic_should_patch_not_replace(harne
         .update_topic(
             &stream,
             &topic,
-            "update-topic",
-            &TopicUpdateOptions::default(),
+            &TopicUpdateOptions {
+                name: Some("update-topic".to_owned()),
+                ..TopicUpdateOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -352,17 +453,20 @@ async fn given_update_options_when_updating_topic_should_patch_not_replace(harne
 #[iggy_harness]
 async fn given_unknown_key_when_updating_stream_or_user_should_reject(harness: &TestHarness) {
     let client = harness.root_client().await.unwrap();
-    client.create_stream("opt-stream").await.unwrap();
+    client
+        .create_stream("opt-stream", &StreamCreateOptions::default())
+        .await
+        .unwrap();
 
-    // Streams and users have no catalog keys yet, so the update blocks exist
-    // as the extension point and reject every key by name rather than storing
-    // one nothing reads.
+    // A key outside the catalog is refused by name rather than stored where
+    // nothing reads it.
     let stream_rejected = client
         .update_stream(
             &Identifier::named("opt-stream").unwrap(),
-            "opt-stream",
             &StreamUpdateOptions {
+                name: Some("opt-stream".to_owned()),
                 raw: BTreeMap::from([("future_key".to_string(), "1".to_string())]),
+                ..StreamUpdateOptions::default()
             },
         )
         .await;
@@ -372,24 +476,32 @@ async fn given_unknown_key_when_updating_stream_or_user_should_reject(harness: &
     client
         .update_stream(
             &Identifier::named("opt-stream").unwrap(),
-            "opt-stream-renamed",
-            &StreamUpdateOptions::default(),
+            &StreamUpdateOptions {
+                name: Some("opt-stream-renamed".to_owned()),
+                ..StreamUpdateOptions::default()
+            },
         )
         .await
         .unwrap();
 
     client
-        .create_user("opt-user", "secret123", UserStatus::Active, None)
+        .create_user(
+            "opt-user",
+            "secret123",
+            UserStatus::Active,
+            None,
+            &UserCreateOptions::default(),
+        )
         .await
         .unwrap();
     let user = Identifier::named("opt-user").unwrap();
     let user_rejected = client
         .update_user(
             &user,
-            Some("opt-user"),
-            None,
             &UserUpdateOptions {
+                username: Some("opt-user".to_owned()),
                 raw: BTreeMap::from([("future_key".to_string(), "1".to_string())]),
+                ..UserUpdateOptions::default()
             },
         )
         .await;
@@ -398,9 +510,10 @@ async fn given_unknown_key_when_updating_stream_or_user_should_reject(harness: &
     client
         .update_user(
             &user,
-            Some("opt-user-renamed"),
-            None,
-            &UserUpdateOptions::default(),
+            &UserUpdateOptions {
+                username: Some("opt-user-renamed".to_owned()),
+                ..UserUpdateOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -411,7 +524,10 @@ async fn given_sentinel_zeros_when_creating_topic_should_report_resolved_default
     harness: &TestHarness,
 ) {
     let client = harness.root_client().await.unwrap();
-    client.create_stream("sentinel-stream").await.unwrap();
+    client
+        .create_stream("sentinel-stream", &StreamCreateOptions::default())
+        .await
+        .unwrap();
     let stream = Identifier::named("sentinel-stream").unwrap();
 
     // 0 means "resolve the server default", not "expire immediately" / "no
@@ -463,7 +579,10 @@ async fn given_sentinel_zeros_when_creating_topic_should_report_resolved_default
 #[iggy_harness]
 async fn given_rename_only_when_updating_topic_should_leave_settings_alone(harness: &TestHarness) {
     let client = harness.root_client().await.unwrap();
-    client.create_stream("patch-stream").await.unwrap();
+    client
+        .create_stream("patch-stream", &StreamCreateOptions::default())
+        .await
+        .unwrap();
     let stream = Identifier::named("patch-stream").unwrap();
 
     client
@@ -489,8 +608,10 @@ async fn given_rename_only_when_updating_topic_should_leave_settings_alone(harne
         .update_topic(
             &stream,
             &topic,
-            "patch-renamed",
-            &TopicUpdateOptions::default(),
+            &TopicUpdateOptions {
+                name: Some("patch-renamed".to_owned()),
+                ..TopicUpdateOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -501,16 +622,22 @@ async fn given_rename_only_when_updating_topic_should_leave_settings_alone(harne
         .unwrap()
         .expect("topic exists");
     assert_eq!(details.name, "patch-renamed");
-    assert_eq!(details.compression_algorithm, CompressionAlgorithm::Gzip);
-    assert_eq!(details.message_expiry, IggyExpiry::from(5_000_000u64));
+    assert_eq!(
+        details.resolved_options().compression_algorithm,
+        CompressionAlgorithm::Gzip
+    );
+    assert_eq!(
+        details.resolved_options().message_expiry,
+        IggyExpiry::from(5_000_000u64)
+    );
 
     // Sending one key changes that key and leaves the other alone.
     client
         .update_topic(
             &stream,
             &Identifier::named("patch-renamed").unwrap(),
-            "patch-renamed",
             &TopicUpdateOptions {
+                name: Some("patch-renamed".to_owned()),
                 message_expiry: Some(IggyExpiry::from(9_000_000u64)),
                 ..TopicUpdateOptions::default()
             },
@@ -523,9 +650,12 @@ async fn given_rename_only_when_updating_topic_should_leave_settings_alone(harne
         .await
         .unwrap()
         .expect("topic exists");
-    assert_eq!(details.message_expiry, IggyExpiry::from(9_000_000u64));
     assert_eq!(
-        details.compression_algorithm,
+        details.resolved_options().message_expiry,
+        IggyExpiry::from(9_000_000u64)
+    );
+    assert_eq!(
+        details.resolved_options().compression_algorithm,
         CompressionAlgorithm::Gzip,
         "a key the update did not carry keeps its value"
     );
@@ -536,7 +666,10 @@ async fn given_resize_policy_when_resizing_should_enforce_the_immutable_partitio
     harness: &TestHarness,
 ) {
     let client = harness.root_client().await.unwrap();
-    client.create_stream("resize-stream").await.unwrap();
+    client
+        .create_stream("resize-stream", &StreamCreateOptions::default())
+        .await
+        .unwrap();
     let stream = Identifier::named("resize-stream").unwrap();
     let policy_key = HeaderKey::from_str(topic_option_keys::PARTITION_RESIZE_POLICY).unwrap();
 
@@ -599,8 +732,8 @@ async fn given_resize_policy_when_resizing_should_enforce_the_immutable_partitio
             .update_topic(
                 &stream,
                 &topic,
-                "renamed",
                 &TopicUpdateOptions {
+                    name: Some("renamed".to_owned()),
                     raw: BTreeMap::from([(
                         topic_option_keys::PARTITION_RESIZE_POLICY.to_owned(),
                         replacement.to_owned(),
@@ -611,7 +744,7 @@ async fn given_resize_policy_when_resizing_should_enforce_the_immutable_partitio
             .await;
         assert_policy_error(
             updated.unwrap_err(),
-            IggyError::UnsupportedOptionKey(String::new()),
+            IggyError::OptionNotUpdatable(String::new()),
         );
         let details = client.get_topic(&stream, &topic).await.unwrap().unwrap();
         assert_eq!(details.name, name);
@@ -632,4 +765,156 @@ fn assert_policy_error(error: IggyError, expected: IggyError) {
     } else {
         assert_eq!(error.as_code(), expected.as_code(), "{error:?}");
     }
+}
+
+#[iggy_harness(test_client_transport = [Tcp, Http, Quic, WebSocket])]
+async fn given_topic_patch_when_using_each_transport_should_set_reset_and_preserve_provenance(
+    harness: &TestHarness,
+) {
+    let client = harness.root_client().await.unwrap();
+    client
+        .create_stream("patch-stream", &StreamCreateOptions::default())
+        .await
+        .unwrap();
+    let stream = Identifier::named("patch-stream").unwrap();
+    let topic = Identifier::named("patch-topic").unwrap();
+    client
+        .create_topic(
+            &stream,
+            "patch-topic",
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                max_topic_size: Some(MaxTopicSize::from(10 * 1024 * 1024 * 1024u64)),
+                durability: iggy_common::Durability::Persisted,
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let before = client
+        .get_topic(&stream, &topic)
+        .await
+        .unwrap()
+        .expect("topic exists");
+    let expiry = IggyExpiry::ExpireDuration(IggyDuration::from(60_000_000u64));
+
+    client
+        .update_topic(
+            &stream,
+            &topic,
+            &TopicUpdateOptions {
+                message_expiry: Some(expiry),
+                reset: BTreeSet::from([OptionKey::MaxTopicSize]),
+                ..TopicUpdateOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let after = client
+        .get_topic(&stream, &topic)
+        .await
+        .unwrap()
+        .expect("topic exists");
+    assert_eq!(after.name, "patch-topic");
+    let resolved = after.resolved_options();
+    assert_eq!(resolved.message_expiry, expiry);
+    assert_eq!(
+        resolved.max_topic_size,
+        MaxTopicSize::from(iggy_common::DEFAULT_MAX_TOPIC_SIZE)
+    );
+    let option = |key: &str| {
+        after
+            .options
+            .get(&HeaderKey::from_str(key).unwrap())
+            .cloned()
+    };
+    assert!(option(topic_option_keys::MESSAGE_EXPIRY).unwrap().explicit);
+    assert!(!option(topic_option_keys::MAX_TOPIC_SIZE).unwrap().explicit);
+    for (key, value) in &before.options {
+        let name = String::from_utf8_lossy(key.as_bytes()).into_owned();
+        if name == topic_option_keys::MESSAGE_EXPIRY || name == topic_option_keys::MAX_TOPIC_SIZE {
+            continue;
+        }
+        assert_eq!(
+            after.options.get(key),
+            Some(value),
+            "{name} must be untouched"
+        );
+    }
+}
+
+#[iggy_harness(test_client_transport = [Tcp, Http, Quic, WebSocket])]
+async fn given_stream_or_user_reset_when_updating_should_reject_without_changes(
+    harness: &TestHarness,
+) {
+    let client = harness.root_client().await.unwrap();
+    client
+        .create_stream("reset-stream", &StreamCreateOptions::default())
+        .await
+        .unwrap();
+    client
+        .create_user(
+            "reset-user",
+            "secret123",
+            UserStatus::Active,
+            None,
+            &UserCreateOptions::default(),
+        )
+        .await
+        .unwrap();
+    let stream = Identifier::named("reset-stream").unwrap();
+    let user = Identifier::named("reset-user").unwrap();
+
+    // The typed reset is refused by the client, the raw one by the server.
+    for patch in [
+        StreamUpdateOptions {
+            reset: BTreeSet::from([OptionKey::Name]),
+            ..StreamUpdateOptions::default()
+        },
+        StreamUpdateOptions {
+            raw_reset: BTreeSet::from([OptionKey::Name.to_string()]),
+            ..StreamUpdateOptions::default()
+        },
+    ] {
+        let error = client
+            .update_stream(&stream, &patch)
+            .await
+            .expect_err("a stream column is not resettable");
+        assert_policy_error(
+            error,
+            IggyError::OptionNotResettable(OptionKey::Name.to_string()),
+        );
+    }
+    for key in [OptionKey::Username, OptionKey::Status] {
+        for patch in [
+            UserUpdateOptions {
+                reset: BTreeSet::from([key]),
+                ..UserUpdateOptions::default()
+            },
+            UserUpdateOptions {
+                raw_reset: BTreeSet::from([key.to_string()]),
+                ..UserUpdateOptions::default()
+            },
+        ] {
+            let error = client
+                .update_user(&user, &patch)
+                .await
+                .expect_err("a user column is not resettable");
+            assert_policy_error(error, IggyError::OptionNotResettable(key.to_string()));
+        }
+    }
+
+    let stream_details = client.get_stream(&stream).await.unwrap();
+    assert_eq!(
+        stream_details.expect("stream kept its name").name,
+        "reset-stream"
+    );
+    let user_details = client
+        .get_user(&user)
+        .await
+        .unwrap()
+        .expect("user kept its name");
+    assert_eq!(user_details.username, "reset-user");
+    assert_eq!(user_details.status, UserStatus::Active);
 }

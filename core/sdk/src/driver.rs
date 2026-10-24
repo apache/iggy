@@ -27,7 +27,7 @@ use bytes::Bytes;
 use iggy_binary_protocol::codes::{
     BIND_SESSION_CODE, CHANGE_PASSWORD_CODE, DELETE_CONSUMER_OFFSET_CODE, GET_CONSUMER_OFFSET_CODE,
     GET_PARTITION_ROUTE_CODE, LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE,
-    POLL_MESSAGES_CODE, SEND_MESSAGES_CODE, STORE_CONSUMER_OFFSET_CODE, UPDATE_USER_CODE,
+    POLL_MESSAGES_CODE, SEND_MESSAGES_CODE, STORE_CONSUMER_OFFSET_CODE, UPDATE_RESOURCE_CODE,
 };
 use iggy_binary_protocol::consensus::{Operation, operation_for_code};
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
@@ -37,12 +37,16 @@ use iggy_binary_protocol::requests::consumer_offsets::{
 use iggy_binary_protocol::requests::messages::{
     GetPartitionRouteRequest, PollMessagesRequest, SendMessagesHeader,
 };
-use iggy_binary_protocol::requests::users::{ChangePasswordRequest, UpdateUserRequest};
+use iggy_binary_protocol::requests::system::{ResourceTarget, UpdateResourceRequest};
+use iggy_binary_protocol::requests::users::ChangePasswordRequest;
 use iggy_binary_protocol::responses::messages::PartitionRouteResponse;
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
-use iggy_binary_protocol::{WireDecode, WireEncode, WirePartitioning, WirePollingStrategy};
+use iggy_binary_protocol::{
+    WireDecode, WireEncode, WireOptions, WirePartitioning, WirePollingStrategy,
+};
 use iggy_common::{
-    BinaryOperationLineage, ClientState, Credentials, DiagnosticEvent, Identifier, IggyError,
+    BinaryOperationLineage, ClientState, Credentials, DiagnosticEvent, HeaderKind, Identifier,
+    IggyError, OptionKey,
 };
 use route_cache::RouteCache;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -329,15 +333,16 @@ impl OperationDriver {
                     self.session.refresh_password(&user, &request.new_password);
                 }
             }
-            UPDATE_USER_CODE => {
-                if let Ok(UpdateUserRequest {
-                    user_id,
-                    username: Some(username),
+            UPDATE_RESOURCE_CODE => {
+                if let Ok(UpdateResourceRequest {
+                    target: ResourceTarget::User { user_id },
+                    options,
                     ..
-                }) = UpdateUserRequest::decode_from(&frame.body)
+                }) = UpdateResourceRequest::decode_from(&frame.body)
+                    && let Some(username) = patched_username(&options)
                     && let Ok(user) = Identifier::try_from(&user_id)
                 {
-                    self.session.refresh_username(&user, username.as_str());
+                    self.session.refresh_username(&user, username);
                 }
             }
             _ => {}
@@ -1107,6 +1112,15 @@ impl Call {
         }
         self.end(refusal)
     }
+}
+
+/// The new username a user patch sets, if it sets one.
+fn patched_username(options: &WireOptions) -> Option<&str> {
+    let key = <&str>::from(OptionKey::Username).as_bytes();
+    options
+        .into_iter()
+        .find(|entry| entry.key == key && entry.value_kind.0 == HeaderKind::String.as_code())
+        .and_then(|entry| std::str::from_utf8(entry.value).ok())
 }
 
 fn is_sign_in(code: u32) -> bool {

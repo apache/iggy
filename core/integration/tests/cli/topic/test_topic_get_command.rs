@@ -26,7 +26,9 @@ use iggy::prelude::Client;
 use iggy::prelude::Durability;
 use iggy::prelude::IggyExpiry;
 use iggy::prelude::defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
-use iggy::prelude::{IggyMessage, Partitioning, StreamClient, TopicClient, TopicCreateOptions};
+use iggy::prelude::{
+    IggyMessage, Partitioning, StreamClient, StreamCreateOptions, TopicClient, TopicCreateOptions,
+};
 use integration::harness::{TestHarnessBuilder, TestServerConfig, wait_for_topic_messages_count};
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::{contains, starts_with};
@@ -115,7 +117,7 @@ impl TestTopicGetCmd {
 impl IggyCmdTestCase for TestTopicGetCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
         let stream = client
-            .create_stream(&self.stream_name)
+            .create_stream(&self.stream_name, &StreamCreateOptions::default())
             .await
             .expect("stream should be created");
         self.stream_id = stream.id;
@@ -366,7 +368,10 @@ struct TestMissingTopicGetCmd;
 #[async_trait]
 impl IggyCmdTestCase for TestMissingTopicGetCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
-        client.create_stream("missing-topic-stream").await.unwrap();
+        client
+            .create_stream("missing-topic-stream", &StreamCreateOptions::default())
+            .await
+            .unwrap();
     }
 
     fn get_command(&self) -> IggyCmdCommand {
@@ -482,7 +487,10 @@ pub async fn should_show_persisted_durability_created_through_cli() {
         .unwrap();
     harness.start().await.expect("test server should start");
     let client = harness.tcp_root_client().await.unwrap();
-    let stream = client.create_stream("cli-persisted-stream").await.unwrap();
+    let stream = client
+        .create_stream("cli-persisted-stream", &StreamCreateOptions::default())
+        .await
+        .unwrap();
     let address = harness.server().raw_tcp_addr().unwrap();
     let socket_address = harness.server().tcp_addr().unwrap();
     clear_session_entry(socket_address);

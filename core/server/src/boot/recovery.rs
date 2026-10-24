@@ -32,14 +32,18 @@ use consensus::{
     ClientTable, HistoryRecovery, JoinMode, LocalPipeline, PipelineEntry, Sequencer, VsrConsensus,
     VsrRestore, VsrState,
 };
-use iggy_common::{Aes256GcmEncryptor, EncryptorKind, IggyByteSize, TopicRuntimeOptions};
+use iggy_common::{
+    EncryptorKind, IggyByteSize, IggyError, PartitionStats, ServerKeyContext, StreamEncryption,
+    TopicRuntimeOptions, check_critical_options,
+};
 use journal::Journal;
 use journal::prepare_journal::PrepareJournal;
 use journal::superblock::PingPongSuperblock;
 use message_bus::IggyMessageBus;
 use metadata::impls::metadata::{IggySnapshot, StreamsFrontend};
 use metadata::stm::snapshot::Snapshot;
-use partitions::{IggyPartitions, PartitionsConfig};
+use metadata::stm::stream::{Partition, Streams};
+use partitions::{IggyPartitions, PartitionsConfig, StreamKeyIdentity};
 use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 use shard::builder::IggyShardBuilder;
 use shard::metrics::ShardMetrics;
@@ -49,10 +53,31 @@ use shard::{
     ShardIdentity, TaggedSender,
 };
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
+
+/// A partition this shard owns, with what building it needs from metadata.
+struct OwnedPartition {
+    stream_id: usize,
+    topic_id: usize,
+    stats: Arc<PartitionStats>,
+    metadata: Partition,
+    runtime: TopicRuntimeOptions,
+    identity: StreamKeyIdentity,
+    encryption: StreamEncryption,
+}
+
+/// How boot treats an owned partition, by whether its stream key opens here.
+enum OwnedPartitionKey {
+    /// Build it with this encryptor, `None` for a plaintext stream.
+    Build(Option<Arc<EncryptorKind>>),
+    /// Leave it unbuilt, hosted nowhere on this shard, until catch-up commits
+    /// a wrap this node opens.
+    Defer,
+}
 
 /// A shard built for its thread, with what `shard_main` wires after the
 /// build: the session manager its request plane shares and the weak
@@ -63,6 +88,9 @@ pub(in crate::boot) struct ShardBuild {
     pub sessions: Rc<RefCell<SessionManager>>,
     pub consumer_group_liveness: Rc<RefCell<ConsumerGroupLiveness>>,
     pub shard_handle: ShellShardHandle<Rc<IggyMessageBus>, PrepareJournal, IggySnapshot>,
+    /// Owned namespaces left unbuilt, for the reconciler to clean up if their
+    /// delete commits before they build.
+    pub unbuilt: Vec<IggyNamespace>,
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -127,16 +155,22 @@ pub(in crate::boot) async fn build_shard_for_thread(
     let owned_partitions_capacity = total_partitions
         .div_ceil(usize::from(total_shards).max(1))
         .saturating_mul(2);
-    // At-rest encryption: built once per shard from the shared config; the
-    // ingestion path encrypts on the primary and the poll reply decrypts.
-    // A bad key fails the boot rather than silently serving plaintext.
-    let encryptor = if config.encryption.enabled {
-        let aes = Aes256GcmEncryptor::from_base64_key(&config.encryption.key)
-            .map_err(|error| ServerError::Iggy(Box::new(error)))?;
-        Some(Arc::new(EncryptorKind::Aes256Gcm(aes)))
-    } else {
-        None
-    };
+    // Each encrypted stream holds its own key, wrapped under the server key.
+    // The shards owning its partitions open it below, shard 0 opens the keys of
+    // streams that own no partition.
+    let key_context = Arc::new(
+        ServerKeyContext::from_config(
+            &config.encryption.key,
+            &config.encryption.previous_keys,
+            config.encryption.enabled,
+        )
+        .map_err(|error| ServerError::Iggy(Box::new(error)))?,
+    );
+    let solo = topology.replica_count == 1;
+    if shard_id == 0 {
+        refuse_partitionless_stream_keys(metadata.mux_stm.streams(), &key_context, solo)?;
+    }
+    refuse_unreadable_topics(metadata.mux_stm.streams())?;
     let partitions = IggyPartitions::with_capacity(
         shard_local_id,
         PartitionsConfig {
@@ -147,7 +181,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
             validate_checksum: config.partition.validate_checksum,
             segment_size: IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
             preallocate_segments: iggy_common::DEFAULT_PREALLOCATE_SEGMENTS,
-            encryptor,
+            key_context,
             path_layout: partitions::PartitionPathLayout {
                 streams_root: config.get_streams_path(),
             },
@@ -164,6 +198,11 @@ pub(in crate::boot) async fn build_shard_for_thread(
     let owned = metadata.mux_stm.streams().read(|inner| {
         let mut owned = Vec::with_capacity(owned_partitions_capacity);
         for (_, stream) in &inner.items {
+            let identity = StreamKeyIdentity {
+                stream_id: stream.id,
+                created_op: stream.created_op,
+            };
+            let mut encryption = None;
             for (topic_id, topic) in &stream.topics {
                 for partition in &topic.partitions {
                     let namespace = IggyNamespace::new(stream.id, topic_id, partition.id);
@@ -178,13 +217,17 @@ pub(in crate::boot) async fn build_shard_for_thread(
                             partition,
                             topic.stats.clone(),
                         );
-                        owned.push((
-                            stream.id,
+                        owned.push(OwnedPartition {
+                            stream_id: stream.id,
                             topic_id,
                             stats,
-                            partition.clone(),
-                            TopicRuntimeOptions::from_resource_options(&topic.options),
-                        ));
+                            metadata: partition.clone(),
+                            runtime: TopicRuntimeOptions::from_resource_options(&topic.options),
+                            identity,
+                            encryption: encryption
+                                .get_or_insert_with(|| StreamEncryption::from(&stream.options))
+                                .clone(),
+                        });
                     } else {
                         shards_table.insert(
                             namespace,
@@ -204,8 +247,33 @@ pub(in crate::boot) async fn build_shard_for_thread(
     // bundle was broadcast (see `MetadataHandoff::Owner`). All shards
     // here only add their per-partition deltas, so the shared
     // `Arc<TopicStats>` atomics race only against other atomic adds.
-    for (stream_id, topic_id, partition_stats, partition_metadata, topic_runtime) in owned {
+    let mut deferred_streams = BTreeSet::new();
+    let mut unbuilt = Vec::new();
+    for OwnedPartition {
+        stream_id,
+        topic_id,
+        stats: partition_stats,
+        metadata: partition_metadata,
+        runtime: topic_runtime,
+        identity,
+        encryption,
+    } in owned
+    {
         let namespace = IggyNamespace::new(stream_id, topic_id, partition_metadata.id);
+        let encryptor = match owned_partition_key(
+            &partitions,
+            &mut deferred_streams,
+            stream_id,
+            identity,
+            &encryption,
+            solo,
+        )? {
+            OwnedPartitionKey::Build(encryptor) => encryptor,
+            OwnedPartitionKey::Defer => {
+                unbuilt.push(namespace);
+                continue;
+            }
+        };
         let loaded = load_partition_or_fence(
             config,
             namespace,
@@ -235,10 +303,13 @@ pub(in crate::boot) async fn build_shard_for_thread(
                     "skipping this partition at boot; the reconciler retries its first \
                      offset reservation claim"
                 );
+                unbuilt.push(namespace);
                 continue;
             }
             Err(error) => return Err(error),
         };
+        let mut partition = partition;
+        partition.set_encryptor(encryptor);
         partitions.insert(namespace, partition);
         shards_table.insert(
             namespace,
@@ -327,7 +398,37 @@ pub(in crate::boot) async fn build_shard_for_thread(
         sessions,
         consumer_group_liveness,
         shard_handle,
+        unbuilt,
     })
+}
+
+/// The key decision for one owned partition. A stream deferred once stays
+/// deferred for its other partitions, so its key is resolved once.
+fn owned_partition_key(
+    partitions: &IggyPartitions<Rc<IggyMessageBus>>,
+    deferred_streams: &mut BTreeSet<usize>,
+    stream_id: usize,
+    identity: StreamKeyIdentity,
+    encryption: &StreamEncryption,
+    solo: bool,
+) -> Result<OwnedPartitionKey, ServerError> {
+    if deferred_streams.contains(&stream_id) {
+        return Ok(OwnedPartitionKey::Defer);
+    }
+    match partitions.resolve_stream_encryptor(identity, encryption) {
+        Ok(encryptor) => Ok(OwnedPartitionKey::Build(encryptor)),
+        Err(source) => {
+            defer_or_refuse_stream_key(
+                stream_id,
+                encryption,
+                &partitions.key_context(),
+                source,
+                solo,
+            )?;
+            deferred_streams.insert(stream_id);
+            Ok(OwnedPartitionKey::Defer)
+        }
+    }
 }
 
 // Pin the configs-crate default literals (duplicated there to avoid a
@@ -397,6 +498,98 @@ const _: () =
 const _: () =
     assert!(consensus::DVC_HEADERS_MAX == iggy_binary_protocol::consensus::DVC_HEADERS_MAX);
 const _: () = assert!(consensus::DVC_HEADERS_MAX == u128::BITS as usize);
+
+/// The boot check of encrypted streams that own no partition, whose keys no
+/// shard opens while building its partitions.
+fn refuse_partitionless_stream_keys(
+    streams: &Streams,
+    key_context: &ServerKeyContext,
+    solo: bool,
+) -> Result<(), ServerError> {
+    let unopenable: Vec<(usize, StreamEncryption, IggyError)> = streams.read(|inner| {
+        inner
+            .items
+            .iter()
+            .filter(|(_, stream)| {
+                stream
+                    .topics
+                    .iter()
+                    .all(|(_, topic)| topic.partitions.is_empty())
+            })
+            .filter_map(|(_, stream)| {
+                let encryption = StreamEncryption::from(&stream.options);
+                let source = match &encryption {
+                    StreamEncryption::Plaintext => None,
+                    StreamEncryption::Unavailable(error) => Some(error.clone()),
+                    StreamEncryption::Wrapped(set) => key_context.open(set).err(),
+                }?;
+                Some((stream.id, encryption, source))
+            })
+            .collect()
+    });
+    for (stream_id, encryption, source) in unopenable {
+        defer_or_refuse_stream_key(stream_id, &encryption, key_context, source, solo)?;
+    }
+    Ok(())
+}
+
+/// A stream key that does not open at boot. A cluster replica's metadata can
+/// trail the commit point until catch-up or state transfer, so the stream waits
+/// for the reconciler, which builds its partitions once a wrap this node opens
+/// commits. Catch-up heals neither a node without a key nor unreadable critical
+/// state, and a solo replay is the whole journal, so these refuse.
+fn defer_or_refuse_stream_key(
+    stream_id: usize,
+    encryption: &StreamEncryption,
+    key_context: &ServerKeyContext,
+    source: IggyError,
+    solo: bool,
+) -> Result<(), ServerError> {
+    let stored_kek_fingerprints = match encryption {
+        StreamEncryption::Wrapped(set) => set.kek_fingerprints().join(","),
+        StreamEncryption::Plaintext | StreamEncryption::Unavailable(_) => String::new(),
+    };
+    let error = ServerError::StreamKeyUnavailable {
+        stream_id,
+        stored_kek_fingerprints,
+        node_kek_fingerprints: key_context.kek_fingerprints().join(","),
+        source: Box::new(source),
+    };
+    if solo
+        || !key_context.accepts_stream_keys()
+        || !matches!(encryption, StreamEncryption::Wrapped(_))
+    {
+        return Err(error);
+    }
+    warn!(
+        stream_id,
+        %error,
+        "Stream {stream_id} is not served on this node until metadata catch-up commits a wrap its keys open"
+    );
+    Ok(())
+}
+
+/// A topic whose critical options this build cannot read is never served, the
+/// way unreadable stream state refuses boot.
+fn refuse_unreadable_topics(streams: &Streams) -> Result<(), ServerError> {
+    let unreadable = streams.read(|inner| {
+        inner.items.iter().find_map(|(_, stream)| {
+            stream.topics.iter().find_map(|(topic_id, topic)| {
+                check_critical_options(&topic.options)
+                    .err()
+                    .map(|error| (stream.id, topic_id, error))
+            })
+        })
+    });
+    match unreadable {
+        Some((stream_id, topic_id, source)) => Err(ServerError::TopicOptionsUnavailable {
+            stream_id,
+            topic_id,
+            source: Box::new(source),
+        }),
+        None => Ok(()),
+    }
+}
 
 /// `[cluster] superblock_wedged_fatal_timeout` as a consecutive-failure count,
 /// which is the only shape the shard's `superblock_wedged` can compare. Zero
@@ -695,6 +888,225 @@ pub(in crate::boot) fn restore_metadata_consensus(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dispatch::test_support::{TestMux, prepare_message};
+    use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
+    use iggy_binary_protocol::requests::streams::CreateStreamRequest;
+    use iggy_binary_protocol::requests::topics::{
+        CreateTopicRequest, CreateTopicWithAssignmentsRequest,
+    };
+    use iggy_binary_protocol::{Operation, WireEncode, WireIdentifier, WireName, WireOptions};
+    use iggy_common::wire_conversions::resource_options_to_wire;
+    use iggy_common::{
+        HeaderKey, HeaderValue, OptionKey, OptionValue, OptionsProvenance, ResourceOptions,
+        StreamEncryptionKey, StreamKeyOrigin, WrapSet,
+    };
+    use metadata::stm::StateMachine as _;
+
+    const CONFIG_KEY: &str = "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=";
+    const OTHER_CONFIG_KEY: &str = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=";
+
+    #[test]
+    fn given_topic_with_unknown_critical_option_when_booting_should_refuse_it() {
+        let future_key = HeaderKey::try_from("a_future_key").expect("key fits");
+        let unreadable = ResourceOptions::from([
+            (
+                HeaderKey::from(OptionKey::CriticalKeys),
+                OptionValue::explicit(HeaderValue::try_from("a_future_key").expect("marker fits")),
+            ),
+            (future_key, OptionValue::explicit(HeaderValue::from(7u64))),
+        ]);
+        for (derived, refused) in [(ResourceOptions::new(), false), (unreadable, true)] {
+            let mux = TestMux::default();
+            mux.users().ensure_root_user("iggy", "hash");
+            mux.update(prepare_message(
+                Operation::CreateStream,
+                1,
+                1,
+                &CreateStreamRequest {
+                    name: WireName::new("stream").expect("name fits"),
+                    options: WireOptions::empty(),
+                }
+                .to_bytes(),
+            ))
+            .expect("stream create applies");
+            mux.update(prepare_message(
+                Operation::CreateTopicWithAssignments,
+                1,
+                2,
+                &CreateTopicWithAssignmentsRequest {
+                    request: CreateTopicRequest {
+                        stream_id: WireIdentifier::numeric(0),
+                        partitions_count: 1,
+                        name: WireName::new("topic").expect("name fits"),
+                        options: WireOptions::empty(),
+                    },
+                    derived_options: resource_options_to_wire(&derived, OptionsProvenance::All)
+                        .expect("options encode"),
+                    partitions: vec![CreatedPartitionAssignment {
+                        partition_id: 0,
+                        consensus_group_id: 1,
+                        initial_view: 0,
+                    }],
+                }
+                .to_bytes(),
+            ))
+            .expect("topic create applies");
+
+            let result = refuse_unreadable_topics(mux.streams());
+
+            assert_eq!(
+                matches!(
+                    result,
+                    Err(ServerError::TopicOptionsUnavailable {
+                        stream_id: 0,
+                        topic_id: 0,
+                        ..
+                    })
+                ),
+                refused,
+                "{result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_stream_key_that_does_not_open_when_booting_should_refuse_only_a_complete_replay() {
+        let stream_context = ServerKeyContext::from_config(CONFIG_KEY, &[], true).expect("key");
+        let key = StreamEncryptionKey::try_from([1; 32].as_slice()).expect("32 bytes");
+        let set = WrapSet::from(
+            stream_context
+                .wrap(&key, StreamKeyOrigin::Server)
+                .expect("wraps"),
+        );
+        let wrapped = ResourceOptions::from([(
+            HeaderKey::from(OptionKey::EncryptionKeyWrapped),
+            OptionValue::explicit(HeaderValue::try_from(set.as_ref()).expect("set fits")),
+        )]);
+        let unreadable = ResourceOptions::from([(
+            HeaderKey::from(OptionKey::CriticalKeys),
+            OptionValue::explicit(HeaderValue::try_from("a_future_key").expect("marker fits")),
+        )]);
+        let plaintext = ResourceOptions::new();
+        let same_key = ServerKeyContext::from_config(CONFIG_KEY, &[], true).expect("key");
+        let other_key = ServerKeyContext::from_config(OTHER_CONFIG_KEY, &[], true).expect("key");
+        let no_key = ServerKeyContext::disabled();
+        for (options, node_context, solo, refused) in [
+            (&wrapped, &same_key, true, false),
+            (&wrapped, &same_key, false, false),
+            (&wrapped, &other_key, true, true),
+            (&wrapped, &other_key, false, false),
+            (&wrapped, &no_key, true, true),
+            (&wrapped, &no_key, false, true),
+            (&plaintext, &no_key, true, false),
+            (&plaintext, &no_key, false, false),
+            (&unreadable, &same_key, true, true),
+            (&unreadable, &same_key, false, true),
+        ] {
+            let mux = TestMux::default();
+            mux.users().ensure_root_user("iggy", "hash");
+            mux.update(prepare_message(
+                Operation::CreateStream,
+                1,
+                1,
+                &CreateStreamRequest {
+                    name: WireName::new("stream").expect("name fits"),
+                    options: resource_options_to_wire(options, OptionsProvenance::All)
+                        .expect("options encode"),
+                }
+                .to_bytes(),
+            ))
+            .expect("stream create applies");
+
+            let result = refuse_partitionless_stream_keys(mux.streams(), node_context, solo);
+
+            assert_eq!(
+                matches!(
+                    result,
+                    Err(ServerError::StreamKeyUnavailable { stream_id: 0, .. })
+                ),
+                refused,
+                "node keys {:?}, solo {solo}: {result:?}",
+                node_context.kek_fingerprints()
+            );
+        }
+    }
+
+    #[test]
+    fn given_stream_key_that_does_not_open_when_deciding_owned_partitions_should_leave_them_unbuilt()
+     {
+        let stream_context = ServerKeyContext::from_config(CONFIG_KEY, &[], true).expect("key");
+        let key = StreamEncryptionKey::try_from([1; 32].as_slice()).expect("32 bytes");
+        let set = WrapSet::from(
+            stream_context
+                .wrap(&key, StreamKeyOrigin::Server)
+                .expect("wraps"),
+        );
+        let wrapped = StreamEncryption::from(&ResourceOptions::from([(
+            HeaderKey::from(OptionKey::EncryptionKeyWrapped),
+            OptionValue::explicit(HeaderValue::try_from(set.as_ref()).expect("set fits")),
+        )]));
+        let identity = StreamKeyIdentity {
+            stream_id: 0,
+            created_op: 1,
+        };
+        let node_partitions = |config_key: &str| {
+            IggyPartitions::new(
+                ShardId::new(0),
+                PartitionsConfig {
+                    messages_required_to_save: 1,
+                    size_of_messages_required_to_save: IggyByteSize::from(1024_u64),
+                    validate_checksum: true,
+                    segment_size: IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
+                    preallocate_segments: false,
+                    key_context: Arc::new(
+                        ServerKeyContext::from_config(config_key, &[], true).expect("key"),
+                    ),
+                    path_layout: partitions::PartitionPathLayout {
+                        streams_root: "/var/lib/iggy/streams".to_owned(),
+                    },
+                },
+            )
+        };
+
+        let other_key = node_partitions(OTHER_CONFIG_KEY);
+        let mut deferred = BTreeSet::new();
+        for _ in 0..2 {
+            let decision =
+                owned_partition_key(&other_key, &mut deferred, 0, identity, &wrapped, false);
+            assert!(matches!(decision, Ok(OwnedPartitionKey::Defer)));
+        }
+        assert_eq!(deferred, BTreeSet::from([0]));
+        assert!(matches!(
+            owned_partition_key(
+                &other_key,
+                &mut BTreeSet::new(),
+                0,
+                identity,
+                &wrapped,
+                true
+            ),
+            Err(ServerError::StreamKeyUnavailable { stream_id: 0, .. })
+        ));
+
+        let same_key = node_partitions(CONFIG_KEY);
+        let mut deferred = BTreeSet::new();
+        assert!(matches!(
+            owned_partition_key(&same_key, &mut deferred, 0, identity, &wrapped, false),
+            Ok(OwnedPartitionKey::Build(Some(_)))
+        ));
+        assert!(matches!(
+            owned_partition_key(
+                &same_key,
+                &mut deferred,
+                1,
+                identity,
+                &StreamEncryption::Plaintext,
+                false
+            ),
+            Ok(OwnedPartitionKey::Build(None))
+        ));
+        assert!(deferred.is_empty());
+    }
 
     #[test]
     fn partition_runtime_and_server_use_the_same_fixed_directory_layout() {
@@ -710,7 +1122,7 @@ mod tests {
             validate_checksum: server.partition.validate_checksum,
             segment_size: IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
             preallocate_segments: iggy_common::DEFAULT_PREALLOCATE_SEGMENTS,
-            encryptor: None,
+            key_context: Arc::default(),
             path_layout: partitions::PartitionPathLayout {
                 streams_root: server.get_streams_path(),
             },

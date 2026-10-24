@@ -42,6 +42,7 @@ internal static class VsrError
     internal const int PERSONAL_ACCESS_TOKEN_EXPIRED = 54;
     internal const int TRANSIENT_NOT_COMMITTED = 57;
     internal const int TRANSIENT_NOT_ACCEPTED = 58;
+    internal const int INVALID_ENCRYPTION_KEY = 70;
     internal const int INVALID_SIZE_BYTES = 80;
     internal const int REQUEST_TOO_OLD = 85;
     internal const int HISTORY_UNAVAILABLE = 87;
@@ -50,12 +51,19 @@ internal static class VsrError
     internal const int EMPTY_RESPONSE = 304;
     internal const int STREAM_ID_NOT_FOUND = 1009;
     internal const int STREAM_NAME_NOT_FOUND = 1010;
+    internal const int INVALID_STREAM_NAME = 1013;
     internal const int TOPIC_ID_NOT_FOUND = 2010;
     internal const int TOPIC_NAME_NOT_FOUND = 2011;
+    internal const int INVALID_TOPIC_NAME = 2014;
     internal const int CONSUMER_GROUP_MEMBER_NOT_FOUND = 5006;
     internal const int PARTITION_NOT_FOUND = 3007;
     internal const int CONSUMER_GROUP_PARTITION_NOT_OWNED = 5009;
     internal const int TOO_MANY_CONSUMER_GROUPS = 5010;
+    internal const int UNSUPPORTED_OPTION_KEY = 4041;
+    internal const int OPTION_NOT_UPDATABLE = 4103;
+    internal const int OPTION_NOT_RESETTABLE = 4104;
+    internal const int READ_ONLY_OPTION = 4105;
+    internal const int CANNOT_MODIFY_ROOT_USER = 4108;
     internal const int INCOMPATIBLE_PROTOCOL_VERSION = 14003;
     internal const int SESSION_MISMATCH = 14004;
     internal const int REQUEST_ID_EXHAUSTED = 14005;

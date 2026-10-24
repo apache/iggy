@@ -126,7 +126,8 @@ impl ActionWeights {
     #[must_use]
     pub fn metadata_only() -> Self {
         Self::new(&[
-            (Action::CreateStream, 12),
+            (Action::CreateStream, 9),
+            (Action::CreateKeyedStream, 3),
             (Action::UpdateStream, 10),
             (Action::DeleteStream, 6),
             (Action::CreateTopic, 12),

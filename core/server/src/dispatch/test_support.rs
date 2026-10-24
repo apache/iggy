@@ -33,7 +33,7 @@ use iggy_binary_protocol::{
     Command, Operation, PrepareHeader, ReplyHeader, RoutedRequestHeader, WireEncode,
     WireGlobalPermissions, WireIdentifier, WireName, WireOptions, WirePermissions,
 };
-use iggy_common::{UserStatus, variadic};
+use iggy_common::{EncryptorKind, ServerKeyContext, UserStatus, variadic};
 use journal::prepare_journal::PrepareJournal;
 use message_bus::client_listener::RequestHandler;
 use message_bus::fd_transfer::DupedFd;
@@ -52,7 +52,11 @@ use metadata::stm::stream::Streams;
 use metadata::stm::user::Users;
 use metadata::{IggyMetadata, MuxStateMachine};
 use partitions::{IggyPartitions, PartitionPathLayout, PartitionsConfig};
-use server_common::iobuf::Frozen;
+use server_common::iobuf::{Frozen, Owned};
+use server_common::send_messages::{
+    COMMAND_HEADER_SIZE, IggyMessage, IggyMessageHeader, IggyMessages, PREPARE_SPLIT_POINT,
+    SendMessagesOwned, encrypt_batch_request,
+};
 use server_common::sharding::{IggyNamespace, ShardId};
 use server_common::{MESSAGE_ALIGN, Message};
 use shard::shards_table::PapayaShardsTable;
@@ -61,6 +65,7 @@ use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::mem::size_of;
 use std::rc::Rc;
+use std::sync::Arc;
 
 pub type TestMux = MuxStateMachine<variadic!(Users, Streams)>;
 pub type TestShard = IggyShard<SpyBus, PrepareJournal, IggySnapshot, TestMux, PapayaShardsTable>;
@@ -280,12 +285,24 @@ pub const UNDECLARED_OPERATION: u8 = 131;
 /// forward-nonce counter from it, so passing a different value models a
 /// restart.
 pub fn test_shard(bus: &SpyBus, replica: u8, replica_count: u8, incarnation: u128) -> TestShard {
-    test_shard_with_frontier(
+    test_shard_with_key_context(bus, replica, replica_count, incarnation, Arc::default())
+}
+
+/// [`test_shard`] holding `key_context` as its server keys.
+pub fn test_shard_with_key_context(
+    bus: &SpyBus,
+    replica: u8,
+    replica_count: u8,
+    incarnation: u128,
+    key_context: Arc<ServerKeyContext>,
+) -> TestShard {
+    build_test_shard(
         bus,
         replica,
         replica_count,
         incarnation,
-        std::sync::Arc::default(),
+        key_context,
+        Arc::default(),
     )
 }
 
@@ -294,7 +311,25 @@ pub fn test_shard_with_frontier(
     replica: u8,
     replica_count: u8,
     incarnation: u128,
-    frontier: std::sync::Arc<metadata::AppliedFrontier>,
+    frontier: Arc<metadata::AppliedFrontier>,
+) -> TestShard {
+    build_test_shard(
+        bus,
+        replica,
+        replica_count,
+        incarnation,
+        Arc::default(),
+        frontier,
+    )
+}
+
+fn build_test_shard(
+    bus: &SpyBus,
+    replica: u8,
+    replica_count: u8,
+    incarnation: u128,
+    key_context: Arc<ServerKeyContext>,
+    frontier: Arc<metadata::AppliedFrontier>,
 ) -> TestShard {
     let consensus = VsrConsensus::new(
         1,
@@ -317,7 +352,7 @@ pub fn test_shard_with_frontier(
             validate_checksum: true,
             segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
             preallocate_segments: false,
-            encryptor: None,
+            key_context,
             path_layout: PartitionPathLayout::default(),
         },
     );
@@ -349,6 +384,51 @@ pub fn register_reply(client: u128, session: u64) -> Message<ReplyHeader> {
         ..Default::default()
     };
     reply
+}
+
+/// A stored batch record holding two messages, encrypted the way the primary
+/// encrypts at ingestion when `encryptor` is set, plaintext otherwise.
+pub fn stored_batch_record(encryptor: Option<&EncryptorKind>) -> Frozen<MESSAGE_ALIGN> {
+    let namespace = IggyNamespace::new(1, 1, 3);
+    let mut messages = IggyMessages::with_capacity(2);
+    for (id, payload) in [(7u128, &b"first-payload"[..]), (8, &b"second-payload"[..])] {
+        messages.push(IggyMessage {
+            header: IggyMessageHeader {
+                id,
+                origin_timestamp: 1_000,
+                ..Default::default()
+            },
+            payload: Bytes::copy_from_slice(payload),
+            user_headers: None,
+        });
+    }
+    let owned = SendMessagesOwned::from_messages(namespace, &messages).expect("build batch");
+    let header_size = size_of::<RoutedRequestHeader>();
+    let total = header_size + owned.header.total_size();
+    let mut buffer = Owned::<MESSAGE_ALIGN>::zeroed(total);
+    {
+        let header: &mut RoutedRequestHeader =
+            bytemuck::checked::try_from_bytes_mut(&mut buffer.as_mut_slice()[..header_size])
+                .expect("zeroed bytes form a valid RoutedRequestHeader");
+        header.command = Command::Request;
+        header.operation = Operation::SendMessages;
+        header.client = 1;
+        header.session = 1;
+        header.request = 1;
+        header.size = u32::try_from(total).expect("size fits u32");
+    }
+    let bytes = buffer.as_mut_slice();
+    owned
+        .header
+        .encode_into(&mut bytes[header_size..header_size + COMMAND_HEADER_SIZE]);
+    bytes[PREPARE_SPLIT_POINT..].copy_from_slice(&owned.blob);
+    let canonical = Message::try_from(buffer).expect("request message is valid");
+    let stored = match encryptor {
+        Some(encryptor) => encrypt_batch_request(canonical, encryptor).expect("encrypt batch"),
+        None => canonical,
+    };
+    let record = &stored.as_slice()[header_size..stored.header().size as usize];
+    Owned::<MESSAGE_ALIGN>::copy_from_slice(record).into()
 }
 
 pub fn request_message(

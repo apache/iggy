@@ -517,6 +517,7 @@ where
                 fragments,
                 current_offset,
                 replication,
+                encryptor,
             }) => {
                 // The owner has admitted progress, but the offset may still be
                 // queued. Release the reply before waiting for replication.
@@ -525,6 +526,7 @@ where
                     context,
                     fragments,
                     current_offset,
+                    encryptor,
                 });
                 if let Some(replication) = replication {
                     partitions

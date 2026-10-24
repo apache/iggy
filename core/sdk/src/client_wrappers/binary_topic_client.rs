@@ -67,34 +67,15 @@ impl TopicClient for ClientWrapper {
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        name: &str,
         options: &TopicUpdateOptions,
     ) -> Result<(), IggyError> {
         match self {
-            ClientWrapper::Iggy(client) => {
-                client
-                    .update_topic(stream_id, topic_id, name, options)
-                    .await
-            }
-            ClientWrapper::Http(client) => {
-                client
-                    .update_topic(stream_id, topic_id, name, options)
-                    .await
-            }
-            ClientWrapper::Tcp(client) => {
-                client
-                    .update_topic(stream_id, topic_id, name, options)
-                    .await
-            }
-            ClientWrapper::Quic(client) => {
-                client
-                    .update_topic(stream_id, topic_id, name, options)
-                    .await
-            }
+            ClientWrapper::Iggy(client) => client.update_topic(stream_id, topic_id, options).await,
+            ClientWrapper::Http(client) => client.update_topic(stream_id, topic_id, options).await,
+            ClientWrapper::Tcp(client) => client.update_topic(stream_id, topic_id, options).await,
+            ClientWrapper::Quic(client) => client.update_topic(stream_id, topic_id, options).await,
             ClientWrapper::WebSocket(client) => {
-                client
-                    .update_topic(stream_id, topic_id, name, options)
-                    .await
+                client.update_topic(stream_id, topic_id, options).await
             }
         }
     }

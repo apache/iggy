@@ -42,7 +42,9 @@ mod segment;
 pub mod segment_anchor;
 mod segment_recovery;
 pub mod state_transfer;
+mod stream_keyring;
 mod types;
+mod view_fence;
 #[cfg(feature = "simulator")]
 mod wal_storage;
 #[cfg(feature = "simulator")]
@@ -69,6 +71,7 @@ pub use io::{
     largest_legal_job_charge,
 };
 pub use journal::{EVICTED_RING_BYTES_MAX, EVICTED_RING_CAPACITY};
+pub use view_fence::ViewWindowVerdict;
 
 /// Offsets a partition claims in its superblock ahead of the mint counter
 /// before it will append, so a crash-restarted replica resumes above every
@@ -107,6 +110,7 @@ pub use segment_recovery::{
 use server_common::Message;
 pub use server_common::send_messages::{IggyMessage, IggyMessageHeader, IggyMessages};
 pub use state_transfer::CONSUMER_OFFSETS_ENTRIES_MAX;
+pub use stream_keyring::{StreamKeyIdentity, StreamKeyring};
 pub use types::{
     AppendResult, COMMIT_WALK_OPS_MAX, FatalCommit, Fragment, PartitionOffsets,
     PartitionPathLayout, PartitionsConfig, PollFragments, PollQueryResult, PollingArgs,

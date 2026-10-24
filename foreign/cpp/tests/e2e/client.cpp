@@ -497,12 +497,12 @@ TEST_F(LowLevelE2E_Client, CreatedUserCanReadOnlyTopicGrantedByPermissions) {
     iggy::ffi::StreamDetails denied_stream{};
     ASSERT_NO_THROW({
         iggy::ffi::ErrorInfo error_info{};
-        allowed_stream = root_client->create_stream(allowed_stream_name, error_info);
+        allowed_stream = root_client->create_stream(allowed_stream_name, {}, error_info);
     });
     TrackStream(allowed_stream_name);
     ASSERT_NO_THROW({
         iggy::ffi::ErrorInfo error_info{};
-        denied_stream = root_client->create_stream(denied_stream_name, error_info);
+        denied_stream = root_client->create_stream(denied_stream_name, {}, error_info);
     });
     TrackStream(denied_stream_name);
 
@@ -560,7 +560,7 @@ TEST_F(LowLevelE2E_Client, CreateUserRejectsDuplicateStreamPermissionIdsWithoutC
     permissions.streams.push_back(std::move(second_stream));
 
     ASSERT_THROW(client->create_user(username, "secret123", iggy::ffi::UserStatus::Active, true, std::move(permissions),
-                                     error_info),
+                                     {}, error_info),
                  std::exception);
     ASSERT_THROW(client->get_user(make_string_identifier(username)), std::exception);
 }
@@ -584,7 +584,7 @@ TEST_F(LowLevelE2E_Client, CreateUserRejectsDuplicateTopicPermissionIdsWithoutCr
     permissions.streams.push_back(std::move(stream));
 
     ASSERT_THROW(client->create_user(username, "secret123", iggy::ffi::UserStatus::Active, true, std::move(permissions),
-                                     error_info),
+                                     {}, error_info),
                  std::exception);
     ASSERT_THROW(client->get_user(make_string_identifier(username)), std::exception);
 }
@@ -605,7 +605,7 @@ TEST_F(LowLevelE2E_Client, ReadUsersPermissionDoesNotAllowCreateUser) {
     ASSERT_NO_THROW(user_client->login_user(username, "secret123", error_info));
 
     ASSERT_THROW(user_client->create_user(target, "secret123", iggy::ffi::UserStatus::Active, false,
-                                          iggy::ffi::Permissions{}, error_info),
+                                          iggy::ffi::Permissions{}, {}, error_info),
                  std::exception);
     ASSERT_THROW(root_client->get_user(make_string_identifier(target)), std::exception);
 }
@@ -629,7 +629,7 @@ TEST_F(LowLevelE2E_Client, ManageUsersPermissionAllowsGrantingAdditionalPermissi
     });
     ASSERT_NO_THROW(manager_client->connect());
     ASSERT_NO_THROW(manager_client->login_user(manager_username, "secret123", error_info));
-    ASSERT_THROW(manager_client->create_stream(denied_stream, error_info), std::exception);
+    ASSERT_THROW(manager_client->create_stream(denied_stream, {}, error_info), std::exception);
 
     iggy::ffi::Permissions child_permissions{};
     child_permissions.global.manage_streams = true;
@@ -647,7 +647,7 @@ TEST_F(LowLevelE2E_Client, ManageUsersPermissionAllowsGrantingAdditionalPermissi
 
     ASSERT_NO_THROW(child_client->connect());
     ASSERT_NO_THROW(child_client->login_user(child_username, "child-secret", error_info));
-    ASSERT_NO_THROW(child_client->create_stream(child_stream, error_info));
+    ASSERT_NO_THROW(child_client->create_stream(child_stream, {}, error_info));
     TrackStream(child_stream);
 }
 
@@ -692,23 +692,27 @@ TEST_F(E2E_Client, UpdateUserRejectsUnauthenticatedClientWithoutChangingTarget) 
         const auto created = CreateUser(root_client, username, "secret123", iggy::UserStatus::Active);
 
         auto client = GetLoggedOutHighLevelClient();
-        ASSERT_THROW(client.UpdateUser(iggy::Identifier::String(username), replacement, iggy::UserStatus::Inactive,
-                                       iggy::UserUpdateOptions{}),
-                     std::exception);
+        ASSERT_THROW(
+            client.UpdateUser(iggy::Identifier::String(username),
+                              iggy::UserUpdateOptions().SetUsername(replacement).SetStatus(iggy::UserStatus::Inactive)),
+            std::exception);
         ASSERT_NO_THROW(client.Connect());
-        ASSERT_THROW(client.UpdateUser(iggy::Identifier::String(username), replacement, iggy::UserStatus::Inactive,
-                                       iggy::UserUpdateOptions{}),
-                     std::exception);
+        ASSERT_THROW(
+            client.UpdateUser(iggy::Identifier::String(username),
+                              iggy::UserUpdateOptions().SetUsername(replacement).SetStatus(iggy::UserStatus::Inactive)),
+            std::exception);
         ASSERT_NO_THROW(client.Login("iggy", "iggy"));
         ASSERT_NO_THROW(client.Logout());
-        ASSERT_THROW(client.UpdateUser(iggy::Identifier::String(username), replacement, iggy::UserStatus::Inactive,
-                                       iggy::UserUpdateOptions{}),
-                     std::exception);
+        ASSERT_THROW(
+            client.UpdateUser(iggy::Identifier::String(username),
+                              iggy::UserUpdateOptions().SetUsername(replacement).SetStatus(iggy::UserStatus::Inactive)),
+            std::exception);
         ASSERT_NO_THROW(client.Login("iggy", "iggy"));
         ASSERT_NO_THROW(client.Disconnect());
-        ASSERT_THROW(client.UpdateUser(iggy::Identifier::String(username), replacement, iggy::UserStatus::Inactive,
-                                       iggy::UserUpdateOptions{}),
-                     std::exception);
+        ASSERT_THROW(
+            client.UpdateUser(iggy::Identifier::String(username),
+                              iggy::UserUpdateOptions().SetUsername(replacement).SetStatus(iggy::UserStatus::Inactive)),
+            std::exception);
 
         const auto fetched = root_client.GetUser(iggy::Identifier::String(username));
         EXPECT_EQ(fetched.Id(), created.Id());
@@ -724,11 +728,13 @@ TEST_F(E2E_Client, UpdateUserRejectsUnknownUsernameAndNumericId) {
     const std::string proposed_username = GetRandomName(50);
     const auto unknown_id               = std::numeric_limits<std::uint32_t>::max();
 
-    ASSERT_THROW(client.UpdateUser(iggy::Identifier::String(unknown_username), proposed_username,
-                                   iggy::UserStatus::Inactive, iggy::UserUpdateOptions{}),
+    ASSERT_THROW(client.UpdateUser(
+                     iggy::Identifier::String(unknown_username),
+                     iggy::UserUpdateOptions().SetUsername(proposed_username).SetStatus(iggy::UserStatus::Inactive)),
                  std::exception);
-    ASSERT_THROW(client.UpdateUser(iggy::Identifier::Numeric(unknown_id), GetRandomName(50), iggy::UserStatus::Inactive,
-                                   iggy::UserUpdateOptions{}),
+    ASSERT_THROW(client.UpdateUser(
+                     iggy::Identifier::Numeric(unknown_id),
+                     iggy::UserUpdateOptions().SetUsername(GetRandomName(50)).SetStatus(iggy::UserStatus::Inactive)),
                  std::exception);
     ASSERT_THROW(client.GetUser(iggy::Identifier::String(proposed_username)), std::exception);
 }
@@ -740,8 +746,9 @@ TEST_F(E2E_Client, UpdateUserByUsernameChangesUsernameAndStatus) {
     const std::string replacement = GetRandomName(50);
     ASSERT_NO_THROW({
         const auto created = CreateUser(client, username, "secret123", iggy::UserStatus::Active);
-        ASSERT_NO_THROW(client.UpdateUser(iggy::Identifier::String(username), replacement, iggy::UserStatus::Inactive,
-                                          iggy::UserUpdateOptions{}));
+        ASSERT_NO_THROW(client.UpdateUser(
+            iggy::Identifier::String(username),
+            iggy::UserUpdateOptions().SetUsername(replacement).SetStatus(iggy::UserStatus::Inactive)));
         RenameTrackedUser(username, replacement);
 
         ASSERT_THROW(client.GetUser(iggy::Identifier::String(username)), std::exception);
@@ -759,8 +766,9 @@ TEST_F(E2E_Client, UpdateUserByNumericIdChangesUsernameAndStatus) {
     const std::string replacement = GetRandomName(50);
     ASSERT_NO_THROW({
         const auto created = CreateUser(client, username, "secret123", iggy::UserStatus::Inactive);
-        ASSERT_NO_THROW(client.UpdateUser(iggy::Identifier::Numeric(created.Id()), replacement,
-                                          iggy::UserStatus::Active, iggy::UserUpdateOptions{}));
+        ASSERT_NO_THROW(
+            client.UpdateUser(iggy::Identifier::Numeric(created.Id()),
+                              iggy::UserUpdateOptions().SetUsername(replacement).SetStatus(iggy::UserStatus::Active)));
         RenameTrackedUser(username, replacement);
 
         const auto by_id   = client.GetUser(iggy::Identifier::Numeric(created.Id()));
@@ -782,14 +790,14 @@ TEST_F(E2E_Client, UpdateUserAllowsUsernameAndStatusToBeUpdatedIndependently) {
     ASSERT_NO_THROW({
         const auto created = CreateUser(client, username, "secret123", iggy::UserStatus::Active);
 
-        ASSERT_NO_THROW(client.UpdateUser(iggy::Identifier::Numeric(created.Id()), std::nullopt,
-                                          iggy::UserStatus::Inactive, iggy::UserUpdateOptions{}));
+        ASSERT_NO_THROW(client.UpdateUser(iggy::Identifier::Numeric(created.Id()),
+                                          iggy::UserUpdateOptions().SetStatus(iggy::UserStatus::Inactive)));
         const auto status_updated = client.GetUser(iggy::Identifier::Numeric(created.Id()));
         EXPECT_EQ(status_updated.Username(), username);
         EXPECT_EQ(status_updated.Status(), iggy::UserStatus::Inactive);
 
-        ASSERT_NO_THROW(client.UpdateUser(iggy::Identifier::Numeric(created.Id()), replacement, std::nullopt,
-                                          iggy::UserUpdateOptions{}));
+        ASSERT_NO_THROW(client.UpdateUser(iggy::Identifier::Numeric(created.Id()),
+                                          iggy::UserUpdateOptions().SetUsername(replacement)));
         RenameTrackedUser(username, replacement);
 
         const auto username_updated = client.GetUser(iggy::Identifier::Numeric(created.Id()));
@@ -798,15 +806,19 @@ TEST_F(E2E_Client, UpdateUserAllowsUsernameAndStatusToBeUpdatedIndependently) {
     });
 }
 
-TEST_F(E2E_Client, UpdateUserWithoutChangesIsNoOp) {
-    RecordProperty("description", "Accepts an empty user update without changing the user.");
+TEST_F(E2E_Client, UpdateUserWithoutChangesIsRefusedWithoutChangingUser) {
+    RecordProperty("description", "Refuses an empty user update with invalid_command and leaves the user unchanged.");
     auto client                = GetLoggedInHighLevelClient();
     const std::string username = GetRandomName(50);
     ASSERT_NO_THROW({
         const auto created = CreateUser(client, username, "secret123", iggy::UserStatus::Active);
 
-        ASSERT_NO_THROW(client.UpdateUser(iggy::Identifier::Numeric(created.Id()), std::nullopt, std::nullopt,
-                                          iggy::UserUpdateOptions{}));
+        try {
+            client.UpdateUser(iggy::Identifier::Numeric(created.Id()), iggy::UserUpdateOptions());
+            ADD_FAILURE() << "An update that changes nothing must be refused";
+        } catch (const iggy::IggyException &error) {
+            EXPECT_EQ(error.Kind(), "invalid_command");
+        }
 
         const auto fetched = client.GetUser(iggy::Identifier::Numeric(created.Id()));
         EXPECT_EQ(fetched.Id(), created.Id());
@@ -828,11 +840,13 @@ TEST_F(E2E_Client, UpdateUserAcceptsUsernameLengthBounds) {
     ASSERT_NO_THROW({
         const auto first  = CreateUser(client, first_username, "secret123", iggy::UserStatus::Active);
         const auto second = CreateUser(client, second_username, "secret123", iggy::UserStatus::Active);
-        ASSERT_NO_THROW(client.UpdateUser(iggy::Identifier::String(first_username), first_replacement,
-                                          iggy::UserStatus::Active, iggy::UserUpdateOptions{}));
+        ASSERT_NO_THROW(client.UpdateUser(
+            iggy::Identifier::String(first_username),
+            iggy::UserUpdateOptions().SetUsername(first_replacement).SetStatus(iggy::UserStatus::Active)));
         RenameTrackedUser(first_username, first_replacement);
-        ASSERT_NO_THROW(client.UpdateUser(iggy::Identifier::String(second_username), second_replacement,
-                                          iggy::UserStatus::Active, iggy::UserUpdateOptions{}));
+        ASSERT_NO_THROW(client.UpdateUser(
+            iggy::Identifier::String(second_username),
+            iggy::UserUpdateOptions().SetUsername(second_replacement).SetStatus(iggy::UserStatus::Active)));
         RenameTrackedUser(second_username, second_replacement);
 
         const auto fetched_first  = client.GetUser(iggy::Identifier::String(first_replacement));
@@ -854,8 +868,9 @@ TEST_F(E2E_Client, UpdateUserRejectsUsernameOutsideLengthBounds) {
         const auto created = CreateUser(client, source, "secret123", iggy::UserStatus::Active);
 
         for (const auto &replacement : invalid_usernames) {
-            ASSERT_THROW(client.UpdateUser(iggy::Identifier::String(source), replacement, iggy::UserStatus::Active,
-                                           iggy::UserUpdateOptions{}),
+            ASSERT_THROW(client.UpdateUser(
+                             iggy::Identifier::String(source),
+                             iggy::UserUpdateOptions().SetUsername(replacement).SetStatus(iggy::UserStatus::Active)),
                          std::exception);
         }
         const auto fetched = client.GetUser(iggy::Identifier::String(source));
@@ -877,8 +892,9 @@ TEST_F(E2E_Client, UpdateUserAcceptsNonAsciiAndNonAlphabeticUsername) {
     for (std::size_t index = 0; index < 3; ++index) {
         ASSERT_NO_THROW({
             const auto created = CreateUser(client, sources[index], "secret123", iggy::UserStatus::Active);
-            ASSERT_NO_THROW(client.UpdateUser(iggy::Identifier::String(sources[index]), replacements[index],
-                                              iggy::UserStatus::Active, iggy::UserUpdateOptions{}));
+            ASSERT_NO_THROW(client.UpdateUser(
+                iggy::Identifier::String(sources[index]),
+                iggy::UserUpdateOptions().SetUsername(replacements[index]).SetStatus(iggy::UserStatus::Active)));
             RenameTrackedUser(sources[index], replacements[index]);
             const auto fetched = client.GetUser(iggy::Identifier::String(replacements[index]));
             EXPECT_EQ(fetched.Id(), created.Id());
@@ -900,9 +916,9 @@ TEST_F(E2E_Client, UpdateUserRejectsInvalidStatusWithoutRenamingTarget) {
         const auto created = CreateUser(client, username, "secret123", iggy::UserStatus::Active);
         for (const auto status : statuses) {
             const std::string replacement = GetRandomName(50);
-            ASSERT_THROW(
-                client.UpdateUser(iggy::Identifier::String(username), replacement, status, iggy::UserUpdateOptions{}),
-                std::exception);
+            ASSERT_THROW(client.UpdateUser(iggy::Identifier::String(username),
+                                           iggy::UserUpdateOptions().SetUsername(replacement).SetStatus(status)),
+                         std::exception);
             ASSERT_THROW(client.GetUser(iggy::Identifier::String(replacement)), std::exception);
         }
         const auto fetched = client.GetUser(iggy::Identifier::String(username));
@@ -920,9 +936,11 @@ TEST_F(E2E_Client, UpdateUserRejectsDuplicateUsernameWithoutChangingStatus) {
     ASSERT_NO_THROW({
         const auto target   = CreateUser(client, target_username, "secret123", iggy::UserStatus::Active);
         const auto conflict = CreateUser(client, conflict_username, "secret123", iggy::UserStatus::Inactive);
-        ASSERT_THROW(client.UpdateUser(iggy::Identifier::String(target_username), conflict_username,
-                                       iggy::UserStatus::Inactive, iggy::UserUpdateOptions{}),
-                     std::exception);
+        ASSERT_THROW(
+            client.UpdateUser(
+                iggy::Identifier::String(target_username),
+                iggy::UserUpdateOptions().SetUsername(conflict_username).SetStatus(iggy::UserStatus::Inactive)),
+            std::exception);
         const auto fetched_target   = client.GetUser(iggy::Identifier::String(target_username));
         const auto fetched_conflict = client.GetUser(iggy::Identifier::String(conflict_username));
         EXPECT_EQ(fetched_target.Id(), target.Id());
@@ -938,8 +956,9 @@ TEST_F(E2E_Client, UpdateUserAllowsCurrentUsernameWhileChangingStatus) {
     const std::string username = GetRandomName(50);
     ASSERT_NO_THROW({
         const auto created = CreateUser(client, username, "secret123", iggy::UserStatus::Active);
-        ASSERT_NO_THROW(client.UpdateUser(iggy::Identifier::String(username), username, iggy::UserStatus::Inactive,
-                                          iggy::UserUpdateOptions{}));
+        ASSERT_NO_THROW(
+            client.UpdateUser(iggy::Identifier::String(username),
+                              iggy::UserUpdateOptions().SetUsername(username).SetStatus(iggy::UserStatus::Inactive)));
         const auto fetched = client.GetUser(iggy::Identifier::String(username));
         EXPECT_EQ(fetched.Id(), created.Id());
         EXPECT_EQ(fetched.Status(), iggy::UserStatus::Inactive);
@@ -960,8 +979,9 @@ TEST_F(E2E_Client, UpdateUserPreservesPasswordPermissionsAndCreationData) {
     permissions.SetGlobal(global);
     ASSERT_NO_THROW({
         const auto created = CreateUser(root_client, username, "known-secret", iggy::UserStatus::Active, permissions);
-        ASSERT_NO_THROW(root_client.UpdateUser(iggy::Identifier::String(username), replacement,
-                                               iggy::UserStatus::Active, iggy::UserUpdateOptions{}));
+        ASSERT_NO_THROW(root_client.UpdateUser(
+            iggy::Identifier::String(username),
+            iggy::UserUpdateOptions().SetUsername(replacement).SetStatus(iggy::UserStatus::Active)));
         RenameTrackedUser(username, replacement);
         const auto fetched = root_client.GetUser(iggy::Identifier::String(replacement));
         EXPECT_EQ(fetched.Id(), created.Id());
@@ -983,12 +1003,14 @@ TEST_F(E2E_Client, UpdateUserToInactiveBlocksFreshLoginUntilReactivated) {
     auto user_client           = GetLoggedOutHighLevelClient();
     const std::string username = GetRandomName(50);
     ASSERT_NO_THROW({ CreateUser(root_client, username, "known-secret", iggy::UserStatus::Active); });
-    ASSERT_NO_THROW(root_client.UpdateUser(iggy::Identifier::String(username), username, iggy::UserStatus::Inactive,
-                                           iggy::UserUpdateOptions{}));
+    ASSERT_NO_THROW(
+        root_client.UpdateUser(iggy::Identifier::String(username),
+                               iggy::UserUpdateOptions().SetUsername(username).SetStatus(iggy::UserStatus::Inactive)));
     ASSERT_NO_THROW(user_client.Connect());
     ASSERT_THROW(user_client.Login(username, "known-secret"), std::exception);
-    ASSERT_NO_THROW(root_client.UpdateUser(iggy::Identifier::String(username), username, iggy::UserStatus::Active,
-                                           iggy::UserUpdateOptions{}));
+    ASSERT_NO_THROW(
+        root_client.UpdateUser(iggy::Identifier::String(username),
+                               iggy::UserUpdateOptions().SetUsername(username).SetStatus(iggy::UserStatus::Active)));
     ASSERT_NO_THROW(user_client.Login(username, "known-secret"));
 }
 
@@ -999,8 +1021,9 @@ TEST_F(E2E_Client, UpdateUserRenameMakesOldUsernameReusable) {
     const std::string new_username = GetRandomName(50);
     ASSERT_NO_THROW({
         const auto first = CreateUser(client, old_username, "secret123", iggy::UserStatus::Active);
-        ASSERT_NO_THROW(client.UpdateUser(iggy::Identifier::String(old_username), new_username,
-                                          iggy::UserStatus::Active, iggy::UserUpdateOptions{}));
+        ASSERT_NO_THROW(
+            client.UpdateUser(iggy::Identifier::String(old_username),
+                              iggy::UserUpdateOptions().SetUsername(new_username).SetStatus(iggy::UserStatus::Active)));
         RenameTrackedUser(old_username, new_username);
         const auto second = CreateUser(client, old_username, "secret123", iggy::UserStatus::Active);
         EXPECT_EQ(client.GetUser(iggy::Identifier::String(new_username)).Username(), new_username);
@@ -1015,9 +1038,10 @@ TEST_F(E2E_Client, UpdateUserRejectsRenameToRootUsername) {
     const std::string username = GetRandomName(50);
     ASSERT_NO_THROW({
         const auto target = CreateUser(client, username, "secret123", iggy::UserStatus::Active);
-        ASSERT_THROW(client.UpdateUser(iggy::Identifier::String(username), "iggy", iggy::UserStatus::Inactive,
-                                       iggy::UserUpdateOptions{}),
-                     std::exception);
+        ASSERT_THROW(
+            client.UpdateUser(iggy::Identifier::String(username),
+                              iggy::UserUpdateOptions().SetUsername("iggy").SetStatus(iggy::UserStatus::Inactive)),
+            std::exception);
         const auto root    = client.GetUser(iggy::Identifier::String("iggy"));
         const auto fetched = client.GetUser(iggy::Identifier::String(username));
         EXPECT_EQ(root.Id(), 0u);
@@ -1037,11 +1061,11 @@ TEST_F(E2E_Client, UpdateUserWithUnsupportedOptionsRejectsAndPreservesUser) {
     ASSERT_NO_THROW({
         const auto created = CreateUser(client, username, "secret123", iggy::UserStatus::Active);
         iggy::UserUpdateOptions options;
-        options.SetRawEntries({{"not_a_real_option", "true"}});
+        options.SetRawEntries({{"not_a_real_option", "true"}})
+            .SetUsername(replacement)
+            .SetStatus(iggy::UserStatus::Inactive);
 
-        ASSERT_THROW(
-            client.UpdateUser(iggy::Identifier::String(username), replacement, iggy::UserStatus::Inactive, options),
-            iggy::IggyException);
+        ASSERT_THROW(client.UpdateUser(iggy::Identifier::String(username), options), iggy::IggyException);
 
         const auto fetched = client.GetUser(iggy::Identifier::String(username));
         EXPECT_EQ(fetched.Id(), created.Id());
@@ -1068,11 +1092,13 @@ TEST_F(LowLevelE2E_Client, ReadUsersPermissionDoesNotAllowUpdateUser) {
     ASSERT_NO_THROW({ target = CreateUser(root_client, target_username, "secret123", iggy::ffi::UserStatus::Active); });
     ASSERT_NO_THROW(caller_client->connect());
     ASSERT_NO_THROW(caller_client->login_user(caller_username, "secret123", error_info));
-    ASSERT_THROW(caller_client->update_user(make_string_identifier(target_username), true, GetRandomName(50), true,
-                                            iggy::ffi::UserStatus::Inactive, {}, error_info),
+    ASSERT_THROW(caller_client->update_user(
+                     make_string_identifier(target_username),
+                     make_user_update_options(GetRandomName(50), iggy::ffi::UserStatus::Inactive), error_info),
                  std::exception);
-    ASSERT_THROW(caller_client->update_user(make_string_identifier(caller_username), true, GetRandomName(50), true,
-                                            iggy::ffi::UserStatus::Inactive, {}, error_info),
+    ASSERT_THROW(caller_client->update_user(
+                     make_string_identifier(caller_username),
+                     make_user_update_options(GetRandomName(50), iggy::ffi::UserStatus::Inactive), error_info),
                  std::exception);
     iggy::ffi::UserInfoDetails fetched{};
     ASSERT_NO_THROW({ fetched = root_client->get_user(make_string_identifier(target_username)); });
@@ -1098,8 +1124,9 @@ TEST_F(LowLevelE2E_Client, ManageUsersPermissionAllowsUpdateWithoutReadUsers) {
     ASSERT_NO_THROW({ target = CreateUser(root_client, target_username, "secret123", iggy::ffi::UserStatus::Active); });
     ASSERT_NO_THROW(manager_client->connect());
     ASSERT_NO_THROW(manager_client->login_user(manager_username, "secret123", error_info));
-    ASSERT_NO_THROW(manager_client->update_user(make_string_identifier(target_username), true, replacement, true,
-                                                iggy::ffi::UserStatus::Inactive, {}, error_info));
+    ASSERT_NO_THROW(manager_client->update_user(make_string_identifier(target_username),
+                                                make_user_update_options(replacement, iggy::ffi::UserStatus::Inactive),
+                                                error_info));
     RenameTrackedUser(target_username, replacement);
     iggy::ffi::UserInfoDetails fetched{};
     ASSERT_NO_THROW({ fetched = root_client->get_user(make_string_identifier(replacement)); });

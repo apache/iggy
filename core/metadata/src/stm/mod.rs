@@ -41,6 +41,7 @@ pub struct ApplyContext {
     pub client_id: u128,
     pub session: u64,
     pub request: u64,
+    pub user_id: u32,
 }
 
 impl From<&PrepareHeader> for ApplyContext {
@@ -50,6 +51,7 @@ impl From<&PrepareHeader> for ApplyContext {
             client_id: header.client,
             session: header.session,
             request: header.request,
+            user_id: header.user_id,
         }
     }
 }

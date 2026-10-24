@@ -196,6 +196,7 @@ cc_binary(
         "tests/bdd/background_steps.cpp",
         "tests/bdd/messaging_steps.cpp",
         "tests/bdd/raw_command_steps.cpp",
+        "tests/bdd/resource_options_steps.cpp",
         "tests/bdd/session_contract_steps.cpp",
         "tests/bdd/world.hpp",
     ],
@@ -239,9 +240,13 @@ cc_test(
             "-fexec-charset=UTF-8",
         ],
     }),
+    data = [
+        "tests/fixtures/resource_options.json",
+    ],
     deps = [
         ":iggy-cpp",
         "@googletest//:gtest_main",
+        "@nlohmann_json//:json",
     ],
 )
 
@@ -264,11 +269,15 @@ cc_test(
             "-fexec-charset=UTF-8",
         ],
     }),
+    data = [
+        "tests/fixtures/resource_options.json",
+    ],
     tags = [
         "e2e",
     ],
     deps = [
         ":iggy-cpp",
         "@googletest//:gtest_main",
+        "@nlohmann_json//:json",
     ],
 )

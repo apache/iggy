@@ -38,7 +38,7 @@ See [Maven Central](https://central.sonatype.com/artifact/org.apache.iggy/iggy) 
 
 ### Snapshot Versions
 
-Development builds of the next release carry the version `0.9.1-SNAPSHOT`. Get them from the ASF snapshot repository:
+Development builds of the next release carry the version `0.9.2-SNAPSHOT`. Get them from the ASF snapshot repository:
 
 **Gradle:**
 
@@ -51,7 +51,7 @@ repositories {
 }
 
 dependencies {
-    implementation 'org.apache.iggy:iggy:0.9.1-SNAPSHOT'
+    implementation 'org.apache.iggy:iggy:0.9.2-SNAPSHOT'
 }
 ```
 
@@ -72,7 +72,7 @@ dependencies {
     <dependency>
         <groupId>org.apache.iggy</groupId>
         <artifactId>iggy</artifactId>
-        <version>0.9.1-SNAPSHOT</version>
+        <version>0.9.2-SNAPSHOT</version>
     </dependency>
 </dependencies>
 ```
@@ -303,6 +303,46 @@ info.getBuildTime();   // Build timestamp
 info.getGitCommit();   // Git commit hash
 info.getUserAgent();   // User-Agent string for HTTP
 ```
+
+### Resource Options
+
+Streams, topics and users carry typed options. Create calls take an options value, updates send only the keys they change, and `reset` returns an updatable key to its server default.
+
+```java
+import org.apache.iggy.identifier.StreamId;
+import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.stream.StreamOptions;
+import org.apache.iggy.system.OptionsScope;
+import org.apache.iggy.topic.CompressionAlgorithm;
+import org.apache.iggy.topic.TopicOptionKey;
+import org.apache.iggy.topic.TopicOptions;
+import org.apache.iggy.topic.TopicUpdate;
+
+import java.math.BigInteger;
+import java.security.SecureRandom;
+
+byte[] key = new byte[32];
+new SecureRandom().nextBytes(key);
+var stream = client.streams().createStream("payments", StreamOptions.builder().encryptionKey(key).build());
+stream.encryptionKeyFingerprint();  // the key itself is never returned
+
+var streamId = StreamId.of(stream.id());
+var topic = client.topics().createTopic(streamId, "orders", 1L, TopicOptions.builder()
+    .compressionAlgorithm(CompressionAlgorithm.Gzip)
+    .messageExpiry(BigInteger.valueOf(3_600_000_000L))
+    .build());
+
+client.topics().updateTopic(streamId, TopicId.of(topic.id()), TopicUpdate.builder()
+    .name("orders-v2")
+    .reset(TopicOptionKey.MESSAGE_EXPIRY)
+    .build());
+
+client.system().describeOptions(OptionsScope.Topic);  // keys, kinds, defaults and flags
+```
+
+The stream key is 32 random bytes. It travels inside the create request over the client's transport, so protecting it on the network is the job of TLS. The server stores it wrapped under its own key and never returns it, reads report only its source and fingerprints. Without a key, a server with encryption enabled generates one for the stream.
+
+The typed builders refuse an update the server would refuse for its shape before anything is sent, with the server's error code. `raw(key, value)` and `rawReset(key)` reach keys this build has no field for, and the server decides whether they are allowed.
 
 ## Exception Handling
 

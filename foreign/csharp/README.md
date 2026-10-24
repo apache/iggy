@@ -28,7 +28,7 @@ The package installation and API examples target server/SDK 0.9.0. For source bu
 from the same checkout. The SDK targets .NET 8 and .NET 10; repository examples require .NET 10.
 `0.9.0` includes the independent message and consumer-offset durability options.
 
-This checkout uses binary protocol 0.11.1. Servers and applicable SDKs must deploy together; mixed versions and
+This checkout uses binary protocol 0.12.0. Servers and applicable SDKs must deploy together. Mixed versions and
 rolling upgrades are unsupported. This checkout requires fresh storage and refuses older data directories
 without modification. `--fresh` deletes existing data in the configured directory.
 See the [server recovery guide](../../core/server/README.md#upgrade-recovery).
@@ -59,6 +59,7 @@ these imports. Create the named resources before read, update, delete, send, or 
 
 ```c#
 using System.Buffers;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Apache.Iggy;
@@ -66,6 +67,7 @@ using Apache.Iggy.Configuration;
 using Apache.Iggy.Consumers;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Contracts.Auth;
+using Apache.Iggy.Encryption;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Factory;
 using Apache.Iggy.Headers;
@@ -445,6 +447,16 @@ await client.LoginWithPersonalAccessTokenAsync(patResponse!.Token);
 await client.CreateStreamAsync("my-stream");
 ```
 
+A stream can carry its own data encryption key, exactly 32 random bytes. The key travels inside the create request, so use TLS when the network is not trusted. The server stores it wrapped under its own key and never returns it: reads report only where the key came from and its fingerprints. When the server has encryption enabled and no key is given, it generates one for the stream. The key cannot change after creation.
+
+```c#
+var key = RandomNumberGenerator.GetBytes(EncryptionKeys.KEY_LENGTH);
+var stream = await client.CreateStreamAsync("payments", new StreamOptions { EncryptionKey = key });
+
+Console.WriteLine(stream?.EncryptionKeySource);      // Stream
+Console.WriteLine(stream?.EncryptionKeyFingerprint); // equals EncryptionKeys.Fingerprint(key)
+```
+
 You can reference streams by either numeric ID or name:
 
 ```c#
@@ -454,7 +466,7 @@ var streamByName = Identifier.String("my-stream");
 
 ### Creating Topics
 
-Every stream contains topics for organizing messages:
+Every stream contains topics for organizing messages. Settings a topic takes at creation go in `TopicOptions`, and every one left null keeps the server default:
 
 ```c#
 var streamId = Identifier.String("my-stream");
@@ -463,11 +475,32 @@ await client.CreateTopicAsync(
     streamId,
     name: "my-topic",
     partitionsCount: 3,
-    compressionAlgorithm: CompressionAlgorithm.None,
-    messageExpiry: TimeSpan.MaxValue,  // never expire
-    maxTopicSize: 1024 * 1024 * 1024   // 1 GiB
+    options: new TopicOptions
+    {
+        CompressionAlgorithm = CompressionAlgorithm.None,
+        MessageExpiry = TimeSpan.MaxValue,  // never expire
+        MaxTopicSize = 1024 * 1024 * 1024   // 1 GiB
+    }
 );
 ```
+
+### Updating Streams, Topics and Users
+
+An update names only what changes. Every property left null keeps the stored value, and `Reset` returns a key to its default:
+
+```c#
+await client.UpdateStreamAsync(streamId, new StreamUpdate { Name = "my-stream-v2" });
+
+await client.UpdateTopicAsync(streamId, Identifier.String("my-topic"), new TopicUpdate
+{
+    MessageExpiry = TimeSpan.FromDays(7),
+    Reset = new HashSet<TopicOptionKey> { TopicOptionKey.MaxTopicSize }
+});
+
+await client.UpdateUserAsync(Identifier.String("alice"), new UserUpdate { Status = UserStatus.Inactive });
+```
+
+Settings fixed at creation, such as compression, cannot be updated. `DescribeOptionsAsync(OptionsScope.Topic)` lists every key the server knows with its kind and whether it can be updated or reset. For a key newer than this SDK, set it through `Options` and reset it through `RawReset`, and the server decides whether the change is allowed.
 
 Note: Stream and topic names use hyphens instead of spaces. Iggy automatically replaces spaces with hyphens.
 

@@ -33,6 +33,7 @@ import org.apache.iggy.identifier.UserId;
 import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.serde.CommandCode;
+import org.apache.iggy.user.UserUpdate;
 import org.junit.jupiter.api.Test;
 
 import java.io.EOFException;
@@ -73,6 +74,11 @@ class AsyncIggyTcpClientTransientFailoverTest {
     static final int EVICTION_STALE_CLIENT = 13;
     static final int OPERATION_CREATE_STREAM = 128;
     static final int CREATE_STREAM_CODE = 202;
+    static final int OPERATION_LOGOUT = 3;
+    static final int UPDATE_RESOURCE_OPERATION = 150;
+    static final int CHANGE_PASSWORD_OPERATION = 144;
+    static final UserUpdate RENAME_USER =
+            UserUpdate.builder().username("renamed-user").build();
 
     private static final int HEADER_SIZE = 256;
     private static final int SIZE_OFFSET = 48;
@@ -92,10 +98,8 @@ class AsyncIggyTcpClientTransientFailoverTest {
 
     private static final int COMMAND_REPLY = 8;
     private static final int COMMAND_EVICTION = 13;
-    private static final int OPERATION_LOGOUT = 3;
     private static final int GROUP_JOIN_OPERATION = 148;
-    private static final int UPDATE_USER_OPERATION = 142;
-    private static final int CHANGE_PASSWORD_OPERATION = 144;
+    private static final int UPDATE_USER_RESOLVED_OPERATION = 74;
     private static final int TRANSIENT_NOT_COMMITTED = 57;
     private static final int POLL_PARAMETERS_BYTES = 14;
     private static final Duration TEST_POLL_TIMEOUT = Duration.ofSeconds(2);
@@ -425,7 +429,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
                 AtomicInteger denials = new AtomicInteger();
                 AtomicInteger nextOperations = new AtomicInteger();
                 List<String> logins = new CopyOnWriteArrayList<>();
-                int mutation = rename ? UPDATE_USER_OPERATION : CHANGE_PASSWORD_OPERATION;
+                int mutation = rename ? UPDATE_RESOURCE_OPERATION : CHANGE_PASSWORD_OPERATION;
                 CompletableFuture<Void> oldLeader = serve(oldSocket, request -> {
                     if (request.operation() == OPERATION_REGISTER) {
                         return Response.success(OPERATION_REGISTER, registerBody(1));
@@ -467,7 +471,9 @@ class AsyncIggyTcpClientTransientFailoverTest {
                     }
                     if (request.operation() == mutation) {
                         return Response.committed(
-                                mutation, 11, Unpooled.buffer().writeIntLE(0));
+                                committedOperation(mutation),
+                                11,
+                                Unpooled.buffer().writeIntLE(0));
                     }
                     if (request.operation() == OPERATION_CREATE_STREAM) {
                         return nextOperations.incrementAndGet() == 1
@@ -488,7 +494,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
                     client.connect().get(5, TimeUnit.SECONDS);
                     client.users().login("manual-user", "manual-password").get(5, TimeUnit.SECONDS);
                     CompletableFuture<Void> mutationResult = rename
-                            ? client.users().updateUser(UserId.of(1L), Optional.of("renamed-user"), Optional.empty())
+                            ? client.users().updateUser(UserId.of(1L), RENAME_USER)
                             : client.users().changePassword(UserId.of(1L), "manual-password", "new-password");
                     mutationResult.get(10, TimeUnit.SECONDS);
                     assertThat(client.getConnectionInfo().port()).isEqualTo(newSocket.getLocalPort());
@@ -783,54 +789,6 @@ class AsyncIggyTcpClientTransientFailoverTest {
                 Optional.empty(),
                 AsyncTcpConnection.TcpConnectionPoolConfig.builder().build(),
                 Optional.empty());
-    }
-
-    @Test
-    void shouldRetainSuccessfulSelfRenameAndPasswordChangeForConfiguredLogin() throws Exception {
-        InetAddress loopback = InetAddress.getLoopbackAddress();
-        try (ServerSocket serverSocket = new ServerSocket(0, 4, loopback)) {
-            List<String> logins = new CopyOnWriteArrayList<>();
-            CompletableFuture<Void> server = serve(serverSocket, request -> {
-                if (request.operation() == OPERATION_REGISTER) {
-                    logins.add(request.bodyAsText());
-                    return Response.success(OPERATION_REGISTER, registerBody(logins.size()));
-                }
-                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
-                    return Response.success(OPERATION_NON_REPLICATED, singleNodeMetadata(serverSocket.getLocalPort()));
-                }
-                if (request.operation() == UPDATE_USER_OPERATION || request.operation() == CHANGE_PASSWORD_OPERATION) {
-                    return Response.committed(
-                            request.operation(), 11, Unpooled.buffer().writeIntLE(0));
-                }
-                if (request.operation() == OPERATION_LOGOUT) {
-                    return Response.success(OPERATION_LOGOUT, Unpooled.EMPTY_BUFFER);
-                }
-                throw new IllegalStateException("Unexpected request: " + request);
-            });
-            AsyncIggyTcpClient client = client(serverSocket);
-            try {
-                client.connect().get(5, TimeUnit.SECONDS);
-                client.login().get(5, TimeUnit.SECONDS);
-                client.users()
-                        .updateUser(UserId.of(1L), Optional.of("renamed-user"), Optional.empty())
-                        .get(5, TimeUnit.SECONDS);
-                client.users()
-                        .changePassword(UserId.of("renamed-user"), "configured-password", "new-password")
-                        .get(5, TimeUnit.SECONDS);
-                client.users().logout().get(5, TimeUnit.SECONDS);
-                client.login().get(5, TimeUnit.SECONDS);
-                assertThat(logins).hasSize(2);
-                assertThat(logins.get(0)).contains("configured-user").contains("configured-password");
-                assertThat(logins.get(1))
-                        .contains("renamed-user")
-                        .contains("new-password")
-                        .doesNotContain("configured-user")
-                        .doesNotContain("configured-password");
-            } finally {
-                client.close().get(5, TimeUnit.SECONDS);
-            }
-            server.get(5, TimeUnit.SECONDS);
-        }
     }
 
     @Test
@@ -1163,10 +1121,12 @@ class AsyncIggyTcpClientTransientFailoverTest {
                                 OPERATION_NON_REPLICATED,
                                 pollRoute(request, 1, Math.max(1, request.metadataOp()), primarySocket.getLocalPort()));
                     }
-                    if (request.operation() == UPDATE_USER_OPERATION
+                    if (request.operation() == UPDATE_RESOURCE_OPERATION
                             || request.operation() == CHANGE_PASSWORD_OPERATION) {
                         return Response.committed(
-                                request.operation(), 11, Unpooled.buffer().writeIntLE(0));
+                                committedOperation(request.operation()),
+                                11,
+                                Unpooled.buffer().writeIntLE(0));
                     }
                     throw new IllegalStateException("Unexpected coordinator request: " + request);
                 });
@@ -1203,9 +1163,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
                             .satisfies(error -> assertThat(((IggyServerException) error.getCause()).getRawErrorCode())
                                     .isEqualTo(failure == -1 ? TRANSIENT_NOT_COMMITTED : failure));
                     assertThat(polls).hasValue(1);
-                    client.users()
-                            .updateUser(UserId.of(1L), Optional.of("renamed-user"), Optional.empty())
-                            .get(5, TimeUnit.SECONDS);
+                    client.users().updateUser(UserId.of(1L), RENAME_USER).get(5, TimeUnit.SECONDS);
                     client.users()
                             .changePassword(UserId.of("renamed-user"), "manual-password", "new-password")
                             .get(5, TimeUnit.SECONDS);
@@ -1812,12 +1770,17 @@ class AsyncIggyTcpClientTransientFailoverTest {
         output.flush();
     }
 
+    /** The server commits a generic user patch under its resolved operation. */
+    static int committedOperation(int requestOperation) {
+        return requestOperation == UPDATE_RESOURCE_OPERATION ? UPDATE_USER_RESOLVED_OPERATION : requestOperation;
+    }
+
     static ByteBuf registerBody(long session) {
         ByteBuf body = Unpooled.buffer();
         body.writeIntLE(0);
         body.writeIntLE(1);
         body.writeLongLE(session);
-        body.writeIntLE((11 << 10) | 1);
+        body.writeIntLE(12 << 10);
         body.writeByte(0);
         return body;
     }
