@@ -53,6 +53,10 @@ import org.apache.iggy.system.CacheMetricsKey;
 import org.apache.iggy.system.ClientInfo;
 import org.apache.iggy.system.ClientInfoDetails;
 import org.apache.iggy.system.ConsumerGroupInfo;
+import org.apache.iggy.system.MetadataChangeBody;
+import org.apache.iggy.system.MetadataChangeRecord;
+import org.apache.iggy.system.MetadataChanges;
+import org.apache.iggy.system.MetadataCurrentItem;
 import org.apache.iggy.system.OptionSpec;
 import org.apache.iggy.system.Stats;
 import org.apache.iggy.topic.Topic;
@@ -73,6 +77,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.function.Supplier;
 
 /**
  * Unified deserializer for both blocking and async clients.
@@ -561,6 +566,35 @@ public final class BytesDeserializer {
                 replicaId, name, ip, new TransportEndpoints(tcpPort, quicPort, httpPort, websocketPort), role, status);
     }
 
+    /**
+     * Reads a metadata changes answer. A group or kind this build does not know is kept with its raw body, while a
+     * truncated answer, a body with trailing bytes, an unknown reason code and a known kind under the wrong group
+     * are malformed.
+     */
+    public static MetadataChanges readMetadataChanges(ByteBuf response) {
+        return readMetadataChangesPart(() -> MetadataChangesReader.readAnswer(response));
+    }
+
+    /** Reads one change record envelope with its body. */
+    public static MetadataChangeRecord readMetadataChangeRecord(ByteBuf record) {
+        return readMetadataChangesPart(() -> MetadataChangesReader.readRecord(record));
+    }
+
+    /** Reads one current state item envelope with its body. */
+    public static MetadataCurrentItem readMetadataCurrentItem(ByteBuf item) {
+        return readMetadataChangesPart(() -> MetadataChangesReader.readItem(item));
+    }
+
+    /** Decodes a change body under its group and kind codes, all of {@code body} and nothing past it. */
+    public static MetadataChangeBody readMetadataChangeBody(int group, int kind, ByteBuf body) {
+        return readMetadataChangesPart(() -> MetadataChangesReader.readChangeBody(group, kind, body));
+    }
+
+    /** Decodes a current state item body under its group code, all of {@code body} and nothing past it. */
+    public static MetadataChangeBody readMetadataItemBody(int group, ByteBuf body) {
+        return readMetadataChangesPart(() -> MetadataChangesReader.readItemBody(group, body));
+    }
+
     public static UserInfoDetails readUserInfoDetails(ByteBuf response) {
         var userInfo = readUserInfo(response);
 
@@ -673,7 +707,7 @@ public final class BytesDeserializer {
      * build has no name for is dropped rather than failing the whole response - the wire
      * contract forwards unknown value kinds so a mixed-version cluster can round-trip them.
      */
-    private static Map<String, HeaderValue> readOptionsBlock(ByteBuf buffer, String field) {
+    static Map<String, HeaderValue> readOptionsBlock(ByteBuf buffer, String field) {
         if (buffer.readableBytes() < Integer.BYTES) {
             throw new IggyMalformedResponseException("Missing length prefix for " + field);
         }
@@ -752,12 +786,20 @@ public final class BytesDeserializer {
         return buffer.readCharSequence(toInt(length), StandardCharsets.UTF_8).toString();
     }
 
-    private static int validatedCollectionSize(long count, int readableBytes, int entryBytes, String field) {
+    static int validatedCollectionSize(long count, int readableBytes, int entryBytes, String field) {
         if (count > readableBytes / entryBytes) {
             throw new IggyMalformedResponseException(
                     field + " " + count + " exceeds remaining payload of " + readableBytes + " bytes");
         }
         return Math.toIntExact(count);
+    }
+
+    private static <T> T readMetadataChangesPart(Supplier<T> reader) {
+        try {
+            return reader.get();
+        } catch (IndexOutOfBoundsException truncated) {
+            throw new IggyMalformedResponseException("Malformed metadata changes answer: it is truncated", truncated);
+        }
     }
 
     static BigInteger readU64AsBigInteger(ByteBuf buffer) {

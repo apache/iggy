@@ -195,6 +195,7 @@ cc_binary(
     srcs = [
         "tests/bdd/background_steps.cpp",
         "tests/bdd/messaging_steps.cpp",
+        "tests/bdd/metadata_changes_steps.cpp",
         "tests/bdd/raw_command_steps.cpp",
         "tests/bdd/resource_options_steps.cpp",
         "tests/bdd/session_contract_steps.cpp",
@@ -241,6 +242,7 @@ cc_test(
         ],
     }),
     data = [
+        "tests/fixtures/metadata_changes.json",
         "tests/fixtures/resource_options.json",
     ],
     deps = [
@@ -275,6 +277,8 @@ cc_test(
     tags = [
         "e2e",
     ],
+    # The suite already takes about four of the default five minutes.
+    timeout = "long",
     deps = [
         ":iggy-cpp",
         "@googletest//:gtest_main",

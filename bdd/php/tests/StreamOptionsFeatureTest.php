@@ -19,6 +19,7 @@
 declare(strict_types=1);
 
 require_once __DIR__ . '/SharedFeatureParser.php';
+require_once __DIR__ . '/StreamSteps.php';
 require_once __DIR__ . '/TestEnvironment.php';
 
 use Iggy\Client as IggyClient;
@@ -34,11 +35,8 @@ use PHPUnit\Framework\TestCase;
 
 final class StreamOptionsFeatureTest extends TestCase
 {
-    private ?IggyClient $client = null;
-    private ?int $streamId = null;
-    private ?string $streamName = null;
-    private ?string $topicName = null;
-    private ?string $keyBase64 = null;
+    use StreamSteps;
+
     private bool $updateRejected = false;
     /** @var array<string, OptionSpec> */
     private array $streamOptionSpecs = [];
@@ -76,27 +74,7 @@ final class StreamOptionsFeatureTest extends TestCase
 
     private function runStep(string $step): void
     {
-        if ($step === 'I have a running Iggy server') {
-            $this->client = new IggyClient(TestEnvironment::serverAddress());
-            $this->client->connect();
-            $this->client->ping();
-            return;
-        }
-
-        if ($step === 'I am authenticated as the root user') {
-            $this->requireClient()->loginUser(TestEnvironment::rootUsername(), TestEnvironment::rootPassword());
-            return;
-        }
-
-        if (preg_match('/^I create a stream named "([^"]+)" with an encryption key of 32 bytes valued (\d+)$/', $step, $matches) === 1
-            || preg_match('/^a stream named "([^"]+)" with an encryption key of 32 bytes valued (\d+) exists$/', $step, $matches) === 1) {
-            $this->keyBase64 = base64_encode(str_repeat(chr((int) $matches[2]), 32));
-            $this->createStream($matches[1], $this->keyBase64);
-            return;
-        }
-
-        if (preg_match('/^I create a stream named "([^"]+)" without an encryption key$/', $step, $matches) === 1) {
-            $this->createStream($matches[1], null);
+        if ($this->runStreamStep($step)) {
             return;
         }
 
@@ -137,12 +115,6 @@ final class StreamOptionsFeatureTest extends TestCase
             return;
         }
 
-        if (preg_match('/^I create a topic named "([^"]+)" with (\d+) partition in the stream$/', $step, $matches) === 1) {
-            $this->topicName = $matches[1];
-            $this->requireClient()->createTopic($this->requireStreamId(), $this->topicName, (int) $matches[2], null, null, null, null);
-            return;
-        }
-
         if (preg_match('/^I send a message with payload "([^"]+)" to the topic$/', $step, $matches) === 1) {
             assert_not_null($this->topicName);
             $this->requireClient()->sendMessages($this->requireStreamId(), $this->topicName, 0, [new SendMessage($matches[1])]);
@@ -155,12 +127,6 @@ final class StreamOptionsFeatureTest extends TestCase
                 $this->requireStreamId(), $this->topicName, 0, PollingStrategy::offset(0), 10, false,
             );
             assert_same([$matches[1]], collect_payloads($messages));
-            return;
-        }
-
-        if (preg_match('/^I rename the stream to "([^"]+)"$/', $step, $matches) === 1) {
-            $this->requireClient()->updateStream($this->requireStreamId(), name: $matches[1]);
-            $this->streamName = $matches[1];
             return;
         }
 
@@ -217,27 +183,6 @@ final class StreamOptionsFeatureTest extends TestCase
         assert_true(array_key_exists($key, $this->streamOptionSpecs), "{$key} must be described");
 
         return $this->streamOptionSpecs[$key];
-    }
-
-    private function createStream(string $name, ?string $key): void
-    {
-        $this->requireClient()->createStream($name, $key);
-        $stream = $this->requireClient()->getStream($name);
-        assert_not_null($stream);
-        $this->streamId = $stream->id;
-        $this->streamName = $name;
-    }
-
-    private function requireClient(): IggyClient
-    {
-        assert_not_null($this->client);
-        return $this->client;
-    }
-
-    private function requireStreamId(): int
-    {
-        assert_not_null($this->streamId);
-        return $this->streamId;
     }
 
     private function requireStream(): StreamDetails

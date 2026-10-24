@@ -11,7 +11,7 @@ certifi = { timestamp = "0001-01-01T00:00:00Z", span = "P2D" }
 
 [[package]]
 name = "apache-iggy"
-version = "0.9.1.dev2"
+version = "0.9.1.dev3"
 source = { editable = "." }
 
 [package.optional-dependencies]

@@ -294,13 +294,23 @@ async fn given_pending_attached_poll_when_metadata_changes_should_fence_only_aff
                 table.end_session(CLIENT, USER, table.get_epoch(CLIENT).unwrap(), 100);
             }
             Change::Leave => {
-                streams.remove_consumer_group_member(CLIENT, IggyTimestamp::default(), 0);
+                streams.remove_consumer_group_member(CLIENT, IggyTimestamp::default(), 0, None);
             }
             Change::OtherLeave => {
-                streams.remove_consumer_group_member(OTHER_CLIENT, IggyTimestamp::default(), 0);
+                streams.remove_consumer_group_member(
+                    OTHER_CLIENT,
+                    IggyTimestamp::default(),
+                    0,
+                    None,
+                );
             }
             Change::MissingLeave => {
-                streams.remove_consumer_group_member(OTHER_CLIENT + 1, IggyTimestamp::default(), 0);
+                streams.remove_consumer_group_member(
+                    OTHER_CLIENT + 1,
+                    IggyTimestamp::default(),
+                    0,
+                    None,
+                );
             }
             Change::Rejoin => apply_poll_metadata(
                 &owner,
@@ -1357,7 +1367,7 @@ async fn given_queued_offset_write_when_parent_or_history_changes_should_fence_a
                     .unwrap();
             }
             Change::Leave => {
-                streams.remove_consumer_group_member(PARENT, IggyTimestamp::default(), 0);
+                streams.remove_consumer_group_member(PARENT, IggyTimestamp::default(), 0, None);
             }
             Change::Delete => apply_poll_metadata(
                 &owner,

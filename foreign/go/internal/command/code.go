@@ -27,6 +27,7 @@ const (
 	DescribeOptionsCode      Code = 13
 	BindSessionCode          Code = 15
 	UpdateResourceCode       Code = 16
+	GetMetadataChangesCode   Code = 17
 	GetMeCode                Code = 20
 	GetClientCode            Code = 21
 	GetClientsCode           Code = 22

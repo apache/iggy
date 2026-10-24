@@ -921,6 +921,20 @@ clients_table_max = 8192
 # instead, and the client retries it until its deadline. 0 means no cap.
 partitions_max = 0
 
+# Records the metadata change log keeps for streams, topics, partitions,
+# consumer groups, users and personal access tokens. Once the count passes
+# it, the oldest records go, and a reader whose position they held must
+# rebuild from current state. The log is part of the metadata snapshot, so a
+# larger value costs memory and checkpoint size. Node-local: replicas may keep
+# different depths. Must be between 1 and 1048576. Each of the two record
+# budgets also keeps at most 128 MiB of record bodies.
+change_log_resource_capacity = 65536
+
+# Records the metadata change log keeps for sessions and consumer group
+# membership. A separate budget, so a login or membership storm cannot evict
+# resource history. Must be between 1 and 1048576.
+change_log_activity_capacity = 16384
+
 # Per-partition consensus plane tunables. Unlike [metadata] (one shard-0
 # plane), a pipeline exists per partition, so raising this multiplies pinned
 # request-buffer memory by the partition count. Keep it modest.

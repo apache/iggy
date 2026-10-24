@@ -146,7 +146,7 @@ The server, SDKs and CLI are versioned independently. For example, server 0.9.0 
 
 We also publish edge releases (versions with an `-edge.N` suffix, and `apache/iggy:edge`) for the SDKs and the Docker images. They track the latest changes, but are not guaranteed to be stable and are not recommended for production use.
 
-This checkout moves the binary protocol to 0.12.0 and the metadata snapshot format to 13. Both are breaking: older clients and servers do not interoperate with it, and data directories written by older releases are refused. See [Upgrade recovery](core/server/README.md#upgrade-recovery).
+This checkout moves the binary protocol to 0.12.0 and the metadata snapshot format to 14. Both are breaking: older clients and servers do not interoperate with it, and data directories written by older releases are refused. See [Upgrade recovery](core/server/README.md#upgrade-recovery).
 
 ---
 
@@ -308,6 +308,8 @@ Rust HTTP callers can use `HttpClient::send_messages_with_durability` to read th
 The CLI exposes `--durability persisted` and `--consumer-offset-durability persisted` on `topic create`. Select either independently. The policy names describe completion guarantees and do not prescribe an I/O syscall.
 
 Streams, topics and users carry options from one catalog, listed by `iggy options <scope>` and changed by one sparse update. Each encrypted stream has its own data key, wrapped under the server's `[encryption] key`, and a stream created without encryption stays plaintext for life. Rotating the server key is a two-phase change through `previous_keys` and `retired_kek_fingerprints`. See [Resource options](core/server/README.md#resource-options) and [Stream encryption](core/server/README.md#stream-encryption).
+
+Each node keeps a bounded log of the committed metadata changes, such as a stream created, a topic renamed, a user's permissions changed or a session closed. A client with `manage_servers` follows it with `metadata.changes` on every transport, `GET /metadata/changes` over HTTP or `iggy metadata changes`, and rebuilds from current state pages when its position falls out of the log. See [Metadata changes](core/server/README.md#metadata-changes).
 
 For the detailed documentation of the configuration file, please refer to the [configuration](https://iggy.apache.org/docs/server/configuration) section.
 

@@ -46,6 +46,7 @@ use consensus::{
 #[cfg(any(test, feature = "simulator"))]
 use crossfire::AsyncRxTrait;
 use futures::FutureExt;
+use iggy_binary_protocol::responses::system::GetMetadataChangesResponse;
 use iggy_binary_protocol::{
     CHECKSUM_UNSEALED, Command, CommitHeader, ConsensusHeader, ConsumerSession,
     ConsumerSessionHeartbeatHeader, DoViewChangeHeader, ForwardCompletionHeader,
@@ -59,7 +60,9 @@ use iggy_binary_protocol::{
 #[cfg(feature = "simulator")]
 use iggy_common::PartitionStats;
 use iggy_common::variadic;
-use iggy_common::{ConsumerKind, EncryptorKind, IggyError, IggyExpiry, IggyTimestamp};
+use iggy_common::{
+    ConsumerKind, EncryptorKind, IggyError, IggyExpiry, IggyTimestamp, MetadataChangesQuery,
+};
 use journal::superblock::{PingPongSuperblock, SuperblockStore};
 use journal::{Journal, JournalHandle};
 use message_bus::client_listener::RequestHandler;
@@ -247,6 +250,16 @@ pub enum MetadataSubmit {
         session: u64,
         secret: iggy_binary_protocol::requests::users::login_register::BindSecret,
         reply: Sender<Result<(u32, u64, consensus::client_table::SessionAttachment), IggyError>>,
+    },
+    /// A home shard asks for one current state page of `metadata.changes`:
+    /// the client table, the token index and the only write side of the
+    /// state live on shard 0, which checks `user_id` again right before it
+    /// projects.
+    MetadataCurrentState {
+        /// Boxed so the inbox slot every frame pays for stays small.
+        query: Box<MetadataChangesQuery>,
+        user_id: u32,
+        reply: Sender<Result<GetMetadataChangesResponse, IggyError>>,
     },
     Register {
         vsr_client_id: u128,
@@ -16345,6 +16358,7 @@ mod partition_placement_tests {
     use journal::prepare_journal::PrepareJournal;
     use message_bus::IggyMessageBus;
     use metadata::MuxStateMachine;
+    use metadata::change_log::ChangeLogCapacities;
     use metadata::impls::metadata::IggySnapshot;
     use metadata::impls::recovery::{ReplicaIdentity, recover};
     use metadata::stm::stream::Streams;
@@ -16798,7 +16812,7 @@ mod partition_placement_tests {
             JOURNAL_SLOTS,
             CLIENTS_TABLE_MAX,
             |_| {},
-            |_, _| {},
+            ChangeLogCapacities::default(),
         )
         .await
         .unwrap();

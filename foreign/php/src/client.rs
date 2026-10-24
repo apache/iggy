@@ -36,6 +36,7 @@ use crate::consumer::{AutoCommit, IggyConsumer};
 use crate::durability::Durability as PhpDurability;
 use crate::error::to_php_exception;
 use crate::identifier::PhpIdentifier;
+use crate::metadata_changes::{MetadataChangeGroup, MetadataChangeStart, MetadataChanges};
 use crate::options::{OptionSpec, OptionsScope, StreamOptionKey, TopicOptionKey, reset_names};
 use crate::receive_message::{PollingStrategy, ReceiveMessage};
 use crate::runtime::runtime;
@@ -421,6 +422,47 @@ impl IggyClient {
         })
     }
 
+    /// Reads one page of the metadata change log, or of the current state.
+    ///
+    /// Needs root or the global `manage_servers` permission. `groups` takes
+    /// `Iggy\MetadataChangeGroup` cases, empty for every group, and a current state scan
+    /// needs the parent groups of each group. `since` and `until` are microseconds as an int
+    /// or a decimal string, and only apply to `earliest` and `after`. `limit` is 1 to 1000,
+    /// 100 when null. A query the server would refuse throws `Invalid command` (code 3)
+    /// before anything is sent.
+    #[php(defaults(groups = Vec::<MetadataChangeGroup>::new()))]
+    pub fn get_metadata_changes(
+        &self,
+        start: &MetadataChangeStart,
+        groups: Vec<MetadataChangeGroup>,
+        since: Option<&Zval>,
+        until: Option<&Zval>,
+        limit: Option<&Zval>,
+    ) -> PhpResult<MetadataChanges> {
+        let timestamp = |micros: u64| {
+            IggyTimestamp::checked_from_micros(micros)
+                .ok_or_else(|| to_php_exception(IggyError::InvalidCommand))
+        };
+        let query = MetadataChangesQuery {
+            start: start.inner.clone(),
+            groups: groups.into_iter().map(Into::into).collect(),
+            since: optional_u64(since, "since")?.map(timestamp).transpose()?,
+            until: optional_u64(until, "until")?.map(timestamp).transpose()?,
+            limit: optional_unsigned(limit, "limit")?
+                .unwrap_or(MetadataChangesQuery::default().limit),
+        };
+        query.validate().map_err(to_php_exception)?;
+        let inner = self.inner.clone();
+
+        runtime().block_on(async move {
+            inner
+                .get_metadata_changes(&query)
+                .await
+                .map(MetadataChanges::from)
+                .map_err(to_php_exception)
+        })
+    }
+
     /// Gets a topic by stream and topic id/name.
     pub fn get_topic(
         &self,
@@ -697,9 +739,13 @@ fn pending_limit(
 
 // u64 values above PHP_INT_MAX, such as the never-expire sentinel, only fit a decimal string.
 fn optional_u64(value: Option<&Zval>, field: &str) -> PhpResult<Option<u64>> {
-    let Some(value) = value.filter(|value| !value.is_null()) else {
-        return Ok(None);
-    };
+    value
+        .filter(|value| !value.is_null())
+        .map(|value| unsigned_argument(value, field))
+        .transpose()
+}
+
+pub(crate) fn unsigned_argument(value: &Zval, field: &str) -> PhpResult<u64> {
     let number = match (value.long(), value.str()) {
         (Some(number), _) => u64::try_from(number).ok(),
         (None, Some(text))
@@ -709,9 +755,9 @@ fn optional_u64(value: Option<&Zval>, field: &str) -> PhpResult<Option<u64>> {
         }
         _ => None,
     };
-    number.map(Some).ok_or_else(|| {
+    number.ok_or_else(|| {
         to_php_exception(format!(
-            "'{field}' must be a non-negative integer, a decimal string or null"
+            "'{field}' must be a non-negative integer or a decimal string"
         ))
     })
 }

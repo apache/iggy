@@ -609,7 +609,11 @@ pub(in crate::http) mod tests {
         WireName, WireOptions,
     };
     use iggy_common::create_personal_access_token::CreatePersonalAccessToken;
-    use iggy_common::{IggyByteSize, IggyError, IggyTimestamp, UserStatus};
+    use iggy_common::defaults::DEFAULT_ROOT_USER_ID as ROOT_USER_ID;
+    use iggy_common::{
+        IggyByteSize, IggyError, IggyTimestamp, MetadataChangeCursor, MetadataChangePhase,
+        MetadataChangeStatus, UserStatus,
+    };
     use message_bus::IggyMessageBus;
     use message_bus::installer::conn_info::ClientTransportKind;
     use message_bus::transports::tls::install_default_crypto_provider;
@@ -618,6 +622,7 @@ pub(in crate::http) mod tests {
     use metadata::stm::StateHandler;
     use metadata::stm::authz::GatedApply;
     use metadata::stm::stream::StreamsInner;
+    use metadata::stm::user::ROOT_USER_CREATED_AT_MICROS;
     use metadata::stm::user::{CreatePersonalAccessTokenRequest, PAT_TOKEN_HASH_BYTES};
     use partitions::{IggyPartitions, PartitionPathLayout, PartitionsConfig};
     use send_wrapper::SendWrapper;
@@ -643,7 +648,7 @@ pub(in crate::http) mod tests {
     use crate::http::error::{ConsistencyQuery, WriteError};
     use crate::http::extractor::{Authenticated, Identity};
     use crate::http::handlers::{
-        create_pat, get_client, get_clients, get_metrics, get_stats, get_user,
+        create_pat, get_client, get_clients, get_metadata_changes, get_metrics, get_stats, get_user,
     };
     use crate::http::metrics::HttpMetrics;
     use crate::http::relay_proof::RelayKey;
@@ -755,6 +760,93 @@ pub(in crate::http) mod tests {
                 "the replacement account must retain self access with its own token"
             );
         }
+    }
+
+    #[compio::test]
+    async fn given_metadata_changes_requests_over_http_should_refuse_bad_queries_and_answer_pages()
+    {
+        let state = read_state();
+        commit_user_request(
+            &state,
+            READER_CREATED_AT,
+            Operation::CreateUser,
+            &create_reader_request().to_bytes(),
+        );
+        let metadata = state.shard.plane.metadata();
+        metadata
+            .change_log()
+            .append(
+                &PrepareHeader {
+                    op: 1,
+                    checksum: 0x5eed,
+                    ..PrepareHeader::default()
+                },
+                Vec::new(),
+            )
+            .unwrap();
+        metadata.advance_applied_frontier(1);
+        let query = |pairs: &[(&str, &str)]| {
+            Query(
+                pairs
+                    .iter()
+                    .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        let reader = authenticated_identity(&state, READER_ID, READER_CREATED_AT).await;
+        let denied = get_metadata_changes(State(state.clone()), reader, query(&[]))
+            .await
+            .into_response();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        for refused in [
+            &[("from", "latest"), ("from", "latest")][..],
+            &[("from", "earliest"), ("cursor", "mc1_")],
+            &[("from", "earliest"), ("since", "5"), ("until", "4")],
+            &[("from", "latest"), ("since", "1")],
+            &[("from", "current"), ("until", "1")],
+            &[("from", "current"), ("groups", "topics")],
+            &[("after", "mc1_not-a-cursor")],
+            &[("current_after", "cs1_AAAA")],
+            &[("from", "earliest"), ("limit", "0")],
+            &[("from", "earliest"), ("limit", "1001")],
+            &[("from", "earliest"), ("limit", "01")],
+            &[("from", "earliest"), ("limit", "+5")],
+            &[("from", "earliest"), ("groups", "streams,,users")],
+            &[("from", "earliest"), ("groups", "nope")],
+        ] {
+            let root =
+                authenticated_identity(&state, ROOT_USER_ID, ROOT_USER_CREATED_AT_MICROS).await;
+            let response = get_metadata_changes(State(state.clone()), root, query(refused))
+                .await
+                .into_response();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{refused:?}");
+        }
+
+        let root = authenticated_identity(&state, ROOT_USER_ID, ROOT_USER_CREATED_AT_MICROS).await;
+        let Ok(Json(latest)) =
+            get_metadata_changes(State(state.clone()), root, query(&[("from", "latest")])).await
+        else {
+            panic!("root reads the feed");
+        };
+        assert_eq!(latest.status, MetadataChangeStatus::Ok);
+        assert_eq!(latest.log_id, Some(0x5eed));
+        assert_eq!(latest.next, Some(MetadataChangeCursor::zero(0x5eed)));
+
+        let root = authenticated_identity(&state, ROOT_USER_ID, ROOT_USER_CREATED_AT_MICROS).await;
+        let Ok(Json(users)) = get_metadata_changes(
+            State(state.clone()),
+            root,
+            query(&[("from", "current"), ("groups", "users")]),
+        )
+        .await
+        else {
+            panic!("root reads the current state");
+        };
+        assert_eq!(users.phase, MetadataChangePhase::Current);
+        assert_eq!(users.items.len(), 2, "root and the reader");
+        assert_eq!(users.current_page_token, None);
     }
 
     /// The client reads gather from every shard after their gate, and the

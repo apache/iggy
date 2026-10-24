@@ -22,6 +22,8 @@ package org.apache.iggy.client.async;
 import org.apache.iggy.cluster.ClusterMetadata;
 import org.apache.iggy.system.ClientInfo;
 import org.apache.iggy.system.ClientInfoDetails;
+import org.apache.iggy.system.MetadataChanges;
+import org.apache.iggy.system.MetadataChangesQuery;
 import org.apache.iggy.system.OptionSpec;
 import org.apache.iggy.system.OptionsScope;
 import org.apache.iggy.system.Stats;
@@ -59,6 +61,19 @@ public interface SystemClient {
      * @return A CompletableFuture containing the catalog entries
      */
     CompletableFuture<List<OptionSpec>> describeOptions(OptionsScope scope);
+
+    /**
+     * Reads one page of the node's metadata change log, or of its current state, asynchronously.
+     *
+     * <p>A mirror keeps a cursor, asks for the records after it and stores the returned
+     * {@link MetadataChanges#next()}. On expired or reset it rebuilds from current state pages and follows the
+     * changes after the anchor they return. Requires root or the global manage servers permission. A query the rules
+     * refuse completes exceptionally with invalid command before anything is sent.
+     *
+     * @param query where to start, which groups, the time range and the page size
+     * @return A CompletableFuture containing the page
+     */
+    CompletableFuture<MetadataChanges> getMetadataChanges(MetadataChangesQuery query);
 
     /**
      * Gets information about the current client asynchronously.

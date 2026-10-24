@@ -27,11 +27,13 @@
 //! the section gains `{index, result}` entries and these enums survive unchanged,
 //! so no variant may encode a carrier assumption (no index, no framing).
 
+use crate::change_log::AppliedChange;
 use bytes::{Bytes, BytesMut};
 use iggy_binary_protocol::Operation;
 use iggy_binary_protocol::consensus::{
     REJECTION_SECTION_LEN, RESULT_COUNT_LEN, write_rejection_section,
 };
+use iggy_binary_protocol::primitives::metadata_changes::WireUserKey;
 
 /// Decode side of the result section, shared with every client (SDK, simulator)
 /// via `binary_protocol`. Re-exported so server-side callers keep one import.
@@ -58,11 +60,15 @@ pub enum DeletedResource {
 pub struct ApplyReply {
     pub code: u32,
     pub body: Bytes,
-    /// Local apply effect, recomputed from the committed operation on every replay.
-    /// It is not part of the client reply or persisted receipt.
-    pub(crate) revoked_user: Option<u32>,
+    /// The user whose sessions end. A local apply effect, recomputed from the
+    /// committed operation on every replay and never part of the client reply
+    /// or persisted receipt.
+    pub(crate) revoked_user: Option<WireUserKey>,
     /// Local apply effect, like `revoked_user`: the grants on this resource must go.
     pub(crate) deleted_resource: Option<DeletedResource>,
+    /// Public results for the change log, in canonical order. Like
+    /// `revoked_user`, never part of the client reply or persisted receipt.
+    pub(crate) changes: Vec<AppliedChange>,
 }
 
 impl ApplyReply {
@@ -74,6 +80,7 @@ impl ApplyReply {
             body,
             revoked_user: None,
             deleted_resource: None,
+            changes: Vec::new(),
         }
     }
 
@@ -86,6 +93,7 @@ impl ApplyReply {
             body: Bytes::new(),
             revoked_user: None,
             deleted_resource: None,
+            changes: Vec::new(),
         }
     }
 

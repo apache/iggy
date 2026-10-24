@@ -27,6 +27,11 @@ import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.stream.StreamDetails;
+import org.apache.iggy.system.MetadataChangeBody;
+import org.apache.iggy.system.MetadataChangeGroup;
+import org.apache.iggy.system.MetadataChangeStart;
+import org.apache.iggy.system.MetadataChangeStatus;
+import org.apache.iggy.system.MetadataChangesQuery;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 import org.slf4j.Logger;
@@ -37,6 +42,7 @@ import java.math.BigInteger;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -106,6 +112,40 @@ class TlsConnectionTest extends BaseIntegrationTest {
                     .isInstanceOfAny(ExecutionException.class, TimeoutException.class);
         } finally {
             executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void readMetadataChangesOverTlsShouldFollowACreatedStream() {
+        var client = IggyTcpClient.builder()
+                .host(TLS_HOST)
+                .port(serverTcpPort())
+                .enableTls()
+                .tlsCertificate(CERTS_DIR.resolve("iggy_ca_cert.pem").toFile())
+                .credentials("iggy", "iggy")
+                .buildAndLogin();
+        var query = MetadataChangesQuery.builder()
+                .start(MetadataChangeStart.latest())
+                .groups(MetadataChangeGroup.STREAMS)
+                .build();
+        var latest = client.system().getMetadataChanges(query);
+        String name = "tls-changes-" + UUID.randomUUID().toString().substring(0, 8);
+        StreamDetails stream = client.streams().createStream(name);
+
+        try {
+            var page = client.system()
+                    .getMetadataChanges(query.withStart(
+                            MetadataChangeStart.after(latest.next().orElseThrow())));
+
+            assertThat(page.status()).isEqualTo(MetadataChangeStatus.OK);
+            assertThat(page.records())
+                    .anySatisfy(record -> assertThat(record.body())
+                            .isInstanceOfSatisfying(MetadataChangeBody.StreamChange.class, created -> {
+                                assertThat(created.streamId()).isEqualTo(stream.id());
+                                assertThat(created.name()).isEqualTo(name);
+                            }));
+        } finally {
+            client.streams().deleteStream(stream.id());
         }
     }
 

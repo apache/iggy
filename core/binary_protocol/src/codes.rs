@@ -29,6 +29,7 @@ pub const DESCRIBE_OPTIONS_CODE: u32 = 13;
 // Code 14 is retired.
 pub const BIND_SESSION_CODE: u32 = 15;
 pub const UPDATE_RESOURCE_CODE: u32 = 16;
+pub const GET_METADATA_CHANGES_CODE: u32 = 17;
 pub const GET_ME_CODE: u32 = 20;
 pub const GET_CLIENT_CODE: u32 = 21;
 pub const GET_CLIENTS_CODE: u32 = 22;
@@ -123,6 +124,7 @@ mod tests {
         DESCRIBE_OPTIONS_CODE,
         BIND_SESSION_CODE,
         UPDATE_RESOURCE_CODE,
+        GET_METADATA_CHANGES_CODE,
         GET_ME_CODE,
         GET_CLIENT_CODE,
         GET_CLIENTS_CODE,

@@ -4867,8 +4867,13 @@ mod tests {
         let stm = &shard.plane.metadata().mux_stm;
         seed_consumer_group_deletion_intent(stm, 5, 0, 0, 0);
         let now = iggy_common::IggyTimestamp::now();
-        stm.streams()
-            .refresh_consumer_group_session(CLIENT_ID, NEW_SESSION, REGISTER_OP, now);
+        stm.streams().refresh_consumer_group_session(
+            CLIENT_ID,
+            NEW_SESSION,
+            REGISTER_OP,
+            now,
+            None,
+        );
         assert_eq!(
             stm.streams().consumer_group_pending_revocations().len(),
             1,
@@ -5747,8 +5752,12 @@ mod tests {
         assert_eq!(assigned(200).map(|p| p.len()), Some(1));
 
         // Client 100 disconnects.
-        mux.streams()
-            .remove_consumer_group_member(100, iggy_common::IggyTimestamp::default(), 6);
+        mux.streams().remove_consumer_group_member(
+            100,
+            iggy_common::IggyTimestamp::default(),
+            6,
+            None,
+        );
         assert_eq!(assigned(200), Some(vec![1]));
         seed_installed_owners(&mux);
 

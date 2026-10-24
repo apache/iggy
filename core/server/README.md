@@ -47,8 +47,10 @@ Command-line arguments include `--replica-id`, `--fresh` (`-f`), `--with-default
 Deploy matching server and SDK releases together. Rolling upgrades and mixed
 server versions are unsupported. Partition control frames from older servers
 carry incarnation zero and are rejected, so a mixed-version cluster cannot
-complete partition view changes. The `IGGY-RESOURCE-OPTIONS-1` storage gate
+complete partition view changes. The `IGGY-METADATA-CHANGE-LOG-1` storage gate
 requires fresh storage and rejects older data directories without modifying them.
+Metadata snapshots now carry the metadata change log and topic creation ops, so
+`IGGY-RESOURCE-OPTIONS-1` data directories must be wiped before the upgrade.
 Cached replies now preserve a committed-result marker, which older receipts lack.
 Partition creation records carry an initial view in each 16-byte assignment,
 replacing the 12-byte assignments and single request-wide view in older metadata
@@ -358,6 +360,26 @@ The primary logs each sweep that rewraps streams, each stream it cannot rewrap, 
 
 A stream created during phase 1 also carries a wrap under the old key until phase 2 drops it. Rotation changes only the wraps, so whoever already holds a stream's data key, or an old wrap together with the old server key, can still read that stream. Changing a stream's own data key is not supported.
 
+## Metadata changes
+
+Each node keeps a bounded log of the public results of committed metadata operations: streams, topics, partition counts, consumer groups and their members, users, personal access tokens and sessions. One operation can produce several records, for example a stream delete followed by the permission updates that pruned grants on it. Refused, denied and no-op operations produce none. Records are produced by the state machine on every replica alike, so a cursor taken on one node continues on another.
+
+The binary `GetMetadataChanges` command (17) serves it over TCP, QUIC and WebSocket, `GET /metadata/changes` over HTTP and `iggy metadata changes` on the command line. Reading it needs root or the global `manage_servers` permission. Other callers get `Unauthorized` (41), 403 over HTTP, whatever groups they ask for.
+
+A request starts at `earliest`, at `latest` (a cursor and no records), after a cursor, or at `current`, which pages the present state instead of history. It may name groups (`streams`, `topics`, `partitions`, `consumer_groups`, `consumer_group_members`, `users`, `personal_access_tokens`, `sessions`), a time range in microseconds and a limit from 1 to 1000. Cursors print as `mc1_` tokens and state page tokens as `cs1_` tokens. Send them back unchanged.
+
+A time range only goes with `earliest` or a cursor. A `current` request must also name the parent groups of every selected group, for example `streams` with `topics`. A request that breaks either rule is refused with `InvalidCommand` (3).
+
+A page also ends before its encoded records or items pass 1 MiB, so it can hold fewer than the limit with `has_more` set. A single larger record or item still comes alone. A current page also ends after it walks 65536 streams and topics, so it can carry a page token and no items.
+
+Each answer has a status. `ok` carries records and the `next` cursor. `behind` means this node has not applied the cursor's operation yet, so ask again or ask another node. `expired` means the node no longer holds every record after the cursor for those groups, and `reset` means the cursor belongs to another history, for example a rebuilt data directory. Neither carries a cursor: page `current` again and follow from the anchor its pages return.
+
+Records name streams and topics by id and creation op, because ids are reused after a delete. Each record carries the acting user, absent for server actions such as key rotation, partition handovers and expiry. Stream options appear only as the read routes return them: key source and fingerprints, never a stream key or its wraps.
+
+Two rings bound the log. `[metadata] change_log_resource_capacity` (default 65536) holds records of streams, topics, partitions, groups, users and tokens, and `change_log_activity_capacity` (default 16384) holds sessions and group membership, so busy sessions never evict resource history. Both accept 1 to 1048576 records. The log rides the metadata snapshot, survives restarts and moves with state transfer.
+
+Each ring also keeps at most 128 MiB of record bodies and evicts its oldest records past that, so large permission sets cannot grow the snapshot past what state transfer carries.
+
 ## Upgrade recovery
 
 This release changes protocol and storage formats. Servers and compatible
@@ -384,7 +406,7 @@ Replacing the binary does not migrate old data. Use the offline re-ingestion
 procedure above for an upgrade. A recovery from a backup must use a separately
 verified, compatible backup; copying a format marker is not a migration.
 
-Within compatible `IGGY-RESOURCE-OPTIONS-1` storage, this release reads superblock
+Within compatible `IGGY-METADATA-CHANGE-LOG-1` storage, this release reads superblock
 envelope versions 1 and 2 and writes version 2. Legacy 66- and 74-byte consensus
 records remain readable. New records atomically retain an adopted view, its
 advertised head and exact prepare headers alongside the existing consensus state.
@@ -457,7 +479,7 @@ Before a partition can serve, initialization publishes its incarnation in
 `partition-initialization/<namespace>/created.revision` under the system data
 directory. This atomic record remains outside the partition directory, including
 after that directory is lost. Preserve it with metadata and partition backups.
-Storage format `IGGY-RESOURCE-OPTIONS-1` requires this initialization contract;
+Storage format `IGGY-METADATA-CHANGE-LOG-1` requires this initialization contract;
 older data directories are refused before mutation.
 
 Retirement also writes `retirement.fence` in that external namespace directory

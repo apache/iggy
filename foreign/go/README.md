@@ -96,6 +96,85 @@ A stream encryption key is exactly 32 random bytes. Never derive it from a passw
 
 The server stores the key wrapped under its own key and never returns it. Reads report only its source and fingerprints. Without a key, a server with encryption enabled generates one for the stream, and a server without it keeps the stream plaintext and refuses a client key.
 
+## Metadata changes
+
+`GetMetadataChanges` reads the node's change log: one record per public result of a committed metadata operation, such as a stream created, a topic renamed, a user's permissions changed or a session closed. A mirror keeps a cursor, asks for the records after it, and stores the returned `Next` cursor. The call needs root or the global `manage_servers` permission.
+
+```go
+func followMetadataChanges(ctx context.Context, cli iggcon.Client, groups ...iggcon.MetadataChangeGroup) error {
+    query := iggcon.NewMetadataChangesQuery(iggcon.EarliestMetadataChangeStart(), groups...)
+    for {
+        page, err := cli.GetMetadataChanges(ctx, query)
+        if err != nil {
+            return err
+        }
+        switch page.Status {
+        case iggcon.MetadataChangeStatusOk:
+            for _, record := range page.Records {
+                log.Printf("op %d %s: %+v", record.Op, record.Kind, record.Body)
+            }
+            if page.Next != nil {
+                query.Start = iggcon.AfterMetadataChangeStart(*page.Next)
+            }
+            if !page.HasMore {
+                time.Sleep(time.Second)
+            }
+        case iggcon.MetadataChangeStatusBehind:
+            time.Sleep(100 * time.Millisecond)
+        default:
+            if query.Start, err = rebuildMetadataMirror(ctx, cli, groups); err != nil {
+                return err
+            }
+        }
+    }
+}
+
+// rebuildMetadataMirror pages the current state, then returns the position to
+// follow from.
+func rebuildMetadataMirror(
+    ctx context.Context,
+    cli iggcon.Client,
+    groups []iggcon.MetadataChangeGroup,
+) (iggcon.MetadataChangeStart, error) {
+    query := iggcon.NewMetadataChangesQuery(iggcon.CurrentMetadataChangeStart(nil), groups...)
+    for {
+        page, err := cli.GetMetadataChanges(ctx, query)
+        if err != nil {
+            return iggcon.MetadataChangeStart{}, err
+        }
+        switch page.Status {
+        case iggcon.MetadataChangeStatusBehind:
+            time.Sleep(100 * time.Millisecond)
+            continue
+        case iggcon.MetadataChangeStatusExpired, iggcon.MetadataChangeStatusReset:
+            query.Start = iggcon.CurrentMetadataChangeStart(nil)
+            continue
+        }
+        for _, item := range page.Items {
+            log.Printf("%s: %+v", item.Group, item.Body)
+        }
+        switch {
+        case page.CurrentPageToken != nil:
+            query.Start = iggcon.CurrentMetadataChangeStart(page.CurrentPageToken)
+        case page.Next != nil:
+            return iggcon.AfterMetadataChangeStart(*page.Next), nil
+        default:
+            query.Start = iggcon.CurrentMetadataChangeStart(nil)
+        }
+    }
+}
+```
+
+The sample is in `client/example_metadata_changes_test.go`.
+
+`MetadataChangeStatusExpired` means the log no longer holds the history after the cursor, and `MetadataChangeStatusReset` means the cursor belongs to another history, for example after the data directory was rebuilt. Either way the mirror rebuilds from current state pages and then follows the changes after the anchor they return.
+
+Current pages need the parent groups of every selected group, for example `MetadataChangeGroupTopics` with `MetadataChangeGroupStreams`. Keep a rebuilt state private until a change page answers `MetadataChangeStatusOk` with `HasMore` false and a `HeadOp` at or above the last current page's.
+
+Record and item bodies are typed by kind and group, for example `*iggcon.MetadataStreamChange` or `*iggcon.MetadataUserPermissionsUpdated`. A group or kind newer than this build arrives as `*iggcon.MetadataUnknownBody` with its raw codes on the record, so a mirror that cannot apply it can stop without advancing its cursor.
+
+A query that breaks the request rules, such as a limit outside 1 to 1000 or a time bound with a latest or current start, is refused with `ierror.ErrInvalidCommand` before anything is sent. Cursors and page tokens print and parse as the `mc1_` and `cs1_` text forms the HTTP API and the CLI use. Page tokens also implement `encoding.TextMarshaler` and `encoding.TextUnmarshaler`, so `encoding/json` stores them as their `cs1_` text.
+
 ## Delivery semantics
 
 Receipt access follows the server's [session and revocation policy](../../core/server/README.md#sessions-and-retry-receipts).

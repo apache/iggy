@@ -290,6 +290,23 @@ extension IggyClient {
         return try Responses.optionSpecs(try await send(.describeOptions, Requests.describeOptions(scope: scope), lineage: lineage)[...])
     }
 
+    /// Reads one page of the metadata change log or of the current state.
+    ///
+    /// The node records one change per public result of a committed metadata
+    /// operation, such as a stream created, a topic renamed, a user's
+    /// permissions changed, or a session closed. A mirror keeps a cursor,
+    /// reads the records after it, and stores the returned
+    /// ``MetadataChanges/next``. Records carry options as the read routes
+    /// return them and never key material. Needs root or the global
+    /// `manageServers` permission, and fails with
+    /// ``IggyErrorCode/unauthorized`` otherwise. An invalid query fails with
+    /// ``IggyErrorCode/invalidCommand`` before anything is sent.
+    public func getMetadataChanges(_ query: MetadataChangesQuery = MetadataChangesQuery()) async throws -> MetadataChanges {
+        let lineage = try await requireAuthenticated()
+        try query.validate()
+        return try Responses.metadataChanges(try await send(.getMetadataChanges, Requests.getMetadataChanges(query), lineage: lineage)[...])
+    }
+
     /// Captures a snapshot archive of the server state.
     public func snapshot(compression: SnapshotCompression = .deflated, types: [SystemSnapshotType] = [.all]) async throws -> Snapshot {
         let lineage = try await requireAuthenticated()

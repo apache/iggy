@@ -36,13 +36,16 @@ use iggy_binary_protocol::requests::messages::GetPartitionRouteRequest;
 use iggy_binary_protocol::requests::system::{BindSessionRequest, SessionIdentity};
 use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::{ClientVersionInfo, IGGY_PROTOCOL_VERSION, WireName};
-use iggy_common::VsrSessionControl;
 use iggy_common::wire_conversions::identifier_to_wire;
+use iggy_common::{MetadataChangeGroups, VsrSessionControl};
 use integration::harness::{TestHarness, login_root};
 
 const STREAM_NAME: &str = "auth-test-stream";
 const TOPIC_NAME: &str = "auth-test-topic";
 const INVALID_BIND_SECRET: [u8; 32] = [0; 32];
+const METADATA_READER_USERNAME: &str = "auth-test-metadata-reader";
+const METADATA_SERVER_MANAGER_USERNAME: &str = "auth-test-metadata-manager";
+const METADATA_USER_PASSWORD: &str = "auth-test-secret";
 
 /// Shared test context with identifiers used across command tests.
 struct TestContext {
@@ -89,6 +92,7 @@ pub async fn run(harness: &TestHarness) {
     assert_eq!(identity.user_id, 0, "root user should have id 0");
     setup_test_resources(&client).await;
     verify_auth_works(&client).await;
+    verify_metadata_changes_need_manage_servers(harness, &client).await;
 
     // Phase 4: Logout and verify commands fail again
     client.logout_user().await.expect("logout should succeed");
@@ -175,6 +179,10 @@ async fn test_all_commands_require_auth(client: &IggyClient, binding_identity: S
             GET_CLUSTER_METADATA_CODE => client.get_cluster_metadata().await.map(|_| ()),
             DESCRIBE_OPTIONS_CODE => client
                 .describe_options(OptionsScope::Topic)
+                .await
+                .map(|_| ()),
+            GET_METADATA_CHANGES_CODE => client
+                .get_metadata_changes(&MetadataChangesQuery::default())
                 .await
                 .map(|_| ()),
             BIND_SESSION_CODE => client
@@ -425,6 +433,78 @@ async fn verify_auth_works(client: &IggyClient) {
     // Users & PATs
     client.get_users().await.expect("get_users");
     client.get_personal_access_tokens().await.expect("get_pats");
+}
+
+/// Reading metadata changes needs `manage_servers`, whatever groups are asked
+/// for and however the scan starts.
+async fn verify_metadata_changes_need_manage_servers(harness: &TestHarness, root: &IggyClient) {
+    let mut queries = vec![
+        MetadataChangesQuery::default(),
+        MetadataChangesQuery {
+            start: MetadataChangeStart::Latest,
+            ..MetadataChangesQuery::default()
+        },
+        MetadataChangesQuery {
+            start: MetadataChangeStart::Current(None),
+            ..MetadataChangesQuery::default()
+        },
+    ];
+    queries.extend(
+        MetadataChangeGroups::all()
+            .iter()
+            .map(|group| MetadataChangesQuery {
+                groups: vec![group],
+                ..MetadataChangesQuery::default()
+            }),
+    );
+    for (username, manage_servers) in [
+        (METADATA_READER_USERNAME, false),
+        (METADATA_SERVER_MANAGER_USERNAME, true),
+    ] {
+        root.create_user(
+            username,
+            METADATA_USER_PASSWORD,
+            UserStatus::Active,
+            Some(Permissions {
+                global: GlobalPermissions {
+                    manage_servers,
+                    read_servers: true,
+                    read_streams: true,
+                    read_users: true,
+                    ..GlobalPermissions::default()
+                },
+                streams: None,
+            }),
+            &UserCreateOptions::default(),
+        )
+        .await
+        .expect("create metadata user");
+        let client = create_client(harness).await;
+        client
+            .login_user(username, METADATA_USER_PASSWORD)
+            .await
+            .expect("metadata user login");
+        for query in &queries {
+            let result = client.get_metadata_changes(query).await;
+            if manage_servers {
+                result.expect("manage_servers reads metadata changes");
+            } else {
+                let error = result.expect_err("reading metadata changes needs manage_servers");
+                assert_eq!(
+                    error.as_code(),
+                    IggyError::Unauthorized.as_code(),
+                    "{query:?}"
+                );
+            }
+        }
+        client.logout_user().await.expect("metadata user logout");
+        root.delete_user(&Identifier::named(username).unwrap())
+            .await
+            .expect("delete metadata user");
+    }
+    root.get_metadata_changes(&MetadataChangesQuery::default())
+        .await
+        .expect("root reads metadata changes");
 }
 
 async fn setup_test_resources(client: &IggyClient) {

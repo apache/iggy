@@ -39,7 +39,7 @@ services:
         trap 'cargo llvm-cov report --lcov --output-path /reports/rust-bdd-coverage.lcov' EXIT
         TEST_ARGS=()
         case "$$BDD_FEATURE" in
-          basic_messaging|leader_redirection|raw_command|session_contract|stream_crud|stream_options|resource_options_patch) TEST_ARGS=(--test "$$BDD_FEATURE") ;;
+          basic_messaging|leader_redirection|raw_command|session_contract|stream_crud|stream_options|resource_options_patch|metadata_changes) TEST_ARGS=(--test "$$BDD_FEATURE") ;;
         esac
         cargo test --locked -p bdd --features "$$BDD_RUST_FEATURES" "$${TEST_ARGS[@]}"
 
@@ -105,6 +105,7 @@ services:
           leader_redirection) FILTER='--filter-trait Category=requires-leader-awareness' ;;
           stream_options)     FILTER='--filter-trait Category=stream-options' ;;
           resource_options_patch) FILTER='--filter-trait Category=resource-options-patch' ;;
+          metadata_changes)   FILTER='--filter-trait Category=metadata-changes' ;;
           session_contract)   FILTER='--filter-trait Category=session-contract' ;;
         esac
         dotnet test $$FILTER --coverage --coverage-output-format cobertura --coverage-output csharp-bdd-coverage.cobertura.xml --results-directory /reports
@@ -124,5 +125,6 @@ services:
           stream_crud)        export CUCUMBER_FILTER_TAGS='@stream-crud' ;;
           stream_options)     export CUCUMBER_FILTER_TAGS='@stream-options' ;;
           resource_options_patch) export CUCUMBER_FILTER_TAGS='@resource-options-patch' ;;
+          metadata_changes)   export CUCUMBER_FILTER_TAGS='@metadata-changes' ;;
         esac
         gradle --no-daemon test jacocoTestReport && cp build/reports/jacoco/test/jacocoTestReport.xml /reports/java-bdd-coverage.xml

@@ -36,6 +36,7 @@ mod authz;
 mod failure;
 pub mod host;
 pub mod login_error;
+pub mod metadata_changes;
 pub mod partition;
 pub mod reads;
 mod segment_delete;
@@ -1223,8 +1224,10 @@ mod tests {
     use iggy_binary_protocol::Command;
     use iggy_binary_protocol::codes::{
         GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE,
-        GET_ME_CODE, GET_PARTITION_ROUTE_CODE, GET_STATS_CODE, POLL_MESSAGES_CODE,
+        GET_ME_CODE, GET_METADATA_CHANGES_CODE, GET_PARTITION_ROUTE_CODE, GET_STATS_CODE,
+        POLL_MESSAGES_CODE,
     };
+    use iggy_binary_protocol::primitives::metadata_changes::WireMetadataChangeStatus;
     use iggy_binary_protocol::primitives::polling_strategy::WirePollingStrategy;
     use iggy_binary_protocol::requests::consumer_offsets::{
         GetConsumerOffsetRequest, StoreConsumerOffsetRequest,
@@ -1235,8 +1238,8 @@ mod tests {
         CreateStreamRequest, UpdateStreamResolvedRequest,
     };
     use iggy_binary_protocol::requests::system::{
-        BindSessionRequest, GetClientRequest, GetClientsRequest, GetStatsRequest, ResourceTarget,
-        UpdateResourceRequest,
+        BindSessionRequest, GetClientRequest, GetClientsRequest, GetMetadataChangesRequest,
+        GetStatsRequest, ResourceTarget, UpdateResourceRequest,
     };
     use iggy_binary_protocol::requests::topics::{DeleteTopicRequest, UpdateTopicResolvedRequest};
     use iggy_binary_protocol::requests::users::login_register::{
@@ -1246,13 +1249,14 @@ mod tests {
     use iggy_binary_protocol::requests::users::{
         CreateUserRequest, DeleteUserRequest, UpdatePermissionsRequest, UpdateUserResolvedRequest,
     };
+    use iggy_binary_protocol::responses::system::GetMetadataChangesResponse;
     use iggy_binary_protocol::{
         AckLevel, ClientVersionInfo, EvictionHeader, IGGY_PROTOCOL_VERSION, ReplyHeader,
         WireConsumer,
     };
-    use iggy_binary_protocol::{WireEncode, WireIdentifier, WireName, WireOptions};
+    use iggy_binary_protocol::{WireDecode, WireEncode, WireIdentifier, WireName, WireOptions};
     use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
-    use iggy_common::{Identifier, IggyByteSize};
+    use iggy_common::{Identifier, IggyByteSize, MetadataChangeStart, MetadataChangesQuery};
     use journal::prepare_journal::PrepareJournal;
     use message_bus::installer::conn_info::ClientTransportKind;
     use metadata::impls::metadata::IggySnapshot;
@@ -1309,6 +1313,7 @@ mod tests {
                     |_| {},
                     prepare,
                 )
+                .reply
             };
             let create = CreateUserRequest {
                 username: WireName::new("original").unwrap(),
@@ -1689,6 +1694,61 @@ mod tests {
         )
         .minimum_metadata_op = metadata_op;
         read.into_generic()
+    }
+
+    #[compio::test]
+    async fn given_root_session_when_reading_metadata_changes_should_answer_pages_and_refuse_bad_bodies()
+     {
+        let (bus, shard, host) = root_host(ServerConfig::default());
+        bind_root_session(&shard, host.sessions()).await;
+        let metadata = shard.plane.metadata();
+        metadata
+            .change_log()
+            .append(
+                &PrepareHeader {
+                    op: 1,
+                    checksum: 0x5eed,
+                    ..PrepareHeader::default()
+                },
+                Vec::new(),
+            )
+            .unwrap();
+        let read = |request, body: &[u8]| {
+            let mut read = wire_request(
+                Operation::NonReplicated,
+                ROOT_CLIENT,
+                ROOT_SESSION,
+                request,
+                body,
+            );
+            bytemuck::checked::from_bytes_mut::<RequestHeader>(
+                &mut read.as_mut_slice()[..size_of::<RequestHeader>()],
+            )
+            .reserved[..4]
+                .copy_from_slice(&GET_METADATA_CHANGES_CODE.to_le_bytes());
+            read.into_generic()
+        };
+        let latest = GetMetadataChangesRequest::from(&MetadataChangesQuery {
+            start: MetadataChangeStart::Latest,
+            ..MetadataChangesQuery::default()
+        })
+        .to_bytes();
+
+        host.on_client_request(ROOT_TRANSPORT, read(1, &latest));
+        host.on_client_request(ROOT_TRANSPORT, read(2, &[0xff]));
+        await_replies(&bus, 2).await;
+
+        let replies = bus.client_replies.borrow();
+        assert_eq!(replies.len(), 2);
+        let (header, body) = replies[0].1.split_at(size_of::<ReplyHeader>());
+        assert_eq!(reply_status(header), 0);
+        let page = GetMetadataChangesResponse::decode_from(body).expect("a change page");
+        assert_eq!(page.status, WireMetadataChangeStatus::Ok);
+        assert_eq!(page.log_id, Some(0x5eed));
+        assert_eq!(
+            reply_status(&replies[1].1),
+            IggyError::InvalidCommand.as_code()
+        );
     }
 
     #[compio::test]
@@ -2348,7 +2408,8 @@ mod tests {
                 true,
                 |_| {},
                 consensus::seal_prepare_checksum(revocation),
-            );
+            )
+            .reply;
             assert_eq!(iggy_binary_protocol::result_code(reply.body()), Some(0));
         }
         let old_binding = sessions.borrow().get_session(TRANSPORT);
@@ -4030,7 +4091,8 @@ mod tests {
             true,
             |_| {},
             prepare,
-        );
+        )
+        .reply;
         assert_eq!(iggy_binary_protocol::result_code(created.body()), Some(0));
         let create = |request, name| {
             let body = WireCreatePersonalAccessTokenRequest {
@@ -4123,7 +4185,8 @@ mod tests {
             true,
             |_| {},
             prepare,
-        );
+        )
+        .reply;
         assert_eq!(iggy_binary_protocol::result_code(created.body()), Some(0));
 
         let resent = submit_client_request_on_owner(&shard, minted)
