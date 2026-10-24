@@ -49,6 +49,10 @@ spotless {
 
 tasks.test {
     useJUnitPlatform()
+    System.getenv("CUCUMBER_FILTER_TAGS")?.let { systemProperty("cucumber.filter.tags", it) }
+    testLogging {
+        exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
+    }
 }
 
 tasks.jacocoTestReport {

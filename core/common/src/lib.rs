@@ -69,6 +69,7 @@ pub const MAX_MESSAGE_SIZE_UPPER_BYTES: u64 = 256 * 1024 * 1024;
 pub use http::consumer_groups::*;
 pub use http::consumer_offsets::*;
 pub use http::messages::*;
+pub use http::options::{OptionInputMap, OptionInputValue, OptionsUpdate, RESET_FIELD};
 pub use http::partitions::*;
 pub use http::personal_access_tokens::*;
 pub use http::segments::*;
@@ -83,7 +84,8 @@ pub use traits::binary_client::BinaryClient;
 pub use traits::binary_transport::BinaryTransport;
 #[doc(hidden)]
 pub use traits::binary_transport::{
-    BINARY_OPERATION_TIMEOUT, binary_operation_deadline, with_binary_deadline,
+    BINARY_OPERATION_TIMEOUT, BinaryOperationLineage, binary_operation_deadline,
+    binary_operation_lineage, with_binary_deadline, with_binary_lineage,
 };
 pub use traits::binary_transport::{VsrSessionControl, VsrSessionSealed, decode_session_binding};
 pub use traits::client::Client;
@@ -104,7 +106,7 @@ pub use traits::user_client::UserClient;
 pub use traits::validatable::Validatable;
 #[doc(hidden)]
 pub use traits::{BinarySendPartitioning, send_binary_messages};
-pub use traits::{rust_sdk_version_info, sign_in_request};
+pub use traits::{binary_sign_in, rust_sdk_version_info, sign_in_request};
 pub use types::args::*;
 pub use types::client::client_info::*;
 pub use types::client_state::ClientState;
@@ -168,6 +170,11 @@ pub use utils::net::validate_server_address;
 pub use utils::personal_access_token_expiry::PersonalAccessTokenExpiry;
 pub use utils::random_id;
 pub use utils::serde_secret;
+pub use utils::stream_key::{
+    MAX_PREVIOUS_KEYS, MAX_WRAP_SET_ENVELOPES, RewrapPlanError, STREAM_KEY_LENGTH,
+    ServerKeyContext, StreamEncryptionKey, StreamKeyOrigin, WRAPPED_STREAM_KEY_LENGTH, WrapSet,
+    WrappedStreamKey, stream_key_fingerprint,
+};
 pub use utils::text;
 pub use utils::timestamp::*;
 pub use utils::topic_size::MaxTopicSize;

@@ -22,7 +22,10 @@ mod messages;
 mod producer;
 mod type_conversion;
 
-use client::{Client, delete_connection as delete_client, from_connection_string, new_connection};
+use client::{
+    Client, delete_connection as delete_client, encryption_key_fingerprint,
+    encryption_key_fingerprint_base64, from_connection_string, new_connection,
+};
 use consumer::Consumer;
 use messages::make_message;
 use producer::Producer;
@@ -117,9 +120,27 @@ mod ffi {
         size_bytes: u64,
         messages_count: u64,
         topics_count: u32,
-        /// Creation options. Streams have no catalog keys yet, so this is
-        /// empty until one lands.
+        /// Options the creating client set explicitly. Key material is never
+        /// returned.
         options: Vec<HeaderEntry>,
+        /// Options the server filled in, including the read-only encryption
+        /// projections.
+        derived_options: Vec<HeaderEntry>,
+        has_encryption_key_source: bool,
+        encryption_key_source: StreamEncryptionSource,
+        has_encryption_key_fingerprint: bool,
+        encryption_key_fingerprint: String,
+        /// One per server key that wraps the stream's key, empty for a
+        /// plaintext stream.
+        encryption_kek_fingerprints: Vec<String>,
+    }
+
+    /// Who chose a stream's at-rest data key.
+    #[repr(u8)]
+    enum StreamEncryptionSource {
+        None = 0,
+        Stream = 1,
+        Server = 2,
     }
 
     #[repr(u8)]
@@ -151,13 +172,13 @@ mod ffi {
         value: HeaderField,
     }
 
-    /// One key a resource's create command accepts, as served by
+    /// One key of a resource's option catalog, as served by
     /// `describe_options`.
     ///
-    /// This is the discovery surface for the keys `create_topic` takes. A key
-    /// outside the server catalog is refused at create, and the binary
-    /// transports carry back only an error code, so nothing in the rejection
-    /// names the keys that would have worked.
+    /// This is the discovery surface for the keys a create or an update takes.
+    /// A key outside the server catalog is refused, and the binary transports
+    /// carry back only an error code, so nothing in the rejection names the
+    /// keys that would have worked.
     struct OptionSpec {
         key: String,
         /// Wire kind code the value is encoded under, the same encoding
@@ -166,6 +187,15 @@ mod ffi {
         /// The default in `kind`'s encoding. Empty when the key has no default.
         default_value: Vec<u8>,
         description: String,
+        updatable: bool,
+        resettable: bool,
+        /// Write-only: accepted at create, never returned.
+        secret: bool,
+        /// Computed by the server and returned on reads, never accepted.
+        read_only: bool,
+        /// A node that does not understand the key refuses to serve the
+        /// resource.
+        critical: bool,
     }
 
     struct IggyMessageToSend {
@@ -234,6 +264,13 @@ mod ffi {
         topics: Vec<Topic>,
         /// See [`Stream::options`].
         options: Vec<HeaderEntry>,
+        /// See [`Stream::derived_options`].
+        derived_options: Vec<HeaderEntry>,
+        has_encryption_key_source: bool,
+        encryption_key_source: StreamEncryptionSource,
+        has_encryption_key_fingerprint: bool,
+        encryption_key_fingerprint: String,
+        encryption_kek_fingerprints: Vec<String>,
     }
 
     struct ConsumerGroupMember {
@@ -414,6 +451,7 @@ mod ffi {
         status: UserStatus,
         username: String,
         options: Vec<HeaderEntry>,
+        derived_options: Vec<HeaderEntry>,
     }
 
     struct UserInfoDetails {
@@ -424,6 +462,7 @@ mod ffi {
         has_permissions: bool,
         permissions: Permissions,
         options: Vec<HeaderEntry>,
+        derived_options: Vec<HeaderEntry>,
     }
 
     struct LoginInfo {
@@ -485,17 +524,56 @@ mod ffi {
         size_of_messages_required_to_save: u64,
         has_preallocate_segments: bool,
         preallocate_segments: bool,
+        has_partition_resize_policy: bool,
+        partition_resize_policy: String,
         raw_options: Vec<HeaderEntry>,
     }
 
+    /// Reset keys travel as catalog names and are validated against the
+    /// scope's catalog before anything is sent. Raw reset names are left to
+    /// the server.
     struct TopicUpdateOptions {
-        has_compression_algorithm: bool,
-        compression_algorithm: String,
+        has_name: bool,
+        name: String,
         has_message_expiry: bool,
         message_expiry_kind: String,
         message_expiry_value: u64,
         has_max_topic_size: bool,
         max_topic_size: String,
+        reset: Vec<String>,
+        raw_reset: Vec<String>,
+        raw_options: Vec<HeaderEntry>,
+    }
+
+    /// The key is either 32 raw bytes or their canonical padded base64, never
+    /// both. An invalid key is refused before anything is sent.
+    struct StreamCreateOptions {
+        has_encryption_key: bool,
+        encryption_key: Vec<u8>,
+        has_encryption_key_base64: bool,
+        encryption_key_base64: String,
+        raw_options: Vec<HeaderEntry>,
+    }
+
+    struct StreamUpdateOptions {
+        has_name: bool,
+        name: String,
+        reset: Vec<String>,
+        raw_reset: Vec<String>,
+        raw_options: Vec<HeaderEntry>,
+    }
+
+    struct UserCreateOptions {
+        raw_options: Vec<HeaderEntry>,
+    }
+
+    struct UserUpdateOptions {
+        has_username: bool,
+        username: String,
+        has_status: bool,
+        status: UserStatus,
+        reset: Vec<String>,
+        raw_reset: Vec<String>,
         raw_options: Vec<HeaderEntry>,
     }
 
@@ -525,13 +603,13 @@ mod ffi {
         fn create_stream(
             self: &Client,
             stream_name: String,
+            options: StreamCreateOptions,
             error_info: &mut ErrorInfo,
         ) -> Result<StreamDetails>;
         fn update_stream(
             self: &Client,
             stream_id: Identifier,
-            stream_name: String,
-            options: Vec<HeaderEntry>,
+            options: StreamUpdateOptions,
             error_info: &mut ErrorInfo,
         ) -> Result<()>;
         fn get_streams(self: &Client) -> Result<Vec<Stream>>;
@@ -558,7 +636,6 @@ mod ffi {
             self: &Client,
             stream_id: Identifier,
             topic_id: Identifier,
-            topic_name: String,
             options: TopicUpdateOptions,
             error_info: &mut ErrorInfo,
         ) -> Result<()>;
@@ -723,6 +800,13 @@ mod ffi {
         /// "user". A scope with no keys yet answers with an empty vector, which
         /// is an empty catalog rather than a failure.
         fn describe_options(self: &Client, scope: String) -> Result<Vec<OptionSpec>>;
+        /// Fingerprint of a 32-byte stream key, computed locally.
+        fn encryption_key_fingerprint(key: &[u8], error_info: &mut ErrorInfo) -> Result<String>;
+        /// Fingerprint of a stream key given as canonical padded base64.
+        fn encryption_key_fingerprint_base64(
+            key: &str,
+            error_info: &mut ErrorInfo,
+        ) -> Result<String>;
         fn ping(self: &Client) -> Result<()>;
         fn heartbeat_interval(self: &Client) -> u64;
         fn snapshot(
@@ -750,6 +834,7 @@ mod ffi {
         ) -> Result<()>;
         fn get_user(self: &Client, user_id: Identifier) -> Result<UserInfoDetails>;
         fn get_users(self: &Client) -> Result<Vec<UserInfo>>;
+        #[allow(clippy::too_many_arguments)]
         fn create_user(
             self: &Client,
             username: String,
@@ -757,6 +842,7 @@ mod ffi {
             status: UserStatus,
             has_permissions: bool,
             permissions: Permissions,
+            options: UserCreateOptions,
             error_info: &mut ErrorInfo,
         ) -> Result<UserInfoDetails>;
         fn delete_user(
@@ -764,15 +850,10 @@ mod ffi {
             user_id: Identifier,
             error_info: &mut ErrorInfo,
         ) -> Result<()>;
-        #[allow(clippy::too_many_arguments)]
         fn update_user(
             self: &Client,
             user_id: Identifier,
-            has_username: bool,
-            username: String,
-            has_status: bool,
-            status: UserStatus,
-            options: Vec<HeaderEntry>,
+            options: UserUpdateOptions,
             error_info: &mut ErrorInfo,
         ) -> Result<()>;
         fn update_permissions(

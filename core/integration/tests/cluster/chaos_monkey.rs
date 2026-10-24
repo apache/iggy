@@ -1285,7 +1285,7 @@ async fn create_topic_and_group(harness: &TestHarness, config: &ChaosConfig) {
     let target = Target::new();
     let client = harness.tcp_root_client().await.expect("root client");
     client
-        .create_stream(STREAM_NAME)
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
         .await
         .expect("create the stream");
     let options = TopicCreateOptions {

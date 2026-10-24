@@ -27,11 +27,13 @@
 
 use crate::cluster_meta::ClusterRoster;
 use crate::dispatch::authz::{
-    authorize_attached, authorize_default_read, authorize_partition_read, authorize_uid,
+    authorize_attached, authorize_default_read, authorize_partition_read,
+    authorize_served_partition_read, authorize_uid,
 };
 use crate::dispatch::complete_session_binding;
 use crate::dispatch::failure::{
-    FrameChannel, send_host_frame, send_non_replicated_bytes, send_non_replicated_deny,
+    ClientOrigin, FrameChannel, send_host_frame, send_non_replicated_bytes,
+    send_non_replicated_deny,
 };
 use crate::dispatch::partition::{handle_get_consumer_offset, handle_poll_messages};
 use crate::namespace::resolve_partition_namespace;
@@ -95,7 +97,7 @@ use tracing::{debug, warn};
 async fn handle_get_personal_access_tokens<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
-    transport_client_id: u128,
+    origin: ClientOrigin,
     request: &Message<RoutedRequestHeader>,
 ) where
     B: ShellBus,
@@ -104,11 +106,12 @@ async fn handle_get_personal_access_tokens<B, MJ, S, SB>(
     S: 'static,
     SB: SuperblockStore + 'static,
 {
+    let transport_client_id = origin.id;
     let response = build_get_personal_access_tokens_response(shard, sessions, transport_client_id);
     send_non_replicated_bytes(
         shard,
         request,
-        transport_client_id,
+        origin,
         response.to_bytes(),
         FrameChannel::Reply,
         "get_personal_access_tokens",
@@ -123,7 +126,7 @@ async fn handle_get_personal_access_tokens<B, MJ, S, SB>(
 async fn handle_get_me<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
-    transport_client_id: u128,
+    origin: ClientOrigin,
     request: &Message<RoutedRequestHeader>,
 ) where
     B: ShellBus,
@@ -132,11 +135,12 @@ async fn handle_get_me<B, MJ, S, SB>(
     S: 'static,
     SB: SuperblockStore + 'static,
 {
+    let transport_client_id = origin.id;
     let response = build_get_me_response(shard, sessions, transport_client_id);
     send_non_replicated_bytes(
         shard,
         request,
-        transport_client_id,
+        origin,
         response.to_bytes(),
         FrameChannel::Reply,
         "get_me",
@@ -355,7 +359,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
     server_config: &Arc<ServerConfig>,
-    transport_client_id: u128,
+    origin: ClientOrigin,
     request: Message<RoutedRequestHeader>,
     // Session attachment, acting user, peer address and read-your-writes floor
     // for the read gates below, resolved by the funnel in the same connection
@@ -378,6 +382,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
     SB: SuperblockStore + 'static,
 {
     const CODE_RANGE: std::ops::Range<usize> = 0..4;
+    let transport_client_id = origin.id;
     let attachment = attachment.as_ref();
     // A client that reads on a connection bound before its last write saw
     // commit carries that commit in `minimum_metadata_op`, and the connection
@@ -396,8 +401,8 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
                 commit,
             );
             send_host_frame(
-                &shard.bus,
-                transport_client_id,
+                shard,
+                origin,
                 reply.into_generic().into_frozen(),
                 FrameChannel::Reply,
                 "ping_reply",
@@ -411,37 +416,33 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
             if let Err(error) =
                 authorize_and_hold_read(shard, attachment, code, watermark, || Ok(())).await
             {
-                send_non_replicated_deny(shard, &request, transport_client_id, error.as_code())
-                    .await;
+                send_non_replicated_deny(shard, &request, origin, error.as_code()).await;
                 return;
             }
-            handle_get_me(shard, sessions, transport_client_id, &request).await;
+            handle_get_me(shard, sessions, origin, &request).await;
         }
         GET_PERSONAL_ACCESS_TOKENS_CODE => {
             if let Err(error) =
                 authorize_and_hold_read(shard, attachment, code, watermark, || Ok(())).await
             {
-                send_non_replicated_deny(shard, &request, transport_client_id, error.as_code())
-                    .await;
+                send_non_replicated_deny(shard, &request, origin, error.as_code()).await;
                 return;
             }
-            handle_get_personal_access_tokens(shard, sessions, transport_client_id, &request).await;
+            handle_get_personal_access_tokens(shard, sessions, origin, &request).await;
         }
         GET_CLIENTS_CODE => {
             let authorize = || authorize_uid(shard, user_id, Permissioner::get_clients);
             if let Err(error) =
                 authorize_and_hold_read(shard, attachment, code, watermark, &authorize).await
             {
-                send_non_replicated_deny(shard, &request, transport_client_id, error.as_code())
-                    .await;
+                send_non_replicated_deny(shard, &request, origin, error.as_code()).await;
                 return;
             }
             // Shared-nothing: each shard knows only its own connections, so
             // gather across all shards (scatter-gather over the mesh).
             let infos = shard.list_all_clients().await;
             if let Err(error) = authorize_attached(attachment, authorize) {
-                send_non_replicated_deny(shard, &request, transport_client_id, error.as_code())
-                    .await;
+                send_non_replicated_deny(shard, &request, origin, error.as_code()).await;
                 return;
             }
             let response = GetClientsResponse {
@@ -453,7 +454,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
             send_non_replicated_bytes(
                 shard,
                 &request,
-                transport_client_id,
+                origin,
                 response.to_bytes(),
                 FrameChannel::Reply,
                 "get_clients",
@@ -465,8 +466,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
             if let Err(error) =
                 authorize_and_hold_read(shard, attachment, code, watermark, &authorize).await
             {
-                send_non_replicated_deny(shard, &request, transport_client_id, error.as_code())
-                    .await;
+                send_non_replicated_deny(shard, &request, origin, error.as_code()).await;
                 return;
             }
             // No reverse map from the wire u32 id to a u128 transport id /
@@ -477,8 +477,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
                 .map(|req| req.client_id);
             let infos = shard.list_all_clients().await;
             if let Err(error) = authorize_attached(attachment, authorize) {
-                send_non_replicated_deny(shard, &request, transport_client_id, error.as_code())
-                    .await;
+                send_non_replicated_deny(shard, &request, origin, error.as_code()).await;
                 return;
             }
             #[allow(clippy::cast_possible_truncation)]
@@ -511,7 +510,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
             send_non_replicated_bytes(
                 shard,
                 &request,
-                transport_client_id,
+                origin,
                 bytes,
                 FrameChannel::Reply,
                 "get_client",
@@ -519,19 +518,11 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
             .await;
         }
         GET_SNAPSHOT_FILE_CODE => {
-            handle_get_snapshot(
-                shard,
-                server_config,
-                transport_client_id,
-                &request,
-                user_id,
-                attachment,
-            )
-            .await;
+            handle_get_snapshot(shard, server_config, origin, &request, user_id, attachment).await;
         }
         BIND_SESSION_CODE | GET_PARTITION_ROUTE_CODE => {
             let result = if code == BIND_SESSION_CODE {
-                bind_session(shard, sessions, transport_client_id, &request).await
+                bind_session(shard, sessions, origin, &request).await
             } else {
                 partition_route(shard, &request, user_id, attachment, watermark).await
             };
@@ -540,7 +531,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
                     send_non_replicated_bytes(
                         shard,
                         &request,
-                        transport_client_id,
+                        origin,
                         bytes,
                         FrameChannel::Reply,
                         "partition_context",
@@ -548,8 +539,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
                     .await;
                 }
                 Err(error) => {
-                    send_non_replicated_deny(shard, &request, transport_client_id, error.as_code())
-                        .await;
+                    send_non_replicated_deny(shard, &request, origin, error.as_code()).await;
                 }
             }
         }
@@ -562,7 +552,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
                 Ok((consumer_client_id, attachment)) => {
                     handle_poll_messages(
                         shard,
-                        transport_client_id,
+                        origin,
                         &request,
                         user_id,
                         consumer_client_id,
@@ -571,14 +561,12 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
                     .await;
                 }
                 Err(error) => {
-                    send_non_replicated_deny(shard, &request, transport_client_id, error.as_code())
-                        .await;
+                    send_non_replicated_deny(shard, &request, origin, error.as_code()).await;
                 }
             }
         }
         GET_CONSUMER_OFFSET_CODE => {
-            handle_get_consumer_offset(shard, transport_client_id, &request, user_id, attachment)
-                .await;
+            handle_get_consumer_offset(shard, origin, &request, user_id, attachment).await;
         }
         SYNC_CONSUMER_GROUP_CODE => {
             // Self-scoped: serves the caller's own assignment keyed by the
@@ -587,11 +575,10 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
             if let Err(error) =
                 authorize_and_hold_read(shard, attachment, code, watermark, || Ok(())).await
             {
-                send_non_replicated_deny(shard, &request, transport_client_id, error.as_code())
-                    .await;
+                send_non_replicated_deny(shard, &request, origin, error.as_code()).await;
                 return;
             }
-            handle_sync_consumer_group(shard, transport_client_id, &request).await;
+            handle_sync_consumer_group(shard, origin, &request).await;
         }
         _ => {
             let roster = sessions.borrow().cluster_roster();
@@ -604,15 +591,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
                 );
             }
             handle_default_non_replicated(
-                shard,
-                transport_client_id,
-                code,
-                &request,
-                user_id,
-                attachment,
-                watermark,
-                &roster,
-                client_ip,
+                shard, origin, code, &request, user_id, attachment, watermark, &roster, client_ip,
             )
             .await;
         }
@@ -623,7 +602,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
 async fn bind_session<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
-    transport_client_id: u128,
+    origin: ClientOrigin,
     request: &Message<RoutedRequestHeader>,
 ) -> Result<Bytes, IggyError>
 where
@@ -633,6 +612,7 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
+    let transport_client_id = origin.id;
     let (version_info, _) = iggy_binary_protocol::ClientVersionInfo::decode(request_body(request))
         .map_err(|_| IggyError::InvalidCommand)?;
     if !iggy_binary_protocol::is_protocol_compatible(version_info.protocol_version) {
@@ -732,15 +712,24 @@ where
     else {
         return Err(IggyError::TransientNotAccepted);
     };
-    authorize_attached(attachment, authorize)?;
+    authorize_served_partition_read(
+        shard,
+        attachment,
+        namespace,
+        incarnation,
+        |permissioner, user_id, stream_id, topic_id| {
+            permissioner
+                .append_messages(user_id, stream_id, topic_id)
+                .or_else(|_| permissioner.poll_messages(user_id, stream_id, topic_id))
+        },
+    )?;
     if shard
         .plane
         .metadata()
         .mux_stm
         .streams()
         .partition_route(namespace)
-        .map(|(current, _)| current)
-        != Some(incarnation)
+        .is_none_or(|(current, _)| current != incarnation)
     {
         return Err(IggyError::TransientNotAccepted);
     }
@@ -757,7 +746,7 @@ where
 #[allow(clippy::future_not_send, clippy::too_many_arguments)]
 async fn handle_default_non_replicated<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    transport_client_id: u128,
+    origin: ClientOrigin,
     code: u32,
     request: &Message<RoutedRequestHeader>,
     user_id: Option<u32>,
@@ -772,6 +761,7 @@ async fn handle_default_non_replicated<B, MJ, S, SB>(
     S: 'static,
     SB: SuperblockStore + 'static,
 {
+    let transport_client_id = origin.id;
     // Gate by command code before the shared builder runs. The builder stays
     // authz-free (it is byte-shared with the HTTP read path, which gates
     // separately); a denial replies status!=0 with an empty body. The
@@ -802,7 +792,7 @@ async fn handle_default_non_replicated<B, MJ, S, SB>(
                 "denying non-replicated VSR request"
             );
         }
-        send_non_replicated_deny(shard, request, transport_client_id, error.as_code()).await;
+        send_non_replicated_deny(shard, request, origin, error.as_code()).await;
         return;
     }
     // Stats is the one default read with an async input: the cross-shard
@@ -837,8 +827,8 @@ async fn handle_default_non_replicated<B, MJ, S, SB>(
                 commit,
             );
             send_host_frame(
-                &shard.bus,
-                transport_client_id,
+                shard,
+                origin,
                 reply.into_generic().into_frozen(),
                 FrameChannel::Reply,
                 "non_replicated_reply",
@@ -856,7 +846,7 @@ async fn handle_default_non_replicated<B, MJ, S, SB>(
                 error = %error,
                 "denying non-replicated VSR request"
             );
-            send_non_replicated_deny(shard, request, transport_client_id, error.as_code()).await;
+            send_non_replicated_deny(shard, request, origin, error.as_code()).await;
         }
     }
 }
@@ -869,7 +859,7 @@ async fn handle_default_non_replicated<B, MJ, S, SB>(
 async fn handle_get_snapshot<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     server_config: &Arc<ServerConfig>,
-    transport_client_id: u128,
+    origin: ClientOrigin,
     request: &Message<RoutedRequestHeader>,
     user_id: Option<u32>,
     attachment: Option<&SessionAttachment>,
@@ -880,13 +870,14 @@ async fn handle_get_snapshot<B, MJ, S, SB>(
     S: 'static,
     SB: SuperblockStore + 'static,
 {
+    let transport_client_id = origin.id;
     let authorize = || {
         authorize_attached(attachment, || {
             authorize_uid(shard, user_id, Permissioner::get_snapshot)
         })
     };
     if let Err(error) = authorize() {
-        send_non_replicated_deny(shard, request, transport_client_id, error.as_code()).await;
+        send_non_replicated_deny(shard, request, origin, error.as_code()).await;
         return;
     }
     let result = match decode_get_snapshot(request_body(request)) {
@@ -917,7 +908,7 @@ async fn handle_get_snapshot<B, MJ, S, SB>(
                 send_non_replicated_deny(
                     shard,
                     request,
-                    transport_client_id,
+                    origin,
                     IggyError::SnapshotFileCompletionFailed.as_code(),
                 )
                 .await;
@@ -926,7 +917,7 @@ async fn handle_get_snapshot<B, MJ, S, SB>(
             send_non_replicated_bytes(
                 shard,
                 request,
-                transport_client_id,
+                origin,
                 GetSnapshotResponse { data: archive }.to_bytes(),
                 FrameChannel::Reply,
                 "get_snapshot",
@@ -935,7 +926,7 @@ async fn handle_get_snapshot<B, MJ, S, SB>(
         }
         Err(error) => {
             warn!(transport_client_id, error = %error, "denying snapshot request");
-            send_non_replicated_deny(shard, request, transport_client_id, error.as_code()).await;
+            send_non_replicated_deny(shard, request, origin, error.as_code()).await;
         }
     }
 }
@@ -960,7 +951,7 @@ fn decode_get_snapshot(
 #[allow(clippy::future_not_send)]
 async fn handle_sync_consumer_group<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    transport_client_id: u128,
+    origin: ClientOrigin,
     request: &Message<RoutedRequestHeader>,
 ) where
     B: ShellBus,
@@ -969,6 +960,7 @@ async fn handle_sync_consumer_group<B, MJ, S, SB>(
     S: 'static,
     SB: SuperblockStore + 'static,
 {
+    let transport_client_id = origin.id;
     let body = match SyncConsumerGroupRequest::decode_from(request_body(request)) {
         Ok(wire) => shard
             .plane
@@ -1000,7 +992,7 @@ async fn handle_sync_consumer_group<B, MJ, S, SB>(
     send_non_replicated_bytes(
         shard,
         request,
-        transport_client_id,
+        origin,
         body,
         FrameChannel::Reply,
         "sync_consumer_group",

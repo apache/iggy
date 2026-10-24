@@ -24,8 +24,7 @@ use consensus::PartitionsHandle;
 use futures::channel::oneshot;
 use iggy_common::{IggyError, PollingStrategy};
 use message_bus::{
-    BusMessage, ClientForwardFn, ConnectionLostFn, JoinHandle, MessageBus, ReplicaForwardFn,
-    SendError,
+    BusMessage, ConnectionLostFn, JoinHandle, MessageBus, ReplicaForwardFn, SendError,
 };
 use metadata::IggyMetadata;
 use partitions::{IggyPartitions, PollFragments, PollingArgs, PollingConsumer};
@@ -547,6 +546,5 @@ impl MessageBus for PollTestBus {
 
     fn set_connection_lost_fn(&self, _f: ConnectionLostFn) {}
     fn set_replica_forward_fn(&self, _f: ReplicaForwardFn) {}
-    fn set_client_forward_fn(&self, _f: ClientForwardFn) {}
     fn track_background(&self, _handle: JoinHandle<()>) {}
 }

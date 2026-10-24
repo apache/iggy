@@ -148,6 +148,8 @@ jobs:
         uses: ./.github/actions/utils/server-start
         with:
           bin: target/debug/iggy-server
+          encryption-enabled: "true"
+          encryption-key: "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE="
 
       - name: Run tests and generate coverage
         working-directory: foreign/java
@@ -298,6 +300,8 @@ jobs:
         uses: ./.github/actions/utils/server-start
         with:
           bin: target/debug/iggy-server
+          encryption-enabled: "true"
+          encryption-key: "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE="
 
       - name: Setup Python
         uses: actions/setup-python@v7.0.0
@@ -447,6 +451,8 @@ jobs:
         uses: ./.github/actions/utils/server-start
         with:
           bin: target/debug/iggy-server
+          encryption-enabled: "true"
+          encryption-key: "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE="
           wait-timeout-seconds: "90"
 
       - name: Run unit tests with coverage
@@ -499,6 +505,8 @@ jobs:
         uses: ./.github/actions/utils/server-start
         with:
           bin: target/debug/iggy-server
+          encryption-enabled: "true"
+          encryption-key: "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE="
           replica-id: "0"
           wait-timeout-seconds: "90"
 

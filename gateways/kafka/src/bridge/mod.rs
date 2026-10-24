@@ -19,7 +19,8 @@
 //!
 //! Maps Kafka topics to Iggy streams/topics, exposes create-if-missing provisioning and
 //! high-watermark lookups, group and translates Iggy errors to Kafka wire error codes. `ListOffsets`,
-//! Produce, Fetch, Metadata, `CreateTopics`, `OffsetCommit`, `OffsetFetch`, `DescribeConfigs` and `AlterConfigs` call it.
+//! Produce, Fetch, Metadata, `CreateTopics`, `DeleteTopics`, `CreatePartitions`, `OffsetCommit`,
+//! `OffsetFetch`, `DescribeConfigs` and `AlterConfigs` call it.
 
 pub mod config;
 pub mod error;
@@ -29,8 +30,9 @@ pub mod topic_map;
 pub use config::{DEFAULT_MAX_MESSAGE_SIZE, IggyBridgeConfig, IggyTls, ProduceSessionLimits};
 pub use error::BridgeError;
 pub use iggy_bridge::{
-    DEFAULT_TOPIC_PARTITIONS, IggyBridge, KafkaTopicMetadata, MAX_TOPIC_PARTITIONS,
-    OFFSET_GROUP_PREFIX, OffsetCalls, ProduceTurn, Producer, StreamTopicCache,
-    TopicCreationOutcome, TopicLoad, TopicTarget,
+    CLUSTER_ID_TOPIC, ClusterIdCall, DEFAULT_TOPIC_PARTITIONS, IggyBridge, KafkaTopicMetadata,
+    MAX_TOPIC_PARTITIONS, OFFSET_GROUP_PREFIX, OffsetCalls, OffsetGroups, ProduceTurn, Producer,
+    ScannedGroups, StreamTopicCache, TopicCreationOutcome, TopicLoad, TopicTarget,
+    cluster_id_stream,
 };
 pub use topic_map::{TopicMapping, TopicOverride};

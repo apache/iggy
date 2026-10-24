@@ -24,7 +24,7 @@ import os
 from dataclasses import dataclass
 
 import pytest
-from apache_iggy import IggyClient, ReceiveMessage
+from apache_iggy import IggyClient, OptionSpec, ReceiveMessage
 
 
 @dataclass
@@ -42,6 +42,29 @@ class GlobalContext:
     last_sent_message: str | None = None  # Store message payload as string
     last_raw_response: bytes | None = None
     last_raw_error: RuntimeError | None = None
+    last_stream_key: bytes | None = None
+    last_update_error: RuntimeError | None = None
+    last_option_specs: list[OptionSpec] | None = None
+    last_user_id: int | None = None
+    last_call_error: RuntimeError | None = None
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Register the shared feature tags as markers.
+
+    The Docker image runs pytest from /app, where bdd/python/pyproject.toml is
+    not the rootdir config, so markers declared there would never load.
+    """
+    for marker in (
+        "basic-messaging: shared basic messaging scenarios",
+        "raw-command: shared raw command scenarios",
+        "session-contract: shared session contract scenarios",
+        "stream-options: shared stream option scenarios",
+        "resource-options-patch: shared resource patch scenarios",
+        "message-headers: scenarios that assert message headers",
+        "describe-options: scenarios that assert the option catalog",
+    ):
+        config.addinivalue_line("markers", marker)
 
 
 def required_env(name: str) -> str:
@@ -63,6 +86,12 @@ def required_env(name: str) -> str:
 def root_credentials() -> tuple[str, str]:
     """Root username and password the server was started with."""
     return required_env("IGGY_ROOT_USERNAME"), required_env("IGGY_ROOT_PASSWORD")
+
+
+@pytest.fixture(scope="session")
+def no_quorum_address() -> str:
+    """Address of the cluster node that cannot reach quorum."""
+    return required_env("IGGY_TCP_ADDRESS_NO_QUORUM")
 
 
 @pytest.fixture(scope="session")

@@ -24,6 +24,23 @@ export {
   HeaderKeyFactory,
   type SendMessagesConfirmation,
   type SendMessagesResponse,
+  CompressionAlgorithm,
+  Durability,
+  PartitionResizePolicy,
+  EncryptionKeySource,
+  OptionsScope,
+  StreamOptionKey,
+  TopicOptionKey,
+  UserOptionKey,
+  UserStatus,
+  StreamEncryptionKey,
+  encryptionKeyFingerprint,
+  type OptionEntry,
+  type OptionSpec,
+  type ParsedOptions,
+  type StreamOptions,
+  type TopicOptions,
+  type UserOptions,
 } from "./wire/index.js";
 
 export * from "./client/index.js";

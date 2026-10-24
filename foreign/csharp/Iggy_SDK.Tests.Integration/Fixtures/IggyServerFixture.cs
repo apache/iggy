@@ -72,6 +72,28 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
     /// </summary>
     public static readonly TimeSpan SessionReportInterval = TimeSpan.FromMilliseconds(500);
 
+    private static readonly TimeSpan StatsConvergenceTimeout = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan StatsPollInterval = TimeSpan.FromMilliseconds(100);
+
+    /// <summary>Node-local counters catch up after partition commit broadcasts.</summary>
+    public static async Task<T> ReadConvergedStatsAsync<T>(Func<Task<T>> read, Func<T, bool> converged)
+    {
+        var deadline = Environment.TickCount64 + (long)StatsConvergenceTimeout.TotalMilliseconds;
+        var result = await read();
+        while (!converged(result) && Environment.TickCount64 < deadline)
+        {
+            await Task.Delay(StatsPollInterval);
+            result = await read();
+        }
+        return result;
+    }
+
+    /// <summary>
+    ///     Server encryption key every node shares. With encryption enabled a stream created without its own key
+    ///     gets one the server generates, so the stream options tests read a server sourced key.
+    /// </summary>
+    public static readonly string ServerEncryptionKey = "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=";
+
     /// <summary>
     ///     Extra environment variables for every node, layered over the cluster's base configuration.
     ///     Heartbeat verification is on for every fixture so the eviction tests share the general server
@@ -81,7 +103,9 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
     {
         { "IGGY_HEARTBEAT_ENABLED", "true" },
         { "IGGY_HEARTBEAT_INTERVAL", $"{ServerHeartbeatInterval.TotalSeconds}s" },
-        { "IGGY_CONSUMER_GROUP_HEARTBEAT_INTERVAL", $"{SessionReportInterval.TotalMilliseconds}ms" }
+        { "IGGY_CONSUMER_GROUP_HEARTBEAT_INTERVAL", $"{SessionReportInterval.TotalMilliseconds}ms" },
+        { "IGGY_ENCRYPTION_ENABLED", "true" },
+        { "IGGY_ENCRYPTION_KEY", ServerEncryptionKey }
     };
 
     /// <summary>

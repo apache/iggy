@@ -56,6 +56,9 @@ jobs:
 
       - name: Generate coverage report
         if: always() && !cancelled()
+        # Coverage must not block the PR: llvm-profdata rejects the whole
+        # merge when a single .profraw file is truncated.
+        continue-on-error: true
         run: |
           if compgen -G 'target/*.profraw' > /dev/null; then
             cargo llvm-cov report --codecov --output-path codecov.json
