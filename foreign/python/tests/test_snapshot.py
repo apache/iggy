@@ -36,12 +36,14 @@ class TestSnapshot:
         assert zipfile.is_zipfile(io.BytesIO(data))
 
     @pytest.mark.unit
-    @pytest.mark.parametrize("compression", ["", "   ", "invalid-compression"])
-    def test_snapshot_rejects_invalid_compression(self, compression: str):
-        """Empty or unknown compression raises ValueError before sending."""
+    @pytest.mark.parametrize("snapshot_compression", ["", "   ", "invalid-compression"])
+    def test_snapshot_rejects_invalid_snapshot_compression(
+        self, snapshot_compression: str
+    ):
+        """Empty or unknown snapshot_compression raises ValueError before sending."""
         client = IggyClient("127.0.0.1:1")
         with pytest.raises(ValueError):
-            client.snapshot(compression, ["test"])
+            client.snapshot(snapshot_compression, ["test"])
 
     @pytest.mark.unit
     def test_snapshot_rejects_invalid_snapshot_type(self):
