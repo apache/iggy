@@ -15,21 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{Error, Payload, Schema, StreamEncoder, convert::apply_field_mappings};
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+
 use base64::{Engine as Base64Engine, engine::general_purpose};
 use iggy_common::IggyTimestamp;
 use prost::Message;
 use prost_types::Any;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::path::PathBuf;
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use tracing::{error, info};
+
+use crate::{Error, Payload, Schema, StreamEncoder, convert::apply_field_mappings};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProtoEncoderConfig {
     pub schema_path: Option<PathBuf>,
     pub message_type: Option<String>,
     pub use_any_wrapper: bool,
+    #[serde(default, deserialize_with = "deserialize_field_mappings")]
     pub field_mappings: Option<HashMap<String, String>>,
     pub schema_registry_url: Option<String>,
     pub descriptor_set: Option<Vec<u8>>,
@@ -71,6 +74,27 @@ impl Default for ProtoFormatOptions {
             deterministic_encoding: false,
         }
     }
+}
+
+fn deserialize_field_mappings<'de, D>(
+    deserializer: D,
+) -> Result<Option<HashMap<String, String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let field_mappings = Option::<HashMap<String, String>>::deserialize(deserializer)?;
+    if let Some(mappings) = &field_mappings {
+        let mut json_names = HashSet::with_capacity(mappings.len());
+        for json_name in mappings.values() {
+            if !json_names.insert(json_name.as_str()) {
+                return Err(D::Error::custom(format!(
+                    "duplicate JSON field name in field_mappings: {json_name}"
+                )));
+            }
+        }
+    }
+
+    Ok(field_mappings)
 }
 
 pub struct ProtoStreamEncoder {
@@ -727,6 +751,94 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::path::PathBuf;
+
+    fn config_value_with_field_mappings(field_mappings: serde_json::Value) -> serde_json::Value {
+        let mut config = serde_json::to_value(ProtoEncoderConfig::default())
+            .expect("serialize default proto encoder config");
+        config["field_mappings"] = field_mappings;
+        config
+    }
+
+    #[test]
+    fn given_duplicate_json_names_when_deserializing_config_should_fail() {
+        let config = config_value_with_field_mappings(serde_json::json!({
+            "id": "shared",
+            "legacy_id": "shared"
+        }));
+
+        let error = serde_json::from_value::<ProtoEncoderConfig>(config)
+            .expect_err("duplicate JSON field names should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate JSON field name in field_mappings: shared"),
+            "unexpected deserialization error: {error}"
+        );
+    }
+
+    #[test]
+    fn given_invalid_field_mappings_when_deserializing_config_should_fail() {
+        let config = config_value_with_field_mappings(serde_json::json!({
+            "id": 123
+        }));
+
+        let error = serde_json::from_value::<ProtoEncoderConfig>(config)
+            .expect_err("non-string field mapping values should be rejected");
+
+        assert!(error.is_data());
+    }
+
+    #[test]
+    fn given_unique_json_names_when_deserializing_config_should_preserve_mappings() {
+        let expected = HashMap::from([
+            ("id".to_string(), "user_id".to_string()),
+            ("name".to_string(), "full_name".to_string()),
+        ]);
+        let config = config_value_with_field_mappings(
+            serde_json::to_value(&expected).expect("serialize field mappings"),
+        );
+
+        let deserialized = serde_json::from_value::<ProtoEncoderConfig>(config)
+            .expect("unique JSON field names should be accepted");
+
+        assert_eq!(deserialized.field_mappings, Some(expected));
+    }
+
+    #[test]
+    fn given_missing_field_mappings_when_deserializing_config_should_default_to_none() {
+        let mut config = serde_json::to_value(ProtoEncoderConfig::default())
+            .expect("serialize default proto encoder config");
+        config
+            .as_object_mut()
+            .expect("proto encoder config should serialize as an object")
+            .remove("field_mappings");
+
+        let deserialized = serde_json::from_value::<ProtoEncoderConfig>(config)
+            .expect("missing field mappings should be accepted");
+
+        assert!(deserialized.field_mappings.is_none());
+    }
+
+    #[test]
+    fn given_null_field_mappings_when_deserializing_config_should_preserve_none() {
+        let config = config_value_with_field_mappings(serde_json::Value::Null);
+
+        let deserialized = serde_json::from_value::<ProtoEncoderConfig>(config)
+            .expect("null field mappings should be accepted");
+
+        assert!(deserialized.field_mappings.is_none());
+    }
+
+    #[test]
+    fn given_empty_field_mappings_when_deserializing_config_should_preserve_empty_map() {
+        let config = config_value_with_field_mappings(serde_json::json!({}));
+
+        let deserialized = serde_json::from_value::<ProtoEncoderConfig>(config)
+            .expect("empty field mappings should be accepted");
+
+        assert_eq!(deserialized.field_mappings, Some(HashMap::new()));
+    }
 
     #[test]
     fn encode_should_succeed_given_json_payload_with_any_wrapper() {
