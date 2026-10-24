@@ -171,11 +171,10 @@ public class TopicsTcpClient implements TopicsClient {
         // the block must not carry a key twice, or the server refuses it whole.
         extra.forEach((key, value) -> options.put(HeaderKey.fromString(key), value));
         if (compressionAlgorithm != CompressionAlgorithm.None) {
-            var compressionName =
-                    switch (compressionAlgorithm) {
-                        case None -> "none";
-                        case Gzip -> "gzip";
-                    };
+            var compressionName = switch (compressionAlgorithm) {
+                case None -> "none";
+                case Gzip -> "gzip";
+            };
             options.put(HeaderKey.fromString(COMPRESSION_ALGORITHM_OPTION), HeaderValue.fromString(compressionName));
         }
         if (messageExpiry.signum() != 0) {
