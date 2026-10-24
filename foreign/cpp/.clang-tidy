@@ -25,7 +25,7 @@ HeaderFileExtensions:
 ImplementationFileExtensions:
 - 'cpp'
 
-HeaderFilterRegex: '.*\.hpp$'
+HeaderFilterRegex: '(^include/|/(foreign/cpp|_main)/include/).*\.hpp$'
 
 CheckOptions:
   readability-identifier-naming.ConstexprVariableCase: CamelCase
