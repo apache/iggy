@@ -1,0 +1,80 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+type = "sink"
+key = "mqtt"
+enabled = true
+version = 0
+name = "MQTT sink"
+path = "target/release/libiggy_connector_mqtt_sink"
+plugin_config_format = "json"
+
+[[streams]]
+stream = "iot"
+topics = ["telemetry"]
+schema = "raw"
+batch_length = 100
+poll_interval = "5ms"
+consumer_group = "mqtt_sink_connector"
+
+[plugin_config]
+# Required broker address. Do not add credentials or MQTT options to this URL.
+broker_url = "mqtt://127.0.0.1:1883"
+protocol = "mqtt5"
+clean_start = true
+session_expiry_interval = 3600
+
+# Select one routing block. Keep one topic_mode line active.
+# Static routing publishes every Iggy record to one MQTT topic.
+topic = "iggy.messages"
+topic_mode = "static"
+qos = 1
+retain = false
+
+# Template routing creates an MQTT topic from the Iggy stream and topic.
+# To select it, comment the active static topic and topic_mode lines above.
+# topic_mode = "template"
+# topic_template = "{stream}/{topic}"
+
+# Dynamic routing reads mqtt.topic from Iggy headers or an MQTT 5 envelope.
+# It uses fallback_topic when the record has no valid MQTT topic.
+# To select it, comment the active static topic and topic_mode lines above.
+# topic_mode = "dynamic"
+# fallback_topic = "{stream}/{topic}"
+
+# Connection, publication, and retry settings.
+keep_alive = "30s"
+request_capacity = 32
+publish_timeout = "30s"
+shutdown_timeout = "30s"
+# Retries after the initial connection attempt. Each publish window receives
+# this many retries after its initial uncertain publication attempt.
+max_retries = 5
+retry_delay = "1s"
+max_retry_delay = "30s"
+max_in_flight = 10
+verbose_logging = false
+
+# Optional broker authentication.
+# username = "emqx-user"
+# password = "replace-me"
+
+# Optional TLS configuration for mqtts:// brokers.
+# [plugin_config.tls]
+# ca_file = "/etc/iggy/certs/emqx-ca.pem"
+# client_cert_file = "/etc/iggy/certs/client-cert.pem"
+# client_key_file = "/etc/iggy/certs/client-key.pem"
