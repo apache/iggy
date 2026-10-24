@@ -14,8 +14,8 @@ The SDK is built up in stages. The client is a TCP connection with optional TLS 
 speaks the consensus protocol, signs in, keeps the session alive with a heartbeat,
 reconnects, and follows the cluster leader. It manages streams, topics, partitions,
 segments, users, personal access tokens, and consumer groups, sends and polls messages,
-and stores consumer offsets. The producer and consumer, examples, and BDD scenarios
-follow in later changes.
+stores consumer offsets, and produces with a batching producer. The consumer, examples,
+and BDD scenarios follow in later changes.
 
 Swift supports the consensus wire protocol and checks commitment proof during
 automatic retries. It does not yet expose retained-operation resolve/abandon APIs,
@@ -216,11 +216,60 @@ group poll fails with `consumerGroupMemberNotFound` until it does. In a cluster,
 and offset writes go to the partition's primary over a second connection bound to the
 same session.
 
+### Producer
+
+`IggyProducer` appends to one topic. `initialize()` creates the stream and topic when
+they are named and missing, then a send either writes from the calling task (`direct`,
+the default) or queues the batch for a background worker (`background`):
+
+```swift
+let producer = try client.producer(streamID: "orders", topicID: "created")
+try await producer.initialize()
+let response = try await producer.send(["placed", "paid"])
+
+let background = try client.producer(
+    streamID: "orders", topicID: "created",
+    configuration: ProducerConfiguration(mode: .background(BackgroundSendOptions(lingerTime: .milliseconds(5)))))
+try await background.initialize()
+try await background.send(["queued"])
+await background.shutdown()
+```
+
+A direct send splits a batch into requests of at most `batchLength` messages, each
+within the server's 64 MiB frame limit, and returns their confirmations; a failure,
+cancellation included, throws `ProducerSendError` with the confirmations so far and the
+unconfirmed tail. A background send returns once queued and reports write failures to
+`errorHandler`; `shutdown()` writes what is still buffered, and the producer is closed
+by then, so a resend from `errorHandler` during that final flush fails with
+`producerClosed`.
+
+The producer retries only a request the server refused to admit or that found no
+connection, since a retry is a new request: anything that may have committed, such as
+`transientNotCommitted` or `disconnected`, is left to the caller, and the server does
+not deduplicate a resend. Resend a failed tail only when its `cause` proves the first
+request never committed; `ProducerSendError` lists those causes. The Rust producer has
+since handed these retries to its client's operation lanes, which the Swift client does
+not have yet.
+
+A send belongs to the session it started in. Once the caller signs in or out, what it
+has not written yet, a background batch still queued, or a retry still waiting, fails
+with `unauthenticated` instead of going under the new session, and a queued batch is
+never merged with one from another session.
+
+With the default ordered sharding, the sends to one stream and topic identifier are
+written in order. A topic addressed by name and by numeric id counts as two, and a
+failed request does not hold back the ones after it, so a resend from `errorHandler`
+lands behind them.
+
 ### Errors
 
-Every operation throws `IggyError`, a value carrying the typed `code`
+Every client operation throws `IggyError`, a value carrying the typed `code`
 (`IggyErrorCode`, one case per server error code), the raw wire code, and optional
-context. A cancelled task gets `CancellationError`:
+context. A cancelled task gets `CancellationError`. A direct producer send is the
+exception: a failure while sending, cancellation included, throws `ProducerSendError`,
+carrying the `IggyError` as `cause`, the confirmations so far, and the unconfirmed
+`failed` tail. A send refused before it starts, such as with `producerClosed` after
+`shutdown()`, throws a plain `IggyError`:
 
 ```swift
 func handle(_ error: IggyError) {

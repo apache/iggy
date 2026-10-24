@@ -162,7 +162,11 @@ pub fn new_shard(
     incarnation: u128,
     data_dir: Option<std::path::PathBuf>,
     system_path: &std::path::Path,
-    seed_namespaces: &[(server_common::sharding::IggyNamespace, u32)],
+    seed_namespaces: &[(
+        server_common::sharding::IggyNamespace,
+        u32,
+        iggy_common::Durability,
+    )],
     applied_frontier: Arc<AppliedFrontier>,
 ) -> (
     Rc<Replica>,
@@ -387,8 +391,13 @@ pub fn new_shard(
     // seeding again would bring back a fixture topic a committed delete removed.
     if shard_idx == 0 && !has_checkpoint {
         let streams = metadata.mux_stm.streams();
-        for &(namespace, created_view) in seed_namespaces {
-            streams.seed_namespace(namespace, namespace.inner(), created_view);
+        for &(namespace, created_view, durability) in seed_namespaces {
+            streams.seed_namespace_with_durability(
+                namespace,
+                namespace.inner(),
+                created_view,
+                durability,
+            );
         }
     }
 

@@ -2864,6 +2864,7 @@ async fn given_a_floor_holding_the_walk_when_a_chunk_without_messages_lands_shou
             peer: PEER,
             idle_ticks: 0,
             floor_pulled_from: 0,
+            requested_from: Some(partition.consensus().commit_min() + 1),
         });
         for op in FLOOR + 1..=FIRST_CHUNK_LAST {
             partition
@@ -2959,6 +2960,7 @@ async fn resident_window_backup_with(
             peer,
             idle_ticks: 0,
             floor_pulled_from: 0,
+            requested_from: Some(partition.consensus().commit_min() + 1),
         });
         for op in floor + 1..=to_op {
             partition
