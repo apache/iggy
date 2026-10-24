@@ -40,7 +40,7 @@ use server_common::fatal::NoteDescriptorExhaustion;
 use server_common::fs_utils::truncate_file;
 use server_common::send_messages::{BatchHeader, COMMAND_HEADER_SIZE, decode_batch_slice};
 use server_common::sharding::IggyNamespace;
-use server_common::{SegmentStorage, yield_to_reactor};
+use server_common::{DISK_USAGE, SegmentStorage, yield_to_reactor};
 use std::io;
 use std::path::{Path, PathBuf};
 use tracing::{debug, error, info, warn};
@@ -1358,6 +1358,7 @@ async fn stage_rebuilt_index(
     entries: Vec<u8>,
 ) -> Result<String, PartitionRecoveryError> {
     let staging_path = format!("{index_path}{STAGING_SUFFIX}");
+    let staged_bytes = entries.len() as u64;
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -1373,7 +1374,10 @@ async fn stage_rebuilt_index(
             );
             PartitionRecoveryError::from(IggyError::CannotWriteToFile)
         })?;
-    file.write_all_at(entries, 0).await.0.map_err(|source| {
+    let charge = DISK_USAGE.charge(staged_bytes);
+    let (result, _) = file.write_all_at(entries, 0).await.into();
+    drop(charge);
+    result.map_err(|source| {
         error!(
             path = %staging_path,
             error = %source,

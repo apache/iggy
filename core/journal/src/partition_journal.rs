@@ -860,7 +860,11 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         self.poisoned = true;
         self.write_segment_bodies(prepares, &records).await?;
         self.retain_segment_inodes(&records).await?;
+        let charge = self
+            .storage
+            .charge_allocation(extent.as_slice().len() as u64);
         self.file.write_aligned(self.state.length, extent).await?;
+        drop(charge);
         for (op, record, _) in records {
             self.entries.insert(op, record);
         }
@@ -1388,7 +1392,9 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                 encoded.as_mut_slice(),
             )?;
             let length = encoded.as_slice().len();
+            let charge = self.storage.charge_allocation(length as u64);
             file.write_aligned(0, encoded).await?;
+            drop(charge);
             entries.insert(
                 checkpoint,
                 StoredPrepare {
@@ -1461,7 +1467,9 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                 )?;
             }
             let length = encoded.as_slice().len();
+            let charge = self.storage.charge_allocation(length as u64);
             file.write_aligned(state.length, encoded).await?;
+            drop(charge);
             entries.insert(
                 op,
                 StoredPrepare {
@@ -3288,6 +3296,49 @@ mod tests {
                 replacement.as_slice()[size_of::<PrepareHeader>()..]
             );
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[compio::test]
+    async fn given_a_preallocated_segment_when_truncating_its_tail_should_reserve_it_again() {
+        const SEGMENT_BYTES: u64 = 4 * 1024 * 1024;
+        const BODY_BYTES: usize = 256 * 1024;
+
+        let partition = tempdir().unwrap();
+        if !supports_preallocation(partition.path(), SEGMENT_BYTES) {
+            eprintln!("skipped: the temporary directory does not support fallocate");
+            return;
+        }
+        let mut journal = PartitionPrepareJournal::open_with_storage_and_capacity(
+            &partition.path().join("prepares-7"),
+            42,
+            7,
+            DiskStorage,
+            PARTITION_WAL_BYTES_MAX,
+            true,
+        )
+        .await
+        .unwrap();
+        journal
+            .enable_segment_storage(SegmentPosition::default(), SEGMENT_BYTES)
+            .await
+            .unwrap();
+        let first = segment_prepare(1, 0, 0, BODY_BYTES);
+        let second = segment_prepare(2, first.header().checksum, 1, BODY_BYTES);
+        journal.append(first.into_frozen()).await.unwrap();
+        journal.append(second.into_frozen()).await.unwrap();
+
+        journal.truncate_from(2).await.unwrap();
+
+        let metadata =
+            std::fs::metadata(partition.path().join("00000000000000000000.log")).unwrap();
+        assert_eq!(metadata.len(), BODY_BYTES as u64);
+        assert!(
+            metadata.blocks() * FILE_BLOCK_BYTES >= SEGMENT_BYTES,
+            "the truncated tail must be reserved up to the segment size again, since writes \
+             into it are charged only past that size; allocated {} bytes",
+            metadata.blocks() * FILE_BLOCK_BYTES
+        );
     }
 
     #[compio::test]
