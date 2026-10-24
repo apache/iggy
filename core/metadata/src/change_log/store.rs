@@ -40,6 +40,10 @@ pub const DEFAULT_ACTIVITY_CAPACITY: usize = 16_384;
 /// Largest ring a snapshot may hold, and the largest configurable capacity.
 pub const MAX_CAPACITY: usize = 1 << 20;
 
+/// Record body bytes one ring keeps, so large permission sets cannot grow the
+/// snapshot past what state transfer carries.
+pub const MAX_RING_BYTES: usize = 128 << 20;
+
 /// Captures a coherent image tries before a read gives up as retryable.
 const COHERENT_READ_ATTEMPTS: usize = 64;
 
@@ -147,6 +151,8 @@ impl Absorb<ChangeLogCommand> for ChangeLog {
 #[derive(Debug, Clone)]
 pub struct Ring {
     entries: VecDeque<Arc<ChangeEntry>>,
+    /// Body bytes of the retained records.
+    bytes: usize,
     evicted_through: (u64, u32),
     evicted_through_timestamp: u64,
     capacity: usize,
@@ -157,6 +163,7 @@ impl Ring {
     pub const fn new(capacity: usize) -> Self {
         Self {
             entries: VecDeque::new(),
+            bytes: 0,
             evicted_through: (0, 0),
             evicted_through_timestamp: 0,
             capacity,
@@ -166,6 +173,12 @@ impl Ring {
     #[must_use]
     pub const fn entries(&self) -> &VecDeque<Arc<ChangeEntry>> {
         &self.entries
+    }
+
+    /// Body bytes of the retained records.
+    #[must_use]
+    pub const fn bytes(&self) -> usize {
+        self.bytes
     }
 
     /// `(op, ordinal)` of the newest evicted record, `(0, 0)` when none was.
@@ -180,15 +193,18 @@ impl Ring {
         self.evicted_through_timestamp
     }
 
-    /// A restored ring, trimmed from the front to `capacity`.
+    /// A restored ring, trimmed from the front to `capacity` and
+    /// [`MAX_RING_BYTES`].
     pub(crate) fn restored(
         entries: VecDeque<Arc<ChangeEntry>>,
         evicted_through: (u64, u32),
         evicted_through_timestamp: u64,
         capacity: usize,
     ) -> Self {
+        let bytes = entries.iter().map(|entry| entry.body.len()).sum();
         let mut ring = Self {
             entries,
+            bytes,
             evicted_through,
             evicted_through_timestamp,
             capacity,
@@ -198,6 +214,7 @@ impl Ring {
     }
 
     fn push(&mut self, entry: Arc<ChangeEntry>) {
+        self.bytes += entry.body.len();
         self.entries.push_back(entry);
         self.trim();
     }
@@ -205,10 +222,11 @@ impl Ring {
     /// Evicts record by record, so one large operation can stay partly
     /// retained.
     fn trim(&mut self) {
-        while self.entries.len() > self.capacity {
+        while self.entries.len() > self.capacity || self.bytes > MAX_RING_BYTES {
             let Some(evicted) = self.entries.pop_front() else {
                 return;
             };
+            self.bytes -= evicted.body.len();
             self.evicted_through = evicted.position();
             self.evicted_through_timestamp = evicted.timestamp;
         }
@@ -287,9 +305,8 @@ pub enum ChangeLogCommand {
 /// The change log behind a left-right pair: the write side on the metadata
 /// shard, read handles on every shard.
 pub struct MetadataChangeLog {
-    write: Option<WriteCell<ChangeLog, ChangeLogCommand>>,
+    write: Option<Writer>,
     read: ReadHandle<ChangeLog>,
-    capacities: ChangeLogCapacities,
 }
 
 impl MetadataChangeLog {
@@ -298,9 +315,11 @@ impl MetadataChangeLog {
     pub fn new(capacities: ChangeLogCapacities) -> Self {
         let (write, read) = left_right::new_from_empty(ChangeLog::new(capacities));
         Self {
-            write: Some(WriteCell::new(write)),
+            write: Some(Writer {
+                cell: WriteCell::new(write),
+                capacities,
+            }),
             read,
-            capacities,
         }
     }
 
@@ -311,7 +330,6 @@ impl MetadataChangeLog {
         Self {
             write: None,
             read: factory.handle(),
-            capacities: ChangeLogCapacities::default(),
         }
     }
 
@@ -321,9 +339,15 @@ impl MetadataChangeLog {
         self.read.factory()
     }
 
-    #[must_use]
-    pub const fn capacities(&self) -> ChangeLogCapacities {
-        self.capacities
+    /// The capacities the write side was built with.
+    ///
+    /// # Errors
+    /// [`ChangeLogError::ReaderOnly`] on a read-only view, which does not know them.
+    pub fn capacities(&self) -> Result<ChangeLogCapacities, ChangeLogError> {
+        self.write
+            .as_ref()
+            .map(|write| write.capacities)
+            .ok_or(ChangeLogError::ReaderOnly)
     }
 
     /// Runs `read` on the published log, `None` once the write side is gone.
@@ -405,7 +429,7 @@ impl MetadataChangeLog {
                 }))
             })
             .collect::<Result<Vec<_>, ChangeLogError>>()?;
-        write.apply(ChangeLogCommand::Append {
+        write.cell.apply(ChangeLogCommand::Append {
             log_id,
             op: header.op,
             entries,
@@ -419,7 +443,7 @@ impl MetadataChangeLog {
     /// [`ChangeLogError::ReaderOnly`] on a read-only view.
     pub fn restore(&self, log: ChangeLog) -> Result<(), ChangeLogError> {
         let write = self.write.as_ref().ok_or(ChangeLogError::ReaderOnly)?;
-        write.apply(ChangeLogCommand::Restore(Box::new(log)));
+        write.cell.apply(ChangeLogCommand::Restore(Box::new(log)));
         Ok(())
     }
 }
@@ -428,9 +452,15 @@ impl fmt::Debug for MetadataChangeLog {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MetadataChangeLog")
             .field("writer", &self.write.is_some())
-            .field("capacities", &self.capacities)
+            .field("capacities", &self.capacities().ok())
             .finish_non_exhaustive()
     }
+}
+
+/// The write side of the log and the capacities it was built with.
+struct Writer {
+    cell: WriteCell<ChangeLog, ChangeLogCommand>,
+    capacities: ChangeLogCapacities,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -578,6 +608,61 @@ mod tests {
     }
 
     #[test]
+    fn given_bodies_past_the_byte_budget_when_appending_should_evict_the_oldest_records() {
+        let log = MetadataChangeLog::new(ChangeLogCapacities::default());
+        for op in 1..=3 {
+            log.append(
+                &header(op, u128::from(op), op),
+                vec![sized_change(MAX_RING_BYTES / 2 + 1)],
+            )
+            .expect("append");
+        }
+
+        let ring = log
+            .read(|log| log.ring(MetadataChangeClass::Resource).clone())
+            .expect("readable");
+
+        assert_eq!(ring.entries().len(), 1);
+        assert_eq!(ring.evicted_through(), (2, 0));
+        assert_eq!(ring.bytes(), MAX_RING_BYTES / 2 + 1);
+    }
+
+    #[test]
+    fn given_snapshot_past_the_byte_budget_when_restoring_should_trim_the_oldest_records() {
+        let entries = (1..=3)
+            .map(|op| {
+                Arc::new(ChangeEntry {
+                    op,
+                    ordinal: 0,
+                    checksum: u128::from(op),
+                    timestamp: op,
+                    actor_user_id: None,
+                    kind: Kind::UserPermissionsUpdated,
+                    body: Bytes::from(vec![0; MAX_RING_BYTES / 2 + 1]),
+                })
+            })
+            .collect();
+
+        let ring = Ring::restored(entries, (0, 0), 0, DEFAULT_RESOURCE_CAPACITY);
+
+        assert_eq!(ring.entries().len(), 1);
+        assert_eq!(ring.evicted_through(), (2, 0));
+    }
+
+    #[test]
+    fn given_reader_view_when_asking_capacities_should_refuse_instead_of_guessing() {
+        let capacities = ChangeLogCapacities {
+            resource: 7,
+            activity: 3,
+        };
+        let writer = MetadataChangeLog::new(capacities);
+        let reader = MetadataChangeLog::from_factory(writer.factory());
+
+        assert_eq!(writer.capacities(), Ok(capacities));
+        assert_eq!(reader.capacities(), Err(ChangeLogError::ReaderOnly));
+    }
+
+    #[test]
     fn given_reader_view_when_writing_should_refuse_and_see_the_writer_state() {
         let writer = MetadataChangeLog::new(ChangeLogCapacities::default());
         let reader = MetadataChangeLog::from_factory(writer.factory());
@@ -612,6 +697,14 @@ mod tests {
             kind,
             actor_user_id,
             body: Bytes::from_static(b"body"),
+        }
+    }
+
+    fn sized_change(body_bytes: usize) -> AppliedChange {
+        AppliedChange {
+            kind: Kind::UserPermissionsUpdated,
+            actor_user_id: None,
+            body: Bytes::from(vec![0; body_bytes]),
         }
     }
 

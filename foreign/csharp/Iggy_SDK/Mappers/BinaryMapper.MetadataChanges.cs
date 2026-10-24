@@ -541,7 +541,7 @@ internal static partial class BinaryMapper
             UserCreatedAt = reader.U64(),
             ClientId = reader.U128(),
             Session = reader.U64(),
-            Reason = (MetadataSessionClosedReason)reader.CodeAtMost((byte)MetadataSessionClosedReason.Expired,
+            Reason = (MetadataSessionClosedReason)reader.CodeAtMost((byte)MetadataSessionClosedReason.Revoked,
                 "session closed reason")
         };
     }
@@ -575,8 +575,8 @@ internal static partial class BinaryMapper
     }
 
     /// <summary>
-    ///     A bounds-checked little-endian cursor over a metadata changes answer. Every overrun is a
-    ///     <see cref="MalformedResponseException" /> instead of a slicing exception.
+    ///     A bounds-checked little-endian cursor over a metadata changes answer or a user's permission set. Every
+    ///     overrun is a <see cref="MalformedResponseException" /> instead of a slicing exception.
     /// </summary>
     private ref struct WireReader
     {
@@ -598,7 +598,7 @@ internal static partial class BinaryMapper
             if (length > Remaining)
             {
                 throw new MalformedResponseException(
-                    $"Metadata changes field of {length} bytes at byte {Position} overruns the {Buffer.Length}-byte payload.");
+                    $"Response field of {length} bytes at byte {Position} overruns the {Buffer.Length}-byte payload.");
             }
 
             var bytes = Buffer.Slice(Position, (int)length);

@@ -125,12 +125,17 @@ export function canReadMetadataChanges(
 }
 
 /** What to tell the reader about a page that carries no records to show. */
-export function statusMessage(status: MetadataChangeStatus): string | undefined {
+export function statusMessage(
+  status: MetadataChangeStatus,
+  following: boolean
+): string | undefined {
   switch (status) {
     case 'ok':
       return undefined;
     case 'behind':
-      return 'This node has not applied that position yet. Retrying.';
+      return following
+        ? 'This node has not applied that position yet. Retrying.'
+        : 'This node has not applied that position yet. Load again shortly.';
     case 'expired':
       return 'The node no longer holds every change after this position. Load again from the earliest retained change.';
     case 'reset':

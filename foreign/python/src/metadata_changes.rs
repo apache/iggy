@@ -15,9 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use bytes::Bytes;
 use iggy::prelude::{
-    IggyTimestamp, MetadataChange as RustMetadataChange,
+    IggyError, IggyTimestamp, MetadataChange as RustMetadataChange,
     MetadataChangeCursor as RustMetadataChangeCursor,
     MetadataChangeGroup as RustMetadataChangeGroup, MetadataChangeKind as RustMetadataChangeKind,
     MetadataChangePhase as RustMetadataChangePhase,
@@ -35,7 +34,7 @@ use iggy::prelude::{
 use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyString};
+use pyo3::types::PyBytes;
 use pyo3_stub_gen::derive::{
     gen_stub_pyclass, gen_stub_pyclass_complex_enum, gen_stub_pyclass_enum, gen_stub_pymethods,
 };
@@ -166,9 +165,9 @@ pub enum MetadataChangeStart {
 
 /// Family of change records and the unit of filtering. `str()` gives the
 /// name the HTTP API uses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[gen_stub_pyclass_enum]
-#[pyclass(eq, from_py_object)]
+#[pyclass(eq, frozen, hash, from_py_object)]
 pub enum MetadataChangeGroup {
     Streams,
     Topics,
@@ -181,9 +180,9 @@ pub enum MetadataChangeGroup {
 }
 
 /// Kind of a change record. `str()` gives the name the HTTP API uses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[gen_stub_pyclass_enum]
-#[pyclass(eq, from_py_object)]
+#[pyclass(eq, frozen, hash, from_py_object)]
 pub enum MetadataChangeKind {
     StreamCreated,
     StreamUpdated,
@@ -209,9 +208,9 @@ pub enum MetadataChangeKind {
 }
 
 /// Outcome of a change log query.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[gen_stub_pyclass_enum]
-#[pyclass(eq, from_py_object)]
+#[pyclass(eq, frozen, hash, from_py_object)]
 pub enum MetadataChangeStatus {
     /// Records or items after the requested position. Apply them and keep
     /// `next`.
@@ -227,45 +226,47 @@ pub enum MetadataChangeStatus {
 }
 
 /// Whether a page carries change records or current state items.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[gen_stub_pyclass_enum]
-#[pyclass(eq, from_py_object)]
+#[pyclass(eq, frozen, hash, from_py_object)]
 pub enum MetadataChangePhase {
     Changes,
     Current,
 }
 
 /// Why a consumer group member was removed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[gen_stub_pyclass_enum]
-#[pyclass(eq, from_py_object)]
+#[pyclass(eq, frozen, hash, from_py_object)]
 pub enum MetadataMemberLeftReason {
     Left,
     SessionEnded,
 }
 
 /// Why a personal access token was removed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[gen_stub_pyclass_enum]
-#[pyclass(eq, from_py_object)]
+#[pyclass(eq, frozen, hash, from_py_object)]
 pub enum MetadataTokenDeletedReason {
     Deleted,
     Expired,
 }
 
 /// Why a session was closed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[gen_stub_pyclass_enum]
-#[pyclass(eq, from_py_object)]
+#[pyclass(eq, frozen, hash, from_py_object)]
 pub enum MetadataSessionClosedReason {
     Logout,
     Expired,
+    /// The user was deactivated or deleted.
+    Revoked,
 }
 
 /// Why a user's public permission set changed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[gen_stub_pyclass_enum]
-#[pyclass(eq, from_py_object)]
+#[pyclass(eq, frozen, hash, from_py_object)]
 pub enum MetadataPermissionsUpdatedReason {
     /// An `update_permissions` call replaced the set.
     Updated,
@@ -694,17 +695,17 @@ pub struct MetadataSessionClosed {
 #[gen_stub_pyclass]
 #[pyclass(frozen)]
 pub struct MetadataUnknownChange {
-    group: UnknownCode,
-    kind: UnknownCode,
-    body: UnknownBody,
+    group: Py<PyAny>,
+    kind: Py<PyAny>,
+    body: Py<PyAny>,
 }
 
 /// A current state item of a group this build does not know.
 #[gen_stub_pyclass]
 #[pyclass(frozen)]
 pub struct MetadataUnknownItem {
-    group: UnknownCode,
-    body: UnknownBody,
+    group: Py<PyAny>,
+    body: Py<PyAny>,
 }
 
 #[gen_stub_pymethods]
@@ -1148,23 +1149,23 @@ impl MetadataUnknownChange {
     /// The group code on binary transports, or the group name over HTTP.
     #[getter]
     #[gen_stub(override_return_type(type_repr = "builtins.int | builtins.str"))]
-    fn group<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
-        self.group.into_pyobject(py)
+    fn group(&self, py: Python<'_>) -> Py<PyAny> {
+        self.group.clone_ref(py)
     }
 
     /// The kind code on binary transports, or the kind name over HTTP.
     #[getter]
     #[gen_stub(override_return_type(type_repr = "builtins.int | builtins.str"))]
-    fn kind<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
-        self.kind.into_pyobject(py)
+    fn kind(&self, py: Python<'_>) -> Py<PyAny> {
+        self.kind.clone_ref(py)
     }
 
     /// The raw body on binary transports, or the record's whole JSON object
     /// over HTTP.
     #[getter]
     #[gen_stub(override_return_type(type_repr = "builtins.bytes | builtins.str"))]
-    fn body<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
-        self.body.into_pyobject(py)
+    fn body(&self, py: Python<'_>) -> Py<PyAny> {
+        self.body.clone_ref(py)
     }
 }
 
@@ -1174,16 +1175,16 @@ impl MetadataUnknownItem {
     /// The group code on binary transports, or the group name over HTTP.
     #[getter]
     #[gen_stub(override_return_type(type_repr = "builtins.int | builtins.str"))]
-    fn group<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
-        self.group.into_pyobject(py)
+    fn group(&self, py: Python<'_>) -> Py<PyAny> {
+        self.group.clone_ref(py)
     }
 
     /// The raw body on binary transports, or the item's whole JSON object
     /// over HTTP.
     #[getter]
     #[gen_stub(override_return_type(type_repr = "builtins.bytes | builtins.str"))]
-    fn body<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
-        self.body.into_pyobject(py)
+    fn body(&self, py: Python<'_>) -> Py<PyAny> {
+        self.body.clone_ref(py)
     }
 }
 
@@ -1341,7 +1342,8 @@ mirror_enum!(
     MetadataSessionClosedReason,
     RustMetadataSessionClosedReason,
     Logout,
-    Expired
+    Expired,
+    Revoked
 );
 mirror_enum!(
     MetadataPermissionsUpdatedReason,
@@ -1350,52 +1352,14 @@ mirror_enum!(
     ResourceDeleted
 );
 
-/// A group or kind as the transport carried it.
-enum UnknownCode {
-    Binary(u8),
-    Json(String),
-}
-
-/// A body as the transport carried it: the raw binary body, or the whole
-/// JSON object.
-enum UnknownBody {
-    Binary(Bytes),
-    Json(String),
-}
-
-impl<'py> IntoPyObject<'py> for &UnknownCode {
-    type Target = PyAny;
-    type Output = Bound<'py, PyAny>;
-    type Error = PyErr;
-
-    fn into_pyobject(self, py: Python<'py>) -> PyResult<Self::Output> {
-        match self {
-            UnknownCode::Binary(code) => code.into_bound_py_any(py),
-            UnknownCode::Json(name) => Ok(PyString::new(py, name).into_any()),
-        }
-    }
-}
-
-impl<'py> IntoPyObject<'py> for &UnknownBody {
-    type Target = PyAny;
-    type Output = Bound<'py, PyAny>;
-    type Error = PyErr;
-
-    fn into_pyobject(self, py: Python<'py>) -> PyResult<Self::Output> {
-        Ok(match self {
-            UnknownBody::Binary(body) => PyBytes::new(py, body).into_any(),
-            UnknownBody::Json(text) => PyString::new(py, text).into_any(),
-        })
-    }
-}
-
 /// Build the query `get_metadata_changes` sends and refuse it before any
 /// I/O when the Rust SDK would.
 ///
 /// # Errors
 ///
 /// Raises `IggyError` with the `InvalidCommand` code for a query
-/// `MetadataChangesQuery::validate` refuses.
+/// `MetadataChangesQuery::validate` refuses, or for a time bound the
+/// platform clock cannot hold.
 pub(crate) fn validated_query(
     start: &MetadataChangeStart,
     groups: Option<Vec<MetadataChangeGroup>>,
@@ -1403,12 +1367,16 @@ pub(crate) fn validated_query(
     until: Option<u64>,
     limit: Option<u32>,
 ) -> PyResult<MetadataChangesQuery> {
+    let timestamp = |micros: u64| {
+        IggyTimestamp::checked_from_micros(micros)
+            .ok_or_else(|| to_runtime_error(IggyError::InvalidCommand))
+    };
     let defaults = MetadataChangesQuery::default();
     let query = MetadataChangesQuery {
         start: start.into(),
         groups: groups.into_iter().flatten().map(Into::into).collect(),
-        since: since.map(IggyTimestamp::from),
-        until: until.map(IggyTimestamp::from),
+        since: since.map(timestamp).transpose()?,
+        until: until.map(timestamp).transpose()?,
         limit: limit.unwrap_or(defaults.limit),
     };
     query.validate().map_err(to_runtime_error)?;
@@ -1613,15 +1581,15 @@ fn change_body(py: Python<'_>, change: RustMetadataChange) -> PyResult<Py<PyAny>
         }
         .into_py_any(py),
         RustMetadataChange::Unknown { group, kind, body } => MetadataUnknownChange {
-            group: UnknownCode::Binary(group),
-            kind: UnknownCode::Binary(kind),
-            body: UnknownBody::Binary(body),
+            group: group.into_py_any(py)?,
+            kind: kind.into_py_any(py)?,
+            body: PyBytes::new(py, &body).into_any().unbind(),
         }
         .into_py_any(py),
         RustMetadataChange::UnknownJson { group, kind, body } => MetadataUnknownChange {
-            group: UnknownCode::Json(group),
-            kind: UnknownCode::Json(kind),
-            body: UnknownBody::Json(body.get().to_owned()),
+            group: group.into_py_any(py)?,
+            kind: kind.into_py_any(py)?,
+            body: body.get().into_py_any(py)?,
         }
         .into_py_any(py),
     }
@@ -1699,13 +1667,13 @@ fn item_body(py: Python<'_>, item: RustMetadataCurrentItem) -> PyResult<Py<PyAny
         }
         .into_py_any(py),
         RustMetadataCurrentItem::Unknown { group, body } => MetadataUnknownItem {
-            group: UnknownCode::Binary(group),
-            body: UnknownBody::Binary(body),
+            group: group.into_py_any(py)?,
+            body: PyBytes::new(py, &body).into_any().unbind(),
         }
         .into_py_any(py),
         RustMetadataCurrentItem::UnknownJson { group, body } => MetadataUnknownItem {
-            group: UnknownCode::Json(group),
-            body: UnknownBody::Json(body.get().to_owned()),
+            group: group.into_py_any(py)?,
+            body: body.get().into_py_any(py)?,
         }
         .into_py_any(py),
     }
@@ -1731,13 +1699,14 @@ fn options_view<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use iggy::prelude::UserStatus as RustUserStatus;
     use iggy_binary_protocol::requests::system::GetMetadataChangesRequest;
     use iggy_binary_protocol::responses::system::{
         GetMetadataChangesResponse, WireMetadataChangeRecord, WireMetadataItem,
     };
     use iggy_binary_protocol::{WireDecode, WireEncode};
-    use pyo3::types::PyDict;
+    use pyo3::types::{PyDict, PyString};
     use serde_json::{Map, Value};
 
     const FIXTURE: &str = include_str!("../tests/fixtures/metadata_changes.json");
@@ -1953,6 +1922,43 @@ mod tests {
                 .and_then(|(response, _)| RustMetadataChanges::try_from(response).map_err(|_| ()));
             assert!(decoded.is_err(), "{}", vector["case"]);
         }
+    }
+
+    #[test]
+    fn given_unknown_records_and_items_when_reading_twice_should_return_the_same_objects() {
+        Python::initialize();
+        let vector = vectors("responses")
+            .into_iter()
+            .find(|vector| vector["case"] == "unknown_kind_and_group")
+            .expect("unknown vector");
+        let bytes = decode_hex(&vector["response_hex"]);
+        let (wire, _) = GetMetadataChangesResponse::decode(&bytes).expect("response decodes");
+        let binary = RustMetadataChanges::try_from(wire).expect("response converts");
+        let json: RustMetadataChanges =
+            serde_json::from_value(vector["expected"].clone()).expect("response parses");
+        let items = vec![
+            RustMetadataCurrentItem::Unknown {
+                group: 200,
+                body: Bytes::from_static(&[0xde, 0xad]),
+            },
+            serde_json::from_str(r#"{"group":"future","value":1}"#).expect("item parses"),
+        ];
+        Python::attach(|py| {
+            let records = binary.records.into_iter().chain(json.records).collect();
+            let page = page_of(py, records, items);
+            let records = page.getattr("records").expect("records");
+            assert_eq!(records.len().expect("length"), 4);
+            for record in records.try_iter().expect("records iterate") {
+                let change = record.and_then(|record| record.getattr("change"));
+                assert_same_on_every_read(&change.expect("change"), &["group", "kind", "body"]);
+            }
+            let items = page.getattr("items").expect("items");
+            assert_eq!(items.len().expect("length"), 2);
+            for item in items.try_iter().expect("items iterate") {
+                let body = item.and_then(|item| item.getattr("body"));
+                assert_same_on_every_read(&body.expect("body"), &["group", "body"]);
+            }
+        });
     }
 
     fn page_of<'py>(
@@ -2190,6 +2196,14 @@ mod tests {
                 actual.eq(&wanted).expect("comparable"),
                 "{getter}: {actual} != {wanted}"
             );
+        }
+    }
+
+    fn assert_same_on_every_read(object: &Bound<'_, PyAny>, names: &[&str]) {
+        for name in names {
+            let first = object.getattr(*name).expect("first read");
+            let second = object.getattr(*name).expect("second read");
+            assert!(first.is(&second), "{name} is rebuilt on every read");
         }
     }
 

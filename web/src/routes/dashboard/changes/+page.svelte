@@ -115,7 +115,7 @@ under the License.
     }, 3000);
   }
 
-  let start = $state<'earliest' | 'recent'>('recent');
+  let start = $state<'earliest' | 'recent'>('earliest');
   const order = $derived(start === 'recent' ? 'newest' : 'oldest');
   let recentLoaded = $state(false);
   let visibleCount = $state(DEFAULT_METADATA_CHANGES_LIMIT);
@@ -176,7 +176,7 @@ under the License.
     }
     const answer = result.page;
     lastPage = answer;
-    notice = statusMessage(answer.status);
+    notice = statusMessage(answer.status, following);
     if (answer.status === 'ok') {
       records = [...records, ...answer.records].slice(-MAX_SHOWN_METADATA_CHANGES);
       cursor = answer.next;
@@ -240,7 +240,7 @@ under the License.
         notice =
           result.page.status === 'behind'
             ? 'This node is behind the captured position. Load again shortly.'
-            : statusMessage(result.page.status);
+            : statusMessage(result.page.status, false);
       }
     } catch (error) {
       if (controller.signal.aborted) notice = 'Loading canceled.';

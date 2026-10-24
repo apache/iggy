@@ -29,7 +29,7 @@ use crate::primitives::options::{
     WireOptions, decode_options_prefixed, encode_options_prefixed, options_prefixed_size,
 };
 use crate::primitives::permissions::WirePermissions;
-use bytes::{BufMut, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use std::borrow::Cow;
 
 /// A change record body, typed by its kind.
@@ -389,25 +389,25 @@ impl WireMetadataChange {
 
     /// Encoded body bytes, without the record envelope.
     #[must_use]
-    pub fn body_bytes(&self) -> Vec<u8> {
+    pub fn body_bytes(&self) -> Bytes {
         match self {
-            Self::StreamCreated(body) | Self::StreamUpdated(body) => super::encode_to_vec(body),
-            Self::StreamDeleted(body) => super::encode_to_vec(body),
-            Self::TopicCreated(body) | Self::TopicUpdated(body) => super::encode_to_vec(body),
-            Self::TopicDeleted(body) => super::encode_to_vec(body),
-            Self::PartitionsChanged(body) => super::encode_to_vec(body),
-            Self::ConsumerGroupCreated(body) => super::encode_to_vec(body),
-            Self::ConsumerGroupDeleted(body) => super::encode_to_vec(body),
-            Self::ConsumerGroupMemberJoined(body) => super::encode_to_vec(body),
-            Self::ConsumerGroupMemberLeft(body) => super::encode_to_vec(body),
-            Self::ConsumerGroupPartitionHandedOver(body) => super::encode_to_vec(body),
-            Self::UserCreated(body) | Self::UserUpdated(body) => super::encode_to_vec(body),
-            Self::UserDeleted(body) | Self::UserPasswordChanged(body) => super::encode_to_vec(body),
-            Self::UserPermissionsUpdated(body) => super::encode_to_vec(body),
-            Self::PersonalAccessTokenCreated(body) => super::encode_to_vec(body),
-            Self::PersonalAccessTokenDeleted(body) => super::encode_to_vec(body),
-            Self::SessionRegistered(body) => super::encode_to_vec(body),
-            Self::SessionClosed(body) => super::encode_to_vec(body),
+            Self::StreamCreated(body) | Self::StreamUpdated(body) => body.to_bytes(),
+            Self::StreamDeleted(body) => body.to_bytes(),
+            Self::TopicCreated(body) | Self::TopicUpdated(body) => body.to_bytes(),
+            Self::TopicDeleted(body) => body.to_bytes(),
+            Self::PartitionsChanged(body) => body.to_bytes(),
+            Self::ConsumerGroupCreated(body) => body.to_bytes(),
+            Self::ConsumerGroupDeleted(body) => body.to_bytes(),
+            Self::ConsumerGroupMemberJoined(body) => body.to_bytes(),
+            Self::ConsumerGroupMemberLeft(body) => body.to_bytes(),
+            Self::ConsumerGroupPartitionHandedOver(body) => body.to_bytes(),
+            Self::UserCreated(body) | Self::UserUpdated(body) => body.to_bytes(),
+            Self::UserDeleted(body) | Self::UserPasswordChanged(body) => body.to_bytes(),
+            Self::UserPermissionsUpdated(body) => body.to_bytes(),
+            Self::PersonalAccessTokenCreated(body) => body.to_bytes(),
+            Self::PersonalAccessTokenDeleted(body) => body.to_bytes(),
+            Self::SessionRegistered(body) => body.to_bytes(),
+            Self::SessionClosed(body) => body.to_bytes(),
         }
     }
 
@@ -499,16 +499,16 @@ impl WireMetadataCurrentItem {
 
     /// Encoded body bytes, without the item envelope.
     #[must_use]
-    pub fn body_bytes(&self) -> Vec<u8> {
+    pub fn body_bytes(&self) -> Bytes {
         match self {
-            Self::Stream(body) => super::encode_to_vec(body),
-            Self::Topic(body) => super::encode_to_vec(body),
-            Self::Partitions(body) => super::encode_to_vec(body),
-            Self::ConsumerGroup(body) => super::encode_to_vec(body),
-            Self::ConsumerGroupMember(body) => super::encode_to_vec(body),
-            Self::User(body) => super::encode_to_vec(body),
-            Self::PersonalAccessToken(body) => super::encode_to_vec(body),
-            Self::Session(body) => super::encode_to_vec(body),
+            Self::Stream(body) => body.to_bytes(),
+            Self::Topic(body) => body.to_bytes(),
+            Self::Partitions(body) => body.to_bytes(),
+            Self::ConsumerGroup(body) => body.to_bytes(),
+            Self::ConsumerGroupMember(body) => body.to_bytes(),
+            Self::User(body) => body.to_bytes(),
+            Self::PersonalAccessToken(body) => body.to_bytes(),
+            Self::Session(body) => body.to_bytes(),
         }
     }
 
@@ -1398,7 +1398,7 @@ mod tests {
     #[test]
     fn given_trailing_bytes_when_decoding_a_change_body_should_refuse() {
         for change in sample_changes() {
-            let mut body = change.body_bytes();
+            let mut body = change.body_bytes().to_vec();
             body.push(0);
             assert!(
                 WireMetadataChange::decode(change.group().as_u8(), change.kind().as_u8(), &body)
@@ -1408,7 +1408,7 @@ mod tests {
             );
         }
         for item in sample_items() {
-            let mut body = item.body_bytes();
+            let mut body = item.body_bytes().to_vec();
             body.push(0);
             assert!(WireMetadataCurrentItem::decode(item.group().as_u8(), &body).is_err());
         }
@@ -1444,7 +1444,7 @@ mod tests {
             members_count: 0,
             reason: WireMemberLeftReason::Left,
         });
-        let mut body = change.body_bytes();
+        let mut body = change.body_bytes().to_vec();
         *body.last_mut().unwrap() = 2;
         assert!(
             WireMetadataChange::decode(change.group().as_u8(), change.kind().as_u8(), &body)
@@ -1474,7 +1474,7 @@ mod tests {
             }),
         ];
         for change in changes {
-            let mut body = change.body_bytes();
+            let mut body = change.body_bytes().to_vec();
             *body.last_mut().unwrap() = 7;
             assert!(
                 WireMetadataChange::decode(change.group().as_u8(), change.kind().as_u8(), &body)
@@ -1488,7 +1488,7 @@ mod tests {
     #[test]
     fn given_options_state_byte_above_one_when_decoding_should_refuse() {
         let change = WireMetadataChange::StreamCreated(stream_body());
-        let mut body = change.body_bytes();
+        let mut body = change.body_bytes().to_vec();
         let state_offset = WireStreamKey::SIZE + 8 + 1 + "orders".len();
         body[state_offset] = 2;
         assert!(
@@ -1505,7 +1505,7 @@ mod tests {
             name: WireName::new("orders").unwrap(),
             requested_op: None,
         });
-        let mut body = change.body_bytes();
+        let mut body = change.body_bytes().to_vec();
         *body.last_mut().unwrap() = 2;
         assert!(
             WireMetadataChange::decode(change.group().as_u8(), change.kind().as_u8(), &body)

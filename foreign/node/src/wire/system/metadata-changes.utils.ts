@@ -38,6 +38,7 @@ const PAGE_TOKEN_FIXED_SIZE = METADATA_CHANGE_CURSOR_SIZE + 8 + 1 + 1 + 2;
 const MAX_PAGE_TOKEN_TEXT_LENGTH = METADATA_CURRENT_PAGE_TOKEN_PREFIX.length +
   Math.ceil((PAGE_TOKEN_FIXED_SIZE + MAX_PAGE_TOKEN_KEY_SIZE) / 3) * 4;
 const INVALID_COMMAND = 3;
+const NON_CANONICAL_CURSOR = 'a cursor at op 0 carries no checksum and no ordinal';
 const U32_MAX = 0xffff_ffff;
 const U64_MASK = 0xffff_ffff_ffff_ffffn;
 const U128_MAX = (1n << 128n) - 1n;
@@ -126,7 +127,9 @@ export type MetadataTokenDeletedReason =
 /** Why a session was closed. */
 export const MetadataSessionClosedReason = {
   Logout: 'logout',
-  Expired: 'expired'
+  Expired: 'expired',
+  /** The user was deactivated or deleted */
+  Revoked: 'revoked'
 } as const;
 
 export type MetadataSessionClosedReason =
@@ -451,7 +454,7 @@ const STATUS_NAMES: readonly MetadataChangeStatus[] = ['ok', 'behind', 'expired'
 const PHASE_NAMES: readonly MetadataChangePhase[] = ['changes', 'current'];
 const MEMBER_LEFT_REASONS: readonly MetadataMemberLeftReason[] = ['left', 'session_ended'];
 const TOKEN_DELETED_REASONS: readonly MetadataTokenDeletedReason[] = ['deleted', 'expired'];
-const SESSION_CLOSED_REASONS: readonly MetadataSessionClosedReason[] = ['logout', 'expired'];
+const SESSION_CLOSED_REASONS: readonly MetadataSessionClosedReason[] = ['logout', 'expired', 'revoked'];
 const PERMISSIONS_UPDATED_REASONS: readonly MetadataPermissionsUpdatedReason[] =
   ['updated', 'resource_deleted'];
 
@@ -496,11 +499,10 @@ export class MetadataChangeCursor {
   static parse(text: string): MetadataChangeCursor {
     if (text.length !== CURSOR_TEXT_LENGTH)
       throw invalidCommand('a change cursor is 63 characters');
-    const bytes = decodeCanonicalBase64(text, METADATA_CHANGE_CURSOR_PREFIX);
-    return new MetadataChangeCursor(
-      readUnsigned128(bytes, 0), bytes.readBigUInt64LE(16),
-      readUnsigned128(bytes, 24), bytes.readUInt32LE(40)
-    );
+    const cursor = decodeCursor(decodeCanonicalBase64(text, METADATA_CHANGE_CURSOR_PREFIX));
+    if (cursor === undefined)
+      throw invalidCommand(NON_CANONICAL_CURSOR);
+    return cursor;
   }
 
   /** The 44 wire bytes: `[log_id:u128][op:u64][checksum:u128][ordinal:u32]`, little-endian. */
@@ -565,10 +567,7 @@ export class MetadataCurrentPageToken {
 
   /** The cursor captured before the scan's first page */
   get anchor(): MetadataChangeCursor {
-    return new MetadataChangeCursor(
-      readUnsigned128(this.#payload, 0), this.#payload.readBigUInt64LE(16),
-      readUnsigned128(this.#payload, 24), this.#payload.readUInt32LE(40)
-    );
+    return decodeCursor(this.#payload)!;
   }
 
   /** The highest head any page of the scan reported so far */
@@ -758,7 +757,8 @@ export const missesParentGroup = (mask: number): boolean =>
 
 /**
  * Decodes a record body by its codes. A group or kind this build does not
- * know keeps the raw body, a known kind under another group is refused.
+ * know keeps the raw body and a known group name, a known kind under another
+ * group is refused.
  */
 export const decodeMetadataChange = (
   groupCode: number, kindCode: number, body: Buffer
@@ -766,7 +766,7 @@ export const decodeMetadataChange = (
   const group = GROUP_BY_CODE.get(groupCode);
   const kind = KIND_BY_CODE.get(kindCode);
   if (group === undefined || kind === undefined)
-    return { kind: 'unknown', group: 'unknown', body: Buffer.from(body) };
+    return { kind: 'unknown', group: group ?? 'unknown', body: Buffer.from(body) };
   const reader = new ChangeReader(body);
   if (metadataChangeKindGroup(kind) !== group)
     reader.fail(`change kind ${kindCode} does not belong to group ${groupCode}`);
@@ -830,15 +830,8 @@ export const decodeMetadataCurrentItem = (groupCode: number, body: Buffer): Meta
 };
 
 /** Reads a 44-byte cursor, refusing an op 0 that carries a checksum or an ordinal. */
-export const readMetadataChangeCursor = (reader: ChangeReader): MetadataChangeCursor => {
-  const bytes = reader.take(METADATA_CHANGE_CURSOR_SIZE);
-  const op = bytes.readBigUInt64LE(16);
-  const checksum = readUnsigned128(bytes, 24);
-  const ordinal = bytes.readUInt32LE(40);
-  if (op === 0n && (checksum !== 0n || ordinal !== 0))
-    reader.fail('a cursor at op 0 carries no checksum and no ordinal');
-  return new MetadataChangeCursor(readUnsigned128(bytes, 0), op, checksum, ordinal);
-};
+export const readMetadataChangeCursor = (reader: ChangeReader): MetadataChangeCursor =>
+  decodeCursor(reader.take(METADATA_CHANGE_CURSOR_SIZE)) ?? reader.fail(NON_CANONICAL_CURSOR);
 
 export const metadataChangeStatus = (reader: ChangeReader): MetadataChangeStatus =>
   reader.code(STATUS_NAMES, 'status');
@@ -1091,8 +1084,8 @@ const groupsOfMask = (mask: number): MetadataChangeGroup[] =>
 const pageTokenRefusal = (payload: Buffer): string | undefined => {
   if (payload.length < PAGE_TOKEN_FIXED_SIZE)
     return `a page token is at least ${PAGE_TOKEN_FIXED_SIZE} bytes`;
-  const op = payload.readBigUInt64LE(16);
-  if (op === 0n && (readUnsigned128(payload, 24) !== 0n || payload.readUInt32LE(40) !== 0))
+  const anchor = decodeCursor(payload);
+  if (anchor === undefined)
     return 'page token anchor is not canonical';
   const groupsMask = payload[METADATA_CHANGE_CURSOR_SIZE + 8];
   const groupCode = payload[METADATA_CHANGE_CURSOR_SIZE + 9];
@@ -1104,7 +1097,7 @@ const pageTokenRefusal = (payload: Buffer): string | undefined => {
     return `page token key of ${keyLength} bytes does not fill a ${payload.length} byte token`;
   if ((groupsMask & (1 << (groupCode - 1))) === 0)
     return 'page token group is not in its group mask';
-  if (payload.readBigUInt64LE(METADATA_CHANGE_CURSOR_SIZE) < op)
+  if (payload.readBigUInt64LE(METADATA_CHANGE_CURSOR_SIZE) < anchor.op)
     return 'page token head is below its anchor';
   if (!keyFitsGroup(group, payload.subarray(PAGE_TOKEN_FIXED_SIZE)))
     return `page token key of ${keyLength} bytes does not fit group ${group}`;
@@ -1141,6 +1134,19 @@ const decodeCanonicalBase64 = (text: string, prefix: string): Buffer => {
   if (bytes.toString('base64url') !== encoded)
     throw invalidCommand('expected canonical unpadded Base64url');
   return bytes;
+};
+
+/**
+ * The cursor in the first 44 bytes, `undefined` for an op 0 that carries a
+ * checksum or an ordinal, so each caller raises its own error.
+ */
+const decodeCursor = (bytes: Buffer): MetadataChangeCursor | undefined => {
+  const op = bytes.readBigUInt64LE(16);
+  const checksum = readUnsigned128(bytes, 24);
+  const ordinal = bytes.readUInt32LE(40);
+  if (op === 0n && (checksum !== 0n || ordinal !== 0))
+    return undefined;
+  return new MetadataChangeCursor(readUnsigned128(bytes, 0), op, checksum, ordinal);
 };
 
 const isUnsigned = (value: bigint, maximum: bigint): boolean =>

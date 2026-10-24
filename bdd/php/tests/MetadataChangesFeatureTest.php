@@ -99,8 +99,8 @@ final class MetadataChangesFeatureTest extends TestCase
         if (preg_match('/^I hold the latest metadata change cursor for the groups "([^"]+)"$/', $step, $matches) === 1) {
             $this->groups = self::parseGroups($matches[1]);
             $page = $this->read(MetadataChangeStart::latest());
-            assert_same(MetadataChangeStatus::Ok, $page->status());
-            $this->cursor = $page->next();
+            assert_same(MetadataChangeStatus::Ok, $page->status);
+            $this->cursor = $page->next;
             assert_not_null($this->cursor);
             return;
         }
@@ -127,12 +127,12 @@ final class MetadataChangesFeatureTest extends TestCase
             );
             $records = $this->follow(count($expected));
             foreach ($records as $record) {
-                assert_true(in_array($record->group(), $this->groups, true), 'a record of an unrequested group');
+                assert_true(in_array($record->group, $this->groups, true), 'a record of an unrequested group');
             }
             $this->followed = $this->streamRecords($records);
             assert_same(
                 $expected,
-                array_map(static fn (MetadataChangeRecord $record): ?MetadataChangeKind => $record->kind(), $this->followed),
+                array_map(static fn (MetadataChangeRecord $record): ?MetadataChangeKind => $record->kind, $this->followed),
             );
             return;
         }
@@ -140,22 +140,22 @@ final class MetadataChangesFeatureTest extends TestCase
         if ($step === 'each followed change should name the root user as its actor') {
             assert_true($this->followed !== [], 'changes were followed');
             foreach ($this->followed as $record) {
-                assert_same(self::ROOT_USER_ID, $record->actorUserId());
+                assert_same(self::ROOT_USER_ID, $record->actor_user_id);
             }
             return;
         }
 
         if (preg_match('/^the followed "([^"]+)" change should carry a requested op before its own op$/', $step, $matches) === 1) {
             $record = $this->followedRecord($matches[1]);
-            $deleted = $record->change();
+            $deleted = $record->change;
             assert_instance_of(MetadataStreamDeleted::class, $deleted);
-            assert_not_null($deleted->requestedOp());
-            assert_true($deleted->requestedOp() < $record->op(), 'the request precedes the completion');
+            assert_not_null($deleted->requested_op);
+            assert_true($deleted->requested_op < $record->op, 'the request precedes the completion');
             return;
         }
 
         if (preg_match('/^the followed "([^"]+)" change should report encryption key source "([^"]+)"$/', $step, $matches) === 1) {
-            assert_same($matches[2], $this->followedStream($matches[1])->derivedOptions()['encryption_key_source'] ?? null);
+            assert_same($matches[2], $this->followedStream($matches[1])->derived_options['encryption_key_source'] ?? null);
             return;
         }
 
@@ -163,7 +163,7 @@ final class MetadataChangesFeatureTest extends TestCase
             assert_not_null($this->keyBase64);
             assert_same(
                 IggyClient::encryptionKeyFingerprint($this->keyBase64),
-                $this->followedStream($matches[1])->derivedOptions()['encryption_key_fingerprint'] ?? null,
+                $this->followedStream($matches[1])->derived_options['encryption_key_fingerprint'] ?? null,
             );
             return;
         }
@@ -171,12 +171,12 @@ final class MetadataChangesFeatureTest extends TestCase
         if ($step === 'the followed changes should expose no encryption key material') {
             assert_true($this->followed !== [], 'changes were followed');
             foreach ($this->followed as $record) {
-                $stream = $record->change();
+                $stream = $record->change;
                 if (!$stream instanceof MetadataStreamChange) {
                     continue;
                 }
-                $explicit = $stream->options();
-                $derived = $stream->derivedOptions();
+                $explicit = $stream->options;
+                $derived = $stream->derived_options;
                 assert_not_null($explicit);
                 assert_not_null($derived);
                 foreach (self::NEVER_RETURNED_KEYS as $secret) {
@@ -195,10 +195,10 @@ final class MetadataChangesFeatureTest extends TestCase
         if (preg_match('/^following the metadata changes should answer "([^"]+)"$/', $step, $matches) === 1) {
             assert_not_null($this->cursor);
             $page = $this->read(MetadataChangeStart::after($this->cursor));
-            assert_same(MetadataChangeStatus::from($matches[1]), $page->status());
-            if ($page->status() !== MetadataChangeStatus::Ok) {
-                assert_same([], $page->records());
-                assert_null($page->next());
+            assert_same(MetadataChangeStatus::from($matches[1]), $page->status);
+            if ($page->status !== MetadataChangeStatus::Ok) {
+                assert_same([], $page->records);
+                assert_null($page->next);
             }
             return;
         }
@@ -209,16 +209,16 @@ final class MetadataChangesFeatureTest extends TestCase
             $token = null;
             do {
                 $page = $this->read(MetadataChangeStart::current($token));
-                assert_same(MetadataChangeStatus::Ok, $page->status());
-                foreach ($page->items() as $item) {
-                    $body = $item->body();
+                assert_same(MetadataChangeStatus::Ok, $page->status);
+                foreach ($page->items as $item) {
+                    $body = $item->body;
                     if ($body instanceof MetadataStreamChange) {
-                        $this->currentStreams[$body->streamId()] = $body->name();
+                        $this->currentStreams[$body->stream_id] = $body->name;
                     }
                 }
-                $token = $page->currentPageToken();
+                $token = $page->current_page_token;
             } while ($token !== null);
-            $this->cursor = $page->next();
+            $this->cursor = $page->next;
             assert_not_null($this->cursor);
             ksort($this->currentStreams);
             return;
@@ -266,11 +266,11 @@ final class MetadataChangesFeatureTest extends TestCase
         $records = [];
         for ($attempt = 0; $attempt < self::FOLLOW_ATTEMPTS; $attempt++) {
             $page = $this->read(MetadataChangeStart::after($cursor));
-            assert_same(MetadataChangeStatus::Ok, $page->status());
-            $cursor = $page->next();
+            assert_same(MetadataChangeStatus::Ok, $page->status);
+            $cursor = $page->next;
             assert_not_null($cursor);
-            array_push($records, ...$page->records());
-            if ($page->hasMore()) {
+            array_push($records, ...$page->records);
+            if ($page->has_more) {
                 continue;
             }
             if (count($this->streamRecords($records)) >= $count) {
@@ -290,9 +290,9 @@ final class MetadataChangesFeatureTest extends TestCase
         return array_values(array_filter(
             $records,
             static function (MetadataChangeRecord $record) use ($streamId): bool {
-                $change = $record->change();
+                $change = $record->change;
 
-                return method_exists($change, 'streamId') && $change->streamId() === $streamId;
+                return property_exists($change, 'stream_id') && $change->stream_id === $streamId;
             },
         ));
     }
@@ -301,7 +301,7 @@ final class MetadataChangesFeatureTest extends TestCase
     {
         $wanted = MetadataChangeKind::from($kind);
         foreach ($this->followed as $record) {
-            if ($record->kind() === $wanted) {
+            if ($record->kind === $wanted) {
                 return $record;
             }
         }
@@ -311,9 +311,9 @@ final class MetadataChangesFeatureTest extends TestCase
 
     private function followedStream(string $kind): MetadataStreamChange
     {
-        $stream = $this->followedRecord($kind)->change();
+        $stream = $this->followedRecord($kind)->change;
         assert_instance_of(MetadataStreamChange::class, $stream);
-        assert_true(!$stream->optionsUnreadable(), 'stream options stay readable');
+        assert_true(!$stream->options_unreadable, 'stream options stay readable');
 
         return $stream;
     }

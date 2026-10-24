@@ -504,7 +504,9 @@ describe('given metadata change queries when encoding should apply the request r
       { since: -1n },
       { until: 1n << 64n },
       { start: MetadataChangeStart.Current(), groups: ['sessions'] },
-      { start: MetadataChangeStart.Current(streamsToken) }
+      { start: MetadataChangeStart.Current(streamsToken) },
+      { start: MetadataChangeStart.Current(null as unknown as MetadataCurrentPageToken) },
+      { start: MetadataChangeStart.Current(fixture.page_tokens[0].text as unknown as MetadataCurrentPageToken) }
     ];
     for (const query of refused)
       assert.throws(() => GET_METADATA_CHANGES.serialize(query), isInvalidCommand, JSON.stringify(query, (_, value) =>
@@ -597,7 +599,7 @@ describe('given malformed responses when decoding should refuse every one', () =
   it('keeps an unknown kind of a known group with its raw body', () => {
     const [record] = deserializeMetadataChanges(changesPage(recordEnvelope(1, 9, Buffer.from([0xde, 0xad])))).records;
     assert.equal(record.kind, 'unknown');
-    assert.equal(record.group, 'unknown');
+    assert.equal(record.group, 'streams');
     assert.equal(record.groupCode, 1);
     assert.equal(record.kindCode, 9);
     assert.deepEqual(record.body, Buffer.from([0xde, 0xad]));

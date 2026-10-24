@@ -926,7 +926,8 @@ partitions_max = 0
 # it, the oldest records go, and a reader whose position they held must
 # rebuild from current state. The log is part of the metadata snapshot, so a
 # larger value costs memory and checkpoint size. Node-local: replicas may keep
-# different depths. Must be between 1 and 1048576.
+# different depths. Must be between 1 and 1048576. Each of the two record
+# budgets also keeps at most 128 MiB of record bodies.
 change_log_resource_capacity = 65536
 
 # Records the metadata change log keeps for sessions and consumer group

@@ -392,7 +392,7 @@ impl Projection<'_> {
         let group = WireMetadataChangeGroup::from(group);
         let item = WireMetadataItem {
             group: group.as_u8(),
-            body: Bytes::from(item.body_bytes()),
+            body: item.body_bytes(),
         };
         let bytes = self.bytes + item.encoded_size();
         if self.items.len() == self.limit || (!self.items.is_empty() && bytes > MAX_PAGE_BYTES) {

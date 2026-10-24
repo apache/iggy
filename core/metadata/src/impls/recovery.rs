@@ -17,7 +17,7 @@
 
 use crate::change_log::{
     ChangeLogCapacities, ChangeLogError, MetadataChangeLog, change_actor, session_closed,
-    session_registered,
+    session_registered, session_revoked,
 };
 use crate::impls::metadata::IggySnapshot;
 use crate::stm::authz::{GatedApply, reject_stale_session};
@@ -789,18 +789,18 @@ where
         // primary/backup commit paths, so it goes through the same gate.
         let mut reply = reject_stale_session(header, &client_table)
             .map_or_else(|| mux_stm.gated_update(entry), Ok)?;
-        if let Some(user_id) = reply.revoked_user {
-            let client_ids: Vec<u128> = client_table
-                .end_user_sessions(user_id, header.op)
-                .into_iter()
-                .map(|identity| identity.client_id)
-                .collect();
-            let ended_memberships = mux_stm.end_memberships(
-                &client_ids,
-                header,
-                change_actor(&ApplyContext::from(header)),
-            );
-            reply.changes.extend(ended_memberships);
+        if let Some(user) = reply.revoked_user {
+            let mut sessions = client_table.end_user_sessions(user.user_id, header.op);
+            sessions.sort_by_key(|identity| identity.client_id);
+            let actor = change_actor(&ApplyContext::from(header));
+            let client_ids: Vec<u128> =
+                sessions.iter().map(|identity| identity.client_id).collect();
+            reply.changes.extend(sessions.iter().map(|identity| {
+                session_revoked(user, identity.client_id, identity.session, actor)
+            }));
+            reply
+                .changes
+                .extend(mux_stm.end_memberships(&client_ids, header, actor));
         }
         // Every client commit must restore its original receipt before admission.
         if header.client != consensus::client_table::RESERVED_CLIENT_ID
@@ -2842,6 +2842,7 @@ mod tests {
                 (9, WireMetadataChangeKind::ConsumerGroupMemberJoined.as_u8()),
                 (10, WireMetadataChangeKind::SessionClosed.as_u8()),
                 (10, WireMetadataChangeKind::ConsumerGroupMemberLeft.as_u8()),
+                (11, WireMetadataChangeKind::SessionClosed.as_u8()),
                 (11, WireMetadataChangeKind::ConsumerGroupMemberLeft.as_u8()),
             ],
             "the replayed history must hold every session and membership change"

@@ -368,6 +368,8 @@ The binary `GetMetadataChanges` command (17) serves it over TCP, QUIC and WebSoc
 
 A request starts at `earliest`, at `latest` (a cursor and no records), after a cursor, or at `current`, which pages the present state instead of history. It may name groups (`streams`, `topics`, `partitions`, `consumer_groups`, `consumer_group_members`, `users`, `personal_access_tokens`, `sessions`), a time range in microseconds and a limit from 1 to 1000. Cursors print as `mc1_` tokens and state page tokens as `cs1_` tokens. Send them back unchanged.
 
+A time range only goes with `earliest` or a cursor. A `current` request must also name the parent groups of every selected group, for example `streams` with `topics`. A request that breaks either rule is refused with `InvalidCommand` (3).
+
 A page also ends before its encoded records or items pass 1 MiB, so it can hold fewer than the limit with `has_more` set. A single larger record or item still comes alone.
 
 Each answer has a status. `ok` carries records and the `next` cursor. `behind` means this node has not applied the cursor's operation yet, so ask again or ask another node. `expired` means the node no longer holds every record after the cursor for those groups, and `reset` means the cursor belongs to another history, for example a rebuilt data directory. Neither carries a cursor: page `current` again and follow from the anchor its pages return.
@@ -375,6 +377,8 @@ Each answer has a status. `ok` carries records and the `next` cursor. `behind` m
 Records name streams and topics by id and creation op, because ids are reused after a delete. Each record carries the acting user, absent for server actions such as key rotation, partition handovers and expiry. Stream options appear only as the read routes return them: key source and fingerprints, never a stream key or its wraps.
 
 Two rings bound the log. `[metadata] change_log_resource_capacity` (default 65536) holds records of streams, topics, partitions, groups, users and tokens, and `change_log_activity_capacity` (default 16384) holds sessions and group membership, so busy sessions never evict resource history. Both accept 1 to 1048576 records. The log rides the metadata snapshot, survives restarts and moves with state transfer.
+
+Each ring also keeps at most 128 MiB of record bodies and evicts its oldest records past that, so large permission sets cannot grow the snapshot past what state transfer carries.
 
 ## Upgrade recovery
 

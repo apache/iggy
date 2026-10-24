@@ -88,20 +88,20 @@ final class TlsTest extends TestCase
         $client->connect();
         $groups = [MetadataChangeGroup::Streams];
         $latest = $client->getMetadataChanges(MetadataChangeStart::latest(), $groups);
-        assert_same(MetadataChangeStatus::Ok, $latest->status());
+        assert_same(MetadataChangeStatus::Ok, $latest->status);
         $streamName = unique_name('tls-changes-stream');
 
         try {
             $client->createStream($streamName);
-            $page = $client->getMetadataChanges(MetadataChangeStart::after($latest->next()), $groups);
-            assert_same(MetadataChangeStatus::Ok, $page->status());
+            $page = $client->getMetadataChanges(MetadataChangeStart::after($latest->next), $groups);
+            assert_same(MetadataChangeStatus::Ok, $page->status);
             $created = array_values(array_filter(
-                $page->records(),
-                static fn ($record): bool => $record->change() instanceof MetadataStreamChange
-                    && $record->change()->name() === $streamName,
+                $page->records,
+                static fn ($record): bool => $record->change instanceof MetadataStreamChange
+                    && $record->change->name === $streamName,
             ));
             assert_count(1, $created);
-            assert_same(MetadataChangeKind::StreamCreated, $created[0]->kind());
+            assert_same(MetadataChangeKind::StreamCreated, $created[0]->kind);
         } finally {
             cleanup_stream($client, $streamName);
         }

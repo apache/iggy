@@ -509,6 +509,8 @@ impl TryFrom<GetMetadataChangesRequest> for MetadataChangesQuery {
     type Error = IggyError;
 
     fn try_from(request: GetMetadataChangesRequest) -> Result<Self, Self::Error> {
+        let timestamp =
+            |micros| IggyTimestamp::checked_from_micros(micros).ok_or(IggyError::InvalidCommand);
         let start = match request.start {
             WireMetadataChangeStart::Earliest => MetadataChangeStart::Earliest,
             WireMetadataChangeStart::Latest => MetadataChangeStart::Latest,
@@ -529,8 +531,8 @@ impl TryFrom<GetMetadataChangesRequest> for MetadataChangesQuery {
         Ok(Self {
             start,
             groups,
-            since: request.since.map(IggyTimestamp::from),
-            until: request.until.map(IggyTimestamp::from),
+            since: request.since.map(timestamp).transpose()?,
+            until: request.until.map(timestamp).transpose()?,
             limit: request.limit,
         })
     }
@@ -582,7 +584,7 @@ mod tests {
             actor_user_id: Some(4),
             group: change.group().as_u8(),
             kind: change.kind().as_u8(),
-            body: change.body_bytes().into(),
+            body: change.body_bytes(),
         }
     }
 

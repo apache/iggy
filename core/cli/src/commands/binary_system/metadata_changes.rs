@@ -19,9 +19,10 @@ use crate::commands::cli_command::CliCommand;
 use anyhow::{Context, bail};
 use async_trait::async_trait;
 use iggy_common::{
-    Client, IggyDuration, MetadataChangeStart, MetadataChangeStatus, MetadataChanges,
-    MetadataChangesQuery,
+    Client, IggyDuration, IggyError, MetadataChangeGroup, MetadataChangeStart,
+    MetadataChangeStatus, MetadataChanges, MetadataChangesQuery,
 };
+use std::future::Future;
 use std::io::{Write, stdout};
 
 /// Reads metadata change pages and prints each as one JSON line.
@@ -37,6 +38,60 @@ impl GetMetadataChangesCmd {
             query,
             follow,
             interval,
+        }
+    }
+
+    /// Reads pages from `read` and writes each to `output` until the query ends.
+    async fn read_pages<R, F>(
+        &self,
+        mut read: R,
+        output: &mut (impl Write + Send),
+    ) -> anyhow::Result<()>
+    where
+        R: FnMut(MetadataChangesQuery) -> F + Send,
+        F: Future<Output = Result<MetadataChanges, IggyError>> + Send,
+    {
+        let mut query = self.first_query();
+        loop {
+            let page = match read(query.clone()).await {
+                Ok(page) => page,
+                Err(IggyError::TransientNotAccepted) if self.follow => {
+                    tokio::time::sleep(self.interval.get_duration()).await;
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| "Problem reading metadata changes".to_owned());
+                }
+            };
+            let quiet_follow_page = self.follow
+                && page.status == MetadataChangeStatus::Ok
+                && page.records.is_empty()
+                && page.items.is_empty();
+            if !quiet_follow_page {
+                writeln!(output, "{}", serde_json::to_string(&page)?)
+                    .and_then(|()| output.flush())
+                    .with_context(|| "Problem writing metadata changes page".to_owned())?;
+            }
+            query = match self.step(query, page)? {
+                Step::Read(next) => next,
+                Step::Wait(next) => {
+                    tokio::time::sleep(self.interval.get_duration()).await;
+                    next
+                }
+                Step::Stop => return Ok(()),
+            };
+        }
+    }
+
+    /// The query that starts the read, with the parent groups a current scan needs.
+    fn first_query(&self) -> MetadataChangesQuery {
+        match self.query.start {
+            MetadataChangeStart::Current(_) => MetadataChangesQuery {
+                groups: self.scan_groups(),
+                ..self.query.clone()
+            },
+            _ => self.query.clone(),
         }
     }
 
@@ -83,15 +138,20 @@ impl GetMetadataChangesCmd {
 
     /// The rebuild scan, with the parent groups and no time bounds the server requires.
     fn current_state_query(&self) -> MetadataChangesQuery {
-        let mut groups = self.query.groups.clone();
-        groups.extend(self.query.groups.iter().flat_map(|group| group.parents()));
         MetadataChangesQuery {
             start: MetadataChangeStart::Current(None),
-            groups,
+            groups: self.scan_groups(),
             since: None,
             until: None,
             limit: self.query.limit,
         }
+    }
+
+    /// The requested groups and their parents.
+    fn scan_groups(&self) -> Vec<MetadataChangeGroup> {
+        let mut groups = self.query.groups.clone();
+        groups.extend(self.query.groups.iter().flat_map(|group| group.parents()));
+        groups
     }
 }
 
@@ -106,32 +166,11 @@ impl CliCommand for GetMetadataChangesCmd {
     }
 
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
-        let mut query = self.query.clone();
-        loop {
-            let page = client
-                .get_metadata_changes(&query)
-                .await
-                .with_context(|| "Problem reading metadata changes".to_owned())?;
-            let quiet_follow_page = self.follow
-                && page.status == MetadataChangeStatus::Ok
-                && page.records.is_empty()
-                && page.items.is_empty();
-            if !quiet_follow_page {
-                let line = serde_json::to_string(&page)?;
-                let mut output = stdout().lock();
-                writeln!(output, "{line}")
-                    .and_then(|()| output.flush())
-                    .with_context(|| "Problem writing metadata changes page".to_owned())?;
-            }
-            query = match self.step(query, page)? {
-                Step::Read(next) => next,
-                Step::Wait(next) => {
-                    tokio::time::sleep(self.interval.get_duration()).await;
-                    next
-                }
-                Step::Stop => return Ok(()),
-            };
-        }
+        self.read_pages(
+            |query| async move { client.get_metadata_changes(&query).await },
+            &mut stdout(),
+        )
+        .await
     }
 }
 
@@ -149,6 +188,64 @@ mod tests {
         IggyTimestamp, MetadataChangeCursor, MetadataChangeGroup, MetadataChangeGroups,
         MetadataChangePhase,
     };
+    use std::collections::VecDeque;
+    use std::future::ready;
+
+    #[test]
+    fn given_current_start_for_topics_when_building_first_query_should_add_their_parent_groups() {
+        let command = GetMetadataChangesCmd::new(
+            MetadataChangesQuery {
+                start: MetadataChangeStart::Current(None),
+                groups: vec![MetadataChangeGroup::Topics],
+                ..MetadataChangesQuery::default()
+            },
+            false,
+            IggyDuration::ONE_SECOND,
+        );
+
+        assert_eq!(
+            command.first_query().validate(),
+            Ok(MetadataChangeGroups::requested(&[
+                MetadataChangeGroup::Streams,
+                MetadataChangeGroup::Topics
+            ]))
+        );
+    }
+
+    #[tokio::test]
+    async fn given_transient_refusal_when_following_should_retry_the_same_query() {
+        let command = GetMetadataChangesCmd::new(
+            MetadataChangesQuery::default(),
+            true,
+            IggyDuration::from(1),
+        );
+        let mut answers = VecDeque::from([
+            Err(IggyError::TransientNotAccepted),
+            Ok(page(MetadataChangeStatus::Behind, None)),
+            Err(IggyError::Unauthenticated),
+        ]);
+        let mut queries = Vec::new();
+        let mut output = Vec::new();
+
+        let result = command
+            .read_pages(
+                |query| {
+                    queries.push(query);
+                    ready(answers.pop_front().expect("scripted answer"))
+                },
+                &mut output,
+            )
+            .await;
+
+        assert!(result.is_err(), "the scripted refusal ends the read");
+        assert_eq!(queries.len(), 3);
+        assert!(
+            queries
+                .iter()
+                .all(|query| *query == MetadataChangesQuery::default())
+        );
+        assert_eq!(String::from_utf8(output).expect("utf-8").lines().count(), 1);
+    }
 
     #[test]
     fn given_expired_cursor_when_following_topics_should_rebuild_with_their_parent_groups() {

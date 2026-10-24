@@ -223,7 +223,7 @@ mod tests {
                 actor_user_id: Some(0),
                 group: 1,
                 kind: 1,
-                body: Bytes::from(body),
+                body,
             }],
             items: Vec::new(),
             current_page_token: None,

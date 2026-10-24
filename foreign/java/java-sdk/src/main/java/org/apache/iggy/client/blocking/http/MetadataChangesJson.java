@@ -42,7 +42,6 @@ import tools.jackson.databind.ObjectMapper;
 import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.function.Function;
@@ -55,7 +54,6 @@ import java.util.regex.Pattern;
  */
 final class MetadataChangesJson {
 
-    private static final BigInteger U64_LIMIT = BigInteger.ONE.shiftLeft(Long.SIZE);
     private static final Pattern HEX_U128 = Pattern.compile("[0-9a-f]{32}");
     private static final TypeReference<Map<String, HttpOptionValue>> OPTIONS = new TypeReference<>() {};
     private static final ObjectMapper OBJECT_MAPPER = ObjectMapperFactory.getInstance();
@@ -298,7 +296,7 @@ final class MetadataChangesJson {
                 u32(body, "member_id"),
                 hexU128(body, "client_id"),
                 u32(body, "members_count"),
-                reason(body, MetadataChangeBody.MemberLeftReason.values()));
+                reason(body, MetadataChangeBody.MemberLeftReason::fromValue));
     }
 
     private static MetadataChangeBody handedOver(JsonNode body) {
@@ -355,7 +353,7 @@ final class MetadataChangesJson {
                 u64(body, "user_created_at"),
                 text(body, "username"),
                 permissions(body),
-                reason(body, MetadataChangeBody.PermissionsUpdatedReason.values()));
+                reason(body, MetadataChangeBody.PermissionsUpdatedReason::fromValue));
     }
 
     private static MetadataChangeBody token(JsonNode body) {
@@ -368,7 +366,7 @@ final class MetadataChangesJson {
                 u32(body, "user_id"),
                 u64(body, "user_created_at"),
                 text(body, "name"),
-                reason(body, MetadataChangeBody.TokenDeletedReason.values()));
+                reason(body, MetadataChangeBody.TokenDeletedReason::fromValue));
     }
 
     private static MetadataChangeBody session(JsonNode body) {
@@ -382,7 +380,7 @@ final class MetadataChangesJson {
                 u64(body, "user_created_at"),
                 hexU128(body, "client_id"),
                 u64(body, "session"),
-                reason(body, MetadataChangeBody.SessionClosedReason.values()));
+                reason(body, MetadataChangeBody.SessionClosedReason::fromValue));
     }
 
     /**
@@ -418,14 +416,9 @@ final class MetadataChangesJson {
         }
     }
 
-    private static <T extends Enum<T>> T reason(JsonNode body, T[] values) {
+    private static <T> T reason(JsonNode body, Function<String, Optional<T>> fromValue) {
         String name = text(body, "reason");
-        for (T value : values) {
-            if (value.name().toLowerCase(Locale.ROOT).equals(name)) {
-                return value;
-            }
-        }
-        throw malformed("reason " + name + " is unknown");
+        return fromValue.apply(name).orElseThrow(() -> malformed("reason " + name + " is unknown"));
     }
 
     private static <T> List<T> list(JsonNode body, String field, Function<JsonNode, T> reader) {
@@ -465,7 +458,7 @@ final class MetadataChangesJson {
             throw malformed(field + " is not an integer");
         }
         BigInteger number = value.bigIntegerValue();
-        if (number.signum() < 0 || number.compareTo(U64_LIMIT) >= 0 || number.bitLength() > bits) {
+        if (number.signum() < 0 || number.bitLength() > bits) {
             throw malformed(field + " is outside an unsigned " + bits + "-bit value");
         }
         return number;

@@ -96,27 +96,27 @@ final class MetadataChangesTest extends TestCase
 
         $followed = self::follow($client, $cursor, [MetadataChangeGroup::Streams], $streamId, 3);
         foreach ($followed as $record) {
-            assert_same(MetadataChangeGroup::Streams, $record->group());
+            assert_same(MetadataChangeGroup::Streams, $record->group);
         }
         $records = self::streamRecords($followed, $streamId);
         assert_same(
             [MetadataChangeKind::StreamCreated, MetadataChangeKind::StreamUpdated, MetadataChangeKind::StreamDeleted],
-            array_map(static fn (MetadataChangeRecord $record): ?MetadataChangeKind => $record->kind(), $records),
+            array_map(static fn (MetadataChangeRecord $record): ?MetadataChangeKind => $record->kind, $records),
         );
-        [$created, $updated, $deleted] = array_map(static fn (MetadataChangeRecord $record): object => $record->change(), $records);
+        [$created, $updated, $deleted] = array_map(static fn (MetadataChangeRecord $record): object => $record->change, $records);
         assert_instance_of(MetadataStreamChange::class, $created);
         assert_instance_of(MetadataStreamChange::class, $updated);
         assert_instance_of(MetadataStreamDeleted::class, $deleted);
-        assert_same([$name, $renamed, $renamed], [$created->name(), $updated->name(), $deleted->name()]);
-        assert_same($records[0]->op(), $created->streamCreatedOp());
-        assert_same($created->streamCreatedOp(), $updated->streamCreatedOp());
-        assert_same($created->streamCreatedOp(), $deleted->streamCreatedOp());
-        assert_true(!$created->optionsUnreadable(), 'a new stream has readable options');
+        assert_same([$name, $renamed, $renamed], [$created->name, $updated->name, $deleted->name]);
+        assert_same($records[0]->op, $created->stream_created_op);
+        assert_same($created->stream_created_op, $updated->stream_created_op);
+        assert_same($created->stream_created_op, $deleted->stream_created_op);
+        assert_true(!$created->options_unreadable, 'a new stream has readable options');
         $positions = [];
         foreach ($records as $record) {
-            assert_same(self::ROOT_USER_ID, $record->actorUserId());
-            self::assertMatchesRegularExpression('/^[1-9][0-9]*$/', $record->checksum());
-            $positions[] = [$record->op(), $record->ordinal()];
+            assert_same(self::ROOT_USER_ID, $record->actor_user_id);
+            self::assertMatchesRegularExpression('/^[1-9][0-9]*$/', $record->checksum);
+            $positions[] = [$record->op, $record->ordinal];
         }
         $sorted = $positions;
         sort($sorted);
@@ -136,15 +136,15 @@ final class MetadataChangesTest extends TestCase
 
         $followed = self::follow($client, $cursor, [MetadataChangeGroup::Topics], $streamId, 1);
         foreach ($followed as $record) {
-            assert_same(MetadataChangeGroup::Topics, $record->group());
+            assert_same(MetadataChangeGroup::Topics, $record->group);
         }
         $records = self::streamRecords($followed, $streamId);
         assert_count(1, $records);
-        assert_same(MetadataChangeKind::TopicCreated, $records[0]->kind());
-        $topic = $records[0]->change();
+        assert_same(MetadataChangeKind::TopicCreated, $records[0]->kind);
+        $topic = $records[0]->change;
         assert_instance_of(MetadataTopicChange::class, $topic);
-        assert_same([$topicName, 2], [$topic->name(), $topic->partitionsCount()]);
-        assert_same($records[0]->op(), $topic->topicCreatedOp());
+        assert_same([$topicName, 2], [$topic->name, $topic->partitions_count]);
+        assert_same($records[0]->op, $topic->topic_created_op);
     }
 
     #[DataProvider('transports')]
@@ -161,29 +161,29 @@ final class MetadataChangesTest extends TestCase
         $records = [];
         do {
             $page = $client->getMetadataChanges(MetadataChangeStart::after($cursor), [MetadataChangeGroup::Streams], limit: 1);
-            assert_same(MetadataChangeStatus::Ok, $page->status());
-            assert_same(MetadataChangePhase::Changes, $page->phase());
-            self::assertLessThanOrEqual(1, count($page->records()));
-            $next = $page->next();
+            assert_same(MetadataChangeStatus::Ok, $page->status);
+            assert_same(MetadataChangePhase::Changes, $page->phase);
+            self::assertLessThanOrEqual(1, count($page->records));
+            $next = $page->next;
             assert_not_null($next);
             assert_true(
-                [$next->op(), $next->ordinal()] > [$cursor->op(), $cursor->ordinal()],
+                [$next->op, $next->ordinal] > [$cursor->op, $cursor->ordinal],
                 'every page advances the cursor',
             );
             $cursor = $next;
-            array_push($records, ...$page->records());
-        } while ($page->hasMore());
+            array_push($records, ...$page->records);
+        } while ($page->has_more);
 
         $streamIds = [];
         foreach ($records as $record) {
-            $change = $record->change();
-            if ($record->kind() === MetadataChangeKind::StreamCreated && $change instanceof MetadataStreamChange) {
-                $streamIds[] = $change->streamId();
+            $change = $record->change;
+            if ($record->kind === MetadataChangeKind::StreamCreated && $change instanceof MetadataStreamChange) {
+                $streamIds[] = $change->stream_id;
             }
         }
         assert_same($created, $streamIds);
         $last = $records[array_key_last($records)];
-        assert_same([$last->op(), $last->ordinal()], [$cursor->op(), $cursor->ordinal()]);
+        assert_same([$last->op, $last->ordinal], [$cursor->op, $cursor->ordinal]);
     }
 
     #[DataProvider('transports')]
@@ -196,7 +196,7 @@ final class MetadataChangesTest extends TestCase
         $timestamp = self::streamRecords(
             self::follow($client, $cursor, [MetadataChangeGroup::Streams], $streamId, 1),
             $streamId,
-        )[0]->timestamp();
+        )[0]->timestamp;
 
         $page = $client->getMetadataChanges(
             MetadataChangeStart::earliest(),
@@ -206,12 +206,12 @@ final class MetadataChangesTest extends TestCase
             limit: self::PAGE_LIMIT,
         );
 
-        assert_same(MetadataChangeStatus::Ok, $page->status());
-        assert_true($page->records() !== [], 'the range holds the stream record');
-        foreach ($page->records() as $record) {
-            assert_same($timestamp, $record->timestamp());
+        assert_same(MetadataChangeStatus::Ok, $page->status);
+        assert_true($page->records !== [], 'the range holds the stream record');
+        foreach ($page->records as $record) {
+            assert_same($timestamp, $record->timestamp);
         }
-        assert_count(1, self::streamRecords($page->records(), $streamId));
+        assert_count(1, self::streamRecords($page->records, $streamId));
     }
 
     #[DataProvider('transports')]
@@ -220,9 +220,9 @@ final class MetadataChangesTest extends TestCase
     {
         $client = new_transport_client($transport);
         $latest = $client->getMetadataChanges(MetadataChangeStart::latest());
-        $logId = $latest->logId();
+        $logId = $latest->log_id;
         assert_not_null($logId);
-        $headOp = $latest->headOp();
+        $headOp = $latest->head_op;
         assert_true(is_int($headOp), 'a live head fits an int');
         $foreign = new MetadataChangeCursor($logId === '1' ? '2' : '1', 1, '1', 0);
         $ahead = new MetadataChangeCursor($logId, $headOp + 1_000_000, '1', 0);
@@ -230,12 +230,12 @@ final class MetadataChangesTest extends TestCase
         $reset = $client->getMetadataChanges(MetadataChangeStart::after($foreign));
         $behind = $client->getMetadataChanges(MetadataChangeStart::after($ahead));
 
-        assert_same(MetadataChangeStatus::Reset, $reset->status());
-        assert_null($reset->next());
-        assert_same([], $reset->records());
-        assert_same(MetadataChangeStatus::Behind, $behind->status());
-        assert_same((string) $ahead, (string) $behind->next());
-        assert_same([], $behind->records());
+        assert_same(MetadataChangeStatus::Reset, $reset->status);
+        assert_null($reset->next);
+        assert_same([], $reset->records);
+        assert_same(MetadataChangeStatus::Behind, $behind->status);
+        assert_same((string) $ahead, (string) $behind->next);
+        assert_same([], $behind->records);
     }
 
     #[DataProvider('transports')]
@@ -253,34 +253,34 @@ final class MetadataChangesTest extends TestCase
         while (true) {
             $page = $client->getMetadataChanges(MetadataChangeStart::current($token), [MetadataChangeGroup::Streams], limit: 2);
             $pages++;
-            assert_same(MetadataChangeStatus::Ok, $page->status());
-            assert_same(MetadataChangePhase::Current, $page->phase());
-            assert_same([], $page->records());
-            self::assertLessThanOrEqual(2, count($page->items()));
-            array_push($items, ...$page->items());
-            $token = $page->currentPageToken();
+            assert_same(MetadataChangeStatus::Ok, $page->status);
+            assert_same(MetadataChangePhase::Current, $page->phase);
+            assert_same([], $page->records);
+            self::assertLessThanOrEqual(2, count($page->items));
+            array_push($items, ...$page->items);
+            $token = $page->current_page_token;
             if ($token === null) {
-                $anchor = $page->next();
+                $anchor = $page->next;
                 break;
             }
-            assert_true($page->hasMore(), 'a page with a token has more');
-            assert_same([MetadataChangeGroup::Streams], $token->groups());
+            assert_true($page->has_more, 'a page with a token has more');
+            assert_same([MetadataChangeGroup::Streams], $token->groups);
             assert_same((string) $token, (string) MetadataCurrentPageToken::parse((string) $token));
         }
 
         $projected = [];
         foreach ($items as $item) {
-            assert_same(MetadataChangeGroup::Streams, $item->group());
-            $body = $item->body();
+            assert_same(MetadataChangeGroup::Streams, $item->group);
+            $body = $item->body;
             assert_instance_of(MetadataStreamChange::class, $body);
-            $projected[$body->streamId()] = $body->name();
+            $projected[$body->stream_id] = $body->name;
         }
         ksort($projected);
         assert_same(stream_list(new_client()), $projected);
         self::assertGreaterThanOrEqual(2, $pages);
         assert_not_null($anchor);
         $following = $client->getMetadataChanges(MetadataChangeStart::after($anchor), [MetadataChangeGroup::Streams]);
-        assert_same(MetadataChangeStatus::Ok, $following->status());
+        assert_same(MetadataChangeStatus::Ok, $following->status);
     }
 
     #[DataProvider('transports')]
@@ -325,11 +325,11 @@ final class MetadataChangesTest extends TestCase
 
         $records = self::streamRecords(self::follow($client, $cursor, [MetadataChangeGroup::Streams], $streamId, 1), $streamId);
         assert_count(1, $records);
-        assert_same(MetadataChangeKind::StreamCreated, $records[0]->kind());
-        $stream = $records[0]->change();
+        assert_same(MetadataChangeKind::StreamCreated, $records[0]->kind);
+        $stream = $records[0]->change;
         assert_instance_of(MetadataStreamChange::class, $stream);
-        $explicit = $stream->options();
-        $derived = $stream->derivedOptions();
+        $explicit = $stream->options;
+        $derived = $stream->derived_options;
         assert_not_null($explicit);
         assert_not_null($derived);
         assert_same('stream', $derived['encryption_key_source']);
@@ -370,8 +370,8 @@ final class MetadataChangesTest extends TestCase
                 MetadataChanges::fromJson(self::pageJson([$objects->records[$index]->expected], [])),
             ];
             foreach ($pages as $page) {
-                assert_count(1, $page->records(), $vector['case']);
-                self::assertRecord($page->records()[0], $vector['expected'], $vector['case']);
+                assert_count(1, $page->records, $vector['case']);
+                self::assertRecord($page->records[0], $vector['expected'], $vector['case']);
             }
         }
         foreach ($fixture['items'] as $index => $vector) {
@@ -380,8 +380,8 @@ final class MetadataChangesTest extends TestCase
                 MetadataChanges::fromJson(self::pageJson([], [$objects->items[$index]->expected])),
             ];
             foreach ($pages as $page) {
-                assert_count(1, $page->items(), $vector['case']);
-                self::assertItem($page->items()[0], $vector['expected'], $vector['case']);
+                assert_count(1, $page->items, $vector['case']);
+                self::assertItem($page->items[0], $vector['expected'], $vector['case']);
             }
         }
     }
@@ -390,16 +390,16 @@ final class MetadataChangesTest extends TestCase
     public function testGivenLargeValuesWhenDecodingShouldKeepEveryBit(): void
     {
         $vector = self::fixture()['large_values'];
-        $record = MetadataChanges::decode(self::pagePayload(hex2bin($vector['record_hex']), ''))->records()[0];
-        $change = $record->change();
+        $record = MetadataChanges::decode(self::pagePayload(hex2bin($vector['record_hex']), ''))->records[0];
+        $change = $record->change;
 
-        assert_same((int) $vector['op'], $record->op());
-        assert_same($vector['timestamp'], $record->timestamp());
-        assert_same($vector['ordinal'], $record->ordinal());
-        assert_same(self::hexToDecimal($vector['checksum']), $record->checksum());
-        assert_same((int) $vector['user_created_at'], $change->userCreatedAt());
-        assert_same((int) $vector['session'], $change->session());
-        assert_same(self::hexToDecimal($vector['client_id']), $change->clientId());
+        assert_same((int) $vector['op'], $record->op);
+        assert_same($vector['timestamp'], $record->timestamp);
+        assert_same($vector['ordinal'], $record->ordinal);
+        assert_same(self::hexToDecimal($vector['checksum']), $record->checksum);
+        assert_same((int) $vector['user_created_at'], $change->user_created_at);
+        assert_same((int) $vector['session'], $change->session);
+        assert_same(self::hexToDecimal($vector['client_id']), $change->client_id);
     }
 
     #[TestDox('Cursor vectors round trip their text and every field')]
@@ -414,7 +414,7 @@ final class MetadataChangesTest extends TestCase
                 self::hexToDecimal($vector['checksum']),
                 $vector['ordinal'],
             ];
-            assert_same($fields, [$cursor->logId(), $cursor->op(), $cursor->checksum(), $cursor->ordinal()], $vector['case']);
+            assert_same($fields, [$cursor->log_id, $cursor->op, $cursor->checksum, $cursor->ordinal], $vector['case']);
             assert_same($vector['text'], (string) $cursor);
             assert_same($constants['cursor_text_length'], strlen((string) $cursor));
             assert_same($vector['text'], (string) new MetadataChangeCursor(...$fields));
@@ -429,20 +429,50 @@ final class MetadataChangesTest extends TestCase
         foreach (self::fixture()['page_tokens'] as $vector) {
             $token = MetadataCurrentPageToken::parse($vector['text']);
             assert_same($vector['text'], (string) $token);
-            assert_same($vector['anchor'], (string) $token->anchor());
-            assert_same($vector['required_head'], $token->requiredHead());
-            assert_same($vector['group'], $token->lastGroup()->value);
-            assert_same($vector['last_key_hex'], bin2hex($token->lastKey()));
+            assert_same($vector['anchor'], (string) $token->anchor);
+            assert_same($vector['required_head'], $token->required_head);
+            assert_same($vector['group'], $token->last_group->value);
+            assert_same($vector['last_key_hex'], bin2hex($token->last_key));
             $masked = array_keys(array_filter(
                 $codes,
                 static fn (int $code): bool => ($vector['groups_mask'] & (1 << ($code - 1))) !== 0,
             ));
             assert_same(
                 $masked,
-                array_map(static fn (MetadataChangeGroup $group): string => $group->value, $token->groups()),
+                array_map(static fn (MetadataChangeGroup $group): string => $group->value, $token->groups),
                 $vector['case'],
             );
         }
+    }
+
+    #[TestDox('Equal values compare equal with == and different cursors, tokens, pages, records, items and bodies do not')]
+    public function testGivenDecodedValuesWhenComparingWithEqualsShouldCompareContents(): void
+    {
+        $fixture = self::fixture();
+        $unknown = hex2bin($fixture['responses'][1]['response_hex']);
+        $builders = [
+            'cursor' => static fn (int $index): object => MetadataChangeCursor::parse($fixture['cursors'][$index]['text']),
+            'page token' => static fn (int $index): object => MetadataCurrentPageToken::parse($fixture['page_tokens'][$index]['text']),
+            'page' => static fn (int $index): object => MetadataChanges::decode(hex2bin($fixture['responses'][$index]['response_hex'])),
+            'record' => static fn (int $index): object => MetadataChanges::decode(
+                self::pagePayload(hex2bin($fixture['records'][$index]['record_hex']), ''),
+            )->records[0],
+            'stream body' => static fn (int $index): object => MetadataChanges::decode(
+                self::pagePayload(hex2bin($fixture['records'][$index]['record_hex']), ''),
+            )->records[0]->change,
+            'item' => static fn (int $index): object => MetadataChanges::decode(
+                self::pagePayload('', hex2bin($fixture['items'][$index]['item_hex'])),
+            )->items[0],
+            'unknown body' => static fn (int $index): object => MetadataChanges::decode($unknown)->records[$index]->change,
+        ];
+        $equalButDifferent = [];
+        foreach ($builders as $label => $build) {
+            assert_true($build(0) == $build(0), "{$label} equals its copy");
+            if ($build(0) == $build(1)) {
+                $equalButDifferent[] = $label;
+            }
+        }
+        assert_same([], $equalButDifferent, 'different values compare equal');
     }
 
     #[TestDox('Refused cursor and page token texts throw invalid command')]
@@ -531,8 +561,8 @@ final class MetadataChangesTest extends TestCase
     private static function latestCursor(IggyClient $client, array $groups): MetadataChangeCursor
     {
         $page = $client->getMetadataChanges(MetadataChangeStart::latest(), $groups);
-        assert_same(MetadataChangeStatus::Ok, $page->status());
-        $cursor = $page->next();
+        assert_same(MetadataChangeStatus::Ok, $page->status);
+        $cursor = $page->next;
         assert_not_null($cursor);
 
         return $cursor;
@@ -549,11 +579,11 @@ final class MetadataChangesTest extends TestCase
         $records = [];
         for ($attempt = 0; $attempt < self::FOLLOW_ATTEMPTS; $attempt++) {
             $page = $client->getMetadataChanges(MetadataChangeStart::after($cursor), $groups, limit: self::PAGE_LIMIT);
-            assert_same(MetadataChangeStatus::Ok, $page->status());
-            $cursor = $page->next();
+            assert_same(MetadataChangeStatus::Ok, $page->status);
+            $cursor = $page->next;
             assert_not_null($cursor);
-            array_push($records, ...$page->records());
-            if ($page->hasMore()) {
+            array_push($records, ...$page->records);
+            if ($page->has_more) {
                 continue;
             }
             if (count(self::streamRecords($records, $streamId)) >= $count) {
@@ -571,9 +601,9 @@ final class MetadataChangesTest extends TestCase
         return array_values(array_filter(
             $records,
             static function (MetadataChangeRecord $record) use ($streamId): bool {
-                $change = $record->change();
+                $change = $record->change;
 
-                return method_exists($change, 'streamId') && $change->streamId() === $streamId;
+                return property_exists($change, 'stream_id') && $change->stream_id === $streamId;
             },
         ));
     }
@@ -626,60 +656,60 @@ final class MetadataChangesTest extends TestCase
 
     private static function assertPage(MetadataChanges $page, array $expected, string $case): void
     {
-        assert_same($expected['status'], $page->status()->value, $case);
-        assert_same($expected['phase'], $page->phase()->value, $case);
+        assert_same($expected['status'], $page->status->value, $case);
+        assert_same($expected['phase'], $page->phase->value, $case);
         assert_same(
             $expected['log_id'] === null ? null : self::hexToDecimal($expected['log_id']),
-            $page->logId(),
+            $page->log_id,
             $case,
         );
         assert_same(
             [$expected['oldest_op'], $expected['retained_since'], $expected['head_op']],
-            [$page->oldestOp(), $page->retainedSince(), $page->headOp()],
+            [$page->oldest_op, $page->retained_since, $page->head_op],
             $case,
         );
-        assert_same($expected['next'], $page->next() === null ? null : (string) $page->next(), $case);
-        assert_same($expected['has_more'], $page->hasMore(), $case);
-        assert_count(count($expected['records']), $page->records(), $case);
-        foreach ($page->records() as $index => $record) {
+        assert_same($expected['next'], $page->next === null ? null : (string) $page->next, $case);
+        assert_same($expected['has_more'], $page->has_more, $case);
+        assert_count(count($expected['records']), $page->records, $case);
+        foreach ($page->records as $index => $record) {
             self::assertRecord($record, $expected['records'][$index], $case);
         }
-        assert_count(count($expected['items']), $page->items(), $case);
-        foreach ($page->items() as $index => $item) {
+        assert_count(count($expected['items']), $page->items, $case);
+        foreach ($page->items as $index => $item) {
             self::assertItem($item, $expected['items'][$index], $case);
         }
-        $token = $page->currentPageToken();
+        $token = $page->current_page_token;
         assert_same($expected['current_page_token'], $token === null ? null : (string) $token, $case);
     }
 
     private static function assertRecord(MetadataChangeRecord $record, array $expected, string $case): void
     {
-        assert_same(self::unsigned($expected['op']), $record->op(), $case);
-        assert_same($expected['ordinal'], $record->ordinal(), $case);
-        assert_same(self::hexToDecimal($expected['checksum']), $record->checksum(), $case);
-        assert_same(self::unsigned($expected['timestamp']), $record->timestamp(), $case);
-        assert_same($expected['actor_user_id'] ?? null, $record->actorUserId(), $case);
-        $change = $record->change();
-        if ($record->kind() === null) {
-            assert_null($record->group(), $case);
+        assert_same(self::unsigned($expected['op']), $record->op, $case);
+        assert_same($expected['ordinal'], $record->ordinal, $case);
+        assert_same(self::hexToDecimal($expected['checksum']), $record->checksum, $case);
+        assert_same(self::unsigned($expected['timestamp']), $record->timestamp, $case);
+        assert_same($expected['actor_user_id'] ?? null, $record->actor_user_id, $case);
+        $change = $record->change;
+        if ($record->kind === null) {
+            assert_null($record->group, $case);
             self::assertUnknown($change, $expected, $case);
 
             return;
         }
-        assert_same($expected['group'], $record->group()?->value, $case);
-        assert_same($expected['kind'], $record->kind()->value, $case);
+        assert_same($expected['group'], $record->group?->value, $case);
+        assert_same($expected['kind'], $record->kind->value, $case);
         self::assertBody($change, $expected, self::ENVELOPE_KEYS, $case);
     }
 
     private static function assertItem(MetadataCurrentItem $item, array $expected, string $case): void
     {
-        $body = $item->body();
-        if ($item->group() === null) {
+        $body = $item->body;
+        if ($item->group === null) {
             self::assertUnknown($body, $expected, $case);
 
             return;
         }
-        assert_same($expected['group'], $item->group()->value, $case);
+        assert_same($expected['group'], $item->group->value, $case);
         self::assertBody($body, $expected, ['group'], $case);
     }
 
@@ -690,14 +720,14 @@ final class MetadataChangesTest extends TestCase
             $unknown instanceof MetadataUnknownChange || $unknown instanceof MetadataUnknownItem,
             $case,
         );
-        assert_same($expected['group'], (string) $unknown->group(), $case);
+        assert_same($expected['group'], (string) $unknown->group, $case);
         if ($unknown instanceof MetadataUnknownChange) {
-            assert_same($expected['kind'], (string) $unknown->kind(), $case);
+            assert_same($expected['kind'], (string) $unknown->kind, $case);
         }
-        if (is_string($unknown->group())) {
-            assert_same($expected, json_decode($unknown->body(), true, 512, JSON_THROW_ON_ERROR), $case);
+        if (is_string($unknown->group)) {
+            assert_same($expected, json_decode($unknown->body, true, 512, JSON_THROW_ON_ERROR), $case);
         } else {
-            assert_same($expected['body'], base64_encode($unknown->body()), $case);
+            assert_same($expected['body'], base64_encode($unknown->body), $case);
         }
     }
 
@@ -707,19 +737,17 @@ final class MetadataChangesTest extends TestCase
             if (in_array($key, $skipped, true)) {
                 continue;
             }
-            $method = lcfirst(str_replace('_', '', ucwords($key, '_')));
             $label = "{$case} {$key}";
             match ($key) {
                 'options' => self::assertOptions($body, $value, $label),
-                'client_id' => assert_same(self::hexToDecimal($value), $body->clientId(), $label),
-                'reason' => assert_same($value, $body->reason()->value, $label),
-                default => assert_same(is_int($value) ? self::unsigned($value) : $value, $body->$method(), $label),
+                'client_id' => assert_same(self::hexToDecimal($value), $body->client_id, $label),
+                'reason' => assert_same($value, $body->reason->value, $label),
+                default => assert_same(is_int($value) ? self::unsigned($value) : $value, $body->$key, $label),
             };
         }
         foreach (self::OPTIONAL_BODY_KEYS as $key) {
-            $method = lcfirst(str_replace('_', '', ucwords($key, '_')));
-            if (!array_key_exists($key, $fields) && method_exists($body, $method)) {
-                assert_null($body->$method(), "{$case} {$key} must be absent");
+            if (!array_key_exists($key, $fields) && property_exists($body, $key)) {
+                assert_null($body->$key, "{$case} {$key} must be absent");
             }
         }
     }
@@ -728,14 +756,14 @@ final class MetadataChangesTest extends TestCase
     private static function assertOptions(object $body, ?array $expected, string $label): void
     {
         if ($expected === null) {
-            assert_true($body->optionsUnreadable(), $label);
-            assert_null($body->options(), $label);
-            assert_null($body->derivedOptions(), $label);
+            assert_true($body->options_unreadable, $label);
+            assert_null($body->options, $label);
+            assert_null($body->derived_options, $label);
 
             return;
         }
-        assert_true(!$body->optionsUnreadable(), $label);
-        foreach (['options' => true, 'derivedOptions' => false] as $method => $explicit) {
+        assert_true(!$body->options_unreadable, $label);
+        foreach (['options' => true, 'derived_options' => false] as $property => $explicit) {
             $wanted = [];
             foreach ($expected as $key => $option) {
                 if ($option['explicit'] !== $explicit) {
@@ -747,10 +775,10 @@ final class MetadataChangesTest extends TestCase
                     default => $option['value'],
                 };
             }
-            $actual = $body->$method();
+            $actual = $body->$property;
             ksort($actual);
             ksort($wanted);
-            assert_same($wanted, $actual, "{$label} {$method}");
+            assert_same($wanted, $actual, "{$label} {$property}");
         }
     }
 

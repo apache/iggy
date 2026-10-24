@@ -19,7 +19,7 @@ use crate::MuxStateMachine;
 use crate::applied_frontier::AppliedFrontier;
 use crate::change_log::{
     AppliedChange, ChangeLogCapacities, ChangeLogSnapshot, CurrentState, MetadataChangeLog,
-    change_actor, change_page, current_page, session_closed, session_registered,
+    change_actor, change_page, current_page, session_closed, session_registered, session_revoked,
 };
 use crate::impls::placement::PlacementState;
 use crate::stm::authz::{
@@ -1052,15 +1052,15 @@ where
                 header.op
             );
         });
-    if let Some(user_id) = apply.revoked_user {
-        let ended_memberships = apply_user_revocation(
+    if let Some(user) = apply.revoked_user {
+        let ended = apply_user_revocation(
             mux_stm,
             client_table,
             table_mutations_allowed,
-            user_id,
+            user,
             &header,
         );
-        apply.changes.extend(ended_memberships);
+        apply.changes.extend(ended);
     }
     fire_notifier(header.operation);
     let reply = build_reply_message_with(&header, apply.reply_body_len(), |dst| {
@@ -1086,39 +1086,47 @@ where
     }
 }
 
-/// Ends the user's sessions and returns the records of the memberships that
-/// ended with them.
+/// Ends the user's sessions and returns their close records, then the records
+/// of the memberships that ended with them.
 fn apply_user_revocation<M: StreamsFrontend>(
     mux_stm: &M,
     client_table: &RefCell<ClientTable>,
     table_mutations_allowed: bool,
-    user_id: u32,
+    user: WireUserKey,
     header: &PrepareHeader,
 ) -> Vec<AppliedChange> {
     if table_mutations_allowed {
         client_table
             .borrow_mut()
-            .end_user_sessions(user_id, header.op);
+            .end_user_sessions(user.user_id, header.op);
     }
     // A transferred table may already contain this end marker while the
     // streams snapshot still needs the matching membership release.
-    let client_ids: Vec<u128> = {
+    let mut sessions: Vec<SessionIdentity> = {
         let table = client_table.borrow();
         table
             .ended_sessions()
             .filter(|identity| {
                 identity.metadata_watermark == header.op
-                    && table.get_user_id(identity.client_id) == Some(user_id)
+                    && table.get_user_id(identity.client_id) == Some(user.user_id)
             })
-            .map(|identity| identity.client_id)
             .collect()
     };
-    mux_stm.streams().remove_consumer_group_members(
+    // Slot order may differ after a restore, so every apply path orders by client.
+    sessions.sort_by_key(|identity| identity.client_id);
+    let actor = change_actor(&ApplyContext::from(header));
+    let client_ids: Vec<u128> = sessions.iter().map(|identity| identity.client_id).collect();
+    let mut changes: Vec<AppliedChange> = sessions
+        .iter()
+        .map(|identity| session_revoked(user, identity.client_id, identity.session, actor))
+        .collect();
+    changes.extend(mux_stm.streams().remove_consumer_group_members(
         &client_ids,
         iggy_common::IggyTimestamp::from(header.timestamp),
         header.op,
-        change_actor(&ApplyContext::from(header)),
-    )
+        actor,
+    ));
+    changes
 }
 
 /// Late-bound callback invoked after every committed op on shard 0's metadata
@@ -2750,10 +2758,10 @@ where
             local_applied = consensus.commit_min();
             snapshot_ahead = snapshot_seq > local_applied;
             if snapshot_ahead {
-                let change_log = snapshot
-                    .snapshot()
-                    .change_log
-                    .restore(self.change_log.capacities())?;
+                let capacities = self.change_log.capacities().map_err(|_| {
+                    SnapshotError::InvalidState("change log restore reached a read-only view")
+                })?;
+                let change_log = snapshot.snapshot().change_log.restore(capacities)?;
                 self.mux_stm
                     .restore_snapshot_in_place(snapshot.snapshot())?;
                 // Replaced with the state machines and before the frontier
@@ -10917,8 +10925,8 @@ mod tests {
             );
             assert_eq!(
                 live_log.activity.entries.len(),
-                2,
-                "{revocation:?}: both registrations are recorded"
+                3,
+                "{revocation:?}: both registrations and the revoked session are recorded"
             );
 
             let receiver = metadata_plane();
@@ -11031,7 +11039,10 @@ mod tests {
                 &*metadata.mux_stm,
                 &metadata.client_table,
                 true,
-                GROUP_MEMBER_USER,
+                WireUserKey {
+                    user_id: GROUP_MEMBER_USER,
+                    user_created_at: 0,
+                },
                 &header,
             );
             let seen = observer.join().unwrap();

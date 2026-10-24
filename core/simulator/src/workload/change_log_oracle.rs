@@ -24,7 +24,6 @@ use iggy_binary_protocol::primitives::metadata_changes::{
 };
 use iggy_common::{
     MetadataChangeClass, MetadataChangeStart, MetadataChangesQuery, MetadataCurrentPageToken,
-    UserStatus,
 };
 use metadata::change_log::{ChangeEntrySnapshot, ChangeLog, ChangeLogSnapshot};
 use metadata::stm::user::ROOT_USER_CREATED_AT_MICROS;
@@ -325,20 +324,12 @@ impl Mirror {
                 }
             }
             WireMetadataChange::UserCreated(body) | WireMetadataChange::UserUpdated(body) => {
-                let user_id = body.key.user_id;
-                // Deactivation ends the user's sessions without a record.
-                if body.status != UserStatus::Active.as_code() {
-                    self.sessions
-                        .retain(|_, session| session.user.user_id != user_id);
-                }
-                self.users.insert(user_id, body);
+                self.users.insert(body.key.user_id, body);
             }
             WireMetadataChange::UserDeleted(deleted) => {
                 let user_id = deleted.key.user_id;
                 self.users.remove(&user_id);
                 self.tokens.retain(|key, _| key.0 != user_id);
-                self.sessions
-                    .retain(|_, session| session.user.user_id != user_id);
             }
             WireMetadataChange::UserPasswordChanged(_) => {}
             WireMetadataChange::UserPermissionsUpdated(updated) => {
@@ -438,6 +429,6 @@ fn seeded_by_harness(item: &WireMetadataCurrentItem) -> bool {
 
 fn encoded(item: &WireMetadataCurrentItem) -> Vec<u8> {
     let mut bytes = vec![item.group().as_u8()];
-    bytes.extend(item.body_bytes());
+    bytes.extend_from_slice(&item.body_bytes());
     bytes
 }

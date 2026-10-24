@@ -712,6 +712,15 @@ TEST(MetadataChangesFixtureTest, GivenRefusedCursorAndTokenTextWhenParsingShould
     }
 }
 
+TEST(MetadataChangesFixtureTest, GivenNonUtf8CursorAndTokenTextWhenParsingShouldThrowInvalidCommand) {
+    const std::string cursor_text = "mc1_" + std::string(58, 'A') + "\xff";
+    const std::string token_text  = "cs1_\xff";
+    EXPECT_TRUE(ThrowsIggyError([&cursor_text] { iggy::MetadataChangeCursor::Parse(cursor_text); }, kInvalidCommand,
+                                "invalid_command"));
+    EXPECT_TRUE(ThrowsIggyError([&token_text] { iggy::MetadataCurrentPageToken::Parse(token_text); }, kInvalidCommand,
+                                "invalid_command"));
+}
+
 TEST(MetadataChangesFixtureTest, GivenRefusedQueriesWhenValidatingShouldThrowInvalidCommand) {
     for (const auto &vector : Fixture().at("refused").at("queries")) {
         SCOPED_TRACE(vector.at("case").get<std::string>());
@@ -749,10 +758,12 @@ TEST(MetadataChangesFixtureTest, GivenGroupCodeThisBuildDoesNotKnowWhenEncodingS
 TEST(MetadataChangesFixtureTest, GivenReadmeSampleWhenCompilingShouldMatchThePublicApi) {
     using Groups              = std::vector<iggy::MetadataChangeGroup>;
     using ApplyStreamFunction = std::function<void(iggy::MetadataChangeKind, const iggy::MetadataStreamChange &)>;
-    using StoreItemFunction   = std::function<void(const iggy::MetadataCurrentItem &)>;
+    using StageItemFunction   = std::function<void(const iggy::MetadataCurrentItem &)>;
+    using ClearStagedFunction = std::function<void()>;
     // Never invoked, they only have to compile, so the README sample cannot drift from the API.
     const auto rebuild = [](iggy::IggyBlockingClient &client, const Groups &groups,
-                            const StoreItemFunction &StoreItem) {
+                            const ClearStagedFunction &ClearStaged, const StageItemFunction &StageItem) {
+        ClearStaged();
         auto query = iggy::MetadataChangesQuery::Current().SetGroups(groups);
         while (true) {
             const auto page = client.GetMetadataChanges(query);
@@ -764,11 +775,12 @@ TEST(MetadataChangesFixtureTest, GivenReadmeSampleWhenCompilingShouldMatchThePub
                     continue;
                 case iggy::MetadataChangeStatus::Expired:
                 case iggy::MetadataChangeStatus::Reset:
+                    ClearStaged();
                     query = iggy::MetadataChangesQuery::Current().SetGroups(groups);
                     continue;
             }
             for (const auto &item : page.Items()) {
-                StoreItem(item);
+                StageItem(item);
             }
             if (!page.CurrentPageToken()) {
                 return iggy::MetadataChangesQuery::After(*page.Next()).SetGroups(groups);
@@ -777,8 +789,9 @@ TEST(MetadataChangesFixtureTest, GivenReadmeSampleWhenCompilingShouldMatchThePub
         }
     };
     const auto follow = [&rebuild](iggy::IggyBlockingClient &client, const Groups &groups,
-                                   const ApplyStreamFunction &ApplyStream, const StoreItemFunction &StoreItem) {
-        auto query = iggy::MetadataChangesQuery::Latest().SetGroups(groups);
+                                   const ApplyStreamFunction &ApplyStream, const ClearStagedFunction &ClearStaged,
+                                   const StageItemFunction &StageItem) {
+        auto query = rebuild(client, groups, ClearStaged, StageItem);
         while (true) {
             const auto page = client.GetMetadataChanges(query);
             switch (page.Status()) {
@@ -798,7 +811,7 @@ TEST(MetadataChangesFixtureTest, GivenReadmeSampleWhenCompilingShouldMatchThePub
                     break;
                 case iggy::MetadataChangeStatus::Expired:
                 case iggy::MetadataChangeStatus::Reset:
-                    query = rebuild(client, groups, StoreItem);
+                    query = rebuild(client, groups, ClearStaged, StageItem);
                     break;
             }
         }

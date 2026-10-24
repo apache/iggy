@@ -1204,6 +1204,8 @@ impl TryFrom<ffi::MetadataChangesQuery> for MetadataChangesQuery {
     type Error = IggyError;
 
     fn try_from(query: ffi::MetadataChangesQuery) -> Result<Self, Self::Error> {
+        let timestamp =
+            |micros| IggyTimestamp::checked_from_micros(micros).ok_or(IggyError::InvalidCommand);
         let start = match query.start {
             ffi::MetadataChangeStart::Earliest => MetadataChangeStart::Earliest,
             ffi::MetadataChangeStart::Latest => MetadataChangeStart::Latest,
@@ -1230,8 +1232,14 @@ impl TryFrom<ffi::MetadataChangesQuery> for MetadataChangesQuery {
         Ok(Self {
             start,
             groups,
-            since: query.has_since.then(|| IggyTimestamp::from(query.since)),
-            until: query.has_until.then(|| IggyTimestamp::from(query.until)),
+            since: query
+                .has_since
+                .then(|| timestamp(query.since))
+                .transpose()?,
+            until: query
+                .has_until
+                .then(|| timestamp(query.until))
+                .transpose()?,
             limit: query.limit,
         })
     }

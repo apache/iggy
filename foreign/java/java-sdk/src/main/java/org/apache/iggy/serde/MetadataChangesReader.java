@@ -47,6 +47,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.function.Function;
+import java.util.function.IntFunction;
 
 /**
  * Decodes metadata changes answers. Bodies are decoded strictly: unknown reason codes, a known kind under the
@@ -96,21 +97,20 @@ final class MetadataChangesReader {
         int group = buffer.readUnsignedByte();
         int kind = buffer.readUnsignedByte();
         ByteBuf body = buffer.readSlice(length(buffer));
-        Optional<MetadataChangeKind> knownKind = knownKind(group, kind);
-        MetadataChangeBody change = knownKind
-                .map(known -> exact(body, changeBody(known, body)))
-                .orElseGet(() -> new MetadataChangeBody.Unknown(group, Optional.of(kind), bytes(body)));
-        return new MetadataChangeRecord(op, ordinal, checksum, timestamp, actorUserId, knownKind, change);
+        return new MetadataChangeRecord(
+                op,
+                ordinal,
+                checksum,
+                timestamp,
+                actorUserId,
+                knownKind(group, kind),
+                readChangeBody(group, kind, body));
     }
 
     static MetadataCurrentItem readItem(ByteBuf buffer) {
         int group = buffer.readUnsignedByte();
         ByteBuf body = buffer.readSlice(length(buffer));
-        Optional<MetadataChangeGroup> knownGroup = MetadataChangeGroup.fromCode(group);
-        MetadataChangeBody item = knownGroup
-                .map(known -> exact(body, itemBody(known, body)))
-                .orElseGet(() -> new MetadataChangeBody.Unknown(group, Optional.empty(), bytes(body)));
-        return new MetadataCurrentItem(knownGroup, item);
+        return new MetadataCurrentItem(MetadataChangeGroup.fromCode(group), readItemBody(group, body));
     }
 
     static MetadataChangeBody readChangeBody(int group, int kind, ByteBuf body) {
@@ -365,7 +365,7 @@ final class MetadataChangesReader {
                 memberId,
                 clientId,
                 membersCount,
-                reason(body, MetadataChangeBody.MemberLeftReason.values(), "member left reason"));
+                reason(body, MetadataChangeBody.MemberLeftReason::fromCode, "member left reason"));
     }
 
     private static MetadataChangeBody handedOver(ByteBuf body) {
@@ -434,7 +434,7 @@ final class MetadataChangesReader {
                 userCreatedAt,
                 username,
                 permissions,
-                reason(body, MetadataChangeBody.PermissionsUpdatedReason.values(), "permissions updated reason"));
+                reason(body, MetadataChangeBody.PermissionsUpdatedReason::fromCode, "permissions updated reason"));
     }
 
     private static MetadataChangeBody token(ByteBuf body) {
@@ -454,7 +454,7 @@ final class MetadataChangesReader {
                 userId,
                 userCreatedAt,
                 name,
-                reason(body, MetadataChangeBody.TokenDeletedReason.values(), "token deleted reason"));
+                reason(body, MetadataChangeBody.TokenDeletedReason::fromCode, "token deleted reason"));
     }
 
     private static MetadataChangeBody session(ByteBuf body) {
@@ -475,7 +475,7 @@ final class MetadataChangesReader {
                 userCreatedAt,
                 clientId,
                 session,
-                reason(body, MetadataChangeBody.SessionClosedReason.values(), "session closed reason"));
+                reason(body, MetadataChangeBody.SessionClosedReason::fromCode, "session closed reason"));
     }
 
     private static UserStatus userStatus(int code) {
@@ -532,12 +532,9 @@ final class MetadataChangesReader {
         return List.copyOf(ids);
     }
 
-    private static <T extends Enum<T>> T reason(ByteBuf body, T[] values, String field) {
+    private static <T> T reason(ByteBuf body, IntFunction<Optional<T>> fromCode, String field) {
         int code = body.readUnsignedByte();
-        if (code >= values.length) {
-            throw malformed(field + " " + code + " is unknown");
-        }
-        return values[code];
+        return fromCode.apply(code).orElseThrow(() -> malformed(field + " " + code + " is unknown"));
     }
 
     private static boolean flag(ByteBuf buffer, String field) {

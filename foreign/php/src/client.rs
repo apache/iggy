@@ -439,11 +439,15 @@ impl IggyClient {
         until: Option<&Zval>,
         limit: Option<&Zval>,
     ) -> PhpResult<MetadataChanges> {
+        let timestamp = |micros: u64| {
+            IggyTimestamp::checked_from_micros(micros)
+                .ok_or_else(|| to_php_exception(IggyError::InvalidCommand))
+        };
         let query = MetadataChangesQuery {
             start: start.inner.clone(),
             groups: groups.into_iter().map(Into::into).collect(),
-            since: optional_u64(since, "since")?.map(IggyTimestamp::from),
-            until: optional_u64(until, "until")?.map(IggyTimestamp::from),
+            since: optional_u64(since, "since")?.map(timestamp).transpose()?,
+            until: optional_u64(until, "until")?.map(timestamp).transpose()?,
             limit: optional_unsigned(limit, "limit")?
                 .unwrap_or(MetadataChangesQuery::default().limit),
         };
@@ -735,9 +739,13 @@ fn pending_limit(
 
 // u64 values above PHP_INT_MAX, such as the never-expire sentinel, only fit a decimal string.
 fn optional_u64(value: Option<&Zval>, field: &str) -> PhpResult<Option<u64>> {
-    let Some(value) = value.filter(|value| !value.is_null()) else {
-        return Ok(None);
-    };
+    value
+        .filter(|value| !value.is_null())
+        .map(|value| unsigned_argument(value, field))
+        .transpose()
+}
+
+pub(crate) fn unsigned_argument(value: &Zval, field: &str) -> PhpResult<u64> {
     let number = match (value.long(), value.str()) {
         (Some(number), _) => u64::try_from(number).ok(),
         (None, Some(text))
@@ -747,9 +755,9 @@ fn optional_u64(value: Option<&Zval>, field: &str) -> PhpResult<Option<u64>> {
         }
         _ => None,
     };
-    number.map(Some).ok_or_else(|| {
+    number.ok_or_else(|| {
         to_php_exception(format!(
-            "'{field}' must be a non-negative integer, a decimal string or null"
+            "'{field}' must be a non-negative integer or a decimal string"
         ))
     })
 }

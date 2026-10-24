@@ -1698,13 +1698,7 @@ impl Streams {
             tracing::error!(client_id, %error, "consumer session refresh dispatched to reader-only Streams STM");
             return Vec::new();
         }
-        self.inner.read(|state| {
-            state
-                .last_result
-                .as_ref()
-                .map(|reply| reply.changes.clone())
-                .unwrap_or_default()
-        })
+        self.last_changes()
     }
 
     /// Drop a disconnected client from every consumer group it joined and
@@ -1756,13 +1750,7 @@ impl Streams {
             );
             return Vec::new();
         }
-        self.inner.read(|state| {
-            state
-                .last_result
-                .as_ref()
-                .map(|reply| reply.changes.clone())
-                .unwrap_or_default()
-        })
+        self.last_changes()
     }
 
     /// Total consumer-group count across all topics (for stats).

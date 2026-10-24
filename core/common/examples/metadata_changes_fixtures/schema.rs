@@ -605,7 +605,7 @@ fn wire_record(
         actor_user_id,
         group: change.group().as_u8(),
         kind: change.kind().as_u8(),
-        body: Bytes::from(change.body_bytes()),
+        body: change.body_bytes(),
     }
 }
 
@@ -844,6 +844,16 @@ fn change_cases() -> FixtureResult<Vec<(&'static str, WireMetadataChange, Option
             }),
             None,
         ),
+        (
+            "session_closed_revoked",
+            WireMetadataChange::SessionClosed(WireSessionClosedBody {
+                user: user_key(),
+                client_id: 0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10,
+                session: 4500,
+                reason: WireSessionClosedReason::Revoked,
+            }),
+            Some(7),
+        ),
     ])
 }
 
@@ -943,7 +953,7 @@ fn item_vectors() -> FixtureResult<Vec<ItemVector>> {
         .map(|(case, item)| {
             let envelope = WireMetadataItem {
                 group: item.group().as_u8(),
-                body: Bytes::from(item.body_bytes()),
+                body: item.body_bytes(),
             };
             Ok(ItemVector {
                 case: case.to_owned(),
@@ -1430,7 +1440,7 @@ fn refused_vectors() -> FixtureResult<RefusedVectors> {
             .iter()
             .find(|(name, _, _)| *name == case)
             .ok_or("missing case")?;
-        Ok((change.clone(), change.body_bytes()))
+        Ok((change.clone(), change.body_bytes().to_vec()))
     };
     let (member_left, mut bad_reason) = body("consumer_group_member_left_session_ended")?;
     if let Some(last) = bad_reason.last_mut() {
@@ -1528,7 +1538,7 @@ fn refused_vectors() -> FixtureResult<RefusedVectors> {
         records: vec![],
         items: vec![WireMetadataItem {
             group: 1,
-            body: Bytes::from(item_body_for_refusal()?),
+            body: item_body_for_refusal()?,
         }],
         current_page_token: None,
     }
@@ -1662,7 +1672,7 @@ fn refused_vectors() -> FixtureResult<RefusedVectors> {
     })
 }
 
-fn item_body_for_refusal() -> FixtureResult<Vec<u8>> {
+fn item_body_for_refusal() -> FixtureResult<Bytes> {
     Ok(WireMetadataCurrentItem::Stream(WireStreamBody {
         key: stream_key(),
         created_at: 1,

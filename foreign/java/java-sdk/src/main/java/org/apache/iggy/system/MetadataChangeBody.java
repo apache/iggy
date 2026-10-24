@@ -19,16 +19,17 @@
 
 package org.apache.iggy.system;
 
-import org.apache.iggy.message.HeaderKind;
 import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.stream.EncryptionKeySource;
-import org.apache.iggy.stream.StreamOptionKey;
+import org.apache.iggy.stream.EncryptionProjection;
 import org.apache.iggy.user.Permissions;
 import org.apache.iggy.user.UserStatus;
 
 import java.math.BigInteger;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 
 /**
@@ -42,36 +43,182 @@ import java.util.Optional;
  */
 public sealed interface MetadataChangeBody {
 
-    /** Why a consumer group member was removed. */
+    /** Why a consumer group member was removed. The codes are the wire codes. */
     enum MemberLeftReason {
         /** The member left the group. */
-        LEFT,
+        LEFT(0, "left"),
         /** The member's session ended. */
-        SESSION_ENDED
+        SESSION_ENDED(1, "session_ended");
+
+        private final int code;
+        private final String value;
+
+        MemberLeftReason(int code, String value) {
+            this.code = code;
+            this.value = value;
+        }
+
+        /** The reason with wire code {@code code}, or empty for a reason this build does not know. */
+        public static Optional<MemberLeftReason> fromCode(int code) {
+            for (MemberLeftReason reason : values()) {
+                if (reason.code == code) {
+                    return Optional.of(reason);
+                }
+            }
+            return Optional.empty();
+        }
+
+        /** The reason named {@code value}, or empty for a reason this build does not know. */
+        public static Optional<MemberLeftReason> fromValue(String value) {
+            for (MemberLeftReason reason : values()) {
+                if (reason.value.equals(value)) {
+                    return Optional.of(reason);
+                }
+            }
+            return Optional.empty();
+        }
+
+        public int asCode() {
+            return code;
+        }
+
+        public String value() {
+            return value;
+        }
     }
 
-    /** Why a personal access token was removed. */
+    /** Why a personal access token was removed. The codes are the wire codes. */
     enum TokenDeletedReason {
         /** A client deleted the token. */
-        DELETED,
+        DELETED(0, "deleted"),
         /** The expiry cleaner removed the token. */
-        EXPIRED
+        EXPIRED(1, "expired");
+
+        private final int code;
+        private final String value;
+
+        TokenDeletedReason(int code, String value) {
+            this.code = code;
+            this.value = value;
+        }
+
+        /** The reason with wire code {@code code}, or empty for a reason this build does not know. */
+        public static Optional<TokenDeletedReason> fromCode(int code) {
+            for (TokenDeletedReason reason : values()) {
+                if (reason.code == code) {
+                    return Optional.of(reason);
+                }
+            }
+            return Optional.empty();
+        }
+
+        /** The reason named {@code value}, or empty for a reason this build does not know. */
+        public static Optional<TokenDeletedReason> fromValue(String value) {
+            for (TokenDeletedReason reason : values()) {
+                if (reason.value.equals(value)) {
+                    return Optional.of(reason);
+                }
+            }
+            return Optional.empty();
+        }
+
+        public int asCode() {
+            return code;
+        }
+
+        public String value() {
+            return value;
+        }
     }
 
-    /** Why a session was closed. */
+    /** Why a session was closed. The codes are the wire codes. */
     enum SessionClosedReason {
         /** The client logged out. */
-        LOGOUT,
+        LOGOUT(0, "logout"),
         /** The session lease expired. */
-        EXPIRED
+        EXPIRED(1, "expired"),
+        /** The user was deactivated or deleted. */
+        REVOKED(2, "revoked");
+
+        private final int code;
+        private final String value;
+
+        SessionClosedReason(int code, String value) {
+            this.code = code;
+            this.value = value;
+        }
+
+        /** The reason with wire code {@code code}, or empty for a reason this build does not know. */
+        public static Optional<SessionClosedReason> fromCode(int code) {
+            for (SessionClosedReason reason : values()) {
+                if (reason.code == code) {
+                    return Optional.of(reason);
+                }
+            }
+            return Optional.empty();
+        }
+
+        /** The reason named {@code value}, or empty for a reason this build does not know. */
+        public static Optional<SessionClosedReason> fromValue(String value) {
+            for (SessionClosedReason reason : values()) {
+                if (reason.value.equals(value)) {
+                    return Optional.of(reason);
+                }
+            }
+            return Optional.empty();
+        }
+
+        public int asCode() {
+            return code;
+        }
+
+        public String value() {
+            return value;
+        }
     }
 
-    /** Why a user's public permission set changed. */
+    /** Why a user's public permission set changed. The codes are the wire codes. */
     enum PermissionsUpdatedReason {
         /** A permissions update replaced the set. */
-        UPDATED,
+        UPDATED(0, "updated"),
         /** A stream or topic delete pruned the user's grants on it. */
-        RESOURCE_DELETED
+        RESOURCE_DELETED(1, "resource_deleted");
+
+        private final int code;
+        private final String value;
+
+        PermissionsUpdatedReason(int code, String value) {
+            this.code = code;
+            this.value = value;
+        }
+
+        /** The reason with wire code {@code code}, or empty for a reason this build does not know. */
+        public static Optional<PermissionsUpdatedReason> fromCode(int code) {
+            for (PermissionsUpdatedReason reason : values()) {
+                if (reason.code == code) {
+                    return Optional.of(reason);
+                }
+            }
+            return Optional.empty();
+        }
+
+        /** The reason named {@code value}, or empty for a reason this build does not know. */
+        public static Optional<PermissionsUpdatedReason> fromValue(String value) {
+            for (PermissionsUpdatedReason reason : values()) {
+                if (reason.value.equals(value)) {
+                    return Optional.of(reason);
+                }
+            }
+            return Optional.empty();
+        }
+
+        public int asCode() {
+            return code;
+        }
+
+        public String value() {
+            return value;
+        }
     }
 
     /** A stream after a create or update, and a streams item. */
@@ -87,22 +234,12 @@ public sealed interface MetadataChangeBody {
 
         /** Who chose the key that encrypts the stream at rest, empty when the record reports no source. */
         public Optional<EncryptionKeySource> encryptionKeySource() {
-            return text(StreamOptionKey.ENCRYPTION_KEY_SOURCE).flatMap(EncryptionKeySource::fromValue);
+            return EncryptionProjection.source(options, derivedOptions);
         }
 
         /** Fingerprint of the stream's key, empty for a plaintext stream. */
         public Optional<String> encryptionKeyFingerprint() {
-            return text(StreamOptionKey.ENCRYPTION_KEY_FINGERPRINT);
-        }
-
-        private Optional<String> text(StreamOptionKey key) {
-            HeaderValue value = derivedOptions.get(key.value());
-            if (value == null) {
-                value = options.get(key.value());
-            }
-            return Optional.ofNullable(value)
-                    .filter(found -> found.kind() == HeaderKind.String)
-                    .map(HeaderValue::asString);
+            return EncryptionProjection.keyFingerprint(options, derivedOptions);
         }
     }
 
@@ -302,7 +439,30 @@ public sealed interface MetadataChangeBody {
      * @param kind the kind code, empty for an item
      * @param body the body exactly as the server sent it
      */
-    record Unknown(int group, Optional<Integer> kind, byte[] body) implements MetadataChangeBody {}
+    record Unknown(int group, Optional<Integer> kind, byte[] body) implements MetadataChangeBody {
+
+        public Unknown {
+            body = MetadataChangeEncoding.copy(body);
+        }
+
+        @Override
+        public byte[] body() {
+            return MetadataChangeEncoding.copy(body);
+        }
+
+        @Override
+        public boolean equals(Object other) {
+            return other instanceof Unknown unknown
+                    && group == unknown.group
+                    && Objects.equals(kind, unknown.kind)
+                    && Arrays.equals(body, unknown.body);
+        }
+
+        @Override
+        public int hashCode() {
+            return 31 * Objects.hash(group, kind) + Arrays.hashCode(body);
+        }
+    }
 
     /**
      * A JSON record or item of a group or kind this build does not know, kept as the whole object.

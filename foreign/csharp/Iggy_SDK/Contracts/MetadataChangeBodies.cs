@@ -59,13 +59,7 @@ public sealed class MetadataStreamChange : MetadataChangeBody
 
     /// <summary>Who chose the key that encrypts the stream at rest, or null when the record reports no source.</summary>
     public StreamEncryptionSource? EncryptionKeySource =>
-        OptionValues.Text(Options, DerivedOptions, StreamOptionKey.EncryptionKeySource) switch
-        {
-            "none" => StreamEncryptionSource.None,
-            "stream" => StreamEncryptionSource.Stream,
-            "server" => StreamEncryptionSource.Server,
-            _ => null
-        };
+        OptionValues.EncryptionKeySource(Options, DerivedOptions);
 
     /// <summary>Fingerprint of the stream's key. Null for a plaintext stream.</summary>
     public string? EncryptionKeyFingerprint =>

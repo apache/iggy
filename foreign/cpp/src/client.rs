@@ -1522,11 +1522,13 @@ pub fn encryption_key_fingerprint_base64(
 
 /// Parses the `mc1_` text form. The error never echoes the text.
 pub fn parse_metadata_change_cursor(
-    text: &str,
+    text: &[u8],
     error_info: &mut ffi::ErrorInfo,
 ) -> Result<ffi::MetadataChangeCursor, String> {
     *error_info = ffi::ErrorInfo::default();
-    MetadataChangeCursor::from_str(text)
+    str::from_utf8(text)
+        .map_err(|_| IggyError::InvalidCommand)
+        .and_then(MetadataChangeCursor::from_str)
         .map(ffi::MetadataChangeCursor::from)
         .inspect_err(|error| error_info.record(error))
         .map_err(|error| format!("Could not parse the metadata change cursor: {error}"))
@@ -1534,11 +1536,13 @@ pub fn parse_metadata_change_cursor(
 
 /// Parses the `cs1_` text form. The error never echoes the text.
 pub fn parse_metadata_current_page_token(
-    text: &str,
+    text: &[u8],
     error_info: &mut ffi::ErrorInfo,
 ) -> Result<ffi::MetadataCurrentPageToken, String> {
     *error_info = ffi::ErrorInfo::default();
-    MetadataCurrentPageToken::from_str(text)
+    str::from_utf8(text)
+        .map_err(|_| IggyError::InvalidCommand)
+        .and_then(MetadataCurrentPageToken::from_str)
         .map(ffi::MetadataCurrentPageToken::from)
         .inspect_err(|error| error_info.record(error))
         .map_err(|error| format!("Could not parse the metadata current page token: {error}"))

@@ -105,7 +105,7 @@ pub const DEFAULT_METADATA_CHANGE_LOG_ACTIVITY_CAPACITY: usize = 16_384;
 
 /// Mirrors `metadata::change_log::MAX_CAPACITY`. A snapshot holding a larger
 /// ring is refused, so a capacity past it could never be restored.
-pub const MAX_METADATA_CHANGE_LOG_CAPACITY: usize = MAX_METADATA_JOURNAL_SLOTS;
+pub const MAX_METADATA_CHANGE_LOG_CAPACITY: usize = 1 << 20;
 
 /// Capacity tunables for the metadata consensus plane.
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]

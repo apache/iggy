@@ -67,6 +67,16 @@ UNAUTHORIZED = 41
 ROOT_USER_ID = 0
 STREAMS = MetadataChangeGroup.Streams
 TOPICS = MetadataChangeGroup.Topics
+ENUM_SECTIONS = (
+    (MetadataChangeGroup, "groups"),
+    (MetadataChangeKind, "kinds"),
+    (MetadataChangeStatus, "statuses"),
+    (MetadataChangePhase, "phases"),
+    (MetadataMemberLeftReason, "member_left_reasons"),
+    (MetadataTokenDeletedReason, "token_deleted_reasons"),
+    (MetadataSessionClosedReason, "session_closed_reasons"),
+    (MetadataPermissionsUpdatedReason, "permissions_updated_reasons"),
+)
 
 
 @pytest.mark.usefixtures("iggy_client")
@@ -390,22 +400,30 @@ class TestMetadataChangesVectors:
     @pytest.mark.unit
     def test_given_fixture_constants_when_reading_enums_should_cover_every_name(self):
         """Every group, kind, status, phase and reason has its member."""
-        for enum_type, section in (
-            (MetadataChangeGroup, "groups"),
-            (MetadataChangeKind, "kinds"),
-            (MetadataChangeStatus, "statuses"),
-            (MetadataChangePhase, "phases"),
-            (MetadataMemberLeftReason, "member_left_reasons"),
-            (MetadataTokenDeletedReason, "token_deleted_reasons"),
-            (MetadataSessionClosedReason, "session_closed_reasons"),
-            (MetadataPermissionsUpdatedReason, "permissions_updated_reasons"),
-        ):
+        for enum_type, section in ENUM_SECTIONS:
             members = {
                 str(value)
                 for value in vars(enum_type).values()
                 if isinstance(value, enum_type)
             }
             assert members == set(CONSTANTS[section]), section
+
+    @pytest.mark.unit
+    def test_given_enum_members_when_used_as_keys_should_hash_by_value(self):
+        """Members key dicts and sets, and equal members hash alike."""
+        for enum_type, section in ENUM_SECTIONS:
+            members = [
+                value
+                for value in vars(enum_type).values()
+                if isinstance(value, enum_type)
+            ]
+            names = {member: str(member) for member in members}
+            assert len(set(members)) == len(names) == len(members), section
+            assert all(names[member] == str(member) for member in members), section
+        for vector in FIXTURE["page_tokens"]:
+            last_group = MetadataCurrentPageToken.parse(vector["text"]).last_group
+            assert last_group in {group(vector["group"])}
+            assert hash(last_group) == hash(group(vector["group"]))
 
 
 def read_vector(client: IggyClient, query: dict):

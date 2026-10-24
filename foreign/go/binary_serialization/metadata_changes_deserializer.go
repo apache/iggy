@@ -262,7 +262,7 @@ func decodeChangeBody(group iggcon.MetadataChangeGroup, kind iggcon.MetadataChan
 			ClientID:        reader.readUnsigned128(),
 			Session:         reader.readUint64(),
 			Reason: iggcon.MetadataSessionClosedReason(
-				reader.readCode("session closed reason", uint8(iggcon.MetadataSessionClosedReasonExpired))),
+				reader.readCode("session closed reason", uint8(iggcon.MetadataSessionClosedReasonRevoked))),
 		}
 	}
 	if err := reader.finish(); err != nil {

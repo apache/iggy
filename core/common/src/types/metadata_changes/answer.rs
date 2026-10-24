@@ -37,13 +37,16 @@ pub struct MetadataChanges {
     pub retained_since: u64,
     /// Highest metadata operation this node applied.
     pub head_op: u64,
-    /// The cursor to send back. Present on `ok`.
+    /// The cursor to send back. Present on `ok`. On `behind` it repeats the
+    /// position the request carried, so the same request can be retried.
     pub next: Option<MetadataChangeCursor>,
     /// More entries remain after `next`, or another state page exists.
     pub has_more: bool,
     pub records: Vec<MetadataChangeRecord>,
     pub items: Vec<MetadataCurrentItem>,
-    /// Continuation of a current state scan, absent once it is complete.
+    /// Continuation of a current state scan, absent once it is complete. On
+    /// `behind` it echoes the token of the page to retry, with `has_more`
+    /// false.
     pub current_page_token: Option<MetadataCurrentPageToken>,
 }
 

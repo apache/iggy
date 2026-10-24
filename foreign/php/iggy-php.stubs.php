@@ -572,6 +572,35 @@ namespace Iggy {
      */
     class MetadataChangeCursor {
         /**
+         * Prepare checksum of `op` as a decimal string.
+         *
+         * @var string
+         */
+        public readonly string $checksum;
+
+        /**
+         * Prepare checksum of op 1 as a decimal string, which names the history the cursor
+         * belongs to.
+         *
+         * @var string
+         */
+        public readonly string $log_id;
+
+        /**
+         * The operation of the last record, 0 before the first record.
+         *
+         * @var mixed
+         */
+        public readonly mixed $op;
+
+        /**
+         * Position of the record within `op`.
+         *
+         * @var int
+         */
+        public readonly int $ordinal;
+
+        /**
          * Builds a cursor from its fields: 128-bit values as decimal strings, `op` as an int or
          * a decimal string.
          *
@@ -586,35 +615,6 @@ namespace Iggy {
          * @return string
          */
         public function __toString(): string {}
-
-        /**
-         * Prepare checksum of `op` as a decimal string.
-         *
-         * @return string
-         */
-        public function checksum(): string {}
-
-        /**
-         * Prepare checksum of op 1 as a decimal string, which names the history the cursor
-         * belongs to.
-         *
-         * @return string
-         */
-        public function logId(): string {}
-
-        /**
-         * The operation of the last record, 0 before the first record.
-         *
-         * @return mixed
-         */
-        public function op(): mixed {}
-
-        /**
-         * Position of the record within `op`.
-         *
-         * @return int
-         */
-        public function ordinal(): int {}
 
         /**
          * Reads a cursor from its `mc1_` text. Anything else throws `Invalid command` (code 3).
@@ -679,64 +679,64 @@ namespace Iggy {
      * operation and the typed body of what is true after it.
      */
     class MetadataChangeRecord {
-        public function __construct() {}
-
         /**
          * The acting user, null for server actions.
          *
-         * @return int|null
+         * @var int|null
          */
-        public function actorUserId(): ?int {}
+        public readonly ?int $actor_user_id;
 
         /**
          * The typed body `kind` names, for example a `MetadataStreamChange` for
          * `StreamCreated` and `StreamUpdated`, or a `MetadataUnknownChange`.
          *
-         * @return mixed
+         * @var mixed
          */
-        public function change(): mixed {}
+        public readonly mixed $change;
 
         /**
          * Prepare checksum of `op` as a decimal string.
          *
-         * @return string
+         * @var string
          */
-        public function checksum(): string {}
+        public readonly string $checksum;
 
         /**
          * The group, null for a record this build does not know.
          *
-         * @return \Iggy\MetadataChangeGroup|null
+         * @var \Iggy\MetadataChangeGroup|null
          */
-        public function group(): ?\Iggy\MetadataChangeGroup {}
+        public readonly ?\Iggy\MetadataChangeGroup $group;
 
         /**
          * The kind, null for a record this build does not know.
          *
-         * @return \Iggy\MetadataChangeKind|null
+         * @var \Iggy\MetadataChangeKind|null
          */
-        public function kind(): ?\Iggy\MetadataChangeKind {}
+        public readonly ?\Iggy\MetadataChangeKind $kind;
 
         /**
          * The metadata operation that produced the record.
          *
-         * @return mixed
+         * @var mixed
          */
-        public function op(): mixed {}
+        public readonly mixed $op;
 
         /**
          * Position of the record within `op`.
          *
-         * @return int
+         * @var int
          */
-        public function ordinal(): int {}
+        public readonly int $ordinal;
 
         /**
          * Prepare timestamp of `op` in microseconds.
          *
-         * @return mixed
+         * @var mixed
          */
-        public function timestamp(): mixed {}
+        public readonly mixed $timestamp;
+
+        public function __construct() {}
     }
 
     /**
@@ -797,14 +797,81 @@ namespace Iggy {
      * (log ids, checksums, client ids) are decimal strings.
      */
     class MetadataChanges {
-        public function __construct() {}
-
         /**
          * Continuation of a current state scan, null once it is complete.
          *
-         * @return \Iggy\MetadataCurrentPageToken|null
+         * @var \Iggy\MetadataCurrentPageToken|null
          */
-        public function currentPageToken(): ?\Iggy\MetadataCurrentPageToken {}
+        public readonly ?\Iggy\MetadataCurrentPageToken $current_page_token;
+
+        /**
+         * More entries remain after `next`, or another state page exists.
+         *
+         * @var bool
+         */
+        public readonly bool $has_more;
+
+        /**
+         * Highest metadata operation the answering node applied.
+         *
+         * @var mixed
+         */
+        public readonly mixed $head_op;
+
+        /**
+         * Current state items, empty on change pages.
+         *
+         * @var array
+         */
+        public readonly array $items;
+
+        /**
+         * This node's log id as a decimal string, null before it applied op 1.
+         *
+         * @var string|null
+         */
+        public readonly ?string $log_id;
+
+        /**
+         * The cursor to send back. Present on `Ok`, echoed on `Behind`, null on `Expired` and
+         * `Reset`. The last state page returns the anchor to follow from.
+         *
+         * @var \Iggy\MetadataChangeCursor|null
+         */
+        public readonly ?\Iggy\MetadataChangeCursor $next;
+
+        /**
+         * Lowest whole operation from which the requested groups are complete.
+         *
+         * @var mixed
+         */
+        public readonly mixed $oldest_op;
+
+        /**
+         * `Changes` for `earliest`, `latest` and `after`, `Current` for state pages.
+         *
+         * @var \Iggy\MetadataChangePhase
+         */
+        public readonly \Iggy\MetadataChangePhase $phase;
+
+        /**
+         * Change records in `(op, ordinal)` order, empty on state pages.
+         *
+         * @var array
+         */
+        public readonly array $records;
+
+        /**
+         * The requested groups are complete for every timestamp above this value in
+         * microseconds, 0 when nothing was evicted.
+         *
+         * @var mixed
+         */
+        public readonly mixed $retained_since;
+
+        public readonly \Iggy\MetadataChangeStatus $status;
+
+        public function __construct() {}
 
         /**
          * Decodes the response payload of the raw `metadata.changes` command (code 17), as
@@ -822,229 +889,105 @@ namespace Iggy {
          * @return \Iggy\MetadataChanges
          */
         public static function fromJson(string $json): \Iggy\MetadataChanges {}
-
-        /**
-         * More entries remain after `next`, or another state page exists.
-         *
-         * @return bool
-         */
-        public function hasMore(): bool {}
-
-        /**
-         * Highest metadata operation the answering node applied.
-         *
-         * @return mixed
-         */
-        public function headOp(): mixed {}
-
-        /**
-         * Current state items, empty on change pages.
-         *
-         * @return array
-         */
-        public function items(): array {}
-
-        /**
-         * This node's log id as a decimal string, null before it applied op 1.
-         *
-         * @return string|null
-         */
-        public function logId(): ?string {}
-
-        /**
-         * The cursor to send back. Present on `Ok`, echoed on `Behind`, null on `Expired` and
-         * `Reset`. The last state page returns the anchor to follow from.
-         *
-         * @return \Iggy\MetadataChangeCursor|null
-         */
-        public function next(): ?\Iggy\MetadataChangeCursor {}
-
-        /**
-         * Lowest whole operation from which the requested groups are complete.
-         *
-         * @return mixed
-         */
-        public function oldestOp(): mixed {}
-
-        /**
-         * `Changes` for `earliest`, `latest` and `after`, `Current` for state pages.
-         *
-         * @return \Iggy\MetadataChangePhase
-         */
-        public function phase(): \Iggy\MetadataChangePhase {}
-
-        /**
-         * Change records in `(op, ordinal)` order, empty on state pages.
-         *
-         * @return array
-         */
-        public function records(): array {}
-
-        /**
-         * The requested groups are complete for every timestamp above this value in
-         * microseconds, 0 when nothing was evicted.
-         *
-         * @return mixed
-         */
-        public function retainedSince(): mixed {}
-
-        /**
-         * @return \Iggy\MetadataChangeStatus
-         */
-        public function status(): \Iggy\MetadataChangeStatus {}
     }
 
     /**
      * A created consumer group with the topic's resulting group count.
      */
     class MetadataConsumerGroupCreated {
-        public function __construct() {}
-
         /**
          * The topic's consumer group count after the change.
          *
-         * @return int
+         * @var int
          */
-        public function consumerGroupsCount(): int {}
+        public readonly int $consumer_groups_count;
 
-        /**
-         * @return int
-         */
-        public function groupId(): int {}
+        public readonly int $group_id;
 
-        /**
-         * @return string
-         */
-        public function name(): string {}
+        public readonly string $name;
 
-        /**
-         * @return mixed
-         */
-        public function streamCreatedOp(): mixed {}
+        public readonly mixed $stream_created_op;
 
-        /**
-         * @return int
-         */
-        public function streamId(): int {}
+        public readonly int $stream_id;
 
-        /**
-         * @return mixed
-         */
-        public function topicCreatedOp(): mixed {}
+        public readonly mixed $topic_created_op;
 
-        /**
-         * @return int
-         */
-        public function topicId(): int {}
+        public readonly int $topic_id;
+
+        public function __construct() {}
     }
 
     /**
      * A removed consumer group with the topic's resulting group count.
      */
     class MetadataConsumerGroupDeleted {
-        public function __construct() {}
-
         /**
          * The topic's consumer group count after the change.
          *
-         * @return int
+         * @var int
          */
-        public function consumerGroupsCount(): int {}
+        public readonly int $consumer_groups_count;
 
-        /**
-         * @return int
-         */
-        public function groupId(): int {}
+        public readonly int $group_id;
 
-        /**
-         * @return string
-         */
-        public function name(): string {}
+        public readonly string $name;
 
         /**
          * The operation of the delete request when the delete completed later, else null.
          *
-         * @return mixed
+         * @var mixed
          */
-        public function requestedOp(): mixed {}
+        public readonly mixed $requested_op;
 
-        /**
-         * @return mixed
-         */
-        public function streamCreatedOp(): mixed {}
+        public readonly mixed $stream_created_op;
 
-        /**
-         * @return int
-         */
-        public function streamId(): int {}
+        public readonly int $stream_id;
 
-        /**
-         * @return mixed
-         */
-        public function topicCreatedOp(): mixed {}
+        public readonly mixed $topic_created_op;
 
-        /**
-         * @return int
-         */
-        public function topicId(): int {}
+        public readonly int $topic_id;
+
+        public function __construct() {}
     }
 
     /**
      * A `consumer_groups` current state item.
      */
     class MetadataConsumerGroupItem {
+        public readonly int $group_id;
+
+        public readonly string $name;
+
+        public readonly mixed $stream_created_op;
+
+        public readonly int $stream_id;
+
+        public readonly mixed $topic_created_op;
+
+        public readonly int $topic_id;
+
         public function __construct() {}
-
-        /**
-         * @return int
-         */
-        public function groupId(): int {}
-
-        /**
-         * @return string
-         */
-        public function name(): string {}
-
-        /**
-         * @return mixed
-         */
-        public function streamCreatedOp(): mixed {}
-
-        /**
-         * @return int
-         */
-        public function streamId(): int {}
-
-        /**
-         * @return mixed
-         */
-        public function topicCreatedOp(): mixed {}
-
-        /**
-         * @return int
-         */
-        public function topicId(): int {}
     }
 
     /**
      * One current state item of a `MetadataChangeStart::current()` page.
      */
     class MetadataCurrentItem {
-        public function __construct() {}
-
         /**
          * The typed body `group` names, or a `MetadataUnknownItem`.
          *
-         * @return mixed
+         * @var mixed
          */
-        public function body(): mixed {}
+        public readonly mixed $body;
 
         /**
          * The group, null for an item this build does not know.
          *
-         * @return \Iggy\MetadataChangeGroup|null
+         * @var \Iggy\MetadataChangeGroup|null
          */
-        public function group(): ?\Iggy\MetadataChangeGroup {}
+        public readonly ?\Iggy\MetadataChangeGroup $group;
+
+        public function __construct() {}
     }
 
     /**
@@ -1054,40 +997,47 @@ namespace Iggy {
      * Casting it to string gives its `cs1_` text, which `parse()` reads back.
      */
     class MetadataCurrentPageToken {
+        /**
+         * The cursor captured before the scan's first page.
+         *
+         * @var \Iggy\MetadataChangeCursor
+         */
+        public readonly \Iggy\MetadataChangeCursor $anchor;
+
+        /**
+         * The groups the scan was started with, in code order.
+         *
+         * @var array
+         */
+        public readonly array $groups;
+
+        /**
+         * The group of the last item returned.
+         *
+         * @var \Iggy\MetadataChangeGroup
+         */
+        public readonly \Iggy\MetadataChangeGroup $last_group;
+
+        /**
+         * The key of the last item returned, in the page token key layout.
+         *
+         * @var string
+         */
+        public readonly string $last_key;
+
+        /**
+         * The highest head any page of the scan reported so far.
+         *
+         * @var mixed
+         */
+        public readonly mixed $required_head;
+
         public function __construct() {}
 
         /**
          * @return string
          */
         public function __toString(): string {}
-
-        /**
-         * The cursor captured before the scan's first page.
-         *
-         * @return \Iggy\MetadataChangeCursor
-         */
-        public function anchor(): \Iggy\MetadataChangeCursor {}
-
-        /**
-         * The groups the scan was started with, in code order.
-         *
-         * @return array
-         */
-        public function groups(): array {}
-
-        /**
-         * The group of the last item returned.
-         *
-         * @return \Iggy\MetadataChangeGroup
-         */
-        public function lastGroup(): \Iggy\MetadataChangeGroup {}
-
-        /**
-         * The key of the last item returned, in the page token key layout.
-         *
-         * @return string
-         */
-        public function lastKey(): string {}
 
         /**
          * Reads a page token from its `cs1_` text. Anything else throws `Invalid command`
@@ -1097,174 +1047,104 @@ namespace Iggy {
          * @return \Iggy\MetadataCurrentPageToken
          */
         public static function parse(string $text): \Iggy\MetadataCurrentPageToken {}
-
-        /**
-         * The highest head any page of the scan reported so far.
-         *
-         * @return mixed
-         */
-        public function requiredHead(): mixed {}
     }
 
     /**
      * A `consumer_group_members` current state item.
      */
     class MetadataMemberItem {
-        public function __construct() {}
-
         /**
          * The member's client id as a decimal string.
          *
-         * @return string
+         * @var string
          */
-        public function clientId(): string {}
+        public readonly string $client_id;
 
-        /**
-         * @return int
-         */
-        public function groupId(): int {}
+        public readonly int $group_id;
 
-        /**
-         * @return int
-         */
-        public function memberId(): int {}
+        public readonly int $member_id;
 
         /**
          * Installed partitions, ascending.
          *
-         * @return array
+         * @var array
          */
-        public function partitionIds(): array {}
+        public readonly array $partition_ids;
 
-        /**
-         * @return mixed
-         */
-        public function streamCreatedOp(): mixed {}
+        public readonly mixed $stream_created_op;
 
-        /**
-         * @return int
-         */
-        public function streamId(): int {}
+        public readonly int $stream_id;
 
-        /**
-         * @return mixed
-         */
-        public function topicCreatedOp(): mixed {}
+        public readonly mixed $topic_created_op;
 
-        /**
-         * @return int
-         */
-        public function topicId(): int {}
+        public readonly int $topic_id;
+
+        public function __construct() {}
     }
 
     /**
      * A member that joined a consumer group.
      */
     class MetadataMemberJoined {
-        public function __construct() {}
-
         /**
          * The member's client id as a decimal string.
          *
-         * @return string
+         * @var string
          */
-        public function clientId(): string {}
+        public readonly string $client_id;
 
-        /**
-         * @return int
-         */
-        public function groupId(): int {}
+        public readonly int $group_id;
 
-        /**
-         * @return int
-         */
-        public function memberId(): int {}
+        public readonly int $member_id;
 
-        /**
-         * @return int
-         */
-        public function membersCount(): int {}
+        public readonly int $members_count;
 
         /**
          * Installed partitions, normally none because a handover installs them.
          *
-         * @return array
+         * @var array
          */
-        public function partitionIds(): array {}
+        public readonly array $partition_ids;
 
-        /**
-         * @return mixed
-         */
-        public function streamCreatedOp(): mixed {}
+        public readonly mixed $stream_created_op;
 
-        /**
-         * @return int
-         */
-        public function streamId(): int {}
+        public readonly int $stream_id;
 
-        /**
-         * @return mixed
-         */
-        public function topicCreatedOp(): mixed {}
+        public readonly mixed $topic_created_op;
 
-        /**
-         * @return int
-         */
-        public function topicId(): int {}
+        public readonly int $topic_id;
+
+        public function __construct() {}
     }
 
     /**
      * A member that left a consumer group.
      */
     class MetadataMemberLeft {
-        public function __construct() {}
-
         /**
          * The member's client id as a decimal string.
          *
-         * @return string
+         * @var string
          */
-        public function clientId(): string {}
+        public readonly string $client_id;
 
-        /**
-         * @return int
-         */
-        public function groupId(): int {}
+        public readonly int $group_id;
 
-        /**
-         * @return int
-         */
-        public function memberId(): int {}
+        public readonly int $member_id;
 
-        /**
-         * @return int
-         */
-        public function membersCount(): int {}
+        public readonly int $members_count;
 
-        /**
-         * @return \Iggy\MetadataMemberLeftReason
-         */
-        public function reason(): \Iggy\MetadataMemberLeftReason {}
+        public readonly \Iggy\MetadataMemberLeftReason $reason;
 
-        /**
-         * @return mixed
-         */
-        public function streamCreatedOp(): mixed {}
+        public readonly mixed $stream_created_op;
 
-        /**
-         * @return int
-         */
-        public function streamId(): int {}
+        public readonly int $stream_id;
 
-        /**
-         * @return mixed
-         */
-        public function topicCreatedOp(): mixed {}
+        public readonly mixed $topic_created_op;
 
-        /**
-         * @return int
-         */
-        public function topicId(): int {}
+        public readonly int $topic_id;
+
+        public function __construct() {}
     }
 
     /**
@@ -1279,124 +1159,79 @@ namespace Iggy {
      * A completed partition handover.
      */
     class MetadataPartitionHandedOver {
-        public function __construct() {}
-
-        /**
-         * @return int
-         */
-        public function groupId(): int {}
+        public readonly int $group_id;
 
         /**
          * The new owner, null when the last member left.
          *
-         * @return int|null
+         * @var int|null
          */
-        public function memberId(): ?int {}
+        public readonly ?int $member_id;
 
-        /**
-         * @return int
-         */
-        public function partitionId(): int {}
+        public readonly int $partition_id;
 
-        /**
-         * @return mixed
-         */
-        public function streamCreatedOp(): mixed {}
+        public readonly mixed $stream_created_op;
 
-        /**
-         * @return int
-         */
-        public function streamId(): int {}
+        public readonly int $stream_id;
 
-        /**
-         * @return mixed
-         */
-        public function topicCreatedOp(): mixed {}
+        public readonly mixed $topic_created_op;
 
-        /**
-         * @return int
-         */
-        public function topicId(): int {}
+        public readonly int $topic_id;
+
+        public function __construct() {}
     }
 
     /**
      * A partition count change.
      */
     class MetadataPartitionsChanged {
-        public function __construct() {}
-
         /**
          * The partition count after the change.
          *
-         * @return int
+         * @var int
          */
-        public function partitionsCount(): int {}
+        public readonly int $partitions_count;
 
         /**
          * The deleted partition ids, ascending, empty on create.
          *
-         * @return array
+         * @var array
          */
-        public function removedPartitionIds(): array {}
+        public readonly array $removed_partition_ids;
 
         /**
          * The operation of the delete request when the delete completed later, else null.
          *
-         * @return mixed
+         * @var mixed
          */
-        public function requestedOp(): mixed {}
+        public readonly mixed $requested_op;
 
-        /**
-         * @return mixed
-         */
-        public function streamCreatedOp(): mixed {}
+        public readonly mixed $stream_created_op;
 
-        /**
-         * @return int
-         */
-        public function streamId(): int {}
+        public readonly int $stream_id;
 
-        /**
-         * @return mixed
-         */
-        public function topicCreatedOp(): mixed {}
+        public readonly mixed $topic_created_op;
 
-        /**
-         * @return int
-         */
-        public function topicId(): int {}
+        public readonly int $topic_id;
+
+        public function __construct() {}
     }
 
     /**
      * A `partitions` current state item.
      */
     class MetadataPartitionsItem {
+        public readonly int $partitions_count;
+
+        public readonly mixed $stream_created_op;
+
+        public readonly int $stream_id;
+
+        public readonly mixed $topic_created_op;
+
+        public readonly int $topic_id;
+
         public function __construct() {}
-
-        /**
-         * @return int
-         */
-        public function partitionsCount(): int {}
-
-        /**
-         * @return mixed
-         */
-        public function streamCreatedOp(): mixed {}
-
-        /**
-         * @return int
-         */
-        public function streamId(): int {}
-
-        /**
-         * @return mixed
-         */
-        public function topicCreatedOp(): mixed {}
-
-        /**
-         * @return int
-         */
-        public function topicId(): int {}
     }
 
     /**
@@ -1411,67 +1246,52 @@ namespace Iggy {
      * A registered session, and a `sessions` current state item.
      */
     class MetadataSession {
-        public function __construct() {}
-
         /**
          * The session's client id as a decimal string.
          *
-         * @return string
+         * @var string
          */
-        public function clientId(): string {}
+        public readonly string $client_id;
 
         /**
          * The session epoch.
          *
-         * @return mixed
+         * @var mixed
          */
-        public function session(): mixed {}
+        public readonly mixed $session;
 
-        /**
-         * @return mixed
-         */
-        public function userCreatedAt(): mixed {}
+        public readonly mixed $user_created_at;
 
-        /**
-         * @return int
-         */
-        public function userId(): int {}
+        public readonly int $user_id;
+
+        public function __construct() {}
     }
 
     /**
      * A closed session.
      */
     class MetadataSessionClosed {
-        public function __construct() {}
-
         /**
          * The session's client id as a decimal string.
          *
-         * @return string
+         * @var string
          */
-        public function clientId(): string {}
+        public readonly string $client_id;
 
-        /**
-         * @return \Iggy\MetadataSessionClosedReason
-         */
-        public function reason(): \Iggy\MetadataSessionClosedReason {}
+        public readonly \Iggy\MetadataSessionClosedReason $reason;
 
         /**
          * The session epoch.
          *
-         * @return mixed
+         * @var mixed
          */
-        public function session(): mixed {}
+        public readonly mixed $session;
 
-        /**
-         * @return mixed
-         */
-        public function userCreatedAt(): mixed {}
+        public readonly mixed $user_created_at;
 
-        /**
-         * @return int
-         */
-        public function userId(): int {}
+        public readonly int $user_id;
+
+        public function __construct() {}
     }
 
     /**
@@ -1480,96 +1300,85 @@ namespace Iggy {
     enum MetadataSessionClosedReason: string {
       case Logout = 'logout';
       case Expired = 'expired';
+    /**
+     * The user was deactivated or deleted.
+     */
+      case Revoked = 'revoked';
     }
 
     /**
      * A stream after a create or update, and a `streams` current state item.
      */
     class MetadataStreamChange {
-        public function __construct() {}
-
         /**
          * Stream creation time in microseconds.
          *
-         * @return mixed
+         * @var mixed
          */
-        public function createdAt(): mixed {}
+        public readonly mixed $created_at;
 
         /**
          * Options the server filled in, including the key source and fingerprints.
          *
-         * @return array|null
+         * @var array|null
          */
-        public function derivedOptions(): ?array {}
+        public readonly ?array $derived_options;
 
-        /**
-         * @return string
-         */
-        public function name(): string {}
+        public readonly string $name;
 
         /**
          * Options the creating client set, as `StreamDetails::$options` returns them, or null
          * when `options_unreadable`. Key material is never returned.
          *
-         * @return array|null
+         * @var array|null
          */
-        public function options(): ?array {}
+        public readonly ?array $options;
 
         /**
          * The server could not read the stream's stored options. Keep the previous values.
          *
-         * @return bool
+         * @var bool
          */
-        public function optionsUnreadable(): bool {}
+        public readonly bool $options_unreadable;
 
         /**
          * The operation that created the stream, which tells it from an earlier stream with
          * the same id.
          *
-         * @return mixed
+         * @var mixed
          */
-        public function streamCreatedOp(): mixed {}
+        public readonly mixed $stream_created_op;
 
         /**
          * Stream id. Ids are reused after a delete.
          *
-         * @return int
+         * @var int
          */
-        public function streamId(): int {}
+        public readonly int $stream_id;
+
+        public function __construct() {}
     }
 
     /**
      * A removed stream.
      */
     class MetadataStreamDeleted {
-        public function __construct() {}
+        public readonly mixed $created_at;
 
-        /**
-         * @return mixed
-         */
-        public function createdAt(): mixed {}
-
-        /**
-         * @return string
-         */
-        public function name(): string {}
+        public readonly string $name;
 
         /**
          * The operation of the delete request when the delete completed later, else null.
          *
-         * @return mixed
+         * @var mixed
          */
-        public function requestedOp(): mixed {}
+        public readonly mixed $requested_op;
 
-        /**
-         * @return mixed
-         */
-        public function streamCreatedOp(): mixed {}
+        public readonly mixed $stream_created_op;
 
-        /**
-         * @return int
-         */
-        public function streamId(): int {}
+        public readonly int $stream_id;
+
+        public function __construct() {}
     }
 
     /**
@@ -1577,56 +1386,35 @@ namespace Iggy {
      * Never the token itself.
      */
     class MetadataTokenChange {
-        public function __construct() {}
-
         /**
          * Expiry in microseconds, null for a token that never expires.
          *
-         * @return mixed
+         * @var mixed
          */
-        public function expiry(): mixed {}
+        public readonly mixed $expiry;
 
-        /**
-         * @return string
-         */
-        public function name(): string {}
+        public readonly string $name;
 
-        /**
-         * @return mixed
-         */
-        public function userCreatedAt(): mixed {}
+        public readonly mixed $user_created_at;
 
-        /**
-         * @return int
-         */
-        public function userId(): int {}
+        public readonly int $user_id;
+
+        public function __construct() {}
     }
 
     /**
      * A removed personal access token.
      */
     class MetadataTokenDeleted {
+        public readonly string $name;
+
+        public readonly \Iggy\MetadataTokenDeletedReason $reason;
+
+        public readonly mixed $user_created_at;
+
+        public readonly int $user_id;
+
         public function __construct() {}
-
-        /**
-         * @return string
-         */
-        public function name(): string {}
-
-        /**
-         * @return \Iggy\MetadataTokenDeletedReason
-         */
-        public function reason(): \Iggy\MetadataTokenDeletedReason {}
-
-        /**
-         * @return mixed
-         */
-        public function userCreatedAt(): mixed {}
-
-        /**
-         * @return int
-         */
-        public function userId(): int {}
     }
 
     /**
@@ -1641,168 +1429,114 @@ namespace Iggy {
      * A topic after a create or update.
      */
     class MetadataTopicChange {
-        public function __construct() {}
-
-        /**
-         * @return mixed
-         */
-        public function createdAt(): mixed {}
+        public readonly mixed $created_at;
 
         /**
          * Options the server filled in from its catalog defaults.
          *
-         * @return array|null
+         * @var array|null
          */
-        public function derivedOptions(): ?array {}
+        public readonly ?array $derived_options;
 
-        /**
-         * @return string
-         */
-        public function name(): string {}
+        public readonly string $name;
 
         /**
          * Options the creating or updating client set, or null when `options_unreadable`.
          *
-         * @return array|null
+         * @var array|null
          */
-        public function options(): ?array {}
+        public readonly ?array $options;
 
         /**
          * The server could not read the topic's stored options. Keep the previous values.
          *
-         * @return bool
+         * @var bool
          */
-        public function optionsUnreadable(): bool {}
+        public readonly bool $options_unreadable;
 
-        /**
-         * @return int
-         */
-        public function partitionsCount(): int {}
+        public readonly int $partitions_count;
 
-        /**
-         * @return mixed
-         */
-        public function streamCreatedOp(): mixed {}
+        public readonly mixed $stream_created_op;
 
-        /**
-         * @return int
-         */
-        public function streamId(): int {}
+        public readonly int $stream_id;
 
         /**
          * The operation that created the topic, which tells it from an earlier topic with the
          * same id.
          *
-         * @return mixed
+         * @var mixed
          */
-        public function topicCreatedOp(): mixed {}
+        public readonly mixed $topic_created_op;
 
-        /**
-         * @return int
-         */
-        public function topicId(): int {}
+        public readonly int $topic_id;
+
+        public function __construct() {}
     }
 
     /**
      * A removed topic.
      */
     class MetadataTopicDeleted {
-        public function __construct() {}
+        public readonly mixed $created_at;
 
-        /**
-         * @return mixed
-         */
-        public function createdAt(): mixed {}
-
-        /**
-         * @return string
-         */
-        public function name(): string {}
+        public readonly string $name;
 
         /**
          * The operation of the delete request when the delete completed later, else null.
          *
-         * @return mixed
+         * @var mixed
          */
-        public function requestedOp(): mixed {}
+        public readonly mixed $requested_op;
 
-        /**
-         * @return mixed
-         */
-        public function streamCreatedOp(): mixed {}
+        public readonly mixed $stream_created_op;
 
-        /**
-         * @return int
-         */
-        public function streamId(): int {}
+        public readonly int $stream_id;
 
-        /**
-         * @return mixed
-         */
-        public function topicCreatedOp(): mixed {}
+        public readonly mixed $topic_created_op;
 
-        /**
-         * @return int
-         */
-        public function topicId(): int {}
+        public readonly int $topic_id;
+
+        public function __construct() {}
     }
 
     /**
      * A `topics` current state item. Partition counts come as `partitions` items.
      */
     class MetadataTopicItem {
-        public function __construct() {}
-
-        /**
-         * @return mixed
-         */
-        public function createdAt(): mixed {}
+        public readonly mixed $created_at;
 
         /**
          * Options the server filled in from its catalog defaults.
          *
-         * @return array|null
+         * @var array|null
          */
-        public function derivedOptions(): ?array {}
+        public readonly ?array $derived_options;
 
-        /**
-         * @return string
-         */
-        public function name(): string {}
+        public readonly string $name;
 
         /**
          * Options the creating or updating client set, or null when `options_unreadable`.
          *
-         * @return array|null
+         * @var array|null
          */
-        public function options(): ?array {}
+        public readonly ?array $options;
 
         /**
          * The server could not read the topic's stored options.
          *
-         * @return bool
+         * @var bool
          */
-        public function optionsUnreadable(): bool {}
+        public readonly bool $options_unreadable;
 
-        /**
-         * @return mixed
-         */
-        public function streamCreatedOp(): mixed {}
+        public readonly mixed $stream_created_op;
 
-        /**
-         * @return int
-         */
-        public function streamId(): int {}
+        public readonly int $stream_id;
 
-        /**
-         * @return mixed
-         */
-        public function topicCreatedOp(): mixed {}
+        public readonly mixed $topic_created_op;
 
-        /**
-         * @return int
-         */
-        public function topicId(): int {}
+        public readonly int $topic_id;
+
+        public function __construct() {}
     }
 
     /**
@@ -1810,168 +1544,144 @@ namespace Iggy {
      * skip a possible state change.
      */
     class MetadataUnknownChange {
-        public function __construct() {}
-
         /**
          * The raw body on binary transports, or the record's whole JSON object over HTTP.
          *
-         * @return string
+         * @var string
          */
-        public function body(): string {}
+        public readonly string $body;
 
         /**
          * The group code on binary transports, or the group name over HTTP.
          *
-         * @return mixed
+         * @var mixed
          */
-        public function group(): mixed {}
+        public readonly mixed $group;
 
         /**
          * The kind code on binary transports, or the kind name over HTTP.
          *
-         * @return mixed
+         * @var mixed
          */
-        public function kind(): mixed {}
+        public readonly mixed $kind;
+
+        public function __construct() {}
     }
 
     /**
      * A current state item of a group this build does not know.
      */
     class MetadataUnknownItem {
-        public function __construct() {}
-
         /**
          * The raw body on binary transports, or the item's whole JSON object over HTTP.
          *
-         * @return string
+         * @var string
          */
-        public function body(): string {}
+        public readonly string $body;
 
         /**
          * The group code on binary transports, or the group name over HTTP.
          *
-         * @return mixed
+         * @var mixed
          */
-        public function group(): mixed {}
+        public readonly mixed $group;
+
+        public function __construct() {}
     }
 
     /**
      * A user after a create or update, and a `users` current state item.
      */
     class MetadataUserChange {
-        public function __construct() {}
-
         /**
          * Options the server filled in.
          *
-         * @return array|null
+         * @var array|null
          */
-        public function derivedOptions(): ?array {}
+        public readonly ?array $derived_options;
 
         /**
          * Options the creating client set, or null when `options_unreadable`.
          *
-         * @return array|null
+         * @var array|null
          */
-        public function options(): ?array {}
+        public readonly ?array $options;
 
         /**
          * The server could not read the user's stored options.
          *
-         * @return bool
+         * @var bool
          */
-        public function optionsUnreadable(): bool {}
+        public readonly bool $options_unreadable;
 
         /**
          * The public permission set in the shape `GET /users/{id}` returns, null when the
          * user has none.
          *
-         * @return array|null
+         * @var array|null
          */
-        public function permissions(): ?array {}
+        public readonly ?array $permissions;
 
         /**
          * `active` or `inactive`.
          *
-         * @return string
+         * @var string
          */
-        public function status(): string {}
+        public readonly string $status;
 
         /**
          * User creation time in microseconds, which tells the user from an earlier user with
          * the same id.
          *
-         * @return mixed
+         * @var mixed
          */
-        public function userCreatedAt(): mixed {}
+        public readonly mixed $user_created_at;
 
         /**
          * User id. Ids are reused after a delete.
          *
-         * @return int
+         * @var int
          */
-        public function userId(): int {}
+        public readonly int $user_id;
 
-        /**
-         * @return string
-         */
-        public function username(): string {}
+        public readonly string $username;
+
+        public function __construct() {}
     }
 
     /**
      * A deleted user, or one whose password changed.
      */
     class MetadataUserIdentity {
+        public readonly mixed $user_created_at;
+
+        public readonly int $user_id;
+
+        public readonly string $username;
+
         public function __construct() {}
-
-        /**
-         * @return mixed
-         */
-        public function userCreatedAt(): mixed {}
-
-        /**
-         * @return int
-         */
-        public function userId(): int {}
-
-        /**
-         * @return string
-         */
-        public function username(): string {}
     }
 
     /**
      * A user's public permission set after a change.
      */
     class MetadataUserPermissionsUpdated {
-        public function __construct() {}
-
         /**
          * The public permission set after the change, null when the user has none.
          *
-         * @return array|null
+         * @var array|null
          */
-        public function permissions(): ?array {}
+        public readonly ?array $permissions;
 
-        /**
-         * @return \Iggy\MetadataPermissionsUpdatedReason
-         */
-        public function reason(): \Iggy\MetadataPermissionsUpdatedReason {}
+        public readonly \Iggy\MetadataPermissionsUpdatedReason $reason;
 
-        /**
-         * @return mixed
-         */
-        public function userCreatedAt(): mixed {}
+        public readonly mixed $user_created_at;
 
-        /**
-         * @return int
-         */
-        public function userId(): int {}
+        public readonly int $user_id;
 
-        /**
-         * @return string
-         */
-        public function username(): string {}
+        public readonly string $username;
+
+        public function __construct() {}
     }
 
     /**

@@ -76,12 +76,12 @@ internal sealed class MetadataChangesConverter : JsonConverter<MetadataChanges>
 
     private static MetadataChangeRecord ReadRecord(JsonElement record)
     {
-        var groupName = Property(record, "group").GetString();
-        var kindName = Property(record, "kind").GetString();
+        var groupName = Text(record, "group");
+        var kindName = Text(record, "kind");
         MetadataChangeKind? kind = null;
         MetadataChangeBody body;
-        if (MetadataChangeGroups.TryParseGroup(groupName, out var group)
-            && MetadataChangeGroups.TryParseKind(kindName, out var knownKind))
+        if (SnakeCaseNames<MetadataChangeGroup>.TryParse(groupName, out var group)
+            && SnakeCaseNames<MetadataChangeKind>.TryParse(kindName, out var knownKind))
         {
             if (MetadataChangeGroups.Of(knownKind) != group)
             {
@@ -93,7 +93,7 @@ internal sealed class MetadataChangesConverter : JsonConverter<MetadataChanges>
         }
         else
         {
-            body = new MetadataUnknownJsonBody { Group = groupName ?? string.Empty, Kind = kindName, Json = record.GetRawText() };
+            body = new MetadataUnknownJsonBody { Group = groupName, Kind = kindName, Json = record.GetRawText() };
         }
 
         return new MetadataChangeRecord
@@ -110,12 +110,12 @@ internal sealed class MetadataChangesConverter : JsonConverter<MetadataChanges>
 
     private static MetadataCurrentItem ReadItem(JsonElement item)
     {
-        var groupName = Property(item, "group").GetString();
-        if (!MetadataChangeGroups.TryParseGroup(groupName, out var group))
+        var groupName = Text(item, "group");
+        if (!SnakeCaseNames<MetadataChangeGroup>.TryParse(groupName, out var group))
         {
             return new MetadataCurrentItem
             {
-                Body = new MetadataUnknownJsonBody { Group = groupName ?? string.Empty, Json = item.GetRawText() }
+                Body = new MetadataUnknownJsonBody { Group = groupName, Json = item.GetRawText() }
             };
         }
 
@@ -437,7 +437,7 @@ internal sealed class MetadataChangesConverter : JsonConverter<MetadataChanges>
     private static T Name<T>(JsonElement body, string name) where T : struct, Enum
     {
         var text = Text(body, name);
-        return SnakeCaseNames<T>.Values.TryGetValue(text, out var value)
+        return SnakeCaseNames<T>.TryParse(text, out var value)
             ? value
             : throw new JsonException($"Metadata changes {name} {text} is unknown.");
     }
@@ -495,11 +495,5 @@ internal sealed class MetadataChangesConverter : JsonConverter<MetadataChanges>
         return body.TryGetProperty(name, out var value)
             ? value
             : throw new JsonException($"Metadata changes {name} is missing.");
-    }
-
-    private static class SnakeCaseNames<T> where T : struct, Enum
-    {
-        internal static readonly Dictionary<string, T> Values =
-            Enum.GetValues<T>().ToDictionary(value => JsonNamingPolicy.SnakeCaseLower.ConvertName(value.ToString()));
     }
 }

@@ -41,9 +41,11 @@ import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.TreeMap;
+import java.util.function.Function;
+import java.util.function.ToIntFunction;
 
 import static org.apache.iggy.MetadataChangesFixture.assertAnswer;
 import static org.apache.iggy.MetadataChangesFixture.assertItem;
@@ -123,15 +125,29 @@ class MetadataChangesTest {
                     .isEqualTo(entry.getValue().get("group").asString());
         });
         assertThat(constants.get("kinds").size()).isEqualTo(MetadataChangeKind.values().length);
-        assertThat(codes(MetadataChangeStatus.values())).isEqualTo(codes(constants.get("statuses")));
-        assertThat(codes(MetadataChangePhase.values())).isEqualTo(codes(constants.get("phases")));
-        assertThat(codes(MetadataChangeBody.MemberLeftReason.values()))
+        assertThat(codes(MetadataChangeStatus.values(), MetadataChangeStatus::value, MetadataChangeStatus::asCode))
+                .isEqualTo(codes(constants.get("statuses")));
+        assertThat(codes(MetadataChangePhase.values(), MetadataChangePhase::value, MetadataChangePhase::asCode))
+                .isEqualTo(codes(constants.get("phases")));
+        assertThat(codes(
+                        MetadataChangeBody.MemberLeftReason.values(),
+                        MetadataChangeBody.MemberLeftReason::value,
+                        MetadataChangeBody.MemberLeftReason::asCode))
                 .isEqualTo(codes(constants.get("member_left_reasons")));
-        assertThat(codes(MetadataChangeBody.TokenDeletedReason.values()))
+        assertThat(codes(
+                        MetadataChangeBody.TokenDeletedReason.values(),
+                        MetadataChangeBody.TokenDeletedReason::value,
+                        MetadataChangeBody.TokenDeletedReason::asCode))
                 .isEqualTo(codes(constants.get("token_deleted_reasons")));
-        assertThat(codes(MetadataChangeBody.SessionClosedReason.values()))
+        assertThat(codes(
+                        MetadataChangeBody.SessionClosedReason.values(),
+                        MetadataChangeBody.SessionClosedReason::value,
+                        MetadataChangeBody.SessionClosedReason::asCode))
                 .isEqualTo(codes(constants.get("session_closed_reasons")));
-        assertThat(codes(MetadataChangeBody.PermissionsUpdatedReason.values()))
+        assertThat(codes(
+                        MetadataChangeBody.PermissionsUpdatedReason.values(),
+                        MetadataChangeBody.PermissionsUpdatedReason::value,
+                        MetadataChangeBody.PermissionsUpdatedReason::asCode))
                 .isEqualTo(codes(constants.get("permissions_updated_reasons")));
         Map<String, Integer> startModes = Map.of(
                 "earliest", MetadataChangeStart.earliest().asCode(),
@@ -345,6 +361,20 @@ class MetadataChangesTest {
     }
 
     @Test
+    void givenUnknownBodiesWithEqualBytesWhenComparingShouldBeEqualAndKeepTheirOwnCopy() {
+        byte[] raw = {1, 2, 3};
+        var unknown = new MetadataChangeBody.Unknown(9, Optional.of(1), raw);
+        var same = new MetadataChangeBody.Unknown(9, Optional.of(1), new byte[] {1, 2, 3});
+
+        raw[0] = 7;
+        unknown.body()[1] = 7;
+
+        assertThat(unknown).isEqualTo(same).hasSameHashCodeAs(same);
+        assertThat(unknown.body()).containsExactly(1, 2, 3);
+        assertThat(unknown).isNotEqualTo(new MetadataChangeBody.Unknown(9, Optional.empty(), new byte[] {1, 2, 3}));
+    }
+
+    @Test
     void givenGroupsInAnyOrderWhenEncodingShouldKeepBinaryOrderAndSortTheHttpNames() {
         var query = MetadataChangesQuery.builder()
                 .groups(MetadataChangeGroup.USERS, MetadataChangeGroup.STREAMS, MetadataChangeGroup.USERS)
@@ -363,10 +393,10 @@ class MetadataChangesTest {
                         refusal -> assertThat(refusal.getErrorCode()).isEqualTo(IggyErrorCode.INVALID_COMMAND));
     }
 
-    private static Map<String, Integer> codes(Enum<?>[] values) {
+    private static <T> Map<String, Integer> codes(T[] values, Function<T, String> name, ToIntFunction<T> code) {
         Map<String, Integer> codes = new TreeMap<>();
-        for (Enum<?> value : values) {
-            codes.put(value.name().toLowerCase(Locale.ROOT), value.ordinal());
+        for (T value : values) {
+            codes.put(name.apply(value), code.applyAsInt(value));
         }
         return codes;
     }

@@ -60,12 +60,12 @@ pub(crate) struct MetadataChangesArgs {
     pub(crate) groups: Vec<MetadataChangeGroup>,
 
     /// Oldest prepare timestamp to include, in microseconds since the epoch
-    #[arg(long)]
-    pub(crate) since: Option<u64>,
+    #[arg(long, value_parser = parse_micros)]
+    pub(crate) since: Option<IggyTimestamp>,
 
     /// Newest prepare timestamp to include, in microseconds since the epoch
-    #[arg(long)]
-    pub(crate) until: Option<u64>,
+    #[arg(long, value_parser = parse_micros)]
+    pub(crate) until: Option<IggyTimestamp>,
 
     /// Records or items per page, 1 to 1000
     #[arg(short, long, default_value_t = 100)]
@@ -101,9 +101,17 @@ impl From<&MetadataChangesArgs> for MetadataChangesQuery {
         Self {
             start,
             groups: args.groups.clone(),
-            since: args.since.map(IggyTimestamp::from),
-            until: args.until.map(IggyTimestamp::from),
+            since: args.since,
+            until: args.until,
             limit: args.limit,
         }
     }
+}
+
+fn parse_micros(raw: &str) -> Result<IggyTimestamp, String> {
+    let micros: u64 = raw
+        .parse()
+        .map_err(|error| format!("expected microseconds since the epoch, got {raw}: {error}"))?;
+    IggyTimestamp::checked_from_micros(micros)
+        .ok_or_else(|| format!("{micros} microseconds is past what this platform's clock holds"))
 }

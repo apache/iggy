@@ -3090,6 +3090,10 @@ class MetadataSessionClosedReason:
 
     Logout: typing.ClassVar[MetadataSessionClosedReason]
     Expired: typing.ClassVar[MetadataSessionClosedReason]
+    Revoked: typing.ClassVar[MetadataSessionClosedReason]
+    r"""
+    The user was deactivated or deleted.
+    """
     def __str__(self) -> builtins.str: ...
 
 @typing.final

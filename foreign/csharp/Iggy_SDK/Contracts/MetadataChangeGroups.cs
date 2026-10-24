@@ -15,23 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using System.Text.Json;
 using Apache.Iggy.Enums;
 
 namespace Apache.Iggy.Contracts;
 
 /// <summary>
-///     Group and kind codes, names and the parent rules of a current state scan.
+///     Group and kind codes and the parent rules of a current state scan.
 /// </summary>
 internal static class MetadataChangeGroups
 {
     internal const byte ALL = byte.MaxValue;
-
-    private static readonly Dictionary<string, MetadataChangeGroup> GroupsByName =
-        Enum.GetValues<MetadataChangeGroup>().ToDictionary(Name);
-
-    private static readonly Dictionary<string, MetadataChangeKind> KindsByName =
-        Enum.GetValues<MetadataChangeKind>().ToDictionary(Name);
 
     internal static bool IsDefined(MetadataChangeGroup group)
     {
@@ -119,25 +112,5 @@ internal static class MetadataChangeGroups
     internal static bool MissesParent(byte mask)
     {
         return FromMask(mask).Any(group => Parents(group).Any(parent => (mask & Bit(parent)) == 0));
-    }
-
-    internal static string Name(MetadataChangeGroup group)
-    {
-        return JsonNamingPolicy.SnakeCaseLower.ConvertName(group.ToString());
-    }
-
-    internal static string Name(MetadataChangeKind kind)
-    {
-        return JsonNamingPolicy.SnakeCaseLower.ConvertName(kind.ToString());
-    }
-
-    internal static bool TryParseGroup(string? name, out MetadataChangeGroup group)
-    {
-        return GroupsByName.TryGetValue(name ?? string.Empty, out group);
-    }
-
-    internal static bool TryParseKind(string? name, out MetadataChangeKind kind)
-    {
-        return KindsByName.TryGetValue(name ?? string.Empty, out kind);
     }
 }

@@ -873,13 +873,24 @@ fn given_revocation_of_clients_in_overlapping_groups_when_permuting_slots_should
         )
     };
 
-    let first = registered_in_order([CLIENT_A, CLIENT_B]);
-    let second = registered_in_order([CLIENT_B, CLIENT_A]);
+    let first = decoded(&registered_in_order([CLIENT_A, CLIENT_B]));
+    let second = decoded(&registered_in_order([CLIENT_B, CLIENT_A]));
 
-    assert_eq!(first, second);
-    let records = decoded(&first);
-    assert!(matches!(records[0], WireMetadataChange::UserDeleted(_)));
-    let removed: Vec<_> = records[1..]
+    // Session epochs follow the registration order, nothing else may.
+    let closed_clients = |records: &[WireMetadataChange]| {
+        records
+            .iter()
+            .filter_map(|record| match record {
+                WireMetadataChange::SessionClosed(body) => Some(body.client_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(closed_clients(&first), [CLIENT_A, CLIENT_B]);
+    assert_eq!(closed_clients(&second), [CLIENT_A, CLIENT_B]);
+    assert_eq!(first[3..], second[3..]);
+    assert!(matches!(first[0], WireMetadataChange::UserDeleted(_)));
+    let removed: Vec<_> = first[3..]
         .iter()
         .map(|record| match record {
             WireMetadataChange::ConsumerGroupMemberLeft(body) => (
@@ -970,7 +981,8 @@ fn given_user_patches_when_applying_should_record_only_changed_values() {
 }
 
 #[test]
-fn given_deactivated_user_with_member_when_applying_should_record_update_then_member_left() {
+fn given_deactivated_user_with_member_when_applying_should_record_update_session_closed_then_member_left()
+ {
     let harness = Harness::with_group(1);
     harness.commit(
         ROOT_CALLER,
@@ -979,6 +991,7 @@ fn given_deactivated_user_with_member_when_applying_should_record_update_then_me
     );
     let session = harness.register(CLIENT_A, ALICE);
     harness.join(CLIENT_A, session);
+    let alice = WireUserKey::from(&harness.user(ALICE));
 
     let committed = harness.commit(
         ROOT_CALLER,
@@ -993,14 +1006,60 @@ fn given_deactivated_user_with_member_when_applying_should_record_update_then_me
     );
 
     let records = decoded(&committed);
-    assert_eq!(records.len(), 2);
+    assert_eq!(records.len(), 3);
     assert!(matches!(&records[0], WireMetadataChange::UserUpdated(body)
         if body.status == UserStatus::Inactive.as_code()));
+    assert_eq!(
+        records[1],
+        WireMetadataChange::SessionClosed(WireSessionClosedBody {
+            user: alice,
+            client_id: CLIENT_A,
+            session,
+            reason: WireSessionClosedReason::Revoked,
+        })
+    );
     assert!(
-        matches!(&records[1], WireMetadataChange::ConsumerGroupMemberLeft(body)
+        matches!(&records[2], WireMetadataChange::ConsumerGroupMemberLeft(body)
         if body.client_id == CLIENT_A && body.reason == WireMemberLeftReason::SessionEnded)
     );
-    assert_eq!(actors(&committed), [Some(ROOT), Some(ROOT)]);
+    assert_eq!(actors(&committed), [Some(ROOT), Some(ROOT), Some(ROOT)]);
+}
+
+#[test]
+fn given_deleted_user_with_sessions_when_applying_should_close_each_session_in_client_order() {
+    let harness = Harness::new();
+    harness.commit(
+        ROOT_CALLER,
+        Operation::CreateUser,
+        &create_user("alice", None),
+    );
+    let second = harness.register(CLIENT_B, ALICE);
+    let first = harness.register(CLIENT_A, ALICE);
+    let alice = WireUserKey::from(&harness.user(ALICE));
+
+    let committed = harness.commit(
+        ROOT_CALLER,
+        Operation::DeleteUser,
+        &DeleteUserRequest {
+            user_id: WireIdentifier::numeric(ALICE),
+        },
+    );
+
+    let closed = |client_id, session| {
+        WireMetadataChange::SessionClosed(WireSessionClosedBody {
+            user: alice,
+            client_id,
+            session,
+            reason: WireSessionClosedReason::Revoked,
+        })
+    };
+    let records = decoded(&committed);
+    assert!(matches!(&records[0], WireMetadataChange::UserDeleted(_)));
+    assert_eq!(
+        records[1..],
+        [closed(CLIENT_A, first), closed(CLIENT_B, second)]
+    );
+    assert_eq!(actors(&committed), [Some(ROOT); 3]);
 }
 
 #[test]

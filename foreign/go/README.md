@@ -173,7 +173,7 @@ Current pages need the parent groups of every selected group, for example `Metad
 
 Record and item bodies are typed by kind and group, for example `*iggcon.MetadataStreamChange` or `*iggcon.MetadataUserPermissionsUpdated`. A group or kind newer than this build arrives as `*iggcon.MetadataUnknownBody` with its raw codes on the record, so a mirror that cannot apply it can stop without advancing its cursor.
 
-A query that breaks the request rules, such as a limit outside 1 to 1000 or a time bound with a latest or current start, is refused with `ierror.ErrInvalidCommand` before anything is sent. Cursors and page tokens print and parse as the `mc1_` and `cs1_` text forms the HTTP API and the CLI use.
+A query that breaks the request rules, such as a limit outside 1 to 1000 or a time bound with a latest or current start, is refused with `ierror.ErrInvalidCommand` before anything is sent. Cursors and page tokens print and parse as the `mc1_` and `cs1_` text forms the HTTP API and the CLI use. Page tokens also implement `encoding.TextMarshaler` and `encoding.TextUnmarshaler`, so `encoding/json` stores them as their `cs1_` text.
 
 ## Delivery semantics
 

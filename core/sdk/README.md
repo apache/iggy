@@ -291,9 +291,11 @@ async fn rebuild(
     client: &IggyClient,
     groups: &[MetadataChangeGroup],
 ) -> Result<MetadataChangeStart, IggyError> {
+    let mut scan_groups = groups.to_vec();
+    scan_groups.extend(groups.iter().flat_map(|group| group.parents()));
     let mut query = MetadataChangesQuery {
         start: MetadataChangeStart::Current(None),
-        groups: groups.to_vec(),
+        groups: scan_groups,
         ..MetadataChangesQuery::default()
     };
     loop {
@@ -323,7 +325,7 @@ async fn rebuild(
 
 `Expired` means the log no longer holds the history after the cursor, and `Reset` means the cursor belongs to another history, for example after the data directory was rebuilt. Either way the mirror rebuilds from current state pages and then follows the changes after the anchor they return.
 
-Current pages need the parent groups of every selected group, for example `topics` with `streams`. Keep a rebuilt state private until a change page answers `Ok` with `has_more == false` and a `head_op` at or above the last current page's.
+Current pages need the parent groups of every selected group, for example `topics` with `streams`, so `rebuild` adds them through `MetadataChangeGroup::parents()`. Keep a rebuilt state private until a change page answers `Ok` with `has_more == false` and a `head_op` at or above the last current page's.
 
 ## Versioning
 

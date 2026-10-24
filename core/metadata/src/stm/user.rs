@@ -387,13 +387,7 @@ impl Users {
             tracing::error!(?deleted, %error, "remove_grants dispatched to reader-only Users STM");
             return Vec::new();
         }
-        self.read(|users| {
-            users
-                .last_result
-                .as_ref()
-                .map(|reply| reply.changes.clone())
-                .unwrap_or_default()
-        })
+        self.last_changes()
     }
 
     /// Insert a root fixture into an empty user set for tests and the simulator.
@@ -711,7 +705,7 @@ impl StateHandler for UpdateUserResolvedRequest {
             .into_iter()
             .collect();
         ApplyReply {
-            revoked_user: (user.status != UserStatus::Active).then_some(user_id as UserId),
+            revoked_user: (user.status != UserStatus::Active).then(|| WireUserKey::from(&*user)),
             changes,
             ..ApplyReply::ok(Bytes::new())
         }
@@ -736,7 +730,9 @@ impl StateHandler for DeleteUserRequest {
         }
 
         let mut changes = Vec::new();
+        let mut revoked_user = None;
         if let Some(user) = state.items.get(user_id) {
+            revoked_user = Some(WireUserKey::from(user));
             let username = user.username.clone();
             changes.extend(WireName::new(username.as_ref()).ok().map(|wire_name| {
                 AppliedChange::new(
@@ -755,7 +751,7 @@ impl StateHandler for DeleteUserRequest {
                 .delete_permissions_for_user(user_id as UserId);
         }
         ApplyReply {
-            revoked_user: Some(user_id as UserId),
+            revoked_user,
             changes,
             ..ApplyReply::ok(Bytes::new())
         }
@@ -2321,7 +2317,10 @@ mod tests {
             IggyTimestamp::now(),
         );
         assert_eq!(deactivate.code, 0);
-        assert_eq!(deactivate.revoked_user, Some(alice_id));
+        assert_eq!(
+            deactivate.revoked_user.map(|user| user.user_id),
+            Some(alice_id)
+        );
         assert_eq!(
             users.items.get(alice_id as usize).map(|user| user.status),
             Some(UserStatus::Inactive)

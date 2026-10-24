@@ -289,20 +289,20 @@ public sealed class MetadataChangesTests
         Assert.Equal(Enum.GetValues<MetadataChangeGroup>().Length, groups.Count);
         foreach (var entry in groups)
         {
-            Assert.True(MetadataChangeGroups.TryParseGroup(entry.Name, out var group), entry.Name);
+            Assert.True(SnakeCaseNames<MetadataChangeGroup>.TryParse(entry.Name, out var group), entry.Name);
             Assert.Equal(entry.Value.GetProperty("code").GetInt32(), (int)group);
             Assert.Equal(entry.Value.GetProperty("parents").EnumerateArray().Select(parent => parent.GetString()!),
-                MetadataChangeGroups.Parents(group).Select(parent => MetadataChangeGroups.Name(parent)));
+                MetadataChangeGroups.Parents(group).Select(SnakeCaseNames<MetadataChangeGroup>.Name));
         }
 
         var kinds = constants.GetProperty("kinds").EnumerateObject().ToList();
         Assert.Equal(Enum.GetValues<MetadataChangeKind>().Length, kinds.Count);
         foreach (var entry in kinds)
         {
-            Assert.True(MetadataChangeGroups.TryParseKind(entry.Name, out var kind), entry.Name);
+            Assert.True(SnakeCaseNames<MetadataChangeKind>.TryParse(entry.Name, out var kind), entry.Name);
             Assert.Equal(entry.Value.GetProperty("code").GetInt32(), (int)kind);
             Assert.Equal(entry.Value.GetProperty("group").GetString(),
-                MetadataChangeGroups.Name(MetadataChangeGroups.Of(kind)));
+                SnakeCaseNames<MetadataChangeGroup>.Name(MetadataChangeGroups.Of(kind)));
         }
 
         AssertCodes<MetadataChangeStatus>(constants.GetProperty("statuses"));
@@ -379,7 +379,7 @@ public sealed class MetadataChangesTests
         Assert.Equal(vector.GetProperty("required_head").GetUInt64(), token.RequiredHead);
         Assert.Equal(vector.GetProperty("groups_mask").GetInt32(), token.GroupsMask);
         Assert.Equal(MetadataChangeGroups.FromMask(token.GroupsMask), token.Groups);
-        Assert.Equal(vector.GetProperty("group").GetString(), MetadataChangeGroups.Name(token.LastGroup));
+        Assert.Equal(vector.GetProperty("group").GetString(), SnakeCaseNames<MetadataChangeGroup>.Name(token.LastGroup));
         Assert.Equal(Hex(vector, "last_key_hex"), token.LastKey.ToArray());
         Assert.Equal(Hex(vector, "hex"), token.Payload.ToArray());
         Assert.Equal(text, token.ToString());
@@ -443,7 +443,7 @@ public sealed class MetadataChangesTests
         {
             Start = start,
             Groups = input.GetProperty("groups").EnumerateArray()
-                .Select(name => MetadataChangeGroups.TryParseGroup(name.GetString(), out var group)
+                .Select(name => SnakeCaseNames<MetadataChangeGroup>.TryParse(name.GetString()!, out var group)
                     ? group
                     : throw new InvalidOperationException($"Unknown group {name}."))
                 .ToArray(),
@@ -522,8 +522,8 @@ public sealed class MetadataChangesTests
             return node;
         }
 
-        node["group"] = MetadataChangeGroups.Name(record.Group!.Value);
-        node["kind"] = MetadataChangeGroups.Name(record.Kind!.Value);
+        node["group"] = SnakeCaseNames<MetadataChangeGroup>.Name(record.Group!.Value);
+        node["kind"] = SnakeCaseNames<MetadataChangeKind>.Name(record.Kind!.Value);
         RenderBody(node, record.Body);
         return node;
     }
@@ -542,7 +542,7 @@ public sealed class MetadataChangesTests
                 };
         }
 
-        var node = new JsonObject { ["group"] = MetadataChangeGroups.Name(item.Group!.Value) };
+        var node = new JsonObject { ["group"] = SnakeCaseNames<MetadataChangeGroup>.Name(item.Group!.Value) };
         RenderBody(node, item.Body);
         return node;
     }

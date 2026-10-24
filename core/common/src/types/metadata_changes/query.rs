@@ -220,8 +220,9 @@ fn parse_micros(value: &str) -> Result<IggyTimestamp, IggyError> {
     }
     value
         .parse::<u64>()
-        .map(IggyTimestamp::from)
-        .map_err(|_| IggyError::InvalidCommand)
+        .ok()
+        .and_then(IggyTimestamp::checked_from_micros)
+        .ok_or(IggyError::InvalidCommand)
 }
 
 #[cfg(test)]

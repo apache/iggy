@@ -21,6 +21,7 @@ use ext_php_rs::{
     binary::Binary,
     boxed::ZBox,
     convert::{IntoZval, StubLiteral},
+    enum_::RegisteredEnum,
     error::Result as ConversionResult,
     exception::PhpResult,
     flags::DataType,
@@ -35,17 +36,35 @@ use iggy::prelude::{
     MetadataChangeRecord as RustMetadataChangeRecord,
     MetadataChangeStart as RustMetadataChangeStart,
     MetadataChangeStatus as RustMetadataChangeStatus, MetadataChanges as RustMetadataChanges,
+    MetadataConsumerGroupCreated as RustMetadataConsumerGroupCreated,
+    MetadataConsumerGroupDeleted as RustMetadataConsumerGroupDeleted,
+    MetadataConsumerGroupItem as RustMetadataConsumerGroupItem,
     MetadataCurrentItem as RustMetadataCurrentItem,
     MetadataCurrentPageToken as RustMetadataCurrentPageToken,
+    MetadataMemberItem as RustMetadataMemberItem, MetadataMemberJoined as RustMetadataMemberJoined,
+    MetadataMemberLeft as RustMetadataMemberLeft,
     MetadataMemberLeftReason as RustMetadataMemberLeftReason, MetadataOptions,
+    MetadataPartitionHandedOver as RustMetadataPartitionHandedOver,
+    MetadataPartitionsChanged as RustMetadataPartitionsChanged,
+    MetadataPartitionsItem as RustMetadataPartitionsItem,
     MetadataPermissionsUpdatedReason as RustMetadataPermissionsUpdatedReason,
+    MetadataSession as RustMetadataSession, MetadataSessionClosed as RustMetadataSessionClosed,
     MetadataSessionClosedReason as RustMetadataSessionClosedReason,
-    MetadataTokenDeletedReason as RustMetadataTokenDeletedReason, Permissions, ResourceOptions,
-    StreamPermissions, UserStatus,
+    MetadataStreamChange as RustMetadataStreamChange,
+    MetadataStreamDeleted as RustMetadataStreamDeleted,
+    MetadataTokenChange as RustMetadataTokenChange,
+    MetadataTokenDeleted as RustMetadataTokenDeleted,
+    MetadataTokenDeletedReason as RustMetadataTokenDeletedReason,
+    MetadataTopicChange as RustMetadataTopicChange,
+    MetadataTopicDeleted as RustMetadataTopicDeleted, MetadataTopicItem as RustMetadataTopicItem,
+    MetadataUserChange as RustMetadataUserChange, MetadataUserIdentity as RustMetadataUserIdentity,
+    MetadataUserPermissionsUpdated as RustMetadataUserPermissionsUpdated, Permissions,
+    StreamPermissions,
 };
 use iggy_binary_protocol::WireDecode;
 use iggy_binary_protocol::responses::system::GetMetadataChangesResponse;
 
+use crate::client::unsigned_argument;
 use crate::error::to_php_exception;
 use crate::options::options_array;
 
@@ -237,6 +256,9 @@ pub enum MetadataSessionClosedReason {
     Logout,
     #[php(value = "expired")]
     Expired,
+    /// The user was deactivated or deleted.
+    #[php(value = "revoked")]
+    Revoked,
 }
 
 /// Why a user's public permission set changed.
@@ -254,214 +276,119 @@ pub enum MetadataPermissionsUpdatedReason {
 #[php_class]
 #[php(name = "Iggy\\MetadataStreamChange")]
 pub struct MetadataStreamChange {
-    stream_id: u32,
-    stream_created_op: u64,
-    created_at: u64,
-    name: String,
-    options: Option<ResourceOptions>,
+    inner: RustMetadataStreamChange,
 }
 
 /// A removed stream.
 #[php_class]
 #[php(name = "Iggy\\MetadataStreamDeleted")]
 pub struct MetadataStreamDeleted {
-    stream_id: u32,
-    stream_created_op: u64,
-    created_at: u64,
-    name: String,
-    requested_op: Option<u64>,
+    inner: RustMetadataStreamDeleted,
 }
 
 /// A topic after a create or update.
 #[php_class]
 #[php(name = "Iggy\\MetadataTopicChange")]
 pub struct MetadataTopicChange {
-    stream_id: u32,
-    stream_created_op: u64,
-    topic_id: u32,
-    topic_created_op: u64,
-    created_at: u64,
-    name: String,
-    partitions_count: u32,
-    options: Option<ResourceOptions>,
+    inner: RustMetadataTopicChange,
 }
 
 /// A `topics` current state item. Partition counts come as `partitions` items.
 #[php_class]
 #[php(name = "Iggy\\MetadataTopicItem")]
 pub struct MetadataTopicItem {
-    stream_id: u32,
-    stream_created_op: u64,
-    topic_id: u32,
-    topic_created_op: u64,
-    created_at: u64,
-    name: String,
-    options: Option<ResourceOptions>,
+    inner: RustMetadataTopicItem,
 }
 
 /// A removed topic.
 #[php_class]
 #[php(name = "Iggy\\MetadataTopicDeleted")]
 pub struct MetadataTopicDeleted {
-    stream_id: u32,
-    stream_created_op: u64,
-    topic_id: u32,
-    topic_created_op: u64,
-    created_at: u64,
-    name: String,
-    requested_op: Option<u64>,
+    inner: RustMetadataTopicDeleted,
 }
 
 /// A partition count change.
 #[php_class]
 #[php(name = "Iggy\\MetadataPartitionsChanged")]
 pub struct MetadataPartitionsChanged {
-    stream_id: u32,
-    stream_created_op: u64,
-    topic_id: u32,
-    topic_created_op: u64,
-    partitions_count: u32,
-    removed_partition_ids: Vec<u32>,
-    requested_op: Option<u64>,
+    inner: RustMetadataPartitionsChanged,
 }
 
 /// A `partitions` current state item.
 #[php_class]
 #[php(name = "Iggy\\MetadataPartitionsItem")]
 pub struct MetadataPartitionsItem {
-    stream_id: u32,
-    stream_created_op: u64,
-    topic_id: u32,
-    topic_created_op: u64,
-    partitions_count: u32,
+    inner: RustMetadataPartitionsItem,
 }
 
 /// A created consumer group with the topic's resulting group count.
 #[php_class]
 #[php(name = "Iggy\\MetadataConsumerGroupCreated")]
 pub struct MetadataConsumerGroupCreated {
-    stream_id: u32,
-    stream_created_op: u64,
-    topic_id: u32,
-    topic_created_op: u64,
-    group_id: u32,
-    name: String,
-    consumer_groups_count: u32,
+    inner: RustMetadataConsumerGroupCreated,
 }
 
 /// A removed consumer group with the topic's resulting group count.
 #[php_class]
 #[php(name = "Iggy\\MetadataConsumerGroupDeleted")]
 pub struct MetadataConsumerGroupDeleted {
-    stream_id: u32,
-    stream_created_op: u64,
-    topic_id: u32,
-    topic_created_op: u64,
-    group_id: u32,
-    name: String,
-    consumer_groups_count: u32,
-    requested_op: Option<u64>,
+    inner: RustMetadataConsumerGroupDeleted,
 }
 
 /// A `consumer_groups` current state item.
 #[php_class]
 #[php(name = "Iggy\\MetadataConsumerGroupItem")]
 pub struct MetadataConsumerGroupItem {
-    stream_id: u32,
-    stream_created_op: u64,
-    topic_id: u32,
-    topic_created_op: u64,
-    group_id: u32,
-    name: String,
+    inner: RustMetadataConsumerGroupItem,
 }
 
 /// A member that joined a consumer group.
 #[php_class]
 #[php(name = "Iggy\\MetadataMemberJoined")]
 pub struct MetadataMemberJoined {
-    stream_id: u32,
-    stream_created_op: u64,
-    topic_id: u32,
-    topic_created_op: u64,
-    group_id: u32,
-    member_id: u32,
-    client_id: u128,
-    members_count: u32,
-    partition_ids: Vec<u32>,
+    inner: RustMetadataMemberJoined,
 }
 
 /// A member that left a consumer group.
 #[php_class]
 #[php(name = "Iggy\\MetadataMemberLeft")]
 pub struct MetadataMemberLeft {
-    stream_id: u32,
-    stream_created_op: u64,
-    topic_id: u32,
-    topic_created_op: u64,
-    group_id: u32,
-    member_id: u32,
-    client_id: u128,
-    members_count: u32,
-    reason: MetadataMemberLeftReason,
+    inner: RustMetadataMemberLeft,
 }
 
 /// A completed partition handover.
 #[php_class]
 #[php(name = "Iggy\\MetadataPartitionHandedOver")]
 pub struct MetadataPartitionHandedOver {
-    stream_id: u32,
-    stream_created_op: u64,
-    topic_id: u32,
-    topic_created_op: u64,
-    group_id: u32,
-    partition_id: u32,
-    member_id: Option<u32>,
+    inner: RustMetadataPartitionHandedOver,
 }
 
 /// A `consumer_group_members` current state item.
 #[php_class]
 #[php(name = "Iggy\\MetadataMemberItem")]
 pub struct MetadataMemberItem {
-    stream_id: u32,
-    stream_created_op: u64,
-    topic_id: u32,
-    topic_created_op: u64,
-    group_id: u32,
-    member_id: u32,
-    client_id: u128,
-    partition_ids: Vec<u32>,
+    inner: RustMetadataMemberItem,
 }
 
 /// A user after a create or update, and a `users` current state item.
 #[php_class]
 #[php(name = "Iggy\\MetadataUserChange")]
 pub struct MetadataUserChange {
-    user_id: u32,
-    user_created_at: u64,
-    username: String,
-    status: UserStatus,
-    permissions: Option<Permissions>,
-    options: Option<ResourceOptions>,
+    inner: RustMetadataUserChange,
 }
 
 /// A deleted user, or one whose password changed.
 #[php_class]
 #[php(name = "Iggy\\MetadataUserIdentity")]
 pub struct MetadataUserIdentity {
-    user_id: u32,
-    user_created_at: u64,
-    username: String,
+    inner: RustMetadataUserIdentity,
 }
 
 /// A user's public permission set after a change.
 #[php_class]
 #[php(name = "Iggy\\MetadataUserPermissionsUpdated")]
 pub struct MetadataUserPermissionsUpdated {
-    user_id: u32,
-    user_created_at: u64,
-    username: String,
-    permissions: Option<Permissions>,
-    reason: MetadataPermissionsUpdatedReason,
+    inner: RustMetadataUserPermissionsUpdated,
 }
 
 /// A created personal access token, and a `personal_access_tokens` current state item.
@@ -469,41 +396,28 @@ pub struct MetadataUserPermissionsUpdated {
 #[php_class]
 #[php(name = "Iggy\\MetadataTokenChange")]
 pub struct MetadataTokenChange {
-    user_id: u32,
-    user_created_at: u64,
-    name: String,
-    expiry: Option<u64>,
+    inner: RustMetadataTokenChange,
 }
 
 /// A removed personal access token.
 #[php_class]
 #[php(name = "Iggy\\MetadataTokenDeleted")]
 pub struct MetadataTokenDeleted {
-    user_id: u32,
-    user_created_at: u64,
-    name: String,
-    reason: MetadataTokenDeletedReason,
+    inner: RustMetadataTokenDeleted,
 }
 
 /// A registered session, and a `sessions` current state item.
 #[php_class]
 #[php(name = "Iggy\\MetadataSession")]
 pub struct MetadataSession {
-    user_id: u32,
-    user_created_at: u64,
-    client_id: u128,
-    session: u64,
+    inner: RustMetadataSession,
 }
 
 /// A closed session.
 #[php_class]
 #[php(name = "Iggy\\MetadataSessionClosed")]
 pub struct MetadataSessionClosed {
-    user_id: u32,
-    user_created_at: u64,
-    client_id: u128,
-    session: u64,
-    reason: MetadataSessionClosedReason,
+    inner: RustMetadataSessionClosed,
 }
 
 /// A record of a group or kind this build does not know. A mirror stops on it rather than
@@ -547,48 +461,57 @@ impl MetadataChanges {
             .map_err(|_| to_php_exception(IggyError::InvalidJsonResponse))
     }
 
+    #[php(getter)]
     pub fn status(&self) -> MetadataChangeStatus {
         self.inner.status.into()
     }
 
     /// `Changes` for `earliest`, `latest` and `after`, `Current` for state pages.
+    #[php(getter)]
     pub fn phase(&self) -> MetadataChangePhase {
         self.inner.phase.into()
     }
 
     /// This node's log id as a decimal string, null before it applied op 1.
+    #[php(getter, change_case = "snake_case")]
     pub fn log_id(&self) -> Option<String> {
         self.inner.log_id.map(|log_id| log_id.to_string())
     }
 
     /// Lowest whole operation from which the requested groups are complete.
+    #[php(getter, change_case = "snake_case")]
     pub fn oldest_op(&self) -> PhpResult<Zval> {
         unsigned(self.inner.oldest_op)
     }
 
     /// The requested groups are complete for every timestamp above this value in
     /// microseconds, 0 when nothing was evicted.
+    #[php(getter, change_case = "snake_case")]
     pub fn retained_since(&self) -> PhpResult<Zval> {
         unsigned(self.inner.retained_since)
     }
 
     /// Highest metadata operation the answering node applied.
+    #[php(getter, change_case = "snake_case")]
     pub fn head_op(&self) -> PhpResult<Zval> {
         unsigned(self.inner.head_op)
     }
 
     /// The cursor to send back. Present on `Ok`, echoed on `Behind`, null on `Expired` and
     /// `Reset`. The last state page returns the anchor to follow from.
+    #[php(getter)]
     pub fn next(&self) -> Option<MetadataChangeCursor> {
         self.inner.next.map(|inner| MetadataChangeCursor { inner })
     }
 
     /// More entries remain after `next`, or another state page exists.
+    #[php(getter, change_case = "snake_case")]
     pub fn has_more(&self) -> bool {
         self.inner.has_more
     }
 
     /// Change records in `(op, ordinal)` order, empty on state pages.
+    #[php(getter)]
     pub fn records(&self) -> Vec<MetadataChangeRecord> {
         self.inner
             .records
@@ -600,6 +523,7 @@ impl MetadataChanges {
     }
 
     /// Current state items, empty on change pages.
+    #[php(getter)]
     pub fn items(&self) -> Vec<MetadataCurrentItem> {
         self.inner
             .items
@@ -611,6 +535,7 @@ impl MetadataChanges {
     }
 
     /// Continuation of a current state scan, null once it is complete.
+    #[php(getter, change_case = "snake_case")]
     pub fn current_page_token(&self) -> Option<MetadataCurrentPageToken> {
         self.inner
             .current_page_token
@@ -622,42 +547,50 @@ impl MetadataChanges {
 #[php_impl]
 impl MetadataChangeRecord {
     /// The metadata operation that produced the record.
+    #[php(getter)]
     pub fn op(&self) -> PhpResult<Zval> {
         unsigned(self.inner.op)
     }
 
     /// Position of the record within `op`.
+    #[php(getter)]
     pub fn ordinal(&self) -> u32 {
         self.inner.ordinal
     }
 
     /// Prepare checksum of `op` as a decimal string.
+    #[php(getter)]
     pub fn checksum(&self) -> String {
         self.inner.checksum.to_string()
     }
 
     /// Prepare timestamp of `op` in microseconds.
+    #[php(getter)]
     pub fn timestamp(&self) -> PhpResult<Zval> {
         unsigned(self.inner.timestamp)
     }
 
     /// The acting user, null for server actions.
+    #[php(getter, change_case = "snake_case")]
     pub fn actor_user_id(&self) -> Option<u32> {
         self.inner.actor_user_id
     }
 
     /// The group, null for a record this build does not know.
+    #[php(getter)]
     pub fn group(&self) -> Option<MetadataChangeGroup> {
         self.inner.change.group().map(Into::into)
     }
 
     /// The kind, null for a record this build does not know.
+    #[php(getter)]
     pub fn kind(&self) -> Option<MetadataChangeKind> {
         self.inner.change.kind().map(Into::into)
     }
 
     /// The typed body `kind` names, for example a `MetadataStreamChange` for
     /// `StreamCreated` and `StreamUpdated`, or a `MetadataUnknownChange`.
+    #[php(getter)]
     pub fn change(&self) -> PhpResult<Zval> {
         change_body(&self.inner.change)
     }
@@ -666,11 +599,13 @@ impl MetadataChangeRecord {
 #[php_impl]
 impl MetadataCurrentItem {
     /// The group, null for an item this build does not know.
+    #[php(getter)]
     pub fn group(&self) -> Option<MetadataChangeGroup> {
         self.inner.group().map(Into::into)
     }
 
     /// The typed body `group` names, or a `MetadataUnknownItem`.
+    #[php(getter)]
     pub fn body(&self) -> PhpResult<Zval> {
         item_body(&self.inner)
     }
@@ -706,21 +641,25 @@ impl MetadataChangeCursor {
 
     /// Prepare checksum of op 1 as a decimal string, which names the history the cursor
     /// belongs to.
+    #[php(getter, change_case = "snake_case")]
     pub fn log_id(&self) -> String {
         self.inner.log_id.to_string()
     }
 
     /// The operation of the last record, 0 before the first record.
+    #[php(getter)]
     pub fn op(&self) -> PhpResult<Zval> {
         unsigned(self.inner.op)
     }
 
     /// Prepare checksum of `op` as a decimal string.
+    #[php(getter)]
     pub fn checksum(&self) -> String {
         self.inner.checksum.to_string()
     }
 
     /// Position of the record within `op`.
+    #[php(getter)]
     pub fn ordinal(&self) -> u32 {
         self.inner.ordinal
     }
@@ -741,6 +680,7 @@ impl MetadataCurrentPageToken {
     }
 
     /// The cursor captured before the scan's first page.
+    #[php(getter)]
     pub fn anchor(&self) -> MetadataChangeCursor {
         MetadataChangeCursor {
             inner: self.inner.anchor(),
@@ -748,21 +688,25 @@ impl MetadataCurrentPageToken {
     }
 
     /// The highest head any page of the scan reported so far.
+    #[php(getter, change_case = "snake_case")]
     pub fn required_head(&self) -> PhpResult<Zval> {
         unsigned(self.inner.required_head())
     }
 
     /// The groups the scan was started with, in code order.
+    #[php(getter)]
     pub fn groups(&self) -> Vec<MetadataChangeGroup> {
         self.inner.groups().iter().map(Into::into).collect()
     }
 
     /// The group of the last item returned.
+    #[php(getter, change_case = "snake_case")]
     pub fn last_group(&self) -> MetadataChangeGroup {
         self.inner.last_group().into()
     }
 
     /// The key of the last item returned, in the page token key layout.
+    #[php(getter, change_case = "snake_case")]
     pub fn last_key(&self) -> Binary<u8> {
         Binary::new(self.inner.last_key().to_vec())
     }
@@ -806,662 +750,808 @@ impl MetadataChangeStart {
 #[php_impl]
 impl MetadataStreamChange {
     /// Stream id. Ids are reused after a delete.
+    #[php(getter, change_case = "snake_case")]
     pub fn stream_id(&self) -> u32 {
-        self.stream_id
+        self.inner.stream_id
     }
 
     /// The operation that created the stream, which tells it from an earlier stream with
     /// the same id.
+    #[php(getter, change_case = "snake_case")]
     pub fn stream_created_op(&self) -> PhpResult<Zval> {
-        unsigned(self.stream_created_op)
+        unsigned(self.inner.stream_created_op)
     }
 
     /// Stream creation time in microseconds.
+    #[php(getter, change_case = "snake_case")]
     pub fn created_at(&self) -> PhpResult<Zval> {
-        unsigned(self.created_at)
+        unsigned(self.inner.created_at)
     }
 
+    #[php(getter)]
     pub fn name(&self) -> String {
-        self.name.clone()
+        self.inner.name.clone()
     }
 
     /// Options the creating client set, as `StreamDetails::$options` returns them, or null
     /// when `options_unreadable`. Key material is never returned.
+    #[php(getter)]
     pub fn options(&self) -> PhpResult<Option<ZBox<ZendHashTable>>> {
-        options_view(self.options.as_ref(), true)
+        options_view(&self.inner.options, true)
     }
 
     /// Options the server filled in, including the key source and fingerprints.
+    #[php(getter, change_case = "snake_case")]
     pub fn derived_options(&self) -> PhpResult<Option<ZBox<ZendHashTable>>> {
-        options_view(self.options.as_ref(), false)
+        options_view(&self.inner.options, false)
     }
 
     /// The server could not read the stream's stored options. Keep the previous values.
+    #[php(getter, change_case = "snake_case")]
     pub fn options_unreadable(&self) -> bool {
-        self.options.is_none()
+        matches!(self.inner.options, MetadataOptions::Unreadable)
     }
 }
 
 #[php_impl]
 impl MetadataStreamDeleted {
+    #[php(getter, change_case = "snake_case")]
     pub fn stream_id(&self) -> u32 {
-        self.stream_id
+        self.inner.stream_id
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn stream_created_op(&self) -> PhpResult<Zval> {
-        unsigned(self.stream_created_op)
+        unsigned(self.inner.stream_created_op)
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn created_at(&self) -> PhpResult<Zval> {
-        unsigned(self.created_at)
+        unsigned(self.inner.created_at)
     }
 
+    #[php(getter)]
     pub fn name(&self) -> String {
-        self.name.clone()
+        self.inner.name.clone()
     }
 
     /// The operation of the delete request when the delete completed later, else null.
+    #[php(getter, change_case = "snake_case")]
     pub fn requested_op(&self) -> PhpResult<Zval> {
-        optional_unsigned(self.requested_op)
+        optional_unsigned(self.inner.requested_op)
     }
 }
 
 #[php_impl]
 impl MetadataTopicChange {
+    #[php(getter, change_case = "snake_case")]
     pub fn stream_id(&self) -> u32 {
-        self.stream_id
+        self.inner.stream_id
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn stream_created_op(&self) -> PhpResult<Zval> {
-        unsigned(self.stream_created_op)
+        unsigned(self.inner.stream_created_op)
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn topic_id(&self) -> u32 {
-        self.topic_id
+        self.inner.topic_id
     }
 
     /// The operation that created the topic, which tells it from an earlier topic with the
     /// same id.
+    #[php(getter, change_case = "snake_case")]
     pub fn topic_created_op(&self) -> PhpResult<Zval> {
-        unsigned(self.topic_created_op)
+        unsigned(self.inner.topic_created_op)
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn created_at(&self) -> PhpResult<Zval> {
-        unsigned(self.created_at)
+        unsigned(self.inner.created_at)
     }
 
+    #[php(getter)]
     pub fn name(&self) -> String {
-        self.name.clone()
+        self.inner.name.clone()
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn partitions_count(&self) -> u32 {
-        self.partitions_count
+        self.inner.partitions_count
     }
 
     /// Options the creating or updating client set, or null when `options_unreadable`.
+    #[php(getter)]
     pub fn options(&self) -> PhpResult<Option<ZBox<ZendHashTable>>> {
-        options_view(self.options.as_ref(), true)
+        options_view(&self.inner.options, true)
     }
 
     /// Options the server filled in from its catalog defaults.
+    #[php(getter, change_case = "snake_case")]
     pub fn derived_options(&self) -> PhpResult<Option<ZBox<ZendHashTable>>> {
-        options_view(self.options.as_ref(), false)
+        options_view(&self.inner.options, false)
     }
 
     /// The server could not read the topic's stored options. Keep the previous values.
+    #[php(getter, change_case = "snake_case")]
     pub fn options_unreadable(&self) -> bool {
-        self.options.is_none()
+        matches!(self.inner.options, MetadataOptions::Unreadable)
     }
 }
 
 #[php_impl]
 impl MetadataTopicItem {
+    #[php(getter, change_case = "snake_case")]
     pub fn stream_id(&self) -> u32 {
-        self.stream_id
+        self.inner.stream_id
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn stream_created_op(&self) -> PhpResult<Zval> {
-        unsigned(self.stream_created_op)
+        unsigned(self.inner.stream_created_op)
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn topic_id(&self) -> u32 {
-        self.topic_id
+        self.inner.topic_id
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn topic_created_op(&self) -> PhpResult<Zval> {
-        unsigned(self.topic_created_op)
+        unsigned(self.inner.topic_created_op)
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn created_at(&self) -> PhpResult<Zval> {
-        unsigned(self.created_at)
+        unsigned(self.inner.created_at)
     }
 
+    #[php(getter)]
     pub fn name(&self) -> String {
-        self.name.clone()
+        self.inner.name.clone()
     }
 
     /// Options the creating or updating client set, or null when `options_unreadable`.
+    #[php(getter)]
     pub fn options(&self) -> PhpResult<Option<ZBox<ZendHashTable>>> {
-        options_view(self.options.as_ref(), true)
+        options_view(&self.inner.options, true)
     }
 
     /// Options the server filled in from its catalog defaults.
+    #[php(getter, change_case = "snake_case")]
     pub fn derived_options(&self) -> PhpResult<Option<ZBox<ZendHashTable>>> {
-        options_view(self.options.as_ref(), false)
+        options_view(&self.inner.options, false)
     }
 
     /// The server could not read the topic's stored options.
+    #[php(getter, change_case = "snake_case")]
     pub fn options_unreadable(&self) -> bool {
-        self.options.is_none()
+        matches!(self.inner.options, MetadataOptions::Unreadable)
     }
 }
 
 #[php_impl]
 impl MetadataTopicDeleted {
+    #[php(getter, change_case = "snake_case")]
     pub fn stream_id(&self) -> u32 {
-        self.stream_id
+        self.inner.stream_id
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn stream_created_op(&self) -> PhpResult<Zval> {
-        unsigned(self.stream_created_op)
+        unsigned(self.inner.stream_created_op)
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn topic_id(&self) -> u32 {
-        self.topic_id
+        self.inner.topic_id
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn topic_created_op(&self) -> PhpResult<Zval> {
-        unsigned(self.topic_created_op)
+        unsigned(self.inner.topic_created_op)
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn created_at(&self) -> PhpResult<Zval> {
-        unsigned(self.created_at)
+        unsigned(self.inner.created_at)
     }
 
+    #[php(getter)]
     pub fn name(&self) -> String {
-        self.name.clone()
+        self.inner.name.clone()
     }
 
     /// The operation of the delete request when the delete completed later, else null.
+    #[php(getter, change_case = "snake_case")]
     pub fn requested_op(&self) -> PhpResult<Zval> {
-        optional_unsigned(self.requested_op)
+        optional_unsigned(self.inner.requested_op)
     }
 }
 
 #[php_impl]
 impl MetadataPartitionsChanged {
+    #[php(getter, change_case = "snake_case")]
     pub fn stream_id(&self) -> u32 {
-        self.stream_id
+        self.inner.stream_id
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn stream_created_op(&self) -> PhpResult<Zval> {
-        unsigned(self.stream_created_op)
+        unsigned(self.inner.stream_created_op)
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn topic_id(&self) -> u32 {
-        self.topic_id
+        self.inner.topic_id
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn topic_created_op(&self) -> PhpResult<Zval> {
-        unsigned(self.topic_created_op)
+        unsigned(self.inner.topic_created_op)
     }
 
     /// The partition count after the change.
+    #[php(getter, change_case = "snake_case")]
     pub fn partitions_count(&self) -> u32 {
-        self.partitions_count
+        self.inner.partitions_count
     }
 
     /// The deleted partition ids, ascending, empty on create.
+    #[php(getter, change_case = "snake_case")]
     pub fn removed_partition_ids(&self) -> Vec<u32> {
-        self.removed_partition_ids.clone()
+        self.inner.removed_partition_ids.clone()
     }
 
     /// The operation of the delete request when the delete completed later, else null.
+    #[php(getter, change_case = "snake_case")]
     pub fn requested_op(&self) -> PhpResult<Zval> {
-        optional_unsigned(self.requested_op)
+        optional_unsigned(self.inner.requested_op)
     }
 }
 
 #[php_impl]
 impl MetadataPartitionsItem {
+    #[php(getter, change_case = "snake_case")]
     pub fn stream_id(&self) -> u32 {
-        self.stream_id
+        self.inner.stream_id
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn stream_created_op(&self) -> PhpResult<Zval> {
-        unsigned(self.stream_created_op)
+        unsigned(self.inner.stream_created_op)
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn topic_id(&self) -> u32 {
-        self.topic_id
+        self.inner.topic_id
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn topic_created_op(&self) -> PhpResult<Zval> {
-        unsigned(self.topic_created_op)
+        unsigned(self.inner.topic_created_op)
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn partitions_count(&self) -> u32 {
-        self.partitions_count
+        self.inner.partitions_count
     }
 }
 
 #[php_impl]
 impl MetadataConsumerGroupCreated {
+    #[php(getter, change_case = "snake_case")]
     pub fn stream_id(&self) -> u32 {
-        self.stream_id
+        self.inner.stream_id
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn stream_created_op(&self) -> PhpResult<Zval> {
-        unsigned(self.stream_created_op)
+        unsigned(self.inner.stream_created_op)
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn topic_id(&self) -> u32 {
-        self.topic_id
+        self.inner.topic_id
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn topic_created_op(&self) -> PhpResult<Zval> {
-        unsigned(self.topic_created_op)
+        unsigned(self.inner.topic_created_op)
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn group_id(&self) -> u32 {
-        self.group_id
+        self.inner.group_id
     }
 
+    #[php(getter)]
     pub fn name(&self) -> String {
-        self.name.clone()
+        self.inner.name.clone()
     }
 
     /// The topic's consumer group count after the change.
+    #[php(getter, change_case = "snake_case")]
     pub fn consumer_groups_count(&self) -> u32 {
-        self.consumer_groups_count
+        self.inner.consumer_groups_count
     }
 }
 
 #[php_impl]
 impl MetadataConsumerGroupDeleted {
+    #[php(getter, change_case = "snake_case")]
     pub fn stream_id(&self) -> u32 {
-        self.stream_id
+        self.inner.stream_id
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn stream_created_op(&self) -> PhpResult<Zval> {
-        unsigned(self.stream_created_op)
+        unsigned(self.inner.stream_created_op)
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn topic_id(&self) -> u32 {
-        self.topic_id
+        self.inner.topic_id
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn topic_created_op(&self) -> PhpResult<Zval> {
-        unsigned(self.topic_created_op)
+        unsigned(self.inner.topic_created_op)
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn group_id(&self) -> u32 {
-        self.group_id
+        self.inner.group_id
     }
 
+    #[php(getter)]
     pub fn name(&self) -> String {
-        self.name.clone()
+        self.inner.name.clone()
     }
 
     /// The topic's consumer group count after the change.
+    #[php(getter, change_case = "snake_case")]
     pub fn consumer_groups_count(&self) -> u32 {
-        self.consumer_groups_count
+        self.inner.consumer_groups_count
     }
 
     /// The operation of the delete request when the delete completed later, else null.
+    #[php(getter, change_case = "snake_case")]
     pub fn requested_op(&self) -> PhpResult<Zval> {
-        optional_unsigned(self.requested_op)
+        optional_unsigned(self.inner.requested_op)
     }
 }
 
 #[php_impl]
 impl MetadataConsumerGroupItem {
+    #[php(getter, change_case = "snake_case")]
     pub fn stream_id(&self) -> u32 {
-        self.stream_id
+        self.inner.stream_id
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn stream_created_op(&self) -> PhpResult<Zval> {
-        unsigned(self.stream_created_op)
+        unsigned(self.inner.stream_created_op)
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn topic_id(&self) -> u32 {
-        self.topic_id
+        self.inner.topic_id
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn topic_created_op(&self) -> PhpResult<Zval> {
-        unsigned(self.topic_created_op)
+        unsigned(self.inner.topic_created_op)
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn group_id(&self) -> u32 {
-        self.group_id
+        self.inner.group_id
     }
 
+    #[php(getter)]
     pub fn name(&self) -> String {
-        self.name.clone()
+        self.inner.name.clone()
     }
 }
 
 #[php_impl]
 impl MetadataMemberJoined {
+    #[php(getter, change_case = "snake_case")]
     pub fn stream_id(&self) -> u32 {
-        self.stream_id
+        self.inner.stream_id
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn stream_created_op(&self) -> PhpResult<Zval> {
-        unsigned(self.stream_created_op)
+        unsigned(self.inner.stream_created_op)
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn topic_id(&self) -> u32 {
-        self.topic_id
+        self.inner.topic_id
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn topic_created_op(&self) -> PhpResult<Zval> {
-        unsigned(self.topic_created_op)
+        unsigned(self.inner.topic_created_op)
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn group_id(&self) -> u32 {
-        self.group_id
+        self.inner.group_id
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn member_id(&self) -> u32 {
-        self.member_id
+        self.inner.member_id
     }
 
     /// The member's client id as a decimal string.
+    #[php(getter, change_case = "snake_case")]
     pub fn client_id(&self) -> String {
-        self.client_id.to_string()
+        self.inner.client_id.to_string()
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn members_count(&self) -> u32 {
-        self.members_count
+        self.inner.members_count
     }
 
     /// Installed partitions, normally none because a handover installs them.
+    #[php(getter, change_case = "snake_case")]
     pub fn partition_ids(&self) -> Vec<u32> {
-        self.partition_ids.clone()
+        self.inner.partition_ids.clone()
     }
 }
 
 #[php_impl]
 impl MetadataMemberLeft {
+    #[php(getter, change_case = "snake_case")]
     pub fn stream_id(&self) -> u32 {
-        self.stream_id
+        self.inner.stream_id
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn stream_created_op(&self) -> PhpResult<Zval> {
-        unsigned(self.stream_created_op)
+        unsigned(self.inner.stream_created_op)
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn topic_id(&self) -> u32 {
-        self.topic_id
+        self.inner.topic_id
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn topic_created_op(&self) -> PhpResult<Zval> {
-        unsigned(self.topic_created_op)
+        unsigned(self.inner.topic_created_op)
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn group_id(&self) -> u32 {
-        self.group_id
+        self.inner.group_id
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn member_id(&self) -> u32 {
-        self.member_id
+        self.inner.member_id
     }
 
     /// The member's client id as a decimal string.
+    #[php(getter, change_case = "snake_case")]
     pub fn client_id(&self) -> String {
-        self.client_id.to_string()
+        self.inner.client_id.to_string()
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn members_count(&self) -> u32 {
-        self.members_count
+        self.inner.members_count
     }
 
+    #[php(getter)]
     pub fn reason(&self) -> MetadataMemberLeftReason {
-        self.reason
+        self.inner.reason.into()
     }
 }
 
 #[php_impl]
 impl MetadataPartitionHandedOver {
+    #[php(getter, change_case = "snake_case")]
     pub fn stream_id(&self) -> u32 {
-        self.stream_id
+        self.inner.stream_id
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn stream_created_op(&self) -> PhpResult<Zval> {
-        unsigned(self.stream_created_op)
+        unsigned(self.inner.stream_created_op)
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn topic_id(&self) -> u32 {
-        self.topic_id
+        self.inner.topic_id
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn topic_created_op(&self) -> PhpResult<Zval> {
-        unsigned(self.topic_created_op)
+        unsigned(self.inner.topic_created_op)
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn group_id(&self) -> u32 {
-        self.group_id
+        self.inner.group_id
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn partition_id(&self) -> u32 {
-        self.partition_id
+        self.inner.partition_id
     }
 
     /// The new owner, null when the last member left.
+    #[php(getter, change_case = "snake_case")]
     pub fn member_id(&self) -> Option<u32> {
-        self.member_id
+        self.inner.member_id
     }
 }
 
 #[php_impl]
 impl MetadataMemberItem {
+    #[php(getter, change_case = "snake_case")]
     pub fn stream_id(&self) -> u32 {
-        self.stream_id
+        self.inner.stream_id
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn stream_created_op(&self) -> PhpResult<Zval> {
-        unsigned(self.stream_created_op)
+        unsigned(self.inner.stream_created_op)
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn topic_id(&self) -> u32 {
-        self.topic_id
+        self.inner.topic_id
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn topic_created_op(&self) -> PhpResult<Zval> {
-        unsigned(self.topic_created_op)
+        unsigned(self.inner.topic_created_op)
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn group_id(&self) -> u32 {
-        self.group_id
+        self.inner.group_id
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn member_id(&self) -> u32 {
-        self.member_id
+        self.inner.member_id
     }
 
     /// The member's client id as a decimal string.
+    #[php(getter, change_case = "snake_case")]
     pub fn client_id(&self) -> String {
-        self.client_id.to_string()
+        self.inner.client_id.to_string()
     }
 
     /// Installed partitions, ascending.
+    #[php(getter, change_case = "snake_case")]
     pub fn partition_ids(&self) -> Vec<u32> {
-        self.partition_ids.clone()
+        self.inner.partition_ids.clone()
     }
 }
 
 #[php_impl]
 impl MetadataUserChange {
     /// User id. Ids are reused after a delete.
+    #[php(getter, change_case = "snake_case")]
     pub fn user_id(&self) -> u32 {
-        self.user_id
+        self.inner.user_id
     }
 
     /// User creation time in microseconds, which tells the user from an earlier user with
     /// the same id.
+    #[php(getter, change_case = "snake_case")]
     pub fn user_created_at(&self) -> PhpResult<Zval> {
-        unsigned(self.user_created_at)
+        unsigned(self.inner.user_created_at)
     }
 
+    #[php(getter)]
     pub fn username(&self) -> String {
-        self.username.clone()
+        self.inner.username.clone()
     }
 
     /// `active` or `inactive`.
+    #[php(getter)]
     pub fn status(&self) -> String {
-        self.status.to_string()
+        self.inner.status.to_string()
     }
 
     /// The public permission set in the shape `GET /users/{id}` returns, null when the
     /// user has none.
+    #[php(getter)]
     pub fn permissions(&self) -> PhpResult<Option<ZBox<ZendHashTable>>> {
-        self.permissions.as_ref().map(permissions_array).transpose()
+        self.inner
+            .permissions
+            .as_ref()
+            .map(permissions_array)
+            .transpose()
     }
 
     /// Options the creating client set, or null when `options_unreadable`.
+    #[php(getter)]
     pub fn options(&self) -> PhpResult<Option<ZBox<ZendHashTable>>> {
-        options_view(self.options.as_ref(), true)
+        options_view(&self.inner.options, true)
     }
 
     /// Options the server filled in.
+    #[php(getter, change_case = "snake_case")]
     pub fn derived_options(&self) -> PhpResult<Option<ZBox<ZendHashTable>>> {
-        options_view(self.options.as_ref(), false)
+        options_view(&self.inner.options, false)
     }
 
     /// The server could not read the user's stored options.
+    #[php(getter, change_case = "snake_case")]
     pub fn options_unreadable(&self) -> bool {
-        self.options.is_none()
+        matches!(self.inner.options, MetadataOptions::Unreadable)
     }
 }
 
 #[php_impl]
 impl MetadataUserIdentity {
+    #[php(getter, change_case = "snake_case")]
     pub fn user_id(&self) -> u32 {
-        self.user_id
+        self.inner.user_id
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn user_created_at(&self) -> PhpResult<Zval> {
-        unsigned(self.user_created_at)
+        unsigned(self.inner.user_created_at)
     }
 
+    #[php(getter)]
     pub fn username(&self) -> String {
-        self.username.clone()
+        self.inner.username.clone()
     }
 }
 
 #[php_impl]
 impl MetadataUserPermissionsUpdated {
+    #[php(getter, change_case = "snake_case")]
     pub fn user_id(&self) -> u32 {
-        self.user_id
+        self.inner.user_id
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn user_created_at(&self) -> PhpResult<Zval> {
-        unsigned(self.user_created_at)
+        unsigned(self.inner.user_created_at)
     }
 
+    #[php(getter)]
     pub fn username(&self) -> String {
-        self.username.clone()
+        self.inner.username.clone()
     }
 
     /// The public permission set after the change, null when the user has none.
+    #[php(getter)]
     pub fn permissions(&self) -> PhpResult<Option<ZBox<ZendHashTable>>> {
-        self.permissions.as_ref().map(permissions_array).transpose()
+        self.inner
+            .permissions
+            .as_ref()
+            .map(permissions_array)
+            .transpose()
     }
 
+    #[php(getter)]
     pub fn reason(&self) -> MetadataPermissionsUpdatedReason {
-        self.reason
+        self.inner.reason.into()
     }
 }
 
 #[php_impl]
 impl MetadataTokenChange {
+    #[php(getter, change_case = "snake_case")]
     pub fn user_id(&self) -> u32 {
-        self.user_id
+        self.inner.user_id
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn user_created_at(&self) -> PhpResult<Zval> {
-        unsigned(self.user_created_at)
+        unsigned(self.inner.user_created_at)
     }
 
+    #[php(getter)]
     pub fn name(&self) -> String {
-        self.name.clone()
+        self.inner.name.clone()
     }
 
     /// Expiry in microseconds, null for a token that never expires.
+    #[php(getter)]
     pub fn expiry(&self) -> PhpResult<Zval> {
-        optional_unsigned(self.expiry)
+        optional_unsigned(self.inner.expiry)
     }
 }
 
 #[php_impl]
 impl MetadataTokenDeleted {
+    #[php(getter, change_case = "snake_case")]
     pub fn user_id(&self) -> u32 {
-        self.user_id
+        self.inner.user_id
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn user_created_at(&self) -> PhpResult<Zval> {
-        unsigned(self.user_created_at)
+        unsigned(self.inner.user_created_at)
     }
 
+    #[php(getter)]
     pub fn name(&self) -> String {
-        self.name.clone()
+        self.inner.name.clone()
     }
 
+    #[php(getter)]
     pub fn reason(&self) -> MetadataTokenDeletedReason {
-        self.reason
+        self.inner.reason.into()
     }
 }
 
 #[php_impl]
 impl MetadataSession {
+    #[php(getter, change_case = "snake_case")]
     pub fn user_id(&self) -> u32 {
-        self.user_id
+        self.inner.user_id
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn user_created_at(&self) -> PhpResult<Zval> {
-        unsigned(self.user_created_at)
+        unsigned(self.inner.user_created_at)
     }
 
     /// The session's client id as a decimal string.
+    #[php(getter, change_case = "snake_case")]
     pub fn client_id(&self) -> String {
-        self.client_id.to_string()
+        self.inner.client_id.to_string()
     }
 
     /// The session epoch.
+    #[php(getter)]
     pub fn session(&self) -> PhpResult<Zval> {
-        unsigned(self.session)
+        unsigned(self.inner.session)
     }
 }
 
 #[php_impl]
 impl MetadataSessionClosed {
+    #[php(getter, change_case = "snake_case")]
     pub fn user_id(&self) -> u32 {
-        self.user_id
+        self.inner.user_id
     }
 
+    #[php(getter, change_case = "snake_case")]
     pub fn user_created_at(&self) -> PhpResult<Zval> {
-        unsigned(self.user_created_at)
+        unsigned(self.inner.user_created_at)
     }
 
     /// The session's client id as a decimal string.
+    #[php(getter, change_case = "snake_case")]
     pub fn client_id(&self) -> String {
-        self.client_id.to_string()
+        self.inner.client_id.to_string()
     }
 
     /// The session epoch.
+    #[php(getter)]
     pub fn session(&self) -> PhpResult<Zval> {
-        unsigned(self.session)
+        unsigned(self.inner.session)
     }
 
+    #[php(getter)]
     pub fn reason(&self) -> MetadataSessionClosedReason {
-        self.reason
+        self.inner.reason.into()
     }
 }
 
 #[php_impl]
 impl MetadataUnknownChange {
     /// The group code on binary transports, or the group name over HTTP.
+    #[php(getter)]
     pub fn group(&self) -> PhpResult<Zval> {
         self.group
             .clone()
@@ -1470,11 +1560,13 @@ impl MetadataUnknownChange {
     }
 
     /// The kind code on binary transports, or the kind name over HTTP.
+    #[php(getter)]
     pub fn kind(&self) -> PhpResult<Zval> {
         self.kind.clone().into_zval(false).map_err(to_php_exception)
     }
 
     /// The raw body on binary transports, or the record's whole JSON object over HTTP.
+    #[php(getter)]
     pub fn body(&self) -> Binary<u8> {
         Binary::new(self.body.clone())
     }
@@ -1483,6 +1575,7 @@ impl MetadataUnknownChange {
 #[php_impl]
 impl MetadataUnknownItem {
     /// The group code on binary transports, or the group name over HTTP.
+    #[php(getter)]
     pub fn group(&self) -> PhpResult<Zval> {
         self.group
             .clone()
@@ -1491,6 +1584,7 @@ impl MetadataUnknownItem {
     }
 
     /// The raw body on binary transports, or the item's whole JSON object over HTTP.
+    #[php(getter)]
     pub fn body(&self) -> Binary<u8> {
         Binary::new(self.body.clone())
     }
@@ -1505,17 +1599,7 @@ impl From<RustMetadataChanges> for MetadataChanges {
 // Lets a group list default to `[]` in the generated stub.
 impl StubLiteral for MetadataChangeGroup {
     fn stub_literal(&self) -> String {
-        let case = match self {
-            Self::Streams => "Streams",
-            Self::Topics => "Topics",
-            Self::Partitions => "Partitions",
-            Self::ConsumerGroups => "ConsumerGroups",
-            Self::ConsumerGroupMembers => "ConsumerGroupMembers",
-            Self::Users => "Users",
-            Self::PersonalAccessTokens => "PersonalAccessTokens",
-            Self::Sessions => "Sessions",
-        };
-        format!("\\Iggy\\MetadataChangeGroup::{case}")
+        format!("\\Iggy\\MetadataChangeGroup::{}", self.to_name())
     }
 }
 
@@ -1622,6 +1706,7 @@ impl From<RustMetadataSessionClosedReason> for MetadataSessionClosedReason {
         match reason {
             RustMetadataSessionClosedReason::Logout => Self::Logout,
             RustMetadataSessionClosedReason::Expired => Self::Expired,
+            RustMetadataSessionClosedReason::Revoked => Self::Revoked,
         }
     }
 }
@@ -1659,164 +1744,78 @@ fn change_body(change: &RustMetadataChange) -> PhpResult<Zval> {
     let body = match change {
         RustMetadataChange::StreamCreated(body) | RustMetadataChange::StreamUpdated(body) => {
             MetadataStreamChange {
-                stream_id: body.stream_id,
-                stream_created_op: body.stream_created_op,
-                created_at: body.created_at,
-                name: body.name.clone(),
-                options: readable_options(&body.options),
+                inner: body.clone(),
             }
             .into_zval(false)
         }
         RustMetadataChange::StreamDeleted(body) => MetadataStreamDeleted {
-            stream_id: body.stream_id,
-            stream_created_op: body.stream_created_op,
-            created_at: body.created_at,
-            name: body.name.clone(),
-            requested_op: body.requested_op,
+            inner: body.clone(),
         }
         .into_zval(false),
         RustMetadataChange::TopicCreated(body) | RustMetadataChange::TopicUpdated(body) => {
             MetadataTopicChange {
-                stream_id: body.stream_id,
-                stream_created_op: body.stream_created_op,
-                topic_id: body.topic_id,
-                topic_created_op: body.topic_created_op,
-                created_at: body.created_at,
-                name: body.name.clone(),
-                partitions_count: body.partitions_count,
-                options: readable_options(&body.options),
+                inner: body.clone(),
             }
             .into_zval(false)
         }
         RustMetadataChange::TopicDeleted(body) => MetadataTopicDeleted {
-            stream_id: body.stream_id,
-            stream_created_op: body.stream_created_op,
-            topic_id: body.topic_id,
-            topic_created_op: body.topic_created_op,
-            created_at: body.created_at,
-            name: body.name.clone(),
-            requested_op: body.requested_op,
+            inner: body.clone(),
         }
         .into_zval(false),
         RustMetadataChange::PartitionsChanged(body) => MetadataPartitionsChanged {
-            stream_id: body.stream_id,
-            stream_created_op: body.stream_created_op,
-            topic_id: body.topic_id,
-            topic_created_op: body.topic_created_op,
-            partitions_count: body.partitions_count,
-            removed_partition_ids: body.removed_partition_ids.clone(),
-            requested_op: body.requested_op,
+            inner: body.clone(),
         }
         .into_zval(false),
         RustMetadataChange::ConsumerGroupCreated(body) => MetadataConsumerGroupCreated {
-            stream_id: body.stream_id,
-            stream_created_op: body.stream_created_op,
-            topic_id: body.topic_id,
-            topic_created_op: body.topic_created_op,
-            group_id: body.group_id,
-            name: body.name.clone(),
-            consumer_groups_count: body.consumer_groups_count,
+            inner: body.clone(),
         }
         .into_zval(false),
         RustMetadataChange::ConsumerGroupDeleted(body) => MetadataConsumerGroupDeleted {
-            stream_id: body.stream_id,
-            stream_created_op: body.stream_created_op,
-            topic_id: body.topic_id,
-            topic_created_op: body.topic_created_op,
-            group_id: body.group_id,
-            name: body.name.clone(),
-            consumer_groups_count: body.consumer_groups_count,
-            requested_op: body.requested_op,
+            inner: body.clone(),
         }
         .into_zval(false),
         RustMetadataChange::ConsumerGroupMemberJoined(body) => MetadataMemberJoined {
-            stream_id: body.stream_id,
-            stream_created_op: body.stream_created_op,
-            topic_id: body.topic_id,
-            topic_created_op: body.topic_created_op,
-            group_id: body.group_id,
-            member_id: body.member_id,
-            client_id: body.client_id,
-            members_count: body.members_count,
-            partition_ids: body.partition_ids.clone(),
+            inner: body.clone(),
         }
         .into_zval(false),
         RustMetadataChange::ConsumerGroupMemberLeft(body) => MetadataMemberLeft {
-            stream_id: body.stream_id,
-            stream_created_op: body.stream_created_op,
-            topic_id: body.topic_id,
-            topic_created_op: body.topic_created_op,
-            group_id: body.group_id,
-            member_id: body.member_id,
-            client_id: body.client_id,
-            members_count: body.members_count,
-            reason: body.reason.into(),
+            inner: body.clone(),
         }
         .into_zval(false),
         RustMetadataChange::ConsumerGroupPartitionHandedOver(body) => MetadataPartitionHandedOver {
-            stream_id: body.stream_id,
-            stream_created_op: body.stream_created_op,
-            topic_id: body.topic_id,
-            topic_created_op: body.topic_created_op,
-            group_id: body.group_id,
-            partition_id: body.partition_id,
-            member_id: body.member_id,
+            inner: body.clone(),
         }
         .into_zval(false),
         RustMetadataChange::UserCreated(body) | RustMetadataChange::UserUpdated(body) => {
             MetadataUserChange {
-                user_id: body.user_id,
-                user_created_at: body.user_created_at,
-                username: body.username.clone(),
-                status: body.status,
-                permissions: body.permissions.clone(),
-                options: readable_options(&body.options),
+                inner: body.clone(),
             }
             .into_zval(false)
         }
         RustMetadataChange::UserDeleted(body) | RustMetadataChange::UserPasswordChanged(body) => {
             MetadataUserIdentity {
-                user_id: body.user_id,
-                user_created_at: body.user_created_at,
-                username: body.username.clone(),
+                inner: body.clone(),
             }
             .into_zval(false)
         }
         RustMetadataChange::UserPermissionsUpdated(body) => MetadataUserPermissionsUpdated {
-            user_id: body.user_id,
-            user_created_at: body.user_created_at,
-            username: body.username.clone(),
-            permissions: body.permissions.clone(),
-            reason: body.reason.into(),
+            inner: body.clone(),
         }
         .into_zval(false),
         RustMetadataChange::PersonalAccessTokenCreated(body) => MetadataTokenChange {
-            user_id: body.user_id,
-            user_created_at: body.user_created_at,
-            name: body.name.clone(),
-            expiry: body.expiry,
+            inner: body.clone(),
         }
         .into_zval(false),
         RustMetadataChange::PersonalAccessTokenDeleted(body) => MetadataTokenDeleted {
-            user_id: body.user_id,
-            user_created_at: body.user_created_at,
-            name: body.name.clone(),
-            reason: body.reason.into(),
+            inner: body.clone(),
         }
         .into_zval(false),
         RustMetadataChange::SessionRegistered(body) => MetadataSession {
-            user_id: body.user_id,
-            user_created_at: body.user_created_at,
-            client_id: body.client_id,
-            session: body.session,
+            inner: body.clone(),
         }
         .into_zval(false),
         RustMetadataChange::SessionClosed(body) => MetadataSessionClosed {
-            user_id: body.user_id,
-            user_created_at: body.user_created_at,
-            client_id: body.client_id,
-            session: body.session,
-            reason: body.reason.into(),
+            inner: body.clone(),
         }
         .into_zval(false),
         RustMetadataChange::Unknown { group, kind, body } => MetadataUnknownChange {
@@ -1838,72 +1837,35 @@ fn change_body(change: &RustMetadataChange) -> PhpResult<Zval> {
 fn item_body(item: &RustMetadataCurrentItem) -> PhpResult<Zval> {
     let body = match item {
         RustMetadataCurrentItem::Stream(body) => MetadataStreamChange {
-            stream_id: body.stream_id,
-            stream_created_op: body.stream_created_op,
-            created_at: body.created_at,
-            name: body.name.clone(),
-            options: readable_options(&body.options),
+            inner: body.clone(),
         }
         .into_zval(false),
         RustMetadataCurrentItem::Topic(body) => MetadataTopicItem {
-            stream_id: body.stream_id,
-            stream_created_op: body.stream_created_op,
-            topic_id: body.topic_id,
-            topic_created_op: body.topic_created_op,
-            created_at: body.created_at,
-            name: body.name.clone(),
-            options: readable_options(&body.options),
+            inner: body.clone(),
         }
         .into_zval(false),
         RustMetadataCurrentItem::Partitions(body) => MetadataPartitionsItem {
-            stream_id: body.stream_id,
-            stream_created_op: body.stream_created_op,
-            topic_id: body.topic_id,
-            topic_created_op: body.topic_created_op,
-            partitions_count: body.partitions_count,
+            inner: body.clone(),
         }
         .into_zval(false),
         RustMetadataCurrentItem::ConsumerGroup(body) => MetadataConsumerGroupItem {
-            stream_id: body.stream_id,
-            stream_created_op: body.stream_created_op,
-            topic_id: body.topic_id,
-            topic_created_op: body.topic_created_op,
-            group_id: body.group_id,
-            name: body.name.clone(),
+            inner: body.clone(),
         }
         .into_zval(false),
         RustMetadataCurrentItem::ConsumerGroupMember(body) => MetadataMemberItem {
-            stream_id: body.stream_id,
-            stream_created_op: body.stream_created_op,
-            topic_id: body.topic_id,
-            topic_created_op: body.topic_created_op,
-            group_id: body.group_id,
-            member_id: body.member_id,
-            client_id: body.client_id,
-            partition_ids: body.partition_ids.clone(),
+            inner: body.clone(),
         }
         .into_zval(false),
         RustMetadataCurrentItem::User(body) => MetadataUserChange {
-            user_id: body.user_id,
-            user_created_at: body.user_created_at,
-            username: body.username.clone(),
-            status: body.status,
-            permissions: body.permissions.clone(),
-            options: readable_options(&body.options),
+            inner: body.clone(),
         }
         .into_zval(false),
         RustMetadataCurrentItem::PersonalAccessToken(body) => MetadataTokenChange {
-            user_id: body.user_id,
-            user_created_at: body.user_created_at,
-            name: body.name.clone(),
-            expiry: body.expiry,
+            inner: body.clone(),
         }
         .into_zval(false),
         RustMetadataCurrentItem::Session(body) => MetadataSession {
-            user_id: body.user_id,
-            user_created_at: body.user_created_at,
-            client_id: body.client_id,
-            session: body.session,
+            inner: body.clone(),
         }
         .into_zval(false),
         RustMetadataCurrentItem::Unknown { group, body } => MetadataUnknownItem {
@@ -1920,20 +1882,14 @@ fn item_body(item: &RustMetadataCurrentItem) -> PhpResult<Zval> {
     body.map_err(to_php_exception)
 }
 
-fn readable_options(options: &MetadataOptions) -> Option<ResourceOptions> {
-    match options {
-        MetadataOptions::Readable(options) => Some(options.clone()),
-        MetadataOptions::Unreadable => None,
-    }
-}
-
 fn options_view(
-    options: Option<&ResourceOptions>,
+    options: &MetadataOptions,
     explicit: bool,
 ) -> PhpResult<Option<ZBox<ZendHashTable>>> {
-    options
-        .map(|options| options_array(options, explicit))
-        .transpose()
+    match options {
+        MetadataOptions::Readable(options) => options_array(options, explicit).map(Some),
+        MetadataOptions::Unreadable => Ok(None),
+    }
 }
 
 /// Public permissions as nested arrays keyed like the `GET /users/{id}` JSON, with stream
@@ -2034,23 +1990,6 @@ fn optional_unsigned(value: Option<u64>) -> PhpResult<Zval> {
         Some(value) => unsigned(value),
         None => Ok(Zval::new()),
     }
-}
-
-fn unsigned_argument(value: &Zval, field: &str) -> PhpResult<u64> {
-    let number = match (value.long(), value.str()) {
-        (Some(number), _) => u64::try_from(number).ok(),
-        (None, Some(text))
-            if !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()) =>
-        {
-            text.parse::<u64>().ok()
-        }
-        _ => None,
-    };
-    number.ok_or_else(|| {
-        to_php_exception(format!(
-            "'{field}' must be a non-negative integer or a decimal string"
-        ))
-    })
 }
 
 fn decimal_u128(text: &str, field: &str) -> PhpResult<u128> {

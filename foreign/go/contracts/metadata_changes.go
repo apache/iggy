@@ -124,6 +124,9 @@ type MetadataSessionClosedReason uint8
 const (
 	MetadataSessionClosedReasonLogout  MetadataSessionClosedReason = 0
 	MetadataSessionClosedReasonExpired MetadataSessionClosedReason = 1
+	// MetadataSessionClosedReasonRevoked is a session ended because its user
+	// was deactivated or deleted.
+	MetadataSessionClosedReasonRevoked MetadataSessionClosedReason = 2
 )
 
 // MetadataPermissionsUpdatedReason says why a user's public permission set
@@ -531,7 +534,7 @@ var (
 	metadataChangePhaseNames              = []string{"changes", "current"}
 	metadataMemberLeftReasonNames         = []string{"left", "session_ended"}
 	metadataTokenDeletedReasonNames       = []string{"deleted", "expired"}
-	metadataSessionClosedReasonNames      = []string{"logout", "expired"}
+	metadataSessionClosedReasonNames      = []string{"logout", "expired", "revoked"}
 	metadataPermissionsUpdatedReasonNames = []string{"updated", "resource_deleted"}
 )
 

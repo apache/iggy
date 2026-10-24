@@ -170,6 +170,23 @@ func (t *MetadataCurrentPageToken) String() string {
 	return MetadataCurrentPageTokenPrefix + base64.RawURLEncoding.EncodeToString(payload)
 }
 
+// MarshalText renders the token's text form, so text encoders such as
+// encoding/json keep the scan position.
+func (t *MetadataCurrentPageToken) MarshalText() ([]byte, error) {
+	return []byte(t.String()), nil
+}
+
+// UnmarshalText reads the text form with the checks of
+// ParseMetadataCurrentPageToken.
+func (t *MetadataCurrentPageToken) UnmarshalText(text []byte) error {
+	token, err := ParseMetadataCurrentPageToken(string(text))
+	if err != nil {
+		return err
+	}
+	*t = *token
+	return nil
+}
+
 // Anchor is the cursor captured before the scan's first page.
 func (t *MetadataCurrentPageToken) Anchor() MetadataChangeCursor {
 	return t.anchor

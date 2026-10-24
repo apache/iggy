@@ -24,6 +24,10 @@ namespace Apache.Iggy.Contracts;
 /// <summary>
 ///     One page of the metadata change log, or of the current state.
 /// </summary>
+/// <remarks>
+///     JSON support is read only. <see cref="System.Text.Json.JsonSerializer" /> deserializes the HTTP answer, and
+///     serializing a page throws <see cref="NotSupportedException" />.
+/// </remarks>
 [JsonConverter(typeof(MetadataChangesConverter))]
 public sealed class MetadataChanges
 {

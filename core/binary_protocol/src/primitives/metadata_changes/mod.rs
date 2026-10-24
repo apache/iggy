@@ -41,10 +41,10 @@ pub use position::{
     WireMetadataChangeCursor, WireMetadataCurrentPageToken,
 };
 
+use crate::WireDecode;
 use crate::WireError;
 use crate::codec::{bounded_capacity, read_u8, read_u32_le, read_u64_le};
 use crate::primitives::identifier::WireName;
-use crate::{WireDecode, WireEncode};
 use bytes::{BufMut, BytesMut};
 use std::borrow::Cow;
 
@@ -91,6 +91,9 @@ macro_rules! wire_code_enum {
 wire_code_enum! {
     /// Family of change records and the unit of filtering. Codes 9 to 127 are
     /// reserved for future groups, 128 to 255 for downstream extensions.
+    ///
+    /// A page token holds the groups in an 8 bit mask, so a ninth group needs
+    /// a new token format.
     WireMetadataChangeGroup {
         Streams = 1,
         Topics = 2,
@@ -193,6 +196,8 @@ wire_code_enum! {
     WireSessionClosedReason {
         Logout = 0,
         Expired = 1,
+        /// The user was deactivated or deleted.
+        Revoked = 2,
     }
 }
 
@@ -339,13 +344,6 @@ pub(crate) fn read_partition_ids(
     Ok((ids, position - offset))
 }
 
-/// Encode a body and return its bytes. Bodies are small, bounded values.
-pub(crate) fn encode_to_vec<T: WireEncode>(value: &T) -> Vec<u8> {
-    let mut buf = BytesMut::with_capacity(value.encoded_size());
-    value.encode(&mut buf);
-    buf.to_vec()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,7 +407,7 @@ mod tests {
     fn given_unknown_reason_codes_when_decoding_should_refuse() {
         assert!(WireMemberLeftReason::from_code(2).is_err());
         assert!(WireTokenDeletedReason::from_code(2).is_err());
-        assert!(WireSessionClosedReason::from_code(2).is_err());
+        assert!(WireSessionClosedReason::from_code(3).is_err());
         assert!(WirePermissionsUpdatedReason::from_code(2).is_err());
         assert!(WireMetadataChangeStatus::from_code(4).is_err());
         assert!(WireMetadataChangePhase::from_code(2).is_err());

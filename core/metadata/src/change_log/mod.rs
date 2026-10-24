@@ -62,7 +62,7 @@ impl AppliedChange {
         Self {
             kind: change.kind(),
             actor_user_id,
-            body: Bytes::from(change.body_bytes()),
+            body: change.body_bytes(),
         }
     }
 
@@ -185,6 +185,24 @@ pub(crate) fn session_closed(header: &PrepareHeader, user: WireUserKey) -> Appli
             reason,
         }),
         actor,
+    )
+}
+
+/// The record of a session that a user's deactivation or deletion ended.
+pub(crate) fn session_revoked(
+    user: WireUserKey,
+    client_id: u128,
+    session: u64,
+    actor_user_id: Option<u32>,
+) -> AppliedChange {
+    AppliedChange::new(
+        &WireMetadataChange::SessionClosed(WireSessionClosedBody {
+            user,
+            client_id,
+            session,
+            reason: WireSessionClosedReason::Revoked,
+        }),
+        actor_user_id,
     )
 }
 

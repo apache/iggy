@@ -156,6 +156,23 @@ func TestMetadataChanges_Positions(t *testing.T) {
 		assert.Equal(t, tokenText, token.String())
 	})
 
+	t.Run("given_page_token_when_round_tripping_through_json_should_keep_its_text_form", func(t *testing.T) {
+		token, err := iggcon.ParseMetadataCurrentPageToken(tokenText)
+		require.NoError(t, err)
+		encoded, err := json.Marshal(iggcon.MetadataChanges{CurrentPageToken: token})
+		require.NoError(t, err)
+		assert.Contains(t, string(encoded), `"CurrentPageToken":"`+tokenText+`"`)
+		var decoded iggcon.MetadataChanges
+		require.NoError(t, json.Unmarshal(encoded, &decoded))
+		assert.Equal(t, token, decoded.CurrentPageToken)
+	})
+
+	t.Run("given_non_canonical_page_token_text_when_unmarshaling_json_should_refuse", func(t *testing.T) {
+		var token iggcon.MetadataCurrentPageToken
+		err := json.Unmarshal([]byte(`"`+tokenText+`="`), &token)
+		assert.ErrorIs(t, err, ierror.ErrInvalidCommand)
+	})
+
 	t.Run("given_cursor_with_last_character_carrying_extra_bits_when_parsing_should_refuse", func(t *testing.T) {
 		text := fixture.Cursors[0].Text
 		last := text[len(text)-1]

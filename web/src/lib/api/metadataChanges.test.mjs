@@ -90,10 +90,16 @@ test('given_user_when_checking_access_should_allow_only_root_and_manage_servers'
 });
 
 test('given_non_ok_status_when_describing_should_explain_what_to_do', () => {
-  assert.equal(statusMessage('ok'), undefined);
+  assert.equal(statusMessage('ok', false), undefined);
   for (const status of /** @type {const} */ (['behind', 'expired', 'reset'])) {
-    assert.ok((statusMessage(status) ?? '').length > 0);
+    assert.ok((statusMessage(status, false) ?? '').length > 0);
   }
+});
+
+test('given_behind_status_when_describing_should_promise_a_retry_only_while_following', () => {
+  assert.match(statusMessage('behind', true) ?? '', /Retrying/);
+  assert.doesNotMatch(statusMessage('behind', false) ?? '', /Retrying/);
+  assert.match(statusMessage('behind', false) ?? '', /Load again/);
 });
 
 test('given_records_when_describing_should_name_the_changed_resource', () => {

@@ -65,7 +65,8 @@ export const MetadataChangeStart = {
  * Refused with `ResponseError` code 3 (invalid command) before anything is
  * sent: a limit outside 1 to 1000, `since` above `until`, a time bound with
  * the latest or current start, an unknown group, a current scan that misses
- * a parent group, and a page token issued for other groups.
+ * a parent group, and a page token that is not a `MetadataCurrentPageToken`
+ * or was issued for other groups.
  */
 export type GetMetadataChanges = {
   /** Defaults to the earliest start */
@@ -236,6 +237,8 @@ const checkQuery = (
         refuse('a current start takes no time bound');
       if (missesParentGroup(mask))
         refuse('a current scan needs the parent groups of every selected group');
+      if (start.pageToken !== undefined && !(start.pageToken instanceof MetadataCurrentPageToken))
+        refuse('a current start continues with a MetadataCurrentPageToken');
       if (start.pageToken !== undefined && metadataChangeGroupsMask(start.pageToken.groups) !== mask)
         refuse('the page token was issued for other groups');
       break;

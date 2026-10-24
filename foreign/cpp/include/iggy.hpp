@@ -103,6 +103,10 @@ class StringTag {
     std::string value_;
 };
 
+/** @brief Runs a bridge call and rethrows its failure as IggyException with the call's ErrorInfo. */
+template <typename Operation>
+decltype(auto) RethrowAsIggyException(Operation &&operation);
+
 }  // namespace detail
 
 /**
@@ -110,7 +114,9 @@ class StringTag {
  *
  * Code() and Kind() are available only when a call forwards a typed Rust SDK
  * error. IggyBlockingClient documents the covered methods. Other calls and
- * C++ or bridge-local argument errors leave Code() empty and Kind() empty.
+ * C++ or bridge-local argument errors leave Code() empty and Kind() empty,
+ * except the metadata change calls, which report invalid input with the kind
+ * each one documents.
  * OperationId() is present only for operation_uncertain, lane_blocked, and
  * operation_not_retained errors and preserves the full unsigned 64-bit ID.
  */
@@ -137,21 +143,34 @@ class IggyException : public std::runtime_error {
         }
     }
 
-    friend class IggyBlockingClient;
-    friend class MetadataChangeCursor;
-    friend class MetadataChangeRecord;
-    friend class MetadataChanges;
-    friend class MetadataChangesQuery;
-    friend class MetadataCurrentItem;
-    friend class MetadataCurrentPageToken;
-    friend std::string EncryptionKeyFingerprint(const std::vector<std::uint8_t> &key);
-    friend std::string EncryptionKeyFingerprint(const std::string &key_base64);
+    template <typename Operation>
+    friend decltype(auto) detail::RethrowAsIggyException(Operation &&operation);
 
     std::optional<std::uint32_t> code_;
     // Shared, so that copying the exception cannot throw.
     std::shared_ptr<const std::string> kind_;
     std::optional<std::uint64_t> operation_id_;
 };
+
+namespace detail {
+
+template <typename Operation>
+decltype(auto) RethrowAsIggyException(Operation &&operation) {
+    ffi::ErrorInfo error_info{};
+    try {
+        if constexpr (std::is_invocable_v<Operation, ffi::ErrorInfo &>) {
+            return std::forward<Operation>(operation)(error_info);
+        } else {
+            return std::forward<Operation>(operation)();
+        }
+    } catch (const IggyException &) {
+        throw;
+    } catch (const std::exception &error) {
+        throw IggyException(error.what(), error_info);
+    }
+}
+
+}  // namespace detail
 
 /**
  * @brief Details returned after a successful login.
@@ -4178,6 +4197,7 @@ constexpr std::string_view to_string(const MetadataTokenDeletedReason reason) {
 enum class MetadataSessionClosedReason : std::uint8_t {
     Logout  = 0,
     Expired = 1,
+    Revoked = 2,  ///< The user was deactivated or deleted.
 };
 
 constexpr std::string_view to_string(const MetadataSessionClosedReason reason) {
@@ -4186,6 +4206,8 @@ constexpr std::string_view to_string(const MetadataSessionClosedReason reason) {
             return "logout";
         case MetadataSessionClosedReason::Expired:
             return "expired";
+        case MetadataSessionClosedReason::Revoked:
+            return "revoked";
     }
     throw std::invalid_argument("Unknown session closed reason");
 }
@@ -4438,8 +4460,9 @@ class MetadataChangesQuery final {
      * @brief Applies the checks GetMetadataChanges() runs before sending.
      * @throws IggyException with Kind() invalid_command when the limit is
      *         outside 1 to kMaxLimit, Since() is above Until(), a time bound
-     *         accompanies Latest() or Current(), a current state scan misses
-     *         a parent group, or the page token was issued for other groups.
+     *         accompanies Latest() or Current() or lies past what the
+     *         platform clock holds, a current state scan misses a parent
+     *         group, or the page token was issued for other groups.
      */
     void Validate() const;
 
@@ -4448,7 +4471,7 @@ class MetadataChangesQuery final {
      *        validating it.
      * @return Request payload without framing.
      * @throws IggyException with Kind() invalid_command for a group this build
-     *         does not know.
+     *         does not know or a time bound past what the platform clock holds.
      */
     [[nodiscard]] std::vector<std::uint8_t> ToBytes() const;
 
@@ -5681,7 +5704,9 @@ class PollingStrategy final {
  *
  * Other methods report errors through the exception message only. C++ and
  * bridge-local argument validation failures also have no structured error
- * details, even for the methods listed above.
+ * details, even for the methods listed above. GetMetadataChanges() is the
+ * exception: it reports every invalid query as invalid_command, including one
+ * the bridge refuses.
  *
  * @code{.cpp}
  * auto client{iggy::IggyBlockingClient::Builder()
@@ -6600,22 +6625,6 @@ class IggyBlockingClient final {
 
   private:
     explicit IggyBlockingClient(ffi::Client *client);
-
-    template <typename Operation>
-    static decltype(auto) RethrowAsIggyException(Operation &&operation) {
-        ffi::ErrorInfo error_info{};
-        try {
-            if constexpr (std::is_invocable_v<Operation, ffi::ErrorInfo &>) {
-                return std::forward<Operation>(operation)(error_info);
-            } else {
-                return std::forward<Operation>(operation)();
-            }
-        } catch (const IggyException &) {
-            throw;
-        } catch (const std::exception &error) {
-            throw IggyException(error.what(), error_info);
-        }
-    }
 
     [[nodiscard]] ffi::Client *Handle() const;
     void Reset() noexcept;

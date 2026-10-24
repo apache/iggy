@@ -1529,7 +1529,7 @@ fn main() {
                 actor_user_id: Some(0),
                 group: stream_created.group().as_u8(),
                 kind: stream_created.kind().as_u8(),
-                body: Bytes::from(stream_created.body_bytes()),
+                body: stream_created.body_bytes(),
             }],
             items: Vec::new(),
             current_page_token: None,

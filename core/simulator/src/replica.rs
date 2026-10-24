@@ -396,7 +396,12 @@ pub fn new_shard(
         let change_log = snapshot
             .snapshot()
             .change_log
-            .restore(metadata.change_log().capacities())
+            .restore(
+                metadata
+                    .change_log()
+                    .capacities()
+                    .expect("shard 0 owns the change log writer"),
+            )
             .expect("the local checkpoint's change log restores");
         metadata
             .change_log()

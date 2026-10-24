@@ -421,7 +421,7 @@ const rebuild = async (client: Client, groups: MetadataChangeGroup[]) => {
 
 Current pages need the parent groups of every selected group, for example `topics` with `streams`. Keep a rebuilt state private until a change page answers `ok` with `hasMore` false and a `headOp` at or above the last current page's.
 
-Records narrow by `kind` and items by `group`, so `record.kind === "stream_created"` types `record.body` as a stream. A group or kind newer than this build arrives as `"unknown"` with the raw body and the wire codes in `groupCode` and `kindCode`, so a mirror that cannot apply it can stop without advancing its cursor. Ops, timestamps and 128-bit ids are `bigint`.
+Records narrow by `kind` and items by `group`, so `record.kind === "stream_created"` types `record.body` as a stream. A group or kind newer than this build arrives as `"unknown"` with the raw body and the wire codes in `groupCode` and `kindCode`, while a record of a newer kind keeps its known `group`, so a mirror that cannot apply it can stop without advancing its cursor. Ops, timestamps and 128-bit ids are `bigint`.
 
 A query that breaks the request rules, such as a limit outside 1 to 1000 or a time bound with a latest or current start, is refused with error 3 before anything is sent. `MetadataChangeCursor` and `MetadataCurrentPageToken` print and parse as the `mc1_` and `cs1_` text forms the HTTP API and the CLI use, and `JSON.stringify` writes them as that text.
 

@@ -239,6 +239,8 @@ pub enum MetadataTokenDeletedReason {
 pub enum MetadataSessionClosedReason {
     Logout,
     Expired,
+    /// The user was deactivated or deleted.
+    Revoked,
 }
 
 /// Why a user's public permission set changed.
@@ -463,7 +465,8 @@ mirror_wire_enum!(
     MetadataSessionClosedReason,
     WireSessionClosedReason,
     Logout,
-    Expired
+    Expired,
+    Revoked
 );
 mirror_wire_enum!(
     MetadataPermissionsUpdatedReason,

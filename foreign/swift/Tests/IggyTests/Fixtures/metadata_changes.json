@@ -201,7 +201,8 @@
     },
     "session_closed_reasons": {
       "expired": 1,
-      "logout": 0
+      "logout": 0,
+      "revoked": 2
     },
     "permissions_updated_reasons": {
       "resource_deleted": 1,
@@ -783,6 +784,27 @@
         "client_id": "0102030405060708090a0b0c0d0e0f10",
         "session": 4500,
         "reason": "expired"
+      }
+    },
+    {
+      "case": "session_closed_revoked",
+      "group": 8,
+      "kind": 71,
+      "body_hex": "0700000000b832c8fb400600100f0e0d0c0b0a090807060504030201941100000000000002",
+      "record_hex": "3010000000000000000000007c3d9e8b03f7c1a500000000000000003000be010941060001070000000847250000000700000000b832c8fb400600100f0e0d0c0b0a090807060504030201941100000000000002",
+      "expected": {
+        "op": 4144,
+        "ordinal": 0,
+        "checksum": "0000000000000000a5c1f7038b9e3d7c",
+        "timestamp": 1760356800004144,
+        "actor_user_id": 7,
+        "group": "sessions",
+        "kind": "session_closed",
+        "user_id": 7,
+        "user_created_at": 1760300000000000,
+        "client_id": "0102030405060708090a0b0c0d0e0f10",
+        "session": 4500,
+        "reason": "revoked"
       }
     }
   ],

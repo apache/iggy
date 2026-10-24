@@ -941,6 +941,21 @@ public sealed class BinaryMapper
         Assert.Throws<MalformedResponseException>(() => Mappers.BinaryMapper.MapClient(payload));
     }
 
+    [Fact]
+    public void MapUser_PermissionsOverrunningTheirLength_Throws()
+    {
+        var payload = new byte[39];
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(0, 4), 1); // user id
+        payload[12] = 1; // status active
+        payload[13] = 1; // username length
+        payload[14] = (byte)'u';
+        payload[23] = 1; // permissions present
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(24, 4), 11); // permissions length
+        payload[38] = 1; // a stream follows the ten global flags, past the length
+
+        Assert.Throws<MalformedResponseException>(() => Mappers.BinaryMapper.MapUser(payload));
+    }
+
     private static byte[] CreateClientPayload(uint userId, byte transport)
     {
         var payload = new byte[17];

@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+import Foundation
+
 /// Family of metadata change records and the unit of filtering. Raw values
 /// are the wire codes. A query without groups selects every group.
 public enum MetadataChangeGroup: UInt8, Sendable, Hashable, CaseIterable, CustomStringConvertible {
@@ -201,11 +203,14 @@ public enum MetadataTokenDeletedReason: UInt8, Sendable, Hashable, CaseIterable,
 public enum MetadataSessionClosedReason: UInt8, Sendable, Hashable, CaseIterable, CustomStringConvertible {
     case logout = 0
     case expired = 1
+    /// The user was deactivated or deleted.
+    case revoked = 2
 
     public var description: String {
         switch self {
         case .logout: "logout"
         case .expired: "expired"
+        case .revoked: "revoked"
         }
     }
 }
@@ -1478,70 +1483,28 @@ extension ByteReader {
     }
 }
 
-/// Unpadded Base64url with the URL-safe alphabet, strict as the Rust
-/// `URL_SAFE_NO_PAD` engine plus its canonical re-encoding check: no padding,
-/// no other alphabet, and zero trailing bits.
+/// Unpadded Base64url on top of Foundation. Decoding accepts only the text
+/// ``encode(_:)`` writes back, so padding, other alphabets and nonzero
+/// trailing bits are refused.
 enum Base64URL {
-    private static let alphabet = Array("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_".utf8)
-    private static let values: [UInt8: UInt32] = Dictionary(uniqueKeysWithValues: alphabet.enumerated().map { ($0.element, UInt32($0.offset)) })
-
     static func encode(_ bytes: [UInt8]) -> String {
-        var output: [UInt8] = []
-        output.reserveCapacity((bytes.count * 4 + 2) / 3)
-        var index = 0
-        while index < bytes.count {
-            let remaining = bytes.count - index
-            var chunk = UInt32(bytes[index]) << 16
-            if remaining > 1 {
-                chunk |= UInt32(bytes[index + 1]) << 8
-            }
-            if remaining > 2 {
-                chunk |= UInt32(bytes[index + 2])
-            }
-            output.append(alphabet[Int(chunk >> 18 & 0x3F)])
-            output.append(alphabet[Int(chunk >> 12 & 0x3F)])
-            if remaining > 1 {
-                output.append(alphabet[Int(chunk >> 6 & 0x3F)])
-            }
-            if remaining > 2 {
-                output.append(alphabet[Int(chunk & 0x3F)])
-            }
-            index += 3
-        }
-        return String(decoding: output, as: UTF8.self)
+        Data(bytes).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
     }
 
     /// The bytes after `prefix`, or nil for text that is not canonical.
     static func decode(_ text: String, prefix: String) -> [UInt8]? {
-        let utf8 = Array(text.utf8)
-        let prefixBytes = Array(prefix.utf8)
-        guard utf8.starts(with: prefixBytes) else {
+        guard text.utf8.starts(with: prefix.utf8) else {
             return nil
         }
-        let encoded = utf8[prefixBytes.count...]
-        guard encoded.count % 4 != 1 else {
+        let encoded = String(decoding: text.utf8.dropFirst(prefix.utf8.count), as: UTF8.self)
+        let standard = encoded.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+        let padding = String(repeating: "=", count: (4 - standard.utf8.count % 4) % 4)
+        guard let data = Data(base64Encoded: standard + padding), encode([UInt8](data)) == encoded else {
             return nil
         }
-        var bytes: [UInt8] = []
-        bytes.reserveCapacity(encoded.count * 3 / 4)
-        var buffer: UInt32 = 0
-        var bits = 0
-        for character in encoded {
-            guard let value = values[character] else {
-                return nil
-            }
-            buffer = buffer << 6 | value
-            bits += 6
-            if bits >= 8 {
-                bits -= 8
-                bytes.append(UInt8(truncatingIfNeeded: buffer >> UInt32(bits)))
-                buffer &= (1 << UInt32(bits)) - 1
-            }
-        }
-        // Leftover bits that a canonical encoder would have written as zero.
-        guard buffer == 0 else {
-            return nil
-        }
-        return bytes
+        return [UInt8](data)
     }
 }

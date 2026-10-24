@@ -162,7 +162,7 @@ public sealed record MetadataChangesQuery
         if (Groups.Count > 0)
         {
             var names = MetadataChangeGroups.FromMask(MetadataChangeGroups.Mask(Groups))
-                .Select(MetadataChangeGroups.Name);
+                .Select(SnakeCaseNames<MetadataChangeGroup>.Name);
             pairs.Add($"groups={string.Join(',', names)}");
         }
 

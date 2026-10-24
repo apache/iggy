@@ -140,6 +140,23 @@ public sealed class HttpMetadataChangesTests
             client.GetMetadataChangesAsync(new MetadataChangesQuery(), TestContext.Current.CancellationToken));
     }
 
+    [Theory]
+    [InlineData("changes", """[{"op":9,"ordinal":0,"checksum":"0000000000000000000000000000000a","timestamp":1,"group":null,"kind":"stream_created"}]""", "[]")]
+    [InlineData("changes", """[{"op":9,"ordinal":0,"checksum":"0000000000000000000000000000000a","timestamp":1,"group":"streams","kind":null}]""", "[]")]
+    [InlineData("current", "[]", """[{"group":null}]""")]
+    public async Task given_record_or_item_with_a_null_group_or_kind_when_reading_over_http_should_raise_a_json_error(
+        string phase, string records, string items)
+    {
+        var handler = new RecordingHandler($$"""
+            {"status":"ok","phase":"{{phase}}","log_id":null,"oldest_op":0,"retained_since":0,"head_op":0,
+             "next":null,"has_more":false,"records":{{records}},"items":{{items}},"current_page_token":null}
+            """);
+        using var client = Client(handler);
+
+        await Assert.ThrowsAsync<JsonException>(() =>
+            client.GetMetadataChangesAsync(new MetadataChangesQuery(), TestContext.Current.CancellationToken));
+    }
+
     private static HttpMessageStream Client(RecordingHandler handler)
     {
         return new HttpMessageStream(new HttpClient(handler) { BaseAddress = new Uri("http://localhost") });

@@ -26,5 +26,8 @@ public enum MetadataSessionClosedReason : byte
     Logout = 0,
 
     /// <summary>The session lease expired.</summary>
-    Expired = 1
+    Expired = 1,
+
+    /// <summary>The user was deactivated or deleted.</summary>
+    Revoked = 2
 }

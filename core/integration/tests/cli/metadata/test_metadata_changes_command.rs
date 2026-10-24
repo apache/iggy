@@ -30,7 +30,7 @@ const STREAM: &str = "metadata-cli";
 enum Read {
     Changes,
     CurrentState,
-    MissingParentGroup,
+    CurrentStateOfChildGroup,
 }
 
 struct TestMetadataChangesCmd {
@@ -58,7 +58,7 @@ impl IggyCmdTestCase for TestMetadataChangesCmd {
                 .arg("current")
                 .arg("--groups")
                 .arg("streams"),
-            Read::MissingParentGroup => command
+            Read::CurrentStateOfChildGroup => command
                 .arg("--from")
                 .arg("current")
                 .arg("--groups")
@@ -83,8 +83,11 @@ impl IggyCmdTestCase for TestMetadataChangesCmd {
                     .stdout(contains(format!(r#""name":"{STREAM}""#)))
                     .stdout(contains(r#""current_page_token":null"#));
             }
-            Read::MissingParentGroup => {
-                command_state.failure();
+            Read::CurrentStateOfChildGroup => {
+                command_state
+                    .success()
+                    .stdout(contains(r#""phase":"current""#))
+                    .stdout(contains(format!(r#""name":"{STREAM}""#)));
             }
         }
     }
@@ -100,7 +103,11 @@ impl IggyCmdTestCase for TestMetadataChangesCmd {
 #[tokio::test]
 #[parallel]
 pub async fn should_be_successful() {
-    for read in [Read::Changes, Read::CurrentState, Read::MissingParentGroup] {
+    for read in [
+        Read::Changes,
+        Read::CurrentState,
+        Read::CurrentStateOfChildGroup,
+    ] {
         let mut iggy_cmd_test = IggyCmdTest::default();
         iggy_cmd_test.setup().await;
         iggy_cmd_test

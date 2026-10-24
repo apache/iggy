@@ -963,11 +963,11 @@ mod ffi {
             error_info: &mut ErrorInfo,
         ) -> Result<String>;
         fn parse_metadata_change_cursor(
-            text: &str,
+            text: &[u8],
             error_info: &mut ErrorInfo,
         ) -> Result<MetadataChangeCursor>;
         fn parse_metadata_current_page_token(
-            text: &str,
+            text: &[u8],
             error_info: &mut ErrorInfo,
         ) -> Result<MetadataCurrentPageToken>;
         fn validate_metadata_changes_query(
