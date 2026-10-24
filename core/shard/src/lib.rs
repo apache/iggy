@@ -2979,6 +2979,29 @@ where
     )
 }
 
+/// Whether a transfer descriptor comes from a replica that knows less than this
+/// one: the phantom view-0 primary signature (a group whose directory vanished
+/// comes up Normal at view 0 over an empty, trivially caught-up log).
+///
+/// The serving view is compared against this replica's `log_view`, the last
+/// view whose log it adopted, NOT its current `view`. A replica that needs
+/// state transfer cannot finish a view change: its WAL cannot certify a holed
+/// log, so every view-scoped send is withheld. Its elections time out alone and
+/// ratchet `view` far past the group's, which never hears them. Compared
+/// against that view, every offer from the group's real primary looked stale
+/// although it held more committed state, and the replica stayed behind for
+/// good, serving reads from its prefix. A peer at or above the newest view this
+/// replica's log belongs to, holding at least the commit point it knows, is not
+/// behind it.
+const fn transfer_offer_is_behind(
+    serving_view: u32,
+    serving_commit_max: u64,
+    local_log_view: u32,
+    local_commit_max: u64,
+) -> bool {
+    serving_view < local_log_view || serving_commit_max < local_commit_max
+}
+
 /// The next replica to try after a transfer against `failed_peer` failed.
 ///
 /// Prefers the view's primary: it is the only replica that can pass the serving
@@ -10184,9 +10207,20 @@ where
                 // rotation spends the next round on a backup that can only
                 // refuse, and the serving side's partial offer-build progress
                 // is memoized per node, so that round advances no hashing.
+                //
+                // Judge the primary by the refuser's view when it is at least the
+                // view whose log this replica adopted: a replica awaiting
+                // transfer raises its own `view` through elections nobody hears
+                // (see `transfer_offer_is_behind`), and the primary of that view
+                // is a backup that can only refuse.
                 let primary = {
                     let consensus = partition.consensus();
-                    consensus.primary_index(consensus.view())
+                    let view = if header.view >= consensus.log_view() {
+                        header.view
+                    } else {
+                        consensus.view()
+                    };
+                    consensus.primary_index(view)
                 };
                 self.rearm_partition_transfer_after_refusal(
                     partition,
@@ -10207,6 +10241,7 @@ where
         // caught up). Installing it would unlink a chain this replica already
         // holds; nonce match alone cannot tell the two apart.
         let local_view = partition.consensus().view();
+        let local_log_view = partition.consensus().log_view();
         let local_commit_max = partition.consensus().commit_max();
         // `commit_op` past the sender's OWN `commit_max` is self-contradictory:
         // the offer cannot be built past the frontier its builder had. Nothing
@@ -10229,7 +10264,12 @@ where
                 .await;
             return;
         }
-        if header.view < local_view || header.commit_max < local_commit_max {
+        if transfer_offer_is_behind(
+            header.view,
+            header.commit_max,
+            local_log_view,
+            local_commit_max,
+        ) {
             tracing::warn!(
                 shard = self.id,
                 namespace_raw = header.group,
@@ -10237,6 +10277,7 @@ where
                 serving_view = header.view,
                 serving_commit_max = header.commit_max,
                 local_view,
+                local_log_view,
                 local_commit_max,
                 "refusing a partition transfer offer from a replica behind this one"
             );
@@ -16749,6 +16790,33 @@ mod partition_placement_tests {
             inherited.as_slice(),
             "reconstruction must preserve the original assignment bytes"
         );
+    }
+}
+
+#[cfg(test)]
+mod transfer_descriptor_gate_tests {
+    //! Which state-transfer descriptors a replica refuses as coming from a
+    //! replica behind it. The accept case runs through the handler in
+    //! `poll::completion_tests`.
+
+    use super::transfer_offer_is_behind;
+
+    #[test]
+    fn given_an_offer_from_before_the_view_this_log_adopted_when_checked_should_refuse() {
+        assert!(transfer_offer_is_behind(10, 55_013, 11, 53_052));
+    }
+
+    #[test]
+    fn given_an_offer_below_the_known_commit_point_when_checked_should_refuse() {
+        assert!(transfer_offer_is_behind(20, 53_000, 11, 53_052));
+    }
+
+    #[test]
+    fn given_a_phantom_view_zero_primary_when_checked_should_refuse() {
+        // An empty group at view 0 must never unlink a chain this replica
+        // holds, whichever comparison catches it.
+        assert!(transfer_offer_is_behind(0, 0, 1, 0));
+        assert!(transfer_offer_is_behind(0, 0, 0, 42));
     }
 }
 

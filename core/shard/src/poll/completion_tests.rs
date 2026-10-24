@@ -51,6 +51,7 @@ use metadata::stm::StateMachine;
 use metadata::stm::consumer_group::{ConsumerGroup, ConsumerGroupMember, JoinConsumerGroupRequest};
 use metadata::stm::stream::{Partition, Stream, StreamsInner, Topic};
 use metadata::stm::user::Users;
+use partitions::state_transfer::PartitionTransferSession;
 use partitions::{IggyPartition, IggyPartitions, PartitionsConfig, PollingArgs, PollingConsumer};
 use server_common::Message;
 use server_common::iobuf::Owned;
@@ -2075,6 +2076,139 @@ async fn given_accepted_descriptor_when_install_fails_should_exhaust_its_generat
         owner.metadata_transfer_decode_failures.get(),
         Some((GENERATION + 1, 1)),
         "a new checkpoint generation starts a fresh decode budget"
+    );
+}
+
+/// A replica that needs partition state transfer cannot finish a view change:
+/// its WAL cannot certify a holed log, so every view-scoped send is withheld.
+/// Its elections time out with nobody hearing them and keep raising its `view`
+/// far past the group's. The numbers are from a reproduction (#4438): this
+/// replica's log was last adopted in view 11, solo elections pushed its view to
+/// 58, and the group's primary at view 20 holds more committed state than this
+/// replica knows. Judged by view 58, that primary looks behind and replica 1
+/// looks like the primary, so the replica stays behind for good and keeps
+/// serving reads from its stale prefix.
+const RATCHETED_NONCE: u128 = 0x5eed;
+const RATCHETED_LOG_VIEW: u32 = 11;
+const RATCHETED_VIEW: u32 = 58;
+const RATCHETED_COMMIT_MAX: u64 = 53_052;
+const GROUP_PRIMARY_VIEW: u32 = 20;
+const GROUP_PRIMARY_COMMIT: u64 = 55_013;
+const GROUP_PRIMARY: u8 = (GROUP_PRIMARY_VIEW % 3) as u8;
+
+/// Replica 0 of a three-replica group, awaiting a transfer descriptor from the
+/// group primary after its view ratcheted alone.
+fn ratcheted_transfer_owner(namespace: IggyNamespace) -> (CompletionTestShard, TaggedSender) {
+    let bus = Rc::new(IggyMessageBus::new(0));
+    let config = partitions_config();
+    let (owner, sender) = owner_with_inbox(&bus, config.clone(), namespace);
+    let mut consensus = VsrConsensus::new(1, 0, 3, namespace.inner(), bus, LocalPipeline::new());
+    consensus.init();
+    consensus.set_view(RATCHETED_VIEW);
+    consensus.set_log_view(RATCHETED_LOG_VIEW);
+    consensus.advance_commit_max(RATCHETED_COMMIT_MAX);
+    consensus.set_state_transfer_stage(StateTransferStage::AwaitingTarget);
+    let mut partition = IggyPartition::with_in_memory_storage(
+        Arc::new(PartitionStats::default()),
+        consensus,
+        config.segment_size,
+    );
+    partition.transfer = Some(PartitionTransferSession {
+        nonce: RATCHETED_NONCE,
+        peer: GROUP_PRIMARY,
+        commit_op: 0,
+        artifacts: Vec::new(),
+        target_accepted: false,
+        idle_ticks: 0,
+    });
+    owner.plane.partitions().insert(namespace, partition);
+    (owner, sender)
+}
+
+/// A descriptor from the group primary at its own view and commit point: an
+/// offer when `available`, otherwise a transient refusal.
+fn group_primary_descriptor(
+    namespace: IggyNamespace,
+    available: bool,
+) -> Message<StateTransferTargetHeader> {
+    let manifest = if available {
+        encode_state_manifest(&[StateArtifact::for_bytes(
+            artifact_kind::SEGMENT_LOG,
+            GROUP_PRIMARY_COMMIT,
+            b"segment",
+        )])
+    } else {
+        Vec::new()
+    };
+    let size = size_of::<StateTransferTargetHeader>() + manifest.len();
+    let mut descriptor = Message::<StateTransferTargetHeader>::new(size);
+    descriptor.as_mut_slice()[size_of::<StateTransferTargetHeader>()..].copy_from_slice(&manifest);
+    descriptor.transmute_header(|_, header: &mut StateTransferTargetHeader| {
+        header.command = Command::StateTransferTarget;
+        header.cluster = 1;
+        header.replica = GROUP_PRIMARY;
+        header.view = GROUP_PRIMARY_VIEW;
+        header.group = namespace.inner();
+        header.nonce = RATCHETED_NONCE;
+        header.size = u32::try_from(size).unwrap();
+        header.commit_max = GROUP_PRIMARY_COMMIT;
+        if available {
+            header.available = 1;
+            header.commit_op = GROUP_PRIMARY_COMMIT;
+        } else {
+            header.unavailable_transient = 1;
+        }
+        header.seal();
+    })
+}
+
+#[compio::test]
+async fn given_the_primary_offer_when_this_replica_ratcheted_its_view_alone_should_accept_it() {
+    let namespace = IggyNamespace::new(0, 0, 0);
+    let (owner, _sender) = ratcheted_transfer_owner(namespace);
+
+    owner
+        .on_partition_state_transfer_target(&group_primary_descriptor(namespace, true))
+        .await;
+
+    let partitions = owner.plane.partitions();
+    let session = partitions
+        .get_by_ns(&namespace)
+        .expect("the partition stays registered")
+        .transfer
+        .as_ref();
+    assert!(
+        session.is_some_and(|session| session.target_accepted),
+        "the group primary's offer holds more committed state than this replica \
+         knows, so it must be accepted"
+    );
+}
+
+/// Under load the primary's first answer is usually a transient refusal (its
+/// offer is still flushing or hashing). Only the primary can serve, so the next
+/// attempt must ask it again. Rotating to replica 1, the primary of the
+/// ratcheted view 58, asks a backup that can only refuse.
+#[compio::test]
+async fn given_a_transient_refusal_from_the_primary_when_this_replica_ratcheted_its_view_alone_should_ask_it_again()
+ {
+    let namespace = IggyNamespace::new(0, 0, 0);
+    let (owner, _sender) = ratcheted_transfer_owner(namespace);
+
+    owner
+        .on_partition_state_transfer_target(&group_primary_descriptor(namespace, false))
+        .await;
+
+    let partitions = owner.plane.partitions();
+    let rearm = partitions
+        .get_by_ns(&namespace)
+        .expect("the partition stays registered")
+        .transfer_rearm
+        .as_ref()
+        .map(|rearm| rearm.peer);
+    assert_eq!(
+        rearm,
+        Some(GROUP_PRIMARY),
+        "a transient refusal from the group primary must re-arm toward it"
     );
 }
 
