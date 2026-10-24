@@ -23,12 +23,6 @@ use iggy_common::{ClusterMetadata, IggyError};
 #[async_trait]
 impl ClusterClient for ClientWrapper {
     async fn get_cluster_metadata(&self) -> Result<ClusterMetadata, IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => client.get_cluster_metadata().await,
-            ClientWrapper::Http(client) => client.get_cluster_metadata().await,
-            ClientWrapper::Quic(client) => client.get_cluster_metadata().await,
-            ClientWrapper::Tcp(client) => client.get_cluster_metadata().await,
-            ClientWrapper::WebSocket(client) => client.get_cluster_metadata().await,
-        }
+        self.as_client().get_cluster_metadata().await
     }
 }
