@@ -786,7 +786,8 @@ public sealed class PrimaryPollingTests
         using var cluster = new PollCluster();
         using var client = await cluster.ConnectAsync();
         await PollAsync(client);
-        await client.UpdateUserAsync(Identifier.Numeric(7), "renamed", token: TestContext.Current.CancellationToken);
+        await client.UpdateUserAsync(Identifier.Numeric(7), new UserUpdate { Username = "renamed" },
+            TestContext.Current.CancellationToken);
         await client.ChangePasswordAsync(Identifier.String("renamed"), "secret", "new-secret",
             TestContext.Current.CancellationToken);
         await client.PollMessagesAsync(Stream, Topic, 1, Consumer.Group(3), PollingStrategy.Next(), 10, true,
@@ -1146,11 +1147,11 @@ public sealed class PrimaryPollingTests
     {
         using var cluster = new PollCluster();
         using var client = await cluster.ConnectAsync();
-        await client.UpdateStreamAsync(Stream, "renamed", TestContext.Current.CancellationToken);
+        await client.UpdateStreamAsync(Stream, new StreamUpdate { Name = "renamed" }, TestContext.Current.CancellationToken);
         await client.StoreOffsetAsync(Consumer.New(3), Stream, Topic, 10, 1, TestContext.Current.CancellationToken);
 
         var update = Assert.Single(cluster.CoordinatorRequests,
-            request => request.Operation == (byte)VsrOperation.UpdateStream);
+            request => request.Operation == (byte)VsrOperation.UpdateResource);
         Assert.True(Assert.Single(cluster.OffsetWrites).RequestId > update.RequestId);
     }
 

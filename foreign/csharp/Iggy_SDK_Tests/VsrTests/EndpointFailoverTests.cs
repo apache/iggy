@@ -370,7 +370,8 @@ public sealed class EndpointFailoverTests
         await client.LoginUserAsync("iggy", "iggy", TestContext.Current.CancellationToken);
         if (changeCredentials)
         {
-            await client.UpdateUserAsync(Identifier.Numeric(7), "renamed", token: TestContext.Current.CancellationToken);
+            await client.UpdateUserAsync(Identifier.Numeric(7), new UserUpdate { Username = "renamed" },
+                TestContext.Current.CancellationToken);
             await client.ChangePasswordAsync(Identifier.String("renamed"), "iggy", "new-secret",
                 TestContext.Current.CancellationToken);
         }

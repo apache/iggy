@@ -133,9 +133,9 @@ public class StreamsTests
         var topicName1 = "Topic1";
         var topicName2 = "Topic2";
         await client.CreateTopicAsync(Identifier.String(streamName),
-            topicName1, 1, messageExpiry: TimeSpan.FromHours(1));
+            topicName1, 1, new TopicOptions { MessageExpiry = TimeSpan.FromHours(1) });
         await client.CreateTopicAsync(Identifier.String(streamName),
-            topicName2, 1, messageExpiry: TimeSpan.FromHours(1));
+            topicName2, 1, new TopicOptions { MessageExpiry = TimeSpan.FromHours(1) });
 
         await client.SendMessagesAsync(Identifier.String(streamName),
             Identifier.String(topicName1), Partitioning.None(),
@@ -186,7 +186,7 @@ public class StreamsTests
         var streamToUpdate = await client.CreateStreamAsync(name);
         streamToUpdate.ShouldNotBeNull();
 
-        await client.UpdateStreamAsync(Identifier.String(streamToUpdate.Name), updatedName);
+        await client.UpdateStreamAsync(Identifier.String(streamToUpdate.Name), new StreamUpdate { Name = updatedName });
 
         var result = await client.GetStreamByIdAsync(Identifier.Numeric(streamToUpdate.Id));
         result.ShouldNotBeNull();

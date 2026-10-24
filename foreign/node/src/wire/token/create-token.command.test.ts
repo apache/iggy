@@ -57,5 +57,19 @@ describe('CreateToken', () => {
       );
     });
 
+    it('writes the expiry as microseconds in a u64 right after the name', () => {
+      assert.deepEqual(
+        CREATE_TOKEN.serialize({ name: 'token', expiry: 0x0102030405060708n }),
+        Buffer.from([5, 0x74, 0x6f, 0x6b, 0x65, 0x6e, 8, 7, 6, 5, 4, 3, 2, 1])
+      );
+    });
+
+    it('defaults the expiry to ten minutes in microseconds', () => {
+      assert.equal(
+        CREATE_TOKEN.serialize({ name: 'token' }).readBigUInt64LE(6),
+        600_000_000n
+      );
+    });
+
   });
 });

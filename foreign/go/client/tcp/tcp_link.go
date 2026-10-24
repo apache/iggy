@@ -83,7 +83,8 @@ func (l *tcpLink) exchange(ctx context.Context, frame *operationFrame) (linkRepl
 		return linkReply{err: ierror.ErrTransientNotAccepted}, false
 	default:
 	}
-	if l.pending[id] != nil {
+	// A select picks a ready case at random, so a cancelled caller must be refused before its frame is queued.
+	if l.pending[id] != nil || ctx.Err() != nil {
 		l.mu.Unlock()
 		<-l.capacity
 		return linkReply{err: ierror.ErrTransientNotAccepted}, false

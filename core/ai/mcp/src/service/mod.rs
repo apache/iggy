@@ -18,10 +18,11 @@
 use iggy::prelude::{
     Client, ClusterClient, CompressionAlgorithm, Consumer, ConsumerGroupClient,
     ConsumerOffsetClient, Identifier, IggyClient, IggyError, IggyExpiry, IggyMessage,
-    IggyTimestamp, MaxTopicSize, MessageClient, PartitionClient, Partitioning,
+    IggyTimestamp, MaxTopicSize, MessageClient, OptionKey, PartitionClient, Partitioning,
     PersonalAccessTokenClient, PollingKind, PollingStrategy, SegmentClient, StreamClient,
-    StreamUpdateOptions, SystemClient, SystemSnapshotType, TopicClient, TopicCreateOptions,
-    TopicUpdateOptions, UserClient, UserStatus, UserUpdateOptions,
+    StreamCreateOptions, StreamUpdateOptions, SystemClient, SystemSnapshotType, TopicClient,
+    TopicCreateOptions, TopicUpdateOptions, UserClient, UserCreateOptions, UserStatus,
+    UserUpdateOptions,
 };
 use requests::*;
 use rmcp::{
@@ -31,6 +32,9 @@ use rmcp::{
     tool, tool_handler, tool_router,
 };
 use serde::Serialize;
+use std::collections::BTreeSet;
+use std::fmt::Display;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::error;
@@ -90,18 +94,23 @@ impl IggyService {
         Parameters(CreateStream { name }): Parameters<CreateStream>,
     ) -> Result<CallToolResult, ErrorData> {
         self.permissions.ensure_create()?;
-        request(self.client.create_stream(&name).await)
+        request(
+            self.client
+                .create_stream(&name, &StreamCreateOptions::default())
+                .await,
+        )
     }
 
     #[tool(description = "Update stream")]
     pub async fn update_stream(
         &self,
-        Parameters(UpdateStream { stream_id, name }): Parameters<UpdateStream>,
+        Parameters(update): Parameters<UpdateStream>,
     ) -> Result<CallToolResult, ErrorData> {
         self.permissions.ensure_update()?;
+        let stream_id = id(&update.stream_id)?;
         request(
             self.client
-                .update_stream(&id(&stream_id)?, &name, &StreamUpdateOptions::default())
+                .update_stream(&stream_id, &StreamUpdateOptions::from(update))
                 .await,
         )
     }
@@ -189,28 +198,15 @@ impl IggyService {
     #[tool(description = "Update topic")]
     pub async fn update_topic(
         &self,
-        Parameters(UpdateTopic {
-            stream_id,
-            topic_id,
-            name,
-            compression_algorithm,
-            message_expiry,
-            max_size,
-            options,
-        }): Parameters<UpdateTopic>,
+        Parameters(update): Parameters<UpdateTopic>,
     ) -> Result<CallToolResult, ErrorData> {
         self.permissions.ensure_update()?;
-        // Absent means "leave alone" now, so an unparsable value must not
-        // silently become a reset to the server default.
-        let update_options = TopicUpdateOptions {
-            compression_algorithm: compression_algorithm.and_then(|ca| ca.parse().ok()),
-            message_expiry: message_expiry.and_then(|me| me.parse().ok()),
-            max_topic_size: max_size.and_then(|ms| ms.parse().ok()),
-            raw: options,
-        };
+        let stream_id = id(&update.stream_id)?;
+        let topic_id = id(&update.topic_id)?;
+        let update_options = TopicUpdateOptions::try_from(update)?;
         request(
             self.client
-                .update_topic(&id(&stream_id)?, &id(&topic_id)?, &name, &update_options)
+                .update_topic(&stream_id, &topic_id, &update_options)
                 .await,
         )
     }
@@ -637,7 +633,8 @@ impl IggyService {
     ) -> Result<CallToolResult, ErrorData> {
         self.permissions.ensure_create()?;
         let expiry = expiry
-            .and_then(|expiry| expiry.parse().ok())
+            .map(|expiry| parsed(&expiry, "personal access token expiry"))
+            .transpose()?
             .unwrap_or_default();
         request(
             self.client
@@ -689,7 +686,13 @@ impl IggyService {
         let permissions = permissions.map(|p| p.into());
         request(
             self.client
-                .create_user(&username, &password, status, permissions)
+                .create_user(
+                    &username,
+                    &password,
+                    status,
+                    permissions,
+                    &UserCreateOptions::default(),
+                )
                 .await,
         )
     }
@@ -697,28 +700,13 @@ impl IggyService {
     #[tool(description = "Update user")]
     pub async fn update_user(
         &self,
-        Parameters(UpdateUser {
-            user_id,
-            username,
-            active,
-        }): Parameters<UpdateUser>,
+        Parameters(update): Parameters<UpdateUser>,
     ) -> Result<CallToolResult, ErrorData> {
         self.permissions.ensure_update()?;
-        let status = active.map(|active| {
-            if active {
-                UserStatus::Active
-            } else {
-                UserStatus::Inactive
-            }
-        });
+        let user_id = id(&update.user_id)?;
         request(
             self.client
-                .update_user(
-                    &id(&user_id)?,
-                    username.as_deref(),
-                    status,
-                    &UserUpdateOptions::default(),
-                )
+                .update_user(&user_id, &UserUpdateOptions::from(update))
                 .await,
         )
     }
@@ -775,6 +763,88 @@ impl ServerHandler for IggyService {
     }
 }
 
+impl From<UpdateStream> for StreamUpdateOptions {
+    fn from(update: UpdateStream) -> Self {
+        let (reset, raw_reset) = split_reset(update.reset);
+        StreamUpdateOptions {
+            name: update.name,
+            reset,
+            raw_reset,
+            ..StreamUpdateOptions::default()
+        }
+    }
+}
+
+impl TryFrom<UpdateTopic> for TopicUpdateOptions {
+    type Error = ErrorData;
+
+    fn try_from(update: UpdateTopic) -> Result<Self, Self::Error> {
+        let (reset, raw_reset) = split_reset(update.reset);
+        Ok(TopicUpdateOptions {
+            name: update.name,
+            message_expiry: update
+                .message_expiry
+                .map(|value| parsed(&value, "message expiry"))
+                .transpose()?,
+            max_topic_size: update
+                .max_size
+                .map(|value| parsed(&value, "maximum size"))
+                .transpose()?,
+            reset,
+            raw_reset,
+            raw: update.options,
+        })
+    }
+}
+
+impl From<UpdateUser> for UserUpdateOptions {
+    fn from(update: UpdateUser) -> Self {
+        let (reset, raw_reset) = split_reset(update.reset);
+        UserUpdateOptions {
+            username: update.username,
+            status: update.active.map(|active| {
+                if active {
+                    UserStatus::Active
+                } else {
+                    UserStatus::Inactive
+                }
+            }),
+            reset,
+            raw_reset,
+            raw: update.options,
+        }
+    }
+}
+
+/// Split reset names into keys this build checks before sending and newer keys
+/// the server decides on.
+fn split_reset(names: Vec<String>) -> (BTreeSet<OptionKey>, BTreeSet<String>) {
+    let mut known = BTreeSet::new();
+    let mut newer = BTreeSet::new();
+    for name in names {
+        match name.parse::<OptionKey>() {
+            Ok(key) => {
+                known.insert(key);
+            }
+            Err(_) => {
+                newer.insert(name);
+            }
+        }
+    }
+    (known, newer)
+}
+
+fn parsed<T: FromStr>(value: &str, what: &str) -> Result<T, ErrorData>
+where
+    T::Err: Display,
+{
+    value.parse().map_err(|error: T::Err| {
+        let message = format!("Failed to parse {what}. {error}");
+        error!(message);
+        ErrorData::invalid_request(message, None)
+    })
+}
+
 fn id(id: &str) -> Result<Identifier, ErrorData> {
     Identifier::from_str_value(id).map_err(|e| {
         let message = format!("Failed to parse identifier. {e}");
@@ -814,6 +884,7 @@ fn operation_id_value(value: &str) -> Result<u64, ErrorData> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     #[test]
     fn given_uncertain_or_blocked_writes_when_reporting_errors_should_preserve_exact_operation_ids()
@@ -827,5 +898,83 @@ mod tests {
             let operation = data["operation_id"].as_str().unwrap();
             assert_eq!(operation_id_value(operation).unwrap(), u64::MAX);
         }
+    }
+
+    #[test]
+    fn given_update_topic_values_when_converting_should_parse_them_into_typed_options() {
+        let update = update_topic(
+            r#"{"name":"events-v2","message_expiry":"7days","max_size":"15GB","options":{"future_key":"1"}}"#,
+        );
+
+        let options = TopicUpdateOptions::try_from(update).expect("valid values convert");
+
+        assert_eq!(
+            options,
+            TopicUpdateOptions {
+                name: Some("events-v2".to_owned()),
+                message_expiry: Some("7days".parse().expect("valid expiry")),
+                max_topic_size: Some("15GB".parse().expect("valid size")),
+                raw: BTreeMap::from([("future_key".to_owned(), "1".to_owned())]),
+                ..TopicUpdateOptions::default()
+            }
+        );
+    }
+
+    #[test]
+    fn given_unparsable_update_topic_value_when_converting_should_refuse() {
+        for body in [r#"{"message_expiry":"soon"}"#, r#"{"max_size":"big"}"#] {
+            assert!(
+                TopicUpdateOptions::try_from(update_topic(body)).is_err(),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_reset_names_when_converting_should_send_known_typed_and_newer_raw() {
+        let update = update_topic(r#"{"reset":["message_expiry","future_key"]}"#);
+
+        let options = TopicUpdateOptions::try_from(update).expect("reset names convert");
+
+        assert_eq!(
+            options,
+            TopicUpdateOptions {
+                reset: BTreeSet::from([OptionKey::MessageExpiry]),
+                raw_reset: BTreeSet::from(["future_key".to_owned()]),
+                ..TopicUpdateOptions::default()
+            }
+        );
+    }
+
+    #[test]
+    fn given_stream_and_user_resets_when_converting_should_keep_the_name_optional() {
+        let stream: UpdateStream =
+            serde_json::from_str(r#"{"stream_id":"orders","reset":["future_key"]}"#)
+                .expect("a reset without a name parses");
+        let user: UpdateUser = serde_json::from_str(
+            r#"{"user_id":"alice","reset":["future_key"],"options":{"newer_key":"x"}}"#,
+        )
+        .expect("a user patch parses");
+
+        assert_eq!(
+            StreamUpdateOptions::from(stream),
+            StreamUpdateOptions {
+                raw_reset: BTreeSet::from(["future_key".to_owned()]),
+                ..StreamUpdateOptions::default()
+            }
+        );
+        assert_eq!(
+            UserUpdateOptions::from(user),
+            UserUpdateOptions {
+                raw_reset: BTreeSet::from(["future_key".to_owned()]),
+                raw: BTreeMap::from([("newer_key".to_owned(), "x".to_owned())]),
+                ..UserUpdateOptions::default()
+            }
+        );
+    }
+
+    fn update_topic(fields: &str) -> UpdateTopic {
+        let ids = r#"{"stream_id":"orders","topic_id":"events","#;
+        serde_json::from_str(&format!("{ids}{}", &fields[1..])).expect("valid update_topic body")
     }
 }

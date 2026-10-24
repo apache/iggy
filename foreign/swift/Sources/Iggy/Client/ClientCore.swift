@@ -545,7 +545,17 @@ actor ClientCore {
                 }
                 refused = error
                 let from = walk
-                guard let step = try await withDeadline(deadline, { [self] in try await self.failOver(from) }) else {
+                let moved: (moved: Bool, walk: RosterWalk)?
+                do {
+                    moved = try await withDeadline(deadline, { [self] in try await self.failOver(from) })
+                } catch let failed as IggyError where outcome.isUncertain && !failed.isReconnectable {
+                    // A failover that ends in a refusal, such as every node
+                    // refusing the sign-in mid view change, proves nothing
+                    // about the attempt that may have committed. A lost
+                    // connection goes back as it is, for the reconnect.
+                    throw outcome.observe(failed)
+                }
+                guard let step = moved else {
                     throw error
                 }
                 walk = step.walk
@@ -1386,10 +1396,9 @@ actor ClientCore {
             case .changePassword:
                 let change = try Requests.changedPassword(payload)
                 refreshSessionPassword(user: change.userID, newPassword: change.newPassword)
-            case .updateUser:
-                let update = try Requests.renamedUser(payload)
-                if let username = update.username {
-                    refreshSessionUsername(user: update.userID, newUsername: username)
+            case .updateResource:
+                if let rename = try Requests.renamedUser(payload) {
+                    refreshSessionUsername(user: rename.userID, newUsername: rename.username)
                 }
             default:
                 break

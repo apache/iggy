@@ -31,6 +31,7 @@
 
 pub mod change_password;
 pub mod create_consumer_group;
+pub mod create_keyed_stream;
 pub mod create_partitions;
 pub mod create_personal_access_token;
 pub mod create_stream;
@@ -217,4 +218,5 @@ op_dispatch! {
     LeaveFixtureGroup         => leave_fixture_group,
     StoreStaleOwnerOffset      => store_stale_owner_offset,
     PollMessages              => poll_messages,
+    CreateKeyedStream          => create_keyed_stream,
 }

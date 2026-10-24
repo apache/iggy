@@ -26,6 +26,7 @@
 
 pub mod actions;
 pub mod auditor;
+pub mod change_log_oracle;
 pub mod effect;
 pub mod ids;
 pub mod invariants;

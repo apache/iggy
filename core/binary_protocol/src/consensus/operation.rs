@@ -64,14 +64,26 @@ pub enum Operation {
     TruncatePartition = 68,
     FinalizeSession = 70,
     CompleteLifecycle = 71,
+    /// Prepare-resolved `UpdateResource` on a stream: column changes extracted,
+    /// resets resolved to their defaults. Claimed by the streams state machine.
+    UpdateStreamResolved = 72,
+    /// Prepare-resolved `UpdateResource` on a topic.
+    UpdateTopicResolved = 73,
+    /// Prepare-resolved `UpdateResource` on a user. Claimed by the users state
+    /// machine.
+    UpdateUserResolved = 74,
+    /// Server-originated: replace encrypted streams' wrap sets during a
+    /// key-encryption key rotation. Proposed by the metadata primary, no
+    /// client wire code.
+    RewrapStreamKeys = 75,
 
     // Metadata operations (shard 0)
     CreateStream = 128,
-    UpdateStream = 129,
+    // 129 was UpdateStream. Never reuse it.
     DeleteStream = 130,
     // 131 was PurgeStream. Never reuse it.
     CreateTopic = 132,
-    UpdateTopic = 133,
+    // 133 was UpdateTopic. Never reuse it.
     DeleteTopic = 134,
     // 135 was PurgeTopic. Never reuse it.
     CreatePartitions = 136,
@@ -84,7 +96,7 @@ pub enum Operation {
     CreateConsumerGroup = 139,
     DeleteConsumerGroup = 140,
     CreateUser = 141,
-    UpdateUser = 142,
+    // 142 was UpdateUser. Never reuse it.
     DeleteUser = 143,
     ChangePassword = 144,
     UpdatePermissions = 145,
@@ -92,6 +104,9 @@ pub enum Operation {
     DeletePersonalAccessToken = 147,
     JoinConsumerGroup = 148,
     LeaveConsumerGroup = 149,
+    /// Generic option patch for a stream, topic or user. Prepare rewrites it to
+    /// the resolved operation of the target's scope.
+    UpdateResource = 150,
 
     // Partition operations (routed by namespace)
     SendMessages = 160,
@@ -128,6 +143,9 @@ impl Operation {
         match self {
             Self::CreateTopicWithAssignments => Self::CreateTopic,
             Self::CreatePartitionsWithAssignments => Self::CreatePartitions,
+            Self::UpdateStreamResolved | Self::UpdateTopicResolved | Self::UpdateUserResolved => {
+                Self::UpdateResource
+            }
             Self::TruncatePartition => Self::DeleteSegments,
             operation => *operation,
         }
@@ -172,17 +190,14 @@ impl Operation {
         matches!(
             self,
             Self::CreateStream
-                | Self::UpdateStream
                 | Self::DeleteStream
                 | Self::CreateTopic
-                | Self::UpdateTopic
                 | Self::DeleteTopic
                 | Self::CreatePartitions
                 | Self::DeletePartitions
                 | Self::CreateConsumerGroup
                 | Self::DeleteConsumerGroup
                 | Self::CreateUser
-                | Self::UpdateUser
                 | Self::DeleteUser
                 | Self::ChangePassword
                 | Self::UpdatePermissions
@@ -190,6 +205,7 @@ impl Operation {
                 | Self::DeletePersonalAccessToken
                 | Self::JoinConsumerGroup
                 | Self::LeaveConsumerGroup
+                | Self::UpdateResource
         )
     }
 
@@ -269,6 +285,10 @@ impl Operation {
             | Self::NonReplicated
             | Self::CreateTopicWithAssignments
             | Self::CreatePartitionsWithAssignments
+            | Self::UpdateStreamResolved
+            | Self::UpdateTopicResolved
+            | Self::UpdateUserResolved
+            | Self::RewrapStreamKeys
             | Self::RemoveConsumerGroupMember
             | Self::CompleteConsumerGroupRevocation
             | Self::TruncatePartition
@@ -279,10 +299,8 @@ impl Operation {
             | Self::TransitionPartitionHistory
             | Self::RetireConsumerGroupOwners => None,
             Self::CreateStream
-            | Self::UpdateStream
             | Self::DeleteStream
             | Self::CreateTopic
-            | Self::UpdateTopic
             | Self::DeleteTopic
             | Self::CreatePartitions
             | Self::DeletePartitions
@@ -290,7 +308,6 @@ impl Operation {
             | Self::CreateConsumerGroup
             | Self::DeleteConsumerGroup
             | Self::CreateUser
-            | Self::UpdateUser
             | Self::DeleteUser
             | Self::ChangePassword
             | Self::UpdatePermissions
@@ -298,6 +315,7 @@ impl Operation {
             | Self::DeletePersonalAccessToken
             | Self::JoinConsumerGroup
             | Self::LeaveConsumerGroup
+            | Self::UpdateResource
             | Self::SendMessages
             | Self::StoreConsumerOffset
             | Self::DeleteConsumerOffset => match crate::dispatch::lookup_by_operation(*self) {
@@ -327,10 +345,8 @@ mod tests {
     fn command_code_roundtrip() {
         let ops = [
             Operation::CreateStream,
-            Operation::UpdateStream,
             Operation::DeleteStream,
             Operation::CreateTopic,
-            Operation::UpdateTopic,
             Operation::DeleteTopic,
             Operation::CreatePartitions,
             Operation::DeletePartitions,
@@ -338,7 +354,6 @@ mod tests {
             Operation::CreateConsumerGroup,
             Operation::DeleteConsumerGroup,
             Operation::CreateUser,
-            Operation::UpdateUser,
             Operation::DeleteUser,
             Operation::ChangePassword,
             Operation::UpdatePermissions,
@@ -346,6 +361,7 @@ mod tests {
             Operation::DeletePersonalAccessToken,
             Operation::JoinConsumerGroup,
             Operation::LeaveConsumerGroup,
+            Operation::UpdateResource,
             Operation::SendMessages,
             Operation::StoreConsumerOffset,
             Operation::DeleteConsumerOffset,
@@ -458,6 +474,45 @@ mod tests {
             assert!(
                 !Operation::is_known_code(code),
                 "reserved operation code {code} must not be reused"
+            );
+        }
+    }
+
+    #[test]
+    fn given_rewrap_operation_when_classifying_should_be_internal_metadata_and_not_client_allowed()
+    {
+        let rewrap = Operation::RewrapStreamKeys;
+        assert_eq!(rewrap as u8, 75);
+        assert!(rewrap.is_internal());
+        assert!(rewrap.is_metadata());
+        assert!(rewrap.is_metadata_plane());
+        assert!(!rewrap.is_client_allowed());
+        assert_eq!(rewrap.to_command_code(), None);
+        assert_eq!(rewrap.request_operation(), rewrap);
+        assert!(!Operation::is_known_code(69));
+    }
+
+    #[test]
+    fn given_resolved_update_operations_when_classifying_should_be_internal_metadata() {
+        for resolved in [
+            Operation::UpdateStreamResolved,
+            Operation::UpdateTopicResolved,
+            Operation::UpdateUserResolved,
+        ] {
+            assert!(resolved.is_internal(), "{resolved:?}");
+            assert!(resolved.is_metadata(), "{resolved:?}");
+            assert!(resolved.is_result_framed(), "{resolved:?}");
+            assert!(!resolved.is_client_allowed(), "{resolved:?}");
+            assert_eq!(resolved.to_command_code(), None);
+            assert_eq!(resolved.request_operation(), Operation::UpdateResource);
+        }
+        assert!(Operation::UpdateResource.is_metadata());
+        assert!(Operation::UpdateResource.is_client_allowed());
+        assert_eq!(Operation::UpdateResource as u8, 150);
+        for retired in [129u8, 133, 142] {
+            assert!(
+                !Operation::is_known_code(retired),
+                "{retired} must stay retired"
             );
         }
     }

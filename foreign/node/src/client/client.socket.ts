@@ -33,6 +33,8 @@ import { deserializePartitionRoute, type PartitionRoute } from '../wire/partitio
 import { ConsumerKind } from '../wire/offset/offset.utils.js';
 import { COMMAND_CODE } from '../wire/command.code.js';
 import { serializeIdentifier } from '../wire/identifier.utils.js';
+import { deserializeOptions } from '../wire/options.utils.js';
+import { OptionsScope } from '../wire/system/describe-options.command.js';
 import { PartitionKind } from '../wire/message/partitioning.utils.js';
 import { PollingStrategyKind } from '../wire/message/poll.utils.js';
 import {
@@ -86,8 +88,8 @@ const TOPIC_DISCOVERY_RESETS = new Set<number>([
 ]);
 const READ_COMMANDS = new Set<number>([
   COMMAND_CODE.Ping, COMMAND_CODE.GetStats, COMMAND_CODE.GetClusterMetadata,
-  COMMAND_CODE.DescribeOptions, COMMAND_CODE.GetMe, COMMAND_CODE.GetClient,
-  COMMAND_CODE.GetClients, COMMAND_CODE.GetUser, COMMAND_CODE.GetUsers,
+  COMMAND_CODE.DescribeOptions, COMMAND_CODE.GetMetadataChanges, COMMAND_CODE.GetMe,
+  COMMAND_CODE.GetClient, COMMAND_CODE.GetClients, COMMAND_CODE.GetUser, COMMAND_CODE.GetUsers,
   COMMAND_CODE.GetAccessTokens, COMMAND_CODE.GetPartitionRoute, COMMAND_CODE.GetOffset,
   COMMAND_CODE.GetStream, COMMAND_CODE.GetStreams, COMMAND_CODE.GetTopic,
   COMMAND_CODE.GetTopics, COMMAND_CODE.GetGroup, COMMAND_CODE.GetGroups, COMMAND_CODE.SyncGroup
@@ -1098,22 +1100,32 @@ export class CommandResponseStream extends EventEmitter {
       };
     } else if (command === LOGIN_WITH_TOKEN.code) {
       this.signInCredentials = { token: readWireName(payload, 0).value };
-    } else if ((command === COMMAND_CODE.ChangePassword || command === COMMAND_CODE.UpdateUser) &&
+    } else if ((command === COMMAND_CODE.ChangePassword ||
+        (command === COMMAND_CODE.UpdateResource && payload[0] === OptionsScope.User)) &&
         this.userId !== undefined && this.signInCredentials &&
         'username' in this.signInCredentials) {
       const credentials = this.signInCredentials;
+      // An update leads with its scope byte, a password change with the user id.
+      const start = command === COMMAND_CODE.ChangePassword ? 0 : 1;
       const identifier = [serializeIdentifier(this.userId), serializeIdentifier(credentials.username)]
-        .find((encoded) => payload.subarray(0, encoded.length).equals(encoded));
+        .find((encoded) => payload.subarray(start, start + encoded.length).equals(encoded));
       if (!identifier)
         return;
       if (command === COMMAND_CODE.ChangePassword) {
         const currentPassword = readWireName(payload, identifier.length);
         const password = readWireName(payload, currentPassword.next).value;
         this.signInCredentials = { ...credentials, password };
-      } else if (payload[identifier.length] === 1) {
-        const username = readWireName(payload, identifier.length + 1).value;
-        this.signInCredentials = { ...credentials, username };
+        return;
       }
+      let position = start + identifier.length;
+      const resetCount = payload.readUInt8(position);
+      position += 1;
+      for (let index = 0; index < resetCount; index++)
+        position = readWireName(payload, position).next;
+      const username = deserializeOptions(payload, position).username;
+      if (typeof username !== 'string')
+        return;
+      this.signInCredentials = { ...credentials, username };
     }
   }
 

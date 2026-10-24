@@ -10,15 +10,21 @@
 /helm
 /licenses
 /local_data
+/local_state
 /performance_results
 /test_logs
+**/.venv
+**/node_modules
+**/.gradle
 /foreign/swift/.build
+/foreign/java/**/build
 /bdd/java/build
 /examples/java/**/build
-/foreign/java/**/build
 /web/build
-**/.gradle
-**/node_modules
+/foreign/csharp/**/bin
+/foreign/csharp/**/obj
+/foreign/cpp/bazel-*
+/foreign/php/vendor
 # Selectively exclude scripts/ subdirs not needed in container builds.
 # scripts/ci/third-party-licenses.sh + render-node-licenses.mjs are
 # required by the convenience-binary Dockerfiles to render LICENSE-binary

@@ -25,6 +25,7 @@ import org.apache.iggy.partition.Partition;
 import java.math.BigInteger;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 /**
  * A topic and its partitions, as the server reports them.
@@ -36,9 +37,6 @@ public record TopicDetails(
         BigInteger createdAt,
         String name,
         String size,
-        BigInteger messageExpiry,
-        CompressionAlgorithm compressionAlgorithm,
-        BigInteger maxTopicSize,
         BigInteger messagesCount,
         Long partitionsCount,
         List<Partition> partitions,
@@ -55,13 +53,25 @@ public record TopicDetails(
                 topic.createdAt(),
                 topic.name(),
                 topic.size(),
-                topic.messageExpiry(),
-                topic.compressionAlgorithm(),
-                topic.maxTopicSize(),
                 topic.messagesCount(),
                 topic.partitionsCount(),
                 partitions,
                 topic.options(),
                 topic.derivedOptions());
+    }
+
+    /** Message expiry in microseconds, {@code 2^64 - 1} meaning never. */
+    public Optional<BigInteger> messageExpiry() {
+        return TopicSettings.uint64(options, derivedOptions, TopicOptionKey.MESSAGE_EXPIRY);
+    }
+
+    /** The stored compression label. */
+    public Optional<CompressionAlgorithm> compressionAlgorithm() {
+        return TopicSettings.compression(options, derivedOptions);
+    }
+
+    /** Topic size cap in bytes, {@code 2^64 - 1} meaning unlimited. */
+    public Optional<BigInteger> maxTopicSize() {
+        return TopicSettings.uint64(options, derivedOptions, TopicOptionKey.MAX_TOPIC_SIZE);
     }
 }

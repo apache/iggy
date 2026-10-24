@@ -24,6 +24,7 @@ import {
   type HeaderValue,
   type ParsedHeaderValue,
 } from './message/header.utils.js';
+import { OptionFlag, OptionsScope } from './system/describe-options.command.js';
 
 /** Maximum number of key-value entries in one options block. */
 export const MAX_OPTIONS = 1024;
@@ -42,6 +43,77 @@ export const MAX_OPTIONS_BYTES = 100 * 1000;
  * rule: the server refuses a block carrying a field outside this range.
  */
 const MAX_HEADER_FIELD_LENGTH = 255;
+
+/** Stream option keys a client can name: create, update, reset or read. */
+export const StreamOptionKey = {
+  Name: 'name',
+  EncryptionKey: 'encryption_key',
+  EncryptionKeySource: 'encryption_key_source',
+  EncryptionKeyFingerprint: 'encryption_key_fingerprint',
+  EncryptionKekFingerprint: 'encryption_kek_fingerprint'
+} as const;
+
+export type StreamOptionKey = typeof StreamOptionKey[keyof typeof StreamOptionKey];
+
+/** Topic option keys a client can name: create, update, reset or read. */
+export const TopicOptionKey = {
+  Name: 'name',
+  CompressionAlgorithm: 'compression_algorithm',
+  MessageExpiry: 'message_expiry',
+  MaxTopicSize: 'max_topic_size',
+  SegmentSize: 'segment_size',
+  Durability: 'durability',
+  ConsumerOffsetDurability: 'consumer_offset_durability',
+  PartitionResizePolicy: 'partition_resize_policy',
+  MessagesRequiredToSave: 'messages_required_to_save',
+  SizeOfMessagesRequiredToSave: 'size_of_messages_required_to_save',
+  PreallocateSegments: 'preallocate_segments'
+} as const;
+
+export type TopicOptionKey = typeof TopicOptionKey[keyof typeof TopicOptionKey];
+
+/** User option keys a client can name: create, update, reset or read. */
+export const UserOptionKey = {
+  Username: 'username',
+  Status: 'status'
+} as const;
+
+export type UserOptionKey = typeof UserOptionKey[keyof typeof UserOptionKey];
+
+/** What the server catalog lets a client do with one key. */
+export type OptionDescriptor = {
+  scopes: readonly OptionsScope[],
+  /** `OptionFlag` bits, as `describeOptions` reports them */
+  flags: number,
+  /** Written only by the server, never accepted and never returned */
+  internal: boolean
+};
+
+const { Topic, Stream, User } = OptionsScope;
+const { Updatable, Resettable, Secret, ReadOnly, Critical } = OptionFlag;
+
+/** The server option catalog in catalog order. */
+export const OPTION_CATALOG: ReadonlyMap<string, OptionDescriptor> = new Map([
+  ['name', { scopes: [Stream, Topic], flags: Updatable, internal: false }],
+  ['username', { scopes: [User], flags: Updatable, internal: false }],
+  ['status', { scopes: [User], flags: Updatable, internal: false }],
+  ['compression_algorithm', { scopes: [Topic], flags: 0, internal: false }],
+  ['message_expiry', { scopes: [Topic], flags: Updatable | Resettable, internal: false }],
+  ['max_topic_size', { scopes: [Topic], flags: Updatable | Resettable, internal: false }],
+  ['segment_size', { scopes: [Topic], flags: 0, internal: false }],
+  ['durability', { scopes: [Topic], flags: 0, internal: false }],
+  ['consumer_offset_durability', { scopes: [Topic], flags: 0, internal: false }],
+  ['partition_resize_policy', { scopes: [Topic], flags: 0, internal: false }],
+  ['messages_required_to_save', { scopes: [Topic], flags: 0, internal: false }],
+  ['size_of_messages_required_to_save', { scopes: [Topic], flags: 0, internal: false }],
+  ['preallocate_segments', { scopes: [Topic], flags: 0, internal: false }],
+  ['encryption_key', { scopes: [Stream], flags: Secret | Critical, internal: false }],
+  ['encryption_key_wrapped', { scopes: [Stream], flags: Critical, internal: true }],
+  ['encryption_key_source', { scopes: [Stream], flags: ReadOnly, internal: false }],
+  ['encryption_key_fingerprint', { scopes: [Stream], flags: ReadOnly, internal: false }],
+  ['encryption_kek_fingerprint', { scopes: [Stream], flags: ReadOnly, internal: false }],
+  ['critical_keys', { scopes: [Stream, Topic, User], flags: 0, internal: true }]
+]);
 
 /** A resource option entry: UTF-8 string key with a typed value. */
 export type OptionEntry = {
@@ -73,6 +145,14 @@ export const dedupeOptions = (options: OptionEntry[]): OptionEntry[] => {
     byKey.set(entry.key, entry);
   return [...byKey.values()];
 };
+
+/**
+ * Orders entries by key bytes, the order the server's own encoders write, so a
+ * command block is byte-identical to the one any other SDK sends.
+ */
+export const sortOptions = (options: OptionEntry[]): OptionEntry[] =>
+  [...options].sort((left, right) =>
+    Buffer.compare(Buffer.from(left.key), Buffer.from(right.key)));
 
 /**
  * Rejects a key or value the codec cannot express.

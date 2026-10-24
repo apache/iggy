@@ -20,6 +20,7 @@
 pub mod ack_level;
 pub mod consumer;
 pub mod identifier;
+pub mod metadata_changes;
 pub mod options;
 pub mod partition_assignment;
 pub mod partition_history;

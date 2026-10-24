@@ -184,7 +184,10 @@ async fn create_client_for_transport(
 }
 
 async fn init_system(client: &IggyClient, total_producers: usize) {
-    client.create_stream(STREAM_NAME).await.unwrap();
+    client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
 
     client
         .create_topic(

@@ -76,6 +76,13 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * kept separate so a death mid-connection cannot disturb that suite's server.
  */
 class AsyncIggyTcpClientEndpointFailoverTest {
+    static final Duration RECOVERY = Duration.ofSeconds(5);
+    // The user that registerBody signs in.
+    static final long SIGNED_IN_USER_ID = 1;
+    static final String USERNAME = "alice";
+    static final String FIRST_PASSWORD = "first-secret";
+    static final String SECOND_PASSWORD = "second-secret";
+
     private static final int OPERATION_REGISTER = 1;
     private static final int OPERATION_NON_REPLICATED = 2;
     private static final int GET_CLUSTER_METADATA_CODE = 12;
@@ -88,18 +95,8 @@ class AsyncIggyTcpClientEndpointFailoverTest {
     // One retry per burst, so an outage of a second outlasts many bursts.
     private static final RetryPolicy ONE_RETRY = RetryPolicy.fixedDelay(1, Duration.ofMillis(50));
     private static final Duration OUTAGE = Duration.ofSeconds(1);
-    private static final Duration RECOVERY = Duration.ofSeconds(5);
     private static final int LOGIN_CODE = CommandCode.User.LOGIN.getValue();
-    private static final int CHANGE_PASSWORD_CODE = CommandCode.User.CHANGE_PASSWORD.getValue();
-    private static final int UPDATE_USER_CODE = CommandCode.User.UPDATE.getValue();
-    // The user that registerBody signs in.
-    private static final long SIGNED_IN_USER_ID = 1;
-    private static final long OTHER_USER_ID = 2;
-    private static final String USERNAME = "alice";
-    private static final String RENAMED = "carol";
     private static final String OTHER_USERNAME = "bob";
-    private static final String FIRST_PASSWORD = "first-secret";
-    private static final String SECOND_PASSWORD = "second-secret";
 
     @Test
     void shouldCloseAnUnmanagedBootstrapAfterRetargeting() throws Exception {
@@ -1184,113 +1181,6 @@ class AsyncIggyTcpClientEndpointFailoverTest {
     }
 
     /**
-     * A committed password change or rename of the signed-in user reaches every later sign-in, also when the
-     * change was sent raw, or ended uncertain until a resolve proved it. Only the request names the new
-     * credentials.
-     */
-    @ParameterizedTest(name = "raw={0}, rename={1}")
-    @CsvSource({"false,false", "true,false", "false,true", "true,true"})
-    @SuppressWarnings("checkstyle:NPathComplexity")
-    void shouldSignInWithTheCommittedChangeOfTheSignedInUser(boolean raw, boolean rename) throws Exception {
-        try (ServerSocket nodeSocket = new ServerSocket(0, 4, InetAddress.getLoopbackAddress())) {
-            AtomicBoolean committing = new AtomicBoolean(raw);
-            AtomicBoolean hangUpOnRegister = new AtomicBoolean();
-            List<String> signIns = new CopyOnWriteArrayList<>();
-            MockNode node = credentialsNode(
-                    nodeSocket,
-                    hangUpOnRegister,
-                    signIns,
-                    request -> committing.get()
-                            ? Response.committed(
-                                    request.operation(), 2, Unpooled.buffer().writeIntLE(0))
-                            : Response.error(request.operation(), AsyncTcpConnection.TRANSIENT_NOT_COMMITTED));
-            AsyncIggyTcpClient client = limitedClient(nodeSocket.getLocalPort());
-            try {
-                client.connect().get(5, TimeUnit.SECONDS);
-                client.users().login(USERNAME, FIRST_PASSWORD).get(5, TimeUnit.SECONDS);
-                // A rename names the user by name and a password change by id, so both ways must match.
-                UserId self = rename ? UserId.of(USERNAME) : UserId.of(SIGNED_IN_USER_ID);
-                if (raw) {
-                    client.sendBinaryRequest(
-                                    rename ? UPDATE_USER_CODE : CHANGE_PASSWORD_CODE,
-                                    rename
-                                            ? renameBody(self, RENAMED)
-                                            : changePasswordBody(self, FIRST_PASSWORD, SECOND_PASSWORD))
-                            .get(5, TimeUnit.SECONDS);
-                } else {
-                    CompletableFuture<Void> change = rename
-                            ? client.users().updateUser(self, Optional.of(RENAMED), Optional.empty())
-                            : client.users().changePassword(self, FIRST_PASSWORD, SECOND_PASSWORD);
-                    long operation = uncertainOperation(change);
-                    committing.set(true);
-                    client.resolveOperation(operation, Duration.ofSeconds(1)).get(5, TimeUnit.SECONDS);
-                }
-
-                assertThat(signInsAfterTheSessionIsLost(client, node, hangUpOnRegister, signIns))
-                        .allSatisfy(signIn -> assertThat(signIn)
-                                .contains(rename ? RENAMED : USERNAME, rename ? FIRST_PASSWORD : SECOND_PASSWORD)
-                                .doesNotContain(rename ? USERNAME : FIRST_PASSWORD));
-            } finally {
-                client.close().get(5, TimeUnit.SECONDS);
-                node.close();
-            }
-        }
-    }
-
-    /**
-     * A change that the server committed as rejected, such as a wrong current password, and a change of another
-     * user leave the sign-in as it was.
-     */
-    @ParameterizedTest(name = "rejected={0}")
-    @ValueSource(booleans = {false, true})
-    void shouldKeepTheSignInAfterARejectedChangeOrAChangeOfAnotherUser(boolean rejected) throws Exception {
-        try (ServerSocket nodeSocket = new ServerSocket(0, 4, InetAddress.getLoopbackAddress())) {
-            AtomicBoolean hangUpOnRegister = new AtomicBoolean();
-            List<String> signIns = new CopyOnWriteArrayList<>();
-            MockNode node = credentialsNode(
-                    nodeSocket,
-                    hangUpOnRegister,
-                    signIns,
-                    request -> Response.committed(
-                            request.operation(),
-                            2,
-                            rejected
-                                    ? AsyncIggyTcpClientTransientFailoverTest.transientResult(
-                                            IggyErrorCode.INVALID_CREDENTIALS.getCode())
-                                    : Unpooled.buffer().writeIntLE(0)));
-            AsyncIggyTcpClient client = limitedClient(nodeSocket.getLocalPort());
-            try {
-                client.connect().get(5, TimeUnit.SECONDS);
-                client.users().login(USERNAME, FIRST_PASSWORD).get(5, TimeUnit.SECONDS);
-                var change = client.sendBinaryRequest(
-                        CHANGE_PASSWORD_CODE,
-                        changePasswordBody(
-                                UserId.of(rejected ? SIGNED_IN_USER_ID : OTHER_USER_ID),
-                                FIRST_PASSWORD,
-                                SECOND_PASSWORD));
-                if (rejected) {
-                    assertThatThrownBy(() -> change.get(5, TimeUnit.SECONDS))
-                            .cause()
-                            .isInstanceOfSatisfying(
-                                    IggyServerException.class,
-                                    error -> assertThat(error.getRawErrorCode())
-                                            .isEqualTo(IggyErrorCode.INVALID_CREDENTIALS.getCode()));
-                } else {
-                    change.get(5, TimeUnit.SECONDS);
-                }
-
-                assertThat(signInsAfterTheSessionIsLost(client, node, hangUpOnRegister, signIns))
-                        .allSatisfy(signIn -> assertThat(signIn)
-                                .contains(USERNAME, FIRST_PASSWORD)
-                                .doesNotContain(SECOND_PASSWORD));
-            } finally {
-                client.close().get(5, TimeUnit.SECONDS);
-                node.close();
-            }
-        }
-    }
-
-    /**
      * Every link of the session signs in with the committed password of the signed-in user. Here that is the poll
      * link on the survivor, which the coordinator moves to and back from before the change commits, and which
      * becomes the coordinator when the leader moves there. An uncertain change commits only when a resolve proves
@@ -1575,47 +1465,7 @@ class AsyncIggyTcpClientEndpointFailoverTest {
         }
     }
 
-    /**
-     * Records every Register and hangs up on the first one after {@code hangUpOnRegister} is set. A password
-     * change or a rename gets the reply of {@code change}.
-     */
-    private static MockNode credentialsNode(
-            ServerSocket socket, AtomicBoolean hangUpOnRegister, List<String> signIns, RequestHandler change) {
-        return MockNode.serve(socket, request -> {
-            if (request.operation() == OPERATION_REGISTER) {
-                signIns.add(request.bodyAsText());
-                return hangUpOnRegister.getAndSet(false)
-                        ? Response.disconnect()
-                        : Response.success(OPERATION_REGISTER, registerBody(signIns.size()));
-            }
-            if (request.operation() == VsrOperation.CHANGE_PASSWORD
-                    || request.operation() == VsrOperation.UPDATE_USER) {
-                return change.handle(request);
-            }
-            return Response.success(request.operation(), Unpooled.EMPTY_BUFFER);
-        });
-    }
-
-    /**
-     * Ends the session and returns the sign-ins that restore it: the one on the next link of the connection,
-     * which hangs up, and the one that the redial replays. A roster read never waits for a session, so it ends
-     * when that sign-in hangs up.
-     */
-    private static List<String> signInsAfterTheSessionIsLost(
-            AsyncIggyTcpClient client, MockNode node, AtomicBoolean hangUpOnRegister, List<String> signIns)
-            throws Exception {
-        int before = signIns.size();
-        node.rejectBindings = true;
-        hangUpOnRegister.set(true);
-        node.dropConnections();
-        assertThatThrownBy(() -> client.system().getClusterMetadata().get(5, TimeUnit.SECONDS))
-                .isInstanceOf(ExecutionException.class);
-        AsyncIggyTcpClientEventLoopGroupTest.await(() -> signIns.size() >= before + 2, "the redial sign-in", RECOVERY);
-        List<String> all = List.copyOf(signIns);
-        return all.subList(before, all.size());
-    }
-
-    private static long uncertainOperation(CompletableFuture<?> call) {
+    static long uncertainOperation(CompletableFuture<?> call) {
         AtomicLong operation = new AtomicLong();
         assertThatThrownBy(() -> call.get(5, TimeUnit.SECONDS))
                 .cause()
@@ -1632,22 +1482,7 @@ class AsyncIggyTcpClientEndpointFailoverTest {
                 .writeBytes(BytesSerializer.toBytes(password, "password")));
     }
 
-    /** The body that {@code UsersClient.changePassword} writes. */
-    private static byte[] changePasswordBody(UserId user, String currentPassword, String newPassword) {
-        return ByteBufUtil.getBytes(BytesSerializer.toBytes(user)
-                .writeBytes(BytesSerializer.toBytes(currentPassword, "current password"))
-                .writeBytes(BytesSerializer.toBytes(newPassword, "new password")));
-    }
-
-    /** The body that {@code UsersClient.updateUser} writes for a rename: a username and no status. */
-    private static byte[] renameBody(UserId user, String username) {
-        return ByteBufUtil.getBytes(BytesSerializer.toBytes(user)
-                .writeByte(1)
-                .writeBytes(BytesSerializer.toBytes(username, "username"))
-                .writeByte(0));
-    }
-
-    private static AsyncIggyTcpClient limitedClient(int port) {
+    static AsyncIggyTcpClient limitedClient(int port) {
         return AsyncIggyTcpClient.builder()
                 .host(InetAddress.getLoopbackAddress().getHostAddress())
                 .port(port)
@@ -1676,7 +1511,7 @@ class AsyncIggyTcpClientEndpointFailoverTest {
         body.writeIntLE(0);
         body.writeIntLE(1);
         body.writeLongLE(session);
-        body.writeIntLE((11 << 10) | 1);
+        body.writeIntLE(12 << 10);
         body.writeByte(0);
         return body;
     }

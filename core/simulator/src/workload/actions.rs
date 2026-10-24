@@ -53,6 +53,7 @@ pub enum Action {
     LeaveFixtureGroup,
     StoreStaleOwnerOffset,
     PollMessages,
+    CreateKeyedStream,
 }
 
 // Lock the discriminants of the first three variants. Inserting a new variant before

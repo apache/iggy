@@ -17,10 +17,12 @@
  * under the License.
  */
 
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -274,19 +276,19 @@ TEST(TopicCreateOptionsTest, RawMapReplacesDuplicateKeysWhenMoved) {
 
 TEST(TopicUpdateOptionsTest, DefaultHasNoValues) {
     const iggy::TopicUpdateOptions options;
-    EXPECT_FALSE(options.CompressionAlgorithm().has_value());
+    EXPECT_FALSE(options.Name().has_value());
     EXPECT_FALSE(options.MessageExpiry().has_value());
     EXPECT_FALSE(options.MaxTopicSize().has_value());
     EXPECT_TRUE(options.RawEntries().empty());
+    EXPECT_TRUE(options.ResetKeys().empty());
 }
 
 TEST(TopicUpdateOptionsTest, StoresUpdatableFields) {
     iggy::TopicUpdateOptions options;
-    options.SetCompressionAlgorithm(iggy::CompressionAlgorithm::Gzip())
+    options.SetName("renamed")
         .SetMessageExpiry(iggy::Expiry::NeverExpire())
         .SetMaxTopicSize(iggy::MaxTopicSize::Unlimited());
-    ASSERT_TRUE(options.CompressionAlgorithm().has_value());
-    EXPECT_EQ(options.CompressionAlgorithm()->Value(), "gzip");
+    EXPECT_EQ(options.Name(), std::optional<std::string>("renamed"));
     ASSERT_TRUE(options.MessageExpiry().has_value());
     EXPECT_EQ(options.MessageExpiry()->Kind(), "never_expire");
     ASSERT_TRUE(options.MaxTopicSize().has_value());
@@ -325,6 +327,77 @@ TEST(TopicUpdateOptionsTest, RawMapReplacesDuplicateKeys) {
     options.SetRawEntries(std::move(third_entries)).SetRawEntries(std::move(fourth_entries));
 
     EXPECT_EQ(options.RawEntries().at("message_expiry"), "1 day");
+}
+
+TEST(TopicUpdateOptionsTest, ResetCollectsTypedKeysOnce) {
+    iggy::TopicUpdateOptions options;
+    options.Reset(iggy::TopicOptionKey::MaxTopicSize)
+        .Reset(iggy::TopicOptionKey::MessageExpiry)
+        .Reset(iggy::TopicOptionKey::MaxTopicSize);
+    EXPECT_EQ(options.ResetKeys(), (std::set<iggy::TopicOptionKey>{iggy::TopicOptionKey::MessageExpiry,
+                                                                   iggy::TopicOptionKey::MaxTopicSize}));
+}
+
+TEST(OptionKeyTest, ReturnsCatalogNames) {
+    EXPECT_EQ(iggy::to_string(iggy::StreamOptionKey::Name), "name");
+    EXPECT_EQ(iggy::to_string(iggy::StreamOptionKey::EncryptionKey), "encryption_key");
+    EXPECT_EQ(iggy::to_string(iggy::StreamOptionKey::EncryptionKekFingerprint), "encryption_kek_fingerprint");
+    EXPECT_EQ(iggy::to_string(iggy::TopicOptionKey::SizeOfMessagesRequiredToSave), "size_of_messages_required_to_save");
+    EXPECT_EQ(iggy::to_string(iggy::UserOptionKey::Status), "status");
+    EXPECT_EQ(iggy::to_string(iggy::OptionsScope::User), "user");
+    EXPECT_EQ(iggy::to_string(iggy::StreamEncryptionSource::Server), "server");
+}
+
+TEST(StreamCreateOptionsTest, LastKeySetterWins) {
+    iggy::StreamCreateOptions options;
+    EXPECT_FALSE(options.HasEncryptionKey());
+    options.SetEncryptionKey(std::vector<std::uint8_t>(32, 7));
+    EXPECT_TRUE(options.HasEncryptionKey());
+    options.SetEncryptionKeyBase64("BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=");
+    EXPECT_TRUE(options.HasEncryptionKey());
+    options.SetRawEntries({{"future_key", "future_value"}});
+    EXPECT_EQ(options.RawEntries().at("future_key"), "future_value");
+}
+
+TEST(StreamUpdateOptionsTest, StoresNameAndReset) {
+    iggy::StreamUpdateOptions options;
+    EXPECT_FALSE(options.Name().has_value());
+    options.SetName("renamed").Reset(iggy::StreamOptionKey::EncryptionKey);
+    EXPECT_EQ(options.Name(), std::optional<std::string>("renamed"));
+    EXPECT_EQ(options.ResetKeys(), (std::set<iggy::StreamOptionKey>{iggy::StreamOptionKey::EncryptionKey}));
+}
+
+TEST(UserUpdateOptionsTest, StoresUsernameStatusAndReset) {
+    iggy::UserUpdateOptions options;
+    EXPECT_FALSE(options.Username().has_value());
+    EXPECT_FALSE(options.Status().has_value());
+    options.SetUsername("renamed").SetStatus(iggy::UserStatus::Inactive).Reset(iggy::UserOptionKey::Status);
+    EXPECT_EQ(options.Username(), std::optional<std::string>("renamed"));
+    EXPECT_EQ(options.Status(), std::optional<iggy::UserStatus>(iggy::UserStatus::Inactive));
+    EXPECT_EQ(options.ResetKeys(), (std::set<iggy::UserOptionKey>{iggy::UserOptionKey::Status}));
+}
+
+TEST(UserCreateOptionsTest, RawMapStoresKeys) {
+    iggy::UserCreateOptions options;
+    EXPECT_TRUE(options.RawEntries().empty());
+    options.SetRawEntries({{"future_key", "future_value"}});
+    EXPECT_EQ(options.RawEntries().at("future_key"), "future_value");
+}
+
+TEST(EncryptionKeyFingerprintTest, AcceptsOnlyThirtyTwoBytes) {
+    const auto fingerprint = iggy::EncryptionKeyFingerprint(std::vector<std::uint8_t>(32, 7));
+    EXPECT_EQ(fingerprint.size(), 16u);
+    EXPECT_EQ(fingerprint, iggy::EncryptionKeyFingerprint(std::vector<std::uint8_t>(32, 7)));
+    for (const std::size_t length : {std::size_t{0}, std::size_t{31}, std::size_t{33}}) {
+        SCOPED_TRACE(length);
+        try {
+            (void)iggy::EncryptionKeyFingerprint(std::vector<std::uint8_t>(length, 7));
+            ADD_FAILURE() << "A key that is not 32 bytes must be refused";
+        } catch (const iggy::IggyException &error) {
+            EXPECT_EQ(error.Kind(), "invalid_encryption_key");
+            EXPECT_EQ(error.Code(), std::optional<std::uint32_t>(70));
+        }
+    }
 }
 
 TEST(StreamUpdateOptionsTest, RawMapStoresKeys) {
@@ -457,16 +530,19 @@ TEST(IggyBlockingClientTest, MovedFromOperationsThrow) {
     EXPECT_THROW((void)client.GetUsers(), iggy::IggyException);
     EXPECT_THROW((void)client.CreateUser("user", "secret123", iggy::UserStatus::Active), iggy::IggyException);
     EXPECT_THROW(client.DeleteUser(stream), iggy::IggyException);
-    EXPECT_THROW(client.UpdateUser(stream, "updated-user", iggy::UserStatus::Active, iggy::UserUpdateOptions{}),
+    EXPECT_THROW(client.UpdateUser(
+                     stream, iggy::UserUpdateOptions().SetUsername("updated-user").SetStatus(iggy::UserStatus::Active)),
                  iggy::IggyException);
     EXPECT_THROW(client.CreateStream("stream"), iggy::IggyException);
-    EXPECT_THROW(client.UpdateStream(stream, "updated-stream"), iggy::IggyException);
+    EXPECT_THROW(client.UpdateStream(stream, iggy::StreamUpdateOptions().SetName("updated-stream")),
+                 iggy::IggyException);
     EXPECT_THROW(client.GetStreams(), iggy::IggyException);
     EXPECT_THROW(client.GetStream(stream), iggy::IggyException);
     EXPECT_THROW(client.DeleteStream(stream), iggy::IggyException);
     EXPECT_THROW(client.CreateTopic(stream, "topic", iggy::TopicCreateOptions().SetPartitionsCount(1)),
                  iggy::IggyException);
-    EXPECT_THROW(client.UpdateTopic(stream, topic, "updated-topic"), iggy::IggyException);
+    EXPECT_THROW(client.UpdateTopic(stream, topic, iggy::TopicUpdateOptions().SetName("updated-topic")),
+                 iggy::IggyException);
     EXPECT_THROW(client.GetTopics(stream), iggy::IggyException);
     EXPECT_THROW(client.GetTopic(stream, topic), iggy::IggyException);
     EXPECT_THROW(client.DeleteTopic(stream, topic), iggy::IggyException);
@@ -484,6 +560,7 @@ TEST(IggyBlockingClientTest, MovedFromOperationsThrow) {
                  iggy::IggyException);
     EXPECT_THROW(client.GetConsumerOffset(consumer, stream, topic, 0), iggy::IggyException);
     EXPECT_THROW(client.DeleteConsumerOffset(consumer, stream, topic, 0), iggy::IggyException);
+    EXPECT_THROW((void)client.DescribeOptions(iggy::OptionsScope::Stream), iggy::IggyException);
     EXPECT_THROW((void)client.GetStats(), iggy::IggyException);
     EXPECT_THROW((void)client.GetMe(), iggy::IggyException);
     EXPECT_THROW((void)client.GetClient(1), iggy::IggyException);

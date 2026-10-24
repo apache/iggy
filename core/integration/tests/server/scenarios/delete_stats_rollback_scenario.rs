@@ -85,7 +85,10 @@ pub async fn run(harness: &TestHarness) {
 /// both the topic and the stream. The retained partition's messages must stay
 /// counted, so a blanket zeroing fails here as loudly as no rollback at all.
 async fn delete_partitions_rolls_back_topic_and_stream(client: &IggyClient) {
-    client.create_stream(STREAM_NAME).await.unwrap();
+    client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     create_topic(client, STREAM_NAME, KEPT_TOPIC).await;
 
     // One pass per partition, so the delete below removes a known share.
@@ -152,7 +155,10 @@ async fn delete_partitions_rolls_back_topic_and_stream(client: &IggyClient) {
 /// Deleting a topic that still holds messages must take its bytes out of the
 /// stream total, not just remove the topic.
 async fn delete_topic_rolls_back_the_stream(client: &IggyClient) {
-    client.create_stream(STREAM_NAME).await.unwrap();
+    client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     create_topic(client, STREAM_NAME, KEPT_TOPIC).await;
     create_topic(client, STREAM_NAME, DELETED_TOPIC).await;
 

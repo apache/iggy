@@ -711,7 +711,16 @@ impl<SB: SuperblockStore> PartitionIoJob<SB> {
                         crate::state_transfer::mark_materialization_missing(&directory, revision)
                             .await?;
                     }
-                    crate::state_transfer::quarantine_partition_files(&directory, None).await
+                    // The drain phase settled every WAL and offset writer, and a
+                    // reload would reject canonical transfers against the divergent
+                    // prepare history and consumer offsets left in place.
+                    let fenced = crate::state_transfer::quarantine_partition_files(
+                        &directory,
+                        replicated.then_some(revision),
+                    )
+                    .await?;
+                    crate::state_transfer::quarantine_offsets(&directory, &fenced).await?;
+                    Ok(fenced)
                 }
                 .await;
                 PartitionIoResult::Quarantine(outcome)

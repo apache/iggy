@@ -23,13 +23,14 @@
 
 use crate::{
     CacheMetrics, CacheMetricsKey, ClientInfo, ClientInfoDetails, ClusterMetadata, ClusterNode,
-    ClusterNodeRole, ClusterNodeStatus, CompressionAlgorithm, Consumer, ConsumerGroup,
-    ConsumerGroupDetails, ConsumerGroupInfo, ConsumerGroupMember, ConsumerOffsetInfo,
-    GlobalPermissions, HeaderKey, HeaderKind, HeaderValue, IdKind, Identifier, IdentityInfo,
-    IggyByteSize, IggyError, IggyExpiry, MaxTopicSize, OptionSpec, OptionValue, OptionsProvenance,
-    Partition, Permissions, PersonalAccessTokenInfo, RawPersonalAccessToken, ResourceOptions,
-    Stats, Stream, StreamDetails, StreamPermissions, Topic, TopicDetails, TopicPermissions,
-    TransportEndpoints, UserInfo, UserInfoDetails, UserStatus,
+    ClusterNodeRole, ClusterNodeStatus, Consumer, ConsumerGroup, ConsumerGroupDetails,
+    ConsumerGroupInfo, ConsumerGroupMember, ConsumerOffsetInfo, GlobalPermissions, HeaderKey,
+    HeaderKind, HeaderValue, IdKind, Identifier, IdentityInfo, IggyByteSize, IggyError,
+    OPTION_FLAG_CRITICAL, OPTION_FLAG_READ_ONLY, OPTION_FLAG_RESETTABLE, OPTION_FLAG_SECRET,
+    OPTION_FLAG_UPDATABLE, OptionSpec, OptionValue, OptionsProvenance, OptionsScope, Partition,
+    Permissions, PersonalAccessTokenInfo, RawPersonalAccessToken, ResourceOptions, Stats, Stream,
+    StreamDetails, StreamPermissions, Topic, TopicDetails, TopicPermissions, TransportEndpoints,
+    UserInfo, UserInfoDetails, UserStatus, descriptors_for,
 };
 use bytes::{BufMut, BytesMut};
 use iggy_binary_protocol::primitives::options::{MAX_OPTIONS, MAX_OPTIONS_BYTES, WireOptions};
@@ -84,7 +85,7 @@ impl TryFrom<StreamResponse> for Stream {
             size: IggyByteSize::from(w.size_bytes),
             messages_count: w.messages_count,
             topics_count: w.topics_count,
-            options: resource_options_from_wire(&w.options, true)?,
+            options: resource_options_from_wire_split(&w.options, &w.derived_options)?,
         })
     }
 }
@@ -107,7 +108,10 @@ impl TryFrom<GetStreamResponse> for StreamDetails {
             messages_count: w.stream.messages_count,
             topics_count: w.stream.topics_count,
             topics,
-            options: resource_options_from_wire(&w.stream.options, true)?,
+            options: resource_options_from_wire_split(
+                &w.stream.options,
+                &w.stream.derived_options,
+            )?,
         })
     }
 }
@@ -130,11 +134,6 @@ impl TryFrom<TopicHeader> for Topic {
     type Error = IggyError;
 
     fn try_from(w: TopicHeader) -> Result<Self, Self::Error> {
-        let message_expiry = match w.message_expiry {
-            0 => IggyExpiry::NeverExpire,
-            v => v.into(),
-        };
-        let max_topic_size: MaxTopicSize = w.max_topic_size.into();
         let options = resource_options_from_wire_split(&w.options, &w.derived_options)?;
         Ok(Self {
             id: w.id,
@@ -143,9 +142,6 @@ impl TryFrom<TopicHeader> for Topic {
             partitions_count: w.partitions_count,
             size: IggyByteSize::from(w.size_bytes),
             messages_count: w.messages_count,
-            message_expiry,
-            compression_algorithm: CompressionAlgorithm::from_code(w.compression_algorithm)?,
-            max_topic_size,
             options,
         })
     }
@@ -179,9 +175,6 @@ impl TryFrom<GetTopicResponse> for TopicDetails {
             name: topic.name,
             size: topic.size,
             messages_count: topic.messages_count,
-            message_expiry: topic.message_expiry,
-            compression_algorithm: topic.compression_algorithm,
-            max_topic_size: topic.max_topic_size,
             partitions_count: topic.partitions_count,
             partitions,
             options: topic.options,
@@ -212,7 +205,7 @@ impl TryFrom<UserResponse> for UserInfo {
             created_at: w.created_at.into(),
             status: UserStatus::from_code(w.status)?,
             username: w.username.to_string(),
-            options: resource_options_from_wire(&w.options, true)?,
+            options: resource_options_from_wire_split(&w.options, &w.derived_options)?,
         })
     }
 }
@@ -876,6 +869,36 @@ fn headers_from_validated_slice(
 
 // -- Options conversions --
 
+/// The `DescribeOptions` response for `scope`: every catalog entry a client
+/// may see, with its kind, flags, default and description. Internal keys stay
+/// out.
+///
+/// # Errors
+///
+/// Propagates a catalog key or default that does not fit the wire, which the
+/// catalog tests rule out.
+pub fn describe_options_response(
+    scope: OptionsScope,
+) -> Result<iggy_binary_protocol::responses::system::DescribeOptionsResponse, IggyError> {
+    let entries = descriptors_for(scope)
+        .filter(|descriptor| descriptor.is_described())
+        .map(|descriptor| {
+            Ok(iggy_binary_protocol::responses::system::OptionDescriptor {
+                key: iggy_binary_protocol::WireName::new(descriptor.key.to_string())
+                    .map_err(|_| IggyError::InvalidFormat)?,
+                kind: descriptor.kind.as_code(),
+                flags: descriptor.flags(),
+                default_value: descriptor
+                    .default_value()?
+                    .map(|value| bytes::Bytes::copy_from_slice(value.as_bytes()))
+                    .unwrap_or_default(),
+                description: (descriptor.description)(),
+            })
+        })
+        .collect::<Result<Vec<_>, IggyError>>()?;
+    Ok(iggy_binary_protocol::responses::system::DescribeOptionsResponse { entries })
+}
+
 /// Decode a `DescribeOptions` response into domain option specs.
 ///
 /// # Errors
@@ -891,6 +914,11 @@ pub fn option_specs_from_wire(
             Ok(OptionSpec {
                 key: entry.key.to_string(),
                 kind: HeaderKind::from_code(entry.kind)?,
+                updatable: entry.flags & OPTION_FLAG_UPDATABLE != 0,
+                resettable: entry.flags & OPTION_FLAG_RESETTABLE != 0,
+                secret: entry.flags & OPTION_FLAG_SECRET != 0,
+                read_only: entry.flags & OPTION_FLAG_READ_ONLY != 0,
+                critical: entry.flags & OPTION_FLAG_CRITICAL != 0,
                 default_value: entry.default_value.to_vec(),
                 description: entry.description,
             })
@@ -983,23 +1011,7 @@ pub fn resource_options_to_wire(
     if entries.is_empty() {
         return Ok(WireOptions::empty());
     }
-    if entries.len() > MAX_OPTIONS as usize {
-        return Err(IggyError::OptionsBlockTooLarge(format!(
-            "{} entries, maximum {MAX_OPTIONS}",
-            entries.len()
-        )));
-    }
-    let size: usize = entries
-        .iter()
-        .map(|(key, option)| {
-            OPTION_ENTRY_OVERHEAD + key.as_bytes().len() + option.value.as_bytes().len()
-        })
-        .sum();
-    if size > MAX_OPTIONS_BYTES {
-        return Err(IggyError::OptionsBlockTooLarge(format!(
-            "{size} bytes, maximum {MAX_OPTIONS_BYTES}"
-        )));
-    }
+    let size = options_block_size(entries.iter().copied())?;
     let mut buf = BytesMut::with_capacity(size);
     for (key, option) in entries {
         // A non-string key would encode a block the receiving peer refuses,
@@ -1025,6 +1037,35 @@ pub fn resource_options_to_wire(
     // and the loop above asserts they are string-kinded. The caps cover what
     // construction cannot.
     Ok(WireOptions::from_validated(buf.freeze()))
+}
+
+/// The encoded size of an options block holding `entries`, without encoding
+/// it.
+///
+/// # Errors
+///
+/// Returns `IggyError::OptionsBlockTooLarge` when the entries exceed
+/// `MAX_OPTIONS` or `MAX_OPTIONS_BYTES`.
+pub(crate) fn options_block_size<'a>(
+    entries: impl Iterator<Item = (&'a HeaderKey, &'a OptionValue)>,
+) -> Result<usize, IggyError> {
+    let (count, size) = entries.fold((0usize, 0usize), |(count, size), (key, option)| {
+        (
+            count + 1,
+            size + OPTION_ENTRY_OVERHEAD + key.as_bytes().len() + option.value.as_bytes().len(),
+        )
+    });
+    if count > MAX_OPTIONS as usize {
+        return Err(IggyError::OptionsBlockTooLarge(format!(
+            "{count} entries, maximum {MAX_OPTIONS}"
+        )));
+    }
+    if size > MAX_OPTIONS_BYTES {
+        return Err(IggyError::OptionsBlockTooLarge(format!(
+            "{size} bytes, maximum {MAX_OPTIONS_BYTES}"
+        )));
+    }
+    Ok(size)
 }
 
 #[cfg(test)]

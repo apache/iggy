@@ -1073,6 +1073,7 @@ mod tests {
             SESSION + 1,
             SESSION + 1,
             iggy_common::IggyTimestamp::default(),
+            None,
         );
         let mut table = ClientTable::new(MAX_LOGOUTS_PER_PASS + 1);
         for index in 0..=MAX_LOGOUTS_PER_PASS {
@@ -1265,6 +1266,7 @@ mod tests {
                 SESSION,
                 SESSION,
                 iggy_common::IggyTimestamp::default(),
+                None,
             );
         }
         (dir, Rc::new(shard))

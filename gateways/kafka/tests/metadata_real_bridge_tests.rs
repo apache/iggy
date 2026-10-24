@@ -28,8 +28,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use iggy::prelude::{
-    GlobalPermissions, Identifier, Permissions, StreamClient, StreamPermissions, UserClient,
-    UserStatus,
+    GlobalPermissions, Identifier, Permissions, StreamClient, StreamCreateOptions,
+    StreamPermissions, UserClient, UserCreateOptions, UserStatus,
 };
 use secrecy::SecretString;
 use serial_test::serial;
@@ -796,7 +796,10 @@ async fn given_a_bridge_user_with_manage_topics_on_the_stream_only_when_auto_cre
 /// Creates the default stream, then a bridge user holding only `on_stream` on it, signed in.
 async fn limited_bridge(server: &TestServer, on_stream: StreamPermissions) -> IggyBridge {
     let root = raw_client(server).await;
-    let stream = root.create_stream("kafka").await.expect("seed the stream");
+    let stream = root
+        .create_stream("kafka", &StreamCreateOptions::default())
+        .await
+        .expect("seed the stream");
     let stream_id = usize::try_from(stream.id).expect("stream id fits usize");
     let permissions = Permissions {
         global: GlobalPermissions::default(),
@@ -807,6 +810,7 @@ async fn limited_bridge(server: &TestServer, on_stream: StreamPermissions) -> Ig
         LIMITED_PASSWORD,
         UserStatus::Active,
         Some(permissions),
+        &UserCreateOptions::default(),
     )
     .await
     .expect("create the bridge user");

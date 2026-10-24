@@ -224,6 +224,30 @@ public final class IggyClient: Sendable {
     func requireAuthenticated() async throws -> UInt64 {
         try await core.requireAuthenticated()
     }
+
+    /// As ``requireAuthenticated()`` for a call pinned to `captured`, such as
+    /// a producer send: once the caller signed in or out since, the call is
+    /// refused as unauthenticated before anything of it is written.
+    func requireAuthenticated(under captured: UInt64?) async throws -> UInt64 {
+        let started = try await requireAuthenticated()
+        guard let captured else {
+            return started
+        }
+        if let refusal = await core.lineageRefusal(captured) {
+            throw refusal
+        }
+        return captured
+    }
+
+    /// The lineage a call that starts now runs under.
+    var operationLineage: UInt64 {
+        get async { await core.lineage }
+    }
+
+    /// The refusal of a call pinned to `captured`, nil while it may go on.
+    func lineageRefusal(_ captured: UInt64) async -> IggyError? {
+        await core.lineageRefusal(captured)
+    }
 }
 
 // MARK: - System
@@ -259,11 +283,28 @@ extension IggyClient {
         return body.isEmpty ? [] : try Responses.clients(body[...])
     }
 
-    /// The option catalog of a resource scope: the keys create accepts, their
-    /// kinds, and this server's defaults.
+    /// The option catalog of a resource scope: every key a client can name,
+    /// its kind, what an update may do with it, and this server's default.
     public func describeOptions(scope: OptionsScope) async throws -> [OptionSpec] {
         let lineage = try await requireAuthenticated()
         return try Responses.optionSpecs(try await send(.describeOptions, Requests.describeOptions(scope: scope), lineage: lineage)[...])
+    }
+
+    /// Reads one page of the metadata change log or of the current state.
+    ///
+    /// The node records one change per public result of a committed metadata
+    /// operation, such as a stream created, a topic renamed, a user's
+    /// permissions changed, or a session closed. A mirror keeps a cursor,
+    /// reads the records after it, and stores the returned
+    /// ``MetadataChanges/next``. Records carry options as the read routes
+    /// return them and never key material. Needs root or the global
+    /// `manageServers` permission, and fails with
+    /// ``IggyErrorCode/unauthorized`` otherwise. An invalid query fails with
+    /// ``IggyErrorCode/invalidCommand`` before anything is sent.
+    public func getMetadataChanges(_ query: MetadataChangesQuery = MetadataChangesQuery()) async throws -> MetadataChanges {
+        let lineage = try await requireAuthenticated()
+        try query.validate()
+        return try Responses.metadataChanges(try await send(.getMetadataChanges, Requests.getMetadataChanges(query), lineage: lineage)[...])
     }
 
     /// Captures a snapshot archive of the server state.

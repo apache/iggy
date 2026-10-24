@@ -413,7 +413,7 @@ async fn connect_any(harness: &TestHarness, nodes: &[usize]) -> Option<IggyClien
 /// is what marches `repair_retained_from` forward.
 async fn seed_topic(client: &IggyClient, segment_size: Option<u64>) {
     client
-        .create_stream(STREAM_NAME)
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
         .await
         .expect("create stream");
     client

@@ -38,20 +38,26 @@ use iggy_binary_protocol::requests::personal_access_tokens::{
 };
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::requests::streams::{
-    CreateStreamRequest, DeleteStreamRequest, GetStreamRequest, UpdateStreamRequest,
+    CreateStreamRequest, DeleteStreamRequest, GetStreamRequest, WRAPPED_STREAM_KEY_LENGTH,
 };
-use iggy_binary_protocol::requests::system::{BindSessionRequest, SessionIdentity};
-use iggy_binary_protocol::requests::topics::{
-    CreateTopicRequest, DeleteTopicRequest, UpdateTopicRequest,
+use iggy_binary_protocol::requests::system::{
+    BindSessionRequest, ResourceTarget, SessionIdentity, UpdateResourceRequest,
 };
+use iggy_binary_protocol::requests::topics::{CreateTopicRequest, DeleteTopicRequest};
 use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::requests::users::{
     ChangePasswordRequest, CreateUserRequest, DeleteUserRequest, LoginRegisterRequest,
-    UpdatePermissionsRequest, UpdateUserRequest,
+    UpdatePermissionsRequest,
 };
 use iggy_binary_protocol::{
     AckLevel, ClientVersionInfo, IGGY_PROTOCOL_VERSION, Operation, RoutedRequestHeader, WireEncode,
-    WireIdentifier, WireName, WireOptions, WirePartitioning, WirePollingStrategy,
+    WireIdentifier, WireName, WireOptions, WirePartitioning, WirePermissions, WirePollingStrategy,
+};
+use iggy_common::wire_conversions::resource_options_to_wire;
+use iggy_common::{
+    HeaderKey, HeaderValue, OptionKey, OptionValue, OptionsPatch, OptionsProvenance,
+    ResourceOptions, StreamUpdateOptions, TopicUpdateOptions, UserStatus, UserUpdateOptions,
+    critical_keys_marker,
 };
 use metadata::stm::user::{
     CreatePersonalAccessTokenRequest, DeletePersonalAccessTokenRequest, ROOT_USER_CREATED_AT_MICROS,
@@ -61,6 +67,30 @@ use server_common::sharding::{IggyNamespace, METADATA_GROUP};
 use server_common::{Message, iobuf::Owned};
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
+
+/// Key-encryption key [`SIM_STREAM_WRAP_SET`] is sealed under.
+pub const SIM_STREAM_KEK: &str = "c2ltdWxhdG9yLXN0cmVhbS1rZXktZW5jcnlwdGlvbi0=";
+/// Key-encryption key [`SIM_ROTATED_WRAP_SET`] is sealed under.
+pub const SIM_ROTATED_KEK: &str = "c2ltdWxhdG9yLXJvdGF0ZWQta2V5LWVuY3J5cHRpb24=";
+/// Client stream key both fixed wrap sets hold.
+pub const SIM_STREAM_KEY: [u8; 32] = [0x51; 32];
+/// [`SIM_STREAM_KEY`] wrapped under [`SIM_STREAM_KEK`]. Precomputed, since a
+/// fresh wrap draws its nonce from the OS generator and breaks seeded replay.
+pub const SIM_STREAM_WRAP_SET: [u8; WRAPPED_STREAM_KEY_LENGTH] = [
+    0x01, 0x01, 0xd5, 0x40, 0xc9, 0x77, 0x57, 0xd4, 0x39, 0x46, 0xec, 0x07, 0x1d, 0xb1, 0x3d, 0xfb,
+    0x78, 0x80, 0x18, 0xfc, 0xae, 0x2b, 0xb8, 0x25, 0x96, 0x8a, 0xd7, 0x9d, 0x65, 0xbc, 0x41, 0x08,
+    0xd6, 0x1d, 0xed, 0x5e, 0x85, 0x01, 0x54, 0xcd, 0x8d, 0x17, 0x34, 0x16, 0x9f, 0x19, 0x6e, 0xc6,
+    0xf7, 0xdc, 0x23, 0xcb, 0x1d, 0x9e, 0x04, 0x7a, 0xc7, 0xa6, 0xbf, 0x8b, 0xf2, 0x81, 0x42, 0x32,
+    0xa9, 0x58, 0xd0, 0x29, 0x44, 0x35, 0x31, 0x19, 0x21, 0x47, 0x46, 0xe2, 0x94, 0xc5,
+];
+/// [`SIM_STREAM_KEY`] wrapped under [`SIM_ROTATED_KEK`], the set a rewrap stores.
+pub const SIM_ROTATED_WRAP_SET: [u8; WRAPPED_STREAM_KEY_LENGTH] = [
+    0x01, 0x01, 0x28, 0x05, 0x68, 0xfc, 0x9e, 0xaa, 0x81, 0x5f, 0x96, 0x5f, 0x30, 0x69, 0xfd, 0x3f,
+    0x3c, 0x50, 0xd8, 0xf5, 0x48, 0xdb, 0x49, 0xb4, 0x0e, 0x11, 0xbb, 0xd0, 0x66, 0x1e, 0xb3, 0xff,
+    0x95, 0xe5, 0x24, 0x1e, 0x4a, 0xb0, 0x69, 0x04, 0xee, 0x40, 0x43, 0xe5, 0x36, 0x81, 0x09, 0xf1,
+    0x16, 0x43, 0xa3, 0x11, 0xf3, 0x53, 0xcd, 0x76, 0x8d, 0x4a, 0xff, 0x95, 0xc4, 0xbd, 0xc8, 0x84,
+    0x41, 0x84, 0xf2, 0x31, 0x01, 0x37, 0x31, 0x19, 0x21, 0x47, 0x46, 0xe2, 0x94, 0xc5,
+];
 
 // TODO: Proper client which implements the full client SDK API
 pub struct SimClient {
@@ -345,6 +375,38 @@ impl SimClient {
         self.build_request(Operation::CreateStream, &payload)
     }
 
+    /// A `CreateStream` already in the replicated form an edge produces: the
+    /// fixed [`SIM_STREAM_WRAP_SET`] and the critical marker naming it. The
+    /// dispatch shell refuses a client-sent wrap set, so only the raw path
+    /// commits one.
+    ///
+    /// # Panics
+    /// Panics if the stream name is not a valid wire name.
+    pub fn create_keyed_stream(&self, name: &str) -> Message<RoutedRequestHeader> {
+        let options = ResourceOptions::from([
+            (
+                HeaderKey::from(OptionKey::EncryptionKeyWrapped),
+                OptionValue::explicit(
+                    HeaderValue::try_from(SIM_STREAM_WRAP_SET.as_slice())
+                        .expect("a wrap set fits a header value"),
+                ),
+            ),
+            (
+                HeaderKey::from(OptionKey::CriticalKeys),
+                OptionValue::explicit(
+                    critical_keys_marker(&[OptionKey::EncryptionKeyWrapped])
+                        .expect("the wrapped key is a critical option"),
+                ),
+            ),
+        ]);
+        let wire = CreateStreamRequest {
+            name: WireName::new(name).expect("stream name must be valid"),
+            options: resource_options_to_wire(&options, OptionsProvenance::All)
+                .expect("the keyed options fit a block"),
+        };
+        self.build_request(Operation::CreateStream, &wire.to_bytes())
+    }
+
     /// # Panics
     /// Panics if the stream name cannot be converted to a `WireIdentifier`.
     pub fn delete_stream(&self, name: &str) -> Message<RoutedRequestHeader> {
@@ -360,12 +422,18 @@ impl SimClient {
     /// Panics if the new name or the existing stream name is not a valid
     /// `WireName`.
     pub fn update_stream(&self, stream: &str, new_name: &str) -> Message<RoutedRequestHeader> {
-        let wire = UpdateStreamRequest {
-            stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
-            name: WireName::new(new_name).expect("stream name must be valid"),
-            options: WireOptions::empty(),
-        };
-        self.build_request(Operation::UpdateStream, &wire.to_bytes())
+        let patch = StreamUpdateOptions {
+            name: Some(new_name.to_owned()),
+            ..StreamUpdateOptions::default()
+        }
+        .to_patch()
+        .expect("stream name must be valid");
+        self.update_resource(
+            ResourceTarget::Stream {
+                stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
+            },
+            patch,
+        )
     }
 
     /// # Panics
@@ -392,20 +460,22 @@ impl SimClient {
     }
 
     /// # Panics
-    /// Panics if `stream`, `topic`, or `new_name` is not a valid `WireName`.
+    /// Panics if `stream` or `topic` is not a valid `WireName`, or `options`
+    /// fail the client-side patch checks.
     pub fn update_topic(
         &self,
         stream: &str,
         topic: &str,
-        new_name: &str,
+        options: &TopicUpdateOptions,
     ) -> Message<RoutedRequestHeader> {
-        let wire = UpdateTopicRequest {
-            stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
-            topic_id: WireIdentifier::named(topic).expect("topic name must be valid"),
-            name: WireName::new(new_name).expect("topic name must be valid"),
-            options: WireOptions::empty(),
-        };
-        self.build_request(Operation::UpdateTopic, &wire.to_bytes())
+        let patch = options.to_patch().expect("topic patch must be valid");
+        self.update_resource(
+            ResourceTarget::Topic {
+                stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
+                topic_id: WireIdentifier::named(topic).expect("topic name must be valid"),
+            },
+            patch,
+        )
     }
 
     /// # Panics
@@ -540,11 +610,23 @@ impl SimClient {
         password: &str,
         status: u8,
     ) -> Message<RoutedRequestHeader> {
+        self.create_user_with_permissions(username, password, status, None)
+    }
+
+    /// # Panics
+    /// Panics if `username` is not a valid `WireName`.
+    pub fn create_user_with_permissions(
+        &self,
+        username: &str,
+        password: &str,
+        status: u8,
+        permissions: Option<WirePermissions>,
+    ) -> Message<RoutedRequestHeader> {
         let wire = CreateUserRequest {
             username: WireName::new(username).expect("username must be valid"),
             password: password.to_string(),
             status,
-            permissions: None,
+            permissions,
             options: WireOptions::empty(),
         };
         self.build_request(Operation::CreateUser, &wire.to_bytes())
@@ -557,15 +639,34 @@ impl SimClient {
         &self,
         user: &str,
         new_username: Option<&str>,
-        status: Option<u8>,
+        status: Option<UserStatus>,
     ) -> Message<RoutedRequestHeader> {
-        let wire = UpdateUserRequest {
-            user_id: WireIdentifier::named(user).expect("username must be valid"),
-            username: new_username.map(|n| WireName::new(n).expect("username must be valid")),
+        let patch = UserUpdateOptions {
+            username: new_username.map(ToOwned::to_owned),
             status,
-            options: WireOptions::empty(),
+            ..UserUpdateOptions::default()
+        }
+        .to_patch()
+        .expect("username must be valid");
+        self.update_resource(
+            ResourceTarget::User {
+                user_id: WireIdentifier::named(user).expect("username must be valid"),
+            },
+            patch,
+        )
+    }
+
+    fn update_resource(
+        &self,
+        target: ResourceTarget,
+        patch: OptionsPatch,
+    ) -> Message<RoutedRequestHeader> {
+        let wire = UpdateResourceRequest {
+            target,
+            reset: patch.reset,
+            options: patch.set,
         };
-        self.build_request(Operation::UpdateUser, &wire.to_bytes())
+        self.build_request(Operation::UpdateResource, &wire.to_bytes())
     }
 
     /// # Panics
@@ -884,7 +985,7 @@ impl SimClient {
 
         let mut header = self.header(operation, group.inner(), total_size);
         self.stamp_partition_context(&mut header);
-        header.request_checksum = u128::from(iggy_common::calculate_checksum(payload));
+        header.request_checksum = 0;
 
         let header_bytes = bytemuck::bytes_of(&header);
         let mut buffer = Vec::with_capacity(total_size);
@@ -903,7 +1004,9 @@ impl SimClient {
         // ops go through `build_request_with_namespace`), and metadata
         // requests carry the metadata consensus group on the wire.
         let mut header = self.header(operation, METADATA_GROUP, total_size);
-        header.request_checksum = u128::from(iggy_common::calculate_checksum(payload));
+        // The simulator keeps request bytes deterministic for seeded replay.
+        // Sequence identity must never expose a hash of a secret-bearing body.
+        header.request_checksum = u128::from(header.request) + 1;
 
         let header_bytes = bytemuck::bytes_of(&header);
         let mut buffer = Vec::with_capacity(total_size);
@@ -964,6 +1067,21 @@ fn namespace_ids(ns: IggyNamespace) -> (WireIdentifier, WireIdentifier, Option<u
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iggy_common::{ServerKeyContext, StreamEncryptionKey, StreamKeyOrigin, WrapSet};
+
+    #[test]
+    fn given_fixed_wrap_sets_when_opened_under_their_keks_should_hold_the_same_client_key() {
+        let key = StreamEncryptionKey::try_from(SIM_STREAM_KEY.as_slice()).expect("32 bytes");
+        for (kek, bytes) in [
+            (SIM_STREAM_KEK, SIM_STREAM_WRAP_SET),
+            (SIM_ROTATED_KEK, SIM_ROTATED_WRAP_SET),
+        ] {
+            let context = ServerKeyContext::from_config(kek, &[], false).expect("valid kek");
+            let set = WrapSet::try_from(bytes.as_slice()).expect("a valid wrap set");
+            assert_eq!(set.origin(), StreamKeyOrigin::Client);
+            assert_eq!(context.open(&set).expect("opens under its kek"), key);
+        }
+    }
 
     // A partition send consumes a request id like any other replicated op, so
     // an interleaved run numbers both planes from one sequence and the metadata

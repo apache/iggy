@@ -18,7 +18,7 @@
 //! On-disk schema for the metadata consensus plane (shard 0's VSR
 //! replica: users, streams, topics, sessions).
 //!
-//! Four capacity knobs. The first three were hardcoded in the runtime
+//! Six capacity knobs. The first three were hardcoded in the runtime
 //! crates before:
 //!
 //! - `prepare_queue_depth` -> `consensus::PIPELINE_PREPARE_QUEUE_MAX`
@@ -32,6 +32,8 @@
 //!   HTTP session cap tracks it at half.
 //! - `partitions_max` (the partitions of all streams and topics, checked
 //!   by the metadata primary when it admits a create; zero is no cap)
+//! - `change_log_resource_capacity` and `change_log_activity_capacity`
+//!   (records the metadata change log retains per retention class)
 //!
 //! The first two interlock through the forced-checkpoint margin
 //! (`max(64, prepare_queue_depth)` at bootstrap): while a checkpoint
@@ -47,6 +49,7 @@
 //! literals against the runtime constants with static asserts.
 
 use super::COMPONENT;
+use super::defaults::SERVER_CONFIG;
 use crate::ConfigurationError;
 use configs::ConfigEnv;
 use iggy_common::Validatable;
@@ -92,6 +95,18 @@ pub const MIN_METADATA_CLIENTS_TABLE_MAX: usize = 2;
 /// population and a likely unit typo.
 pub const MAX_METADATA_CLIENTS_TABLE_MAX: usize = 1 << 16;
 
+/// Mirrors `metadata::change_log::DEFAULT_RESOURCE_CAPACITY`, the records of
+/// streams, topics, partitions, consumer groups, users and tokens retained.
+pub const DEFAULT_METADATA_CHANGE_LOG_RESOURCE_CAPACITY: usize = 65_536;
+
+/// Mirrors `metadata::change_log::DEFAULT_ACTIVITY_CAPACITY`, the records of
+/// sessions and consumer group membership retained.
+pub const DEFAULT_METADATA_CHANGE_LOG_ACTIVITY_CAPACITY: usize = 16_384;
+
+/// Mirrors `metadata::change_log::MAX_CAPACITY`. A snapshot holding a larger
+/// ring is refused, so a capacity past it could never be restored.
+pub const MAX_METADATA_CHANGE_LOG_CAPACITY: usize = 1 << 20;
+
 /// Capacity tunables for the metadata consensus plane.
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct MetadataConfig {
@@ -126,6 +141,17 @@ pub struct MetadataConfig {
     /// the creates still in flight, so creates never take the count past it.
     #[serde(default)]
     pub partitions_max: u32,
+
+    /// Change log records kept for streams, topics, partitions, consumer
+    /// groups, users and personal access tokens. The oldest record goes once
+    /// the count passes it. Node-local: replicas may keep different depths.
+    #[serde(default = "default_change_log_resource_capacity")]
+    pub change_log_resource_capacity: usize,
+
+    /// Change log records kept for sessions and consumer group membership,
+    /// separate so a login or membership storm cannot evict resource history.
+    #[serde(default = "default_change_log_activity_capacity")]
+    pub change_log_activity_capacity: usize,
 }
 
 impl MetadataConfig {
@@ -191,13 +217,41 @@ impl Validatable<ConfigurationError> for MetadataConfig {
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
+        for (name, capacity) in [
+            (
+                "change_log_resource_capacity",
+                self.change_log_resource_capacity,
+            ),
+            (
+                "change_log_activity_capacity",
+                self.change_log_activity_capacity,
+            ),
+        ] {
+            if !(1..=MAX_METADATA_CHANGE_LOG_CAPACITY).contains(&capacity) {
+                eprintln!(
+                    "{COMPONENT} metadata.{name} ({capacity}) must be between 1 and {MAX_METADATA_CHANGE_LOG_CAPACITY}"
+                );
+                return Err(ConfigurationError::InvalidConfigurationValue);
+            }
+        }
         Ok(())
     }
+}
+
+/// Zero fails validation, so the value comes from the embedded `config.toml`.
+fn default_change_log_resource_capacity() -> usize {
+    SERVER_CONFIG.metadata.change_log_resource_capacity as usize
+}
+
+fn default_change_log_activity_capacity() -> usize {
+    SERVER_CONFIG.metadata.change_log_activity_capacity as usize
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use figment::Figment;
+    use figment::providers::{Format, Toml};
 
     #[test]
     fn defaults_are_valid() {
@@ -206,6 +260,8 @@ mod tests {
             journal_slots: DEFAULT_METADATA_JOURNAL_SLOTS,
             clients_table_max: DEFAULT_METADATA_CLIENTS_TABLE_MAX,
             partitions_max: 0,
+            change_log_resource_capacity: DEFAULT_METADATA_CHANGE_LOG_RESOURCE_CAPACITY,
+            change_log_activity_capacity: DEFAULT_METADATA_CHANGE_LOG_ACTIVITY_CAPACITY,
         };
         assert!(config.validate().is_ok());
         assert_eq!(config.checkpoint_margin(), METADATA_CHECKPOINT_MARGIN_FLOOR);
@@ -218,6 +274,8 @@ mod tests {
             journal_slots: 4096,
             clients_table_max: DEFAULT_METADATA_CLIENTS_TABLE_MAX,
             partitions_max: 0,
+            change_log_resource_capacity: DEFAULT_METADATA_CHANGE_LOG_RESOURCE_CAPACITY,
+            change_log_activity_capacity: DEFAULT_METADATA_CHANGE_LOG_ACTIVITY_CAPACITY,
         };
         assert!(config.validate().is_ok());
         assert_eq!(config.checkpoint_margin(), MAX_METADATA_PREPARE_QUEUE_DEPTH);
@@ -233,6 +291,8 @@ mod tests {
             journal_slots: min_slots,
             clients_table_max: DEFAULT_METADATA_CLIENTS_TABLE_MAX,
             partitions_max: 0,
+            change_log_resource_capacity: DEFAULT_METADATA_CHANGE_LOG_RESOURCE_CAPACITY,
+            change_log_activity_capacity: DEFAULT_METADATA_CHANGE_LOG_ACTIVITY_CAPACITY,
         };
         assert!(boundary.validate().is_ok());
         // ...one slot fewer is refused.
@@ -241,6 +301,8 @@ mod tests {
             journal_slots: min_slots - 1,
             clients_table_max: DEFAULT_METADATA_CLIENTS_TABLE_MAX,
             partitions_max: 0,
+            change_log_resource_capacity: DEFAULT_METADATA_CHANGE_LOG_RESOURCE_CAPACITY,
+            change_log_activity_capacity: DEFAULT_METADATA_CHANGE_LOG_ACTIVITY_CAPACITY,
         };
         assert!(starved.validate().is_err());
     }
@@ -255,6 +317,8 @@ mod tests {
             journal_slots: MAX_METADATA_JOURNAL_SLOTS,
             clients_table_max: DEFAULT_METADATA_CLIENTS_TABLE_MAX,
             partitions_max: 0,
+            change_log_resource_capacity: DEFAULT_METADATA_CHANGE_LOG_RESOURCE_CAPACITY,
+            change_log_activity_capacity: DEFAULT_METADATA_CHANGE_LOG_ACTIVITY_CAPACITY,
         };
         assert!(over.validate().is_err());
         assert_eq!(
@@ -271,6 +335,8 @@ mod tests {
             journal_slots: DEFAULT_METADATA_JOURNAL_SLOTS,
             clients_table_max: DEFAULT_METADATA_CLIENTS_TABLE_MAX,
             partitions_max: 0,
+            change_log_resource_capacity: DEFAULT_METADATA_CHANGE_LOG_RESOURCE_CAPACITY,
+            change_log_activity_capacity: DEFAULT_METADATA_CHANGE_LOG_ACTIVITY_CAPACITY,
         };
         assert!(config.validate().is_err());
     }
@@ -292,6 +358,8 @@ mod tests {
             journal_slots: DEFAULT_METADATA_JOURNAL_SLOTS,
             clients_table_max: MIN_METADATA_CLIENTS_TABLE_MAX - 1,
             partitions_max: 0,
+            change_log_resource_capacity: DEFAULT_METADATA_CHANGE_LOG_RESOURCE_CAPACITY,
+            change_log_activity_capacity: DEFAULT_METADATA_CHANGE_LOG_ACTIVITY_CAPACITY,
         };
         assert!(config.validate().is_err());
     }
@@ -303,8 +371,68 @@ mod tests {
             journal_slots: DEFAULT_METADATA_JOURNAL_SLOTS,
             clients_table_max: MIN_METADATA_CLIENTS_TABLE_MAX,
             partitions_max: 0,
+            change_log_resource_capacity: DEFAULT_METADATA_CHANGE_LOG_RESOURCE_CAPACITY,
+            change_log_activity_capacity: DEFAULT_METADATA_CHANGE_LOG_ACTIVITY_CAPACITY,
         };
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn embedded_defaults_match_canonical_change_log_capacities() {
+        let config = MetadataConfig::default();
+        assert_eq!(
+            config.change_log_resource_capacity,
+            DEFAULT_METADATA_CHANGE_LOG_RESOURCE_CAPACITY
+        );
+        assert_eq!(
+            config.change_log_activity_capacity,
+            DEFAULT_METADATA_CHANGE_LOG_ACTIVITY_CAPACITY
+        );
+    }
+
+    #[test]
+    fn change_log_capacities_absent_from_toml_take_the_defaults() {
+        let config: MetadataConfig = Figment::new()
+            .merge(Toml::string(
+                "prepare_queue_depth = 32\njournal_slots = 1024\nclients_table_max = 8192\n",
+            ))
+            .extract()
+            .expect("config without change log capacities deserializes");
+        assert_eq!(
+            config.change_log_resource_capacity,
+            DEFAULT_METADATA_CHANGE_LOG_RESOURCE_CAPACITY
+        );
+        assert_eq!(
+            config.change_log_activity_capacity,
+            DEFAULT_METADATA_CHANGE_LOG_ACTIVITY_CAPACITY
+        );
+    }
+
+    #[test]
+    fn change_log_capacity_out_of_bounds_is_refused() {
+        for capacity in [0, MAX_METADATA_CHANGE_LOG_CAPACITY + 1] {
+            for resource in [true, false] {
+                let mut config = MetadataConfig::default();
+                if resource {
+                    config.change_log_resource_capacity = capacity;
+                } else {
+                    config.change_log_activity_capacity = capacity;
+                }
+                assert!(config.validate().is_err(), "{capacity} must be refused");
+            }
+        }
+    }
+
+    #[test]
+    fn change_log_capacity_at_bounds_is_accepted() {
+        for capacity in [1, MAX_METADATA_CHANGE_LOG_CAPACITY] {
+            let config = MetadataConfig {
+                change_log_resource_capacity: capacity,
+                change_log_activity_capacity: capacity,
+                ..MetadataConfig::default()
+            };
+            assert!(config.validate().is_ok(), "{capacity} must be accepted");
+        }
     }
 
     #[test]
@@ -314,6 +442,8 @@ mod tests {
             journal_slots: DEFAULT_METADATA_JOURNAL_SLOTS,
             clients_table_max: MAX_METADATA_CLIENTS_TABLE_MAX + 1,
             partitions_max: 0,
+            change_log_resource_capacity: DEFAULT_METADATA_CHANGE_LOG_RESOURCE_CAPACITY,
+            change_log_activity_capacity: DEFAULT_METADATA_CHANGE_LOG_ACTIVITY_CAPACITY,
         };
         assert!(config.validate().is_err());
     }

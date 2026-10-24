@@ -214,6 +214,135 @@ async def main():
 asyncio.run(main())
 ```
 
+## Stream, Topic and User Options
+
+`create_stream`, `create_topic` and `create_user` take typed options: `StreamOptions`, `TopicOptions` and `UserOptions`. Updates are patches: `update_stream`, `update_topic` and `update_user` change only the fields you pass, and `reset` returns keys to their server defaults.
+
+A topic's `message_expiry` and `max_topic_size` are the only resettable keys. Settings such as the compression algorithm are fixed at creation and have no update field. `describe_options("stream" | "topic" | "user")` reports which keys are updatable, resettable, secret or read-only.
+
+The update methods also take `options` and `raw_reset`, which send keys and reset names verbatim, so a key newer than this build can be set or reset. The server decides those. A refused option raises `OptionError`, a `RuntimeError` whose `code` and `kind` name the refusal, for example `4103` and `"option_not_updatable"`, the same on every transport.
+
+Root user rename and status refusals also raise `OptionError` with code `4108` and kind `"cannot_modify_root_user"`.
+
+```python
+import asyncio
+import secrets
+from datetime import timedelta
+
+from apache_iggy import (
+    IggyClient,
+    IggyExpiry,
+    OptionKey,
+    StreamOptions,
+    TopicOptions,
+    encryption_key_fingerprint,
+)
+
+
+async def main():
+    client = IggyClient.from_connection_string("iggy+tcp://iggy:iggy@127.0.0.1:8090")
+    await client.connect()
+
+    key = secrets.token_bytes(32)
+    stream = await client.create_stream("orders", StreamOptions(encryption_key=key))
+    assert stream.encryption_key_source == "stream"
+    assert stream.encryption_key_fingerprint == encryption_key_fingerprint(key)
+
+    await client.create_topic(
+        "orders",
+        "created",
+        TopicOptions(
+            partitions_count=3,
+            compression_algorithm="gzip",
+            message_expiry=IggyExpiry.ExpireDuration(timedelta(days=7)),
+        ),
+    )
+    await client.update_topic(
+        "orders",
+        "created",
+        message_expiry=IggyExpiry.ExpireDuration(timedelta(days=1)),
+        reset=[OptionKey.MaxTopicSize],
+    )
+    await client.update_stream("orders", name="orders-v2")
+
+
+asyncio.run(main())
+```
+
+A stream encryption key must be 32 random bytes, given as `bytes` or as their canonical base64 text. The key travels inside the create request over whatever transport the client uses, so protecting it in transit with TLS is your responsibility.
+
+The server never returns the key, only `encryption_key_source`, `encryption_key_fingerprint` and `encryption_kek_fingerprints`. Without a key, a server with encryption enabled generates one for the stream and reports the source `"server"`. An invalid key raises `ValueError` before anything is sent, and no repr or error message contains it.
+
+## Metadata Changes
+
+`get_metadata_changes` reads the node's change log: one record per public result of a committed metadata operation, such as a stream created, a topic renamed, a user's permissions changed or a session closed. A mirror keeps a cursor, asks for the records after it, and stores the returned `next` cursor. The call needs root or the global `manage_servers` permission. A query the server would refuse raises `IggyError` with the invalid command code before anything is sent.
+
+```python
+import asyncio
+
+from apache_iggy import (
+    IggyClient,
+    MetadataChangeGroup,
+    MetadataChangeStart,
+    MetadataChangeStatus,
+)
+
+
+async def follow(client, groups):
+    start = MetadataChangeStart.Earliest()
+    while True:
+        page = await client.get_metadata_changes(start, groups=groups)
+        if page.status == MetadataChangeStatus.Ok:
+            for record in page.records:
+                print(record.op, record.actor_user_id, record.kind, record.change)
+            if page.next is not None:
+                start = MetadataChangeStart.After(page.next)
+            if not page.has_more:
+                await asyncio.sleep(1)
+        elif page.status == MetadataChangeStatus.Behind:
+            await asyncio.sleep(0.1)
+        else:
+            start = await rebuild(client, groups)
+
+
+async def rebuild(client, groups):
+    """Pages the current state, then returns the position to follow from."""
+    start = MetadataChangeStart.Current()
+    while True:
+        page = await client.get_metadata_changes(start, groups=groups)
+        if page.status == MetadataChangeStatus.Behind:
+            await asyncio.sleep(0.1)
+            continue
+        if page.status != MetadataChangeStatus.Ok:
+            start = MetadataChangeStart.Current()
+            continue
+        for item in page.items:
+            print(item.group, item.body)
+        if page.current_page_token is not None:
+            start = MetadataChangeStart.Current(page.current_page_token)
+        elif page.next is not None:
+            return MetadataChangeStart.After(page.next)
+        else:
+            start = MetadataChangeStart.Current()
+
+
+async def main():
+    client = IggyClient.from_connection_string("iggy+tcp://iggy:iggy@127.0.0.1:8090")
+    await client.connect()
+    await follow(client, [MetadataChangeGroup.Streams, MetadataChangeGroup.Topics])
+
+
+asyncio.run(main())
+```
+
+`Expired` means the log no longer holds the history after the cursor, and `Reset` means the cursor belongs to another history, for example after the data directory was rebuilt. Either way the mirror rebuilds from current state pages and then follows the changes after the anchor they return.
+
+Current pages need the parent groups of every selected group, for example `Topics` with `Streams`. Keep a rebuilt state private until a change page answers `Ok` with `has_more` false and a `head_op` at or above the last current page's.
+
+`record.kind` names the body in `record.change`, for example a `MetadataStreamChange` for `StreamCreated` and `StreamUpdated`. A record or item this build does not know has `kind` or `group` set to `None` and a `MetadataUnknownChange` or `MetadataUnknownItem` body with its codes and raw body, so a mirror can stop there rather than skip a change. Stream, topic and user bodies expose `options` and `derived_options` as `StreamDetails` does: a stream's key source and fingerprints, never its key.
+
+`str()` of a cursor gives its `mc1_` text and of a page token its `cs1_` text, and `MetadataChangeCursor.parse` and `MetadataCurrentPageToken.parse` read them back, so a mirror can store its position as a string. Log ids, checksums and client ids are Python ints.
+
 ## High-Level Producer
 
 The Python high-level producer API is a port of the Rust high-level producer
@@ -306,7 +435,7 @@ Every error that the Rust SDK reports reaches Python as `IggyError`, a `RuntimeE
 - 57 (`TransientNotCommitted`): the outcome is unknown, and the server possibly applied the write. Read the state before you write it again.
 - 40 (`Unauthenticated`): the request needs a session. Sign in, then retry.
 
-`PendingOperationError` and `ProducerSendError` are `IggyError` subclasses. An error that the binding raises itself, such as a `ValueError`, a `TypeError`, or a plain `RuntimeError` for an invalid argument or a shut-down producer, is not an `IggyError` and carries no code.
+`OptionError`, `PendingOperationError` and `ProducerSendError` are `IggyError` subclasses. An error that the binding raises itself, such as a `ValueError`, a `TypeError`, or a plain `RuntimeError` for an invalid argument or a shut-down producer, is not an `IggyError` and carries no code.
 
 `PendingOperationError` exposes the exact integer `operation_id`, the numeric
 `code`, and `kind` (`"uncertain"`, `"lane_blocked"`, or `"not_retained"`). On the

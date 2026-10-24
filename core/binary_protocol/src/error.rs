@@ -47,6 +47,9 @@ pub enum WireError {
     #[error("payload too large: {size} bytes, max {max}")]
     PayloadTooLarge { size: usize, max: usize },
 
+    #[error("secure random source unavailable")]
+    RandomSourceUnavailable,
+
     #[error("validation failed: {0}")]
     Validation(Cow<'static, str>),
 

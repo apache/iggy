@@ -26,6 +26,7 @@ import org.apache.commons.lang3.StringUtils;
 import org.apache.iggy.client.async.tcp.vsr.VsrHeaders;
 import org.apache.iggy.identifier.UserId;
 import org.apache.iggy.serde.CommandCode;
+import org.apache.iggy.system.OptionsScope;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Optional;
@@ -36,9 +37,6 @@ import java.util.Optional;
  * none of them signs in with an old copy.
  */
 final class SessionLogin {
-    // Flags the optional username of an UpdateUser body.
-    private static final int USERNAME_PRESENT = 1;
-
     private int commandCode;
     private byte[] payload;
     private long version;
@@ -82,13 +80,17 @@ final class SessionLogin {
     @SuppressWarnings({"checkstyle:CyclomaticComplexity", "checkstyle:NPathComplexity"})
     synchronized Optional<Change> refresh(int requestCode, ByteBuf frame, long userId) {
         boolean passwordChange = requestCode == CommandCode.User.CHANGE_PASSWORD.getValue();
-        if ((!passwordChange && requestCode != CommandCode.User.UPDATE.getValue())
+        if ((!passwordChange && requestCode != CommandCode.System.UPDATE_RESOURCE.getValue())
                 || payload == null
                 || commandCode != CommandCode.User.LOGIN.getValue()) {
             return Optional.empty();
         }
         ByteBuf change = frame.slice(
                 frame.readerIndex() + VsrHeaders.HEADER_SIZE, frame.readableBytes() - VsrHeaders.HEADER_SIZE);
+        // A stream or topic patch never touches credentials, even when it renames.
+        if (!passwordChange && (!change.isReadable() || change.readUnsignedByte() != OptionsScope.User.asCode())) {
+            return Optional.empty();
+        }
         ByteBuf current = Unpooled.wrappedBuffer(payload);
         String oldUsername = current.readCharSequence(current.readUnsignedByte(), StandardCharsets.UTF_8)
                 .toString();
@@ -101,8 +103,8 @@ final class SessionLogin {
         Optional<String> password = Optional.empty();
         if (passwordChange) {
             password = readField(change).flatMap(currentPassword -> readField(change));
-        } else if (change.isReadable() && change.readUnsignedByte() == USERNAME_PRESENT) {
-            username = readField(change);
+        } else {
+            username = UserPatchCredentials.patchedUsername(change);
         }
         if (username.isEmpty() && password.isEmpty()) {
             return Optional.empty();

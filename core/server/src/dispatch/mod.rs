@@ -36,6 +36,7 @@ mod authz;
 mod failure;
 pub mod host;
 pub mod login_error;
+pub mod metadata_changes;
 pub mod partition;
 pub mod reads;
 mod segment_delete;
@@ -59,7 +60,6 @@ use crate::reply_frame::build_raw_pat_reply;
 use crate::rewrite::{RewriteDeny, tcp_chain};
 use crate::session_manager::{ConnectionContext, SessionManager};
 use crate::shell::{ShellBus, ShellShard, ShellShardHandle};
-use crate::wire::verify_request_checksum;
 use ahash::{AHashMap, AHashSet};
 use configs::server::ServerConfig;
 use consensus::MetadataHandle;
@@ -758,19 +758,6 @@ async fn handle_client_request<B, MJ, S, SB>(
     // resolution sites below stamp it before anything routes on it.
     let request = request.into_routed();
 
-    // The last point that still sees the body the CLIENT sent; every rewrite below
-    // substitutes server-chosen bytes and carries the stamp through unchanged.
-    if let Err(error) = verify_request_checksum(&request) {
-        warn!(
-            transport_client_id,
-            operation = ?request.header().operation,
-            request = request.header().request,
-            "dropping client request whose body does not match its own checksum"
-        );
-        send_deny_reply(shard, origin, request.header(), error.as_code()).await;
-        return;
-    }
-
     // ONE `connections` walk for the whole prologue. Any request is liveness
     // proof, not just PING: an idle-but-active client (e.g. an admin issuing
     // reads between long sleeps) must not be evicted by the heartbeat
@@ -1237,33 +1224,39 @@ mod tests {
     use iggy_binary_protocol::Command;
     use iggy_binary_protocol::codes::{
         GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE,
-        GET_ME_CODE, GET_PARTITION_ROUTE_CODE, GET_STATS_CODE, POLL_MESSAGES_CODE,
+        GET_ME_CODE, GET_METADATA_CHANGES_CODE, GET_PARTITION_ROUTE_CODE, GET_STATS_CODE,
+        POLL_MESSAGES_CODE,
     };
+    use iggy_binary_protocol::primitives::metadata_changes::WireMetadataChangeStatus;
     use iggy_binary_protocol::primitives::polling_strategy::WirePollingStrategy;
     use iggy_binary_protocol::requests::consumer_offsets::{
         GetConsumerOffsetRequest, StoreConsumerOffsetRequest,
     };
     use iggy_binary_protocol::requests::messages::{GetPartitionRouteRequest, PollMessagesRequest};
     use iggy_binary_protocol::requests::personal_access_tokens::CreatePersonalAccessTokenRequest as WireCreatePersonalAccessTokenRequest;
-    use iggy_binary_protocol::requests::streams::{CreateStreamRequest, UpdateStreamRequest};
-    use iggy_binary_protocol::requests::system::{
-        BindSessionRequest, GetClientRequest, GetClientsRequest, GetStatsRequest,
+    use iggy_binary_protocol::requests::streams::{
+        CreateStreamRequest, UpdateStreamResolvedRequest,
     };
-    use iggy_binary_protocol::requests::topics::{DeleteTopicRequest, UpdateTopicRequest};
+    use iggy_binary_protocol::requests::system::{
+        BindSessionRequest, GetClientRequest, GetClientsRequest, GetMetadataChangesRequest,
+        GetStatsRequest, ResourceTarget, UpdateResourceRequest,
+    };
+    use iggy_binary_protocol::requests::topics::{DeleteTopicRequest, UpdateTopicResolvedRequest};
     use iggy_binary_protocol::requests::users::login_register::{
         LoginRegisterRequest, RegisterRequest,
     };
     use iggy_binary_protocol::requests::users::login_register_with_pat::LoginRegisterWithPatRequest;
     use iggy_binary_protocol::requests::users::{
-        CreateUserRequest, DeleteUserRequest, UpdatePermissionsRequest, UpdateUserRequest,
+        CreateUserRequest, DeleteUserRequest, UpdatePermissionsRequest, UpdateUserResolvedRequest,
     };
+    use iggy_binary_protocol::responses::system::GetMetadataChangesResponse;
     use iggy_binary_protocol::{
         AckLevel, ClientVersionInfo, EvictionHeader, IGGY_PROTOCOL_VERSION, ReplyHeader,
         WireConsumer,
     };
-    use iggy_binary_protocol::{WireEncode, WireIdentifier, WireName, WireOptions};
+    use iggy_binary_protocol::{WireDecode, WireEncode, WireIdentifier, WireName, WireOptions};
     use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
-    use iggy_common::{Identifier, IggyByteSize};
+    use iggy_common::{Identifier, IggyByteSize, MetadataChangeStart, MetadataChangesQuery};
     use journal::prepare_journal::PrepareJournal;
     use message_bus::installer::conn_info::ClientTransportKind;
     use metadata::impls::metadata::IggySnapshot;
@@ -1320,6 +1313,7 @@ mod tests {
                     |_| {},
                     prepare,
                 )
+                .reply
             };
             let create = CreateUserRequest {
                 username: WireName::new("original").unwrap(),
@@ -1508,31 +1502,35 @@ mod tests {
             let bus = SpyBus::default();
             let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
             let metadata = shard.plane.metadata();
+            let account_id = u32::from(status == Some(UserStatus::Inactive));
             if let Some(status) = status {
                 metadata.mux_stm.users().ensure_root_user("iggy", "hash");
-                metadata
-                    .mux_stm
-                    .update(prepare_message(
-                        Operation::UpdateUser,
-                        CLIENT,
-                        SESSION,
-                        &UpdateUserRequest {
-                            user_id: WireIdentifier::numeric(0),
-                            username: None,
-                            status: Some(status.as_code()),
-                            options: WireOptions::empty(),
-                        }
-                        .to_bytes(),
-                    ))
-                    .unwrap();
+                if status == UserStatus::Inactive {
+                    metadata
+                        .mux_stm
+                        .update(prepare_message(
+                            Operation::CreateUser,
+                            CLIENT,
+                            SESSION,
+                            &CreateUserRequest {
+                                username: WireName::new("inactive-user").unwrap(),
+                                password: "hash".to_owned(),
+                                status: status.as_code(),
+                                permissions: None,
+                                options: WireOptions::empty(),
+                            }
+                            .to_bytes(),
+                        ))
+                        .unwrap();
+                }
             }
             metadata
                 .client_table
                 .borrow_mut()
                 .commit_register(
                     client_id,
-                    0,
-                    bind_verifier(client_id, 0, &SECRET),
+                    account_id,
+                    bind_verifier(client_id, account_id, &SECRET),
                     register_reply(client_id, SESSION),
                 )
                 .unwrap();
@@ -1559,7 +1557,7 @@ mod tests {
             if status == Some(UserStatus::Active)
                 && !message_bus::is_server_internal_client(client_id)
             {
-                assert_eq!(outcome.unwrap(), (0, SESSION));
+                assert_eq!(outcome.unwrap(), (account_id, SESSION));
                 assert_eq!(
                     sessions.borrow().get_session(TRANSPORT),
                     Some((client_id, SESSION))
@@ -1699,6 +1697,61 @@ mod tests {
     }
 
     #[compio::test]
+    async fn given_root_session_when_reading_metadata_changes_should_answer_pages_and_refuse_bad_bodies()
+     {
+        let (bus, shard, host) = root_host(ServerConfig::default());
+        bind_root_session(&shard, host.sessions()).await;
+        let metadata = shard.plane.metadata();
+        metadata
+            .change_log()
+            .append(
+                &PrepareHeader {
+                    op: 1,
+                    checksum: 0x5eed,
+                    ..PrepareHeader::default()
+                },
+                Vec::new(),
+            )
+            .unwrap();
+        let read = |request, body: &[u8]| {
+            let mut read = wire_request(
+                Operation::NonReplicated,
+                ROOT_CLIENT,
+                ROOT_SESSION,
+                request,
+                body,
+            );
+            bytemuck::checked::from_bytes_mut::<RequestHeader>(
+                &mut read.as_mut_slice()[..size_of::<RequestHeader>()],
+            )
+            .reserved[..4]
+                .copy_from_slice(&GET_METADATA_CHANGES_CODE.to_le_bytes());
+            read.into_generic()
+        };
+        let latest = GetMetadataChangesRequest::from(&MetadataChangesQuery {
+            start: MetadataChangeStart::Latest,
+            ..MetadataChangesQuery::default()
+        })
+        .to_bytes();
+
+        host.on_client_request(ROOT_TRANSPORT, read(1, &latest));
+        host.on_client_request(ROOT_TRANSPORT, read(2, &[0xff]));
+        await_replies(&bus, 2).await;
+
+        let replies = bus.client_replies.borrow();
+        assert_eq!(replies.len(), 2);
+        let (header, body) = replies[0].1.split_at(size_of::<ReplyHeader>());
+        assert_eq!(reply_status(header), 0);
+        let page = GetMetadataChangesResponse::decode_from(body).expect("a change page");
+        assert_eq!(page.status, WireMetadataChangeStatus::Ok);
+        assert_eq!(page.log_id, Some(0x5eed));
+        assert_eq!(
+            reply_status(&replies[1].1),
+            IggyError::InvalidCommand.as_code()
+        );
+    }
+
+    #[compio::test]
     async fn given_a_read_held_at_the_frontier_when_the_session_ends_should_refuse_stale_client() {
         let (bus, shard, host) = root_host(ServerConfig::default());
         bind_root_session(&shard, host.sessions()).await;
@@ -1749,7 +1802,10 @@ mod tests {
         let stream_id = WireIdentifier::named("stream").unwrap();
         let topic_id = WireIdentifier::named("topic").unwrap();
         for (code, body) in partition_namespace_reads(&stream_id, &topic_id) {
-            for rename in [Operation::UpdateStream, Operation::UpdateTopic] {
+            for rename in [
+                Operation::UpdateStreamResolved,
+                Operation::UpdateTopicResolved,
+            ] {
                 assert_read_refused_after_shard_wait(
                     code,
                     &body,
@@ -2012,19 +2068,21 @@ mod tests {
                         WireIdentifier::numeric(namespace.stream_id().try_into().unwrap());
                     let name = WireName::new("renamed").unwrap();
                     let body = match operation {
-                        Operation::UpdateStream => UpdateStreamRequest {
+                        Operation::UpdateStreamResolved => UpdateStreamResolvedRequest {
                             stream_id,
-                            name,
-                            options: WireOptions::empty(),
+                            name: Some(name),
+                            explicit_options: WireOptions::empty(),
+                            derived_options: WireOptions::empty(),
                         }
                         .to_bytes(),
-                        Operation::UpdateTopic => UpdateTopicRequest {
+                        Operation::UpdateTopicResolved => UpdateTopicResolvedRequest {
                             stream_id,
                             topic_id: WireIdentifier::numeric(
                                 namespace.topic_id().try_into().unwrap(),
                             ),
-                            name,
-                            options: WireOptions::empty(),
+                            name: Some(name),
+                            explicit_options: WireOptions::empty(),
+                            derived_options: WireOptions::empty(),
                         }
                         .to_bytes(),
                         _ => panic!("{operation:?} renames neither a stream nor a topic"),
@@ -2185,6 +2243,7 @@ mod tests {
                     context: attachment.metadata.context(0),
                     fragments: Vec::new().into(),
                     current_offset: STORED_OFFSET,
+                    encryptor: None,
                 })
                 .unwrap(),
             LifecycleFrame::PartitionRead {
@@ -2211,7 +2270,7 @@ mod tests {
     #[compio::test]
     async fn given_deactivated_user_when_reactivated_should_reject_retained_session() {
         for primary in [false, true] {
-            assert_revoked_user_cannot_resume(Operation::UpdateUser, primary).await;
+            assert_revoked_user_cannot_resume(Operation::UpdateUserResolved, primary).await;
         }
     }
 
@@ -2289,11 +2348,12 @@ mod tests {
             }
             .to_bytes()
         } else {
-            UpdateUserRequest {
+            UpdateUserResolvedRequest {
                 user_id: WireIdentifier::numeric(USER),
                 username: None,
                 status: Some(UserStatus::Inactive.as_code()),
-                options: WireOptions::empty(),
+                explicit_options: WireOptions::empty(),
+                derived_options: WireOptions::empty(),
             }
             .to_bytes()
         };
@@ -2306,6 +2366,28 @@ mod tests {
             let consensus = metadata.consensus.as_ref().unwrap();
             consensus.restore_commit_state(SESSION, SESSION);
             consensus.sequencer().set_sequence(SESSION);
+            // A client sends the generic patch, the primary resolves it.
+            let (operation, body) = if operation == Operation::UpdateUserResolved {
+                let patch = iggy_common::UserUpdateOptions {
+                    status: Some(UserStatus::Inactive),
+                    ..iggy_common::UserUpdateOptions::default()
+                }
+                .to_patch()
+                .unwrap();
+                (
+                    Operation::UpdateResource,
+                    UpdateResourceRequest {
+                        target: ResourceTarget::User {
+                            user_id: WireIdentifier::numeric(USER),
+                        },
+                        reset: patch.reset,
+                        options: patch.set,
+                    }
+                    .to_bytes(),
+                )
+            } else {
+                (operation, body)
+            };
             let request = request_message(operation, ROOT_CLIENT, 1, 1, &body).transmute_header(
                 |old, header: &mut RoutedRequestHeader| {
                     *header = old;
@@ -2326,7 +2408,8 @@ mod tests {
                 true,
                 |_| {},
                 consensus::seal_prepare_checksum(revocation),
-            );
+            )
+            .reply;
             assert_eq!(iggy_binary_protocol::result_code(reply.body()), Some(0));
         }
         let old_binding = sessions.borrow().get_session(TRANSPORT);
@@ -2343,14 +2426,15 @@ mod tests {
             )
         } else {
             prepare_message(
-                Operation::UpdateUser,
+                Operation::UpdateUserResolved,
                 0,
                 4,
-                &UpdateUserRequest {
+                &UpdateUserResolvedRequest {
                     user_id: WireIdentifier::numeric(USER),
                     username: None,
                     status: Some(UserStatus::Active.as_code()),
-                    options: WireOptions::empty(),
+                    explicit_options: WireOptions::empty(),
+                    derived_options: WireOptions::empty(),
                 }
                 .to_bytes(),
             )
@@ -2397,7 +2481,7 @@ mod tests {
                 validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 preallocate_segments: false,
-                encryptor: None,
+                key_context: Arc::default(),
                 path_layout: PartitionPathLayout::default(),
             },
         );
@@ -3012,55 +3096,6 @@ mod tests {
             "pre-auth ping must get a Reply, not an eviction"
         );
         assert_eq!(reply_status(frame), 0, "pre-auth ping must succeed");
-    }
-
-    /// The request-checksum gate runs before every probe: a replicated op
-    /// from an UNBOUND transport with a bad stamp must get the checksum deny
-    /// Reply, not the `Eviction(NoSession)` the session gate would send.
-    #[compio::test]
-    async fn checksum_mismatch_denies_before_everything() {
-        const TRANSPORT: u128 = 97;
-        const BODY: &[u8] = b"stream-body";
-        let bus = SpyBus::default();
-        let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
-        let sessions = Rc::new(RefCell::new(SessionManager::new()));
-        let server_config = Arc::new(ServerConfig::default());
-
-        let mut message = wire_request(Operation::CreateStream, TRANSPORT, 1, 1, BODY);
-        {
-            let header_size = size_of::<RequestHeader>();
-            let header = bytemuck::checked::from_bytes_mut::<RequestHeader>(
-                &mut message.as_mut_slice()[..header_size],
-            );
-            // Nonzero (zero means unstamped and skips the check) and never
-            // the body's real checksum.
-            header.request_checksum = u128::from(iggy_common::calculate_checksum(BODY)) + 1;
-        }
-        handle_client_request(
-            &shard,
-            &sessions,
-            &server_config,
-            &ClientRequestQueues::default(),
-            &Rc::new(ClientDrain::new(&server_config)),
-            ClientOrigin::capture(&shard.bus, TRANSPORT),
-            message.into_generic(),
-            None,
-        )
-        .await;
-        let replies = bus.client_replies.borrow();
-        assert_eq!(replies.len(), 1, "bad stamp must be answered");
-        let (client, frame) = &replies[0];
-        assert_eq!(*client, TRANSPORT);
-        assert_eq!(
-            frame_command(frame),
-            Command::Reply as u8,
-            "a bad stamp must get the checksum deny, not the NoSession eviction"
-        );
-        assert_eq!(
-            reply_status(frame),
-            IggyError::InvalidFormat.as_code(),
-            "the deny status must carry the checksum error"
-        );
     }
 
     /// The late-bound self-reference as the shard build creates it: unset
@@ -4056,7 +4091,8 @@ mod tests {
             true,
             |_| {},
             prepare,
-        );
+        )
+        .reply;
         assert_eq!(iggy_binary_protocol::result_code(created.body()), Some(0));
         let create = |request, name| {
             let body = WireCreatePersonalAccessTokenRequest {
@@ -4149,7 +4185,8 @@ mod tests {
             true,
             |_| {},
             prepare,
-        );
+        )
+        .reply;
         assert_eq!(iggy_binary_protocol::result_code(created.body()), Some(0));
 
         let resent = submit_client_request_on_owner(&shard, minted)

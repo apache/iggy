@@ -32,7 +32,7 @@ public struct ProtocolVersion: Sendable, Hashable, Comparable, CustomStringConve
     /// The protocol version this SDK implements: the version of the
     /// `iggy_binary_protocol` crate it was ported from. The golden fixture
     /// carries the crate's value and a test fails when the two diverge.
-    public static let current = ProtocolVersion(major: 0, minor: 11, patch: 1)
+    public static let current = ProtocolVersion(major: 0, minor: 12, patch: 0)
 
     public var major: UInt32 { packed >> 20 }
     public var minor: UInt32 { (packed >> 10) & 0x3FF }

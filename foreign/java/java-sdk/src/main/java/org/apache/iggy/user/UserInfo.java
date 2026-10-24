@@ -19,6 +19,26 @@
 
 package org.apache.iggy.user;
 
-import java.math.BigInteger;
+import org.apache.iggy.message.HeaderValue;
 
-public record UserInfo(Long id, BigInteger createdAt, UserStatus status, String username) {}
+import java.math.BigInteger;
+import java.util.Map;
+
+/**
+ * A user as the server reports it.
+ *
+ * <p>{@code options} carries the keys the creating client set, {@code derivedOptions} the values the
+ * server filled. No user key exists in this release, so both are empty until a server adds one.
+ */
+public record UserInfo(
+        Long id,
+        BigInteger createdAt,
+        UserStatus status,
+        String username,
+        Map<String, HeaderValue> options,
+        Map<String, HeaderValue> derivedOptions) {
+    public UserInfo {
+        options = options == null ? Map.of() : options;
+        derivedOptions = derivedOptions == null ? Map.of() : derivedOptions;
+    }
+}
