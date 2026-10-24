@@ -16172,6 +16172,14 @@ mod probe_answer_divergence_tests {
             "no committed metadata op was witnessed on two replicas, so this seed \
              would pass on a diverged cluster"
         );
+        assert!(
+            report.change_records_compared > 0,
+            "no change record was compared between replicas"
+        );
+        assert!(
+            report.projection_items_compared > 0,
+            "the leader's change records were never replayed against its current state"
+        );
     }
 }
 

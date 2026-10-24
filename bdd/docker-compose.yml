@@ -38,6 +38,7 @@ services:
       - ./scenarios/stream_crud.feature:/app/features/stream_crud.feature
       - ./scenarios/stream_options.feature:/app/features/stream_options.feature
       - ./scenarios/resource_options_patch.feature:/app/features/resource_options_patch.feature
+      - ./scenarios/metadata_changes.feature:/app/features/metadata_changes.feature
     command:
       - sh
       - -c
@@ -50,6 +51,7 @@ services:
           stream_crud)        cargo test -p bdd --features "$$BDD_RUST_FEATURES" --test stream_crud ;;
           stream_options)     cargo test -p bdd --features "$$BDD_RUST_FEATURES" --test stream_options ;;
           resource_options_patch) cargo test -p bdd --features "$$BDD_RUST_FEATURES" --test resource_options_patch ;;
+          metadata_changes)   cargo test -p bdd --features "$$BDD_RUST_FEATURES" --test metadata_changes ;;
           *)                  cargo test -p bdd --features "$$BDD_RUST_FEATURES" ;;
         esac
     networks:
@@ -69,6 +71,7 @@ services:
       - ./scenarios/raw_command.feature:/app/features/raw_command.feature
       - ./scenarios/stream_options.feature:/app/features/stream_options.feature
       - ./scenarios/resource_options_patch.feature:/app/features/resource_options_patch.feature
+      - ./scenarios/metadata_changes.feature:/app/features/metadata_changes.feature
       - ./scenarios/session_contract.feature:/app/features/session_contract.feature
     working_dir: /app
     command:
@@ -81,6 +84,7 @@ services:
           session_contract)       TEST_PATH='tests/test_session_contract.py' ;;
           stream_options)         TEST_PATH='tests/test_stream_options.py' ;;
           resource_options_patch) TEST_PATH='tests/test_resource_options_patch.py' ;;
+          metadata_changes)       TEST_PATH='tests/test_metadata_changes.py' ;;
           *)                      TEST_PATH='tests/' ;;
         esac
         uv run --project /workspace/bdd/python pytest $$TEST_PATH -v
@@ -100,6 +104,7 @@ services:
       - ./scenarios/raw_command.feature:/app/features/raw_command.feature
       - ./scenarios/stream_options.feature:/app/features/stream_options.feature
       - ./scenarios/session_contract.feature:/app/features/session_contract.feature
+      - ./scenarios/metadata_changes.feature:/app/features/metadata_changes.feature
     command:
       - sh
       - -c
@@ -109,6 +114,7 @@ services:
           raw_command)      GROUP='--group raw-command' ;;
           session_contract) GROUP='--group session-contract' ;;
           stream_options)   GROUP='--group stream-options' ;;
+          metadata_changes) GROUP='--group metadata-changes' ;;
           *)                GROUP='' ;;
         esac
         ./scripts/test.sh --configuration /workspace/bdd/php/phpunit.xml.dist $$GROUP
@@ -148,6 +154,7 @@ services:
           session_contract)       TAGS='--tags @session-contract' ;;
           stream_options)         TAGS='--tags @stream-options' ;;
           resource_options_patch) TAGS='--tags @resource-options-patch' ;;
+          metadata_changes)       TAGS='--tags @metadata-changes' ;;
           *)                      TAGS='' ;;
         esac
         npm run test:bdd -- $$TAGS
@@ -174,6 +181,7 @@ services:
           raw_command)        FILTER='--filter-trait Category=raw-command' ;;
           stream_options)     FILTER='--filter-trait Category=stream-options' ;;
           resource_options_patch) FILTER='--filter-trait Category=resource-options-patch' ;;
+          metadata_changes)   FILTER='--filter-trait Category=metadata-changes' ;;
           session_contract)   FILTER='--filter-trait Category=session-contract' ;;
         esac
         dotnet test $$FILTER
@@ -197,6 +205,7 @@ services:
       - ./scenarios/stream_crud.feature:/app/features/stream_crud.feature
       - ./scenarios/stream_options.feature:/app/features/stream_options.feature
       - ./scenarios/resource_options_patch.feature:/app/features/resource_options_patch.feature
+      - ./scenarios/metadata_changes.feature:/app/features/metadata_changes.feature
     command:
       - sh
       - -c
@@ -209,6 +218,7 @@ services:
           stream_crud)        export CUCUMBER_FILTER_TAGS='@stream-crud' ;;
           stream_options)     export CUCUMBER_FILTER_TAGS='@stream-options' ;;
           resource_options_patch) export CUCUMBER_FILTER_TAGS='@resource-options-patch' ;;
+          metadata_changes)   export CUCUMBER_FILTER_TAGS='@metadata-changes' ;;
         esac
         gradle --no-daemon test
     networks:
@@ -228,6 +238,7 @@ services:
       - ./scenarios/raw_command.feature:/app/features/raw_command.feature
       - ./scenarios/stream_options.feature:/app/features/stream_options.feature
       - ./scenarios/resource_options_patch.feature:/app/features/resource_options_patch.feature
+      - ./scenarios/metadata_changes.feature:/app/features/metadata_changes.feature
       - ./scenarios/session_contract.feature:/app/features/session_contract.feature
     networks:
       - iggy-bdd-network

@@ -73,6 +73,8 @@ services:
       # Every feature shares this server, and stream_options asserts server-generated stream keys.
       - IGGY_ENCRYPTION_ENABLED=true
       - IGGY_ENCRYPTION_KEY=/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=
+      # Small enough for metadata_changes to expire a cursor with a few dozen streams.
+      - IGGY_METADATA_CHANGE_LOG_RESOURCE_CAPACITY=64
     volumes:
       - iggy_data:/app/local_data
       - ../target:/profiles

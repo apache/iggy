@@ -64,19 +64,6 @@ constexpr iggy::TopicOptionKey kTopicOptionKeys[] = {
     iggy::TopicOptionKey::PreallocateSegments,
 };
 
-iggy::IggyBlockingClient &Sdk(bdd::GlobalContext &context) {
-    if (!context.sdk) {
-        auto client =
-            iggy::IggyBlockingClient::Builder()
-                .WithServerAddress(bdd::required_env("IGGY_TCP_ADDRESS"))
-                .WithAutoLogin(bdd::required_env("IGGY_ROOT_USERNAME"), bdd::required_env("IGGY_ROOT_PASSWORD"))
-                .Build();
-        client.Connect();
-        context.sdk.emplace(std::move(client));
-    }
-    return *context.sdk;
-}
-
 template <typename Key, std::size_t Count>
 Key KeyFromName(const Key (&keys)[Count], const std::string &name) {
     for (const auto key : keys) {
@@ -106,15 +93,15 @@ iggy::Identifier TopicIdentifier(const bdd::GlobalContext &context) {
 }
 
 iggy::StreamDetails FetchStream(bdd::GlobalContext &context) {
-    return Sdk(context).GetStream(StreamIdentifier(context));
+    return bdd::sdk_client(context).GetStream(StreamIdentifier(context));
 }
 
 iggy::TopicDetails FetchTopic(bdd::GlobalContext &context) {
-    return Sdk(context).GetTopic(StreamIdentifier(context), TopicIdentifier(context));
+    return bdd::sdk_client(context).GetTopic(StreamIdentifier(context), TopicIdentifier(context));
 }
 
 iggy::UserInfoDetails FetchUser(bdd::GlobalContext &context) {
-    return Sdk(context).GetUser(iggy::Identifier::Numeric(context.last_user_id.value()));
+    return bdd::sdk_client(context).GetUser(iggy::Identifier::Numeric(context.last_user_id.value()));
 }
 
 void CreateStream(bdd::GlobalContext &context,
@@ -124,13 +111,13 @@ void CreateStream(bdd::GlobalContext &context,
     if (key) {
         options.SetEncryptionKey(*key);
     }
-    const auto stream       = Sdk(context).CreateStream(name, options);
+    const auto stream       = bdd::sdk_client(context).CreateStream(name, options);
     context.last_stream_id  = stream.Id();
     context.last_stream_key = key;
 }
 
 void CreateTopic(bdd::GlobalContext &context, const std::string &name, iggy::TopicCreateOptions options) {
-    const auto topic      = Sdk(context).CreateTopic(StreamIdentifier(context), name, options);
+    const auto topic      = bdd::sdk_client(context).CreateTopic(StreamIdentifier(context), name, options);
     context.last_topic_id = topic.Id();
 }
 
@@ -172,7 +159,7 @@ const iggy::OptionSpec &StreamOptionSpec(const bdd::GlobalContext &context, cons
 }
 
 void UpdateTopic(bdd::GlobalContext &context, const iggy::TopicUpdateOptions &options) {
-    Sdk(context).UpdateTopic(StreamIdentifier(context), TopicIdentifier(context), options);
+    bdd::sdk_client(context).UpdateTopic(StreamIdentifier(context), TopicIdentifier(context), options);
 }
 
 }  // namespace
@@ -311,7 +298,7 @@ WHEN("^I rename the stream to \"([^\"]+)\"$") {
     REGEX_PARAM(std::string, name);
     cucumber::ScenarioScope<bdd::GlobalContext> context;
 
-    Sdk(*context).UpdateStream(StreamIdentifier(*context), iggy::StreamUpdateOptions().SetName(name));
+    bdd::sdk_client(*context).UpdateStream(StreamIdentifier(*context), iggy::StreamUpdateOptions().SetName(name));
 }
 
 THEN("^the stream name should be \"([^\"]+)\"$") {
@@ -327,7 +314,7 @@ WHEN("^I request a reset of the stream option \"([^\"]+)\"$") {
 
     const auto options = iggy::StreamUpdateOptions().Reset(KeyFromName(kStreamOptionKeys, key));
     try {
-        Sdk(*context).UpdateStream(StreamIdentifier(*context), options);
+        bdd::sdk_client(*context).UpdateStream(StreamIdentifier(*context), options);
         context->last_update_rejected = false;
     } catch (const iggy::IggyException &) {
         context->last_update_rejected = true;
@@ -343,7 +330,7 @@ THEN("^the stream update should be rejected$") {
 WHEN("^I describe the stream options$") {
     cucumber::ScenarioScope<bdd::GlobalContext> context;
 
-    context->last_option_specs = Sdk(*context).DescribeOptions(iggy::OptionsScope::Stream);
+    context->last_option_specs = bdd::sdk_client(*context).DescribeOptions(iggy::OptionsScope::Stream);
 }
 
 THEN("^the stream option \"([^\"]+)\" should be updatable and not secret$") {
@@ -446,8 +433,8 @@ GIVEN("^a user named \"([^\"]+)\" with password \"([^\"]+)\" exists$") {
     REGEX_PARAM(std::string, password);
     cucumber::ScenarioScope<bdd::GlobalContext> context;
 
-    const auto user =
-        Sdk(*context).CreateUser(username, password, iggy::UserStatus::Active, std::nullopt, iggy::UserCreateOptions());
+    const auto user = bdd::sdk_client(*context).CreateUser(username, password, iggy::UserStatus::Active, std::nullopt,
+                                                           iggy::UserCreateOptions());
     context->last_user_id = user.Id();
 }
 
@@ -456,8 +443,9 @@ WHEN("^I update the user username to \"([^\"]+)\" and status to \"([^\"]+)\"$") 
     REGEX_PARAM(std::string, status);
     cucumber::ScenarioScope<bdd::GlobalContext> context;
 
-    Sdk(*context).UpdateUser(iggy::Identifier::Numeric(context->last_user_id.value()),
-                             iggy::UserUpdateOptions().SetUsername(username).SetStatus(UserStatusFromName(status)));
+    bdd::sdk_client(*context).UpdateUser(
+        iggy::Identifier::Numeric(context->last_user_id.value()),
+        iggy::UserUpdateOptions().SetUsername(username).SetStatus(UserStatusFromName(status)));
 }
 
 THEN("^the user should have username \"([^\"]+)\"$") {

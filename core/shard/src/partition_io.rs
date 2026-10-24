@@ -2490,6 +2490,7 @@ mod tests {
                     floor: None,
                     peer: 1,
                     idle_ticks: 0,
+                    floor_pulled_from: 0,
                     requested_from: Some(1),
                 });
                 let reply =
@@ -2563,6 +2564,7 @@ mod tests {
             floor: None,
             peer: 0,
             idle_ticks: 0,
+            floor_pulled_from: 0,
             requested_from: Some(1),
         });
         assert_eq!(
@@ -3210,6 +3212,7 @@ mod tests {
                 fetch_to_op: commit_max,
                 floor: None,
                 peer: 0,
+                floor_pulled_from: 0,
                 idle_ticks: 0,
                 requested_from: Some(1),
             });
@@ -7830,6 +7833,7 @@ mod tests {
             commit_to_op: STALE_SHAPE_OP,
             fetch_to_op: STALE_SHAPE_OP,
             floor: None,
+            floor_pulled_from: 0,
             requested_from: Some(STALE_SHAPE_OP),
             peer,
             idle_ticks: 0,
@@ -8085,6 +8089,7 @@ mod tests {
             floor: None,
             peer,
             idle_ticks: 0,
+            floor_pulled_from: 0,
             requested_from: Some(commit_min + 1),
         });
         partition

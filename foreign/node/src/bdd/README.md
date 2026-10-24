@@ -31,6 +31,8 @@ iggy-server started with the same root credentials
 
 The stream options feature also needs the server to run with encryption enabled and a config key (`IGGY_ENCRYPTION_ENABLED=true`, `IGGY_ENCRYPTION_KEY`), as `scripts/run-bdd-tests.sh` starts it.
 
+The metadata changes feature needs the same key and `IGGY_METADATA_CHANGE_LOG_RESOURCE_CAPACITY=64`, so its expiry scenario can push a held cursor out of the change log.
+
 from [/foreign/node](../../) run
 
 ```bash

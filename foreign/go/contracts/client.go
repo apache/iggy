@@ -86,6 +86,16 @@ type Client interface {
 	// Authentication is required.
 	DescribeOptions(ctx context.Context, scope OptionsScope) ([]OptionSpec, error)
 
+	// GetMetadataChanges get one page of the server's metadata change log: the
+	// public results of committed metadata operations after a cursor, or a
+	// page of the current state with a current start. Keep the returned Next
+	// cursor and send it back to continue. Expired and reset answers mean the
+	// mirror rebuilds from current state pages.
+	// A query that breaks the request rules is refused with
+	// ierror.ErrInvalidCommand before anything is sent.
+	// Authentication is required, and the permission to manage the servers.
+	GetMetadataChanges(ctx context.Context, query MetadataChangesQuery) (*MetadataChanges, error)
+
 	// CreateTopic create a new topic. Nil options select the defaults.
 	// Authentication is required, and the permission to manage the topics.
 	//

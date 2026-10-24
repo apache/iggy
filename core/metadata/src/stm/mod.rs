@@ -413,6 +413,17 @@ macro_rules! define_state {
                         inner: $crate::stm::LeftRight::from_factory(factory),
                     }
                 }
+
+                /// The change records of the command applied last.
+                pub(crate) fn last_changes(&self) -> Vec<$crate::change_log::AppliedChange> {
+                    self.inner.read(|state| {
+                        state
+                            .last_result
+                            .as_ref()
+                            .map(|reply| reply.changes.clone())
+                            .unwrap_or_default()
+                    })
+                }
             }
 
             impl $crate::stm::mux::WithFactory for $state {

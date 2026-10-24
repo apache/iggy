@@ -63,6 +63,7 @@ class ProtocolParityTest {
             Map.entry(CommandCode.System.DESCRIBE_OPTIONS, "DESCRIBE_OPTIONS_CODE"),
             Map.entry(CommandCode.System.BIND_SESSION, "BIND_SESSION_CODE"),
             Map.entry(CommandCode.System.UPDATE_RESOURCE, "UPDATE_RESOURCE_CODE"),
+            Map.entry(CommandCode.System.GET_METADATA_CHANGES, "GET_METADATA_CHANGES_CODE"),
             Map.entry(CommandCode.System.GET_ME, "GET_ME_CODE"),
             Map.entry(CommandCode.System.GET_CLIENT, "GET_CLIENT_CODE"),
             Map.entry(CommandCode.System.GET_ALL_CLIENTS, "GET_CLIENTS_CODE"),

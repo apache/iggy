@@ -86,3 +86,16 @@ pub use iggy_common::{
     RESYNC_REQUIRED_PARTITION_SENTINEL, SEC_IN_MICRO,
     defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USER_ID, DEFAULT_ROOT_USERNAME},
 };
+pub use iggy_common::{
+    MAX_METADATA_CHANGES_LIMIT, MetadataChange, MetadataChangeCursor, MetadataChangeGroup,
+    MetadataChangeKind, MetadataChangePhase, MetadataChangeRecord, MetadataChangeStart,
+    MetadataChangeStatus, MetadataChanges, MetadataChangesQuery, MetadataConsumerGroupCreated,
+    MetadataConsumerGroupDeleted, MetadataConsumerGroupItem, MetadataCurrentItem,
+    MetadataCurrentPageToken, MetadataMemberItem, MetadataMemberJoined, MetadataMemberLeft,
+    MetadataMemberLeftReason, MetadataOptions, MetadataPartitionHandedOver,
+    MetadataPartitionsChanged, MetadataPartitionsItem, MetadataPermissionsUpdatedReason,
+    MetadataRawJson, MetadataSession, MetadataSessionClosed, MetadataSessionClosedReason,
+    MetadataStreamChange, MetadataStreamDeleted, MetadataTokenChange, MetadataTokenDeleted,
+    MetadataTokenDeletedReason, MetadataTopicChange, MetadataTopicDeleted, MetadataTopicItem,
+    MetadataUserChange, MetadataUserIdentity, MetadataUserPermissionsUpdated,
+};

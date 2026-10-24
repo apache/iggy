@@ -21,6 +21,7 @@ mod consumer;
 mod durability;
 mod duration;
 mod identifier;
+mod metadata_changes;
 mod options;
 mod partitioning;
 mod permissions;
@@ -42,6 +43,18 @@ use config::{
 use consumer::{
     AutoCommit, AutoCommitAfter, AutoCommitWhen, Consumer, ConsumerGroup, ConsumerGroupDetails,
     ConsumerGroupMember, IggyConsumer, ReceiveMessageIterator,
+};
+use metadata_changes::{
+    MetadataChangeCursor, MetadataChangeGroup, MetadataChangeKind, MetadataChangePhase,
+    MetadataChangeRecord, MetadataChangeStart, MetadataChangeStatus, MetadataChanges,
+    MetadataConsumerGroupCreated, MetadataConsumerGroupDeleted, MetadataConsumerGroupItem,
+    MetadataCurrentItem, MetadataCurrentPageToken, MetadataMemberItem, MetadataMemberJoined,
+    MetadataMemberLeft, MetadataMemberLeftReason, MetadataPartitionHandedOver,
+    MetadataPartitionsChanged, MetadataPartitionsItem, MetadataPermissionsUpdatedReason,
+    MetadataSession, MetadataSessionClosed, MetadataSessionClosedReason, MetadataStreamChange,
+    MetadataStreamDeleted, MetadataTokenChange, MetadataTokenDeleted, MetadataTokenDeletedReason,
+    MetadataTopicChange, MetadataTopicDeleted, MetadataTopicItem, MetadataUnknownChange,
+    MetadataUnknownItem, MetadataUserChange, MetadataUserIdentity, MetadataUserPermissionsUpdated,
 };
 use options::OptionSpec;
 use partitioning::Partitioning;
@@ -133,5 +146,42 @@ fn apache_iggy(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<GlobalPermissions>()?;
     m.add_class::<StreamPermissions>()?;
     m.add_class::<TopicPermissions>()?;
+    m.add_class::<MetadataChanges>()?;
+    m.add_class::<MetadataChangeRecord>()?;
+    m.add_class::<MetadataCurrentItem>()?;
+    m.add_class::<MetadataChangeCursor>()?;
+    m.add_class::<MetadataCurrentPageToken>()?;
+    m.add_class::<MetadataChangeStart>()?;
+    m.add_class::<MetadataChangeGroup>()?;
+    m.add_class::<MetadataChangeKind>()?;
+    m.add_class::<MetadataChangeStatus>()?;
+    m.add_class::<MetadataChangePhase>()?;
+    m.add_class::<MetadataMemberLeftReason>()?;
+    m.add_class::<MetadataTokenDeletedReason>()?;
+    m.add_class::<MetadataSessionClosedReason>()?;
+    m.add_class::<MetadataPermissionsUpdatedReason>()?;
+    m.add_class::<MetadataStreamChange>()?;
+    m.add_class::<MetadataStreamDeleted>()?;
+    m.add_class::<MetadataTopicChange>()?;
+    m.add_class::<MetadataTopicItem>()?;
+    m.add_class::<MetadataTopicDeleted>()?;
+    m.add_class::<MetadataPartitionsChanged>()?;
+    m.add_class::<MetadataPartitionsItem>()?;
+    m.add_class::<MetadataConsumerGroupCreated>()?;
+    m.add_class::<MetadataConsumerGroupDeleted>()?;
+    m.add_class::<MetadataConsumerGroupItem>()?;
+    m.add_class::<MetadataMemberJoined>()?;
+    m.add_class::<MetadataMemberLeft>()?;
+    m.add_class::<MetadataPartitionHandedOver>()?;
+    m.add_class::<MetadataMemberItem>()?;
+    m.add_class::<MetadataUserChange>()?;
+    m.add_class::<MetadataUserIdentity>()?;
+    m.add_class::<MetadataUserPermissionsUpdated>()?;
+    m.add_class::<MetadataTokenChange>()?;
+    m.add_class::<MetadataTokenDeleted>()?;
+    m.add_class::<MetadataSession>()?;
+    m.add_class::<MetadataSessionClosed>()?;
+    m.add_class::<MetadataUnknownChange>()?;
+    m.add_class::<MetadataUnknownItem>()?;
     Ok(())
 }

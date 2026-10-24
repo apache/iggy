@@ -408,6 +408,40 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         ring.get(&op).cloned()
     }
 
+    /// The lowest resident `SendMessages` op in `ops` with its entry bytes, in
+    /// one pass over the headers. Resident only: the evicted ring holds what
+    /// already committed, which is not what a repair window is judged by.
+    #[must_use]
+    pub fn lowest_resident_send_in(
+        &self,
+        ops: RangeInclusive<u64>,
+    ) -> Option<(u64, JournalBuffer)> {
+        let op = {
+            let headers = unsafe { &*self.headers.get() };
+            headers
+                .iter()
+                .filter(|header| {
+                    header.operation == Operation::SendMessages && ops.contains(&header.op)
+                })
+                .map(|header| header.op)
+                .min()?
+        };
+        let entry = {
+            let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
+            let inner = unsafe { &*self.inner.get() };
+            op_to_storage_offset
+                .get(&op)
+                .and_then(|&storage_offset| inner.storage.read_at_sync(storage_offset))
+        };
+        if entry.is_none() {
+            warn!(
+                op,
+                "resident SendMessages header has no stored entry; the repair window has no anchor"
+            );
+        }
+        entry.map(|entry| (op, entry))
+    }
+
     /// The header at `op`, over exactly the range [`Self::repair_entry`] serves.
     ///
     /// NOT [`Self::header_by_op`], which reads the resident headers alone. The
@@ -973,20 +1007,6 @@ where
             // In-window ops only, deduplicated, so a count match IS coverage.
             complete: covered == expected_len,
         }
-    }
-
-    /// Base offset of the lowest resident message batch in `(floor, to_op]`.
-    ///
-    /// Read off the offset index, which `append` fills from the header of
-    /// each batch that carries messages, so this is the stamp that the
-    /// commit walk applies for that op.
-    pub fn first_batch_offset(&self, floor: u64, to_op: u64) -> Option<u64> {
-        let offset_to_op = unsafe { &*self.offset_to_op.get() };
-        offset_to_op
-            .iter()
-            .filter(|&(_, &op)| op > floor && op <= to_op)
-            .min_by_key(|&(_, &op)| op)
-            .map(|(&offset, _)| offset)
     }
 
     /// Highest `commit` any resident header stamped, in ONE pass.

@@ -28,15 +28,16 @@ import java.util.Map;
 import java.util.Optional;
 
 /** Reads the encryption projections a server reports in a stream's derived options. */
-final class EncryptionProjection {
+public final class EncryptionProjection {
 
     private EncryptionProjection() {}
 
-    static Optional<EncryptionKeySource> source(Map<String, HeaderValue> options, Map<String, HeaderValue> derived) {
+    public static Optional<EncryptionKeySource> source(
+            Map<String, HeaderValue> options, Map<String, HeaderValue> derived) {
         return text(options, derived, StreamOptionKey.ENCRYPTION_KEY_SOURCE).flatMap(EncryptionKeySource::fromValue);
     }
 
-    static Optional<String> keyFingerprint(Map<String, HeaderValue> options, Map<String, HeaderValue> derived) {
+    public static Optional<String> keyFingerprint(Map<String, HeaderValue> options, Map<String, HeaderValue> derived) {
         return text(options, derived, StreamOptionKey.ENCRYPTION_KEY_FINGERPRINT);
     }
 

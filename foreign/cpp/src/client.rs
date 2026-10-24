@@ -32,8 +32,15 @@ use iggy::prelude::{
     UserClient, UserCreateOptions as RustUserCreateOptions, UserStatus as RustUserStatus,
     UserUpdateOptions as RustUserUpdateOptions,
 };
+use iggy_binary_protocol::requests::system::GetMetadataChangesRequest;
+use iggy_binary_protocol::responses::system::{
+    GetMetadataChangesResponse, WireMetadataChangeRecord, WireMetadataItem,
+};
+use iggy_binary_protocol::{WireDecode, WireEncode};
 use iggy_common::{
-    Credentials as RustCredentials, IggyError, PendingOperationsConfig, stream_key_fingerprint,
+    Credentials as RustCredentials, IggyError, MetadataChangeCursor, MetadataChangeRecord,
+    MetadataChanges, MetadataChangesQuery, MetadataCurrentItem, MetadataCurrentPageToken,
+    PendingOperationsConfig, stream_key_fingerprint,
 };
 use serde::Deserialize;
 use std::collections::HashSet;
@@ -1184,6 +1191,31 @@ impl Client {
         })
     }
 
+    /// Reads one page of the metadata change log or of the current state.
+    ///
+    /// The Rust SDK validates the query before anything is sent, so a refused
+    /// query and a refusal by the server both carry their error code.
+    pub fn get_metadata_changes(
+        &self,
+        query: ffi::MetadataChangesQuery,
+        error_info: &mut ffi::ErrorInfo,
+    ) -> Result<ffi::MetadataChanges, String> {
+        *error_info = ffi::ErrorInfo::default();
+        let query = MetadataChangesQuery::try_from(query)
+            .inspect_err(|error| error_info.record(error))
+            .map_err(|error| format!("Could not get metadata changes: {error}"))?;
+
+        RUNTIME.block_on(async {
+            let changes = self
+                .inner
+                .get_metadata_changes(&query)
+                .await
+                .inspect_err(|error| error_info.record(error))
+                .map_err(|error| format!("Could not get metadata changes: {error}"))?;
+            Ok(ffi::MetadataChanges::from(changes))
+        })
+    }
+
     pub fn ping(&self) -> Result<(), String> {
         RUNTIME.block_on(async {
             self.inner
@@ -1486,6 +1518,95 @@ pub fn encryption_key_fingerprint_base64(
         .map(|key| key.fingerprint())
         .inspect_err(|error| error_info.record(error))
         .map_err(|error| format!("Could not compute the stream key fingerprint: {error}"))
+}
+
+/// Parses the `mc1_` text form. The error never echoes the text.
+pub fn parse_metadata_change_cursor(
+    text: &[u8],
+    error_info: &mut ffi::ErrorInfo,
+) -> Result<ffi::MetadataChangeCursor, String> {
+    *error_info = ffi::ErrorInfo::default();
+    str::from_utf8(text)
+        .map_err(|_| IggyError::InvalidCommand)
+        .and_then(MetadataChangeCursor::from_str)
+        .map(ffi::MetadataChangeCursor::from)
+        .inspect_err(|error| error_info.record(error))
+        .map_err(|error| format!("Could not parse the metadata change cursor: {error}"))
+}
+
+/// Parses the `cs1_` text form. The error never echoes the text.
+pub fn parse_metadata_current_page_token(
+    text: &[u8],
+    error_info: &mut ffi::ErrorInfo,
+) -> Result<ffi::MetadataCurrentPageToken, String> {
+    *error_info = ffi::ErrorInfo::default();
+    str::from_utf8(text)
+        .map_err(|_| IggyError::InvalidCommand)
+        .and_then(MetadataCurrentPageToken::from_str)
+        .map(ffi::MetadataCurrentPageToken::from)
+        .inspect_err(|error| error_info.record(error))
+        .map_err(|error| format!("Could not parse the metadata current page token: {error}"))
+}
+
+pub fn validate_metadata_changes_query(
+    query: ffi::MetadataChangesQuery,
+    error_info: &mut ffi::ErrorInfo,
+) -> Result<(), String> {
+    *error_info = ffi::ErrorInfo::default();
+    MetadataChangesQuery::try_from(query)
+        .and_then(|query| query.validate().map(|_| ()))
+        .inspect_err(|error| error_info.record(error))
+        .map_err(|error| format!("Invalid metadata changes query: {error}"))
+}
+
+pub fn encode_metadata_changes_query(
+    query: ffi::MetadataChangesQuery,
+    error_info: &mut ffi::ErrorInfo,
+) -> Result<Vec<u8>, String> {
+    *error_info = ffi::ErrorInfo::default();
+    MetadataChangesQuery::try_from(query)
+        .map(|query| GetMetadataChangesRequest::from(&query).to_bytes().to_vec())
+        .inspect_err(|error| error_info.record(error))
+        .map_err(|error| format!("Could not encode the metadata changes query: {error}"))
+}
+
+pub fn decode_metadata_changes(
+    payload: &[u8],
+    error_info: &mut ffi::ErrorInfo,
+) -> Result<ffi::MetadataChanges, String> {
+    *error_info = ffi::ErrorInfo::default();
+    GetMetadataChangesResponse::decode_from(payload)
+        .map_err(|_| IggyError::InvalidFormat)
+        .and_then(MetadataChanges::try_from)
+        .map(ffi::MetadataChanges::from)
+        .inspect_err(|error| error_info.record(error))
+        .map_err(|error| format!("Could not decode the metadata changes: {error}"))
+}
+
+pub fn decode_metadata_change_record(
+    bytes: &[u8],
+    error_info: &mut ffi::ErrorInfo,
+) -> Result<ffi::MetadataChangeRecord, String> {
+    *error_info = ffi::ErrorInfo::default();
+    WireMetadataChangeRecord::decode_from(bytes)
+        .map_err(|_| IggyError::InvalidFormat)
+        .and_then(MetadataChangeRecord::try_from)
+        .map(ffi::MetadataChangeRecord::from)
+        .inspect_err(|error| error_info.record(error))
+        .map_err(|error| format!("Could not decode the metadata change record: {error}"))
+}
+
+pub fn decode_metadata_current_item(
+    bytes: &[u8],
+    error_info: &mut ffi::ErrorInfo,
+) -> Result<ffi::MetadataCurrentItem, String> {
+    *error_info = ffi::ErrorInfo::default();
+    WireMetadataItem::decode_from(bytes)
+        .map_err(|_| IggyError::InvalidFormat)
+        .and_then(MetadataCurrentItem::try_from)
+        .map(ffi::MetadataCurrentItem::from)
+        .inspect_err(|error| error_info.record(error))
+        .map_err(|error| format!("Could not decode the metadata current item: {error}"))
 }
 
 fn is_option_error(error: &IggyError) -> bool {
