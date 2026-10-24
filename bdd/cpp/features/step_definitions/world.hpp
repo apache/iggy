@@ -64,7 +64,6 @@ struct GlobalContext {
     std::optional<iggy::MetadataChangeCursor> last_change_cursor;
     std::vector<iggy::MetadataChangeRecord> last_changes;
     std::vector<iggy::MetadataCurrentItem> last_current_items;
-
 };
 
 inline std::string required_env(const char *name) {
