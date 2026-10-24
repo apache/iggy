@@ -5910,7 +5910,7 @@ class SendMessagesResponse final {
     explicit SendMessagesResponse(std::vector<SendMessagesConfirmation> confirmations)
         : confirmations_(std::move(confirmations)) {}
 
-    static SendMessagesResponse FromFfi(ffi::SendMessagesResponse response);
+    static SendMessagesResponse FromFfi(const ffi::SendMessagesResponse &response);
 
     friend class IggyBlockingClient;
 
