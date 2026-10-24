@@ -738,12 +738,6 @@ async fn should_reject_mutating_tools_with_read_only_permissions() {
     let messages: PolledMessages = invoke(&client, "poll_messages", Some(partition.clone())).await;
     assert_eq!(messages.messages.len(), 2, "Read-only polling must work");
 
-    let mut store = partition.clone();
-    store["offset"] = json!(1);
-    let mut auto_commit = partition.clone();
-    auto_commit["auto_commit"] = json!(true);
-    let mut next = partition.clone();
-    next["strategy"] = json!("next");
     let mut unexpected = Vec::new();
     for (method, mut arguments, permission) in [
         (
@@ -756,10 +750,6 @@ async fn should_reject_mutating_tools_with_read_only_permissions() {
             json!({"name": seeds::names::PERSONAL_ACCESS_TOKEN}),
             "delete",
         ),
-        ("store_consumer_offset", store, "update"),
-        ("delete_consumer_offset", partition.clone(), "delete"),
-        ("poll_messages", auto_commit, "update"),
-        ("poll_messages", next, "update"),
         (
             "resolve_operation",
             json!({"operation_id": "1"}),
@@ -788,8 +778,39 @@ async fn should_reject_mutating_tools_with_read_only_permissions() {
     );
 
     let offset: Option<ConsumerOffsetInfo> =
-        invoke(&client, "get_consumer_offset", Some(partition)).await;
+        invoke(&client, "get_consumer_offset", Some(partition.clone())).await;
     assert_eq!(offset.expect("Seeded offset must remain").stored_offset, 0);
+
+    // The server's own consumer offsets need only read, as on the broker.
+    let mut store = partition.clone();
+    store["offset"] = json!(1);
+    invoke_empty(&client, "store_consumer_offset", Some(store)).await;
+    let offset: Option<ConsumerOffsetInfo> =
+        invoke(&client, "get_consumer_offset", Some(partition.clone())).await;
+    assert_eq!(offset.expect("Stored offset").stored_offset, 1);
+
+    invoke_empty(&client, "delete_consumer_offset", Some(partition.clone())).await;
+    let offset: Option<ConsumerOffsetInfo> =
+        invoke(&client, "get_consumer_offset", Some(partition.clone())).await;
+    assert!(offset.is_none(), "Deleted offset must be gone");
+
+    let mut auto_commit = partition.clone();
+    auto_commit["auto_commit"] = json!(true);
+    let messages: PolledMessages = invoke(&client, "poll_messages", Some(auto_commit)).await;
+    assert_eq!(messages.messages.len(), 2);
+    let offset: Option<ConsumerOffsetInfo> =
+        invoke(&client, "get_consumer_offset", Some(partition.clone())).await;
+    assert_eq!(offset.expect("Auto-committed offset").stored_offset, 1);
+
+    invoke_empty(&client, "delete_consumer_offset", Some(partition.clone())).await;
+    let mut next = partition.clone();
+    next["strategy"] = json!("next");
+    let messages: PolledMessages = invoke(&client, "poll_messages", Some(next)).await;
+    assert_eq!(messages.messages.len(), 2);
+    let offset: Option<ConsumerOffsetInfo> =
+        invoke(&client, "get_consumer_offset", Some(partition)).await;
+    assert_eq!(offset.expect("Next strategy offset").stored_offset, 1);
+
     let tokens: Vec<PersonalAccessTokenInfo> =
         invoke(&client, "get_personal_access_tokens", None).await;
     assert_eq!(
