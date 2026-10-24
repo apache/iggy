@@ -43,6 +43,25 @@ pub enum ServerError {
     },
     #[error(transparent)]
     Iggy(Box<iggy_common::IggyError>),
+    #[error(
+        "stream {stream_id} is encrypted under server keys with fingerprints [{stored_kek_fingerprints}], this node holds [{node_kek_fingerprints}]: {source}. Configure the key the stream was wrapped with as the encryption key or as a previous key"
+    )]
+    StreamKeyUnavailable {
+        stream_id: usize,
+        stored_kek_fingerprints: String,
+        node_kek_fingerprints: String,
+        #[source]
+        source: Box<iggy_common::IggyError>,
+    },
+    #[error(
+        "topic {topic_id} of stream {stream_id} holds critical options this build cannot read: {source}. Run a build that understands them"
+    )]
+    TopicOptionsUnavailable {
+        stream_id: usize,
+        topic_id: usize,
+        #[source]
+        source: Box<iggy_common::IggyError>,
+    },
     #[error("failed to load server config")]
     Config(#[source] configs::ConfigurationError),
     #[error("failed to allocate shards from sharding.cpu_allocation")]

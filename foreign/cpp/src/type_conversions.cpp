@@ -21,6 +21,33 @@
 
 namespace iggy {
 
+namespace {
+
+std::optional<StreamEncryptionSource> EncryptionKeySourceFromFfi(bool has_source, ffi::StreamEncryptionSource source) {
+    if (!has_source) {
+        return std::nullopt;
+    }
+    return static_cast<StreamEncryptionSource>(source);
+}
+
+std::optional<std::string> TextFromFfi(bool has_text, const rust::String &text) {
+    if (!has_text) {
+        return std::nullopt;
+    }
+    return std::string(text.data(), text.size());
+}
+
+std::vector<std::string> TextsFromFfi(const rust::Vec<rust::String> &texts) {
+    std::vector<std::string> result;
+    result.reserve(texts.size());
+    for (const auto &text : texts) {
+        result.emplace_back(text.data(), text.size());
+    }
+    return result;
+}
+
+}  // namespace
+
 LoginInfo LoginInfo::FromFfi(ffi::LoginInfo login_info) {
     std::optional<std::string> access_token;
     std::optional<std::uint64_t> access_token_expiry;
@@ -137,7 +164,7 @@ Permissions Permissions::FromFfi(const ffi::Permissions &permissions) {
 UserInfo UserInfo::FromFfi(ffi::UserInfo user) {
     return UserInfo(user.id, user.created_at, static_cast<UserStatus>(user.status),
                     std::string(user.username.c_str(), user.username.size()),
-                    ResourceOptions::FromFfi(std::move(user.options), rust::Vec<ffi::HeaderEntry>{}));
+                    ResourceOptions::FromFfi(std::move(user.options), std::move(user.derived_options)));
 }
 
 UserInfoDetails UserInfoDetails::FromFfi(ffi::UserInfoDetails user) {
@@ -147,7 +174,7 @@ UserInfoDetails UserInfoDetails::FromFfi(ffi::UserInfoDetails user) {
     }
     return UserInfoDetails(user.id, user.created_at, static_cast<UserStatus>(user.status),
                            std::string(user.username.c_str(), user.username.size()), std::move(permissions),
-                           ResourceOptions::FromFfi(std::move(user.options), rust::Vec<ffi::HeaderEntry>{}));
+                           ResourceOptions::FromFfi(std::move(user.options), std::move(user.derived_options)));
 }
 
 ffi::Identifier Identifier::ToFfi() const {
@@ -281,13 +308,26 @@ StreamDetails StreamDetails::FromFfi(ffi::StreamDetails stream) {
 
     return StreamDetails(stream.id, stream.created_at, std::string(stream.name.c_str(), stream.name.size()),
                          stream.size_bytes, stream.messages_count, stream.topics_count, std::move(topics),
-                         ResourceOptions::FromFfi(std::move(stream.options), rust::Vec<ffi::HeaderEntry>{}));
+                         ResourceOptions::FromFfi(std::move(stream.options), std::move(stream.derived_options)),
+                         EncryptionKeySourceFromFfi(stream.has_encryption_key_source, stream.encryption_key_source),
+                         TextFromFfi(stream.has_encryption_key_fingerprint, stream.encryption_key_fingerprint),
+                         TextsFromFfi(stream.encryption_kek_fingerprints));
 }
 
 Stream Stream::FromFfi(ffi::Stream stream) {
     return Stream(stream.id, stream.created_at, std::string(stream.name.c_str(), stream.name.size()), stream.size_bytes,
                   stream.messages_count, stream.topics_count,
-                  ResourceOptions::FromFfi(std::move(stream.options), rust::Vec<ffi::HeaderEntry>{}));
+                  ResourceOptions::FromFfi(std::move(stream.options), std::move(stream.derived_options)),
+                  EncryptionKeySourceFromFfi(stream.has_encryption_key_source, stream.encryption_key_source),
+                  TextFromFfi(stream.has_encryption_key_fingerprint, stream.encryption_key_fingerprint),
+                  TextsFromFfi(stream.encryption_kek_fingerprints));
+}
+
+OptionSpec OptionSpec::FromFfi(ffi::OptionSpec spec) {
+    return OptionSpec(std::string(spec.key.c_str(), spec.key.size()), static_cast<HeaderKind>(spec.kind),
+                      std::vector<std::uint8_t>(spec.default_value.begin(), spec.default_value.end()),
+                      std::string(spec.description.c_str(), spec.description.size()), spec.updatable, spec.resettable,
+                      spec.secret, spec.read_only, spec.critical);
 }
 
 ConsumerGroupMember ConsumerGroupMember::FromFfi(ffi::ConsumerGroupMember member) {

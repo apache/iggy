@@ -26,7 +26,7 @@ import { COMMAND_CODE } from '../command.code.js';
 export type CreateToken = {
   /** Token name (1-255 bytes) */
   name: string,
-  /** Token expiry time in seconds (default: 600) */
+  /** Token lifetime in microseconds, 0 never expires (default: 10 minutes) */
   expiry?: bigint
 }
 
@@ -37,7 +37,7 @@ export type CreateToken = {
 export const CREATE_TOKEN = {
   code: COMMAND_CODE.CreateAccessToken,
 
-  serialize: ({ name, expiry = 600n }: CreateToken): Buffer => {
+  serialize: ({ name, expiry = 600_000_000n }: CreateToken): Buffer => {
     const bName = Buffer.from(name);
 
     if (bName.length < 1 || bName.length > 255)

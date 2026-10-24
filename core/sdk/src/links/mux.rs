@@ -23,7 +23,7 @@
 
 use crate::links::{Frame, Reply};
 use crate::vsr::{decode_eviction, eviction_reason, peek_command, reply_request_id, response_size};
-use bytes::{BufMut, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use iggy_binary_protocol::consensus::{Command, EvictionReason, HEADER_SIZE};
@@ -273,16 +273,29 @@ impl MuxShared {
         }
     }
 
+    /// Dispatches each whole frame of `message` as a slice of it. Only a frame
+    /// that spans messages is copied, into `buffer`.
+    fn deliver_message(&self, buffer: &mut BytesMut, mut message: Bytes) -> Result<(), IggyError> {
+        if !buffer.is_empty() {
+            buffer.extend_from_slice(&message);
+            return self.deliver_buffered(buffer);
+        }
+        while let Some(&header) = message.first_chunk::<HEADER_SIZE>() {
+            let size = self.frame_size(&header)?;
+            if message.len() < size {
+                break;
+            }
+            let body = message.split_to(size).slice(HEADER_SIZE..);
+            self.dispatch(Reply { header, body })?;
+        }
+        buffer.extend_from_slice(&message);
+        Ok(())
+    }
+
     /// Cuts every whole frame off the front of `buffer` and dispatches it.
     fn deliver_buffered(&self, buffer: &mut BytesMut) -> Result<(), IggyError> {
         while let Some(&header) = buffer.first_chunk::<HEADER_SIZE>() {
-            let Ok(size) = response_size(&header) else {
-                error!(
-                    "Received a frame shorter than its header from {}.",
-                    self.peer
-                );
-                return Err(IggyError::Disconnected);
-            };
+            let size = self.frame_size(&header)?;
             if buffer.len() < size {
                 break;
             }
@@ -290,6 +303,16 @@ impl MuxShared {
             self.dispatch(Reply { header, body })?;
         }
         Ok(())
+    }
+
+    fn frame_size(&self, header: &[u8; HEADER_SIZE]) -> Result<usize, IggyError> {
+        response_size(header).map_err(|_| {
+            error!(
+                "Received a frame shorter than its header from {}.",
+                self.peer
+            );
+            IggyError::Disconnected
+        })
     }
 
     /// Gives a reply to the request that waits for it. An error closes the link,
@@ -387,8 +410,10 @@ async fn write_tcp<W: AsyncWrite + Unpin>(
 ) {
     while let Some(frame) = shared.next_frame(&mut frames).await {
         let written = async {
-            writer.write_all(bytemuck::bytes_of(&frame.header)).await?;
-            writer.write_all(&frame.body).await?;
+            // One write for both: a header sent alone makes Nagle hold the
+            // body until the peer acknowledges the header, which it delays.
+            let mut bytes = Buf::chain(bytemuck::bytes_of(&frame.header), &frame.body[..]);
+            writer.write_all_buf(&mut bytes).await?;
             // A frame queued behind this one goes out with the same flush.
             if frames.is_empty() {
                 writer.flush().await?;
@@ -451,6 +476,8 @@ async fn write_websocket<S: AsyncRead + AsyncWrite + Unpin>(
     shared: Arc<MuxShared>,
 ) {
     while let Some(frame) = shared.next_frame(&mut frames).await {
+        // A message takes one contiguous payload. Two fragments would make the
+        // server join them with a copy of its own.
         let mut message = BytesMut::with_capacity(HEADER_SIZE + frame.body.len());
         message.put_slice(bytemuck::bytes_of(&frame.header));
         message.put_slice(&frame.body);
@@ -482,8 +509,7 @@ async fn read_websocket<S: AsyncRead + AsyncWrite + Unpin>(
     let reason = loop {
         match stream.next().await {
             Some(Ok(message @ (Message::Binary(_) | Message::Text(_)))) => {
-                buffer.extend_from_slice(&message.into_data());
-                if let Err(reason) = shared.deliver_buffered(&mut buffer) {
+                if let Err(reason) = shared.deliver_message(&mut buffer, message.into_data()) {
                     break reason;
                 }
             }
@@ -511,10 +537,12 @@ async fn read_websocket<S: AsyncRead + AsyncWrite + Unpin>(
 mod tests {
     use super::*;
     use crate::links::test_support::{
-        CLIENT, DUPLEX_CAPACITY, LOCALHOST, read_request_header, reply, request,
+        CLIENT, DUPLEX_CAPACITY, LOCALHOST, read_request_header, reply, request, request_with_body,
     };
-    use bytes::Bytes;
     use iggy_binary_protocol::consensus::{EvictionHeader, EvictionReason, RequestHeader};
+    use std::io::IoSlice;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
     use tokio::io::{DuplexStream, duplex};
     use tokio_tungstenite::{accept_async, client_async};
 
@@ -523,6 +551,56 @@ mod tests {
     const TEST_BUDGET: Duration = Duration::from_secs(5);
     /// Larger than the buffers on both sides, so a reply arrives in pieces.
     const LARGE_REPLY: usize = 3 * DUPLEX_CAPACITY;
+    /// Larger than the write buffer of a TCP link.
+    const LARGE_REQUEST: usize = 16 * 1024;
+
+    /// A socket with room for every write, as a vectored TCP socket has. It
+    /// records the bytes of each write call.
+    #[derive(Clone, Default)]
+    struct RecordingSocket {
+        writes: Arc<StdMutex<Vec<usize>>>,
+    }
+
+    impl RecordingSocket {
+        fn writes(&self) -> Vec<usize> {
+            self.writes.lock().unwrap().clone()
+        }
+
+        fn take(&self, len: usize) -> Poll<io::Result<usize>> {
+            self.writes.lock().unwrap().push(len);
+            Poll::Ready(Ok(len))
+        }
+    }
+
+    impl AsyncWrite for RecordingSocket {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.take(buf.len())
+        }
+
+        fn poll_write_vectored(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bufs: &[IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            self.take(bufs.iter().map(|buf| buf.len()).sum())
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     enum Peer {
         Tcp(DuplexStream),
@@ -608,6 +686,21 @@ mod tests {
             assert_eq!(first.unwrap().body[..], reply_body(1));
             assert_eq!(second.unwrap().body[..], reply_body(2));
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_frame_larger_than_the_write_buffer_when_sent_should_reach_the_socket_in_one_write()
+     {
+        let (reader, _peer) = duplex(DUPLEX_CAPACITY);
+        let socket = RecordingSocket::default();
+        let link = MuxLink::tcp(reader, socket.clone(), LOCALHOST);
+        let frame = request_with_body(1, BOUND_SESSION, Bytes::from(vec![0; LARGE_REQUEST]));
+
+        // The peer never answers, so the request ends at its deadline.
+        let unanswered = send(&link, frame, Instant::now() + TEST_BUDGET).await;
+
+        assert_eq!(unanswered.unwrap_err(), IggyError::Disconnected);
+        assert_eq!(socket.writes(), [HEADER_SIZE + LARGE_REQUEST]);
     }
 
     #[tokio::test]
@@ -787,6 +880,33 @@ mod tests {
         );
         assert_eq!(first.unwrap().body[..], 1u64.to_le_bytes());
         assert_eq!(second.unwrap().body[..], 2u64.to_le_bytes());
+    }
+
+    #[tokio::test]
+    async fn given_whole_replies_in_one_websocket_message_should_hand_over_slices_of_it() {
+        let (link, _server) = websocket_link().await;
+        let mut message = reply(1, &1u64.to_le_bytes());
+        message.extend_from_slice(&reply(2, &2u64.to_le_bytes()));
+        let message = Bytes::from(message);
+        let (first_waiter, first) = oneshot::channel();
+        let (second_waiter, second) = oneshot::channel();
+        let _first_entry = link.shared.wait_for(1, first_waiter).unwrap();
+        let _second_entry = link.shared.wait_for(2, second_waiter).unwrap();
+        let mut buffer = BytesMut::new();
+
+        link.shared
+            .deliver_message(&mut buffer, message.clone())
+            .unwrap();
+
+        let first = first.await.unwrap().unwrap();
+        let second = second.await.unwrap().unwrap();
+        let second_frame = message.len() / 2;
+        assert_eq!(first.body.as_ptr(), message[HEADER_SIZE..].as_ptr());
+        assert_eq!(
+            second.body.as_ptr(),
+            message[second_frame + HEADER_SIZE..].as_ptr()
+        );
+        assert!(buffer.is_empty());
     }
 
     #[tokio::test]

@@ -428,7 +428,6 @@ public class IggyTypedPublisherTests
             Name = "topic",
             Size = 0,
             CreatedAt = default,
-            MaxTopicSize = 0,
             MessagesCount = 0,
             PartitionsCount = 1
         };

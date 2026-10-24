@@ -20,12 +20,12 @@ use iggy_binary_protocol::HEADER_SIZE;
 use iggy_binary_protocol::requests::system::SessionIdentity;
 use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_common::{
-    AutoLogin, ConsumerGroupClientState, Credentials, IdKind, Identifier, IggyError,
-    PendingOperationsConfig,
+    AutoLogin, BinaryOperationLineage, ConsumerGroupClientState, Credentials, IdKind, Identifier,
+    IggyError, PendingOperationsConfig,
 };
 use lanes::{Lanes, ProvedOutcomes};
 use pending::PendingOperations;
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use tokio::sync::watch;
@@ -39,10 +39,13 @@ pub(crate) use lanes::{LaneKey, LaneTicket, RetainedOperation};
 /// session, its epoch, the lanes, the metadata watermark and the sign-in.
 ///
 /// Lock order is session, lanes, then either the proved outcomes or the
-/// pending-operation usage. The epoch is read and written under session or
-/// lanes, never the other way round. No lock is held across an await.
+/// pending-operation usage. The sign-in also comes after the session. The
+/// epoch is read and written under session or lanes, never the other way
+/// round. No lock is held across an await.
 #[derive(Debug)]
 pub(crate) struct SessionOwner {
+    /// The initial client id identifies this owner even after session replacement.
+    operation_owner: u128,
     session: Mutex<ConsensusSession>,
     /// Changed only under the `session` lock. Every reset raises the fence,
     /// so a route, a link binding or a frame made under an older fence
@@ -58,7 +61,8 @@ pub(crate) struct SessionOwner {
     auto_login: AutoLogin,
 }
 
-/// The fence of the current session, and whether the session is bound.
+/// The fence of the current session, whether the session is bound, and the
+/// lineage of its sign-in.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct SessionEpoch {
     pub(crate) fence: u64,
@@ -67,10 +71,17 @@ pub(crate) struct SessionEpoch {
     /// still signs in again by itself. Only a sign-in, the start of an
     /// explicit one, an explicit reset or a forget clears it.
     pub(crate) sign_in_owed: bool,
+    /// Rises when the caller signs in or out, and when the server refuses a
+    /// sign-in of the client. A call continues only in the lineage that it
+    /// started in, so it never runs under a session that the caller signed
+    /// in to later. A recovery by the client keeps the lineage.
+    pub(crate) lineage: u64,
 }
 
 #[derive(Debug, Default)]
 struct SignIn {
+    /// Explicit attempts and credential refusals require another caller sign-in.
+    blocked: bool,
     /// Lets a reconnect, to this node or after a failover to another one,
     /// sign in again instead of surfacing `Unauthenticated`. A logout and an
     /// explicit disconnect clear it.
@@ -100,8 +111,10 @@ impl SessionOwner {
         auto_login: AutoLogin,
         pending_operations: PendingOperationsConfig,
     ) -> Self {
+        let session = ConsensusSession::new();
         Self {
-            session: Mutex::new(ConsensusSession::new()),
+            operation_owner: session.client_id(),
+            session: Mutex::new(session),
             epoch: watch::Sender::new(SessionEpoch::default()),
             lanes: Mutex::default(),
             proved: Mutex::new(ProvedOutcomes::new(pending_operations.max_operations)),
@@ -166,10 +179,11 @@ impl SessionOwner {
 
     /// Replaces the session, raises the fence and drops every retained
     /// operation. The request counter, the proved outcomes, the watermark and
-    /// the sign-in stay. The caller ended the session, so no sign-in is owed.
+    /// the sign-in stay. The caller ended the session, so no sign-in is owed,
+    /// and the lineage ends.
     pub(crate) fn reset(&self) -> Result<(), IggyError> {
         let mut session = self.session()?;
-        self.replace(&mut session, false);
+        self.replace(&mut session, false, true);
         Ok(())
     }
 
@@ -186,25 +200,125 @@ impl SessionOwner {
         if self.fence() != fence {
             return Ok(None);
         }
-        self.replace(&mut session, sign_in_owed);
+        self.replace(&mut session, sign_in_owed, !sign_in_owed);
         Ok(Some(self.fence()))
     }
 
-    /// [`Self::reset`], but only while a sign-in is owed. A caller that signs
-    /// in instead gets a new client id, because the server refuses another
-    /// user on the client id of the owed Register. The new fence fails a late
-    /// bind of that Register. Returns whether this call reset the session.
-    pub(crate) fn reset_if_sign_in_owed(&self) -> Result<bool, IggyError> {
+    /// One caller lineage owns preparation, Register and final publication.
+    pub(crate) fn begin_sign_in(&self) -> Result<(BinaryOperationLineage, bool), IggyError> {
         let mut session = self.session()?;
-        if !self.epoch().sign_in_owed {
-            return Ok(false);
+        let owed = self.epoch().sign_in_owed;
+        {
+            let mut sign_in = self.sign_in();
+            sign_in.remembered = None;
+            sign_in.blocked = true;
         }
-        self.replace(&mut session, false);
-        Ok(true)
+        if self.epoch().bound {
+            self.epoch.send_modify(|epoch| epoch.lineage += 1);
+            self.consumer_group_state.clear_session_scoped();
+        } else {
+            self.replace(&mut session, false, true);
+        }
+        Ok((
+            BinaryOperationLineage::new(self.operation_owner, self.epoch().lineage),
+            owed,
+        ))
+    }
+
+    pub(crate) fn reset_for_sign_in(&self, lineage: u64) -> Result<(), IggyError> {
+        let mut session = self.session()?;
+        if self.epoch().lineage != lineage {
+            return Err(IggyError::Unauthenticated);
+        }
+        self.replace(&mut session, false, false);
+        Ok(())
+    }
+
+    pub(crate) fn fail_sign_in(&self, lineage: u64, disconnect: impl FnOnce()) {
+        let Ok(mut session) = self.session() else {
+            return;
+        };
+        if self.epoch().lineage != lineage {
+            return;
+        }
+        {
+            let mut sign_in = self.sign_in();
+            sign_in.remembered = None;
+            sign_in.blocked = true;
+        }
+        self.replace(&mut session, false, true);
+        disconnect();
+    }
+
+    pub(crate) fn finish_sign_in(
+        &self,
+        lineage: u64,
+        credentials: Credentials,
+        user_id: u32,
+        publish: impl FnOnce(),
+    ) -> Result<(), IggyError> {
+        let _session = self.session()?;
+        let epoch = self.epoch();
+        if epoch.lineage != lineage || !epoch.bound {
+            return Err(IggyError::Unauthenticated);
+        }
+        let mut sign_in = self.sign_in();
+        sign_in.remembered = Some(RememberedSignIn {
+            credentials,
+            user_id,
+        });
+        sign_in.blocked = false;
+        publish();
+        Ok(())
+    }
+
+    pub(crate) fn finish_sign_out(
+        &self,
+        lineage: u64,
+        signing_in: bool,
+        publish: impl FnOnce(),
+    ) -> Result<(), IggyError> {
+        let mut session = self.session()?;
+        if self.epoch().lineage != lineage {
+            return Ok(());
+        }
+        self.sign_in().remembered = None;
+        self.replace(&mut session, false, !signing_in);
+        publish();
+        Ok(())
+    }
+
+    pub(crate) fn in_operation_lineage(&self, action: impl FnOnce()) {
+        self.in_lineage(self.operation_lineage().lineage(), action);
+    }
+
+    pub(crate) fn in_lineage(&self, lineage: u64, action: impl FnOnce()) {
+        if let Ok(_session) = self.session()
+            && self.epoch().lineage == lineage
+        {
+            action();
+        }
+    }
+
+    pub(crate) fn forget_in_operation(&self) {
+        self.in_operation_lineage(|| {
+            let mut sign_in = self.sign_in();
+            sign_in.remembered = None;
+            self.epoch
+                .send_if_modified(|epoch| std::mem::take(&mut epoch.sign_in_owed));
+        });
+    }
+
+    pub(crate) fn sign_in_blocked(&self) -> bool {
+        self.sign_in().blocked
     }
 
     pub(crate) fn fence(&self) -> u64 {
         self.epoch.borrow().fence
+    }
+
+    pub(crate) fn operation_lineage(&self) -> BinaryOperationLineage {
+        BinaryOperationLineage::capture(self.operation_owner, self.epoch().lineage)
     }
 
     pub(crate) fn epoch(&self) -> SessionEpoch {
@@ -225,20 +339,23 @@ impl SessionOwner {
 
     #[cfg(test)]
     pub(crate) fn remember(&self, credentials: Credentials, user_id: u32) {
-        self.remember_unless(|| false, credentials, user_id);
+        self.sign_in().remembered = Some(RememberedSignIn {
+            credentials,
+            user_id,
+        });
     }
 
-    /// Remembers credentials unless `withdrawn` returns true. It runs under the
-    /// sign-in lock, so a caller that marks the sign-in withdrawn and then
-    /// calls [`Self::forget`] cannot have a later sign-in undo that forget.
-    /// Returns whether the credentials were kept.
-    pub(crate) fn remember_unless(
+    /// Keeps committed credential updates that completed while Register was in flight.
+    /// The lock also prevents a late recovery from undoing an explicit forget.
+    pub(crate) fn remember_recovered_unless(
         &self,
         withdrawn: impl FnOnce() -> bool,
-        credentials: Credentials,
         user_id: u32,
     ) -> bool {
         let mut sign_in = self.sign_in();
+        let Some(credentials) = self.credentials(&sign_in) else {
+            return false;
+        };
         if withdrawn() {
             return false;
         }
@@ -249,20 +366,58 @@ impl SessionOwner {
         true
     }
 
-    /// Also clears an owed sign-in, so that after a logout or a rejected
-    /// credential the keepalive does not sign in again.
+    /// Also clears an owed sign-in, so that after a logout or a disconnect the
+    /// keepalive does not sign in again.
     pub(crate) fn forget(&self) {
-        self.sign_in().remembered = None;
         if let Ok(_session) = self.session() {
+            let mut sign_in = self.sign_in();
+            sign_in.remembered = None;
             self.epoch
                 .send_if_modified(|epoch| std::mem::take(&mut epoch.sign_in_owed));
         }
     }
 
+    /// [`Self::forget`] for a sign-in of the session at `fence` that the
+    /// server refused. No session comes without the caller then, so the
+    /// lineage ends and every call that waits for a session fails. A refusal
+    /// that comes after another sign-in replaced or bound that session leaves
+    /// the newer sign-in alone. Returns true when a committed credential update
+    /// superseded the rejected credentials and the same owner should retry.
+    pub(crate) fn refuse_sign_in(&self, started: SessionEpoch, rejected: &Credentials) -> bool {
+        let Ok(_session) = self.session() else {
+            return false;
+        };
+        let epoch = self.epoch();
+        if epoch.fence != started.fence || epoch.lineage != started.lineage || epoch.bound {
+            return false;
+        }
+        let mut sign_in = self.sign_in();
+        if self
+            .credentials(&sign_in)
+            .is_some_and(|current| !same_credentials(&current, rejected))
+        {
+            return true;
+        }
+        sign_in.remembered = None;
+        sign_in.blocked = true;
+        self.consumer_group_state.clear_session_scoped();
+        self.epoch.send_modify(|epoch| {
+            epoch.sign_in_owed = false;
+            epoch.lineage += 1;
+        });
+        false
+    }
+
     /// The last successful sign-in, else the configured `AutoLogin` with the
     /// changes this client committed for its user.
     pub(crate) fn sign_in_credentials(&self) -> Option<Credentials> {
-        let sign_in = self.sign_in();
+        self.credentials(&self.sign_in())
+    }
+
+    fn credentials(&self, sign_in: &SignIn) -> Option<Credentials> {
+        if sign_in.blocked {
+            return None;
+        }
         // A client is whoever it last signed in as, so a reconnect restores
         // the sign-in the caller last asked for. A configured `AutoLogin`
         // signs in through this path too.
@@ -295,6 +450,7 @@ impl SessionOwner {
             remembered,
             configured_password,
             configured_username,
+            ..
         } = &mut *sign_in;
         // A personal access token is not derived from the password.
         let session_username = match remembered {
@@ -364,17 +520,36 @@ impl SessionOwner {
         self.proved.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn replace(&self, session: &mut ConsensusSession, sign_in_owed: bool) {
+    fn replace(&self, session: &mut ConsensusSession, sign_in_owed: bool, end_lineage: bool) {
         let mut lanes = self.lanes();
         *session = ConsensusSession::with_next_request_id(session.current_request_id());
         self.epoch.send_modify(|epoch| {
             epoch.fence += 1;
             epoch.bound = false;
             epoch.sign_in_owed = sign_in_owed;
+            if end_lineage {
+                epoch.lineage += 1;
+            }
         });
         self.pending.reset(self.fence());
         self.consumer_group_state.clear_session_scoped();
         lanes::drop_retained(&mut lanes);
+    }
+}
+
+fn same_credentials(left: &Credentials, right: &Credentials) -> bool {
+    match (left, right) {
+        (
+            Credentials::UsernamePassword(left_name, left_password),
+            Credentials::UsernamePassword(right_name, right_password),
+        ) => {
+            left_name == right_name
+                && left_password.expose_secret() == right_password.expose_secret()
+        }
+        (Credentials::PersonalAccessToken(left), Credentials::PersonalAccessToken(right)) => {
+            left.expose_secret() == right.expose_secret()
+        }
+        _ => false,
     }
 }
 

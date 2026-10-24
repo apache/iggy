@@ -33,14 +33,19 @@ use crate::bridge::config::IggyBridgeConfig;
 use crate::bridge::error::BridgeError;
 use crate::bridge::topic_map::validate_kafka_topic_name;
 
+mod cluster_id;
 mod fetch;
+mod group_index;
 mod group_offsets;
 mod offsets;
 mod produce;
 mod topics;
 
+pub use cluster_id::{CLUSTER_ID_TOPIC, ClusterIdCall, cluster_id_stream};
 use fetch::{FetchPool, LazyClient};
 pub(crate) use fetch::{FetchSlot, PartitionProbe, TopicProbe};
+use group_index::GroupIndex;
+pub use group_index::{OffsetGroups, ScannedGroups};
 use group_offsets::OffsetPool;
 pub use group_offsets::{OFFSET_GROUP_PREFIX, OffsetCalls};
 pub(crate) use offsets::{LocatedRecord, RecordLookup};
@@ -112,7 +117,7 @@ const SLOT_LIMIT: Duration = Duration::from_secs(45);
 /// its connection. A Fetch poll then drops that connection (`LazyClient::until`). An offset
 /// commit keeps it, so the next commit waits behind it in the SDK and commits stay in order. A
 /// Produce send closes it before the slot frees (`LazyClient::retire`).
-async fn in_slot<S: Send + 'static, T: Send + 'static>(
+pub(crate) async fn in_slot<S: Send + 'static, T: Send + 'static>(
     slot: S,
     deadline: Instant,
     call: impl Future<Output = T> + Send + 'static,
@@ -137,16 +142,16 @@ async fn permit_by(turn: &Arc<Semaphore>, deadline: Instant) -> Option<OwnedSema
 /// Owns the connected `IggyClient`s and resolves Kafka topics against them.
 ///
 /// Each producer sends on a client of its own, one request at a time. Producers past the session
-/// limit share one more. Metadata, `CreateTopics`, `DeleteTopics`, `DescribeConfigs` and
-/// `AlterConfigs` share another. Topic probes, certificate user lookups and `Metadata`'s auto topic
-/// creations each use a client of their own, Fetch polls one per read slot, and offset calls two
-/// per offset slot.
+/// limit share one more. Metadata, `CreateTopics`, `DeleteTopics`, `CreatePartitions`,
+/// `DescribeConfigs` and `AlterConfigs` share another. Topic probes, certificate user lookups and
+/// `Metadata`'s auto topic creations each use a client of their own, Fetch polls one per read
+/// slot, offset calls two per offset slot, and the scan for the groups that hold offsets one more.
 ///
 /// Each client signs in at the metadata leader, and a view change or a refused call can move it to
 /// another node. So in a cluster, two clients can read replicas that are not at the same offset.
 pub struct IggyBridge {
-    /// The client of Metadata, `CreateTopics`, `DeleteTopics`, `DescribeConfigs` and
-    /// `AlterConfigs`.
+    /// The client of Metadata, `CreateTopics`, `DeleteTopics`, `CreatePartitions`,
+    /// `DescribeConfigs` and `AlterConfigs`.
     client: Arc<IggyClient>,
     config: IggyBridgeConfig,
     /// One Iggy session per producer. See `produce_turn`.
@@ -161,9 +166,14 @@ pub struct IggyBridge {
     auto_create_client: LazyClient,
     /// Group offset slots, each with a commit client and a read client. See `OffsetPool`.
     offset_pool: OffsetPool,
+    /// The Kafka groups that hold offsets. See `offset_groups`.
+    group_index: GroupIndex,
+    /// The client of the scan that finds those groups, so no offset call waits behind it.
+    scan_client: LazyClient,
 }
 
 /// The Iggy stream and topic one Kafka topic maps to. Resolve once per topic, use many times.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TopicTarget {
     stream_id: Identifier,
     topic_id: Identifier,
@@ -203,6 +213,8 @@ impl IggyBridge {
             lookup_client: LazyClient::default(),
             auto_create_client: LazyClient::default(),
             offset_pool: OffsetPool::new(),
+            group_index: GroupIndex::new(),
+            scan_client: LazyClient::default(),
         })
     }
 
@@ -284,6 +296,7 @@ impl IggyBridge {
             lookup_client,
             auto_create_client,
             offset_clients,
+            scan_client,
             shared_client,
         ) = tokio::join!(
             self.produce_pool.close(),
@@ -292,6 +305,7 @@ impl IggyBridge {
             self.lookup_client.close(),
             self.auto_create_client.close(),
             self.offset_pool.close(),
+            self.scan_client.close(),
             sign_out_and_shut_down(&self.client),
         );
         produce_clients
@@ -300,6 +314,7 @@ impl IggyBridge {
             .and(lookup_client)
             .and(auto_create_client)
             .and(offset_clients)
+            .and(scan_client)
             .and(shared_client)
     }
 
@@ -379,6 +394,8 @@ impl IggyBridge {
         Self {
             // Held rather than lazy, so an auto topic creation fails at once instead of dialing.
             auto_create_client: LazyClient::holding(Arc::clone(&client)),
+            // Held for the same reason, so a scan of the groups that hold offsets fails at once.
+            scan_client: LazyClient::holding(Arc::clone(&client)),
             client,
             produce_pool: Arc::new(ProducePool::new(config.produce_sessions)),
             config,
@@ -386,6 +403,7 @@ impl IggyBridge {
             probe_client: LazyClient::default(),
             lookup_client: LazyClient::default(),
             offset_pool: OffsetPool::new(),
+            group_index: GroupIndex::new(),
         }
     }
 }

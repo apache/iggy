@@ -37,6 +37,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -148,6 +149,14 @@ class VsrResponseHandlerTest {
 
     @Test
     void shouldBindSessionOnRegisterReply() throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        var ticket = session.acquire(
+                        ConsensusSession.LaneKey.METADATA, true, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop())
+                .join();
+        var heldMonitor = new AtomicBoolean();
+        var waiting = ticket.awaitSession(session.lineage(), deadline, channel.eventLoop())
+                .thenRun(() -> heldMonitor.set(Thread.holdsLock(session)));
+        assertThat(waiting).isNotDone();
         CompletableFuture<ByteBuf> future = enqueue(VsrOperation.REGISTER, 0);
         ByteBuf body = Unpooled.buffer();
         body.writeIntLE(0); // result section: success
@@ -163,7 +172,10 @@ class VsrResponseHandlerTest {
             assertThat(response.readUnsignedIntLE()).isEqualTo(1);
             assertThat(session.isBound()).isTrue();
             assertThat(session.boundSession()).isEqualTo(99);
+            waiting.get();
+            assertThat(heldMonitor).isFalse();
         } finally {
+            ticket.complete();
             response.release();
         }
     }
@@ -474,6 +486,32 @@ class VsrResponseHandlerTest {
     }
 
     @Test
+    void givenResolvedUpdateReplyWhenCorrelatingShouldAcceptOnlyMatchingRequestIdentity() {
+        int updateResource = 150;
+        for (int resolved : new int[] {72, 73, 74}) {
+            assertThat(correlates(updateResource, resolved, reply -> {}))
+                    .as("resolved %s", resolved)
+                    .isTrue();
+            assertThat(correlates(
+                            updateResource,
+                            resolved,
+                            reply -> reply.setByte(
+                                    VsrHeaders.REPLY_CLIENT_OFFSET, reply.getByte(VsrHeaders.REPLY_CLIENT_OFFSET) + 1)))
+                    .as("client mismatch for %s", resolved)
+                    .isFalse();
+            assertThat(correlates(
+                            updateResource, resolved, reply -> reply.setLongLE(VsrHeaders.REPLY_CHECKSUM_OFFSET, 14)))
+                    .as("request checksum mismatch for %s", resolved)
+                    .isFalse();
+            assertThat(correlates(VsrOperation.CREATE_STREAM, resolved, reply -> {}))
+                    .as("unrelated request for %s", resolved)
+                    .isFalse();
+        }
+        assertThat(correlates(updateResource, VsrOperation.CREATE_TOPIC_WITH_ASSIGNMENTS, reply -> {}))
+                .isFalse();
+    }
+
+    @Test
     void shouldRejectUnrelatedReplyOperation() {
         CompletableFuture<ByteBuf> pending = enqueue(VsrOperation.CREATE_TOPIC, 7);
         CompletableFuture<ByteBuf> other = enqueue(VsrOperation.CREATE_STREAM, 8);
@@ -552,6 +590,32 @@ class VsrResponseHandlerTest {
         handler.registerRequest(channel, request, future, System.nanoTime() + TimeUnit.MINUTES.toNanos(1), 1);
         request.release();
         return future;
+    }
+
+    /** Registers one committed request on a fresh link and reports whether the reply completes it. */
+    private boolean correlates(int requestOperation, int replyOperation, Consumer<ByteBuf> alteration) {
+        VsrResponseHandler link = new VsrResponseHandler(session, errorCode -> {});
+        EmbeddedChannel linkChannel = new EmbeddedChannel(link);
+        try {
+            CompletableFuture<ByteBuf> result = new CompletableFuture<>();
+            ByteBuf request = requestFrame(requestOperation, 1);
+            request.setLongLE(VsrHeaders.REQUEST_CHECKSUM_OFFSET, 13);
+            link.registerRequest(linkChannel, request, result, System.nanoTime() + TimeUnit.MINUTES.toNanos(1), 16);
+            request.release();
+            ByteBuf reply = replyFrame(replyOperation, 1, Unpooled.buffer().writeIntLE(0));
+            reply.setLongLE(VsrHeaders.REPLY_CHECKSUM_OFFSET, 13);
+            alteration.accept(reply);
+            linkChannel.writeInbound(reply);
+            assertThat(result).isDone();
+            if (result.isCompletedExceptionally()) {
+                assertThatThrownBy(result::join).hasCauseInstanceOf(IggyConnectionException.class);
+                return false;
+            }
+            result.join().release();
+            return true;
+        } finally {
+            linkChannel.finishAndReleaseAll();
+        }
     }
 
     /**

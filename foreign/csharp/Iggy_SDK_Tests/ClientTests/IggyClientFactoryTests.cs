@@ -72,6 +72,29 @@ public sealed class IggyClientFactoryTests
     }
 
     [Theory]
+    [InlineData(0, 1L, nameof(IggyClientConfigurator.MaxPendingOperations), 0L)]
+    [InlineData(-1, 1L, nameof(IggyClientConfigurator.MaxPendingOperations), -1L)]
+    [InlineData(1, 0L, nameof(IggyClientConfigurator.MaxPendingOperationBytes), 0L)]
+    [InlineData(1, -1L, nameof(IggyClientConfigurator.MaxPendingOperationBytes), -1L)]
+    public void CreateClient_RejectsNonPositivePendingLimitWithItsValue(int operations, long bytes, string limit,
+        long rejected)
+    {
+        var options = new IggyClientConfigurator
+        {
+            BaseAddress = "127.0.0.1:8090",
+            Protocol = Protocol.Tcp,
+            MaxPendingOperations = operations,
+            MaxPendingOperationBytes = bytes
+        };
+
+        var error = Assert.Throws<ArgumentOutOfRangeException>(() => IggyClientFactory.CreateClient(options));
+        Assert.Equal(limit, error.ParamName);
+        Assert.NotNull(error.ActualValue);
+        Assert.Equal(rejected, Convert.ToInt64(error.ActualValue));
+        Assert.Contains($"{limit} must be greater than 0.", error.Message);
+    }
+
+    [Theory]
     [InlineData(0)]
     [InlineData(-1000)]
     [InlineData(0.5)]

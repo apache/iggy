@@ -88,7 +88,8 @@ warnings = "deny"
 actix-cors = "0.7.2"
 actix-files = "0.7.0"
 actix-web = "4.16.0"
-aes-gcm = "0.11.1"
+aes-gcm = { version = "0.11.1", features = ["zeroize"] }
+aes-gcm-siv = { version = "0.12.1", features = ["zeroize"] }
 ahash = { version = "0.8.12", features = ["serde"] }
 aligned-vec = "0.6.4"
 anyhow = "1.0.104"
@@ -212,11 +213,11 @@ hyper-util = { version = "0.1.21", features = ["server-auto", "service"] }
 iceberg = "0.10.1"
 iceberg-catalog-rest = "0.10.1"
 iceberg-storage-opendal = "0.10.1"
-iggy = { path = "core/sdk", version = "0.11.1-edge.1" }
-iggy-cli = { path = "core/cli", version = "0.14.1-edge.1" }
+iggy = { path = "core/sdk", version = "0.11.1-edge.2" }
+iggy-cli = { path = "core/cli", version = "0.14.1-edge.2" }
 iggy-gateway-kafka = { path = "gateways/kafka" }
-iggy_binary_protocol = { path = "core/binary_protocol", version = "0.11.1-edge.1" }
-iggy_common = { path = "core/common", version = "0.11.1-edge.1" }
+iggy_binary_protocol = { path = "core/binary_protocol", version = "0.11.1-edge.2" }
+iggy_common = { path = "core/common", version = "0.11.1-edge.2" }
 iggy_connector_doris_sink = { path = "core/connectors/sinks/doris_sink" }
 iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.5.1-edge.2" }
 indexmap = "2.14.2"
@@ -304,7 +305,8 @@ rmcp = "3.5.1"
 rmp = "0.8.15"
 rmp-serde = "1.3.1"
 rolling-file = "0.2.0"
-rumqttc = { version = "0.25.1", features = ["url"] }
+rumqttc-v4 = { package = "rumqttc-v4-next", version = "0.34.0", features = ["url"] }
+rumqttc-v5 = { package = "rumqttc-v5-next", version = "0.34.0", features = ["url"] }
 rust-embed = "8.13.0"
 rust-s3 = { version = "0.38.0", default-features = false, features = ["tokio-rustls-tls", "tags"] }
 rustls = { version = "0.23.46", features = ["ring"] }
@@ -396,6 +398,7 @@ webpki-roots = "1.0.9"
 windows-native-keyring-store = "1.1.0"
 wiremock = "0.6"
 x509-parser = "0.18.1"
+xaes-256-gcm = "0.1.0"
 yew = { version = "0.23", features = ["csr"] }
 yew-router = "0.20"
 zbus-secret-service-keyring-store = { version = "1.0.1", features = ["rt-async-io-crypto-rust"] }

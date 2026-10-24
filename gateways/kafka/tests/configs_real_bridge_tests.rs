@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! `DescribeConfigs` and `AlterConfigs` against a real `iggy-server`.
+//! `DescribeConfigs`, `AlterConfigs` and `IncrementalAlterConfigs` against a real `iggy-server`.
 
 use std::sync::Arc;
 
@@ -29,6 +29,11 @@ use kafka_protocol::messages::describe_configs_request::{
 use kafka_protocol::messages::describe_configs_response::{
     DescribeConfigsResourceResult, DescribeConfigsResponse, DescribeConfigsSynonym,
 };
+use kafka_protocol::messages::incremental_alter_configs_request::{
+    AlterConfigsResource as IncrementalAlterConfigsResource,
+    AlterableConfig as IncrementalAlterableConfig, IncrementalAlterConfigsRequest,
+};
+use kafka_protocol::messages::incremental_alter_configs_response::IncrementalAlterConfigsResponse;
 use kafka_protocol::protocol::StrBytes;
 use serial_test::serial;
 use tokio_util::sync::CancellationToken;
@@ -39,7 +44,9 @@ use iggy_gateway_kafka::protocol::api::{
     ERROR_INVALID_CONFIG, ERROR_INVALID_REQUEST, ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NONE,
     ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState,
 };
-use iggy_gateway_kafka::protocol::handlers::{alter_configs, describe_configs};
+use iggy_gateway_kafka::protocol::handlers::{
+    alter_configs, describe_configs, incremental_alter_configs,
+};
 
 #[path = "common/codec.rs"]
 mod codec;
@@ -55,9 +62,19 @@ const DESCRIBE_V4: i16 = 4;
 const DESCRIBE_V1: i16 = 1;
 const ALTER_V2: i16 = 2;
 const ALTER_V0: i16 = 0;
+const INCREMENTAL_V1: i16 = 1;
+const INCREMENTAL_V0: i16 = 0;
 const TOPIC: i8 = 2;
 const SOURCE_TOPIC: i8 = 1;
 const SOURCE_DEFAULT: i8 = 5;
+/// Kafka `AlterConfigOp.OpType` bytes.
+const OP_SET: i8 = 0;
+const OP_DELETE: i8 = 1;
+const OP_APPEND: i8 = 2;
+const OP_SUBTRACT: i8 = 3;
+
+/// The entries of one incremental resource: name, operation byte, value.
+type Configs = &'static [(&'static str, i8, Option<&'static str>)];
 
 const fn text(value: &'static str) -> StrBytes {
     StrBytes::from_static_str(value)
@@ -136,6 +153,88 @@ async fn alter(
         .with_validate_only(validate_only);
     let outcome = alter_configs::handle(state, None, version, encode(&request, version)).await;
     decode(outcome.expect_response("AlterConfigs answers"), version)
+}
+
+fn incremental_resource(
+    name: &str,
+    resource_type: i8,
+    configs: Configs,
+) -> IncrementalAlterConfigsResource {
+    IncrementalAlterConfigsResource::default()
+        .with_resource_type(resource_type)
+        .with_resource_name(StrBytes::from(name.to_string()))
+        .with_configs(
+            configs
+                .iter()
+                .map(|(key, operation, value)| {
+                    IncrementalAlterableConfig::default()
+                        .with_name(text(key))
+                        .with_config_operation(*operation)
+                        .with_value(value.map(text))
+                })
+                .collect(),
+        )
+}
+
+async fn incremental_alter(
+    state: &GatewayState,
+    version: i16,
+    resources: Vec<IncrementalAlterConfigsResource>,
+    validate_only: bool,
+) -> IncrementalAlterConfigsResponse {
+    let request = IncrementalAlterConfigsRequest::default()
+        .with_resources(resources)
+        .with_validate_only(validate_only);
+    let outcome =
+        incremental_alter_configs::handle(state, None, version, encode(&request, version)).await;
+    decode(
+        outcome.expect_response("IncrementalAlterConfigs answers"),
+        version,
+    )
+}
+
+/// One resource, one topic: its error code and message.
+async fn incremental_one(
+    state: &GatewayState,
+    version: i16,
+    name: &str,
+    configs: Configs,
+) -> (i16, String) {
+    let response = incremental_alter(
+        state,
+        version,
+        vec![incremental_resource(name, TOPIC, configs)],
+        false,
+    )
+    .await;
+    let resource = &response.responses[0];
+    (
+        resource.error_code,
+        resource
+            .error_message
+            .as_ref()
+            .map_or(String::new(), |message| message.as_str().to_string()),
+    )
+}
+
+/// `retention.ms` as a describe reports it: the value and its config source.
+async fn retention(state: &GatewayState, name: &str) -> (String, i8) {
+    let described = describe(
+        state,
+        DESCRIBE_V4,
+        vec![describe_resource(name, Some(vec!["retention.ms"]))],
+        false,
+        false,
+    )
+    .await;
+    let config = &described.results[0].configs[0];
+    (
+        config
+            .value
+            .as_ref()
+            .map_or(String::new(), |value| value.as_str().to_string()),
+        config.config_source,
+    )
 }
 
 fn entry<'a>(
@@ -631,4 +730,407 @@ async fn alter_configs_rejects_an_empty_list_and_leaves_retention_unchanged() {
         "an empty configs list must not clear a previously set retention.ms"
     );
     assert_eq!(described.results[0].configs[0].config_source, SOURCE_TOPIC);
+}
+
+#[tokio::test]
+#[serial]
+async fn incremental_alter_configs_sets_deletes_and_validates_retention() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let state = connected_state(&server).await;
+    create_topic(&state, "orders").await;
+
+    let validated = incremental_alter(
+        &state,
+        INCREMENTAL_V1,
+        vec![incremental_resource(
+            "orders",
+            TOPIC,
+            &[("retention.ms", OP_SET, Some("8000"))],
+        )],
+        true,
+    )
+    .await;
+    assert_eq!(validated.responses[0].error_code, ERROR_NONE);
+    assert_eq!(
+        retention(&state, "orders").await,
+        ("-1".to_string(), SOURCE_DEFAULT),
+        "validate_only must not write"
+    );
+
+    assert_eq!(
+        incremental_one(
+            &state,
+            INCREMENTAL_V1,
+            "orders",
+            &[("retention.ms", OP_SET, Some("8000"))]
+        )
+        .await,
+        (ERROR_NONE, String::new())
+    );
+    assert_eq!(
+        retention(&state, "orders").await,
+        ("8000".to_string(), SOURCE_TOPIC)
+    );
+
+    assert_eq!(
+        incremental_one(&state, INCREMENTAL_V1, "orders", &[]).await,
+        (ERROR_NONE, String::new()),
+        "an empty operation list is a no-op, not a reset"
+    );
+    assert_eq!(
+        retention(&state, "orders").await,
+        ("8000".to_string(), SOURCE_TOPIC)
+    );
+
+    // `kafka-configs.sh --delete-config` sends an empty value with its delete.
+    assert_eq!(
+        incremental_one(
+            &state,
+            INCREMENTAL_V1,
+            "orders",
+            &[("retention.ms", OP_DELETE, Some(""))]
+        )
+        .await,
+        (ERROR_NONE, String::new())
+    );
+    assert_eq!(
+        retention(&state, "orders").await,
+        ("-1".to_string(), SOURCE_TOPIC),
+        "a delete stores never-expire, and the key stays explicitly set"
+    );
+
+    assert_eq!(
+        incremental_one(
+            &state,
+            INCREMENTAL_V0,
+            "orders",
+            &[("retention.ms", OP_SET, Some("7000"))]
+        )
+        .await,
+        (ERROR_NONE, String::new())
+    );
+    assert_eq!(
+        retention(&state, "orders").await,
+        ("7000".to_string(), SOURCE_TOPIC)
+    );
+    assert_eq!(
+        incremental_one(
+            &state,
+            INCREMENTAL_V0,
+            "orders",
+            &[("retention.ms", OP_DELETE, None)]
+        )
+        .await,
+        (ERROR_NONE, String::new())
+    );
+    assert_eq!(
+        retention(&state, "orders").await,
+        ("-1".to_string(), SOURCE_TOPIC)
+    );
+
+    assert_eq!(
+        incremental_one(
+            &state,
+            INCREMENTAL_V1,
+            "orders",
+            &[("retention.ms", OP_SET, Some("6000"))]
+        )
+        .await,
+        (ERROR_NONE, String::new())
+    );
+    assert_eq!(
+        incremental_one(
+            &state,
+            INCREMENTAL_V1,
+            "orders",
+            &[("retention.ms", OP_DELETE, Some("5000"))]
+        )
+        .await,
+        (ERROR_NONE, String::new()),
+        "the value sent with a delete is ignored"
+    );
+    assert_eq!(
+        retention(&state, "orders").await,
+        ("-1".to_string(), SOURCE_TOPIC)
+    );
+}
+
+/// A delete writes never-expire even where nothing was ever set, so the describe source flips
+/// to the topic although the value does not change. Kafka writes nothing there.
+#[tokio::test]
+#[serial]
+async fn incremental_alter_configs_delete_on_a_never_altered_topic_marks_retention_explicit() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let state = connected_state(&server).await;
+    create_topic(&state, "orders").await;
+    assert_eq!(
+        retention(&state, "orders").await,
+        ("-1".to_string(), SOURCE_DEFAULT)
+    );
+
+    assert_eq!(
+        incremental_one(
+            &state,
+            INCREMENTAL_V1,
+            "orders",
+            &[("retention.ms", OP_DELETE, Some(""))]
+        )
+        .await,
+        (ERROR_NONE, String::new())
+    );
+    assert_eq!(
+        retention(&state, "orders").await,
+        ("-1".to_string(), SOURCE_TOPIC)
+    );
+}
+
+/// Request faults are answered without an Iggy call, so a missing topic still gets
+/// `INVALID_REQUEST` for them. Config faults come after the lookup, so a missing topic gets
+/// `UNKNOWN_TOPIC_OR_PARTITION` for those. Nothing in this test writes.
+#[tokio::test]
+#[serial]
+async fn incremental_alter_configs_answers_request_faults_then_config_faults() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let state = connected_state(&server).await;
+    create_topic(&state, "orders").await;
+    assert_eq!(
+        incremental_one(
+            &state,
+            INCREMENTAL_V1,
+            "orders",
+            &[("retention.ms", OP_SET, Some("4000"))]
+        )
+        .await,
+        (ERROR_NONE, String::new())
+    );
+
+    let request_faults: [(&str, Configs, &str); 4] = [
+        (
+            "orders",
+            &[
+                ("retention.ms", OP_SET, Some("1")),
+                ("retention.ms", OP_SET, Some("2")),
+            ],
+            "Error due to duplicate config keys",
+        ),
+        (
+            "orders",
+            &[("retention.ms", OP_SET, None), ("no.such", OP_SET, None)],
+            "Null value not supported for : retention.ms, no.such",
+        ),
+        (
+            "orders",
+            &[("retention.ms", 7, Some("1"))],
+            "Unknown operations type 7",
+        ),
+        (
+            "missing-topic",
+            &[("retention.ms", 7, Some("1"))],
+            "Unknown operations type 7",
+        ),
+    ];
+    for (name, configs, message) in request_faults {
+        assert_eq!(
+            incremental_one(&state, INCREMENTAL_V1, name, configs).await,
+            (ERROR_INVALID_REQUEST, message.to_string()),
+            "{name}: {configs:?}"
+        );
+    }
+
+    let config_faults: [(Configs, &str); 6] = [
+        (
+            &[("retention.ms", OP_APPEND, Some("1"))],
+            "Can't APPEND to key retention.ms because its type is not LIST.",
+        ),
+        (
+            &[("no.such", OP_SUBTRACT, Some("1"))],
+            "Can't SUBTRACT to key no.such because its type is not LIST.",
+        ),
+        (
+            &[("cleanup.policy", OP_APPEND, Some("compact"))],
+            "cleanup.policy is read-only",
+        ),
+        (
+            &[("no.such", OP_SET, Some("1"))],
+            "unknown config key 'no.such'",
+        ),
+        (
+            &[("cleanup.policy", OP_SET, Some("compact"))],
+            "cleanup.policy is read-only",
+        ),
+        (
+            &[("retention.ms", OP_SET, Some("abc"))],
+            "retention.ms must be -1 or a positive count",
+        ),
+    ];
+    for (configs, message) in config_faults {
+        let (code, text) = incremental_one(&state, INCREMENTAL_V1, "orders", configs).await;
+        assert_eq!(code, ERROR_INVALID_CONFIG, "{configs:?}");
+        assert!(text.starts_with(message), "{configs:?}: {text}");
+    }
+
+    // `validate_only` runs the same checks, so a dry run reports a fault instead of hiding it.
+    let validated = incremental_alter(
+        &state,
+        INCREMENTAL_V1,
+        vec![incremental_resource(
+            "orders",
+            TOPIC,
+            &[
+                ("retention.ms", OP_SET, Some("1")),
+                ("retention.ms", OP_SET, Some("2")),
+            ],
+        )],
+        true,
+    )
+    .await;
+    assert_eq!(validated.responses[0].error_code, ERROR_INVALID_REQUEST);
+    let validated = incremental_alter(
+        &state,
+        INCREMENTAL_V1,
+        vec![incremental_resource(
+            "orders",
+            TOPIC,
+            &[("retention.ms", OP_APPEND, Some("1"))],
+        )],
+        true,
+    )
+    .await;
+    assert_eq!(validated.responses[0].error_code, ERROR_INVALID_CONFIG);
+    assert_eq!(
+        incremental_one(
+            &state,
+            INCREMENTAL_V1,
+            "missing-topic",
+            &[("no.such", OP_SET, Some("1"))]
+        )
+        .await
+        .0,
+        ERROR_UNKNOWN_TOPIC_OR_PARTITION
+    );
+
+    // A delete of a key this gateway never stored removes nothing, as Kafka answers an
+    // override that was never set.
+    assert_eq!(
+        incremental_one(
+            &state,
+            INCREMENTAL_V1,
+            "orders",
+            &[
+                ("no.such", OP_DELETE, None),
+                ("cleanup.policy", OP_DELETE, None)
+            ]
+        )
+        .await,
+        (ERROR_NONE, String::new())
+    );
+
+    let (code, text) = incremental_one(
+        &state,
+        INCREMENTAL_V1,
+        "has a space",
+        &[("retention.ms", OP_SET, Some("1000"))],
+    )
+    .await;
+    assert_eq!(code, ERROR_INVALID_TOPIC_EXCEPTION);
+    assert!(!text.contains("has a space"));
+
+    let nontopic = incremental_alter(
+        &state,
+        INCREMENTAL_V1,
+        vec![incremental_resource(
+            "1",
+            4,
+            &[("retention.ms", OP_SET, Some("1000"))],
+        )],
+        false,
+    )
+    .await;
+    assert_eq!(nontopic.responses[0].error_code, ERROR_INVALID_REQUEST);
+    assert_eq!(
+        nontopic.responses[0]
+            .error_message
+            .as_ref()
+            .map(StrBytes::as_str),
+        Some("only topic resources are supported")
+    );
+
+    assert_eq!(
+        retention(&state, "orders").await,
+        ("4000".to_string(), SOURCE_TOPIC),
+        "no refused request may write"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn incremental_alter_configs_rejects_every_occurrence_of_a_duplicate_resource() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let state = connected_state(&server).await;
+    create_topic(&state, "orders").await;
+
+    let altered = incremental_alter(
+        &state,
+        INCREMENTAL_V1,
+        vec![
+            incremental_resource("orders", TOPIC, &[("retention.ms", OP_SET, Some("4000"))]),
+            incremental_resource("orders", TOPIC, &[("retention.ms", OP_SET, Some("5000"))]),
+        ],
+        false,
+    )
+    .await;
+    assert_eq!(altered.responses.len(), 2);
+    for resource in &altered.responses {
+        assert_eq!(resource.error_code, ERROR_INVALID_REQUEST);
+        assert_eq!(
+            resource.error_message.as_ref().map(StrBytes::as_str),
+            Some("Each resource must appear at most once.")
+        );
+    }
+    assert_eq!(
+        retention(&state, "orders").await,
+        ("-1".to_string(), SOURCE_DEFAULT)
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn incremental_alter_configs_one_bad_resource_skips_only_that_resource() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let state = connected_state(&server).await;
+    create_topic(&state, "kept").await;
+    create_topic(&state, "changed").await;
+
+    let altered = incremental_alter(
+        &state,
+        INCREMENTAL_V1,
+        vec![
+            incremental_resource(
+                "kept",
+                TOPIC,
+                &[
+                    ("retention.ms", OP_SET, Some("4000")),
+                    ("no.such", OP_APPEND, Some("1")),
+                ],
+            ),
+            incremental_resource("changed", TOPIC, &[("retention.ms", OP_SET, Some("5000"))]),
+        ],
+        false,
+    )
+    .await;
+    assert_eq!(altered.responses[0].error_code, ERROR_INVALID_CONFIG);
+    assert_eq!(altered.responses[1].error_code, ERROR_NONE);
+    assert_eq!(
+        retention(&state, "kept").await,
+        ("-1".to_string(), SOURCE_DEFAULT)
+    );
+    assert_eq!(
+        retention(&state, "changed").await,
+        ("5000".to_string(), SOURCE_TOPIC)
+    );
 }

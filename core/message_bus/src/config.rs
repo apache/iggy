@@ -153,6 +153,10 @@ pub struct MessageBusConfig {
     /// Bound on each SDK connection's inbound and outbound queues.
     pub client_queue_capacity: usize,
 
+    /// How long a reply waits for room in a full client queue before the
+    /// connection is closed.
+    pub client_write_stall_timeout: Duration,
+
     /// Interval between outbound reconnect attempts to peers with
     /// `peer_id > self_id`.
     pub reconnect_period: Duration,
@@ -227,6 +231,7 @@ impl From<&ServerConfig> for MessageBusConfig {
                 .expect("message_bus.replica_read_buffer_size fits usize on supported targets"),
             peer_queue_capacity: bus.peer_queue_capacity,
             client_queue_capacity: bus.client_queue_capacity,
+            client_write_stall_timeout: bus.client_write_stall_timeout.get_duration(),
             reconnect_period: bus.reconnect_period.get_duration(),
             mesh_expected_peers: if cfg.cluster.enabled {
                 cfg.cluster.nodes.len().saturating_sub(1)

@@ -21,6 +21,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 use crate::bridge::error::BridgeError;
+use crate::bridge::iggy_bridge::cluster_id_stream;
 
 /// Upper bound `Identifier::named` itself enforces (`identifier/mod.rs`). Checked here too so a
 /// too-long name in the mapping file fails at config load with a message that names the file and
@@ -192,13 +193,22 @@ impl TopicMapping {
     /// Returns [`BridgeError::InvalidConfig`] if `default_stream` or any override's `stream`/
     /// `topic` is empty, has leading/trailing whitespace, or exceeds `MAX_IDENTIFIER_LEN`; if any
     /// override key fails Kafka's own topic-naming rules (see
-    /// `validate_kafka_topic_name`); or if two override entries are not injective (see
-    /// [`resolve`](Self::resolve)).
+    /// `validate_kafka_topic_name`); if two override entries are not injective (see
+    /// [`resolve`](Self::resolve)); if `default_stream` with `.meta` appended, the stream that
+    /// holds the cluster id, exceeds `MAX_IDENTIFIER_LEN`; or if an override targets that
+    /// stream.
     pub fn new(
         default_stream: String,
         topics: HashMap<String, TopicOverride>,
     ) -> Result<Self, BridgeError> {
         validate_identifier_name("topic mapping's default_stream", &default_stream)?;
+        // The gateway keeps its cluster id in this stream. It is checked here so a default
+        // stream too long to name it fails at config load, not at the first start against Iggy.
+        let meta_stream = cluster_id_stream(&default_stream);
+        validate_identifier_name(
+            "topic mapping's default_stream with the `.meta` suffix of its cluster id stream",
+            &meta_stream,
+        )?;
 
         let mut targets = HashSet::with_capacity(topics.len());
         for (kafka_topic, over) in &topics {
@@ -225,6 +235,15 @@ impl TopicMapping {
                 &format!("topic mapping override for '{kafka_topic}': its topic"),
                 &over.topic,
             )?;
+
+            // A Kafka client could then read or delete the topic that holds the cluster id.
+            if over.stream == meta_stream {
+                return Err(BridgeError::InvalidConfig(format!(
+                    "topic mapping override for '{kafka_topic}' targets Iggy stream '{}', which \
+                     holds this gateway's cluster id; target another stream",
+                    over.stream
+                )));
+            }
 
             let target = (over.stream.clone(), over.topic.clone());
             if !targets.insert(target) {
@@ -405,6 +424,44 @@ mod tests {
         "#;
         let err = TopicMapping::from_toml_str(toml).unwrap_err();
         assert!(matches!(err, BridgeError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn given_a_default_stream_whose_meta_stream_is_too_long_should_reject_it() {
+        // A 250-byte name leaves its `.meta` stream at the 255-byte limit; one byte more crosses
+        // it.
+        let longest = "s".repeat(MAX_IDENTIFIER_LEN - ".meta".len());
+        assert!(TopicMapping::new(longest.clone(), HashMap::new()).is_ok());
+        let err = TopicMapping::new(format!("{longest}s"), HashMap::new()).unwrap_err();
+        assert!(matches!(err, BridgeError::InvalidConfig(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn given_an_override_into_the_cluster_id_stream_should_reject_it() {
+        let toml = r#"
+            default_stream = "kafka"
+
+            [topics.ids]
+            stream = "kafka.meta"
+            topic = "cluster_id"
+        "#;
+        let err = TopicMapping::from_toml_str(toml).unwrap_err();
+        assert!(
+            matches!(&err, BridgeError::InvalidConfig(message) if message.contains("cluster id")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn given_an_override_into_another_meta_stream_should_accept_it() {
+        let toml = r#"
+            default_stream = "kafka"
+
+            [topics.ids]
+            stream = "other.meta"
+            topic = "ids"
+        "#;
+        assert!(TopicMapping::from_toml_str(toml).is_ok());
     }
 
     #[test]
