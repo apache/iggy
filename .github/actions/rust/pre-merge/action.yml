@@ -20,7 +20,7 @@ description: Rust pre-merge testing and linting github iggy actions
 
 inputs:
   task:
-    description: "Task to run (check, check-msrv, fmt, clippy, clippy-macos-aarch64, sort, machete, doctest, verify-publish, runtime, test-build, test, test-storage-compat, miri)"
+    description: "Task to run (check, check-msrv, fmt, clippy, clippy-macos-aarch64, sort, machete, doctest, verify-publish, runtime, test-build, test, test-storage-compat, miri, build-web-ui)"
     required: true
   component:
     description: "Component name (for context)"
@@ -67,7 +67,7 @@ runs:
         save-cache: ${{ inputs.save-cache }}
         # Artifact builders do not pull test containers. Test shards have ~78 GB
         # free when tests start and use ~15 GB, so the cleanup costs minutes.
-        free-disk-space: ${{ (inputs.task == 'runtime' || inputs.task == 'test-build' || inputs.task == 'test' || inputs.task == 'miri' || inputs.task == 'fmt' || inputs.task == 'sort' || inputs.task == 'clippy' || inputs.task == 'check' || inputs.task == 'check-msrv' || inputs.task == 'machete' || inputs.task == 'doctest') && 'false' || 'true' }}
+        free-disk-space: ${{ (inputs.task == 'runtime' || inputs.task == 'test-build' || inputs.task == 'test' || inputs.task == 'miri' || inputs.task == 'fmt' || inputs.task == 'sort' || inputs.task == 'clippy' || inputs.task == 'check' || inputs.task == 'check-msrv' || inputs.task == 'machete' || inputs.task == 'doctest' || inputs.task == 'build-web-ui') && 'false' || 'true' }}
 
     - name: Install cargo-sort
       if: inputs.task == 'sort'
@@ -89,6 +89,13 @@ runs:
       with:
         tool: cargo-machete
 
+    # dx is not in taiki-e/install-action's manifests, so the script fetches
+    # the pinned Dioxus release, like the cargo-sort step above.
+    - name: Install dx
+      if: inputs.task == 'build-web-ui'
+      run: ./scripts/ci/install-dx.sh
+      shell: bash
+
     # cargo-http-registry has no prebuilt artifact in taiki-e/install-action,
     # so it stays a source build. verify-publish is a low-frequency task.
     - name: Install tools for specific tasks
@@ -107,6 +114,17 @@ runs:
       if: inputs.task == 'test-build' && inputs.test-scope == 'affected'
       continue-on-error: true
       uses: loadingalias/cargo-rail-action@409962f05d90a78aae995ef6b1c8466010c0a460 # v10.1.1
+
+    # The workspace clippy builds the web UI for the host only, so the wasm32
+    # build gets its own lint pass before the bundle.
+    - name: Build web UI
+      if: inputs.task == 'build-web-ui'
+      run: |
+        rustup target add wasm32-unknown-unknown
+        cargo clippy --locked -p iggy-web-ui --target wasm32-unknown-unknown --all-features --all-targets -- -D warnings
+        ./scripts/build-web-ui.sh
+        test -f core/web_ui/dist/public/index.html
+      shell: bash
 
     # Individual lint tasks for parallel execution
     - name: Cargo check

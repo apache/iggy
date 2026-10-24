@@ -213,6 +213,7 @@ components:
       - "rust-mcp"
       - "rust-integration"
       - "rust-gateway"
+      - "rust-web-ui"
       - "ci-infrastructure"
     paths:
       - "Dockerfile*"
@@ -595,6 +596,18 @@ components:
       - "core/bench/dashboard/**"
       - "scripts/dashboard/**"
     tasks: ["build"]
+
+  # Dioxus web UI. The rust component runs the native workspace checks on it,
+  # and build-web-ui adds the wasm32 lints and the dx bundle the server embeds.
+  rust-web-ui:
+    depends_on:
+      - "rust-workspace" # a Cargo.lock bump of dioxus must re-check the dx pin
+      - "ci-infrastructure"
+    paths:
+      - "core/web_ui/**"
+      - "scripts/build-web-ui.sh"
+      - "scripts/ci/install-dx.sh"
+    tasks: ["build-web-ui"]
 
   # Core tools component
   rust-tools:
