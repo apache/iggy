@@ -114,7 +114,7 @@ Direct generated-bridge callers pass a local `iggy::ffi::ErrorInfo` as the last 
 
 `send_binary_request_to_replica(code, payload, replica_id, error_info)` sends a raw command to one node of a cluster, named by the replica id that cluster metadata returns.
 
-Each node answers non-replicated commands such as `GetStats` from its own state, so this reads the state of that node. Replicated commands, polls and session-control codes fail with `invalid_command` before anything is sent. An id that cluster metadata does not name fails with `invalid_identifier`. An unreachable node is retried until the request timeout, and `not_primary` is returned rather than sent to another node.
+Each node answers non-replicated commands such as `GetStats` from its own state, so this reads the state of that node. Replicated commands, polls, consumer-offset reads and session-control codes fail with `invalid_command` before anything is sent. An id that cluster metadata does not name fails with `invalid_identifier`. An unreachable node is retried until the request timeout, and `not_primary` is returned rather than sent to another node.
 
 Inspect `kind`, `code`, and, when `has_operation_id` is true, `operation_id`. Use separate values for concurrent calls. Error state is never stored globally or on the client.
 

@@ -424,9 +424,10 @@ type Client interface {
 	// replicaID, for example to read the stats that replica keeps for itself, and returns
 	// that replica's raw response body. Replica ids are the ones GetClusterMetadata returns.
 	// The request carries the session's metadata watermark, so the replica answers once it
-	// applied the metadata the session saw. Session-control codes, replicated commands and
-	// polls return ierror.ErrInvalidCommand without writing to the connection. An id the
-	// roster does not name returns ierror.ErrInvalidIdentifier. The replica's own refusal,
-	// such as ierror.ErrNotPrimary, is returned and never retried on another replica.
-	SendBinaryRequestToReplica(ctx context.Context, replicaID uint8, code uint32, payload []byte) ([]byte, error)
+	// applied the metadata the session saw. Session-control codes, replicated commands,
+	// polls and consumer offset reads return ierror.ErrInvalidCommand without writing to
+	// the connection. An id the roster does not name returns ierror.ErrInvalidIdentifier.
+	// The replica's own refusal, such as ierror.ErrNotPrimary, is returned and never
+	// retried on another replica.
+	SendBinaryRequestToReplica(ctx context.Context, code uint32, payload []byte, replicaID uint8) ([]byte, error)
 }

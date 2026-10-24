@@ -120,7 +120,7 @@ public class IggyHttpClient implements IggyBaseClient, Closeable {
 
     /** {@inheritDoc} */
     @Override
-    public byte[] sendBinaryRequestToReplica(int replicaId, int code, byte[] payload) {
+    public byte[] sendBinaryRequestToReplica(int code, byte[] payload, int replicaId) {
         throw new IggyOperationNotSupportedException("sendBinaryRequestToReplica", "HTTP");
     }
 

@@ -72,8 +72,8 @@ export type SendCommandOptions = {
    * Sends the command to the replica with this id instead of the replica the
    * client picks, for example to read the stats that replica keeps for itself.
    * Replica ids are the ones the cluster metadata returns. Only non-replicated
-   * commands other than a poll are accepted, others fail with status 3 before
-   * anything is sent. An id the roster does not name fails with status 6. The
+   * commands other than a poll, a consumer-offset read or session control are
+   * accepted, others fail with status 3 before anything is sent. An id the roster does not name fails with status 6. The
    * replica's reply is returned as it is, a `NotPrimary` (89) refusal
    * included, and nothing is retried on another replica.
    */

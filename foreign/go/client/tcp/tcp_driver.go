@@ -265,10 +265,12 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 		} else if operation.replica != nil {
 			link = c.links.replica(*operation.replica)
 			if link == nil && !c.links.contains(*operation.replica) {
-				if rosterRefreshed {
+				if !rosterRefreshed {
+					rosterRefreshed = c.refreshRoster(ctx, nil) == nil
+				}
+				if rosterRefreshed && !c.links.contains(*operation.replica) {
 					return nil, ierror.ErrInvalidIdentifier
 				}
-				rosterRefreshed = c.refreshRoster(ctx, nil) == nil
 				link = c.links.replica(*operation.replica)
 			}
 		} else {

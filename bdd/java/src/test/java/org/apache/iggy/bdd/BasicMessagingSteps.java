@@ -277,7 +277,7 @@ public class BasicMessagingSteps {
     @When("I send a raw command with code {int} and an empty payload to replica {int}")
     public void sendRawCommandToReplica(int code, int replica) {
         try {
-            context.lastRawResponse = getClient().sendBinaryRequestToReplica(replica, code, new byte[0]);
+            context.lastRawResponse = getClient().sendBinaryRequestToReplica(code, new byte[0], replica);
             context.lastRawError = null;
         } catch (RuntimeException error) {
             context.lastRawResponse = null;

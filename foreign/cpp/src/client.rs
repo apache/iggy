@@ -1498,9 +1498,9 @@ impl Client {
 
     /// Sends a command code and payload to the replica with `replica_id`, as
     /// cluster metadata names it, and returns its raw response bytes.
-    /// Replicated commands, polls and session-control codes return an
-    /// invalid-command error, and a replica that cluster metadata does not
-    /// name returns an invalid-identifier error.
+    /// Replicated commands, polls, consumer-offset reads and session-control
+    /// codes return an invalid-command error, and a replica that cluster
+    /// metadata does not name returns an invalid-identifier error.
     pub fn send_binary_request_to_replica(
         &self,
         code: u32,

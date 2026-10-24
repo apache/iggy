@@ -93,7 +93,7 @@ public class RawCommandTests
         metadata.Nodes.ShouldNotBeEmpty();
         foreach (var node in metadata.Nodes)
         {
-            var statsResponse = await client.SendBinaryRequestToReplicaAsync(node.ReplicaId, 10, []);
+            var statsResponse = await client.SendBinaryRequestToReplicaAsync(10, [], node.ReplicaId);
             statsResponse.ShouldNotBeEmpty();
         }
     }
@@ -109,7 +109,7 @@ public class RawCommandTests
         var unknown = (byte)(metadata.Nodes.Max(node => node.ReplicaId) + 1);
 
         var exception = await Should.ThrowAsync<IggyInvalidStatusCodeException>(() =>
-            client.SendBinaryRequestToReplicaAsync(unknown, 10, []));
+            client.SendBinaryRequestToReplicaAsync(10, [], unknown));
 
         exception.StatusCode.ShouldBe(6);
     }
@@ -124,7 +124,7 @@ public class RawCommandTests
         foreach (var code in new uint[] { 100, 202 })
         {
             var exception = await Should.ThrowAsync<IggyInvalidStatusCodeException>(() =>
-                client.SendBinaryRequestToReplicaAsync(0, code, []));
+                client.SendBinaryRequestToReplicaAsync(code, [], 0));
             exception.StatusCode.ShouldBe(3);
         }
     }
@@ -136,6 +136,6 @@ public class RawCommandTests
     {
         var client = await Fixture.CreateAuthenticatedClient(protocol);
 
-        await Should.ThrowAsync<FeatureUnavailableException>(() => client.SendBinaryRequestToReplicaAsync(0, 10, []));
+        await Should.ThrowAsync<FeatureUnavailableException>(() => client.SendBinaryRequestToReplicaAsync(10, [], 0));
     }
 }

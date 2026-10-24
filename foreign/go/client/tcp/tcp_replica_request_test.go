@@ -22,7 +22,9 @@ import (
 	"encoding/binary"
 	"net"
 	"testing"
+	"time"
 
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/apache/iggy/foreign/go/internal/command"
 	"github.com/apache/iggy/foreign/go/internal/vsr"
@@ -43,7 +45,7 @@ func TestSendBinaryRequestToReplica_SendsOnlyToTheChosenReplicaWithTheMetadataWa
 		return replyFrame(vsr.OperationNonReplicated, []byte("replica-1"))
 	})
 
-	response, err := client.SendBinaryRequestToReplica(context.Background(), 1, uint32(command.GetStatsCode), nil)
+	response, err := client.SendBinaryRequestToReplica(context.Background(), uint32(command.GetStatsCode), nil, 1)
 
 	require.NoError(t, err)
 	assert.Equal(t, []byte("replica-1"), response)
@@ -60,7 +62,7 @@ func TestSendBinaryRequestToReplica_ReturnsNotPrimaryWithoutTryingAnotherReplica
 		return statusReplyFrame(vsr.OperationNonReplicated, uint32(ierror.NotPrimaryCode), nil)
 	})
 
-	_, err := client.SendBinaryRequestToReplica(context.Background(), 1, uint32(command.GetStatsCode), nil)
+	_, err := client.SendBinaryRequestToReplica(context.Background(), uint32(command.GetStatsCode), nil, 1)
 
 	require.ErrorIs(t, err, ierror.ErrNotPrimary)
 	assert.Equal(t, 1, requestCount(secondServer.recorded(), command.GetStatsCode))
@@ -77,7 +79,7 @@ func TestSendBinaryRequestToReplica_RetriesATransientRefusalOnTheSameReplica(t *
 		return replyFrame(vsr.OperationNonReplicated, []byte("served"))
 	})
 
-	response, err := client.SendBinaryRequestToReplica(context.Background(), 1, uint32(command.GetStatsCode), nil)
+	response, err := client.SendBinaryRequestToReplica(context.Background(), uint32(command.GetStatsCode), nil, 1)
 
 	require.NoError(t, err)
 	assert.Equal(t, []byte("served"), response)
@@ -96,7 +98,7 @@ func TestSendBinaryRequestToReplica_FailsAReplicaTheRosterDoesNotNameAfterOneRos
 	firstServer := serve(first, roster)
 	secondServer := serve(second, roster)
 
-	_, err := client.SendBinaryRequestToReplica(context.Background(), 9, uint32(command.GetStatsCode), nil)
+	_, err := client.SendBinaryRequestToReplica(context.Background(), uint32(command.GetStatsCode), nil, 9)
 
 	require.ErrorIs(t, err, ierror.ErrInvalidIdentifier)
 	reads := append(firstServer.recorded(), secondServer.recorded()...)
@@ -104,7 +106,29 @@ func TestSendBinaryRequestToReplica_FailsAReplicaTheRosterDoesNotNameAfterOneRos
 	assert.Equal(t, 0, requestCount(reads, command.GetStatsCode))
 }
 
-func TestSendBinaryRequestToReplica_RefusesReplicatedCommandsPollsAndSessionControlWithoutWriting(t *testing.T) {
+func TestSendBinaryRequestToReplica_FailsAnUnknownReplicaRightAfterTheRosterRead(t *testing.T) {
+	client, first, second := newTwoReplicaClient(t)
+	roster := func(_ int, read request) []byte {
+		if read.code() == uint32(command.GetClusterMetadataCode) {
+			return clusterMetadataFrame(t, 0, firstReplicaAddress, secondReplicaAddress)
+		}
+		return replyFrame(vsr.OperationNonReplicated, nil)
+	}
+	serve(first, roster)
+	serve(second, roster)
+	const calls = 40
+
+	started := time.Now()
+	for range calls {
+		_, err := client.SendBinaryRequestToReplica(context.Background(), uint32(command.GetStatsCode), nil, 9)
+		require.ErrorIs(t, err, ierror.ErrInvalidIdentifier)
+	}
+
+	// A retry pause before the answer averages half of replayInterval per call.
+	assert.Less(t, time.Since(started), calls*replayInterval/5)
+}
+
+func TestSendBinaryRequestToReplica_RefusesReplicatedCommandsPartitionReadsAndSessionControlWithoutWriting(t *testing.T) {
 	client, first, second := newTwoReplicaClient(t)
 	firstServer := serve(first, func(_ int, _ request) []byte { return nil })
 	secondServer := serve(second, func(_ int, _ request) []byte { return nil })
@@ -115,10 +139,18 @@ func TestSendBinaryRequestToReplica_RefusesReplicatedCommandsPollsAndSessionCont
 		command.StoreOffsetCode,
 		command.PollMessagesCode,
 		command.LoginUserCode,
+		command.LoginRegisterCode,
 	} {
-		_, err := client.SendBinaryRequestToReplica(context.Background(), 1, uint32(code), nil)
+		_, err := client.SendBinaryRequestToReplica(context.Background(), uint32(code), nil, 1)
 		require.ErrorIs(t, err, ierror.ErrInvalidCommand, "code %d", code)
 	}
+	stream, topic, group := groupConsumer(t)
+	partition := uint32(1)
+	offsetRead, err := (&command.GetConsumerOffset{StreamId: stream, TopicId: topic,
+		Consumer: iggcon.NewSingleConsumer(group.Id), PartitionId: &partition}).MarshalBinary()
+	require.NoError(t, err)
+	_, err = client.SendBinaryRequestToReplica(context.Background(), uint32(command.GetOffsetCode), offsetRead, 1)
+	require.ErrorIs(t, err, ierror.ErrInvalidCommand)
 	assert.Empty(t, firstServer.recorded())
 	assert.Empty(t, secondServer.recorded())
 }

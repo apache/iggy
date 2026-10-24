@@ -621,10 +621,11 @@ public sealed partial class TcpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public async Task<byte[]> SendBinaryRequestToReplicaAsync(byte replicaId, uint code, byte[] payload,
+    public async Task<byte[]> SendBinaryRequestToReplicaAsync(uint code, byte[] payload, byte replicaId,
         CancellationToken token = default)
     {
         if (SessionControlCodes.Contains(code) || code == CommandCodes.POLL_MESSAGES_CODE
+            || code == CommandCodes.GET_CONSUMER_OFFSET_CODE
             || VsrOperations.ForCode((int)code) != VsrOperation.NonReplicated)
         {
             throw VsrError.Exception(VsrError.INVALID_COMMAND,

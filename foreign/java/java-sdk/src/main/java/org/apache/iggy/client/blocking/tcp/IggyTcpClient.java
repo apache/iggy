@@ -114,8 +114,8 @@ public class IggyTcpClient implements IggyBaseClient, Closeable {
 
     /** {@inheritDoc} */
     @Override
-    public byte[] sendBinaryRequestToReplica(int replicaId, int code, byte[] payload) {
-        return FutureUtil.resolve(asyncClient.sendBinaryRequestToReplica(replicaId, code, payload));
+    public byte[] sendBinaryRequestToReplica(int code, byte[] payload, int replicaId) {
+        return FutureUtil.resolve(asyncClient.sendBinaryRequestToReplica(code, payload, replicaId));
     }
 
     /**

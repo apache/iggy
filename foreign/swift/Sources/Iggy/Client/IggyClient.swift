@@ -218,8 +218,9 @@ public final class IggyClient: Sendable {
     /// node. The request carries the session's metadata watermark, so the
     /// replica answers once it applied the metadata this client saw.
     ///
-    /// Replicated commands, `PollMessages`, and session-control codes fail
-    /// with ``IggyErrorCode/invalidCommand`` before anything is sent. A
+    /// Replicated commands, `PollMessages`, `GetConsumerOffset`, and
+    /// session-control codes fail with ``IggyErrorCode/invalidCommand``
+    /// before anything is sent. A
     /// replica the roster does not list after one more roster read fails with
     /// ``IggyErrorCode/invalidIdentifier``. A replica that cannot be reached,
     /// or that answers ``IggyErrorCode/transientNotAccepted``, is asked again
@@ -228,7 +229,7 @@ public final class IggyClient: Sendable {
     /// another replica.
     public func sendRawRequest(code: UInt32, payload: [UInt8], replica: UInt8) async throws -> [UInt8] {
         guard !CommandCode.isSessionControl(code), code != CommandCode.pollMessages.rawValue,
-            ConsensusOperation.forCode(code) == .nonReplicated
+            code != CommandCode.getConsumerOffset.rawValue, ConsensusOperation.forCode(code) == .nonReplicated
         else {
             throw IggyError(.invalidCommand, context: "command \(code) cannot be sent to a chosen replica")
         }

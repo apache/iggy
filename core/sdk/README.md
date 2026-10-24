@@ -251,7 +251,9 @@ For lower-level control over individual commands (login, stream/topic management
 
 `IggyClient::send_binary_request_to_replica(code, payload, replica_id)` sends a raw command to one node of a cluster, named by the replica id that cluster metadata returns.
 
-Each node answers non-replicated commands such as `GetStats` from its own state, so this reads the state of that node. The request carries the session's metadata watermark. Replicated commands, polls and session-control codes fail with `InvalidCommand` before anything is sent. An id that cluster metadata does not name fails with `InvalidIdentifier`. An unreachable node is retried until the request deadline, and a `NotPrimary` reply is returned rather than sent to another node.
+Each node answers non-replicated commands such as `GetStats` from its own state, so this reads the state of that node. The request carries the session's metadata watermark. Replicated commands, polls, consumer-offset reads and session-control codes fail with `InvalidCommand` before anything is sent.
+
+An id that cluster metadata does not name fails with `InvalidIdentifier`. An unreachable node is retried until the request deadline, and a `NotPrimary` reply is returned rather than sent to another node.
 
 HTTP clients return `FeatureUnavailable` for this call, as for `send_binary_request`.
 

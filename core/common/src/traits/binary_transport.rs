@@ -155,10 +155,14 @@ pub trait BinaryTransport {
     /// The request carries the session's metadata watermark, so the replica
     /// answers once it applied the metadata the session saw. The reply is the
     /// chosen replica's own: a refusal such as [`IggyError::NotPrimary`] is
-    /// returned, never retried on another replica. A replicated command or a
-    /// poll returns [`IggyError::InvalidCommand`] before anything is sent, and a
-    /// replica the roster does not name returns [`IggyError::InvalidIdentifier`].
-    /// Transports without replica links return [`IggyError::FeatureUnavailable`].
+    /// returned, never retried on another replica. A replicated command, a poll
+    /// or a consumer-offset read returns [`IggyError::InvalidCommand`] before
+    /// anything is sent. A replica the roster does not name, or names without
+    /// an endpoint for this transport, returns [`IggyError::InvalidIdentifier`].
+    /// A link lost after the request was written makes the outcome unknown, so
+    /// a call that no later attempt answers returns
+    /// [`IggyError::TransientNotCommitted`]. Transports without replica links
+    /// return [`IggyError::FeatureUnavailable`].
     async fn send_raw_to_replica(
         &self,
         _code: u32,

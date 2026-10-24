@@ -49,8 +49,8 @@ public sealed class ReplicaRequestTests
         using var client = await cluster.SignedInAsync();
         await client.SendBinaryRequestAsync((uint)CommandCodes.CREATE_STREAM_CODE, [], token);
 
-        var backup = await client.SendBinaryRequestToReplicaAsync(1, GetStatsCode, [1], token);
-        var leader = await client.SendBinaryRequestToReplicaAsync(0, GetStatsCode, [0], token);
+        var backup = await client.SendBinaryRequestToReplicaAsync(GetStatsCode, [1], 1, token);
+        var leader = await client.SendBinaryRequestToReplicaAsync(GetStatsCode, [0], 0, token);
 
         Assert.Equal(BackupReply, backup);
         Assert.Equal(LeaderReply, leader);
@@ -70,7 +70,7 @@ public sealed class ReplicaRequestTests
         using var client = await cluster.SignedInAsync();
 
         var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() =>
-            client.SendBinaryRequestToReplicaAsync(1, GetStatsCode, [], token));
+            client.SendBinaryRequestToReplicaAsync(GetStatsCode, [], 1, token));
 
         Assert.Equal((int)NotPrimary, error.StatusCode);
         Assert.Single(cluster.BackupStats);
@@ -89,7 +89,7 @@ public sealed class ReplicaRequestTests
         });
         using var client = await cluster.SignedInAsync();
 
-        var backup = await client.SendBinaryRequestToReplicaAsync(1, GetStatsCode, [], token);
+        var backup = await client.SendBinaryRequestToReplicaAsync(GetStatsCode, [], 1, token);
 
         Assert.Equal(BackupReply, backup);
         Assert.Equal(3, cluster.BackupStats.Count);
@@ -106,7 +106,7 @@ public sealed class ReplicaRequestTests
             + cluster.Backup.Requests(GET_CLUSTER_METADATA_CODE);
 
         var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() =>
-            client.SendBinaryRequestToReplicaAsync(2, GetStatsCode, [], token));
+            client.SendBinaryRequestToReplicaAsync(GetStatsCode, [], 2, token));
 
         Assert.Equal(VsrError.INVALID_IDENTIFIER, error.StatusCode);
         Assert.Equal(rosterReads + 1, cluster.Leader.Requests(GET_CLUSTER_METADATA_CODE)
@@ -116,7 +116,7 @@ public sealed class ReplicaRequestTests
     }
 
     [Fact]
-    public async Task given_a_replicated_poll_or_session_command_when_sent_to_a_replica_should_refuse_it_before_sending()
+    public async Task given_a_replicated_partition_read_or_session_command_when_sent_to_a_replica_should_refuse_it_before_sending()
     {
         var token = TestContext.Current.CancellationToken;
         using var cluster = new TwoReplicas(_ => Reply(OPERATION_NON_REPLICATED, BackupReply));
@@ -126,17 +126,18 @@ public sealed class ReplicaRequestTests
         foreach (var code in new[]
                  {
                      (uint)CommandCodes.CREATE_STREAM_CODE, (uint)CommandCodes.POLL_MESSAGES_CODE,
-                     (uint)CommandCodes.LOGIN_USER_CODE, (uint)CommandCodes.LOGOUT_USER_CODE
+                     (uint)CommandCodes.GET_CONSUMER_OFFSET_CODE, (uint)CommandCodes.LOGIN_USER_CODE,
+                     (uint)CommandCodes.LOGOUT_USER_CODE
                  })
         {
             var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() =>
-                client.SendBinaryRequestToReplicaAsync(1, code, [], token));
+                client.SendBinaryRequestToReplicaAsync(code, [], 1, token));
             Assert.Equal(VsrError.INVALID_COMMAND, error.StatusCode);
         }
 
         Assert.Equal(requests, cluster.Recorded);
         Assert.Empty(cluster.BackupStats);
-        Assert.Equal(BackupReply, await client.SendBinaryRequestToReplicaAsync(1, GetStatsCode, [], token));
+        Assert.Equal(BackupReply, await client.SendBinaryRequestToReplicaAsync(GetStatsCode, [], 1, token));
     }
 
     /// <summary>

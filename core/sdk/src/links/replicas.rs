@@ -404,7 +404,8 @@ impl ReplicaLinks {
             .ok_or(IggyError::NotConnected)
     }
 
-    /// Whether the last roster names replica `id`.
+    /// Whether the last roster names replica `id` with a port for this
+    /// transport. A node without one has no link slot, so it reads as unnamed.
     pub(crate) fn has_replica(&self, id: u8) -> bool {
         self.shared.table().slots.contains_key(&id)
     }

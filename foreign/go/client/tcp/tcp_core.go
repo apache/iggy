@@ -324,12 +324,13 @@ func releaseRequestBuf(bp *[]byte) {
 // do sends the command and returns the response body. Commands implementing
 // the appender interface encode directly into a pooled buffer.
 func (c *IggyTcpClient) do(ctx context.Context, cmd command.Command) ([]byte, error) {
-	return c.doCaptured(ctx, cmd, nil)
+	return c.doCaptured(ctx, cmd, nil, nil)
 }
 
 // doCaptured is do for a partition command that carries captured, a context
-// the caller holds, instead of the context its route names.
-func (c *IggyTcpClient) doCaptured(ctx context.Context, cmd command.Command, captured *iggcon.PartitionContext) ([]byte, error) {
+// the caller holds, instead of the context its route names, and for a command
+// sent to the replica the caller chose.
+func (c *IggyTcpClient) doCaptured(ctx context.Context, cmd command.Command, captured *iggcon.PartitionContext, replica *uint8) ([]byte, error) {
 	if ctx == nil {
 		return nil, ierror.ErrNilContext
 	}
@@ -354,7 +355,7 @@ func (c *IggyTcpClient) doCaptured(ctx context.Context, cmd command.Command, cap
 		}
 		return c.drive(ctx, cmd.Code(), query, frame, captured, nil)
 	}
-	return c.drive(ctx, cmd.Code(), nil, frame, nil, nil)
+	return c.drive(ctx, cmd.Code(), nil, frame, nil, replica)
 }
 
 // rawRequest carries a SendBinaryRequest through do, so a raw partition
@@ -385,29 +386,15 @@ func (c *IggyTcpClient) SendBinaryRequest(ctx context.Context, code uint32, payl
 
 // SendBinaryRequestToReplica sends a command code and payload to the replica with id
 // replicaID and returns that replica's raw response body. Session-control codes,
-// replicated commands and polls return ierror.ErrInvalidCommand without writing to the
-// connection. A replica the roster does not name, after one roster read, returns
-// ierror.ErrInvalidIdentifier. The replica's own refusal, such as ierror.ErrNotPrimary,
-// is returned as it is.
-func (c *IggyTcpClient) SendBinaryRequestToReplica(ctx context.Context, replicaID uint8, code uint32, payload []byte) ([]byte, error) {
-	if _, replicated := vsr.ReplicatedOperation(code); replicated || isSessionControlCode(code) || command.Code(code) == command.PollMessagesCode {
+// replicated commands, polls and consumer offset reads return ierror.ErrInvalidCommand
+// without writing to the connection. A replica the roster does not name, after one
+// roster read, returns ierror.ErrInvalidIdentifier. The replica's own refusal, such as
+// ierror.ErrNotPrimary, is returned as it is.
+func (c *IggyTcpClient) SendBinaryRequestToReplica(ctx context.Context, code uint32, payload []byte, replicaID uint8) ([]byte, error) {
+	if _, replicated := vsr.ReplicatedOperation(code); replicated || isSessionControlCode(code) || isPartitionRead(command.Code(code)) {
 		return nil, ierror.ErrInvalidCommand
 	}
-	if ctx == nil {
-		return nil, ierror.ErrNilContext
-	}
-	ctx, cancel := c.operationContext(ctx)
-	defer cancel()
-	bp := acquireRequestBuf()
-	defer releaseRequestBuf(bp)
-	frame, err := appendCommandFrame(*bp, rawRequest{code: command.Code(code), payload: payload})
-	if frame != nil {
-		*bp = frame
-	}
-	if err != nil {
-		return nil, err
-	}
-	return c.drive(ctx, command.Code(code), nil, frame, nil, &replicaID)
+	return c.doCaptured(ctx, rawRequest{code: command.Code(code), payload: payload}, nil, &replicaID)
 }
 
 // reserveHeader returns buf truncated to exactly the header prologue, growing
@@ -416,6 +403,12 @@ func (c *IggyTcpClient) SendBinaryRequestToReplica(ctx context.Context, replicaI
 // write four extra cache lines per request.
 func reserveHeader(buf []byte) []byte {
 	return slices.Grow(buf[:0], vsr.HeaderSize)[:vsr.HeaderSize]
+}
+
+// isPartitionRead reports whether code reads a partition through its primary and
+// incarnation, which a request to a chosen replica does not carry.
+func isPartitionRead(code command.Code) bool {
+	return code == command.PollMessagesCode || code == command.GetOffsetCode
 }
 
 func isSessionControlCode(code uint32) bool {

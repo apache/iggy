@@ -347,7 +347,7 @@ Current pages need the parent groups of every selected group, for example `Topic
 
 `send_binary_request(code, payload)` sends a command code with a payload and returns the raw response bytes. `send_binary_request_to_replica(code, payload, replica_id)` sends it to one node of a cluster, named by the replica id that cluster metadata returns.
 
-Each node answers non-replicated commands such as `GetStats` from its own state, so this reads the state of that node. Replicated commands, polls and session-control codes raise an invalid-command error before anything is sent. An id that cluster metadata does not name raises an invalid-identifier error. An unreachable node is retried until the request timeout, and a `NotPrimary` reply is raised rather than sent to another node. HTTP does not support raw commands.
+Each node answers non-replicated commands such as `GetStats` from its own state, so this reads the state of that node. Replicated commands, polls, consumer-offset reads and session-control codes raise an invalid-command error before anything is sent. An id that cluster metadata does not name raises an invalid-identifier error. An unreachable node is retried until the request timeout, and a `NotPrimary` reply is raised rather than sent to another node. HTTP does not support raw commands.
 
 ## High-Level Producer
 

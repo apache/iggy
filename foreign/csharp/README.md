@@ -348,9 +348,9 @@ of the metadata primary. When the client believes that the replica that replied 
 the cluster roster from that replica. When it has no ready link to the metadata primary, it does the same. If that
 roster names this replica as the metadata primary, the reply is final. Otherwise the call retries.
 
-`SendBinaryRequestToReplicaAsync(replicaId, code, payload)` sends a raw command to one node of a cluster, named by the replica id that cluster metadata returns.
+`SendBinaryRequestToReplicaAsync(code, payload, replicaId)` sends a raw command to one node of a cluster, named by the replica id that cluster metadata returns.
 
-Each node answers non-replicated commands such as `GetStats` from its own state, so this reads the state of that node. Replicated commands, polls and session-control codes fail with status 3 before anything is sent. An id that cluster metadata does not name fails with status 6. An unreachable node is retried until the request timeout, and a `NotPrimary` (89) reply is returned rather than sent to another node.
+Each node answers non-replicated commands such as `GetStats` from its own state, so this reads the state of that node. Replicated commands, polls, consumer-offset reads and session-control codes fail with status 3 before anything is sent. An id that cluster metadata does not name fails with status 6. An unreachable node is retried until the request timeout, and a `NotPrimary` (89) reply is returned rather than sent to another node.
 
 ### Limitations
 

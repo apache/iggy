@@ -255,14 +255,19 @@ impl OperationDriver {
     }
 
     /// Sends a non-replicated request to replica `replica_id` and returns its
-    /// reply. Writes and polls go through the routing of their own kind.
+    /// reply. Writes and partition reads go through the routing of their own
+    /// kind: a poll or a consumer-offset read needs the partition's primary and
+    /// its incarnation, which a request to a chosen replica does not carry.
     pub(crate) async fn send_to_replica(
         &self,
         code: u32,
         payload: Bytes,
         replica_id: u8,
     ) -> Result<Bytes, IggyError> {
-        if operation_for_code(code) != Operation::NonReplicated || code == POLL_MESSAGES_CODE {
+        if operation_for_code(code) != Operation::NonReplicated
+            || code == POLL_MESSAGES_CODE
+            || code == GET_CONSUMER_OFFSET_CODE
+        {
             return Err(IggyError::InvalidCommand);
         }
         self.send(code, payload, RequestTarget::Replica(replica_id))
@@ -2001,6 +2006,28 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn given_a_link_lost_after_the_write_when_the_chosen_replica_then_refuses_should_return_not_committed()
+     {
+        let f = Fixture::new().await;
+        f.cluster.script(
+            &endpoint(2),
+            GET_STREAMS_CODE,
+            [Answer::HangUp, Answer::Refuse(IggyError::NotPrimary)],
+        );
+
+        let result = f
+            .driver
+            .send_to_replica(GET_STREAMS_CODE, Bytes::from_static(PAYLOAD), 2)
+            .await;
+
+        assert_eq!(result, Err(IggyError::TransientNotCommitted));
+        assert_eq!(
+            endpoints(&f.cluster.received(GET_STREAMS_CODE)),
+            [endpoint(2), endpoint(2)]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn given_a_replica_the_roster_does_not_name_when_reading_should_fail_after_one_roster_read()
      {
         let f = Fixture::new().await;
@@ -2017,7 +2044,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn given_a_replicated_command_or_a_poll_when_sent_to_a_replica_should_refuse_before_the_wire()
+    async fn given_a_replicated_command_or_a_partition_read_when_sent_to_a_replica_should_refuse_before_the_wire()
      {
         let f = Fixture::new().await;
         let rosters = f.cluster.count(GET_CLUSTER_METADATA_CODE);
@@ -2027,6 +2054,7 @@ mod tests {
             SEND_MESSAGES_CODE,
             STORE_CONSUMER_OFFSET_CODE,
             POLL_MESSAGES_CODE,
+            GET_CONSUMER_OFFSET_CODE,
         ] {
             assert_eq!(
                 f.driver

@@ -75,7 +75,7 @@ func (rawCommandSteps) whenSendRawCommand(ctx context.Context, code uint32) erro
 
 func (rawCommandSteps) whenSendRawCommandToReplica(ctx context.Context, code uint32, replica uint8) error {
 	state := getRawCommandCtx(ctx)
-	state.lastResponse, state.lastError = state.client.SendBinaryRequestToReplica(ctx, replica, code, nil)
+	state.lastResponse, state.lastError = state.client.SendBinaryRequestToReplica(ctx, code, nil, replica)
 	return nil
 }
 

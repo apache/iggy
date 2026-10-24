@@ -1943,9 +1943,10 @@ impl IggyClient {
     ///
     /// The replica id is the one cluster metadata names for the node. Every
     /// node answers non-replicated commands such as GetStats from its own
-    /// state. Replicated commands, polls and session-control codes are
-    /// rejected client-side, and a replica id that cluster metadata does not
-    /// name fails. HTTP transport does not support raw binary commands.
+    /// state. Replicated commands, polls, consumer-offset reads and
+    /// session-control codes are rejected client-side, and a replica id that
+    /// cluster metadata does not name fails. HTTP transport does not support
+    /// raw binary commands.
     ///
     /// Args:
     ///     code: Command code as `int`.

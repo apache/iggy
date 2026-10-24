@@ -66,12 +66,12 @@ class RawCommandTcpClientTest extends IntegrationTest {
 
     @Test
     void shouldReturnRawResponsePayloadsOfTheServerReplica() {
-        assertThat(client.sendBinaryRequestToReplica(0, 10, new byte[0])).isNotEmpty();
+        assertThat(client.sendBinaryRequestToReplica(10, new byte[0], 0)).isNotEmpty();
     }
 
     @Test
     void shouldRejectAReplicaThatClusterMetadataDoesNotName() {
-        assertThatThrownBy(() -> client.sendBinaryRequestToReplica(9, 10, new byte[0]))
+        assertThatThrownBy(() -> client.sendBinaryRequestToReplica(10, new byte[0], 9))
                 .isInstanceOf(IggyServerException.class)
                 .extracting(exception -> ((IggyServerException) exception).getErrorCode())
                 .isEqualTo(IggyErrorCode.INVALID_IDENTIFIER);
@@ -80,7 +80,7 @@ class RawCommandTcpClientTest extends IntegrationTest {
     @Test
     void shouldRejectReplicatedCommandsToAReplica() {
         for (int code : new int[] {100, 202}) {
-            assertThatThrownBy(() -> client.sendBinaryRequestToReplica(0, code, new byte[0]))
+            assertThatThrownBy(() -> client.sendBinaryRequestToReplica(code, new byte[0], 0))
                     .isInstanceOf(IggyServerException.class)
                     .extracting(exception -> ((IggyServerException) exception).getErrorCode())
                     .isEqualTo(IggyErrorCode.INVALID_COMMAND);

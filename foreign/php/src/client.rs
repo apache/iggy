@@ -715,9 +715,9 @@ impl IggyClient {
 
     /// Sends a command code with a payload to the replica with the given id, as
     /// cluster metadata names it, and returns the raw response bytes.
-    /// Replicated commands, polls and session-control codes return an
-    /// invalid-command exception, and a replica that cluster metadata does not
-    /// name returns an invalid-identifier exception.
+    /// Replicated commands, polls, consumer-offset reads and session-control
+    /// codes return an invalid-command exception, and a replica that cluster
+    /// metadata does not name returns an invalid-identifier exception.
     pub fn send_binary_request_to_replica(
         &self,
         code: u32,

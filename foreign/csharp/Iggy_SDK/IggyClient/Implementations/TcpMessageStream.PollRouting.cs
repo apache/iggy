@@ -577,7 +577,8 @@ public sealed partial class TcpMessageStream
             {
                 ExceptionDispatchInfo.Throw(refusal);
             }
-            throw _consensusSession.Ended(generation) ?? PollNotAccepted();
+            throw _consensusSession.Ended(generation)
+                ?? (replica is { } chosen ? ReplicaNotAccepted(chosen) : PollNotAccepted());
         }
         catch (Exception error) when (error is IOException or SocketException
             && refusal is not null
@@ -1019,5 +1020,10 @@ public sealed partial class TcpMessageStream
     private static IggyInvalidStatusCodeException PollNotAccepted()
     {
         return VsrError.Exception(VsrError.TRANSIENT_NOT_ACCEPTED, "The primary poll was not admitted.");
+    }
+
+    private static IggyInvalidStatusCodeException ReplicaNotAccepted(byte replica)
+    {
+        return VsrError.Exception(VsrError.TRANSIENT_NOT_ACCEPTED, $"Replica {replica} did not answer before the deadline.");
     }
 }

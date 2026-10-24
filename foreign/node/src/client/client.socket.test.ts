@@ -452,23 +452,6 @@ describe('raw commands to a chosen replica', () => {
     }
   });
 
-  it('sends a consumer offset read to the chosen replica instead of the partition primary', async () => {
-    const cluster = await startPollCluster();
-    const payload = GET_OFFSET.serialize({ streamId: 1, topicId: 2, partitionId: 3,
-      consumer: { kind: ConsumerKind.Single, id: 1 } });
-    try {
-      await cluster.client.sendCommand(COMMAND_CODE.GetOffset, payload, { replica: 0, deadline: Date.now() + 1_000 });
-      assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.GetOffset), 1);
-      assert.equal(countCommand(cluster.primary, COMMAND_CODE.GetOffset), 0);
-      assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.GetPartitionRoute), 0);
-      const sent = cluster.coordinator.frames.find((frame) =>
-        frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.GetOffset)!;
-      assert.equal(stampedContext(sent).incarnation, 0n);
-    } finally {
-      await cluster.close();
-    }
-  });
-
   it('returns 89 from the chosen replica without trying another replica', async () => {
     const cluster = await startPollCluster((frame, socket) => {
       if (!isStats(frame))
@@ -524,11 +507,12 @@ describe('raw commands to a chosen replica', () => {
     }
   });
 
-  it('refuses replicated commands, polls, session control and invalid ids before the wire', async () => {
+  it('refuses replicated commands, partition reads, session control and invalid ids before the wire', async () => {
     const cluster = await startPollCluster();
     try {
       for (const command of [COMMAND_CODE.SendMessages, COMMAND_CODE.StoreOffset, COMMAND_CODE.CreateStream,
-        COMMAND_CODE.PollMessages, LOGIN.code, LOGOUT.code])
+        COMMAND_CODE.PollMessages, COMMAND_CODE.GetOffset, LOGIN.code, LOGOUT.code, COMMAND_CODE.LoginRegister,
+        COMMAND_CODE.LoginRegisterWithAccessToken])
         await assert.rejects(cluster.client.sendCommand(command, Buffer.alloc(0), { replica: 7 }),
           (error: unknown) => error instanceof ResponseError && error.errorCode === 3);
       for (const replica of [-1, 1.5, 256])

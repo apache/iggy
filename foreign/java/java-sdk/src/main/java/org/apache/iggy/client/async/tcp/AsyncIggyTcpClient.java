@@ -459,8 +459,8 @@ public class AsyncIggyTcpClient {
      * as GetStats from its own state, so this reads the state of the chosen node.
      *
      * <p>The request carries the metadata watermark of the session, so the replica answers after it applied the
-     * metadata that this client saw. Replicated commands, PollMessages and session-control codes complete the
-     * returned future with an invalid-command error before anything is sent. An id that cluster metadata does not
+     * metadata that this client saw. Replicated commands, PollMessages, GetConsumerOffset and session-control codes
+     * complete the returned future with an invalid-command error before anything is sent. An id that cluster metadata does not
      * name after one read of it completes the future with an invalid-identifier error. A replica that cannot be
      * reached, or that answers with code 58, is asked again until the request timeout, which ends the call with code
      * 58. Any other refusal, NotPrimary (89) included, completes the future unchanged and is never sent to another
@@ -468,16 +468,17 @@ public class AsyncIggyTcpClient {
      *
      * <p>The future completes on the client event loop, as the callbacks section of this class says.
      *
-     * @param replicaId the replica id that cluster metadata names
      * @param code the command code
      * @param payload the command payload
+     * @param replicaId the replica id that cluster metadata names
      * @return a future containing the raw response payload
      * @throws IggyNotConnectedException if {@link #connect()} has not been called
      */
-    public CompletableFuture<byte[]> sendBinaryRequestToReplica(int replicaId, int code, byte[] payload) {
+    public CompletableFuture<byte[]> sendBinaryRequestToReplica(int code, byte[] payload, int replicaId) {
         Objects.requireNonNull(payload, "payload cannot be null");
         if (isSessionControlCode(code)
                 || code == CommandCode.Messages.POLL.getValue()
+                || code == CommandCode.ConsumerOffset.GET.getValue()
                 || VsrOperation.operationForCode(code) != VsrOperation.NON_REPLICATED) {
             return CompletableFuture.failedFuture(
                     IggyServerException.fromTcpResponse(INVALID_COMMAND_ERROR_CODE, new byte[0]));

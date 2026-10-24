@@ -93,12 +93,12 @@ struct ReplicaRequestTests {
         await client.shutdown()
     }
 
-    @Test func replicatedPollAndSessionCommandsAreRefusedBeforeAnythingIsSent() async throws {
+    @Test func replicatedPartitionReadAndSessionCommandsAreRefusedBeforeAnythingIsSent() async throws {
         let cluster = try await TwoReplicas.started { _ in .ok(backupReply) }
         defer { cluster.stop() }
         let client = try await cluster.signedInClient()
         let requests = await cluster.leader.requests.count + cluster.backup.requests.count
-        let refused: [CommandCode] = [.createStream, .pollMessages, .loginUser, .logoutUser]
+        let refused: [CommandCode] = [.createStream, .pollMessages, .getConsumerOffset, .loginUser, .logoutUser]
 
         for code in refused {
             await expectCode(.invalidCommand) { _ = try await client.sendRawRequest(code: code.rawValue, payload: [], replica: 1) }

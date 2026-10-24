@@ -958,13 +958,16 @@ impl IggyClient {
     ///
     /// # Errors
     /// [`IggyError::InvalidCommand`] before anything is sent if `code` is a
-    /// session-control code, a replicated command, or a poll. Writes and polls
-    /// reach their primary through the typed API and
-    /// [`send_binary_request`](IggyClient::send_binary_request).
+    /// session-control code, a replicated command, a poll, or a consumer-offset
+    /// read. Writes and partition reads reach their primary through the typed
+    /// API and [`send_binary_request`](IggyClient::send_binary_request).
     /// [`IggyError::InvalidIdentifier`] if the roster does not name
-    /// `replica_id`. [`IggyError::TransientNotAccepted`] if the replica stays
-    /// unreachable until the deadline. [`IggyError::FeatureUnavailable`] on the
-    /// HTTP transport, which has no binary path.
+    /// `replica_id`, or names it without an endpoint for this transport.
+    /// [`IggyError::TransientNotAccepted`] if the replica stays unreachable
+    /// until the deadline. [`IggyError::TransientNotCommitted`] if a link was
+    /// lost after the request was written and no later attempt got a reply,
+    /// because the replica may have run it. [`IggyError::FeatureUnavailable`]
+    /// on the HTTP transport, which has no binary path.
     pub async fn send_binary_request_to_replica(
         &self,
         code: u32,

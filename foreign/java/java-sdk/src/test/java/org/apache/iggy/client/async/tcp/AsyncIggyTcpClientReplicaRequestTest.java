@@ -56,6 +56,7 @@ class AsyncIggyTcpClientReplicaRequestTest {
     private static final int GET_STATS_CODE = 10;
     private static final int LOGIN_CODE = 38;
     private static final int LOGOUT_CODE = 39;
+    private static final int GET_OFFSET_CODE = 120;
     private static final int NOT_PRIMARY = 89;
     private static final long METADATA_COMMIT = 11;
     private static final int TEST_TIMEOUT_SECONDS = 5;
@@ -69,9 +70,9 @@ class AsyncIggyTcpClientReplicaRequestTest {
             try {
                 client.sendBinaryRequest(CREATE_STREAM_CODE, new byte[0]).get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
-                byte[] backup = client.sendBinaryRequestToReplica(1, GET_STATS_CODE, new byte[] {1})
+                byte[] backup = client.sendBinaryRequestToReplica(GET_STATS_CODE, new byte[] {1}, 1)
                         .get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-                byte[] leader = client.sendBinaryRequestToReplica(0, GET_STATS_CODE, new byte[] {0})
+                byte[] leader = client.sendBinaryRequestToReplica(GET_STATS_CODE, new byte[] {0}, 0)
                         .get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
                 assertThat(backup).isEqualTo(BACKUP_STATS);
@@ -96,7 +97,7 @@ class AsyncIggyTcpClientReplicaRequestTest {
         try (Cluster cluster = new Cluster(1, stats -> Response.error(OPERATION_NON_REPLICATED, NOT_PRIMARY))) {
             AsyncIggyTcpClient client = cluster.signIn();
             try {
-                assertServerError(client.sendBinaryRequestToReplica(1, GET_STATS_CODE, new byte[0]), NOT_PRIMARY);
+                assertServerError(client.sendBinaryRequestToReplica(GET_STATS_CODE, new byte[0], 1), NOT_PRIMARY);
 
                 assertThat(cluster.backupStats).hasSize(1);
                 assertThat(cluster.leaderStats).isEmpty();
@@ -116,7 +117,7 @@ class AsyncIggyTcpClientReplicaRequestTest {
         })) {
             AsyncIggyTcpClient client = cluster.signIn();
             try {
-                byte[] backup = client.sendBinaryRequestToReplica(1, GET_STATS_CODE, new byte[0])
+                byte[] backup = client.sendBinaryRequestToReplica(GET_STATS_CODE, new byte[0], 1)
                         .get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
                 assertThat(backup).isEqualTo(BACKUP_STATS);
@@ -136,7 +137,7 @@ class AsyncIggyTcpClientReplicaRequestTest {
             AsyncIggyTcpClient client = cluster.signIn();
             try {
                 assertServerError(
-                        client.sendBinaryRequestToReplica(1, GET_STATS_CODE, new byte[0]), TRANSIENT_NOT_ACCEPTED);
+                        client.sendBinaryRequestToReplica(GET_STATS_CODE, new byte[0], 1), TRANSIENT_NOT_ACCEPTED);
 
                 assertThat(cluster.backupStats.size()).isGreaterThan(1);
                 assertThat(cluster.leaderStats).isEmpty();
@@ -155,7 +156,7 @@ class AsyncIggyTcpClientReplicaRequestTest {
                 int rosterReads = cluster.rosterReads.get();
 
                 assertServerError(
-                        client.sendBinaryRequestToReplica(2, GET_STATS_CODE, new byte[0]),
+                        client.sendBinaryRequestToReplica(GET_STATS_CODE, new byte[0], 2),
                         IggyErrorCode.INVALID_IDENTIFIER.getCode());
 
                 assertThat(cluster.rosterReads).hasValue(rosterReads + 1);
@@ -169,21 +170,21 @@ class AsyncIggyTcpClientReplicaRequestTest {
     }
 
     @Test
-    void shouldRejectReplicatedPollAndSessionControlCodesBeforeSending() throws Exception {
+    void shouldRejectReplicatedPartitionReadAndSessionControlCodesBeforeSending() throws Exception {
         try (Cluster cluster = new Cluster(1, stats -> Response.success(OPERATION_NON_REPLICATED, backupStats()))) {
             AsyncIggyTcpClient client = cluster.signIn();
             try {
                 int requests = cluster.leaderRequests.get();
 
-                for (int code : List.of(CREATE_STREAM_CODE, POLL_CODE, LOGIN_CODE, LOGOUT_CODE)) {
+                for (int code : List.of(CREATE_STREAM_CODE, POLL_CODE, GET_OFFSET_CODE, LOGIN_CODE, LOGOUT_CODE)) {
                     assertServerError(
-                            client.sendBinaryRequestToReplica(1, code, new byte[0]),
+                            client.sendBinaryRequestToReplica(code, new byte[0], 1),
                             IggyErrorCode.INVALID_COMMAND.getCode());
                 }
 
                 assertThat(cluster.leaderRequests).hasValue(requests);
                 assertThat(cluster.backupStats).isEmpty();
-                assertThat(client.sendBinaryRequestToReplica(1, GET_STATS_CODE, new byte[0])
+                assertThat(client.sendBinaryRequestToReplica(GET_STATS_CODE, new byte[0], 1)
                                 .get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS))
                         .isEqualTo(BACKUP_STATS);
             } finally {

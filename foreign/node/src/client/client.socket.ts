@@ -72,6 +72,16 @@ const NOT_PRIMARY = 89;
 const INVALID_COMMAND = 3;
 const FEATURE_UNAVAILABLE = 5;
 const INVALID_IDENTIFIER = 6;
+// Session control, and the partition reads that need the primary and its incarnation.
+const REPLICA_REFUSED_CODES = new Set<number>([
+  COMMAND_CODE.LoginUser,
+  COMMAND_CODE.LogoutUser,
+  COMMAND_CODE.LoginRegister,
+  COMMAND_CODE.LoginWithAccessToken,
+  COMMAND_CODE.LoginRegisterWithAccessToken,
+  COMMAND_CODE.PollMessages,
+  COMMAND_CODE.GetOffset,
+]);
 const INVALID_SESSION_BINDING = 14004;
 const ROUTE_NAMESPACE_MISSING = new Set([1009, 1010, 2010, 2011, 3007]);
 const POLL_OPTIONS_SIZE = 9 + 4 + 1;
@@ -273,8 +283,7 @@ export class CommandResponseStream extends EventEmitter {
     deadline: number, signal: AbortSignal, lineage: number, retained?: ClientOperation): Promise<CommandResponse> {
     /** The session that the frame of the call belongs to. */
     let generation = this.routingGeneration;
-    // The caller chose the replica, so no partition route picks one.
-    const target = options.replica === undefined ? partitionRoute(command, body) : undefined;
+    const target = partitionRoute(command, body);
     const replicated = command !== LOGOUT.code && operationForCode(command) !== Operation.NonReplicated;
     const progress = command === COMMAND_CODE.PollMessages &&
       (body[body.length - 1] !== 0 || body[body.length - POLL_OPTIONS_SIZE] === PollingStrategyKind.Next);
@@ -1365,10 +1374,9 @@ const partitionRoute = (command: number, payload: Buffer): PartitionTarget | und
   return { query, key: query.toString('hex') };
 };
 
-/** A command the caller may send to a replica it chooses: non-replicated, not a poll, not session control. */
+/** A command the caller may send to a replica it chooses: non-replicated, not a partition read, not session control. */
 const isReplicaCommand = (command: number): boolean =>
-  !isLoginCommand(command) && command !== LOGOUT.code && command !== COMMAND_CODE.PollMessages &&
-  operationForCode(command) === Operation.NonReplicated;
+  !REPLICA_REFUSED_CODES.has(command) && operationForCode(command) === Operation.NonReplicated;
 
 const identifierEnd = (payload: Buffer, position: number, command: number): number => {
   if (position + IDENTIFIER_PREFIX_SIZE > payload.length)
