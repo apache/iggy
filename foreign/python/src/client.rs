@@ -47,6 +47,9 @@ use crate::permissions::Permissions as PyPermissions;
 use crate::producer::{IggyProducer, ProducerMode, u32_param as producer_u32_param};
 use crate::receive_message::{PartitionContext, PollingStrategy, ReceiveMessage};
 use crate::send_message::{SendMessage, SendMessagesResponse as PySendMessagesResponse};
+use crate::snapshot::{
+    SnapshotCompression as PySnapshotCompression, SystemSnapshotType as PySystemSnapshotType,
+};
 use crate::stats::Stats as PyStats;
 use crate::stream::{Stream, StreamDetails};
 use crate::topic::{IggyExpiry, MaxTopicSize, Topic, TopicDetails};
@@ -263,48 +266,44 @@ impl IggyClient {
     /// global permission.
     ///
     /// Args:
-    ///     snapshot_compression: Archive compression method. One of `"stored"`,
-    ///         `"deflated"`, `"bzip2"`, `"zstd"`, `"lzma"`, `"xz"`.
-    ///     snapshot_types: Data to include in the snapshot. Each entry is one
-    ///         of `"filesystem_overview"`, `"process_list"`, `"resource_usage"`,
-    ///         `"test"`, `"server_logs"`, `"server_config"`, `"all"`. `"all"`
-    ///         cannot be combined with any other snapshot type.
+    ///     snapshot_compression: Archive compression method as a
+    ///         `SnapshotCompression` enum.
+    ///     snapshot_types: Data to include in the snapshot as a list of
+    ///         `SystemSnapshotType` enums. `SystemSnapshotType.All` cannot be
+    ///         combined with any other snapshot type.
     ///
     /// Returns:
     ///     An awaitable that resolves to the ZIP archive `bytes`.
     ///
     /// Raises:
-    ///     ValueError: If `snapshot_compression` is empty or unknown, `snapshot_types`
-    ///         is empty, or any entry in `snapshot_types` is unknown.
+    ///     TypeError: If `snapshot_compression` is not a `SnapshotCompression`
+    ///         or `snapshot_types` contains elements other than `SystemSnapshotType`.
+    ///     ValueError: If `snapshot_types` is empty.
     ///     RuntimeError: If the client is not connected, the session is not
-    ///         authenticated, the user lacks the permission, `"all"` is
+    ///         authenticated, the user lacks the permission, `SystemSnapshotType.All` is
     ///         combined with another snapshot type, the 30-second binary
     ///         operation deadline expires, or the request fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[bytes]", imports=("collections.abc")))]
     fn snapshot<'a>(
         &self,
         py: Python<'a>,
-        snapshot_compression: &str,
-        snapshot_types: Vec<String>,
+        snapshot_compression: PySnapshotCompression,
+        snapshot_types: Vec<PySystemSnapshotType>,
     ) -> PyResult<Bound<'a, PyAny>> {
-        let compression = match snapshot_compression.trim() {
-            "" => return Err(PyValueError::new_err("snapshot_compression must not be empty")),
-            value => SnapshotCompression::from_str(value).map_err(to_value_error)?,
-        };
         if snapshot_types.is_empty() {
             return Err(PyValueError::new_err("snapshot_types must not be empty"));
         }
 
         let mut parsed_types = Vec::with_capacity(snapshot_types.len());
         for snapshot_type in snapshot_types {
-            let parsed =
-                SystemSnapshotType::from_str(snapshot_type.trim()).map_err(to_value_error)?;
-            if !parsed_types.contains(&parsed) {
-                parsed_types.push(parsed);
+            let rust_type: SystemSnapshotType = snapshot_type.into();
+            if !parsed_types.contains(&rust_type) {
+                parsed_types.push(rust_type);
             }
         }
 
         let inner = self.inner.clone();
+        let compression: SnapshotCompression = snapshot_compression.into();
         future_into_py(py, async move {
             let snapshot = inner
                 .snapshot(compression, parsed_types)

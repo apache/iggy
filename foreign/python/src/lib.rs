@@ -27,6 +27,7 @@ mod permissions;
 mod producer;
 mod receive_message;
 mod send_message;
+mod snapshot;
 mod stats;
 mod stream;
 mod topic;
@@ -52,6 +53,7 @@ use producer::{
 use pyo3::prelude::*;
 use receive_message::{ConsumerPosition, PartitionContext, PollingStrategy, ReceiveMessage};
 use send_message::{SendMessage, SendMessagesConfirmation, SendMessagesResponse};
+use snapshot::{SnapshotCompression, SystemSnapshotType};
 use stats::{CacheMetrics, CacheMetricsKey, Stats};
 use stream::{Stream, StreamDetails};
 use topic::{IggyExpiry, MaxTopicSize, Partition, Topic, TopicDetails};
@@ -120,5 +122,7 @@ fn apache_iggy(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<GlobalPermissions>()?;
     m.add_class::<StreamPermissions>()?;
     m.add_class::<TopicPermissions>()?;
+    m.add_class::<SnapshotCompression>()?;
+    m.add_class::<SystemSnapshotType>()?;
     Ok(())
 }
