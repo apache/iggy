@@ -864,7 +864,7 @@ SendMessagesResponse SendMessagesResponse::FromFfi(ffi::SendMessagesResponse res
     std::vector<SendMessagesConfirmation> confirmations;
     confirmations.reserve(response.confirmations.size());
     for (auto &confirmation : response.confirmations) {
-        confirmations.push_back(SendMessagesConfirmation::FromFfi(std::move(confirmation)));
+        confirmations.push_back(SendMessagesConfirmation::FromFfi(confirmation));
     }
     return SendMessagesResponse(std::move(confirmations));
 }

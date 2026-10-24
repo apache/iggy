@@ -6009,7 +6009,7 @@ class ClusterNode final {
     ClusterNode(std::string name, std::string ip, TransportEndpoints endpoints, std::string role, std::string status)
         : name_(std::move(name)),
           ip_(std::move(ip)),
-          endpoints_(std::move(endpoints)),
+          endpoints_(endpoints),
           role_(std::move(role)),
           status_(std::move(status)) {}
 
