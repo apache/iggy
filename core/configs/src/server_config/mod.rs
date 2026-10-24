@@ -24,6 +24,7 @@
 pub mod cluster;
 pub mod defaults;
 pub mod displays;
+pub mod external_auth;
 pub mod message_bus;
 pub mod metadata;
 pub mod node;
