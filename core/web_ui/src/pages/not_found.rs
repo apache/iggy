@@ -27,7 +27,7 @@ pub fn NotFound(segments: Vec<String>) -> Element {
             div { class: "auth-card",
                 h1 { "Page not found" }
                 p { class: "muted", "/{path}" }
-                Link { to: Route::Streams {}, "Back to the dashboard" }
+                Link { to: Route::Overview {}, "Back to the dashboard" }
             }
         }
     }

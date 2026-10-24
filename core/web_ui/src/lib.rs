@@ -39,7 +39,7 @@ mod route {
     use dioxus::prelude::*;
 
     use crate::pages::{
-        DashboardLayout, Messages, NotFound, SignIn, StreamPage, Streams, TopicPage,
+        DashboardLayout, Messages, NotFound, Overview, SignIn, StreamPage, Streams, TopicPage,
     };
 
     #[derive(Debug, Clone, PartialEq, Routable)]
@@ -49,7 +49,9 @@ mod route {
         #[route("/auth/sign-in")]
         SignIn {},
         #[layout(DashboardLayout)]
-            #[redirect("/dashboard", || Route::Streams {})]
+            #[redirect("/dashboard", || Route::Overview {})]
+            #[route("/dashboard/overview")]
+            Overview {},
             #[route("/dashboard/streams")]
             Streams {},
             #[route("/dashboard/streams/:stream_id")]
