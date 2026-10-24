@@ -4262,6 +4262,7 @@ where
         self.owner_install_barrier = 0;
         self.observed_view = self.consensus().view();
         self.repair = None;
+        self.forget_recovered_commit();
         self.transfer_offer_cache.borrow_mut().take();
     }
 

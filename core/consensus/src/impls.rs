@@ -1131,6 +1131,9 @@ pub enum VsrAction {
     RetransmitPrepares {
         targets: Vec<(PrepareHeader, Vec<u8>)>,
     },
+    /// Re-submit the primary's own WAL write for `op` and re-arm its self-ack.
+    /// Partition plane only; metadata re-acks via `repair_primary_self_acks`.
+    RetryLocalWrite { op: u64 },
     /// Rebuild the pipeline from the journal after a view change.
     ///
     /// The new primary must re-populate its pipeline with uncommitted ops
@@ -1348,6 +1351,13 @@ where
     /// or below `view` is stale and inert because the catch-up guard is a
     /// strict `>`.
     observed_newer_view: Cell<u32>,
+
+    /// `(view, replica)` of the highest-view sender heard acting as that view's
+    /// primary: a partition `Commit` heartbeat, which only a `Normal` primary
+    /// sends, or a state-transfer offer, which only a primary serves. A replica
+    /// that cannot rejoin keeps electing alone, so its own `view` names a
+    /// primary nobody follows.
+    observed_primary: Cell<Option<(u32, u8)>>,
 
     /// Highest op number that has been locally executed (state machine applied,
     /// client table updated). Advances one-by-one in `commit_journal` (backup)
@@ -1870,6 +1880,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             status: Cell::new(Status::Recovering),
             state_transfer_stage: Cell::new(StateTransferStage::Idle),
             observed_newer_view: Cell::new(0),
+            observed_primary: Cell::new(None),
             sequencer: LocalSequencer::new(0),
             commit_min: Cell::new(0),
             commit_max: Cell::new(0),
@@ -3527,33 +3538,41 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         );
     }
 
-    /// Collect uncommitted pipeline entries that should be retransmitted.
+    /// What the prepare timeout has to re-drive, as `(retransmits, local retries)`.
     ///
-    /// Returns `(PrepareHeader, Vec<u8>)` pairs: each op that hasn't reached
-    /// quorum paired with the replica IDs that haven't acked it.
-    fn retransmit_targets(&self) -> Vec<(PrepareHeader, Vec<u8>)> {
+    /// Retransmits pair an op short of quorum with the backups missing its ack.
+    /// Local retries are the ops short of quorum this primary has not acked.
+    fn prepare_timeout_targets(&self) -> (Vec<(PrepareHeader, Vec<u8>)>, Vec<u64>) {
         let pipeline = self.pipeline.borrow();
         let current_op = self.sequencer.current_sequence();
         let replica_count = self.replica_count;
-        let mut targets = Vec::new();
+        let self_replica = self.replica;
+        let mut retransmits = Vec::new();
+        let mut local_retries = Vec::new();
 
         let mut op = self.commit_max() + 1;
         while op <= current_op {
             if let Some(entry) = pipeline.entry_by_op(op)
                 && !entry.ok_quorum_received
             {
-                let missing: Vec<u8> = (0..replica_count).filter(|&r| !entry.has_ack(r)).collect();
+                if !entry.has_ack(self_replica) && !self.loopback_holds_prepare_ok(op) {
+                    local_retries.push(op);
+                }
+                let missing: Vec<u8> = (0..replica_count)
+                    .filter(|&replica| replica != self_replica && !entry.has_ack(replica))
+                    .collect();
                 if !missing.is_empty() {
-                    targets.push((entry.header, missing));
+                    retransmits.push((entry.header, missing));
                 }
             }
             op += 1;
         }
 
-        targets
+        (retransmits, local_retries)
     }
 
-    /// Retransmit uncommitted prepares when the prepare timeout fires.
+    /// Retransmit uncommitted prepares when the prepare timeout fires, and
+    /// retry the local write for any that still lack this primary's own ack.
     ///
     /// Only acts on the primary in normal status with a non-empty pipeline.
     /// Resets the timeout with backoff on each firing.
@@ -3565,10 +3584,6 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         // entry's elapsed ticks. The stop below is now a backstop for a pipeline
         // emptied by a path that skipped that maintenance, not the primary
         // disarm.
-        //
-        // TODO(prepare-timeout): special-case "all remote acks present, own
-        // journal write is the laggard" by retrying the local write instead of
-        // retransmitting to peers that already acked.
         //
         // Every early return below must stop or back off the timeout.
         // `fired()` stays true until the timer is rearmed, so returning
@@ -3587,8 +3602,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             return Vec::new();
         }
 
-        let targets = self.retransmit_targets();
-        if targets.is_empty() {
+        let (targets, local_retries) = self.prepare_timeout_targets();
+        if targets.is_empty() && local_retries.is_empty() {
             // In-flight ops all have their acks; re-check after backoff.
             self.timeouts.borrow_mut().backoff(TimeoutKind::Prepare);
             return Vec::new();
@@ -3598,12 +3613,24 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             replica = self.replica,
             view = self.view.get(),
             targets = targets.len(),
-            first_op = targets.first().map(|(h, _)| h.op),
-            "prepare timeout: retransmitting un-acked prepares"
+            first_retransmit_op = targets.first().map(|(h, _)| h.op),
+            local_retries = local_retries.len(),
+            first_local_retry_op = local_retries.first(),
+            "prepare timeout: re-driving un-acked prepares"
         );
         self.timeouts.borrow_mut().backoff(TimeoutKind::Prepare);
 
-        vec![VsrAction::RetransmitPrepares { targets }]
+        let mut actions =
+            Vec::with_capacity(local_retries.len() + usize::from(!targets.is_empty()));
+        actions.extend(
+            local_retries
+                .into_iter()
+                .map(|op| VsrAction::RetryLocalWrite { op }),
+        );
+        if !targets.is_empty() {
+            actions.push(VsrAction::RetransmitPrepares { targets });
+        }
+        actions
     }
 
     /// Primary heartbeat: send commit point to all backups so they know
@@ -4063,6 +4090,53 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         if view > self.observed_newer_view.get() {
             self.observed_newer_view.set(view);
         }
+    }
+
+    /// Record a frame from `replica` stamped with `view`, if `replica` is that
+    /// view's primary. Monotone in `view`.
+    pub fn observe_primary(&self, view: u32, replica: u8) {
+        if replica != self.primary_index(view) {
+            return;
+        }
+        if self
+            .observed_primary
+            .get()
+            .is_none_or(|(observed_view, _)| view > observed_view)
+        {
+            self.observed_primary.set(Some((view, replica)));
+        }
+    }
+
+    /// Drop the observed primary if it is `replica`, after a request to it
+    /// failed. A dead primary sends nothing newer, so a kept hint would steer
+    /// every later rotation back to it.
+    pub fn forget_primary(&self, replica: u8) {
+        if self
+            .observed_primary
+            .get()
+            .is_some_and(|(_, observed)| observed == replica)
+        {
+            self.observed_primary.set(None);
+        }
+    }
+
+    /// The replica most likely to be the group's primary, or `None` when this
+    /// replica cannot tell.
+    ///
+    /// `primary_index(view)` only while `view` is the view the log was adopted
+    /// in: past it, `view` may have climbed through elections nobody joined.
+    /// An observed primary counts only from `log_view` on, because below it the
+    /// group has provably moved on.
+    #[must_use]
+    pub fn primary_hint(&self) -> Option<u8> {
+        let log_view = self.log_view.get();
+        if let Some((view, replica)) = self.observed_primary.get()
+            && view >= log_view
+        {
+            return Some(replica);
+        }
+        let view = self.view.get();
+        (view == log_view).then(|| self.primary_index(view))
     }
 
     #[must_use]
@@ -4843,6 +4917,15 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             .flatten()
     }
 
+    /// Whether the accepted `StartView` names `header`'s prepare identity.
+    #[must_use]
+    pub fn adopted_view_vouches_for(&self, header: &PrepareHeader) -> bool {
+        self.adopted_view
+            .borrow()
+            .as_ref()
+            .is_some_and(|adopted| adopted.vouches_for(header))
+    }
+
     /// The accepted `StartView`'s view and advertised head, including after repair.
     #[must_use]
     pub fn adopted_view_head(&self) -> Option<(u32, u64)> {
@@ -5419,6 +5502,17 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                 notifier.notify();
             }
         }
+    }
+
+    /// Whether the undrained loopback already carries this replica's `PrepareOk` for `op`.
+    fn loopback_holds_prepare_ok(&self, op: u64) -> bool {
+        self.loopback_queue.borrow().iter().any(|message| {
+            message.header().command == Command::PrepareOk
+                && bytemuck::checked::try_from_bytes::<PrepareOkHeader>(
+                    &message.as_slice()[..size_of::<PrepareOkHeader>()],
+                )
+                .is_ok_and(|header| header.op == op)
+        })
     }
 
     /// Drain all pending loopback messages into `buf`, leaving the queue empty.
@@ -7864,6 +7958,151 @@ mod vsr_consensus_tests {
         );
     }
 
+    /// A backup's `PrepareOk` for `header`, in the primary's current view.
+    fn backup_ack(
+        consensus: &VsrConsensus<StageNoopBus>,
+        replica: u8,
+        header: &PrepareHeader,
+    ) -> PrepareOkHeader {
+        PrepareOkHeader {
+            command: Command::PrepareOk,
+            replica,
+            view: consensus.view(),
+            op: header.op,
+            prepare_checksum: header.checksum,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn given_every_backup_ack_when_the_prepare_timeout_fires_should_retry_the_local_write() {
+        // Two replicas need both votes, so with the backup's ack in the only
+        // one that can still commit op 1 is this primary's own, and a
+        // retransmit cannot produce it: the send to self is a no-op.
+        let consensus = VsrConsensus::new(1, 0, 2, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        let prepare = projected_prepare(1, 0);
+        pipeline(&consensus, &prepare);
+        assert!(matches!(
+            consensus.handle_prepare_ok(
+                PlaneKind::Metadata,
+                &backup_ack(&consensus, 1, prepare.header())
+            ),
+            PrepareOkOutcome::Accepted {
+                quorum_reached: false,
+                ..
+            }
+        ));
+
+        let actions = consensus.handle_prepare_timeout();
+        assert!(
+            matches!(actions.as_slice(), [VsrAction::RetryLocalWrite { op: 1 }]),
+            "expected only a local retry, got {actions:?}"
+        );
+        assert!(
+            prepare_ticking(&consensus),
+            "the retry backs the timer off rather than stopping it"
+        );
+    }
+
+    #[test]
+    fn given_a_solo_primary_when_the_prepare_timeout_fires_should_retry_the_local_write_not_itself()
+    {
+        let consensus = VsrConsensus::new(1, 0, 1, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        pipeline(&consensus, &projected_prepare(1, 0));
+
+        let actions = consensus.handle_prepare_timeout();
+        assert!(
+            matches!(actions.as_slice(), [VsrAction::RetryLocalWrite { op: 1 }]),
+            "a solo group has nobody to retransmit to, got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn given_a_silent_backup_and_no_self_ack_when_the_prepare_timeout_fires_should_retry_locally_and_retransmit_to_the_silent_backup()
+     {
+        // Backup 1 acked, backup 2 is silent, and this primary's own write is
+        // still outstanding. Each missing vote gets its own remedy, and the
+        // retransmit names neither the acked backup nor the primary.
+        let consensus = VsrConsensus::new(1, 0, 3, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        let prepare = projected_prepare(1, 0);
+        pipeline(&consensus, &prepare);
+        consensus.handle_prepare_ok(
+            PlaneKind::Metadata,
+            &backup_ack(&consensus, 1, prepare.header()),
+        );
+
+        let actions = consensus.handle_prepare_timeout();
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, VsrAction::RetryLocalWrite { op: 1 })),
+            "the primary's own vote is still missing, got {actions:?}"
+        );
+        let targets = actions
+            .iter()
+            .find_map(|action| match action {
+                VsrAction::RetransmitPrepares { targets } => Some(targets),
+                _ => None,
+            })
+            .expect("the silent backup still needs the prepare");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].0.op, 1);
+        assert_eq!(targets[0].1, vec![2], "neither self nor the acked backup");
+        assert_eq!(actions.len(), 2, "{actions:?}");
+    }
+
+    #[test]
+    fn given_a_self_ack_queued_in_loopback_when_the_prepare_timeout_fires_should_not_retry_the_local_write()
+     {
+        let consensus = VsrConsensus::new(1, 0, 1, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        let prepare = projected_prepare(1, 0);
+        pipeline(&consensus, &prepare);
+        let self_ack = backup_ack(&consensus, 0, prepare.header());
+        consensus.push_loopback(
+            Message::<PrepareOkHeader>::new(size_of::<PrepareOkHeader>())
+                .transmute_header(|_, header: &mut PrepareOkHeader| {
+                    *header = PrepareOkHeader {
+                        size: u32::try_from(size_of::<PrepareOkHeader>()).unwrap(),
+                        ..self_ack
+                    };
+                    header.seal();
+                })
+                .into_generic(),
+        );
+
+        let actions = consensus.handle_prepare_timeout();
+        assert!(
+            actions.is_empty(),
+            "the queued self-ack already carries this vote, got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn given_a_self_acked_op_short_of_quorum_when_the_prepare_timeout_fires_should_only_retransmit()
+    {
+        let consensus = VsrConsensus::new(1, 0, 3, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        let prepare = projected_prepare(1, 0);
+        pipeline(&consensus, &prepare);
+        consensus.handle_prepare_ok(
+            PlaneKind::Metadata,
+            &backup_ack(&consensus, 0, prepare.header()),
+        );
+
+        let actions = consensus.handle_prepare_timeout();
+        match actions.as_slice() {
+            [VsrAction::RetransmitPrepares { targets }] => {
+                assert_eq!(targets.len(), 1);
+                assert_eq!(targets[0].1, vec![1, 2]);
+            }
+            other => panic!("expected one retransmit to both backups, got {other:?}"),
+        }
+    }
+
     #[test]
     fn clearing_the_pipeline_disarms_the_prepare_timeout() {
         // A view change re-prepares from the new primary, so nothing left here is
@@ -8442,6 +8681,95 @@ mod probe_answer_tests {
             "announced commit {commit} exceeds head {op}, which StartViewHeader::validate \
              rejects and the dispatcher panics on"
         );
+    }
+}
+
+#[cfg(test)]
+mod primary_hint_tests {
+    //! Which replica a partition peer choice treats as the group's primary.
+
+    use super::*;
+    use crate::LocalPipeline;
+    use crate::test_bus::NoopBus;
+
+    /// Replica 0 of five whose log was adopted in `log_view` and whose own
+    /// view has since moved to `view`.
+    fn replica(view: u32, log_view: u32) -> VsrConsensus<NoopBus> {
+        let mut consensus = VsrConsensus::new(1, 0, 5, 7, NoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.set_view(view);
+        consensus.set_log_view(log_view);
+        consensus
+    }
+
+    #[test]
+    fn given_a_view_matching_log_view_when_nothing_was_observed_should_name_its_primary() {
+        assert_eq!(replica(12, 12).primary_hint(), Some(2));
+    }
+
+    #[test]
+    fn given_a_view_ratcheted_past_log_view_when_nothing_was_observed_should_have_no_hint() {
+        assert_eq!(replica(58, 11).primary_hint(), None);
+    }
+
+    #[test]
+    fn given_a_view_ratcheted_past_log_view_when_the_group_primary_was_heard_should_name_it() {
+        let consensus = replica(58, 11);
+        consensus.observe_primary(21, 1);
+        assert_eq!(consensus.primary_hint(), Some(1));
+    }
+
+    #[test]
+    fn given_a_view_ratcheted_past_log_view_when_the_primary_of_log_view_was_heard_should_name_it()
+    {
+        let consensus = replica(58, 11);
+        let primary = consensus.primary_index(11);
+        consensus.observe_primary(11, primary);
+        assert_eq!(consensus.primary_hint(), Some(primary));
+    }
+
+    #[test]
+    fn given_an_observed_primary_when_it_is_forgotten_should_fall_back_to_no_hint() {
+        let consensus = replica(58, 11);
+        consensus.observe_primary(21, 1);
+        consensus.forget_primary(1);
+        assert_eq!(consensus.primary_hint(), None);
+        consensus.observe_primary(21, 1);
+        assert_eq!(
+            consensus.primary_hint(),
+            Some(1),
+            "a forgotten primary that speaks again is heard again"
+        );
+    }
+
+    #[test]
+    fn given_an_observed_primary_when_another_replica_is_forgotten_should_keep_it() {
+        let consensus = replica(58, 11);
+        consensus.observe_primary(21, 1);
+        consensus.forget_primary(2);
+        assert_eq!(consensus.primary_hint(), Some(1));
+    }
+
+    #[test]
+    fn given_a_sender_that_is_not_its_view_primary_when_observed_should_ignore_it() {
+        let consensus = replica(58, 11);
+        consensus.observe_primary(21, 2);
+        assert_eq!(consensus.primary_hint(), None);
+    }
+
+    #[test]
+    fn given_a_primary_below_log_view_when_observed_should_ignore_it() {
+        let consensus = replica(58, 11);
+        consensus.observe_primary(8, 3);
+        assert_eq!(consensus.primary_hint(), None);
+    }
+
+    #[test]
+    fn given_an_older_view_primary_when_observed_after_a_newer_one_should_keep_the_newer() {
+        let consensus = replica(58, 11);
+        consensus.observe_primary(21, 1);
+        consensus.observe_primary(12, 2);
+        assert_eq!(consensus.primary_hint(), Some(1));
     }
 }
 

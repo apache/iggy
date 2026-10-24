@@ -110,7 +110,7 @@
 //! nobody to answer, so the counter is the only record it existed.
 //!
 //! A shed or discarded *prepare* is not recovered by retransmit once its op has
-//! reached quorum (`consensus::retransmit_targets` skips entries with
+//! reached quorum (`consensus::prepare_timeout_targets` skips entries with
 //! `ok_quorum_received`), so the backup gap-stops. `tick_partitions` opens a
 //! repair session for it: its level-triggered detector arms once a partition has
 //! been gap-stopped for `[cluster] repair_gap_debounce_interval`, independently of the
@@ -4027,6 +4027,8 @@ mod tests {
                 floor: None,
                 peer: PEER,
                 idle_ticks: 0,
+                floor_pulled_from: 0,
+                requested_from: Some(1),
             });
             for op in 1..=8 {
                 let parent = partition.consensus().last_prepare_checksum();

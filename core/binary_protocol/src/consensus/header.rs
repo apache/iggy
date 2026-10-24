@@ -1260,6 +1260,14 @@ impl PrepareHeader {
         covered.view = 0;
         u128::from(twox_hash::XxHash3_64::oneshot(bytemuck::bytes_of(&covered)))
     }
+
+    /// Whether a parent chain can be proven down from this header. An unsealed
+    /// header names no identity, and a zero `parent` would link anything below it;
+    /// op 1 is the one prepare whose real parent is zero.
+    #[must_use]
+    pub const fn anchors_chain(&self) -> bool {
+        self.checksum != CHECKSUM_UNSEALED && (self.parent != CHECKSUM_UNSEALED || self.op == 1)
+    }
 }
 
 // RepairPrepareHeader - repair peer -> recovering replica (journal repair)

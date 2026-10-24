@@ -35,10 +35,10 @@ pub use router::CONSENSUS_TICK_INTERVAL;
 #[cfg(feature = "simulator")]
 use consensus::LocalPipeline;
 use consensus::{
-    ChunkProgress, CommitOutcome, Consensus, ConsensusClock, DVC_HEADERS_MAX, DvcHeaderKind,
-    DvcSuffix, FatalReason, MergedLog, MetadataHandle, MuxPlane, PartitionsHandle, Pipeline, Plane,
-    PlaneKind, RepairEvidence, STATE_TRANSFER_MAX_DECODE_RETRIES, STATE_TRANSFER_MAX_STALL_RETRIES,
-    Sequencer, StartViewRefusal, Status, VsrAction, VsrConsensus,
+    AdoptedView, ChunkProgress, CommitOutcome, Consensus, ConsensusClock, DVC_HEADERS_MAX,
+    DvcHeaderKind, DvcSuffix, FatalReason, MergedLog, MetadataHandle, MuxPlane, PartitionsHandle,
+    Pipeline, Plane, PlaneKind, RepairEvidence, STATE_TRANSFER_MAX_DECODE_RETRIES,
+    STATE_TRANSFER_MAX_STALL_RETRIES, Sequencer, StartViewRefusal, Status, VsrAction, VsrConsensus,
     build_deny_reply_from_request_header, dvc_blank, dvc_header_kind, encode_prepare_headers,
     fatal, repaired_frontier_update, repaired_prepare_evidence, restamp_prepare_view,
     verify_prepare_integrity,
@@ -1067,8 +1067,8 @@ impl ShardFrame {
 ///
 /// The per-peer bus queues are bounded (`peer_queue_capacity`)
 /// and overrun frames drop silently, so an unbounded burst loses its own tail;
-/// the receiver pulls the window chunk by chunk instead (each walked
-/// `RepairDone` immediately requests the next chunk while progress holds).
+/// the receiver pulls the window chunk by chunk instead (each `RepairDone`
+/// whose held run reached the requested chunk asks for the next).
 ///
 /// Runtime default; the server overrides the live ceiling per shard from
 /// `[cluster] repair_chunk_max` at bootstrap.
@@ -2979,15 +2979,39 @@ where
     )
 }
 
+/// Whether a transfer descriptor comes from a replica that knows less than this
+/// one. The serving view is compared against `log_view`, not `view`: a replica
+/// that needs state transfer cannot join a view change, so its `view` runs ahead.
+const fn transfer_offer_is_behind(
+    serving_view: u32,
+    serving_commit_max: u64,
+    local_log_view: u32,
+    local_commit_max: u64,
+) -> bool {
+    serving_view < local_log_view || serving_commit_max < local_commit_max
+}
+
 /// The next replica to try after a transfer against `failed_peer` failed.
 ///
-/// Prefers the view's primary: it is the only replica that can pass the serving
+/// Prefers the group's primary: it is the only replica that can pass the serving
 /// side's primary gate, so rotating by ring index alone can spend a
 /// full backoff round on a backup that must refuse -- and, worse, can land on a
 /// phantom view-0 primary of an empty group. Falls back to the ring step of
-/// [`next_repair_peer`].
-const fn next_transfer_peer(self_id: u8, failed_peer: u8, replica_count: u8, primary: u8) -> u8 {
-    if replica_count > 1 && primary != self_id && primary != failed_peer {
+/// [`next_repair_peer`], which also covers a cluster of two retrying the same peer.
+///
+/// `primary` is `None` when the group's primary is unknown, which also walks
+/// the ring.
+const fn next_transfer_peer(
+    self_id: u8,
+    failed_peer: u8,
+    replica_count: u8,
+    primary: Option<u8>,
+) -> u8 {
+    if let Some(primary) = primary
+        && replica_count > 1
+        && primary != self_id
+        && primary != failed_peer
+    {
         return primary;
     }
     next_repair_peer(self_id, failed_peer, replica_count)
@@ -3019,16 +3043,43 @@ const fn next_repair_peer(self_id: u8, failed_peer: u8, replica_count: u8) -> u8
     }
 }
 
+/// The replica to re-arm journal repair from after `failed_peer` spent its
+/// stall budget, forgetting `failed_peer` as the primary this replica heard.
+///
+/// Steps around the ring ([`next_repair_peer`]) unless the primary hint is new
+/// to the walk: forgetting the quiet peer moved it, or it names a primary the
+/// group moved to after this replica's log view. Returning to the log view's
+/// primary after each backup alternates between two peers.
+fn next_stalled_repair_peer<B, P>(consensus: &VsrConsensus<B, P>, failed_peer: u8) -> u8
+where
+    B: MessageBus,
+    P: Pipeline<Entry = consensus::PipelineEntry>,
+{
+    let failed_was_hint = consensus.primary_hint() == Some(failed_peer);
+    consensus.forget_primary(failed_peer);
+    let self_id = consensus.replica();
+    let log_view_primary = consensus.primary_index(consensus.log_view());
+    consensus
+        .primary_hint()
+        .filter(|&primary| {
+            primary != failed_peer
+                && primary != self_id
+                && (failed_was_hint || primary != log_view_primary)
+        })
+        .unwrap_or_else(|| next_repair_peer(self_id, failed_peer, consensus.replica_count()))
+}
+
 /// The primary to transfer from once journal repair stalled on the whole
 /// ring, or `None` while the spent session rotates as before.
 ///
 /// Called when a session spent its stall budget. The ring is spent once the
 /// rotations since the last progress, with this session, reach the number of
-/// other replicas. Only a rotation that opened a session counts. Each rotation
-/// steps one replica around the ring ([`next_repair_peer`]), so a lap from the
-/// primary asks every other replica once. That still counts sessions, not
-/// peers: when a rotation cannot open its session, the detector re-arms against
-/// the primary and the walk starts over without restarting the count.
+/// other replicas. Only a rotation that opened a session counts. While the
+/// primary hint holds still, each rotation steps one replica around the ring
+/// ([`next_stalled_repair_peer`]), so a lap from the primary asks every other
+/// replica once. That still counts sessions, not peers: when a rotation cannot
+/// open its session, the detector re-arms against the primary and the walk
+/// starts over without restarting the count.
 ///
 /// Only the primary serves a partition transfer, so only a backup in `Normal`
 /// that misses committed ops converts: a primary-elect repairs toward its
@@ -3047,7 +3098,11 @@ where
         && consensus.commit_min() < consensus.commit_max()
         && partition.transfer.is_none()
         && partition.transfer_rearm.is_none())
-    .then_some(consensus.primary_index(consensus.view()))
+    .then(|| {
+        consensus
+            .primary_hint()
+            .unwrap_or_else(|| consensus.primary_index(consensus.view()))
+    })
 }
 
 /// Consecutive transient refusals before the re-arm starts logging at `error`,
@@ -3085,7 +3140,9 @@ fn split_local_actions(actions: Vec<VsrAction>) -> (Vec<VsrAction>, Vec<VsrActio
     actions.into_iter().partition(|action| {
         matches!(
             action,
-            VsrAction::RebuildPipeline { .. } | VsrAction::CommitJournal
+            VsrAction::RebuildPipeline { .. }
+                | VsrAction::CommitJournal
+                | VsrAction::RetryLocalWrite { .. }
         )
     })
 }
@@ -4155,7 +4212,7 @@ where
         let parked_len = existing.as_ref().map_or(0, |entry| entry.frames.len());
         let namespace_bytes = existing.as_ref().map_or(0, |entry| entry.bytes);
         // A prepare is never shed on a byte budget. No client to answer, and
-        // recovery is slow: `consensus::retransmit_targets` skips an op that
+        // recovery is slow: `consensus::prepare_timeout_targets` skips an op that
         // already reached quorum, so shedding one gap-stops the backup until
         // `tick_partitions`' driver repairs it, where shedding a request costs
         // one retry. A request is refused the moment admitting it
@@ -5152,6 +5209,7 @@ where
             return;
         };
         partition.ensure_materialization_recovery();
+        let prior_log_view = partition.consensus().log_view();
         let actions = match partition.consensus().try_handle_start_view(
             PlaneKind::Partitions,
             &header,
@@ -5193,7 +5251,15 @@ where
             );
             return;
         }
-        if !partition.consensus().is_transferring() && partition.consensus().view_log_unproven() {
+        let adopted = !actions.is_empty();
+        let transferring = partition.consensus().is_transferring();
+        // Consumed only by an adoption that fences, so a transfer that aborts still
+        // leaves the recovered suffix to the next one.
+        let recovered = adopted && !transferring && partition.take_recovered_unproven();
+        let fence_below = adopted
+            && !transferring
+            && (recovered || prior_log_view < partition.consensus().view());
+        if !transferring && (partition.consensus().view_log_unproven() || fence_below) {
             // Any stream armed before this adoption belongs to the superseded
             // view. Repair bodies carry no nonce, so drop the receiving session
             // before reconciling or arming the new view's canonical range.
@@ -5203,6 +5269,9 @@ where
             // like it, pending-less adoptions (empty StartView suffix) still sweep
             // the relics above the adopted head.
             let pending = partition.consensus().pending_view_log();
+            if fence_below {
+                fence_view_window_below(partition, pending.as_ref());
+            }
             if partition.has_io_dispatcher()
                 && let Some(from_op) = partition_view_divergence_from(partition, pending.as_ref())
             {
@@ -5210,11 +5279,25 @@ where
                 return;
             }
             reconcile_partition_view_divergence(self.id, partition, pending.as_ref()).await;
+            if fence_below {
+                let truncating = partition.view_truncation_pending();
+                partition.prove_view_window().await;
+                // A Break queued a cut, and the pipeline rebuild must read the journal after it.
+                if !truncating && partition.view_truncation_pending() {
+                    partition.defer_view_adoption(actions, header.replica);
+                    return;
+                }
+            }
             if partition.consensus().view_log_unproven() {
                 self.maybe_request_partition_repair(partition, header.replica)
                     .await;
                 return;
             }
+        }
+        anchor_view_fence_from_start_view(self.id, partition, &header, suffix_body).await;
+        if partition.view_truncation_pending() {
+            partition.defer_view_adoption(actions, header.replica);
+            return;
         }
         self.finish_partition_view_adoption(
             IggyNamespace::from_raw(header.group),
@@ -5300,6 +5383,9 @@ where
         if let Some(ref consensus) = planes.0.consensus
             && consensus.group() == header.group
         {
+            // Ahead of `handle_commit`, which drops a lower-view heartbeat from
+            // the real primary once this replica's view climbed alone.
+            consensus.observe_primary(header.view, header.replica);
             match consensus.handle_commit(&header) {
                 CommitOutcome::Advanced => {
                     // Mid-transfer the pre-install STM must not walk: the
@@ -5355,6 +5441,10 @@ where
             return;
         };
         let consensus = partition.consensus();
+        // Ahead of `handle_commit`: a replica whose view climbed through
+        // elections nobody joined drops the real primary's lower-view
+        // heartbeats there, and they are how it learns whom to repair from.
+        consensus.observe_primary(header.view, header.replica);
         match consensus.handle_commit(&header) {
             CommitOutcome::Advanced => {
                 if !partition.consensus().is_transferring() {
@@ -5608,6 +5698,7 @@ where
         // by the backup gap check (adoption already advanced its sequencer to
         // the head), so repair is the only channel that can deliver them.
         let to_op = repair_serve_ceiling(&header, partition.consensus());
+        let fence_floor = partition.view_fenced().then(|| partition.fence_floor());
         // `None` means the journal holds NOTHING, not "nothing was evicted":
         // the partition journal is memory-only and `clear_all` wipes the
         // evicted ring with it, so a freshly installed or freshly restarted
@@ -5647,6 +5738,14 @@ where
         let mut served_through = from_op.saturating_sub(1);
         for op in from_op..=chunk_end {
             if !partition.consensus().view_log_entry_proven(op) {
+                break;
+            }
+            let Some(held) = partition.log.journal().inner.repair_header(op) else {
+                break;
+            };
+            if !fenced_serve_admits(fence_floor, op, || {
+                partition.consensus().adopted_view_vouches_for(&held)
+            }) {
                 break;
             }
             let Some(entry) = partition.log.journal().inner.repair_entry(op) else {
@@ -5953,6 +6052,7 @@ where
         if closes_proof_gap {
             let pending = partition.consensus().pending_view_log();
             reconcile_partition_view_divergence(self.id, partition, pending.as_ref()).await;
+            anchor_view_fence_from_view_log(partition, pending.as_ref()).await;
         }
         if ingest == RepairIngest::Unvouched {
             tracing::debug!(
@@ -5962,6 +6062,8 @@ where
                 "refusing a repaired partition prepare the view log does not vouch for"
             );
             self.retarget_partition_repair(partition).await;
+        } else if closes_proof_gap {
+            self.request_moved_proof_op(partition).await;
         }
     }
 
@@ -6229,8 +6331,10 @@ where
                 // op (the peer's served-through claim proves nothing about
                 // delivery on a lossy bus). Proof moves backward through gaps,
                 // then may need a higher canonical header's body. Either change
-                // pulls the next chunk without waiting for the retry timer.
-                let before = partition.consensus().commit_min();
+                // pulls the next chunk without waiting for the retry timer, and so
+                // do a held run that reached the chunk just requested and a
+                // floor-held resident prefix that grew. A shorter run is left to
+                // the retry timer.
                 if let partitions::RepairConclusion::FloorRefused { floor, to_op } =
                     partition.complete_repair(&config).await
                 {
@@ -6290,13 +6394,25 @@ where
                         "partition journal repair complete"
                     );
                 } else {
-                    let commit_min = partition.consensus().commit_min();
+                    let repaired_through = partition.held_through();
                     let proof_op = partition.consensus().view_log_repair_op();
-                    let next = partition.repair.as_mut().and_then(|live| {
-                        let from_op = proof_op.filter(|&op| op != live.from_op).or_else(|| {
-                            partition_repair_next_chunk(before, commit_min, live.fetch_to_op)
-                        })?;
+                    let from_op = partition
+                        .repair
+                        .as_ref()
+                        .and_then(|live| {
+                            proof_op.filter(|&op| op != live.from_op).or_else(|| {
+                                partition_repair_next_chunk(
+                                    live.requested_from,
+                                    repaired_through,
+                                    live.fetch_to_op,
+                                )
+                            })
+                        })
+                        .or_else(|| partition.next_floor_pull());
+                    let next = from_op.and_then(|from_op| {
+                        let live = partition.repair.as_mut()?;
                         live.from_op = from_op;
+                        live.requested_from = Some(from_op);
                         Some((live.peer, live.nonce, from_op, live.fetch_to_op))
                     });
                     if let Some((peer, nonce, from_op, to_op)) = next {
@@ -6489,6 +6605,14 @@ where
             // already holds a header for, so the scan would report a gap nothing
             // fills. Backups reach this on StartView adoption; a primary-elect has no
             // adoption to hang it off.
+            // `log_view` still names the old log here: it is raised only when the
+            // view starts.
+            let recovered = partition.take_recovered_unproven();
+            let fence_below =
+                recovered || partition.consensus().log_view() < partition.consensus().view();
+            if fence_below {
+                fence_view_window_below(partition, Some(&pending));
+            }
             if partition.has_io_dispatcher()
                 && let Some(from_op) = partition_view_divergence_from(partition, Some(&pending))
             {
@@ -6496,6 +6620,9 @@ where
                 return;
             }
             reconcile_partition_view_divergence(self.id, partition, Some(&pending)).await;
+            if fence_below {
+                partition.prove_view_window().await;
+            }
             if partition.view_truncation_pending()
                 || (partition.consensus().view_log_unproven()
                     && partition.consensus().view_log_repair_op().is_none())
@@ -6548,6 +6675,11 @@ where
                 // the metadata plane's view repair.
                 self.request_partition_view_repair(partition, missing_op, pending.op_head, None)
                     .await;
+                return;
+            }
+            // Everything is held, but not yet proven to be the view's: starting
+            // now commits whatever this replica journaled in an older view.
+            if partition.view_fenced() {
                 return;
             }
 
@@ -6692,7 +6824,7 @@ where
     ///
     /// Two rings, because two things decide who can serve. A `Normal` backup is
     /// repairing its committed tail and any replica ahead of it will do, so it
-    /// walks the whole cluster ring ([`next_repair_peer`]). A primary-elect is
+    /// walks the whole cluster ring ([`next_stalled_repair_peer`]). A primary-elect is
     /// repairing toward a merged log, and only the `DoViewChange` senders that
     /// named the op can serve it: walking the whole ring lands on a replica that
     /// answers `RangeEvicted` for a range it never held.
@@ -6746,7 +6878,7 @@ where
             return;
         }
 
-        let next_peer = next_repair_peer(consensus.replica(), peer, consensus.replica_count());
+        let next_peer = next_stalled_repair_peer(consensus, peer);
         if next_peer == peer {
             // The ring had nobody else to offer (a solo group, or a two-replica
             // cluster whose only peer went quiet). Dropping the session is still
@@ -8394,6 +8526,19 @@ where
                         walk_cursor.get_or_insert(namespace);
                     }
                 }
+                // Entries that filled the window after its last proof re-drive
+                // nothing themselves once there is nothing left to fetch. A backup
+                // in a view change must not truncate what its DVC reported.
+                if consensus::repair_session_live(partition.consensus())
+                    && partition.view_fence_provable()
+                {
+                    if walks < PARTITION_WALKS_PER_TICK_MAX {
+                        walks += 1;
+                        partition.commit_journal(partitions.config()).await;
+                    } else {
+                        walk_cursor.get_or_insert(namespace);
+                    }
+                }
                 if let Some(fault) = partition.fatal() {
                     if fatal.is_none() {
                         fatal = Some(fault.clone());
@@ -8440,27 +8585,49 @@ where
                     );
                     continue;
                 }
-                let repair_from = partition
-                    .consensus()
-                    .view_log_repair_op()
-                    .unwrap_or_else(|| commit_min.saturating_add(1));
-                let due = partition.repair.as_mut().and_then(|session| {
+                let proof_op = partition.consensus().view_log_repair_op();
+                let retry_due = partition.repair.as_mut().is_some_and(|session| {
                     if !session_live {
-                        return None;
+                        return false;
                     }
                     session.idle_ticks += 1;
-                    if session.idle_ticks < repair_retry_ticks {
-                        return None;
+                    if !partition_repair_retry_due(
+                        session.requested_from,
+                        session.idle_ticks,
+                        repair_retry_ticks,
+                    ) {
+                        return false;
                     }
                     session.idle_ticks = 0;
-                    session.from_op = repair_from;
-                    Some((
-                        session.peer,
-                        session.nonce,
-                        repair_from,
-                        session.fetch_to_op,
-                    ))
+                    true
                 });
+                // A pending proof names the hole to fetch. Otherwise the held run,
+                // not `commit_min`, marks progress: a fenced commit point cannot
+                // move until the whole window is held.
+                let pull_from = retry_due.then(|| partition.repair_pull_from()).flatten();
+                let due = partition
+                    .repair
+                    .as_mut()
+                    .filter(|_| retry_due)
+                    .and_then(|session| {
+                        let floor_pending = session.floor.is_some_and(|floor| floor > commit_min);
+                        let from_op = match proof_op {
+                            Some(op) => op,
+                            // A fully resident window puts a floor-held pull past
+                            // `fetch_to_op`, yet only a `RepairDone` concludes that
+                            // session, completing or refusing it. Asking again for
+                            // the last op draws one, and keeps the stall budget able
+                            // to rotate off a dead peer.
+                            None if floor_pending => pull_from?.min(session.fetch_to_op),
+                            None => pull_from?,
+                        };
+                        session.from_op = from_op;
+                        session.requested_from = Some(from_op);
+                        if proof_op.is_none() && from_op > session.fetch_to_op {
+                            return None;
+                        }
+                        Some((session.peer, session.nonce, from_op, session.fetch_to_op))
+                    });
                 // A session pins its peer and fences every arming site while it
                 // stands, so a peer that cannot answer wedges the group harder
                 // than having no session at all -- and the gap-stopped-primary
@@ -8521,9 +8688,7 @@ where
                     let Some(partition) = partitions.get_mut_by_ns(&namespace) else {
                         continue;
                     };
-                    let consensus = partition.consensus();
-                    let next_peer =
-                        next_repair_peer(consensus.replica(), peer, consensus.replica_count());
+                    let next_peer = next_stalled_repair_peer(partition.consensus(), peer);
                     tracing::warn!(
                         shard = self.id,
                         namespace_raw = namespace.inner(),
@@ -8607,7 +8772,11 @@ where
                     continue;
                 };
                 let probe = partition_gap_probe(partition);
-                let walk_stalled = !partition.has_pending_commit() && group_is_walk_stalled(&probe);
+                // A fenced walk takes only the recovered committed prefix; the
+                // proof, re-driven by repair and the anchor, releases the rest.
+                let walk_stalled = !partition.has_pending_commit()
+                    && group_is_walk_stalled(&probe)
+                    && (!partition.view_fenced() || partition.recovered_prefix_pending());
                 // The RATE cap only. The concurrency cap lives in the arm fn,
                 // which is the funnel every arming site goes through; resolved
                 // before the debounce either way, so a refusal keeps the group
@@ -8625,7 +8794,7 @@ where
                         let peer = gap_repair_peer(
                             consensus.replica(),
                             consensus.replica_count(),
-                            consensus.primary_index(consensus.view()),
+                            consensus.primary_hint(),
                         );
                         if peer.is_none() {
                             // Restart the debounce so this repeats at its
@@ -8707,6 +8876,27 @@ where
                         continue;
                     }
                 }
+            }
+
+            // A fence with no anchor stays shut until the view's primary names the
+            // header above it; ask again rather than wait for the next prepare.
+            if let Some(partition) = partitions.get_mut_by_ns(&namespace)
+                && !partition
+                    .consensus()
+                    .is_primary_for_view(partition.consensus().view())
+                // The answer would re-adopt the view and drop the live repair session.
+                && !partition.consensus().view_log_unproven()
+                && partition.view_fence_probe_due(self.repair_retry_ticks.get())
+            {
+                // A probe promises nothing about this replica's view, so it skips the
+                // superblock gate, which cannot certify while the fence holds the
+                // WAL back.
+                let consensus = partition.consensus();
+                let probe = [VsrAction::SendRequestStartView {
+                    view: consensus.view(),
+                    group: consensus.group(),
+                }];
+                dispatch_vsr_actions::<B, _, MJ>(consensus, None, &probe).await;
             }
 
             // Transfer stall retry: descriptor and chunk frames are
@@ -9816,6 +10006,8 @@ where
             floor: None,
             peer,
             idle_ticks: 0,
+            floor_pulled_from: 0,
+            requested_from: Some(from_op),
         });
         tracing::info!(
             shard = self.id,
@@ -9837,6 +10029,44 @@ where
         )
         .await;
         true
+    }
+
+    /// Request the op the view-log proof names once it climbed above the one the
+    /// live session last asked for. The walk runs downward, so it climbs only after
+    /// everything below is held and nothing of that request is still in flight.
+    /// `RepairDone` pulls the same op, but a body that lands after its `RepairDone`
+    /// moves the proof when nothing is left to notice, and the op would wait out
+    /// the retry timer.
+    #[allow(clippy::future_not_send)]
+    async fn request_moved_proof_op(&self, partition: &mut IggyPartition<B, SB>)
+    where
+        B: MessageBus,
+    {
+        let Some(proof_op) = partition.consensus().view_log_repair_op() else {
+            return;
+        };
+        let next = partition
+            .repair
+            .as_mut()
+            .filter(|live| proof_op > live.from_op)
+            .map(|live| {
+                live.from_op = proof_op;
+                live.requested_from = Some(proof_op);
+                (live.peer, live.nonce, live.fetch_to_op)
+            });
+        let Some((peer, nonce, to_op)) = next else {
+            return;
+        };
+        self.send_request_prepares(
+            partition.consensus(),
+            peer,
+            nonce,
+            proof_op,
+            to_op,
+            partition.consensus().group(),
+            partition.created_revision(),
+        )
+        .await;
     }
 
     /// Partition twin of [`Self::retarget_metadata_repair`]: re-request the
@@ -9951,6 +10181,8 @@ where
             floor: None,
             peer,
             idle_ticks: 0,
+            floor_pulled_from: 0,
+            requested_from: Some(from_op),
         });
         tracing::info!(
             shard = self.id,
@@ -10014,6 +10246,13 @@ where
         if !session_matches {
             return;
         }
+        // Offers only: a refusal is sent by whoever was asked, primary or not,
+        // and stamps the sender's own view, which climbs alone while it lags.
+        if header.available == 1 {
+            partition
+                .consensus()
+                .observe_primary(header.view, header.replica);
+        }
         if header.available == 0 {
             // A refusal the peer marked transient (its offer build is still
             // flushing or hashing, which is routine under produce load) must
@@ -10032,20 +10271,17 @@ where
                 "partition transfer peer cannot serve; backing off before re-arming"
             );
             if transient {
-                // The peer that refused is the node that would otherwise serve,
-                // and on the partition arm only the primary can. Keep
-                // asking it unless it is not the primary this replica knows: a
-                // rotation spends the next round on a backup that can only
-                // refuse, and the serving side's partial offer-build progress
-                // is memoized per node, so that round advances no hashing.
-                let primary = {
-                    let consensus = partition.consensus();
-                    consensus.primary_index(consensus.view())
-                };
+                // Keep asking the refusing peer only while it is the primary
+                // this replica last heard from: only the primary serves, and its
+                // partial offer-build progress is memoized per node. The
+                // refusal's own view proves nothing, since a lagging replica
+                // stamps a view that climbed alone.
+                let is_hinted_primary =
+                    partition.consensus().primary_hint() == Some(header.replica);
                 self.rearm_partition_transfer_after_refusal(
                     partition,
                     header.replica,
-                    header.replica != primary,
+                    !is_hinted_primary,
                 )
                 .await;
             } else {
@@ -10061,6 +10297,7 @@ where
         // caught up). Installing it would unlink a chain this replica already
         // holds; nonce match alone cannot tell the two apart.
         let local_view = partition.consensus().view();
+        let local_log_view = partition.consensus().log_view();
         let local_commit_max = partition.consensus().commit_max();
         // `commit_op` past the sender's OWN `commit_max` is self-contradictory:
         // the offer cannot be built past the frontier its builder had. Nothing
@@ -10083,7 +10320,12 @@ where
                 .await;
             return;
         }
-        if header.view < local_view || header.commit_max < local_commit_max {
+        if transfer_offer_is_behind(
+            header.view,
+            header.commit_max,
+            local_log_view,
+            local_commit_max,
+        ) {
             tracing::warn!(
                 shard = self.id,
                 namespace_raw = header.group,
@@ -10091,6 +10333,7 @@ where
                 serving_view = header.view,
                 serving_commit_max = header.commit_max,
                 local_view,
+                local_log_view,
                 local_commit_max,
                 "refusing a partition transfer offer from a replica behind this one"
             );
@@ -10645,11 +10888,12 @@ where
             consensus.set_state_transfer_stage(consensus::StateTransferStage::Idle);
         }
         let next_peer = if rotate {
+            consensus.forget_primary(peer);
             next_transfer_peer(
                 consensus.replica(),
                 peer,
                 consensus.replica_count(),
-                consensus.primary_index(consensus.view()),
+                consensus.primary_hint(),
             )
         } else {
             peer
@@ -11040,11 +11284,7 @@ where
             );
         }
 
-        // Repair a lost primary self-ack: `RetransmitPrepares` to self is a
-        // no-op, so the timer-driven retransmit above cannot recover the
-        // primary's own missing vote. Without this the commit prefix can pin
-        // forever (commit_min stuck below commit_max). See
-        // `IggyMetadata::repair_primary_self_acks`.
+        // Re-emit a lost primary self-ack; see `IggyMetadata::repair_primary_self_acks`.
         metadata.repair_primary_self_acks().await;
 
         // Backstop for commit work stranded by a canceled `on_ack` driver
@@ -11094,7 +11334,7 @@ where
                 match gap_repair_peer(
                     consensus.replica(),
                     consensus.replica_count(),
-                    consensus.primary_index(consensus.view()),
+                    consensus.primary_hint(),
                 ) {
                     None => {
                         // Restart the debounce so this repeats at its interval,
@@ -11197,13 +11437,13 @@ where
                     consensus.set_state_transfer_stage(consensus::StateTransferStage::Idle);
                 }
                 metadata.commit_journal().await;
-                // Rotated, not `primary_index` raw: this replica can BE the
+                // Rotated, not the hint raw: this replica can BE the
                 // primary here (a leading replica that transferred to catch up
                 // on a checkpoint it lacked), and the arm refuses self.
                 if let Some(next_peer) = gap_repair_peer(
                     consensus.replica(),
                     consensus.replica_count(),
-                    consensus.primary_index(consensus.view()),
+                    consensus.primary_hint(),
                 ) {
                     self.maybe_request_metadata_repair(consensus, next_peer)
                         .await;
@@ -11609,6 +11849,12 @@ fn repair_op_in_scope(
         })
 }
 
+/// A fenced replica serves what it has proven: ops up to `fence_floor`, and above
+/// it only entries the adopted view's log names, which `build_dvc_suffix` advertises.
+fn fenced_serve_admits(fence_floor: Option<u64>, op: u64, vouched: impl FnOnce() -> bool) -> bool {
+    fence_floor.is_none_or(|floor| op <= floor || vouched())
+}
+
 /// Ceiling on the op range a repair request may ask this replica to walk.
 ///
 /// Only peers in this view may receive an uncommitted suffix. During view
@@ -11874,11 +12120,10 @@ const fn drive_group_gap_debounce(
 ///
 /// Shared by both planes so the rule cannot drift: the partition sweep and
 /// `tick_metadata` arm off the same predicate and owe the same answer.
-const fn gap_repair_peer(self_id: u8, replica_count: u8, primary: u8) -> Option<u8> {
-    let peer = if primary == self_id {
-        next_transfer_peer(self_id, self_id, replica_count, primary)
-    } else {
-        primary
+const fn gap_repair_peer(self_id: u8, replica_count: u8, primary: Option<u8>) -> Option<u8> {
+    let peer = match primary {
+        Some(primary) if primary != self_id => primary,
+        _ => next_transfer_peer(self_id, self_id, replica_count, primary),
     };
     // A solo group (or a ring with nobody else live to name) rotates back to
     // self, which no session can be opened against.
@@ -11947,15 +12192,33 @@ fn partition_repair_fetch_to_op(
 }
 
 /// Start of the next chunk to pull after a `RepairDone`, or `None` when the
-/// walk made no progress (the stall retry owns the remainder) or already
-/// stands at the session's fetch ceiling. The sweep closes such a session,
-/// because `fetch_to_op` never sits below `commit_to_op`.
+/// held run did not reach the chunk just requested (the stall retry owns the
+/// remainder) or already stands at the session's fetch ceiling. The sweep
+/// closes such a session, because `fetch_to_op` never sits below
+/// `commit_to_op`.
 ///
 /// A session can outlive its last fetchable op until that close, and
 /// `from_op > to_op` fails `RequestPreparesHeader::validate` on the serving
 /// peer, which drops the frame as unparsable.
-fn partition_repair_next_chunk(before: u64, commit_min: u64, fetch_to_op: u64) -> Option<u64> {
-    (commit_min > before && commit_min < fetch_to_op).then_some(commit_min + 1)
+fn partition_repair_next_chunk(
+    requested_from: Option<u64>,
+    held_through: u64,
+    fetch_to_op: u64,
+) -> Option<u64> {
+    (requested_from.is_none_or(|from_op| held_through >= from_op) && held_through < fetch_to_op)
+        .then_some(held_through + 1)
+}
+
+/// Whether the stall sweep re-requests a session's remaining window this tick.
+/// A session whose held entries a proof just dropped has nothing in flight for
+/// the cut window, so waiting out the retry timer only stalls the fenced
+/// replica's catch-up.
+const fn partition_repair_retry_due(
+    requested_from: Option<u64>,
+    idle_ticks: u32,
+    retry_ticks: u32,
+) -> bool {
+    requested_from.is_none() || idle_ticks >= retry_ticks
 }
 
 /// Highest adopted suffix op whose bodies are not all present above `commit_max`.
@@ -12029,7 +12292,10 @@ where
             .log
             .journal()
             .inner
-            .holds_op(commit_min.saturating_add(1));
+            .holds_op(commit_min.saturating_add(1))
+        // The fenced commit walk cannot reach a hole above the next op, so only
+        // repair fills it.
+        && partition.view_fence_hole().is_none();
     // Same discipline, one guard deeper: the suffix test walks the header vec,
     // so it runs only for a group that HAS an unfinished suffix and already
     // owes nothing else.
@@ -12437,15 +12703,17 @@ where
     {
         return None;
     }
-    let applied_floor = partition
-        .consensus()
-        .commit_min()
+    // This cut stays above the recovered commit point, which the WAL names committed.
+    let committed_floor = partition
+        .fence_floor()
         .max(partition.log.journal().inner.evicted_through());
     let op_head = pending.map_or_else(
         || partition.consensus().sequencer().current_sequence(),
         |pending| pending.op_head,
     );
-    let above_head = op_head.max(applied_floor).checked_add(1)?;
+    // An adopted head never omits a known commit (`handle_start_view`).
+    debug_assert!(op_head >= partition.fence_floor());
+    let above_head = op_head.max(committed_floor).checked_add(1)?;
     partition
         .log
         .journal()
@@ -12531,6 +12799,179 @@ async fn reconcile_partition_view_divergence<B, SB>(
             }
         }
     }
+}
+
+/// The lowest header in a view's suffix that can anchor a fence. A blank slot
+/// names no identity, so its zero `parent` would link anything below it.
+fn view_fence_anchor(headers: &[PrepareHeader]) -> Option<PrepareHeader> {
+    headers
+        .iter()
+        .filter(|header| {
+            matches!(dvc_header_kind(header), DvcHeaderKind::Valid) && header.anchors_chain()
+        })
+        .min_by_key(|header| header.op)
+        .copied()
+}
+
+/// Fence what this replica holds between its commit point and the view's lowest
+/// canonical header (or the adopted head, when the `StartView` named none).
+///
+/// Those entries can come from a log the view discarded, and nothing else
+/// compares them before the commit walk applies them. Fencing, not truncating: a
+/// hole or a missing anchor is no evidence against an entry, and truncating on
+/// either drops entries this replica may be the only one to hold. An empty window
+/// is fenced too, so whatever repair puts there is proven before it is applied.
+fn fence_view_window_below<B, SB>(partition: &mut IggyPartition<B, SB>, pending: Option<&MergedLog>)
+where
+    B: MessageBus,
+    SB: journal::superblock::SuperblockStore,
+{
+    let anchor = pending.and_then(|pending| view_fence_anchor(&pending.headers));
+    // Without an anchor the window runs to the adopted head, which the pending log
+    // names; the sequencer can sit above it after an above-head truncation.
+    let through = match (anchor, pending) {
+        (Some(anchor), _) => anchor.op.saturating_sub(1),
+        (None, Some(pending)) => pending.op_head,
+        (None, None) => partition.consensus().sequencer().current_sequence(),
+    };
+    partition.fence_view_window(through, anchor);
+}
+
+/// Anchor a fence that adopted a blank head once a proven repair body fills that
+/// head in the view's log, as a `StartView` naming the header would have.
+#[allow(clippy::future_not_send)]
+async fn anchor_view_fence_from_view_log<B, SB>(
+    partition: &mut IggyPartition<B, SB>,
+    pending: Option<&MergedLog>,
+) where
+    B: MessageBus,
+    SB: journal::superblock::SuperblockStore,
+{
+    if !partition.view_fence_unanchored()
+        || pending.is_none_or(|pending| view_fence_anchor(&pending.headers).is_none())
+    {
+        return;
+    }
+    fence_view_window_below(partition, pending);
+    partition.prove_view_window().await;
+}
+
+/// From this view's primary, and not behind what this replica already holds: an
+/// older frame would truncate above its own head.
+const fn start_view_may_anchor(
+    (frame_view, sender, frame_op): (u32, u8, u64),
+    view: u32,
+    primary: u8,
+    head: u64,
+) -> bool {
+    frame_view == view && sender == primary && frame_op >= head
+}
+
+/// Hand a fence still waiting for its anchor the headers a same-view `StartView`
+/// carries: the probe answer a fenced replica asked for. A held entry the answer
+/// names differently, or a proof that breaks, queues a truncation, as on adoption.
+#[allow(clippy::future_not_send)]
+async fn anchor_view_fence_from_start_view<B, SB>(
+    shard: u16,
+    partition: &mut IggyPartition<B, SB>,
+    header: &StartViewHeader,
+    suffix_body: &[u8],
+) where
+    B: MessageBus,
+    SB: journal::superblock::SuperblockStore,
+{
+    let consensus = partition.consensus();
+    if !partition.view_fence_unanchored()
+        || !start_view_may_anchor(
+            (header.view, header.replica, header.op),
+            consensus.view(),
+            consensus.primary_index(header.view),
+            consensus.sequencer().current_sequence(),
+        )
+    {
+        return;
+    }
+    let pending = match MergedLog::from_start_view(header, suffix_body) {
+        Ok(pending) if !pending.headers.is_empty() => pending,
+        Ok(_) => return,
+        Err(error) => {
+            tracing::warn!(
+                shard,
+                namespace_raw = consensus.group(),
+                view = header.view,
+                %error,
+                "start_view suffix did not decode, so the fence keeps waiting for an anchor"
+            );
+            return;
+        }
+    };
+    let proof = AdoptedView {
+        view: header.view,
+        group: consensus.group(),
+        partition_incarnation: consensus.partition_incarnation(),
+        op_head: pending.op_head,
+        commit_max: pending.commit_max,
+        headers: pending.headers,
+    };
+    if let Err(error) = proof.validate(consensus.cluster(), consensus.view()) {
+        tracing::warn!(
+            shard,
+            namespace_raw = consensus.group(),
+            view = header.view,
+            %error,
+            "start_view suffix names another partition or incarnation, so the fence keeps waiting for an anchor"
+        );
+        return;
+    }
+    let pending = proof.merged_log();
+    if let Some(op) = first_view_divergence(partition, &pending) {
+        tracing::warn!(
+            shard,
+            namespace_raw = partition.consensus().group(),
+            op,
+            view = header.view,
+            "held partition entry at op {op} disagrees with the view's log, dropping from there"
+        );
+        partition.consensus().fence_view_log(op, op);
+        if partition.has_io_dispatcher() {
+            partition.defer_view_truncation(op..=u64::MAX, Vec::new(), Some(header.replica));
+        } else if let Err(error) = partition.truncate_uncommitted_from(op).await {
+            tracing::error!(shard, op, %error, "could not truncate diverging partition entries");
+        } else {
+            reconcile_partition_view_divergence(shard, partition, Some(&pending)).await;
+        }
+    }
+    fence_view_window_below(partition, Some(&pending));
+    partition.prove_view_window().await;
+}
+
+/// The lowest op above the fence floor where this replica holds an entry the view's
+/// log names differently. The fence's chain proof stops below its anchor, so held
+/// entries at or above it are compared here.
+fn first_view_divergence<B, SB>(
+    partition: &IggyPartition<B, SB>,
+    pending: &MergedLog,
+) -> Option<u64>
+where
+    B: MessageBus,
+    SB: journal::superblock::SuperblockStore,
+{
+    let journal = &partition.log.journal().inner;
+    let floor = partition.fence_floor();
+    let top = pending.op_head.min(journal.last_op()?);
+    pending
+        .headers
+        .iter()
+        .filter(|canonical| {
+            canonical.op > floor
+                && canonical.op <= top
+                && matches!(dvc_header_kind(canonical), DvcHeaderKind::Valid)
+                && journal
+                    .header_by_op(canonical.op)
+                    .is_some_and(|local| !header_is_view_entry(&local, canonical))
+        })
+        .map(|canonical| canonical.op)
+        .min()
 }
 
 /// Whether a locally journaled header IS the entry the view's log names at that op.
@@ -12912,9 +13353,9 @@ async fn dispatch_vsr_actions<B, P, J>(
                     |_| true,
                 );
             }
-            // Handled by the caller (shard view change handlers) since it
-            // requires access to the plane's commit_journal method.
-            VsrAction::CommitJournal => {}
+            // Handled by the caller, which owns the plane's journal. Metadata
+            // ignores `RetryLocalWrite` and re-acks via `repair_primary_self_acks`.
+            VsrAction::CommitJournal | VsrAction::RetryLocalWrite { .. } => {}
             VsrAction::SendCommit {
                 view,
                 commit,
@@ -13062,6 +13503,9 @@ async fn dispatch_partition_journal_actions<B, P, SB>(
                     |header| partition.register_rebuilt_ack(header),
                 );
             }
+            VsrAction::RetryLocalWrite { op } => {
+                partition.retry_local_write(*op).await;
+            }
             _ => {}
         }
     }
@@ -13131,6 +13575,18 @@ mod persist_gate_tests {
         let (local, wire) = split_local_actions(actions);
         assert!(local.is_empty());
         assert_eq!(wire.len(), 1);
+    }
+
+    #[test]
+    fn given_a_local_write_retry_when_split_should_keep_it_out_of_the_gate() {
+        // A withheld superblock persist must not drop the only action that
+        // recovers the primary's vote.
+        let (local, wire) = split_local_actions(vec![VsrAction::RetryLocalWrite { op: 4 }]);
+        assert!(matches!(
+            local.as_slice(),
+            [VsrAction::RetryLocalWrite { op: 4 }]
+        ));
+        assert!(wire.is_empty());
     }
 }
 
@@ -13265,13 +13721,27 @@ mod repair_scope_tests {
 
     #[test]
     fn given_a_walk_at_the_fetch_ceiling_when_repair_done_lands_should_not_request_a_chunk() {
-        assert_eq!(super::partition_repair_next_chunk(4, 7, 8), Some(8));
-        // No progress leaves the remainder to the stall retry.
-        assert_eq!(super::partition_repair_next_chunk(7, 7, 8), None);
+        assert_eq!(super::partition_repair_next_chunk(Some(4), 7, 8), Some(8));
+        // A held run short of the requested chunk leaves the remainder to the
+        // stall retry, so a peer with nothing new to serve is not re-asked at once.
+        assert_eq!(super::partition_repair_next_chunk(Some(8), 7, 9), None);
         // Progress that reached the ceiling has nothing left to ask for: the
         // sweep closes the session, and `9..=8` is not a range.
-        assert_eq!(super::partition_repair_next_chunk(7, 8, 8), None);
-        assert_eq!(super::partition_repair_next_chunk(7, 9, 8), None);
+        assert_eq!(super::partition_repair_next_chunk(Some(7), 8, 8), None);
+        assert_eq!(super::partition_repair_next_chunk(Some(7), 9, 8), None);
+    }
+
+    #[test]
+    fn given_a_cut_window_when_repair_done_lands_should_pull_from_the_held_run() {
+        assert_eq!(super::partition_repair_next_chunk(None, 2, 8), Some(3));
+        assert_eq!(super::partition_repair_next_chunk(None, 8, 8), None);
+    }
+
+    #[test]
+    fn given_a_cut_window_when_the_sweep_runs_should_re_request_before_the_retry_timer() {
+        assert!(super::partition_repair_retry_due(None, 1, 10));
+        assert!(!super::partition_repair_retry_due(Some(3), 9, 10));
+        assert!(super::partition_repair_retry_due(Some(3), 10, 10));
     }
 
     #[test]
@@ -13711,6 +14181,73 @@ mod view_coverage_tests {
             Some(2),
             "a peer no longer in the list means nothing here has been tried yet"
         );
+    }
+}
+
+#[cfg(test)]
+mod view_fence_gate_tests {
+    //! The gates around the partition view fence, apart from the partition.
+
+    use super::{fenced_serve_admits, start_view_may_anchor, view_fence_anchor};
+    use consensus::dvc_blank;
+    use iggy_binary_protocol::{Command, Operation, PrepareHeader};
+
+    fn sealed(op: u64, parent: u128) -> PrepareHeader {
+        let mut header = PrepareHeader {
+            command: Command::Prepare,
+            operation: Operation::SendMessages,
+            op,
+            parent,
+            ..Default::default()
+        };
+        header.checksum = header.identity_checksum();
+        header
+    }
+
+    #[test]
+    fn given_a_blank_commit_point_when_choosing_an_anchor_should_take_the_lowest_sealed_header() {
+        let above = sealed(6, 7);
+        let headers = [sealed(7, above.checksum), above, dvc_blank(5)];
+        assert_eq!(
+            view_fence_anchor(&headers).map(|anchor| anchor.op),
+            Some(6),
+            "a blank's zero parent links any window below it"
+        );
+        assert_eq!(view_fence_anchor(&[dvc_blank(5)]), None);
+    }
+
+    #[test]
+    fn given_op_one_when_choosing_an_anchor_should_accept_its_zero_parent() {
+        assert_eq!(
+            view_fence_anchor(&[sealed(1, 0)]).map(|anchor| anchor.op),
+            Some(1)
+        );
+        assert_eq!(
+            view_fence_anchor(&[sealed(2, 0)]),
+            None,
+            "a zero parent above op 1 vouches for nothing"
+        );
+    }
+
+    #[test]
+    fn given_a_start_view_when_deciding_whether_it_anchors_should_require_this_views_primary_at_or_above_the_head()
+     {
+        let start_view = |view: u32, replica: u8, op: u64| (view, replica, op);
+        assert!(start_view_may_anchor(start_view(2, 1, 9), 2, 1, 9));
+        assert!(!start_view_may_anchor(start_view(1, 1, 9), 2, 1, 9));
+        assert!(!start_view_may_anchor(start_view(2, 0, 9), 2, 1, 9));
+        assert!(
+            !start_view_may_anchor(start_view(2, 1, 8), 2, 1, 9),
+            "an older frame truncates above its own head"
+        );
+    }
+
+    #[test]
+    fn given_a_fenced_server_when_serving_should_admit_only_proven_entries_above_its_floor() {
+        assert!(fenced_serve_admits(None, 9, || false));
+        assert!(fenced_serve_admits(Some(4), 4, || false));
+        assert!(!fenced_serve_admits(Some(4), 5, || false));
+        assert!(fenced_serve_admits(Some(4), 5, || true));
     }
 }
 
@@ -15599,8 +16136,8 @@ mod metadata_repair_session_tests {
 
     #[test]
     fn given_a_gap_stopped_backup_when_picking_a_peer_should_ask_the_primary() {
-        assert_eq!(gap_repair_peer(2, 3, 0), Some(0));
-        assert_eq!(gap_repair_peer(1, 5, 3), Some(3));
+        assert_eq!(gap_repair_peer(2, 3, Some(0)), Some(0));
+        assert_eq!(gap_repair_peer(1, 5, Some(3)), Some(3));
     }
 
     #[test]
@@ -15610,7 +16147,7 @@ mod metadata_repair_session_tests {
         // self-addressed request fails to send AFTER the session is recorded.
         for replica_count in 2..=7u8 {
             for primary in 0..replica_count {
-                let peer = gap_repair_peer(primary, replica_count, primary);
+                let peer = gap_repair_peer(primary, replica_count, Some(primary));
                 assert_ne!(peer, Some(primary), "count {replica_count}");
                 assert!(peer.is_some(), "count {replica_count}");
             }
@@ -15618,8 +16155,15 @@ mod metadata_repair_session_tests {
     }
 
     #[test]
+    fn given_an_unknown_primary_when_picking_a_peer_should_walk_the_ring() {
+        assert_eq!(gap_repair_peer(0, 5, None), Some(1));
+        assert_eq!(next_transfer_peer(0, 1, 5, None), 2);
+        assert_eq!(next_transfer_peer(0, 4, 5, None), 1);
+    }
+
+    #[test]
     fn given_a_solo_group_when_picking_a_peer_should_answer_nobody() {
-        assert_eq!(gap_repair_peer(0, 1, 0), None);
+        assert_eq!(gap_repair_peer(0, 1, Some(0)), None);
     }
 
     #[test]
@@ -15629,8 +16173,9 @@ mod metadata_repair_session_tests {
         for replica_count in 3..=7u8 {
             for primary in 0..replica_count {
                 let self_id = (primary + 1) % replica_count;
-                let failed = gap_repair_peer(self_id, replica_count, primary).expect("a peer");
-                let next = next_transfer_peer(self_id, failed, replica_count, primary);
+                let failed =
+                    gap_repair_peer(self_id, replica_count, Some(primary)).expect("a peer");
+                let next = next_transfer_peer(self_id, failed, replica_count, Some(primary));
                 assert_ne!(next, failed, "count {replica_count}, primary {primary}");
                 assert_ne!(next, self_id, "count {replica_count}, primary {primary}");
             }
@@ -15641,7 +16186,7 @@ mod metadata_repair_session_tests {
     fn given_two_replicas_when_the_stall_budget_is_spent_should_name_the_same_peer_back() {
         // Which is how the caller reads "nobody else to ask" and drops the
         // session instead of re-arming it.
-        assert_eq!(next_transfer_peer(1, 0, 2, 0), 0);
+        assert_eq!(next_transfer_peer(1, 0, 2, Some(0)), 0);
         assert_eq!(next_repair_peer(1, 0, 2), 0);
     }
 
@@ -15749,6 +16294,40 @@ mod metadata_repair_session_tests {
         // A frame was lost inside the served chunk: re-requesting now would
         // race the retry timer for the same window.
         assert!(!repair_chunk_walked(5, 5, 12));
+    }
+}
+
+#[cfg(test)]
+mod transfer_descriptor_gate_tests {
+    //! Which state-transfer descriptors a replica refuses as coming from a
+    //! replica behind it.
+
+    use super::transfer_offer_is_behind;
+
+    #[test]
+    fn given_the_primary_offer_when_this_replica_ratcheted_its_view_alone_should_accept() {
+        // Numbers from a reproduction: the lagging replica last adopted view
+        // 11, solo elections that nobody heard pushed its view to 58, and the
+        // group's primary at view 20 offers more committed state than it holds.
+        assert!(!transfer_offer_is_behind(20, 55_013, 11, 53_052));
+    }
+
+    #[test]
+    fn given_an_offer_from_before_the_view_this_log_adopted_when_checked_should_refuse() {
+        assert!(transfer_offer_is_behind(10, 55_013, 11, 53_052));
+    }
+
+    #[test]
+    fn given_an_offer_below_the_known_commit_point_when_checked_should_refuse() {
+        assert!(transfer_offer_is_behind(20, 53_000, 11, 53_052));
+    }
+
+    #[test]
+    fn given_a_phantom_view_zero_primary_when_checked_should_refuse() {
+        // An empty group at view 0 must never unlink a chain this replica
+        // holds, whichever comparison catches it.
+        assert!(transfer_offer_is_behind(0, 0, 1, 0));
+        assert!(transfer_offer_is_behind(0, 0, 0, 42));
     }
 }
 
@@ -16465,6 +17044,110 @@ mod partition_ack_durability_tests {
         );
     }
 
+    /// A primary with a consumer-offset WAL under `directory` whose journal
+    /// holds op 1 that the WAL has not taken yet.
+    #[allow(clippy::future_not_send)]
+    async fn primary_with_journaled_offset_prepare(
+        directory: &std::path::Path,
+        durability: Durability,
+    ) -> IggyPartition<IggyMessageBus> {
+        let consensus =
+            VsrConsensus::new(1, 0, 3, 42, IggyMessageBus::new(0), LocalPipeline::new());
+        consensus.init();
+        consensus.mark_superblock_durable(0, 0);
+        let mut partition: IggyPartition<IggyMessageBus> = IggyPartition::with_in_memory_storage(
+            Arc::new(PartitionStats::default()),
+            consensus,
+            IggyByteSize::from(1024 * 1024),
+        );
+        partition.set_partition_dir(directory.to_string_lossy().into_owned());
+        partition.set_runtime_options(TopicRuntimeOptions {
+            consumer_offset_durability: durability,
+            ..TopicRuntimeOptions::default()
+        });
+        partition.open_persistence().await.unwrap();
+        let prepare = Message::<PrepareHeader>::new(size_of::<PrepareHeader>()).transmute_header(
+            |_, header: &mut PrepareHeader| {
+                header.command = Command::Prepare;
+                header.operation = Operation::StoreConsumerOffset;
+                header.cluster = 1;
+                header.group = 42;
+                header.op = 1;
+                header.size = u32::try_from(size_of::<PrepareHeader>()).unwrap();
+                header.checksum = header.identity_checksum();
+            },
+        );
+        partition
+            .log
+            .journal()
+            .inner
+            .append(prepare.into_frozen())
+            .await
+            .unwrap();
+        partition.consensus().sequencer().set_sequence(1);
+        partition
+    }
+
+    /// Drive the WAL writer until the loopback carries a self-ack, bounded.
+    #[allow(clippy::future_not_send)]
+    async fn await_self_acks(
+        partition: &mut IggyPartition<IggyMessageBus>,
+    ) -> Vec<Message<GenericHeader>> {
+        let mut acknowledgments = Vec::new();
+        for _ in 0..100 {
+            compio::runtime::time::sleep(Duration::from_millis(10)).await;
+            partition.drive_persistence().await;
+            partition
+                .consensus()
+                .drain_loopback_into(&mut acknowledgments);
+            if !acknowledgments.is_empty() {
+                break;
+            }
+        }
+        acknowledgments
+    }
+
+    #[compio::test]
+    async fn given_a_local_write_retry_when_dispatched_should_resubmit_the_prepare_and_ack_once_durable()
+     {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "iggy-retry-local-write-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        // Boxed: the setup future carries a whole partition, and holding it
+        // inline next to the test's own copy overflows the test thread's stack.
+        let mut partition = Box::pin(primary_with_journaled_offset_prepare(
+            &directory,
+            Durability::Persisted,
+        ))
+        .await;
+        dispatch_partition_journal_actions(
+            partition.consensus(),
+            &partition,
+            &[VsrAction::RetryLocalWrite { op: 1 }],
+        )
+        .await;
+        let mut acknowledgments = await_self_acks(&mut partition).await;
+        assert_eq!(
+            acknowledgments.len(),
+            1,
+            "the retry must re-submit op 1 to the WAL and self-ack it once durable"
+        );
+        let ack: Message<PrepareOkHeader> = acknowledgments
+            .pop()
+            .expect("one self-ack")
+            .try_into_typed()
+            .expect("loopback holds PrepareOks");
+        assert_eq!(ack.header().op, 1);
+        drop(partition);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[compio::test]
     async fn start_view_ack_waits_for_partition_wal_completion() {
         for durability in [Durability::Replicated, Durability::Persisted] {
@@ -16477,40 +17160,12 @@ mod partition_ack_durability_tests {
                 std::process::id()
             ));
             std::fs::create_dir(&directory).unwrap();
-            let consensus =
-                VsrConsensus::new(1, 0, 3, 42, IggyMessageBus::new(0), LocalPipeline::new());
-            consensus.init();
-            consensus.mark_superblock_durable(0, 0);
-            let mut partition: IggyPartition<IggyMessageBus> =
-                IggyPartition::with_in_memory_storage(
-                    Arc::new(PartitionStats::default()),
-                    consensus,
-                    IggyByteSize::from(1024 * 1024),
-                );
-            partition.set_partition_dir(directory.to_string_lossy().into_owned());
-            partition.set_runtime_options(TopicRuntimeOptions {
-                consumer_offset_durability: durability,
-                ..TopicRuntimeOptions::default()
-            });
-            partition.open_persistence().await.unwrap();
-            let prepare = Message::<PrepareHeader>::new(size_of::<PrepareHeader>())
-                .transmute_header(|_, header: &mut PrepareHeader| {
-                    header.command = Command::Prepare;
-                    header.operation = Operation::StoreConsumerOffset;
-                    header.cluster = 1;
-                    header.group = 42;
-                    header.op = 1;
-                    header.size = u32::try_from(size_of::<PrepareHeader>()).unwrap();
-                    header.checksum = header.identity_checksum();
-                });
-            partition
-                .log
-                .journal()
-                .inner
-                .append(prepare.into_frozen())
-                .await
-                .unwrap();
-            partition.consensus().sequencer().set_sequence(1);
+            // Boxed: the setup future carries a whole partition, and holding it
+            // inline next to the test's own copy overflows the test thread's stack.
+            let mut partition = Box::pin(primary_with_journaled_offset_prepare(
+                &directory, durability,
+            ))
+            .await;
             dispatch_partition_journal_actions(
                 partition.consensus(),
                 &partition,

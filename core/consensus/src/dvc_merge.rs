@@ -28,9 +28,10 @@
 #[cfg(test)]
 use crate::view_change_quorum::DvcSuffix;
 use crate::view_change_quorum::{
-    DvcQuorumArray, StoredDvc, dvc_count, dvc_iter, dvc_quorum_array_empty, dvc_record,
+    DvcQuorumArray, DvcSuffixError, StoredDvc, dvc_count, dvc_iter, dvc_quorum_array_empty,
+    dvc_record, dvc_suffix_decode,
 };
-use iggy_binary_protocol::{CHECKSUM_UNSEALED, PrepareHeader};
+use iggy_binary_protocol::{CHECKSUM_UNSEALED, PrepareHeader, StartViewHeader};
 
 /// Sizes the merge needs from the replica.
 #[derive(Debug, Clone, Copy)]
@@ -96,6 +97,26 @@ pub struct MergedLog {
     /// Headers non-canonical senders report committed and the canonical chain
     /// corroborates. See `committed_elsewhere`.
     pub committed_elsewhere: Vec<PrepareHeader>,
+}
+
+impl MergedLog {
+    /// The log a `StartView` announces: its suffix slots verbatim, blanks included,
+    /// and no headers when it carries numbers only.
+    ///
+    /// # Errors
+    /// Returns the decode error when the suffix body is malformed.
+    pub fn from_start_view(
+        header: &StartViewHeader,
+        suffix_body: &[u8],
+    ) -> Result<Self, DvcSuffixError> {
+        let suffix = dvc_suffix_decode(suffix_body, header.op, 0, 0)?;
+        Ok(Self {
+            op_head: header.op,
+            commit_max: header.commit,
+            headers: suffix.headers().to_vec(),
+            committed_elsewhere: Vec::new(),
+        })
+    }
 }
 
 /// Highest op the quorum proves committed.
