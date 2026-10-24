@@ -467,11 +467,11 @@ void IggyBlockingClient::StoreConsumerOffset(const Consumer &consumer,
                                              const std::optional<std::uint32_t> partition_id,
                                              const std::uint64_t offset) {
     RethrowAsIggyException([this, &consumer, &stream, &topic, offset, partition_id](ffi::ErrorInfo &error_info) {
-        constexpr auto unspecified_partition_id = std::numeric_limits<std::uint32_t>::max();
-        if (partition_id == unspecified_partition_id) {
+        constexpr auto kUnspecifiedPartitionId = std::numeric_limits<std::uint32_t>::max();
+        if (partition_id == kUnspecifiedPartitionId) {
             throw std::invalid_argument("partition_id cannot be the maximum std::uint32_t value");
         }
-        const auto ffi_partition_id = partition_id.value_or(unspecified_partition_id);
+        const auto ffi_partition_id = partition_id.value_or(kUnspecifiedPartitionId);
         Handle()->store_consumer_offset(stream.ToFfi(), topic.ToFfi(), ffi_partition_id, consumer.ToFfi(), offset,
                                         error_info);
     });
@@ -502,11 +502,11 @@ ConsumerOffsetInfo IggyBlockingClient::GetConsumerOffset(const Consumer &consume
                                                          const Identifier &topic,
                                                          const std::optional<std::uint32_t> partition_id) {
     return RethrowAsIggyException([this, &consumer, &stream, &topic, partition_id] {
-        constexpr auto unspecified_partition_id = std::numeric_limits<std::uint32_t>::max();
-        if (partition_id == unspecified_partition_id) {
+        constexpr auto kUnspecifiedPartitionId = std::numeric_limits<std::uint32_t>::max();
+        if (partition_id == kUnspecifiedPartitionId) {
             throw std::invalid_argument("partition_id cannot be the maximum std::uint32_t value");
         }
-        const auto ffi_partition_id = partition_id.value_or(unspecified_partition_id);
+        const auto ffi_partition_id = partition_id.value_or(kUnspecifiedPartitionId);
         return ConsumerOffsetInfo::FromFfi(
             Handle()->get_consumer_offset(stream.ToFfi(), topic.ToFfi(), ffi_partition_id, consumer.ToFfi()));
     });
@@ -517,11 +517,11 @@ void IggyBlockingClient::DeleteConsumerOffset(const Consumer &consumer,
                                               const Identifier &topic,
                                               const std::optional<std::uint32_t> partition_id) {
     RethrowAsIggyException([this, &consumer, &stream, &topic, partition_id](ffi::ErrorInfo &error_info) {
-        constexpr auto unspecified_partition_id = std::numeric_limits<std::uint32_t>::max();
-        if (partition_id == unspecified_partition_id) {
+        constexpr auto kUnspecifiedPartitionId = std::numeric_limits<std::uint32_t>::max();
+        if (partition_id == kUnspecifiedPartitionId) {
             throw std::invalid_argument("partition_id cannot be the maximum std::uint32_t value");
         }
-        const auto ffi_partition_id = partition_id.value_or(unspecified_partition_id);
+        const auto ffi_partition_id = partition_id.value_or(kUnspecifiedPartitionId);
         Handle()->delete_consumer_offset(stream.ToFfi(), topic.ToFfi(), ffi_partition_id, consumer.ToFfi(), error_info);
     });
 }
@@ -600,11 +600,11 @@ PolledMessages IggyBlockingClient::PollMessages(const Identifier &stream,
                                                 const bool auto_commit) {
     return RethrowAsIggyException(
         [this, &stream, &topic, partition_id, &consumer, &strategy, count, auto_commit](ffi::ErrorInfo &error_info) {
-            constexpr auto unspecified_partition_id = std::numeric_limits<std::uint32_t>::max();
-            if (partition_id == unspecified_partition_id) {
+            constexpr auto kUnspecifiedPartitionId = std::numeric_limits<std::uint32_t>::max();
+            if (partition_id == kUnspecifiedPartitionId) {
                 throw std::invalid_argument("partition_id cannot be the maximum std::uint32_t value");
             }
-            const auto ffi_partition_id = partition_id.value_or(unspecified_partition_id);
+            const auto ffi_partition_id = partition_id.value_or(kUnspecifiedPartitionId);
             return PolledMessages::FromFfi(Handle()->poll_messages(stream.ToFfi(), topic.ToFfi(), ffi_partition_id,
                                                                    consumer.ToFfi(), std::string(strategy.Kind()),
                                                                    strategy.Value(), count, auto_commit, error_info));
