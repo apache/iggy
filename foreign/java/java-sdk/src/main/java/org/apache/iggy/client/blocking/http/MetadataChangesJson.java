@@ -325,12 +325,11 @@ final class MetadataChangesJson {
 
     private static MetadataChangeBody user(JsonNode body) {
         var options = options(body);
-        UserStatus status =
-                switch (text(body, "status")) {
-                    case "active" -> UserStatus.Active;
-                    case "inactive" -> UserStatus.Inactive;
-                    default -> throw malformed("user status " + text(body, "status") + " is unknown");
-                };
+        UserStatus status = switch (text(body, "status")) {
+            case "active" -> UserStatus.Active;
+            case "inactive" -> UserStatus.Inactive;
+            default -> throw malformed("user status " + text(body, "status") + " is unknown");
+        };
         return new MetadataChangeBody.UserChange(
                 u32(body, "user_id"),
                 u64(body, "user_created_at"),
