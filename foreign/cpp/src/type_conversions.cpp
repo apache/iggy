@@ -875,13 +875,8 @@ PolledMessages PolledMessages::FromFfi(ffi::PolledMessages polled) {
     for (auto &message : polled.messages) {
         messages.push_back(IggyMessagePolled::FromFfi(std::move(message)));
     }
-    return PolledMessages(polled.partition_id, polled.current_offset, polled.count, std::move(messages));
-}
-
-OptionSpec OptionSpec::FromFfi(ffi::OptionSpec spec) {
-    return OptionSpec(std::string(spec.key.c_str(), spec.key.size()), spec.kind,
-                      std::vector<std::uint8_t>(spec.default_value.begin(), spec.default_value.end()),
-                      std::string(spec.description.c_str(), spec.description.size()));
+    return PolledMessages(polled.partition_id, polled.current_offset, polled.count, std::move(messages),
+                          PartitionContext::FromFfi(polled.context));
 }
 
 TransportEndpoints TransportEndpoints::FromFfi(ffi::TransportEndpoints endpoints) {

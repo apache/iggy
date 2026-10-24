@@ -42,44 +42,38 @@ const std::map<std::uint32_t, std::string> ERROR_MESSAGES = {
 GIVEN("^I have a cluster node that cannot reach quorum$") {
     cucumber::ScenarioScope<bdd::GlobalContext> context;
 
-    iggy::ffi::IggyClientConfig config{};
-    config.server_address     = bdd::required_env("IGGY_TCP_ADDRESS_NO_QUORUM");
-    iggy::ffi::Client *client = iggy::ffi::new_connection(std::move(config));
-    ASSERT_NE(client, nullptr);
-    context->client = client;
-    context->client->connect();
+    context->client.emplace(
+        iggy::IggyBlockingClient::Builder().WithServerAddress(bdd::required_env("IGGY_TCP_ADDRESS_NO_QUORUM")).Build());
+    context->client->Connect();
 }
 
 WHEN("^I sign out$") {
-    iggy::ffi::ErrorInfo error_info{};
     cucumber::ScenarioScope<bdd::GlobalContext> context;
-    ASSERT_NE(context->client, nullptr);
+    ASSERT_TRUE(context->client.has_value());
 
-    context->client->logout_user(error_info);
+    context->client->Logout();
 }
 
 WHEN("^I request the stream with ID ([0-9]+)$") {
     REGEX_PARAM(std::uint32_t, stream_id);
     cucumber::ScenarioScope<bdd::GlobalContext> context;
-    ASSERT_NE(context->client, nullptr);
+    ASSERT_TRUE(context->client.has_value());
 
     context->call_error.clear();
     try {
-        context->client->get_stream(bdd::make_numeric_identifier(stream_id));
+        context->client->GetStream(iggy::Identifier::Numeric(stream_id));
     } catch (const std::exception &error) {
         context->call_error = error.what();
     }
 }
 
 WHEN("^I sign in to that node as the root user$") {
-    iggy::ffi::ErrorInfo error_info{};
     cucumber::ScenarioScope<bdd::GlobalContext> context;
-    ASSERT_NE(context->client, nullptr);
+    ASSERT_TRUE(context->client.has_value());
 
     context->call_error.clear();
     try {
-        context->client->login_user(bdd::required_env("IGGY_ROOT_USERNAME"), bdd::required_env("IGGY_ROOT_PASSWORD"),
-                                    error_info);
+        context->client->Login(bdd::required_env("IGGY_ROOT_USERNAME"), bdd::required_env("IGGY_ROOT_PASSWORD"));
     } catch (const std::exception &error) {
         context->call_error = error.what();
     }

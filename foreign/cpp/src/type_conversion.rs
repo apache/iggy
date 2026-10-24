@@ -22,14 +22,13 @@ use std::{
 
 use bytes::Bytes;
 use iggy::prelude::{
-    CompressionAlgorithm as RustCompressionAlgorithm,
-    Consumer as RustConsumer, ConsumerGroupDetails as RustConsumerGroupDetails,
-    ConsumerKind as RustConsumerKind, Durability as RustDurability, IdKind,
-    Identifier as RustIdentifier, IggyByteSize as RustIggyByteSize, IggyExpiry as RustIggyExpiry,
-    IggyMessage as RustIggyMessage, MaxTopicSize as RustMaxTopicSize, OptionKey,
-    OptionSpec as RustOptionSpec, Partition as RustPartition,
-    PartitionContext as RustPartitionContext, PartitionResizePolicy as RustPartitionResizePolicy,
-    PolledMessages as RustPolledMessages,
+    CompressionAlgorithm as RustCompressionAlgorithm, Consumer as RustConsumer,
+    ConsumerGroupDetails as RustConsumerGroupDetails, ConsumerKind as RustConsumerKind,
+    Durability as RustDurability, IdKind, Identifier as RustIdentifier,
+    IggyByteSize as RustIggyByteSize, IggyExpiry as RustIggyExpiry, IggyMessage as RustIggyMessage,
+    MaxTopicSize as RustMaxTopicSize, OptionKey, OptionSpec as RustOptionSpec,
+    Partition as RustPartition, PartitionContext as RustPartitionContext,
+    PartitionResizePolicy as RustPartitionResizePolicy, PolledMessages as RustPolledMessages,
     SendMessagesConfirmationResponse as RustSendMessagesConfirmationResponse,
     SendMessagesResponse as RustSendMessagesResponse, Stream as RustStream,
     StreamDetails as RustStreamDetails, StreamEncryptionKey,
