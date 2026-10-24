@@ -496,7 +496,7 @@ final class IggySdkTest extends TestCase
                 AutoCommit::interval(micros(5)),
                 true,
                 true,
-                micros(1),
+                null,
                 null,
                 null,
                 null,
@@ -509,39 +509,6 @@ final class IggySdkTest extends TestCase
             assert_same(0, $consumer->partitionId());
             assert_null($consumer->getLastConsumedOffset($partitionId));
             assert_null($consumer->getLastStoredOffset($partitionId));
-        } finally {
-            cleanup_stream_with_topics($client, $streamName, [$topicName]);
-        }
-    }
-
-    #[TestDox('Consumer group accepts a zero polling interval')]
-    public function testConsumerGroupAcceptsZeroPollInterval(): void
-    {
-        $client = new_client();
-        $consumerName = unique_name('consumer-group-consumer');
-        $streamName = unique_name('consumer-group-stream');
-        $topicName = unique_name('consumer-group-topic');
-
-        try {
-            create_stream_and_topic($client, $streamName, $topicName);
-            $consumer = $client->consumerGroup(
-                $consumerName,
-                $streamName,
-                $topicName,
-                0,
-                PollingStrategy::next(),
-                10,
-                AutoCommit::disabled(),
-                true,
-                true,
-                0,
-                null,
-                null,
-                null,
-                false,
-            );
-
-            assert_same($consumerName, $consumer->name());
         } finally {
             cleanup_stream_with_topics($client, $streamName, [$topicName]);
         }
@@ -579,7 +546,7 @@ final class IggySdkTest extends TestCase
                     AutoCommit::disabled(),
                     true,
                     true,
-                    micros(1),
+                    null,
                     0,
                     null,
                     null,
@@ -599,7 +566,7 @@ final class IggySdkTest extends TestCase
                     AutoCommit::disabled(),
                     true,
                     true,
-                    micros(1),
+                    null,
                     null,
                     0,
                     0,
@@ -632,7 +599,7 @@ final class IggySdkTest extends TestCase
                 AutoCommit::disabled(),
                 true,
                 true,
-                micros(1),
+                null,
                 null,
                 null,
                 null,
@@ -678,7 +645,7 @@ final class IggySdkTest extends TestCase
                 AutoCommit::interval(micros(5)),
                 true,
                 true,
-                micros(1),
+                null,
                 null,
                 null,
                 null,
@@ -731,7 +698,7 @@ final class IggySdkTest extends TestCase
                 AutoCommit::interval(micros(5)),
                 true,
                 true,
-                micros(1),
+                null,
                 null,
                 null,
                 null,
@@ -788,8 +755,8 @@ final class IggySdkTest extends TestCase
                 AutoCommit::disabled(),
                 true,
                 true,
-                micros(1),
                 null,
+                micros(1),
                 null,
                 null,
                 false,
@@ -833,7 +800,7 @@ final class IggySdkTest extends TestCase
                 AutoCommit::disabled(),
                 true,
                 true,
-                micros(1),
+                null,
                 null,
                 null,
                 null,

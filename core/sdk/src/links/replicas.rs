@@ -424,6 +424,10 @@ impl ReplicaLinks {
         &self.shared.session
     }
 
+    pub(crate) fn reply_body_limit(&self) -> Option<usize> {
+        self.shared.dialer.reply_body_limit()
+    }
+
     /// Records that `link` carries the session of `fence`. A sign-in calls it
     /// before it binds the session, so the slots keep this link when they
     /// close the links of the old session.

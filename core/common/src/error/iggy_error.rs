@@ -194,6 +194,9 @@ pub enum IggyError {
     LifecycleBusy = 88,
     #[error("Request not accepted by a backup replica; retry on the primary of its group")]
     NotPrimary = 89,
+    /// No poll progress was applied. Back off without invalidating the partition route.
+    #[error("Deferred poll capacity exceeded; retry after backoff on the same replica")]
+    DeferredPollCapacityExceeded = 90,
     #[error("Client with ID: {0} was not found.")]
     ClientNotFound(u32) = 100,
     #[error("Invalid client ID")]
@@ -768,6 +771,11 @@ mod tests {
         let cases = [
             (IggyError::NotPrimary, 89, "not_primary"),
             (
+                IggyError::DeferredPollCapacityExceeded,
+                90,
+                "deferred_poll_capacity_exceeded",
+            ),
+            (
                 IggyError::OperationUncertain(RETAINED_OPERATION),
                 14006,
                 "operation_uncertain",
@@ -791,6 +799,10 @@ mod tests {
 
         // `PartialEq` compares codes only, so the payload needs a pattern.
         assert!(matches!(IggyError::from_code(89), IggyError::NotPrimary));
+        assert!(matches!(
+            IggyError::from_code(90),
+            IggyError::DeferredPollCapacityExceeded
+        ));
         assert!(matches!(
             IggyError::from_code(14006),
             IggyError::OperationUncertain(0)

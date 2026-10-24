@@ -16,10 +16,11 @@
 // under the License.
 
 use crate::client_wrappers::client_wrapper::ClientWrapper;
-use crate::prelude::{AutoCommit, AutoCommitWhen, IggyConsumer};
+use crate::prelude::{AutoCommit, IggyConsumer};
 use iggy_common::locking::IggyRwLock;
 use iggy_common::{
-    Consumer, EncryptorKind, Identifier, IggyDuration, NonZeroIggyDuration, PollingStrategy,
+    Consumer, DeferredPollOptions, EncryptorKind, Identifier, IggyDuration, NonZeroIggyDuration,
+    PollingStrategy,
 };
 use std::sync::Arc;
 
@@ -32,8 +33,10 @@ pub struct IggyConsumerBuilder {
     topic: Identifier,
     partition: Option<u32>,
     polling_strategy: PollingStrategy,
-    polling_interval: Option<IggyDuration>,
     batch_length: u32,
+    poll_options: DeferredPollOptions,
+    prefetch_bytes: u32,
+    prefetch_messages: Option<u32>,
     auto_commit: AutoCommit,
     auto_join_consumer_group: bool,
     create_consumer_group_if_not_exists: bool,
@@ -55,7 +58,6 @@ impl IggyConsumerBuilder {
         topic_id: Identifier,
         partition_id: Option<u32>,
         encryptor: Option<Arc<EncryptorKind>>,
-        polling_interval: Option<IggyDuration>,
     ) -> Self {
         Self {
             client,
@@ -66,14 +68,13 @@ impl IggyConsumerBuilder {
             partition: partition_id,
             polling_strategy: PollingStrategy::next(),
             batch_length: 1000,
-            auto_commit: AutoCommit::IntervalOrWhen(
-                NonZeroIggyDuration::ONE_SECOND,
-                AutoCommitWhen::PollingMessages,
-            ),
+            poll_options: DeferredPollOptions::default(),
+            prefetch_bytes: super::consumer::deferred::DEFAULT_PREFETCH_BYTES,
+            prefetch_messages: None,
+            auto_commit: AutoCommit::Disabled,
             auto_join_consumer_group: true,
             create_consumer_group_if_not_exists: true,
             encryptor,
-            polling_interval,
             polling_retry_interval: NonZeroIggyDuration::ONE_SECOND,
             init_retries: None,
             init_retry_interval: NonZeroIggyDuration::ONE_SECOND,
@@ -115,7 +116,38 @@ impl IggyConsumerBuilder {
         }
     }
 
+    /// Sets readiness, response-byte and overall request limits. Defaults to one
+    /// message, a 1 MiB reply, a one-second wait and an eleven-second request timeout.
+    /// A message larger than the reply limit is fetched alone, without that limit.
+    pub fn poll_options(self, poll_options: DeferredPollOptions) -> Self {
+        Self {
+            poll_options,
+            ..self
+        }
+    }
+
+    /// Caps encoded bytes reserved for in-flight and buffered replies. Default: 16 MiB.
+    /// Must fit at least one complete reply configured by `poll_options`.
+    pub fn prefetch_bytes(self, prefetch_bytes: u32) -> Self {
+        Self {
+            prefetch_bytes,
+            ..self
+        }
+    }
+
+    /// Caps messages reserved for in-flight and buffered replies. Default: 16,000, or
+    /// `batch_length` when that is larger. Must fit at least `batch_length` messages.
+    pub fn prefetch_messages(self, prefetch_messages: u32) -> Self {
+        Self {
+            prefetch_messages: Some(prefetch_messages),
+            ..self
+        }
+    }
+
     /// Sets the auto-commit configuration for storing the offset on the server.
+    /// Defaults to [`AutoCommit::Disabled`]: the consumer stores no offset, so a
+    /// restart with `Next` reads every message after the last offset stored with
+    /// `store_offset` or `store_position` again.
     pub fn auto_commit(self, auto_commit: AutoCommit) -> Self {
         Self {
             auto_commit,
@@ -154,22 +186,6 @@ impl IggyConsumerBuilder {
     pub fn do_not_create_consumer_group_if_not_exists(self) -> Self {
         Self {
             create_consumer_group_if_not_exists: false,
-            ..self
-        }
-    }
-
-    /// Sets the polling interval for messages.
-    pub fn poll_interval(self, interval: IggyDuration) -> Self {
-        Self {
-            polling_interval: Some(interval),
-            ..self
-        }
-    }
-
-    /// Clears the polling interval for messages.
-    pub fn without_poll_interval(self) -> Self {
-        Self {
-            polling_interval: None,
             ..self
         }
     }
@@ -239,7 +255,11 @@ impl IggyConsumerBuilder {
             self.stream,
             self.topic,
             self.partition,
-            self.polling_interval,
+            self.poll_options,
+            self.prefetch_bytes,
+            self.prefetch_messages.unwrap_or(
+                super::consumer::deferred::DEFAULT_PREFETCH_MESSAGES.max(self.batch_length),
+            ),
             self.polling_strategy,
             self.batch_length,
             self.auto_commit,

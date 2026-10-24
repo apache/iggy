@@ -18,7 +18,13 @@
 pub mod get_partition_route;
 pub mod poll_messages;
 pub mod send_messages;
+pub mod wait_for_messages;
 
 pub use get_partition_route::GetPartitionRouteRequest;
-pub use poll_messages::PollMessagesRequest;
+pub use poll_messages::{
+    DeferredPollMessagesRequest, MAX_DEFERRED_POLL_TIMEOUT_US, MAX_DEFERRED_POLL_WAIT_US,
+    MIN_DEFERRED_POLL_MAX_BYTES, MIN_DEFERRED_POLL_REPLY_MARGIN_US, PollMessagesRequest,
+    deferred_timeout_covers_wait,
+};
 pub use send_messages::{RawMessage, SendMessagesEncoder, SendMessagesHeader};
+pub use wait_for_messages::{WaitForMessagesRequest, WaitForMessagesTarget};

@@ -279,6 +279,7 @@ where
     poll_history: PollHistoryId,
     incarnation: crate::PartitionIncarnation,
     workerless_offset_files: Rc<crate::offset_storage::RetainedOffsetFiles<compio::fs::File>>,
+    poll_notifier: Option<Rc<dyn Fn()>>,
     /// Committed consumer-offset membership and values. This is deliberately
     /// separate from the eager poll maps because follower-local and uncommitted
     /// auto-commit progress must never consume a durable slot or enter a state
@@ -920,6 +921,7 @@ where
             poll_history: PollHistoryId::default(),
             incarnation: crate::PartitionIncarnation::default(),
             workerless_offset_files: Rc::default(),
+            poll_notifier: None,
             durable_consumer_offsets: DurableConsumerOffsets::default(),
             consumer_offset_capacities: ConsumerKind::ALL
                 .map(|kind| ConsumerOffsetCapacity::new(kind, crate::DEFAULT_CONSUMER_OFFSETS_MAX)),
@@ -2869,6 +2871,7 @@ where
         // the pre-first-flush shape, where the committed counter still seeds
         // nothing.
         self.offset_space.committed_seeded |= frontier > 0;
+        self.publish_poll_visibility();
     }
 
     /// Path of the anchor whose lifecycle is this segment's.
@@ -2888,11 +2891,12 @@ where
     /// because a segment on disk holds committed messages only). Everything on
     /// the live path moves ONE bit -- see [`Self::note_append_live`] and
     /// [`Self::note_committed_seeded`].
-    pub const fn set_offset_space_used(&mut self, used: bool) {
+    pub fn set_offset_space_used(&mut self, used: bool) {
         self.offset_space = OffsetSpace {
             append_live: used,
             committed_seeded: used,
         };
+        self.publish_poll_visibility();
     }
 
     /// The append counter is live: an offset has been journaled, so the next
@@ -2913,9 +2917,10 @@ where
     /// Implies the append counter is live too -- nothing commits that was not
     /// journaled first -- but the reverse does not hold, which is the whole
     /// reason the two bits are separate.
-    pub const fn note_committed_seeded(&mut self) {
+    pub fn note_committed_seeded(&mut self) {
         self.offset_space.append_live = true;
         self.offset_space.committed_seeded = true;
+        self.publish_poll_visibility();
     }
 
     /// Whether this partition ever stamped an offset, i.e. whether its offset
@@ -3066,6 +3071,7 @@ where
             .max(durable)
             .max(self.dirty_offset.load(Ordering::Relaxed));
         self.offset.store(durable, Ordering::Release);
+        self.publish_poll_visibility();
         self.dirty_offset.store(dirty, Ordering::Relaxed);
         self.offset_space = offset_space;
         self.recovered_durable_offset = offset_space.committed_seeded.then_some(durable);
@@ -4315,8 +4321,33 @@ where
     pub(crate) fn invalidate_poll_history(&mut self) {
         self.workerless_offset_files.clear();
         self.poll_history = PollHistoryId::default();
+        self.publish_poll_visibility();
         self.discard_queued_auto_commits();
         self.transfer_plan.borrow_mut().take();
+    }
+
+    /// The served history and the committed offset, which stays `None` until the
+    /// offset space is seeded. A change of either can make a parked poll ready.
+    pub fn poll_visibility(&self) -> (PollHistoryId, Option<u64>) {
+        (
+            self.poll_history,
+            self.offset_space
+                .committed_seeded
+                .then(|| self.offset.load(Ordering::Acquire)),
+        )
+    }
+
+    /// The notifier runs inside partition mutations whenever [`Self::poll_visibility`]
+    /// can change. It must only record the change, and it must not re-enter the
+    /// partition.
+    pub fn set_poll_notifier(&mut self, notifier: Option<Rc<dyn Fn()>>) {
+        self.poll_notifier = notifier;
+    }
+
+    pub(crate) fn publish_poll_visibility(&self) {
+        if let Some(notify) = &self.poll_notifier {
+            notify();
+        }
     }
 
     fn discard_queued_auto_commits(&self) {
@@ -5546,9 +5577,10 @@ where
 
         if serve_journal_first {
             let tier = match self.journal_get_sync(&query) {
-                Some((fragments, last_matching_offset)) => PollTier::Resident {
+                Some((fragments, last_matching_offset, message_count)) => PollTier::Resident {
                     fragments,
                     last_matching_offset,
+                    message_count,
                 },
                 None => PollTier::Empty,
             };
@@ -13520,7 +13552,7 @@ mod tests {
     use crate::iggy_index::{IGGY_INDEX_SIZE, IggyIndex, IggyIndexCache};
     use crate::iggy_index_reader::IggyIndexReader;
     use crate::offset_storage::{OffsetRecord, decode_offset_record, persist_offset};
-    use crate::poll_plan::{DiskReadOutcome, SealedSegmentHandle};
+    use crate::poll_plan::{DiskFault, DiskReadOutcome, SealedSegmentHandle};
     use crate::{IggyIndexWriter, MessagesWriter};
     use bytes::{Bytes, BytesMut};
     use compio::io::AsyncWriteAtExt;
@@ -27106,6 +27138,9 @@ mod tests {
             fragments,
             commit_offset: partition.offsets().commit_offset,
             last_matching_offset,
+            message_count: u32::from(last_matching_offset.is_some()),
+            truncated: false,
+            read_error: None,
         }
     }
 
@@ -30205,7 +30240,7 @@ mod tests {
             .await;
 
         assert!(
-            matches!(outcome, DiskReadOutcome::Faulted),
+            matches!(outcome, DiskReadOutcome::Faulted(DiskFault::Retryable)),
             "unreadable first segment must fault-close, not skip forward to the later segment",
         );
 
@@ -30369,7 +30404,7 @@ mod tests {
             .await;
 
         assert!(
-            matches!(outcome, DiskReadOutcome::Faulted),
+            matches!(outcome, DiskReadOutcome::Faulted(DiskFault::Unreadable)),
             "corrupt earlier segment must fault-close, not skip forward to the later segment",
         );
 
@@ -30437,7 +30472,7 @@ mod tests {
 
         let outcome = plan(true).read_disk(query).await;
         assert!(
-            matches!(outcome, DiskReadOutcome::Faulted),
+            matches!(outcome, DiskReadOutcome::Faulted(DiskFault::Unreadable)),
             "a batch that fails its own checksum must fault-close"
         );
 
@@ -30505,7 +30540,7 @@ mod tests {
             .await;
 
         assert!(
-            matches!(outcome, DiskReadOutcome::Faulted),
+            matches!(outcome, DiskReadOutcome::Faulted(DiskFault::Unreadable)),
             "flushed offsets of a file-less partition must fault-close, not serve the journal",
         );
     }
@@ -30540,7 +30575,7 @@ mod tests {
             .await;
 
         assert!(
-            matches!(outcome, DiskReadOutcome::Faulted),
+            matches!(outcome, DiskReadOutcome::Faulted(DiskFault::Retryable)),
             "unresolvable dir over file-backed data must fault-close, not serve the journal",
         );
     }

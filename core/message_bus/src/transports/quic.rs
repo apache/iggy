@@ -76,7 +76,13 @@ use compio_quic::{
 use futures::FutureExt;
 use futures::channel::oneshot;
 use futures::stream::{FuturesUnordered, StreamExt};
-use iggy_binary_protocol::{Command, GenericHeader, ReplyHeader, RequestHeader};
+use iggy_binary_protocol::codes::{POLL_MESSAGES_DEFERRED_CODE, WAIT_FOR_MESSAGES_CODE};
+use iggy_binary_protocol::requests::messages::{
+    DeferredPollMessagesRequest, WaitForMessagesRequest,
+};
+use iggy_binary_protocol::{
+    Command, GenericHeader, HEADER_SIZE, ReplyHeader, RequestHeader, WireDecode,
+};
 use server_common::Message;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -325,6 +331,24 @@ fn request_id(request: &Message<GenericHeader>) -> Option<u64> {
     read_u64(request.as_slice(), offset_of!(RequestHeader, request))
 }
 
+/// The request timeout that the body of a deferred request of `code` declares.
+fn deferred_timeout(code: u32, body: &[u8]) -> Option<Duration> {
+    let micros = match code {
+        POLL_MESSAGES_DEFERRED_CODE => {
+            DeferredPollMessagesRequest::decode_from(body)
+                .ok()?
+                .request_timeout_us
+        }
+        WAIT_FOR_MESSAGES_CODE => {
+            WaitForMessagesRequest::decode_from(body)
+                .ok()?
+                .request_timeout_us
+        }
+        _ => return None,
+    };
+    Some(Duration::from_micros(micros))
+}
+
 fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
     bytes
         .get(offset..offset + size_of::<u64>())
@@ -471,6 +495,21 @@ impl StreamContext<'_> {
             debug!(%label, %peer, "quic: frame shorter than a request header");
             return ControlFlow::Continue(());
         };
+        let header =
+            bytemuck::checked::try_from_bytes::<RequestHeader>(&request.as_slice()[..HEADER_SIZE])
+                .ok();
+        let cancellation = header.and_then(RequestHeader::deferred_cancellation);
+        // Only a cancellable request waits, so one predicate decides both.
+        let deferred_timeout = header
+            .filter(|_| cancellation.is_some())
+            .and_then(|header| {
+                deferred_timeout(
+                    u32::from_le_bytes(header.reserved),
+                    &request.as_slice()[HEADER_SIZE..],
+                )
+            })
+            .unwrap_or_default();
+        let reply_backstop = reply_backstop.max(deferred_timeout);
         let mut reply = router.borrow_mut().register(request_id);
         if in_tx.send(request).await.is_err() {
             debug!(%label, %peer, "quic: inbound queue dropped");
@@ -491,14 +530,26 @@ impl StreamContext<'_> {
                 }
             }
         };
-        let Some(frame) = replied else {
+        let Some(mut frame) = replied else {
             drop(reply);
             router.borrow_mut().release(request_id);
+            if let Some(header) = cancellation {
+                let mut cancel = server_common::Message::<RequestHeader>::new(HEADER_SIZE);
+                cancel
+                    .as_mut_slice()
+                    .copy_from_slice(bytemuck::bytes_of(&header));
+                // Both frames enter the same connection drain in order, including
+                // a stream stopped before its original request reaches dispatch.
+                if in_tx.send(cancel.into_generic()).await.is_err() {
+                    return ControlFlow::Break(());
+                }
+            }
             if let Err(e) = send.reset(VarInt::from_u32(QUIC_NO_REPLY)) {
                 debug!(%label, %peer, error = ?e, "quic: stream reset failed");
             }
             return ControlFlow::Continue(());
         };
+        let receipt = frame.take_write_receipt();
         for fragment in frame.into_fragments() {
             let BufResult(result, _frozen) = send.write_all(fragment).await;
             if let Err(e) = result {
@@ -510,6 +561,10 @@ impl StreamContext<'_> {
         // reply is complete.
         if let Err(e) = send.finish() {
             debug!(%label, %peer, error = ?e, "quic: send.finish() failed");
+            return ControlFlow::Continue(());
+        }
+        if let Some(receipt) = receipt {
+            receipt.complete();
         }
         // Keep the reply alive through graceful shutdown until the peer has
         // acknowledged it. Closing the connection after FIN alone can discard it.

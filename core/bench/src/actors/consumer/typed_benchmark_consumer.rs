@@ -54,6 +54,7 @@ impl TypedBenchmarkConsumer {
         sampling_time: IggyDuration,
         moving_average_window: u32,
         polling_kind: PollingKind,
+        poll_options: DeferredPollOptions,
         limit_bytes_per_second: Option<IggyByteSize>,
         origin_timestamp_latency_calculation: bool,
         pretty: bool,
@@ -65,6 +66,7 @@ impl TypedBenchmarkConsumer {
             messages_per_batch,
             warmup_time,
             polling_kind,
+            poll_options,
             origin_timestamp_latency_calculation,
             pretty,
         };

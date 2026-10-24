@@ -153,7 +153,7 @@ $consumer = $client->consumerGroup(
     \Iggy\AutoCommit::disabled(),
     true,
     true,
-    1_000_000,
+    null,
     null,
     null,
     null,
@@ -357,6 +357,9 @@ follow($client, [MetadataChangeGroup::Streams, MetadataChangeGroup::Topics]);
   by default.
 - `iterMessages()` returns a PHP `Iterator` and can be used with `foreach`.
   Break out of the loop when the caller's processing limit or shutdown signal is reached.
+- Without an `AutoCommit` argument, the consumer stores no offset, as with
+  `AutoCommit::disabled()`. Store positions after processing, or each restart
+  reads the same messages again.
 - `AutoCommit::when()` may queue an offset commit before the PHP callback runs.
   If callback success must control commits, use `AutoCommit::disabled()` and call
   `storePosition($message->position())` after the callback work succeeds.

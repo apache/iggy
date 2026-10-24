@@ -125,6 +125,7 @@ use crate::http::relay_proof::{RELAY_PROOF_LIFETIME, RelayKey, UnprovenRelay, pa
 use crate::http::state::{
     APPLIED_OP_HEADER, DURABILITY_HEADER, FloorReads, ForwardState, HttpInner, VIEW_HEADER,
 };
+use crate::http::wire::DeferredPollQuery;
 use crate::http::{HttpState, close_connection};
 use crate::server_error::ServerError;
 
@@ -160,11 +161,13 @@ pub(in crate::http) const METADATA_FLOOR_PATH: &str = "/cluster/metadata-floor";
 /// The route a metadata floor request proves: it relays no partition request.
 const NO_PARTITION_ROUTE: HeaderValue = HeaderValue::from_static("");
 
-/// One bound for a partition request on the node that received it: the
-/// metadata floor read and hold, every local attempt, primary lookup and relay
-/// attempt, a relayed poll body, the hop target's metadata hold, and the local
-/// lane and reply waits. A relay proof lives as long, so no relay attempt
-/// outlives its proof.
+/// One bound for an immediate partition request on the node that received it:
+/// the metadata floor read and hold, every local attempt, primary lookup and
+/// relay attempt, a relayed poll body, the hop target's metadata hold, and the
+/// local lane and reply waits. A deferred poll takes this bound from its
+/// `request_timeout` instead. Each relay attempt signs a new proof, which the
+/// hop target checks when the request head arrives, so a longer wait needs no
+/// longer proof.
 pub(in crate::http) const PARTITION_REQUEST_DEADLINE: Duration = RELAY_PROOF_LIFETIME;
 
 /// Keeps the hop target's deadline before the contacted node's, so the hop
@@ -190,7 +193,8 @@ const FORWARD_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const FORWARD_RETRY_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Cap on concurrent forwards held by this node: metadata forwards and
-/// partition relays. Deliberately its own budget: a forward
+/// partition relays. Relayed deferred polls have a second cap of the same
+/// size. Deliberately its own budget: a forward
 /// parks no reply slot and touches none of the shard bus machinery the
 /// partition-write caps protect, and counting forwards against those caps
 /// would let a slow primary starve this node's own direct clients.
@@ -368,6 +372,8 @@ pub(in crate::http) struct PartitionRequest {
     headers: HeaderMap,
     path_and_query: String,
     body: Bytes,
+    /// A deferred poll, which holds its relay slots for its whole wait.
+    deferred: bool,
     pub(in crate::http) hop: PartitionHop,
     pub(in crate::http) deadline: Instant,
 }
@@ -484,7 +490,9 @@ pub(in crate::http) fn build_forward_state(
         scheme,
         body_limit,
         in_flight: Rc::new(Cell::new(0)),
+        deferred_in_flight: Rc::new(Cell::new(0)),
         relay_targets: RelayTargets::default(),
+        deferred_relay_targets: RelayTargets::default(),
         floor_reads: FloorReads::default(),
     })
 }
@@ -685,7 +693,12 @@ async fn relay_to_primary(
         return AttemptOutcome::Relay(not_admitted());
     }
     if guard.is_none() {
-        *guard = ForwardGuard::admit(&state.forward.in_flight);
+        let in_flight = if request.deferred {
+            &state.forward.deferred_in_flight
+        } else {
+            &state.forward.in_flight
+        };
+        *guard = ForwardGuard::admit(in_flight);
         if guard.is_none() {
             return AttemptOutcome::Relay(forward_busy());
         }
@@ -962,6 +975,7 @@ fn record_relayed_floor(state: &HttpInner, user_id: u32, response: &Response) {
     state.metadata_watermarks.record(user_id, applied);
 }
 
+#[allow(clippy::too_many_lines)]
 async fn attach_partition_request(state: HttpState, request: Request, next: Next) -> Response {
     let received = Instant::now();
     let hop = match partition_hop(
@@ -978,10 +992,25 @@ async fn attach_partition_request(state: HttpState, request: Request, next: Next
         Ok(bearer) => bearer,
         Err(error) => return CustomError::from(error).into_response(),
     };
+    let deferred =
+        request.method() == Method::GET && request.uri().path().ends_with("/messages/deferred");
+    let request_budget = if deferred {
+        let query = match axum::extract::Query::<DeferredPollQuery>::try_from_uri(request.uri()) {
+            Ok(query) => query.0,
+            Err(_) => return CustomError::from(IggyError::InvalidCommand).into_response(),
+        };
+        let options = iggy_common::DeferredPollOptions::from(query);
+        if let Err(error) = options.validate(u32::MAX) {
+            return CustomError::from(error).into_response();
+        }
+        options.request_timeout.get_duration()
+    } else {
+        PARTITION_REQUEST_DEADLINE
+    };
     let deadline = received
         + match hop {
-            PartitionHop::Target(route) => route.budget.min(PARTITION_REQUEST_DEADLINE),
-            PartitionHop::Contacted | PartitionHop::Unrouted => PARTITION_REQUEST_DEADLINE,
+            PartitionHop::Target(route) => route.budget.min(request_budget),
+            PartitionHop::Contacted | PartitionHop::Unrouted => request_budget,
         };
     // The contacted node chose the partition and authenticated the caller
     // from metadata at this op. Before that op is applied here, the topic, the
@@ -1008,7 +1037,12 @@ async fn attach_partition_request(state: HttpState, request: Request, next: Next
             verified.user_id,
             verified.user_created_at,
         );
-        match state.forward.relay_targets.admit(credential) {
+        let relay_targets = if deferred {
+            &state.forward.deferred_relay_targets
+        } else {
+            &state.forward.relay_targets
+        };
+        match relay_targets.admit(credential) {
             Ok(guard) => Some(guard),
             Err(refusal) => return relay_target_refused(refusal),
         }
@@ -1044,6 +1078,7 @@ async fn attach_partition_request(state: HttpState, request: Request, next: Next
             .map_or("/", |path_and_query| path_and_query.as_str())
             .to_owned(),
         body: body.clone(),
+        deferred,
         hop,
         deadline,
     };
@@ -2010,6 +2045,7 @@ mod tests {
             headers: forwarded_headers(&HeaderMap::new()),
             path_and_query: format!("{SEND_PATH}?consumer_id=o'brien"),
             body: Bytes::new(),
+            deferred: false,
             hop: PartitionHop::Contacted,
             deadline: Instant::now(),
         };
@@ -2682,6 +2718,7 @@ mod tests {
             headers: HeaderMap::new(),
             path_and_query: SEND_PATH.to_owned(),
             body: Bytes::new(),
+            deferred: false,
             hop,
             deadline: Instant::now() + budget,
         }

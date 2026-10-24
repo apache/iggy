@@ -28,7 +28,7 @@
 //! `source::init` and `sink::init`:
 //!   * plugin path resolution failure (missing `.so`),
 //!   * source state-load failure (unreachable state file),
-//!   * post-container setup failure (invalid duration in stream config),
+//!   * post-container setup failure (invalid transform config),
 //!   * post-container setup failure surfaced as an Iggy error (missing stream).
 
 use iggy_common::{Identifier, IggyMessage, MessageClient, Partitioning};
@@ -107,8 +107,10 @@ async fn sink_with_invalid_config_does_not_abort_runtime(harness: &TestHarness) 
         .as_ref()
         .expect("Invalid sink should expose a last_error");
     assert!(
-        last_error.message.contains("poll interval"),
-        "last_error should mention the misconfigured poll_interval, got: {}",
+        last_error
+            .message
+            .contains("Failed to parse transform config"),
+        "last_error should mention the misconfigured transform, got: {}",
         last_error.message
     );
 

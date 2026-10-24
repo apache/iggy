@@ -123,6 +123,7 @@ impl<'a> IggyConsumerMessageExt<'a> for IggyConsumer {
                                 err,
                                 IggyError::InvalidServerAddress
                                     | IggyError::InvalidClientAddress
+                                    | IggyError::InvalidConfiguration
                                     | IggyError::LaneBlocked(_)
                                     | IggyError::ClientShutdown
                             ) || !self.client_can_recover().await;

@@ -35,6 +35,7 @@ import org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.
 import org.apache.iggy.client.async.tcp.vsr.ConsensusSession;
 import org.apache.iggy.client.async.tcp.vsr.VsrFrameDecoder;
 import org.apache.iggy.client.async.tcp.vsr.VsrHeaders;
+import org.apache.iggy.client.async.tcp.vsr.VsrOperation;
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.exception.IggyClientException;
 import org.apache.iggy.exception.IggyConnectionException;
@@ -44,6 +45,7 @@ import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.DeferredPollOptions;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PolledMessages;
@@ -104,6 +106,7 @@ class PollRouterTest {
     private static final int PRIMARY_PORT = 8090;
     private static final int BIND_SECRET_BYTES = 32;
     private static final int PENDING_POLL_CAPACITY = 4096;
+    private static final int DEFERRED_POLL_CAPACITY = 64;
     private static final int REQUEST_ID_OFFSET = 168;
     private static final int REQUEST_INCARNATION_OFFSET = 200;
     private static final int REQUEST_METADATA_OP_OFFSET = 216;
@@ -428,8 +431,9 @@ class PollRouterTest {
      * A poll over the pending capacity fails at once, and the router holds no more payloads than that capacity. Each
      * held poll ends with an explicit failure, and every payload goes back.
      */
-    @Test
-    void shouldReleaseEveryPayloadAboveAndWithinThePendingPollCapacity() throws Exception {
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void shouldReleaseEveryPayloadAboveAndWithinThePendingPollCapacity(boolean deferred) throws Exception {
         IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
         ManualTimers timers = new ManualTimers();
         Coordinator coordinator = new Coordinator(group, timers);
@@ -441,10 +445,10 @@ class PollRouterTest {
             for (int index = 0; index < PENDING_POLL_CAPACITY; index++) {
                 ByteBuf payload = tracked(pollPayload());
                 payloads.add(payload);
-                held.add(router.poll(payload, Optional.empty()));
+                held.add(routedPoll(router, payload, deferred));
             }
             ByteBuf rejected = tracked(pollPayload());
-            assertThatThrownBy(() -> router.poll(rejected, Optional.empty()).join())
+            assertThatThrownBy(() -> routedPoll(router, rejected, deferred).join())
                     .hasRootCauseMessage("Too many pending primary polls and offset writes");
             assertThat(rejected.refCnt()).isZero();
             assertThat(payloads)
@@ -460,16 +464,168 @@ class PollRouterTest {
         }
     }
 
-    /** A reply that comes after its poll timed out goes back, and so does the payload of that poll. */
     @Test
-    void shouldReleaseALateReplyAndThePayloadOfARoutedPollThatTimedOut() throws Exception {
+    void shouldAdmitDeferredPollsInOrderAsSlotsBecomeAvailable() throws Exception {
         IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
         ManualTimers timers = new ManualTimers();
         Coordinator coordinator = new Coordinator(group, timers);
         Primary primary = new Primary(group);
         PollRouter router = new PollRouter(() -> coordinator, endpoint -> primary);
         try {
-            router.poll(pollPayload(), Optional.empty())
+            List<CompletableFuture<ByteBuf>> replies = new ArrayList<>();
+            for (int index = 0; index < DEFERRED_POLL_CAPACITY + 2; index++) {
+                var reply = new CompletableFuture<ByteBuf>();
+                primary.replies.add(reply);
+                replies.add(reply);
+            }
+            List<CompletableFuture<ByteBuf>> polls = new ArrayList<>();
+            for (int index = 0; index < DEFERRED_POLL_CAPACITY + 2; index++) {
+                polls.add(routedPoll(router, tracked(pollPayload()), true));
+            }
+            assertThat(primary.sentContexts).hasSize(DEFERRED_POLL_CAPACITY);
+            assertThat(polls).allSatisfy(poll -> assertThat(poll).isNotDone());
+
+            replies.get(0).complete(emptyPoll(0));
+            polls.get(0).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS).release();
+            await(() -> primary.sentContexts.size() == DEFERRED_POLL_CAPACITY + 1, "first queued poll", TIMEOUT);
+            assertThat(polls.get(DEFERRED_POLL_CAPACITY + 1)).isNotDone();
+
+            replies.get(DEFERRED_POLL_CAPACITY).complete(emptyPoll(0));
+            polls.get(DEFERRED_POLL_CAPACITY)
+                    .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
+                    .release();
+            await(() -> primary.sentContexts.size() == DEFERRED_POLL_CAPACITY + 2, "second queued poll", TIMEOUT);
+            replies.get(DEFERRED_POLL_CAPACITY + 1).complete(emptyPoll(0));
+            polls.get(DEFERRED_POLL_CAPACITY + 1)
+                    .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
+                    .release();
+        } finally {
+            router.clearSession().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            timers.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+            group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void shouldRemoveADeferredPollThatEndsWhileWaitingForASlot(boolean cancelled) throws Exception {
+        IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+        ManualTimers timers = new ManualTimers();
+        Coordinator coordinator = new Coordinator(group, timers);
+        Primary primary = new Primary(group);
+        PollRouter router = new PollRouter(() -> coordinator, endpoint -> primary);
+        try {
+            List<CompletableFuture<ByteBuf>> replies = new ArrayList<>();
+            List<CompletableFuture<ByteBuf>> polls = new ArrayList<>();
+            for (int index = 0; index < DEFERRED_POLL_CAPACITY; index++) {
+                var reply = new CompletableFuture<ByteBuf>();
+                replies.add(reply);
+                primary.replies.add(reply);
+                polls.add(routedPoll(router, tracked(pollPayload()), true));
+            }
+            ByteBuf expiredPayload = tracked(pollPayload());
+            var expired = routedPoll(router, expiredPayload, true);
+            assertThat(expired).isNotDone();
+            if (cancelled) {
+                expired.cancel(false);
+            } else {
+                timers.runLast();
+                assertServerError(expired, AsyncTcpConnection.TRANSIENT_NOT_ACCEPTED);
+            }
+            assertThat(expiredPayload.refCnt()).isZero();
+            var nextReply = new CompletableFuture<ByteBuf>();
+            primary.replies.add(nextReply);
+            var next = routedPoll(router, tracked(pollPayload()), true);
+
+            replies.get(0).complete(emptyPoll(0));
+            polls.get(0).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS).release();
+            await(() -> primary.sentContexts.size() == DEFERRED_POLL_CAPACITY + 1, "next live queued poll", TIMEOUT);
+            nextReply.complete(emptyPoll(0));
+            next.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS).release();
+        } finally {
+            router.clearSession().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            timers.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+            group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void shouldNotSendAQueuedDeferredPollAfterItsDeadline() throws Exception {
+        IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+        ManualTimers timers = new ManualTimers();
+        Coordinator coordinator = new Coordinator(group, timers);
+        Primary primary = new Primary(group);
+        PollRouter router = new PollRouter(() -> coordinator, endpoint -> primary);
+        try {
+            List<CompletableFuture<ByteBuf>> polls = new ArrayList<>();
+            for (int index = 0; index < DEFERRED_POLL_CAPACITY; index++) {
+                primary.replies.add(new CompletableFuture<>());
+                polls.add(routedPoll(router, tracked(pollPayload()), true));
+            }
+            var options = DeferredPollOptions.defaults();
+            ByteBuf payload = tracked(pollPayload());
+            payload.writeLongLE(options.maxWaitMicros())
+                    .writeIntLE((int) options.minCount())
+                    .writeIntLE((int) options.maxBytes())
+                    .writeLongLE(options.requestTimeoutMicros());
+            var queued = router.partitionRequest(
+                    CommandCode.Messages.POLL_DEFERRED.getValue(), payload, Optional.empty(), System.nanoTime());
+            assertThat(queued).isNotDone();
+
+            polls.get(0).cancel(false);
+
+            assertServerError(queued, AsyncTcpConnection.TRANSIENT_NOT_ACCEPTED);
+            assertThat(primary.sentContexts).hasSize(DEFERRED_POLL_CAPACITY);
+            assertThat(payload.refCnt()).isZero();
+        } finally {
+            router.clearSession().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            timers.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+            group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void shouldEndQueuedDeferredPollsOnSessionResetAndReleaseTheirSlots() throws Exception {
+        IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+        ManualTimers timers = new ManualTimers();
+        Coordinator coordinator = new Coordinator(group, timers);
+        Primary primary = new Primary(group);
+        PollRouter router = new PollRouter(() -> coordinator, endpoint -> primary);
+        try {
+            coordinator.routeReady = new CompletableFuture<>();
+            List<CompletableFuture<ByteBuf>> polls = new ArrayList<>();
+            for (int index = 0; index <= DEFERRED_POLL_CAPACITY; index++) {
+                polls.add(routedPoll(router, tracked(pollPayload()), true));
+            }
+
+            router.clearSession().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            assertThat(polls).allSatisfy(poll -> assertServerError(poll, AsyncTcpConnection.TRANSIENT_NOT_ACCEPTED));
+            coordinator.routeReady.complete(null);
+            List<CompletableFuture<ByteBuf>> fresh = new ArrayList<>();
+            for (int index = 0; index < DEFERRED_POLL_CAPACITY; index++) {
+                primary.replies.add(new CompletableFuture<>());
+                fresh.add(routedPoll(router, tracked(pollPayload()), true));
+            }
+            assertThat(primary.sentContexts).hasSize(DEFERRED_POLL_CAPACITY);
+            assertThat(fresh).allSatisfy(poll -> assertThat(poll).isNotDone());
+        } finally {
+            router.clearSession().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            timers.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+            group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    /** A reply that comes after its poll timed out goes back, and so does the payload of that poll. */
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void shouldReleaseALateReplyAndThePayloadOfARoutedPollThatTimedOut(boolean deferred) throws Exception {
+        IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+        ManualTimers timers = new ManualTimers();
+        Coordinator coordinator = new Coordinator(group, timers);
+        Primary primary = new Primary(group);
+        PollRouter router = new PollRouter(() -> coordinator, endpoint -> primary);
+        try {
+            routedPoll(router, pollPayload(), deferred)
                     .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
                     .release();
             int pollTimeout = timers.scheduled.size();
@@ -478,7 +634,7 @@ class PollRouterTest {
             primary.beforeSend = () -> timers.scheduled.get(pollTimeout).run();
             ByteBuf payload = tracked(pollPayload());
 
-            var polled = router.poll(payload, Optional.empty());
+            var polled = routedPoll(router, payload, deferred);
 
             assertServerError(polled, AsyncTcpConnection.TRANSIENT_NOT_COMMITTED);
             assertThat(late.refCnt()).isZero();
@@ -490,21 +646,22 @@ class PollRouterTest {
         }
     }
 
-    @Test
-    void shouldReleaseThePayloadOfACancelledRoutedPollAndCancelItsExchange() throws Exception {
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void shouldReleaseThePayloadOfACancelledRoutedPollAndCancelItsExchange(boolean deferred) throws Exception {
         IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
         ManualTimers timers = new ManualTimers();
         Coordinator coordinator = new Coordinator(group, timers);
         Primary primary = new Primary(group);
         PollRouter router = new PollRouter(() -> coordinator, endpoint -> primary);
         try {
-            router.poll(pollPayload(), Optional.empty())
+            routedPoll(router, pollPayload(), deferred)
                     .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
                     .release();
             CompletableFuture<ByteBuf> exchange = new CompletableFuture<>();
             primary.replies.add(exchange);
             ByteBuf payload = tracked(pollPayload());
-            var polled = router.poll(payload, Optional.empty());
+            var polled = routedPoll(router, payload, deferred);
             assertThat(polled).isNotDone();
 
             assertThat(polled.cancel(false)).isTrue();
@@ -557,15 +714,16 @@ class PollRouterTest {
         }
     }
 
-    @Test
-    void shouldReleaseThePayloadOfARoutedPollRetriedAfterARefusal() throws Exception {
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void shouldReleaseThePayloadOfARoutedPollRetriedAfterARefusal(boolean deferred) throws Exception {
         IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
         ManualTimers timers = new ManualTimers();
         Coordinator coordinator = new Coordinator(group, timers);
         Primary primary = new Primary(group);
         PollRouter router = new PollRouter(() -> coordinator, endpoint -> primary);
         try {
-            router.poll(pollPayload(), Optional.empty())
+            routedPoll(router, pollPayload(), deferred)
                     .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
                     .release();
             ByteBuf reply = tracked(emptyPoll(0));
@@ -573,7 +731,7 @@ class PollRouterTest {
                     IggyServerException.fromTcpResponse(AsyncTcpConnection.TRANSIENT_NOT_ACCEPTED, new byte[0])));
             primary.replies.add(CompletableFuture.completedFuture(reply));
             ByteBuf payload = tracked(pollPayload());
-            var polled = router.poll(payload, Optional.empty());
+            var polled = routedPoll(router, payload, deferred);
             assertThat(polled).isNotDone();
 
             timers.runLast();
@@ -721,6 +879,108 @@ class PollRouterTest {
                 // router's completion callback in that task releases the payload.
                 link.get().eventLoop().submit(() -> {}).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
                 assertThat(payload.refCnt()).isZero();
+            } finally {
+                router.clearSession().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                parent.close().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                parent.sessionOwner().reset();
+            }
+            coordinatorServing.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            primaryServing.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        }
+    }
+
+    @Test
+    @SuppressWarnings({"checkstyle:CyclomaticComplexity", "checkstyle:NPathComplexity"})
+    void shouldSendWhileADeferredProgressPollKeepsOffsetOperationsWaiting() throws Exception {
+        InetAddress loopback = InetAddress.getLoopbackAddress();
+        try (ServerSocket coordinatorSocket = new ServerSocket(0, 1, loopback);
+                ServerSocket primarySocket = new ServerSocket(0, 1, loopback)) {
+            CompletableFuture<Void> parked = new CompletableFuture<>();
+            AtomicInteger offsetRequests = new AtomicInteger();
+            var coordinatorServing = serve(coordinatorSocket, request -> {
+                if (request.operation() == OPERATION_REGISTER) {
+                    return Response.success(OPERATION_REGISTER, registerBody(SESSION));
+                }
+                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(
+                            OPERATION_NON_REPLICATED,
+                            AsyncIggyTcpClientTransientFailoverTest.clusterMetadata(
+                                    coordinatorSocket.getLocalPort(),
+                                    primarySocket.getLocalPort(),
+                                    coordinatorSocket.getLocalPort()));
+                }
+                if (request.is(GET_PARTITION_ROUTE_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(
+                            OPERATION_NON_REPLICATED,
+                            pollRoute(request, SESSION, ROUTE_WATERMARK, primarySocket.getLocalPort(), INCARNATION));
+                }
+                return pong(request);
+            });
+            var primaryServing = serve(primarySocket, request -> {
+                if (request.is(BIND_SESSION_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(OPERATION_NON_REPLICATED, bindBody(request));
+                }
+                if (request.is(CommandCode.Messages.POLL_DEFERRED.getValue(), OPERATION_NON_REPLICATED)) {
+                    parked.complete(null);
+                    return Response.noReply();
+                }
+                if (request.is(CommandCode.Messages.CANCEL_DEFERRED_REQUEST.getValue(), OPERATION_NON_REPLICATED)) {
+                    return Response.noReply();
+                }
+                if (request.operation() == VsrOperation.SEND_MESSAGES) {
+                    return Response.success(request.operation(), Unpooled.EMPTY_BUFFER);
+                }
+                if (request.is(CommandCode.ConsumerOffset.GET.getValue(), OPERATION_NON_REPLICATED)
+                        || request.operation() == VsrOperation.STORE_CONSUMER_OFFSET
+                        || request.operation() == VsrOperation.DELETE_CONSUMER_OFFSET) {
+                    offsetRequests.incrementAndGet();
+                    return Response.success(
+                            request.operation(),
+                            request.operation() == OPERATION_NON_REPLICATED
+                                    ? Unpooled.EMPTY_BUFFER
+                                    : Unpooled.buffer(Integer.BYTES).writeIntLE(0));
+                }
+                return pong(request);
+            });
+            AsyncTcpConnection parent = connection(coordinatorSocket);
+            PollRouter router = new PollRouter(() -> parent, endpoint -> connection(primarySocket));
+            router.coordinatorEndpoint(
+                    () -> new ConnectionInfo(loopback.getHostAddress(), coordinatorSocket.getLocalPort()));
+            try {
+                parent.connect().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                new UsersTcpClient(() -> parent)
+                        .login("user", "password")
+                        .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                ByteBuf payload = pollPayload();
+                payload.setByte(payload.writerIndex() - 1, 1);
+                var poll = routedPoll(router, payload, true);
+                parked.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                List<CompletableFuture<ByteBuf>> offsets = new ArrayList<>();
+                for (var command : List.of(
+                        CommandCode.ConsumerOffset.STORE,
+                        CommandCode.ConsumerOffset.GET,
+                        CommandCode.ConsumerOffset.DELETE)) {
+                    ByteBuf offset = offsetPayload();
+                    if (command != CommandCode.ConsumerOffset.STORE) {
+                        offset.writerIndex(offset.writerIndex() - Long.BYTES);
+                    }
+                    offsets.add(router.partitionRequest(command.getValue(), offset, Optional.empty()));
+                }
+                new MessagesTcpClient(() -> parent, new ClientRoutingState(), router)
+                        .sendMessages(
+                                StreamId.of(1L),
+                                TopicId.of(1L),
+                                Partitioning.partitionId(0L),
+                                List.of(Message.of("message")))
+                        .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                assertThat(poll).isNotDone();
+                assertThat(offsetRequests.get()).isZero();
+                assertThat(offsets).allSatisfy(offset -> assertThat(offset).isNotDone());
+                assertThat(poll.cancel(false)).isTrue();
+                for (var offset : offsets) {
+                    offset.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS).release();
+                }
+                assertThat(offsetRequests.get()).isEqualTo(offsets.size());
             } finally {
                 router.clearSession().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
                 parent.close().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
@@ -1204,7 +1464,7 @@ class PollRouterTest {
         var owner = connection.sessionOwner();
         owner.configurePendingOperations(1, frameBytes);
         var ticket = owner.acquire(
-                        new ConsensusSession.LaneKey(INCARNATION, 0),
+                        new ConsensusSession.LaneKey(INCARNATION, 0, true),
                         true,
                         frameBytes,
                         System.nanoTime() + NEVER.toNanos(),
@@ -1434,6 +1694,18 @@ class PollRouterTest {
                             context.incarnation().longValue())
                     .setIntLE(Long.BYTES * 2, routeView));
         }
+    }
+
+    private static CompletableFuture<ByteBuf> routedPoll(PollRouter router, ByteBuf payload, boolean deferred) {
+        if (!deferred) {
+            return router.poll(payload, Optional.empty());
+        }
+        var options = DeferredPollOptions.defaults();
+        payload.writeLongLE(options.maxWaitMicros())
+                .writeIntLE((int) options.minCount())
+                .writeIntLE((int) options.maxBytes())
+                .writeLongLE(options.requestTimeoutMicros());
+        return router.partitionRequest(CommandCode.Messages.POLL_DEFERRED.getValue(), payload, Optional.empty());
     }
 
     /** Answers the first poll and leaves every later one in flight until it is closed. */

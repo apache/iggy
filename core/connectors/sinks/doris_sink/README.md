@@ -70,7 +70,6 @@ stream = "events"
 topics = ["doris_events"]
 schema = "json"
 batch_length = 100
-poll_interval = "5ms"
 consumer_group = "doris_sink"
 
 [plugin_config]

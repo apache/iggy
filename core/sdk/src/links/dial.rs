@@ -67,6 +67,18 @@ impl Dialer {
         }
     }
 
+    /// The largest reply body that a link reads, where the transport caps it.
+    pub(crate) fn reply_body_limit(&self) -> Option<usize> {
+        match self {
+            Self::Quic { config, .. } => Some(
+                usize::try_from(config.response_buffer_size)
+                    .unwrap_or(usize::MAX)
+                    .saturating_sub(iggy_binary_protocol::HEADER_SIZE),
+            ),
+            _ => None,
+        }
+    }
+
     /// Opens a link to `endpoint` within `DIAL_TIMEOUT`.
     ///
     /// `CannotEstablishConnection` means that this endpoint failed, and
@@ -469,6 +481,22 @@ mod tests {
         });
         assert!(accepted.is_err(), "the untrusted certificate must fail TLS");
         assert_eq!(result.err(), Some(IggyError::CannotEstablishConnection));
+    }
+
+    #[tokio::test]
+    async fn given_a_quic_response_buffer_when_limiting_replies_should_leave_room_for_the_header() {
+        let quic = quic_dialer(QuicClientConfig {
+            response_buffer_size: 1 << 20,
+            ..Default::default()
+        });
+        assert_eq!(
+            quic.reply_body_limit(),
+            Some((1 << 20) - iggy_binary_protocol::HEADER_SIZE)
+        );
+        assert_eq!(
+            Dialer::Tcp(Arc::new(TcpClientConfig::default())).reply_body_limit(),
+            None
+        );
     }
 
     #[test]

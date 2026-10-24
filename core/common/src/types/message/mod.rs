@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod deferred_poll_options;
 mod iggy_message;
 mod index;
 mod index_view;
@@ -34,6 +35,8 @@ pub mod polling_strategy;
 mod user_headers;
 
 pub const INDEX_SIZE: usize = 16;
+
+pub use deferred_poll_options::{DEFAULT_POLL_MAX_BYTES, DeferredPollOptions};
 
 pub use crate::http::messages::poll_messages::PollMessages;
 pub use crate::http::messages::send_messages::{

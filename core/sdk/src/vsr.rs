@@ -196,6 +196,7 @@ fn decode_reply_outcome(
                     outcome.result,
                     Err(IggyError::TransientNotCommitted
                         | IggyError::TransientNotAccepted
+                        | IggyError::DeferredPollCapacityExceeded
                         | IggyError::NotPrimary)
                 );
             }
@@ -512,6 +513,7 @@ mod tests {
         for error in [
             IggyError::TransientNotCommitted,
             IggyError::TransientNotAccepted,
+            IggyError::DeferredPollCapacityExceeded,
             IggyError::NotPrimary,
         ] {
             let body = rejection_body(error.as_code());

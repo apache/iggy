@@ -29,7 +29,6 @@ stream = "qw"
 topics = ["records"]
 schema = "json"
 batch_length = 1000
-poll_interval = "5ms"
 consumer_group = "qw_sink_connector"
 
 [transforms.add_fields]
