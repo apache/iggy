@@ -311,6 +311,44 @@ Run it four ways, with `CA_FILE=/tmp/certs/ca.pem` exported: `go run . 127.0.0.1
 and certificate runs also list `User:iggy`'s bindings, and the last reports the broker closing the
 connection during `ApiVersions`.
 
+### Category V — Node failover in a 3-node cluster
+
+Run against a 3-node Iggy cluster, because a single node has no partition primaries to move. A
+partition primary is the node that orders the writes of a partition. `scripts/cluster-failover.sh`
+starts 3 Iggy nodes and one gateway on 127.0.0.1, and creates a topic with 6 partitions. Each node
+holds the primary of 2 partitions. Through the gateway, `kafka-producer-perf-test.sh` sends 2000
+records a second, and a `kafka-verifiable-consumer.sh` group reads them.
+
+Under this load, the script stops a node that holds partition primaries and restarts it. Then it
+does the same to the metadata primary. At the end, `tests/java/ReadYourCommitsProbe.java` commits an
+offset in each partition and reads it back at once, 300 times. The gateway's node is a backup for 4
+of the 6 partitions. Since the fix for [#4409](https://github.com/apache/iggy/issues/4409), offset
+reads go to the partition primary. If a backup answers one instead, the probe gets a wrong offset.
+
+The script needs Linux, Docker, jq, perl and a JDK 17 or later. A run takes about 5 minutes:
+
+```bash
+cargo build --release --bin iggy-server
+cargo build --release -p iggy-gateway-kafka --bin iggy-gateway-kafka --example partition_routes
+docker pull apache/kafka:4.4.0
+./gateways/kafka/scripts/cluster-failover.sh /tmp/failover-term
+STOP_SIGNAL=KILL ./gateways/kafka/scripts/cluster-failover.sh /tmp/failover-kill
+```
+
+The work dir keeps every log. To print the report of a run again, run `cluster-failover.sh --report
+<work dir>`. For each phase, the report shows the slowest send, the time until sends recovered and
+the client retries. It also counts how often the gateway's Iggy session dialed another node.
+
+| ID | Test | Command | Pass criteria | Last run |
+| ---- | ------ | --------- | --------------- | ---------- |
+| V1 | Graceful stop | `cluster-failover.sh` | Prints `pass` and exits 0. No record is missing, and no offset reads back wrong | Pass |
+| V2 | Crash | `STOP_SIGNAL=KILL cluster-failover.sh` | Same as V1 | Pass |
+
+In the last runs, the gateway's session stayed on its node, and the producer got no error. A stop
+paused sends for about 5 s. Then new partition primaries took over, and sends continued. After a
+restart, the restarted node caught up for up to 25 s, and sends through the gateway were slow in
+that time.
+
 ### Category A — Smoke tests (must pass before check-in)
 
 The gateway binds `:9093` by default; `kafka-message-gen`'s own default is `:9092` (a real Kafka

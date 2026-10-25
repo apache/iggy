@@ -44,10 +44,7 @@ Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/34
 > resumes from its last commit, also after a gateway restart
 > ([docs/OFFSET_STORAGE.md](docs/OFFSET_STORAGE.md)). Every Iggy server must run a build with the
 > external group consumer kind ([#4392](https://github.com/apache/iggy/pull/4392)) before the first
-> commit. In a partly upgraded cluster, one commit can make a partition stop committing. In a
-> cluster, a node that has not applied a group's first commit answers "no offset", so a consumer on
-> `auto.offset.reset=latest` can skip records until
-> [#4409](https://github.com/apache/iggy/issues/4409).
+> commit. In a partly upgraded cluster, one commit can make a partition stop committing.
 
 ## Run
 

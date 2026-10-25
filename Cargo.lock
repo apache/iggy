@@ -7290,6 +7290,7 @@ dependencies = [
  "flate2",
  "futures",
  "iggy",
+ "iggy_binary_protocol",
  "kafka-protocol",
  "libc",
  "lz4",
