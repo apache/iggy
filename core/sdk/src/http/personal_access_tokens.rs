@@ -17,6 +17,7 @@
 
 use crate::http::http_client::HttpClient;
 use crate::http::http_transport::HttpTransport;
+use crate::http::path::encode_segment;
 use crate::prelude::IggyError;
 use async_trait::async_trait;
 use iggy_common::IdentityInfo;
@@ -62,7 +63,8 @@ impl PersonalAccessTokenClient for HttpClient {
     }
 
     async fn delete_personal_access_token(&self, name: &str) -> Result<(), IggyError> {
-        self.delete(&format!("{PATH}/{name}")).await?;
+        self.delete(&format!("{PATH}/{}", encode_segment(name)))
+            .await?;
         Ok(())
     }
 
