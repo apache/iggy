@@ -30,7 +30,7 @@ impl ConsumerOffsetClient for ClientWrapper {
         topic_id: &Identifier,
         position: ConsumerPosition,
     ) -> Result<(), IggyError> {
-        dispatch_client!(
+        super::dispatch_client!(
             self,
             ConsumerOffsetClient::store_consumer_position(consumer, stream_id, topic_id, position)
         )
@@ -45,7 +45,7 @@ impl ConsumerOffsetClient for ClientWrapper {
         partition_id: Option<u32>,
         offset: u64,
     ) -> Result<(), IggyError> {
-        dispatch_client!(
+        super::dispatch_client!(
             self,
             ConsumerOffsetClient::store_consumer_offset(
                 consumer,
@@ -65,7 +65,7 @@ impl ConsumerOffsetClient for ClientWrapper {
         topic_id: &Identifier,
         partition_id: Option<u32>,
     ) -> Result<Option<ConsumerOffsetInfo>, IggyError> {
-        dispatch_client!(
+        super::dispatch_client!(
             self,
             ConsumerOffsetClient::get_consumer_offset(consumer, stream_id, topic_id, partition_id)
         )
@@ -79,7 +79,7 @@ impl ConsumerOffsetClient for ClientWrapper {
         topic_id: &Identifier,
         partition_id: Option<u32>,
     ) -> Result<(), IggyError> {
-        dispatch_client!(
+        super::dispatch_client!(
             self,
             ConsumerOffsetClient::delete_consumer_offset(
                 consumer,

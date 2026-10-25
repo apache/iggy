@@ -26,35 +26,35 @@ use iggy_common::{
 #[async_trait]
 impl SystemClient for ClientWrapper {
     async fn get_stats(&self) -> Result<Stats, IggyError> {
-        dispatch_client!(self, SystemClient::get_stats()).await
+        super::dispatch_client!(self, SystemClient::get_stats()).await
     }
 
     async fn get_me(&self) -> Result<ClientInfoDetails, IggyError> {
-        dispatch_client!(self, SystemClient::get_me()).await
+        super::dispatch_client!(self, SystemClient::get_me()).await
     }
 
     async fn get_client(&self, client_id: u32) -> Result<Option<ClientInfoDetails>, IggyError> {
-        dispatch_client!(self, SystemClient::get_client(client_id)).await
+        super::dispatch_client!(self, SystemClient::get_client(client_id)).await
     }
 
     async fn get_clients(&self) -> Result<Vec<ClientInfo>, IggyError> {
-        dispatch_client!(self, SystemClient::get_clients()).await
+        super::dispatch_client!(self, SystemClient::get_clients()).await
     }
 
     async fn describe_options(&self, scope: OptionsScope) -> Result<Vec<OptionSpec>, IggyError> {
-        dispatch_client!(self, SystemClient::describe_options(scope)).await
+        super::dispatch_client!(self, SystemClient::describe_options(scope)).await
     }
 
     async fn ping(&self) -> Result<(), IggyError> {
-        dispatch_client!(self, SystemClient::ping()).await
+        super::dispatch_client!(self, SystemClient::ping()).await
     }
 
     async fn heartbeat_interval(&self) -> NonZeroIggyDuration {
-        dispatch_client!(self, SystemClient::heartbeat_interval()).await
+        super::dispatch_client!(self, SystemClient::heartbeat_interval()).await
     }
 
     async fn refresh_consumer_group_assignments(&self) {
-        dispatch_client!(self, SystemClient::refresh_consumer_group_assignments()).await
+        super::dispatch_client!(self, SystemClient::refresh_consumer_group_assignments()).await
     }
 
     async fn snapshot(
@@ -62,13 +62,13 @@ impl SystemClient for ClientWrapper {
         compression: SnapshotCompression,
         snapshot_types: Vec<SystemSnapshotType>,
     ) -> Result<Snapshot, IggyError> {
-        dispatch_client!(self, SystemClient::snapshot(compression, snapshot_types)).await
+        super::dispatch_client!(self, SystemClient::snapshot(compression, snapshot_types)).await
     }
 
     async fn get_metadata_changes(
         &self,
         query: &MetadataChangesQuery,
     ) -> Result<MetadataChanges, IggyError> {
-        dispatch_client!(self, SystemClient::get_metadata_changes(query)).await
+        super::dispatch_client!(self, SystemClient::get_metadata_changes(query)).await
     }
 }

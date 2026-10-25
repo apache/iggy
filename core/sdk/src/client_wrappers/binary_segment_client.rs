@@ -28,7 +28,7 @@ impl SegmentClient for ClientWrapper {
         partition_id: u32,
         segments_count: u32,
     ) -> Result<(), IggyError> {
-        dispatch_client!(
+        super::dispatch_client!(
             self,
             SegmentClient::delete_segments(stream_id, topic_id, partition_id, segments_count)
         )

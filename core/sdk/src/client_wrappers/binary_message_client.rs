@@ -56,7 +56,7 @@ impl MessageClient for ClientWrapper {
         count: u32,
         auto_commit: bool,
     ) -> Result<PolledMessages, IggyError> {
-        dispatch_client!(
+        super::dispatch_client!(
             self,
             MessageClient::poll_messages_with_strategy_for(
                 stream_id,
@@ -78,7 +78,7 @@ impl MessageClient for ClientWrapper {
         partitioning: &Partitioning,
         messages: &mut [IggyMessage],
     ) -> Result<SendMessagesResponse, IggyError> {
-        dispatch_client!(
+        super::dispatch_client!(
             self,
             MessageClient::send_messages(stream_id, topic_id, partitioning, messages)
         )

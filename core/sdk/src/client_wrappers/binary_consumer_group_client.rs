@@ -30,7 +30,7 @@ impl ConsumerGroupClient for ClientWrapper {
         topic_id: &Identifier,
         group_id: &Identifier,
     ) -> Result<Option<ConsumerGroupDetails>, IggyError> {
-        dispatch_client!(
+        super::dispatch_client!(
             self,
             ConsumerGroupClient::get_consumer_group(stream_id, topic_id, group_id)
         )
@@ -42,7 +42,7 @@ impl ConsumerGroupClient for ClientWrapper {
         stream_id: &Identifier,
         topic_id: &Identifier,
     ) -> Result<Vec<ConsumerGroup>, IggyError> {
-        dispatch_client!(
+        super::dispatch_client!(
             self,
             ConsumerGroupClient::get_consumer_groups(stream_id, topic_id)
         )
@@ -55,7 +55,7 @@ impl ConsumerGroupClient for ClientWrapper {
         topic_id: &Identifier,
         name: &str,
     ) -> Result<ConsumerGroupDetails, IggyError> {
-        dispatch_client!(
+        super::dispatch_client!(
             self,
             ConsumerGroupClient::create_consumer_group(stream_id, topic_id, name)
         )
@@ -68,7 +68,7 @@ impl ConsumerGroupClient for ClientWrapper {
         topic_id: &Identifier,
         group_id: &Identifier,
     ) -> Result<(), IggyError> {
-        dispatch_client!(
+        super::dispatch_client!(
             self,
             ConsumerGroupClient::delete_consumer_group(stream_id, topic_id, group_id)
         )
@@ -81,7 +81,7 @@ impl ConsumerGroupClient for ClientWrapper {
         topic_id: &Identifier,
         group_id: &Identifier,
     ) -> Result<(), IggyError> {
-        dispatch_client!(
+        super::dispatch_client!(
             self,
             ConsumerGroupClient::join_consumer_group(stream_id, topic_id, group_id)
         )
@@ -94,7 +94,7 @@ impl ConsumerGroupClient for ClientWrapper {
         topic_id: &Identifier,
         group_id: &Identifier,
     ) -> Result<(), IggyError> {
-        dispatch_client!(
+        super::dispatch_client!(
             self,
             ConsumerGroupClient::leave_consumer_group(stream_id, topic_id, group_id)
         )
@@ -105,6 +105,6 @@ impl ConsumerGroupClient for ClientWrapper {
 #[async_trait]
 impl AsyncDrop for ClientWrapper {
     async fn async_drop(&mut self) {
-        let _ = dispatch_client!(self, UserClient::logout_user()).await;
+        let _ = super::dispatch_client!(self, UserClient::logout_user()).await;
     }
 }

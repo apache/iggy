@@ -25,11 +25,11 @@ use iggy_common::{
 #[async_trait]
 impl StreamClient for ClientWrapper {
     async fn get_stream(&self, stream_id: &Identifier) -> Result<Option<StreamDetails>, IggyError> {
-        dispatch_client!(self, StreamClient::get_stream(stream_id)).await
+        super::dispatch_client!(self, StreamClient::get_stream(stream_id)).await
     }
 
     async fn get_streams(&self) -> Result<Vec<Stream>, IggyError> {
-        dispatch_client!(self, StreamClient::get_streams()).await
+        super::dispatch_client!(self, StreamClient::get_streams()).await
     }
 
     async fn create_stream(
@@ -37,7 +37,7 @@ impl StreamClient for ClientWrapper {
         name: &str,
         options: &StreamCreateOptions,
     ) -> Result<StreamDetails, IggyError> {
-        dispatch_client!(self, StreamClient::create_stream(name, options)).await
+        super::dispatch_client!(self, StreamClient::create_stream(name, options)).await
     }
 
     async fn update_stream(
@@ -45,10 +45,10 @@ impl StreamClient for ClientWrapper {
         stream_id: &Identifier,
         options: &StreamUpdateOptions,
     ) -> Result<(), IggyError> {
-        dispatch_client!(self, StreamClient::update_stream(stream_id, options)).await
+        super::dispatch_client!(self, StreamClient::update_stream(stream_id, options)).await
     }
 
     async fn delete_stream(&self, stream_id: &Identifier) -> Result<(), IggyError> {
-        dispatch_client!(self, StreamClient::delete_stream(stream_id)).await
+        super::dispatch_client!(self, StreamClient::delete_stream(stream_id)).await
     }
 }

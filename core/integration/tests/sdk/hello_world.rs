@@ -35,6 +35,7 @@ async fn hello_world(harness: &TestHarness) {
     client.logout_user().await.unwrap();
 }
 
+// The matrix varies the inner transport of ClientWrapper::Iggy.
 #[iggy_harness(test_client_transport = [Tcp, Http, Quic, WebSocket])]
 async fn nested_client_wrapper_forwards_results_and_errors(harness: &TestHarness) {
     let client = harness.root_client().await.unwrap();

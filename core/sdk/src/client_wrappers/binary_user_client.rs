@@ -25,11 +25,11 @@ use iggy_common::{
 #[async_trait]
 impl UserClient for ClientWrapper {
     async fn get_user(&self, user_id: &Identifier) -> Result<Option<UserInfoDetails>, IggyError> {
-        dispatch_client!(self, UserClient::get_user(user_id)).await
+        super::dispatch_client!(self, UserClient::get_user(user_id)).await
     }
 
     async fn get_users(&self) -> Result<Vec<UserInfo>, IggyError> {
-        dispatch_client!(self, UserClient::get_users()).await
+        super::dispatch_client!(self, UserClient::get_users()).await
     }
 
     async fn create_user(
@@ -40,7 +40,7 @@ impl UserClient for ClientWrapper {
         permissions: Option<Permissions>,
         options: &UserCreateOptions,
     ) -> Result<UserInfoDetails, IggyError> {
-        dispatch_client!(
+        super::dispatch_client!(
             self,
             UserClient::create_user(username, password, status, permissions, options)
         )
@@ -48,7 +48,7 @@ impl UserClient for ClientWrapper {
     }
 
     async fn delete_user(&self, user_id: &Identifier) -> Result<(), IggyError> {
-        dispatch_client!(self, UserClient::delete_user(user_id)).await
+        super::dispatch_client!(self, UserClient::delete_user(user_id)).await
     }
 
     async fn update_user(
@@ -56,7 +56,7 @@ impl UserClient for ClientWrapper {
         user_id: &Identifier,
         options: &UserUpdateOptions,
     ) -> Result<(), IggyError> {
-        dispatch_client!(self, UserClient::update_user(user_id, options)).await
+        super::dispatch_client!(self, UserClient::update_user(user_id, options)).await
     }
 
     async fn update_permissions(
@@ -64,7 +64,7 @@ impl UserClient for ClientWrapper {
         user_id: &Identifier,
         permissions: Option<Permissions>,
     ) -> Result<(), IggyError> {
-        dispatch_client!(self, UserClient::update_permissions(user_id, permissions)).await
+        super::dispatch_client!(self, UserClient::update_permissions(user_id, permissions)).await
     }
 
     async fn change_password(
@@ -73,7 +73,7 @@ impl UserClient for ClientWrapper {
         current_password: &str,
         new_password: &str,
     ) -> Result<(), IggyError> {
-        dispatch_client!(
+        super::dispatch_client!(
             self,
             UserClient::change_password(user_id, current_password, new_password)
         )
@@ -81,10 +81,10 @@ impl UserClient for ClientWrapper {
     }
 
     async fn login_user(&self, username: &str, password: &str) -> Result<IdentityInfo, IggyError> {
-        dispatch_client!(self, UserClient::login_user(username, password)).await
+        super::dispatch_client!(self, UserClient::login_user(username, password)).await
     }
 
     async fn logout_user(&self) -> Result<(), IggyError> {
-        dispatch_client!(self, UserClient::logout_user()).await
+        super::dispatch_client!(self, UserClient::logout_user()).await
     }
 }

@@ -28,11 +28,11 @@ impl TopicClient for ClientWrapper {
         stream_id: &Identifier,
         topic_id: &Identifier,
     ) -> Result<Option<TopicDetails>, IggyError> {
-        dispatch_client!(self, TopicClient::get_topic(stream_id, topic_id)).await
+        super::dispatch_client!(self, TopicClient::get_topic(stream_id, topic_id)).await
     }
 
     async fn get_topics(&self, stream_id: &Identifier) -> Result<Vec<Topic>, IggyError> {
-        dispatch_client!(self, TopicClient::get_topics(stream_id)).await
+        super::dispatch_client!(self, TopicClient::get_topics(stream_id)).await
     }
 
     async fn create_topic(
@@ -41,7 +41,7 @@ impl TopicClient for ClientWrapper {
         name: &str,
         options: &TopicCreateOptions,
     ) -> Result<TopicDetails, IggyError> {
-        dispatch_client!(self, TopicClient::create_topic(stream_id, name, options)).await
+        super::dispatch_client!(self, TopicClient::create_topic(stream_id, name, options)).await
     }
 
     async fn update_topic(
@@ -50,7 +50,7 @@ impl TopicClient for ClientWrapper {
         topic_id: &Identifier,
         options: &TopicUpdateOptions,
     ) -> Result<(), IggyError> {
-        dispatch_client!(
+        super::dispatch_client!(
             self,
             TopicClient::update_topic(stream_id, topic_id, options)
         )
@@ -62,6 +62,6 @@ impl TopicClient for ClientWrapper {
         stream_id: &Identifier,
         topic_id: &Identifier,
     ) -> Result<(), IggyError> {
-        dispatch_client!(self, TopicClient::delete_topic(stream_id, topic_id)).await
+        super::dispatch_client!(self, TopicClient::delete_topic(stream_id, topic_id)).await
     }
 }

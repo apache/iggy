@@ -24,26 +24,26 @@ use std::time::Instant;
 #[async_trait]
 impl Client for ClientWrapper {
     async fn connect(&self) -> Result<(), IggyError> {
-        dispatch_client!(self, Client::connect()).await
+        super::dispatch_client!(self, Client::connect()).await
     }
 
     async fn disconnect(&self) -> Result<(), IggyError> {
-        dispatch_client!(self, Client::disconnect()).await
+        super::dispatch_client!(self, Client::disconnect()).await
     }
 
     async fn shutdown(&self) -> Result<(), IggyError> {
-        dispatch_client!(self, Client::shutdown()).await
+        super::dispatch_client!(self, Client::shutdown()).await
     }
 
     async fn subscribe_events(&self) -> Receiver<DiagnosticEvent> {
-        dispatch_client!(self, Client::subscribe_events()).await
+        super::dispatch_client!(self, Client::subscribe_events()).await
     }
 
     async fn resolve_operation(&self, op: u64, deadline: Instant) -> Result<(), IggyError> {
-        dispatch_client!(self, Client::resolve_operation(op, deadline)).await
+        super::dispatch_client!(self, Client::resolve_operation(op, deadline)).await
     }
 
     async fn abandon_operation(&self, op: u64) -> Result<(), IggyError> {
-        dispatch_client!(self, Client::abandon_operation(op)).await
+        super::dispatch_client!(self, Client::abandon_operation(op)).await
     }
 }

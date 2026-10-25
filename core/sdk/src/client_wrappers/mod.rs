@@ -28,6 +28,8 @@ macro_rules! dispatch_client {
     };
 }
 
+pub(crate) use dispatch_client;
+
 mod binary_client;
 mod binary_cluster_client;
 mod binary_consumer_group_client;

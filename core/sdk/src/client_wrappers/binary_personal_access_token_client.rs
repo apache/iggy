@@ -25,7 +25,7 @@ use iggy_common::{
 #[async_trait]
 impl PersonalAccessTokenClient for ClientWrapper {
     async fn get_personal_access_tokens(&self) -> Result<Vec<PersonalAccessTokenInfo>, IggyError> {
-        dispatch_client!(
+        super::dispatch_client!(
             self,
             PersonalAccessTokenClient::get_personal_access_tokens()
         )
@@ -37,7 +37,7 @@ impl PersonalAccessTokenClient for ClientWrapper {
         name: &str,
         expiry: PersonalAccessTokenExpiry,
     ) -> Result<RawPersonalAccessToken, IggyError> {
-        dispatch_client!(
+        super::dispatch_client!(
             self,
             PersonalAccessTokenClient::create_personal_access_token(name, expiry)
         )
@@ -45,7 +45,7 @@ impl PersonalAccessTokenClient for ClientWrapper {
     }
 
     async fn delete_personal_access_token(&self, name: &str) -> Result<(), IggyError> {
-        dispatch_client!(
+        super::dispatch_client!(
             self,
             PersonalAccessTokenClient::delete_personal_access_token(name)
         )
@@ -56,7 +56,7 @@ impl PersonalAccessTokenClient for ClientWrapper {
         &self,
         token: &str,
     ) -> Result<IdentityInfo, IggyError> {
-        dispatch_client!(
+        super::dispatch_client!(
             self,
             PersonalAccessTokenClient::login_with_personal_access_token(token)
         )

@@ -27,7 +27,7 @@ impl PartitionClient for ClientWrapper {
         topic_id: &Identifier,
         partitions_count: u32,
     ) -> Result<(), IggyError> {
-        dispatch_client!(
+        super::dispatch_client!(
             self,
             PartitionClient::create_partitions(stream_id, topic_id, partitions_count)
         )
@@ -40,7 +40,7 @@ impl PartitionClient for ClientWrapper {
         topic_id: &Identifier,
         partitions_count: u32,
     ) -> Result<(), IggyError> {
-        dispatch_client!(
+        super::dispatch_client!(
             self,
             PartitionClient::delete_partitions(stream_id, topic_id, partitions_count)
         )
