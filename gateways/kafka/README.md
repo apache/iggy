@@ -77,7 +77,7 @@ Default bind: a `PLAINTEXT` listener on `127.0.0.1:9093`. Environment variables:
 | `IGGY_KAFKA_WRITE_TIMEOUT_SECS` | `10` | Seconds allowed to write a response frame |
 | `IGGY_KAFKA_SHUTDOWN_DRAIN_TIMEOUT_SECS` | `25` | Seconds graceful shutdown waits for in-flight connections before abandoning them. The bridge then signs its Iggy clients out, 5 s at most |
 | `IGGY_KAFKA_INSTANCE_ID` | `0` | This gateway's number among the gateways fronting one Iggy cluster. It is the high half of every producer id `InitProducerId` hands out, and Kafka requires those to be cluster-unique, so give every gateway its own value. A single gateway can leave it at `0`. |
-| `IGGY_KAFKA_BRIDGE_ENABLED` | `false` | Connect the Iggy bridge at startup. While false every API answers with its stub, and the `IGGY_KAFKA_IGGY_*` variables below are read by nothing. A failed connection is fatal, not a downgrade to stubs. |
+| `IGGY_KAFKA_BRIDGE_ENABLED` | `false` | Connect the Iggy bridge at startup. While false every API answers with its stub, and the `IGGY_KAFKA_IGGY_*` variables below are read by nothing. If Iggy does not answer, startup tries again 1 s after each failed connect, for up to 60 s, and then the gateway stops. A wrong password or a missing permission stops it at once. It never falls back to stubs. |
 | `IGGY_KAFKA_SASL_ENABLED` | `false` | Single-listener form: require SASL/PLAIN before serving any other API (`true` or `false`, nothing else). With `IGGY_KAFKA_LISTENERS`, a `SASL_PLAINTEXT` or `SASL_SSL` listener says the same |
 | `IGGY_KAFKA_PRE_AUTH_TIMEOUT_SECS` | `15` | Seconds an unauthenticated connection may sit between frames. Waiting for an authentication slot and the verification itself each get this budget, the verification's starting once it holds a slot. Separate from the 10-minute idle timeout that applies once authenticated |
 | `IGGY_KAFKA_MAX_CONCURRENT_AUTHENTICATIONS` | `4` | Credential verifications the gateway runs at once, across all connections. Each costs a password hash on an Iggy shard thread. This bounds the gateway's side only: a check that times out frees its slot while its hash keeps running inside Iggy. Size it below the Iggy node's shard count |
@@ -316,6 +316,10 @@ IGGY_KAFKA_LISTENERS=PLAINTEXT://127.0.0.1:9093,SSL://0.0.0.0:9094,SASL_SSL://0.
 
 Each security protocol can be bound once, since the protocol is also the listener's name.
 
+No `accept()` error stops a listener. An error of one pending connection, such as a reset, retries
+at once. Any other error, such as no free file descriptor, waits 10 ms before the next accept.
+The wait doubles up to 1 s while the error continues.
+
 TLS is rustls. One certificate serves every `SSL` and `SASL_SSL` listener, and the files are
 re-read every `IGGY_KAFKA_TLS_RELOAD_INTERVAL_SECS`: a rotated certificate takes effect for new
 connections without a restart, a key that does not match leaves the previous material serving and
@@ -422,8 +426,10 @@ Four things to know before switching it on:
 - **Enabling it breaks every existing client at once.** The two SASL keys appear in the
   `ApiVersions` advertisement only while it is on, and unauthenticated clients are refused.
 - **Every connection costs a login**, meaning one password hash on an Iggy shard thread and one
-  replicated registration. Verification is deliberately not cached, since caching it per username
-  would let a second connection present any password. Connection churn is therefore server load.
+  replicated registration. The check then signs out, so its Iggy session ends at once. Without
+  the sign out, Iggy keeps the session for 36 s, and a full session table refuses new logins.
+  Verification is deliberately not cached, since caching it per username would let a second
+  connection present any password. Connection churn is therefore server load.
   `IGGY_KAFKA_MAX_CONCURRENT_AUTHENTICATIONS` bounds the checks the gateway runs at once, and a peer
   whose login was rejected is refused for a delay that doubles per rejection, from 0.5s up to 30s.
 - **Authentication and an ACL view, not enforcement.** The gateway verifies the credentials and
@@ -596,7 +602,9 @@ The initial connect retries a fixed, bounded number of times (`RECONNECTION_RETR
 Iggy SDK client's own default of unlimited retries, one dial per second, forever), and the whole
 attempt - retries included - is capped at `REQUEST_TIMEOUT` (15s) wall-clock, so `IggyBridge::connect`
 fails in bounded time whether the address refuses the connection or silently drops it, instead of
-blocking the calling task indefinitely. Every other bridge call (`ensure_stream_and_topic`,
+blocking the calling task indefinitely. At startup, the gateway retries a connect that a retry can
+fix (6 or 7). It waits 1 s between tries, for up to 60 s. The cluster id load after it does the same.
+So a gateway that starts before its Iggy node waits for it. Every other bridge call (`ensure_stream_and_topic`,
 `high_watermark(s)`, `probe`, `close`) carries the same `REQUEST_TIMEOUT` for the same
 reason: the SDK reconnects internally, mid-call, on a transport error, through the same
 undead-lined dial path - a bridge call made well after the initial connect can still hit this if

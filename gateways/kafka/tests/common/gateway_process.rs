@@ -26,6 +26,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command};
 
 use crate::iggy_server::{PortGuard, TestServer, graceful_kill, wait_for_listener};
+use iggy_gateway_kafka::bridge::IggyBridgeConfig;
 use std::env;
 
 /// Locates the already-built `iggy-gateway-kafka` binary.
@@ -50,9 +51,16 @@ impl TestGateway {
     /// Spawns `iggy-gateway-kafka` with the bridge enabled against `server`, then blocks until
     /// its listener is ready or the startup budget is exhausted.
     pub async fn spawn(server: &TestServer) -> Self {
+        let mut gateway = Self::start(&server.test_config());
+        gateway.wait_ready().await;
+        gateway
+    }
+
+    /// Starts `iggy-gateway-kafka` against the Iggy server that `config` names, which need not run
+    /// yet. [`Self::wait_ready`] waits for its listener.
+    pub fn start(config: &IggyBridgeConfig) -> Self {
         let port_guard = PortGuard::acquire();
         let address = format!("127.0.0.1:{}", port_guard.port);
-        let config = server.test_config();
 
         let mut command = Command::new(iggy_gateway_binary());
         // env_clear(): without it the child inherits this test process's full environment, and
@@ -76,20 +84,26 @@ impl TestGateway {
             );
         let child = command.spawn().expect("spawn iggy-gateway-kafka");
 
-        let mut gateway = Self {
+        Self {
             child,
             address,
             _port_guard: port_guard,
-        };
-        gateway.wait_ready().await;
-        gateway
+        }
+    }
+
+    /// Whether the process still runs.
+    pub fn is_running(&mut self) -> bool {
+        self.child
+            .try_wait()
+            .expect("poll iggy-gateway-kafka")
+            .is_none()
     }
 
     /// Bare TCP connect poll, same rationale as `TestServer::wait_ready`: a full Kafka client
     /// handshake would pay retry overhead on every failed attempt. A connect slightly ahead of
     /// the gateway's own accept loop can't happen here - `main.rs` connects the bridge before
     /// binding the listener, so a successful connect already implies the bridge is up too.
-    async fn wait_ready(&mut self) {
+    pub async fn wait_ready(&mut self) {
         wait_for_listener(&mut self.child, &self.address, "iggy-gateway-kafka").await;
     }
 }

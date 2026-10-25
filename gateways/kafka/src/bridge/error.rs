@@ -196,6 +196,19 @@ impl BridgeError {
         }
     }
 
+    /// True when the same call can succeed later: Kafka clients retry its code, 6 or 7. A wrong
+    /// password, a missing permission or a bad configuration is not.
+    #[must_use]
+    pub fn is_retriable(&self) -> bool {
+        match self {
+            Self::ClusterIdCall { source, .. } => source.is_retriable(),
+            _ => matches!(
+                self.to_kafka_error_code(),
+                ERROR_NOT_LEADER_OR_FOLLOWER | ERROR_REQUEST_TIMED_OUT
+            ),
+        }
+    }
+
     /// True when Iggy rejected the bridge's own login. The Kafka client only sees -1.
     #[must_use]
     pub const fn is_bridge_login_rejected(&self) -> bool {
@@ -657,5 +670,44 @@ mod tests {
         }
         assert!(!BridgeError::Iggy(IggyError::Unauthorized).is_bridge_login_rejected());
         assert!(!BridgeError::Timeout.is_bridge_login_rejected());
+    }
+
+    #[test]
+    fn given_an_iggy_that_is_not_up_yet_should_be_retriable() {
+        for error in [
+            BridgeError::Iggy(IggyError::CannotEstablishConnection),
+            BridgeError::Iggy(IggyError::Disconnected),
+            BridgeError::Timeout,
+        ] {
+            assert!(error.is_retriable(), "{error}");
+        }
+        let call = BridgeError::ClusterIdCall {
+            call: ClusterIdCall::Poll,
+            stream: "kafka".to_string(),
+            topic: "topic",
+            source: Box::new(BridgeError::Iggy(IggyError::NotConnected)),
+        };
+        assert!(
+            call.is_retriable(),
+            "a cluster id call answers for its cause"
+        );
+    }
+
+    #[test]
+    fn given_a_wrong_setting_should_not_be_retriable() {
+        for error in [
+            BridgeError::Iggy(IggyError::InvalidCredentials),
+            BridgeError::Iggy(IggyError::Unauthorized),
+            BridgeError::InvalidConfig("empty address".to_string()),
+        ] {
+            assert!(!error.is_retriable(), "{error}");
+        }
+        let call = BridgeError::ClusterIdCall {
+            call: ClusterIdCall::CreateStream,
+            stream: "kafka".to_string(),
+            topic: "topic",
+            source: Box::new(BridgeError::Iggy(IggyError::Unauthorized)),
+        };
+        assert!(!call.is_retriable());
     }
 }

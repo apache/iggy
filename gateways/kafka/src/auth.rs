@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use iggy::prelude::{
     AutoLogin, Client, Credentials, Identifier, IggyError, Permissions, TcpClient,
-    TcpClientConfigBuilder, UserStatus,
+    TcpClientConfigBuilder, UserClient, UserStatus,
 };
 use tokio::sync::SemaphorePermit;
 use tracing::{debug, warn};
@@ -64,12 +64,12 @@ const VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 /// would only hide the failure underneath one the client cannot see.
 const VERIFY_RECONNECTION_RETRIES: u32 = 0;
 
-/// Budget for tearing the verification client down again.
+/// Budget for signing the verification client out and tearing it down again.
 ///
 /// Deliberately far shorter than [`VERIFY_TIMEOUT`]. The authentication slot is already released by
 /// the time teardown runs, but every second here still comes out of the caller's own
-/// pre-authentication budget. Nothing is lost by cutting it short: dropping the client closes the
-/// socket regardless.
+/// pre-authentication budget. Little is lost by cutting it short: dropping the client closes the
+/// socket regardless, and Iggy ends a session that did not sign out when its lease runs out.
 const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Delay imposed on a peer after its first rejected login, doubled on every further rejection.
@@ -391,6 +391,7 @@ impl SaslAuthenticator for IggyAuthenticator {
         // The password verify the slot bounds is done. Holding it across the permission read and
         // teardown would keep a slot busy for two more round trips per login.
         drop(slot);
+        let signed_in = matches!(connected, Ok(Ok(())));
         let outcome = match connected {
             Err(_elapsed) => Err(AuthError::Unavailable),
             Ok(Err(error)) => Err(classify(&error)),
@@ -402,20 +403,28 @@ impl SaslAuthenticator for IggyAuthenticator {
             Ok(Ok(())) => fetch_permissions(&client, &credentials.username).await,
         };
 
-        // Shut down rather than drop, so the socket closes cleanly and Iggy releases the session
-        // now instead of noticing the dead peer later.
+        // Sign out first: a shutdown only closes the socket, and Iggy keeps the session in its
+        // clients table until the lease runs out, 36 s by default. A full table refuses every new
+        // login, so a burst of Kafka logins would lock out the cluster's other clients. Then shut
+        // down rather than drop, so the socket closes cleanly.
         //
         // Both failure shapes are reported, and separately: the outer `Elapsed` and the inner
         // `IggyError` mean different things, and folding them together would log "timed out" for a
         // shutdown that failed immediately. Neither leaks the client, since dropping it closes the
         // socket regardless, but an invisible failure here would hide a real one.
-        match tokio::time::timeout(TEARDOWN_TIMEOUT, client.shutdown()).await {
+        let teardown = async {
+            if signed_in && let Err(error) = client.logout_user().await {
+                debug!(%error, "a credential-verification client did not sign out");
+            }
+            client.shutdown().await
+        };
+        match tokio::time::timeout(TEARDOWN_TIMEOUT, teardown).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 warn!(%error, "failed to shut down a credential-verification client");
             }
             Err(_elapsed) => {
-                warn!("timed out shutting down a credential-verification client");
+                warn!("timed out signing out and shutting down a credential-verification client");
             }
         }
 

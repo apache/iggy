@@ -262,12 +262,12 @@ impl TestServer {
     /// its assertions, orphaning a process that still holds its `PortGuard` slot, which then
     /// fails the next test that draws that slot to bind.
     pub async fn spawn_with_password(data_dir: &std::path::Path, password: &str) -> Self {
-        Self::spawn_configured(data_dir, password, None, &[]).await
+        Self::spawn_configured(data_dir, password, None, &[], PortGuard::acquire()).await
     }
 
     /// [`Self::spawn`] with server settings of its own, as `IGGY_*` variables.
     pub async fn spawn_with_env(data_dir: &std::path::Path, env: &[(&str, &str)]) -> Self {
-        Self::spawn_configured(data_dir, "iggy", None, env).await
+        Self::spawn_configured(data_dir, "iggy", None, env, PortGuard::acquire()).await
     }
 
     /// Spawns `iggy-server` whose TCP listener speaks only TLS, with the given PEM pair.
@@ -279,7 +279,19 @@ impl TestServer {
         cert_file: &std::path::Path,
         key_file: &std::path::Path,
     ) -> Self {
-        Self::spawn_configured(data_dir, "iggy", Some((cert_file, key_file)), &[]).await
+        Self::spawn_configured(
+            data_dir,
+            "iggy",
+            Some((cert_file, key_file)),
+            &[],
+            PortGuard::acquire(),
+        )
+        .await
+    }
+
+    /// [`Self::spawn`] on the port that [`Self::stop`] kept, as a node that comes back.
+    pub async fn spawn_on(data_dir: &std::path::Path, port_guard: PortGuard) -> Self {
+        Self::spawn_configured(data_dir, "iggy", None, &[], port_guard).await
     }
 
     async fn spawn_configured(
@@ -287,8 +299,8 @@ impl TestServer {
         password: &str,
         tls: Option<(&std::path::Path, &std::path::Path)>,
         env: &[(&str, &str)],
+        port_guard: PortGuard,
     ) -> Self {
-        let port_guard = PortGuard::acquire();
         let address = format!("127.0.0.1:{}", port_guard.port);
 
         let mut command = Command::new(iggy_server_binary());
