@@ -67,7 +67,23 @@ export type SendCommandOptions = {
    * after a history refusal (87): work from one partition incarnation must
    * not land in another.
    */
-  context?: PartitionContext
+  context?: PartitionContext,
+  /**
+   * Sends the command to the replica with this id instead of the replica the
+   * client picks, for example to read the stats that replica keeps for itself.
+   * Replica ids are the ones the cluster metadata returns. Only non-replicated
+   * commands other than a poll, a consumer-offset read or session control are
+   * accepted, others fail with status 3 before anything is sent. An id the roster does not name fails with status 6. The
+   * replica's reply is returned as it is, a `NotPrimary` (89) refusal
+   * included, and nothing is retried on another replica.
+   */
+  replica?: number,
+  /**
+   * The `RawClient.lineage` that a call of several commands started with. A
+   * command of an older lineage fails with status 40 and sends nothing, so no
+   * part of the call runs under a session the caller opened after it started.
+   */
+  lineage?: number
 };
 
 /**
@@ -83,8 +99,13 @@ export type RawClient = {
   ) => Promise<CommandResponse>,
   /** Whether the client has been authenticated */
   isAuthenticated: boolean
-  /** Authenticates the client with the server */
+  /** Raised by each sign-in and logout of the caller. */
+  readonly lineage?: number
+  /** Uses caller credentials; any failed attempt withdraws automatic sign-in. */
   authenticate: (c: ClientCredentials) => Promise<boolean>
+  /** Typed login delegates validation to the session owner when supported. */
+  _authWithPassword?: (c: PasswordCredentials) => Promise<{ userId: number }>
+  _authWithToken?: (c: TokenCredentials) => Promise<{ userId: number }>
   /**
    * Resolves the original frozen operation; never sends it under a fresh identity.
    * The client keeps the proved outcomes of its last `maxPendingOperations`

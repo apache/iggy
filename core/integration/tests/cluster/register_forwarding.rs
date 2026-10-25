@@ -333,7 +333,7 @@ async fn given_a_backup_when_auto_login_dials_it_should_settle_on_the_leader(
         .expect("a backup-dialed login must succeed and settle on the leader");
 
     client
-        .create_stream(STREAM_NAME)
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
         .await
         .expect("create stream after a backup-dialed login");
     let stream_id = Identifier::named(STREAM_NAME).expect("stream identifier");

@@ -51,14 +51,15 @@ pub trait TopicClient {
         name: &str,
         options: &TopicCreateOptions,
     ) -> Result<TopicDetails, IggyError>;
-    /// Update a topic by unique ID or name.
+    /// Patch a topic by unique ID or name: rename it, change its updatable
+    /// options, or reset them to their defaults. Keys `options` leaves out keep
+    /// their values.
     ///
     /// Authentication is required, and the permission to manage the topics.
     async fn update_topic(
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        name: &str,
         options: &TopicUpdateOptions,
     ) -> Result<(), IggyError>;
     /// Delete a topic by unique ID or name.

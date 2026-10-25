@@ -21,8 +21,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use iggy::prelude::{
-    Identifier, IggyClient, IggyError, IggyExpiry, PartitionClient, StreamClient, Topic,
-    TopicClient, TopicCreateOptions, TopicDetails, TopicUpdateOptions,
+    Identifier, IggyClient, IggyError, IggyExpiry, PartitionClient, StreamClient,
+    StreamCreateOptions, Topic, TopicClient, TopicCreateOptions, TopicDetails, TopicUpdateOptions,
 };
 use kafka_protocol::protocol::StrBytes;
 use tokio::time::{Instant, timeout_at};
@@ -73,6 +73,14 @@ pub enum TopicCreationOutcome {
 pub struct KafkaTopicMetadata {
     pub kafka_topic: String,
     pub partitions_count: u32,
+}
+
+/// [`IggyBridge::list_kafka_topics`], with the override topics that it leaves out because the
+/// bridge user may not read them.
+pub(super) struct KafkaTopicListing {
+    pub(super) topics: Vec<KafkaTopicMetadata>,
+    /// The Kafka names of those override topics.
+    pub(super) unreadable: Vec<String>,
 }
 
 impl IggyBridge {
@@ -329,7 +337,7 @@ impl IggyBridge {
     }
 
     /// [`Self::get_kafka_topic`] on `client`.
-    async fn get_kafka_topic_on(
+    pub(super) async fn get_kafka_topic_on(
         &self,
         client: &IggyClient,
         kafka_topic: &str,
@@ -346,8 +354,7 @@ impl IggyBridge {
 
     /// Sets `message_expiry` on the Iggy topic backing `kafka_topic`.
     ///
-    /// Does not create the topic and does not rename it: `name` is the mapped Iggy
-    /// topic name, which `update_topic` also takes as the topic's new name.
+    /// Does not create the topic and does not rename it.
     ///
     /// # Errors
     ///
@@ -368,11 +375,8 @@ impl IggyBridge {
             message_expiry: Some(message_expiry),
             ..TopicUpdateOptions::default()
         };
-        self.metadata_write(|| {
-            self.client
-                .update_topic(&stream_id, &topic_id, topic_name, &options)
-        })
-        .await
+        self.metadata_write(|| self.client.update_topic(&stream_id, &topic_id, &options))
+            .await
     }
 
     async fn topics_in_stream(&self, stream_name: &str) -> Result<Vec<Topic>, BridgeError> {
@@ -591,10 +595,20 @@ impl IggyBridge {
         &self,
         client: &IggyClient,
     ) -> Result<Vec<KafkaTopicMetadata>, BridgeError> {
+        Ok(self.kafka_topic_listing_on(client).await?.topics)
+    }
+
+    /// [`Self::list_kafka_topics_on`], with the override topics that it leaves out because the
+    /// bridge user may not read them.
+    pub(super) async fn kafka_topic_listing_on(
+        &self,
+        client: &IggyClient,
+    ) -> Result<KafkaTopicListing, BridgeError> {
         let default_stream = self.config.topic_mapping.default_stream();
         let mut default_stream_override_targets: HashSet<&str> = HashSet::new();
         let mut override_keys: HashSet<&str> = HashSet::new();
         let mut results = Vec::new();
+        let mut unreadable = Vec::new();
 
         for (kafka_topic, over) in self.config.topic_mapping.overrides() {
             override_keys.insert(kafka_topic);
@@ -618,6 +632,7 @@ impl IggyBridge {
                          unauthorized to read it",
                         over.stream, over.topic
                     );
+                    unreadable.push(kafka_topic.to_string());
                 }
                 Err(err) => return Err(err),
             }
@@ -654,7 +669,10 @@ impl IggyBridge {
             });
         }
 
-        Ok(results)
+        Ok(KafkaTopicListing {
+            topics: results,
+            unreadable,
+        })
     }
 }
 
@@ -683,9 +701,10 @@ impl IggyBridge {
 /// this pays one round trip in every case instead of up to two in the common one.
 async fn ensure_stream(client: &IggyClient, stream_name: &str) -> Result<Identifier, BridgeError> {
     let identifier = Identifier::named(stream_name).map_err(BridgeError::Iggy)?;
+    let options = StreamCreateOptions::default();
     stream_ensured(
         stream_name,
-        metadata_write_on(client, || client.create_stream(stream_name)).await,
+        metadata_write_on(client, || client.create_stream(stream_name, &options)).await,
     )?;
     Ok(identifier)
 }
@@ -809,10 +828,11 @@ async fn load_stream(
                 .into_iter()
                 .map(|topic| {
                     let message_expiry_explicit = message_expiry_is_explicit(&topic.options);
+                    let message_expiry = topic.resolved_options().message_expiry;
                     (
                         topic.name,
                         TopicConfigSnapshot {
-                            message_expiry: topic.message_expiry,
+                            message_expiry,
                             message_expiry_explicit,
                         },
                     )

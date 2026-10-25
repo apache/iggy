@@ -36,7 +36,7 @@ usage(){
   log "Usage: $0 [--coverage] <sdk> [feature]"
   log ""
   log "  sdk:     rust | python | php | go | go-race | node | csharp | java | cpp | all | clean (default: all)"
-  log "  feature: basic_messaging | leader_redirection | raw_command | stream_crud | all  (default: all)"
+  log "  feature: basic_messaging | leader_redirection | raw_command | session_contract | stream_crud | stream_options | resource_options_patch | metadata_changes | all  (default: all)"
   log ""
   log "  Every suite runs against iggy-server, taken from IGGY_SERVER_PATH"
   log "  (default: target/debug/iggy-server) with an iggy CLI at IGGY_CLI_PATH."
@@ -49,7 +49,7 @@ usage(){
 }
 
 case "$FEATURE" in
-  basic_messaging|leader_redirection|raw_command|stream_crud|all) ;;
+  basic_messaging|leader_redirection|raw_command|session_contract|stream_crud|stream_options|resource_options_patch|metadata_changes|all) ;;
   *)
     log "Unknown feature: ${FEATURE}"
     usage
@@ -64,17 +64,22 @@ ALL_COMPOSE_FILES=(
   -f docker-compose.yml
   -f docker-compose.server.yml
   -f docker-compose.cluster.yml
+  -f docker-compose.no-quorum.yml
   -f docker-compose.coverage.yml
 )
 
 COMPOSE_FILES=(-f docker-compose.yml)
 case "$FEATURE" in
-  basic_messaging|leader_redirection|raw_command|stream_crud|all)
+  basic_messaging|leader_redirection|raw_command|session_contract|stream_crud|stream_options|resource_options_patch|metadata_changes|all)
     COMPOSE_FILES+=(-f docker-compose.server.yml) ;;
 esac
 case "$FEATURE" in
   leader_redirection|all)
     COMPOSE_FILES+=(-f docker-compose.cluster.yml) ;;
+esac
+case "$FEATURE" in
+  session_contract|all)
+    COMPOSE_FILES+=(-f docker-compose.no-quorum.yml) ;;
 esac
 if [ "$COVERAGE" = "1" ]; then
   COMPOSE_FILES+=(-f docker-compose.coverage.yml)
@@ -124,6 +129,11 @@ run_suite(){
         unsupported "$FEATURE" "$svc" || return 1
         return 0 ;;
     esac
+  fi
+
+  if [ "$FEATURE" = "resource_options_patch" ] && [ "$svc" = "php-bdd" ]; then
+    unsupported "$FEATURE" "$svc" || return 1
+    return 0
   fi
 
   log "${emoji} ${label}..."

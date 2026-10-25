@@ -74,6 +74,26 @@ public interface IIggyClient : IIggyPublisher, IIggyStream, IIggyTopic, IIggyCon
     Task<byte[]> SendBinaryRequestAsync(uint code, byte[] payload, CancellationToken token = default);
 
     /// <summary>
+    ///     Sends a command code with a payload to the replica with the given id and returns its raw response bytes.
+    /// </summary>
+    /// <remarks>
+    ///     The replica id is the one that cluster metadata names for the node. Every node answers non-replicated
+    ///     commands such as GetStats from its own state, so this reads the state of the chosen node. The request carries
+    ///     the metadata watermark of the session. Replicated commands, PollMessages, GetConsumerOffset and session-control
+    ///     codes are rejected with an invalid-command error before anything is sent. An id that cluster metadata does not name
+    ///     after one read of it fails with an invalid-identifier error. A replica that cannot be reached, or that answers
+    ///     with TransientNotAccepted, is asked again until the request timeout. Any other refusal, NotPrimary included, is
+    ///     returned and never sent to another replica. HTTP clients report that this operation is unavailable.
+    /// </remarks>
+    /// <param name="code">The numeric command code to send.</param>
+    /// <param name="payload">The request payload.</param>
+    /// <param name="replicaId">The replica id that cluster metadata names.</param>
+    /// <param name="token">The cancellation token to cancel the operation.</param>
+    /// <returns>A task that represents the asynchronous operation and returns the raw response payload bytes.</returns>
+    Task<byte[]> SendBinaryRequestToReplicaAsync(uint code, byte[] payload, byte replicaId,
+        CancellationToken token = default);
+
+    /// <summary>
     ///     Replays a retained operation within one timeout. Success proves commit; a proved business rejection
     ///     returns its original error and frees the lane. An unknown outcome keeps the operation retained.
     /// </summary>

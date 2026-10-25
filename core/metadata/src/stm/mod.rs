@@ -41,6 +41,7 @@ pub struct ApplyContext {
     pub client_id: u128,
     pub session: u64,
     pub request: u64,
+    pub user_id: u32,
 }
 
 impl From<&PrepareHeader> for ApplyContext {
@@ -50,6 +51,7 @@ impl From<&PrepareHeader> for ApplyContext {
             client_id: header.client,
             session: header.session,
             request: header.request,
+            user_id: header.user_id,
         }
     }
 }
@@ -410,6 +412,17 @@ macro_rules! define_state {
                     Self {
                         inner: $crate::stm::LeftRight::from_factory(factory),
                     }
+                }
+
+                /// The change records of the command applied last.
+                pub(crate) fn last_changes(&self) -> Vec<$crate::change_log::AppliedChange> {
+                    self.inner.read(|state| {
+                        state
+                            .last_result
+                            .as_ref()
+                            .map(|reply| reply.changes.clone())
+                            .unwrap_or_default()
+                    })
                 }
             }
 

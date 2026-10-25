@@ -41,12 +41,16 @@ public final class VsrOperation {
     public static final int TRUNCATE_PARTITION = 68;
     public static final int FINALIZE_SESSION = 70;
     public static final int COMPLETE_LIFECYCLE = 71;
+    public static final int UPDATE_STREAM_RESOLVED = 72;
+    public static final int UPDATE_TOPIC_RESOLVED = 73;
+    public static final int UPDATE_USER_RESOLVED = 74;
+    public static final int REWRAP_STREAM_KEYS = 75;
 
     public static final int CREATE_STREAM = 128;
-    public static final int UPDATE_STREAM = 129;
+    // 129 was UpdateStream. Never reuse it.
     public static final int DELETE_STREAM = 130;
     public static final int CREATE_TOPIC = 132;
-    public static final int UPDATE_TOPIC = 133;
+    // 133 was UpdateTopic. Never reuse it.
     public static final int DELETE_TOPIC = 134;
     public static final int CREATE_PARTITIONS = 136;
     public static final int DELETE_PARTITIONS = 137;
@@ -54,7 +58,7 @@ public final class VsrOperation {
     public static final int CREATE_CONSUMER_GROUP = 139;
     public static final int DELETE_CONSUMER_GROUP = 140;
     public static final int CREATE_USER = 141;
-    public static final int UPDATE_USER = 142;
+    // 142 was UpdateUser. Never reuse it.
     public static final int DELETE_USER = 143;
     public static final int CHANGE_PASSWORD = 144;
     public static final int UPDATE_PERMISSIONS = 145;
@@ -62,6 +66,7 @@ public final class VsrOperation {
     public static final int DELETE_PERSONAL_ACCESS_TOKEN = 147;
     public static final int JOIN_CONSUMER_GROUP = 148;
     public static final int LEAVE_CONSUMER_GROUP = 149;
+    public static final int UPDATE_RESOURCE = 150;
 
     public static final int SEND_MESSAGES = 160;
     public static final int STORE_CONSUMER_OFFSET = 161;
@@ -82,8 +87,8 @@ public final class VsrOperation {
      */
     private static final Map<Integer, Integer> REPLICATED_OPERATIONS = Map.ofEntries(
             Map.entry(33, CREATE_USER),
+            Map.entry(16, UPDATE_RESOURCE),
             Map.entry(34, DELETE_USER),
-            Map.entry(35, UPDATE_USER),
             Map.entry(36, UPDATE_PERMISSIONS),
             Map.entry(37, CHANGE_PASSWORD),
             Map.entry(42, CREATE_PERSONAL_ACCESS_TOKEN),
@@ -93,10 +98,8 @@ public final class VsrOperation {
             Map.entry(122, DELETE_CONSUMER_OFFSET),
             Map.entry(202, CREATE_STREAM),
             Map.entry(203, DELETE_STREAM),
-            Map.entry(204, UPDATE_STREAM),
             Map.entry(302, CREATE_TOPIC),
             Map.entry(303, DELETE_TOPIC),
-            Map.entry(304, UPDATE_TOPIC),
             Map.entry(402, CREATE_PARTITIONS),
             Map.entry(403, DELETE_PARTITIONS),
             Map.entry(503, DELETE_SEGMENTS),
@@ -112,9 +115,13 @@ public final class VsrOperation {
     static {
         KNOWN_OPERATIONS.set(RESERVED, LOGOUT + 1);
         KNOWN_OPERATIONS.set(CREATE_TOPIC_WITH_ASSIGNMENTS, TRUNCATE_PARTITION + 1);
-        KNOWN_OPERATIONS.set(CREATE_STREAM, DELETE_STREAM + 1);
-        KNOWN_OPERATIONS.set(CREATE_TOPIC, DELETE_TOPIC + 1);
-        KNOWN_OPERATIONS.set(CREATE_PARTITIONS, LEAVE_CONSUMER_GROUP + 1);
+        KNOWN_OPERATIONS.set(UPDATE_STREAM_RESOLVED, REWRAP_STREAM_KEYS + 1);
+        KNOWN_OPERATIONS.set(CREATE_STREAM);
+        KNOWN_OPERATIONS.set(DELETE_STREAM);
+        KNOWN_OPERATIONS.set(CREATE_TOPIC);
+        KNOWN_OPERATIONS.set(DELETE_TOPIC);
+        KNOWN_OPERATIONS.set(CREATE_PARTITIONS, CREATE_USER + 1);
+        KNOWN_OPERATIONS.set(DELETE_USER, UPDATE_RESOURCE + 1);
         KNOWN_OPERATIONS.set(SEND_MESSAGES);
         KNOWN_OPERATIONS.set(STORE_CONSUMER_OFFSET);
         KNOWN_OPERATIONS.set(DELETE_CONSUMER_OFFSET);
@@ -149,7 +156,7 @@ public final class VsrOperation {
         if (operation == DELETE_SEGMENTS) {
             return false;
         }
-        return operation >= METADATA_START && operation <= LEAVE_CONSUMER_GROUP;
+        return operation >= METADATA_START && operation <= UPDATE_RESOURCE;
     }
 
     /**
@@ -178,6 +185,7 @@ public final class VsrOperation {
             case CREATE_TOPIC_WITH_ASSIGNMENTS -> CREATE_TOPIC;
             case CREATE_PARTITIONS_WITH_ASSIGNMENTS -> CREATE_PARTITIONS;
             case TRUNCATE_PARTITION -> DELETE_SEGMENTS;
+            case UPDATE_STREAM_RESOLVED, UPDATE_TOPIC_RESOLVED, UPDATE_USER_RESOLVED -> UPDATE_RESOURCE;
             default -> operation;
         };
     }

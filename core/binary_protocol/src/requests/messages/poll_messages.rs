@@ -49,6 +49,29 @@ const STRATEGY_SIZE: usize = 9;
 const COUNT_SIZE: usize = 4;
 const AUTO_COMMIT_SIZE: usize = 1;
 
+impl PollMessagesRequest {
+    /// Read the strategy and auto-commit flag without allocating identifiers.
+    ///
+    /// # Errors
+    /// Validates the same request bytes as [`WireDecode::decode_from`], including
+    /// the fields before the flags. Trailing bytes are accepted by both paths.
+    pub fn peek_progress(buf: &[u8]) -> Result<(WirePollingStrategy, bool), WireError> {
+        let mut pos = WireConsumer::skip(buf)?;
+        pos += WireIdentifier::skip(&buf[pos..])?;
+        pos += WireIdentifier::skip(&buf[pos..])?;
+        read_u8(buf, pos)?;
+        pos += PARTITION_FLAG_SIZE;
+        read_u32_le(buf, pos)?;
+        pos += PARTITION_VALUE_SIZE;
+        let (strategy, consumed) = WirePollingStrategy::decode(&buf[pos..])?;
+        pos += consumed;
+        read_u32_le(buf, pos)?;
+        pos += COUNT_SIZE;
+        let auto_commit = read_u8(buf, pos)? != 0;
+        Ok((strategy, auto_commit))
+    }
+}
+
 impl WireEncode for PollMessagesRequest {
     fn encoded_size(&self) -> usize {
         self.consumer.encoded_size()

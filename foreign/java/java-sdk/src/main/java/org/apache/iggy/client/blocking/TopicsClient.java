@@ -22,11 +22,11 @@ package org.apache.iggy.client.blocking;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.HeaderValue;
-import org.apache.iggy.topic.CompressionAlgorithm;
 import org.apache.iggy.topic.Topic;
 import org.apache.iggy.topic.TopicDetails;
+import org.apache.iggy.topic.TopicOptions;
+import org.apache.iggy.topic.TopicUpdate;
 
-import java.math.BigInteger;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -45,79 +45,42 @@ public interface TopicsClient {
 
     List<Topic> getTopics(StreamId streamId);
 
-    default TopicDetails createTopic(
-            Long streamId,
-            Long partitionsCount,
-            CompressionAlgorithm compressionAlgorithm,
-            BigInteger messageExpiry,
-            BigInteger maxTopicSize,
-            String name) {
-        return createTopic(
-                StreamId.of(streamId), partitionsCount, compressionAlgorithm, messageExpiry, maxTopicSize, name);
+    default TopicDetails createTopic(Long streamId, String name, long partitionsCount) {
+        return createTopic(StreamId.of(streamId), name, partitionsCount);
     }
 
-    default TopicDetails createTopic(
-            StreamId streamId,
-            Long partitionsCount,
-            CompressionAlgorithm compressionAlgorithm,
-            BigInteger messageExpiry,
-            BigInteger maxTopicSize,
-            String name) {
+    default TopicDetails createTopic(Long streamId, String name, long partitionsCount, TopicOptions options) {
+        return createTopic(StreamId.of(streamId), name, partitionsCount, options);
+    }
+
+    /** Creates a topic with the server's default settings. */
+    default TopicDetails createTopic(StreamId streamId, String name, long partitionsCount) {
         return createTopic(
-                streamId, partitionsCount, compressionAlgorithm, messageExpiry, maxTopicSize, name, Map.of());
+                streamId, name, partitionsCount, TopicOptions.builder().build());
+    }
+
+    /** Creates a topic with typed settings. Unset keys resolve to the server defaults. */
+    default TopicDetails createTopic(StreamId streamId, String name, long partitionsCount, TopicOptions options) {
+        return createTopic(streamId, name, partitionsCount, options.entries());
     }
 
     /**
-     * Creates a topic, carrying option keys that have no parameter of their own.
+     * Creates a topic with settings keyed by option name, for keys newer than this build.
      *
-     * <p>{@code options} is keyed by option name and reuses {@link HeaderValue} because options ride
-     * the user-headers codec. It reaches keys the server catalog gained after this build shipped; a
-     * parameter above wins on collision, and a key outside the catalog is refused by name.
+     * <p>{@code options} reuses {@link HeaderValue} because options ride the user-headers codec. A key
+     * outside the catalog is refused by name.
      */
-    TopicDetails createTopic(
-            StreamId streamId,
-            Long partitionsCount,
-            CompressionAlgorithm compressionAlgorithm,
-            BigInteger messageExpiry,
-            BigInteger maxTopicSize,
-            String name,
-            Map<String, HeaderValue> options);
+    TopicDetails createTopic(StreamId streamId, String name, long partitionsCount, Map<String, HeaderValue> options);
 
-    default void updateTopic(
-            Long streamId,
-            Long topicId,
-            CompressionAlgorithm compressionAlgorithm,
-            BigInteger messageExpiry,
-            BigInteger maxTopicSize,
-            String name) {
-        updateTopic(
-                StreamId.of(streamId), TopicId.of(topicId), compressionAlgorithm, messageExpiry, maxTopicSize, name);
-    }
-
-    default void updateTopic(
-            StreamId streamId,
-            TopicId topicId,
-            CompressionAlgorithm compressionAlgorithm,
-            BigInteger messageExpiry,
-            BigInteger maxTopicSize,
-            String name) {
-        updateTopic(streamId, topicId, compressionAlgorithm, messageExpiry, maxTopicSize, name, Map.of());
+    default void updateTopic(Long streamId, Long topicId, TopicUpdate update) {
+        updateTopic(StreamId.of(streamId), TopicId.of(topicId), update);
     }
 
     /**
-     * Updates a topic, carrying option keys that have no parameter of their own.
-     *
-     * <p>The server refuses any key an update may not change, by name. A key left out keeps its
-     * current value.
+     * Updates a topic's name, message expiry or size cap, or resets the last two to their defaults. Every
+     * key left out keeps its value.
      */
-    void updateTopic(
-            StreamId streamId,
-            TopicId topicId,
-            CompressionAlgorithm compressionAlgorithm,
-            BigInteger messageExpiry,
-            BigInteger maxTopicSize,
-            String name,
-            Map<String, HeaderValue> options);
+    void updateTopic(StreamId streamId, TopicId topicId, TopicUpdate update);
 
     default void deleteTopic(Long streamId, Long topicId) {
         deleteTopic(StreamId.of(streamId), TopicId.of(topicId));

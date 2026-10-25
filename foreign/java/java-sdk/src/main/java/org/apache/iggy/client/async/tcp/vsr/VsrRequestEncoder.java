@@ -23,6 +23,9 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import org.apache.iggy.partition.PartitionContext;
 
+import java.security.SecureRandom;
+import java.util.Arrays;
+
 /**
  * Encodes a (code, payload) command into a VSR request frame:
  * a 256-byte {@code RequestHeader} followed by the unchanged command payload.
@@ -37,6 +40,8 @@ public final class VsrRequestEncoder {
     private static final int LOGIN_REGISTER_CODE = 40;
     private static final int LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE = 44;
     private static final int LOGIN_REGISTER_WITH_PAT_CODE = 45;
+    private static final SecureRandom RANDOM = new SecureRandom();
+    private static final byte[] ZERO_IDENTIFIER = new byte[16];
 
     private final ConsensusSession session;
 
@@ -125,6 +130,7 @@ public final class VsrRequestEncoder {
             frame.setByte(VsrHeaders.COMMAND_OFFSET, VsrHeaders.COMMAND_REQUEST);
             frame.setLongLE(VsrHeaders.REQUEST_CLIENT_OFFSET, session.clientIdLow());
             frame.setLongLE(VsrHeaders.REQUEST_CLIENT_OFFSET + 8, session.clientIdHigh());
+            stampRequestIdentifier(frame, operation);
             frame.setLongLE(VsrHeaders.REQUEST_ID_OFFSET, requestId);
             frame.setByte(VsrHeaders.REQUEST_OPERATION_OFFSET, operation);
             frame.setLongLE(VsrHeaders.REQUEST_SESSION_OFFSET, sessionId);
@@ -147,6 +153,19 @@ public final class VsrRequestEncoder {
             if (releaseBody) {
                 body.release();
             }
+        }
+    }
+
+    private void stampRequestIdentifier(ByteBuf frame, int operation) {
+        if (operation == VsrOperation.REGISTER) {
+            frame.setLongLE(VsrHeaders.REQUEST_CHECKSUM_OFFSET, session.registerIdentifierLow());
+            frame.setLongLE(VsrHeaders.REQUEST_CHECKSUM_OFFSET + 8, session.registerIdentifierHigh());
+        } else if (operation != VsrOperation.NON_REPLICATED && operation < VsrOperation.SEND_MESSAGES) {
+            byte[] identifier = new byte[16];
+            do {
+                RANDOM.nextBytes(identifier);
+            } while (Arrays.equals(identifier, ZERO_IDENTIFIER));
+            frame.setBytes(VsrHeaders.REQUEST_CHECKSUM_OFFSET, identifier);
         }
     }
 }

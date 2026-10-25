@@ -16,8 +16,9 @@
 // under the License.
 
 use crate::{
-    ClientInfo, ClientInfoDetails, IggyError, NonZeroIggyDuration, OptionSpec, OptionsScope,
-    Snapshot, SnapshotCompression, Stats, SystemSnapshotType,
+    ClientInfo, ClientInfoDetails, IggyError, MetadataChanges, MetadataChangesQuery,
+    NonZeroIggyDuration, OptionSpec, OptionsScope, Snapshot, SnapshotCompression, Stats,
+    SystemSnapshotType,
 };
 use async_trait::async_trait;
 
@@ -65,4 +66,12 @@ pub trait SystemClient {
         compression: SnapshotCompression,
         snapshot_types: Vec<SystemSnapshotType>,
     ) -> Result<Snapshot, IggyError>;
+    /// One page of the node's metadata change log, or of the current state
+    /// to rebuild from. Requires root or the global `manage_servers`
+    /// permission. Keep the returned `next` cursor and send it back to
+    /// continue.
+    async fn get_metadata_changes(
+        &self,
+        query: &MetadataChangesQuery,
+    ) -> Result<MetadataChanges, IggyError>;
 }

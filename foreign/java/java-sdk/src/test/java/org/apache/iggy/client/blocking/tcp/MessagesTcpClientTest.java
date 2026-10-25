@@ -27,10 +27,8 @@ import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PollingStrategy;
-import org.apache.iggy.topic.CompressionAlgorithm;
 import org.junit.jupiter.api.Test;
 
-import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Optional;
@@ -80,15 +78,7 @@ class MessagesTcpClientTest extends MessagesClientBaseTest {
         var topicId = TopicId.of("тема-日本語");
         var stream = client.streams().createStream(streamId.getName());
         trackStream(stream.id());
-        client.topics()
-                .createTopic(
-                        streamId,
-                        1L,
-                        CompressionAlgorithm.None,
-                        BigInteger.ZERO,
-                        BigInteger.ZERO,
-                        topicId.getName(),
-                        PERSISTED_TOPIC_OPTIONS);
+        client.topics().createTopic(streamId, topicId.getName(), 1L, PERSISTED_TOPIC_OPTIONS);
         String text = "wiadomość 世界 😀";
 
         // when

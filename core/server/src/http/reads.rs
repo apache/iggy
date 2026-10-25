@@ -31,13 +31,17 @@ use iggy_binary_protocol::WireIdentifier;
 use iggy_binary_protocol::codes::GET_STATS_CODE;
 use iggy_common::wire_conversions::identifier_to_wire;
 use iggy_common::{Identifier, IggyError};
+use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
 use send_wrapper::SendWrapper;
+use server_common::sharding::IggyNamespace;
 use std::rc::Rc;
+use std::time::Instant;
 
 use crate::http::error::{Consistency, ReadError};
 use crate::http::extractor::Identity;
+use crate::http::forward::metadata_floor;
 use crate::http::state::HttpInner;
 use crate::responses::{NonReplicatedResponse, build_non_replicated_response};
 
@@ -48,7 +52,9 @@ use crate::responses::{NonReplicatedResponse, build_non_replicated_response};
 /// without a user-id short-circuit. A linearizable read must come from the
 /// primary; on a follower it redirects (307) to the primary's HTTP address when
 /// resolvable, else fails closed to a 503 (see
-/// [`HttpInner::not_primary_read_error`]).
+/// [`HttpInner::not_primary_read_error`]). A partition read reaches this as a
+/// serializable read instead once it held for the metadata primary's commit
+/// floor ([`await_metadata_floor`]).
 ///
 /// Every read route reaches this through [`gate_local_read`], which is what
 /// pairs it with the two waits a local read must serve behind. A route that
@@ -80,6 +86,27 @@ pub(in crate::http) fn authorize_read(
         return Err(state.not_primary_read_error(&identity.path_and_query, identity.client_ip));
     }
     Ok(())
+}
+
+/// A reply must still belong to the partition incarnation captured before its owner read.
+pub(in crate::http) fn check_partition_incarnation(
+    state: &HttpInner,
+    namespace: IggyNamespace,
+    incarnation: u64,
+) -> Result<(), ReadError> {
+    if state
+        .shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .created_revision_for_namespace(namespace)
+        == Some(incarnation)
+    {
+        Ok(())
+    } else {
+        Err(ReadError::Rejected(IggyError::HistoryUnavailable))
+    }
 }
 
 /// Serve one authenticated read from the local metadata STM and hand back the
@@ -199,7 +226,7 @@ pub(in crate::http) async fn gate_local_read(
 /// (`http::forward::record_relayed_floor`), so a caller that posted through
 /// this follower is held here too. A user who wrote through a different node
 /// entirely still leaves no floor here, and neither does a relayed write
-/// answered with the `TransientNotCommitted` 503, whose op may have committed
+/// answered with the `TransientNotCommitted` 504, whose op may have committed
 /// anyway (see `http::submit::submit_committed`).
 ///
 /// The wait itself is the binary plane's [`hold_for_frontier`]: woken by the
@@ -232,6 +259,39 @@ async fn await_metadata_read_frontier(
         );
         ReadError::MetadataFrontierUnreached
     })
+}
+
+/// Hold a linearizable partition read on a node that is not the metadata
+/// primary until this node applied the metadata primary's commit floor
+/// ([`metadata_floor`]), and return the floor.
+///
+/// The partition primary serves the data, but this node authorizes the caller
+/// and resolves the stream, topic and partition, and the context it relays
+/// fixes what the partition primary holds for. Without this hold both would
+/// rest on state older than what the cluster already acknowledged, so a relay
+/// alone would not make the read linearizable. Fails closed on the retryable
+/// 503s: [`ReadError::NotPrimary`] when no metadata primary answered its floor
+/// before `deadline`, [`ReadError::MetadataFrontierUnreached`] when this node
+/// did not apply the floor by then, or the forwarding capacity/proof refusal.
+pub(in crate::http) async fn await_metadata_floor(
+    state: &HttpInner,
+    deadline: Instant,
+) -> Result<u64, ReadError> {
+    let floor = metadata_floor(state, deadline).await?;
+    hold_for_frontier(
+        state.shard.plane.metadata().applied_frontier(),
+        floor,
+        compio::time::sleep(deadline.saturating_duration_since(Instant::now())),
+    )
+    .await
+    .map_err(|FrontierUnreached| {
+        state
+            .shard
+            .metrics()
+            .record_metadata_read_frontier_refusal();
+        ReadError::MetadataFrontierUnreached
+    })?;
+    Ok(floor)
 }
 
 /// One recovery-barrier check's outcome, factored out of [`await_recovery_barrier`]
@@ -379,6 +439,20 @@ pub(in crate::http) fn resolve_gate_topic_ids(
     resolve_gate_topic(state, &wire_stream, &wire_topic)
 }
 
+pub(in crate::http) fn check_partition_freshness(state: &HttpInner) -> Result<(), IggyError> {
+    if state
+        .shard
+        .plane
+        .metadata()
+        .applied_frontier()
+        .partition_requests_allowed(state.shard.bus.monotonic_now())
+    {
+        Ok(())
+    } else {
+        Err(IggyError::TransientNotAccepted)
+    }
+}
+
 /// Authorize an HTTP data-plane write (produce / consumer-offset) on (stream,
 /// topic). A resolution miss returns `Ok(())` so the write proceeds to the
 /// dispatch gates, which render the existing 404; a resolved entity whose rule
@@ -392,6 +466,7 @@ pub(in crate::http) fn authorize_data_plane(
     topic_id: &Identifier,
     rule: impl FnOnce(&Permissioner, u32, usize, usize) -> Result<(), IggyError>,
 ) -> Result<(), IggyError> {
+    check_partition_freshness(state)?;
     let (Ok(wire_stream), Ok(wire_topic)) =
         (identifier_to_wire(stream_id), identifier_to_wire(topic_id))
     else {
@@ -491,13 +566,14 @@ pub(in crate::http) fn topic_durability(
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::http) mod tests {
     use std::cell::{Cell, RefCell};
     use std::future::pending;
     use std::net::Ipv4Addr;
     use std::pin::pin;
     use std::rc::Rc;
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     use axum::Json;
     use axum::body::Body;
@@ -506,6 +582,7 @@ mod tests {
     use axum::response::IntoResponse;
     use configs::server::ServerConfig;
     use consensus::{LocalPipeline, MetadataHandle, VsrConsensus};
+    use futures::future::{Either, select};
     use futures::poll;
     use hyper::service::Service as _;
     use hyper_util::service::TowerToHyperService;
@@ -517,10 +594,10 @@ mod tests {
     use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
     use iggy_binary_protocol::requests::messages::SendMessagesHeader;
     use iggy_binary_protocol::requests::streams::{
-        CreateStreamRequest, DeleteStreamRequest, UpdateStreamRequest,
+        CreateStreamRequest, DeleteStreamRequest, UpdateStreamResolvedRequest,
     };
     use iggy_binary_protocol::requests::topics::{
-        CreateTopicRequest, CreateTopicWithAssignmentsRequest, UpdateTopicRequest,
+        CreateTopicRequest, CreateTopicWithAssignmentsRequest, UpdateTopicResolvedRequest,
     };
     use iggy_binary_protocol::requests::users::{
         CreateUserRequest, DeleteUserRequest, UpdatePermissionsRequest,
@@ -532,7 +609,11 @@ mod tests {
         WireName, WireOptions,
     };
     use iggy_common::create_personal_access_token::CreatePersonalAccessToken;
-    use iggy_common::{IggyByteSize, IggyError, IggyTimestamp, UserStatus};
+    use iggy_common::defaults::DEFAULT_ROOT_USER_ID as ROOT_USER_ID;
+    use iggy_common::{
+        IggyByteSize, IggyError, IggyTimestamp, MetadataChangeCursor, MetadataChangePhase,
+        MetadataChangeStatus, UserStatus,
+    };
     use message_bus::IggyMessageBus;
     use message_bus::installer::conn_info::ClientTransportKind;
     use message_bus::transports::tls::install_default_crypto_provider;
@@ -541,6 +622,7 @@ mod tests {
     use metadata::stm::StateHandler;
     use metadata::stm::authz::GatedApply;
     use metadata::stm::stream::StreamsInner;
+    use metadata::stm::user::ROOT_USER_CREATED_AT_MICROS;
     use metadata::stm::user::{CreatePersonalAccessTokenRequest, PAT_TOKEN_HASH_BYTES};
     use partitions::{IggyPartitions, PartitionPathLayout, PartitionsConfig};
     use send_wrapper::SendWrapper;
@@ -560,14 +642,16 @@ mod tests {
     use crate::cluster_meta::ClusterRoster;
     use crate::consumer_group::lease::SessionActivity;
     use crate::dispatch::test_support::{
-        create_one_partition_in, create_reader_request, prepare_message, register_reply,
+        create_one_partition_in, create_reader_request, prepare_message, recreate_topic_in,
+        register_reply,
     };
     use crate::http::error::{ConsistencyQuery, WriteError};
     use crate::http::extractor::{Authenticated, Identity};
     use crate::http::handlers::{
-        create_pat, get_client, get_clients, get_metrics, get_stats, get_user,
+        create_pat, get_client, get_clients, get_metadata_changes, get_metrics, get_stats, get_user,
     };
     use crate::http::metrics::HttpMetrics;
+    use crate::http::relay_proof::RelayKey;
     use crate::http::router;
     use crate::http::session::{FIRST_REQUEST_ID, HttpSession, RegistrationBarrier};
     use crate::http::state::{HttpInner, HttpState, MetadataWatermarks};
@@ -678,6 +762,93 @@ mod tests {
         }
     }
 
+    #[compio::test]
+    async fn given_metadata_changes_requests_over_http_should_refuse_bad_queries_and_answer_pages()
+    {
+        let state = read_state();
+        commit_user_request(
+            &state,
+            READER_CREATED_AT,
+            Operation::CreateUser,
+            &create_reader_request().to_bytes(),
+        );
+        let metadata = state.shard.plane.metadata();
+        metadata
+            .change_log()
+            .append(
+                &PrepareHeader {
+                    op: 1,
+                    checksum: 0x5eed,
+                    ..PrepareHeader::default()
+                },
+                Vec::new(),
+            )
+            .unwrap();
+        metadata.advance_applied_frontier(1);
+        let query = |pairs: &[(&str, &str)]| {
+            Query(
+                pairs
+                    .iter()
+                    .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        let reader = authenticated_identity(&state, READER_ID, READER_CREATED_AT).await;
+        let denied = get_metadata_changes(State(state.clone()), reader, query(&[]))
+            .await
+            .into_response();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        for refused in [
+            &[("from", "latest"), ("from", "latest")][..],
+            &[("from", "earliest"), ("cursor", "mc1_")],
+            &[("from", "earliest"), ("since", "5"), ("until", "4")],
+            &[("from", "latest"), ("since", "1")],
+            &[("from", "current"), ("until", "1")],
+            &[("from", "current"), ("groups", "topics")],
+            &[("after", "mc1_not-a-cursor")],
+            &[("current_after", "cs1_AAAA")],
+            &[("from", "earliest"), ("limit", "0")],
+            &[("from", "earliest"), ("limit", "1001")],
+            &[("from", "earliest"), ("limit", "01")],
+            &[("from", "earliest"), ("limit", "+5")],
+            &[("from", "earliest"), ("groups", "streams,,users")],
+            &[("from", "earliest"), ("groups", "nope")],
+        ] {
+            let root =
+                authenticated_identity(&state, ROOT_USER_ID, ROOT_USER_CREATED_AT_MICROS).await;
+            let response = get_metadata_changes(State(state.clone()), root, query(refused))
+                .await
+                .into_response();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{refused:?}");
+        }
+
+        let root = authenticated_identity(&state, ROOT_USER_ID, ROOT_USER_CREATED_AT_MICROS).await;
+        let Ok(Json(latest)) =
+            get_metadata_changes(State(state.clone()), root, query(&[("from", "latest")])).await
+        else {
+            panic!("root reads the feed");
+        };
+        assert_eq!(latest.status, MetadataChangeStatus::Ok);
+        assert_eq!(latest.log_id, Some(0x5eed));
+        assert_eq!(latest.next, Some(MetadataChangeCursor::zero(0x5eed)));
+
+        let root = authenticated_identity(&state, ROOT_USER_ID, ROOT_USER_CREATED_AT_MICROS).await;
+        let Ok(Json(users)) = get_metadata_changes(
+            State(state.clone()),
+            root,
+            query(&[("from", "current"), ("groups", "users")]),
+        )
+        .await
+        else {
+            panic!("root reads the current state");
+        };
+        assert_eq!(users.phase, MetadataChangePhase::Current);
+        assert_eq!(users.items.len(), 2, "root and the reader");
+        assert_eq!(users.current_page_token, None);
+    }
+
     /// The client reads gather from every shard after their gate, and the
     /// account behind the token can change during the gather.
     #[compio::test]
@@ -686,7 +857,7 @@ mod tests {
         for route in ["/stats", "/clients", "/clients/{client_id}"] {
             for replace in [true, false] {
                 let (sender, shard_inbox, _shard_replies) = shard_channel(0, 1, 1);
-                let state = read_state_on(Some(sender));
+                let state = read_state_on(Some(sender), None);
                 commit_user_request(
                     &state,
                     READER_CREATED_AT,
@@ -759,11 +930,11 @@ mod tests {
                 (true, true, None),
                 (false, true, None),
                 (false, true, Some(Operation::DeleteStream)),
-                (false, true, Some(Operation::UpdateStream)),
-                (false, true, Some(Operation::UpdateTopic)),
+                (false, true, Some(Operation::UpdateStreamResolved)),
+                (false, true, Some(Operation::UpdateTopicResolved)),
             ] {
                 let (sender, shard_inbox, _shard_replies) = shard_channel(0, 1, 1);
-                let state = read_state_on(Some(sender));
+                let state = read_state_on(Some(sender), None);
                 let namespace = create_one_partition_in(&state.shard.plane.metadata().mux_stm);
                 state
                     .shard
@@ -794,35 +965,19 @@ mod tests {
                 let mut response = pin!(service.call(request));
                 assert!(poll!(response.as_mut()).is_pending());
                 let Ok(ShardFrame::Lifecycle(LifecycleFrame::PartitionRead {
-                    read: PartitionRead::Primary,
-                    reply,
-                    ..
+                    read, reply, ..
                 })) = shard_inbox.try_recv()
                 else {
-                    panic!("{uri} must ask its partition for the primary");
-                };
-
-                let primary = PartitionReadReply::Primary {
-                    view: 0,
-                    primary: 0,
+                    panic!("{uri} must wait for its partition data");
                 };
                 let (reply, body) = if final_wait {
-                    reply.try_send(primary).unwrap();
-                    assert!(poll!(response.as_mut()).is_pending());
-                    let Ok(ShardFrame::Lifecycle(LifecycleFrame::PartitionRead {
-                        read,
-                        reply,
-                        ..
-                    })) = shard_inbox.try_recv()
-                    else {
-                        panic!("{uri} must wait for its partition data");
-                    };
                     let body = match read {
                         PartitionRead::UnboundPollOnPrimary { metadata, .. } => {
                             PartitionReadReply::Poll {
                                 context: metadata.context(0),
                                 fragments: Vec::new().into(),
                                 current_offset: 0,
+                                encryptor: None,
                             }
                         }
                         PartitionRead::ConsumerOffsetOnPrimary { .. } => {
@@ -835,6 +990,23 @@ mod tests {
                     };
                     (reply, body)
                 } else {
+                    reply
+                        .try_send(PartitionReadReply::Rejected(IggyError::NotPrimary))
+                        .unwrap();
+                    assert!(poll!(response.as_mut()).is_pending());
+                    let Ok(ShardFrame::Lifecycle(LifecycleFrame::PartitionRead {
+                        read: PartitionRead::Primary,
+                        reply,
+                        ..
+                    })) = shard_inbox.try_recv()
+                    else {
+                        panic!("{uri} must ask its partition for the primary after a refusal");
+                    };
+                    // This replica became the primary, so the read runs here again.
+                    let primary = PartitionReadReply::Primary {
+                        view: 0,
+                        primary: 0,
+                    };
                     (reply, primary)
                 };
                 let rejection = change_reader(&state, replace);
@@ -844,17 +1016,19 @@ mod tests {
                             stream_id: WireIdentifier::numeric(0),
                         }
                         .to_bytes(),
-                        Operation::UpdateStream => UpdateStreamRequest {
+                        Operation::UpdateStreamResolved => UpdateStreamResolvedRequest {
                             stream_id: WireIdentifier::numeric(0),
-                            name: WireName::new("renamed").unwrap(),
-                            options: WireOptions::empty(),
+                            name: Some(WireName::new("renamed").unwrap()),
+                            explicit_options: WireOptions::empty(),
+                            derived_options: WireOptions::empty(),
                         }
                         .to_bytes(),
-                        Operation::UpdateTopic => UpdateTopicRequest {
+                        Operation::UpdateTopicResolved => UpdateTopicResolvedRequest {
                             stream_id: WireIdentifier::numeric(0),
                             topic_id: WireIdentifier::numeric(0),
-                            name: WireName::new("renamed").unwrap(),
-                            options: WireOptions::empty(),
+                            name: Some(WireName::new("renamed").unwrap()),
+                            explicit_options: WireOptions::empty(),
+                            derived_options: WireOptions::empty(),
                         }
                         .to_bytes(),
                         _ => unreachable!(),
@@ -875,9 +1049,201 @@ mod tests {
         }
     }
 
+    #[compio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn given_a_partition_read_when_freshness_expires_before_retry_should_not_read_again() {
+        for uri in [
+            "/streams/stream/topics/topic/messages?consumer_id=1&partition_id=0&kind=offset&value=0&count=1",
+            "/streams/stream/topics/topic/consumer-offsets?consumer_id=1&partition_id=0",
+        ] {
+            let (sender, shard_inbox, _shard_replies) = shard_channel(0, 1, 1);
+            let frontier = Arc::new(
+                AppliedFrontier::default().with_partition_freshness(Instant::now(), Duration::ZERO),
+            );
+            let state = read_state_with_frontier(Some(sender), None, Arc::clone(&frontier));
+            let namespace = create_one_partition_in(&state.shard.plane.metadata().mux_stm);
+            state
+                .shard
+                .shards_table()
+                .insert(namespace, PartitionLocation::new(ShardId::new(0), 0));
+            commit_user_request(
+                &state,
+                READER_CREATED_AT,
+                Operation::CreateUser,
+                &create_reader_request().to_bytes(),
+            );
+            let token = state
+                .jwt
+                .generate(READER_ID, IggyTimestamp::from(READER_CREATED_AT))
+                .unwrap();
+            let service = TowerToHyperService::new(router(
+                state.clone(),
+                state.forward.body_limit,
+                None,
+                None,
+                false,
+            ));
+            let request = Request::builder()
+                .uri(uri)
+                .header(AUTHORIZATION, format!("Bearer {}", token.access_token))
+                .body(Body::empty())
+                .unwrap();
+            frontier.credit_partition_freshness(Instant::now(), Duration::ZERO);
+            let mut response = pin!(service.call(request));
+            assert!(poll!(response.as_mut()).is_pending());
+            let Ok(ShardFrame::Lifecycle(LifecycleFrame::PartitionRead { reply, .. })) =
+                shard_inbox.try_recv()
+            else {
+                panic!("{uri} must start its first read while evidence is fresh");
+            };
+            reply
+                .try_send(PartitionReadReply::Rejected(IggyError::NotPrimary))
+                .unwrap();
+            assert!(poll!(response.as_mut()).is_pending());
+            let Ok(ShardFrame::Lifecycle(LifecycleFrame::PartitionRead {
+                read: PartitionRead::Primary,
+                reply,
+                ..
+            })) = shard_inbox.try_recv()
+            else {
+                panic!("{uri} must look up the primary after a refusal");
+            };
+            compio::time::sleep(AppliedFrontier::PARTITION_FRESHNESS_MARGIN).await;
+            assert!(!frontier.partition_requests_allowed(Instant::now()));
+            reply
+                .try_send(PartitionReadReply::Primary {
+                    view: 0,
+                    primary: 0,
+                })
+                .unwrap();
+            let receive = pin!(shard_inbox.recv());
+            let Either::Right((
+                Ok(ShardFrame::Lifecycle(LifecycleFrame::PartitionRead { read, reply, .. })),
+                _,
+            )) = select(response.as_mut(), receive).await
+            else {
+                panic!("{uri} must resolve its freshness refusal against the primary");
+            };
+            assert!(
+                matches!(read, PartitionRead::Primary),
+                "{uri} retried its data read after freshness expired"
+            );
+            reply
+                .try_send(PartitionReadReply::Primary {
+                    view: 0,
+                    primary: 0,
+                })
+                .unwrap();
+            assert_eq!(
+                response.await.unwrap().status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+            assert!(shard_inbox.try_recv().is_err());
+        }
+    }
+
+    #[compio::test]
+    async fn given_a_poll_waiting_on_its_owner_when_topic_recreated_should_refuse_changed_history()
+    {
+        assert_read_refused_after_topic_recreation(
+            "/streams/stream/topics/topic/messages?consumer_id=1&partition_id=0&kind=offset&value=0&count=1",
+        ).await;
+    }
+
+    #[compio::test]
+    async fn given_an_offset_read_waiting_on_its_owner_when_topic_recreated_should_refuse_changed_history()
+     {
+        assert_read_refused_after_topic_recreation(
+            "/streams/stream/topics/topic/consumer-offsets?consumer_id=1&partition_id=0",
+        )
+        .await;
+    }
+
+    async fn assert_read_refused_after_topic_recreation(uri: &str) {
+        let (sender, shard_inbox, _shard_replies) = shard_channel(0, 1, 1);
+        let state = read_state_on(Some(sender), None);
+        let metadata = state.shard.plane.metadata();
+        let namespace = create_one_partition_in(&metadata.mux_stm);
+        state
+            .shard
+            .shards_table()
+            .insert(namespace, PartitionLocation::new(ShardId::new(0), 0));
+        commit_user_request(
+            &state,
+            READER_CREATED_AT,
+            Operation::CreateUser,
+            &create_reader_request().to_bytes(),
+        );
+        let token = state
+            .jwt
+            .generate(READER_ID, IggyTimestamp::from(READER_CREATED_AT))
+            .unwrap();
+        let service = TowerToHyperService::new(router(
+            state.clone(),
+            state.forward.body_limit,
+            None,
+            None,
+            false,
+        ));
+        let request = Request::builder()
+            .uri(uri)
+            .header(AUTHORIZATION, format!("Bearer {}", token.access_token))
+            .body(Body::empty())
+            .unwrap();
+        let mut response = pin!(service.call(request));
+        assert!(poll!(response.as_mut()).is_pending());
+        let Ok(ShardFrame::Lifecycle(LifecycleFrame::PartitionRead { read, reply, .. })) =
+            shard_inbox.try_recv()
+        else {
+            panic!("{uri} must wait for its partition data");
+        };
+        let body = match read {
+            PartitionRead::UnboundPollOnPrimary { metadata, .. } => PartitionReadReply::Poll {
+                context: metadata.context(0),
+                fragments: Vec::new().into(),
+                current_offset: 0,
+                encryptor: None,
+            },
+            PartitionRead::ConsumerOffsetOnPrimary { .. } => PartitionReadReply::ConsumerOffset {
+                stored: Some(0),
+                current_offset: 0,
+            },
+            _ => panic!("{uri} sent an unexpected partition read"),
+        };
+        let incarnation = metadata
+            .mux_stm
+            .streams()
+            .created_revision_for_namespace(namespace)
+            .unwrap();
+        recreate_topic_in(&metadata.mux_stm, namespace);
+        assert_ne!(
+            metadata
+                .mux_stm
+                .streams()
+                .created_revision_for_namespace(namespace),
+            Some(incarnation)
+        );
+        reply.try_send(body).unwrap();
+        drop(shard_inbox);
+
+        let response = response.await.unwrap();
+        let expected = ReadError::Rejected(IggyError::HistoryUnavailable).into_response();
+        assert_eq!(response.status(), expected.status(), "{uri}");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let expected = axum::body::to_bytes(expected.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            body, expected,
+            "{uri} must refuse the old data without retrying an admitted read"
+        );
+    }
+
     /// The account of [`create_reader_request`], the first one after root.
-    const READER_ID: u32 = 1;
-    const READER_CREATED_AT: u64 = 10;
+    pub(in crate::http) const READER_ID: u32 = 1;
+    pub(in crate::http) const READER_CREATED_AT: u64 = 10;
 
     /// Replace the reader account under its ID, or revoke its grants, and
     /// return the status that a read the reader started before must answer.
@@ -958,11 +1324,12 @@ mod tests {
 
             commit(
                 &mut inner,
-                &UpdateTopicRequest {
+                &UpdateTopicResolvedRequest {
                     stream_id: WireIdentifier::named("events").unwrap(),
                     topic_id: WireIdentifier::named("orders").unwrap(),
-                    name: WireName::new("renamed").unwrap(),
-                    options: WireOptions::empty(),
+                    name: Some(WireName::new("renamed").unwrap()),
+                    explicit_options: WireOptions::empty(),
+                    derived_options: WireOptions::empty(),
                 },
             );
             let replacement_topic = create_topic(&mut inner, "events", "orders", 2);
@@ -973,10 +1340,11 @@ mod tests {
             if rename_stream {
                 commit(
                     &mut inner,
-                    &UpdateStreamRequest {
+                    &UpdateStreamResolvedRequest {
                         stream_id: WireIdentifier::named("events").unwrap(),
-                        name: WireName::new("renamed-stream").unwrap(),
-                        options: WireOptions::empty(),
+                        name: Some(WireName::new("renamed-stream").unwrap()),
+                        explicit_options: WireOptions::empty(),
+                        derived_options: WireOptions::empty(),
                     },
                 );
                 let replacement_stream = create_stream(&mut inner, "events");
@@ -1037,10 +1405,10 @@ mod tests {
                 },
                 derived_options: WireOptions::empty(),
                 partitions: vec![CreatedPartitionAssignment {
+                    initial_view: 0,
                     partition_id: 0,
                     consensus_group_id,
                 }],
-                created_view: 0,
             },
         );
         GetTopicResponse::decode_from(&reply).unwrap().topic.id as usize
@@ -1306,21 +1674,35 @@ mod tests {
         );
     }
 
-    fn read_state() -> HttpState {
-        read_state_on(None)
+    pub(in crate::http) fn read_state() -> HttpState {
+        read_state_on(None, None)
     }
 
     /// [`read_state`] whose shard sends its cross-shard requests to `mesh`,
-    /// so a test can hold a read while it waits on another shard.
-    fn read_state_on(mesh: Option<TaggedSender>) -> HttpState {
+    /// so a test can hold a read while it waits on another shard. With
+    /// `relay_key_material` it takes the relays proven under that key, as a
+    /// cluster node configured with it does.
+    pub(in crate::http) fn read_state_on(
+        mesh: Option<TaggedSender>,
+        relay_key_material: Option<&str>,
+    ) -> HttpState {
+        read_state_with_frontier(mesh, relay_key_material, Arc::default())
+    }
+
+    pub(in crate::http) fn read_state_with_frontier(
+        mesh: Option<TaggedSender>,
+        relay_key_material: Option<&str>,
+        frontier: Arc<AppliedFrontier>,
+    ) -> HttpState {
         install_default_crypto_provider();
         let config = Arc::new(ServerConfig::default());
-        let prepared = crate::http::prepare(
+        let mut prepared = crate::http::prepare(
             (Ipv4Addr::LOCALHOST, 0).into(),
             &config.http,
             &config.cluster,
         )
         .unwrap();
+        prepared.forward.relay_key = relay_key_material.map(RelayKey::derive);
         let bus = Rc::new(IggyMessageBus::with_config(0, &config));
         let consensus = VsrConsensus::new(
             1,
@@ -1333,7 +1715,8 @@ mod tests {
         consensus.init();
         let mux = ServerMuxStateMachine::default();
         mux.users().ensure_root_user("iggy", "hash");
-        let metadata = ServerMetadata::new(Some(consensus), None, None, None, mux, None);
+        let metadata = ServerMetadata::new(Some(consensus), None, None, None, mux, None)
+            .with_applied_frontier(frontier);
         let partitions = IggyPartitions::new(
             ShardId::new(0),
             PartitionsConfig {
@@ -1344,7 +1727,7 @@ mod tests {
                 validate_checksum: config.partition.validate_checksum,
                 segment_size: IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
                 preallocate_segments: iggy_common::DEFAULT_PREALLOCATE_SEGMENTS,
-                encryptor: None,
+                key_context: Arc::default(),
                 path_layout: PartitionPathLayout::default(),
             },
         );
@@ -1376,7 +1759,12 @@ mod tests {
         }))
     }
 
-    fn commit_user_request(state: &HttpState, timestamp: u64, operation: Operation, body: &[u8]) {
+    pub(in crate::http) fn commit_user_request(
+        state: &HttpState,
+        timestamp: u64,
+        operation: Operation,
+        body: &[u8],
+    ) {
         let mut prepare = prepare_message(operation, 0, 0, body);
         let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(
             &mut prepare.as_mut_slice()[..size_of::<PrepareHeader>()],

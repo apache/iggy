@@ -161,6 +161,7 @@ impl SessionManager {
         connection_id: u128,
         address: SocketAddr,
         transport: ClientTransportKind,
+        now: Instant,
     ) {
         self.connections
             .entry(connection_id)
@@ -168,7 +169,7 @@ impl SessionManager {
                 address,
                 transport,
                 state: ConnectionState::Connected,
-                last_heartbeat: Instant::now(),
+                last_heartbeat: now,
                 sdk: None,
                 metadata_watermark: 0,
                 consumer_session: None,
@@ -186,6 +187,7 @@ impl SessionManager {
         &mut self,
         connection_id: u128,
         include_attachment: bool,
+        now: Instant,
     ) -> Option<ConnectionContext> {
         let conn = self.connections.get_mut(&connection_id)?;
         if conn
@@ -197,7 +199,7 @@ impl SessionManager {
             conn.consumer_session = None;
             conn.metadata_watermark = 0;
         }
-        conn.last_heartbeat = Instant::now();
+        conn.last_heartbeat = now;
         let (bound, user_id) = match conn.state {
             ConnectionState::Bound {
                 user_id,
@@ -265,6 +267,7 @@ impl SessionManager {
         None
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn bind_authenticated_connection(
         &mut self,
         connection_id: u128,
@@ -273,6 +276,7 @@ impl SessionManager {
         user_id: u32,
         attachment: SessionAttachment,
         metadata_watermark: u64,
+        now: Instant,
     ) -> Result<(), IggyError> {
         if !attachment.is_valid() {
             return Err(IggyError::Unauthenticated);
@@ -300,7 +304,7 @@ impl SessionManager {
             .metadata_watermark
             .max(metadata_watermark)
             .max(session);
-        connection.last_heartbeat = Instant::now();
+        connection.last_heartbeat = now;
         Ok(())
     }
 
@@ -352,16 +356,6 @@ impl SessionManager {
             return Err(IggyError::StaleClient);
         }
         Ok(Some((*client_id, attachment.clone())))
-    }
-
-    /// The highest metadata op this connection was told committed, or `0` when
-    /// it was told none (an unknown or still-unbound connection, which has no
-    /// write to read back).
-    #[must_use]
-    pub fn metadata_watermark(&self, connection_id: u128) -> u64 {
-        self.connections
-            .get(&connection_id)
-            .map_or(0, |conn| conn.metadata_watermark)
     }
 
     /// Look up the consensus session for a connection.
@@ -437,8 +431,8 @@ impl SessionManager {
     pub fn iter_consumer_sessions(
         &self,
         timeout: std::time::Duration,
+        now: Instant,
     ) -> impl Iterator<Item = ConsumerSession> + '_ {
-        let now = std::time::Instant::now();
         self.connections.values().filter_map(move |connection| {
             if now.saturating_duration_since(connection.last_heartbeat) >= timeout
                 || connection
@@ -524,10 +518,23 @@ mod tests {
     }
 
     fn bind(sessions: &mut SessionManager, table: &mut ClientTable, connection: u128) {
-        sessions.ensure_connection(connection, addr(5000), ClientTransportKind::Tcp);
+        sessions.ensure_connection(
+            connection,
+            addr(5000),
+            ClientTransportKind::Tcp,
+            std::time::Instant::now(),
+        );
         let attachment = table.attach_session(CLIENT, EPOCH, USER).unwrap();
         sessions
-            .bind_authenticated_connection(connection, CLIENT, EPOCH, USER, attachment, EPOCH)
+            .bind_authenticated_connection(
+                connection,
+                CLIENT,
+                EPOCH,
+                USER,
+                attachment,
+                EPOCH,
+                std::time::Instant::now(),
+            )
             .unwrap();
     }
 
@@ -550,13 +557,23 @@ mod tests {
                 Err(IggyError::StaleClient)
             ));
         }
-        assert_eq!(sessions.iter_consumer_sessions(TIMEOUT).count(), 0);
+        assert_eq!(
+            sessions
+                .iter_consumer_sessions(TIMEOUT, std::time::Instant::now())
+                .count(),
+            0
+        );
     }
 
     #[test]
     fn record_sdk_info_exposed_via_iter_clients() {
         let mut mgr = SessionManager::new();
-        mgr.ensure_connection(1, addr(5000), ClientTransportKind::Tcp);
+        mgr.ensure_connection(
+            1,
+            addr(5000),
+            ClientTransportKind::Tcp,
+            std::time::Instant::now(),
+        );
 
         // Pre-login: no SDK identity.
         let info = mgr.iter_clients().next().unwrap();
@@ -603,26 +620,55 @@ mod tests {
     fn activity_reports_include_only_recent_valid_bindings() {
         let mut table = registry(CLIENT, USER, EPOCH);
         let mut sessions = SessionManager::new();
-        sessions.ensure_connection(9, addr(5000), ClientTransportKind::Tcp);
-        assert_eq!(sessions.iter_consumer_sessions(TIMEOUT).count(), 0);
+        sessions.ensure_connection(
+            9,
+            addr(5000),
+            ClientTransportKind::Tcp,
+            std::time::Instant::now(),
+        );
+        assert_eq!(
+            sessions
+                .iter_consumer_sessions(TIMEOUT, std::time::Instant::now())
+                .count(),
+            0
+        );
         for connection in [1, 2] {
             bind(&mut sessions, &mut table, connection);
         }
         sessions.connections.get_mut(&1).unwrap().last_heartbeat =
             Instant::now().checked_sub(TIMEOUT).unwrap();
         assert_eq!(
-            sessions.iter_consumer_sessions(TIMEOUT).collect::<Vec<_>>(),
+            sessions
+                .iter_consumer_sessions(TIMEOUT, std::time::Instant::now())
+                .collect::<Vec<_>>(),
             [ConsumerSession {
                 client_id: CLIENT,
                 session: EPOCH
             }]
         );
-        sessions.touch_connection(1, false).unwrap();
-        assert_eq!(sessions.iter_consumer_sessions(TIMEOUT).count(), 2);
+        sessions
+            .touch_connection(1, false, std::time::Instant::now())
+            .unwrap();
+        assert_eq!(
+            sessions
+                .iter_consumer_sessions(TIMEOUT, std::time::Instant::now())
+                .count(),
+            2
+        );
         sessions.remove_connection(2);
-        assert_eq!(sessions.iter_consumer_sessions(TIMEOUT).count(), 1);
+        assert_eq!(
+            sessions
+                .iter_consumer_sessions(TIMEOUT, std::time::Instant::now())
+                .count(),
+            1
+        );
         table.end_session(CLIENT, USER, EPOCH, EPOCH + 1);
-        assert_eq!(sessions.iter_consumer_sessions(TIMEOUT).count(), 0);
+        assert_eq!(
+            sessions
+                .iter_consumer_sessions(TIMEOUT, std::time::Instant::now())
+                .count(),
+            0
+        );
     }
 
     #[test]
@@ -632,14 +678,35 @@ mod tests {
         bind(&mut sessions, &mut table, 1);
         let attachment = table.attach_session(CLIENT, EPOCH, USER).unwrap();
         sessions
-            .bind_authenticated_connection(1, CLIENT, EPOCH, USER, attachment.clone(), EPOCH + 5)
+            .bind_authenticated_connection(
+                1,
+                CLIENT,
+                EPOCH,
+                USER,
+                attachment.clone(),
+                EPOCH + 5,
+                std::time::Instant::now(),
+            )
             .unwrap();
         assert!(matches!(
-            sessions.bind_authenticated_connection(1, CLIENT + 1, EPOCH, USER, attachment, EPOCH),
+            sessions.bind_authenticated_connection(
+                1,
+                CLIENT + 1,
+                EPOCH,
+                USER,
+                attachment,
+                EPOCH,
+                std::time::Instant::now()
+            ),
             Err(IggyError::AlreadyAuthenticated)
         ));
         assert_eq!(sessions.get_session(1), Some((CLIENT, EPOCH)));
-        assert_eq!(sessions.metadata_watermark(1), EPOCH + 5);
+        assert_eq!(
+            sessions
+                .touch_connection(1, false, Instant::now())
+                .map(|context| context.metadata_watermark),
+            Some(EPOCH + 5)
+        );
     }
 
     #[test]
@@ -654,14 +721,28 @@ mod tests {
                 EPOCH,
                 USER,
                 attachment.clone(),
-                EPOCH
+                EPOCH,
+                std::time::Instant::now()
             ),
             Err(IggyError::Unauthenticated)
         ));
-        sessions.ensure_connection(1, addr(5000), ClientTransportKind::Tcp);
+        sessions.ensure_connection(
+            1,
+            addr(5000),
+            ClientTransportKind::Tcp,
+            std::time::Instant::now(),
+        );
         table.end_session(CLIENT, USER, EPOCH, EPOCH + 1);
         assert!(matches!(
-            sessions.bind_authenticated_connection(1, CLIENT, EPOCH, USER, attachment, EPOCH),
+            sessions.bind_authenticated_connection(
+                1,
+                CLIENT,
+                EPOCH,
+                USER,
+                attachment,
+                EPOCH,
+                std::time::Instant::now()
+            ),
             Err(IggyError::Unauthenticated)
         ));
         assert_eq!(sessions.get_session(1), None);
@@ -684,11 +765,21 @@ mod tests {
         let mut table = registry(CLIENT, USER, EPOCH);
         let mut sessions = SessionManager::new();
         bind(&mut sessions, &mut table, 1);
-        assert_eq!(sessions.metadata_watermark(1), EPOCH);
+        assert_eq!(
+            sessions
+                .touch_connection(1, false, Instant::now())
+                .map(|context| context.metadata_watermark),
+            Some(EPOCH)
+        );
         sessions.record_metadata_watermark(1, 50);
         sessions.record_metadata_watermark(1, 7);
         bind(&mut sessions, &mut table, 1);
-        assert_eq!(sessions.metadata_watermark(1), 50);
+        assert_eq!(
+            sessions
+                .touch_connection(1, false, Instant::now())
+                .map(|context| context.metadata_watermark),
+            Some(50)
+        );
     }
 
     #[test]
@@ -698,7 +789,9 @@ mod tests {
         bind(&mut sessions, &mut table, 1);
         sessions.record_metadata_watermark(1, 50);
         table.end_session(CLIENT, USER, EPOCH, EPOCH + 1);
-        let context = sessions.touch_connection(1, true).unwrap();
+        let context = sessions
+            .touch_connection(1, true, std::time::Instant::now())
+            .unwrap();
         assert_eq!(context.bound, None);
         assert_eq!(context.user_id, None);
         assert_eq!(context.metadata_watermark, 0);
@@ -715,16 +808,26 @@ mod tests {
                 USER + 1,
                 attachment,
                 EPOCH + 2,
+                std::time::Instant::now(),
             )
             .unwrap();
-        assert_eq!(sessions.metadata_watermark(1), EPOCH + 2);
+        assert_eq!(
+            sessions
+                .touch_connection(1, false, Instant::now())
+                .map(|context| context.metadata_watermark),
+            Some(EPOCH + 2)
+        );
     }
 
     #[test]
     fn a_reply_after_disconnect_does_not_recreate_connection_state() {
         let mut sessions = SessionManager::new();
         sessions.record_metadata_watermark(9, 5);
-        assert_eq!(sessions.metadata_watermark(9), 0);
+        assert!(
+            sessions
+                .touch_connection(9, false, Instant::now())
+                .is_none()
+        );
         assert_eq!(sessions.client_count(), 0);
     }
 }

@@ -34,8 +34,8 @@ internal static class LoginRegister
     /// <summary>Explicit wire version from <c>core/binary_protocol/src/version.rs</c>.</summary>
     internal const int PROTOCOL_VERSION_MAJOR = 0;
 
-    internal const int PROTOCOL_VERSION_MINOR = 11;
-    internal const int PROTOCOL_VERSION_PATCH = 1;
+    internal const int PROTOCOL_VERSION_MINOR = 12;
+    internal const int PROTOCOL_VERSION_PATCH = 0;
 
     /// <summary>Packed protocol version: <c>major &lt;&lt; 20 | minor &lt;&lt; 10 | patch</c>, 10 bits each.</summary>
     internal const uint PROTOCOL_VERSION =

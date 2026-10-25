@@ -17,6 +17,7 @@
 
 """Exercise runtime archive transfer and CI selection without compiling the workspace."""
 
+import base64
 import json
 import os
 from pathlib import Path
@@ -133,6 +134,28 @@ class RuntimeBuildSelection(unittest.TestCase):
         git = self.root / "git"
         git.write_text(f"#!/bin/sh\ncase $1 in\n  rev-parse) echo {self.revision} ;;\n  cat-file) echo 'parent fixture' ;;\n  *) exit 1 ;;\nesac\n")
         git.chmod(0o755)
+        self.runtime_files = {
+            "iggy-connectors": ("bin", "target/debug/iggy-connectors"),
+            "iggy_connector_stdout_sink": ("cdylib", "target/debug/libiggy_connector_stdout_sink.so"),
+            "iggy-bench-dashboard-server": ("bin", "target/debug/iggy-bench-dashboard-server"),
+            "kafka-message-gen": ("bin", "target/debug/kafka-message-gen"),
+        }
+        packages = []
+        artifacts = []
+        for package, (kind, filename) in self.runtime_files.items():
+            package_id = f"path+file://{self.root}/{package}#0.1.0"
+            packages.append({"name": package, "id": package_id})
+            binary = self.root / filename
+            binary.parent.mkdir(parents=True, exist_ok=True)
+            binary.write_text(package)
+            artifacts.append({
+                "reason": "compiler-artifact", "package_id": package_id,
+                "target": {"name": binary.stem, "kind": [kind], "crate_types": [kind]},
+                "executable": str(binary) if kind == "bin" else None,
+                "filenames": [str(binary)],
+            })
+        (self.root / "metadata.json").write_text(json.dumps({"packages": packages}))
+        (self.root / "build.jsonl").write_text("\n".join(json.dumps(artifact) for artifact in artifacts))
         cargo = self.root / "cargo"
         cargo.write_text("""#!/usr/bin/env python3
 import json
@@ -143,11 +166,15 @@ with (Path(os.environ['RUNNER_TEMP']) / 'cargo-calls').open('a') as calls:
     calls.write(json.dumps(sys.argv[1:]) + '\\n')
 if sys.argv[1:3] == ['nextest', 'archive']:
     Path(sys.argv[sys.argv.index('--archive-file') + 1]).touch()
+elif sys.argv[1] in ('build', 'metadata'):
+    output = 'build.jsonl' if sys.argv[1] == 'build' else 'metadata.json'
+    print((Path(os.environ['RUNNER_TEMP']) / output).read_text())
 """)
         cargo.chmod(0o755)
         generator = self.root / "gateways/kafka/scripts/ci-wire-fixtures.sh"
         generator.parent.mkdir(parents=True)
-        generator.write_text("#!/bin/sh\nmkdir -p gateways/kafka/tools/kafka-tool/kafka_messages\n")
+        generator.write_text("#!/bin/sh\nmkdir -p gateways/kafka/tools/kafka-tool/kafka_messages\n"
+                             "printf '%s' \"$KAFKA_MESSAGE_GEN\" > \"$RUNNER_TEMP/kafka-message-gen\"\n")
         generator.chmod(0o755)
 
     def assert_workspace_fallback(self):
@@ -160,9 +187,17 @@ if sys.argv[1:3] == ['nextest', 'archive']:
         self.assertEqual(calls[0], ["build", "--locked", "--workspace", "--exclude", "server",
                                    "--exclude", "iggy-cli", "--message-format=json-render-diagnostics"])
         self.assertEqual(calls[1], ["nextest", "archive", "--locked", "--profile", "ci",
+                                   "--workspace",
                                    "--archive-file", str(artifact / "nextest.tar.zst")])
-        self.assertTrue((artifact / "runtime.tar.zst").is_file())
+        self.assert_runtime_archive([filename for _, filename in self.runtime_files.values()])
         self.assertEqual((artifact / "kafka-fixtures").read_text(), "true\n")
+        self.assertEqual((self.root / "kafka-message-gen").read_text(),
+                         str(self.root / "target/debug/kafka-message-gen"))
+
+    def assert_runtime_archive(self, files):
+        result = run("tar", "--zstd", "-tf", str(self.root / "rust-test-build/runtime.tar.zst"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(sorted(result.stdout.splitlines()), sorted(files))
 
     def test_planner_failure_builds_all_test_extras_and_tests(self):
         self.assert_workspace_fallback()
@@ -171,13 +206,67 @@ if sys.argv[1:3] == ['nextest', 'archive']:
         self.env["TEST_SELECTION"] = "workspace"
         self.assert_workspace_fallback()
 
+    def select(self, packages, *, tests=(), runtime_packages=()):
+        outputs = {
+            "cargo-scope:cargo.test": "packages\n" if packages else "skipped\n",
+            "cargo-scope:runtime-artifacts": "packages\n" if runtime_packages else "skipped\n",
+            "package-names:cargo.test": "".join(package + "\0" for package in packages),
+            "package-names:runtime-artifacts": "".join(package + "\0" for package in runtime_packages),
+            "target-args:cargo.test": "".join("--test\0" + test + "\0" for test in tests),
+        }
+        selector = self.root / "cargo-rail-action"
+        selector.write_text("#!/usr/bin/env python3\nimport sys\n"
+                            f"outputs = {outputs!r}\n"
+                            "sys.stdout.write(outputs[f'{sys.argv[2]}:{sys.argv[4]}'])\n")
+        selector.chmod(0o755)
+        self.env["PLAN_STATUS"] = "success"
+        result = run("bash", "-euo", "pipefail", "-c", self.script, cwd=self.root, env=self.env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.root / "cargo-calls"
+        return [json.loads(line) for line in calls.read_text().splitlines()] if calls.exists() else []
+
+    def test_affected_packages_keep_workspace_builds_and_filter_only_the_archive(self):
+        calls = self.select(["integration", "iggy"],
+                            runtime_packages=["iggy-connectors", "iggy_connector_stdout_sink"])
+        self.assertEqual(calls[0], ["build", "--locked", "--workspace", "--exclude", "server",
+                                   "--exclude", "iggy-cli", "--message-format=json-render-diagnostics"])
+        self.assertEqual(calls[-1], ["nextest", "archive", "--locked", "--profile", "ci",
+                                   "--workspace", "-E", "package(=integration) | package(=iggy)",
+                                   "--archive-file", str(self.root / "rust-test-build/nextest.tar.zst")])
+        self.assert_runtime_archive(["target/debug/iggy-connectors",
+                                     "target/debug/libiggy_connector_stdout_sink.so"])
+        self.assertEqual((self.root / "rust-test-build/scope").read_text(), "packages\n")
+        self.assertEqual((self.root / "rust-test-build/kafka-fixtures").read_text(), "false\n")
+
+    def test_selected_integration_targets_filter_by_package_kind_and_name(self):
+        calls = self.select(["integration", "iggy"], tests=["round_trip", "protocol"])
+        self.assertEqual(len(calls), 1)
+        self.assertIn("--workspace", calls[0])
+        self.assertNotIn("--test", calls[0])
+        self.assertEqual(calls[0][calls[0].index("-E") + 1],
+                         "(package(=integration) | package(=iggy)) & kind(test) & "
+                         "(binary(=round_trip) | binary(=protocol))")
+
+    def test_server_and_cli_prerequisites_use_the_shared_runtime(self):
+        calls = self.select(["iggy-gateway-kafka"], runtime_packages=["server", "iggy-cli"])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][:2], ["nextest", "archive"])
+        self.assert_runtime_archive([])
+        self.assertEqual((self.root / "rust-test-build/kafka-fixtures").read_text(), "true\n")
+        # No runtime build means no prebuilt generator, so the script builds its own.
+        self.assertEqual((self.root / "kafka-message-gen").read_text(), "")
+
+    def test_skipped_scope_does_not_compile_or_archive(self):
+        self.assertEqual(self.select([]), [])
+        self.assertEqual((self.root / "rust-test-build/scope").read_text(), "skipped\n")
+        self.assertFalse((self.root / "rust-test-build/nextest.tar.zst").exists())
+
     def test_selector_failure_discards_partial_package_selection(self):
         selector = self.root / "cargo-rail-action"
         selector.write_text("""#!/usr/bin/env bash
 case "$2:$4" in
   cargo-scope:*) printf 'packages\\n' ;;
-  cargo-args:*) printf '%s\\0' '-p' 'selected-test-package' ;;
-  target-args:*) printf '%s\\0' '--lib' ;;
+  target-args:*) printf '%s\\0' '--test' 'selected-test' ;;
   package-names:cargo.test) printf '%s\\0' 'selected-test-package' ;;
   *) exit 1 ;;
 esac
@@ -208,6 +297,11 @@ class RuntimeSelection(unittest.TestCase):
                       [(entry["component"], entry["task"])
                        for entry in json.loads(outputs["other_matrix"])["include"]])
 
+    def test_nextest_config_change_runs_miri(self):
+        outputs = self.select([".config/nextest.toml"])
+        plan = json.loads(outputs["rust_plan"])
+        self.assertIn("miri", [entry["task"] for entry in plan["checks"]])
+
     def test_runtime_restore_change_exercises_real_consumers(self):
         outputs = self.select(["scripts/ci/restore-runtime.sh"])
         self.assertEqual(outputs["runtime"], "true")
@@ -230,7 +324,6 @@ class RuntimeSelection(unittest.TestCase):
         self.assertTrue(runtime_plan["tests"])
         self.assertEqual([entry["task"] for entry in runtime_plan["checks"]], ["test-storage-compat"])
         plan = json.loads(outputs["rust_plan"])
-        self.assertFalse(plan["tests"])
         self.assertFalse({"test", "test-storage-compat"} & {entry["task"] for entry in plan["checks"]})
 
     def test_swift_only_change_builds_server_for_e2e(self):
@@ -250,6 +343,137 @@ class RuntimeConsumers(unittest.TestCase):
                 uses = [step.get("uses") for step in steps]
                 if SERVER_START in uses:
                     self.assertIn(DOWNLOAD_RUNTIME, uses[:uses.index(SERVER_START)], path.relative_to(REPO_ROOT))
+
+
+class PublishSelection(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.remote = self.root / "origin.git"
+        self.checkout = self.root / "checkout"
+        self.checkout.mkdir()
+        self.env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
+                        GIT_AUTHOR_NAME="Publish test", GIT_AUTHOR_EMAIL="publish@example.com",
+                        GIT_COMMITTER_NAME="Publish test", GIT_COMMITTER_EMAIL="publish@example.com")
+        self.git("init", "--bare", "--quiet", str(self.remote))
+        self.git("init", "--quiet")
+        self.git("commit", "--allow-empty", "-m", "Release candidate A")
+        self.first_commit = self.git("rev-parse", "HEAD").strip()
+        self.git("commit", "--allow-empty", "-m", "Release candidate B")
+        self.git("remote", "add", "origin", str(self.remote))
+        self.git("push", "origin", "HEAD:refs/heads/master")
+        self.tags = {
+            "rust-common": "common-0.9.0-edge.1",
+            "rust-binary-protocol": "binary-protocol-0.9.0-edge.1",
+            "rust-sdk": "iggy-0.9.0-edge.1",
+            "rust-cli": "cli-0.9.0-edge.1",
+            "sdk-python": "python-sdk-0.9.0rc1",
+            "sdk-node": "node-sdk-0.9.0-rc.1",
+            "sdk-java": "java-sdk-0.9.0-rc.1",
+            "sdk-csharp": "csharp-sdk-0.9.0-rc.1",
+            "sdk-go": "foreign/go/v0.9.0-rc.1",
+        }
+        (self.checkout / "scripts").mkdir()
+
+    def git(self, *args):
+        result = run("git", *args, cwd=self.checkout, env=self.env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout
+
+    def release(self, *components):
+        for component in components or self.tags:
+            tag = self.tags[component]
+            if tag:
+                self.git("--git-dir", str(self.remote), "tag", "-a", tag,
+                         self.first_commit, "-m", tag)
+
+    def plan(self, *, automatic=True, skip_tags=False, docker="rust-server"):
+        extractor = []
+        for key, tag in self.tags.items():
+            extractor.append(f"{key}:--should-tag) echo {'true' if tag else 'false'} ;;")
+            if tag:
+                extractor.append(f"{key}:--tag) echo '{tag}' ;;")
+        (self.checkout / "scripts/extract-version.sh").write_text(
+            'case "$1:$2" in\n' + "\n".join(extractor) + "\n*) exit 1 ;;\nesac\n")
+        workflow = yaml.safe_load((REPO_ROOT / ".github/workflows/publish.yml").read_text())
+        config = yaml.safe_load((REPO_ROOT / ".github/config/publish.yml").read_text())["components"]
+        step = next(step for step in workflow["jobs"]["plan"]["steps"] if step.get("id") == "mk")
+        script = step["with"]["script"]
+        values = {
+            "steps.cfg.outputs.components_b64": base64.b64encode(json.dumps(config).encode()).decode(),
+            "inputs.publish_crates": ",".join(key for key in self.tags if key.startswith("rust-")),
+            "inputs.publish_dockerhub": docker,
+            "inputs.publish_other": ",".join(key.removeprefix("sdk-") for key in self.tags if key.startswith("sdk-")),
+            "inputs.create_edge_docker_tag": str(automatic).lower(),
+            "inputs.skip_tag_creation": str(skip_tags).lower(),
+        }
+        for expression, value in values.items():
+            script = script.replace("${{ " + expression + " }}", value)
+        harness = """
+const outputs = {};
+const core = { setOutput(name, value) { outputs[name] = value; }, info() {}, warning() {} };
+const console = { log() {} };
+"""
+        return run("node", "-e", harness + script + "\nprocess.stdout.write(JSON.stringify(outputs));",
+                   cwd=self.checkout, env=self.env)
+
+    def outputs(self, **kwargs):
+        result = self.plan(**kwargs)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_queued_publish_drops_completed_releases_but_keeps_edge_images(self):
+        before = self.outputs()
+        self.assertEqual({target["key"] for target in json.loads(before["targets"])["include"]},
+                         set(self.tags) | {"rust-server"})
+        self.release()
+        self.assertEqual(self.git("tag", "--list"), "")
+        after = self.outputs()
+        self.assertEqual([target["key"] for target in json.loads(after["targets"])["include"]], ["rust-server"])
+        self.assertEqual(after["crates"], "")
+        self.assertEqual(after["has_python"], "false")
+        self.assertEqual(after["has_docker"], "true")
+        self.assertEqual(len(json.loads(after["docker_matrix"])["include"]), 2)
+
+    def test_partial_release_keeps_only_unreleased_crates_and_sdks(self):
+        self.release("rust-sdk", "sdk-python")
+        outputs = self.outputs()
+        self.assertEqual(set(outputs["crates"].split(",")), {"rust-common", "rust-binary-protocol", "rust-cli"})
+        self.assertEqual({target["key"] for target in json.loads(outputs["targets"])["include"]},
+                         (set(self.tags) - {"rust-sdk", "sdk-python"}) | {"rust-server"})
+
+    def test_completed_release_without_docker_targets_produces_an_empty_plan(self):
+        self.release()
+        outputs = self.outputs(docker="")
+        self.assertEqual(outputs["count"], "0")
+        self.assertEqual(outputs["crates"], "")
+        self.assertEqual(outputs["has_python"], "false")
+        self.assertEqual(outputs["has_docker"], "false")
+        self.assertEqual(json.loads(outputs["targets"]), {"include": [{"key": "noop", "type": "noop"}]})
+
+    def test_mutable_snapshot_remains_selected_after_other_releases_complete(self):
+        self.tags["sdk-java"] = None
+        self.release()
+        outputs = self.outputs()
+        self.assertEqual([target["key"] for target in json.loads(outputs["non_docker_targets"])["include"]], ["sdk-java"])
+
+    def test_manual_and_explicit_republish_requests_keep_completed_releases(self):
+        self.release()
+        self.git("remote", "set-url", "origin", str(self.root / "missing.git"))
+        for options in ({"automatic": False}, {"skip_tags": True}):
+            with self.subTest(**options):
+                outputs = self.outputs(**options)
+                self.assertEqual({target["key"] for target in json.loads(outputs["targets"])["include"]},
+                                 set(self.tags) | {"rust-server"})
+                self.assertEqual(outputs["has_python"], "true")
+
+    def test_remote_lookup_failure_does_not_produce_a_publish_plan(self):
+        self.git("remote", "set-url", "origin", str(self.root / "missing.git"))
+        result = self.plan()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not appear to be a git repository", result.stderr)
+        self.assertEqual(result.stdout, "")
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ the bdd test suite has no defaults and fails when any of these is missing:
 
 - `IGGY_TCP_ADDRESS="host:port"` - server address
 - `IGGY_ROOT_USERNAME` / `IGGY_ROOT_PASSWORD` - root credentials
+- `IGGY_TCP_ADDRESS_NO_QUORUM="host:port"` - cluster node that cannot reach quorum, read only by the session contract scenarios
 
 ## Run (recommended)
 
@@ -27,6 +28,10 @@ sdk and feature matrix.
 
 for iterating against a server you started yourself. note: bdd test expect an
 iggy-server started with the same root credentials
+
+The stream options feature also needs the server to run with encryption enabled and a config key (`IGGY_ENCRYPTION_ENABLED=true`, `IGGY_ENCRYPTION_KEY`), as `scripts/run-bdd-tests.sh` starts it.
+
+The metadata changes feature needs the same key and `IGGY_METADATA_CHANGE_LOG_RESOURCE_CAPACITY=64`, so its expiry scenario can push a held cursor out of the change log.
 
 from [/foreign/node](../../) run
 
