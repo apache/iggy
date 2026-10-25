@@ -33,6 +33,10 @@ pub trait CliCommand {
     fn use_tracing(&self) -> bool {
         true
     }
+    /// Whether stdout carries only the command's data, so the banner goes to stderr.
+    fn stdout_is_data(&self) -> bool {
+        false
+    }
     fn login_required(&self) -> bool {
         true
     }

@@ -19,12 +19,18 @@
 
 package org.apache.iggy.client.blocking;
 
+import org.apache.iggy.exception.IggyErrorCode;
+import org.apache.iggy.exception.IggyServerException;
+import org.apache.iggy.exception.IggyValidationException;
 import org.apache.iggy.user.GlobalPermissions;
 import org.apache.iggy.user.IdentityInfo;
 import org.apache.iggy.user.Permissions;
 import org.apache.iggy.user.UserInfo;
 import org.apache.iggy.user.UserInfoDetails;
+import org.apache.iggy.user.UserOptionKey;
+import org.apache.iggy.user.UserOptions;
 import org.apache.iggy.user.UserStatus;
+import org.apache.iggy.user.UserUpdate;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -33,6 +39,7 @@ import java.util.List;
 import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 public abstract class UsersClientBaseTest extends IntegrationTest {
 
@@ -112,7 +119,8 @@ public abstract class UsersClientBaseTest extends IntegrationTest {
         trackUser(user.id());
 
         // when
-        usersClient.updateUser(user.id(), Optional.of("new-name"), Optional.empty());
+        usersClient.updateUser(
+                user.id(), UserUpdate.builder().username("new-name").build());
 
         // then
         var updatedUser = usersClient.getUser(user.id());
@@ -129,7 +137,12 @@ public abstract class UsersClientBaseTest extends IntegrationTest {
         trackUser(user.id());
 
         // when
-        usersClient.updateUser(user.id(), Optional.of("renamed"), Optional.of(UserStatus.Inactive));
+        usersClient.updateUser(
+                user.id(),
+                UserUpdate.builder()
+                        .username("renamed")
+                        .status(UserStatus.Inactive)
+                        .build());
 
         // then
         var updatedUser = usersClient.getUser(user.id());
@@ -146,7 +159,8 @@ public abstract class UsersClientBaseTest extends IntegrationTest {
         trackUser(user.id());
 
         // when
-        usersClient.updateUser(user.id(), Optional.empty(), Optional.of(UserStatus.Inactive));
+        usersClient.updateUser(
+                user.id(), UserUpdate.builder().status(UserStatus.Inactive).build());
 
         // then
         List<UserInfo> users = usersClient.getUsers();
@@ -206,6 +220,52 @@ public abstract class UsersClientBaseTest extends IntegrationTest {
         // then
         assertThat(afterSecondChange).isNotNull();
         assertThat(afterSecondChange.userId()).isEqualTo(testUser.id());
+    }
+
+    @Test
+    void givenUserOptionsWhenCreatingAndUpdatingShouldPreserveUserBehavior() {
+        // given
+        login();
+        UserInfoDetails first = usersClient.createUser(
+                "options-user", "secret", UserStatus.Active, Optional.empty(), UserOptions.empty());
+        trackUser(first.id());
+        UserInfoDetails second = usersClient.createUser("other-user", "secret", UserStatus.Active, Optional.empty());
+        trackUser(second.id());
+
+        // when
+        usersClient.updateUser(
+                first.id(),
+                UserUpdate.builder()
+                        .username("options-user-renamed")
+                        .status(UserStatus.Inactive)
+                        .build());
+
+        // then
+        var updated = usersClient.getUser(first.id()).orElseThrow();
+        assertThat(updated.username()).isEqualTo("options-user-renamed");
+        assertThat(updated.status()).isEqualTo(UserStatus.Inactive);
+        assertThat(updated.options()).isEmpty();
+        assertThat(updated.derivedOptions()).isEmpty();
+        assertThat(first.options()).isEmpty();
+
+        // when a duplicate username rides with a status change
+        assertThatThrownBy(() -> usersClient.updateUser(
+                        second.id(),
+                        UserUpdate.builder()
+                                .username("options-user-renamed")
+                                .status(UserStatus.Inactive)
+                                .build()))
+                .isInstanceOf(IggyServerException.class);
+
+        // then neither change applied
+        var untouched = usersClient.getUser(second.id()).orElseThrow();
+        assertThat(untouched.username()).isEqualTo("other-user");
+        assertThat(untouched.status()).isEqualTo(UserStatus.Active);
+        assertThatThrownBy(
+                        () -> UserUpdate.builder().reset(UserOptionKey.STATUS).build())
+                .isInstanceOfSatisfying(
+                        IggyValidationException.class,
+                        refusal -> assertThat(refusal.getErrorCode()).isEqualTo(IggyErrorCode.OPTION_NOT_RESETTABLE));
     }
 
     @Test

@@ -28,6 +28,7 @@ type CreateUser struct {
 	Password    string              `json:"Password"`
 	Status      iggcon.UserStatus   `json:"Status"`
 	Permissions *iggcon.Permissions `json:"Permissions,omitempty"`
+	Options     iggcon.UserOptions  `json:"-"`
 }
 
 func (c *CreateUser) Code() Code {
@@ -35,12 +36,16 @@ func (c *CreateUser) Code() Code {
 }
 
 func (c *CreateUser) MarshalBinary() ([]byte, error) {
+	optionsBytes, err := encodeOptions(c.Options.Raw)
+	if err != nil {
+		return nil, err
+	}
 	capacity := 4 + len(c.Username) + len(c.Password)
 	if c.Permissions != nil {
 		capacity += 4 + c.Permissions.Size()
 	}
 
-	bytes := make([]byte, capacity)
+	bytes := make([]byte, capacity, capacity+len(optionsBytes))
 	position := 0
 
 	bytes[position] = byte(len(c.Username))
@@ -77,7 +82,7 @@ func (c *CreateUser) MarshalBinary() ([]byte, error) {
 		bytes[position] = byte(0)
 	}
 
-	return bytes, nil
+	return append(bytes, optionsBytes...), nil
 }
 
 type GetUser struct {

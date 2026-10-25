@@ -28,7 +28,7 @@ The package installation and API examples target server/SDK 0.9.0. For source bu
 from the same checkout. The SDK targets .NET 8 and .NET 10; repository examples require .NET 10.
 `0.9.0` includes the independent message and consumer-offset durability options.
 
-This checkout uses binary protocol 0.11.1. Servers and applicable SDKs must deploy together; mixed versions and
+This checkout uses binary protocol 0.12.0. Servers and applicable SDKs must deploy together. Mixed versions and
 rolling upgrades are unsupported. This checkout requires fresh storage and refuses older data directories
 without modification. `--fresh` deletes existing data in the configured directory.
 See the [server recovery guide](../../core/server/README.md#upgrade-recovery).
@@ -59,6 +59,7 @@ these imports. Create the named resources before read, update, delete, send, or 
 
 ```c#
 using System.Buffers;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Apache.Iggy;
@@ -66,6 +67,7 @@ using Apache.Iggy.Configuration;
 using Apache.Iggy.Consumers;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Contracts.Auth;
+using Apache.Iggy.Encryption;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Factory;
 using Apache.Iggy.Headers;
@@ -152,6 +154,14 @@ await client.ConnectAsync();
 
 TCP applies the connection, heartbeat, TLS, and auto-login settings. HTTP `ConnectAsync` does no
 network work and requires explicit login. For TLS configuration, see the [TcpTls example](../../examples/csharp/README.md#tcptls).
+
+A public TCP sign-in uses the supplied credentials and supersedes any automatic sign-in in progress.
+If that call fails, including validation, cancellation, timeout, or discovery after registration,
+the tentative session is discarded and automatic sign-in stays disabled until another explicit
+sign-in succeeds. Logout also withdraws configured auto-login. Calls that had not been sent under
+the previous caller session fail as unauthenticated; possibly applied writes retain their uncertainty.
+An automatic sign-in rejected with an older password snapshot retries a newer password committed
+by the same caller session.
 
 ### Connection String
 
@@ -262,6 +272,28 @@ await client.ConnectAsync();
 
 ### Retries and failed requests
 
+HTTP retries 429 and 503 responses, including `relay_refused`, within its existing
+30-second retry budget. It uses the delta value of `Retry-After`, or 50 ms when
+that value is absent. Retained-operation recovery below applies to TCP.
+
+On a multi-node cluster, an HTTP call often reaches a node that is not the
+partition primary. For message sends, polls and consumer offset calls, that
+node relays the call to the primary. The relay needs identical `http.jwt`
+secrets or `cluster.auth` on every node. Without that key material, these calls
+answer 503 with code 58. See
+[HTTP routing and backpressure](../../core/server/README.md#http-routing-and-backpressure).
+
+Receipt access follows the server's [session and revocation policy](../../core/server/README.md#sessions-and-retry-receipts).
+An unresolved operation cannot recover its receipt after its original session
+ends, even after a new login or account reactivation. A fresh send can duplicate
+that operation.
+
+Each node counts the messages in its stream, topic and system stats. After a
+successful send, a node that is not the partition primary shows the new count
+only after the next prepare or commit broadcast. When no other write follows,
+this delay is at most `cluster.commit_broadcast_interval` (500 ms by default).
+See [metadata freshness and counters](../../core/server/README.md#metadata-freshness-and-counters).
+
 Within one call deadline, the SDK retries an unresolved replicated mutation using its original session,
 request id, context, and frozen frame. Metadata mutations share one lane; partition mutations share a lane
 by incarnation and partition id, including requests using different names for the same partition.
@@ -304,10 +336,26 @@ Smaller positive limits are valid but reject mutations that cannot fit; reads an
 Reads and control requests have a separate per-link limit of 256 pending calls and a 32-frame write queue.
 Their bodies, including unknown raw non-replicated commands, are outside the mutation byte budget.
 
+Partition primaries are spread over the replicas, so many of them are metadata backups. A backup applies metadata
+commits after the metadata primary, so it can miss a stream, topic or partition that the metadata primary already
+created. A replica can answer a route lookup, a send, a poll or an offset request with "not found". The status is
+1009, 1010, 2010, 2011 or 3007. If that replica is not the metadata primary, the call looks up the route again and
+retries. If the 30-second call deadline ends first, the call fails with `IggyInvalidStatusCodeException` and
+status 58. A mutation with an unknown earlier outcome ends with `VsrRequestOutcomeUnknownException` instead.
+
+Only a "not found" reply from the metadata primary is final. A leader change can leave the client with an old view
+of the metadata primary. When the client believes that the replica that replied is the metadata primary, it reads
+the cluster roster from that replica. When it has no ready link to the metadata primary, it does the same. If that
+roster names this replica as the metadata primary, the reply is final. Otherwise the call retries.
+
+`SendBinaryRequestToReplicaAsync(code, payload, replicaId)` sends a raw command to one node of a cluster, named by the replica id that cluster metadata returns.
+
+Each node answers non-replicated commands such as `GetStats` from its own state, so this reads the state of that node. Replicated commands, polls, consumer-offset reads and session-control codes fail with status 3 before anything is sent. An id that cluster metadata does not name fails with status 6. An unreachable node is retried until the request timeout, and a `NotPrimary` (89) reply is returned rather than sent to another node.
+
 ### Limitations
 
 - TCP uses VSR framing; HTTP uses the separate REST API. Join/leave, `GetMeAsync`, segment deletion,
-  and raw binary requests are TCP-only and throw `FeatureUnavailableException` on HTTP.
+  and raw binary requests, also to a chosen replica, are TCP-only and throw `FeatureUnavailableException` on HTTP.
 - `StoreOffsetAsync` / `DeleteOffsetAsync` need an explicit partition id under VSR: the broker does not
   resolve a `null` partition for a consumer-offset request, so passing one throws client-side.
 - Polling a missing topic throws `IggyInvalidStatusCodeException`. An existing topic with no available
@@ -331,8 +379,9 @@ Their bodies, including unknown raw non-replicated commands, are outside the mut
   Logout and `Dispose` stop the restarts. Invalid local CA configuration and rejected credentials surface as
   errors. A caller's cancellation stops that call while the link owner continues reconnecting. Request replay
   has its own deadline.
-  Configured auto-login credentials take precedence over credentials remembered from successful
-  username/password or PAT login. Without either, reconnecting cannot restore the authenticated session.
+  Reconnecting signs in with the last successful username/password or PAT login, or with the configured
+  auto-login credentials if the caller never signed in. Without either, reconnecting cannot restore the
+  authenticated session.
   A committed password change or rename of the signed-in user updates these credentials. This includes a
   change that `ResolveOperationAsync` proves. A committed rejection leaves them unchanged.
 - `AutoLoginSettings` properties are now `init`-only, as is `IggyClientConfigurator.HeartbeatInterval`. Build
@@ -402,6 +451,16 @@ await client.LoginWithPersonalAccessTokenAsync(patResponse!.Token);
 await client.CreateStreamAsync("my-stream");
 ```
 
+A stream can carry its own data encryption key, exactly 32 random bytes. The key travels inside the create request, so use TLS when the network is not trusted. The server stores it wrapped under its own key and never returns it: reads report only where the key came from and its fingerprints. When the server has encryption enabled and no key is given, it generates one for the stream. The key cannot change after creation.
+
+```c#
+var key = RandomNumberGenerator.GetBytes(EncryptionKeys.KEY_LENGTH);
+var stream = await client.CreateStreamAsync("payments", new StreamOptions { EncryptionKey = key });
+
+Console.WriteLine(stream?.EncryptionKeySource);      // Stream
+Console.WriteLine(stream?.EncryptionKeyFingerprint); // equals EncryptionKeys.Fingerprint(key)
+```
+
 You can reference streams by either numeric ID or name:
 
 ```c#
@@ -411,7 +470,7 @@ var streamByName = Identifier.String("my-stream");
 
 ### Creating Topics
 
-Every stream contains topics for organizing messages:
+Every stream contains topics for organizing messages. Settings a topic takes at creation go in `TopicOptions`, and every one left null keeps the server default:
 
 ```c#
 var streamId = Identifier.String("my-stream");
@@ -420,11 +479,32 @@ await client.CreateTopicAsync(
     streamId,
     name: "my-topic",
     partitionsCount: 3,
-    compressionAlgorithm: CompressionAlgorithm.None,
-    messageExpiry: TimeSpan.MaxValue,  // never expire
-    maxTopicSize: 1024 * 1024 * 1024   // 1 GiB
+    options: new TopicOptions
+    {
+        CompressionAlgorithm = CompressionAlgorithm.None,
+        MessageExpiry = TimeSpan.MaxValue,  // never expire
+        MaxTopicSize = 1024 * 1024 * 1024   // 1 GiB
+    }
 );
 ```
+
+### Updating Streams, Topics and Users
+
+An update names only what changes. Every property left null keeps the stored value, and `Reset` returns a key to its default:
+
+```c#
+await client.UpdateStreamAsync(streamId, new StreamUpdate { Name = "my-stream-v2" });
+
+await client.UpdateTopicAsync(streamId, Identifier.String("my-topic"), new TopicUpdate
+{
+    MessageExpiry = TimeSpan.FromDays(7),
+    Reset = new HashSet<TopicOptionKey> { TopicOptionKey.MaxTopicSize }
+});
+
+await client.UpdateUserAsync(Identifier.String("alice"), new UserUpdate { Status = UserStatus.Inactive });
+```
+
+Settings fixed at creation, such as compression, cannot be updated. `DescribeOptionsAsync(OptionsScope.Topic)` lists every key the server knows with its kind and whether it can be updated or reset. For a key newer than this SDK, set it through `Options` and reset it through `RawReset`, and the server decides whether the change is allowed.
 
 Note: Stream and topic names use hyphens instead of spaces. Iggy automatically replaces spaces with hyphens.
 
@@ -696,6 +776,89 @@ Available compression methods: `Stored`, `Deflated`, `Bzip2`, `Zstd`, `Lzma`, `X
 Available snapshot types: `FilesystemOverview`, `ProcessList`, `ResourceUsage`, `Test`, `ServerLogs`, `ServerConfig`,
 `All`.
 
+### Metadata Changes
+
+`GetMetadataChangesAsync` reads the node's change log: one record per public result of a committed metadata operation, such as a stream created, a topic renamed, a user's permissions changed or a session closed. A mirror keeps a cursor, asks for the records after it, and stores the returned `Next` cursor. The call needs root or the global `ManageServers` permission and works over TCP and HTTP.
+
+```c#
+var query = new MetadataChangesQuery { Groups = [MetadataChangeGroup.Streams, MetadataChangeGroup.Topics] };
+while (true)
+{
+    var page = await client.GetMetadataChangesAsync(query);
+    switch (page.Status)
+    {
+        case MetadataChangeStatus.Ok:
+            foreach (var record in page.Records)
+            {
+                Console.WriteLine($"op {record.Op} by {record.ActorUserId}: {record.Kind}");
+            }
+
+            if (page.Next is { } next)
+            {
+                query = query with { Start = MetadataChangeStart.After(next) };
+            }
+
+            if (!page.HasMore)
+            {
+                await Task.Delay(TimeSpan.FromSeconds(1));
+            }
+
+            break;
+        case MetadataChangeStatus.Behind:
+            await Task.Delay(TimeSpan.FromMilliseconds(100));
+            break;
+        default:
+            query = query with { Start = await RebuildAsync(client, query.Groups) };
+            break;
+    }
+}
+
+// Pages the current state, then returns the position to follow from.
+static async Task<MetadataChangeStart> RebuildAsync(IIggyClient client, IReadOnlyList<MetadataChangeGroup> groups)
+{
+    var query = new MetadataChangesQuery { Start = MetadataChangeStart.Current(), Groups = groups };
+    while (true)
+    {
+        var page = await client.GetMetadataChangesAsync(query);
+        if (page.Status == MetadataChangeStatus.Behind)
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(100));
+            continue;
+        }
+
+        if (page.Status != MetadataChangeStatus.Ok)
+        {
+            query = query with { Start = MetadataChangeStart.Current() };
+            continue;
+        }
+
+        foreach (var item in page.Items)
+        {
+            Console.WriteLine($"{item.Group}: {item.Body.GetType().Name}");
+        }
+
+        if (page.CurrentPageToken is { } token)
+        {
+            query = query with { Start = MetadataChangeStart.Current(token) };
+        }
+        else if (page.Next is { } anchor)
+        {
+            return MetadataChangeStart.After(anchor);
+        }
+        else
+        {
+            query = query with { Start = MetadataChangeStart.Current() };
+        }
+    }
+}
+```
+
+`Expired` means the log no longer holds the history after the cursor, and `Reset` means the cursor belongs to another history, for example after the data directory was rebuilt. Either way the mirror rebuilds from current state pages and then follows the changes after the anchor they return.
+
+Current pages need the parent groups of every selected group, for example `Topics` with `Streams`. Keep a rebuilt state private until a change page answers `Ok` with `HasMore` false and a `HeadOp` at or above the last current page's.
+
+A cursor's `ToString()` is its `mc1_` text, which `MetadataChangeCursor.Parse` reads back, so a mirror can store it. A query the rules refuse fails with code 3 before anything is sent, and a record of a kind this SDK does not know arrives as `MetadataUnknownBody` or `MetadataUnknownJsonBody`.
+
 ### Segment Management
 
 Delete up to N of the oldest sealed segments from a partition; the active segment is retained:
@@ -839,6 +1002,14 @@ await foreach (var message in consumer.ReceiveAsync())
     Console.WriteLine($"Partition {message.PartitionId}: {payload}");
 }
 ```
+
+Disposal cancels and drains pending offset stores, then checkpoints the last message delivered
+from each partition before leaving the group. Buffered messages are excluded, and each checkpoint
+keeps the delivered message's partition context. `AutoCommitMode.Disabled` skips this final
+checkpoint. The final stores share one 30-second budget; failures are logged and cleanup continues.
+Disposing from inside a receive loop is supported, including rented and deserialized messages.
+
+Under `AutoCommitMode.AfterReceive` a message counts as delivered once its loop body completes. A message whose body threw, broke or was still running when the consumer was disposed is not checkpointed and is delivered again.
 
 For automatic deserialization:
 

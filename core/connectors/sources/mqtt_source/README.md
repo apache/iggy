@@ -1,6 +1,6 @@
 # Apache Iggy MQTT Source Connector (`iggy_connector_mqtt_source`)
 
-The **MQTT Source Connector** is a dynamically loaded shared library plugin (`.so` / `.dylib` / `.dll`) for Apache Iggy. Built using the `iggy_connector_sdk::source_connector!` C-FFI ABI and the [`rumqttc`](https://crates.io/crates/rumqttc) asynchronous client, it ingests telemetry and event streams from external MQTT brokers (such as **EMQX** or Mosquitto) directly into persistent **Apache Iggy** streams, topics, and partitions.
+The **MQTT Source Connector** is a dynamically loaded shared library plugin (`.so` / `.dylib` / `.dll`) for Apache Iggy. Built using the `iggy_connector_sdk::source_connector!` C-FFI ABI and the `rumqttc-v4-next` and `rumqttc-v5-next` asynchronous clients, it ingests telemetry and event streams from external MQTT brokers (such as **EMQX** or Mosquitto) directly into persistent **Apache Iggy** streams, topics, and partitions.
 
 ---
 
@@ -88,7 +88,7 @@ Configuration operates in **two distinct layers**:
 | `client_id` | String | Conditional | `iggy-mqtt-source-{id}` when `clean_start = true` | MQTT client identifier. Required and non-empty when `clean_start = false` so a restart resumes the same broker session. |
 | `username` | String | No | None | Broker authentication username (must be supplied together with `password`). |
 | `password` | String | No | None | Broker authentication password (wrapped as a secret, never logged). |
-| `clean_start` | Boolean | No | `false` | MQTT clean start flag (or clean session for MQTT 3.1.1). |
+| `clean_start` | Boolean | No | `false` | MQTT clean start flag (or clean session for MQTT 3.1.1). When an MQTT 5 broker resumes the session, the source keeps the subscriptions stored in that session and does not subscribe again, so a changed `subscriptions` list takes effect once the broker starts a fresh session. |
 | `session_expiry_interval` | Integer | No | `3600` | MQTT 5 session expiry interval in seconds. Set to `0` only when immediate session discard is intentional. |
 | `keep_alive` | Duration | No | `"30s"` | Ping interval string (minimum `1s` for MQTT 3.1.1, minimum `5s` for MQTT 5). |
 | `poll_timeout` | Duration | No | `"1s"` | Maximum duration spent waiting on network events per driver poll tick. |

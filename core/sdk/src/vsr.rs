@@ -71,12 +71,15 @@ pub(crate) fn encode_request_header(
             }
         }
     };
-    // The header rules (checksum stamp, size, reserved code) live in the
+    // The header rules (request identifier, size, reserved code) live in the
     // protocol crate so every client and the cross-SDK fixtures share them;
     // only the session identity is decided here.
-    let header =
+    let mut header =
         RequestHeader::for_request(code, session.client_id(), request_id, session_id, payload)
             .map_err(|_| IggyError::InvalidConfiguration)?;
+    if operation == Operation::Register {
+        header.request_checksum = session.register_request_identifier()?;
+    }
     debug_assert_eq!(header.operation, operation);
     Ok((header, header.size as usize))
 }
@@ -180,18 +183,9 @@ fn decode_reply_outcome(
             if let Some(request) = request.filter(|_| header.has_committed_result()) {
                 let matches_request = header.client == request.client
                     && header.request_checksum == request.request_checksum
-                    && (header.operation == request.operation
-                        || matches!(
-                            (request.operation, header.operation),
-                            // The primary resolves these commands before committing their prepare.
-                            (
-                                Operation::CreateTopic,
-                                Operation::CreateTopicWithAssignments
-                            ) | (
-                                Operation::CreatePartitions,
-                                Operation::CreatePartitionsWithAssignments
-                            ) | (Operation::DeleteSegments, Operation::TruncatePartition)
-                        ))
+                    // The primary resolves some commands into an internal
+                    // operation before committing their prepare.
+                    && header.operation.request_operation() == request.operation
                     && header.partition_incarnation == request.partition_incarnation
                     && header.op != 0
                     && header.op == header.commit;
@@ -345,7 +339,7 @@ mod tests {
     use bytes::{BufMut, BytesMut};
     use iggy_binary_protocol::codes::{
         CREATE_PARTITIONS_CODE, CREATE_STREAM_CODE, CREATE_TOPIC_CODE, DELETE_SEGMENTS_CODE,
-        GET_STREAM_CODE, LOGOUT_USER_CODE, PING_CODE, SEND_MESSAGES_CODE,
+        GET_STREAM_CODE, LOGOUT_USER_CODE, PING_CODE, SEND_MESSAGES_CODE, UPDATE_RESOURCE_CODE,
     };
     use iggy_binary_protocol::consensus::{NON_REPLICATED_CODE_RANGE, PrepareHeader};
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
@@ -407,6 +401,40 @@ mod tests {
                         Err(IggyError::InvalidCommand)
                     ));
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn given_resolved_update_reply_when_correlating_should_accept_only_matching_request_identity() {
+        let request =
+            RequestHeader::for_request(UPDATE_RESOURCE_CODE, 1, 2, 3, b"request").unwrap();
+        let body = rejection_body(0);
+        for resolved in [
+            Operation::UpdateStreamResolved,
+            Operation::UpdateTopicResolved,
+            Operation::UpdateUserResolved,
+        ] {
+            let mut reply = committed_header(&request, &body);
+            reply.operation = resolved;
+            let outcome = decode_for_test(&request, &reply, body.clone()).unwrap();
+            assert!(outcome.committed, "{resolved:?}");
+            assert!(outcome.result.is_ok(), "{resolved:?}");
+            let mismatches: [fn(&mut ReplyHeader); 3] = [
+                |reply| reply.client ^= 1,
+                |reply| reply.request_checksum ^= 1,
+                |reply| reply.operation = Operation::CreateTopicWithAssignments,
+            ];
+            for mismatch in mismatches {
+                let mut unrelated = reply;
+                mismatch(&mut unrelated);
+                assert!(
+                    matches!(
+                        decode_for_test(&request, &unrelated, body.clone()),
+                        Err(IggyError::InvalidCommand)
+                    ),
+                    "{resolved:?}"
+                );
             }
         }
     }
@@ -661,8 +689,8 @@ mod tests {
 
     #[test]
     fn request_checksum_is_stamped_for_metadata_but_not_partition_operations() {
-        // Metadata dedup compares the stamp against cached replies. Partition
-        // dedup checks request ids without stamps; NonReplicated bypasses dedup.
+        // Metadata replies carry the request identifier. Partition operations
+        // leave it zero and NonReplicated bypasses dedup.
         let mut session = ConsensusSession::with_client_id(42);
         session.bind(99).unwrap();
         let payload = Bytes::from_static(b"payload");
@@ -670,9 +698,24 @@ mod tests {
         let metadata = encode_request_header(&mut session, CREATE_STREAM_CODE, &payload)
             .unwrap()
             .0;
-        assert_eq!(
+        assert_ne!(metadata.request_checksum, 0);
+        assert_ne!(
             metadata.request_checksum,
             u128::from(calculate_checksum(&payload)),
+        );
+
+        let repeated = encode_request_header(&mut session, CREATE_STREAM_CODE, &payload)
+            .unwrap()
+            .0;
+        assert_ne!(metadata.request_checksum, repeated.request_checksum);
+        let request_frame = crate::links::Frame {
+            header: metadata,
+            body: payload.clone(),
+        };
+        let replay_frame = request_frame.clone();
+        assert_eq!(
+            replay_frame.header.request_checksum,
+            request_frame.header.request_checksum
         );
 
         let partition = encode_request_header(&mut session, SEND_MESSAGES_CODE, &payload)
@@ -684,6 +727,21 @@ mod tests {
             .unwrap()
             .0;
         assert_eq!(ping.request_checksum, 0);
+    }
+
+    #[test]
+    fn given_register_retry_when_encoding_again_should_keep_request_identifier() {
+        let mut session = ConsensusSession::with_client_id(42);
+        let payload = Bytes::from_static(b"login-body");
+        let first = encode_request_header(&mut session, LOGIN_REGISTER_CODE, &payload)
+            .expect("first register")
+            .0;
+        let retry = encode_request_header(&mut session, LOGIN_REGISTER_CODE, &payload)
+            .expect("register retry")
+            .0;
+        assert_ne!(first.request_checksum, 0);
+        assert_eq!(retry.request_checksum, first.request_checksum);
+        assert_eq!(retry.request, first.request);
     }
 
     #[test]

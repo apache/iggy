@@ -23,7 +23,9 @@ using Apache.Iggy.IggyClient.Implementations;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Utils;
 using Apache.Iggy.Vsr;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using Moq;
 using static Apache.Iggy.Tests.VsrTests.MockFrames;
 
 namespace Apache.Iggy.Tests.VsrTests;
@@ -36,9 +38,13 @@ public sealed class ReplicaLinkTests
 {
     private const int MaxRetries = 1;
     private const int WaitMs = 5_000;
+    private const int MeasuredRestarts = 4;
+    private const int BindsPerRestart = 2;
     private static readonly TimeSpan Heartbeat = TimeSpan.FromMilliseconds(20);
+    private static readonly TimeSpan CadenceHeartbeat = TimeSpan.FromMilliseconds(150);
     private static readonly Identifier Stream = Identifier.Numeric(1);
     private static readonly Identifier Topic = Identifier.Numeric(2);
+    private static readonly uint[] Groups = [3, 4];
 
     [Fact]
     public async Task given_an_outage_longer_than_the_retry_budget_when_the_node_returns_should_resume_on_its_own()
@@ -113,6 +119,90 @@ public sealed class ReplicaLinkTests
         Assert.Equal(1, Volatile.Read(ref cluster.PrimaryWrites));
         Assert.Equal(1, cluster.Coordinator.Registrations);
         Assert.Equal(0, cluster.Primary.Registrations);
+    }
+
+    [Fact]
+    public async Task given_a_disconnected_member_of_two_groups_when_the_heartbeat_ticks_should_restart_links_without_syncing_groups()
+    {
+        using var cluster = new LinkCluster();
+        var logger = new Mock<ILogger>();
+        var loggers = new Mock<ILoggerFactory>();
+        loggers.Setup(factory => factory.CreateLogger(It.IsAny<string>())).Returns(logger.Object);
+        using var client = await InGroupsAsync(cluster, loggers.Object);
+        var states = RecordStates(client);
+        int Binds() => cluster.Primary.Requests(BIND_SESSION_CODE);
+        // A failed group sync is the only warning a client without a ready link logs.
+        int Warnings() => logger.Invocations.Count(call => call.Method.Name == nameof(ILogger.Log)
+            && call.Arguments[0] is LogLevel.Warning);
+        cluster.PrimaryDown = true;
+        Assert.True(await EventuallyAsync(() => Binds() >= 2), "The partition primary link uses up its retry budget.");
+
+        cluster.Coordinator.Kill();
+        Assert.True(await EventuallyAsync(() => states.Contains(ConnectionState.Disconnected)),
+            "The metadata primary link uses up its retry budget too.");
+        var binds = Binds();
+        // The tick that restarts the link begins after every group sync of an earlier tick has ended.
+        Assert.True(await EventuallyAsync(() => Binds() > binds),
+            $"Group syncs with no link to reach must not hold up link restarts. Binds: {Binds()}.");
+        var warnings = Warnings();
+        binds = Binds();
+
+        // Two dials per restart, so eight more binds prove four more restarts.
+        Assert.True(await EventuallyAsync(() => Binds() >= binds + 8),
+            $"The heartbeat keeps restarting links while disconnected. Binds: {Binds()}.");
+        Assert.Equal(warnings, Warnings());
+    }
+
+    [Fact]
+    public async Task given_a_coordinator_holding_group_syncs_when_the_heartbeat_ticks_should_keep_restarting_links()
+    {
+        using var cluster = new LinkCluster();
+        using var client = await InGroupsAsync(cluster);
+        int Binds() => cluster.Primary.Requests(BIND_SESSION_CODE);
+        cluster.PrimaryDown = true;
+        Assert.True(await EventuallyAsync(() => Binds() >= 2), "The partition primary link uses up its retry budget.");
+
+        cluster.SyncsHeld = true;
+        var binds = Binds();
+
+        // Two dials per restart, so eight more binds prove four restarts.
+        Assert.True(await EventuallyAsync(() => Binds() >= binds + 8),
+            $"Group syncs the coordinator never answers must not hold up link restarts. Binds: {Binds()}.");
+    }
+
+    [Fact]
+    public async Task given_a_coordinator_holding_the_syncs_of_three_groups_when_the_heartbeat_ticks_should_restart_links_every_tick()
+    {
+        using var cluster = new LinkCluster();
+        var failures = 0;
+        var logger = new Mock<ILogger>();
+        logger.Setup(log => log.IsEnabled(It.IsAny<LogLevel>())).Returns(true);
+        logger.Setup(log => log.Log(It.IsAny<LogLevel>(), It.IsAny<EventId>(),
+                It.IsAny<It.IsAnyType>(), It.IsAny<Exception?>(), It.IsAny<Func<It.IsAnyType, Exception?, string>>()))
+            .Callback(new InvocationAction(call =>
+            {
+                if (call.Arguments[2]?.ToString()?.StartsWith("Failed to refresh the consumer group assignment", StringComparison.Ordinal) == true)
+                {
+                    Interlocked.Increment(ref failures);
+                }
+            }));
+        var loggers = new Mock<ILoggerFactory>();
+        loggers.Setup(factory => factory.CreateLogger(It.IsAny<string>())).Returns(logger.Object);
+        using var client = await InGroupsAsync(cluster, loggers.Object, groups: [3, 4, 5], heartbeat: CadenceHeartbeat);
+        int Binds() => cluster.Primary.Requests(BIND_SESSION_CODE);
+        cluster.PrimaryDown = true;
+        Assert.True(await EventuallyAsync(() => Binds() >= 2), "The partition primary link uses up its retry budget.");
+        cluster.SyncsHeld = true;
+        var observations = new ConcurrentQueue<int>();
+        cluster.OnPrimaryBind = () => observations.Enqueue(Volatile.Read(ref failures));
+        Assert.True(await EventuallyAsync(() => observations.Count >= BindsPerRestart * (MeasuredRestarts + 1)),
+            $"Binds: {Binds()}.");
+        var restarts = observations.ToArray().Where((_, index) => index % BindsPerRestart == 0).ToArray();
+        for (var index = 1; index < restarts.Length; index++)
+        {
+            Assert.InRange(restarts[index] - restarts[index - 1], 0, 1);
+        }
+        Assert.True(restarts[^1] > restarts[0], "At least one held sync exhausted the shared refresh budget.");
     }
 
     [Fact]
@@ -213,13 +303,63 @@ public sealed class ReplicaLinkTests
         Assert.Equal(1, advertised.Connections);
     }
 
-    private static async Task<TcpMessageStream> SignedInAsync(ushort port, bool reconnect = true)
+    [Fact]
+    public async Task given_a_single_node_when_the_base_address_changes_after_connect_should_keep_the_configured_endpoint()
     {
-        var client = new TcpMessageStream(new IggyClientConfigurator
+        var token = TestContext.Current.CancellationToken;
+        using var node = new MockNode();
+        using var moved = new MockNode();
+        node.Serve(request => request.Code == GET_CLUSTER_METADATA_CODE ? StandaloneRoster(node.Port) : Answer(request));
+        moved.Serve(Answer);
+        var configuration = Configuration(node.Port);
+        var configured = configuration.BaseAddress;
+        using var client = await SignedInAsync(configuration);
+
+        configuration.BaseAddress = $"127.0.0.1:{moved.Port}";
+        await client.GetClusterMetadataAsync(token);
+        await client.GetStatsAsync(token);
+
+        Assert.Equal(configured, client.GetCurrentAddress());
+        Assert.Equal(1, node.Connections);
+        Assert.Equal(0, moved.Connections);
+    }
+
+    private static Task<TcpMessageStream> SignedInAsync(ushort port, bool reconnect = true)
+    {
+        return SignedInAsync(Configuration(port, reconnect));
+    }
+
+    private static async Task<TcpMessageStream> SignedInAsync(IggyClientConfigurator configuration,
+        ILoggerFactory? loggers = null)
+    {
+        var client = new TcpMessageStream(configuration, loggers ?? NullLoggerFactory.Instance);
+        await client.ConnectAsync(TestContext.Current.CancellationToken);
+        await client.LoginUserAsync("iggy", "iggy", TestContext.Current.CancellationToken);
+        return client;
+    }
+
+    /// <summary>
+    ///     A signed-in client that a group poll made a member of every group in <paramref name="groups" />, by
+    ///     default <see cref="Groups" />.
+    /// </summary>
+    private static async Task<TcpMessageStream> InGroupsAsync(LinkCluster cluster, ILoggerFactory? loggers = null,
+        uint[]? groups = null, TimeSpan? heartbeat = null)
+    {
+        var client = await SignedInAsync(Configuration(cluster.Coordinator.Port, heartbeat: heartbeat), loggers);
+        foreach (var group in groups ?? Groups)
+        {
+            await client.PollMessagesAsync(Stream, Topic, null, Consumer.Group(group), PollingStrategy.Next(), 1,
+                false, TestContext.Current.CancellationToken);
+        }
+        return client;
+    }
+
+    private static IggyClientConfigurator Configuration(ushort port, bool reconnect = true,
+        TimeSpan? heartbeat = null) => new()
         {
             BaseAddress = $"127.0.0.1:{port}",
             Protocol = Protocol.Tcp,
-            HeartbeatInterval = Heartbeat,
+            HeartbeatInterval = heartbeat ?? Heartbeat,
             ReconnectionSettings = new ReconnectionSettings
             {
                 Enabled = reconnect,
@@ -228,11 +368,7 @@ public sealed class ReplicaLinkTests
                 MaxDelay = TimeSpan.FromMilliseconds(1),
                 WaitAfterReconnect = TimeSpan.Zero
             }
-        }, NullLoggerFactory.Instance);
-        await client.ConnectAsync(TestContext.Current.CancellationToken);
-        await client.LoginUserAsync("iggy", "iggy", TestContext.Current.CancellationToken);
-        return client;
-    }
+        };
 
     private static ConcurrentQueue<ConnectionState> RecordStates(TcpMessageStream client)
     {
@@ -267,20 +403,35 @@ public sealed class ReplicaLinkTests
 
     /// <summary>
     ///     A metadata primary that stays up and a partition primary whose handler throws while it is down, so the
-    ///     node closes every connection on its first request.
+    ///     node closes every connection on its first request. While syncs are held, the metadata primary answers
+    ///     no group sync, and nothing after one on the same connection, until the cluster is disposed.
     /// </summary>
     private sealed class LinkCluster : IDisposable
     {
         internal readonly MockNode Coordinator = new();
         internal readonly MockNode Primary = new();
+        private readonly TaskCompletionSource _syncRelease = new(TaskCreationOptions.RunContinuationsAsynchronously);
         internal volatile bool PrimaryDown;
+        internal volatile bool SyncsHeld;
         internal int PrimaryWrites;
+        internal Action? OnPrimaryBind;
 
         internal LinkCluster()
         {
-            Coordinator.Serve(Handle);
+            Coordinator.Serve(request =>
+            {
+                if (SyncsHeld && request.Code == CommandCodes.SYNC_CONSUMER_GROUP_CODE)
+                {
+                    _syncRelease.Task.GetAwaiter().GetResult();
+                }
+                return Handle(request);
+            });
             Primary.Serve(request =>
             {
+                if (request.Code == BIND_SESSION_CODE)
+                {
+                    OnPrimaryBind?.Invoke();
+                }
                 if (PrimaryDown)
                 {
                     throw new IOException("outage");
@@ -302,6 +453,7 @@ public sealed class ReplicaLinkTests
 
         public void Dispose()
         {
+            _syncRelease.TrySetResult();
             Coordinator.Dispose();
             Primary.Dispose();
         }
@@ -316,6 +468,11 @@ public sealed class ReplicaLinkTests
                 WriteNode(body, Coordinator.Port, true, 0);
                 WriteNode(body, Primary.Port, false, 1);
                 return Reply(OPERATION_NON_REPLICATED, body.ToArray());
+            }
+            if (request.Code == CommandCodes.SYNC_CONSUMER_GROUP_CODE)
+            {
+                // A member that owns no partition yet, so a group poll joins without polling a partition.
+                return Reply(OPERATION_NON_REPLICATED, AssignmentBody(1, []));
             }
             return request.Code == CommandCodes.GET_PARTITION_ROUTE_CODE
                 ? RouteReply(request, new PartitionContext(17, 0, 1), 1)

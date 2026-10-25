@@ -203,6 +203,10 @@ where
     /// A resident op follows a higher one, so the next op to flush can sit
     /// behind the front. Flushes wait for `sort_by_op`.
     out_of_order: Cell<bool>,
+    /// `(floor, through)`: every op in `floor + 1..=through` is resident. Repair
+    /// ticks resume the walk from here instead of rescanning the held prefix, and
+    /// any removal resets it.
+    held_run: Cell<(u64, u64)>,
 }
 
 /// How many evicted entries each partition retains for repair. Sized to
@@ -237,6 +241,7 @@ where
             resident_control_ops: Cell::new(0),
             evicted_through: Cell::new(0),
             out_of_order: Cell::new(false),
+            held_run: Cell::new((0, 0)),
         }
     }
 }
@@ -401,6 +406,40 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         }
         let ring = unsafe { &*self.evicted_ring.get() };
         ring.get(&op).cloned()
+    }
+
+    /// The lowest resident `SendMessages` op in `ops` with its entry bytes, in
+    /// one pass over the headers. Resident only: the evicted ring holds what
+    /// already committed, which is not what a repair window is judged by.
+    #[must_use]
+    pub fn lowest_resident_send_in(
+        &self,
+        ops: RangeInclusive<u64>,
+    ) -> Option<(u64, JournalBuffer)> {
+        let op = {
+            let headers = unsafe { &*self.headers.get() };
+            headers
+                .iter()
+                .filter(|header| {
+                    header.operation == Operation::SendMessages && ops.contains(&header.op)
+                })
+                .map(|header| header.op)
+                .min()?
+        };
+        let entry = {
+            let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
+            let inner = unsafe { &*self.inner.get() };
+            op_to_storage_offset
+                .get(&op)
+                .and_then(|&storage_offset| inner.storage.read_at_sync(storage_offset))
+        };
+        if entry.is_none() {
+            warn!(
+                op,
+                "resident SendMessages header has no stored entry; the repair window has no anchor"
+            );
+        }
+        entry.map(|entry| (op, entry))
     }
 
     /// The header at `op`, over exactly the range [`Self::repair_entry`] serves.
@@ -819,6 +858,7 @@ where
             resident_control_ops: Cell::new(0),
             evicted_through: Cell::new(0),
             out_of_order: Cell::new(false),
+            held_run: Cell::new((0, 0)),
         }
     }
 
@@ -828,6 +868,7 @@ where
         self.first_header_by_op.borrow_mut().clear();
         unsafe { &mut *self.op_to_storage_offset.get() }.clear();
         unsafe { &mut *self.offset_to_op.get() }.clear();
+        self.held_run.set((0, 0));
         unsafe { &mut *self.timestamp_to_op.get() }.clear();
         self.resident_control_ops.set(0);
         self.out_of_order.set(false);
@@ -882,6 +923,41 @@ where
         op_to_storage_offset.contains_key(&op)
     }
 
+    /// Highest op `h >= floor` such that every op in `floor + 1..=h` is resident.
+    pub fn held_through(&self, floor: u64) -> u64 {
+        self.held_through_until(floor, u64::MAX)
+    }
+
+    /// [`Self::held_through`] capped at `top`, walking only the resident ops at
+    /// or below it.
+    pub fn held_through_until(&self, floor: u64, top: u64) -> u64 {
+        if floor >= top {
+            return floor;
+        }
+        let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
+        let (run_floor, run_through) = self.held_run.get();
+        let mut through = if run_floor <= floor && run_through > floor {
+            run_through.min(top)
+        } else {
+            floor
+        };
+        if through < top {
+            for op in op_to_storage_offset
+                .range(through + 1..=top)
+                .map(|(op, _)| *op)
+            {
+                if op != through + 1 {
+                    break;
+                }
+                through = op;
+            }
+        }
+        if through > floor && (run_floor > floor || run_through < through) {
+            self.held_run.set((floor, through));
+        }
+        through
+    }
+
     /// Whether any op in `ops` is resident, in one pass over the headers: the
     /// range can be far wider than what is resident.
     pub fn holds_op_in(&self, ops: RangeInclusive<u64>) -> bool {
@@ -931,20 +1007,6 @@ where
             // In-window ops only, deduplicated, so a count match IS coverage.
             complete: covered == expected_len,
         }
-    }
-
-    /// Base offset of the lowest resident message batch in `(floor, to_op]`.
-    ///
-    /// Read off the offset index, which `append` fills from the header of
-    /// each batch that carries messages, so this is the stamp that the
-    /// commit walk applies for that op.
-    pub fn first_batch_offset(&self, floor: u64, to_op: u64) -> Option<u64> {
-        let offset_to_op = unsafe { &*self.offset_to_op.get() };
-        offset_to_op
-            .iter()
-            .filter(|&(_, &op)| op > floor && op <= to_op)
-            .min_by_key(|&(_, &op)| op)
-            .map(|(&offset, _)| offset)
     }
 
     /// Highest `commit` any resident header stamped, in ONE pass.
@@ -1587,6 +1649,23 @@ mod tests {
         }
 
         assert_eq!(journal.last_op(), Some(3));
+    }
+
+    #[compio::test]
+    async fn given_a_run_past_the_top_when_capping_held_through_should_stop_at_the_top() {
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        for op in [1, 2, 3, 4, 6] {
+            journal
+                .append(build_prepare(op, HEADER_SIZE + 16).into_frozen())
+                .await
+                .expect("append");
+        }
+
+        assert_eq!(journal.held_through(0), 4);
+        assert_eq!(journal.held_through_until(0, 2), 2);
+        assert_eq!(journal.held_through_until(0, 6), 4);
+        assert_eq!(journal.held_through_until(3, 3), 3);
+        assert_eq!(journal.held_through_until(5, 3), 5);
     }
 
     #[compio::test]

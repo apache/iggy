@@ -19,7 +19,7 @@ from datetime import timedelta
 
 import pytest
 
-from apache_iggy import IggyClient, PendingOperationError
+from apache_iggy import IggyClient, IggyError, PendingOperationError
 
 
 @pytest.mark.asyncio
@@ -49,6 +49,30 @@ async def test_raw_unknown_code_is_rejected_by_server(iggy_client: IggyClient):
         await iggy_client.send_binary_request(60_000, b"")
 
 
+@pytest.mark.asyncio
+async def test_raw_get_stats_to_the_server_replica_returns_non_empty_response(
+    iggy_client: IggyClient,
+):
+    response = await iggy_client.send_binary_request_to_replica(10, b"", 0)
+
+    assert response
+
+
+@pytest.mark.asyncio
+async def test_raw_command_to_an_unknown_replica_is_rejected(iggy_client: IggyClient):
+    with pytest.raises(RuntimeError, match="(?i)invalid identifier"):
+        await iggy_client.send_binary_request_to_replica(10, b"", 9)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", [100, 202])
+async def test_raw_replicated_command_or_poll_to_a_replica_is_rejected(
+    iggy_client: IggyClient, code: int
+):
+    with pytest.raises(RuntimeError, match="(?i)invalid command"):
+        await iggy_client.send_binary_request_to_replica(code, b"", 0)
+
+
 @pytest.mark.unit
 @pytest.mark.asyncio
 @pytest.mark.parametrize("operation_id", [2**53 + 17, 2**64 - 1])
@@ -62,10 +86,35 @@ async def test_missing_retained_operation_preserves_exact_identity(
     assert raised.value.operation_id == operation_id
     assert raised.value.kind == "not_retained"
     assert raised.value.code == 14008
+    assert isinstance(raised.value, IggyError)
     assert isinstance(raised.value, RuntimeError)
     with pytest.raises(AttributeError):
         # pyrefly: ignore  # read-only
         raised.value.operation_id = 0
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_request_on_unconnected_client_raises_its_code():
+    client = IggyClient("127.0.0.1:1")
+    with pytest.raises(IggyError) as raised:
+        await client.send_binary_request(1, b"")
+    assert raised.value.code == 61
+    assert str(raised.value) == "Not connected"
+    assert isinstance(raised.value, RuntimeError)
+    with pytest.raises(AttributeError):
+        # pyrefly: ignore  # read-only
+        raised.value.code = 0
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_request_after_shutdown_raises_its_code():
+    client = IggyClient("127.0.0.1:1")
+    await client.shutdown()
+    with pytest.raises(IggyError) as raised:
+        await client.ping()
+    assert raised.value.code == 63
 
 
 @pytest.mark.unit
