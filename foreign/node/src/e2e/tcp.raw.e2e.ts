@@ -42,6 +42,29 @@ describe('e2e -> raw', async () => {
     assert.ok(response.length > 0);
   });
 
+  it('e2e -> raw::getStatsFromTheServerReplica', async () => {
+    const response = await c.sendBinaryRequestToReplica(
+      COMMAND_CODE.GetStats,
+      Buffer.alloc(0),
+      0
+    );
+    assert.ok(response.length > 0);
+  });
+
+  it('e2e -> raw::unknownReplicaRejected', async () => {
+    await assert.rejects(
+      () => c.sendBinaryRequestToReplica(COMMAND_CODE.GetStats, Buffer.alloc(0), 9),
+      /code: 6, message: Invalid identifier/
+    );
+  });
+
+  it('e2e -> raw::replicatedCommandToAReplicaRejectedClientSide', async () => {
+    await assert.rejects(
+      () => c.sendBinaryRequestToReplica(COMMAND_CODE.CreateStream, Buffer.alloc(0), 0),
+      /code: 3/
+    );
+  });
+
   it('e2e -> raw::sessionControlCodeRejectedClientSide', async () => {
     await assert.rejects(
       () => c.sendBinaryRequest(COMMAND_CODE.LoginUser, Buffer.alloc(0))

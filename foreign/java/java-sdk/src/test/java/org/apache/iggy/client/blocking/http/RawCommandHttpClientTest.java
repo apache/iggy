@@ -33,4 +33,12 @@ class RawCommandHttpClientTest {
         assertThatThrownBy(() -> client.sendBinaryRequest(1, new byte[0]))
                 .isInstanceOf(IggyOperationNotSupportedException.class);
     }
+
+    @Test
+    void shouldRejectRawCommandsToAReplica() {
+        var client = new IggyHttpClient("http://127.0.0.1:3000");
+
+        assertThatThrownBy(() -> client.sendBinaryRequestToReplica(10, new byte[0], 0))
+                .isInstanceOf(IggyOperationNotSupportedException.class);
+    }
 }

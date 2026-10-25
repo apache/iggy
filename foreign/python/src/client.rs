@@ -1937,6 +1937,44 @@ impl IggyClient {
             Ok(Python::attach(|py| PyBytes::new(py, &response).unbind()))
         })
     }
+
+    /// Send a command code with a payload to the replica with the given id and
+    /// return the raw response bytes.
+    ///
+    /// The replica id is the one cluster metadata names for the node. Every
+    /// node answers non-replicated commands such as GetStats from its own
+    /// state. Replicated commands, polls, consumer-offset reads and
+    /// session-control codes are rejected client-side, and a replica id that
+    /// cluster metadata does not name fails. HTTP transport does not support
+    /// raw binary commands.
+    ///
+    /// Args:
+    ///     code: Command code as `int`.
+    ///     payload: Request payload as `bytes`.
+    ///     replica_id: Replica id as `int`, as cluster metadata names it.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to the raw response `bytes`.
+    ///
+    /// Raises:
+    ///     RuntimeError: If the command cannot be sent or the replica returns an error.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[bytes]", imports=("collections.abc")))]
+    fn send_binary_request_to_replica<'a>(
+        &self,
+        py: Python<'a>,
+        code: u32,
+        #[gen_stub(override_type(type_repr = "builtins.bytes"))] payload: Vec<u8>,
+        replica_id: u8,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let response = inner
+                .send_binary_request_to_replica(code, Bytes::from(payload), replica_id)
+                .await
+                .map_err(to_runtime_error)?;
+            Ok(Python::attach(|py| PyBytes::new(py, &response).unbind()))
+        })
+    }
 }
 
 define_stub_info_gatherer!(stub_info);

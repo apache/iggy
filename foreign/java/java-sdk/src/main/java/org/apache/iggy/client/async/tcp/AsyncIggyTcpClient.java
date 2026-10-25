@@ -36,6 +36,7 @@ import org.apache.iggy.client.async.TopicsClient;
 import org.apache.iggy.client.async.UsersClient;
 import org.apache.iggy.client.async.tcp.AsyncTcpConnection.TcpConnectionPoolConfig;
 import org.apache.iggy.client.async.tcp.vsr.VsrFrameDecoder;
+import org.apache.iggy.client.async.tcp.vsr.VsrOperation;
 import org.apache.iggy.cluster.ClusterMetadata;
 import org.apache.iggy.config.RetryPolicy;
 import org.apache.iggy.exception.IggyConnectionException;
@@ -448,18 +449,45 @@ public class AsyncIggyTcpClient {
             throw new IggyNotConnectedException();
         }
 
-        return pollRouter.onClientLoop(AsyncTcpConnection.mapResponse(raw.send(code, payload), response -> {
-            try {
-                if (response.readableBytes() <= 1) {
-                    return new byte[0];
-                }
-                byte[] responsePayload = new byte[response.readableBytes()];
-                response.readBytes(responsePayload);
-                return responsePayload;
-            } finally {
-                response.release();
-            }
-        }));
+        return pollRouter.onClientLoop(
+                AsyncTcpConnection.mapResponse(raw.send(code, payload), AsyncIggyTcpClient::responsePayload));
+    }
+
+    /**
+     * Sends a command code and payload to the replica with the given id and returns its raw response payload. The
+     * replica id is the one that cluster metadata names for the node. Every node answers non-replicated commands such
+     * as GetStats from its own state, so this reads the state of the chosen node.
+     *
+     * <p>The request carries the metadata watermark of the session, so the replica answers after it applied the
+     * metadata that this client saw. Replicated commands, PollMessages, GetConsumerOffset and session-control codes
+     * complete the returned future with an invalid-command error before anything is sent. An id that cluster metadata does not
+     * name after one read of it completes the future with an invalid-identifier error. A replica that cannot be
+     * reached, or that answers with code 58, is asked again until the request timeout, which ends the call with code
+     * 58. Any other refusal, NotPrimary (89) included, completes the future unchanged and is never sent to another
+     * replica.
+     *
+     * <p>The future completes on the client event loop, as the callbacks section of this class says.
+     *
+     * @param code the command code
+     * @param payload the command payload
+     * @param replicaId the replica id that cluster metadata names
+     * @return a future containing the raw response payload
+     * @throws IggyNotConnectedException if {@link #connect()} has not been called
+     */
+    public CompletableFuture<byte[]> sendBinaryRequestToReplica(int code, byte[] payload, int replicaId) {
+        Objects.requireNonNull(payload, "payload cannot be null");
+        if (isSessionControlCode(code)
+                || code == CommandCode.Messages.POLL.getValue()
+                || code == CommandCode.ConsumerOffset.GET.getValue()
+                || VsrOperation.operationForCode(code) != VsrOperation.NON_REPLICATED) {
+            return CompletableFuture.failedFuture(
+                    IggyServerException.fromTcpResponse(INVALID_COMMAND_ERROR_CODE, new byte[0]));
+        }
+        if (connection.get() == null || rawRequests == null) {
+            throw new IggyNotConnectedException();
+        }
+        return pollRouter.onClientLoop(AsyncTcpConnection.mapResponse(
+                pollRouter.replicaRequest(replicaId, code, payload), AsyncIggyTcpClient::responsePayload));
     }
 
     /**
@@ -1686,6 +1714,19 @@ public class AsyncIggyTcpClient {
             }
         });
         return CompletableFuture.completedFuture(null);
+    }
+
+    private static byte[] responsePayload(ByteBuf response) {
+        try {
+            if (response.readableBytes() <= 1) {
+                return new byte[0];
+            }
+            byte[] payload = new byte[response.readableBytes()];
+            response.readBytes(payload);
+            return payload;
+        } finally {
+            response.release();
+        }
     }
 
     private static boolean isSessionControlCode(int code) {

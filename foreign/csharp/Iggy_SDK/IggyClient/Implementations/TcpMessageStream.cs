@@ -621,6 +621,24 @@ public sealed partial class TcpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
+    public async Task<byte[]> SendBinaryRequestToReplicaAsync(uint code, byte[] payload, byte replicaId,
+        CancellationToken token = default)
+    {
+        if (SessionControlCodes.Contains(code) || code == CommandCodes.POLL_MESSAGES_CODE
+            || code == CommandCodes.GET_CONSUMER_OFFSET_CODE
+            || VsrOperations.ForCode((int)code) != VsrOperation.NonReplicated)
+        {
+            throw VsrError.Exception(VsrError.INVALID_COMMAND,
+                $"Command {code} cannot be sent to a chosen replica.");
+        }
+
+        using IMemoryOwner<byte> result = await RunClientOperationAsync((int)code, payload, null, null, token,
+            replica: replicaId);
+
+        return result.Memory.Length == 0 ? [] : result.Memory.Span.ToArray();
+    }
+
+    /// <inheritdoc />
     public Task ConnectAsync(CancellationToken token = default)
     {
         if (_configuration.ReconnectionSettings.Enabled && !_configuration.AutoLoginSettings.Enabled)

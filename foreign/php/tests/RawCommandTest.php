@@ -31,6 +31,9 @@ final class RawCommandTest extends TestCase
     private const PING_CODE = 1;
     private const GET_STATS_CODE = 10;
     private const UNKNOWN_CODE = 60_000;
+    private const CREATE_STREAM_CODE = 202;
+    private const SERVER_REPLICA_ID = 0;
+    private const UNKNOWN_REPLICA_ID = 9;
 
     #[TestDox('A raw ping command returns an empty successful response')]
     public function testRawPingReturnsEmptyResponse(): void
@@ -71,6 +74,42 @@ final class RawCommandTest extends TestCase
         $throwable = assert_throws(static fn () => $client->sendBinaryRequest(self::UNKNOWN_CODE, ''));
 
         assert_instance_of(IggyException::class, $throwable);
+    }
+
+    #[TestDox('A raw get-stats command sent to the server replica returns a non-empty response')]
+    public function testRawGetStatsToTheServerReplicaReturnsNonEmptyResponse(): void
+    {
+        $client = new_client();
+
+        $response = $client->sendBinaryRequestToReplica(self::GET_STATS_CODE, '', self::SERVER_REPLICA_ID);
+
+        assert_true($response !== '', 'expected a non-empty stats response');
+    }
+
+    #[TestDox('A replica that cluster metadata does not name is rejected')]
+    public function testRawCommandToAnUnknownReplicaIsRejected(): void
+    {
+        $client = new_client();
+
+        $throwable = assert_throws(
+            static fn () => $client->sendBinaryRequestToReplica(self::GET_STATS_CODE, '', self::UNKNOWN_REPLICA_ID)
+        );
+
+        assert_instance_of(IggyException::class, $throwable);
+        assert_same(6, $throwable->getCode());
+    }
+
+    #[TestDox('A replicated command sent to a replica is rejected before reaching the server')]
+    public function testRawReplicatedCommandToAReplicaIsRejected(): void
+    {
+        $client = new_client();
+
+        $throwable = assert_throws(
+            static fn () => $client->sendBinaryRequestToReplica(self::CREATE_STREAM_CODE, '', self::SERVER_REPLICA_ID)
+        );
+
+        assert_instance_of(IggyException::class, $throwable);
+        assert_same(3, $throwable->getCode());
     }
 
     public static function sessionControlCodes(): array
