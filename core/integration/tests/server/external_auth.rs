@@ -22,6 +22,7 @@
 //! verifies the ext-auth login flow.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use iggy::prelude::*;
 use integration::harness::ext_auth_server::{
@@ -245,6 +246,68 @@ async fn given_ext_auth_when_server_timeout_should_deny_login() {
         .login_user(EXT_AUTH_USERNAME, EXT_AUTH_PASSWORD)
         .await;
     assert!(result.is_err(), "ext-auth timeout should deny login");
+}
+
+/// When the per-shard callout cap is saturated, the next ext-auth login
+/// gets a retryable error instead of a terminal InvalidCredentials.
+#[tokio::test]
+#[serial_test::parallel]
+async fn given_ext_auth_when_callout_cap_saturated_should_return_retryable_error() {
+    // Slow server holds callouts open; cap of 2 is easy to saturate.
+    let ext_server = ExtAuthServer::start_slow(Duration::from_secs(30)).await;
+    let mut envs = ext_auth_envs(&ext_server.url());
+    envs.insert("IGGY_EXTERNAL_AUTH_TIMEOUT".to_owned(), "60 s".to_owned());
+    envs.insert(
+        "IGGY_EXTERNAL_AUTH_MAX_CONCURRENT_CALLOUTS".to_owned(),
+        "2".to_owned(),
+    );
+
+    let mut harness = TestHarness::builder()
+        .server(TestServerConfig::builder().extra_envs(envs).build())
+        .cluster_nodes(1)
+        .build()
+        .expect("build harness");
+    harness.start().await.expect("start server");
+
+    // Fire two logins that will block on the slow ext-auth server.
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let client = harness
+            .client_builder_for(TransportProtocol::Tcp)
+            .expect("tcp builder")
+            .connect()
+            .await
+            .expect("connect");
+        handles.push(tokio::spawn(async move {
+            client
+                .login_user(EXT_AUTH_USERNAME, EXT_AUTH_PASSWORD)
+                .await
+        }));
+    }
+
+    // Give the server time to accept the two callouts.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // The third login hits the overloaded guard.
+    let overflow_client = harness
+        .client_builder_for(TransportProtocol::Tcp)
+        .expect("tcp builder")
+        .connect()
+        .await
+        .expect("connect for overflow");
+    let result = overflow_client
+        .login_user(EXT_AUTH_USERNAME, EXT_AUTH_PASSWORD)
+        .await;
+
+    // The error must be retryable, not a terminal auth rejection.
+    let err = result.expect_err("overloaded login must fail");
+    assert!(
+        matches!(
+            err,
+            IggyError::TransientNotAccepted | IggyError::TransientNotCommitted
+        ),
+        "overloaded callout must return a retryable error, got: {err}"
+    );
 }
 
 /// A local user with correct password logs in through the built-in path,

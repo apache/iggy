@@ -40,6 +40,8 @@ pub struct ExternalAuthConfig {
     #[serde(default = "default_external_auth_timeout")]
     #[config_env(leaf)]
     pub timeout: IggyDuration,
+    #[serde(default = "default_max_concurrent_callouts")]
+    pub max_concurrent_callouts: u32,
 }
 
 impl Default for ExternalAuthConfig {
@@ -48,10 +50,15 @@ impl Default for ExternalAuthConfig {
             enabled: false,
             url: String::new(),
             timeout: default_external_auth_timeout(),
+            max_concurrent_callouts: default_max_concurrent_callouts(),
         }
     }
 }
 
 fn default_external_auth_timeout() -> IggyDuration {
     "5 s".parse().expect("hardcoded timeout expected to parse")
+}
+
+const fn default_max_concurrent_callouts() -> u32 {
+    64
 }

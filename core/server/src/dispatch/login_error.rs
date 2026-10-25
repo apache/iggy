@@ -34,8 +34,6 @@ pub enum LoginRegisterError {
     InvalidCredentials,
     InvalidToken,
     UserInactive,
-    /// The external auth service denied the login.
-    ExternalAuthDenied(String),
     Binding(IggyError),
     /// Recoverable consensus failure. The connection stays `Connected`; the
     /// SDK read-timeout replays.
@@ -70,9 +68,6 @@ impl std::fmt::Display for LoginRegisterError {
             Self::InvalidCredentials => write!(f, "invalid username or password"),
             Self::InvalidToken => write!(f, "invalid or expired personal access token"),
             Self::UserInactive => write!(f, "user account is inactive"),
-            Self::ExternalAuthDenied(reason) => {
-                write!(f, "external auth denied: {reason}")
-            }
             Self::Binding(error) => write!(f, "session binding: {error}"),
             Self::Transient(e) => write!(f, "transient consensus failure: {e}"),
         }

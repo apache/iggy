@@ -236,9 +236,7 @@ pub(in crate::http) fn eviction_error(reply: &Message<GenericHeader>) -> IggyErr
 /// `#[non_exhaustive]` enum.
 pub(in crate::http) const fn login_error_to_iggy(error: &LoginRegisterError) -> IggyError {
     match error {
-        LoginRegisterError::InvalidCredentials | LoginRegisterError::ExternalAuthDenied(_) => {
-            IggyError::InvalidCredentials
-        }
+        LoginRegisterError::InvalidCredentials => IggyError::InvalidCredentials,
         LoginRegisterError::InvalidToken => IggyError::InvalidPersonalAccessToken,
         LoginRegisterError::UserInactive => IggyError::UserInactive,
         LoginRegisterError::Transient(MetadataSubmitError::NotCaughtUp) => {

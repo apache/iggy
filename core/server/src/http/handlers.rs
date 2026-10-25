@@ -24,7 +24,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
@@ -109,8 +109,8 @@ use iggy_common::{
 };
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
-use secrecy::ExposeSecret;
 use secrecy::zeroize::Zeroizing;
+use secrecy::{ExposeSecret, SecretString};
 use send_wrapper::SendWrapper;
 use serde::Deserialize;
 use shard::{PartitionRead, PartitionReadReply};
@@ -119,7 +119,9 @@ use crate::dispatch::partition::{
     ConsumerOffsetTarget, fence_poll_context, resolve_consumer_offset_request,
     resolve_poll_request, resolve_primary_consumer_offset_request,
 };
-use crate::dispatch::session_ops::{verify_login_credentials, verify_pat_credentials};
+use crate::dispatch::session_ops::{
+    UserProbe, probe_user, verify_login_credentials, verify_pat_credentials,
+};
 use crate::http::error::{
     Consistency, ConsistencyQuery, CustomError, PartitionWriteError, ProduceAck, ProduceQuery,
     ReadError, WriteError,
@@ -183,6 +185,7 @@ pub(in crate::http) async fn ping(State(_state): State<HttpState>) -> &'static s
 
 pub(in crate::http) async fn login_user(
     State(state): State<HttpState>,
+    ConnectInfo(client_addr): ConnectInfo<crate::http::ClientAddr>,
     Json(command): Json<LoginUser>,
 ) -> Result<Json<IdentityInfo>, CustomError> {
     // Credential verification is a consensus-free STM read; hold it while a
@@ -195,22 +198,30 @@ pub(in crate::http) async fn login_user(
         .await
         .map_err(|_| IggyError::TransientNotAccepted)?;
 
-    let user_exists_locally = state
+    // Single read: check not-caught-up and resolve the user in one lock
+    // acquisition, matching the TCP path's pattern.
+    let probe = state
         .shard
         .plane
         .metadata()
         .mux_stm
         .users()
-        .read(|users| users.user_by_name(&command.username).is_some());
+        .read(|users| probe_user(users, &command.username));
 
-    if user_exists_locally {
-        let (user_id, created_at) = verify_login_credentials(
-            &state.shard,
-            &command.username,
-            command.password.expose_secret(),
-        )
-        .map_err(|error| login_error_to_iggy(&error))?;
-        return issue_identity(&state, user_id, created_at);
+    match probe {
+        UserProbe::NotCaughtUp => {
+            return Err(IggyError::TransientNotAccepted.into());
+        }
+        UserProbe::Found => {
+            let (user_id, created_at) = verify_login_credentials(
+                &state.shard,
+                &command.username,
+                command.password.expose_secret(),
+            )
+            .map_err(|error| login_error_to_iggy(&error))?;
+            return issue_identity(&state, user_id, created_at);
+        }
+        UserProbe::NotFound => {}
     }
 
     if state.server_config.external_auth.enabled {
@@ -218,17 +229,22 @@ pub(in crate::http) async fn login_user(
             &state,
             &command.username,
             command.password.expose_secret(),
+            &client_addr,
         ))
         .await;
     }
 
-    // No local user, no ext-auth. Run the dummy Argon2 hash so the
-    // response timing is indistinguishable from a wrong password for a
-    // real local user.
-    let _ = server_common::crypto::verify_password(
-        command.password.expose_secret(),
-        crate::dispatch::session_ops::dummy_password_hash(),
-    );
+    // No local user, no ext-auth: reject with timing equalization.
+    // Apply the same length guard that verify_login_credentials uses on
+    // the Found path so that a short password rejects fast on both paths,
+    // closing the timing oracle.
+    if (iggy_common::defaults::MIN_USERNAME_LENGTH..=iggy_common::defaults::MAX_USERNAME_LENGTH)
+        .contains(&command.username.len())
+        && (iggy_common::defaults::MIN_PASSWORD_LENGTH..=iggy_common::defaults::MAX_PASSWORD_LENGTH)
+            .contains(&command.password.expose_secret().len())
+    {
+        crate::dispatch::session_ops::dummy_password_verify(command.password.expose_secret());
+    }
     Err(IggyError::InvalidCredentials.into())
 }
 
@@ -2149,6 +2165,7 @@ async fn try_external_auth_http_login(
     state: &HttpInner,
     username: &str,
     password: &str,
+    client_addr: &crate::http::ClientAddr,
 ) -> Result<Json<IdentityInfo>, CustomError> {
     use crate::external_auth::{
         CredentialType, ExternalAuthDecision, ExternalAuthRequest, callout_external_auth,
@@ -2157,19 +2174,21 @@ async fn try_external_auth_http_login(
     let ext_config = &state.server_config.external_auth;
     let ext_request = ExternalAuthRequest {
         credential_type: CredentialType::Password,
-        credential: Some(password.to_owned()),
+        credential: Some(SecretString::from(password.to_owned())),
         username: username.to_owned(),
         transport: "http".to_owned(),
-        // The HTTP handler does not have direct access to the peer
-        // address; axum's ConnectInfo is not wired here.
-        client_address: "unknown".to_owned(),
+        client_address: client_addr.addr.to_string(),
     };
 
     let decision = callout_external_auth(ext_config, ext_request)
         .await
         .map_err(|error| {
             tracing::warn!(error = %error, "external auth callout failed");
-            IggyError::InvalidCredentials
+            if error.is_overloaded() {
+                IggyError::TransientNotAccepted
+            } else {
+                IggyError::InvalidCredentials
+            }
         })?;
 
     match decision {

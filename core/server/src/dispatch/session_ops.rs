@@ -64,7 +64,7 @@ use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use metadata::MetadataSubmitError;
 use metadata::impls::metadata::{BoundSession, StreamsFrontend};
-use secrecy::ExposeSecret;
+use secrecy::{ExposeSecret, SecretString};
 use server_common::Message;
 use server_common::crypto;
 use std::cell::RefCell;
@@ -90,11 +90,33 @@ pub fn warm_dummy_password_hash() {
     LazyLock::force(&DUMMY_PASSWORD_HASH);
 }
 
-/// The pre-warmed dummy hash, for callers that need to equalize timing
-/// outside of `verify_login_credentials` (e.g. the HTTP login handler's
-/// fast-reject path).
-pub fn dummy_password_hash() -> &'static str {
-    DUMMY_PASSWORD_HASH.as_str()
+/// Run the dummy Argon2 verify so the response timing of a "user not found"
+/// reject is indistinguishable from a "wrong password" reject. The result is
+/// discarded: even presenting the exact dummy plaintext cannot authenticate.
+pub fn dummy_password_verify(password: &str) {
+    let _ = crypto::verify_password(password, DUMMY_PASSWORD_HASH.as_str());
+}
+
+/// Result of a single STM read that checks whether the user store is
+/// populated and whether a given username exists locally.
+pub enum UserProbe {
+    NotCaughtUp,
+    Found,
+    NotFound,
+}
+
+/// Probe the user store for `username` in a single STM read. Returns
+/// `NotCaughtUp` when the store is still empty (replica has not caught up),
+/// `Found` when the user exists, or `NotFound` otherwise.
+pub fn probe_user(users: &metadata::stm::user::UsersInner, username: &str) -> UserProbe {
+    if users.items.is_empty() {
+        return UserProbe::NotCaughtUp;
+    }
+    if users.user_by_name(username).is_some() {
+        UserProbe::Found
+    } else {
+        UserProbe::NotFound
+    }
 }
 
 pub fn verify_login_credentials<B, MJ, S, SB>(
@@ -385,9 +407,7 @@ const fn transient_login_code(error: &LoginRegisterError) -> IggyError {
 /// `SessionError`; the SDK maps it to `Unauthenticated`.
 const fn eviction_reason_for(error: &LoginRegisterError) -> EvictionReason {
     match error {
-        LoginRegisterError::InvalidCredentials | LoginRegisterError::ExternalAuthDenied(_) => {
-            EvictionReason::InvalidCredentials
-        }
+        LoginRegisterError::InvalidCredentials => EvictionReason::InvalidCredentials,
         LoginRegisterError::InvalidToken => EvictionReason::InvalidToken,
         LoginRegisterError::UserInactive => EvictionReason::UserInactive,
         _ => EvictionReason::SessionError,
@@ -1181,19 +1201,25 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
     // local credential verification handles the login. If it does not and
     // ext-auth is enabled, the callout handles it. The two pools never
     // overlap, so there is no fallback from one to the other.
+    //
+    // A body that decodes as LoginRegisterRequest is always treated as a
+    // password login. A wrong password is final: the handler returns without
+    // trying PAT decode. WireName validation rejects most byte patterns, so
+    // a valid PAT body cannot cross-decode as a LoginRegisterRequest.
     if let Ok((wire_request, _)) =
         LoginRegisterRequest::decode_after_prefix(version_info.clone(), body_tail)
     {
-        // Guard: a replica that has not yet replayed its WAL has an empty
-        // user store. Return a retryable error so the SDK replays after the
-        // node catches up, matching the behaviour of verify_login_credentials.
-        let not_caught_up = shard
+        // Single read: check not-caught-up and resolve the user in one lock
+        // acquisition. On the single-threaded shard reactor no committed op
+        // can apply between synchronous reads, but one round-trip is cheaper.
+        let probe = shard
             .plane
             .metadata()
             .mux_stm
             .users()
-            .read(|users| users.items.is_empty());
-        if not_caught_up {
+            .read(|users| probe_user(users, wire_request.username.as_str()));
+
+        if matches!(probe, UserProbe::NotCaughtUp) {
             surface_login_failure(
                 shard,
                 origin,
@@ -1204,14 +1230,7 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
             return;
         }
 
-        let user_exists_locally = shard
-            .plane
-            .metadata()
-            .mux_stm
-            .users()
-            .read(|users| users.user_by_name(wire_request.username.as_str()).is_some());
-
-        if user_exists_locally {
+        if matches!(probe, UserProbe::Found) {
             match verify_login_credentials(
                 shard,
                 wire_request.username.as_str(),
@@ -1256,13 +1275,16 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
             return;
         }
 
-        // No local user, no ext-auth: reject. Run the dummy Argon2 hash
-        // so the response timing is indistinguishable from a wrong password
-        // for a real local user.
-        let _ = crypto::verify_password(
-            wire_request.password.expose_secret(),
-            DUMMY_PASSWORD_HASH.as_str(),
-        );
+        // No local user, no ext-auth: reject with timing equalization.
+        // Apply the same length guard that verify_login_credentials uses on
+        // the Found path so that a short password rejects fast on both paths,
+        // closing the timing oracle.
+        if (MIN_USERNAME_LENGTH..=MAX_USERNAME_LENGTH).contains(&wire_request.username.len())
+            && (MIN_PASSWORD_LENGTH..=MAX_PASSWORD_LENGTH)
+                .contains(&wire_request.password.expose_secret().len())
+        {
+            dummy_password_verify(wire_request.password.expose_secret());
+        }
         warn!(
             transport_client_id,
             "rejecting register request: invalid credentials"
@@ -1270,7 +1292,7 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
         send_eviction(
             shard,
             origin,
-            request.header().client,
+            vsr_client_id,
             EvictionReason::InvalidCredentials,
             "login_rejection",
         )
@@ -1330,8 +1352,6 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
     .await;
 }
 
-/// Attempt external auth callout and, on success, resolve the returned
-/// username to a pre-provisioned Iggy user and complete the login.
 /// Build the ext-auth callout request from the wire login and session state.
 fn build_ext_auth_request(
     sessions: &RefCell<SessionManager>,
@@ -1361,7 +1381,9 @@ fn build_ext_auth_request(
 
     ExternalAuthRequest {
         credential_type: CredentialType::Password,
-        credential: Some(wire_request.password.expose_secret().to_owned()),
+        credential: Some(SecretString::from(
+            wire_request.password.expose_secret().to_owned(),
+        )),
         username: wire_request.username.to_string(),
         transport: transport.to_owned(),
         client_address,
@@ -1394,14 +1416,24 @@ async fn try_external_auth_login<B, MJ, S, SB>(
         Ok(decision) => decision,
         Err(error) => {
             warn!(transport_client_id, error = %error, "external auth callout failed");
-            send_eviction(
-                shard,
-                origin,
-                vsr_client_id,
-                EvictionReason::InvalidCredentials,
-                "login_rejection",
-            )
-            .await;
+            if error.is_overloaded() {
+                surface_login_failure(
+                    shard,
+                    origin,
+                    header,
+                    &LoginRegisterError::Transient(MetadataSubmitError::NotCaughtUp),
+                )
+                .await;
+            } else {
+                send_eviction(
+                    shard,
+                    origin,
+                    vsr_client_id,
+                    EvictionReason::InvalidCredentials,
+                    "login_rejection",
+                )
+                .await;
+            }
             return;
         }
     };
@@ -1486,10 +1518,9 @@ where
         .mux_stm
         .users()
         .read(|users| crate::external_auth::resolve_username(users, username))
-        .map_err(|_| {
-            LoginRegisterError::ExternalAuthDenied(format!(
-                "ext-auth username '{username}' could not be resolved"
-            ))
+        .map_err(|reason| {
+            warn!("ext-auth username '{username}' could not be resolved: {reason}");
+            LoginRegisterError::InvalidCredentials
         })
 }
 

@@ -177,8 +177,8 @@ impl Display for ExternalAuthConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ enabled: {}, url: [redacted], timeout: {} }}",
-            self.enabled, self.timeout,
+            "{{ enabled: {}, url: [redacted], timeout: {}, max_concurrent_callouts: {} }}",
+            self.enabled, self.timeout, self.max_concurrent_callouts,
         )
     }
 }

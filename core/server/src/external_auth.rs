@@ -30,6 +30,7 @@ use std::cell::Cell;
 use std::fmt;
 
 use configs::external_auth::ExternalAuthConfig;
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
 const MAX_RESPONSE_BODY_BYTES: usize = 1_048_576;
@@ -38,8 +39,6 @@ const MAX_RESPONSE_BODY_BYTES: usize = 1_048_576;
 /// callout body. A multi-MB PAT passes the built-in hash check (mismatch)
 /// and would otherwise be forwarded verbatim to the external service.
 const MAX_CREDENTIAL_BYTES: usize = 8_192;
-
-const MAX_IN_FLIGHT_CALLOUTS: u32 = 64;
 
 thread_local! {
     static HTTP_CLIENT: cyper::Client =
@@ -51,16 +50,15 @@ thread_local! {
     static IN_FLIGHT_CALLOUTS: Cell<u32> = const { Cell::new(0) };
 }
 
+#[derive(Debug)]
 struct CalloutGuard;
 
 impl CalloutGuard {
-    fn acquire() -> Result<Self, ExternalAuthError> {
+    fn acquire(max: u32) -> Result<Self, ExternalAuthError> {
         IN_FLIGHT_CALLOUTS.with(|c| {
             let current = c.get();
-            if current >= MAX_IN_FLIGHT_CALLOUTS {
-                return Err(ExternalAuthError::HttpError(format!(
-                    "too many concurrent callouts ({current})"
-                )));
+            if current >= max {
+                return Err(ExternalAuthError::Overloaded(current));
             }
             c.set(current + 1);
             Ok(Self)
@@ -78,6 +76,21 @@ fn get_http_client() -> cyper::Client {
     HTTP_CLIENT.with(cyper::Client::clone)
 }
 
+/// Serialize the plaintext of a `SecretString`. Used only for the outbound
+/// ext-auth JSON body, never for logging.
+// serde's `serialize_with` passes the field by reference, which forces
+// the `&Option<T>` signature that `ref_option` flags.
+#[allow(clippy::ref_option)]
+fn serialize_credential<S: serde::Serializer>(
+    value: &Option<SecretString>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match value {
+        Some(secret) => serializer.serialize_str(secret.expose_secret()),
+        None => serializer.serialize_none(),
+    }
+}
+
 /// Credential metadata sent to the external auth service.
 ///
 /// Manual `Debug` redacts the `credential` field so passwords never
@@ -85,8 +98,11 @@ fn get_http_client() -> cyper::Client {
 #[derive(Serialize)]
 pub struct ExternalAuthRequest {
     pub credential_type: CredentialType,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub credential: Option<String>,
+    #[serde(
+        serialize_with = "serialize_credential",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub credential: Option<SecretString>,
     pub username: String,
     pub transport: String,
     pub client_address: String,
@@ -147,6 +163,15 @@ pub enum ExternalAuthError {
     /// too large). Distinguished from `BadResponse` so callers/logs can tell
     /// which side was at fault.
     BadRequest(String),
+    /// Too many concurrent callouts on this shard thread. The caller must
+    /// return a retryable error so the SDK retries after backoff.
+    Overloaded(u32),
+}
+
+impl ExternalAuthError {
+    pub const fn is_overloaded(&self) -> bool {
+        matches!(self, Self::Overloaded(_))
+    }
 }
 
 impl fmt::Display for ExternalAuthError {
@@ -156,6 +181,9 @@ impl fmt::Display for ExternalAuthError {
             Self::Timeout => write!(f, "external auth callout timed out"),
             Self::BadResponse(msg) => write!(f, "external auth bad response: {msg}"),
             Self::BadRequest(msg) => write!(f, "external auth bad request: {msg}"),
+            Self::Overloaded(n) => {
+                write!(f, "too many concurrent ext-auth callouts ({n})")
+            }
         }
     }
 }
@@ -269,16 +297,16 @@ pub async fn callout_external_auth(
             request.username.len()
         )));
     }
-    if let Some(ref cred) = request.credential
-        && cred.len() > MAX_CREDENTIAL_BYTES
-    {
-        return Err(ExternalAuthError::BadRequest(format!(
-            "credential too large ({} bytes, limit {MAX_CREDENTIAL_BYTES})",
-            cred.len()
-        )));
+    if let Some(ref cred) = request.credential {
+        let cred_len = cred.expose_secret().len();
+        if cred_len > MAX_CREDENTIAL_BYTES {
+            return Err(ExternalAuthError::BadRequest(format!(
+                "credential too large ({cred_len} bytes, limit {MAX_CREDENTIAL_BYTES})",
+            )));
+        }
     }
 
-    let _guard = CalloutGuard::acquire()?;
+    let _guard = CalloutGuard::acquire(config.max_concurrent_callouts)?;
     let client = get_http_client();
     let timeout = config.timeout.get_duration();
 
@@ -411,7 +439,7 @@ mod tests {
     fn request_password_round_trip() {
         let req = ExternalAuthRequest {
             credential_type: CredentialType::Password,
-            credential: Some("s3cret".to_owned()),
+            credential: Some(SecretString::from("s3cret".to_owned())),
             username: "alice".to_owned(),
             transport: "tcp".to_owned(),
             client_address: "10.0.0.1:5000".to_owned(),
@@ -593,6 +621,7 @@ mod tests {
             enabled: true,
             url: "https://auth.example.com/verify".to_owned(),
             timeout: "0 s".parse().expect("valid duration"),
+            ..ExternalAuthConfig::default()
         };
         let err = validate_config(&config).unwrap_err();
         assert!(
@@ -621,5 +650,43 @@ mod tests {
         };
         let err = validate_config(&config).unwrap_err();
         assert!(err.to_string().contains("has no host"));
+    }
+
+    // ── callout guard ──────────────────────────────────────────────
+
+    #[test]
+    fn given_guard_at_capacity_when_acquired_should_return_overloaded() {
+        const CAP: u32 = 4;
+        IN_FLIGHT_CALLOUTS.with(|c| c.set(0));
+
+        let mut guards = Vec::with_capacity(CAP as usize);
+        for _ in 0..CAP {
+            guards.push(CalloutGuard::acquire(CAP).expect("acquire must succeed below cap"));
+        }
+
+        let err = CalloutGuard::acquire(CAP).unwrap_err();
+        assert!(err.is_overloaded());
+        assert!(err.to_string().contains("too many concurrent"));
+
+        // Drop one guard and verify the next acquire succeeds.
+        guards.pop();
+        let _recovered = CalloutGuard::acquire(CAP).expect("acquire must succeed after drop");
+
+        drop(guards);
+    }
+
+    #[test]
+    fn given_overloaded_error_when_checked_should_report_overloaded() {
+        let err = ExternalAuthError::Overloaded(64);
+        assert!(err.is_overloaded());
+    }
+
+    #[test]
+    fn given_non_overloaded_error_when_checked_should_not_report_overloaded() {
+        let err = ExternalAuthError::Timeout;
+        assert!(!err.is_overloaded());
+
+        let err = ExternalAuthError::HttpError("connection refused".to_owned());
+        assert!(!err.is_overloaded());
     }
 }
