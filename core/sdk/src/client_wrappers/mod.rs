@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// Trait calls avoid selecting a transport's similarly named inherent method.
+/// Forwards a trait method to the concrete client using static dispatch.
 macro_rules! dispatch_client {
     ($wrapper:expr, $trait:ident::$method:ident($($arg:expr),* $(,)?)) => {
         match $wrapper {
