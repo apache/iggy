@@ -18,8 +18,9 @@
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 use async_dropper::AsyncDrop;
 use async_trait::async_trait;
-use iggy_common::ConsumerGroupClient;
-use iggy_common::{ConsumerGroup, ConsumerGroupDetails, Identifier, IggyError};
+use iggy_common::{
+    ConsumerGroup, ConsumerGroupClient, ConsumerGroupDetails, Identifier, IggyError, UserClient,
+};
 
 #[async_trait]
 impl ConsumerGroupClient for ClientWrapper {
@@ -29,9 +30,11 @@ impl ConsumerGroupClient for ClientWrapper {
         topic_id: &Identifier,
         group_id: &Identifier,
     ) -> Result<Option<ConsumerGroupDetails>, IggyError> {
-        self.as_client()
-            .get_consumer_group(stream_id, topic_id, group_id)
-            .await
+        dispatch_client!(
+            self,
+            ConsumerGroupClient::get_consumer_group(stream_id, topic_id, group_id)
+        )
+        .await
     }
 
     async fn get_consumer_groups(
@@ -39,9 +42,11 @@ impl ConsumerGroupClient for ClientWrapper {
         stream_id: &Identifier,
         topic_id: &Identifier,
     ) -> Result<Vec<ConsumerGroup>, IggyError> {
-        self.as_client()
-            .get_consumer_groups(stream_id, topic_id)
-            .await
+        dispatch_client!(
+            self,
+            ConsumerGroupClient::get_consumer_groups(stream_id, topic_id)
+        )
+        .await
     }
 
     async fn create_consumer_group(
@@ -50,9 +55,11 @@ impl ConsumerGroupClient for ClientWrapper {
         topic_id: &Identifier,
         name: &str,
     ) -> Result<ConsumerGroupDetails, IggyError> {
-        self.as_client()
-            .create_consumer_group(stream_id, topic_id, name)
-            .await
+        dispatch_client!(
+            self,
+            ConsumerGroupClient::create_consumer_group(stream_id, topic_id, name)
+        )
+        .await
     }
 
     async fn delete_consumer_group(
@@ -61,9 +68,11 @@ impl ConsumerGroupClient for ClientWrapper {
         topic_id: &Identifier,
         group_id: &Identifier,
     ) -> Result<(), IggyError> {
-        self.as_client()
-            .delete_consumer_group(stream_id, topic_id, group_id)
-            .await
+        dispatch_client!(
+            self,
+            ConsumerGroupClient::delete_consumer_group(stream_id, topic_id, group_id)
+        )
+        .await
     }
 
     async fn join_consumer_group(
@@ -72,9 +81,11 @@ impl ConsumerGroupClient for ClientWrapper {
         topic_id: &Identifier,
         group_id: &Identifier,
     ) -> Result<(), IggyError> {
-        self.as_client()
-            .join_consumer_group(stream_id, topic_id, group_id)
-            .await
+        dispatch_client!(
+            self,
+            ConsumerGroupClient::join_consumer_group(stream_id, topic_id, group_id)
+        )
+        .await
     }
 
     async fn leave_consumer_group(
@@ -83,15 +94,17 @@ impl ConsumerGroupClient for ClientWrapper {
         topic_id: &Identifier,
         group_id: &Identifier,
     ) -> Result<(), IggyError> {
-        self.as_client()
-            .leave_consumer_group(stream_id, topic_id, group_id)
-            .await
+        dispatch_client!(
+            self,
+            ConsumerGroupClient::leave_consumer_group(stream_id, topic_id, group_id)
+        )
+        .await
     }
 }
 
 #[async_trait]
 impl AsyncDrop for ClientWrapper {
     async fn async_drop(&mut self) {
-        let _ = self.as_client().logout_user().await;
+        let _ = dispatch_client!(self, UserClient::logout_user()).await;
     }
 }

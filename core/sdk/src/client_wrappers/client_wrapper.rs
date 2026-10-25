@@ -23,8 +23,8 @@ use crate::tcp::tcp_client::TcpClient;
 use crate::websocket::websocket_client::WebSocketClient;
 use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{
-    BinaryOperationLineage, BinarySendPartitioning, BinaryTransport, Client, ClientState,
-    Identifier, IggyError, IggyMessage, MessageClient, SendMessagesResponse, SystemClient,
+    BinaryOperationLineage, BinarySendPartitioning, BinaryTransport, ClientState, Identifier,
+    IggyError, IggyMessage, MessageClient, SendMessagesResponse, SystemClient,
     send_binary_messages,
 };
 
@@ -122,16 +122,6 @@ impl ClientWrapper {
             Self::Tcp(client) => client.can_recover(),
             Self::Quic(client) => client.can_recover(),
             Self::WebSocket(client) => client.can_recover(),
-        }
-    }
-
-    pub(super) fn as_client(&self) -> &dyn Client {
-        match self {
-            Self::Iggy(client) => client,
-            Self::Http(client) => client,
-            Self::Tcp(client) => client,
-            Self::Quic(client) => client,
-            Self::WebSocket(client) => client,
         }
     }
 }

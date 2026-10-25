@@ -18,33 +18,32 @@
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 use async_broadcast::Receiver;
 use async_trait::async_trait;
-use iggy_common::Client;
-use iggy_common::{DiagnosticEvent, IggyError};
+use iggy_common::{Client, DiagnosticEvent, IggyError};
 use std::time::Instant;
 
 #[async_trait]
 impl Client for ClientWrapper {
     async fn connect(&self) -> Result<(), IggyError> {
-        self.as_client().connect().await
+        dispatch_client!(self, Client::connect()).await
     }
 
     async fn disconnect(&self) -> Result<(), IggyError> {
-        self.as_client().disconnect().await
+        dispatch_client!(self, Client::disconnect()).await
     }
 
     async fn shutdown(&self) -> Result<(), IggyError> {
-        self.as_client().shutdown().await
+        dispatch_client!(self, Client::shutdown()).await
     }
 
     async fn subscribe_events(&self) -> Receiver<DiagnosticEvent> {
-        self.as_client().subscribe_events().await
+        dispatch_client!(self, Client::subscribe_events()).await
     }
 
     async fn resolve_operation(&self, op: u64, deadline: Instant) -> Result<(), IggyError> {
-        self.as_client().resolve_operation(op, deadline).await
+        dispatch_client!(self, Client::resolve_operation(op, deadline)).await
     }
 
     async fn abandon_operation(&self, op: u64) -> Result<(), IggyError> {
-        self.as_client().abandon_operation(op).await
+        dispatch_client!(self, Client::abandon_operation(op)).await
     }
 }

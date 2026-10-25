@@ -15,6 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Trait calls avoid selecting a transport's similarly named inherent method.
+macro_rules! dispatch_client {
+    ($wrapper:expr, $trait:ident::$method:ident($($arg:expr),* $(,)?)) => {
+        match $wrapper {
+            Self::Iggy(client) => $trait::$method(client $(, $arg)*),
+            Self::Http(client) => $trait::$method(client $(, $arg)*),
+            Self::Tcp(client) => $trait::$method(client $(, $arg)*),
+            Self::Quic(client) => $trait::$method(client $(, $arg)*),
+            Self::WebSocket(client) => $trait::$method(client $(, $arg)*),
+        }
+    };
+}
+
 mod binary_client;
 mod binary_cluster_client;
 mod binary_consumer_group_client;

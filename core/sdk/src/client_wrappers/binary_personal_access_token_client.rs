@@ -17,16 +17,19 @@
 
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 use async_trait::async_trait;
-use iggy_common::PersonalAccessTokenClient;
 use iggy_common::{
-    IdentityInfo, IggyError, PersonalAccessTokenExpiry, PersonalAccessTokenInfo,
-    RawPersonalAccessToken,
+    IdentityInfo, IggyError, PersonalAccessTokenClient, PersonalAccessTokenExpiry,
+    PersonalAccessTokenInfo, RawPersonalAccessToken,
 };
 
 #[async_trait]
 impl PersonalAccessTokenClient for ClientWrapper {
     async fn get_personal_access_tokens(&self) -> Result<Vec<PersonalAccessTokenInfo>, IggyError> {
-        self.as_client().get_personal_access_tokens().await
+        dispatch_client!(
+            self,
+            PersonalAccessTokenClient::get_personal_access_tokens()
+        )
+        .await
     }
 
     async fn create_personal_access_token(
@@ -34,21 +37,29 @@ impl PersonalAccessTokenClient for ClientWrapper {
         name: &str,
         expiry: PersonalAccessTokenExpiry,
     ) -> Result<RawPersonalAccessToken, IggyError> {
-        self.as_client()
-            .create_personal_access_token(name, expiry)
-            .await
+        dispatch_client!(
+            self,
+            PersonalAccessTokenClient::create_personal_access_token(name, expiry)
+        )
+        .await
     }
 
     async fn delete_personal_access_token(&self, name: &str) -> Result<(), IggyError> {
-        self.as_client().delete_personal_access_token(name).await
+        dispatch_client!(
+            self,
+            PersonalAccessTokenClient::delete_personal_access_token(name)
+        )
+        .await
     }
 
     async fn login_with_personal_access_token(
         &self,
         token: &str,
     ) -> Result<IdentityInfo, IggyError> {
-        self.as_client()
-            .login_with_personal_access_token(token)
-            .await
+        dispatch_client!(
+            self,
+            PersonalAccessTokenClient::login_with_personal_access_token(token)
+        )
+        .await
     }
 }

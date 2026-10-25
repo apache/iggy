@@ -17,45 +17,44 @@
 
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 use async_trait::async_trait;
-use iggy_common::SystemClient;
 use iggy_common::{
     ClientInfo, ClientInfoDetails, IggyError, MetadataChanges, MetadataChangesQuery,
     NonZeroIggyDuration, OptionSpec, OptionsScope, Snapshot, SnapshotCompression, Stats,
-    SystemSnapshotType,
+    SystemClient, SystemSnapshotType,
 };
 
 #[async_trait]
 impl SystemClient for ClientWrapper {
     async fn get_stats(&self) -> Result<Stats, IggyError> {
-        self.as_client().get_stats().await
+        dispatch_client!(self, SystemClient::get_stats()).await
     }
 
     async fn get_me(&self) -> Result<ClientInfoDetails, IggyError> {
-        self.as_client().get_me().await
+        dispatch_client!(self, SystemClient::get_me()).await
     }
 
     async fn get_client(&self, client_id: u32) -> Result<Option<ClientInfoDetails>, IggyError> {
-        self.as_client().get_client(client_id).await
+        dispatch_client!(self, SystemClient::get_client(client_id)).await
     }
 
     async fn get_clients(&self) -> Result<Vec<ClientInfo>, IggyError> {
-        self.as_client().get_clients().await
+        dispatch_client!(self, SystemClient::get_clients()).await
     }
 
     async fn describe_options(&self, scope: OptionsScope) -> Result<Vec<OptionSpec>, IggyError> {
-        self.as_client().describe_options(scope).await
+        dispatch_client!(self, SystemClient::describe_options(scope)).await
     }
 
     async fn ping(&self) -> Result<(), IggyError> {
-        self.as_client().ping().await
+        dispatch_client!(self, SystemClient::ping()).await
     }
 
     async fn heartbeat_interval(&self) -> NonZeroIggyDuration {
-        self.as_client().heartbeat_interval().await
+        dispatch_client!(self, SystemClient::heartbeat_interval()).await
     }
 
     async fn refresh_consumer_group_assignments(&self) {
-        self.as_client().refresh_consumer_group_assignments().await
+        dispatch_client!(self, SystemClient::refresh_consumer_group_assignments()).await
     }
 
     async fn snapshot(
@@ -63,19 +62,13 @@ impl SystemClient for ClientWrapper {
         compression: SnapshotCompression,
         snapshot_types: Vec<SystemSnapshotType>,
     ) -> Result<Snapshot, IggyError> {
-        self.as_client().snapshot(compression, snapshot_types).await
+        dispatch_client!(self, SystemClient::snapshot(compression, snapshot_types)).await
     }
 
     async fn get_metadata_changes(
         &self,
         query: &MetadataChangesQuery,
     ) -> Result<MetadataChanges, IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => client.get_metadata_changes(query).await,
-            ClientWrapper::Http(client) => client.get_metadata_changes(query).await,
-            ClientWrapper::Tcp(client) => client.get_metadata_changes(query).await,
-            ClientWrapper::Quic(client) => client.get_metadata_changes(query).await,
-            ClientWrapper::WebSocket(client) => client.get_metadata_changes(query).await,
-        }
+        dispatch_client!(self, SystemClient::get_metadata_changes(query)).await
     }
 }

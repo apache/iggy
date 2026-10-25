@@ -17,9 +17,8 @@
 
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 use async_trait::async_trait;
-use iggy_common::TopicClient;
 use iggy_common::{
-    Identifier, IggyError, Topic, TopicCreateOptions, TopicDetails, TopicUpdateOptions,
+    Identifier, IggyError, Topic, TopicClient, TopicCreateOptions, TopicDetails, TopicUpdateOptions,
 };
 
 #[async_trait]
@@ -29,11 +28,11 @@ impl TopicClient for ClientWrapper {
         stream_id: &Identifier,
         topic_id: &Identifier,
     ) -> Result<Option<TopicDetails>, IggyError> {
-        self.as_client().get_topic(stream_id, topic_id).await
+        dispatch_client!(self, TopicClient::get_topic(stream_id, topic_id)).await
     }
 
     async fn get_topics(&self, stream_id: &Identifier) -> Result<Vec<Topic>, IggyError> {
-        self.as_client().get_topics(stream_id).await
+        dispatch_client!(self, TopicClient::get_topics(stream_id)).await
     }
 
     async fn create_topic(
@@ -42,9 +41,7 @@ impl TopicClient for ClientWrapper {
         name: &str,
         options: &TopicCreateOptions,
     ) -> Result<TopicDetails, IggyError> {
-        self.as_client()
-            .create_topic(stream_id, name, options)
-            .await
+        dispatch_client!(self, TopicClient::create_topic(stream_id, name, options)).await
     }
 
     async fn update_topic(
@@ -53,9 +50,11 @@ impl TopicClient for ClientWrapper {
         topic_id: &Identifier,
         options: &TopicUpdateOptions,
     ) -> Result<(), IggyError> {
-        self.as_client()
-            .update_topic(stream_id, topic_id, options)
-            .await
+        dispatch_client!(
+            self,
+            TopicClient::update_topic(stream_id, topic_id, options)
+        )
+        .await
     }
 
     async fn delete_topic(
@@ -63,6 +62,6 @@ impl TopicClient for ClientWrapper {
         stream_id: &Identifier,
         topic_id: &Identifier,
     ) -> Result<(), IggyError> {
-        self.as_client().delete_topic(stream_id, topic_id).await
+        dispatch_client!(self, TopicClient::delete_topic(stream_id, topic_id)).await
     }
 }

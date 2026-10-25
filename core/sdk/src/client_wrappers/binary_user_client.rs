@@ -17,20 +17,19 @@
 
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 use async_trait::async_trait;
-use iggy_common::UserClient;
 use iggy_common::{
-    Identifier, IdentityInfo, IggyError, Permissions, UserInfo, UserInfoDetails, UserStatus,
+    Identifier, IdentityInfo, IggyError, Permissions, UserClient, UserCreateOptions, UserInfo,
+    UserInfoDetails, UserStatus, UserUpdateOptions,
 };
-use iggy_common::{UserCreateOptions, UserUpdateOptions};
 
 #[async_trait]
 impl UserClient for ClientWrapper {
     async fn get_user(&self, user_id: &Identifier) -> Result<Option<UserInfoDetails>, IggyError> {
-        self.as_client().get_user(user_id).await
+        dispatch_client!(self, UserClient::get_user(user_id)).await
     }
 
     async fn get_users(&self) -> Result<Vec<UserInfo>, IggyError> {
-        self.as_client().get_users().await
+        dispatch_client!(self, UserClient::get_users()).await
     }
 
     async fn create_user(
@@ -41,13 +40,15 @@ impl UserClient for ClientWrapper {
         permissions: Option<Permissions>,
         options: &UserCreateOptions,
     ) -> Result<UserInfoDetails, IggyError> {
-        self.as_client()
-            .create_user(username, password, status, permissions, options)
-            .await
+        dispatch_client!(
+            self,
+            UserClient::create_user(username, password, status, permissions, options)
+        )
+        .await
     }
 
     async fn delete_user(&self, user_id: &Identifier) -> Result<(), IggyError> {
-        self.as_client().delete_user(user_id).await
+        dispatch_client!(self, UserClient::delete_user(user_id)).await
     }
 
     async fn update_user(
@@ -55,7 +56,7 @@ impl UserClient for ClientWrapper {
         user_id: &Identifier,
         options: &UserUpdateOptions,
     ) -> Result<(), IggyError> {
-        self.as_client().update_user(user_id, options).await
+        dispatch_client!(self, UserClient::update_user(user_id, options)).await
     }
 
     async fn update_permissions(
@@ -63,9 +64,7 @@ impl UserClient for ClientWrapper {
         user_id: &Identifier,
         permissions: Option<Permissions>,
     ) -> Result<(), IggyError> {
-        self.as_client()
-            .update_permissions(user_id, permissions)
-            .await
+        dispatch_client!(self, UserClient::update_permissions(user_id, permissions)).await
     }
 
     async fn change_password(
@@ -74,16 +73,18 @@ impl UserClient for ClientWrapper {
         current_password: &str,
         new_password: &str,
     ) -> Result<(), IggyError> {
-        self.as_client()
-            .change_password(user_id, current_password, new_password)
-            .await
+        dispatch_client!(
+            self,
+            UserClient::change_password(user_id, current_password, new_password)
+        )
+        .await
     }
 
     async fn login_user(&self, username: &str, password: &str) -> Result<IdentityInfo, IggyError> {
-        self.as_client().login_user(username, password).await
+        dispatch_client!(self, UserClient::login_user(username, password)).await
     }
 
     async fn logout_user(&self) -> Result<(), IggyError> {
-        self.as_client().logout_user().await
+        dispatch_client!(self, UserClient::logout_user()).await
     }
 }

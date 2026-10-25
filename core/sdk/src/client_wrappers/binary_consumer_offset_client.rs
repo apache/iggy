@@ -17,8 +17,9 @@
 
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 use async_trait::async_trait;
-use iggy_common::ConsumerOffsetClient;
-use iggy_common::{Consumer, ConsumerOffsetInfo, ConsumerPosition, Identifier, IggyError};
+use iggy_common::{
+    Consumer, ConsumerOffsetClient, ConsumerOffsetInfo, ConsumerPosition, Identifier, IggyError,
+};
 
 #[async_trait]
 impl ConsumerOffsetClient for ClientWrapper {
@@ -29,9 +30,11 @@ impl ConsumerOffsetClient for ClientWrapper {
         topic_id: &Identifier,
         position: ConsumerPosition,
     ) -> Result<(), IggyError> {
-        self.as_client()
-            .store_consumer_position(consumer, stream_id, topic_id, position)
-            .await
+        dispatch_client!(
+            self,
+            ConsumerOffsetClient::store_consumer_position(consumer, stream_id, topic_id, position)
+        )
+        .await
     }
 
     async fn store_consumer_offset(
@@ -42,9 +45,17 @@ impl ConsumerOffsetClient for ClientWrapper {
         partition_id: Option<u32>,
         offset: u64,
     ) -> Result<(), IggyError> {
-        self.as_client()
-            .store_consumer_offset(consumer, stream_id, topic_id, partition_id, offset)
-            .await
+        dispatch_client!(
+            self,
+            ConsumerOffsetClient::store_consumer_offset(
+                consumer,
+                stream_id,
+                topic_id,
+                partition_id,
+                offset
+            )
+        )
+        .await
     }
 
     async fn get_consumer_offset(
@@ -54,9 +65,11 @@ impl ConsumerOffsetClient for ClientWrapper {
         topic_id: &Identifier,
         partition_id: Option<u32>,
     ) -> Result<Option<ConsumerOffsetInfo>, IggyError> {
-        self.as_client()
-            .get_consumer_offset(consumer, stream_id, topic_id, partition_id)
-            .await
+        dispatch_client!(
+            self,
+            ConsumerOffsetClient::get_consumer_offset(consumer, stream_id, topic_id, partition_id)
+        )
+        .await
     }
 
     async fn delete_consumer_offset(
@@ -66,8 +79,15 @@ impl ConsumerOffsetClient for ClientWrapper {
         topic_id: &Identifier,
         partition_id: Option<u32>,
     ) -> Result<(), IggyError> {
-        self.as_client()
-            .delete_consumer_offset(consumer, stream_id, topic_id, partition_id)
-            .await
+        dispatch_client!(
+            self,
+            ConsumerOffsetClient::delete_consumer_offset(
+                consumer,
+                stream_id,
+                topic_id,
+                partition_id
+            )
+        )
+        .await
     }
 }

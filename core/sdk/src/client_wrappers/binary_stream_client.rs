@@ -17,19 +17,19 @@
 
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 use async_trait::async_trait;
-use iggy_common::StreamClient;
 use iggy_common::{
-    Identifier, IggyError, Stream, StreamCreateOptions, StreamDetails, StreamUpdateOptions,
+    Identifier, IggyError, Stream, StreamClient, StreamCreateOptions, StreamDetails,
+    StreamUpdateOptions,
 };
 
 #[async_trait]
 impl StreamClient for ClientWrapper {
     async fn get_stream(&self, stream_id: &Identifier) -> Result<Option<StreamDetails>, IggyError> {
-        self.as_client().get_stream(stream_id).await
+        dispatch_client!(self, StreamClient::get_stream(stream_id)).await
     }
 
     async fn get_streams(&self) -> Result<Vec<Stream>, IggyError> {
-        self.as_client().get_streams().await
+        dispatch_client!(self, StreamClient::get_streams()).await
     }
 
     async fn create_stream(
@@ -37,7 +37,7 @@ impl StreamClient for ClientWrapper {
         name: &str,
         options: &StreamCreateOptions,
     ) -> Result<StreamDetails, IggyError> {
-        self.as_client().create_stream(name, options).await
+        dispatch_client!(self, StreamClient::create_stream(name, options)).await
     }
 
     async fn update_stream(
@@ -45,10 +45,10 @@ impl StreamClient for ClientWrapper {
         stream_id: &Identifier,
         options: &StreamUpdateOptions,
     ) -> Result<(), IggyError> {
-        self.as_client().update_stream(stream_id, options).await
+        dispatch_client!(self, StreamClient::update_stream(stream_id, options)).await
     }
 
     async fn delete_stream(&self, stream_id: &Identifier) -> Result<(), IggyError> {
-        self.as_client().delete_stream(stream_id).await
+        dispatch_client!(self, StreamClient::delete_stream(stream_id)).await
     }
 }

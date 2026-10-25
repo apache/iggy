@@ -17,10 +17,9 @@
 
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 use async_trait::async_trait;
-use iggy_common::MessageClient;
 use iggy_common::{
-    Consumer, Identifier, IggyError, IggyMessage, Partitioning, PolledMessages, PollingStrategy,
-    SendMessagesResponse,
+    Consumer, Identifier, IggyError, IggyMessage, MessageClient, Partitioning, PolledMessages,
+    PollingStrategy, SendMessagesResponse,
 };
 
 #[async_trait]
@@ -57,17 +56,19 @@ impl MessageClient for ClientWrapper {
         count: u32,
         auto_commit: bool,
     ) -> Result<PolledMessages, IggyError> {
-        self.as_client()
-            .poll_messages_with_strategy_for(
+        dispatch_client!(
+            self,
+            MessageClient::poll_messages_with_strategy_for(
                 stream_id,
                 topic_id,
                 partition_id,
                 consumer,
                 strategy_for,
                 count,
-                auto_commit,
+                auto_commit
             )
-            .await
+        )
+        .await
     }
 
     async fn send_messages(
@@ -77,8 +78,10 @@ impl MessageClient for ClientWrapper {
         partitioning: &Partitioning,
         messages: &mut [IggyMessage],
     ) -> Result<SendMessagesResponse, IggyError> {
-        self.as_client()
-            .send_messages(stream_id, topic_id, partitioning, messages)
-            .await
+        dispatch_client!(
+            self,
+            MessageClient::send_messages(stream_id, topic_id, partitioning, messages)
+        )
+        .await
     }
 }
