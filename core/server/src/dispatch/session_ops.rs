@@ -1358,7 +1358,7 @@ fn build_ext_auth_request(
     transport_client_id: u128,
     wire_request: &LoginRegisterRequest,
 ) -> crate::external_auth::ExternalAuthRequest {
-    use crate::external_auth::{CredentialType, ExternalAuthRequest};
+    use crate::external_auth::{Credentials, ExternalAuthRequest};
     use message_bus::installer::conn_info::ClientTransportKind;
 
     let (transport, client_address) = sessions
@@ -1380,13 +1380,13 @@ fn build_ext_auth_request(
         );
 
     ExternalAuthRequest {
-        credential_type: CredentialType::Password,
-        credential: Some(SecretString::from(
-            wire_request.password.expose_secret().to_owned(),
-        )),
-        username: wire_request.username.to_string(),
         transport: transport.to_owned(),
         client_address,
+        connection_id: uuid::Uuid::from_u128(transport_client_id).to_string(),
+        credentials: Credentials::UsernamePassword {
+            username: wire_request.username.to_string(),
+            password: SecretString::from(wire_request.password.expose_secret().to_owned()),
+        },
     }
 }
 

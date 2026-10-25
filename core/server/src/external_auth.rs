@@ -76,57 +76,60 @@ fn get_http_client() -> cyper::Client {
     HTTP_CLIENT.with(cyper::Client::clone)
 }
 
-/// Serialize the plaintext of a `SecretString`. Used only for the outbound
-/// ext-auth JSON body, never for logging.
-// serde's `serialize_with` passes the field by reference, which forces
-// the `&Option<T>` signature that `ref_option` flags.
-#[allow(clippy::ref_option)]
-fn serialize_credential<S: serde::Serializer>(
-    value: &Option<SecretString>,
+fn serialize_secret<S: serde::Serializer>(
+    value: &SecretString,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
-    match value {
-        Some(secret) => serializer.serialize_str(secret.expose_secret()),
-        None => serializer.serialize_none(),
-    }
+    serializer.serialize_str(value.expose_secret())
 }
 
-/// Credential metadata sent to the external auth service.
+/// Connection and credential metadata sent to the external auth service.
 ///
-/// Manual `Debug` redacts the `credential` field so passwords never
-/// appear in log output.
+/// Manual `Debug` redacts credentials so secrets never appear in log output.
 #[derive(Serialize)]
 pub struct ExternalAuthRequest {
-    pub credential_type: CredentialType,
-    #[serde(
-        serialize_with = "serialize_credential",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub credential: Option<SecretString>,
-    pub username: String,
     pub transport: String,
     pub client_address: String,
+    pub connection_id: String,
+    pub credentials: Credentials,
 }
 
 impl fmt::Debug for ExternalAuthRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ExternalAuthRequest")
-            .field("credential_type", &self.credential_type)
-            .field(
-                "credential",
-                &self.credential.as_ref().map(|_| "[REDACTED]"),
-            )
-            .field("username", &self.username)
             .field("transport", &self.transport)
             .field("client_address", &self.client_address)
+            .field("connection_id", &self.connection_id)
+            .field("credentials", &self.credentials)
             .finish()
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum CredentialType {
-    Password,
+/// Credential payload for the external auth callout.
+///
+/// Internally tagged on `"type"` so each variant carries exactly the fields
+/// it needs. Future credential kinds (bearer tokens, client certificates)
+/// add a variant here without touching the request envelope.
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Credentials {
+    UsernamePassword {
+        username: String,
+        #[serde(serialize_with = "serialize_secret")]
+        password: SecretString,
+    },
+}
+
+impl fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UsernamePassword { username, .. } => f
+                .debug_struct("UsernamePassword")
+                .field("username", username)
+                .field("password", &"[REDACTED]")
+                .finish(),
+        }
+    }
 }
 
 /// JSON response from the external auth service.
@@ -279,6 +282,26 @@ pub fn warn_insecure_url(config: &ExternalAuthConfig) {
     }
 }
 
+fn validate_credential_size(credentials: &Credentials) -> Result<(), ExternalAuthError> {
+    match credentials {
+        Credentials::UsernamePassword { username, password } => {
+            if username.len() > MAX_CREDENTIAL_BYTES {
+                return Err(ExternalAuthError::BadRequest(format!(
+                    "username too large ({} bytes, limit {MAX_CREDENTIAL_BYTES})",
+                    username.len()
+                )));
+            }
+            let password_len = password.expose_secret().len();
+            if password_len > MAX_CREDENTIAL_BYTES {
+                return Err(ExternalAuthError::BadRequest(format!(
+                    "credential too large ({password_len} bytes, limit {MAX_CREDENTIAL_BYTES})",
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Call the external auth service and parse the response.
 ///
 /// # Errors
@@ -291,20 +314,7 @@ pub async fn callout_external_auth(
 ) -> Result<ExternalAuthDecision, ExternalAuthError> {
     use futures::StreamExt;
 
-    if request.username.len() > MAX_CREDENTIAL_BYTES {
-        return Err(ExternalAuthError::BadRequest(format!(
-            "username too large ({} bytes, limit {MAX_CREDENTIAL_BYTES})",
-            request.username.len()
-        )));
-    }
-    if let Some(ref cred) = request.credential {
-        let cred_len = cred.expose_secret().len();
-        if cred_len > MAX_CREDENTIAL_BYTES {
-            return Err(ExternalAuthError::BadRequest(format!(
-                "credential too large ({cred_len} bytes, limit {MAX_CREDENTIAL_BYTES})",
-            )));
-        }
-    }
+    validate_credential_size(&request.credentials)?;
 
     let _guard = CalloutGuard::acquire(config.max_concurrent_callouts)?;
     let client = get_http_client();
@@ -436,40 +446,25 @@ mod tests {
     // ── request serialization ───────────────────────────────────────
 
     #[test]
-    fn request_password_round_trip() {
+    fn request_username_password_round_trip() {
         let req = ExternalAuthRequest {
-            credential_type: CredentialType::Password,
-            credential: Some(SecretString::from("s3cret".to_owned())),
-            username: "alice".to_owned(),
             transport: "tcp".to_owned(),
             client_address: "10.0.0.1:5000".to_owned(),
+            connection_id: "0195f4d7-57d3-7c21-a711-08a147ad6c90".to_owned(),
+            credentials: Credentials::UsernamePassword {
+                username: "alice".to_owned(),
+                password: SecretString::from("s3cret".to_owned()),
+            },
         };
         let val: serde_json::Value = serde_json::to_value(&req).unwrap();
-        assert_eq!(val["credential_type"], "password");
-        assert_eq!(val["credential"], "s3cret");
-        assert_eq!(val["username"], "alice");
         assert_eq!(val["transport"], "tcp");
         assert_eq!(val["client_address"], "10.0.0.1:5000");
-        assert_eq!(val.as_object().unwrap().len(), 5);
-    }
-
-    #[test]
-    fn request_omits_credential_when_none() {
-        let req = ExternalAuthRequest {
-            credential_type: CredentialType::Password,
-            credential: None,
-            username: String::new(),
-            transport: "http".to_owned(),
-            client_address: "10.0.0.1:443".to_owned(),
-        };
-        let val: serde_json::Value = serde_json::to_value(&req).unwrap();
-        assert_eq!(val["credential_type"], "password");
-        assert!(
-            val.get("credential").is_none(),
-            "credential must be omitted"
-        );
-        assert_eq!(val["username"], "");
-        assert_eq!(val.as_object().unwrap().len(), 4);
+        assert_eq!(val["connection_id"], "0195f4d7-57d3-7c21-a711-08a147ad6c90");
+        let creds = &val["credentials"];
+        assert_eq!(creds["type"], "username_password");
+        assert_eq!(creds["username"], "alice");
+        assert_eq!(creds["password"], "s3cret");
+        assert_eq!(creds.as_object().unwrap().len(), 3);
     }
 
     // ── response deserialization: allow ──────────────────────────────
@@ -602,17 +597,19 @@ mod tests {
     }
 
     #[test]
-    fn given_request_without_credential_when_serializing_should_omit_field() {
+    fn request_credentials_nested_under_tagged_envelope() {
         let req = ExternalAuthRequest {
-            credential_type: CredentialType::Password,
-            credential: None,
-            username: String::new(),
             transport: "http".to_owned(),
             client_address: "10.0.0.1:443".to_owned(),
+            connection_id: "00000000-0000-0000-0000-000000000001".to_owned(),
+            credentials: Credentials::UsernamePassword {
+                username: "bob".to_owned(),
+                password: SecretString::from("pw".to_owned()),
+            },
         };
         let json = serde_json::to_string(&req).unwrap();
-        assert!(!json.contains("credential\":"));
-        assert!(json.contains("\"credential_type\":\"password\""));
+        assert!(json.contains("\"credentials\":{"));
+        assert!(json.contains("\"type\":\"username_password\""));
     }
 
     #[test]

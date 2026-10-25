@@ -172,13 +172,20 @@ async fn handle_connection(stream: tokio::net::TcpStream, mode: Mode) {
         Mode::Normal => {
             let decision = match serde_json::from_slice::<serde_json::Value>(&body) {
                 Ok(req) => {
-                    let username = req.get("username").and_then(|v| v.as_str()).unwrap_or("");
-                    let credential = req.get("credential").and_then(|v| v.as_str()).unwrap_or("");
+                    let creds = req.get("credentials");
+                    let username = creds
+                        .and_then(|c| c.get("username"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let password = creds
+                        .and_then(|c| c.get("password"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     match username {
-                        EXT_AUTH_USERNAME if credential == EXT_AUTH_PASSWORD => {
+                        EXT_AUTH_USERNAME if password == EXT_AUTH_PASSWORD => {
                             allow_response(EXT_AUTH_IGGY_USERNAME)
                         }
-                        EXT_DENIED_USERNAME if credential == EXT_DENIED_PASSWORD => {
+                        EXT_DENIED_USERNAME if password == EXT_DENIED_PASSWORD => {
                             deny_response("access denied by policy")
                         }
                         _ => deny_response("unknown user or bad credentials"),
