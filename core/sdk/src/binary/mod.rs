@@ -112,6 +112,15 @@ macro_rules! impl_binary_client {
                     .await
             }
 
+            async fn send_raw_to_replica(
+                &self,
+                code: u32,
+                payload: bytes::Bytes,
+                replica_id: u8,
+            ) -> Result<bytes::Bytes, iggy_common::IggyError> {
+                self.driver.send_to_replica(code, payload, replica_id).await
+            }
+
             async fn send_offset_write_with_response(
                 &self,
                 code: u32,

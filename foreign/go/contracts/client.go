@@ -419,4 +419,15 @@ type Client interface {
 	// explicit partition id: a balanced or key-partitioned send returns
 	// ierror.ErrFeatureUnavailable without writing, so use SendMessages for those.
 	SendBinaryRequest(ctx context.Context, code uint32, payload []byte) ([]byte, error)
+
+	// SendBinaryRequestToReplica sends a command code and payload to the replica with id
+	// replicaID, for example to read the stats that replica keeps for itself, and returns
+	// that replica's raw response body. Replica ids are the ones GetClusterMetadata returns.
+	// The request carries the session's metadata watermark, so the replica answers once it
+	// applied the metadata the session saw. Session-control codes, replicated commands,
+	// polls and consumer offset reads return ierror.ErrInvalidCommand without writing to
+	// the connection. An id the roster does not name returns ierror.ErrInvalidIdentifier.
+	// The replica's own refusal, such as ierror.ErrNotPrimary, is returned and never
+	// retried on another replica.
+	SendBinaryRequestToReplica(ctx context.Context, code uint32, payload []byte, replicaID uint8) ([]byte, error)
 }

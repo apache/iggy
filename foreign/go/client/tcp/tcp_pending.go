@@ -134,6 +134,8 @@ type pendingOperation struct {
 	key   laneKey
 	fence uint64
 	frame *operationFrame
+	// replica is the replica the caller chose, nil when the client routes the request.
+	replica *uint8
 }
 
 type laneTicket struct {

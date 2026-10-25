@@ -343,6 +343,12 @@ Current pages need the parent groups of every selected group, for example `Topic
 
 `str()` of a cursor gives its `mc1_` text and of a page token its `cs1_` text, and `MetadataChangeCursor.parse` and `MetadataCurrentPageToken.parse` read them back, so a mirror can store its position as a string. Log ids, checksums and client ids are Python ints.
 
+## Raw Commands
+
+`send_binary_request(code, payload)` sends a command code with a payload and returns the raw response bytes. `send_binary_request_to_replica(code, payload, replica_id)` sends it to one node of a cluster, named by the replica id that cluster metadata returns.
+
+Each node answers non-replicated commands such as `GetStats` from its own state, so this reads the state of that node. Replicated commands, polls, consumer-offset reads and session-control codes raise an invalid-command error before anything is sent. An id that cluster metadata does not name raises an invalid-identifier error. An unreachable node is retried until the request timeout, and a `NotPrimary` reply is raised rather than sent to another node. HTTP does not support raw commands.
+
 ## High-Level Producer
 
 The Python high-level producer API is a port of the Rust high-level producer

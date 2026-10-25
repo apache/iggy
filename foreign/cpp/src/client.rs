@@ -1495,6 +1495,32 @@ impl Client {
             Ok(Vec::from(response))
         })
     }
+
+    /// Sends a command code and payload to the replica with `replica_id`, as
+    /// cluster metadata names it, and returns its raw response bytes.
+    /// Replicated commands, polls, consumer-offset reads and session-control
+    /// codes return an invalid-command error, and a replica that cluster
+    /// metadata does not name returns an invalid-identifier error.
+    pub fn send_binary_request_to_replica(
+        &self,
+        code: u32,
+        payload: Vec<u8>,
+        replica_id: u8,
+        error_info: &mut ffi::ErrorInfo,
+    ) -> Result<Vec<u8>, String> {
+        *error_info = ffi::ErrorInfo::default();
+        RUNTIME.block_on(async {
+            let response = self
+                .inner
+                .send_binary_request_to_replica(code, Bytes::from(payload), replica_id)
+                .await
+                .inspect_err(|error| error_info.record(error))
+                .map_err(|error| {
+                    format!("Could not send raw command '{code}' to replica {replica_id}: {error}")
+                })?;
+            Ok(Vec::from(response))
+        })
+    }
 }
 
 /// Fingerprint of a 32-byte stream key. Any other length is refused with
