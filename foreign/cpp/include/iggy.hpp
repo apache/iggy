@@ -6011,6 +6011,9 @@ class IggyBlockingClient final {
     /**
      * @brief Deletes one of the caller's personal access tokens.
      *
+     * A failed or unknown transport outcome can leave the deletion committed;
+     * list the tokens before retrying.
+     *
      * @param name Name of the token to delete.
      * @throws IggyException if @p name is empty or exceeds 255 bytes; the
      *         client is unavailable or unauthenticated; the token does not
