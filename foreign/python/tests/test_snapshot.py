@@ -47,6 +47,7 @@ class TestSnapshot:
         """Passing non-enum snapshot_compression raises TypeError before sending."""
         client = IggyClient("127.0.0.1:1")
         with pytest.raises(TypeError):
+            # pyrefly: ignore  # bad-argument-type
             client.snapshot(invalid_compression, [SystemSnapshotType.Test])
 
     @pytest.mark.unit
@@ -54,6 +55,7 @@ class TestSnapshot:
         """An unknown or non-enum snapshot type raises TypeError before sending."""
         client = IggyClient("127.0.0.1:1")
         with pytest.raises(TypeError):
+            # pyrefly: ignore  # bad-argument-type
             client.snapshot(SnapshotCompression.Deflated, ["test"])
 
     @pytest.mark.unit
