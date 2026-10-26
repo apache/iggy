@@ -469,9 +469,13 @@ fn same_incarnation_and_owner(left: PartitionContext, right: PartitionContext) -
 /// The initial polling strategy is resolved separately for each partition. `Next`
 /// starts after the stored offset, or at zero when no offset exists. Subsequent
 /// fetches use explicit offsets, so a lost reply can be retried without advancing
-/// past unseen messages. Reassignment discards prefetched data and resolves the
-/// starting position again. Messages already delivered are filtered unless replay
-/// is enabled. Delivery and durable processing progress are separate.
+/// past unseen messages. Reassignment discards prefetched data. A partition that a
+/// rebalance leaves with its group member continues after the last message that the
+/// application took. The member resolves the starting position again for a partition
+/// that it gets back from another member. After the client starts a new session, the
+/// member resolves it again for every partition. Messages already delivered are
+/// filtered unless replay is enabled. Delivery and durable processing progress are
+/// separate.
 ///
 /// The default is [`AutoCommit::Disabled`]. Store offsets only after successfully
 /// processing messages, in partition order. Fetching ahead never commits under this

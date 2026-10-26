@@ -279,9 +279,12 @@ The high-level consumer then fetches that record alone, without the byte limit.
 
 Both builders default to `Next` and manual commits. Process messages in partition order,
 then call `store_offset(offset, Some(partition_id))`. Fetch positions advance
-independently of stored offsets; an initial `Next` is resolved once per partition
-and assignment. Restarting before a commit can replay work. Explicit auto-commit
-policies remain available and can commit messages before processing.
+independently of stored offsets. An initial `Next` is resolved once per partition.
+A partition that a rebalance leaves with its group member continues after the last
+message that the application took. The member resolves `Next` again for a partition
+that it gets back from another member. After the client starts a new session, the
+member resolves `Next` again for every partition. Restarting before a commit can replay work.
+Explicit auto-commit policies remain available and can commit messages before processing.
 
 This default is incompatible with earlier releases. The builder used to commit
 with `AutoCommit::IntervalOrWhen(1s, PollingMessages)`, and `IggyConsumerConfig`

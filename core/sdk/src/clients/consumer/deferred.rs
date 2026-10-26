@@ -493,11 +493,23 @@ impl Worker {
         if refreshed.epoch != self.epoch || self.epoch != self.generation.load(ORDERING) {
             return false;
         }
-        // Positions belong to one assignment, so they survive reconnects that
-        // keep it.
         if self.assignment != Some(refreshed.assignment) {
             self.invalidate();
-            self.positions.clear();
+            // The server keeps the owner of a partition that stays with its
+            // member, so that partition continues from its position. Every
+            // partition has a new owner in a new session. A partition that
+            // moved away and back between two refreshes has one too: the
+            // server refuses a poll from its old position, and the worker
+            // then drops that position.
+            if self
+                .assignment
+                .is_some_and(|assignment| assignment.session == refreshed.assignment.session)
+            {
+                self.positions
+                    .retain(|partition, _| refreshed.partitions.binary_search(partition).is_ok());
+            } else {
+                self.positions.clear();
+            }
             self.assignment = Some(refreshed.assignment);
         }
         self.partitions = refreshed.partitions;
@@ -910,7 +922,11 @@ impl Worker {
             Ok(polled) => polled,
             Err(error) => {
                 if current {
-                    if matches!(error, IggyError::HistoryUnavailable) {
+                    if matches!(
+                        error,
+                        IggyError::HistoryUnavailable
+                            | IggyError::ConsumerGroupPartitionNotOwned(..)
+                    ) {
                         self.positions.remove(&partition);
                     }
                     self.fail_on_demand(&[partition], error);
@@ -1368,6 +1384,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rebalance_keeps_the_position_of_a_partition_that_stays_with_the_member() {
+        let consumer = builder_for(Consumer::group(Identifier::numeric(1).unwrap()))
+            .polling_strategy(PollingStrategy::first())
+            .auto_commit(AutoCommit::Disabled)
+            .build();
+        let (sender, _receiver) = mpsc::channel(consumer.prefetch_slots());
+        let mut worker = Worker::new(&consumer, sender);
+        assert!(worker.apply(assigned(&worker, 1, 1, [0, 1, 2])));
+        for partition in [0, 2] {
+            worker.complete(fetched(
+                &worker,
+                worker.epoch,
+                PollingStrategy::first(),
+                partition,
+                [0, 1, 2],
+                9,
+            ));
+            consumer.state.last_consumed_offsets.insert(
+                partition,
+                ConsumerPosition {
+                    partition_id: partition,
+                    offset: 0,
+                    context: Default::default(),
+                },
+            );
+        }
+
+        assert!(worker.apply(assigned(&worker, 1, 2, [0, 1])));
+        assert_eq!(
+            worker.position(0),
+            PollingStrategy::offset(1).with_context(Default::default()),
+            "the partition continues after its last delivered message"
+        );
+        assert!(
+            !worker.positions.contains_key(&2),
+            "a partition that left starts over when it comes back"
+        );
+
+        assert!(worker.apply(assigned(&worker, 2, 2, [0, 1])));
+        assert_eq!(
+            worker.position(0),
+            PollingStrategy::first(),
+            "a new session owns every partition anew"
+        );
+    }
+
+    #[tokio::test]
+    async fn committing_member_retries_a_lost_reply_until_the_partition_changes_owner() {
+        let (mut worker, _receiver) = on_demand_worker(
+            Consumer::group(Identifier::numeric(1).unwrap()),
+            PollingStrategy::next(),
+        );
+        assert!(worker.apply(assigned(&worker, 1, 1, [0, 1])));
+        worker.complete(fetched(
+            &worker,
+            worker.epoch,
+            PollingStrategy::next(),
+            0,
+            [3, 4],
+            9,
+        ));
+        let retried = worker.position(0);
+        worker.complete(CompletedPoll {
+            epoch: worker.epoch,
+            partition: 0,
+            strategy: retried,
+            result: Err(IggyError::TransientNotCommitted),
+            capacity: worker.reserve().unwrap(),
+        });
+        assert!(worker.retry_at.contains_key(&0));
+
+        assert!(worker.apply(assigned(&worker, 1, 2, [0])));
+        assert_eq!(
+            worker.position(0),
+            retried,
+            "`Next` would start after the batch that the server may have committed"
+        );
+
+        worker.complete(CompletedPoll {
+            epoch: worker.epoch,
+            partition: 0,
+            strategy: retried,
+            result: Err(IggyError::ConsumerGroupPartitionNotOwned(1, 0)),
+            capacity: worker.reserve().unwrap(),
+        });
+        assert!(worker.apply(assigned(&worker, 1, 2, [0])));
+        assert_eq!(
+            worker.position(0),
+            PollingStrategy::next(),
+            "a partition that moved away and back resolves its position again"
+        );
+    }
+
+    #[tokio::test]
     async fn stored_offset_moves_the_fetch_position_past_a_message_that_never_reads() {
         let consumer = builder_for(Consumer::default())
             .auto_commit(AutoCommit::Disabled)
@@ -1701,6 +1811,24 @@ mod tests {
             .build();
         let (sender, receiver) = mpsc::channel(consumer.prefetch_slots());
         (Worker::new(&consumer, sender), receiver)
+    }
+
+    /// A refresh in the current fetch state that read `partitions`.
+    fn assigned(
+        worker: &Worker,
+        session: u64,
+        generation: u64,
+        partitions: impl Into<Vec<u32>>,
+    ) -> Refreshed {
+        Refreshed {
+            epoch: worker.epoch,
+            assignment: AssignmentVersion {
+                session,
+                generation,
+            },
+            partitions: partitions.into(),
+            groups: None,
+        }
     }
 
     /// A fetch of `partition` that the worker started in `epoch`.
