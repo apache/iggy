@@ -28,6 +28,13 @@ namespace Apache.Iggy.Tests.Integrations;
 
 public class TopicsTests
 {
+    private static readonly TopicOptions GzipTenMinutes = new()
+    {
+        CompressionAlgorithm = CompressionAlgorithm.Gzip,
+        MessageExpiry = TimeSpan.FromMinutes(10),
+        MaxTopicSize = 2_000_000_000
+    };
+
     [ClassDataSource<IggyServerFixture>(Shared = SharedType.PerAssembly)]
     public required IggyServerFixture Fixture { get; init; }
 
@@ -40,9 +47,7 @@ public class TopicsTests
         var streamName = $"topic-create-{Guid.NewGuid():N}";
         await client.CreateStreamAsync(streamName);
 
-        var response = await client.CreateTopicAsync(Identifier.String(streamName), "Test Topic", 2,
-            CompressionAlgorithm.Gzip,
-            TimeSpan.FromMinutes(10), 2_000_000_000);
+        var response = await client.CreateTopicAsync(Identifier.String(streamName), "Test Topic", 2, GzipTenMinutes);
 
         response.ShouldNotBeNull();
         response.CreatedAt.UtcDateTime.ShouldBe(DateTimeOffset.UtcNow.UtcDateTime, TimeSpan.FromMinutes(1));
@@ -78,8 +83,7 @@ public class TopicsTests
 
         var streamName = $"topic-get-{Guid.NewGuid():N}";
         await client.CreateStreamAsync(streamName);
-        await client.CreateTopicAsync(Identifier.String(streamName), "Get Topic", 2,
-            CompressionAlgorithm.Gzip, TimeSpan.FromMinutes(10), 2_000_000_000);
+        await client.CreateTopicAsync(Identifier.String(streamName), "Get Topic", 2, GzipTenMinutes);
 
         var response = await client.GetTopicByIdAsync(Identifier.String(streamName), Identifier.Numeric(0));
 
@@ -103,8 +107,7 @@ public class TopicsTests
 
         var streamName = $"topic-getname-{Guid.NewGuid():N}";
         await client.CreateStreamAsync(streamName);
-        await client.CreateTopicAsync(Identifier.String(streamName), "Name Topic", 2,
-            CompressionAlgorithm.Gzip, TimeSpan.FromMinutes(10), 2_000_000_000);
+        await client.CreateTopicAsync(Identifier.String(streamName), "Name Topic", 2, GzipTenMinutes);
 
         var response = await client.GetTopicByIdAsync(Identifier.String(streamName),
             Identifier.String("Name Topic"));
@@ -128,10 +131,8 @@ public class TopicsTests
 
         var streamName = $"topic-list-{Guid.NewGuid():N}";
         await client.CreateStreamAsync(streamName);
-        await client.CreateTopicAsync(Identifier.String(streamName), "List Topic 1", 2,
-            CompressionAlgorithm.Gzip, TimeSpan.FromMinutes(10), 2_000_000_000);
-        await client.CreateTopicAsync(Identifier.String(streamName), "List Topic 2", 2,
-            CompressionAlgorithm.Gzip, TimeSpan.FromMinutes(10), 2_000_000_000);
+        await client.CreateTopicAsync(Identifier.String(streamName), "List Topic 1", 2, GzipTenMinutes);
+        await client.CreateTopicAsync(Identifier.String(streamName), "List Topic 2", 2, GzipTenMinutes);
 
         IReadOnlyList<TopicResponse> response = await client.GetTopicsAsync(Identifier.String(streamName));
 
@@ -192,15 +193,20 @@ public class TopicsTests
         topicToUpdate.ShouldNotBeNull();
 
         await Should.NotThrowAsync(client.UpdateTopicAsync(Identifier.String(streamName),
-            Identifier.Numeric(topicToUpdate.Id), "Updated Topic",
-            CompressionAlgorithm.Gzip, 3_000_000_000, TimeSpan.FromMinutes(10)));
+            Identifier.Numeric(topicToUpdate.Id), new TopicUpdate
+            {
+                Name = "Updated Topic",
+                MaxTopicSize = 3_000_000_000,
+                MessageExpiry = TimeSpan.FromMinutes(10)
+            }));
 
         var result = await client.GetTopicByIdAsync(Identifier.String(streamName),
             Identifier.Numeric(topicToUpdate.Id));
         result.ShouldNotBeNull();
         result!.Name.ShouldBe("Updated Topic");
         result.MessageExpiry.ShouldBe(TimeSpan.FromMinutes(10));
-        result.CompressionAlgorithm.ShouldBe(CompressionAlgorithm.Gzip);
+        // Compression is set only at creation, so the update leaves the default in place.
+        result.CompressionAlgorithm.ShouldBe(CompressionAlgorithm.None);
         result.MaxTopicSize.ShouldBe(3_000_000_000u);
     }
 

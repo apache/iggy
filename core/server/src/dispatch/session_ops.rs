@@ -57,7 +57,9 @@ use iggy_binary_protocol::{
 use iggy_common::defaults::{
     MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH, MIN_PASSWORD_LENGTH, MIN_USERNAME_LENGTH,
 };
-use iggy_common::{IggyError, IggyTimestamp, PersonalAccessToken, UserStatus};
+use iggy_common::{
+    IggyError, IggyTimestamp, PersonalAccessToken, UserStatus, check_critical_options,
+};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use metadata::MetadataSubmitError;
@@ -125,9 +127,11 @@ where
         // Verify before the status check and collapse inactive to
         // InvalidCredentials: an inactive account must answer exactly like a
         // wrong password (same error, same Argon2 cost), or login could probe
-        // which accounts exist but are disabled.
+        // which accounts exist but are disabled. An account holding critical
+        // options this build cannot read answers the same way.
         if !crypto::verify_password(password, user.password_hash.as_ref())
             || user.status != UserStatus::Active
+            || check_critical_options(&user.options).is_err()
         {
             return Err(LoginRegisterError::InvalidCredentials);
         }
@@ -200,7 +204,7 @@ where
         let Some(user) = users.items.get(*user_id as usize) else {
             return Err(LoginRegisterError::InvalidToken);
         };
-        if user.status != UserStatus::Active {
+        if user.status != UserStatus::Active || check_critical_options(&user.options).is_err() {
             return Err(LoginRegisterError::UserInactive);
         }
         // `expiry_at == None` is a never-expiring PAT; map it to `u64::MAX` so
@@ -1282,13 +1286,21 @@ mod tests {
     };
     use consensus::{LocalPipeline, Plane as _, PlaneKind, VsrConsensus};
     use iggy_binary_protocol::Operation;
+    use iggy_binary_protocol::WireName;
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
+    use iggy_binary_protocol::requests::users::CreateUserRequest;
     use iggy_binary_protocol::{PrepareOkHeader, ReplyHeader, WireEncode, WireOptions};
     use iggy_common::eviction_reason_to_error;
+    use iggy_common::wire_conversions::resource_options_to_wire;
+    use iggy_common::{
+        HeaderKey, HeaderValue, OptionKey, OptionValue, OptionsProvenance, ResourceOptions,
+    };
     use journal::prepare_journal::PrepareJournal;
     use message_bus::installer::conn_info::ClientTransportKind;
     use metadata::IggyMetadata;
     use metadata::impls::metadata::IggySnapshot;
+    use metadata::stm::StateMachine as _;
+    use metadata::stm::user::CreatePersonalAccessTokenRequest;
     use partitions::{IggyPartitions, PartitionPathLayout, PartitionsConfig};
     use server_common::MessageBag;
     use server_common::sharding::ShardId;
@@ -1296,6 +1308,7 @@ mod tests {
     use shard::{PartitionConsensusConfig, ReplicaTopology, ShardIdentity};
     use std::future::Future;
     use std::mem::size_of;
+    use std::sync::Arc;
 
     #[test]
     fn given_uninitialized_root_when_verifying_credentials_should_return_a_retryable_failure() {
@@ -1311,6 +1324,75 @@ mod tests {
                     MetadataSubmitError::NotCaughtUp
                 ))
             ));
+        }
+    }
+
+    #[test]
+    fn given_user_with_unknown_critical_option_when_logging_in_should_refuse_it() {
+        const PASSWORD: &str = "user-password";
+        const TOKEN: &str = "user-personal-access-token";
+        let unreadable = ResourceOptions::from([
+            (
+                HeaderKey::from(OptionKey::CriticalKeys),
+                OptionValue::explicit(HeaderValue::try_from("a_future_key").expect("marker fits")),
+            ),
+            (
+                HeaderKey::try_from("a_future_key").expect("key fits"),
+                OptionValue::explicit(HeaderValue::from(7u64)),
+            ),
+        ]);
+        for (options, refused) in [(ResourceOptions::new(), false), (unreadable, true)] {
+            let bus = SpyBus::default();
+            let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
+            let mux_stm = &shard.plane.metadata().mux_stm;
+            mux_stm.users().ensure_root_user("root", "hash");
+            mux_stm
+                .update(prepare_message(
+                    Operation::CreateUser,
+                    0,
+                    1,
+                    &CreateUserRequest {
+                        username: WireName::new("user").expect("name fits"),
+                        password: server_common::crypto::hash_password(PASSWORD),
+                        status: UserStatus::Active.as_code(),
+                        permissions: None,
+                        options: resource_options_to_wire(&options, OptionsProvenance::All)
+                            .expect("options encode"),
+                    }
+                    .to_bytes(),
+                ))
+                .expect("user create applies");
+            mux_stm
+                .update(prepare_message(
+                    Operation::CreatePersonalAccessToken,
+                    0,
+                    2,
+                    &CreatePersonalAccessTokenRequest {
+                        user_id: 1,
+                        name: WireName::new("token").expect("name fits"),
+                        expiry: 0,
+                        token_hash: PersonalAccessToken::hash_token(TOKEN)
+                            .as_bytes()
+                            .try_into()
+                            .expect("hash fits"),
+                    }
+                    .to_bytes(),
+                ))
+                .expect("token create applies");
+
+            let password_login = verify_login_credentials(&shard, "user", PASSWORD);
+            let token_login = verify_pat_credentials(&shard, TOKEN);
+
+            if refused {
+                assert!(matches!(
+                    password_login,
+                    Err(LoginRegisterError::InvalidCredentials)
+                ));
+                assert!(matches!(token_login, Err(LoginRegisterError::UserInactive)));
+            } else {
+                assert!(password_login.is_ok(), "{password_login:?}");
+                assert!(token_login.is_ok(), "{token_login:?}");
+            }
         }
     }
 
@@ -1451,7 +1533,7 @@ mod tests {
                 validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 preallocate_segments: false,
-                encryptor: None,
+                key_context: Arc::default(),
                 path_layout: PartitionPathLayout::default(),
             },
         );

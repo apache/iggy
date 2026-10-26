@@ -20,7 +20,12 @@
 extension IggyClient {
     /// A stream by id or name, with its topics, or nil if it does not exist.
     public func getStream(_ streamID: Identifier) async throws -> StreamDetails? {
-        let lineage = try await requireAuthenticated()
+        try await getStream(streamID, lineage: nil)
+    }
+
+    /// ``getStream(_:)`` for a call pinned to `captured`.
+    func getStream(_ streamID: Identifier, lineage captured: UInt64?) async throws -> StreamDetails? {
+        let lineage = try await requireAuthenticated(under: captured)
         let body = try await send(.getStream, Requests.identifierOnly(streamID), lineage: lineage)
         return body.isEmpty ? nil : try Responses.streamDetails(body[...])
     }
@@ -32,16 +37,24 @@ extension IggyClient {
         return body.isEmpty ? [] : try Responses.streams(body[...])
     }
 
-    /// Creates a stream and returns it.
-    public func createStream(name: String) async throws -> StreamDetails {
-        let lineage = try await requireAuthenticated()
-        return try Responses.streamDetails(try await send(.createStream, try Requests.createStream(name: name), lineage: lineage)[...])
+    /// Creates a stream and returns it. A key in ``StreamCreateOptions/encryptionKey``
+    /// is refused before anything is sent unless it is exactly 32 bytes.
+    public func createStream(name: String, options: StreamCreateOptions = StreamCreateOptions()) async throws -> StreamDetails {
+        try await createStream(name: name, options: options, lineage: nil)
     }
 
-    /// Renames a stream.
-    public func updateStream(_ streamID: Identifier, name: String, options: StreamUpdateOptions = StreamUpdateOptions()) async throws {
+    /// ``createStream(name:options:)`` for a call pinned to `captured`.
+    func createStream(name: String, options: StreamCreateOptions = StreamCreateOptions(), lineage captured: UInt64?) async throws -> StreamDetails {
+        let payload = try Requests.createStream(name: name, options: try options.encode())
+        let lineage = try await requireAuthenticated(under: captured)
+        return try Responses.streamDetails(try await send(.createStream, payload, lineage: lineage)[...])
+    }
+
+    /// Updates a stream: renames it today. Unmentioned keys keep their values.
+    public func updateStream(_ streamID: Identifier, options: StreamUpdateOptions) async throws {
+        let payload = try Requests.updateResource(.stream(streamID), try options.toPatch())
         let lineage = try await requireAuthenticated()
-        _ = try await send(.updateStream, try Requests.updateStream(streamID: streamID, name: name, options: try options.encode()), lineage: lineage)
+        _ = try await send(.updateResource, payload, lineage: lineage)
     }
 
     /// Deletes a stream with every topic and message in it.
@@ -85,18 +98,26 @@ extension IggyClient {
     /// Creates a topic and returns it. Every knob rides `options`; an absent
     /// key resolves against the server's defaults.
     public func createTopic(streamID: Identifier, name: String, options: TopicCreateOptions = TopicCreateOptions()) async throws -> TopicDetails {
-        let lineage = try await requireAuthenticated()
+        try await createTopic(streamID: streamID, name: name, options: options, lineage: nil)
+    }
+
+    /// ``createTopic(streamID:name:options:)`` for a call pinned to `captured`.
+    func createTopic(
+        streamID: Identifier, name: String, options: TopicCreateOptions = TopicCreateOptions(), lineage captured: UInt64?
+    ) async throws -> TopicDetails {
+        let lineage = try await requireAuthenticated(under: captured)
         let payload = try Requests.createTopic(
             streamID: streamID, partitionsCount: options.partitionsCount ?? TopicCreateOptions.defaultPartitionsCount,
             name: name, options: try options.encode())
         return try Responses.topicDetails(try await send(.createTopic, payload, lineage: lineage)[...])
     }
 
-    /// Renames a topic and updates its updatable options.
-    public func updateTopic(streamID: Identifier, topicID: Identifier, name: String, options: TopicUpdateOptions = TopicUpdateOptions()) async throws {
+    /// Renames a topic, sets its updatable options, or resets them to their
+    /// defaults. Unmentioned keys keep their values.
+    public func updateTopic(streamID: Identifier, topicID: Identifier, options: TopicUpdateOptions) async throws {
+        let payload = try Requests.updateResource(.topic(stream: streamID, topic: topicID), try options.toPatch())
         let lineage = try await requireAuthenticated()
-        _ = try await send(
-            .updateTopic, try Requests.updateTopic(streamID: streamID, topicID: topicID, name: name, options: try options.encode()), lineage: lineage)
+        _ = try await send(.updateResource, payload, lineage: lineage)
     }
 
     /// Deletes a topic with every message in it.
@@ -198,9 +219,11 @@ extension IggyClient {
     }
 
     /// Creates a user and returns it.
-    public func createUser(username: String, password: String, status: UserStatus = .active, permissions: Permissions? = nil) async throws -> UserInfoDetails {
+    public func createUser(
+        username: String, password: String, status: UserStatus = .active, permissions: Permissions? = nil, options: UserCreateOptions = UserCreateOptions()
+    ) async throws -> UserInfoDetails {
+        let payload = try Requests.createUser(username: username, password: password, status: status, permissions: permissions, options: try options.encode())
         let lineage = try await requireAuthenticated()
-        let payload = try Requests.createUser(username: username, password: password, status: status, permissions: permissions)
         return try Responses.userDetails(try await send(.createUser, payload, lineage: lineage)[...])
     }
 
@@ -210,13 +233,12 @@ extension IggyClient {
         _ = try await send(.deleteUser, Requests.identifierOnly(userID), lineage: lineage)
     }
 
-    /// Changes a user's name and/or status; nil leaves a field as is.
-    public func updateUser(
-        _ userID: Identifier, username: String? = nil, status: UserStatus? = nil, options: UserUpdateOptions = UserUpdateOptions()
-    ) async throws {
+    /// Changes a user's name and/or status. Renaming the signed-in or
+    /// auto-login user moves the credentials later reconnects sign in with.
+    public func updateUser(_ userID: Identifier, options: UserUpdateOptions) async throws {
+        let payload = try Requests.updateResource(.user(userID), try options.toPatch())
         let lineage = try await requireAuthenticated()
-        _ = try await send(
-            .updateUser, try Requests.updateUser(userID: userID, username: username, status: status, options: try options.encode()), lineage: lineage)
+        _ = try await send(.updateResource, payload, lineage: lineage)
     }
 
     /// Replaces a user's permissions; nil removes them all.

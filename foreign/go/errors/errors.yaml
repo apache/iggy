@@ -1097,6 +1097,38 @@
       type: uint64
     - name: Expected
       type: uint64
+- name: OptionNotUpdatable
+  code: 4103
+  format: "option cannot be updated after creation: %s"
+  fields:
+    - name: Key
+      type: string
+- name: OptionNotResettable
+  code: 4104
+  format: "option cannot be reset: %s"
+  fields:
+    - name: Key
+      type: string
+- name: ReadOnlyOption
+  code: 4105
+  format: "option is read-only: %s"
+  fields:
+    - name: Key
+      type: string
+- name: StreamEncryptionUnavailable
+  code: 4106
+  format: "stream encryption key requires a server encryption key"
+  fields: []
+- name: UnsupportedCriticalOption
+  code: 4107
+  format: "unsupported critical option: %s"
+  fields:
+    - name: Key
+      type: string
+- name: CannotModifyRootUser
+  code: 4108
+  format: "cannot modify root user"
+  fields: []
 - name: ConsumerGroupIdNotFound
   code: 5000
   format: "consumer group with id: %d for topic with id: %d was not found."

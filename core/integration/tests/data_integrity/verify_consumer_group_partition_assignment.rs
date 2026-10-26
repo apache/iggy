@@ -113,7 +113,10 @@ async fn should_not_duplicate_partition_assignments_after_stale_client_cleanup(
         .unwrap();
 
     // 1. Create stream, topic with 3 partitions, consumer group
-    root_client.create_stream(STREAM_NAME).await.unwrap();
+    root_client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     root_client
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
@@ -775,7 +778,10 @@ async fn should_handle_partition_delete_while_multiple_consumers_polling(harness
     let root_client = harness.root_client().await.unwrap();
 
     // Start with 6 partitions
-    root_client.create_stream(STREAM_NAME).await.unwrap();
+    root_client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     root_client
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
@@ -913,7 +919,10 @@ async fn should_reach_even_distribution_after_multiple_joins(harness: &TestHarne
     let root_client = harness.root_client().await.unwrap();
 
     // Start with 6 partitions for cleaner math
-    root_client.create_stream(STREAM_NAME).await.unwrap();
+    root_client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     root_client
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
@@ -1316,7 +1325,10 @@ async fn should_handle_delete_partitions_with_uncommitted_work(harness: &TestHar
     let root_client = harness.root_client().await.unwrap();
 
     // Create with 6 partitions
-    root_client.create_stream(STREAM_NAME).await.unwrap();
+    root_client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     root_client
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
@@ -1659,7 +1671,10 @@ async fn should_rebalance_after_deleting_partitions(harness: &TestHarness) {
     let root_client = harness.root_client().await.unwrap();
 
     // Create with 6 partitions
-    root_client.create_stream(STREAM_NAME).await.unwrap();
+    root_client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     root_client
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
@@ -1943,7 +1958,10 @@ async fn should_not_duplicate_after_reconnect_without_heartbeat(harness: &TestHa
         .unwrap();
 
     // 1. Setup
-    root_client.create_stream(STREAM_NAME).await.unwrap();
+    root_client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     root_client
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
@@ -2084,7 +2102,10 @@ async fn should_not_duplicate_partition_assignments_after_client_reconnect(harne
         .expect("Failed to get root client");
 
     // 1. Create stream, topic with 3 partitions, consumer group
-    root_client.create_stream(STREAM_NAME).await.unwrap();
+    root_client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     root_client
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
@@ -2286,7 +2307,10 @@ async fn setup_stream_topic_cg(client: &IggyClient) {
 }
 
 async fn setup_stream_topic_cg_with_partitions(client: &IggyClient, partitions: u32) {
-    client.create_stream(STREAM_NAME).await.unwrap();
+    client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     client
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),

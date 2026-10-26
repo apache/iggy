@@ -66,8 +66,50 @@ func rename(t *testing.T) credentialChange {
 	return credentialChange{
 		request: &command.UpdateUser{UserID: user, Username: &username},
 		typed: func(ctx context.Context, client *IggyTcpClient) error {
-			return client.UpdateUser(ctx, user, &username, nil)
+			return client.UpdateUser(ctx, user, iggcon.UserUpdate{Username: &username})
 		},
+	}
+}
+
+// otherRename is a patch that names something other than the signed-in user.
+func otherRename(t *testing.T, name string) credentialChange {
+	t.Helper()
+	newName := renamedUsername
+	switch name {
+	case "other_user":
+		user := numericIdentifier(t, signedInUserID+1)
+		return credentialChange{
+			request: &command.UpdateUser{UserID: user, Username: &newName},
+			typed: func(ctx context.Context, client *IggyTcpClient) error {
+				return client.UpdateUser(ctx, user, iggcon.UserUpdate{Username: &newName})
+			},
+		}
+	case "status_only":
+		user := numericIdentifier(t, signedInUserID)
+		status := iggcon.Active
+		return credentialChange{
+			request: &command.UpdateUser{UserID: user, Status: &status},
+			typed: func(ctx context.Context, client *IggyTcpClient) error {
+				return client.UpdateUser(ctx, user, iggcon.UserUpdate{Status: &status})
+			},
+		}
+	case "stream":
+		stream := numericIdentifier(t, signedInUserID)
+		return credentialChange{
+			request: &command.UpdateStream{StreamId: stream, Name: &newName},
+			typed: func(ctx context.Context, client *IggyTcpClient) error {
+				return client.UpdateStream(ctx, stream, iggcon.StreamUpdate{Name: &newName})
+			},
+		}
+	default:
+		stream := numericIdentifier(t, signedInUserID)
+		topic := numericIdentifier(t, signedInUserID)
+		return credentialChange{
+			request: &command.UpdateTopic{StreamId: stream, TopicId: topic, Name: &newName},
+			typed: func(ctx context.Context, client *IggyTcpClient) error {
+				return client.UpdateTopic(ctx, stream, topic, iggcon.TopicUpdate{Name: &newName})
+			},
+		}
 	}
 }
 
@@ -110,12 +152,12 @@ func credentialServer(t *testing.T, change func(attempt int, read request) []byt
 			return clusterMetadataFrame(t, 0, server.address())
 		case read.code() == uint32(command.PingCode) && evict.CompareAndSwap(true, false):
 			return evictionFrame(vsr.EvictionSessionError, 0, 0)
-		case read.operation() == vsr.OperationChangePassword || read.operation() == vsr.OperationUpdateUser:
+		case read.operation() == vsr.OperationChangePassword || read.operation() == vsr.OperationUpdateResource:
 			mtx.Lock()
 			attempt := attempts[read.requestID()]
 			attempts[read.requestID()]++
 			mtx.Unlock()
-			return change(attempt, read)
+			return resolvedReply(change(attempt, read), read)
 		default:
 			return replyFrame(read.operation(), nil)
 		}
@@ -161,8 +203,24 @@ func requireSignInAgain(t *testing.T, client *IggyTcpClient, server *testListene
 	require.Equal(t, []string{username, password}, names, "the username and password of the new sign-in")
 }
 
+// resolvedReply stamps a committed patch reply with the operation prepare
+// rewrites it to, as a server does: 73 for a topic, 72 for a stream, 74 for a
+// user, chosen by the scope byte that leads the request body.
+func resolvedReply(reply []byte, read request) []byte {
+	if read.operation() != vsr.OperationUpdateResource || reply[220] != 1 || len(read.payload) == 0 {
+		return reply
+	}
+	resolved := map[byte]vsr.Operation{
+		byte(iggcon.OptionsScopeTopic):  vsr.OperationUpdateTopicResolved,
+		byte(iggcon.OptionsScopeStream): vsr.OperationUpdateStreamResolved,
+		byte(iggcon.OptionsScopeUser):   vsr.OperationUpdateUserResolved,
+	}[read.payload[0]]
+	reply[replyFrameOffsetOperation] = byte(resolved)
+	return reply
+}
+
 func credentialChanges(reads []request) int {
-	return len(requestsFor(reads, vsr.OperationChangePassword)) + len(requestsFor(reads, vsr.OperationUpdateUser))
+	return len(requestsFor(reads, vsr.OperationChangePassword)) + len(requestsFor(reads, vsr.OperationUpdateResource))
 }
 
 func TestCredentialChange_CommittedChangeIsTheNextSignIn(t *testing.T) {
@@ -199,6 +257,52 @@ func TestCredentialChange_CommittedChangeIsTheNextSignIn(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestCredentialChange_GenericUserPatch(t *testing.T) {
+	t.Run("given_logged_in_user_rename_when_reconnecting_should_keep_new_username", func(t *testing.T) {
+		for _, raw := range []bool{false, true} {
+			for _, autoLogin := range []bool{false, true} {
+				t.Run(fmt.Sprintf("self_rename/raw_%t/auto_login_%t", raw, autoLogin), func(t *testing.T) {
+					server, evict := credentialServer(t, func(_ int, read request) []byte {
+						return committedReply(read, 0)
+					})
+					client := signedInClient(t, server, autoLogin)
+
+					require.NoError(t, rename(t).send(t, client, raw))
+
+					require.Len(t, requestsFor(server.recorded(), vsr.OperationUpdateResource), 1,
+						"a rename travels as the generic patch")
+					requireSignInAgain(t, client, server, evict, renamedUsername, signInPassword)
+				})
+
+				t.Run(fmt.Sprintf("rejected_rename/raw_%t/auto_login_%t", raw, autoLogin), func(t *testing.T) {
+					server, evict := credentialServer(t, func(_ int, read request) []byte {
+						return committedReply(read, ierror.UserAlreadyExistsCode)
+					})
+					client := signedInClient(t, server, autoLogin)
+
+					err := rename(t).send(t, client, raw)
+
+					require.ErrorIs(t, err, ierror.ErrUserAlreadyExists)
+					requireSignInAgain(t, client, server, evict, signInUsername, signInPassword)
+				})
+
+				for _, name := range []string{"other_user", "status_only", "stream", "topic"} {
+					t.Run(fmt.Sprintf("%s/raw_%t/auto_login_%t", name, raw, autoLogin), func(t *testing.T) {
+						server, evict := credentialServer(t, func(_ int, read request) []byte {
+							return committedReply(read, 0)
+						})
+						client := signedInClient(t, server, autoLogin)
+
+						require.NoError(t, otherRename(t, name).send(t, client, raw))
+
+						requireSignInAgain(t, client, server, evict, signInUsername, signInPassword)
+					})
+				}
+			}
+		}
+	})
 }
 
 func TestCredentialChange_CommittedRejectionKeepsTheNextSignIn(t *testing.T) {

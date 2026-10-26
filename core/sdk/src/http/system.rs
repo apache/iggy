@@ -24,6 +24,7 @@ use iggy_common::Stats;
 use iggy_common::SystemClient;
 use iggy_common::get_snapshot::GetSnapshot;
 use iggy_common::{ClientInfo, ClientInfoDetails};
+use iggy_common::{MetadataChanges, MetadataChangesQuery};
 use iggy_common::{OptionSpec, OptionsScope};
 use iggy_common::{SnapshotCompression, SystemSnapshotType};
 
@@ -31,6 +32,7 @@ const PING: &str = "/ping";
 const CLIENTS: &str = "/clients";
 const STATS: &str = "/stats";
 const SNAPSHOT: &str = "/snapshot";
+const METADATA_CHANGES: &str = "/metadata/changes";
 
 #[async_trait]
 impl SystemClient for HttpClient {
@@ -110,5 +112,19 @@ impl SystemClient for HttpClient {
             .map_err(|_| IggyError::InvalidBytesResponse)?;
         let snapshot = Snapshot::new(file.to_vec());
         Ok(snapshot)
+    }
+
+    async fn get_metadata_changes(
+        &self,
+        query: &MetadataChangesQuery,
+    ) -> Result<MetadataChanges, IggyError> {
+        query.validate()?;
+        let response = self
+            .get_with_query(METADATA_CHANGES, &query.http_query_pairs())
+            .await?;
+        response
+            .json()
+            .await
+            .map_err(|_| IggyError::InvalidJsonResponse)
     }
 }

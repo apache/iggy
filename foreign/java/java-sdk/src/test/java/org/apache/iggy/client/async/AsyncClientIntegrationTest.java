@@ -37,7 +37,6 @@ import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.message.SendMessagesResponse;
 import org.apache.iggy.serde.CommandCode;
-import org.apache.iggy.topic.CompressionAlgorithm;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -112,14 +111,7 @@ public class AsyncClientIntegrationTest extends BaseIntegrationTest {
         try {
             client.streams().createStream(streamName).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
             client.topics()
-                    .createTopic(
-                            streamId,
-                            2L,
-                            CompressionAlgorithm.None,
-                            BigInteger.ZERO,
-                            BigInteger.ZERO,
-                            "test-topic",
-                            PERSISTED_TOPIC_OPTIONS)
+                    .createTopic(streamId, "test-topic", 2L, PERSISTED_TOPIC_OPTIONS)
                     .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
             List<Message> messages = new ArrayList<>();
@@ -167,14 +159,7 @@ public class AsyncClientIntegrationTest extends BaseIntegrationTest {
         try {
             client.streams().createStream(streamName).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
             client.topics()
-                    .createTopic(
-                            streamId,
-                            2L,
-                            CompressionAlgorithm.None,
-                            BigInteger.ZERO,
-                            BigInteger.ZERO,
-                            "test-topic",
-                            PERSISTED_TOPIC_OPTIONS)
+                    .createTopic(streamId, "test-topic", 2L, PERSISTED_TOPIC_OPTIONS)
                     .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
             // when — send messages concurrently from multiple threads
@@ -230,14 +215,7 @@ public class AsyncClientIntegrationTest extends BaseIntegrationTest {
         try {
             client.streams().createStream(streamName).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
             client.topics()
-                    .createTopic(
-                            streamId,
-                            2L,
-                            CompressionAlgorithm.None,
-                            BigInteger.ZERO,
-                            BigInteger.ZERO,
-                            "test-topic",
-                            PERSISTED_TOPIC_OPTIONS)
+                    .createTopic(streamId, "test-topic", 2L, PERSISTED_TOPIC_OPTIONS)
                     .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
             // when — send messages in concurrent batches
@@ -297,14 +275,7 @@ public class AsyncClientIntegrationTest extends BaseIntegrationTest {
         try {
             client.streams().createStream(streamName).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
             client.topics()
-                    .createTopic(
-                            stream,
-                            1L,
-                            CompressionAlgorithm.None,
-                            BigInteger.ZERO,
-                            BigInteger.ZERO,
-                            "large-replies",
-                            PERSISTED_TOPIC_OPTIONS)
+                    .createTopic(stream, "large-replies", 1L, PERSISTED_TOPIC_OPTIONS)
                     .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
             for (int index = 0; index < PAUSED_READER_REQUESTS; index++) {
                 String payload = String.valueOf((char) ('a' + index)).repeat(LARGE_REPLY_BYTES);

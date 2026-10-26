@@ -594,10 +594,10 @@ pub(in crate::http) mod tests {
     use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
     use iggy_binary_protocol::requests::messages::SendMessagesHeader;
     use iggy_binary_protocol::requests::streams::{
-        CreateStreamRequest, DeleteStreamRequest, UpdateStreamRequest,
+        CreateStreamRequest, DeleteStreamRequest, UpdateStreamResolvedRequest,
     };
     use iggy_binary_protocol::requests::topics::{
-        CreateTopicRequest, CreateTopicWithAssignmentsRequest, UpdateTopicRequest,
+        CreateTopicRequest, CreateTopicWithAssignmentsRequest, UpdateTopicResolvedRequest,
     };
     use iggy_binary_protocol::requests::users::{
         CreateUserRequest, DeleteUserRequest, UpdatePermissionsRequest,
@@ -609,7 +609,11 @@ pub(in crate::http) mod tests {
         WireName, WireOptions,
     };
     use iggy_common::create_personal_access_token::CreatePersonalAccessToken;
-    use iggy_common::{IggyByteSize, IggyError, IggyTimestamp, UserStatus};
+    use iggy_common::defaults::DEFAULT_ROOT_USER_ID as ROOT_USER_ID;
+    use iggy_common::{
+        IggyByteSize, IggyError, IggyTimestamp, MetadataChangeCursor, MetadataChangePhase,
+        MetadataChangeStatus, UserStatus,
+    };
     use message_bus::IggyMessageBus;
     use message_bus::installer::conn_info::ClientTransportKind;
     use message_bus::transports::tls::install_default_crypto_provider;
@@ -618,6 +622,7 @@ pub(in crate::http) mod tests {
     use metadata::stm::StateHandler;
     use metadata::stm::authz::GatedApply;
     use metadata::stm::stream::StreamsInner;
+    use metadata::stm::user::ROOT_USER_CREATED_AT_MICROS;
     use metadata::stm::user::{CreatePersonalAccessTokenRequest, PAT_TOKEN_HASH_BYTES};
     use partitions::{IggyPartitions, PartitionPathLayout, PartitionsConfig};
     use send_wrapper::SendWrapper;
@@ -643,7 +648,7 @@ pub(in crate::http) mod tests {
     use crate::http::error::{ConsistencyQuery, WriteError};
     use crate::http::extractor::{Authenticated, Identity};
     use crate::http::handlers::{
-        create_pat, get_client, get_clients, get_metrics, get_stats, get_user,
+        create_pat, get_client, get_clients, get_metadata_changes, get_metrics, get_stats, get_user,
     };
     use crate::http::metrics::HttpMetrics;
     use crate::http::relay_proof::RelayKey;
@@ -757,6 +762,93 @@ pub(in crate::http) mod tests {
         }
     }
 
+    #[compio::test]
+    async fn given_metadata_changes_requests_over_http_should_refuse_bad_queries_and_answer_pages()
+    {
+        let state = read_state();
+        commit_user_request(
+            &state,
+            READER_CREATED_AT,
+            Operation::CreateUser,
+            &create_reader_request().to_bytes(),
+        );
+        let metadata = state.shard.plane.metadata();
+        metadata
+            .change_log()
+            .append(
+                &PrepareHeader {
+                    op: 1,
+                    checksum: 0x5eed,
+                    ..PrepareHeader::default()
+                },
+                Vec::new(),
+            )
+            .unwrap();
+        metadata.advance_applied_frontier(1);
+        let query = |pairs: &[(&str, &str)]| {
+            Query(
+                pairs
+                    .iter()
+                    .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        let reader = authenticated_identity(&state, READER_ID, READER_CREATED_AT).await;
+        let denied = get_metadata_changes(State(state.clone()), reader, query(&[]))
+            .await
+            .into_response();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        for refused in [
+            &[("from", "latest"), ("from", "latest")][..],
+            &[("from", "earliest"), ("cursor", "mc1_")],
+            &[("from", "earliest"), ("since", "5"), ("until", "4")],
+            &[("from", "latest"), ("since", "1")],
+            &[("from", "current"), ("until", "1")],
+            &[("from", "current"), ("groups", "topics")],
+            &[("after", "mc1_not-a-cursor")],
+            &[("current_after", "cs1_AAAA")],
+            &[("from", "earliest"), ("limit", "0")],
+            &[("from", "earliest"), ("limit", "1001")],
+            &[("from", "earliest"), ("limit", "01")],
+            &[("from", "earliest"), ("limit", "+5")],
+            &[("from", "earliest"), ("groups", "streams,,users")],
+            &[("from", "earliest"), ("groups", "nope")],
+        ] {
+            let root =
+                authenticated_identity(&state, ROOT_USER_ID, ROOT_USER_CREATED_AT_MICROS).await;
+            let response = get_metadata_changes(State(state.clone()), root, query(refused))
+                .await
+                .into_response();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{refused:?}");
+        }
+
+        let root = authenticated_identity(&state, ROOT_USER_ID, ROOT_USER_CREATED_AT_MICROS).await;
+        let Ok(Json(latest)) =
+            get_metadata_changes(State(state.clone()), root, query(&[("from", "latest")])).await
+        else {
+            panic!("root reads the feed");
+        };
+        assert_eq!(latest.status, MetadataChangeStatus::Ok);
+        assert_eq!(latest.log_id, Some(0x5eed));
+        assert_eq!(latest.next, Some(MetadataChangeCursor::zero(0x5eed)));
+
+        let root = authenticated_identity(&state, ROOT_USER_ID, ROOT_USER_CREATED_AT_MICROS).await;
+        let Ok(Json(users)) = get_metadata_changes(
+            State(state.clone()),
+            root,
+            query(&[("from", "current"), ("groups", "users")]),
+        )
+        .await
+        else {
+            panic!("root reads the current state");
+        };
+        assert_eq!(users.phase, MetadataChangePhase::Current);
+        assert_eq!(users.items.len(), 2, "root and the reader");
+        assert_eq!(users.current_page_token, None);
+    }
+
     /// The client reads gather from every shard after their gate, and the
     /// account behind the token can change during the gather.
     #[compio::test]
@@ -838,8 +930,8 @@ pub(in crate::http) mod tests {
                 (true, true, None),
                 (false, true, None),
                 (false, true, Some(Operation::DeleteStream)),
-                (false, true, Some(Operation::UpdateStream)),
-                (false, true, Some(Operation::UpdateTopic)),
+                (false, true, Some(Operation::UpdateStreamResolved)),
+                (false, true, Some(Operation::UpdateTopicResolved)),
             ] {
                 let (sender, shard_inbox, _shard_replies) = shard_channel(0, 1, 1);
                 let state = read_state_on(Some(sender), None);
@@ -885,6 +977,7 @@ pub(in crate::http) mod tests {
                                 context: metadata.context(0),
                                 fragments: Vec::new().into(),
                                 current_offset: 0,
+                                encryptor: None,
                             }
                         }
                         PartitionRead::ConsumerOffsetOnPrimary { .. } => {
@@ -923,17 +1016,19 @@ pub(in crate::http) mod tests {
                             stream_id: WireIdentifier::numeric(0),
                         }
                         .to_bytes(),
-                        Operation::UpdateStream => UpdateStreamRequest {
+                        Operation::UpdateStreamResolved => UpdateStreamResolvedRequest {
                             stream_id: WireIdentifier::numeric(0),
-                            name: WireName::new("renamed").unwrap(),
-                            options: WireOptions::empty(),
+                            name: Some(WireName::new("renamed").unwrap()),
+                            explicit_options: WireOptions::empty(),
+                            derived_options: WireOptions::empty(),
                         }
                         .to_bytes(),
-                        Operation::UpdateTopic => UpdateTopicRequest {
+                        Operation::UpdateTopicResolved => UpdateTopicResolvedRequest {
                             stream_id: WireIdentifier::numeric(0),
                             topic_id: WireIdentifier::numeric(0),
-                            name: WireName::new("renamed").unwrap(),
-                            options: WireOptions::empty(),
+                            name: Some(WireName::new("renamed").unwrap()),
+                            explicit_options: WireOptions::empty(),
+                            derived_options: WireOptions::empty(),
                         }
                         .to_bytes(),
                         _ => unreachable!(),
@@ -1107,6 +1202,7 @@ pub(in crate::http) mod tests {
                 context: metadata.context(0),
                 fragments: Vec::new().into(),
                 current_offset: 0,
+                encryptor: None,
             },
             PartitionRead::ConsumerOffsetOnPrimary { .. } => PartitionReadReply::ConsumerOffset {
                 stored: Some(0),
@@ -1228,11 +1324,12 @@ pub(in crate::http) mod tests {
 
             commit(
                 &mut inner,
-                &UpdateTopicRequest {
+                &UpdateTopicResolvedRequest {
                     stream_id: WireIdentifier::named("events").unwrap(),
                     topic_id: WireIdentifier::named("orders").unwrap(),
-                    name: WireName::new("renamed").unwrap(),
-                    options: WireOptions::empty(),
+                    name: Some(WireName::new("renamed").unwrap()),
+                    explicit_options: WireOptions::empty(),
+                    derived_options: WireOptions::empty(),
                 },
             );
             let replacement_topic = create_topic(&mut inner, "events", "orders", 2);
@@ -1243,10 +1340,11 @@ pub(in crate::http) mod tests {
             if rename_stream {
                 commit(
                     &mut inner,
-                    &UpdateStreamRequest {
+                    &UpdateStreamResolvedRequest {
                         stream_id: WireIdentifier::named("events").unwrap(),
-                        name: WireName::new("renamed-stream").unwrap(),
-                        options: WireOptions::empty(),
+                        name: Some(WireName::new("renamed-stream").unwrap()),
+                        explicit_options: WireOptions::empty(),
+                        derived_options: WireOptions::empty(),
                     },
                 );
                 let replacement_stream = create_stream(&mut inner, "events");
@@ -1629,7 +1727,7 @@ pub(in crate::http) mod tests {
                 validate_checksum: config.partition.validate_checksum,
                 segment_size: IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
                 preallocate_segments: iggy_common::DEFAULT_PREALLOCATE_SEGMENTS,
-                encryptor: None,
+                key_context: Arc::default(),
                 path_layout: PartitionPathLayout::default(),
             },
         );

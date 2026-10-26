@@ -338,7 +338,7 @@ internal sealed class ConsensusSession
 
         _registerPending = true;
 
-        return new SessionFrame(_clientId, 0, 0);
+        return new SessionFrame(_clientId, 0, 0, RandomRequestIdentifier());
     }
 
     private SessionFrame RequestFrameLocked(VsrOperation operation)
@@ -354,7 +354,23 @@ internal sealed class ConsensusSession
         var requestId = _requestCounter;
         _requestCounter = checked(_requestCounter + 1);
 
-        return new SessionFrame(_clientId, requestId, sessionId);
+        var requestChecksum = operation != VsrOperation.NonReplicated
+            && (byte)operation < (byte)VsrOperation.SendMessages
+            ? RandomRequestIdentifier() : UInt128.Zero;
+        return new SessionFrame(_clientId, requestId, sessionId, requestChecksum);
+    }
+
+    private static UInt128 RandomRequestIdentifier()
+    {
+        Span<byte> bytes = stackalloc byte[16];
+        UInt128 identifier;
+        do
+        {
+            RandomNumberGenerator.Fill(bytes);
+            identifier = BinaryPrimitives.ReadUInt128LittleEndian(bytes);
+        } while (identifier == UInt128.Zero);
+
+        return identifier;
     }
 
     private void ReArmLocked()
@@ -388,4 +404,5 @@ internal sealed class ConsensusSession
 }
 
 /// <summary>The session identity one request header is encoded from, resolved as a single atomic snapshot.</summary>
-internal readonly record struct SessionFrame(UInt128 ClientId, ulong RequestId, ulong SessionId);
+internal readonly record struct SessionFrame(UInt128 ClientId, ulong RequestId, ulong SessionId,
+    UInt128 RequestChecksum = default);

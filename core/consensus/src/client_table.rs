@@ -1527,6 +1527,16 @@ impl ClientTable {
     pub fn count(&self) -> usize {
         self.index.len()
     }
+
+    /// Sessions not yet ended, as `(client_id, user_id, epoch)` in slot order.
+    /// Never the bind verifier or a cached reply.
+    pub fn active_sessions(&self) -> impl Iterator<Item = (u128, u32, u64)> + '_ {
+        self.slots
+            .iter()
+            .flatten()
+            .filter(|entry| entry.ended_op.is_none())
+            .map(|entry| (entry.client_id, entry.user_id, entry.epoch))
+    }
 }
 
 /// Failure decoding the state-transfer WIRE encoding of a client table
@@ -1857,7 +1867,9 @@ impl ClientEntry {
                     || (ended == self.latest_commit
                         && !matches!(
                             header.operation,
-                            Operation::Logout | Operation::UpdateUser | Operation::DeleteUser
+                            Operation::Logout
+                                | Operation::UpdateUserResolved
+                                | Operation::DeleteUser
                         ))
             })
         {
@@ -2029,6 +2041,22 @@ mod tests {
             ..ReplyHeader::default()
         };
         msg
+    }
+
+    #[test]
+    fn given_ended_and_live_sessions_when_listing_active_should_yield_only_live_identities() {
+        let mut table = ClientTable::new(8);
+        for (client, user, epoch) in [(1, 11, 10), (2, 22, 20), (3, 11, 30)] {
+            table
+                .commit_register(client, user, [0x5a; 32], make_register_reply(client, epoch))
+                .unwrap();
+        }
+        table.end_user_sessions(22, 40);
+
+        let mut active: Vec<_> = table.active_sessions().collect();
+        active.sort_unstable();
+
+        assert_eq!(active, [(1, 11, 10), (3, 11, 30)]);
     }
 
     #[test]
@@ -2245,7 +2273,7 @@ mod tests {
         let secret = [0x5a; BIND_SECRET_BYTES];
         for self_revocation in [
             None,
-            Some(Operation::UpdateUser),
+            Some(Operation::UpdateUserResolved),
             Some(Operation::DeleteUser),
         ] {
             let mut table = ClientTable::new(1);
@@ -2296,6 +2324,73 @@ mod tests {
         }
     }
 
+    #[test]
+    fn given_self_deactivation_through_generic_patch_when_validating_protection_should_accept_resolved_operation()
+     {
+        const CLIENT: u128 = 7;
+        const EPOCH: u64 = 10;
+        const END: u64 = 40;
+        let secret = [0x5a; BIND_SECRET_BYTES];
+        for (operation, accepted) in [
+            (Operation::UpdateUserResolved, true),
+            (Operation::UpdateStreamResolved, false),
+            (Operation::UpdateTopicResolved, false),
+        ] {
+            let mut table = ClientTable::new(1);
+            table
+                .commit_register(
+                    CLIENT,
+                    TEST_USER_ID,
+                    bind_verifier(CLIENT, TEST_USER_ID, &secret),
+                    make_register_reply(CLIENT, EPOCH),
+                )
+                .unwrap();
+            table.commit_reply(CLIENT, TEST_USER_ID, make_reply_for(CLIENT, 5, END - 1));
+            assert_eq!(table.end_user_sessions(TEST_USER_ID, END).len(), 1);
+            let receipt = make_reply_for(CLIENT, 6, END).transmute_header(|old, header| {
+                *header = old;
+                header.operation = operation;
+            });
+            table.commit_reply(CLIENT, TEST_USER_ID, receipt);
+            assert_eq!(
+                ClientTable::from_snapshot(table.to_snapshot()).is_ok(),
+                accepted,
+                "{operation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_resolved_update_receipt_when_retrying_client_operation_should_return_cached_reply() {
+        for resolved in [
+            Operation::UpdateStreamResolved,
+            Operation::UpdateTopicResolved,
+            Operation::UpdateUserResolved,
+        ] {
+            let (mut table, epoch) = table_with_client();
+            let reply = make_reply_for(1, 1, 11).transmute_header(|old, header| {
+                *header = old;
+                header.operation = resolved;
+            });
+            table.commit_reply(1, TEST_USER_ID, reply.clone());
+            for restored in [
+                ClientTable::from_snapshot(table.to_snapshot()).unwrap(),
+                ClientTable::decode(&table.encode()).unwrap(),
+            ] {
+                let RequestStatus::Duplicate(cached) =
+                    restored.check_request(1, epoch, 1, Operation::UpdateResource)
+                else {
+                    panic!("lost the receipt for {resolved:?}");
+                };
+                assert_eq!(cached.into_message().as_slice(), reply.as_slice());
+                assert!(matches!(
+                    restored.check_request(1, epoch, 1, Operation::DeleteStream),
+                    RequestStatus::OperationMismatch { .. }
+                ));
+            }
+        }
+    }
+
     /// A request admitted before its user's revocation committed commits
     /// right behind it. Its session already ended, so the op stays uncertain.
     #[test]
@@ -2308,7 +2403,7 @@ mod tests {
         let secret = [0x5a; BIND_SECRET_BYTES];
         for self_revocation in [
             None,
-            Some(Operation::UpdateUser),
+            Some(Operation::UpdateUserResolved),
             Some(Operation::DeleteUser),
         ] {
             let mut table = ClientTable::new(2);
@@ -2729,7 +2824,7 @@ mod tests {
                 };
                 assert_eq!(cached.into_message().as_slice(), reply.as_slice());
                 assert!(matches!(
-                    restored.check_request(1, epoch, 1, Operation::UpdateStream),
+                    restored.check_request(1, epoch, 1, Operation::UpdateResource),
                     RequestStatus::OperationMismatch { .. }
                 ));
             }

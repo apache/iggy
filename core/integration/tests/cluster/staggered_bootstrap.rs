@@ -102,7 +102,7 @@ async fn given_replica_zero_arrives_late_when_producing_to_a_fresh_topic_should_
         .await
         .expect("root client on the metadata leader");
     let created_stream = setup
-        .create_stream(STREAM_NAME)
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
         .await
         .expect("create stream");
     let stream_id = Identifier::named(STREAM_NAME).expect("stream identifier");

@@ -101,7 +101,7 @@ use consensus::{MetadataHandle, is_settled_primary};
 use cyper::IntoUrl;
 use futures::{Stream, StreamExt};
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
-use iggy_common::{IggyError, IggyTimestamp};
+use iggy_common::{IggyError, IggyTimestamp, erase_buffer};
 use message_bus::MessageBus;
 use message_bus::transports::tls::load_pem;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -920,9 +920,12 @@ async fn forward_or_pass(state: HttpState, request: Request, next: Next) -> Resp
         );
     };
     let Some(_guard) = ForwardGuard::admit(&state.forward.in_flight) else {
+        erase_buffer(body);
         return forward_busy();
     };
     let response = forward(&state, &parts, &body, deadline).await;
+    // Kept for retries, so it may hold a create body's plaintext stream key.
+    erase_buffer(body);
     record_relayed_floor(&state, user_id, &response);
     response
 }
@@ -2383,6 +2386,7 @@ mod tests {
                 context: metadata.context(READER_CREATED_AT),
                 fragments: Vec::new().into(),
                 current_offset: 0,
+                encryptor: None,
             })
             .expect("the poll waits for its reply");
         assert_eq!(

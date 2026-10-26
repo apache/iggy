@@ -252,7 +252,7 @@ func TestExchange_PreservesUncertaintyAfterALaterRefusal(t *testing.T) {
 	}
 	frame, err := appendCommandFrame(nil, request)
 	require.NoError(t, err)
-	_, err = client.drive(context.Background(), request.Code(), nil, frame, nil)
+	_, err = client.drive(context.Background(), request.Code(), nil, frame, nil, nil)
 	require.NoError(t, err, "a later refusal must not escape as permission to register a fresh identity")
 	allRecorded := server.recorded()
 	recorded := allRecorded[:0]
@@ -290,7 +290,7 @@ func TestExchange_RetriesALifecycleRefusalAsANewRequest(t *testing.T) {
 	join := lifecycleBusyJoin(t)
 	frame, err := appendCommandFrame(nil, join)
 	require.NoError(t, err)
-	response, err := client.drive(context.Background(), join.Code(), nil, frame, &captured)
+	response, err := client.drive(context.Background(), join.Code(), nil, frame, &captured, nil)
 	require.NoError(t, err)
 	assert.Equal(t, []byte("joined"), response)
 
@@ -865,7 +865,7 @@ func TestSendMessages_RejectsAnEmptyBatch(t *testing.T) {
 func topicDetailsBody(t *testing.T, partitionsCount uint32) []byte {
 	t.Helper()
 
-	const nameLenOffset = 49
+	const nameLenOffset = 32
 	name := "orders"
 	body := make([]byte, nameLenOffset+1+len(name)+4+4)
 	binary.LittleEndian.PutUint32(body[0:4], 1)

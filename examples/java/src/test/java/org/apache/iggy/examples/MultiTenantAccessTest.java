@@ -29,7 +29,6 @@ import org.apache.iggy.exception.IggyConnectionException;
 import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.stream.StreamDetails;
-import org.apache.iggy.topic.CompressionAlgorithm;
 import org.apache.iggy.topic.TopicDetails;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
@@ -113,22 +112,19 @@ class MultiTenantAccessTest {
                         }
                     }
                     if (service == StreamsClient.class) {
-                        return Optional.of(
-                                new StreamDetails(0L, BigInteger.ZERO, stream, "0 B", BigInteger.ZERO, 0L, List.of()));
+                        return Optional.of(new StreamDetails(
+                                0L,
+                                BigInteger.ZERO,
+                                stream,
+                                "0 B",
+                                BigInteger.ZERO,
+                                0L,
+                                List.of(),
+                                Map.of(),
+                                Map.of()));
                     }
                     return Optional.of(new TopicDetails(
-                            0L,
-                            BigInteger.ZERO,
-                            "events",
-                            "0 B",
-                            BigInteger.ZERO,
-                            CompressionAlgorithm.None,
-                            BigInteger.ZERO,
-                            BigInteger.ZERO,
-                            0L,
-                            List.of(),
-                            Map.of(),
-                            Map.of()));
+                            0L, BigInteger.ZERO, "events", "0 B", BigInteger.ZERO, 0L, List.of(), Map.of(), Map.of()));
                 }));
     }
 

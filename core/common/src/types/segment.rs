@@ -73,7 +73,7 @@ impl Segment {
             IggyExpiry::NeverExpire => false,
             IggyExpiry::ServerDefault => false,
             IggyExpiry::ExpireDuration(duration) => {
-                self.end_timestamp + duration.as_micros() <= now.as_micros()
+                self.end_timestamp.saturating_add(duration.as_micros()) <= now.as_micros()
             }
         }
     }
@@ -103,5 +103,17 @@ mod tests {
             !seg.is_expired(now, expiry),
             "BUG: segment with end_timestamp=0 appears instantly expired"
         );
+    }
+
+    #[test]
+    fn segment_with_expiry_past_the_end_of_the_clock_should_not_appear_expired() {
+        let now = IggyTimestamp::now();
+        let mut seg = Segment::new(5000, IggyByteSize::from(128 * 1024 * 1024u64));
+        seg.sealed = true;
+        seg.end_timestamp = now.as_micros();
+
+        let expiry = IggyExpiry::ExpireDuration(IggyDuration::from(u64::MAX - 1));
+
+        assert!(!seg.is_expired(now, expiry));
     }
 }

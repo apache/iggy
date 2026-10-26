@@ -199,7 +199,8 @@ struct ClientTransportTests {
         #expect(requests[0].session == 0 && requests[0].requestID == 0 && requests[0].checksum != 0)
         #expect(requests[1].code == CommandCode.getClusterMetadata.rawValue)
         #expect(requests[2].code == CommandCode.ping.rawValue && requests[2].session == 1)
-        #expect(requests[3].session == 1 && requests[3].checksum == XXH3.hash64(requests[3].payload))
+        #expect(requests[3].session == 1 && requests[3].checksum != XXH3.hash64(requests[3].payload))
+        #expect(requests[3].checksum != requests[4].checksum)
         #expect(requests[5].checksum == 0)
         #expect(requests.allSatisfy { $0.clientID == requests[0].clientID })
         #expect(await client.serverAddress == server.address)
@@ -863,6 +864,55 @@ struct ClientTransportTests {
         #expect(await first.requests.filter { $0.operation == .deleteStream }.count == 1)
         #expect(await second.requests.filter { $0.operation == .deleteStream }.count == 1)
         #expect(await client.serverAddress == second.address)
+        await client.shutdown()
+    }
+
+    /// A write whose first attempt may have committed stays uncertain when
+    /// the failover after a later "not primary" fails: every node refusing
+    /// the sign-in mid view change must not turn it into "not accepted",
+    /// which a caller may resend under a new request id.
+    @Test func aFailedFailoverKeepsAnUncertainWriteUncertain() async throws {
+        let first = try await FakeVSRServer.started()
+        let second = try await FakeVSRServer.started()
+        defer {
+            Task {
+                await first.stop()
+                await second.stop()
+            }
+        }
+        let addresses = [first.address, second.address]
+        let viewChanging = Locked(false)
+        let attempts = Locked(0)
+        let refuseSignIn: @Sendable (FakeVSRServer.Request) -> FakeVSRServer.Reply? = { request in
+            guard request.operation == .register || request.code == CommandCode.bindSession.rawValue else { return nil }
+            return viewChanging.withLock { $0 } ? .status(IggyErrorCode.transientNotAccepted.rawValue) : FakeVSRServer.sessionReply(request)
+        }
+        await first.respond { request in
+            if let reply = refuseSignIn(request) { return reply }
+            if request.code == CommandCode.getClusterMetadata.rawValue {
+                return .ok(FakeVSRServer.rosterBody(addresses, leaderIndex: viewChanging.withLock { $0 } ? 1 : 0))
+            }
+            guard request.operation == .deleteStream else { return .ok([]) }
+            let attempt = attempts.withLock {
+                $0 += 1; return $0
+            }
+            if attempt == 1 {
+                return .status(IggyErrorCode.transientNotCommitted.rawValue)
+            }
+            viewChanging.withLock { $0 = true }
+            return .status(IggyErrorCode.notPrimary.rawValue)
+        }
+        await second.respond { request in
+            if let reply = refuseSignIn(request) { return reply }
+            if request.code == CommandCode.getClusterMetadata.rawValue { return .ok(FakeVSRServer.rosterBody(addresses, leaderIndex: 1)) }
+            return .ok([])
+        }
+        // One reconnect attempt, so the sweep gives up before the deadline.
+        let client = makeClient(first, maxRetries: 1)
+        try await client.connect()
+        await expectCode(.transientNotCommitted) { try await client.deleteStream(1) }
+        #expect(await first.requests.filter { $0.operation == .deleteStream }.count >= 2)
+        #expect(await second.requests.filter { $0.operation == .deleteStream }.isEmpty)
         await client.shutdown()
     }
 
@@ -2102,7 +2152,7 @@ struct ClientTransportTests {
         await Self.forgetSessions(on: server)
         let client = makeClient(server)
         try await client.connect()
-        try await client.updateUser("iggy", username: "renamed")
+        try await client.updateUser("iggy", options: UserUpdateOptions(username: "renamed"))
         await server.closeAllConnections()
         try await Task.sleep(for: .milliseconds(20))
         try await client.ping()
@@ -2119,6 +2169,22 @@ struct ClientTransportTests {
         let latest = await server.requests.filter { $0.operation == .register }.last!
         #expect(Self.username(in: latest.payload) == "renamed")
         #expect(Self.password(in: latest.payload) == "new-secret")
+        await client.shutdown()
+    }
+
+    @Test func rawUsernameRenameUpdatesTheReconnectCredentials() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        await Self.forgetSessions(on: server)
+        let client = makeClient(server)
+        try await client.connect()
+        try await client.updateUser("iggy", options: UserUpdateOptions(raw: [UserOptionKey.username.rawValue: "renamed"]))
+        await server.closeAllConnections()
+        try await Task.sleep(for: .milliseconds(20))
+        try await client.ping()
+        let registers = await server.requests.filter { $0.operation == .register }
+        #expect(registers.count == 2)
+        #expect(Self.username(in: registers[1].payload) == "renamed")
         await client.shutdown()
     }
 
@@ -2145,8 +2211,8 @@ struct ClientTransportTests {
         await Self.forgetSessions(on: server)
         let client = makeClient(server)
         try await client.connect()
-        let rename = try Requests.updateUser(userID: "iggy", username: "renamed", status: nil, options: [])
-        _ = try await client.sendRawRequest(code: CommandCode.updateUser.rawValue, payload: rename)
+        let rename = try Requests.updateResource(.user("iggy"), try UserUpdateOptions(username: "renamed").toPatch())
+        _ = try await client.sendRawRequest(code: CommandCode.updateResource.rawValue, payload: rename)
         await server.closeAllConnections()
         try await Task.sleep(for: .milliseconds(20))
         try await client.ping()

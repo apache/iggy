@@ -41,6 +41,7 @@ public sealed partial class TcpMessageStream
     private const int ConsumerSessionWatermarkOffset = 24;
     private const int IdentifierPrefixSize = 2;
     private const byte ConsumerGroupWireKind = 2;
+    private const byte StringKind = 2;
 
     private readonly object _pollRoutingGate = new();
     private readonly Dictionary<PartitionRouteKey, CachedRoute> _partitionRoutes = [];
@@ -176,7 +177,7 @@ public sealed partial class TcpMessageStream
 
     private async Task<IMemoryOwner<byte>> RunClientOperationAsync(int code, ReadOnlyMemory<byte> payload,
         PartitionContext? context, SendTarget? target, CancellationToken token, ClientOperation? retained = null,
-        TimeSpan? timeout = null, ulong? startedUnder = null)
+        TimeSpan? timeout = null, ulong? startedUnder = null, byte? replica = null)
     {
         using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(token, _clientLifetime.Token);
         var budget = timeout ?? TimeSpan.FromMilliseconds(VsrRequestTimeoutMs);
@@ -199,6 +200,7 @@ public sealed partial class TcpMessageStream
         var routingRetries = 0;
         var lastWasNotPrimary = false;
         var askMetadataPrimaryFirst = false;
+        var rosterRead = false;
         var terminal = false;
         var frameAcquired = false;
         var startOver = false;
@@ -301,6 +303,31 @@ public sealed partial class TcpMessageStream
                             continue;
                         }
                         connection = primary;
+                    }
+                    else if (replica is { } chosen)
+                    {
+                        if (await FindReadyReplicaAsync(chosen, cancellation.Token) is not { } ready)
+                        {
+                            bool known;
+                            lock (_pollRoutingGate)
+                            {
+                                known = _replicaLinks.ContainsKey(chosen);
+                            }
+                            if (!known && rosterRead)
+                            {
+                                throw VsrError.Exception(VsrError.INVALID_IDENTIFIER,
+                                    $"Cluster metadata names no replica {chosen}.");
+                            }
+                            if (!known)
+                            {
+                                rosterRead = true;
+                                await RefreshPartitionRosterAsync(deadline, cancellation.Token);
+                                continue;
+                            }
+                            await Task.Delay(PollRoutingRetryDelay(routingRetries++, Random.Shared.NextDouble()), cancellation.Token);
+                            continue;
+                        }
+                        connection = ready;
                     }
                     else if (_metadataReplica is { } metadataPrimary)
                     {
@@ -423,7 +450,8 @@ public sealed partial class TcpMessageStream
                     await Task.Delay(PollRoutingRetryDelay(routingRetries++, Random.Shared.NextDouble()), cancellation.Token);
                 }
                 catch (IggyInvalidStatusCodeException error) when (error.StatusCode is
-                    VsrError.TRANSIENT_NOT_ACCEPTED or VsrError.NOT_PRIMARY or VsrError.TRANSIENT_NOT_COMMITTED)
+                    VsrError.TRANSIENT_NOT_ACCEPTED or VsrError.TRANSIENT_NOT_COMMITTED
+                    || error.StatusCode == VsrError.NOT_PRIMARY && replica is null)
                 {
                     if (generation != _consensusSession.Generation && retained is null
                         && operation is not { Uncertain: true } && ResumesUnderNewSession(generation))
@@ -463,7 +491,7 @@ public sealed partial class TcpMessageStream
                         RemovePartitionRoute(failed.Key, error.StatusCode == VsrError.NOT_PRIMARY ? route : null);
                     }
                     await Task.Delay(pause, cancellation.Token);
-                    if (target is null)
+                    if (target is null && replica is null)
                     {
                         try
                         {
@@ -549,7 +577,8 @@ public sealed partial class TcpMessageStream
             {
                 ExceptionDispatchInfo.Throw(refusal);
             }
-            throw _consensusSession.Ended(generation) ?? PollNotAccepted();
+            throw _consensusSession.Ended(generation)
+                ?? (replica is { } chosen ? ReplicaNotAccepted(chosen) : PollNotAccepted());
         }
         catch (Exception error) when (error is IOException or SocketException
             && refusal is not null
@@ -914,25 +943,54 @@ public sealed partial class TcpMessageStream
     // Typed, raw and replayed calls share this success path, and only the request body carries the new credentials.
     private void RefreshCommittedCredentials(int code, ReadOnlySpan<byte> body, ulong generation)
     {
-        if (code is not (CommandCodes.CHANGE_PASSWORD_CODE or CommandCodes.UPDATE_USER_CODE))
-        {
-            return;
-        }
-
-        var position = 0;
-        var user = ReadIdentifier(body, ref position);
         if (code == CommandCodes.CHANGE_PASSWORD_CODE)
         {
+            var position = 0;
+            var user = ReadIdentifier(body, ref position);
             var currentPasswordLength = body[position];
             RefreshRememberedCredentials(user, null, ReadName(body, position + 1 + currentPasswordLength), generation);
         }
-        else if (body[position] == 1)
+        else if (code == CommandCodes.UPDATE_RESOURCE_CODE && body.Length > 0 && body[0] == (byte)OptionsScope.User)
         {
-            RefreshRememberedCredentials(user, ReadName(body, position + 1), null, generation);
+            var position = 1;
+            var user = ReadIdentifier(body, ref position);
+            var resetCount = body[position++];
+            for (var reset = 0; reset < resetCount; reset++)
+            {
+                position += 1 + body[position];
+            }
+
+            if (PatchedUsername(body[position..]) is { } username)
+            {
+                RefreshRememberedCredentials(user, username, null, generation);
+            }
         }
 
         static string ReadName(ReadOnlySpan<byte> body, int position) =>
             Encoding.UTF8.GetString(body.Slice(position + 1, body[position]));
+    }
+
+    /// <summary>The username a user update sets, read from the options block that ends its body.</summary>
+    private static string? PatchedUsername(ReadOnlySpan<byte> options)
+    {
+        var position = 0;
+        while (position < options.Length)
+        {
+            var keyKind = options[position];
+            var keyLength = BinaryPrimitives.ReadInt32LittleEndian(options[(position + 1)..]);
+            var key = options.Slice(position + 5, keyLength);
+            position += 5 + keyLength;
+            var valueKind = options[position];
+            var valueLength = BinaryPrimitives.ReadInt32LittleEndian(options[(position + 1)..]);
+            var value = options.Slice(position + 5, valueLength);
+            position += 5 + valueLength;
+            if (keyKind == StringKind && valueKind == StringKind && key.SequenceEqual("username"u8))
+            {
+                return Encoding.UTF8.GetString(value);
+            }
+        }
+
+        return null;
     }
 
     private void RefreshRememberedCredentials(Identifier user, string? username, string? password, ulong generation)
@@ -962,5 +1020,10 @@ public sealed partial class TcpMessageStream
     private static IggyInvalidStatusCodeException PollNotAccepted()
     {
         return VsrError.Exception(VsrError.TRANSIENT_NOT_ACCEPTED, "The primary poll was not admitted.");
+    }
+
+    private static IggyInvalidStatusCodeException ReplicaNotAccepted(byte replica)
+    {
+        return VsrError.Exception(VsrError.TRANSIENT_NOT_ACCEPTED, $"Replica {replica} did not answer before the deadline.");
     }
 }

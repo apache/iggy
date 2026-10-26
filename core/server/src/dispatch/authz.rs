@@ -121,14 +121,15 @@ where
                 | Operation::FinalizeSession
                 | Operation::RetireSession
                 | Operation::CompleteLifecycle
+                | Operation::RewrapStreamKeys
                 | Operation::TransitionPartitionHistory
                 | Operation::InstallConsumerGroupOwner
                 | Operation::RetireConsumerGroupOwners
                 | Operation::CreateStream
-                | Operation::UpdateStream
+                | Operation::UpdateStreamResolved
                 | Operation::DeleteStream
                 | Operation::CreateTopic
-                | Operation::UpdateTopic
+                | Operation::UpdateTopicResolved
                 | Operation::DeleteTopic
                 | Operation::CreatePartitions
                 | Operation::DeletePartitions
@@ -136,7 +137,8 @@ where
                 | Operation::CreateConsumerGroup
                 | Operation::DeleteConsumerGroup
                 | Operation::CreateUser
-                | Operation::UpdateUser
+                | Operation::UpdateUserResolved
+                | Operation::UpdateResource
                 | Operation::DeleteUser
                 | Operation::ChangePassword
                 | Operation::UpdatePermissions
@@ -461,8 +463,8 @@ mod tests {
     use iggy_binary_protocol::COMMAND_TABLE;
     use iggy_binary_protocol::codes::{
         BIND_SESSION_CODE, CREATE_STREAM_CODE, GET_CLIENT_CODE, GET_CLIENTS_CODE,
-        GET_CONSUMER_OFFSET_CODE, GET_ME_CODE, GET_PARTITION_ROUTE_CODE, GET_SNAPSHOT_FILE_CODE,
-        LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE, LOGIN_USER_CODE,
+        GET_CONSUMER_OFFSET_CODE, GET_ME_CODE, GET_METADATA_CHANGES_CODE, GET_PARTITION_ROUTE_CODE,
+        GET_SNAPSHOT_FILE_CODE, LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE, LOGIN_USER_CODE,
         LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE, LOGOUT_USER_CODE, PING_CODE, POLL_MESSAGES_CODE,
         SYNC_CONSUMER_GROUP_CODE,
     };
@@ -548,6 +550,7 @@ mod tests {
                 invalid_command,
             ),
             (DESCRIBE_OPTIONS_CODE, unauthenticated, allow),
+            (GET_METADATA_CHANGES_CODE, invalid_command, invalid_command),
         ]
     }
 

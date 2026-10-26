@@ -71,6 +71,19 @@ struct ConsensusSessionTests {
         #expect(!session.isBound)
     }
 
+    @Test func metadataRequestIdentifiersAreUniqueAndRetainedInRetryFrame() throws {
+        var session = ConsensusSession(clientID: 7)
+        try session.bind(42)
+        let payload: [UInt8] = [1, 2, 3]
+        let first = try VSRFrame.encodeRequest(session: &session, code: CommandCode.createStream.rawValue, payload: payload)
+        let second = try VSRFrame.encodeRequest(session: &session, code: CommandCode.createStream.rawValue, payload: payload)
+        let range = VSRFrame.RequestOffset.requestChecksum..<VSRFrame.RequestOffset.requestChecksum + 16
+        #expect(Array(first.bytes[range]) != Array(repeating: 0, count: 16))
+        #expect(Array(first.bytes[range]) != Array(second.bytes[range]))
+        let retry = first
+        #expect(Array(retry.bytes[range]) == Array(first.bytes[range]))
+    }
+
     /// A reconnect replays the Register on a bound session and binds to the
     /// fence the server returns again, without losing the request watermark.
     @Test func reconnectPreservesBindingAndRequestCounter() throws {
@@ -112,11 +125,11 @@ struct ConsensusSessionTests {
 @Suite("Command codes and operations")
 struct CommandCodeTests {
     @Test func retiredCodesStayUnknown() {
-        for code: UInt32 in [14, 102, 103, 104, 123, 124, 205, 305] {
+        for code: UInt32 in [14, 35, 102, 103, 104, 123, 124, 204, 205, 304, 305] {
             #expect(CommandCode(rawValue: code) == nil)
             #expect(ConsensusOperation.forCode(code) == .nonReplicated)
         }
-        for operation: UInt8 in [131, 135, 163, 164, 165] {
+        for operation: UInt8 in [129, 131, 133, 135, 142, 163, 164, 165] {
             #expect(ConsensusOperation(rawValue: operation) == nil)
         }
     }
@@ -142,12 +155,17 @@ struct CommandCodeTests {
             #expect(!operation.isMetadata)
             #expect(!operation.isResultFramed)
         }
-        for operation in [ConsensusOperation.finalizeSession, .completeLifecycle, .truncatePartition] {
+        for operation in [
+            ConsensusOperation.finalizeSession, .completeLifecycle, .truncatePartition, .updateStreamResolved, .updateTopicResolved,
+            .updateUserResolved, .rewrapStreamKeys,
+        ] {
             #expect(operation.isInternal)
             #expect(operation.isMetadata)
             #expect(!operation.isPartition)
         }
-        for operation in [ConsensusOperation.sendMessages, .storeConsumerOffset, .createStream, .register] {
+        #expect(ConsensusOperation.forCode(CommandCode.updateResource.rawValue) == .updateResource)
+        #expect(ConsensusOperation.updateResource.isMetadata && ConsensusOperation.updateResource.isResultFramed)
+        for operation in [ConsensusOperation.sendMessages, .storeConsumerOffset, .createStream, .register, .updateResource] {
             #expect(!operation.isInternal)
         }
     }

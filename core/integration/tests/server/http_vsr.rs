@@ -27,7 +27,7 @@ use iggy::prelude::*;
 use iggy_common::create_stream::CreateStream;
 use iggy_common::create_topic::CreateTopic;
 use iggy_common::store_consumer_offset::StoreConsumerOffset;
-use iggy_common::{ConsumerOffsetInfo, IggyMessagesBatch};
+use iggy_common::{ConsumerOffsetInfo, IggyMessagesBatch, OptionInputMap, OptionInputValue};
 use integration::iggy_harness;
 use reqwest::{Response, StatusCode};
 use serde_json::json;
@@ -110,6 +110,7 @@ impl HttpSessionExt for HttpClient {
             .bearer_auth(&self.token)
             .json(&CreateStream {
                 name: stream.to_string(),
+                options: OptionInputMap::default(),
             })
             .send()
             .await
@@ -123,17 +124,17 @@ impl HttpSessionExt for HttpClient {
         let command = CreateTopic {
             stream_id: Identifier::default(),
             partitions_count: partitions,
-            compression_algorithm: CompressionAlgorithm::None,
-            message_expiry: IggyExpiry::NeverExpire,
-            max_topic_size: MaxTopicSize::ServerDefault,
             name: topic.to_string(),
-            options: BTreeMap::from([
-                ("durability".to_string(), Durability::Persisted.to_string()),
+            options: OptionInputMap(BTreeMap::from([
+                (
+                    "durability".to_string(),
+                    OptionInputValue::String(Durability::Persisted.to_string().into()),
+                ),
                 (
                     "consumer_offset_durability".to_string(),
-                    Durability::Persisted.to_string(),
+                    OptionInputValue::String(Durability::Persisted.to_string().into()),
                 ),
-            ]),
+            ])),
         };
         let response = self
             .client
@@ -1207,7 +1208,10 @@ async fn given_independent_durability_policies_when_producing_should_attest_mess
     harness: &TestHarness,
 ) {
     let client = harness.tcp_root_client().await.unwrap();
-    client.create_stream("durability-http").await.unwrap();
+    client
+        .create_stream("durability-http", &StreamCreateOptions::default())
+        .await
+        .unwrap();
     let stream = Identifier::named("durability-http").unwrap();
     let http = HttpClient::login_root(harness).await;
     for (index, (message_policy, offset_policy)) in [
@@ -1226,13 +1230,16 @@ async fn given_independent_durability_policies_when_producing_should_attest_mess
             .bearer_auth(&http.token)
             .json(&CreateTopic {
                 name: topic.clone(),
-                options: BTreeMap::from([
-                    ("durability".to_string(), message_policy.to_string()),
+                options: OptionInputMap(BTreeMap::from([
+                    (
+                        "durability".to_string(),
+                        OptionInputValue::String(message_policy.to_string().into()),
+                    ),
                     (
                         "consumer_offset_durability".to_string(),
-                        offset_policy.to_string(),
+                        OptionInputValue::String(offset_policy.to_string().into()),
                     ),
-                ]),
+                ])),
                 ..CreateTopic::default()
             })
             .send()
@@ -1325,7 +1332,10 @@ async fn given_one_http_durability_option_when_creating_should_derive_the_other_
             .bearer_auth(&http.token)
             .json(&CreateTopic {
                 name: key.to_string(),
-                options: BTreeMap::from([(key.to_string(), "persisted".to_string())]),
+                options: OptionInputMap(BTreeMap::from([(
+                    key.to_string(),
+                    OptionInputValue::String("persisted".to_string().into()),
+                )])),
                 ..CreateTopic::default()
             })
             .send()
@@ -1354,7 +1364,10 @@ async fn given_http_sdk_when_sending_should_expose_the_advertised_durability(
     let address = harness.server().http_addr().unwrap();
     let client = iggy::http::http_client::HttpClient::new(&format!("http://{address}")).unwrap();
     client.login_user("iggy", "iggy").await.unwrap();
-    client.create_stream("sdk-durability").await.unwrap();
+    client
+        .create_stream("sdk-durability", &StreamCreateOptions::default())
+        .await
+        .unwrap();
     let stream = Identifier::named("sdk-durability").unwrap();
     client
         .create_topic(
@@ -1409,5 +1422,121 @@ async fn given_forwarding_off_when_a_follower_takes_a_write_should_refuse_at_onc
     assert!(
         elapsed < REFUSAL_BUDGET,
         "a follower refused after {elapsed:?}, the replay budget is not for backups"
+    );
+}
+
+/// A PUT body the update shape refuses answers the Iggy error JSON with
+/// `InvalidCommand`, the category the binary decoder gives the same patch,
+/// naming in `field` the member the shape refuses. A `null` member leaves its
+/// key unchanged.
+#[iggy_harness]
+async fn given_malformed_update_body_when_putting_should_reject_invalid_command(
+    harness: &TestHarness,
+) {
+    let http = HttpClient::login_root(harness).await;
+    http.create_stream_and_topic("http-put-shape", "shape", 1)
+        .await;
+    let path = "/streams/http-put-shape/topics/shape";
+    let stream_path = "/streams/http-put-shape";
+    let cases = [
+        (path, r#"{"name":"first","name":"second"}"#, Some("name")),
+        (
+            path,
+            r#"{"message_expiry":{"value":"1 day"}}"#,
+            Some("message_expiry"),
+        ),
+        (path, r#"["name"]"#, None),
+        (path, r#"{"reset":"message_expiry"}"#, Some("reset")),
+        (
+            path,
+            r#"{"message_expiry":"1 day","reset":["message_expiry"]}"#,
+            None,
+        ),
+        (path, r#"{}"#, None),
+        (
+            stream_path,
+            r#"{"name":"renamed","options":{}}"#,
+            Some("options"),
+        ),
+    ];
+    for (path, body, field) in cases {
+        let response = http
+            .client
+            .put(http.url(path))
+            .bearer_auth(&http.token)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .send()
+            .await
+            .expect("put request");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+        let error: serde_json::Value = response.json().await.expect("decode the error body");
+        assert_eq!(error["id"], IggyError::InvalidCommand.as_code(), "{body}");
+        assert_eq!(
+            error["code"],
+            IggyError::InvalidCommand.as_string(),
+            "{body}"
+        );
+        assert_eq!(error["field"], json!(field), "{body}");
+    }
+
+    let before: serde_json::Value = http.get(path).await.json().await.expect("topic json");
+    let response = http
+        .put_json(
+            path,
+            &json!({ "name": "shape-renamed", "message_expiry": null }),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let after: serde_json::Value = http
+        .get("/streams/http-put-shape/topics/shape-renamed")
+        .await
+        .json()
+        .await
+        .expect("topic json");
+    assert_eq!(after["options"], before["options"]);
+}
+
+/// An option placed beside `options` in a POST create body is refused, not
+/// dropped, so a stream never commits without the key its client sent. The
+/// error names the misplaced member in `field`.
+#[iggy_harness]
+async fn given_option_beside_options_when_creating_should_reject_invalid_command(
+    harness: &TestHarness,
+) {
+    let http = HttpClient::login_root(harness).await;
+    http.create_stream_and_topic("http-misplaced", "kept", 1)
+        .await;
+    let cases = [
+        (
+            "/streams",
+            json!({
+                "name": "misplaced-key",
+                "encryption_key": "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE="
+            }),
+            "encryption_key",
+        ),
+        (
+            "/streams/http-misplaced/topics",
+            json!({ "name": "misplaced-expiry", "partitions_count": 1, "message_expiry": "7 days" }),
+            "message_expiry",
+        ),
+    ];
+    for (path, body, field) in cases {
+        let response = http.post_json(path, &body).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+        let error: serde_json::Value = response.json().await.expect("decode the error body");
+        assert_eq!(error["id"], IggyError::InvalidCommand.as_code(), "{body}");
+        assert_eq!(error["field"], field, "{body}");
+    }
+    assert_eq!(
+        http.get("/streams/misplaced-key").await.status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        http.get("/streams/http-misplaced/topics/misplaced-expiry")
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
     );
 }

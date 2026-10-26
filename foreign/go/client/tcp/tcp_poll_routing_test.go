@@ -634,7 +634,7 @@ func TestPrimaryPoll_ManualIdentityAndChangedCredentialsBindNewDataConnections(t
 	_, err = pollPrimaryPartition(context.Background(), fixture.client, 0)
 	require.NoError(t, err)
 	newName := "renamed"
-	require.NoError(t, fixture.client.UpdateUser(context.Background(), numericIdentifier(t, 7), &newName, nil))
+	require.NoError(t, fixture.client.UpdateUser(context.Background(), numericIdentifier(t, 7), iggcon.UserUpdate{Username: &newName}))
 	named, err := iggcon.NewIdentifier(newName)
 	require.NoError(t, err)
 	require.NoError(t, fixture.client.ChangePassword(context.Background(), named, "manual-secret", "changed-secret"))
@@ -656,7 +656,7 @@ func TestPrimaryPoll_ManualIdentityAndChangedCredentialsBindNewDataConnections(t
 func TestPrimaryPoll_ConfiguredCredentialsFollowSuccessfulSelfUpdates(t *testing.T) {
 	fixture := newPrimaryPollFixture(t, nil, nil)
 	newName := "renamed"
-	require.NoError(t, fixture.client.UpdateUser(context.Background(), numericIdentifier(t, 7), &newName, nil))
+	require.NoError(t, fixture.client.UpdateUser(context.Background(), numericIdentifier(t, 7), iggcon.UserUpdate{Username: &newName}))
 	name, err := iggcon.NewIdentifier(newName)
 	require.NoError(t, err)
 	require.NoError(t, fixture.client.ChangePassword(context.Background(), name, "secret", "changed-secret"))

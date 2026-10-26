@@ -220,6 +220,56 @@ final class PollRouter: Sendable {
         }
     }
 
+    /// Sends a non-replicated request to `replica` and returns its answer.
+    /// The request carries the session's metadata watermark. On a single node
+    /// it goes over the coordinator, in a cluster over a data connection to
+    /// the replica, bound to the client's session. A replica the roster does
+    /// not list after one more roster read fails with `invalidIdentifier`. A
+    /// lost connection or a `transientNotAccepted` refusal sends the request
+    /// to the same replica again until `deadline`, which ends the call with
+    /// the last refusal. Any other answer, `notPrimary` included, is the
+    /// caller's, as the caller chose the replica.
+    func sendToReplica(
+        _ replica: UInt8, code: UInt32, payload: [UInt8], lineage: UInt64, coordinator: ClientCore, deadline: ContinuousClock.Instant
+    ) async throws -> [UInt8] {
+        _ = try await isClustered(coordinator, lineage: lineage, deadline: deadline)
+        if state.withLockedValue({ $0.nodes[replica] }) == nil {
+            try await readRoster(coordinator, lineage: lineage, deadline: deadline)
+        }
+        let (listed, clustered) = state.withLockedValue { ($0.nodes[replica] != nil, $0.nodes.count > 1) }
+        guard listed else {
+            throw IggyError(.invalidIdentifier, context: "the cluster roster does not list replica \(replica)")
+        }
+        guard clustered else {
+            return try await coordinator.exchange(code: code, payload: payload, deadline: deadline, lineage: lineage)
+        }
+        let clock = ContinuousClock()
+        var backoff = Backoff()
+        var refusal = IggyError(.transientNotAccepted, context: "the budget ran out before command \(code) reached replica \(replica)")
+        while clock.now < deadline {
+            let watermark = await coordinator.metadataWatermark
+            guard let identity = await coordinator.sessionIdentity(at: watermark) else {
+                throw IggyError(.unauthenticated, context: "no session is bound to send command \(code) to replica \(replica)")
+            }
+            let fence = state.withLockedValue { $0.fence }
+            do {
+                return try await exchange(
+                    onReplica: replica, code: code, payload: payload, context: ClientCore.readContext(watermark), identity: identity,
+                    lineage: lineage, fence: fence, coordinator: coordinator, deadline: deadline,
+                    dialDeadline: min(deadline, .now + ClientCore.failoverDialTimeout))
+            } catch let unsent as UnsentRequest {
+                guard unsent.refusal.code == .transientNotAccepted else {
+                    throw unsent.refusal
+                }
+                refusal = unsent.refusal
+            } catch let error as IggyError where error.code == .transientNotAccepted || error.code == .transientNotCommitted {
+                refusal = error
+            }
+            try await backoff.pause(after: refusal, before: deadline)
+        }
+        throw refusal
+    }
+
     /// The pauses between the refused attempts of one request: from
     /// `retryInterval`, doubling up to `maxRetryInterval`.
     struct Backoff {

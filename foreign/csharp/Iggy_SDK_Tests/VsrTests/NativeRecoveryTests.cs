@@ -1222,7 +1222,7 @@ public sealed partial class NativeRecoveryTests
         }
         var change = changePassword
             ? client.ChangePasswordAsync(Identifier.String("user"), "secret", "rotated", cancellation.Token)
-            : client.UpdateUserAsync(Identifier.String("user"), "renamed", token: cancellation.Token);
+            : client.UpdateUserAsync(Identifier.String("user"), new UserUpdate { Username = "renamed" }, cancellation.Token);
         if (resolve)
         {
             var uncertain = await Assert.ThrowsAsync<VsrRequestOutcomeUnknownException>(() => change);
@@ -1252,6 +1252,72 @@ public sealed partial class NativeRecoveryTests
 
         var registration = Assert.Single(registrations);
         Assert.Equal(LoginRegister.Serialize(username, password, LoginRegister.ReadBindSecret(registration.Body)),
+            registration.Body);
+    }
+
+    /// <summary>
+    ///     Every update commits under the resolved operation of its scope. Only a committed username change of the
+    ///     signed-in user moves the credentials recovery signs in with. A rejected rename, a rename of another
+    ///     user and a stream or topic rename all keep them.
+    /// </summary>
+    [Theory]
+    [InlineData("self", 0, "renamed")]
+    [InlineData("self", VsrError.UNAUTHORIZED, "user")]
+    [InlineData("other", 0, "user")]
+    [InlineData("stream", 0, "user")]
+    [InlineData("topic", 0, "user")]
+    public async Task given_logged_in_user_rename_when_reconnecting_should_keep_new_username(string target,
+        int status, string username)
+    {
+        using var cluster = new RecoveryCluster();
+        using var client = await cluster.ConnectAsync(heartbeat: TimeSpan.FromMilliseconds(25));
+        var resolved = target switch
+        {
+            "stream" => VsrOperation.UpdateStreamResolved,
+            "topic" => VsrOperation.UpdateTopicResolved,
+            _ => VsrOperation.UpdateUserResolved
+        };
+        var updates = new ConcurrentQueue<MockRequest>();
+        cluster.OnMetadata = request =>
+        {
+            updates.Enqueue(request);
+            var reply = Result(request, status);
+            reply[REPLY_OPERATION_OFFSET] = (byte)resolved;
+            return reply;
+        };
+        var update = target switch
+        {
+            "self" => client.UpdateUserAsync(Identifier.String("user"), new UserUpdate { Username = "renamed" },
+                cluster.Token),
+            "other" => client.UpdateUserAsync(Identifier.String("someone"), new UserUpdate { Username = "renamed" },
+                cluster.Token),
+            "stream" => client.UpdateStreamAsync(Stream, new StreamUpdate { Name = "renamed" }, cluster.Token),
+            _ => client.UpdateTopicAsync(Stream, Topic, new TopicUpdate { Name = "renamed" }, cluster.Token)
+        };
+        if (status == 0)
+        {
+            await update;
+        }
+        else
+        {
+            Assert.True((await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() => update)).Committed);
+        }
+
+        Assert.Equal((byte)VsrOperation.UpdateResource, Assert.Single(updates).Operation);
+        var registrations = new ConcurrentQueue<MockRequest>();
+        cluster.BeforeReply = (request, _) =>
+        {
+            if (request.Operation == (byte)VsrOperation.Register)
+            {
+                registrations.Enqueue(request);
+            }
+        };
+
+        cluster.PingEviction = EvictionReason.SessionError;
+        await cluster.UntilAsync(() => !registrations.IsEmpty);
+
+        var registration = Assert.Single(registrations);
+        Assert.Equal(LoginRegister.Serialize(username, "secret", LoginRegister.ReadBindSecret(registration.Body)),
             registration.Body);
     }
 
@@ -1628,7 +1694,7 @@ public sealed partial class NativeRecoveryTests
     private static Task WriteAsync(TcpMessageStream client, bool send, CancellationToken token) => send
         ? client.SendMessagesAsync(Stream, Topic, Partitioning.PartitionId(0),
             new Message(Guid.NewGuid(), "payload"u8.ToArray()), token)
-        : client.CreateStreamAsync("created", token);
+        : client.CreateStreamAsync("created", token: token);
 
     private static Task PartitionWriteAsync(TcpMessageStream client, bool send, CancellationToken token) => send
         ? WriteAsync(client, send: true, token)

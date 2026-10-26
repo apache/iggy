@@ -41,8 +41,8 @@ use crate::reply_frame::{
 use crate::shell::{ShellBus, ShellShard};
 use crate::wire::request_body;
 use bytes::Bytes;
+use consensus::MetadataHandle;
 use consensus::client_table::SessionAttachment;
-use consensus::{MetadataHandle, PartitionsHandle};
 use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::codes::{GET_CONSUMER_OFFSET_CODE, POLL_MESSAGES_CODE};
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
@@ -673,8 +673,8 @@ pub(in crate::dispatch) async fn handle_poll_messages<B, MJ, S, SB>(
 /// Run the resolved poll on the owning shard and re-encode the stored
 /// batches into the wire `PolledMessages` reply. Owner rejections preserve
 /// their error; a missing reply reports a communication error without claiming
-/// that the owner rejected the read. Unexpected replies and encoding failures
-/// retain the empty poll fallback.
+/// that the owner rejected the read. Decrypt and encoding failures deny with
+/// their error. Unexpected replies retain the empty poll fallback.
 #[allow(clippy::future_not_send)]
 async fn read_polled_messages<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
@@ -750,6 +750,7 @@ where
             context,
             fragments,
             current_offset,
+            encryptor,
         }) => build_polled_messages_reply(
             request.header(),
             current_metadata_commit(shard),
@@ -757,15 +758,17 @@ where
             current_offset,
             context,
             fragments,
-            shard.plane.partitions().config().encryptor.as_deref(),
+            encryptor.as_deref(),
         )
         .map_err(|error| {
+            // An empty poll would read as caught up, so a batch that cannot be
+            // decrypted or re-encoded must surface as an error.
             warn!(
                 transport_client_id,
                 error = %error,
-                "failed to re-encode polled batches; replying empty poll"
+                "failed to decrypt or re-encode polled batches; replying denied"
             );
-            ReadPolledMessagesError::Fallback(empty_poll_fallback(partition_id))
+            ReadPolledMessagesError::Rejected(error)
         }),
         Some(PartitionReadReply::Rejected(error)) => Err(ReadPolledMessagesError::Rejected(error)),
         None => {
@@ -1515,8 +1518,8 @@ mod tests {
     use super::*;
     use crate::dispatch::test_support::{
         SpyBus, TestMux, TestShard, create_consumer_group, create_one_partition,
-        create_reader_request, prepare_message, register_reply, request_message, test_shard,
-        test_shard_with_frontier,
+        create_reader_request, prepare_message, register_reply, request_message,
+        stored_batch_record, test_shard, test_shard_with_frontier,
     };
     use crate::dispatch::tests::non_replicated_request;
     use crate::dispatch::{
@@ -1527,6 +1530,7 @@ mod tests {
     use crate::shell::ShellShardHandle;
     use bytes::BytesMut;
     use configs::server::ServerConfig;
+    use consensus::PartitionsHandle;
     #[cfg(target_os = "linux")]
     use consensus::Sequencer;
     use iggy_binary_protocol::codes::PING_CODE;
@@ -1545,8 +1549,8 @@ mod tests {
         Command, ConsensusHeader, GenericHeader, PrepareOkHeader, ReplyHeader, SegmentDeleteHeader,
         SegmentDeleteKind, WireEncode, WireIdentifier, WireName, WireOptions, WirePartitioning,
     };
-    use iggy_common::Identifier;
     use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
+    use iggy_common::{Aes256GcmEncryptor, EncryptorKind, Identifier};
     use journal::prepare_journal::PrepareJournal;
     use message_bus::{BusReceiver, IggyMessageBus, Shutdown, ShutdownToken};
     use metadata::IggyMetadata;
@@ -1556,7 +1560,9 @@ mod tests {
         CompleteConsumerGroupRevocationRequest, JoinConsumerGroupRequest,
     };
     use metadata::stm::lifecycle::{CompleteLifecycleRequest, LifecycleCompletion};
-    use partitions::{IggyPartitions, PartitionPathLayout, PartitionsConfig};
+    use partitions::{
+        Fragment, IggyPartitions, PartitionPathLayout, PartitionsConfig, PollFragments,
+    };
     use server_common::MessageBag;
     use server_common::sharding::{PartitionLocation, ShardId};
     use shard::metrics::{ShardMetrics, frame_drop_reason, frame_drop_variant};
@@ -2826,6 +2832,55 @@ mod tests {
     }
 
     #[compio::test]
+    async fn given_decrypt_failure_when_building_poll_reply_should_return_rejected_error() {
+        let bus = SpyBus::default();
+        let encryptor = Arc::new(EncryptorKind::Aes256Gcm(
+            Aes256GcmEncryptor::new(&[7; 32]).expect("valid key"),
+        ));
+        let mut shard = test_shard(&bus, 0, 1, 1);
+        let (sender, owner_inbox, _owner_replies) = shard_channel(0, 1, 1);
+        shard.attach_senders(vec![sender]);
+        let shard = Rc::new(shard);
+        let namespace = route_one_partition(&shard);
+
+        // The first stored record was written in plaintext, the second with
+        // the partition's key: only the second may be served.
+        let owner_task = compio::runtime::spawn(async move {
+            for record in [
+                stored_batch_record(None),
+                stored_batch_record(Some(&encryptor)),
+            ] {
+                let ShardFrame::Lifecycle(LifecycleFrame::PartitionRead { reply, .. }) =
+                    owner_inbox.recv().await.unwrap()
+                else {
+                    panic!("the poll must have reached the owner");
+                };
+                reply
+                    .try_send(PartitionReadReply::Poll {
+                        context: PartitionContext::default(),
+                        fragments: PollFragments::from_iter([Fragment::whole(record)]),
+                        current_offset: 1,
+                        encryptor: Some(Arc::clone(&encryptor)),
+                    })
+                    .expect("the caller still awaits the reply");
+            }
+        });
+
+        let attachment = attach_root_session(&shard, 1, 1);
+        assert!(matches!(
+            poll_attached(&shard, namespace, &attachment).await,
+            Err(ReadPolledMessagesError::Rejected(
+                IggyError::CannotDecryptData
+            ))
+        ));
+        let reply = poll_attached(&shard, namespace, &attachment)
+            .await
+            .unwrap_or_else(|_| panic!("a record encrypted with the shard key must decrypt"));
+        assert!(reply.total_len() > size_of::<ReplyHeader>());
+        owner_task.await.expect("the owner task must finish");
+    }
+
+    #[compio::test]
     async fn given_pending_poll_when_owner_reply_times_out_should_report_unknown_acceptance() {
         const TRANSPORT_CLIENT_ID: u128 = 91;
         const VSR_CLIENT_ID: u128 = 1;
@@ -3799,7 +3854,7 @@ mod tests {
                 validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 preallocate_segments: false,
-                encryptor: None,
+                key_context: Arc::default(),
                 path_layout: PartitionPathLayout::default(),
             },
         );
@@ -3920,7 +3975,7 @@ mod tests {
                 validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 preallocate_segments: false,
-                encryptor: None,
+                key_context: Arc::default(),
                 path_layout: PartitionPathLayout::default(),
             },
         );
@@ -3964,7 +4019,7 @@ mod tests {
                 validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 preallocate_segments: false,
-                encryptor: None,
+                key_context: Arc::default(),
                 path_layout: PartitionPathLayout::default(),
             },
         );
@@ -4070,7 +4125,7 @@ mod tests {
                 validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 preallocate_segments: false,
-                encryptor: None,
+                key_context: Arc::default(),
                 path_layout: PartitionPathLayout::default(),
             },
         );
@@ -4241,12 +4296,35 @@ mod tests {
     /// `namespace`, so the poll metadata gate and the context fence pass for
     /// an existing partition.
     async fn poll_and_expect_error(shard: &Rc<TestShard>, namespace: IggyNamespace) -> IggyError {
+        match poll_once(shard, namespace).await {
+            Err(ReadPolledMessagesError::Rejected(error)) => error,
+            Err(ReadPolledMessagesError::Fallback(_)) => {
+                panic!("poll must not return an empty reply")
+            }
+            Ok(_) => panic!("poll must not succeed without an owner reply"),
+        }
+    }
+
+    /// One root-session poll of partition 0 of `namespace`, as the binary
+    /// transports resolve it.
+    async fn poll_once(
+        shard: &Rc<TestShard>,
+        namespace: IggyNamespace,
+    ) -> Result<BusMessage, ReadPolledMessagesError> {
+        let attachment = attach_root_session(shard, 1, 1);
+        poll_attached(shard, namespace, &attachment).await
+    }
+
+    async fn poll_attached(
+        shard: &Rc<TestShard>,
+        namespace: IggyNamespace,
+        attachment: &SessionAttachment,
+    ) -> Result<BusMessage, ReadPolledMessagesError> {
         let vsr_client_id = 1;
         let session = 1;
         let transport_client_id = 91;
         let consumer_id = 1;
         let partition_id = 0;
-        let attachment = attach_root_session(shard, vsr_client_id, session);
         let request = with_partition_incarnation(
             shard,
             namespace,
@@ -4258,22 +4336,15 @@ mod tests {
             PollingConsumer::Consumer(consumer_id, usize::try_from(partition_id).unwrap()),
             PollingArgs::new(PollingStrategy::offset(0), 1, true),
         );
-        match read_polled_messages(
+        read_polled_messages(
             shard,
             ClientOrigin::capture(&shard.bus, transport_client_id),
             &request,
             resolved_poll,
-            &attachment,
+            attachment,
             transport_client_id,
         )
         .await
-        {
-            Err(ReadPolledMessagesError::Rejected(error)) => error,
-            Err(ReadPolledMessagesError::Fallback(_)) => {
-                panic!("poll must not return an empty reply")
-            }
-            Ok(_) => panic!("poll must not succeed without an owner reply"),
-        }
     }
 
     /// The control of a routing refusal: the same poll reaches the owner
@@ -4505,7 +4576,7 @@ mod tests {
                 validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 preallocate_segments: false,
-                encryptor: None,
+                key_context: Arc::default(),
                 path_layout: PartitionPathLayout::default(),
             },
         );

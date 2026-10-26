@@ -31,6 +31,21 @@ const enter = (lanes: MutationLanes, state: VsrSession, lane: string,
   lanes.enter(lane, COMMAND_CODE.CreateStream, body, EMPTY_PARTITION_CONTEXT, true, state, deadline, signal);
 
 describe('mutation admission and retained ownership', () => {
+  it('retains the request identifier for a replay and mints one for a restart', async () => {
+    const lanes = new MutationLanes(1, frameSize);
+    const state = session();
+    const operation = await enter(lanes, state, 'metadata');
+    const span = [REQUEST_OFFSET.requestChecksum, REQUEST_OFFSET.requestChecksum + 16] as const;
+    const first = Buffer.from(operation.frame.buffer.subarray(...span));
+    const replay = operation.frame.buffer;
+    assert.deepEqual(replay.subarray(...span), first);
+
+    await lanes.restart(operation, body, EMPTY_PARTITION_CONTEXT, state, Date.now() + 1_000,
+      new AbortController().signal);
+    assert.notDeepEqual(operation.frame.buffer.subarray(...span), first);
+    lanes.complete(operation);
+  });
+
   it('retains one lane while independent groups keep their own order', async () => {
     const lanes = new MutationLanes(3, 3 * frameSize);
     const state = session();

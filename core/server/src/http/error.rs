@@ -77,6 +77,8 @@ impl IntoResponse for CustomError {
                     | IggyError::InvalidPersonalAccessToken => StatusCode::UNAUTHORIZED,
                     IggyError::Unauthorized => StatusCode::FORBIDDEN,
                     IggyError::PartitionHistoryChanged => StatusCode::CONFLICT,
+                    // Stored state this build cannot read, not a caller error.
+                    IggyError::UnsupportedCriticalOption(_) => StatusCode::INTERNAL_SERVER_ERROR,
                     // The write path ran out of replays of a request id whose
                     // op may still commit (see `submit::submit_committed`).
                     // HTTP mints a new id per request, so a resend could apply
@@ -234,6 +236,10 @@ impl IntoResponse for AuthError {
 /// business error or, worse, a 200 with a stale body.
 pub(in crate::http) enum WriteError {
     Rejected(IggyError),
+    /// A body member the request shape refuses, rendered as `InvalidCommand`
+    /// with the member named in `field`, because REST has no version handshake
+    /// to tell an older client why its body no longer fits.
+    MalformedMember(String),
     /// The VSR session was evicted (its client slot was reclaimed cluster-side,
     /// e.g. LRU-evicted from the full client table). Renders identically to a
     /// terminal `Rejected` (401 -> re-authenticate), but is a distinct variant
@@ -249,6 +255,14 @@ impl IntoResponse for WriteError {
             Self::Rejected(error) | Self::Evicted(error) => {
                 CustomError::from(error).into_response()
             }
+            Self::MalformedMember(member) => (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    field: Some(member),
+                    ..ErrorResponse::from_error(&IggyError::InvalidCommand)
+                }),
+            )
+                .into_response(),
             Self::Unavailable => service_unavailable(),
         }
     }
@@ -683,6 +697,22 @@ mod tests {
                 crate::cluster_meta::METADATA_VIEW_UNKNOWN,
             )),
         }
+    }
+
+    #[test]
+    fn given_unreadable_critical_option_when_rendering_read_error_should_answer_500() {
+        let response = ReadError::Rejected(IggyError::UnsupportedCriticalOption(
+            "future_key".to_owned(),
+        ))
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn given_root_guard_error_when_rendering_http_should_answer_400() {
+        let response = CustomError::Error(IggyError::CannotModifyRootUser).into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]

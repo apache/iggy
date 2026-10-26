@@ -20,8 +20,8 @@
 
 use crate::http::http_client::HttpClient;
 use crate::prelude::{
-    CompressionAlgorithm, HttpClientConfig, IggyByteSize, IggyError, IggyExpiry, IggyTimestamp,
-    MaxTopicSize, Partition, PartitionContext, StreamDetails, TopicDetails,
+    HttpClientConfig, IggyByteSize, IggyError, IggyTimestamp, Partition, PartitionContext,
+    StreamDetails, TopicDetails,
 };
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -204,9 +204,6 @@ pub(crate) fn topic_details_json(contexts: &[(u32, PartitionContext)]) -> String
         created_at: IggyTimestamp::zero(),
         name: "topic".to_owned(),
         size: IggyByteSize::default(),
-        message_expiry: IggyExpiry::NeverExpire,
-        compression_algorithm: CompressionAlgorithm::None,
-        max_topic_size: MaxTopicSize::Unlimited,
         messages_count: 0,
         partitions_count: u32::try_from(partitions.len()).unwrap(),
         partitions,

@@ -38,7 +38,7 @@ and why, answer review questions about it yourself, and defend the design withou
 back to the tool for an answer. If you can't, the PR isn't ready.
 
 If an AI assistant helped you write the change, review it with the
-[`team-review-slim`](.claude/skills/team-review-slim/SKILL.md) skill before you open the PR.
+[`team-review`](.claude/skills/team-review/SKILL.md) skill before you open the PR.
 The skill can report false findings. Fix every finding that is correct and that applies to
 your change.
 
@@ -221,6 +221,12 @@ ready, sets `S-waiting-on-review`. A "Request changes" review sets
 author. Closing a PR, or converting it to a draft, clears both. GitHub skips
 the lifecycle workflow on a PR with merge conflicts, so there these labels
 catch up on a schedule instead of straight away.
+
+When a PR is opened, including a draft, `PR Triage Apply` checks its author once.
+It adds `Prolific Author` if a human author opened PRs in more than 20 visible
+repositories over the last 30 days, unless they have at least 10 merged PRs in Iggy.
+This follows [Arrow-rs's criteria](https://github.com/apache/arrow-rs/issues/11808).
+The label is informational and is not removed automatically.
 
 Commands take up to ~90s. A 👍 reaction means applied, 😕 means you lacked
 permission; if neither shows up, check the `PR Triage Apply` run in the

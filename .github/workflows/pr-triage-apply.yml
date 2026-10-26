@@ -137,6 +137,15 @@ permissions:
   # artifact uploaded by the upstream PR Triage Collect run via run-id.
   actions: read
 
+concurrency:
+  # Shared with PR Skill Review Post: neither whole-label replacement may
+  # overwrite an addition made by the other workflow. The PR number is not
+  # available on workflow_run until the artifact has been resolved.
+  group: pr-label-writes-${{ github.repository }}
+  cancel-in-progress: false
+  # Retain pending open events and commands instead of replacing them.
+  queue: max
+
 jobs:
   resolve:
     if: github.event.workflow_run.conclusion == 'success'
@@ -426,6 +435,8 @@ jobs:
             const WELCOME_BODY = [
               WELCOME_MARKER,
               'Thanks for the PR. It is labeled `S-waiting-on-review` and queued for review.',
+              '',
+              'If AI was used to create this PR, you must run the [`team-review` skill](https://github.com/apache/iggy/blob/master/.claude/skills/team-review/SKILL.md) before opening it.',
               '',
               'Slash commands (own line, regular comment) move it around the queue:',
               '',
@@ -1222,3 +1233,94 @@ jobs:
             } else if (applied) {
               await react('+1');
             }
+
+      - name: Label prolific author on open
+        if: needs.resolve.outputs.lifecycle_action == 'opened'
+        env:
+          PR_NUMBER: ${{ needs.resolve.outputs.pr_number }}
+        uses: actions/github-script@v9
+        with:
+          script: |
+            // Criteria from https://github.com/apache/arrow-rs/issues/11808
+            // and its attached label_prolific.py. This label is add-only.
+            const LABEL_NAME = 'Prolific Author';
+            const LABEL_COLOR = '5319E7';
+            const LABEL_DESCRIPTION = 'author has opened PRs in many repositories in the last month';
+            const LOOKBACK_DAYS = 30;
+            const REPOSITORY_THRESHOLD = 20;
+            const EXEMPT_MERGED_PRS = 10;
+            const MAX_REPOSITORIES = 100;
+            const prNumber = Number(process.env.PR_NUMBER);
+            const { data: opened } = await github.rest.pulls.get({
+              ...context.repo,
+              pull_number: prNumber,
+            });
+            const author = opened.user;
+            if (author?.type !== 'User') return;
+
+            const until = new Date();
+            const since = new Date(until);
+            since.setUTCDate(since.getUTCDate() - LOOKBACK_DAYS);
+
+            // A failed lookup must not turn an unknown merged count into
+            // a missing exemption. GraphQL errors fail before any writes.
+            const { user, search } = await github.graphql(`
+              query($login: String!, $since: DateTime!, $until: DateTime!,
+                    $maxRepositories: Int!, $mergedQuery: String!) {
+                user(login: $login) {
+                  contributionsCollection(from: $since, to: $until) {
+                    pullRequestContributionsByRepository(maxRepositories: $maxRepositories) {
+                      repository { nameWithOwner }
+                    }
+                  }
+                }
+                search(type: ISSUE, first: 0, query: $mergedQuery) { issueCount }
+              }
+            `, {
+              login: author.login,
+              since: since.toISOString(),
+              until: until.toISOString(),
+              maxRepositories: MAX_REPOSITORIES,
+              mergedQuery: `repo:${context.repo.owner}/${context.repo.repo} is:pr is:merged author:${author.login}`,
+            });
+            if (!user) {
+              core.warning(`Skipping unavailable author ${author.login}`);
+              return;
+            }
+            const repositories = user.contributionsCollection.pullRequestContributionsByRepository.length;
+            const merged = search.issueCount;
+            core.info(`${author.login}: ${repositories} repositories, ${merged} merged PRs`);
+            const isProlific = repositories > REPOSITORY_THRESHOLD && merged < EXEMPT_MERGED_PRS;
+            if (!isProlific) return;
+
+            // The issue check above may have closed the PR, and a rerun may
+            // find the label already applied.
+            const { data: pr } = await github.rest.pulls.get({
+              ...context.repo,
+              pull_number: prNumber,
+            });
+            if (pr.state !== 'open' || pr.labels.some(label => label.name === LABEL_NAME)) return;
+
+            try {
+              await github.rest.issues.getLabel({ ...context.repo, name: LABEL_NAME });
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              try {
+                await github.rest.issues.createLabel({
+                  ...context.repo,
+                  name: LABEL_NAME,
+                  color: LABEL_COLOR,
+                  description: LABEL_DESCRIPTION,
+                });
+              } catch (error) {
+                if (error.status !== 422) throw error;
+                // Accept a concurrent creation only if the label exists.
+                await github.rest.issues.getLabel({ ...context.repo, name: LABEL_NAME });
+              }
+            }
+            await github.rest.issues.addLabels({
+              ...context.repo,
+              issue_number: pr.number,
+              labels: [LABEL_NAME],
+            });
+            core.info(`Labeled #${pr.number} (${author.login})`);

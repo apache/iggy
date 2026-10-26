@@ -168,7 +168,7 @@ func TestDecodeReplyFor_RejectsAFrameAboveTheTransportLimit(t *testing.T) {
 }
 
 func TestDecodeReplyFor_RejectsAnUndeclaredReplyOperation(t *testing.T) {
-	for _, operation := range []Operation{4, 63, 150, 163, 255} {
+	for _, operation := range []Operation{4, 63, 129, 133, 142, 151, 163, 255} {
 		request, reply := exchange(OperationNonReplicated, 0, 0)
 		reply[replyOffsetOperation] = byte(operation)
 
@@ -373,6 +373,45 @@ func TestDecodeReplyForRequiresCompleteFinalResultProof(t *testing.T) {
 	outcome, err = DecodeReplyFor(&request, &denied, body)
 	require.NoError(t, err)
 	require.False(t, outcome.Committed)
+}
+
+func TestDecodeReplyFor_ResolvedUpdate(t *testing.T) {
+	t.Run("given_resolved_update_reply_when_correlating_should_accept_only_matching_request_identity", func(t *testing.T) {
+		var request [HeaderSize]byte
+		EncodeRequestHeader(&request, RequestFields{Size: HeaderSize, Client: ClientID{Lo: 7, Hi: 9}, Request: 42, Operation: OperationUpdateResource, Session: 3})
+		request[requestOffsetChecksum] = 11
+		body := resultSection()
+		for _, resolved := range []Operation{OperationUpdateStreamResolved, OperationUpdateTopicResolved, OperationUpdateUserResolved} {
+			header := replyHeader(resolved, 0, len(body))
+			header[replyOffsetResult] = committedResult
+			copy(header[replyOffsetClient:replyOffsetClient+16], request[requestOffsetClient:requestOffsetClient+16])
+			copy(header[replyOffsetChecksum:replyOffsetChecksum+16], request[requestOffsetChecksum:requestOffsetChecksum+16])
+			binary.LittleEndian.PutUint64(header[replyOffsetRequest:], 42)
+			binary.LittleEndian.PutUint64(header[replyOffsetOp:], 17)
+			binary.LittleEndian.PutUint64(header[replyOffsetCommit:], 17)
+
+			outcome, err := DecodeReplyFor(&request, header, body)
+			require.NoError(t, err, "operation %d", resolved)
+			assert.True(t, outcome.Committed, "operation %d", resolved)
+			assert.NoError(t, outcome.Err, "operation %d", resolved)
+
+			for name, mismatch := range map[string]func(*[HeaderSize]byte){
+				"client":    func(reply *[HeaderSize]byte) { reply[replyOffsetClient] ^= 1 },
+				"checksum":  func(reply *[HeaderSize]byte) { reply[replyOffsetChecksum] ^= 1 },
+				"operation": func(reply *[HeaderSize]byte) { reply[replyOffsetOperation] = byte(OperationCreateTopicWithAssignments) },
+				"rewrap":    func(reply *[HeaderSize]byte) { reply[replyOffsetOperation] = byte(OperationRewrapStreamKeys) },
+			} {
+				unrelated := *header
+				mismatch(&unrelated)
+				_, err := DecodeReplyFor(&request, &unrelated, body)
+				assert.ErrorIs(t, err, ierror.ErrInvalidCommand, "operation %d, mismatched %s", resolved, name)
+			}
+
+			assert.False(t, ReplyOperationMatches(resolved, OperationUpdateResource), "the rewrite is directed")
+			assert.False(t, ReplyOperationMatches(OperationCreateStream, resolved))
+		}
+		assert.False(t, ReplyOperationMatches(OperationUpdateResource, OperationRewrapStreamKeys))
+	})
 }
 
 func TestReplyOperationMatchesOnlyCanonicalDirectedRewrites(t *testing.T) {

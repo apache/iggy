@@ -164,9 +164,10 @@ public sealed partial class TcpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public async Task<StreamResponse?> CreateStreamAsync(string name, CancellationToken token = default)
+    public async Task<StreamResponse?> CreateStreamAsync(string name, StreamOptions? options = null,
+        CancellationToken token = default)
     {
-        var message = TcpContracts.CreateStream(name);
+        var message = TcpContracts.CreateStream(name, options?.ToDictionary());
         using IMemoryOwner<byte> responseBuffer
             = await SendWithResponseAsync(CommandCodes.CREATE_STREAM_CODE, message, token: token);
 
@@ -209,10 +210,11 @@ public sealed partial class TcpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public async Task UpdateStreamAsync(Identifier streamId, string name, CancellationToken token = default)
+    public async Task UpdateStreamAsync(Identifier streamId, StreamUpdate update, CancellationToken token = default)
     {
-        var message = TcpContracts.UpdateStream(streamId, name);
-        await SendAckAsync(CommandCodes.UPDATE_STREAM_CODE, message, token);
+        ArgumentNullException.ThrowIfNull(update);
+        var message = TcpContracts.UpdateStream(streamId, update.ToPatch());
+        await SendAckAsync(CommandCodes.UPDATE_RESOURCE_CODE, message, token);
     }
 
     /// <inheritdoc />
@@ -257,15 +259,10 @@ public sealed partial class TcpMessageStream : IIggyClient
 
     /// <inheritdoc />
     public async Task<TopicResponse?> CreateTopicAsync(Identifier streamId, string name, uint partitionsCount,
-        CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None,
-        TimeSpan? messageExpiry = null, ulong maxTopicSize = 0,
-        IReadOnlyDictionary<string, HeaderValue>? options = null, CancellationToken token = default)
+        TopicOptions? options = null, CancellationToken token = default)
     {
-
-        options = TopicOptions.WithDurabilityDefaults(options);
-        var messageExpiryValue = DurationHelpers.ToDuration(messageExpiry);
-        var message = TcpContracts.CreateTopic(streamId, name, partitionsCount, compressionAlgorithm,
-            messageExpiryValue, maxTopicSize, options);
+        var message = TcpContracts.CreateTopic(streamId, name, partitionsCount,
+            (options ?? new TopicOptions()).ToDictionary());
 
         using IMemoryOwner<byte> responseBuffer = await SendWithResponseAsync(CommandCodes.CREATE_TOPIC_CODE, message, token: token);
 
@@ -278,16 +275,12 @@ public sealed partial class TcpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public async Task UpdateTopicAsync(Identifier streamId, Identifier topicId, string name,
-        CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None,
-        ulong maxTopicSize = 0, TimeSpan? messageExpiry = null,
-        IReadOnlyDictionary<string, HeaderValue>? options = null,
+    public async Task UpdateTopicAsync(Identifier streamId, Identifier topicId, TopicUpdate update,
         CancellationToken token = default)
     {
-        var messageExpiryValue = DurationHelpers.ToDuration(messageExpiry);
-        var message = TcpContracts.UpdateTopic(streamId, topicId, name, compressionAlgorithm, maxTopicSize,
-            messageExpiryValue, options);
-        await SendAckAsync(CommandCodes.UPDATE_TOPIC_CODE, message, token);
+        ArgumentNullException.ThrowIfNull(update);
+        var message = TcpContracts.UpdateTopic(streamId, topicId, update.ToPatch());
+        await SendAckAsync(CommandCodes.UPDATE_RESOURCE_CODE, message, token);
     }
 
     /// <inheritdoc />
@@ -582,6 +575,19 @@ public sealed partial class TcpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
+    public async Task<MetadataChanges> GetMetadataChangesAsync(MetadataChangesQuery query,
+        CancellationToken token = default)
+    {
+        ArgumentNullException.ThrowIfNull(query);
+        query.Validate();
+        var message = TcpContracts.GetMetadataChanges(query);
+        using IMemoryOwner<byte> responseBuffer
+            = await SendWithResponseAsync(CommandCodes.GET_METADATA_CHANGES_CODE, message, token: token);
+
+        return BinaryMapper.MapMetadataChanges(responseBuffer.Memory.Span);
+    }
+
+    /// <inheritdoc />
     public async Task PingAsync(CancellationToken token = default)
     {
         var message = Array.Empty<byte>();
@@ -610,6 +616,24 @@ public sealed partial class TcpMessageStream : IIggyClient
         }
 
         using IMemoryOwner<byte> result = await SendWithResponseAsync((int)code, payload, token: token);
+
+        return result.Memory.Length == 0 ? [] : result.Memory.Span.ToArray();
+    }
+
+    /// <inheritdoc />
+    public async Task<byte[]> SendBinaryRequestToReplicaAsync(uint code, byte[] payload, byte replicaId,
+        CancellationToken token = default)
+    {
+        if (SessionControlCodes.Contains(code) || code == CommandCodes.POLL_MESSAGES_CODE
+            || code == CommandCodes.GET_CONSUMER_OFFSET_CODE
+            || VsrOperations.ForCode((int)code) != VsrOperation.NonReplicated)
+        {
+            throw VsrError.Exception(VsrError.INVALID_COMMAND,
+                $"Command {code} cannot be sent to a chosen replica.");
+        }
+
+        using IMemoryOwner<byte> result = await RunClientOperationAsync((int)code, payload, null, null, token,
+            replica: replicaId);
 
         return result.Memory.Length == 0 ? [] : result.Memory.Span.ToArray();
     }
@@ -688,9 +712,9 @@ public sealed partial class TcpMessageStream : IIggyClient
 
     /// <inheritdoc />
     public async Task<UserResponse?> CreateUserAsync(string userName, string password, UserStatus status,
-        Permissions? permissions = null, CancellationToken token = default)
+        Permissions? permissions = null, UserOptions? options = null, CancellationToken token = default)
     {
-        var message = TcpContracts.CreateUser(userName, password, status, permissions);
+        var message = TcpContracts.CreateUser(userName, password, status, permissions, options?.ToDictionary());
         using IMemoryOwner<byte> responseBuffer
             = await SendWithResponseAsync(CommandCodes.CREATE_USER_CODE, message, token: token);
 
@@ -710,11 +734,11 @@ public sealed partial class TcpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public async Task UpdateUserAsync(Identifier userId, string? userName = null, UserStatus? status = null,
-        CancellationToken token = default)
+    public async Task UpdateUserAsync(Identifier userId, UserUpdate update, CancellationToken token = default)
     {
-        var message = TcpContracts.UpdateUser(userId, userName, status);
-        await SendAckAsync(CommandCodes.UPDATE_USER_CODE, message, token);
+        ArgumentNullException.ThrowIfNull(update);
+        var message = TcpContracts.UpdateUser(userId, update.ToPatch());
+        await SendAckAsync(CommandCodes.UPDATE_RESOURCE_CODE, message, token);
     }
 
     /// <inheritdoc />

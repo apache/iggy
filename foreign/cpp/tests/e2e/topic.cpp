@@ -336,8 +336,8 @@ TEST_F(E2E_Topic, CreateTopicWithTypedOptionHelpersReportsThemAsExplicitOptions)
 
 TEST_F(E2E_Topic, DescribeOptionsServesTopicCatalogAndRejectsUnknownScope) {
     RecordProperty("description",
-                   "Serves the topic option catalog with each key's kind, default and description, returns an empty "
-                   "catalog for the stream scope, and rejects an unknown scope name.");
+                   "Serves the topic option catalog with each key's kind, default and description, serves the "
+                   "stream catalog, and rejects an unknown scope name.");
 
     iggy::ffi::Client *client = GetLoggedInClient();
 
@@ -361,10 +361,11 @@ TEST_F(E2E_Topic, DescribeOptionsServesTopicCatalogAndRejectsUnknownScope) {
     EXPECT_FALSE(segment_size->default_value.empty());
     EXPECT_FALSE(segment_size->description.empty());
 
-    // Streams take no option keys yet, which is an empty catalog rather than a failure.
     ASSERT_NO_THROW({
         const auto stream_options = client->describe_options("stream");
-        EXPECT_TRUE(stream_options.empty());
+        ASSERT_FALSE(stream_options.empty());
+        EXPECT_EQ(static_cast<std::string>(stream_options[0].key), "name");
+        EXPECT_TRUE(stream_options[0].updatable);
     });
 
     ASSERT_THROW(client->describe_options("not_a_scope"), std::exception);
@@ -884,7 +885,9 @@ TEST_F(E2E_Topic, GetTopicsAfterTopicDeletionReturnsRemainingTopics) {
 }
 
 TEST_F(E2E_Topic, GetTopicsAfterTopicUpdateReturnsUpdatedInputFields) {
-    RecordProperty("description", "Returns updated user-provided topic fields after a topic update.");
+    RecordProperty("description",
+                   "Returns updated user-provided topic fields after a topic update and keeps the create-only "
+                   "compression algorithm.");
     const std::string stream_name        = GetRandomName();
     const std::string original_topic     = GetRandomName();
     const std::string updated_topic_name = GetRandomName();
@@ -892,14 +895,14 @@ TEST_F(E2E_Topic, GetTopicsAfterTopicUpdateReturnsUpdatedInputFields) {
     auto client = GetLoggedInHighLevelClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), original_topic,
-                                       iggy::TopicCreateOptions().SetPartitionsCount(2)));
-    ASSERT_NO_THROW(client.UpdateTopic(
-        iggy::Identifier::String(stream_name), iggy::Identifier::String(original_topic), updated_topic_name,
-        iggy::TopicUpdateOptions()
-            .SetCompressionAlgorithm(iggy::CompressionAlgorithm::Gzip())
-            .SetMessageExpiry(iggy::Expiry::Duration(1000))
-            .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL))));
+    ASSERT_NO_THROW(client.CreateTopic(
+        iggy::Identifier::String(stream_name), original_topic,
+        iggy::TopicCreateOptions().SetPartitionsCount(2).SetCompressionAlgorithm(iggy::CompressionAlgorithm::Gzip())));
+    ASSERT_NO_THROW(client.UpdateTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(original_topic),
+                                       iggy::TopicUpdateOptions()
+                                           .SetMessageExpiry(iggy::Expiry::Duration(1000))
+                                           .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL))
+                                           .SetName(updated_topic_name)));
 
     ASSERT_NO_THROW({
         const auto topics = client.GetTopics(iggy::Identifier::String(stream_name));
@@ -923,12 +926,11 @@ TEST_F(E2E_Topic, UpdateTopicWorksCorrectly) {
     TrackStream(stream_name);
     ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), original_topic,
                                        iggy::TopicCreateOptions().SetPartitionsCount(2)));
-    ASSERT_NO_THROW(client.UpdateTopic(
-        iggy::Identifier::String(stream_name), iggy::Identifier::String(original_topic), updated_topic_name,
-        iggy::TopicUpdateOptions()
-            .SetCompressionAlgorithm(iggy::CompressionAlgorithm::Gzip())
-            .SetMessageExpiry(iggy::Expiry::Duration(1000))
-            .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL))));
+    ASSERT_NO_THROW(client.UpdateTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(original_topic),
+                                       iggy::TopicUpdateOptions()
+                                           .SetMessageExpiry(iggy::Expiry::Duration(1000))
+                                           .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL))
+                                           .SetName(updated_topic_name)));
 
     ASSERT_NO_THROW({
         const auto topic_details =
@@ -962,12 +964,11 @@ TEST_F(E2E_Topic, UpdateTopicDoesNotChangePartitionsCount) {
     ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), original_topic,
                                        iggy::TopicCreateOptions().SetPartitionsCount(partitions_count)));
 
-    ASSERT_NO_THROW(client.UpdateTopic(
-        iggy::Identifier::String(stream_name), iggy::Identifier::String(original_topic), updated_topic_name,
-        iggy::TopicUpdateOptions()
-            .SetCompressionAlgorithm(iggy::CompressionAlgorithm::Gzip())
-            .SetMessageExpiry(iggy::Expiry::Duration(1000))
-            .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL))));
+    ASSERT_NO_THROW(client.UpdateTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(original_topic),
+                                       iggy::TopicUpdateOptions()
+                                           .SetMessageExpiry(iggy::Expiry::Duration(1000))
+                                           .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL))
+                                           .SetName(updated_topic_name)));
 
     ASSERT_NO_THROW({
         const auto topic_details =
@@ -1003,12 +1004,11 @@ TEST_F(E2E_Topic, UpdateTopicDoesNotChangeMessages) {
                                                   make_numeric_identifier(topic_id), "partition_id",
                                                   partition_id_bytes(0), std::move(messages), error_info));
 
-    ASSERT_NO_THROW(client.UpdateTopic(
-        iggy::Identifier::String(stream_name), iggy::Identifier::String(original_topic), updated_topic_name,
-        iggy::TopicUpdateOptions()
-            .SetCompressionAlgorithm(iggy::CompressionAlgorithm::Gzip())
-            .SetMessageExpiry(iggy::Expiry::Duration(1000))
-            .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL))));
+    ASSERT_NO_THROW(client.UpdateTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(original_topic),
+                                       iggy::TopicUpdateOptions()
+                                           .SetMessageExpiry(iggy::Expiry::Duration(1000))
+                                           .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL))
+                                           .SetName(updated_topic_name)));
 
     ASSERT_NO_THROW({
         iggy::ffi::ErrorInfo error_info{};
@@ -1028,14 +1028,6 @@ TEST_F(E2E_Topic, UpdateTopicWithAllOptionCombinationsUpdatesInputFields) {
     const std::string stream_name = GetRandomName();
     std::string topic_name        = GetRandomName();
 
-    struct CompressionOption {
-        std::string name;
-        iggy::CompressionAlgorithm value;
-    };
-    const std::vector<CompressionOption> compression_algorithms = {
-        {"none", iggy::CompressionAlgorithm::None()},
-        {"gzip", iggy::CompressionAlgorithm::Gzip()},
-    };
     struct ExpiryOption {
         std::string name;
         iggy::Expiry value;
@@ -1066,37 +1058,34 @@ TEST_F(E2E_Topic, UpdateTopicWithAllOptionCombinationsUpdatesInputFields) {
     std::uint64_t expected_message_expiry = initial_topic.MessageExpiry();
     std::uint64_t expected_max_topic_size = initial_topic.MaxTopicSize();
 
-    for (const auto &compression_algorithm : compression_algorithms) {
-        for (const auto &expiry_option : expiry_options) {
-            for (const auto &max_topic_size : max_topic_sizes) {
-                const std::string updated_topic_name = GetRandomName();
-                SCOPED_TRACE("compression=" + compression_algorithm.name + ", expiry_kind=" + expiry_option.name +
-                             ", max_topic_size=" + max_topic_size.name);
+    for (const auto &expiry_option : expiry_options) {
+        for (const auto &max_topic_size : max_topic_sizes) {
+            const std::string updated_topic_name = GetRandomName();
+            SCOPED_TRACE("expiry_kind=" + expiry_option.name + ", max_topic_size=" + max_topic_size.name);
 
-                ASSERT_NO_THROW(client.UpdateTopic(iggy::Identifier::String(stream_name),
-                                                   iggy::Identifier::String(topic_name), updated_topic_name,
-                                                   iggy::TopicUpdateOptions()
-                                                       .SetCompressionAlgorithm(compression_algorithm.value)
-                                                       .SetMessageExpiry(expiry_option.value)
-                                                       .SetMaxTopicSize(max_topic_size.value)));
-                topic_name = updated_topic_name;
+            ASSERT_NO_THROW(client.UpdateTopic(iggy::Identifier::String(stream_name),
+                                               iggy::Identifier::String(topic_name),
+                                               iggy::TopicUpdateOptions()
+                                                   .SetMessageExpiry(expiry_option.value)
+                                                   .SetMaxTopicSize(max_topic_size.value)
+                                                   .SetName(updated_topic_name)));
+            topic_name = updated_topic_name;
 
-                if (expiry_option.value.Kind() != "server_default") {
-                    expected_message_expiry = expiry_option.value.Value();
-                }
-                if (max_topic_size.value.Value() == "unlimited") {
-                    expected_max_topic_size = std::numeric_limits<std::uint64_t>::max();
-                } else if (max_topic_size.value.Value() != "server_default") {
-                    expected_max_topic_size = 1024ULL * 1024ULL * 1024ULL;
-                }
-
-                const auto updated_topic =
-                    client.GetTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name));
-                EXPECT_EQ(updated_topic.Name(), updated_topic_name);
-                EXPECT_EQ(updated_topic.CompressionAlgorithm(), compression_algorithm.name);
-                EXPECT_EQ(updated_topic.MessageExpiry(), expected_message_expiry);
-                EXPECT_EQ(updated_topic.MaxTopicSize(), expected_max_topic_size);
+            if (expiry_option.value.Kind() != "server_default") {
+                expected_message_expiry = expiry_option.value.Value();
             }
+            if (max_topic_size.value.Value() == "unlimited") {
+                expected_max_topic_size = std::numeric_limits<std::uint64_t>::max();
+            } else if (max_topic_size.value.Value() != "server_default") {
+                expected_max_topic_size = 1024ULL * 1024ULL * 1024ULL;
+            }
+
+            const auto updated_topic =
+                client.GetTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name));
+            EXPECT_EQ(updated_topic.Name(), updated_topic_name);
+            EXPECT_EQ(updated_topic.CompressionAlgorithm(), initial_topic.CompressionAlgorithm());
+            EXPECT_EQ(updated_topic.MessageExpiry(), expected_message_expiry);
+            EXPECT_EQ(updated_topic.MaxTopicSize(), expected_max_topic_size);
         }
     }
 }
@@ -1116,21 +1105,21 @@ TEST_F(E2E_Topic, UpdateTopicWithSameOptionsIsIdempotent) {
     const auto created_topic =
         client.GetTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(original_topic));
 
-    ASSERT_NO_THROW(client.UpdateTopic(
-        iggy::Identifier::String(stream_name), iggy::Identifier::Numeric(created_topic.Id()), updated_topic_name,
-        iggy::TopicUpdateOptions()
-            .SetCompressionAlgorithm(iggy::CompressionAlgorithm::Gzip())
-            .SetMessageExpiry(iggy::Expiry::Duration(1000))
-            .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL))));
+    ASSERT_NO_THROW(client.UpdateTopic(iggy::Identifier::String(stream_name),
+                                       iggy::Identifier::Numeric(created_topic.Id()),
+                                       iggy::TopicUpdateOptions()
+                                           .SetMessageExpiry(iggy::Expiry::Duration(1000))
+                                           .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL))
+                                           .SetName(updated_topic_name)));
     const auto first_update =
         client.GetTopic(iggy::Identifier::String(stream_name), iggy::Identifier::Numeric(created_topic.Id()));
 
-    ASSERT_NO_THROW(client.UpdateTopic(
-        iggy::Identifier::String(stream_name), iggy::Identifier::Numeric(created_topic.Id()), updated_topic_name,
-        iggy::TopicUpdateOptions()
-            .SetCompressionAlgorithm(iggy::CompressionAlgorithm::Gzip())
-            .SetMessageExpiry(iggy::Expiry::Duration(1000))
-            .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL))));
+    ASSERT_NO_THROW(client.UpdateTopic(iggy::Identifier::String(stream_name),
+                                       iggy::Identifier::Numeric(created_topic.Id()),
+                                       iggy::TopicUpdateOptions()
+                                           .SetMessageExpiry(iggy::Expiry::Duration(1000))
+                                           .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL))
+                                           .SetName(updated_topic_name)));
     const auto second_update =
         client.GetTopic(iggy::Identifier::String(stream_name), iggy::Identifier::Numeric(created_topic.Id()));
 
@@ -1157,11 +1146,10 @@ TEST_F(E2E_Topic, UpdateTopicWithDuplicateTopicNameThrows) {
                                        iggy::TopicCreateOptions().SetPartitionsCount(1)));
 
     ASSERT_THROW(client.UpdateTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(first_topic_name),
-                                    second_topic_name,
                                     iggy::TopicUpdateOptions()
-                                        .SetCompressionAlgorithm(iggy::CompressionAlgorithm::Gzip())
                                         .SetMessageExpiry(iggy::Expiry::Duration(1000))
-                                        .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL))),
+                                        .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL))
+                                        .SetName(second_topic_name)),
                  iggy::IggyException);
 }
 
@@ -1184,14 +1172,12 @@ TEST_F(E2E_Topic, UpdateTopicWithInvalidNamesThrows) {
     for (const auto &invalid_topic_name : invalid_topic_names) {
         SCOPED_TRACE("invalid_topic_name_length=" + std::to_string(invalid_topic_name.size()));
 
-        ASSERT_THROW(
-            client.UpdateTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name),
-                               invalid_topic_name,
-                               iggy::TopicUpdateOptions()
-                                   .SetCompressionAlgorithm(iggy::CompressionAlgorithm::Gzip())
-                                   .SetMessageExpiry(iggy::Expiry::Duration(1000))
-                                   .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL))),
-            iggy::IggyException);
+        ASSERT_THROW(client.UpdateTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name),
+                                        iggy::TopicUpdateOptions()
+                                            .SetMessageExpiry(iggy::Expiry::Duration(1000))
+                                            .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL))
+                                            .SetName(invalid_topic_name)),
+                     iggy::IggyException);
     }
 }
 
@@ -1217,12 +1203,11 @@ TEST_F(E2E_Topic, UpdateTopicFailedValidationDoesNotMutateTopic) {
         client.GetTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name));
 
     ASSERT_THROW(client.UpdateTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name),
-                                    updated_topic_name,
                                     iggy::TopicUpdateOptions()
-                                        .SetCompressionAlgorithm(iggy::CompressionAlgorithm::None())
                                         .SetMessageExpiry(iggy::Expiry::Duration(2000))
                                         .SetMaxTopicSize(iggy::MaxTopicSize::ServerDefault())
-                                        .SetRawEntries({{"max_topic_size", "not-a-size"}})),
+                                        .SetRawEntries({{"max_topic_size", "not-a-size"}})
+                                        .SetName(updated_topic_name)),
                  iggy::IggyException);
 
     const auto topic_after_failed_update =
@@ -1253,18 +1238,21 @@ TEST_F(E2E_Topic, UpdateTopicBeforeLoginThrows) {
 
     auto unauthenticated_client = GetLoggedOutHighLevelClient();
 
-    ASSERT_THROW(unauthenticated_client.UpdateTopic(iggy::Identifier::String(stream_name),
-                                                    iggy::Identifier::String(topic_name), updated_topic_name),
-                 iggy::IggyException);
+    ASSERT_THROW(
+        unauthenticated_client.UpdateTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name),
+                                           iggy::TopicUpdateOptions().SetName(updated_topic_name)),
+        iggy::IggyException);
     ASSERT_NO_THROW(unauthenticated_client.Connect());
-    ASSERT_THROW(unauthenticated_client.UpdateTopic(iggy::Identifier::String(stream_name),
-                                                    iggy::Identifier::String(topic_name), updated_topic_name),
-                 iggy::IggyException);
+    ASSERT_THROW(
+        unauthenticated_client.UpdateTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name),
+                                           iggy::TopicUpdateOptions().SetName(updated_topic_name)),
+        iggy::IggyException);
     ASSERT_NO_THROW(unauthenticated_client.Login("iggy", "iggy"));
     ASSERT_NO_THROW(unauthenticated_client.Disconnect());
-    ASSERT_THROW(unauthenticated_client.UpdateTopic(iggy::Identifier::String(stream_name),
-                                                    iggy::Identifier::String(topic_name), updated_topic_name),
-                 iggy::IggyException);
+    ASSERT_THROW(
+        unauthenticated_client.UpdateTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name),
+                                           iggy::TopicUpdateOptions().SetName(updated_topic_name)),
+        iggy::IggyException);
 }
 
 TEST_F(E2E_Topic, UpdateTopicOnNonExistentStreamThrows) {
@@ -1275,11 +1263,10 @@ TEST_F(E2E_Topic, UpdateTopicOnNonExistentStreamThrows) {
 
     auto client = GetLoggedInHighLevelClient();
     ASSERT_THROW(client.UpdateTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name),
-                                    updated_topic_name,
                                     iggy::TopicUpdateOptions()
-                                        .SetCompressionAlgorithm(iggy::CompressionAlgorithm::Gzip())
                                         .SetMessageExpiry(iggy::Expiry::Duration(1000))
-                                        .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL))),
+                                        .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL))
+                                        .SetName(updated_topic_name)),
                  iggy::IggyException);
 }
 
@@ -1294,11 +1281,10 @@ TEST_F(E2E_Topic, UpdateTopicOnNonExistentTopicThrows) {
     TrackStream(stream_name);
 
     ASSERT_THROW(client.UpdateTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name),
-                                    updated_topic_name,
                                     iggy::TopicUpdateOptions()
-                                        .SetCompressionAlgorithm(iggy::CompressionAlgorithm::Gzip())
                                         .SetMessageExpiry(iggy::Expiry::Duration(1000))
-                                        .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL))),
+                                        .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL))
+                                        .SetName(updated_topic_name)),
                  iggy::IggyException);
 }
 

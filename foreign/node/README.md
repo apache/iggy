@@ -22,7 +22,7 @@ note: previous works on node.js http client has been moved to [iggy-node-http-cl
 npm i --save apache-iggy@edge
 ```
 
-Use matching SDK and server builds from the coordinated VSR release. Older builds are incompatible. This release requires fresh server storage (`IGGY-BOUND-GRANTS-5`). Existing incompatible data is refused unchanged. For a local server with the example credentials, follow the [example setup](../../examples/node/README.md#running-examples).
+Use matching SDK and server builds from the coordinated VSR release. Older builds are incompatible. This release requires fresh server storage (`IGGY-METADATA-CHANGE-LOG-1`). Existing incompatible data is refused unchanged. For a local server with the example credentials, follow the [example setup](../../examples/node/README.md#running-examples).
 
 ## basic usage
 
@@ -58,6 +58,10 @@ The count is cached per topic. The client reads it again after a refused send,
 and after the client deletes a stream or a topic or creates or deletes
 partitions. A raw `SendMessages` command without an explicit partition id
 fails with error code 5 before the client sends it.
+
+`sendBinaryRequestToReplica(code, payload, replica)` sends a raw command to one node of a cluster, named by the replica id that cluster metadata returns, and `sendCommand` takes the same id as the `replica` option.
+
+Each node answers non-replicated commands such as `GetStats` from its own state, so this reads the state of that node. Replicated commands, polls, consumer-offset reads and session-control codes fail with error code 3 before anything is sent. An id that cluster metadata does not name fails with error code 6. An unreachable node is retried until the request deadline, and a `NotPrimary` (89) reply is returned rather than sent to another node.
 
 Partition commands carry a context containing the partition incarnation, owner
 generation and metadata operation. Pass the context of an earlier poll reply to
@@ -319,12 +323,120 @@ Durations accept the same expressions as the Rust SDK, for example `500ms`,
 `0`, `unlimited`, `disabled` and `none` map to zero. Unit-less numbers such as
 `5` are rejected.
 
+### resource options
+
+A stream can carry its own data encryption key. Build it with `StreamEncryptionKey.from` from exactly 32 random bytes, or from their canonical padded base64, and pass it to `stream.create` as `encryptionKey`. Never derive the key from a password, because its fingerprint is readable by anyone who can read the stream. A key that is not 32 bytes or canonical base64 is refused with error 70 before anything is sent.
+
+A `StreamEncryptionKey` keeps its own copy of the bytes and prints only its fingerprint through `util.inspect`, `JSON.stringify` and string conversion, so create arguments carrying it can be logged. Entries passed through `options` print as given, so an `encryption_key` entry there is refused with error 70 before anything is sent.
+
+The key travels inside the create request over whatever transport the client uses, so connect over TLS when the key must stay confidential. The server stores the key wrapped and never returns it: reads report only `encryptionKeySource`, `encryptionKeyFingerprint` and `encryptionKekFingerprints`. Without a key, a server with encryption enabled generates one for the stream and reports the source `server`.
+
+```ts
+import { randomBytes } from "node:crypto";
+import { Client, StreamEncryptionKey } from "apache-iggy";
+
+const client = new Client({
+  transport: "TLS",
+  options: { host: "localhost", port: 8090 },
+  credentials: { username: "iggy", password: "iggy" },
+});
+
+const key = StreamEncryptionKey.from(randomBytes(32));
+const stream = await client.stream.create({ name: "orders", encryptionKey: key });
+console.log(stream.encryptionKeySource); // "stream"
+console.log(stream.encryptionKeyFingerprint === key.fingerprint()); // true
+```
+
+`stream.update`, `topic.update` and `user.update` change only the keys they name and leave every other setting as it is, so an update without `name` keeps the name. `reset` returns a key to the server default. Use the `StreamOptionKey`, `TopicOptionKey` and `UserOptionKey` constants to name keys.
+
+Only the topic keys `message_expiry` and `max_topic_size` can be reset. Settings fixed at create, such as the topic compression algorithm, the partition resize policy or the stream key, have no update field.
+
+The SDK checks the typed fields and `reset` before sending, in the server's order and with its error codes (4041 for an unknown key, 4105 for a read-only key, 4103 for a create-only key, 4104 for a key without a default, then the name, username or status error). For a key this build has no field or constant for, pass `options` entries and `rawReset` names. The SDK sends those as they are and the server decides, so a refusal comes back from the server.
+
+The server returns 4108 when a non-root caller tries to rename root or change root's status, or when root tries to deactivate itself.
+
+```ts
+await client.topic.update({
+  streamId: "orders",
+  topicId: "events",
+  messageExpiry: 7_200_000_000n,
+  reset: ["max_topic_size"],
+});
+```
+
+Reads return every setting in `options` (keys the client set) and `derivedOptions` (keys the server filled). `u64` values stay `bigint`, so values above 2^53 keep their precision. `system.describeOptions({ scope: OptionsScope.Stream })` lists the keys a server accepts per scope, with `updatable`, `resettable`, `secret`, `readOnly` and `critical`.
+
+### metadata changes
+
+`system.getMetadataChanges` reads the node's change log: one record per public result of a committed metadata operation, such as a stream created, a topic renamed, a user's permissions changed or a session closed. A mirror keeps a cursor, asks for the records after it, and stores the returned `next` cursor. The call needs root or the global `manage_servers` permission.
+
+```ts
+import { setTimeout as sleep } from "node:timers/promises";
+import {
+  Client, MetadataChangeStart, MetadataChangeStatus,
+  type MetadataChangeGroup, type MetadataCurrentPageToken,
+} from "apache-iggy";
+
+const follow = async (client: Client, groups: MetadataChangeGroup[]) => {
+  let start: MetadataChangeStart = MetadataChangeStart.Earliest;
+  for (;;) {
+    const page = await client.system.getMetadataChanges({ start, groups });
+    switch (page.status) {
+      case MetadataChangeStatus.Ok:
+        for (const record of page.records)
+          console.log(record.op, record.kind, record.actorUserId, record.body);
+        if (page.next) start = MetadataChangeStart.After(page.next);
+        if (!page.hasMore) await sleep(1000);
+        break;
+      case MetadataChangeStatus.Behind:
+        await sleep(100);
+        break;
+      default:
+        start = await rebuild(client, groups);
+    }
+  }
+};
+
+/** Pages the current state, then returns the position to follow from. */
+const rebuild = async (client: Client, groups: MetadataChangeGroup[]) => {
+  let pageToken: MetadataCurrentPageToken | undefined;
+  for (;;) {
+    const page = await client.system.getMetadataChanges({
+      start: MetadataChangeStart.Current(pageToken), groups,
+    });
+    if (page.status === MetadataChangeStatus.Behind) {
+      await sleep(100);
+      continue;
+    }
+    if (page.status !== MetadataChangeStatus.Ok) {
+      pageToken = undefined;
+      continue;
+    }
+    for (const item of page.items)
+      console.log(item.group, item.body);
+    if (page.currentPageToken) pageToken = page.currentPageToken;
+    else if (page.next) return MetadataChangeStart.After(page.next);
+    else pageToken = undefined;
+  }
+};
+```
+
+`expired` means the log no longer holds the history after the cursor, and `reset` means the cursor belongs to another history, for example after the data directory was rebuilt. Either way the mirror rebuilds from current state pages and then follows the changes after the anchor they return.
+
+Current pages need the parent groups of every selected group, for example `topics` with `streams`. Keep a rebuilt state private until a change page answers `ok` with `hasMore` false and a `headOp` at or above the last current page's.
+
+Records narrow by `kind` and items by `group`, so `record.kind === "stream_created"` types `record.body` as a stream. A group or kind newer than this build arrives as `"unknown"` with the raw body and the wire codes in `groupCode` and `kindCode`, while a record of a newer kind keeps its known `group`, so a mirror that cannot apply it can stop without advancing its cursor. Ops, timestamps and 128-bit ids are `bigint`.
+
+A query that breaks the request rules, such as a limit outside 1 to 1000 or a time bound with a latest or current start, is refused with error 3 before anything is sent. `MetadataChangeCursor` and `MetadataCurrentPageToken` print and parse as the `mc1_` and `cs1_` text forms the HTTP API and the CLI use, and `JSON.stringify` writes them as that text.
+
 ## use sources
 
 Cluster polling uses command 15 (`BindSession`), route discovery 105 and poll
 100. Commands 14, 103, 104 and 123 are retired. Pause consumers for the coordinated
 server/SDK upgrade and restart them to rejoin their groups. There is no fallback
 to retired polling commands.
+
+Stream, topic and user updates use the generic update command 16. The former update commands 35, 204 and 304 are retired.
 
 ### Install
 
@@ -352,6 +464,8 @@ npm run test:unit
 #### e2e tests
 
 e2e test expect an iggy-server at tcp://127.0.0.1:8090
+
+The resource options tests also expect the server to run with encryption enabled and a config key (`IGGY_ENCRYPTION_ENABLED=true` and `IGGY_ENCRYPTION_KEY` set to the base64 of 32 bytes), so a stream created without a key reports a server-generated one. The keyed metadata changes case registered from the same file needs the config key too.
 
 ```bash
 npm run test:e2e

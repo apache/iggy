@@ -66,7 +66,7 @@ use iggy_binary_protocol::Operation;
 use message_bus::replica::handshake::ReplicaHandshakeCtx;
 use message_bus::transports::tls::install_default_crypto_provider;
 use message_bus::{IggyMessageBus, ReplicaOwnerTable};
-use metadata::impls::metadata::StreamsFrontend;
+use metadata::change_log::{ChangeLogCapacities, MetadataChangeLog};
 use metadata::impls::recovery::recover;
 use metadata::{AppliedFrontier, ReplicaIdentity};
 use server_common::bootstrap::create_directories;
@@ -87,7 +87,7 @@ use tracing::{error, info, warn};
 
 const STORAGE_FORMAT_FILE: &str = "storage-format";
 const STORAGE_FORMAT_TEMP_FILE: &str = "storage-format.tmp";
-const STORAGE_FORMAT: &[u8] = b"IGGY-BOUND-GRANTS-5\n";
+const STORAGE_FORMAT: &[u8] = b"IGGY-METADATA-CHANGE-LOG-1\n";
 
 /// Load the server configuration from the active config provider.
 ///
@@ -569,73 +569,64 @@ async fn shard_main(
     // so the writer must first be parked in a binding that outlives the peer
     // wait armed below. A `recover()` failure inside the arm is safe for the
     // same reason -- no peer holds a handle yet.
-    let (mux_stm, pending_bundle_tx, owner_state, root_credentials) = match metadata_handoff {
-        MetadataHandoff::Owner {
-            bundle_tx,
-            root_credentials,
-        } => {
-            let recovered = recover::<ServerMuxStateMachine>(
-                data_dir,
-                ReplicaIdentity {
-                    cluster: topology.cluster_id,
-                    replica_id: topology.self_replica_id,
-                    replica_count: topology.replica_count,
-                },
-                config.metadata.journal_slots,
-                config.metadata.clients_table_max,
-                |_| {},
-                |mux_stm, header| {
-                    if header.operation == iggy_binary_protocol::Operation::Register {
-                        mux_stm.streams().refresh_consumer_group_session(
-                            header.client,
-                            header.op,
-                            header.op,
-                            iggy_common::IggyTimestamp::from(header.timestamp),
-                        );
-                    } else {
-                        mux_stm.streams().remove_consumer_group_member(
-                            header.client,
-                            iggy_common::IggyTimestamp::from(header.timestamp),
-                            header.op,
-                        );
-                    }
-                },
-            )
-            .await
-            .map_err(ServerError::MetadataRecovery)?;
-            (
-                Rc::new(recovered.mux_stm),
-                Some(bundle_tx),
-                Some(RecoveredOwnerState {
-                    journal: recovered.journal,
-                    snapshot: recovered.snapshot,
-                    last_applied_op: recovered.last_applied_op,
-                    last_journaled_op: recovered.last_journaled_op,
-                    client_table: recovered.client_table,
-                    superblock: recovered.superblock,
-                    recovered_state: recovered.recovered_state,
-                    snapshot_checkpoint: recovered.snapshot_checkpoint,
-                    history: recovered.history,
-                }),
+    let (mux_stm, change_log, pending_bundle_tx, owner_state, root_credentials) =
+        match metadata_handoff {
+            MetadataHandoff::Owner {
+                bundle_tx,
                 root_credentials,
-            )
-        }
-        MetadataHandoff::Waiter { bundle_rx } => {
-            let bundle = await_metadata_bundle(
-                shard_id,
-                &bundle_rx,
-                &shutdown_flag_for_handoff,
-                poll_interval,
-            )
-            .await?;
-            (
-                Rc::new(ServerMuxStateMachine::from_factory_bundle(bundle)),
-                None,
-                None,
-                None,
-            )
-        }
-    };
+            } => {
+                let recovered = recover::<ServerMuxStateMachine>(
+                    data_dir,
+                    ReplicaIdentity {
+                        cluster: topology.cluster_id,
+                        replica_id: topology.self_replica_id,
+                        replica_count: topology.replica_count,
+                    },
+                    config.metadata.journal_slots,
+                    config.metadata.clients_table_max,
+                    |_| {},
+                    ChangeLogCapacities {
+                        resource: config.metadata.change_log_resource_capacity,
+                        activity: config.metadata.change_log_activity_capacity,
+                    },
+                )
+                .await
+                .map_err(ServerError::MetadataRecovery)?;
+                (
+                    Rc::new(recovered.mux_stm),
+                    Rc::new(recovered.change_log),
+                    Some(bundle_tx),
+                    Some(RecoveredOwnerState {
+                        journal: recovered.journal,
+                        snapshot: recovered.snapshot,
+                        last_applied_op: recovered.last_applied_op,
+                        last_journaled_op: recovered.last_journaled_op,
+                        client_table: recovered.client_table,
+                        superblock: recovered.superblock,
+                        recovered_state: recovered.recovered_state,
+                        snapshot_checkpoint: recovered.snapshot_checkpoint,
+                        history: recovered.history,
+                    }),
+                    root_credentials,
+                )
+            }
+            MetadataHandoff::Waiter { bundle_rx } => {
+                let bundle = await_metadata_bundle(
+                    shard_id,
+                    &bundle_rx,
+                    &shutdown_flag_for_handoff,
+                    poll_interval,
+                )
+                .await?;
+                (
+                    Rc::new(ServerMuxStateMachine::from_factory_bundle(bundle.states)),
+                    Rc::new(MetadataChangeLog::from_factory(bundle.change_log)),
+                    None,
+                    None,
+                    None,
+                )
+            }
+        };
 
     // Shard 0 owns the metadata state machine's only write handle, and the
     // peers read through it until their runtimes are gone. Declared after
@@ -655,7 +646,10 @@ async fn shard_main(
         broadcast_metadata_bundle(
             shard_id,
             &bundle_tx,
-            mux_stm.factory_bundle(),
+            ServerMetadataBundle {
+                states: mux_stm.factory_bundle(),
+                change_log: change_log.factory(),
+            },
             total_shards.saturating_sub(1),
             &shutdown_flag_for_handoff,
             poll_interval,
@@ -700,7 +694,8 @@ async fn shard_main(
         Rc::clone(&mux_stm),
         Some(PathBuf::from(&config.path)),
     )
-    .with_applied_frontier(metadata_applied_frontier);
+    .with_applied_frontier(metadata_applied_frontier)
+    .with_change_log(Rc::clone(&change_log));
     metadata.seed_applied_frontier_from_consensus();
     // Size the VSR client table before listeners bind and any client registers.
     // Must precede the recovered-table install below: the setter rebuilds the
@@ -740,6 +735,7 @@ async fn shard_main(
         sessions,
         consumer_group_liveness,
         shard_handle,
+        unbuilt,
     } = Box::pin(build_shard_for_thread(
         shard_id,
         total_shards,
@@ -858,6 +854,7 @@ async fn shard_main(
         topology.self_replica_id,
         topology.replica_count,
     ));
+    reconciler_ctx.mark_unbuilt(unbuilt);
     let reconcile_periodic = config.sharding.reconcile_periodic_interval.get_duration();
     let reconciler_handle = compio::runtime::spawn({
         let ctx = Rc::clone(&reconciler_ctx);
@@ -919,6 +916,39 @@ async fn shard_main(
         None
     };
 
+    // Stream key rewrapper: shard 0 only, and only while this node's keys call
+    // for a rotation, since otherwise no stored set can differ from its target.
+    // Retired fingerprints matter only to the rewrapper, so only its context
+    // holds them. Each sweep no-ops unless this node is the caught-up metadata
+    // primary, so a rotation is replicated once to every replica.
+    let rewrap_context = if shard_id == 0 {
+        Some(
+            (*shard.plane.partitions().key_context())
+                .clone()
+                .with_retired_kek_fingerprints(&config.encryption.retired_kek_fingerprints)
+                .map_err(|error| ServerError::Iggy(Box::new(error)))?,
+        )
+    } else {
+        None
+    };
+    let stream_key_rewrapper_stop = match rewrap_context {
+        Some(rewrap_context) if rewrap_context.rotating() => {
+            let (rewrapper_stop_tx, rewrapper_stop_rx) = channel(1);
+            let rewrapper_shard = Rc::clone(&shard);
+            let rewrapper_handle = compio::runtime::spawn(async move {
+                crate::stream_key_rewrapper::run_stream_key_rewrapper(
+                    rewrapper_shard,
+                    rewrap_context,
+                    rewrapper_stop_rx,
+                )
+                .await;
+            });
+            bus.track_background(rewrapper_handle);
+            Some(rewrapper_stop_tx)
+        }
+        _ => None,
+    };
+
     // Segment cleaner: runs on every shard (each replica trims its own log,
     // primary and backup alike). Local and unreplicated; gated by the shared
     // data-maintenance config.
@@ -939,6 +969,7 @@ async fn shard_main(
         reconciler: reconcile_stop_tx,
         heartbeat: heartbeat_stop_tx,
         pat_cleaner: pat_cleaner_stop,
+        stream_key_rewrapper: stream_key_rewrapper_stop,
         segment_cleaner: segment_cleaner_stop,
         sysinfo_printer: None,
         consumer_group_liveness: None,
@@ -1251,7 +1282,9 @@ mod tests {
             b"IGGY-BOUND-GRANTS-2\n",
             b"IGGY-BOUND-GRANTS-3\n",
             b"IGGY-BOUND-GRANTS-4\n",
+            b"IGGY-BOUND-GRANTS-5\n",
             b"IGGY-DURABLE-SESSIONS-3\n",
+            b"IGGY-RESOURCE-OPTIONS-1\n",
             &STORAGE_FORMAT[..STORAGE_FORMAT.len() - 1],
         ] {
             std::fs::write(&marker, format).unwrap();
@@ -1281,7 +1314,12 @@ mod tests {
 
     #[test]
     fn given_different_storage_formats_when_identifying_replicas_should_reject_mixing() {
-        for older_format in [b"IGGY-BOUND-GRANTS-3\n", b"IGGY-BOUND-GRANTS-4\n"] {
+        for older_format in [
+            b"IGGY-BOUND-GRANTS-3\n".as_slice(),
+            b"IGGY-BOUND-GRANTS-4\n",
+            b"IGGY-BOUND-GRANTS-5\n",
+            b"IGGY-RESOURCE-OPTIONS-1\n",
+        ] {
             assert_ne!(
                 message_bus::replica::handshake::binary_identity(crate::VERSION, STORAGE_FORMAT),
                 message_bus::replica::handshake::binary_identity(crate::VERSION, older_format),

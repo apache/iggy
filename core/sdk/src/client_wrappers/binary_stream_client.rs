@@ -17,66 +17,38 @@
 
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 use async_trait::async_trait;
-use iggy_common::StreamClient;
-use iggy_common::StreamUpdateOptions;
-use iggy_common::{Identifier, IggyError, Stream, StreamDetails};
+use iggy_common::{
+    Identifier, IggyError, Stream, StreamClient, StreamCreateOptions, StreamDetails,
+    StreamUpdateOptions,
+};
 
 #[async_trait]
 impl StreamClient for ClientWrapper {
     async fn get_stream(&self, stream_id: &Identifier) -> Result<Option<StreamDetails>, IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => client.get_stream(stream_id).await,
-            ClientWrapper::Http(client) => client.get_stream(stream_id).await,
-            ClientWrapper::Tcp(client) => client.get_stream(stream_id).await,
-            ClientWrapper::Quic(client) => client.get_stream(stream_id).await,
-            ClientWrapper::WebSocket(client) => client.get_stream(stream_id).await,
-        }
+        super::dispatch_client!(self, StreamClient::get_stream(stream_id)).await
     }
 
     async fn get_streams(&self) -> Result<Vec<Stream>, IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => client.get_streams().await,
-            ClientWrapper::Http(client) => client.get_streams().await,
-            ClientWrapper::Tcp(client) => client.get_streams().await,
-            ClientWrapper::Quic(client) => client.get_streams().await,
-            ClientWrapper::WebSocket(client) => client.get_streams().await,
-        }
+        super::dispatch_client!(self, StreamClient::get_streams()).await
     }
 
-    async fn create_stream(&self, name: &str) -> Result<StreamDetails, IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => client.create_stream(name).await,
-            ClientWrapper::Http(client) => client.create_stream(name).await,
-            ClientWrapper::Tcp(client) => client.create_stream(name).await,
-            ClientWrapper::Quic(client) => client.create_stream(name).await,
-            ClientWrapper::WebSocket(client) => client.create_stream(name).await,
-        }
+    async fn create_stream(
+        &self,
+        name: &str,
+        options: &StreamCreateOptions,
+    ) -> Result<StreamDetails, IggyError> {
+        super::dispatch_client!(self, StreamClient::create_stream(name, options)).await
     }
 
     async fn update_stream(
         &self,
         stream_id: &Identifier,
-        name: &str,
         options: &StreamUpdateOptions,
     ) -> Result<(), IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => client.update_stream(stream_id, name, options).await,
-            ClientWrapper::Http(client) => client.update_stream(stream_id, name, options).await,
-            ClientWrapper::Tcp(client) => client.update_stream(stream_id, name, options).await,
-            ClientWrapper::Quic(client) => client.update_stream(stream_id, name, options).await,
-            ClientWrapper::WebSocket(client) => {
-                client.update_stream(stream_id, name, options).await
-            }
-        }
+        super::dispatch_client!(self, StreamClient::update_stream(stream_id, options)).await
     }
 
     async fn delete_stream(&self, stream_id: &Identifier) -> Result<(), IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => client.delete_stream(stream_id).await,
-            ClientWrapper::Http(client) => client.delete_stream(stream_id).await,
-            ClientWrapper::Tcp(client) => client.delete_stream(stream_id).await,
-            ClientWrapper::Quic(client) => client.delete_stream(stream_id).await,
-            ClientWrapper::WebSocket(client) => client.delete_stream(stream_id).await,
-        }
+        super::dispatch_client!(self, StreamClient::delete_stream(stream_id)).await
     }
 }

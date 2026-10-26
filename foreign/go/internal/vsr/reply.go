@@ -80,7 +80,9 @@ func ReplyOperationMatches(request, reply Operation) bool {
 	return request == reply ||
 		request == OperationCreateTopic && reply == OperationCreateTopicWithAssignments ||
 		request == OperationCreatePartitions && reply == OperationCreatePartitionsWithAssignments ||
-		request == OperationDeleteSegments && reply == OperationTruncatePartition
+		request == OperationDeleteSegments && reply == OperationTruncatePartition ||
+		request == OperationUpdateResource && (reply == OperationUpdateStreamResolved ||
+			reply == OperationUpdateTopicResolved || reply == OperationUpdateUserResolved)
 }
 
 // Result section layout: [count u32][{index u32, result u32} x count].

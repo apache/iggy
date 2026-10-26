@@ -25,12 +25,24 @@ use iggy::prelude::{
     NonZeroIggyDuration as RustNonZeroIggyDuration, OptionsScope as RustOptionsScope,
     PartitionClient, PartitionContext, Partitioning, Permissions as RustPermissions,
     PollingStrategy, SegmentClient, SnapshotCompression as RustSnapshotCompression, StreamClient,
-    StreamUpdateOptions, SystemClient as RustSystemClient,
+    StreamCreateOptions as RustStreamCreateOptions, StreamEncryptionKey,
+    StreamUpdateOptions as RustStreamUpdateOptions, SystemClient as RustSystemClient,
     SystemSnapshotType as RustSystemSnapshotType, TopicClient,
     TopicCreateOptions as RustTopicCreateOptions, TopicUpdateOptions as RustTopicUpdateOptions,
-    UserClient, UserStatus as RustUserStatus, UserUpdateOptions,
+    UserClient, UserCreateOptions as RustUserCreateOptions, UserStatus as RustUserStatus,
+    UserUpdateOptions as RustUserUpdateOptions,
 };
-use iggy_common::{Credentials as RustCredentials, IggyError, PendingOperationsConfig};
+use iggy_binary_protocol::requests::system::GetMetadataChangesRequest;
+use iggy_binary_protocol::responses::system::{
+    GetMetadataChangesResponse, WireMetadataChangeRecord, WireMetadataItem,
+};
+use iggy_binary_protocol::{WireDecode, WireEncode};
+use iggy_common::{
+    Credentials as RustCredentials, IggyError, MetadataChangeCursor, MetadataChangeRecord,
+    MetadataChanges, MetadataChangesQuery, MetadataCurrentItem, MetadataCurrentPageToken,
+    PendingOperationsConfig, stream_key_fingerprint,
+};
+use serde::Deserialize;
 use std::collections::HashSet;
 use std::convert::TryFrom;
 use std::num::NonZeroUsize;
@@ -78,10 +90,24 @@ fn polling_strategy(
     })
 }
 
+/// The `id` of the JSON error body an HTTP refusal carries.
+#[derive(Deserialize)]
+struct HttpErrorBody {
+    id: u32,
+}
+
 impl ffi::ErrorInfo {
     fn record(&mut self, error: &IggyError) {
         self.code = error.as_code();
         self.kind = error.as_string().to_owned();
+        // HTTP reports an option refusal only in its body, binary transports by the error itself.
+        if let IggyError::HttpResponseError(_, body) = error
+            && let Ok(body) = serde_json::from_str::<HttpErrorBody>(body)
+            && is_option_error(&IggyError::from_code(body.id))
+        {
+            self.code = body.id;
+            self.kind = IggyError::from_code_as_string(body.id).to_owned();
+        }
         let operation = error.operation_id();
         self.has_operation_id = operation.is_some();
         self.operation_id = operation.unwrap_or_default();
@@ -298,13 +324,24 @@ impl Client {
     pub fn create_stream(
         &self,
         stream_name: String,
+        options: ffi::StreamCreateOptions,
         error_info: &mut ffi::ErrorInfo,
     ) -> Result<ffi::StreamDetails, String> {
         *error_info = ffi::ErrorInfo::default();
+        let encryption_key = options
+            .encryption_key()
+            .inspect_err(|error| error_info.record(error))
+            .map_err(|error| format!("Could not create stream '{stream_name}': {error}"))?;
+        let create_options = RustStreamCreateOptions {
+            encryption_key,
+            raw: ffi_options_to_raw(options.raw_options)
+                .map_err(|error| format!("Could not create stream '{stream_name}': {error}"))?,
+        };
+
         RUNTIME.block_on(async {
             let stream_details = self
                 .inner
-                .create_stream(&stream_name)
+                .create_stream(&stream_name, &create_options)
                 .await
                 .inspect_err(|error| error_info.record(error))
                 .map_err(|error| format!("Could not create stream '{stream_name}': {error}"))?;
@@ -315,28 +352,21 @@ impl Client {
     pub fn update_stream(
         &self,
         stream_id: ffi::Identifier,
-        stream_name: String,
-        options: Vec<ffi::HeaderEntry>,
+        options: ffi::StreamUpdateOptions,
         error_info: &mut ffi::ErrorInfo,
     ) -> Result<(), String> {
         *error_info = ffi::ErrorInfo::default();
         let rust_stream_id = RustIdentifier::try_from(stream_id)
-            .map_err(|error| format!("Could not update stream '{stream_name}': {error}"))?;
-        let update_options = StreamUpdateOptions {
-            raw: ffi_options_to_raw(options)
-                .map_err(|error| format!("Could not update stream '{stream_name}': {error}"))?,
-        };
+            .map_err(|error| format!("Could not update stream: {error}"))?;
+        let update_options = RustStreamUpdateOptions::try_from(options)
+            .map_err(|error| format!("Could not update stream '{rust_stream_id}': {error}"))?;
 
         RUNTIME.block_on(async {
             self.inner
-                .update_stream(&rust_stream_id, &stream_name, &update_options)
+                .update_stream(&rust_stream_id, &update_options)
                 .await
                 .inspect_err(|error| error_info.record(error))
-                .map_err(|error| {
-                    format!(
-                        "Could not update stream '{rust_stream_id}' to '{stream_name}': {error}"
-                    )
-                })?;
+                .map_err(|error| format!("Could not update stream '{rust_stream_id}': {error}"))?;
             Ok(())
         })
     }
@@ -628,21 +658,25 @@ impl Client {
         &self,
         stream_id: ffi::Identifier,
         topic_id: ffi::Identifier,
-        topic_name: String,
         options: ffi::TopicUpdateOptions,
         error_info: &mut ffi::ErrorInfo,
     ) -> Result<(), String> {
         *error_info = ffi::ErrorInfo::default();
-        let rust_stream_id = RustIdentifier::try_from(stream_id)
-            .map_err(|error| format!("Could not update topic '{topic_name}': {error}"))?;
-        let rust_topic_id = RustIdentifier::try_from(topic_id)
-            .map_err(|error| format!("Could not update topic '{topic_name}': {error}"))?;
-        let update_options = RustTopicUpdateOptions::try_from(options)
-            .map_err(|error| format!("Could not update topic '{topic_name}': {error}"))?;
+        let rust_stream_id = RustIdentifier::try_from(stream_id).map_err(|error| {
+            format!("Could not update topic: invalid stream identifier: {error}")
+        })?;
+        let rust_topic_id = RustIdentifier::try_from(topic_id).map_err(|error| {
+            format!("Could not update topic: invalid topic identifier: {error}")
+        })?;
+        let update_options = RustTopicUpdateOptions::try_from(options).map_err(|error| {
+            format!(
+                "Could not update topic '{rust_topic_id}' on stream '{rust_stream_id}': {error}"
+            )
+        })?;
 
         RUNTIME.block_on(async {
             self.inner
-                .update_topic(&rust_stream_id, &rust_topic_id, &topic_name, &update_options)
+                .update_topic(&rust_stream_id, &rust_topic_id, &update_options)
                 .await
                 .inspect_err(|error| error_info.record(error))
                 .map_err(|error| {
@@ -1157,6 +1191,31 @@ impl Client {
         })
     }
 
+    /// Reads one page of the metadata change log or of the current state.
+    ///
+    /// The Rust SDK validates the query before anything is sent, so a refused
+    /// query and a refusal by the server both carry their error code.
+    pub fn get_metadata_changes(
+        &self,
+        query: ffi::MetadataChangesQuery,
+        error_info: &mut ffi::ErrorInfo,
+    ) -> Result<ffi::MetadataChanges, String> {
+        *error_info = ffi::ErrorInfo::default();
+        let query = MetadataChangesQuery::try_from(query)
+            .inspect_err(|error| error_info.record(error))
+            .map_err(|error| format!("Could not get metadata changes: {error}"))?;
+
+        RUNTIME.block_on(async {
+            let changes = self
+                .inner
+                .get_metadata_changes(&query)
+                .await
+                .inspect_err(|error| error_info.record(error))
+                .map_err(|error| format!("Could not get metadata changes: {error}"))?;
+            Ok(ffi::MetadataChanges::from(changes))
+        })
+    }
+
     pub fn ping(&self) -> Result<(), String> {
         RUNTIME.block_on(async {
             self.inner
@@ -1286,6 +1345,7 @@ impl Client {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn create_user(
         &self,
         username: String,
@@ -1293,6 +1353,7 @@ impl Client {
         status: ffi::UserStatus,
         has_permissions: bool,
         permissions: ffi::Permissions,
+        options: ffi::UserCreateOptions,
         error_info: &mut ffi::ErrorInfo,
     ) -> Result<ffi::UserInfoDetails, String> {
         *error_info = ffi::ErrorInfo::default();
@@ -1302,11 +1363,19 @@ impl Client {
             .then(|| RustPermissions::try_from(permissions))
             .transpose()
             .map_err(|error| format!("Could not create user '{username}': {error}"))?;
+        let create_options = RustUserCreateOptions::try_from(options)
+            .map_err(|error| format!("Could not create user '{username}': {error}"))?;
 
         RUNTIME.block_on(async {
             let user = self
                 .inner
-                .create_user(&username, &password, rust_status, rust_permissions)
+                .create_user(
+                    &username,
+                    &password,
+                    rust_status,
+                    rust_permissions,
+                    &create_options,
+                )
                 .await
                 .inspect_err(|error| error_info.record(error))
                 .map_err(|error| format!("Could not create user '{username}': {error}"))?;
@@ -1333,36 +1402,21 @@ impl Client {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn update_user(
         &self,
         user_id: ffi::Identifier,
-        has_username: bool,
-        username: String,
-        has_status: bool,
-        status: ffi::UserStatus,
-        options: Vec<ffi::HeaderEntry>,
+        options: ffi::UserUpdateOptions,
         error_info: &mut ffi::ErrorInfo,
     ) -> Result<(), String> {
         *error_info = ffi::ErrorInfo::default();
         let rust_user_id = RustIdentifier::try_from(user_id)
             .map_err(|error| format!("Could not update user: invalid user identifier: {error}"))?;
-        let rust_status = has_status
-            .then(|| RustUserStatus::try_from(status))
-            .transpose()
+        let rust_options = RustUserUpdateOptions::try_from(options)
             .map_err(|error| format!("Could not update user '{rust_user_id}': {error}"))?;
-        let raw = ffi_options_to_raw(options)
-            .map_err(|error| format!("Could not update user '{rust_user_id}': {error}"))?;
-        let rust_options = UserUpdateOptions { raw };
 
         RUNTIME.block_on(async {
             self.inner
-                .update_user(
-                    &rust_user_id,
-                    has_username.then_some(username.as_str()),
-                    rust_status,
-                    &rust_options,
-                )
+                .update_user(&rust_user_id, &rust_options)
                 .await
                 .inspect_err(|error| error_info.record(error))
                 .map_err(|error| format!("Could not update user '{rust_user_id}': {error}"))?;
@@ -1441,6 +1495,159 @@ impl Client {
             Ok(Vec::from(response))
         })
     }
+
+    /// Sends a command code and payload to the replica with `replica_id`, as
+    /// cluster metadata names it, and returns its raw response bytes.
+    /// Replicated commands, polls, consumer-offset reads and session-control
+    /// codes return an invalid-command error, and a replica that cluster
+    /// metadata does not name returns an invalid-identifier error.
+    pub fn send_binary_request_to_replica(
+        &self,
+        code: u32,
+        payload: Vec<u8>,
+        replica_id: u8,
+        error_info: &mut ffi::ErrorInfo,
+    ) -> Result<Vec<u8>, String> {
+        *error_info = ffi::ErrorInfo::default();
+        RUNTIME.block_on(async {
+            let response = self
+                .inner
+                .send_binary_request_to_replica(code, Bytes::from(payload), replica_id)
+                .await
+                .inspect_err(|error| error_info.record(error))
+                .map_err(|error| {
+                    format!("Could not send raw command '{code}' to replica {replica_id}: {error}")
+                })?;
+            Ok(Vec::from(response))
+        })
+    }
+}
+
+/// Fingerprint of a 32-byte stream key. Any other length is refused with
+/// `InvalidEncryptionKey`.
+pub fn encryption_key_fingerprint(
+    key: &[u8],
+    error_info: &mut ffi::ErrorInfo,
+) -> Result<String, String> {
+    *error_info = ffi::ErrorInfo::default();
+    stream_key_fingerprint(key)
+        .inspect_err(|error| error_info.record(error))
+        .map_err(|error| format!("Could not compute the stream key fingerprint: {error}"))
+}
+
+pub fn encryption_key_fingerprint_base64(
+    key: &str,
+    error_info: &mut ffi::ErrorInfo,
+) -> Result<String, String> {
+    *error_info = ffi::ErrorInfo::default();
+    StreamEncryptionKey::from_str(key)
+        .map(|key| key.fingerprint())
+        .inspect_err(|error| error_info.record(error))
+        .map_err(|error| format!("Could not compute the stream key fingerprint: {error}"))
+}
+
+/// Parses the `mc1_` text form. The error never echoes the text.
+pub fn parse_metadata_change_cursor(
+    text: &[u8],
+    error_info: &mut ffi::ErrorInfo,
+) -> Result<ffi::MetadataChangeCursor, String> {
+    *error_info = ffi::ErrorInfo::default();
+    str::from_utf8(text)
+        .map_err(|_| IggyError::InvalidCommand)
+        .and_then(MetadataChangeCursor::from_str)
+        .map(ffi::MetadataChangeCursor::from)
+        .inspect_err(|error| error_info.record(error))
+        .map_err(|error| format!("Could not parse the metadata change cursor: {error}"))
+}
+
+/// Parses the `cs1_` text form. The error never echoes the text.
+pub fn parse_metadata_current_page_token(
+    text: &[u8],
+    error_info: &mut ffi::ErrorInfo,
+) -> Result<ffi::MetadataCurrentPageToken, String> {
+    *error_info = ffi::ErrorInfo::default();
+    str::from_utf8(text)
+        .map_err(|_| IggyError::InvalidCommand)
+        .and_then(MetadataCurrentPageToken::from_str)
+        .map(ffi::MetadataCurrentPageToken::from)
+        .inspect_err(|error| error_info.record(error))
+        .map_err(|error| format!("Could not parse the metadata current page token: {error}"))
+}
+
+pub fn validate_metadata_changes_query(
+    query: ffi::MetadataChangesQuery,
+    error_info: &mut ffi::ErrorInfo,
+) -> Result<(), String> {
+    *error_info = ffi::ErrorInfo::default();
+    MetadataChangesQuery::try_from(query)
+        .and_then(|query| query.validate().map(|_| ()))
+        .inspect_err(|error| error_info.record(error))
+        .map_err(|error| format!("Invalid metadata changes query: {error}"))
+}
+
+pub fn encode_metadata_changes_query(
+    query: ffi::MetadataChangesQuery,
+    error_info: &mut ffi::ErrorInfo,
+) -> Result<Vec<u8>, String> {
+    *error_info = ffi::ErrorInfo::default();
+    MetadataChangesQuery::try_from(query)
+        .map(|query| GetMetadataChangesRequest::from(&query).to_bytes().to_vec())
+        .inspect_err(|error| error_info.record(error))
+        .map_err(|error| format!("Could not encode the metadata changes query: {error}"))
+}
+
+pub fn decode_metadata_changes(
+    payload: &[u8],
+    error_info: &mut ffi::ErrorInfo,
+) -> Result<ffi::MetadataChanges, String> {
+    *error_info = ffi::ErrorInfo::default();
+    GetMetadataChangesResponse::decode_from(payload)
+        .map_err(|_| IggyError::InvalidFormat)
+        .and_then(MetadataChanges::try_from)
+        .map(ffi::MetadataChanges::from)
+        .inspect_err(|error| error_info.record(error))
+        .map_err(|error| format!("Could not decode the metadata changes: {error}"))
+}
+
+pub fn decode_metadata_change_record(
+    bytes: &[u8],
+    error_info: &mut ffi::ErrorInfo,
+) -> Result<ffi::MetadataChangeRecord, String> {
+    *error_info = ffi::ErrorInfo::default();
+    WireMetadataChangeRecord::decode_from(bytes)
+        .map_err(|_| IggyError::InvalidFormat)
+        .and_then(MetadataChangeRecord::try_from)
+        .map(ffi::MetadataChangeRecord::from)
+        .inspect_err(|error| error_info.record(error))
+        .map_err(|error| format!("Could not decode the metadata change record: {error}"))
+}
+
+pub fn decode_metadata_current_item(
+    bytes: &[u8],
+    error_info: &mut ffi::ErrorInfo,
+) -> Result<ffi::MetadataCurrentItem, String> {
+    *error_info = ffi::ErrorInfo::default();
+    WireMetadataItem::decode_from(bytes)
+        .map_err(|_| IggyError::InvalidFormat)
+        .and_then(MetadataCurrentItem::try_from)
+        .map(ffi::MetadataCurrentItem::from)
+        .inspect_err(|error| error_info.record(error))
+        .map_err(|error| format!("Could not decode the metadata current item: {error}"))
+}
+
+fn is_option_error(error: &IggyError) -> bool {
+    matches!(
+        error,
+        IggyError::UnsupportedOptionKey(_)
+            | IggyError::InvalidOptionValue(_)
+            | IggyError::OptionsBlockTooLarge(_)
+            | IggyError::OptionNotUpdatable(_)
+            | IggyError::OptionNotResettable(_)
+            | IggyError::ReadOnlyOption(_)
+            | IggyError::StreamEncryptionUnavailable
+            | IggyError::UnsupportedCriticalOption(_)
+            | IggyError::CannotModifyRootUser
+    )
 }
 
 pub unsafe fn delete_connection(client: *mut Client) {
@@ -1526,6 +1733,37 @@ mod tests {
                 "{kind}"
             );
         }
+    }
+
+    #[test]
+    fn given_http_option_refusal_when_recording_should_report_the_server_error_code() {
+        let mut error_info = ffi::ErrorInfo::default();
+        error_info.record(&IggyError::HttpResponseError(
+            400,
+            r#"{"id":4105,"code":"read_only_option","reason":"Option is read-only: critical_keys","field":null}"#
+                .to_owned(),
+        ));
+        assert_eq!(
+            error_info.code,
+            IggyError::ReadOnlyOption(String::new()).as_code()
+        );
+        assert_eq!(error_info.kind, "read_only_option");
+
+        let mut root = ffi::ErrorInfo::default();
+        root.record(&IggyError::HttpResponseError(
+            400,
+            r#"{"id":4108,"code":"cannot_modify_root_user","reason":"Cannot modify root user","field":null}"#
+                .to_owned(),
+        ));
+        assert_eq!(root.code, IggyError::CannotModifyRootUser.as_code());
+        assert_eq!(root.kind, "cannot_modify_root_user");
+
+        let mut other = ffi::ErrorInfo::default();
+        other.record(&IggyError::HttpResponseError(
+            400,
+            r#"{"id":1013,"reason":"invalid"}"#.to_owned(),
+        ));
+        assert_eq!(other.kind, "http_response_error");
     }
 
     #[test]
