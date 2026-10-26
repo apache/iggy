@@ -522,8 +522,10 @@ impl OperationDriver {
 
     /// Sends a non-replicated request to replica `replica_id` and returns its
     /// reply. Writes and partition reads go through the routing of their own
-    /// kind: a poll or a consumer-offset read needs the partition's primary and
-    /// its incarnation, which a request to a chosen replica does not carry.
+    /// kind: a poll, a readiness wait or a consumer-offset read needs the
+    /// partition's primary and its incarnation, which a request to a chosen
+    /// replica does not carry. The server answers no cancel, so a raw one
+    /// could only wait for its deadline.
     pub(crate) async fn send_to_replica(
         &self,
         code: u32,
@@ -531,8 +533,14 @@ impl OperationDriver {
         replica_id: u8,
     ) -> Result<Bytes, IggyError> {
         if operation_for_code(code) != Operation::NonReplicated
-            || code == POLL_MESSAGES_CODE
-            || code == GET_CONSUMER_OFFSET_CODE
+            || matches!(
+                code,
+                POLL_MESSAGES_CODE
+                    | POLL_MESSAGES_DEFERRED_CODE
+                    | WAIT_FOR_MESSAGES_CODE
+                    | CANCEL_DEFERRED_REQUEST_CODE
+                    | GET_CONSUMER_OFFSET_CODE
+            )
         {
             return Err(IggyError::InvalidCommand);
         }
@@ -2432,6 +2440,9 @@ mod tests {
             SEND_MESSAGES_CODE,
             STORE_CONSUMER_OFFSET_CODE,
             POLL_MESSAGES_CODE,
+            POLL_MESSAGES_DEFERRED_CODE,
+            WAIT_FOR_MESSAGES_CODE,
+            CANCEL_DEFERRED_REQUEST_CODE,
             GET_CONSUMER_OFFSET_CODE,
         ] {
             assert_eq!(

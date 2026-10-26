@@ -459,8 +459,9 @@ public class AsyncIggyTcpClient {
      * as GetStats from its own state, so this reads the state of the chosen node.
      *
      * <p>The request carries the metadata watermark of the session, so the replica answers after it applied the
-     * metadata that this client saw. Replicated commands, PollMessages, GetConsumerOffset and session-control codes
-     * complete the returned future with an invalid-command error before anything is sent. An id that cluster metadata does not
+     * metadata that this client saw. Replicated commands, PollMessages, deferred polls, WaitForMessages,
+     * CancelDeferredRequest, GetConsumerOffset and session-control codes complete the returned future with an
+     * invalid-command error before anything is sent. An id that cluster metadata does not
      * name after one read of it completes the future with an invalid-identifier error. A replica that cannot be
      * reached, or that answers with code 58, is asked again until the request timeout, which ends the call with code
      * 58. Any other refusal, NotPrimary (89) included, completes the future unchanged and is never sent to another
@@ -478,6 +479,9 @@ public class AsyncIggyTcpClient {
         Objects.requireNonNull(payload, "payload cannot be null");
         if (isSessionControlCode(code)
                 || code == CommandCode.Messages.POLL.getValue()
+                || code == CommandCode.Messages.POLL_DEFERRED.getValue()
+                || code == CommandCode.Messages.WAIT_FOR_MESSAGES.getValue()
+                || code == CommandCode.Messages.CANCEL_DEFERRED_REQUEST.getValue()
                 || code == CommandCode.ConsumerOffset.GET.getValue()
                 || VsrOperation.operationForCode(code) != VsrOperation.NON_REPLICATED) {
             return CompletableFuture.failedFuture(

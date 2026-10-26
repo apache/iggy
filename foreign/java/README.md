@@ -125,7 +125,7 @@ credentials unchanged.
 
 `sendBinaryRequestToReplica(code, payload, replicaId)` sends a raw command to one node of a cluster, named by the replica id that cluster metadata returns.
 
-Each node answers non-replicated commands such as `GetStats` from its own state, so this reads the state of that node. Replicated commands, polls, consumer-offset reads and session-control codes fail with `INVALID_COMMAND` before anything is sent.
+Each node answers non-replicated commands such as `GetStats` from its own state, so this reads the state of that node. Replicated commands, polls, readiness waits, deferred-request cancels, consumer-offset reads and session-control codes fail with `INVALID_COMMAND` before anything is sent.
 
 An id that cluster metadata does not name fails with `INVALID_IDENTIFIER`. An unreachable node is retried until the request timeout, and a `NOT_PRIMARY` reply is returned rather than sent to another node. The HTTP client throws `IggyOperationNotSupportedException`.
 

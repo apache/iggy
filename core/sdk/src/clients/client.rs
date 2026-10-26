@@ -953,8 +953,8 @@ impl IggyClient {
     ///
     /// # Errors
     /// [`IggyError::InvalidCommand`] before anything is sent if `code` is a
-    /// session-control code, a replicated command, a poll, or a consumer-offset
-    /// read. Writes and partition reads reach their primary through the typed
+    /// session-control code, a replicated command, a poll, a readiness wait, a
+    /// deferred-request cancel, or a consumer-offset read. Writes and partition reads reach their primary through the typed
     /// API and [`send_binary_request`](IggyClient::send_binary_request).
     /// [`IggyError::InvalidIdentifier`] if the roster does not name
     /// `replica_id`, or names it without an endpoint for this transport.
