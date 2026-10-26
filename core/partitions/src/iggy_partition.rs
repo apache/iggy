@@ -168,6 +168,8 @@ where
     /// Widest batch committed here, the floor for a disk poll's first read.
     /// See [`Self::widest_committed_batch`].
     widest_batch_bytes: Cell<u64>,
+    /// See [`PollVisibility::committed_bytes`].
+    committed_bytes: u64,
     pub created_at: IggyTimestamp,
     pub revision_id: u64,
     pub(crate) offset_space: OffsetSpace,
@@ -483,6 +485,17 @@ pub struct PollReplication {
     prepare: Message<PrepareHeader>,
     /// Keeps the consumer key reserved until replication stages the prepare.
     reservation: AutoCommitReservation,
+}
+
+/// What a parked poll compares between two reads of a partition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PollVisibility {
+    /// The committed offset, `None` until the offset space is seeded.
+    pub offset: Option<u64>,
+    /// Encoded bytes, batch framing included, of the batches that commits
+    /// made visible since the partition was opened. Only its growth between
+    /// two reads has a meaning.
+    pub committed_bytes: u64,
 }
 
 /// Post-preflight dispatch in `on_request`: replicate via VSR or take the
@@ -880,6 +893,7 @@ where
             history_transition: None,
             stats,
             widest_batch_bytes: Cell::new(0),
+            committed_bytes: 0,
             created_at: IggyTimestamp::now(),
             revision_id: 0,
             offset_space: OffsetSpace::default(),
@@ -4326,14 +4340,18 @@ where
         self.transfer_plan.borrow_mut().take();
     }
 
-    /// The served history and the committed offset, which stays `None` until the
-    /// offset space is seeded. A change of either can make a parked poll ready.
-    pub fn poll_visibility(&self) -> (PollHistoryId, Option<u64>) {
+    /// The served history and what commits made visible in it. A change of
+    /// either can make a parked poll ready.
+    pub fn poll_visibility(&self) -> (PollHistoryId, PollVisibility) {
         (
             self.poll_history,
-            self.offset_space
-                .committed_seeded
-                .then(|| self.offset.load(Ordering::Acquire)),
+            PollVisibility {
+                offset: self
+                    .offset_space
+                    .committed_seeded
+                    .then(|| self.offset.load(Ordering::Acquire)),
+                committed_bytes: self.committed_bytes,
+            },
         )
     }
 
@@ -11408,6 +11426,7 @@ where
             .is_none_or(|durable| end_offset > durable)
         {
             self.offset.store(end_offset, Ordering::Release);
+            self.committed_bytes = self.committed_bytes.saturating_add(batch_stats.size_bytes);
             self.stats.set_current_offset(end_offset);
             // Advance the aggregate stats with the visible offset. Disk
             // persistence is threshold-gated in `commit_messages`, which

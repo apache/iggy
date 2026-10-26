@@ -92,7 +92,7 @@ pub const DEFAULT_CONSUMER_OFFSETS_MAX: usize = 4096;
 
 pub(crate) const FILE_SYNC_CONCURRENCY: usize = 16;
 
-pub use iggy_partition::{PollCompletion, PollReplication};
+pub use iggy_partition::{PollCompletion, PollReplication, PollVisibility};
 pub use messages_writer::MessagesWriter;
 pub use offset_storage::delete_persisted_offset;
 pub use partition_storage::{

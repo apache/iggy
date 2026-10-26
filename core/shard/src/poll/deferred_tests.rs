@@ -22,7 +22,7 @@ use std::time::Duration;
 use super::*;
 use consensus::PartitionsHandle;
 use iggy_binary_protocol::requests::partitions::InstallConsumerGroupOwnerRequest;
-use iggy_common::IggyTimestamp;
+use iggy_common::{IggyByteSize, IggyTimestamp};
 use metadata::IggyMetadata;
 use metadata::stm::consumer_group::{ConsumerGroup, ConsumerGroupMember};
 use metadata::stm::stream::{Partition as MetadataPartition, Stream, StreamsInner, Topic};
@@ -346,10 +346,60 @@ async fn commit(owner: &TestShard, payloads: &[&str], request: u64) {
     partitions.insert(namespace(), partition);
 }
 
+/// Commits `payloads` and, like a persisted topic on one replica, can drop
+/// them from the journal in the same step.
+async fn commit_and_evict(owner: &TestShard, payloads: &[&str], request: u64, evict: bool) {
+    commit(owner, payloads, request).await;
+    if evict {
+        evict_messages_for_disk_dispatch(owner, namespace());
+    }
+}
+
+/// Routes timestamp polls to the disk, as segment bytes do.
+fn persist_segment_bytes(owner: &TestShard) {
+    let partitions = owner.plane.partitions();
+    let mut partition = partitions.remove(&namespace()).unwrap();
+    partition.log.active_segment_mut().size = IggyByteSize::from(1);
+    partitions.insert(namespace(), partition);
+}
+
 #[compio::test]
 async fn waiter_reads_from_disk_again_only_once_new_messages_can_reach_min_count() {
+    for evict in [false, true] {
+        let owner = owner(&["first"]).await;
+        let replies = parked_after_disk_read(&owner, request(&owner, 3, false, false)).await;
+
+        commit_and_evict(&owner, &["second"], 2, evict).await;
+        owner.service_deferred_polls().await;
+        pending(&replies);
+        assert!(
+            owner.bus.spawned_tasks.borrow().is_empty(),
+            "two of three messages start no read, evicted: {evict}"
+        );
+        assert_eq!(
+            owner.deferred_polls.state.borrow().waiters[&1]
+                .last_visibility
+                .map(|visibility| visibility.offset),
+            Some(Some(1))
+        );
+
+        commit_and_evict(&owner, &["third"], 3, evict).await;
+        owner.service_deferred_polls().await;
+        assert_eq!(
+            owner.bus.spawned_tasks.borrow().len(),
+            1,
+            "three messages start a read, evicted: {evict}"
+        );
+    }
+}
+
+#[compio::test]
+async fn timestamp_waiter_reads_again_only_once_new_messages_can_reach_min_count() {
     let owner = owner(&["first"]).await;
-    let replies = parked_after_disk_read(&owner, request(&owner, 3, false, false)).await;
+    let mut request = request(&owner, 3, false, false);
+    request.args = PollingArgs::new(PollingStrategy::timestamp(IggyTimestamp::from(0)), 3, false);
+    persist_segment_bytes(&owner);
+    let replies = parked_after_disk_read(&owner, request).await;
 
     commit(&owner, &["second"], 2).await;
     owner.service_deferred_polls().await;
@@ -357,10 +407,6 @@ async fn waiter_reads_from_disk_again_only_once_new_messages_can_reach_min_count
     assert!(
         owner.bus.spawned_tasks.borrow().is_empty(),
         "two of three messages start no read"
-    );
-    assert_eq!(
-        owner.deferred_polls.state.borrow().waiters[&1].last_visibility,
-        Some(Some(1))
     );
 
     commit(&owner, &["third"], 3).await;

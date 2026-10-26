@@ -37,7 +37,7 @@ use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::stream::PollMetadata;
-use partitions::{Partition, PollReadResult, PollingArgs, PollingConsumer};
+use partitions::{Partition, PollReadResult, PollVisibility, PollingArgs, PollingConsumer};
 use server_common::poll::PollHistoryId;
 use server_common::sharding::IggyNamespace;
 
@@ -136,16 +136,43 @@ struct Waiter {
     reply: Sender<PartitionReadReply>,
     history: PollHistoryId,
     view: u32,
-    /// The visible offset at the last read, `None` before the first read.
-    #[allow(clippy::option_option)]
-    last_visibility: Option<Option<u64>>,
+    /// The visibility at the last read, `None` before the first read.
+    last_visibility: Option<PollVisibility>,
     running: bool,
     terminal: bool,
     /// When a full read budget first refused this waiter. It keeps the
     /// waiter's place in the read queue until one of its reads starts.
     refused_at: Option<u64>,
-    /// What a read from the start offset through `last_visibility` selects.
+    /// At most what a read from the start through `last_visibility` selects.
     selected: Selection,
+}
+
+impl Waiter {
+    /// At most what a read from the start selects at `visibility`. Offsets
+    /// are consecutive, so the offsets committed after the last read bound
+    /// the messages that a read can add, whatever the polling kind.
+    fn selection_at(&self, visibility: PollVisibility) -> Option<Selection> {
+        let last = self.last_visibility?;
+        let args = &self.request.args;
+        let mut from = last.offset.map_or(0, |offset| offset.saturating_add(1));
+        if args.kind == PollingKind::Offset {
+            from = from.max(args.value);
+        }
+        let messages = visibility
+            .offset
+            .map_or(0, |offset| offset.saturating_add(1).saturating_sub(from));
+        let bytes = visibility
+            .committed_bytes
+            .saturating_sub(last.committed_bytes);
+        Some(Selection {
+            messages: u32::try_from(messages).map_or(u32::MAX, |messages| {
+                self.selected.messages.saturating_add(messages)
+            }),
+            bytes: usize::try_from(bytes).map_or(usize::MAX, |bytes| {
+                self.selected.bytes.saturating_add(bytes)
+            }),
+        })
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -479,7 +506,7 @@ where
         namespace: IggyNamespace,
         context: &DeferredPollContext,
         consumer: PollingConsumer,
-    ) -> Result<(PollHistoryId, Option<u64>, u32), IggyError> {
+    ) -> Result<(PollHistoryId, PollVisibility, u32), IggyError> {
         if context
             .session
             .as_ref()
@@ -542,16 +569,16 @@ where
                 {
                     return Err(IggyError::TransientNotAccepted);
                 }
-                let (history, offset) = partition.poll_visibility();
-                Ok((history, offset, consensus.view()))
+                let (history, visibility) = partition.poll_visibility();
+                Ok((history, visibility, consensus.view()))
             })
             .ok_or(IggyError::TransientNotAccepted)?
     }
 
-    /// The visible offset of the partition, while its history and view are
-    /// those of the admission.
-    fn validate_waiter(&self, waiter: &Waiter) -> Result<Option<u64>, IggyError> {
-        let (history, offset, view) = self.validate_deferred_context(
+    /// The visibility of the partition, while its history and view are those
+    /// of the admission.
+    fn validate_waiter(&self, waiter: &Waiter) -> Result<PollVisibility, IggyError> {
+        let (history, visibility, view) = self.validate_deferred_context(
             waiter.namespace,
             &waiter.request.context,
             waiter.request.consumer,
@@ -559,7 +586,7 @@ where
         if history != waiter.history || view != waiter.view {
             return Err(IggyError::TransientNotAccepted);
         }
-        Ok(offset)
+        Ok(visibility)
     }
 
     /// The pump services the admitted waiter at the top of its next turn.
@@ -712,13 +739,12 @@ where
                 .deadlines
                 .insert((waiter.request.request_deadline, id));
         }
-        // A read from the start offset that cannot finish would only park the
-        // waiter again. Counting what was committed after the last read
-        // stands in for it.
+        // A read from the start that cannot finish would only park the waiter
+        // again. What was committed after the last read bounds what it adds.
         if !waiter.running
             && !waiter.terminal
             && waiter.last_visibility != Some(visibility)
-            && let Some(selected) = self.selected_through(&waiter)
+            && let Some(selected) = waiter.selection_at(visibility)
             && !selected.finishes_read(
                 &waiter.request.options,
                 self.deferred_polls.config.borrow().max_read_bytes,
@@ -787,44 +813,6 @@ where
         self.bus.spawn(async move {
             completion.complete(plan.execute_with_limit(max_bytes).await);
         });
-    }
-
-    /// Adds the resident messages committed after `last_visibility` to the
-    /// last read. `None` before the first read, for a start that moves with
-    /// the partition, and once those messages left the journal, because then
-    /// only a full read can count them.
-    fn selected_through(&self, waiter: &Waiter) -> Option<Selection> {
-        let args = &waiter.request.args;
-        if args.kind != PollingKind::Offset {
-            return None;
-        }
-        let from = waiter.last_visibility?.map_or(args.value, |offset| {
-            args.value.max(offset.saturating_add(1))
-        });
-        let needed = waiter
-            .request
-            .options
-            .min_count
-            .saturating_sub(waiter.selected.messages);
-        let plan = self.plane.partitions().build_poll_snapshot(
-            &waiter.namespace,
-            waiter.request.consumer,
-            &PollingArgs::new(PollingStrategy::offset(from), needed, false),
-        )?;
-        if plan.needs_off_pump_io() {
-            return None;
-        }
-        let committed = plan.execute_resident().checked().ok()?;
-        Some(Selection {
-            messages: waiter
-                .selected
-                .messages
-                .saturating_add(committed.message_count()),
-            bytes: waiter
-                .selected
-                .bytes
-                .saturating_add(committed.encoded_bytes()),
-        })
     }
 
     #[allow(clippy::future_not_send)]
@@ -1067,7 +1055,7 @@ where
         &self,
         target: &ReadinessTarget,
     ) -> Result<(PollHistoryId, u32, bool), IggyError> {
-        let (history, commit, view) =
+        let (history, visibility, view) =
             self.validate_deferred_context(target.namespace, &target.context, target.consumer)?;
         let start = match target.strategy.kind {
             PollingKind::Offset => target.strategy.value,
@@ -1085,7 +1073,11 @@ where
                 })?,
             _ => return Err(IggyError::InvalidCommand),
         };
-        Ok((history, view, commit.is_some_and(|commit| start <= commit)))
+        Ok((
+            history,
+            view,
+            visibility.offset.is_some_and(|commit| start <= commit),
+        ))
     }
 
     fn probe_readiness(&self, id: u64, waiter: ReadinessWaiter) {
