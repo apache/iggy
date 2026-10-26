@@ -14,7 +14,7 @@ Set the broker credentials and connector configuration directory before starting
 
 The [docker image](https://hub.docker.com/r/apache/iggy-connect) is available, and can be fetched via `docker pull apache/iggy-connect:edge`.
 
-The runtime opens two Iggy TCP clients, one for producers and one for consumers. Set credentials matching the broker and a connector configuration provider. Omitted settings use the embedded defaults, including file-based source state storage. Save this example as `connectors.toml` in the repository root and replace `path/to/connectors` with your connector configuration directory.
+The runtime opens one Iggy TCP client that all sources share, and each sink opens its own client every time it starts. Set credentials matching the broker and a connector configuration provider. Omitted settings use the embedded defaults, including file-based source state storage. Save this example as `connectors.toml` in the repository root and replace `path/to/connectors` with your connector configuration directory.
 
 ```toml
 [iggy]
@@ -64,6 +64,14 @@ Use `max_wait` and `min_count` in place of `poll_interval`. If a sink
 commits the offset of each sink poll when it answers the poll, before the
 plugin consumes the messages. Sinks need a server that supports deferred polls
 (binary commands 106 and 107).
+
+At each start, a sink connects an Iggy client of its own. After the last
+consumer of that start stops, the sink logs the client out and shuts it down.
+A poll of one sink that waits for messages thus does not delay the polls or
+offset stores of another sink. The consumers inside one sink share its client.
+They share the progress lane of each partition, which orders their polls and
+offset calls. They also share the limit of 64 deferred requests per client.
+The [SDK README](../../sdk/README.md) describes both.
 
 ## State storage
 

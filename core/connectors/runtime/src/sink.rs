@@ -20,6 +20,7 @@ use crate::configs::connectors::{SinkConfig, StreamConsumerConfig};
 use crate::context::RuntimeContext;
 use crate::log::LOG_CALLBACK;
 use crate::metrics::{ConnectorType, Metrics, SinkLabels};
+use crate::stream::IggyClients;
 use crate::{
     FailedPlugin, PLUGIN_ID, RuntimeError, SinkApi, SinkConnector, SinkConnectorConsumer,
     SinkConnectorPlugin, SinkConnectorWrapper, close_plugin_instance, resolve_plugin_path,
@@ -28,8 +29,8 @@ use crate::{
 use dlopen2::wrapper::Container;
 use futures::{Stream, StreamExt};
 use iggy::prelude::{
-    AutoCommit, AutoCommitWhen, DeferredPollOptions, IggyClient, IggyConsumer, IggyError,
-    IggyMessage, NonZeroIggyDuration, PollingStrategy,
+    AutoCommit, AutoCommitWhen, Client, DeferredPollOptions, IggyClient, IggyConsumer, IggyError,
+    IggyMessage, NonZeroIggyDuration, PollingStrategy, UserClient,
 };
 use iggy_connector_sdk::decoders::avro::{AvroConfig, AvroStreamDecoder};
 use iggy_connector_sdk::{
@@ -48,8 +49,8 @@ use tracing::{debug, error, info, warn};
 
 /// Initializes all enabled sink connectors.
 ///
-/// Per-connector failures (path resolution, dlopen, plugin init,
-/// consumer/decoder/transform setup) are captured against the offending
+/// Per-connector failures (path resolution, dlopen, plugin init, client
+/// connect, consumer/decoder/transform setup) are captured against the offending
 /// connector and do not abort the runtime. Connectors that fail before their
 /// FFI container can be loaded are returned in the second tuple element so
 /// they remain visible in health/status output.
@@ -58,7 +59,7 @@ use tracing::{debug, error, info, warn};
 /// propagated as `Err`.
 pub async fn init(
     sink_configs: HashMap<String, SinkConfig>,
-    iggy_client: &IggyClient,
+    iggy_clients: &IggyClients,
 ) -> Result<(HashMap<String, SinkConnector>, Vec<FailedPlugin>), RuntimeError> {
     let mut sink_connectors: HashMap<String, SinkConnector> = HashMap::new();
     let mut failed_plugins: Vec<FailedPlugin> = Vec::new();
@@ -145,6 +146,7 @@ pub async fn init(
             version,
             config_format: config.plugin_config_format,
             consumers: vec![],
+            client: None,
             error: init_error.clone(),
             verbose: config.verbose,
             benchmark: config.benchmark,
@@ -155,8 +157,18 @@ pub async fn init(
             continue;
         }
 
-        match setup_sink_consumers(&key, &config, iggy_client).await {
-            Ok(consumers) => {
+        let setup = async {
+            let client = iggy_clients.connect_sink_client().await?;
+            match setup_sink_consumers(&key, &config, &client).await {
+                Ok(consumers) => Ok((client, consumers)),
+                Err(error) => {
+                    release_sink_client(client, plugin_id).await;
+                    Err(error)
+                }
+            }
+        };
+        match setup.await {
+            Ok((client, consumers)) => {
                 let connector = sink_connectors
                     .get_mut(&path)
                     .expect("sink connector was inserted above");
@@ -165,6 +177,7 @@ pub async fn init(
                     .iter_mut()
                     .find(|plugin| plugin.id == plugin_id)
                     .expect("sink plugin was pushed above");
+                plugin.client = Some(client);
                 for (consumer, decoder, batch_size, transforms) in consumers {
                     plugin.consumers.push(SinkConnectorConsumer {
                         consumer,
@@ -206,13 +219,15 @@ pub fn consume(
     let mut handles = Vec::new();
     for sink in sinks {
         for plugin in sink.plugins {
-            if let Some(error) = &plugin.error {
+            // Only a sink whose setup failed has no client, and its error says why.
+            let Some(client) = plugin.client else {
                 error!(
-                    "Failed to initialize sink connector with ID: {}: {error}. Skipping...",
+                    "Failed to initialize sink connector with ID: {}: {}. Skipping...",
                     plugin.id,
+                    plugin.error.as_deref().unwrap_or_default(),
                 );
                 continue;
-            }
+            };
             info!("Starting consume for sink with ID: {}...", plugin.id);
             let consumers = plugin
                 .consumers
@@ -223,6 +238,7 @@ pub fn consume(
                 plugin.id,
                 &plugin.key,
                 consumers,
+                client,
                 sink.callback,
                 plugin.verbose,
                 plugin.benchmark,
@@ -235,6 +251,10 @@ pub fn consume(
     handles
 }
 
+/// Every task holds a reference to the `client` of this start, and the task
+/// that ends last logs it out and shuts it down. A consumer shutdown can still
+/// store offsets after a stop stops waiting for its task, so the client must
+/// outlive it.
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub(crate) fn spawn_consume_tasks(
     plugin_id: u32,
@@ -245,6 +265,7 @@ pub(crate) fn spawn_consume_tasks(
         u32,
         Vec<Arc<dyn Transform>>,
     )>,
+    client: Arc<IggyClient>,
     callback: ConsumeCallback,
     verbose: bool,
     benchmark: bool,
@@ -258,9 +279,19 @@ pub(crate) fn spawn_consume_tasks(
         );
     }
     let (shutdown_tx, shutdown_rx) = watch::channel(());
+    if consumers.is_empty() {
+        // Without a task, nothing else shuts the client down.
+        tokio::spawn(release_sink_client(client, plugin_id));
+        return (shutdown_tx, Vec::new());
+    }
+    // Each task gets its own reference and none stays here, so the task that
+    // ends last finds the client unshared.
+    let clients = vec![client; consumers.len()];
     let mut task_handles = Vec::new();
     let labels = Arc::new(SinkLabels::new(plugin_key));
-    for (mut consumer, decoder, batch_size, transforms) in consumers {
+    for ((mut consumer, decoder, batch_size, transforms), client) in
+        consumers.into_iter().zip(clients)
+    {
         let plugin_key = plugin_key.to_string();
         let metrics = metrics.clone();
         let shutdown_rx = shutdown_rx.clone();
@@ -304,10 +335,29 @@ pub(crate) fn spawn_consume_tasks(
                     "Failed to shut down the consumer of sink connector with ID: {plugin_id}: {error}"
                 );
             }
+            release_sink_client(client, plugin_id).await;
         });
         task_handles.push(handle);
     }
     (shutdown_tx, task_handles)
+}
+
+/// Logs the client of a sink start out and shuts it down when the caller holds
+/// its last reference. Each holder calls it once it is done with the client. A
+/// closed connection alone keeps its session, and with it the group members,
+/// until the session times out.
+pub(crate) async fn release_sink_client(client: Arc<IggyClient>, plugin_id: u32) {
+    let Some(client) = Arc::into_inner(client) else {
+        return;
+    };
+    if let Err(error) = client.logout_user().await {
+        warn!("Failed to log out the Iggy client of sink connector with ID: {plugin_id}: {error}");
+    }
+    if let Err(error) = client.shutdown().await {
+        error!(
+            "Failed to shut down the Iggy client of sink connector with ID: {plugin_id}: {error}"
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -17,6 +17,7 @@
 
 use iggy::prelude::{Client, IggyClient, IggyClientBuilder};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing::{error, info};
 
 use crate::configs::runtime::IggyConfig;
@@ -74,14 +75,24 @@ fn resolve_token(token: &str) -> Result<String, RuntimeError> {
 
 pub struct IggyClients {
     pub producer: IggyClient,
-    pub consumer: IggyClient,
+    /// Each sink start connects its own client with it.
+    pub config: IggyConfig,
 }
 
 pub async fn init(config: IggyConfig) -> Result<IggyClients, RuntimeError> {
-    let consumer = create_client(&config).await?;
     let producer = create_client(&config).await?;
-    let iggy_clients = IggyClients { producer, consumer };
-    Ok(iggy_clients)
+    Ok(IggyClients { producer, config })
+}
+
+impl IggyClients {
+    /// A client of its own for one sink start. The consumers of one client
+    /// share its progress lanes and deferred request slots, so on a shared
+    /// client a parked poll of one sink holds back the polls and offset stores
+    /// of another. A stopped start that leaves its group late also cannot touch
+    /// the group membership of the next start.
+    pub async fn connect_sink_client(&self) -> Result<Arc<IggyClient>, RuntimeError> {
+        create_client(&self.config).await.map(Arc::new)
+    }
 }
 
 /// Builds the authenticated connection string for `config`, resolving a
