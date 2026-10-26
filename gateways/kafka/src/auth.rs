@@ -29,13 +29,12 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use iggy::prelude::{
     AutoLogin, Client, Credentials, Identifier, IggyError, Permissions, TcpClient,
-    TcpClientConfigBuilder,
+    TcpClientConfigBuilder, UserStatus,
 };
 use tokio::sync::SemaphorePermit;
 use tracing::{debug, warn};
 
-use crate::bridge::config::DEFAULT_IGGY_ADDR;
-use crate::env::parse_bool;
+use crate::bridge::config::{DEFAULT_IGGY_ADDR, IggyTls};
 use crate::protocol::acl::PrincipalPermissions;
 use crate::protocol::sasl::PlainCredentials;
 
@@ -216,6 +215,23 @@ pub struct AuthenticatedPrincipal {
     pub permissions_known: bool,
 }
 
+impl AuthenticatedPrincipal {
+    /// Kafka's name for a client that proved no identity, as `DescribeAcls` renders it.
+    pub const ANONYMOUS: &'static str = "ANONYMOUS";
+
+    /// A connection that proved no identity on a gateway that authenticates somewhere: it holds
+    /// nothing, and that is a real answer rather than a failed read. It is "authenticated" only in
+    /// the sense that the connection's identity has been decided.
+    #[must_use]
+    pub fn anonymous() -> Self {
+        Self {
+            username: Self::ANONYMOUS.to_string(),
+            permissions: PrincipalPermissions::default(),
+            permissions_known: true,
+        }
+    }
+}
+
 /// Verifies Kafka-supplied credentials.
 ///
 /// A trait rather than a concrete type so the protocol tests can drive the whole SASL exchange
@@ -240,18 +256,21 @@ pub trait SaslAuthenticator: Send + Sync + std::fmt::Debug {
     ) -> Result<AuthenticatedPrincipal, AuthError>;
 }
 
-/// How the verifier reaches Iggy.
+/// Names an Iggy user a listener authenticated by some means other than a password.
 ///
-/// Separate from the gateway's own listener security. A deployment can terminate TLS on the Kafka
-/// side and still speak plain TCP to a co-located Iggy, or the reverse, and the two are configured
-/// independently because they protect different hops.
-#[derive(Debug, Clone, Default)]
-pub struct IggyTls {
-    pub enabled: bool,
-    /// Name checked against the server certificate. Empty means derive it from the address.
-    pub domain: String,
-    /// PEM roots to trust. Unset uses the SDK's bundled roots, not the system trust store.
-    pub ca_file: Option<String>,
+/// An `SSL` listener that verifies client certificates maps each certificate's subject to a
+/// username and asks this whether that user exists and what it may do. The bridge implements it
+/// over its own session; the protocol tests drive the certificate path without an Iggy server
+/// through a stub.
+#[async_trait]
+pub trait PrincipalResolver: Send + Sync + std::fmt::Debug {
+    /// Returns the principal when `username` names an active Iggy user.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::Rejected`] when no such active user exists and
+    /// [`AuthError::Unavailable`] when Iggy cannot be asked.
+    async fn resolve(&self, username: &str) -> Result<AuthenticatedPrincipal, AuthError>;
 }
 
 /// Verifies credentials by logging into a real Iggy server with them.
@@ -322,30 +341,7 @@ impl IggyAuthenticator {
     pub fn from_env() -> Result<Self, String> {
         let address =
             std::env::var("IGGY_KAFKA_IGGY_ADDR").unwrap_or_else(|_| DEFAULT_IGGY_ADDR.to_string());
-        // Unset reads as off; only a value that is set and unrecognised is an error, which is
-        // what `parse_bool` decides for every switch in this gateway.
-        let enabled = match std::env::var("IGGY_KAFKA_IGGY_TLS_ENABLED") {
-            Ok(raw) => parse_bool("IGGY_KAFKA_IGGY_TLS_ENABLED", &raw)?,
-            Err(_) => false,
-        };
-        let domain = std::env::var("IGGY_KAFKA_IGGY_TLS_DOMAIN").unwrap_or_default();
-        let ca_file = std::env::var("IGGY_KAFKA_IGGY_TLS_CA_FILE").ok();
-        // Configuring TLS material and leaving the switch off is the same "believes TLS is on"
-        // mistake the value check above exists to catch, reached through the unset path instead of
-        // a typo. Silently ignoring it would send credentials in the clear.
-        if !enabled && (!domain.is_empty() || ca_file.is_some()) {
-            return Err(
-                "IGGY_KAFKA_IGGY_TLS_DOMAIN or IGGY_KAFKA_IGGY_TLS_CA_FILE is set but \
-                 IGGY_KAFKA_IGGY_TLS_ENABLED is not true; the connection to Iggy would be in the \
-                 clear despite the TLS configuration"
-                    .to_string(),
-            );
-        }
-        Ok(Self::new(address).with_tls(IggyTls {
-            enabled,
-            domain,
-            ca_file,
-        }))
+        Ok(Self::new(address).with_tls(IggyTls::from_env()?))
     }
 }
 
@@ -429,6 +425,67 @@ impl SaslAuthenticator for IggyAuthenticator {
             permissions_known: read == PermissionRead::Resolved,
         })
     }
+}
+
+/// Looks up a user Iggy did not authenticate itself, for a listener where the client's
+/// certificate is the credential.
+///
+/// `client` is a session the gateway holds in its own name, so reading another account's record
+/// needs `read_users` on that session. A record that resolves to nothing is a rejection here,
+/// unlike [`fetch_permissions`]'s empty fallback: there a login had already proven the account
+/// exists, and here nothing has.
+///
+/// # Errors
+///
+/// Returns [`AuthError::Rejected`] when `username` names no active user and
+/// [`AuthError::Unavailable`] when the lookup itself failed, including for want of `read_users`.
+pub(crate) async fn resolve_principal(
+    client: &impl Client,
+    username: &str,
+) -> Result<AuthenticatedPrincipal, AuthError> {
+    let Ok(identifier) = Identifier::named(username) else {
+        debug!(
+            username,
+            "the certificate's mapped name is not a valid Iggy identifier"
+        );
+        return Err(AuthError::Rejected);
+    };
+    let user = match client.get_user(&identifier).await {
+        Ok(Some(user)) => user,
+        Ok(None) => {
+            debug!(
+                username,
+                "the certificate's mapped name is not an Iggy user"
+            );
+            return Err(AuthError::Rejected);
+        }
+        Err(IggyError::Unauthorized) => {
+            // Not a rejection: the account may well exist. The session doing the lookup lacks
+            // `read_users`, which is the operator's to fix, and reporting it as an unknown user
+            // would send them to provision an account they already have.
+            warn!(
+                "the bridge's Iggy user lacks read_users, so certificate identities cannot be resolved"
+            );
+            return Err(AuthError::Unavailable);
+        }
+        Err(error) => {
+            warn!(%error, "could not look up the certificate's Iggy user");
+            return Err(AuthError::Unavailable);
+        }
+    };
+    if user.status != UserStatus::Active {
+        debug!(username, "the certificate names an inactive Iggy user");
+        return Err(AuthError::Rejected);
+    }
+    Ok(AuthenticatedPrincipal {
+        username: username.to_string(),
+        permissions: user
+            .permissions
+            .as_ref()
+            .map(PrincipalPermissions::from)
+            .unwrap_or_default(),
+        permissions_known: true,
+    })
 }
 
 /// How the permission read after a login ended.

@@ -222,6 +222,17 @@ pub struct Permissions {
 }
 
 impl Permissions {
+    pub fn ensure_recovery(&self) -> Result<(), ErrorData> {
+        if self.create || self.update || self.delete {
+            Ok(())
+        } else {
+            Err(ErrorData::invalid_request(
+                "Insufficient 'write recovery' permissions",
+                None,
+            ))
+        }
+    }
+
     pub fn ensure_read(&self) -> Result<(), ErrorData> {
         if self.read {
             Ok(())

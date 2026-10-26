@@ -47,21 +47,17 @@ export type CommandResponse = {
 };
 
 export type SendCommandOptions = {
+  /** Cancels this call without closing its shared replica link. */
+  signal?: AbortSignal,
   /** Whether the response uses the standard command response decoder */
   handleResponse?: boolean,
-  /** Whether to append rather than prepend the command to the queue */
+  /** @deprecated Multiplexed calls ignore this queue-order hint. */
   last?: boolean,
-  /**
-   * Whether a not-admitted refusal re-checks the leader and re-issues the
-   * command. False for the roster read a re-check itself runs: answering a
-   * leader check with another leader check would recurse.
-   */
+  /** @deprecated The shared session owner manages replica routing. */
   followsLeaderMoves?: boolean,
   /**
    * When the whole request gives up, as an epoch timestamp in milliseconds.
-   * Set when a command already carries a budget -- one re-issued after a
-   * leader move keeps the budget it was first submitted with, rather than
-   * opening a second one on top of it. Defaults to a fresh response timeout.
+   * Includes admission, discovery, link waits and retries. Defaults to 30 seconds.
    */
   deadline?: number,
   /**
@@ -71,7 +67,23 @@ export type SendCommandOptions = {
    * after a history refusal (87): work from one partition incarnation must
    * not land in another.
    */
-  context?: PartitionContext
+  context?: PartitionContext,
+  /**
+   * Sends the command to the replica with this id instead of the replica the
+   * client picks, for example to read the stats that replica keeps for itself.
+   * Replica ids are the ones the cluster metadata returns. Only non-replicated
+   * commands other than a poll, a consumer-offset read or session control are
+   * accepted, others fail with status 3 before anything is sent. An id the roster does not name fails with status 6. The
+   * replica's reply is returned as it is, a `NotPrimary` (89) refusal
+   * included, and nothing is retried on another replica.
+   */
+  replica?: number,
+  /**
+   * The `RawClient.lineage` that a call of several commands started with. A
+   * command of an older lineage fails with status 40 and sends nothing, so no
+   * part of the call runs under a session the caller opened after it started.
+   */
+  lineage?: number
 };
 
 /**
@@ -87,11 +99,31 @@ export type RawClient = {
   ) => Promise<CommandResponse>,
   /** Whether the client has been authenticated */
   isAuthenticated: boolean
-  /** Authenticates the client with the server */
+  /** Raised by each sign-in and logout of the caller. */
+  readonly lineage?: number
+  /** Uses caller credentials; any failed attempt withdraws automatic sign-in. */
   authenticate: (c: ClientCredentials) => Promise<boolean>
+  /** Typed login delegates validation to the session owner when supported. */
+  _authWithPassword?: (c: PasswordCredentials) => Promise<{ userId: number }>
+  _authWithToken?: (c: TokenCredentials) => Promise<{ userId: number }>
+  /**
+   * Resolves the original frozen operation; never sends it under a fresh identity.
+   * The client keeps the proved outcomes of its last `maxPendingOperations`
+   * replays, also across a session reset, so a later resolve of the same
+   * operation returns the same outcome without a request.
+   * `OperationNotRetainedError` means that a session reset or an abandon came
+   * before a replay proved the outcome, or that the proved outcome aged out.
+   */
+  resolveOperation?: (operationId: bigint, options?: SendCommandOptions) => Promise<void>,
+  /**
+   * Releases a retained lane without asserting that the operation did not commit.
+   * A replay that is already running keeps the lane until it ends, and the
+   * client keeps the outcome that it proves.
+   */
+  abandonOperation?: (operationId: bigint) => void,
   /** Destroys the client connection */
   destroy: () => void,
-  /** Holds a pooled client across multiple command submissions */
+  /** Tracks one facade operation across multiple command submissions. */
   hold?: () => () => void,
   /** Registers an event listener */
   on: (ev: string, cb: (e?: unknown) => void) => void
@@ -103,7 +135,7 @@ export type RawClient = {
 
 /**
  * Function type that provides a RawClient instance.
- * Used for dependency injection and connection pooling.
+ * Used for dependency injection.
  */
 export type ClientProvider = () => Promise<RawClient>;
 
@@ -125,14 +157,15 @@ export type ReconnectOption = {
   /** Whether automatic reconnection is enabled */
   enabled: boolean,
   /**
-   * Milliseconds to wait between passes. The first pass runs at once when more
-   * than one endpoint is known.
+   * Initial reconnect delay in milliseconds. Each replica uses exponential
+   * backoff capped at 10 seconds with jitter.
    */
   interval: number,
   /**
-   * Maximum number of passes over the known endpoints. One pass dials the
-   * endpoint the client is on, the endpoint it was configured with, and every
-   * node the roster named, so this counts passes rather than dials.
+   * Maximum retries per replica after the first attempt. Bootstrap retries
+   * sweep the configured seed and remembered endpoints. The budget limits one
+   * reconnect burst: while the client stays signed in, each heartbeat restarts
+   * a replica link that used its budget, with a fresh budget.
    */
   maxRetries: number
 }
@@ -167,12 +200,12 @@ export type PasswordCredentials = {
 export type ClientCredentials = TokenCredentials | PasswordCredentials;
 
 /**
- * Connection pool size configuration.
+ * Legacy logical-client count. Replica links are managed independently.
  */
 export type PoolSizeOption = {
-  /** Minimum number of connections in the pool */
+  /** Minimum logical clients; normalized to one */
   min?: number,
-  /** Maximum number of connections in the pool */
+  /** Maximum logical clients; only one is supported */
   max?: number
 }
 
@@ -192,12 +225,19 @@ export type ClientConfig = {
   options: TransportOption,
   /** Authentication credentials */
   credentials: ClientCredentials,
-  /** Connection pool size configuration */
+  /** Legacy logical-client count; does not limit replica links. */
   poolSize?: PoolSizeOption,
   /** Automatic reconnection configuration */
   reconnect?: ReconnectOption,
-  /** Interval for sending heartbeat pings, in milliseconds */
+  /**
+   * Interval for sending heartbeat pings, in milliseconds. Each heartbeat also
+   * restarts replica links that used their reconnect budget. 0 disables both.
+   */
   heartbeatInterval?: number,
   /** Maximum accepted response frame size in bytes */
-  maxResponseFrameSize?: number
+  maxResponseFrameSize?: number,
+  /** Maximum active plus retained mutations across this client. Default: 256. */
+  maxPendingOperations?: number,
+  /** Frozen mutation headers and bodies, including retained and writer-owned bytes. Default: 64 MiB. */
+  maxPendingOperationBytes?: number
 }

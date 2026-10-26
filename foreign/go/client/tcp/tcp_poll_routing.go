@@ -21,513 +21,420 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
-	"net"
-	"strconv"
-	"strings"
+	"math"
+	"slices"
 	"sync"
 	"time"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/apache/iggy/foreign/go/internal/command"
-	"github.com/apache/iggy/foreign/go/internal/vsr"
 )
 
 const (
-	maxPollRoutes         = 4096
-	maxPollConnections    = 256
-	consumerSessionSize   = 32
-	pollParametersSize    = 1 + 8 + 4 + 1
-	pollHeartbeatInterval = 5 * time.Second
-	// Offset writes end with the offset and the ack level, a delete with the
-	// ack level only.
+	maxPollRoutes          = 4096
+	pollParametersSize     = 1 + 8 + 4 + 1
 	storeOffsetSuffixSize  = 8 + 1
 	deleteOffsetSuffixSize = 1
+	partitionLookupTimeout = 2 * time.Second
 )
 
-// Primary polls have no deduplication key, including within one VSR session.
-type singlePollExchange struct{}
-type capturedPartitionContext struct{}
-
-type pollExchangeState struct {
-	written  bool
-	reusable bool
-}
-
-// Published under c.mtx after authentication, then immutable. Warm data polls
-// must not wait behind unrelated coordinator I/O just to read their identity.
-type activePollSession struct {
-	bindSecret    [vsr.BindSecretBytes]byte
-	parent        consumerSession
-	configuration config
-}
-
-func (c *IggyTcpClient) publishPollSession() {
-	if c.session == nil || !c.session.Bound() || !c.rememberedLogin.enabled {
-		return
-	}
-	configuration := c.config
-	configuration.autoLogin = c.rememberedLogin
-	c.pollSession.Store(&activePollSession{
-		bindSecret:    c.session.BindSecret(),
-		parent:        consumerSession{client: c.session.ClientID(), session: c.session.SessionID()},
-		configuration: configuration,
-	})
-}
-
-func (c *IggyTcpClient) clearPollSession() {
-	c.pollSession.Store(nil)
-	c.polls.clear()
-}
-
-type consumerSession struct {
-	client    vsr.ClientID
-	session   uint64
-	watermark uint64
-}
-
-func (s consumerSession) bytes() []byte {
-	body := make([]byte, consumerSessionSize)
-	binary.LittleEndian.PutUint64(body, s.client.Lo)
-	binary.LittleEndian.PutUint64(body[8:], s.client.Hi)
-	binary.LittleEndian.PutUint64(body[16:], s.session)
-	binary.LittleEndian.PutUint64(body[24:], s.watermark)
-	return body
-}
-
 type pollRoute struct {
-	context  iggcon.PartitionContext
-	endpoint string
-	parent   consumerSession
+	context iggcon.PartitionContext
+	primary uint8
+	view    uint32
+	fence   uint64
+	age     uint64
+	key     laneKey
+	// generation is the generation of the hint that the route was accepted
+	// under. The route is stale once the hint moves past it.
+	generation uint64
+	// cleared is the count of route clears when the route was accepted. Any
+	// later clear makes the route stale.
+	cleared uint64
 }
-
-// The gate serializes a data connection without making callers wait beyond
-// their context. Retirement closes its socket without waiting for an exchange.
-type pollConnection struct {
-	gate     chan struct{}
-	mu       sync.Mutex
-	ctx      context.Context
-	cancel   context.CancelFunc
-	conn     net.Conn
-	retired  bool
-	client   *IggyTcpClient
-	parent   consumerSession
-	attached bool
+type routeHint struct {
+	fence         uint64
+	floor         uint32
+	view          uint32
+	primary       uint8
+	preferred     uint8
+	hasPreferred  bool
+	lastFailed    uint8
+	hasFailed     bool
+	metadataFirst bool
+	generation    uint64
 }
-
-func (p *pollConnection) retire() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.retired = true
-	p.cancel()
-	if p.conn != nil {
-		_ = p.conn.Close()
-		p.conn = nil
-	}
+type routeAge struct {
+	key string
+	age uint64
 }
-
 type pollRouter struct {
-	mu            sync.Mutex
-	routes        map[string]pollRoute
-	connections   map[string]*pollConnection
-	nextHeartbeat time.Time
+	mu     sync.Mutex
+	routes map[string]pollRoute
+	hints  map[laneKey]routeHint
+	// aliases counts the routes of each partition history. A hint whose
+	// history has none is idle, and only an idle hint makes room for another.
+	aliases map[laneKey]int
+	idle    map[laneKey]struct{}
+	// ages holds the route keys oldest first, from agesHead. A replaced or
+	// dropped route leaves its entry until an eviction or a compaction skips it.
+	ages              []routeAge
+	agesHead          int
+	clock             uint64
+	cleared           uint64
+	lastLookupFailure uint8
+	hasLookupFailure  bool
 }
 
-func (p *pollRouter) clear() {
+// clearRoutes marks every cached route stale. A stale route still gives its
+// lookup hints and its metadata floor.
+func (p *pollRouter) clearRoutes() {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	clear(p.routes)
-	for _, connection := range p.connections {
-		connection.retire()
-	}
-	clear(p.connections)
-	p.nextHeartbeat = time.Time{}
+	p.cleared++
+	p.mu.Unlock()
 }
-
+func (p *pollRouter) reset() {
+	p.mu.Lock()
+	clear(p.routes)
+	clear(p.hints)
+	clear(p.aliases)
+	clear(p.idle)
+	p.ages, p.agesHead = nil, 0
+	p.hasLookupFailure = false
+	p.mu.Unlock()
+}
 func (p *pollRouter) dropRoute(key string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	delete(p.routes, key)
+	if route, cached := p.routes[key]; cached {
+		p.deleteRouteLocked(key, route)
+	}
 }
 
-func (p *pollRouter) dropConnection(endpoint string, connection *pollConnection) {
+// storeLocked caches route under key, in place of a route that key had.
+func (p *pollRouter) storeLocked(key string, route pollRoute) {
+	replaced, cached := p.routes[key]
+	p.routes[key] = route
+	if !cached || replaced.key != route.key {
+		if cached {
+			p.retireAliasLocked(replaced.key)
+		}
+		p.aliases[route.key]++
+		delete(p.idle, route.key)
+	}
+	if len(p.ages) == cap(p.ages) && len(p.ages) > 0 {
+		p.compactAgesLocked()
+	}
+	p.ages = append(p.ages, routeAge{key: key, age: route.age})
+}
+
+func (p *pollRouter) deleteRouteLocked(key string, route pollRoute) {
+	delete(p.routes, key)
+	p.retireAliasLocked(route.key)
+}
+
+func (p *pollRouter) retireAliasLocked(group laneKey) {
+	if aliases := p.aliases[group] - 1; aliases > 0 {
+		p.aliases[group] = aliases
+		return
+	}
+	delete(p.aliases, group)
+	p.idle[group] = struct{}{}
+}
+
+// evictOldestLocked drops the route that was accepted first.
+func (p *pollRouter) evictOldestLocked() {
+	for p.agesHead < len(p.ages) {
+		oldest := p.ages[p.agesHead]
+		p.ages[p.agesHead] = routeAge{}
+		p.agesHead++
+		if route, cached := p.routes[oldest.key]; cached && route.age == oldest.age {
+			p.deleteRouteLocked(oldest.key, route)
+			return
+		}
+	}
+}
+
+// compactAgesLocked drops the entries of replaced and dropped routes. It grows
+// the buffer when that frees less than half of it, so each accepted route
+// costs constant amortized work.
+func (p *pollRouter) compactAgesLocked() {
+	live := p.ages[:0]
+	for _, entry := range p.ages[p.agesHead:] {
+		if route, cached := p.routes[entry.key]; cached && route.age == entry.age {
+			live = append(live, entry)
+		}
+	}
+	clear(p.ages[len(live):])
+	p.ages, p.agesHead = live, 0
+	if len(live) > cap(live)/2 {
+		p.ages = slices.Grow(live, len(live))
+	}
+}
+
+// evictIdleHintLocked drops the hint of a history that has no route left.
+func (p *pollRouter) evictIdleHintLocked() {
+	for group := range p.idle {
+		delete(p.idle, group)
+		delete(p.hints, group)
+		return
+	}
+}
+func (p *pollRouter) invalidate(route pollRoute, refused bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.connections[endpoint] == connection {
-		delete(p.connections, endpoint)
+	hint, known := p.staleLocked(route)
+	if !known {
+		return
 	}
-	connection.retire()
+	hint.lastFailed, hint.hasFailed = route.primary, true
+	if refused {
+		floor := route.view
+		if floor < math.MaxUint32 {
+			floor++
+		}
+		hint.floor = max(hint.floor, floor)
+		hint.preferred = route.primary
+		hint.hasPreferred = true
+	}
+	p.hints[route.key] = hint
 }
 
-func (c *IggyTcpClient) pollPrimary(caller context.Context, request *command.PollMessages) ([]byte, error) {
-	payload, err := request.MarshalBinary()
-	if err != nil {
-		return nil, err
+// relookup starts again at the metadata primary after a missing namespace,
+// a lost partition history or a change of consumer group ownership.
+func (p *pollRouter) relookup(route pollRoute) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if hint, known := p.staleLocked(route); known {
+		hint.metadataFirst = true
+		hint.hasPreferred = false
+		p.hints[route.key] = hint
 	}
-	key := string(payload[:len(payload)-pollParametersSize])
-	return c.sendRouted(caller, command.PollMessagesOnPrimaryCode, key, command.GetPollRoutingCode,
-		payload, payload, request.Strategy.Context)
 }
 
-// sendRouted sends a partition request to the partition primary, keeping the
-// coordinator connection and its group membership in place. A captured
-// context is stamped on every attempt; without one, every attempt keeps the
-// context the first route reported.
-func (c *IggyTcpClient) sendRouted(caller context.Context, code command.Code, key string,
-	routeCode command.Code, routePayload, payload []byte, captured *iggcon.PartitionContext,
-) (response []byte, err error) {
-	if caller == nil {
-		return nil, ierror.ErrNilContext
+// staleLocked marks every alias of the partition history of route stale and
+// returns its hint, unless route belongs to another session.
+func (p *pollRouter) staleLocked(route pollRoute) (routeHint, bool) {
+	hint, known := p.hints[route.key]
+	if !known || hint.fence != route.fence {
+		return routeHint{}, false
 	}
-	ctx, cancel := context.WithTimeout(caller, responseReadTimeout)
+	hint.generation++
+	p.hints[route.key] = hint
+	return hint, true
+}
+
+// consumerRoute returns the route of the partition that query names, cached or
+// looked up. An ended caller epoch prevents the partition request from being
+// stamped under a later sign-in. The epoch checks between lookup steps do not
+// fence the auxiliary roster reads themselves.
+func (c *IggyTcpClient) consumerRoute(ctx context.Context, query []byte) (_ pollRoute, err error) {
+	if len(query) < partitionIdSize {
+		return pollRoute{}, ierror.ErrInvalidCommand
+	}
+	epoch := c.callEpoch(ctx)
 	defer func() {
-		if err != nil && ctx.Err() != nil {
-			if caller.Err() != nil {
-				err = caller.Err()
-			} else if !errors.Is(err, ierror.ErrTransientNotAccepted) {
-				err = ierror.ErrTransientNotCommitted
+		if ended := epoch.err(); err != nil && ended != nil {
+			err = ended
+		}
+	}()
+	c.mtx.Lock()
+	fence := c.sessionFence
+	bound := c.session.Bound()
+	c.mtx.Unlock()
+	if err := epoch.err(); err != nil {
+		return pollRoute{}, err
+	}
+	if !bound {
+		return pollRoute{}, ierror.ErrUnauthenticated
+	}
+	if !c.links.hasRoster.Load() {
+		if err := c.refreshRoster(ctx, c.links.any()); err != nil {
+			return pollRoute{}, err
+		}
+	}
+	watermark := c.metadataWatermark.Load()
+	c.polls.mu.Lock()
+	cached, found := c.polls.routes[string(query)]
+	if found && cached.fence == fence {
+		watermark = max(watermark, cached.context.MetadataOp)
+	}
+	hint := c.polls.hints[cached.key]
+	if found && cached.cleared == c.polls.cleared && cached.generation == hint.generation && cached.fence == fence && cached.context.MetadataOp >= watermark && cached.view >= hint.floor && cached.view == hint.view && cached.primary == hint.primary {
+		c.polls.mu.Unlock()
+		return cached, nil
+	}
+	var preferred, after *uint8
+	if c.polls.hasLookupFailure {
+		replica := c.polls.lastLookupFailure
+		after = &replica
+	}
+	if found {
+		if hint, ok := c.polls.hints[cached.key]; ok {
+			if hint.hasPreferred {
+				replica := hint.preferred
+				preferred = &replica
+				hint.hasPreferred = false
+				c.polls.hints[cached.key] = hint
+			}
+			if hint.hasFailed {
+				replica := hint.lastFailed
+				after = &replica
+			}
+			if hint.metadataFirst {
+				after = nil
 			}
 		}
-		cancel()
-	}()
-
-	c.polls.mu.Lock()
-	now := time.Now()
-	heartbeatDue := !c.polls.nextHeartbeat.IsZero() && !now.Before(c.polls.nextHeartbeat)
-	if c.polls.nextHeartbeat.IsZero() || heartbeatDue {
-		c.polls.nextHeartbeat = now.Add(pollHeartbeatInterval)
 	}
 	c.polls.mu.Unlock()
-	if heartbeatDue {
-		if _, _, err := c.sendPollRequest(ctx, uint32(command.PingCode), nil); err != nil {
-			if !isReconnectable(err) {
-				return nil, err
-			}
-			if _, err := c.do(ctx, &command.Ping{}); err != nil {
-				return nil, err
-			}
+	for _, link := range c.links.lookupCandidates(preferred, after) {
+		if ctx.Err() != nil {
+			return pollRoute{}, ierror.ErrTransientNotAccepted
 		}
-	}
-
-	for {
-		if err := ctx.Err(); err != nil {
-			return nil, err
+		if err := epoch.err(); err != nil {
+			return pollRoute{}, err
 		}
-		route, err := c.consumerRoute(ctx, key, routePayload, routeCode)
-		var response []byte
+		attempt, cancel := context.WithTimeout(ctx, partitionLookupTimeout)
+		if err := c.bindLink(attempt, link); err != nil {
+			cancel()
+			if isSessionError(err) {
+				c.recoverSession(fence)
+				return pollRoute{}, err
+			}
+			if retryBeforeAdmission(err) {
+				c.recordLookupFailure(fence, cached, found, link)
+				continue
+			}
+			return pollRoute{}, err
+		}
+		body, err := c.readOnLink(attempt, link, command.GetPartitionRouteCode, query, &iggcon.PartitionContext{MetadataOp: watermark})
+		cancel()
+		if err != nil {
+			// A deny with StaleClient closed only this link, and its bind decides.
+			if isSessionError(err) && !errors.Is(err, ierror.ErrStaleClient) {
+				c.recoverSession(fence)
+				return pollRoute{}, err
+			}
+			if retryBeforeAdmission(err) {
+				c.recordLookupFailure(fence, cached, found, link)
+				continue
+			}
+			if isNamespaceMiss(err) && !c.isMetadataPrimary(ctx, link) {
+				c.recordLookupFailure(fence, cached, found, link)
+				continue
+			}
+			return pollRoute{}, err
+		}
+		var decoded iggcon.PartitionRoute
+		if err := decoded.UnmarshalBinary(body); err != nil {
+			return pollRoute{}, err
+		}
+		if decoded.PartitionsCount == 0 || decoded.MetadataOp < watermark {
+			c.recordLookupFailure(fence, cached, found, link)
+			continue
+		}
+		// Only an accepted route stores its key, so a cached lookup copies nothing.
+		route, err := c.acceptRoute(fence, string(query), query, decoded)
 		if err == nil {
-			if captured == nil {
-				value := route.context
-				captured = &value
-			}
-			route.context = *captured
-			response, err = c.pollOnRoute(ctx, code, key, payload, route)
+			return route, nil
 		}
 		if !errors.Is(err, ierror.ErrTransientNotAccepted) {
-			return response, err
+			return pollRoute{}, err
 		}
-		c.polls.dropRoute(key)
-		deadline, _ := ctx.Deadline()
-		if time.Until(deadline) <= replayInterval {
-			return nil, err
-		}
-		if waitErr := c.waitBeforeReplay(ctx, deadline); waitErr != nil {
-			if caller.Err() == nil && ctx.Err() != nil {
-				return nil, err
-			}
-			return nil, waitErr
-		}
+		c.recordLookupFailure(fence, cached, found, link)
 	}
+	return pollRoute{}, ierror.ErrTransientNotAccepted
 }
 
-func (c *IggyTcpClient) pollOnRoute(ctx context.Context, code command.Code, key string, payload []byte, route pollRoute) ([]byte, error) {
-	c.polls.mu.Lock()
-	if !c.matchesPollParent(route.parent) {
-		c.polls.mu.Unlock()
-		return nil, ierror.ErrTransientNotAccepted
-	}
-	slot := c.polls.connections[route.endpoint]
-	if slot == nil {
-		if len(c.polls.connections) >= maxPollConnections {
-			for endpoint, candidate := range c.polls.connections {
-				select {
-				case candidate.gate <- struct{}{}:
-					delete(c.polls.connections, endpoint)
-					candidate.retire()
-					<-candidate.gate
-				default:
-				}
-				if len(c.polls.connections) < maxPollConnections {
-					break
-				}
-			}
-			if len(c.polls.connections) >= maxPollConnections {
-				c.polls.mu.Unlock()
-				return nil, ierror.ErrTransientNotAccepted
-			}
-		}
-		if c.polls.connections == nil {
-			c.polls.connections = make(map[string]*pollConnection)
-		}
-		lifetime, cancel := context.WithCancel(context.Background())
-		slot = &pollConnection{gate: make(chan struct{}, 1), ctx: lifetime, cancel: cancel}
-		c.polls.connections[route.endpoint] = slot
-	}
-	c.polls.mu.Unlock()
-	select {
-	case slot.gate <- struct{}{}:
-		defer func() { <-slot.gate }()
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-slot.ctx.Done():
-		return nil, ierror.ErrTransientNotAccepted
-	}
-	exchangeCtx, cancel := context.WithCancel(ctx)
-	stop := context.AfterFunc(slot.ctx, cancel)
-	defer stop()
-	defer cancel()
-	if slot.ctx.Err() != nil {
-		return nil, ierror.ErrTransientNotAccepted
-	}
-	if !c.pollParentCurrent(route.parent) {
-		return nil, ierror.ErrTransientNotAccepted
-	}
-
-	if slot.client == nil {
-		client, err := c.connectPollClient(exchangeCtx, route)
-		if err != nil {
-			err = slot.exchangeError(ctx, pollExchangeState{}, err)
-			c.polls.dropConnection(route.endpoint, slot)
-			return nil, err
-		}
-		slot.mu.Lock()
-		if slot.retired {
-			slot.mu.Unlock()
-			_ = client.Close()
-			return nil, ierror.ErrTransientNotAccepted
-		}
-		slot.conn = client.conn
-		slot.client = client
-		slot.mu.Unlock()
-	}
-	if !slot.attached || slot.parent.client != route.parent.client ||
-		slot.parent.session != route.parent.session || slot.parent.watermark < route.parent.watermark {
-		current := c.pollSession.Load()
-		if current == nil || current.parent.client != route.parent.client || current.parent.session != route.parent.session {
-			return nil, ierror.ErrTransientNotAccepted
-		}
-		binding, err := vsr.SerializeBindSession(route.parent.bytes(), iggcon.Version, current.bindSecret)
-		if err != nil {
-			return nil, err
-		}
-		response, state, err := slot.client.sendPollRequest(exchangeCtx, uint32(command.BindSessionCode), binding)
-		if err != nil {
-			// An attach cannot advance an offset, even if its reply is lost.
-			state.written = false
-			err = slot.exchangeError(ctx, state, err)
-			if !state.reusable {
-				c.polls.dropConnection(route.endpoint, slot)
-			}
-			return nil, err
-		}
-		bound, err := vsr.DecodeLoginRegister(response)
-		if err != nil {
-			c.polls.dropConnection(route.endpoint, slot)
-			return nil, err
-		}
-		if bound.Session != route.parent.session {
-			c.polls.dropConnection(route.endpoint, slot)
-			return nil, ierror.SessionMismatch{Requested: route.parent.session, Bound: bound.Session}
-		}
-		slot.parent = route.parent
-		slot.attached = true
-	}
-	if !c.pollParentCurrent(route.parent) {
-		return nil, ierror.ErrTransientNotAccepted
-	}
-	var response []byte
-	var state pollExchangeState
-	var err error
-	if _, replicated := vsr.ReplicatedOperation(uint32(code)); replicated {
-		response, state, err = c.sendPrimaryWrite(exchangeCtx, slot.client, code, payload, route)
-	} else {
-		response, state, err = slot.client.sendPollRequest(context.WithValue(exchangeCtx, capturedPartitionContext{}, route.context), uint32(code), payload)
-	}
-	err = slot.exchangeError(ctx, state, err)
-	if errors.Is(err, ierror.ErrTransientNotAccepted) {
-		slot.attached = false
-	}
-	if err != nil {
-		c.polls.dropRoute(key)
-		if !state.reusable {
-			c.polls.dropConnection(route.endpoint, slot)
-		}
-	}
-	return response, err
+// isNamespaceMiss reports whether err tells that a replica has no such stream,
+// topic or partition.
+func isNamespaceMiss(err error) bool {
+	return errors.Is(err, ierror.ErrStreamIdNotFound) || errors.Is(err, ierror.ErrStreamNameNotFound) ||
+		errors.Is(err, ierror.ErrTopicIdNotFound) || errors.Is(err, ierror.ErrTopicNameNotFound) ||
+		errors.Is(err, ierror.ErrPartitionNotFound)
 }
 
-// Cache insertion checks this under the router lock; teardown clears the
-// atomic snapshot before taking that lock and retiring old connections.
-func (c *IggyTcpClient) matchesPollParent(parent consumerSession) bool {
-	current := c.pollSession.Load()
-	return current != nil && current.parent.client == parent.client &&
-		current.parent.session == parent.session
+// isMetadataPrimary reports whether link reaches the metadata primary. Only its
+// namespace miss is final, because a backup can lag a namespace that another
+// client just created. The belief can predate a view change, so a roster read
+// on link must still name the replica of link. No lookup reaches a believed
+// metadata primary without a ready link, so then the roster on link is read
+// to update the belief.
+func (c *IggyTcpClient) isMetadataPrimary(ctx context.Context, link *tcpLink) bool {
+	replica, known := c.links.replicaID(link)
+	if !known {
+		return false
+	}
+	if believed, named := c.links.metadataPrimary(); named && believed != replica && c.links.replica(believed) != nil {
+		return false
+	}
+	if c.refreshRoster(ctx, link) != nil {
+		return false
+	}
+	believed, named := c.links.metadataPrimary()
+	return named && believed == replica
 }
 
-func (c *IggyTcpClient) pollParentCurrent(parent consumerSession) bool {
-	return c.matchesPollParent(parent) && parent.watermark >= c.metadataWatermark.Load()
-}
-
-func (c *IggyTcpClient) consumerRoute(ctx context.Context, key string, payload []byte, code command.Code) (pollRoute, error) {
-	c.polls.mu.Lock()
-	route, cached := c.polls.routes[key]
-	c.polls.mu.Unlock()
-	if cached && c.pollParentCurrent(route.parent) {
-		return route, nil
+func (c *IggyTcpClient) recordLookupFailure(fence uint64, cached pollRoute, found bool, link *tcpLink) {
+	replica, known := c.links.replicaID(link)
+	if !known {
+		return
 	}
-	// This control command can recover a failed coordinator, but its one-exchange
-	// sendFrame path never moves a healthy coordinator after partition refusal.
-	body, err := c.SendBinaryRequest(ctx, uint32(code), payload)
-	if err != nil {
-		return pollRoute{}, err
-	}
-	route, err = decodePollRoute(body)
-	if err != nil {
-		return pollRoute{}, err
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	if c.sessionFence != fence {
+		return
 	}
 	c.polls.mu.Lock()
 	defer c.polls.mu.Unlock()
-	if !c.matchesPollParent(route.parent) {
+	c.polls.lastLookupFailure, c.polls.hasLookupFailure = replica, true
+	if !found {
+		return
+	}
+	if hint, ok := c.polls.hints[cached.key]; ok {
+		hint.lastFailed, hint.hasFailed = replica, true
+		c.polls.hints[cached.key] = hint
+	}
+}
+
+func (c *IggyTcpClient) acceptRoute(fence uint64, key string, query []byte, decoded iggcon.PartitionRoute) (pollRoute, error) {
+	route := pollRoute{context: decoded.Context(), primary: decoded.PrimaryReplica, view: decoded.View, fence: fence, key: laneKey{incarnation: decoded.Incarnation, partition: binary.LittleEndian.Uint32(query[len(query)-partitionIdSize:])}}
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	if c.sessionFence != fence || decoded.MetadataOp < c.metadataWatermark.Load() {
 		return pollRoute{}, ierror.ErrTransientNotAccepted
 	}
-	route.parent.watermark = max(route.parent.watermark, c.metadataWatermark.Load())
+	c.polls.mu.Lock()
+	defer c.polls.mu.Unlock()
 	if c.polls.routes == nil {
 		c.polls.routes = make(map[string]pollRoute)
+		c.polls.hints = make(map[laneKey]routeHint)
+		c.polls.aliases = make(map[laneKey]int)
+		c.polls.idle = make(map[laneKey]struct{})
+	}
+	hint, known := c.polls.hints[route.key]
+	if route.view < hint.floor || known && (route.view < hint.view || route.view == hint.view && route.primary != hint.primary) {
+		return pollRoute{}, ierror.ErrTransientNotAccepted
 	}
 	if len(c.polls.routes) >= maxPollRoutes {
-		clear(c.polls.routes)
+		c.polls.evictOldestLocked()
 	}
-	c.polls.routes[key] = route
-	return route, nil
-}
-
-func decodePollRoute(body []byte) (pollRoute, error) {
-	if len(body) < consumerSessionSize+iggcon.PartitionContextSize {
-		return pollRoute{}, ierror.ErrInvalidCommand
-	}
-	var node iggcon.ClusterNode
-	if err := node.UnmarshalBinary(body[consumerSessionSize+iggcon.PartitionContextSize:]); err != nil {
-		return pollRoute{}, err
-	}
-	if node.Endpoints.Tcp == 0 {
-		return pollRoute{}, ierror.ErrFeatureUnavailable
-	}
-	var partitionContext iggcon.PartitionContext
-	if err := partitionContext.UnmarshalBinary(body[consumerSessionSize : consumerSessionSize+iggcon.PartitionContextSize]); err != nil {
-		return pollRoute{}, err
-	}
-	return pollRoute{
-		context:  partitionContext,
-		endpoint: net.JoinHostPort(strings.Trim(node.IP, "[]"), strconv.Itoa(int(node.Endpoints.Tcp))),
-		parent: consumerSession{
-			client:    vsr.ClientID{Lo: binary.LittleEndian.Uint64(body), Hi: binary.LittleEndian.Uint64(body[8:])},
-			session:   binary.LittleEndian.Uint64(body[16:]),
-			watermark: binary.LittleEndian.Uint64(body[24:]),
-		},
-	}, nil
-}
-
-func (c *IggyTcpClient) connectPollClient(ctx context.Context, route pollRoute) (*IggyTcpClient, error) {
-	snapshot := c.pollSession.Load()
-	if snapshot == nil || snapshot.parent.client != route.parent.client || snapshot.parent.session != route.parent.session {
-		return nil, ierror.ErrUnauthenticated
-	}
-	configuration := snapshot.configuration
-	configuration.serverAddress = route.endpoint
-	configuration.reconnection.enabled = false
-	client := NewIggyTcpClient(c.logger, func(options *Options) { options.config = configuration })
-	if err := client.Connect(suppressAutoLogin(suppressLeaderSettlement(ctx))); err != nil {
-		_ = client.Close()
-		return nil, err
-	}
-	client.mtx.Lock()
-	client.session = vsr.NewSessionWithClientID(route.parent.client)
-	err := client.session.Bind(route.parent.session)
-	client.session.SetBindSecret(snapshot.bindSecret)
-	client.mtx.Unlock()
-	if err != nil {
-		_ = client.Close()
-		return nil, err
-	}
-	return client, nil
-}
-
-func (c *IggyTcpClient) sendPollRequest(ctx context.Context, code uint32, payload []byte) ([]byte, pollExchangeState, error) {
-	bp := acquireRequestBuf()
-	defer releaseRequestBuf(bp)
-	frame := append(reserveHeader(*bp), payload...)
-	*bp = frame
-	response, _, state, err := c.sendPollFrame(ctx, code, frame)
-	return response, state, err
-}
-
-// sendPrimaryWrite sends a replicated write over a data connection. That
-// connection shares this client's session identity, which the partition
-// deduplicates by, so the request id comes from this client's counter, as
-// the Rust SDK shares one consensus session between both connections.
-func (c *IggyTcpClient) sendPrimaryWrite(ctx context.Context, data *IggyTcpClient, code command.Code, payload []byte, route pollRoute) ([]byte, pollExchangeState, error) {
-	state := pollExchangeState{}
-	bp := acquireRequestBuf()
-	defer releaseRequestBuf(bp)
-	frame := append(reserveHeader(*bp), payload...)
-	*bp = frame
-	// The gate is taken first, as attempt does, so a coordinator exchange
-	// holding the session cannot outlast the caller's deadline here.
-	select {
-	case c.exchangeGate <- struct{}{}:
-	case <-ctx.Done():
-		return nil, state, ctx.Err()
-	case <-c.closed:
-		return nil, state, ierror.ErrClientShutdown
-	}
-	c.mtx.Lock()
-	var err error = ierror.ErrTransientNotAccepted
-	if c.session.ClientID() == route.parent.client && c.session.SessionID() == route.parent.session {
-		err = vsr.StampRequestHeader(c.session, uint32(code), frame)
-	}
-	c.mtx.Unlock()
-	<-c.exchangeGate
-	if err != nil {
-		return nil, state, err
-	}
-	vsr.StampPartitionContext((*[vsr.HeaderSize]byte)(frame[:vsr.HeaderSize]), route.context)
-	response, _, _, err := data.attempt(context.WithValue(ctx, singlePollExchange{}, &state),
-		uint32(code), frame, true, time.Now(), time.Now().Add(responseReadTimeout))
-	return response, state, err
-}
-
-func (c *IggyTcpClient) sendPollFrame(ctx context.Context, code uint32, frame []byte) ([]byte, uint64, pollExchangeState, error) {
-	state := pollExchangeState{}
-	if ctx == nil {
-		return nil, 0, state, ierror.ErrNilContext
-	}
-	response, _, generation, err := c.attempt(context.WithValue(ctx, singlePollExchange{}, &state),
-		code, frame, false, time.Now(), time.Now().Add(responseReadTimeout))
-	return response, generation, state, err
-}
-
-func (p *pollConnection) exchangeError(ctx context.Context, state pollExchangeState, err error) error {
-	if err == nil {
-		return nil
-	}
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
-	if p.ctx.Err() != nil || isReconnectable(err) || (state.written && !state.reusable) {
-		if state.written {
-			return ierror.ErrTransientNotCommitted
+	// Hints outlive eviction of an alias and remain bounded by the same group limit.
+	if !known && len(c.polls.hints) >= maxPollRoutes {
+		c.polls.evictIdleHintLocked()
+		if len(c.polls.hints) >= maxPollRoutes {
+			return pollRoute{}, ierror.ErrTransientNotAccepted
 		}
-		return ierror.ErrTransientNotAccepted
 	}
-	return err
+	c.polls.hints[route.key] = routeHint{fence: route.fence, floor: hint.floor, view: route.view, primary: route.primary, generation: hint.generation}
+	c.polls.clock++
+	route.age = c.polls.clock
+	route.generation = hint.generation
+	route.cleared = c.polls.cleared
+	c.polls.storeLocked(key, route)
+	streamEnd := fieldPrefixSize + int(query[1])
+	topicEnd := len(query) - partitionIdSize
+	c.topics.setPartitionsCount(topicKey{stream: string(query[:streamEnd]), topic: string(query[streamEnd:topicEnd])}, decoded.PartitionsCount)
+	return route, nil
 }

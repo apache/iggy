@@ -189,8 +189,8 @@ where
     if streams.topic_partition_ids(stream_id, topic_id).is_some() {
         return Err(IggyError::PartitionNotFound(
             partition_id as usize,
-            wire_identifier_for_display(topic_id),
-            wire_identifier_for_display(stream_id),
+            Identifier::try_from(topic_id).unwrap_or_default(),
+            Identifier::try_from(stream_id).unwrap_or_default(),
         ));
     }
     Err(streams.read(|inner| {
@@ -206,9 +206,9 @@ where
     }))
 }
 
-/// Reject a consumer-group read whose parent stream/topic is absent with the
-/// legacy typed error naming the level that missed; the group itself missing
-/// stays the shared not-found reply (empty over TCP, 404 over HTTP).
+/// Reject a request whose parent stream/topic is absent with the legacy typed
+/// error naming the level that missed. For a consumer-group read, a missing
+/// group itself stays the shared not-found reply (empty over TCP, 404 over HTTP).
 pub fn ensure_topic_exists<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     stream_id: &WireIdentifier,
@@ -237,7 +237,6 @@ where
 /// consumers (no fence) and for owned group partitions; `Err` otherwise so a
 /// stale client re-syncs instead of corrupting the shared group offset. An
 /// external group has no members here, so it needs only an existing group.
-#[allow(clippy::cast_possible_truncation)]
 fn fence_group_offset<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     consumer: &WireConsumer,
@@ -278,7 +277,7 @@ where
     else {
         resolve_offset_group_id(streams, stream_id, topic_id, &consumer.id)?;
         return Err(IggyError::ConsumerGroupPartitionNotOwned(
-            client_id as u32,
+            client_id,
             partition_id,
         ));
     };
@@ -286,11 +285,12 @@ where
 }
 
 fn missing_consumer_group_error(group: &WireIdentifier, topic: &WireIdentifier) -> IggyError {
-    let topic = wire_identifier_for_display(topic);
+    let topic = Identifier::try_from(topic).unwrap_or_default();
     match group {
-        WireIdentifier::Numeric(_) => {
-            IggyError::ConsumerGroupIdNotFound(wire_identifier_for_display(group), topic)
-        }
+        WireIdentifier::Numeric(_) => IggyError::ConsumerGroupIdNotFound(
+            Identifier::try_from(group).unwrap_or_default(),
+            topic,
+        ),
         WireIdentifier::String(name) => {
             IggyError::ConsumerGroupNameNotFound(name.as_str().to_owned(), topic)
         }
@@ -308,22 +308,20 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
+    let streams = shard.plane.metadata().mux_stm.streams();
     let partition_id = match &header.partitioning {
-        WirePartitioning::PartitionId(partition_id) => *partition_id,
-        WirePartitioning::Balanced => shard
-            .plane
-            .metadata()
-            .mux_stm
-            .streams()
-            .next_balanced_partition(&header.stream_id, &header.topic_id)
-            .ok_or(IggyError::InvalidIdentifier)?,
-        WirePartitioning::MessagesKey(key) => shard
-            .plane
-            .metadata()
-            .mux_stm
-            .streams()
-            .partition_by_messages_key(&header.stream_id, &header.topic_id, key)
-            .ok_or(IggyError::InvalidIdentifier)?,
+        WirePartitioning::PartitionId(partition_id) => Some(*partition_id),
+        WirePartitioning::Balanced => {
+            streams.next_balanced_partition(&header.stream_id, &header.topic_id)
+        }
+        WirePartitioning::MessagesKey(key) => {
+            streams.partition_by_messages_key(&header.stream_id, &header.topic_id, key)
+        }
+    };
+    let Some(partition_id) = partition_id else {
+        ensure_topic_exists(shard, &header.stream_id, &header.topic_id)?;
+        // The topic exists but has no partition to pick.
+        return Err(IggyError::InvalidIdentifier);
     };
     resolve_partition_namespace(
         shard,
@@ -333,38 +331,86 @@ where
     )
 }
 
-/// Best-effort conversion for error payloads only: the wire reply carries just
-/// the error code, so a failed conversion may fall back to a default without
-/// changing what the client sees.
-fn wire_identifier_for_display(id: &WireIdentifier) -> Identifier {
-    match id {
-        WireIdentifier::Numeric(numeric_id) => Identifier::numeric(*numeric_id),
-        WireIdentifier::String(name) => Identifier::named(name.as_str()),
-    }
-    .unwrap_or_default()
-}
-
 /// Typed miss for a read's parent stream, matching the legacy servers' error
 /// shape. The identifier only feeds the error message; a wire form with no
 /// domain equivalent (numeric 0 is a live slab id here but not a legacy id)
 /// falls back to the default identifier.
 fn stream_not_found(stream_id: &WireIdentifier) -> IggyError {
-    IggyError::StreamIdNotFound(wire_id_to_identifier(stream_id).unwrap_or_default())
+    IggyError::StreamIdNotFound(Identifier::try_from(stream_id).unwrap_or_default())
 }
 
 /// Typed miss for a read's parent topic; see [`stream_not_found`]. The variant's
 /// display order is (topic, stream).
 fn topic_not_found(stream_id: &WireIdentifier, topic_id: &WireIdentifier) -> IggyError {
     IggyError::TopicIdNotFound(
-        wire_id_to_identifier(topic_id).unwrap_or_default(),
-        wire_id_to_identifier(stream_id).unwrap_or_default(),
+        Identifier::try_from(topic_id).unwrap_or_default(),
+        Identifier::try_from(stream_id).unwrap_or_default(),
     )
 }
 
-/// Convert a `WireIdentifier` to the domain `Identifier`.
-fn wire_id_to_identifier(wire: &WireIdentifier) -> Result<Identifier, IggyError> {
-    match wire {
-        WireIdentifier::Numeric(id) => Identifier::numeric(*id),
-        WireIdentifier::String(name) => Identifier::named(name.as_str()),
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dispatch::test_support::{
+        SpyBus, create_consumer_group, create_one_partition, test_shard,
+    };
+
+    /// A group offset write from a client that owns no partition of the group
+    /// is fenced, and the refusal names that client.
+    #[test]
+    fn given_non_member_when_fencing_group_offset_should_name_the_full_client_id() {
+        // Wider than u64, so a refusal that truncated it would name another client.
+        const CLIENT_ID: u128 = (1 << 64) + 41;
+        const GROUP_ID: u32 = 0;
+        const PARTITION_ID: u32 = 0;
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, 1));
+        create_one_partition(&shard);
+        create_consumer_group(&shard);
+
+        let refusal = fence_and_resolve_offset_namespace(
+            &shard,
+            &WireConsumer::consumer_group(WireIdentifier::numeric(GROUP_ID)),
+            &WireIdentifier::numeric(0),
+            &WireIdentifier::numeric(0),
+            Some(PARTITION_ID),
+            CLIENT_ID,
+        )
+        .err();
+
+        assert!(
+            matches!(
+                refusal,
+                Some(IggyError::ConsumerGroupPartitionNotOwned(
+                    CLIENT_ID,
+                    PARTITION_ID
+                ))
+            ),
+            "{refusal:?}"
+        );
+    }
+
+    /// The payload only feeds the error message, so a wire id with no domain
+    /// form reports the default identifier instead of failing the lookup.
+    #[test]
+    fn given_wire_id_without_domain_form_when_reporting_a_miss_should_name_the_default_identifier()
+    {
+        let zero = WireIdentifier::Numeric(0);
+
+        // `IggyError` equality compares codes only, so match the payload.
+        assert!(matches!(
+            stream_not_found(&zero),
+            IggyError::StreamIdNotFound(stream) if stream == Identifier::default()
+        ));
+        assert!(matches!(
+            topic_not_found(&zero, &zero),
+            IggyError::TopicIdNotFound(topic, stream)
+                if topic == Identifier::default() && stream == Identifier::default()
+        ));
+        assert!(matches!(
+            missing_consumer_group_error(&zero, &zero),
+            IggyError::ConsumerGroupIdNotFound(group, topic)
+                if group == Identifier::default() && topic == Identifier::default()
+        ));
     }
 }

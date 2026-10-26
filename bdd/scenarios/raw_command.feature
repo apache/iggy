@@ -39,3 +39,13 @@ Feature: Raw Command API
   Scenario: Session control command code is rejected
     When I send a raw command with code 38 and an empty payload
     Then the raw command should fail with an invalid command error
+
+  Scenario: Raw command to a chosen replica
+    When I send a raw command with code 10 and an empty payload to replica 0
+    Then the raw command should succeed with a non-empty response
+
+    When I send a raw command with code 10 and an empty payload to replica 9
+    Then the raw command should fail with an invalid identifier error
+
+    When I send a raw command with code 202 and an empty payload to replica 0
+    Then the raw command should fail with an invalid command error

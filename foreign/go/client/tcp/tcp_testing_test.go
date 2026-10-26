@@ -18,14 +18,17 @@
 package tcp
 
 import (
+	"context"
 	"encoding/binary"
 	"io"
 	"log/slog"
 	"net"
 	"sync"
 	"testing"
+	"time"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/apache/iggy/foreign/go/internal/command"
 	"github.com/apache/iggy/foreign/go/internal/vsr"
 	"github.com/stretchr/testify/require"
@@ -101,7 +104,18 @@ func (r request) partitionID(t *testing.T) uint32 {
 
 // replyFrame builds a committed reply carrying body.
 func replyFrame(operation vsr.Operation, body []byte) []byte {
-	return statusReplyFrame(operation, 0, body)
+	frame := statusReplyFrame(operation, 0, body)
+	if operation != vsr.OperationNonReplicated && operation != vsr.OperationReserved {
+		transient := false
+		if vsr.IsResultFramed(operation) && len(body) >= 12 && binary.LittleEndian.Uint32(body) > 0 {
+			code := binary.LittleEndian.Uint32(body[8:])
+			transient = code == uint32(ierror.TransientNotCommittedCode) || code == uint32(ierror.TransientNotAcceptedCode) || code == uint32(ierror.NotPrimaryCode)
+		}
+		if !transient {
+			frame[220] = 1
+		}
+	}
+	return frame
 }
 
 // statusReplyFrame builds a reply whose header carries a pre-commit denial.
@@ -168,6 +182,7 @@ func clusterMetadataFrame(t *testing.T, leaderIndex int, addresses ...string) []
 			role = iggcon.RoleLeader
 		}
 		metadata.Nodes = append(metadata.Nodes, iggcon.ClusterNode{
+			ReplicaID: uint8(index),
 			Name:      host,
 			IP:        host,
 			Role:      role,
@@ -190,6 +205,40 @@ func echoReplyRequest(answer []byte, read request) {
 	}
 	copy(answer[replyFrameOffsetRequest:replyFrameOffsetRequest+8],
 		read.header[frameOffsetRequest:frameOffsetRequest+8])
+	if answer[220] == 1 {
+		copy(answer[128:144], read.header[144:160])
+		copy(answer[160:176], read.header[128:144])
+		copy(answer[224:232], read.header[200:208])
+		commit := binary.LittleEndian.Uint64(answer[184:192])
+		if commit == 0 {
+			commit = 1
+			binary.LittleEndian.PutUint64(answer[184:192], commit)
+		}
+		binary.LittleEndian.PutUint64(answer[176:184], commit)
+	}
+
+}
+
+func requestsFor(reads []request, operation vsr.Operation) []request {
+	var found []request
+	for _, read := range reads {
+		if read.operation() == operation {
+			found = append(found, read)
+		}
+	}
+	return found
+}
+
+// versionInfoEnd is the offset after the [protocol version u32][sdk name]
+// [sdk version] prefix of a Register or BindSession body.
+func versionInfoEnd(t *testing.T, payload []byte) int {
+	t.Helper()
+	offset := 4
+	for range 2 {
+		require.Greater(t, len(payload), offset)
+		offset += 1 + int(payload[offset])
+	}
+	return offset
 }
 
 // readRequest reads one complete frame from conn.
@@ -249,18 +298,21 @@ func (s *fakeServer) recorded() []request {
 	return append([]request(nil), s.requests...)
 }
 
-func servePartitionOperations(t *testing.T, conn net.Conn, handler func(index int, read request) []byte) *fakeServer {
+func servePartitionOperations(t *testing.T, conn net.Conn, handler func(index int, read request) []byte, partitionsCount ...uint32) *fakeServer {
 	t.Helper()
 	return serve(conn, func(index int, read request) []byte {
 		switch read.code() {
-		case uint32(command.GetSendContextCode):
-			body := make([]byte, 0, iggcon.PartitionContextSize)
-			for _, field := range []uint64{17, 0, 100} {
-				body = binary.LittleEndian.AppendUint64(body, field)
+		case uint32(command.GetPartitionRouteCode):
+			body := binary.LittleEndian.AppendUint64(nil, 17)
+			body = binary.LittleEndian.AppendUint64(body, 100)
+			body = binary.LittleEndian.AppendUint32(body, 0)
+			count := uint32(1)
+			if len(partitionsCount) != 0 {
+				count = partitionsCount[0]
 			}
+			body = binary.LittleEndian.AppendUint32(body, count)
+			body = append(body, 0)
 			return replyFrame(vsr.OperationNonReplicated, body)
-		case uint32(command.GetPollRoutingCode), uint32(command.GetOffsetRoutingCode):
-			return pollRoutingReply(t, read, "127.0.0.1:8090", read.sessionID())
 		default:
 			return handler(index, read)
 		}
@@ -269,37 +321,73 @@ func servePartitionOperations(t *testing.T, conn net.Conn, handler func(index in
 
 // newPipeClient builds a client wired to one end of an in-memory pipe, with a
 // session already bound so replicated commands encode.
-func newPipeClient(t *testing.T) (*IggyTcpClient, net.Conn) {
+func newPipeClient(t testing.TB) (*IggyTcpClient, net.Conn) {
 	t.Helper()
-
 	serverConn, clientConn := net.Pipe()
 	client := newTestClient(t, clientConn)
 	client.session.BeginRegister()
 	require.NoError(t, client.session.Bind(100))
-	client.sessionState = iggcon.SessionStateAuthenticated
-	client.rememberLogin(NewUsernamePasswordCredentials("iggy", "secret"))
-
-	t.Cleanup(func() {
-		_ = clientConn.Close()
-		_ = serverConn.Close()
-	})
+	client.rememberedLogin = NewAutoLogin(NewUsernamePasswordCredentials("iggy", "secret"))
+	client.links.bootstrap.markBound(client.sessionFence)
+	client.links.slots[0] = &replicaSlot{endpoint: "pipe", link: client.links.bootstrap, cancel: func() {}}
+	client.links.rosterOrder = []uint8{0}
+	client.links.hasRoster.Store(true)
+	client.links.hasPrimary = true
+	client.links.primary = 0
+	t.Cleanup(func() { _ = client.Close(); _ = serverConn.Close() })
 	return client, serverConn
 }
 
-// newTestClient builds a connected client over an established connection.
-func newTestClient(t *testing.T, conn net.Conn) *IggyTcpClient {
+// newRosterPipeClient is a pipe client that keeps its link when it installs a
+// one-node roster, which names the configured endpoint. A namespace miss of the
+// node reads that roster to confirm the node is the metadata primary.
+func newRosterPipeClient(t testing.TB) (*IggyTcpClient, net.Conn) {
 	t.Helper()
-	client := &IggyTcpClient{
-		conn:           conn,
-		transportState: iggcon.TransportStateConnected,
-		sessionState:   iggcon.SessionStateUnauthenticated,
-		logger:         slog.New(slog.DiscardHandler),
-		session:        vsr.NewSession(),
-		config:         defaultTcpClientConfig(),
-		closed:         make(chan struct{}),
-		exchangeGate:   make(chan struct{}, 1),
-	}
-	// Pipe fixtures model an already discovered standalone broker.
-	client.topologyKnown.Store(true)
+	client, serverConn := newPipeClient(t)
+	client.config.serverAddress = "pipe"
+	client.links.bootstrap = nil
+	return client, serverConn
+}
+
+func newTestClient(t testing.TB, conn net.Conn) *IggyTcpClient {
+	t.Helper()
+	client := NewIggyTcpClient(slog.New(slog.DiscardHandler), WithHeartbeatInterval(0))
+	client.links.ctx, client.links.cancel = context.WithCancel(context.Background())
+	client.links.tasks = &sync.WaitGroup{}
+	client.links.bootstrap = newTCPLink(conn, "pipe")
+	t.Cleanup(func() { _ = client.Close() })
 	return client
+}
+
+// recoverNow starts the automatic recovery of the session the client holds.
+func recoverNow(client *IggyTcpClient) {
+	client.mtx.Lock()
+	fence := client.sessionFence
+	client.mtx.Unlock()
+	client.recoverSession(fence)
+}
+
+// holdRecovery keeps the next recovery from connecting until release runs, so
+// the test observes the recovery while it is in progress.
+func holdRecovery(t *testing.T, client *IggyTcpClient) (release func()) {
+	t.Helper()
+	client.connectMu.Lock()
+	var once sync.Once
+	release = func() { once.Do(client.connectMu.Unlock) }
+	t.Cleanup(release)
+	return release
+}
+
+// awaitRecoveryEnd waits until the latest automatic recovery has ended.
+func awaitRecoveryEnd(t *testing.T, client *IggyTcpClient) {
+	t.Helper()
+	client.mtx.Lock()
+	recovery := client.recovery
+	client.mtx.Unlock()
+	require.NotNil(t, recovery, "no recovery started")
+	select {
+	case <-recovery.Done():
+	case <-time.After(time.Second):
+		t.Fatal("the session recovery did not end")
+	}
 }

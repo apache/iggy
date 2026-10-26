@@ -89,6 +89,57 @@ async fn duplicate_install_drops_second_fd_without_panic() {
     );
 }
 
+/// A connection removes only its own client metadata. Once a reinstall
+/// under the same client id holds the slot, the metadata and the
+/// connection-lost notice belong to the reinstall, so the replaced
+/// connection's exit must neither remove the one nor fire the other.
+#[compio::test]
+#[allow(clippy::future_not_send)]
+async fn given_reinstalled_client_id_when_replaced_connection_exits_should_keep_reinstall_meta() {
+    let bus = Rc::new(IggyMessageBus::new(0));
+    let lost: Rc<Cell<u32>> = Rc::new(Cell::new(0));
+    let lost_hook = Rc::clone(&lost);
+    bus.set_client_connection_lost_fn(Rc::new(move |_| lost_hook.set(lost_hook.get() + 1)));
+    let on_request: RequestHandler = Rc::new(|_, _| {});
+    let client_id: u128 = 0x5ca1_ab1e;
+    let (first_local, _first_peer) = loopback_peer_pair().await;
+    let (second_local, _second_peer) = loopback_peer_pair().await;
+
+    install_client_tcp(
+        &bus,
+        test_client_meta(client_id, ClientTransportKind::Tcp),
+        first_local,
+        test_permit(),
+        on_request.clone(),
+    );
+    // Let the first connection's tasks start, so their cleanup is armed.
+    compio::time::sleep(Duration::from_millis(10)).await;
+    // Dropping the slot ends the first connection's tasks, as a close in
+    // progress does; the reinstall takes the id before their cleanup runs.
+    assert!(bus.clients().remove(client_id));
+    install_client_tcp(
+        &bus,
+        test_client_meta(client_id, ClientTransportKind::Tcp),
+        second_local,
+        test_permit(),
+        on_request,
+    );
+    compio::time::sleep(Duration::from_millis(50)).await;
+
+    assert!(bus.clients().contains(client_id));
+    assert!(
+        bus.client_meta(client_id).is_some(),
+        "the replaced connection must not remove the reinstall's metadata"
+    );
+    assert_eq!(
+        lost.get(),
+        0,
+        "the reinstall must not be reported lost by the connection it replaced"
+    );
+    let outcome = bus.shutdown(Duration::from_secs(2)).await;
+    assert_eq!(outcome.force, 0);
+}
+
 #[allow(clippy::future_not_send)]
 async fn loopback_peer_pair() -> (TcpStream, TcpStream) {
     let listener = TcpListener::bind(loopback()).await.expect("bind");

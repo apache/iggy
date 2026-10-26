@@ -91,8 +91,8 @@ jobs:
         id: interpreters
         run: ./scripts/ci/wheel-interpreters.sh >> "$GITHUB_OUTPUT"
 
-      - name: Setup Rust with cache
-        uses: ./.github/actions/utils/setup-rust-with-cache
+      - name: Setup Rust
+        uses: ./.github/actions/utils/setup-rust
 
       - name: Generate third-party license manifest
         run: |
@@ -166,8 +166,8 @@ jobs:
         with:
           python-version: ${{ steps.interpreters.outputs.python_versions }}
 
-      - name: Setup Rust with cache
-        uses: ./.github/actions/utils/setup-rust-with-cache
+      - name: Setup Rust
+        uses: ./.github/actions/utils/setup-rust
 
       - name: Generate third-party license manifest
         run: |
@@ -240,8 +240,8 @@ jobs:
           python-version: ${{ matrix.python-version }}
           architecture: x64
 
-      - name: Setup Rust with cache
-        uses: ./.github/actions/utils/setup-rust-with-cache
+      - name: Setup Rust
+        uses: ./.github/actions/utils/setup-rust
         with:
           shared-key: python-wheels-windows
 

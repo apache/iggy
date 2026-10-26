@@ -41,6 +41,7 @@ pub struct ApplyContext {
     pub client_id: u128,
     pub session: u64,
     pub request: u64,
+    pub user_id: u32,
 }
 
 impl From<&PrepareHeader> for ApplyContext {
@@ -50,6 +51,7 @@ impl From<&PrepareHeader> for ApplyContext {
             client_id: header.client,
             session: header.session,
             request: header.request,
+            user_id: header.user_id,
         }
     }
 }
@@ -84,13 +86,24 @@ where
     /// Panics if the inner `UnsafeCell` pointer is null (should never happen
     /// unless the writer was not properly initialized).
     pub fn apply(&self, cmd: O) {
+        self.apply_all(std::iter::once(cmd));
+    }
+
+    /// Applies `cmds` in order and publishes once, so readers see all of them
+    /// or none.
+    ///
+    /// # Panics
+    /// Panics if the inner `UnsafeCell` pointer is null (should never happen
+    /// unless the writer was not properly initialized).
+    pub fn apply_all(&self, cmds: impl IntoIterator<Item = O>) {
         let hdl = unsafe {
             self.inner
                 .get()
                 .as_mut()
                 .expect("[apply]: called on uninit writer")
         };
-        hdl.append(cmd).publish();
+        hdl.extend(cmds);
+        hdl.publish();
     }
 }
 
@@ -240,6 +253,21 @@ where
         cell.apply(cmd);
         Ok(())
     }
+
+    /// Apply `cmds` in order with one publish, see [`WriteCell::apply_all`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApplyOnReaderError::ReaderOnly`] like [`Self::try_apply`],
+    /// with no command applied.
+    pub fn try_apply_all(
+        &self,
+        cmds: impl IntoIterator<Item = <T as Command>::Cmd>,
+    ) -> Result<(), ApplyOnReaderError> {
+        let cell = self.write.as_ref().ok_or(ApplyOnReaderError::ReaderOnly)?;
+        cell.apply_all(cmds);
+        Ok(())
+    }
 }
 
 /// Public interface for state handlers.
@@ -384,6 +412,17 @@ macro_rules! define_state {
                     Self {
                         inner: $crate::stm::LeftRight::from_factory(factory),
                     }
+                }
+
+                /// The change records of the command applied last.
+                pub(crate) fn last_changes(&self) -> Vec<$crate::change_log::AppliedChange> {
+                    self.inner.read(|state| {
+                        state
+                            .last_result
+                            .as_ref()
+                            .map(|reply| reply.changes.clone())
+                            .unwrap_or_default()
+                    })
                 }
             }
 
@@ -550,6 +589,8 @@ macro_rules! collect_handlers {
 mod tests {
     use super::*;
     use left_right::Absorb;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     #[derive(Debug, Default, Clone)]
     struct Counter(u64);
@@ -608,5 +649,55 @@ mod tests {
             0,
             "reader state must be unchanged after a rejected try_apply"
         );
+    }
+
+    /// `absorb_first` gets the copy that readers see, so each first absorb
+    /// logs how many commands readers saw then. Both copies share the log.
+    #[derive(Debug, Default, Clone)]
+    struct PublishProbe {
+        applied: u64,
+        visible_at_absorb: Rc<RefCell<Vec<u64>>>,
+    }
+
+    impl Absorb<CounterCmd> for PublishProbe {
+        fn absorb_first(&mut self, _cmd: &mut CounterCmd, other: &Self) {
+            self.visible_at_absorb.borrow_mut().push(other.applied);
+            self.applied += 1;
+        }
+
+        fn absorb_second(&mut self, _cmd: CounterCmd, _other: &Self) {
+            self.applied += 1;
+        }
+
+        fn sync_with(&mut self, first: &Self) {
+            *self = first.clone();
+        }
+    }
+
+    impl Command for PublishProbe {
+        type Cmd = CounterCmd;
+        type Input = ();
+        type Error = ();
+
+        fn parse(_input: Self::Input) -> Result<Either<Self::Cmd, Self::Input>, Self::Error> {
+            Ok(Either::Left(CounterCmd::Inc))
+        }
+    }
+
+    #[test]
+    fn given_two_commands_when_applied_together_should_publish_them_at_once() {
+        let lr: LeftRight<PublishProbe, CounterCmd> = PublishProbe::default().into();
+        // Until its first publish, left-right absorbs in place, past `absorb_first`.
+        lr.try_apply(CounterCmd::Inc)
+            .expect("writer must accept apply");
+        lr.try_apply_all([CounterCmd::Inc, CounterCmd::Inc])
+            .expect("writer must accept apply");
+        let visible_at_absorb = lr.read(|probe| Rc::clone(&probe.visible_at_absorb));
+        assert_eq!(
+            *visible_at_absorb.borrow(),
+            [1, 1],
+            "readers must see no command of the batch before all of them apply"
+        );
+        assert_eq!(lr.read(|probe| probe.applied), 3);
     }
 }

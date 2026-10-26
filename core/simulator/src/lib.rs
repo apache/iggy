@@ -27,23 +27,29 @@ pub mod seeds;
 pub mod storage;
 pub mod workload;
 
+mod partition_wal;
+
 use bus::SimOutbox;
 use client::SimClient;
 use clock::Clock;
-use consensus::{ConsensusClock, MetadataHandle, PartitionsHandle, VsrState};
+use consensus::{ConsensusClock, MetadataHandle, PartitionsHandle, Status, VsrState};
 use deps::SimClock;
 use deps::SimSuperblock;
 use deps::{MemStorage, SimJournal};
 use executor::{DetExecutor, RunOutcome, TaskId};
-use iggy_binary_protocol::primitives::partition_history::PartitionContext;
-use iggy_binary_protocol::{Command, GenericHeader, PrepareHeader, ReplyHeader};
-use iggy_common::IggyError;
+use iggy_binary_protocol::primitives::partition_history::{ConsumerGroupOwner, PartitionContext};
+use iggy_binary_protocol::{
+    Command, CommitHeader, DoViewChangeHeader, GenericHeader, PrepareHeader, ReplyHeader,
+    RequestHeader, RoutedRequestHeader, StartViewChangeHeader, StartViewHeader,
+};
+use iggy_common::{Durability, IggyError};
+use message_bus::MessageBus;
 use message_bus::installer::conn_info::{ClientConnMeta, ClientTransportKind};
 use metadata::impls::metadata::StreamsFrontend;
 use network::Network;
 use packet::{PacketSimulatorOptions, ProcessId};
 use partitions::{
-    Partition, PartitionOffsets, PollFragments, PollingArgs, PollingConsumer,
+    IggyPartition, Partition, PartitionOffsets, PollFragments, PollingArgs, PollingConsumer,
     RetainedPartitionState,
 };
 use rand::RngExt;
@@ -52,15 +58,17 @@ use rand_xoshiro::rand_core::SeedableRng;
 use replica::{Replica, SIM_INBOX_CAPACITY, new_shard};
 use seeds::SimSeeds;
 use server_common::Message;
-use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
+use server_common::sharding::{IggyNamespace, METADATA_GROUP, PartitionLocation, ShardId};
 use shard::shards_table::{ShardsTable, calculate_shard_assignment};
 use shard::{CONSENSUS_TICK_INTERVAL, PartitionMaterialisation};
 use std::cell::RefCell;
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use storage::{Crash, SimStorage};
 
 /// Poll budget per [`DetExecutor::run_until_stalled`]. Pumps are event-driven, so
 /// hitting it means a task is spin-waking: a bug, panicked with the seed.
@@ -79,7 +87,7 @@ const SETUP_TOTAL_STEPS: u32 = 4_000;
 pub struct SimReplica {
     /// Fixture metadata this replica observed before any WAL replay. Runtime
     /// allocations must be recovered from their logged commands instead.
-    seeded_namespaces: RefCell<BTreeMap<IggyNamespace, u32>>,
+    seeded_namespaces: RefCell<BTreeMap<IggyNamespace, (u32, Durability)>>,
     /// Shards of this replica, indexed by shard id.
     pub shards: Vec<Rc<Replica>>,
     /// Shard 0's durable superblock. Held here, not in the shard, so its bytes
@@ -93,21 +101,30 @@ pub struct SimReplica {
     /// restart: distinct incarnations, byte-identical replay. See
     /// `VsrConsensus::set_incarnation`.
     pub metadata_incarnation: u128,
-    /// One durable superblock per materialised partition group, retained like
-    /// `superblock` so a re-materialised group recovers its recorded
-    /// `(view, log_view)` instead of re-entering view 0. Storeless, the persist gate
-    /// marks every view durable without writing, leaving the gate, its write-failure
-    /// fence and view recovery unexercised.
-    pub partition_superblocks: RefCell<HashMap<IggyNamespace, Rc<SimSuperblock>>>,
+    /// One durable superblock per materialised partition group, with the incarnation
+    /// it belongs to, retained like `superblock` so a re-materialised group recovers
+    /// its recorded `(view, log_view)` instead of re-entering view 0. Storeless, the
+    /// persist gate marks every view durable without writing, leaving the gate, its
+    /// write-failure fence and view recovery unexercised.
+    pub partition_superblocks: RefCell<HashMap<IggyNamespace, (u64, Rc<SimSuperblock>)>>,
+    /// The disk under every partition WAL of this replica, retained across a
+    /// restart like `superblock`. A crash keeps only what the WAL synced.
+    pub partition_storage: SimStorage,
     /// One retained message log per partition group, plus the offsets recovered from
     /// it. A real server's messages are in segment files; the simulator has none, so
     /// without this a rebuilt partition comes back empty and the monotonicity
     /// invariant calls a discarded log a consensus regression. Populated by
-    /// [`Simulator::replica_restart`], consumed by `materialise_partition`.
+    /// [`Simulator::replica_restart`], consumed by `materialise_partition`. Belongs
+    /// to the incarnation of the group's `partition_superblocks` entry.
     partition_logs: RefCell<HashMap<IggyNamespace, RetainedPartitionState>>,
+    /// Fixture groups the last restart could not re-materialise, its replay having
+    /// stopped short of their incarnation. Reconcile materialises each once the
+    /// metadata catches up.
+    deferred_partitions: RefCell<BTreeSet<IggyNamespace>>,
     /// This replica's data directory when checkpoints are enabled. Retained so a
     /// restart reads back the snapshot its previous incarnation wrote.
     data_dir: Option<std::path::PathBuf>,
+    system_path: std::path::PathBuf,
     /// Keeps each pump's stop channel alive. Dropping one ends that pump gracefully,
     /// reserved for shutdown tests; crash uses `DetExecutor::abort`.
     _stop_txs: Vec<shard::Sender<()>>,
@@ -116,6 +133,9 @@ pub struct SimReplica {
     /// Lifecycle report state per shard, indexed by shard id. A restart starts
     /// it empty, as a rebooted reconciler does.
     lifecycle_reports: Vec<server::LifecycleReports>,
+    /// Group offset cleanup state per shard, indexed by shard id, reset by a
+    /// restart like `lifecycle_reports`.
+    group_offset_cleanups: Vec<server::GroupOffsetCleanup>,
 }
 
 impl SimReplica {
@@ -215,31 +235,37 @@ pub struct Simulator {
     entry_rng: Xoshiro256PlusPlus,
     /// Network seed, kept for livelock diagnostics.
     seed: u64,
-    /// Clients the cluster has evicted since the last drain, in delivery order.
-    ///
-    /// An eviction ends a session: outstanding requests go unanswered and the client
-    /// must log in again. Recorded, not acted on, because re-establishing a session
-    /// steps the simulator and drops workload expectations, neither of which belongs
-    /// inside packet delivery.
-    evicted: Vec<u128>,
-    /// The view each namespace was created in, what production records on the
-    /// committed partition and every replica seeds its group from. Read from the
-    /// metadata plane once, at the first seed, and reused for every later seed
-    /// of that namespace, a restart's included, so no replica seeds a view its
-    /// peers did not.
+    /// Evicted clients and the refusing replicas, in delivery order. Recovery
+    /// must bind that transport before retrying its unresolved requests.
+    evicted: Vec<(u128, u8)>,
+    /// Creation views retained across materialization and restart. Manual
+    /// fixtures choose the metadata view at first seed; replicated creates use
+    /// their committed per-assignment views. Later seeds reuse the same choice
+    /// so replicas cannot initialize one group with different views.
     partition_created_views: HashMap<IggyNamespace, u32>,
+    /// Topic durability a namespace is seeded with, `persisted` unless a test
+    /// chose otherwise through [`Self::set_partition_durability`].
+    partition_durabilities: HashMap<IggyNamespace, Durability>,
+    /// Highest view in which each replica sent a view-scoped message of a
+    /// partition group, keyed with the incarnation it hosted when the message
+    /// left. A restart may forget a later view only if it sent nothing in it.
+    partition_sent_views: HashMap<(u8, IggyNamespace, u64), u32>,
     /// Replies a setup handshake pulled off the wire that were not its own.
     ///
     /// `await_setup_reply` steps the whole simulator, so it sees every client's
     /// replies. Dropping the rest strands their auditor expectations until a resend
-    /// re-commits, so they are parked here and returned by the next [`Self::step`].
-    deferred_client_replies: Vec<Message<ReplyHeader>>,
+    /// re-commits, so they are parked here with their senders and returned by the
+    /// next [`Self::step_with_senders`].
+    deferred_client_replies: Vec<(u8, Message<ReplyHeader>)>,
     /// Dispatch-shell mode: inbound client packets go through the real
     /// `on_client_request` handler (see
     /// [`shard::IggyShard::deliver_client_request`]) instead of raw `dispatch`
     /// routing. Set at construction by [`Simulator::with_shards_shell`].
     shell: bool,
+    seed_root: bool,
     consumer_offsets_max: usize,
+    // The liveness fence directory survives replica restarts and is removed last.
+    _system_directory: Option<tempfile::TempDir>,
 }
 
 impl Simulator {
@@ -308,11 +334,9 @@ impl Simulator {
     /// `checkpoint_if_needed` returns immediately and nothing produces the snapshot a
     /// state transfer serves.
     ///
-    /// Opt-in, and separate from the other constructors, because checkpoints use
-    /// synchronous snapshot I/O: a harness that touches nothing outside memory
-    /// should not start writing files by omission. Writes never
-    /// touch the executor, so replay stays deterministic; the caller owns the
-    /// directory's lifetime.
+    /// Checkpoints remain opt-in independently of liveness fence files. Snapshot
+    /// writes use synchronous I/O without advancing the executor; the caller owns
+    /// the directory's lifetime.
     ///
     /// Pair with [`Simulator::set_metadata_journal_slots`]: a checkpoint is forced by
     /// the journal running low on slots, and it is unbounded until told otherwise.
@@ -334,6 +358,7 @@ impl Simulator {
             network_options,
             shell,
             Some(data_dir_root),
+            true,
         )
     }
 
@@ -360,6 +385,7 @@ impl Simulator {
             network_options,
             shell,
             None,
+            true,
         )
     }
 
@@ -371,6 +397,7 @@ impl Simulator {
         network_options: PacketSimulatorOptions,
         shell: bool,
         data_dir_root: Option<&std::path::Path>,
+        seed_root: bool,
     ) -> Self {
         assert!(
             shards_per_replica >= 1,
@@ -402,12 +429,21 @@ impl Simulator {
         let consensus_clock = ConsensusClock::new(Rc::new(SimClock::new(timer.clone())));
 
         let rc = replica_count as u8;
+        let system_directory = data_dir_root
+            .is_none()
+            .then(|| tempfile::tempdir().expect("simulator system directory is creatable"));
+        let system_root = data_dir_root.unwrap_or_else(|| {
+            system_directory
+                .as_ref()
+                .expect("a simulator without a checkpoint root owns a temporary directory")
+                .path()
+        });
         let mut replicas = Vec::with_capacity(replica_count);
         let mut outboxes = Vec::with_capacity(replica_count);
 
         for i in 0..replica_count {
             let id = i as u8;
-            let mut bus = SimOutbox::new(id, timer.clone(), spawns.clone());
+            let mut bus = SimOutbox::new(id, timer.clone(), spawns.clone(), shell);
             for &cid in &client_ids {
                 bus.add_client(cid);
             }
@@ -425,8 +461,11 @@ impl Simulator {
             // Created up front: the snapshot coordinator writes into
             // `<dir>/metadata/` and does not create it. Retained on `SimReplica` so a
             // restart reads back the snapshot its previous incarnation wrote.
-            let replica_data_dir = data_dir_root.as_ref().map(|root| {
-                let dir = root.join(format!("replica-{i}"));
+            let system_path = system_root.join(format!("replica-{i}"));
+            std::fs::create_dir_all(&system_path)
+                .expect("simulator replica system directory is creatable");
+            let replica_data_dir = data_dir_root.map(|_| {
+                let dir = system_path.clone();
                 std::fs::create_dir_all(dir.join(metadata::impls::METADATA_DIR))
                     .expect("simulator data directory is creatable");
                 dir
@@ -451,7 +490,17 @@ impl Simulator {
             // One applied-metadata frontier per REPLICA, shared by its shards,
             // as the server bootstrap mints one per process. Volatile: a restart
             // below builds a fresh cell, matching a rebooted node.
-            let metadata_applied_frontier = Arc::<metadata::AppliedFrontier>::default();
+            let mut metadata_applied_frontier = metadata::AppliedFrontier::default();
+            if replica_count > 1 {
+                metadata_applied_frontier = metadata_applied_frontier.with_partition_freshness(
+                    outbox.monotonic_now(),
+                    configs::server::ServerConfig::default()
+                        .cluster
+                        .heartbeat_timeout
+                        .get_duration(),
+                );
+            }
+            let metadata_applied_frontier = Arc::new(metadata_applied_frontier);
             for shard_idx in 0..shards_per_replica {
                 let inbox = inboxes[usize::from(shard_idx)]
                     .take()
@@ -467,7 +516,7 @@ impl Simulator {
                     None
                 };
                 let shard_journal = (shard_idx == 0).then(|| Rc::clone(&metadata_journal));
-                let (shard, writer_bundle) = new_shard(
+                let (shard, writer_bundle, liveness_stops) = new_shard(
                     id,
                     shard_idx,
                     format!("replica-{i}-shard-{shard_idx}"),
@@ -478,16 +527,19 @@ impl Simulator {
                     reply_inbox,
                     consensus_clock.clone(),
                     shell,
+                    seed_root,
                     metadata_bundle.clone(),
                     shard_superblock,
                     shard_journal,
                     None, // fresh boot: no recovered VSR state
                     metadata_incarnation,
                     (shard_idx == 0).then(|| replica_data_dir.clone()).flatten(),
+                    &system_path,
                     // Fresh boot: `init_partition` seeds later, before any workload.
                     &[],
                     Arc::clone(&metadata_applied_frontier),
                 );
+                stop_txs.extend(liveness_stops);
                 if shard_idx == 0 {
                     metadata_bundle = Some(
                         writer_bundle
@@ -515,6 +567,10 @@ impl Simulator {
                 .iter()
                 .map(|_| server::LifecycleReports::default())
                 .collect();
+            let group_offset_cleanups = shards
+                .iter()
+                .map(|_| server::GroupOffsetCleanup::default())
+                .collect();
             replicas.push(SimReplica {
                 seeded_namespaces: RefCell::new(BTreeMap::new()),
                 shards,
@@ -522,11 +578,15 @@ impl Simulator {
                 metadata_journal,
                 metadata_incarnation,
                 partition_superblocks: RefCell::new(HashMap::new()),
+                partition_storage: SimStorage::default(),
                 partition_logs: RefCell::new(HashMap::new()),
+                deferred_partitions: RefCell::new(BTreeSet::new()),
                 data_dir: replica_data_dir,
+                system_path,
                 _stop_txs: stop_txs,
                 pump_tasks,
                 lifecycle_reports,
+                group_offset_cleanups,
             });
             outboxes.push(outbox);
         }
@@ -542,10 +602,14 @@ impl Simulator {
             entry_rng: Xoshiro256PlusPlus::seed_from_u64(SimSeeds::derive(seed).entry_shard),
             evicted: Vec::new(),
             partition_created_views: HashMap::new(),
+            partition_durabilities: HashMap::new(),
+            partition_sent_views: HashMap::new(),
             deferred_client_replies: Vec::new(),
             seed,
             shell,
+            seed_root,
             consumer_offsets_max: partitions::DEFAULT_CONSUMER_OFFSETS_MAX,
+            _system_directory: system_directory,
         }
     }
 
@@ -602,6 +666,7 @@ impl Simulator {
         let Some(created_view) = self.partition_created_view(namespace) else {
             return;
         };
+        let durability = self.partition_durability(namespace);
         for (i, replica) in self.replicas.iter().enumerate() {
             if self.crashed.contains(&(i as u8)) {
                 continue;
@@ -611,8 +676,13 @@ impl Simulator {
                 replica
                     .seeded_namespaces
                     .borrow_mut()
-                    .insert(namespace, created_view);
-                streams.seed_namespace(namespace, namespace.inner(), created_view);
+                    .insert(namespace, (created_view, durability));
+                streams.seed_namespace_with_durability(
+                    namespace,
+                    namespace.inner(),
+                    created_view,
+                    durability,
+                );
             }
             materialise_partition(replica, namespace, self.consumer_offsets_max);
         }
@@ -633,6 +703,7 @@ impl Simulator {
         let Some(created_view) = self.partition_created_view(namespace) else {
             return;
         };
+        let durability = self.partition_durability(namespace);
         for (i, replica) in self.replicas.iter().enumerate() {
             if self.crashed.contains(&(i as u8)) {
                 continue;
@@ -640,7 +711,7 @@ impl Simulator {
             replica
                 .seeded_namespaces
                 .borrow_mut()
-                .insert(namespace, created_view);
+                .insert(namespace, (created_view, durability));
             // Shard 0 is the sole metadata writer. Peers see the seed through the
             // left-right publish, so seeding a reader-mode peer STM would panic.
             replica.shards[0]
@@ -648,13 +719,35 @@ impl Simulator {
                 .metadata()
                 .mux_stm
                 .streams()
-                .seed_namespace(namespace, namespace.inner(), created_view);
+                .seed_namespace_with_durability(
+                    namespace,
+                    namespace.inner(),
+                    created_view,
+                    durability,
+                );
         }
     }
 
-    /// The view `namespace` was created in: the metadata plane's view at its
-    /// first seed, as the prepare of a real create carries it, and the same value
-    /// for every seed after. `None` with no live metadata consensus to read.
+    /// Seed `namespace`'s topic with `durability` for both messages and consumer
+    /// offsets. Call before the first seed; a topic already seeded keeps its own.
+    pub fn set_partition_durability(&mut self, namespace: IggyNamespace, durability: Durability) {
+        debug_assert!(
+            !self.partition_created_views.contains_key(&namespace),
+            "{namespace:?} is already seeded with its own durability"
+        );
+        self.partition_durabilities.insert(namespace, durability);
+    }
+
+    fn partition_durability(&self, namespace: IggyNamespace) -> Durability {
+        self.partition_durabilities
+            .get(&namespace)
+            .copied()
+            .unwrap_or(Durability::Persisted)
+    }
+
+    /// Manual fixtures choose the metadata view at first seed and retain it
+    /// for later seeds. Production create requests choose each assignment's
+    /// initial view separately. `None` with no live metadata consensus to read.
     fn partition_created_view(&mut self, namespace: IggyNamespace) -> Option<u32> {
         if let Some(&created_view) = self.partition_created_views.get(&namespace) {
             return Some(created_view);
@@ -689,6 +782,25 @@ impl Simulator {
     /// If no login reply arrives within `SETUP_TOTAL_STEPS`, or it carries no
     /// session.
     pub fn shell_login_via(&mut self, client: &SimClient, target: u8) {
+        self.shell_login_as(
+            client,
+            target,
+            replica::SHELL_ROOT_USERNAME,
+            replica::SHELL_ROOT_PASSWORD,
+        );
+    }
+
+    /// [`Self::shell_login_via`] with the credentials of a user the run created.
+    ///
+    /// # Panics
+    /// As [`Self::shell_login_via`].
+    pub fn shell_login_as(
+        &mut self,
+        client: &SimClient,
+        target: u8,
+        username: &str,
+        password: &str,
+    ) {
         // Connection metadata on every replica, as `install_client_fd` does in
         // production. `ensure_transport_connection` reads it to admit the connection
         // into the SessionManager, which the login's bind
@@ -705,13 +817,11 @@ impl Simulator {
         // From here this client talks the real client protocol. See
         // `SimClient::shell_wire`.
         client.set_shell_wire();
-        let msg = client
-            .login(replica::SHELL_ROOT_USERNAME, replica::SHELL_ROOT_PASSWORD)
-            .into_generic();
+        let msg = client.login(username, password).into_generic();
         // `build_reply_with_body` maps the session field to `op`.
         let session = self
             .await_setup_reply(
-                client.client_id(),
+                client,
                 target,
                 &msg,
                 iggy_binary_protocol::Operation::Register,
@@ -727,28 +837,57 @@ impl Simulator {
     /// Submit `message` to `target` and step until a client reply arrives,
     /// resubmitting every [`SETUP_RETRY_STEPS`] steps.
     ///
-    /// Resubmitted verbatim, so the request id is stable. Not free, though:
-    /// `register_preflight` dispatches every `Register` past its gates, even one
-    /// whose client already holds an entry, because a bind is a fencing event and
-    /// absorbing it would hand back an un-bumped epoch. Each landed retry therefore
-    /// commits another register and fences the previous holder, recoverable in one
-    /// round trip but a reason to keep the interval well above it.
+    /// Resubmitted verbatim, so the request id is stable. A shell request first
+    /// binds its destination: setup logins can answer from a backup while the
+    /// primary's transport remains unbound. The same identity and secret recover
+    /// the existing session across those bindings.
     ///
     /// # Panics
     /// If no reply arrives within `SETUP_TOTAL_STEPS`. A handshake that never
     /// completes leaves the fixture unusable, so there is no useful `None`.
     fn await_setup_reply(
         &mut self,
-        client_id: u128,
+        client: &SimClient,
         target: u8,
         message: &Message<GenericHeader>,
         expected_operation: iggy_binary_protocol::Operation,
         label: &str,
     ) -> Message<ReplyHeader> {
+        self.try_await_setup_reply(client, target, message, expected_operation)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{label}: no reply for client {} within {SETUP_TOTAL_STEPS} steps \
+                     (seed {:#x})",
+                    client.client_id(),
+                    self.seed,
+                )
+            })
+    }
+
+    /// [`Self::await_setup_reply`] that returns `None` instead of panicking when
+    /// no reply arrives within `SETUP_TOTAL_STEPS`.
+    fn try_await_setup_reply(
+        &mut self,
+        client: &SimClient,
+        target: u8,
+        message: &Message<GenericHeader>,
+        expected_operation: iggy_binary_protocol::Operation,
+    ) -> Option<Message<ReplyHeader>> {
+        let client_id = client.client_id();
+        let request = bytemuck::checked::from_bytes::<RequestHeader>(
+            &message.as_slice()[..size_of::<RequestHeader>()],
+        )
+        .request;
+        let bind_before_request =
+            self.shell && expected_operation != iggy_binary_protocol::Operation::Register;
         let mut target = target;
         for step in 0..SETUP_TOTAL_STEPS {
             if step % SETUP_RETRY_STEPS == 0 {
-                self.submit_request(client_id, target, message.deep_copy());
+                if bind_before_request {
+                    self.submit_handshake(client, target);
+                } else {
+                    self.submit_request(client_id, target, message.deep_copy());
+                }
                 // Rotate, as the workload's resend path does. Retrying one replica
                 // forever suffices on a perfect network and is useless once it is
                 // partitioned or crashed mid-handshake: a register has to reach the
@@ -757,8 +896,17 @@ impl Simulator {
                 target = (target + 1) % self.replica_count.max(1);
             }
             let mut answer = None;
-            for reply in self.step() {
+            for (from, reply) in self.step_with_senders() {
                 let header = reply.header();
+                if bind_before_request
+                    && header.client == client_id
+                    && header.operation == iggy_binary_protocol::Operation::Register
+                    && let Some(session) = self.handshake_session(&reply)
+                {
+                    client.bind_session(session);
+                    self.submit_request(client_id, from, message.deep_copy());
+                    continue;
+                }
                 // Correlate. Stepping the whole simulator surfaces every client's
                 // replies, and taking the first hands a two-client run another
                 // client's committed op as this answer, whose `op` is then bound as
@@ -773,22 +921,19 @@ impl Simulator {
                 if answer.is_none()
                     && header.client == client_id
                     && header.operation == expected_operation
+                    && header.request == request
                     && !setup_reply_is_transient(&reply)
                 {
                     answer = Some(reply);
                     continue;
                 }
-                self.deferred_client_replies.push(reply);
+                self.deferred_client_replies.push((from, reply));
             }
-            if let Some(reply) = answer {
-                return reply;
+            if answer.is_some() {
+                return answer;
             }
         }
-        panic!(
-            "{label}: no reply for client {client_id} within {SETUP_TOTAL_STEPS} steps \
-             (seed {:#x})",
-            self.seed,
-        );
+        None
     }
 
     /// Advance the simulation by one tick. Returns client replies delivered.
@@ -801,14 +946,24 @@ impl Simulator {
     /// advances.
     ///
     /// # Panics
-    /// If a client-addressed packet does not decode as `ReplyHeader`, or a pump
-    /// livelocks (poll budget exhausted).
-    #[allow(clippy::cast_possible_truncation)]
+    /// If a client-addressed packet comes from a client or does not decode as
+    /// `ReplyHeader`, or a pump livelocks (poll budget exhausted).
     pub fn step(&mut self) -> Vec<Message<ReplyHeader>> {
+        self.step_with_senders()
+            .into_iter()
+            .map(|(_, reply)| reply)
+            .collect()
+    }
+
+    /// [`Self::step`], with the replica that sent each reply.
+    ///
+    /// # Panics
+    /// As [`Self::step`].
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn step_with_senders(&mut self) -> Vec<(u8, Message<ReplyHeader>)> {
         // Ahead of this step's own traffic, so a driver sees replies in delivery
         // order rather than the order a handshake happened to interrupt.
-        let mut client_replies: Vec<Message<ReplyHeader>> =
-            std::mem::take(&mut self.deferred_client_replies);
+        let mut client_replies = std::mem::take(&mut self.deferred_client_replies);
 
         // Phase 0: Fire the pumps' consensus-tick timers (view change,
         // retransmits) and run them to quiescence. Crashed replicas have no
@@ -843,7 +998,11 @@ impl Simulator {
                                 replica.shards[entry]
                                     .deliver_client_request(client_id, packet.message.deep_copy());
                             }
-                            ProcessId::Client(_) | ProcessId::Replica(_) => {
+                            ProcessId::Client(_) => {
+                                let shard = &replica.shards[entry];
+                                shard.dispatch(stamp_metadata_watermark(shard, &packet.message));
+                            }
+                            ProcessId::Replica(_) => {
                                 replica.shards[entry].dispatch(packet.message.deep_copy());
                             }
                         }
@@ -851,13 +1010,13 @@ impl Simulator {
                     // Crashed or missing: packet silently dropped.
                 }
                 ProcessId::Client(client_id) => {
-                    // Not every client-addressed frame is a reply. `Eviction` tells
-                    // a client its session is gone, sent once the client table drops
-                    // it, which the dispatch shell reaches as soon as replicas crash
-                    // and restart. Decoding it as a reply fails on the command
-                    // discriminant, so classify first and record it for the driver.
+                    let ProcessId::Replica(from) = packet.from else {
+                        panic!("client {client_id} got a packet from another client");
+                    };
+                    // An eviction cannot decode as a reply. Preserve its sender
+                    // so recovery binds the transport that refused the request.
                     if packet.message.header().command == Command::Eviction {
-                        self.evicted.push(client_id);
+                        self.evicted.push((client_id, from));
                         continue;
                     }
                     let reply: Message<ReplyHeader> = packet
@@ -865,7 +1024,7 @@ impl Simulator {
                         .deep_copy()
                         .try_into_typed()
                         .expect("invalid message, wrong command type for a client response");
-                    client_replies.push(reply);
+                    client_replies.push((from, reply));
                 }
             }
         }
@@ -897,6 +1056,14 @@ impl Simulator {
                 let message = match envelope.payload {
                     bus::EnvelopePayload::Replica(m) | bus::EnvelopePayload::Client(m) => m,
                 };
+                if let Some((namespace, incarnation, view)) = view_scoped_partition_frame(&message)
+                {
+                    let sent = self
+                        .partition_sent_views
+                        .entry((i as u8, namespace, incarnation))
+                        .or_default();
+                    *sent = (*sent).max(view);
+                }
                 self.network.submit(from, to, message);
             }
         }
@@ -964,12 +1131,11 @@ impl Simulator {
         (session > 0).then_some(session)
     }
 
-    /// Take the clients evicted since the last call.
+    /// Take the evicted clients and refusing replicas since the last call.
     ///
-    /// A driver must consume these: the session is gone, so outstanding requests are
-    /// unanswerable and the next one is refused until the client logs in again.
-    /// Ignoring them looks exactly like a wedge.
-    pub fn take_evictions(&mut self) -> Vec<u128> {
+    /// A driver must rebind their transports. The successful handshake determines
+    /// whether outstanding requests still belong to the recovered retry session.
+    pub fn take_evictions(&mut self) -> Vec<(u128, u8)> {
         std::mem::take(&mut self.evicted)
     }
 
@@ -1082,11 +1248,8 @@ impl Simulator {
     }
 
     fn reconcile_transitions(&mut self) {
-        let now = SimClock::new(self.executor.timer()).realtime().as_micros();
-        let timeout = configs::server::ServerConfig::default()
-            .consumer_group
-            .rebalancing_timeout
-            .as_micros();
+        let now = self.realtime_micros();
+        let timeout = rebalancing_timeout_micros();
         for (index, replica) in self.replicas.iter().enumerate() {
             if self
                 .crashed
@@ -1095,56 +1258,79 @@ impl Simulator {
                 continue;
             }
             let streams = replica.shards[0].plane.metadata().mux_stm.streams();
-            let mut targets = BTreeSet::new();
+            // Whether to materialise the target when nothing hosts it. A recreated
+            // fixture topic takes no lifecycle path, so its new incarnation only
+            // replaces a hosted one, or comes up where a restart deferred it.
+            let mut targets: BTreeMap<IggyNamespace, bool> = replica
+                .seeded_namespaces
+                .borrow()
+                .keys()
+                .map(|&namespace| (namespace, false))
+                .collect();
+            targets.extend(
+                replica
+                    .deferred_partitions
+                    .borrow()
+                    .iter()
+                    .map(|&namespace| (namespace, true)),
+            );
             for intent in streams.pending_lifecycles() {
                 for target in intent.partitions {
-                    targets.insert(IggyNamespace::new(
-                        intent.stream_id as usize,
-                        target.topic_id as usize,
-                        target.partition_id as usize,
-                    ));
+                    targets.insert(
+                        IggyNamespace::new(
+                            intent.stream_id as usize,
+                            target.topic_id as usize,
+                            target.partition_id as usize,
+                        ),
+                        true,
+                    );
                 }
             }
             for transition in streams.consumer_group_pending_revocations() {
-                targets.insert(IggyNamespace::new(
-                    transition.stream_id as usize,
-                    transition.topic_id as usize,
-                    transition.partition_id as usize,
-                ));
+                targets.insert(
+                    IggyNamespace::new(
+                        transition.stream_id as usize,
+                        transition.topic_id as usize,
+                        transition.partition_id as usize,
+                    ),
+                    true,
+                );
             }
-            for namespace in targets {
+            for (namespace, materialise_unhosted) in targets {
                 let incarnation = streams.created_revision_for_namespace(namespace);
-                let local = replica.shards.iter().find_map(|shard| {
-                    let partitions = shard.plane.partitions();
-                    let local = partitions.get_by_ns(&namespace)?.created_revision();
-                    Some((partitions, local))
-                });
-                match local {
+                let partitions = replica.partition_shard(namespace).plane.partitions();
+                match partitions
+                    .get_by_ns(&namespace)
+                    .map(IggyPartition::created_revision)
+                {
                     // A recreated topic reuses the deleted one's ids. The production
                     // reconciler tears the deleted incarnation down before it
                     // materializes the new one.
-                    Some((partitions, local))
-                        if incarnation.is_some_and(|current| current != local) =>
-                    {
+                    Some(local) if incarnation.is_some_and(|current| current != local) => {
                         partitions.remove(&namespace);
-                        replica
-                            .partition_superblocks
-                            .borrow_mut()
-                            .remove(&namespace);
                     }
                     Some(_) => continue,
+                    None if !materialise_unhosted => continue,
                     None => {}
                 }
                 if let Some(view) = streams.created_view_for_namespace(namespace) {
                     self.partition_created_views
                         .entry(namespace)
                         .or_insert(view);
-                    materialise_partition(replica, namespace, self.consumer_offsets_max);
+                    if materialise_partition(replica, namespace, self.consumer_offsets_max) {
+                        replica.deferred_partitions.borrow_mut().remove(&namespace);
+                    }
                 }
             }
-            for (shard, reports) in replica.shards.iter().zip(&replica.lifecycle_reports) {
+            for ((shard, reports), cleanup) in replica
+                .shards
+                .iter()
+                .zip(&replica.lifecycle_reports)
+                .zip(&replica.group_offset_cleanups)
+            {
                 server::reconcile_pending_revocations(shard, now, timeout);
                 server::reconcile_partition_lifecycles(shard, reports, now);
+                server::reconcile_consumer_group_offsets(shard, cleanup);
             }
         }
     }
@@ -1223,7 +1409,7 @@ impl Simulator {
     pub fn register_client_via(&mut self, client: &SimClient, target: u8) {
         let msg = client.register().into_generic();
         let reply = self.await_setup_reply(
-            client.client_id(),
+            client,
             target,
             &msg,
             iggy_binary_protocol::Operation::Register,
@@ -1273,6 +1459,12 @@ impl Simulator {
         // Discard any unsent messages (never reached the wire).
         self.outboxes[replica_index as usize].drain();
 
+        // Power loss: the WAL keeps only what it synced. Handles the dead
+        // process held go stale, as they do across a real restart.
+        self.replicas[replica_index as usize]
+            .partition_storage
+            .crash(Crash::PowerLoss);
+
         // Block all network links to/from this process.
         self.network
             .process_disable(ProcessId::Replica(replica_index));
@@ -1296,8 +1488,18 @@ impl Simulator {
     /// # Panics
     /// If the replica is not crashed, or its shard count does not fit `u16`; mesh
     /// construction caps it.
-    #[allow(clippy::too_many_lines)]
     pub fn replica_restart(&mut self, replica_index: u8) {
+        self.replica_restart_losing_partitions(replica_index, &[]);
+    }
+
+    /// Restart a crashed replica whose `lost` partitions come back with no log,
+    /// as a server whose partition directories were wiped does: the group
+    /// re-materialises from its recorded view alone and may not elect on it.
+    ///
+    /// # Panics
+    /// As [`Self::replica_restart`].
+    #[allow(clippy::too_many_lines)]
+    pub fn replica_restart_losing_partitions(&mut self, replica_index: u8, lost: &[IggyNamespace]) {
         assert!(
             self.crashed.contains(&replica_index),
             "cannot restart replica {replica_index}: not crashed"
@@ -1317,15 +1519,22 @@ impl Simulator {
         // partition reads the record in its directory.
         let partition_superblocks =
             std::mem::take(&mut *self.replicas[idx].partition_superblocks.borrow_mut());
+        let partition_storage = self.replicas[idx].partition_storage.clone();
         // Take each live partition's log while its shard still stands: a real
         // server's messages are in segment files its boot recovers the offset counter
         // from, so rebuilding with nothing would model total data loss rather than a
-        // restart. Before the rebuild, which drops the shards.
-        let partition_logs = self.retain_partition_logs(idx, &partition_superblocks);
+        // restart. Before the rebuild, which drops the shards. A log the last boot
+        // retained for a group its replay had not reached yet is still owed too.
+        let mut partition_logs =
+            std::mem::take(&mut *self.replicas[idx].partition_logs.borrow_mut());
+        partition_logs.extend(self.retain_partition_logs(idx, &partition_superblocks));
+        for namespace in lost {
+            partition_logs.remove(namespace);
+        }
         let seeded_namespaces = self.replicas[idx].seeded_namespaces.borrow().clone();
         let seed_namespaces: Vec<_> = seeded_namespaces
             .iter()
-            .map(|(&namespace, &view)| (namespace, view))
+            .map(|(&namespace, &(view, durability))| (namespace, view, durability))
             .collect();
         let mut materialized_namespaces: Vec<_> = partition_superblocks.keys().copied().collect();
         materialized_namespaces.sort_unstable();
@@ -1339,6 +1548,7 @@ impl Simulator {
         // Carried like the WAL and superblocks: the rebuilt replica has to find the
         // snapshot its previous incarnation persisted.
         let replica_data_dir = self.replicas[idx].data_dir.clone();
+        let system_path = self.replicas[idx].system_path.clone();
 
         let consensus_clock = ConsensusClock::new(Rc::new(SimClock::new(self.executor.timer())));
         let outbox = Rc::clone(&self.outboxes[idx]);
@@ -1349,7 +1559,17 @@ impl Simulator {
         let mut stop_txs = Vec::with_capacity(usize::from(shards_per_replica));
         let mut pump_tasks = Vec::with_capacity(usize::from(shards_per_replica));
         let mut metadata_bundle: Option<replica::SimMetadataBundle> = None;
-        let metadata_applied_frontier = Arc::<metadata::AppliedFrontier>::default();
+        let mut metadata_applied_frontier = metadata::AppliedFrontier::default();
+        if self.replica_count > 1 {
+            metadata_applied_frontier = metadata_applied_frontier.with_partition_freshness(
+                outbox.monotonic_now(),
+                configs::server::ServerConfig::default()
+                    .cluster
+                    .heartbeat_timeout
+                    .get_duration(),
+            );
+        }
+        let metadata_applied_frontier = Arc::new(metadata_applied_frontier);
         for shard_idx in 0..shards_per_replica {
             let inbox = inboxes[usize::from(shard_idx)]
                 .take()
@@ -1363,7 +1583,7 @@ impl Simulator {
                 None
             };
             let shard_journal = (shard_idx == 0).then(|| Rc::clone(&metadata_journal));
-            let (shard, writer_bundle) = new_shard(
+            let (shard, writer_bundle, liveness_stops) = new_shard(
                 replica_index,
                 shard_idx,
                 format!("replica-{replica_index}-shard-{shard_idx}"),
@@ -1374,15 +1594,18 @@ impl Simulator {
                 reply_inbox,
                 consensus_clock.clone(),
                 self.shell,
+                self.seed_root,
                 metadata_bundle.clone(),
                 shard_superblock,
                 shard_journal,
-                recovered_state,
+                recovered_state.as_ref(),
                 metadata_incarnation,
                 (shard_idx == 0).then(|| replica_data_dir.clone()).flatten(),
+                &system_path,
                 &seed_namespaces,
                 Arc::clone(&metadata_applied_frontier),
             );
+            stop_txs.extend(liveness_stops);
             if shard_idx == 0 {
                 metadata_bundle =
                     Some(writer_bundle.expect("shard 0 returns the metadata factory bundle"));
@@ -1405,6 +1628,10 @@ impl Simulator {
             .iter()
             .map(|_| server::LifecycleReports::default())
             .collect();
+        let group_offset_cleanups = shards
+            .iter()
+            .map(|_| server::GroupOffsetCleanup::default())
+            .collect();
         self.replicas[idx] = SimReplica {
             seeded_namespaces: RefCell::new(seeded_namespaces),
             shards,
@@ -1412,11 +1639,15 @@ impl Simulator {
             metadata_journal,
             metadata_incarnation,
             partition_superblocks: RefCell::new(partition_superblocks),
+            partition_storage,
             partition_logs: RefCell::new(partition_logs),
+            deferred_partitions: RefCell::new(BTreeSet::new()),
             data_dir: replica_data_dir,
+            system_path,
             _stop_txs: stop_txs,
             pump_tasks,
             lifecycle_reports,
+            group_offset_cleanups,
         };
 
         // Re-materialise every group this replica had before the crash, as a
@@ -1425,7 +1656,12 @@ impl Simulator {
         // recorded `(view, log_view)` instead of re-entering view 0. The metadata half
         // of the seed already ran inside `new_shard`, ahead of the replay.
         for namespace in materialized_namespaces {
-            materialise_partition(&self.replicas[idx], namespace, self.consumer_offsets_max);
+            let replica = &self.replicas[idx];
+            if !materialise_partition(replica, namespace, self.consumer_offsets_max)
+                && replica.seeded_namespaces.borrow().contains_key(&namespace)
+            {
+                replica.deferred_partitions.borrow_mut().insert(namespace);
+            }
         }
 
         // Reconnect to the network and mark the replica live again.
@@ -1446,7 +1682,7 @@ impl Simulator {
     fn retain_partition_logs(
         &self,
         replica_idx: usize,
-        materialised: &HashMap<IggyNamespace, Rc<SimSuperblock>>,
+        materialised: &HashMap<IggyNamespace, (u64, Rc<SimSuperblock>)>,
     ) -> HashMap<IggyNamespace, RetainedPartitionState> {
         let replica = &self.replicas[replica_idx];
         let mut retained = HashMap::with_capacity(materialised.len());
@@ -1531,6 +1767,66 @@ impl Simulator {
         Some(partition.offsets())
     }
 
+    /// The incarnation of the partition a replica hosts for `namespace`, or `None`
+    /// when it hosts none. A recreated topic keeps the namespace and changes this.
+    #[must_use]
+    pub(crate) fn partition_incarnation(
+        &self,
+        replica_idx: usize,
+        namespace: IggyNamespace,
+    ) -> Option<u64> {
+        self.replicas[replica_idx]
+            .partition_shard(namespace)
+            .plane
+            .partitions()
+            .get_by_ns(&namespace)
+            .map(IggyPartition::created_revision)
+    }
+
+    /// The owner of consumer group `group_id` that a replica installed on its
+    /// partition of `namespace`, or `None` when it installed none or hosts none.
+    #[must_use]
+    pub(crate) fn installed_group_owner(
+        &self,
+        replica_idx: usize,
+        namespace: IggyNamespace,
+        group_id: u64,
+    ) -> Option<ConsumerGroupOwner> {
+        self.replicas[replica_idx]
+            .partition_shard(namespace)
+            .plane
+            .partitions()
+            .get_by_ns(&namespace)?
+            .consumer_group_owner(group_id)
+    }
+
+    /// The consensus clock's realtime, in microseconds.
+    #[must_use]
+    pub(crate) fn realtime_micros(&self) -> u64 {
+        SimClock::new(self.executor.timer()).realtime().as_micros()
+    }
+
+    /// Whether every live replica applied metadata `op` and hosts each of
+    /// `namespaces` at the incarnation its own metadata names.
+    #[must_use]
+    pub(crate) fn incarnation_settled(&self, op: u64, namespaces: &[IggyNamespace]) -> bool {
+        (0..self.replica_count)
+            .filter(|replica_idx| !self.crashed.contains(replica_idx))
+            .all(|replica_idx| {
+                let idx = usize::from(replica_idx);
+                let metadata = self.replicas[idx].shards[0].plane.metadata();
+                let streams = metadata.mux_stm.streams();
+                metadata.applied_frontier().get() >= op
+                    && namespaces.iter().all(|&namespace| {
+                        streams
+                            .created_revision_for_namespace(namespace)
+                            .is_some_and(|current| {
+                                self.partition_incarnation(idx, namespace) == Some(current)
+                            })
+                    })
+            })
+    }
+
     /// A replica's journaled partition-plane prepare headers over `ops`, or `None`
     /// when it does not host the namespace.
     ///
@@ -1558,6 +1854,19 @@ impl Simulator {
     /// Consensus view for a replica's partition-plane group, or `None` if that
     /// replica does not host the namespace.
     #[must_use]
+    /// Highest view in which `replica_idx` sent a view-scoped message of
+    /// `incarnation` of `namespace`, or `None` when it sent none.
+    pub(crate) fn partition_sent_view(
+        &self,
+        replica_idx: u8,
+        namespace: IggyNamespace,
+        incarnation: u64,
+    ) -> Option<u32> {
+        self.partition_sent_views
+            .get(&(replica_idx, namespace, incarnation))
+            .copied()
+    }
+
     pub(crate) fn consensus_view(
         &self,
         replica_idx: usize,
@@ -1602,6 +1911,37 @@ impl Simulator {
             .metadata()
             .consensus
             .as_ref()
+    }
+
+    /// Logs a replica refused for contradicting an op it applied, over its
+    /// metadata consensus and every partition group it hosts. See
+    /// `VsrConsensus::contradicts_applied_log`.
+    ///
+    /// Read through the tombstone: a refused partition `StartView` fences its
+    /// partition for resync, and the fenced owner stays until its quarantine
+    /// drains.
+    #[must_use]
+    pub(crate) fn applied_log_contradictions(&self, replica_idx: usize) -> u64 {
+        let metadata = self
+            .metadata_consensus(replica_idx)
+            .map_or(0, consensus::VsrConsensus::applied_log_contradictions);
+        let partitions: u64 = self.replicas[replica_idx]
+            .shards
+            .iter()
+            .map(|shard| {
+                let partitions = shard.plane.partitions();
+                partitions
+                    .namespaces()
+                    .filter_map(|namespace| {
+                        partitions
+                            .local_idx(namespace)
+                            .and_then(|local| partitions.get(local))
+                    })
+                    .map(|partition| partition.consensus().applied_log_contradictions())
+                    .sum::<u64>()
+            })
+            .sum();
+        metadata + partitions
     }
 
     /// The metadata pipeline head the commit walk is holding on, if any. See
@@ -1686,6 +2026,24 @@ impl Simulator {
             })
     }
 
+    /// The live replica whose metadata plane is a `Normal` primary: the holder of
+    /// the committed metadata log, and where a client's leader redirect goes.
+    #[must_use]
+    pub fn metadata_leader(&self) -> Option<u8> {
+        (0..self.replica_count)
+            .filter(|replica_idx| !self.crashed.contains(replica_idx))
+            .find(|&replica_idx| {
+                self.replicas[usize::from(replica_idx)].shards[0]
+                    .plane
+                    .metadata()
+                    .consensus
+                    .as_ref()
+                    .is_some_and(|consensus| {
+                        consensus.is_primary() && consensus.status() == Status::Normal
+                    })
+            })
+    }
+
     #[must_use]
     pub(crate) fn primary_index(&self, namespace: IggyNamespace) -> Option<u8> {
         (0..self.replica_count)
@@ -1709,32 +2067,54 @@ impl Simulator {
 /// re-opens every partition directory it owns, so the sim must re-materialise too,
 /// else the superblock a restart carries forward is never read back and the
 /// recovered-view branch is dead code.
+///
+/// Returns whether it materialised the group, which it declines while the
+/// replica's metadata names no incarnation for it, or one older than its store.
 fn materialise_partition(
     replica: &SimReplica,
     namespace: IggyNamespace,
     consumer_offsets_max: usize,
-) {
+) -> bool {
     let shard_count = u32::try_from(replica.shards.len()).expect("shard count fits u32");
     let owner = calculate_shard_assignment(&namespace, shard_count);
     let streams = replica.shards[0].plane.metadata().mux_stm.streams();
     // Materialization and recovery must never create metadata. Seeding a vacant
     // slab here changes future allocation and makes replicas diverge after deletion.
     let Some(epoch) = streams.created_revision_for_namespace(namespace) else {
-        return;
+        return false;
     };
     // Production seeds from the committed partition, never from a live view.
     let created_view = streams
         .created_view_for_namespace(namespace)
         .expect("a committed partition records its creation view");
-    // One store per group, minted on first materialisation and reused after, so the
-    // recorded view survives a replica restart.
-    let superblock = Rc::clone(
-        replica
-            .partition_superblocks
-            .borrow_mut()
-            .entry(namespace)
-            .or_default(),
-    );
+    // One store per incarnation, minted on first materialisation and reused after, so
+    // the recorded view survives a replica restart. A deleted incarnation's store
+    // must not reach its successor, and metadata replayed behind the store waits for
+    // repair to catch it up.
+    let (superblock, first_initialization) = {
+        let mut stores = replica.partition_superblocks.borrow_mut();
+        if let Some(stored) = stores.get(&namespace).map(|(incarnation, _)| *incarnation) {
+            match stored.cmp(&epoch) {
+                Ordering::Greater => return false,
+                Ordering::Less => {
+                    stores.remove(&namespace);
+                    replica.partition_logs.borrow_mut().remove(&namespace);
+                    partition_wal::remove(&replica.partition_storage, namespace, stored);
+                }
+                Ordering::Equal => {}
+            }
+        }
+        // Store creation and shard initialization run synchronously, with no
+        // simulated crash between them. Keep this record even if history is lost.
+        let first_initialization = !stores.contains_key(&namespace);
+        let superblock = Rc::clone(
+            &stores
+                .entry(namespace)
+                .or_insert_with(|| (epoch, Rc::default()))
+                .1,
+        );
+        (superblock, first_initialization)
+    };
     let recovered_state = superblock
         .read_latest_sync()
         .and_then(|bytes| VsrState::try_from(bytes.as_slice()).ok());
@@ -1742,40 +2122,650 @@ fn materialise_partition(
     // Removed rather than cloned: the rebuilt partition becomes its sole owner, and
     // a second materialisation with no restart between would otherwise resurrect a
     // log the live partition has moved past.
-    let retained = replica.partition_logs.borrow_mut().remove(&namespace);
-    replica.shards[usize::from(owner)].init_partition(
-        namespace,
-        Some(superblock),
-        recovered_state,
-        retained,
-        PartitionMaterialisation::new(epoch, created_view)
-            .with_consumer_offsets_max(consumer_offsets_max),
-    );
+    let mut retained = replica.partition_logs.borrow_mut().remove(&namespace);
+    let owner_shard = &replica.shards[usize::from(owner)];
+    // The live group holds this incarnation's WAL lease; a second open is refused.
+    if !owner_shard.plane.partitions().contains(&namespace) {
+        let persistence = partition_wal::reopen(
+            &replica.partition_storage,
+            namespace,
+            epoch,
+            retained.as_mut(),
+        );
+        owner_shard.init_partition(
+            namespace,
+            Some(superblock),
+            recovered_state.as_ref(),
+            retained,
+            persistence,
+            PartitionMaterialisation::new(epoch, created_view, first_initialization)
+                .with_consumer_offsets_max(consumer_offsets_max),
+        );
+    }
     for shard in &replica.shards {
         shard.shards_table().insert(
             namespace,
             PartitionLocation::new(ShardId::new(owner), epoch),
         );
     }
+    true
+}
+
+/// The partition group, incarnation and view of a message the persist gate
+/// holds until the replica's view is durable, or `None` for any other message.
+/// `PrepareOk` names no incarnation, so it is left out.
+fn view_scoped_partition_frame(
+    message: &Message<GenericHeader>,
+) -> Option<(IggyNamespace, u64, u32)> {
+    let (group, incarnation) = match message.header().command {
+        Command::Prepare => {
+            let header = message.try_as_typed::<PrepareHeader>().ok()?.header();
+            (header.group, header.partition_incarnation)
+        }
+        Command::Commit => {
+            let header = message.try_as_typed::<CommitHeader>().ok()?.header();
+            (header.group, header.partition_incarnation)
+        }
+        Command::StartViewChange => {
+            let header = message
+                .try_as_typed::<StartViewChangeHeader>()
+                .ok()?
+                .header();
+            (header.group, header.partition_incarnation)
+        }
+        Command::DoViewChange => {
+            let header = message.try_as_typed::<DoViewChangeHeader>().ok()?.header();
+            (header.group, header.partition_incarnation)
+        }
+        Command::StartView => {
+            let header = message.try_as_typed::<StartViewHeader>().ok()?.header();
+            (header.group, header.partition_incarnation)
+        }
+        _ => return None,
+    };
+    (group != METADATA_GROUP).then(|| {
+        (
+            IggyNamespace::from_raw(group),
+            incarnation,
+            message.header().view,
+        )
+    })
+}
+
+/// How long the reconciler lets a revocation wait for its drain, in microseconds.
+pub(crate) fn rebalancing_timeout_micros() -> u64 {
+    configs::server::ServerConfig::default()
+        .consumer_group
+        .rebalancing_timeout
+        .as_micros()
+}
+
+/// The watermark is server-owned: production stamps it on the node that
+/// dispatches a partition write, so the raw path stamps it on delivery.
+fn stamp_metadata_watermark(
+    shard: &Replica,
+    message: &Message<GenericHeader>,
+) -> Message<GenericHeader> {
+    match message.try_as_typed::<RoutedRequestHeader>() {
+        Ok(request) if request.header().operation.is_partition() => {
+            let watermark = shard.plane.metadata().applied_frontier().get();
+            request
+                .deep_copy()
+                .transmute_header(|header, stamped: &mut RoutedRequestHeader| {
+                    *stamped = header;
+                    stamped.metadata_watermark = watermark;
+                })
+                .into_generic()
+        }
+        _ => message.deep_copy(),
+    }
 }
 
 #[cfg(test)]
+mod slow_replica_tests;
+
+#[cfg(test)]
+mod stale_prepare_commit_tests;
+
+#[cfg(test)]
 mod tests {
-    use super::partition_repair_driver_tests::cluster;
+    use super::partition_repair_driver_tests::{
+        cluster, is_commit_for, prepare_for, sharded_cluster,
+    };
     use super::*;
-    use crate::client::SimClient;
+    use crate::client::{SIM_ROTATED_WRAP_SET, SIM_STREAM_WRAP_SET, SimClient};
     use crate::workload::apply_sim_commands;
     use bytes::Bytes;
-    use consensus::{Sequencer, Status, client_table::COMMITTED_WINDOW_BITS};
+    use consensus::{
+        Consensus, PlaneKind, Project, Sequencer, Status, client_table::COMMITTED_WINDOW_BITS,
+    };
     use futures::FutureExt;
-    use iggy_binary_protocol::{AckLevel, RoutedRequestHeader, WireIdentifier};
-    use iggy_common::{ConsumerKind, IggyError};
-    use server_common::sharding::{IggyNamespace, LIST_CLIENTS_GATHER_TIMEOUT};
+    use iggy_binary_protocol::requests::partitions::InstallConsumerGroupOwnerRequest;
+    use iggy_binary_protocol::requests::streams::{RewrapStreamKeyEntry, RewrapStreamKeysRequest};
+    use iggy_binary_protocol::requests::users::CreateUserRequest;
+    use iggy_binary_protocol::{
+        AckLevel, ConsensusHeader, Operation, PrepareOkHeader, RoutedRequestHeader,
+        StartViewHeader, WireDecode, WireEncode, WireGlobalPermissions, WireIdentifier, WireName,
+        WireOptions, WirePermissions,
+    };
+    use iggy_common::{ConsumerKind, HeaderKey, IggyError, OptionKey, WrapSet};
+    use journal::{Journal, JournalHandle};
+    use message_bus::lifecycle::Shutdown;
+    use message_bus::{AUTO_COMMIT_CLIENT_ID, ConnectionInstaller, MessageBus};
+    use metadata::stm::stream::Streams;
+    use server_common::MessageBag;
+    use server_common::sharding::{IggyNamespace, LIST_CLIENTS_GATHER_TIMEOUT, METADATA_GROUP};
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct RootInitialization {
+        shutdown: Shutdown,
+        result: Rc<RefCell<Option<Result<(), server::server_error::ServerError>>>>,
+    }
+
+    fn start_root_initialization(
+        sim: &mut Simulator,
+        node: usize,
+        with_credentials: bool,
+    ) -> RootInitialization {
+        let shard = Rc::clone(&sim.replicas[node].shards[0]);
+        let timer = sim.executor.timer();
+        let (shutdown, token) = Shutdown::new();
+        let result = Rc::new(RefCell::new(None));
+        let completed = Rc::clone(&result);
+        let task = sim.executor.spawn(async move {
+            let credentials = with_credentials.then(|| CreateUserRequest {
+                username: WireName::new(replica::SHELL_ROOT_USERNAME).unwrap(),
+                password: server_common::crypto::hash_with_fixed_salt(replica::SHELL_ROOT_PASSWORD),
+                status: iggy_common::UserStatus::Active.as_code(),
+                permissions: Some(WirePermissions {
+                    global: WireGlobalPermissions {
+                        manage_servers: true,
+                        read_servers: true,
+                        manage_users: true,
+                        read_users: true,
+                        manage_streams: true,
+                        read_streams: true,
+                        manage_topics: true,
+                        read_topics: true,
+                        poll_messages: true,
+                        send_messages: true,
+                    },
+                    streams: Vec::new(),
+                }),
+                options: WireOptions::empty(),
+            });
+            let outcome = server::boot::initialize_root_user(
+                &shard,
+                credentials.as_ref(),
+                token,
+                |duration| timer.sleep(duration),
+            )
+            .await;
+            *completed.borrow_mut() = Some(outcome);
+        });
+        sim.replicas[node].pump_tasks.push(task);
+        RootInitialization { shutdown, result }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn given_uncommitted_root_when_primary_crashes_should_recover_or_replace_the_prepare() {
+        for replicated in [true, false] {
+            let mut sim = Simulator::build_inner(
+                3,
+                2,
+                std::iter::once(1),
+                PacketSimulatorOptions {
+                    node_count: 3,
+                    client_count: 1,
+                    seed: 4585,
+                    ..Default::default()
+                },
+                true,
+                None,
+                false,
+            );
+            for node in &sim.replicas {
+                assert!(
+                    node.shards[0]
+                        .plane
+                        .metadata()
+                        .mux_stm
+                        .users()
+                        .read(|users| users.items.is_empty())
+                );
+            }
+            let client = SimClient::new(1);
+            sim.outboxes[1].insert_client_meta(ClientConnMeta::new(
+                client.client_id(),
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+                ClientTransportKind::Tcp,
+            ));
+            let reply = submit_and_wait_for_reply(
+                &mut sim,
+                client.client_id(),
+                1,
+                client.login(replica::SHELL_ROOT_USERNAME, replica::SHELL_ROOT_PASSWORD),
+            );
+            assert_eq!(
+                iggy_binary_protocol::result_code(reply.body()),
+                Some(IggyError::TransientNotAccepted.as_code())
+            );
+            for backup in [1, 2] {
+                if replicated {
+                    sim.network
+                        .link_filter_mut(ProcessId::Replica(backup), ProcessId::Replica(0))
+                        .remove(Command::PrepareOk);
+                } else {
+                    sim.network
+                        .link_filter_mut(ProcessId::Replica(0), ProcessId::Replica(backup))
+                        .remove(Command::Prepare);
+                }
+            }
+            let _primary = start_root_initialization(&mut sim, 0, true);
+            let backups = [
+                start_root_initialization(&mut sim, 1, !replicated),
+                start_root_initialization(&mut sim, 2, !replicated),
+            ];
+            for _ in 0..200 {
+                sim.step();
+                if sim.replicas[0].metadata_journal.last_op() == Some(1)
+                    && (!replicated
+                        || sim
+                            .replicas
+                            .iter()
+                            .all(|node| node.metadata_journal.last_op() == Some(1)))
+                {
+                    break;
+                }
+            }
+            let original_checksum = sim.replicas[0].metadata_journal.header(1).unwrap().checksum;
+            for (index, node) in sim.replicas.iter().enumerate() {
+                assert_eq!(
+                    node.metadata_journal.last_op(),
+                    (index == 0 || replicated).then_some(1)
+                );
+                assert!(
+                    node.shards[0]
+                        .plane
+                        .metadata()
+                        .mux_stm
+                        .users()
+                        .read(|users| users.items.is_empty())
+                );
+            }
+            sim.replica_crash(0);
+            if !replicated {
+                for backup in [1, 2] {
+                    sim.network
+                        .link_clear(ProcessId::Replica(0), ProcessId::Replica(backup));
+                }
+            }
+            sim.network.clear_partition();
+            for _ in 0..2_000 {
+                sim.step();
+                if backups
+                    .iter()
+                    .all(|initialization| initialization.result.borrow().is_some())
+                {
+                    break;
+                }
+            }
+            sim.shell_login_via(&client, 1);
+            assert_ne!(client.session_id(), 0);
+            for initialization in &backups {
+                assert!(matches!(*initialization.result.borrow(), Some(Ok(()))));
+            }
+            if !replicated {
+                let primary = [1u8, 2]
+                    .into_iter()
+                    .find(|&node| {
+                        sim.replicas[usize::from(node)].shards[0]
+                            .plane
+                            .metadata()
+                            .consensus
+                            .as_ref()
+                            .unwrap()
+                            .is_primary()
+                    })
+                    .unwrap();
+                let repaired = sim.replicas[usize::from(primary)]
+                    .metadata_journal
+                    .entry_sync(client.session_id())
+                    .unwrap();
+                assert!(repaired.header().op > 1);
+                sim.replicas[0]
+                    .metadata_journal
+                    .append(repaired)
+                    .now_or_never()
+                    .unwrap()
+                    .unwrap();
+            }
+            sim.replica_restart(0);
+            let restarted = start_root_initialization(&mut sim, 0, false);
+            for _ in 0..2_000 {
+                sim.step();
+                if restarted.result.borrow().is_some() {
+                    break;
+                }
+            }
+            assert!(matches!(*restarted.result.borrow(), Some(Ok(()))));
+            for node in &sim.replicas {
+                let header = node.metadata_journal.header(1).unwrap();
+                assert_eq!(header.operation, Operation::CreateUser);
+                assert_eq!(header.client, consensus::RESERVED_CLIENT_ID);
+                assert_eq!(header.user_id, 0);
+                if !replicated {
+                    assert_ne!(
+                        header.checksum, original_checksum,
+                        "the discarded root prepare must be replaced on every replica"
+                    );
+                }
+                for shard in &node.shards {
+                    assert!(shard.plane.metadata().mux_stm.users().read(|users| {
+                        let root = users.items.get(0).unwrap();
+                        root.username.as_ref() == replica::SHELL_ROOT_USERNAME
+                            && server_common::crypto::verify_password(
+                                replica::SHELL_ROOT_PASSWORD,
+                                &root.password_hash,
+                            )
+                            && users.items.len() == 1
+                    }));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn given_a_solo_replica_without_credentials_when_initializing_root_should_fail_without_waiting()
+    {
+        let mut sim = Simulator::build_inner(
+            1,
+            1,
+            std::iter::empty(),
+            PacketSimulatorOptions::default(),
+            true,
+            None,
+            false,
+        );
+        let initialization = start_root_initialization(&mut sim, 0, false);
+        sim.step();
+        assert!(matches!(
+            *initialization.result.borrow(),
+            Some(Err(
+                server::server_error::ServerError::RootCredentialsRequired { .. }
+            ))
+        ));
+        assert_eq!(sim.replicas[0].metadata_journal.last_op(), None);
+    }
+
+    #[test]
+    fn given_root_initialization_when_shutdown_before_commit_should_exit_cleanly() {
+        for with_credentials in [false, true] {
+            let mut sim = Simulator::build_inner(
+                3,
+                1,
+                std::iter::empty(),
+                PacketSimulatorOptions {
+                    node_count: 3,
+                    ..Default::default()
+                },
+                true,
+                None,
+                false,
+            );
+            for backup in [1, 2] {
+                sim.network
+                    .link_filter_mut(ProcessId::Replica(backup), ProcessId::Replica(0))
+                    .remove(Command::PrepareOk);
+            }
+            let initialization = start_root_initialization(&mut sim, 0, with_credentials);
+            for _ in 0..20 {
+                sim.step();
+            }
+            assert!(initialization.result.borrow().is_none());
+            assert_eq!(
+                sim.replicas[0].metadata_journal.last_op(),
+                with_credentials.then_some(1)
+            );
+            initialization.shutdown.trigger();
+            sim.step();
+            assert!(matches!(*initialization.result.borrow(), Some(Ok(()))));
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn given_journaled_root_when_a_fresh_replica_needs_state_transfer_should_recover_without_credentials()
+     {
+        for chunk in [2, 128] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut sim = Simulator::build_inner(
+                3,
+                1,
+                std::iter::once(1),
+                PacketSimulatorOptions {
+                    node_count: 3,
+                    client_count: 1,
+                    seed: 4586,
+                    ..Default::default()
+                },
+                true,
+                Some(directory.path()),
+                false,
+            );
+            for node in &sim.replicas {
+                for shard in &node.shards {
+                    shard.set_repair_chunk_max(chunk);
+                }
+            }
+            sim.replica_crash(2);
+            let initializations = [
+                start_root_initialization(&mut sim, 0, true),
+                start_root_initialization(&mut sim, 1, false),
+            ];
+            for _ in 0..200 {
+                sim.step();
+                if initializations
+                    .iter()
+                    .all(|initialization| initialization.result.borrow().is_some())
+                {
+                    break;
+                }
+            }
+            for initialization in &initializations {
+                assert!(matches!(*initialization.result.borrow(), Some(Ok(()))));
+            }
+            sim.set_metadata_journal_slots(80);
+            let client = SimClient::new(1);
+            sim.shell_login(&client);
+            for sequence in 0..40 {
+                let reply = submit_and_wait_for_reply(
+                    &mut sim,
+                    client.client_id(),
+                    0,
+                    client.create_stream(&format!("root-recovery-{sequence}")),
+                );
+                assert_eq!(iggy_binary_protocol::result_code(reply.body()), Some(0));
+                for _ in 0..40 {
+                    sim.step();
+                }
+            }
+            assert!(snapshot_floor(&sim, 0) > 1);
+            assert!(sim.replicas[0].metadata_journal.header(1).is_none());
+            sim.replica_restart(2);
+            for shard in &sim.replicas[2].shards {
+                shard.set_repair_chunk_max(chunk);
+            }
+            let rejoined = start_root_initialization(&mut sim, 2, false);
+            for _ in 0..8_000 {
+                sim.step();
+                let checkpoint = directory.path().join("replica-2/metadata/snapshot.bin");
+                if checkpoint.exists() {
+                    assert!(
+                        metadata::impls::metadata::IggySnapshot::load(&checkpoint)
+                            .unwrap()
+                            .0
+                            .snapshot()
+                            .sequence_number
+                            > 0
+                    );
+                }
+                if rejoined.result.borrow().is_some()
+                    && committed_stream_names(&sim, 2) == committed_stream_names(&sim, 0)
+                {
+                    break;
+                }
+            }
+            assert!(matches!(*rejoined.result.borrow(), Some(Ok(()))));
+            assert!(sim.network.delivered_any(Command::RequestStateChunk));
+            assert!(sim.network.delivered_any(Command::StateChunk));
+            assert_eq!(
+                committed_stream_names(&sim, 2),
+                committed_stream_names(&sim, 0)
+            );
+            let root_identity = |node: usize| {
+                sim.replicas[node].shards[0]
+                    .plane
+                    .metadata()
+                    .mux_stm
+                    .users()
+                    .read(|users| {
+                        assert_eq!(users.items.len(), 1);
+                        let root = users.items.get(0).unwrap();
+                        (
+                            root.username.clone(),
+                            root.password_hash.clone(),
+                            root.created_at,
+                        )
+                    })
+            };
+            assert_eq!(root_identity(2), root_identity(0));
+            sim.shell_login_via(&client, 2);
+        }
+    }
 
     const DISCONNECT_STREAM: &str = "sim-stream-0";
     const DISCONNECT_TOPIC: &str = "sim-topic-0-0";
     const DISCONNECT_GROUP: &str = "disconnect-recovery";
     const DISCONNECT_PROGRESS_STEPS: usize = 200;
+
+    #[test]
+    fn given_admission_mode_when_reply_is_originless_should_only_allow_consensus_mode() {
+        const CLIENT: u128 = 7;
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+        for shell in [false, true] {
+            let options = packet::PacketSimulatorOptions {
+                node_count: 1,
+                client_count: 1,
+                ..packet::PacketSimulatorOptions::default()
+            };
+            let mut sim = Simulator::build(1, 1, std::iter::once(CLIENT), options, shell);
+            let client = SimClient::new(CLIENT);
+            if shell {
+                sim.shell_login(&client);
+            } else {
+                sim.register_client_with_primary(&client);
+            }
+            let reply =
+                submit_and_wait_for_reply(&mut sim, CLIENT, 0, client.create_stream("reply-mode"));
+            assert_eq!(reply.header().client, CLIENT);
+            assert_eq!(metadata::stm::result::result_code(reply.body()), Some(0));
+            let bus = crate::bus::SharedSimOutbox(Rc::clone(&sim.outboxes[0]));
+            bus.drain();
+            let originless = bus
+                .send_to_client(CLIENT, reply.deep_copy().into_frozen())
+                .now_or_never();
+            if shell {
+                assert!(matches!(
+                    originless,
+                    Some(Err(message_bus::SendError::ClientNotFound(CLIENT)))
+                ));
+                assert!(bus.drain().is_empty());
+                let delivered = bus
+                    .send_to_client_instance(
+                        CLIENT,
+                        bus.client_instance(CLIENT),
+                        reply.into_frozen().into(),
+                    )
+                    .now_or_never();
+                assert!(matches!(delivered, Some(Ok(()))));
+            } else {
+                assert!(matches!(originless, Some(Ok(()))));
+            }
+            assert_eq!(bus.drain().len(), 1);
+        }
+    }
+
+    #[test]
+    fn given_concurrent_simulators_when_one_restarts_should_keep_only_its_system_files() {
+        let options = packet::PacketSimulatorOptions {
+            node_count: 1,
+            client_count: 0,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        let mut first = Simulator::with_shards_shell(1, 1, std::iter::empty(), options.clone());
+        let second = Simulator::with_shards_shell(1, 1, std::iter::empty(), options);
+        let first_path = first.replicas[0].system_path.clone();
+        let second_path = second.replicas[0].system_path.clone();
+        assert_ne!(first_path, second_path);
+        assert!(first.replicas[0].data_dir.is_none());
+        assert!(
+            first.replicas[0].shards[0]
+                .plane
+                .metadata()
+                .coordinator
+                .is_none()
+        );
+        let marker = first_path.join("retained-fence");
+        std::fs::write(&marker, b"first simulator").unwrap();
+        assert!(!second_path.join("retained-fence").exists());
+
+        first.replica_crash(0);
+        first.replica_restart(0);
+        assert_eq!(first.replicas[0].system_path, first_path);
+        assert_eq!(std::fs::read(&marker).unwrap(), b"first simulator");
+        assert!(
+            first.replicas[0].shards[0]
+                .plane
+                .metadata()
+                .coordinator
+                .is_none()
+        );
+        drop(first);
+        assert!(!first_path.exists());
+        assert!(second_path.exists());
+        drop(second);
+        assert!(!second_path.exists());
+    }
+
+    #[test]
+    fn given_checkpoint_root_when_simulator_stops_should_retain_its_system_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let options = packet::PacketSimulatorOptions {
+            node_count: 1,
+            client_count: 0,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        let sim = Simulator::with_checkpoints(1, std::iter::empty(), options, true, root.path());
+        let system_path = root.path().join("replica-0");
+        assert_eq!(sim.replicas[0].system_path, system_path);
+        assert_eq!(sim.replicas[0].data_dir.as_ref(), Some(&system_path));
+        assert!(
+            sim.replicas[0].shards[0]
+                .plane
+                .metadata()
+                .coordinator
+                .is_some()
+        );
+        drop(sim);
+        assert!(system_path.exists());
+    }
 
     #[test]
     #[allow(clippy::too_many_lines)]
@@ -1909,6 +2899,180 @@ mod tests {
         }
     }
 
+    /// Only partition replicas can prove a lifecycle fence, so a metadata primary
+    /// without one needs a backup to relay the completion.
+    #[test]
+    fn given_metadata_primary_without_partition_replica_when_topic_is_deleted_should_finish_the_delete()
+     {
+        const PROGRESS_STEPS: usize = 4_000;
+        let (mut sim, client) = cluster(0x4643_4F4D);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        sim.init_partition(namespace);
+        sim.register_client_with_primary(&client);
+        fence_partition_on_metadata_primary(&mut sim, namespace);
+
+        let delete = client.delete_topic(DISCONNECT_STREAM, DISCONNECT_TOPIC);
+        let response = submit_and_wait_for_reply(&mut sim, client.client_id(), 0, delete);
+        let code = metadata::stm::result::result_code(response.body());
+        assert!(
+            code == Some(0) || code == Some(IggyError::TransientNotCommitted.as_code()),
+            "unexpected result code {code:?}"
+        );
+        let intent_op = response.header().op;
+        assert!(
+            (0..PROGRESS_STEPS).any(|_| {
+                sim.step();
+                sim.replicas.iter().all(|replica| {
+                    let streams = replica.shards[0].plane.metadata().mux_stm.streams();
+                    !streams.lifecycle_pending(intent_op)
+                        && streams.created_revision_for_namespace(namespace).is_none()
+                })
+            }),
+            "the delete must finish while the metadata primary holds no partition replica"
+        );
+        assert!(sim.network.delivered_any(Command::ForwardCompletion));
+        assert_eq!(
+            sim.metadata_primary_index(),
+            Some(0),
+            "the metadata primary is the replica without the partition"
+        );
+        assert_eq!(
+            sim.metadata_view(),
+            Some(0),
+            "the delete must finish without a metadata view change"
+        );
+    }
+
+    /// Fences `namespace` on replica 0, the metadata primary, as boot recovery
+    /// does with unreadable files, and waits until a replica that serves the
+    /// partition leads it.
+    fn fence_partition_on_metadata_primary(sim: &mut Simulator, namespace: IggyNamespace) {
+        const FAILOVER_STEPS: usize = 2_000;
+        let revision = sim.replicas[0].shards[0]
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .created_revision_for_namespace(namespace)
+            .expect("the partition is committed");
+        sim.replicas[0]
+            .partition_shard(namespace)
+            .plane
+            .partitions()
+            .fence(namespace, revision);
+        assert!(
+            (0..FAILOVER_STEPS).any(|_| {
+                sim.step();
+                matches!(sim.primary_index(namespace), Some(1 | 2))
+            }),
+            "the partition must fail over to a replica that serves it"
+        );
+    }
+
+    /// `commit_message_ticks` no test outlives. Set after `init`, it also stops
+    /// the running timer, so no `Commit` heartbeat fires again.
+    pub const NO_COMMIT_HEARTBEAT: u64 = u64::MAX;
+    /// One tick to emit the eager `Commit`, then the default network's one-way
+    /// delay (at least 1, exponential with mean 3) with room for its tail.
+    const EAGER_COMMIT_TICKS: usize = 16;
+
+    /// A partition primary on a metadata backup acts on a metadata op only once
+    /// it learns the commit, so the backups must not wait for the heartbeat.
+    #[test]
+    fn given_no_commit_heartbeat_when_metadata_commits_should_reach_every_backup_within_a_few_ticks()
+     {
+        let (mut sim, client) = cluster(0x4541_4745);
+        sim.register_client_with_primary(&client);
+        for replica in 0..sim.replica_count {
+            sim.metadata_consensus(usize::from(replica))
+                .expect("every replica runs the metadata plane")
+                .set_commit_message_ticks(NO_COMMIT_HEARTBEAT);
+        }
+
+        let reply = submit_and_wait_for_reply(
+            &mut sim,
+            client.client_id(),
+            0,
+            client.create_stream("eager-commit"),
+        );
+        assert_eq!(metadata::stm::result::result_code(reply.body()), Some(0));
+        let op = reply.header().op;
+        assert!(
+            (0..EAGER_COMMIT_TICKS).any(|_| {
+                sim.step();
+                (0..sim.replica_count).all(|replica| {
+                    sim.metadata_consensus(usize::from(replica))
+                        .is_some_and(|consensus| consensus.commit_max() >= op)
+                })
+            }),
+            "every backup must learn metadata op {op} within {EAGER_COMMIT_TICKS} ticks"
+        );
+    }
+
+    /// A delete completes only once its reporter commits the partition fence
+    /// locally, and the metadata primary is often a backup of the partition.
+    #[test]
+    fn given_no_commit_heartbeat_when_a_partition_fence_commits_should_reach_every_backup_within_a_few_ticks()
+     {
+        const FENCE_STEPS: usize = 400;
+        let (mut sim, client) = cluster(0x4645_4E43);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        sim.init_partition(namespace);
+        sim.register_client_with_primary(&client);
+        let commit_max = |sim: &Simulator, replica: u8| {
+            sim.replicas[usize::from(replica)]
+                .partition_shard(namespace)
+                .plane
+                .partitions()
+                .get_by_ns(&namespace)
+                .map(|partition| partition.consensus().commit_max())
+        };
+        for replica in &sim.replicas {
+            replica
+                .partition_shard(namespace)
+                .plane
+                .partitions()
+                .get_by_ns(&namespace)
+                .expect("every replica hosts the partition")
+                .consensus()
+                .set_commit_message_ticks(NO_COMMIT_HEARTBEAT);
+        }
+
+        let delete = client.delete_topic(DISCONNECT_STREAM, DISCONNECT_TOPIC);
+        let _ = submit_and_wait_for_reply(&mut sim, client.client_id(), 0, delete);
+        let primary = sim
+            .primary_index(namespace)
+            .expect("the partition has a primary");
+        let fenced = |sim: &Simulator| {
+            sim.replicas[usize::from(primary)]
+                .partition_shard(namespace)
+                .plane
+                .partitions()
+                .get_by_ns(&namespace)
+                .is_some_and(IggyPartition::history_deleted)
+        };
+        for _ in 0..FENCE_STEPS {
+            if fenced(&sim) {
+                break;
+            }
+            sim.step();
+        }
+        assert!(
+            fenced(&sim),
+            "the partition primary must commit the delete fence"
+        );
+        let fence_op = commit_max(&sim, primary).expect("the primary hosts the partition");
+        assert!(
+            (0..EAGER_COMMIT_TICKS).any(|_| {
+                sim.step();
+                (0..sim.replica_count).all(|replica| {
+                    commit_max(&sim, replica).is_some_and(|commit| commit >= fence_op)
+                })
+            }),
+            "every backup must learn the fence commit {fence_op} within {EAGER_COMMIT_TICKS} ticks"
+        );
+    }
+
     /// Topic ids are reused after a delete, so the recreated topic's delete fence
     /// targets the namespace of a partition materialized for the deleted incarnation.
     #[test]
@@ -1916,31 +3080,6 @@ mod tests {
         const STREAM: &str = "recreated-stream";
         const TOPIC: &str = "recreated-topic";
         const PROGRESS_STEPS: usize = 4_000;
-        // Deletes reply before their partition fences install.
-        fn complete(
-            sim: &mut Simulator,
-            client: &SimClient,
-            request: Message<RoutedRequestHeader>,
-        ) {
-            let reply = submit_and_wait_for_reply(sim, client.client_id(), 0, request);
-            let code = metadata::stm::result::result_code(reply.body());
-            assert!(
-                code == Some(0) || code == Some(IggyError::TransientNotCommitted.as_code()),
-                "unexpected result code {code:?}"
-            );
-            let op = reply.header().op;
-            assert!(
-                (0..PROGRESS_STEPS).any(|_| {
-                    sim.step();
-                    sim.replicas.iter().all(|replica| {
-                        let metadata = replica.shards[0].plane.metadata();
-                        metadata.applied_frontier().get() >= op
-                            && !metadata.mux_stm.streams().lifecycle_pending(op)
-                    })
-                }),
-                "metadata op {op} must complete on every replica"
-            );
-        }
         fn incarnation(sim: &Simulator) -> (IggyNamespace, u64) {
             let streams = sim.replicas[0].shards[0].plane.metadata().mux_stm.streams();
             let namespace = streams
@@ -1955,17 +3094,25 @@ mod tests {
                 streams.created_revision_for_namespace(namespace).unwrap(),
             )
         }
-        let (mut sim, client) = cluster(0x5245_4352);
+        // Two shards, so the partition can live off shard 0 and reconcile has to
+        // look it up on its hash shard.
+        const SHARDS_PER_REPLICA: u16 = 2;
+        let (mut sim, client) = sharded_cluster(0x5245_4352, SHARDS_PER_REPLICA);
         sim.register_client_with_primary(&client);
-        complete(&mut sim, &client, client.create_stream(STREAM));
-        complete(&mut sim, &client, client.create_topic(STREAM, TOPIC, 1));
+        complete_metadata_op(&mut sim, &client, client.create_keyed_stream(STREAM));
+        complete_metadata_op(&mut sim, &client, client.create_topic(STREAM, TOPIC, 1));
         let (namespace, deleted) = incarnation(&sim);
-        complete(&mut sim, &client, client.delete_topic(STREAM, TOPIC));
-        complete(&mut sim, &client, client.create_topic(STREAM, TOPIC, 1));
+        assert_ne!(
+            calculate_shard_assignment(&namespace, u32::from(SHARDS_PER_REPLICA)),
+            0,
+            "the partition must live off shard 0"
+        );
+        complete_metadata_op(&mut sim, &client, client.delete_topic(STREAM, TOPIC));
+        complete_metadata_op(&mut sim, &client, client.create_topic(STREAM, TOPIC, 1));
         let (recreated_namespace, recreated) = incarnation(&sim);
         assert_eq!(recreated_namespace, namespace);
         assert_ne!(recreated, deleted);
-        complete(&mut sim, &client, client.delete_topic(STREAM, TOPIC));
+        complete_metadata_op(&mut sim, &client, client.delete_topic(STREAM, TOPIC));
         assert!(
             (0..PROGRESS_STEPS).any(|_| {
                 sim.step();
@@ -1981,6 +3128,958 @@ mod tests {
                 })
             }),
             "every replica must fence the recreated incarnation"
+        );
+    }
+
+    /// A client keeps the route it captured before a `DeleteStream`. Only a
+    /// partition's primary orders its delete fence, so while that primary, a
+    /// metadata backup, has not applied the intent, the route still commits into
+    /// the old incarnation, ahead of the fence. The recreated stream serves
+    /// neither that write nor a later one that still names the old route.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn given_a_stale_route_while_the_primary_lags_a_stream_delete_when_writing_should_commit_only_before_the_old_fence()
+     {
+        const STREAM: &str = "stale-route-stream";
+        const TOPIC: &str = "stale-route-topic";
+        const METADATA_PRIMARY: u8 = 0;
+        const PROGRESS_STEPS: usize = 4_000;
+        /// Room for a refused write to commit anyway before the oracle reads.
+        const FOREIGN_WRITE_STEPS: usize = 200;
+        const CONSUMER_ID: usize = 1;
+        const POLL_COUNT: u32 = 16;
+        const IN_WINDOW: &[u8] = b"stale-route-in-window";
+        const AFTER_RECREATE: &[u8] = b"stale-route-after-recreate";
+
+        /// The frames that would teach the partition primary about the delete.
+        fn withhold_metadata(packet: &packet::Packet) -> bool {
+            prepare_for(packet, METADATA_GROUP).is_some() || is_commit_for(packet, METADATA_GROUP)
+        }
+        fn namespace_of(sim: &Simulator, partition: u32) -> Option<IggyNamespace> {
+            sim.replicas[usize::from(METADATA_PRIMARY)].shards[0]
+                .plane
+                .metadata()
+                .mux_stm
+                .streams()
+                .namespace_from_partition(
+                    &WireIdentifier::named(STREAM).unwrap(),
+                    &WireIdentifier::named(TOPIC).unwrap(),
+                    partition,
+                )
+        }
+        fn applied_metadata(sim: &Simulator, replica: u8) -> u64 {
+            sim.replicas[usize::from(replica)].shards[0]
+                .plane
+                .metadata()
+                .applied_frontier()
+                .get()
+        }
+        fn fenced(
+            sim: &Simulator,
+            replica: usize,
+            namespace: IggyNamespace,
+            incarnation: u64,
+        ) -> bool {
+            sim.replicas[replica]
+                .partition_shard(namespace)
+                .plane
+                .partitions()
+                .get_by_ns(&namespace)
+                .is_some_and(|partition| {
+                    partition.created_revision() == incarnation && partition.history_deleted()
+                })
+        }
+        fn retained_log(
+            sim: &Simulator,
+            replica: usize,
+            namespace: IggyNamespace,
+        ) -> BTreeMap<u64, PrepareHeader> {
+            sim.partition_journaled_headers(replica, namespace, 0..=u64::MAX)
+                .expect("the replica hosts the partition")
+        }
+        fn serving(sim: &Simulator, namespaces: &[IggyNamespace]) -> bool {
+            sim.incarnation_settled(0, namespaces)
+                && namespaces.iter().all(|&namespace| {
+                    (0..usize::from(sim.replica_count)).all(|replica| {
+                        sim.partition_consensus_state(replica, namespace)
+                            .is_some_and(|state| state.status == Status::Normal)
+                    })
+                })
+        }
+
+        let (mut sim, client) = cluster(0x5354_414C);
+        let replicas = usize::from(sim.replica_count);
+        let partitions = u32::from(sim.replica_count);
+        assert_eq!(sim.metadata_primary_index(), Some(METADATA_PRIMARY));
+        sim.register_client_with_primary(&client);
+        complete_metadata_op(&mut sim, &client, client.create_stream(STREAM));
+        complete_metadata_op(
+            &mut sim,
+            &client,
+            client.create_topic(STREAM, TOPIC, partitions),
+        );
+        let namespaces: Vec<_> = (0..partitions)
+            .map(|partition| namespace_of(&sim, partition).expect("the topic has the partition"))
+            .collect();
+        for &namespace in &namespaces {
+            sim.init_partition(namespace);
+        }
+        assert!(
+            (0..PROGRESS_STEPS).any(|_| {
+                sim.step();
+                serving(&sim, &namespaces)
+            }),
+            "every replica must serve the created partitions"
+        );
+        // Spread placement leaves some partition primary on a metadata backup.
+        let (partition, namespace, lagging) = (0..partitions)
+            .zip(namespaces.iter().copied())
+            .find_map(|(partition, namespace)| {
+                sim.primary_index(namespace)
+                    .filter(|&primary| primary != METADATA_PRIMARY)
+                    .map(|primary| (partition, namespace, primary))
+            })
+            .expect("a partition primary must sit on a metadata backup");
+        let old = sim
+            .partition_incarnation(usize::from(lagging), namespace)
+            .expect("the partition primary hosts the partition");
+        sim.discover_partition_contexts(&client);
+
+        *sim.network.link_drop_packet_fn(
+            ProcessId::Replica(METADATA_PRIMARY),
+            ProcessId::Replica(lagging),
+        ) = Some(withhold_metadata);
+        let delete = submit_and_wait_for_reply(
+            &mut sim,
+            client.client_id(),
+            METADATA_PRIMARY,
+            client.delete_stream(STREAM),
+        );
+        assert_eq!(
+            metadata::stm::result::result_code(delete.body()),
+            Some(IggyError::TransientNotCommitted.as_code()),
+            "the delete intent must commit without the lagging partition primary"
+        );
+        let intent_op = delete.header().op;
+
+        let write = client.send_messages(namespace, &[Bytes::from_static(IN_WINDOW)]);
+        let write_request = write.header().request;
+        let reply = submit_and_wait_for_reply(&mut sim, client.client_id(), lagging, write);
+        assert_eq!(
+            reply.header().status,
+            0,
+            "the stale route must still commit"
+        );
+        assert!(
+            applied_metadata(&sim, lagging) < intent_op,
+            "the write must commit before its primary applies the delete intent"
+        );
+        for replica in 0..replicas {
+            assert!(
+                !fenced(&sim, replica, namespace, old),
+                "replica {replica} installed a fence the lagging primary never ordered"
+            );
+        }
+
+        *sim.network.link_drop_packet_fn(
+            ProcessId::Replica(METADATA_PRIMARY),
+            ProcessId::Replica(lagging),
+        ) = None;
+        assert!(
+            (0..PROGRESS_STEPS).any(|_| {
+                sim.step();
+                (0..replicas).all(|replica| fenced(&sim, replica, namespace, old))
+            }),
+            "every replica must install the old incarnation's fence"
+        );
+        for replica in 0..replicas {
+            let log = retained_log(&sim, replica, namespace);
+            assert!(
+                log.values()
+                    .all(|header| header.partition_incarnation == old),
+                "replica {replica} logged a prepare from another incarnation"
+            );
+            let write_op = log
+                .values()
+                .find(|header| {
+                    header.operation == Operation::SendMessages
+                        && header.client == client.client_id()
+                        && header.request == write_request
+                })
+                .map(|header| header.op)
+                .expect("the write must commit in the old incarnation");
+            let fences: Vec<u64> = log
+                .values()
+                .filter(|header| header.operation == Operation::TransitionPartitionHistory)
+                .map(|header| header.op)
+                .collect();
+            assert_eq!(
+                fences.len(),
+                1,
+                "replica {replica} must log one delete fence"
+            );
+            assert!(
+                write_op < fences[0],
+                "replica {replica} ordered the write after the fence"
+            );
+            assert_eq!(
+                log.keys().next_back(),
+                Some(&fences[0]),
+                "replica {replica} logged an op after the fence"
+            );
+        }
+        assert!(
+            (0..PROGRESS_STEPS).any(|_| {
+                sim.step();
+                sim.replicas.iter().all(|replica| {
+                    let streams = replica.shards[0].plane.metadata().mux_stm.streams();
+                    !streams.lifecycle_pending(intent_op)
+                        && streams.created_revision_for_namespace(namespace).is_none()
+                })
+            }),
+            "the delete must complete once the lagging primary fences"
+        );
+
+        // The production reconciler tears a deleted incarnation down before it
+        // builds the recreated one. The simulator does that only for fixtures.
+        for replica in &sim.replicas {
+            replica
+                .partition_shard(namespace)
+                .plane
+                .partitions()
+                .remove(&namespace);
+        }
+        complete_metadata_op(&mut sim, &client, client.create_stream(STREAM));
+        complete_metadata_op(
+            &mut sim,
+            &client,
+            client.create_topic(STREAM, TOPIC, partitions),
+        );
+        assert_eq!(
+            namespace_of(&sim, partition),
+            Some(namespace),
+            "the recreated stream must reuse the deleted ids"
+        );
+        sim.init_partition(namespace);
+        assert!(
+            (0..PROGRESS_STEPS).any(|_| {
+                sim.step();
+                serving(&sim, &[namespace])
+            }),
+            "every replica must serve the recreated partition"
+        );
+        let recreated = sim
+            .partition_incarnation(usize::from(METADATA_PRIMARY), namespace)
+            .expect("the metadata primary hosts the recreated partition");
+        assert_ne!(recreated, old);
+
+        // The client never rediscovered, so this write still names `old`.
+        let target = sim
+            .primary_index(namespace)
+            .expect("the recreated partition has a primary");
+        let foreign = client.send_messages(namespace, &[Bytes::from_static(AFTER_RECREATE)]);
+        let foreign_request = foreign.header().request;
+        sim.submit_request(client.client_id(), target, foreign.into_generic());
+        let mut foreign_status = None;
+        for _ in 0..FOREIGN_WRITE_STEPS {
+            if let Some(reply) = sim
+                .step()
+                .into_iter()
+                .find(|reply| reply.header().request == foreign_request)
+            {
+                foreign_status = Some(reply.header().status);
+            }
+        }
+        for replica in 0..replicas {
+            assert_eq!(
+                sim.partition_incarnation(replica, namespace),
+                Some(recreated)
+            );
+            assert!(
+                !retained_log(&sim, replica, namespace)
+                    .values()
+                    .any(|header| header.operation == Operation::SendMessages),
+                "replica {replica} logged a write in the recreated partition"
+            );
+        }
+        let poll = sim.poll_messages(
+            usize::from(target),
+            namespace,
+            PollingConsumer::Consumer(CONSUMER_ID, namespace.partition_id()),
+            &PollingArgs::new(iggy_common::PollingStrategy::offset(0), POLL_COUNT, false),
+        );
+        let polled = complete_now(&mut sim, poll).expect("the recreated primary serves the poll");
+        assert!(
+            polled.is_empty(),
+            "the recreated partition must read back empty"
+        );
+        assert_eq!(
+            foreign_status,
+            Some(IggyError::HistoryUnavailable.as_code()),
+            "the old route must be refused by the recreated partition"
+        );
+    }
+
+    /// A replica restarted while a fixture topic is deleted keeps the deleted
+    /// incarnation's store, which the recreated incarnation must not adopt.
+    #[test]
+    fn given_a_restart_between_fixture_delete_and_recreate_when_recreated_should_start_empty() {
+        const SENDS: usize = 3;
+        const PROGRESS_STEPS: usize = 4_000;
+        const RESTARTED: u8 = 2;
+        let (mut sim, client) = cluster(0x5245_5354);
+        let fixture = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(fixture);
+        sim.register_client_with_primary(&client);
+        let stream = Streams::seeded_stream_name(fixture.stream_id());
+        let topic = Streams::seeded_topic_name(fixture.stream_id(), fixture.topic_id());
+        for index in 0..SENDS {
+            let send = client.send_messages(fixture, &[Bytes::from(format!("deleted-{index}"))]);
+            let reply = submit_and_wait_for_reply(&mut sim, client.client_id(), 0, send);
+            assert_eq!(reply.header().status, 0, "send {index} must commit");
+        }
+        complete_metadata_op(&mut sim, &client, client.delete_topic(&stream, &topic));
+        // A later prepare carries the completion's commit point, so the restarted
+        // replica replays the topic as deleted and materializes nothing.
+        complete_metadata_op(&mut sim, &client, client.create_stream("wl-after-delete"));
+        sim.replica_crash(RESTARTED);
+        sim.replica_restart(RESTARTED);
+        assert_eq!(
+            sim.partition_incarnation(usize::from(RESTARTED), fixture),
+            None,
+            "the restarted replica must replay the delete"
+        );
+
+        complete_metadata_op(&mut sim, &client, client.create_topic(&stream, &topic, 1));
+        assert!(
+            (0..PROGRESS_STEPS).any(|_| {
+                sim.step();
+                sim.incarnation_settled(0, &[fixture])
+            }),
+            "every replica must materialize the recreated incarnation"
+        );
+        assert_eq!(
+            sim.offsets(usize::from(RESTARTED), fixture)
+                .map(|offsets| offsets.commit_offset),
+            sim.offsets(0, fixture).map(|offsets| offsets.commit_offset),
+            "the restarted replica started the recreated incarnation from the deleted \
+             incarnation's log"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn given_restarted_primary_with_discarded_send_when_next_send_arrives_should_rejoin_quorum() {
+        const PROGRESS_STEPS: usize = 4_000;
+        const OLD_PRIMARY: u8 = 0;
+        const NEW_PRIMARY: u8 = 1;
+        const OTHER_BACKUP: u8 = 2;
+        const RETAINED: &[u8] = b"retained-prefix";
+        const DISCARDED: &[u8] = b"discarded-suffix";
+        const REPLACEMENT: &[u8] = b"replacement-send";
+        for committed_prefix in [false, true] {
+            let (mut sim, client) = cluster(0x5245_414E);
+            let namespace = IggyNamespace::new(1, 1, 0);
+            sim.init_partition(namespace);
+            sim.register_client_with_primary(&client);
+            let registered_op = metadata_commit(&sim, usize::from(OLD_PRIMARY));
+            let committed_op = if committed_prefix {
+                let send = client.send_messages(namespace, &[Bytes::from_static(RETAINED)]);
+                let reply =
+                    submit_and_wait_for_reply(&mut sim, client.client_id(), OLD_PRIMARY, send);
+                assert_eq!(reply.header().status, 0);
+                reply.header().commit
+            } else {
+                0
+            };
+            assert!(
+                (0..PROGRESS_STEPS).any(|_| {
+                    sim.step();
+                    (0..3).all(|replica| {
+                        metadata_commit(&sim, replica) >= registered_op
+                            && sim
+                                .partition_consensus_state(replica, namespace)
+                                .is_some_and(|state| state.commit_min == committed_op)
+                    })
+                }),
+                "every replica must commit the registration and prefix before isolating the send"
+            );
+            for backup in [NEW_PRIMARY, OTHER_BACKUP] {
+                sim.network
+                    .link_filter_mut(ProcessId::Replica(OLD_PRIMARY), ProcessId::Replica(backup))
+                    .remove(Command::Prepare);
+            }
+            let send = client.send_messages(namespace, &[Bytes::from_static(DISCARDED)]);
+            sim.submit_request(client.client_id(), OLD_PRIMARY, send.into_generic());
+            assert!(
+                (0..PROGRESS_STEPS).any(|_| {
+                    sim.step();
+                    sim.partition_journaled_headers(
+                        usize::from(OLD_PRIMARY),
+                        namespace,
+                        committed_op + 1..=committed_op + 1,
+                    )
+                    .is_some_and(|headers| headers.contains_key(&(committed_op + 1)))
+                }),
+                "the old primary must retain the uncommitted send before crashing"
+            );
+            assert_eq!(
+                sim.partition_consensus_state(usize::from(OLD_PRIMARY), namespace)
+                    .expect("old primary hosts the partition")
+                    .commit_min,
+                committed_op
+            );
+            sim.replica_crash(OLD_PRIMARY);
+            assert!(
+                (0..PROGRESS_STEPS).any(|_| {
+                    sim.step();
+                    sim.partition_consensus_state(usize::from(NEW_PRIMARY), namespace)
+                        .is_some_and(|state| {
+                            state.status == Status::Normal && state.is_primary && state.view > 0
+                        })
+                }),
+                "the remaining replicas must elect a primary without the isolated send"
+            );
+            for backup in [NEW_PRIMARY, OTHER_BACKUP] {
+                sim.network
+                    .link_filter_mut(ProcessId::Replica(OLD_PRIMARY), ProcessId::Replica(backup))
+                    .insert(Command::Prepare);
+            }
+            sim.replica_restart(OLD_PRIMARY);
+            assert!(
+                (0..PROGRESS_STEPS).any(|_| {
+                    sim.step();
+                    sim.partition_consensus_state(usize::from(OLD_PRIMARY), namespace)
+                        .is_some_and(|state| state.status == Status::Normal && state.view > 0)
+                        && sim
+                            .partition_journaled_headers(
+                                usize::from(OLD_PRIMARY),
+                                namespace,
+                                committed_op + 1..=committed_op + 1,
+                            )
+                            .is_some_and(|headers| headers.is_empty())
+                }),
+                "StartView must discard the old primary's uncommitted suffix"
+            );
+            sim.replica_crash(OTHER_BACKUP);
+            let send = client.send_messages(namespace, &[Bytes::from_static(REPLACEMENT)]);
+            let reply = submit_and_wait_for_reply(&mut sim, client.client_id(), NEW_PRIMARY, send);
+            assert_eq!(
+                reply.header().status,
+                0,
+                "the restarted replica must acknowledge the replacement"
+            );
+            let restored = retained_prepare(
+                &sim,
+                usize::from(OLD_PRIMARY),
+                namespace,
+                reply.header().commit,
+            );
+            assert!(
+                restored
+                    .body()
+                    .windows(REPLACEMENT.len())
+                    .any(|bytes| bytes == REPLACEMENT)
+            );
+            assert!(
+                !restored
+                    .body()
+                    .windows(DISCARDED.len())
+                    .any(|bytes| bytes == DISCARDED)
+            );
+        }
+    }
+
+    /// A replica that restarts again before its metadata reaches a recreated
+    /// fixture topic still owns the log of the incarnation it hosted.
+    #[test]
+    fn given_two_restarts_before_a_recreated_fixture_is_hosted_when_hosted_should_keep_its_log() {
+        const SENDS: usize = 3;
+        const PROGRESS_STEPS: usize = 4_000;
+        const RESTARTED: u8 = 2;
+        let (mut sim, client) = cluster(0x4C4F_4753);
+        let fixture = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(fixture);
+        sim.register_client_with_primary(&client);
+        let stream = Streams::seeded_stream_name(fixture.stream_id());
+        let topic = Streams::seeded_topic_name(fixture.stream_id(), fixture.topic_id());
+        complete_metadata_op(&mut sim, &client, client.delete_topic(&stream, &topic));
+        complete_metadata_op(&mut sim, &client, client.create_topic(&stream, &topic, 1));
+        assert!(
+            (0..PROGRESS_STEPS).any(|_| {
+                sim.step();
+                sim.incarnation_settled(0, &[fixture])
+            }),
+            "every replica must materialize the recreated incarnation"
+        );
+        sim.discover_partition_contexts(&client);
+        for index in 0..SENDS {
+            let send = client.send_messages(fixture, &[Bytes::from(format!("recreated-{index}"))]);
+            let reply = submit_and_wait_for_reply(&mut sim, client.client_id(), 0, send);
+            assert_eq!(reply.header().status, 0, "send {index} must commit");
+        }
+        let committed = |sim: &Simulator, replica_idx: usize| {
+            sim.offsets(replica_idx, fixture)
+                .map(|offsets| offsets.commit_offset)
+        };
+        assert!(
+            (0..PROGRESS_STEPS).any(|_| {
+                sim.step();
+                committed(&sim, usize::from(RESTARTED)) == committed(&sim, 0)
+            }),
+            "the replica to restart must hold every send first"
+        );
+
+        // No prepare carries the create's commit point yet, so each replay stops
+        // short of it and the replica materializes nothing.
+        for _ in 0..2 {
+            sim.replica_crash(RESTARTED);
+            sim.replica_restart(RESTARTED);
+            assert_eq!(
+                sim.partition_incarnation(usize::from(RESTARTED), fixture),
+                None,
+                "the replay must stop before the recreate"
+            );
+        }
+
+        assert!(
+            (0..PROGRESS_STEPS).any(|_| {
+                sim.step();
+                sim.incarnation_settled(0, &[fixture])
+            }),
+            "the restarted replica must materialize the recreated incarnation"
+        );
+        assert_eq!(
+            committed(&sim, usize::from(RESTARTED)),
+            committed(&sim, 0),
+            "the second restart dropped the log the first one retained"
+        );
+    }
+
+    /// A restart can replay metadata that names an incarnation older than a
+    /// group's store. Materializing waits for the metadata, keeping the store.
+    #[test]
+    fn given_a_store_of_a_newer_incarnation_when_metadata_names_an_older_one_should_keep_it() {
+        let (mut sim, _) = cluster(0x4E45_5752);
+        let fixture = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(fixture);
+        let replica = &sim.replicas[0];
+        let named = replica.shards[0]
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .created_revision_for_namespace(fixture)
+            .expect("the seed creates the fixture");
+        replica
+            .partition_shard(fixture)
+            .plane
+            .partitions()
+            .remove(&fixture);
+        let newer = named + 1;
+        replica
+            .partition_superblocks
+            .borrow_mut()
+            .get_mut(&fixture)
+            .expect("materializing stores the group")
+            .0 = newer;
+
+        assert!(
+            !materialise_partition(replica, fixture, sim.consumer_offsets_max),
+            "the replica materialized an incarnation older than its store"
+        );
+        assert_eq!(replica.partition_superblocks.borrow()[&fixture].0, newer);
+    }
+
+    /// A recreated fixture topic starts its offsets again at its chosen
+    /// creation view, which the per-tick marks must not read as a regression.
+    #[test]
+    fn given_a_recreated_fixture_when_checked_should_start_its_marks_again() {
+        const SENDS: usize = 3;
+        const PROGRESS_STEPS: usize = 4_000;
+        const SEED: u64 = 0x4D41_524B;
+
+        // Link hooks are bare `fn` pointers, so the group travels in a static.
+        static GROUP: AtomicU64 = AtomicU64::new(0);
+
+        fn starve_commits(packet: &packet::Packet) -> bool {
+            is_commit_for(packet, GROUP.load(Ordering::Relaxed))
+        }
+
+        let (mut sim, client) = cluster(SEED);
+        let fixture = IggyNamespace::new(1, 1, 0);
+        GROUP.store(fixture.inner(), Ordering::Relaxed);
+        sim.init_partition(fixture);
+        sim.register_client_with_primary(&client);
+        let workload = crate::workload::Workload::new(
+            crate::workload::options::WorkloadOptions::new(SEED, sim.replica_count, vec![fixture]),
+        );
+        let mut invariants = crate::workload::invariants::Invariants::new();
+        commit_sends_everywhere(&mut sim, &client, fixture, SENDS);
+        // Without commits from its primary the partition alone changes view, so
+        // the recreated incarnation starts below it.
+        for backup in 1..sim.replica_count {
+            *sim.network
+                .link_drop_packet_fn(ProcessId::Replica(0), ProcessId::Replica(backup)) =
+                Some(starve_commits);
+        }
+        let replicas = 0..usize::from(sim.replica_count);
+        assert!(
+            (0..PROGRESS_STEPS).any(|_| {
+                sim.step();
+                replicas
+                    .clone()
+                    .all(|replica_idx| sim.consensus_view(replica_idx, fixture) > Some(0))
+            }),
+            "starved commits must move the partition to a later view"
+        );
+        for backup in 1..sim.replica_count {
+            *sim.network
+                .link_drop_packet_fn(ProcessId::Replica(0), ProcessId::Replica(backup)) = None;
+        }
+        invariants.check(&sim, &workload);
+        let deleted_views: Vec<Option<u64>> = replicas
+            .clone()
+            .map(|replica_idx| sim.consensus_view(replica_idx, fixture))
+            .collect();
+
+        let stream = Streams::seeded_stream_name(fixture.stream_id());
+        let topic = Streams::seeded_topic_name(fixture.stream_id(), fixture.topic_id());
+        complete_metadata_op(&mut sim, &client, client.delete_topic(&stream, &topic));
+        complete_metadata_op(&mut sim, &client, client.create_topic(&stream, &topic, 1));
+        assert!(
+            (0..PROGRESS_STEPS).any(|_| {
+                sim.step();
+                sim.incarnation_settled(0, &[fixture])
+            }),
+            "every replica must materialize the recreated incarnation"
+        );
+        assert!(
+            replicas
+                .zip(deleted_views)
+                .all(|(replica_idx, deleted)| sim.consensus_view(replica_idx, fixture) < deleted),
+            "the recreated incarnation must start below the deleted one's view"
+        );
+        invariants.check(&sim, &workload);
+    }
+
+    /// Production refuses a `StartView` that names another prepare at an applied
+    /// op and keeps running; a simulated run fails on it, since a quorum decided a
+    /// log without a committed op.
+    #[test]
+    #[should_panic(expected = "contradict an op it applied")]
+    fn given_a_start_view_that_contradicts_an_applied_op_when_checked_should_fail_the_run() {
+        const SEED: u64 = 0x4150_504C;
+        const BACKUP: usize = 1;
+        let (mut sim, client) = cluster(SEED);
+        sim.register_client_with_primary(&client);
+        complete_metadata_op(&mut sim, &client, client.create_stream("applied"));
+
+        let metadata = sim.replicas[BACKUP].shards[0].plane.metadata();
+        let consensus = metadata
+            .consensus
+            .as_ref()
+            .expect("shard 0 runs the metadata consensus");
+        check_after_refusing_a_contradiction(&sim, SEED, consensus, PlaneKind::Metadata, |op| {
+            metadata.applied_header(op)
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "contradict an op it applied")]
+    fn given_a_partition_start_view_that_contradicts_an_applied_op_when_checked_should_fail_the_run()
+     {
+        const SEED: u64 = 0x5041_5254;
+        const SENDS: usize = 2;
+        let (mut sim, client) = cluster(SEED);
+        let fixture = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(fixture);
+        sim.register_client_with_primary(&client);
+        commit_sends_everywhere(&mut sim, &client, fixture, SENDS);
+
+        let primary = sim
+            .primary_index(fixture)
+            .expect("the fixture has a primary");
+        let backup = (0..sim.replica_count)
+            .find(|replica| *replica != primary)
+            .expect("the cluster has a backup");
+        let partitions = sim.replicas[usize::from(backup)]
+            .partition_shard(fixture)
+            .plane
+            .partitions();
+        let partition = partitions
+            .get_by_ns(&fixture)
+            .expect("every replica hosts the fixture");
+        check_after_refusing_a_contradiction(
+            &sim,
+            SEED,
+            partition.consensus(),
+            PlaneKind::Partitions,
+            |op| partition.applied_header(op),
+        );
+    }
+
+    /// Offer `consensus` a `StartView` of a view it does not lead whose log names
+    /// another prepare at its commit point, assert the refusal, then check the
+    /// invariants.
+    fn check_after_refusing_a_contradiction(
+        sim: &Simulator,
+        seed: u64,
+        consensus: &consensus::VsrConsensus<crate::bus::SharedSimOutbox>,
+        plane: PlaneKind,
+        applied_at: impl Fn(u64) -> Option<PrepareHeader>,
+    ) {
+        let applied_op = consensus.commit_min();
+        assert_eq!(
+            consensus.commit_max(),
+            applied_op,
+            "the backup is caught up"
+        );
+        let mut forged = applied_at(applied_op).expect("the backup journals the op it applied");
+        forged.timestamp += 1;
+        forged.checksum = forged.identity_checksum();
+        let view = (consensus.view() + 1..=consensus.view() + u32::from(sim.replica_count))
+            .find(|view| !consensus.is_primary_for_view(*view))
+            .expect("primaryship rotates through every replica");
+        let start_view = Message::<StartViewHeader>::new(size_of::<StartViewHeader>())
+            .transmute_header(|_, header: &mut StartViewHeader| {
+                header.command = Command::StartView;
+                header.cluster = consensus.cluster();
+                header.view = view;
+                header.op = applied_op;
+                header.commit = applied_op;
+                header.replica = consensus.primary_index(view);
+                header.group = consensus.group();
+                header.size = u32::try_from(size_of::<StartViewHeader>()).unwrap();
+            });
+        assert!(
+            consensus
+                .handle_start_view_guarded(
+                    plane,
+                    start_view.header(),
+                    bytemuck::bytes_of(&forged),
+                    applied_at,
+                )
+                .is_none(),
+            "the backup refuses the StartView"
+        );
+
+        let workload = crate::workload::Workload::new(
+            crate::workload::options::WorkloadOptions::new(seed, sim.replica_count, Vec::new()),
+        );
+        crate::workload::invariants::Invariants::new().check(sim, &workload);
+    }
+
+    /// The log of a deleted fixture incarnation goes when its topic comes back, so
+    /// the driver compares it across replicas as soon as the delete is reached.
+    #[test]
+    #[should_panic(expected = "disagree on committed partition op")]
+    fn given_replicas_that_disagree_on_a_deleted_fixture_log_when_the_delete_is_reached_should_fail_the_run()
+     {
+        const SENDS: usize = 3;
+        const SEED: u64 = 0x4445_4C44;
+        const DIVERGED: usize = 2;
+        const DELETE_STEPS: usize = 4_000;
+        let (mut sim, client) = cluster(SEED);
+        let fixture = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(fixture);
+        sim.register_client_with_primary(&client);
+        commit_sends_everywhere(&mut sim, &client, fixture, SENDS);
+        let mut options =
+            crate::workload::options::WorkloadOptions::new(SEED, sim.replica_count, vec![fixture]);
+        options.weights = crate::workload::options::ActionWeights::new(&[(
+            crate::workload::actions::Action::ReplaceFixtureTopic,
+            100,
+        )]);
+        let mut workload = crate::workload::Workload::new(options);
+        let (target, delete) = workload
+            .build_request(&client)
+            .expect("the fixture must take a delete");
+        assert_eq!(delete.header().operation, Operation::DeleteTopic);
+        sim.submit_request(client.client_id(), target, delete.into_generic());
+        // The first reply comes before the partition fences install, so only a
+        // resend learns that the delete was reached.
+        assert!(
+            (0..DELETE_STEPS).any(|_| {
+                for reply in sim.step() {
+                    assert!(workload.on_reply(&reply).is_empty());
+                }
+                workload.tick();
+                for (target, resend) in workload.due_resends() {
+                    sim.submit_request(client.client_id(), target, resend.into_generic());
+                }
+                workload.client_idle(client.client_id())
+            }),
+            "the fixture delete must be reached"
+        );
+
+        let partitions = sim.replicas[DIVERGED]
+            .partition_shard(fixture)
+            .plane
+            .partitions();
+        let partition = partitions
+            .get_by_ns(&fixture)
+            .expect("the deleted incarnation stays hosted until the topic comes back");
+        let journal = &partition.log.journal().inner;
+        let op = partition.consensus().commit_min();
+        let mut entry = journal
+            .repair_entry(op)
+            .expect("the replica journaled its last committed op")
+            .as_slice()
+            .to_vec();
+        let header_bytes = &mut entry[..size_of::<PrepareHeader>()];
+        let mut header: PrepareHeader = bytemuck::checked::pod_read_unaligned(header_bytes);
+        header.timestamp += 1;
+        header_bytes.copy_from_slice(bytemuck::bytes_of(&header));
+        // Only the evicted ring takes an entry from outside, and resident entries
+        // take precedence over it.
+        journal.clear_all();
+        journal.restore_checkpoint_prepare(
+            op,
+            server_common::iobuf::Owned::copy_from_slice(&entry).into(),
+        );
+
+        workload.compare_deleted_fixture_logs(&sim);
+    }
+
+    /// A replica that was down while a fixture topic was replaced comes back on the
+    /// deleted incarnation, whose log the quiesce oracle must not hold against the
+    /// recreated one.
+    #[test]
+    fn given_a_replica_back_on_a_deleted_fixture_incarnation_when_converged_should_skip_it() {
+        const SENDS: usize = 3;
+        const PROGRESS_STEPS: usize = 4_000;
+        const SEED: u64 = 0x5354_414C;
+        const RESTARTED: u8 = 2;
+        let (mut sim, client) = cluster(SEED);
+        let fixture = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(fixture);
+        sim.register_client_with_primary(&client);
+        let committed = |sim: &Simulator, replica_idx: u8| {
+            sim.partition_consensus_state(usize::from(replica_idx), fixture)
+                .map(|state| state.commit_min)
+        };
+        for index in 0..SENDS {
+            let send = client.send_messages(fixture, &[Bytes::from(format!("deleted-{index}"))]);
+            let reply = submit_and_wait_for_reply(&mut sim, client.client_id(), 0, send);
+            assert_eq!(reply.header().status, 0, "send {index} must commit");
+        }
+        assert!(
+            (0..PROGRESS_STEPS).any(|_| {
+                sim.step();
+                committed(&sim, RESTARTED) == committed(&sim, 0)
+            }),
+            "the replica to crash must commit every send first"
+        );
+        sim.replica_crash(RESTARTED);
+        let stream = Streams::seeded_stream_name(fixture.stream_id());
+        let topic = Streams::seeded_topic_name(fixture.stream_id(), fixture.topic_id());
+        complete_metadata_op(&mut sim, &client, client.delete_topic(&stream, &topic));
+        complete_metadata_op(&mut sim, &client, client.create_topic(&stream, &topic, 1));
+        assert!(
+            (0..PROGRESS_STEPS).any(|_| {
+                sim.step();
+                sim.incarnation_settled(0, &[fixture])
+            }),
+            "every live replica must materialize the recreated incarnation"
+        );
+        sim.discover_partition_contexts(&client);
+        let send = client.send_messages(fixture, &[Bytes::from_static(b"recreated")]);
+        let reply = submit_and_wait_for_reply(&mut sim, client.client_id(), 0, send);
+        assert_eq!(
+            reply.header().status,
+            0,
+            "the recreated fixture must take a send"
+        );
+        sim.replica_restart(RESTARTED);
+        let deleted = sim.partition_incarnation(usize::from(RESTARTED), fixture);
+        assert!(
+            deleted.is_some() && deleted != sim.partition_incarnation(0, fixture),
+            "the restarted replica must replay the fixture as it was before the delete"
+        );
+        assert!(
+            committed(&sim, RESTARTED) > committed(&sim, 0),
+            "the deleted incarnation must hold more commits than the recreated one, or \
+             no leader check could trip on it"
+        );
+
+        let mut workload = crate::workload::Workload::new(
+            crate::workload::options::WorkloadOptions::new(SEED, sim.replica_count, vec![fixture]),
+        );
+        let convergence = crate::workload::oracle::assert_converged(&sim, &mut workload);
+        assert_eq!(convergence.namespaces_checked, 1);
+    }
+
+    /// A replica that hosts an incarnation its own metadata does not name fails
+    /// the quiesce check. No comparison between replicas of one incarnation can
+    /// see it.
+    #[test]
+    #[should_panic(expected = "but its metadata names")]
+    fn given_a_backup_hosting_an_unnamed_incarnation_when_converged_should_fail_the_run() {
+        const FORGED: usize = 2;
+        let (mut sim, _) = cluster(0x464F_5247);
+        let fixture = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(fixture);
+        let replica = &sim.replicas[FORGED];
+        let streams = replica.shards[0].plane.metadata().mux_stm.streams();
+        let named = streams
+            .created_revision_for_namespace(fixture)
+            .expect("the fixture is in metadata");
+        let created_view = streams
+            .created_view_for_namespace(fixture)
+            .expect("the fixture records its creation view");
+        let shard = replica.partition_shard(fixture);
+        shard.plane.partitions().remove(&fixture);
+        shard.init_partition(
+            fixture,
+            None,
+            None,
+            None,
+            crate::partition_wal::reopen(&replica.partition_storage, fixture, named + 1, None),
+            PartitionMaterialisation::new(named + 1, created_view, true),
+        );
+        assert_eq!(sim.partition_incarnation(FORGED, fixture), Some(named + 1));
+
+        let mut workload =
+            crate::workload::Workload::new(crate::workload::options::WorkloadOptions::new(
+                sim.seed,
+                sim.replica_count,
+                vec![fixture],
+            ));
+        let _ = crate::workload::oracle::assert_converged(&sim, &mut workload);
+    }
+
+    /// A caller context from a node ahead of the dispatching one can name an
+    /// incarnation the dispatching node has not seen, so only that node's
+    /// metadata may bound the request.
+    #[test]
+    fn given_raw_request_ahead_of_destination_metadata_when_delivered_should_refuse_as_not_accepted()
+     {
+        let (mut sim, client) = cluster(0x5741_5445);
+        let namespace = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(namespace);
+        sim.register_client_with_primary(&client);
+        let primary = sim.primary_index(namespace).unwrap();
+        let metadata = sim.replicas[usize::from(primary)].shards[0]
+            .plane
+            .metadata();
+        client.set_partition_context(
+            namespace,
+            PartitionContext {
+                incarnation: metadata
+                    .mux_stm
+                    .streams()
+                    .created_revision_for_namespace(namespace)
+                    .unwrap(),
+                owner_generation: 0,
+                metadata_op: metadata.applied_frontier().get() + 1,
+            },
+        );
+        let send = client.send_messages(namespace, &[Bytes::from_static(b"ahead")]);
+        let reply = submit_and_wait_for_reply(&mut sim, client.client_id(), primary, send);
+        assert_eq!(
+            reply.header().status,
+            IggyError::TransientNotAccepted.as_code()
         );
     }
 
@@ -2024,6 +4123,458 @@ mod tests {
     }
 
     #[test]
+    fn given_idle_owner_when_replica_restarts_should_expire_via_virtual_heartbeats() {
+        const PROGRESS_STEPS: usize = 20_000;
+        for restart in [false, true] {
+            let (mut sim, original, replacement) = consumer_group_disconnect_fixture(3, 2);
+            sim.shell_login(&replacement);
+            let reply = submit_and_wait_for_reply(
+                &mut sim,
+                replacement.client_id(),
+                0,
+                replacement.join_consumer_group(
+                    DISCONNECT_STREAM,
+                    DISCONNECT_TOPIC,
+                    DISCONNECT_GROUP,
+                ),
+            );
+            assert_eq!(reply.header().status, 0);
+            if restart {
+                sim.replica_crash(2);
+                sim.replica_restart(2);
+            }
+            assert!(
+                (0..PROGRESS_STEPS).any(|step| {
+                    if step % DISCONNECT_PROGRESS_STEPS == 0 {
+                        sim.submit_request(
+                            replacement.client_id(),
+                            0,
+                            replacement.get_stream(DISCONNECT_STREAM).into_generic(),
+                        );
+                    }
+                    sim.step();
+                    disconnect_group_assignment(&sim, original.client_id()).is_none()
+                        && disconnect_group_assignment(&sim, replacement.client_id())
+                            == Some(vec![0])
+                }),
+                "restart={restart}: a silent original must expire while the active replacement stays live"
+            );
+            assert!(sim.network.delivered_any(Command::ConsumerSessionHeartbeat));
+            assert!(
+                (0..PROGRESS_STEPS).any(|step| {
+                    if step % DISCONNECT_PROGRESS_STEPS == 0 {
+                        sim.submit_request(
+                            replacement.client_id(),
+                            0,
+                            replacement.get_stream(DISCONNECT_STREAM).into_generic(),
+                        );
+                    }
+                    sim.step();
+                    sim.network
+                        .delivered_any(Command::SessionRetirementProgress)
+                }),
+                "restart={restart}: ended sessions must reach the production partition-retirement reports"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn given_ended_session_batch_when_liveness_sweeps_should_submit_bounded_real_barriers() {
+        const PARTITIONS: usize = 2;
+        const STEPS: usize = 20_000;
+        const BASE_CLIENT: u128 = 100;
+        let session_count = iggy_binary_protocol::requests::system::MAX_SESSIONS_PER_RETIREMENT + 1;
+        let (mut sim, client, _) = consumer_group_disconnect_cluster(3, session_count + 2);
+        for partition in 0..PARTITIONS {
+            let namespace = IggyNamespace::new(0, 0, partition);
+            sim.init_partition(namespace);
+            sim.seed_stream_topic_partition(namespace);
+        }
+        sim.discover_partition_contexts(&client);
+        for partition in 0..PARTITIONS {
+            commit_sends_everywhere(&mut sim, &client, IggyNamespace::new(0, 0, partition), 1);
+        }
+        let end_op = sim.metadata_consensus(0).unwrap().commit_min();
+        sim.discover_partition_contexts(&client);
+        for partition_id in 0..PARTITIONS {
+            let namespace = IggyNamespace::new(0, 0, partition_id);
+            for index in 0..session_count {
+                let client_id = BASE_CLIENT + index as u128;
+                sim.submit_request(
+                    client.client_id(),
+                    0,
+                    client.get_stream(DISCONNECT_STREAM).into_generic(),
+                );
+                let primary = usize::from(sim.primary_index(namespace).unwrap());
+                let owner = Rc::clone(sim.replicas[primary].partition_shard(namespace));
+                let previous = owner
+                    .plane
+                    .partitions()
+                    .get_by_ns(&namespace)
+                    .unwrap()
+                    .consensus()
+                    .commit_min();
+                let request = client
+                    .store_consumer_offset(
+                        namespace,
+                        ConsumerKind::Consumer.as_code(),
+                        0,
+                        0,
+                        AckLevel::Quorum,
+                    )
+                    .transmute_header(|old, header: &mut RoutedRequestHeader| {
+                        *header = old;
+                        header.client = client_id;
+                        header.session = end_op;
+                        header.request = 1;
+                        header.metadata_watermark = end_op;
+                        header.checksum = 0;
+                    });
+                let ticket = owner.partition_submit(namespace, request).unwrap();
+                let (result_tx, result_rx) = shard::channel(1);
+                sim.executor.spawn(async move {
+                    let _ = result_tx.try_send(owner.await_partition_submit(ticket).await);
+                });
+                assert!(
+                    (0..DISCONNECT_PROGRESS_STEPS).any(|_| {
+                        sim.step();
+                        sim.replicas.iter().all(|replica| {
+                            replica
+                                .partition_shard(namespace)
+                                .plane
+                                .partitions()
+                                .get_by_ns(&namespace)
+                                .unwrap()
+                                .consensus()
+                                .commit_min()
+                                > previous
+                        })
+                    }),
+                    "client {client_id} must hold a committed partition receipt before retirement: {:?}",
+                    result_rx
+                        .try_recv()
+                        .map(|reply| reply.map(|reply| *reply.header()))
+                );
+            }
+        }
+        for replica in &sim.replicas {
+            let mut table = replica.shards[0].plane.metadata().client_table.borrow_mut();
+            for index in 0..session_count {
+                let client_id = BASE_CLIENT + index as u128;
+                let mut reply = Message::<ReplyHeader>::new(size_of::<ReplyHeader>());
+                *bytemuck::checked::from_bytes_mut(reply.as_mut_slice()) = ReplyHeader {
+                    command: Command::Reply,
+                    operation: Operation::Register,
+                    client: client_id,
+                    op: end_op,
+                    commit: end_op,
+                    size: u32::try_from(size_of::<ReplyHeader>()).unwrap(),
+                    ..ReplyHeader::default()
+                };
+                table
+                    .commit_register(client_id, 0, [0x5a; 32], reply)
+                    .unwrap();
+            }
+        }
+        for replica in &sim.replicas {
+            let mut table = replica.shards[0].plane.metadata().client_table.borrow_mut();
+            for index in 0..session_count {
+                assert!(table.end_session(BASE_CLIENT + index as u128, 0, end_op, end_op));
+            }
+        }
+        assert!(
+            (0..STEPS).any(|step| {
+                if step % DISCONNECT_PROGRESS_STEPS == 0 {
+                    sim.submit_request(
+                        client.client_id(),
+                        0,
+                        client.get_stream(DISCONNECT_STREAM).into_generic(),
+                    );
+                }
+                sim.step();
+                sim.replicas.iter().all(|replica| {
+                    replica.shards[0]
+                        .plane
+                        .metadata()
+                        .client_table
+                        .borrow()
+                        .ended_sessions()
+                        .next()
+                        .is_none()
+                })
+            }),
+            "the real sweeper must retire every ended session"
+        );
+        for partition_id in 0..PARTITIONS {
+            let namespace = IggyNamespace::new(0, 0, partition_id);
+            let primary = sim.primary_index(namespace).unwrap();
+            let partition = sim.replicas[usize::from(primary)]
+                .partition_shard(namespace)
+                .plane
+                .partitions()
+                .get_by_ns(&namespace)
+                .unwrap();
+            let journal = &partition.log.journal().inner;
+            let barriers: Vec<_> = journal
+                .repair_headers_in(1..=partition.consensus().commit_min())
+                .into_iter()
+                .filter(|(_, header)| header.operation == Operation::RetireSession)
+                .map(|(op, _)| {
+                    iggy_binary_protocol::requests::system::RetireSessionsRequest::decode_from(
+                        &journal.repair_entry(op).unwrap().as_slice()[size_of::<PrepareHeader>()..],
+                    )
+                    .unwrap()
+                })
+                .collect();
+            assert_eq!(
+                barriers.len(),
+                session_count
+                    .div_ceil(iggy_binary_protocol::requests::system::MAX_SESSIONS_PER_RETIREMENT),
+                "partition {partition_id}: production submissions must batch every ended session"
+            );
+            let mut retired: Vec<_> = barriers
+                .iter()
+                .flat_map(|batch| batch.identities.iter().map(|identity| identity.client_id))
+                .collect();
+            retired.sort_unstable();
+            retired.dedup();
+            assert_eq!(
+                retired,
+                (BASE_CLIENT..BASE_CLIENT + session_count as u128).collect::<Vec<_>>()
+            );
+            assert!(barriers.iter().all(|batch| batch.identities.len()
+                <= iggy_binary_protocol::requests::system::MAX_SESSIONS_PER_RETIREMENT));
+        }
+    }
+
+    #[test]
+    fn given_stored_offsets_when_polling_next_should_start_after_each_committed_position() {
+        let (mut sim, client, _) = consumer_group_disconnect_fixture(3, 2);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        commit_sends_everywhere(&mut sim, &client, namespace, 4);
+        sim.discover_partition_contexts(&client);
+        for kind in [
+            iggy_binary_protocol::KIND_CONSUMER,
+            iggy_binary_protocol::KIND_CONSUMER_GROUP,
+        ] {
+            let stored = submit_and_wait_for_reply(
+                &mut sim,
+                client.client_id(),
+                0,
+                client.store_consumer_offset(namespace, kind, 0, 1, AckLevel::Quorum),
+            );
+            assert_eq!(stored.header().status, 0);
+            let offset_poll = client.poll_messages_at(namespace, kind, 0, 0, 2);
+            let mut body =
+                iggy_binary_protocol::requests::messages::PollMessagesRequest::decode_from(
+                    offset_poll.body(),
+                )
+                .unwrap();
+            body.strategy = iggy_binary_protocol::WirePollingStrategy::next();
+            let encoded = body.to_bytes();
+            let mut next = Message::<RoutedRequestHeader>::new(
+                size_of::<RoutedRequestHeader>() + encoded.len(),
+            );
+            next.as_mut_slice()[size_of::<RoutedRequestHeader>()..].copy_from_slice(&encoded);
+            let next = next.transmute_header(|_, header: &mut RoutedRequestHeader| {
+                *header = *offset_poll.header();
+                header.size =
+                    u32::try_from(size_of::<RoutedRequestHeader>() + encoded.len()).unwrap();
+            });
+            let reply = submit_and_wait_for_reply(&mut sim, client.client_id(), 0, next);
+            assert_eq!(reply.header().status, 0);
+            let poll = iggy_binary_protocol::responses::messages::PollMessagesResponse::decode(
+                reply.body(),
+            )
+            .unwrap();
+            assert_eq!(
+                poll.messages
+                    .map(|message| message.unwrap().offset)
+                    .collect::<Vec<_>>(),
+                [2, 3],
+                "kind={kind}: Next must use the acknowledged stored position"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn given_consumer_handoff_when_each_replica_crashes_at_committed_boundaries_should_reassign() {
+        const STEPS: usize = 10_000;
+        const DOWN_STEPS: usize = 500;
+        fn setup() -> (Simulator, SimClient, SimClient, u64, u64) {
+            let (mut sim, original, replacement) = consumer_group_disconnect_fixture(3, 2);
+            sim.shell_login(&replacement);
+            let joined = submit_and_wait_for_reply(
+                &mut sim,
+                replacement.client_id(),
+                0,
+                replacement.join_consumer_group(
+                    DISCONNECT_STREAM,
+                    DISCONNECT_TOPIC,
+                    DISCONNECT_GROUP,
+                ),
+            );
+            assert_eq!(joined.header().status, 0);
+            for _ in 0..DISCONNECT_PROGRESS_STEPS {
+                sim.step();
+            }
+            let namespace = IggyNamespace::new(0, 0, 0);
+            let metadata_start = sim.metadata_consensus(0).unwrap().commit_min();
+            let partition_start = sim.replicas[0]
+                .partition_shard(namespace)
+                .plane
+                .partitions()
+                .get_by_ns(&namespace)
+                .unwrap()
+                .consensus()
+                .commit_min();
+            sim.submit_request(
+                original.client_id(),
+                0,
+                original
+                    .leave_consumer_group(DISCONNECT_STREAM, DISCONNECT_TOPIC, DISCONNECT_GROUP)
+                    .into_generic(),
+            );
+            (sim, original, replacement, metadata_start, partition_start)
+        }
+        fn advance(sim: &mut Simulator, replacement: &SimClient, step: usize) {
+            if step.is_multiple_of(DISCONNECT_PROGRESS_STEPS) {
+                let target = sim.metadata_primary_index().unwrap_or(0);
+                sim.submit_request(
+                    replacement.client_id(),
+                    target,
+                    replacement.get_stream(DISCONNECT_STREAM).into_generic(),
+                );
+            }
+            sim.step();
+        }
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let (mut baseline, _, replacement, metadata_start, partition_start) = setup();
+        let mut seen = BTreeSet::new();
+        let mut boundaries = Vec::new();
+        for step in 0..STEPS {
+            advance(&mut baseline, &replacement, step);
+            for replica in &baseline.replicas {
+                let metadata = replica.shards[0].plane.metadata();
+                for op in metadata_start + 1..=metadata.consensus.as_ref().unwrap().commit_min() {
+                    let Some(header) = metadata
+                        .journal
+                        .as_ref()
+                        .unwrap()
+                        .header(usize::try_from(op).unwrap())
+                    else {
+                        continue;
+                    };
+                    if matches!(
+                        header.operation,
+                        Operation::LeaveConsumerGroup | Operation::CompleteConsumerGroupRevocation
+                    ) && seen.insert((METADATA_GROUP, op))
+                    {
+                        boundaries.push((step, header.operation));
+                    }
+                }
+                let partition = replica
+                    .partition_shard(namespace)
+                    .plane
+                    .partitions()
+                    .get_by_ns(&namespace)
+                    .unwrap();
+                for (op, header) in partition
+                    .log
+                    .journal()
+                    .inner
+                    .repair_headers_in(partition_start + 1..=partition.consensus().commit_min())
+                {
+                    if header.operation == Operation::InstallConsumerGroupOwner
+                        && seen.insert((namespace.inner(), op))
+                    {
+                        boundaries.push((step, header.operation));
+                    }
+                }
+            }
+            if disconnect_group_assignment(&baseline, replacement.client_id()) == Some(vec![0]) {
+                break;
+            }
+        }
+        assert!(
+            boundaries
+                .iter()
+                .any(|(_, operation)| *operation == Operation::LeaveConsumerGroup)
+        );
+        assert!(
+            boundaries
+                .iter()
+                .any(|(_, operation)| *operation == Operation::InstallConsumerGroupOwner)
+        );
+        assert!(
+            boundaries
+                .iter()
+                .any(|(_, operation)| *operation == Operation::CompleteConsumerGroupRevocation)
+        );
+        for (cut, operation) in boundaries {
+            for victim in 0..3 {
+                let (mut sim, original, replacement, _, _) = setup();
+                for step in 0..=cut {
+                    advance(&mut sim, &replacement, step);
+                }
+                sim.replica_crash(victim);
+                for step in 0..DOWN_STEPS {
+                    advance(&mut sim, &replacement, step);
+                }
+                sim.replica_restart(victim);
+                assert!(
+                    (0..STEPS).any(|step| {
+                        advance(&mut sim, &replacement, step);
+                        sim.replicas.iter().all(|replica| {
+                            let streams = replica.shards[0].plane.metadata().mux_stm.streams();
+                            streams
+                                .consumer_group_member_assignment(
+                                    &WireIdentifier::numeric(0),
+                                    &WireIdentifier::numeric(0),
+                                    &WireIdentifier::named(DISCONNECT_GROUP).unwrap(),
+                                    replacement.client_id(),
+                                )
+                                .is_some_and(|(_, partitions)| partitions == [0])
+                                && replica
+                                    .partition_shard(namespace)
+                                    .plane
+                                    .partitions()
+                                    .get_by_ns(&namespace)
+                                    .is_some_and(|partition| {
+                                        partition.consumer_group_owner(0).is_some_and(|owner| {
+                                            owner.client_id == replacement.client_id()
+                                        })
+                                    })
+                        })
+                    }),
+                    "{operation:?} step={cut} victim={victim}: restarted replicas must complete the handoff"
+                );
+                assert_eq!(
+                    disconnect_group_assignment(&sim, original.client_id()),
+                    None
+                );
+                for replica in &sim.replicas {
+                    let owner = replica
+                        .partition_shard(namespace)
+                        .plane
+                        .partitions()
+                        .get_by_ns(&namespace)
+                        .unwrap()
+                        .consumer_group_owner(0)
+                        .unwrap();
+                    assert_eq!(
+                        owner.client_id,
+                        replacement.client_id(),
+                        "{operation:?} victim={victim}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn given_full_registry_when_another_client_logs_in_should_preserve_the_live_session() {
         let (mut sim, original, replacement) = consumer_group_disconnect_fixture(1, 1);
         sim.submit_handshake(&replacement, 0);
@@ -2064,7 +4615,126 @@ mod tests {
         );
     }
 
+    /// Only partition replicas can prove an owner install, so a metadata primary
+    /// without one needs a backup to relay the revocation completion.
+    #[test]
+    fn given_metadata_primary_without_partition_replica_when_member_joins_should_activate_its_partition()
+     {
+        let (mut sim, original, _) = consumer_group_disconnect_cluster(3, 2);
+        fence_partition_on_metadata_primary(&mut sim, IggyNamespace::new(0, 0, 0));
+        join_disconnect_group(&mut sim, &original);
+        assert!(sim.network.delivered_any(Command::ForwardCompletion));
+        assert_eq!(
+            sim.metadata_primary_index(),
+            Some(0),
+            "the metadata primary is the replica without the partition"
+        );
+        assert_eq!(
+            sim.metadata_view(),
+            Some(0),
+            "the owner must activate without a metadata view change"
+        );
+    }
+
+    /// Without a quorum neither the fence of a handoff nor its completion can
+    /// commit, so the revocation stays pending past any deadline.
+    #[test]
+    #[should_panic(expected = "pending revocation")]
+    fn given_a_handoff_without_quorum_when_it_outlives_the_bound_should_fail_the_quiesce_check() {
+        let mut sim = pending_leave_fixture();
+        sim.replica_crash(1);
+        sim.replica_crash(2);
+        let deadline = sim.realtime_micros()
+            + crate::workload::oracle::PENDING_REVOCATION_TIMEOUTS_MAX
+                * rebalancing_timeout_micros();
+        while sim.realtime_micros() <= deadline {
+            sim.step();
+        }
+        crate::workload::oracle::assert_no_stale_revocations(&sim, 0, sim.seed);
+    }
+
+    /// The reconciler installs an owner on its own schedule, so settling waits
+    /// for a pending one, and the owner oracle compares it.
+    #[test]
+    fn given_a_pending_owner_when_settled_should_compare_it() {
+        let mut sim = pending_leave_fixture();
+        assert_eq!(
+            settle_and_converge(&mut sim).owners_compared,
+            1,
+            "the owner that the leave installs was not compared"
+        );
+    }
+
+    /// Without a quorum the pending owner never installs, so settling stops at
+    /// the stale revocation bound and the quiesce check fails the revocation.
+    #[test]
+    #[should_panic(expected = "pending revocation")]
+    fn given_a_pending_owner_without_quorum_when_settled_should_fail_the_quiesce_check() {
+        let mut sim = pending_leave_fixture();
+        sim.replica_crash(1);
+        sim.replica_crash(2);
+        settle_and_converge(&mut sim);
+    }
+
+    /// [`consumer_group_disconnect_fixture`] with the revocation that its owner's
+    /// leave starts still pending.
+    fn pending_leave_fixture() -> Simulator {
+        let (mut sim, original, _) = consumer_group_disconnect_fixture(3, 2);
+        let leave =
+            original.leave_consumer_group(DISCONNECT_STREAM, DISCONNECT_TOPIC, DISCONNECT_GROUP);
+        sim.submit_request(original.client_id(), 0, leave.into_generic());
+        assert!(
+            (0..DISCONNECT_PROGRESS_STEPS).any(|_| {
+                sim.step();
+                !sim.replicas[0].shards[0]
+                    .plane
+                    .metadata()
+                    .mux_stm
+                    .streams()
+                    .consumer_group_pending_revocations()
+                    .is_empty()
+            }),
+            "the leave must start a revocation"
+        );
+        sim
+    }
+
+    /// Settle `sim` as the fuzz driver does after its drain, then run the quiesce
+    /// oracle over the namespace of [`consumer_group_disconnect_fixture`].
+    fn settle_and_converge(sim: &mut Simulator) -> crate::workload::oracle::ConvergenceReport {
+        const SETTLE_TICKS: u64 = 50_000;
+        let mut workload =
+            crate::workload::Workload::new(crate::workload::options::WorkloadOptions::new(
+                sim.seed,
+                sim.replica_count,
+                vec![IggyNamespace::new(0, 0, 0)],
+            ));
+        let mut invariants = crate::workload::invariants::Invariants::new();
+        assert!(
+            crate::workload::oracle::settle_to_stable_view(
+                sim,
+                &mut workload,
+                SETTLE_TICKS,
+                &mut invariants
+            ),
+            "the views never settled"
+        );
+        crate::workload::oracle::assert_converged(sim, &mut workload)
+    }
+
     fn consumer_group_disconnect_fixture(
+        replica_count: u8,
+        client_capacity: usize,
+    ) -> (Simulator, SimClient, SimClient) {
+        let (mut sim, original, replacement) =
+            consumer_group_disconnect_cluster(replica_count, client_capacity);
+        join_disconnect_group(&mut sim, &original);
+        (sim, original, replacement)
+    }
+
+    /// The shell cluster of [`consumer_group_disconnect_fixture`], with the
+    /// original client logged in and no group yet.
+    fn consumer_group_disconnect_cluster(
         replica_count: u8,
         client_capacity: usize,
     ) -> (Simulator, SimClient, SimClient) {
@@ -2098,23 +4768,29 @@ mod tests {
         sim.init_partition(namespace);
         sim.seed_stream_topic_partition(namespace);
         sim.shell_login(&original);
+        (sim, original, replacement)
+    }
+
+    /// `original` creates the group and joins it, and then owns partition 0.
+    fn join_disconnect_group(sim: &mut Simulator, original: &SimClient) {
+        let namespace = IggyNamespace::new(0, 0, 0);
         for request in [
             original.create_consumer_group(DISCONNECT_STREAM, DISCONNECT_TOPIC, DISCONNECT_GROUP),
             original.join_consumer_group(DISCONNECT_STREAM, DISCONNECT_TOPIC, DISCONNECT_GROUP),
         ] {
-            let reply = submit_and_wait_for_reply(&mut sim, original.client_id(), 0, request);
+            let reply = submit_and_wait_for_reply(sim, original.client_id(), 0, request);
             assert_eq!(reply.header().status, 0);
         }
         for _ in 0..SETUP_TOTAL_STEPS {
-            if disconnect_group_assignment(&sim, original.client_id()) == Some(vec![0]) {
+            if disconnect_group_assignment(sim, original.client_id()) == Some(vec![0]) {
                 break;
             }
             sim.step();
         }
         assert_eq!(
-            disconnect_group_assignment(&sim, original.client_id()),
+            disconnect_group_assignment(sim, original.client_id()),
             Some(vec![0]),
-            "original consumer must own the only partition before disconnecting; pending={:?}, partition={:?}",
+            "the original consumer must come to own the only partition; pending={:?}, partition={:?}",
             sim.replicas[0].shards[0]
                 .plane
                 .metadata()
@@ -2132,7 +4808,126 @@ mod tests {
                     partition.fatal().is_some(),
                 )),
         );
-        (sim, original, replacement)
+    }
+
+    /// Metadata settles an owner only after the partition installed it, so a
+    /// partition primary holding another owner fails the quiesce check.
+    #[test]
+    #[should_panic(expected = "but partition primary")]
+    fn given_a_partition_primary_holding_another_owner_when_converged_should_fail_the_run() {
+        const INSTALL_STEPS: usize = 2_000;
+        let (mut sim, _, replacement) = consumer_group_disconnect_fixture(3, 2);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let mut workload =
+            crate::workload::Workload::new(crate::workload::options::WorkloadOptions::new(
+                sim.seed,
+                sim.replica_count,
+                vec![namespace],
+            ));
+        assert_eq!(
+            crate::workload::oracle::assert_converged(&sim, &mut workload).owners_compared,
+            1,
+            "the fixture must settle its one owner"
+        );
+        let leader = usize::from(sim.metadata_leader().expect("the cluster has a leader"));
+        let metadata = sim.replicas[leader].shards[0].plane.metadata();
+        let group_id = metadata
+            .mux_stm
+            .streams()
+            .read(|inner| {
+                inner
+                    .items
+                    .get(namespace.stream_id())
+                    .and_then(|stream| stream.topics.get(namespace.topic_id()))
+                    .and_then(|topic| topic.consumer_groups.keys().next().copied())
+            })
+            .expect("the fixture created a group");
+        let metadata_op = metadata
+            .consensus
+            .as_ref()
+            .expect("the leader runs consensus")
+            .commit_min();
+        let primary = usize::from(
+            sim.primary_index(namespace)
+                .expect("the partition has a primary"),
+        );
+        let settled = sim
+            .installed_group_owner(primary, namespace, group_id)
+            .expect("the primary installed the settled owner");
+        assert!(
+            metadata_op > settled.generation,
+            "the forged owner must be newer"
+        );
+        let installation = InstallConsumerGroupOwnerRequest {
+            incarnation: sim
+                .partition_incarnation(primary, namespace)
+                .expect("the primary hosts the partition"),
+            group_id,
+            owner: ConsumerGroupOwner {
+                client_id: replacement.client_id(),
+                session: settled.session,
+                generation: metadata_op,
+            },
+            metadata_op,
+        };
+        let body = installation.to_bytes();
+        let size = size_of::<RoutedRequestHeader>() + body.len();
+        let mut request = Message::<RoutedRequestHeader>::new(size);
+        request.as_mut_slice()[size_of::<RoutedRequestHeader>()..].copy_from_slice(&body);
+        let request = request.transmute_header(|_, header: &mut RoutedRequestHeader| {
+            *header = RoutedRequestHeader {
+                command: Command::Request,
+                operation: Operation::InstallConsumerGroupOwner,
+                size: u32::try_from(size).expect("the install fits a frame"),
+                client: AUTO_COMMIT_CLIENT_ID,
+                session: 1,
+                request: metadata_op,
+                group: namespace.inner(),
+                partition_incarnation: installation.incarnation,
+                metadata_watermark: metadata_op,
+                ..Default::default()
+            };
+        });
+        let _ticket = sim.replicas[primary]
+            .partition_shard(namespace)
+            .partition_submit(namespace, request)
+            .expect("the owning shard takes the install");
+        assert!(
+            (0..INSTALL_STEPS).any(|_| {
+                sim.step();
+                sim.installed_group_owner(primary, namespace, group_id) == Some(installation.owner)
+            }),
+            "the primary must install the forged owner"
+        );
+
+        let _ = crate::workload::oracle::assert_converged(&sim, &mut workload);
+    }
+
+    /// Commit `count` sends on `namespace` through replica 0, then step until
+    /// every replica committed them all.
+    pub fn commit_sends_everywhere(
+        sim: &mut Simulator,
+        client: &SimClient,
+        namespace: IggyNamespace,
+        count: usize,
+    ) {
+        const PROGRESS_STEPS: usize = 4_000;
+        for index in 0..count {
+            let send = client.send_messages(namespace, &[Bytes::from(format!("message-{index}"))]);
+            let reply = submit_and_wait_for_reply(sim, client.client_id(), 0, send);
+            assert_eq!(reply.header().status, 0, "send {index} must commit");
+        }
+        let last = u64::try_from(count - 1).expect("a send count fits u64");
+        assert!(
+            (0..PROGRESS_STEPS).any(|_| {
+                sim.step();
+                (0..usize::from(sim.replica_count)).all(|replica_idx| {
+                    sim.offsets(replica_idx, namespace)
+                        .is_some_and(|offsets| offsets.commit_offset == last)
+                })
+            }),
+            "every replica must commit every send"
+        );
     }
 
     fn disconnect_group_assignment(sim: &Simulator, client_id: u128) -> Option<Vec<u32>> {
@@ -2155,6 +4950,7 @@ mod tests {
         original: &SimClient,
         replacement: &SimClient,
     ) {
+        const EXPIRY_STEPS: usize = 20_000;
         assert_eq!(
             disconnect_group_assignment(sim, original.client_id()),
             Some(vec![0]),
@@ -2165,55 +4961,24 @@ mod tests {
             Some(vec![]),
             "the replacement joins successfully but cannot poll any partition"
         );
-        let owner = Rc::clone(&sim.replicas[0].shards[0]);
-        let session = owner
-            .plane
-            .metadata()
-            .mux_stm
-            .streams()
-            .consumer_group_session(original.client_id())
-            .expect("the orphan retains its session even after client-table eviction");
         let original_id = original.client_id();
         let replacement_id = replacement.client_id();
-        let (complete, completed) = shard::channel(1);
-        // The simulator does not run the wall-clock liveness task. Exercise its
-        // committed cleanup separately from timeout selection and reporting.
-        sim.executor.spawn(async move {
-            let live = owner.gather_consumer_sessions().await;
-            assert!(live.complete);
-            assert!(
-                live.clients
-                    .iter()
-                    .all(|client| client.client_id != original_id),
-                "the real disconnect callback must remove the original connection"
-            );
-            assert!(
-                live.clients
-                    .iter()
-                    .any(|client| client.client_id == replacement_id)
-            );
-            let cleanup = owner
-                .plane
-                .metadata()
-                .submit_expired_logout_in_process(original_id, Some(session))
-                .await;
-            complete.try_send(cleanup).unwrap();
-        });
-        let cleanup = (0..DISCONNECT_PROGRESS_STEPS)
-            .find_map(|_| {
+        assert!(
+            (0..EXPIRY_STEPS).any(|step| {
+                if step % DISCONNECT_PROGRESS_STEPS == 0 {
+                    sim.submit_request(
+                        replacement_id,
+                        0,
+                        replacement.get_stream(DISCONNECT_STREAM).into_generic(),
+                    );
+                }
                 sim.step();
-                completed.recv().now_or_never()
-            })
-            .expect("session expiry cleanup must complete")
-            .expect("cleanup result channel stays open")
-            .expect("the primary must accept expiry cleanup");
-        assert!(cleanup.is_some(), "expiry must commit a Logout");
-        for _ in 0..DISCONNECT_PROGRESS_STEPS {
-            if disconnect_group_assignment(sim, replacement_id) == Some(vec![0]) {
-                break;
-            }
-            sim.step();
-        }
+                disconnect_group_assignment(sim, original_id).is_none()
+                    && disconnect_group_assignment(sim, replacement_id) == Some(vec![0])
+            }),
+            "the production liveness loop must expire the disconnected owner and reassign its partition"
+        );
+        assert!(sim.network.delivered_any(Command::ConsumerSessionHeartbeat));
         assert_eq!(disconnect_group_assignment(sim, original_id), None);
         assert_eq!(
             disconnect_group_assignment(sim, replacement_id),
@@ -2294,6 +5059,170 @@ mod tests {
         }
     }
 
+    /// A keyed create commits its wrap set on every replica, then a rewrap
+    /// replaces it there while an entry naming another incarnation is skipped.
+    #[test]
+    fn given_keyed_stream_when_rewrapped_should_store_the_new_set_on_every_replica() {
+        const PROGRESS_STEPS: usize = 4_000;
+        const STREAM: &str = "keyed";
+        let (mut sim, client) = cluster(0x5245_5752);
+        sim.register_client_with_primary(&client);
+        complete_metadata_op(&mut sim, &client, client.create_keyed_stream(STREAM));
+        let (stream_id, created_op) = keyed_stream(&sim, 0, STREAM);
+        for replica in 0..sim.replica_count {
+            assert_eq!(
+                keyed_stream_wrap_set(&sim, replica, STREAM),
+                Some(SIM_STREAM_WRAP_SET.to_vec())
+            );
+        }
+
+        let key_fingerprint = WrapSet::try_from(SIM_STREAM_WRAP_SET.as_slice())
+            .expect("a valid wrap set")
+            .key_fingerprint_bytes()
+            .try_into()
+            .expect("an eight byte fingerprint");
+        let request = RewrapStreamKeysRequest {
+            entries: vec![
+                RewrapStreamKeyEntry {
+                    stream_id,
+                    created_op,
+                    key_fingerprint,
+                    wrap_set: Bytes::from_static(&SIM_ROTATED_WRAP_SET),
+                },
+                RewrapStreamKeyEntry {
+                    stream_id,
+                    created_op: created_op + 1,
+                    key_fingerprint,
+                    wrap_set: Bytes::from_static(&SIM_STREAM_WRAP_SET),
+                },
+            ],
+        };
+        let primary = usize::from(sim.metadata_primary_index().expect("a metadata primary"));
+        let shard = Rc::clone(&sim.replicas[primary].shards[0]);
+        let committed = Rc::new(Cell::new(None));
+        let outcome = Rc::clone(&committed);
+        let task = sim.executor.spawn(async move {
+            let result = shard
+                .plane
+                .metadata()
+                .submit_rewrap_stream_keys_in_process(request)
+                .await;
+            outcome.set(Some(result.is_ok()));
+        });
+        sim.replicas[primary].pump_tasks.push(task);
+        assert!(
+            (0..PROGRESS_STEPS).any(|_| {
+                sim.step();
+                committed.get().is_some()
+                    && (0..sim.replica_count).all(|replica| {
+                        keyed_stream_wrap_set(&sim, replica, STREAM)
+                            == Some(SIM_ROTATED_WRAP_SET.to_vec())
+                    })
+            }),
+            "every replica must store the rewrapped set, and keep it past the stale entry"
+        );
+        assert_eq!(committed.get(), Some(true));
+    }
+
+    /// A user deactivating itself ends its own session on commit. Every replica
+    /// keeps that session's receipt, which a client table snapshot admits after
+    /// the session end only for a self-deactivation.
+    #[test]
+    fn given_shell_user_when_deactivating_itself_should_end_its_session_and_keep_the_receipt() {
+        const PROGRESS_STEPS: usize = 4_000;
+        const ROOT_CLIENT: u128 = 1;
+        const USER_CLIENT: u128 = 2;
+        const USERNAME: &str = "self-deactivating";
+        const PASSWORD: &str = "self-deactivating-password";
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+        let mut sim = Simulator::with_shards_shell(
+            3,
+            1,
+            [ROOT_CLIENT, USER_CLIENT].into_iter(),
+            PacketSimulatorOptions {
+                node_count: 3,
+                client_count: 2,
+                seed: 0x4445_4143,
+                ..Default::default()
+            },
+        );
+        let root = SimClient::new(ROOT_CLIENT);
+        sim.shell_login(&root);
+        let permissions = WirePermissions {
+            global: WireGlobalPermissions {
+                manage_servers: false,
+                read_servers: false,
+                manage_users: true,
+                read_users: true,
+                manage_streams: false,
+                read_streams: false,
+                manage_topics: false,
+                read_topics: false,
+                poll_messages: false,
+                send_messages: false,
+            },
+            streams: Vec::new(),
+        };
+        let created = submit_and_wait_for_reply(
+            &mut sim,
+            ROOT_CLIENT,
+            0,
+            root.create_user_with_permissions(
+                USERNAME,
+                PASSWORD,
+                iggy_common::UserStatus::Active.as_code(),
+                Some(permissions),
+            ),
+        );
+        assert_eq!(metadata::stm::result::result_code(created.body()), Some(0));
+
+        let user = SimClient::new(USER_CLIENT);
+        sim.shell_login_as(&user, 0, USERNAME, PASSWORD);
+        let deactivated = submit_and_wait_for_reply(
+            &mut sim,
+            USER_CLIENT,
+            0,
+            user.update_user(USERNAME, None, Some(iggy_common::UserStatus::Inactive)),
+        );
+        assert_eq!(deactivated.header().status, 0);
+        assert_eq!(
+            metadata::stm::result::result_code(deactivated.body()),
+            Some(0)
+        );
+
+        assert!(
+            (0..PROGRESS_STEPS).any(|_| {
+                sim.step();
+                sim.replicas.iter().all(|replica| {
+                    let table = replica.shards[0].plane.metadata().client_table.borrow();
+                    table.get_epoch(USER_CLIENT).is_none()
+                        && table
+                            .ended_sessions()
+                            .any(|session| session.client_id == USER_CLIENT)
+                })
+            }),
+            "every replica must end the deactivated user's session"
+        );
+        for replica in &sim.replicas {
+            let table = replica.shards[0].plane.metadata().client_table.borrow();
+            assert_eq!(
+                table
+                    .get_reply(USER_CLIENT)
+                    .expect("the ended session keeps its receipt")
+                    .header()
+                    .operation,
+                Operation::UpdateUserResolved
+            );
+            assert!(
+                consensus::client_table::ClientTable::from_snapshot(table.to_snapshot()).is_ok()
+            );
+        }
+    }
+
     pub fn submit_and_wait_for_reply(
         sim: &mut Simulator,
         client_id: u128,
@@ -2312,6 +5241,80 @@ mod tests {
             }
         }
         panic!("request {request_id} did not receive a reply");
+    }
+
+    /// `(stream id, created op)` of `name` on `replica`.
+    fn keyed_stream(sim: &Simulator, replica: u8, name: &str) -> (u32, u64) {
+        let streams = sim.replicas[usize::from(replica)].shards[0]
+            .plane
+            .metadata()
+            .mux_stm
+            .streams();
+        let stream_id = streams
+            .resolve_stream_id(&WireIdentifier::named(name).expect("valid name"))
+            .expect("the stream is committed");
+        let created_op = streams.read(|inner| {
+            inner
+                .items
+                .get(stream_id)
+                .expect("the stream is committed")
+                .created_op
+        });
+        (
+            u32::try_from(stream_id).expect("stream id fits u32"),
+            created_op,
+        )
+    }
+
+    /// The wrap set `replica` stores for stream `name`.
+    fn keyed_stream_wrap_set(sim: &Simulator, replica: u8, name: &str) -> Option<Vec<u8>> {
+        let streams = sim.replicas[usize::from(replica)].shards[0]
+            .plane
+            .metadata()
+            .mux_stm
+            .streams();
+        let stream_id = streams.resolve_stream_id(&WireIdentifier::named(name).ok()?)?;
+        streams.read(|inner| {
+            inner.items.get(stream_id).and_then(|stream| {
+                stream
+                    .options
+                    .get(&HeaderKey::from(OptionKey::EncryptionKeyWrapped))
+                    .map(|wrapped| wrapped.value.as_bytes().to_vec())
+            })
+        })
+    }
+
+    /// Submit a metadata op to replica 0 and step until every live replica applied
+    /// it and finished its lifecycle. Deletes reply before their partition fences
+    /// install.
+    pub fn complete_metadata_op(
+        sim: &mut Simulator,
+        client: &SimClient,
+        request: Message<RoutedRequestHeader>,
+    ) {
+        const PROGRESS_STEPS: usize = 4_000;
+        let reply = submit_and_wait_for_reply(sim, client.client_id(), 0, request);
+        let code = metadata::stm::result::result_code(reply.body());
+        assert!(
+            code == Some(0) || code == Some(IggyError::TransientNotCommitted.as_code()),
+            "unexpected result code {code:?}"
+        );
+        let op = reply.header().op;
+        assert!(
+            (0..PROGRESS_STEPS).any(|_| {
+                sim.step();
+                (0..sim.replica_count)
+                    .filter(|replica_idx| !sim.is_crashed(*replica_idx))
+                    .all(|replica_idx| {
+                        let metadata = sim.replicas[usize::from(replica_idx)].shards[0]
+                            .plane
+                            .metadata();
+                        metadata.applied_frontier().get() >= op
+                            && !metadata.mux_stm.streams().lifecycle_pending(op)
+                    })
+            }),
+            "metadata op {op} must complete on every live replica"
+        );
     }
 
     /// The simulator helper must yield while its owner runs, then return the
@@ -2586,6 +5589,1316 @@ mod tests {
         }
     }
 
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn given_metadata_entries_below_a_new_view_suffix_when_adopting_should_refill_before_apply() {
+        const BACKUP: usize = 1;
+        const NEW_VIEW: u32 = 2;
+        const LOCAL_ENTRIES: usize = 2;
+        for fail_truncation in [false, true] {
+            let (mut sim, client) = cluster(0x5EED_0310);
+            sim.register_client_with_primary(&client);
+            let registered = sim.replicas[0].shards[0]
+                .plane
+                .metadata()
+                .consensus
+                .as_ref()
+                .unwrap()
+                .commit_min();
+            for _ in 0..SETUP_TOTAL_STEPS {
+                if sim.replicas[BACKUP].shards[0]
+                    .plane
+                    .metadata()
+                    .consensus
+                    .as_ref()
+                    .unwrap()
+                    .commit_min()
+                    == registered
+                {
+                    break;
+                }
+                sim.step();
+            }
+            let primary = Rc::clone(&sim.replicas[0].shards[0]);
+            let shard = Rc::clone(&sim.replicas[BACKUP].shards[0]);
+            let outbox = Rc::clone(&sim.outboxes[BACKUP]);
+            complete_now(&mut sim, async move {
+                let metadata = shard.plane.metadata();
+                let consensus = metadata.consensus.as_ref().unwrap();
+                let journal = metadata.journal.as_ref().unwrap();
+                let applied = consensus.commit_min();
+                assert_eq!(applied, registered);
+                let source_metadata = primary.plane.metadata();
+                let source = source_metadata.consensus.as_ref().unwrap();
+                let mut prepares = Vec::new();
+                for name in [
+                    "retained-first",
+                    "retained-second",
+                    "repair-gap",
+                    "repair-head",
+                ] {
+                    let prepare = consensus::seal_prepare_capacity(
+                        client.create_stream(name).project(source),
+                        source.retry_capacity(&source_metadata.client_table.borrow()),
+                    );
+                    source.sequencer().set_sequence(prepare.header().op);
+                    source.set_last_prepare_checksum(prepare.header().checksum);
+                    prepares.push(prepare);
+                }
+                for (index, prepare) in prepares.iter().take(LOCAL_ENTRIES).enumerate() {
+                    let entry = if fail_truncation && index == 0 {
+                        prepare
+                            .clone()
+                            .transmute_header(|mut header, next: &mut PrepareHeader| {
+                                header.client += 1;
+                                header.checksum = header.identity_checksum();
+                                *next = header;
+                            })
+                    } else {
+                        prepare.clone()
+                    };
+                    journal.handle().append(entry).await.unwrap();
+                }
+                let old_head = prepares[LOCAL_ENTRIES - 1].header().op;
+                let suffix_head = *prepares.last().unwrap().header();
+                consensus.sequencer().set_sequence(old_head);
+                let canonical: Vec<_> = if fail_truncation {
+                    prepares
+                        .iter()
+                        .rev()
+                        .map(|prepare| *prepare.header())
+                        .collect()
+                } else {
+                    vec![suffix_head]
+                };
+                if fail_truncation {
+                    journal.fail_next_truncate();
+                }
+                let header_size = size_of::<iggy_binary_protocol::StartViewHeader>();
+                let mut message = Message::<iggy_binary_protocol::StartViewHeader>::new(
+                    header_size + std::mem::size_of_val(canonical.as_slice()),
+                );
+                consensus::encode_prepare_headers(
+                    &canonical,
+                    &mut message.as_mut_slice()[header_size..],
+                );
+                let checksum_body = u128::from(iggy_common::calculate_checksum(
+                    &message.as_slice()[header_size..],
+                ));
+                let total = message.as_slice().len();
+                let message = message.transmute_header(
+                    |_, header: &mut iggy_binary_protocol::StartViewHeader| {
+                        header.command = Command::StartView;
+                        header.cluster = consensus.cluster();
+                        header.group = METADATA_GROUP;
+                        header.view = NEW_VIEW;
+                        header.replica = u8::try_from(NEW_VIEW).unwrap();
+                        header.op = suffix_head.op;
+                        header.commit = suffix_head.op;
+                        header.size = u32::try_from(total).unwrap();
+                        header.checksum_body = checksum_body;
+                        header.seal();
+                    },
+                );
+                shard
+                    .on_message(MessageBag::StartView(message.clone()))
+                    .await;
+                assert_eq!(consensus.commit_min(), applied);
+                assert!(
+                    journal
+                        .handle()
+                        .header(usize::try_from(applied + 1).unwrap())
+                        .is_some()
+                );
+                assert!(
+                    journal
+                        .handle()
+                        .header(usize::try_from(old_head).unwrap())
+                        .is_some()
+                );
+                assert!(consensus.view_log_unproven());
+                assert!(!consensus.view_log_entry_proven(applied + 1));
+
+                outbox.drain();
+                let request =
+                    Message::<iggy_binary_protocol::RequestPreparesHeader>::new(size_of::<
+                        iggy_binary_protocol::RequestPreparesHeader,
+                    >(
+                    ))
+                    .transmute_header(
+                        |_, header: &mut iggy_binary_protocol::RequestPreparesHeader| {
+                            header.command = Command::RequestPrepares;
+                            header.cluster = consensus.cluster();
+                            header.group = METADATA_GROUP;
+                            header.replica = 0;
+                            header.view = NEW_VIEW;
+                            header.from_op = applied + 1;
+                            header.to_op = old_head;
+                            header.size = u32::try_from(std::mem::size_of_val(header)).unwrap();
+                            header.seal();
+                        },
+                    );
+                shard.on_message(MessageBag::RequestPrepares(request)).await;
+                assert!(
+                    outbox.drain().is_empty(),
+                    "unproved entries cannot serve peer repair"
+                );
+
+                if fail_truncation {
+                    shard.on_message(MessageBag::StartView(message)).await;
+                    assert_eq!(consensus.view(), NEW_VIEW);
+                    assert!(
+                        journal
+                            .handle()
+                            .header(usize::try_from(applied + 1).unwrap())
+                            .is_none(),
+                        "the same-view retry must remove the proven mismatch"
+                    );
+                    assert!(
+                        journal
+                            .handle()
+                            .header(usize::try_from(old_head).unwrap())
+                            .is_some(),
+                        "removing a mismatch must preserve the canonical tail"
+                    );
+                }
+                for prepare in prepares.iter().rev() {
+                    let repaired = prepare.clone().transmute_header(
+                        |header, repaired: &mut iggy_binary_protocol::RepairPrepareHeader| {
+                            repaired.0 = header;
+                            repaired.0.command = Command::RepairPrepare;
+                        },
+                    );
+                    shard.on_message(MessageBag::RepairPrepare(repaired)).await;
+                }
+                assert!(!consensus.view_log_unproven());
+                metadata.commit_journal().await;
+                assert_eq!(consensus.commit_min(), suffix_head.op);
+                for prepare in prepares {
+                    assert_eq!(
+                        journal
+                            .handle()
+                            .header(usize::try_from(prepare.header().op).unwrap())
+                            .unwrap()
+                            .checksum,
+                        prepare.header().checksum
+                    );
+                }
+            });
+        }
+    }
+    /// Where a backup crashes while it reconciles a `StartView` whose log conflicts
+    /// with the suffix it journaled in an older view.
+    #[derive(Debug, Clone, Copy)]
+    enum ViewLogCrash {
+        /// The divergent suffix is still in the WAL: its removal failed.
+        RemovalFailed,
+        /// The suffix is gone and one op of the adopted log was refilled.
+        RefillLanded,
+        /// The whole adopted log is proven.
+        Proven,
+    }
+
+    /// A metadata `StartView` from `primary`, carrying `suffix` highest op first.
+    fn metadata_start_view(
+        cluster: u128,
+        view: u32,
+        primary: u8,
+        commit: u64,
+        suffix: &[PrepareHeader],
+    ) -> Message<iggy_binary_protocol::StartViewHeader> {
+        let header_size = size_of::<iggy_binary_protocol::StartViewHeader>();
+        let mut message = Message::<iggy_binary_protocol::StartViewHeader>::new(
+            header_size + std::mem::size_of_val(suffix),
+        );
+        consensus::encode_prepare_headers(suffix, &mut message.as_mut_slice()[header_size..]);
+        let checksum_body = u128::from(iggy_common::calculate_checksum(
+            &message.as_slice()[header_size..],
+        ));
+        let total = message.as_slice().len();
+        message.transmute_header(|_, header: &mut iggy_binary_protocol::StartViewHeader| {
+            header.command = Command::StartView;
+            header.cluster = cluster;
+            header.group = METADATA_GROUP;
+            header.view = view;
+            header.replica = primary;
+            header.op = suffix[0].op;
+            header.commit = commit;
+            header.size = u32::try_from(total).unwrap();
+            header.checksum_body = checksum_body;
+            header.seal();
+        })
+    }
+
+    fn as_repair_prepare(
+        prepare: &Message<PrepareHeader>,
+    ) -> Message<iggy_binary_protocol::RepairPrepareHeader> {
+        prepare.clone().transmute_header(
+            |header, repaired: &mut iggy_binary_protocol::RepairPrepareHeader| {
+                repaired.0 = header;
+                repaired.0.command = Command::RepairPrepare;
+            },
+        )
+    }
+
+    /// A backup journals an old view's suffix, adopts a view whose log conflicts with
+    /// it, records the adopted view, and crashes before the log is proven. It must
+    /// recover the adopted head and exact identities independently of its older
+    /// body certificate. Repaired matching bodies survive, divergent ones do not.
+    /// With the primary gone the survivors must still start a later view.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn given_an_unproven_adopted_view_when_the_backup_restarts_should_restore_identity_and_body_proof()
+     {
+        const BACKUP: u8 = 1;
+        const PEER: u8 = 2;
+        const OLD_VIEW: u32 = 0;
+        // Led by replica 0, which crashes before the backups move on.
+        const ADOPTED_VIEW: u32 = 3;
+        const CONVERGE_STEPS: u32 = 3 * SETUP_TOTAL_STEPS;
+        for crash in [
+            ViewLogCrash::RemovalFailed,
+            ViewLogCrash::RefillLanded,
+            ViewLogCrash::Proven,
+        ] {
+            let (mut sim, client) = cluster(0x5EED_0C06);
+            sim.register_client_with_primary(&client);
+            let commit_min = |sim: &Simulator, replica: u8| {
+                sim.replicas[usize::from(replica)].shards[0]
+                    .plane
+                    .metadata()
+                    .consensus
+                    .as_ref()
+                    .unwrap()
+                    .commit_min()
+            };
+            let registered = commit_min(&sim, 0);
+            for _ in 0..SETUP_TOTAL_STEPS {
+                if [BACKUP, PEER]
+                    .iter()
+                    .all(|&replica| commit_min(&sim, replica) == registered)
+                {
+                    break;
+                }
+                sim.step();
+            }
+            let primary = Rc::clone(&sim.replicas[0].shards[0]);
+            let backup = Rc::clone(&sim.replicas[usize::from(BACKUP)].shards[0]);
+            let peer = Rc::clone(&sim.replicas[usize::from(PEER)].shards[0]);
+            let adopted = complete_now(&mut sim, async move {
+                let source_metadata = primary.plane.metadata();
+                let source = source_metadata.consensus.as_ref().unwrap();
+                let base_op = source.sequencer().current_sequence();
+                let base_checksum = source.last_prepare_checksum();
+                assert_eq!(base_op, registered);
+                // Two logs over the same committed prefix, as two views decide them.
+                let build = |names: [&str; 2]| -> Vec<Message<PrepareHeader>> {
+                    source.sequencer().set_sequence(base_op);
+                    source.set_last_prepare_checksum(base_checksum);
+                    names
+                        .into_iter()
+                        .map(|name| {
+                            let prepare = consensus::seal_prepare_capacity(
+                                client.create_stream(name).project(source),
+                                source.retry_capacity(&source_metadata.client_table.borrow()),
+                            );
+                            source.sequencer().set_sequence(prepare.header().op);
+                            source.set_last_prepare_checksum(prepare.header().checksum);
+                            prepare
+                        })
+                        .collect()
+                };
+                let old_suffix = build(["old-view-first", "old-view-second"]);
+                let adopted = build(["adopted-view-first", "adopted-view-second"]);
+                source.sequencer().set_sequence(base_op);
+                source.set_last_prepare_checksum(base_checksum);
+                let commit_point = *source_metadata
+                    .journal
+                    .as_ref()
+                    .unwrap()
+                    .handle()
+                    .header(usize::try_from(base_op).unwrap())
+                    .unwrap();
+                let start_view = metadata_start_view(
+                    source.cluster(),
+                    ADOPTED_VIEW,
+                    0,
+                    base_op,
+                    &[*adopted[1].header(), *adopted[0].header(), commit_point],
+                );
+
+                for prepare in &old_suffix {
+                    backup
+                        .on_message(MessageBag::Prepare(prepare.clone()))
+                        .await;
+                }
+                let backup_metadata = backup.plane.metadata();
+                let backup_consensus = backup_metadata.consensus.as_ref().unwrap();
+                let backup_journal = backup_metadata.journal.as_ref().unwrap();
+                for prepare in &old_suffix {
+                    let slot = usize::try_from(prepare.header().op).unwrap();
+                    assert_eq!(
+                        backup_journal
+                            .handle()
+                            .header(slot)
+                            .map(|held| held.checksum),
+                        Some(prepare.header().checksum),
+                        "the backup journals the old view's suffix"
+                    );
+                }
+
+                peer.on_message(MessageBag::StartView(start_view.clone()))
+                    .await;
+                for prepare in adopted.iter().rev() {
+                    peer.on_message(MessageBag::RepairPrepare(as_repair_prepare(prepare)))
+                        .await;
+                }
+                let peer_metadata = peer.plane.metadata();
+                let peer_consensus = peer_metadata.consensus.as_ref().unwrap();
+                assert!(
+                    !peer_consensus.view_log_unproven(),
+                    "the peer proves the log"
+                );
+                assert!(
+                    peer_metadata
+                        .persist_superblock_if_needed(peer_consensus)
+                        .await
+                );
+
+                if matches!(crash, ViewLogCrash::RemovalFailed) {
+                    backup_journal.fail_next_truncate();
+                }
+                backup.on_message(MessageBag::StartView(start_view)).await;
+                assert_eq!(backup_consensus.log_view(), ADOPTED_VIEW);
+                match crash {
+                    ViewLogCrash::RemovalFailed => {}
+                    ViewLogCrash::RefillLanded => {
+                        backup
+                            .on_message(MessageBag::RepairPrepare(as_repair_prepare(&adopted[0])))
+                            .await;
+                    }
+                    ViewLogCrash::Proven => {
+                        for prepare in adopted.iter().rev() {
+                            backup
+                                .on_message(MessageBag::RepairPrepare(as_repair_prepare(prepare)))
+                                .await;
+                        }
+                    }
+                }
+                assert_eq!(
+                    backup_consensus.view_log_unproven(),
+                    !matches!(crash, ViewLogCrash::Proven)
+                );
+                // What the tick would do next: record the adopted view.
+                assert!(
+                    backup_metadata
+                        .persist_superblock_if_needed(backup_consensus)
+                        .await
+                );
+                adopted
+                    .iter()
+                    .map(|prepare| *prepare.header())
+                    .collect::<Vec<_>>()
+            });
+
+            sim.replica_crash(0);
+            sim.replica_crash(BACKUP);
+            sim.replica_restart(BACKUP);
+            {
+                let metadata = sim.replicas[usize::from(BACKUP)].shards[0].plane.metadata();
+                let consensus = metadata.consensus.as_ref().unwrap();
+                let held = metadata
+                    .journal
+                    .as_ref()
+                    .unwrap()
+                    .handle()
+                    .header(usize::try_from(adopted[0].op).unwrap())
+                    .map(|header| header.checksum);
+                assert_eq!(consensus.log_view(), ADOPTED_VIEW, "{crash:?}");
+                assert_eq!(consensus.log_view_claim(), ADOPTED_VIEW, "{crash:?}");
+                assert_eq!(
+                    consensus.adopted_view_head(),
+                    Some((ADOPTED_VIEW, adopted[1].op))
+                );
+                let proven = matches!(crash, ViewLogCrash::Proven);
+                assert_eq!(consensus.view_log_unproven(), !proven, "{crash:?}");
+                assert_eq!(
+                    consensus.history_certificate().unwrap().view,
+                    if proven { ADOPTED_VIEW } else { OLD_VIEW },
+                    "{crash:?}"
+                );
+                assert_eq!(
+                    held,
+                    (!matches!(crash, ViewLogCrash::RemovalFailed)).then_some(adopted[0].checksum),
+                    "{crash:?}: only the vouched repaired body may survive",
+                );
+            }
+
+            let adopted_view_holder = |sim: &Simulator, replica: u8| {
+                let metadata = sim.replicas[usize::from(replica)].shards[0]
+                    .plane
+                    .metadata();
+                let consensus = metadata.consensus.as_ref().unwrap();
+                let journal = metadata.journal.as_ref().unwrap();
+                let holds_log = adopted.iter().all(|header| {
+                    journal
+                        .handle()
+                        .header(usize::try_from(header.op).unwrap())
+                        .is_some_and(|held| held.checksum == header.checksum)
+                });
+                (consensus.status() == Status::Normal
+                    && !consensus.view_log_unproven()
+                    && consensus.view() > ADOPTED_VIEW
+                    && holds_log)
+                    .then(|| consensus.view())
+            };
+            let mut converged = None;
+            for _ in 0..CONVERGE_STEPS {
+                let views = (
+                    adopted_view_holder(&sim, BACKUP),
+                    adopted_view_holder(&sim, PEER),
+                );
+                if let (Some(backup_view), Some(peer_view)) = views
+                    && backup_view == peer_view
+                {
+                    converged = Some(backup_view);
+                    break;
+                }
+                sim.step();
+            }
+            assert!(
+                converged.is_some(),
+                "{crash:?}: the backup and its peer never started a view past {ADOPTED_VIEW} \
+                 holding the adopted log"
+            );
+        }
+    }
+
+    /// A record from a build without history certificates proves nothing about the
+    /// WAL beside it. The restarted replica may hold ops a quorum committed in a view
+    /// it can no longer claim, so when its view probe goes unanswered it must not
+    /// elect under a lower `log_view` with the one peer left. It waits for the
+    /// `StartView` of an election it took no part in, proves its log against it, and
+    /// records a certificate.
+    #[test]
+    fn given_a_record_without_a_history_certificate_when_no_primary_answers_should_wait_for_a_start_view()
+     {
+        const LEGACY: u8 = 1;
+        const PEER: u8 = 2;
+        // Several times what an unanswered probe takes to fall back to an election.
+        const PROBE_STEPS: u32 = 3 * SETUP_TOTAL_STEPS;
+        const CONVERGE_STEPS: u32 = 3 * SETUP_TOTAL_STEPS;
+        let (mut sim, client) = cluster(0x5EED_0C07);
+        sim.register_client_with_primary(&client);
+        let with_consensus = |sim: &Simulator, replica: u8| {
+            let metadata = sim.replicas[usize::from(replica)].shards[0]
+                .plane
+                .metadata();
+            let consensus = metadata.consensus.as_ref().unwrap();
+            (
+                consensus.status(),
+                consensus.view_log_unproven(),
+                consensus.history_certified(),
+                consensus.recovery_election_allowed(),
+                consensus.commit_min(),
+            )
+        };
+        let registered = with_consensus(&sim, 0).4;
+        for _ in 0..SETUP_TOTAL_STEPS {
+            if [LEGACY, PEER]
+                .iter()
+                .all(|&replica| with_consensus(&sim, replica).4 == registered)
+            {
+                break;
+            }
+            sim.step();
+        }
+        let legacy_record = sim.replicas[usize::from(LEGACY)].shards[0]
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+            .unwrap()
+            .vsr_state(0, 0)
+            .with_history_certificate(None);
+
+        sim.replica_crash(0);
+        sim.replica_crash(LEGACY);
+        let superblock = Rc::clone(&sim.replicas[usize::from(LEGACY)].superblock);
+        journal::superblock::SuperblockStore::write(&*superblock, &legacy_record.to_bytes())
+            .now_or_never()
+            .expect("the simulated superblock writes on first poll")
+            .expect("the simulated superblock accepts the record");
+        sim.replica_restart(LEGACY);
+        let (status, unproven, _, election_allowed, _) = with_consensus(&sim, LEGACY);
+        assert_eq!(status, Status::Recovering);
+        assert!(unproven, "nothing proves the restarted WAL");
+        assert!(!election_allowed);
+
+        for _ in 0..PROBE_STEPS {
+            sim.step();
+        }
+        assert_eq!(
+            with_consensus(&sim, LEGACY).0,
+            Status::Recovering,
+            "an unanswered probe let an unproven log vote"
+        );
+        assert_ne!(
+            with_consensus(&sim, PEER).0,
+            Status::Normal,
+            "one peer started a view without a quorum"
+        );
+
+        sim.replica_restart(0);
+        let mut certified = false;
+        for _ in 0..CONVERGE_STEPS {
+            let (status, unproven, history_certified, election_allowed, _) =
+                with_consensus(&sim, LEGACY);
+            let recorded = superblock
+                .read_latest_sync()
+                .and_then(|bytes| consensus::VsrState::try_from(&bytes[..]).ok())
+                .is_some_and(|state| {
+                    state
+                        .history_certificate()
+                        .is_some_and(|certificate| certificate.view == state.log_view)
+                });
+            if status == Status::Normal
+                && !unproven
+                && history_certified
+                && election_allowed
+                && recorded
+            {
+                certified = true;
+                break;
+            }
+            sim.step();
+        }
+        assert!(
+            certified,
+            "the restarted replica never proved its log against the new view and recorded it"
+        );
+    }
+
+    /// A restarted backup adopts the view and arms repair up to the head the
+    /// `StartView` names. A second `StartView` of the same view raises the head
+    /// while that session stands, and the window's terminator is lost, so the
+    /// session closes one op short of what the view-log proof waits on. The walk
+    /// refuses the unproven log and no commit edge comes, since the backup's
+    /// commit point already matches the primary's. Only the tick can arm the rest.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn given_a_repair_window_below_the_proof_op_when_the_session_closes_should_arm_the_rest_from_the_tick()
+     {
+        const PRIMARY: u8 = 0;
+        const BACKUP: u8 = 2;
+        const MISSED_OPS: u64 = 2;
+        // The stall retry that closes the short window, the gap debounce, then
+        // the repair round trip, with margin.
+        const HEAL_STEPS: u32 = 4 * partitions::REPAIR_RETRY_TICKS;
+        // Probe answers would re-adopt the view and arm repair on their own, and a
+        // lost terminator is what leaves the stall retry to close the window.
+        fn starve_backup(packet: &packet::Packet) -> bool {
+            matches!(
+                packet.message.header().command,
+                Command::StartView | Command::RepairDone
+            )
+        }
+
+        let (mut sim, client) = cluster(0x5EED_0C08);
+        sim.register_client_with_primary(&client);
+        let consensus_at = |sim: &Simulator, replica: u8| {
+            let metadata = sim.replicas[usize::from(replica)].shards[0]
+                .plane
+                .metadata();
+            let consensus = metadata.consensus.as_ref().unwrap();
+            (
+                consensus.status(),
+                consensus.view(),
+                consensus.view_log_unproven(),
+                consensus.commit_min(),
+                consensus.commit_max(),
+            )
+        };
+        let base = consensus_at(&sim, PRIMARY).3;
+        for _ in 0..SETUP_TOTAL_STEPS {
+            if consensus_at(&sim, BACKUP).3 == base {
+                break;
+            }
+            sim.step();
+        }
+        assert_eq!(consensus_at(&sim, BACKUP).3, base);
+
+        sim.replica_crash(BACKUP);
+        let head = base + MISSED_OPS;
+        for index in 0..MISSED_OPS {
+            let msg = client.create_stream(&format!("missed-{index}"));
+            sim.submit_request(client.client_id(), PRIMARY, msg.into_generic());
+            for _ in 0..SETUP_TOTAL_STEPS {
+                if consensus_at(&sim, PRIMARY).3 == base + index + 1 {
+                    break;
+                }
+                sim.step();
+            }
+        }
+        assert_eq!(consensus_at(&sim, PRIMARY).3, head);
+
+        let primary_metadata = sim.replicas[usize::from(PRIMARY)].shards[0]
+            .plane
+            .metadata();
+        let cluster_id = primary_metadata.consensus.as_ref().unwrap().cluster();
+        let header_at = |op: u64| {
+            *primary_metadata
+                .journal
+                .as_ref()
+                .unwrap()
+                .handle()
+                .header(usize::try_from(op).unwrap())
+                .unwrap()
+        };
+        let first_head = metadata_start_view(
+            cluster_id,
+            0,
+            PRIMARY,
+            head - 1,
+            &[header_at(head - 1), header_at(base)],
+        );
+        let raised_head = metadata_start_view(
+            cluster_id,
+            0,
+            PRIMARY,
+            head,
+            &[header_at(head), header_at(head - 1), header_at(base)],
+        );
+
+        sim.replica_restart(BACKUP);
+        assert_eq!(consensus_at(&sim, BACKUP).0, Status::Recovering);
+        for peer in [PRIMARY, 1] {
+            *sim.network
+                .link_drop_packet_fn(ProcessId::Replica(peer), ProcessId::Replica(BACKUP)) =
+                Some(starve_backup);
+        }
+        let backup = Rc::clone(&sim.replicas[usize::from(BACKUP)].shards[0]);
+        complete_now(&mut sim, async move {
+            backup.on_message(MessageBag::StartView(first_head)).await;
+            backup.on_message(MessageBag::StartView(raised_head)).await;
+        });
+        let (status, view, unproven, _, commit_max) = consensus_at(&sim, BACKUP);
+        assert_eq!((status, view, unproven), (Status::Normal, 0, true));
+        assert_eq!(commit_max, head);
+        assert_eq!(
+            sim.replicas[usize::from(BACKUP)].shards[0].metadata_repair_window(),
+            Some((head - 1, PRIMARY)),
+            "the session armed for the first head must stand when the head is raised"
+        );
+
+        for _ in 0..HEAL_STEPS {
+            if consensus_at(&sim, BACKUP).3 == head {
+                break;
+            }
+            sim.step();
+        }
+        let (status, view, unproven, commit_min, _) = consensus_at(&sim, BACKUP);
+        assert_eq!(
+            (status, view),
+            (Status::Normal, 0),
+            "a view change healed the backup instead of the repair driver"
+        );
+        assert_eq!(
+            (commit_min, unproven),
+            (head, false),
+            "the backup never proved op {head}: its repair window closed at {}, and \
+             nothing armed the rest",
+            head - 1
+        );
+    }
+
+    /// The test above without a lag below the frontier. A lost quorum leaves
+    /// every op above `base` uncommitted, so the restarted backup's commit point
+    /// matches the primary's and no commit edge or walk can follow. Its window
+    /// closes below the op the raised head's proof waits on, and only a probe
+    /// that reads the proof's op can arm the rest.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn given_a_proof_op_above_a_caught_up_commit_point_when_the_session_closes_should_arm_the_rest_from_the_tick()
+     {
+        const REPLICA_COUNT: u8 = 3;
+        const PRIMARY: u8 = 0;
+        const DOWN: u8 = 1;
+        const BACKUP: u8 = 2;
+        // One op each: a client has one request in flight.
+        const CLIENTS: [u128; 3] = [1, 2, 3];
+        const HEAL_STEPS: u32 = 4 * partitions::REPAIR_RETRY_TICKS;
+        fn drop_prepare_ok(packet: &packet::Packet) -> bool {
+            packet.message.header().command == Command::PrepareOk
+        }
+        fn starve_backup(packet: &packet::Packet) -> bool {
+            matches!(
+                packet.message.header().command,
+                Command::StartView | Command::RepairDone
+            )
+        }
+        fn journal_holds(sim: &Simulator, replica: u8, op: u64) -> bool {
+            sim.replicas[usize::from(replica)].shards[0]
+                .plane
+                .metadata()
+                .journal
+                .as_ref()
+                .unwrap()
+                .handle()
+                .header(usize::try_from(op).unwrap())
+                .is_some()
+        }
+        fn submit_until_journaled(sim: &mut Simulator, client: &SimClient, replica: u8, op: u64) {
+            let msg = client.create_stream(&format!("uncommitted-{op}"));
+            sim.submit_request(client.client_id(), PRIMARY, msg.into_generic());
+            for _ in 0..SETUP_TOTAL_STEPS {
+                if journal_holds(sim, replica, op) {
+                    break;
+                }
+                sim.step();
+            }
+            assert!(
+                journal_holds(sim, replica, op),
+                "replica {replica} never journaled op {op}"
+            );
+        }
+
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+        let mut sim = Simulator::new(
+            usize::from(REPLICA_COUNT),
+            CLIENTS.iter().copied(),
+            packet::PacketSimulatorOptions {
+                node_count: REPLICA_COUNT,
+                client_count: u8::try_from(CLIENTS.len()).expect("test clients fit u8"),
+                seed: 0x5EED_0C11,
+                ..packet::PacketSimulatorOptions::default()
+            },
+        );
+        let clients = CLIENTS.map(SimClient::new);
+        for client in &clients {
+            sim.register_client_with_primary(client);
+        }
+        let consensus_at = |sim: &Simulator, replica: u8| {
+            let metadata = sim.replicas[usize::from(replica)].shards[0]
+                .plane
+                .metadata();
+            let consensus = metadata.consensus.as_ref().unwrap();
+            (
+                consensus.status(),
+                consensus.view(),
+                consensus.view_log_unproven(),
+                consensus.commit_min(),
+                consensus.commit_max(),
+            )
+        };
+        let base = consensus_at(&sim, PRIMARY).3;
+        for _ in 0..SETUP_TOTAL_STEPS {
+            if consensus_at(&sim, BACKUP).3 == base {
+                break;
+            }
+            sim.step();
+        }
+        assert_eq!(consensus_at(&sim, BACKUP).3, base);
+
+        // The backup journals the first op, whose stamp makes `base` its
+        // recovered commit point, but its ack is lost, so nothing above `base`
+        // can commit.
+        sim.replica_crash(DOWN);
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(BACKUP), ProcessId::Replica(PRIMARY)) =
+            Some(drop_prepare_ok);
+        submit_until_journaled(&mut sim, &clients[0], BACKUP, base + 1);
+        sim.replica_crash(BACKUP);
+        submit_until_journaled(&mut sim, &clients[1], PRIMARY, base + 2);
+        submit_until_journaled(&mut sim, &clients[2], PRIMARY, base + 3);
+        let head = base + 3;
+        assert_eq!(consensus_at(&sim, PRIMARY).4, base);
+
+        let primary_metadata = sim.replicas[usize::from(PRIMARY)].shards[0]
+            .plane
+            .metadata();
+        let cluster_id = primary_metadata.consensus.as_ref().unwrap().cluster();
+        let header_at = |op: u64| {
+            *primary_metadata
+                .journal
+                .as_ref()
+                .unwrap()
+                .handle()
+                .header(usize::try_from(op).unwrap())
+                .unwrap()
+        };
+        let first_head = metadata_start_view(
+            cluster_id,
+            0,
+            PRIMARY,
+            base,
+            &[header_at(head - 1), header_at(base + 1), header_at(base)],
+        );
+        let raised_head = metadata_start_view(
+            cluster_id,
+            0,
+            PRIMARY,
+            base,
+            &[
+                header_at(head),
+                header_at(head - 1),
+                header_at(base + 1),
+                header_at(base),
+            ],
+        );
+
+        sim.replica_restart(BACKUP);
+        let (status, _, _, commit_min, _) = consensus_at(&sim, BACKUP);
+        assert_eq!((status, commit_min), (Status::Recovering, base));
+        for peer in [PRIMARY, DOWN] {
+            *sim.network
+                .link_drop_packet_fn(ProcessId::Replica(peer), ProcessId::Replica(BACKUP)) =
+                Some(starve_backup);
+        }
+        let backup = Rc::clone(&sim.replicas[usize::from(BACKUP)].shards[0]);
+        complete_now(&mut sim, async move {
+            backup.on_message(MessageBag::StartView(first_head)).await;
+            backup.on_message(MessageBag::StartView(raised_head)).await;
+        });
+        assert_eq!(
+            consensus_at(&sim, BACKUP),
+            (Status::Normal, 0, true, base, base)
+        );
+        assert_eq!(
+            sim.replicas[usize::from(BACKUP)].shards[0].metadata_repair_window(),
+            Some((head - 1, PRIMARY)),
+            "the session armed for the first head must stand when the head is raised"
+        );
+
+        for _ in 0..HEAL_STEPS {
+            if !consensus_at(&sim, BACKUP).2 {
+                break;
+            }
+            sim.step();
+        }
+        let (status, view, unproven, _, _) = consensus_at(&sim, BACKUP);
+        assert_eq!(
+            (status, view),
+            (Status::Normal, 0),
+            "a view change healed the backup instead of the repair driver"
+        );
+        assert!(
+            !unproven,
+            "the backup never proved op {head}: its repair window closed at {}, and \
+             nothing armed the rest",
+            head - 1
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn given_metadata_promotion_after_commit_resume_when_the_pipeline_owns_the_next_op_should_keep_its_body()
+     {
+        const NEW_PRIMARY: usize = 1;
+        const NEW_VIEW: u32 = 1;
+        const STREAM: &str = "promoted-pipeline-entry";
+        let (mut sim, client) = cluster(0x5EED_0311);
+        sim.register_client_with_primary(&client);
+        let primary = Rc::clone(&sim.replicas[0].shards[0]);
+        let candidate = Rc::clone(&sim.replicas[NEW_PRIMARY].shards[0]);
+        let registered_op = primary
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+            .unwrap()
+            .commit_min();
+        for _ in 0..SETUP_TOTAL_STEPS {
+            if candidate
+                .plane
+                .metadata()
+                .consensus
+                .as_ref()
+                .unwrap()
+                .commit_min()
+                == registered_op
+            {
+                break;
+            }
+            sim.step();
+        }
+        complete_now(&mut sim, async move {
+            let primary_metadata = primary.plane.metadata();
+            let primary_consensus = primary_metadata.consensus.as_ref().unwrap();
+            let prepare = consensus::seal_prepare_capacity(
+                client.create_stream(STREAM).project(primary_consensus),
+                primary_consensus.retry_capacity(&primary_metadata.client_table.borrow()),
+            );
+            let prepare_header = *prepare.header();
+            let metadata = candidate.plane.metadata();
+            let consensus = metadata.consensus.as_ref().unwrap();
+            let journal = metadata.journal.as_ref().unwrap();
+            let applied = consensus.commit_min();
+            assert_eq!(
+                applied, registered_op,
+                "registration must apply on the candidate"
+            );
+            assert_eq!(prepare_header.op, applied + 1);
+            assert_eq!(consensus.sequencer().current_sequence(), applied);
+
+            // A commit can arrive ahead of its body. The DVC clamps that
+            // frontier to the resident head, while consensus retains it.
+            consensus.advance_commit_max(prepare_header.op);
+            let header_size = size_of::<iggy_binary_protocol::DoViewChangeHeader>();
+            let mut message = Message::<iggy_binary_protocol::DoViewChangeHeader>::new(
+                header_size + size_of::<PrepareHeader>(),
+            );
+            consensus::encode_prepare_headers(
+                &[prepare_header],
+                &mut message.as_mut_slice()[header_size..],
+            );
+            let checksum_body = u128::from(iggy_common::calculate_checksum(
+                &message.as_slice()[header_size..],
+            ));
+            let total = message.as_slice().len();
+            let message = message.transmute_header(
+                |_, header: &mut iggy_binary_protocol::DoViewChangeHeader| {
+                    header.command = Command::DoViewChange;
+                    header.cluster = consensus.cluster();
+                    header.group = METADATA_GROUP;
+                    header.view = NEW_VIEW;
+                    header.replica = 0;
+                    header.log_view = prepare_header.view;
+                    header.op = prepare_header.op;
+                    header.commit = applied;
+                    header.present_bitset = 1;
+                    header.size = u32::try_from(total).unwrap();
+                    header.checksum_body = checksum_body;
+                    header.seal();
+                },
+            );
+            candidate
+                .on_message(MessageBag::DoViewChange(message))
+                .await;
+            assert_eq!(consensus.status(), Status::ViewChange);
+            let pending = consensus.pending_view_log().unwrap();
+            assert_eq!(pending.op_head, prepare_header.op);
+            assert_eq!(pending.commit_max, applied);
+            candidate.tick_metadata().await;
+
+            let repaired = prepare.transmute_header(
+                |header, repaired: &mut iggy_binary_protocol::RepairPrepareHeader| {
+                    repaired.0 = header;
+                    repaired.0.command = Command::RepairPrepare;
+                },
+            );
+            candidate
+                .on_message(MessageBag::RepairPrepare(repaired))
+                .await;
+            assert!(journal.handle().entry(&prepare_header).await.is_some());
+
+            candidate.tick_metadata().await;
+            assert!(consensus.is_primary() && consensus.is_normal());
+            assert_eq!(consensus.commit_min(), applied);
+            assert_eq!(consensus.commit_max(), prepare_header.op);
+            assert_eq!(
+                consensus.pipeline_head_header().map(|header| header.op),
+                Some(prepare_header.op),
+                "promotion must rebuild the entry after the stranded-commit driver ran"
+            );
+            candidate.tick_metadata().await;
+            assert_eq!(consensus.commit_min(), prepare_header.op);
+            assert!(consensus.pipeline_head_header().is_none());
+            assert!(
+                journal.handle().entry(&prepare_header).await.is_some(),
+                "the tick must not discard the body owned by the rebuilt pipeline"
+            );
+            assert!(metadata.mux_stm.streams().read(|streams| {
+                streams
+                    .items
+                    .iter()
+                    .any(|(_, stream)| &*stream.name == STREAM)
+            }));
+        });
+    }
+
+    /// Runs `future` on the simulator executor. Its output must be ready once
+    /// the pumps drain.
+    fn complete_now<T: Send + 'static>(
+        sim: &mut Simulator,
+        future: impl Future<Output = T> + 'static,
+    ) -> T {
+        let (sender, receiver) = shard::channel(1);
+        sim.executor.spawn(async move {
+            let _ = sender.try_send(future.await);
+        });
+        sim.run_pumps();
+        receiver
+            .recv()
+            .now_or_never()
+            .expect("the future completes once the pumps drain")
+            .expect("the sender stays open until it sends")
+    }
+
+    /// Replica 0 acknowledges `write`, whose commit never reaches the backups,
+    /// then crashes. The write sits above the merged commit of the next view,
+    /// and the backups hold their `PrepareOk`s, so the new primary starts that
+    /// view without applying it. Returns the new primary and the op of the
+    /// write.
+    fn fail_over_before_the_write_applies(
+        sim: &mut Simulator,
+        client: &SimClient,
+        namespace: IggyNamespace,
+        write: Message<RoutedRequestHeader>,
+    ) -> (usize, u64) {
+        const FAILOVER_STEPS: usize = 2_000;
+
+        // Link hooks are bare `fn` pointers, so the group travels in a static.
+        static GROUP: AtomicU64 = AtomicU64::new(0);
+
+        fn starve_commits(packet: &packet::Packet) -> bool {
+            is_commit_for(packet, GROUP.load(Ordering::Relaxed))
+        }
+
+        fn hold_prepare_oks(packet: &packet::Packet) -> bool {
+            packet.message.header().command == Command::PrepareOk
+                && bytemuck::checked::from_bytes::<PrepareOkHeader>(
+                    &packet.message.as_slice()[..size_of::<PrepareOkHeader>()],
+                )
+                .group
+                    == GROUP.load(Ordering::Relaxed)
+        }
+
+        GROUP.store(namespace.inner(), Ordering::Relaxed);
+        for backup in [1, 2] {
+            *sim.network
+                .link_drop_packet_fn(ProcessId::Replica(0), ProcessId::Replica(backup)) =
+                Some(starve_commits);
+        }
+        let acknowledged = submit_and_wait_for_reply(sim, client.client_id(), 0, write);
+        assert_eq!(acknowledged.header().status, 0);
+        let write_op = sim
+            .partition_consensus_state(0, namespace)
+            .expect("the old primary hosts the partition")
+            .commit_min;
+        sim.replica_crash(0);
+        for (from, to) in [(1, 2), (2, 1)] {
+            *sim.network
+                .link_drop_packet_fn(ProcessId::Replica(from), ProcessId::Replica(to)) =
+                Some(hold_prepare_oks);
+        }
+
+        let new_primary = (0..FAILOVER_STEPS)
+            .find_map(|_| {
+                sim.step();
+                [1usize, 2].into_iter().find(|replica| {
+                    sim.partition_consensus_state(*replica, namespace)
+                        .is_some_and(|state| state.is_primary && state.status == Status::Normal)
+                })
+            })
+            .expect("the backups elect a new partition primary");
+        let (commit_min, commit_max) = sim.replicas[new_primary]
+            .partition_shard(namespace)
+            .plane
+            .partitions()
+            .with_partition(&namespace, |partition| {
+                let consensus = partition.consensus();
+                (consensus.commit_min(), consensus.commit_max())
+            })
+            .expect("the new primary hosts the partition");
+        assert_eq!(
+            commit_min, commit_max,
+            "the new primary applied everything it knows to be committed"
+        );
+        assert!(
+            commit_min < write_op,
+            "the new primary must not have applied the acknowledged write yet"
+        );
+        (new_primary, write_op)
+    }
+
+    /// Lets the `PrepareOk`s that [`fail_over_before_the_write_applies`] holds
+    /// through, and steps until the new primary applies the write.
+    fn release_held_prepare_oks(
+        sim: &mut Simulator,
+        namespace: IggyNamespace,
+        new_primary: usize,
+        write_op: u64,
+    ) {
+        const RECOMMIT_STEPS: usize = 2_000;
+
+        for (from, to) in [(1, 2), (2, 1)] {
+            *sim.network
+                .link_drop_packet_fn(ProcessId::Replica(from), ProcessId::Replica(to)) = None;
+        }
+        let applied = (0..RECOMMIT_STEPS).any(|_| {
+            sim.step();
+            sim.partition_consensus_state(new_primary, namespace)
+                .is_some_and(|state| state.commit_min >= write_op)
+        });
+        assert!(
+            applied,
+            "the new view re-commits the write once PrepareOk flows"
+        );
+    }
+
+    /// The old primary acknowledges an offset store whose commit never reaches
+    /// the backups, then crashes. The store sits above the merged commit of the
+    /// next view, so the new primary has not applied it. Until it does, an
+    /// offset read and a `Next` poll must answer `TransientNotAccepted` instead
+    /// of reading the older offset.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn given_an_acknowledged_offset_store_when_the_primary_fails_over_should_not_read_back_the_older_offset()
+     {
+        const CONSUMER_ID: u32 = 7;
+        const CONSUMER_KIND: u8 = 1;
+        const OLDER_OFFSET: u64 = 1;
+        const ACKNOWLEDGED_OFFSET: u64 = 2;
+        const MESSAGES: usize = 4;
+        const SETTLE_STEPS: usize = 200;
+
+        let (mut sim, client) = cluster(0x5EED_0411);
+        let namespace = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(namespace);
+        sim.register_client_with_primary(&client);
+        let consumer = PollingConsumer::Consumer(CONSUMER_ID as usize, 0);
+        let next_poll = PollingArgs::new(iggy_common::PollingStrategy::next(), 1, false);
+        for index in 0..MESSAGES {
+            let message = Bytes::from(format!("message-{index}"));
+            let reply = submit_and_wait_for_reply(
+                &mut sim,
+                client.client_id(),
+                0,
+                client.send_messages(namespace, &[message]),
+            );
+            assert_eq!(reply.header().status, 0);
+        }
+        let stored = submit_and_wait_for_reply(
+            &mut sim,
+            client.client_id(),
+            0,
+            client.store_consumer_offset(
+                namespace,
+                CONSUMER_KIND,
+                CONSUMER_ID,
+                OLDER_OFFSET,
+                AckLevel::Quorum,
+            ),
+        );
+        assert_eq!(stored.header().status, 0);
+        for _ in 0..SETTLE_STEPS {
+            sim.step();
+        }
+
+        let acknowledged = client.store_consumer_offset(
+            namespace,
+            CONSUMER_KIND,
+            CONSUMER_ID,
+            ACKNOWLEDGED_OFFSET,
+            AckLevel::Quorum,
+        );
+        let (new_primary, store_op) =
+            fail_over_before_the_write_applies(&mut sim, &client, namespace, acknowledged);
+        let owner = Rc::clone(sim.replicas[new_primary].partition_shard(namespace));
+        let (stored_offset, _) = owner
+            .plane
+            .partitions()
+            .consumer_offset_read(&namespace, consumer)
+            .expect("the new primary hosts the group");
+        assert_eq!(
+            stored_offset,
+            Some(OLDER_OFFSET),
+            "the applied state still holds the older offset"
+        );
+
+        let offset_read = Rc::clone(&owner);
+        let reply = complete_now(&mut sim, async move {
+            offset_read
+                .partition_read(namespace, shard::PartitionRead::ConsumerOffset { consumer })
+                .await
+        });
+        assert!(
+            matches!(
+                reply,
+                Some(shard::PartitionReadReply::Rejected(
+                    IggyError::TransientNotAccepted
+                ))
+            ),
+            "an offset read before the view start applies must be refused, got {reply:?}"
+        );
+        let poll = sim.poll_messages(new_primary, namespace, consumer, &next_poll);
+        let polled = complete_now(&mut sim, poll);
+        assert!(
+            matches!(polled, Err(IggyError::TransientNotAccepted)),
+            "a Next poll before the view start applies must be refused, got {polled:?}"
+        );
+
+        release_held_prepare_oks(&mut sim, namespace, new_primary, store_op);
+        let offset_read = Rc::clone(&owner);
+        let reply = complete_now(&mut sim, async move {
+            offset_read
+                .partition_read(namespace, shard::PartitionRead::ConsumerOffset { consumer })
+                .await
+        });
+        assert!(
+            matches!(
+                reply,
+                Some(shard::PartitionReadReply::ConsumerOffset {
+                    stored: Some(ACKNOWLEDGED_OFFSET),
+                    ..
+                })
+            ),
+            "the read after the view start applies returns the acknowledged offset, got {reply:?}"
+        );
+        let poll = sim.poll_messages(new_primary, namespace, consumer, &next_poll);
+        let polled = complete_now(&mut sim, poll);
+        assert!(
+            polled.is_ok_and(|fragments| !fragments.is_empty()),
+            "a Next poll after the view start applies is served"
+        );
+    }
+
+    /// The old primary acknowledges a send whose commit never reaches the
+    /// backups, then crashes. Until the new primary applies the send, a poll
+    /// from its offset must answer `TransientNotAccepted` instead of returning
+    /// no messages.
+    #[test]
+    fn given_an_acknowledged_send_when_the_primary_fails_over_should_not_poll_without_it() {
+        const PAYLOAD: &[u8] = b"acknowledged-before-failover";
+        const SEND_OFFSET: u64 = 0;
+        const CONSUMER_ID: usize = 7;
+
+        let (mut sim, client) = cluster(0x5EED_0412);
+        let namespace = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(namespace);
+        sim.register_client_with_primary(&client);
+        let consumer = PollingConsumer::Consumer(CONSUMER_ID, 0);
+        let offset_poll =
+            PollingArgs::new(iggy_common::PollingStrategy::offset(SEND_OFFSET), 1, false);
+
+        let acknowledged = client.send_messages(namespace, &[Bytes::from_static(PAYLOAD)]);
+        let (new_primary, send_op) =
+            fail_over_before_the_write_applies(&mut sim, &client, namespace, acknowledged);
+        let poll = sim.poll_messages(new_primary, namespace, consumer, &offset_poll);
+        let polled = complete_now(&mut sim, poll);
+        assert!(
+            matches!(polled, Err(IggyError::TransientNotAccepted)),
+            "a poll before the view start applies must be refused, got {polled:?}"
+        );
+
+        release_held_prepare_oks(&mut sim, namespace, new_primary, send_op);
+        let poll = sim.poll_messages(new_primary, namespace, consumer, &offset_poll);
+        let fragments =
+            complete_now(&mut sim, poll).expect("a poll after the view start applies is served");
+        assert!(
+            fragments.iter().any(|fragment| fragment
+                .as_slice()
+                .windows(PAYLOAD.len())
+                .any(|bytes| bytes == PAYLOAD)),
+            "the poll returns the acknowledged message"
+        );
+    }
+
     /// Crashing the primary in a 5-node cluster: 4 survivors detect via
     /// heartbeat timeout and elect a new primary via view change.
     #[test]
@@ -2682,22 +6995,11 @@ mod tests {
         );
     }
 
-    /// A partition group materialised AFTER a metadata election starts in the
-    /// metadata plane's view, so both planes name the same primary.
-    ///
-    /// Left at view 0 the group names replica 0 whatever the metadata plane has
-    /// got to. Nothing on the wire can express a partition primary
-    /// (`ClusterNode` carries one cluster-wide `role`) and partition ops route
-    /// within a node rather than to a peer, so the node clients are sent to
-    /// refuses every write to that group and the SDK burns its budget
-    /// rediscovering the same wrong answer.
-    ///
-    /// The simulator reaches this where the integration tests cannot: no
-    /// client, no transport, just the two planes' views read directly. It is
-    /// also the only place the SEED itself is asserted rather than inferred
-    /// from a send succeeding.
+    /// Manual fixture seeding chooses the current metadata view. Materializing
+    /// that fixture must preserve the choice on every replica. This tests the
+    /// creation-view handoff, not the production placement selector.
     #[test]
-    fn given_a_metadata_election_when_a_group_materialises_should_seed_the_metadata_view() {
+    fn given_a_chosen_creation_view_when_a_group_materialises_should_seed_that_view() {
         server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
@@ -2730,13 +7032,10 @@ mod tests {
             .expect("a live replica must own metadata consensus");
         assert_ne!(
             metadata_primary, 0,
-            "crashing replica 0 must have moved the metadata plane off view 0; with the \
-             primary back at replica 0 both planes agree and the split cannot show"
+            "the fixture needs a chosen view whose primary differs from the default replica 0"
         );
 
-        // Materialise a brand-new group. Every live replica seeds from the view
-        // the create was committed in, which production reads off the committed
-        // partition.
+        // The manual fixture chooses this metadata view as its creation view.
         let namespace = IggyNamespace::new(1, 1, 0);
         sim.init_partition(namespace);
 
@@ -2745,9 +7044,7 @@ mod tests {
             .expect("the group must exist on a live replica after materialisation");
         assert_eq!(
             partition_primary, metadata_primary,
-            "a group materialised after a metadata election must name the same primary as the \
-             metadata plane; seeded at view 0 instead it names replica 0, which no client can \
-             be routed to"
+            "materialization must preserve the primary selected by the fixture's creation view"
         );
 
         // Per replica, not just the aggregate: the seed is read locally on each
@@ -2769,8 +7066,7 @@ mod tests {
             assert_eq!(
                 seeded_primary, metadata_primary,
                 "replica {replica_idx} seeded its group at view {}, naming replica \
-                 {seeded_primary} primary while the metadata plane names {metadata_primary}; \
-                 replicas that seed different views disagree on their own group's primary",
+                 {seeded_primary} instead of the fixture's chosen primary {metadata_primary}",
                 state.view
             );
         }
@@ -2900,6 +7196,124 @@ mod tests {
             "a write must commit after the late materialiser joined; a wedged merge \
              answers nothing",
         );
+    }
+
+    #[test]
+    fn given_committed_unmaterialized_groups_when_restarted_should_complete_their_first_lifecycle()
+    {
+        const PROGRESS_STEPS: usize = 4_000;
+        let (mut sim, client) = cluster(0x4649_5253);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        sim.register_client_with_primary(&client);
+        complete_metadata_op(&mut sim, &client, client.create_stream("late"));
+        complete_metadata_op(&mut sim, &client, client.create_topic("late", "empty", 1));
+        complete_metadata_op(&mut sim, &client, client.create_stream("replay-fence"));
+        for replica in &sim.replicas {
+            assert!(replica.partition_superblocks.borrow().is_empty());
+            assert!(
+                !replica
+                    .partition_shard(namespace)
+                    .plane
+                    .partitions()
+                    .contains(&namespace)
+            );
+        }
+        for replica in 0..sim.replica_count {
+            sim.replica_crash(replica);
+        }
+        for replica in 0..sim.replica_count {
+            sim.replica_restart(replica);
+            let metadata = sim.replicas[usize::from(replica)].shards[0]
+                .plane
+                .metadata();
+            let epoch = metadata
+                .mux_stm
+                .streams()
+                .created_revision_for_namespace(namespace)
+                .expect("the committed create must survive metadata replay");
+            assert!(epoch > 0 && epoch <= metadata.applied_frontier().recovered_revision());
+        }
+        sim.register_client_with_primary(&client);
+        let primary = sim
+            .metadata_primary_index()
+            .expect("metadata has a live primary");
+        let reply = submit_and_wait_for_reply(
+            &mut sim,
+            client.client_id(),
+            primary,
+            client.delete_topic("late", "empty"),
+        );
+        assert_eq!(
+            metadata::stm::result::result_code(reply.body()),
+            Some(IggyError::TransientNotCommitted.as_code())
+        );
+        let intent_op = reply.header().op;
+        assert!(
+            (0..PROGRESS_STEPS).any(|_| {
+                sim.step();
+                sim.replicas.iter().all(|replica| {
+                    !replica.shards[0]
+                        .plane
+                        .metadata()
+                        .mux_stm
+                        .streams()
+                        .lifecycle_pending(intent_op)
+                })
+            }),
+            "a never-materialized committed group must initialize and finish its delete after restart"
+        );
+    }
+
+    #[test]
+    fn given_initialized_groups_when_retained_history_is_erased_should_remain_nonvoting() {
+        const PROGRESS_STEPS: usize = 2_000;
+        let (mut sim, client) = cluster(0x4552_4153);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        sim.register_client_with_primary(&client);
+        complete_metadata_op(&mut sim, &client, client.create_stream("initialized"));
+        complete_metadata_op(
+            &mut sim,
+            &client,
+            client.create_topic("initialized", "history", 1),
+        );
+        sim.init_partition(namespace);
+        sim.discover_partition_contexts(&client);
+        commit_sends_everywhere(&mut sim, &client, namespace, 1);
+        complete_metadata_op(&mut sim, &client, client.create_stream("replay-fence"));
+        for replica in 0..sim.replica_count {
+            sim.replica_crash(replica);
+            let replica = &sim.replicas[usize::from(replica)];
+            assert!(
+                replica
+                    .partition_superblocks
+                    .borrow()
+                    .contains_key(&namespace)
+            );
+            replica
+                .partition_shard(namespace)
+                .plane
+                .partitions()
+                .remove(&namespace);
+            replica.partition_logs.borrow_mut().remove(&namespace);
+        }
+        for replica in 0..sim.replica_count {
+            sim.replica_restart(replica);
+        }
+        for _ in 0..PROGRESS_STEPS {
+            sim.step();
+        }
+        for replica in &sim.replicas {
+            let partitions = replica.partition_shard(namespace).plane.partitions();
+            let partition = partitions
+                .get_by_ns(&namespace)
+                .expect("an initialized group's surviving store is reopened");
+            assert!(
+                !partition.consensus().recovery_election_allowed(),
+                "missing retained history must not count as first initialization"
+            );
+            assert_eq!(partition.consensus().status(), Status::Recovering);
+            assert_eq!(partition.consensus().commit_min(), 0);
+        }
     }
 
     /// A replica that advanced its view, persisted it through the superblock gate,
@@ -3159,6 +7573,12 @@ mod tests {
         // the deterministic trace. Ownership fencing now refuses group offset
         // writes without an installed owner, changing the partition commit trace.
         // External groups expand the consumer-kind draw from two choices to three.
+        // Rebalance probes consume network randomness and change the scheduled trace.
+        // So do the eager `Commit`s a primary sends after each metadata commit, and
+        // a backup re-acking a retransmit of an op it already applied: on this seed one
+        // `PrepareOk` for the committed `Register`, which the primary ignores. Sending
+        // the eager `Commit` to a backup only once it acked the op moves those sends.
+        // So does re-probing each peer once partition admission opens at boot.
         assert_eq!(
             h1, 0xECC6_9F76_2D47_8F12,
             "workload reply hash drifted from locked baseline"
@@ -3232,7 +7652,7 @@ mod tests {
         assert!(replies > 0, "workload produced no replies");
 
         assert!(
-            oracle::drive_to_quiesce(&mut sim, &mut wl, 5_000, &mut invariants),
+            oracle::drive_to_quiesce(&mut sim, &mut wl, &clients, 5_000, &mut invariants),
             "system did not drain within the tick budget"
         );
         // Cross-replica agreement + entity oracle (single client => strict).
@@ -3300,7 +7720,7 @@ mod tests {
         );
 
         assert!(
-            oracle::drive_to_quiesce(&mut sim, &mut wl, 5_000, &mut invariants),
+            oracle::drive_to_quiesce(&mut sim, &mut wl, &clients, 5_000, &mut invariants),
             "surviving quorum did not drain within the tick budget"
         );
         oracle::assert_converged(&sim, &mut wl);
@@ -3370,7 +7790,7 @@ mod tests {
         );
 
         assert!(
-            oracle::drive_to_quiesce(&mut sim, &mut wl, 20_000, &mut invariants),
+            oracle::drive_to_quiesce(&mut sim, &mut wl, &clients, 20_000, &mut invariants),
             "{}",
             oracle::quiesce_failure_report(&sim, &wl),
         );
@@ -3601,7 +8021,7 @@ mod tests {
                 if initially_committed {
                     0
                 } else {
-                    IggyError::TransientNotAccepted.as_code()
+                    IggyError::NotPrimary.as_code()
                 },
                 "the original attempt must establish the intended admission outcome",
             );
@@ -3757,6 +8177,7 @@ mod tests {
                 materialise_partition(replica, namespace, sim.consumer_offsets_max);
                 assert!(
                     replica.partition_superblocks.borrow()[&namespace]
+                        .1
                         .read_latest_sync()
                         .is_none(),
                     "the crash must precede the first durable view write"
@@ -3777,6 +8198,20 @@ mod tests {
                     })
                 })
                 .expect("the restarted quorum must elect a primary");
+            // Discovery names the most advanced metadata, and the restarted
+            // primary refuses a send until it applied that metadata too.
+            let applied =
+                |replica: &SimReplica| replica.shards[0].plane.metadata().applied_frontier().get();
+            assert!(
+                (0..PROGRESS_STEPS).any(|_| {
+                    sim.step();
+                    let primary_applied = applied(&sim.replicas[usize::from(primary)]);
+                    sim.replicas
+                        .iter()
+                        .all(|replica| applied(replica) <= primary_applied)
+                }),
+                "the restarted primary must apply the committed metadata"
+            );
             sim.discover_partition_contexts(&client);
             let request = client.send_messages(namespace, &[Bytes::from_static(PAYLOAD)]);
             let committed =
@@ -3818,6 +8253,316 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Each replica's count of partitions waiting on a trusted quorum or every
+    /// replica to report.
+    fn untrusted_log_gauges(sim: &Simulator, namespace: IggyNamespace) -> Vec<i64> {
+        sim.replicas
+            .iter()
+            .map(|replica| {
+                replica
+                    .partition_shard(namespace)
+                    .metrics()
+                    .partitions_untrusted_log_value()
+            })
+            .collect()
+    }
+
+    /// Commit a send on a fresh three-replica partition, crash `crashed`, then
+    /// restart them. Every replica must settle on a log that still holds the
+    /// acknowledged send, trusting it again, and a new send must commit.
+    fn restart_keeps_acknowledged_send(durability: iggy_common::Durability, crashed: &[u8]) {
+        restart_keeps_acknowledged_send_losing(durability, crashed, &[]);
+    }
+
+    /// [`restart_keeps_acknowledged_send`], with the replicas in `lost`
+    /// restarting without the partition's log, so they may not elect on it.
+    fn restart_keeps_acknowledged_send_losing(
+        durability: iggy_common::Durability,
+        crashed: &[u8],
+        lost: &[u8],
+    ) {
+        const PROGRESS_STEPS: usize = 4_000;
+        const PAYLOAD: &[u8] = b"acknowledged-before-the-crash";
+        let (mut sim, client) = cluster(packet::PacketSimulatorOptions::default().seed);
+        sim.register_client_with_primary(&client);
+        let namespace = IggyNamespace::new(1, 1, 0);
+        sim.set_partition_durability(namespace, durability);
+        sim.seed_stream_topic_partition(namespace);
+        for replica in &sim.replicas {
+            materialise_partition(replica, namespace, sim.consumer_offsets_max);
+        }
+        let primary = (0..PROGRESS_STEPS)
+            .find_map(|_| {
+                sim.step();
+                (0..3).find(|replica| {
+                    sim.partition_consensus_state(usize::from(*replica), namespace)
+                        .is_some_and(|state| state.status == Status::Normal && state.is_primary)
+                })
+            })
+            .expect("the fresh partition elects a primary");
+        sim.discover_partition_contexts(&client);
+        let request = client.send_messages(namespace, &[Bytes::from_static(PAYLOAD)]);
+        let committed = submit_and_wait_for_reply(&mut sim, client.client_id(), primary, request);
+        assert_eq!(committed.header().status, 0);
+        let committed_op = committed.header().commit;
+        let expected = sim
+            .offsets(usize::from(primary), namespace)
+            .expect("acknowledged partition offsets");
+
+        for replica in crashed {
+            sim.replica_crash(*replica);
+        }
+        for replica in crashed {
+            if lost.contains(replica) {
+                sim.replica_restart_losing_partitions(*replica, &[namespace]);
+            } else {
+                sim.replica_restart(*replica);
+            }
+        }
+
+        let mut gauge_saw_halt = false;
+        let settled = |sim: &Simulator| {
+            (0..3).all(|replica| {
+                sim.partition_consensus_state(replica, namespace)
+                    .is_some_and(|state| {
+                        state.status == Status::Normal && state.commit_min >= committed_op
+                    })
+                    && sim.replicas[replica]
+                        .partition_shard(namespace)
+                        .plane
+                        .partitions()
+                        .get_by_ns(&namespace)
+                        .is_some_and(|partition| !partition.consensus().has_untrusted_log())
+                    && sim.offsets(replica, namespace) == Some(expected)
+            })
+        };
+        assert!(
+            (0..PROGRESS_STEPS).any(|_| {
+                sim.step();
+                gauge_saw_halt |= untrusted_log_gauges(&sim, namespace)
+                    .iter()
+                    .any(|gauge| *gauge > 0);
+                settled(&sim)
+            }),
+            "{durability:?}: replicas {crashed:?} restarted and the group never settled on the \
+             acknowledged prefix: states={:?}, offsets={:?}",
+            (0..3)
+                .map(|replica| sim.partition_consensus_state(replica, namespace))
+                .collect::<Vec<_>>(),
+            (0..3)
+                .map(|replica| sim.offsets(replica, namespace))
+                .collect::<Vec<_>>()
+        );
+        for replica in 0..3 {
+            let prepare = retained_prepare(&sim, replica, namespace, committed_op);
+            assert!(
+                prepare
+                    .body()
+                    .windows(PAYLOAD.len())
+                    .any(|bytes| bytes == PAYLOAD),
+                "replica {replica} lost the acknowledged payload at op {committed_op}"
+            );
+        }
+        assert_eq!(
+            gauge_saw_halt,
+            durability == iggy_common::Durability::Replicated,
+            "{durability:?}: only a restarted replicated log waits on a trusted quorum or every \
+             replica"
+        );
+        for _ in 0..PROGRESS_STEPS / 10 {
+            sim.step();
+        }
+        assert_eq!(untrusted_log_gauges(&sim, namespace), vec![0; 3]);
+
+        let primary = (0..3)
+            .find(|replica| {
+                sim.partition_consensus_state(usize::from(*replica), namespace)
+                    .is_some_and(|state| state.is_primary)
+            })
+            .expect("a settled group has a primary");
+        sim.discover_partition_contexts(&client);
+        let request = client.send_messages(namespace, &[Bytes::from_static(b"after-restart")]);
+        let reply = submit_and_wait_for_reply(&mut sim, client.client_id(), primary, request);
+        assert_eq!(reply.header().status, 0);
+    }
+
+    /// The double crash of #4476: the primary and one backup restart while the
+    /// third replica keeps running. Under `replicated` the restarted pair may
+    /// not elect past the survivor and the group settles once it reports;
+    /// `persisted` keeps the fast fallback.
+    #[test]
+    fn given_primary_and_backup_crash_when_they_restart_should_settle_and_accept_sends() {
+        for durability in [
+            iggy_common::Durability::Replicated,
+            iggy_common::Durability::Persisted,
+        ] {
+            restart_keeps_acknowledged_send(durability, &[0, 1]);
+        }
+    }
+
+    /// Every replica crashes and restarts. Nobody can answer a view probe, so
+    /// the fallback election must still settle the group, on the full log.
+    #[test]
+    fn given_every_replica_restarts_when_none_answers_a_probe_should_settle_and_accept_sends() {
+        for durability in [
+            iggy_common::Durability::Replicated,
+            iggy_common::Durability::Persisted,
+        ] {
+            restart_keeps_acknowledged_send(durability, &[0, 1, 2]);
+        }
+    }
+
+    /// Every replica crashes and one comes back without the partition's log,
+    /// so it may not elect. Under `replicated` the other two need every replica
+    /// to report, which the barred one does with an empty vote; it then joins
+    /// the view they start and catches up from it.
+    #[test]
+    fn given_every_replica_restarts_with_one_partition_log_lost_should_settle_and_accept_sends() {
+        for durability in [
+            iggy_common::Durability::Replicated,
+            iggy_common::Durability::Persisted,
+        ] {
+            restart_keeps_acknowledged_send_losing(durability, &[0, 1, 2], &[2]);
+        }
+    }
+
+    /// Every replica crashes and two come back without the partition's log.
+    /// Both cast empty votes, broadcast to every peer as production sends a
+    /// `DoViewChange`, and must not answer each other's: the group settles on
+    /// the one log left. `replicated` only, since `persisted` cannot vouch for a
+    /// lone disk and rightly halts.
+    #[test]
+    fn given_every_replica_restarts_with_two_partition_logs_lost_should_settle_and_accept_sends() {
+        restart_keeps_acknowledged_send_losing(
+            iggy_common::Durability::Replicated,
+            &[0, 1, 2],
+            &[1, 2],
+        );
+    }
+
+    /// Every replica crashes and the replicas in `awaiting` come back with the
+    /// partition awaiting a state transfer. The shard lets only their empty votes
+    /// out, broadcast like any `DoViewChange`, and the others must still start a
+    /// view on the acknowledged send. Catching the awaiting replicas up takes a
+    /// partition state transfer, which in-memory storage does not model, so this
+    /// stops at the view.
+    fn full_restart_awaiting_transfer_starts_a_view(awaiting: &[u8]) {
+        const PROGRESS_STEPS: usize = 4_000;
+        let (mut sim, client) = cluster(packet::PacketSimulatorOptions::default().seed);
+        sim.register_client_with_primary(&client);
+        let namespace = IggyNamespace::new(1, 1, 0);
+        sim.set_partition_durability(namespace, iggy_common::Durability::Replicated);
+        sim.seed_stream_topic_partition(namespace);
+        for replica in &sim.replicas {
+            materialise_partition(replica, namespace, sim.consumer_offsets_max);
+        }
+        let primary = (0..PROGRESS_STEPS)
+            .find_map(|_| {
+                sim.step();
+                (0..3).find(|replica| {
+                    sim.partition_consensus_state(usize::from(*replica), namespace)
+                        .is_some_and(|state| state.status == Status::Normal && state.is_primary)
+                })
+            })
+            .expect("the fresh partition elects a primary");
+        sim.discover_partition_contexts(&client);
+        let request = client.send_messages(namespace, &[Bytes::from_static(b"acknowledged")]);
+        let committed = submit_and_wait_for_reply(&mut sim, client.client_id(), primary, request);
+        assert_eq!(committed.header().status, 0);
+        let committed_op = committed.header().commit;
+        let old_view = sim
+            .partition_consensus_state(usize::from(primary), namespace)
+            .expect("primary hosts the partition")
+            .view;
+
+        for replica in 0..3 {
+            sim.replica_crash(replica);
+        }
+        for replica in 0..3 {
+            if awaiting.contains(&replica) {
+                sim.replica_restart_losing_partitions(replica, &[namespace]);
+            } else {
+                sim.replica_restart(replica);
+            }
+        }
+        for replica in awaiting {
+            let partitions = sim.replicas[usize::from(*replica)]
+                .partition_shard(namespace)
+                .plane
+                .partitions();
+            let partition = partitions
+                .get_mut_by_ns(&namespace)
+                .expect("a restarted replica rebuilds the partition");
+            partition.force_requires_state_transfer_for_test();
+            assert!(partition.requires_state_transfer());
+        }
+
+        let electing: Vec<u8> = (0..3)
+            .filter(|replica| !awaiting.contains(replica))
+            .collect();
+        let started = |sim: &Simulator| {
+            electing.iter().all(|replica| {
+                sim.replicas[usize::from(*replica)]
+                    .partition_shard(namespace)
+                    .plane
+                    .partitions()
+                    .get_by_ns(&namespace)
+                    .is_some_and(|partition| {
+                        let consensus = partition.consensus();
+                        consensus.status() == Status::Normal
+                            && consensus.view() > old_view
+                            && consensus.commit_max() >= committed_op
+                            && !consensus.has_untrusted_log()
+                    })
+            })
+        };
+        assert!(
+            (0..PROGRESS_STEPS).any(|_| {
+                sim.step();
+                started(&sim)
+            }),
+            "replicas {awaiting:?} await a state transfer and replicas {electing:?} never \
+             started a view holding op {committed_op}: states={:?}",
+            (0..3)
+                .map(|replica| sim.partition_consensus_state(replica, namespace))
+                .collect::<Vec<_>>()
+        );
+        // The awaiting replicas stay `Recovering`, hearing each other's
+        // broadcast votes, so the vote traffic must die down with the view.
+        let do_view_changes =
+            |sim: &Simulator| sim.network.command_counts()[Command::DoViewChange as usize];
+        let at_start = do_view_changes(&sim);
+        for _ in 0..PROGRESS_STEPS / 4 {
+            sim.step();
+        }
+        let after_start = do_view_changes(&sim) - at_start;
+        assert!(
+            after_start <= 16,
+            "{after_start} DoViewChanges delivered after the view started"
+        );
+        for replica in awaiting {
+            let state = sim
+                .partition_consensus_state(usize::from(*replica), namespace)
+                .expect("the awaiting replica hosts the partition");
+            assert!(
+                !state.is_primary || state.status != Status::Normal,
+                "replica {replica} led a view while awaiting a state transfer"
+            );
+        }
+    }
+
+    #[test]
+    fn given_full_restart_when_one_replica_awaits_a_state_transfer_should_start_a_view_on_its_empty_vote()
+     {
+        full_restart_awaiting_transfer_starts_a_view(&[2]);
+    }
+
+    #[test]
+    fn given_full_restart_when_two_replicas_await_a_state_transfer_should_start_a_view_on_their_empty_votes()
+     {
+        full_restart_awaiting_transfer_starts_a_view(&[1, 2]);
     }
 
     fn successful_send_reply_count(replies: &[Message<ReplyHeader>]) -> usize {
@@ -4005,8 +8750,12 @@ mod tests {
         sim.shell_login(&client);
         let request = client.send_messages(namespace, &[Bytes::from_static(b"solo-redispatch")]);
         let shard = Rc::clone(&sim.replicas[0].shards[0]);
-        let request = server_common::MessageBag::try_from(request.into_generic())
-            .expect("valid send request");
+        // Skips dispatch, so it carries the watermark dispatch would stamp.
+        let request = server_common::MessageBag::try_from(stamp_metadata_watermark(
+            &shard,
+            &request.into_generic(),
+        ))
+        .expect("valid send request");
         futures::executor::block_on(shard.on_message(request));
         assert_eq!(
             shard.parked_frame_count(namespace),
@@ -4190,13 +8939,16 @@ mod tests {
             });
             executor.run_until_stalled(POLL_BUDGET); // borrow acquired; task parks
             let grow = Rc::clone(&sim.replicas[0].shards[0]);
+            let persistence =
+                crate::partition_wal::reopen(&SimStorage::default(), ns_grow, 0, None);
             executor.spawn(async move {
                 grow.init_partition(
                     ns_grow,
                     None,
                     None,
                     None,
-                    PartitionMaterialisation::new(0, 0),
+                    persistence,
+                    PartitionMaterialisation::new(0, 0, true),
                 );
             });
             executor.run_until_stalled(POLL_BUDGET); // grow while the borrow is live
@@ -4231,13 +8983,15 @@ mod tests {
         });
         executor.run_until_stalled(POLL_BUDGET);
         let grow = Rc::clone(&sim.replicas[0].shards[0]);
+        let persistence = crate::partition_wal::reopen(&SimStorage::default(), ns_grow, 0, None);
         executor.spawn(async move {
             grow.init_partition(
                 ns_grow,
                 None,
                 None,
                 None,
-                PartitionMaterialisation::new(0, 0),
+                persistence,
+                PartitionMaterialisation::new(0, 0, true),
             );
         });
         executor.run_until_stalled(POLL_BUDGET);
@@ -4304,6 +9058,13 @@ mod tests {
         prefix: &str,
         streams: u32,
     ) -> (Simulator, u128, tempfile::TempDir) {
+        let (mut sim, client, root) = checkpointing_sim(replicas, seed);
+        commit_streams(&mut sim, &client, prefix, streams);
+        (sim, client.client_id(), root)
+    }
+
+    /// A checkpointing cluster with one registered client and nothing else committed.
+    fn checkpointing_sim(replicas: u8, seed: u64) -> (Simulator, SimClient, tempfile::TempDir) {
         server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
@@ -4323,19 +9084,23 @@ mod tests {
             false,
             root.path(),
         );
-        // Small enough that the ops below cross the coordinator's margin.
+        // Small enough that a few dozen ops cross the coordinator's margin.
         sim.set_metadata_journal_slots(80);
 
         let client = SimClient::new(client_id);
         sim.register_client_with_primary(&client);
+        (sim, client, root)
+    }
+
+    /// Commit `streams` streams named `wl-{prefix}-N` through replica 0.
+    fn commit_streams(sim: &mut Simulator, client: &SimClient, prefix: &str, streams: u32) {
         for sequence in 0..streams {
             let msg = client.create_stream(&format!("wl-{prefix}-{sequence}"));
-            sim.submit_request(client_id, 0, msg.into_generic());
+            sim.submit_request(client.client_id(), 0, msg.into_generic());
             for _ in 0..40 {
                 sim.step();
             }
         }
-        (sim, client_id, root)
     }
 
     #[test]
@@ -4825,29 +9590,23 @@ mod tests {
         );
     }
 
-    /// Turning the dispatch shell on wires the server's real deferred
-    /// handlers on every shard. With no client traffic none of them is
-    /// reached, so the consensus plane both replays deterministically and
-    /// matches the shell-off schedule: the toggle is genuinely off the
-    /// consensus path. Also guards that shell construction does not panic.
+    /// Liveness adds timed tasks even without client traffic, so each admission
+    /// mode must reproduce its own schedule rather than the other mode's schedule.
     #[test]
-    fn shell_on_consensus_schedule_matches_shell_off() {
-        let seed = 0x5CED_0001;
-        assert_eq!(
-            consensus_schedule_hash(seed, true),
-            consensus_schedule_hash(seed, true),
-            "shell-on schedule diverged at same seed"
-        );
-        assert_eq!(
-            consensus_schedule_hash(seed, true),
-            consensus_schedule_hash(seed, false),
-            "shell perturbed the consensus schedule despite no client traffic"
-        );
-        assert_ne!(
-            consensus_schedule_hash(0x5CED_0001, true),
-            consensus_schedule_hash(0x5CED_0002, true),
-            "different seeds produced identical shell-on schedule"
-        );
+    fn given_liveness_tasks_when_shell_replays_should_preserve_seeded_schedule() {
+        const SEED: u64 = 0x5CED_0001;
+        for shell in [false, true] {
+            assert_eq!(
+                consensus_schedule_hash(SEED, shell),
+                consensus_schedule_hash(SEED, shell),
+                "shell={shell}: schedule diverged at the same seed"
+            );
+            assert_ne!(
+                consensus_schedule_hash(SEED, shell),
+                consensus_schedule_hash(SEED + 1, shell),
+                "shell={shell}: different seeds produced identical schedules"
+            );
+        }
     }
 
     /// Multi-shard replay: the same seed reproduces both the reply trace
@@ -5100,6 +9859,76 @@ mod tests {
         );
     }
 
+    /// A checkpoint replaces the seeded baseline, so a restart from one must not
+    /// seed a fixture topic again that a committed delete removed before it.
+    #[test]
+    fn given_a_fixture_deleted_before_a_checkpoint_when_the_replica_restarts_should_stay_deleted() {
+        const STREAMS: u32 = 40;
+        const STEPS_PER_STREAM: usize = 40;
+        const CLIENT_ID: u128 = 1;
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+        let root = tempfile::tempdir().expect("temp dir for the simulator's snapshots");
+        let mut sim = Simulator::with_checkpoints(
+            1,
+            std::iter::once(CLIENT_ID),
+            packet::PacketSimulatorOptions {
+                node_count: 1,
+                client_count: 1,
+                seed: 0xC4E0_0006,
+                ..packet::PacketSimulatorOptions::default()
+            },
+            false,
+            root.path(),
+        );
+        sim.set_metadata_journal_slots(80);
+        let fixture = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(fixture);
+        let client = SimClient::new(CLIENT_ID);
+        sim.register_client_with_primary(&client);
+        let fixture_exists = |sim: &Simulator| {
+            sim.replicas[0].shards[0]
+                .plane
+                .metadata()
+                .mux_stm
+                .streams()
+                .created_revision_for_namespace(fixture)
+                .is_some()
+        };
+
+        complete_metadata_op(
+            &mut sim,
+            &client,
+            client.delete_topic(
+                &Streams::seeded_stream_name(fixture.stream_id()),
+                &Streams::seeded_topic_name(fixture.stream_id(), fixture.topic_id()),
+            ),
+        );
+        assert!(!fixture_exists(&sim), "the delete must remove the fixture");
+        for sequence in 0..STREAMS {
+            let msg = client.create_stream(&format!("wl-reseed-{sequence}"));
+            sim.submit_request(CLIENT_ID, 0, msg.into_generic());
+            for _ in 0..STEPS_PER_STREAM {
+                sim.step();
+            }
+        }
+        assert!(
+            snapshot_floor(&sim, 0) > 0,
+            "the replica never checkpointed, so its restart reads no snapshot"
+        );
+
+        sim.replica_crash(0);
+        sim.replica_restart(0);
+
+        assert!(
+            !fixture_exists(&sim),
+            "the restart seeded the fixture topic that its checkpoint holds deleted"
+        );
+    }
+
     /// A clustered replica that took its own checkpoint rejoins holding the same
     /// committed metadata as a healthy peer.
     ///
@@ -5135,6 +9964,81 @@ mod tests {
             healthy,
             "the rejoined replica disagrees with a healthy peer on committed \
              metadata: local recovery dropped the prefix its checkpoint drained"
+        );
+    }
+
+    /// A primary that recovered a WAL suffix still serves the state transfer its
+    /// only live backup needs before it can ack that suffix.
+    ///
+    /// Replica 2 is down while the others commit past a checkpoint, so its gap sits
+    /// below every peer's WAL floor. A full outage follows and replica 1 stays down.
+    /// Replica 0 boots with its WAL head as a recovery barrier (each prepare carries
+    /// the commit point of the one before it), wins a view, and needs replica 2's
+    /// ack to re-commit that head. Replica 2 appends nothing until a transfer lifts
+    /// it past the floor, so a primary that refuses transfers below its barrier
+    /// wedges this two-replica quorum until replica 1 returns.
+    #[test]
+    fn given_a_backup_below_the_floor_when_the_primary_recovered_a_suffix_should_transfer_and_recommit()
+     {
+        const STREAMS: u32 = 40;
+        const RECOVERY_TICKS: usize = 8_000;
+        let (primary, absent, lagging) = (0u8, 1u8, 2u8);
+        let (mut sim, client, _root) = checkpointing_sim(3, 0xC4E0_0005);
+
+        sim.replica_crash(lagging);
+        commit_streams(&mut sim, &client, "barrier", STREAMS);
+        sim.replica_crash(absent);
+        sim.replica_crash(primary);
+        sim.replica_restart(primary);
+        sim.replica_restart(lagging);
+
+        let floor = snapshot_floor(&sim, usize::from(primary));
+        let barrier = {
+            let recovered = sim
+                .metadata_consensus(usize::from(primary))
+                .expect("shard 0 owns metadata consensus");
+            assert!(
+                recovered.recovery_barrier() > recovered.commit_max(),
+                "replica {primary} recovered no suffix past its commit point, so \
+                 nothing waits on the barrier"
+            );
+            recovered.recovery_barrier()
+        };
+        let lagging_commit = sim
+            .metadata_consensus(usize::from(lagging))
+            .expect("shard 0 owns metadata consensus")
+            .commit_min();
+        assert!(
+            lagging_commit < floor,
+            "replica {lagging} commits through {lagging_commit} and replica {primary} \
+             retains ops above {floor}: journal repair alone can close this gap"
+        );
+
+        for _ in 0..RECOVERY_TICKS {
+            sim.step();
+        }
+
+        for replica in [primary, lagging] {
+            let consensus = sim
+                .metadata_consensus(usize::from(replica))
+                .expect("shard 0 owns metadata consensus");
+            assert_eq!(
+                consensus.status(),
+                consensus::Status::Normal,
+                "replica {replica} never settled into a view"
+            );
+            assert!(
+                consensus.commit_min() >= barrier,
+                "replica {replica} commits through {} but the recovered head {barrier} \
+                 never re-committed: the primary withheld the transfer its only live \
+                 backup needed to ack it",
+                consensus.commit_min(),
+            );
+        }
+        assert_eq!(
+            committed_stream_names(&sim, usize::from(lagging)),
+            committed_stream_names(&sim, usize::from(primary)),
+            "the backup caught up to different committed metadata than the primary"
         );
     }
 
@@ -5371,8 +10275,8 @@ mod tests {
         // the session was real, only a bound session being torn down, with the
         // teardown replicating through the primary as the register did. A logout, not
         // a data request, because the session belongs to the connection and a backup
-        // refuses a partition write for routing reasons (`TransientNotAccepted`) that
-        // say nothing about the session.
+        // refuses a partition write for routing reasons (`NotPrimary`) that say
+        // nothing about the session.
         let logout = client.logout();
         let request = logout.header().request;
         sim.submit_request(client_id, 1, logout.into_generic());
@@ -5418,6 +10322,15 @@ mod tests {
     /// denied.
     #[test]
     fn shell_workload_drains_and_converges() {
+        shell_workload_with_ack_quorum_ratio(0.5);
+    }
+
+    #[test]
+    fn given_serial_quorum_offsets_when_shell_workload_quiesces_should_compare_the_shadow() {
+        shell_workload_with_ack_quorum_ratio(1.0);
+    }
+
+    fn shell_workload_with_ack_quorum_ratio(ack_quorum_ratio: f32) {
         use crate::workload::{
             self, Workload,
             options::{ActionWeights, WorkloadOptions},
@@ -5457,6 +10370,7 @@ mod tests {
 
         let mut options = WorkloadOptions::new(seed, replica_count, vec![ns]);
         options.weights = ActionWeights::uniform();
+        options.ack_quorum_ratio = ack_quorum_ratio;
         let mut wl = Workload::new(options);
 
         let clients = [client];
@@ -5484,11 +10398,31 @@ mod tests {
         );
 
         assert!(
-            oracle::drive_to_quiesce(&mut sim, &mut wl, 20_000, &mut invariants),
+            oracle::drive_to_quiesce(&mut sim, &mut wl, &clients, 20_000, &mut invariants),
             "{}",
             oracle::quiesce_failure_report(&sim, &wl),
         );
-        oracle::assert_converged(&sim, &mut wl);
+        let convergence = oracle::assert_converged(&sim, &mut wl);
+        if ack_quorum_ratio >= 1.0 {
+            assert!(
+                wl.auditor
+                    .stats()
+                    .commits(crate::workload::actions::Action::StoreConsumerOffset)
+                    > 0,
+                "the strict CI cell must acknowledge an offset store"
+            );
+            assert!(
+                convergence.offsets_compared_with_shadow > 0,
+                "the strict CI cell must compare its acknowledged offset shadow"
+            );
+            println!(
+                "strict offset proof: stores={}, offsets_compared_with_shadow={}",
+                wl.auditor
+                    .stats()
+                    .commits(crate::workload::actions::Action::StoreConsumerOffset),
+                convergence.offsets_compared_with_shadow,
+            );
+        }
     }
 
     /// A result-framed transport rejection is not a committed result.
@@ -5507,9 +10441,11 @@ mod tests {
     /// Asserts a transient was seen, so this cannot pass on a path that never produces
     /// one.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn shell_workload_survives_result_framed_transient_rejections() {
         use crate::workload::{
             FaultInjector, Workload,
+            actions::Action,
             options::{ActionWeights, WorkloadOptions},
             oracle, run_with_faults,
         };
@@ -5521,10 +10457,64 @@ mod tests {
 
         let replica_count: u8 = 3;
         let client_id: u128 = 1;
-        // Hand-picked: of seeds 1..=40 under these options, ten reached a transient.
-        // Crashing the primary under a lossy network is necessary but not sufficient,
-        // so the seed cannot be arbitrary. Re-scan if the PRNG streams are remapped.
         let seed = 2;
+        {
+            const SAMPLE_ATTEMPTS: usize = 16;
+            let mut sim = Simulator::with_shards_shell(
+                usize::from(replica_count),
+                1,
+                std::iter::once(client_id),
+                packet::PacketSimulatorOptions {
+                    node_count: replica_count,
+                    client_count: 1,
+                    seed,
+                    ..packet::PacketSimulatorOptions::default()
+                },
+            );
+            let client = SimClient::new(client_id);
+            sim.shell_login(&client);
+            let mut options = WorkloadOptions::new(seed, replica_count, vec![]);
+            options.weights = ActionWeights::new(&[(Action::CreateStream, 100)]);
+            let mut workload = Workload::new(options);
+            let (target, request) = (0..SAMPLE_ATTEMPTS)
+                .find_map(|_| workload.build_request(&client))
+                .expect("a fresh stream can be created without existing metadata");
+            let request_id = request.header().request;
+
+            // Admission must refuse the request before the workload sees any reply.
+            sim.metadata_consensus(usize::from(target))
+                .expect("target hosts metadata")
+                .begin_state_transfer_await();
+            let reply = submit_and_wait_for_reply(&mut sim, client_id, target, request);
+            assert_eq!(reply.header().request, request_id);
+            assert_eq!(reply.header().status, 0);
+            assert_eq!(
+                iggy_binary_protocol::consensus::result_code(reply.body()),
+                Some(iggy_common::IggyError::TransientNotAccepted.as_code()),
+            );
+            assert!(workload.on_reply(&reply).is_empty());
+            assert_eq!(workload.auditor.stats().transient_rejections, 1);
+            assert_eq!(workload.total_in_flight(), 1);
+
+            sim.metadata_consensus(usize::from(target))
+                .expect("target hosts metadata")
+                .set_state_transfer_stage(consensus::StateTransferStage::Idle);
+            let mut invariants = crate::workload::invariants::Invariants::new();
+            assert!(
+                oracle::drive_to_quiesce(
+                    &mut sim,
+                    &mut workload,
+                    &[client],
+                    1_000,
+                    &mut invariants,
+                ),
+                "{}",
+                oracle::quiesce_failure_report(&sim, &workload),
+            );
+            assert_eq!(workload.auditor.stats().commits(Action::CreateStream), 1);
+            assert_eq!(workload.total_in_flight(), 0);
+        }
+
         let network_opts = packet::PacketSimulatorOptions {
             node_count: replica_count,
             client_count: 1,
@@ -5557,8 +10547,6 @@ mod tests {
 
         let mut options = WorkloadOptions::new(seed, replica_count, vec![ns]);
         options.weights = ActionWeights::uniform();
-        // Crashing the primary is what puts a live request on a replica that
-        // cannot place it, which is where the transient comes from.
         options.crash_per_tick_ratio = 0.05;
         options.restart_per_tick_ratio = 0.08;
         options.spare_primary = false;
@@ -5578,16 +10566,274 @@ mod tests {
         );
 
         assert!(
-            wl.auditor.stats().transient_rejections > 0,
-            "no request was answered with a result-framed transient rejection, so the \
-             path this test exists to cover never ran"
-        );
-
-        assert!(
-            oracle::drive_to_quiesce(&mut sim, &mut wl, 50_000, &mut invariants),
+            oracle::drive_to_quiesce(&mut sim, &mut wl, &clients, 50_000, &mut invariants),
             "{}",
             oracle::quiesce_failure_report(&sim, &wl),
         );
+    }
+
+    /// A shell client that logged in to a backup follows the metadata leader.
+    ///
+    /// The session is bound to the replica the client logged in to, so pointing
+    /// requests at the leader alone gets them evicted. Without a fresh login there
+    /// every request lands on the backup and is refused with `NotPrimary`, which
+    /// is how a crash and restart strands a client for the rest of a run.
+    #[test]
+    fn given_a_client_logged_in_to_a_backup_when_refused_should_follow_the_leader() {
+        const RUN_TICKS: u64 = 1_000;
+        let (mut sim, mut wl, clients) = client_logged_in_to_a_backup();
+        let mut invariants = crate::workload::invariants::Invariants::new();
+        crate::workload::run(
+            &mut sim,
+            &mut wl,
+            &clients,
+            RUN_TICKS,
+            u64::MAX,
+            &mut invariants,
+        );
+
+        assert!(
+            wl.auditor.stats().commits_per_action.iter().sum::<u64>() > 0,
+            "the client committed nothing, so it never reached the leader"
+        );
+        assert!(
+            wl.redirects() > 0,
+            "no request was redirected to the leader"
+        );
+        assert!(
+            crate::workload::oracle::drive_to_quiesce(
+                &mut sim,
+                &mut wl,
+                &clients,
+                20_000,
+                &mut invariants
+            ),
+            "{}",
+            crate::workload::oracle::quiesce_failure_report(&sim, &wl),
+        );
+    }
+
+    /// A lost login must be retried during the drain before its held request can go out.
+    #[test]
+    fn given_a_lost_leader_login_when_drained_should_retry_it_and_send_the_held_request() {
+        const REDIRECT_TICKS: usize = 1_000;
+        const ACTION: crate::workload::actions::Action =
+            crate::workload::actions::Action::CreateStream;
+        let (mut sim, mut wl, clients) = client_logged_in_to_a_backup();
+        // Setup retries can leave replies that would satisfy the later handshake.
+        assert!(
+            (0..SETUP_TOTAL_STEPS).any(|_| {
+                sim.step();
+                sim.network.packets_in_flight() == 0
+            }),
+            "setup login traffic must settle before losing the redirect login"
+        );
+        wl.options.weights = crate::workload::options::ActionWeights::new(&[(ACTION, 100)]);
+        let client_id = clients[0].client_id();
+        let mut invariants = crate::workload::invariants::Invariants::new();
+        assert!(
+            (0..REDIRECT_TICKS).any(|_| {
+                crate::workload::run(&mut sim, &mut wl, &clients, 1, u64::MAX, &mut invariants);
+                wl.is_recovering(client_id) && wl.total_in_flight() == 1
+            }),
+            "no request waited for a leader login"
+        );
+        let leader = sim
+            .metadata_leader()
+            .expect("the cluster has a metadata leader");
+        let before_loss = sim.network.packets_in_flight();
+        sim.network
+            .link_clear(ProcessId::Client(client_id), ProcessId::Replica(leader));
+        assert_eq!(
+            before_loss - sim.network.packets_in_flight(),
+            1,
+            "the pending leader login must be the lost packet"
+        );
+        for replica in 0..sim.replica_count {
+            if replica != leader {
+                sim.network.set_link_filter(
+                    ProcessId::Client(client_id),
+                    ProcessId::Replica(replica),
+                    false,
+                );
+            }
+        }
+        let commits_before = wl.auditor.stats().commits(ACTION);
+
+        assert!(
+            crate::workload::oracle::drive_to_quiesce(
+                &mut sim,
+                &mut wl,
+                &clients,
+                20_000,
+                &mut invariants
+            ),
+            "{}",
+            crate::workload::oracle::quiesce_failure_report(&sim, &wl),
+        );
+        assert!(
+            !wl.is_recovering(client_id),
+            "the drain did not bind the leader login"
+        );
+        assert_eq!(
+            wl.auditor.stats().commits(ACTION),
+            commits_before + 1,
+            "the held request must commit after the login retry"
+        );
+    }
+
+    #[test]
+    fn given_a_client_bound_only_to_a_backup_when_setting_up_a_fixture_group_should_bind_the_primary()
+     {
+        const PRIMARY: u8 = 0;
+        let (mut sim, mut workload, clients) = client_logged_in_to_a_backup();
+        workload.options.weights = crate::workload::options::ActionWeights::lifecycle();
+        let client = &clients[0];
+        let original_session = client.session_id();
+        let (stream, topic) = workload.shadow.fixture_names(0);
+        let request = client.create_consumer_group(
+            &stream,
+            &topic,
+            crate::workload::shadow::FIXTURE_GROUP_NAME,
+        );
+        sim.submit_request(client.client_id(), PRIMARY, request.into_generic());
+        let mut evicted = Vec::new();
+        for _ in 0..SETUP_TOTAL_STEPS {
+            sim.step();
+            evicted.extend(sim.take_evictions());
+            if !evicted.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(
+            evicted,
+            vec![(client.client_id(), PRIMARY)],
+            "the primary must start unbound"
+        );
+
+        crate::workload::create_fixture_groups(&mut sim, &mut workload, client);
+
+        assert_eq!(client.session_id(), original_session);
+        let metadata = sim.replicas[usize::from(PRIMARY)].shards[0]
+            .plane
+            .metadata();
+        assert!(metadata.mux_stm.streams().read(|inner| {
+            inner
+                .items
+                .iter()
+                .flat_map(|(_, stream)| stream.topics.iter())
+                .any(|(_, entry)| {
+                    entry.name.as_ref() == topic
+                        && entry.consumer_groups.values().any(|group| {
+                            group.name.as_ref() == crate::workload::shadow::FIXTURE_GROUP_NAME
+                        })
+                })
+        }));
+        let journal = &sim.replicas[usize::from(PRIMARY)].metadata_journal;
+        let creates = (1..=journal.last_op().unwrap())
+            .filter_map(|op| journal.entry_sync(op))
+            .filter(|entry| entry.header().operation == Operation::CreateConsumerGroup)
+            .count();
+        assert_eq!(creates, 1, "fixture setup must commit exactly one create");
+    }
+
+    #[test]
+    fn given_a_previous_fixture_setup_reply_when_creating_another_group_should_wait_for_its_own_reply()
+     {
+        const PRIMARY: u8 = 0;
+        let (mut sim, workload, clients) = client_logged_in_to_a_backup();
+        let client = &clients[0];
+        let (stream, topic) = workload.shadow.fixture_names(0);
+        let request = client.create_consumer_group(
+            &stream,
+            &topic,
+            crate::workload::shadow::FIXTURE_GROUP_NAME,
+        );
+        let first_reply = sim.await_setup_reply(
+            client,
+            PRIMARY,
+            &request.into_generic(),
+            Operation::CreateConsumerGroup,
+            "first fixture group",
+        );
+        assert_eq!(
+            iggy_binary_protocol::result_code(first_reply.body()),
+            Some(0)
+        );
+        sim.deferred_client_replies.push((PRIMARY, first_reply));
+
+        let second = IggyNamespace::new(1, 2, 0);
+        sim.init_partition(second);
+        sim.seed_stream_topic_partition(second);
+        let mut options = crate::workload::options::WorkloadOptions::new(
+            workload.options.seed,
+            sim.replica_count,
+            vec![second],
+        );
+        options.weights = crate::workload::options::ActionWeights::lifecycle();
+        let mut second_workload = crate::workload::Workload::new(options);
+        let (_, second_topic) = second_workload.shadow.fixture_names(0);
+
+        crate::workload::create_fixture_groups(&mut sim, &mut second_workload, client);
+
+        let metadata = sim.replicas[usize::from(PRIMARY)].shards[0]
+            .plane
+            .metadata();
+        assert!(
+            metadata.mux_stm.streams().read(|inner| {
+                inner
+                    .items
+                    .iter()
+                    .flat_map(|(_, stream)| stream.topics.iter())
+                    .any(|(_, entry)| {
+                        entry.name.as_ref() == second_topic
+                            && entry.consumer_groups.values().any(|group| {
+                                group.name.as_ref() == crate::workload::shadow::FIXTURE_GROUP_NAME
+                            })
+                    })
+            }),
+            "an earlier setup reply must not finish the next fixture before its group exists"
+        );
+    }
+
+    /// A shell cluster whose only client logged in to a backup, and a uniform
+    /// workload that sends there.
+    fn client_logged_in_to_a_backup() -> (Simulator, crate::workload::Workload, [SimClient; 1]) {
+        const BACKUP: u8 = 1;
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+        let replica_count: u8 = 3;
+        let client_id: u128 = 1;
+        let seed = 0x4C45_4144;
+        let mut sim = Simulator::with_shards_shell(
+            usize::from(replica_count),
+            1,
+            std::iter::once(client_id),
+            packet::PacketSimulatorOptions {
+                node_count: replica_count,
+                client_count: 1,
+                seed,
+                ..packet::PacketSimulatorOptions::default()
+            },
+        );
+        let ns = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(ns);
+        sim.seed_stream_topic_partition(ns);
+        let client = SimClient::new(client_id);
+        sim.shell_login_via(&client, BACKUP);
+
+        let mut options =
+            crate::workload::options::WorkloadOptions::new(seed, replica_count, vec![ns]);
+        options.weights = crate::workload::options::ActionWeights::uniform();
+        let mut wl = crate::workload::Workload::new(options);
+        assert!(
+            wl.rehome(client_id, BACKUP).is_empty(),
+            "nothing is outstanding before the run"
+        );
+        (sim, wl, [client])
     }
 
     /// The cross-replica equality check actually compares replicas against each
@@ -5671,7 +10917,7 @@ mod tests {
             "no replica crashed, so no view change ran and this proves nothing"
         );
         assert!(
-            oracle::drive_to_quiesce(&mut sim, &mut workload, 50_000, &mut invariants),
+            oracle::drive_to_quiesce(&mut sim, &mut workload, &clients, 50_000, &mut invariants),
             "{}",
             oracle::quiesce_failure_report(&sim, &workload),
         );
@@ -5750,7 +10996,7 @@ mod tests {
         );
 
         assert!(
-            oracle::drive_to_quiesce(&mut sim, &mut wl, 50_000, &mut invariants),
+            oracle::drive_to_quiesce(&mut sim, &mut wl, &clients, 50_000, &mut invariants),
             "{}",
             oracle::quiesce_failure_report(&sim, &wl),
         );
@@ -5973,13 +11219,19 @@ mod tests {
     /// IGGY-66 acceptance: per-partition consensus independence. Blocking `ns_a`'s
     /// `PrepareOk` acks and filling its pipeline to `PIPELINE_PREPARE_QUEUE_MAX`
     /// wedges it for want of quorum, `ns_b` still commits, and lifting the block
-    /// drains `ns_a` completely.
+    /// recovers every `ns_a` operation, replaying its identity if leadership moves.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn per_partition_consensus_independence() {
         use consensus::PIPELINE_PREPARE_QUEUE_MAX;
         use iggy_binary_protocol::{Command, PrepareOkHeader};
         use packet::Packet;
+        use std::collections::HashSet;
         use std::sync::atomic::{AtomicU64, Ordering};
+
+        const DRAIN_STEPS: usize = 800;
+        const RESOLVE_STEPS: usize = 800;
+        const RETRY_INTERVAL: usize = 100;
 
         // The link predicate is a plain fn pointer (no captures), so the
         // namespace under blockade travels through a static. Owned by
@@ -6030,18 +11282,26 @@ mod tests {
 
         // Block every backup's PrepareOk for ns_a toward the primary: the
         // primary's self-ack alone is 1 < quorum 2, so ns_a can prepare
-        // and replicate but never commit.
-        for backup in 1..replica_count {
-            *sim.network
-                .link_drop_packet_fn(ProcessId::Replica(backup), ProcessId::Replica(0)) =
-                Some(drop_blocked_prepare_ok);
+        // and replicate but never commit. Every link, because the primary
+        // rebalance may move ns_a's primary off replica 0 during the blockade.
+        let replica_links = || {
+            (0..replica_count).flat_map(move |from| {
+                (0..replica_count)
+                    .filter(move |to| *to != from)
+                    .map(move |to| (ProcessId::Replica(from), ProcessId::Replica(to)))
+            })
+        };
+        for (from, to) in replica_links() {
+            *sim.network.link_drop_packet_fn(from, to) = Some(drop_blocked_prepare_ok);
         }
 
         // Fill ns_a's pipeline exactly to the cap (one more would be
         // rejected at preflight and generate a reply, muddying the
         // no-replies assertion below).
+        let mut retained = Vec::with_capacity(clients.len());
         for (sequence, client) in clients.iter().enumerate() {
             let msg = client.send_messages(ns_a, &[Bytes::from(format!("wedged-{sequence}"))]);
+            retained.push(msg.deep_copy());
             sim.submit_request(client.client_id(), 0, msg.into_generic());
         }
         for _ in 0..100 {
@@ -6075,27 +11335,60 @@ mod tests {
         );
 
         // Lift the blockade: retransmitted acks land and ns_a drains.
-        for backup in 1..replica_count {
-            *sim.network
-                .link_drop_packet_fn(ProcessId::Replica(backup), ProcessId::Replica(0)) = None;
+        for (from, to) in replica_links() {
+            *sim.network.link_drop_packet_fn(from, to) = None;
         }
-        let mut drained_replies = 0usize;
-        for _ in 0..800 {
-            for reply in sim.step() {
-                // Only ns_a replies are outstanding once ns_b committed
-                // above, so every reply counts toward the drain.
-                if reply.header().request != ns_b_request {
-                    drained_replies += 1;
+        let mut committed = HashSet::new();
+        // Rebalancing can cancel original waiters and discard uncommitted work.
+        // Resolve the remaining identities at the current primary without
+        // minting new requests or counting duplicate replies as progress.
+        for step in 0..DRAIN_STEPS + RESOLVE_STEPS {
+            if committed.len() == PIPELINE_PREPARE_QUEUE_MAX {
+                break;
+            }
+            if step >= DRAIN_STEPS
+                && step % RETRY_INTERVAL == 0
+                && let Some(primary) = (0..replica_count).find(|replica| {
+                    sim.partition_consensus_state(usize::from(*replica), ns_a)
+                        .is_some_and(|state| state.is_primary && state.status == Status::Normal)
+                })
+            {
+                for request in &retained {
+                    let identity = (request.header().client, request.header().request);
+                    if !committed.contains(&identity) {
+                        sim.submit_request(identity.0, primary, request.deep_copy().into_generic());
+                    }
                 }
             }
-            if drained_replies == PIPELINE_PREPARE_QUEUE_MAX {
-                break;
+            for reply in sim.step() {
+                let identity = (reply.header().client, reply.header().request);
+                assert!(retained.iter().any(|request| {
+                    (request.header().client, request.header().request) == identity
+                }));
+                if reply.header().status == 0 {
+                    committed.insert(identity);
+                } else {
+                    assert!(
+                        workload::TransientRejection::from_code(reply.header().status).is_some(),
+                        "unexpected recovery reply: {:?}",
+                        reply.header()
+                    );
+                }
             }
         }
         assert_eq!(
-            drained_replies, PIPELINE_PREPARE_QUEUE_MAX,
+            committed.len(),
+            PIPELINE_PREPARE_QUEUE_MAX,
             "every wedged ns_a send must commit once acks flow again"
         );
+        for _ in 0..100 {
+            sim.step();
+        }
+        for replica in 0..usize::from(replica_count) {
+            let offsets = sim.offsets(replica, ns_a).unwrap();
+            assert_eq!(offsets.commit_offset, PIPELINE_PREPARE_QUEUE_MAX as u64 - 1);
+            assert_eq!(offsets.write_offset, offsets.commit_offset);
+        }
     }
 
     /// `SendMessages` workload at 3 replicas x 4 shards drains, converges
@@ -6150,7 +11443,7 @@ mod tests {
         assert!(replies > 0, "workload produced no replies");
 
         assert!(
-            oracle::drive_to_quiesce(&mut sim, &mut wl, 5_000, &mut invariants),
+            oracle::drive_to_quiesce(&mut sim, &mut wl, &clients, 5_000, &mut invariants),
             "system did not drain within the tick budget"
         );
         oracle::assert_converged(&sim, &mut wl);
@@ -6177,6 +11470,9 @@ mod view_change_data_loss_tests {
     use super::*;
     use crate::executor::yield_once;
     use consensus::{Sequencer, Status};
+    use iggy_binary_protocol::WireDecode;
+    use iggy_binary_protocol::requests::topics::CreateTopicWithAssignmentsRequest;
+    use iggy_binary_protocol::requests::users::login_register::RegisterRequest;
     use journal::Journal;
     use message_bus::MessageBus;
 
@@ -6230,11 +11526,8 @@ mod view_change_data_loss_tests {
         // next primary's journal, then the old primary dies before the commit
         // makes it back.
         let straggler = SimClient::new(straggler_client);
-        let straggler_verifier = straggler
-            .register()
-            .body()
-            .try_into()
-            .expect("registration carries a verifier");
+        let registration = RegisterRequest::decode_from(straggler.register().body())
+            .expect("registration carries a verified account and verifier");
         sim.submit_request(straggler_client, 0, straggler.register().into_generic());
         let mut staged = None;
         for _ in 0..200 {
@@ -6272,7 +11565,7 @@ mod view_change_data_loss_tests {
                     match submit_shard
                         .plane
                         .metadata()
-                        .submit_register_in_process(straggler_client, 0, straggler_verifier)
+                        .submit_register_in_process(straggler_client, 0, registration)
                         .await
                     {
                         Ok(_) => {
@@ -6592,6 +11885,312 @@ mod view_change_data_loss_tests {
             .expect("shard 0 owns metadata consensus")
             .status()
     }
+
+    /// The metadata primary admits a create that both backups journal, then
+    /// crashes before any ack reaches it, so its client has no reply. The
+    /// survivors elect a primary that inherits the create uncommitted. A create
+    /// that primary admits meanwhile must count the inherited partitions once,
+    /// and the inherited create must commit once, with the assignments the
+    /// crashed primary persisted.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn given_an_inherited_create_when_the_new_primary_admits_another_should_count_and_commit_it_once()
+     {
+        const STREAM: &str = "inherited-placement";
+        const INHERITED_TOPIC: &str = "inherited";
+        const ADMITTED_TOPIC: &str = "admitted";
+        const INHERITOR: u128 = 1;
+        const ADMITTER: u128 = 2;
+        const OLD_PRIMARY: u8 = 0;
+        const INHERITED_PARTITIONS: u32 = 1;
+        const ADMITTED_PARTITIONS: u32 = 3;
+        // Nothing is placed before the inherited create, so it takes replica 0.
+        const INHERITED_VIEWS: [u32; 1] = [0];
+        // Counting the inherited partition once fills replicas 1 and 2 first.
+        // Dropping it starts again at replica 0 ([0, 1, 2]), and counting it
+        // twice repeats replica 1 ([1, 2, 1]).
+        const ADMITTED_VIEWS: [u32; 3] = [1, 2, 0];
+        const PREPARE_STEPS: usize = 200;
+        const ELECTION_STEPS: usize = 5_000;
+        const ADMISSION_STEPS: usize = 2_000;
+        const RESUBMIT_STEPS: usize = 50;
+        const COMMIT_STEPS: usize = 5_000;
+
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+        let replica_count: u8 = 3;
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: replica_count,
+            client_count: 2,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        let mut sim = Simulator::new(
+            usize::from(replica_count),
+            [INHERITOR, ADMITTER].into_iter(),
+            network_opts,
+        );
+        let inheritor = SimClient::new(INHERITOR);
+        let admitter = SimClient::new(ADMITTER);
+        sim.register_client_with_primary(&inheritor);
+        sim.register_client_with_primary(&admitter);
+        let created = super::tests::submit_and_wait_for_reply(
+            &mut sim,
+            INHERITOR,
+            OLD_PRIMARY,
+            inheritor.create_stream(STREAM),
+        );
+        assert_eq!(
+            iggy_binary_protocol::result_code(created.body()),
+            Some(0),
+            "the stream must commit before the creates race"
+        );
+        let views = |assignments: &[(u64, u32)]| {
+            assignments
+                .iter()
+                .map(|&(_, view)| view)
+                .collect::<Vec<_>>()
+        };
+
+        // No ack reaches the old primary or passes between the survivors, so the
+        // create stays uncommitted through the election and after it.
+        for (from, to) in [(1, 0), (2, 0), (1, 2), (2, 1)] {
+            set_prepare_ok_delivery(&mut sim, from, to, false);
+        }
+        let committed = metadata_progress(&sim, OLD_PRIMARY).1;
+        let inherited_create =
+            inheritor.create_topic(STREAM, INHERITED_TOPIC, INHERITED_PARTITIONS);
+        let inherited_request = inherited_create.header().request;
+        sim.submit_request(
+            INHERITOR,
+            OLD_PRIMARY,
+            inherited_create.deep_copy().into_generic(),
+        );
+        let (inherited_op, inherited_assignments) = (0..PREPARE_STEPS)
+            .find_map(|_| {
+                assert!(
+                    sim.step()
+                        .iter()
+                        .all(|reply| reply.header().client != INHERITOR),
+                    "the inherited create must not be answered before it commits"
+                );
+                let on_backups = [1, 2]
+                    .map(|backup| journaled_creates(&sim, backup, INHERITOR, inherited_request));
+                (on_backups[0].len() == 1 && on_backups[0] == on_backups[1])
+                    .then(|| on_backups[0][0].clone())
+            })
+            .expect("both backups must journal the create");
+        assert_eq!(views(&inherited_assignments), INHERITED_VIEWS);
+        assert_eq!(
+            metadata_progress(&sim, OLD_PRIMARY).1,
+            committed,
+            "the old primary must not commit the create without acks"
+        );
+
+        sim.replica_crash(OLD_PRIMARY);
+        let leader = (0..ELECTION_STEPS)
+            .find_map(|_| {
+                assert!(
+                    sim.step()
+                        .iter()
+                        .all(|reply| reply.header().client != INHERITOR),
+                    "the inherited create must not be answered before it commits"
+                );
+                (1..replica_count).find(|&replica| is_new_metadata_primary(&sim, replica))
+            })
+            .expect("the survivors must elect a metadata primary");
+        let (head, commit_max) = metadata_progress(&sim, leader);
+        assert!(
+            head >= inherited_op && commit_max < inherited_op,
+            "the new primary must inherit op {inherited_op} uncommitted \
+             (head {head}, commit {commit_max})"
+        );
+
+        let admitted_create = admitter.create_topic(STREAM, ADMITTED_TOPIC, ADMITTED_PARTITIONS);
+        let admitted_request = admitted_create.header().request;
+        let (admitted_op, admitted_assignments) = (0..ADMISSION_STEPS)
+            .find_map(|step| {
+                if step % RESUBMIT_STEPS == 0 {
+                    sim.submit_request(
+                        ADMITTER,
+                        leader,
+                        admitted_create.deep_copy().into_generic(),
+                    );
+                }
+                for reply in sim.step() {
+                    assert!(
+                        reply.header().client == ADMITTER && setup_reply_is_transient(&reply),
+                        "only a transient refusal of the second create may be answered \
+                         before the survivors ack"
+                    );
+                }
+                journaled_creates(&sim, leader, ADMITTER, admitted_request)
+                    .into_iter()
+                    .next()
+            })
+            .expect("the new primary must admit a create while it holds the inherited one");
+        assert!(
+            metadata_progress(&sim, leader).1 < inherited_op,
+            "the inherited create must still be pending when the second one is admitted"
+        );
+        assert_eq!(
+            views(&admitted_assignments),
+            ADMITTED_VIEWS,
+            "the second create must count the inherited partition exactly once"
+        );
+
+        for (from, to) in [(1, 2), (2, 1)] {
+            set_prepare_ok_delivery(&mut sim, from, to, true);
+        }
+        let reply = (0..COMMIT_STEPS)
+            .find_map(|_| {
+                sim.step().into_iter().find(|reply| {
+                    reply.header().client == ADMITTER
+                        && reply.header().request == admitted_request
+                        && !setup_reply_is_transient(reply)
+                })
+            })
+            .expect("the second create must commit once the survivors ack");
+        assert_eq!(
+            (
+                reply.header().op,
+                iggy_binary_protocol::result_code(reply.body())
+            ),
+            (admitted_op, Some(0))
+        );
+
+        // Commits are ordered, so the inherited create committed before the
+        // second one. Its retry must get that commit back, not apply again.
+        sim.submit_request(INHERITOR, leader, inherited_create.into_generic());
+        let retried = (0..COMMIT_STEPS)
+            .find_map(|_| {
+                sim.step()
+                    .into_iter()
+                    .find(|reply| reply.header().client == INHERITOR)
+            })
+            .expect("the retried create must be answered");
+        assert_eq!(
+            (
+                retried.header().op,
+                iggy_binary_protocol::result_code(retried.body())
+            ),
+            (inherited_op, Some(0)),
+            "the retry must return the inherited commit"
+        );
+        assert_eq!(
+            journaled_creates(&sim, leader, INHERITOR, inherited_request),
+            vec![(inherited_op, inherited_assignments.clone())],
+            "the inherited create must be prepared once"
+        );
+
+        let expected = vec![
+            (ADMITTED_TOPIC.to_string(), admitted_assignments),
+            (INHERITED_TOPIC.to_string(), inherited_assignments),
+        ];
+        for replica in 1..replica_count {
+            assert!(
+                (0..COMMIT_STEPS).any(|_| {
+                    sim.step();
+                    sim.replicas[usize::from(replica)].shards[0]
+                        .plane
+                        .metadata()
+                        .applied_frontier()
+                        .get()
+                        >= admitted_op
+                }),
+                "replica {replica} must apply both creates"
+            );
+            assert_eq!(
+                committed_topics(&sim, replica, STREAM),
+                expected,
+                "replica {replica} must hold each create once, with its persisted assignments"
+            );
+        }
+    }
+
+    fn set_prepare_ok_delivery(sim: &mut Simulator, from: u8, to: u8, deliver: bool) {
+        let filter = sim
+            .network
+            .link_filter_mut(ProcessId::Replica(from), ProcessId::Replica(to));
+        if deliver {
+            filter.insert(Command::PrepareOk);
+        } else {
+            filter.remove(Command::PrepareOk);
+        }
+    }
+
+    /// Each op a replica journaled for `client`'s create `request`, with its
+    /// partition assignments as `(consensus group, initial view)`.
+    fn journaled_creates(
+        sim: &Simulator,
+        replica: u8,
+        client: u128,
+        request: u64,
+    ) -> Vec<(u64, Vec<(u64, u32)>)> {
+        let journal: &SimJournal<MemStorage> = sim.replicas[usize::from(replica)].shards[0]
+            .plane
+            .metadata()
+            .journal
+            .as_ref()
+            .expect("shard 0 owns the metadata journal");
+        (1..=journal.last_op().unwrap_or(0))
+            .filter_map(|op| {
+                let header = *Journal::header(journal, usize::try_from(op).ok()?)?;
+                if header.client != client || header.request != request {
+                    return None;
+                }
+                let prepare = futures::executor::block_on(journal.entry(&header))?;
+                let create = CreateTopicWithAssignmentsRequest::decode_from(prepare.body())
+                    .expect("a journaled create carries its assignments");
+                Some((
+                    header.op,
+                    create
+                        .partitions
+                        .iter()
+                        .map(|assignment| (assignment.consensus_group_id, assignment.initial_view))
+                        .collect(),
+                ))
+            })
+            .collect()
+    }
+
+    /// Each topic a replica committed in `stream`, sorted by name, with its
+    /// partitions as `(consensus group, created view)`.
+    fn committed_topics(
+        sim: &Simulator,
+        replica: u8,
+        stream: &str,
+    ) -> Vec<(String, Vec<(u64, u32)>)> {
+        let mut topics = sim.replicas[usize::from(replica)].shards[0]
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .read(|streams| {
+                streams
+                    .items
+                    .iter()
+                    .filter(|(_, candidate)| &*candidate.name == stream)
+                    .flat_map(|(_, matched)| matched.topics.iter())
+                    .map(|(_, topic)| {
+                        (
+                            topic.name.to_string(),
+                            topic
+                                .partitions
+                                .iter()
+                                .map(|partition| {
+                                    (partition.consensus_group_id, partition.created_view)
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            });
+        topics.sort();
+        topics
+    }
 }
 
 /// Whether a setup-handshake reply is a result-framed transport rejection rather
@@ -6782,7 +12381,7 @@ mod partition_repair_driver_tests {
 
     use super::*;
     use bytes::Bytes;
-    use consensus::Status;
+    use consensus::{Sequencer, Status};
     use iggy_binary_protocol::{
         CommitHeader, ConsensusHeader, PrepareHeader, RepairRangeReplyHeader,
         RequestPreparesHeader, StartViewHeader,
@@ -6795,6 +12394,10 @@ mod partition_repair_driver_tests {
     /// replica 2 forwards to nobody: it is the only replica whose losses do not
     /// also starve its successor, and therefore the group, of quorum.
     const LAGGING: u8 = 2;
+
+    /// Replicas in a [`cluster`]: the smallest group that keeps quorum while
+    /// [`LAGGING`] misses ops.
+    const CLUSTER_REPLICAS: u8 = 3;
 
     const CLIENT_ID: u128 = 1;
 
@@ -6920,20 +12523,34 @@ mod partition_repair_driver_tests {
     }
 
     pub fn cluster(seed: u64) -> (Simulator, SimClient) {
+        sharded_cluster(seed, 1)
+    }
+
+    /// [`cluster`] with `shards_per_replica` shards on each replica.
+    pub fn sharded_cluster(seed: u64, shards_per_replica: u16) -> (Simulator, SimClient) {
+        sized_cluster(seed, CLUSTER_REPLICAS, shards_per_replica)
+    }
+
+    /// [`sharded_cluster`] with `replica_count` replicas.
+    pub fn sized_cluster(
+        seed: u64,
+        replica_count: u8,
+        shards_per_replica: u16,
+    ) -> (Simulator, SimClient) {
         server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
         });
-        let replica_count: u8 = 3;
         let network_opts = packet::PacketSimulatorOptions {
             node_count: replica_count,
             client_count: 1,
             seed,
             ..packet::PacketSimulatorOptions::default()
         };
-        let sim = Simulator::new(
+        let sim = Simulator::with_shards(
             replica_count as usize,
+            shards_per_replica,
             std::iter::once(CLIENT_ID),
             network_opts,
         );
@@ -6958,7 +12575,7 @@ mod partition_repair_driver_tests {
     }
 
     /// `(status, view, commit_min, commit_max)` of one replica's partition group.
-    fn group_state(
+    pub fn group_state(
         sim: &Simulator,
         replica: u8,
         namespace: IggyNamespace,
@@ -7118,6 +12735,7 @@ mod partition_repair_driver_tests {
             header.group = namespace.inner();
             header.op = OPS as u64;
             header.commit = COMMITTED_OPS as u64;
+            header.partition_incarnation = missing.header().partition_incarnation;
             header.size = u32::try_from(total_size).unwrap();
             header.checksum_body = body_checksum;
             header.seal();
@@ -7182,12 +12800,19 @@ mod partition_repair_driver_tests {
     }
 
     fn deliver_commit(shard: &Replica, namespace: IggyNamespace, commit: u64) {
+        let incarnation = shard
+            .plane
+            .partitions()
+            .get_by_ns(&namespace)
+            .expect("the replica hosts the partition")
+            .created_revision();
         let message = Message::<CommitHeader>::new(size_of::<CommitHeader>()).transmute_header(
             |_, header: &mut CommitHeader| {
                 header.command = Command::Commit;
                 header.cluster = 1;
                 header.replica = 0;
                 header.group = namespace.inner();
+                header.partition_incarnation = incarnation;
                 header.commit = commit;
                 header.timestamp_monotonic = commit;
                 header.size = u32::try_from(size_of::<CommitHeader>()).unwrap();
@@ -7230,7 +12855,7 @@ mod partition_repair_driver_tests {
         /// Primary -> 2: withhold this group's commit heartbeats, so the
         /// `Advanced` backstop can never run, and withhold retransmits of the
         /// dropped op. The retransmit half stands in for production behaviour
-        /// rather than adding a fault: `consensus::retransmit_targets` skips an
+        /// rather than adding a fault: `consensus::prepare_timeout_targets` skips an
         /// op that already reached quorum, and this op reaches quorum on 0 and 1
         /// alone. Without it the retry timer could heal the gap and the test
         /// would pass with no repair driver at all.
@@ -7355,12 +12980,20 @@ mod partition_repair_driver_tests {
         *sim.network
             .link_drop_packet_fn(ProcessId::Replica(0), ProcessId::Replica(LAGGING)) =
             Some(starve_commit_edge);
-
-        produce(&mut sim, &client, namespace, GAP_SENDS, "gap");
+        // Evict before the repair debounce can heal the hole during produce.
+        produce(&mut sim, &client, namespace, STRAND_SENDS, "gap");
+        let withheld = WITHHELD_OP.load(Ordering::Relaxed);
         assert_ne!(
-            WITHHELD_OP.load(Ordering::Relaxed),
-            0,
+            withheld, 0,
             "no partition prepare crossed the chain link, so the fault never armed"
+        );
+        let (_, _, commit_min, commit_max) = group_state(&sim, LAGGING, namespace);
+        assert!(
+            commit_min < withheld
+                && withheld <= commit_max
+                && !journal_holds(&sim, LAGGING, namespace, withheld),
+            "op {withheld} must still be a committed hole before eviction \
+             (walkable to {commit_min} of {commit_max})"
         );
 
         // Compact the serving side past the gap. This plane's journal is
@@ -7378,14 +13011,27 @@ mod partition_repair_driver_tests {
             partition.log.journal().inner.clear_all();
         }
 
-        for _ in 0..QUIET_STEPS {
+        // A reordered RepairDone can precede RangeEvicted, requiring a retry.
+        // This budget remains below the heartbeat timeout with the short burst.
+        let mut repair_armed = false;
+        for _ in 0..STRAND_QUIET_STEPS {
             sim.step();
+            repair_armed |= sim.replicas[usize::from(LAGGING)]
+                .partition_shard(namespace)
+                .plane
+                .partitions()
+                .get_by_ns(&namespace)
+                .is_some_and(|partition| partition.repair.is_some());
             if transfer_armed(&sim, LAGGING, namespace) {
                 break;
             }
         }
 
         let (status, view, ..) = group_state(&sim, LAGGING, namespace);
+        assert!(
+            repair_armed,
+            "the tick driver never armed the repair session"
+        );
         assert_eq!(
             view, 0,
             "a view change armed the recovery instead of the tick-armed repair session"
@@ -7394,6 +13040,175 @@ mod partition_repair_driver_tests {
             transfer_armed(&sim, LAGGING, namespace),
             "the tick-armed repair session hit an evicted range but never converted \
              to a state transfer (status {status:?})"
+        );
+    }
+
+    /// The rotation used to step back to the primary after each backup, so in a
+    /// group of five a backup alternated between the primary and the replica
+    /// after it until it spent the ring and transferred from the primary. Neither
+    /// of those answers this group's repair here, nor does replica 3: only
+    /// replica 2, two after the primary, serves the withheld op.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn given_five_replicas_when_only_the_second_after_the_primary_serves_repair_should_repair_from_it()
+     {
+        const REPLICAS: u8 = 5;
+        /// Last in the chain 0 -> 1 -> 2 -> 3 -> 4, so its losses cannot starve
+        /// the group of quorum.
+        const LAGGING_OF_FIVE: u8 = 4;
+        /// Every replica but `primary + 2` drops the lagging replica's repair
+        /// requests for the group.
+        const SILENT: [u8; 3] = [0, 1, 3];
+        /// Short sessions, so two silent peers fit in the quiet budget.
+        const ROTATE_RETRY_TICKS: u32 = 10;
+        /// The debounce, two silent sessions and the repair stream. With the
+        /// produce before it, under `NORMAL_HEARTBEAT_TICKS`, so no election
+        /// heals the gap first.
+        const RING_QUIET_STEPS: usize = 400;
+
+        static GAP_NS: AtomicU64 = AtomicU64::new(0);
+        static WITHHELD_OP: AtomicU64 = AtomicU64::new(0);
+        static WITHHELD_COPIES: AtomicU64 = AtomicU64::new(0);
+        static SERVING_PEER_REQUESTS: AtomicU64 = AtomicU64::new(0);
+
+        fn withhold_selected_prepare(packet: &Packet) -> bool {
+            let selected = prepare_for(packet, GAP_NS.load(Ordering::Relaxed))
+                .is_some_and(|header| header.op == WITHHELD_OP.load(Ordering::Relaxed));
+            if selected {
+                WITHHELD_COPIES.fetch_add(1, Ordering::Relaxed);
+            }
+            selected
+        }
+
+        /// Primary -> 4: withhold this group's commit heartbeats, so only the
+        /// tick driver arms and rotates the repair, and the dropped op's
+        /// retransmits.
+        fn starve_commit_edge(packet: &Packet) -> bool {
+            let group = GAP_NS.load(Ordering::Relaxed);
+            withhold_selected_prepare(packet) || is_commit_for(packet, group)
+        }
+
+        fn drop_repair_request(packet: &Packet) -> bool {
+            is_request_prepares_for(packet, GAP_NS.load(Ordering::Relaxed))
+        }
+
+        fn count_serving_peer_request(packet: &Packet) -> bool {
+            if is_request_prepares_for(packet, GAP_NS.load(Ordering::Relaxed)) {
+                SERVING_PEER_REQUESTS.fetch_add(1, Ordering::Relaxed);
+            }
+            false
+        }
+
+        let (mut sim, client) = sized_cluster(0x5EED_024B, REPLICAS, 1);
+        let namespace = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(namespace);
+        sim.register_client_with_primary(&client);
+        GAP_NS.store(namespace.inner(), Ordering::Relaxed);
+        WITHHELD_COPIES.store(0, Ordering::Relaxed);
+        SERVING_PEER_REQUESTS.store(0, Ordering::Relaxed);
+        sim.replicas[usize::from(LAGGING_OF_FIVE)]
+            .partition_shard(namespace)
+            .set_repair_retry_ticks(ROTATE_RETRY_TICKS);
+
+        // Five replicas can outlast the three-replica fixture's fixed send pace.
+        // Await replies so an in-flight request cannot discard the next send.
+        for _ in 0..WARMUP_SENDS {
+            let reply = tests::submit_and_wait_for_reply(
+                &mut sim,
+                CLIENT_ID,
+                0,
+                client.send_messages(namespace, &[Bytes::from_static(b"warmup")]),
+            );
+            assert_eq!(reply.header().status, 0);
+        }
+        let next_op = sim.replicas[0]
+            .partition_shard(namespace)
+            .plane
+            .partitions()
+            .get_by_ns(&namespace)
+            .unwrap()
+            .consensus()
+            .sequencer()
+            .current_sequence()
+            + 1;
+        WITHHELD_OP.store(next_op, Ordering::Relaxed);
+
+        *sim.network.link_drop_packet_fn(
+            ProcessId::Replica(LAGGING_OF_FIVE - 1),
+            ProcessId::Replica(LAGGING_OF_FIVE),
+        ) = Some(withhold_selected_prepare);
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(0), ProcessId::Replica(LAGGING_OF_FIVE)) =
+            Some(starve_commit_edge);
+        for peer in SILENT {
+            *sim.network.link_drop_packet_fn(
+                ProcessId::Replica(LAGGING_OF_FIVE),
+                ProcessId::Replica(peer),
+            ) = Some(drop_repair_request);
+        }
+
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(LAGGING_OF_FIVE), ProcessId::Replica(2)) =
+            Some(count_serving_peer_request);
+
+        for _ in 0..GAP_SENDS {
+            let reply = tests::submit_and_wait_for_reply(
+                &mut sim,
+                CLIENT_ID,
+                0,
+                client.send_messages(namespace, &[Bytes::from_static(b"gap")]),
+            );
+            assert_eq!(reply.header().status, 0);
+            if gap_drops(&sim, LAGGING_OF_FIVE, namespace) > 0 {
+                break;
+            }
+        }
+        let withheld = WITHHELD_OP.load(Ordering::Relaxed);
+        assert!(
+            WITHHELD_COPIES.load(Ordering::Relaxed) > 0,
+            "no partition prepare crossed the chain link, so the fault never armed"
+        );
+        assert!(
+            gap_drops(&sim, LAGGING_OF_FIVE, namespace) > 0,
+            "the lagging replica never reached its backup gap check: withheld {withheld}, state {:?}, held {}",
+            group_state(&sim, LAGGING_OF_FIVE, namespace),
+            journal_holds(&sim, LAGGING_OF_FIVE, namespace, withheld)
+        );
+
+        let mut transferred = false;
+        for _ in 0..RING_QUIET_STEPS {
+            sim.step();
+            transferred |= transfer_armed(&sim, LAGGING_OF_FIVE, namespace);
+            let (_, view, commit_min, _) = group_state(&sim, LAGGING_OF_FIVE, namespace);
+            if transferred || view != 0 || commit_min >= withheld {
+                break;
+            }
+        }
+
+        let (status, view, commit_min, commit_max) = group_state(&sim, LAGGING_OF_FIVE, namespace);
+        assert_eq!(
+            view, 0,
+            "a view change healed the gap instead of the rotation; the test proves \
+             nothing about the ring"
+        );
+        assert_eq!(status, Status::Normal, "the replica left Normal status");
+        assert!(
+            !transferred,
+            "the ring was spent before the rotation reached replica 2, the only one \
+             that serves repair, so the replica transferred from the primary"
+        );
+        assert!(
+            SERVING_PEER_REQUESTS.load(Ordering::Relaxed) > 0,
+            "the repair rotation never requested the withheld op from replica 2"
+        );
+        assert!(
+            journal_holds(&sim, LAGGING_OF_FIVE, namespace, withheld),
+            "op {withheld} was never repaired from replica 2"
+        );
+        assert!(
+            commit_min >= withheld,
+            "the commit walk never crossed the hole: stopped at {commit_min} of \
+             {commit_max}, the withheld op is {withheld}"
         );
     }
 
@@ -7413,7 +13228,7 @@ mod partition_repair_driver_tests {
 
         // TWO replicas, so quorum spans both: no op can commit without the
         // backup's ack, every reordering-induced gap therefore blocks quorum, and
-        // `consensus::retransmit_targets` refills it. At three, the network's
+        // `consensus::prepare_timeout_targets` refills it. At three, the network's
         // per-tick delivery shuffle lets an op commit on the primary and its
         // first chain hop while the last replica loses it for good, which is the
         // very fault the sibling tests inject -- it would then be repaired here,
@@ -7628,7 +13443,7 @@ mod partition_repair_driver_tests {
             is_commit_for(packet, group)
         }
 
-        let (mut sim, client) = cluster(0x5EED_0238);
+        let (mut sim, client) = cluster(0x5EED_0239);
         let namespace = IggyNamespace::new(1, 1, 0);
         sim.init_partition(namespace);
         sim.register_client_with_primary(&client);
@@ -7863,9 +13678,13 @@ mod metadata_repair_driver_tests {
 
     use super::partition_repair_driver_tests::{
         cluster, is_commit_for, is_repair_done_for, is_request_prepares_for, prepare_for,
+        sized_cluster,
     };
+    use super::tests::NO_COMMIT_HEARTBEAT;
     use super::*;
-    use consensus::Status;
+    use consensus::{Sequencer, Status};
+    use futures::FutureExt;
+    use iggy_binary_protocol::RequestStateTransferHeader;
     use journal::Journal;
     use packet::Packet;
     use server_common::sharding::METADATA_GROUP;
@@ -7933,6 +13752,16 @@ mod metadata_repair_driver_tests {
     /// intervals, not that it was saturated.
     const COMMITTED_MIN: u64 = 20;
 
+    /// Seed of the one-op-at-a-time run.
+    const QUIET_SEED: u64 = 0x7A11_0001;
+
+    /// Creations in the one-op-at-a-time run.
+    const QUIET_SENDS: usize = 40;
+
+    /// Two round trips per creation, so each op commits and its eager `Commit`
+    /// lands before the next prepare could carry the commit instead.
+    const QUIET_STEPS_PER_SEND: usize = 2 * STEPS_PER_SEND;
+
     /// Defines this test's `withhold_one_prepare` chain hook over the static it
     /// names: swallow the FIRST metadata prepare, once, and record its op in
     /// `$withheld_op`.
@@ -7958,7 +13787,7 @@ mod metadata_repair_driver_tests {
     /// retransmits of the op `$withheld_op` names.
     ///
     /// The retransmit half stands in for production behaviour rather than
-    /// adding a fault: `consensus::retransmit_targets` skips an op that already
+    /// adding a fault: `consensus::prepare_timeout_targets` skips an op that already
     /// reached quorum, and this op reaches quorum on 0 and 1 alone.
     macro_rules! starve_commit_edge {
         ($withheld_op:ident) => {
@@ -8007,6 +13836,17 @@ mod metadata_repair_driver_tests {
         })
     }
 
+    /// Whether a packet is a state transfer request for `group`.
+    fn is_request_state_transfer_for(packet: &Packet, group: u64) -> bool {
+        if packet.message.header().command != Command::RequestStateTransfer {
+            return false;
+        }
+        let header: &RequestStateTransferHeader = bytemuck::checked::from_bytes(
+            &packet.message.as_slice()[..size_of::<RequestStateTransferHeader>()],
+        );
+        header.group == group
+    }
+
     /// Submit `sends` stream creations to the primary, stepping between each.
     fn create_streams(sim: &mut Simulator, client: &SimClient, sends: usize, tag: &str) {
         for index in 0..sends {
@@ -8016,6 +13856,172 @@ mod metadata_repair_driver_tests {
                 sim.step();
             }
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn given_an_acked_prepare_above_a_hole_when_restarting_and_losing_primary_should_keep_it() {
+        let (mut sim, client) = cluster(0x5EED_4585);
+        sim.register_client_with_primary(&client);
+        for index in 0..3 {
+            let reply = tests::submit_and_wait_for_reply(
+                &mut sim,
+                client.client_id(),
+                0,
+                client.create_stream(&format!("before-hole-{index}")),
+            );
+            assert_eq!(iggy_binary_protocol::result_code(reply.body()), Some(0));
+        }
+        // The chain reaches replica 2 last, and one hop can outlast a round trip.
+        for _ in 0..DRAIN_STEPS {
+            if sim.replicas[2].metadata_journal.last_op()
+                == sim.replicas[0].metadata_journal.last_op()
+            {
+                break;
+            }
+            sim.step();
+        }
+        let floor = sim.replicas[2].metadata_journal.last_op().unwrap();
+        assert_eq!(sim.replicas[0].metadata_journal.last_op(), Some(floor));
+        sim.network.process_disable(ProcessId::Replica(LAGGING));
+        for index in 0..6 {
+            let reply = tests::submit_and_wait_for_reply(
+                &mut sim,
+                client.client_id(),
+                0,
+                client.create_stream(&format!("repair-tail-{index}")),
+            );
+            assert_eq!(iggy_binary_protocol::result_code(reply.body()), Some(0));
+        }
+        let repaired_head = sim.replicas[0].metadata_journal.last_op().unwrap();
+        // Backward repair can persist later entries before it fills the first hole.
+        for op in floor + 2..=repaired_head {
+            let repaired = sim.replicas[0].metadata_journal.entry_sync(op).unwrap();
+            sim.replicas[2]
+                .metadata_journal
+                .append(repaired)
+                .now_or_never()
+                .unwrap()
+                .unwrap();
+        }
+        sim.replica_crash(1);
+        sim.network.process_enable(ProcessId::Replica(LAGGING));
+        sim.network
+            .link_filter_mut(ProcessId::Replica(LAGGING), ProcessId::Replica(0))
+            .remove(Command::RequestPrepares);
+        sim.network
+            .link_filter_mut(ProcessId::Replica(0), ProcessId::Replica(LAGGING))
+            .remove(Command::Commit);
+        let reply = tests::submit_and_wait_for_reply(
+            &mut sim,
+            client.client_id(),
+            0,
+            client.create_stream("acked-above-hole"),
+        );
+        assert_eq!(iggy_binary_protocol::result_code(reply.body()), Some(0));
+        let acked_op = reply.header().op;
+        assert_eq!(acked_op, repaired_head + 1);
+        let acked_stream_id = sim.replicas[0].shards[0]
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .read(|streams| {
+                streams
+                    .items
+                    .iter()
+                    .find(|(_, stream)| &*stream.name == "acked-above-hole")
+                    .map(|(id, _)| id)
+                    .unwrap()
+            });
+        let checksum = sim.replicas[2]
+            .metadata_journal
+            .header(usize::try_from(acked_op).unwrap())
+            .unwrap()
+            .checksum;
+        assert!(!journal_holds(&sim, LAGGING, floor + 1));
+        sim.replica_crash(LAGGING);
+        sim.replica_restart(LAGGING);
+        assert!(
+            journal_holds(&sim, LAGGING, acked_op),
+            "restart discarded an acknowledged prepare"
+        );
+        let consensus = sim.replicas[2].shards[0]
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+            .unwrap();
+        assert_eq!(consensus.sequencer().current_sequence(), acked_op);
+        sim.replica_crash(0);
+        sim.replica_restart(1);
+        for _ in 0..5_000 {
+            sim.step();
+            if [1, 2]
+                .iter()
+                .all(|&node| metadata_state(&sim, node).2 >= acked_op)
+            {
+                break;
+            }
+        }
+        for node in [1, 2] {
+            assert!(metadata_state(&sim, node).2 >= acked_op);
+            assert_eq!(
+                sim.replicas[usize::from(node)]
+                    .metadata_journal
+                    .header(usize::try_from(acked_op).unwrap())
+                    .unwrap()
+                    .checksum,
+                checksum
+            );
+            assert_eq!(
+                sim.replicas[usize::from(node)].shards[0]
+                    .plane
+                    .metadata()
+                    .mux_stm
+                    .streams()
+                    .read(|streams| streams
+                        .items
+                        .iter()
+                        .find(|(_, stream)| &*stream.name == "acked-above-hole")
+                        .map(|(id, _)| id)),
+                Some(acked_stream_id)
+            );
+        }
+        let primary = [1, 2]
+            .into_iter()
+            .find(|&node| {
+                sim.replicas[usize::from(node)].shards[0]
+                    .plane
+                    .metadata()
+                    .consensus
+                    .as_ref()
+                    .unwrap()
+                    .is_primary()
+            })
+            .unwrap();
+        let reply = tests::submit_and_wait_for_reply(
+            &mut sim,
+            client.client_id(),
+            primary,
+            client.create_stream("after-hole-recovery"),
+        );
+        assert_eq!(iggy_binary_protocol::result_code(reply.body()), Some(0));
+        assert!(reply.header().op > acked_op);
+        let next_stream_id = sim.replicas[usize::from(primary)].shards[0]
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .read(|streams| {
+                streams
+                    .items
+                    .iter()
+                    .find(|(_, stream)| &*stream.name == "after-hole-recovery")
+                    .map(|(id, _)| id)
+                    .unwrap()
+            });
+        assert_ne!(next_stream_id, acked_stream_id);
     }
 
     #[test]
@@ -8272,8 +14278,9 @@ mod metadata_repair_driver_tests {
             "no metadata prepare crossed the chain link, so the fault never armed"
         );
 
-        // Corrupt the op the walk is about to read, once repair has put a
-        // window back but before the walk has consumed it. Injected here
+        // Corrupt the lowest op repair has put back above the commit point,
+        // before the walk has consumed it. Repair can land a later op first,
+        // so the op the walk reads next may still be a hole. Injected here
         // rather than by dropping packets: the header and the body land in the
         // same append, so no link fault produces this state.
         let mut doomed = 0;
@@ -8283,15 +14290,16 @@ mod metadata_repair_driver_tests {
             if view != 0 {
                 break;
             }
-            let next_op = commit_min + 1;
-            if commit_min < commit_max && journal_holds(&sim, LAGGING, next_op) {
+            if let Some(resident) =
+                (commit_min + 1..=commit_max).find(|&op| journal_holds(&sim, LAGGING, op))
+            {
                 assert!(
                     sim.replicas[LAGGING as usize]
                         .metadata_journal
-                        .forget_body(next_op),
-                    "op {next_op} had no body to forget"
+                        .forget_body(resident),
+                    "op {resident} had no body to forget"
                 );
-                doomed = next_op;
+                doomed = resident;
                 break;
             }
         }
@@ -8435,6 +14443,516 @@ mod metadata_repair_driver_tests {
         );
     }
 
+    /// A repair peer with a hole at the requested floor skips it and answers
+    /// `RangeEvicted` above the floor, which reads as a compacted prefix and
+    /// converts to a state transfer against that peer. A backup refuses every
+    /// transfer (only a caught-up primary serves one), and the refusal re-arms
+    /// repair against the same peer, which answers the same way. Each step is a
+    /// direct reply, so no stall clock fires and no budget is charged: the
+    /// replica never leaves that peer, even once another one can serve the hole.
+    #[test]
+    fn given_a_repair_peer_without_snapshot_when_it_answers_range_evicted_should_rotate_instead_of_transferring()
+     {
+        /// Where the session rotates off the primary (`next_transfer_peer`), and
+        /// the replica given the hole.
+        const SUCCESSOR: u8 = 1;
+
+        static WITHHELD_OP: AtomicU64 = AtomicU64::new(0);
+        static TRANSFER_REQUESTS: AtomicU64 = AtomicU64::new(0);
+        withhold_one_metadata_prepare!(WITHHELD_OP);
+
+        fn blackhole(_packet: &Packet) -> bool {
+            true
+        }
+
+        /// Observer, not a fault: every packet passes.
+        fn count_transfer_requests(packet: &Packet) -> bool {
+            if is_request_state_transfer_for(packet, METADATA_GROUP) {
+                TRANSFER_REQUESTS.fetch_add(1, Ordering::Relaxed);
+            }
+            false
+        }
+
+        let (mut sim, client) = cluster(0x5EED_0246);
+        sim.register_client_with_primary(&client);
+        WITHHELD_OP.store(0, Ordering::Relaxed);
+        TRANSFER_REQUESTS.store(0, Ordering::Relaxed);
+        sim.replicas[LAGGING as usize].shards[0].set_repair_retry_ticks(ROTATE_RETRY_TICKS);
+
+        create_streams(&mut sim, &client, WARMUP_SENDS, "md-warm");
+
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(SUCCESSOR), ProcessId::Replica(LAGGING)) =
+            Some(withhold_one_prepare);
+        // Silent until the session has spent its budget on it and rotated.
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(0), ProcessId::Replica(LAGGING)) =
+            Some(blackhole);
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(LAGGING), ProcessId::Replica(SUCCESSOR)) =
+            Some(count_transfer_requests);
+
+        create_streams(&mut sim, &client, SHORT_GAP_SENDS, "md-gap");
+        let withheld = WITHHELD_OP.load(Ordering::Relaxed);
+        assert_ne!(
+            withheld, 0,
+            "no metadata prepare crossed the chain link, so the fault never armed"
+        );
+
+        // The hole a lost repair frame leaves (see `SimJournal::forget_op`). The
+        // successor already walked past the op, so nothing ever refills it.
+        let (_, _, successor_commit_min, _) = metadata_state(&sim, SUCCESSOR);
+        assert!(
+            successor_commit_min > withheld,
+            "the successor has not walked past op {withheld} (commit_min \
+             {successor_commit_min}), so it would repair the hole itself"
+        );
+        assert!(
+            sim.replicas[SUCCESSOR as usize]
+                .metadata_journal
+                .forget_op(withheld),
+            "the successor never journaled op {withheld}"
+        );
+
+        for _ in 0..ROTATE_QUIET_STEPS {
+            sim.step();
+            if TRANSFER_REQUESTS.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+        }
+        assert_eq!(
+            TRANSFER_REQUESTS.load(Ordering::Relaxed),
+            1,
+            "the session never rotated onto the successor and converted its \
+             eviction notice into a state transfer"
+        );
+
+        // The primary can serve the hole from here on, and the stall clock is back
+        // at the production interval, far above a round trip: a request/refusal
+        // loop on the successor shows as more transfer requests long before the
+        // stall sweep rotates the session off it.
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(0), ProcessId::Replica(LAGGING)) = None;
+        sim.replicas[LAGGING as usize].shards[0]
+            .set_repair_retry_ticks(partitions::REPAIR_RETRY_TICKS);
+
+        for _ in 0..ROTATE_QUIET_STEPS {
+            sim.step();
+            let (_, view, commit_min, _) = metadata_state(&sim, LAGGING);
+            if view != 0 || commit_min >= withheld {
+                break;
+            }
+        }
+
+        let (status, view, commit_min, commit_max) = metadata_state(&sim, LAGGING);
+        assert_eq!(
+            view, 0,
+            "a view change healed the gap instead of the rotation; the test proves \
+             nothing about the refused transfer"
+        );
+        assert_eq!(status, Status::Normal, "the replica left Normal status");
+        assert_eq!(
+            TRANSFER_REQUESTS.load(Ordering::Relaxed),
+            1,
+            "the successor refused the transfer, and the repair re-armed against it \
+             converted the same eviction notice into another request: a \
+             request/refusal loop between two pumps"
+        );
+        assert!(
+            !transfer_armed(&sim, LAGGING),
+            "the replica is still waiting on a state transfer"
+        );
+        assert!(
+            journal_holds(&sim, LAGGING, withheld),
+            "op {withheld} was never repaired back into the lagging replica's WAL"
+        );
+        assert!(
+            commit_min >= withheld,
+            "the commit walk never crossed the hole: stopped at {commit_min} of \
+             {commit_max}, the withheld op is {withheld}"
+        );
+    }
+
+    /// The primary is the peer `gap_repair_peer` names, so when it holds the hole
+    /// and refuses the transfer, the refused session's `RangeEvicted` takes the
+    /// unspent-budget branch: drop the session and let the level trigger re-arm,
+    /// which picks the primary again with a fresh session. Only the round each
+    /// trip charges moves the replica off it, onto the backup that holds the op.
+    #[test]
+    fn given_a_primary_without_snapshot_holding_a_hole_when_it_refuses_the_transfer_should_rotate_after_the_budget()
+     {
+        static WITHHELD_OP: AtomicU64 = AtomicU64::new(0);
+        static TRANSFER_REQUESTS: AtomicU64 = AtomicU64::new(0);
+        withhold_one_metadata_prepare!(WITHHELD_OP);
+        starve_commit_edge!(WITHHELD_OP);
+
+        /// Observer, not a fault: every packet passes.
+        fn count_transfer_requests(packet: &Packet) -> bool {
+            if is_request_state_transfer_for(packet, METADATA_GROUP) {
+                TRANSFER_REQUESTS.fetch_add(1, Ordering::Relaxed);
+            }
+            false
+        }
+
+        let (mut sim, client) = cluster(0x5EED_0248);
+        sim.register_client_with_primary(&client);
+        WITHHELD_OP.store(0, Ordering::Relaxed);
+        TRANSFER_REQUESTS.store(0, Ordering::Relaxed);
+
+        create_streams(&mut sim, &client, WARMUP_SENDS, "md-warm");
+
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(1), ProcessId::Replica(LAGGING)) =
+            Some(withhold_one_prepare);
+        // Starved so no heartbeat arms the repair before the primary's hole exists.
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(0), ProcessId::Replica(LAGGING)) =
+            Some(starve_commit_edge);
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(LAGGING), ProcessId::Replica(0)) =
+            Some(count_transfer_requests);
+
+        create_streams(&mut sim, &client, SHORT_GAP_SENDS, "md-gap");
+        let withheld = WITHHELD_OP.load(Ordering::Relaxed);
+        assert_ne!(
+            withheld, 0,
+            "no metadata prepare crossed the chain link, so the fault never armed"
+        );
+        let (_, _, primary_commit_min, _) = metadata_state(&sim, 0);
+        assert!(
+            primary_commit_min > withheld,
+            "the primary has not walked past op {withheld} (commit_min \
+             {primary_commit_min}), so it would repair the hole itself"
+        );
+        assert!(
+            sim.replicas[0].metadata_journal.forget_op(withheld),
+            "the primary never journaled op {withheld}"
+        );
+        // Heartbeats again, so no election heals the gap first.
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(0), ProcessId::Replica(LAGGING)) = None;
+
+        for _ in 0..DRAIN_STEPS {
+            sim.step();
+            let (_, view, commit_min, _) = metadata_state(&sim, LAGGING);
+            if view != 0 || commit_min >= withheld {
+                break;
+            }
+        }
+
+        let requests = TRANSFER_REQUESTS.load(Ordering::Relaxed);
+        let (status, view, commit_min, commit_max) = metadata_state(&sim, LAGGING);
+        assert_eq!(
+            view, 0,
+            "a view change healed the gap instead of the rotation; the test proves \
+             nothing about the refused transfer"
+        );
+        assert_eq!(status, Status::Normal, "the replica left Normal status");
+        assert!(
+            requests > 0,
+            "the primary's eviction notice never converted to a transfer, so the \
+             refusal was never exercised"
+        );
+        assert!(
+            requests <= u64::from(partitions::REPAIR_MAX_STALL_RETRIES) + 1,
+            "the primary refused {requests} transfers: each refusal re-armed repair \
+             against it without charging a round, so the replica never left it"
+        );
+        assert!(
+            journal_holds(&sim, LAGGING, withheld),
+            "op {withheld} was never repaired back into the lagging replica's WAL"
+        );
+        assert!(
+            commit_min >= withheld,
+            "the commit walk never crossed the hole: stopped at {commit_min} of \
+             {commit_max}, the withheld op is {withheld}"
+        );
+    }
+
+    /// Every peer compacted past the gap and none can serve a transfer: the
+    /// primary has no snapshot coordinator, and a backup is not a caught-up
+    /// primary. Each visit converts the eviction notice once, and the refused
+    /// session's `RangeEvicted` charges a round. Once the budget is spent, a
+    /// rotation straight off that reply cycles the ring at network rate, so the
+    /// session must first sit out a stall round, as it does against a silent peer.
+    #[test]
+    fn given_no_peer_able_to_serve_when_the_repair_budget_is_spent_should_pace_the_rotation() {
+        /// Ticks counted once the budget is spent, several retry intervals long.
+        const PACE_WINDOW_TICKS: u32 = 5 * partitions::REPAIR_RETRY_TICKS;
+        /// Room for the debounce before each round the budget charges.
+        const SPEND_STEPS: usize = 1000;
+
+        static WITHHELD_OP: AtomicU64 = AtomicU64::new(0);
+        static TRANSFER_REQUESTS: AtomicU64 = AtomicU64::new(0);
+        withhold_one_metadata_prepare!(WITHHELD_OP);
+        starve_commit_edge!(WITHHELD_OP);
+
+        /// Observer, not a fault: every packet passes.
+        fn count_transfer_requests(packet: &Packet) -> bool {
+            if is_request_state_transfer_for(packet, METADATA_GROUP) {
+                TRANSFER_REQUESTS.fetch_add(1, Ordering::Relaxed);
+            }
+            false
+        }
+
+        let (mut sim, client) = cluster(0x5EED_0249);
+        sim.register_client_with_primary(&client);
+        WITHHELD_OP.store(0, Ordering::Relaxed);
+        TRANSFER_REQUESTS.store(0, Ordering::Relaxed);
+
+        create_streams(&mut sim, &client, WARMUP_SENDS, "md-warm");
+
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(1), ProcessId::Replica(LAGGING)) =
+            Some(withhold_one_prepare);
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(0), ProcessId::Replica(LAGGING)) =
+            Some(starve_commit_edge);
+        for peer in [0, 1] {
+            *sim.network
+                .link_drop_packet_fn(ProcessId::Replica(LAGGING), ProcessId::Replica(peer)) =
+                Some(count_transfer_requests);
+        }
+
+        create_streams(&mut sim, &client, SHORT_GAP_SENDS, "md-gap");
+        let withheld = WITHHELD_OP.load(Ordering::Relaxed);
+        assert_ne!(
+            withheld, 0,
+            "no metadata prepare crossed the chain link, so the fault never armed"
+        );
+        for peer in [0, 1] {
+            let (_, _, peer_commit_min, _) = metadata_state(&sim, peer);
+            assert!(
+                peer_commit_min > withheld,
+                "replica {peer} has not walked past op {withheld} (commit_min \
+                 {peer_commit_min}), so the stamp would not evict it"
+            );
+            sim.stamp_metadata_snapshot(usize::from(peer), peer_commit_min);
+        }
+        // Heartbeats again, so no election ends the run.
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(0), ProcessId::Replica(LAGGING)) = None;
+
+        let spent_after = u64::from(partitions::REPAIR_MAX_STALL_RETRIES) + 1;
+        for _ in 0..SPEND_STEPS {
+            sim.step();
+            if TRANSFER_REQUESTS.load(Ordering::Relaxed) >= spent_after {
+                break;
+            }
+        }
+        let at_spend = TRANSFER_REQUESTS.load(Ordering::Relaxed);
+        assert!(
+            at_spend >= spent_after,
+            "the replica converted {at_spend} eviction notices, too few to spend its \
+             repair budget, so the rotation was never exercised"
+        );
+        for _ in 0..PACE_WINDOW_TICKS {
+            sim.step();
+        }
+
+        let in_window = TRANSFER_REQUESTS.load(Ordering::Relaxed) - at_spend;
+        let paced_max = u64::from(PACE_WINDOW_TICKS / partitions::REPAIR_RETRY_TICKS) + 1;
+        let (status, view, commit_min, _) = metadata_state(&sim, LAGGING);
+        assert_eq!(
+            (status, view),
+            (Status::Normal, 0),
+            "an election interrupted the run"
+        );
+        assert!(
+            commit_min < withheld,
+            "a peer served op {withheld}, so nothing was left to rotate over"
+        );
+        assert!(
+            in_window > 0,
+            "the replica stopped asking once its budget was spent, though no peer \
+             has served the gap"
+        );
+        assert!(
+            in_window <= paced_max,
+            "{in_window} transfer requests in {PACE_WINDOW_TICKS} ticks after the \
+             budget was spent, more than one per retry interval: the rotation runs \
+             at network rate"
+        );
+    }
+
+    /// The rotation used to step back to the primary after each backup, so in a
+    /// group of five a backup alternated between the primary and the replica
+    /// after it. Neither of those holds the withheld op here, nor does replica 3:
+    /// only replica 2, two after the primary, can serve it.
+    #[test]
+    fn given_five_replicas_when_only_the_second_after_the_primary_holds_the_op_should_repair_from_it()
+     {
+        const REPLICAS: u8 = 5;
+        /// Last in the chain 0 -> 1 -> 2 -> 3 -> 4, so its losses cannot starve
+        /// the group of quorum.
+        const LAGGING_OF_FIVE: u8 = 4;
+        /// Every replica but `primary + 2` forgets the withheld op.
+        const HOLED: [u8; 3] = [0, 1, 3];
+        /// The debounce before each round charged against the primary, then two
+        /// held rotations and the repair stream.
+        const FIVE_QUIET_STEPS: usize = 1000;
+
+        static WITHHELD_OP: AtomicU64 = AtomicU64::new(0);
+        withhold_one_metadata_prepare!(WITHHELD_OP);
+        starve_commit_edge!(WITHHELD_OP);
+
+        let (mut sim, client) = sized_cluster(0x5EED_024A, REPLICAS, 1);
+        sim.register_client_with_primary(&client);
+        WITHHELD_OP.store(0, Ordering::Relaxed);
+        sim.replicas[usize::from(LAGGING_OF_FIVE)].shards[0]
+            .set_repair_retry_ticks(ROTATE_RETRY_TICKS);
+
+        create_streams(&mut sim, &client, WARMUP_SENDS, "md-warm");
+
+        *sim.network.link_drop_packet_fn(
+            ProcessId::Replica(LAGGING_OF_FIVE - 1),
+            ProcessId::Replica(LAGGING_OF_FIVE),
+        ) = Some(withhold_one_prepare);
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(0), ProcessId::Replica(LAGGING_OF_FIVE)) =
+            Some(starve_commit_edge);
+
+        create_streams(&mut sim, &client, SHORT_GAP_SENDS, "md-gap");
+        let withheld = WITHHELD_OP.load(Ordering::Relaxed);
+        assert_ne!(
+            withheld, 0,
+            "no metadata prepare crossed the chain link, so the fault never armed"
+        );
+        // A peer can learn the last gap commit from the primary's next `Commit`,
+        // after the sends end. Waiting one more send interval keeps the gap phase
+        // under the repair debounce, so the lagging replica cannot fetch the op.
+        for _ in 0..STEPS_PER_SEND {
+            if HOLED
+                .iter()
+                .all(|&peer| metadata_state(&sim, peer).2 > withheld)
+            {
+                break;
+            }
+            sim.step();
+        }
+        for peer in HOLED {
+            let (_, _, peer_commit_min, _) = metadata_state(&sim, peer);
+            assert!(
+                peer_commit_min > withheld,
+                "replica {peer} has not walked past op {withheld} (commit_min \
+                 {peer_commit_min}), so it would repair the hole itself"
+            );
+            assert!(
+                sim.replicas[usize::from(peer)]
+                    .metadata_journal
+                    .forget_op(withheld),
+                "replica {peer} never journaled op {withheld}"
+            );
+        }
+        // Heartbeats again, so no election heals the gap first.
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(0), ProcessId::Replica(LAGGING_OF_FIVE)) = None;
+
+        for _ in 0..FIVE_QUIET_STEPS {
+            sim.step();
+            let (_, view, commit_min, _) = metadata_state(&sim, LAGGING_OF_FIVE);
+            if view != 0 || commit_min >= withheld {
+                break;
+            }
+        }
+
+        let (status, view, commit_min, commit_max) = metadata_state(&sim, LAGGING_OF_FIVE);
+        assert_eq!(
+            view, 0,
+            "a view change healed the gap instead of the rotation; the test proves \
+             nothing about the ring"
+        );
+        assert_eq!(status, Status::Normal, "the replica left Normal status");
+        assert!(
+            journal_holds(&sim, LAGGING_OF_FIVE, withheld),
+            "op {withheld} was never repaired: the rotation never reached replica 2, \
+             the only one that holds it"
+        );
+        assert!(
+            commit_min >= withheld,
+            "the commit walk never crossed the hole: stopped at {commit_min} of \
+             {commit_max}, the withheld op is {withheld}"
+        );
+    }
+
+    /// A rejoining replica awaits a state transfer from the view's primary, as
+    /// production's `JoinMode::ProbeAsBackup { await_state_transfer: true }`
+    /// arms it; the harness restart does not, so this test does. A primary whose
+    /// checkpoint never finishes refuses each descriptor request as transiently
+    /// busy. If that refusal refills the transfer's stall budget, the replica
+    /// waits in `AwaitingTarget` for good, with its commit walk and journal
+    /// repair both deferred, though the primary's WAL still covers its gap.
+    #[test]
+    fn given_a_transfer_peer_that_stays_checkpointing_when_the_budget_is_spent_should_fall_back_to_journal_repair()
+     {
+        static TRANSFER_REQUESTS: AtomicU64 = AtomicU64::new(0);
+
+        /// Observer, not a fault: every packet passes.
+        fn count_transfer_requests(packet: &Packet) -> bool {
+            if is_request_state_transfer_for(packet, METADATA_GROUP) {
+                TRANSFER_REQUESTS.fetch_add(1, Ordering::Relaxed);
+            }
+            false
+        }
+
+        let (mut sim, client) = cluster(0x5EED_0247);
+        sim.register_client_with_primary(&client);
+        TRANSFER_REQUESTS.store(0, Ordering::Relaxed);
+
+        create_streams(&mut sim, &client, WARMUP_SENDS, "md-warm");
+        sim.replica_crash(LAGGING);
+        create_streams(&mut sim, &client, SHORT_GAP_SENDS, "md-gap");
+
+        let primary = Rc::clone(&sim.replicas[0].shards[0]);
+        let _checkpoint = primary
+            .plane
+            .metadata()
+            .hold_checkpoint_gate()
+            .expect("nothing checkpoints without a snapshot coordinator");
+
+        sim.replica_restart(LAGGING);
+        sim.metadata_consensus(usize::from(LAGGING))
+            .expect("shard 0 owns metadata consensus")
+            .begin_state_transfer_await();
+        // The transfer stall shares this interval; shortened as in the rotation run.
+        sim.replicas[LAGGING as usize].shards[0].set_repair_retry_ticks(ROTATE_RETRY_TICKS);
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(LAGGING), ProcessId::Replica(0)) =
+            Some(count_transfer_requests);
+
+        let (_, _, primary_commit_min, _) = metadata_state(&sim, 0);
+        for _ in 0..ROTATE_QUIET_STEPS {
+            sim.step();
+            let (_, _, commit_min, _) = metadata_state(&sim, LAGGING);
+            if !transfer_armed(&sim, LAGGING) && commit_min >= primary_commit_min {
+                break;
+            }
+        }
+
+        let requests = TRANSFER_REQUESTS.load(Ordering::Relaxed);
+        let (status, view, commit_min, commit_max) = metadata_state(&sim, LAGGING);
+        assert!(
+            requests > 0,
+            "the rejoining replica never asked the primary for a transfer, so the \
+             refusal was never exercised"
+        );
+        assert!(
+            requests <= u64::from(consensus::STATE_TRANSFER_MAX_STALL_RETRIES) + 1,
+            "the primary refused {requests} descriptor requests as busy and every \
+             refusal refilled the stall budget, so the replica never gave up on it"
+        );
+        assert!(
+            !transfer_armed(&sim, LAGGING),
+            "the replica is still awaiting a transfer the primary keeps refusing"
+        );
+        assert_eq!((status, view), (Status::Normal, 0));
+        assert!(
+            commit_min >= primary_commit_min,
+            "journal repair never caught the replica up: commit_min {commit_min} of \
+             {commit_max}, the primary committed through {primary_commit_min}"
+        );
+    }
+
     /// Regression canary, expected green even without the tick driver: a
     /// healthy metadata backup walks at every accepted prepare's tail
     /// (`on_replicate`), so per-tick lag never survives to quiescence and the
@@ -8554,6 +15072,99 @@ mod metadata_repair_driver_tests {
              is reading ordinary commit lag as a journal hole"
         );
     }
+
+    /// A backup outside the replication quorum gets each prepare from the chain
+    /// after the primary committed it. An eager `Commit` that overtakes the
+    /// prepare makes the backup repair an op that is still on its way.
+    #[test]
+    fn given_one_metadata_op_at_a_time_when_each_commits_should_not_repair_a_backup_outside_the_quorum()
+     {
+        static REPAIR_REQUESTS: AtomicU64 = AtomicU64::new(0);
+
+        /// Observer, not a fault: counts this group's repair requests and
+        /// passes every packet through.
+        fn count_repair_requests(packet: &Packet) -> bool {
+            if is_request_prepares_for(packet, METADATA_GROUP) {
+                REPAIR_REQUESTS.fetch_add(1, Ordering::Relaxed);
+            }
+            false
+        }
+
+        // `(replicas, repair requests, ops the primary applied, whether every
+        // replica applied them in view 0)` per run.
+        let runs: Vec<(u8, u64, u64, bool)> = [3, 5]
+            .into_iter()
+            .map(|replica_count| {
+                let (mut sim, client) = sized_cluster(QUIET_SEED, replica_count, 1);
+                sim.register_client_with_primary(&client);
+                // The heartbeat still reaches every backup on its own schedule, so
+                // it can overtake a prepare too. Without it the backups learn each
+                // commit from the eager `Commit` alone.
+                for replica in 0..replica_count {
+                    sim.metadata_consensus(usize::from(replica))
+                        .expect("every replica runs the metadata plane")
+                        .set_commit_message_ticks(NO_COMMIT_HEARTBEAT);
+                }
+                REPAIR_REQUESTS.store(0, Ordering::Relaxed);
+                for from in 0..replica_count {
+                    for to in (0..replica_count).filter(|to| *to != from) {
+                        *sim.network.link_drop_packet_fn(
+                            ProcessId::Replica(from),
+                            ProcessId::Replica(to),
+                        ) = Some(count_repair_requests);
+                    }
+                }
+
+                for index in 0..QUIET_SENDS {
+                    let msg = client.create_stream(&format!("quiet-{index}"));
+                    sim.submit_request(client.client_id(), 0, msg.into_generic());
+                    for _ in 0..QUIET_STEPS_PER_SEND {
+                        sim.step();
+                    }
+                }
+
+                let (_, _, primary_commit, _) = metadata_state(&sim, 0);
+                let settled = |sim: &Simulator| {
+                    (0..replica_count).all(|replica| {
+                        metadata_state(sim, replica)
+                            == (Status::Normal, 0, primary_commit, primary_commit)
+                    })
+                };
+                for _ in 0..DRAIN_STEPS {
+                    if settled(&sim) {
+                        break;
+                    }
+                    sim.step();
+                }
+                (
+                    replica_count,
+                    REPAIR_REQUESTS.load(Ordering::Relaxed),
+                    primary_commit,
+                    settled(&sim),
+                )
+            })
+            .collect();
+        assert_eq!(
+            runs.iter()
+                .map(|&(replica_count, repairs, ..)| (replica_count, repairs))
+                .collect::<Vec<_>>(),
+            [(3, 0), (5, 0)],
+            "(replicas, metadata repair requests): an eager Commit overtook the \
+             prepare the chain was still forwarding"
+        );
+        for (replica_count, _, primary_commit, settled) in runs {
+            assert!(
+                primary_commit >= COMMITTED_MIN,
+                "{replica_count} replicas committed only {primary_commit} metadata ops, \
+                 too few for a clean run to mean anything"
+            );
+            assert!(
+                settled,
+                "{replica_count} replicas did not all apply op {primary_commit} in view 0, \
+                 so a view change or a lost op could account for repair traffic"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -8589,7 +15200,7 @@ mod metadata_read_frontier_tests {
     use super::*;
     use crate::client::SimClient;
     use iggy_binary_protocol::responses::streams::get_stream::GetStreamResponse;
-    use iggy_binary_protocol::{Command, RoutedRequestHeader, WireDecode};
+    use iggy_binary_protocol::{Command, PrimaryRebalanceHeader, RoutedRequestHeader, WireDecode};
 
     /// Replica 0 leads the metadata plane at view 0, so this one is a backup
     /// for the whole run and is the node the client re-homes onto.
@@ -8892,6 +15503,437 @@ mod metadata_read_frontier_tests {
         }
     }
 
+    #[test]
+    fn given_an_isolated_metadata_primary_when_partition_requests_exceed_the_bound_should_refuse_before_resolution()
+     {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+        let mut sim = Simulator::with_shards_shell(
+            3,
+            1,
+            std::iter::once(1),
+            packet::PacketSimulatorOptions {
+                node_count: 3,
+                client_count: 1,
+                seed: 0xF2E5_0001,
+                ..packet::PacketSimulatorOptions::default()
+            },
+        );
+        let client = SimClient::new(1);
+        sim.shell_login(&client);
+        for peer in 1..3 {
+            sim.network
+                .set_link_filter(ProcessId::Replica(0), ProcessId::Replica(peer), false);
+            sim.network
+                .set_link_filter(ProcessId::Replica(peer), ProcessId::Replica(0), false);
+        }
+        let bound = std::time::Duration::from_secs(9);
+        for _ in 0..(bound.as_millis() / shard::CONSENSUS_TICK_INTERVAL.as_millis()) {
+            sim.step();
+        }
+        let missing = IggyNamespace::new(99, 99, 0);
+        let poll = client.poll_messages(missing, 1);
+        let send = client.send_messages(missing, &[bytes::Bytes::from_static(b"expired")]);
+        for request in [poll, send] {
+            let reply = super::tests::submit_and_wait_for_reply(&mut sim, 1, 0, request);
+            assert_eq!(
+                reply.header().status,
+                iggy_common::IggyError::TransientNotAccepted.as_code()
+            );
+        }
+    }
+
+    fn partition_freshness_cluster(
+        replicas: u8,
+        seed: u64,
+    ) -> (Simulator, SimClient, IggyNamespace) {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+        let mut sim = Simulator::with_shards_shell(
+            usize::from(replicas),
+            1,
+            std::iter::once(1),
+            packet::PacketSimulatorOptions {
+                node_count: replicas,
+                client_count: 1,
+                seed,
+                ..Default::default()
+            },
+        );
+        let client = SimClient::new(1);
+        sim.shell_login(&client);
+        commit_write(&mut sim, 1, 0, client.create_stream("freshness"));
+        let created = commit_write(
+            &mut sim,
+            1,
+            0,
+            client.create_topic("freshness", "partition", 1),
+        );
+        let namespace = sim.replicas[0].shards[0]
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .namespace_from_partition(
+                &iggy_binary_protocol::WireIdentifier::named("freshness").unwrap(),
+                &iggy_binary_protocol::WireIdentifier::named("partition").unwrap(),
+                0,
+            )
+            .unwrap();
+        for replica in 0..replicas {
+            step_until_applied(&mut sim, replica, created);
+        }
+        sim.init_partition(namespace);
+        assert!(
+            (0..replicas).all(|replica| {
+                sim.partition_consensus_state(usize::from(replica), namespace)
+                    .is_some()
+            }),
+            "freshness fixture must materialise its committed partition"
+        );
+        sim.discover_partition_contexts(&client);
+        for replica in 1..replicas {
+            let reply = super::tests::submit_and_wait_for_reply(
+                &mut sim,
+                1,
+                replica,
+                client.bind_session_request(created),
+            );
+            assert_eq!(reply.header().status, 0, "bind replica{replica}");
+        }
+        for _ in 0..SETUP_TOTAL_STEPS {
+            if (0..replicas).all(|replica| partition_fresh(&sim, replica)) {
+                return (sim, client, namespace);
+            }
+            sim.step();
+        }
+        panic!("healthy cluster never credited every node");
+    }
+
+    fn partition_fresh(sim: &Simulator, replica: u8) -> bool {
+        let shard = &sim.replicas[usize::from(replica)].shards[0];
+        shard
+            .plane
+            .metadata()
+            .applied_frontier()
+            .partition_requests_allowed(shard.bus.monotonic_now())
+    }
+
+    fn advance_freshness_time(sim: &mut Simulator, duration: std::time::Duration) {
+        for _ in 0..(duration.as_millis() / shard::CONSENSUS_TICK_INTERVAL.as_millis()) {
+            sim.step();
+        }
+    }
+
+    #[test]
+    fn given_healthy_idle_three_and_five_node_clusters_when_partition_requests_arrive_should_stay_admitted()
+     {
+        for replicas in [3, 5] {
+            let (mut sim, client, namespace) =
+                partition_freshness_cluster(replicas, 0xF2E5_0010 + u64::from(replicas));
+            for _ in 0..3 {
+                advance_freshness_time(&mut sim, std::time::Duration::from_secs(8));
+                assert!(
+                    (0..replicas).all(|replica| partition_fresh(&sim, replica)),
+                    "idle{replicas}-node cluster lost quorum evidence"
+                );
+            }
+            let mut served = false;
+            for replica in 0..replicas {
+                let reply = super::tests::submit_and_wait_for_reply(
+                    &mut sim,
+                    1,
+                    replica,
+                    client.poll_messages(namespace, 1),
+                );
+                assert_ne!(
+                    reply.header().status,
+                    IggyError::TransientNotAccepted.as_code(),
+                    "healthy node{replica}: partition {:?}, fresh {}",
+                    sim.partition_consensus_state(usize::from(replica), namespace),
+                    partition_fresh(&sim, replica)
+                );
+                served |= reply.header().status == 0;
+            }
+            assert!(served, "a healthy partition primary must serve the poll");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn given_a_five_node_split_when_the_bound_expires_should_fence_the_minority_and_keep_the_majority_available()
+     {
+        let (mut sim, client, namespace) = partition_freshness_cluster(5, 0xF2E5_0020);
+        let split_tick = sim.network.current_tick();
+        eprintln!("split starts at network tick {split_tick}");
+        for from in [2, 3, 4] {
+            for to in [2, 3, 4] {
+                *sim.network
+                    .link_drop_packet_fn(ProcessId::Replica(from), ProcessId::Replica(to)) = Some(
+                    |packet| {
+                        if packet.message.header().command == Command::PrimaryRebalance {
+                            let message: Message<PrimaryRebalanceHeader> =
+                                packet.message.deep_copy().try_into_typed().unwrap();
+                            let header = message.header();
+                            if header.view > 0 {
+                                eprintln!(
+                                    "freshness packet {:?}->{:?}, deliverable tick {}, view {}, {:?}, quorum age ns {}",
+                                    packet.from,
+                                    packet.to,
+                                    packet.ready_at,
+                                    header.view,
+                                    header.kind,
+                                    header.quorum_age_ns,
+                                );
+                            }
+                        }
+                        false
+                    },
+                );
+            }
+        }
+        let mut previous = None;
+        let mut step = |sim: &mut Simulator| {
+            sim.step();
+            let state = [2, 3, 4].map(|node| {
+                let consensus = sim.metadata_consensus(node).unwrap();
+                (
+                    consensus.view(),
+                    consensus.status(),
+                    partition_fresh(sim, u8::try_from(node).unwrap()),
+                )
+            });
+            if previous != Some(state) {
+                eprintln!(
+                    "majority state at split tick +{}: {state:?}",
+                    sim.network.current_tick() - split_tick,
+                );
+                previous = Some(state);
+            }
+        };
+        for minority in [0, 1] {
+            for majority in [2, 3, 4] {
+                sim.network.set_link_filter(
+                    ProcessId::Replica(minority),
+                    ProcessId::Replica(majority),
+                    false,
+                );
+                sim.network.set_link_filter(
+                    ProcessId::Replica(majority),
+                    ProcessId::Replica(minority),
+                    false,
+                );
+            }
+        }
+        for _ in 0..(std::time::Duration::from_secs(6).as_millis()
+            / shard::CONSENSUS_TICK_INTERVAL.as_millis())
+        {
+            step(&mut sim);
+        }
+        assert!(
+            partition_fresh(&sim, 0) && partition_fresh(&sim, 1),
+            "a sub-K election must not clear existing credit"
+        );
+        let before = super::tests::submit_and_wait_for_reply(
+            &mut sim,
+            1,
+            0,
+            client.poll_messages(namespace, 1),
+        );
+        assert_eq!(
+            before.header().status,
+            0,
+            "the old primary may serve until its evidence expires: partition {:?}, fresh {}",
+            sim.partition_consensus_state(0, namespace),
+            partition_fresh(&sim, 0)
+        );
+        for _ in 0..(std::time::Duration::from_secs(4).as_millis()
+            / shard::CONSENSUS_TICK_INTERVAL.as_millis())
+        {
+            step(&mut sim);
+        }
+        for replica in [0, 1] {
+            assert!(
+                !partition_fresh(&sim, replica),
+                "minority node{replica} credited without a quorum"
+            );
+            let reply = super::tests::submit_and_wait_for_reply(
+                &mut sim,
+                1,
+                replica,
+                client.poll_messages(namespace, 1),
+            );
+            assert_eq!(
+                reply.header().status,
+                IggyError::TransientNotAccepted.as_code()
+            );
+        }
+        let old = sim.replicas[0].shards[0]
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+            .unwrap();
+        assert!(
+            old.is_primary(),
+            "the isolated node still believes it is primary"
+        );
+        assert_eq!(old.view(), 0);
+        let convergence_start = sim.network.current_tick();
+        for _ in 0..SETUP_TOTAL_STEPS {
+            if [2, 3, 4]
+                .into_iter()
+                .all(|replica| partition_fresh(&sim, replica))
+            {
+                break;
+            }
+            step(&mut sim);
+            assert!(
+                !partition_fresh(&sim, 0) && !partition_fresh(&sim, 1),
+                "minority credit must remain expired during majority convergence",
+            );
+        }
+        eprintln!(
+            "majority qualification took {} ticks after expiry checks",
+            sim.network.current_tick() - convergence_start,
+        );
+        let mut served = false;
+        for replica in [2, 3, 4] {
+            assert!(
+                partition_fresh(&sim, replica),
+                "majority node{replica} lost credit: {:?}",
+                [2, 3, 4].map(|node| {
+                    let consensus = sim.metadata_consensus(node).unwrap();
+                    (
+                        node,
+                        consensus.view(),
+                        consensus.status(),
+                        consensus.commit_min(),
+                        consensus.commit_max(),
+                        consensus.adopted_view_head(),
+                        partition_fresh(&sim, u8::try_from(node).unwrap()),
+                    )
+                })
+            );
+            let consensus = sim.replicas[usize::from(replica)].shards[0]
+                .plane
+                .metadata()
+                .consensus
+                .as_ref()
+                .unwrap();
+            assert!(consensus.view() > 0, "the majority must depose replica0");
+            let reply = super::tests::submit_and_wait_for_reply(
+                &mut sim,
+                1,
+                replica,
+                client.poll_messages(namespace, 1),
+            );
+            assert_ne!(
+                reply.header().status,
+                IggyError::TransientNotAccepted.as_code()
+            );
+            served |= reply.header().status == 0;
+        }
+        assert!(served, "the majority's partition primary must serve a read");
+    }
+
+    #[test]
+    fn given_an_empty_same_view_restart_when_a_partition_is_created_should_advance_metadata_before_serving_it()
+     {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+        let mut sim = Simulator::with_shards_shell(
+            3,
+            1,
+            std::iter::once(1),
+            packet::PacketSimulatorOptions {
+                node_count: 3,
+                client_count: 1,
+                seed: 0xF2E5_0030,
+                ..Default::default()
+            },
+        );
+        assert!(sim.replicas[0].superblock.read_latest_sync().is_none());
+        assert_eq!(metadata_commit(&sim, 0), 0);
+        sim.replica_crash(0);
+        sim.replica_restart(0);
+        let metadata = sim.replicas[0].shards[0].plane.metadata();
+        assert_eq!(metadata.consensus.as_ref().unwrap().view(), 0);
+        assert!(
+            metadata
+                .mux_stm
+                .streams()
+                .read(|streams| streams.items.is_empty())
+        );
+        assert!(!partition_fresh(&sim, 0));
+        let client = SimClient::new(1);
+        sim.shell_login(&client);
+        commit_write(&mut sim, 1, 0, client.create_stream("after-empty-restart"));
+        let created = commit_write(
+            &mut sim,
+            1,
+            0,
+            client.create_topic("after-empty-restart", "partition", 1),
+        );
+        assert!(
+            created > 0,
+            "a partition cannot appear at the ambiguous commit0 boot"
+        );
+        for replica in 0..3 {
+            step_until_applied(&mut sim, replica, created);
+        }
+        for _ in 0..SETUP_TOTAL_STEPS {
+            if (0..3).all(|replica| partition_fresh(&sim, replica)) {
+                return;
+            }
+            sim.step();
+        }
+        panic!("first committed metadata must restore backup credit after an empty restart");
+    }
+
+    #[test]
+    fn given_a_durable_primary_restart_when_rejoining_should_start_uncredited_and_adopt_a_new_view()
+    {
+        let (mut sim, _client, _namespace) = partition_freshness_cluster(3, 0xF2E5_0040);
+        let committed = metadata_commit(&sim, 0);
+        assert!(committed > 0);
+        sim.replica_crash(0);
+        sim.replica_restart(0);
+        assert!(
+            !partition_fresh(&sim, 0),
+            "durable metadata is not quorum evidence after reboot"
+        );
+        for _ in 0..SETUP_TOTAL_STEPS {
+            sim.step();
+            let consensus = sim.replicas[0].shards[0]
+                .plane
+                .metadata()
+                .consensus
+                .as_ref()
+                .unwrap();
+            if partition_fresh(&sim, 0) {
+                assert!(consensus.view() > 0);
+                assert!(
+                    consensus
+                        .adopted_view_head()
+                        .is_some_and(|(view, head)| view == consensus.view() && head >= committed)
+                );
+                assert!(metadata_commit(&sim, 0) >= committed);
+                return;
+            }
+        }
+        panic!("durable primary did not regain credit after adopting the current view");
+    }
+
     /// Open or close every replication route from the primary into `replica`.
     fn set_replication(sim: &mut Simulator, replica: u8, open: bool) {
         for frame in REPLICATION_FRAMES {
@@ -9105,12 +16147,13 @@ mod probe_answer_divergence_tests {
 
         let mut injector = FaultInjector::new(seed, replica_count);
         let mut invariants = crate::workload::invariants::Invariants::new();
+        let clients = [client];
         // `run_with_faults` runs the per-tick invariants and the live state
         // checker, which is where the divergence fired.
         workload::run_with_faults(
             &mut sim,
             &mut wl,
-            &[client],
+            &clients,
             6_000,
             u64::MAX,
             &mut injector,
@@ -9118,7 +16161,7 @@ mod probe_answer_divergence_tests {
         );
 
         assert!(
-            oracle::drive_to_quiesce(&mut sim, &mut wl, 50_000, &mut invariants),
+            oracle::drive_to_quiesce(&mut sim, &mut wl, &clients, 50_000, &mut invariants),
             "{}",
             oracle::quiesce_failure_report(&sim, &wl),
         );
@@ -9132,5 +16175,867 @@ mod probe_answer_divergence_tests {
             "no committed metadata op was witnessed on two replicas, so this seed \
              would pass on a diverged cluster"
         );
+        assert!(
+            report.change_records_compared > 0,
+            "no change record was compared between replicas"
+        );
+        assert!(
+            report.projection_items_compared > 0,
+            "the leader's change records were never replayed against its current state"
+        );
+    }
+}
+
+#[cfg(test)]
+mod applied_divergence_resync_tests {
+    //! A view that contradicts an op this replica already applied fences that
+    //! one partition for a resync by state transfer. The WAL's parent check
+    //! would otherwise refuse the view's next prepare and stop the node.
+
+    use super::*;
+    use bytes::Bytes;
+    use consensus::{StateTransferStage, Status};
+    use iggy_binary_protocol::{
+        ConsensusHeader, DoViewChangeHeader, StartViewHeader, StateTransferTargetHeader,
+    };
+    use partitions::state_transfer::PartitionTransferSession;
+    use server_common::MessageBag;
+
+    const CLIENT_ID: u128 = 1;
+    /// Backup of view 0 and primary of view 4.
+    const DIVERGED: u8 = 1;
+    /// One single-message send per op, so op `n` holds offset `n - 1`.
+    const SENDS: u64 = 5;
+    const SETTLE_STEPS: usize = 2_000;
+
+    /// Every replica applied `SENDS` sends.
+    fn applied_sends(namespace: IggyNamespace) -> Simulator {
+        let (mut sim, client) = partition_repair_driver_tests::cluster(0x5EED_4476);
+        sim.init_partition(namespace);
+        sim.register_client_with_primary(&client);
+        for index in 0..SENDS {
+            let reply = tests::submit_and_wait_for_reply(
+                &mut sim,
+                CLIENT_ID,
+                0,
+                client.send_messages(namespace, &[Bytes::from(format!("applied-{index}"))]),
+            );
+            assert_eq!(reply.header().status, 0);
+        }
+        let applied = |sim: &Simulator| {
+            sim.replicas[usize::from(DIVERGED)]
+                .partition_shard(namespace)
+                .plane
+                .partitions()
+                .get_by_ns(&namespace)
+                .is_some_and(|partition| partition.consensus().commit_min() == SENDS)
+        };
+        assert!(
+            (0..SETTLE_STEPS).any(|_| {
+                sim.step();
+                applied(&sim)
+            }),
+            "replica {DIVERGED} never applied op {SENDS}"
+        );
+        sim
+    }
+
+    /// A history that leaves the cluster's at `from_op` and runs to `SENDS`,
+    /// newest first like a view's headers.
+    fn forged_suffix(
+        sim: &Simulator,
+        namespace: IggyNamespace,
+        from_op: u64,
+    ) -> Vec<PrepareHeader> {
+        let mut parent = tests::retained_prepare(sim, 0, namespace, from_op - 1)
+            .header()
+            .checksum;
+        let mut forged: Vec<PrepareHeader> = (from_op..=SENDS)
+            .map(|op| {
+                let mut header = *tests::retained_prepare(sim, 0, namespace, op).header();
+                header.parent = parent;
+                header.timestamp += 1;
+                header.checksum = header.identity_checksum();
+                parent = header.checksum;
+                header
+            })
+            .collect();
+        forged.reverse();
+        forged
+    }
+
+    /// A view 3 `StartView` from replica 0 carrying `headers` in order.
+    fn start_view(
+        sim: &Simulator,
+        namespace: IggyNamespace,
+        headers: &[PrepareHeader],
+    ) -> Message<StartViewHeader> {
+        let incarnation = sim
+            .partition_incarnation(usize::from(DIVERGED), namespace)
+            .expect("the diverged replica hosts the partition");
+        let header_size = size_of::<StartViewHeader>();
+        let total_size = header_size + size_of_val(headers);
+        let mut start_view = Message::<StartViewHeader>::new(total_size);
+        start_view.as_mut_slice()[header_size..].copy_from_slice(bytemuck::cast_slice(headers));
+        let body_checksum = u128::from(iggy_common::calculate_checksum(
+            &start_view.as_slice()[header_size..],
+        ));
+        start_view.transmute_header(|_, header: &mut StartViewHeader| {
+            header.command = Command::StartView;
+            header.cluster = 1;
+            header.replica = 0;
+            header.view = 3;
+            header.group = namespace.inner();
+            header.partition_incarnation = incarnation;
+            header.op = SENDS;
+            header.commit = SENDS;
+            header.size = u32::try_from(total_size).unwrap();
+            header.checksum_body = body_checksum;
+            header.seal();
+        })
+    }
+
+    /// The live offset frontier of the diverged replica's partition.
+    fn offset_frontier(sim: &Simulator, namespace: IggyNamespace) -> u64 {
+        sim.replicas[usize::from(DIVERGED)]
+            .partition_shard(namespace)
+            .plane
+            .partitions()
+            .get_by_ns(&namespace)
+            .expect("the partition is live")
+            .offset_frontier()
+    }
+
+    /// The partition is fenced for rebuild at `frontier`, the divergence is
+    /// counted, and the next sweep reports no node fault.
+    fn assert_resynced(sim: &Simulator, namespace: IggyNamespace, frontier: u64) {
+        let shard = sim.replicas[usize::from(DIVERGED)].partition_shard(namespace);
+        let partitions = shard.plane.partitions();
+        assert!(partitions.is_tombstoned(&namespace));
+        assert_eq!(
+            partitions
+                .get_io_owner(&namespace)
+                .and_then(|partition| partition.quarantine_frontier()),
+            Some(frontier),
+            "the rebuild must record a frontier no history past the agreed ops minted"
+        );
+        assert_eq!(shard.metrics().partition_applied_divergences_value(), 1);
+        let mut namespace_scratch = Vec::new();
+        assert!(
+            futures::executor::block_on(shard.tick_partitions(&mut namespace_scratch)).is_none(),
+            "a diverged partition must not stop the node"
+        );
+    }
+
+    #[test]
+    fn given_start_view_contradicting_an_applied_op_when_offered_should_fence_the_partition_for_resync()
+     {
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let sim = applied_sends(namespace);
+        let live_frontier = offset_frontier(&sim, namespace);
+        let forged = forged_suffix(&sim, namespace, SENDS);
+        let shard = sim.replicas[usize::from(DIVERGED)].partition_shard(namespace);
+
+        futures::executor::block_on(
+            shard.on_message(MessageBag::StartView(start_view(&sim, namespace, &forged))),
+        );
+
+        assert_resynced(&sim, namespace, live_frontier - 1);
+        assert_eq!(
+            sim.applied_log_contradictions(usize::from(DIVERGED)),
+            1,
+            "the fence must not hide the refusal from the simulator invariants"
+        );
+    }
+
+    /// Offers a view whose history leaves the cluster's at `diverged_op` and
+    /// carries `window` of its newest headers plus the cluster's own `agreed`
+    /// ones, then checks the rebuild recorded `frontier`.
+    fn offer_multi_op_divergence(diverged_op: u64, window: usize, agreed: &[u64], frontier: u64) {
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let sim = applied_sends(namespace);
+        let mut headers: Vec<PrepareHeader> = forged_suffix(&sim, namespace, diverged_op)
+            .into_iter()
+            .take(window)
+            .collect();
+        headers.extend(
+            agreed
+                .iter()
+                .map(|&op| *tests::retained_prepare(&sim, 0, namespace, op).header()),
+        );
+        let shard = sim.replicas[usize::from(DIVERGED)].partition_shard(namespace);
+
+        futures::executor::block_on(
+            shard.on_message(MessageBag::StartView(start_view(&sim, namespace, &headers))),
+        );
+
+        assert_resynced(&sim, namespace, frontier);
+    }
+
+    #[test]
+    fn given_multi_op_divergence_with_agreed_header_when_offered_should_record_frontier_below_first_diverged_op()
+     {
+        // Ops 4 and 5 diverge and the view still carries the cluster's op 3, so
+        // the offsets of ops 1..=3 are the only ones both histories minted.
+        offer_multi_op_divergence(4, 2, &[3], 3);
+    }
+
+    #[test]
+    fn given_multi_op_divergence_agreed_only_by_parent_when_offered_should_record_frontier_below_first_diverged_op()
+     {
+        // The view's op 4 names the cluster's op 3 as parent, which is the only
+        // witness that op 3 is shared.
+        offer_multi_op_divergence(4, 2, &[], 3);
+    }
+
+    #[test]
+    fn given_divergence_below_the_view_window_when_offered_should_record_no_frontier() {
+        // The histories split at op 2 but the view carries only ops 4 and 5, so
+        // nothing it holds confirms a shared op and the rebuild accepts any offer.
+        offer_multi_op_divergence(2, 2, &[], 0);
+    }
+
+    #[test]
+    fn given_contradicting_view_offered_while_transfer_fetching_when_transfer_refused_should_fence_the_partition_for_resync()
+     {
+        const TRANSFER_NONCE: u128 = 0x4500;
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let sim = applied_sends(namespace);
+        let live_frontier = offset_frontier(&sim, namespace);
+        let forged = forged_suffix(&sim, namespace, SENDS);
+        let incarnation = sim
+            .partition_incarnation(usize::from(DIVERGED), namespace)
+            .expect("the diverged replica hosts the partition");
+        let shard = sim.replicas[usize::from(DIVERGED)].partition_shard(namespace);
+        {
+            let partitions = shard.plane.partitions();
+            let partition = partitions.get_mut_by_ns(&namespace).unwrap();
+            partition.transfer = Some(PartitionTransferSession {
+                nonce: TRANSFER_NONCE,
+                peer: 0,
+                commit_op: 0,
+                artifacts: Vec::new(),
+                target_accepted: false,
+                idle_ticks: 0,
+            });
+            let consensus = partition.consensus();
+            consensus.set_state_transfer_stage(StateTransferStage::AwaitingTarget);
+            consensus.set_state_transfer_stage(StateTransferStage::Fetching);
+        }
+
+        futures::executor::block_on(
+            shard.on_message(MessageBag::StartView(start_view(&sim, namespace, &forged))),
+        );
+        let refusal =
+            Message::<StateTransferTargetHeader>::new(size_of::<StateTransferTargetHeader>())
+                .transmute_header(|_, header: &mut StateTransferTargetHeader| {
+                    header.command = Command::StateTransferTarget;
+                    header.cluster = 1;
+                    header.replica = 0;
+                    header.view = 3;
+                    header.group = namespace.inner();
+                    header.partition_incarnation = incarnation;
+                    header.nonce = TRANSFER_NONCE;
+                    header.available = 0;
+                    header.size = u32::try_from(size_of::<StateTransferTargetHeader>()).unwrap();
+                    header.seal();
+                });
+        futures::executor::block_on(shard.on_message(MessageBag::StateTransferTarget(refusal)));
+
+        assert_resynced(&sim, namespace, live_frontier - 1);
+    }
+
+    #[test]
+    fn given_merged_view_contradicting_an_applied_op_when_primary_elect_advances_should_fence_the_partition_for_resync()
+     {
+        const VIEW: u32 = 4;
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let sim = applied_sends(namespace);
+        let live_frontier = offset_frontier(&sim, namespace);
+        let forged = forged_suffix(&sim, namespace, SENDS)[0];
+        let shard = sim.replicas[usize::from(DIVERGED)].partition_shard(namespace);
+        assert_eq!(
+            shard
+                .plane
+                .partitions()
+                .get_by_ns(&namespace)
+                .unwrap()
+                .consensus()
+                .primary_index(VIEW),
+            DIVERGED
+        );
+        let incarnation = sim
+            .partition_incarnation(usize::from(DIVERGED), namespace)
+            .expect("the diverged replica hosts the partition");
+        let header_size = size_of::<DoViewChangeHeader>();
+        let total_size = header_size + size_of::<PrepareHeader>();
+        let mut do_view_change = Message::<DoViewChangeHeader>::new(total_size);
+        do_view_change.as_mut_slice()[header_size..].copy_from_slice(bytemuck::bytes_of(&forged));
+        let body_checksum = u128::from(iggy_common::calculate_checksum(
+            &do_view_change.as_slice()[header_size..],
+        ));
+        let do_view_change =
+            do_view_change.transmute_header(|_, header: &mut DoViewChangeHeader| {
+                header.command = Command::DoViewChange;
+                header.cluster = 1;
+                header.replica = 2;
+                header.view = VIEW;
+                header.log_view = VIEW - 1;
+                header.group = namespace.inner();
+                header.partition_incarnation = incarnation;
+                header.op = SENDS;
+                header.commit = SENDS;
+                header.present_bitset = 1;
+                header.size = u32::try_from(total_size).unwrap();
+                header.checksum_body = body_checksum;
+                header.seal();
+            });
+
+        futures::executor::block_on(shard.on_message(MessageBag::DoViewChange(do_view_change)));
+        let partition = shard.plane.partitions().get_by_ns(&namespace);
+        assert!(
+            partition.is_some_and(|partition| {
+                partition.consensus().status() == Status::ViewChange
+                    && partition.consensus().view_log_is_pending()
+            }),
+            "the merge must park the view on the forged log"
+        );
+        let mut namespace_scratch = Vec::new();
+        assert!(
+            futures::executor::block_on(shard.tick_partitions(&mut namespace_scratch)).is_none()
+        );
+
+        assert_resynced(&sim, namespace, live_frontier - 1);
+    }
+}
+
+#[cfg(test)]
+mod metadata_walk_stuck_detector_tests {
+    //! The metadata walk-stall detector in `tick_metadata` must keep the
+    //! pipeline head journaled.
+    //!
+    //! `commit_journal` stops at the op the pipeline holds and reports
+    //! `CommitWalkStop::PipelineHead`, and the detector truncates only on
+    //! `BodyMissing`. Truncating from the head would leave the primary's
+    //! pipeline with a committed header whose prepare is gone, and the next
+    //! commit driver would panic with `committed prepare ... must be in journal`.
+
+    use consensus::Consensus;
+
+    use super::*;
+
+    /// Swarm seed whose network elects replica 1 primary of view 1 with a
+    /// committed pipeline head it has not yet walked.
+    const SEED: u64 = 1723;
+    const REPLICAS: u8 = 3;
+    const CLIENTS: [u128; 3] = [1, 2, 3];
+
+    const VIEW_0_PRIMARY: u8 = 0;
+    /// The replica the faults leave to win view 1.
+    const PRIMARY_ELECT: usize = 1;
+
+    /// Replica faults as `(step, replica, crash)`. The view-0 primary goes
+    /// down, which puts the view-1 change on the primary-elect, and comes back
+    /// before the primary-elect holds the inherited head.
+    const FAULTS: [(usize, u8, bool); 2] =
+        [(130, VIEW_0_PRIMARY, true), (250, VIEW_0_PRIMARY, false)];
+
+    /// Past the inherited-head window, then the drain heals the cluster.
+    const FAULT_STEPS: usize = 800;
+    const DRAIN_STEPS: usize = 4_000;
+
+    /// Only the three `Register`s go through the metadata plane: no client
+    /// traffic, no metadata workload. Op 3 is the last of them.
+    const REGISTERED_OPS: u64 = 3;
+
+    #[test]
+    fn given_primary_elect_inheriting_a_committed_head_when_the_tick_probes_the_walk_should_keep_its_prepare()
+     {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+        let mut network = packet::PacketSimulatorOptions::swarm(SEED);
+        network.node_count = REPLICAS;
+        network.client_count = u8::try_from(CLIENTS.len()).expect("few clients");
+        let mut sim = Simulator::new(usize::from(REPLICAS), CLIENTS.iter().copied(), network);
+        sim.init_partition(IggyNamespace::new(1, 1, 0));
+        for id in CLIENTS {
+            sim.register_client_with_primary(&SimClient::new(id));
+        }
+
+        let mut inherited_head_seen = false;
+        for step in 0..FAULT_STEPS {
+            for &(at, replica, crash) in &FAULTS {
+                if at == step {
+                    if crash {
+                        sim.replica_crash(replica);
+                    } else {
+                        sim.replica_restart(replica);
+                    }
+                }
+            }
+            sim.step();
+            inherited_head_seen |= primary_elect_holds_inherited_head(&sim);
+        }
+        // Without this a drifted seed that never builds the shape passes the
+        // drain assertion below without testing anything.
+        assert!(
+            inherited_head_seen,
+            "replica {PRIMARY_ELECT} never led view 1 with a committed pipeline head at \
+             commit_min + 1; the seed no longer reaches the shape under test"
+        );
+        for _ in 0..DRAIN_STEPS {
+            sim.step();
+        }
+
+        // Every replica applies every registration: a dropped pipeline prepare
+        // must neither panic the primary nor leave any replica short of it.
+        for replica in 0..usize::from(REPLICAS) {
+            let consensus = sim
+                .metadata_consensus(replica)
+                .expect("shard 0 hosts the metadata plane");
+            assert!(
+                consensus.commit_min() >= REGISTERED_OPS,
+                "replica {replica} applied metadata only through op {}, short of the \
+                 {REGISTERED_OPS} registrations",
+                consensus.commit_min()
+            );
+        }
+    }
+
+    /// Whether the primary-elect is a normal primary of view 1 or later whose
+    /// pipeline head is committed and is the very next op it owes the state
+    /// machine. Gated like `group_is_walk_stalled`, so a view-change window
+    /// does not count.
+    fn primary_elect_holds_inherited_head(sim: &Simulator) -> bool {
+        let consensus = sim
+            .metadata_consensus(PRIMARY_ELECT)
+            .expect("shard 0 hosts the metadata plane");
+        consensus.is_primary()
+            && consensus.is_normal()
+            && !consensus.is_transferring()
+            && consensus.view() >= 1
+            && consensus.pipeline_head_header().is_some_and(|head| {
+                head.op == consensus.commit_min() + 1 && head.op <= consensus.commit_max()
+            })
+    }
+}
+
+#[cfg(test)]
+mod primary_transfer_crash_tests {
+    //! Crash each replica at each handoff message of a planned primary transfer.
+    //!
+    //! Spread placement moves a partition primary with an ordinary view change,
+    //! after the metadata primary confirmed the source frontier and the target's
+    //! applied history. Every run of a sweep replays one seed to the tick that
+    //! delivers one handoff message, crashes one replica there and restarts it
+    //! later, while writes and offset stores keep flowing. The run must converge
+    //! with every acknowledged effect, and the primaries must spread again.
+
+    use super::partition_repair_driver_tests::cluster;
+    use super::*;
+    use crate::workload::{
+        self, Workload,
+        invariants::Invariants,
+        options::{ActionWeights, WorkloadOptions},
+        oracle,
+    };
+    use iggy_binary_protocol::{
+        DoViewChangeHeader, PrimaryRebalanceHeader, PrimaryRebalanceKind, StartViewChangeHeader,
+        StartViewHeader,
+    };
+    use packet::Packet;
+    use server_common::sharding::METADATA_GROUP;
+
+    const SEED: u64 = 0x5052_494D;
+    /// Fails and returns ahead of the transfer that [`Sweep::Return`] crashes into.
+    const RETURNING: u8 = 1;
+    /// Ticks for the swept transfer to finish in the baseline.
+    const TRANSFER_TICKS: u64 = 5_000;
+    /// Ticks a crashed replica stays down: past a heartbeat timeout, so the
+    /// groups it led fail over.
+    const DOWN_TICKS: u64 = 800;
+    /// Ticks for the primaries to spread again once every replica is up.
+    const SPREAD_TICKS: u64 = 10_000;
+    const QUIESCE_TICKS: u64 = 20_000;
+
+    thread_local! {
+        /// Handoff messages in delivery order. A link hook is a bare `fn` and
+        /// cannot capture.
+        static DELIVERED: RefCell<Vec<Handoff>> = const { RefCell::new(Vec::new()) };
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Kind {
+        SourceProbe,
+        SourceReply,
+        PartitionProbe,
+        PartitionReply,
+        PrimaryTransfer,
+        StartViewChange,
+        DoViewChange,
+        StartView,
+    }
+
+    /// A delivered handoff message. `view` is the probed view of a rebalance
+    /// frame and the proposed view of a view-change frame.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct Handoff {
+        tick: u64,
+        kind: Kind,
+        group: u64,
+        view: u32,
+        ready: bool,
+        from: u8,
+        to: u8,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Sweep {
+        /// The first spread transfer. The metadata primary also leads the group,
+        /// so it drains its own accepted work and the source frames stay local.
+        Spread,
+        /// The transfer back to [`RETURNING`]. Coordinator, source and target are
+        /// three replicas, so every handoff crosses the network.
+        Return,
+    }
+
+    impl Sweep {
+        const fn handoffs(self) -> &'static [Kind] {
+            match self {
+                Self::Spread => &[
+                    Kind::PartitionProbe,
+                    Kind::PartitionReply,
+                    Kind::StartViewChange,
+                    Kind::DoViewChange,
+                    Kind::StartView,
+                ],
+                Self::Return => &[
+                    Kind::SourceProbe,
+                    Kind::SourceReply,
+                    Kind::PartitionProbe,
+                    Kind::PartitionReply,
+                    Kind::PrimaryTransfer,
+                    Kind::StartViewChange,
+                    Kind::DoViewChange,
+                    Kind::StartView,
+                ],
+            }
+        }
+    }
+
+    fn record_handoff(packet: &Packet) -> bool {
+        let (ProcessId::Replica(from), ProcessId::Replica(to)) = (packet.from, packet.to) else {
+            return false;
+        };
+        let bytes = packet.message.as_slice();
+        let (kind, group, view, ready) = match packet.message.header().command {
+            Command::PrimaryRebalance => {
+                let header: &PrimaryRebalanceHeader =
+                    bytemuck::checked::from_bytes(&bytes[..size_of::<PrimaryRebalanceHeader>()]);
+                let kind = match header.kind {
+                    PrimaryRebalanceKind::MetadataProbe | PrimaryRebalanceKind::MetadataReply => {
+                        return false;
+                    }
+                    PrimaryRebalanceKind::SourceProbe => Kind::SourceProbe,
+                    PrimaryRebalanceKind::SourceReply => Kind::SourceReply,
+                    PrimaryRebalanceKind::PartitionProbe => Kind::PartitionProbe,
+                    PrimaryRebalanceKind::PartitionReply => Kind::PartitionReply,
+                    PrimaryRebalanceKind::PrimaryTransfer => Kind::PrimaryTransfer,
+                };
+                (
+                    kind,
+                    header.namespace,
+                    header.partition_view,
+                    header.ready == 1,
+                )
+            }
+            Command::StartViewChange => {
+                let header: &StartViewChangeHeader =
+                    bytemuck::checked::from_bytes(&bytes[..size_of::<StartViewChangeHeader>()]);
+                (Kind::StartViewChange, header.group, header.view, false)
+            }
+            Command::DoViewChange => {
+                let header: &DoViewChangeHeader =
+                    bytemuck::checked::from_bytes(&bytes[..size_of::<DoViewChangeHeader>()]);
+                (Kind::DoViewChange, header.group, header.view, false)
+            }
+            Command::StartView => {
+                let header: &StartViewHeader =
+                    bytemuck::checked::from_bytes(&bytes[..size_of::<StartViewHeader>()]);
+                (Kind::StartView, header.group, header.view, false)
+            }
+            _ => return false,
+        };
+        if group != METADATA_GROUP {
+            DELIVERED.with_borrow_mut(|delivered| {
+                delivered.push(Handoff {
+                    tick: 0,
+                    kind,
+                    group,
+                    view,
+                    ready,
+                    from,
+                    to,
+                });
+            });
+        }
+        false
+    }
+
+    /// The handoff messages of the first transfer a target confirmed after
+    /// `after`, in protocol order, once the target started its view.
+    fn transfer(trace: &[Handoff], after: u64) -> Option<Vec<Handoff>> {
+        let confirmed = trace.iter().position(|handoff| {
+            handoff.tick > after && handoff.kind == Kind::PartitionReply && handoff.ready
+        })?;
+        let reply = trace[confirmed];
+        let probed = |handoff: &&Handoff| {
+            handoff.tick > after && handoff.group == reply.group && handoff.view == reply.view
+        };
+        let mut handoffs: Vec<_> = [Kind::SourceProbe, Kind::SourceReply, Kind::PartitionProbe]
+            .into_iter()
+            .filter_map(|kind| {
+                trace[..confirmed]
+                    .iter()
+                    .rev()
+                    .filter(probed)
+                    .find(|handoff| handoff.kind == kind)
+                    .copied()
+            })
+            .collect();
+        handoffs.push(reply);
+        handoffs.extend(
+            trace[confirmed..]
+                .iter()
+                .find(|handoff| {
+                    handoff.kind == Kind::PrimaryTransfer
+                        && handoff.group == reply.group
+                        && handoff.view == reply.view
+                })
+                .copied(),
+        );
+        let started = *trace[confirmed..].iter().find(|handoff| {
+            handoff.kind == Kind::StartView
+                && handoff.group == reply.group
+                && handoff.view > reply.view
+        })?;
+        for kind in [Kind::StartViewChange, Kind::DoViewChange] {
+            handoffs.push(*trace[confirmed..].iter().find(|handoff| {
+                handoff.kind == kind
+                    && handoff.group == started.group
+                    && handoff.view == started.view
+            })?);
+        }
+        handoffs.push(started);
+        Some(handoffs)
+    }
+
+    /// One seeded run. Every run replays the same trace until its crash.
+    struct Run {
+        sim: Simulator,
+        workload: Workload,
+        clients: [SimClient; 1],
+        invariants: Invariants,
+        namespaces: Vec<IggyNamespace>,
+        tick: u64,
+        replies: u64,
+        trace: Vec<Handoff>,
+    }
+
+    impl Run {
+        /// One fixture group per replica. Every fixture starts on the metadata
+        /// primary, so the rebalance has to move all but one of them.
+        fn new() -> Self {
+            let (mut sim, client) = cluster(SEED);
+            let namespaces: Vec<_> = (0..usize::from(sim.replica_count))
+                .map(|partition| IggyNamespace::new(1, 1, partition))
+                .collect();
+            for &namespace in &namespaces {
+                sim.init_partition(namespace);
+            }
+            sim.register_client_with_primary(&client);
+            for from in 0..sim.replica_count {
+                for to in (0..sim.replica_count).filter(|&to| to != from) {
+                    *sim.network
+                        .link_drop_packet_fn(ProcessId::Replica(from), ProcessId::Replica(to)) =
+                        Some(record_handoff);
+                }
+            }
+            DELIVERED.take();
+            let mut options = WorkloadOptions::new(SEED, sim.replica_count, namespaces.clone());
+            options.weights = ActionWeights::partition_only();
+            options.ack_quorum_ratio = 1.0;
+            Self {
+                sim,
+                workload: Workload::new(options),
+                clients: [client],
+                invariants: Invariants::new(),
+                namespaces,
+                tick: 0,
+                replies: 0,
+                trace: Vec::new(),
+            }
+        }
+
+        fn tick(&mut self) {
+            self.replies += workload::run(
+                &mut self.sim,
+                &mut self.workload,
+                &self.clients,
+                1,
+                u64::MAX,
+                &mut self.invariants,
+            );
+            self.tick += 1;
+            let tick = self.tick;
+            self.trace.extend(
+                DELIVERED
+                    .take()
+                    .into_iter()
+                    .map(|handoff| Handoff { tick, ..handoff }),
+            );
+        }
+
+        fn tick_until(&mut self, budget: u64, done: impl Fn(&Self) -> bool) -> bool {
+            for _ in 0..budget {
+                if done(self) {
+                    return true;
+                }
+                self.tick();
+            }
+            done(self)
+        }
+
+        /// Every replica up, every group normal in one view on all of them, and
+        /// each replica the primary of exactly one group.
+        fn spread(&self) -> bool {
+            let mut led = vec![0_usize; usize::from(self.sim.replica_count)];
+            for &namespace in &self.namespaces {
+                let mut view = None;
+                for replica in 0..self.sim.replica_count {
+                    let Some(state) = (!self.sim.is_crashed(replica))
+                        .then(|| {
+                            self.sim
+                                .partition_consensus_state(usize::from(replica), namespace)
+                        })
+                        .flatten()
+                    else {
+                        return false;
+                    };
+                    if state.status != Status::Normal
+                        || *view.get_or_insert(state.view) != state.view
+                    {
+                        return false;
+                    }
+                    if state.is_primary {
+                        led[usize::from(replica)] += 1;
+                    }
+                }
+            }
+            led.iter().all(|&groups| groups == 1)
+        }
+
+        /// Drive to the start of the sweep's transfer window.
+        fn prepare(&mut self, sweep: Sweep) {
+            if matches!(sweep, Sweep::Return) {
+                assert!(
+                    self.tick_until(SPREAD_TICKS, Self::spread),
+                    "the fixtures must spread before replica {RETURNING} fails"
+                );
+                self.sim.replica_crash(RETURNING);
+                for _ in 0..DOWN_TICKS {
+                    self.tick();
+                }
+                self.sim.replica_restart(RETURNING);
+            }
+        }
+    }
+
+    /// Crash each replica at each handoff message of the sweep's transfer.
+    fn sweep(sweep: Sweep) {
+        let mut baseline = Run::new();
+        baseline.prepare(sweep);
+        let start = baseline.tick;
+        assert!(
+            baseline.tick_until(TRANSFER_TICKS, |run| transfer(&run.trace, start).is_some()),
+            "{sweep:?}: a planned transfer must finish without faults"
+        );
+        let handoffs = transfer(&baseline.trace, start).expect("the transfer finished");
+        assert_eq!(
+            handoffs
+                .iter()
+                .map(|handoff| handoff.kind)
+                .collect::<Vec<_>>(),
+            sweep.handoffs(),
+            "{sweep:?}: unexpected handoff messages {handoffs:?}"
+        );
+        let mut crash_points = HashSet::new();
+        for &handoff in &handoffs {
+            for victim in 0..baseline.sim.replica_count {
+                if crash_points.insert((handoff.tick, victim)) {
+                    crash_at(sweep, handoff, victim);
+                }
+            }
+        }
+    }
+
+    fn crash_at(sweep: Sweep, handoff: Handoff, victim: u8) {
+        let context = format!("{sweep:?}: replica {victim} crashed after {handoff:?}");
+        let mut run = Run::new();
+        run.prepare(sweep);
+        while run.tick < handoff.tick {
+            run.tick();
+        }
+        assert!(
+            run.trace.contains(&handoff),
+            "{context}: the replay must deliver the handoff at the baseline tick"
+        );
+        run.sim.replica_crash(victim);
+        for _ in 0..DOWN_TICKS {
+            run.tick();
+        }
+        run.sim.replica_restart(victim);
+        let restarted_with = run.replies;
+        assert!(
+            run.tick_until(SPREAD_TICKS, |run| run.spread()
+                && run.replies > restarted_with),
+            "{context}: the primaries must spread again and serve new work"
+        );
+        assert!(
+            oracle::drive_to_quiesce(
+                &mut run.sim,
+                &mut run.workload,
+                &run.clients,
+                QUIESCE_TICKS,
+                &mut run.invariants
+            ),
+            "{context}: {}",
+            oracle::quiesce_failure_report(&run.sim, &run.workload)
+        );
+        assert!(
+            oracle::settle_to_stable_view(
+                &mut run.sim,
+                &mut run.workload,
+                QUIESCE_TICKS,
+                &mut run.invariants
+            ),
+            "{context}: the views must settle after the drain"
+        );
+        oracle::assert_converged(&run.sim, &mut run.workload);
+    }
+
+    #[test]
+    fn given_the_first_spread_transfer_when_each_replica_crashes_at_each_handoff_should_converge_and_spread()
+     {
+        sweep(Sweep::Spread);
+    }
+
+    #[test]
+    fn given_a_transfer_to_a_returned_replica_when_each_replica_crashes_at_each_handoff_should_converge_and_spread()
+     {
+        sweep(Sweep::Return);
     }
 }

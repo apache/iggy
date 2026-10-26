@@ -22,7 +22,7 @@ note: previous works on node.js http client has been moved to [iggy-node-http-cl
 npm i --save apache-iggy@edge
 ```
 
-Use the `edge` package with server 0.9.0 or `edge`. Stable Node SDK 0.8.0 uses the older wire protocol. For a local server with the example credentials, follow the [example setup](../../examples/node/README.md#running-examples).
+Use matching SDK and server builds from the coordinated VSR release. Older builds are incompatible. This release requires fresh server storage (`IGGY-METADATA-CHANGE-LOG-1`). Existing incompatible data is refused unchanged. For a local server with the example credentials, follow the [example setup](../../examples/node/README.md#running-examples).
 
 ## basic usage
 
@@ -59,27 +59,143 @@ and after the client deletes a stream or a topic or creates or deletes
 partitions. A raw `SendMessages` command without an explicit partition id
 fails with error code 5 before the client sends it.
 
-Partition commands carry a partition context: the partition incarnation, the
-owner generation and a metadata operation. To make a poll or an offset write
-fail instead of landing in a recreated partition, pass the `context` of the
-earlier poll reply. Without one, the client takes the context that its cached
-route reports. If another client deletes and recreates the partition, one such
-call can fail with error code 87 (5009 for a consumer group). The client then
-drops the route, and the next call routes again. On a cluster, polls and
-offset writes go to the partition primary with one attempt per route, as in the
-Rust SDK. They return a lifecycle refusal (error code 88) at once. The client
-retries an 88 for any other request as a new request until the request
-deadline. The pause starts at 50 ms and doubles up to 1 s.
+`sendBinaryRequestToReplica(code, payload, replica)` sends a raw command to one node of a cluster, named by the replica id that cluster metadata returns, and `sendCommand` takes the same id as the `replica` option.
 
-VSR works over TCP and TLS. It restricts `Client` to one pooled connection because authentication, request sequencing, and consumer-group assignments belong to one consensus session. Configurations requesting more than one pooled connection fail before a socket is opened.
+Each node answers non-replicated commands such as `GetStats` from its own state, so this reads the state of that node. Replicated commands, polls, consumer-offset reads and session-control codes fail with error code 3 before anything is sent. An id that cluster metadata does not name fails with error code 6. An unreachable node is retried until the request deadline, and a `NotPrimary` (89) reply is returned rather than sent to another node.
 
-VSR authentication translates the existing password and personal-access-token
-login APIs into the register handshake required by the consensus protocol.
-Transport loss clears local authentication but retains the logical session and
-its bind proof. Login with the same credentials first tries to bind that session;
-a confirmed ended session requires a new registration. Logout forgets the local
-session. Transient not-committed responses retry the exact encoded request within
-one bounded deadline. A disconnected mutation is never replayed under a new session.
+Partition commands carry a context containing the partition incarnation, owner
+generation and metadata operation. Pass the context of an earlier poll reply to
+keep an offset write or continuation tied to that history. Otherwise the client
+captures the route context. Non-admission retries and uncertain-operation replay
+preserve the first captured context, request identity and payload. Route refreshes
+change the destination. Lifecycle error 88 retries with a fresh ID and the same
+context. A send without caller-supplied context can refresh history once after
+error 87; explicit contexts return that error. A new call can capture newer
+metadata progress.
+
+Route discovery uses command 105. Sends, polls and offset reads/writes use the
+partition primary; other commands use the metadata primary. One logical client
+owns a shared session, a monotonic request counter and one multiplexed link per
+replica. Healthy links survive primary changes. Each link dials the address
+that its node advertises in the cluster roster. With a one-node roster, the
+link dials the configured endpoint instead. A single node behind a port
+mapping or a port-forward thus stays reachable. The legacy `poolSize` option
+accepts only one logical client; it does not limit replica links or concurrency.
+The public `Client._pool` property has been removed. Applications should use the
+client methods directly; the client owns its replica connections.
+
+A backup replica can miss a stream, topic or partition that the metadata primary
+already created. When such a replica replies "not found" (error 1009, 1010,
+2010, 2011 or 3007) to a route lookup or a partition command, the call looks up
+the route again and retries. If the deadline ends the call first, it fails with
+error 58. Only a "not found" reply from the metadata primary is final. A leader
+change can make the client's view of the metadata primary out of date. If the
+client believes that the replica that replied is the metadata primary, it reads
+the cluster roster from that replica. If the client has no link to the metadata
+primary, it also reads that roster. If that roster names this replica as the
+metadata primary, the reply is final.
+
+VSR authentication translates password and personal-access-token login into the
+Register handshake. Replacement links bind the existing session. Confirmed
+session expiry requires a new Register; an uncertain mutation is never replayed
+under that new session. An eviction that ends the session does not prove the
+outcome of a mutation that the client already wrote. That call ends with
+`OperationUncertainError`. A stale client eviction drops only its link, because
+the server keeps the session. The client binds the same session on a new link,
+as after any lost link, so retained operations and group membership stay.
+Explicit relogin logs out the previous session first.
+
+The client signs in by itself as the last sign-in of the caller, or with the
+configured `credentials` while the caller never signed in. After a logout, or
+after the server refuses those credentials, it does not sign in by itself, and
+a call fails with status 40 until the caller signs in again. A sign-in or
+logout of the caller ends each earlier call that has to wait for a new session:
+with status 40 if it sent nothing, or with `OperationUncertainError` if its
+outcome is unknown. An auto-commit or Next poll, which has no operation ID, ends with status 57 instead. A typed send and a group poll can send more than one
+command. If the caller signs in or logs out before the next command of such a
+call, the call fails with status 40. Only a call that waits for the client's own sign-in goes on
+under the new session. If the server refuses that sign-in, the call fails with
+status 40, and its `cause` holds the refusal. A call whose deadline ends while
+it waits for a session fails with status 58. So does a call that replicas refuse with 89 until its deadline.
+
+A reply with status 30 (`StaleClient`) says that the server no longer attaches
+the link to the session. This happens, for example, after the user was deleted
+or deactivated. A 30 refusal before commit fails a first attempt with that
+error. After an earlier written attempt, it does not prove the outcome, so that
+call ends with `OperationUncertainError`. The client closes that link and binds
+the session on a new link, as after any lost link. A replica that replaced its
+client table refuses a live session the same way, so the bind decides. A live
+session stays, with its retained operations and group membership. An ended
+session refuses the bind, and the client signs in again.
+
+A committed 30 comes from the replicated session table, so that session ended.
+It is a proved outcome, like any other committed rejection, and the client
+drops the session at once and signs in again.
+
+### Mutation recovery and limits
+
+Receipt access follows the server's [session and revocation policy](../../core/server/README.md#sessions-and-retry-receipts).
+An unresolved operation cannot recover its receipt after its original session
+ends, even after a new login or account reactivation. A fresh send can duplicate
+that operation.
+
+Each node counts the messages in its stream, topic and system stats. After a
+successful send, a node that is not the partition primary shows the new count
+only after the next prepare or commit broadcast. When no other write follows,
+this delay is at most `cluster.commit_broadcast_interval` (500 ms by default).
+See [metadata freshness and counters](../../core/server/README.md#metadata-freshness-and-counters).
+
+Mutations share one FIFO lane per partition history, with a separate metadata
+lane. An uncertain mutation remains retained and blocks later mutations in its
+lane. `OperationUncertainError.operationId` and `LaneBlockedError.operationId`
+are exact `bigint` values. Use `resolveOperation(operationId, { deadline })` to
+replay the retained frame, where `deadline` is an absolute `Date.now()` timestamp
+in milliseconds. The default operation budget is 30 seconds, including admission,
+routing, link waits and retries.
+
+Resolution requires correlated committed-result proof. A proved business
+rejection returns the original error and releases the lane. An unproved denial
+keeps an uncertain operation retained. The client keeps the proved outcomes of
+its last `maxPendingOperations` replays, also across a session reset. If a
+resolver already proved the outcome, a later `resolveOperation` of the same ID
+returns it without a request. A `resolveOperation` call that waits for another
+replay of the same ID and reaches its deadline fails with
+`OperationUncertainError`.
+
+`abandonOperation(operationId)` releases the client lane without proving that
+the mutation failed. A replay that is already running keeps the lane until it
+ends, and the client keeps the outcome that it proves. Logout, session reset and
+destruction discard retained operations with their outcomes still unknown.
+`OperationNotRetainedError` does not establish the outcome: a reset or an
+abandon came before a proved outcome, or the proved outcome aged out.
+
+**Breaking change:** `Client.destroy()` aborts in-flight calls immediately and
+discards retained operations. It does not wait for outstanding calls to finish.
+Await those calls before destroying the client when their results are needed.
+
+Auto-commit and Next polls hold their partition lane only during the active call.
+Error 57, a lost reply or another unknown outcome ends the call immediately with status 57 and no
+retained operation ID. These polls never replay after uncertainty. Known
+non-admission errors 58/89 remain retryable; pure reads may retry lost replies.
+Before uncertainty, lifecycle error 88 retries with a fresh ID within the same
+deadline. After uncertainty, only committed-result proof can release the lane.
+
+Configure `maxPendingOperations` (default 256) and `maxPendingOperationBytes`
+(default 64 MiB) on the client. Admission waits before allocating an ID or freezing
+a mutation frame. Both limits must be positive. The byte budget includes the
+256-byte header and body; smaller positive budgets reject mutations that cannot
+fit while reads and login remain available. Oversized frames fail locally.
+Completion, abandonment and reset release the operation slot. Writer aliases keep bytes charged until they release
+the frame. These limits cover admitted active/retained frames, not caller buffers,
+queued API input snapshots, or read/control bodies. `sendBinaryRequest` preserves
+its immediate payload snapshot before awaiting a custom provider.
+
+An explicit sign-in uses its caller's credentials and supersedes automatic or
+queued sign-ins. A failed explicit attempt, including invalid input, timeout or
+cancellation, withdraws credentials from automatic sign-in until another explicit
+sign-in succeeds. This also discards a session whose Register succeeded when a
+later step of the explicit sign-in fails. Earlier calls keep their original
+lineage; only SDK recovery continues them under a replacement session.
 
 An established session has its own lifetime. Password or PAT changes and PAT
 expiry do not end it. Logout, session lease expiry, or user deactivation end the
@@ -89,12 +205,53 @@ The client pings every `heartbeatInterval` milliseconds, 5000 by default, which
 keeps an idle session alive when the server's `[heartbeat]` eviction is enabled.
 `heartbeatInterval` also accepts a duration expression such as `"10s"` or
 `"1h 30m"`, like the Rust SDK.
-With the default heartbeat settings, a group member becomes eligible for
-eviction after 36 s of silence (1.2 x the 30 s interval); the verifier checks
-once per interval. Raising the client interval past that window, or setting it
-to 0 to disable client heartbeats, exposes an idle consumer-group member to
-eviction; a connection holding no group membership is left alone. Any other
-unusable value is rejected instead of silently disabling the heartbeat.
+With the default heartbeat settings, a client that sends nothing for 36 s
+(1.2 x the 30 s interval) stops renewing its session, and the server ends the
+session about 36 s later. The verifier checks once per interval and also evicts
+the connection of a consumer-group member that is silent past 36 s. If the
+client interval exceeds 36 s, the verifier evicts an idle group member. If it
+exceeds about 72 s, or is 0 to disable client heartbeats, any idle session
+expires. Any other unusable value is rejected instead of silently disabling the
+heartbeat.
+
+A replica link redials on its own after it drops, with jittered exponential
+backoff. `reconnect.maxRetries` limits one burst of redials, not the life of
+the client. While the client stays signed in, each heartbeat restarts a link
+that used its budget, with a fresh budget. A request does not redial a link. It
+retries within its deadline until the link returns. If the deadline ends before
+the request was sent and no replica refused it, it fails with status 58.
+`destroy()` and logout stop the restarts.
+
+When every link used its budget, a request fails with `NotConnectedError` and
+does not wait for its deadline. When no endpoint accepts a dial before its retry
+budget or its deadline ends, a sign-in also fails with `NotConnectedError`, and
+its `cause` holds the last dial error. In both cases a later call can succeed,
+because the heartbeat restarts the links and each sign-in dials again. If
+reconnection or heartbeats are disabled, nothing restarts a link that used its
+budget, so the request fails with a plain `Error` instead.
+
+When a poll fails with status 30, 40, 57, 58 or 89, `singleConsumerStream` and
+`groupConsumerStream` poll again after `interval`. They also poll again after a
+poll deadline, after a poll with unknown progress, after `NotConnectedError` and
+after `ConnectionClosedError`. That error reports a lost connected socket. The
+client binds the session again, signs in again,
+reconnects or routes again after these on its own. Any other error ends the
+stream. The server can also refuse a sign-in with status 40, for example for an
+inactive user. So after a 40 the stream waits for the next sign-in, and a
+refused sign-in ends the stream. If the reply of an auto-commit poll is lost,
+the stream can skip that batch.
+
+`singleConsumerStream` and `groupConsumerStream` sign in before they return the
+stream, and `groupConsumerStream` also joins its group. If the sign-in or the
+join fails, the call destroys its client and rejects with that error. If no
+endpoint accepts a dial before the retry budget or the 30 second sign-in
+deadline ends, the error is `NotConnectedError`. When a stream closes, it
+destroys its client. A group stream that is still signed in first leaves its
+group, so that the server gives its partitions to the other members at once. If
+the leave fails or takes more than 5 seconds, the membership ends when the
+session lease expires. If the client of a destroyed stream has no session, or
+loses it, the stream destroys the client at once. It does not wait for a poll
+or a sign-in that still runs.
 
 `sendBinaryRequest(code, payload)` sends an arbitrary command code. Known replicated commands use their registered operation, while unknown codes reach the server as non-replicated requests and are rejected by servers that do not register them.
 
@@ -143,7 +300,8 @@ const stats = await client.system.getStats();
 Supported schemes are `iggy://` (TCP, default) and `iggy+tcp://`. Credentials
 are `username:password` or a single personal access token. Options mirror the
 other SDKs: `tls`, `tls_domain`, `tls_ca_file`, `reconnection_retries`,
-`reconnection_interval`, `heartbeat_interval` and `nodelay`. `reestablish_after`
+`reconnection_interval`, `heartbeat_interval`, `nodelay`, `max_pending_operations`
+and `max_pending_operation_bytes`. `reestablish_after`
 is accepted for format compatibility but has no Node equivalent.
 
 note: `SimpleClient` does not accept a connection string: it wraps an existing
@@ -165,14 +323,120 @@ Durations accept the same expressions as the Rust SDK, for example `500ms`,
 `0`, `unlimited`, `disabled` and `none` map to zero. Unit-less numbers such as
 `5` are rejected.
 
+### resource options
+
+A stream can carry its own data encryption key. Build it with `StreamEncryptionKey.from` from exactly 32 random bytes, or from their canonical padded base64, and pass it to `stream.create` as `encryptionKey`. Never derive the key from a password, because its fingerprint is readable by anyone who can read the stream. A key that is not 32 bytes or canonical base64 is refused with error 70 before anything is sent.
+
+A `StreamEncryptionKey` keeps its own copy of the bytes and prints only its fingerprint through `util.inspect`, `JSON.stringify` and string conversion, so create arguments carrying it can be logged. Entries passed through `options` print as given, so an `encryption_key` entry there is refused with error 70 before anything is sent.
+
+The key travels inside the create request over whatever transport the client uses, so connect over TLS when the key must stay confidential. The server stores the key wrapped and never returns it: reads report only `encryptionKeySource`, `encryptionKeyFingerprint` and `encryptionKekFingerprints`. Without a key, a server with encryption enabled generates one for the stream and reports the source `server`.
+
+```ts
+import { randomBytes } from "node:crypto";
+import { Client, StreamEncryptionKey } from "apache-iggy";
+
+const client = new Client({
+  transport: "TLS",
+  options: { host: "localhost", port: 8090 },
+  credentials: { username: "iggy", password: "iggy" },
+});
+
+const key = StreamEncryptionKey.from(randomBytes(32));
+const stream = await client.stream.create({ name: "orders", encryptionKey: key });
+console.log(stream.encryptionKeySource); // "stream"
+console.log(stream.encryptionKeyFingerprint === key.fingerprint()); // true
+```
+
+`stream.update`, `topic.update` and `user.update` change only the keys they name and leave every other setting as it is, so an update without `name` keeps the name. `reset` returns a key to the server default. Use the `StreamOptionKey`, `TopicOptionKey` and `UserOptionKey` constants to name keys.
+
+Only the topic keys `message_expiry` and `max_topic_size` can be reset. Settings fixed at create, such as the topic compression algorithm, the partition resize policy or the stream key, have no update field.
+
+The SDK checks the typed fields and `reset` before sending, in the server's order and with its error codes (4041 for an unknown key, 4105 for a read-only key, 4103 for a create-only key, 4104 for a key without a default, then the name, username or status error). For a key this build has no field or constant for, pass `options` entries and `rawReset` names. The SDK sends those as they are and the server decides, so a refusal comes back from the server.
+
+The server returns 4108 when a non-root caller tries to rename root or change root's status, or when root tries to deactivate itself.
+
+```ts
+await client.topic.update({
+  streamId: "orders",
+  topicId: "events",
+  messageExpiry: 7_200_000_000n,
+  reset: ["max_topic_size"],
+});
+```
+
+Reads return every setting in `options` (keys the client set) and `derivedOptions` (keys the server filled). `u64` values stay `bigint`, so values above 2^53 keep their precision. `system.describeOptions({ scope: OptionsScope.Stream })` lists the keys a server accepts per scope, with `updatable`, `resettable`, `secret`, `readOnly` and `critical`.
+
+### metadata changes
+
+`system.getMetadataChanges` reads the node's change log: one record per public result of a committed metadata operation, such as a stream created, a topic renamed, a user's permissions changed or a session closed. A mirror keeps a cursor, asks for the records after it, and stores the returned `next` cursor. The call needs root or the global `manage_servers` permission.
+
+```ts
+import { setTimeout as sleep } from "node:timers/promises";
+import {
+  Client, MetadataChangeStart, MetadataChangeStatus,
+  type MetadataChangeGroup, type MetadataCurrentPageToken,
+} from "apache-iggy";
+
+const follow = async (client: Client, groups: MetadataChangeGroup[]) => {
+  let start: MetadataChangeStart = MetadataChangeStart.Earliest;
+  for (;;) {
+    const page = await client.system.getMetadataChanges({ start, groups });
+    switch (page.status) {
+      case MetadataChangeStatus.Ok:
+        for (const record of page.records)
+          console.log(record.op, record.kind, record.actorUserId, record.body);
+        if (page.next) start = MetadataChangeStart.After(page.next);
+        if (!page.hasMore) await sleep(1000);
+        break;
+      case MetadataChangeStatus.Behind:
+        await sleep(100);
+        break;
+      default:
+        start = await rebuild(client, groups);
+    }
+  }
+};
+
+/** Pages the current state, then returns the position to follow from. */
+const rebuild = async (client: Client, groups: MetadataChangeGroup[]) => {
+  let pageToken: MetadataCurrentPageToken | undefined;
+  for (;;) {
+    const page = await client.system.getMetadataChanges({
+      start: MetadataChangeStart.Current(pageToken), groups,
+    });
+    if (page.status === MetadataChangeStatus.Behind) {
+      await sleep(100);
+      continue;
+    }
+    if (page.status !== MetadataChangeStatus.Ok) {
+      pageToken = undefined;
+      continue;
+    }
+    for (const item of page.items)
+      console.log(item.group, item.body);
+    if (page.currentPageToken) pageToken = page.currentPageToken;
+    else if (page.next) return MetadataChangeStart.After(page.next);
+    else pageToken = undefined;
+  }
+};
+```
+
+`expired` means the log no longer holds the history after the cursor, and `reset` means the cursor belongs to another history, for example after the data directory was rebuilt. Either way the mirror rebuilds from current state pages and then follows the changes after the anchor they return.
+
+Current pages need the parent groups of every selected group, for example `topics` with `streams`. Keep a rebuilt state private until a change page answers `ok` with `hasMore` false and a `headOp` at or above the last current page's.
+
+Records narrow by `kind` and items by `group`, so `record.kind === "stream_created"` types `record.body` as a stream. A group or kind newer than this build arrives as `"unknown"` with the raw body and the wire codes in `groupCode` and `kindCode`, while a record of a newer kind keeps its known `group`, so a mirror that cannot apply it can stop without advancing its cursor. Ops, timestamps and 128-bit ids are `bigint`.
+
+A query that breaks the request rules, such as a limit outside 1 to 1000 or a time bound with a latest or current start, is refused with error 3 before anything is sent. `MetadataChangeCursor` and `MetadataCurrentPageToken` print and parse as the `mc1_` and `cs1_` text forms the HTTP API and the CLI use, and `JSON.stringify` writes them as that text.
+
 ## use sources
 
-Cluster auto-commit polling over TCP/TLS keeps group membership on the coordinator
-and uses separate connections to partition primaries. It requires server support
-for binary commands 15 (`BindSession`), 103 and 104. Pause binary auto-commit consumers for the
-whole upgrade: upgrade every server first, then the SDKs, and restart consumers
-so they rejoin their groups. Older SDKs can lose membership when a backup refuses
-an offset commit; the new SDK does not fall back to legacy polling.
+Cluster polling uses command 15 (`BindSession`), route discovery 105 and poll
+100. Commands 14, 103, 104 and 123 are retired. Pause consumers for the coordinated
+server/SDK upgrade and restart them to rejoin their groups. There is no fallback
+to retired polling commands.
+
+Stream, topic and user updates use the generic update command 16. The former update commands 35, 204 and 304 are retired.
 
 ### Install
 
@@ -200,6 +464,8 @@ npm run test:unit
 #### e2e tests
 
 e2e test expect an iggy-server at tcp://127.0.0.1:8090
+
+The resource options tests also expect the server to run with encryption enabled and a config key (`IGGY_ENCRYPTION_ENABLED=true` and `IGGY_ENCRYPTION_KEY` set to the base64 of 32 bytes), so a stream created without a key reports a server-generated one. The keyed metadata changes case registered from the same file needs the config key too.
 
 ```bash
 npm run test:e2e

@@ -243,7 +243,6 @@ mod tests {
             vec![0, 1]
         );
 
-        shard.shards_table().remove(&namespace(&shard, 1));
         let join = maybe_rewrite_consumer_group_request(join_request(SECOND_CLIENT)).unwrap();
         mux.update(prepare_message(
             Operation::JoinConsumerGroup,
@@ -303,11 +302,11 @@ mod tests {
                 derived_options: WireOptions::empty(),
                 partitions: (0..PARTITION_COUNT)
                     .map(|partition_id| CreatedPartitionAssignment {
+                        initial_view: 0,
                         partition_id,
                         consensus_group_id: u64::from(partition_id) + 1,
                     })
                     .collect(),
-                created_view: 0,
             }
             .to_bytes(),
         ))
@@ -333,8 +332,8 @@ mod tests {
         shard
     }
 
-    /// Build a shard with its own inbox so tests can serve group progress reads
-    /// and clears through the production message pump.
+    /// Build a shard with its own inbox, so a test can serve partition requests
+    /// through the production message pump.
     pub(super) fn partition_read_shard(replica_count: u8) -> Rc<TestShard> {
         // These tests do not dispatch disk polls, so keep that lane minimal.
         const POLL_COMPLETION_CAPACITY: usize = 1;
@@ -360,7 +359,7 @@ mod tests {
                 validate_checksum: true,
                 segment_size: IggyByteSize::from(1_048_576_u64),
                 preallocate_segments: false,
-                encryptor: None,
+                key_context: Arc::default(),
                 path_layout: PartitionPathLayout::default(),
             },
         );
@@ -405,8 +404,8 @@ mod tests {
         )
     }
 
-    /// Poll the shard's message pump alongside the operation until it finishes.
-    /// This serves progress reads and also executes any requested stale clears.
+    /// Poll the shard's message pump alongside the operation until it finishes,
+    /// so the partition requests the operation sends are served.
     pub(super) async fn run_with_partition_message_pump<T>(
         shard: &Rc<TestShard>,
         operation: impl Future<Output = T>,

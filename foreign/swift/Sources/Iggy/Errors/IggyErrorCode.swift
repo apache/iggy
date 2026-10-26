@@ -95,6 +95,7 @@ public enum IggyErrorCode: UInt32, Sendable, Hashable, CaseIterable, Codable {
     case requestTooOld = 85
     case historyUnavailable = 87
     case lifecycleBusy = 88
+    case notPrimary = 89
     case clientNotFound = 100
     case invalidClientId = 101
     case connectionClosed = 206
@@ -227,6 +228,12 @@ public enum IggyErrorCode: UInt32, Sendable, Hashable, CaseIterable, Codable {
     case invalidOffset = 4100
     case invalidReservedField = 4101
     case segmentSizeMismatchAtOpen = 4102
+    case optionNotUpdatable = 4103
+    case optionNotResettable = 4104
+    case readOnlyOption = 4105
+    case streamEncryptionUnavailable = 4106
+    case unsupportedCriticalOption = 4107
+    case cannotModifyRootUser = 4108
     case consumerGroupIdNotFound = 5000
     case invalidConsumerGroupId = 5002
     case consumerGroupNameNotFound = 5003
@@ -273,6 +280,9 @@ public enum IggyErrorCode: UInt32, Sendable, Hashable, CaseIterable, Codable {
     case incompatibleProtocolVersion = 14003
     case sessionMismatch = 14004
     case requestIdExhausted = 14005
+    case operationUncertain = 14006
+    case laneBlocked = 14007
+    case operationNotRetained = 14008
 }
 
 extension IggyErrorCode {
@@ -350,6 +360,7 @@ extension IggyErrorCode {
         case .requestTooOld: "request_too_old"
         case .historyUnavailable: "history_unavailable"
         case .lifecycleBusy: "lifecycle_busy"
+        case .notPrimary: "not_primary"
         case .clientNotFound: "client_not_found"
         case .invalidClientId: "invalid_client_id"
         case .connectionClosed: "connection_closed"
@@ -482,6 +493,12 @@ extension IggyErrorCode {
         case .invalidOffset: "invalid_offset"
         case .invalidReservedField: "invalid_reserved_field"
         case .segmentSizeMismatchAtOpen: "segment_size_mismatch_at_open"
+        case .optionNotUpdatable: "option_not_updatable"
+        case .optionNotResettable: "option_not_resettable"
+        case .readOnlyOption: "read_only_option"
+        case .streamEncryptionUnavailable: "stream_encryption_unavailable"
+        case .unsupportedCriticalOption: "unsupported_critical_option"
+        case .cannotModifyRootUser: "cannot_modify_root_user"
         case .consumerGroupIdNotFound: "consumer_group_id_not_found"
         case .invalidConsumerGroupId: "invalid_consumer_group_id"
         case .consumerGroupNameNotFound: "consumer_group_name_not_found"
@@ -528,6 +545,9 @@ extension IggyErrorCode {
         case .incompatibleProtocolVersion: "incompatible_protocol_version"
         case .sessionMismatch: "session_mismatch"
         case .requestIdExhausted: "request_id_exhausted"
+        case .operationUncertain: "operation_uncertain"
+        case .laneBlocked: "lane_blocked"
+        case .operationNotRetained: "operation_not_retained"
         }
     }
 }

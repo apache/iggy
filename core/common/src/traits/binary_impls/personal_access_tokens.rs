@@ -18,14 +18,11 @@
 use crate::traits::binary_auth::fail_if_not_authenticated;
 use crate::wire_conversions::personal_access_tokens_from_wire;
 use crate::{
-    BinaryClient, ClientState, Credentials, DiagnosticEvent, IdentityInfo, IggyError,
-    PersonalAccessTokenClient, PersonalAccessTokenExpiry, PersonalAccessTokenInfo,
-    RawPersonalAccessToken,
+    BinaryClient, Credentials, IdentityInfo, IggyError, PersonalAccessTokenClient,
+    PersonalAccessTokenExpiry, PersonalAccessTokenInfo, RawPersonalAccessToken,
 };
-use iggy_binary_protocol::MAX_WIRE_NAME_LENGTH;
 use iggy_binary_protocol::WireName;
 use iggy_binary_protocol::codec::WireEncode;
-use iggy_binary_protocol::codes::LOGIN_REGISTER_WITH_PAT_CODE;
 use iggy_binary_protocol::codes::{
     CREATE_PERSONAL_ACCESS_TOKEN_CODE, DELETE_PERSONAL_ACCESS_TOKEN_CODE,
     GET_PERSONAL_ACCESS_TOKENS_CODE,
@@ -34,10 +31,8 @@ use iggy_binary_protocol::requests::personal_access_tokens::{
     CreatePersonalAccessTokenRequest, DeletePersonalAccessTokenRequest,
     GetPersonalAccessTokensRequest,
 };
-use iggy_binary_protocol::requests::users::LoginRegisterWithPatRequest;
 use iggy_binary_protocol::responses::personal_access_tokens::create_personal_access_token::RawPersonalAccessTokenResponse;
 use iggy_binary_protocol::responses::personal_access_tokens::get_personal_access_tokens::GetPersonalAccessTokensResponse;
-use iggy_binary_protocol::responses::users::LoginRegisterResponse;
 use secrecy::SecretString;
 
 #[async_trait::async_trait]
@@ -93,42 +88,12 @@ impl<B: BinaryClient> PersonalAccessTokenClient for B {
         &self,
         token: &str,
     ) -> Result<IdentityInfo, IggyError> {
-        super::logout_before_relogin(self).await?;
-        // The request stores a `SecretString` rather than a `WireName`, so the
-        // `WireName` bounds are enforced here to keep the u8 length prefix
-        // consistent with the realized bytes.
-        if token.is_empty() || token.len() > MAX_WIRE_NAME_LENGTH {
-            return Err(IggyError::InvalidFormat);
-        }
-        let response = self
-            .send_raw_with_response(
-                LOGIN_REGISTER_WITH_PAT_CODE,
-                LoginRegisterWithPatRequest {
-                    version_info: super::rust_sdk_version_info(self.sdk_version())?,
-                    bind_secret: self.session_bind_secret().await?,
-                    token: SecretString::from(token.to_string()),
-                    client_context: None,
-                }
-                .to_bytes(),
-            )
-            .await?;
-        let wire_resp = super::decode_response::<LoginRegisterResponse>(&response)?;
-        self.bind_vsr_session(wire_resp.session).await?;
-        tracing::debug!(
-            server_version = %wire_resp.server_version,
-            server_protocol_version = wire_resp.server_protocol_version,
-            "authenticated against iggy server"
-        );
-        self.set_state(ClientState::Authenticated).await;
-        self.remember_session_credentials(
-            Credentials::PersonalAccessToken(SecretString::from(token.to_string())),
-            wire_resp.user_id,
-        )
-        .await;
-        self.publish_event(DiagnosticEvent::SignedIn).await;
-        Ok(IdentityInfo {
-            user_id: wire_resp.user_id,
-            access_token: None,
+        crate::with_binary_deadline(crate::binary_operation_deadline(), async {
+            super::validate_token(token)?;
+            let credentials =
+                Credentials::PersonalAccessToken(SecretString::from(token.to_string()));
+            self.sign_in_with_credentials(credentials).await
         })
+        .await
     }
 }

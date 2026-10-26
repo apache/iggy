@@ -45,7 +45,7 @@ class LeaderAwarenessTest {
 
     private static ClusterNode node(
             String name, String ip, int tcpPort, ClusterNodeRole role, ClusterNodeStatus status) {
-        return new ClusterNode(name, ip, new TransportEndpoints(tcpPort, 8080, 3000, 8070), role, status);
+        return new ClusterNode(0, name, ip, new TransportEndpoints(tcpPort, 8080, 3000, 8070), role, status);
     }
 
     private static ClusterMetadata cluster(ClusterNode... nodes) {
@@ -430,36 +430,6 @@ class LeaderAwarenessTest {
             assertThat(LeaderAwareness.isSameAddress(
                             new ConnectionInfo("localhost", 8090), new ConnectionInfo("127.0.0.1", 8090)))
                     .isTrue();
-        }
-    }
-
-    @Nested
-    class RedirectionState {
-
-        @Test
-        void shouldCapConsecutiveRedirectsAtThree() {
-            var state = new LeaderAwareness.LeaderRedirectionState();
-            assertThat(state.canRedirect()).isTrue();
-
-            state.recordRedirect();
-            state.recordRedirect();
-            assertThat(state.canRedirect()).isTrue();
-
-            state.recordRedirect();
-            assertThat(state.canRedirect()).isFalse();
-        }
-
-        @Test
-        void shouldGrantFreshBudgetToEachCheck() {
-            var exhausted = new LeaderAwareness.LeaderRedirectionState();
-            exhausted.recordRedirect();
-            exhausted.recordRedirect();
-            exhausted.recordRedirect();
-            assertThat(exhausted.canRedirect()).isFalse();
-
-            var nextCheck = new LeaderAwareness.LeaderRedirectionState();
-
-            assertThat(nextCheck.canRedirect()).isTrue();
         }
     }
 }

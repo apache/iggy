@@ -28,18 +28,36 @@ export const OptionsScope = {
 
 export type OptionsScope = typeof OptionsScope[keyof typeof OptionsScope];
 
+/** Bits of the `flags` byte a `DescribeOptions` entry carries. */
+export const OptionFlag = {
+  Updatable: 1,
+  Resettable: 2,
+  Secret: 4,
+  ReadOnly: 8,
+  Critical: 16
+} as const;
+
 /**
- * One catalog entry: the key a create command accepts, the kind the server
- * encodes its default under, that default, and what the option does.
+ * One catalog entry: the key, the kind the server encodes its default under,
+ * what a client may do with it, that default, and what the option does.
  *
  * `kind` is this key's canonical kind: what the server encodes its default
- * under, and what a value set at create is stored as whatever kind it was sent
- * in, since create admission re-encodes the block from its own parse. An update
- * stores the client's bytes verbatim and is the exception.
+ * under, and what a value set at create or update is stored as whatever kind it
+ * was sent in, since admission re-encodes every block from its own parse.
  */
 export type OptionSpec = {
   key: string,
   kind: number,
+  /** An update may set the key */
+  updatable: boolean,
+  /** An update may reset the key to its default */
+  resettable: boolean,
+  /** Write-only: accepted at create, never returned */
+  secret: boolean,
+  /** Computed by the server and returned on reads, never accepted */
+  readOnly: boolean,
+  /** A node that does not understand the key must not serve the resource */
+  critical: boolean,
   defaultValue: Buffer,
   description: string
 };
@@ -61,7 +79,8 @@ const deserializeDescribeOptions = (b: Buffer): OptionSpec[] => {
     position += keyLength;
 
     const kind = b.readUInt8(position);
-    position += 1;
+    const flags = b.readUInt8(position + 1);
+    position += 2;
 
     const defaultLength = b.readUInt32LE(position);
     position += 4;
@@ -81,7 +100,17 @@ const deserializeDescribeOptions = (b: Buffer): OptionSpec[] => {
     ).toString();
     position += descriptionLength;
 
-    specs.push({ key, kind, defaultValue, description });
+    specs.push({
+      key,
+      kind,
+      updatable: (flags & OptionFlag.Updatable) !== 0,
+      resettable: (flags & OptionFlag.Resettable) !== 0,
+      secret: (flags & OptionFlag.Secret) !== 0,
+      readOnly: (flags & OptionFlag.ReadOnly) !== 0,
+      critical: (flags & OptionFlag.Critical) !== 0,
+      defaultValue,
+      description
+    });
   }
   return specs;
 };

@@ -28,6 +28,7 @@ import {
 } from "./send-messages.command.js";
 import { HeaderValue, HeaderKeyFactory } from "./header.utils.js";
 import { Partitioning, PartitionKind } from "./partitioning.utils.js";
+import { serializePartitionRoute } from '../partition/partition-route.js';
 import { COMMAND_CODE } from "../command.code.js";
 import { DeserializeError, responseError } from "../error.utils.js";
 
@@ -274,11 +275,9 @@ describe("SendMessages", () => {
   });
 });
 
-const topicBody = (partitionsCount: number): Buffer => {
-  const body = Buffer.alloc(50 + 1 + 4 + 4 + partitionsCount * 64);
-  body.writeUInt32LE(partitionsCount, 12);
-  body.writeUInt8(1, 49);
-  body.write("t", 50);
+const routeBody = (partitionsCount: number): Buffer => {
+  const body = Buffer.alloc(25);
+  body.writeUInt32LE(partitionsCount, 20);
   return body;
 };
 
@@ -294,7 +293,7 @@ const sendClient = (partitionsCount: number, refuseFirstSend = false) => {
         refuseFirstSend = false;
         throw responseError(code, 87);
       }
-      return response(code === COMMAND_CODE.GetTopic ? topicBody(partitionsCount) : Buffer.alloc(0));
+      return response(code === COMMAND_CODE.GetPartitionRoute ? routeBody(partitionsCount) : Buffer.alloc(0));
     }
   } as unknown as RawClient;
   return { client, sent };
@@ -312,12 +311,41 @@ const countOf = (sent: { code: number }[], code: number) =>
 const request = { streamId: 1, topicId: 2, messages: [{ payload: "m" }] };
 
 describe("SendMessages partition resolution", () => {
-  it("resolves Balanced sends round-robin from one topic read", async () => {
+  it("resolves Balanced sends round-robin from one route read", async () => {
     const { client, sent } = sendClient(3);
     const send = sendMessages(async () => client);
     for (let index = 0; index < 4; index += 1) await send(request);
     assert.deepEqual(sentPartitions(sent), [0, 1, 2, 0]);
-    assert.equal(countOf(sent, COMMAND_CODE.GetTopic), 1);
+    assert.equal(countOf(sent, COMMAND_CODE.GetPartitionRoute), 1);
+  });
+
+  it("waits for a route to become ready within the original send deadline", async () => {
+    const { client } = sendClient(2);
+    const sendCommand = client.sendCommand;
+    let reads = 0;
+    const deadlines: number[] = [];
+    client.sendCommand = async (code, payload, options) => {
+      deadlines.push(options!.deadline!);
+      if (code === COMMAND_CODE.GetPartitionRoute && ++reads === 1)
+        throw responseError(code, 58);
+      return sendCommand(code, payload, options);
+    };
+    await sendMessages(async () => client)(request);
+    assert.equal(reads, 2);
+    assert.equal(new Set(deadlines).size, 1);
+  });
+
+  it("uses refreshed route counts for later balanced sends", async () => {
+    const { client, sent } = sendClient(2);
+    const send = sendMessages(async () => client);
+    await send(request);
+    (client as unknown as EventEmitter).emit("partitionRoute", {
+      topic: serializePartitionRoute(1, 2, 0).subarray(0, -4).toString('hex'), count: 3
+    });
+    await send(request);
+    await send(request);
+    assert.deepEqual(sentPartitions(sent), [0, 1, 2]);
+    assert.equal(countOf(sent, COMMAND_CODE.GetPartitionRoute), 1);
   });
 
   it("hashes MessageKey sends with XXH32 seed 0 like the Rust SDK", async () => {
@@ -336,7 +364,7 @@ describe("SendMessages partition resolution", () => {
     const send = sendMessages(async () => client);
     await assert.rejects(send(request));
     await send(request);
-    assert.equal(countOf(sent, COMMAND_CODE.GetTopic), 2);
+    assert.equal(countOf(sent, COMMAND_CODE.GetPartitionRoute), 2);
   });
 
   it("reads the partition count again after the client changes topics", async () => {
@@ -345,11 +373,11 @@ describe("SendMessages partition resolution", () => {
     await send(request);
     (client as unknown as EventEmitter).emit("topicDiscoveryReset");
     await send(request);
-    assert.equal(countOf(sent, COMMAND_CODE.GetTopic), 2);
+    assert.equal(countOf(sent, COMMAND_CODE.GetPartitionRoute), 2);
     assert.deepEqual(sentPartitions(sent), [0, 1], "the round-robin position survives");
   });
 
-  it("holds the raw client across the topic read and the send", async () => {
+  it("holds the raw client across the route read and the send", async () => {
     const { client, sent } = sendClient(2);
     let held = false;
     client.hold = () => {
@@ -362,7 +390,7 @@ describe("SendMessages partition resolution", () => {
       return sendCommand(code, payload);
     };
     await sendMessages(async () => client)(request);
-    assert.equal(countOf(sent, COMMAND_CODE.GetTopic), 1);
+    assert.equal(countOf(sent, COMMAND_CODE.GetPartitionRoute), 1);
     assert.equal(held, false);
   });
 });

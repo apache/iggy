@@ -27,6 +27,12 @@ under the License.
   import { typedRoute } from '#lib/types/appRoutes.js';
   import LogoType from '#lib/components/Logo/LogoType.svelte';
   import LogoMark from '#lib/components/Logo/LogoMark.svelte';
+  import { authStore } from '#lib/auth/authStore.svelte.js';
+  import { canReadMetadataChanges } from '#lib/api/metadataChanges.js';
+
+  let showChanges = $derived(
+    canReadMetadataChanges(authStore.userId, page.data.user?.permissions?.global?.manageServers)
+  );
   let navItems = $derived([
     {
       name: 'Overview',
@@ -40,6 +46,16 @@ under the License.
       path: typedRoute('dashboard/streams'),
       active: page.url.pathname.includes(typedRoute('dashboard/streams'))
     },
+    ...(showChanges
+      ? [
+          {
+            name: 'Metadata changes',
+            icon: 'timeline' as const,
+            path: typedRoute('dashboard/changes'),
+            active: page.url.pathname.includes(typedRoute('dashboard/changes'))
+          }
+        ]
+      : []),
     {
       name: 'Settings',
       icon: 'settings',

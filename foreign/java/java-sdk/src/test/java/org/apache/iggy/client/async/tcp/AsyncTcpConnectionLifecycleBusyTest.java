@@ -29,7 +29,10 @@ import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.Message;
+import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.partition.PartitionContext;
+import org.apache.iggy.serde.CommandCode;
 import org.junit.jupiter.api.Test;
 
 import java.math.BigInteger;
@@ -45,17 +48,22 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.BIND_SESSION_CODE;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.GET_CLUSTER_METADATA_CODE;
-import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.GET_POLL_ROUTING_CODE;
+import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.GET_PARTITION_ROUTE_CODE;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.OPERATION_NON_REPLICATED;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.OPERATION_REGISTER;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.assertServerError;
+import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.bindBody;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.client;
+import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.clusterMetadata;
+import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.pollRoute;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.registerBody;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.serve;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.singleNodeMetadata;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.transientResult;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class AsyncTcpConnectionLifecycleBusyTest {
     private static final int LIFECYCLE_BUSY = IggyErrorCode.LIFECYCLE_BUSY.getCode();
@@ -63,9 +71,11 @@ class AsyncTcpConnectionLifecycleBusyTest {
     private static final int UNAUTHORIZED = IggyErrorCode.UNAUTHORIZED.getCode();
     private static final int PING_CODE = 1;
     private static final int LOGIN_CODE = 38;
-    private static final int POLL_ON_PRIMARY_CODE = 104;
+    private static final int POLL_CODE = CommandCode.Messages.POLL.getValue();
+    private static final int GET_STATS_CODE = CommandCode.System.GET_STATS.getValue();
     private static final int JOIN_GROUP_CODE = 604;
     private static final int OPERATION_JOIN_GROUP = 148;
+    private static final int OPERATION_SEND_MESSAGES = 160;
     private static final int TEST_TIMEOUT_SECONDS = 5;
     private static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(1);
     // Pauses doubling from 50 ms start attempts near 0, 50, 150, 350 and 750 ms
@@ -260,11 +270,11 @@ class AsyncTcpConnectionLifecycleBusyTest {
                 if (request.operation() == OPERATION_REGISTER) {
                     return Response.success(OPERATION_REGISTER, registerBody(1));
                 }
-                if (request.is(GET_POLL_ROUTING_CODE, OPERATION_NON_REPLICATED)) {
+                if (request.is(GET_PARTITION_ROUTE_CODE, OPERATION_NON_REPLICATED)) {
                     routings.incrementAndGet();
                     return Response.error(OPERATION_NON_REPLICATED, LIFECYCLE_BUSY);
                 }
-                if (request.is(POLL_ON_PRIMARY_CODE, OPERATION_NON_REPLICATED)) {
+                if (request.is(POLL_CODE, OPERATION_NON_REPLICATED)) {
                     primaryPolls.incrementAndGet();
                     return Response.error(OPERATION_NON_REPLICATED, LIFECYCLE_BUSY);
                 }
@@ -276,14 +286,14 @@ class AsyncTcpConnectionLifecycleBusyTest {
                 // Context discovery may replay transient denials, never a lifecycle refusal.
                 assertServerError(
                         connection.send(
-                                GET_POLL_ROUTING_CODE,
+                                GET_PARTITION_ROUTE_CODE,
                                 Unpooled.EMPTY_BUFFER,
                                 0,
-                                new TransientFailoverState(PartitionContext.EMPTY, true)),
+                                new TransientFailoverState(PartitionContext.EMPTY)),
                         LIFECYCLE_BUSY);
                 assertServerError(
-                        connection.send(
-                                POLL_ON_PRIMARY_CODE, Unpooled.EMPTY_BUFFER, 0, new TransientFailoverState(CONTEXT)),
+                        connection.sendRouted(
+                                POLL_CODE, Unpooled.EMPTY_BUFFER, 0, 0, new TransientFailoverState(CONTEXT)),
                         LIFECYCLE_BUSY);
             } finally {
                 connection.close().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
@@ -295,7 +305,7 @@ class AsyncTcpConnectionLifecycleBusyTest {
     }
 
     @Test
-    void shouldReplayNotCommittedUnderItsIdAndKeepTheUncertainOutcomeAcrossALifecycleRetry() throws Exception {
+    void shouldStopUncertaintyAtTheProvedCommittedRejection() throws Exception {
         try (ServerSocket socket = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
             List<Long> requestIds = new CopyOnWriteArrayList<>();
             CompletableFuture<Void> server = serve(socket, request -> {
@@ -315,16 +325,12 @@ class AsyncTcpConnectionLifecycleBusyTest {
             AsyncTcpConnection connection = connection(socket, REQUEST_TIMEOUT);
             try {
                 login(connection);
-                // A later refusal cannot prove the first attempt was not committed.
-                assertServerError(
-                        connection.send(JOIN_GROUP_CODE, Unpooled.wrappedBuffer(JOIN_BODY)), TRANSIENT_NOT_COMMITTED);
+                assertServerError(connection.send(JOIN_GROUP_CODE, Unpooled.wrappedBuffer(JOIN_BODY)), LIFECYCLE_BUSY);
             } finally {
                 connection.close().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
             }
             server.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-            assertThat(requestIds).hasSize(3);
-            assertThat(requestIds.get(1)).isEqualTo(requestIds.get(0));
-            assertThat(requestIds.get(2)).isNotEqualTo(requestIds.get(0));
+            assertThat(requestIds).hasSize(2).containsOnly(requestIds.get(0));
         }
     }
 
@@ -388,6 +394,200 @@ class AsyncTcpConnectionLifecycleBusyTest {
         }
     }
 
+    @Test
+    void shouldCompleteATransientRetryWhenItsEventLoopStops() throws Exception {
+        try (ServerSocket socket = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
+            CompletableFuture<Void> refused = new CompletableFuture<>();
+            CompletableFuture<Void> server = serve(socket, request -> {
+                if (request.operation() == OPERATION_REGISTER) {
+                    return Response.success(OPERATION_REGISTER, registerBody(1));
+                }
+                if (request.operation() == OPERATION_JOIN_GROUP) {
+                    refused.complete(null);
+                    return Response.error(OPERATION_JOIN_GROUP, AsyncTcpConnection.TRANSIENT_NOT_COMMITTED);
+                }
+                throw new IllegalStateException("Unexpected request: " + request);
+            });
+            AsyncTcpConnection connection = connection(socket, REQUEST_TIMEOUT);
+            CompletableFuture<ByteBuf> pending;
+            try {
+                login(connection);
+                pending = connection.send(JOIN_GROUP_CODE, Unpooled.wrappedBuffer(JOIN_BODY));
+                refused.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                // Let the refusal schedule its delayed replay before shutdown cancels it.
+                Thread.sleep(10);
+            } finally {
+                connection.close().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            }
+            assertServerError(pending, org.apache.iggy.exception.IggyErrorCode.OPERATION_UNCERTAIN.getCode());
+            server.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void shouldReleaseTheLaneWhenMetadataFailoverFailsBeforeAnotherSend() throws Exception {
+        try (ServerSocket socket = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
+            AtomicInteger attempts = new AtomicInteger();
+            var server = serve(socket, request -> {
+                if (request.operation() == OPERATION_REGISTER) {
+                    return Response.success(OPERATION_REGISTER, registerBody(1));
+                }
+                if (request.operation() == OPERATION_JOIN_GROUP) {
+                    return attempts.incrementAndGet() == 1
+                            ? Response.error(OPERATION_JOIN_GROUP, AsyncTcpConnection.NOT_PRIMARY)
+                            : joined();
+                }
+                throw new IllegalStateException("Unexpected request: " + request);
+            });
+            var failure = new IllegalStateException("replacement metadata link unavailable");
+            var connection = connection(
+                    socket,
+                    REQUEST_TIMEOUT,
+                    (source, deadline, rejection, state) -> CompletableFuture.failedFuture(failure));
+            try {
+                login(connection);
+                assertThatThrownBy(() -> connection
+                                .send(JOIN_GROUP_CODE, Unpooled.wrappedBuffer(JOIN_BODY))
+                                .get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+                        .hasCause(failure);
+                connection
+                        .send(JOIN_GROUP_CODE, Unpooled.wrappedBuffer(JOIN_BODY))
+                        .get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                        .release();
+                assertThat(attempts).hasValue(2);
+            } finally {
+                connection.close().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            }
+            server.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void shouldRetryAnOrdinaryReadAfterLifecycleBusyWithANewCorrelationId() throws Exception {
+        try (ServerSocket socket = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
+            List<Request> reads = new CopyOnWriteArrayList<>();
+            var server = serve(socket, request -> {
+                if (request.operation() == OPERATION_REGISTER) {
+                    return Response.success(OPERATION_REGISTER, registerBody(1));
+                }
+                if (request.is(PING_CODE, OPERATION_NON_REPLICATED)) {
+                    reads.add(request);
+                    return reads.size() == 1
+                            ? Response.error(OPERATION_NON_REPLICATED, LIFECYCLE_BUSY)
+                            : Response.success(OPERATION_NON_REPLICATED, Unpooled.EMPTY_BUFFER);
+                }
+                throw new IllegalStateException("Unexpected request: " + request);
+            });
+            var connection = connection(socket, REQUEST_TIMEOUT);
+            try {
+                login(connection);
+                connection
+                        .send(PING_CODE, Unpooled.EMPTY_BUFFER)
+                        .get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                        .release();
+                assertThat(reads).hasSize(2);
+                assertThat(reads.get(1).requestId()).isNotEqualTo(reads.get(0).requestId());
+            } finally {
+                connection.close().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            }
+            server.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        }
+    }
+
+    /**
+     * The partition primary refuses a send with 88, and the client loses its session before the retry: the metadata
+     * primary dropped the link after it routed the send and refuses the bind on the next link, so the client
+     * registers a new session. The refusal proved that nothing applied the send, so it goes out again under that
+     * session with a new request id and does not end uncertain.
+     */
+    @Test
+    @SuppressWarnings({"checkstyle:CyclomaticComplexity", "checkstyle:NPathComplexity"})
+    void shouldSendALifecycleRefusalAgainUnderTheNextSessionWhenTheSessionIsLostDuringThePause() throws Exception {
+        InetAddress loopback = InetAddress.getLoopbackAddress();
+        // The link that routes the send and the link that finds the session lost.
+        int leaderLinks = 2;
+        try (ServerSocket leader = new ServerSocket(0, leaderLinks, loopback);
+                ServerSocket primary = new ServerSocket(0, 1, loopback)) {
+            List<Request> registers = new CopyOnWriteArrayList<>();
+            AtomicInteger lookups = new AtomicInteger();
+            var leaderServed = serve(leader, leaderLinks, request -> {
+                if (request.operation() == OPERATION_REGISTER) {
+                    registers.add(request);
+                    return Response.success(OPERATION_REGISTER, registerBody(registers.size()));
+                }
+                if (request.is(BIND_SESSION_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.error(OPERATION_NON_REPLICATED, IggyErrorCode.UNAUTHENTICATED.getCode());
+                }
+                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(
+                            OPERATION_NON_REPLICATED,
+                            clusterMetadata(leader.getLocalPort(), primary.getLocalPort(), leader.getLocalPort()));
+                }
+                if (request.is(GET_STATS_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(OPERATION_NON_REPLICATED, Unpooled.EMPTY_BUFFER);
+                }
+                if (!request.is(GET_PARTITION_ROUTE_CODE, OPERATION_NON_REPLICATED)) {
+                    throw new IllegalStateException("Unexpected leader request: " + request);
+                }
+                ByteBuf route = pollRoute(request, 1, 1, primary.getLocalPort());
+                return lookups.incrementAndGet() == 1
+                        ? Response.successAndDisconnect(OPERATION_NON_REPLICATED, route)
+                        : Response.success(OPERATION_NON_REPLICATED, route);
+            });
+            List<Request> sends = new CopyOnWriteArrayList<>();
+            CompletableFuture<Void> firstSend = new CompletableFuture<>();
+            CompletableFuture<Void> refuse = new CompletableFuture<>();
+            var primaryServed = serve(primary, request -> {
+                if (request.is(BIND_SESSION_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(OPERATION_NON_REPLICATED, bindBody(request));
+                }
+                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(
+                            OPERATION_NON_REPLICATED,
+                            clusterMetadata(leader.getLocalPort(), primary.getLocalPort(), leader.getLocalPort()));
+                }
+                if (request.operation() != OPERATION_SEND_MESSAGES) {
+                    throw new IllegalStateException("Unexpected primary request: " + request);
+                }
+                sends.add(request);
+                if (sends.size() > 1) {
+                    return Response.success(OPERATION_SEND_MESSAGES, Unpooled.EMPTY_BUFFER);
+                }
+                firstSend.complete(null);
+                refuse.join();
+                return Response.error(OPERATION_SEND_MESSAGES, LIFECYCLE_BUSY);
+            });
+            AsyncIggyTcpClient client = client(leader);
+            try {
+                client.connect().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                client.login().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+
+                var sent = client.messages()
+                        .sendMessages(
+                                StreamId.of(1L),
+                                TopicId.of(1L),
+                                Partitioning.partitionId(0L),
+                                List.of(Message.of("m")));
+                firstSend.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                client.sendBinaryRequest(GET_STATS_CODE, new byte[0]).get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                refuse.complete(null);
+                sent.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+
+                assertThat(registers).hasSize(2);
+                assertThat(sends).hasSize(2);
+                Request retried = sends.get(1);
+                assertThat(retried.requestId()).isNotEqualTo(sends.get(0).requestId());
+                assertThat(retried.clientLow()).isEqualTo(registers.get(1).clientLow());
+                assertThat(retried.clientHigh()).isEqualTo(registers.get(1).clientHigh());
+            } finally {
+                refuse.complete(null);
+                client.close().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            }
+            leaderServed.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            primaryServed.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        }
+    }
+
     /** The server commits a lifecycle refusal in the result section, as the metadata plane does. */
     private static Response lifecycleBusy() {
         return Response.success(OPERATION_JOIN_GROUP, transientResult(LIFECYCLE_BUSY));
@@ -399,6 +599,11 @@ class AsyncTcpConnectionLifecycleBusyTest {
     }
 
     private static AsyncTcpConnection connection(ServerSocket socket, Duration requestTimeout) {
+        return connection(socket, requestTimeout, null);
+    }
+
+    private static AsyncTcpConnection connection(
+            ServerSocket socket, Duration requestTimeout, TransientFailoverHandler failover) {
         return new AsyncTcpConnection(
                 socket.getInetAddress().getHostAddress(),
                 socket.getLocalPort(),
@@ -411,9 +616,9 @@ class AsyncTcpConnectionLifecycleBusyTest {
                 Optional.of(requestTimeout),
                 Duration.ofHours(1),
                 1024 * 1024,
-                null,
+                failover,
                 errorCode -> {},
-                ignored -> {});
+                (source, cause) -> {});
     }
 
     private static void login(AsyncTcpConnection connection) throws Exception {

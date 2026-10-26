@@ -1,0 +1,1619 @@
+{
+  "schema_version": 1,
+  "generated_by": "core/common/examples/resource_options_fixtures.rs",
+  "conventions": {
+    "byte_strings": "Every *_hex field is lowercase hex without separators.",
+    "errors": "name is the snake_case IggyError name and code its numeric code.",
+    "max_topic_size": "Bytes. 18446744073709551615 means unlimited.",
+    "message_expiry": "Microseconds. 18446744073709551615 means never expire.",
+    "never_returned_keys": "No response, decoded projection or accessor may contain these keys or their values.",
+    "option_maps": "Option maps use the HTTP JSON form: value as reversible text, kind, and explicit provenance. Request blocks mark every entry explicit.",
+    "options_block_order": "Options block entries are encoded in ascending key byte order.",
+    "request_bodies": "body_hex and update_resource_hex are command payloads without framing. constants.command_codes maps each command to its code and VSR operation.",
+    "reset_order": "The typed encoders and the HTTP handler write reset keys in ascending key byte order.",
+    "stream_state": "state is the stored server state a stream response was projected from. SDKs need only response_hex and expected.",
+    "u64_values": "u64 option values and typed u64 inputs are decimal strings, so values above 2^53 keep their precision."
+  },
+  "constants": {
+    "protocol_version": {
+      "packed": 12288,
+      "text": "0.12.0",
+      "major": 0,
+      "minor": 12,
+      "patch": 0
+    },
+    "protocol_version_min": {
+      "packed": 12288,
+      "text": "0.12.0",
+      "major": 0,
+      "minor": 12,
+      "patch": 0
+    },
+    "command_codes": {
+      "create_stream": {
+        "code": 202,
+        "operation": 128
+      },
+      "create_topic": {
+        "code": 302,
+        "operation": 132
+      },
+      "create_user": {
+        "code": 33,
+        "operation": 141
+      },
+      "describe_options": {
+        "code": 13,
+        "operation": null
+      },
+      "get_stream": {
+        "code": 200,
+        "operation": null
+      },
+      "get_streams": {
+        "code": 201,
+        "operation": null
+      },
+      "get_topic": {
+        "code": 300,
+        "operation": null
+      },
+      "get_topics": {
+        "code": 301,
+        "operation": null
+      },
+      "get_user": {
+        "code": 31,
+        "operation": null
+      },
+      "get_users": {
+        "code": 32,
+        "operation": null
+      },
+      "update_resource": {
+        "code": 16,
+        "operation": 150
+      }
+    },
+    "error_codes": {
+      "cannot_modify_root_user": 4108
+    },
+    "retired_command_codes": {
+      "update_stream": 204,
+      "update_topic": 304,
+      "update_user": 35
+    },
+    "operations": {
+      "rewrap_stream_keys": {
+        "value": 75,
+        "internal": true,
+        "request_operation": 75
+      },
+      "update_resource": {
+        "value": 150,
+        "internal": false,
+        "request_operation": 150
+      },
+      "update_stream_resolved": {
+        "value": 72,
+        "internal": true,
+        "request_operation": 150
+      },
+      "update_topic_resolved": {
+        "value": 73,
+        "internal": true,
+        "request_operation": 150
+      },
+      "update_user_resolved": {
+        "value": 74,
+        "internal": true,
+        "request_operation": 150
+      }
+    },
+    "retired_operations": {
+      "update_stream": 129,
+      "update_topic": 133,
+      "update_user": 142
+    },
+    "scope_codes": {
+      "stream": 2,
+      "topic": 1,
+      "user": 3
+    },
+    "header_kind_codes": {
+      "raw": 1,
+      "string": 2,
+      "bool": 3,
+      "uint32": 11,
+      "uint64": 12
+    },
+    "option_flags": {
+      "critical": 16,
+      "read_only": 8,
+      "resettable": 2,
+      "secret": 4,
+      "updatable": 1
+    },
+    "user_status_codes": {
+      "active": 1,
+      "inactive": 2
+    },
+    "stream_key_length": 32,
+    "never_returned_keys": [
+      "encryption_key",
+      "encryption_key_wrapped",
+      "critical_keys"
+    ]
+  },
+  "catalog": [
+    {
+      "key": "name",
+      "scopes": [
+        "stream",
+        "topic"
+      ],
+      "kind": "string",
+      "kind_code": 2,
+      "storage": "column",
+      "mutability": "updatable",
+      "visibility": "public",
+      "critical": false,
+      "flags": 1,
+      "described": true,
+      "default": null
+    },
+    {
+      "key": "username",
+      "scopes": [
+        "user"
+      ],
+      "kind": "string",
+      "kind_code": 2,
+      "storage": "column",
+      "mutability": "updatable",
+      "visibility": "public",
+      "critical": false,
+      "flags": 1,
+      "described": true,
+      "default": null
+    },
+    {
+      "key": "status",
+      "scopes": [
+        "user"
+      ],
+      "kind": "string",
+      "kind_code": 2,
+      "storage": "column",
+      "mutability": "updatable",
+      "visibility": "public",
+      "critical": false,
+      "flags": 1,
+      "described": true,
+      "default": null
+    },
+    {
+      "key": "compression_algorithm",
+      "scopes": [
+        "topic"
+      ],
+      "kind": "string",
+      "kind_code": 2,
+      "storage": "map",
+      "mutability": "create_only",
+      "visibility": "public",
+      "critical": false,
+      "flags": 0,
+      "described": true,
+      "default": "none"
+    },
+    {
+      "key": "message_expiry",
+      "scopes": [
+        "topic"
+      ],
+      "kind": "uint64",
+      "kind_code": 12,
+      "storage": "map",
+      "mutability": "updatable",
+      "visibility": "public",
+      "critical": false,
+      "flags": 3,
+      "described": true,
+      "default": "18446744073709551615"
+    },
+    {
+      "key": "max_topic_size",
+      "scopes": [
+        "topic"
+      ],
+      "kind": "uint64",
+      "kind_code": 12,
+      "storage": "map",
+      "mutability": "updatable",
+      "visibility": "public",
+      "critical": false,
+      "flags": 3,
+      "described": true,
+      "default": "18446744073709551615"
+    },
+    {
+      "key": "segment_size",
+      "scopes": [
+        "topic"
+      ],
+      "kind": "uint64",
+      "kind_code": 12,
+      "storage": "map",
+      "mutability": "create_only",
+      "visibility": "public",
+      "critical": false,
+      "flags": 0,
+      "described": true,
+      "default": "1073741824"
+    },
+    {
+      "key": "durability",
+      "scopes": [
+        "topic"
+      ],
+      "kind": "string",
+      "kind_code": 2,
+      "storage": "map",
+      "mutability": "create_only",
+      "visibility": "public",
+      "critical": false,
+      "flags": 0,
+      "described": true,
+      "default": "replicated"
+    },
+    {
+      "key": "consumer_offset_durability",
+      "scopes": [
+        "topic"
+      ],
+      "kind": "string",
+      "kind_code": 2,
+      "storage": "map",
+      "mutability": "create_only",
+      "visibility": "public",
+      "critical": false,
+      "flags": 0,
+      "described": true,
+      "default": "replicated"
+    },
+    {
+      "key": "partition_resize_policy",
+      "scopes": [
+        "topic"
+      ],
+      "kind": "string",
+      "kind_code": 2,
+      "storage": "map",
+      "mutability": "create_only",
+      "visibility": "public",
+      "critical": false,
+      "flags": 0,
+      "described": true,
+      "default": "mutable"
+    },
+    {
+      "key": "messages_required_to_save",
+      "scopes": [
+        "topic"
+      ],
+      "kind": "uint32",
+      "kind_code": 11,
+      "storage": "map",
+      "mutability": "create_only",
+      "visibility": "public",
+      "critical": false,
+      "flags": 0,
+      "described": true,
+      "default": "1024"
+    },
+    {
+      "key": "size_of_messages_required_to_save",
+      "scopes": [
+        "topic"
+      ],
+      "kind": "uint64",
+      "kind_code": 12,
+      "storage": "map",
+      "mutability": "create_only",
+      "visibility": "public",
+      "critical": false,
+      "flags": 0,
+      "described": true,
+      "default": "1048576"
+    },
+    {
+      "key": "preallocate_segments",
+      "scopes": [
+        "topic"
+      ],
+      "kind": "bool",
+      "kind_code": 3,
+      "storage": "map",
+      "mutability": "create_only",
+      "visibility": "public",
+      "critical": false,
+      "flags": 0,
+      "described": true,
+      "default": "false"
+    },
+    {
+      "key": "encryption_key",
+      "scopes": [
+        "stream"
+      ],
+      "kind": "raw",
+      "kind_code": 1,
+      "storage": "map",
+      "mutability": "create_only",
+      "visibility": "secret",
+      "critical": true,
+      "flags": 20,
+      "described": true,
+      "default": null
+    },
+    {
+      "key": "encryption_key_wrapped",
+      "scopes": [
+        "stream"
+      ],
+      "kind": "raw",
+      "kind_code": 1,
+      "storage": "map",
+      "mutability": "create_only",
+      "visibility": "internal",
+      "critical": true,
+      "flags": 16,
+      "described": false,
+      "default": null
+    },
+    {
+      "key": "encryption_key_source",
+      "scopes": [
+        "stream"
+      ],
+      "kind": "string",
+      "kind_code": 2,
+      "storage": "computed",
+      "mutability": "read_only",
+      "visibility": "read_only",
+      "critical": false,
+      "flags": 8,
+      "described": true,
+      "default": null
+    },
+    {
+      "key": "encryption_key_fingerprint",
+      "scopes": [
+        "stream"
+      ],
+      "kind": "string",
+      "kind_code": 2,
+      "storage": "computed",
+      "mutability": "read_only",
+      "visibility": "read_only",
+      "critical": false,
+      "flags": 8,
+      "described": true,
+      "default": null
+    },
+    {
+      "key": "encryption_kek_fingerprint",
+      "scopes": [
+        "stream"
+      ],
+      "kind": "string",
+      "kind_code": 2,
+      "storage": "computed",
+      "mutability": "read_only",
+      "visibility": "read_only",
+      "critical": false,
+      "flags": 8,
+      "described": true,
+      "default": null
+    },
+    {
+      "key": "critical_keys",
+      "scopes": [
+        "stream",
+        "topic",
+        "user"
+      ],
+      "kind": "string",
+      "kind_code": 2,
+      "storage": "map",
+      "mutability": "create_only",
+      "visibility": "internal",
+      "critical": false,
+      "flags": 0,
+      "described": false,
+      "default": null
+    }
+  ],
+  "describe_options": [
+    {
+      "scope": "topic",
+      "request_hex": "01",
+      "response_hex": "0b000000046e616d650201000000007e0000005265736f75726365206e616d652c203120746f203235352062797465732c20756e697175652077697468696e2069747320706172656e742e20536574206279207468652063726561746520636f6d6d616e642773206e616d65206669656c6420616e64206368616e676564207468726f75676820616e207570646174652e15636f6d7072657373696f6e5f616c676f726974686d0200040000006e6f6e6550000000436f6d7072657373696f6e20616c676f726974686d20286e6f6e652c20677a6970292e2053746f72656420616e64207265706f727465642c206e6f74206170706c69656420746f206d657373616765730e6d6573736167655f6578706972790c0308000000ffffffffffffffff430000004d6573736167652065787069727920696e206d6963726f7365636f6e64732c206f7220612068756d616e74696d6520737472696e672028652e672e20372064617973290e6d61785f746f7069635f73697a650c0308000000ffffffffffffffff9d000000546f7069632d77696465207365616c65642d7365676d656e742073697a65206361702c2073706c6974206163726f737320616c6c20706172746974696f6e732c20696e206279746573206f72206120627974652d73697a6520737472696e672028652e672e203120476942293b2066696e6974652076616c756573206d757374206265206174206c6561737420746865207365676d656e742073697a650c7365676d656e745f73697a650c000800000000000040000000006c0000005365676d656e742073697a6520696e2062797465732c206f72206120627974652d73697a6520737472696e672028652e672e20313238204d6942293b2061203531322d62797465206d756c7469706c652077697468696e20313034383537362e2e3d313037333734313832340a6475726162696c69747902000a0000007265706c6963617465643e0100004d65737361676520636f6d706c6574696f6e3a207265706c696361746564206f72207065727369737465642e20496e646570656e64656e746c792064656661756c747320746f207265706c6963617465642e20412073696e676c65746f6e2071756f72756d20686173206f6e6520636f70792e20496e207265706c6963617465642067726f7570732c20706572736973746564206d65737361676573207573652057414c207265666572656e63657320746f207365676d656e7420626f646965732c2072657461696e696e6720746865697220696e6f6465732062792068617264206c696e6b20756e74696c2057414c207265636c616d6174696f6e2e205468652066756c6c20626f64792073697a65207374696c6c20636f756e747320616761696e737420706172746974696f6e2e77616c5f62797465735f6d61782e1a636f6e73756d65725f6f66667365745f6475726162696c69747902000a0000007265706c6963617465646e0100004578706c69636974206f666673657420636f6d706c6574696f6e3a207265706c696361746564206f72207065727369737465642e20496e646570656e64656e746c792064656661756c747320746f207265706c6963617465642e20506f6c6c206175746f2d636f6d6d69742072656d61696e73206173796e6368726f6e6f75732e20496e207265706c6963617465642067726f7570732c20706572736973746564206f66667365747320616c736f20656e61626c652057414c207265666572656e63657320746f207365676d656e7420626f646965732c2072657461696e696e6720746865697220696e6f6465732062792068617264206c696e6b20756e74696c207265636c616d6174696f6e2c206576656e2077697468207265706c696361746564206d657373616765206475726162696c6974792e2046756c6c20626f64792073697a657320636f756e7420616761696e737420706172746974696f6e2e77616c5f62797465735f6d61782e17706172746974696f6e5f726573697a655f706f6c6963790200070000006d757461626c65c8000000496d6d757461626c65206166746572206372656174696f6e3a206d757461626c65207065726d69747320706172746974696f6e206164646974696f6e2f64656c6574696f6e20776974686f7574206120626f756e646564206375746f766572206f72207065722d6b6579206f72646572696e67206163726f7373206c61796f7574733b2066697865642072656a6563747320626f74682e20526574656e74696f6e20616e6420746f7069632064656c6574696f6e2072656d61696e2064657374727563746976652e196d657373616765735f72657175697265645f746f5f736176650b000400000000040000870000004f7264696e617279206d6573736167652d636f756e7420666c75736820747269676765723b20312e2e3d31363737373231362e2052657175697265642070657273697374656e63652c2063617061636974792070726573737572652c20616e64206c6966656379636c65206f7065726174696f6e732063616e20666c757368206561726c6965722173697a655f6f665f6d657373616765735f72657175697265645f746f5f736176650c0008000000000010000000000083000000466c75736820746865206a6f75726e616c206f6e636520697420686f6c64732074686973206d616e792062797465732c206f72206120627974652d73697a6520737472696e673b20776869636865766572207468726573686f6c6420747269707320666972737420666c75736865732e204174206d6f7374203130373337343138323414707265616c6c6f636174655f7365676d656e7473030001000000001201000052657175657374207365676d656e745f73697a65206279746573206f66206469736b207265736572766174696f6e207768656e2065616368207365676d656e74206f70656e732e20556e737570706f72746564206f72206661696c6564207265736572766174696f6e732066616c6c206261636b20746f206f7264696e61727920616c6c6f636174696f6e20776974682061207761726e696e672e205265736572766174696f6e2072756e7320696e6c696e65206f6e20746865206f776e696e672073686172642e207365676d656e745f73697a65202a20706172746974696f6e735f636f756e74206973206361707065642061742036383731393437363733362062797465732070657220637265617465",
+      "entries": [
+        {
+          "key": "name",
+          "kind": "string",
+          "flags": 1,
+          "default": null
+        },
+        {
+          "key": "compression_algorithm",
+          "kind": "string",
+          "flags": 0,
+          "default": "none"
+        },
+        {
+          "key": "message_expiry",
+          "kind": "uint64",
+          "flags": 3,
+          "default": "18446744073709551615"
+        },
+        {
+          "key": "max_topic_size",
+          "kind": "uint64",
+          "flags": 3,
+          "default": "18446744073709551615"
+        },
+        {
+          "key": "segment_size",
+          "kind": "uint64",
+          "flags": 0,
+          "default": "1073741824"
+        },
+        {
+          "key": "durability",
+          "kind": "string",
+          "flags": 0,
+          "default": "replicated"
+        },
+        {
+          "key": "consumer_offset_durability",
+          "kind": "string",
+          "flags": 0,
+          "default": "replicated"
+        },
+        {
+          "key": "partition_resize_policy",
+          "kind": "string",
+          "flags": 0,
+          "default": "mutable"
+        },
+        {
+          "key": "messages_required_to_save",
+          "kind": "uint32",
+          "flags": 0,
+          "default": "1024"
+        },
+        {
+          "key": "size_of_messages_required_to_save",
+          "kind": "uint64",
+          "flags": 0,
+          "default": "1048576"
+        },
+        {
+          "key": "preallocate_segments",
+          "kind": "bool",
+          "flags": 0,
+          "default": "false"
+        }
+      ]
+    },
+    {
+      "scope": "stream",
+      "request_hex": "02",
+      "response_hex": "05000000046e616d650201000000007e0000005265736f75726365206e616d652c203120746f203235352062797465732c20756e697175652077697468696e2069747320706172656e742e20536574206279207468652063726561746520636f6d6d616e642773206e616d65206669656c6420616e64206368616e676564207468726f75676820616e207570646174652e0e656e6372797074696f6e5f6b6579011400000000a30100005468652073747265616d2773206f776e206461746120656e6372797074696f6e206b65793a2033322072616e646f6d2062797465732c20726177206f72207374616e6461726420706164646564206261736536342e204372656174652d6f6e6c7920616e642077726974652d6f6e6c793a20746865207365727665722073746f726573206974207772617070656420756e6465722061206b657920646572697665642066726f6d207468652073657276657220656e6372797074696f6e206b657920616e64206e657665722072657475726e732069742e205265717569726573207468652073657276657220656e6372797074696f6e206b657920746f20626520636f6e666967757265642e20576974686f75742069742c206120736572766572207769746820656e6372797074696f6e20656e61626c65642067656e6572617465732061206b657920666f72207468652073747265616d2e20546865206b65792074726176656c7320696e20746865206372656174652072657175657374206f76657220746865207472616e73706f72742074686520636c69656e7420757365732e15656e6372797074696f6e5f6b65795f736f757263650208000000009f00000057686f2063686f7365207468652073747265616d27732061742d72657374206b65793a2073747265616d207768656e2074686520636c69656e742073656e742069742c20736572766572207768656e20746865207365727665722067656e6572617465642069742c206e6f6e65207768656e207468652073747265616d2773206d65737361676573206172652073746f72656420756e656e637279707465641a656e6372797074696f6e5f6b65795f66696e6765727072696e740208000000009f0000005468652066697273742038206279746573206f66205348412d323536206f76657220746865206c6162656c20696767792f73747265616d2d6b65792d66696e6765727072696e742f763120616e64207468652073747265616d2773206b65792c206173203136206c6f776572636173652068657820636861726163746572732e20416273656e74207768656e2074686520736f75726365206973206e6f6e651a656e6372797074696f6e5f6b656b5f66696e6765727072696e74020800000000b800000046696e6765727072696e7473206f6620746865206b65792d656e6372797074696f6e206b65797320746861742077726170207468652073747265616d2773206b65792c20636f6d6d612d7365706172617465643a206f6e65206f7574736964652061206b657920726f746174696f6e2c206f6e652070657220636f6e6669677572656420736572766572206b657920647572696e672069742e20416273656e74207768656e2074686520736f75726365206973206e6f6e65",
+      "entries": [
+        {
+          "key": "name",
+          "kind": "string",
+          "flags": 1,
+          "default": null
+        },
+        {
+          "key": "encryption_key",
+          "kind": "raw",
+          "flags": 20,
+          "default": null
+        },
+        {
+          "key": "encryption_key_source",
+          "kind": "string",
+          "flags": 8,
+          "default": null
+        },
+        {
+          "key": "encryption_key_fingerprint",
+          "kind": "string",
+          "flags": 8,
+          "default": null
+        },
+        {
+          "key": "encryption_kek_fingerprint",
+          "kind": "string",
+          "flags": 8,
+          "default": null
+        }
+      ]
+    },
+    {
+      "scope": "user",
+      "request_hex": "03",
+      "response_hex": "0200000008757365726e616d650201000000006b00000055736572206e616d652c203320746f2035302062797465732c20756e697175652e20536574206279207468652063726561746520636f6d6d616e64277320757365726e616d65206669656c6420616e64206368616e676564207468726f75676820616e207570646174652e067374617475730201000000008f00000055736572207374617475732c20616374697665206f7220696e6163746976652e20536574206279207468652063726561746520636f6d6d616e64277320737461747573206669656c6420616e64206368616e676564207468726f75676820616e207570646174652e20446561637469766174696e672061207573657220656e6473206974732073657373696f6e732e",
+      "entries": [
+        {
+          "key": "username",
+          "kind": "string",
+          "flags": 1,
+          "default": null
+        },
+        {
+          "key": "status",
+          "kind": "string",
+          "flags": 1,
+          "default": null
+        }
+      ]
+    }
+  ],
+  "stream_key": {
+    "key_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "key_base64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+    "fingerprint_label": "iggy/stream-key-fingerprint/v1",
+    "fingerprint": "8441e38538cbfa57",
+    "invalid_keys": [
+      {
+        "case": "raw_31_bytes",
+        "input": {
+          "raw_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e"
+        },
+        "error": {
+          "name": "invalid_encryption_key",
+          "code": 70
+        }
+      },
+      {
+        "case": "raw_33_bytes",
+        "input": {
+          "raw_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
+        },
+        "error": {
+          "name": "invalid_encryption_key",
+          "code": 70
+        }
+      },
+      {
+        "case": "base64_with_whitespace",
+        "input": {
+          "base64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=\n"
+        },
+        "error": {
+          "name": "invalid_encryption_key",
+          "code": 70
+        }
+      },
+      {
+        "case": "base64_missing_padding",
+        "input": {
+          "base64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+        },
+        "error": {
+          "name": "invalid_encryption_key",
+          "code": 70
+        }
+      },
+      {
+        "case": "base64_noncanonical_trailing_bits",
+        "input": {
+          "base64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh9="
+        },
+        "error": {
+          "name": "invalid_encryption_key",
+          "code": 70
+        }
+      }
+    ]
+  },
+  "update_resource": [
+    {
+      "case": "topic_set_expiry_without_name_reset_max_topic_size",
+      "scope": "topic",
+      "target": {
+        "stream_id": 1,
+        "topic_id": 2
+      },
+      "input": {
+        "message_expiry": "604800000000",
+        "reset": [
+          "max_topic_size"
+        ]
+      },
+      "wire_set": {
+        "message_expiry": {
+          "value": "604800000000",
+          "kind": "uint64",
+          "explicit": true
+        }
+      },
+      "wire_reset": [
+        "max_topic_size"
+      ],
+      "body_hex": "01010401000000010402000000010e6d61785f746f7069635f73697a65020e0000006d6573736167655f6578706972790c0800000000a0e3d08c000000"
+    },
+    {
+      "case": "topic_rename_only_named_identifiers",
+      "scope": "topic",
+      "target": {
+        "stream_id": "orders",
+        "topic_id": "events"
+      },
+      "input": {
+        "name": "events-v2"
+      },
+      "wire_set": {
+        "name": {
+          "value": "events-v2",
+          "kind": "string",
+          "explicit": true
+        }
+      },
+      "wire_reset": [],
+      "body_hex": "0102066f726465727302066576656e74730002040000006e616d6502090000006576656e74732d7632"
+    },
+    {
+      "case": "topic_rename_set_expiry_reset_max_topic_size",
+      "scope": "topic",
+      "target": {
+        "stream_id": 7,
+        "topic_id": "events"
+      },
+      "input": {
+        "name": "events-v3",
+        "message_expiry": "86400000000",
+        "reset": [
+          "max_topic_size"
+        ]
+      },
+      "wire_set": {
+        "message_expiry": {
+          "value": "86400000000",
+          "kind": "uint64",
+          "explicit": true
+        },
+        "name": {
+          "value": "events-v3",
+          "kind": "string",
+          "explicit": true
+        }
+      },
+      "wire_reset": [
+        "max_topic_size"
+      ],
+      "body_hex": "0101040700000002066576656e7473010e6d61785f746f7069635f73697a65020e0000006d6573736167655f6578706972790c080000000060d71d1400000002040000006e616d6502090000006576656e74732d7633"
+    },
+    {
+      "case": "topic_reset_both_defaults",
+      "scope": "topic",
+      "target": {
+        "stream_id": 1,
+        "topic_id": 2
+      },
+      "input": {
+        "reset": [
+          "max_topic_size",
+          "message_expiry"
+        ]
+      },
+      "wire_set": {},
+      "wire_reset": [
+        "max_topic_size",
+        "message_expiry"
+      ],
+      "body_hex": "01010401000000010402000000020e6d61785f746f7069635f73697a650e6d6573736167655f657870697279"
+    },
+    {
+      "case": "topic_max_topic_size_above_2_pow_53",
+      "scope": "topic",
+      "target": {
+        "stream_id": 1,
+        "topic_id": 2
+      },
+      "input": {
+        "max_topic_size": "9007199254740993"
+      },
+      "wire_set": {
+        "max_topic_size": {
+          "value": "9007199254740993",
+          "kind": "uint64",
+          "explicit": true
+        }
+      },
+      "wire_reset": [],
+      "body_hex": "0101040100000001040200000000020e0000006d61785f746f7069635f73697a650c080000000100000000002000"
+    },
+    {
+      "case": "stream_rename",
+      "scope": "stream",
+      "target": {
+        "stream_id": 3
+      },
+      "input": {
+        "name": "payments-v2"
+      },
+      "wire_set": {
+        "name": {
+          "value": "payments-v2",
+          "kind": "string",
+          "explicit": true
+        }
+      },
+      "wire_reset": [],
+      "body_hex": "020104030000000002040000006e616d65020b0000007061796d656e74732d7632"
+    },
+    {
+      "case": "user_username_and_status",
+      "scope": "user",
+      "target": {
+        "user_id": 5
+      },
+      "input": {
+        "username": "alice2",
+        "status": "inactive"
+      },
+      "wire_set": {
+        "status": {
+          "value": "inactive",
+          "kind": "string",
+          "explicit": true
+        },
+        "username": {
+          "value": "alice2",
+          "kind": "string",
+          "explicit": true
+        }
+      },
+      "wire_reset": [],
+      "body_hex": "030104050000000002060000007374617475730208000000696e6163746976650208000000757365726e616d650206000000616c69636532"
+    }
+  ],
+  "update_resource_errors": [
+    {
+      "case": "topic_empty_update",
+      "scope": "topic",
+      "target": {
+        "stream_id": 1,
+        "topic_id": 2
+      },
+      "input": {},
+      "error": {
+        "name": "invalid_command",
+        "code": 3
+      }
+    },
+    {
+      "case": "topic_set_and_reset_same_key",
+      "scope": "topic",
+      "target": {
+        "stream_id": 1,
+        "topic_id": 2
+      },
+      "input": {
+        "message_expiry": "604800000000",
+        "reset": [
+          "message_expiry"
+        ]
+      },
+      "error": {
+        "name": "invalid_command",
+        "code": 3
+      }
+    },
+    {
+      "case": "topic_reset_create_only_key",
+      "scope": "topic",
+      "target": {
+        "stream_id": 1,
+        "topic_id": 2
+      },
+      "input": {
+        "reset": [
+          "compression_algorithm"
+        ]
+      },
+      "error": {
+        "name": "option_not_updatable",
+        "code": 4103
+      }
+    },
+    {
+      "case": "stream_reset_name",
+      "scope": "stream",
+      "target": {
+        "stream_id": 3
+      },
+      "input": {
+        "reset": [
+          "name"
+        ]
+      },
+      "error": {
+        "name": "option_not_resettable",
+        "code": 4104
+      }
+    },
+    {
+      "case": "user_reset_status",
+      "scope": "user",
+      "target": {
+        "user_id": 5
+      },
+      "input": {
+        "reset": [
+          "status"
+        ]
+      },
+      "error": {
+        "name": "option_not_resettable",
+        "code": 4104
+      }
+    },
+    {
+      "case": "stream_reset_read_only_key",
+      "scope": "stream",
+      "target": {
+        "stream_id": 3
+      },
+      "input": {
+        "reset": [
+          "encryption_key_source"
+        ]
+      },
+      "error": {
+        "name": "read_only_option",
+        "code": 4105
+      }
+    },
+    {
+      "case": "user_reset_internal_key",
+      "scope": "user",
+      "target": {
+        "user_id": 5
+      },
+      "input": {
+        "reset": [
+          "critical_keys"
+        ]
+      },
+      "error": {
+        "name": "read_only_option",
+        "code": 4105
+      }
+    },
+    {
+      "case": "topic_empty_name",
+      "scope": "topic",
+      "target": {
+        "stream_id": 1,
+        "topic_id": 2
+      },
+      "input": {
+        "name": ""
+      },
+      "error": {
+        "name": "invalid_topic_name",
+        "code": 2014
+      }
+    },
+    {
+      "case": "topic_empty_name_and_create_only_reset",
+      "scope": "topic",
+      "target": {
+        "stream_id": 1,
+        "topic_id": 2
+      },
+      "input": {
+        "name": "",
+        "reset": [
+          "segment_size"
+        ]
+      },
+      "error": {
+        "name": "option_not_updatable",
+        "code": 4103
+      }
+    },
+    {
+      "case": "stream_empty_name",
+      "scope": "stream",
+      "target": {
+        "stream_id": 3
+      },
+      "input": {
+        "name": ""
+      },
+      "error": {
+        "name": "invalid_stream_name",
+        "code": 1013
+      }
+    },
+    {
+      "case": "user_short_username",
+      "scope": "user",
+      "target": {
+        "user_id": 5
+      },
+      "input": {
+        "username": "a"
+      },
+      "error": {
+        "name": "invalid_username",
+        "code": 43
+      }
+    },
+    {
+      "case": "user_short_username_and_status_reset",
+      "scope": "user",
+      "target": {
+        "user_id": 5
+      },
+      "input": {
+        "username": "a",
+        "reset": [
+          "status"
+        ]
+      },
+      "error": {
+        "name": "option_not_resettable",
+        "code": 4104
+      }
+    }
+  ],
+  "create_stream": [
+    {
+      "case": "stream_without_key",
+      "input": {
+        "name": "orders"
+      },
+      "wire_options": {},
+      "body_hex": "066f7264657273",
+      "http_body": "{\"name\":\"orders\"}",
+      "admission_error": null
+    },
+    {
+      "case": "stream_with_key",
+      "input": {
+        "name": "orders",
+        "encryption_key": {
+          "raw_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+        }
+      },
+      "wire_options": {
+        "encryption_key": {
+          "value": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+          "kind": "raw",
+          "explicit": true
+        }
+      },
+      "body_hex": "066f7264657273020e000000656e6372797074696f6e5f6b65790120000000000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "http_body": "{\"name\":\"orders\",\"options\":{\"encryption_key\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=\"}}",
+      "admission_error": null
+    },
+    {
+      "case": "stream_with_raw_extra_key",
+      "input": {
+        "name": "orders",
+        "raw": {
+          "future_option": "enabled"
+        }
+      },
+      "wire_options": {
+        "future_option": {
+          "value": "enabled",
+          "kind": "string",
+          "explicit": true
+        }
+      },
+      "body_hex": "066f7264657273020d0000006675747572655f6f7074696f6e0207000000656e61626c6564",
+      "http_body": "{\"name\":\"orders\",\"options\":{\"future_option\":\"enabled\"}}",
+      "admission_error": {
+        "name": "unsupported_option_key",
+        "code": 4041
+      }
+    }
+  ],
+  "create_topic": [
+    {
+      "case": "topic_with_options",
+      "input": {
+        "stream_id": 1,
+        "name": "events",
+        "partitions_count": 3,
+        "compression_algorithm": "gzip",
+        "message_expiry": "604800000000",
+        "max_topic_size": "9007199254740993",
+        "segment_size": "134217728",
+        "durability": "persisted",
+        "consumer_offset_durability": "replicated"
+      },
+      "wire_options": {
+        "compression_algorithm": {
+          "value": "gzip",
+          "kind": "string",
+          "explicit": true
+        },
+        "consumer_offset_durability": {
+          "value": "replicated",
+          "kind": "string",
+          "explicit": true
+        },
+        "durability": {
+          "value": "persisted",
+          "kind": "string",
+          "explicit": true
+        },
+        "max_topic_size": {
+          "value": "9007199254740993",
+          "kind": "uint64",
+          "explicit": true
+        },
+        "message_expiry": {
+          "value": "604800000000",
+          "kind": "uint64",
+          "explicit": true
+        },
+        "segment_size": {
+          "value": "134217728",
+          "kind": "uint64",
+          "explicit": true
+        }
+      },
+      "body_hex": "01040100000003000000066576656e74730215000000636f6d7072657373696f6e5f616c676f726974686d0204000000677a6970021a000000636f6e73756d65725f6f66667365745f6475726162696c697479020a0000007265706c696361746564020a0000006475726162696c6974790209000000706572736973746564020e0000006d61785f746f7069635f73697a650c080000000100000000002000020e0000006d6573736167655f6578706972790c0800000000a0e3d08c000000020c0000007365676d656e745f73697a650c080000000000000800000000",
+      "http_body": "{\"partitions_count\":3,\"name\":\"events\",\"options\":{\"compression_algorithm\":\"gzip\",\"consumer_offset_durability\":\"replicated\",\"durability\":\"persisted\",\"max_topic_size\":\"9007199254740993\",\"message_expiry\":604800000000,\"segment_size\":134217728}}",
+      "admission_error": null
+    }
+  ],
+  "create_user": [
+    {
+      "case": "user_with_empty_options",
+      "input": {
+        "username": "alice",
+        "password": "s3cret-pass",
+        "status": "active"
+      },
+      "wire_options": {},
+      "body_hex": "05616c6963650b7333637265742d706173730100",
+      "http_body": "{\"username\":\"alice\",\"password\":\"s3cret-pass\",\"status\":\"active\",\"permissions\":null}",
+      "admission_error": null
+    }
+  ],
+  "http_update": [
+    {
+      "case": "topic_flat_keys",
+      "scope": "topic",
+      "target": {
+        "stream_id": 1,
+        "topic_id": 2
+      },
+      "body": "{\"name\":\"events-v2\",\"message_expiry\":\"7 days\"}",
+      "update_resource_hex": "0101040100000001040200000000020e0000006d6573736167655f657870697279020600000037206461797302040000006e616d6502090000006576656e74732d7632",
+      "outcome": "accepted",
+      "error": null
+    },
+    {
+      "case": "topic_reset_array",
+      "scope": "topic",
+      "target": {
+        "stream_id": 1,
+        "topic_id": 2
+      },
+      "body": "{\"message_expiry\":604800000000,\"reset\":[\"max_topic_size\"]}",
+      "update_resource_hex": "01010401000000010402000000010e6d61785f746f7069635f73697a65020e0000006d6573736167655f6578706972790c0800000000a0e3d08c000000",
+      "outcome": "accepted",
+      "error": null
+    },
+    {
+      "case": "topic_null_ignored",
+      "scope": "topic",
+      "target": {
+        "stream_id": 1,
+        "topic_id": 2
+      },
+      "body": "{\"name\":null,\"max_topic_size\":null,\"message_expiry\":\"1 day\"}",
+      "update_resource_hex": "0101040100000001040200000000020e0000006d6573736167655f65787069727902050000003120646179",
+      "outcome": "accepted",
+      "error": null
+    },
+    {
+      "case": "topic_u64_above_2_pow_53_as_string",
+      "scope": "topic",
+      "target": {
+        "stream_id": 1,
+        "topic_id": 2
+      },
+      "body": "{\"max_topic_size\":\"9007199254740993\"}",
+      "update_resource_hex": "0101040100000001040200000000020e0000006d61785f746f7069635f73697a65021000000039303037313939323534373430393933",
+      "outcome": "accepted",
+      "error": null
+    },
+    {
+      "case": "stream_rename",
+      "scope": "stream",
+      "target": {
+        "stream_id": 3
+      },
+      "body": "{\"name\":\"payments-v2\"}",
+      "update_resource_hex": "020104030000000002040000006e616d65020b0000007061796d656e74732d7632",
+      "outcome": "accepted",
+      "error": null
+    },
+    {
+      "case": "user_username_and_status",
+      "scope": "user",
+      "target": {
+        "user_id": 5
+      },
+      "body": "{\"username\":\"alice2\",\"status\":\"inactive\"}",
+      "update_resource_hex": "030104050000000002060000007374617475730208000000696e6163746976650208000000757365726e616d650206000000616c69636532",
+      "outcome": "accepted",
+      "error": null
+    },
+    {
+      "case": "topic_duplicate_key",
+      "scope": "topic",
+      "target": {
+        "stream_id": 1,
+        "topic_id": 2
+      },
+      "body": "{\"message_expiry\":\"1 day\",\"message_expiry\":\"2 days\"}",
+      "update_resource_hex": null,
+      "outcome": "json_refused",
+      "error": null
+    },
+    {
+      "case": "topic_nested_object",
+      "scope": "topic",
+      "target": {
+        "stream_id": 1,
+        "topic_id": 2
+      },
+      "body": "{\"message_expiry\":{\"value\":\"1 day\"}}",
+      "update_resource_hex": null,
+      "outcome": "json_refused",
+      "error": null
+    },
+    {
+      "case": "topic_null_only",
+      "scope": "topic",
+      "target": {
+        "stream_id": 1,
+        "topic_id": 2
+      },
+      "body": "{\"max_topic_size\":null}",
+      "update_resource_hex": "0101040100000001040200000000",
+      "outcome": "decode_refused",
+      "error": {
+        "name": "invalid_command",
+        "code": 3
+      }
+    },
+    {
+      "case": "topic_zero_sentinel_only",
+      "scope": "topic",
+      "target": {
+        "stream_id": 1,
+        "topic_id": 2
+      },
+      "body": "{\"message_expiry\":0}",
+      "update_resource_hex": "0101040100000001040200000000020e0000006d6573736167655f6578706972790c080000000000000000000000",
+      "outcome": "admission_refused",
+      "error": {
+        "name": "invalid_command",
+        "code": 3
+      }
+    },
+    {
+      "case": "topic_reset_names_set_key",
+      "scope": "topic",
+      "target": {
+        "stream_id": 1,
+        "topic_id": 2
+      },
+      "body": "{\"message_expiry\":\"1 day\",\"reset\":[\"message_expiry\"]}",
+      "update_resource_hex": "01010401000000010402000000010e6d6573736167655f657870697279020e0000006d6573736167655f65787069727902050000003120646179",
+      "outcome": "decode_refused",
+      "error": {
+        "name": "invalid_command",
+        "code": 3
+      }
+    },
+    {
+      "case": "topic_unknown_key",
+      "scope": "topic",
+      "target": {
+        "stream_id": 1,
+        "topic_id": 2
+      },
+      "body": "{\"retention\":\"1 day\"}",
+      "update_resource_hex": "01010401000000010402000000000209000000726574656e74696f6e02050000003120646179",
+      "outcome": "admission_refused",
+      "error": {
+        "name": "unsupported_option_key",
+        "code": 4041
+      }
+    },
+    {
+      "case": "topic_set_create_only_key",
+      "scope": "topic",
+      "target": {
+        "stream_id": 1,
+        "topic_id": 2
+      },
+      "body": "{\"compression_algorithm\":\"gzip\"}",
+      "update_resource_hex": "01010401000000010402000000000215000000636f6d7072657373696f6e5f616c676f726974686d0204000000677a6970",
+      "outcome": "admission_refused",
+      "error": {
+        "name": "option_not_updatable",
+        "code": 4103
+      }
+    },
+    {
+      "case": "topic_reset_create_only_key",
+      "scope": "topic",
+      "target": {
+        "stream_id": 1,
+        "topic_id": 2
+      },
+      "body": "{\"reset\":[\"compression_algorithm\"]}",
+      "update_resource_hex": "010104010000000104020000000115636f6d7072657373696f6e5f616c676f726974686d",
+      "outcome": "admission_refused",
+      "error": {
+        "name": "option_not_updatable",
+        "code": 4103
+      }
+    },
+    {
+      "case": "stream_reset_name",
+      "scope": "stream",
+      "target": {
+        "stream_id": 3
+      },
+      "body": "{\"reset\":[\"name\"]}",
+      "update_resource_hex": "0201040300000001046e616d65",
+      "outcome": "admission_refused",
+      "error": {
+        "name": "option_not_resettable",
+        "code": 4104
+      }
+    },
+    {
+      "case": "topic_name_as_number",
+      "scope": "topic",
+      "target": {
+        "stream_id": 1,
+        "topic_id": 2
+      },
+      "body": "{\"name\":5}",
+      "update_resource_hex": "010104010000000104020000000002040000006e616d650c080000000500000000000000",
+      "outcome": "admission_refused",
+      "error": {
+        "name": "invalid_topic_name",
+        "code": 2014
+      }
+    },
+    {
+      "case": "stream_empty_name",
+      "scope": "stream",
+      "target": {
+        "stream_id": 3
+      },
+      "body": "{\"name\":\"\"}",
+      "update_resource_hex": "020104030000000002040000006e616d65030100000000",
+      "outcome": "admission_refused",
+      "error": {
+        "name": "invalid_stream_name",
+        "code": 1013
+      }
+    },
+    {
+      "case": "user_status_as_bool",
+      "scope": "user",
+      "target": {
+        "user_id": 5
+      },
+      "body": "{\"status\":true}",
+      "update_resource_hex": "03010405000000000206000000737461747573030100000001",
+      "outcome": "admission_refused",
+      "error": {
+        "name": "invalid_user_status",
+        "code": 45
+      }
+    },
+    {
+      "case": "topic_create_only_key_as_bool",
+      "scope": "topic",
+      "target": {
+        "stream_id": 1,
+        "topic_id": 2
+      },
+      "body": "{\"segment_size\":true}",
+      "update_resource_hex": "0101040100000001040200000000020c0000007365676d656e745f73697a65030100000001",
+      "outcome": "admission_refused",
+      "error": {
+        "name": "option_not_updatable",
+        "code": 4103
+      }
+    },
+    {
+      "case": "stream_read_only_key_as_number",
+      "scope": "stream",
+      "target": {
+        "stream_id": 3
+      },
+      "body": "{\"encryption_key_source\":1}",
+      "update_resource_hex": "02010403000000000215000000656e6372797074696f6e5f6b65795f736f757263650c080000000100000000000000",
+      "outcome": "admission_refused",
+      "error": {
+        "name": "read_only_option",
+        "code": 4105
+      }
+    },
+    {
+      "case": "topic_invalid_value",
+      "scope": "topic",
+      "target": {
+        "stream_id": 1,
+        "topic_id": 2
+      },
+      "body": "{\"message_expiry\":\"soon\"}",
+      "update_resource_hex": "0101040100000001040200000000020e0000006d6573736167655f6578706972790204000000736f6f6e",
+      "outcome": "admission_refused",
+      "error": {
+        "name": "invalid_option_value",
+        "code": 4042
+      }
+    }
+  ],
+  "stream_responses": [
+    {
+      "case": "stream_source_none",
+      "state": {
+        "encryption_key_source": "none",
+        "stored_extra": {}
+      },
+      "response_hex": "0100000000e090663c1306000000000000100000000000000c000000000000000c706c61696e2d73747265616d00000000230000000215000000656e6372797074696f6e5f6b65795f736f7572636502040000006e6f6e65",
+      "expected": {
+        "id": 1,
+        "created_at": 1710000000000000,
+        "name": "plain-stream",
+        "topics_count": 0,
+        "size_bytes": 4096,
+        "messages_count": 12,
+        "options": {
+          "encryption_key_source": {
+            "value": "none",
+            "kind": "string",
+            "explicit": false
+          }
+        },
+        "encryption_key_source": "none",
+        "encryption_key_fingerprint": null,
+        "encryption_kek_fingerprints": []
+      }
+    },
+    {
+      "case": "stream_source_stream_with_unknown_explicit_key",
+      "state": {
+        "encryption_key_source": "stream",
+        "data_key": {
+          "raw_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+        },
+        "kek_config_keys": [
+          "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE="
+        ],
+        "stored_extra": {
+          "future_option": {
+            "value": "enabled",
+            "kind": "string",
+            "explicit": true
+          }
+        }
+      },
+      "response_hex": "0200000000e090663c1306000000000000100000000000000c0000000000000011636c69656e742d6b65792d73747265616d1e000000020d0000006675747572655f6f7074696f6e0207000000656e61626c65648d000000021a000000656e6372797074696f6e5f6b656b5f66696e6765727072696e74021000000033396534663066393563333639336337021a000000656e6372797074696f6e5f6b65795f66696e6765727072696e740210000000383434316533383533386362666135370215000000656e6372797074696f6e5f6b65795f736f75726365020600000073747265616d",
+      "expected": {
+        "id": 2,
+        "created_at": 1710000000000000,
+        "name": "client-key-stream",
+        "topics_count": 0,
+        "size_bytes": 4096,
+        "messages_count": 12,
+        "options": {
+          "encryption_kek_fingerprint": {
+            "value": "39e4f0f95c3693c7",
+            "kind": "string",
+            "explicit": false
+          },
+          "encryption_key_fingerprint": {
+            "value": "8441e38538cbfa57",
+            "kind": "string",
+            "explicit": false
+          },
+          "encryption_key_source": {
+            "value": "stream",
+            "kind": "string",
+            "explicit": false
+          },
+          "future_option": {
+            "value": "enabled",
+            "kind": "string",
+            "explicit": true
+          }
+        },
+        "encryption_key_source": "stream",
+        "encryption_key_fingerprint": "8441e38538cbfa57",
+        "encryption_kek_fingerprints": [
+          "39e4f0f95c3693c7"
+        ]
+      }
+    },
+    {
+      "case": "stream_source_server_two_keks",
+      "state": {
+        "encryption_key_source": "server",
+        "data_key": {
+          "raw_hex": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f"
+        },
+        "kek_config_keys": [
+          "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=",
+          "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="
+        ],
+        "stored_extra": {}
+      },
+      "response_hex": "0300000000e090663c1306000000000000100000000000000c00000000000000117365727665722d6b65792d73747265616d000000009e000000021a000000656e6372797074696f6e5f6b656b5f66696e6765727072696e740221000000333965346630663935633336393363372c64353564343739383239626332393336021a000000656e6372797074696f6e5f6b65795f66696e6765727072696e740210000000306563616666316261323931666530640215000000656e6372797074696f6e5f6b65795f736f757263650206000000736572766572",
+      "expected": {
+        "id": 3,
+        "created_at": 1710000000000000,
+        "name": "server-key-stream",
+        "topics_count": 0,
+        "size_bytes": 4096,
+        "messages_count": 12,
+        "options": {
+          "encryption_kek_fingerprint": {
+            "value": "39e4f0f95c3693c7,d55d479829bc2936",
+            "kind": "string",
+            "explicit": false
+          },
+          "encryption_key_fingerprint": {
+            "value": "0ecaff1ba291fe0d",
+            "kind": "string",
+            "explicit": false
+          },
+          "encryption_key_source": {
+            "value": "server",
+            "kind": "string",
+            "explicit": false
+          }
+        },
+        "encryption_key_source": "server",
+        "encryption_key_fingerprint": "0ecaff1ba291fe0d",
+        "encryption_kek_fingerprints": [
+          "39e4f0f95c3693c7",
+          "d55d479829bc2936"
+        ]
+      }
+    }
+  ],
+  "topic_responses": [
+    {
+      "case": "topic_explicit_and_derived",
+      "response_hex": "0400000000e090663c1306000000000000080000000000000700000000000000066576656e7473430000000215000000636f6d7072657373696f6e5f616c676f726974686d0204000000677a6970020e0000006d6573736167655f6578706972790c0800000000a0e3d08c0000002b010000021a000000636f6e73756d65725f6f66667365745f6475726162696c697479020a0000007265706c696361746564020a0000006475726162696c697479020a0000007265706c696361746564020e0000006d61785f746f7069635f73697a650c08000000ffffffffffffffff02190000006d657373616765735f72657175697265645f746f5f736176650b04000000000400000217000000706172746974696f6e5f726573697a655f706f6c69637902070000006d757461626c650214000000707265616c6c6f636174655f7365676d656e7473030100000000020c0000007365676d656e745f73697a650c080000000000004000000000022100000073697a655f6f665f6d657373616765735f72657175697265645f746f5f736176650c080000000000100000000000",
+      "expected": {
+        "id": 4,
+        "created_at": 1710000000000000,
+        "name": "events",
+        "partitions_count": 0,
+        "size_bytes": 2048,
+        "messages_count": 7,
+        "options": {
+          "compression_algorithm": {
+            "value": "gzip",
+            "kind": "string",
+            "explicit": true
+          },
+          "consumer_offset_durability": {
+            "value": "replicated",
+            "kind": "string",
+            "explicit": false
+          },
+          "durability": {
+            "value": "replicated",
+            "kind": "string",
+            "explicit": false
+          },
+          "max_topic_size": {
+            "value": "18446744073709551615",
+            "kind": "uint64",
+            "explicit": false
+          },
+          "message_expiry": {
+            "value": "604800000000",
+            "kind": "uint64",
+            "explicit": true
+          },
+          "messages_required_to_save": {
+            "value": "1024",
+            "kind": "uint32",
+            "explicit": false
+          },
+          "partition_resize_policy": {
+            "value": "mutable",
+            "kind": "string",
+            "explicit": false
+          },
+          "preallocate_segments": {
+            "value": "false",
+            "kind": "bool",
+            "explicit": false
+          },
+          "segment_size": {
+            "value": "1073741824",
+            "kind": "uint64",
+            "explicit": false
+          },
+          "size_of_messages_required_to_save": {
+            "value": "1048576",
+            "kind": "uint64",
+            "explicit": false
+          }
+        },
+        "compression_algorithm": "gzip",
+        "message_expiry": "604800000000",
+        "max_topic_size": "18446744073709551615"
+      }
+    }
+  ],
+  "user_responses": [
+    {
+      "case": "user_empty_blocks",
+      "response_hex": "0500000000e090663c1306000105616c696365000000000000000000000000",
+      "expected": {
+        "id": 5,
+        "created_at": 1710000000000000,
+        "status": "active",
+        "username": "alice",
+        "options": {}
+      }
+    },
+    {
+      "case": "user_populated_blocks",
+      "response_hex": "0600000000e090663c1306000203626f621e000000020d0000006675747572655f6f7074696f6e0207000000656e61626c65641e000000020c0000006675747572655f71756f74610c08000000010000000000200000000000",
+      "expected": {
+        "id": 6,
+        "created_at": 1710000000000000,
+        "status": "inactive",
+        "username": "bob",
+        "options": {
+          "future_option": {
+            "value": "enabled",
+            "kind": "string",
+            "explicit": true
+          },
+          "future_quota": {
+            "value": "9007199254740993",
+            "kind": "uint64",
+            "explicit": false
+          }
+        }
+      }
+    }
+  ]
+}

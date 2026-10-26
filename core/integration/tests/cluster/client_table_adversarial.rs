@@ -195,7 +195,7 @@ async fn given_partition_batches_spent_request_ids_when_a_metadata_request_is_re
     // so the raw session below spends ids only on what this spec is about.
     let setup = harness.tcp_root_client().await.unwrap();
     setup
-        .create_stream(GAP_STREAM)
+        .create_stream(GAP_STREAM, &StreamCreateOptions::default())
         .await
         .expect("create stream");
     setup
@@ -599,4 +599,5 @@ async fn exchange(stream: &mut TcpStream, header: &RequestHeader, body: &Bytes) 
 fn is_transient(code: u32) -> bool {
     code == IggyError::TransientNotCommitted.as_code()
         || code == IggyError::TransientNotAccepted.as_code()
+        || code == IggyError::NotPrimary.as_code()
 }

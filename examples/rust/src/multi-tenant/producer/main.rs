@@ -326,7 +326,9 @@ async fn create_stream_and_user(
     username: &str,
     client: &IggyClient,
 ) -> Result<(), IggyError> {
-    let stream = client.create_stream(stream_name).await?;
+    let stream = client
+        .create_stream(stream_name, &StreamCreateOptions::default())
+        .await?;
     info!("Created stream: {stream_name} with ID: {}", stream.id);
     let mut streams_permissions = BTreeMap::new();
     streams_permissions.insert(
@@ -342,7 +344,13 @@ async fn create_stream_and_user(
         ..Default::default()
     };
     let user = client
-        .create_user(username, PASSWORD, UserStatus::Active, Some(permissions))
+        .create_user(
+            username,
+            PASSWORD,
+            UserStatus::Active,
+            Some(permissions),
+            &UserCreateOptions::default(),
+        )
         .await?;
     info!(
         "Created user: {username} with ID: {}, with permissions for stream: {stream_name}",

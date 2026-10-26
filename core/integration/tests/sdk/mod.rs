@@ -23,6 +23,7 @@ mod consumer_shutdown;
 mod disconnect_relogin;
 mod hello_world;
 mod http_refresh;
+mod metadata_changes;
 mod options;
 mod producer;
 mod protocol_version;

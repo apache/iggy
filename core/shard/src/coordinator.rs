@@ -623,6 +623,11 @@ mod tests {
             u128::from(BOOT_NONCE)
         );
         assert_eq!(id & CLIENT_SEQUENCE_MASK, 1, "first seq is 1");
+        for target_shard in 0..u16::MAX {
+            assert!(!message_bus::is_server_internal_client(
+                coord.mint_client_id(target_shard)
+            ));
+        }
     }
 
     // Every boot and every node restarts the counter at 1, while the client
@@ -682,7 +687,7 @@ mod tests {
                 validate_checksum: true,
                 segment_size,
                 preallocate_segments: false,
-                encryptor: None,
+                key_context: Arc::default(),
                 path_layout: PartitionPathLayout::default(),
             },
         );

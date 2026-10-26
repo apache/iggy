@@ -55,8 +55,6 @@ pub struct RepairedWindowShape {
     /// Every op in the window is resident. An EMPTY window is complete: nothing
     /// left can arrive and change the floor verdict.
     pub complete: bool,
-    /// At least one resident op in the window is a `SendMessages`.
-    pub holds_messages: bool,
 }
 
 /// Lookup key for querying messages from the journal.
@@ -205,6 +203,10 @@ where
     /// A resident op follows a higher one, so the next op to flush can sit
     /// behind the front. Flushes wait for `sort_by_op`.
     out_of_order: Cell<bool>,
+    /// `(floor, through)`: every op in `floor + 1..=through` is resident. Repair
+    /// ticks resume the walk from here instead of rescanning the held prefix, and
+    /// any removal resets it.
+    held_run: Cell<(u64, u64)>,
 }
 
 /// How many evicted entries each partition retains for repair. Sized to
@@ -239,6 +241,7 @@ where
             resident_control_ops: Cell::new(0),
             evicted_through: Cell::new(0),
             out_of_order: Cell::new(false),
+            held_run: Cell::new((0, 0)),
         }
     }
 }
@@ -363,6 +366,13 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         (ring.len(), self.evicted_ring_bytes.get())
     }
 
+    /// Committed entries already flushed out of the resident journal cannot be
+    /// discarded by view reconciliation, even while the apply walk lags behind.
+    #[must_use]
+    pub const fn evicted_through(&self) -> u64 {
+        self.evicted_through.get()
+    }
+
     /// Resident (un-evicted) entry count; diagnostics only.
     pub fn resident_count(&self) -> usize {
         let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
@@ -396,6 +406,40 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         }
         let ring = unsafe { &*self.evicted_ring.get() };
         ring.get(&op).cloned()
+    }
+
+    /// The lowest resident `SendMessages` op in `ops` with its entry bytes, in
+    /// one pass over the headers. Resident only: the evicted ring holds what
+    /// already committed, which is not what a repair window is judged by.
+    #[must_use]
+    pub fn lowest_resident_send_in(
+        &self,
+        ops: RangeInclusive<u64>,
+    ) -> Option<(u64, JournalBuffer)> {
+        let op = {
+            let headers = unsafe { &*self.headers.get() };
+            headers
+                .iter()
+                .filter(|header| {
+                    header.operation == Operation::SendMessages && ops.contains(&header.op)
+                })
+                .map(|header| header.op)
+                .min()?
+        };
+        let entry = {
+            let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
+            let inner = unsafe { &*self.inner.get() };
+            op_to_storage_offset
+                .get(&op)
+                .and_then(|&storage_offset| inner.storage.read_at_sync(storage_offset))
+        };
+        if entry.is_none() {
+            warn!(
+                op,
+                "resident SendMessages header has no stored entry; the repair window has no anchor"
+            );
+        }
+        entry.map(|entry| (op, entry))
     }
 
     /// The header at `op`, over exactly the range [`Self::repair_entry`] serves.
@@ -814,6 +858,7 @@ where
             resident_control_ops: Cell::new(0),
             evicted_through: Cell::new(0),
             out_of_order: Cell::new(false),
+            held_run: Cell::new((0, 0)),
         }
     }
 
@@ -823,6 +868,7 @@ where
         self.first_header_by_op.borrow_mut().clear();
         unsafe { &mut *self.op_to_storage_offset.get() }.clear();
         unsafe { &mut *self.offset_to_op.get() }.clear();
+        self.held_run.set((0, 0));
         unsafe { &mut *self.timestamp_to_op.get() }.clear();
         self.resident_control_ops.set(0);
         self.out_of_order.set(false);
@@ -877,6 +923,41 @@ where
         op_to_storage_offset.contains_key(&op)
     }
 
+    /// Highest op `h >= floor` such that every op in `floor + 1..=h` is resident.
+    pub fn held_through(&self, floor: u64) -> u64 {
+        self.held_through_until(floor, u64::MAX)
+    }
+
+    /// [`Self::held_through`] capped at `top`, walking only the resident ops at
+    /// or below it.
+    pub fn held_through_until(&self, floor: u64, top: u64) -> u64 {
+        if floor >= top {
+            return floor;
+        }
+        let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
+        let (run_floor, run_through) = self.held_run.get();
+        let mut through = if run_floor <= floor && run_through > floor {
+            run_through.min(top)
+        } else {
+            floor
+        };
+        if through < top {
+            for op in op_to_storage_offset
+                .range(through + 1..=top)
+                .map(|(op, _)| *op)
+            {
+                if op != through + 1 {
+                    break;
+                }
+                through = op;
+            }
+        }
+        if through > floor && (run_floor > floor || run_through < through) {
+            self.held_run.set((floor, through));
+        }
+        through
+    }
+
     /// Whether any op in `ops` is resident, in one pass over the headers: the
     /// range can be far wider than what is resident.
     pub fn holds_op_in(&self, ops: RangeInclusive<u64>) -> bool {
@@ -884,8 +965,8 @@ where
         headers.iter().any(|header| ops.contains(&header.op))
     }
 
-    /// Presence and message-carrying shape of the repair window `(floor, to_op]`
-    /// in ONE pass over the header vec.
+    /// Presence shape of the repair window `(floor, to_op]` in ONE pass over
+    /// the header vec.
     ///
     /// Work and scratch space are bounded by resident headers, even when the
     /// requested op window is much larger than the local journal.
@@ -900,14 +981,7 @@ where
         // so this is both the early answer and what keeps the bitset below from
         // being sized off an arbitrary number.
         if expected > headers.len() as u64 {
-            return RepairedWindowShape {
-                complete: false,
-                holds_messages: headers.iter().any(|header| {
-                    header.op > floor
-                        && header.op <= to_op
-                        && header.operation == Operation::SendMessages
-                }),
-            };
+            return RepairedWindowShape { complete: false };
         }
         // Dense window, so a flat presence vector beats a `HashSet`: no hashing
         // per op and one contiguous allocation. One BYTE per op rather than one
@@ -918,14 +992,10 @@ where
         let expected_len = expected as usize;
         let mut present = vec![false; expected_len];
         let mut covered = 0usize;
-        let mut holds_messages = false;
         for header in headers
             .iter()
             .filter(|header| header.op > floor && header.op <= to_op)
         {
-            if header.operation == Operation::SendMessages {
-                holds_messages = true;
-            }
             #[allow(clippy::cast_possible_truncation)]
             let slot = (header.op - floor - 1) as usize;
             if !present[slot] {
@@ -936,7 +1006,6 @@ where
         RepairedWindowShape {
             // In-window ops only, deduplicated, so a count match IS coverage.
             complete: covered == expected_len,
-            holds_messages,
         }
     }
 
@@ -1120,19 +1189,12 @@ impl Journal for PartitionJournal<PartitionJournalMemStorage> {
         op_to_storage_offset.last_key_value().map(|(op, _)| *op)
     }
 
-    /// Drop every entry at or above `from_op`, rebuilding the indexes. Same
-    /// drain-and-re-append shape as `evict_prefix`, from the other end and retaining
-    /// nothing: `append` has no slot-collision check here, so a superseded entry left
-    /// in place sits beside the new view's prepare at the same op and
-    /// positional materialization flushes the stale one.
-    ///
-    /// Dropped entries do NOT enter the evicted repair ring: it answers repair for
-    /// committed ops, and these are ones the view just decided against.
-    async fn truncate_from(&self, from_op: u64) -> io::Result<usize> {
-        if from_op == 0 {
+    /// Removed entries must stay refillable and cannot enter the committed repair ring.
+    async fn remove_range(&self, ops: std::ops::RangeInclusive<u64>) -> io::Result<usize> {
+        if *ops.start() == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "truncate_from: ops are 1-based, so 0 would discard the whole journal",
+                "journal removal requires 1-based operations",
             ));
         }
         let all_entries = {
@@ -1141,15 +1203,15 @@ impl Journal for PartitionJournal<PartitionJournalMemStorage> {
         };
         // Positional against `headers` until the clear below (see the length-lock
         // invariant on `append_with_meta_sync`), so the ops are captured first.
-        let ops: Vec<u64> = {
+        let entry_ops: Vec<u64> = {
             let headers = unsafe { &*self.headers.get() };
             headers.iter().map(|header| header.op).collect()
         };
         self.clear_resident_indexes();
 
         let mut removed = 0usize;
-        for (op, entry) in ops.into_iter().zip(all_entries) {
-            if op >= from_op {
+        for (op, entry) in entry_ops.into_iter().zip(all_entries) {
+            if ops.contains(&op) {
                 removed += 1;
                 continue;
             }
@@ -1590,6 +1652,23 @@ mod tests {
     }
 
     #[compio::test]
+    async fn given_a_run_past_the_top_when_capping_held_through_should_stop_at_the_top() {
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        for op in [1, 2, 3, 4, 6] {
+            journal
+                .append(build_prepare(op, HEADER_SIZE + 16).into_frozen())
+                .await
+                .expect("append");
+        }
+
+        assert_eq!(journal.held_through(0), 4);
+        assert_eq!(journal.held_through_until(0, 2), 2);
+        assert_eq!(journal.held_through_until(0, 6), 4);
+        assert_eq!(journal.held_through_until(3, 3), 3);
+        assert_eq!(journal.held_through_until(5, 3), 5);
+    }
+
+    #[compio::test]
     async fn repaired_window_shape_rejects_unbounded_sparse_window_before_allocation() {
         let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
         journal
@@ -1600,7 +1679,6 @@ mod tests {
         let shape = journal.repaired_window_shape(0, u64::MAX);
 
         assert!(!shape.complete);
-        assert!(!shape.holds_messages);
     }
 
     #[compio::test]
