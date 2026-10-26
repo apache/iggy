@@ -93,7 +93,7 @@ impl TypedBenchmarkProducer {
 
     pub async fn run(self) -> Result<BenchmarkIndividualMetrics, IggyError> {
         match self {
-            Self::High(producer) => producer.run().await,
+            Self::High(producer) => Box::pin(producer.run()).await,
             Self::Low(producer) => producer.run().await,
         }
     }

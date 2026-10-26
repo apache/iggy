@@ -20,9 +20,14 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdlib>
+#include <optional>
+#include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "iggy.hpp"
 #include "lib.rs.h"
 
 namespace bdd {
@@ -47,6 +52,19 @@ struct GlobalContext {
     PolledData polled;
     std::vector<std::uint8_t> raw_response;
     std::string raw_error;
+    // Public client for the option and metadata change steps, see sdk_client().
+    std::optional<iggy::IggyBlockingClient> sdk;
+    std::optional<std::uint32_t> last_stream_id;
+    std::optional<std::uint32_t> last_topic_id;
+    std::optional<std::uint32_t> last_user_id;
+    std::optional<std::vector<std::uint8_t>> last_stream_key;
+    bool last_update_rejected = false;
+    std::vector<iggy::OptionSpec> last_option_specs;
+    std::string call_error;
+    std::vector<iggy::MetadataChangeGroup> last_change_groups;
+    std::optional<iggy::MetadataChangeCursor> last_change_cursor;
+    std::vector<iggy::MetadataChangeRecord> last_changes;
+    std::vector<iggy::MetadataCurrentItem> last_current_items;
 
     GlobalContext()                                 = default;
     GlobalContext(const GlobalContext &)            = delete;
@@ -62,6 +80,27 @@ struct GlobalContext {
         }
     }
 };
+
+inline std::string required_env(const char *name) {
+    const char *value = std::getenv(name);
+    if (value == nullptr || *value == '\0') {
+        throw std::runtime_error(std::string(name) + " must be set. Run the suite via scripts/run-bdd-tests.sh");
+    }
+    return std::string(value);
+}
+
+// Public client for the option and metadata change steps, connected as root on first use.
+inline iggy::IggyBlockingClient &sdk_client(GlobalContext &context) {
+    if (!context.sdk) {
+        auto client = iggy::IggyBlockingClient::Builder()
+                          .WithServerAddress(required_env("IGGY_TCP_ADDRESS"))
+                          .WithAutoLogin(required_env("IGGY_ROOT_USERNAME"), required_env("IGGY_ROOT_PASSWORD"))
+                          .Build();
+        client.Connect();
+        context.sdk.emplace(std::move(client));
+    }
+    return *context.sdk;
+}
 
 inline iggy::ffi::Identifier make_string_identifier(const std::string &value) {
     iggy::ffi::Identifier identifier;

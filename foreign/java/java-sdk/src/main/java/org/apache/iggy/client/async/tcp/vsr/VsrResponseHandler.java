@@ -26,6 +26,7 @@ import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.util.concurrent.ScheduledFuture;
 import org.apache.iggy.exception.IggyConnectionException;
 import org.apache.iggy.exception.IggyErrorCode;
+import org.apache.iggy.exception.IggyNotConnectedException;
 import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.exception.IggyTimeoutException;
 import org.slf4j.Logger;
@@ -83,8 +84,18 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
         try {
             timeoutFuture = channel.eventLoop()
                     .schedule(
-                            () -> future.completeExceptionally(new IggyTimeoutException(
-                                    "Timed out waiting for a response to command code " + commandCode)),
+                            () -> {
+                                if (pending.operation == VsrOperation.REGISTER
+                                        && pendingRequests.remove(pending.requestId, pending)) {
+                                    // Every Register has the same request id, so its late reply would answer the next
+                                    // Register on this channel and fail its proof check.
+                                    closeChannel(
+                                            channel,
+                                            new IggyNotConnectedException("A Register timed out on this channel"));
+                                }
+                                future.completeExceptionally(new IggyTimeoutException(
+                                        "Timed out waiting for a response to command code " + commandCode));
+                            },
                             timeoutNanos,
                             TimeUnit.NANOSECONDS);
         } catch (RuntimeException error) {
@@ -215,25 +226,32 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 && resultCode != VsrHeaders.ERROR_TRANSIENT_NOT_COMMITTED
                 && resultCode != VsrHeaders.ERROR_TRANSIENT_NOT_ACCEPTED
                 && resultCode != IggyErrorCode.NOT_PRIMARY.getCode();
-        synchronized (session) {
-            if (pending.identity.matches(session)) {
-                if (pending.committed
-                        && (VsrOperation.isMetadata(operation)
-                                || operation == VsrOperation.REGISTER
-                                || operation == VsrOperation.LOGOUT)) {
-                    session.observeMetadata(frame.getLongLE(frame.readerIndex() + VsrHeaders.REPLY_COMMIT_OFFSET));
-                }
-                if (resultCode == 0) {
-                    applySessionEffects(frame, operation, bodyStart, bodyLength);
-                }
-            }
-        }
-        resetLogoutSession(pending, operation, resultCode);
+        recordSessionReply(frame, pending, operation, resultCode, bodyStart, bodyLength);
         if (resultCode != 0) {
             throw IggyServerException.fromTcpResponse(resultCode, new byte[0]);
         }
 
         return frame.retainedSlice(bodyStart, bodyLength);
+    }
+
+    private void recordSessionReply(
+            ByteBuf frame, PendingRequest pending, int operation, long resultCode, int bodyStart, int bodyLength) {
+        boolean sessionBound = false;
+        synchronized (session) {
+            if (pending.identity.matches(session)) {
+                if (pending.committed && advancesMetadata(operation)) {
+                    session.observeMetadata(frame.getLongLE(frame.readerIndex() + VsrHeaders.REPLY_COMMIT_OFFSET));
+                }
+                if (resultCode == 0) {
+                    applySessionEffects(frame, operation, bodyStart, bodyLength);
+                    sessionBound = operation == VsrOperation.REGISTER;
+                }
+            }
+        }
+        if (sessionBound) {
+            session.owner().changed();
+        }
+        resetLogoutSession(pending, operation, resultCode);
     }
 
     private int validatedOperation(ByteBuf frame) {
@@ -270,8 +288,18 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
     private void resetLogoutSession(PendingRequest pending, int operation, long resultCode) {
         if (resultCode == 0 && operation == VsrOperation.LOGOUT) {
-            session.resetIfCurrent(pending.identity.clientLow, pending.identity.clientHigh);
+            if (pending.keepsLineage) {
+                session.resetForSignIn(pending.identity.clientLow, pending.identity.clientHigh);
+            } else {
+                session.resetIfCurrent(pending.identity.clientLow, pending.identity.clientHigh);
+            }
         }
+    }
+
+    private static boolean advancesMetadata(int operation) {
+        return VsrOperation.isMetadata(operation)
+                || operation == VsrOperation.REGISTER
+                || operation == VsrOperation.LOGOUT;
     }
 
     private void applySessionEffects(ByteBuf frame, int operation, int bodyStart, int bodyLength) {
@@ -282,7 +310,7 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
             if (bodyLength < REGISTER_BODY_MIN_LEN) {
                 throw IggyServerException.fromTcpResponse(VsrHeaders.ERROR_UNAUTHENTICATED, new byte[0]);
             }
-            session.bind(frame.getLongLE(bodyStart + 4));
+            session.bindWithoutSignal(frame.getLongLE(bodyStart + 4));
         }
     }
 
@@ -309,6 +337,7 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
         private volatile boolean committed;
         private volatile boolean failedByLink;
         private volatile boolean detachedSession;
+        private volatile boolean keepsLineage;
 
         private PendingRequest(
                 CompletableFuture<ByteBuf> future, int operation, long requestId, RequestIdentity identity) {
@@ -329,6 +358,11 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
         public boolean isSessionDetached() {
             return detachedSession;
+        }
+
+        /** Marks the logout that a sign-in sends first, so that its reply keeps the lineage that the sign-in began. */
+        public void keepLineage() {
+            keepsLineage = true;
         }
     }
 

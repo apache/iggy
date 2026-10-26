@@ -75,7 +75,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
 }
 
 async fn init_system(client: &IggyClient) -> (u32, u32) {
-    let stream = match client.create_stream(STREAM_NAME).await {
+    let stream = match client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+    {
         Ok(stream) => {
             info!("Stream was created.");
             stream

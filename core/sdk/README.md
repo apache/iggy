@@ -39,6 +39,7 @@ Official Rust client SDK for [Apache Iggy](https://iggy.apache.org), the persist
 - **Reliability**: managed replica connections, heartbeat, ordered mutation lanes, explicit recovery of uncertain mutations, and offset auto-commit.
 - **Message features**: optional headers (`HeaderKey` / `HeaderValue`), client-side AES-256-GCM encryption (via `Aes256GcmEncryptor`), topic compression metadata (`None` and `Gzip`; no runtime compression yet), server-honored message expiry, and server-side deduplication.
 - **Admin**: stream/topic/partition CRUD, consumer-group management, server-side consumer offsets, system stats.
+- **Resource options**: typed create and update options for streams, topics and users (`StreamCreateOptions`, `TopicUpdateOptions`, `UserUpdateOptions` and friends). An update sends only the settings it names and resets others by key. A stream can carry its own at-rest key (`StreamCreateOptions::encryption_key`), reads report only its source and fingerprints.
 
 ## Installation
 
@@ -50,7 +51,7 @@ directories are refused without modification; `--fresh` deletes existing data
 in the configured directory. See the [server recovery guide](../server/README.md#upgrade-recovery).
 Mixed versions and rolling upgrades are unsupported. Binary clients share one
 logical session across replica links using BindSession (15) and discover
-partition primaries with GetPartitionRoute (105). Commands 14, 103, 104 and 123
+partition primaries with GetPartitionRoute (105). Commands 14, 103, 104, 123 and 124
 are retired. HTTP clients use server-side forwarding.
 
 ```bash
@@ -68,6 +69,13 @@ credential for internal session control and must never be logged or exposed.
 `refresh_session_password` and `refresh_session_username` are removed. A
 transport that signs in again applies a committed credential change where its
 calls complete.
+
+`IggyError::ProducerSendFailed` changes its public `stream_name` and `topic_name`
+fields from `String` to `Box<str>`. Existing constructors must convert their names
+with `.into()`; the callback's `ErrorCtx` fields remain `String`. It also adds a
+public `uncertain: usize` field, so struct literals and exhaustive patterns must
+name it. `ConsumerGroupClientState` no longer has its public `partition_count` and
+`set_partition_context` methods.
 
 An established session has its own lifetime. Password or PAT changes and PAT
 expiry do not end it. Logout, session lease expiry, or user deactivation end the
@@ -94,6 +102,43 @@ the outcome unknown. A session reset drops retained requests. An
 `OperationNotRetained` error does not establish the outcome. A reset or an
 abandon came before a proved outcome, or the proved outcome aged out.
 Recovery is unavailable over HTTP.
+
+Receipt access follows the server's [session and revocation policy](../server/README.md#sessions-and-retry-receipts).
+An unresolved operation cannot recover its receipt after its original session
+ends, even after a new login or account reactivation. With a live session,
+partition permission revocation prevents resolution with 41 until a re-grant;
+metadata can replay the user's own committed cached result without a new
+permission check. A fresh application send can duplicate an uncertain operation.
+
+Each node counts the messages in its stream, topic and system stats. After a
+successful send, a node that is not the partition primary shows the new count
+only after the next prepare or commit broadcast. When no other write follows,
+this delay is at most `cluster.commit_broadcast_interval` (500 ms by default).
+See [metadata freshness and counters](../server/README.md#metadata-freshness-and-counters).
+
+An explicit sign-in or logout ends earlier calls: unsent calls fail with 40,
+and possibly applied mutations remain uncertain. SDK-managed recovery can keep
+an unsent call waiting for a session or a primary within its original deadline.
+Expiry returns 58. A refused automatic sign-in ends each unsent call that waits
+for it with 40. Until the caller signs in, later calls also fail with 40.
+`IggyError` carries no cause, so the client logs the refusal as a warning. If
+the sign-in of a `connect()` call is refused, that call returns the refusal.
+Recovery uses the caller's last explicit sign-in, or configured automatic
+credentials only if the caller never signed in. Logout disables automatic sign-in.
+
+HTTP 503 `relay_refused` uses the configured HTTP retry policy, regardless of
+its body code. Rust's HTTP retry schedule does not use the server's `Retry-After`
+header. This retry support does not provide retained-operation recovery.
+If the last 503 body carries code 58, the call returns `TransientNotAccepted`.
+A write that possibly committed, for example after a 504 or a lost reply, is
+not sent again and returns `TransientNotCommitted`.
+
+On a multi-node cluster, an HTTP call often reaches a node that is not the
+partition primary. For message sends, polls and consumer offset calls, that
+node relays the call to the primary. The relay needs identical `http.jwt`
+secrets or `cluster.auth` on every node. Without that key material, these calls
+answer 503 with code 58. See
+[HTTP routing and backpressure](../server/README.md#http-routing-and-backpressure).
 
 A committed password change or rename of the signed-in user updates the
 credentials that the client signs in with again. This holds for a typed call, a
@@ -204,7 +249,91 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 For lower-level control over individual commands (login, stream/topic management, raw send, polling by offset or timestamp), use the transport-specific clients directly. See the [examples](https://github.com/apache/iggy/tree/master/examples/rust) and the [Rust SDK docs](https://iggy.apache.org/docs/sdk/rust/intro/).
 
+`IggyClient::send_binary_request_to_replica(code, payload, replica_id)` sends a raw command to one node of a cluster, named by the replica id that cluster metadata returns.
+
+Each node answers non-replicated commands such as `GetStats` from its own state, so this reads the state of that node. The request carries the session's metadata watermark. Replicated commands, polls, consumer-offset reads and session-control codes fail with `InvalidCommand` before anything is sent.
+
+An id that cluster metadata does not name fails with `InvalidIdentifier`. An unreachable node is retried until the request deadline, and a `NotPrimary` reply is returned rather than sent to another node.
+
+HTTP clients return `FeatureUnavailable` for this call, as for `send_binary_request`.
+
 For `IggyConsumerConfig`, `partitions_count` controls topic creation only. An ordinary consumer uses partition `0` unless the builder's `partition_id` or the config's `with_partition_id` selects another partition. Code that previously used `partitions_count` to select an existing partition must set `partition_id` explicitly. Consumer-group assignment ignores `partition_id`.
+
+## Metadata changes
+
+`get_metadata_changes` reads the node's change log: one record per public result of a committed metadata operation, such as a stream created, a topic renamed, a user's permissions changed or a session closed. A mirror keeps a cursor, asks for the records after it, and stores the returned `next` cursor. The call needs root or the global `manage_servers` permission.
+
+```rust
+use iggy::prelude::*;
+use std::time::Duration;
+
+async fn follow(client: &IggyClient, groups: Vec<MetadataChangeGroup>) -> Result<(), IggyError> {
+    let mut query = MetadataChangesQuery {
+        groups,
+        ..MetadataChangesQuery::default()
+    };
+    loop {
+        let page = client.get_metadata_changes(&query).await?;
+        match page.status {
+            MetadataChangeStatus::Ok => {
+                for record in &page.records {
+                    println!("op {} by {:?}: {:?}", record.op, record.actor_user_id, record.change);
+                }
+                if let Some(next) = page.next {
+                    query.start = MetadataChangeStart::After(next);
+                }
+                if !page.has_more {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+            MetadataChangeStatus::Behind => tokio::time::sleep(Duration::from_millis(100)).await,
+            MetadataChangeStatus::Expired | MetadataChangeStatus::Reset => {
+                query.start = rebuild(client, &query.groups).await?;
+            }
+        }
+    }
+}
+
+/// Pages the current state, then returns the position to follow from.
+async fn rebuild(
+    client: &IggyClient,
+    groups: &[MetadataChangeGroup],
+) -> Result<MetadataChangeStart, IggyError> {
+    let mut scan_groups = groups.to_vec();
+    scan_groups.extend(groups.iter().flat_map(|group| group.parents()));
+    let mut query = MetadataChangesQuery {
+        start: MetadataChangeStart::Current(None),
+        groups: scan_groups,
+        ..MetadataChangesQuery::default()
+    };
+    loop {
+        let page = client.get_metadata_changes(&query).await?;
+        match page.status {
+            MetadataChangeStatus::Ok => {}
+            MetadataChangeStatus::Behind => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            MetadataChangeStatus::Expired | MetadataChangeStatus::Reset => {
+                query.start = MetadataChangeStart::Current(None);
+                continue;
+            }
+        }
+        for item in &page.items {
+            println!("{item:?}");
+        }
+        match (page.current_page_token, page.next) {
+            (Some(token), _) => query.start = MetadataChangeStart::Current(Some(token)),
+            (None, Some(anchor)) => return Ok(MetadataChangeStart::After(anchor)),
+            (None, None) => query.start = MetadataChangeStart::Current(None),
+        }
+    }
+}
+```
+
+`Expired` means the log no longer holds the history after the cursor, and `Reset` means the cursor belongs to another history, for example after the data directory was rebuilt. Either way the mirror rebuilds from current state pages and then follows the changes after the anchor they return.
+
+Current pages need the parent groups of every selected group, for example `topics` with `streams`, so `rebuild` adds them through `MetadataChangeGroup::parents()`. Keep a rebuilt state private until a change page answers `Ok` with `has_more == false` and a `head_op` at or above the last current page's.
 
 ## Versioning
 

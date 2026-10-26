@@ -654,14 +654,15 @@ class TestUpdateUser:
         await iggy_client.delete_user(created.id)
 
     @pytest.mark.asyncio
-    async def test_update_user_with_no_fields_is_a_noop(
+    async def test_update_user_with_no_fields_is_refused_before_sending(
         self, iggy_client: IggyClient, unique_name
     ):
-        """Test the server permits an update with neither username nor status."""
+        """Test an update that changes nothing is refused and leaves the user."""
         username, password = unique_credentials(unique_name)
         created = await iggy_client.create_user(username, password)
 
-        await iggy_client.update_user(created.id)
+        with pytest.raises(RuntimeError, match="Invalid command"):
+            await iggy_client.update_user(created.id)
 
         user = await iggy_client.get_user(created.id)
         assert user is not None
@@ -920,7 +921,7 @@ async def test_user_management_requires_connection_and_auth(method_name, unique_
         "get_user": (username,),
         "get_users": (),
         "create_user": (username, "secret"),
-        "update_user": (username,),
+        "update_user": (username, username),
         "delete_user": (username,),
         "update_permissions": (username, None),
         "change_password": (username, "secret", "secret2"),

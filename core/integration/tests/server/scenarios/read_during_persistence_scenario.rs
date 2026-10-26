@@ -32,7 +32,10 @@ const TOPIC_NAME: &str = "eventual-consistency-topic";
 async fn should_read_messages_still_in_the_journal(harness: &integration::harness::TestHarness) {
     let producer = harness.tcp_root_client().await.unwrap();
 
-    producer.create_stream(STREAM_NAME).await.unwrap();
+    producer
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     producer
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),

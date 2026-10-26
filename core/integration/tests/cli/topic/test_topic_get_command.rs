@@ -26,11 +26,14 @@ use iggy::prelude::Client;
 use iggy::prelude::Durability;
 use iggy::prelude::IggyExpiry;
 use iggy::prelude::defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
-use iggy::prelude::{IggyMessage, Partitioning, StreamClient, TopicClient, TopicCreateOptions};
-use integration::harness::{TestHarnessBuilder, TestServerConfig};
+use iggy::prelude::{
+    IggyMessage, Partitioning, StreamClient, StreamCreateOptions, TopicClient, TopicCreateOptions,
+};
+use integration::harness::{TestHarnessBuilder, TestServerConfig, wait_for_topic_messages_count};
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::{contains, starts_with};
 use serial_test::parallel;
+use std::time::Duration;
 
 struct TestTopicGetCmd {
     stream_id: u32,
@@ -44,6 +47,7 @@ struct TestTopicGetCmd {
     consumer_offset_durability: Durability,
     partition_ids: Vec<u32>,
     populate_partitions: bool,
+    commit_budget: Duration,
 }
 
 impl TestTopicGetCmd {
@@ -65,10 +69,16 @@ impl TestTopicGetCmd {
             consumer_offset_durability: Durability::Replicated,
             partition_ids: Vec::new(),
             populate_partitions: false,
+            commit_budget: Duration::ZERO,
         }
     }
 
-    fn with_topic_options(mut self, partitions_count: u32, durability: Durability) -> Self {
+    fn with_topic_options(
+        mut self,
+        partitions_count: u32,
+        durability: Durability,
+        commit_budget: Duration,
+    ) -> Self {
         self.partitions_count = partitions_count;
         self.durability = durability;
         self.consumer_offset_durability = match durability {
@@ -76,6 +86,7 @@ impl TestTopicGetCmd {
             Durability::Replicated => Durability::Persisted,
         };
         self.populate_partitions = true;
+        self.commit_budget = commit_budget;
         self
     }
 
@@ -92,13 +103,21 @@ impl TestTopicGetCmd {
 
         command
     }
+
+    fn expected_messages_count(&self) -> u64 {
+        if self.populate_partitions {
+            (1..=u64::from(self.partitions_count)).sum()
+        } else {
+            0
+        }
+    }
 }
 
 #[async_trait]
 impl IggyCmdTestCase for TestTopicGetCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
         let stream = client
-            .create_stream(&self.stream_name)
+            .create_stream(&self.stream_name, &StreamCreateOptions::default())
             .await
             .expect("stream should be created");
         self.stream_id = stream.id;
@@ -135,6 +154,14 @@ impl IggyCmdTestCase for TestTopicGetCmd {
                     .await
                     .expect("messages should be sent");
             }
+            wait_for_topic_messages_count(
+                client,
+                &self.stream_id.try_into().unwrap(),
+                &self.topic_id.try_into().unwrap(),
+                self.expected_messages_count(),
+                self.commit_budget,
+            )
+            .await;
         }
 
         self.partition_ids = topic
@@ -167,11 +194,6 @@ impl IggyCmdTestCase for TestTopicGetCmd {
         let start_message =
             format!("Executing get topic with ID: {topic_id} from stream with ID: {stream_id}");
 
-        let expected_messages_count = if self.populate_partitions {
-            (1..=u64::from(self.partitions_count)).sum::<u64>()
-        } else {
-            0
-        };
         let assertion = command_state
             .success()
             .stdout(starts_with(start_message))
@@ -185,7 +207,7 @@ impl IggyCmdTestCase for TestTopicGetCmd {
             .stdout(contains("Max topic size      | unlimited"))
             .stdout(contains(format!(
                 "Topic message count | {}",
-                expected_messages_count
+                self.expected_messages_count()
             )))
             .stdout(contains(format!(
                 "Partitions count    | {}",
@@ -308,6 +330,7 @@ pub async fn should_be_successful() {
 pub async fn should_show_multiple_partitions_and_persisted_durability() {
     let mut iggy_cmd_test = IggyCmdTest::default();
     iggy_cmd_test.setup().await;
+    let commit_budget = iggy_cmd_test.backup_commit_budget();
     iggy_cmd_test
         .execute_test(
             TestTopicGetCmd::new(
@@ -316,7 +339,7 @@ pub async fn should_show_multiple_partitions_and_persisted_durability() {
                 TestStreamId::Named,
                 TestTopicId::Named,
             )
-            .with_topic_options(3, Durability::Persisted),
+            .with_topic_options(3, Durability::Persisted, commit_budget),
         )
         .await;
 }
@@ -326,6 +349,7 @@ pub async fn should_show_multiple_partitions_and_persisted_durability() {
 pub async fn should_show_multiple_partitions_using_numeric_identifiers() {
     let mut iggy_cmd_test = IggyCmdTest::default();
     iggy_cmd_test.setup().await;
+    let commit_budget = iggy_cmd_test.backup_commit_budget();
     iggy_cmd_test
         .execute_test(
             TestTopicGetCmd::new(
@@ -334,7 +358,7 @@ pub async fn should_show_multiple_partitions_using_numeric_identifiers() {
                 TestStreamId::Numeric,
                 TestTopicId::Numeric,
             )
-            .with_topic_options(3, Durability::Replicated),
+            .with_topic_options(3, Durability::Replicated, commit_budget),
         )
         .await;
 }
@@ -344,7 +368,10 @@ struct TestMissingTopicGetCmd;
 #[async_trait]
 impl IggyCmdTestCase for TestMissingTopicGetCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
-        client.create_stream("missing-topic-stream").await.unwrap();
+        client
+            .create_stream("missing-topic-stream", &StreamCreateOptions::default())
+            .await
+            .unwrap();
     }
 
     fn get_command(&self) -> IggyCmdCommand {
@@ -460,7 +487,10 @@ pub async fn should_show_persisted_durability_created_through_cli() {
         .unwrap();
     harness.start().await.expect("test server should start");
     let client = harness.tcp_root_client().await.unwrap();
-    let stream = client.create_stream("cli-persisted-stream").await.unwrap();
+    let stream = client
+        .create_stream("cli-persisted-stream", &StreamCreateOptions::default())
+        .await
+        .unwrap();
     let address = harness.server().raw_tcp_addr().unwrap();
     let socket_address = harness.server().tcp_addr().unwrap();
     clear_session_entry(socket_address);

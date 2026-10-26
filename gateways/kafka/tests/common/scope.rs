@@ -46,7 +46,9 @@ pub const SCOPED_API_KEYS: &[(i16, &str, i16, i16)] = &[
     (32, "DescribeConfigs", 1, 4),
     (33, "AlterConfigs", 0, 2),
     (37, "CreatePartitions", 0, 3),
+    (42, "DeleteGroups", 0, 2),
     (44, "IncrementalAlterConfigs", 0, 1),
+    (47, "OffsetDelete", 0, 0),
     (60, "DescribeCluster", 0, 2),
 ];
 

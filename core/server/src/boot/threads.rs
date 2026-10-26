@@ -819,7 +819,7 @@ pub(in crate::boot) async fn await_pump_drain(
 /// The caller owns the returned handle and must await it on the exit paths
 /// where shutdown is in progress (flag set or bus token triggered):
 /// dropping it there cancels the watchdog mid-`bus.shutdown()`, truncating
-/// in-flight `ClientForwardFailed` replies (terminal per `SendError` docs).
+/// in-flight client replies.
 /// It cannot go through `bus.track_background` instead: the watchdog itself
 /// drives `bus.shutdown()`, and the bg-drain loop in `shutdown()` would
 /// re-enter awaiting the watchdog's own pending shutdown call
@@ -858,6 +858,7 @@ pub(in crate::boot) struct StopSignals {
     pub(in crate::boot) reconciler: Sender<()>,
     pub(in crate::boot) heartbeat: Option<Sender<()>>,
     pub(in crate::boot) pat_cleaner: Option<Sender<()>>,
+    pub(in crate::boot) stream_key_rewrapper: Option<Sender<()>>,
     pub(in crate::boot) segment_cleaner: Option<Sender<()>>,
     pub(in crate::boot) sysinfo_printer: Option<Sender<()>>,
     pub(in crate::boot) consumer_group_liveness: Option<Sender<()>>,
@@ -871,6 +872,7 @@ impl StopSignals {
         for stop in [
             &self.heartbeat,
             &self.pat_cleaner,
+            &self.stream_key_rewrapper,
             &self.segment_cleaner,
             &self.sysinfo_printer,
             &self.consumer_group_liveness,

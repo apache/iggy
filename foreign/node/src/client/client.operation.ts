@@ -190,8 +190,7 @@ export class FrozenFrame {
 export type ClientOperation = {
   readonly lane: string,
   readonly command: number,
-  readonly context: PartitionContext,
-  readonly generation: number,
+  context: PartitionContext,
   frame: FrozenFrame,
   id: bigint,
   readonly retainable: boolean,
@@ -227,7 +226,7 @@ export class MutationLanes {
   constructor(private readonly maxOperations: number, private readonly maxBytes: number) {}
 
   async enter(lane: string, command: number, body: Buffer, context: PartitionContext,
-    generation: number, retainable: boolean, session: VsrSession, deadline: number,
+    retainable: boolean, session: VsrSession, deadline: number,
     signal: AbortSignal): Promise<ClientOperation> {
     const size = retainable ? HEADER_SIZE + body.length : 0;
     if (!Number.isSafeInteger(size) || size > this.maxBytes)
@@ -262,7 +261,7 @@ export class MutationLanes {
             throw error;
           }
           const operation: ClientOperation = {
-            lane, command, context, generation, retainable,
+            lane, command, context, retainable,
             id: bytes.readBigUInt64LE(REQUEST_OFFSET.request),
             frame: this.freeze(bytes, size),
             lifetime: new AbortController(), resolving: false, retained: false, uncertain: false,
@@ -291,7 +290,7 @@ export class MutationLanes {
     }
   }
 
-  async restart(operation: ClientOperation, body: Buffer, session: VsrSession,
+  async restart(operation: ClientOperation, body: Buffer, context: PartitionContext, session: VsrSession,
     deadline: number, signal: AbortSignal): Promise<void> {
     operation.frame.releaseOwner();
     const size = operation.retainable ? HEADER_SIZE + body.length : 0;
@@ -302,10 +301,11 @@ export class MutationLanes {
       if (size <= this.maxBytes - this.bytes) break;
       await waitWithin(this.changed.promise, deadline, signal);
     }
-    const bytes = session.encode(operation.command, body, operation.context);
+    const bytes = session.encode(operation.command, body, context);
     this.bytes += size;
     this.operations.delete(operation.id);
     operation.id = bytes.readBigUInt64LE(REQUEST_OFFSET.request);
+    operation.context = context;
     operation.frame = this.freeze(bytes, size);
     this.operations.set(operation.id, operation);
   }
@@ -393,9 +393,14 @@ export class MutationLanes {
     this.changed.pulse();
   }
 
+  /**
+   * Drops the retained operations and ends their replays, because no other
+   * session can replay their frames. A call keeps the lane it holds and starts
+   * again under the next session, so the calls in a lane keep their order.
+   */
   reset(): void {
     for (const operation of this.operations.values())
-      this.complete(operation);
+      if (operation.retained || operation.resolving) this.complete(operation);
   }
 
   private releaseSlot(operation: ClientOperation): void {

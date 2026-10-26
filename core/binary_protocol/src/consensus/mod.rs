@@ -41,8 +41,10 @@ mod consumer_session;
 mod error;
 mod header;
 mod operation;
+mod primary_rebalance;
 mod reply_result;
 mod request;
+mod segment_delete;
 
 pub use command::Command;
 pub use consumer_session::{
@@ -62,8 +64,10 @@ pub use header::{
     prepare_identity_checksum_bytes, read_size_field,
 };
 pub use operation::Operation;
+pub use primary_rebalance::{PrimaryRebalanceHeader, PrimaryRebalanceKind};
 pub use reply_result::{
     REJECTION_SECTION_LEN, RESULT_COUNT_LEN, RESULT_ENTRY_LEN, result_code, result_section_len,
     write_rejection_section,
 };
 pub use request::{NON_REPLICATED_CODE_RANGE, operation_for_code};
+pub use segment_delete::{SegmentDeleteHeader, SegmentDeleteKind};

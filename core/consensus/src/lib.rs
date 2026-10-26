@@ -211,6 +211,6 @@ pub use view_change_quorum::*;
 mod dvc_merge;
 pub use dvc_merge::*;
 mod vsr_state;
-pub use vsr_state::{VsrState, VsrStateError};
+pub use vsr_state::{AdoptedView, HistoryCertificate, HistoryRecovery, VsrState, VsrStateError};
 mod vsr_timeout;
 pub use vsr_timeout::{TICK_INTERVAL, TimeoutManager};
