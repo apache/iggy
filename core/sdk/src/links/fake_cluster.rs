@@ -525,7 +525,8 @@ pub(crate) fn links(
 ) -> ReplicaLinks {
     let credentials = Credentials::UsernamePassword("iggy".to_owned(), SecretString::from("iggy"));
     let session = Arc::new(SessionOwner::new(AutoLogin::Enabled(credentials)));
-    ReplicaLinks::new(cluster.dialer(), configured.to_owned(), policy, session)
+    let configured = configured.split(',').map(str::to_owned).collect();
+    ReplicaLinks::new(cluster.dialer(), configured, policy, session)
 }
 
 /// Connects, and waits until `count` slots serve the session.

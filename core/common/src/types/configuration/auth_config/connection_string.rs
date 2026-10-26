@@ -82,16 +82,10 @@ impl<T: ConnectionStringOptions + Default> ConnectionString<T> {
         }
 
         let server_address = server_and_options[0];
-        if server_address.starts_with('[') {
-            validate_server_address(server_address)
-                .map_err(|_| IggyError::InvalidConnectionString)?;
+        if T::ADDRESS_LIST {
+            server_address.split(',').try_for_each(validate_address)?;
         } else {
-            let (host, port) = server_address
-                .split_once(':')
-                .ok_or(IggyError::InvalidConnectionString)?;
-            if host.is_empty() || !port.parse::<u16>().is_ok_and(|port| port != 0) {
-                return Err(IggyError::InvalidConnectionString);
-            }
+            validate_address(server_address)?;
         }
 
         let connection_string_options;
@@ -127,6 +121,21 @@ impl<T: ConnectionStringOptions + Default> FromStr for ConnectionString<T> {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         ConnectionString::<T>::new(s)
     }
+}
+
+/// Checks one `host:port` or `[ipv6]:port` of a connection string.
+fn validate_address(server_address: &str) -> Result<(), IggyError> {
+    if server_address.starts_with('[') {
+        return validate_server_address(server_address)
+            .map_err(|_| IggyError::InvalidConnectionString);
+    }
+    let (host, port) = server_address
+        .split_once(':')
+        .ok_or(IggyError::InvalidConnectionString)?;
+    if host.is_empty() || !port.parse::<u16>().is_ok_and(|port| port != 0) {
+        return Err(IggyError::InvalidConnectionString);
+    }
+    Ok(())
 }
 
 /// ConnectionStringUtils is a utility struct for connection strings.
@@ -178,6 +187,45 @@ mod tests {
                 ConnectionString::<TcpConnectionStringOptions>::new(&value).unwrap();
             assert_eq!(connection_string.server_address(), server_address);
         }
+    }
+
+    #[test]
+    fn should_succeed_with_a_list_of_tcp_addresses() {
+        let value = "iggy://user:secret@10.0.0.1:8090,[2001:db8::1]:8090,node-3:8090";
+        let connection_string = ConnectionString::<TcpConnectionStringOptions>::new(value).unwrap();
+        let config = TcpClientConfig::from(connection_string);
+        assert_eq!(
+            config.server_addresses(),
+            ["10.0.0.1:8090", "[2001:db8::1]:8090", "node-3:8090"]
+        );
+    }
+
+    #[test]
+    fn should_fail_with_a_list_that_holds_a_bad_address() {
+        for addresses in [
+            "10.0.0.1:8090,",
+            "10.0.0.1:8090,node-3",
+            "10.0.0.1:8090,,node-3:8090",
+        ] {
+            let value = format!("iggy://user:secret@{addresses}");
+            assert!(
+                matches!(
+                    ConnectionString::<TcpConnectionStringOptions>::new(&value),
+                    Err(IggyError::InvalidConnectionString)
+                ),
+                "{addresses}"
+            );
+        }
+    }
+
+    /// Only TCP clients dial a list.
+    #[test]
+    fn should_fail_with_a_list_of_quic_addresses() {
+        let value = "iggy+quic://user:secret@10.0.0.1:8080,10.0.0.2:8080";
+        assert!(matches!(
+            ConnectionString::<QuicConnectionStringOptions>::new(value),
+            Err(IggyError::InvalidConnectionString)
+        ));
     }
 
     #[test]

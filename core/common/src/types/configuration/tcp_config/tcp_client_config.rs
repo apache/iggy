@@ -24,7 +24,9 @@ use std::str::FromStr;
 /// Configuration for the TCP client.
 #[derive(Debug, Clone)]
 pub struct TcpClientConfig {
-    /// The address of the Iggy server.
+    /// The address of the Iggy server. To reach a cluster while one of its nodes is down, list
+    /// the addresses of several nodes, separated by commas. A new client tries each address in
+    /// order, and then the nodes of the last roster that it read.
     pub server_address: String,
     /// Whether to use TLS when connecting to the server.
     pub tls_enabled: bool,
@@ -61,6 +63,16 @@ impl Default for TcpClientConfig {
             reconnection: TcpClientReconnectionConfig::default(),
             nodelay: false,
         }
+    }
+}
+
+impl TcpClientConfig {
+    /// Each address of `server_address`, in order.
+    pub fn server_addresses(&self) -> Vec<String> {
+        self.server_address
+            .split(',')
+            .map(|address| address.trim().to_owned())
+            .collect()
     }
 }
 

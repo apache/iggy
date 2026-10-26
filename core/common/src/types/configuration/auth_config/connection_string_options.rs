@@ -18,6 +18,10 @@
 use crate::{IggyError, NonZeroIggyDuration};
 
 pub trait ConnectionStringOptions {
+    /// Whether the address of a connection string can list several nodes of one cluster,
+    /// separated by commas.
+    const ADDRESS_LIST: bool = false;
+
     fn retries(&self) -> Option<u32>;
 
     fn heartbeat_interval(&self) -> NonZeroIggyDuration;

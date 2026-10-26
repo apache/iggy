@@ -2249,7 +2249,7 @@ mod tests {
         ));
         fixture.driver = OperationDriver::new(ReplicaLinks::new(
             fixture.cluster.dialer(),
-            endpoint(0),
+            vec![endpoint(0)],
             policy(),
             session,
         ));
@@ -3378,7 +3378,7 @@ mod tests {
     ) -> OperationDriver {
         let session = Arc::new(SessionOwner::new(auto_login));
         session.remember(credentials, USER_ID);
-        let links = ReplicaLinks::new(cluster.dialer(), endpoint(0), policy(), session);
+        let links = ReplicaLinks::new(cluster.dialer(), vec![endpoint(0)], policy(), session);
         links.connect().await.unwrap();
         eventually("every replica is bound", || {
             links.ready_replicas().len() == usize::from(REPLICAS)
@@ -3636,7 +3636,7 @@ mod tests {
         session.bind(FIRST_SESSION).unwrap();
         f.driver = OperationDriver::new(ReplicaLinks::new(
             f.cluster.dialer(),
-            endpoint(0),
+            vec![endpoint(0)],
             policy(),
             session,
         ));

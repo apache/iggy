@@ -92,7 +92,7 @@ impl TcpClient {
         ));
         let links = ReplicaLinks::new(
             Dialer::Tcp(Arc::clone(&config)),
-            config.server_address.clone(),
+            config.server_addresses(),
             ReconnectPolicy::from(&config.reconnection),
             session,
         );
@@ -156,7 +156,7 @@ mod tests {
         let session = Arc::new(SessionOwner::new(AutoLogin::Disabled));
         TcpClient::from_links(ReplicaLinks::new(
             cluster.dialer(),
-            endpoint(0),
+            vec![endpoint(0)],
             policy(),
             session,
         ))
@@ -942,7 +942,7 @@ mod tests {
                 let session = Arc::new(SessionOwner::new(AutoLogin::Enabled(credentials)));
                 let client = TcpClient::from_links(ReplicaLinks::new(
                     cluster.dialer(),
-                    endpoint(0),
+                    vec![endpoint(0)],
                     policy(),
                     session,
                 ));
@@ -987,7 +987,7 @@ mod tests {
             let client = || {
                 TcpClient::from_links(ReplicaLinks::new(
                     cluster.dialer(),
-                    endpoint(0),
+                    vec![endpoint(0)],
                     policy(),
                     Arc::new(SessionOwner::new(AutoLogin::Enabled(credentials.clone()))),
                 ))

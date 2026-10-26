@@ -141,7 +141,9 @@ pub(crate) struct ReplicaLinks {
 #[derive(Debug)]
 struct LinksShared {
     dialer: Dialer,
-    configured_endpoint: String,
+    /// The endpoints of the client configuration, in order. A sweep dials
+    /// them before the roster.
+    configured_endpoints: Vec<String>,
     policy: ReconnectPolicy,
     session: Arc<SessionOwner>,
     /// Never held across an await. The epoch of the session is read before
@@ -168,7 +170,7 @@ struct Table {
     bootstrap: Option<Bootstrap>,
     metadata_primary: Option<u8>,
     /// The endpoints of the last roster. A sweep dials them after the
-    /// configured endpoint.
+    /// configured endpoints.
     roster: Vec<String>,
 }
 
@@ -229,7 +231,7 @@ impl From<IggyError> for SignInFailure {
 impl ReplicaLinks {
     pub(crate) fn new(
         dialer: Dialer,
-        configured_endpoint: String,
+        configured_endpoints: Vec<String>,
         policy: ReconnectPolicy,
         session: Arc<SessionOwner>,
     ) -> Self {
@@ -245,7 +247,7 @@ impl ReplicaLinks {
         Self {
             shared: Arc::new(LinksShared {
                 dialer,
-                configured_endpoint,
+                configured_endpoints,
                 policy,
                 session,
                 table: Mutex::new(table),
@@ -472,7 +474,7 @@ impl ReplicaLinks {
     }
 
     /// The endpoint of the metadata primary, else of the bootstrap link, else
-    /// the configured one.
+    /// the first configured one.
     pub(crate) fn connection_address(&self) -> String {
         let table = self.shared.table();
         table
@@ -483,8 +485,9 @@ impl ReplicaLinks {
                 .bootstrap
                 .as_ref()
                 .map(|bootstrap| &bootstrap.endpoint))
-            .unwrap_or(&self.shared.configured_endpoint)
-            .clone()
+            .or(self.shared.configured_endpoints.first())
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -633,11 +636,11 @@ impl LinksShared {
         Ok(())
     }
 
-    /// The configured endpoint, then the endpoints of the last roster, each
+    /// The configured endpoints, then the endpoints of the last roster, each
     /// spelling once. Spellings need no name lookup, which can stall a sweep.
     fn candidates(&self, roster: &[String]) -> Vec<String> {
-        let mut candidates = vec![self.configured_endpoint.clone()];
-        for endpoint in roster {
+        let mut candidates: Vec<String> = Vec::new();
+        for endpoint in self.configured_endpoints.iter().chain(roster) {
             if !candidates
                 .iter()
                 .any(|known| is_same_spelling(known, endpoint))
@@ -646,6 +649,22 @@ impl LinksShared {
             }
         }
         candidates
+    }
+
+    /// The configured endpoint that `link` was dialed at, else the first
+    /// configured one.
+    fn configured_endpoint_of(&self, link: &Arc<Link>) -> String {
+        let dialed = self.table().endpoint_of(link).map(str::to_owned);
+        let configured = &self.configured_endpoints;
+        dialed
+            .and_then(|dialed| {
+                configured
+                    .iter()
+                    .find(|endpoint| is_same_spelling(endpoint, &dialed))
+            })
+            .or(configured.first())
+            .cloned()
+            .unwrap_or_default()
     }
 
     async fn try_endpoint(
@@ -964,7 +983,7 @@ impl LinksShared {
     /// Rebuilds the slots from the roster that `via` carried. A removed
     /// replica or a moved endpoint retires its link, so the requests that
     /// hold it finish first. The slot of a one-node roster dials the
-    /// configured endpoint.
+    /// configured endpoint that `via` was dialed at, else the first one.
     async fn apply_roster(
         self: &Arc<Self>,
         roster: &ClusterMetadata,
@@ -989,12 +1008,12 @@ impl LinksShared {
             }
         }
         // A single node advertises its own view of its address, such as a
-        // bind address or a container name. Only the configured endpoint is
+        // bind address or a container name. Only a configured endpoint is
         // known to reach it.
         if wanted.len() == 1
             && let Some(endpoint) = wanted.values_mut().next()
         {
-            endpoint.clone_from(&self.configured_endpoint);
+            *endpoint = self.configured_endpoint_of(via);
         }
         let primary = roster
             .nodes
@@ -1330,6 +1349,22 @@ impl Table {
         self.links().find(|ready| Arc::ptr_eq(&ready.link, link))
     }
 
+    /// The endpoint that `link` was dialed at, while a slot or the bootstrap
+    /// holds it.
+    fn endpoint_of(&self, link: &Arc<Link>) -> Option<&str> {
+        let holds = |ready: &ReadyLink| Arc::ptr_eq(&ready.link, link);
+        self.slots
+            .values()
+            .find(|slot| slot.link.as_ref().is_some_and(holds))
+            .map(|slot| slot.endpoint.as_str())
+            .or_else(|| {
+                self.bootstrap
+                    .as_ref()
+                    .filter(|bootstrap| holds(&bootstrap.link))
+                    .map(|bootstrap| bootstrap.endpoint.as_str())
+            })
+    }
+
     fn find_mut(&mut self, link: &Arc<Link>) -> Option<&mut ReadyLink> {
         self.slots
             .values_mut()
@@ -1584,6 +1619,66 @@ mod tests {
         assert_eq!(slot_endpoints(&links), [(0, MAPPED.to_owned())]);
         assert!(Arc::ptr_eq(&links.link(Target::Replica(0)).unwrap(), &link));
         assert_eq!(links.connection_address(), MAPPED);
+    }
+
+    /// The first pass of the sweep dials every configured endpoint.
+    #[tokio::test(start_paused = true)]
+    async fn given_configured_endpoints_when_the_first_is_down_should_connect_through_the_next() {
+        let cluster = FakeCluster::new(3);
+        cluster.down.lock().unwrap().insert(endpoint(0));
+        let links = links(
+            &cluster,
+            &format!("{},{}", endpoint(0), endpoint(1)),
+            one_retry(),
+        );
+
+        links.connect().await.unwrap();
+
+        let dialed: Vec<String> = cluster
+            .dials
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(endpoint, _)| endpoint.clone())
+            .take(2)
+            .collect();
+        assert_eq!(dialed, [endpoint(0), endpoint(1)]);
+        eventually("the live replicas are ready", || {
+            links.ready_replicas() == [1, 2]
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_single_node_roster_should_redial_the_configured_endpoint_that_reached_it() {
+        const GONE: &str = "127.0.0.1:18091";
+        const MAPPED: &str = "127.0.0.1:18090";
+        let cluster = FakeCluster::new(1);
+        cluster
+            .down
+            .lock()
+            .unwrap()
+            .extend([endpoint(0), GONE.to_owned()]);
+        let links = links(&cluster, &format!("{GONE},{MAPPED}"), one_retry());
+        links.connect().await.unwrap();
+
+        cluster.drop_connections(MAPPED);
+        eventually(
+            "the slot redials the endpoint that reached the node",
+            || cluster.dials_to(MAPPED).len() == 2 && links.ready_replicas() == [0],
+        )
+        .await;
+        assert_eq!(slot_endpoints(&links), [(0, MAPPED.to_owned())]);
+        assert_eq!(links.connection_address(), MAPPED);
+    }
+
+    /// A policy that gives up after one retry, so a client that cannot
+    /// connect fails the test instead of retrying for ever.
+    fn one_retry() -> ReconnectPolicy {
+        ReconnectPolicy {
+            max_retries: Some(1),
+            ..policy()
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -2034,7 +2129,7 @@ mod tests {
         session.remember(credentials.clone(), 1);
         let links = ReplicaLinks::new(
             cluster.dialer(),
-            endpoint(0),
+            vec![endpoint(0)],
             policy(),
             Arc::clone(&session),
         );

@@ -402,7 +402,7 @@ check's and the bridge's alike, and are refused while neither SASL nor the bridg
 | Variable | Default | Description |
 | --- | --- | --- |
 | `IGGY_KAFKA_IGGY_TLS_ENABLED` | `false` | Encrypt the gateway's connections to Iggy (`true` or `false`, nothing else). Required if the Iggy server only accepts TLS, otherwise the bridge fails to connect and every verification fails as unreachable |
-| `IGGY_KAFKA_IGGY_TLS_DOMAIN` | derived from the address | Name checked against the Iggy server certificate |
+| `IGGY_KAFKA_IGGY_TLS_DOMAIN` | derived from each address | Name checked against the certificate of every Iggy node |
 | `IGGY_KAFKA_IGGY_TLS_CA_FILE` | SDK bundled roots | PEM roots to trust. Note the SDK does not use the system trust store |
 
 Client side, for example with `kcat`:
@@ -583,7 +583,7 @@ Limits:
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `IGGY_KAFKA_IGGY_ADDR` | `127.0.0.1:8090` | Address of the Iggy server to bridge to |
+| `IGGY_KAFKA_IGGY_ADDR` | `127.0.0.1:8090` | Address of the Iggy server to bridge to and to check SASL logins against. For a cluster, list several nodes, separated by commas: each new Iggy client tries them in order, so new producers and logins go on while one node is down |
 | `IGGY_KAFKA_IGGY_USERNAME` | `iggy` | Iggy username |
 | `IGGY_KAFKA_IGGY_PASSWORD` | none - **required** | Iggy password. No default: `iggy-server` only uses the well-known `iggy`/`iggy` root credentials when started with `--with-default-root-credentials` (dev-only). Otherwise the operator sets the root password, so a hardcoded default here could never be right and would invite running as root unnoticed |
 | `IGGY_KAFKA_IGGY_STREAM` | `kafka` | Default Iggy stream for a Kafka topic with no explicit mapping override |
@@ -596,7 +596,8 @@ The initial connect retries a fixed, bounded number of times (`RECONNECTION_RETR
 Iggy SDK client's own default of unlimited retries, one dial per second, forever), and the whole
 attempt - retries included - is capped at `REQUEST_TIMEOUT` (15s) wall-clock, so `IggyBridge::connect`
 fails in bounded time whether the address refuses the connection or silently drops it, instead of
-blocking the calling task indefinitely. Every other bridge call (`ensure_stream_and_topic`,
+blocking the calling task indefinitely. Each of those tries dials every address of
+`IGGY_KAFKA_IGGY_ADDR` in turn. Every other bridge call (`ensure_stream_and_topic`,
 `high_watermark(s)`, `probe`, `close`) carries the same `REQUEST_TIMEOUT` for the same
 reason: the SDK reconnects internally, mid-call, on a transport error, through the same
 undead-lined dial path - a bridge call made well after the initial connect can still hit this if

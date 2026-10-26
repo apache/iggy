@@ -96,7 +96,7 @@ impl QuicClient {
                 endpoint: OnceCell::new(),
                 client_config,
             },
-            config.server_address.clone(),
+            vec![config.server_address.clone()],
             ReconnectPolicy::from(&config.reconnection),
             session,
         );

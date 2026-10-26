@@ -38,7 +38,8 @@ impl TcpClientConfigBuilder {
         TcpClientConfigBuilder::default()
     }
 
-    /// Sets the server address for the TCP client.
+    /// Sets the server address for the TCP client, or a comma-separated list of the addresses of
+    /// several nodes of one cluster.
     pub fn with_server_address(mut self, server_address: String) -> Self {
         self.config.server_address = server_address;
         self
@@ -112,8 +113,11 @@ impl TcpClientConfigBuilder {
 
     /// Builds the TCP client configuration.
     pub fn build(mut self) -> Result<TcpClientConfig, IggyError> {
-        self.config.server_address = self.config.server_address.trim().to_owned();
-        validate_server_address(&self.config.server_address)?;
+        let addresses = self.config.server_addresses();
+        for address in &addresses {
+            validate_server_address(address)?;
+        }
+        self.config.server_address = addresses.join(",");
 
         Ok(self.config)
     }
@@ -149,6 +153,31 @@ mod tests {
             builder.build(),
             Err(IggyError::InvalidIpAddress(_, _))
         ));
+    }
+
+    #[test]
+    fn list_of_addresses_should_succeed_with_each_trimmed() {
+        let config = builder_with_address(" 10.0.0.1:8090 , [::1]:8090,node-3:8090 ")
+            .build()
+            .unwrap();
+        assert_eq!(
+            config.server_address,
+            "10.0.0.1:8090,[::1]:8090,node-3:8090"
+        );
+        assert_eq!(
+            config.server_addresses(),
+            ["10.0.0.1:8090", "[::1]:8090", "node-3:8090"]
+        );
+    }
+
+    #[test]
+    fn list_with_an_empty_address_should_fail() {
+        for addresses in ["10.0.0.1:8090,,node-3:8090", "10.0.0.1:8090,"] {
+            assert!(
+                builder_with_address(addresses).build().is_err(),
+                "{addresses}"
+            );
+        }
     }
 
     #[test]

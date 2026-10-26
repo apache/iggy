@@ -349,13 +349,18 @@ async fn start_bridged_gateway_with(
     topics: &[(&str, u32)],
     gateway_config: GatewayConfig,
 ) -> BridgedGateway {
-    start_gateway(server, topics, false, gateway_config).await
+    start_gateway(&server.address, topics, false, gateway_config).await
 }
 
 /// A bridge to `server` as the root user, with the default topic mapping.
 async fn root_bridge(server: &TestServer) -> IggyBridge {
+    root_bridge_at(&server.address).await
+}
+
+/// [`root_bridge`] for `IGGY_KAFKA_IGGY_ADDR` set to `iggy_address`.
+async fn root_bridge_at(iggy_address: &str) -> IggyBridge {
     let config = IggyBridgeConfig {
-        address: server.address.clone(),
+        address: iggy_address.to_owned(),
         username: ROOT_USER.to_string(),
         password: SecretString::from(ROOT_PASSWORD.to_string()),
         topic_mapping: TopicMapping::new("kafka".to_string(), HashMap::new())
@@ -369,15 +374,16 @@ async fn root_bridge(server: &TestServer) -> IggyBridge {
         .expect("the bridge connects to a ready server")
 }
 
-/// A bridged gateway on `gateway_config`, with SASL on when `sasl` is set, creating each
-/// `(topic, partitions)` first. Its listeners are replaced by one on an ephemeral port.
+/// A gateway bridged to `iggy_address` on `gateway_config`, with SASL on when `sasl` is set,
+/// creating each `(topic, partitions)` first. Its listeners are replaced by one on an ephemeral
+/// port.
 async fn start_gateway(
-    server: &TestServer,
+    iggy_address: &str,
     topics: &[(&str, u32)],
     sasl: bool,
     gateway_config: GatewayConfig,
 ) -> BridgedGateway {
-    let bridge = root_bridge(server).await;
+    let bridge = root_bridge_at(iggy_address).await;
     for &(topic, partitions) in topics {
         bridge
             .ensure_stream_and_topic(topic, partitions)
@@ -395,7 +401,7 @@ async fn start_gateway(
     let mut gateway = KafkaGateway::new(gateway_config).with_bridge(Some(Arc::new(bridge)));
     if sasl {
         gateway =
-            gateway.with_authenticator(Arc::new(IggyAuthenticator::new(server.address.clone())));
+            gateway.with_authenticator(Arc::new(IggyAuthenticator::new(iggy_address.to_owned())));
     }
     let (shutdown, receiver) = broadcast::channel(1);
     let task = tokio::spawn(async move {
@@ -719,7 +725,13 @@ async fn bridged_stack() -> Option<(TestServer, SocketAddr)> {
 /// serves it.
 async fn sasl_bridged_stack() -> Option<(TestServer, SocketAddr)> {
     let server = ready_server()?;
-    let gateway = start_gateway(&server, &[(TOPIC, 1)], true, GatewayConfig::default()).await;
+    let gateway = start_gateway(
+        &server.address,
+        &[(TOPIC, 1)],
+        true,
+        GatewayConfig::default(),
+    )
+    .await;
     // Held for the test's lifetime: dropping the sender shuts the gateway down mid-exchange.
     std::mem::forget(gateway.shutdown);
     Some((server, gateway.addr))
@@ -1389,6 +1401,22 @@ async fn given_sasl_and_the_bridge_when_kcat_produces_and_consumes_should_read_b
     let auth = sasl_plain_args(ROOT_USER, ROOT_PASSWORD);
     kcat_produce(gateway, TOPIC, 0, &RECORDS, &auth).expect_ran("kcat produce over SASL");
     let output = kcat_consume(gateway, &auth).expect_ran("kcat consume over SASL");
+    assert_read_in_order(&output, &RECORDS);
+}
+
+/// `IGGY_KAFKA_IGGY_ADDR` can list several Iggy nodes. With the first one stopped, the bridge, each
+/// SASL login and each new producer start on the next one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_a_stopped_first_iggy_node_when_kcat_signs_in_and_produces_should_use_the_next_one() {
+    let Some(server) = ready_server() else {
+        return;
+    };
+    // Nothing listens on a released port, so a connect to it is refused at once.
+    let iggy_address = format!("127.0.0.1:{},{}", free_port(), server.address);
+    let gateway = start_gateway(&iggy_address, &[(TOPIC, 1)], true, GatewayConfig::default()).await;
+    let auth = sasl_plain_args(ROOT_USER, ROOT_PASSWORD);
+    kcat_produce(gateway.addr, TOPIC, 0, &RECORDS, &auth).expect_ran("kcat produce over SASL");
+    let output = kcat_consume(gateway.addr, &auth).expect_ran("kcat consume over SASL");
     assert_read_in_order(&output, &RECORDS);
 }
 

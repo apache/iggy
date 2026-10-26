@@ -27,7 +27,7 @@ Official Rust client SDK for [Apache Iggy](https://iggy.apache.org), the persist
 
 - **Transports**: TCP (custom binary), QUIC, HTTP, WebSocket. One unified `IggyClient` API across all four.
 - **TLS**: TCP and WebSocket expose TLS connection-string options; QUIC always uses TLS; HTTP uses an HTTPS URL configured through the builder.
-- **Connection strings**: `iggy://` (TCP default), `iggy+tcp://`, `iggy+quic://`, `iggy+http://`, `iggy+ws://`. Binary transports apply credentials on `connect()`; HTTP requires an explicit login. Option keys and reconnection support differ by transport.
+- **Connection strings**: `iggy://` (TCP default), `iggy+tcp://`, `iggy+quic://`, `iggy+http://`, `iggy+ws://`. Binary transports apply credentials on `connect()`; HTTP requires an explicit login. Option keys and reconnection support differ by transport. A TCP client can list several nodes of one cluster, separated by commas, as in `iggy://iggy:iggy@node-1:8090,node-2:8090`: a new client tries each in order, then the nodes of the last roster that it read.
 - **Authentication**: username/password and Personal Access Tokens (PAT).
 - **Async, non-blocking** client built on Tokio with custom zero-copy (de)serialization.
 - **High-level builders** on `IggyClient`: `producer(stream, topic)`, `consumer(name, stream, topic, partition)`, and `consumer_group(name, stream, topic)`.

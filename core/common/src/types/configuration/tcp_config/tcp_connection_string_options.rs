@@ -59,6 +59,8 @@ impl TcpConnectionStringOptions {
 }
 
 impl ConnectionStringOptions for TcpConnectionStringOptions {
+    const ADDRESS_LIST: bool = true;
+
     fn retries(&self) -> Option<u32> {
         self.reconnection.max_retries
     }

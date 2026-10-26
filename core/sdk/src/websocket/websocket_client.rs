@@ -73,7 +73,7 @@ impl WebSocketClient {
         ));
         let links = ReplicaLinks::new(
             Dialer::WebSocket(Arc::clone(&config)),
-            config.server_address.clone(),
+            vec![config.server_address.clone()],
             ReconnectPolicy::from(&config.reconnection),
             session,
         );
