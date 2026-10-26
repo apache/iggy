@@ -77,7 +77,7 @@ func TestCreatePersonalAccessTokenMarshalBinary(t *testing.T) {
 				t.Fatal(err)
 			}
 			if !bytes.Equal(got, test.want) {
-				t.Fatalf("CreatePersonalAccessToken body = %v, want %v", got, test.want)
+				t.Fatalf("CreatePersonalAccessToken body = %x, want %x", got, test.want)
 			}
 		})
 	}
@@ -106,7 +106,7 @@ func TestGetPersonalAccessTokensMarshalBinary(t *testing.T) {
 				t.Fatal(err)
 			}
 			if !bytes.Equal(got, test.want) {
-				t.Fatalf("GetPersonalAccessTokens body = %v, want %v", got, test.want)
+				t.Fatalf("GetPersonalAccessTokens body = %x, want %x", got, test.want)
 			}
 		})
 	}
@@ -147,7 +147,7 @@ func TestDeletePersonalAccessTokenMarshalBinary(t *testing.T) {
 				t.Fatal(err)
 			}
 			if !bytes.Equal(got, test.want) {
-				t.Fatalf("DeletePersonalAccessToken body = %v, want %v", got, test.want)
+				t.Fatalf("DeletePersonalAccessToken body = %x, want %x", got, test.want)
 			}
 		})
 	}
