@@ -341,6 +341,13 @@ hold both lanes; an unresolved store or delete blocks later progress until it is
 resolved or abandoned. Different consumers on one partition still share the
 progress lane.
 
+A parked progress poll holds the progress lane of its partition for up to
+`max_wait`. Offset reads, stores and deletes of the same client on that
+partition wait for it. Each of these calls waits for at most the 30-second
+operation timeout. If the poll holds the lane longer, the call fails with
+`TransientNotAccepted`. The client did not send the call, so it is safe to
+retry.
+
 HTTP uses `GET /streams/{stream}/topics/{topic}/messages/deferred` with the ordinary
 poll fields plus `wait_us`, `min_count`, `max_bytes` and `request_timeout_us`.
 Omitted options use the SDK defaults. Binary command 106 carries the same
