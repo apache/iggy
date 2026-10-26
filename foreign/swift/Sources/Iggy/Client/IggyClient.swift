@@ -267,6 +267,11 @@ public final class IggyClient: Sendable {
         return captured
     }
 
+    /// Whether the client comes back on its own after an outage.
+    var canRecover: Bool {
+        get async { await core.canRecover }
+    }
+
     /// The lineage a call that starts now runs under.
     var operationLineage: UInt64 {
         get async { await core.lineage }

@@ -383,6 +383,19 @@ actor ClientCore {
         try VSRFrame.encodeRequest(session: &session, code: code, payload: payload, partitionContext: context)
     }
 
+    /// Whether the client comes back on its own: it is signed in, or a
+    /// request or the heartbeat reconnects and signs it in again. A client
+    /// that is shut down, that the caller disconnected, or that has no
+    /// reconnection or no credentials only comes back when the caller acts.
+    var canRecover: Bool {
+        switch state {
+        case .shutdown: false
+        case .authenticated: true
+        case .disconnected, .connecting, .connected, .authenticating:
+            !disconnectedByCaller && configuration.reconnection.enabled && signInCredentials() != nil
+        }
+    }
+
     /// The refusal of a call that started under `captured` once the caller
     /// signed in or out since: nothing of it may be written any more.
     func lineageRefusal(_ captured: UInt64, code: UInt32? = nil) -> IggyError? {
