@@ -359,7 +359,10 @@ reservation first, it stops there. It returns what it read, even below
 `min_count`. Configure
 `sharding.deferred_poll_*` accordingly. The response cap is applied to the selected
 result; it does not cap all storage work. Capacity refusal returns
-`DeferredPollCapacityExceeded` (90); clients back off on the same route. A
+`DeferredPollCapacityExceeded` (90); clients back off on the same route. Over
+HTTP, a partition primary with no free relay slot refuses a relayed deferred poll
+with the same code. If the caller's credential holds its whole share of slots,
+the status is 429. In all other cases, it is 503. A
 high-level consumer whose poll is still refused when its request timeout ends
 returns the error to the application and polls that partition again after
 `polling_retry_interval`. A replica

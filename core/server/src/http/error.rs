@@ -388,7 +388,12 @@ fn not_accepted_response(code: &str, reason: &str) -> Response {
     ))
 }
 
-fn coded_error_response(status: StatusCode, id: u32, code: &str, reason: &str) -> Response {
+pub(in crate::http) fn coded_error_response(
+    status: StatusCode,
+    id: u32,
+    code: &str,
+    reason: &str,
+) -> Response {
     (
         status,
         Json(ErrorResponse {
