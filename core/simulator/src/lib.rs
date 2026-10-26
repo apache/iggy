@@ -2222,6 +2222,9 @@ fn stamp_metadata_watermark(
 }
 
 #[cfg(test)]
+mod slow_replica_tests;
+
+#[cfg(test)]
 mod stale_prepare_commit_tests;
 
 #[cfg(test)]
