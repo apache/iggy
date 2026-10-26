@@ -12,6 +12,7 @@ Source connectors are responsible for ingesting data from external sources into 
 | **http_source** | Webhook gateway: an embedded HTTP server shared by every instance, with per-endpoint bearer/HMAC auth and a management API for endpoints registered at runtime |
 | **influxdb_source** | Polls InfluxDB with cursor-based timestamp tracking; supports V2 (Flux, annotated CSV) and V3 (SQL, JSONL) |
 | **mqtt_source** | Subscribes to MQTT 3.1.1 or MQTT 5 brokers with QoS 0, 1, or 2 |
+| **mssql_source** | Streams SQL Server change data capture (CDC) events in commit order across tables |
 | **postgres_source** | Reads rows from PostgreSQL tables with multiple strategies: delete after read, mark as processed, or timestamp tracking |
 | **random_source** | Generates random test messages (useful for testing and development) |
 
