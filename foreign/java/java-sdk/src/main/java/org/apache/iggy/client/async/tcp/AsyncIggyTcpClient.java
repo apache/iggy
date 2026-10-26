@@ -414,22 +414,30 @@ public class AsyncIggyTcpClient {
      * Sends a command code and payload and returns the raw response payload.
      *
      * <p>Session-control codes complete the returned future with an invalid-command error.
+     * So does CancelDeferredRequest, because a cancel names a pending request by its
+     * id and the server answers no cancel. WaitForMessages completes it with a
+     * feature-unavailable error, because this client does not route readiness waits.
+     * None of them is sent.
      *
-     * <p>SendMessages, PollMessages, StoreConsumerOffset and DeleteConsumerOffset
-     * carry the partition context the server fences them by, which the client
-     * captures before it sends them. A SendMessages payload must name an explicit
-     * partition id: balanced and messages-key partitioning complete the future
-     * with a feature-unavailable error, because only the typed
+     * <p>SendMessages, PollMessages, deferred polls, StoreConsumerOffset and
+     * DeleteConsumerOffset carry the partition context the server fences them by,
+     * which the client captures before it sends them. A SendMessages payload must
+     * name an explicit partition id: balanced and messages-key partitioning
+     * complete the future with a feature-unavailable error, because only the typed
      * {@link MessagesClient#sendMessages} resolves them to a partition. A payload
-     * of these commands that does not follow their binary layout completes the
-     * future with an {@link org.apache.iggy.exception.IggyInvalidArgumentException}.
-     * Neither failure sends anything.
+     * of these commands that does not follow their binary layout, or a deferred
+     * poll with limits that {@link org.apache.iggy.message.DeferredPollOptions}
+     * refuses, completes the future with an
+     * {@link org.apache.iggy.exception.IggyInvalidArgumentException}. Neither
+     * failure sends anything.
      *
-     * <p>PollMessages takes the routed path of a typed poll, and StoreConsumerOffset
-     * and DeleteConsumerOffset that of a typed offset write. Each uses the context
-     * its route reports, so after another client deleted and recreated the
-     * partition, one call can fail with code 87 (5009 for a consumer group). The
-     * failed route is dropped and the next call routes again.
+     * <p>PollMessages and deferred polls take the routed path of a typed poll, and
+     * StoreConsumerOffset and DeleteConsumerOffset that of a typed offset write.
+     * Each uses the context its route reports, so after another client deleted and
+     * recreated the partition, one call can fail with code 87 (5009 for a consumer
+     * group). The failed route is dropped and the next call routes again. As for a
+     * typed deferred poll, the request timeout in a deferred poll's payload sets
+     * its deadline.
      *
      * <p>The future completes on the client event loop, as the callbacks section of this class says.
      *

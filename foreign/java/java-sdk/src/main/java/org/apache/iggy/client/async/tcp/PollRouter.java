@@ -41,6 +41,7 @@ import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.exception.IggyTimeoutException;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.DeferredPollOptions;
 import org.apache.iggy.message.PollingKind;
 import org.apache.iggy.partition.PartitionContext;
 import org.apache.iggy.partition.PartitionRoute;
@@ -50,6 +51,7 @@ import org.apache.iggy.serde.CommandCode;
 
 import java.io.IOException;
 import java.time.Duration;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -78,11 +80,11 @@ import java.util.function.Supplier;
  */
 final class PollRouter {
     static final int POLL_PARAMETERS_BYTES = 14;
+    static final int DEFERRED_PARAMETERS_BYTES = 2 * Long.BYTES + 2 * Integer.BYTES;
 
     static final Duration POLL_TIMEOUT = Duration.ofSeconds(30);
     static final int MAX_CONCURRENT_DIALS = 4;
     private static final int MAX_DEFERRED_POLLS = 64;
-    private static final int DEFERRED_PARAMETERS_BYTES = 2 * Long.BYTES + 2 * Integer.BYTES;
 
     private static final int MAX_ROUTES = 4096;
     private static final int MAX_CONNECTIONS = 256;
@@ -569,6 +571,16 @@ final class PollRouter {
         } finally {
             payload.release();
         }
+    }
+
+    /** The limits that end a deferred poll request or frame, checked by the {@link DeferredPollOptions} constructor. */
+    static DeferredPollOptions deferredOptions(ByteBuf request) {
+        int parameters = request.writerIndex() - DEFERRED_PARAMETERS_BYTES;
+        return new DeferredPollOptions(
+                Duration.of(request.getLongLE(parameters), ChronoUnit.MICROS),
+                request.getUnsignedIntLE(parameters + Long.BYTES),
+                request.getUnsignedIntLE(parameters + Long.BYTES + Integer.BYTES),
+                Duration.of(request.getLongLE(parameters + Long.BYTES + 2 * Integer.BYTES), ChronoUnit.MICROS));
     }
 
     ConsensusSession sessionOwner() {

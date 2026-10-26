@@ -29,6 +29,7 @@ import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.DeferredPollOptions;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PollingStrategy;
@@ -40,6 +41,8 @@ import java.math.BigInteger;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.List;
@@ -77,6 +80,9 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class AsyncIggyTcpClientRawRequestTest {
     private static final int SEND_CODE = 101;
     private static final int GET_PARTITION_ROUTE_CODE = 105;
+    private static final int POLL_DEFERRED_CODE = 106;
+    private static final int WAIT_FOR_MESSAGES_CODE = 107;
+    private static final int CANCEL_DEFERRED_REQUEST_CODE = 108;
     private static final int STORE_OFFSET_CODE = 121;
     private static final int DELETE_OFFSET_CODE = 122;
     private static final int GET_OFFSET_ROUTING_CODE = 105;
@@ -94,6 +100,7 @@ class AsyncIggyTcpClientRawRequestTest {
     private static final long METADATA_OP = 7;
     private static final StreamId STREAM = StreamId.of(1L);
     private static final TopicId TOPIC = TopicId.of(2L);
+    private static final DeferredPollOptions DEFERRED = DeferredPollOptions.defaults();
     // Replicated commands travel under their operation and carry no command code.
     private static final Map<Integer, Integer> REPLICATED_CODES = Map.of(
             OPERATION_SEND_MESSAGES, SEND_CODE,
@@ -367,6 +374,37 @@ class AsyncIggyTcpClientRawRequestTest {
     }
 
     @Test
+    void shouldRouteRawDeferredPollsLikeTypedDeferredPolls() throws Exception {
+        assertRawRequests(request -> null, (client, requests) -> {
+            client.sendBinaryRequest(
+                            POLL_DEFERRED_CODE,
+                            deferred(rawPoll(), DEFERRED.minCount(), DEFERRED.requestTimeoutMicros()))
+                    .get(5, TimeUnit.SECONDS);
+
+            assertThat(requests)
+                    .extracting(AsyncIggyTcpClientRawRequestTest::code)
+                    .containsExactly(GET_PARTITION_ROUTE_CODE, POLL_DEFERRED_CODE);
+            assertCapturedContext(List.of(requests.get(1)));
+            // The budget counts down from the request timeout in the payload, so routing time comes off it.
+            ByteBuffer body = ByteBuffer.wrap(requests.get(1).body()).order(ByteOrder.LITTLE_ENDIAN);
+            assertThat(body.getLong(body.limit() - Long.BYTES))
+                    .isLessThan(DEFERRED.requestTimeoutMicros())
+                    .isGreaterThan(DEFERRED.requestTimeoutMicros() / 2);
+        });
+    }
+
+    @Test
+    void shouldRefuseRawReadinessWaitsAndDeferredCancelsWithoutSendingThem() throws Exception {
+        assertRawRequests(request -> null, (client, requests) -> {
+            CompletableFuture<byte[]> wait = client.sendBinaryRequest(WAIT_FOR_MESSAGES_CODE, new byte[0]);
+            assertServerError(wait, FEATURE_UNAVAILABLE);
+            assertThatThrownBy(wait::join).rootCause().hasMessageContaining("readiness waits");
+            assertServerError(client.sendBinaryRequest(CANCEL_DEFERRED_REQUEST_CODE, new byte[0]), INVALID_COMMAND);
+            assertThat(requests).isEmpty();
+        });
+    }
+
+    @Test
     void shouldRouteRawOffsetWritesLikeTypedOffsetWrites() throws Exception {
         assertRawRequests(request -> null, (client, requests) -> {
             client.sendBinaryRequest(STORE_OFFSET_CODE, rawStoreOffset()).get(5, TimeUnit.SECONDS);
@@ -425,6 +463,8 @@ class AsyncIggyTcpClientRawRequestTest {
             byte[] delete = rawDeleteOffset();
             delete[bytes(offsetTarget()).length - OPTIONAL_PARTITION_BYTES] = 0;
             assertMalformed(client.sendBinaryRequest(POLL_CODE, groupPoll));
+            assertMalformed(client.sendBinaryRequest(
+                    POLL_DEFERRED_CODE, deferred(groupPoll, DEFERRED.minCount(), DEFERRED.requestTimeoutMicros())));
             assertMalformed(client.sendBinaryRequest(STORE_OFFSET_CODE, store));
             assertMalformed(client.sendBinaryRequest(DELETE_OFFSET_CODE, delete));
             assertThat(requests).isEmpty();
@@ -456,6 +496,11 @@ class AsyncIggyTcpClientRawRequestTest {
             badIdentifier[Integer.BYTES + 1] = 5;
             assertMalformed(client.sendBinaryRequest(SEND_CODE, badIdentifier));
             assertMalformed(client.sendBinaryRequest(POLL_CODE, Arrays.copyOf(poll, poll.length - 1)));
+            // No deferred limits, a minimum above the poll's count of one, and no request budget.
+            assertMalformed(client.sendBinaryRequest(POLL_DEFERRED_CODE, poll));
+            assertMalformed(client.sendBinaryRequest(
+                    POLL_DEFERRED_CODE, deferred(poll, DEFERRED.minCount() + 1, DEFERRED.requestTimeoutMicros())));
+            assertMalformed(client.sendBinaryRequest(POLL_DEFERRED_CODE, deferred(poll, DEFERRED.minCount(), 0)));
             assertMalformed(client.sendBinaryRequest(STORE_OFFSET_CODE, bytes(offsetTarget())));
             assertMalformed(client.sendBinaryRequest(DELETE_OFFSET_CODE, Arrays.copyOf(delete, delete.length + 1)));
             assertMalformed(client.sendBinaryRequest(STORE_OFFSET_CODE, Arrays.copyOf(store, 2)));
@@ -589,7 +634,7 @@ class AsyncIggyTcpClientRawRequestTest {
                                 .writeByte(0));
             case GET_OFFSET_CODE -> Response.success(OPERATION_NON_REPLICATED, Unpooled.EMPTY_BUFFER);
             case SEND_CODE -> Response.success(OPERATION_SEND_MESSAGES, Unpooled.EMPTY_BUFFER);
-            case POLL_CODE -> Response.success(OPERATION_NON_REPLICATED, emptyPoll(0));
+            case POLL_CODE, POLL_DEFERRED_CODE -> Response.success(OPERATION_NON_REPLICATED, emptyPoll(0));
             case STORE_OFFSET_CODE, DELETE_OFFSET_CODE ->
                 Response.success(request.operation(), Unpooled.buffer().writeIntLE(0));
             default -> Response.error(request.operation(), INVALID_COMMAND);
@@ -634,6 +679,16 @@ class AsyncIggyTcpClientRawRequestTest {
         payload.writeIntLE(1);
         payload.writeByte(0);
         return bytes(payload);
+    }
+
+    private static byte[] deferred(byte[] poll, long minCount, long requestTimeoutMicros) {
+        return bytes(
+                Unpooled.wrappedBuffer(poll),
+                Unpooled.buffer()
+                        .writeLongLE(DEFERRED.maxWaitMicros())
+                        .writeIntLE((int) minCount)
+                        .writeIntLE((int) DEFERRED.maxBytes())
+                        .writeLongLE(requestTimeoutMicros));
     }
 
     static byte[] rawStoreOffset() {

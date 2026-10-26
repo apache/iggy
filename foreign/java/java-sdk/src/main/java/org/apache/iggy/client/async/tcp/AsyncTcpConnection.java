@@ -59,7 +59,6 @@ import org.apache.iggy.exception.IggyOperationException;
 import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.exception.IggyTimeoutException;
 import org.apache.iggy.exception.IggyTlsException;
-import org.apache.iggy.message.DeferredPollOptions;
 import org.apache.iggy.partition.PartitionContext;
 import org.apache.iggy.serde.CommandCode;
 import org.slf4j.Logger;
@@ -68,7 +67,6 @@ import org.slf4j.LoggerFactory;
 import javax.net.ssl.SSLException;
 import java.io.File;
 import java.time.Duration;
-import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -116,7 +114,6 @@ public class AsyncTcpConnection {
     private static final int UNAUTHENTICATED = 40;
     private static final int LIFECYCLE_BUSY = 88;
     private static final int REGISTER_RESPONSE_MIN_BYTES = 17;
-    private static final int DEFERRED_PARAMETERS_BYTES = 2 * Long.BYTES + 2 * Integer.BYTES;
     private static final Logger log = LoggerFactory.getLogger(AsyncTcpConnection.class);
     private static final Duration DEFAULT_CONNECTION_TIMEOUT = Duration.ofMillis(3000);
     // A missing reply must not hold the single VSR-pinned channel forever.
@@ -1282,12 +1279,8 @@ public class AsyncTcpConnection {
         if (exchange.commandCode() != CommandCode.Messages.POLL_DEFERRED.getValue()) {
             return retainedFrame;
         }
-        int parameters = retainedFrame.writerIndex() - DEFERRED_PARAMETERS_BYTES;
-        var options = new DeferredPollOptions(
-                Duration.of(retainedFrame.getLongLE(parameters), ChronoUnit.MICROS),
-                retainedFrame.getUnsignedIntLE(parameters + Long.BYTES),
-                retainedFrame.getUnsignedIntLE(parameters + Long.BYTES + Integer.BYTES),
-                Duration.of(retainedFrame.getLongLE(retainedFrame.writerIndex() - Long.BYTES), ChronoUnit.MICROS));
+        int parameters = retainedFrame.writerIndex() - PollRouter.DEFERRED_PARAMETERS_BYTES;
+        var options = PollRouter.deferredOptions(retainedFrame);
         var remaining = options.remaining(
                 options.requestTimeout().minusNanos(exchange.requestDeadlineNanos() - System.nanoTime()));
         if (remaining.isEmpty()) {
