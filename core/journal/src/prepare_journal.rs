@@ -22,7 +22,7 @@ use futures::channel::oneshot;
 use futures::lock::{Mutex, OwnedMutexGuard};
 use iggy_binary_protocol::consensus::{CHECKSUM_UNSEALED, Command, PrepareHeader};
 use server_common::fatal::NoteDescriptorExhaustion;
-use server_common::{MESSAGE_ALIGN, Message, iobuf::Owned};
+use server_common::{DISK_USAGE, MESSAGE_ALIGN, Message, iobuf::Owned};
 use std::cell::{Cell, OnceCell, Ref, RefCell};
 use std::fmt;
 use std::io::{self, Read};
@@ -960,7 +960,9 @@ impl PrepareJournal {
                 let size = header.size as usize;
                 let buf = vec![0u8; size];
                 let buf = self.storage.read_at(*old_offset, buf).await?;
+                let charge = DISK_USAGE.charge(size as u64);
                 let (result, _buf) = tmp.write_all_at(buf, write_pos).await.into();
+                drop(charge);
                 result?;
                 write_pos += size as u64;
             }

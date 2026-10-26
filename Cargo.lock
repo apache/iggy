@@ -8119,6 +8119,7 @@ dependencies = [
  "deltalake",
  "dtor 1.0.6",
  "figment",
+ "fs2",
  "futures",
  "harness_derive",
  "hex",

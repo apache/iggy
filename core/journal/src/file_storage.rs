@@ -18,6 +18,7 @@
 use crate::Storage;
 use compio::buf::IoBuf;
 use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
+use server_common::DISK_USAGE;
 use server_common::fatal::NoteDescriptorExhaustion;
 use server_common::fs_utils::truncate_file;
 use std::cell::{Cell, UnsafeCell};
@@ -126,7 +127,9 @@ impl FileStorage {
         self.write_offset.set(offset + len);
         // SAFETY: single-threaded compio runtime, no concurrent access to the file.
         let file = unsafe { &mut *self.file.get() };
+        let charge = DISK_USAGE.charge(len);
         let (result, _buf) = file.write_all_at(buf, offset).await.into();
+        drop(charge);
         if let Err(error) = result {
             if self.write_offset.get() == offset + len {
                 self.write_offset.set(offset);
