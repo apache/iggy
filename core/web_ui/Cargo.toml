@@ -31,11 +31,14 @@ base64 = { workspace = true }
 chrono = { workspace = true }
 dioxus = { workspace = true }
 gloo-net = { workspace = true }
-gloo-storage = { workspace = true }
 js-sys = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+web-sys = { workspace = true, features = ["Storage"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+iggy_common = { workspace = true }
 
 [lints]
 workspace = true

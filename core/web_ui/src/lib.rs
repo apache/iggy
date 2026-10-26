@@ -29,6 +29,7 @@ use crate::pages::{DashboardLayout, Messages, NotFound, SignIn, StreamPage, Stre
 
 const STYLESHEET: Asset = asset!("/assets/main.css");
 const FAVICON: Asset = asset!("/assets/favicon.svg");
+const LOGO: Asset = asset!("/assets/iggy-apache-darkbg.svg");
 
 #[derive(Debug, Clone, PartialEq, Routable)]
 #[rustfmt::skip]
@@ -44,8 +45,8 @@ pub enum Route {
         StreamPage { stream_id: u32 },
         #[route("/dashboard/streams/:stream_id/topics/:topic_id")]
         TopicPage { stream_id: u32, topic_id: u32 },
-        #[route("/dashboard/streams/:stream_id/topics/:topic_id/partitions/:partition_id/messages")]
-        Messages { stream_id: u32, topic_id: u32, partition_id: u32 },
+        #[route("/dashboard/streams/:stream_id/topics/:topic_id/partitions/:partition_id/messages?:offset")]
+        Messages { stream_id: u32, topic_id: u32, partition_id: u32, offset: Option<u64> },
     #[end_layout]
     #[route("/:..segments")]
     NotFound { segments: Vec<String> },

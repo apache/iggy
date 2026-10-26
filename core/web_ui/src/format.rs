@@ -51,13 +51,15 @@ pub fn message_expiry(options: &ResourceOptions) -> String {
 /// Shows the payload as text when it is UTF-8 and as hex otherwise.
 pub fn payload(base64_payload: &str) -> String {
     match STANDARD.decode(base64_payload) {
-        Ok(bytes) => text_or_hex(bytes),
+        Ok(bytes) => String::from_utf8(bytes).unwrap_or_else(|error| hex(error.as_bytes())),
         Err(_) => base64_payload.to_owned(),
     }
 }
 
-/// The first `max_chars` characters of [`payload`], decoding only as much of
-/// the payload as that needs, so a list of large messages stays cheap.
+/// Up to `max_chars` characters of the payload, decoding only as much of it
+/// as that needs, so a list of large messages stays cheap. Text or hex is
+/// picked from the decoded prefix alone, so a payload whose invalid UTF-8
+/// comes later previews as text while [`payload`] shows it as hex.
 pub fn payload_preview(base64_payload: &str, max_chars: usize) -> String {
     // A character is at most 4 bytes of UTF-8, and every 3 bytes take 4
     // base64 characters, so this prefix always holds `max_chars` characters.
@@ -97,10 +99,6 @@ pub fn message_id(id: u128) -> String {
         &hex[16..20],
         &hex[20..]
     )
-}
-
-fn text_or_hex(bytes: Vec<u8>) -> String {
-    String::from_utf8(bytes).unwrap_or_else(|error| hex(error.as_bytes()))
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -158,8 +156,6 @@ mod tests {
             "message_expiry".to_owned(),
             OptionValue {
                 value: micros.to_string(),
-                kind: "uint64".to_owned(),
-                explicit: true,
             },
         )])
     }

@@ -17,11 +17,8 @@
 
 use dioxus::prelude::*;
 
-use crate::Route;
-use crate::auth::Session;
 use crate::components::{api_client, use_session};
-
-const LOGO: Asset = asset!("/assets/iggy-apache-darkbg.svg");
+use crate::{LOGO, Route};
 
 /// Shell for every signed-in page. Without a session it redirects to sign-in.
 #[component]
@@ -41,11 +38,13 @@ pub fn DashboardLayout() -> Element {
     });
 
     let sign_out = move |_| async move {
-        // The token is dropped locally either way, so a failed revoke only
-        // leaves it valid on the server until it expires.
+        // Logout does not revoke the bearer, so the token stays valid on the
+        // server until `expiry` whether or not this call succeeds.
         let _ = api_client(session).logout().await;
-        Session::clear();
-        session.set(None);
+        let signed_out = session.write().take();
+        if let Some(signed_out) = signed_out {
+            signed_out.forget();
+        }
     };
 
     if session.read().is_none() {
