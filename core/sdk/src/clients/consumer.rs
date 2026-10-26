@@ -487,7 +487,12 @@ fn same_incarnation_and_owner(left: PartitionContext, right: PartitionContext) -
 /// until one of its partitions holds a message, with one readiness wait per partition
 /// primary. A batch that the server committed reaches the application even after a
 /// reassignment. After its first batch, a partition continues from an explicit offset,
-/// so only a lost reply to the first `Next` poll of a partition can skip that batch.
+/// so the consumer retries a lost reply from the same offset. If the consumer shuts down
+/// first, [`shutdown`](Self::shutdown) moves the offset back over the messages that the
+/// application did not take, also for a fetch in flight. A lost reply to the first `Next`
+/// poll of a partition can still skip its batch. So can a lost reply whose partition gets
+/// a new owner before the retry. A new session of the client gives every partition a new
+/// owner.
 ///
 /// ```rust,no_run
 /// use futures_util::StreamExt;
@@ -1532,7 +1537,8 @@ impl IggyConsumer {
     /// - finish storing the offsets that are currently in-flight.
     ///   The interval task and the offset store task (see [`init()`](Self::init)) can both have
     ///   commits in flight. The consumer waits for `offset_drain_timeout` on each in turn before
-    ///   forcing it to abort.
+    ///   forcing it to abort. Under auto-commit-on-poll, a fetch in flight first gets the same
+    ///   time to hand its batch over. The store below then moves the offset back over it.
     /// - commit the reading position of every partition where it is ahead of this consumer's own
     ///   record of what it stored, unless [`auto_commit()`] is [`AutoCommit::Disabled`]. Under
     ///   auto-commit-on-poll, the poll admitted progress for the whole batch. This
@@ -1556,8 +1562,11 @@ impl IggyConsumer {
             return Ok(());
         }
 
+        let grace = self
+            .auto_commit_after_polling
+            .then(|| self.offset_drain_timeout.get_duration());
         let undelivered = match self.deferred_polls.take() {
-            Some(polls) => polls.stop().await,
+            Some(polls) => polls.stop(grace).await,
             None => Vec::new(),
         };
         self.buffered_messages.clear();
@@ -3264,6 +3273,177 @@ mod tests {
 
         assert_eq!(result, Ok(Ok(())));
         assert_eq!(*handler.offsets.lock().unwrap(), [OFFSET]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_lost_commit_reply_when_shutdown_comes_before_the_retry_should_store_the_delivered_offset_again()
+     {
+        const DELIVERED: u64 = 4;
+        let (client, cluster) = connect_to_three_replicas().await;
+        let mut consumer = committing_consumer(client).await;
+        record_delivered(&consumer, DELIVERED);
+        cluster.script(
+            &endpoint(PARTITION_PRIMARY),
+            POLL_MESSAGES_DEFERRED_CODE,
+            [
+                Answer::Refuse(IggyError::HistoryUnavailable),
+                Answer::Refuse(IggyError::TransientNotCommitted),
+            ],
+        );
+
+        let refused = poll_once(&mut consumer).await;
+        assert!(
+            matches!(refused, Err(IggyError::HistoryUnavailable)),
+            "{refused:?}"
+        );
+        assert_eq!(
+            consumer.get_last_stored_offset(POLLED_PARTITION),
+            Some(DELIVERED),
+            "a refused poll commits nothing"
+        );
+        let lost = poll_once(&mut consumer).await;
+        assert!(
+            matches!(lost, Err(IggyError::TransientNotCommitted)),
+            "{lost:?}"
+        );
+        consumer.shutdown().await.unwrap();
+
+        assert_eq!(
+            Served(cluster).stored_offsets(),
+            [DELIVERED],
+            "the server can have committed the batch of the lost reply"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_committing_fetch_in_flight_when_shutdown_starts_should_rewind_over_its_batch()
+    {
+        const FIRST: u64 = 5;
+        const REPLY_DELAY: Duration = Duration::from_millis(100);
+        let (client, cluster) = connect_to_three_replicas().await;
+        let mut consumer = committing_consumer(client).await;
+        cluster.hold(POLL_MESSAGES_DEFERRED_CODE);
+        cluster.script(
+            &endpoint(PARTITION_PRIMARY),
+            POLL_MESSAGES_DEFERRED_CODE,
+            [poll_of_one_message(FIRST)],
+        );
+        start_fetch(&mut consumer, &cluster).await;
+        let started = Instant::now();
+
+        let (shut_down, ()) = tokio::join!(consumer.shutdown(), async {
+            sleep(REPLY_DELAY).await;
+            cluster.release(POLL_MESSAGES_DEFERRED_CODE);
+        });
+
+        shut_down.unwrap();
+        assert!(
+            started.elapsed() < consumer.offset_drain_timeout.get_duration(),
+            "the stop ends with the fetch, not with the drain timeout"
+        );
+        assert_eq!(
+            Served(cluster).stored_offsets(),
+            [FIRST - 1],
+            "the server committed a batch that the application never got"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_committing_fetch_that_outlasts_the_drain_timeout_when_shutdown_aborts_it_should_store_the_delivered_offset_again()
+     {
+        const DELIVERED: u64 = 4;
+        let (client, cluster) = connect_to_three_replicas().await;
+        let mut consumer = committing_consumer(client).await;
+        assert!(
+            consumer.offset_drain_timeout.get_duration()
+                < consumer.poll_options.request_timeout.get_duration(),
+            "the drain timeout must end before the poll does"
+        );
+        record_delivered(&consumer, DELIVERED);
+        cluster.script(
+            &endpoint(PARTITION_PRIMARY),
+            POLL_MESSAGES_DEFERRED_CODE,
+            [Answer::Silence],
+        );
+        start_fetch(&mut consumer, &cluster).await;
+
+        consumer.shutdown().await.unwrap();
+
+        assert_eq!(
+            Served(cluster).stored_offsets(),
+            [DELIVERED],
+            "the server can commit the batch of the aborted poll"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn given_a_shutdown_task_on_the_worker_thread_when_it_aborts_a_committing_fetch_should_store_after_the_fetch_drops()
+     {
+        const DELIVERED: u64 = 4;
+        const DRAIN_TIMEOUT: Duration = Duration::from_millis(50);
+        let (client, cluster) = connect_to_three_replicas().await;
+        let mut consumer = committing_consumer(client).await;
+        consumer.offset_drain_timeout = IggyDuration::from(DRAIN_TIMEOUT);
+        record_delivered(&consumer, DELIVERED);
+        cluster.script(
+            &endpoint(PARTITION_PRIMARY),
+            POLL_MESSAGES_DEFERRED_CODE,
+            [Answer::Silence],
+        );
+        start_fetch(&mut consumer, &cluster).await;
+
+        // The only worker thread runs the woken shutdown task before the
+        // aborted fetch task, which drops its future later.
+        let shut_down = tokio::spawn(async move { consumer.shutdown().await }).await;
+
+        assert!(matches!(shut_down, Ok(Ok(()))), "{shut_down:?}");
+        assert_eq!(
+            Served(cluster).stored_offsets(),
+            [DELIVERED],
+            "the server can commit the batch of the aborted poll"
+        );
+    }
+
+    /// Records `offset` of `POLLED_PARTITION` as the last delivered and stored message.
+    fn record_delivered(consumer: &IggyConsumer, offset: u64) {
+        let delivered = position_at(offset, 1);
+        consumer
+            .state
+            .last_consumed_offsets
+            .insert(POLLED_PARTITION, delivered);
+        consumer
+            .state
+            .last_stored_offsets
+            .insert(POLLED_PARTITION, delivered);
+    }
+
+    /// A consumer of `POLLED_PARTITION` whose every poll commits its batch.
+    async fn committing_consumer(client: TcpClient) -> IggyConsumer {
+        let mut consumer = builder_on(client, Consumer::new(Identifier::numeric(1).unwrap()))
+            .partition(Some(POLLED_PARTITION))
+            .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
+            .polling_retry_interval(NonZeroIggyDuration::new(POLL_RETRY_INTERVAL).unwrap())
+            .build();
+        consumer.initialized = true;
+        consumer.events_task = Some(consumer.subscribe_events().await);
+        consumer
+    }
+
+    /// Polls `consumer` until its fetch reaches `cluster`, then leaves that fetch in flight.
+    async fn start_fetch(consumer: &mut IggyConsumer, cluster: &FakeCluster) {
+        let mut poll = Box::pin(poll_once(consumer));
+        timeout(TEST_BUDGET, async {
+            while cluster.count(POLL_MESSAGES_DEFERRED_CODE) == 0 {
+                assert!(
+                    poll.as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(start_paused = true)]

@@ -235,8 +235,9 @@ impl IggyConsumerBuilder {
         }
     }
 
-    /// Sets how long `shutdown()` waits for the background auto-commit tasks to
-    /// drain before leaving the consumer group. 5 seconds by default.
+    /// Sets how long `shutdown()` waits for each background auto-commit task to
+    /// drain before leaving the consumer group. Under auto-commit-on-poll, a fetch
+    /// in flight gets the same time to hand its batch over. 5 seconds by default.
     pub fn offset_drain_timeout(self, timeout: IggyDuration) -> Self {
         Self {
             offset_drain_timeout: timeout,

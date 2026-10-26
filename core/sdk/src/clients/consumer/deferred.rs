@@ -66,6 +66,7 @@ pub(super) struct PrefetchedBatch {
 
 pub(super) struct DeferredPolls {
     receiver: mpsc::Receiver<PrefetchedBatch>,
+    wake: Arc<Notify>,
     task: JoinHandle<()>,
 }
 
@@ -76,6 +77,7 @@ impl DeferredPolls {
         let worker = Worker::new(consumer, sender);
         Self {
             receiver,
+            wake: Arc::clone(&worker.wake),
             task: tokio::spawn(worker.run()),
         }
     }
@@ -96,6 +98,7 @@ impl DeferredPolls {
             .unwrap_or_else(|_| panic!("the test queue is empty"));
         Self {
             receiver,
+            wake: Arc::clone(&worker.wake),
             task: tokio::spawn(async move {
                 worker.wake.notified().await;
                 worker.run().await;
@@ -108,12 +111,27 @@ impl DeferredPolls {
     }
 
     /// Stops fetching and returns the polled batches that the application did not take.
-    pub(super) async fn stop(mut self) -> Vec<PolledMessages> {
-        self.task.abort();
-        // The ended worker sends nothing more, so the drain sees every batch.
-        let _ = (&mut self.task).await;
+    ///
+    /// The server can commit the batch of a committing fetch in flight. With a `grace`, the
+    /// woken worker sees the shutdown flag of the consumer and lets its fetches hand their
+    /// batches over first. After the grace, a fetch still in flight is aborted, and its
+    /// pending commit forgets the stored offset.
+    pub(super) async fn stop(mut self, grace: Option<Duration>) -> Vec<PolledMessages> {
+        let ended = match grace {
+            Some(grace) => {
+                self.wake.notify_one();
+                tokio::time::timeout(grace, &mut self.task).await.is_ok()
+            }
+            None => false,
+        };
+        if !ended {
+            self.task.abort();
+        }
+        // The channel closes once the worker and every pending commit are gone.
+        // The drain then holds every batch, and each aborted fetch already
+        // forgot its stored offset.
         let mut undelivered = Vec::new();
-        while let Ok(batch) = self.receiver.try_recv() {
+        while let Some(batch) = self.receiver.recv().await {
             if let Ok(polled) = batch.result {
                 undelivered.push(polled);
             }
@@ -136,6 +154,45 @@ struct CompletedPoll {
     strategy: PollingStrategy,
     result: Result<PolledMessages, IggyError>,
     capacity: FetchCapacity,
+    /// Set for a fetch that commits its batch.
+    commit: Option<PendingCommit>,
+}
+
+/// The server can commit the batch of a committing fetch whose reply never
+/// reaches the application. Unless the fetch settles, dropping this forgets
+/// the stored offset of its partition. A shutdown then stores the last
+/// delivered message again, which moves the server offset back to it.
+struct PendingCommit {
+    partition: u32,
+    consumed: Arc<DashMap<u32, ConsumerPosition>>,
+    stored: Arc<DashMap<u32, ConsumerPosition>>,
+    /// An aborted worker leaves the drop of a fetch in flight to the task of that
+    /// fetch. Until then, this keeps the batch channel open for `stop` to wait on.
+    _batches: mpsc::Sender<PrefetchedBatch>,
+    settled: bool,
+}
+
+impl PendingCommit {
+    fn settle(mut self) {
+        self.settled = true;
+    }
+}
+
+impl Drop for PendingCommit {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        // A record that differs from the delivered message makes a shutdown
+        // store that message anyway. Such a record can also be an offset that
+        // the application stored to skip a message.
+        let consumed = self
+            .consumed
+            .get(&self.partition)
+            .map(|entry| *entry.value());
+        self.stored
+            .remove_if(&self.partition, |_, stored| consumed == Some(*stored));
+    }
 }
 
 struct CompletedWait {
@@ -206,6 +263,7 @@ struct Worker {
     joined: Arc<std::sync::atomic::AtomicBool>,
     uncertain_group_operation: Arc<tokio::sync::Mutex<Option<u64>>>,
     can_poll: Arc<std::sync::atomic::AtomicBool>,
+    shutdown: Arc<AtomicBool>,
     generation: Arc<AtomicU64>,
     wake: Arc<Notify>,
     strategy: PollingStrategy,
@@ -256,6 +314,7 @@ impl Worker {
             joined: Arc::clone(&consumer.joined_consumer_group),
             uncertain_group_operation: Arc::clone(&consumer.uncertain_consumer_group_operation),
             can_poll: Arc::clone(&consumer.can_poll),
+            shutdown: Arc::clone(&consumer.shutdown),
             generation: Arc::clone(&consumer.fetch_generation),
             wake: Arc::clone(&consumer.fetch_notify),
             strategy: consumer.polling_strategy,
@@ -297,6 +356,10 @@ impl Worker {
         refresh.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             if self.sender.is_closed() {
+                return;
+            }
+            if self.shutdown.load(ORDERING) {
+                self.finish_fetches().await;
                 return;
             }
             if self.epoch != self.generation.load(ORDERING) {
@@ -383,6 +446,14 @@ impl Worker {
                     }
                 }
             }
+        }
+    }
+
+    /// The server can commit the batch of a committing fetch in flight, so the
+    /// worker ends once its fetches hand their batches over. Nothing new starts.
+    async fn finish_fetches(&mut self) {
+        while let Some(Ok(completed)) = self.tasks.join_next().await {
+            self.complete(completed);
         }
     }
 
@@ -781,6 +852,13 @@ impl Worker {
             (self.count, self.options)
         };
         let auto_commit = self.auto_commit;
+        let commit = auto_commit.then(|| PendingCommit {
+            partition,
+            consumed: Arc::clone(&self.consumed),
+            stored: Arc::clone(&self.stored),
+            _batches: self.sender.clone(),
+            settled: false,
+        });
         let encryptor = self.encryptor.clone();
         let epoch = self.epoch;
         self.tasks.spawn(DEFERRED_CONSUMER_CAPACITY.scope(
@@ -829,6 +907,7 @@ impl Worker {
                 strategy,
                 result,
                 capacity,
+                commit,
             }
             },
         ));
@@ -838,6 +917,16 @@ impl Worker {
 
     fn complete(&mut self, mut completed: CompletedPoll) {
         self.active.remove(&completed.partition);
+        // A reply that never arrived can commit a batch that never reaches the
+        // application. So can a reply that the worker drops for holding more
+        // messages than it asked for.
+        if !matches!(
+            completed.result,
+            Err(IggyError::TransientNotCommitted | IggyError::InvalidMessagesCount)
+        ) && let Some(commit) = completed.commit.take()
+        {
+            commit.settle();
+        }
         // A record above `max_bytes` would stall its partition, so the next
         // fetch reads it alone. Only a failure of that fetch is reported.
         if !self.oversized.remove(&completed.partition)
@@ -1175,6 +1264,7 @@ mod tests {
                 strategy: worker.strategy,
                 result: Err(error.clone()),
                 capacity,
+                commit: None,
             });
             assert!(worker.retry_at.contains_key(&0), "the partition retries");
             assert!(
@@ -1318,6 +1408,7 @@ mod tests {
                     strategy: worker.strategy,
                     result: Err(IggyError::InvalidSizeBytes),
                     capacity: worker.reserve().unwrap(),
+                    commit: None,
                 });
                 assert_eq!(worker.oversized.contains(&0), !reported);
                 assert_eq!(worker.retry_at.contains_key(&0), reported);
@@ -1452,6 +1543,7 @@ mod tests {
             strategy: retried,
             result: Err(IggyError::TransientNotCommitted),
             capacity: worker.reserve().unwrap(),
+            commit: None,
         });
         assert!(worker.retry_at.contains_key(&0));
 
@@ -1468,6 +1560,7 @@ mod tests {
             strategy: retried,
             result: Err(IggyError::ConsumerGroupPartitionNotOwned(1, 0)),
             capacity: worker.reserve().unwrap(),
+            commit: None,
         });
         assert!(worker.apply(assigned(&worker, 1, 2, [0])));
         assert_eq!(
@@ -1759,6 +1852,7 @@ mod tests {
                 strategy: PollingStrategy::offset(11),
                 result: Err(error.clone()),
                 capacity: worker.reserve().unwrap(),
+                commit: None,
             });
             assert_eq!(receiver.recv().await.unwrap().result.unwrap_err(), error);
             assert!(!worker.positions.contains_key(&3));
@@ -1780,6 +1874,7 @@ mod tests {
             strategy: PollingStrategy::offset(11),
             result: Err(IggyError::HistoryUnavailable),
             capacity: worker.reserve().unwrap(),
+            commit: None,
         });
         assert!(matches!(
             receiver.recv().await.unwrap().result,
@@ -1853,6 +1948,7 @@ mod tests {
                 messages,
             }),
             capacity: worker.reserve().unwrap(),
+            commit: None,
         }
     }
 }
