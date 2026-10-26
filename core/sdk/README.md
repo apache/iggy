@@ -290,8 +290,11 @@ This default is incompatible with earlier releases. The builder used to commit
 with `AutoCommit::IntervalOrWhen(1s, PollingMessages)`, and `IggyConsumerConfig`
 used `AutoCommit::When(PollingMessages)` with `Last`. Code that relied on those
 defaults must set `auto_commit` explicitly, or each restart reads the same
-messages again. A consumer that delivered messages but stored no offset logs a
-warning at shutdown.
+messages again. `IggyConsumerConfig::with_auto_commit` sets it on a `default` or
+`from_stream_topic` config. A consumer that delivered messages but stored no
+offset logs a warning at shutdown. With `AutoCommit::Disabled` and `Next`,
+`consume_messages` also warns at its start, because its message consumer cannot
+store offsets.
 
 Under `PollingMessages` the server commits every batch that it reads, so the
 consumer does not prefetch. It fetches one batch when the application asks for a

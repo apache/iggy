@@ -222,6 +222,12 @@ impl IggyConsumerConfig {
         self
     }
 
+    /// Sets the auto-commit configuration, which `default` and `from_stream_topic` leave disabled.
+    pub fn with_auto_commit(mut self, auto_commit: AutoCommit) -> Self {
+        self.auto_commit = auto_commit;
+        self
+    }
+
     pub fn stream_name(&self) -> &str {
         &self.stream_name
     }

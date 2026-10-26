@@ -717,6 +717,11 @@ impl IggyConsumer {
         self.auto_commit
     }
 
+    /// Whether the consumer resumes after its stored offsets but never stores one itself.
+    pub(crate) fn relies_on_manual_commits(&self) -> bool {
+        self.auto_commit == AutoCommit::Disabled && self.polling_strategy.kind == PollingKind::Next
+    }
+
     /// Whether the client is up or comes back without the caller.
     pub(crate) async fn client_can_recover(&self) -> bool {
         self.client.read().await.can_recover().await
@@ -1618,8 +1623,7 @@ impl IggyConsumer {
             );
         }
 
-        if self.auto_commit == AutoCommit::Disabled
-            && self.polling_strategy.kind == PollingKind::Next
+        if self.relies_on_manual_commits()
             && self.state.last_stored_offsets.is_empty()
             && !self.state.last_consumed_offsets.is_empty()
         {
@@ -1764,7 +1768,8 @@ mod tests {
         }
     }
 
-    /// Records the offset of each message and stops the consumption after the first one.
+    /// Records the offset of each message. With a `shutdown` sender, it stops the consumption
+    /// after the first one.
     struct RecordMessages {
         offsets: std::sync::Mutex<Vec<u64>>,
         shutdown: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
@@ -3838,6 +3843,70 @@ mod tests {
         .await;
 
         assert_eq!(result, Ok(Err(IggyError::InvalidConfiguration)));
+    }
+
+    #[tokio::test]
+    async fn given_disabled_auto_commit_and_next_when_consuming_callbacks_should_warn_once() {
+        let warnings = consume_three_messages(AutoCommit::Disabled, PollingStrategy::next()).await;
+
+        assert_eq!(
+            warnings.len(),
+            1,
+            "a run warns once, not per message: {warnings:?}"
+        );
+        assert!(warnings[0].contains("never stores offsets"), "{warnings:?}");
+    }
+
+    #[tokio::test]
+    async fn given_auto_commit_or_a_fixed_start_when_consuming_callbacks_should_not_warn() {
+        for (auto_commit, polling_strategy) in [
+            (
+                AutoCommit::When(AutoCommitWhen::PollingMessages),
+                PollingStrategy::next(),
+            ),
+            (AutoCommit::Disabled, PollingStrategy::first()),
+        ] {
+            let warnings = consume_three_messages(auto_commit, polling_strategy).await;
+
+            assert!(
+                warnings.is_empty(),
+                "{auto_commit:?} with {polling_strategy:?}: {warnings:?}"
+            );
+        }
+    }
+
+    /// Runs `consume_messages` over three buffered messages, ends it with a blocked poll, and
+    /// returns the warnings that the run logged.
+    async fn consume_three_messages(
+        auto_commit: AutoCommit,
+        polling_strategy: PollingStrategy,
+    ) -> Vec<String> {
+        const OPERATION: u64 = 42;
+        let mut consumer = builder()
+            .partition(Some(1))
+            .auto_commit(auto_commit)
+            .polling_strategy(polling_strategy)
+            .build();
+        consumer.initialized = true;
+        consumer.buffered_messages =
+            VecDeque::from(vec![message_at(1), message_at(2), message_at(3)]);
+        consumer.deferred_polls = Some(deferred::DeferredPolls::with_error(
+            &consumer,
+            IggyError::LaneBlocked(OPERATION),
+        ));
+        let handler = RecordMessages {
+            offsets: std::sync::Mutex::default(),
+            shutdown: std::sync::Mutex::new(None),
+        };
+        let (_shutdown, receiver) = tokio::sync::oneshot::channel();
+        let recorder = LevelReports::warnings();
+        let _subscriber = tracing::subscriber::set_default(recorder.clone());
+
+        let result = timeout(POLL_TIMEOUT, consumer.consume_messages(&handler, receiver)).await;
+
+        assert_eq!(result, Ok(Err(IggyError::LaneBlocked(OPERATION))));
+        assert_eq!(*handler.offsets.lock().unwrap(), [1, 2, 3]);
+        recorder.events.lock().unwrap().clone()
     }
 
     #[tokio::test]
