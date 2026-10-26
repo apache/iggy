@@ -3582,34 +3582,7 @@ mod tests {
         let config = Arc::new(config);
         let drain = Rc::new(ClientDrain::new(&config));
         let held = drain.admit(Admission::Cap).await;
-        let poll = DeferredPollMessagesRequest {
-            poll: PollMessagesRequest {
-                consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
-                stream_id: WireIdentifier::numeric(0),
-                topic_id: WireIdentifier::numeric(0),
-                partition_id: Some(0),
-                strategy: WirePollingStrategy::offset(0),
-                count: 1,
-                auto_commit: false,
-            },
-            wait_us: 1,
-            min_count: 1,
-            max_bytes: u32::try_from(MIN_DEFERRED_POLL_MAX_BYTES).unwrap(),
-            request_timeout_us: 1 + MIN_DEFERRED_POLL_REPLY_MARGIN_US,
-        }
-        .to_bytes();
-        let mut message = wire_request(
-            Operation::NonReplicated,
-            ROOT_CLIENT,
-            ROOT_SESSION,
-            1,
-            &poll,
-        );
-        bytemuck::checked::from_bytes_mut::<RequestHeader>(
-            &mut message.as_mut_slice()[..size_of::<RequestHeader>()],
-        )
-        .reserved[..4]
-            .copy_from_slice(&POLL_MESSAGES_DEFERRED_CODE.to_le_bytes());
+        let message = root_deferred_poll(1, false);
         let mut queue = ClientRequestQueue::default();
         queue.push_back(QueuedClientRequest::new(
             ClientOrigin::capture(&bus, ROOT_TRANSPORT),
@@ -3637,6 +3610,160 @@ mod tests {
         drop(held);
         let _ = futures::poll!(running.as_mut());
         assert_eq!(queued(), 0, "room under the cap admits it");
+    }
+
+    #[compio::test]
+    async fn given_a_queued_deferred_poll_when_its_cancel_arrives_should_drop_it_before_admission()
+    {
+        assert_cancel_of_queued_deferred_poll(true).await;
+    }
+
+    #[compio::test]
+    async fn given_a_queued_deferred_poll_when_a_cancel_names_another_request_should_still_admit_it()
+     {
+        assert_cancel_of_queued_deferred_poll(false).await;
+    }
+
+    /// Queues an auto-commit deferred poll behind a drain whose only place
+    /// under the cap is taken, then sends a cancellation the way the transport
+    /// does. A poll admitted after its own cancellation would park and commit
+    /// with nothing left to abort it, so only that cancellation may keep it
+    /// from its owner.
+    async fn assert_cancel_of_queued_deferred_poll(cancel_names_the_poll: bool) {
+        const POLL_REQUEST: u64 = 3;
+        let cancelled = if cancel_names_the_poll {
+            POLL_REQUEST
+        } else {
+            POLL_REQUEST + 1
+        };
+        let bus = SpyBus::default();
+        let mut shard = test_shard(&bus, 0, 1, FIRST_BOOT);
+        let (sender, owner_inbox, _owner_replies) = shard_channel(0, 1, 1);
+        shard.attach_senders(vec![sender]);
+        let shard = Rc::new(shard);
+        let namespace = create_one_partition(&shard);
+        shard
+            .shards_table()
+            .insert(namespace, PartitionLocation::new(ShardId::new(0), 0));
+        commit_root_session(&shard);
+        let shard_handle = Rc::new(RefCell::new(Some(Rc::downgrade(&shard))));
+        let sessions = Rc::new(RefCell::new(SessionManager::new()));
+        bind_root_session(&shard, &sessions).await;
+        let mut server_config = ServerConfig::default();
+        server_config.message_bus.client_queue_capacity = 1;
+        let server_config = Arc::new(server_config);
+        let queues: ClientRequestQueues = Rc::default();
+        let active: ActiveClientRequests = Rc::default();
+        let enqueue = |message| {
+            enqueue_client_request(
+                &bus,
+                &shard_handle,
+                &sessions,
+                &server_config,
+                &queues,
+                &active,
+                ROOT_TRANSPORT,
+                message,
+            );
+        };
+        let poll_queued = || {
+            queues.borrow().get(&ROOT_TRANSPORT).is_some_and(|queue| {
+                queue.requests.iter().any(|queued| {
+                    queued
+                        .message
+                        .try_as_typed::<RequestHeader>()
+                        .is_ok_and(|request| request.header().request == POLL_REQUEST)
+                })
+            })
+        };
+
+        // The first read takes the only place under the cap and the second
+        // holds the drain, so the poll behind them stays queued.
+        enqueue(held_get_me(1, UNAPPLIED_OP));
+        enqueue(held_get_me(2, UNAPPLIED_OP));
+        settle().await;
+        let mut poll = root_deferred_poll(POLL_REQUEST, true);
+        bytemuck::checked::from_bytes_mut::<RequestHeader>(
+            &mut poll.as_mut_slice()[..size_of::<RequestHeader>()],
+        )
+        .partition_incarnation = shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .created_revision_for_namespace(namespace)
+            .unwrap();
+        enqueue(poll.into_generic());
+        assert!(poll_queued(), "the full cap keeps the poll queued");
+
+        enqueue(root_read(CANCEL_DEFERRED_REQUEST_CODE, cancelled).into_generic());
+        assert_eq!(
+            poll_queued(),
+            !cancel_names_the_poll,
+            "a cancellation removes only the queued poll that it names"
+        );
+
+        shard
+            .plane
+            .metadata()
+            .applied_frontier()
+            .advance(UNAPPLIED_OP);
+        await_replies(&bus, 2).await;
+        settle().await;
+        let reached_owner = std::iter::from_fn(|| owner_inbox.try_recv().ok()).any(|frame| {
+            matches!(
+                frame,
+                ShardFrame::Lifecycle(LifecycleFrame::PartitionRead {
+                    read: PartitionRead::DeferredPoll(_),
+                    ..
+                })
+            )
+        });
+        assert_eq!(
+            reached_owner, !cancel_names_the_poll,
+            "only a poll that was not cancelled reaches its owner"
+        );
+        let mut replies: Vec<u64> = bus
+            .client_replies
+            .borrow()
+            .iter()
+            .map(|(_, frame)| reply_request(frame))
+            .collect();
+        replies.sort_unstable();
+        assert_eq!(replies, [1, 2], "a cancellation gets no reply of its own");
+    }
+
+    /// A deferred poll of partition 0 by the root session, sent as `request`.
+    fn root_deferred_poll(request: u64, auto_commit: bool) -> Message<RequestHeader> {
+        let poll = DeferredPollMessagesRequest {
+            poll: PollMessagesRequest {
+                consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                partition_id: Some(0),
+                strategy: WirePollingStrategy::offset(0),
+                count: 1,
+                auto_commit,
+            },
+            wait_us: 1,
+            min_count: 1,
+            max_bytes: u32::try_from(MIN_DEFERRED_POLL_MAX_BYTES).unwrap(),
+            request_timeout_us: 1 + MIN_DEFERRED_POLL_REPLY_MARGIN_US,
+        }
+        .to_bytes();
+        let mut message = wire_request(
+            Operation::NonReplicated,
+            ROOT_CLIENT,
+            ROOT_SESSION,
+            request,
+            &poll,
+        );
+        bytemuck::checked::from_bytes_mut::<RequestHeader>(
+            &mut message.as_mut_slice()[..size_of::<RequestHeader>()],
+        )
+        .reserved[..4]
+            .copy_from_slice(&POLL_MESSAGES_DEFERRED_CODE.to_le_bytes());
+        message
     }
 
     #[compio::test]
