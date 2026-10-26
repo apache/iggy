@@ -24,7 +24,7 @@ use crate::links::{Frame, Link, ReplicaLinks, Target, lost_link, pause_before_re
 use crate::session_owner::{LaneKey, LaneTicket, RetainedOperation, SessionEpoch, SessionOwner};
 use crate::vsr::decode_reply_for;
 use bytes::Bytes;
-use futures::stream::{FuturesUnordered, StreamExt};
+use futures::stream::{self, FuturesUnordered, StreamExt};
 use iggy_binary_protocol::codes::{
     BIND_SESSION_CODE, CANCEL_DEFERRED_REQUEST_CODE, CHANGE_PASSWORD_CODE,
     DELETE_CONSUMER_OFFSET_CODE, GET_CONSUMER_OFFSET_CODE, GET_PARTITION_ROUTE_CODE,
@@ -63,6 +63,12 @@ mod route_cache;
 
 pub(crate) const MAX_DEFERRED_REQUESTS: usize = 64;
 pub(crate) const MAX_DEFERRED_REQUESTS_PER_CONSUMER: usize = 16;
+/// Route lookups in flight while [`OperationDriver::readiness_groups`] groups
+/// the partitions of a wait. After a move, each stale partition needs one, so
+/// a primary that held 333 of 1000 partitions on 3 nodes costs 21 round trips
+/// instead of 333. Sixteen is a small share of the requests that one link
+/// holds, so the polls and sends of the client keep their room.
+const MAX_ROUTE_LOOKUPS_IN_FLIGHT: usize = 16;
 
 tokio::task_local! {
     pub(crate) static DEFERRED_CONSUMER_CAPACITY: Arc<Semaphore>;
@@ -285,7 +291,8 @@ impl OperationDriver {
     }
 
     /// The partitions grouped by primary endpoint and split to fit one wait
-    /// request each.
+    /// request each. Each group keeps the order of `partitions`, and the first
+    /// failed lookup in that order is the error.
     pub(crate) async fn readiness_groups(
         &self,
         stream_id: &Identifier,
@@ -294,16 +301,25 @@ impl OperationDriver {
     ) -> Result<Vec<Vec<u32>>, IggyError> {
         let lineage = self.session.operation_lineage().lineage();
         let deadline = operation_deadline();
+        let mut routes = stream::iter(partitions.iter().copied())
+            .map(|partition_id| {
+                let key = PartitionKey {
+                    stream_id: stream_id.clone(),
+                    topic_id: topic_id.clone(),
+                    partition_id,
+                };
+                async move {
+                    self.route(&key, lineage, deadline)
+                        .await
+                        .map(|route| (route.primary_replica, partition_id))
+                }
+            })
+            .buffered(MAX_ROUTE_LOOKUPS_IN_FLIGHT);
         let mut endpoints = std::collections::BTreeMap::<u8, Vec<u32>>::new();
-        for &partition_id in partitions {
-            let key = PartitionKey {
-                stream_id: stream_id.clone(),
-                topic_id: topic_id.clone(),
-                partition_id,
-            };
-            let route = self.route(&key, lineage, deadline).await?;
+        while let Some(route) = routes.next().await {
+            let (primary_replica, partition_id) = route?;
             endpoints
-                .entry(route.primary_replica)
+                .entry(primary_replica)
                 .or_default()
                 .push(partition_id);
         }
@@ -3337,6 +3353,48 @@ mod tests {
 
         let (first, rest) = partitions.split_at(MAX_PARTITIONS_PER_REQUEST as usize);
         assert_eq!(groups, [first, rest]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_partitions_without_routes_when_grouping_should_look_up_a_bounded_number_at_once()
+    {
+        const PARTITIONS: u32 = 3 * MAX_ROUTE_LOOKUPS_IN_FLIGHT as u32;
+        let f = Fixture::new().await;
+        // Descending, so a group in the order that lookups finish differs.
+        let partitions: Vec<u32> = (0..PARTITIONS).rev().collect();
+        f.cluster.hold(GET_PARTITION_ROUTE_CODE);
+
+        let (groups, ()) = tokio::join!(
+            f.driver
+                .readiness_groups(&f.stream_id, &f.topic_id, &partitions),
+            async {
+                eventually("the lookups fill the bound", || {
+                    f.cluster.count(GET_PARTITION_ROUTE_CODE) >= MAX_ROUTE_LOOKUPS_IN_FLIGHT
+                })
+                .await;
+                sleep(CALLER_TIMEOUT).await;
+                assert_eq!(
+                    f.cluster.count(GET_PARTITION_ROUTE_CODE),
+                    MAX_ROUTE_LOOKUPS_IN_FLIGHT,
+                    "a full bound starts no lookup"
+                );
+                for _ in 0..MAX_ROUTE_LOOKUPS_IN_FLIGHT {
+                    f.cluster.release_latest(GET_PARTITION_ROUTE_CODE);
+                }
+                f.cluster.release(GET_PARTITION_ROUTE_CODE);
+            }
+        );
+
+        assert_eq!(
+            groups.unwrap(),
+            [partitions.as_slice()],
+            "a group keeps the order of the partitions"
+        );
+        assert_eq!(
+            f.cluster.count(GET_PARTITION_ROUTE_CODE),
+            partitions.len(),
+            "one lookup per partition"
+        );
     }
 
     #[tokio::test(start_paused = true)]
