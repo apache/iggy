@@ -32,7 +32,9 @@ use server_common::send_messages::decode_batch_slice;
 use server_common::sharding::{PartitionLocation, ShardId};
 
 use crate::poll::completion::PollCompletionLane;
-use crate::poll::test_support::{PollTestMetadata, install_group_owner, partition_with_messages};
+use crate::poll::test_support::{
+    PollTestMetadata, commit_messages, install_group_owner, partition_with_messages,
+};
 use crate::poll::timeout_tests::{PollTestBus, evict_messages_for_disk_dispatch};
 use crate::shards_table::PapayaShardsTable;
 use crate::{
@@ -43,6 +45,8 @@ use crate::{
 const DEADLINE: u64 = 100;
 const REQUEST_DEADLINE: u64 = DEADLINE + iggy_common::MIN_DEFERRED_POLL_REPLY_MARGIN_US;
 const CLIENT: u128 = 41;
+/// The metadata op that installs the fixture's consumer group owners.
+const METADATA_OP: u64 = 1;
 fn namespace() -> IggyNamespace {
     partition_namespace(0)
 }
@@ -84,7 +88,7 @@ async fn owner_of(partitions: &[&[&str]]) -> TestShard {
     let mut member = ConsumerGroupMember::new(0, CLIENT);
     member.session = Some(1);
     group.members.insert(member);
-    group.rebalance_members(&topic.partitions, 1, 1);
+    group.rebalance_members(&topic.partitions, METADATA_OP, 1);
     let config = partitions_plane.config().clone();
     for id in 0..partitions.len() {
         let assignment = &group.assignments[&id];
@@ -295,6 +299,100 @@ async fn cancelled_refused_read_does_not_hold_back_later_reads() {
     assert!(!state.waiters.contains_key(&1));
     assert!(state.waiters[&2].running);
     assert!(state.read_queue.is_empty());
+}
+
+/// Parks `request` after a first disk read that selected only offset 0, with
+/// that message evicted from the journal.
+async fn parked_after_disk_read(
+    owner: &TestShard,
+    request: DeferredPollRequest,
+) -> Receiver<PartitionReadReply> {
+    let first_read = resident_read(owner, request.consumer, request.args.count);
+    evict_messages_for_disk_dispatch(owner, namespace());
+    let replies = submit(owner, request).await;
+    assert_eq!(owner.bus.spawned_tasks.borrow().len(), 1, "a disk read");
+    // Dropping the captured read frees its completion slot and reservation,
+    // and the result arrives as a read of the evicted message would.
+    owner.bus.spawned_tasks.borrow_mut().clear();
+    owner.on_deferred_poll_completed(1, first_read).await;
+    pending(&replies);
+    replies
+}
+
+fn resident_read(owner: &TestShard, consumer: PollingConsumer, count: u32) -> PollReadResult {
+    owner
+        .plane
+        .partitions()
+        .build_poll_snapshot(
+            &namespace(),
+            consumer,
+            &PollingArgs::new(PollingStrategy::offset(0), count, false),
+        )
+        .unwrap()
+        .execute_resident()
+}
+
+async fn commit(owner: &TestShard, payloads: &[&str], request: u64) {
+    let partitions = owner.plane.partitions();
+    let mut partition = partitions.remove(&namespace()).unwrap();
+    commit_messages(
+        &mut partition,
+        partitions.config(),
+        namespace(),
+        payloads,
+        (request, METADATA_OP),
+    )
+    .await;
+    partitions.insert(namespace(), partition);
+}
+
+#[compio::test]
+async fn waiter_reads_from_disk_again_only_once_new_messages_can_reach_min_count() {
+    let owner = owner(&["first"]).await;
+    let replies = parked_after_disk_read(&owner, request(&owner, 3, false, false)).await;
+
+    commit(&owner, &["second"], 2).await;
+    owner.service_deferred_polls().await;
+    pending(&replies);
+    assert!(
+        owner.bus.spawned_tasks.borrow().is_empty(),
+        "two of three messages start no read"
+    );
+    assert_eq!(
+        owner.deferred_polls.state.borrow().waiters[&1].last_visibility,
+        Some(Some(1))
+    );
+
+    commit(&owner, &["third"], 3).await;
+    owner.service_deferred_polls().await;
+    assert_eq!(owner.bus.spawned_tasks.borrow().len(), 1);
+}
+
+#[compio::test]
+async fn waiter_below_min_count_reads_again_once_new_bytes_reach_the_byte_limit() {
+    // Payloads of one length keep every batch at `batch_bytes`.
+    let owner = owner(&["first"]).await;
+    let mut request = request(&owner, 100, false, false);
+    let batch_bytes = resident_read(&owner, request.consumer, 1).encoded_bytes();
+    request.options.max_bytes =
+        u32::try_from(POLL_RESPONSE_HEADER_SIZE + batch_bytes * 5 / 2).unwrap();
+    let replies = parked_after_disk_read(&owner, request).await;
+
+    commit(&owner, &["third"], 2).await;
+    owner.service_deferred_polls().await;
+    pending(&replies);
+    assert!(
+        owner.bus.spawned_tasks.borrow().is_empty(),
+        "two batches stay below the byte limit"
+    );
+
+    commit(&owner, &["fifth"], 3).await;
+    owner.service_deferred_polls().await;
+    assert_eq!(
+        owner.bus.spawned_tasks.borrow().len(),
+        1,
+        "three batches reach the byte limit before min_count"
+    );
 }
 
 #[compio::test]

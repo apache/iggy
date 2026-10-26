@@ -313,8 +313,7 @@ impl PollReadResult {
     /// keeps batch framing intact.
     #[must_use]
     pub fn compacted(mut self) -> Self {
-        let total: usize = self.fragments.iter().map(Fragment::len).sum();
-        let mut buffer = Owned::with_capacity(total);
+        let mut buffer = Owned::with_capacity(self.encoded_bytes());
         for fragment in &self.fragments {
             buffer.extend_from_slice(fragment.as_slice());
         }
@@ -336,6 +335,13 @@ impl PollReadResult {
     #[must_use]
     pub const fn message_count(&self) -> u32 {
         self.message_count
+    }
+
+    /// The selected bytes with their batch framing, which is what
+    /// [`Self::limit_bytes`] counts against its limits.
+    #[must_use]
+    pub fn encoded_bytes(&self) -> usize {
+        self.fragments.iter().map(Fragment::len).sum()
     }
 
     /// Whether the byte budget or a fault stopped the read early. Waiting for

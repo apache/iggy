@@ -31,6 +31,7 @@ use std::task::{Context, Poll, Waker};
 
 use consensus::client_table::SessionAttachment;
 use consensus::{Consensus, MetadataHandle, PartitionsHandle};
+use iggy_binary_protocol::responses::messages::poll_messages::POLL_RESPONSE_HEADER_SIZE;
 use iggy_common::{DeferredPollOptions, IggyError, PollingKind, PollingStrategy};
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
@@ -143,6 +144,27 @@ struct Waiter {
     /// When a full read budget first refused this waiter. It keeps the
     /// waiter's place in the read queue until one of its reads starts.
     refused_at: Option<u64>,
+    /// What a read from the start offset through `last_visibility` selects.
+    selected: Selection,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Selection {
+    messages: u32,
+    /// Counted as `PollReadResult::limit_bytes` counts them.
+    bytes: usize,
+}
+
+impl Selection {
+    /// The reasons of `accept_deferred_result` that do not depend on time. A
+    /// disk read that its walk budget would stop earlier is not predicted, and
+    /// it runs when one of these holds or when the wait expires.
+    fn finishes_read(self, options: &DeferredPollOptions, max_read_bytes: usize) -> bool {
+        let byte_limit = (options.max_bytes as usize)
+            .min(max_read_bytes)
+            .saturating_sub(POLL_RESPONSE_HEADER_SIZE);
+        self.messages >= options.min_count || self.bytes >= byte_limit
+    }
 }
 
 /// Only a watched partition has a notifier, so only its commits mark it.
@@ -595,6 +617,7 @@ where
                     running: false,
                     terminal: false,
                     refused_at: None,
+                    selected: Selection::default(),
                 },
             );
             state.enqueue(id);
@@ -689,6 +712,21 @@ where
                 .deadlines
                 .insert((waiter.request.request_deadline, id));
         }
+        // A read from the start offset that cannot finish would only park the
+        // waiter again. Counting what was committed after the last read
+        // stands in for it.
+        if !waiter.running
+            && !waiter.terminal
+            && waiter.last_visibility != Some(visibility)
+            && let Some(selected) = self.selected_through(&waiter)
+            && !selected.finishes_read(
+                &waiter.request.options,
+                self.deferred_polls.config.borrow().max_read_bytes,
+            )
+        {
+            waiter.last_visibility = Some(visibility);
+            waiter.selected = selected;
+        }
         if waiter.running || (!waiter.terminal && waiter.last_visibility == Some(visibility)) {
             self.deferred_polls
                 .state
@@ -751,6 +789,44 @@ where
         });
     }
 
+    /// Adds the resident messages committed after `last_visibility` to the
+    /// last read. `None` before the first read, for a start that moves with
+    /// the partition, and once those messages left the journal, because then
+    /// only a full read can count them.
+    fn selected_through(&self, waiter: &Waiter) -> Option<Selection> {
+        let args = &waiter.request.args;
+        if args.kind != PollingKind::Offset {
+            return None;
+        }
+        let from = waiter.last_visibility?.map_or(args.value, |offset| {
+            args.value.max(offset.saturating_add(1))
+        });
+        let needed = waiter
+            .request
+            .options
+            .min_count
+            .saturating_sub(waiter.selected.messages);
+        let plan = self.plane.partitions().build_poll_snapshot(
+            &waiter.namespace,
+            waiter.request.consumer,
+            &PollingArgs::new(PollingStrategy::offset(from), needed, false),
+        )?;
+        if plan.needs_off_pump_io() {
+            return None;
+        }
+        let committed = plan.execute_resident().checked().ok()?;
+        Some(Selection {
+            messages: waiter
+                .selected
+                .messages
+                .saturating_add(committed.message_count()),
+            bytes: waiter
+                .selected
+                .bytes
+                .saturating_add(committed.encoded_bytes()),
+        })
+    }
+
     #[allow(clippy::future_not_send)]
     pub(super) async fn on_deferred_poll_completed(&self, id: u64, result: PollReadResult) {
         let waiter = self.deferred_polls.state.borrow_mut().waiters.remove(&id);
@@ -763,7 +839,7 @@ where
     }
 
     #[allow(clippy::future_not_send)]
-    async fn accept_deferred_result(&self, id: u64, waiter: Waiter, result: PollReadResult) {
+    async fn accept_deferred_result(&self, id: u64, mut waiter: Waiter, result: PollReadResult) {
         if waiter.reply.is_disconnected() {
             self.metrics.deferred_polls.cancelled.inc();
             self.remove_deferred_poll(id, &waiter);
@@ -812,6 +888,10 @@ where
             self.finish_deferred_poll(id, waiter, result).await;
             return;
         }
+        waiter.selected = Selection {
+            messages: result.message_count(),
+            bytes: result.encoded_bytes(),
+        };
         let changed = waiter.last_visibility != Some(visibility);
         let mut state = self.deferred_polls.state.borrow_mut();
         state.waiters.insert(id, waiter);
