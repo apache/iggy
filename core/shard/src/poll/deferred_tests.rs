@@ -485,6 +485,70 @@ async fn waiter_below_min_count_reads_again_once_new_bytes_reach_the_byte_limit(
 }
 
 #[compio::test]
+async fn commit_below_min_count_probes_no_parked_waiter() {
+    // One waiter more than a pump turn serves, so a probe of each would leave
+    // one queued.
+    const WAITERS: usize = SERVICE_BUDGET + 1;
+    for reach_min_count in [true, false] {
+        let owner = owner(&["first"]).await;
+        let mut waiters = Vec::with_capacity(WAITERS);
+        for _ in 0..WAITERS {
+            waiters.push(submit(&owner, request(&owner, 3, false, false)).await);
+        }
+
+        commit(&owner, &["second"], 2).await;
+        owner.service_deferred_polls().await;
+        waiters.iter().for_each(pending);
+        {
+            let state = owner.deferred_polls.state.borrow();
+            assert!(
+                state.ready.is_empty(),
+                "two of three messages probe no waiter"
+            );
+            assert!(
+                state.waiters.values().all(|waiter| {
+                    waiter.last_visibility.map(|visibility| visibility.offset) == Some(Some(1))
+                }),
+                "each waiter counts the second message"
+            );
+        }
+
+        if reach_min_count {
+            commit(&owner, &["third"], 3).await;
+        } else {
+            owner.bus.now.set(DEADLINE);
+        }
+        owner.service_deferred_polls().await;
+        owner.service_deferred_polls().await;
+        let expected: &[u64] = if reach_min_count { &[0, 1, 2] } else { &[0, 1] };
+        for replies in &waiters {
+            assert_eq!(
+                offsets(replies),
+                expected,
+                "min_count reached: {reach_min_count}"
+            );
+        }
+    }
+}
+
+#[compio::test]
+async fn replacement_history_rejects_parked_poll_on_its_next_signal() {
+    let owner = owner(&["old"]).await;
+    let replies = submit(&owner, request(&owner, 2, false, false)).await;
+    let (replacement, _) = partition_with_messages(&owner.bus, namespace(), &["new"]).await;
+    owner.plane.partitions().insert(namespace(), replacement);
+    // A partition publishes its visibility when it replaces its history.
+    owner.deferred_polls.signals.borrow_mut().mark(namespace());
+    owner.service_deferred_polls().await;
+    assert!(matches!(
+        replies.try_recv(),
+        Ok(PartitionReadReply::Rejected(
+            IggyError::TransientNotAccepted
+        ))
+    ));
+}
+
+#[compio::test]
 async fn read_budget_caps_a_resident_reply_after_its_first_message() {
     let owner = owner(&["first", "second"]).await;
     owner.set_deferred_poll_config(DeferredPollConfig {

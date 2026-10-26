@@ -176,6 +176,23 @@ impl Waiter {
             }),
         })
     }
+
+    /// Whether a probe at `visibility` only parks the waiter again, because
+    /// its read runs or because a read from the start could not finish. In
+    /// the second case the waiter moves its bound to `visibility`: what was
+    /// committed after the last read bounds what a read adds.
+    fn parks_at(&mut self, visibility: PollVisibility, max_read_bytes: usize) -> bool {
+        if !self.running
+            && !self.terminal
+            && self.last_visibility != Some(visibility)
+            && let Some(selected) = self.selection_at(visibility)
+            && !selected.finishes_read(&self.request.options, max_read_bytes)
+        {
+            self.last_visibility = Some(visibility);
+            self.selected = selected;
+        }
+        self.running || (!self.terminal && self.last_visibility == Some(visibility))
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -713,6 +730,19 @@ where
                         namespace
                     };
                     if let Some(namespace) = namespace {
+                        // A commit queues a poll only if its history or view
+                        // changed or if its probe can read. One read of the
+                        // partition decides that for every poll. Each probe still
+                        // validates before its read and commit, and maintenance
+                        // and the deadline still probe the polls that stay parked.
+                        let current =
+                            self.plane
+                                .partitions()
+                                .with_partition(&namespace, |partition| {
+                                    let (history, visibility) = partition.poll_visibility();
+                                    (history, visibility, partition.consensus().view())
+                                });
+                        let max_read_bytes = self.deferred_polls.config.borrow().max_read_bytes;
                         let ids: Vec<_> = state
                             .partitions
                             .get(&namespace)
@@ -720,6 +750,14 @@ where
                             .flat_map(|ids| ids.iter().copied())
                             .collect();
                         for id in ids {
+                            if let Some((history, visibility, view)) = current
+                                && let Some(waiter) = state.waiters.get_mut(&id)
+                                && waiter.history == history
+                                && waiter.view == view
+                                && waiter.parks_at(visibility, max_read_bytes)
+                            {
+                                continue;
+                            }
                             state.enqueue(id);
                         }
                     }
@@ -770,21 +808,10 @@ where
                 .deadlines
                 .insert((waiter.request.request_deadline, id));
         }
-        // A read from the start that cannot finish would only park the waiter
-        // again. What was committed after the last read bounds what it adds.
-        if !waiter.running
-            && !waiter.terminal
-            && waiter.last_visibility != Some(visibility)
-            && let Some(selected) = waiter.selection_at(visibility)
-            && !selected.finishes_read(
-                &waiter.request.options,
-                self.deferred_polls.config.borrow().max_read_bytes,
-            )
-        {
-            waiter.last_visibility = Some(visibility);
-            waiter.selected = selected;
-        }
-        if waiter.running || (!waiter.terminal && waiter.last_visibility == Some(visibility)) {
+        if waiter.parks_at(
+            visibility,
+            self.deferred_polls.config.borrow().max_read_bytes,
+        ) {
             self.deferred_polls
                 .state
                 .borrow_mut()
