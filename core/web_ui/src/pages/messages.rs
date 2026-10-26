@@ -15,13 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::rc::Rc;
+
 use dioxus::prelude::*;
 
 use crate::Route;
 use crate::api::ApiError;
 use crate::components::{Crumb, ErrorView, Loading, PageHeader, api_client, use_session};
 use crate::format;
-use crate::models::Message;
+use crate::models::IggyMessage;
 
 const PAGE_SIZE: u32 = 20;
 const PAYLOAD_PREVIEW_CHARS: usize = 60;
@@ -29,54 +31,75 @@ const PAYLOAD_PREVIEW_CHARS: usize = 60;
 #[derive(Debug, Clone, PartialEq)]
 struct MessagesPage {
     topic_name: String,
-    /// Offset of the newest message, `None` when the partition is empty.
-    last_offset: Option<u64>,
-    /// Offset of the first message shown. Retention can make it later than
-    /// the offset that was asked for.
-    first_offset: u64,
-    /// The server answered with a later offset than requested, so nothing
-    /// older is left.
-    at_oldest: bool,
-    messages: Vec<Message>,
+    /// Offset the page was polled from. Retention can make the first message
+    /// later than this.
+    requested_offset: u64,
+    /// Newest offset in the partition, taken from the poll reply so it always
+    /// agrees with `messages`.
+    current_offset: u64,
+    messages: Vec<Rc<IggyMessage>>,
 }
 
+/// `offset` is the first offset of the page. `None` follows the newest page,
+/// so reloading picks up new messages.
 #[component]
-pub fn Messages(stream_id: u32, topic_id: u32, partition_id: u32) -> Element {
+pub fn Messages(stream_id: u32, topic_id: u32, partition_id: u32, offset: Option<u64>) -> Element {
     let session = use_session();
-    // `None` follows the newest page, so reloading picks up new messages.
-    let mut requested_offset = use_signal(|| None::<u64>);
+    let navigator = navigator();
 
-    let page = use_resource(use_reactive!(
-        |(stream_id, topic_id, partition_id)| async move {
-            let client = api_client(session);
-            let topic = client.topic(stream_id, topic_id).await?;
-            let partition = topic
-                .partitions
-                .iter()
-                .find(|partition| partition.id == partition_id)
-                .ok_or(ApiError::NotFound)?;
-            let last_offset = (partition.messages_count > 0).then_some(partition.current_offset);
-            let newest_page_start = last_offset
-                .map(|last| last.saturating_sub(u64::from(PAGE_SIZE) - 1))
-                .unwrap_or(0);
-            let requested = requested_offset().unwrap_or(newest_page_start);
+    let mut page = use_resource(use_reactive!(|(
+        stream_id,
+        topic_id,
+        partition_id,
+        offset,
+    )| async move {
+        let client = api_client(session);
+        let topic = client.topic(stream_id, topic_id).await?;
+        let partition = topic
+            .partitions
+            .iter()
+            .find(|partition| partition.id == partition_id)
+            .ok_or(ApiError::NotFound)?;
+        let requested_offset = offset.unwrap_or_else(|| {
+            partition
+                .current_offset
+                .saturating_sub(u64::from(PAGE_SIZE) - 1)
+        });
 
-            let polled = client
-                .poll_messages(stream_id, topic_id, partition_id, requested, PAGE_SIZE)
-                .await?;
-            let first_offset = polled
-                .messages
-                .first()
-                .map_or(requested, |message| message.header.offset);
-            Ok::<_, ApiError>(MessagesPage {
-                topic_name: topic.name,
-                last_offset,
-                first_offset,
-                at_oldest: first_offset > requested,
-                messages: polled.messages,
-            })
+        let polled = client
+            .poll_messages(
+                stream_id,
+                topic_id,
+                partition_id,
+                requested_offset,
+                PAGE_SIZE,
+            )
+            .await?;
+        Ok::<_, ApiError>(MessagesPage {
+            topic_name: topic.name,
+            requested_offset,
+            current_offset: polled.current_offset,
+            messages: polled.messages.into_iter().map(Rc::new).collect(),
+        })
+    }));
+
+    let mut show = move |target: Option<u64>| {
+        // A second click would restart the poll in flight and fetch the same
+        // page again.
+        if page.pending() {
+            return;
         }
-    ));
+        if target == offset {
+            page.restart();
+        } else {
+            navigator.push(Route::Messages {
+                stream_id,
+                topic_id,
+                partition_id,
+                offset: target,
+            });
+        }
+    };
 
     let header = rsx! {
         PageHeader { title: format!("Partition {partition_id} messages"),
@@ -89,56 +112,65 @@ pub fn Messages(stream_id: u32, topic_id: u32, partition_id: u32) -> Element {
     let body = match &*page.read() {
         None => rsx! { Loading {} },
         Some(Err(error)) => rsx! { ErrorView { error: error.clone() } },
-        Some(Ok(page)) if page.last_offset.is_none() => rsx! {
-            p { class: "muted", "Topic {page.topic_name} has no messages in this partition." }
-        },
-        Some(Ok(page)) => {
-            let first_offset = page.first_offset;
-            let last_offset = page.last_offset.unwrap_or(0);
-            let page_size = u64::from(PAGE_SIZE);
-            let has_older = first_offset > 0 && !page.at_oldest;
-            let has_newer = first_offset + page_size <= last_offset;
-            let shown_last_offset = page
-                .messages
-                .last()
-                .map_or(first_offset, |message| message.header.offset);
-            rsx! {
-                div { class: "pager",
-                    span { class: "muted",
-                        "Topic {page.topic_name}, showing offsets {first_offset} to {shown_last_offset} of {last_offset}"
-                    }
-                    button {
-                        class: "secondary",
-                        disabled: !has_older,
-                        onclick: move |_| requested_offset.set(Some(first_offset.saturating_sub(page_size))),
-                        "Older"
-                    }
-                    button {
-                        class: "secondary",
-                        disabled: !has_newer,
-                        onclick: move |_| requested_offset.set(Some(first_offset + page_size)),
-                        "Newer"
-                    }
-                    button { class: "secondary", onclick: move |_| requested_offset.set(None), "Latest" }
-                }
-                table {
-                    thead {
-                        tr {
-                            th { class: "num", "Offset" }
-                            th { "Timestamp" }
-                            th { "ID" }
-                            th { class: "num", "Bytes" }
-                            th { "Payload" }
+        Some(Ok(loaded)) => match (loaded.messages.first(), loaded.messages.last()) {
+            (Some(first), Some(last)) => {
+                let first_offset = first.header.offset;
+                let shown_last_offset = last.header.offset;
+                let current_offset = loaded.current_offset;
+                // The server skipped ahead of the requested offset, so
+                // nothing older is left.
+                let at_oldest = first_offset > loaded.requested_offset;
+                let has_older = first_offset > 0 && !at_oldest;
+                let has_newer = shown_last_offset < current_offset;
+                rsx! {
+                    div { class: "pager",
+                        span { class: "muted",
+                            "Topic {loaded.topic_name}, showing offsets {first_offset} to {shown_last_offset} of {current_offset}"
                         }
+                        button {
+                            class: "secondary",
+                            disabled: !has_older,
+                            onclick: move |_| show(Some(first_offset.saturating_sub(u64::from(PAGE_SIZE)))),
+                            "Older"
+                        }
+                        button {
+                            class: "secondary",
+                            disabled: !has_newer,
+                            onclick: move |_| show(Some(shown_last_offset + 1)),
+                            "Newer"
+                        }
+                        button { class: "secondary", onclick: move |_| show(None), "Latest" }
                     }
-                    tbody {
-                        for message in page.messages.iter().rev() {
-                            MessageRow { key: "{message.header.offset}", message: message.clone() }
+                    table {
+                        thead {
+                            tr {
+                                th { class: "num", "Offset" }
+                                th { "Timestamp" }
+                                th { "ID" }
+                                th { class: "num", "Bytes" }
+                                th { "Payload" }
+                            }
+                        }
+                        tbody {
+                            for message in loaded.messages.iter().rev() {
+                                MessageRow { key: "{message.header.offset}", message: Rc::clone(message) }
+                            }
                         }
                     }
                 }
             }
-        }
+            _ if loaded.requested_offset == 0 => rsx! {
+                p { class: "muted", "Topic {loaded.topic_name} has no messages in this partition." }
+            },
+            _ => rsx! {
+                div { class: "pager",
+                    span { class: "muted",
+                        "Topic {loaded.topic_name} has no messages from offset {loaded.requested_offset}."
+                    }
+                    button { class: "secondary", onclick: move |_| show(None), "Latest" }
+                }
+            },
+        },
     };
 
     rsx! {
@@ -148,7 +180,7 @@ pub fn Messages(stream_id: u32, topic_id: u32, partition_id: u32) -> Element {
 }
 
 #[component]
-fn MessageRow(message: Message) -> Element {
+fn MessageRow(message: Rc<IggyMessage>) -> Element {
     // The full payload can be up to 64 MB, so it is decoded only once the
     // row is opened.
     let mut open = use_signal(|| false);

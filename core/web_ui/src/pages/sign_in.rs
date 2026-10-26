@@ -17,13 +17,11 @@
 
 use dioxus::prelude::*;
 
-use crate::Route;
 use crate::api::ApiClient;
 use crate::auth::Session;
 use crate::components::use_session;
-use crate::models::LoginRequest;
-
-const LOGO: Asset = asset!("/assets/iggy-apache-darkbg.svg");
+use crate::models::LoginUser;
+use crate::{LOGO, Route};
 
 #[component]
 pub fn SignIn() -> Element {
@@ -43,23 +41,20 @@ pub fn SignIn() -> Element {
     let submit = move |event: FormEvent| async move {
         event.prevent_default();
         submitting.set(true);
-        let credentials = LoginRequest {
+        let credentials = LoginUser {
             username: username(),
             password: password(),
         };
         let result = ApiClient::default().login(&credentials).await;
         submitting.set(false);
 
-        let signed_in = match result {
-            Ok(identity) => Session::try_from(identity).map_err(|error| error.to_string()),
-            Err(error) => Err(error.to_string()),
-        };
-        match signed_in {
-            Ok(new_session) => {
+        match result {
+            Ok(identity) => {
+                let new_session = Session::from(identity);
                 new_session.persist();
                 session.set(Some(new_session));
             }
-            Err(message) => error.set(Some(message)),
+            Err(failure) => error.set(Some(failure.to_string())),
         }
     };
 

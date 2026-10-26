@@ -8084,11 +8084,12 @@ dependencies = [
  "chrono",
  "dioxus",
  "gloo-net 0.7.0",
- "gloo-storage 0.4.0",
+ "iggy_common",
  "js-sys",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "web-sys",
 ]
 
 [[package]]

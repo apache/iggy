@@ -74,9 +74,12 @@ pub fn ErrorView(error: ApiError) -> Element {
     // Reactive on the prop, because a mounted view can change from another
     // error to a 401 without remounting.
     use_effect(use_reactive!(|unauthorized| {
-        if unauthorized {
-            Session::clear();
-            session.set(None);
+        if !unauthorized {
+            return;
+        }
+        let failed = session.write().take();
+        if let Some(failed) = failed {
+            failed.forget();
         }
     }));
 

@@ -68,7 +68,7 @@ pub fn TopicPage(stream_id: u32, topic_id: u32) -> Element {
                             td { {format::timestamp(partition.created_at)} }
                             td {
                                 Link {
-                                    to: Route::Messages { stream_id, topic_id, partition_id: partition.id },
+                                    to: Route::Messages { stream_id, topic_id, partition_id: partition.id, offset: None },
                                     "Browse messages"
                                 }
                             }

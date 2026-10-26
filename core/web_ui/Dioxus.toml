@@ -21,5 +21,6 @@ default_platform = "web"
 
 [web.app]
 title = "Apache Iggy"
-# The server embeds the bundle and serves it under /ui.
+# The switch-over from the Svelte app will have the server embed the bundle
+# and serve it under /ui.
 base_path = "ui"

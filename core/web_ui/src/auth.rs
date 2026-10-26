@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use gloo_storage::{LocalStorage, Storage};
 use serde::{Deserialize, Serialize};
+use web_sys::Storage;
 
 use crate::models::IdentityInfo;
 
@@ -33,10 +33,13 @@ pub struct Session {
 
 impl Session {
     /// Restores the stored session, dropping it if the token has expired.
+    /// Blocked or unreadable storage counts as no session.
     pub fn restore() -> Option<Self> {
-        let session: Self = LocalStorage::get(SESSION_KEY).ok()?;
+        let storage = local_storage()?;
+        let stored = storage.get_item(SESSION_KEY).ok()??;
+        let session: Self = serde_json::from_str(&stored).ok()?;
         if session.is_expired() {
-            Self::clear();
+            let _ = storage.remove_item(SESSION_KEY);
             return None;
         }
         Some(session)
@@ -44,11 +47,26 @@ impl Session {
 
     pub fn persist(&self) {
         // A failed write only costs the user a sign-in after the next reload.
-        let _ = LocalStorage::set(SESSION_KEY, self);
+        let (Some(storage), Ok(json)) = (local_storage(), serde_json::to_string(self)) else {
+            return;
+        };
+        let _ = storage.set_item(SESSION_KEY, &json);
     }
 
-    pub fn clear() {
-        LocalStorage::delete(SESSION_KEY);
+    /// Removes this session from storage. Tabs share the stored session, so
+    /// one that another tab saved after signing in again is left alone.
+    pub fn forget(&self) {
+        let Some(storage) = local_storage() else {
+            return;
+        };
+        let stored = storage
+            .get_item(SESSION_KEY)
+            .ok()
+            .flatten()
+            .and_then(|stored| serde_json::from_str::<Self>(&stored).ok());
+        if stored.is_none_or(|stored| stored.access_token == self.access_token) {
+            let _ = storage.remove_item(SESSION_KEY);
+        }
     }
 
     fn is_expired(&self) -> bool {
@@ -57,21 +75,18 @@ impl Session {
     }
 }
 
-impl TryFrom<IdentityInfo> for Session {
-    type Error = MissingToken;
-
-    fn try_from(identity: IdentityInfo) -> Result<Self, Self::Error> {
-        let token = identity.access_token.ok_or(MissingToken)?;
-        Ok(Self {
+impl From<IdentityInfo> for Session {
+    fn from(identity: IdentityInfo) -> Self {
+        Self {
             user_id: identity.user_id,
-            access_token: token.token,
-            expiry: token.expiry,
-        })
+            access_token: identity.access_token.token,
+            expiry: identity.access_token.expiry,
+        }
     }
 }
 
-/// The server answered a login without an access token, which happens when
-/// JWT auth is disabled for HTTP.
-#[derive(Debug, Clone, Copy, thiserror::Error)]
-#[error("the server did not return an access token")]
-pub struct MissingToken;
+/// `None` when the browser blocks site storage, where reading
+/// `window.localStorage` throws.
+fn local_storage() -> Option<Storage> {
+    web_sys::window()?.local_storage().ok().flatten()
+}

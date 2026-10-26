@@ -202,7 +202,6 @@ getrandom = { version = "0.4", features = ["wasm_js"] }
 git2 = { version = "0.21.0", default-features = false, features = ["vendored-libgit2"] }
 gloo = "0.12"
 gloo-net = { version = "0.7.0", default-features = false, features = ["http", "json"] }
-gloo-storage = "0.4.0"
 governor = "0.10.4"
 harness_derive = { path = "core/harness_derive" }
 hash32 = "1.0.0"

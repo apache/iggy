@@ -21,11 +21,12 @@ use serde::de::DeserializeOwned;
 
 use crate::auth::Session;
 use crate::models::{
-    IdentityInfo, LoginRequest, PolledMessages, Stream, StreamDetails, TopicDetails, UserDetails,
+    IdentityInfo, LoginUser, PolledMessages, Stream, StreamDetails, TopicDetails, UserInfoDetails,
 };
 
-/// Empty in the embedded build so requests go to the server that served the
-/// UI. Set at build time to point `dx serve` at a separately running server.
+/// Empty by default so requests go to the server that served the UI. Set at
+/// build time to point `dx serve` at a separately running server, see the
+/// crate README.
 const API_BASE_URL: &str = match option_env!("IGGY_WEB_UI_API_URL") {
     Some(url) => url,
     None => "",
@@ -65,11 +66,11 @@ impl ApiClient {
         }
     }
 
-    pub async fn login(&self, credentials: &LoginRequest) -> Result<IdentityInfo, ApiError> {
+    pub async fn login(&self, credentials: &LoginUser) -> Result<IdentityInfo, ApiError> {
         let request = self
             .builder(Request::post(&url("/users/login")))
             .json(credentials)
-            .map_err(|error| ApiError::Decode(error.to_string()))?;
+            .map_err(|error| ApiError::Network(error.to_string()))?;
         let response = request
             .send()
             .await
@@ -86,7 +87,7 @@ impl ApiClient {
         check_status(response).await.map(drop)
     }
 
-    pub async fn user(&self, user_id: u32) -> Result<UserDetails, ApiError> {
+    pub async fn user(&self, user_id: u32) -> Result<UserInfoDetails, ApiError> {
         self.get(&format!("/users/{user_id}"), &[]).await
     }
 
@@ -153,12 +154,15 @@ fn url(path: &str) -> String {
     format!("{API_BASE_URL}{path}")
 }
 
+/// Reads the body as bytes, because `Response::json` goes through one JS
+/// string, which browsers cap well below a page of large messages.
 async fn decode<T: DeserializeOwned>(response: Response) -> Result<T, ApiError> {
-    check_status(response)
+    let body = check_status(response)
         .await?
-        .json::<T>()
+        .binary()
         .await
-        .map_err(|error| ApiError::Decode(error.to_string()))
+        .map_err(|error| ApiError::Network(error.to_string()))?;
+    serde_json::from_slice(&body).map_err(|error| ApiError::Decode(error.to_string()))
 }
 
 async fn check_status(response: Response) -> Result<Response, ApiError> {
