@@ -133,6 +133,9 @@ struct ReadinessWaiter {
 struct Waiter {
     namespace: IggyNamespace,
     request: DeferredPollRequest,
+    /// Admission turned this `Next` poll into an `Offset` poll that starts
+    /// after the stored offset.
+    next: bool,
     reply: Sender<PartitionReadReply>,
     history: PollHistoryId,
     view: u32,
@@ -591,17 +594,43 @@ where
     }
 
     /// The visibility of the partition, while its history and view are those
-    /// of the admission.
+    /// of the admission. A `Next` poll also needs the stored offset of its
+    /// admission: another session can store an offset while it waits, and a
+    /// commit of this poll would then pass over a rewind.
     fn validate_waiter(&self, waiter: &Waiter) -> Result<PollVisibility, IggyError> {
         let (history, visibility, view) = self.validate_deferred_context(
             waiter.namespace,
             &waiter.request.context,
             waiter.request.consumer,
         )?;
-        if history != waiter.history || view != waiter.view {
+        if history != waiter.history
+            || view != waiter.view
+            || (waiter.next
+                && self.next_offset(waiter.namespace, waiter.request.consumer)?
+                    != waiter.request.args.value)
+        {
             return Err(IggyError::TransientNotAccepted);
         }
         Ok(visibility)
+    }
+
+    /// Where a `Next` poll of `consumer` starts: after its stored offset.
+    fn next_offset(
+        &self,
+        namespace: IggyNamespace,
+        consumer: PollingConsumer,
+    ) -> Result<u64, IggyError> {
+        self.plane
+            .partitions()
+            .with_partition(&namespace, |partition| {
+                partition.get_consumer_offset(consumer)
+            })
+            .ok_or(IggyError::TransientNotAccepted)?
+            .map_or(Ok(0), |offset| {
+                offset
+                    .checked_add(1)
+                    .ok_or(IggyError::InvalidOffset(offset))
+            })
     }
 
     /// The pump services the admitted waiter at the top of its next turn.
@@ -622,24 +651,10 @@ where
             let config = *self.deferred_polls.config.borrow();
             let mut state = self.deferred_polls.state.borrow_mut();
             let id = state.admit(request.context.quota, &config)?;
-            if request.args.kind == PollingKind::Next {
-                let stored = self
-                    .plane
-                    .partitions()
-                    .with_partition(&namespace, |partition| {
-                        partition.get_consumer_offset(request.consumer)
-                    })
-                    .ok_or(IggyError::TransientNotAccepted)?;
-                let offset = stored
-                    .map(|offset| {
-                        offset
-                            .checked_add(1)
-                            .ok_or(IggyError::InvalidOffset(offset))
-                    })
-                    .transpose()?
-                    .unwrap_or(0);
+            let next = request.args.kind == PollingKind::Next;
+            if next {
                 request.args.kind = PollingKind::Offset;
-                request.args.value = offset;
+                request.args.value = self.next_offset(namespace, request.consumer)?;
             }
             self.register_waiter(
                 &mut state,
@@ -652,6 +667,7 @@ where
                 Waiter {
                     namespace,
                     request,
+                    next,
                     reply: reply.clone(),
                     history,
                     view,
@@ -1075,18 +1091,7 @@ where
             self.validate_deferred_context(target.namespace, &target.context, target.consumer)?;
         let start = match target.strategy.kind {
             PollingKind::Offset => target.strategy.value,
-            PollingKind::Next => self
-                .plane
-                .partitions()
-                .with_partition(&target.namespace, |partition| {
-                    partition.get_consumer_offset(target.consumer)
-                })
-                .ok_or(IggyError::TransientNotAccepted)?
-                .map_or(Ok(0), |offset| {
-                    offset
-                        .checked_add(1)
-                        .ok_or(IggyError::InvalidOffset(offset))
-                })?,
+            PollingKind::Next => self.next_offset(target.namespace, target.consumer)?,
             _ => return Err(IggyError::InvalidCommand),
         };
         Ok((

@@ -22,7 +22,7 @@ use std::time::Duration;
 use super::*;
 use consensus::PartitionsHandle;
 use iggy_binary_protocol::requests::partitions::InstallConsumerGroupOwnerRequest;
-use iggy_common::{IggyByteSize, IggyTimestamp};
+use iggy_common::{ConsumerGroupId, ConsumerKind, ConsumerOffset, IggyByteSize, IggyTimestamp};
 use metadata::IggyMetadata;
 use metadata::stm::consumer_group::{ConsumerGroup, ConsumerGroupMember};
 use metadata::stm::stream::{Partition as MetadataPartition, Stream, StreamsInner, Topic};
@@ -643,6 +643,114 @@ async fn replacement_history_invalidates_pending_manual_poll() {
             IggyError::TransientNotAccepted
         ))
     ));
+}
+
+/// Applies an explicit offset store of another session. Unlike the commit of
+/// a poll, it can move the offset back.
+fn store_offset(owner: &TestShard, consumer: PollingConsumer, offset: u64) {
+    owner
+        .plane
+        .partitions()
+        .with_partition(&namespace(), |partition| match consumer {
+            PollingConsumer::Consumer(id, _) => {
+                let stored = ConsumerOffset::new(
+                    ConsumerKind::Consumer,
+                    u32::try_from(id).unwrap(),
+                    offset,
+                    String::new(),
+                );
+                partition.consumer_offsets.pin().insert(id, stored);
+            }
+            PollingConsumer::ConsumerGroup(id, _) => {
+                let stored = ConsumerOffset::new(
+                    ConsumerKind::ConsumerGroup,
+                    u32::try_from(id).unwrap(),
+                    offset,
+                    String::new(),
+                );
+                partition
+                    .consumer_group_offsets
+                    .pin()
+                    .insert(ConsumerGroupId(id), stored);
+            }
+        })
+        .unwrap();
+}
+
+fn stored_offset(owner: &TestShard, consumer: PollingConsumer) -> Option<u64> {
+    owner
+        .plane
+        .partitions()
+        .consumer_offset_read(&namespace(), consumer)
+        .unwrap()
+        .0
+}
+
+#[compio::test]
+async fn offset_that_another_session_stores_rejects_parked_next_poll() {
+    // A rewind asks for messages again, and a store ahead marks them read.
+    for stored in [0, 2] {
+        for group in [false, true] {
+            for exit in ["message", "deadline"] {
+                let owner = owner(&["a", "b", "c", "d"]).await;
+                let poll = request(&owner, 3, group, true);
+                let consumer = poll.consumer;
+                store_offset(&owner, consumer, 1);
+                // Two of the three messages it needs, so it parks at offset 2.
+                let replies = submit(&owner, poll).await;
+                pending(&replies);
+
+                store_offset(&owner, consumer, stored);
+                if exit == "message" {
+                    commit(&owner, &["e"], 2).await;
+                } else {
+                    owner.bus.now.set(DEADLINE);
+                }
+                owner.service_deferred_polls().await;
+
+                let reply = replies.try_recv();
+                assert!(
+                    matches!(
+                        reply,
+                        Ok(PartitionReadReply::Rejected(
+                            IggyError::TransientNotAccepted
+                        ))
+                    ),
+                    "a read from offset 2 passes over the store of {stored}, exit {exit}: {reply:?}"
+                );
+                assert_eq!(
+                    stored_offset(&owner, consumer),
+                    Some(stored),
+                    "the refused poll commits nothing"
+                );
+                assert!(owner.deferred_polls.state.borrow().waiters.is_empty());
+                if stored == 0 {
+                    assert_eq!(
+                        offsets(&submit(&owner, request(&owner, 3, group, true)).await),
+                        [1, 2, 3],
+                        "the poll again reads the rewound messages"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[compio::test]
+async fn offset_that_another_session_stores_again_lets_parked_next_poll_finish() {
+    let owner = owner(&["a", "b", "c", "d"]).await;
+    let poll = request(&owner, 3, false, true);
+    let consumer = poll.consumer;
+    store_offset(&owner, consumer, 1);
+    let replies = submit(&owner, poll).await;
+    pending(&replies);
+
+    store_offset(&owner, consumer, 1);
+    commit(&owner, &["e"], 2).await;
+    owner.service_deferred_polls().await;
+
+    assert_eq!(offsets(&replies), [2, 3, 4]);
+    assert_eq!(stored_offset(&owner, consumer), Some(4));
 }
 
 #[compio::test]
