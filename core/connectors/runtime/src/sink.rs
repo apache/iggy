@@ -260,7 +260,7 @@ pub(crate) fn spawn_consume_tasks(
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     let mut task_handles = Vec::new();
     let labels = Arc::new(SinkLabels::new(plugin_key));
-    for (consumer, decoder, batch_size, transforms) in consumers {
+    for (mut consumer, decoder, batch_size, transforms) in consumers {
         let plugin_key = plugin_key.to_string();
         let metrics = metrics.clone();
         let shutdown_rx = shutdown_rx.clone();
@@ -278,7 +278,7 @@ pub(crate) fn spawn_consume_tasks(
                 callback,
                 transforms,
                 topic_metadata,
-                consumer,
+                &mut consumer,
                 verbose,
                 benchmark,
                 &plugin_key,
@@ -296,6 +296,13 @@ pub(crate) fn spawn_consume_tasks(
                     .sinks
                     .set_error(&plugin_key, &error.to_string(), Some(&metrics))
                     .await;
+            }
+            // The polls also committed the batches the consumer still holds,
+            // and only a shutdown moves the offsets back over them.
+            if let Err(error) = consumer.shutdown().await {
+                error!(
+                    "Failed to shut down the consumer of sink connector with ID: {plugin_id}: {error}"
+                );
             }
         });
         task_handles.push(handle);
@@ -329,41 +336,49 @@ pub(crate) async fn consume_messages(
 
     loop {
         let message = match next.take() {
-            Some(message) => message,
+            Some(message) => Some(message),
             None => {
                 let message = tokio::select! {
                     _ = shutdown_rx.changed() => {
                         info!("Sink connector with ID: {plugin_id} received shutdown signal");
-                        break;
+                        None
                     }
                     msg = messages.next() => msg,
                 };
-                let Some(message) = message else {
-                    break;
-                };
-                let Ok(message) = message else {
-                    error!(
-                        "Failed to receive message for sink connector with ID: {plugin_id} from stream: {}, topic: {}",
-                        topic_metadata.stream, topic_metadata.topic
-                    );
-                    metrics.inc_errors_with_labels(&labels.counter);
-                    continue;
-                };
-                message
+                match message {
+                    Some(Ok(message)) => Some(message),
+                    Some(Err(_)) => {
+                        error!(
+                            "Failed to receive message for sink connector with ID: {plugin_id} from stream: {}, topic: {}",
+                            topic_metadata.stream, topic_metadata.topic
+                        );
+                        metrics.inc_errors_with_labels(&labels.counter);
+                        continue;
+                    }
+                    None => None,
+                }
             }
         };
 
-        if buffered.is_some_and(|(partition_id, _)| partition_id != message.partition_id) {
-            next = Some(message);
-        } else {
-            let message_offset = message.message.header.offset;
-            buffered = Some((message.partition_id, message.current_offset));
-            batch.push(message.message);
-            if message.current_offset != message_offset && batch.len() < batch_size {
-                continue;
+        // The poll committed the batch held here, so a stop still hands it to
+        // the plugin instead of dropping it.
+        let stopping = message.is_none();
+        if let Some(message) = message {
+            if buffered.is_some_and(|(partition_id, _)| partition_id != message.partition_id) {
+                next = Some(message);
+            } else {
+                let message_offset = message.message.header.offset;
+                buffered = Some((message.partition_id, message.current_offset));
+                batch.push(message.message);
+                if message.current_offset != message_offset && batch.len() < batch_size {
+                    continue;
+                }
             }
         }
         let Some((partition_id, current_offset)) = buffered.take() else {
+            if stopping {
+                break;
+            }
             continue;
         };
 
@@ -453,6 +468,9 @@ pub(crate) async fn consume_messages(
                 "Consumed {messages_count} messages in {:#?} for sink connector with ID: {plugin_id}",
                 elapsed
             );
+        }
+        if stopping {
+            break;
         }
     }
     info!("Stopped consuming messages for sink connector with ID: {plugin_id}");
@@ -1246,6 +1264,63 @@ mod tests {
         assert_eq!(
             batches,
             [(1, vec![0, 1]), (2, vec![0]), (1, vec![2]), (2, vec![1])]
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_batch_short_of_the_partition_head_when_shutdown_arrives_should_still_send_it()
+    {
+        const BATCH_SIZE: u32 = 16;
+        let plugin_id = next_plugin_id();
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
+        let received = |offset| {
+            Ok(iggy::prelude::ReceivedMessage {
+                context: iggy::prelude::PartitionContext::default(),
+                message: test_message(offset, br#"{"id":1}"#.to_vec()),
+                current_offset: TEST_CURRENT_OFFSET,
+                partition_id: 1,
+            })
+        };
+        // A byte-limited reply ends short of the head, so the loop asks for
+        // more. That poll parks, and the shutdown arrives while it waits.
+        let messages = Box::pin(futures::stream::iter([received(0), received(1)]).chain(
+            futures::stream::once(async move {
+                shutdown_tx
+                    .send(())
+                    .expect("the sink loop should still listen for shutdown");
+                std::future::pending().await
+            }),
+        ));
+
+        consume_messages(
+            plugin_id,
+            Schema::Json.decoder(),
+            BATCH_SIZE,
+            capturing_consume,
+            Vec::new(),
+            TopicMetadata {
+                stream: "test_stream".to_owned(),
+                topic: "test_topic".to_owned(),
+            },
+            messages,
+            false,
+            false,
+            "test_sink",
+            &Arc::new(Metrics::init()),
+            &SinkLabels::new("test_sink"),
+            shutdown_rx,
+        )
+        .await
+        .expect("consuming the stream should succeed");
+
+        let batches: Vec<_> = captured(plugin_id)
+            .into_iter()
+            .map(|batch| (batch.partition_id, batch.offsets))
+            .collect();
+        assert_eq!(
+            batches,
+            [(1, vec![0, 1])],
+            "the poll committed this batch, so a shutdown must not drop it"
         );
     }
 
