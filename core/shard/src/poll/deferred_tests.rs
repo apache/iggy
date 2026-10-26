@@ -33,7 +33,7 @@ use server_common::sharding::{PartitionLocation, ShardId};
 
 use crate::poll::completion::PollCompletionLane;
 use crate::poll::test_support::{PollTestMetadata, install_group_owner, partition_with_messages};
-use crate::poll::timeout_tests::PollTestBus;
+use crate::poll::timeout_tests::{PollTestBus, evict_messages_for_disk_dispatch};
 use crate::shards_table::PapayaShardsTable;
 use crate::{
     LifecycleFrame, PARTITION_READ_TIMEOUT, PartitionConsensusConfig, Receiver, ReplicaTopology,
@@ -235,6 +235,66 @@ async fn resident_poll_completes_while_disk_reads_hold_the_whole_read_budget() {
     ));
     let replies = submit(&owner, request(&owner, 2, false, false)).await;
     assert_eq!(offsets(&replies), [0, 1]);
+}
+
+#[compio::test]
+async fn freed_read_budget_starts_refused_disk_reads_in_refusal_order() {
+    let owner = owner(&["first"]).await;
+    // One message is below `min_count`, so the older waiter parks after a
+    // resident read and needs a disk read once the journal drops the batch.
+    let older = submit(&owner, request(&owner, 2, false, false)).await;
+    pending(&older);
+    evict_messages_for_disk_dispatch(&owner, namespace());
+    let mut held: Vec<_> =
+        std::iter::from_fn(|| owner.deferred_polls.reserve_read().ok()).collect();
+    let refused = submit(&owner, request(&owner, 2, false, false)).await;
+    pending(&refused);
+    assert_eq!(
+        owner.deferred_polls.state.borrow().read_queue,
+        BTreeSet::from([(0, 2)])
+    );
+
+    drop(held.pop());
+    owner.bus.now.set(DEADLINE);
+    owner.service_deferred_polls().await;
+    {
+        let state = owner.deferred_polls.state.borrow();
+        assert!(state.waiters[&2].running, "the read refused first starts");
+        assert!(
+            !state.waiters[&1].running,
+            "an older waiter queues behind a refused read"
+        );
+        assert_eq!(state.read_queue, BTreeSet::from([(DEADLINE, 1)]));
+        assert!(state.ready.is_empty(), "a full budget wakes nobody");
+    }
+
+    // Dropping the captured read frees its completion slot and its
+    // reservation, as a finished read does.
+    owner.bus.spawned_tasks.borrow_mut().clear();
+    owner.service_deferred_polls().await;
+    let state = owner.deferred_polls.state.borrow();
+    assert!(state.waiters[&1].running, "freed room wakes the next read");
+    assert!(state.read_queue.is_empty());
+}
+
+#[compio::test]
+async fn cancelled_refused_read_does_not_hold_back_later_reads() {
+    let owner = owner(&["first"]).await;
+    evict_messages_for_disk_dispatch(&owner, namespace());
+    let mut held: Vec<_> =
+        std::iter::from_fn(|| owner.deferred_polls.reserve_read().ok()).collect();
+    let cancelled = submit(&owner, request(&owner, 2, false, false)).await;
+    let later = submit(&owner, request(&owner, 2, false, false)).await;
+    assert_eq!(owner.deferred_polls.state.borrow().read_queue.len(), 2);
+
+    drop(cancelled);
+    drop(held.pop());
+    owner.service_deferred_polls().await;
+    pending(&later);
+    let state = owner.deferred_polls.state.borrow();
+    assert!(!state.waiters.contains_key(&1));
+    assert!(state.waiters[&2].running);
+    assert!(state.read_queue.is_empty());
 }
 
 #[compio::test]
@@ -624,6 +684,7 @@ fn assert_released(owner: &TestShard) {
     assert!(state.partitions.is_empty());
     assert!(state.deadlines.is_empty());
     assert!(state.ready.is_empty());
+    assert!(state.read_queue.is_empty());
 }
 
 #[compio::test]

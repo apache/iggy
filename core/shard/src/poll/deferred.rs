@@ -140,6 +140,9 @@ struct Waiter {
     last_visibility: Option<Option<u64>>,
     running: bool,
     terminal: bool,
+    /// When a full read budget first refused this waiter. It keeps the
+    /// waiter's place in the read queue until one of its reads starts.
+    refused_at: Option<u64>,
 }
 
 /// Only a watched partition has a notifier, so only its commits mark it.
@@ -171,6 +174,8 @@ struct State {
     sessions: BTreeMap<PollQuotaIdentity, usize>,
     ready: VecDeque<u64>,
     queued: BTreeSet<u64>,
+    /// Parked waiters whose read the budget refused, by `(refused_at, id)`.
+    read_queue: BTreeSet<(u64, u64)>,
     maintenance_cursor: u64,
     closed: bool,
 }
@@ -311,16 +316,49 @@ impl DeferredPolls {
         state.sessions.clear();
         state.ready.clear();
         state.queued.clear();
+        state.read_queue.clear();
         self.metrics.pending.set(0);
         *self.signals.borrow_mut() = Signals::default();
+    }
+
+    fn has_read_room(&self) -> bool {
+        Self::with_read(
+            &self.config.borrow(),
+            self.inflight_bytes.load(Ordering::Relaxed),
+        )
+        .is_some()
+    }
+
+    /// Takes a waiter out of the read queue for a probe. Only a read that the
+    /// budget refuses again puts it back, at the same place.
+    fn take_read_place(&self, id: u64, waiter: &mut Waiter) -> Option<u64> {
+        let refused_at = waiter.refused_at.take()?;
+        self.state.borrow_mut().read_queue.remove(&(refused_at, id));
+        Some(refused_at)
+    }
+
+    /// A read starts only ahead of every refused read, so that a waiter
+    /// whose read keeps coming back cannot take the budget from a refused
+    /// one. A refused read joins the queue at `place`.
+    fn reserve_read_in_turn(&self, place: (u64, u64)) -> Option<ReadReservation> {
+        let mut state = self.state.borrow_mut();
+        let reservation = state
+            .read_queue
+            .first()
+            .is_none_or(|first| place < *first)
+            .then(|| self.reserve_read().ok())
+            .flatten();
+        if reservation.is_none() {
+            state.read_queue.insert(place);
+        }
+        reservation
     }
 
     fn reserve_read(&self) -> Result<ReadReservation, IggyError> {
         let config = *self.config.borrow();
         self.inflight_bytes
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-                used.checked_add(config.max_read_bytes)
-                    .filter(|next| *next <= config.max_inflight_bytes)
+                Self::with_read(&config, used)
             })
             .map_err(|_| IggyError::DeferredPollCapacityExceeded)?;
         self.metrics
@@ -331,6 +369,12 @@ impl DeferredPolls {
             bytes: config.max_read_bytes,
             used: Arc::clone(&self.inflight_bytes),
         })
+    }
+
+    /// The in-flight read bytes after one more reservation, if they fit.
+    fn with_read(config: &DeferredPollConfig, used: usize) -> Option<usize> {
+        used.checked_add(config.max_read_bytes)
+            .filter(|next| *next <= config.max_inflight_bytes)
     }
 
     /// Returns the namespaces that no waiter watches any more.
@@ -347,6 +391,7 @@ impl DeferredPolls {
         }
         state.queued.remove(&id);
         state.ready.retain(|queued| *queued != id);
+        state.read_queue.retain(|(_, queued)| *queued != id);
         self.metrics.pending.dec();
         if let Some(count) = state.sessions.get_mut(&quota) {
             *count -= 1;
@@ -549,6 +594,7 @@ where
                     last_visibility: None,
                     running: false,
                     terminal: false,
+                    refused_at: None,
                 },
             );
             state.enqueue(id);
@@ -590,6 +636,12 @@ where
                             state.enqueue(id);
                         }
                     }
+                    // Freed room goes to the read that the budget refused first.
+                    if let Some(&(_, id)) = state.read_queue.first()
+                        && self.deferred_polls.has_read_room()
+                    {
+                        state.enqueue(id);
+                    }
                     let next = state.ready.pop_front();
                     if let Some(id) = next {
                         state.queued.remove(&id);
@@ -612,6 +664,7 @@ where
 
     #[allow(clippy::future_not_send)]
     async fn probe_deferred_poll(&self, id: u64, mut waiter: Waiter) {
+        let refused_at = self.deferred_polls.take_read_place(id, &mut waiter);
         if waiter.reply.is_disconnected() {
             self.metrics.deferred_polls.cancelled.inc();
             self.remove_deferred_poll(id, &waiter);
@@ -659,8 +712,13 @@ where
             return;
         }
         // A busy budget only delays the read. The waiter keeps its last
-        // visibility, so maintenance or the next commit probes it again.
-        let Ok(reservation) = self.deferred_polls.reserve_read() else {
+        // visibility, so that its next probe does not skip the read.
+        let place = (
+            refused_at.unwrap_or_else(|| self.bus.monotonic_micros()),
+            id,
+        );
+        let Some(reservation) = self.deferred_polls.reserve_read_in_turn(place) else {
+            waiter.refused_at = Some(place.0);
             self.deferred_polls
                 .state
                 .borrow_mut()

@@ -437,16 +437,15 @@ async fn given_disconnected_owner_when_disk_poll_arrives_should_reject_before_di
     assert_eq!(committed, None);
 }
 
-/// Remove the fixture's only resident batch to select disk dispatch without
+/// Remove the fixture's resident batches to select disk dispatch without
 /// creating files. Captured tasks must stay unpolled: these tests establish
 /// admission behavior, while real disk reads are covered in partition tests.
-fn evict_messages_for_disk_dispatch(owner: &PollTestShard, namespace: IggyNamespace) {
+pub(super) fn evict_messages_for_disk_dispatch(owner: &PollTestShard, namespace: IggyNamespace) {
     let partitions = owner.plane.partitions();
     let partition = partitions
         .remove(&namespace)
         .expect("fixture partition exists");
-    let retained = partition.log.journal().inner.evict_prefix(1);
-    assert!(retained.is_empty(), "fixture has exactly one batch");
+    partition.log.journal().inner.evict_prefix(usize::MAX);
     assert!(
         partition
             .log
