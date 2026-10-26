@@ -220,11 +220,17 @@ impl Selection {
     /// disk read that its walk budget would stop earlier is not predicted, and
     /// it runs when one of these holds or when the wait expires.
     fn finishes_read(self, options: &DeferredPollOptions, max_read_bytes: usize) -> bool {
-        let byte_limit = (options.max_bytes as usize)
-            .min(max_read_bytes)
-            .saturating_sub(POLL_RESPONSE_HEADER_SIZE);
-        self.messages >= options.min_count || self.bytes >= byte_limit
+        self.messages >= options.min_count
+            || self.bytes >= reply_byte_limit(options, max_read_bytes)
     }
+}
+
+/// The selection bytes that a reply to `options` keeps, counted as
+/// `PollReadResult::limit_bytes` counts them.
+fn reply_byte_limit(options: &DeferredPollOptions, max_read_bytes: usize) -> usize {
+    (options.max_bytes as usize)
+        .min(max_read_bytes)
+        .saturating_sub(POLL_RESPONSE_HEADER_SIZE)
 }
 
 /// Only a watched partition has a notifier, so only its commits mark it.
@@ -911,6 +917,10 @@ where
         };
         // Snapshot, disk selection and index loading can coexist.
         let max_bytes = reservation.bytes / READ_BUDGET_PARTS;
+        let max_selected_bytes = reply_byte_limit(
+            &waiter.request.options,
+            self.deferred_polls.config.borrow().max_read_bytes,
+        );
         let completion =
             match self
                 .poll_completions
@@ -930,7 +940,7 @@ where
             .waiters
             .insert(id, waiter);
         self.bus.spawn(async move {
-            completion.complete(plan.execute_with_limit(max_bytes).await);
+            completion.complete(plan.execute_with_limit(max_bytes, max_selected_bytes).await);
         });
     }
 

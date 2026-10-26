@@ -353,8 +353,10 @@ its existing command and route.
 The server defaults to a 30-second maximum readiness wait, 1024 pending polls per
 shard, 64 per logical session (or HTTP user), 16 MiB per read reservation and
 64 MiB of in-flight read reservations. A longer requested wait is shortened to
-the server maximum. A disk read stops at its reservation and returns what it
-read, even below `min_count`. Configure
+the server maximum. A disk read stops after the messages that fill `max_bytes`,
+capped at the read reservation. If its buffers fill their share of that
+reservation first, it stops there. It returns what it read, even below
+`min_count`. Configure
 `sharding.deferred_poll_*` accordingly. The response cap is applied to the selected
 result; it does not cap all storage work. Capacity refusal returns
 `DeferredPollCapacityExceeded` (90); clients back off on the same route. A
