@@ -14499,6 +14499,240 @@ mod dvc_suffix_window_tests {
 }
 
 #[cfg(test)]
+mod installed_transfer_dvc_tests {
+    //! A lagging replica adopts a `StartView` and later installs a state
+    //! transfer below that view's head. The install rewinds the sequencer to
+    //! the transfer's op and keeps the adopted view. Each `DoViewChange` the
+    //! replica sends from then on carries the transfer op in its header but
+    //! starts its suffix at the adopted head, and its peers drop every one as
+    //! unreadable. With a third replica down, or back with an untrusted log,
+    //! no quorum of readable votes forms and the view change never ends.
+
+    use super::*;
+    use consensus::{LocalPipeline, dvc_suffix_decode};
+    use iggy_common::{IggyByteSize, PartitionStats};
+    use journal::prepare_journal::PrepareJournal;
+    use message_bus::IggyMessageBus;
+    use server_common::iobuf::Owned;
+    use std::sync::Arc;
+
+    const CLUSTER: u128 = 1;
+    const REPLICA_COUNT: u8 = 3;
+    const GROUP: u64 = 42;
+    /// Adopts the view, then installs the transfer.
+    const LAGGING: u8 = 2;
+    /// Led by replica 0.
+    const ADOPTED_VIEW: u32 = 3;
+    /// Led by replica 1, which receives the lagging replica's vote.
+    const NEXT_VIEW: u32 = 4;
+    const HEAD: u64 = 300;
+    /// Two below the head, so the adopted view still carries uncommitted ops.
+    const COMMIT: u64 = HEAD - 2;
+
+    #[compio::test]
+    #[ignore = "known bug: a transfer installed below the adopted view head makes the replica's DoViewChange unreadable; run with --ignored"]
+    async fn given_a_transfer_installed_below_the_adopted_head_when_a_view_change_follows_should_send_a_readable_do_view_change()
+     {
+        // Inside the 128-entry window, so only the head disagrees.
+        let transfer = HEAD - 100;
+        // Boxed: the setup future carries a whole partition.
+        let (vote, message) = Box::pin(vote_after_install(transfer)).await;
+        let VsrAction::SendDoViewChange { suffix, .. } = &vote else {
+            unreachable!("matched in vote_after_install");
+        };
+        let header = message.header();
+        // What `decode_peer_suffix` runs on the receiving replica.
+        if let Err(error) = dvc_suffix_decode(
+            &message.as_slice()[size_of::<DoViewChangeHeader>()..],
+            header.op,
+            header.nack_bitset,
+            header.present_bitset,
+        ) {
+            panic!(
+                "replica {LAGGING} adopted a view with head {HEAD} and then installed a state \
+                 transfer at op {transfer}. Its DoViewChange carries op {} in the header but starts \
+                 its suffix at op {}, so the receiver drops it as unreadable ({error}) and the \
+                 view change cannot complete without a vote from the third replica",
+                header.op,
+                suffix.headers().first().map_or(0, |entry| entry.op),
+            );
+        }
+    }
+
+    #[compio::test]
+    #[ignore = "known bug: a transfer installed far below the adopted view head leaves uncommitted ops outside the DoViewChange window; run with --ignored"]
+    async fn given_a_transfer_installed_far_below_the_adopted_head_when_a_view_change_follows_should_describe_every_uncommitted_op()
+     {
+        // Past the 128-entry window.
+        let transfer = HEAD - 200;
+        let (vote, _) = Box::pin(vote_after_install(transfer)).await;
+        let VsrAction::SendDoViewChange { commit, suffix, .. } = &vote else {
+            unreachable!("matched in vote_after_install");
+        };
+        let floor = suffix.headers().last().map_or(0, |entry| entry.op);
+        assert!(
+            floor <= *commit,
+            "replica {LAGGING}'s DoViewChange window starts at op {floor}, above its commit point \
+             {commit}, so ops {}..={} go out described by nobody and the view change cannot decide \
+             them. The install put the sequencer {} ops below the adopted head, past the \
+             {DVC_HEADERS_MAX}-entry window that `build_dvc_suffix` treats as unreachable",
+            commit + 1,
+            floor.saturating_sub(1),
+            HEAD - transfer,
+        );
+    }
+
+    /// The lagging replica's vote for `NEXT_VIEW`, and the frame the shard sends
+    /// for it. Before the vote, the replica adopts the `ADOPTED_VIEW` `StartView`
+    /// and then installs a peer's state transfer at `transfer`.
+    #[allow(clippy::future_not_send)]
+    async fn vote_after_install(transfer: u64) -> (VsrAction, Message<DoViewChangeHeader>) {
+        let bus = IggyMessageBus::new(0);
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let captured = Rc::clone(&sent);
+        bus.set_replica_forward_fn(Box::new(move |_, _, frame| {
+            captured.borrow_mut().push(frame);
+            Ok(())
+        }));
+        for peer in (0..REPLICA_COUNT).filter(|&peer| peer != LAGGING) {
+            assert!(bus.owner_table().try_claim(peer, 1));
+        }
+        let consensus = VsrConsensus::new(
+            CLUSTER,
+            LAGGING,
+            REPLICA_COUNT,
+            GROUP,
+            bus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let mut partition: IggyPartition<IggyMessageBus> = IggyPartition::with_in_memory_storage(
+            Arc::new(PartitionStats::default()),
+            consensus,
+            IggyByteSize::from(1024 * 1024),
+        );
+
+        // `on_start_view`: adopt, then reconcile the journal against the view.
+        let announce = start_view();
+        let actions = partition
+            .consensus()
+            .try_handle_start_view(
+                PlaneKind::Partitions,
+                announce.header(),
+                &announce.as_slice()[size_of::<StartViewHeader>()..],
+                |op| partition.applied_header(op),
+            )
+            .expect("the StartView is well formed");
+        assert!(!actions.is_empty(), "the lagging replica adopts the view");
+        let pending = partition.consensus().pending_view_log();
+        reconcile_partition_view_divergence(0, &mut partition, pending.as_ref()).await;
+
+        // Repair finds the gap evicted at every peer, so a transfer follows. The
+        // install cannot run here: its offsets artifact is a type private to
+        // `partitions`. So these are its journal wipe and then the steps of
+        // `publish_installed_consensus`, in its order, with a checkpoint prepare
+        // built here in place of the origin's. They rewind the sequencer to
+        // `transfer` and keep the adopted view.
+        let checkpoint = Message::<PrepareHeader>::new(size_of::<PrepareHeader>())
+            .transmute_header(|_, header: &mut PrepareHeader| {
+                *header = prepare_header(transfer, 0);
+            });
+        partition.log.journal().inner.clear_all();
+        partition.log.journal().inner.restore_checkpoint_prepare(
+            transfer,
+            Owned::<MESSAGE_ALIGN>::copy_from_slice(checkpoint.as_slice()).into(),
+        );
+        let consensus = partition.consensus();
+        consensus.set_commit_floor(transfer);
+        consensus.sequencer().set_sequence(transfer);
+        consensus.set_last_prepare_checksum(checkpoint.header().checksum);
+        consensus.clear_pipeline();
+        consensus.advance_commit_max(transfer);
+
+        // `on_start_view_change`: snapshot the suffix, then vote.
+        refresh_partition_dvc_suffix(&partition);
+        let consensus = partition.consensus();
+        let actions =
+            consensus.handle_start_view_change(PlaneKind::Partitions, start_view_change().header());
+        let vote = actions
+            .iter()
+            .find(|action| matches!(action, VsrAction::SendDoViewChange { .. }))
+            .cloned()
+            .expect("the lagging replica votes");
+        dispatch_partition_wire_actions::<_, _, PrepareJournal, _>(consensus, &partition, actions)
+            .await;
+        let message = sent
+            .borrow()
+            .iter()
+            .find_map(|frame| {
+                Message::<DoViewChangeHeader>::try_from(Owned::copy_from_slice(frame.as_slice()))
+                    .ok()
+            })
+            .expect("the vote goes out on the wire");
+        (vote, message)
+    }
+
+    /// The `ADOPTED_VIEW` `StartView`: its head and commit point, with the
+    /// hash-chained headers of `COMMIT..=HEAD`, high-to-low.
+    fn start_view() -> Message<StartViewHeader> {
+        let mut headers = Vec::new();
+        let mut parent = 0;
+        for op in COMMIT..=HEAD {
+            let header = prepare_header(op, parent);
+            parent = header.checksum;
+            headers.push(header);
+        }
+        headers.reverse();
+        let header_size = size_of::<StartViewHeader>();
+        let total = header_size + size_of_val(headers.as_slice());
+        let mut message = Message::<StartViewHeader>::new(total);
+        encode_prepare_headers(&headers, &mut message.as_mut_slice()[header_size..total]);
+        message.transmute_header(|_, header: &mut StartViewHeader| {
+            header.command = Command::StartView;
+            header.cluster = CLUSTER;
+            header.view = ADOPTED_VIEW;
+            header.op = HEAD;
+            header.commit = COMMIT;
+            header.replica = 0;
+            header.group = GROUP;
+            header.size = u32::try_from(total).unwrap();
+        })
+    }
+
+    fn start_view_change() -> Message<StartViewChangeHeader> {
+        Message::<StartViewChangeHeader>::new(size_of::<StartViewChangeHeader>()).transmute_header(
+            |_, header: &mut StartViewChangeHeader| {
+                header.command = Command::StartViewChange;
+                header.cluster = CLUSTER;
+                header.view = NEXT_VIEW;
+                header.replica = 1;
+                header.group = GROUP;
+                header.size = u32::try_from(size_of::<StartViewChangeHeader>()).unwrap();
+            },
+        )
+    }
+
+    /// A body-less prepare header at `op` in `ADOPTED_VIEW`, chained to `parent`.
+    fn prepare_header(op: u64, parent: u128) -> PrepareHeader {
+        let mut header = PrepareHeader {
+            command: Command::Prepare,
+            cluster: CLUSTER,
+            group: GROUP,
+            operation: Operation::StoreConsumerOffset,
+            size: u32::try_from(size_of::<PrepareHeader>()).unwrap(),
+            op,
+            commit: op - 1,
+            timestamp: op,
+            parent,
+            view: ADOPTED_VIEW,
+            ..PrepareHeader::default()
+        };
+        header.checksum = header.identity_checksum();
+        header
+    }
+}
+
+#[cfg(test)]
 mod adopted_view_retention_tests {
     //! The view 12 stall of workload-fuzz seed 890 at 45a4ea297. Replica 0
     //! adopted the view-11 `StartView` (head 26, commit 26), repaired ops 24 and
