@@ -174,7 +174,7 @@ std::vector<PersonalAccessTokenInfo> IggyBlockingClient::GetPersonalAccessTokens
     });
 }
 
-void IggyBlockingClient::DeletePersonalAccessToken(const std::string &name) {
+void IggyBlockingClient::DeletePersonalAccessToken(std::string name) {
     RethrowAsIggyException(
         [this, &name](ffi::ErrorInfo &error_info) { Handle()->delete_personal_access_token(name, error_info); });
 }

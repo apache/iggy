@@ -1356,13 +1356,13 @@ impl Client {
 
     pub fn delete_personal_access_token(
         &self,
-        name: String,
+        name: &str,
         error_info: &mut ffi::ErrorInfo,
     ) -> Result<(), String> {
         *error_info = ffi::ErrorInfo::default();
         RUNTIME.block_on(async {
             self.inner
-                .delete_personal_access_token(&name)
+                .delete_personal_access_token(name)
                 .await
                 .inspect_err(|error| error_info.record(error))
                 .map_err(|error| {

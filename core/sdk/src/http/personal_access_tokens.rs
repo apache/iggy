@@ -30,6 +30,10 @@ use secrecy::SecretString;
 
 const PATH: &str = "/personal-access-tokens";
 
+fn delete_path(name: &str) -> String {
+    format!("{PATH}/{}", encode_segment(name))
+}
+
 #[async_trait]
 impl PersonalAccessTokenClient for HttpClient {
     async fn get_personal_access_tokens(&self) -> Result<Vec<PersonalAccessTokenInfo>, IggyError> {
@@ -63,8 +67,11 @@ impl PersonalAccessTokenClient for HttpClient {
     }
 
     async fn delete_personal_access_token(&self, name: &str) -> Result<(), IggyError> {
-        self.delete(&format!("{PATH}/{}", encode_segment(name)))
-            .await?;
+        // The URL parser resolves "." and ".." even when percent-encoded, so the request would hit another route.
+        if matches!(name, "." | "..") {
+            return Err(IggyError::InvalidPersonalAccessTokenName);
+        }
+        self.delete(&delete_path(name)).await?;
         Ok(())
     }
 
@@ -86,5 +93,28 @@ impl PersonalAccessTokenClient for HttpClient {
             .map_err(|_| IggyError::InvalidJsonResponse)?;
         self.set_token_from_identity(&identity_info).await?;
         Ok(identity_info)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn given_reserved_characters_when_building_delete_path_should_percent_encode() {
+        assert_eq!(delete_path("abc?x"), "/personal-access-tokens/abc%3Fx");
+        assert_eq!(delete_path("a/b"), "/personal-access-tokens/a%2Fb");
+    }
+
+    #[tokio::test]
+    async fn given_dot_segment_name_when_deleting_should_fail_before_sending() {
+        let client = HttpClient::default();
+
+        for name in [".", ".."] {
+            assert!(matches!(
+                client.delete_personal_access_token(name).await,
+                Err(IggyError::InvalidPersonalAccessTokenName)
+            ));
+        }
     }
 }

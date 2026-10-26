@@ -209,7 +209,7 @@ impl From<RustPersonalAccessTokenInfo> for ffi::PersonalAccessTokenInfo {
         ffi::PersonalAccessTokenInfo {
             name: token.name,
             has_expiry,
-            expiry_at: token.expiry_at.map_or(0, |expiry_at| expiry_at.as_micros()),
+            expiry: token.expiry_at.map_or(0, |expiry_at| expiry_at.as_micros()),
         }
     }
 }
@@ -2122,13 +2122,13 @@ mod tests {
         });
         assert_eq!(expiring.name, "ci-bot");
         assert!(expiring.has_expiry);
-        assert_eq!(expiring.expiry_at, 1_700_000_000_000_000);
+        assert_eq!(expiring.expiry, 1_700_000_000_000_000);
 
         let permanent = ffi::PersonalAccessTokenInfo::from(RustPersonalAccessTokenInfo {
             name: "laptop".to_owned(),
             expiry_at: None,
         });
         assert!(!permanent.has_expiry);
-        assert_eq!(permanent.expiry_at, 0);
+        assert_eq!(permanent.expiry, 0);
     }
 }

@@ -1329,7 +1329,7 @@ class UserInfoDetails final {
  * @brief Snapshot of one personal access token's metadata.
  *
  * GetPersonalAccessTokens() returns one value for each token owned by the
- * caller. The secret token string is never included. ExpiresAt() is expressed
+ * caller. The secret token string is never included. Expiry() is expressed
  * in microseconds since the Unix epoch and is empty when the token never
  * expires.
  */
@@ -1345,7 +1345,7 @@ class PersonalAccessTokenInfo final {
      * @brief Returns the expiry timestamp.
      * @return Timestamp in microseconds since the Unix epoch, or empty when the token never expires.
      */
-    [[nodiscard]] std::optional<std::uint64_t> ExpiresAt() const noexcept { return expires_at_; }
+    [[nodiscard]] std::optional<std::uint64_t> Expiry() const noexcept { return expires_at_; }
 
   private:
     PersonalAccessTokenInfo(std::string name, std::optional<std::uint64_t> expires_at)
@@ -6019,7 +6019,7 @@ class IggyBlockingClient final {
      *         client is unavailable or unauthenticated; the token does not
      *         exist; or the request fails.
      */
-    void DeletePersonalAccessToken(const std::string &name);
+    void DeletePersonalAccessToken(std::string name);
 
     /**
      * @brief Creates a user account.

@@ -471,7 +471,7 @@ mod ffi {
     struct PersonalAccessTokenInfo {
         name: String,
         has_expiry: bool,
-        expiry_at: u64,
+        expiry: u64,
     }
 
     struct LoginInfo {
@@ -1078,7 +1078,7 @@ mod ffi {
         ) -> Result<String>;
         fn delete_personal_access_token(
             self: &Client,
-            name: String,
+            name: &str,
             error_info: &mut ErrorInfo,
         ) -> Result<()>;
         // fn login_with_personal_access_token(self: &Client, token: String) -> Result<IdentityInfo>;

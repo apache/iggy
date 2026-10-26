@@ -1252,6 +1252,41 @@ TEST_F(E2E_Client, GetPersonalAccessTokensAfterLoginSucceeds) {
     ASSERT_NO_THROW(client.GetPersonalAccessTokens());
 }
 
+TEST_F(E2E_Client, PersonalAccessTokenCanBeListedAndDeleted) {
+    RecordProperty("description",
+                   "Lists a created personal access token with its expiry, deletes it, and lists again.");
+    constexpr std::uint32_t create_personal_access_token_command_code = 42;
+    constexpr std::uint64_t expiry_micros                             = 3'600'000'000;
+    iggy::ffi::Client *raw_client                                     = GetLoggedInClient();
+    auto client                                                       = GetLoggedInHighLevelClient();
+    const std::string token_name                                      = GetRandomName(50);
+
+    rust::Vec<std::uint8_t> payload;
+    payload.push_back(static_cast<std::uint8_t>(token_name.size()));
+    for (const char character : token_name) {
+        payload.push_back(static_cast<std::uint8_t>(character));
+    }
+    for (int shift = 0; shift < 64; shift += 8) {
+        payload.push_back(static_cast<std::uint8_t>(expiry_micros >> shift));
+    }
+    iggy::ffi::ErrorInfo error_info{};
+    ASSERT_NO_THROW(raw_client->send_binary_request(create_personal_access_token_command_code, payload, error_info));
+
+    const auto tokens = client.GetPersonalAccessTokens();
+    const auto found =
+        std::find_if(tokens.begin(), tokens.end(), [&](const auto &token) { return token.Name() == token_name; });
+    EXPECT_NE(found, tokens.end());
+    if (found != tokens.end()) {
+        EXPECT_TRUE(found->Expiry().has_value());
+    }
+
+    ASSERT_NO_THROW(client.DeletePersonalAccessToken(token_name));
+    const auto remaining = client.GetPersonalAccessTokens();
+    EXPECT_EQ(std::count_if(remaining.begin(), remaining.end(),
+                            [&](const auto &token) { return token.Name() == token_name; }),
+              0);
+}
+
 TEST_F(E2E_Client, DeleteUnknownPersonalAccessTokenThrows) {
     RecordProperty("description", "Rejects deleting a personal access token that does not exist.");
     auto client = GetLoggedInHighLevelClient();
