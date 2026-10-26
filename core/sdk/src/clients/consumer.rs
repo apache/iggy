@@ -556,6 +556,7 @@ pub struct IggyConsumer {
     assignment_state: Option<(Arc<ConsumerGroupClientState>, String)>,
     buffered_capacity: Option<deferred::FetchCapacity>,
     initialized: bool,
+    uninitialized_poll_warned: bool,
     shutdown: Arc<AtomicBool>,
     can_poll: Arc<AtomicBool>,
     client: IggyRwLock<ClientWrapper>,
@@ -654,6 +655,7 @@ impl IggyConsumer {
             assignment_state: None,
             buffered_capacity: None,
             initialized: false,
+            uninitialized_poll_warned: false,
             shutdown: Arc::new(AtomicBool::new(false)),
             is_consumer_group,
             joined_consumer_group: Arc::new(AtomicBool::new(false)),
@@ -1411,6 +1413,14 @@ impl Stream for IggyConsumer {
             return Poll::Ready(None);
         }
         if !self.initialized {
+            // A loop that continues on errors would otherwise spin without a trace.
+            if !self.uninitialized_poll_warned {
+                self.uninitialized_poll_warned = true;
+                warn!(
+                    "Consumer: {} was polled before init(). Every poll fails until init() runs.",
+                    self.consumer_name
+                );
+            }
             return Poll::Ready(Some(Err(IggyError::InvalidConfiguration)));
         }
         loop {
@@ -2666,14 +2676,17 @@ mod tests {
         assert_eq!(consumer.get_last_stored_offset(1), Some(LOWER_OFFSET));
     }
 
-    /// Records the error events emitted on the test thread. The current-thread runtime of
-    /// `#[tokio::test]` polls the tasks it spawns on that thread, so their events count too.
-    #[derive(Clone, Default)]
-    struct ErrorReports(Arc<std::sync::Mutex<Vec<String>>>);
+    /// Records the events of one level emitted on the test thread. The current-thread runtime
+    /// of `#[tokio::test]` polls the tasks it spawns on that thread, so their events count too.
+    #[derive(Clone)]
+    struct LevelReports {
+        level: Level,
+        events: Arc<std::sync::Mutex<Vec<String>>>,
+    }
 
-    impl Subscriber for ErrorReports {
+    impl Subscriber for LevelReports {
         fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-            *metadata.level() == Level::ERROR
+            *metadata.level() == self.level
         }
 
         fn new_span(&self, _: &Attributes<'_>) -> Id {
@@ -2689,7 +2702,7 @@ mod tests {
             event.record(&mut |field: &Field, value: &dyn Debug| {
                 fields.push(format!("{field}: {value:?}"));
             });
-            self.0.lock().unwrap().push(fields.join(", "));
+            self.events.lock().unwrap().push(fields.join(", "));
         }
 
         fn enter(&self, _: &Id) {}
@@ -2697,12 +2710,26 @@ mod tests {
         fn exit(&self, _: &Id) {}
     }
 
-    impl ErrorReports {
+    impl LevelReports {
+        fn errors() -> Self {
+            Self {
+                level: Level::ERROR,
+                events: Arc::default(),
+            }
+        }
+
+        fn warnings() -> Self {
+            Self {
+                level: Level::WARN,
+                events: Arc::default(),
+            }
+        }
+
         /// Waits for the first report, or returns none after [`POLL_TIMEOUT`].
         async fn wait(&self) -> Vec<String> {
             let first = async {
                 loop {
-                    let reports = self.0.lock().unwrap().clone();
+                    let reports = self.events.lock().unwrap().clone();
                     if !reports.is_empty() {
                         return reports;
                     }
@@ -2715,7 +2742,7 @@ mod tests {
 
     #[tokio::test]
     async fn interval_commit_should_report_a_failed_store() {
-        let recorder = ErrorReports::default();
+        let recorder = LevelReports::errors();
         let _subscriber = tracing::subscriber::set_default(recorder.clone());
         let consumer = builder().partition(Some(1)).build();
         consumer
@@ -2742,7 +2769,7 @@ mod tests {
 
     #[tokio::test]
     async fn queued_commit_should_report_a_failed_store() {
-        let recorder = ErrorReports::default();
+        let recorder = LevelReports::errors();
         let _subscriber = tracing::subscriber::set_default(recorder.clone());
         let mut consumer = builder().partition(Some(1)).build();
         consumer.initialized = true;
@@ -3811,5 +3838,32 @@ mod tests {
         .await;
 
         assert_eq!(result, Ok(Err(IggyError::InvalidConfiguration)));
+    }
+
+    #[tokio::test]
+    async fn given_an_uninitialized_consumer_when_polled_should_fail_each_poll_and_warn_once() {
+        let mut consumer = builder_for(Consumer::default()).build();
+        let recorder = LevelReports::warnings();
+        let _subscriber = tracing::subscriber::set_default(recorder.clone());
+
+        let first = poll_once(&mut consumer).await;
+        let second = poll_once(&mut consumer).await;
+
+        for polled in [first, second] {
+            assert!(
+                matches!(polled, Err(IggyError::InvalidConfiguration)),
+                "every poll before init fails: {polled:?}"
+            );
+        }
+        let warnings = recorder.events.lock().unwrap().clone();
+        assert_eq!(
+            warnings.len(),
+            1,
+            "only the first poll before init warns: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("was polled before init()"),
+            "{warnings:?}"
+        );
     }
 }
