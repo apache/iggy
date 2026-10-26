@@ -1351,6 +1351,9 @@ class IggyClient:
         Create a personal access token for the currently authenticated user.
 
         The token is returned only once, so store it when this call completes.
+        If the reply is lost, a retry raises `RuntimeError` because the token
+        already exists, and its secret cannot be recovered. Delete the token by
+        name and create it again to get a usable secret.
 
         Args:
             name: Token name as `str`.

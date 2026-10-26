@@ -376,20 +376,21 @@ class TestLoginIdentity:
             personal_access_token = await iggy_client.create_personal_access_token(
                 name, IggyExpiry.NeverExpire()
             )
+            try:
+                host, port = get_server_config()
+                client = IggyClient(f"{host}:{port}")
+                await client.connect()
+                identity = await client.login_with_personal_access_token(
+                    personal_access_token
+                )
 
-            host, port = get_server_config()
-            client = IggyClient(f"{host}:{port}")
-            await client.connect()
-            identity = await client.login_with_personal_access_token(
-                personal_access_token
-            )
-
-            user = await client.get_user("iggy")
-            assert user is not None
-            assert identity.user_id == user.id
-            assert personal_access_token not in repr(identity)
+                user = await client.get_user("iggy")
+                assert user is not None
+                assert identity.user_id == user.id
+                assert personal_access_token not in repr(identity)
+            finally:
+                _delete_personal_access_token(api, jwt, name)
         finally:
-            _delete_personal_access_token(api, jwt, name)
             _delete_personal_access_token(api, jwt, helper_name)
 
     @pytest.mark.parametrize(
