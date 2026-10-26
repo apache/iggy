@@ -1945,6 +1945,111 @@ mod tests {
         assert_eq!(consumer.get_last_consumed_offset(3), Some(11));
     }
 
+    #[tokio::test]
+    async fn given_a_committed_batch_when_the_generation_or_assignment_changes_should_hand_over_the_rest()
+     {
+        let mut consumer = builder_for(Consumer::group(Identifier::numeric(1).unwrap()))
+            .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
+            .build();
+        let state = Arc::new(ConsumerGroupClientState::new());
+        let key = "1|1|1".to_owned();
+        let identifier = Identifier::numeric(1).unwrap();
+        state.register_group(
+            key.clone(),
+            identifier.clone(),
+            identifier.clone(),
+            identifier,
+        );
+        state.set_assignment(key.clone(), 1, vec![3]);
+        consumer.assignment_state = Some((Arc::clone(&state), key.clone()));
+        consumer.buffered_assignment = Some(AssignmentVersion {
+            session: state.session_generation(),
+            generation: 1,
+        });
+        consumer.initialized = true;
+        consumer.state.current_partition_id.store(3, ORDERING);
+        consumer.buffered_messages =
+            VecDeque::from(vec![message_at(10), message_at(11), message_at(12)]);
+        assert_eq!(poll_offset(&mut consumer), Poll::Ready(Some(Ok(10))));
+
+        consumer.fetch_generation.fetch_add(1, ORDERING);
+        assert_eq!(
+            poll_offset(&mut consumer),
+            Poll::Ready(Some(Ok(11))),
+            "the server committed the batch, so a new fetch generation keeps it"
+        );
+        state.set_assignment(key, 2, vec![3]);
+        assert_eq!(
+            poll_offset(&mut consumer),
+            Poll::Ready(Some(Ok(12))),
+            "the server committed the batch, so a new assignment keeps it"
+        );
+    }
+
+    #[test]
+    fn given_a_reread_up_to_the_delivered_offset_when_polled_should_hand_over_only_newer_messages()
+    {
+        const DELIVERED: u64 = 11;
+        let mut consumer = builder_for(Consumer::default())
+            .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
+            .build();
+        buffer_reread(&mut consumer, DELIVERED);
+
+        assert_eq!(
+            poll_offset(&mut consumer),
+            Poll::Ready(Some(Ok(DELIVERED + 1))),
+            "the application already took the messages up to {DELIVERED}"
+        );
+    }
+
+    #[test]
+    fn given_replay_when_a_reread_up_to_the_delivered_offset_is_polled_should_hand_it_over_again() {
+        const DELIVERED: u64 = 11;
+        let mut consumer = builder_for(Consumer::default())
+            .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
+            .allow_replay()
+            .build();
+        buffer_reread(&mut consumer, DELIVERED);
+
+        for offset in DELIVERED - 1..=DELIVERED + 1 {
+            assert_eq!(
+                poll_offset(&mut consumer),
+                Poll::Ready(Some(Ok(offset))),
+                "replay hands over every message that the batch read"
+            );
+        }
+    }
+
+    /// Buffers a batch that reads the messages around `delivered` again, in the
+    /// partition history in which the application took `delivered`.
+    fn buffer_reread(consumer: &mut IggyConsumer, delivered: u64) {
+        let position = position_at(delivered, 1);
+        consumer.initialized = true;
+        consumer
+            .state
+            .current_partition_id
+            .store(position.partition_id, ORDERING);
+        consumer
+            .state
+            .last_consumed_offsets
+            .insert(position.partition_id, position);
+        consumer.buffered_context = position.context;
+        consumer.buffered_messages = VecDeque::from(vec![
+            message_at(delivered - 1),
+            message_at(delivered),
+            message_at(delivered + 1),
+        ]);
+    }
+
+    /// The offset of the message that one poll of `consumer` hands over.
+    fn poll_offset(consumer: &mut IggyConsumer) -> Poll<Option<Result<u64, IggyError>>> {
+        Pin::new(consumer)
+            .poll_next(&mut Context::from_waker(Waker::noop()))
+            .map(|polled| {
+                polled.map(|received| received.map(|received| received.message.header.offset))
+            })
+    }
+
     #[test]
     fn group_member_tracks_delivered_positions_separately_per_partition() {
         let mut consumer = builder_for(Consumer::group(Identifier::numeric(1).unwrap()))
@@ -3401,6 +3506,32 @@ mod tests {
             Served(cluster).stored_offsets(),
             [DELIVERED],
             "the server can commit the batch of the aborted poll"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_committing_fetch_in_flight_when_the_generation_changes_should_hand_over_its_batch()
+     {
+        const FIRST: u64 = 5;
+        let (client, cluster) = connect_to_three_replicas().await;
+        let mut consumer = committing_consumer(client).await;
+        cluster.hold(POLL_MESSAGES_DEFERRED_CODE);
+        cluster.script(
+            &endpoint(PARTITION_PRIMARY),
+            POLL_MESSAGES_DEFERRED_CODE,
+            [poll_of_one_message(FIRST)],
+        );
+        start_fetch(&mut consumer, &cluster).await;
+
+        // The worker reads the generation only at the top of its loop, so it
+        // hands this batch over with the generation that the fetch started in.
+        consumer.fetch_generation.fetch_add(1, ORDERING);
+        cluster.release(POLL_MESSAGES_DEFERRED_CODE);
+        let polled = timeout(TEST_BUDGET, poll_once(&mut consumer)).await;
+
+        assert!(
+            matches!(&polled, Ok(Ok(received)) if received.message.header.offset == FIRST),
+            "the server committed this batch, so a new fetch generation must not drop it: {polled:?}"
         );
     }
 
