@@ -77,11 +77,15 @@ lifecycle rule that deletes or archives objects: Iggy deletes them itself, and a
 cannot be read without a restore. The `fs` backend points at a directory on another filesystem. It
 is what tests use and what "archive to disk" means.
 
-Every node must point at the same backend. Each node registers a fingerprint of its backend (kind,
-bucket or path, prefix, endpoint) in the metadata plane. Enabling tiering on a topic records the
-fingerprint with the topic and is refused while any node's differs, and a node whose fingerprint
-differs from a topic's neither uploads nor serves polls for it. A node that finds tiered segments
-on disk with no backend configured refuses to boot.
+Every node must reach the same store, and matching configuration cannot prove it: per-node `fs`
+directories at one path, or a MinIO on each node's `localhost`, look identical. The cluster writes a
+store identity object under its prefix once, and a node uploads, evicts or reads remote segments
+only after reading that object back through its own backend since it booted. Enabling tiering on a
+topic is refused while any node cannot. A store that becomes unreachable later is an outage, during
+which eviction of floored segments continues, while an identity found missing or different stops
+the node's uploads, eviction and remote reads and answers `TieredReadFailed`. A node booted during
+an outage evicts nothing until the store returns. A node that finds tiered segments on disk with no
+backend configured refuses to boot.
 
 A topic opts in with options, at creation or later:
 
@@ -246,7 +250,12 @@ the segment list, so resolving a poll's start by offset or timestamp is unchange
 Every replica can check the uploaded bytes against its own copy before evicting, without re-reading
 the segment on the eviction path. A mismatch never evicts and never advances the floor. To that end
 each replica of a tiered topic hashes every segment on its commit path, so the hash describes the
-bytes consensus agreed on rather than what a disk returns later.
+bytes consensus agreed on rather than what a disk returns later. A segment not fully hashed that
+way, because it sealed or was active before the replica applied the enable, or arrived by state
+transfer, is hashed once from disk, a weaker guarantee named as such. Hashes are durable from the
+moment they exist: a replica keeps each segment's hash, each applied advance's hash until its check
+has run, and the check's result, and state transfer carries them, so no restart, snapshot or
+install loses a hash or a pending check.
 
 #### Primary: upload and floor advancement
 
@@ -267,9 +276,11 @@ Upload reads the sealed `.log` up to its committed size through its own file des
 working if retention unlinks the file. It validates every batch checksum and compares the stream's
 hash with the commit-path hash, so a primary's media fault fails the upload and raises an alarm
 instead of reaching the store. The store verifies a body checksum, and the upload counts only when
-it matches. A key that already exists counts as uploaded only after a HEAD shows the same size and
-checksum, and a difference raises a divergence alarm and leaves the floor. If `deleted_up_to_offset`
-passed the segment during the upload, the object is scheduled for deletion.
+it matches. A `.log` key that already exists counts as uploaded only after a HEAD shows the same
+size and checksum, and a difference raises a divergence alarm and leaves the floor. An existing
+`.index` key needs only to be a valid index for that `.log`, since sparse indexes differ per
+replica. If the primary's barrier-clamped removal retired the segment during the upload, its objects
+are scheduled for deletion and no advance covers it. The watermark alone never deletes an object.
 
 On success the primary commits `AdvanceTieredFloor { created_revision, start, up_to, hash }` to the
 partition's control log: the incarnation, the first offset the advance covers, the segment's last
@@ -323,14 +334,20 @@ that group's primary, possibly on another node. The floor advances at most once 
 segment, so either serves. This RFC needs from the facility the command encoding, the apply hook, a
 durable snapshot with the control log's own replay point, and state-transfer inclusion.
 
-The state machine holds one value, `tiered_up_to_offset`, for the incarnation named by its
-`created_revision`. `AdvanceTieredFloor` applies as follows:
+The state machine holds one value, `tiered_up_to_offset`, and the `created_revision` it belongs to.
+The partition's current incarnation lives in metadata, which the control log is not ordered with, so
+the state carries its own. `AdvanceTieredFloor` applies as follows:
 
-- A `created_revision` other than the partition's is refused, as `TruncatePartition` refuses a stale
-  incarnation.
+- A `created_revision` below the state's is refused, so a delayed command of a deleted incarnation
+  never reaches its successor. One above the state's starts an empty floor for that incarnation.
 - A `start` above `floor + 1` is refused, so the floor never jumps over a segment nobody uploaded.
   An empty floor counts as `floor + 1 = 0`.
 - Otherwise the floor becomes `max(floor, up_to)`, and a repeated advance is a no-op.
+
+The state learns of a new incarnation only from its first advance, so every reader of the floor
+(the upload loop, a new primary's duties, eviction) and every hash check uses the state or an
+advance only when its `created_revision` is the partition's local incarnation, and otherwise treats
+the floor as empty and the check as not yet due.
 
 Apply reads nothing but the command and the state, so every replica reaches the same floor whatever
 its data log's progress, and eviction, not apply, clamps the floor to the local sealed chain. The
@@ -340,7 +357,7 @@ few bytes, and each replica checks the hash outside the state machine.
 The control log needs its own replay point: master's partition-state checkpoint is cut at the data
 log's commit point, so a floor applied after it would regress on restart, and the superblock, whose
 writes follow view changes rather than applies, is a poor fit. The floor rides state transfer,
-installed as the larger of the receiver's and the sender's, so a rebuilt replica never starts at
+installed as the larger `(created_revision, floor)` pair, so a rebuilt replica never starts at
 zero, and a floor that still trails a replica's markers is re-committed through them by the next
 primary. The floor is monotone for the life of the partition incarnation.
 
@@ -435,7 +452,7 @@ with backoff, so client retries reply at once and cost the store nothing.
 
 Transient store errors (throttling, timeouts, transport errors, a full cache) reply 58. Permanent
 ones (rejected credentials, an archived object, an object missing above what total retention
-removed, a malformed response, a fingerprint mismatch) reply a new non-retryable code,
+removed, a malformed response, a store identity mismatch) reply a new non-retryable code,
 `TieredReadFailed`, which every SDK learns. The Java SDK's poll path, which retries 58 every 50 ms,
 gains the backoff the Rust SDK has. Batch-checksum validation is always on for remote chunks. Only
 the primary serves polls, so cold reads and uploads happen on the same node, and after a rebalance
@@ -529,11 +546,12 @@ shard loses primacy or whose incarnation retires is cancelled for good.
   included, with the floor, and fetches indexes lazily. No segment bytes cross between replicas
   for tiered data.
 - **Delete.** The history fence of a two-phase delete does not reach the control log, so a delayed
-  floor command for a deleted incarnation is refused at apply by its `created_revision`, whether
-  the slot is empty or re-created. When metadata completes the delete, the reconciler removes the
-  directory and the incarnation's cache chunks, and the metadata primary queues its prefix for
-  object deletion. An orphan sweep lists `{prefix}/{cluster_uid}/` at incarnation granularity under
-  a metadata revision snapshot and deletes incarnations absent from metadata, as a safety net.
+  floor command for a deleted incarnation is refused at apply once the new incarnation's first
+  advance has applied, and before that it only moves a floor no reader of the new incarnation
+  uses. When metadata completes the delete, the reconciler removes the directory and the
+  incarnation's cache chunks, and the metadata primary queues its prefix for object deletion. An
+  orphan sweep lists `{prefix}/{cluster_uid}/` at incarnation granularity under a metadata
+  revision snapshot and deletes incarnations absent from metadata, as a safety net.
 - **Manifest object.** The primary uploads `manifest.bin` under `meta/` when the remote set changes,
   rate-limited. It is derived, never the source of truth for a live cluster, and exists so a
   partition can be restored into an empty cluster by reading one object and planting markers.
@@ -555,7 +573,7 @@ there are no server-level local retention defaults.
 
 | Key | Kind | Mutability | Default | Critical | Notes |
 | --- | --- | --- | --- | --- | --- |
-| `tiered_storage` | Bool | off to on only | off | yes | a new catalog mutability: turning it off is refused with `OptionNotUpdatable`; enabling records the backend fingerprint and is refused while any node's differs |
+| `tiered_storage` | Bool | off to on only | off | yes | a new catalog mutability: turning it off is refused with `OptionNotUpdatable`; enabling is refused while any node cannot read the store identity |
 | `local_retention_age` | expiry-style | updatable | 1 day | no | typed to tell "catalog default" from "unlimited", as `message_expiry` is; an explicit value above a finite `message_expiry` is refused, and the default yields to a shorter one |
 | `local_retention_size` | size-style | updatable | unlimited | no | per topic, divided by partition count like `max_topic_size`; an explicit value above a finite `max_topic_size` is refused |
 | `segment_max_age` | expiry-style | create-only | never | yes | age roll on any topic, tiered or not; at least 10 minutes; refused together with `preallocate_segments` |
@@ -574,8 +592,8 @@ admission records explicitly set critical keys as well.
    objects with every upload check passed (see [Roles](#roles)). No replica ever drops the last
    copy of committed data.
 2. Object keys are unique per cluster lifetime and partition incarnation, objects are immutable,
-   and `.log` bytes are identical from any replica. An existing key counts as a duplicate upload
-   only when its size and checksum match.
+   and `.log` bytes are identical from any replica. An existing `.log` key counts as a duplicate
+   upload only when its size and checksum match.
 3. Local eviction never touches the active segment, the WAL tail or checkpoint-cursor segment, or a
    sealed segment not yet uploaded. Tiered segments are always a prefix of the chain.
 4. Boot accepts a chain whose prefix is markers and refuses every other missing `.log`, every
@@ -593,8 +611,8 @@ admission records explicitly set critical keys as well.
 9. A segment with a local `.log` is read locally. The store is consulted only for segments whose
    local copy is gone.
 10. Correctness never depends on object store conditional writes. A conditional PUT is a cost
-    optimization, and neither a precondition failure nor an existing key is success without a size
-    and checksum match.
+    optimization, and neither a precondition failure nor an existing `.log` key is success without
+    a size and checksum match.
 11. Every tier wait of a poll runs under one deadline inside the read timeout, and cold polls never
     hold more completion-lane slots than their own cap, so a store outage never refuses a warm poll.
 12. Tiering never fills a data disk. Producers are refused before a node crosses its free-space
@@ -607,7 +625,7 @@ admission records explicitly set critical keys as well.
 | Store unreachable during upload | Uploads retry with backoff, the floor stays and eviction waits. Producers and consumers are unaffected while the disk has room, and the stalled gauge rises. Producers are refused before the free-space reserve, and eviction frees the space once the store returns. |
 | Store unreachable during a cold poll | The poll returns what it read within its deadline, or 58. Failed chunks are remembered, so retries cost no GETs, and the cold admission cap keeps warm polls serving. |
 | Store refuses for a permanent reason | `TieredReadFailed`, which no SDK retries, and an alarm naming the cause. |
-| Primary dies or is moved mid-upload | The old primary cancels its uploads. The new one re-commits the floor through its markers, lists the prefix, truncates to a verified trim point if needed and re-uploads. An existing key counts only after a size and checksum match. |
+| Primary dies or is moved mid-upload | The old primary cancels its uploads. The new one re-commits the floor through its markers, lists the prefix, truncates to a verified trim point if needed and re-uploads. An existing `.log` key counts only after a size and checksum match, and an existing `.index` only needs to be valid. |
 | Upload lands after its segment was deleted | The uploader schedules the object's deletion. The listing on becoming primary catches what a lost primary left. |
 | Primary's stream hash or a batch checksum fails during upload | The upload fails, the floor stays and an alarm rises. The other replicas still hold good copies. |
 | Replica's hash differs from the advance's | That replica never evicts the segment and raises a divergence alarm. |
@@ -621,8 +639,8 @@ admission records explicitly set critical keys as well.
 | Topic or partition deleted during an upload | The floor command names the deleted incarnation, so its apply is refused, and the metadata primary queues the prefix for deletion. |
 | WAL still hard-links an evicted segment | Eviction never touches the WAL tail or checkpoint-cursor segment. Below them, unlinking the public name is what retention does today. |
 | Cache full | The cache trims on the failed reservation. A fetch that still finds no room fails as transient, and the poll replies 58. |
-| Node boots during a store outage | It boots with `upload_stalled` raised. Only a deterministic misconfiguration refuses boot. |
-| Node's backend fingerprint differs from a topic's | The node neither uploads nor serves that topic's partitions, and enabling tiering is refused until fingerprints match. |
+| Node boots during a store outage | It boots with `upload_stalled` raised and evicts nothing until it has read the store identity. Only a deterministic misconfiguration refuses boot. |
+| Node finds the store identity missing or different | The node neither uploads, evicts nor reads remote segments, and answers `TieredReadFailed`. Enabling tiering is refused until every node reads it. |
 | Clock skew against the store | One re-sign with the offset the store's rejection reports. A second failure is a hard error. |
 
 ### Implementation plan
@@ -654,11 +672,11 @@ accepting a missing tiered prefix as a front trim.
    backend, configuration, metrics, and a pump tick latency metric, the server's first latency
    distribution. Its defaults are provisional until phase 4 measures them.
 4. **End to end.** The upload loop and the duties of a new primary, eviction staged on floor apply,
-   the poll error channel and `TieredReadFailed` in every SDK, topic options and fingerprints, the
-   retention split, primary object deletion and the orphan sweep, the chain file in state transfer,
-   and the free-space reserve. An upload backlog first exists here, so this phase also measures
-   uploads, cold reads, eviction and deletion together on one shard against the pump tick latency,
-   which settles the tuning defaults.
+   the poll error channel and `TieredReadFailed` in every SDK, topic options and the store
+   identity, the retention split, primary object deletion and the orphan sweep, the chain file in
+   state transfer, and the free-space reserve. An upload backlog first exists here, so this phase
+   also measures uploads, cold reads, eviction and deletion together on one shard against the pump
+   tick latency, which settles the tuning defaults.
 5. **Age roll.** `segment_max_age` as a general topic option, the roll rule in materialization and
    the WAL, and the WAL format change. Independent of tiering, so it can land first.
 6. **The bucket as an archive.** Manifests under `meta/`, shallow restore, the verify pass, and the
@@ -868,8 +886,8 @@ Open design decisions:
 - **A `segment_size` floor for tiered topics** above the catalog's 1 MiB, settled by measurement.
 - **Eager WAL checkpoints.** A lagging checkpoint holds local data past the envelope, since eviction
   stops at the checkpoint-cursor segment. Whether eviction should request one is open.
-- **Placement and fingerprints.** Whether the rebalance should avoid giving primacy to a node whose
-  backend fingerprint differs, rather than letting that node refuse the partition.
+- **Placement and store identity.** Whether the rebalance should avoid giving primacy to a node that
+  cannot read the store identity, rather than letting that node refuse the partition.
 - **Indexes in the cache.** Whether a remote segment's `.index` should move into the chunk cache, so
   the files the install backup links stop growing with total retention, at the price of an index
   fetch on a cold poll.
