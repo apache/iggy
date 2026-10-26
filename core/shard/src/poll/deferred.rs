@@ -72,9 +72,10 @@ pub struct DeferredPollContext {
 
 /// A deferred poll as the origin resolved it.
 ///
-/// The owner shard sets both deadlines from its own clock when the request
-/// arrives through `partition_read`, so a request that arrives any other way
-/// expires at once.
+/// The origin shard sets both deadlines in `partition_read` from the bus
+/// clock, which every shard of the process shares, before it routes the
+/// request to the owner. A request that skips `partition_read` keeps the
+/// zero deadlines of `new` and expires at once.
 #[derive(Debug)]
 pub struct DeferredPollRequest {
     pub consumer: PollingConsumer,
