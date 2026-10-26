@@ -275,10 +275,53 @@ async fn freed_read_budget_starts_refused_disk_reads_in_refusal_order() {
     // Dropping the captured read frees its completion slot and its
     // reservation, as a finished read does.
     owner.bus.spawned_tasks.borrow_mut().clear();
+    assert!(
+        owner
+            .deferred_polls
+            .poll_ready(&Context::from_waker(Waker::noop()))
+            .is_ready(),
+        "freed room wakes the pump"
+    );
     owner.service_deferred_polls().await;
     let state = owner.deferred_polls.state.borrow();
     assert!(state.waiters[&1].running, "freed room wakes the next read");
     assert!(state.read_queue.is_empty());
+}
+
+#[compio::test]
+async fn freed_read_budget_starts_a_refused_read_ahead_of_other_wakes() {
+    let owner = owner(&["first"]).await;
+    evict_messages_for_disk_dispatch(&owner, namespace());
+    let mut held: Vec<_> =
+        std::iter::from_fn(|| owner.deferred_polls.reserve_read().ok()).collect();
+    // Admitted first, these waits take the lower ids, so a maintenance wake
+    // queues them ahead of the refused read and fills a whole service turn.
+    let waits: Vec<_> = (0..SERVICE_BUDGET)
+        .map(|_| {
+            wait(
+                &owner,
+                vec![readiness_target(&owner, 0, PollingStrategy::offset(1))],
+            )
+        })
+        .collect();
+    let refused = submit(&owner, request(&owner, 2, false, false)).await;
+    let refused_id = u64::try_from(SERVICE_BUDGET).unwrap() + 1;
+    assert_eq!(
+        owner.deferred_polls.state.borrow().read_queue,
+        BTreeSet::from([(0, refused_id)])
+    );
+
+    drop(held.pop());
+    owner.deferred_polls.maintenance();
+    owner.service_deferred_polls().await;
+    pending(&refused);
+    let state = owner.deferred_polls.state.borrow();
+    assert!(
+        state.waiters[&refused_id].running,
+        "freed room goes to the refused read first"
+    );
+    assert!(state.read_queue.is_empty());
+    assert_eq!(state.readiness.len(), waits.len());
 }
 
 #[compio::test]

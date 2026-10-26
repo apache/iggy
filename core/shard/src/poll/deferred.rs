@@ -319,7 +319,13 @@ impl DeferredPolls {
 
     pub(crate) fn poll_ready(&self, context: &Context<'_>) -> Poll<()> {
         let mut signals = self.signals.borrow_mut();
-        if !signals.dirty.is_empty() || !self.state.borrow().ready.is_empty() {
+        let state = self.state.borrow();
+        // Freed read room wakes nobody, so a refused read that can start
+        // keeps the pump turning.
+        if !signals.dirty.is_empty()
+            || !state.ready.is_empty()
+            || (!state.read_queue.is_empty() && self.has_read_room())
+        {
             Poll::Ready(())
         } else {
             signals.waker = Some(context.waker().clone());
@@ -386,21 +392,30 @@ impl DeferredPolls {
         Some(refused_at)
     }
 
-    /// A read starts only ahead of every refused read, so that a waiter
-    /// whose read keeps coming back cannot take the budget from a refused
-    /// one. A refused read joins the queue at `place`.
-    fn reserve_read_in_turn(&self, place: (u64, u64)) -> Option<ReadReservation> {
-        let mut state = self.state.borrow_mut();
-        let reservation = state
+    /// Whether a read at `place` can start now. A read starts only ahead of
+    /// every refused read, so that a waiter whose read keeps coming back
+    /// cannot take the budget from a refused one.
+    fn read_turn(&self, place: (u64, u64)) -> bool {
+        self.state
+            .borrow()
             .read_queue
             .first()
             .is_none_or(|first| place < *first)
+            && self.has_read_room()
+    }
+
+    fn reserve_read_in_turn(&self, place: (u64, u64)) -> Option<ReadReservation> {
+        self.read_turn(place)
             .then(|| self.reserve_read().ok())
-            .flatten();
-        if reservation.is_none() {
-            state.read_queue.insert(place);
-        }
-        reservation
+            .flatten()
+    }
+
+    /// Parks a waiter whose read found no room at `place` in the read queue.
+    fn queue_read(&self, id: u64, mut waiter: Waiter, place: (u64, u64)) {
+        waiter.refused_at = Some(place.0);
+        let mut state = self.state.borrow_mut();
+        state.read_queue.insert(place);
+        state.waiters.insert(id, waiter);
     }
 
     fn reserve_read(&self) -> Result<ReadReservation, IggyError> {
@@ -666,6 +681,12 @@ where
                     && deadline <= now
                 {
                     Some(id)
+                } else if self.deferred_polls.has_read_room()
+                    && let Some((_, id)) = state.read_queue.pop_first()
+                {
+                    // Freed room goes to the read that the budget refused
+                    // first, ahead of the other wakes.
+                    Some(id)
                 } else {
                     let namespace = {
                         let mut signals = self.deferred_polls.signals.borrow_mut();
@@ -685,12 +706,6 @@ where
                         for id in ids {
                             state.enqueue(id);
                         }
-                    }
-                    // Freed room goes to the read that the budget refused first.
-                    if let Some(&(_, id)) = state.read_queue.first()
-                        && self.deferred_polls.has_read_room()
-                    {
-                        state.enqueue(id);
                     }
                     let next = state.ready.pop_front();
                     if let Some(id) = next {
@@ -761,6 +776,18 @@ where
                 .insert(id, waiter);
             return;
         }
+        // A busy budget only delays the read. The waiter keeps its last
+        // visibility, so that its next probe does not skip the read. A read
+        // that the budget refused needed the disk, so until its turn it
+        // waits without building another plan.
+        let place = (
+            refused_at.unwrap_or_else(|| self.bus.monotonic_micros()),
+            id,
+        );
+        if refused_at.is_some() && !self.deferred_polls.read_turn(place) {
+            self.deferred_polls.queue_read(id, waiter, place);
+            return;
+        }
         let Some(plan) = self.plane.partitions().build_poll_snapshot(
             &waiter.namespace,
             waiter.request.consumer,
@@ -775,19 +802,8 @@ where
             self.accept_deferred_result(id, waiter, result).await;
             return;
         }
-        // A busy budget only delays the read. The waiter keeps its last
-        // visibility, so that its next probe does not skip the read.
-        let place = (
-            refused_at.unwrap_or_else(|| self.bus.monotonic_micros()),
-            id,
-        );
         let Some(reservation) = self.deferred_polls.reserve_read_in_turn(place) else {
-            waiter.refused_at = Some(place.0);
-            self.deferred_polls
-                .state
-                .borrow_mut()
-                .waiters
-                .insert(id, waiter);
+            self.deferred_polls.queue_read(id, waiter, place);
             return;
         };
         // Snapshot, disk selection and index loading can coexist.
