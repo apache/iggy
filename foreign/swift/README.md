@@ -337,8 +337,11 @@ for try await received in consumer {
 }
 ```
 
-A poll refills the buffer once it runs empty, and each poll of a partition continues
-after the last message handed over from it. A failed poll is thrown after the retry
+A poll refills the buffer once it runs empty. `pollingStrategy` says where reading a
+partition starts, and each later poll of it continues after the last message handed over
+from it. The exception is `.next` with an `autoCommit` that commits with every poll, as in
+the default configuration. That poll starts after the offset that the previous poll
+stored. A failed poll is thrown after the retry
 interval and leaves the consumer usable, so a caller of `next()` can call it again, and
 `consumeMessages(_:)` logs it and keeps reading until the client cannot come back on its
 own. Without `allowReplay` a message at or below the last one handed over from the same

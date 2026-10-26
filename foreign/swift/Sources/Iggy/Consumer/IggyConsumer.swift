@@ -40,7 +40,8 @@ import NIOConcurrencyHelpers
 /// failed poll is thrown after ``ConsumerConfiguration/pollingRetryInterval``
 /// and leaves the consumer usable, so a caller of ``next()`` can call it again;
 /// a `for try await` loop ends at the first error instead. ``next()`` returns
-/// nil only after ``shutdown()``.
+/// nil only after ``shutdown()``. One reader consumes a consumer, as in the
+/// Rust SDK: two loops over the same consumer split its messages between them.
 ///
 /// The consumer remembers the last message handed over from each partition.
 /// Without ``ConsumerConfiguration/allowReplay`` a message at or below it is
@@ -67,8 +68,15 @@ public actor IggyConsumer: AsyncSequence {
     private let configuration: ConsumerConfiguration
     private let logger: Logger
     private let isConsumerGroup: Bool
-    /// One reader at a time, as the Rust consumer's `&mut self` ensures.
+    /// One poll at a time: a reader that finds the buffer empty waits here
+    /// while another one polls.
     private let reading = AsyncMutex()
+    /// Held by a join and by the final leave, so a join in flight ends
+    /// before the leave and none starts after it.
+    private let membership = AsyncMutex()
+    /// Held by every store and delete, so a coverage check, its request, and
+    /// the cache update see no other store in between.
+    private let offsetWrites = AsyncMutex()
     private let commitWakeups: AsyncStream<Void>
     private let commitWakeup: AsyncStream<Void>.Continuation
 
@@ -87,7 +95,7 @@ public actor IggyConsumer: AsyncSequence {
     private var bufferedCurrentOffset: UInt64 = 0
     private var lastPolledAt: ContinuousClock.Instant?
     /// Where each partition continues after its last message handed over,
-    /// unless the strategy is `next`, which leaves that to the server.
+    /// unless a `next` poll commits, which leaves that to the offset it stores.
     private var nextPositions: [UInt32: ConsumerPosition] = [:]
     private var lastConsumed: [UInt32: ConsumerPosition] = [:]
     private var lastStored: [UInt32: ConsumerPosition] = [:]
@@ -128,10 +136,24 @@ public actor IggyConsumer: AsyncSequence {
     }
 
     public struct AsyncIterator: AsyncIteratorProtocol {
-        let consumer: IggyConsumer
+        /// Nil once an error or nil ended the iteration, as the protocol
+        /// requires. The consumer itself can be read on after an error.
+        var consumer: IggyConsumer?
 
         public mutating func next() async throws -> ReceivedMessage? {
-            try await consumer.next()
+            guard let consumer else {
+                return nil
+            }
+            do {
+                let received = try await consumer.next()
+                if received == nil {
+                    self.consumer = nil
+                }
+                return received
+            } catch {
+                self.consumer = nil
+                throw error
+            }
         }
     }
 
@@ -217,16 +239,17 @@ public actor IggyConsumer: AsyncSequence {
         logger.info("Shutting down the consumer", metadata: metadata)
         let timeout = configuration.offsetDrainTimeout
         if let intervalTask {
-            // A tick sleeping gets cancelled; one storing finishes first.
+            // A sleeping tick is cancelled. One that is storing ends after its
+            // store.
             if intervalIsStoring {
                 await Self.wait(for: intervalTask, upTo: timeout)
+            } else {
+                intervalTask.cancel()
             }
-            intervalTask.cancel()
         }
         if let commitTask {
             commitWakeup.yield()
             await Self.wait(for: commitTask, upTo: timeout)
-            commitTask.cancel()
         }
         if configuration.autoCommit != .disabled {
             let positions = Array(lastConsumed.values)
@@ -235,13 +258,18 @@ public actor IggyConsumer: AsyncSequence {
                 await self.storeFinalPositions(positions)
             }
         }
-        if isConsumerGroup, joinedGroup {
-            joinedGroup = false
-            do {
-                try await client.leaveConsumerGroup(streamID: streamID, topicID: topicID, groupID: consumer.id)
-            } catch {
-                // Expected after an explicit leave or a deleted group.
-                logger.debug("Failed to leave the consumer group", metadata: metadata.merging(["error": "\(error)"]) { $1 })
+        // Every join checks the shutdown under this lock, so none comes after
+        // the leave.
+        if isConsumerGroup, (try? await membership.lock()) != nil {
+            defer { membership.unlock() }
+            if joinedGroup {
+                joinedGroup = false
+                do {
+                    try await client.leaveConsumerGroup(streamID: streamID, topicID: topicID, groupID: consumer.id)
+                } catch {
+                    // Expected after an explicit leave or a deleted group.
+                    logger.debug("Failed to leave the consumer group", metadata: metadata.merging(["error": "\(error)"]) { $1 })
+                }
             }
         }
         eventsTask?.cancel()
@@ -255,15 +283,21 @@ public actor IggyConsumer: AsyncSequence {
     /// Throws what a poll or join ran into, after the retry interval, and can
     /// be called again after it threw. Nil once the consumer is shut down.
     public func next() async throws -> ReceivedMessage? {
-        try await reading.lock()
-        defer { reading.unlock() }
         if isShutDown {
             return nil
         }
+        // Nothing suspends between the check and the handover, so a
+        // buffered message needs no lock.
         if bufferIndex < buffer.count {
             return handOverBuffered()
         }
+        try await reading.lock()
+        defer { reading.unlock() }
         while !isShutDown {
+            // The poll this reader waited for can have refilled the buffer.
+            if bufferIndex < buffer.count {
+                return handOverBuffered()
+            }
             try Task.checkCancellation()
             let polled = try await poll()
             if !polled.messages.isEmpty, !isShutDown {
@@ -331,6 +365,8 @@ public actor IggyConsumer: AsyncSequence {
             try await storePosition(ConsumerPosition(partitionID: partition, offset: offset, context: last.context))
             return
         }
+        try await offsetWrites.lock()
+        defer { offsetWrites.unlock() }
         try await client.storeConsumerOffset(consumer: consumer, streamID: streamID, topicID: topicID, partitionID: partition, offset: offset)
         lastStored[partition] = ConsumerPosition(partitionID: partition, offset: offset, context: .empty)
     }
@@ -348,6 +384,8 @@ public actor IggyConsumer: AsyncSequence {
     /// server, since the Swift client routes the request by its partition.
     public func deleteOffset(partitionID: UInt32? = nil) async throws {
         let partition = partitionID ?? currentPartitionID
+        try await offsetWrites.lock()
+        defer { offsetWrites.unlock() }
         // A cancelled delete can still have committed, so a later store must
         // not be skipped as covered.
         lastStored[partition] = nil
@@ -405,7 +443,10 @@ public actor IggyConsumer: AsyncSequence {
     }
 
     private func joinGroup() async throws {
-        if joinedGroup {
+        try await membership.lock()
+        defer { membership.unlock() }
+        // The final leave of a shutdown may have gone already.
+        if joinedGroup || isShutDown {
             return
         }
         if try await client.getConsumerGroup(streamID: streamID, topicID: topicID, groupID: consumer.id) == nil {
@@ -453,7 +494,12 @@ public actor IggyConsumer: AsyncSequence {
         let retryInterval = configuration.pollingRetryInterval
         // A client that only the caller brings back never recovers, so the
         // poll goes on and fails with the reason instead of waiting for good.
-        while !canPoll, await client.canRecover {
+        // Without a heartbeat or a commit to send, nothing else signs the
+        // client in again, so the wait does.
+        while !canPoll, !isShutDown, await client.canRecover {
+            if (try? await client.requireAuthenticated()) != nil {
+                break
+            }
             try await Task.sleep(for: retryInterval)
         }
         if isConsumerGroup, configuration.autoJoinConsumerGroup, !joinedGroup {
@@ -464,6 +510,10 @@ public actor IggyConsumer: AsyncSequence {
                 try await Task.sleep(for: retryInterval)
                 throw error
             }
+        }
+        // A shutdown may have sent its final commits and leave already.
+        if isShutDown {
+            return .empty
         }
         lastPolledAt = .now
         let continuations = nextPositions
@@ -524,11 +574,6 @@ public actor IggyConsumer: AsyncSequence {
         let position = ConsumerPosition(partitionID: partition, offset: message.offset, context: bufferedContext)
         lastConsumed[partition] = position
         let drained = bufferIndex == buffer.count
-        // The strategy only says where a partition starts; the next poll of
-        // it continues after the last message handed over.
-        if configuration.pollingStrategy.kind != .next {
-            nextPositions[partition] = ConsumerPosition(partitionID: partition, offset: message.offset + 1, context: bufferedContext)
-        }
         switch configuration.autoCommit.whenTrigger {
         case .consumingEachMessage?:
             queueCommit(position)
@@ -545,6 +590,12 @@ public actor IggyConsumer: AsyncSequence {
         }
         let received = ReceivedMessage(message: message, currentOffset: bufferedCurrentOffset, partitionID: partition, context: bufferedContext)
         if drained {
+            // The strategy only says where a partition starts; the next poll
+            // of it continues after the last message handed over. A `next`
+            // poll that commits starts after the offset it stored instead.
+            if configuration.pollingStrategy.kind != .next || configuration.autoCommit.whenTrigger != .pollingMessages {
+                nextPositions[partition] = ConsumerPosition(partitionID: partition, offset: message.offset + 1, context: bufferedContext)
+            }
             buffer.removeAll(keepingCapacity: true)
             bufferIndex = 0
         }
@@ -572,7 +623,8 @@ public actor IggyConsumer: AsyncSequence {
     }
 
     /// Returns false once the consumer is shut down, which ends the interval
-    /// task before it stores anything more.
+    /// task before it stores anything more, or right after the store that a
+    /// shutdown waits for.
     private func storeOnTick() async -> Bool {
         guard !isShutDown else {
             return false
@@ -582,7 +634,7 @@ public actor IggyConsumer: AsyncSequence {
         for position in lastConsumed.values {
             await storeInBackground(position)
         }
-        return true
+        return !isShutDown
     }
 
     private func storeFinalPositions(_ positions: [ConsumerPosition]) async {
@@ -610,6 +662,8 @@ public actor IggyConsumer: AsyncSequence {
     }
 
     private func store(_ position: ConsumerPosition, allowReplay: Bool) async throws {
+        try await offsetWrites.lock()
+        defer { offsetWrites.unlock() }
         if !allowReplay, storedPositionCovers(position) {
             return
         }
@@ -639,9 +693,18 @@ public actor IggyConsumer: AsyncSequence {
         }
     }
 
+    /// Waits for `task` up to `timeout`, then cancels it and waits for it to
+    /// end: a waiter that gives up does not cancel what it waits for.
     private static func wait(for task: Task<Void, Never>, upTo timeout: Duration) async {
-        _ = try? await withDeadline(.now + timeout) {
-            await task.value
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask { await task.value }
+            group.addTask {
+                if (try? await Task.sleep(for: timeout)) != nil {
+                    task.cancel()
+                }
+            }
+            _ = await group.next()
+            group.cancelAll()
         }
     }
 }

@@ -88,8 +88,9 @@ public enum AutoCommitAfter: Sendable, Hashable {
 public struct ConsumerConfiguration: Sendable {
     /// Where reading a partition starts. After the first batch each poll
     /// continues after the last message handed over from that partition,
-    /// except under ``PollingStrategy/next``, which leaves the continuation
-    /// to the offsets stored on the server.
+    /// except a ``PollingStrategy/next`` poll that commits with
+    /// ``AutoCommitWhen/pollingMessages``: it starts after the offset the
+    /// previous poll stored.
     public var pollingStrategy: PollingStrategy
     /// Messages asked for per poll.
     public var batchLength: UInt32
