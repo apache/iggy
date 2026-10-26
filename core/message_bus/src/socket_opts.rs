@@ -20,13 +20,16 @@
 //! Keepalive is intentionally NOT configured here: SDK clients manage
 //! their own keepalive policy at the application layer, and
 //! replica<->replica liveness is observed by VSR heartbeats rather
-//! than by `SO_KEEPALIVE`. Only `TCP_NODELAY` toggling lives in this
-//! module today.
+//! than by `SO_KEEPALIVE`. Heartbeats tell consensus that a peer is
+//! gone, but they never close its socket. So replica sockets get
+//! `TCP_USER_TIMEOUT` on Linux, which errors a link whose sent data
+//! stays unacknowledged, and the error tears the peer's bundle down.
 
 use compio::net::{TcpListener, TcpStream};
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use std::io;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 /// Disable Nagle on a per-connection socket.
 ///
@@ -43,6 +46,30 @@ use std::net::SocketAddr;
 /// Nagle-delayed frame on the soft-failure path.
 pub fn apply_nodelay_for_connection(stream: &TcpStream) -> io::Result<()> {
     SockRef::from(stream).set_tcp_nodelay(true)
+}
+
+/// Disable Nagle on a replica link and, on Linux, bound how long sent data
+/// may stay unacknowledged before the kernel errors the socket.
+///
+/// A peer that died without a FIN or RST leaves a half-open link: its
+/// queue fills and every later send fails with `Backpressure`, while
+/// nothing closes the link. With `user_timeout` the kernel closes it once
+/// a frame waits that long, and per tcp(7) the limit also covers data
+/// held back by a zero window, so a peer that stops reading loses the
+/// link too. The timer only runs while data waits: an idle dead link
+/// stays until the next frame. Other targets get no user timeout.
+///
+/// # Errors
+///
+/// Returns the first `io::Error` the kernel reports. Callers log and
+/// continue with the link.
+pub fn apply_replica_socket_options(stream: &TcpStream, user_timeout: Duration) -> io::Result<()> {
+    apply_nodelay_for_connection(stream)?;
+    #[cfg(target_os = "linux")]
+    SockRef::from(stream).set_tcp_user_timeout(Some(user_timeout))?;
+    #[cfg(not(target_os = "linux"))]
+    let _ = user_timeout;
+    Ok(())
 }
 
 /// Build a TCP listener that tolerates `TIME_WAIT` leftovers and bound-but-idle

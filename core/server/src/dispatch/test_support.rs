@@ -42,8 +42,8 @@ use message_bus::installer::conn_info::ClientConnMeta;
 use message_bus::replica::listener::MessageHandler;
 use message_bus::{
     BusMessage, ClientConnectionLostFn, ConnectionLostFn, ConnectionPermit, ConnectionRegistry,
-    InstanceToken, JoinHandle, MessageBus, ReplicaForwardFn, ReplicaHandshakeDoneFn, SendError,
-    SharedTlsServerConfig,
+    InstanceToken, JoinHandle, MessageBus, ReplicaForwardFn, ReplicaHandshakeDoneFn, ReplicaLinkId,
+    SendError, SharedTlsServerConfig,
 };
 use metadata::impls::metadata::{IggySnapshot, StreamsFrontend};
 use metadata::stm::StateMachine as _;
@@ -191,6 +191,7 @@ impl ConnectionInstaller for SpyBus {
     fn install_replica_inbound_fd(
         &self,
         _fd: DupedFd,
+        _link: ReplicaLinkId,
         _on_message: MessageHandler,
         _on_done: ReplicaHandshakeDoneFn,
     ) {
@@ -198,13 +199,15 @@ impl ConnectionInstaller for SpyBus {
     fn install_replica_outbound_fd(
         &self,
         _fd: DupedFd,
-        _replica_id: u8,
+        _link: ReplicaLinkId,
         _on_message: MessageHandler,
         _on_done: ReplicaHandshakeDoneFn,
     ) {
     }
-    fn release_replica_handshake_slot(&self, _slot: u64) {}
-    fn clear_replica_dial_pending(&self, _replica_id: u8) {}
+    fn replica_inbound_handshake_done(&self, _slot: u64, _link: ReplicaLinkId) {}
+    fn replica_outbound_handshake_done(&self, _link: ReplicaLinkId) {}
+    fn replica_link_closed(&self, _link: ReplicaLinkId) {}
+    fn close_replica_link(&self, _link: ReplicaLinkId) {}
     fn install_client_fd(
         &self,
         _fd: DupedFd,

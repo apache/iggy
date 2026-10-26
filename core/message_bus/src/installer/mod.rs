@@ -52,7 +52,7 @@ use crate::installer::conn_info::ClientConnMeta;
 use crate::replica::listener::MessageHandler;
 use crate::{
     BusMessage, ClientConnectionLostFn, ConnectionPermit, IggyMessageBus, InstanceToken,
-    ReplicaHandshakeDoneFn, SendError, SharedTlsServerConfig,
+    ReplicaHandshakeDoneFn, ReplicaLinkId, SendError, SharedTlsServerConfig,
 };
 use std::rc::Rc;
 use tracing::warn;
@@ -62,40 +62,51 @@ use tracing::warn;
 ///
 /// The production implementation is on `Rc<IggyMessageBus>`.
 pub trait ConnectionInstaller {
-    /// Wrap a blind-delegated inbound replica fd into a `TcpStream` on
-    /// the local compio runtime, run the acceptor handshake in a spawned
-    /// task (bounded by `handshake_grace`), and register the connection
-    /// on this shard on success. `on_done` is the shard-0 outcome ack;
-    /// the install path fires it exactly once, on every exit path.
+    /// Wrap a delegated inbound replica fd into a `TcpStream` on the
+    /// local compio runtime, run the acceptor handshake in a spawned task
+    /// (bounded by `handshake_grace`), and register the connection on
+    /// this shard as `link` on success. Shard 0 read the placement
+    /// preamble and nothing else, so `link` names the peer and the link
+    /// the hello must announce. `on_done` is the shard-0 outcome ack; the
+    /// install path fires it exactly once, on every exit path.
     ///
     /// Takes ownership of `fd`. On any failure the fd is closed by
     /// dropping the wrapping `TcpStream`.
     fn install_replica_inbound_fd(
         &self,
         fd: DupedFd,
+        link: ReplicaLinkId,
         on_message: MessageHandler,
         on_done: ReplicaHandshakeDoneFn,
     );
 
-    /// Same for a delegated outbound replica connection: runs the dialer
-    /// handshake half toward the configured `replica_id`.
+    /// Same for a delegated outbound replica link: writes the placement
+    /// preamble and runs the dialer handshake half toward `link.replica`.
     fn install_replica_outbound_fd(
         &self,
         fd: DupedFd,
-        replica_id: u8,
+        link: ReplicaLinkId,
         on_message: MessageHandler,
         on_done: ReplicaHandshakeDoneFn,
     );
 
-    /// Release a shard-0 in-flight inbound handshake slot. Routed here
-    /// when shard 0's router processes the owning shard's
-    /// handshake-outcome ack. Idempotent (the slot may have expired).
-    fn release_replica_handshake_slot(&self, slot: u64);
+    /// Shard 0: an inbound handshake of `link` finished. Releases its
+    /// in-flight slot and refreshes the bundle of the peer. Idempotent
+    /// (the slot may have expired).
+    fn replica_inbound_handshake_done(&self, slot: u64, link: ReplicaLinkId);
 
-    /// Clear a shard-0 pending-dial entry. Routed here when shard 0's
-    /// router processes the owning shard's handshake-outcome ack.
+    /// Shard 0: an outbound handshake of `link` finished. Clears its
+    /// pending-dial entry and refreshes the bundle of the peer.
     /// Idempotent (the entry may have expired).
-    fn clear_replica_dial_pending(&self, replica_id: u8);
+    fn replica_outbound_handshake_done(&self, link: ReplicaLinkId);
+
+    /// Shard 0: an installed link closed on its owner shard. See
+    /// [`IggyMessageBus::replica_link_closed`].
+    fn replica_link_closed(&self, link: ReplicaLinkId);
+
+    /// Owner shard: close `link` if this shard still holds it in the epoch
+    /// of `link`. See [`IggyMessageBus::close_replica_link`].
+    fn close_replica_link(&self, link: ReplicaLinkId);
 
     /// Same for an SDK client connection. The owning shard is already
     /// encoded in the top 16 bits of `meta.client_id`. `meta` is stored
@@ -191,30 +202,42 @@ impl ConnectionInstaller for Rc<IggyMessageBus> {
     fn install_replica_inbound_fd(
         &self,
         fd: DupedFd,
+        link: ReplicaLinkId,
         on_message: MessageHandler,
         on_done: ReplicaHandshakeDoneFn,
     ) {
         let stream = fd_transfer::wrap_duped_fd(fd);
-        install_replica_inbound(self, stream, on_message, on_done);
+        install_replica_inbound(self, stream, link, on_message, on_done);
     }
 
     fn install_replica_outbound_fd(
         &self,
         fd: DupedFd,
-        replica_id: u8,
+        link: ReplicaLinkId,
         on_message: MessageHandler,
         on_done: ReplicaHandshakeDoneFn,
     ) {
         let stream = fd_transfer::wrap_duped_fd(fd);
-        install_replica_outbound(self, replica_id, stream, on_message, on_done);
+        install_replica_outbound(self, link, stream, on_message, on_done);
     }
 
-    fn release_replica_handshake_slot(&self, slot: u64) {
-        IggyMessageBus::release_replica_handshake_slot(self, slot);
+    fn replica_inbound_handshake_done(&self, slot: u64, link: ReplicaLinkId) {
+        self.release_replica_handshake_slot(slot);
+        self.refresh_replica_bundle(link.replica);
     }
 
-    fn clear_replica_dial_pending(&self, replica_id: u8) {
-        self.clear_dial_pending(replica_id);
+    fn replica_outbound_handshake_done(&self, link: ReplicaLinkId) {
+        self.clear_dial_pending(link.replica, link.link);
+        self.refresh_replica_bundle(link.replica);
+    }
+
+    // Fully qualified: the inherent methods share the trait method names.
+    fn replica_link_closed(&self, link: ReplicaLinkId) {
+        IggyMessageBus::replica_link_closed(self, link);
+    }
+
+    fn close_replica_link(&self, link: ReplicaLinkId) {
+        IggyMessageBus::close_replica_link(self, link);
     }
 
     fn install_client_fd(

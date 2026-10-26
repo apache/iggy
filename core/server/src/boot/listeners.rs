@@ -40,7 +40,7 @@ use message_bus::transports::quic::server_config_with_cert;
 use message_bus::{
     AcceptedClientFn, AcceptedQuicClientFn, AcceptedReplicaFn, AcceptedTlsClientFn,
     AcceptedWsClientFn, AcceptedWssClientFn, ConnectionCap, DialedReplicaFn, IggyMessageBus,
-    MAX_INFLIGHT_REPLICA_HANDSHAKES, connector, installer,
+    connector, installer,
 };
 use shard::metrics::ShardMetrics;
 use std::net::SocketAddr;
@@ -371,15 +371,15 @@ async fn start_manual_runtime(
 
 /// Replica delegation callbacks for shard 0's listener and connector.
 ///
-/// Inbound: acquire a slot in the shard-0-global in-flight handshake cap
-/// (drop the connection when full), then blind-delegate the raw fd
-/// through the coordinator's round-robin. The fd lands on the target
-/// shard's inbox as a [`shard::LifecycleFrame::ReplicaInboundSetup`]
-/// frame; the owning shard runs the acceptor handshake and acks the
-/// slot back. A failed delegation releases the slot immediately.
+/// Inbound: [`replica_listener::admit_inbound`] takes a slot in the
+/// shard-0-global in-flight handshake cap and reads the placement
+/// preamble, then the fd goes to the shard that owns the link as a
+/// [`shard::LifecycleFrame::ReplicaInboundSetup`] frame; the owning shard
+/// runs the acceptor handshake and acks the slot back. A failed delegation
+/// releases the slot immediately.
 ///
-/// Outbound: delegate the dialed fd as
-/// [`shard::LifecycleFrame::ReplicaOutboundSetup`] and mark the peer
+/// Outbound: delegate the dialed fd to the shard that owns the link as
+/// [`shard::LifecycleFrame::ReplicaOutboundSetup`] and mark the link
 /// dial-pending so the reconnect sweep skips it until the owning
 /// shard's handshake outcome arrives (or the entry expires).
 pub(in crate::boot) fn make_replica_delegation_fns(
@@ -389,44 +389,52 @@ pub(in crate::boot) fn make_replica_delegation_fns(
     let inbound_bus = Rc::clone(bus);
     let inbound_coord = Rc::clone(&coord);
     let accepted: AcceptedReplicaFn = Rc::new(move |stream| {
-        let Some(slot) = inbound_bus.try_acquire_replica_handshake_slot() else {
-            warn!(
-                cap = MAX_INFLIGHT_REPLICA_HANDSHAKES,
-                "replica handshake in-flight cap reached; dropping inbound"
-            );
-            return;
-        };
-        match inbound_coord.delegate_replica_inbound(stream, slot) {
-            Ok(target) => {
-                info!(slot, target, "inbound replica connection delegated");
+        let coord = Rc::clone(&inbound_coord);
+        let bus = Rc::clone(&inbound_bus);
+        replica_listener::admit_inbound(&inbound_bus, stream, move |stream, link, owner, slot| {
+            match coord.delegate_replica_inbound(stream, owner, slot, link) {
+                Ok(()) => info!(
+                    replica = link.replica,
+                    link = link.link,
+                    owner,
+                    slot,
+                    "inbound replica link delegated"
+                ),
+                Err(error) => {
+                    bus.release_replica_handshake_slot(slot);
+                    warn!(
+                        replica = link.replica,
+                        link = link.link,
+                        owner,
+                        error = ?error,
+                        "delegate_replica_inbound failed; dropping inbound replica link"
+                    );
+                }
             }
-            Err(error) => {
-                inbound_bus.release_replica_handshake_slot(slot);
-                warn!(
-                    error = ?error,
-                    "delegate_replica_inbound failed; dropping inbound replica connection"
-                );
-            }
-        }
+        });
     });
 
     let outbound_bus = Rc::clone(bus);
-    let dialed: DialedReplicaFn =
-        Rc::new(
-            move |stream, peer_id| match coord.delegate_replica_outbound(stream, peer_id) {
-                Ok(target) => {
-                    outbound_bus.mark_dial_pending(peer_id);
-                    info!(peer_id, target, "outbound replica connection delegated");
-                }
-                Err(error) => {
-                    warn!(
-                        peer_id,
-                        error = ?error,
-                        "delegate_replica_outbound failed; dropping dialed replica connection"
-                    );
-                }
-            },
-        );
+    let dialed: DialedReplicaFn = Rc::new(move |stream, link, owner| {
+        match coord.delegate_replica_outbound(stream, owner, link) {
+            Ok(()) => {
+                outbound_bus.mark_dial_pending(link.replica, link.link);
+                info!(
+                    replica = link.replica,
+                    link = link.link,
+                    owner,
+                    "outbound replica link delegated"
+                );
+            }
+            Err(error) => warn!(
+                replica = link.replica,
+                link = link.link,
+                owner,
+                error = ?error,
+                "delegate_replica_outbound failed; dropping dialed replica link"
+            ),
+        }
+    });
 
     (accepted, dialed)
 }

@@ -26,6 +26,8 @@ mod poll;
 mod primary_rebalance;
 mod router;
 pub mod shards_table;
+#[cfg(test)]
+mod test_support;
 
 pub use config::CoordinatorConfig;
 pub use host::{NoopHost, ShardHost};
@@ -72,7 +74,7 @@ use message_bus::client_listener::RequestHandler;
 use message_bus::fd_transfer::DupedFd;
 use message_bus::installer::conn_info::{ClientConnMeta, ClientTransportKind};
 use message_bus::replica::listener::MessageHandler;
-use message_bus::{BusMessage, ConnectionPermit, MessageBus, SharedTlsServerConfig};
+use message_bus::{BusMessage, ConnectionPermit, MessageBus, ReplicaLinkId, SharedTlsServerConfig};
 use metadata::IggyMetadata;
 use metadata::impls::metadata::{PartitionPlacementView, StreamsFrontend, metadata_wal_head};
 use metadata::stm::StateMachine;
@@ -839,12 +841,11 @@ fn boot_nonce<B: MessageBus>(consensus: Option<&VsrConsensus<B>>) -> u64 {
 /// and per-client reply order is preserved within the reply lane itself).
 #[non_exhaustive]
 pub enum LifecycleFrame {
-    /// Shard 0 distributes an inbound replica TCP connection fd to the
-    /// owning shard BEFORE any byte is read (blind delegation - the peer
-    /// id is unknown until the `ReplicaHello` is read). The receiving
-    /// shard wraps the fd, runs the acceptor handshake in its own
-    /// spawned task (`message_bus::replica::handshake`), installs the
-    /// connection on success, and answers shard 0 with
+    /// Shard 0 distributes an inbound replica link fd to the shard that
+    /// owns `link`, after reading only the placement preamble that names
+    /// it. The receiving shard wraps the fd, runs the acceptor handshake
+    /// in its own spawned task (`message_bus::replica::handshake`),
+    /// installs the link on success, and answers shard 0 with
     /// [`LifecycleFrame::ReplicaInboundHandshakeDone`] echoing `slot`.
     /// The `fd` is an owning [`DupedFd`] so that a frame dropped
     /// unprocessed (shutdown, pump drain abort, router panic before
@@ -852,28 +853,46 @@ pub enum LifecycleFrame {
     ReplicaInboundSetup {
         fd: DupedFd,
         slot: u64,
+        link: ReplicaLinkId,
     },
-    /// Shard 0 dialed the higher-id peer `replica_id` and delegates the
-    /// raw connection; the receiving shard runs the dialer handshake
-    /// half, installs on success, and answers shard 0 with
+    /// Shard 0 dialed `link` to a higher-id peer and delegates the raw
+    /// connection to the shard that owns the link; the receiving shard
+    /// writes the placement preamble, runs the dialer handshake half,
+    /// installs on success, and answers shard 0 with
     /// [`LifecycleFrame::ReplicaOutboundHandshakeDone`] so the
     /// pending-dial entry clears and the reconnect sweep may redial on
     /// failure.
     ReplicaOutboundSetup {
         fd: DupedFd,
-        replica_id: u8,
+        link: ReplicaLinkId,
     },
     /// Owning shard -> shard 0: a delegated inbound handshake finished
-    /// (any outcome). Releases the global in-flight cap slot. Lost acks
-    /// are covered by the slot's deadline expiry on shard 0.
+    /// (any outcome). Releases the global in-flight cap slot and refreshes
+    /// the bundle of the peer. Lost acks are covered by the slot's
+    /// deadline expiry and the next reconnect sweep on shard 0.
     ReplicaInboundHandshakeDone {
         slot: u64,
+        link: ReplicaLinkId,
     },
     /// Owning shard -> shard 0: a delegated outbound handshake finished
-    /// (any outcome). Clears the pending-dial entry for `replica_id`.
-    /// Lost acks are covered by the entry's deadline expiry on shard 0.
+    /// (any outcome). Clears the pending-dial entry of `link` and
+    /// refreshes the bundle of the peer. Lost acks are covered by the
+    /// entry's deadline expiry and the next reconnect sweep on shard 0.
     ReplicaOutboundHandshakeDone {
-        replica_id: u8,
+        link: ReplicaLinkId,
+    },
+    /// Owning shard -> shard 0: an installed replica link closed. A close
+    /// in the current epoch of the peer's bundle tears the bundle down.
+    /// A lost report is covered by the next reconnect sweep, which finds
+    /// the link missing.
+    ReplicaLinkClosed {
+        link: ReplicaLinkId,
+    },
+    /// Shard 0 -> owning shard: close `link`, whose bundle tore down. The
+    /// owner closes it only while it holds the link in that epoch. A lost
+    /// request is sent again by the next bundle refresh.
+    ReplicaLinkClose {
+        link: ReplicaLinkId,
     },
     /// Shard 0 distributes an inbound SDK client TCP connection fd to the
     /// owning shard. The receiving shard wraps the fd and installs client
@@ -8556,6 +8575,10 @@ where
         self.metrics
             .record_replica_reads(&self.bus.take_replica_read_stats());
         self.metrics
+            .record_replica_outbound_drops(self.bus.take_replica_outbound_drops());
+        self.metrics
+            .record_replica_link_stats(&self.bus.take_replica_link_stats());
+        self.metrics
             .set_repair_ring(repair_ring_entries, repair_ring_bytes);
         self.metrics.set_partitions_untrusted_log(untrusted_logs);
 
@@ -14754,7 +14777,7 @@ mod installed_transfer_dvc_tests {
             Ok(())
         }));
         for peer in (0..REPLICA_COUNT).filter(|&peer| peer != LAGGING) {
-            assert!(bus.owner_table().try_claim(peer, 1));
+            crate::test_support::connect_replica_on(&bus, peer, 1);
         }
         let consensus = VsrConsensus::new(
             CLUSTER,
@@ -17321,7 +17344,7 @@ mod partition_ack_durability_tests {
             Ok(())
         }));
         for replica in 1..3 {
-            assert!(bus.owner_table().try_claim(replica, 1));
+            crate::test_support::connect_replica_on(&bus, replica, 1);
         }
         let consensus = VsrConsensus::new(1, 0, 3, 42, bus, LocalPipeline::new());
         consensus.init();
@@ -17646,7 +17669,7 @@ mod untrusted_do_view_change_tests {
             Ok(())
         }));
         for replica in 1..3 {
-            assert!(bus.owner_table().try_claim(replica, 1));
+            crate::test_support::connect_replica_on(&bus, replica, 1);
         }
         let consensus = VsrConsensus::new(1, 0, 3, GROUP, bus, LocalPipeline::new());
         consensus.init();

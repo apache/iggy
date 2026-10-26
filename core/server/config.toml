@@ -503,6 +503,8 @@ name = "iggy-cluster"
 # death. Must be at least "2s" and at least 4x commit_broadcast_interval: the
 # primary signals liveness through its commit broadcast, and the window must
 # span several broadcasts so one delayed broadcast never trips an election.
+# On Linux it is also the TCP_USER_TIMEOUT of every replica link: sent data
+# that stays unacknowledged this long closes the link.
 heartbeat_timeout = "5s"
 
 # How often the primary broadcasts its commit point to every backup (duration).
@@ -649,11 +651,17 @@ ca_file = ""
 
 # Shard-0 coordinator placement.
 [cluster.coordinator]
-# When the server runs more than one shard, exclude shard 0 from replica
-# placement. Shard 0 already hosts the coordinator, the metadata writer, and
-# both listeners; replica connections are long-lived steady flows, so they are
-# offloaded to peer shards by default.
+# Keep replica links off shard 0 while the shard range of link 0 has another
+# shard. Shard 0 already hosts the coordinator, the metadata writer, and both
+# listeners; replica links are long-lived steady flows, so they are offloaded
+# to peer shards by default.
 skip_shard_zero_for_replicas = true
+
+# TCP links to each peer replica, at most the shard count. Link j carries the
+# frames of the shards in range j, so more links spread replication over more
+# shards. Every node must run the same value and the same shard count: the
+# replica handshake refuses a peer that differs.
+replica_connections_per_peer = 1
 
 # When the server runs more than one shard, exclude shard 0 from client
 # placement. Off by default: client connections are short-lived and benefit

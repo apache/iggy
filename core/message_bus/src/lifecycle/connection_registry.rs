@@ -936,6 +936,16 @@ impl ReplicaRegistry {
         Ok(token)
     }
 
+    /// Trigger the per-connection shutdown of the entry under `key` and
+    /// leave the entry in place: the connection's own exit path removes it
+    /// and reports the close. Returns whether an entry was present.
+    pub fn shutdown_connection(&self, key: u8) -> bool {
+        self.slots.borrow()[usize::from(key)]
+            .as_ref()
+            .map(|entry| entry.conn_shutdown.trigger())
+            .is_some()
+    }
+
     /// See [`ConnectionRegistry::remove`].
     pub fn remove(&self, key: u8) -> bool {
         // Dropping the Entry drops `conn_shutdown`; see its rustdoc on

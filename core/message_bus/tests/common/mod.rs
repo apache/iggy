@@ -27,13 +27,15 @@
 #![allow(dead_code)] // each test binary uses a subset
 
 use compio::io::{AsyncRead, AsyncWriteExt};
-use compio::net::TcpStream;
+use compio::net::{TcpListener, TcpStream};
+use compio::runtime::JoinHandle;
 use iggy_binary_protocol::{Command, GenericHeader, HEADER_SIZE};
 use message_bus::ConnectionInstaller;
 use message_bus::client_listener::RequestHandler;
-use message_bus::replica::auth::ReplicaAuth;
-use message_bus::replica::handshake::{ReplicaHandshakeCtx, ReplicaTlsCtx};
-use message_bus::replica::listener::MessageHandler;
+use message_bus::replica::auth::{ChannelBinding, LinkPlacement, ReplicaAuth};
+use message_bus::replica::handshake::{ReplicaHandshakeCtx, ReplicaTlsCtx, acceptor_handshake};
+use message_bus::replica::listener::{self, MessageHandler};
+use message_bus::replica::preamble::{Preamble, read_preamble};
 use message_bus::transports::tls::{
     AcceptAnyServerCert, REPLICA_ALPN, install_default_crypto_provider, self_signed_for_loopback,
 };
@@ -159,51 +161,104 @@ pub fn self_signed_replica_tls_ctx(replica_count: u8) -> Rc<ReplicaTlsCtx> {
 /// Build an [`AcceptedReplicaFn`] that runs the owning-shard inbound
 /// path (acceptor handshake + install) locally on the given bus,
 /// bypassing the coordinator but exercising the same admission (cap
-/// slot) and handshake code the production owning shard runs. Requires
-/// [`set_replica_ctx`] on the bus.
+/// slot + placement preamble) and handshake code the production shards
+/// run. The handshake ack refreshes the bundle, so a single-shard bus
+/// brings the peer Up. Requires [`set_replica_ctx`] on the bus.
 #[must_use]
 pub fn install_replicas_locally(
     bus: Rc<IggyMessageBus>,
     on_message: MessageHandler,
 ) -> AcceptedReplicaFn {
     Rc::new(move |stream| {
-        let Some(slot) = bus.try_acquire_replica_handshake_slot() else {
-            return;
-        };
-        let release_bus = Rc::clone(&bus);
-        installer::install_replica_inbound(
-            &bus,
-            stream,
-            on_message.clone(),
-            Box::new(move || {
-                release_bus.release_replica_handshake_slot(slot);
-            }),
-        );
+        let install_bus = Rc::clone(&bus);
+        let on_message = on_message.clone();
+        listener::admit_inbound(&bus, stream, move |stream, link, _owner, slot| {
+            let done_bus = Rc::clone(&install_bus);
+            installer::install_replica_inbound(
+                &install_bus,
+                stream,
+                link,
+                on_message,
+                Box::new(move || done_bus.replica_inbound_handshake_done(slot, link)),
+            );
+        });
     })
 }
 
 /// Build a [`DialedReplicaFn`] that runs the owning-shard outbound path
-/// (dialer handshake + install) locally on the given bus, including the
-/// pending-dial mark / clear the production shard-0 callback and router
-/// perform. Requires [`set_replica_ctx`] on the bus.
+/// (preamble + dialer handshake + install) locally on the given bus,
+/// including the pending-dial mark and the handshake ack the production
+/// shard-0 callback and router perform. Requires [`set_replica_ctx`] on
+/// the bus.
 #[must_use]
 pub fn install_dialed_replicas_locally(
     bus: Rc<IggyMessageBus>,
     on_message: MessageHandler,
 ) -> DialedReplicaFn {
-    Rc::new(move |stream, peer_id| {
-        bus.mark_dial_pending(peer_id);
-        let clear_bus = Rc::clone(&bus);
+    Rc::new(move |stream, link, _owner| {
+        bus.mark_dial_pending(link.replica, link.link);
+        let done_bus = Rc::clone(&bus);
         installer::install_replica_outbound(
             &bus,
-            peer_id,
+            link,
             stream,
             on_message.clone(),
-            Box::new(move || {
-                clear_bus.clear_dial_pending(peer_id);
-            }),
+            Box::new(move || done_bus.replica_outbound_handshake_done(link)),
         );
     })
+}
+
+/// Bind a raw replica `self_id` that admits each dialed link with the real
+/// acceptor handshake and then never reads again, so the dialer's frames
+/// back up in the kernel buffers of both ends. The cluster, the build
+/// identity and the link layout come from `template`, a bus of the same
+/// cluster. Dropping the returned task closes the held links.
+#[allow(clippy::future_not_send)]
+pub async fn spawn_stalled_replica(
+    template: &IggyMessageBus,
+    self_id: u8,
+) -> (SocketAddr, JoinHandle<()>) {
+    let listener = TcpListener::bind(loopback())
+        .await
+        .expect("bind the stalled replica");
+    let addr = listener.local_addr().expect("stalled replica address");
+    let ctx = ReplicaHandshakeCtx {
+        self_id,
+        ..template
+            .replica_handshake_ctx()
+            .expect("template bus has a replica handshake ctx")
+            .clone()
+    };
+    let layout = template.link_layout();
+    let grace = template.config().handshake_grace;
+    let accept = compio::runtime::spawn(async move {
+        // Held only to keep the links open; the stalled replica never reads.
+        #[allow(clippy::collection_is_never_read)]
+        let mut held = Vec::new();
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let bytes = read_preamble(&mut stream, grace)
+                .await
+                .expect("dialer must send its preamble");
+            let preamble = Preamble::admit(bytes, self_id, ctx.replica_count, layout.links())
+                .expect("valid preamble");
+            acceptor_handshake(
+                &mut stream,
+                &ctx,
+                preamble.dialer,
+                LinkPlacement {
+                    shards: layout.shards(),
+                    links: layout.links(),
+                    link: preamble.link,
+                },
+                ChannelBinding::Plaintext,
+                HEADER_SIZE,
+            )
+            .await
+            .expect("stalled replica must complete replica admission");
+            held.push(stream);
+        }
+    });
+    (addr, accept)
 }
 
 /// A slot in an uncapped connection cap, for installs that do not test the cap.

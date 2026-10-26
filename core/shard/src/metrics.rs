@@ -47,7 +47,7 @@ use std::sync::{Arc, OnceLock};
 
 use iggy_binary_protocol::Command;
 use iggy_common::ConsumerKind;
-use message_bus::ReplicaReadMetrics;
+use message_bus::{ReplicaLinkStats, ReplicaReadMetrics};
 
 /// Label for `frame_drops_total`.
 ///
@@ -142,6 +142,12 @@ pub mod frame_drop_variant {
     /// dropped; the shard-0 deadline expiry recovers the slot / pending
     /// entry, so this stays informational.
     pub const REPLICA_HANDSHAKE_ACK: &str = "replica_handshake_ack";
+    /// A replica link's close report to shard 0 was dropped; the next
+    /// reconnect sweep finds the link missing and tears its bundle down.
+    pub const REPLICA_LINK_CLOSED: &str = "replica_link_closed";
+    /// Shard 0's request to close a link of a torn down bundle was
+    /// dropped; the next bundle refresh sends it again.
+    pub const REPLICA_LINK_CLOSE: &str = "replica_link_close";
     pub const PARTITION_PERSISTENCE_COMPLETED: &str = "partition_persistence_completed";
     /// A disk poll could not reserve completion capacity or return its result
     /// to the owning shard.
@@ -355,6 +361,11 @@ pub struct ShardMetrics {
     client_requests_denied_queue_full_total: Counter,
     replica_socket_reads_total: Counter,
     replica_inbound_frames_total: Counter,
+    replica_outbound_drops_total: Counter,
+    replica_bundle_teardowns_total: Counter,
+    replica_preamble_refusals_total: Counter,
+    replica_handshake_failures_total: Counter,
+    replica_bundles_up: Gauge,
     partition_consumer_offsets_denied_total: Family<ConsumerOffsetKindLabel, Counter>,
     consumer_offset_denied_counters: [Counter; ConsumerKind::COUNT],
     partition_consumer_offsets_stranded: Family<ConsumerOffsetKindLabel, Gauge>,
@@ -437,6 +448,11 @@ impl ShardMetrics {
             client_requests_denied_queue_full_total: Counter::default(),
             replica_socket_reads_total: Counter::default(),
             replica_inbound_frames_total: Counter::default(),
+            replica_outbound_drops_total: Counter::default(),
+            replica_bundle_teardowns_total: Counter::default(),
+            replica_preamble_refusals_total: Counter::default(),
+            replica_handshake_failures_total: Counter::default(),
+            replica_bundles_up: Gauge::default(),
             partition_consumer_offsets_denied_total,
             consumer_offset_denied_counters,
             partition_consumer_offsets_stranded,
@@ -474,6 +490,27 @@ impl ShardMetrics {
     pub fn record_replica_reads(&self, metrics: &ReplicaReadMetrics) {
         self.replica_socket_reads_total.inc_by(metrics.reads);
         self.replica_inbound_frames_total.inc_by(metrics.frames);
+    }
+
+    /// Fold one sweep's count of replica frames refused at a full peer
+    /// queue. A delta from a take, as in [`Self::record_replica_reads`].
+    pub fn record_replica_outbound_drops(&self, drops: u64) {
+        self.replica_outbound_drops_total.inc_by(drops);
+    }
+
+    /// Fold one sweep's replica link events in. The counters take deltas,
+    /// as in [`Self::record_replica_reads`]; `bundles_up` is a gauge.
+    /// Bundles, preambles and their refusals live on shard 0 only, so the
+    /// other shards report zero there.
+    pub fn record_replica_link_stats(&self, stats: &ReplicaLinkStats) {
+        self.replica_bundle_teardowns_total
+            .inc_by(stats.bundle_teardowns);
+        self.replica_preamble_refusals_total
+            .inc_by(stats.preamble_refusals);
+        self.replica_handshake_failures_total
+            .inc_by(stats.handshake_failures);
+        self.replica_bundles_up
+            .set(i64::try_from(stats.bundles_up).unwrap_or(i64::MAX));
     }
 
     fn register_persistence(&self, registry: &mut Registry) {
@@ -1137,6 +1174,31 @@ impl ShardMetrics {
             self.replica_inbound_frames_total.clone(),
         );
         registry.register(
+            "replica_outbound_drops",
+            "replica frames dropped because a peer send queue was full",
+            self.replica_outbound_drops_total.clone(),
+        );
+        registry.register(
+            "replica_bundle_teardowns",
+            "replica bundles torn down because a link closed or the bundle stayed incomplete",
+            self.replica_bundle_teardowns_total.clone(),
+        );
+        registry.register(
+            "replica_preamble_refusals",
+            "inbound replica connections closed for a missing or refused placement preamble",
+            self.replica_preamble_refusals_total.clone(),
+        );
+        registry.register(
+            "replica_handshake_failures",
+            "delegated replica link handshakes that failed or ran out of handshake_grace",
+            self.replica_handshake_failures_total.clone(),
+        );
+        registry.register(
+            "replica_bundles_up",
+            "peers whose replica links are all installed, so frames flow to them",
+            self.replica_bundles_up.clone(),
+        );
+        registry.register(
             "metadata_prepare_gap_drops",
             "replicated metadata prepares dropped out of order by a backup's gap check",
             self.metadata_prepare_gap_drops_total.clone(),
@@ -1289,6 +1351,53 @@ mod tests {
             buffer
                 .lines()
                 .any(|line| line == "partition_wal_retained_bytes 65536")
+        );
+    }
+
+    #[test]
+    fn replica_link_stats_add_up_and_bundles_up_follows_the_last_sweep() {
+        let metrics = ShardMetrics::for_shard();
+        metrics.record_replica_link_stats(&ReplicaLinkStats {
+            bundle_teardowns: 2,
+            preamble_refusals: 1,
+            handshake_failures: 3,
+            bundles_up: 1,
+        });
+        metrics.record_replica_link_stats(&ReplicaLinkStats {
+            bundle_teardowns: 1,
+            bundles_up: 2,
+            ..ReplicaLinkStats::default()
+        });
+        let mut registry = Registry::default();
+        metrics.register(&mut registry);
+        let mut buffer = String::new();
+        prometheus_client::encoding::text::encode(&mut buffer, &registry)
+            .expect("scrape encoding succeeds");
+        for line in [
+            "replica_bundle_teardowns_total 3",
+            "replica_preamble_refusals_total 1",
+            "replica_handshake_failures_total 3",
+            "replica_bundles_up 2",
+        ] {
+            assert!(buffer.lines().any(|scraped| scraped == line), "{line}");
+        }
+    }
+
+    #[test]
+    fn replica_outbound_drops_from_two_sweeps_add_up_in_the_scrape() {
+        let metrics = ShardMetrics::for_shard();
+        metrics.record_replica_outbound_drops(2);
+        metrics.record_replica_outbound_drops(1);
+        let mut registry = Registry::default();
+        metrics.register(&mut registry);
+        let mut buffer = String::new();
+        prometheus_client::encoding::text::encode(&mut buffer, &registry)
+            .expect("scrape encoding succeeds");
+        assert!(
+            buffer
+                .lines()
+                .any(|line| line == "replica_outbound_drops_total 3"),
+            "both sweep deltas land on the registered counter",
         );
     }
 

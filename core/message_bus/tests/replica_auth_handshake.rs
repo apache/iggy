@@ -16,8 +16,8 @@
 // under the License.
 
 //! End-to-end replica auth handshake over real loopback TCP, through the
-//! owning-shard install paths (blind delegation: the listener reads
-//! nothing, the handshake runs in the install task). The dialer holds
+//! owning-shard install paths (shard 0 reads only the placement preamble,
+//! the handshake runs in the install task). The dialer holds
 //! the lower id and dials the higher-id acceptor. The MAC algebra
 //! (reflection, replay, swapped pair) is unit-tested in
 //! `message_bus::replica::auth`; here we assert the full 3-message
@@ -35,9 +35,10 @@ use iggy_binary_protocol::{Command, GenericHeader, HEADER_SIZE};
 use iggy_common::IggyError;
 use message_bus::connector::start as start_connector;
 use message_bus::framing::{self, MAX_MESSAGE_SIZE};
-use message_bus::replica::auth::{self, HandshakeStatus, ReplicaAuth};
+use message_bus::replica::auth::{self, HandshakeStatus, LinkPlacement, ReplicaAuth};
 use message_bus::replica::listener::{MessageHandler, bind, run};
-use message_bus::{IggyMessageBus, MessageBusConfig};
+use message_bus::replica::preamble::{Preamble, read_preamble, write_preamble};
+use message_bus::{IggyMessageBus, MessageBus, MessageBusConfig};
 use server_common::Message;
 use std::cell::Cell;
 use std::rc::Rc;
@@ -47,6 +48,14 @@ const CLUSTER: u128 = 0xCAFE;
 const SECRET_A: &[u8] = b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const SECRET_B: &[u8] = b"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
 const LONG_PERIOD: Duration = Duration::from_secs(30);
+const PREAMBLE_WAIT: Duration = Duration::from_secs(2);
+/// The placement of link 0 between one-shard, one-link nodes.
+const PLACEMENT: LinkPlacement = LinkPlacement {
+    shards: 1,
+    links: 1,
+    link: 0,
+};
+const LINK_0_OF_REPLICA_0: Preamble = Preamble { dialer: 0, link: 0 };
 
 fn noop_handler() -> MessageHandler {
     Rc::new(|_peer, _msg| {})
@@ -61,7 +70,19 @@ async fn spawn_acceptor(
     bus: &Rc<IggyMessageBus>,
     auth: Option<ReplicaAuth>,
 ) -> std::net::SocketAddr {
-    set_replica_ctx(bus, CLUSTER, 1, 2, auth);
+    spawn_acceptor_as(bus, 1, 2, auth).await
+}
+
+/// [`spawn_acceptor`] for replica `self_id` of a `replica_count`-node
+/// cluster.
+#[allow(clippy::future_not_send)]
+async fn spawn_acceptor_as(
+    bus: &Rc<IggyMessageBus>,
+    self_id: u8,
+    replica_count: u8,
+    auth: Option<ReplicaAuth>,
+) -> std::net::SocketAddr {
+    set_replica_ctx(bus, CLUSTER, self_id, replica_count, auth);
     let (listener, addr) = bind(loopback()).await.expect("bind acceptor");
     let token = bus.token();
     let delegate = install_replicas_locally(bus.clone(), noop_handler());
@@ -113,7 +134,7 @@ async fn acceptor_refuses_incompatible_build_with_and_without_auth() {
         let acceptor = Rc::new(IggyMessageBus::new(0));
         let addr =
             spawn_acceptor(&acceptor, authenticated.then(|| ReplicaAuth::new(SECRET_A))).await;
-        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        let mut stream = connect_link(addr, LINK_0_OF_REPLICA_0).await;
         let nonce = auth::random_nonce().expect("nonce");
         let hello = build_hello(CLUSTER, 0, authenticated.then_some(&nonce)).transmute_header(
             |old, header: &mut GenericHeader| {
@@ -144,6 +165,13 @@ async fn dialer_refuses_incompatible_build_with_and_without_auth() {
         let observed = Rc::clone(&responded);
         let peer = compio::runtime::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
+            let preamble = read_preamble(&mut stream, PREAMBLE_WAIT)
+                .await
+                .expect("read preamble");
+            assert_eq!(
+                Preamble::admit(preamble, 1, 2, PLACEMENT.links).expect("valid preamble"),
+                LINK_0_OF_REPLICA_0
+            );
             let hello = framing::read_message(&mut stream, MAX_MESSAGE_SIZE)
                 .await
                 .expect("read hello");
@@ -277,7 +305,7 @@ async fn acceptor_nacks_authenticated_dialer_on_cluster_mismatch() {
     let acceptor = Rc::new(IggyMessageBus::new(0));
     let addr = spawn_acceptor(&acceptor, Some(ReplicaAuth::new(SECRET_A))).await;
 
-    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    let mut stream = connect_link(addr, LINK_0_OF_REPLICA_0).await;
     let nonce = auth::random_nonce().expect("nonce");
     framing::write_message(&mut stream, build_hello(0xDEAD, 0, Some(&nonce)))
         .await
@@ -303,7 +331,7 @@ async fn no_nack_to_unauthenticated_peer() {
     let acceptor = Rc::new(IggyMessageBus::new(0));
     let addr = spawn_acceptor(&acceptor, Some(ReplicaAuth::new(SECRET_A))).await;
 
-    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    let mut stream = connect_link(addr, LINK_0_OF_REPLICA_0).await;
     framing::write_message(&mut stream, build_hello(CLUSTER, 0, None))
         .await
         .expect("write hello");
@@ -326,7 +354,7 @@ async fn acceptor_rejects_wrong_command_on_frame3() {
     let acceptor = Rc::new(IggyMessageBus::new(0));
     let addr = spawn_acceptor(&acceptor, Some(ReplicaAuth::new(SECRET_A))).await;
 
-    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    let mut stream = connect_link(addr, LINK_0_OF_REPLICA_0).await;
     let nonce = auth::random_nonce().expect("nonce");
     framing::write_message(&mut stream, build_hello(CLUSTER, 0, Some(&nonce)))
         .await
@@ -359,9 +387,109 @@ async fn acceptor_rejects_wrong_command_on_frame3() {
     acceptor.shutdown(Duration::from_secs(2)).await;
 }
 
-/// Build a raw `ReplicaHello` frame for the wire-level reject tests. With
-/// `nonce` set it opens the authenticated handshake (`reserved_command[0..32]`);
-/// without, it is a legacy plaintext announce.
+#[compio::test]
+async fn acceptor_refuses_a_hello_whose_placement_differs() {
+    for (placement, status) in [
+        (
+            LinkPlacement {
+                shards: 2,
+                ..PLACEMENT
+            },
+            HandshakeStatus::ShardCountMismatch,
+        ),
+        (
+            LinkPlacement {
+                links: 2,
+                ..PLACEMENT
+            },
+            HandshakeStatus::LinkCountMismatch,
+        ),
+        (
+            LinkPlacement {
+                link: 1,
+                ..PLACEMENT
+            },
+            HandshakeStatus::PlacementMismatch,
+        ),
+    ] {
+        let acceptor = Rc::new(IggyMessageBus::new(0));
+        let addr = spawn_acceptor(&acceptor, None).await;
+        let mut stream = connect_link(addr, LINK_0_OF_REPLICA_0).await;
+        let hello =
+            build_hello(CLUSTER, 0, None).transmute_header(|old, header: &mut GenericHeader| {
+                *header = old;
+                placement.write(&mut header.reserved_command);
+            });
+        framing::write_message(&mut stream, hello)
+            .await
+            .expect("write hello");
+        let response = framing::read_message(&mut stream, MAX_MESSAGE_SIZE)
+            .await
+            .expect("read refusal");
+        assert_eq!(
+            auth::read_status(&response.header().reserved_command),
+            status,
+            "{placement:?}"
+        );
+        assert!(!acceptor.replicas().contains(0));
+        acceptor.shutdown(Duration::from_secs(2)).await;
+    }
+}
+
+/// Shard 0 placed the link for the dialer its preamble named, so a hello
+/// from another replica is refused even when that replica may dial.
+#[compio::test]
+async fn acceptor_refuses_a_hello_from_another_replica_than_its_preamble() {
+    let acceptor = Rc::new(IggyMessageBus::new(0));
+    let addr = spawn_acceptor_as(&acceptor, 2, 3, None).await;
+    let mut stream = connect_link(addr, Preamble { dialer: 1, link: 0 }).await;
+    framing::write_message(&mut stream, build_hello(CLUSTER, 0, None))
+        .await
+        .expect("write hello");
+    let response = framing::read_message(&mut stream, MAX_MESSAGE_SIZE)
+        .await
+        .expect("read refusal");
+    assert_eq!(
+        auth::read_status(&response.header().reserved_command),
+        HandshakeStatus::PlacementMismatch
+    );
+    assert!(!acceptor.replicas().contains(0));
+    assert!(!acceptor.replicas().contains(1));
+    acceptor.shutdown(Duration::from_secs(2)).await;
+}
+
+/// A dialer that sends no preamble, such as an older build, is closed by
+/// shard 0 before any handshake frame is answered.
+#[compio::test]
+async fn acceptor_closes_a_link_without_a_preamble() {
+    let acceptor = Rc::new(IggyMessageBus::new(0));
+    let addr = spawn_acceptor(&acceptor, None).await;
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    framing::write_message(&mut stream, build_hello(CLUSTER, 0, None))
+        .await
+        .expect("write hello");
+
+    let res = framing::read_message(&mut stream, MAX_MESSAGE_SIZE).await;
+    assert!(res.is_err(), "expected a close, got a response frame");
+    assert!(!acceptor.replicas().contains(0));
+    assert_eq!(acceptor.take_replica_link_stats().preamble_refusals, 1);
+    acceptor.shutdown(Duration::from_secs(2)).await;
+}
+
+/// Connect to `addr` and send `preamble`, the way the owner shard of a
+/// dialer starts a link.
+#[allow(clippy::future_not_send)]
+async fn connect_link(addr: std::net::SocketAddr, preamble: Preamble) -> TcpStream {
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    write_preamble(&mut stream, preamble)
+        .await
+        .expect("write preamble");
+    stream
+}
+
+/// Build a raw `ReplicaHello` frame for link 0 for the wire-level reject
+/// tests. With `nonce` set it opens the authenticated handshake
+/// (`reserved_command[0..32]`); without, it is a legacy plaintext announce.
 #[allow(clippy::cast_possible_truncation)]
 fn build_hello(
     cluster_id: u128,
@@ -378,6 +506,7 @@ fn build_hello(
         if let Some(nonce) = nonce {
             h.reserved_command[..auth::NONCE_LEN].copy_from_slice(nonce);
         }
+        PLACEMENT.write(&mut h.reserved_command);
     })
 }
 
