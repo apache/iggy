@@ -46,6 +46,7 @@ impl IntoResponse for ApiError {
                     RuntimeError::MissingIggyCredentials => StatusCode::BAD_REQUEST,
                     RuntimeError::InvalidConfiguration(_) => StatusCode::BAD_REQUEST,
                     RuntimeError::InvalidConnectorKey(_) => StatusCode::BAD_REQUEST,
+                    RuntimeError::UnsupportedPollInterval(_) => StatusCode::BAD_REQUEST,
                     RuntimeError::CannotConvertConfiguration => StatusCode::BAD_REQUEST,
                     RuntimeError::SinkNotFound(_) => StatusCode::NOT_FOUND,
                     RuntimeError::SourceNotFound(_) => StatusCode::NOT_FOUND,

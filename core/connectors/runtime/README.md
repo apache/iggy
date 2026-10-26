@@ -59,10 +59,11 @@ ready (default 1), when its reply reaches 1 MiB, or when `max_wait` expires
 example `max_wait = "3s"` with `min_count` equal to `batch_length`. `min_count`
 must not exceed `batch_length`. `max_wait` must be above zero and at most 10
 minutes, and the server shortens a wait above its `deferred_poll_max_wait`.
-A configured `poll_interval` is deprecated: the runtime logs a warning and
-ignores it. The server commits the offset of each sink poll when it answers
-the poll, before the plugin consumes the messages. Sinks need a server that
-supports deferred polls (binary commands 106 and 107).
+Use `max_wait` and `min_count` in place of `poll_interval`. If a sink
+`[[streams]]` entry sets `poll_interval`, that sink fails to start. The server
+commits the offset of each sink poll when it answers the poll, before the
+plugin consumes the messages. Sinks need a server that supports deferred polls
+(binary commands 106 and 107).
 
 ## State storage
 

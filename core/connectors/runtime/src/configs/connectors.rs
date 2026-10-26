@@ -269,6 +269,8 @@ pub struct StreamConsumerConfig {
     #[config_env(leaf)]
     pub avro_schema_path: Option<PathBuf>,
     pub batch_length: Option<u32>,
+    /// Replaced by `max_wait` and `min_count`. Kept so that a sink that still
+    /// sets it fails to start: without the field, serde ignores the setting.
     pub poll_interval: Option<String>,
     pub max_wait: Option<String>,
     pub min_count: Option<u32>,

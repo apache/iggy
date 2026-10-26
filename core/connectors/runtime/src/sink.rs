@@ -534,12 +534,6 @@ pub(crate) async fn setup_sink_consumers(
 
     let mut consumers = Vec::new();
     for stream in config.streams.iter() {
-        if stream.poll_interval.is_some() {
-            warn!(
-                "Sink connector: {key}, stream: {} configures deprecated poll_interval, which the runtime ignores. Set max_wait and min_count to batch messages.",
-                stream.stream
-            );
-        }
         let poll_options = poll_options(stream)?;
         let default_consumer_group = format!("iggy-connect-sink-{key}");
         let consumer_group = stream
@@ -583,6 +577,9 @@ pub(crate) async fn setup_sink_consumers(
 /// A configured wait extends the default request timeout by its length, so the
 /// final read and the reply keep the default time after the wait.
 fn poll_options(stream: &StreamConsumerConfig) -> Result<DeferredPollOptions, RuntimeError> {
+    if stream.poll_interval.is_some() {
+        return Err(RuntimeError::UnsupportedPollInterval(stream.stream.clone()));
+    }
     let mut options = DeferredPollOptions::default();
     if let Some(max_wait) = stream.max_wait.as_deref() {
         // A zero wait answers at once, so an idle topic would be polled constantly.
@@ -1553,5 +1550,28 @@ mod tests {
                 "max_wait {max_wait} would poll an idle topic constantly"
             );
         }
+    }
+
+    #[test]
+    fn given_a_poll_interval_when_building_poll_options_should_refuse_it() {
+        let stream = StreamConsumerConfig {
+            stream: "orders".to_owned(),
+            poll_interval: Some("3s".to_owned()),
+            max_wait: Some("3s".to_owned()),
+            min_count: Some(500),
+            ..StreamConsumerConfig::default()
+        };
+
+        let error = poll_options(&stream).expect_err("poll_interval is no longer supported");
+
+        assert!(
+            matches!(&error, RuntimeError::UnsupportedPollInterval(name) if name == "orders"),
+            "unexpected error: {error}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("max_wait") && message.contains("min_count"),
+            "the error must name the settings that replace poll_interval, got: {message}"
+        );
     }
 }
