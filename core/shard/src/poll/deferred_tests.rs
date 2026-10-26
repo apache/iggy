@@ -23,7 +23,10 @@ use super::*;
 use consensus::{ClientTable, PartitionsHandle, build_reply_message_with};
 use iggy_binary_protocol::requests::partitions::InstallConsumerGroupOwnerRequest;
 use iggy_binary_protocol::{Operation, PrepareHeader};
-use iggy_common::{ConsumerGroupId, ConsumerKind, ConsumerOffset, IggyByteSize, IggyTimestamp};
+use iggy_common::{
+    ConsumerGroupId, ConsumerKind, ConsumerOffset, DEFAULT_POLL_MAX_BYTES, IggyByteSize,
+    IggyTimestamp,
+};
 use metadata::IggyMetadata;
 use metadata::stm::consumer_group::{ConsumerGroup, ConsumerGroupMember};
 use metadata::stm::stream::{Partition as MetadataPartition, Stream, StreamsInner, Topic};
@@ -206,20 +209,40 @@ fn pending(replies: &Receiver<PartitionReadReply>) {
     ));
 }
 
+/// What a disk read of the fixture's `request` reserves.
+fn read_bytes(owner: &TestShard) -> usize {
+    owner
+        .deferred_polls
+        .read_bytes(&request(owner, 1, false, false).options)
+}
+
+/// Fills the read budget with reservations the size of a fixture read, so
+/// that dropping one makes room for exactly one such read.
+fn hold_read_budget(owner: &TestShard) -> Vec<ReadReservation> {
+    let bytes = read_bytes(owner);
+    std::iter::from_fn(|| owner.deferred_polls.reserve_read(bytes).ok()).collect()
+}
+
 #[compio::test]
 async fn deferred_completion_capacity_is_distinct_from_a_closed_lane() {
     let owner = owner(&["first"]).await;
     let lane = PollCompletionLane::new(1, &owner.metrics);
+    let reserve = || {
+        owner
+            .deferred_polls
+            .reserve_read(read_bytes(&owner))
+            .unwrap()
+    };
     let active = lane
-        .try_reserve_deferred(namespace(), 1, owner.deferred_polls.reserve_read().unwrap())
+        .try_reserve_deferred(namespace(), 1, reserve())
         .unwrap();
     assert!(matches!(
-        lane.try_reserve_deferred(namespace(), 2, owner.deferred_polls.reserve_read().unwrap()),
+        lane.try_reserve_deferred(namespace(), 2, reserve()),
         Err(IggyError::DeferredPollCapacityExceeded)
     ));
     lane.close();
     assert!(matches!(
-        lane.try_reserve_deferred(namespace(), 3, owner.deferred_polls.reserve_read().unwrap()),
+        lane.try_reserve_deferred(namespace(), 3, reserve()),
         Err(IggyError::TransientNotAccepted)
     ));
     drop(active);
@@ -232,10 +255,10 @@ async fn deferred_completion_capacity_is_distinct_from_a_closed_lane() {
 #[compio::test]
 async fn resident_poll_completes_while_disk_reads_hold_the_whole_read_budget() {
     let owner = owner(&["first", "second"]).await;
-    let held: Vec<_> = std::iter::from_fn(|| owner.deferred_polls.reserve_read().ok()).collect();
+    let held = hold_read_budget(&owner);
     assert!(!held.is_empty());
     assert!(matches!(
-        owner.deferred_polls.reserve_read(),
+        owner.deferred_polls.reserve_read(read_bytes(&owner)),
         Err(IggyError::DeferredPollCapacityExceeded)
     ));
     let replies = submit(&owner, request(&owner, 2, false, false)).await;
@@ -250,8 +273,7 @@ async fn freed_read_budget_starts_refused_disk_reads_in_refusal_order() {
     let older = submit(&owner, request(&owner, 2, false, false)).await;
     pending(&older);
     evict_messages_for_disk_dispatch(&owner, namespace());
-    let mut held: Vec<_> =
-        std::iter::from_fn(|| owner.deferred_polls.reserve_read().ok()).collect();
+    let mut held = hold_read_budget(&owner);
     let refused = submit(&owner, request(&owner, 2, false, false)).await;
     pending(&refused);
     assert_eq!(
@@ -293,8 +315,7 @@ async fn freed_read_budget_starts_refused_disk_reads_in_refusal_order() {
 async fn freed_read_budget_starts_a_refused_read_ahead_of_other_wakes() {
     let owner = owner(&["first"]).await;
     evict_messages_for_disk_dispatch(&owner, namespace());
-    let mut held: Vec<_> =
-        std::iter::from_fn(|| owner.deferred_polls.reserve_read().ok()).collect();
+    let mut held = hold_read_budget(&owner);
     // Admitted first, these waits take the lower ids, so a maintenance wake
     // queues them ahead of the refused read and fills a whole service turn.
     let waits: Vec<_> = (0..SERVICE_BUDGET)
@@ -329,8 +350,7 @@ async fn freed_read_budget_starts_a_refused_read_ahead_of_other_wakes() {
 async fn cancelled_refused_read_does_not_hold_back_later_reads() {
     let owner = owner(&["first"]).await;
     evict_messages_for_disk_dispatch(&owner, namespace());
-    let mut held: Vec<_> =
-        std::iter::from_fn(|| owner.deferred_polls.reserve_read().ok()).collect();
+    let mut held = hold_read_budget(&owner);
     let cancelled = submit(&owner, request(&owner, 2, false, false)).await;
     let later = submit(&owner, request(&owner, 2, false, false)).await;
     assert_eq!(owner.deferred_polls.state.borrow().read_queue.len(), 2);
@@ -341,6 +361,131 @@ async fn cancelled_refused_read_does_not_hold_back_later_reads() {
     pending(&later);
     let state = owner.deferred_polls.state.borrow();
     assert!(!state.waiters.contains_key(&1));
+    assert!(state.waiters[&2].running);
+    assert!(state.read_queue.is_empty());
+}
+
+#[compio::test]
+async fn disk_reads_reserve_three_parts_of_their_max_bytes_or_one_chunk() {
+    // A small max_bytes must not let more reads start than chunk-sized parts fit.
+    for (max_bytes, part) in [
+        (DEFAULT_POLL_MAX_BYTES, DEFAULT_POLL_MAX_BYTES as usize),
+        (4 << 10, READ_PART_MIN_BYTES),
+    ] {
+        let mut owner = owner(&["first"]).await;
+        let per_read = READ_BUDGET_PARTS * part;
+        let reads = owner.deferred_polls.config.borrow().max_inflight_bytes / per_read;
+        owner.poll_completions = PollCompletionLane::new(reads + 1, &owner.metrics);
+        evict_messages_for_disk_dispatch(&owner, namespace());
+        let mut replies = Vec::with_capacity(reads + 1);
+        for _ in 0..=reads {
+            let mut request = request(&owner, 2, false, false);
+            request.options.max_bytes = max_bytes;
+            replies.push(submit(&owner, request).await);
+        }
+        replies.iter().for_each(pending);
+        let state = owner.deferred_polls.state.borrow();
+        assert_eq!(
+            state
+                .waiters
+                .values()
+                .filter(|waiter| waiter.running)
+                .count(),
+            reads,
+            "every read that fits the budget starts, max_bytes {max_bytes}"
+        );
+        assert_eq!(
+            state.read_queue.len(),
+            1,
+            "the read past the budget waits, max_bytes {max_bytes}"
+        );
+        assert_eq!(
+            owner.deferred_polls.inflight_bytes.load(Ordering::Relaxed),
+            reads * per_read,
+            "max_bytes {max_bytes}"
+        );
+    }
+}
+
+#[compio::test]
+async fn disk_read_reserves_at_most_max_read_bytes() {
+    let mut owner = owner(&["first"]).await;
+    let max_read_bytes = owner.deferred_polls.config.borrow().max_read_bytes;
+    let ceiling = u32::try_from(max_read_bytes.div_ceil(READ_BUDGET_PARTS)).unwrap();
+    let cases = [
+        (ceiling - 1, READ_BUDGET_PARTS * (ceiling - 1) as usize),
+        (ceiling, max_read_bytes),
+        (u32::MAX, max_read_bytes),
+    ];
+    owner.poll_completions = PollCompletionLane::new(cases.len(), &owner.metrics);
+    evict_messages_for_disk_dispatch(&owner, namespace());
+    let mut replies = Vec::with_capacity(cases.len());
+    for (max_bytes, reserved) in cases {
+        let before = owner.deferred_polls.inflight_bytes.load(Ordering::Relaxed);
+        let mut request = request(&owner, 2, false, false);
+        request.options.max_bytes = max_bytes;
+        replies.push(submit(&owner, request).await);
+        assert_eq!(
+            owner.deferred_polls.inflight_bytes.load(Ordering::Relaxed) - before,
+            reserved,
+            "max_bytes {max_bytes}"
+        );
+    }
+    replies.iter().for_each(pending);
+    let held = owner.deferred_polls.inflight_bytes.load(Ordering::Relaxed);
+    assert_eq!(
+        owner.deferred_polls.metrics.inflight_bytes.get(),
+        i64::try_from(held).unwrap()
+    );
+
+    // Dropping the captured reads releases each reservation by its own size.
+    owner.bus.spawned_tasks.borrow_mut().clear();
+    assert_eq!(
+        owner.deferred_polls.inflight_bytes.load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(owner.deferred_polls.metrics.inflight_bytes.get(), 0);
+}
+
+#[compio::test]
+async fn refused_large_read_keeps_smaller_reads_behind_it_waiting() {
+    let mut owner = owner(&["first"]).await;
+    owner.poll_completions = PollCompletionLane::new(2, &owner.metrics);
+    evict_messages_for_disk_dispatch(&owner, namespace());
+    let config = *owner.deferred_polls.config.borrow();
+    // Room for a fixture read, but not for one at `max_read_bytes`.
+    let held = owner
+        .deferred_polls
+        .reserve_read(config.max_inflight_bytes - read_bytes(&owner))
+        .unwrap();
+    let mut large = request(&owner, 2, false, false);
+    large.options.max_bytes = u32::try_from(config.max_read_bytes).unwrap();
+    let large = submit(&owner, large).await;
+    let small = submit(&owner, request(&owner, 2, false, false)).await;
+    {
+        let state = owner.deferred_polls.state.borrow();
+        assert_eq!(state.read_queue, BTreeSet::from([(0, 1), (0, 2)]));
+        assert!(
+            !state.waiters[&2].running,
+            "a smaller read that fits does not overtake the refused one"
+        );
+    }
+    let context = Context::from_waker(Waker::noop());
+    assert!(
+        owner.deferred_polls.poll_ready(&context).is_pending(),
+        "room for a smaller read wakes nobody"
+    );
+
+    drop(held);
+    assert!(
+        owner.deferred_polls.poll_ready(&context).is_ready(),
+        "room for the head read wakes the pump"
+    );
+    owner.service_deferred_polls().await;
+    pending(&large);
+    pending(&small);
+    let state = owner.deferred_polls.state.borrow();
+    assert!(state.waiters[&1].running);
     assert!(state.waiters[&2].running);
     assert!(state.read_queue.is_empty());
 }
@@ -658,7 +803,10 @@ async fn expired_or_cancelled_waiter_discards_queued_read_without_progress() {
             .unwrap()
             .execute_resident();
         // A read dispatched before expiry still owns its byte reservation after cancellation.
-        let reservation = owner.deferred_polls.reserve_read().unwrap();
+        let reservation = owner
+            .deferred_polls
+            .reserve_read(read_bytes(&owner))
+            .unwrap();
         owner
             .poll_completions
             .try_reserve_deferred(namespace(), id, reservation)
@@ -925,7 +1073,10 @@ async fn read_crossing_readiness_deadline_finishes_within_request_budget() {
             )
             .unwrap()
             .execute_resident();
-        let reservation = owner.deferred_polls.reserve_read().unwrap();
+        let reservation = owner
+            .deferred_polls
+            .reserve_read(read_bytes(&owner))
+            .unwrap();
         let completion = owner
             .poll_completions
             .try_reserve_deferred(namespace(), id, reservation)

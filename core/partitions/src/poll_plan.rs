@@ -634,7 +634,7 @@ impl DiskFault {
 
 /// Ceiling for ordinary disk reads. An incomplete batch may require one
 /// larger re-read, without widening subsequent chunks or segments.
-const DISK_POLL_CHUNK_MAX: u64 = 1 << 20;
+pub const DISK_POLL_CHUNK_MAX: u64 = 1 << 20;
 
 /// Budget charge per byte a chunk read holds: the read buffer itself, a sparse
 /// copy of its selection, and headroom for the fragment headers and

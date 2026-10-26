@@ -37,7 +37,9 @@ use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::stream::PollMetadata;
-use partitions::{Partition, PollReadResult, PollVisibility, PollingArgs, PollingConsumer};
+use partitions::{
+    DISK_POLL_CHUNK_MAX, Partition, PollReadResult, PollVisibility, PollingArgs, PollingConsumer,
+};
 use server_common::poll::PollHistoryId;
 use server_common::sharding::IggyNamespace;
 
@@ -49,6 +51,12 @@ use prometheus_client::metrics::gauge::Gauge;
 
 const SERVICE_BUDGET: usize = 8;
 const READ_BUDGET_PARTS: usize = 3;
+/// The smallest part of a disk read reservation. One disk read can take a
+/// chunk of up to [`DISK_POLL_CHUNK_MAX`] whatever its reply size, so a
+/// smaller part would let polls with a small `max_bytes` start more reads than
+/// the budget can hold.
+#[allow(clippy::cast_possible_truncation)]
+const READ_PART_MIN_BYTES: usize = DISK_POLL_CHUNK_MAX as usize;
 const MAINTENANCE_BUDGET: usize = 16;
 
 /// Auxiliary connections are charged to their parent session. HTTP requests
@@ -362,10 +370,7 @@ impl DeferredPolls {
         let state = self.state.borrow();
         // Freed read room wakes nobody, so a refused read that can start
         // keeps the pump turning.
-        if !signals.dirty.is_empty()
-            || !state.ready.is_empty()
-            || (!state.read_queue.is_empty() && self.has_read_room())
-        {
+        if !signals.dirty.is_empty() || !state.ready.is_empty() || self.head_read_fits(&state) {
             Poll::Ready(())
         } else {
             signals.waker = Some(context.waker().clone());
@@ -438,12 +443,37 @@ impl DeferredPolls {
         *self.signals.borrow_mut() = Signals::default();
     }
 
-    fn has_read_room(&self) -> bool {
+    /// The budget that a disk read of `options` reserves. Its snapshot, disk
+    /// selection and index loading can coexist, so it reserves one part as
+    /// large as its reply for each, at least [`READ_PART_MIN_BYTES`], up to
+    /// `max_read_bytes` in total.
+    fn read_bytes(&self, options: &DeferredPollOptions) -> usize {
+        (options.max_bytes as usize)
+            .max(READ_PART_MIN_BYTES)
+            .saturating_mul(READ_BUDGET_PARTS)
+            .min(self.config.borrow().max_read_bytes)
+    }
+
+    fn has_read_room(&self, bytes: usize) -> bool {
         Self::with_read(
             &self.config.borrow(),
             self.inflight_bytes.load(Ordering::Relaxed),
+            bytes,
         )
         .is_some()
+    }
+
+    /// Whether the read at the head of the read queue fits the free budget.
+    /// Only that read can start, so a large one keeps the smaller reads
+    /// behind it waiting. A head without a waiter fits, so that the service
+    /// loop drops it instead of stalling the queue.
+    fn head_read_fits(&self, state: &State) -> bool {
+        state.read_queue.first().is_some_and(|(_, id)| {
+            state
+                .waiters
+                .get(id)
+                .is_none_or(|waiter| self.has_read_room(self.read_bytes(&waiter.request.options)))
+        })
     }
 
     /// Takes a waiter out of the read queue for a probe. Only a read that the
@@ -454,21 +484,21 @@ impl DeferredPolls {
         Some(refused_at)
     }
 
-    /// Whether a read at `place` can start now. A read starts only ahead of
-    /// every refused read, so that a waiter whose read keeps coming back
-    /// cannot take the budget from a refused one.
-    fn read_turn(&self, place: (u64, u64)) -> bool {
+    /// Whether a read at `place` that reserves `bytes` can start now. A read
+    /// starts only ahead of every refused read, so that a waiter whose read
+    /// keeps coming back cannot take the budget from a refused one.
+    fn read_turn(&self, place: (u64, u64), bytes: usize) -> bool {
         self.state
             .borrow()
             .read_queue
             .first()
             .is_none_or(|first| place < *first)
-            && self.has_read_room()
+            && self.has_read_room(bytes)
     }
 
-    fn reserve_read_in_turn(&self, place: (u64, u64)) -> Option<ReadReservation> {
-        self.read_turn(place)
-            .then(|| self.reserve_read().ok())
+    fn reserve_read_in_turn(&self, place: (u64, u64), bytes: usize) -> Option<ReadReservation> {
+        self.read_turn(place, bytes)
+            .then(|| self.reserve_read(bytes).ok())
             .flatten()
     }
 
@@ -480,26 +510,27 @@ impl DeferredPolls {
         state.waiters.insert(id, waiter);
     }
 
-    fn reserve_read(&self) -> Result<ReadReservation, IggyError> {
+    fn reserve_read(&self, bytes: usize) -> Result<ReadReservation, IggyError> {
         let config = *self.config.borrow();
         self.inflight_bytes
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-                Self::with_read(&config, used)
+                Self::with_read(&config, used, bytes)
             })
             .map_err(|_| IggyError::DeferredPollCapacityExceeded)?;
         self.metrics
             .inflight_bytes
-            .inc_by(i64::try_from(config.max_read_bytes).unwrap_or(i64::MAX));
+            .inc_by(i64::try_from(bytes).unwrap_or(i64::MAX));
         Ok(ReadReservation {
             gauge: self.metrics.inflight_bytes.clone(),
-            bytes: config.max_read_bytes,
+            bytes,
             used: Arc::clone(&self.inflight_bytes),
         })
     }
 
-    /// The in-flight read bytes after one more reservation, if they fit.
-    fn with_read(config: &DeferredPollConfig, used: usize) -> Option<usize> {
-        used.checked_add(config.max_read_bytes)
+    /// The in-flight read bytes after one more reservation of `bytes`, if
+    /// they fit.
+    fn with_read(config: &DeferredPollConfig, used: usize, bytes: usize) -> Option<usize> {
+        used.checked_add(bytes)
             .filter(|next| *next <= config.max_inflight_bytes)
     }
 
@@ -776,7 +807,7 @@ where
                     && deadline <= now
                 {
                     Some(id)
-                } else if self.deferred_polls.has_read_room()
+                } else if self.deferred_polls.head_read_fits(&state)
                     && let Some((_, id)) = state.read_queue.pop_first()
                 {
                     // Freed room goes to the read that the budget refused
@@ -894,7 +925,8 @@ where
             refused_at.unwrap_or_else(|| self.bus.monotonic_micros()),
             id,
         );
-        if refused_at.is_some() && !self.deferred_polls.read_turn(place) {
+        let read_bytes = self.deferred_polls.read_bytes(&waiter.request.options);
+        if refused_at.is_some() && !self.deferred_polls.read_turn(place, read_bytes) {
             self.deferred_polls.queue_read(id, waiter, place);
             return;
         }
@@ -912,7 +944,7 @@ where
             self.accept_deferred_result(id, waiter, result).await;
             return;
         }
-        let Some(reservation) = self.deferred_polls.reserve_read_in_turn(place) else {
+        let Some(reservation) = self.deferred_polls.reserve_read_in_turn(place, read_bytes) else {
             self.deferred_polls.queue_read(id, waiter, place);
             return;
         };

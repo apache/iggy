@@ -126,8 +126,10 @@ pub struct ShardingConfig {
     /// The part of [`Self::deferred_poll_max_pending`] that one session may
     /// hold. An HTTP request without a binary session counts against its user.
     pub deferred_poll_max_pending_per_session: usize,
-    /// Disk bytes that one deferred poll reserves for its read. Its reply
-    /// carries no more, unless the first message alone is wider.
+    /// The most disk bytes that one deferred poll reserves for its read: three
+    /// times its `max_bytes`, and at least three times the largest disk chunk
+    /// (1 MiB), up to this value. Its reply carries no more than this value, unless the
+    /// first message alone is wider.
     #[config_env(leaf)]
     pub deferred_poll_max_read_bytes: IggyByteSize,
     /// Disk bytes that the deferred reads of one shard reserve together. A
