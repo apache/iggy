@@ -1346,7 +1346,7 @@ class IggyClient:
         """
     def create_personal_access_token(
         self, name: builtins.str, expiry: IggyExpiry
-    ) -> collections.abc.Awaitable[builtins.str]:
+    ) -> collections.abc.Awaitable[str]:
         r"""
         Create a personal access token for the currently authenticated user.
 
