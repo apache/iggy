@@ -39,6 +39,17 @@ max-threads = 1
 filter = 'package(integration) and test(/connectors::elasticsearch::/)'
 test-group = "elasticsearch"
 
+# MSSQL tests share one reusable SQL Server container (`iggy-test-mssql`) for the
+# same reason. Each fixture creates its own database in it.
+[test-groups.mssql]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'package(integration) and test(/connectors::mssql::/)'
+test-group = "mssql"
+# A test can wait up to 180 s for SQL Server to start and up to 180 s for delivery.
+slow-timeout = { period = "60s", terminate-after = 8 }
+
 # Each test in these binaries spawns its own real iggy-server subprocess (isolated data dir, port
 # from PortGuard's own flock, so no two ever share a port). #[serial] on them is a dead letter
 # under nextest - nextest runs every test as its own process, and #[serial]'s mutex only excludes

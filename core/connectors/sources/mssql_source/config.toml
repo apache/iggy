@@ -1,0 +1,46 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+type = "source"
+key = "mssql"
+enabled = true
+version = 1
+name = "MSSQL source"
+path = "target/release/libiggy_connector_mssql_source"
+plugin_config_format = "json"
+verbose = false
+benchmark = false
+
+# Commit order needs a one-partition, durability=persisted topic. The runtime creates one if missing.
+[[streams]]
+stream = "cdc"
+topic = "mssql"
+schema = "json"
+batch_length = 1000
+linger_time = "5ms"
+
+[plugin_config]
+# ADO.NET string with Database=. A named instance needs its port. Set the password through an environment override.
+connection_string = "Server=tcp:localhost,1433;Database=shop;User Id=iggy_cdc;Password=replace-me;Encrypt=true;TrustServerCertificate=false"
+# Unquoted schema.table names. Each table must already be enabled for CDC.
+tables = ["dbo.users"]
+poll_interval = "1s"
+batch_size = 1000
+query_timeout = "30s"
+# "earliest" reads every retained change on the first start. "latest" skips them.
+start_position = "earliest"
+verbose_logging = false

@@ -246,8 +246,9 @@ appends a uuid for parallel-safe ephemeral containers. Reuse fixtures use a fixe
 nextest processes attach to the same container via `ReuseDirective::Always`. Do
 not hand-roll a different prefix - the sweep only finds `iggy-test-*`.
 
-As of now only `elasticsearch` and `doris` share a container. Both have a slow
-boot (JVM / Doris FE+BE, tens of seconds), so reusing one across the whole
+As of now only `elasticsearch`, `doris` and `mssql` share a container. All have
+a slow boot (JVM / Doris FE+BE / SQL Server, tens of seconds) or a large memory
+footprint (SQL Server needs about 2 GB), so reusing one across the whole
 regression beats spinning a fresh one per test. Every other fixture boots a
 fresh, ephemeral container per test - cheap enough that the isolation is worth
 more than the reuse.

@@ -1487,6 +1487,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5161fb43cb8f231f06983cb2b8f9ee9cee14be0b1356d8383398cc0f312800d1"
 
 [[package]]
+name = "asynchronous-codec"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a860072022177f903e59730004fb5dc13db9275b79bb2aef7ba8ce831956c233"
+dependencies = [
+ "bytes",
+ "futures-sink",
+ "futures-util",
+ "memchr",
+ "pin-project-lite",
+]
+
+[[package]]
 name = "atoi"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3486,6 +3499,12 @@ dependencies = [
  "quote",
  "syn 3.0.9",
 ]
+
+[[package]]
+name = "connection-string"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "510ca239cf13b7f8d16a2b48f263de7b4f8c566f0af58d901031473c76afb1e3"
 
 [[package]]
 name = "consensus"
@@ -7704,6 +7723,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "iggy_connector_mssql_source"
+version = "0.5.1-edge.1"
+dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "blake3",
+ "chrono",
+ "dashmap",
+ "humantime",
+ "iggy_common",
+ "iggy_connector_sdk",
+ "rmp-serde",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "tiberius",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "iggy_connector_postgres_sink"
 version = "0.5.1-edge.1"
 dependencies = [
@@ -8160,8 +8202,10 @@ dependencies = [
  "test-case",
  "testcontainers",
  "testcontainers-modules",
+ "tiberius",
  "tokio",
  "tokio-postgres",
+ "tokio-util",
  "toml 1.1.8+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
@@ -11039,6 +11083,12 @@ dependencies = [
  "ipnet",
  "num-traits",
 ]
+
+[[package]]
+name = "pretty-hex"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9a65843dfefbafd3c879c683306959a6de478443ffe9c9adf02f5976432402d7"
 
 [[package]]
 name = "prettyplease"
@@ -14290,6 +14340,51 @@ dependencies = [
  "byteorder",
  "integer-encoding",
  "ordered-float 2.10.1",
+]
+
+[[package]]
+name = "tiberius"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e07324791de2bdaed058af4aa433a0b5ec5c0beac407a9797419c19805df2415"
+dependencies = [
+ "async-trait",
+ "asynchronous-codec",
+ "byteorder",
+ "bytes",
+ "chrono",
+ "connection-string",
+ "encoding_rs",
+ "enumflags2",
+ "futures-timer",
+ "futures-util",
+ "libc",
+ "num-traits",
+ "once_cell",
+ "pin-project-lite",
+ "pretty-hex",
+ "rustls-native-certs",
+ "rustls-pki-types",
+ "rustls-webpki 0.103.15",
+ "secrecy",
+ "thiserror 2.0.21",
+ "tiberius-macros",
+ "tokio-rustls",
+ "tokio-util",
+ "tracing",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
+name = "tiberius-macros"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "907fed5ea55695d902cc3359fffa4a35021dfa9b95ab4eb9c8376d42ffb9eec8"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

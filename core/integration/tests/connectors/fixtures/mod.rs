@@ -28,6 +28,7 @@ mod influxdb;
 mod meilisearch;
 mod mongodb;
 mod mqtt;
+mod mssql;
 mod postgres;
 mod quickwit;
 mod rabbitmq;
@@ -88,6 +89,12 @@ pub use mqtt::{
     Mqtt5InvalidCredentialsFixture, Mqtt5MetadataQos1Fixture, Mqtt5PendingBatchFixture,
     Mqtt5Qos0Fixture, Mqtt5Qos1Fixture, Mqtt5Qos2Fixture, Mqtt311InvalidCredentialsFixture,
     Mqtt311Qos0Fixture, Mqtt311Qos1Fixture, Mqtt311Qos2Fixture,
+};
+pub use mssql::{
+    MSSQL_ORDERS_INSTANCE, MssqlAllTypesFixture, MssqlCdcDisabledFixture,
+    MssqlDuplicateTableFixture, MssqlInvalidCredentialsFixture, MssqlLatestStartFixture,
+    MssqlMissingTableFixture, MssqlSourceFixture, MssqlSourceManualScanFixture,
+    MssqlUncapturedTableFixture, MssqlUnsupportedTypeFixture,
 };
 pub use postgres::{
     POSTGRES_LARGE_BATCH_SIZE, PostgresOps, PostgresSinkByteaFixture, PostgresSinkFixture,
