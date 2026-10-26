@@ -727,9 +727,9 @@ where
     let request = DeferredPollRequest::new(
         consumer,
         args,
+        metadata,
         DeferredPollContext {
             session: Some(session),
-            metadata,
             user_id,
             user_created_at: None,
             quota: PollQuotaIdentity::Session(consumer_client_id),
@@ -742,12 +742,12 @@ where
 
 /// Resolve and authorize every partition of a readiness wait with the fence
 /// and metadata identity of a poll. The owner checks them again at each
-/// evaluation.
+/// evaluation. Returns the caller that every target shares, and the targets.
 pub(super) fn resolve_readiness_wait<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     wire: WaitForMessagesRequest,
     (consumer_client_id, session, user_id): (u128, SessionAttachment, u32),
-) -> Result<Vec<ReadinessTarget>, IggyError>
+) -> Result<(DeferredPollContext, Vec<ReadinessTarget>), IggyError>
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -775,7 +775,8 @@ where
         count: 1,
         auto_commit: false,
     };
-    wire.partitions
+    let targets = wire
+        .partitions
         .into_iter()
         .map(|target| {
             poll.partition_id = Some(target.partition_id);
@@ -794,22 +795,18 @@ where
                     value: args.value,
                     context: None,
                 },
-                context: DeferredPollContext {
-                    session: Some(session.clone()),
-                    metadata: consumer_poll_metadata(
-                        shard,
-                        namespace,
-                        consumer,
-                        consumer_client_id,
-                    )?,
-                    user_id,
-                    user_created_at: None,
-                    quota: PollQuotaIdentity::Session(consumer_client_id),
-                    primary: true,
-                },
+                metadata: consumer_poll_metadata(shard, namespace, consumer, consumer_client_id)?,
             })
         })
-        .collect()
+        .collect::<Result<_, _>>()?;
+    let caller = DeferredPollContext {
+        session: Some(session),
+        user_id,
+        user_created_at: None,
+        quota: PollQuotaIdentity::Session(consumer_client_id),
+        primary: true,
+    };
+    Ok((caller, targets))
 }
 
 fn consumer_poll_metadata<B, MJ, S, SB>(

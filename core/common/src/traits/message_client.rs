@@ -188,7 +188,8 @@ pub trait MessageClient {
     /// Each start point is [`PollingStrategy::offset`] or [`PollingStrategy::next`] of
     /// `consumer`, and each partition appears once. A reported partition returns at least one
     /// message to a poll with the same consumer and strategy, unless a purge or retention
-    /// removed the messages, or another commit moved `next` past them, in the meantime.
+    /// removed the messages, or another commit moved `next` past them, in the meantime. A
+    /// reply can leave out a `next` partition whose stored offset moved back during the wait.
     ///
     /// The wait runs on the primary of each partition. If the partitions have more than one
     /// primary, the call waits on each of them and returns the first reply that lists a

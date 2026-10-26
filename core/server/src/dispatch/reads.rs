@@ -717,7 +717,7 @@ async fn handle_deferred_request<B, MJ, S, SB>(
                 }
                 Either::Right(wait) => {
                     let duration = Duration::from_micros(shard.deferred_wait_us(wait.wait_us));
-                    let targets = resolve_readiness_wait(
+                    let (caller, targets) = resolve_readiness_wait(
                         shard,
                         wait,
                         (consumer_client_id, attachment.clone(), user_id),
@@ -727,14 +727,11 @@ async fn handle_deferred_request<B, MJ, S, SB>(
                         .map(|target| {
                             (
                                 target.namespace,
-                                target
-                                    .context
-                                    .metadata
-                                    .context(current_metadata_commit(shard)),
+                                target.metadata.context(current_metadata_commit(shard)),
                             )
                         })
                         .collect();
-                    let partitions = shard.wait_for_messages(targets, duration).await?;
+                    let partitions = shard.wait_for_messages(caller, targets, duration).await?;
                     for (namespace, context) in contexts {
                         authorize_served_partition_read(
                             shard,

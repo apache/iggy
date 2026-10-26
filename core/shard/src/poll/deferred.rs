@@ -59,10 +59,11 @@ pub enum PollQuotaIdentity {
     User(u32),
 }
 
-#[derive(Debug)]
+/// The caller of a deferred request. A readiness wait shares one context
+/// across its targets.
+#[derive(Debug, Clone)]
 pub struct DeferredPollContext {
     pub session: Option<SessionAttachment>,
-    pub metadata: PollMetadata,
     pub user_id: u32,
     pub user_created_at: Option<u64>,
     pub quota: PollQuotaIdentity,
@@ -78,6 +79,7 @@ pub struct DeferredPollContext {
 pub struct DeferredPollRequest {
     pub consumer: PollingConsumer,
     pub args: PollingArgs,
+    pub metadata: PollMetadata,
     pub context: DeferredPollContext,
     pub options: DeferredPollOptions,
     pub(crate) deadline: u64,
@@ -89,12 +91,14 @@ impl DeferredPollRequest {
     pub const fn new(
         consumer: PollingConsumer,
         args: PollingArgs,
+        metadata: PollMetadata,
         context: DeferredPollContext,
         options: DeferredPollOptions,
     ) -> Self {
         Self {
             consumer,
             args,
+            metadata,
             context,
             options,
             deadline: 0,
@@ -111,22 +115,31 @@ pub struct ReadinessTarget {
     pub consumer: PollingConsumer,
     /// `Offset` or `Next`, the start point of a poll with the same strategy.
     pub strategy: PollingStrategy,
-    pub context: DeferredPollContext,
+    pub metadata: PollMetadata,
 }
 
-/// The targets of one readiness wait that a single owner shard holds.
+/// The targets of one readiness wait that a single owner shard holds. They
+/// name one stream and topic, so one check of `context` covers all of them.
 #[derive(Debug)]
 pub struct ReadinessWait {
+    pub context: DeferredPollContext,
     pub targets: Vec<ReadinessTarget>,
     pub deadline: u64,
 }
 
-/// A readiness waiter answers once. `admitted` holds the history and view of
-/// each target at admission, and any change rejects the waiter.
+/// A readiness waiter answers once. Its targets are sorted by namespace.
+/// `admitted` holds the history and view of each target at admission, and a
+/// change that an evaluation finds rejects the waiter.
 struct ReadinessWaiter {
     wait: ReadinessWait,
     admitted: Vec<(PollHistoryId, u32)>,
-    quota: PollQuotaIdentity,
+    /// Namespaces that changed since the last probe. A commit makes only its
+    /// own target ready, so a probe evaluates these targets.
+    dirty: Vec<IggyNamespace>,
+    /// Maintenance evaluates every target in turn: `swept` targets of its
+    /// current pass are done, and the next probe evaluates `sweep` more.
+    swept: usize,
+    sweep: usize,
     reply: Sender<PartitionReadReply>,
 }
 
@@ -353,17 +366,39 @@ impl DeferredPolls {
         }
     }
 
+    /// A tick probes polls and readiness targets up to `MAINTENANCE_BUDGET`,
+    /// so a large wait spreads over several ticks. The cursor stays before a
+    /// wait that the budget covers in part, and the next tick resumes it.
     pub(crate) fn maintenance(&self) {
         let mut state = self.state.borrow_mut();
         let mut ids = state.ids_after(state.maintenance_cursor);
         if ids.is_empty() {
             ids = state.ids_after(0);
         }
-        if let Some(last) = ids.last() {
-            state.maintenance_cursor = *last;
-        }
+        let mut budget = MAINTENANCE_BUDGET;
         for id in ids {
+            if budget == 0 {
+                break;
+            }
+            let partial = if let Some(waiter) = state.readiness.get_mut(&id) {
+                let remaining = waiter
+                    .wait
+                    .targets
+                    .len()
+                    .saturating_sub(waiter.swept + waiter.sweep);
+                let sweep = remaining.min(budget);
+                waiter.sweep += sweep;
+                budget -= sweep;
+                sweep < remaining
+            } else {
+                budget -= 1;
+                false
+            };
             state.enqueue(id);
+            if partial {
+                break;
+            }
+            state.maintenance_cursor = id;
         }
     }
 
@@ -539,9 +574,24 @@ where
     fn validate_deferred_context(
         &self,
         namespace: IggyNamespace,
-        context: &DeferredPollContext,
-        consumer: PollingConsumer,
+        request: &DeferredPollRequest,
     ) -> Result<(PollHistoryId, PollVisibility, u32), IggyError> {
+        self.validate_caller(namespace, &request.context)?;
+        self.validate_partition(
+            namespace,
+            request.context.primary,
+            &request.metadata,
+            request.consumer,
+        )
+    }
+
+    /// The checks of the caller, the same for every partition of one stream
+    /// and topic.
+    fn validate_caller(
+        &self,
+        namespace: IggyNamespace,
+        context: &DeferredPollContext,
+    ) -> Result<(), IggyError> {
         if context
             .session
             .as_ref()
@@ -568,7 +618,18 @@ where
         metadata.users().authorize(|permissioner| {
             permissioner.poll_messages(context.user_id, namespace.stream_id(), namespace.topic_id())
         })?;
-        if !context.metadata.is_valid(metadata.streams(), namespace) {
+        Ok(())
+    }
+
+    /// The checks of one partition, after those of its caller.
+    fn validate_partition(
+        &self,
+        namespace: IggyNamespace,
+        primary: bool,
+        metadata: &PollMetadata,
+        consumer: PollingConsumer,
+    ) -> Result<(PollHistoryId, PollVisibility, u32), IggyError> {
+        if !metadata.is_valid(self.plane.metadata().mux_stm.streams(), namespace) {
             return Err(IggyError::TransientNotAccepted);
         }
         self.plane
@@ -578,7 +639,7 @@ where
                 if partition.history_deleted() {
                     return Err(IggyError::HistoryUnavailable);
                 }
-                if context.primary && consensus.is_normal_backup() {
+                if primary && consensus.is_normal_backup() {
                     return Err(IggyError::NotPrimary);
                 }
                 if let PollingConsumer::ConsumerGroup(group, _) = consumer
@@ -586,21 +647,19 @@ where
                         namespace,
                         group as u64,
                         partition.consumer_group_owner(group as u64),
-                        &context.metadata,
+                        metadata,
                     )
                 {
                     return Err(error);
                 }
                 if partition.fatal().is_some()
                     || partition.read_history_is_changing()
-                    || (context.primary && !consensus.applied_view_start())
+                    || (primary && !consensus.applied_view_start())
                     || partition.requires_state_transfer()
                     || !consensus.is_normal()
                     || consensus.is_transferring()
-                    || (context.primary && !consensus.is_primary())
-                    || !context
-                        .metadata
-                        .matches_partition(self.shards_table.epoch_for(namespace))
+                    || (primary && !consensus.is_primary())
+                    || !metadata.matches_partition(self.shards_table.epoch_for(namespace))
                 {
                     return Err(IggyError::TransientNotAccepted);
                 }
@@ -615,11 +674,8 @@ where
     /// admission: another session can store an offset while it waits, and a
     /// commit of this poll would then pass over a rewind.
     fn validate_waiter(&self, waiter: &Waiter) -> Result<PollVisibility, IggyError> {
-        let (history, visibility, view) = self.validate_deferred_context(
-            waiter.namespace,
-            &waiter.request.context,
-            waiter.request.consumer,
-        )?;
+        let (history, visibility, view) =
+            self.validate_deferred_context(waiter.namespace, &waiter.request)?;
         if history != waiter.history
             || view != waiter.view
             || (waiter.next
@@ -663,8 +719,7 @@ where
         }
         let admission = (|| {
             request.options.validate(request.args.count)?;
-            let (history, _, view) =
-                self.validate_deferred_context(namespace, &request.context, request.consumer)?;
+            let (history, _, view) = self.validate_deferred_context(namespace, &request)?;
             let config = *self.deferred_polls.config.borrow();
             let mut state = self.deferred_polls.state.borrow_mut();
             let id = state.admit(request.context.quota, &config)?;
@@ -757,6 +812,11 @@ where
                                 && waiter.parks_at(visibility, max_read_bytes)
                             {
                                 continue;
+                            }
+                            if let Some(waiter) = state.readiness.get_mut(&id)
+                                && !waiter.dirty.contains(&namespace)
+                            {
+                                waiter.dirty.push(namespace);
                             }
                             state.enqueue(id);
                         }
@@ -1051,19 +1111,27 @@ where
 
     fn park_readiness_wait(
         &self,
-        wait: ReadinessWait,
+        mut wait: ReadinessWait,
         reply: &Sender<PartitionReadReply>,
     ) -> Result<PartitionReadReply, IggyError> {
-        let quota = wait
+        let first = wait
             .targets
             .first()
             .ok_or(IggyError::InvalidCommand)?
-            .context
-            .quota;
+            .namespace;
+        if wait.targets.iter().any(|target| {
+            target.namespace.stream_id() != first.stream_id()
+                || target.namespace.topic_id() != first.topic_id()
+        }) {
+            return Err(IggyError::InvalidCommand);
+        }
+        self.validate_caller(first, &wait.context)?;
+        // A probe finds the target of a changed namespace by binary search.
+        wait.targets.sort_unstable_by_key(|target| target.namespace);
         let mut admitted = Vec::with_capacity(wait.targets.len());
         let mut partitions = Vec::new();
         for target in &wait.targets {
-            let (history, view, ready) = self.evaluate_readiness(target)?;
+            let (history, view, ready) = self.evaluate_readiness(wait.context.primary, target)?;
             admitted.push((history, view));
             if ready {
                 partitions.push(target.partition_id);
@@ -1084,6 +1152,7 @@ where
         }
         let config = *self.deferred_polls.config.borrow();
         let mut state = self.deferred_polls.state.borrow_mut();
+        let quota = wait.context.quota;
         let id = state.admit(quota, &config)?;
         self.register_waiter(
             &mut state,
@@ -1096,7 +1165,9 @@ where
             ReadinessWaiter {
                 wait,
                 admitted,
-                quota,
+                dirty: Vec::new(),
+                swept: 0,
+                sweep: 0,
                 reply: reply.clone(),
             },
         );
@@ -1109,13 +1180,14 @@ where
 
     /// Returns the history and view of the target, and whether a poll with its
     /// strategy returns a message now. This is the empty-plan test of
-    /// `build_poll_plan`.
+    /// `build_poll_plan`. The caller of the wait is checked before.
     fn evaluate_readiness(
         &self,
+        primary: bool,
         target: &ReadinessTarget,
     ) -> Result<(PollHistoryId, u32, bool), IggyError> {
         let (history, visibility, view) =
-            self.validate_deferred_context(target.namespace, &target.context, target.consumer)?;
+            self.validate_partition(target.namespace, primary, &target.metadata, target.consumer)?;
         let start = match target.strategy.kind {
             PollingKind::Offset => target.strategy.value,
             PollingKind::Next => self.next_offset(target.namespace, target.consumer)?,
@@ -1128,7 +1200,7 @@ where
         ))
     }
 
-    fn probe_readiness(&self, id: u64, waiter: ReadinessWaiter) {
+    fn probe_readiness(&self, id: u64, mut waiter: ReadinessWaiter) {
         if waiter.reply.is_disconnected() {
             self.metrics.deferred_polls.cancelled.inc();
             self.remove_readiness_wait(id, &waiter);
@@ -1140,21 +1212,63 @@ where
             self.remove_readiness_wait(id, &waiter);
             return;
         }
-        let partitions = waiter
-            .wait
-            .targets
-            .iter()
-            .zip(&waiter.admitted)
-            .filter_map(|(target, admitted)| match self.evaluate_readiness(target) {
-                Ok((history, view, ready)) if (history, view) == *admitted => {
-                    ready.then_some(Ok(target.partition_id))
-                }
-                Ok(_) => Some(Err(IggyError::TransientNotAccepted)),
-                Err(error) => Some(Err(error)),
+        let targets = &waiter.wait.targets;
+        // A commit marks only its own namespace. The probe evaluates the
+        // targets of marked namespaces, also of those that the pump has not
+        // taken yet, and the targets that maintenance assigned. Maintenance
+        // reaches every other target in turn. A lookup per target keeps the
+        // cost of the marks that the shard still holds within the wait size.
+        let mut evaluated: Vec<usize> = {
+            let signals = self.deferred_polls.signals.borrow();
+            waiter
+                .dirty
+                .iter()
+                .filter_map(|namespace| {
+                    targets
+                        .binary_search_by_key(namespace, |target| target.namespace)
+                        .ok()
+                })
+                .chain(
+                    targets
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, target)| signals.queued.contains(&target.namespace))
+                        .map(|(index, _)| index),
+                )
+                .chain(waiter.swept..waiter.swept + waiter.sweep)
+                .collect()
+        };
+        evaluated.sort_unstable();
+        evaluated.dedup();
+        let context = &waiter.wait.context;
+        let partitions = targets
+            .first()
+            .map_or(Ok(()), |first| {
+                self.validate_caller(first.namespace, context)
             })
-            .collect::<Result<Vec<_>, _>>();
+            .and_then(|()| {
+                evaluated
+                    .iter()
+                    .filter_map(|index| targets.get(*index).zip(waiter.admitted.get(*index)))
+                    .filter_map(|(target, admitted)| {
+                        match self.evaluate_readiness(context.primary, target) {
+                            Ok((history, view, ready)) if (history, view) == *admitted => {
+                                ready.then_some(Ok(target.partition_id))
+                            }
+                            Ok(_) => Some(Err(IggyError::TransientNotAccepted)),
+                            Err(error) => Some(Err(error)),
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            });
         let answer = match partitions {
             Ok(partitions) if partitions.is_empty() => {
+                waiter.dirty.clear();
+                waiter.swept += waiter.sweep;
+                waiter.sweep = 0;
+                if waiter.swept >= waiter.wait.targets.len() {
+                    waiter.swept = 0;
+                }
                 self.deferred_polls
                     .state
                     .borrow_mut()
@@ -1183,7 +1297,7 @@ where
         self.unwatch_partitions(self.deferred_polls.remove(
             id,
             &[waiter.wait.deadline],
-            waiter.quota,
+            waiter.wait.context.quota,
             waiter.wait.targets.iter().map(|target| target.namespace),
         ));
     }

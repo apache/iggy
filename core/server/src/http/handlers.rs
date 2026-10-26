@@ -1355,9 +1355,9 @@ async fn poll_messages_impl(
             PartitionRead::DeferredPoll(Box::new(DeferredPollRequest::new(
                 consumer,
                 args.clone(),
+                metadata,
                 DeferredPollContext {
                     session: None,
-                    metadata,
                     user_id: identity.user_id,
                     user_created_at: Some(identity.user_created_at.as_micros()),
                     quota: PollQuotaIdentity::User(identity.user_id),

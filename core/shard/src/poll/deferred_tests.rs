@@ -20,8 +20,9 @@
 use std::time::Duration;
 
 use super::*;
-use consensus::PartitionsHandle;
+use consensus::{ClientTable, PartitionsHandle, build_reply_message_with};
 use iggy_binary_protocol::requests::partitions::InstallConsumerGroupOwnerRequest;
+use iggy_binary_protocol::{Operation, PrepareHeader};
 use iggy_common::{ConsumerGroupId, ConsumerKind, ConsumerOffset, IggyByteSize, IggyTimestamp};
 use metadata::IggyMetadata;
 use metadata::stm::consumer_group::{ConsumerGroup, ConsumerGroupMember};
@@ -148,9 +149,9 @@ fn request(owner: &TestShard, count: u32, group: bool, auto_commit: bool) -> Def
             count,
             auto_commit,
         },
+        metadata,
         DeferredPollContext {
             session: None,
-            metadata,
             user_id: 0,
             user_created_at: None,
             quota: PollQuotaIdentity::Session(CLIENT),
@@ -991,14 +992,17 @@ fn readiness_target(
         partition_id: u32::try_from(partition).unwrap(),
         consumer: PollingConsumer::Consumer(0, partition),
         strategy,
-        context: DeferredPollContext {
-            session: None,
-            metadata,
-            user_id: 0,
-            user_created_at: None,
-            quota: PollQuotaIdentity::Session(CLIENT),
-            primary: true,
-        },
+        metadata,
+    }
+}
+
+fn readiness_caller() -> DeferredPollContext {
+    DeferredPollContext {
+        session: None,
+        user_id: 0,
+        user_created_at: None,
+        quota: PollQuotaIdentity::Session(CLIENT),
+        primary: true,
     }
 }
 
@@ -1006,6 +1010,7 @@ fn wait(owner: &TestShard, targets: Vec<ReadinessTarget>) -> Receiver<PartitionR
     let (reply, replies) = channel(2);
     owner.admit_readiness_wait(
         ReadinessWait {
+            context: readiness_caller(),
             targets,
             deadline: DEADLINE,
         },
@@ -1178,6 +1183,125 @@ async fn replacement_history_rejects_parked_readiness() {
     assert_released(&owner);
 }
 
+/// An owner whose partitions each hold one message, and a parked wait for
+/// the next message of every partition.
+async fn parked_wait_on(partitions: usize) -> (TestShard, Receiver<PartitionReadReply>) {
+    let owner = owner_of(&vec![&["first"][..]; partitions]).await;
+    let targets = (0..partitions)
+        .map(|partition| readiness_target(&owner, partition, PollingStrategy::offset(1)))
+        .collect();
+    let replies = wait(&owner, targets);
+    assert!(answer(&replies).0.is_some());
+    (owner, replies)
+}
+
+/// The partition refuses reads but marks nothing, so only an evaluation of
+/// its target finds it.
+fn begin_state_transfer(owner: &TestShard, partition: usize) {
+    owner
+        .plane
+        .partitions()
+        .with_partition(&partition_namespace(partition), |partition| {
+            partition.consensus().begin_state_transfer_await();
+        })
+        .unwrap();
+}
+
+#[compio::test]
+async fn commit_evaluates_only_the_readiness_target_of_its_partition() {
+    let (owner, replies) = parked_wait_on(MAINTENANCE_BUDGET + 1).await;
+    begin_state_transfer(&owner, MAINTENANCE_BUDGET);
+    commit(&owner, &["second"], 2).await;
+    owner.service_deferred_polls().await;
+    assert_eq!(answer(&replies), (None, vec![0]));
+    assert_released(&owner);
+}
+
+#[compio::test]
+async fn maintenance_evaluates_a_large_readiness_wait_one_budget_per_tick() {
+    let (owner, replies) = parked_wait_on(MAINTENANCE_BUDGET + 1).await;
+    let tick = async || {
+        owner.deferred_polls.maintenance();
+        owner.service_deferred_polls().await;
+    };
+    // The first pass takes two ticks. The second starts again at the first
+    // target, so it reaches the last one on the fourth tick.
+    tick().await;
+    tick().await;
+    begin_state_transfer(&owner, MAINTENANCE_BUDGET);
+    tick().await;
+    pending(&replies);
+    tick().await;
+    assert!(matches!(
+        replies.try_recv(),
+        Ok(PartitionReadReply::Rejected(
+            IggyError::TransientNotAccepted
+        ))
+    ));
+    assert_released(&owner);
+}
+
+#[compio::test]
+async fn stale_session_rejects_parked_readiness_on_a_commit() {
+    let owner = owner(&["first"]).await;
+    let mut table = ClientTable::new(1);
+    let registration = PrepareHeader {
+        client: CLIENT,
+        operation: Operation::Register,
+        op: 1,
+        ..Default::default()
+    };
+    table
+        .commit_register(
+            CLIENT,
+            0,
+            [0x5a; 32],
+            build_reply_message_with(&registration, 0, |_| {}),
+        )
+        .unwrap();
+    let session = table.attach_session(CLIENT, 1, 0).unwrap();
+    let (reply, replies) = channel(2);
+    owner.admit_readiness_wait(
+        ReadinessWait {
+            context: DeferredPollContext {
+                session: Some(session),
+                ..readiness_caller()
+            },
+            targets: vec![readiness_target(&owner, 0, PollingStrategy::offset(1))],
+            deadline: DEADLINE,
+        },
+        &reply,
+    );
+    assert!(answer(&replies).0.is_some());
+    drop(table);
+    commit(&owner, &["second"], 2).await;
+    owner.service_deferred_polls().await;
+    assert!(matches!(
+        replies.try_recv(),
+        Ok(PartitionReadReply::Rejected(IggyError::StaleClient))
+    ));
+    assert_released(&owner);
+}
+
+#[compio::test]
+async fn readiness_refuses_targets_of_more_than_one_topic() {
+    let owner = owner(&["first"]).await;
+    let mut other_topic = readiness_target(&owner, 0, PollingStrategy::offset(1));
+    other_topic.namespace = IggyNamespace::new(0, 1, 0);
+    let replies = wait(
+        &owner,
+        vec![
+            readiness_target(&owner, 0, PollingStrategy::offset(1)),
+            other_topic,
+        ],
+    );
+    assert!(matches!(
+        replies.try_recv(),
+        Ok(PartitionReadReply::Rejected(IggyError::InvalidCommand))
+    ));
+    assert_released(&owner);
+}
+
 #[compio::test]
 async fn readiness_quota_counts_parked_waiters_only() {
     let owner = owner(&["first"]).await;
@@ -1259,7 +1383,10 @@ async fn fan_out_merges_admissions_and_cancels_what_stays_parked() {
                     .unwrap();
             }
         };
-        let (ready, ()) = futures::join!(owner.wait_for_messages(targets, duration), owners);
+        let (ready, ()) = futures::join!(
+            owner.wait_for_messages(readiness_caller(), targets, duration),
+            owners
+        );
         if later {
             assert_eq!(ready.unwrap(), [1]);
             let Ok(ShardFrame::Lifecycle(LifecycleFrame::ReadinessCancel { waiter })) =

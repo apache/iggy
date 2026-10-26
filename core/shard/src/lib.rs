@@ -2462,6 +2462,7 @@ where
     #[allow(clippy::future_not_send)]
     pub async fn wait_for_messages(
         &self,
+        context: DeferredPollContext,
         targets: Vec<ReadinessTarget>,
         wait: std::time::Duration,
     ) -> Result<Vec<u32>, IggyError> {
@@ -2486,7 +2487,11 @@ where
         let mut admitting = BTreeSet::new();
         for (shard, targets) in owners {
             let frame = ShardFrame::lifecycle(LifecycleFrame::ReadinessWait {
-                wait: ReadinessWait { targets, deadline },
+                wait: ReadinessWait {
+                    context: context.clone(),
+                    targets,
+                    deadline,
+                },
                 reply: reply.clone(),
             });
             self.senders
