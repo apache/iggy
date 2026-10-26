@@ -712,6 +712,32 @@ impl IggyClient {
                 .map_err(to_php_exception)
         })
     }
+
+    /// Sends a command code with a payload to the replica with the given id, as
+    /// cluster metadata names it, and returns the raw response bytes.
+    /// Replicated commands, polls, consumer-offset reads and session-control
+    /// codes return an invalid-command exception, and a replica that cluster
+    /// metadata does not name returns an invalid-identifier exception.
+    pub fn send_binary_request_to_replica(
+        &self,
+        code: u32,
+        payload: Binary<u8>,
+        replica_id: u8,
+    ) -> PhpResult<Binary<u8>> {
+        let inner = self.inner.clone();
+
+        runtime().block_on(async move {
+            inner
+                .send_binary_request_to_replica(
+                    code,
+                    Bytes::from(Vec::<u8>::from(payload)),
+                    replica_id,
+                )
+                .await
+                .map(|response| Binary::new(Vec::from(response)))
+                .map_err(to_php_exception)
+        })
+    }
 }
 
 pub(crate) fn non_zero_duration_micros(field: &str, micros: u64) -> PhpResult<NonZeroIggyDuration> {

@@ -177,7 +177,7 @@ public sealed partial class TcpMessageStream
 
     private async Task<IMemoryOwner<byte>> RunClientOperationAsync(int code, ReadOnlyMemory<byte> payload,
         PartitionContext? context, SendTarget? target, CancellationToken token, ClientOperation? retained = null,
-        TimeSpan? timeout = null, ulong? startedUnder = null)
+        TimeSpan? timeout = null, ulong? startedUnder = null, byte? replica = null)
     {
         using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(token, _clientLifetime.Token);
         var budget = timeout ?? TimeSpan.FromMilliseconds(VsrRequestTimeoutMs);
@@ -200,6 +200,7 @@ public sealed partial class TcpMessageStream
         var routingRetries = 0;
         var lastWasNotPrimary = false;
         var askMetadataPrimaryFirst = false;
+        var rosterRead = false;
         var terminal = false;
         var frameAcquired = false;
         var startOver = false;
@@ -302,6 +303,31 @@ public sealed partial class TcpMessageStream
                             continue;
                         }
                         connection = primary;
+                    }
+                    else if (replica is { } chosen)
+                    {
+                        if (await FindReadyReplicaAsync(chosen, cancellation.Token) is not { } ready)
+                        {
+                            bool known;
+                            lock (_pollRoutingGate)
+                            {
+                                known = _replicaLinks.ContainsKey(chosen);
+                            }
+                            if (!known && rosterRead)
+                            {
+                                throw VsrError.Exception(VsrError.INVALID_IDENTIFIER,
+                                    $"Cluster metadata names no replica {chosen}.");
+                            }
+                            if (!known)
+                            {
+                                rosterRead = true;
+                                await RefreshPartitionRosterAsync(deadline, cancellation.Token);
+                                continue;
+                            }
+                            await Task.Delay(PollRoutingRetryDelay(routingRetries++, Random.Shared.NextDouble()), cancellation.Token);
+                            continue;
+                        }
+                        connection = ready;
                     }
                     else if (_metadataReplica is { } metadataPrimary)
                     {
@@ -424,7 +450,8 @@ public sealed partial class TcpMessageStream
                     await Task.Delay(PollRoutingRetryDelay(routingRetries++, Random.Shared.NextDouble()), cancellation.Token);
                 }
                 catch (IggyInvalidStatusCodeException error) when (error.StatusCode is
-                    VsrError.TRANSIENT_NOT_ACCEPTED or VsrError.NOT_PRIMARY or VsrError.TRANSIENT_NOT_COMMITTED)
+                    VsrError.TRANSIENT_NOT_ACCEPTED or VsrError.TRANSIENT_NOT_COMMITTED
+                    || error.StatusCode == VsrError.NOT_PRIMARY && replica is null)
                 {
                     if (generation != _consensusSession.Generation && retained is null
                         && operation is not { Uncertain: true } && ResumesUnderNewSession(generation))
@@ -464,7 +491,7 @@ public sealed partial class TcpMessageStream
                         RemovePartitionRoute(failed.Key, error.StatusCode == VsrError.NOT_PRIMARY ? route : null);
                     }
                     await Task.Delay(pause, cancellation.Token);
-                    if (target is null)
+                    if (target is null && replica is null)
                     {
                         try
                         {
@@ -550,7 +577,8 @@ public sealed partial class TcpMessageStream
             {
                 ExceptionDispatchInfo.Throw(refusal);
             }
-            throw _consensusSession.Ended(generation) ?? PollNotAccepted();
+            throw _consensusSession.Ended(generation)
+                ?? (replica is { } chosen ? ReplicaNotAccepted(chosen) : PollNotAccepted());
         }
         catch (Exception error) when (error is IOException or SocketException
             && refusal is not null
@@ -992,5 +1020,10 @@ public sealed partial class TcpMessageStream
     private static IggyInvalidStatusCodeException PollNotAccepted()
     {
         return VsrError.Exception(VsrError.TRANSIENT_NOT_ACCEPTED, "The primary poll was not admitted.");
+    }
+
+    private static IggyInvalidStatusCodeException ReplicaNotAccepted(byte replica)
+    {
+        return VsrError.Exception(VsrError.TRANSIENT_NOT_ACCEPTED, $"Replica {replica} did not answer before the deadline.");
     }
 }

@@ -620,6 +620,21 @@ public class HttpMessageStream : IIggyClient
         throw new FeatureUnavailableException();
     }
 
+    /// <summary>
+    ///     This method is only supported in TCP protocol
+    /// </summary>
+    /// <param name="code">The numeric command code to send.</param>
+    /// <param name="payload">The opaque request payload.</param>
+    /// <param name="replicaId">The replica id that cluster metadata names.</param>
+    /// <param name="token">The cancellation token to cancel the operation.</param>
+    /// <returns>A task representing the asynchronous operation.</returns>
+    /// <exception cref="FeatureUnavailableException"></exception>
+    public Task<byte[]> SendBinaryRequestToReplicaAsync(uint code, byte[] payload, byte replicaId,
+        CancellationToken token = default)
+    {
+        throw new FeatureUnavailableException();
+    }
+
     /// <inheritdoc />
     public Task ConnectAsync(CancellationToken token = default)
     {

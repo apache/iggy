@@ -274,6 +274,17 @@ public class BasicMessagingSteps {
         }
     }
 
+    @When("I send a raw command with code {int} and an empty payload to replica {int}")
+    public void sendRawCommandToReplica(int code, int replica) {
+        try {
+            context.lastRawResponse = getClient().sendBinaryRequestToReplica(code, new byte[0], replica);
+            context.lastRawError = null;
+        } catch (RuntimeException error) {
+            context.lastRawResponse = null;
+            context.lastRawError = error;
+        }
+    }
+
     @Then("the raw command should succeed with an empty response")
     public void rawCommandSucceedsWithEmptyResponse() {
         assertNull(context.lastRawError, "Raw command should succeed");
@@ -294,6 +305,14 @@ public class BasicMessagingSteps {
         assertTrue(context.lastRawError instanceof IggyServerException, "Expected an Iggy server error");
         IggyServerException error = (IggyServerException) context.lastRawError;
         assertEquals(IggyErrorCode.INVALID_COMMAND, error.getErrorCode());
+    }
+
+    @Then("the raw command should fail with an invalid identifier error")
+    public void rawCommandFailsWithInvalidIdentifier() {
+        assertNull(context.lastRawResponse, "Raw response should be absent");
+        assertTrue(context.lastRawError instanceof IggyServerException, "Expected an Iggy server error");
+        IggyServerException error = (IggyServerException) context.lastRawError;
+        assertEquals(IggyErrorCode.INVALID_IDENTIFIER, error.getErrorCode());
     }
 
     @Given("I have a cluster node that cannot reach quorum")

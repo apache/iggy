@@ -80,4 +80,62 @@ public class RawCommandTests
 
         await Should.ThrowAsync<FeatureUnavailableException>(() => client.SendBinaryRequestAsync(1, []));
     }
+
+    [Test]
+    [SkipHttp]
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task SendBinaryRequestToReplica_Tcp_ShouldReturnRawPayloadsOfEveryReplica(Protocol protocol)
+    {
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
+        var metadata = await client.GetClusterMetadataAsync();
+
+        metadata.ShouldNotBeNull();
+        metadata.Nodes.ShouldNotBeEmpty();
+        foreach (var node in metadata.Nodes)
+        {
+            var statsResponse = await client.SendBinaryRequestToReplicaAsync(10, [], node.ReplicaId);
+            statsResponse.ShouldNotBeEmpty();
+        }
+    }
+
+    [Test]
+    [SkipHttp]
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task SendBinaryRequestToReplica_Tcp_ShouldRejectUnknownReplica(Protocol protocol)
+    {
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
+        var metadata = await client.GetClusterMetadataAsync();
+        metadata.ShouldNotBeNull();
+        var unknown = (byte)(metadata.Nodes.Max(node => node.ReplicaId) + 1);
+
+        var exception = await Should.ThrowAsync<IggyInvalidStatusCodeException>(() =>
+            client.SendBinaryRequestToReplicaAsync(10, [], unknown));
+
+        exception.StatusCode.ShouldBe(6);
+    }
+
+    [Test]
+    [SkipHttp]
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task SendBinaryRequestToReplica_Tcp_ShouldRejectReplicatedCommands(Protocol protocol)
+    {
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
+
+        foreach (var code in new uint[] { 100, 202 })
+        {
+            var exception = await Should.ThrowAsync<IggyInvalidStatusCodeException>(() =>
+                client.SendBinaryRequestToReplicaAsync(code, [], 0));
+            exception.StatusCode.ShouldBe(3);
+        }
+    }
+
+    [Test]
+    [SkipTcp]
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task SendBinaryRequestToReplica_Http_ShouldThrowFeatureUnavailable(Protocol protocol)
+    {
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
+
+        await Should.ThrowAsync<FeatureUnavailableException>(() => client.SendBinaryRequestToReplicaAsync(10, [], 0));
+    }
 }

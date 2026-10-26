@@ -34,6 +34,22 @@ public interface IggyBaseClient {
      */
     byte[] sendBinaryRequest(int code, byte[] payload);
 
+    /**
+     * Sends a command code and payload to the replica with the given id and returns its raw response payload.
+     *
+     * <p>The replica id is the one that cluster metadata names for the node. Every node answers non-replicated
+     * commands such as GetStats from its own state, so this reads the state of the chosen node. Replicated commands,
+     * PollMessages, GetConsumerOffset and session-control codes are rejected with an invalid-command error before
+     * anything is sent. An id that cluster metadata does not name fails with an invalid-identifier error. A NotPrimary refusal is returned and
+     * never sent to another replica. HTTP clients report that this operation is unsupported.
+     *
+     * @param code the command code
+     * @param payload the command payload
+     * @param replicaId the replica id that cluster metadata names
+     * @return the raw response payload
+     */
+    byte[] sendBinaryRequestToReplica(int code, byte[] payload, int replicaId);
+
     SystemClient system();
 
     StreamsClient streams();

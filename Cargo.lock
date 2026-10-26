@@ -7089,7 +7089,7 @@ checksum = "cd62e6b5e86ea8eeeb8db1de02880a6abc01a397b2ebb64b5d74ac255318f5cb"
 
 [[package]]
 name = "iggy"
-version = "0.11.1-edge.3"
+version = "0.11.1-edge.4"
 dependencies = [
  "async-broadcast",
  "async-dropper",
@@ -7369,7 +7369,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_common"
-version = "0.11.1-edge.3"
+version = "0.11.1-edge.4"
 dependencies = [
  "aes-gcm 0.11.1",
  "aes-gcm-siv",

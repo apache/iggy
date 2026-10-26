@@ -249,6 +249,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 For lower-level control over individual commands (login, stream/topic management, raw send, polling by offset or timestamp), use the transport-specific clients directly. See the [examples](https://github.com/apache/iggy/tree/master/examples/rust) and the [Rust SDK docs](https://iggy.apache.org/docs/sdk/rust/intro/).
 
+`IggyClient::send_binary_request_to_replica(code, payload, replica_id)` sends a raw command to one node of a cluster, named by the replica id that cluster metadata returns.
+
+Each node answers non-replicated commands such as `GetStats` from its own state, so this reads the state of that node. The request carries the session's metadata watermark. Replicated commands, polls, consumer-offset reads and session-control codes fail with `InvalidCommand` before anything is sent.
+
+An id that cluster metadata does not name fails with `InvalidIdentifier`. An unreachable node is retried until the request deadline, and a `NotPrimary` reply is returned rather than sent to another node.
+
+HTTP clients return `FeatureUnavailable` for this call, as for `send_binary_request`.
+
 For `IggyConsumerConfig`, `partitions_count` controls topic creation only. An ordinary consumer uses partition `0` unless the builder's `partition_id` or the config's `with_partition_id` selects another partition. Code that previously used `partitions_count` to select an existing partition must set `partition_id` explicitly. Consumer-group assignment ignores `partition_id`.
 
 ## Metadata changes
