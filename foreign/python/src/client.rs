@@ -447,6 +447,38 @@ impl IggyClient {
         })
     }
 
+    /// Create a personal access token for the currently authenticated user.
+    ///
+    /// The token is returned only once, so store it when this call completes.
+    ///
+    /// Args:
+    ///     name: Token name as `str`.
+    ///     expiry: Token expiry as `IggyExpiry`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to the raw token as `str`.
+    ///
+    /// Raises:
+    ///     ValueError: If the expiry is invalid.
+    ///     RuntimeError: If the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[str]", imports=("collections.abc")))]
+    fn create_personal_access_token<'a>(
+        &self,
+        py: Python<'a>,
+        name: String,
+        expiry: &IggyExpiry,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let expiry = RustIggyExpiry::try_from(expiry)?;
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let token = inner
+                .create_personal_access_token(&name, expiry)
+                .await
+                .map_err(to_runtime_error)?;
+            Ok(token.token)
+        })
+    }
+
     /// Get the info about a specific user by unique ID or username.
     ///
     /// Args:

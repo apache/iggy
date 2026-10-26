@@ -1344,6 +1344,25 @@ class IggyClient:
         Raises:
             RuntimeError: If the request fails.
         """
+    def create_personal_access_token(
+        self, name: builtins.str, expiry: IggyExpiry
+    ) -> collections.abc.Awaitable[builtins.str]:
+        r"""
+        Create a personal access token for the currently authenticated user.
+
+        The token is returned only once, so store it when this call completes.
+
+        Args:
+            name: Token name as `str`.
+            expiry: Token expiry as `IggyExpiry`.
+
+        Returns:
+            An awaitable that resolves to the raw token as `str`.
+
+        Raises:
+            ValueError: If the expiry is invalid.
+            RuntimeError: If the request fails.
+        """
     def get_user(
         self, user_id: builtins.str | builtins.int
     ) -> collections.abc.Awaitable[UserInfoDetails | None]:

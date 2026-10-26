@@ -27,6 +27,7 @@ from apache_iggy import (
     HttpConfig,
     IdentityInfo,
     IggyClient,
+    IggyExpiry,
     Permissions,
     QuicConfig,
     QuicReconnectionConfig,
@@ -357,6 +358,39 @@ class TestLoginIdentity:
             assert personal_access_token not in repr(identity)
         finally:
             _delete_personal_access_token(api, jwt, name)
+
+    @pytest.mark.asyncio
+    async def test_create_personal_access_token(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test that a token created through the client logs in as the same user."""
+        name = unique_name(min_bytes=16, max_bytes=30)
+        helper_name = unique_name(min_bytes=16, max_bytes=30)
+        http_host, http_port = get_http_server_config()
+        api = f"http://{http_host}:{http_port}"
+        jwt, _ = _create_personal_access_token(
+            api, "iggy", "iggy", helper_name, NEVER_EXPIRE
+        )
+
+        try:
+            personal_access_token = await iggy_client.create_personal_access_token(
+                name, IggyExpiry.NeverExpire()
+            )
+
+            host, port = get_server_config()
+            client = IggyClient(f"{host}:{port}")
+            await client.connect()
+            identity = await client.login_with_personal_access_token(
+                personal_access_token
+            )
+
+            user = await client.get_user("iggy")
+            assert user is not None
+            assert identity.user_id == user.id
+            assert personal_access_token not in repr(identity)
+        finally:
+            _delete_personal_access_token(api, jwt, name)
+            _delete_personal_access_token(api, jwt, helper_name)
 
     @pytest.mark.parametrize(
         "token",
