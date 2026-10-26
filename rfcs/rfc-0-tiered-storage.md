@@ -164,7 +164,7 @@ All verified on `master @ 285192450`.
   so no control operation consumes a message offset and no offset translation exists or is needed.
   There is no general state-machine facility on the partition plane yet; the metadata plane has one
   (`StateHandler`, `collect_handlers!`, versioned snapshots) and already holds per-partition facts
-  such as `deleted_up_to_offset` and `purge_generation`. The partition journal is in memory with a
+  such as `deleted_up_to_offset`. The partition journal is in memory with a
   64 MiB evicted ring, so partition-plane state cannot be rebuilt by replaying the log after a
   restart; consumer offsets persist their own files and ride state transfer as `ConsumerOffsetsWire`.
 - Disk polls are planned on the pump and executed as a detached compio task on the same thread,
@@ -180,15 +180,16 @@ All verified on `master @ 285192450`.
 ### Object layout
 
 ```text
-{prefix}/{cluster_id}/{stream_id}/{topic_id}/{partition_id}/{created_revision}-{purge_generation}/{start_offset:020}.log
-{prefix}/{cluster_id}/{stream_id}/{topic_id}/{partition_id}/{created_revision}-{purge_generation}/{start_offset:020}.index
-{prefix}/{cluster_id}/meta/{stream_id}/{topic_id}/{partition_id}/{created_revision}-{purge_generation}/manifest.bin
+{prefix}/{cluster_id}/{stream_id}/{topic_id}/{partition_id}/{created_revision}/{start_offset:020}.log
+{prefix}/{cluster_id}/{stream_id}/{topic_id}/{partition_id}/{created_revision}/{start_offset:020}.index
+{prefix}/{cluster_id}/meta/{stream_id}/{topic_id}/{partition_id}/{created_revision}/manifest.bin
 ```
 
 Stream, topic and partition ids are slab-allocated and reused after deletion, so
-`Partition.created_revision` (unique across the cluster) identifies the incarnation and
-`purge_generation` separates offset spaces before and after a purge. `cluster_id` lets several
-clusters share one bucket. The zero-padded stem matches the on-disk name so a listing sorts by
+`Partition.created_revision` (unique across the cluster) identifies the incarnation. Offsets never
+restart within an incarnation: the offset frontier is durable and never rewound, and
+`DeleteSegments` only trims from the front, so `created_revision` alone separates every offset
+space. `cluster_id` lets several clusters share one bucket. The zero-padded stem matches the on-disk name so a listing sorts by
 offset.
 
 Objects are immutable. The `.log` object is canonical and identical whichever replica produced it.
@@ -207,7 +208,7 @@ version            u16      flags u16      reserved u32
 start_offset       u64      end_offset     u64
 size               u64      index_size     u64
 start_timestamp    u64      end_timestamp  u64      max_timestamp u64
-created_revision   u64      purge_generation u64
+created_revision   u64      reserved       u64
 log_checksum       u128     (the state-transfer artifact hash of the .log)
 record_checksum    u64      padding to 128
 ```
@@ -225,8 +226,8 @@ Boot rules:
   marker is still a `Hole`.
 - Tiered segments are always a prefix of the chain. A marker after a local sealed segment is a
   refusal.
-- Marker `created_revision` and `purge_generation` must match the partition's; a stale marker is
-  quarantined with the partition.
+- Marker `created_revision` must match the partition's; a stale marker is quarantined with the
+  partition.
 
 In memory, `Segment` gains `location: SegmentLocation` with `Local`, `Uploaded` (both copies) and
 `Remote`. Tiered segments stay in `SegmentedLog.segments`, so `disk_poll_start` keeps resolving the
@@ -280,8 +281,8 @@ is not ordered with the data log. It holds no per-segment data on purpose: deter
 the local markers carry the segment list, so the snapshot stays a few bytes and is persisted in the
 partition superblock, whose payload has room, with a write on every apply. That snapshot is the
 floor's durable home; it is also carried in state transfer next to the consumer offsets, so a
-rebuilt replica never starts at zero. Purge resets the floor with the generation, and the eviction
-primitive reads it directly from the partition.
+rebuilt replica never starts at zero. The floor is monotone for the life of the partition
+incarnation, and the eviction primitive reads it directly from the partition.
 
 `TruncatePartition` stays in the metadata plane, where it already ships. If the facility settles on
 the metadata plane, both watermarks share a log from the start; if it settles on per-shard control
@@ -466,9 +467,8 @@ a 90 s deadline per segment.
   the offsets artifact the way consumer offsets do, so an installed replica never starts at floor
   zero. No segment bytes cross between replicas for tiered data. `install_backup::link_tree` links markers; install and converge sweep `.remote`
   alongside `.log`, `.index` and `.anchor`.
-- **Purge and delete.** Purge bumps `purge_generation`, which changes the key prefix, resets the
-  state machine's floor to zero, and unlinks markers with everything else. Objects of an old generation or a deleted topic are removed by an
-  orphan sweep on the metadata primary: it lists `{prefix}/{cluster_id}/` at incarnation
+- **Delete.** Deleting a topic or partition removes its directory, markers included. Objects of a
+  deleted incarnation are removed by an orphan sweep on the metadata primary: it lists `{prefix}/{cluster_id}/` at incarnation
   granularity under a metadata revision snapshot and deletes any incarnation absent from metadata
   with `created_revision` below the snapshot.
 - **Manifest object.** Housekeeping on the primary uploads `manifest.bin` under `meta/` whenever the
@@ -553,7 +553,7 @@ Topic options:
 1. A replica evicts a local segment only when `end_offset <= tiered_up_to_offset` as committed in
    the partition's control log, and the floor advances only after the primary observed a successful
    PUT of both objects. No replica ever drops the last copy of committed data.
-2. Object keys are unique per partition incarnation and purge generation, objects are immutable, and
+2. Object keys are unique per partition incarnation, objects are immutable, and
    `.log` bytes are identical from any replica. A duplicate upload is a no-op.
 3. Local eviction never crosses the WAL checkpoint, the active segment, or a local sealed segment not
    yet uploaded. Tiered segments are always a prefix of the chain.
@@ -562,7 +562,7 @@ Topic options:
    of the next segment, whichever source it has.
 6. Deletion from the store is decided by the primary and replicated as an offset watermark, never by
    per-replica clocks or counts.
-7. The tiered floor is monotone within a purge generation and resets with it.
+7. The tiered floor is monotone for the life of a partition incarnation.
 8. The consumer barrier applies to total retention and to nothing else.
 9. A segment with a local `.log` is read locally. The store is consulted only for segments whose
    local copy is gone.
@@ -581,7 +581,7 @@ Topic options:
 | Object missing on GET | Below `deleted_up_to_offset`: retire locally and clamp forward. Otherwise data loss: fault the poll, raise a metric. |
 | Replica behind on the control log | Has not applied the latest floor yet, so it evicts less. Reads unaffected. |
 | Replica restarts or is rebuilt by state transfer | The floor is restored from the superblock or arrives with the offsets artifact; it never starts at zero, so nothing is re-uploaded or wrongly kept. |
-| Purge during an upload | Upload lands under the old generation prefix; floor submit rejected by the generation check; orphan sweep deletes. |
+| Topic or partition deleted during an upload | Upload lands under the deleted incarnation's prefix; the floor command has no partition to apply to; the orphan sweep deletes the objects. |
 | WAL still hard-links an evicted segment | Eviction stops at the WAL checkpoint; after it, unlinking the public name is what retention does today. |
 | Cache directory full | Fetch fails typed; poll replies transient; eviction is driven harder; gauge rises. |
 | Node restart | Markers rebuild segment metadata; the cache survives via its access-time table. |
@@ -597,9 +597,9 @@ Each phase is one reviewable PR or a short stack, in dependency order.
    the persisted access-time table, all against the `fs` backend. Docker-free tests.
 2. **Partition state machine and the floor.** Depends on the partition state-machine facility
    landing first, including its choice of control log. The `AdvanceTieredFloor` command and its
-   apply, the superblock-persisted floor, its inclusion in state transfer, the purge reset, and the
+   apply, the superblock-persisted floor, its inclusion in state transfer, and the
    reconciler extension for remote segments in `TruncatePartition` enforcement with deletion caps. Tests: a partitions unit test that
-   the floor is monotone and survives a restart; a simulator scenario across view changes and purges.
+   the floor is monotone and survives a restart; a simulator scenario across view changes and restarts.
 3. **Tier service and S3 provider.** The per-shard `TierService` with piece-wise tasks, the
    single-threaded semaphore and its byte-counted variant, the `ObjectStore` trait, the S3 provider
    over `cyper` with single streamed PUTs, unsigned payloads, conditional create, the boot probe and
@@ -633,7 +633,7 @@ Each phase is one reviewable PR or a short stack, in dependency order.
   for any one piece, and the per-shard caps bound how many pieces are in flight, but a shard with
   many cold readers and a large upload backlog will give tiering more of its CPU than a
   shares-based scheduler would.
-- The state-transfer manifest, boot recovery, purge, install backup and quarantine all learn about a
+- The state-transfer manifest, boot recovery, install backup and quarantine all learn about a
   new file type. Every one of those paths has crash-consistency rules that must be extended.
 - Cold reads add a latency mode clients have not seen before. A poll can now take tens to hundreds
   of milliseconds and can reply with a transient error, which SDKs handle but users must expect.
@@ -672,8 +672,8 @@ per-message delivery state. A separate control log keeps the data path for user 
 the price of cross-log ordering, which the floor tolerates by checking against the committed end at
 apply time.
 
-Between the two realizations, the metadata plane exists today and already holds `deleted_up_to_offset`
-and `purge_generation`, but a floor there needs a submit path from the owner shard to shard 0 and a
+Between the two realizations, the metadata plane exists today and already holds
+`deleted_up_to_offset`, but a floor there needs a submit path from the owner shard to shard 0 and a
 reconciler pass to re-drive it, lags the data by a reconcile interval, and shares one cluster-wide
 group with everything else. A control group per shard applies on the owner shard with no hop and no
 lag and scales with shards. The floor's rate makes the choice immaterial for this RFC, so it is
@@ -839,7 +839,7 @@ Out of scope for this RFC, addressable later independently of it:
 Simulator versus integration coverage:
 
 - The deterministic simulator can cover the protocol: monotonicity of `tiered_up_to_offset` across
-  view changes, purges and restarts; the eviction eligibility rules (floor, WAL checkpoint, active
+  view changes and restarts; the eviction eligibility rules (floor, WAL checkpoint, active
   segment, local retention budget); the `REMOTE_CHAIN` state-transfer artifact; the orphan sweep's
   incarnation logic; and the `sim` object store with injected latency, throttling and partial
   failures. The `SimStorage` harness that already drives the WAL and persistence with real bytes
@@ -850,7 +850,7 @@ Simulator versus integration coverage:
   boundaries, cold-read latency and the completion-lane sizing need integration tests against the
   `fs` backend (Docker-free) and MinIO through `testcontainers-modules`, and the three-node
   scenarios (eviction on every replica, cold reads from a backup, a poll spanning remote and local
-  segments, the primary killed mid-upload, purge and delete followed by the sweep) need the
+  segments, the primary killed mid-upload, topic delete followed by the sweep) need the
   `--features vsr` cluster harness.
 - Not testable locally at all: real-provider quirks such as GCS interoperability conditional
   headers, Azure hierarchical namespaces, and the IAM, STS and metadata-server credential chains.
