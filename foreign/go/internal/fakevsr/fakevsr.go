@@ -187,7 +187,6 @@ type Server struct {
 	mtx      sync.Mutex
 	requests []Request
 	listener net.Listener
-	done     chan struct{}
 }
 
 // Listen answers frames the way a single-node Iggy server does, so a test
@@ -203,9 +202,8 @@ func Listen(t *testing.T, wrap func(net.Conn) net.Conn) *Server {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = listener.Close() })
 
-	server := &Server{listener: listener, done: make(chan struct{})}
+	server := &Server{listener: listener}
 	go func() {
-		defer close(server.done)
 		for {
 			conn, err := listener.Accept()
 			if err != nil {

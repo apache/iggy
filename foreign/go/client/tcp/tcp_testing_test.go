@@ -228,15 +228,13 @@ func readRequest(conn net.Conn) (request, error) {
 type fakeServer struct {
 	mtx      sync.Mutex
 	requests []request
-	done     chan struct{}
 }
 
 // serve reads frames off conn until it closes, answering each with the frame
 // the handler returns. A nil answer leaves the request unanswered.
 func serve(conn net.Conn, handler func(index int, read request) []byte) *fakeServer {
-	server := &fakeServer{done: make(chan struct{})}
+	server := &fakeServer{}
 	go func() {
-		defer close(server.done)
 		for index := 0; ; index++ {
 			read, err := readRequest(conn)
 			if err != nil {

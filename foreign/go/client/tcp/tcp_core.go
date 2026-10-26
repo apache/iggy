@@ -513,8 +513,8 @@ func (c *IggyTcpClient) GetConnectionInfo() *iggcon.ConnectionInfo {
 // tests and callers can use to observe the parsed nodelay option before a
 // connection exists to read it off.
 func (c *IggyTcpClient) GetNoDelay() bool {
-	c.mtx.Lock()
-	defer c.mtx.Unlock()
+	// The client configuration does not change after construction, so this
+	// reads the field directly, like the dial path does.
 	return c.config.noDelay
 }
 
