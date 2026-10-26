@@ -30,7 +30,7 @@ use iggy_common::{
     PolledMessages, PollingKind, PollingStrategy,
 };
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::{AbortHandle, Id, JoinHandle, JoinSet};
 use tokio::time::{Instant, MissedTickBehavior};
 use tracing::error;
 
@@ -160,14 +160,15 @@ struct Refreshed {
 struct OnDemand {
     /// Set while the application waits for a message and its buffer is empty.
     demand: Arc<AtomicBool>,
-    /// At most one readiness wait per group.
+    /// One readiness wait per group that has idle partitions.
     waits: JoinSet<CompletedWait>,
     /// The assigned partitions, grouped by primary endpoint and split to fit
     /// one wait request each.
     groups: Vec<Vec<u32>>,
     /// Partitions that hold a message for their next poll.
     ready: BTreeSet<u32>,
-    waiting: BTreeSet<u32>,
+    /// The wait that covers each waiting partition.
+    waiting: BTreeMap<u32, AbortHandle>,
     /// The offset after the newest message that a `Timestamp` poll skipped.
     floors: BTreeMap<u32, u64>,
 }
@@ -179,6 +180,16 @@ impl OnDemand {
         self.ready.clear();
         self.waiting.clear();
         self.floors.clear();
+    }
+
+    /// A wait can end before the restart that replaces it cancels it. Only
+    /// the wait that covers the partitions now reports them.
+    fn covers(&self, wait: Id, partitions: &[u32]) -> bool {
+        partitions.iter().all(|partition| {
+            self.waiting
+                .get(partition)
+                .is_some_and(|running| running.id() == wait)
+        })
     }
 }
 
@@ -275,7 +286,7 @@ impl Worker {
                 waits: JoinSet::new(),
                 groups: Vec::new(),
                 ready: BTreeSet::new(),
-                waiting: BTreeSet::new(),
+                waiting: BTreeMap::new(),
                 floors: BTreeMap::new(),
             },
         }
@@ -352,13 +363,21 @@ impl Worker {
                         }
                     }
                 }
-                Some(completed) = self.on_demand.waits.join_next(), if !self.on_demand.waits.is_empty() => {
-                    let Ok(completed) = completed else {
-                        self.invalidate();
-                        self.report(IggyError::ClientShutdown);
-                        return;
-                    };
-                    self.complete_wait(completed);
+                Some(joined) = self.on_demand.waits.join_next_with_id(), if !self.on_demand.waits.is_empty() => {
+                    match joined {
+                        Ok((wait, completed)) => {
+                            if self.on_demand.covers(wait, &completed.partitions) {
+                                self.complete_wait(completed);
+                            }
+                        }
+                        // A restart cancelled the wait.
+                        Err(error) if error.is_cancelled() => {}
+                        Err(_) => {
+                            self.invalidate();
+                            self.report(IggyError::ClientShutdown);
+                            return;
+                        }
+                    }
                     if self.partitions.is_empty() {
                         refresh.reset_after(self.retry_interval);
                     }
@@ -482,7 +501,13 @@ impl Worker {
             self.assignment = Some(refreshed.assignment);
         }
         self.partitions = refreshed.partitions;
-        if let Some(groups) = refreshed.groups {
+        if let Some(groups) = refreshed.groups
+            && groups != self.on_demand.groups
+        {
+            // A restart cancels the wait of its own group only, so no wait
+            // may cover partitions of two groups.
+            self.on_demand.waits = JoinSet::new();
+            self.on_demand.waiting.clear();
             self.on_demand.groups = groups;
         }
         true
@@ -588,25 +613,23 @@ impl Worker {
 
     /// Every poll of this mode commits its batch. The worker fetches one batch
     /// per demand, so it never holds a committed batch that the application
-    /// did not ask for.
+    /// did not ask for. A wait commits nothing, so the waits run without
+    /// demand.
     fn schedule_on_demand(&mut self) {
-        if !self.on_demand.demand.load(ORDERING) || !self.tasks.is_empty() {
-            return;
-        }
-        let partition = if self.is_group {
-            self.next_ready()
-        } else {
-            self.partitions.first().copied()
-        };
-        match partition.filter(|partition| !self.retry_at.contains_key(partition)) {
-            Some(partition) => {
-                if let Some(capacity) = self.reserve() {
-                    self.spawn_fetch(partition, capacity);
-                }
+        if self.on_demand.demand.load(ORDERING) && self.tasks.is_empty() {
+            let partition = if self.is_group {
+                self.next_ready()
+            } else {
+                self.partitions.first().copied()
+            };
+            if let Some(partition) =
+                partition.filter(|partition| !self.retry_at.contains_key(partition))
+                && let Some(capacity) = self.reserve()
+            {
+                self.spawn_fetch(partition, capacity);
             }
-            None if self.is_group => self.start_waits(),
-            None => {}
         }
+        self.start_waits();
     }
 
     fn next_ready(&self) -> Option<u32> {
@@ -621,37 +644,42 @@ impl Worker {
             })
     }
 
-    /// One readiness wait per group, over its partitions that are not known
-    /// to be ready and not waiting already.
+    /// One readiness wait per group covers the idle partitions of the group:
+    /// those that are not ready, not fetched and not retrying. A wait takes
+    /// no partitions after it starts, so a partition that becomes idle
+    /// restarts the wait of its group. A second wait would hold one more of
+    /// the deferred requests that the fetches of the consumer share.
     fn start_waits(&mut self) {
+        let idle = |partition: &&u32| {
+            !self.on_demand.ready.contains(*partition)
+                && !self.retry_at.contains_key(*partition)
+                && !self.active.contains(*partition)
+        };
         for group in &self.on_demand.groups {
             if group
                 .iter()
-                .any(|partition| self.on_demand.waiting.contains(partition))
+                .filter(idle)
+                .all(|partition| self.on_demand.waiting.contains_key(partition))
             {
                 continue;
             }
+            for partition in group {
+                if let Some(wait) = self.on_demand.waiting.remove(partition) {
+                    wait.abort();
+                }
+            }
             let targets: Vec<_> = group
                 .iter()
-                .filter(|partition| {
-                    !self.on_demand.ready.contains(partition)
-                        && !self.retry_at.contains_key(partition)
-                        && !self.active.contains(partition)
-                })
+                .filter(idle)
                 .map(|partition| (*partition, self.wait_target(*partition)))
                 .collect();
-            if targets.is_empty() {
-                continue;
-            }
-            self.on_demand
-                .waiting
-                .extend(targets.iter().map(|(partition, _)| *partition));
+            let partitions: Vec<_> = targets.iter().map(|(partition, _)| *partition).collect();
             let client = self.client.clone();
             let stream = Arc::clone(&self.stream);
             let topic = Arc::clone(&self.topic);
             let consumer = Arc::clone(&self.consumer);
             let options = self.options;
-            self.on_demand.waits.spawn(DEFERRED_CONSUMER_CAPACITY.scope(
+            let wait = self.on_demand.waits.spawn(DEFERRED_CONSUMER_CAPACITY.scope(
                 Arc::clone(&self.request_capacity),
                 async move {
                     let result =
@@ -677,6 +705,11 @@ impl Worker {
                     }
                 },
             ));
+            self.on_demand.waiting.extend(
+                partitions
+                    .into_iter()
+                    .map(|partition| (partition, wait.clone())),
+            );
         }
     }
 
@@ -1450,6 +1483,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn committing_member_watches_idle_partitions_while_it_fetches_a_backlog() {
+        let (mut worker, _receiver) = on_demand_worker(
+            Consumer::group(Identifier::numeric(1).unwrap()),
+            PollingStrategy::next(),
+        );
+        let client = worker.client.clone();
+        let _blocked_connection = client.write().await;
+        worker.partitions = vec![0, 1];
+        worker.on_demand.groups = vec![vec![0, 1]];
+        worker.on_demand.ready.insert(0);
+        worker.on_demand.demand.store(true, ORDERING);
+        worker.schedule();
+        assert!(worker.active.contains(&0));
+        let watching = worker.on_demand.waiting.get(&1).map(AbortHandle::id);
+        assert!(
+            watching.is_some(),
+            "a backlog on one partition does not hide new messages on another"
+        );
+
+        let epoch = worker.epoch;
+        worker.complete(fetched(
+            &worker,
+            epoch,
+            PollingStrategy::next(),
+            0,
+            [5, 6],
+            9,
+        ));
+        worker.schedule();
+        assert_eq!(
+            worker.on_demand.waiting.get(&1).map(AbortHandle::id),
+            watching,
+            "the wait runs on while no partition becomes idle"
+        );
+
+        worker.complete(fetched(&worker, epoch, worker.position(0), 0, [7, 8, 9], 9));
+        worker.schedule();
+        let restarted = worker.on_demand.waiting.get(&0).map(AbortHandle::id);
+        assert!(
+            restarted.is_some_and(|wait| worker.on_demand.covers(wait, &[0, 1])),
+            "a drained partition restarts the wait of its group before the application asks"
+        );
+        let replaced = worker.on_demand.waits.join_next_with_id().await.unwrap();
+        assert!(
+            replaced.is_err_and(|error| error.is_cancelled() && Some(error.id()) == watching),
+            "the restart cancels the wait that it replaces"
+        );
+        assert_eq!(worker.on_demand.waits.len(), 1, "one wait per group");
+        assert!(
+            watching.is_some_and(|wait| !worker.on_demand.covers(wait, &[1])),
+            "a reply of the replaced wait is stale"
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_readiness_groups_restart_every_wait() {
+        let (mut worker, _receiver) = on_demand_worker(
+            Consumer::group(Identifier::numeric(1).unwrap()),
+            PollingStrategy::next(),
+        );
+        let client = worker.client.clone();
+        let _blocked_connection = client.write().await;
+        let (epoch, assignment) = (worker.epoch, AssignmentVersion::default());
+        worker.assignment = Some(assignment);
+        let refreshed = |groups| Refreshed {
+            epoch,
+            assignment,
+            partitions: vec![0, 1],
+            groups: Some(groups),
+        };
+        assert!(worker.apply(refreshed(vec![vec![0, 1]])));
+        worker.schedule();
+        let watching = worker.on_demand.waiting.get(&0).map(AbortHandle::id);
+        assert!(worker.apply(refreshed(vec![vec![0, 1]])));
+        worker.schedule();
+        assert!(
+            watching.is_some_and(|wait| worker.on_demand.covers(wait, &[0, 1])),
+            "a refresh that keeps the groups keeps the waits"
+        );
+
+        assert!(worker.apply(refreshed(vec![vec![0], vec![1]])));
+        worker.schedule();
+        let waits: BTreeSet<_> = worker
+            .on_demand
+            .waiting
+            .values()
+            .map(AbortHandle::id)
+            .collect();
+        assert_eq!(
+            (worker.on_demand.waiting.len(), waits.len()),
+            (2, 2),
+            "each wait covers one group, so a restart of one group leaves the other watched"
+        );
+    }
+
+    #[tokio::test]
     async fn more_partitions_than_fetch_slots_fetch_only_partitions_that_hold_messages() {
         let consumer = builder_for(Consumer::group(Identifier::numeric(1).unwrap()))
             .auto_commit(AutoCommit::Disabled)
@@ -1493,6 +1622,12 @@ mod tests {
         );
         worker.complete(fetched(&worker, epoch, worker.position(3), 3, [7, 8, 9], 9));
         assert!(!worker.on_demand.ready.contains(&3));
+        worker.schedule();
+        let restarted = worker.on_demand.waiting.get(&3).map(AbortHandle::id);
+        assert!(
+            restarted.is_some_and(|wait| worker.on_demand.covers(wait, &partitions)),
+            "a drained partition restarts the wait of its group at once"
+        );
     }
 
     #[tokio::test]
