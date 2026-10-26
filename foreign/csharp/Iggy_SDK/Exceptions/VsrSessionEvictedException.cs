@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using Apache.Iggy.Vsr;
+
 namespace Apache.Iggy.Exceptions;
 
 /// <summary>
@@ -23,12 +25,15 @@ namespace Apache.Iggy.Exceptions;
 ///     still have committed.
 /// </summary>
 /// <remarks>
-///     The server emits evictions off its own heartbeat timer rather than as an answer, so the frame carries no
-///     correlation with the request it interrupts and that request's real reply is never read.
+///     The frame carries no correlation with the request it interrupts, so that request's real reply is never
+///     read. NoSession and StaleClient can mean only the link was detached. A replacement link binds the same
+///     session before deciding whether its retained operations can still be recovered.
 /// </remarks>
-internal sealed class VsrSessionEvictedException(Exception verdict)
+internal sealed class VsrSessionEvictedException(EvictionReason? reason, Exception verdict)
     : Exception("The consensus session was evicted by the server.", verdict)
 {
+    internal EvictionReason? Reason { get; } = reason;
+
     /// <summary>The error the eviction reason maps to, for the requests it can safely be reported as.</summary>
     internal Exception Verdict { get; } = verdict;
 }

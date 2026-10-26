@@ -38,7 +38,7 @@ and why, answer review questions about it yourself, and defend the design withou
 back to the tool for an answer. If you can't, the PR isn't ready.
 
 If an AI assistant helped you write the change, review it with the
-[`team-review-slim`](.claude/skills/team-review-slim/SKILL.md) skill before you open the PR.
+[`team-review`](.claude/skills/team-review/SKILL.md) skill before you open the PR.
 The skill can report false findings. Fix every finding that is correct and that applies to
 your change.
 
@@ -184,6 +184,22 @@ chore(integration): remove streaming tests superseded by API-level coverage
 
 Keep subject under 72 chars. Use body for details if needed.
 
+A pull request that adds or amends an RFC under `rfcs/` uses the type `rfc`,
+as described in `rfcs/README.md`. If no scope in
+`.github/workflows/pr-title.yml` fits, add the RFC's feature name to that list
+in the same pull request.
+
+## Reviewing PRs
+
+Anyone can review a PR. You don't need to be a committer, and reviews from contributors
+are welcome. Read the change, run it locally if you can, and leave comments or a review.
+Questions count too. If something isn't clear to you, it probably isn't clear to the next
+reader either.
+
+A committer still has to approve and merge. If you're a returning contributor, your
+"Request changes" review moves the PR to `S-waiting-on-author`, and you can use `/author`
+to do the same.
+
 ## PR Triage Commands
 
 Move a PR around the review queue by posting a slash command on its own
@@ -197,10 +213,18 @@ line in a regular PR comment (not an inline review reply):
 | `/pin`                              | author or maintainer                | add `pinned`, exempting the PR from the stale bot            |
 | `/unpin`                            | author or maintainer                | remove `pinned`                                              |
 
+A returning contributor is anyone who has had a commit merged into apache/iggy.
+
 Some labels move on their own. Opening a non-draft PR, or marking a draft
 ready, sets `S-waiting-on-review`. A "Request changes" review sets
 `S-waiting-on-author`, and so does a `/skill` bot review with findings for the
 author. Closing a PR, or converting it to a draft, clears both.
+
+When a PR is opened, including a draft, `PR Triage Apply` checks its author once.
+It adds `Prolific Author` if a human author opened PRs in more than 20 visible
+repositories over the last 30 days, unless they have at least 10 merged PRs in Iggy.
+This follows [Arrow-rs's criteria](https://github.com/apache/arrow-rs/issues/11808).
+The label is informational and is not removed automatically.
 
 Commands take up to ~90s. A 👍 reaction means applied, 😕 means you lacked
 permission; if neither shows up, check the `PR Triage Apply` run in the

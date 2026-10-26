@@ -1,0 +1,170 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: setup-rust
+description: Setup Rust toolchain with Swatinem/rust-cache
+
+inputs:
+  coverage:
+    description: "Instrument workspace crates for coverage before compiling"
+    required: false
+    default: "false"
+  install-nextest:
+    description: "Whether to install cargo-nextest"
+    required: false
+    default: "false"
+  install-system-dependencies:
+    description: "Whether to install system packages required by Rust builds"
+    required: false
+    default: "true"
+  read-cache:
+    description: "Whether to read from cache"
+    required: false
+    default: "true"
+  shared-key:
+    description: "Shared cache key across jobs"
+    required: false
+    default: "dev"
+  save-cache:
+    description: "Whether to save cache (true/false)"
+    required: false
+    default: "false"
+  free-disk-space:
+    description: >-
+      Whether to reclaim runner disk before the build. Default "true".
+      Artifact builders, Rust test shards, Miri and lightweight checks
+      disable cleanup when they fit within the runner's available disk space.
+    required: false
+    default: "true"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Free runner disk space
+      if: inputs.free-disk-space == 'true'
+      uses: ./.github/actions/utils/free-disk-space
+
+    - name: Install system dependencies (Linux)
+      if: runner.os == 'Linux' && inputs.install-system-dependencies == 'true'
+      run: ./scripts/ci/apt-install.sh libhwloc-dev pkg-config libudev-dev
+      shell: bash
+
+    - name: Install system dependencies (macOS)
+      if: runner.os == 'macOS' && inputs.install-system-dependencies == 'true'
+      run: |
+        # Pin version of hwloc to 2.12.2_1
+        # brew extract doesn't have this version, so we fetch the formula directly
+        brew tap-new iggy/local-hwloc
+        curl -fsSL --retry 5 --retry-all-errors https://raw.githubusercontent.com/Homebrew/homebrew-core/bb1e23f8e5eacf4d31acd489f6079c8a53ebd690/Formula/h/hwloc.rb \
+          -o "$(brew --repository iggy/local-hwloc)/Formula/hwloc.rb"
+        brew install iggy/local-hwloc/hwloc
+      shell: bash
+
+    - name: Setup Rust toolchain
+      run: |
+        # macOS runners provision Rust via the Homebrew `rustup` formula, which
+        # installs only `rustup-init` plus brew shims that resolve back to it in
+        # installer mode - so `cargo` errors out and ~/.cargo/bin has no proxies.
+        # Run rustup-init once to generate the real cargo/rustc proxies.
+        if [ "$RUNNER_OS" = "macOS" ]; then
+          rustup-init -y --no-modify-path --default-toolchain none
+        fi
+        rustup show
+        # rust-cache hashes every installed toolchain, including unused runner defaults.
+        active_toolchain=$(rustup show active-toolchain)
+        active_toolchain=${active_toolchain%% *}
+        installed_toolchains=$(rustup toolchain list --quiet)
+        while read -r toolchain; do
+          if [[ "$toolchain" != "$active_toolchain" ]]; then
+            rustup toolchain uninstall "$toolchain"
+          fi
+        done <<< "$installed_toolchains"
+        echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      shell: bash
+
+    - name: Configure Cargo for CI
+      run: |
+        echo "CARGO_INCREMENTAL=0" >> "$GITHUB_ENV"
+        echo "CARGO_PROFILE_DEV_DEBUG=0" >> "$GITHUB_ENV"
+        echo "CARGO_PROFILE_TEST_DEBUG=0" >> "$GITHUB_ENV"
+        echo "CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse" >> "$GITHUB_ENV"
+      shell: bash
+
+    # llvm-cov instruments workspace crates, which rust-cache removes before saving.
+    # External dependencies can share the cache with check, lint and SDK server builds.
+    - name: Setup Rust cache
+      id: rust-cache
+      if: inputs.read-cache == 'true'
+      uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: ${{ inputs.shared-key }}
+        cache-workspace-crates: "false"
+        save-if: ${{ inputs.save-cache == 'true' }}
+
+    - name: Cache status
+      if: inputs.read-cache == 'true'
+      run: |
+        CARGO_HOME_DIR="${CARGO_HOME:-$HOME/.cargo}"
+        if [ "${{ steps.rust-cache.outputs.cache-hit }}" == "true" ]; then
+          status="full hit"
+        elif [ -d "target" ]; then
+          status="partial hit"
+        else
+          status="miss"
+        fi
+        # Unpacked on-disk footprint of the restore. The cache action only logs
+        # the compressed size; this prints to the job log (stdout), so size is
+        # visible without opening the summary and without annotations.
+        echo "Rust cache: ${status}"
+        printf '%-10s %s\n' "SIZE" "PATH"
+        for dir in "${GITHUB_WORKSPACE}/target" "${CARGO_HOME_DIR}/registry" "${CARGO_HOME_DIR}/git"; do
+          if [ -d "${dir}" ]; then
+            printf '%-10s %s\n' "$(du -sh "${dir}" 2>/dev/null | cut -f1)" "${dir/#${GITHUB_WORKSPACE}\//}"
+          fi
+        done
+      shell: bash
+
+    - name: Install cargo-nextest
+      if: inputs.install-nextest == 'true'
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-nextest@0.9.149
+
+    - name: Install cargo-llvm-cov
+      if: inputs.coverage == 'true'
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-llvm-cov@0.9.1
+
+    - name: Enable coverage for subsequent builds and tests
+      if: inputs.coverage == 'true'
+      run: |
+        set -euo pipefail
+        rustup component add llvm-tools-preview
+        coverage_env=$(cargo llvm-cov show-env --sh)
+        eval "$coverage_env"
+        if [[ "${{ inputs.read-cache }}" == true ]]; then
+          cargo llvm-cov clean --workspace
+        fi
+        while IFS= read -r line; do
+          if [[ "$line" =~ ^export\ ([A-Za-z_][A-Za-z0-9_]*)= ]]; then
+            name=${BASH_REMATCH[1]}
+            delimiter="COVERAGE_ENV_${RANDOM}_${RANDOM}"
+            printf '%s<<%s\n%s\n%s\n' "$name" "$delimiter" "${!name}" "$delimiter" >> "$GITHUB_ENV"
+          fi
+        done <<< "$coverage_env"
+      shell: bash

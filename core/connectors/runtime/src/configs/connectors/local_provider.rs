@@ -21,7 +21,7 @@ use crate::configs::connectors::{
     SourceConfig,
 };
 use crate::error::RuntimeError;
-use ::configs::{ConfigProvider, FileConfigProvider, TypedEnvProvider};
+use ::configs::{ConfigProvider, FileConfigProvider, PLUGIN_CONFIG_ENV_SEGMENT, TypedEnvProvider};
 use async_trait::async_trait;
 use dashmap::DashMap;
 use figment::value::Dict;
@@ -229,6 +229,12 @@ impl LocalConnectorsConfigProvider<Created> {
                     });
                 let connector_id: ConnectorId = (&connector_config).into();
                 let version = connector_config.version();
+                Self::reject_conflicting_identity_overrides(
+                    &base_config,
+                    version,
+                    &path,
+                    |name| std::env::var(name).ok(),
+                )?;
 
                 match connector_config {
                     ConnectorConfig::Sink(mut sink_config) => {
@@ -342,13 +348,47 @@ impl<S: ProviderState> LocalConnectorsConfigProvider<S> {
         })
     }
 
+    /// `KEY` and `VERSION` no longer come from the environment. An override that
+    /// differs from the file would silently select another checkpoint (sources)
+    /// or consumer group (sinks) on upgrade, so fail instead of ignoring it.
+    fn reject_conflicting_identity_overrides(
+        base_config: &BaseConnectorConfig,
+        version: u64,
+        path: &str,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<(), RuntimeError> {
+        let key = base_config.key();
+        let prefix = connector_env_prefix(
+            &base_config.connector_type().to_uppercase(),
+            &key.to_uppercase(),
+        );
+        for (suffix, file_value) in [("KEY", key.to_owned()), ("VERSION", version.to_string())] {
+            let name = format!("{prefix}{suffix}");
+            if let Some(value) = env(&name)
+                && value != file_value
+            {
+                return Err(RuntimeError::InvalidConfiguration(format!(
+                    "Environment variable '{name}' is set to '{value}' but '{path}' defines {} '{file_value}'. \
+                     Connector key and version can no longer be overridden from the environment: \
+                     remove '{name}', or put the value in the config file (a new key or version \
+                     starts without the previous state).",
+                    suffix.to_lowercase()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn apply_plugin_config_env_overrides(
         plugin_config: &mut Option<serde_json::Value>,
         base_config: &BaseConnectorConfig,
     ) {
         let connector_type = base_config.connector_type().to_uppercase();
         let key = base_config.key().to_uppercase();
-        let prefix = format!("IGGY_CONNECTORS_{connector_type}_{key}_PLUGIN_CONFIG_");
+        let prefix = format!(
+            "{}{PLUGIN_CONFIG_ENV_SEGMENT}",
+            connector_env_prefix(&connector_type, &key)
+        );
 
         for (env_key, env_value) in std::env::vars() {
             let env_key_upper = env_key.to_uppercase();
@@ -380,19 +420,33 @@ pub enum BaseConnectorConfig {
 }
 
 impl BaseConnectorConfig {
-    fn key(&self) -> &str {
+    pub(crate) fn key(&self) -> &str {
         match self {
             BaseConnectorConfig::Sink { key, .. } => key,
             BaseConnectorConfig::Source { key, .. } => key,
         }
     }
 
-    fn connector_type(&self) -> &str {
+    pub(crate) fn connector_type(&self) -> &str {
         match self {
             BaseConnectorConfig::Sink { .. } => "sink",
             BaseConnectorConfig::Source { .. } => "source",
         }
     }
+}
+
+/// Builds the env-var prefix a connector's config and plugin-config overrides
+/// are matched against: `IGGY_CONNECTORS_{TYPE}_{KEY}_`. `connector_type` and
+/// `key` are expected uppercased, as `BaseConnectorConfig`'s callers already
+/// do. Shared by the runtime's actual override lookup here and by
+/// `--list-config-env-vars`'s listing in `main.rs` (passing the literal
+/// `<KEY>` as the key), so the two can't drift apart on the prefix the
+/// connectors runtime actually reads.
+pub(crate) fn connector_env_prefix(connector_type: &str, key: &str) -> String {
+    format!(
+        "{}{connector_type}_{key}_",
+        crate::configs::runtime::ConnectorsRuntimeConfig::ENV_PREFIX
+    )
 }
 
 #[async_trait]
@@ -822,7 +876,7 @@ impl ConnectorEnvProvider {
     fn with_connector_base_config(base_config: &BaseConnectorConfig) -> Self {
         let connector_type = base_config.connector_type().to_uppercase();
         let key = base_config.key().to_uppercase();
-        let prefix = format!("IGGY_CONNECTORS_{}_{}_", connector_type, key);
+        let prefix = connector_env_prefix(&connector_type, &key);
         let connector_name = base_config.key().to_owned();
 
         match base_config {
@@ -889,6 +943,43 @@ mod tests {
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(entries, vec!["source_random_0.toml"]);
+    }
+
+    #[test]
+    fn given_identity_env_overrides_when_checked_should_reject_only_conflicts() {
+        let base_config = BaseConnectorConfig::Source {
+            key: "stdout".to_owned(),
+        };
+        let check = |env: &[(&str, &str)]| {
+            LocalConnectorsConfigProvider::<Initialized>::reject_conflicting_identity_overrides(
+                &base_config,
+                2,
+                "source_stdout_2.toml",
+                |name| {
+                    env.iter()
+                        .find(|(env_name, _)| *env_name == name)
+                        .map(|(_, value)| (*value).to_owned())
+                },
+            )
+        };
+
+        assert!(check(&[]).is_ok());
+        assert!(
+            check(&[
+                ("IGGY_CONNECTORS_SOURCE_STDOUT_KEY", "stdout"),
+                ("IGGY_CONNECTORS_SOURCE_STDOUT_VERSION", "2"),
+            ])
+            .is_ok()
+        );
+        let key_error = check(&[("IGGY_CONNECTORS_SOURCE_STDOUT_KEY", "other")])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            key_error.contains("IGGY_CONNECTORS_SOURCE_STDOUT_KEY"),
+            "{key_error}"
+        );
+        assert!(key_error.contains("remove"), "{key_error}");
+        assert!(check(&[("IGGY_CONNECTORS_SOURCE_STDOUT_VERSION", "3")]).is_err());
     }
 
     #[test]

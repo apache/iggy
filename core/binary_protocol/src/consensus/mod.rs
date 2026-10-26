@@ -41,8 +41,10 @@ mod consumer_session;
 mod error;
 mod header;
 mod operation;
+mod primary_rebalance;
 mod reply_result;
 mod request;
+mod segment_delete;
 
 pub use command::Command;
 pub use consumer_session::{
@@ -51,9 +53,10 @@ pub use consumer_session::{
 pub use error::ConsensusError;
 pub use header::{
     CHECKSUM_UNSEALED, CommitHeader, ConsensusHeader, DVC_HEADERS_MAX, DoViewChangeHeader,
-    EvictionHeader, EvictionReason, ForwardLogoutHeader, ForwardLogoutOutcome,
-    ForwardLogoutResultHeader, ForwardRegisterHeader, ForwardRegisterOutcome,
-    ForwardRegisterResultHeader, GenericHeader, HEADER_SIZE, PrepareHeader, PrepareOkHeader,
+    EvictionHeader, EvictionReason, ForwardCompletionHeader, ForwardLogoutHeader,
+    ForwardLogoutOutcome, ForwardLogoutResultHeader, ForwardRegisterHeader, ForwardRegisterOutcome,
+    ForwardRegisterResultHeader, GenericHeader, HEADER_SIZE, LIFECYCLE_BATCH_HEADER_SIZE,
+    LIFECYCLE_COMPLETION_SIZE, LIFECYCLE_COMPLETIONS_MAX, PrepareHeader, PrepareOkHeader,
     RESERVED_COMMAND_LEN, RepairPrepareHeader, RepairRangeReplyHeader, ReplyHeader, RequestHeader,
     RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
     RequestStateTransferHeader, RoutedRequestHeader, SIZE_FIELD_OFFSET, StartViewChangeHeader,
@@ -61,8 +64,10 @@ pub use header::{
     prepare_identity_checksum_bytes, read_size_field,
 };
 pub use operation::Operation;
+pub use primary_rebalance::{PrimaryRebalanceHeader, PrimaryRebalanceKind};
 pub use reply_result::{
     REJECTION_SECTION_LEN, RESULT_COUNT_LEN, RESULT_ENTRY_LEN, result_code, result_section_len,
     write_rejection_section,
 };
 pub use request::{NON_REPLICATED_CODE_RANGE, operation_for_code};
+pub use segment_delete::{SegmentDeleteHeader, SegmentDeleteKind};

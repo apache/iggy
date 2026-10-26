@@ -62,7 +62,7 @@ You can also customize the server using environment variables:
 
 ```bash
 ## Example: Enable HTTP transport and set custom address
-IGGY_HTTP_ENABLED=true IGGY_HTTP_ADDRESS=127.0.0.1:3000 cargo run --bin iggy-server
+IGGY_HTTP_ENABLED=true IGGY_HTTP_ADDRESS=127.0.0.1:3000 cargo run --bin iggy-server -- --with-default-root-credentials
 ```
 
 You can run multiple producers and consumers simultaneously to observe how messages are distributed across clients. Most examples support configurable options via the [Args](https://github.com/apache/iggy/blob/master/examples/rust/src/shared/args.rs) struct, including transport protocol, stream/topic/partition settings, consumer ID, message size, and more.

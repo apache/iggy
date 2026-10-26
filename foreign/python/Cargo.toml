@@ -17,7 +17,7 @@
 
 [package]
 name = "apache-iggy"
-version = "0.9.1-dev1"
+version = "0.9.1-dev4"
 edition = "2024"
 authors = ["Iggy Committers <dev@iggy.apache.org>"]
 license = "Apache-2.0"
@@ -37,13 +37,19 @@ doc = false
 [dependencies]
 bytes = "1.12.1"
 futures = "0.3.34"
-iggy = { path = "../../core/sdk", version = "0.11.1-edge.1" }
+iggy = { path = "../../core/sdk", version = "0.11.1-edge.4" }
 paste = "1"
-pyo3 = "0.29.2"
+pyo3 = "0.29.3"
 pyo3-async-runtimes = { version = "0.29.0", features = [
     "attributes",
     "tokio-runtime",
 ] }
-pyo3-stub-gen = "0.23.0"
+pyo3-stub-gen = "0.23.1"
 secrecy = "0.10"
-tokio = "1.53.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tokio = "1.53.3"
+
+[dev-dependencies]
+iggy_binary_protocol = { path = "../../core/binary_protocol" }
+iggy_common = { path = "../../core/common" }

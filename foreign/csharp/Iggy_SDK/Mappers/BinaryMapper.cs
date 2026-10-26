@@ -31,17 +31,17 @@ using Apache.Iggy.Vsr;
 
 namespace Apache.Iggy.Mappers;
 
-internal static class BinaryMapper
+internal static partial class BinaryMapper
 {
     private const int CONSUMER_GROUP_HEADER_SIZE = 13;
     private const int MEMBER_HEADER_SIZE = 8;
     private const int CONSUMER_GROUP_INFO_SIZE = 12;
     private const int CACHE_METRICS_ENTRY_SIZE = 32;
     private const int OPEN_FILES_FIELDS_SIZE = 8 + 8;
-    private const int MIN_TOPIC_SIZE = 50 + 4 + 4;
-    private const int MIN_OPTION_SPEC_SIZE = 1 + 1 + 4 + 4;
+    private const int MIN_TOPIC_SIZE = 33 + 4 + 4;
+    private const int MIN_OPTION_SPEC_SIZE = 1 + 1 + 1 + 4 + 4;
     private const int CLUSTER_NODE_TAIL_SIZE = 4 * 2 + 1 + 1;
-    private const int MIN_CLUSTER_NODE_SIZE = 4 + 4 + CLUSTER_NODE_TAIL_SIZE;
+    private const int MIN_CLUSTER_NODE_SIZE = 1 + 4 + 4 + CLUSTER_NODE_TAIL_SIZE;
 
     internal static RawPersonalAccessToken MapRawPersonalAccessToken(ReadOnlySpan<byte> payload)
     {
@@ -113,7 +113,7 @@ internal static class BinaryMapper
         {
             var permissionLength = ReadLength(payload, position + 1, "User permissions");
             ReadOnlySpan<byte> permissionsPayload = payload[(position + 5)..(position + 5 + permissionLength)];
-            var permissions = MapPermissions(permissionsPayload);
+            var permissions = new WireReader(permissionsPayload).Permissions();
             return new UserResponse
             {
                 Permissions = permissions,
@@ -121,7 +121,8 @@ internal static class BinaryMapper
                 CreatedAt = response.CreatedAt,
                 Username = response.Username,
                 Status = response.Status,
-                Options = response.Options
+                Options = response.Options,
+                DerivedOptions = response.DerivedOptions
             };
         }
 
@@ -132,95 +133,8 @@ internal static class BinaryMapper
             Username = response.Username,
             Status = response.Status,
             Permissions = null,
-            Options = response.Options
-        };
-    }
-
-    private static Permissions MapPermissions(ReadOnlySpan<byte> bytes)
-    {
-        var streamMap = new Dictionary<uint, StreamPermissions>();
-        var index = 0;
-
-        var globalPermissions = new GlobalPermissions
-        {
-            ManageServers = bytes[index++] == 1,
-            ReadServers = bytes[index++] == 1,
-            ManageUsers = bytes[index++] == 1,
-            ReadUsers = bytes[index++] == 1,
-            ManageStreams = bytes[index++] == 1,
-            ReadStreams = bytes[index++] == 1,
-            ManageTopics = bytes[index++] == 1,
-            ReadTopics = bytes[index++] == 1,
-            PollMessages = bytes[index++] == 1,
-            SendMessages = bytes[index++] == 1
-        };
-
-        if (bytes[index++] == 1)
-        {
-            while (true)
-            {
-                var streamId = BinaryPrimitives.ReadUInt32LittleEndian(bytes[index..(index + 4)]);
-                index += sizeof(uint);
-
-                var manageStream = bytes[index++] == 1;
-                var readStream = bytes[index++] == 1;
-                var manageTopics = bytes[index++] == 1;
-                var readTopics = bytes[index++] == 1;
-                var pollMessagesStream = bytes[index++] == 1;
-                var sendMessagesStream = bytes[index++] == 1;
-                var topicsMap = new Dictionary<uint, TopicPermissions>();
-
-                if (bytes[index++] == 1)
-                {
-                    while (true)
-                    {
-                        var topicId = BinaryPrimitives.ReadUInt32LittleEndian(bytes[index..(index + 4)]);
-                        index += sizeof(uint);
-
-                        var manageTopic = bytes[index++] == 1;
-                        var readTopic = bytes[index++] == 1;
-                        var pollMessagesTopic = bytes[index++] == 1;
-                        var sendMessagesTopic = bytes[index++] == 1;
-
-                        topicsMap.Add(topicId,
-                            new TopicPermissions
-                            {
-                                ManageTopic = manageTopic,
-                                ReadTopic = readTopic,
-                                PollMessages = pollMessagesTopic,
-                                SendMessages = sendMessagesTopic
-                            });
-
-                        if (bytes[index++] == 0)
-                        {
-                            break;
-                        }
-                    }
-                }
-
-                streamMap.Add(streamId,
-                    new StreamPermissions
-                    {
-                        ManageStream = manageStream,
-                        ReadStream = readStream,
-                        ManageTopics = manageTopics,
-                        ReadTopics = readTopics,
-                        PollMessages = pollMessagesStream,
-                        SendMessages = sendMessagesStream,
-                        Topics = topicsMap.Count > 0 ? topicsMap : null
-                    });
-
-                if (bytes[index++] == 0)
-                {
-                    break;
-                }
-            }
-        }
-
-        return new Permissions
-        {
-            Global = globalPermissions,
-            Streams = streamMap.Count > 0 ? streamMap : null
+            Options = response.Options,
+            DerivedOptions = response.DerivedOptions
         };
     }
 
@@ -240,6 +154,8 @@ internal static class BinaryMapper
         var readBytes = 4 + 8 + 1 + 1 + usernameLength;
         var options = MapOptions(payload, position + readBytes, out var optionsReadBytes);
         readBytes += optionsReadBytes;
+        var derivedOptions = MapOptions(payload, position + readBytes, out var derivedOptionsReadBytes);
+        readBytes += derivedOptionsReadBytes;
 
         return (new UserResponse
         {
@@ -247,7 +163,8 @@ internal static class BinaryMapper
             CreatedAt = createdAt,
             Status = userStatus,
             Username = username,
-            Options = options
+            Options = options,
+            DerivedOptions = derivedOptions
         },
             readBytes);
     }
@@ -348,6 +265,17 @@ internal static class BinaryMapper
         };
     }
 
+    internal static PartitionContext MapPartitionContext(ReadOnlySpan<byte> bytes)
+    {
+        if (bytes.Length < PartitionContext.ENCODED_SIZE)
+        {
+            throw new MalformedResponseException("Truncated partition context.");
+        }
+        return new PartitionContext(BinaryPrimitives.ReadUInt64LittleEndian(bytes),
+            BinaryPrimitives.ReadUInt64LittleEndian(bytes[8..]),
+            BinaryPrimitives.ReadUInt64LittleEndian(bytes[16..]));
+    }
+
     internal static PolledMessagesRental MapRentedMessages(ReadOnlyMemory<byte> payload,
         IMemoryOwner<byte> payloadOwner, IMessageEncryptor? encryptor = null)
     {
@@ -356,12 +284,19 @@ internal static class BinaryMapper
         var partitionId = BinaryPrimitives.ReadUInt32LittleEndian(span[..4]);
         var currentOffset = BinaryPrimitives.ReadUInt64LittleEndian(span[4..12]);
         var messagesCount = BinaryPrimitives.ReadUInt32LittleEndian(span[12..16]);
-        var position = 16;
+        var context = MapPartitionContext(span[16..]);
+        var position = 16 + PartitionContext.ENCODED_SIZE;
         if (position >= length)
         {
+            if (messagesCount != 0)
+            {
+                throw new MalformedResponseException("Poll count does not match its messages.");
+            }
+
             return new PolledMessagesRental(payloadOwner)
             {
                 PartitionId = partitionId,
+                Context = context,
                 CurrentOffset = currentOffset,
                 Messages = []
             };
@@ -384,7 +319,7 @@ internal static class BinaryMapper
                 }
             }
 
-            var maxMessages = (length - 16) / BatchWireFormat.FRAME_HEADER_SIZE;
+            var maxMessages = (length - position) / BatchWireFormat.FRAME_HEADER_SIZE;
             var capacity = (int)Math.Min(messagesCount, (uint)maxMessages);
             List<RentedMessageResponse> messages = new(capacity);
 
@@ -470,9 +405,15 @@ internal static class BinaryMapper
                 position = batchEnd;
             }
 
+            if (messages.Count != messagesCount)
+            {
+                throw new MalformedResponseException("Poll count does not match its messages.");
+            }
+
             return new PolledMessagesRental(payloadOwner, plaintextOwner)
             {
                 PartitionId = partitionId,
+                Context = context,
                 CurrentOffset = currentOffset,
                 Messages = messages
             };
@@ -544,7 +485,7 @@ internal static class BinaryMapper
     // and frame walk as the main loop, so both agree on which messages are included.
     private static int SumMaxDecryptedLength(ReadOnlySpan<byte> span, int length, IMessageEncryptor encryptor)
     {
-        var position = 16;
+        var position = 16 + PartitionContext.ENCODED_SIZE;
         var total = 0;
         while (position < length)
         {
@@ -584,6 +525,7 @@ internal static class BinaryMapper
         return new PolledMessages
         {
             PartitionId = rental.PartitionId,
+            Context = rental.Context,
             CurrentOffset = rental.CurrentOffset,
             Messages = messages
         };
@@ -606,6 +548,7 @@ internal static class BinaryMapper
         return new PolledMessagesRental(EmptyMemoryOwner.Instance)
         {
             PartitionId = messages.PartitionId,
+            Context = messages.Context,
             CurrentOffset = messages.CurrentOffset,
             Messages = rentedMessages
         };
@@ -976,7 +919,8 @@ internal static class BinaryMapper
             CreatedAt = stream.CreatedAt,
             MessagesCount = stream.MessagesCount,
             Size = stream.Size,
-            Options = stream.Options
+            Options = stream.Options,
+            DerivedOptions = stream.DerivedOptions
         };
     }
 
@@ -993,6 +937,8 @@ internal static class BinaryMapper
         var readBytes = 4 + 4 + 8 + 8 + 8 + 1 + nameLength;
         var options = MapOptions(payload, position + readBytes, out var optionsReadBytes);
         readBytes += optionsReadBytes;
+        var derivedOptions = MapOptions(payload, position + readBytes, out var derivedOptionsReadBytes);
+        readBytes += derivedOptionsReadBytes;
 
         return (
             new StreamResponse
@@ -1003,7 +949,8 @@ internal static class BinaryMapper
                 Size = sizeBytes,
                 MessagesCount = messagesCount,
                 CreatedAt = DateTimeOffsetUtils.FromUnixTimeMicroSeconds(createdAt).LocalDateTime,
-                Options = options
+                Options = options,
+                DerivedOptions = derivedOptions
             }, readBytes);
     }
 
@@ -1042,12 +989,9 @@ internal static class BinaryMapper
             Id = topic.Id,
             Name = topic.Name,
             PartitionsCount = topic.PartitionsCount,
-            CompressionAlgorithm = topic.CompressionAlgorithm,
             CreatedAt = topic.CreatedAt,
-            MessageExpiry = topic.MessageExpiry,
             MessagesCount = topic.MessagesCount,
             Size = topic.Size,
-            MaxTopicSize = topic.MaxTopicSize,
             Partitions = partitions,
             Options = topic.Options,
             DerivedOptions = topic.DerivedOptions
@@ -1059,14 +1003,11 @@ internal static class BinaryMapper
         var id = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
         var createdAt = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 4)..(position + 12)]);
         var partitionsCount = BinaryPrimitives.ReadUInt32LittleEndian(payload[(position + 12)..(position + 16)]);
-        var messageExpiry = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 16)..(position + 24)]);
-        var compressionAlgorithm = payload[position + 24];
-        var maxTopicSize = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 25)..(position + 33)]);
-        var sizeBytes = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 33)..(position + 41)]);
-        var messagesCount = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 41)..(position + 49)]);
-        var nameLength = (int)payload[position + 49];
-        var name = Encoding.UTF8.GetString(payload[(position + 50)..(position + 50 + nameLength)]);
-        var readBytes = 4 + 8 + 4 + 8 + 1 + 8 + 8 + 8 + 1 + nameLength;
+        var sizeBytes = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 16)..(position + 24)]);
+        var messagesCount = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 24)..(position + 32)]);
+        var nameLength = (int)payload[position + 32];
+        var name = Encoding.UTF8.GetString(payload[(position + 33)..(position + 33 + nameLength)]);
+        var readBytes = 4 + 8 + 4 + 8 + 8 + 1 + nameLength;
         var options = MapOptions(payload, position + readBytes, out var optionsReadBytes);
         readBytes += optionsReadBytes;
         var derivedOptions = MapOptions(payload, position + readBytes, out var derivedOptionsReadBytes);
@@ -1078,12 +1019,9 @@ internal static class BinaryMapper
                 Id = id,
                 PartitionsCount = partitionsCount,
                 Name = name,
-                CompressionAlgorithm = (CompressionAlgorithm)compressionAlgorithm,
                 MessagesCount = messagesCount,
                 Size = sizeBytes,
                 CreatedAt = DateTimeOffsetUtils.FromUnixTimeMicroSeconds(createdAt).LocalDateTime,
-                MessageExpiry = DurationHelpers.FromDuration(messageExpiry),
-                MaxTopicSize = maxTopicSize,
                 Options = options,
                 DerivedOptions = derivedOptions
             }, readBytes);
@@ -1098,11 +1036,12 @@ internal static class BinaryMapper
         var currentOffset = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 16)..(position + 24)]);
         var sizeBytes = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 24)..(position + 32)]);
         var messagesCount = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 32)..(position + 40)]);
-        var readBytes = 4 + 4 + 8 + 8 + 8 + 8;
+        var readBytes = 40 + PartitionContext.ENCODED_SIZE;
 
         return (
             new PartitionResponse
             {
+                Context = MapPartitionContext(payload[(position + 40)..]),
                 Id = id,
                 SegmentsCount = segmentsCount,
                 CurrentOffset = currentOffset,
@@ -1350,8 +1289,16 @@ internal static class BinaryMapper
             var key = Encoding.UTF8.GetString(payload[position..(position + keyLength)]);
             position += keyLength;
 
+            if (position + 2 > payload.Length)
+            {
+                throw new MalformedResponseException(
+                    $"Malformed DescribeOptions response: option kind and flags at offset {position} overrun the " +
+                    $"{payload.Length}-byte payload");
+            }
+
             var kind = payload[position];
-            position += 1;
+            var flags = (OptionFlags)payload[position + 1];
+            position += 2;
 
             var defaultLength = ReadLength(payload, position, "Option default value");
             position += 4;
@@ -1364,6 +1311,11 @@ internal static class BinaryMapper
             {
                 Key = key,
                 Kind = MapHeaderKind(kind),
+                Updatable = flags.HasFlag(OptionFlags.Updatable),
+                Resettable = flags.HasFlag(OptionFlags.Resettable),
+                Secret = flags.HasFlag(OptionFlags.Secret),
+                ReadOnly = flags.HasFlag(OptionFlags.ReadOnly),
+                Critical = flags.HasFlag(OptionFlags.Critical),
                 DefaultValue = defaultValue,
                 Description = description
             });
@@ -1398,8 +1350,26 @@ internal static class BinaryMapper
         };
     }
 
+    internal static PartitionRoute MapPartitionRoute(ReadOnlySpan<byte> payload)
+    {
+        if (payload.Length != PartitionRoute.ENCODED_SIZE)
+        {
+            throw new MalformedResponseException($"Partition route requires exactly {PartitionRoute.ENCODED_SIZE} bytes.");
+        }
+
+        return new PartitionRoute(BinaryPrimitives.ReadUInt64LittleEndian(payload),
+            BinaryPrimitives.ReadUInt64LittleEndian(payload[8..]),
+            BinaryPrimitives.ReadUInt32LittleEndian(payload[16..]),
+            BinaryPrimitives.ReadUInt32LittleEndian(payload[20..]), payload[24]);
+    }
+
     internal static ClusterNode MapClusterNode(ReadOnlySpan<byte> payload, ref int position)
     {
+        if (position >= payload.Length)
+        {
+            throw new MalformedResponseException("Cluster node is missing its replica id.");
+        }
+        var replicaId = payload[position++];
         var name = ReadString(payload, ref position, "Cluster node name");
         var ip = ReadString(payload, ref position, "Cluster node ip");
         if (position + CLUSTER_NODE_TAIL_SIZE > payload.Length)
@@ -1431,6 +1401,7 @@ internal static class BinaryMapper
 
         return new ClusterNode
         {
+            ReplicaId = replicaId,
             Name = name,
             Ip = ip,
             Endpoints = new TransportEndpoints

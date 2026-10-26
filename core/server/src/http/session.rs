@@ -78,7 +78,8 @@ const PARTITION_GATE_SWEEP_THRESHOLD: usize = 64;
 pub(in crate::http) struct HttpSession {
     pub(in crate::http) attachment: RefCell<SessionAttachment>,
     pub(in crate::http) activity: Rc<SessionActivity>,
-    /// Session-table key this entry lives under (`jwt:{jti}` / `pat:{sha}`).
+    /// Session-table key this entry lives under
+    /// (`jwt:{user_id}:{created_at}:{jti}` / `pat:{sha}`).
     /// Held so an eviction observed on the write path can remove exactly this
     /// entry (see [`HttpInner::forget_session`]) without threading the key
     /// through the whole write chain.

@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -23,24 +24,30 @@ use kafka_protocol::error::ResponseError;
 use kafka_protocol::messages::{
     DescribeAclsRequest, SaslAuthenticateRequest, SaslHandshakeRequest,
 };
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedMutexGuard, Semaphore};
 use tokio_util::sync::CancellationToken;
 
+use crate::auth::AuthenticatedPrincipal;
 use crate::bridge::IggyBridge;
+use crate::cluster_id::ClusterId;
 use crate::error::Result;
-use crate::group::{GroupCoordinator, GroupCoordinatorConfig};
+use crate::group::{GroupCoordinator, GroupCoordinatorConfig, GroupMember};
 use crate::protocol::acl::{
     self, AclBinding, AclFilter, PrincipalPermissions, encode_describe_acls_error_response,
     encode_describe_acls_response,
 };
+use crate::protocol::auto_topic_creation::{AutoTopicCreationConfig, AutoTopicCreator};
 use crate::protocol::bounds_guard::{
     validate_describe_acls_shape, validate_sasl_authenticate_shape, validate_sasl_handshake_shape,
 };
+use crate::protocol::handlers::api_versions::Advertisement;
 use crate::protocol::handlers::init_producer_id::ProducerIdAllocator;
 use crate::protocol::handlers::{
-    api_versions, create_topics, decode_guarded, dispatch, fetch, find_coordinator, heartbeat,
-    init_producer_id, join_group, leave_group, list_offsets, metadata, produce, respond_or_close,
-    sync_group,
+    alter_configs, api_versions, create_partitions, create_topics, decode_guarded, delete_groups,
+    delete_topics, describe_cluster, describe_configs, describe_groups, dispatch, fetch,
+    find_coordinator, heartbeat, incremental_alter_configs, init_producer_id, join_group,
+    leave_group, list_groups, list_offsets, metadata, offset_commit, offset_delete, offset_fetch,
+    produce, respond_or_close, sync_group,
 };
 use crate::protocol::probe_board::ProbeBoard;
 use crate::protocol::sasl::{
@@ -51,17 +58,29 @@ pub const API_KEY_PRODUCE: i16 = 0;
 pub const API_KEY_FETCH: i16 = 1;
 pub const API_KEY_LIST_OFFSETS: i16 = 2;
 pub const API_KEY_METADATA: i16 = 3;
+pub const API_KEY_OFFSET_COMMIT: i16 = 8;
+pub const API_KEY_OFFSET_FETCH: i16 = 9;
 pub const API_KEY_FIND_COORDINATOR: i16 = 10;
 pub const API_KEY_JOIN_GROUP: i16 = 11;
 pub const API_KEY_HEARTBEAT: i16 = 12;
 pub const API_KEY_LEAVE_GROUP: i16 = 13;
 pub const API_KEY_SYNC_GROUP: i16 = 14;
+pub const API_KEY_DESCRIBE_GROUPS: i16 = 15;
+pub const API_KEY_LIST_GROUPS: i16 = 16;
 pub const API_KEY_SASL_HANDSHAKE: i16 = 17;
 pub const API_KEY_API_VERSIONS: i16 = 18;
 pub const API_KEY_CREATE_TOPICS: i16 = 19;
+pub const API_KEY_DELETE_TOPICS: i16 = 20;
 pub const API_KEY_INIT_PRODUCER_ID: i16 = 22;
 pub const API_KEY_DESCRIBE_ACLS: i16 = 29;
+pub const API_KEY_DESCRIBE_CONFIGS: i16 = 32;
+pub const API_KEY_ALTER_CONFIGS: i16 = 33;
 pub const API_KEY_SASL_AUTHENTICATE: i16 = 36;
+pub const API_KEY_CREATE_PARTITIONS: i16 = 37;
+pub const API_KEY_DELETE_GROUPS: i16 = 42;
+pub const API_KEY_INCREMENTAL_ALTER_CONFIGS: i16 = 44;
+pub const API_KEY_OFFSET_DELETE: i16 = 47;
+pub const API_KEY_DESCRIBE_CLUSTER: i16 = 60;
 
 pub const DEFAULT_KAFKA_PORT: u16 = 9093;
 
@@ -90,6 +109,8 @@ pub const ERROR_INVALID_TOPIC_EXCEPTION: i16 = ResponseError::InvalidTopicExcept
 /// Produce: `acks` is not 0, 1 or -1. A conformant client never sends one, since `acks` comes
 /// from validated configuration rather than from application input.
 pub const ERROR_INVALID_REQUIRED_ACKS: i16 = ResponseError::InvalidRequiredAcks.code();
+/// Retriable, and the client keeps its coordinator. An offset call to Iggy that may work on retry.
+pub const ERROR_COORDINATOR_LOAD_IN_PROGRESS: i16 = ResponseError::CoordinatorLoadInProgress.code();
 /// Retriable. Sent when this coordinator is at one of its `GroupCoordinatorConfig` capacity
 /// caps: the client should back off and retry rather than treat the group as unusable.
 pub const ERROR_COORDINATOR_NOT_AVAILABLE: i16 = 15;
@@ -103,9 +124,25 @@ pub const ERROR_ILLEGAL_GENERATION: i16 = 22;
 pub const ERROR_INCONSISTENT_GROUP_PROTOCOL: i16 = 23;
 pub const ERROR_INVALID_GROUP_ID: i16 = 24;
 pub const ERROR_UNKNOWN_MEMBER_ID: i16 = 25;
+/// `DescribeGroups` v6: the named group is not on this coordinator.
+///
+/// Earlier versions of the same response report that miss as state `Dead` with error 0.
+/// Kafka 4.0's `describeGroups` splits it the same way, and a v6 client treats error 0 as a
+/// group that exists.
+pub const ERROR_GROUP_ID_NOT_FOUND: i16 = ResponseError::GroupIdNotFound.code();
 pub const ERROR_INVALID_SESSION_TIMEOUT: i16 = 26;
 /// How a follower learns to rejoin: its heartbeat is answered with this while the group prepares.
 pub const ERROR_REBALANCE_IN_PROGRESS: i16 = 27;
+/// `DeleteGroups` and `OffsetDelete`: the principal may not delete groups or their offsets.
+///
+/// `DeleteGroups` also sends it when Iggy refuses the bridge user, either the delete of the Iggy
+/// group that holds the offsets, or the listing of the groups of a topic where it can hold them.
+pub const ERROR_GROUP_AUTHORIZATION_FAILED: i16 = ResponseError::GroupAuthorizationFailed.code();
+/// `DeleteGroups`: the group has members. `OffsetDelete`: it has members of a protocol other than
+/// `consumer`.
+pub const ERROR_NON_EMPTY_GROUP: i16 = ResponseError::NonEmptyGroup.code();
+/// `OffsetDelete`: a member subscribes to the topic, so its offsets stay.
+pub const ERROR_GROUP_SUBSCRIBED_TO_TOPIC: i16 = ResponseError::GroupSubscribedToTopic.code();
 /// Closest fit for an Iggy permission/credential rejection in `bridge`'s error mapping.
 ///
 /// Still not `SASL_AUTHENTICATION_FAILED`, and now for a firmer reason than when this was written:
@@ -136,24 +173,20 @@ pub const ERROR_INVALID_REPLICATION_FACTOR: i16 = 38;
 /// map's keys the same way regardless of what a client's replica list under each key says (this
 /// bridge doesn't model replicas at all, so only the key set is checked).
 pub const ERROR_INVALID_REPLICA_ASSIGNMENT: i16 = 39;
-/// `CreateTopics` stub: do not claim topics were created (no controller / no Iggy bridge).
+/// No controller and no Iggy bridge. `CreateTopics`, `DescribeConfigs`, and `AlterConfigs`
+/// answer this so a client does not treat a stub as a completed create, read, or alter.
 pub const ERROR_NOT_CONTROLLER: i16 = 41;
 pub const ERROR_INVALID_REQUEST: i16 = 42;
-/// `CreateTopics`: a requested topic carried one or more per-topic Kafka configs.
+/// A config this gateway will not apply.
 ///
-/// None of `retention.ms`, `cleanup.policy`, etc. maps onto an Iggy topic option this bridge
-/// applies, so every non-empty `configs` list is rejected outright rather than silently dropping
-/// a subset an operator might believe took effect.
+/// `CreateTopics` rejects any per-topic config list and points the client at `AlterConfigs`.
+/// `AlterConfigs` stores `retention.ms`, `retention.minutes`, or `retention.hours` as
+/// `message_expiry` in milliseconds and rejects every other key, and a value that cannot
+/// be stored. `DescribeConfigs` sends this when a requested key is unknown or a stored expiry
+/// cannot be shown as `retention.ms`.
 pub const ERROR_INVALID_CONFIG: i16 = 40;
-/// `ListOffsets`' code for a timestamp lookup the broker cannot perform.
-///
-/// Real brokers send this for an old-message-format log; this bridge sends it for any timestamp
-/// other than the two KIP-79 sentinels, since Iggy has no per-message timestamp index at all.
-/// Non-retriable, so a Java client resolves immediately instead of retrying
-/// [`ERROR_UNKNOWN_SERVER_ERROR`] until its own `default.api.timeout.ms`.
-pub const ERROR_UNSUPPORTED_FOR_MESSAGE_FORMAT: i16 =
-    ResponseError::UnsupportedForMessageFormat.code();
-/// `CreateTopics`: request addressed more distinct topics than this bridge admits in one call.
+/// `CreateTopics`, `DescribeConfigs`, and `AlterConfigs`: the request addressed more distinct
+/// topics than this bridge admits in one call.
 ///
 /// A server-imposed limit, not a malformed request - `INVALID_REQUEST` would blame the client for
 /// a request Kafka itself would accept.
@@ -177,7 +210,8 @@ pub const ERROR_UNSUPPORTED_COMPRESSION_TYPE: i16 =
 /// this code, and the client rejoins carrying it.
 pub const ERROR_MEMBER_ID_REQUIRED: i16 = 79;
 pub const ERROR_GROUP_MAX_SIZE_REACHED: i16 = 81;
-/// Sent only by `LeaveGroup`: the member id does not hold the `group_instance_id` it named.
+/// The member id does not hold the `group_instance_id` it named, or a static member that
+/// returned has since replaced it.
 pub const ERROR_FENCED_INSTANCE_ID: i16 = 82;
 /// Produce: a record or batch this gateway cannot map.
 ///
@@ -185,6 +219,10 @@ pub const ERROR_FENCED_INSTANCE_ID: i16 = 82;
 /// retriable, so a client would resend a batch that can never decode. A client older than Kafka
 /// 2.4 reads 87 as a generic server error, which is still terminal and still better than a loop.
 pub const ERROR_INVALID_RECORD: i16 = ResponseError::InvalidRecord.code();
+/// `DescribeCluster` v1+ asked a broker for the controller endpoints.
+pub const ERROR_MISMATCHED_ENDPOINT_TYPE: i16 = ResponseError::MismatchedEndpointType.code();
+/// `DescribeCluster` v1+ named an endpoint type Kafka does not define.
+pub const ERROR_UNSUPPORTED_ENDPOINT_TYPE: i16 = ResponseError::UnsupportedEndpointType.code();
 
 /// Kafka's -1 for an offset or a timestamp that is not known.
 pub(crate) const UNKNOWN_OFFSET: i64 = -1;
@@ -270,14 +308,26 @@ static SUPPORTED_RANGES: &[ApiVersionRange] = &[
     fetch::RANGE,
     list_offsets::RANGE,
     metadata::RANGE,
+    offset_commit::RANGE,
+    offset_fetch::RANGE,
     api_versions::RANGE,
     create_topics::RANGE,
+    delete_topics::RANGE,
+    create_partitions::RANGE,
+    describe_configs::RANGE,
+    alter_configs::RANGE,
+    incremental_alter_configs::RANGE,
     init_producer_id::RANGE,
     find_coordinator::RANGE,
     join_group::RANGE,
     heartbeat::RANGE,
     leave_group::RANGE,
     sync_group::RANGE,
+    describe_groups::RANGE,
+    list_groups::RANGE,
+    delete_groups::RANGE,
+    offset_delete::RANGE,
+    describe_cluster::RANGE,
 ];
 
 #[must_use]
@@ -290,68 +340,137 @@ pub fn supported_api_ranges() -> &'static [ApiVersionRange] {
 /// `bridge` is `None` until `IGGY_KAFKA_BRIDGE_ENABLED` turns it on. A handler that finds `None`
 /// answers with its stub, so APIs can be wired one at a time.
 ///
-/// Every Iggy call but a Fetch poll goes through one lockstep `IggyClient`, so Kafka connections
-/// serialize behind whichever of those calls is in flight. The `Arc` does not change that. See the
-/// README's "Concurrency ceiling".
+/// Produce sends on one Iggy client per producer. Metadata, `CreateTopics`, `DeleteTopics`,
+/// `CreatePartitions`, `DescribeConfigs`, `AlterConfigs` and `IncrementalAlterConfigs` share one
+/// lockstep `IggyClient`, so those calls run one at a time across connections. See the README's
+/// "Concurrency ceiling".
 pub struct GatewayState {
-    pub broker: BrokerAdvertise,
     pub bridge: Option<Arc<IggyBridge>>,
     pub max_frame_size: usize,
-    /// Whether `SaslHandshake` and `SaslAuthenticate` are advertised and routed. Kept on the
-    /// shared state so `ApiVersions` can answer without a widened handler signature.
-    pub sasl_enabled: bool,
     /// Shared across every connection this gateway serves: a producer id has to be unique for
     /// the process, not for the connection that asked for it.
     pub producer_ids: ProducerIdAllocator,
-    /// Produce requests that decode and send at once. Caps their memory.
-    pub(crate) produce_slots: Semaphore,
+    /// `PRODUCE_CAPS` partition caps, in frame bytes, that Produce may hold decoded at once. Caps
+    /// its memory. A request takes what its largest partition may decode, and a send that
+    /// outlives the request keeps it while it owns the decoded partition.
+    pub(crate) produce_memory: Arc<Semaphore>,
+    /// `PRODUCE_LARGE` slots a large Produce request takes before its memory. Small ones skip it.
+    pub(crate) produce_large: Arc<Semaphore>,
     /// Consumer group membership. Process-wide and independent of the bridge: a member outlives
     /// the connection that created it, and group coordination needs no Iggy call.
     pub groups: GroupCoordinator,
     /// Per Kafka topic and partition, how long probes read it as loading. Fetch and `ListOffsets`
     /// share it, since every consumer sees the same probe.
     pub(crate) loading: Mutex<fetch::Spells>,
+    /// Per Kafka topic and partition, how long `ListOffsets` lookups by time poll empty without
+    /// proof that no record matches. Only the first of a spell warns.
+    pub(crate) unproven_empty: Mutex<fetch::Spells>,
     /// Topic probes that every Fetch shares.
     pub(crate) probe_board: ProbeBoard,
+    /// Held by `CreatePartitions` from reading a topic's partition count until its write is
+    /// settled, and by `CreateTopics` and `DeleteTopics` around their writes. Iggy adds a number
+    /// of partitions, Kafka asks for a count to reach, and two requests that read the same count
+    /// would otherwise both add and overshoot it. Per process: other gateways and direct Iggy
+    /// clients are not behind it.
+    pub(crate) partition_growth: Arc<tokio::sync::Mutex<()>>,
+    /// What Metadata and `DescribeCluster` report. Random unless [`Self::with_cluster_id`] sets
+    /// the one stored in Iggy.
+    pub cluster_id: ClusterId,
+    /// Present only while `IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED` is on.
+    pub(crate) auto_topic_creation: Option<AutoTopicCreator>,
 }
 
-/// Each holds one decoded partition at a time, so about 160 MB at the default 8 MiB frame. Sends
-/// run one at a time anyway.
-const PRODUCE_SLOTS: usize = 4;
+/// Large Produce requests that decode and send at once. More at once only contend for the
+/// gateway's workers and for Iggy: at full load they cost CPU and gave no throughput.
+const PRODUCE_LARGE: usize = 4;
+
+/// Partition caps Produce may hold decoded at once, about 200 MB at the default 8 MiB frame.
+///
+/// Counted in bytes, not requests, so a small request takes a small share. One cap more than the
+/// large slots: large requests can hold a cap each, and the small ones still have one.
+const PRODUCE_CAPS: usize = PRODUCE_LARGE + 1;
 
 impl GatewayState {
     #[must_use]
     pub fn new(
-        broker: BrokerAdvertise,
         bridge: Option<Arc<IggyBridge>>,
         max_frame_size: usize,
-        sasl_enabled: bool,
         instance_id: u16,
         groups: GroupCoordinator,
     ) -> Self {
         Self {
-            broker,
             bridge,
             max_frame_size,
-            sasl_enabled,
             producer_ids: ProducerIdAllocator::new(instance_id),
-            produce_slots: Semaphore::const_new(PRODUCE_SLOTS),
+            produce_memory: Arc::new(Semaphore::new(
+                PRODUCE_CAPS
+                    .saturating_mul(max_frame_size)
+                    .min(Semaphore::MAX_PERMITS),
+            )),
+            produce_large: Arc::new(Semaphore::new(PRODUCE_LARGE)),
             groups,
             loading: Mutex::default(),
+            unproven_empty: Mutex::default(),
             probe_board: ProbeBoard::default(),
+            partition_growth: Arc::default(),
+            cluster_id: ClusterId::random(),
+            auto_topic_creation: None,
         }
+    }
+
+    /// Turns on Kafka's `auto.create.topics.enable` behaviour for `Metadata` when `config` says
+    /// so.
+    ///
+    /// # Errors
+    ///
+    /// [`KafkaProtocolError::InvalidConfig`](crate::error::KafkaProtocolError::InvalidConfig)
+    /// when creation is on and `config.partitions` is 0 or over Iggy's per-topic cap.
+    pub fn with_auto_topic_creation(mut self, config: AutoTopicCreationConfig) -> Result<Self> {
+        self.auto_topic_creation = if config.enabled {
+            Some(AutoTopicCreator::new(config.partitions)?)
+        } else {
+            None
+        };
+        Ok(self)
+    }
+
+    /// Cancels the auto topic creations still running and waits up to `deadline` for them to
+    /// end. An embedder that builds its own `GatewayState` calls it before closing the bridge.
+    pub async fn shutdown_auto_topic_creation(&self, deadline: Duration) {
+        let Some(creator) = &self.auto_topic_creation else {
+            return;
+        };
+        if creator.shutdown(deadline).await
+            && let Some(bridge) = &self.bridge
+        {
+            // A cancelled create can keep its client busy, and the bridge's sign-out would queue
+            // behind it.
+            bridge.discard_auto_create_client();
+        }
+    }
+
+    /// Holds back the writes of `CreateTopics`, `DeleteTopics` and `CreatePartitions` on this
+    /// gateway until the guard drops, the way a `CreatePartitions` settling an unknown outcome
+    /// does. For tests that check those handlers wait for it.
+    #[doc(hidden)]
+    pub async fn hold_topic_changes(&self) -> OwnedMutexGuard<()> {
+        Arc::clone(&self.partition_growth).lock_owned().await
+    }
+
+    #[must_use]
+    pub fn with_cluster_id(mut self, cluster_id: ClusterId) -> Self {
+        self.cluster_id = cluster_id;
+        self
     }
 
     /// State with no bridge, so every handler takes its stub path.
     ///
     /// The coordinator is real but fresh, so two calls never share group state.
     #[must_use]
-    pub fn stub(broker: BrokerAdvertise, max_frame_size: usize) -> Self {
+    pub fn stub(max_frame_size: usize) -> Self {
         Self::new(
-            broker,
             None,
             max_frame_size,
-            false,
             0,
             GroupCoordinator::new(GroupCoordinatorConfig::default(), CancellationToken::new()),
         )
@@ -363,12 +482,83 @@ impl GatewayState {
 /// Fetch keeps its -1 holds and the offsets it cannot place here. One consumer's stuck offset then
 /// neither skips another consumer's read of it nor replaces the hold of a consumer stuck elsewhere
 /// in the partition, and one consumer's wait for an offset never spends another's grace.
+///
+/// The listener the connection arrived through lives here too, because a gateway with several
+/// listeners answers Metadata and `ApiVersions` differently on each: a client is pointed back at
+/// the port it used, and the SASL keys are advertised only where the exchange is run.
 #[derive(Default)]
 pub struct ConnectionState {
+    /// The broker address this connection's listener advertises.
+    pub broker: BrokerAdvertise,
+    /// Whether `SaslHandshake` and `SaslAuthenticate` are advertised and routed on this
+    /// connection's listener.
+    pub sasl_enabled: bool,
+    /// Whether `DescribeAcls` is advertised and answered: the listener names a principal, by
+    /// SASL or by a verified client certificate.
+    pub acls_enabled: bool,
     /// Partitions that answered -1 to this connection's Fetches, per Kafka topic.
     pub(crate) stuck_offsets: Mutex<fetch::StuckOffsets>,
     /// Offsets this connection's Fetches cannot place, per Kafka topic.
     pub(crate) unplaced: Mutex<fetch::Unplaced>,
+    /// The member that last sent a Heartbeat here. An offset call caps its hold by that member's
+    /// session, since its next heartbeat waits behind the call.
+    heartbeat_member: Mutex<Option<GroupMember>>,
+    /// Keys the Produce session of a producer without a producer id that this gateway gave out.
+    id: ConnectionId,
+}
+
+/// A Kafka connection's number, unique in the process.
+#[derive(Debug, Clone, Copy)]
+struct ConnectionId(u64);
+
+static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(0);
+
+impl Default for ConnectionId {
+    fn default() -> Self {
+        Self(NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+impl ConnectionState {
+    /// State for a connection accepted on the listener that advertises `broker`.
+    ///
+    /// `acls_enabled` is at least `sasl_enabled`: a SASL listener always names a principal.
+    #[must_use]
+    pub fn for_listener(broker: BrokerAdvertise, sasl_enabled: bool, acls_enabled: bool) -> Self {
+        Self {
+            broker,
+            sasl_enabled,
+            acls_enabled: acls_enabled || sasl_enabled,
+            ..Self::default()
+        }
+    }
+
+    /// What `ApiVersions` tells this connection about the listener-dependent keys.
+    #[must_use]
+    pub const fn advertisement(&self) -> Advertisement {
+        Advertisement {
+            sasl: self.sasl_enabled,
+            acls: self.acls_enabled,
+        }
+    }
+
+    pub(crate) const fn id(&self) -> u64 {
+        self.id.0
+    }
+
+    pub(crate) fn note_heartbeat(&self, member: GroupMember) {
+        *self
+            .heartbeat_member
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(member);
+    }
+
+    pub(crate) fn heartbeat_member(&self) -> Option<GroupMember> {
+        self.heartbeat_member
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
 }
 
 /// Default `max_frame_size` used by [`handle_request`] - the direct call sites across this
@@ -384,8 +574,9 @@ pub async fn handle_request(
     body: Bytes,
     broker: &BrokerAdvertise,
 ) -> HandleOutcome {
-    let state = GatewayState::stub(broker.clone(), DEFAULT_MAX_FRAME_SIZE);
-    handle_request_bounded(&state, api_key, api_version, body).await
+    let state = GatewayState::stub(DEFAULT_MAX_FRAME_SIZE);
+    let connection = ConnectionState::for_listener(broker.clone(), false, false);
+    handle_connection_request(&state, &connection, None, api_key, api_version, body).await
 }
 
 /// Same as [`handle_request`], but rejects a request whose declared array/string lengths project
@@ -405,18 +596,23 @@ pub async fn handle_request_bounded(
     body: Bytes,
 ) -> HandleOutcome {
     let connection = ConnectionState::default();
-    handle_connection_request(state, &connection, api_key, api_version, body).await
+    handle_connection_request(state, &connection, None, api_key, api_version, body).await
 }
 
 /// [`handle_request_bounded`] for one request of `connection`.
+///
+/// `principal` is `None` when no listener of the gateway names principals, or for a key the
+/// connection reached before authenticating. Only `crate::server::route_frame` ever has a
+/// principal to pass.
 pub async fn handle_connection_request(
     state: &GatewayState,
     connection: &ConnectionState,
+    principal: Option<&AuthenticatedPrincipal>,
     api_key: i16,
     api_version: i16,
     body: Bytes,
 ) -> HandleOutcome {
-    dispatch(state, connection, api_key, api_version, body).await
+    dispatch(state, connection, principal, api_key, api_version, body).await
 }
 
 #[must_use]
@@ -479,15 +675,19 @@ static SASL_ADVERTISED_RANGES: &[ApiVersionRange] = &[
         min_version: 0,
         max_version: 2,
     },
-    // Grouped with the SASL keys rather than with `SUPPORTED_RANGES` because it answers about the
-    // authenticated principal. With SASL off there is no principal, so there is nothing it could
-    // truthfully describe, and advertising it would invite a question with no answer.
-    ApiVersionRange {
-        api_key: API_KEY_DESCRIBE_ACLS,
-        min_version: 1,
-        max_version: 3,
-    },
 ];
+
+/// Advertised only on a listener that names a principal, and absent from [`SUPPORTED_RANGES`]
+/// for the same reason the SASL keys are: it answers about the authenticated principal, which
+/// only the connection knows. On a plaintext listener with SASL off there is none, so there is
+/// nothing it could truthfully describe, and advertising it would invite a question with no
+/// answer. An `SSL` listener that verifies client certificates names one too, so it is advertised
+/// there without the SASL keys.
+static ACL_ADVERTISED_RANGES: &[ApiVersionRange] = &[ApiVersionRange {
+    api_key: API_KEY_DESCRIBE_ACLS,
+    min_version: 1,
+    max_version: 3,
+}];
 
 /// Sent with every `SASL_AUTHENTICATION_FAILED`, whatever the real cause.
 ///
@@ -628,10 +828,16 @@ fn finish_sasl(encoded: Result<Bytes>, close: bool, api_name: &str) -> HandleOut
     }
 }
 
-/// The SASL keys, advertised only while the feature is on.
+/// The SASL keys, advertised only on a listener that runs the exchange.
 #[must_use]
 pub fn sasl_advertised_ranges() -> &'static [ApiVersionRange] {
     SASL_ADVERTISED_RANGES
+}
+
+/// The ACL keys, advertised only on a listener that names a principal.
+#[must_use]
+pub fn acl_advertised_ranges() -> &'static [ApiVersionRange] {
+    ACL_ADVERTISED_RANGES
 }
 
 /// Builds a well-formed error response for `api_key`, shaped for `api_version`.
@@ -650,7 +856,7 @@ pub fn encode_error_for_key(
     api_key: i16,
     api_version: i16,
     error_code: i16,
-    sasl_enabled: bool,
+    advertisement: Advertisement,
 ) -> HandleOutcome {
     // The firewall applies here too, and it has to be checked explicitly. `kafka_protocol`'s
     // encoders accept a wider version range than `SUPPORTED_RANGES` does (Fetch to 18 against a
@@ -664,11 +870,21 @@ pub fn encode_error_for_key(
         API_KEY_FETCH => fetch::encode_error_response(api_version, error_code),
         API_KEY_LIST_OFFSETS => list_offsets::encode_error_response(api_version, error_code),
         API_KEY_CREATE_TOPICS => create_topics::encode_error_response(api_version, error_code),
-        // Carries the live SASL setting, not a hardcoded `false`: answering an illegal-state
-        // ApiVersions with a SASL-less key set contradicts the advertisement sent one frame
-        // earlier on the same connection.
+        API_KEY_DESCRIBE_CONFIGS => {
+            describe_configs::encode_error_response(api_version, error_code)
+        }
+        API_KEY_ALTER_CONFIGS => alter_configs::encode_error_response(api_version, error_code),
+        API_KEY_INCREMENTAL_ALTER_CONFIGS => {
+            incremental_alter_configs::encode_error_response(api_version, error_code)
+        }
+        API_KEY_DESCRIBE_CLUSTER => {
+            describe_cluster::encode_error_response(api_version, error_code)
+        }
+        // Carries the listener's live advertisement, not a hardcoded `NONE`: answering an
+        // illegal-state ApiVersions with a SASL-less key set contradicts the advertisement sent
+        // one frame earlier on the same connection.
         API_KEY_API_VERSIONS => {
-            api_versions::encode_response(api_version, error_code, sasl_enabled)
+            api_versions::encode_response(api_version, error_code, advertisement)
         }
         _ => return HandleOutcome::Close,
     };

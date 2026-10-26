@@ -19,6 +19,10 @@ using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using Apache.Iggy.Contracts;
+using Apache.Iggy.Mappers;
+using Apache.Iggy.Utils;
+using Apache.Iggy.Vsr;
 using static Apache.Iggy.Tests.VsrTests.MockFrames;
 
 namespace Apache.Iggy.Tests.VsrTests;
@@ -32,6 +36,7 @@ internal static class MockFrames
     internal const int REQUEST_ID_OFFSET = 168;
     internal const int REQUEST_OPERATION_OFFSET = 176;
     internal const int REQUEST_RESERVED_OFFSET = 196;
+    internal const int REQUEST_CONTEXT_OFFSET = 200;
     internal const int REPLY_REQUEST_ID_OFFSET = 200;
     internal const int REPLY_OPERATION_OFFSET = 208;
     internal const int REPLY_STATUS_OFFSET = 216;
@@ -50,13 +55,17 @@ internal static class MockFrames
     /// <summary>A reply for anything the roster read does not claim: a register, or an empty read.</summary>
     internal static byte[] Answer(MockRequest request)
     {
+        if (request.Code == CommandCodes.GET_PARTITION_ROUTE_CODE)
+        {
+            return RouteReply(request, new PartitionContext(17, 0, 1), 0);
+        }
         if (request.Code == BIND_SESSION_CODE)
         {
             return Reply(OPERATION_NON_REPLICATED, RegisterBody(request.Session)[4..]);
         }
         return request.Operation == OPERATION_REGISTER
             ? Reply(OPERATION_REGISTER, RegisterBody(session: 128))
-            : Reply(OPERATION_NON_REPLICATED, []);
+            : Reply(request.Operation, ((VsrOperation)request.Operation).IsResultFramed() ? new byte[4] : []);
     }
 
     internal static byte[] Reply(byte operation, byte[] body)
@@ -70,10 +79,83 @@ internal static class MockFrames
         BinaryPrimitives.WriteUInt32LittleEndian(frame.AsSpan(SIZE_OFFSET, 4), (uint)frame.Length);
         frame[COMMAND_OFFSET] = COMMAND_REPLY;
         frame[REPLY_OPERATION_OFFSET] = operation;
+        if (status == 0 && operation is not OPERATION_NON_REPLICATED)
+        {
+            frame[VsrHeader.REPLY_COMMITTED_OFFSET] = VsrHeader.COMMITTED_RESULT_MARKER;
+        }
         BinaryPrimitives.WriteUInt32LittleEndian(frame.AsSpan(REPLY_STATUS_OFFSET, 4), status);
         body.CopyTo(frame.AsSpan(HEADER_SIZE));
 
         return frame;
+    }
+
+    internal static void CorrelateReply(MockRequest request, byte[] reply)
+    {
+        BinaryPrimitives.WriteUInt64LittleEndian(reply.AsSpan(REPLY_REQUEST_ID_OFFSET), request.RequestId);
+        BinaryPrimitives.WriteUInt128LittleEndian(reply.AsSpan(VsrHeader.REPLY_CLIENT_OFFSET), request.ClientId);
+        BinaryPrimitives.WriteUInt128LittleEndian(reply.AsSpan(VsrHeader.REPLY_CHECKSUM_OFFSET), request.RequestChecksum);
+        BinaryPrimitives.WriteUInt64LittleEndian(reply.AsSpan(VsrHeader.REPLY_INCARNATION_OFFSET), request.Context.Incarnation);
+        if (VsrHeader.ReadCommitted(reply))
+        {
+            var commit = BinaryPrimitives.ReadUInt64LittleEndian(reply.AsSpan(VsrHeader.REPLY_COMMIT_OFFSET));
+            commit = Math.Max(1, commit);
+            BinaryPrimitives.WriteUInt64LittleEndian(reply.AsSpan(VsrHeader.REPLY_COMMIT_OFFSET), commit);
+            BinaryPrimitives.WriteUInt64LittleEndian(reply.AsSpan(VsrHeader.REPLY_OP_OFFSET), commit);
+        }
+    }
+
+    /// <summary>The roster a standalone server reports: itself, as the leader.</summary>
+    internal static byte[] StandaloneRoster(ushort port)
+    {
+        var body = new List<byte>();
+        WriteString(body, "standalone");
+        body.AddRange(BitConverter.GetBytes(1u));
+        WriteNode(body, port, true);
+        return Reply(OPERATION_NON_REPLICATED, body.ToArray());
+    }
+
+    internal static byte[] RouteReply(MockRequest request, PartitionContext context, byte primaryReplica,
+        uint partitionsCount = 1, uint view = 0)
+    {
+        var body = new byte[PartitionRoute.ENCODED_SIZE];
+        BinaryPrimitives.WriteUInt64LittleEndian(body, context.Incarnation);
+        BinaryPrimitives.WriteUInt64LittleEndian(body.AsSpan(8), context.MetadataOp);
+        BinaryPrimitives.WriteUInt32LittleEndian(body.AsSpan(16), view);
+        BinaryPrimitives.WriteUInt32LittleEndian(body.AsSpan(20), partitionsCount);
+        body[24] = primaryReplica;
+        return Reply(OPERATION_NON_REPLICATED, body);
+    }
+
+    /// <summary>A SyncConsumerGroup reply body: the assignment generation and the member's partitions.</summary>
+    internal static byte[] AssignmentBody(ulong generation, uint[] partitions)
+    {
+        var body = new byte[12 + partitions.Length * 4];
+        BinaryPrimitives.WriteUInt64LittleEndian(body.AsSpan(0, 8), generation);
+        BinaryPrimitives.WriteUInt32LittleEndian(body.AsSpan(8, 4), (uint)partitions.Length);
+        for (var index = 0; index < partitions.Length; index++)
+        {
+            BinaryPrimitives.WriteUInt32LittleEndian(body.AsSpan(12 + index * 4, 4), partitions[index]);
+        }
+
+        return body;
+    }
+
+    internal static void WriteNode(List<byte> body, ushort port, bool leader, byte replicaId = 0)
+    {
+        body.Add(replicaId);
+        WriteString(body, $"node-{port}");
+        WriteString(body, "127.0.0.1");
+        body.AddRange(BitConverter.GetBytes(port));
+        body.AddRange(new byte[6]);
+        body.Add(leader ? (byte)0 : (byte)1);
+        body.Add(0);
+    }
+
+    internal static void WriteString(List<byte> body, string value)
+    {
+        var bytes = Encoding.UTF8.GetBytes(value);
+        body.AddRange(BitConverter.GetBytes((uint)bytes.Length));
+        body.AddRange(bytes);
     }
 
     /// <summary>
@@ -98,7 +180,9 @@ internal static class MockFrames
 internal readonly record struct MockRequest(byte Operation, int Code, ulong RequestId)
 {
     internal UInt128 ClientId { get; init; }
+    internal UInt128 RequestChecksum { get; init; }
     internal ulong Session { get; init; }
+    internal PartitionContext Context { get; init; }
     internal byte[] Body { get; init; } = [];
 }
 
@@ -142,6 +226,17 @@ internal sealed class MockNode : IDisposable
         }
     }
 
+    public int ActiveConnections
+    {
+        get
+        {
+            lock (_accepted)
+            {
+                return _accepted.Count;
+            }
+        }
+    }
+
     public int Connections
     {
         get
@@ -153,7 +248,9 @@ internal sealed class MockNode : IDisposable
         }
     }
 
-    public void Serve(Func<MockRequest, byte[]> handler)
+    /// <param name="handler">Answers each request.</param>
+    /// <param name="beforeSend">Runs before each reply goes out. The reply waits until its task ends.</param>
+    public void Serve(Func<MockRequest, byte[]> handler, Func<MockRequest, byte[], Task>? beforeSend = null)
     {
         _ = Task.Run(async () =>
         {
@@ -175,7 +272,7 @@ internal sealed class MockNode : IDisposable
                     _connections++;
                 }
 
-                _ = Task.Run(() => Exchange(connection, handler));
+                _ = Task.Run(() => Exchange(connection, handler, beforeSend));
             }
         });
     }
@@ -201,7 +298,8 @@ internal sealed class MockNode : IDisposable
         Kill();
     }
 
-    private async Task Exchange(TcpClient connection, Func<MockRequest, byte[]> handler)
+    private async Task Exchange(TcpClient connection, Func<MockRequest, byte[]> handler,
+        Func<MockRequest, byte[], Task>? beforeSend)
     {
         try
         {
@@ -218,8 +316,10 @@ internal sealed class MockNode : IDisposable
                     BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(REQUEST_RESERVED_OFFSET, 4)),
                     BinaryPrimitives.ReadUInt64LittleEndian(header.AsSpan(REQUEST_ID_OFFSET, 8)))
                 {
-                    ClientId = BinaryPrimitives.ReadUInt128LittleEndian(header.AsSpan(128)),
+                    ClientId = BinaryPrimitives.ReadUInt128LittleEndian(header.AsSpan(VsrHeader.REQUEST_CLIENT_OFFSET)),
+                    RequestChecksum = BinaryPrimitives.ReadUInt128LittleEndian(header.AsSpan(VsrHeader.REQUEST_CHECKSUM_OFFSET)),
                     Session = BinaryPrimitives.ReadUInt64LittleEndian(header.AsSpan(184)),
+                    Context = BinaryMapper.MapPartitionContext(header.AsSpan(REQUEST_CONTEXT_OFFSET)),
                     Body = body
                 };
                 lock (_recorded)
@@ -237,8 +337,11 @@ internal sealed class MockNode : IDisposable
                 }
 
                 var reply = handler(request);
-                BinaryPrimitives.WriteUInt64LittleEndian(reply.AsSpan(REPLY_REQUEST_ID_OFFSET, 8),
-                    request.RequestId);
+                CorrelateReply(request, reply);
+                if (beforeSend is not null)
+                {
+                    await beforeSend(request, reply);
+                }
                 await stream.WriteAsync(reply);
                 await stream.FlushAsync();
             }
@@ -246,6 +349,14 @@ internal sealed class MockNode : IDisposable
         catch (Exception)
         {
             // A killed node and a client that went away look the same here.
+        }
+        finally
+        {
+            connection.Dispose();
+            lock (_accepted)
+            {
+                _accepted.Remove(connection);
+            }
         }
     }
 

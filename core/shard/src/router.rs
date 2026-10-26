@@ -107,7 +107,7 @@ where
                 // never acked, and every later prepare dies on the resulting
                 // gap while quorum hides the outage. Repair wraps the same
                 // typed header, so it cannot rescue this node either -- only
-                // upgrading it can. A routed request, by contrast, is dropped
+                // aligning the releases can. A routed request, by contrast, is dropped
                 // before journaling and stalls nothing; the consequence in the
                 // log follows the frame. Nothing fences the sending peer, so
                 // the log and the counter are the whole signal an operator
@@ -119,7 +119,7 @@ where
                 let consequence = match command {
                     Command::Prepare | Command::RepairPrepare | Command::PrepareOk => {
                         "this node cannot journal or ack it, so its consensus group stops \
-                         making progress until this node is upgraded"
+                         making progress until the releases are aligned"
                     }
                     _ => "the frame is dropped before journaling, with no reply to the sender",
                 };
@@ -130,8 +130,8 @@ where
                     build_release = %iggy_binary_protocol::ProtocolVersion(
                         iggy_binary_protocol::IGGY_PROTOCOL_VERSION
                     ),
-                    "frame carries an operation this build does not know; a newer release \
-                     likely added it. {consequence}"
+                    "frame carries an operation this build does not know; the sender likely \
+                     runs another release. {consequence}"
                 );
                 return;
             }
@@ -394,16 +394,13 @@ where
                     // offers live on every shard that hosts a serving group --
                     // parked behind the shard-0 gate they would never expire.
                     self.expire_idle_state_transfer_offers();
-                    // While a cooperative revocation is pending, wake the
-                    // reconciler each tick so the handoff completes within ~one
-                    // tick of the partition draining, not the periodic pass.
-                    if self
-                        .plane
-                        .metadata()
-                        .mux_stm
-                        .streams()
-                        .has_pending_revocations()
-                    {
+                    // A drain completes without an event, so a pending
+                    // revocation wakes the reconciler each tick. A published
+                    // fence wakes it once, and retries of an unpublished one
+                    // stay on its periodic pass.
+                    let fence_published = self.plane.partitions().take_fence_published();
+                    let streams = self.plane.metadata().mux_stm.streams();
+                    if fence_published || streams.has_pending_revocations() {
                         self.dispatch_metadata_commit_tick();
                     }
                     // A dropped `ReconcileApply` marker (full inbox at
@@ -946,20 +943,17 @@ where
             }
             LifecycleFrame::ForwardClientSend { client_id, msg } => {
                 if let Err(e) = self.bus.send_to_client(client_id, msg).await {
-                    // Terminal per `SendError` docs: the client never
-                    // receives the reply and request / response semantics
-                    // break above the bus. Bump the receiver-side counter
-                    // (sender side already bumps in `builder.rs`) and raise
-                    // to `warn!` so it surfaces in default operator logs.
+                    // The production bus refuses every frame sent by id, so
+                    // this is the expected outcome there, not a fault.
                     self.metrics.record_frame_drop(
                         frame_drop_variant::FORWARD_CLIENT_SEND,
                         frame_drop_reason::DELIVERY_FAILED,
                     );
-                    tracing::warn!(
+                    tracing::debug!(
                         shard = self.id,
                         client_id,
                         error = ?e,
-                        "forward-client-send delivery failed"
+                        "staged client deny has no route by client id"
                     );
                 }
             }
@@ -1018,6 +1012,19 @@ where
                         "metadata commit tick received before reconciler handler installed; dropping"
                     );
                 }
+            }
+            LifecycleFrame::PartitionPlacementViews(reports) => {
+                if self.id == 0 {
+                    self.plane.metadata().observe_partition_views(&reports);
+                } else {
+                    self.metrics.record_frame_drop(
+                        frame_drop_variant::PARTITION_PLACEMENT_VIEWS,
+                        frame_drop_reason::MISROUTED,
+                    );
+                }
+            }
+            LifecycleFrame::PrimaryRebalance(frame) => {
+                self.on_local_rebalance(*frame).await;
             }
             LifecycleFrame::PartitionPersistenceCompleted(completion) => {
                 let namespace = IggyNamespace::from_raw(completion.group);
@@ -1103,120 +1110,6 @@ where
                     }
                 }
             }
-            LifecycleFrame::PurgePartition {
-                namespace,
-                generation,
-            } => {
-                // Pump-side enforcement of a committed `PurgeTopic`: reset the
-                // partition to empty at offset 0 and clear consumer offsets.
-                // Idempotent per generation -- skip if already applied so a
-                // redundant reconcile pass does not wipe messages sent since.
-                let config = self.plane.partitions().config().clone();
-                if let Some(partition) = self.plane.partitions().get_mut_by_ns(&namespace)
-                    && partition.applied_purge_generation() < generation
-                {
-                    match partition.purge(&config, generation).await {
-                        Err(partitions::PurgeError::Pending) => {}
-                        Ok(()) => {
-                            // The purge unlinked the very bytes this shard is
-                            // serving: the cached offer still advertises the
-                            // pre-purge manifest and the payload cache can
-                            // answer chunk requests for it without touching
-                            // disk, so a puller would install purged data. Both
-                            // are keyed on pre-purge content, so neither can
-                            // notice on its own.
-                            self.drop_partition_transfer_state(namespace, partition);
-                            tracing::debug!(
-                                shard = self.id,
-                                namespace_raw = namespace.inner(),
-                                generation,
-                                "purge-partition reset partition to empty"
-                            );
-                        }
-                        Err(partitions::PurgeError::FrontierNotRecorded) => {
-                            // NOT fenced: nothing was mutated, so the chain is
-                            // whole and `applied_purge_generation` is unmoved,
-                            // which means the reconciler's `committed > applied`
-                            // gate still sees this purge as outstanding.
-                            // Fencing here would quarantine live data, and the
-                            // fence's own frontier write would first stamp the
-                            // pre-purge counter the purge was about to reset.
-                            //
-                            // NOT woken: staging a purge counts as work in the
-                            // pass, which keeps the fast-skip disarmed, so the
-                            // ordinary periodic pass re-issues until one lands
-                            // and stops once `applied` catches `committed`. An
-                            // eager wake here closes a loop with no pacing in
-                            // it at all -- pass, stage, defer, wake -- and on a
-                            // disk that refuses instantly that is a full O(N)
-                            // reconcile scan and a real `atomic_replace`
-                            // attempt per turn, holding the partition write
-                            // lock each time.
-                            tracing::warn!(
-                                shard = self.id,
-                                namespace_raw = namespace.inner(),
-                                generation,
-                                "purge-partition deferred: could not record the frontier reset; \
-                                 the reconciler re-issues it while the generation stays unapplied"
-                            );
-                        }
-                        Err(error @ partitions::PurgeError::GenerationNotRecorded(_)) => {
-                            // NOT fenced: the wipe ran and a fresh chain is
-                            // planted, so the partition is serviceable; only
-                            // the durable record failed, which leaves
-                            // `applied_purge_generation` unmoved and the
-                            // reconciler re-issuing the purge, which redoes
-                            // only the record.
-                            // Same pacing argument as the frontier deferral
-                            // above; the caches already describe wiped bytes.
-                            self.drop_partition_transfer_state(namespace, partition);
-                            tracing::warn!(
-                                shard = self.id,
-                                namespace_raw = namespace.inner(),
-                                generation,
-                                %error,
-                                "purge-partition deferred: reset applied but the generation \
-                                 record failed; the reconciler re-issues it"
-                            );
-                        }
-                        Err(error @ partitions::PurgeError::OffsetsNotDurable(_)) => {
-                            // The chain is serviceable, but the unlinks of the
-                            // offset files may not be durable, and no retried
-                            // sync can prove them. Fence it like the arm below,
-                            // so the rebuild replaces those files.
-                            tracing::error!(
-                                shard = self.id,
-                                namespace_raw = namespace.inner(),
-                                generation,
-                                %error,
-                                "purge-partition could not sync an offsets dir; fencing it for rebuild"
-                            );
-                            self.drop_partition_transfer_state(namespace, partition);
-                            self.fence_partition_for_rebuild(namespace, partition, None);
-                        }
-                        Err(error @ partitions::PurgeError::Unserviceable(_)) => {
-                            // Past the drain, so this group has no serviceable
-                            // chain and the next append panics on
-                            // `active_segment()`. Fence it for rebuild, exactly
-                            // as a failed state-transfer convergence does. The
-                            // counters were already reset to 0 before the
-                            // fallible plant, so the fence's advancing write
-                            // records the post-purge frontier.
-                            tracing::error!(
-                                shard = self.id,
-                                namespace_raw = namespace.inner(),
-                                generation,
-                                %error,
-                                "purge-partition failed to reset partition; fencing it for rebuild"
-                            );
-                            // Fenced, but the caches still describe the
-                            // pre-purge bytes until the rebuild lands.
-                            self.drop_partition_transfer_state(namespace, partition);
-                            self.fence_partition_for_rebuild(namespace, partition, None);
-                        }
-                    }
-                }
-            }
         }
     }
 
@@ -1280,10 +1173,15 @@ enum ReplicaHandshakeOutcome {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::partition_placement_tests::owner;
+    use crate::{build_deny_reply_from_request_header, shard_channel};
+    use iggy_binary_protocol::RoutedRequestHeader;
     use iggy_binary_protocol::{
         Command, ConsensusError, GenericHeader, HEADER_SIZE, PrepareHeader,
         prepare_identity_checksum_bytes,
     };
+    use iggy_common::IggyError;
     use server_common::iobuf::Owned;
     use server_common::{MESSAGE_ALIGN, Message, MessageBag};
     use std::mem::offset_of;
@@ -1350,6 +1248,180 @@ mod tests {
              InvalidBitPattern as corruption, and dispatch drops both with only a warn log, \
              no operator signal and no upgrade fence, so an old node in a mixed cluster \
              gap-stops its consensus group while quorum hides it; got {error:?}"
+        );
+    }
+    #[compio::test]
+    async fn given_no_reply_owner_when_forwarded_client_send_arrives_should_not_fire_http_slot() {
+        const CLIENT: u128 = 41;
+        const REQUEST: u64 = 7;
+        let (shard, _) = owner(0);
+        shard.bus.clients().insert_in_process(CLIENT).unwrap();
+        let (_slot, mut reply) = shard
+            .bus
+            .clients()
+            .install_reply_slot(CLIENT, REQUEST)
+            .unwrap();
+        let header = RoutedRequestHeader {
+            client: CLIENT,
+            request: REQUEST,
+            ..Default::default()
+        };
+        let message = build_deny_reply_from_request_header(
+            &header,
+            IggyError::TransientNotAccepted.as_code(),
+        );
+        shard
+            .process_frame(ShardFrame::lifecycle(LifecycleFrame::ForwardClientSend {
+                client_id: CLIENT,
+                msg: message.into_generic().into_frozen().into(),
+            }))
+            .await;
+        assert!(
+            matches!(reply.try_recv(), Ok(None)),
+            "an originless forwarded reply must not fill an HTTP slot"
+        );
+    }
+
+    #[compio::test]
+    async fn given_no_reply_owner_when_shard_denies_tombstoned_partition_should_not_fire_http_slot()
+    {
+        const CLIENT: u128 = 42;
+        const REQUEST: u64 = 8;
+        let (shard, _) = owner(0);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        shard.plane.partitions().tombstone(namespace);
+        shard.bus.clients().insert_in_process(CLIENT).unwrap();
+        let (_slot, mut reply) = shard
+            .bus
+            .clients()
+            .install_reply_slot(CLIENT, REQUEST)
+            .unwrap();
+        let request = Message::<RoutedRequestHeader>::new(size_of::<RoutedRequestHeader>())
+            .transmute_header(|_, header: &mut RoutedRequestHeader| {
+                header.command = Command::Request;
+                header.operation = Operation::SendMessages;
+                header.client = CLIENT;
+                header.session = 1;
+                header.request = REQUEST;
+                header.group = namespace.inner();
+                header.size = u32::try_from(size_of::<RoutedRequestHeader>()).unwrap();
+            });
+        shard.on_message(MessageBag::Request(request)).await;
+        assert!(
+            matches!(reply.try_recv(), Ok(None)),
+            "a tombstone denial without its owner must not fill an HTTP slot"
+        );
+    }
+
+    #[compio::test]
+    async fn given_no_reply_owner_when_shard_denies_unroutable_request_should_not_fire_http_slot() {
+        const CLIENT: u128 = 43;
+        const REQUEST: u64 = 9;
+        let (shard, _) = owner(0);
+        shard.bus.clients().insert_in_process(CLIENT).unwrap();
+        let (_slot, mut reply) = shard
+            .bus
+            .clients()
+            .install_reply_slot(CLIENT, REQUEST)
+            .unwrap();
+        let request = Message::<RoutedRequestHeader>::new(size_of::<RoutedRequestHeader>())
+            .transmute_header(|_, header: &mut RoutedRequestHeader| {
+                header.command = Command::Request;
+                header.operation = Operation::NonReplicated;
+                header.client = CLIENT;
+                header.request = REQUEST;
+                header.size = u32::try_from(size_of::<RoutedRequestHeader>()).unwrap();
+            });
+        shard.on_message(MessageBag::Request(request)).await;
+        assert!(
+            matches!(reply.try_recv(), Ok(None)),
+            "an unroutable denial without its owner must not fill an HTTP slot"
+        );
+    }
+
+    #[compio::test]
+    async fn given_carried_reply_when_partition_is_tombstoned_or_park_buffer_full_should_answer_owner()
+     {
+        const CLIENT: u128 = 45;
+        const REQUEST: u64 = 11;
+        for tombstoned in [false, true] {
+            let (shard, _) = owner(0);
+            let namespace = IggyNamespace::new(0, 0, 0);
+            shard.bus.clients().insert_in_process(CLIENT).unwrap();
+            let (_slot, mut unrelated) = shard
+                .bus
+                .clients()
+                .install_reply_slot(CLIENT, REQUEST)
+                .unwrap();
+            let request = Message::<RoutedRequestHeader>::new(size_of::<RoutedRequestHeader>())
+                .transmute_header(|_, header: &mut RoutedRequestHeader| {
+                    header.command = Command::Request;
+                    header.operation = Operation::SendMessages;
+                    header.client = CLIENT;
+                    header.session = 1;
+                    header.request = REQUEST;
+                    header.group = namespace.inner();
+                    header.size = u32::try_from(size_of::<RoutedRequestHeader>()).unwrap();
+                });
+            if tombstoned {
+                shard.plane.partitions().tombstone(namespace);
+            } else {
+                for _ in 0..crate::MAX_PARKED_PER_NAMESPACE {
+                    shard.on_message(MessageBag::Request(request.clone())).await;
+                }
+                assert_eq!(
+                    shard.parked_frame_count(namespace),
+                    crate::MAX_PARKED_PER_NAMESPACE
+                );
+            }
+            let (reply, receiver) = crate::channel(1);
+            shard
+                .process_frame(ShardFrame::lifecycle(LifecycleFrame::PartitionSubmit {
+                    request,
+                    reply,
+                    attachment: None,
+                }))
+                .await;
+            let response = receiver
+                .try_recv()
+                .expect("the carried receiver is answered immediately")
+                .expect("a concrete denial")
+                .try_into_typed::<iggy_binary_protocol::ReplyHeader>()
+                .unwrap();
+            assert_eq!(
+                response.header().status,
+                IggyError::TransientNotAccepted.as_code()
+            );
+            assert!(
+                matches!(unrelated.try_recv(), Ok(None)),
+                "the same client/request pair does not confer slot ownership"
+            );
+        }
+    }
+
+    #[compio::test]
+    async fn given_no_reply_owner_when_shard_stages_deny_should_not_fire_http_slot() {
+        const CLIENT: u128 = 44;
+        const REQUEST: u64 = 10;
+        let (mut shard, _) = owner(0);
+        let (sender, _inbox, replies) = shard_channel(0, 1, 1);
+        shard.attach_senders(vec![sender]);
+        shard.bus.clients().insert_in_process(CLIENT).unwrap();
+        let (_slot, mut reply) = shard
+            .bus
+            .clients()
+            .install_reply_slot(CLIENT, REQUEST)
+            .unwrap();
+        let header = RoutedRequestHeader {
+            client: CLIENT,
+            request: REQUEST,
+            ..Default::default()
+        };
+        assert!(shard.stage_transient_deny(&header));
+        shard.process_frame(replies.recv().await.unwrap()).await;
+        assert!(
+            matches!(reply.try_recv(), Ok(None)),
+            "a staged denial without its owner must not fill an HTTP slot"
         );
     }
 }

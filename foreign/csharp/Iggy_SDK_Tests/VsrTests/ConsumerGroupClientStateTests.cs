@@ -94,7 +94,7 @@ public sealed class ConsumerGroupClientStateTests
         state.RegisterGroup(Key, Identifier.Numeric(1), Identifier.Numeric(2), Identifier.Numeric(3));
         state.SetAssignment(Key, 1, []);
 
-        Assert.True(state.HasAssignment(Key));
+        Assert.False(state.HasAssignment(Key));
         Assert.Null(state.NextGroupPartition(Key));
         Assert.True(state.IsRegistered(Key));
 
@@ -107,7 +107,7 @@ public sealed class ConsumerGroupClientStateTests
     public void HasAssignment_ExpiresAfterTheRefreshInterval()
     {
         var state = new ConsumerGroupClientState();
-        state.SetAssignment(Key, 1, []);
+        state.SetAssignment(Key, 1, [0]);
         var now = Environment.TickCount64;
 
         Assert.True(state.HasAssignment(Key, now));

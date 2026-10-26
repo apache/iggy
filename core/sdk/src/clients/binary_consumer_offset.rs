@@ -19,10 +19,20 @@ use crate::prelude::IggyClient;
 use async_trait::async_trait;
 use iggy_common::ConsumerOffsetClient;
 use iggy_common::locking::IggyRwLockFn;
-use iggy_common::{Consumer, ConsumerOffsetInfo, Identifier, IggyError};
+use iggy_common::{Consumer, ConsumerOffsetInfo, ConsumerPosition, Identifier, IggyError};
 
 #[async_trait]
 impl ConsumerOffsetClient for IggyClient {
+    async fn store_consumer_position(
+        &self,
+        consumer: &Consumer,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        position: ConsumerPosition,
+    ) -> Result<(), IggyError> {
+        super::with_client!(self, client => client.store_consumer_position(consumer, stream_id, topic_id, position).await)
+    }
+
     async fn store_consumer_offset(
         &self,
         consumer: &Consumer,
@@ -31,11 +41,7 @@ impl ConsumerOffsetClient for IggyClient {
         partition_id: Option<u32>,
         offset: u64,
     ) -> Result<(), IggyError> {
-        self.client
-            .read()
-            .await
-            .store_consumer_offset(consumer, stream_id, topic_id, partition_id, offset)
-            .await
+        super::with_client!(self, client => client.store_consumer_offset(consumer, stream_id, topic_id, partition_id, offset).await)
     }
 
     async fn get_consumer_offset(
@@ -45,11 +51,7 @@ impl ConsumerOffsetClient for IggyClient {
         topic_id: &Identifier,
         partition_id: Option<u32>,
     ) -> Result<Option<ConsumerOffsetInfo>, IggyError> {
-        self.client
-            .read()
-            .await
-            .get_consumer_offset(consumer, stream_id, topic_id, partition_id)
-            .await
+        super::with_client!(self, client => client.get_consumer_offset(consumer, stream_id, topic_id, partition_id).await)
     }
 
     async fn delete_consumer_offset(
@@ -59,10 +61,6 @@ impl ConsumerOffsetClient for IggyClient {
         topic_id: &Identifier,
         partition_id: Option<u32>,
     ) -> Result<(), IggyError> {
-        self.client
-            .read()
-            .await
-            .delete_consumer_offset(consumer, stream_id, topic_id, partition_id)
-            .await
+        super::with_client!(self, client => client.delete_consumer_offset(consumer, stream_id, topic_id, partition_id).await)
     }
 }

@@ -296,7 +296,7 @@ pub struct ClusterConfig {
     #[serde_as(as = "DisplayFromStr")]
     #[config_env(leaf)]
     pub repair_gap_debounce_interval: IggyDuration,
-    /// Prepares a peer serves per repair round before the requester walks to
+    /// Prepares a peer serves per repair round before the requester asks for
     /// the next chunk. Each frame rides the per-peer message-bus queue, so this
     /// must stay below `message_bus.peer_queue_capacity` or a full round
     /// overruns the queue and silently drops frames (enforced at the top
@@ -308,10 +308,14 @@ pub struct ClusterConfig {
     /// Applies per plane: the metadata superblock, and each PARTITION's own. While
     /// wedged the group is already fenced quorum-invisible and peers elect around
     /// it; this converts the log-only limp into a distinct exit status a
-    /// supervisor can act on. Zero (and the `0` /
-    /// `disabled` / `unlimited` sentinels, which all parse to zero) disables
-    /// the fail-stop; nonzero values below
-    /// `MIN_SUPERBLOCK_WEDGED_FATAL_TIMEOUT` are rejected at boot.
+    /// supervisor can act on. It is also the deadline of each running
+    /// partition file job (`sharding.partition_io_capacity`), counted in pump
+    /// ticks. Expiry fences the partition that owns the job and stops the
+    /// node, and the timed-out job keeps its slot and allocation charge until
+    /// shutdown. Zero (and the `0` / `disabled` / `unlimited` sentinels, which
+    /// all parse to zero) disables both the fail-stop and the file-job
+    /// deadline; nonzero values below `MIN_SUPERBLOCK_WEDGED_FATAL_TIMEOUT` are
+    /// rejected at boot.
     #[serde(default = "default_superblock_wedged_fatal_timeout")]
     #[serde_as(as = "DisplayFromStr")]
     #[config_env(leaf)]
@@ -848,20 +852,31 @@ impl fmt::Display for AdvertisedAddressError {
 
 impl std::error::Error for AdvertisedAddressError {}
 
-/// Whether cluster-wide JWT key material exists: a configured `http.jwt`
-/// secret, or the signing key derived from the cluster PSK. When it does, a
-/// bearer minted on any node verifies on every node - the invariant
-/// follower-to-primary HTTP forwarding depends on. Callers gate `http.enabled`
-/// themselves; this covers only the key material.
+/// The cluster-wide JWT key material, when it exists: a configured `http.jwt`
+/// secret, else the cluster PSK the signing key derives from - the precedence
+/// the JWT manager applies. With it, a bearer minted on any node verifies on
+/// every node - the invariant follower-to-primary HTTP forwarding depends on.
+/// The key that proves a relay comes from a node derives from the same
+/// material, so relay proofs verify exactly where bearers do. Callers gate
+/// `http.enabled` themselves; this covers only the key material.
 ///
 /// Forwarding targets resolve from the roster (`ip:ports.http`); the config
 /// validator unconditionally requires a roster port for every enabled
 /// transport, so a forward never dials a node without a declared http port.
-pub fn http_forwarding_key_material(jwt: &HttpJwtConfig, cluster: &ClusterConfig) -> bool {
-    cluster.enabled
-        && ((cluster.auth.enabled && !cluster.auth.shared_secret.is_empty())
-            || !jwt.encoding_secret.is_empty()
-            || !jwt.decoding_secret.is_empty())
+pub fn http_forwarding_key_material<'a>(
+    jwt: &'a HttpJwtConfig,
+    cluster: &'a ClusterConfig,
+) -> Option<&'a str> {
+    if !cluster.enabled {
+        return None;
+    }
+    let psk = (cluster.auth.enabled && !cluster.auth.shared_secret.is_empty())
+        .then_some(&cluster.auth.shared_secret);
+    [&jwt.encoding_secret, &jwt.decoding_secret]
+        .into_iter()
+        .find(|secret| !secret.is_empty())
+        .or(psk)
+        .map(String::as_str)
 }
 
 impl Validatable<ConfigurationError> for ClusterConfig {
@@ -1569,6 +1584,25 @@ mod tests {
             "selector env expansion must stop at max_elements = 16"
         );
     }
+
+    #[test]
+    fn advertised_addresses_env_template_keeps_each_vector_limit() {
+        let template = <ClusterConfig as configs::ConfigEnvMappings>::env_templates()
+            .iter()
+            .find(|template| template.env_name == "NODES_<N>_ADVERTISED_ADDRESSES_<N>_CLIENT_CIDR")
+            .expect("advertised address template");
+
+        assert_eq!(template.max_elements, &[256, 16]);
+
+        let mapping = <ClusterConfig as configs::ConfigEnvMappings>::env_mappings()
+            .iter()
+            .find(|mapping| mapping.env_name == "NODES_3_ADVERTISED_ADDRESSES_7_CLIENT_CIDR")
+            .expect("expanded advertised address mapping");
+        assert_eq!(
+            mapping.config_path,
+            "nodes.3.advertised_addresses.7.client_cidr"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1922,6 +1956,40 @@ mod cluster_validate_tests {
             tls: ClusterTlsConfig::default(),
             coordinator: ClusterCoordinatorConfig::default(),
         }
+    }
+
+    /// Every node must pick the same material, or nodes refuse each other's
+    /// relay proofs: the secret the JWT manager signs with, else the PSK.
+    #[test]
+    fn given_jwt_secrets_and_a_psk_when_choosing_key_material_should_follow_the_jwt_signing_secret()
+    {
+        let jwt = |encoding: &str, decoding: &str| HttpJwtConfig {
+            encoding_secret: encoding.to_owned(),
+            decoding_secret: decoding.to_owned(),
+            ..HttpJwtConfig::default()
+        };
+        let mut cluster = cfg(Vec::new());
+        cluster.auth = ClusterAuthConfig {
+            enabled: true,
+            shared_secret: "psk".to_owned(),
+            previous_shared_secret: String::new(),
+        };
+        let material = |jwt: &HttpJwtConfig, cluster: &ClusterConfig| {
+            http_forwarding_key_material(jwt, cluster).map(str::to_owned)
+        };
+        assert_eq!(
+            material(&jwt("enc", "dec"), &cluster).as_deref(),
+            Some("enc")
+        );
+        assert_eq!(material(&jwt("", "dec"), &cluster).as_deref(), Some("dec"));
+        assert_eq!(material(&jwt("", ""), &cluster).as_deref(), Some("psk"));
+
+        cluster.auth.enabled = false;
+        assert_eq!(material(&jwt("", ""), &cluster), None);
+        assert_eq!(material(&jwt("enc", ""), &cluster).as_deref(), Some("enc"));
+
+        cluster.enabled = false;
+        assert_eq!(material(&jwt("enc", "dec"), &cluster), None);
     }
 
     #[test]

@@ -35,6 +35,8 @@ use server_common::poll::PollHistoryId;
 use server_common::send_messages::{BatchIntegrity, COMMAND_HEADER_SIZE};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use tracing::{error, warn};
 
 /// Byte cap for materializing a sealed segment's sparse index into its shared
@@ -72,10 +74,11 @@ pub enum PartitionDirResolution {
 /// on the first sealed poll and are reused after. On retention retirement the
 /// pump just drops its handle: the state frees once any in-flight poll holding
 /// a clone finishes, and a cached fd meanwhile reads the unlinked inode, which
-/// is consistent because retired paths are never recreated. A purge instead
-/// wipes the slots in place (`SegmentedLog::invalidate_sealed_read_state`):
-/// it recreates the same paths, so a clone surviving in a suspended walk must
-/// re-open by path and observe the fresh files rather than serve purged data.
+/// is consistent because retired paths are never recreated. An install or a
+/// converge instead wipes the slots in place
+/// (`SegmentedLog::invalidate_sealed_read_state`): it recreates the same paths,
+/// so a clone surviving in a suspended walk must re-open by path and observe
+/// the fresh files rather than serve replaced data.
 /// The active segment uses the [`Self::fd`] slot only: it grows under the
 /// reader, so a size-derived memo on it would go stale, and its slot sits
 /// outside the sealed LRU (`SegmentedLog::reset_read_state` drops it wherever
@@ -105,8 +108,9 @@ pub struct SealedSegmentReadState {
     /// inside `[offset, valid_until)` with zero index-file reads. Only the
     /// too-large-to-materialize index path consults it (a resident
     /// [`Self::index`] already resolves in memory). Sealed segments are
-    /// immutable, so the memo cannot go stale; the one exception is a purge
-    /// recreating the same paths, which wipes this slot with the others.
+    /// immutable, so the memo cannot go stale; the one exception is an install
+    /// or a converge recreating the same paths, which wipes this slot with the
+    /// others.
     /// Timestamp polls bypass it.
     pub(crate) offset_cursor: Cell<Option<SealedOffsetCursor>>,
 }
@@ -175,6 +179,10 @@ pub struct PollContext {
     /// For nonempty results, whether to advance the stored offset locally.
     /// Group `last_polled` progress also advances when this is false.
     pub(crate) auto_commit: bool,
+    pub(crate) owner:
+        Option<iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner>,
+    /// Keeps drain evidence incomplete until this read is accepted or dropped.
+    pub(crate) _group_poll: Option<Arc<AtomicBool>>,
 }
 
 /// An owned read result awaiting validation by the partition owner.
@@ -501,11 +509,18 @@ impl DiskReadPlan {
         }
         let partition_dir = match &self.partition_dir {
             PartitionDirResolution::Resolved(dir) => dir.as_str(),
-            // Simulated in-memory persistence: no files exist, so this is not
-            // an IO fault on present data. `Empty` lets the caller serve the
-            // resident journal tier (the sim's only tier) without skipping
-            // anything.
-            PartitionDirResolution::NoFiles => return DiskReadOutcome::Empty,
+            // Simulated in-memory persistence: no files exist. Until a flush
+            // persists anything, the journal is the only tier and `Empty` lets
+            // the caller serve it without skipping anything. A flush evicts
+            // what it persisted from the journal, and those bytes cannot be
+            // read back, so the journal-forward would skip them: fail closed.
+            PartitionDirResolution::NoFiles => {
+                return if self.segments.iter().any(|segment| segment.persisted > 0) {
+                    DiskReadOutcome::Faulted
+                } else {
+                    DiskReadOutcome::Empty
+                };
+            }
             // File-backed data exists but the dir was unresolvable at plan
             // time (mid-rotation). Fail-closed like an IO fault: the
             // journal-forward would splice resident ops over the hidden
@@ -1362,6 +1377,8 @@ mod tests {
         let resident_plan = PollPlan {
             commit_offset: partition_commit_offset,
             context: PollContext {
+                owner: None,
+                _group_poll: None,
                 history: snapshot_history,
                 consumer: PollingConsumer::Consumer(consumer_id, partition_id),
                 auto_commit: true,
@@ -1389,6 +1406,8 @@ mod tests {
         let empty_plan = PollPlan {
             commit_offset: 9,
             context: PollContext {
+                owner: None,
+                _group_poll: None,
                 history: PollHistoryId::default(),
                 consumer: PollingConsumer::Consumer(consumer_id, partition_id),
                 auto_commit: true,

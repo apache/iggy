@@ -17,6 +17,7 @@
 
 using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
+using System.Runtime.ExceptionServices;
 using System.Threading.Channels;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
@@ -48,16 +49,51 @@ public partial class IggyConsumer : IAsyncDisposable
     /// </summary>
     private const int NoAssignedPartitionBackoffMs = 100;
 
+    /// <summary>
+    ///     Delay after a failed poll, the default polling retry interval of the Rust consumer. Without it a client
+    ///     that keeps failing, for example while it is disconnected, is polled in a hot loop whenever
+    ///     <c>PollingIntervalMs</c> is zero.
+    /// </summary>
+    private const int PollRetryDelayMs = 1_000;
+    private const int OperationTimeoutMs = 30_000;
+
     private readonly Channel<ReceivedMessage> _channel;
     private readonly IIggyClient _client;
     private readonly IggyConsumerConfig _config;
+
+    /// <summary>
+    ///     Never disposed, like <see cref="_pollingSemaphore" />: a group rejoin that runs during
+    ///     <see cref="DisposeAsync" />, from a poll or from a state event, still releases it. A poll or a state event
+    ///     that takes it after the dispose started skips the rejoin.
+    /// </summary>
     private readonly SemaphoreSlim _connectionStateSemaphore = new(1, 1);
+
     private readonly EventAggregator<ConsumerErrorEventArgs> _consumerErrorEvents;
+    private readonly ConcurrentDictionary<uint, PartitionContext> _lastPolledContext = new();
     private readonly ConcurrentDictionary<uint, ulong> _lastPolledOffset = new();
     private readonly ILogger<IggyConsumer> _logger;
+
+    /// <summary>
+    ///     The poll that continues each partition after the last batch it delivered, under the context of that batch.
+    ///     The configured strategy only says where reading a partition starts, as in the Rust consumer. A
+    ///     continuation pinned to its context is refused by a recreated partition instead of reading a later offset
+    ///     of the new incarnation, and it never moves to another partition of a consumer group.
+    /// </summary>
+    private readonly ConcurrentDictionary<uint, PollingStrategy> _nextPollingStrategies = new();
+
+    /// <summary>
+    ///     Never disposed: a poll in flight during <see cref="DisposeAsync" /> still releases it, and a semaphore whose
+    ///     wait handle is never used holds nothing to free.
+    /// </summary>
     private readonly SemaphoreSlim _pollingSemaphore = new(1, 1);
+
     private readonly Channel<ReceivedRentedMessage> _rentedChannel;
     private string? _consumerGroupName;
+    private readonly object _deliveryGate = new();
+    private readonly Dictionary<uint, (ulong Offset, PartitionContext Context)> _deliveredOffsets = [];
+    private readonly Dictionary<uint, (ulong Offset, PartitionContext Context)> _storedOffsets = [];
+    private readonly SemaphoreSlim _offsetSemaphore = new(1, 1);
+    private readonly CancellationTokenSource _lifetime = new();
     private int _disposeState;
     private volatile bool _isInitialized;
     private volatile bool _joinedConsumerGroup;
@@ -72,6 +108,9 @@ public partial class IggyConsumer : IAsyncDisposable
 
     /// <summary>Whether this consumer has been initialized via <see cref="InitAsync" />.</summary>
     protected bool IsInitialized => _isInitialized;
+
+    /// <summary>Whether <see cref="DisposeAsync" /> has started. The receive loops end once it has.</summary>
+    private protected bool IsDisposed => Volatile.Read(ref _disposeState) == 1;
 
     /// <summary>
     ///     Initializes a new instance of the <see cref="IggyConsumer" /> class
@@ -96,65 +135,133 @@ public partial class IggyConsumer : IAsyncDisposable
     /// </summary>
     public async ValueTask DisposeAsync()
     {
-        if (Interlocked.Exchange(ref _disposeState, 1) == 1)
+        lock (_deliveryGate)
         {
-            return;
+            if (IsDisposed)
+            {
+                return;
+            }
+            Volatile.Write(ref _disposeState, 1);
         }
+        _lifetime.Cancel();
+        CompleteReceiveChannels();
+        await _connectionStateSemaphore.WaitAsync();
+        try
+        {
+            if (_isInitialized)
+            {
+                _client.UnsubscribeConnectionEvents(OnClientConnectionStateChangedAsync);
+            }
+            // Cancellation drains stores already in flight before the final checkpoint and leave.
+            await _offsetSemaphore.WaitAsync();
+            try
+            {
+                using var checkpoint = new CancellationTokenSource(OperationTimeoutMs);
+                if (_config.AutoCommitMode != AutoCommitMode.Disabled)
+                {
+                    foreach (var (partition, position) in _deliveredOffsets)
+                    {
+                        if (checkpoint.IsCancellationRequested)
+                        {
+                            break;
+                        }
+                        if (_storedOffsets.TryGetValue(partition, out var stored)
+                            && SamePartition(stored.Context, position.Context) && stored.Offset >= position.Offset)
+                        {
+                            continue;
+                        }
+                        try
+                        {
+                            await WithLaneRecoveryAsync(token => _client.StoreOffsetAsync(_config.Consumer,
+                                _config.StreamId, _config.TopicId, position.Offset, partition, position.Context, token),
+                                checkpoint.Token);
+                        }
+                        catch (Exception error)
+                        {
+                            _logger.LogWarning(error, "Failed to checkpoint consumed offset {Offset} for partition {PartitionId}",
+                                position.Offset, partition);
+                        }
+                    }
+                }
+            }
+            finally
+            {
+                _offsetSemaphore.Release();
+            }
+            if (!string.IsNullOrEmpty(_consumerGroupName) && _joinedConsumerGroup)
+            {
+                await LeaveConsumerGroupAsync(_consumerGroupName);
+                _joinedConsumerGroup = false;
+            }
+            if (_config.CreateIggyClient)
+            {
+                try
+                {
+                    try
+                    {
+                        if (_isInitialized)
+                        {
+                            await _client.LogoutUserAsync();
+                        }
+                    }
+                    finally
+                    {
+                        _client.Dispose();
+                    }
+                }
+                catch (Exception error)
+                {
+                    LogFailedToLogoutOrDispose(error);
+                }
+            }
+            _isInitialized = false;
+            _consumerErrorEvents.Clear();
+        }
+        finally
+        {
+            _connectionStateSemaphore.Release();
+        }
+    }
 
+    private protected virtual void CompleteReceiveChannels()
+    {
         _channel.Writer.TryComplete();
         _rentedChannel.Writer.TryComplete();
-
+        while (_channel.Reader.TryRead(out _)) { }
         while (_rentedChannel.Reader.TryRead(out var queued))
         {
             queued.Dispose();
         }
-
-        if (_isInitialized)
-        {
-            _client.UnsubscribeConnectionEvents(OnClientConnectionStateChangedAsync);
-        }
-
-        if (!string.IsNullOrEmpty(_consumerGroupName) && _isInitialized)
-        {
-            try
-            {
-                await _client.LeaveConsumerGroupAsync(_config.StreamId, _config.TopicId,
-                    Identifier.String(_consumerGroupName));
-
-                LogLeftConsumerGroup(_consumerGroupName);
-            }
-            catch (Exception e)
-            {
-                LogFailedToLeaveConsumerGroup(e, _consumerGroupName);
-            }
-        }
-
-        if (_config.CreateIggyClient)
-        {
-            try
-            {
-                try
-                {
-                    if (_isInitialized)
-                    {
-                        await _client.LogoutUserAsync();
-                    }
-                }
-                finally
-                {
-                    _client.Dispose();
-                }
-            }
-            catch (Exception e)
-            {
-                LogFailedToLogoutOrDispose(e);
-            }
-        }
-
-        _consumerErrorEvents.Clear();
-        _pollingSemaphore.Dispose();
-        _connectionStateSemaphore.Dispose();
     }
+
+    // Under AfterReceive a message counts as delivered once its loop body completes, in CommitDeliveredAsync.
+    private protected bool BeginDelivery(ulong offset, uint partition, PartitionContext context) =>
+        _config.AutoCommitMode == AutoCommitMode.AfterReceive ? !IsDisposed : RecordDelivery(offset, partition, context);
+
+    private bool RecordDelivery(ulong offset, uint partition, PartitionContext context)
+    {
+        lock (_deliveryGate)
+        {
+            if (IsDisposed)
+            {
+                return false;
+            }
+            if (!_deliveredOffsets.TryGetValue(partition, out var previous)
+                || !SamePartition(previous.Context, context) || previous.Offset < offset)
+            {
+                _deliveredOffsets[partition] = (offset, context);
+            }
+            return true;
+        }
+    }
+
+    private static bool SamePartition(PartitionContext first, PartitionContext second) =>
+        first.Incarnation == second.Incarnation && first.OwnerGeneration == second.OwnerGeneration;
+
+    private protected Task CommitDeliveredAsync(ulong offset, uint partition, PartitionContext context, CancellationToken ct) =>
+        RecordDelivery(offset, partition, context)
+            ? StoreOffsetCoreAsync(offset, partition, context, ct, afterReceive: true)
+            : Task.CompletedTask;
 
     /// <summary>
     ///     Initializes the consumer by logging in (if needed) and setting up consumer groups
@@ -162,16 +269,20 @@ public partial class IggyConsumer : IAsyncDisposable
     /// <param name="ct">Cancellation token</param>
     /// <exception cref="InvalidConsumerGroupNameException">Thrown when consumer group name is invalid</exception>
     /// <exception cref="ConsumerGroupNotFoundException">Thrown when consumer group doesn't exist and auto-creation is disabled</exception>
+    /// <exception cref="ObjectDisposedException">The consumer is disposed before it was initialized.</exception>
     public async Task InitAsync(CancellationToken ct = default)
     {
+        ObjectDisposedException.ThrowIf(IsDisposed, this);
         if (_isInitialized)
         {
             return;
         }
-
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(ct, _lifetime.Token);
+        ct = cancellation.Token;
         await _connectionStateSemaphore.WaitAsync(ct);
         try
         {
+            ObjectDisposedException.ThrowIf(IsDisposed, this);
             if (_isInitialized)
             {
                 return;
@@ -191,10 +302,12 @@ public partial class IggyConsumer : IAsyncDisposable
             }
 
             await InitializeConsumerGroupAsync(ct);
-
-            _client.SubscribeConnectionEvents(OnClientConnectionStateChangedAsync);
-
-            _isInitialized = true;
+            lock (_deliveryGate)
+            {
+                ObjectDisposedException.ThrowIf(IsDisposed, this);
+                _client.SubscribeConnectionEvents(OnClientConnectionStateChangedAsync);
+                _isInitialized = true;
+            }
         }
         finally
         {
@@ -205,12 +318,17 @@ public partial class IggyConsumer : IAsyncDisposable
     /// <summary>
     ///     Receives messages asynchronously from the consumer as an async stream.
     ///     Messages are automatically polled from the server and buffered in a bounded channel.
+    ///     The stream ends once the consumer is disposed.
     /// </summary>
     /// <param name="ct">Cancellation token to stop receiving messages</param>
     /// <returns>An async enumerable of received messages</returns>
     /// <exception cref="ConsumerNotInitializedException">Thrown when InitAsync has not been called</exception>
     public async IAsyncEnumerable<ReceivedMessage> ReceiveAsync([EnumeratorCancellation] CancellationToken ct = default)
     {
+        if (IsDisposed)
+        {
+            yield break;
+        }
         if (!_isInitialized)
         {
             throw new ConsumerNotInitializedException();
@@ -224,18 +342,29 @@ public partial class IggyConsumer : IAsyncDisposable
                 continue;
             }
 
+            if (!BeginDelivery(message.CurrentOffset, message.PartitionId, message.Context))
+            {
+                yield break;
+            }
             yield return message;
 
             if (_config.AutoCommitMode == AutoCommitMode.AfterReceive)
             {
-                await StoreOffsetAsync(message.CurrentOffset, message.PartitionId, false, ct);
+                await CommitDeliveredAsync(message.CurrentOffset, message.PartitionId, message.Context, ct);
             }
-        } while (!ct.IsCancellationRequested);
+        } while (!ct.IsCancellationRequested && !IsDisposed);
     }
 
     /// <summary>
     ///     Manually stores the consumer offset for a specific partition.
     ///     Use this when auto-commit is disabled or when you need manual offset control.
+    ///     The offset is stored under the context of the partition's last poll, so the server refuses it when the
+    ///     partition was deleted and recreated since then or moved to another member of the consumer group.
+    ///     An offset taken from a message of an earlier poll belongs under that message's context: store it with
+    ///     <see cref="StoreOffsetAsync(ulong, uint, PartitionContext, CancellationToken)" /> instead.
+    ///     Before the first poll of the partition the store takes the context the partition's route reports. It can
+    ///     then fail once with status 87, or 5009 for a consumer group, after another client recreated the
+    ///     partition. The failed route is dropped and the next call routes again.
     /// </summary>
     /// <param name="offset">The offset to store</param>
     /// <param name="partitionId">The partition ID</param>
@@ -247,7 +376,8 @@ public partial class IggyConsumer : IAsyncDisposable
     public async Task StoreOffsetAsync(ulong offset, uint partitionId, bool resetLastPolled = false,
         CancellationToken ct = default)
     {
-        await _client.StoreOffsetAsync(_config.Consumer, _config.StreamId, _config.TopicId, offset, partitionId, ct);
+        PartitionContext? context = _lastPolledContext.TryGetValue(partitionId, out var polled) ? polled : null;
+        await StoreOffsetCoreAsync(offset, partitionId, context, ct);
 
         if (resetLastPolled)
         {
@@ -256,14 +386,68 @@ public partial class IggyConsumer : IAsyncDisposable
     }
 
     /// <summary>
+    ///     Stores the offset of a received message under the context of the poll that delivered it, taken from
+    ///     <see cref="ReceivedMessage.Context" />. The server refuses it with status 87 when the partition was
+    ///     deleted and recreated after that poll, and with status 5009 when the partition moved to another member
+    ///     of the consumer group, so a late commit never lands on the newer partition.
+    /// </summary>
+    /// <param name="offset">The offset to store</param>
+    /// <param name="partitionId">The partition that delivered the offset</param>
+    /// <param name="context">The context of the message the offset belongs to</param>
+    /// <param name="ct">Cancellation token</param>
+    public async Task StoreOffsetAsync(ulong offset, uint partitionId, PartitionContext context,
+        CancellationToken ct = default)
+    {
+        await StoreOffsetCoreAsync(offset, partitionId, context, ct);
+    }
+
+    private async Task StoreOffsetCoreAsync(ulong offset, uint partitionId, PartitionContext? context,
+        CancellationToken ct, bool afterReceive = false)
+    {
+        if (afterReceive && IsDisposed) { return; }
+        ObjectDisposedException.ThrowIf(IsDisposed, this);
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(ct, _lifetime.Token);
+        try
+        {
+            await _offsetSemaphore.WaitAsync(cancellation.Token);
+            try
+            {
+                if (afterReceive && IsDisposed) { return; }
+                ObjectDisposedException.ThrowIf(IsDisposed, this);
+                await WithLaneRecoveryAsync(token => context is { } captured
+                    ? _client.StoreOffsetAsync(_config.Consumer, _config.StreamId, _config.TopicId,
+                        offset, partitionId, captured, token)
+                    : _client.StoreOffsetAsync(_config.Consumer, _config.StreamId, _config.TopicId,
+                        offset, partitionId, token), cancellation.Token);
+                if (context is { } stored && (!_storedOffsets.TryGetValue(partitionId, out var previous)
+                    || !SamePartition(previous.Context, stored) || previous.Offset < offset))
+                {
+                    _storedOffsets[partitionId] = (offset, stored);
+                }
+            }
+            finally { _offsetSemaphore.Release(); }
+        }
+        catch (OperationCanceledException) when (afterReceive && IsDisposed && !ct.IsCancellationRequested)
+        {
+        }
+        catch (VsrRequestOutcomeUnknownException) when (afterReceive && IsDisposed && !ct.IsCancellationRequested)
+        {
+        }
+    }
+
+    /// <summary>
     ///     Deletes the stored consumer offset for a specific partition.
     ///     The local duplicate filter, polling strategy, and buffered messages remain unchanged.
+    ///     The delete takes the context the partition's route reports, so it can fail once with status 87, or 5009
+    ///     for a consumer group, after another client recreated the partition. The failed route is dropped and the
+    ///     next call routes again.
     /// </summary>
     /// <param name="partitionId">The partition ID</param>
     /// <param name="ct">Cancellation token</param>
     public async Task DeleteOffsetAsync(uint partitionId, CancellationToken ct = default)
     {
-        await _client.DeleteOffsetAsync(_config.Consumer, _config.StreamId, _config.TopicId, partitionId, ct);
+        await WithLaneRecoveryAsync(token => _client.DeleteOffsetAsync(_config.Consumer, _config.StreamId,
+            _config.TopicId, partitionId, token), ct);
     }
 
     /// <summary>
@@ -289,7 +473,9 @@ public partial class IggyConsumer : IAsyncDisposable
     /// </summary>
     private async Task InitializeConsumerGroupAsync(CancellationToken ct = default)
     {
-        if (_joinedConsumerGroup)
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(ct, _lifetime.Token);
+        ct = cancellation.Token;
+        if (IsDisposed || _joinedConsumerGroup)
         {
             return;
         }
@@ -335,7 +521,7 @@ public partial class IggyConsumer : IAsyncDisposable
                 throw new ConsumerGroupNotFoundException(_consumerGroupName);
             }
 
-            if (_config.JoinConsumerGroup)
+            if (_config.JoinConsumerGroup && !IsDisposed)
             {
                 LogJoiningConsumerGroup(_consumerGroupName, _config.StreamId, _config.TopicId);
 
@@ -351,6 +537,19 @@ public partial class IggyConsumer : IAsyncDisposable
         {
             LogFailedToInitializeConsumerGroup(ex, _consumerGroupName);
             throw;
+        }
+    }
+
+    private async Task LeaveConsumerGroupAsync(string groupName)
+    {
+        try
+        {
+            await _client.LeaveConsumerGroupAsync(_config.StreamId, _config.TopicId, Identifier.String(groupName));
+            LogLeftConsumerGroup(groupName);
+        }
+        catch (Exception e)
+        {
+            LogFailedToLeaveConsumerGroup(e, groupName);
         }
     }
 
@@ -398,9 +597,15 @@ public partial class IggyConsumer : IAsyncDisposable
     ///     Polls messages from the server and writes them to the internal channel.
     ///     Handles offset tracking and auto-commit logic.
     ///     Uses semaphore to ensure single concurrent polling operation.
+    ///     Once the consumer is disposed it returns without polling.
     /// </summary>
     private async Task PollMessagesAsync(CancellationToken ct)
     {
+        if (IsDisposed)
+        {
+            return;
+        }
+
         if (!_joinedConsumerGroup || !IsGroupMembershipCurrent())
         {
             LogConsumerGroupNotJoinedYetSkippingPolling();
@@ -412,6 +617,7 @@ public partial class IggyConsumer : IAsyncDisposable
 
         await _pollingSemaphore.WaitAsync(ct);
 
+        var polledPartition = PolledMessages.NoAssignedPartition;
         try
         {
             if (_config.PollingIntervalMs > 0)
@@ -420,13 +626,18 @@ public partial class IggyConsumer : IAsyncDisposable
             }
 
             var messages = await _client.PollMessagesAsync(_config.StreamId, _config.TopicId,
-                _config.PartitionId, _config.Consumer, _config.PollingStrategy, _config.BatchSize,
-                _config.AutoCommit, ct);
+                _config.PartitionId, _config.Consumer, partitionId =>
+                {
+                    polledPartition = partitionId;
+                    return PollingStrategyFor(partitionId);
+                }, _config.BatchSize, _config.AutoCommit, ct);
 
             if (messages.Messages.Count == 0)
             {
                 if (messages.PartitionId == PolledMessages.NoAssignedPartition)
                 {
+                    // Partitions come back under a new owner generation, which refuses a kept continuation.
+                    _nextPollingStrategies.Clear();
                     LogNoPartitionAssignedBackingOff(NoAssignedPartitionBackoffMs);
                     await Task.Delay(NoAssignedPartitionBackoffMs, ct);
                 }
@@ -434,6 +645,7 @@ public partial class IggyConsumer : IAsyncDisposable
                 return;
             }
 
+            RememberPolledContext(messages.PartitionId, messages.Context);
             var hasLastOffset = _lastPolledOffset.TryGetValue(messages.PartitionId,
                 out var lastPolledPartitionOffset);
 
@@ -451,6 +663,7 @@ public partial class IggyConsumer : IAsyncDisposable
                     Message = message,
                     CurrentOffset = message.Header.Offset,
                     PartitionId = messages.PartitionId,
+                    Context = messages.Context,
                     Status = MessageStatus.Success,
                     Error = null
                 };
@@ -466,18 +679,14 @@ public partial class IggyConsumer : IAsyncDisposable
                 {
                     _logger.LogDebug("No new messages found, committing offset {Offset} for partition {PartitionId}",
                         lastPolledPartitionOffset, messages.PartitionId);
-                    await StoreOffsetAsync(lastPolledPartitionOffset, messages.PartitionId, false, ct);
+                    await StoreOffsetAsync(lastPolledPartitionOffset, messages.PartitionId, messages.Context, ct);
                 }
 
                 return;
             }
 
             _lastPolledOffset[messages.PartitionId] = currentOffset;
-
-            if (_config.PollingStrategy.Kind == MessagePolling.Offset)
-            {
-                _config.PollingStrategy = PollingStrategy.Offset(currentOffset + 1);
-            }
+            RememberNextPollingStrategy(messages.PartitionId, currentOffset, messages.Context);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -488,15 +697,152 @@ public partial class IggyConsumer : IAsyncDisposable
             LogFailedToDecryptMessage(ex, ex.Offset, ex.PartitionId);
             throw;
         }
-        catch (Exception ex) when (ex is not (MalformedResponseException or VsrRequestOutcomeUnknownException))
+        // Without an operation id nothing is retained to resolve, so the next poll can run.
+        catch (Exception ex) when (ex is not (MalformedResponseException
+            or VsrRequestOutcomeUnknownException { OperationId: not null } or VsrLaneBlockedException))
         {
-            LogFailedToPollMessages(ex);
-            _consumerErrorEvents.Publish(new ConsumerErrorEventArgs(ex, "Failed to poll messages"));
+            await ReportPollFailureAsync(ex, polledPartition, ct);
         }
         finally
         {
             _pollingSemaphore.Release();
         }
+    }
+
+    /// <summary>
+    ///     Publishes a failed poll as an error event and waits <see cref="PollRetryDelayMs" /> before the next poll.
+    ///     A cancellation can interrupt an in-flight poll with another exception, so after a cancellation the failure
+    ///     ends the receive loop as a cancellation instead. A dispose can fail an in-flight poll too, and no poll
+    ///     follows it, so then the failure is neither reported nor waited out.
+    /// </summary>
+    private async Task ReportPollFailureAsync(Exception error, uint polledPartition, CancellationToken ct)
+    {
+        ForgetRefusedPollingStrategy(error, polledPartition);
+        if (ct.IsCancellationRequested)
+        {
+            throw new OperationCanceledException("The poll was canceled.", error, ct);
+        }
+
+        if (IsDisposed)
+        {
+            return;
+        }
+
+        LogFailedToPollMessages(error);
+        _consumerErrorEvents.Publish(new ConsumerErrorEventArgs(error, "Failed to poll messages"));
+        await Task.Delay(PollRetryDelayMs, ct);
+    }
+
+    private async Task WithLaneRecoveryAsync(Func<CancellationToken, Task> operation, CancellationToken ct)
+    {
+        var deadline = Environment.TickCount64 + OperationTimeoutMs;
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        cancellation.CancelAfter(OperationTimeoutMs);
+        try
+        {
+            try
+            {
+                await operation(cancellation.Token);
+            }
+            catch (VsrLaneBlockedException blocked)
+            {
+                ct.ThrowIfCancellationRequested();
+                var remainingMs = deadline - Environment.TickCount64;
+                if (remainingMs <= 0)
+                {
+                    throw;
+                }
+
+                try
+                {
+                    await _client.ResolveOperationAsync(blocked.OperationId, TimeSpan.FromMilliseconds(remainingMs),
+                        cancellation.Token);
+                }
+                catch (VsrRequestOutcomeUnknownException)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    ExceptionDispatchInfo.Throw(blocked);
+                }
+                catch (OperationCanceledException) when (cancellation.IsCancellationRequested && !ct.IsCancellationRequested)
+                {
+                    ExceptionDispatchInfo.Throw(blocked);
+                }
+                catch (VsrOperationNotRetainedException)
+                {
+                }
+                catch (IggyInvalidStatusCodeException error) when (error.Committed)
+                {
+                    // The blocker can belong to the application, which reads this rejection through
+                    // ResolveOperationAsync. The store only needs the free lane.
+                }
+
+                cancellation.Token.ThrowIfCancellationRequested();
+                if (Environment.TickCount64 >= deadline)
+                {
+                    throw VsrError.Exception(VsrError.TRANSIENT_NOT_ACCEPTED, "The consumer operation deadline expired.");
+                }
+
+                await operation(cancellation.Token);
+            }
+        }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested && !ct.IsCancellationRequested)
+        {
+            throw VsrError.Exception(VsrError.TRANSIENT_NOT_ACCEPTED, "The consumer operation deadline expired.");
+        }
+    }
+
+    /// <summary>
+    ///     The strategy for the partition a poll reads: the continuation after its last batch, or the configured
+    ///     strategy before the first batch and after a refused continuation.
+    /// </summary>
+    private PollingStrategy PollingStrategyFor(uint partitionId)
+    {
+        return _nextPollingStrategies.TryGetValue(partitionId, out var next) ? next : _config.PollingStrategy;
+    }
+
+    /// <summary>
+    ///     Under <see cref="MessagePolling.Next" /> the server keeps the position, so nothing is recorded.
+    /// </summary>
+    private void RememberNextPollingStrategy(uint partitionId, ulong lastOffset, PartitionContext context)
+    {
+        if (_config.PollingStrategy.Kind != MessagePolling.Next)
+        {
+            _nextPollingStrategies[partitionId] = PollingStrategy.Offset(lastOffset + 1).WithContext(context);
+        }
+    }
+
+    /// <summary>
+    ///     A refusal names no partition: it answers the poll of the partition the client asked a strategy for last.
+    ///     Status 87 or 5009 means the partition no longer has the incarnation or owner the continuation was pinned
+    ///     to, so its next poll starts over from the configured strategy.
+    /// </summary>
+    private void ForgetRefusedPollingStrategy(Exception error, uint polledPartition)
+    {
+        if (error is IggyInvalidStatusCodeException
+            {
+                FromServer: true,
+                StatusCode: VsrError.HISTORY_UNAVAILABLE or VsrError.CONSUMER_GROUP_PARTITION_NOT_OWNED
+            })
+        {
+            _nextPollingStrategies.TryRemove(polledPartition, out _);
+        }
+    }
+
+    /// <summary>
+    ///     Records the context a poll of the partition was served under. Offsets compare only within one
+    ///     incarnation and owner, as in the Rust consumer: a recreated partition restarts at offset 0, so a duplicate
+    ///     filter carried over from the old incarnation would drop the replacement's messages and then commit the
+    ///     old offset into it. The metadata operation is left out because unrelated metadata commits advance it.
+    /// </summary>
+    private void RememberPolledContext(uint partitionId, PartitionContext context)
+    {
+        if (_lastPolledContext.TryGetValue(partitionId, out var previous)
+            && (previous.Incarnation != context.Incarnation || previous.OwnerGeneration != context.OwnerGeneration))
+        {
+            _lastPolledOffset.TryRemove(partitionId, out _);
+        }
+
+        _lastPolledContext[partitionId] = context;
     }
 
     /// <summary>
@@ -530,6 +876,12 @@ public partial class IggyConsumer : IAsyncDisposable
             await _connectionStateSemaphore.WaitAsync(ct);
             try
             {
+                // The dispose left the group, so a rejoin now would add a member that never polls.
+                if (IsDisposed)
+                {
+                    return;
+                }
+
                 if (!_joinedConsumerGroup || !IsGroupMembershipCurrent())
                 {
                     _joinedConsumerGroup = false;
@@ -608,6 +960,11 @@ public partial class IggyConsumer : IAsyncDisposable
         await _connectionStateSemaphore.WaitAsync();
         try
         {
+            if (IsDisposed)
+            {
+                return;
+            }
+
             if (_client is ISessionGenerationProvider generationProvider)
             {
                 if (e.CurrentState != ConnectionState.Authenticated)

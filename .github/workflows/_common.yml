@@ -30,8 +30,9 @@ permissions:
 
 jobs:
   rust-versions:
-    name: Check Rust versions sync
-    runs-on: ubuntu-latest
+    name: Rust versions sync
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -39,8 +40,9 @@ jobs:
         run: ./scripts/ci/sync-rustc-version.sh --check
 
   python-versions:
-    name: Check Python SDK versions sync
-    runs-on: ubuntu-latest
+    name: Python SDK versions sync
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -48,8 +50,9 @@ jobs:
         run: ./scripts/ci/python-sdk-version-sync.sh --check
 
   python-interpreter-versions:
-    name: Check Python interpreter versions sync
-    runs-on: ubuntu-latest
+    name: Python interpreter versions sync
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -57,20 +60,22 @@ jobs:
         run: ./scripts/ci/sync-python-interpreter-version.sh --check
 
   python-lockfiles:
-    name: Check Python lockfiles
-    runs-on: ubuntu-latest
+    name: Python lockfiles
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
 
       - name: Check uv.lock files are in sync with pyproject.toml
         run: ./scripts/ci/uv-lock-check.sh --check
 
   version-consistency:
-    name: Check version consistency
-    runs-on: ubuntu-latest
+    name: Version consistency
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -88,8 +93,9 @@ jobs:
         run: ./scripts/extract-version.sh --check
 
   edge-image-catalog:
-    name: Check edge image catalog
-    runs-on: ubuntu-latest
+    name: Edge image catalog
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -107,8 +113,9 @@ jobs:
         run: ./scripts/ci/edge-image-catalog.sh --check
 
   license-headers:
-    name: Check license headers
-    runs-on: ubuntu-latest
+    name: License headers
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -117,7 +124,7 @@ jobs:
         run: echo "version=$(cat .github/config/hawkeye.version)" >> "$GITHUB_OUTPUT"
 
       - name: Install HawkEye
-        uses: taiki-e/install-action@v2.87.22
+        uses: taiki-e/install-action@v2.87.28
         with:
           tool: hawkeye@${{ steps.hawkeye-version.outputs.version }}
 
@@ -127,14 +134,16 @@ jobs:
   third-party-licenses:
     name: Validate third-party licenses
     if: inputs.validate-third-party-licenses
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: ./.github/actions/utils/validate-third-party-licenses
 
   markdown:
     name: Markdown lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -142,6 +151,7 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: "23"
+          package-manager-cache: false
 
       - name: Install markdownlint-cli
         run: npm install -g markdownlint-cli
@@ -154,7 +164,8 @@ jobs:
 
   shellcheck:
     name: Shell scripts lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
     steps:
       - name: Checkout code
         uses: actions/checkout@v7.0.1
@@ -169,8 +180,9 @@ jobs:
         run: ./scripts/ci/shellcheck.sh --check
 
   trailing-whitespace:
-    name: Check trailing whitespace
-    runs-on: ubuntu-latest
+    name: Trailing whitespace
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
     steps:
       - name: Checkout code
         uses: actions/checkout@v7.0.1
@@ -181,8 +193,9 @@ jobs:
         run: ./scripts/ci/trailing-whitespace.sh --check --ci
 
   trailing-newline:
-    name: Check trailing newline
-    runs-on: ubuntu-latest
+    name: Trailing newline
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
     steps:
       - name: Checkout code
         uses: actions/checkout@v7.0.1
@@ -193,8 +206,9 @@ jobs:
         run: ./scripts/ci/trailing-newline.sh --check --ci
 
   toml-format:
-    name: Check TOML formatting
-    runs-on: ubuntu-latest
+    name: TOML formatting
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
     steps:
       - name: Checkout code
         uses: actions/checkout@v7.0.1
@@ -216,8 +230,9 @@ jobs:
         run: ./scripts/ci/taplo.sh --check --ci
 
   binary-artifacts:
-    name: Check binary artifacts
-    runs-on: ubuntu-latest
+    name: Binary artifacts
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
     steps:
       - name: Checkout code
         uses: actions/checkout@v7.0.1
@@ -228,8 +243,8 @@ jobs:
         run: ./scripts/ci/binary-artifacts.sh --check --ci
 
   typos:
-    name: Check typos
-    runs-on: ubuntu-latest
+    name: Typos
+    runs-on: ubuntu-slim
     timeout-minutes: 10
     env:
       FORCE_COLOR: 1
@@ -239,7 +254,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: Check typos
-        uses: crate-ci/typos@v1.50.3
+        uses: crate-ci/typos@v1.51.1
 
   summary:
     name: Common checks summary
@@ -262,7 +277,8 @@ jobs:
         typos,
       ]
     if: ${{ !cancelled() }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
     steps:
       - name: Summary
         run: |

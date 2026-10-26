@@ -28,25 +28,39 @@
 //! assignment. At the former 2s interval the 16-consumer spec sat 2.27s into a
 //! 2.4s deadline over quic -- under 5% margin.
 //!
-//! Connection eviction retains logical sessions. The liveness specs also set
-//! a short consumer-group session timeout so ordered Logout can remove stale
-//! memberships. Their stale clients send no further activity.
+//! `1.2 x heartbeat.interval` is also the session timeout, with or without
+//! heartbeat checks. The specs that wait for a closed member's session to end
+//! set a 7s interval and a 500ms `consumer_group.heartbeat_interval`, near the
+//! validator's minimum, and turn the checks off so an idle open member keeps
+//! its session. The two stale-client specs keep the checks on, so their
+//! silent sockets lose their sessions.
 
 use iggy::prelude::*;
+use integration::harness::{backup_commit_budget, wait_for_consumer_group_assignment};
 use integration::iggy_harness;
 use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use tokio::time::{Duration, sleep};
+use tokio::time::{Duration, Instant, sleep};
 
 const STREAM_NAME: &str = "cg-partition-test-stream";
 const TOPIC_NAME: &str = "cg-partition-test-topic";
 const CONSUMER_GROUP_NAME: &str = "cg-partition-test-group";
 const PARTITIONS_COUNT: u32 = 3;
 /// Bounds [`await_members_count`], including logical-session lease expiry.
+/// Specs that prove a drain or commit completes a handoff keep the default
+/// `consumer_group.rebalancing_timeout`, which outlasts this bound, so the
+/// deadline cannot complete the handoff for them.
 const MEMBERS_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(15);
-const MEMBERS_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+/// Bounds the removal of members whose sockets stay open and silent. At the
+/// 7s heartbeat interval, the server stops renewing such a session after 8.4s
+/// and ends it about 8.4s later.
+const SILENT_MEMBERS_EXPIRY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Covers two passes of the default 1 s `reconcile_periodic_interval` with
+/// margin, and stays far below the default `consumer_group.rebalancing_timeout`.
+const LEAVE_OBSERVATION_WINDOW: Duration = Duration::from_secs(3);
+const MEMBER_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Slices the slab-reuse wait so the surviving consumer can prove liveness
 /// inside the server's staleness window. Product of the two is the 3s the
 /// spec waits for the freed slab to become reusable.
@@ -57,6 +71,10 @@ async fn create_stale_tcp_client(server_addr: &str) -> IggyClient {
     let config = TcpClientConfig {
         server_address: server_addr.to_string(),
         heartbeat_interval: NonZeroIggyDuration::from_str("1h").unwrap(),
+        reconnection: TcpClientReconnectionConfig {
+            enabled: false,
+            ..TcpClientReconnectionConfig::default()
+        },
         nodelay: true,
         ..TcpClientConfig::default()
     };
@@ -78,10 +96,10 @@ async fn create_tcp_client(server_addr: &str) -> IggyClient {
 }
 
 #[iggy_harness(server(
+    consumer_group.rebalancing_timeout = "1s",
     heartbeat.enabled = true,
-    heartbeat.interval = "2s",
+    heartbeat.interval = "7s",
     consumer_group.heartbeat_interval = "500ms",
-    consumer_group.session_timeout = "8s",
 ))]
 async fn should_not_duplicate_partition_assignments_after_stale_client_cleanup(
     harness: &TestHarness,
@@ -95,7 +113,10 @@ async fn should_not_duplicate_partition_assignments_after_stale_client_cleanup(
         .unwrap();
 
     // 1. Create stream, topic with 3 partitions, consumer group
-    root_client.create_stream(STREAM_NAME).await.unwrap();
+    root_client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     root_client
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
@@ -155,7 +176,7 @@ async fn should_not_duplicate_partition_assignments_after_stale_client_cleanup(
     }
 
     // 4. Verify initial state: 3 members, each with 1 unique partition
-    let cg = get_consumer_group(&root_client).await;
+    let cg = await_members_count(&root_client, 3).await;
     assert_eq!(cg.members_count, 3, "Expected 3 members before kill");
     assert_unique_partition_assignments(&cg);
 
@@ -179,7 +200,7 @@ async fn should_not_duplicate_partition_assignments_after_stale_client_cleanup(
     );
 
     // Membership removal follows logical-session expiry, including after TCP eviction.
-    await_members_count(&root_client, 0).await;
+    await_members_count_within(&root_client, 0, SILENT_MEMBERS_EXPIRY_TIMEOUT).await;
 
     // 9. Now create 3 new clients and join same CG (simulating app restart after kill -9).
     let client1 = create_tcp_client(&server_addr).await;
@@ -202,7 +223,7 @@ async fn should_not_duplicate_partition_assignments_after_stale_client_cleanup(
     }
 
     // 10. Verify exactly 3 members with unique partition assignments
-    let cg = get_consumer_group(&root_client).await;
+    let cg = await_members_count(&root_client, 3).await;
     assert_eq!(
         cg.members_count, 3,
         "Expected 3 members after new clients join, got {}. Members: {:?}",
@@ -259,6 +280,7 @@ async fn should_not_duplicate_partition_assignments_after_stale_client_cleanup(
 }
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
+    consumer_group.rebalancing_timeout = "1s",
     heartbeat.enabled = true,
     heartbeat.interval = "60s",
 ))]
@@ -281,7 +303,7 @@ async fn should_not_reshuffle_partitions_when_new_member_joins(harness: &TestHar
     }
 
     // 3. Record the current partition assignments
-    let cg_before = get_consumer_group(&root_client).await;
+    let cg_before = await_members_count(&root_client, 2).await;
     assert_eq!(cg_before.members_count, 2);
 
     let assignments_before: Vec<(u32, Vec<u32>)> = cg_before
@@ -300,7 +322,7 @@ async fn should_not_reshuffle_partitions_when_new_member_joins(harness: &TestHar
 
     // 5. Verify: members that had exactly 1 partition still have it (stable assignment).
     //    Members that were over-assigned may have given up excess partitions - that's expected.
-    let cg_after = get_consumer_group(&root_client).await;
+    let cg_after = await_members_count(&root_client, 3).await;
     assert_eq!(cg_after.members_count, 3);
 
     for (old_id, old_partitions) in &assignments_before {
@@ -370,6 +392,7 @@ async fn should_skip_revoked_partitions_in_round_robin(harness: &TestHarness) {
         assert!(polled_before.insert(polled.partition_id));
     }
     assert_eq!(polled_before.len(), PARTITIONS_COUNT as usize);
+    let member1_id = get_consumer_group(&client1).await.members[0].id;
 
     let client2 = harness.new_client().await.unwrap();
     client2
@@ -377,36 +400,61 @@ async fn should_skip_revoked_partitions_in_round_robin(harness: &TestHarness) {
         .await
         .unwrap();
     join_cg(&client2).await;
-    sleep(Duration::from_millis(100)).await;
 
-    // Consumer1 polls again — round-robin skips revoked partitions
-    let mut polled_after = HashSet::new();
-    for _ in 0..PARTITIONS_COUNT {
-        let polled = client1
-            .poll_messages(
-                &Identifier::named(STREAM_NAME).unwrap(),
-                &Identifier::named(TOPIC_NAME).unwrap(),
-                None,
-                &consumer,
-                &PollingStrategy::next(),
-                1,
-                false,
-            )
-            .await
-            .unwrap();
-        if !polled.messages.is_empty() {
-            polled_after.insert(polled.partition_id);
+    // A partition primary that is a metadata backup fences polls on its own
+    // applied metadata, so it can learn client2's join after the join returns.
+    let deadline = Instant::now() + backup_commit_budget(harness);
+    let polled_after = loop {
+        let mut polled_after = HashSet::new();
+        for _ in 0..PARTITIONS_COUNT {
+            let polled = client1
+                .poll_messages(
+                    &Identifier::named(STREAM_NAME).unwrap(),
+                    &Identifier::named(TOPIC_NAME).unwrap(),
+                    None,
+                    &consumer,
+                    &PollingStrategy::next(),
+                    1,
+                    false,
+                )
+                .await
+                .unwrap();
+            if !polled.messages.is_empty() {
+                polled_after.insert(polled.partition_id);
+            }
         }
-    }
-
-    assert!(
-        polled_after.len() < PARTITIONS_COUNT as usize,
-        "Consumer1 should skip revoked partitions but got all {PARTITIONS_COUNT}: {polled_after:?}"
-    );
+        if polled_after.len() < PARTITIONS_COUNT as usize {
+            break polled_after;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Consumer1 should skip revoked partitions but got all {PARTITIONS_COUNT}: {polled_after:?}"
+        );
+        sleep(MEMBER_POLL_INTERVAL).await;
+    };
     assert!(
         !polled_after.is_empty(),
         "Consumer1 must keep at least 1 partition"
     );
+
+    // Client1 never commits and the default rebalancing_timeout outlasts the
+    // wait, so only the pending-revocation fence can explain the skip. Read
+    // through client2: whichever node answers holds the read until it applied
+    // client2's join, and a node without the join shows client1 owning all.
+    let cg = get_consumer_group(&client2).await;
+    let member1 = cg
+        .members
+        .iter()
+        .find(|member| member.id == member1_id)
+        .expect("Consumer1 is still a member");
+    for skipped in polled_before.difference(&polled_after) {
+        assert!(
+            member1.partitions.contains(skipped),
+            "Consumer1 skipped partition {skipped} after its revocation completed. \
+             Members: {:?}",
+            cg.members
+        );
+    }
 
     root_client
         .delete_stream(&Identifier::named(STREAM_NAME).unwrap())
@@ -415,6 +463,7 @@ async fn should_skip_revoked_partitions_in_round_robin(harness: &TestHarness) {
 }
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
+    consumer_group.rebalancing_timeout = "1s",
     heartbeat.enabled = true,
     heartbeat.interval = "60s",
 ))]
@@ -547,7 +596,7 @@ async fn should_not_lose_messages_with_concurrent_polls_during_partition_add(
     let _ = poll_task_2.await;
 
     // 4. Verify: no duplicates, all partitions assigned
-    let cg = get_consumer_group(&root_client).await;
+    let cg = await_members_count(&root_client, 2).await;
     assert_eq!(cg.members_count, 2);
     assert_unique_partition_assignments(&cg);
     let total: u32 = cg.members.iter().map(|m| m.partitions_count).sum();
@@ -573,9 +622,10 @@ async fn should_not_lose_messages_with_concurrent_polls_during_partition_add(
 }
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
-    heartbeat.interval = "60s",
+    consumer_group.rebalancing_timeout = "1s",
+    heartbeat.enabled = false,
+    heartbeat.interval = "7s",
     consumer_group.heartbeat_interval = "500ms",
-    consumer_group.session_timeout = "8s",
 ))]
 async fn should_handle_partition_add_then_consumer_disconnect_then_new_join(harness: &TestHarness) {
     let root_client = harness.root_client().await.unwrap();
@@ -666,7 +716,7 @@ async fn should_handle_partition_add_then_consumer_disconnect_then_new_join(harn
     sleep(Duration::from_millis(500)).await;
 
     // 5. Verify: both members have partitions, no duplicates
-    let cg = get_consumer_group(&root_client).await;
+    let cg = await_members_count(&root_client, 2).await;
     assert_eq!(cg.members_count, 2);
     assert_unique_partition_assignments(&cg);
     let total: u32 = cg.members.iter().map(|m| m.partitions_count).sum();
@@ -720,6 +770,7 @@ async fn should_handle_partition_add_then_consumer_disconnect_then_new_join(harn
 }
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
+    consumer_group.rebalancing_timeout = "1s",
     heartbeat.enabled = true,
     heartbeat.interval = "60s",
 ))]
@@ -727,7 +778,10 @@ async fn should_handle_partition_delete_while_multiple_consumers_polling(harness
     let root_client = harness.root_client().await.unwrap();
 
     // Start with 6 partitions
-    root_client.create_stream(STREAM_NAME).await.unwrap();
+    root_client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     root_client
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
@@ -832,7 +886,7 @@ async fn should_handle_partition_delete_while_multiple_consumers_polling(harness
     }
 
     // 4. Verify: 3 members, 3 remaining partitions, no duplicates
-    let cg = get_consumer_group(&root_client).await;
+    let cg = await_members_count(&root_client, 3).await;
     assert_eq!(cg.members_count, 3);
     assert_unique_partition_assignments(&cg);
     let total: u32 = cg.members.iter().map(|m| m.partitions_count).sum();
@@ -857,6 +911,7 @@ async fn should_handle_partition_delete_while_multiple_consumers_polling(harness
 }
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
+    consumer_group.rebalancing_timeout = "1s",
     heartbeat.enabled = true,
     heartbeat.interval = "60s",
 ))]
@@ -864,7 +919,10 @@ async fn should_reach_even_distribution_after_multiple_joins(harness: &TestHarne
     let root_client = harness.root_client().await.unwrap();
 
     // Start with 6 partitions for cleaner math
-    root_client.create_stream(STREAM_NAME).await.unwrap();
+    root_client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     root_client
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
@@ -924,7 +982,7 @@ async fn should_reach_even_distribution_after_multiple_joins(harness: &TestHarne
     join_cg(&client2).await;
 
     sleep(Duration::from_millis(200)).await;
-    let cg = get_consumer_group(&root_client).await;
+    let cg = await_members_count(&root_client, 2).await;
     assert_eq!(cg.members_count, 2);
     assert_unique_partition_assignments(&cg);
     let total: u32 = cg.members.iter().map(|m| m.partitions_count).sum();
@@ -939,7 +997,7 @@ async fn should_reach_even_distribution_after_multiple_joins(harness: &TestHarne
     join_cg(&client3).await;
 
     sleep(Duration::from_millis(200)).await;
-    let cg = get_consumer_group(&root_client).await;
+    let cg = await_members_count(&root_client, 3).await;
     assert_eq!(cg.members_count, 3);
     assert_unique_partition_assignments(&cg);
     let total: u32 = cg.members.iter().map(|m| m.partitions_count).sum();
@@ -962,7 +1020,7 @@ async fn should_reach_even_distribution_after_multiple_joins(harness: &TestHarne
     join_cg(&client4).await;
 
     sleep(Duration::from_millis(200)).await;
-    let cg = get_consumer_group(&root_client).await;
+    let cg = await_members_count(&root_client, 4).await;
     assert_eq!(cg.members_count, 4);
     assert_unique_partition_assignments(&cg);
     let total: u32 = cg.members.iter().map(|m| m.partitions_count).sum();
@@ -988,7 +1046,7 @@ async fn should_reach_even_distribution_after_multiple_joins(harness: &TestHarne
     }
 
     sleep(Duration::from_millis(200)).await;
-    let cg = get_consumer_group(&root_client).await;
+    let cg = await_members_count(&root_client, 6).await;
     assert_eq!(cg.members_count, 6);
     assert_unique_partition_assignments(&cg);
     let total: u32 = cg.members.iter().map(|m| m.partitions_count).sum();
@@ -1039,6 +1097,7 @@ async fn should_reach_even_distribution_after_multiple_joins(harness: &TestHarne
 }
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
+    consumer_group.rebalancing_timeout = "1s",
     heartbeat.enabled = true,
     heartbeat.interval = "60s",
 ))]
@@ -1060,7 +1119,7 @@ async fn should_split_evenly_when_consumer_joins_after_partitions_added(harness:
     }
 
     sleep(Duration::from_millis(200)).await;
-    let cg = get_consumer_group(&root_client).await;
+    let cg = await_members_count(&root_client, 2).await;
     assert_eq!(cg.members_count, 2);
     let total: u32 = cg.members.iter().map(|m| m.partitions_count).sum();
     assert_eq!(total, 3);
@@ -1103,7 +1162,7 @@ async fn should_split_evenly_when_consumer_joins_after_partitions_added(harness:
 
     sleep(Duration::from_millis(500)).await;
 
-    let cg = get_consumer_group(&root_client).await;
+    let cg = await_members_count(&root_client, 3).await;
     assert_eq!(cg.members_count, 3);
     assert_unique_partition_assignments(&cg);
     let total: u32 = cg.members.iter().map(|m| m.partitions_count).sum();
@@ -1158,6 +1217,7 @@ async fn should_split_evenly_when_consumer_joins_after_partitions_added(harness:
 }
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
+    consumer_group.rebalancing_timeout = "1s",
     heartbeat.enabled = true,
     heartbeat.interval = "60s",
 ))]
@@ -1209,7 +1269,7 @@ async fn should_not_duplicate_messages_when_partitions_added_during_polling(harn
     sleep(Duration::from_millis(500)).await;
 
     // 4. After rebalance, verify no partition is assigned to both consumers
-    let cg = get_consumer_group(&root_client).await;
+    let cg = await_members_count(&root_client, 2).await;
     assert_eq!(cg.members_count, 2);
     assert_unique_partition_assignments(&cg);
     let total: u32 = cg.members.iter().map(|m| m.partitions_count).sum();
@@ -1257,6 +1317,7 @@ async fn should_not_duplicate_messages_when_partitions_added_during_polling(harn
 }
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
+    consumer_group.rebalancing_timeout = "1s",
     heartbeat.enabled = true,
     heartbeat.interval = "60s",
 ))]
@@ -1264,7 +1325,10 @@ async fn should_handle_delete_partitions_with_uncommitted_work(harness: &TestHar
     let root_client = harness.root_client().await.unwrap();
 
     // Create with 6 partitions
-    root_client.create_stream(STREAM_NAME).await.unwrap();
+    root_client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     root_client
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
@@ -1344,7 +1408,7 @@ async fn should_handle_delete_partitions_with_uncommitted_work(harness: &TestHar
     sleep(Duration::from_millis(500)).await;
 
     // 4. After rebalance: 3 remaining partitions, no duplicates, even split
-    let cg = get_consumer_group(&root_client).await;
+    let cg = await_members_count(&root_client, 2).await;
     assert_eq!(cg.members_count, 2);
     assert_unique_partition_assignments(&cg);
     let total: u32 = cg.members.iter().map(|m| m.partitions_count).sum();
@@ -1389,6 +1453,7 @@ async fn should_handle_delete_partitions_with_uncommitted_work(harness: &TestHar
 }
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
+    consumer_group.rebalancing_timeout = "1s",
     heartbeat.enabled = true,
     heartbeat.interval = "60s",
 ))]
@@ -1470,7 +1535,7 @@ async fn should_handle_rapid_partition_changes_with_active_consumers(harness: &T
     sleep(Duration::from_millis(500)).await;
 
     // 3. 9 partitions, 3 consumers → 3 each
-    let cg = get_consumer_group(&root_client).await;
+    let cg = await_members_count(&root_client, 3).await;
     assert_eq!(cg.members_count, 3);
     assert_unique_partition_assignments(&cg);
     let total: u32 = cg.members.iter().map(|m| m.partitions_count).sum();
@@ -1525,6 +1590,7 @@ async fn should_handle_rapid_partition_changes_with_active_consumers(harness: &T
 }
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
+    consumer_group.rebalancing_timeout = "1s",
     heartbeat.enabled = true,
     heartbeat.interval = "60s",
 ))]
@@ -1548,7 +1614,7 @@ async fn should_rebalance_after_adding_partitions(harness: &TestHarness) {
 
     sleep(Duration::from_millis(200)).await;
 
-    let cg = get_consumer_group(&root_client).await;
+    let cg = await_members_count(&root_client, 3).await;
     assert_eq!(cg.members_count, 3);
     assert_unique_partition_assignments(&cg);
     for member in &cg.members {
@@ -1572,7 +1638,7 @@ async fn should_rebalance_after_adding_partitions(harness: &TestHarness) {
     sleep(Duration::from_millis(500)).await;
 
     // 3. After rebalance, each consumer should have 2 partitions (6/3)
-    let cg = get_consumer_group(&root_client).await;
+    let cg = await_members_count(&root_client, 3).await;
     assert_eq!(cg.members_count, 3);
     assert_unique_partition_assignments(&cg);
     let total: u32 = cg.members.iter().map(|m| m.partitions_count).sum();
@@ -1597,6 +1663,7 @@ async fn should_rebalance_after_adding_partitions(harness: &TestHarness) {
 }
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
+    consumer_group.rebalancing_timeout = "1s",
     heartbeat.enabled = true,
     heartbeat.interval = "60s",
 ))]
@@ -1604,7 +1671,10 @@ async fn should_rebalance_after_deleting_partitions(harness: &TestHarness) {
     let root_client = harness.root_client().await.unwrap();
 
     // Create with 6 partitions
-    root_client.create_stream(STREAM_NAME).await.unwrap();
+    root_client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     root_client
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
@@ -1642,7 +1712,7 @@ async fn should_rebalance_after_deleting_partitions(harness: &TestHarness) {
 
     sleep(Duration::from_millis(200)).await;
 
-    let cg = get_consumer_group(&root_client).await;
+    let cg = await_members_count(&root_client, 3).await;
     assert_eq!(cg.members_count, 3);
     let total: u32 = cg.members.iter().map(|m| m.partitions_count).sum();
     assert_eq!(total, 6);
@@ -1660,7 +1730,7 @@ async fn should_rebalance_after_deleting_partitions(harness: &TestHarness) {
     sleep(Duration::from_millis(500)).await;
 
     // 3. After rebalance, each consumer should have 1 partition (3/3)
-    let cg = get_consumer_group(&root_client).await;
+    let cg = await_members_count(&root_client, 3).await;
     assert_eq!(cg.members_count, 3);
     assert_unique_partition_assignments(&cg);
     let total: u32 = cg.members.iter().map(|m| m.partitions_count).sum();
@@ -1685,6 +1755,7 @@ async fn should_rebalance_after_deleting_partitions(harness: &TestHarness) {
 }
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
+    consumer_group.rebalancing_timeout = "1s",
     heartbeat.enabled = true,
     heartbeat.interval = "60s",
 ))]
@@ -1742,7 +1813,7 @@ async fn should_handle_partition_add_during_pending_revocation(harness: &TestHar
 
     // 4. After full rebalance triggered by partition change,
     //    all 6 partitions should be distributed, no duplicates
-    let cg = get_consumer_group(&root_client).await;
+    let cg = await_members_count(&root_client, 2).await;
     assert_eq!(cg.members_count, 2);
     assert_unique_partition_assignments(&cg);
     let total: u32 = cg.members.iter().map(|m| m.partitions_count).sum();
@@ -1783,7 +1854,7 @@ async fn should_timeout_revocation(harness: &TestHarness) {
         .unwrap();
     join_cg(&client1).await;
 
-    let cg = get_consumer_group(&root_client).await;
+    let cg = await_members_count(&root_client, 1).await;
     assert_eq!(cg.members_count, 1);
     assert_eq!(cg.members[0].partitions_count, PARTITIONS_COUNT);
 
@@ -1827,7 +1898,7 @@ async fn should_timeout_revocation(harness: &TestHarness) {
     sleep(Duration::from_secs(6)).await;
 
     // 6. The periodic checker should have force-completed the revocation.
-    let cg = get_consumer_group(&root_client).await;
+    let cg = await_members_count(&root_client, 2).await;
     assert_eq!(cg.members_count, 2);
     assert_unique_partition_assignments(&cg);
 
@@ -1873,10 +1944,10 @@ async fn should_timeout_revocation(harness: &TestHarness) {
 }
 
 #[iggy_harness(server(
+    consumer_group.rebalancing_timeout = "1s",
     heartbeat.enabled = true,
-    heartbeat.interval = "2s",
+    heartbeat.interval = "7s",
     consumer_group.heartbeat_interval = "500ms",
-    consumer_group.session_timeout = "8s",
 ))]
 async fn should_not_duplicate_after_reconnect_without_heartbeat(harness: &TestHarness) {
     let server_addr = harness.server().raw_tcp_addr().expect("tcp addr");
@@ -1887,7 +1958,10 @@ async fn should_not_duplicate_after_reconnect_without_heartbeat(harness: &TestHa
         .unwrap();
 
     // 1. Setup
-    root_client.create_stream(STREAM_NAME).await.unwrap();
+    root_client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     root_client
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
@@ -1957,7 +2031,7 @@ async fn should_not_duplicate_after_reconnect_without_heartbeat(harness: &TestHa
         }
     }
 
-    await_members_count(&root_client, 0).await;
+    await_members_count_within(&root_client, 0, SILENT_MEMBERS_EXPIRY_TIMEOUT).await;
 
     // 5. Phase 2: 3 new clients join, poll concurrently — exactly 1 must get the message
     let new_client1 = create_tcp_client(&server_addr).await;
@@ -1972,7 +2046,7 @@ async fn should_not_duplicate_after_reconnect_without_heartbeat(harness: &TestHa
         join_cg(client).await;
     }
 
-    let cg = get_consumer_group(&root_client).await;
+    let cg = await_members_count(&root_client, 3).await;
     assert_eq!(cg.members_count, 3);
     assert_unique_partition_assignments(&cg);
 
@@ -2015,8 +2089,10 @@ async fn should_not_duplicate_after_reconnect_without_heartbeat(harness: &TestHa
 #[iggy_harness(
     test_client_transport = [Tcp, WebSocket, Quic],
     server(
-        consumer_group.heartbeat_interval = "500ms",
-        consumer_group.session_timeout = "8s"
+    consumer_group.rebalancing_timeout = "1s",
+        heartbeat.enabled = false,
+        heartbeat.interval = "7s",
+        consumer_group.heartbeat_interval = "500ms"
     )
 )]
 async fn should_not_duplicate_partition_assignments_after_client_reconnect(harness: &TestHarness) {
@@ -2026,7 +2102,10 @@ async fn should_not_duplicate_partition_assignments_after_client_reconnect(harne
         .expect("Failed to get root client");
 
     // 1. Create stream, topic with 3 partitions, consumer group
-    root_client.create_stream(STREAM_NAME).await.unwrap();
+    root_client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     root_client
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
@@ -2085,7 +2164,7 @@ async fn should_not_duplicate_partition_assignments_after_client_reconnect(harne
             .unwrap();
     }
 
-    let cg = get_consumer_group(&root_client).await;
+    let cg = await_members_count(&root_client, 3).await;
     assert_eq!(cg.members_count, 3);
     assert_unique_partition_assignments(&cg);
 
@@ -2139,7 +2218,7 @@ async fn should_not_duplicate_partition_assignments_after_client_reconnect(harne
             .unwrap();
     }
 
-    let cg = get_consumer_group(&root_client).await;
+    let cg = await_members_count(&root_client, 3).await;
     assert_eq!(cg.members_count, 3);
     assert_unique_partition_assignments(&cg);
 
@@ -2175,26 +2254,24 @@ async fn should_not_duplicate_partition_assignments_after_client_reconnect(harne
         .unwrap();
 }
 
-/// Poll the group until it reports `expected` members, then return it.
-///
-/// Closing a binding preserves its logical session until lease expiry.
-/// Wait for the committed expiry and membership update before checking ownership.
 async fn await_members_count(client: &IggyClient, expected: u32) -> ConsumerGroupDetails {
-    let deadline = tokio::time::Instant::now() + MEMBERS_CONVERGENCE_TIMEOUT;
-    loop {
-        let group = get_consumer_group(client).await;
-        if group.members_count == expected {
-            return group;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "expected {expected} members within {MEMBERS_CONVERGENCE_TIMEOUT:?}, \
-             last saw {}. Members: {:?}",
-            group.members_count,
-            group.members
-        );
-        sleep(MEMBERS_RETRY_INTERVAL).await;
-    }
+    await_members_count_within(client, expected, MEMBERS_CONVERGENCE_TIMEOUT).await
+}
+
+async fn await_members_count_within(
+    client: &IggyClient,
+    expected: u32,
+    timeout: Duration,
+) -> ConsumerGroupDetails {
+    wait_for_consumer_group_assignment(
+        client,
+        &Identifier::named(STREAM_NAME).unwrap(),
+        &Identifier::named(TOPIC_NAME).unwrap(),
+        &Identifier::named(CONSUMER_GROUP_NAME).unwrap(),
+        expected,
+        timeout,
+    )
+    .await
 }
 
 async fn get_consumer_group(client: &IggyClient) -> ConsumerGroupDetails {
@@ -2230,7 +2307,10 @@ async fn setup_stream_topic_cg(client: &IggyClient) {
 }
 
 async fn setup_stream_topic_cg_with_partitions(client: &IggyClient, partitions: u32) {
-    client.create_stream(STREAM_NAME).await.unwrap();
+    client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     client
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
@@ -2280,6 +2360,9 @@ async fn join_cg(client: &IggyClient) {
         )
         .await
         .unwrap();
+    if get_consumer_group(client).await.members_count == 1 {
+        await_members_count(client, 1).await;
+    }
 }
 
 fn assert_balanced_partition_distribution(cg: &ConsumerGroupDetails, expected_total: u32) {
@@ -2335,7 +2418,7 @@ async fn should_not_return_same_message_to_two_consumers_during_rebalance(harnes
         .unwrap();
     join_cg(&client1).await;
 
-    let cg = get_consumer_group(&root_client).await;
+    let cg = await_members_count(&root_client, 1).await;
     assert_eq!(cg.members_count, 1);
     assert_eq!(cg.members[0].partitions_count, PARTITIONS_COUNT);
 
@@ -2364,6 +2447,9 @@ async fn should_not_return_same_message_to_two_consumers_during_rebalance(harnes
         .await
         .unwrap();
     join_cg(&client2).await;
+    // The join moves a partition client1 was never served, so its handoff
+    // needs no commit. Before that install client2 owns nothing and polls empty.
+    await_members_count(&root_client, 2).await;
 
     // 4. Consumer2 polls - it must NOT get the same partition as consumer1's
     //    in-flight message. Due to cooperative rebalance, the partition with
@@ -2381,23 +2467,27 @@ async fn should_not_return_same_message_to_two_consumers_during_rebalance(harnes
         .await
         .unwrap();
 
-    if !polled2.messages.is_empty() {
-        assert_ne!(
-            polled2.partition_id,
-            partition_polled_by_client1,
-            "Consumer2 got partition {} which consumer1 is still processing! \
-             Message ID from consumer1: offset={}, partition={}. \
-             Message ID from consumer2: offset={}, partition={}. \
-             This is the duplicate processing bug!",
-            polled2.partition_id,
-            message_from_client1.header.offset,
-            partition_polled_by_client1,
-            polled2.messages[0].header.offset,
-            polled2.partition_id,
-        );
-    }
+    assert_eq!(
+        polled2.messages.len(),
+        1,
+        "Consumer2 must get the message of the partition it was handed, got partition {}",
+        polled2.partition_id
+    );
+    assert_ne!(
+        polled2.partition_id,
+        partition_polled_by_client1,
+        "Consumer2 got partition {} which consumer1 is still processing! \
+         Message ID from consumer1: offset={}, partition={}. \
+         Message ID from consumer2: offset={}, partition={}. \
+         This is the duplicate processing bug!",
+        polled2.partition_id,
+        message_from_client1.header.offset,
+        partition_polled_by_client1,
+        polled2.messages[0].header.offset,
+        polled2.partition_id,
+    );
 
-    // 5. Now consumer1 commits the offset
+    // 5. Consumer1 commits its in-flight message on the partition it kept
     client1
         .store_consumer_offset(
             &consumer,
@@ -2409,11 +2499,8 @@ async fn should_not_return_same_message_to_two_consumers_during_rebalance(harnes
         .await
         .unwrap();
 
-    // 6. Give the server a moment to process the revocation completion
-    sleep(Duration::from_millis(100)).await;
-
-    // 7. After commit, the partition should have transferred. Verify final state.
-    let cg = get_consumer_group(&root_client).await;
+    // 6. The commit hands off nothing, so the assignments stay unique
+    let cg = await_members_count(&root_client, 2).await;
     assert_eq!(cg.members_count, 2);
     assert_unique_partition_assignments(&cg);
 
@@ -2473,7 +2560,7 @@ async fn should_complete_revocation_on_auto_commit(harness: &TestHarness) {
     sleep(Duration::from_millis(100)).await;
 
     // 3. Verify partitions are distributed
-    let cg = get_consumer_group(&root_client).await;
+    let cg = await_members_count(&root_client, 2).await;
     assert_eq!(cg.members_count, 2);
     assert_unique_partition_assignments(&cg);
 
@@ -2529,9 +2616,9 @@ async fn should_transfer_never_polled_partitions_immediately(harness: &TestHarne
         .unwrap();
     join_cg(&client3).await;
 
-    // 4. All 3 members should have exactly 1 partition each - immediately,
-    //    no waiting for commits
-    let cg = get_consumer_group(&root_client).await;
+    // 4. All 3 members should have exactly 1 partition each, no waiting for
+    //    commits or for the rebalancing deadline
+    let cg = await_members_count(&root_client, 3).await;
     assert_eq!(cg.members_count, 3);
     assert_unique_partition_assignments(&cg);
 
@@ -2551,9 +2638,10 @@ async fn should_transfer_never_polled_partitions_immediately(harness: &TestHarne
 }
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
-    heartbeat.interval = "60s",
+    consumer_group.rebalancing_timeout = "1s",
+    heartbeat.enabled = false,
+    heartbeat.interval = "7s",
     consumer_group.heartbeat_interval = "500ms",
-    consumer_group.session_timeout = "8s",
 ))]
 async fn should_rebalance_when_member_with_pending_revocation_leaves(harness: &TestHarness) {
     let root_client = harness.root_client().await.unwrap();
@@ -2641,6 +2729,7 @@ async fn should_rebalance_when_member_with_pending_revocation_leaves(harness: &T
 }
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
+    consumer_group.rebalancing_timeout = "1s",
     heartbeat.enabled = true,
     heartbeat.interval = "60s",
 ))]
@@ -2725,8 +2814,7 @@ async fn should_not_produce_duplicate_messages_with_sequential_consumer_joins(
         .await
         .unwrap();
 
-    // 6. Small delay for revocation completions
-    sleep(Duration::from_millis(200)).await;
+    await_members_count(&root_client, 3).await;
 
     // 7. All 3 consumers poll messages with manual ack - collect ALL messages
     let mut all_messages: Vec<(u32, u64)> = Vec::new();
@@ -2883,7 +2971,7 @@ async fn should_wait_for_manual_commit_before_completing_revocation(harness: &Te
     sleep(Duration::from_millis(200)).await;
 
     // 5. Now consumer2 should have partitions
-    let cg = get_consumer_group(&root_client).await;
+    let cg = await_members_count(&root_client, 2).await;
     assert_eq!(cg.members_count, 2);
     assert_unique_partition_assignments(&cg);
 
@@ -2904,10 +2992,10 @@ async fn should_wait_for_manual_commit_before_completing_revocation(harness: &Te
 }
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
-    heartbeat.enabled = true,
-    heartbeat.interval = "60s",
+    consumer_group.rebalancing_timeout = "1s",
+    heartbeat.enabled = false,
+    heartbeat.interval = "7s",
     consumer_group.heartbeat_interval = "500ms",
-    consumer_group.session_timeout = "8s",
 ))]
 async fn should_redistribute_when_revocation_target_leaves(harness: &TestHarness) {
     let root_client = harness.root_client().await.unwrap();
@@ -2997,6 +3085,7 @@ async fn should_redistribute_when_revocation_target_leaves(harness: &TestHarness
 }
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
+    consumer_group.rebalancing_timeout = "1s",
     heartbeat.enabled = true,
     heartbeat.interval = "60s",
 ))]
@@ -3036,7 +3125,7 @@ async fn should_distribute_partitions_evenly_with_concurrent_joins(harness: &Tes
     sleep(Duration::from_millis(200)).await;
 
     // Verify: 3 members, each with exactly 1 partition
-    let cg = get_consumer_group(&root_client).await;
+    let cg = await_members_count(&root_client, 3).await;
     assert_eq!(
         cg.members_count, 3,
         "Expected 3 members after concurrent joins, got {}. Members: {:?}",
@@ -3128,7 +3217,7 @@ async fn should_not_assign_partition_to_wrong_member_after_slab_reuse(harness: &
             .unwrap();
     }
 
-    // 2. Consumer2 joins — triggers pending revocation targeting consumer2's slab
+    // Consumer2 joins while consumer1 still has uncommitted offsets.
     let client2 = harness.new_client().await.unwrap();
     client2
         .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
@@ -3141,22 +3230,14 @@ async fn should_not_assign_partition_to_wrong_member_after_slab_reuse(harness: &
     let cg = get_consumer_group(&root_client).await;
     assert_eq!(cg.members_count, 2);
 
-    // 3. Consumer2 (revocation target) disconnects — its slab is freed
+    // The next connection may reuse the departed transport's slab.
     drop(client2);
-    // Consumer1 must stay alive across the wait. This spec asks the server for
-    // `heartbeat.interval = 2s`, so its verifier evicts any consumer-group
-    // member idle past 1.2 intervals, and harness clients never ping on their
-    // own (the SDK pinger is spawned by `IggyClient::connect`, which the
-    // builder does not call). Silence here evicted consumer1 mid-wait and its
-    // offset store below came back `StaleClient`. Any request refreshes
-    // liveness; a ping is the cheapest. Consumer2 stays silent by construction
-    // - it is already dropped, and the socket close frees its slab.
+    // Keep consumer1 alive without draining its offsets during transport cleanup.
     for _ in 0..CONSUMER1_KEEPALIVE_PINGS {
         sleep(CONSUMER1_KEEPALIVE_INTERVAL).await;
         client1.ping().await.unwrap();
     }
 
-    // 4. Consumer3 joins — may reuse consumer2's old slab
     let client3 = harness.new_client().await.unwrap();
     client3
         .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
@@ -3164,8 +3245,7 @@ async fn should_not_assign_partition_to_wrong_member_after_slab_reuse(harness: &
         .unwrap();
     join_cg(&client3).await;
 
-    // 5. Consumer1 commits all offsets — revocation completion should detect
-    //    slab reuse via target_member_id validation and trigger full rebalance
+    // Complete the handoff before its deadline, after a new transport can reuse the slab.
     for partition_id in 0..PARTITIONS_COUNT {
         client1
             .store_consumer_offset(
@@ -3179,10 +3259,7 @@ async fn should_not_assign_partition_to_wrong_member_after_slab_reuse(harness: &
             .unwrap();
     }
 
-    sleep(Duration::from_millis(500)).await;
-
-    // 6. Verify no partition duplication and all partitions assigned
-    let cg = get_consumer_group(&root_client).await;
+    let cg = await_members_count(&root_client, 3).await;
     assert_unique_partition_assignments(&cg);
     let total: u32 = cg.members.iter().map(|m| m.partitions_count).sum();
     assert_eq!(
@@ -3199,10 +3276,9 @@ async fn should_not_assign_partition_to_wrong_member_after_slab_reuse(harness: &
 }
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
-    heartbeat.enabled = true,
-    heartbeat.interval = "60s",
+    heartbeat.enabled = false,
+    heartbeat.interval = "7s",
     consumer_group.heartbeat_interval = "500ms",
-    consumer_group.session_timeout = "8s",
 ))]
 async fn should_not_complete_other_members_revocations_on_leave(harness: &TestHarness) {
     let root_client = harness.root_client().await.unwrap();
@@ -3219,8 +3295,9 @@ async fn should_not_complete_other_members_revocations_on_leave(harness: &TestHa
     join_cg(&client1).await;
 
     let consumer = Consumer::group(Identifier::named(CONSUMER_GROUP_NAME).unwrap());
+    let mut polled_offsets = Vec::with_capacity(PARTITIONS_COUNT as usize);
     for _ in 0..PARTITIONS_COUNT {
-        client1
+        let polled = client1
             .poll_messages(
                 &Identifier::named(STREAM_NAME).unwrap(),
                 &Identifier::named(TOPIC_NAME).unwrap(),
@@ -3232,6 +3309,8 @@ async fn should_not_complete_other_members_revocations_on_leave(harness: &TestHa
             )
             .await
             .unwrap();
+        assert_eq!(polled.messages.len(), 1);
+        polled_offsets.push((polled.partition_id, polled.messages[0].header.offset));
     }
 
     // 2. Consumer2 joins — triggers pending revocation for 1 partition
@@ -3259,6 +3338,39 @@ async fn should_not_complete_other_members_revocations_on_leave(harness: &TestHa
 
     client3.shutdown().await.unwrap();
     drop(client3);
+
+    // Client1 committed nothing and the default deadline outlasts this window,
+    // so only the leave could complete client2's revocation here.
+    let deadline = Instant::now() + MEMBERS_CONVERGENCE_TIMEOUT;
+    while get_consumer_group(&root_client).await.members_count != 2 {
+        assert!(
+            Instant::now() < deadline,
+            "Client3 did not leave the group within {MEMBERS_CONVERGENCE_TIMEOUT:?}"
+        );
+        sleep(MEMBER_POLL_INTERVAL).await;
+    }
+    sleep(LEAVE_OBSERVATION_WINDOW).await;
+    let cg = get_consumer_group(&root_client).await;
+    assert!(
+        cg.members
+            .iter()
+            .any(|member| member.partitions_count == PARTITIONS_COUNT),
+        "The leave completed a revocation that client1 never drained. Members: {:?}",
+        cg.members
+    );
+
+    for (partition_id, offset) in &polled_offsets {
+        client1
+            .store_consumer_offset(
+                &consumer,
+                &Identifier::named(STREAM_NAME).unwrap(),
+                &Identifier::named(TOPIC_NAME).unwrap(),
+                Some(*partition_id),
+                *offset,
+            )
+            .await
+            .unwrap();
+    }
 
     let cg = await_members_count(&root_client, 2).await;
     assert_eq!(cg.members_count, 2);
@@ -3314,6 +3426,7 @@ async fn should_not_complete_other_members_revocations_on_leave(harness: &TestHa
 }
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
+    consumer_group.rebalancing_timeout = "1s",
     heartbeat.enabled = true,
     heartbeat.interval = "60s",
 ))]
@@ -3359,7 +3472,7 @@ async fn should_distribute_16_partitions_evenly_across_16_consumers(harness: &Te
 
     sleep(Duration::from_millis(500)).await;
 
-    let cg = get_consumer_group(&root_client).await;
+    let cg = await_members_count(&root_client, 16).await;
     assert_eq!(cg.members_count, 16);
     assert_unique_partition_assignments(&cg);
     assert_balanced_partition_distribution(&cg, 16);
@@ -3405,6 +3518,7 @@ async fn should_distribute_16_partitions_evenly_across_16_consumers(harness: &Te
 }
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
+    consumer_group.rebalancing_timeout = "1s",
     heartbeat.enabled = true,
     heartbeat.interval = "60s",
 ))]
@@ -3449,7 +3563,7 @@ async fn should_distribute_excess_evenly_when_multiple_idle_members_join(harness
 
     sleep(Duration::from_millis(500)).await;
 
-    let cg = get_consumer_group(&root_client).await;
+    let cg = await_members_count(&root_client, 4).await;
     assert_eq!(cg.members_count, 4);
     assert_unique_partition_assignments(&cg);
     assert_balanced_partition_distribution(&cg, 12);
@@ -3470,6 +3584,7 @@ async fn should_distribute_excess_evenly_when_multiple_idle_members_join(harness
 }
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
+    consumer_group.rebalancing_timeout = "1s",
     heartbeat.enabled = true,
     heartbeat.interval = "60s",
 ))]
@@ -3498,7 +3613,7 @@ async fn should_distribute_remainder_fairly_with_uneven_ratio(harness: &TestHarn
 
     sleep(Duration::from_millis(500)).await;
 
-    let cg = get_consumer_group(&root_client).await;
+    let cg = await_members_count(&root_client, 4).await;
     assert_eq!(cg.members_count, 4);
     assert_unique_partition_assignments(&cg);
     assert_balanced_partition_distribution(&cg, 10);
@@ -3533,6 +3648,7 @@ async fn should_distribute_remainder_fairly_with_uneven_ratio(harness: &TestHarn
 }
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
+    consumer_group.rebalancing_timeout = "1s",
     heartbeat.enabled = true,
     heartbeat.interval = "60s",
 ))]
@@ -3553,7 +3669,7 @@ async fn should_collect_excess_from_multiple_overassigned_members(harness: &Test
 
     sleep(Duration::from_millis(200)).await;
 
-    let cg = get_consumer_group(&root_client).await;
+    let cg = await_members_count(&root_client, 2).await;
     assert_eq!(cg.members_count, 2);
     let total: u32 = cg.members.iter().map(|m| m.partitions_count).sum();
     assert_eq!(total, 16);
@@ -3571,7 +3687,7 @@ async fn should_collect_excess_from_multiple_overassigned_members(harness: &Test
 
     sleep(Duration::from_millis(500)).await;
 
-    let cg = get_consumer_group(&root_client).await;
+    let cg = await_members_count(&root_client, 8).await;
     assert_eq!(cg.members_count, 8);
     assert_unique_partition_assignments(&cg);
     assert_balanced_partition_distribution(&cg, 16);
@@ -3592,6 +3708,7 @@ async fn should_collect_excess_from_multiple_overassigned_members(harness: &Test
 }
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
+    consumer_group.rebalancing_timeout = "1s",
     heartbeat.enabled = true,
     heartbeat.interval = "60s",
 ))]
@@ -3623,7 +3740,7 @@ async fn should_not_starve_any_member_in_large_scale_rebalance(harness: &TestHar
 
     sleep(Duration::from_millis(500)).await;
 
-    let cg = get_consumer_group(&root_client).await;
+    let cg = await_members_count(&root_client, 8).await;
     assert_eq!(cg.members_count, 8);
     assert_unique_partition_assignments(&cg);
     assert_balanced_partition_distribution(&cg, 24);
@@ -3645,10 +3762,10 @@ async fn should_not_starve_any_member_in_large_scale_rebalance(harness: &TestHar
 }
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
-    heartbeat.enabled = true,
-    heartbeat.interval = "60s",
+    consumer_group.rebalancing_timeout = "1s",
+    heartbeat.enabled = false,
+    heartbeat.interval = "7s",
     consumer_group.heartbeat_interval = "500ms",
-    consumer_group.session_timeout = "8s",
 ))]
 async fn should_maintain_balance_after_member_churn(harness: &TestHarness) {
     let root_client = harness.root_client().await.unwrap();
@@ -3670,7 +3787,7 @@ async fn should_maintain_balance_after_member_churn(harness: &TestHarness) {
 
     sleep(Duration::from_millis(300)).await;
 
-    let cg = get_consumer_group(&root_client).await;
+    let cg = await_members_count(&root_client, 4).await;
     assert_eq!(cg.members_count, 4);
     assert_unique_partition_assignments(&cg);
     assert_balanced_partition_distribution(&cg, 16);
@@ -3697,7 +3814,7 @@ async fn should_maintain_balance_after_member_churn(harness: &TestHarness) {
 
     sleep(Duration::from_millis(500)).await;
 
-    let cg = get_consumer_group(&root_client).await;
+    let cg = await_members_count(&root_client, 4).await;
     assert_eq!(cg.members_count, 4);
     assert_unique_partition_assignments(&cg);
     assert_balanced_partition_distribution(&cg, 16);

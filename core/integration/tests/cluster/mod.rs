@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod chaos_monkey;
 mod client_table_adversarial;
 mod client_table_restart;
 mod consumer_offset_quota;
@@ -23,6 +24,7 @@ mod crash_offset_reuse;
 mod crash_recovery_corruption;
 mod failover_client_continuity;
 mod fast_primary_rejoin;
+mod metadata_changes;
 mod metadata_checkpoint_restart;
 mod metadata_state_transfer;
 mod multi_shard_partition_convergence;
@@ -31,5 +33,10 @@ mod partition_dedup;
 mod partition_primary_routing;
 mod partition_state_transfer;
 mod register_forwarding;
+mod replica_raw_request;
 mod replica_read_batching;
+mod rolling_sigkill_repro;
+mod root_credentials;
 mod staggered_bootstrap;
+mod stream_encryption;
+mod stream_key_rotation;

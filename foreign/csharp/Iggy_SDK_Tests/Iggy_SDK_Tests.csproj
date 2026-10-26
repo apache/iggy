@@ -31,7 +31,6 @@ under the License.
     </PropertyGroup>
 
     <ItemGroup>
-        <PackageReference Include="FluentAssertions" />
         <PackageReference Include="Microsoft.NET.Test.Sdk" />
         <PackageReference Include="Microsoft.Testing.Extensions.CodeCoverage" />
         <PackageReference Include="Moq" />
@@ -47,6 +46,15 @@ under the License.
         <ProjectReference Include="..\Iggy_SDK\Iggy_SDK.csproj" />
         <ProjectReference Include="..\Shared\Shared.csproj" />
         <Compile Include="../../../examples/csharp/src/Iggy_SDK.Examples.Shared/ExampleHelpers.cs" Link="Examples/ExampleHelpers.cs" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <None Include="Fixtures/resource_options.json">
+            <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+        </None>
+        <None Include="Fixtures/metadata_changes.json">
+            <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+        </None>
     </ItemGroup>
 
 </Project>

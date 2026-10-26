@@ -24,9 +24,10 @@ use bytes::Bytes;
 use kafka_protocol::messages::{HeartbeatRequest, HeartbeatResponse};
 
 use crate::error::Result;
+use crate::group::GroupMember;
 use crate::protocol::api::{
-    API_KEY_HEARTBEAT, ApiVersionRange, ERROR_INVALID_REQUEST, ERROR_UNSUPPORTED_VERSION,
-    GatewayState, HandleOutcome, is_supported_version,
+    API_KEY_HEARTBEAT, ApiVersionRange, ConnectionState, ERROR_INVALID_REQUEST,
+    ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome, is_supported_version,
 };
 use crate::protocol::bounds_guard::validate_heartbeat_shape;
 use crate::protocol::handlers::{
@@ -39,7 +40,12 @@ pub const RANGE: ApiVersionRange = ApiVersionRange {
     max_version: 4,
 };
 
-pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> HandleOutcome {
+pub async fn handle(
+    state: &GatewayState,
+    connection: &ConnectionState,
+    api_version: i16,
+    body: Bytes,
+) -> HandleOutcome {
     if !is_supported_version(API_KEY_HEARTBEAT, api_version) {
         return unsupported_version_response(API_KEY_HEARTBEAT, api_version, |version| {
             encode_error_response(version, ERROR_UNSUPPORTED_VERSION)
@@ -64,8 +70,10 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
             &request.group_id.0,
             request.generation_id,
             &request.member_id,
+            request.group_instance_id.as_ref(),
         )
         .await;
+    connection.note_heartbeat(GroupMember::from(&request));
     respond_or_close(encode_error_response(api_version, error_code), "Heartbeat")
 }
 

@@ -18,11 +18,13 @@
 pub mod authz;
 pub mod consumer_group;
 pub mod id_slab;
+pub mod lifecycle;
 pub mod mux;
 pub mod result;
 pub mod snapshot;
 pub mod stream;
 pub mod user;
+use iggy_binary_protocol::PrepareHeader;
 use iggy_common::Either;
 use left_right::{Absorb, ReadHandle, ReadHandleFactory, WriteHandle};
 use std::cell::Cell;
@@ -30,6 +32,29 @@ use std::cell::UnsafeCell;
 use std::sync::Arc;
 
 pub use left_right::ReadHandleFactory as LeftRightFactory;
+
+/// Identity of the committed operation driving a metadata transition.
+/// The Streams revision is an incarnation counter and cannot replace `metadata_op`.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+pub struct ApplyContext {
+    pub metadata_op: u64,
+    pub client_id: u128,
+    pub session: u64,
+    pub request: u64,
+    pub user_id: u32,
+}
+
+impl From<&PrepareHeader> for ApplyContext {
+    fn from(header: &PrepareHeader) -> Self {
+        Self {
+            metadata_op: header.op,
+            client_id: header.client,
+            session: header.session,
+            request: header.request,
+            user_id: header.user_id,
+        }
+    }
+}
 
 pub struct WriteCell<T, O>
 where
@@ -61,13 +86,24 @@ where
     /// Panics if the inner `UnsafeCell` pointer is null (should never happen
     /// unless the writer was not properly initialized).
     pub fn apply(&self, cmd: O) {
+        self.apply_all(std::iter::once(cmd));
+    }
+
+    /// Applies `cmds` in order and publishes once, so readers see all of them
+    /// or none.
+    ///
+    /// # Panics
+    /// Panics if the inner `UnsafeCell` pointer is null (should never happen
+    /// unless the writer was not properly initialized).
+    pub fn apply_all(&self, cmds: impl IntoIterator<Item = O>) {
         let hdl = unsafe {
             self.inner
                 .get()
                 .as_mut()
                 .expect("[apply]: called on uninit writer")
         };
-        hdl.append(cmd).publish();
+        hdl.extend(cmds);
+        hdl.publish();
     }
 }
 
@@ -217,6 +253,21 @@ where
         cell.apply(cmd);
         Ok(())
     }
+
+    /// Apply `cmds` in order with one publish, see [`WriteCell::apply_all`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApplyOnReaderError::ReaderOnly`] like [`Self::try_apply`],
+    /// with no command applied.
+    pub fn try_apply_all(
+        &self,
+        cmds: impl IntoIterator<Item = <T as Command>::Cmd>,
+    ) -> Result<(), ApplyOnReaderError> {
+        let cell = self.write.as_ref().ok_or(ApplyOnReaderError::ReaderOnly)?;
+        cell.apply_all(cmds);
+        Ok(())
+    }
 }
 
 /// Public interface for state handlers.
@@ -308,6 +359,7 @@ macro_rules! define_state {
                     $field_vis $field_name: $field_type,
                 )*
                 pub(crate) last_result: Option<$crate::stm::result::ApplyReply>,
+                pub(crate) apply_context: $crate::stm::ApplyContext,
             }
 
             impl [<$state Inner>] {
@@ -361,6 +413,17 @@ macro_rules! define_state {
                         inner: $crate::stm::LeftRight::from_factory(factory),
                     }
                 }
+
+                /// The change records of the command applied last.
+                pub(crate) fn last_changes(&self) -> Vec<$crate::change_log::AppliedChange> {
+                    self.inner.read(|state| {
+                        state
+                            .last_result
+                            .as_ref()
+                            .map(|reply| reply.changes.clone())
+                            .unwrap_or_default()
+                    })
+                }
             }
 
             impl $crate::stm::mux::WithFactory for $state {
@@ -403,10 +466,10 @@ macro_rules! collect_handlers {
             #[derive(Debug, Clone)]
             pub enum [<$state Command>] {
                 $(
-                    $operation([<$operation Request>], ::iggy_common::IggyTimestamp),
+                    $operation([<$operation Request>], ::iggy_common::IggyTimestamp, $crate::stm::ApplyContext),
                 )*
                 $($(
-                    $internal([<$internal Request>], ::iggy_common::IggyTimestamp),
+                    $internal([<$internal Request>], ::iggy_common::IggyTimestamp, $crate::stm::ApplyContext),
                 )*)?
                 /// Replace the whole state from a snapshot section, in place.
                 /// Never parsed off the wire (state transfer installs it via
@@ -429,9 +492,9 @@ macro_rules! collect_handlers {
                     // Both scalars copied out of one header read. `header()`
                     // re-validates the bit pattern on each call, and the borrow has
                     // to end before the pass-through arm can move `input` on.
-                    let (operation, timestamp) = {
+                    let (operation, timestamp, context) = {
                         let header = input.header();
-                        (header.operation, header.timestamp)
+                        (header.operation, header.timestamp, $crate::stm::ApplyContext::from(header))
                     };
 
                     match operation {
@@ -443,7 +506,7 @@ macro_rules! collect_handlers {
                                 let cmd = [<$operation Request>]::decode_from(input.body())
                                     .map_err(|_| ::iggy_common::IggyError::InvalidCommand)?;
                                 let ts = ::iggy_common::IggyTimestamp::from(timestamp);
-                                Ok(Either::Left([<$state Command>]::$operation(cmd, ts)))
+                                Ok(Either::Left([<$state Command>]::$operation(cmd, ts, context)))
                             },
                         )*
                         _ => Ok(Either::Right(input)),
@@ -455,12 +518,14 @@ macro_rules! collect_handlers {
                 fn dispatch(&mut self, cmd: &[<$state Command>]) {
                     self.last_result = Some(match cmd {
                         $(
-                            [<$state Command>]::$operation(payload, ts) => {
+                            [<$state Command>]::$operation(payload, ts, context) => {
+                                self.apply_context = *context;
                                 $crate::stm::StateHandler::apply(payload, self, *ts)
                             },
                         )*
                         $($(
-                            [<$state Command>]::$internal(payload, ts) => {
+                            [<$state Command>]::$internal(payload, ts, context) => {
+                                self.apply_context = *context;
                                 $crate::stm::StateHandler::apply(payload, self, *ts)
                             },
                         )*)?
@@ -524,6 +589,8 @@ macro_rules! collect_handlers {
 mod tests {
     use super::*;
     use left_right::Absorb;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     #[derive(Debug, Default, Clone)]
     struct Counter(u64);
@@ -582,5 +649,55 @@ mod tests {
             0,
             "reader state must be unchanged after a rejected try_apply"
         );
+    }
+
+    /// `absorb_first` gets the copy that readers see, so each first absorb
+    /// logs how many commands readers saw then. Both copies share the log.
+    #[derive(Debug, Default, Clone)]
+    struct PublishProbe {
+        applied: u64,
+        visible_at_absorb: Rc<RefCell<Vec<u64>>>,
+    }
+
+    impl Absorb<CounterCmd> for PublishProbe {
+        fn absorb_first(&mut self, _cmd: &mut CounterCmd, other: &Self) {
+            self.visible_at_absorb.borrow_mut().push(other.applied);
+            self.applied += 1;
+        }
+
+        fn absorb_second(&mut self, _cmd: CounterCmd, _other: &Self) {
+            self.applied += 1;
+        }
+
+        fn sync_with(&mut self, first: &Self) {
+            *self = first.clone();
+        }
+    }
+
+    impl Command for PublishProbe {
+        type Cmd = CounterCmd;
+        type Input = ();
+        type Error = ();
+
+        fn parse(_input: Self::Input) -> Result<Either<Self::Cmd, Self::Input>, Self::Error> {
+            Ok(Either::Left(CounterCmd::Inc))
+        }
+    }
+
+    #[test]
+    fn given_two_commands_when_applied_together_should_publish_them_at_once() {
+        let lr: LeftRight<PublishProbe, CounterCmd> = PublishProbe::default().into();
+        // Until its first publish, left-right absorbs in place, past `absorb_first`.
+        lr.try_apply(CounterCmd::Inc)
+            .expect("writer must accept apply");
+        lr.try_apply_all([CounterCmd::Inc, CounterCmd::Inc])
+            .expect("writer must accept apply");
+        let visible_at_absorb = lr.read(|probe| Rc::clone(&probe.visible_at_absorb));
+        assert_eq!(
+            *visible_at_absorb.borrow(),
+            [1, 1],
+            "readers must see no command of the batch before all of them apply"
+        );
+        assert_eq!(lr.read(|probe| probe.applied), 3);
     }
 }

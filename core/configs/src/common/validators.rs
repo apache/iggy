@@ -18,11 +18,11 @@
 use super::COMPONENT;
 use super::server::{DataMaintenanceConfig, MessagesMaintenanceConfig, TelemetryConfig};
 use super::server::{MemoryPoolConfig, PersonalAccessTokenConfig};
-use super::system::LoggingConfig;
+use super::system::{EncryptionConfig, LoggingConfig};
 use crate::ConfigurationError;
 use cpu_allocation::{CpuAllocation, allowed_cpus};
 use err_trail::ErrContext;
-use iggy_common::Validatable;
+use iggy_common::{ServerKeyContext, Validatable};
 use server_common::log::LogFilter;
 use std::thread::available_parallelism;
 
@@ -51,6 +51,27 @@ impl Validatable<ConfigurationError> for TelemetryConfig {
         }
 
         Ok(())
+    }
+}
+
+impl Validatable<ConfigurationError> for EncryptionConfig {
+    /// A supplied key must be 32 bytes of base64, and `enabled` needs one.
+    /// The key values are never printed.
+    fn validate(&self) -> Result<(), ConfigurationError> {
+        ServerKeyContext::from_config(&self.key, &self.previous_keys, self.enabled)
+            .and_then(|context| {
+                context.with_retired_kek_fingerprints(&self.retired_kek_fingerprints)
+            })
+            .map(|_| ())
+            .map_err(|_| {
+                eprintln!(
+                    "encryption.key must be 32 bytes of standard base64, set when encryption is \
+                     enabled, encryption.previous_keys may hold at most two other such keys, and \
+                     encryption.retired_kek_fingerprints needs a key and holds 16 lowercase hex \
+                     characters per entry, none naming a configured key"
+                );
+                ConfigurationError::InvalidConfigurationValue
+            })
     }
 }
 
@@ -309,29 +330,35 @@ mod logging_tests {
     use iggy_common::{IggyByteSize, IggyDuration};
     use std::time::Duration;
 
+    #[test]
+    fn given_print_interval_samples_when_validating_should_accept_zero_or_at_least_one_second() {
+        let one_second = Duration::from_secs(1);
+        let samples = [
+            Duration::ZERO,
+            Duration::from_nanos(1),
+            Duration::from_micros(1),
+            Duration::from_millis(1),
+            Duration::from_millis(500),
+            Duration::from_nanos(999_999_999),
+            one_second,
+            Duration::from_nanos(1_000_000_001),
+            Duration::from_secs(10),
+        ];
+        for interval in samples {
+            let accepted = with_sysinfo_print_interval(interval).validate().is_ok();
+            assert_eq!(
+                accepted,
+                interval.is_zero() || interval >= one_second,
+                "sysinfo_print_interval {interval:?}"
+            );
+        }
+    }
+
     fn with_sysinfo_print_interval(interval: Duration) -> LoggingConfig {
         LoggingConfig {
             sysinfo_print_interval: IggyDuration::new(interval),
             ..LoggingConfig::default()
         }
-    }
-
-    #[test]
-    fn sub_second_sysinfo_print_interval_is_rejected() {
-        let config = with_sysinfo_print_interval(Duration::from_millis(999));
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn one_second_sysinfo_print_interval_is_accepted() {
-        let config = with_sysinfo_print_interval(Duration::from_secs(1));
-        assert!(config.validate().is_ok());
-    }
-
-    #[test]
-    fn disabled_sysinfo_print_interval_is_accepted() {
-        let config = with_sysinfo_print_interval(Duration::ZERO);
-        assert!(config.validate().is_ok());
     }
 
     #[test]
@@ -380,5 +407,96 @@ mod logging_tests {
         };
         assert!(below.validate().is_err());
         assert!(unlimited.validate().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const KEY: &str = "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=";
+    const OTHER_KEY: &str = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=";
+    const THIRD_KEY: &str = "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=";
+
+    #[test]
+    fn given_encryption_config_when_validating_should_require_valid_key_only_when_supplied_or_enabled()
+     {
+        for (enabled, key, valid) in [
+            (false, "", true),
+            (false, KEY, true),
+            (true, KEY, true),
+            (true, "", false),
+            (false, "c2hvcnQ=", false),
+            (true, "not base64", false),
+        ] {
+            assert_eq!(
+                config(enabled, key, &[]).validate().is_ok(),
+                valid,
+                "enabled={enabled}, key length {}",
+                key.len()
+            );
+        }
+    }
+
+    #[test]
+    fn given_previous_keys_when_validating_should_require_valid_current_key_and_at_most_two() {
+        for (key, previous, valid) in [
+            (KEY, vec![], true),
+            (KEY, vec![OTHER_KEY], true),
+            (KEY, vec![OTHER_KEY, THIRD_KEY], true),
+            (KEY, vec![OTHER_KEY, THIRD_KEY, "AAAA"], false),
+            (KEY, vec![KEY], false),
+            (KEY, vec![OTHER_KEY, OTHER_KEY], false),
+            (KEY, vec!["c2hvcnQ="], false),
+            ("", vec![OTHER_KEY], false),
+        ] {
+            assert_eq!(
+                config(true, key, &previous).validate().is_ok(),
+                valid,
+                "{} previous keys",
+                previous.len()
+            );
+        }
+    }
+
+    #[test]
+    fn given_retired_kek_fingerprints_when_validating_should_require_a_key_and_unconfigured_hex() {
+        let configured = ServerKeyContext::from_config(KEY, &[], true)
+            .expect("valid key")
+            .kek_fingerprint()
+            .expect("a fingerprint");
+        let unconfigured = ServerKeyContext::from_config(THIRD_KEY, &[], true)
+            .expect("valid key")
+            .kek_fingerprint()
+            .expect("a fingerprint");
+        for (key, previous, retired, valid) in [
+            (KEY, vec![], vec![unconfigured.clone()], true),
+            (KEY, vec![], vec![], true),
+            ("", vec![], vec![], true),
+            ("", vec![], vec![unconfigured.clone()], false),
+            (KEY, vec![], vec![configured], false),
+            (KEY, vec![THIRD_KEY], vec![unconfigured.clone()], false),
+            (KEY, vec![], vec![unconfigured.to_uppercase()], false),
+            (KEY, vec![], vec![unconfigured[..15].to_owned()], false),
+            (
+                KEY,
+                vec![],
+                vec![unconfigured.clone(), unconfigured.clone()],
+                false,
+            ),
+        ] {
+            let mut config = config(!key.is_empty(), key, &previous);
+            config.retired_kek_fingerprints = retired.clone();
+            assert_eq!(config.validate().is_ok(), valid, "{retired:?}");
+        }
+    }
+
+    fn config(enabled: bool, key: &str, previous_keys: &[&str]) -> EncryptionConfig {
+        EncryptionConfig {
+            enabled,
+            key: key.to_owned(),
+            previous_keys: previous_keys.iter().map(|key| (*key).to_owned()).collect(),
+            retired_kek_fingerprints: Vec::new(),
+        }
     }
 }

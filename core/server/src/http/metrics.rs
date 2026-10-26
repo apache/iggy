@@ -20,13 +20,21 @@
 //! whether the route is mounted. The scrape handler itself lives with the
 //! other route handlers so this leaf never imports the state hub.
 
+use std::fmt::Write;
+use std::mem;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+
 use configs::http::HttpMetricsConfig;
 use iggy_common::{IggyError, stats_rollup_underflows};
 use prometheus_client::collector::Collector;
 use prometheus_client::encoding::text::encode;
-use prometheus_client::encoding::{DescriptorEncoder, EncodeMetric};
+use prometheus_client::encoding::{
+    DescriptorEncoder, EncodeLabelValue, EncodeMetric, LabelValueEncoder,
+};
+use prometheus_client::metrics::MetricType;
 use prometheus_client::metrics::counter::{ConstCounter, Counter};
-use prometheus_client::metrics::gauge::Gauge;
+use prometheus_client::metrics::gauge::{ConstGauge, Gauge};
 use prometheus_client::registry::Registry;
 use tracing::error;
 
@@ -39,7 +47,7 @@ use tracing::error;
 /// one counter, which carries no scope label -- the `warn!` in `iggy_common`
 /// names the scope and counter that moved it.
 ///
-/// Not "alert on any increase". A delete, a purge, a partition teardown and a
+/// Not "alert on any increase". A delete, a partition teardown and a
 /// snapshot restore each open a window where a retention pass hands back bytes
 /// the parents have already given up, and the clamp is the intended outcome
 /// there -- `given_a_rolled_back_partition_when_a_late_decrement_arrives_should_leave_siblings_alone`
@@ -73,6 +81,110 @@ impl Collector for StatsRollupUnderflows {
     }
 }
 
+/// One topic's usage as the scrape handler sampled it from the streams STM.
+#[derive(Debug)]
+pub(in crate::http) struct TopicUsageSample {
+    pub(in crate::http) stream: Arc<str>,
+    pub(in crate::http) topic: Arc<str>,
+    pub(in crate::http) size_bytes: u64,
+    pub(in crate::http) messages: u64,
+    /// `None` for an uncapped topic, so its series is absent rather than 0 and
+    /// `topic_size_bytes / topic_max_size_bytes` never yields `+Inf`.
+    pub(in crate::http) max_size_bytes: Option<u64>,
+}
+
+/// Per-topic `{stream, topic}` series, replaced wholesale on every scrape so a
+/// deleted or renamed topic drops out on the next one.
+///
+/// The collector cannot read the streams STM itself: it lives on shard 0 and
+/// is `!Sync`, while a registered collector must be `Send + Sync`, so the
+/// scrape handler hands it a snapshot instead.
+#[derive(Debug, Clone, Default)]
+pub(in crate::http) struct TopicUsage {
+    samples: Arc<Mutex<Vec<TopicUsageSample>>>,
+}
+
+impl TopicUsage {
+    pub(in crate::http) fn replace(&self, samples: Vec<TopicUsageSample>) {
+        *self.samples.lock().unwrap_or_else(PoisonError::into_inner) = samples;
+    }
+}
+
+impl Collector for TopicUsage {
+    fn encode(&self, mut encoder: DescriptorEncoder) -> Result<(), std::fmt::Error> {
+        // The scrape handler refills the snapshot before every encode, so
+        // keeping it past this encode only pins every topic name until the
+        // next scrape.
+        let samples = mem::take(&mut *self.samples.lock().unwrap_or_else(PoisonError::into_inner));
+        encode_topic_gauge(
+            &mut encoder,
+            "topic_size_bytes",
+            "size of the topic's stored messages in bytes",
+            &samples,
+            |sample| Some(sample.size_bytes),
+        )?;
+        encode_topic_gauge(
+            &mut encoder,
+            "topic_messages",
+            "count of the topic's stored messages",
+            &samples,
+            |sample| Some(sample.messages),
+        )?;
+        encode_topic_gauge(
+            &mut encoder,
+            "topic_max_size_bytes",
+            concat!(
+                "configured size cap of the topic in bytes, absent when unlimited; ",
+                "retention may keep more",
+            ),
+            &samples,
+            |sample| sample.max_size_bytes,
+        )
+    }
+}
+
+fn encode_topic_gauge(
+    encoder: &mut DescriptorEncoder,
+    name: &str,
+    help: &str,
+    samples: &[TopicUsageSample],
+    value: impl Fn(&TopicUsageSample) -> Option<u64>,
+) -> Result<(), std::fmt::Error> {
+    let mut metric_encoder = encoder.encode_descriptor(name, help, None, MetricType::Gauge)?;
+    for sample in samples {
+        let Some(value) = value(sample) else {
+            continue;
+        };
+        let labels = [
+            ("stream", EscapedLabelValue(&sample.stream)),
+            ("topic", EscapedLabelValue(&sample.topic)),
+        ];
+        ConstGauge::new(value).encode(metric_encoder.encode_family(&labels)?)?;
+    }
+    Ok(())
+}
+
+/// prometheus-client writes label values verbatim, and stream and topic names
+/// may contain any character the exposition format treats as syntax.
+struct EscapedLabelValue<'a>(&'a str);
+
+impl EncodeLabelValue for EscapedLabelValue<'_> {
+    fn encode(&self, encoder: &mut LabelValueEncoder) -> Result<(), std::fmt::Error> {
+        if !self.0.contains(['\\', '"', '\n']) {
+            return encoder.write_str(self.0);
+        }
+        for character in self.0.chars() {
+            match character {
+                '\\' => encoder.write_str("\\\\")?,
+                '"' => encoder.write_str("\\\"")?,
+                '\n' => encoder.write_str("\\n")?,
+                other => encoder.write_char(other)?,
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The legacy server's metric set, registered under the same names and help
 /// texts so existing dashboards and alerts keep working unchanged.
 ///
@@ -90,6 +202,16 @@ pub(in crate::http) struct HttpMetrics {
     pub(in crate::http) messages: Gauge,
     pub(in crate::http) users: Gauge,
     pub(in crate::http) clients: Gauge,
+    pub(in crate::http) topic_usage: TopicUsage,
+    /// Partition primary lookups on the owning shard for HTTP partition requests.
+    pub(in crate::http) partition_primary_probes: Counter,
+    /// Attempts to relay an HTTP partition request to another node.
+    pub(in crate::http) partition_relays: Counter,
+    /// Requests for the metadata primary's commit floor, one per attempt.
+    pub(in crate::http) metadata_floor_reads: Counter,
+    /// VSR `Register` submits for HTTP sessions, one per minted client id.
+    pub(in crate::http) session_registers: Counter,
+    last_output_len: AtomicUsize,
 }
 
 impl HttpMetrics {
@@ -119,9 +241,36 @@ impl HttpMetrics {
         registry.register("messages", "total count of messages", messages.clone());
         registry.register("users", "total count of users", users.clone());
         registry.register("clients", "total count of clients", clients.clone());
+        // Not legacy parity: what routing the HTTP partition requests cost.
+        let partition_primary_probes = Counter::default();
+        let partition_relays = Counter::default();
+        let metadata_floor_reads = Counter::default();
+        let session_registers = Counter::default();
+        registry.register(
+            "http_partition_primary_probes",
+            "partition primary lookups on the owning shard for HTTP partition requests",
+            partition_primary_probes.clone(),
+        );
+        registry.register(
+            "http_partition_relays",
+            "attempts to relay an HTTP partition request to the partition primary on another node",
+            partition_relays.clone(),
+        );
+        registry.register(
+            "http_metadata_floor_reads",
+            "requests for the metadata primary's commit floor by linearizable HTTP partition reads",
+            metadata_floor_reads.clone(),
+        );
+        registry.register(
+            "http_session_registers",
+            "VSR Register submits that open an HTTP session, a metadata commit each",
+            session_registers.clone(),
+        );
         // Not a legacy-parity metric, and not a mirrored one: the source is a
         // process-wide static the scrape reads directly.
         registry.register_collector(Box::new(StatsRollupUnderflows));
+        let topic_usage = TopicUsage::default();
+        registry.register_collector(Box::new(topic_usage.clone()));
         // Every shard's drop / reconcile / partition counters, one
         // `shard`-labelled sub-registry per shard so series stay per-shard
         // without a `shard_id` label in the counter label sets (see
@@ -145,6 +294,12 @@ impl HttpMetrics {
             messages,
             users,
             clients,
+            topic_usage,
+            partition_primary_probes,
+            partition_relays,
+            metadata_floor_reads,
+            session_registers,
+            last_output_len: AtomicUsize::new(0),
         }
     }
 
@@ -155,10 +310,12 @@ impl HttpMetrics {
     }
 
     pub(in crate::http) fn formatted_output(&self) -> String {
-        let mut buffer = String::new();
+        let last = self.last_output_len.load(Ordering::Relaxed);
+        let mut buffer = String::with_capacity(last + last / 8);
         if let Err(error) = encode(&mut buffer, &self.registry) {
             error!(%error, "failed to encode metrics");
         }
+        self.last_output_len.store(buffer.len(), Ordering::Relaxed);
         buffer
     }
 }
@@ -317,6 +474,90 @@ mod tests {
     fn validated_endpoint_returns_enabled_path() {
         let endpoint = validated_endpoint(&metrics_config(true, "/metrics")).unwrap();
         assert_eq!(endpoint.as_deref(), Some("/metrics"));
+    }
+
+    fn topic_sample(stream: &str, topic: &str, max_size_bytes: Option<u64>) -> TopicUsageSample {
+        TopicUsageSample {
+            stream: Arc::from(stream),
+            topic: Arc::from(topic),
+            size_bytes: 4096,
+            messages: 20,
+            max_size_bytes,
+        }
+    }
+
+    #[test]
+    fn given_topic_samples_when_encoding_should_label_each_series_by_stream_and_topic() {
+        let metrics = HttpMetrics::init(&[]);
+        metrics.topic_usage.replace(vec![
+            topic_sample("orders", "eu", Some(1_000_000)),
+            topic_sample("orders", "us", None),
+        ]);
+        let output = metrics.formatted_output();
+        for line in [
+            "# TYPE topic_size_bytes gauge",
+            "# TYPE topic_messages gauge",
+            "# TYPE topic_max_size_bytes gauge",
+            r#"topic_size_bytes{stream="orders",topic="eu"} 4096"#,
+            r#"topic_size_bytes{stream="orders",topic="us"} 4096"#,
+            r#"topic_messages{stream="orders",topic="eu"} 20"#,
+            r#"topic_messages{stream="orders",topic="us"} 20"#,
+            r#"topic_max_size_bytes{stream="orders",topic="eu"} 1000000"#,
+        ] {
+            assert!(
+                output.contains(&format!("\n{line}\n")),
+                "expected `{line}` in exposition:\n{output}"
+            );
+        }
+        assert!(
+            !output.contains(r#"topic_max_size_bytes{stream="orders",topic="us"}"#),
+            "an uncapped topic must not export a max size:\n{output}"
+        );
+    }
+
+    #[test]
+    fn given_replaced_snapshot_when_encoding_should_drop_topics_no_longer_present() {
+        let metrics = HttpMetrics::init(&[]);
+        metrics
+            .topic_usage
+            .replace(vec![topic_sample("orders", "eu", None)]);
+        metrics.topic_usage.replace(Vec::new());
+        let output = metrics.formatted_output();
+        assert!(
+            !output.contains(r#"topic="eu""#),
+            "a deleted topic must not outlive the next scrape:\n{output}"
+        );
+    }
+
+    #[test]
+    fn given_encoded_snapshot_when_scraping_again_without_refill_should_not_retain_it() {
+        let metrics = HttpMetrics::init(&[]);
+        metrics
+            .topic_usage
+            .replace(vec![topic_sample("orders", "eu", None)]);
+        let first = metrics.formatted_output();
+        assert!(
+            first.contains(r#"topic="eu""#),
+            "the snapshot must be encoded before it is released:\n{first}"
+        );
+        let second = metrics.formatted_output();
+        assert!(
+            !second.contains(r#"topic="eu""#),
+            "the snapshot must not outlive the scrape that encoded it:\n{second}"
+        );
+    }
+
+    #[test]
+    fn given_name_with_exposition_syntax_when_encoding_should_escape_it() {
+        let metrics = HttpMetrics::init(&[]);
+        metrics
+            .topic_usage
+            .replace(vec![topic_sample("a\"b", "c\\d\ne", None)]);
+        let output = metrics.formatted_output();
+        assert!(
+            output.contains(r#"topic_messages{stream="a\"b",topic="c\\d\ne"} 20"#),
+            "label values must be escaped:\n{output}"
+        );
     }
 
     #[test]

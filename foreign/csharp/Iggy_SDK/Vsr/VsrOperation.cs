@@ -36,22 +36,25 @@ internal enum VsrOperation : byte
     CompleteConsumerGroupRevocation = 67,
     TruncatePartition = 68,
     FinalizeSession = 70,
+    CompleteLifecycle = 71,
+    UpdateStreamResolved = 72,
+    UpdateTopicResolved = 73,
+    UpdateUserResolved = 74,
+    RewrapStreamKeys = 75,
 
     CreateStream = 128,
-    UpdateStream = 129,
+    // 129 was UpdateStream. Never reuse it.
     DeleteStream = 130,
-    PurgeStream = 131,
     CreateTopic = 132,
-    UpdateTopic = 133,
+    // 133 was UpdateTopic. Never reuse it.
     DeleteTopic = 134,
-    PurgeTopic = 135,
     CreatePartitions = 136,
     DeletePartitions = 137,
     DeleteSegments = 138,
     CreateConsumerGroup = 139,
     DeleteConsumerGroup = 140,
     CreateUser = 141,
-    UpdateUser = 142,
+    // 142 was UpdateUser. Never reuse it.
     DeleteUser = 143,
     ChangePassword = 144,
     UpdatePermissions = 145,
@@ -59,11 +62,15 @@ internal enum VsrOperation : byte
     DeletePersonalAccessToken = 147,
     JoinConsumerGroup = 148,
     LeaveConsumerGroup = 149,
+    UpdateResource = 150,
 
     SendMessages = 160,
     StoreConsumerOffset = 161,
     DeleteConsumerOffset = 162,
-    RetireSession = 166
+    RetireSession = 166,
+    InstallConsumerGroupOwner = 167,
+    TransitionPartitionHistory = 168,
+    RetireConsumerGroupOwners = 169
 }
 
 internal static class VsrOperations
@@ -81,6 +88,7 @@ internal static class VsrOperations
         CommandCodes.GET_STATS_CODE,
         CommandCodes.GET_SNAPSHOT_CODE,
         CommandCodes.GET_CLUSTER_METADATA_CODE,
+        CommandCodes.GET_METADATA_CHANGES_CODE,
         CommandCodes.GET_ME_CODE,
         CommandCodes.GET_CLIENT_CODE,
         CommandCodes.GET_CLIENTS_CODE,
@@ -95,7 +103,7 @@ internal static class VsrOperations
         CommandCodes.GET_CONSUMER_GROUP_CODE,
         CommandCodes.GET_CONSUMER_GROUPS_CODE,
         CommandCodes.SYNC_CONSUMER_GROUP_CODE,
-        CommandCodes.GET_POLL_ROUTING_CODE
+        CommandCodes.GET_PARTITION_ROUTE_CODE,
     ];
 
     /// <summary>
@@ -118,7 +126,6 @@ internal static class VsrOperations
             CommandCodes.LOGOUT_USER_CODE => VsrOperation.Logout,
             CommandCodes.CREATE_USER_CODE => VsrOperation.CreateUser,
             CommandCodes.DELETE_USER_CODE => VsrOperation.DeleteUser,
-            CommandCodes.UPDATE_USER_CODE => VsrOperation.UpdateUser,
             CommandCodes.UPDATE_PERMISSIONS_CODE => VsrOperation.UpdatePermissions,
             CommandCodes.CHANGE_PASSWORD_CODE => VsrOperation.ChangePassword,
             CommandCodes.CREATE_PERSONAL_ACCESS_TOKEN_CODE => VsrOperation.CreatePersonalAccessToken,
@@ -128,12 +135,9 @@ internal static class VsrOperations
             CommandCodes.DELETE_CONSUMER_OFFSET_CODE => VsrOperation.DeleteConsumerOffset,
             CommandCodes.CREATE_STREAM_CODE => VsrOperation.CreateStream,
             CommandCodes.DELETE_STREAM_CODE => VsrOperation.DeleteStream,
-            CommandCodes.UPDATE_STREAM_CODE => VsrOperation.UpdateStream,
-            CommandCodes.PURGE_STREAM_CODE => VsrOperation.PurgeStream,
             CommandCodes.CREATE_TOPIC_CODE => VsrOperation.CreateTopic,
             CommandCodes.DELETE_TOPIC_CODE => VsrOperation.DeleteTopic,
-            CommandCodes.UPDATE_TOPIC_CODE => VsrOperation.UpdateTopic,
-            CommandCodes.PURGE_TOPIC_CODE => VsrOperation.PurgeTopic,
+            CommandCodes.UPDATE_RESOURCE_CODE => VsrOperation.UpdateResource,
             CommandCodes.CREATE_PARTITIONS_CODE => VsrOperation.CreatePartitions,
             CommandCodes.DELETE_PARTITIONS_CODE => VsrOperation.DeletePartitions,
             CommandCodes.DELETE_SEGMENTS_CODE => VsrOperation.DeleteSegments,
@@ -149,17 +153,8 @@ internal static class VsrOperations
     ///     Whether losing the connection mid-request leaves nothing for the server to deduplicate, so the request
     ///     can be re-issued on a fresh session by the reconnect path instead of failing the caller.
     /// </summary>
-    internal static bool IsReplaySafeRead(int code, bool isLoginRegister, ReadOnlySpan<byte> body)
+    internal static bool IsReplaySafeRead(int code, ReadOnlySpan<byte> body)
     {
-        // A register lost mid-flight is replayable: the retry re-arms the session under a fresh client id, so
-        // it cannot be mistaken for the first one. At worst the server keeps an entry nobody binds, which it
-        // ages out. Reporting an unknown outcome here instead would deny the caller the retry that is in fact
-        // the only correct response.
-        if (isLoginRegister)
-        {
-            return true;
-        }
-
         var operation = ForCode(code);
 
         if (operation != VsrOperation.NonReplicated)
@@ -169,7 +164,7 @@ internal static class VsrOperations
 
         // A poll that auto-commits moves the consumer offset server-side, so a reply lost after the commit
         // would make the replay start past a batch the caller never saw. auto_commit is the last body byte.
-        if (code is CommandCodes.POLL_MESSAGES_CODE or CommandCodes.POLL_MESSAGES_ON_PRIMARY_CODE)
+        if (code is CommandCodes.POLL_MESSAGES_CODE)
         {
             return body.Length > 0 && body[^1] == 0;
         }
@@ -182,20 +177,27 @@ internal static class VsrOperations
 
     /// <summary>
     ///     Whether the byte is a declared discriminant. Replies carry a server-controlled operation byte, so
-    ///     an undeclared value is rejected rather than classified by range.
+    ///     an undeclared value, a retired one included, is rejected rather than classified by range.
     /// </summary>
     internal static bool IsKnown(byte value)
     {
-        return (VsrOperation)value switch
+        return Enum.IsDefined((VsrOperation)value);
+    }
+
+    /// <summary>
+    ///     The operation a request carried before prepare rewrote it, mirroring <c>Operation::request_operation</c>.
+    ///     A committed reply names the rewritten operation, so a reply correlates with its request through this.
+    /// </summary>
+    internal static VsrOperation RequestOperation(this VsrOperation operation)
+    {
+        return operation switch
         {
-            VsrOperation.Reserved or VsrOperation.Register or VsrOperation.NonReplicated or VsrOperation.Logout =>
-                true,
-            >= VsrOperation.CreateTopicWithAssignments and <= VsrOperation.TruncatePartition => true,
-            VsrOperation.FinalizeSession or VsrOperation.RetireSession => true,
-            >= VsrOperation.CreateStream and <= VsrOperation.LeaveConsumerGroup => true,
-            VsrOperation.SendMessages or VsrOperation.StoreConsumerOffset or VsrOperation.DeleteConsumerOffset =>
-                true,
-            _ => false
+            VsrOperation.CreateTopicWithAssignments => VsrOperation.CreateTopic,
+            VsrOperation.CreatePartitionsWithAssignments => VsrOperation.CreatePartitions,
+            VsrOperation.UpdateStreamResolved or VsrOperation.UpdateTopicResolved or VsrOperation.UpdateUserResolved =>
+                VsrOperation.UpdateResource,
+            VsrOperation.TruncatePartition => VsrOperation.DeleteSegments,
+            _ => operation
         };
     }
 
@@ -203,7 +205,7 @@ internal static class VsrOperations
     internal static bool IsInternal(this VsrOperation operation)
     {
         return ((byte)operation >= InternalStart && (byte)operation < MetadataStart)
-            || operation == VsrOperation.RetireSession;
+            || operation is VsrOperation.RetireSession or VsrOperation.InstallConsumerGroupOwner or VsrOperation.TransitionPartitionHistory or VsrOperation.RetireConsumerGroupOwners;
     }
 
     /// <summary>
@@ -217,26 +219,22 @@ internal static class VsrOperations
     {
         return (operation.IsInternal() && (byte)operation < (byte)VsrOperation.SendMessages)
             || operation is VsrOperation.CreateStream
-            or VsrOperation.UpdateStream
             or VsrOperation.DeleteStream
-            or VsrOperation.PurgeStream
             or VsrOperation.CreateTopic
-            or VsrOperation.UpdateTopic
             or VsrOperation.DeleteTopic
-            or VsrOperation.PurgeTopic
             or VsrOperation.CreatePartitions
             or VsrOperation.DeletePartitions
             or VsrOperation.CreateConsumerGroup
             or VsrOperation.DeleteConsumerGroup
             or VsrOperation.CreateUser
-            or VsrOperation.UpdateUser
             or VsrOperation.DeleteUser
             or VsrOperation.ChangePassword
             or VsrOperation.UpdatePermissions
             or VsrOperation.CreatePersonalAccessToken
             or VsrOperation.DeletePersonalAccessToken
             or VsrOperation.JoinConsumerGroup
-            or VsrOperation.LeaveConsumerGroup;
+            or VsrOperation.LeaveConsumerGroup
+            or VsrOperation.UpdateResource;
     }
 
     /// <summary>

@@ -17,8 +17,11 @@
 
 pub mod acl;
 pub mod api;
+pub mod auto_topic_creation;
 pub mod bounds_guard;
+pub mod dedup;
 pub mod handlers;
 pub mod header;
 pub(crate) mod probe_board;
 pub mod sasl;
+pub mod wire_len;

@@ -20,13 +20,13 @@ use crate::sharding::METADATA_GROUP;
 use aligned_vec::{AVec, ConstAlign};
 use iggy_binary_protocol::{
     Command, CommitHeader, ConsensusError, ConsensusHeader, ConsumerSessionHeartbeatHeader,
-    DoViewChangeHeader, ForwardLogoutHeader, ForwardLogoutResultHeader, ForwardRegisterHeader,
-    ForwardRegisterResultHeader, GenericHeader, HEADER_SIZE, Operation, PrepareHeader,
-    PrepareOkHeader, RepairPrepareHeader, RepairRangeReplyHeader, RequestHeader,
-    RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
-    RequestStateTransferHeader, RoutedRequestHeader, StartViewChangeHeader, StartViewHeader,
-    StateChunkHeader, StateTransferTargetHeader, frame_checksum_bytes,
-    prepare_identity_checksum_bytes,
+    DoViewChangeHeader, ForwardCompletionHeader, ForwardLogoutHeader, ForwardLogoutResultHeader,
+    ForwardRegisterHeader, ForwardRegisterResultHeader, GenericHeader, HEADER_SIZE, Operation,
+    PrepareHeader, PrepareOkHeader, PrimaryRebalanceHeader, RepairPrepareHeader,
+    RepairRangeReplyHeader, RequestHeader, RequestPreparesHeader, RequestStartViewHeader,
+    RequestStateChunkHeader, RequestStateTransferHeader, RoutedRequestHeader, SegmentDeleteHeader,
+    StartViewChangeHeader, StartViewHeader, StateChunkHeader, StateTransferTargetHeader,
+    frame_checksum_bytes, prepare_identity_checksum_bytes,
 };
 use smallvec::SmallVec;
 use std::{
@@ -647,6 +647,11 @@ pub enum MessageBag {
     ForwardLogoutResult(Message<ForwardLogoutResultHeader>),
     /// A backup reports session liveness to the metadata primary without a reply.
     ConsumerSessionHeartbeat(Message<ConsumerSessionHeartbeatHeader>),
+    /// Readiness exchanges pass through shard 0 before reaching a partition owner.
+    PrimaryRebalance(Message<PrimaryRebalanceHeader>),
+    SegmentDelete(Message<SegmentDeleteHeader>),
+    /// A backup relays a partition completion to the metadata primary without a reply.
+    ForwardCompletion(Message<ForwardCompletionHeader>),
 }
 
 impl MessageBag {
@@ -732,6 +737,9 @@ impl MessageBag {
                 (message.header().operation(), METADATA_GROUP)
             }
             Self::ForwardLogoutResult(message) => (message.header().operation(), METADATA_GROUP),
+            Self::ForwardCompletion(message) => (message.header().operation(), METADATA_GROUP),
+            Self::PrimaryRebalance(message) => (message.header().operation(), METADATA_GROUP),
+            Self::SegmentDelete(message) => (message.header().operation(), METADATA_GROUP),
         }
     }
 
@@ -764,6 +772,9 @@ impl MessageBag {
             Self::ForwardLogout(message) => message.into_generic(),
             Self::ConsumerSessionHeartbeat(message) => message.into_generic(),
             Self::ForwardLogoutResult(message) => message.into_generic(),
+            Self::ForwardCompletion(message) => message.into_generic(),
+            Self::PrimaryRebalance(message) => message.into_generic(),
+            Self::SegmentDelete(message) => message.into_generic(),
         }
     }
 
@@ -790,6 +801,9 @@ impl MessageBag {
             Self::ForwardLogout(message) => message.header().command,
             Self::ConsumerSessionHeartbeat(message) => message.header().command,
             Self::ForwardLogoutResult(message) => message.header().command,
+            Self::ForwardCompletion(message) => message.header().command,
+            Self::PrimaryRebalance(message) => message.header().command,
+            Self::SegmentDelete(message) => message.header().command,
         }
     }
 
@@ -816,6 +830,9 @@ impl MessageBag {
             Self::ForwardLogout(message) => message.header().size(),
             Self::ConsumerSessionHeartbeat(message) => message.header().size(),
             Self::ForwardLogoutResult(message) => message.header().size(),
+            Self::ForwardCompletion(message) => message.header().size(),
+            Self::PrimaryRebalance(message) => message.header().size(),
+            Self::SegmentDelete(message) => message.header().size(),
         }
     }
 
@@ -842,16 +859,21 @@ impl MessageBag {
             Self::ForwardLogout(message) => message.header().operation(),
             Self::ConsumerSessionHeartbeat(message) => message.header().operation(),
             Self::ForwardLogoutResult(message) => message.header().operation(),
+            Self::ForwardCompletion(message) => message.header().operation(),
+            Self::PrimaryRebalance(message) => message.header().operation(),
+            Self::SegmentDelete(message) => message.header().operation(),
         }
     }
 }
 
 /// Why `H`'s header bytes failed bytemuck's checked cast.
 ///
-/// An operation discriminant this build does not define means the sender runs a
-/// newer release; the frame is wire-valid and the node needs upgrading, which is
-/// a different operator action from the corrupted-header case. bytemuck reports
-/// both as one error, so the operation byte is probed here to separate them.
+/// An operation discriminant this build does not define means the sender runs
+/// another release: a newer one adds operations, and an older one can still
+/// send a retired one. The frame is wire-valid and the releases must be
+/// aligned, a different operator action from the corrupted-header case.
+/// bytemuck reports both as one error, so the operation byte is probed here to
+/// separate them.
 fn classify_failed_cast<H>(bytes: &[u8]) -> ConsensusError
 where
     H: ConsensusHeader,
@@ -871,7 +893,7 @@ where
 ///
 /// This classification runs before `verify_frame`, so the byte is still
 /// unverified: a flipped bit landing in an undefined discriminant would
-/// otherwise be reported as "upgrade this node", and for a `PrepareOk` --
+/// otherwise be reported as version skew, and for a `PrepareOk` --
 /// which echoes an operation this primary minted itself -- corruption is the
 /// likelier cause anyway. Sealed headers verify the frame checksum; the
 /// Prepare family verifies the identity checksum, which covers the operation
@@ -978,6 +1000,15 @@ where
                     value.try_into_typed::<ConsumerSessionHeartbeatHeader>()?,
                 ))
             }
+            Command::ForwardCompletion => Ok(Self::ForwardCompletion(
+                value.try_into_typed::<ForwardCompletionHeader>()?,
+            )),
+            Command::SegmentDelete => Ok(Self::SegmentDelete(
+                value.try_into_typed::<SegmentDeleteHeader>()?,
+            )),
+            Command::PrimaryRebalance => Ok(Self::PrimaryRebalance(
+                value.try_into_typed::<PrimaryRebalanceHeader>()?,
+            )),
             // Reply / Eviction are server-to-client frames; they do not
             // appear on the inbound dispatch path.
             Command::Reply | Command::Eviction => Err(ConsensusError::ClientBoundCommand(command)),
@@ -994,9 +1025,10 @@ mod tests {
     use super::*;
     use iggy_binary_protocol::{
         ForwardLogoutHeader, ForwardLogoutOutcome, ForwardLogoutResultHeader, HEADER_SIZE,
-        Operation, ReplyHeader, RequestHeader, frame_checksum_bytes,
+        Operation, PrimaryRebalanceKind, ReplyHeader, RequestHeader, frame_checksum_bytes,
     };
     use smallvec::smallvec;
+    use std::mem::offset_of;
 
     // Field offsets via `offset_of!`: a field reorder fails to compile here
     // rather than silently corrupting test bytes.
@@ -1307,6 +1339,125 @@ mod tests {
         assert_eq!(result.size(), HEADER_SIZE as u32);
     }
 
+    fn primary_rebalance_frame(kind: PrimaryRebalanceKind) -> Message<PrimaryRebalanceHeader> {
+        Message::<PrimaryRebalanceHeader>::new(HEADER_SIZE).transmute_header(
+            |_, header: &mut PrimaryRebalanceHeader| {
+                header.command = Command::PrimaryRebalance;
+                header.size = HEADER_SIZE as u32;
+                header.cluster = 7;
+                header.view = 11;
+                header.replica = 2;
+                header.nonce = 13;
+                header.kind = kind;
+                header.quorum_age_ns = PrimaryRebalanceHeader::NO_QUORUM_EVIDENCE;
+                if matches!(
+                    kind,
+                    PrimaryRebalanceKind::PartitionProbe
+                        | PrimaryRebalanceKind::PartitionReply
+                        | PrimaryRebalanceKind::SourceProbe
+                        | PrimaryRebalanceKind::SourceReply
+                        | PrimaryRebalanceKind::PrimaryTransfer
+                ) {
+                    header.namespace = 17;
+                    header.created_revision = 19;
+                    header.commit = 23;
+                    header.partition_view = 5;
+                }
+                header.ready = u8::from(matches!(
+                    kind,
+                    PrimaryRebalanceKind::MetadataReply
+                        | PrimaryRebalanceKind::PartitionReply
+                        | PrimaryRebalanceKind::SourceReply
+                ));
+                header.target = u8::from(kind == PrimaryRebalanceKind::PrimaryTransfer);
+                header.seal();
+            },
+        )
+    }
+
+    #[test]
+    fn given_rebalance_phases_when_dispatched_should_route_through_metadata_with_identity_intact() {
+        for kind in [
+            PrimaryRebalanceKind::MetadataProbe,
+            PrimaryRebalanceKind::MetadataReply,
+            PrimaryRebalanceKind::PartitionProbe,
+            PrimaryRebalanceKind::PartitionReply,
+            PrimaryRebalanceKind::SourceProbe,
+            PrimaryRebalanceKind::SourceReply,
+            PrimaryRebalanceKind::PrimaryTransfer,
+        ] {
+            let frame = primary_rebalance_frame(kind);
+            let expected = *frame.header();
+            let bag = MessageBag::try_from(frame.into_generic()).unwrap();
+            assert!(matches!(bag, MessageBag::PrimaryRebalance(_)));
+            assert_eq!(bag.routing(), (Operation::Reserved, METADATA_GROUP));
+            assert_eq!(bag.command(), Command::PrimaryRebalance);
+            assert_eq!(bag.operation(), Operation::Reserved);
+            assert_eq!(bag.size(), HEADER_SIZE as u32);
+            let decoded = bag
+                .into_generic()
+                .try_into_typed::<PrimaryRebalanceHeader>()
+                .unwrap();
+            assert_eq!(*decoded.header(), expected);
+            assert!(decoded.body().is_empty());
+        }
+    }
+
+    #[test]
+    fn given_invalid_rebalance_fields_when_dispatched_should_reject_before_routing() {
+        for (offset, value, bit_pattern) in [
+            (offset_of!(PrimaryRebalanceHeader, kind), u8::MAX, true),
+            (offset_of!(PrimaryRebalanceHeader, reserved_frame), 1, false),
+            (offset_of!(PrimaryRebalanceHeader, reserved), 1, false),
+            (offset_of!(PrimaryRebalanceHeader, checksum_body), 1, false),
+            (offset_of!(PrimaryRebalanceHeader, release), 1, false),
+            (offset_of!(PrimaryRebalanceHeader, nonce), 0, false),
+            (offset_of!(PrimaryRebalanceHeader, ready), 1, false),
+            (offset_of!(PrimaryRebalanceHeader, namespace), 1, false),
+        ] {
+            let mut owned =
+                primary_rebalance_frame(PrimaryRebalanceKind::MetadataProbe).into_owned();
+            owned.as_mut_slice()[offset] = value;
+            seal_header_bytes(owned.as_mut_slice());
+            let generic = Message::<GenericHeader>::try_from(owned).unwrap();
+            let error = MessageBag::try_from(generic).unwrap_err();
+            if bit_pattern {
+                assert!(matches!(error, ConsensusError::InvalidBitPattern));
+            } else {
+                assert!(
+                    matches!(error, ConsensusError::InvalidField(_)),
+                    "{offset}: {error}"
+                );
+            }
+        }
+
+        let mut owned = primary_rebalance_frame(PrimaryRebalanceKind::PartitionReply).into_owned();
+        owned.as_mut_slice()[offset_of!(PrimaryRebalanceHeader, nonce)] ^= 1;
+        let generic = Message::<GenericHeader>::try_from(owned).unwrap();
+        assert!(matches!(
+            MessageBag::try_from(generic),
+            Err(ConsensusError::FrameChecksumMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn given_a_rebalance_frame_when_it_advertises_a_body_should_reject_before_routing() {
+        let valid = primary_rebalance_frame(PrimaryRebalanceKind::PartitionProbe);
+        let mut owned = Owned::<MESSAGE_ALIGN>::zeroed(HEADER_SIZE + 1);
+        owned.as_mut_slice()[..HEADER_SIZE].copy_from_slice(valid.as_slice());
+        owned.as_mut_slice()[SIZE_OFF..SIZE_OFF + size_of::<u32>()]
+            .copy_from_slice(&((HEADER_SIZE + 1) as u32).to_le_bytes());
+        seal_header_bytes(owned.as_mut_slice());
+        let generic = Message::<GenericHeader>::try_from(owned).unwrap();
+        assert!(matches!(
+            MessageBag::try_from(generic),
+            Err(ConsensusError::InvalidSize {
+                expected: 256,
+                found: 257
+            })
+        ));
+    }
+
     // Construction via Message::new (zeroed)
 
     #[test]
@@ -1609,7 +1760,7 @@ mod tests {
     // non-replicated op code lives in `reserved[0..4]`) and unset only the
     // routing fields, whatever bytes the client sent in that tail.
     #[test]
-    fn into_routed_keeps_reserved_prefix_and_unsets_group() {
+    fn into_routed_keeps_client_context_and_clears_routing_fields() {
         const RESERVED_OFF: usize = std::mem::offset_of!(RequestHeader, reserved);
 
         let mut owned = header_bytes(Command::Request, 256);
@@ -1634,6 +1785,15 @@ mod tests {
             "the client-sent reserved tail must not leak into `group`"
         );
         assert_eq!(header.metadata_watermark, 0);
+        assert_eq!(
+            header.partition_incarnation,
+            client_header.partition_incarnation
+        );
+        assert_eq!(header.owner_generation, client_header.owner_generation);
+        assert_eq!(
+            header.minimum_metadata_op,
+            client_header.minimum_metadata_op
+        );
         assert_eq!(header.client, client_header.client);
         assert_eq!(header.operation, client_header.operation);
         assert_eq!(header.session, client_header.session);

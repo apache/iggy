@@ -21,7 +21,7 @@ use std::io::IoSlice;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::task::{Poll, Waker};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use compio::fs::File;
 use consensus::VsrState;
@@ -43,8 +43,8 @@ use tracing::warn;
 use crate::iggy_index::IGGY_INDEX_SIZE;
 use crate::offset_storage::{
     OffsetFilePermit, PersistedOffset, delete_persisted_offset,
-    delete_persisted_offset_with_storage, persist_offset, persist_offset_retained,
-    persist_purge_generation_with_storage, read_offset_max,
+    delete_persisted_offset_with_storage, persist_emptied_marker_with_storage, persist_offset,
+    persist_offset_retained, read_offset_max,
 };
 use crate::{IggyIndexWriter, MessagesWriter, Segment};
 
@@ -93,20 +93,11 @@ pub enum PartitionIoJob<SB = PingPongSuperblock> {
         strict: bool,
     },
     EmptySegment(SegmentIoJob),
-    PurgeCleanup {
-        directory: String,
-        bodies: bool,
-    },
-    PurgeOffsets {
+    OffsetCleanup {
         directory: String,
         known: HashSet<u32>,
         /// Sorted IDs preserved by a state-transfer install.
         retained: Vec<u32>,
-    },
-    PurgeGeneration {
-        path: String,
-        generation: u64,
-        revision: u64,
     },
     RetryCheckpoint {
         path: PathBuf,
@@ -143,9 +134,7 @@ pub enum PartitionIoResult {
     },
     SegmentRemoved(Result<(), IggyError>),
     EmptySegment(Result<InstalledSegment, IggyError>),
-    PurgeCleanup(std::io::Result<()>),
-    PurgeOffsets(PurgeOffsetsIoResult),
-    PurgeGeneration(Result<(), IggyError>),
+    OffsetCleanup(OffsetCleanupIoResult),
     RetryCheckpoint(std::io::Result<()>),
     ReclaimRetryCheckpoints(std::io::Result<()>),
     Quarantine(std::io::Result<String>),
@@ -167,7 +156,6 @@ pub enum PartitionIoContinuation {
     Superblock,
     Checkpoint,
     Retention,
-    Purge,
     Quarantine,
 }
 
@@ -288,7 +276,9 @@ impl PartitionTeardown {
             self.io.drain().await?;
             if let Some(persistence) = &self.persistence {
                 persistence.retire();
-                persistence.drain_with_timeout().await?;
+                persistence
+                    .drain_with_timeout(compio::runtime::time::sleep)
+                    .await?;
             }
             Ok(())
         })
@@ -310,19 +300,36 @@ pub struct PartitionIoPlan {
     pub allocation_charge: usize,
 }
 
+/// A coordinator grant issued only after fresh target readiness.
+///
+/// The source node sets the deadline on its own clock when the grant arrives,
+/// so no coordinator, stalled or replaced, can extend it. The shard rechecks it
+/// and the captured history/view after draining, before election.
+#[derive(Debug)]
+pub struct PreparedPrimaryTransfer {
+    pub created_revision: u64,
+    pub expected_view: u32,
+    pub target: u8,
+    pub expires_at: Instant,
+}
+
+impl PreparedPrimaryTransfer {
+    #[must_use]
+    pub fn is_active_at(&self, now: Instant) -> bool {
+        now < self.expires_at
+    }
+}
+
 pub enum PartitionIoStep {
     WireActions(Vec<consensus::VsrAction>),
     Progress,
     Pending,
     Ready(PartitionIoPlan),
     Transition(server_common::MessageBag),
+    PrimaryTransfer(PreparedPrimaryTransfer),
     ViewApplied {
         actions: Vec<consensus::VsrAction>,
         peer: Option<u8>,
-    },
-    PurgeFinished {
-        generation: u64,
-        outcome: Result<(), crate::PurgeError>,
     },
     QuarantineFinished(std::io::Result<Option<String>>),
     TransferReady,
@@ -403,6 +410,7 @@ pub enum TransferFileJob {
     Backup {
         directory: String,
         begin: bool,
+        synced_files: std::collections::BTreeSet<std::path::PathBuf>,
     },
     Sweep {
         directory: String,
@@ -425,10 +433,15 @@ pub enum TransferFileJob {
         active: bool,
     },
     CommitOffsets(Vec<String>),
+    EmptiedMarker {
+        path: String,
+        emptied_at: u64,
+    },
     ClearMissing(String),
     Converge {
         directory: String,
         offset_directories: [Option<String>; ConsumerKind::COUNT],
+        emptied_marker: Option<String>,
         // Keep recovery-only snapshots out of every file job's inline state.
         stranded_offsets: Box<[HashSet<u32>; ConsumerKind::COUNT]>,
         segment: SegmentIoJob,
@@ -471,6 +484,8 @@ pub struct OffsetIoJob {
     pub(crate) owner: OffsetFileOwner,
     pub(crate) file: Option<File>,
     pub(crate) permit: Option<Rc<OffsetFilePermit>>,
+    /// The emptied-table marker this store removes before it writes.
+    pub(crate) retired_marker: Option<String>,
 }
 
 pub struct OffsetIoResult {
@@ -484,6 +499,9 @@ pub struct OffsetIoResult {
 
 pub struct OffsetDeleteIoJob {
     pub(crate) path: String,
+    /// The emptied-table marker this delete writes after the unlink, and the
+    /// delete's op it names.
+    pub(crate) emptied_marker: Option<(String, u64)>,
 }
 
 pub struct OffsetDirectoriesIoJob {
@@ -499,7 +517,7 @@ pub struct OffsetDirectoriesIoResult {
     pub(crate) failed: [bool; ConsumerKind::COUNT],
 }
 
-pub struct PurgeOffsetsIoResult {
+pub struct OffsetCleanupIoResult {
     /// Consumer ids whose offset files were removed or already absent.
     pub(crate) released: Vec<u32>,
     /// Consumer ids whose offset file could not be removed.
@@ -619,9 +637,7 @@ impl<SB: SuperblockStore> PartitionIoJob<SB> {
             | Self::SegmentDirectory(_)
             | Self::RemoveSegment { .. }
             | Self::EmptySegment(_)
-            | Self::PurgeCleanup { .. }
-            | Self::PurgeOffsets { .. }
-            | Self::PurgeGeneration { .. }
+            | Self::OffsetCleanup { .. }
             | Self::RetryCheckpoint { .. }
             | Self::ReclaimRetryCheckpoints { .. }
             | Self::Quarantine { .. } => {}
@@ -631,16 +647,6 @@ impl<SB: SuperblockStore> PartitionIoJob<SB> {
 
     #[allow(clippy::future_not_send)]
     pub async fn execute(self) -> PartitionIoResult {
-        self.execute_with_storage(&DiskStorage).await
-    }
-
-    /// Directory syncs and the purge's offset and generation files go through
-    /// `storage`. Other file work uses its disk implementation.
-    #[allow(clippy::future_not_send)]
-    pub(crate) async fn execute_with_storage<S: DurableStorage>(
-        self,
-        storage: &S,
-    ) -> PartitionIoResult {
         match self {
             Self::Materialize(job) => PartitionIoResult::Materialize(job.execute().await),
             Self::OffsetWrite(job) => PartitionIoResult::OffsetWrite(job.execute().await),
@@ -651,9 +657,9 @@ impl<SB: SuperblockStore> PartitionIoJob<SB> {
             Self::OffsetDirectories(job) => {
                 PartitionIoResult::OffsetDirectories(job.execute().await)
             }
-            Self::SegmentDirectory(path) => {
-                PartitionIoResult::SegmentDirectory(storage.sync_directory(Path::new(&path)).await)
-            }
+            Self::SegmentDirectory(path) => PartitionIoResult::SegmentDirectory(
+                DiskStorage.sync_directory(Path::new(&path)).await,
+            ),
             Self::IndexSync(writer) => {
                 let outcome = writer.fsync().await;
                 PartitionIoResult::IndexSync { writer, outcome }
@@ -679,34 +685,12 @@ impl<SB: SuperblockStore> PartitionIoJob<SB> {
                 PartitionIoResult::SegmentRemoved(outcome)
             }
             Self::EmptySegment(job) => PartitionIoResult::EmptySegment(job.execute().await),
-            Self::PurgeCleanup { directory, bodies } => {
-                let outcome = if bodies {
-                    crate::state_transfer::remove_public_segment_files(&directory).await
-                } else {
-                    Ok(())
-                };
-                if outcome.is_ok() {
-                    crate::state_transfer::sweep_staging_except(
-                        &directory,
-                        std::collections::HashSet::new(),
-                    )
-                    .await;
-                }
-                PartitionIoResult::PurgeCleanup(outcome)
-            }
-            Self::PurgeOffsets {
+            Self::OffsetCleanup {
                 directory,
                 known,
                 retained,
-            } => PartitionIoResult::PurgeOffsets(
-                purge_offset_files(storage, &directory, known, &retained).await,
-            ),
-            Self::PurgeGeneration {
-                path,
-                generation,
-                revision,
-            } => PartitionIoResult::PurgeGeneration(
-                persist_purge_generation_with_storage(storage, &path, generation, revision).await,
+            } => PartitionIoResult::OffsetCleanup(
+                remove_offset_files(&DiskStorage, &directory, known, &retained).await,
             ),
             Self::RetryCheckpoint { path, bytes } => PartitionIoResult::RetryCheckpoint(
                 crate::state_transfer::write_retry_checkpoint(&path, bytes).await,
@@ -727,7 +711,16 @@ impl<SB: SuperblockStore> PartitionIoJob<SB> {
                         crate::state_transfer::mark_materialization_missing(&directory, revision)
                             .await?;
                     }
-                    crate::state_transfer::quarantine_partition_files(&directory, None).await
+                    // The drain phase settled every WAL and offset writer, and a
+                    // reload would reject canonical transfers against the divergent
+                    // prepare history and consumer offsets left in place.
+                    let fenced = crate::state_transfer::quarantine_partition_files(
+                        &directory,
+                        replicated.then_some(revision),
+                    )
+                    .await?;
+                    crate::state_transfer::quarantine_offsets(&directory, &fenced).await?;
+                    Ok(fenced)
                 }
                 .await;
                 PartitionIoResult::Quarantine(outcome)
@@ -822,16 +815,15 @@ fn execution_allocation_charge<SB: SuperblockStore>() -> Option<usize> {
         .checked_add(IO_CONTROL_ALLOCATION_RESERVE)
 }
 
-/// Sweep the directory, not just the ids the live maps hold: a pre-purge op
-/// re-persisted by journal repair on a restarted replica would otherwise leave
-/// an offset file for boot to hydrate back. The caller syncs the directory.
-async fn purge_offset_files<S: DurableStorage>(
+/// Sweep the directory, not just the ids the live maps hold, so a file they do
+/// not track cannot be hydrated back at boot. The caller syncs the directory.
+async fn remove_offset_files<S: DurableStorage>(
     storage: &S,
     directory: &str,
     mut known: HashSet<u32>,
     retained: &[u32],
-) -> PurgeOffsetsIoResult {
-    let mut result = PurgeOffsetsIoResult {
+) -> OffsetCleanupIoResult {
+    let mut result = OffsetCleanupIoResult {
         released: Vec::new(),
         failed: Vec::new(),
         scan_error: None,
@@ -888,7 +880,7 @@ async fn purge_offset_files<S: DurableStorage>(
     result
 }
 
-impl PurgeOffsetsIoResult {
+impl OffsetCleanupIoResult {
     async fn remove<S: DurableStorage>(
         &mut self,
         storage: &S,
@@ -928,10 +920,14 @@ impl TransferFileJob {
                 crate::state_transfer::discard_offset_writes(&writes).await;
                 TransferFileResult::Finished(Ok(()))
             }
-            Self::Backup { directory, begin } => {
+            Self::Backup {
+                directory,
+                begin,
+                synced_files,
+            } => {
                 let path = std::path::Path::new(&directory);
                 let outcome = if begin {
-                    crate::install_backup::begin(path).await
+                    crate::install_backup::begin(path, &synced_files).await
                 } else {
                     crate::install_backup::finish(path).await
                 };
@@ -1102,6 +1098,16 @@ impl TransferFileJob {
                     results.into_iter().try_for_each(std::convert::identity),
                 )
             }
+            Self::EmptiedMarker { path, emptied_at } => TransferFileResult::Finished(
+                persist_emptied_marker_with_storage(&DiskStorage, &path, emptied_at)
+                    .await
+                    .map_err(|source| {
+                        crate::state_transfer::PartitionInstallError::OffsetPersistence {
+                            path,
+                            source,
+                        }
+                    }),
+            ),
             Self::ClearMissing(path) => TransferFileResult::Finished(
                 crate::state_transfer::clear_materialization_missing(&path)
                     .await
@@ -1115,6 +1121,7 @@ impl TransferFileJob {
             Self::Converge {
                 directory,
                 offset_directories,
+                emptied_marker,
                 mut stranded_offsets,
                 segment,
             } => {
@@ -1122,6 +1129,11 @@ impl TransferFileJob {
                 let mut released =
                     Vec::with_capacity(stranded_offsets.iter().map(HashSet::len).sum());
                 let outcome = async {
+                    // First, because convergence discards the history the marker
+                    // describes, and an emptied table must not keep it.
+                    if let Some(marker) = &emptied_marker {
+                        persist_emptied_marker_with_storage(&DiskStorage, marker, 0).await?;
+                    }
                     for (kind, path) in offset_directories.into_iter().enumerate() {
                         let Some(path) = path else {
                             continue;
@@ -1290,14 +1302,22 @@ impl<SB: SuperblockStore> SuperblockIoJob<SB> {
 impl OffsetIoJob {
     #[allow(clippy::future_not_send)]
     pub(crate) async fn execute(mut self) -> OffsetIoResult {
-        let value = if self.fold_max {
-            read_offset_max(&self.path, self.offset).await
-        } else {
-            Ok(PersistedOffset {
-                offset: self.offset,
-                written: true,
-            })
-        };
+        let value = async {
+            // A lost store file must not leave an older marker claiming the
+            // table is empty. Keep marker removal strict before writing it.
+            if let Some(marker) = &self.retired_marker {
+                persist_emptied_marker_with_storage(&DiskStorage, marker, 0).await?;
+            }
+            if self.fold_max {
+                read_offset_max(&self.path, self.offset).await
+            } else {
+                Ok(PersistedOffset {
+                    offset: self.offset,
+                    written: true,
+                })
+            }
+        }
+        .await;
         let mut write_error = None;
         let outcome = match value {
             Ok(value) if value.written => match self.owner {
@@ -1347,7 +1367,16 @@ impl OffsetIoJob {
 impl OffsetDeleteIoJob {
     #[allow(clippy::future_not_send)]
     pub(crate) async fn execute(self) -> Result<bool, IggyError> {
-        delete_persisted_offset(&self.path).await
+        let removed = delete_persisted_offset(&self.path).await?;
+        // A missing marker after restart loses empty-table transfer proof, not
+        // the committed delete. Replay may find the key already absent and
+        // cannot be relied on to recreate the marker.
+        if let Some((marker, op)) = &self.emptied_marker
+            && let Err(error) = persist_emptied_marker_with_storage(&DiskStorage, marker, *op).await
+        {
+            warn!(%marker, op, %error, "could not persist emptied offset table marker");
+        }
+        Ok(removed)
     }
 }
 
@@ -1473,12 +1502,75 @@ mod tests {
     }
 
     #[compio::test]
+    async fn given_failed_emptied_marker_when_offset_delete_succeeds_should_preserve_success() {
+        let directory = tempfile::tempdir().unwrap();
+        let offset = directory.path().join("offset");
+        let marker = directory.path().join("emptied");
+        std::fs::write(&offset, crate::offset_storage::encode_offset_record(7)).unwrap();
+        std::fs::create_dir(&marker).unwrap();
+        let job = OffsetDeleteIoJob {
+            path: offset.to_str().unwrap().to_owned(),
+            emptied_marker: Some((marker.to_str().unwrap().to_owned(), 9)),
+        };
+
+        assert_eq!(job.execute().await, Ok(true));
+        assert!(!offset.exists());
+        assert!(marker.is_dir());
+    }
+
+    #[compio::test]
+    async fn given_failed_marker_clear_when_storing_should_preserve_error_without_offset() {
+        let directory = tempfile::tempdir().unwrap();
+        let offset = directory.path().join("offset");
+        let marker = directory.path().join("emptied");
+        std::fs::create_dir(&marker).unwrap();
+        let marker_path = marker.to_str().unwrap().to_owned();
+        let job = OffsetIoJob {
+            path: offset.to_str().unwrap().to_owned(),
+            offset: 7,
+            fold_max: false,
+            persisted: true,
+            owner: OffsetFileOwner::Uncached,
+            file: None,
+            permit: None,
+            retired_marker: Some(marker_path.clone()),
+        };
+
+        assert_eq!(
+            job.execute().await.outcome,
+            Err(IggyError::CannotDeleteConsumerOffsetFile(marker_path))
+        );
+        assert!(!offset.exists());
+        assert!(marker.is_dir());
+    }
+
+    #[compio::test]
+    async fn given_failed_offset_delete_when_executing_should_preserve_error_without_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        let offset = directory.path().join("offset");
+        let marker = directory.path().join("emptied");
+        std::fs::create_dir(&offset).unwrap();
+        let path = offset.to_str().unwrap().to_owned();
+        let job = OffsetDeleteIoJob {
+            path: path.clone(),
+            emptied_marker: Some((marker.to_str().unwrap().to_owned(), 9)),
+        };
+
+        assert_eq!(
+            job.execute().await,
+            Err(IggyError::CannotDeleteConsumerOffsetFile(path))
+        );
+        assert!(offset.is_dir());
+        assert!(!marker.exists());
+    }
+
+    #[compio::test]
     async fn given_failed_offset_scan_when_replacing_history_should_remove_known_stale_files() {
         let directory = tempfile::tempdir().unwrap();
         for id in [1, 99] {
             std::fs::write(directory.path().join(id.to_string()), [0; 16]).unwrap();
         }
-        let result = purge_offset_files(
+        let result = remove_offset_files(
             &FailedOffsetScan,
             directory.path().to_str().unwrap(),
             HashSet::from([1, 99]),
@@ -1515,6 +1607,12 @@ mod tests {
         std::os::unix::fs::symlink(&preserved, &replacement_symlink).unwrap();
         let stale_segment = directory.path().join("stale.log");
         std::fs::write(&stale_segment, b"stale").unwrap();
+        let emptied_marker = directory.path().join("emptied");
+        std::fs::write(
+            &emptied_marker,
+            crate::offset_storage::encode_offset_record(1),
+        )
+        .unwrap();
         let segment_symlink = directory.path().join("linked.log");
         std::os::unix::fs::symlink(&preserved, &segment_symlink).unwrap();
         let mut offset_directories = std::array::from_fn(|_| None);
@@ -1534,6 +1632,7 @@ mod tests {
         let result = TransferFileJob::Converge {
             directory: directory.path().to_string_lossy().into_owned(),
             offset_directories,
+            emptied_marker: Some(emptied_marker.to_string_lossy().into_owned()),
             stranded_offsets,
             segment: SegmentIoJob {
                 messages_path: messages_path.to_string_lossy().into_owned(),
@@ -1566,6 +1665,7 @@ mod tests {
         assert!(replacement_symlink.is_symlink());
         assert_eq!(std::fs::read(&preserved).unwrap(), b"preserved");
         assert!(!stale_segment.exists());
+        assert!(!emptied_marker.exists());
         assert!(!segment_symlink.exists());
         assert!(messages_path.is_file());
         assert!(index_path.is_file());

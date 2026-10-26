@@ -28,7 +28,9 @@ public enum AutoCommitMode
     Auto,
 
     /// <summary>
-    ///     Set offset after receive message
+    ///     Stores the offset of a message once the receive loop asks for the next message. Neither this store nor the
+    ///     final checkpoint on dispose covers a message whose loop body threw, broke or was still running, so that
+    ///     message is delivered again.
     /// </summary>
     AfterReceive,
 

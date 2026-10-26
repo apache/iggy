@@ -1,0 +1,191 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Three-node Apache Iggy VSR cluster on a single Docker host.
+#
+#   IGGY_ROOT_PASSWORD=... \
+#   IGGY_CLUSTER_SHARED_SECRET="$(openssl rand -hex 32)" \
+#   docker compose -f docker-compose.cluster.yml up -d
+#
+# Clients on the host connect to 127.0.0.1:8090, 8091 or 8092 (TCP).
+# Set IGGY_ADVERTISED_ADDRESS to the host's IP when clients run elsewhere.
+# The cluster uses 10.29.0.0/24. Set IGGY_SUBNET (first three octets, e.g.
+# 10.77.0) if that clashes with a local network.
+#
+# The cluster name is stamped into every node's data on first boot. Changing
+# IGGY_CLUSTER_NAME later stops the nodes starting against existing volumes;
+# run `docker compose -f docker-compose.cluster.yml down -v` to start over.
+#
+# Constraints that shape this file:
+#   - `cluster.nodes[*].ip` must be a literal IP, so nodes get static
+#     addresses on a dedicated network.
+#   - Ports come from the roster, so each node uses its own port set and the
+#     host mappings match what the cluster advertises. The shared listener
+#     addresses only choose the bind interface.
+#   - Clients reached through a published port are handed
+#     IGGY_ADVERTISED_ADDRESS. Containers on the cluster network get an
+#     address from the .128/25 half of the subnet and are handed the node's
+#     internal IP instead. The gateway (.1), which is how host
+#     clients appear, sits outside that pool on purpose.
+#   - Three servers share one host, so each runs a small unpinned shard set
+#     instead of claiming every core.
+
+x-iggy-node: &iggy-node
+  image: apache/iggy:${IGGY_VERSION:-0.9.0}
+  restart: unless-stopped
+  cap_add:
+    - SYS_NICE
+  security_opt:
+    - seccomp:unconfined
+  ulimits:
+    memlock:
+      soft: -1
+      hard: -1
+
+x-cluster-roster: &cluster-roster
+  IGGY_ROOT_USERNAME: ${IGGY_ROOT_USERNAME:-iggy}
+  IGGY_ROOT_PASSWORD: ${IGGY_ROOT_PASSWORD:?set IGGY_ROOT_PASSWORD}
+  IGGY_CLUSTER_ENABLED: "true"
+  IGGY_CLUSTER_NAME: ${IGGY_CLUSTER_NAME:-iggy-cluster}
+  IGGY_CLUSTER_AUTH_ENABLED: "true"
+  IGGY_CLUSTER_AUTH_SHARED_SECRET: ${IGGY_CLUSTER_SHARED_SECRET:?set IGGY_CLUSTER_SHARED_SECRET to at least 32 bytes}
+  IGGY_SHARDING_CPU_ALLOCATION: ${IGGY_SHARDS_PER_NODE:-2}
+  IGGY_SHARDING_PIN_CORES: "false"
+  RUST_LOG: ${RUST_LOG:-info}
+  IGGY_PATH: local_data
+  IGGY_TCP_ADDRESS: 0.0.0.0:8090
+  IGGY_QUIC_ADDRESS: 0.0.0.0:8080
+  IGGY_HTTP_ADDRESS: 0.0.0.0:3000
+  IGGY_WEBSOCKET_ADDRESS: 0.0.0.0:8070
+
+  IGGY_CLUSTER_NODES_0_NAME: iggy-node-0
+  IGGY_CLUSTER_NODES_0_IP: ${IGGY_SUBNET:-10.29.0}.10
+  IGGY_CLUSTER_NODES_0_REPLICA_ID: "0"
+  IGGY_CLUSTER_NODES_0_ADVERTISED_ADDRESS: ${IGGY_ADVERTISED_ADDRESS:-127.0.0.1}
+  IGGY_CLUSTER_NODES_0_ADVERTISED_ADDRESSES_0_CLIENT_CIDR: ${IGGY_SUBNET:-10.29.0}.128/25
+  IGGY_CLUSTER_NODES_0_ADVERTISED_ADDRESSES_0_ADDRESS: ${IGGY_SUBNET:-10.29.0}.10
+  IGGY_CLUSTER_NODES_0_PORTS_TCP: "8090"
+  IGGY_CLUSTER_NODES_0_PORTS_QUIC: "8080"
+  IGGY_CLUSTER_NODES_0_PORTS_HTTP: "3000"
+  IGGY_CLUSTER_NODES_0_PORTS_WEBSOCKET: "8070"
+  IGGY_CLUSTER_NODES_0_PORTS_TCP_REPLICA: "9090"
+
+  IGGY_CLUSTER_NODES_1_NAME: iggy-node-1
+  IGGY_CLUSTER_NODES_1_IP: ${IGGY_SUBNET:-10.29.0}.11
+  IGGY_CLUSTER_NODES_1_REPLICA_ID: "1"
+  IGGY_CLUSTER_NODES_1_ADVERTISED_ADDRESS: ${IGGY_ADVERTISED_ADDRESS:-127.0.0.1}
+  IGGY_CLUSTER_NODES_1_ADVERTISED_ADDRESSES_0_CLIENT_CIDR: ${IGGY_SUBNET:-10.29.0}.128/25
+  IGGY_CLUSTER_NODES_1_ADVERTISED_ADDRESSES_0_ADDRESS: ${IGGY_SUBNET:-10.29.0}.11
+  IGGY_CLUSTER_NODES_1_PORTS_TCP: "8091"
+  IGGY_CLUSTER_NODES_1_PORTS_QUIC: "8081"
+  IGGY_CLUSTER_NODES_1_PORTS_HTTP: "3001"
+  IGGY_CLUSTER_NODES_1_PORTS_WEBSOCKET: "8071"
+  IGGY_CLUSTER_NODES_1_PORTS_TCP_REPLICA: "9091"
+
+  IGGY_CLUSTER_NODES_2_NAME: iggy-node-2
+  IGGY_CLUSTER_NODES_2_IP: ${IGGY_SUBNET:-10.29.0}.12
+  IGGY_CLUSTER_NODES_2_REPLICA_ID: "2"
+  IGGY_CLUSTER_NODES_2_ADVERTISED_ADDRESS: ${IGGY_ADVERTISED_ADDRESS:-127.0.0.1}
+  IGGY_CLUSTER_NODES_2_ADVERTISED_ADDRESSES_0_CLIENT_CIDR: ${IGGY_SUBNET:-10.29.0}.128/25
+  IGGY_CLUSTER_NODES_2_ADVERTISED_ADDRESSES_0_ADDRESS: ${IGGY_SUBNET:-10.29.0}.12
+  IGGY_CLUSTER_NODES_2_PORTS_TCP: "8092"
+  IGGY_CLUSTER_NODES_2_PORTS_QUIC: "8082"
+  IGGY_CLUSTER_NODES_2_PORTS_HTTP: "3002"
+  IGGY_CLUSTER_NODES_2_PORTS_WEBSOCKET: "8072"
+  IGGY_CLUSTER_NODES_2_PORTS_TCP_REPLICA: "9092"
+
+services:
+  iggy-node-0:
+    <<: *iggy-node
+    container_name: iggy-node-0
+    command: [ "--replica-id", "0" ]
+    environment: *cluster-roster
+    healthcheck:
+      test: [ "CMD", "iggy", "--tcp-server-address", "${IGGY_SUBNET:-10.29.0}.10:8090", "ping" ]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+    networks:
+      iggy-cluster:
+        ipv4_address: ${IGGY_SUBNET:-10.29.0}.10
+    ports:
+      - "8090:8090"
+      - "8080:8080/udp"
+      - "3000:3000"
+      - "8070:8070"
+    volumes:
+      - iggy-node-0:/app/local_data
+
+  iggy-node-1:
+    <<: *iggy-node
+    container_name: iggy-node-1
+    command: [ "--replica-id", "1" ]
+    environment: *cluster-roster
+    healthcheck:
+      test: [ "CMD", "iggy", "--tcp-server-address", "${IGGY_SUBNET:-10.29.0}.11:8091", "ping" ]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+    networks:
+      iggy-cluster:
+        ipv4_address: ${IGGY_SUBNET:-10.29.0}.11
+    ports:
+      - "8091:8091"
+      - "8081:8081/udp"
+      - "3001:3001"
+      - "8071:8071"
+    volumes:
+      - iggy-node-1:/app/local_data
+
+  iggy-node-2:
+    <<: *iggy-node
+    container_name: iggy-node-2
+    command: [ "--replica-id", "2" ]
+    environment: *cluster-roster
+    healthcheck:
+      test: [ "CMD", "iggy", "--tcp-server-address", "${IGGY_SUBNET:-10.29.0}.12:8092", "ping" ]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+    networks:
+      iggy-cluster:
+        ipv4_address: ${IGGY_SUBNET:-10.29.0}.12
+    ports:
+      - "8092:8092"
+      - "8082:8082/udp"
+      - "3002:3002"
+      - "8072:8072"
+    volumes:
+      - iggy-node-2:/app/local_data
+
+networks:
+  iggy-cluster:
+    name: iggy-cluster
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${IGGY_SUBNET:-10.29.0}.0/24
+          ip_range: ${IGGY_SUBNET:-10.29.0}.128/25
+          gateway: ${IGGY_SUBNET:-10.29.0}.1
+
+volumes:
+  iggy-node-0:
+  iggy-node-1:
+  iggy-node-2:

@@ -39,21 +39,36 @@ export const REQUEST_OFFSET = {
   size: 48,
   command: 60,
   client: 128,
+  requestChecksum: 144,
   timestamp: 160,
   request: 168,
   operation: 176,
   session: 184,
-  reserved: 196
+  reserved: 196,
+  partitionIncarnation: 200,
+  ownerGeneration: 208,
+  minimumMetadataOp: 216
 } as const;
 
 /** `ReplyHeader` field offsets the client reads. */
 export const REPLY_OFFSET = {
   size: 48,
   command: 60,
+  requestChecksum: 128,
+  client: 160,
+  op: 176,
   commit: 184,
+  request: 200,
   operation: 208,
-  status: 216
+  status: 216,
+  reserved: 220,
+  partitionIncarnation: 224
 } as const;
+
+export const COMMITTED_RESULT_MARKER = 1;
+export const hasCommittedResult = (header: Buffer): boolean =>
+  peekCommand(header) === Command.Reply && readStatus(header) === 0 &&
+  header[REPLY_OFFSET.reserved] === COMMITTED_RESULT_MARKER;
 
 /** `EvictionHeader` field offsets the client reads. */
 export const EVICTION_OFFSET = {
@@ -94,8 +109,29 @@ export const EvictionReason = {
   MalformedLogin: 15
 } as const;
 
+export const PARTITION_CONTEXT_SIZE = 24;
+
+export type PartitionContext = {
+  readonly incarnation: bigint,
+  readonly ownerGeneration: bigint,
+  readonly metadataOp: bigint
+};
+
+export const EMPTY_PARTITION_CONTEXT: PartitionContext = Object.freeze({
+  incarnation: 0n,
+  ownerGeneration: 0n,
+  metadataOp: 0n
+});
+
+export const deserializePartitionContext = (data: Buffer, offset = 0): PartitionContext => ({
+  incarnation: data.readBigUInt64LE(offset),
+  ownerGeneration: data.readBigUInt64LE(offset + 8),
+  metadataOp: data.readBigUInt64LE(offset + 16)
+});
+
 /** Fields the client writes into a request header. */
 export type RequestHeaderFields = {
+  context?: PartitionContext,
   /** Header + body total, bytes. */
   size: number,
   /** Ephemeral client identifier (u128). */
@@ -112,13 +148,7 @@ export type RequestHeaderFields = {
 
 const U64_MASK = 0xFFFFFFFFFFFFFFFFn;
 
-/**
- * Encodes a 256-byte request header. Only the six fields the server reads
- * are written. The checksums stay zero: the frame and body checksums are not
- * read on the client request path, and `request_checksum` treats zero as
- * unstamped, which opts out of the server's payload comparison. Stamping it is
- * optional -- the Rust SDK does for deduped ops, this SDK does not yet.
- */
+/** Encodes one request identity and its captured partition context. */
 export const encodeRequestHeader = (fields: RequestHeaderFields): Buffer => {
   const header = Buffer.alloc(HEADER_SIZE);
   header.writeUInt32LE(fields.size, REQUEST_OFFSET.size);
@@ -129,6 +159,10 @@ export const encodeRequestHeader = (fields: RequestHeaderFields): Buffer => {
   header.writeBigUInt64LE(fields.request, REQUEST_OFFSET.request);
   header.writeUInt8(fields.operation, REQUEST_OFFSET.operation);
   header.writeBigUInt64LE(fields.session, REQUEST_OFFSET.session);
+  const context = fields.context ?? EMPTY_PARTITION_CONTEXT;
+  header.writeBigUInt64LE(context.incarnation, REQUEST_OFFSET.partitionIncarnation);
+  header.writeBigUInt64LE(context.ownerGeneration, REQUEST_OFFSET.ownerGeneration);
+  header.writeBigUInt64LE(context.metadataOp, REQUEST_OFFSET.minimumMetadataOp);
   if (fields.nonReplicatedCode !== undefined)
     header.writeUInt32LE(fields.nonReplicatedCode, REQUEST_OFFSET.reserved);
   return header;
@@ -145,7 +179,7 @@ export const peekCommand = (header: Buffer): number =>
 export const readSize = (header: Buffer): number =>
   header.readUInt32LE(REPLY_OFFSET.size);
 
-/** Reads the pre-commit denial status; 0 means the reply committed. */
+/** Reads the pre-commit denial status; zero alone does not prove commit. */
 export const readStatus = (header: Buffer): number =>
   header.readUInt32LE(REPLY_OFFSET.status);
 

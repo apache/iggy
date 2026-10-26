@@ -26,9 +26,10 @@
 //! transport. The coordinator fences stale selections (rebalance), prompting a
 //! re-sync that resets the cursor.
 
-use crate::Identifier;
+use crate::{Identifier, IggyError};
+use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 #[derive(Debug, Default, Clone)]
 struct GroupAssignment {
@@ -37,18 +38,42 @@ struct GroupAssignment {
     cursor: usize,
 }
 
-/// Per-transport cache of consumer-group assignments + partition counts used to
-/// resolve partitioning client-side. Keys are `stream|topic[|group]` strings
-/// built from the request identifiers.
+#[derive(Debug, Default)]
+struct TopicPartitions {
+    contexts: HashMap<u32, PartitionContext>,
+    cursor: usize,
+    /// HTTP only: the client may send to the topic but not read its details, the only HTTP
+    /// source of send contexts, so its sends there carry none.
+    send_contexts_refused: bool,
+}
+
+/// Per-transport cache of group assignments, producer cursors and send
+/// contexts. Topic lookups borrow identifiers without formatting keys.
 #[derive(Debug, Default)]
 pub struct ConsumerGroupClientState {
-    assignments: Mutex<HashMap<String, GroupAssignment>>,
-    balanced_cursors: Mutex<HashMap<String, usize>>,
-    partition_counts: Mutex<HashMap<String, u32>>,
+    groups: Mutex<GroupState>,
+    topic_partitions: Mutex<HashMap<Identifier, HashMap<Identifier, TopicPartitions>>>,
+}
+
+#[derive(Debug, Default)]
+struct GroupState {
+    generation: u64,
+    assignments: HashMap<String, GroupAssignment>,
     /// Identifiers of the joined groups, so the heartbeat can rebuild a sync
     /// request without re-deriving them from the cache key. Keyed by the same
     /// `stream|topic|group` string as `assignments`.
-    joined_groups: Mutex<HashMap<String, (Identifier, Identifier, Identifier)>>,
+    joined_groups: HashMap<String, (Identifier, Identifier, Identifier)>,
+}
+
+impl GroupState {
+    fn set_assignment(&mut self, key: String, generation: u64, partitions: Vec<u32>) {
+        let entry = self.assignments.entry(key).or_default();
+        if entry.generation != generation {
+            entry.cursor = 0;
+        }
+        entry.generation = generation;
+        entry.partitions = partitions;
+    }
 }
 
 impl ConsumerGroupClientState {
@@ -60,9 +85,8 @@ impl ConsumerGroupClientState {
     /// True if a non-empty assignment is cached for the group.
     #[must_use]
     pub fn has_assignment(&self, key: &str) -> bool {
-        self.assignments
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.groups()
+            .assignments
             .get(key)
             .is_some_and(|assignment| !assignment.partitions.is_empty())
     }
@@ -70,35 +94,21 @@ impl ConsumerGroupClientState {
     /// Replace the cached assignment for a group. A generation change (a
     /// rebalance) resets the round-robin cursor so selection restarts cleanly.
     pub fn set_assignment(&self, key: String, generation: u64, partitions: Vec<u32>) {
-        let mut map = self
-            .assignments
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let entry = map.entry(key).or_default();
-        if entry.generation != generation {
-            entry.cursor = 0;
-        }
-        entry.generation = generation;
-        entry.partitions = partitions;
+        self.groups().set_assignment(key, generation, partitions);
     }
 
     /// Drop a group's cached assignment (after a fence rejection) so the next
     /// poll re-syncs.
     pub fn invalidate_assignment(&self, key: &str) {
-        self.assignments
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(key);
+        self.groups().assignments.remove(key);
     }
 
     /// The next assigned partition for a group poll, advancing the cursor.
     /// `None` when nothing is cached / the assignment is empty.
     #[must_use]
     pub fn next_group_partition(&self, key: &str) -> Option<u32> {
-        let mut map = self
-            .assignments
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut groups = self.groups();
+        let map = &mut groups.assignments;
         let assignment = map.get_mut(key)?;
         if assignment.partitions.is_empty() {
             return None;
@@ -111,34 +121,123 @@ impl ConsumerGroupClientState {
     /// The next `Balanced` produce partition for a topic, advancing the cursor.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
-    pub fn next_balanced_partition(&self, key: &str, partition_count: u32) -> u32 {
-        if partition_count == 0 {
+    pub fn next_balanced_partition(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partitions_count: u32,
+    ) -> u32 {
+        if partitions_count == 0 {
             return 0;
         }
         let mut map = self
-            .balanced_cursors
+            .topic_partitions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let cursor = map.entry(key.to_owned()).or_default();
-        let partition = (*cursor % partition_count as usize) as u32;
-        *cursor = cursor.wrapping_add(1);
-        partition
+        if let Some(topic) = map
+            .get_mut(stream_id)
+            .and_then(|topics| topics.get_mut(topic_id))
+        {
+            let partition = (topic.cursor % partitions_count as usize) as u32;
+            topic.cursor = topic.cursor.wrapping_add(1);
+            return partition;
+        }
+        map.entry(stream_id.clone()).or_default().insert(
+            topic_id.clone(),
+            TopicPartitions {
+                cursor: 1,
+                ..Default::default()
+            },
+        );
+        0
+    }
+
+    pub fn set_topic_partitions(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partitions: &[crate::Partition],
+    ) {
+        let mut map = self
+            .topic_partitions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let topic = map
+            .entry(stream_id.clone())
+            .or_default()
+            .entry(topic_id.clone())
+            .or_default();
+        topic.contexts = partitions
+            .iter()
+            .map(|partition| (partition.id, partition.context))
+            .collect();
+        topic.send_contexts_refused = false;
     }
 
     #[must_use]
-    pub fn partition_count(&self, key: &str) -> Option<u32> {
-        self.partition_counts
+    pub fn partition_context(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: u32,
+    ) -> Option<PartitionContext> {
+        self.topic_partitions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(key)
+            .get(stream_id)?
+            .get(topic_id)?
+            .contexts
+            .get(&partition_id)
             .copied()
     }
 
-    pub fn set_partition_count(&self, key: String, partition_count: u32) {
-        self.partition_counts
+    /// Remember that the topic details were refused to this client, so its sends to the topic go
+    /// without a context instead of asking for the details again.
+    pub fn refuse_send_contexts(&self, stream_id: &Identifier, topic_id: &Identifier) {
+        self.topic_partitions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(key, partition_count);
+            .entry(stream_id.clone())
+            .or_default()
+            .entry(topic_id.clone())
+            .or_default()
+            .send_contexts_refused = true;
+    }
+
+    #[must_use]
+    pub fn send_contexts_refused(&self, stream_id: &Identifier, topic_id: &Identifier) -> bool {
+        self.topic_partitions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(stream_id)
+            .and_then(|topics| topics.get(topic_id))
+            .is_some_and(|topic| topic.send_contexts_refused)
+    }
+
+    pub fn invalidate_topic(&self, stream_id: &Identifier, topic_id: &Identifier) {
+        if let Some(topic) = self
+            .topic_partitions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(stream_id)
+            .and_then(|topics| topics.get_mut(topic_id))
+        {
+            topic.contexts.clear();
+            topic.send_contexts_refused = false;
+        }
+    }
+
+    /// Names and numeric identifiers can cache the same partition under different keys.
+    /// Already captured request contexts are independent of this discovery cache.
+    pub fn invalidate_topic_discovery(&self) {
+        let mut map = self
+            .topic_partitions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for topic in map.values_mut().flat_map(HashMap::values_mut) {
+            topic.contexts.clear();
+            topic.send_contexts_refused = false;
+        }
     }
 
     /// Record a joined group's identifiers so the heartbeat can re-sync it.
@@ -149,18 +248,14 @@ impl ConsumerGroupClientState {
         topic_id: Identifier,
         group_id: Identifier,
     ) {
-        self.joined_groups
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.groups()
+            .joined_groups
             .insert(key, (stream_id, topic_id, group_id));
     }
 
     /// Forget a group (after leave / delete) so the heartbeat stops re-syncing.
     pub fn deregister_group(&self, key: &str) {
-        self.joined_groups
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(key);
+        self.groups().joined_groups.remove(key);
     }
 
     /// True if the last assignment sync observed this client as a member. A
@@ -168,45 +263,94 @@ impl ConsumerGroupClientState {
     /// this is a different question than [`Self::has_assignment`].
     #[must_use]
     pub fn is_registered(&self, key: &str) -> bool {
-        self.joined_groups
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains_key(key)
+        self.groups().joined_groups.contains_key(key)
     }
 
     /// Identifiers of every group the client has joined on this transport.
     #[must_use]
     pub fn registered_groups(&self) -> Vec<(Identifier, Identifier, Identifier)> {
-        self.joined_groups
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .values()
-            .cloned()
-            .collect()
+        self.groups().joined_groups.values().cloned().collect()
     }
 
     /// Drop what the consensus session owned. Membership is per connection
     /// and the coordinator fences assignments by a generation it tracks per
     /// session, so nothing synced under the old session holds once it is
-    /// reset. The balanced cursors and the partition counts stay: they belong
-    /// to a topic, not to a session, and clearing them would restart the
-    /// produce round-robin at partition 0 and cost a metadata round trip per
-    /// topic on every reconnect.
+    /// reset. The topic state stays: it belongs to a topic, not to a session,
+    /// and clearing the balanced cursors would restart the produce round-robin
+    /// at partition 0 on every reconnect.
     pub fn clear_session_scoped(&self) {
-        self.assignments
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
-        self.joined_groups
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
+        let mut groups = self.groups();
+        groups.generation += 1;
+        groups.assignments.clear();
+        groups.joined_groups.clear();
+    }
+
+    #[doc(hidden)]
+    pub fn session_generation(&self) -> u64 {
+        self.groups().generation
+    }
+
+    /// Publishes membership and assignment together, only for the session that requested them.
+    #[doc(hidden)]
+    pub fn apply_group_assignment(
+        &self,
+        generation: u64,
+        key: String,
+        identifiers: (Identifier, Identifier, Identifier),
+        assignment: Option<(u64, Vec<u32>)>,
+    ) -> Result<(), IggyError> {
+        let mut groups = self.groups();
+        if groups.generation != generation {
+            return Err(IggyError::TransientNotAccepted);
+        }
+        let Some((generation, partitions)) = assignment else {
+            groups.assignments.remove(&key);
+            groups.joined_groups.remove(&key);
+            return Ok(());
+        };
+        groups.joined_groups.insert(key.clone(), identifiers);
+        groups.set_assignment(key, generation, partitions);
+        Ok(())
+    }
+
+    fn groups(&self) -> MutexGuard<'_, GroupState> {
+        self.groups.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn partitions(count: u32) -> Vec<crate::Partition> {
+        (0..count)
+            .map(|id| crate::Partition {
+                id,
+                created_at: Default::default(),
+                segments_count: 0,
+                current_offset: 0,
+                size: Default::default(),
+                messages_count: 0,
+                context: PartitionContext::default(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn topic_identifiers_do_not_alias_and_discovery_refresh_preserves_the_cursor() {
+        let state = ConsumerGroupClientState::new();
+        let stream = Identifier::numeric(1).unwrap();
+        let numeric = Identifier::numeric(2).unwrap();
+        let named = Identifier::named("2").unwrap();
+        state.set_topic_partitions(&stream, &numeric, &partitions(3));
+        assert!(state.partition_context(&stream, &numeric, 0).is_some());
+        assert_eq!(state.partition_context(&stream, &named, 0), None);
+        assert_eq!(state.next_balanced_partition(&stream, &numeric, 3), 0);
+        state.invalidate_topic_discovery();
+        assert_eq!(state.partition_context(&stream, &numeric, 0), None);
+        state.set_topic_partitions(&stream, &numeric, &partitions(3));
+        assert_eq!(state.next_balanced_partition(&stream, &numeric, 3), 1);
+    }
 
     #[test]
     fn group_partition_round_robins_then_wraps() {
@@ -233,9 +377,36 @@ mod tests {
     fn balanced_round_robins() {
         let state = ConsumerGroupClientState::new();
         let picks: Vec<u32> = (0..4)
-            .map(|_| state.next_balanced_partition("s|t", 3))
+            .map(|_| {
+                state.next_balanced_partition(
+                    &Identifier::named("s").unwrap(),
+                    &Identifier::named("t").unwrap(),
+                    3,
+                )
+            })
             .collect();
         assert_eq!(picks, vec![0, 1, 2, 0]);
+    }
+
+    #[test]
+    fn refused_send_contexts_are_forgotten_with_the_topic_state() {
+        let stream = Identifier::named("s").unwrap();
+        let topic = Identifier::named("t").unwrap();
+        let state = ConsumerGroupClientState::new();
+        assert!(!state.send_contexts_refused(&stream, &topic));
+
+        state.refuse_send_contexts(&stream, &topic);
+        assert!(state.send_contexts_refused(&stream, &topic));
+        state.invalidate_topic(&stream, &topic);
+        assert!(!state.send_contexts_refused(&stream, &topic));
+
+        state.refuse_send_contexts(&stream, &topic);
+        state.invalidate_topic_discovery();
+        assert!(!state.send_contexts_refused(&stream, &topic));
+
+        state.refuse_send_contexts(&stream, &topic);
+        state.set_topic_partitions(&stream, &topic, &partitions(1));
+        assert!(!state.send_contexts_refused(&stream, &topic));
     }
 
     #[test]
@@ -262,12 +433,21 @@ mod tests {
 
     #[test]
     fn session_reset_drops_membership_and_keeps_topic_state() {
+        let stream = Identifier::named("s").unwrap();
+        let topic = Identifier::named("t").unwrap();
         let state = ConsumerGroupClientState::new();
         let id = Identifier::named("g").unwrap();
         state.register_group("s|t|g".to_owned(), id.clone(), id.clone(), id);
         state.set_assignment("s|t|g".to_owned(), 1, vec![0, 1]);
-        assert_eq!(state.next_balanced_partition("s|t", 3), 0);
-        state.set_partition_count("s|t".to_owned(), 3);
+        assert_eq!(
+            state.next_balanced_partition(
+                &Identifier::named("s").unwrap(),
+                &Identifier::named("t").unwrap(),
+                3
+            ),
+            0
+        );
+        state.set_topic_partitions(&stream, &topic, &partitions(3));
 
         state.clear_session_scoped();
 
@@ -275,8 +455,15 @@ mod tests {
         assert!(!state.is_registered("s|t|g"));
         assert!(!state.has_assignment("s|t|g"));
         // Topic state outlives the session: the produce cursor carries on and
-        // the partition count is still cached.
-        assert_eq!(state.next_balanced_partition("s|t", 3), 1);
-        assert_eq!(state.partition_count("s|t"), Some(3));
+        // the send contexts are still cached.
+        assert_eq!(
+            state.next_balanced_partition(
+                &Identifier::named("s").unwrap(),
+                &Identifier::named("t").unwrap(),
+                3
+            ),
+            1
+        );
+        assert!(state.partition_context(&stream, &topic, 0).is_some());
     }
 }

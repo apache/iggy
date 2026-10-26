@@ -47,25 +47,45 @@ pub use crate::common::server::{
     TelemetryConfig, TelemetryLogsConfig, TelemetryTracesConfig, TelemetryTransport,
 };
 
-pub const SERVER_PROCESS_ENV_VARS: &[&str] = &[
-    "IGGY_CONFIG_PATH",
-    "IGGY_ENV_PATH",
-    "IGGY_DISPLAY_CONFIG",
-    "IGGY_ROOT_USERNAME",
-    "IGGY_ROOT_PASSWORD",
+/// Vars used by sibling binaries (iggy CLI) or test/CI-only. These suppress
+/// unknown-name warnings but are not advertised by the server.
+const SERVER_SCAN_ONLY_ENV_VARS: &[&str] = &[
     "IGGY_TEST_VERBOSE",
     "IGGY_TEST_CLUSTER_NODES",
     "IGGY_TEST_CLEANUP_DISABLED",
-    "IGGY_SHARD_RUNTIME_CAPACITY",
-    "IGGY_SHARD_EVENT_INTERVAL",
     "IGGY_CI_BUILD",
     "IGGY_HOME",
     "IGGY_USERNAME",
     "IGGY_PASSWORD",
+    "IGGY_TOKEN",
 ];
 
+/// Non-config env vars supported by the server and advertised to operators.
+const SERVER_RUNTIME_ENV_VARS: &[&str] = &[
+    "IGGY_CONFIG_PATH",
+    "IGGY_ENV_PATH",
+    crate::configs_impl::DISPLAY_CONFIG_ENV,
+    "IGGY_ROOT_USERNAME",
+    "IGGY_ROOT_PASSWORD",
+    "IGGY_SHARD_RUNTIME_CAPACITY",
+    "IGGY_SHARD_EVENT_INTERVAL",
+];
+
+/// Non-config vars advertised by `iggy-server --list-config-env-vars`.
+pub fn server_runtime_env_vars() -> impl Iterator<Item = &'static str> {
+    SERVER_RUNTIME_ENV_VARS.iter().copied()
+}
+
+/// All non-config vars accepted by the server's unknown-name scan.
+pub fn server_process_env_vars() -> impl Iterator<Item = &'static str> {
+    SERVER_RUNTIME_ENV_VARS
+        .iter()
+        .chain(SERVER_SCAN_ONLY_ENV_VARS)
+        .copied()
+}
+
 pub(crate) const SERVER_ALLOWED_ENV_PREFIXES: &[&str] =
-    &["IGGY_CONNECTORS_", "IGGY_KAFKA_", "IGGY_MCP_"];
+    &["IGGY_CONNECTORS_", "IGGY_KAFKA_", "IGGY_MCP_", "IGGY_TEST_"];
 
 const DEFAULT_CONFIG_PATH: &str = "core/server/config.toml";
 
@@ -132,6 +152,14 @@ const RELOCATED_CONFIG_KEYS: &[RelocatedKey] = &[
     RelocatedKey {
         path: "extra",
         replacement: RelocatedTarget::Removed,
+    },
+    // Refusing the old key keeps an operator's timeout from changing without
+    // notice.
+    RelocatedKey {
+        path: "consumer_group.session_timeout",
+        replacement: RelocatedTarget::Superseded(
+            "the session timeout is now 1.2 x heartbeat.interval",
+        ),
     },
 ];
 
@@ -262,7 +290,7 @@ impl ServerConfig {
         .with_known_env_names(
             Self::all_env_var_names()
                 .into_iter()
-                .chain(SERVER_PROCESS_ENV_VARS.iter().copied())
+                .chain(server_process_env_vars())
                 .collect(),
         )
         .with_allowed_env_prefixes(SERVER_ALLOWED_ENV_PREFIXES)
@@ -433,6 +461,25 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn given_change_log_capacity_env_var_when_loading_should_override_the_default() {
+        const NAME: &str = "IGGY_METADATA_CHANGE_LOG_ACTIVITY_CAPACITY";
+        assert!(ServerConfig::all_env_var_names().contains(&NAME));
+        // SAFETY: `serial_test::serial` keeps other tests off the environment.
+        unsafe { env::set_var(NAME, "4096") };
+
+        let cfg: Result<ServerConfig, _> = Figment::new()
+            .merge(Toml::string(include_str!("../../../server/config.toml")))
+            .merge(ServerConfigEnvProvider::default())
+            .extract();
+
+        // SAFETY: paired with the set above.
+        unsafe { env::remove_var(NAME) };
+        let cfg = cfg.expect("config with the env override deserializes");
+        assert_eq!(cfg.metadata.change_log_activity_capacity, 4096);
+    }
+
+    #[test]
     fn default_impl_validates() {
         let cfg = ServerConfig::default();
         cfg.validate().expect("Default impl validates");
@@ -468,7 +515,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn env_provider_accepts_server_process_env_vars() {
-        for name in SERVER_PROCESS_ENV_VARS {
+        for name in server_process_env_vars() {
             // SAFETY: the race is process-wide, not per key: `set_var` is unsound
             // against any concurrent environment access. `serial_test::serial` on
             // this test is what prevents that.
@@ -477,7 +524,7 @@ mod tests {
 
         let data = ServerConfigEnvProvider::default().data();
 
-        for name in SERVER_PROCESS_ENV_VARS {
+        for name in server_process_env_vars() {
             // SAFETY: paired with the set above.
             unsafe { env::remove_var(name) };
         }
@@ -490,6 +537,31 @@ mod tests {
         assert!(
             profile.is_empty(),
             "none of these variables is a config value, so none of them may reach the map: {profile:?}"
+        );
+    }
+
+    #[test]
+    fn server_process_env_vars_include_every_scan_only_name() {
+        let process_names = server_process_env_vars().collect::<std::collections::HashSet<_>>();
+        for name in [
+            "IGGY_TEST_VERBOSE",
+            "IGGY_TEST_CLUSTER_NODES",
+            "IGGY_TEST_CLEANUP_DISABLED",
+            "IGGY_CI_BUILD",
+            "IGGY_HOME",
+            "IGGY_USERNAME",
+            "IGGY_PASSWORD",
+        ] {
+            assert!(
+                process_names.contains(name),
+                "missing scan-only name {name}"
+            );
+        }
+        assert!(
+            SERVER_RUNTIME_ENV_VARS
+                .iter()
+                .all(|name| !SERVER_SCAN_ONLY_ENV_VARS.contains(name)),
+            "advertised and scan-only env vars must stay disjoint"
         );
     }
 }

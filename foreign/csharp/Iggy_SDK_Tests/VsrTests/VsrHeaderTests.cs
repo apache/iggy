@@ -16,6 +16,7 @@
 // under the License.
 
 using System.Buffers.Binary;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Utils;
 using Apache.Iggy.Vsr;
@@ -110,7 +111,7 @@ public sealed class VsrHeaderTests
 
         Assert.Equal((byte)VsrOperation.NonReplicated, header[VsrHeader.REQUEST_OPERATION_OFFSET]);
         Assert.Equal(1UL, ReadUInt64(header, VsrHeader.REQUEST_ID_OFFSET));
-        Assert.Equal(1UL, session.RequestCounter);
+        Assert.Equal(2UL, session.RequestCounter);
         Assert.Equal(5UL, ReadUInt64(header, VsrHeader.REQUEST_SESSION_OFFSET));
         Assert.Equal((uint)CommandCodes.PING_CODE, ReadUInt32(header, VsrHeader.REQUEST_RESERVED_OFFSET));
     }
@@ -174,6 +175,19 @@ public sealed class VsrHeaderTests
         var second = Encode(session, CommandCodes.SEND_MESSAGES_CODE, payload, out _);
         Assert.Equal(2UL, ReadUInt64(second, VsrHeader.REQUEST_ID_OFFSET));
         Assert.Equal(3UL, session.RequestCounter);
+    }
+
+    [Fact]
+    public void Encode_WritesThePartitionContext()
+    {
+        var header = new byte[VsrHeader.HEADER_SIZE];
+
+        VsrHeader.EncodeRequestHeader(header, BoundSession(), CommandCodes.SEND_MESSAGES_CODE,
+            VsrTestPayloads.SendMessagesToPartition(2, 3, 4), new PartitionContext(17, 9, 52));
+
+        Assert.Equal(17UL, ReadUInt64(header, VsrHeader.REQUEST_INCARNATION_OFFSET));
+        Assert.Equal(9UL, ReadUInt64(header, VsrHeader.REQUEST_OWNER_GENERATION_OFFSET));
+        Assert.Equal(52UL, ReadUInt64(header, VsrHeader.REQUEST_METADATA_OP_OFFSET));
     }
 
     [Fact]

@@ -579,6 +579,14 @@ async fn load_partition(
         partition_metadata.created_view,
     )
     .await?;
+    if let Some(state) = &recovered_state {
+        state
+            .validate_group(namespace.inner(), partition_metadata.created_revision)
+            .map_err(|source| ServerError::PartitionSuperblockUndecodable {
+                dir: PathBuf::from(&partition_dir),
+                source,
+            })?;
+    }
 
     // A recovered partition lost its journal state with the process: the
     // partition journal is in-memory and segments carry no op numbers, so
@@ -676,7 +684,7 @@ async fn load_partition(
             &directory,
             namespace.inner(),
             partition_metadata.created_revision,
-            DiskStorage,
+            partitions::WalStorage::default(),
             config.partition.wal_bytes_max.as_bytes_u64(),
             runtime_options
                 .preallocate_segments
@@ -711,8 +719,6 @@ async fn load_partition(
     partition.set_consumer_offsets_max(config.partition.consumer_offsets_max);
     partition.set_offset_reservation_lease(config.partition.offset_reservation_lease);
     partition.set_partition_dir(partition_dir.clone());
-    // Before the hydrate: the durable record is keyed by incarnation, so a
-    // `purge.gen` left behind by a previous life of this namespace reads 0.
     partition.set_created_revision(partition_metadata.created_revision);
     partition
         .restore_retry_checkpoint(recovered_persistence.0.checkpoint_op())
@@ -726,7 +732,6 @@ async fn load_partition(
         segment_checkpoint,
     )
     .await?;
-    partition.hydrate_applied_purge_generation().await?;
     hydrate_partition_log(
         &mut partition,
         &partition_dir,
@@ -905,11 +910,9 @@ async fn recover_partition_segments(
 /// The namespace arrives packed, so its components are in range by
 /// construction. Metadata admission is what bounds them.
 ///
-/// `created_view` is the view a group with no durable record of its own starts
-/// in: the metadata plane's view when it committed the create, recorded on
-/// the committed partition so every replica seeds the same value. See the
-/// `seed_view` comment below for why a group left at view 0 is unreachable. A
-/// restart keeps it as a view floor while probing for the live view, without
+/// `created_view` is the committed assignment's initial view, independent of
+/// metadata leadership. Every replica seeds a fresh group from that value.
+/// A restart keeps it as a view floor while probing for the live view, without
 /// assigning it to the recovered log.
 ///
 /// The returned partition's `offset` / `dirty_offset` are `0` and its
@@ -1004,6 +1007,14 @@ pub async fn build_partition_fresh(
         created_view,
     )
     .await?;
+    if let Some(state) = &recovered_state {
+        state
+            .validate_group(namespace.inner(), created_revision)
+            .map_err(|source| ServerError::PartitionSuperblockUndecodable {
+                dir: PathBuf::from(&partition_dir),
+                source,
+            })?;
+    }
 
     // The external initialization record, including after directory loss,
     // distinguishes a prior participant from a fresh group member. Prior
@@ -1033,22 +1044,10 @@ pub async fn build_partition_fresh(
             timers: &timers,
             durable_view,
             view_fallback,
-            // Both planes pick their primary as `view % replica_count` from
-            // their OWN view counter. A group left at view 0 while the
-            // metadata plane sits elsewhere therefore names a different node
-            // than the roster advertises as leader, and nothing routes a
-            // partition write across that gap: the client is sent to the
-            // metadata leader and refused there for the whole budget. Seeding
-            // from the view the create was admitted in keeps the two congruent
-            // for a group born after a metadata election.
-            //
-            // The seed comes off the committed partition, not this replica's
-            // live metadata view: the two differ once the metadata plane
-            // elects again, and a seed above the group's real view is an
-            // empty log that outranks committed history in the next DVC
-            // merge. The value rides the create's request body (a header view
-            // is restamped per delivery), so every replica commits the same
-            // one and a late materialiser lands at or below its peers.
+            // Placement chooses this group's initial view independently of
+            // metadata leadership. Use its committed assignment: a late
+            // materializer must not invent a higher empty history that could
+            // outrank acknowledged entries in the next view change.
             seed_view,
             incarnation: None,
             join,
@@ -1073,14 +1072,7 @@ pub async fn build_partition_fresh(
     partition.set_consumer_offsets_max(config.partition.consumer_offsets_max);
     partition.set_offset_reservation_lease(config.partition.offset_reservation_lease);
     partition.set_partition_dir(partition_dir);
-    // Fresh dirs read generation 0; a dir surviving from a crashed process
-    // (this "fresh" build races repair re-materialization) reads the last
-    // durably-applied purge so the reconciler does not re-wipe messages
-    // appended after it. Keyed by incarnation, so a dir left behind by a failed
-    // delete does not fence the recreated partition's purges: set the revision
-    // first.
     partition.set_created_revision(created_revision);
-    partition.hydrate_applied_purge_generation().await?;
     partition.created_at = IggyTimestamp::now();
     partition.offset.store(0, Ordering::Release);
     partition.dirty_offset.store(0, Ordering::Relaxed);
@@ -1347,7 +1339,7 @@ mod tests {
     const REPLICA: u8 = 1;
     const REPLICAS: u8 = 3;
     const OFFSETS_MAGIC: &[u8; 4] = b"ICO1";
-    const OFFSETS_VERSION: u8 = 4;
+    const OFFSETS_VERSION: u8 = 8;
     const RETRY_CHECKPOINT_MAGIC: &[u8; 4] = b"IRP2";
 
     #[compio::test]
@@ -2247,7 +2239,8 @@ mod tests {
         }
         let mut protection = OFFSETS_MAGIC.to_vec();
         protection.push(OFFSETS_VERSION);
-        for value in [0_u64, 1, 0] {
+        // next_offset, emptied_at, required_metadata_frontier
+        for value in [1_u64, 0, 0] {
             protection.extend_from_slice(&value.to_le_bytes());
         }
         protection.extend_from_slice(
@@ -2256,6 +2249,9 @@ mod tests {
                 .to_le_bytes(),
         );
         protection.extend_from_slice(&[0; (ConsumerKind::COUNT + 1) * size_of::<u32>()]);
+        protection.extend_from_slice(&0_u32.to_le_bytes());
+        protection.push(0);
+        protection.extend_from_slice(&0_u32.to_le_bytes());
         protection.push(0);
         protection.extend_from_slice(&0_u128.to_le_bytes());
         protection.extend_from_slice(&0_u32.to_le_bytes());
@@ -2374,7 +2370,7 @@ mod tests {
             let (_, recovered) = open_partition_superblock(&directory, test_identity(), 0)
                 .await
                 .unwrap();
-            assert_eq!(recovered, Some(state));
+            assert_eq!(recovered.as_ref(), Some(&state));
         }
         assert_eq!(
             std::fs::read(format!("{directory}.fenced.0/prepares-0/frontier")).unwrap(),
@@ -2394,6 +2390,7 @@ mod tests {
             checkpoint_checksum: 0,
             offset_frontier: 0,
             offset_reserved: 0,
+            adopted_view: None,
         }
     }
 
@@ -2466,7 +2463,7 @@ mod tests {
             validate_checksum: true,
             segment_size: IggyByteSize::from(1_048_576_u64),
             preallocate_segments: false,
-            encryptor: None,
+            key_context: Arc::default(),
             path_layout: PartitionPathLayout {
                 streams_root: config.get_streams_path(),
             },

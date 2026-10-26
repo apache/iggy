@@ -23,6 +23,10 @@ use std::fmt::Display;
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ClusterNode {
+    /// The node's configured VSR replica id. Key nodes by it: the position in
+    /// [`crate::ClusterMetadata::nodes`] is not an id. Required on
+    /// deserialization, since a defaulted 0 would name the wrong replica.
+    pub replica_id: u8,
     pub name: String,
     pub ip: String,
     pub endpoints: TransportEndpoints,
@@ -34,8 +38,8 @@ impl Display for ClusterNode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "ClusterNode {{ name: {}, ip: {}, endpoints: {}, role: {}, status: {} }}",
-            self.name, self.ip, self.endpoints, self.role, self.status
+            "ClusterNode {{ replica_id: {}, name: {}, ip: {}, endpoints: {}, role: {}, status: {} }}",
+            self.replica_id, self.name, self.ip, self.endpoints, self.role, self.status
         )
     }
 }

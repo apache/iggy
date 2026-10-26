@@ -38,9 +38,10 @@ Commands:
   segment          segments operations [alias: seg]
   ping             ping iggy server
   me               get current client info
-  options          list the options a resource's create command accepts
+  options          list the option catalog of a resource scope
   stats            get iggy server statistics
   snapshot         collect iggy server troubleshooting data
+  metadata         metadata change log operations [alias: md]
   pat              personal access token operations
   user             user operations [alias: u]
   client           client operations [alias: c]
@@ -199,16 +200,27 @@ Options:
 
   -u, --username <USERNAME>
           Iggy server username
+{CLAP_INDENT}
+          When no credential flags are supplied, set both IGGY_USERNAME and
+          IGGY_PASSWORD. This environment pair does not fill omitted flags.
 
   -p, --password <PASSWORD>
           Iggy server password
 {CLAP_INDENT}
-          An optional parameter to specify the password for authentication.
-          If not provided, user will be prompted interactively to enter the
-          password securely.
+          With --username and no --password, read the password from the terminal
+          or stdin. IGGY_PASSWORD does not supply a password for --username.
+{CLAP_INDENT}
+          When no credential flags are supplied, set both IGGY_USERNAME and
+          IGGY_PASSWORD. This environment pair does not fill omitted flags.
 
   -t, --token <TOKEN>
           Iggy server personal access token
+{CLAP_INDENT}
+          Can also be provided with the IGGY_TOKEN environment variable.
+          An empty IGGY_TOKEN is treated as unset.
+          Command line credentials take precedence over the environment
+          variables, and IGGY_TOKEN takes precedence over the IGGY_USERNAME and
+          IGGY_PASSWORD pair.
 
   -n, --token-name <TOKEN_NAME>
           Iggy server personal access token name

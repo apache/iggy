@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import type { ClientProvider } from '../client/client.type.js';
+import type { ClientProvider, SendCommandOptions } from '../client/client.type.js';
 
 import { COMMAND_CODE } from './command.code.js';
 import { responseError } from './error.utils.js';
@@ -38,7 +38,6 @@ import {
   ensureConsumerGroup, ensureConsumerGroupAndJoin
 } from './consumer-group/ensure-group.virtual.command.js';
 
-import { purgeTopic } from './topic/purge-topic.command.js';
 import { createTopic } from './topic/create-topic.command.js';
 import { updateTopic } from './topic/update-topic.command.js';
 import { getTopic } from './topic/get-topic.command.js';
@@ -58,7 +57,6 @@ import { updateStream } from './stream/update-stream.command.js';
 import { getStream } from './stream/get-stream.command.js';
 import { getStreams } from './stream/get-streams.command.js';
 import { deleteStream } from './stream/delete-stream.command.js';
-import { purgeStream } from './stream/purge-stream.command.js';
 import { ensureStream } from './stream/ensure-stream.virtual.command.js';
 
 import { createPartition } from './partition/create-partition.command.js';
@@ -67,6 +65,7 @@ import { deletePartition } from './partition/delete-partition.command.js';
 import { deleteSegments } from './segment/delete-segments.command.js';
 
 import { describeOptions } from './system/describe-options.command.js';
+import { getMetadataChanges } from './system/get-metadata-changes.command.js';
 import { getStats } from './system/get-stats.command.js';
 import { snapshot } from './system/snapshot.command.js';
 import { ping } from './system/ping.command.js';
@@ -128,7 +127,6 @@ const streamAPI = (c: ClientProvider) => ({
   create: createStream(c),
   update: updateStream(c),
   delete: deleteStream(c),
-  purge: purgeStream(c),
   ensure: ensureStream(c)
 });
 
@@ -140,7 +138,6 @@ const topicAPI = (c: ClientProvider) => ({
   create: createTopic(c),
   update: updateTopic(c),
   delete: deleteTopic(c),
-  purge: purgeTopic(c),
   ensure: ensureTopic(c)
 });
 
@@ -191,7 +188,8 @@ const systemAPI = (c: ClientProvider) => ({
   ping: ping(c),
   getStats: getStats(c),
   snapshot: snapshot(c),
-  describeOptions: describeOptions(c)
+  describeOptions: describeOptions(c),
+  getMetadataChanges: getMetadataChanges(c)
 });
 
 type SystemAPI = ReturnType<typeof systemAPI>;
@@ -211,6 +209,7 @@ const SESSION_CONTROL_CODES = new Set([
 ]);
 
 const INVALID_COMMAND_ERROR_CODE = 3;
+const FEATURE_UNAVAILABLE_ERROR_CODE = 5;
 
 export abstract class AbstractAPI {
   clientProvider: ClientProvider;
@@ -239,6 +238,20 @@ export abstract class CommandAPI extends AbstractAPI {
     super(c);
   }
 
+  async resolveOperation(operationId: bigint, options?: SendCommandOptions): Promise<void> {
+    const client = await this.clientProvider();
+    if (!client.resolveOperation)
+      throw responseError(0, FEATURE_UNAVAILABLE_ERROR_CODE, 'the supplied raw client does not support operation recovery');
+    return client.resolveOperation(operationId, options);
+  }
+
+  async abandonOperation(operationId: bigint): Promise<void> {
+    const client = await this.clientProvider();
+    if (!client.abandonOperation)
+      throw responseError(0, FEATURE_UNAVAILABLE_ERROR_CODE, 'the supplied raw client does not support operation recovery');
+    client.abandonOperation(operationId);
+  }
+
   /**
    * Sends a command code with a payload and returns the raw response payload.
    * Session-control codes are rejected with an invalid-command error.
@@ -251,13 +264,44 @@ export abstract class CommandAPI extends AbstractAPI {
     code: number,
     payload: Buffer
   ): Promise<Buffer> {
+    return this.sendRawCommand(code, payload);
+  }
+
+  /**
+   * Sends a command code with a payload to the replica with the given id, as
+   * the cluster metadata names it, and returns the raw response payload. Every
+   * node answers non-replicated commands such as GetStats from its own state.
+   * Replicated commands, polls, consumer-offset reads and session-control codes
+   * are rejected with an invalid-command error, and a replica id the cluster
+   * metadata does not name with an invalid-identifier error. A `NotPrimary`
+   * refusal is returned and not retried on another replica.
+   *
+   * @param code - Command code to send
+   * @param payload - Raw command payload
+   * @param replica - Replica id, as the cluster metadata names it
+   * @returns Raw response payload
+   */
+  async sendBinaryRequestToReplica(
+    code: number,
+    payload: Buffer,
+    replica: number
+  ): Promise<Buffer> {
+    return this.sendRawCommand(code, payload, { replica });
+  }
+
+  private async sendRawCommand(
+    code: number,
+    payload: Buffer,
+    options?: SendCommandOptions
+  ): Promise<Buffer> {
     if (SESSION_CONTROL_CODES.has(code))
       throw responseError(code, INVALID_COMMAND_ERROR_CODE);
 
-    const requestPayload = Buffer.from(payload);
+    const snapshot = Buffer.from(payload);
     const response = await (await this.clientProvider()).sendCommand(
       code,
-      requestPayload
+      snapshot,
+      options
     );
     return response.length <= 1 ? Buffer.alloc(0) : response.data;
   }

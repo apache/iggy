@@ -17,7 +17,5 @@
 
 pub mod create_stream;
 pub mod delete_stream;
-pub mod purge_stream;
-pub mod update_stream;
 
 use crate::MAX_NAME_LENGTH;

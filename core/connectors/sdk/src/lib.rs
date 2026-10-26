@@ -46,7 +46,7 @@ pub mod sink;
 pub mod source;
 pub mod transforms;
 
-pub use convert::owned_value_to_serde_json;
+pub use convert::{owned_value_into_serde_json, owned_value_to_serde_json};
 pub use log::LogCallback;
 pub use transforms::Transform;
 
@@ -108,6 +108,15 @@ impl ConnectorState {
 pub trait Source: Send + Sync {
     /// Invoked when the source is initialized, allowing it to perform any necessary setup.
     async fn open(&mut self) -> Result<(), Error>;
+
+    /// Controls whether repeated NACKs stop this source.
+    ///
+    /// The default stops after five consecutive NACKs. Sources that hold accepted input only in
+    /// memory can disable that limit so a transient broker outage does not strand their input.
+    /// The SDK reads this policy once after `open()`; later changes have no effect.
+    fn batch_policy(&self) -> source::BatchPolicy {
+        source::BatchPolicy::default()
+    }
 
     /// Retrieves the next batch for the runtime to process and deliver.
     async fn poll(&self) -> Result<ProducedMessages, Error>;

@@ -26,16 +26,19 @@ use integration::iggy_harness;
 
 // Consumer group scenarios do not support HTTP (stateful operations).
 
-// Every spec here pins a 60s server heartbeat because harness clients never
-// ping on their own: the SDK pinger is spawned by `IggyClient::connect`, which
-// the harness builder does not call. At the shipped 30s interval a group member
-// that idles through another client's setup is reaped by the server's verifier,
-// and the failure surfaces as a short member count instead of anything about
-// the scenario under test.
+// Harness clients never ping on their own: the SDK pinger is spawned by
+// `IggyClient::connect`, which the harness builder does not call. With
+// heartbeat checks on, the server logs out a group member that stays silent
+// too long, and the failure surfaces as a missing member or a reassigned
+// partition instead of anything about the scenario under test.
 
 #[iggy_harness(
     test_client_transport = [Tcp, WebSocket, Quic],
-    server(heartbeat.enabled = true, heartbeat.interval = "60s")
+    server(
+        heartbeat.enabled = true,
+        heartbeat.interval = "60s",
+        consumer_group.rebalancing_timeout = "1s"
+    )
 )]
 async fn join(harness: &TestHarness) {
     consumer_group_join_scenario::run(harness).await;
@@ -51,7 +54,11 @@ async fn single_client(harness: &TestHarness) {
 
 #[iggy_harness(
     test_client_transport = [Tcp, WebSocket, Quic],
-    server(heartbeat.enabled = true, heartbeat.interval = "60s")
+    server(
+        heartbeat.enabled = true,
+        heartbeat.interval = "60s",
+        consumer_group.rebalancing_timeout = "1s"
+    )
 )]
 async fn multiple_clients(harness: &TestHarness) {
     consumer_group_with_multiple_clients_polling_messages_scenario::run(harness).await;

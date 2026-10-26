@@ -173,6 +173,7 @@ extension IggyMessage: CustomStringConvertible {
 
 /// The messages one poll returned.
 public struct PolledMessages: Sendable, Hashable {
+    public var context: PartitionContext
     /// The partition that was read. Empty consumer-group polls can carry a
     /// sentinel instead of a real id, see ``noAssignedPartition``.
     public var partitionID: UInt32
@@ -182,7 +183,8 @@ public struct PolledMessages: Sendable, Hashable {
     public var count: UInt32
     public var messages: [IggyMessage]
 
-    public init(partitionID: UInt32, currentOffset: UInt64, count: UInt32, messages: [IggyMessage]) {
+    public init(partitionID: UInt32, currentOffset: UInt64, count: UInt32, messages: [IggyMessage], context: PartitionContext = .empty) {
+        self.context = context
         self.partitionID = partitionID
         self.currentOffset = currentOffset
         self.count = count
@@ -194,6 +196,12 @@ public struct PolledMessages: Sendable, Hashable {
     /// Partition id of an empty poll by a consumer-group member that currently
     /// holds no partitions: `NO_ASSIGNED_PARTITION` in `core/common`.
     public static let noAssignedPartition: UInt32 = UInt32.max - 1
+
+    /// Partition id of an empty consumer-group poll the coordinator fenced
+    /// because the member's assignment is stale:
+    /// `RESYNC_REQUIRED_PARTITION_SENTINEL` in `core/common`. The client
+    /// syncs the assignment and polls again, so callers never see it.
+    static let resyncRequiredPartition: UInt32 = UInt32.max
 }
 
 /// One confirmation of a committed batch.

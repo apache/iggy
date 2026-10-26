@@ -93,6 +93,9 @@ public enum IggyErrorCode: UInt32, Sendable, Hashable, CaseIterable, Codable {
     case invalidBooleanValue = 83
     case invalidNumberValue = 84
     case requestTooOld = 85
+    case historyUnavailable = 87
+    case lifecycleBusy = 88
+    case notPrimary = 89
     case clientNotFound = 100
     case invalidClientId = 101
     case connectionClosed = 206
@@ -149,6 +152,7 @@ public enum IggyErrorCode: UInt32, Sendable, Hashable, CaseIterable, Codable {
     case topicDirectoryNotFound = 2020
     case tooManyTopics = 2021
     case partitionsLimitReached = 2022
+    case partitionResizeDisabled = 2023
     case cannotCreatePartition = 3000
     case cannotCreatePartitionsDirectory = 3001
     case cannotCreatePartitionDirectory = 3002
@@ -224,6 +228,12 @@ public enum IggyErrorCode: UInt32, Sendable, Hashable, CaseIterable, Codable {
     case invalidOffset = 4100
     case invalidReservedField = 4101
     case segmentSizeMismatchAtOpen = 4102
+    case optionNotUpdatable = 4103
+    case optionNotResettable = 4104
+    case readOnlyOption = 4105
+    case streamEncryptionUnavailable = 4106
+    case unsupportedCriticalOption = 4107
+    case cannotModifyRootUser = 4108
     case consumerGroupIdNotFound = 5000
     case invalidConsumerGroupId = 5002
     case consumerGroupNameNotFound = 5003
@@ -233,6 +243,7 @@ public enum IggyErrorCode: UInt32, Sendable, Hashable, CaseIterable, Codable {
     case cannotCreateConsumerGroupInfo = 5007
     case cannotDeleteConsumerGroupInfo = 5008
     case consumerGroupPartitionNotOwned = 5009
+    case tooManyConsumerGroups = 5010
     case missingBaseOffsetRetainedMessageBatch = 6000
     case missingLastOffsetDeltaRetainedMessageBatch = 6001
     case missingMaxTimestampRetainedMessageBatch = 6002
@@ -269,6 +280,9 @@ public enum IggyErrorCode: UInt32, Sendable, Hashable, CaseIterable, Codable {
     case incompatibleProtocolVersion = 14003
     case sessionMismatch = 14004
     case requestIdExhausted = 14005
+    case operationUncertain = 14006
+    case laneBlocked = 14007
+    case operationNotRetained = 14008
 }
 
 extension IggyErrorCode {
@@ -344,6 +358,9 @@ extension IggyErrorCode {
         case .invalidBooleanValue: "invalid_boolean_value"
         case .invalidNumberValue: "invalid_number_value"
         case .requestTooOld: "request_too_old"
+        case .historyUnavailable: "history_unavailable"
+        case .lifecycleBusy: "lifecycle_busy"
+        case .notPrimary: "not_primary"
         case .clientNotFound: "client_not_found"
         case .invalidClientId: "invalid_client_id"
         case .connectionClosed: "connection_closed"
@@ -400,6 +417,7 @@ extension IggyErrorCode {
         case .topicDirectoryNotFound: "topic_directory_not_found"
         case .tooManyTopics: "too_many_topics"
         case .partitionsLimitReached: "partitions_limit_reached"
+        case .partitionResizeDisabled: "partition_resize_disabled"
         case .cannotCreatePartition: "cannot_create_partition"
         case .cannotCreatePartitionsDirectory: "cannot_create_partitions_directory"
         case .cannotCreatePartitionDirectory: "cannot_create_partition_directory"
@@ -475,6 +493,12 @@ extension IggyErrorCode {
         case .invalidOffset: "invalid_offset"
         case .invalidReservedField: "invalid_reserved_field"
         case .segmentSizeMismatchAtOpen: "segment_size_mismatch_at_open"
+        case .optionNotUpdatable: "option_not_updatable"
+        case .optionNotResettable: "option_not_resettable"
+        case .readOnlyOption: "read_only_option"
+        case .streamEncryptionUnavailable: "stream_encryption_unavailable"
+        case .unsupportedCriticalOption: "unsupported_critical_option"
+        case .cannotModifyRootUser: "cannot_modify_root_user"
         case .consumerGroupIdNotFound: "consumer_group_id_not_found"
         case .invalidConsumerGroupId: "invalid_consumer_group_id"
         case .consumerGroupNameNotFound: "consumer_group_name_not_found"
@@ -484,6 +508,7 @@ extension IggyErrorCode {
         case .cannotCreateConsumerGroupInfo: "cannot_create_consumer_group_info"
         case .cannotDeleteConsumerGroupInfo: "cannot_delete_consumer_group_info"
         case .consumerGroupPartitionNotOwned: "consumer_group_partition_not_owned"
+        case .tooManyConsumerGroups: "too_many_consumer_groups"
         case .missingBaseOffsetRetainedMessageBatch: "missing_base_offset_retained_message_batch"
         case .missingLastOffsetDeltaRetainedMessageBatch: "missing_last_offset_delta_retained_message_batch"
         case .missingMaxTimestampRetainedMessageBatch: "missing_max_timestamp_retained_message_batch"
@@ -520,6 +545,9 @@ extension IggyErrorCode {
         case .incompatibleProtocolVersion: "incompatible_protocol_version"
         case .sessionMismatch: "session_mismatch"
         case .requestIdExhausted: "request_id_exhausted"
+        case .operationUncertain: "operation_uncertain"
+        case .laneBlocked: "lane_blocked"
+        case .operationNotRetained: "operation_not_retained"
         }
     }
 }

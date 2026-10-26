@@ -34,6 +34,7 @@ use crate::args::{
     consumer_offset::ConsumerOffsetAction,
     context::ContextAction,
     message::MessageAction,
+    metadata::MetadataAction,
     partition::PartitionAction,
     personal_access_token::PersonalAccessTokenAction,
     stream::StreamAction,
@@ -56,6 +57,7 @@ pub(crate) mod consumer_group;
 pub(crate) mod consumer_offset;
 pub(crate) mod context;
 pub(crate) mod message;
+pub(crate) mod metadata;
 pub(crate) mod partition;
 pub(crate) mod permissions;
 pub(crate) mod personal_access_token;
@@ -96,19 +98,30 @@ pub(crate) struct CliOptions {
     pub(crate) debug: Option<PathBuf>,
 
     /// Iggy server username
-    #[clap(short, long, group = "credentials")]
+    ///
+    /// When no credential flags are supplied, set both IGGY_USERNAME and
+    /// IGGY_PASSWORD. This environment pair does not fill omitted flags.
+    #[clap(short, long, group = "credentials", verbatim_doc_comment)]
     pub(crate) username: Option<String>,
 
     /// Iggy server password
     ///
-    /// An optional parameter to specify the password for authentication.
-    /// If not provided, user will be prompted interactively to enter the
-    /// password securely.
+    /// With --username and no --password, read the password from the terminal
+    /// or stdin. IGGY_PASSWORD does not supply a password for --username.
+    ///
+    /// When no credential flags are supplied, set both IGGY_USERNAME and
+    /// IGGY_PASSWORD. This environment pair does not fill omitted flags.
     #[clap(short, long, verbatim_doc_comment)]
     pub(crate) password: Option<String>,
 
     /// Iggy server personal access token
-    #[clap(short, long, group = "credentials")]
+    ///
+    /// Can also be provided with the IGGY_TOKEN environment variable.
+    /// An empty IGGY_TOKEN is treated as unset.
+    /// Command line credentials take precedence over the environment
+    /// variables, and IGGY_TOKEN takes precedence over the IGGY_USERNAME and
+    /// IGGY_PASSWORD pair.
+    #[clap(short, long, group = "credentials", verbatim_doc_comment)]
     pub(crate) token: Option<String>,
 
     #[cfg(feature = "login-session")]
@@ -162,11 +175,13 @@ pub(crate) enum Command {
     /// client address as seen by the server and protocol type.
     #[clap(verbatim_doc_comment)]
     Me,
-    /// list the options a resource's create command accepts
+    /// list the option catalog of a resource scope
     ///
     /// Prints the server's option catalog for one scope (topic, stream, user):
-    /// every key, the kind its default is reported in, that default, and the
-    /// bounds each value is checked against. These are the keys `--set` takes.
+    /// every key, the kind its default is reported in, that default, and what a
+    /// client may do with it (create only, updatable, resettable, read only,
+    /// secret, critical). Create-only keys go to `--set` on topic create,
+    /// updatable keys to `--set` and `--reset` on topic and stream update.
     #[clap(verbatim_doc_comment)]
     Options(OptionsArgs),
     /// get iggy server statistics
@@ -178,6 +193,9 @@ pub(crate) enum Command {
     /// collect iggy server troubleshooting data
     #[clap(verbatim_doc_comment)]
     Snapshot(SnapshotArgs),
+    /// metadata change log operations
+    #[command(subcommand, visible_alias = "md")]
+    Metadata(MetadataAction),
     /// personal access token operations
     #[command(subcommand)]
     Pat(PersonalAccessTokenAction),

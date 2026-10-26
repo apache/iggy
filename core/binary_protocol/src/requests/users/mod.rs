@@ -25,7 +25,7 @@ pub mod login_register_with_pat;
 pub mod login_user;
 pub mod logout_user;
 pub mod update_permissions;
-pub mod update_user;
+pub mod update_user_resolved;
 
 pub use change_password::ChangePasswordRequest;
 pub use create_user::CreateUserRequest;
@@ -37,4 +37,4 @@ pub use login_register_with_pat::LoginRegisterWithPatRequest;
 pub use login_user::LoginUserRequest;
 pub use logout_user::LogoutUserRequest;
 pub use update_permissions::UpdatePermissionsRequest;
-pub use update_user::UpdateUserRequest;
+pub use update_user_resolved::UpdateUserResolvedRequest;

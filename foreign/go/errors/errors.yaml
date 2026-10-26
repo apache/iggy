@@ -237,7 +237,7 @@
   fields: []
 - name: TransientNotCommitted
   code: 57
-  format: "request transiently not committed; retry"
+  format: "request outcome unknown; it may have applied"
   fields: []
 - name: TransientNotAccepted
   code: 58
@@ -338,6 +338,18 @@
 - name: RequestTooOld
   code: 85
   format: "request is below the deduplication window; outcome unknown, resending may duplicate the write"
+  fields: []
+- name: HistoryUnavailable
+  code: 87
+  format: "request history is no longer available; retry cannot execute it again"
+  fields: []
+- name: LifecycleBusy
+  code: 88
+  format: "a committed lifecycle operation prevents this mutation; retry as a new request"
+  fields: []
+- name: NotPrimary
+  code: 89
+  format: "the replica is not the primary of the target group"
   fields: []
 - name: ClientNotFound
   code: 100
@@ -658,6 +670,10 @@
 - name: PartitionsLimitReached
   code: 2022
   format: "partitions limit reached, raise [metadata] partitions_max"
+  fields: []
+- name: PartitionResizeDisabled
+  code: 2023
+  format: "partition resizing is disabled for this fixed topic"
   fields: []
 - name: CannotCreatePartition
   code: 3000
@@ -1081,6 +1097,38 @@
       type: uint64
     - name: Expected
       type: uint64
+- name: OptionNotUpdatable
+  code: 4103
+  format: "option cannot be updated after creation: %s"
+  fields:
+    - name: Key
+      type: string
+- name: OptionNotResettable
+  code: 4104
+  format: "option cannot be reset: %s"
+  fields:
+    - name: Key
+      type: string
+- name: ReadOnlyOption
+  code: 4105
+  format: "option is read-only: %s"
+  fields:
+    - name: Key
+      type: string
+- name: StreamEncryptionUnavailable
+  code: 4106
+  format: "stream encryption key requires a server encryption key"
+  fields: []
+- name: UnsupportedCriticalOption
+  code: 4107
+  format: "unsupported critical option: %s"
+  fields:
+    - name: Key
+      type: string
+- name: CannotModifyRootUser
+  code: 4108
+  format: "cannot modify root user"
+  fields: []
 - name: ConsumerGroupIdNotFound
   code: 5000
   format: "consumer group with id: %d for topic with id: %d was not found."
@@ -1145,12 +1193,14 @@
       type: uint32
 - name: ConsumerGroupPartitionNotOwned
   code: 5009
-  format: "consumer group member with client id: %d does not own partition: %d at the current generation (rebalance in progress)."
+  format: "consumer group member does not own partition: %d at the current generation (rebalance in progress)."
   fields:
-    - name: ClientId
-      type: uint32
     - name: PartitionId
       type: uint32
+- name: TooManyConsumerGroups
+  code: 5010
+  format: "too many consumer groups"
+  fields: []
 - name: MissingBaseOffsetRetainedMessageBatch
   code: 6000
   format: "base offset is missing"
@@ -1318,3 +1368,21 @@
 - name: RequestIdExhausted
   code: 14005
   format: "vsr request id exhausted"
+- name: OperationUncertain
+  code: 14006
+  format: "operation %d has an uncertain outcome"
+  fields:
+    - name: OperationID
+      type: uint64
+- name: LaneBlocked
+  code: 14007
+  format: "lane blocked by operation %d"
+  fields:
+    - name: OperationID
+      type: uint64
+- name: OperationNotRetained
+  code: 14008
+  format: "operation %d is not retained"
+  fields:
+    - name: OperationID
+      type: uint64

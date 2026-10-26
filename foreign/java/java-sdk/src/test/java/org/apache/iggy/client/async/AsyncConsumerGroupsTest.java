@@ -27,14 +27,12 @@ import org.apache.iggy.exception.IggyResourceNotFoundException;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
-import org.apache.iggy.topic.CompressionAlgorithm;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -81,9 +79,7 @@ public class AsyncConsumerGroupsTest extends BaseIntegrationTest {
                 .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
         client.streams().createStream(TEST_STREAM).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
-        client.topics()
-                .createTopic(STREAM_ID, 1L, CompressionAlgorithm.None, BigInteger.ZERO, BigInteger.ZERO, TEST_TOPIC)
-                .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        client.topics().createTopic(STREAM_ID, TEST_TOPIC, 1L).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
     }
 
     @AfterAll
@@ -260,9 +256,7 @@ public class AsyncConsumerGroupsTest extends BaseIntegrationTest {
 
         try {
             client.streams().createStream(streamName).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
-            client.topics()
-                    .createTopic(streamId, 1L, CompressionAlgorithm.None, BigInteger.ZERO, BigInteger.ZERO, topicName)
-                    .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            client.topics().createTopic(streamId, topicName, 1L).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
             // when
             List<CompletableFuture<ConsumerGroupDetails>> futures = new ArrayList<>();

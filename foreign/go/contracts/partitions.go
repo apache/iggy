@@ -24,13 +24,58 @@ import (
 	"github.com/google/uuid"
 )
 
+const PartitionContextSize = 24
+
+const PartitionRouteSize = 25
+
+type PartitionRoute struct {
+	Incarnation     uint64
+	MetadataOp      uint64
+	View            uint32
+	PartitionsCount uint32
+	PrimaryReplica  uint8
+}
+
+func (r *PartitionRoute) UnmarshalBinary(data []byte) error {
+	if len(data) != PartitionRouteSize {
+		return errors.New("invalid partition route size")
+	}
+	r.Incarnation = binary.LittleEndian.Uint64(data)
+	r.MetadataOp = binary.LittleEndian.Uint64(data[8:])
+	r.View = binary.LittleEndian.Uint32(data[16:])
+	r.PartitionsCount = binary.LittleEndian.Uint32(data[20:])
+	r.PrimaryReplica = data[24]
+	return nil
+}
+
+func (r PartitionRoute) Context() PartitionContext {
+	return PartitionContext{Incarnation: r.Incarnation, MetadataOp: r.MetadataOp}
+}
+
+type PartitionContext struct {
+	Incarnation     uint64 `json:"incarnation"`
+	OwnerGeneration uint64 `json:"ownerGeneration"`
+	MetadataOp      uint64 `json:"metadataOp"`
+}
+
+func (c *PartitionContext) UnmarshalBinary(data []byte) error {
+	if len(data) != PartitionContextSize {
+		return errors.New("invalid partition context size")
+	}
+	c.Incarnation = binary.LittleEndian.Uint64(data)
+	c.OwnerGeneration = binary.LittleEndian.Uint64(data[8:])
+	c.MetadataOp = binary.LittleEndian.Uint64(data[16:])
+	return nil
+}
+
 type PartitionContract struct {
-	Id            uint32 `json:"id"`
-	MessagesCount uint64 `json:"messagesCount"`
-	CreatedAt     uint64 `json:"createdAt"`
-	SegmentsCount uint32 `json:"segmentsCount"`
-	CurrentOffset uint64 `json:"currentOffset"`
-	SizeBytes     uint64 `json:"sizeBytes"`
+	Context       PartitionContext `json:"context"`
+	Id            uint32           `json:"id"`
+	MessagesCount uint64           `json:"messagesCount"`
+	CreatedAt     uint64           `json:"createdAt"`
+	SegmentsCount uint32           `json:"segmentsCount"`
+	CurrentOffset uint64           `json:"currentOffset"`
+	SizeBytes     uint64           `json:"sizeBytes"`
 }
 
 type PartitioningKind int

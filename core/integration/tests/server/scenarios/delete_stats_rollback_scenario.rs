@@ -17,10 +17,10 @@
 
 //! Deleting data that is still counted must leave the parent totals correct.
 //!
-//! `stream_size_validation_scenario` covers delete too, but it purges each
-//! topic first, so every delete it performs removes an already-empty scope and
-//! cannot observe a rollback that never happened. These scenarios delete scopes
-//! that still hold messages, which is what the parent totals are wrong about.
+//! `stream_size_validation_scenario` also deletes scopes that still hold
+//! messages, but it retries each read until the totals converge, and it never
+//! deletes partitions. These scenarios read once after each delete, and they
+//! delete partitions next to one that keeps its messages.
 //!
 //! What this guards, and what it does not. Two mechanisms roll a deleted scope
 //! out of its parents: the metadata STM evicts the registry entries at commit
@@ -85,7 +85,10 @@ pub async fn run(harness: &TestHarness) {
 /// both the topic and the stream. The retained partition's messages must stay
 /// counted, so a blanket zeroing fails here as loudly as no rollback at all.
 async fn delete_partitions_rolls_back_topic_and_stream(client: &IggyClient) {
-    client.create_stream(STREAM_NAME).await.unwrap();
+    client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     create_topic(client, STREAM_NAME, KEPT_TOPIC).await;
 
     // One pass per partition, so the delete below removes a known share.
@@ -152,7 +155,10 @@ async fn delete_partitions_rolls_back_topic_and_stream(client: &IggyClient) {
 /// Deleting a topic that still holds messages must take its bytes out of the
 /// stream total, not just remove the topic.
 async fn delete_topic_rolls_back_the_stream(client: &IggyClient) {
-    client.create_stream(STREAM_NAME).await.unwrap();
+    client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     create_topic(client, STREAM_NAME, KEPT_TOPIC).await;
     create_topic(client, STREAM_NAME, DELETED_TOPIC).await;
 

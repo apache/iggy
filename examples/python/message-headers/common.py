@@ -22,7 +22,7 @@ import secrets
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
 
 from apache_iggy import (
     Consumer,
@@ -50,7 +50,7 @@ HeadersBuilder = Callable[["Order"], PlainHeaders | TypedHeaders]
 MessageHandler = Callable[[ReceiveMessage], None]
 
 
-class OrderType(str, Enum):
+class OrderType(StrEnum):
     CREATED = "OrderCreated"
     CONFIRMED = "OrderConfirmed"
     REJECTED = "OrderRejected"
@@ -129,11 +129,7 @@ async def init_system(client: IggyClient) -> None:
     logger.info(f"Creating topic {TOPIC_NAME} in stream {STREAM_NAME}")
     topic: TopicDetails | None = await client.get_topic(STREAM_NAME, TOPIC_NAME)
     if topic is None:
-        await client.create_topic(
-            stream=STREAM_NAME,
-            partitions_count=1,
-            name=TOPIC_NAME,
-        )
+        await client.create_topic(stream=STREAM_NAME, name=TOPIC_NAME)
         logger.info("Topic was created successfully.")
     else:
         logger.warning(f"Topic {topic.name} already exists with ID {topic.id}")

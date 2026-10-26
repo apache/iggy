@@ -20,6 +20,9 @@ package tcp
 import (
 	"context"
 	"encoding/binary"
+	"log/slog"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -43,11 +46,11 @@ func assignmentBody(generation uint64, partitions ...uint32) []byte {
 }
 
 // emptyBatchBody builds a PollMessages reply body carrying no messages:
-// [partition_id u32][current_offset u64][messages_count u32].
+// [partition_id u32][current_offset u64][messages_count u32][context 24].
 func emptyBatchBody(partitionId uint32) []byte {
 	body := binary.LittleEndian.AppendUint32(nil, partitionId)
 	body = binary.LittleEndian.AppendUint64(body, 0)
-	return binary.LittleEndian.AppendUint32(body, 0)
+	return append(binary.LittleEndian.AppendUint32(body, 0), make([]byte, iggcon.PartitionContextSize)...)
 }
 
 // polledPartition reads the explicit partition id of a recorded poll request
@@ -86,7 +89,7 @@ func agedGroupEntries(client *IggyTcpClient) {
 
 func TestPollMessages_GroupPollRoundRobinsTheOwnedPartitions(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	server := serve(serverConn, func(_ int, read request) []byte {
+	server := servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
 		switch read.code() {
 		case uint32(command.SyncGroupCode):
 			return replyFrame(vsr.OperationNonReplicated, assignmentBody(7, 1, 3))
@@ -115,7 +118,7 @@ func TestPollMessages_GroupPollRoundRobinsTheOwnedPartitions(t *testing.T) {
 
 func TestPollMessages_GroupPollKeepsTheCursorAcrossASameGenerationRefresh(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	serve(serverConn, func(_ int, read request) []byte {
+	servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
 		if read.code() == uint32(command.SyncGroupCode) {
 			return replyFrame(vsr.OperationNonReplicated, assignmentBody(7, 1, 3))
 		}
@@ -139,7 +142,7 @@ func TestPollMessages_GroupPollKeepsTheCursorAcrossASameGenerationRefresh(t *tes
 func TestPollMessages_GroupPollRestartsTheCursorOnANewGeneration(t *testing.T) {
 	client, serverConn := newPipeClient(t)
 	generation := uint64(7)
-	serve(serverConn, func(_ int, read request) []byte {
+	servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
 		if read.code() == uint32(command.SyncGroupCode) {
 			return replyFrame(vsr.OperationNonReplicated, assignmentBody(generation, 1, 3))
 		}
@@ -162,7 +165,7 @@ func TestPollMessages_GroupPollRestartsTheCursorOnANewGeneration(t *testing.T) {
 func TestPollMessages_GroupPollJoinsTheGroupOnTheFirstPoll(t *testing.T) {
 	client, serverConn := newPipeClient(t)
 	joined := false
-	server := serve(serverConn, func(_ int, read request) []byte {
+	server := servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
 		switch {
 		case read.code() == uint32(command.SyncGroupCode) && !joined:
 			// An empty body means the client is not a member yet.
@@ -191,7 +194,7 @@ func TestPollMessages_GroupPollJoinsTheGroupOnTheFirstPoll(t *testing.T) {
 
 func TestPollMessages_GroupPollDoesNotRejoinALeftGroup(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	server := serve(serverConn, func(_ int, read request) []byte {
+	server := servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
 		switch {
 		case read.code() == uint32(command.SyncGroupCode):
 			return replyFrame(vsr.OperationNonReplicated, nil)
@@ -216,10 +219,49 @@ func TestPollMessages_GroupPollDoesNotRejoinALeftGroup(t *testing.T) {
 	}
 }
 
+func TestPollMessages_ResolvedLeaveDoesNotRejoinTheGroup(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var leaveID atomic.Uint64
+	var server *testListener
+	server = listenVSR(t, nil, func(_, _ int, read request) []byte {
+		switch {
+		case read.operation() == vsr.OperationRegister:
+			return registerReplyFrame(signedInUserID, 128)
+		case read.code() == uint32(command.BindSessionCode):
+			return bindReplyFrame(signedInUserID, read.sessionID())
+		case read.code() == uint32(command.GetClusterMetadataCode):
+			return clusterMetadataFrame(t, 0, server.address())
+		case read.code() == uint32(command.SyncGroupCode):
+			return replyFrame(vsr.OperationNonReplicated, nil)
+		case read.operation() == vsr.OperationLeaveConsumerGroup:
+			if leaveID.CompareAndSwap(0, read.requestID()) {
+				cancel()
+				return nil
+			}
+			assert.Equal(t, leaveID.Load(), read.requestID(), "resolve must replay the committed leave")
+			return committedReply(read, 0)
+		default:
+			return committedReply(read, 0)
+		}
+	})
+	client := signedInClient(t, server, true)
+	streamId, topicId, consumer := groupConsumer(t)
+	require.NoError(t, client.JoinConsumerGroup(context.Background(), streamId, topicId, consumer.Id))
+	var uncertain ierror.OperationUncertain
+	require.ErrorAs(t, client.LeaveConsumerGroup(ctx, streamId, topicId, consumer.Id), &uncertain)
+	require.NoError(t, client.ResolveOperation(context.Background(), uncertain.OperationID))
+
+	_, err := pollOnce(t, client)
+	require.ErrorIs(t, err, ierror.ErrConsumerGroupMemberNotFound)
+	require.Equal(t, 1, len(requestsFor(server.recorded(), vsr.OperationJoinConsumerGroup)),
+		"polling after a resolved leave must not join the group again")
+}
+
 func TestPollMessages_GroupPollRejoinsAfterAnExplicitJoin(t *testing.T) {
 	client, serverConn := newPipeClient(t)
 	member := false
-	serve(serverConn, func(_ int, read request) []byte {
+	servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
 		switch {
 		case read.code() == uint32(command.SyncGroupCode) && member:
 			return replyFrame(vsr.OperationNonReplicated, assignmentBody(2, 4))
@@ -249,7 +291,7 @@ func TestPollMessages_GroupPollRejoinsAfterAnExplicitJoin(t *testing.T) {
 
 func TestPollMessages_GroupPollReportsAnEmptyPollWhenTheMemberOwnsNothing(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	serve(serverConn, func(_ int, read request) []byte {
+	servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
 		if read.code() == uint32(command.SyncGroupCode) {
 			return replyFrame(vsr.OperationNonReplicated, assignmentBody(5))
 		}
@@ -263,9 +305,39 @@ func TestPollMessages_GroupPollReportsAnEmptyPollWhenTheMemberOwnsNothing(t *tes
 	assert.Empty(t, polled.Messages)
 }
 
+func TestPollMessages_GroupPollResyncsAnEmptyAssignmentOnTheNextPoll(t *testing.T) {
+	client, serverConn := newPipeClient(t)
+	// The join committed, but no partition installed the member as owner yet.
+	assignment := assignmentBody(1)
+	server := servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
+		if read.code() == uint32(command.SyncGroupCode) {
+			return replyFrame(vsr.OperationNonReplicated, assignment)
+		}
+		return replyFrame(vsr.OperationNonReplicated, emptyBatchBody(polledPartition(t, read)))
+	})
+
+	first, err := pollOnce(t, client)
+	require.NoError(t, err)
+	require.Equal(t, iggcon.NoAssignedPartition, first.PartitionId)
+
+	assignment = assignmentBody(4, 7)
+
+	second, err := pollOnce(t, client)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(7), second.PartitionId,
+		"an empty assignment is not trusted for the refresh window")
+	syncs := 0
+	for _, read := range server.recorded() {
+		if read.code() == uint32(command.SyncGroupCode) {
+			syncs++
+		}
+	}
+	assert.Equal(t, 2, syncs, "the poll after an empty sync syncs again")
+}
+
 func TestPollMessages_GroupPollReportsAnEmptyPollWhenTheRebalanceOutlastsTheAttempts(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	server := serve(serverConn, func(_ int, read request) []byte {
+	server := servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
 		if read.code() == uint32(command.SyncGroupCode) {
 			return replyFrame(vsr.OperationNonReplicated, assignmentBody(9, 0))
 		}
@@ -291,7 +363,7 @@ func TestPollMessages_GroupPollReportsAnEmptyPollWhenTheRebalanceOutlastsTheAtte
 func TestPollMessages_GroupPollResyncsAfterAFencedPoll(t *testing.T) {
 	client, serverConn := newPipeClient(t)
 	generation := uint64(1)
-	serve(serverConn, func(_ int, read request) []byte {
+	servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
 		switch {
 		case read.code() == uint32(command.SyncGroupCode):
 			return replyFrame(vsr.OperationNonReplicated, assignmentBody(generation, 1))
@@ -309,6 +381,91 @@ func TestPollMessages_GroupPollResyncsAfterAFencedPoll(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, uint32(1), polled.PartitionId,
 		"the fenced poll re-synced and retried within the same call")
+}
+
+// pauseAtLog holds the goroutine that first logs message until resume closes.
+type pauseAtLog struct {
+	message         string
+	reached, resume chan struct{}
+	once            sync.Once
+}
+
+func (p *pauseAtLog) Enabled(context.Context, slog.Level) bool { return true }
+func (p *pauseAtLog) WithAttrs([]slog.Attr) slog.Handler       { return p }
+func (p *pauseAtLog) WithGroup(string) slog.Handler            { return p }
+func (p *pauseAtLog) Handle(_ context.Context, record slog.Record) error {
+	if record.Message == p.message {
+		p.once.Do(func() {
+			close(p.reached)
+			<-p.resume
+		})
+	}
+	return nil
+}
+
+// A recovery overtakes a group poll after its sync. The poll syncs again under
+// the session of the recovery and polls, and only a failed recovery ends it.
+func TestPollMessages_GroupPollSyncsAgainUnderTheSessionOfARecovery(t *testing.T) {
+	for _, test := range []struct {
+		name               string
+		hold, refuseSignIn bool
+		want               error
+	}{
+		{"running", true, false, nil},
+		{"bound a new session", false, false, nil},
+		{"failed", false, true, ierror.ErrUnauthenticated},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var server *testListener
+			var registers atomic.Int32
+			node := singleNodeHandler(t, func() string { return server.address() })
+			server = listenVSR(t, nil, func(connection, index int, read request) []byte {
+				switch {
+				case read.code() == uint32(command.SyncGroupCode):
+					return replyFrame(vsr.OperationNonReplicated, assignmentBody(7, 1))
+				case read.code() == uint32(command.GetPartitionRouteCode):
+					return pollRoutingReply(t, read, 0, 1)
+				case read.code() == uint32(command.PollMessagesCode):
+					return replyFrame(vsr.OperationNonReplicated, emptyBatchBody(polledPartition(t, read)))
+				case read.operation() == vsr.OperationRegister && registers.Add(1) > 1 && test.refuseSignIn:
+					return statusReplyFrame(vsr.OperationRegister, uint32(ierror.ErrInvalidCredentials.Code()), nil)
+				}
+				return node(connection, index, read)
+			})
+			client := newDialingClient(t, server.address(), WithAutoLogin(NewUsernamePasswordCredentials("iggy", "iggy")))
+			synced, resume := make(chan struct{}), make(chan struct{})
+			client.logger = slog.New(&pauseAtLog{message: "Synced the consumer group assignment", reached: synced, resume: resume})
+			require.NoError(t, client.Connect(context.Background()))
+			done := make(chan error, 1)
+			go func() { _, err := pollOnce(t, client); done <- err }()
+			select {
+			case <-synced:
+			case <-time.After(time.Second):
+				t.Fatal("the group poll did not sync its assignment")
+			}
+			var release func()
+			if test.hold {
+				release = holdRecovery(t, client)
+			}
+			recoverNow(client)
+			if !test.hold {
+				awaitRecoveryEnd(t, client)
+				require.Equal(t, !test.refuseSignIn, sessionBound(client))
+			}
+			close(resume)
+			if test.hold {
+				require.Never(t, func() bool { return len(done) != 0 }, recoveryWaitDeadline, time.Millisecond,
+					"the poll waits for the running recovery")
+				release()
+			}
+			require.ErrorIs(t, <-done, test.want)
+			if test.want == nil {
+				reads := server.recorded()
+				require.Equal(t, 2, requestCount(reads, command.SyncGroupCode), "the poll syncs again under the new session")
+				require.Equal(t, 1, requestCount(reads, command.PollMessagesCode))
+			}
+		})
+	}
 }
 
 func TestGroupAssignmentCache_TheLeftMarkSurvivesClear(t *testing.T) {

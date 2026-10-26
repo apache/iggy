@@ -27,11 +27,9 @@ async fn main() -> Result<(), IggyError> {
 
     // The builder simplifies the IggyProducer configuration.
     let config = IggyProducerConfig::builder()
-        // Set the stream identifier and name.
-        .stream_id(Identifier::from_str_value(stream)?)
+        // Set the stream name. The producer binds to the stream by this name.
         .stream_name(stream)
-        // Set the topic identifier and name
-        .topic_id(Identifier::from_str_value(topic)?)
+        // Set the topic name. The producer binds to the topic by this name.
         .topic_name(topic)
         // Sets the number of partitions to create for the topic.
         // The more clients are reading concurrently, the more partitions you should create.
@@ -49,11 +47,6 @@ async fn main() -> Result<(), IggyError> {
         // - `MessagesKey` - the binary client hashes the messages key to a partition ID.
         // Binary clients cache partition counts for their lifetime, including reconnects.
         .partitioning(Partitioning::balanced())
-        // Sets the retry policy (maximum number of retries and interval between them) in case of messages sending failure.
-        // The error can be related either to disconnecting from the server or to the server rejecting the messages.
-        // Default is 3 retries with 1 second interval between them. Customize to your requirements.
-        .send_retries_count(3)
-        .send_retries_interval(NonZeroIggyDuration::ONE_SECOND)
         // Optionally, set a custom client side encryptor for encrypting the messages' payloads. Currently only Aes256Gcm is supported.
         // Note, this is independent of server side encryption meaning you can add client encryption, server encryption, or both.
         // .encryptor(std::sync::Arc::new(EncryptorKind::Aes256Gcm(Aes256GcmEncryptor::new(&[1; 32])?)))

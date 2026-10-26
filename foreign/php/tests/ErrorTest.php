@@ -33,6 +33,24 @@ use PHPUnit\Framework\TestCase;
 
 final class ErrorTest extends TestCase
 {
+    #[TestDox('Root policy refusal keeps its typed exception and shared code')]
+    public function testRootPolicyRefusalKeepsTypedCode(): void
+    {
+        $fixture = json_decode((string) file_get_contents(__DIR__ . '/fixtures/resource_options.json'), true, 512, JSON_THROW_ON_ERROR);
+        $vector = array_values(array_filter(
+            $fixture['update_resource'],
+            static fn (array $entry): bool => $entry['case'] === 'user_username_and_status',
+        ))[0];
+        $body = hex2bin($vector['body_hex']);
+        assert_true($body !== false);
+        $body[3] = "\0";
+        $client = new_client();
+
+        $error = assert_throws(static fn () => $client->sendBinaryRequest(16, $body));
+        assert_instance_of(AuthenticationException::class, $error);
+        assert_same($fixture['constants']['error_codes']['cannot_modify_root_user'], $error->getCode());
+    }
+
     #[TestDox('Connection configuration errors use the typed connection exception')]
     public function testConnectionConfigurationErrorsUseTypedException(): void
     {

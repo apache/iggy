@@ -31,6 +31,7 @@
 
 pub mod change_password;
 pub mod create_consumer_group;
+pub mod create_keyed_stream;
 pub mod create_partitions;
 pub mod create_personal_access_token;
 pub mod create_stream;
@@ -44,10 +45,13 @@ pub mod delete_segments;
 pub mod delete_stream;
 pub mod delete_topic;
 pub mod delete_user;
-pub mod purge_stream;
-pub mod purge_topic;
+pub mod join_fixture_group;
+pub mod leave_fixture_group;
+pub mod poll_messages;
+pub mod replace_fixture_topic;
 pub mod send_messages;
 pub mod store_consumer_offset;
+pub mod store_stale_owner_offset;
 pub mod update_permissions;
 pub mod update_stream;
 pub mod update_topic;
@@ -64,7 +68,7 @@ use crate::client::SimClient;
 use crate::workload::actions::Action;
 use crate::workload::effect::Effect;
 use crate::workload::options::WorkloadOptions;
-use crate::workload::shadow::Shadow;
+use crate::workload::shadow::{Replacements, Shadow};
 
 /// Draw a consumer kind for the four consumer-offset ops, as the WIRE
 /// discriminant.
@@ -109,6 +113,8 @@ macro_rules! op_dispatch {
             pub input: InFlightInput,
             pub outcome: InFlightOutcome,
             pub request_namespace: u64,
+            /// Fixture replacements of `request_namespace` at sample time.
+            pub replacements: Replacements,
         }
 
         /// Sample an `Input` for `action` realizing the outcome at `outcome_id`
@@ -191,11 +197,9 @@ op_dispatch! {
     // Append-only; mirrors actions::Action declaration order.
     DeleteStream              => delete_stream,
     UpdateStream              => update_stream,
-    PurgeStream               => purge_stream,
     CreateTopic               => create_topic,
     UpdateTopic               => update_topic,
     DeleteTopic               => delete_topic,
-    PurgeTopic                => purge_topic,
     CreatePartitions          => create_partitions,
     DeletePartitions          => delete_partitions,
     DeleteSegments            => delete_segments,
@@ -209,4 +213,10 @@ op_dispatch! {
     CreatePersonalAccessToken => create_personal_access_token,
     DeletePersonalAccessToken => delete_personal_access_token,
     DeleteConsumerOffset      => delete_consumer_offset,
+    ReplaceFixtureTopic       => replace_fixture_topic,
+    JoinFixtureGroup          => join_fixture_group,
+    LeaveFixtureGroup         => leave_fixture_group,
+    StoreStaleOwnerOffset      => store_stale_owner_offset,
+    PollMessages              => poll_messages,
+    CreateKeyedStream          => create_keyed_stream,
 }

@@ -33,7 +33,9 @@ use std::time::Duration;
 use iggy::prelude::{AutoLogin, Client, Credentials, IggyClient, IggyClientBuilder};
 use secrecy::SecretString;
 
-use iggy_gateway_kafka::bridge::{DEFAULT_MAX_MESSAGE_SIZE, IggyBridgeConfig, TopicMapping};
+use iggy_gateway_kafka::bridge::{
+    DEFAULT_MAX_MESSAGE_SIZE, IggyBridgeConfig, IggyTls, ProduceSessionLimits, TopicMapping,
+};
 
 /// Desired slot count - the actual count `port_band()` computes may be smaller if the machine's
 /// real ephemeral range leaves little room, but this crate never needs more than a handful live
@@ -239,7 +241,8 @@ pub struct TestServer {
     child: Child,
     address: String,
     password: String,
-    _port_guard: PortGuard,
+    /// `None` once [`Self::stop`] handed it to the caller.
+    port_guard: Option<PortGuard>,
 }
 
 impl TestServer {
@@ -259,6 +262,32 @@ impl TestServer {
     /// its assertions, orphaning a process that still holds its `PortGuard` slot, which then
     /// fails the next test that draws that slot to bind.
     pub async fn spawn_with_password(data_dir: &std::path::Path, password: &str) -> Self {
+        Self::spawn_configured(data_dir, password, None, &[]).await
+    }
+
+    /// [`Self::spawn`] with server settings of its own, as `IGGY_*` variables.
+    pub async fn spawn_with_env(data_dir: &std::path::Path, env: &[(&str, &str)]) -> Self {
+        Self::spawn_configured(data_dir, "iggy", None, env).await
+    }
+
+    /// Spawns `iggy-server` whose TCP listener speaks only TLS, with the given PEM pair.
+    ///
+    /// The bridge under test then has to dial it over TLS, which is the one way to prove the
+    /// bridge's own `IggyTls` reaches the socket rather than only the credential check's.
+    pub async fn spawn_with_tls(
+        data_dir: &std::path::Path,
+        cert_file: &std::path::Path,
+        key_file: &std::path::Path,
+    ) -> Self {
+        Self::spawn_configured(data_dir, "iggy", Some((cert_file, key_file)), &[]).await
+    }
+
+    async fn spawn_configured(
+        data_dir: &std::path::Path,
+        password: &str,
+        tls: Option<(&std::path::Path, &std::path::Path)>,
+        env: &[(&str, &str)],
+    ) -> Self {
         let port_guard = PortGuard::acquire();
         let address = format!("127.0.0.1:{}", port_guard.port);
 
@@ -295,21 +324,48 @@ impl TestServer {
             // fixed range (matching the same harness's own fallback for an unreadable core count)
             // caps that instead.
             .env("IGGY_SHARDING_CPU_ALLOCATION", "0..4")
-            // `--with-default-root-credentials` is off by default (args.rs) - without these,
-            // a fresh server provisions no loginable root user at all, and every bridge connect
-            // attempt fails with "invalid credentials" no matter what this test passes.
+            // `--with-default-root-credentials` is off by default (args.rs), and without these
+            // the server refuses to boot. The password is the one the bridge logs in with.
             .env("IGGY_ROOT_USERNAME", "iggy")
-            .env("IGGY_ROOT_PASSWORD", password);
+            .env("IGGY_ROOT_PASSWORD", password)
+            .envs(env.iter().copied());
+        if let Some((cert_file, key_file)) = tls {
+            // `self_signed` is off explicitly: left on, the server would still load an existing
+            // pair, but the test should fail loudly on a missing file rather than mint one.
+            command
+                .env("IGGY_TCP_TLS_ENABLED", "true")
+                .env("IGGY_TCP_TLS_SELF_SIGNED", "false")
+                .env("IGGY_TCP_TLS_CERT_FILE", cert_file)
+                .env("IGGY_TCP_TLS_KEY_FILE", key_file);
+        }
         let child = command.spawn().expect("spawn iggy-server");
 
         let mut server = Self {
             child,
             address,
             password: password.to_string(),
-            _port_guard: port_guard,
+            port_guard: Some(port_guard),
         };
         server.wait_ready().await;
         server
+    }
+
+    /// Stops the server and keeps its port until the returned guard drops. Without it, another
+    /// test's server can take the port while a client of this one still retries there.
+    pub fn stop(mut self) -> PortGuard {
+        let port_guard = self
+            .port_guard
+            .take()
+            .expect("a running server holds its port");
+        drop(self);
+        port_guard
+    }
+
+    /// Kills the server with SIGKILL, skipping its shutdown path the way a crash would. The data
+    /// dir stays, for a new server to start on.
+    pub fn crash(mut self) {
+        self.child.kill().expect("SIGKILL iggy-server");
+        let _ = self.child.wait();
     }
 
     /// Polls with a bare TCP connect, not a full `IggyBridge::connect`: the latter carries
@@ -332,6 +388,8 @@ impl TestServer {
             topic_mapping: TopicMapping::new("kafka".to_string(), HashMap::new())
                 .expect("valid mapping for this test's fixture data"),
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            tls: IggyTls::default(),
+            produce_sessions: ProduceSessionLimits::default(),
         }
     }
 }

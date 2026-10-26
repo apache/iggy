@@ -22,7 +22,7 @@ mod banner;
 
 use args::Args;
 use clap::Parser;
-use configs::server::ServerConfig;
+use configs::{ConfigEnvMappings, print_env_var_names, server::ServerConfig};
 use server::boot::{
     apply_default_root_credentials, bootstrap, load_config, prepare_runtime_dirs,
     raise_open_file_limit,
@@ -30,10 +30,29 @@ use server::boot::{
 use server::server_error::ServerError;
 use server_common::fatal::{FatalReason, descriptors_exhausted, fatal_with_log_flush};
 use server_common::log::Logging;
+use std::error::Error;
+use std::io::{self, Write};
+use std::process::ExitCode;
 use system_stats::capture_allowed_cpus;
 use tracing::{error, info, warn};
 
-fn main() -> Result<(), ServerError> {
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            let mut stderr = io::stderr().lock();
+            let _ = writeln!(stderr, "Error: {error}");
+            let mut source = error.source();
+            while let Some(cause) = source {
+                let _ = writeln!(stderr, "  Caused by: {cause}");
+                source = cause.source();
+            }
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<(), ServerError> {
     // This prelude must stay ahead of the first thread the process ever
     // spawns: `--with-default-root-credentials` writes to the environment,
     // and `set_var` is only sound while single-threaded. `early_init` just
@@ -42,6 +61,10 @@ fn main() -> Result<(), ServerError> {
     // visible. `create_shard_executor` also reads its capacity knob from the
     // environment, which is why the `.env` load has to precede it.
     let args = Args::parse();
+    if args.list_config_env_vars {
+        print_config_env_vars().map_err(ServerError::ListConfigEnvVars)?;
+        return Ok(());
+    }
     banner::print(server::VERSION);
     // `logging` owns the tracing appender worker guards; it must outlive the
     // shard threads or every log line after bootstrap is silently dropped.
@@ -131,4 +154,15 @@ fn main() -> Result<(), ServerError> {
     joined?;
     info!("server shutdown complete");
     Ok(())
+}
+
+fn print_config_env_vars() -> std::io::Result<()> {
+    let mut stdout = std::io::stdout();
+    print_env_var_names(
+        ServerConfig::env_templates()
+            .iter()
+            .map(|t| t.env_name)
+            .chain(configs::server::server_runtime_env_vars()),
+        &mut stdout,
+    )
 }

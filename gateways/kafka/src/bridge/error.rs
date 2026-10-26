@@ -18,11 +18,13 @@
 use iggy::prelude::IggyError;
 use thiserror::Error;
 
+use crate::bridge::iggy_bridge::ClusterIdCall;
+use crate::cluster_id::InvalidClusterId;
 use crate::protocol::api::{
-    ERROR_INVALID_PARTITIONS, ERROR_INVALID_REQUEST, ERROR_INVALID_TOPIC_EXCEPTION,
-    ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_POLICY_VIOLATION, ERROR_REQUEST_TIMED_OUT,
-    ERROR_TOPIC_ALREADY_EXISTS, ERROR_TOPIC_AUTHORIZATION_FAILED, ERROR_UNKNOWN_SERVER_ERROR,
-    ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+    ERROR_COORDINATOR_LOAD_IN_PROGRESS, ERROR_INVALID_PARTITIONS, ERROR_INVALID_REQUEST,
+    ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_POLICY_VIOLATION,
+    ERROR_REQUEST_TIMED_OUT, ERROR_TOPIC_ALREADY_EXISTS, ERROR_TOPIC_AUTHORIZATION_FAILED,
+    ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
 };
 
 /// Errors from the `IggyBridge`: connection lifecycle, config, and Iggy SDK calls.
@@ -84,12 +86,36 @@ pub enum BridgeError {
     /// raw or non-conformant client, not an expected path.
     #[error("invalid Kafka topic name '{kafka_topic}': {reason}")]
     InvalidKafkaTopicName { kafka_topic: String, reason: String },
-    /// `ensure_stream_and_topic` was asked for `partition_count == 0`. Enforced here, not only
-    /// at the `CreateTopics` wire-validation layer that's this bridge's only caller today - the
-    /// method is `pub`, so a future caller (a test, or a later Produce auto-create path)
-    /// bypassing that layer must not be able to provision a topic nothing can produce to.
+    /// `ensure_stream_and_topic`, `create_kafka_topic` or `create_kafka_partitions` was asked
+    /// for `partition_count == 0`. Enforced here, not only at the wire-validation layer of the
+    /// handlers that call them - the methods are `pub`, so a future caller (a test, or a later
+    /// Produce auto-create path) bypassing that layer must not be able to provision a topic
+    /// nothing can produce to, or spend a replicated log entry adding nothing.
     #[error("partition count must be at least 1, got 0 for topic '{kafka_topic}'")]
     InvalidPartitionCount { kafka_topic: String },
+    /// The message Iggy holds as the cluster id is not one. Read once, at startup.
+    #[error(
+        "the earliest stored message of Iggy topic '{stream}/{topic}' is not a Kafka cluster \
+         id: {source}. With every gateway stopped, replace that message with a valid id, or \
+         delete the topic to start a new cluster"
+    )]
+    InvalidClusterId {
+        stream: String,
+        topic: &'static str,
+        source: InvalidClusterId,
+    },
+    /// A call to Iggy for the cluster id failed. Made only at startup.
+    #[error(
+        "cannot {call} '{}' for the Kafka cluster id: {source}{}",
+        call.target(stream, topic),
+        call.permission_hint(source, stream)
+    )]
+    ClusterIdCall {
+        call: ClusterIdCall,
+        stream: String,
+        topic: &'static str,
+        source: Box<Self>,
+    },
 }
 
 impl BridgeError {
@@ -120,7 +146,53 @@ impl BridgeError {
             // is reachable only if a future caller starts constructing configs at request time.
             // `UNKNOWN_SERVER_ERROR` at least doesn't claim a specific, wrong cause the way
             // `UNSUPPORTED_VERSION` (misleadingly implies a Kafka API version mismatch) would.
-            Self::InvalidConfig(_) => ERROR_UNKNOWN_SERVER_ERROR,
+            Self::InvalidConfig(_) | Self::InvalidClusterId { .. } | Self::ClusterIdCall { .. } => {
+                ERROR_UNKNOWN_SERVER_ERROR
+            }
+        }
+    }
+
+    /// [`Self::to_kafka_error_code`] for the group offset APIs. A failure that a retry can fix
+    /// becomes `COORDINATOR_LOAD_IN_PROGRESS` (14): the Java client retries 14 in `OffsetCommit`
+    /// and `OffsetFetch`, but fails the call on 6, and on 7 in `OffsetFetch`. Offset calls are
+    /// idempotent, so the unknown outcome behind 7 does no harm on a retry. Nor does
+    /// `RequestTooOld`'s: the retry is a new request, which Iggy runs. `LifecycleBusy` ends when
+    /// the delete of a group on the topic ends. `LaneBlocked` sent nothing: an earlier write of the
+    /// client is still in doubt, and a retry runs once it settles.
+    #[must_use]
+    pub const fn to_offset_error_code(&self) -> i16 {
+        if matches!(
+            self,
+            Self::Iggy(
+                IggyError::RequestTooOld | IggyError::LifecycleBusy | IggyError::LaneBlocked(_)
+            )
+        ) {
+            return ERROR_COORDINATOR_LOAD_IN_PROGRESS;
+        }
+        match self.to_kafka_error_code() {
+            ERROR_NOT_LEADER_OR_FOLLOWER | ERROR_REQUEST_TIMED_OUT => {
+                ERROR_COORDINATOR_LOAD_IN_PROGRESS
+            }
+            code => code,
+        }
+    }
+
+    /// [`Self::to_kafka_error_code`] for `ListOffsets`. The Java `AdminClient` fails a partition
+    /// on any code that is neither 6 nor retriable (`ListOffsetsHandler.handlePartitionError`), so
+    /// these refusals answer 6 or 7 here, not -1. `HistoryUnavailable` refuses a poll that names
+    /// an older incarnation of the partition, as after a delete and recreate. The retry probes
+    /// again and answers 3 if the topic is gone, and clients handle 3 and 6 alike.
+    /// `RequestTooOld` is not returned to `ListOffsets` reads today, so its arm is defensive.
+    #[must_use]
+    pub const fn to_list_offsets_error_code(&self) -> i16 {
+        match self {
+            Self::Iggy(
+                IggyError::HistoryUnavailable
+                | IggyError::LifecycleBusy
+                | IggyError::ClientShutdown,
+            ) => ERROR_NOT_LEADER_OR_FOLLOWER,
+            Self::Iggy(IggyError::RequestTooOld) => ERROR_REQUEST_TIMED_OUT,
+            _ => self.to_kafka_error_code(),
         }
     }
 
@@ -197,7 +269,11 @@ const fn iggy_error_to_kafka_code(err: &IggyError) -> i16 {
         | IggyError::CannotEstablishConnection
         | IggyError::TcpError
         | IggyError::TransientNotAccepted => ERROR_NOT_LEADER_OR_FOLLOWER,
-        IggyError::TransientNotCommitted => ERROR_REQUEST_TIMED_OUT,
+        // `OperationNotRetained` comes only from resolving the earlier operation that blocks a
+        // call. That call was not sent, so unlike `RequestTooOld` a retry cannot write it twice.
+        IggyError::TransientNotCommitted
+        | IggyError::OperationUncertain(_)
+        | IggyError::OperationNotRetained(_) => ERROR_REQUEST_TIMED_OUT,
         // The outcome was forgotten; a retry after client eviction could duplicate the write.
         // UNKNOWN_SERVER_ERROR is non-retryable in the Kafka protocol.
         IggyError::RequestTooOld => ERROR_UNKNOWN_SERVER_ERROR,
@@ -209,6 +285,12 @@ const fn iggy_error_to_kafka_code(err: &IggyError) -> i16 {
         // The node is at `[metadata] partitions_max`. Kafka answers a create that breaks a
         // broker-side rule with 44, and the request itself is valid, so not `INVALID_REQUEST`.
         IggyError::PartitionsLimitReached => ERROR_POLICY_VIOLATION,
+        // A topic created with a fixed partition count refuses `CreatePartitions`. The same
+        // reasoning: the request is one Kafka would accept, and a rule on the server refuses it.
+        IggyError::PartitionResizeDisabled => ERROR_POLICY_VIOLATION,
+        // The topic has no partition ids left to mint. A server-side rule refuses a valid
+        // request, as with the two above.
+        IggyError::PartitionIdSpaceExhausted => ERROR_POLICY_VIOLATION,
         // Deliberately NOT special-cased here to ERROR_NONE: this function is shared by every
         // handler's error path, but "the operation did commit, so report success" only holds for
         // a caller that issued a *write* - the SDK's own reconnect path replayed a write whose
@@ -216,7 +298,7 @@ const fn iggy_error_to_kafka_code(err: &IggyError) -> i16 {
         // A read that somehow reaches this variant has no write to have "already applied"; a
         // write-side caller (CreateTopics) special-cases it locally, close to the write it
         // concerns, instead of baking a write-only assumption into a mapping every read also
-        // goes through.
+        // goes through. OffsetCommit does the same in `group_offsets.rs`.
         _ => ERROR_UNKNOWN_SERVER_ERROR,
     }
 }
@@ -287,12 +369,65 @@ mod tests {
     }
 
     #[test]
+    fn partition_resize_disabled_maps_to_policy_violation() {
+        let err = BridgeError::Iggy(IggyError::PartitionResizeDisabled);
+        assert_eq!(err.to_kafka_error_code(), ERROR_POLICY_VIOLATION);
+    }
+
+    #[test]
+    fn partition_id_space_exhausted_maps_to_policy_violation() {
+        let err = BridgeError::Iggy(IggyError::PartitionIdSpaceExhausted);
+        assert_eq!(err.to_kafka_error_code(), ERROR_POLICY_VIOLATION);
+    }
+
+    #[test]
     fn request_already_applied_falls_to_the_generic_mapping_here() {
         // This shared mapping has no write to know "already applied" refers to - CreateTopics
-        // (the only caller for whom that's a success, not a fault) special-cases it locally
-        // instead (`create_topics.rs`), close to the write it concerns.
+        // and OffsetCommit (the callers for whom that's a success, not a fault) special-case it
+        // locally instead (`create_topics.rs`, `group_offsets.rs`), close to the write.
         let err = BridgeError::Iggy(IggyError::RequestAlreadyApplied);
         assert_eq!(err.to_kafka_error_code(), ERROR_UNKNOWN_SERVER_ERROR);
+    }
+
+    #[test]
+    fn given_a_retriable_iggy_refusal_when_mapped_for_list_offsets_should_answer_retriable() {
+        let retriable = [
+            (IggyError::HistoryUnavailable, ERROR_NOT_LEADER_OR_FOLLOWER),
+            (IggyError::LifecycleBusy, ERROR_NOT_LEADER_OR_FOLLOWER),
+            (IggyError::ClientShutdown, ERROR_NOT_LEADER_OR_FOLLOWER),
+            (IggyError::RequestTooOld, ERROR_REQUEST_TIMED_OUT),
+        ];
+        for (error, code) in retriable {
+            let err = BridgeError::Iggy(error);
+            assert_eq!(
+                err.to_kafka_error_code(),
+                ERROR_UNKNOWN_SERVER_ERROR,
+                "{err}"
+            );
+            assert_eq!(err.to_list_offsets_error_code(), code, "{err}");
+        }
+    }
+
+    #[test]
+    fn given_any_other_failure_when_mapped_for_list_offsets_should_keep_the_shared_code() {
+        let others = [
+            BridgeError::InvalidKafkaTopicName {
+                kafka_topic: " ".to_string(),
+                reason: "whitespace".to_string(),
+            },
+            BridgeError::Iggy(IggyError::Unauthorized),
+            BridgeError::Iggy(IggyError::InvalidCredentials),
+            BridgeError::Iggy(IggyError::TopicNameNotFound(String::new(), String::new())),
+            BridgeError::Iggy(IggyError::Disconnected),
+            BridgeError::Timeout,
+        ];
+        for err in others {
+            assert_eq!(
+                err.to_list_offsets_error_code(),
+                err.to_kafka_error_code(),
+                "{err}"
+            );
+        }
     }
 
     #[test]
@@ -389,6 +524,23 @@ mod tests {
     }
 
     #[test]
+    fn uncertain_operation_maps_to_request_timed_out() {
+        let err = BridgeError::Iggy(IggyError::OperationUncertain(42));
+        assert_eq!(err.to_kafka_error_code(), ERROR_REQUEST_TIMED_OUT);
+    }
+
+    #[test]
+    fn given_an_unretained_blocker_when_mapped_should_answer_a_retriable_timeout() {
+        let err = BridgeError::Iggy(IggyError::OperationNotRetained(42));
+
+        assert_eq!(err.to_kafka_error_code(), ERROR_REQUEST_TIMED_OUT);
+        assert_eq!(
+            err.to_offset_error_code(),
+            ERROR_COORDINATOR_LOAD_IN_PROGRESS
+        );
+    }
+
+    #[test]
     fn transient_not_committed_maps_to_request_timed_out_not_plain_retry() {
         // Outcome is unknown, not known-safe-to-retry - must not share a code with the
         // unambiguous retriable set, or a caller could blindly retry a Produce into a duplicate.
@@ -397,17 +549,19 @@ mod tests {
     }
 
     #[test]
-    fn request_too_old_maps_to_non_retryable_unknown_server_error() {
-        let err = BridgeError::Iggy(IggyError::RequestTooOld);
-        let code = err.to_kafka_error_code();
+    fn unavailable_request_history_maps_to_non_retryable_unknown_server_error() {
+        for error in [IggyError::RequestTooOld, IggyError::HistoryUnavailable] {
+            let error = BridgeError::Iggy(error);
+            let code = error.to_kafka_error_code();
 
-        assert_eq!(code, ERROR_UNKNOWN_SERVER_ERROR);
-        assert!(
-            !kafka_protocol::error::ResponseError::try_from_code(code)
-                .unwrap()
-                .is_retriable(),
-            "an aged-out request has an unknown outcome and must not be retried"
-        );
+            assert_eq!(code, ERROR_UNKNOWN_SERVER_ERROR, "{error}");
+            assert!(
+                !kafka_protocol::error::ResponseError::try_from_code(code)
+                    .unwrap()
+                    .is_retriable(),
+                "unavailable request history must not authorize replay: {error}"
+            );
+        }
     }
 
     #[test]

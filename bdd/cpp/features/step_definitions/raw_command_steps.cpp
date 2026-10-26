@@ -36,7 +36,25 @@ WHEN("^I send a raw command with code ([0-9]+) and an empty payload$") {
     context->raw_response.clear();
     context->raw_error.clear();
     try {
-        const auto response = context->client->send_binary_request(code, rust::Vec<std::uint8_t>());
+        iggy::ffi::ErrorInfo error_info{};
+        const auto response = context->client->send_binary_request(code, rust::Vec<std::uint8_t>(), error_info);
+        context->raw_response.assign(response.begin(), response.end());
+    } catch (const std::exception &error) {
+        context->raw_error = error.what();
+    }
+}
+
+WHEN("^I send a raw command with code ([0-9]+) and an empty payload to replica ([0-9]+)$") {
+    REGEX_PARAM(std::uint32_t, code);
+    REGEX_PARAM(unsigned int, replica);
+    cucumber::ScenarioScope<bdd::GlobalContext> context;
+
+    context->raw_response.clear();
+    context->raw_error.clear();
+    try {
+        iggy::ffi::ErrorInfo error_info{};
+        const auto response = context->client->send_binary_request_to_replica(
+            code, rust::Vec<std::uint8_t>(), static_cast<std::uint8_t>(replica), error_info);
         context->raw_response.assign(response.begin(), response.end());
     } catch (const std::exception &error) {
         context->raw_error = error.what();
@@ -62,4 +80,11 @@ THEN("^the raw command should fail with an invalid command error$") {
 
     EXPECT_TRUE(context->raw_response.empty());
     EXPECT_NE(context->raw_error.find("Invalid command"), std::string::npos);
+}
+
+THEN("^the raw command should fail with an invalid identifier error$") {
+    cucumber::ScenarioScope<bdd::GlobalContext> context;
+
+    EXPECT_TRUE(context->raw_response.empty());
+    EXPECT_NE(context->raw_error.find("Invalid identifier"), std::string::npos);
 }

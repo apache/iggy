@@ -17,13 +17,13 @@
 
 use crate::http::http_client::HttpClient;
 use crate::http::http_transport::HttpTransport;
-use crate::prelude::{Identifier, IggyError, IggyExpiry, MaxTopicSize};
+use crate::http::path::encode_segment;
+use crate::prelude::{Identifier, IggyError};
 use async_trait::async_trait;
-use iggy_common::TopicClient;
 use iggy_common::create_topic::CreateTopic;
-use iggy_common::update_topic::UpdateTopic;
 use iggy_common::{
-    DEFAULT_PARTITIONS_COUNT, Topic, TopicCreateOptions, TopicDetails, TopicUpdateOptions,
+    DEFAULT_PARTITIONS_COUNT, OptionInputMap, Topic, TopicClient, TopicCreateOptions, TopicDetails,
+    TopicUpdateOptions,
 };
 
 #[async_trait]
@@ -33,25 +33,11 @@ impl TopicClient for HttpClient {
         stream_id: &Identifier,
         topic_id: &Identifier,
     ) -> Result<Option<TopicDetails>, IggyError> {
-        let response = self
-            .get(&get_details_path(
-                &stream_id.as_cow_str(),
-                &topic_id.as_cow_str(),
-            ))
-            .await;
-        if let Err(error) = response {
-            if matches!(error, IggyError::ResourceNotFound(_)) {
-                return Ok(None);
-            }
-
-            return Err(error);
+        match self.topic_details(stream_id, topic_id).await {
+            Ok(topic) => Ok(Some(topic)),
+            Err(IggyError::ResourceNotFound(_)) => Ok(None),
+            Err(error) => Err(error),
         }
-
-        let topic = response?
-            .json()
-            .await
-            .map_err(|_| IggyError::InvalidJsonResponse)?;
-        Ok(Some(topic))
     }
 
     async fn get_topics(&self, stream_id: &Identifier) -> Result<Vec<Topic>, IggyError> {
@@ -76,16 +62,7 @@ impl TopicClient for HttpClient {
                     stream_id: stream_id.clone(),
                     name: name.to_string(),
                     partitions_count: options.partitions_count.unwrap_or(DEFAULT_PARTITIONS_COUNT),
-                    compression_algorithm: options.compression_algorithm.unwrap_or_default(),
-                    message_expiry: options.message_expiry.unwrap_or(IggyExpiry::ServerDefault),
-                    max_topic_size: options
-                        .max_topic_size
-                        .unwrap_or(MaxTopicSize::ServerDefault),
-                    // Carries the runtime knobs too, not just `raw`: this body
-                    // has no dedicated field for them, and dropping them here
-                    // gave one transport a topic without the fsync the caller
-                    // asked for while the other honored it.
-                    options: options.to_string_options()?,
+                    options: OptionInputMap(options.to_input_map()?),
                 },
             )
             .await?;
@@ -100,20 +77,11 @@ impl TopicClient for HttpClient {
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        name: &str,
         options: &TopicUpdateOptions,
     ) -> Result<(), IggyError> {
         self.put(
             &get_details_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),
-            &UpdateTopic {
-                stream_id: stream_id.clone(),
-                topic_id: topic_id.clone(),
-                name: name.to_string(),
-                compression_algorithm: options.compression_algorithm,
-                message_expiry: options.message_expiry,
-                max_topic_size: options.max_topic_size,
-                options: options.raw.clone(),
-            },
+            &options.to_update_body()?,
         )
         .await?;
         Ok(())
@@ -129,27 +97,37 @@ impl TopicClient for HttpClient {
             &topic_id.as_cow_str(),
         ))
         .await?;
+        self.send_contexts.invalidate_topic_discovery();
         Ok(())
     }
+}
 
-    async fn purge_topic(
+impl HttpClient {
+    /// Reads the topic details and keeps their partition contexts for the sends that follow.
+    pub(super) async fn topic_details(
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
-    ) -> Result<(), IggyError> {
-        self.delete(&format!(
-            "{}/purge",
-            get_details_path(&stream_id.as_cow_str(), &topic_id.as_cow_str(),)
-        ))
-        .await?;
-        Ok(())
+    ) -> Result<TopicDetails, IggyError> {
+        let topic: TopicDetails = self
+            .get(&get_details_path(
+                &stream_id.as_cow_str(),
+                &topic_id.as_cow_str(),
+            ))
+            .await?
+            .json()
+            .await
+            .map_err(|_| IggyError::InvalidJsonResponse)?;
+        self.send_contexts
+            .set_topic_partitions(stream_id, topic_id, &topic.partitions);
+        Ok(topic)
     }
 }
 
 fn get_path(stream_id: &str) -> String {
-    format!("streams/{stream_id}/topics")
+    format!("streams/{}/topics", encode_segment(stream_id))
 }
 
 fn get_details_path(stream_id: &str, topic_id: &str) -> String {
-    format!("{}/{topic_id}", get_path(stream_id))
+    format!("{}/{}", get_path(stream_id), encode_segment(topic_id))
 }

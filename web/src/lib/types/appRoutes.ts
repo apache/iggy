@@ -17,17 +17,18 @@
 
 type SettingsSegment = `settings/${'server' | 'users' | 'terminal' | 'webUI'}`;
 
-type DashboardRoutes = `/dashboard/${
+type DashboardRoutes = `dashboard/${
   | 'overview'
   | 'streams'
   | `streams/${number}`
   | `streams/${number}/topics/${number}`
   | `streams/${number}/topics/${number}/partitions/${number}/messages`
   | 'clients'
+  | 'changes'
   | 'logs'
   | SettingsSegment}`;
 
-type AuthRoutes = `/auth/${'sign-in' | 'logout'}`;
+type AuthRoutes = `auth/${'sign-in' | 'logout'}`;
 
 export const typedRoute = <const T extends DashboardRoutes | AuthRoutes>(route: T) => route;
 export const publicRoutes = ['/auth/sign-in', '/auth/logout', '/auth/test'] as const;

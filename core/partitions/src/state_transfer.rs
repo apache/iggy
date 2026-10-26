@@ -28,12 +28,11 @@
 //! partition-specific payload handling on either end.
 
 use crate::IggyPartition;
-use crate::offset_storage::{
-    PURGE_GENERATION_FILE, discard_offset_replacement, stage_offset_replacement,
-};
+use crate::iggy_partition::{InstalledConsumerGroupOwner, InstalledPartitionHistory};
+use crate::offset_storage::{discard_offset_replacement, stage_offset_replacement};
 use crate::partition_storage::{read_revision_record, write_revision_record};
 use crate::segment_anchor::ANCHOR_SUFFIX;
-use crate::types::PartitionsConfig;
+use crate::types::{OFFSETS_DIR, PartitionsConfig};
 use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
 use consensus::client_table::{CLIENTS_TABLE_SLOT_MAX, ClientTable, ClientTableMode};
 use consensus::le_cursor::{LeCursor, Truncated, split_verified_trailer};
@@ -41,8 +40,13 @@ use consensus::state_manifest::artifact_kind;
 use consensus::{
     ArtifactProgress, DedupWatermark, Sequencer as _, StateArtifactHasher, state_artifact_checksum,
 };
+use iggy_binary_protocol::requests::partitions::retire_consumer_group_owners::CONSUMER_GROUP_OWNERS_MAX;
+use iggy_binary_protocol::requests::partitions::{
+    InstallConsumerGroupOwnerRequest, RetireConsumerGroupOwnersRequest,
+    TransitionPartitionHistoryRequest,
+};
 use iggy_binary_protocol::responses::messages::send_messages::CONFIRMATION_SIZE;
-use iggy_binary_protocol::{Operation, PrepareHeader, ReplyHeader};
+use iggy_binary_protocol::{Operation, PrepareHeader, ReplyHeader, WireDecode, WireEncode};
 use iggy_common::{ConsumerGroupId, ConsumerKind, ConsumerOffset};
 use journal::durable_storage::{DiskStorage, DurableStorage};
 use journal::superblock::SuperblockStore;
@@ -54,7 +58,7 @@ use server_common::iobuf::Owned;
 use server_common::send_messages::{decode_batch_slice, decode_prepare_slice};
 use server_common::sharding::IggyNamespace;
 use server_common::yield_to_reactor;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fmt;
 use std::future::Future;
 use std::mem::size_of;
@@ -64,7 +68,10 @@ use std::sync::atomic::Ordering;
 
 /// Current state-transfer offsets format, including the prepare-chain anchor.
 pub(crate) const CONSUMER_OFFSETS_MAGIC: [u8; 4] = *b"ICO1";
-pub(crate) const CONSUMER_OFFSETS_VERSION: u8 = 4;
+/// Version 6 dropped the purge generation that followed the version byte.
+/// Version 7 carries the installed consumer-group owners and history fence.
+/// Version 8 carries the op of the delete that emptied the offset table.
+pub(crate) const CONSUMER_OFFSETS_VERSION: u8 = 8;
 pub(crate) const SEGMENT_SWEEP_STACK_BYTES: usize = 2 * 1024 * 1024;
 
 const RETRY_CHECKPOINT_MAGIC: [u8; 4] = *b"IRP2";
@@ -76,6 +83,9 @@ const RETRY_CHECKPOINT_BYTES_MAX: usize = journal::partition_journal::PREPARE_BY
         * CONSUMER_OFFSETS_ENTRIES_MAX as usize
         * (size_of::<u32>() + size_of::<u64>())
     + CLIENTS_TABLE_SLOT_MAX * (DEDUP_ENTRY_LEN + PARTITION_RECEIPT_BYTES_MAX)
+    + CONSUMER_OFFSETS_ENTRIES_MAX as usize * OWNERSHIP_ENTRY_LEN
+    + RetireConsumerGroupOwnersRequest::PREFIX_SIZE
+    + CONSUMER_GROUP_OWNERS_MAX as usize * size_of::<u64>()
     + size_of::<PrepareHeader>();
 
 /// Per-section entry ceiling for the consumer-offsets artifact.
@@ -87,6 +97,8 @@ pub const CONSUMER_OFFSETS_ENTRIES_MAX: u32 = 1 << 20;
 
 /// Fixed prefix of a session-qualified receipt; reply bytes follow.
 const DEDUP_ENTRY_LEN: usize = 2 * size_of::<u128>() + 3 * size_of::<u64>() + 2 * size_of::<u32>();
+const OWNERSHIP_ENTRY_LEN: usize =
+    InstallConsumerGroupOwnerRequest::ENCODED_SIZE + size_of::<u64>();
 const PARTITION_RECEIPT_BYTES_MAX: usize =
     size_of::<ReplyHeader>() + size_of::<u32>() + CONFIRMATION_SIZE;
 
@@ -238,9 +250,9 @@ pub struct StagedSegmentMeta {
 /// Keyed per segment rather than per `(base offset, size)` pair so the ACTIVE
 /// segment extends its own hasher as it grows, instead of missing the memo on
 /// every byte it gained and re-reading from byte zero. Every path that plants a
-/// new file at an existing base offset (purge, install, converge) clears the
-/// whole map, which is what makes "same base offset, longer file, same leading
-/// bytes" hold.
+/// new file at an existing base offset (install, converge) clears the whole
+/// map, which is what makes "same base offset, longer file, same leading bytes"
+/// hold.
 pub(crate) struct SegmentChecksumMemo {
     hashed_len: u64,
     /// The stamp is NOT cached alongside: `StateArtifactHasher::finish` takes
@@ -297,18 +309,12 @@ impl StagedSegmentMeta {
     }
 }
 
-/// The consumer-offset artifact: the offsets of every kind plus the applied
-/// purge generation, at the offer's `commit_op`.
-///
-/// The purge generation rides here because a receiver that missed a
-/// `PurgeTopic` would otherwise install post-purge data at a stale local
-/// generation and the reconciler would immediately re-wipe it, costing a
-/// full extra transfer.
+/// The consumer-offset artifact: the offsets of every kind at the offer's
+/// `commit_op`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct ConsumerOffsetsWire {
     pub dedup_capacity: usize,
     pub required_metadata_frontier: u64,
-    pub purge_generation: u64,
     /// Checksum of the prepare at the offer's committed operation.
     pub prepare_checksum: Option<u128>,
     pub checkpoint_prepare: Vec<u8>,
@@ -319,6 +325,12 @@ pub(crate) struct ConsumerOffsetsWire {
     /// this field would restart the receiver's offset space at 0, forking
     /// every future batch stamp from the rest of the group.
     pub next_offset: u64,
+    /// The op of the committed delete that left every offset kind empty, `0`
+    /// when the origin knows of none. It lets a receiver that applied less
+    /// than that op accept an empty table that a delete emptied. A donor whose
+    /// boot lost offset files before that delete still sends it, as the
+    /// marking rule in `IggyPartition::plan_committed_offset` notes.
+    pub emptied_at: u64,
     /// `(consumer id, offset)`, ascending by id.
     pub consumers: Vec<(u32, u64)>,
     /// `(consumer group id, offset)`, ascending by id.
@@ -329,45 +341,33 @@ pub(crate) struct ConsumerOffsetsWire {
     /// rejoining behind the repair floor can absorb a replay of what the group
     /// already committed instead of re-executing it.
     pub dedup: Vec<DedupWatermark>,
+    pub owners: Vec<InstalledConsumerGroupOwner>,
+    pub history_transition: Option<InstalledPartitionHistory>,
+    pub owner_retirement:
+        Option<iggy_binary_protocol::requests::partitions::RetireConsumerGroupOwnersRequest>,
 }
 
 impl ConsumerOffsetsWire {
-    /// Encode: `magic | version u8 | purge_generation u64 | next_offset u64 |
+    /// Encode: `magic | version u8 | next_offset u64 | emptied_at u64 |
     /// required_metadata_frontier u64 | dedup_capacity u32 |
     /// consumer_count u32 | group_count u32 | external_group_count u32 |
     /// dedup_count u32 | {id u32, offset u64}xN | {id u32, offset u64}xM |
     /// {id u32, offset u64}xE | {client u128, watermark u64, latest_commit u64,
     /// user_id u32, committed_window u128, session u64, reply_length u32,
-    /// reply bytes}xD | checksum_present u8 |
+    /// reply bytes}xD | owner_count u32 | {installation, partition_op u64}xO |
+    /// history_present u8 | [history fence, partition_op u64] |
+    /// retirement_length u32 | retirement bytes | checksum_present u8 |
     /// prepare_checksum u128 | prepare_length u32 | checkpoint_prepare bytes |
     /// XxHash3_64 trailer`. Little-endian throughout.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let sections = self.offset_sections();
-        // Size exactly rather than guess; the reservation assert keeps the
-        // arithmetic honest as fields are added.
-        let reserved = CONSUMER_OFFSETS_MAGIC.len()
-            + size_of::<u8>()
-            + 3 * size_of::<u64>()
-            + (sections.len() + 2) * size_of::<u32>()
-            + sections.iter().map(|entries| entries.len()).sum::<usize>()
-                * (size_of::<u32>() + size_of::<u64>())
-            + self.dedup.len() * DEDUP_ENTRY_LEN
-            + self
-                .dedup
-                .iter()
-                .map(|entry| entry.reply.len())
-                .sum::<usize>()
-            + size_of::<u8>()
-            + size_of::<u128>()
-            + size_of::<u32>()
-            + self.checkpoint_prepare.len()
-            + size_of::<u64>();
+        let reserved = self.encoded_size();
         let mut out = Vec::with_capacity(reserved);
         out.extend_from_slice(&CONSUMER_OFFSETS_MAGIC);
         out.push(CONSUMER_OFFSETS_VERSION);
-        out.extend_from_slice(&self.purge_generation.to_le_bytes());
         out.extend_from_slice(&self.next_offset.to_le_bytes());
+        out.extend_from_slice(&self.emptied_at.to_le_bytes());
         out.extend_from_slice(&self.required_metadata_frontier.to_le_bytes());
         out.extend_from_slice(
             &u32::try_from(self.dedup_capacity)
@@ -398,6 +398,35 @@ impl ConsumerOffsetsWire {
             );
             out.extend_from_slice(&entry.reply);
         }
+        out.extend_from_slice(
+            &u32::try_from(self.owners.len())
+                .expect("bounded ownership count")
+                .to_le_bytes(),
+        );
+        let mut encoded_owner =
+            bytes::BytesMut::with_capacity(InstallConsumerGroupOwnerRequest::ENCODED_SIZE);
+        for installed in &self.owners {
+            encoded_owner.clear();
+            installed.installation.encode(&mut encoded_owner);
+            out.extend_from_slice(&encoded_owner);
+            out.extend_from_slice(&installed.partition_op.to_le_bytes());
+        }
+        out.push(u8::from(self.history_transition.is_some()));
+        if let Some(installed) = self.history_transition {
+            out.extend_from_slice(&installed.transition.to_bytes());
+            out.extend_from_slice(&installed.partition_op.to_le_bytes());
+        }
+        let retirement_bytes = self
+            .owner_retirement
+            .as_ref()
+            .map(WireEncode::to_bytes)
+            .unwrap_or_default();
+        out.extend_from_slice(
+            &u32::try_from(retirement_bytes.len())
+                .expect("bounded owner retirement")
+                .to_le_bytes(),
+        );
+        out.extend_from_slice(&retirement_bytes);
         out.push(u8::from(self.prepare_checksum.is_some()));
         out.extend_from_slice(&self.prepare_checksum.unwrap_or(0).to_le_bytes());
         out.extend_from_slice(
@@ -424,6 +453,7 @@ impl ConsumerOffsetsWire {
     /// # Errors
     /// Any [`ConsumerOffsetsWireError`]; the input is never partially
     /// trusted.
+    #[allow(clippy::too_many_lines)]
     pub fn decode(bytes: &[u8]) -> Result<Self, ConsumerOffsetsWireError> {
         let content = split_verified_trailer(bytes).map_err(|mismatch| match mismatch {
             None => ConsumerOffsetsWireError::Truncated,
@@ -440,8 +470,8 @@ impl ConsumerOffsetsWire {
         if version != CONSUMER_OFFSETS_VERSION {
             return Err(ConsumerOffsetsWireError::UnsupportedVersion { version });
         }
-        let purge_generation = cursor.u64()?;
         let next_offset = cursor.u64()?;
+        let emptied_at = cursor.u64()?;
         let required_metadata_frontier = cursor.u64()?;
         let dedup_capacity = cursor.u32()? as usize;
         let consumer_count = cursor.u32()?;
@@ -463,6 +493,27 @@ impl ConsumerOffsetsWire {
         let external_groups =
             Self::decode_section(&mut cursor, "external groups", external_group_count)?;
         let dedup = Self::decode_dedup_section(&mut cursor, dedup_count)?;
+        let owners = Self::decode_ownership_section(&mut cursor, required_metadata_frontier)?;
+        let history_transition = match cursor.u8()? {
+            0 => None,
+            1 => {
+                let transition = TransitionPartitionHistoryRequest::decode_from(
+                    cursor.take(TransitionPartitionHistoryRequest::ENCODED_SIZE)?,
+                )
+                .map_err(|_| ConsumerOffsetsWireError::InvalidOwnership)?;
+                let partition_op = cursor.u64()?;
+                if transition.metadata_op > required_metadata_frontier || partition_op == 0 {
+                    return Err(ConsumerOffsetsWireError::InvalidOwnership);
+                }
+                Some(InstalledPartitionHistory {
+                    transition,
+                    partition_op,
+                })
+            }
+            _ => return Err(ConsumerOffsetsWireError::InvalidOwnership),
+        };
+        let owner_retirement =
+            Self::decode_retirement_section(&mut cursor, required_metadata_frontier)?;
         let present = cursor.u8()?;
         let checksum = cursor.u128()?;
         let prepare_checksum = match present {
@@ -486,20 +537,147 @@ impl ConsumerOffsetsWire {
         Ok(Self {
             dedup_capacity,
             required_metadata_frontier,
-            purge_generation,
             prepare_checksum,
             checkpoint_prepare,
             next_offset,
+            emptied_at,
             consumers,
             groups,
             external_groups,
             dedup,
+            owners,
+            history_transition,
+            owner_retirement,
         })
     }
 
     /// The offset section of each kind, in [`ConsumerKind::ALL`] order.
     pub(crate) fn offset_sections(&self) -> [&[(u32, u64)]; ConsumerKind::COUNT] {
         [&self.consumers, &self.groups, &self.external_groups]
+    }
+
+    fn encoded_size(&self) -> usize {
+        CONSUMER_OFFSETS_MAGIC.len()
+            + size_of::<u8>()
+            + 3 * size_of::<u64>()
+            + (ConsumerKind::COUNT + 2) * size_of::<u32>()
+            + self
+                .offset_sections()
+                .iter()
+                .map(|entries| entries.len())
+                .sum::<usize>()
+                * (size_of::<u32>() + size_of::<u64>())
+            + self.dedup.len() * DEDUP_ENTRY_LEN
+            + self
+                .dedup
+                .iter()
+                .map(|entry| entry.reply.len())
+                .sum::<usize>()
+            + size_of::<u8>()
+            + size_of::<u128>()
+            + size_of::<u32>()
+            + self.checkpoint_prepare.len()
+            + size_of::<u32>()
+            + self.owners.len() * OWNERSHIP_ENTRY_LEN
+            + size_of::<u8>()
+            + self.history_transition.map_or(0, |_| {
+                TransitionPartitionHistoryRequest::ENCODED_SIZE + size_of::<u64>()
+            })
+            + size_of::<u32>()
+            + self
+                .owner_retirement
+                .as_ref()
+                .map_or(0, WireEncode::encoded_size)
+            + size_of::<u64>()
+    }
+
+    fn decode_retirement_section(
+        cursor: &mut LeCursor<'_>,
+        metadata_frontier: u64,
+    ) -> Result<Option<RetireConsumerGroupOwnersRequest>, ConsumerOffsetsWireError> {
+        let retirement_length = cursor.u32()? as usize;
+        if retirement_length == 0 {
+            Ok(None)
+        } else {
+            let catalog =
+                RetireConsumerGroupOwnersRequest::decode_from(cursor.take(retirement_length)?)
+                    .map_err(|_| ConsumerOffsetsWireError::InvalidOwnership)?;
+            if catalog.metadata_op > metadata_frontier {
+                return Err(ConsumerOffsetsWireError::InvalidOwnership);
+            }
+            Ok(Some(catalog))
+        }
+    }
+
+    fn decode_ownership_section(
+        cursor: &mut LeCursor<'_>,
+        metadata_frontier: u64,
+    ) -> Result<Vec<InstalledConsumerGroupOwner>, ConsumerOffsetsWireError> {
+        let count = cursor.u32()?;
+        if count > CONSUMER_OFFSETS_ENTRIES_MAX {
+            return Err(ConsumerOffsetsWireError::TooManyEntries {
+                section: "owners",
+                count,
+                max: CONSUMER_OFFSETS_ENTRIES_MAX,
+            });
+        }
+        if count as usize * OWNERSHIP_ENTRY_LEN > cursor.remaining().len() {
+            return Err(ConsumerOffsetsWireError::Truncated);
+        }
+        let mut owners = Vec::with_capacity(count as usize);
+        let mut previous = None;
+        for _ in 0..count {
+            let installation = InstallConsumerGroupOwnerRequest::decode_from(
+                cursor.take(InstallConsumerGroupOwnerRequest::ENCODED_SIZE)?,
+            )
+            .map_err(|_| ConsumerOffsetsWireError::InvalidOwnership)?;
+            let partition_op = cursor.u64()?;
+            if partition_op == 0
+                || installation.group_id > u64::from(u32::MAX)
+                || previous.is_some_and(|id| id >= installation.group_id)
+                || installation.metadata_op > metadata_frontier
+            {
+                return Err(ConsumerOffsetsWireError::InvalidOwnership);
+            }
+            previous = Some(installation.group_id);
+            owners.push(InstalledConsumerGroupOwner {
+                installation,
+                partition_op,
+            });
+        }
+        Ok(owners)
+    }
+
+    fn validate_owners(
+        &self,
+        incarnation: u64,
+        through_op: u64,
+    ) -> Result<(), ConsumerOffsetsWireError> {
+        if self.history_transition.is_some_and(|installed| {
+            installed.partition_op > through_op || installed.transition.incarnation != incarnation
+        }) {
+            return Err(ConsumerOffsetsWireError::InvalidOwnership);
+        }
+        // The delete fence is terminal, so every owner was installed before it.
+        if self.owners.iter().any(|installed| {
+            installed.partition_op > through_op
+                || installed.installation.incarnation != incarnation
+                || self
+                    .history_transition
+                    .is_some_and(|history| installed.partition_op >= history.partition_op)
+        }) {
+            return Err(ConsumerOffsetsWireError::InvalidOwnership);
+        }
+        if self.owner_retirement.as_ref().is_some_and(|catalog| {
+            catalog.incarnation != incarnation
+                || self.owners.iter().any(|installed| {
+                    catalog.retires(installed.installation.group_id)
+                        && !installed.installation.owner.is_unassigned()
+                })
+        }) {
+            return Err(ConsumerOffsetsWireError::InvalidOwnership);
+        }
+        Ok(())
     }
 
     /// Same guards as [`Self::decode_section`] at the dedup stride: peer count
@@ -604,6 +782,7 @@ impl ConsumerOffsetsWire {
 /// different trust (this node's own bytes vs a peer's).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsumerOffsetsWireError {
+    InvalidOwnership,
     InvalidCapacity,
     InvalidReceipt,
     InvalidPrepareChecksum,
@@ -652,6 +831,10 @@ impl From<Truncated> for ConsumerOffsetsWireError {
 impl fmt::Display for ConsumerOffsetsWireError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidOwnership => write!(
+                f,
+                "invalid owner, history fence or retirement catalog in consumer-offsets artifact"
+            ),
             Self::InvalidCapacity => write!(f, "invalid committed retry capacity"),
             Self::InvalidReceipt => {
                 write!(f, "invalid partition receipt in consumer-offsets artifact")
@@ -724,6 +907,7 @@ const fn validate_consumer_offset_transfer_count(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner;
 
     #[test]
     fn given_segment_read_error_when_classifying_should_tell_local_faults_from_stale_offers() {
@@ -792,12 +976,15 @@ mod tests {
 
     fn table() -> ConsumerOffsetsWire {
         ConsumerOffsetsWire {
+            owner_retirement: None,
+            owners: Vec::new(),
+            history_transition: None,
             dedup_capacity: consensus::CLIENTS_TABLE_MAX,
             required_metadata_frontier: 0,
             prepare_checksum: None,
             checkpoint_prepare: Vec::new(),
-            purge_generation: 3,
             next_offset: 43,
+            emptied_at: 0,
             consumers: vec![(1, 10), (7, 42)],
             groups: vec![(2, 5)],
             external_groups: Vec::new(),
@@ -845,6 +1032,7 @@ mod tests {
         assert_eq!(restored.capacity(), FIRST_COMMITTED_CAPACITY);
         assert!(checked_retry_table(&decoded, 1, LOCAL_CAPACITY).is_err());
         let with_receipt = ConsumerOffsetsWire {
+            owner_retirement: None,
             dedup: vec![dedup_entry(1, 1, 1)],
             ..wire
         };
@@ -857,6 +1045,97 @@ mod tests {
         assert_eq!(
             ConsumerOffsetsWire::decode(&encoded).expect("round trip"),
             table()
+        );
+    }
+
+    #[test]
+    fn given_history_and_owner_evidence_when_restored_should_validate_order_and_identity() {
+        const INCARNATION: u64 = 7;
+        let mut wire = table();
+        wire.required_metadata_frontier = 13;
+        wire.history_transition = Some(InstalledPartitionHistory {
+            transition: TransitionPartitionHistoryRequest {
+                incarnation: INCARNATION,
+                metadata_op: 12,
+            },
+            partition_op: 6,
+        });
+        wire.owners.push(InstalledConsumerGroupOwner {
+            installation: InstallConsumerGroupOwnerRequest {
+                incarnation: INCARNATION,
+                group_id: 2,
+                owner: iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner {
+                    client_id: 11,
+                    session: 4,
+                    generation: 9,
+                },
+                metadata_op: 13,
+            },
+            partition_op: 5,
+        });
+        wire.owner_retirement = Some(
+            iggy_binary_protocol::requests::partitions::RetireConsumerGroupOwnersRequest {
+                incarnation: INCARNATION,
+                metadata_op: 13,
+                next_group_id: 4,
+                live_group_ids: vec![2],
+            },
+        );
+        let restored = ConsumerOffsetsWire::decode(&wire.encode()).unwrap();
+        assert_eq!(wire, restored);
+        assert!(restored.validate_owners(INCARNATION, 91).is_ok());
+        assert_eq!(
+            restored.validate_owners(INCARNATION + 1, 91),
+            Err(ConsumerOffsetsWireError::InvalidOwnership)
+        );
+        assert_eq!(
+            restored.validate_owners(INCARNATION, 5),
+            Err(ConsumerOffsetsWireError::InvalidOwnership)
+        );
+
+        let mut invalid = wire.clone();
+        invalid
+            .owner_retirement
+            .as_mut()
+            .unwrap()
+            .live_group_ids
+            .clear();
+        assert_eq!(
+            invalid.validate_owners(INCARNATION, 91),
+            Err(ConsumerOffsetsWireError::InvalidOwnership)
+        );
+        invalid = wire.clone();
+        invalid.owner_retirement.as_mut().unwrap().metadata_op += 1;
+        assert_eq!(
+            ConsumerOffsetsWire::decode(&invalid.encode()),
+            Err(ConsumerOffsetsWireError::InvalidOwnership)
+        );
+        // The delete fence is terminal, so no owner shares or follows its op.
+        for partition_op in [6, 7] {
+            invalid = wire.clone();
+            invalid.owners[0].partition_op = partition_op;
+            assert_eq!(
+                invalid.validate_owners(INCARNATION, 91),
+                Err(ConsumerOffsetsWireError::InvalidOwnership)
+            );
+        }
+        invalid = wire.clone();
+        invalid.owners[0].installation.incarnation += 1;
+        assert_eq!(
+            invalid.validate_owners(INCARNATION, 91),
+            Err(ConsumerOffsetsWireError::InvalidOwnership)
+        );
+        invalid = wire.clone();
+        invalid.owners.push(invalid.owners[0]);
+        assert_eq!(
+            ConsumerOffsetsWire::decode(&invalid.encode()),
+            Err(ConsumerOffsetsWireError::InvalidOwnership)
+        );
+        invalid = wire;
+        invalid.required_metadata_frontier = 11;
+        assert_eq!(
+            ConsumerOffsetsWire::decode(&invalid.encode()),
+            Err(ConsumerOffsetsWireError::InvalidOwnership)
         );
     }
 
@@ -883,12 +1162,15 @@ mod tests {
     #[test]
     fn given_empty_table_when_encoded_should_round_trip() {
         let empty = ConsumerOffsetsWire {
+            owner_retirement: None,
+            owners: Vec::new(),
+            history_transition: None,
             dedup_capacity: consensus::CLIENTS_TABLE_MAX,
             required_metadata_frontier: 0,
             prepare_checksum: None,
             checkpoint_prepare: Vec::new(),
-            purge_generation: 0,
             next_offset: 0,
+            emptied_at: 0,
             consumers: Vec::new(),
             groups: Vec::new(),
             external_groups: Vec::new(),
@@ -898,6 +1180,42 @@ mod tests {
         assert_eq!(
             ConsumerOffsetsWire::decode(&encoded).expect("round trip"),
             empty
+        );
+    }
+
+    #[test]
+    fn given_emptied_table_when_encoded_should_round_trip_the_emptied_op() {
+        let emptied = ConsumerOffsetsWire {
+            emptied_at: 9,
+            consumers: Vec::new(),
+            groups: Vec::new(),
+            ..table()
+        };
+        assert_eq!(
+            ConsumerOffsetsWire::decode(&emptied.encode()).expect("round trip"),
+            emptied
+        );
+    }
+
+    /// Version 7 had no emptied-at op after the next offset. Read in place, its
+    /// later fields would land one word early.
+    #[test]
+    fn given_version_7_offsets_artifact_when_decoded_should_reject_it() {
+        const RELEASED_VERSION: u8 = 7;
+        const EMPTIED_AT_START: usize =
+            CONSUMER_OFFSETS_MAGIC.len() + size_of::<u8>() + size_of::<u64>();
+        let encoded = table().encode();
+        let mut released = encoded[..encoded.len() - size_of::<u64>()].to_vec();
+        released.drain(EMPTIED_AT_START..EMPTIED_AT_START + size_of::<u64>());
+        released[CONSUMER_OFFSETS_MAGIC.len()] = RELEASED_VERSION;
+        let trailer = state_artifact_checksum(&released);
+        released.extend_from_slice(&trailer.to_le_bytes());
+
+        assert_eq!(
+            ConsumerOffsetsWire::decode(&released),
+            Err(ConsumerOffsetsWireError::UnsupportedVersion {
+                version: RELEASED_VERSION
+            })
         );
     }
 
@@ -944,20 +1262,47 @@ mod tests {
         // of place. One entry per section makes each length cover the header,
         // every count field and every entry stride. Changing a length is the
         // reminder to change its version.
-        const WITHOUT_EXTERNAL_LEN: usize = 422;
-        const WITH_EXTERNAL_LEN: usize = 434;
+        const WITHOUT_EXTERNAL_LEN: usize = 555;
+        const WITH_EXTERNAL_LEN: usize = 567;
 
+        const INCARNATION: u64 = 1;
         let with_external = ConsumerOffsetsWire {
             dedup_capacity: consensus::CLIENTS_TABLE_MAX,
-            required_metadata_frontier: 0,
+            required_metadata_frontier: 3,
             prepare_checksum: Some(1),
             checkpoint_prepare: Vec::new(),
-            purge_generation: 0,
             next_offset: 0,
+            emptied_at: 0,
             consumers: vec![(1, 0)],
             groups: vec![(1, 0)],
             external_groups: vec![(1, 0)],
             dedup: vec![dedup_entry(1, 0, 0)],
+            owners: vec![InstalledConsumerGroupOwner {
+                installation: InstallConsumerGroupOwnerRequest {
+                    incarnation: INCARNATION,
+                    group_id: 1,
+                    owner: ConsumerGroupOwner {
+                        client_id: 1,
+                        session: 1,
+                        generation: 1,
+                    },
+                    metadata_op: 2,
+                },
+                partition_op: 1,
+            }],
+            history_transition: Some(InstalledPartitionHistory {
+                transition: TransitionPartitionHistoryRequest {
+                    incarnation: INCARNATION,
+                    metadata_op: 3,
+                },
+                partition_op: 2,
+            }),
+            owner_retirement: Some(RetireConsumerGroupOwnersRequest {
+                incarnation: INCARNATION,
+                metadata_op: 3,
+                next_group_id: 2,
+                live_group_ids: vec![1],
+            }),
         };
         let without_external = ConsumerOffsetsWire {
             external_groups: Vec::new(),
@@ -976,7 +1321,7 @@ mod tests {
             );
         }
         assert_eq!(
-            CONSUMER_OFFSETS_VERSION, 4,
+            CONSUMER_OFFSETS_VERSION, 8,
             "a consumer-offsets version moved; confirm its layout moved with it"
         );
     }
@@ -992,7 +1337,8 @@ mod tests {
         let mut released = Vec::new();
         released.extend_from_slice(&CONSUMER_OFFSETS_MAGIC);
         released.push(1);
-        released.extend_from_slice(&wire.purge_generation.to_le_bytes());
+        // 0.9.0 wrote its purge generation here.
+        released.extend_from_slice(&0u64.to_le_bytes());
         released.extend_from_slice(&wire.next_offset.to_le_bytes());
         for count in [wire.consumers.len(), wire.groups.len(), wire.dedup.len()] {
             released.extend_from_slice(&u32::try_from(count).unwrap().to_le_bytes());
@@ -1052,12 +1398,15 @@ mod tests {
     #[test]
     fn given_unordered_dedup_clients_when_decoded_should_reject() {
         let unordered = ConsumerOffsetsWire {
+            owner_retirement: None,
+            owners: Vec::new(),
+            history_transition: None,
             dedup_capacity: consensus::CLIENTS_TABLE_MAX,
             required_metadata_frontier: 0,
             prepare_checksum: None,
             checkpoint_prepare: Vec::new(),
-            purge_generation: 0,
             next_offset: 0,
+            emptied_at: 0,
             consumers: Vec::new(),
             groups: Vec::new(),
             external_groups: Vec::new(),
@@ -1072,12 +1421,15 @@ mod tests {
     #[test]
     fn given_reserved_client_in_dedup_when_decoded_should_reject() {
         let reserved = ConsumerOffsetsWire {
+            owner_retirement: None,
+            owners: Vec::new(),
+            history_transition: None,
             dedup_capacity: consensus::CLIENTS_TABLE_MAX,
             required_metadata_frontier: 0,
             prepare_checksum: None,
             checkpoint_prepare: Vec::new(),
-            purge_generation: 0,
             next_offset: 0,
+            emptied_at: 0,
             consumers: Vec::new(),
             groups: Vec::new(),
             external_groups: Vec::new(),
@@ -1178,14 +1530,43 @@ mod tests {
     }
 
     #[test]
+    fn given_owner_count_past_ceiling_when_decoded_should_reject_before_allocating() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&CONSUMER_OFFSETS_MAGIC);
+        bytes.push(CONSUMER_OFFSETS_VERSION);
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&(u32::try_from(CLIENTS_TABLE_SLOT_MAX).unwrap()).to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&(CONSUMER_OFFSETS_ENTRIES_MAX + 1).to_le_bytes());
+        let trailer = state_artifact_checksum(&bytes);
+        bytes.extend_from_slice(&trailer.to_le_bytes());
+        assert_eq!(
+            ConsumerOffsetsWire::decode(&bytes),
+            Err(ConsumerOffsetsWireError::TooManyEntries {
+                section: "owners",
+                count: CONSUMER_OFFSETS_ENTRIES_MAX + 1,
+                max: CONSUMER_OFFSETS_ENTRIES_MAX,
+            })
+        );
+    }
+
+    #[test]
     fn given_duplicate_or_unordered_ids_when_decoded_should_reject() {
         let duplicate = ConsumerOffsetsWire {
+            owner_retirement: None,
+            owners: Vec::new(),
+            history_transition: None,
             dedup_capacity: consensus::CLIENTS_TABLE_MAX,
             required_metadata_frontier: 0,
             prepare_checksum: None,
             checkpoint_prepare: Vec::new(),
-            purge_generation: 0,
             next_offset: 0,
+            emptied_at: 0,
             consumers: vec![(5, 1), (5, 2)],
             groups: Vec::new(),
             external_groups: Vec::new(),
@@ -1199,12 +1580,15 @@ mod tests {
             })
         );
         let unordered = ConsumerOffsetsWire {
+            owner_retirement: None,
+            owners: Vec::new(),
+            history_transition: None,
             dedup_capacity: consensus::CLIENTS_TABLE_MAX,
             required_metadata_frontier: 0,
             prepare_checksum: None,
             checkpoint_prepare: Vec::new(),
-            purge_generation: 0,
             next_offset: 0,
+            emptied_at: 0,
             consumers: Vec::new(),
             groups: vec![(9, 1), (4, 2)],
             external_groups: Vec::new(),
@@ -1516,10 +1900,6 @@ impl PartitionStateTransferOffer {
 /// these lengths, so hash rounds that span them still describe `commit_op`.
 pub(crate) struct TransferPlan {
     commit_op: u64,
-    /// A purge truncates every file and restarts the offset space, so a size
-    /// that grew back past its planned length would pass the size re-check
-    /// while the stamps describe post-purge bytes at pre-purge offsets.
-    purge_generation: u64,
     /// `(start_offset, len, log_path)` of each non-empty segment.
     segments: Vec<(u64, u64, String)>,
     offsets: ConsumerOffsetsWire,
@@ -1672,7 +2052,7 @@ impl fmt::Display for PartitionTransferUnavailable {
 impl std::error::Error for PartitionTransferUnavailable {}
 
 /// Outcome of a completed install. Offset files must land before the installed
-/// commit floor advances. A failed purge-generation record remains retryable.
+/// commit floor advances.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PartitionInstallOutcome {
     /// The consensus op the install applied. Named for what it holds: every
@@ -1681,9 +2061,6 @@ pub struct PartitionInstallOutcome {
     /// `installed_frontier`), and op-vs-offset confusion is what produced this
     /// PR's durability defects.
     pub applied_commit_op: u64,
-    /// The offered purge generation was already recorded or persisted during
-    /// this install. False means a restart may repeat the purge and transfer.
-    pub purge_generation_recorded: bool,
 }
 
 /// Failure installing a transferred partition state.
@@ -1725,6 +2102,8 @@ pub enum PartitionInstallError {
     /// would unlink them. Such an offer can come from a primary that lost its
     /// directory, and a receiver that only holds external group offsets has
     /// no message offset for [`Self::OfferRewindsDurableData`] to protect.
+    /// An offer whose table a committed delete emptied after this replica's
+    /// last applied op is installed instead.
     OfferErasesDurableOffsets {
         local_offsets: usize,
     },
@@ -1745,11 +2124,13 @@ pub enum PartitionInstallError {
         previous_end: u64,
         next_start: u64,
     },
-    /// Filesystem failure at/after the swap; disk holds a contiguous prefix
-    /// of the new state and a crash-restart recovers it (see the module
-    /// crash-window notes). The IN-MEMORY partition is converged to an
-    /// empty, honestly-lagging state before this returns, so the live
-    /// process stays serviceable and the normal triggers re-transfer.
+    /// A writer sync or backup preparation failure returns before the swap;
+    /// the old in-memory partition remains in place and may be fenced.
+    /// At/after the swap, disk holds a contiguous prefix of the new state
+    /// and a crash-restart recovers it (see the module crash-window notes).
+    /// On the storeless post-swap failure path, the IN-MEMORY partition is
+    /// converged to an empty, honestly-lagging state before this returns,
+    /// so the live process stays serviceable and the normal triggers re-transfer.
     SwapIo {
         path: String,
         source: std::io::Error,
@@ -1769,10 +2150,8 @@ pub enum PartitionInstallError {
         source: iggy_common::IggyError,
         /// The offer's frontier, carried because the LIVE counter is not it on
         /// this path: a mutate failure can leave the counter at its pre-install
-        /// value, and under an advancing purge generation that value is above
-        /// the group's. The fence records this instead, or it would stamp the
-        /// stale counter over the reset the install already made and then
-        /// quarantine the segments that would have contradicted it.
+        /// value, which can lag the group's. The fence records this instead of
+        /// the stale counter.
         frontier: u64,
     },
 }
@@ -1866,22 +2245,19 @@ fn staging_paths(partition_dir: &str, start_offset: u64) -> (PathBuf, PathBuf) {
 
 /// Every entry of one partition directory, as paths.
 ///
-/// Enumeration only: callers keep their own predicates and their own
-/// error policies (propagate / silent skip / log-and-fail), which is what
-/// `sweep_staging_except`'s do-not-widen warning depends on.
+/// Boot recovery must refuse an incomplete listing before changing segments.
 pub(crate) async fn segment_dir_entries(partition_dir: &str) -> std::io::Result<Vec<PathBuf>> {
     let partition_dir = partition_dir.to_owned();
     server_common::fs_utils::run_blocking("iggy-segment-scan", move || {
-        Ok(std::fs::read_dir(partition_dir)?
-            .flatten()
-            .map(|entry| entry.path())
-            .collect())
+        std::fs::read_dir(partition_dir)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect()
     })
     .await
 }
 
 /// Remove physical tails outside the logical segment list after draining the WAL.
-/// The owner has settled its writers and published a purge or install backup.
+/// The owner has settled its writers and published an install backup.
 pub(crate) async fn remove_public_segment_files(partition_dir: &str) -> std::io::Result<()> {
     let directory = PathBuf::from(partition_dir);
     run_blocking("iggy-segment-sweep", move || {
@@ -1940,8 +2316,8 @@ pub(crate) async fn clear_materialization_missing(directory: &str) -> std::io::R
 /// Move every segment file in `partition_dir` aside into `<dir>.fenced.<n>/`,
 /// returning the directory used.
 ///
-/// Boot recovery also supplies `wal_revision` to
-/// move the refused prepare WAL. Live callers leave it unset to retain open writers.
+/// Callers supply `wal_revision` to move the refused prepare WAL, once its
+/// writers are closed (boot recovery, or a live quarantine after its drain).
 ///
 /// The partition directory itself STAYS, and so do its two superblock slots:
 /// they hold the group's only durable `(view, log_view)`, and moving them would
@@ -2030,6 +2406,28 @@ pub async fn quarantine_partition_files(
     Ok(target)
 }
 
+/// Move the consumer offset files of `partition_dir` into the `fenced` copy
+/// [`quarantine_partition_files`] created, so a rebuild starts without the
+/// offsets the diverged history produced.
+///
+/// # Errors
+/// The underlying `std::io::Error`, with the same operator-facing semantics as
+/// [`quarantine_partition_files`].
+pub async fn quarantine_offsets(partition_dir: &str, fenced: &str) -> std::io::Result<()> {
+    match compio::fs::rename(
+        &Path::new(partition_dir).join(OFFSETS_DIR),
+        &Path::new(fenced).join(OFFSETS_DIR),
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    }
+    fsync_dir(fenced).await?;
+    fsync_dir(partition_dir).await
+}
+
 /// Unlink every staging file in `partition_dir` except `keep`.
 ///
 /// Best-effort disk hygiene shared by the reuse scan and the install: a file
@@ -2038,10 +2436,10 @@ pub async fn quarantine_partition_files(
 /// function -- it deletes the live chain as well and must propagate its
 /// errors.
 /// Do NOT widen this predicate to the quarantine's four-suffix list if the two
-/// are ever unified: the keep-lists callers pass hold staging paths only (purge
-/// passes none), so a wider filter would unlink every live `.log` and `.index`
-/// on the partition -- worst at the reuse scan, which runs at descriptor-accept
-/// on a serving partition.
+/// are ever unified: the keep-lists callers pass hold staging paths only, so a
+/// wider filter would unlink every live `.log` and `.index` on the partition --
+/// worst at the reuse scan, which runs at descriptor-accept on a serving
+/// partition.
 pub(crate) async fn sweep_staging_except(partition_dir: &str, keep: HashSet<PathBuf>) {
     let partition_dir = partition_dir.to_owned();
     let _ = run_blocking("iggy-staging-sweep", move || {
@@ -2117,11 +2515,13 @@ pub(crate) struct PendingInstall {
     partition_dir: String,
     staged: Vec<StagedSegmentMeta>,
     offsets_wire: ConsumerOffsetsWire,
+    /// The emptied-at op the installed table keeps, `0` for none.
+    emptied_at: u64,
     planned_offsets: Vec<PlannedOffsetWrite>,
     next_offset: u64,
-    purge_advances: bool,
     phase: InstallPhase,
     drain: Option<crate::PersistenceDrain>,
+    synced_files: BTreeSet<PathBuf>,
     directory_handle: Option<compio::fs::File>,
     offset_dirs_changed: [bool; ConsumerKind::COUNT],
     /// Published with the offsets, replacing the local receipt table.
@@ -2130,7 +2530,6 @@ pub(crate) struct PendingInstall {
     retry_checkpoint: Vec<u8>,
     failure: Option<PartitionInstallError>,
     disposition: InstallDisposition,
-    purge_generation_recorded: bool,
 }
 
 enum InstallDisposition {
@@ -2155,7 +2554,6 @@ enum InstallPhase {
     CommitOffsets(usize),
     OffsetDirectories,
     Publish,
-    PurgeGeneration,
     RetryCheckpoint,
     WalReset,
     ResetDraining,
@@ -2182,9 +2580,9 @@ enum InstallFilePhase {
     OpenSegment(usize),
     EmptyDirectory,
     OldOffsets(ConsumerKind),
+    EmptiedMarker,
     CommitOffsets { start: usize, end: usize },
     OffsetDirectories,
-    PurgeGeneration,
     RetryCheckpoint,
     ReclaimRetry,
     FinishBackup,
@@ -2318,6 +2716,10 @@ where
         if self.partition_dir.is_none() {
             // Also defuses the in-memory trap where `segment.size` grows with
             // no bytes on disk ("simulated in-memory batch persistence").
+            // TODO: simulator cluster partitions have no directory, so the
+            // simulator never serves or installs a partition state transfer.
+            // A simulated replica that needs one stays behind until the
+            // simulator models partition state transfer.
             return Err(PartitionTransferUnavailable::NoPartitionDir);
         }
         if self.repair.is_some() {
@@ -2420,10 +2822,10 @@ where
         }
 
         // Re-validate the chain under the lock: the plan outlives the rounds
-        // that hash it, so GC could have unlinked a sealed segment or a purge
-        // could have planted a fresh file at a planned path. Every stamp would
-        // then describe bytes the offer no longer addresses, so refuse and let
-        // the requester ask again against the chain that exists now.
+        // that hash it, so GC could have unlinked a sealed segment or a
+        // replaced file could stand at a planned path. Every stamp would then
+        // describe bytes the offer no longer addresses, so refuse and let the
+        // requester ask again against the chain that exists now.
         {
             let write_lock = self.write_lock.clone();
             let _guard = write_lock.lock().await;
@@ -2435,11 +2837,10 @@ where
                 .collect();
             // Append-only within a segment instance, so a live size BELOW the
             // planned one means the file was replaced rather than extended.
-            let changed = plan.purge_generation != self.applied_purge_generation
-                || planned.iter().any(|(start_offset, size, _)| {
-                    live.get(start_offset)
-                        .is_none_or(|live_size| live_size < size)
-                });
+            let changed = planned.iter().any(|(start_offset, size, _)| {
+                live.get(start_offset)
+                    .is_none_or(|live_size| live_size < size)
+            });
             if changed {
                 return Err(PartitionTransferUnavailable::SegmentSetChanged);
             }
@@ -2465,20 +2866,11 @@ where
             return Err(PartitionTransferUnavailable::FlushPending);
         }
 
-        // An empty chain at frontier 0 tells the receiver to unlink its own, so
-        // serve it only when a recorded purge says the emptiness is the truth.
-        // Offset-only ops, such as external group commits, move the commit
-        // floor without a message, so a replica holding zero bytes passes the
-        // `NothingCommitted` gate above. Its empty chain would let a receiver at
-        // frontier 0 claim a history that neither replica holds.
-        // `install_state_transfer`'s `purge_advances` check re-decides the purge
-        // against the metadata plane and refuses the rest.
-        if segments.is_empty()
-            && plan.offsets.next_offset == 0
-            && plan.offsets.purge_generation == 0
-        {
-            return Err(PartitionTransferUnavailable::NothingCommitted);
-        }
+        // An empty chain at frontier 0 is real state: `complete_repair` lets a
+        // replica with no committed message jump its commit floor only past
+        // ops proven to hold none, so this primary holds every message the
+        // group committed. A receiver that holds data refuses an offer that
+        // would erase it.
         let offsets_bytes = Rc::new(plan.offsets.encode());
         let offsets_entry = consensus::StateArtifact::for_bytes(
             artifact_kind::CONSUMER_OFFSETS,
@@ -2516,7 +2908,6 @@ where
         }
         Ok(TransferPlan {
             commit_op: self.consensus().commit_min(),
-            purge_generation: self.applied_purge_generation,
             segments,
             offsets: self.offsets_wire_snapshot()?,
         })
@@ -2718,12 +3109,15 @@ where
             },
             checkpoint_prepare,
             prepare_checksum,
-            purge_generation: self.applied_purge_generation,
             next_offset,
+            emptied_at: self.durable_consumer_offsets.emptied_at(),
             consumers,
             groups,
             external_groups,
             dedup,
+            owners: self.consumer_group_owners.values().copied().collect(),
+            history_transition: self.history_transition,
+            owner_retirement: self.owner_retirement.clone(),
         })
     }
 
@@ -2971,19 +3365,14 @@ where
         commit_op: u64,
         staged: Vec<StagedSegmentMeta>,
         offsets_bytes: &[u8],
-        committed_purge_generation: u64,
         peer: u8,
     ) -> Result<(), PartitionInstallError> {
         if self.is_shutting_down() {
             return Err(PartitionInstallError::ShuttingDown);
         }
-        let pending = self.prepare_state_transfer_install(
-            commit_op,
-            staged,
-            offsets_bytes,
-            committed_purge_generation,
-            peer,
-        )?;
+        let pending =
+            self.prepare_state_transfer_install(commit_op, staged, offsets_bytes, peer)?;
+        self.cancel_primary_transfer();
         self.transition = Some(crate::iggy_partition::PendingPartitionTransition::Install(
             Box::new(pending),
         ));
@@ -3055,13 +3444,18 @@ where
             }
             InstallPhase::Drain => {
                 if let Some(persistence) = &self.persistence {
+                    if install.drain.is_none() {
+                        // Checkpoint syncs may be skipped when the frontier is unchanged.
+                        // The backup still needs proof from each original writer.
+                        install.synced_files = self.barrier_install_files_locked();
+                        install.disposition = InstallDisposition::Backup;
+                    }
                     self.start_persistence();
                     let drain = install
                         .drain
                         .get_or_insert_with(|| persistence.begin_drain());
                     match persistence.observe_drain(drain) {
                         Ok(true) => {
-                            install.disposition = InstallDisposition::Backup;
                             install.phase = InstallPhase::Backup;
                         }
                         Ok(false) => step = crate::PartitionIoStep::Pending,
@@ -3079,12 +3473,12 @@ where
             }
             InstallPhase::Frontier => {
                 let frontier = install.offsets_wire.next_offset;
-                let intent = if install.purge_advances {
-                    crate::iggy_partition::SuperblockIntent::Reset(frontier)
-                } else {
-                    crate::iggy_partition::SuperblockIntent::Install(frontier)
-                };
-                match self.transition_superblock(intent).await {
+                match self
+                    .transition_superblock(crate::iggy_partition::SuperblockIntent::Install(
+                        frontier,
+                    ))
+                    .await
+                {
                     crate::PartitionIoVerdict::Pending => step = crate::PartitionIoStep::Pending,
                     crate::PartitionIoVerdict::Failed => self.fail_install(
                         &mut install,
@@ -3118,8 +3512,8 @@ where
                 self.clear_install_journal();
                 install.phase = InstallPhase::OldOffsets(Some(ConsumerKind::Consumer));
             }
-            InstallPhase::OldOffsets(None) => {
-                self.clear_install_offsets();
+            InstallPhase::OldOffsets(None) if self.emptied_marker_path().is_none() => {
+                self.clear_install_offsets(install.emptied_at);
                 install.phase = InstallPhase::CommitOffsets(0);
             }
             InstallPhase::OldOffsets(Some(kind)) if self.consumer_offsets_dir(kind).is_none() => {
@@ -3134,24 +3528,12 @@ where
             }
             InstallPhase::Publish => {
                 self.publish_installed_state(&mut install);
-                install.phase = InstallPhase::PurgeGeneration;
-            }
-            InstallPhase::PurgeGeneration
-                if install.offsets_wire.purge_generation <= self.applied_purge_generation =>
-            {
                 install.phase = InstallPhase::RetryCheckpoint;
             }
             InstallPhase::RetryCheckpoint if self.persistence.is_none() => {
                 install.phase = InstallPhase::WalReset;
             }
             InstallPhase::WalReset => {
-                self.applied_purge_generation = self
-                    .applied_purge_generation
-                    .max(install.offsets_wire.purge_generation);
-                self.purge_deferred = false;
-                // The chain an unrecorded purge reset is gone, so a purge still
-                // owed here has to run whole.
-                self.unrecorded_purge_generation = None;
                 if let Some(persistence) = &self.persistence {
                     let prepare =
                         (!install.offsets_wire.checkpoint_prepare.is_empty()).then(|| {
@@ -3253,7 +3635,6 @@ where
                     || {
                         Ok(PartitionInstallOutcome {
                             applied_commit_op: install.commit_op,
-                            purge_generation_recorded: install.purge_generation_recorded,
                         })
                     },
                     Err,
@@ -3352,6 +3733,7 @@ where
                 file_job(crate::io::TransferFileJob::Backup {
                     directory: install.partition_dir.clone(),
                     begin: true,
+                    synced_files: install.synced_files.clone(),
                 }),
                 InstallFilePhase::Backup,
             ),
@@ -3454,6 +3836,17 @@ where
                     InstallFilePhase::OldOffsets(consumer_kind),
                 )
             }
+            // After the unlinks and before the renames, the order a committed
+            // delete or store keeps.
+            InstallPhase::OldOffsets(None) => (
+                file_job(crate::io::TransferFileJob::EmptiedMarker {
+                    path: self
+                        .emptied_marker_path()
+                        .ok_or(iggy_common::IggyError::CannotWriteToFile)?,
+                    emptied_at: install.emptied_at,
+                }),
+                InstallFilePhase::EmptiedMarker,
+            ),
             InstallPhase::CommitOffsets(cursor) => {
                 let end = (*cursor + OFFSET_PERSIST_CONCURRENCY).min(install.planned_offsets.len());
                 (
@@ -3495,18 +3888,11 @@ where
                     InstallFilePhase::OffsetDirectories,
                 )
             }
-            InstallPhase::PurgeGeneration => (
-                crate::PartitionIoJob::PurgeGeneration {
-                    path: format!("{}/{PURGE_GENERATION_FILE}", install.partition_dir),
-                    generation: install.offsets_wire.purge_generation,
-                    revision: self.created_revision,
-                },
-                InstallFilePhase::PurgeGeneration,
-            ),
             InstallPhase::FinishBackup => (
                 file_job(crate::io::TransferFileJob::Backup {
                     directory: install.partition_dir.clone(),
                     begin: false,
+                    synced_files: BTreeSet::new(),
                 }),
                 InstallFilePhase::FinishBackup,
             ),
@@ -3530,6 +3916,7 @@ where
                     directory: install.partition_dir.clone(),
                     offset_directories: ConsumerKind::ALL
                         .map(|kind| self.consumer_offsets_dir(kind).map(str::to_owned)),
+                    emptied_marker: self.emptied_marker_path(),
                     stranded_offsets: Box::new(ConsumerKind::ALL.map(|kind| {
                         let capacity = self.consumer_offset_capacity_for(kind);
                         let mut known = HashSet::with_capacity(capacity.stranded_count());
@@ -3583,6 +3970,10 @@ where
                 InstallFilePhase::Sweep => InstallPhase::RenameIndexes(0),
                 InstallFilePhase::RenameIndex(cursor) => InstallPhase::RenameIndexes(cursor + 1),
                 InstallFilePhase::RenameLog(cursor) => InstallPhase::RenameLogs(cursor + 1),
+                InstallFilePhase::EmptiedMarker => {
+                    self.clear_install_offsets(install.emptied_at);
+                    InstallPhase::CommitOffsets(0)
+                }
                 InstallFilePhase::CommitOffsets { start, end } => {
                     for write in &install.planned_offsets[start..end] {
                         self.publish_transferred_offset(write);
@@ -3653,7 +4044,7 @@ where
                 }),
             (
                 InstallPhase::Submitted(InstallFilePhase::OldOffsets(consumer_kind)),
-                crate::PartitionIoResult::PurgeOffsets(outcome),
+                crate::PartitionIoResult::OffsetCleanup(outcome),
             ) => {
                 let kind = consumer_kind.index();
                 let capacity = self.consumer_offset_capacity_for(consumer_kind);
@@ -3700,16 +4091,6 @@ where
                         source: std::io::Error::other("consumer offset directory sync failed"),
                     })
                 }),
-            (
-                InstallPhase::Submitted(InstallFilePhase::PurgeGeneration),
-                crate::PartitionIoResult::PurgeGeneration(outcome),
-            ) => {
-                if let Err(error) = outcome {
-                    tracing::warn!(%error, "installed purge generation could not be recorded");
-                    install.purge_generation_recorded = false;
-                }
-                Ok(InstallPhase::RetryCheckpoint)
-            }
             (
                 InstallPhase::Submitted(InstallFilePhase::RetryCheckpoint),
                 crate::PartitionIoResult::RetryCheckpoint(outcome),
@@ -3781,11 +4162,13 @@ where
         self.log.journal_mut().info = crate::log::JournalInfo::default();
     }
 
-    fn clear_install_offsets(&mut self) {
+    /// Clear the offset table for the installed one, which keeps `emptied_at`.
+    fn clear_install_offsets(&mut self, emptied_at: u64) {
         self.consumer_offsets.pin().clear();
         self.consumer_group_offsets.pin().clear();
         self.last_polled_offsets.pin().clear();
         self.durable_consumer_offsets.clear();
+        self.durable_consumer_offsets.set_emptied_at(emptied_at);
         self.pending_consumer_offset_commits.clear();
         for kind in ConsumerKind::ALL {
             self.consumer_offset_capacity_for(kind)
@@ -3824,6 +4207,16 @@ where
         self.required_metadata_frontier = self
             .required_metadata_frontier
             .max(install.offsets_wire.required_metadata_frontier);
+        self.consumer_group_owners = install
+            .offsets_wire
+            .owners
+            .iter()
+            .map(|installed| (installed.installation.group_id, *installed))
+            .collect();
+        self.consumer_group_polls.clear();
+        self.history_transition = install.offsets_wire.history_transition;
+        self.owner_retirement
+            .clone_from(&install.offsets_wire.owner_retirement);
         let end = install.next_offset.saturating_sub(1);
         self.offset.store(end, Ordering::Release);
         self.dirty_offset.store(end, Ordering::Relaxed);
@@ -3863,8 +4256,13 @@ where
         }
         consensus.clear_pipeline();
         consensus.advance_commit_max(install.commit_op);
+        // The cleared journal and pipeline held any unapplied install, and the
+        // checkpoint already carries every owner installed up to commit_op.
+        self.pending_owner_install.set(None);
+        self.owner_install_barrier = 0;
         self.observed_view = self.consensus().view();
         self.repair = None;
+        self.forget_recovered_commit();
         self.transfer_offer_cache.borrow_mut().take();
     }
 
@@ -3872,11 +4270,11 @@ where
         self.invalidate_poll_history();
         self.log.invalidate_sealed_read_state();
         while self.log.retire_front().is_some() {}
-        // Same as a completed install: no chain an unrecorded purge reset
-        // survives this, so a purge still owed here has to run whole.
-        self.unrecorded_purge_generation = None;
         self.clear_install_journal();
-        self.clear_install_offsets();
+        // The journal wipe took the bodies of the pipeline's prepares, and its
+        // queued requests were admitted under the history retired above.
+        self.consensus().clear_pipeline();
+        self.clear_install_offsets(0);
         self.segment_checksum_cache.borrow_mut().clear();
         self.reuse_scan_memo.borrow_mut().take();
         let end = install.offsets_wire.next_offset.saturating_sub(1);
@@ -3900,7 +4298,6 @@ where
         commit_op: u64,
         mut staged: Vec<StagedSegmentMeta>,
         offsets_bytes: &[u8],
-        committed_purge_generation: u64,
         peer: u8,
     ) -> Result<PendingInstall, PartitionInstallError> {
         // ---- check phase: nothing below may mutate live state. Staging
@@ -3920,22 +4317,31 @@ where
             });
         }
         // The install wipes the journal and rewinds the sequencer to
-        // `commit_op`. A committed op this replica journaled past it may be one
-        // the quorum counted, so the install refuses to erase it. Ops known
-        // only from heartbeats are not held (a transferring replica journals
-        // nothing), and repair fetches them after the install. Refusing on
+        // `commit_op`. The primary may have counted this replica's ack before
+        // its commit reached us. Acks wait for the contiguous WAL head, so
+        // protect held ops through that head as well as the known commit.
+        // Ops known only from heartbeats are not held: a transferring replica
+        // journals nothing, and repair fetches them after install. Refusing on
         // `commit_max` alone would refuse every offer under steady writes:
         // heartbeats carry the primary's `commit_min` past whatever op an offer
         // pinned.
         let commit_max = self.consensus().commit_max();
+        let held_max = self
+            .persistence
+            .as_ref()
+            .map_or(commit_max, |persistence| persistence.head().max(commit_max));
         let journal = &self.log.journal().inner;
-        if commit_op < commit_max && journal.holds_op_in(commit_op + 1..=commit_max) {
+        if commit_op < held_max && journal.holds_op_in(commit_op + 1..=held_max) {
             return Err(PartitionInstallError::StaleTransfer {
                 commit_op,
-                commit_min: commit_max,
+                commit_min: held_max,
             });
         }
         let offsets_wire = ConsumerOffsetsWire::decode(offsets_bytes)?;
+        offsets_wire.validate_owners(self.created_revision(), commit_op)?;
+        if self.history_deleted() && offsets_wire.history_transition != self.history_transition {
+            return Err(ConsumerOffsetsWireError::InvalidOwnership.into());
+        }
         let retry_table = checked_retry_table(&offsets_wire, commit_op, self.dedup().capacity())
             .map_err(PartitionInstallError::RetryProtection)?;
         if self.persistence.is_some()
@@ -3980,27 +4386,8 @@ where
         // `stamp_prepare_for_persistence` overwrites `base_offset` from this
         // counter and recomputes `batch_checksum` over it, so a rewound
         // counter persists different bytes and a different checksum on this
-        // replica than on the rest of the group. A purge is the one
-        // legitimate rewind, and the artifact carries the generation that
-        // proves one happened.
-        // Against the METADATA plane's committed generation, which the caller
-        // reads off durable state, NOT against `self.applied_purge_generation`:
-        // that one hydrates from `purge.gen`, which a kill before the purge's
-        // record step leaves absent or stale, so a post-restart rejoin of an
-        // ever-purged topic could see `offered > applied` and call it an
-        // advancing purge. That is the canonical rejoin, and treating it as a
-        // purge disables the `OfferRewindsDurableData` refusal below -- the
-        // one guard standing between an offer that rewinds this replica's
-        // offset space and its durable data.
-        // Second disjunct: this replica has NOT applied the committed purge, so
-        // its frontier still measures the pre-purge offset space and cannot be
-        // compared against a post-purge offer. Restricted to `next_offset == 0`
-        // -- the state a purge leaves before anything is appended -- so an
-        // origin that merely lags within the same purge era still fails the
-        // fence rather than rewinding this replica's durable post-purge data.
-        let purge_advances = offsets_wire.purge_generation > committed_purge_generation
-            || (self.applied_purge_generation < committed_purge_generation
-                && offsets_wire.next_offset == 0);
+        // replica than on the rest of the group.
+        //
         // The COMMITTED frontier, which is what an offer is comparable against:
         // `held_offset_frontier` reads 0 for a chain installed empty at frontier
         // N (its disk arm filters empty segments and the install clears the
@@ -4009,8 +4396,7 @@ where
         // point is not usable either -- it can stand a lease block high -- but
         // only on a solo group, which never receives an offer.
         let local_next_offset = self.offset_frontier();
-        if !purge_advances && local_next_offset > 0 && offsets_wire.next_offset < local_next_offset
-        {
+        if local_next_offset > 0 && offsets_wire.next_offset < local_next_offset {
             return Err(PartitionInstallError::OfferRewindsDurableData {
                 offer_next_offset: offsets_wire.next_offset,
                 local_next_offset,
@@ -4019,7 +4405,9 @@ where
         // The durable offset table has no frontier to compare, so the same
         // rule keys on what each side holds. A replica that only holds external
         // group offsets reads 0 above, and an offer that holds nothing at all
-        // would unlink every one of them.
+        // would unlink every one of them. That is right only when a committed
+        // delete this replica has not applied emptied the donor's table: every
+        // offset held here was gone at that op.
         let offer_holds_nothing = staged.is_empty()
             && offsets_wire.next_offset == 0
             && offsets_wire
@@ -4030,7 +4418,13 @@ where
             .into_iter()
             .map(|kind| self.durable_consumer_offsets.count(kind))
             .sum();
-        if !purge_advances && offer_holds_nothing && local_offsets > 0 {
+        // An op past the offer's own is not one the donor applied.
+        let emptied_at = if offsets_wire.emptied_at <= commit_op {
+            offsets_wire.emptied_at
+        } else {
+            0
+        };
+        if offer_holds_nothing && local_offsets > 0 && emptied_at <= commit_min {
             return Err(PartitionInstallError::OfferErasesDurableOffsets { local_offsets });
         }
         staged.sort_unstable_by_key(|meta| meta.start_offset);
@@ -4056,7 +4450,7 @@ where
         let retry_checkpoint = if self.persistence.is_some() {
             retry_checkpoint_bytes(
                 self.consensus().group(),
-                self.created_revision,
+                self.created_revision(),
                 commit_op,
                 &offsets_wire,
             )
@@ -4069,18 +4463,22 @@ where
             partition_dir,
             staged,
             offsets_wire,
+            emptied_at: if planned_offsets.is_empty() {
+                emptied_at
+            } else {
+                0
+            },
             planned_offsets,
             next_offset,
-            purge_advances,
             phase: InstallPhase::StageOffsets(0),
             drain: None,
+            synced_files: BTreeSet::new(),
             directory_handle: None,
             offset_dirs_changed: [false; ConsumerKind::COUNT],
             retry_table: Some(retry_table),
             retry_checkpoint,
             failure: None,
             disposition: InstallDisposition::Prepared,
-            purge_generation_recorded: true,
         })
     }
 
@@ -4094,16 +4492,11 @@ where
         commit_op: u64,
         staged: Vec<StagedSegmentMeta>,
         offsets_bytes: &[u8],
-        committed_purge_generation: u64,
     ) -> Result<PartitionInstallOutcome, PartitionInstallError> {
         let peer = self.consensus().primary_index(self.consensus().view());
-        let pending = self.prepare_state_transfer_install(
-            commit_op,
-            staged,
-            offsets_bytes,
-            committed_purge_generation,
-            peer,
-        )?;
+        let pending =
+            self.prepare_state_transfer_install(commit_op, staged, offsets_bytes, peer)?;
+        self.cancel_primary_transfer();
         self.transition = Some(crate::iggy_partition::PendingPartitionTransition::Install(
             Box::new(pending),
         ));
@@ -4116,7 +4509,11 @@ where
                 },
                 crate::PartitionIoStep::Pending => {
                     if let Some(persistence) = &self.persistence {
-                        if let Err(source) = persistence.drain_with_timeout().await
+                        if let Err(source) = persistence
+                            .drain_with_timeout(|timeout| {
+                                self.consensus().message_bus().sleep(timeout)
+                            })
+                            .await
                             && let Some(crate::iggy_partition::PendingPartitionTransition::Install(
                                 mut install,
                             )) = self.transition.take()
@@ -4376,21 +4773,6 @@ async fn verify_state_artifact_yielding(entry: &consensus::StateArtifact, bytes:
     hasher.finish() == entry.checksum
 }
 
-/// The purge generation an encoded consumer-offsets artifact carries, or `0`
-/// when it cannot be decoded.
-///
-/// Lets the shard refuse an offer built BEFORE a committed purge without
-/// duplicating the wire codec: the install's own generation handling only ever
-/// widens permission, so a stale offer would resurrect purged data with the
-/// local applied generation left at the newer value, which the reconciler's
-/// re-wipe gate then reads as "already applied".
-#[must_use]
-pub fn offered_purge_generation(offsets_bytes: &[u8]) -> u64 {
-    ConsumerOffsetsWire::decode(offsets_bytes)
-        .map(|wire| wire.purge_generation)
-        .unwrap_or_default()
-}
-
 pub(crate) fn numeric_offset_id(path: &str) -> Option<u32> {
     Path::new(path).file_name()?.to_str()?.parse().ok()
 }
@@ -4488,7 +4870,7 @@ where
             )
         })?;
         Ok(Path::new(directory)
-            .join(format!("prepares-{}", self.created_revision))
+            .join(format!("prepares-{}", self.created_revision()))
             .join(format!(
                 "{RETRY_CHECKPOINT_PREFIX}{through_op}{RETRY_CHECKPOINT_SUFFIX}"
             )))
@@ -4517,11 +4899,14 @@ where
             dedup_capacity: self.dedup().capacity(),
             required_metadata_frontier: self.required_metadata_frontier,
             dedup: self.dedup().watermarks_sorted(),
+            owners: self.consumer_group_owners.values().copied().collect(),
+            history_transition: self.history_transition,
+            owner_retirement: self.owner_retirement.clone(),
             ..Default::default()
         };
         Ok(retry_checkpoint_bytes(
             self.consensus().group(),
-            self.created_revision,
+            self.created_revision(),
             through_op,
             &wire,
         ))
@@ -4571,7 +4956,7 @@ where
             Ok(
                 cursor.take(RETRY_CHECKPOINT_MAGIC.len())? == RETRY_CHECKPOINT_MAGIC
                     && cursor.u64()? == self.consensus().group()
-                    && cursor.u64()? == self.created_revision
+                    && cursor.u64()? == self.created_revision()
                     && cursor.u64()? == through_op,
             )
         })()
@@ -4589,9 +4974,19 @@ where
         }
         let wire = ConsumerOffsetsWire::decode(cursor.remaining())
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        wire.validate_owners(self.created_revision(), through_op)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
         let table = checked_retry_table(&wire, through_op, self.dedup().capacity())
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
         *self.dedup_mut() = table;
+        self.history_transition = wire.history_transition;
+        self.owner_retirement = wire.owner_retirement;
+        self.consumer_group_polls.clear();
+        self.consumer_group_owners = wire
+            .owners
+            .iter()
+            .map(|installed| (installed.installation.group_id, *installed))
+            .collect();
         self.required_metadata_frontier = self
             .required_metadata_frontier
             .max(wire.required_metadata_frontier);

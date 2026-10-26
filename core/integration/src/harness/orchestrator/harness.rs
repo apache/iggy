@@ -16,13 +16,14 @@
 // under the License.
 
 use super::builder::TestHarnessBuilder;
-use crate::harness::config::{ClientConfig, JwksConfig};
+use crate::harness::config::{ClientConfig, JWKS_ISSUER_USERNAME, JwksConfig};
 use crate::harness::context::TestContext;
 use crate::harness::error::TestBinaryError;
 use crate::harness::handle::{
     ClientBuilder, ClientHandle, ConnectorsRuntimeHandle, McpClient, McpHandle, ServerHandle,
     ServerLogs,
 };
+use crate::harness::peer_relay::PeerRelays;
 use crate::harness::traits::{Restartable, TestBinary};
 use futures::executor::block_on;
 use iggy::prelude::{ClientWrapper, IggyClient};
@@ -53,6 +54,7 @@ pub struct TestHarness {
     pub(super) jwks_config: Option<JwksConfig>,
     pub(super) jwks_server: Option<MockServer>,
     pub(super) started: bool,
+    pub(super) peer_relays: Option<PeerRelays>,
 }
 
 impl std::fmt::Debug for TestHarness {
@@ -144,7 +146,10 @@ impl TestHarness {
                     jwks_url.as_str(),
                 );
                 server.add_env("IGGY_HTTP_JWT_TRUSTED_ISSUERS_0_AUDIENCE", "iggy");
-                server.add_env("IGGY_HTTP_JWT_TRUSTED_ISSUERS_0_USER_ID", "1");
+                server.add_env(
+                    "IGGY_HTTP_JWT_TRUSTED_ISSUERS_0_USERNAME",
+                    JWKS_ISSUER_USERNAME,
+                );
             }
 
             self.jwks_server = Some(mock_server);
@@ -215,7 +220,6 @@ impl TestHarness {
             }
 
             const CLUSTER_READY_TIMEOUT: Duration = Duration::from_secs(15);
-            const CLUSTER_READY_RETRY_INTERVAL: Duration = Duration::from_millis(200);
 
             let deadline = Instant::now() + CLUSTER_READY_TIMEOUT;
 
@@ -226,28 +230,52 @@ impl TestHarness {
             // every later op as a gap. Gating on all nodes meshed means the
             // test runs against a fully constructed cluster with no late
             // joiners.
-            while Instant::now() < deadline
-                && !self.servers.iter().all(ServerHandle::replica_mesh_complete)
-            {
-                sleep(CLUSTER_READY_RETRY_INTERVAL).await;
-            }
-            if !self.servers.iter().all(ServerHandle::replica_mesh_complete) {
-                let per_node: Vec<String> = self
-                    .servers
-                    .iter()
-                    .enumerate()
-                    .map(|(i, s)| format!("node{i}={}", s.replica_mesh_complete()))
-                    .collect();
-                return Err(TestBinaryError::InvalidState {
-                    message: format!(
-                        "Timed out waiting for VSR replica mesh to form on all nodes [{}]",
-                        per_node.join(", ")
-                    ),
-                });
-            }
+            self.wait_for_every_node(
+                deadline,
+                ServerHandle::replica_mesh_complete,
+                "VSR replica mesh to form",
+            )
+            .await?;
+            // Admission needs a probe round, not an op. A backup credits a
+            // probe only after applying the commit it carries, so the login
+            // waits until then instead of racing it.
+            self.wait_for_every_node(
+                deadline,
+                ServerHandle::partition_admission_open,
+                "partition admission to open",
+            )
+            .await?;
 
             self.wait_for_login_ready(deadline).await
         }
+    }
+
+    async fn wait_for_every_node(
+        &self,
+        deadline: Instant,
+        ready: fn(&ServerHandle) -> bool,
+        what: &str,
+    ) -> Result<(), TestBinaryError> {
+        const RETRY_INTERVAL: Duration = Duration::from_millis(200);
+
+        while Instant::now() < deadline && !self.servers.iter().all(ready) {
+            sleep(RETRY_INTERVAL).await;
+        }
+        if self.servers.iter().all(ready) {
+            return Ok(());
+        }
+        let per_node: Vec<String> = self
+            .servers
+            .iter()
+            .enumerate()
+            .map(|(i, s)| format!("node{i}={}", ready(s)))
+            .collect();
+        Err(TestBinaryError::InvalidState {
+            message: format!(
+                "Timed out waiting for {what} on all nodes [{}]",
+                per_node.join(", ")
+            ),
+        })
     }
 
     /// Poll a root login until one succeeds or `deadline` passes.
@@ -361,6 +389,35 @@ impl TestHarness {
         Ok(())
     }
 
+    /// Stop every node at once: disconnect clients, stop dependents, send
+    /// SIGTERM to every running server, then wait for each in index order
+    /// with the usual grace and SIGKILL escalation. Each server's
+    /// [`ServerHandle::last_stop`] records its outcome.
+    ///
+    /// [`Self::stop`] stops one node at a time, so each later node shuts down
+    /// after its peers are already gone and its stop measures a different
+    /// shutdown from the first node's. Signalling every node first gives
+    /// every node the same one.
+    pub async fn stop_all_at_once(&mut self) -> Result<(), TestBinaryError> {
+        for client in &mut self.clients {
+            client.disconnect().await;
+        }
+        self.clients.clear();
+
+        for server in &mut self.servers {
+            server.stop_dependents()?;
+        }
+        for server in &mut self.servers {
+            server.signal_stop();
+        }
+        for server in &mut self.servers {
+            server.stop()?;
+        }
+
+        self.started = false;
+        Ok(())
+    }
+
     /// Restart the node at index 0 and reconnect all clients. Index 0 is not
     /// "the primary" (see [`Self::running_server`]); use
     /// [`Self::restart_node`] to name a different one.
@@ -436,10 +493,12 @@ impl TestHarness {
     }
 
     /// SIGKILL EVERY node, in ascending index order: the whole-cluster
-    /// power-loss shape, versus [`Self::restart_cluster`]'s graceful
+    /// crash shape, versus [`Self::restart_cluster`]'s graceful
     /// stop-all-then-start-all. The kills spread over at most a couple hundred
     /// milliseconds (a watchdog join plus a reap each), far below the 5s
-    /// heartbeat timeout, so no election starts between them. Restart via
+    /// heartbeat timeout, so no election starts between them. SIGKILL leaves
+    /// the page cache intact, so this is a process crash, not a power loss:
+    /// a write that reached the kernel survives without an fsync. Restart via
     /// [`Self::restart_cluster`].
     pub fn kill_cluster(&mut self) -> Result<(), TestBinaryError> {
         if self.servers.is_empty() {
@@ -539,6 +598,35 @@ impl TestHarness {
     /// Get reference to all servers.
     pub fn all_servers(&self) -> &[ServerHandle] {
         &self.servers
+    }
+
+    /// Cut every replica-to-replica link of node `index`: the live
+    /// connections through its relays are dropped and new ones are closed
+    /// until [`Self::heal_node`]. The node keeps running and its client ports
+    /// stay reachable, so clients still talk to it. Idempotent. Needs
+    /// [`TestHarnessBuilder::peer_relays`].
+    ///
+    /// The fault is a connection-reset partition, not a silent packet drop:
+    /// each side sees EOF or a reset at once and redials, and every redial is
+    /// closed on accept. A link to another isolated node stays cut until both
+    /// ends are healed.
+    pub fn isolate_node(&self, index: usize) -> Result<(), TestBinaryError> {
+        self.peer_relays()?.cut_node(index)
+    }
+
+    /// Restore every replica-to-replica link of node `index` that
+    /// [`Self::isolate_node`] cut. Idempotent.
+    pub fn heal_node(&self, index: usize) -> Result<(), TestBinaryError> {
+        self.peer_relays()?.heal_node(index)
+    }
+
+    fn peer_relays(&self) -> Result<&PeerRelays, TestBinaryError> {
+        self.peer_relays
+            .as_ref()
+            .ok_or_else(|| TestBinaryError::InvalidState {
+                message: "peer links are not relayed; build the harness with peer_relays()"
+                    .to_string(),
+            })
     }
 
     /// Number of requests the trusted-issuer JWKS mock has served, or 0 when no

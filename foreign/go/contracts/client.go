@@ -26,6 +26,19 @@ type Client interface {
 	// Close closes the client and releases all the resources.
 	Close() error
 
+	// ResolveOperation replays a retained mutation until its final result or ctx deadline.
+	// The client keeps the last outcomes that its replays proved, as many as the operation
+	// limit of tcp.WithPendingOperations, also across a session reset. So a later call for
+	// the same operation returns that outcome without a request. ierror.OperationNotRetained
+	// means that the client never proved the outcome, because a session reset or an abandon
+	// came first, or that the proven outcome aged out.
+	ResolveOperation(ctx context.Context, operationID uint64) error
+
+	// AbandonOperation forgets local recovery state; it cannot undo a server effect.
+	// A ResolveOperation that is still running keeps the lane until it ends, and the
+	// client keeps the outcome that it proves.
+	AbandonOperation(ctx context.Context, operationID uint64) error
+
 	// GetConnectionInfo returns the current connection information including protocol and server address
 	GetConnectionInfo() *ConnectionInfo
 
@@ -41,13 +54,19 @@ type Client interface {
 	// Authentication is required, and the permission to read the streams.
 	GetStreams(ctx context.Context) ([]Stream, error)
 
-	// CreateStream create a new stream.
+	// CreateStream create a new stream. Nil options select the defaults.
 	// Authentication is required, and the permission to manage the streams.
-	CreateStream(ctx context.Context, name string) (*StreamDetails, error)
+	//
+	// An invalid StreamOptions.EncryptionKey is refused before anything is
+	// sent. A valid one travels inside this request, so use TLS on an
+	// untrusted network. The server never returns the key: the returned
+	// stream reports only its source and fingerprints.
+	CreateStream(ctx context.Context, name string, options *StreamOptions) (*StreamDetails, error)
 
-	// UpdateStream update a stream by unique ID or name.
+	// UpdateStream patch a stream by unique ID or name: set the keys update
+	// names, leave every other key alone.
 	// Authentication is required, and the permission to manage the streams.
-	UpdateStream(ctx context.Context, streamId Identifier, name string) error
+	UpdateStream(ctx context.Context, streamId Identifier, update StreamUpdate) error
 
 	// DeleteStream delete a stream by unique ID or name.
 	// Authentication is required, and the permission to manage the streams.
@@ -61,42 +80,47 @@ type Client interface {
 	// Authentication is required, and the permission to read the topics.
 	GetTopics(ctx context.Context, streamId Identifier) ([]Topic, error)
 
-	// DescribeOptions get the option catalog for a resource scope: every key its
-	// create command accepts, with the kind, default and bounds of each.
+	// DescribeOptions get the option catalog for a resource scope: every key,
+	// with its kind, default and bounds, and whether an update may set or
+	// reset it.
 	// Authentication is required.
 	DescribeOptions(ctx context.Context, scope OptionsScope) ([]OptionSpec, error)
 
-	// CreateTopic create a new topic.
+	// GetMetadataChanges get one page of the server's metadata change log: the
+	// public results of committed metadata operations after a cursor, or a
+	// page of the current state with a current start. Keep the returned Next
+	// cursor and send it back to continue. Expired and reset answers mean the
+	// mirror rebuilds from current state pages.
+	// A query that breaks the request rules is refused with
+	// ierror.ErrInvalidCommand before anything is sent.
+	// Authentication is required, and the permission to manage the servers.
+	GetMetadataChanges(ctx context.Context, query MetadataChangesQuery) (*MetadataChanges, error)
+
+	// CreateTopic create a new topic. Nil options select the defaults.
 	// Authentication is required, and the permission to manage the topics.
 	//
-	// options carries topic option keys with no parameter of their own, for a key
-	// the server catalog gained after this build shipped; call DescribeOptions to
-	// see which keys a server accepts. A parameter above wins on collision.
+	// TopicOptions.Raw carries keys the server catalog gained after this build
+	// shipped. Call DescribeOptions to see which keys a server accepts.
 	CreateTopic(
 		ctx context.Context,
 		streamId Identifier,
 		name string,
-		partitionsCount uint32,
-		compressionAlgorithm CompressionAlgorithm,
-		messageExpiry Duration,
-		maxTopicSize uint64,
-		options ...HeaderEntry,
+		options *TopicOptions,
 	) (*TopicDetails, error)
 
-	// UpdateTopic update a topic by unique ID or name.
+	// UpdateTopic patch a topic by unique ID or name: set the keys update
+	// names, reset the keys it lists, leave every other key alone.
 	// Authentication is required, and the permission to manage the topics.
 	//
-	// options carries keys with no parameter of their own. The server refuses any
-	// key an update may not change, by name.
+	// A patch that changes nothing is refused before anything is sent, and so
+	// is a patch of typed fields that names a key it may not change. A patch
+	// with RawReset names or Options entries is checked by the server, whose
+	// catalog may be newer than this build.
 	UpdateTopic(
 		ctx context.Context,
 		streamId Identifier,
 		topicId Identifier,
-		name string,
-		compressionAlgorithm CompressionAlgorithm,
-		messageExpiry Duration,
-		maxTopicSize uint64,
-		options ...HeaderEntry,
+		update TopicUpdate,
 	) error
 
 	// DeleteTopic delete a topic by unique ID or name.
@@ -107,11 +131,8 @@ type Client interface {
 	// Authentication is required, and the permission to send the messages.
 	//
 	// The returned confirmations report where the server committed the batch.
-	// A send whose reply is lost to a dropped connection returns
-	// ErrDisconnected without a replay: a reconnect registers a fresh client
-	// identity, so the server could not deduplicate the replay against a
-	// batch that may have already committed. Retrying such a send is the
-	// caller's decision and may write the batch twice.
+	// An uncertain mutation returns ierror.OperationUncertain with its exact OperationID.
+	// ResolveOperation replays that retained identity; AbandonOperation releases its lane.
 	SendMessages(
 		ctx context.Context,
 		streamId Identifier,
@@ -123,12 +144,19 @@ type Client interface {
 	// PollMessages poll given amount of messages using the specified consumer and strategy from the specified stream and topic by unique IDs or names.
 	// Authentication is required, and the permission to poll the messages.
 	//
-	// Clustered auto-commit polls use persistent partition-primary connections
-	// while the coordinator retains group membership. Only explicit refusal
-	// before admission is retried. ErrTransientNotCommitted, or cancellation
-	// after sending a poll, can mean the offset advanced without a reply.
+	// Clustered polls use persistent partition-primary connections while the
+	// coordinator retains group membership. Only explicit refusal before
+	// admission is retried. ErrTransientNotCommitted, or cancellation after
+	// sending an auto-commit poll, can mean the offset advanced without a reply.
 	// These polls are never replayed automatically after an unknown outcome.
 	// Servers must support primary routing and consumer-session attachment.
+	//
+	// Without a caller-supplied partition context, a poll stamps the context
+	// of a cached route. After another client deleted and recreated the
+	// partition, one such poll can fail with ErrHistoryUnavailable, or with
+	// ErrConsumerGroupPartitionNotOwned for a consumer group that names the
+	// partition. The SDK drops the failed route and does not retry the poll.
+	// The next call routes again.
 	//
 	// A group poll that names no partition is orchestrated client-side and
 	// has three outcomes:
@@ -156,6 +184,12 @@ type Client interface {
 
 	// StoreConsumerOffset store the consumer offset for a specific consumer or consumer group for the given stream and topic by unique IDs or names.
 	// Authentication is required, and the permission to poll the messages.
+	// The partition context is read at store time, so a polled offset belongs in StoreConsumerPosition.
+	//
+	// The context comes from a cached route. After another client deleted and
+	// recreated the partition, one call can fail with ErrHistoryUnavailable, or
+	// with ErrConsumerGroupPartitionNotOwned for a consumer group. The SDK drops
+	// the failed route and does not retry the call. The next call routes again.
 	StoreConsumerOffset(
 		ctx context.Context,
 		consumer Consumer,
@@ -163,6 +197,18 @@ type Client interface {
 		topicId Identifier,
 		offset uint64,
 		partitionId *uint32,
+	) error
+
+	// StoreConsumerPosition stores a polled position under the partition context of its poll.
+	// A store that outlives an incarnation or owner change fails with ErrHistoryUnavailable or
+	// ErrConsumerGroupPartitionNotOwned instead of committing into the new incarnation.
+	// Authentication is required, and the permission to poll the messages.
+	StoreConsumerPosition(
+		ctx context.Context,
+		consumer Consumer,
+		streamId Identifier,
+		topicId Identifier,
+		position ConsumerPosition,
 	) error
 
 	// GetConsumerOffset get the consumer offset for a specific consumer or consumer group for the given stream and topic by unique IDs or names.
@@ -181,6 +227,12 @@ type Client interface {
 
 	// DeleteConsumerOffset delete the consumer offset for a specific consumer or consumer group for the given stream and topic by unique IDs or names.
 	// Authentication is required, and the permission to poll the messages.
+	//
+	// The partition context comes from a cached route. After another client
+	// deleted and recreated the partition, one call can fail with
+	// ErrHistoryUnavailable, or with ErrConsumerGroupPartitionNotOwned for a
+	// consumer group. The SDK drops the failed route and does not retry the
+	// call. The next call routes again.
 	DeleteConsumerOffset(
 		ctx context.Context,
 		consumer Consumer,
@@ -285,7 +337,7 @@ type Client interface {
 	// Authentication is required, and the permission to read the users.
 	GetUsers(ctx context.Context) ([]UserInfo, error)
 
-	// CreateUser create a new user.
+	// CreateUser create a new user. Nil options select the defaults.
 	// Authentication is required, and the permission to manage the users.
 	CreateUser(
 		ctx context.Context,
@@ -293,15 +345,16 @@ type Client interface {
 		password string,
 		status UserStatus,
 		permissions *Permissions,
+		options *UserOptions,
 	) (*UserInfoDetails, error)
 
-	// UpdateUser update a user by unique ID or username.
+	// UpdateUser patch a user by unique ID or username: set the keys update
+	// names, leave every other key alone.
 	// Authentication is required, and the permission to manage the users.
 	UpdateUser(
 		ctx context.Context,
 		userID Identifier,
-		username *string,
-		status *UserStatus,
+		update UserUpdate,
 	) error
 
 	// UpdatePermissions update the permissions of a user by unique ID or username.
@@ -322,7 +375,8 @@ type Client interface {
 	DeleteUser(ctx context.Context, identifier Identifier) error
 
 	// CreatePersonalAccessToken create a new personal access token for the currently authenticated user.
-	CreatePersonalAccessToken(ctx context.Context, name string, expiry uint32) (*RawPersonalAccessToken, error)
+	// The expiry is the token lifetime in microseconds. IggyExpiryServerDefault and IggyExpiryNeverExpire create a token that never expires.
+	CreatePersonalAccessToken(ctx context.Context, name string, expiry Duration) (*RawPersonalAccessToken, error)
 
 	// DeletePersonalAccessToken delete a personal access token of the currently authenticated user by unique token name.
 	DeletePersonalAccessToken(ctx context.Context, name string) error
@@ -360,5 +414,20 @@ type Client interface {
 
 	// SendBinaryRequest sends a command code and payload and returns the raw response body.
 	// Session-control codes return ierror.ErrInvalidCommand without writing to the connection.
+	// Message sends, polls and consumer offset writes are stamped with the partition context
+	// their typed methods would capture, and keep it across retries. A send must name an
+	// explicit partition id: a balanced or key-partitioned send returns
+	// ierror.ErrFeatureUnavailable without writing, so use SendMessages for those.
 	SendBinaryRequest(ctx context.Context, code uint32, payload []byte) ([]byte, error)
+
+	// SendBinaryRequestToReplica sends a command code and payload to the replica with id
+	// replicaID, for example to read the stats that replica keeps for itself, and returns
+	// that replica's raw response body. Replica ids are the ones GetClusterMetadata returns.
+	// The request carries the session's metadata watermark, so the replica answers once it
+	// applied the metadata the session saw. Session-control codes, replicated commands,
+	// polls and consumer offset reads return ierror.ErrInvalidCommand without writing to
+	// the connection. An id the roster does not name returns ierror.ErrInvalidIdentifier.
+	// The replica's own refusal, such as ierror.ErrNotPrimary, is returned and never
+	// retried on another replica.
+	SendBinaryRequestToReplica(ctx context.Context, code uint32, payload []byte, replicaID uint8) ([]byte, error)
 }

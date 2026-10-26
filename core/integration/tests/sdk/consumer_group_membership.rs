@@ -23,8 +23,9 @@ use futures::StreamExt;
 use iggy::prelude::locking::IggyRwLockFn;
 use iggy::prelude::*;
 use iggy_common::{BinaryTransport, ConsumerGroupClientState};
+use integration::harness::wait_for_consumer_group_assignment;
 use integration::iggy_harness;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 
 const STREAM_NAME: &str = "cg-membership-stream";
 const TOPIC_NAME: &str = "cg-membership-topic";
@@ -35,6 +36,7 @@ const CONSUMER_GROUP_NAME: &str = "cg-membership-group";
 const PARK_TIMEOUT: Duration = Duration::from_secs(2);
 // Generous bound: on regression the poll hangs until this elapses.
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
+const ASSIGNMENT_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 // Legacy wire error codes for the join/leave failure ladder. Pinned as literals
 // (not derived from `IggyError`) so renumbering the wire contract fails here
@@ -46,10 +48,9 @@ const CONSUMER_GROUP_MEMBER_NOT_FOUND: u32 = 5006;
 
 // Every spec here pins a 60s server heartbeat because harness clients never
 // ping on their own: the SDK pinger is spawned by `IggyClient::connect`, which
-// the harness builder does not call. At the shipped 30s interval a group member
-// that idles through another client's setup is reaped by the server's verifier,
-// and the failure surfaces as a short member count instead of anything about
-// the scenario under test.
+// the harness builder does not call. With heartbeat checks on, the server logs
+// out a group member that stays silent too long, and the failure surfaces as a
+// short member count instead of anything about the scenario under test.
 
 // A consumer-group member holding zero partitions has the same empty client-side
 // assignment as a non-member; only membership tells them apart. When the group
@@ -76,7 +77,10 @@ async fn given_group_member_holds_no_partitions_when_group_deleted_should_surfac
     let admin = clients.remove(0);
     let consumer_client = clients.remove(0);
 
-    admin.create_stream(STREAM_NAME).await.unwrap();
+    admin
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     admin
         .create_topic(
             &stream_id,
@@ -111,6 +115,7 @@ async fn given_group_member_holds_no_partitions_when_group_deleted_should_surfac
         .build();
     consumer.init().await.unwrap();
 
+    wait_for_assignment(&admin, 2).await;
     let group = admin
         .get_consumer_group(&stream_id, &topic_id, &group_id)
         .await
@@ -181,7 +186,10 @@ async fn given_member_holds_no_partitions_when_polled_should_report_no_assigned_
     let first_member = clients.remove(0);
     let second_member = clients.remove(0);
 
-    first_member.create_stream(STREAM_NAME).await.unwrap();
+    first_member
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     first_member
         .create_topic(
             &stream_id,
@@ -209,6 +217,7 @@ async fn given_member_holds_no_partitions_when_polled_should_report_no_assigned_
         .await
         .unwrap();
 
+    wait_for_assignment(&first_member, 2).await;
     let consumer = Consumer::group(group_id.clone());
     let owner_poll = first_member
         .poll_messages(
@@ -265,7 +274,10 @@ async fn given_member_that_does_not_auto_join_when_joined_by_the_caller_should_r
         .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
         .await
         .unwrap();
-    client.create_stream(STREAM_NAME).await.unwrap();
+    client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     client
         .create_topic(
             &stream_id,
@@ -348,7 +360,10 @@ async fn given_join_and_leave_failures_when_sent_over_the_wire_should_return_leg
         "join with a missing stream",
     );
 
-    root_client.create_stream(STREAM_NAME).await.unwrap();
+    root_client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     assert_rejected(
         root_client
             .join_consumer_group(&stream_id, &missing, &group_id)
@@ -431,7 +446,10 @@ async fn given_group_member_when_session_reset_should_forget_membership(harness:
         .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
         .await
         .unwrap();
-    client.create_stream(STREAM_NAME).await.unwrap();
+    client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     client
         .create_topic(
             &stream_id,
@@ -456,6 +474,7 @@ async fn given_group_member_when_session_reset_should_forget_membership(harness:
     let consumer = Consumer::group(group_id.clone());
     // The first group poll syncs the assignment, which is what registers the
     // membership in the transport cache.
+    wait_for_assignment(&client, 1).await;
     client
         .poll_messages(
             &stream_id,
@@ -515,6 +534,152 @@ async fn given_group_member_when_session_reset_should_forget_membership(harness:
         matches!(poll, Err(IggyError::ConsumerGroupMemberNotFound(..))),
         "expected ConsumerGroupMemberNotFound for a poll without a rejoin, got {poll:?}"
     );
+}
+
+#[iggy_harness(cluster_nodes = 3)]
+async fn given_weak_offset_durability_when_owner_changes_should_preserve_progress_after_crash(
+    harness: &mut TestHarness,
+) {
+    const MESSAGE_COUNT: u32 = 3;
+    const STORED_OFFSET: u64 = 1;
+    let predecessor = harness.tcp_root_client().await.unwrap();
+    let successor = harness.tcp_root_client().await.unwrap();
+    let stream_id = Identifier::named(STREAM_NAME).unwrap();
+    let topic_id = Identifier::named(TOPIC_NAME).unwrap();
+    let group_id = Identifier::named(CONSUMER_GROUP_NAME).unwrap();
+    let consumer = Consumer::group(group_id.clone());
+    predecessor
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
+    predecessor
+        .create_topic(
+            &stream_id,
+            TOPIC_NAME,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                durability: Durability::Replicated,
+                consumer_offset_durability: Durability::Replicated,
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    predecessor
+        .create_consumer_group(&stream_id, &topic_id, CONSUMER_GROUP_NAME)
+        .await
+        .unwrap();
+    predecessor
+        .join_consumer_group(&stream_id, &topic_id, &group_id)
+        .await
+        .unwrap();
+    wait_for_assignment(&predecessor, 1).await;
+    let mut messages: Vec<_> = (0..MESSAGE_COUNT)
+        .map(|offset| IggyMessage::from_str(&format!("record-{offset}")).unwrap())
+        .collect();
+    predecessor
+        .send_messages(
+            &stream_id,
+            &topic_id,
+            &Partitioning::partition_id(0),
+            &mut messages,
+        )
+        .await
+        .unwrap();
+    let polled = predecessor
+        .poll_messages(
+            &stream_id,
+            &topic_id,
+            Some(0),
+            &consumer,
+            &PollingStrategy::first(),
+            2,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(polled.messages.len(), 2);
+    let position = ConsumerPosition {
+        partition_id: 0,
+        offset: STORED_OFFSET,
+        context: polled.context,
+    };
+    predecessor
+        .store_consumer_position(&consumer, &stream_id, &topic_id, position)
+        .await
+        .unwrap();
+
+    let primary = integration::harness::disk::leader_node_index(harness).await;
+    harness
+        .kill_node((primary + 1) % harness.cluster_size())
+        .unwrap();
+    predecessor
+        .leave_consumer_group(&stream_id, &topic_id, &group_id)
+        .await
+        .unwrap();
+    successor
+        .join_consumer_group(&stream_id, &topic_id, &group_id)
+        .await
+        .unwrap();
+    wait_for_assignment(&successor, 1).await;
+    let resumed = successor
+        .poll_messages(
+            &stream_id,
+            &topic_id,
+            Some(0),
+            &consumer,
+            &PollingStrategy::next(),
+            MESSAGE_COUNT,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(resumed.messages.len(), 1);
+    assert_eq!(resumed.messages[0].header.offset, STORED_OFFSET + 1);
+    assert!(resumed.context.owner_generation > position.context.owner_generation);
+    assert_eq!(resumed.context.incarnation, position.context.incarnation);
+    assert!(matches!(
+        successor
+            .store_consumer_position(&consumer, &stream_id, &topic_id, position)
+            .await,
+        Err(IggyError::ConsumerGroupPartitionNotOwned(..))
+    ));
+
+    harness.kill_cluster().unwrap();
+    harness.restart_cluster().await.unwrap();
+    let recovered = harness.tcp_root_client().await.unwrap();
+    timeout(RESOLVE_TIMEOUT, async {
+        loop {
+            match recovered
+                .get_consumer_offset(&consumer, &stream_id, &topic_id, Some(0))
+                .await
+            {
+                Ok(Some(offset)) => {
+                    assert_eq!(offset.stored_offset, STORED_OFFSET);
+                    break;
+                }
+                // Right after a whole-cluster restart, every node can refuse
+                // the read while it recovers the partition.
+                Ok(None) | Err(IggyError::TransientNotAccepted) => {}
+                Err(error) => panic!("reading the recovered offset failed: {error}"),
+            }
+            sleep(ASSIGNMENT_POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("the installed owner's committed offset must survive whole-cluster crash");
+}
+
+async fn wait_for_assignment(client: &IggyClient, members_count: u32) {
+    wait_for_consumer_group_assignment(
+        client,
+        &Identifier::named(STREAM_NAME).unwrap(),
+        &Identifier::named(TOPIC_NAME).unwrap(),
+        &Identifier::named(CONSUMER_GROUP_NAME).unwrap(),
+        members_count,
+        RESOLVE_TIMEOUT,
+    )
+    .await;
 }
 
 /// The consumer-group cache lives on the transport `IggyClient` wraps.

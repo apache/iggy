@@ -17,7 +17,11 @@
 
 package vsr
 
-import ierror "github.com/apache/iggy/foreign/go/errors"
+import (
+	"crypto/rand"
+	"encoding/binary"
+	ierror "github.com/apache/iggy/foreign/go/errors"
+)
 
 // EncodeRequest returns the complete request frame for a command code and its
 // already-encoded payload.
@@ -37,7 +41,7 @@ func EncodeRequest(session *Session, code uint32, payload []byte) ([]byte, error
 //
 // frame must be at least HeaderSize bytes long.
 func StampRequestHeader(session *Session, code uint32, frame []byte) error {
-	if len(frame) > MaxFrameSize {
+	if len(frame) < HeaderSize || len(frame) > MaxFrameSize {
 		return ierror.ErrInvalidConfiguration
 	}
 	operation := OperationForCode(code)
@@ -55,9 +59,10 @@ func StampRequestHeader(session *Session, code uint32, frame []byte) error {
 	case OperationRegister:
 		request = session.BeginRegister()
 	case OperationNonReplicated:
-		// Non-replicated operations bypass server-side dedup and are routed by
-		// transport identity, so they travel sessionless before Register.
-		request = session.CurrentRequestID()
+		request, err = session.NextReadRequestID()
+		if err != nil {
+			return err
+		}
 		sessionID = session.SessionID()
 	default:
 		sessionID = session.SessionID()
@@ -80,5 +85,16 @@ func StampRequestHeader(session *Session, code uint32, frame []byte) error {
 		fields.NonReplicatedCode = code
 	}
 	EncodeRequestHeader((*[HeaderSize]byte)(frame[:HeaderSize]), fields)
+	if operation != OperationNonReplicated && operation < OperationSendMessages {
+		for {
+			if _, err := rand.Read(frame[requestOffsetChecksum : requestOffsetChecksum+16]); err != nil {
+				return err
+			}
+			if binary.LittleEndian.Uint64(frame[requestOffsetChecksum:]) != 0 ||
+				binary.LittleEndian.Uint64(frame[requestOffsetChecksum+8:]) != 0 {
+				break
+			}
+		}
+	}
 	return nil
 }

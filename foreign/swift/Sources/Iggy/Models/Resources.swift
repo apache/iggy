@@ -98,6 +98,8 @@ public enum MaxTopicSize: Sendable, Hashable {
 
 /// A stream as listed. Named `StreamInfo` so that a file importing
 /// Foundation, which has its own `Stream`, never sees an ambiguous type.
+/// ``options`` holds the keys the client set and the projections the server
+/// computes, such as ``encryptionKeySource``.
 public struct StreamInfo: Sendable, Hashable {
     public var id: UInt32
     public var createdAt: IggyTimestamp
@@ -146,30 +148,26 @@ public struct StreamDetails: Sendable, Hashable {
     }
 }
 
-/// A topic as listed.
+/// A topic as listed. Message expiry, compression and the size cap live in
+/// ``options``, read typed through ``messageExpiry``,
+/// ``compressionAlgorithm`` and ``maxTopicSize``.
 public struct Topic: Sendable, Hashable {
     public var id: UInt32
     public var createdAt: IggyTimestamp
     public var name: String
     public var sizeBytes: UInt64
-    public var messageExpiry: IggyExpiry
-    public var compressionAlgorithm: CompressionAlgorithm
-    public var maxTopicSize: MaxTopicSize
     public var messagesCount: UInt64
     public var partitionsCount: UInt32
     public var options: ResourceOptions
 
     public init(
-        id: UInt32, createdAt: IggyTimestamp, name: String, sizeBytes: UInt64, messageExpiry: IggyExpiry, compressionAlgorithm: CompressionAlgorithm,
-        maxTopicSize: MaxTopicSize, messagesCount: UInt64, partitionsCount: UInt32, options: ResourceOptions = [:]
+        id: UInt32, createdAt: IggyTimestamp, name: String, sizeBytes: UInt64, messagesCount: UInt64, partitionsCount: UInt32,
+        options: ResourceOptions = [:]
     ) {
         self.id = id
         self.createdAt = createdAt
         self.name = name
         self.sizeBytes = sizeBytes
-        self.messageExpiry = messageExpiry
-        self.compressionAlgorithm = compressionAlgorithm
-        self.maxTopicSize = maxTopicSize
         self.messagesCount = messagesCount
         self.partitionsCount = partitionsCount
         self.options = options
@@ -182,9 +180,6 @@ public struct TopicDetails: Sendable, Hashable {
     public var createdAt: IggyTimestamp
     public var name: String
     public var sizeBytes: UInt64
-    public var messageExpiry: IggyExpiry
-    public var compressionAlgorithm: CompressionAlgorithm
-    public var maxTopicSize: MaxTopicSize
     public var messagesCount: UInt64
     public var partitionsCount: UInt32
     public var partitions: [Partition]
@@ -195,9 +190,6 @@ public struct TopicDetails: Sendable, Hashable {
         createdAt = topic.createdAt
         name = topic.name
         sizeBytes = topic.sizeBytes
-        messageExpiry = topic.messageExpiry
-        compressionAlgorithm = topic.compressionAlgorithm
-        maxTopicSize = topic.maxTopicSize
         messagesCount = topic.messagesCount
         partitionsCount = topic.partitionsCount
         self.partitions = partitions
@@ -205,8 +197,36 @@ public struct TopicDetails: Sendable, Hashable {
     }
 }
 
+/// Immutable authority captured before a partition operation is sent.
+public struct PartitionContext: Sendable, Hashable {
+    /// Incarnation to which offsets and retry results belong. It changes only
+    /// when a partition id is reused after a delete.
+    public let incarnation: UInt64
+    public let ownerGeneration: UInt64
+    public let metadataOp: UInt64
+
+    public init(incarnation: UInt64, ownerGeneration: UInt64, metadataOp: UInt64) {
+        self.incarnation = incarnation
+        self.ownerGeneration = ownerGeneration
+        self.metadataOp = metadataOp
+    }
+
+    public static let empty = PartitionContext(incarnation: 0, ownerGeneration: 0, metadataOp: 0)
+
+    func encode(into writer: inout ByteWriter) {
+        writer.write(incarnation)
+        writer.write(ownerGeneration)
+        writer.write(metadataOp)
+    }
+
+    static func decode(from reader: inout ByteReader) throws -> PartitionContext {
+        try PartitionContext(incarnation: reader.readUInt64(), ownerGeneration: reader.readUInt64(), metadataOp: reader.readUInt64())
+    }
+}
+
 /// One partition of a topic.
 public struct Partition: Sendable, Hashable {
+    public var context: PartitionContext
     public var id: UInt32
     public var createdAt: IggyTimestamp
     public var segmentsCount: UInt32
@@ -214,7 +234,11 @@ public struct Partition: Sendable, Hashable {
     public var sizeBytes: UInt64
     public var messagesCount: UInt64
 
-    public init(id: UInt32, createdAt: IggyTimestamp, segmentsCount: UInt32, currentOffset: UInt64, sizeBytes: UInt64, messagesCount: UInt64) {
+    public init(
+        id: UInt32, createdAt: IggyTimestamp, segmentsCount: UInt32, currentOffset: UInt64, sizeBytes: UInt64, messagesCount: UInt64,
+        context: PartitionContext = .empty
+    ) {
+        self.context = context
         self.id = id
         self.createdAt = createdAt
         self.segmentsCount = segmentsCount
@@ -551,13 +575,15 @@ public struct TransportEndpoints: Sendable, Hashable {
 
 /// One node of the cluster roster.
 public struct ClusterNode: Sendable, Hashable {
+    public var replicaID: UInt8
     public var name: String
     public var ip: String
     public var endpoints: TransportEndpoints
     public var role: ClusterNodeRole
     public var status: ClusterNodeStatus
 
-    public init(name: String, ip: String, endpoints: TransportEndpoints, role: ClusterNodeRole, status: ClusterNodeStatus) {
+    public init(replicaID: UInt8, name: String, ip: String, endpoints: TransportEndpoints, role: ClusterNodeRole, status: ClusterNodeStatus) {
+        self.replicaID = replicaID
         self.name = name
         self.ip = ip
         self.endpoints = endpoints

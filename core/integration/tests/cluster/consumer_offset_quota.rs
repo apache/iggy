@@ -25,6 +25,7 @@ use iggy_binary_protocol::requests::consumer_offsets::{
 use iggy_binary_protocol::{AckLevel, WireConsumer, WireIdentifier};
 use integration::harness::{TestHarness, disk};
 use integration::iggy_harness;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::time::{Instant, sleep};
@@ -50,7 +51,7 @@ async fn given_replicated_partition_when_no_ack_offsets_mutate_should_converge_a
     let stream = Identifier::named(STREAM_NAME).expect("stream identifier");
     let topic = Identifier::named(TOPIC_NAME).expect("topic identifier");
     let stream_details = client
-        .create_stream(STREAM_NAME)
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
         .await
         .expect("create stream");
     let topic_details = client
@@ -84,6 +85,7 @@ async fn given_replicated_partition_when_no_ack_offsets_mutate_should_converge_a
     let address = harness.node(leader).tcp_addr().expect("leader TCP address");
     let mut raw = raw_tcp::connect_to(address).await;
     let session = raw_tcp::register_root(&mut raw, RAW_CLIENT_ID).await;
+    let context = raw_tcp::partition_context(&client, &stream, &topic, PARTITION_ID).await;
     let wire_stream = WireIdentifier::Numeric(stream_details.id);
     let wire_topic = WireIdentifier::Numeric(topic_details.id);
     let raw_consumer_id = 41;
@@ -97,13 +99,14 @@ async fn given_replicated_partition_when_no_ack_offsets_mutate_should_converge_a
         ack: AckLevel::NoAck,
     }
     .to_bytes();
-    let store_header = raw_tcp::request_header(
+    let mut store_header = raw_tcp::request_header(
         Operation::StoreConsumerOffset,
         RAW_CLIENT_ID,
         session,
         1,
         store.len(),
     );
+    context.stamp(&mut store_header);
     let (reply, _) = raw_tcp::exchange(&mut raw, &store_header, &store).await;
     assert_eq!(raw_tcp::reply_status(&reply), 0);
     wait_for_file_state(
@@ -123,13 +126,14 @@ async fn given_replicated_partition_when_no_ack_offsets_mutate_should_converge_a
         ack: AckLevel::NoAck,
     }
     .to_bytes();
-    let delete_header = raw_tcp::request_header(
+    let mut delete_header = raw_tcp::request_header(
         Operation::DeleteConsumerOffset,
         RAW_CLIENT_ID,
         session,
         2,
         delete.len(),
     );
+    context.stamp(&mut delete_header);
     let (reply, _) = raw_tcp::exchange(&mut raw, &delete_header, &delete).await;
     assert_eq!(raw_tcp::reply_status(&reply), 0);
     wait_for_file_state(
@@ -189,15 +193,20 @@ async fn given_replicated_partition_when_no_ack_offsets_mutate_should_converge_a
         .expect("pause one replica during group churn");
     for generation in 0..6 {
         let name = format!("quota-group-{generation}");
-        client
+        let group_id = client
             .create_consumer_group(&stream, &topic, &name)
             .await
-            .expect("create group");
+            .expect("create group")
+            .id;
         let group = Identifier::named(&name).expect("group identifier");
         client
             .join_consumer_group(&stream, &topic, &group)
             .await
             .expect("join group");
+        integration::harness::wait_for_consumer_group_assignment(
+            &client, &stream, &topic, &group, 1, WAIT,
+        )
+        .await;
         client
             .store_consumer_offset(
                 &Consumer::group(group.clone()),
@@ -208,29 +217,30 @@ async fn given_replicated_partition_when_no_ack_offsets_mutate_should_converge_a
             )
             .await
             .expect("store valid group offset");
+        // The cleanup wait below would also pass if the store never reached
+        // disk.
+        wait_for_group_offset_ids(
+            harness,
+            leader,
+            stream_details.id,
+            topic_details.id,
+            "group offset file did not reach disk",
+            |ids| ids.contains(&group_id),
+        )
+        .await;
         client
             .delete_consumer_group(&stream, &topic, &group)
             .await
             .expect("delete group metadata");
-        let deadline = Instant::now() + WAIT;
-        loop {
-            let ids = disk::consumer_offset_file_ids(
-                &harness.node(leader).data_path(),
-                stream_details.id,
-                topic_details.id,
-                PARTITION_ID,
-                ConsumerKind::ConsumerGroup,
-            )
-            .expect("group offset directory");
-            if ids.is_empty() {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "replicated cleanup did not delete {ids:?}"
-            );
-            sleep(Duration::from_millis(50)).await;
-        }
+        wait_for_group_offset_ids(
+            harness,
+            leader,
+            stream_details.id,
+            topic_details.id,
+            "replicated cleanup did not delete the group offset files",
+            BTreeSet::is_empty,
+        )
+        .await;
     }
     harness
         .restart_node(backup)
@@ -341,6 +351,35 @@ async fn wait_for_max_file_count(harness: &TestHarness, stream_id: u32, topic_id
             "consumer offset files did not converge at {max}: {counts:?}"
         );
         sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn wait_for_group_offset_ids(
+    harness: &TestHarness,
+    node: usize,
+    stream_id: u32,
+    topic_id: u32,
+    failure: &str,
+    converged: impl Fn(&BTreeSet<u32>) -> bool,
+) {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let ids = disk::consumer_offset_file_ids(
+            &harness.node(node).data_path(),
+            stream_id,
+            topic_id,
+            PARTITION_ID,
+            ConsumerKind::ConsumerGroup,
+        )
+        .expect("group offset directory");
+        if converged(&ids) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{failure}: node {node} holds {ids:?}"
+        );
+        sleep(Duration::from_millis(50)).await;
     }
 }
 

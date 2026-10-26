@@ -47,8 +47,8 @@ use tokio_util::sync::CancellationToken;
 use iggy_gateway_kafka::bridge::IggyBridge;
 use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
 use iggy_gateway_kafka::protocol::api::{
-    API_KEY_FETCH, API_KEY_PRODUCE, BrokerAdvertise, ConnectionState, GatewayState,
-    handle_connection_request, handle_request_bounded,
+    API_KEY_FETCH, API_KEY_PRODUCE, ConnectionState, GatewayState, handle_connection_request,
+    handle_request_bounded,
 };
 use iggy_gateway_kafka::records::{MAPPING_VERSION, TimestampWindow, VERSION_HEADER, to_iggy};
 
@@ -89,10 +89,8 @@ async fn gateway_with_topic(server: &TestServer, partitions: u32) -> GatewayStat
         .await
         .expect("the topic must exist before fetching from it");
     GatewayState::new(
-        BrokerAdvertise::default(),
         Some(Arc::new(bridge)),
         MAX_FRAME_SIZE,
-        false,
         0,
         GroupCoordinator::new(GroupCoordinatorConfig::default(), CancellationToken::new()),
     )
@@ -166,30 +164,39 @@ fn unmappable() -> IggyMessage {
         .expect("valid message")
 }
 
-/// Purges the topic, and waits until every partition reads empty.
-async fn purge(server: &TestServer) {
+/// Deletes the topic, creates it again through the gateway's bridge, and waits until each of its
+/// `partitions` reads empty.
+async fn recreate(server: &TestServer, state: &GatewayState, partitions: u32) {
     let client = raw_client(server).await;
     let stream = Identifier::named(STREAM).expect("valid stream name");
     let topic = Identifier::named(TOPIC).expect("valid topic name");
     client
-        .purge_topic(&stream, &topic)
+        .delete_topic(&stream, &topic)
         .await
-        .expect("purge the topic");
+        .expect("delete the topic");
+    state
+        .bridge
+        .as_ref()
+        .expect("the gateway has a bridge")
+        .ensure_stream_and_topic(TOPIC, partitions)
+        .await
+        .expect("create the topic again");
     let deadline = Instant::now() + PROMPT;
     loop {
-        let details = client
+        let empty = client
             .get_topic(&stream, &topic)
             .await
             .expect("read the topic")
-            .expect("the topic outlives a purge");
-        let empty = details
-            .partitions
-            .iter()
-            .all(|partition| partition.current_offset == 0 && partition.messages_count == 0);
+            .is_some_and(|details| {
+                details.partitions_count == partitions
+                    && details.partitions.iter().all(|partition| {
+                        partition.current_offset == 0 && partition.messages_count == 0
+                    })
+            });
         if empty {
             return;
         }
-        assert!(Instant::now() < deadline, "the purge never showed");
+        assert!(Instant::now() < deadline, "the new topic never read empty");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
@@ -249,8 +256,14 @@ async fn fetch_on(
     request
         .encode(&mut body, VERSION)
         .expect("the request encodes at this version");
-    let handled =
-        handle_connection_request(state, connection, API_KEY_FETCH, VERSION, body.freeze());
+    let handled = handle_connection_request(
+        state,
+        connection,
+        None,
+        API_KEY_FETCH,
+        VERSION,
+        body.freeze(),
+    );
     let mut response = tokio::time::timeout(PROMPT, handled)
         .await
         .expect("records or an error answer at once")
@@ -554,7 +567,7 @@ async fn given_minus_one_holds_on_two_connections_when_both_retry_should_keep_ea
     }
 
     // A read of partition 0 now finds nothing, so only a hold answers -1 there.
-    purge(&server).await;
+    recreate(&server, &state, 2).await;
     let at = |offset| request(TOPIC, &[(0, offset)]).with_max_wait_ms(0);
     assert_refused(
         only(&fetch_on(&state, &stuck_at_1, &at(1)).await),
@@ -568,6 +581,14 @@ async fn given_minus_one_holds_on_two_connections_when_both_retry_should_keep_ea
     assert_refused(
         only(&fetch_on(&state, &fresh, &at(2)).await),
         ERROR_NOT_LEADER_OR_FOLLOWER,
+    );
+
+    store(&server, 0, &[keyed(b"a"), keyed(b"b"), keyed(b"c")]).await;
+    let response = fetch_on(&state, &fresh, &at(2)).await;
+    assert_eq!(only(&response).error_code, ERROR_NONE);
+    assert_eq!(
+        values(only(&response)),
+        vec![Some(Bytes::from_static(b"c"))]
     );
 }
 

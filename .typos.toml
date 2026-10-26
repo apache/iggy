@@ -51,6 +51,9 @@ ublish = "ublish"
 mis = "mis"
 # CVE Numbering Authority; the ASF Security Team is the CNA for Apache projects
 CNA = "CNA"
+# MQTT command-line client and broker project name
+mosquitto = "mosquitto"
+Mosquitto = "Mosquitto"
 
 # Exclude auto-generated/non-editable files from typos check
 [files]
@@ -159,5 +162,9 @@ extend-exclude = [
     "**/wiremock/__files/*.json",
     # Swift SDK golden vectors dumped from the Rust crates (hex payloads)
     "foreign/swift/Tests/IggyTests/Fixtures/golden.json",
+    # Resource options fixture copies in every SDK test tree (hex payloads)
+    "**/resource_options.json",
+    # Metadata change fixture copies in every SDK test tree (hex and base64url payloads)
+    "**/metadata_changes.json",
     "**/.python-version",
 ]

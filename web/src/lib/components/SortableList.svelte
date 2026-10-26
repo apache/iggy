@@ -21,6 +21,7 @@ under the License.
   type ListItem = {
     id: string | number;
   };
+
   type Ordering<T> = { key: keyof T; asc: boolean } | { key: undefined; asc: undefined };
 
   function orderData<T>(data: T[], key: keyof T, asc: boolean) {
@@ -35,7 +36,7 @@ under the License.
 <script lang="ts" generics="T extends ListItem">
   import { run } from 'svelte/legacy';
 
-  import { asConst } from '$lib/utils/asConst';
+  import { asConst } from '#lib/utils/asConst.js';
 
   import { onNavigate } from '$app/navigation';
 
@@ -44,13 +45,15 @@ under the License.
   import Icon from './Icon.svelte';
 
   import { twMerge } from 'tailwind-merge';
-  import { noTypeCheck } from '$lib/utils/noTypeCheck';
+  import { noTypeCheck } from '#lib/utils/noTypeCheck.js';
 
   let animationEnabled = $state(true);
   let isAnimating = $state(false);
   let timeout: ReturnType<typeof setTimeout>;
 
-  onNavigate(() => {
+  onNavigate(({ shallow, type }) => {
+    if (shallow && type === 'goto') return;
+
     animationEnabled = false;
 
     return () => {

@@ -86,7 +86,10 @@ pub async fn run(harness: &TestHarness) {
     assert!(streams.is_empty());
 
     // 3. Create the stream
-    let stream = client.create_stream(STREAM_NAME).await.unwrap();
+    let stream = client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
 
     let stream_id = stream.id;
     assert_eq!(stream.name, STREAM_NAME);
@@ -126,7 +129,9 @@ pub async fn run(harness: &TestHarness) {
     assert_eq!(stream.name, STREAM_NAME);
 
     // 7. Try to create the stream with the same name and validate that it fails
-    let create_stream_result = client.create_stream(STREAM_NAME).await;
+    let create_stream_result = client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await;
     assert!(create_stream_result.is_err());
 
     // 9. Create the topic
@@ -156,11 +161,20 @@ pub async fn run(harness: &TestHarness) {
     assert_eq!(topic.id, topic_id);
     assert_eq!(topic.name, TOPIC_NAME);
     assert_eq!(topic.partitions_count, PARTITIONS_COUNT);
-    assert_eq!(topic.compression_algorithm, CompressionAlgorithm::default());
+    assert_eq!(
+        topic.resolved_options().compression_algorithm,
+        CompressionAlgorithm::default()
+    );
     assert_eq!(topic.size, 0);
     assert_eq!(topic.messages_count, 0);
-    assert_eq!(topic.message_expiry, IggyExpiry::NeverExpire);
-    assert_eq!(topic.max_topic_size, MaxTopicSize::Unlimited);
+    assert_eq!(
+        topic.resolved_options().message_expiry,
+        IggyExpiry::NeverExpire
+    );
+    assert_eq!(
+        topic.resolved_options().max_topic_size,
+        MaxTopicSize::Unlimited
+    );
 
     // 11. Get topic details by ID. The owning shards materialize fresh
     // partitions asynchronously after the commit, but the reply reports the
@@ -502,7 +516,15 @@ pub async fn run(harness: &TestHarness) {
 
     match result {
         Ok(_) => {
-            let consumer_group = get_consumer_group(&client).await;
+            let consumer_group = integration::harness::wait_for_consumer_group_assignment(
+                &client,
+                &Identifier::named(STREAM_NAME).unwrap(),
+                &Identifier::named(TOPIC_NAME).unwrap(),
+                &Identifier::named(CONSUMER_GROUP_NAME).unwrap(),
+                1,
+                TOPIC_CONVERGENCE_TIMEOUT,
+            )
+            .await;
             assert_eq!(consumer_group.id, consumer_group_id);
             assert_eq!(consumer_group.partitions_count, PARTITIONS_COUNT);
             assert_eq!(consumer_group.name, CONSUMER_GROUP_NAME);
@@ -611,9 +633,8 @@ pub async fn run(harness: &TestHarness) {
         .update_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             &Identifier::named(TOPIC_NAME).unwrap(),
-            &updated_topic_name,
             &TopicUpdateOptions {
-                compression_algorithm: Some(CompressionAlgorithm::Gzip),
+                name: Some(updated_topic_name.to_owned()),
                 message_expiry: Some(IggyExpiry::ExpireDuration(message_expiry_duration)),
                 max_topic_size: Some(updated_max_topic_size),
                 ..TopicUpdateOptions::default()
@@ -633,20 +654,15 @@ pub async fn run(harness: &TestHarness) {
 
     assert_eq!(updated_topic.name, updated_topic_name);
     assert_eq!(
-        updated_topic.message_expiry,
+        updated_topic.resolved_options().message_expiry,
         IggyExpiry::ExpireDuration(message_expiry_duration)
     );
     assert_eq!(
-        updated_topic.compression_algorithm,
-        CompressionAlgorithm::Gzip
+        updated_topic.resolved_options().max_topic_size,
+        updated_max_topic_size
     );
-    assert_eq!(updated_topic.max_topic_size, updated_max_topic_size);
-    // The three settings the update carries as fixed fields are mirrored into
-    // the stored map, so `options` cannot report a value the typed field has
-    // already moved past. Compared through the rendered value rather than the
-    // raw bytes: this scenario runs on every transport, and HTTP renders option
-    // values as readable strings where the binary transports carry the kind the
-    // server stored.
+    // The updated settings read back from the options map as explicit entries,
+    // the same on every transport.
     let expiry_key = HeaderKey::from_str(topic_option_keys::MESSAGE_EXPIRY).unwrap();
     let expiry = updated_topic
         .options
@@ -655,7 +671,7 @@ pub async fn run(harness: &TestHarness) {
     assert!(expiry.explicit, "an updated key is explicit");
     assert_eq!(
         expiry.value.to_string_value(),
-        u64::from(updated_topic.message_expiry).to_string()
+        u64::from(updated_topic.resolved_options().message_expiry).to_string()
     );
     let max_size_key = HeaderKey::from_str(topic_option_keys::MAX_TOPIC_SIZE).unwrap();
     let max_size = updated_topic
@@ -664,43 +680,8 @@ pub async fn run(harness: &TestHarness) {
         .expect("max topic size echoes back as an option");
     assert_eq!(
         max_size.value.to_string_value(),
-        u64::from(updated_topic.max_topic_size).to_string()
+        u64::from(updated_topic.resolved_options().max_topic_size).to_string()
     );
-
-    // 39. Purge the existing topic and ensure it has no messages
-    client
-        .purge_topic(
-            &Identifier::named(STREAM_NAME).unwrap(),
-            &Identifier::named(&updated_topic_name).unwrap(),
-        )
-        .await
-        .unwrap();
-
-    // The purge is applied by the owning shard's reconciler after the commit;
-    // poll until the wiped partition is observable.
-    let deadline = Instant::now() + TOPIC_CONVERGENCE_TIMEOUT;
-    let polled_messages = loop {
-        let polled_messages = client
-            .poll_messages(
-                &Identifier::named(STREAM_NAME).unwrap(),
-                &Identifier::named(&updated_topic_name).unwrap(),
-                Some(PARTITION_ID),
-                &consumer,
-                &PollingStrategy::offset(0),
-                MESSAGES_COUNT,
-                false,
-            )
-            .await
-            .unwrap();
-        if (polled_messages.current_offset == 0 && polled_messages.messages.is_empty())
-            || Instant::now() >= deadline
-        {
-            break polled_messages;
-        }
-        sleep(TOPIC_RETRY_INTERVAL).await;
-    };
-    assert_eq!(polled_messages.current_offset, 0);
-    assert!(polled_messages.messages.is_empty());
 
     // 40. Update the existing stream and ensure it's updated
     let updated_stream_name = format!("{STREAM_NAME}-updated");
@@ -708,8 +689,10 @@ pub async fn run(harness: &TestHarness) {
     client
         .update_stream(
             &Identifier::named(STREAM_NAME).unwrap(),
-            &updated_stream_name,
-            &StreamUpdateOptions::default(),
+            &StreamUpdateOptions {
+                name: Some(updated_stream_name.to_owned()),
+                ..StreamUpdateOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -721,49 +704,6 @@ pub async fn run(harness: &TestHarness) {
         .expect("Failed to get stream");
 
     assert_eq!(updated_stream.name, updated_stream_name);
-
-    // 41. Purge the existing stream and ensure it has no messages
-    let mut messages = create_messages();
-    client
-        .send_messages(
-            &Identifier::named(&updated_stream_name).unwrap(),
-            &Identifier::named(&updated_topic_name).unwrap(),
-            &Partitioning::partition_id(PARTITION_ID),
-            &mut messages,
-        )
-        .await
-        .unwrap();
-
-    client
-        .purge_stream(&Identifier::named(&updated_stream_name).unwrap())
-        .await
-        .unwrap();
-
-    // As with the topic purge above, the stream purge is applied by the
-    // owning shard's reconciler after the commit; poll until observable.
-    let deadline = Instant::now() + TOPIC_CONVERGENCE_TIMEOUT;
-    let polled_messages = loop {
-        let polled_messages = client
-            .poll_messages(
-                &Identifier::named(&updated_stream_name).unwrap(),
-                &Identifier::named(&updated_topic_name).unwrap(),
-                Some(PARTITION_ID),
-                &consumer,
-                &PollingStrategy::offset(0),
-                MESSAGES_COUNT,
-                false,
-            )
-            .await
-            .unwrap();
-        if (polled_messages.current_offset == 0 && polled_messages.messages.is_empty())
-            || Instant::now() >= deadline
-        {
-            break polled_messages;
-        }
-        sleep(TOPIC_RETRY_INTERVAL).await;
-    };
-    assert_eq!(polled_messages.current_offset, 0);
-    assert!(polled_messages.messages.is_empty());
 
     // 42. Delete the existing topic and ensure it doesn't exist anymore
     client
@@ -781,7 +721,10 @@ pub async fn run(harness: &TestHarness) {
 
     // 43. Create the stream
     let stream_name = format!("{STREAM_NAME}-auto");
-    let _ = client.create_stream(&stream_name).await.unwrap();
+    let _ = client
+        .create_stream(&stream_name, &StreamCreateOptions::default())
+        .await
+        .unwrap();
 
     let stream = client
         .get_stream(&Identifier::named(&stream_name).unwrap())
