@@ -499,13 +499,6 @@ impl Worker {
     }
 
     fn report(&mut self, error: IggyError) {
-        // No node accepted the request, so nothing changed and the retry repeats it.
-        if matches!(
-            error,
-            IggyError::TransientNotAccepted | IggyError::DeferredPollCapacityExceeded
-        ) {
-            return;
-        }
         if matches!(error, IggyError::ConsumerGroupMemberNotFound(..)) {
             self.joined.store(false, ORDERING);
             if self.auto_join {
@@ -865,12 +858,6 @@ impl Worker {
             }
             self.retry_at
                 .insert(completed.partition, Instant::now() + self.retry_interval);
-            if matches!(
-                error,
-                IggyError::TransientNotAccepted | IggyError::DeferredPollCapacityExceeded
-            ) {
-                return;
-            }
             completed.result = Err(error);
         }
         self.deliver(PrefetchedBatch {
@@ -983,7 +970,7 @@ impl Worker {
     }
 
     /// Membership and connection errors clear the fetch state. Other errors
-    /// make the partitions retry later, and the application sees all but 58.
+    /// make the partitions retry later, and the application sees them.
     fn fail_on_demand(&mut self, partitions: &[u32], error: IggyError) {
         match error {
             IggyError::ConsumerGroupPartitionNotOwned(..) => self.invalidate(),
@@ -1071,7 +1058,7 @@ mod tests {
                 let mut completed = completed.unwrap();
                 assert!(
                     matches!(completed.result, Err(IggyError::TransientNotAccepted)),
-                    "a timed-out fetch that commits nothing retries silently"
+                    "a timed-out fetch that commits nothing was not accepted"
                 );
                 completed.result = Err(IggyError::CannotReadMessage);
                 worker.complete(completed);
@@ -1115,7 +1102,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unaccepted_polls_retry_without_reaching_the_application() {
+    async fn refused_polls_reach_the_application_and_retry_later() {
         let consumer = IggyConsumerBuilder::new(
             IggyRwLock::new(ClientWrapper::Tcp(TcpClient::default())),
             "reader".into(),
@@ -1126,9 +1113,8 @@ mod tests {
             None,
         )
         .build();
-        let (sender, receiver) = mpsc::channel(consumer.prefetch_slots());
+        let (sender, mut receiver) = mpsc::channel(consumer.prefetch_slots());
         let mut worker = Worker::new(&consumer, sender);
-        let slots = worker.capacity.available_permits();
         for error in [
             IggyError::TransientNotAccepted,
             IggyError::DeferredPollCapacityExceeded,
@@ -1141,17 +1127,15 @@ mod tests {
                 result: Err(error.clone()),
                 capacity,
             });
-            worker.report(error);
             assert!(worker.retry_at.contains_key(&0), "the partition retries");
-            assert!(worker.pending_error.is_none());
-            assert_eq!(
-                worker.capacity.available_permits(),
-                slots,
-                "the reservation is released"
-            );
             assert!(
-                receiver.is_empty(),
-                "transient refusals are retried internally"
+                matches!(receiver.try_recv().unwrap().result, Err(ref fetched) if *fetched == error),
+                "a refused fetch reaches the application"
+            );
+            worker.report(error.clone());
+            assert!(
+                matches!(receiver.try_recv().unwrap().result, Err(ref reported) if *reported == error),
+                "a refused wait or refresh reaches the application"
             );
         }
     }
@@ -1392,7 +1376,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readiness_waits_cover_each_endpoint_once_and_retry_without_errors() {
+    async fn readiness_waits_cover_each_endpoint_once_and_retry_after_errors() {
         let (mut worker, mut receiver) = on_demand_worker(
             Consumer::group(Identifier::numeric(1).unwrap()),
             PollingStrategy::next(),
@@ -1426,7 +1410,15 @@ mod tests {
         });
         assert!(worker.retry_at.contains_key(&1), "the partition retries");
         assert!(worker.pending_error.is_none());
-        assert!(receiver.is_empty(), "the application never sees 58");
+        assert!(
+            matches!(
+                receiver.try_recv().unwrap().result,
+                Err(IggyError::TransientNotAccepted)
+            ),
+            "the application sees a refused wait"
+        );
+        // The application asks again after it took the error.
+        worker.on_demand.demand.store(true, ORDERING);
 
         worker.schedule();
         assert!(

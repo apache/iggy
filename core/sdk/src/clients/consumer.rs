@@ -459,6 +459,10 @@ fn same_incarnation_and_owner(left: PartitionContext, right: PartitionContext) -
 /// its byte limit is reached, or `max_wait` expires. `batch_length` is the maximum
 /// message count. The separate request timeout covers routing, waiting and reading.
 /// There is no normal polling interval; errors and reconnects retain retry backoff.
+/// A poll that is still refused when its request timeout ends, for example by a
+/// server at its deferred poll capacity, reaches the application as an error, and
+/// the consumer polls that partition again after
+/// [`polling_retry_interval`](crate::prelude::IggyConsumerBuilder::polling_retry_interval).
 ///
 /// # Positions and commits
 ///

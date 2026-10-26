@@ -2882,9 +2882,11 @@ async fn assert_cached_route_after_primary_loss(
         loop {
             match receiver.next().await.expect("the consumer must stay open") {
                 Ok(message) => break message,
-                // The fixture killed the old owner before polling, so the
-                // uncertain reply cannot hide admission of this new message.
-                Err(IggyError::TransientNotCommitted) => {}
+                // A readiness wait sent to the killed owner times out as not
+                // accepted, and an auto-commit poll as uncertain. The fixture
+                // killed it before polling, so the uncertain reply cannot hide
+                // admission of this new message.
+                Err(IggyError::TransientNotAccepted | IggyError::TransientNotCommitted) => {}
                 Err(error) => panic!("poll could not recover its cached data route: {error:?}"),
             }
         }

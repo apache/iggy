@@ -354,7 +354,10 @@ the server maximum. A disk read stops at its reservation and returns what it
 read, even below `min_count`. Configure
 `sharding.deferred_poll_*` accordingly. The response cap is applied to the selected
 result; it does not cap all storage work. Capacity refusal returns
-`DeferredPollCapacityExceeded` (90); clients back off on the same route. A replica
+`DeferredPollCapacityExceeded` (90); clients back off on the same route. A
+high-level consumer whose poll is still refused when its request timeout ends
+returns the error to the application and polls that partition again after
+`polling_retry_interval`. A replica
 that cannot serve a partition still returns `TransientNotAccepted` (58) or
 `NotPrimary` (89), prompting route refresh. Upgrade clients with code 90 support
 before enabling deferred polling against this server. Metrics expose pending polls, read reservations and
