@@ -453,10 +453,22 @@ impl IggyClient {
     /// `IggyExpiry.ServerDefault()` and `IggyExpiry.NeverExpire()` create a token
     /// that never expires.
     ///
-    /// If the reply is lost, the call raises `PendingOperationError` with the
-    /// operation ID. Call `resolve_operation` with that ID to learn the outcome.
+    /// The Python SDK cannot delete a token yet. Delete it by name with the
+    /// server's HTTP API.
+    ///
+    /// On TCP, QUIC, and WebSocket, a lost reply raises `PendingOperationError`
+    /// with `operation_id`. Call `resolve_operation` with that ID to learn the
+    /// outcome. When `kind` is `lane_blocked`, `operation_id` names an earlier
+    /// metadata operation, not this token.
+    ///
+    /// On HTTP, a lost reply raises `RuntimeError` with code 57, and the token may
+    /// exist. HTTP has no `resolve_operation`.
+    ///
+    /// A replayed create that already committed raises `RuntimeError` with code
+    /// 51 (`PersonalAccessTokenAlreadyExists`). A name clash raises the same code.
+    ///
     /// If the token was created, its secret cannot be recovered. Delete the token
-    /// by name and create it again to get a usable secret.
+    /// by name over HTTP, then create it again to get a usable secret.
     ///
     /// Args:
     ///     name: Token name as `str`.
@@ -467,9 +479,11 @@ impl IggyClient {
     ///
     /// Raises:
     ///     ValueError: If the expiry is invalid.
-    ///     RuntimeError: If the server refuses the request, for example because the
-    ///         name is invalid or the expiry is too far in the future.
-    ///     PendingOperationError: If the reply is lost. See above.
+    ///     RuntimeError: If the server refuses the request, for example because
+    ///         the expiry is too far in the future. An invalid name is refused
+    ///         before anything is sent.
+    ///     PendingOperationError: If the reply is lost on TCP, QUIC, or WebSocket.
+    ///         See above.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[str]", imports=("collections.abc")))]
     fn create_personal_access_token<'a>(
         &self,
