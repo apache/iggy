@@ -131,32 +131,8 @@ warning() {
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-# Keys go to curl in header files, never on its command line.
-TOKEN="${GITHUB_TOKEN:-$(gh auth token 2>/dev/null || true)}"
-printf 'Authorization: Bearer %s\n' "$TOKEN" > "$TMP/github-auth"
-
-# Prints the response body. Exits on a network or HTTP error.
-github() {
-  local method=$1 path=$2 data=${3:-} status
-  local args=(-sS -X "$method" -o "$TMP/github.json" -w '%{http_code}'
-    -H 'Accept: application/vnd.github+json'
-    -H 'X-GitHub-Api-Version: 2022-11-28')
-  if [[ -n $TOKEN ]]; then
-    args+=(-H "@$TMP/github-auth")
-  fi
-  if [[ -n $data ]]; then
-    args+=(-H 'Content-Type: application/json' --data-binary "$data")
-  fi
-  if ! status=$(curl "${args[@]}" "https://api.github.com$path" 2>"$TMP/github.err"); then
-    echo "GitHub $method $path: $(<"$TMP/github.err")" >&2
-    exit 1
-  fi
-  if [[ $status != 2?? ]]; then
-    echo "GitHub $method $path: HTTP $status $(<"$TMP/github.json")" >&2
-    exit 1
-  fi
-  cat "$TMP/github.json"
-}
+# shellcheck source-path=SCRIPTDIR
+source "$(dirname "${BASH_SOURCE[0]}")/lib/github.sh"
 
 # Sets LABELS to the area labels picked in the issue form.
 form_labels() {

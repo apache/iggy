@@ -56,6 +56,7 @@ jobs:
           sparse-checkout: |
             scripts/ci/pr-description-check.sh
             scripts/ci/lib/init.sh
+            scripts/ci/lib/github.sh
           sparse-checkout-cone-mode: false
           persist-credentials: false
 

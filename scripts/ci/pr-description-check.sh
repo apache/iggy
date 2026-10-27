@@ -63,24 +63,10 @@ fi
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-# The token goes to curl in a header file, never on its command line.
-TOKEN="${GITHUB_TOKEN:-$(gh auth token 2>/dev/null || true)}"
-ARGS=(-sS -o "$TMP/pr.json" -w '%{http_code}'
-  -H 'Accept: application/vnd.github+json'
-  -H 'X-GitHub-Api-Version: 2022-11-28')
-if [[ -n $TOKEN ]]; then
-  printf 'Authorization: Bearer %s\n' "$TOKEN" > "$TMP/auth"
-  ARGS+=(-H "@$TMP/auth")
-fi
-PR_PATH="/repos/$REPO/pulls/$PR"
-if ! STATUS=$(curl "${ARGS[@]}" "https://api.github.com$PR_PATH" 2>"$TMP/err"); then
-  echo "GitHub GET $PR_PATH: $(<"$TMP/err")" >&2
-  exit 1
-fi
-if [[ $STATUS != 2?? ]]; then
-  echo "GitHub GET $PR_PATH: HTTP $STATUS $(<"$TMP/pr.json")" >&2
-  exit 1
-fi
+# shellcheck source-path=SCRIPTDIR
+source "$(dirname "${BASH_SOURCE[0]}")/lib/github.sh"
+
+github GET "/repos/$REPO/pulls/$PR" > "$TMP/pr.json"
 
 # jq regexes anchor ^ and $ to the whole string, so line-based checks split
 # the body into lines first.
@@ -99,9 +85,9 @@ FOUND=$(jq -r '
   | ($body | split("\n") | map(select(test("^\\s*#") | not)) | join(" ")
      | gsub("\\s+"; " ") | sub("^ "; "") | sub(" $"; "")) as $prose
   # An explicit "N/A" or "None" under the issue heading is an answer.
-  # "#123" must stand alone, so a colour like #007bff or an entity like &#123;
-  # is not taken for an issue link.
-  | (if ($body | test("(^|[^\\w&])#\\d+\\b|github\\.com/apache/iggy/issues/\\d+") | not)
+  # "#123" or "owner/repo#123" must stand alone, so a colour like #007bff or
+  # an entity like &#123; is not taken for an issue link.
+  | (if ($body | test("(^|[^\\w&]|[\\w.-]+/[\\w.-]+)#\\d+\\b|github\\.com/apache/iggy/issues/\\d+") | not)
         and ($issue | split("\n") | any(test("^\\s*(N/A|None)\\b"; "i")) | not)
      then "Link the issue this PR addresses, for example `Closes #123` or `Relates to #123`, or write N/A under \"Which issue does this PR address?\"."
      else empty end),
