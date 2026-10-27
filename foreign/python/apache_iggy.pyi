@@ -1376,9 +1376,9 @@ class IggyClient:
         `RuntimeError` with code 300. Code 300 is also the generic HTTP error, so
         read the message to tell a name clash from other failures.
 
-        If the token was created, its secret cannot be recovered. Code 51 can also
-        mean a token that existed before this call. Confirm that this call created
-        the token before you delete it by name over HTTP, then create it again.
+        If the token was created, its secret cannot be recovered. Do not delete a
+        token by name after code 51, because code 51 can also mean a token that
+        existed before this call. Create the token again under a new name instead.
 
         Args:
             name: Token name as `str`.
