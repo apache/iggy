@@ -309,7 +309,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@v2.87.28
+        uses: taiki-e/install-action@v2.87.29
         with:
           tool: cargo-llvm-cov
 

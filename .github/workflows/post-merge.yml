@@ -63,7 +63,7 @@ jobs:
       - name: Plan affected edge images
         id: rail
         continue-on-error: true
-        uses: loadingalias/cargo-rail-action@2104429578cfeef1a6a5beb379c2202e0310df78 # v11.0.1
+        uses: loadingalias/cargo-rail-action@fd41439dfa862939e6928cb98d7e76de580f673c # v12.0.0
 
       - name: Check all components
         id: check
