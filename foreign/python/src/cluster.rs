@@ -110,7 +110,7 @@ impl TransportEndpoints {
 
 /// A node in the cluster with its transport endpoints, role, and status.
 #[gen_stub_pyclass]
-#[pyclass]
+#[pyclass(frozen)]
 pub struct ClusterNode {
     pub(crate) inner: RustClusterNode,
 }
@@ -176,7 +176,7 @@ impl ClusterNode {
 ///
 /// A server running without clustering reports itself as the only node.
 #[gen_stub_pyclass]
-#[pyclass]
+#[pyclass(frozen)]
 pub struct ClusterMetadata {
     pub(crate) inner: RustClusterMetadata,
 }
