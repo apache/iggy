@@ -18,7 +18,8 @@
 use async_trait::async_trait;
 use iggy::prelude::{
     Client, CompressionAlgorithm, Consumer, Identifier, IggyClient, IggyError, IggyMessage,
-    MessageClient, PollingStrategy, StreamClient, TopicClient, TopicCreateOptions,
+    MessageClient, PollingStrategy, StreamClient, StreamCreateOptions, TopicClient,
+    TopicCreateOptions,
 };
 use iggy_common::Durability;
 use iggy_connector_sdk::{
@@ -254,7 +255,13 @@ impl IggySource {
                      connector ID: {}",
                     self.config.upstream_stream, self.id
                 );
-                match client.create_stream(&self.config.upstream_stream).await {
+                match client
+                    .create_stream(
+                        &self.config.upstream_stream,
+                        &StreamCreateOptions::default(),
+                    )
+                    .await
+                {
                     Ok(_) | Err(IggyError::StreamNameAlreadyExists(_)) => {}
                     Err(e) => {
                         return Err(Error::InitError(format!(
