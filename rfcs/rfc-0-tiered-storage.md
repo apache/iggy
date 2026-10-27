@@ -2,7 +2,7 @@
 
 - Feature Name: `tiered_storage`
 - Start Date: 2026-09-29
-- RFC PR: [apache/iggy#0000](https://github.com/apache/iggy/pull/0000)
+- RFC PR: [apache/iggy#4404](https://github.com/apache/iggy/pull/4404)
 - Discussion: [apache/iggy#0000](https://github.com/apache/iggy/discussions/0000)
 - Iggy Issue: [apache/iggy#0000](https://github.com/apache/iggy/issues/0000)
 
