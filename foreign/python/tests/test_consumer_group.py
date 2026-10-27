@@ -2162,7 +2162,6 @@ class TestConsumerShutdown:
                     polling_strategy=PollingStrategy.First(),
                     batch_length=1,
                     auto_commit=AutoCommit.Interval(timedelta(hours=1)),
-                    poll_interval=timedelta(milliseconds=10),
                     **timeout_options,
                 )
                 await wait_for_consumer_group_assignment(
@@ -2213,7 +2212,6 @@ class TestConsumerShutdown:
                     polling_strategy=PollingStrategy.Next(),
                     batch_length=1,
                     auto_commit=AutoCommit.Disabled(),
-                    poll_interval=timedelta(milliseconds=10),
                 )
                 await wait_for_consumer_group_assignment(
                     iggy_client, stream, topic, group, members_count=1
