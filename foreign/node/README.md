@@ -78,11 +78,12 @@ partition primary; other commands use the metadata primary. One logical client
 owns a shared session, a monotonic request counter and one multiplexed link per
 replica. Healthy links survive primary changes. Each link dials the address
 that its node advertises in the cluster roster. With a one-node roster, the
-link dials the configured endpoint instead. A single node behind a port
-mapping or a port-forward thus stays reachable. The legacy `poolSize` option
-accepts only one logical client; it does not limit replica links or concurrency.
-The public `Client._pool` property has been removed. Applications should use the
-client methods directly; the client owns its replica connections.
+link dials the configured endpoint that reached the node instead. A single
+node behind a port mapping or a port-forward thus stays reachable. The legacy
+`poolSize` option accepts only one logical client; it does not limit replica
+links or concurrency. The public `Client._pool` property has been removed.
+Applications should use the client methods directly; the client owns its
+replica connections.
 
 A backup replica can miss a stream, topic or partition that the metadata primary
 already created. When such a replica replies "not found" (error 1009, 1010,
@@ -303,6 +304,11 @@ other SDKs: `tls`, `tls_domain`, `tls_ca_file`, `reconnection_retries`,
 `reconnection_interval`, `heartbeat_interval`, `nodelay`, `max_pending_operations`
 and `max_pending_operation_bytes`. `reestablish_after`
 is accepted for format compatibility but has no Node equivalent.
+
+The address can list several nodes of one cluster, separated by commas, as in
+`iggy://iggy:iggy@node-1:8090,node-2:8090`; a config object takes the nodes
+after the first as `fallbackEndpoints`. A new client tries each in order, then
+the nodes of the last roster that it read.
 
 note: `SimpleClient` does not accept a connection string: it wraps an existing
 `RawClient` instance rather than building one from configuration. Pass the

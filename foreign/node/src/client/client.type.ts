@@ -163,7 +163,7 @@ export type ReconnectOption = {
   interval: number,
   /**
    * Maximum retries per replica after the first attempt. Bootstrap retries
-   * sweep the configured seed and remembered endpoints. The budget limits one
+   * sweep the configured endpoints, then the remembered ones. The budget limits one
    * reconnect burst: while the client stays signed in, each heartbeat restarts
    * a replica link that used its budget, with a fresh budget.
    */
@@ -223,6 +223,11 @@ export type ClientConfig = {
   transport: TransportType,
   /** Transport-specific connection options */
   options: TransportOption,
+  /**
+   * Other nodes of the same cluster. A new client dials the node of `options`,
+   * then these in order, then the nodes of the last roster that it read.
+   */
+  fallbackEndpoints?: { host: string, port: number }[],
   /** Authentication credentials */
   credentials: ClientCredentials,
   /** Legacy logical-client count; does not limit replica links. */

@@ -95,18 +95,7 @@ export const parseConnectionString = (connectionString: string): ClientConfig =>
   if (serverAndOptions.length > 2)
     throw new TypeError('invalid connection string');
 
-  const serverAddress = serverAndOptions[0];
-  // One match covers both `[ipv6]:port` and `host:port`, where the
-  // unbracketed host may not contain a colon. Multi-colon authorities such
-  // as `2001:db8::1:8090` or `host:8090:9090` are rejected
-  const addressMatch = /^(?:\[([^\]]+)\]|([^:\[\]]+)):(\d+)$/.exec(serverAddress);
-  if (!addressMatch)
-    throw new TypeError('invalid connection string');
-
-  const host = addressMatch[1] ?? addressMatch[2];
-  const port = Number(addressMatch[3]);
-  if (port > 65535)
-    throw new TypeError('invalid connection string');
+  const [endpoint, ...fallbackEndpoints] = serverAndOptions[0].split(',').map(parseEndpoint);
 
   const options: ParsedConnectionOptions = serverAndOptions.length === 2
     ? parseConnectionOptions(serverAndOptions[1])
@@ -120,8 +109,7 @@ export const parseConnectionString = (connectionString: string): ClientConfig =>
   const config: ClientConfig = {
     transport: tls ? 'TLS' : 'TCP',
     options: {
-      host,
-      port: Number(port),
+      ...endpoint,
       ...transportOptions
     },
     credentials: tokenCredentials
@@ -131,6 +119,8 @@ export const parseConnectionString = (connectionString: string): ClientConfig =>
     // reconnection defaults even without query options.
     reconnect
   };
+  if (fallbackEndpoints.length > 0)
+    config.fallbackEndpoints = fallbackEndpoints;
   if (heartbeatInterval !== undefined)
     config.heartbeatInterval = heartbeatInterval;
   if (maxPendingOperations !== undefined)
@@ -139,6 +129,23 @@ export const parseConnectionString = (connectionString: string): ClientConfig =>
     config.maxPendingOperationBytes = maxPendingOperationBytes;
 
   return config;
+};
+
+/** Parses one entry of the address, which can list several nodes of one
+ * cluster separated by commas.
+ */
+const parseEndpoint = (address: string): { host: string, port: number } => {
+  // One match covers both `[ipv6]:port` and `host:port`, where the
+  // unbracketed host may not contain a colon. Multi-colon authorities such
+  // as `2001:db8::1:8090` or `host:8090:9090` are rejected
+  const addressMatch = /^(?:\[([^\]]+)\]|([^:\[\]]+)):(\d+)$/.exec(address.trim());
+  if (!addressMatch)
+    throw new TypeError('invalid connection string');
+
+  const port = Number(addressMatch[3]);
+  if (port > 65535)
+    throw new TypeError('invalid connection string');
+  return { host: addressMatch[1] ?? addressMatch[2], port };
 };
 
 type ParsedConnectionOptions = {

@@ -145,6 +145,25 @@ describe('normalizeClientConfig', () => {
       assert.throws(() => normalizeClientConfig({ ...config(), maxPendingOperationBytes }), /maxPendingOperationBytes/);
   });
 
+  it('keeps fallback endpoints and rejects malformed ones', () => {
+    const fallbackEndpoints = [{ host: 'node-2', port: 8090 }];
+    assert.deepEqual(
+      normalizeClientConfig({ ...config(), fallbackEndpoints }).fallbackEndpoints,
+      fallbackEndpoints
+    );
+    for (const malformed of [
+      'node-2:8090', [{ host: '', port: 8090 }], [{ host: 'node-2', port: 70000 }],
+      [{ host: 'node-2', port: 1.5 }], [{ host: 'node-2' }], [null]
+    ])
+      assert.throws(
+        () => normalizeClientConfig({
+          ...config(),
+          fallbackEndpoints: malformed
+        } as unknown as ClientConfig),
+        /fallbackEndpoints/
+      );
+  });
+
   it('supports TLS transport', () => {
     const normalized = normalizeClientConfig({
       ...config(),

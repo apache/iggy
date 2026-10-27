@@ -54,6 +54,17 @@ export const normalizeClientConfig = (
   if (!Number.isSafeInteger(maxPendingOperationBytes) || maxPendingOperationBytes <= 0)
     throw new TypeError('maxPendingOperationBytes must be a positive safe integer');
 
+  // A malformed entry would otherwise fail only as a dial error, after the
+  // client tried every other endpoint.
+  if (config.fallbackEndpoints !== undefined &&
+      (!Array.isArray(config.fallbackEndpoints) ||
+        !config.fallbackEndpoints.every((endpoint) =>
+          typeof endpoint?.host === 'string' && endpoint.host.length > 0 &&
+          Number.isInteger(endpoint.port) && endpoint.port >= 0 && endpoint.port <= 65535)))
+    throw new TypeError(
+      'fallbackEndpoints must be an array of { host, port } with a non-empty host and a port up to 65535'
+    );
+
   if ((config.poolSize?.min ?? 1) > 1 || (config.poolSize?.max ?? 1) > 1)
     throw new TypeError(
       'poolSize supports exactly one logical client; replica links are managed independently'

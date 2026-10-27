@@ -23,7 +23,7 @@ import type { AddressInfo, Socket } from 'node:net';
 import { createServer, type Server } from 'node:net';
 import type { Readable } from 'node:stream';
 import { describe, it, type TestContext } from 'node:test';
-import { createServer as createTlsServer } from 'node:tls';
+import { createServer as createTlsServer, type TLSSocket } from 'node:tls';
 import { groupConsumerStream, singleConsumerStream } from '../stream/consumer-stream.js';
 import { COMMAND_CODE } from '../wire/command.code.js';
 import { LEAVE_GROUP } from '../wire/consumer-group/leave-group.command.js';
@@ -1793,6 +1793,83 @@ describe('VSR client socket', () => {
       await client.sendCommand(COMMAND_CODE.GetStats, Buffer.alloc(0), { deadline: Date.now() + 2_000 });
       assert.equal(countCommand(server, COMMAND_CODE.BindSession), 1);
       assert.equal(framesOf(server, Operation.Register).length, 1);
+    } finally {
+      client.destroy();
+      await server.close();
+    }
+  });
+
+  it('signs in through the next configured endpoint when the first is down', async (context) => {
+    const gone = await startVsrServer(() => {});
+    const server = await startVsrServer((frame, socket) => singleNodeHandler(server.port)(frame, socket));
+    // Closed only once the live server listens, so the two never share a port.
+    await gone.close();
+    const dials = context.mock.method(IggyConnection.prototype, 'connect');
+    const client = new CommandResponseStream(`iggy://iggy:iggy@127.0.0.1:${gone.port},127.0.0.1:${server.port}` +
+      '?reconnection_retries=1&reconnection_interval=1ms&heartbeat_interval=0');
+    try {
+      await client.sendCommand(COMMAND_CODE.GetStats, Buffer.alloc(0), { deadline: Date.now() + 2_000 });
+      const dialed = dials.mock.calls.map((call) => (call.this as IggyConnection).config.options.port);
+      assert.deepEqual(dialed.slice(0, 2), [gone.port, server.port]);
+      assert.equal(client.isAuthenticated, true);
+    } finally {
+      client.destroy();
+      await server.close();
+    }
+  });
+
+  it('redials the configured endpoint that reached a single node', async (context) => {
+    const gone = await startVsrServer(() => {});
+    const unreachable = await startVsrServer(() => {});
+    const server = await startVsrServer((frame, socket) => {
+      if (frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.GetClusterMetadata) {
+        socket.write(replyFrame(frame, Operation.NonReplicated, singleNodeMetadataBody(unreachable.port)));
+        return;
+      }
+      singleNodeHandler(server.port)(frame, socket);
+    });
+    await Promise.all([gone.close(), unreachable.close()]);
+    const mapped = { host: '127.0.0.1', port: server.port };
+    const dials = context.mock.method(IggyConnection.prototype, 'connect');
+    const dialsTo = (port: number): number =>
+      dials.mock.calls.filter((call) => (call.this as IggyConnection).config.options.port === port).length;
+    const client = new CommandResponseStream({ ...vsrConfig(gone.port), fallbackEndpoints: [mapped],
+      heartbeatInterval: 0, reconnect: { enabled: true, interval: 1, maxRetries: 3 } });
+    try {
+      await client.sendCommand(COMMAND_CODE.GetStats, Buffer.alloc(0), { deadline: Date.now() + 2_000 });
+      const slot = (client as unknown as { replicas: Map<number, { dialEndpoint: unknown }> }).replicas.get(0);
+      assert.deepEqual(slot?.dialEndpoint, mapped);
+
+      for (const socket of server.sockets) socket.destroy();
+      await client.sendCommand(COMMAND_CODE.GetStats, Buffer.alloc(0), { deadline: Date.now() + 2_000 });
+      assert.equal(countCommand(server, COMMAND_CODE.BindSession), 1);
+      assert.equal(framesOf(server, Operation.Register).length, 1);
+      assert.equal(dialsTo(gone.port), 1);
+      assert.equal(dialsTo(server.port), 2);
+    } finally {
+      client.destroy();
+      await server.close();
+    }
+  });
+
+  it('sends the host of each dialed configured endpoint as the TLS server name', async () => {
+    const servernames = new Set<string | false | null>();
+    const gone = await startVsrServer(() => {});
+    const server = await startVsrServer((frame, socket) => {
+      servernames.add((socket as TLSSocket).servername);
+      singleNodeHandler(server.port)(frame, socket);
+    }, 'TLS');
+    await gone.close();
+    const client = new CommandResponseStream({
+      ...vsrConfig(gone.port),
+      transport: 'TLS',
+      options: { host: 'first.example.test', port: gone.port, family: 4, rejectUnauthorized: false,
+        lookup: (_hostname, _options, callback) => callback(null, '127.0.0.1', 4) },
+      fallbackEndpoints: [{ host: 'second.example.test', port: server.port }]
+    });
+    try {
+      await client.sendCommand(COMMAND_CODE.GetStats, Buffer.alloc(0), { deadline: Date.now() + 2_000 });
+      assert.deepEqual([...servernames], ['second.example.test']);
     } finally {
       client.destroy();
       await server.close();

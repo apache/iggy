@@ -270,6 +270,39 @@ describe('parseConnectionString', () => {
     }
   });
 
+  it('parses a list of addresses into the first endpoint and fallback endpoints', () => {
+    assert.deepEqual(
+      parseConnectionString(
+        'iggy://iggy:secret@10.0.0.1:8090, [2001:db8::1]:8090 ,node-3:8090?nodelay=true'
+      ),
+      {
+        transport: 'TCP',
+        options: { host: '10.0.0.1', port: 8090, noDelay: true },
+        fallbackEndpoints: [
+          { host: '2001:db8::1', port: 8090 },
+          { host: 'node-3', port: 8090 }
+        ],
+        credentials: { username: 'iggy', password: 'secret' },
+        reconnect: { enabled: true, interval: 1000, maxRetries: MAX_U32 }
+      }
+    );
+  });
+
+  it('rejects a list that holds a bad address', () => {
+    for (const addresses of [
+      '10.0.0.1:8090,',
+      ',10.0.0.1:8090',
+      '10.0.0.1:8090,,node-3:8090',
+      '10.0.0.1:8090,node-3',
+      '10.0.0.1:8090,node-3:70000'
+    ])
+      assert.throws(
+        () => parseConnectionString(`iggy://iggy:secret@${addresses}`),
+        TypeError,
+        addresses
+      );
+  });
+
   it('parses IPv6 host addresses without their brackets', () => {
     assert.deepEqual(
       parseConnectionString('iggy://iggy:secret@[::1]:8090').options,

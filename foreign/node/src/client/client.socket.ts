@@ -175,7 +175,8 @@ export class CommandResponseStream extends EventEmitter {
    */
   private sessionLineage = 0;
   private knownEndpoints: Endpoint[] = [];
-  private readonly configuredEndpoint: Endpoint;
+  /** The endpoints of the configuration, in order. A bootstrap dials them before the roster. */
+  private readonly configuredEndpoints: Endpoint[];
   private metadataReplica?: number;
   private metadataWatermark = 0n;
   private routingGeneration = 0;
@@ -189,7 +190,8 @@ export class CommandResponseStream extends EventEmitter {
     super();
     this.options = normalizeClientConfig(config);
     this.signInCredentials = this.options.credentials;
-    this.configuredEndpoint = { host: this.options.options.host ?? '127.0.0.1', port: this.options.options.port };
+    this.configuredEndpoints = [{ host: this.options.options.host ?? '127.0.0.1', port: this.options.options.port },
+      ...(this.options.fallbackEndpoints ?? []).map(({ host, port }) => ({ host, port }))];
     this.lanes = new MutationLanes(this.options.maxPendingOperations!, this.options.maxPendingOperationBytes!);
   }
 
@@ -442,7 +444,7 @@ export class CommandResponseStream extends EventEmitter {
           }
           if (lineage === this.lineage) this._rememberCredentials(command, body);
           if (command === GET_CLUSTER_METADATA.code)
-            this.installRoster(attempt.response!);
+            this.installRoster(attempt.response!, previousLink!);
           if (TOPIC_DISCOVERY_RESETS.has(command)) {
             for (const route of this.partitionRoutes.values()) route.stale = true;
             this.emit('topicDiscoveryReset');
@@ -690,7 +692,7 @@ export class CommandResponseStream extends EventEmitter {
         { ...EMPTY_PARTITION_CONTEXT, metadataOp: this.metadataWatermark }), deadline, signal);
       if (attempt.error) throw attempt.error;
       this.ensureGeneration(generation, GET_CLUSTER_METADATA.code);
-      this.installRoster(attempt.response!);
+      this.installRoster(attempt.response!, link);
     } catch (error) {
       debug('roster read after a namespace miss failed', error);
       return false;
@@ -810,14 +812,15 @@ export class CommandResponseStream extends EventEmitter {
         const response = await this.control(link, GET_CLUSTER_METADATA.code, GET_CLUSTER_METADATA.serialize(),
           Date.now() + OPERATION_TIMEOUT_MS, ownerSignal);
         this.ensureGeneration(generation, GET_CLUSTER_METADATA.code);
-        this.installRoster(response);
+        this.installRoster(response, link);
       })().finally(() => { if (this.rosterPromise === pending) this.rosterPromise = undefined; });
       this.rosterPromise = pending;
     }
     await waitWithin(this.rosterPromise, deadline, signal);
   }
 
-  private installRoster(response: CommandResponse): void {
+  /** Rebuilds the replica slots from the roster that `link` carried. */
+  private installRoster(response: CommandResponse, link: IggyConnection): void {
     const metadata = GET_CLUSTER_METADATA.deserialize(response);
     if (metadata.nodes.length === 0 || metadata.nodes.length > MAX_REPLICAS || new Set(metadata.nodes.map((node) => node.replicaId)).size !== metadata.nodes.length)
       throw responseError(GET_CLUSTER_METADATA.code, INVALID_COMMAND, 'invalid replica roster');
@@ -835,13 +838,13 @@ export class CommandResponseStream extends EventEmitter {
     }
     // A single node can advertise an address the client cannot reach, such as
     // one behind a port mapping or a port-forward, so its slot dials the
-    // configured endpoint.
+    // configured endpoint that reached it.
     const single = metadata.nodes.length === 1;
     for (const node of metadata.nodes) {
       if (this.replicas.has(node.replicaId)) continue;
       const endpoint = { host: node.ip, port: node.endpoints.tcp };
       const slot: ReplicaSlot = {
-        replica: node.replicaId, endpoint, dialEndpoint: single ? this.configuredEndpoint : endpoint,
+        replica: node.replicaId, endpoint, dialEndpoint: single ? this.configuredEndpointOf(link) : endpoint,
         generation: this.routingGeneration, lifetime: new AbortController(), attached: false, initial: true,
         heartbeat: false, restartable: false
       };
@@ -859,6 +862,13 @@ export class CommandResponseStream extends EventEmitter {
       this.bootstrap = undefined;
     }
     this.changed.pulse();
+  }
+
+  /** The configured endpoint that `link` was dialed at, else the first configured one. */
+  private configuredEndpointOf(link: IggyConnection): Endpoint {
+    const { host = '', port } = link.config.options;
+    const dialed = endpointKey({ host, port });
+    return this.configuredEndpoints.find((endpoint) => endpointKey(endpoint) === dialed) ?? this.configuredEndpoints[0];
   }
 
   private async runReplica(slot: ReplicaSlot): Promise<void> {
@@ -960,7 +970,7 @@ export class CommandResponseStream extends EventEmitter {
       const ownerSignal = AbortSignal.any([this.lifetime.signal, this.sessionLifetime.signal]);
       this.bootstrapFailure = undefined;
       const pending = (async () => {
-        const endpoints = [...new Map([this.configuredEndpoint, ...this.knownEndpoints].map((endpoint) => [endpointKey(endpoint), endpoint])).values()];
+        const endpoints = [...new Map([...this.configuredEndpoints, ...this.knownEndpoints].map((endpoint) => [endpointKey(endpoint), endpoint])).values()];
         const reconnect = this.options.reconnect ?? { enabled: true, interval: 5_000, maxRetries: 12 };
         let dialed = false;
         for (let pass = 0; ; pass += 1) {
