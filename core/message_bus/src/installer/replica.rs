@@ -40,13 +40,14 @@ use std::cell::Cell;
 use std::future::Future;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::{debug, info, warn};
 
 /// Shared scaffold for both delegated install directions: shutdown
 /// gate, handshake ctx fetch, socket options, then the direction's
-/// handshake future (built by `make`) spawned under one
-/// `handshake_grace` budget. Fires `on_done` (the shard-0 outcome ack)
-/// on every exit path. The handshake runs in its own spawned task so a
+/// handshake future (built by `make`) spawned to end by `deadline`, the
+/// end of the link's one `handshake_grace` budget. Fires `on_done` (the
+/// shard-0 outcome ack) on every exit path. The handshake runs in its own spawned task so a
 /// slow or hostile peer never stalls the shard's frame pump; handshake
 /// failures are logged at their cause site, only the grace timeout is
 /// logged here.
@@ -63,6 +64,7 @@ fn spawn_replica_install<Fut>(
     bus: &Rc<IggyMessageBus>,
     stream: TcpStream,
     peer: String,
+    deadline: Instant,
     on_done: ReplicaHandshakeDoneFn,
     make: impl FnOnce(Rc<IggyMessageBus>, ReplicaHandshakeCtx, TcpStream, String) -> Fut,
 ) where
@@ -87,7 +89,8 @@ fn spawn_replica_install<Fut>(
     let fut = make(Rc::clone(bus), ctx, stream, peer.clone());
     let bus_for_task = Rc::clone(bus);
     let handle = compio::runtime::spawn(async move {
-        let outcome = compio::time::timeout(grace, fut).await;
+        let budget = deadline.saturating_duration_since(Instant::now());
+        let outcome = compio::time::timeout(budget, fut).await;
         if outcome.is_err() {
             warn!(
                 peer = %peer,
@@ -107,9 +110,10 @@ fn spawn_replica_install<Fut>(
 ///
 /// When `cluster.tls` is configured, wraps the raw stream as a TLS
 /// server first; the acceptor handshake then runs over the encrypted
-/// stream. TLS wrap + replica handshake share ONE `handshake_grace`
-/// budget, so a peer cannot stretch admission to two grace windows by
-/// stalling between the steps.
+/// stream. The preamble read on shard 0, the TLS wrap and the replica
+/// handshake share ONE `handshake_grace` budget, which ends at
+/// `deadline`, so a peer cannot stretch admission to two grace windows
+/// by stalling between the steps.
 ///
 /// Shard 0 placed the link from its preamble, so `link` names the peer
 /// and the link the hello must announce; the acceptor refuses any other.
@@ -118,64 +122,73 @@ pub fn install_replica_inbound(
     bus: &Rc<IggyMessageBus>,
     stream: TcpStream,
     link: ReplicaLinkId,
+    deadline: Instant,
     on_message: MessageHandler,
     on_done: ReplicaHandshakeDoneFn,
 ) {
     let peer = stream
         .peer_addr()
         .map_or_else(|_| "unknown".to_string(), |addr| addr.to_string());
-    spawn_replica_install(bus, stream, peer, on_done, |bus, ctx, stream, peer| {
-        async move {
-            match ctx.tls.clone() {
-                None => {
-                    let read_buffer = bus.config().replica_read_buffer_size;
-                    let read_stats = bus.replica_read_stats();
-                    accept_and_install(
-                        &bus,
-                        stream,
-                        &ctx,
-                        link,
-                        ChannelBinding::Plaintext,
-                        move |stream| {
-                            TcpTransportConn::new(stream).with_replica_read(read_buffer, read_stats)
-                        },
-                        on_message,
-                        &peer,
-                    )
-                    .await
-                }
-                Some(tls) => {
-                    // Handshake with futures-rustls directly (compio-tls's
-                    // TlsAcceptor hides the rustls connection, so the
-                    // exporter is unreachable through it), mirroring
-                    // compio-tls's own adapter: compat-wrap, pin, accept,
-                    // then convert into the compio TlsStream the pump runs
-                    // on via compio-tls's public From impls.
-                    let tls_stream = futures_rustls::TlsAcceptor::from(Arc::clone(&tls.server))
-                        .accept(Box::pin(AsyncStream::new(stream)))
+    spawn_replica_install(
+        bus,
+        stream,
+        peer,
+        deadline,
+        on_done,
+        |bus, ctx, stream, peer| {
+            async move {
+                match ctx.tls.clone() {
+                    None => {
+                        let read_buffer = bus.config().replica_read_buffer_size;
+                        let read_stats = bus.replica_read_stats();
+                        accept_and_install(
+                            &bus,
+                            stream,
+                            &ctx,
+                            link,
+                            ChannelBinding::Plaintext,
+                            move |stream| {
+                                TcpTransportConn::new(stream)
+                                    .with_replica_read(read_buffer, read_stats)
+                            },
+                            on_message,
+                            &peer,
+                        )
                         .await
-                        .map_err(|e| warn!(peer = %peer, "replica TLS accept failed: {e}"))?;
-                    let binding = exporter_binding(tls_stream.get_ref().1)
-                        .map_err(|e| warn!(peer = %peer, "replica TLS exporter failed: {e}"))?;
-                    let close_grace = bus.config().close_grace;
-                    accept_and_install(
-                        &bus,
-                        TlsStream::from(tls_stream),
-                        &ctx,
-                        link,
-                        binding,
-                        |tls_stream| {
-                            TcpTlsTransportConn::from_established(tls_stream)
-                                .with_close_grace(close_grace)
-                        },
-                        on_message,
-                        &peer,
-                    )
-                    .await
+                    }
+                    Some(tls) => {
+                        // Handshake with futures-rustls directly (compio-tls's
+                        // TlsAcceptor hides the rustls connection, so the
+                        // exporter is unreachable through it), mirroring
+                        // compio-tls's own adapter: compat-wrap, pin, accept,
+                        // then convert into the compio TlsStream the pump runs
+                        // on via compio-tls's public From impls.
+                        let tls_stream = futures_rustls::TlsAcceptor::from(Arc::clone(&tls.server))
+                            .accept(Box::pin(AsyncStream::new(stream)))
+                            .await
+                            .map_err(|e| warn!(peer = %peer, "replica TLS accept failed: {e}"))?;
+                        let binding = exporter_binding(tls_stream.get_ref().1)
+                            .map_err(|e| warn!(peer = %peer, "replica TLS exporter failed: {e}"))?;
+                        let close_grace = bus.config().close_grace;
+                        accept_and_install(
+                            &bus,
+                            TlsStream::from(tls_stream),
+                            &ctx,
+                            link,
+                            binding,
+                            |tls_stream| {
+                                TcpTlsTransportConn::from_established(tls_stream)
+                                    .with_close_grace(close_grace)
+                            },
+                            on_message,
+                            &peer,
+                        )
+                        .await
+                    }
                 }
             }
-        }
-    });
+        },
+    );
 }
 
 /// Shared tail of the inbound path: run the acceptor handshake over
@@ -261,10 +274,12 @@ pub fn install_replica_outbound(
 ) {
     let peer_id = link.replica;
     let peer = format!("replica {peer_id} link {}", link.link);
+    let deadline = Instant::now() + bus.config().handshake_grace;
     spawn_replica_install(
         bus,
         stream,
         peer,
+        deadline,
         on_done,
         move |bus, ctx, mut stream, peer| {
             async move {

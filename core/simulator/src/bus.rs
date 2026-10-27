@@ -358,6 +358,7 @@ impl ConnectionInstaller for SharedSimOutbox {
         &self,
         _fd: DupedFd,
         _link: ReplicaLinkId,
+        _deadline: Instant,
         _on_message: MessageHandler,
         _on_done: ReplicaHandshakeDoneFn,
     ) {

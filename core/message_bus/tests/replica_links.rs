@@ -219,16 +219,21 @@ fn accept_fn(shards: &Shards, received: &Received) -> AcceptedReplicaFn {
         };
         let received = Rc::clone(&received);
         let shard_zero = Rc::clone(&shards[0]);
-        listener::admit_inbound(&shard_zero, stream, move |stream, link, owner, slot| {
-            let ack_to = Rc::clone(&shards[0]);
-            installer::install_replica_inbound(
-                &shards[usize::from(owner)],
-                stream,
-                link,
-                on_message(&received, owner),
-                Box::new(move || ack_to.replica_inbound_handshake_done(slot, link)),
-            );
-        });
+        listener::admit_inbound(
+            &shard_zero,
+            stream,
+            move |stream, link, owner, slot, deadline| {
+                let ack_to = Rc::clone(&shards[0]);
+                installer::install_replica_inbound(
+                    &shards[usize::from(owner)],
+                    stream,
+                    link,
+                    deadline,
+                    on_message(&received, owner),
+                    Box::new(move || ack_to.replica_inbound_handshake_done(slot, link)),
+                );
+            },
+        );
     })
 }
 

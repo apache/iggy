@@ -94,7 +94,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::future::Future;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub type ShardPlane<B, J, S, M, SB = PingPongSuperblock> =
     MuxPlane<variadic!(IggyMetadata<VsrConsensus<B>, J, S, M, SB>, IggyPartitions<B, SB>)>;
@@ -847,13 +847,16 @@ pub enum LifecycleFrame {
     /// in its own spawned task (`message_bus::replica::handshake`),
     /// installs the link on success, and answers shard 0 with
     /// [`LifecycleFrame::ReplicaInboundHandshakeDone`] echoing `slot`.
-    /// The `fd` is an owning [`DupedFd`] so that a frame dropped
-    /// unprocessed (shutdown, pump drain abort, router panic before
+    /// The handshake ends by `deadline`, which shard 0 set when it took
+    /// `slot`, so the preamble read and the handshake share one
+    /// `handshake_grace`. The `fd` is an owning [`DupedFd`] so that a frame
+    /// dropped unprocessed (shutdown, pump drain abort, router panic before
     /// `install_*_fd`) closes the dup instead of leaking it.
     ReplicaInboundSetup {
         fd: DupedFd,
         slot: u64,
         link: ReplicaLinkId,
+        deadline: Instant,
     },
     /// Shard 0 dialed `link` to a higher-id peer and delegates the raw
     /// connection to the shard that owns the link; the receiving shard

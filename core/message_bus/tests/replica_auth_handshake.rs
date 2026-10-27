@@ -476,6 +476,41 @@ async fn acceptor_closes_a_link_without_a_preamble() {
     acceptor.shutdown(Duration::from_secs(2)).await;
 }
 
+/// The preamble read on shard 0 and the handshake on the owner shard share
+/// one `handshake_grace`, so a dialer that spends most of the grace before
+/// its preamble and then sends no hello is closed one grace after it
+/// connected, not two. Two windows would end at `PREAMBLE_DELAY` plus the
+/// grace, past the bound below.
+#[compio::test]
+async fn acceptor_closes_a_slow_link_one_grace_after_connect() {
+    const GRACE: Duration = Duration::from_secs(1);
+    const PREAMBLE_DELAY: Duration = Duration::from_millis(800);
+    let acceptor = Rc::new(IggyMessageBus::with_tunables(
+        0,
+        MessageBusConfig {
+            handshake_grace: GRACE,
+            ..MessageBusConfig::default()
+        },
+    ));
+    let addr = spawn_acceptor(&acceptor, None).await;
+    let connected = Instant::now();
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    compio::time::sleep(PREAMBLE_DELAY).await;
+    write_preamble(&mut stream, LINK_0_OF_REPLICA_0)
+        .await
+        .expect("write preamble");
+
+    let res = framing::read_message(&mut stream, MAX_MESSAGE_SIZE).await;
+    let open_for = connected.elapsed();
+    assert!(res.is_err(), "expected a close, got a response frame");
+    assert!(
+        open_for < GRACE + PREAMBLE_DELAY / 2,
+        "link stayed open {open_for:?}, longer than one grace of {GRACE:?}"
+    );
+    assert!(!acceptor.replicas().contains(0));
+    acceptor.shutdown(Duration::from_secs(2)).await;
+}
+
 /// Connect to `addr` and send `preamble`, the way the owner shard of a
 /// dialer starts a link.
 #[allow(clippy::future_not_send)]

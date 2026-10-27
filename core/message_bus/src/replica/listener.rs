@@ -63,6 +63,7 @@ use futures::FutureExt;
 use iggy_common::IggyError;
 use std::net::SocketAddr;
 use std::rc::Rc;
+use std::time::Instant;
 use tracing::{debug, error, info, warn};
 
 /// Handler for inbound replica consensus messages.
@@ -93,14 +94,16 @@ pub async fn bind(addr: SocketAddr) -> Result<(TcpListener, SocketAddr), IggyErr
 /// Takes a slot in the in-flight handshake cap, then reads the placement
 /// preamble in a task tracked on `bus`, so a slow dialer never stalls the
 /// accept loop. A placed socket goes to `delegate` with its link, the shard
-/// that owns the link and the slot. From there the slot belongs to
-/// `delegate`: the owner shard's handshake ack releases it, and a failed
-/// delegation must release it at once. A full cap or a refused preamble
-/// closes the socket.
+/// that owns the link, the slot and the admission deadline: one
+/// `handshake_grace` after the slot was taken. The preamble read and the
+/// owner shard's handshake both end by that deadline, so a live handshake
+/// never outlasts its slot. From there the slot belongs to `delegate`: the
+/// owner shard's handshake ack releases it, and a failed delegation must
+/// release it at once. A full cap or a refused preamble closes the socket.
 pub fn admit_inbound(
     bus: &Rc<IggyMessageBus>,
     stream: TcpStream,
-    delegate: impl FnOnce(TcpStream, ReplicaLinkId, u16, u64) + 'static,
+    delegate: impl FnOnce(TcpStream, ReplicaLinkId, u16, u64, Instant) + 'static,
 ) {
     let Some(slot) = bus.try_acquire_replica_handshake_slot() else {
         warn!(
@@ -109,11 +112,12 @@ pub fn admit_inbound(
         );
         return;
     };
+    let deadline = Instant::now() + bus.config().handshake_grace;
     let task_bus = Rc::clone(bus);
     let handle = compio::runtime::spawn(async move {
         let mut stream = stream;
-        match task_bus.place_replica_inbound(&mut stream).await {
-            Ok((link, owner)) => delegate(stream, link, owner, slot),
+        match task_bus.place_replica_inbound(&mut stream, deadline).await {
+            Ok((link, owner)) => delegate(stream, link, owner, slot, deadline),
             Err(error) => {
                 task_bus.release_replica_handshake_slot(slot);
                 warn!(

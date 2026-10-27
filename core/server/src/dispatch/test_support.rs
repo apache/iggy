@@ -66,6 +66,7 @@ use std::future::Future;
 use std::mem::size_of;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Instant;
 
 pub type TestMux = MuxStateMachine<variadic!(Users, Streams)>;
 pub type TestShard = IggyShard<SpyBus, PrepareJournal, IggySnapshot, TestMux, PapayaShardsTable>;
@@ -192,6 +193,7 @@ impl ConnectionInstaller for SpyBus {
         &self,
         _fd: DupedFd,
         _link: ReplicaLinkId,
+        _deadline: Instant,
         _on_message: MessageHandler,
         _on_done: ReplicaHandshakeDoneFn,
     ) {

@@ -55,6 +55,7 @@ use crate::{
     ReplicaHandshakeDoneFn, ReplicaLinkId, SendError, SharedTlsServerConfig,
 };
 use std::rc::Rc;
+use std::time::Instant;
 use tracing::warn;
 
 /// Operations a shard needs to perform on its local bus when the router
@@ -64,8 +65,9 @@ use tracing::warn;
 pub trait ConnectionInstaller {
     /// Wrap a delegated inbound replica fd into a `TcpStream` on the
     /// local compio runtime, run the acceptor handshake in a spawned task
-    /// (bounded by `handshake_grace`), and register the connection on
-    /// this shard as `link` on success. Shard 0 read the placement
+    /// that ends by `deadline` (set by shard 0 when it took the in-flight
+    /// slot), and register the connection on this shard as `link` on
+    /// success. Shard 0 read the placement
     /// preamble and nothing else, so `link` names the peer and the link
     /// the hello must announce. `on_done` is the shard-0 outcome ack; the
     /// install path fires it exactly once, on every exit path.
@@ -76,6 +78,7 @@ pub trait ConnectionInstaller {
         &self,
         fd: DupedFd,
         link: ReplicaLinkId,
+        deadline: Instant,
         on_message: MessageHandler,
         on_done: ReplicaHandshakeDoneFn,
     );
@@ -203,11 +206,12 @@ impl ConnectionInstaller for Rc<IggyMessageBus> {
         &self,
         fd: DupedFd,
         link: ReplicaLinkId,
+        deadline: Instant,
         on_message: MessageHandler,
         on_done: ReplicaHandshakeDoneFn,
     ) {
         let stream = fd_transfer::wrap_duped_fd(fd);
-        install_replica_inbound(self, stream, link, on_message, on_done);
+        install_replica_inbound(self, stream, link, deadline, on_message, on_done);
     }
 
     fn install_replica_outbound_fd(

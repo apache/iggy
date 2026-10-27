@@ -1247,6 +1247,11 @@ close_grace = "2 s"
 # (TCP-TLS rustls accept, WS HTTP-Upgrade, WSS combined TLS+WS, QUIC
 # connecting.await + accept_bi.await) so a slowloris peer cannot pin
 # per-conn channels + registry slot + spawned task indefinitely.
+# A replica link gets one such window for the placement preamble, TLS and
+# the replica handshake together. The window also bounds how long the links
+# to a peer may stay incomplete before they close and redial, so keep it
+# above reconnect_period: below it, the links to a peer form only when all
+# of them connect in one sweep.
 handshake_grace = "10 s"
 
 # Cap on open client sockets of the node: TCP, TCP-TLS, WebSocket, WSS, HTTP

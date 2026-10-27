@@ -1117,8 +1117,8 @@ impl IggyMessageBus {
     /// and place its link. Returns the link, in the current epoch of the
     /// dialer's bundle, and the shard that owns it.
     ///
-    /// Reads exactly the preamble bytes, within `handshake_grace`, so the
-    /// owner shard still finds the TLS `ClientHello` or the hello first.
+    /// Reads exactly the preamble bytes, before `deadline`, so the owner
+    /// shard still finds the TLS `ClientHello` or the hello first.
     ///
     /// # Errors
     ///
@@ -1127,8 +1127,9 @@ impl IggyMessageBus {
     pub async fn place_replica_inbound(
         &self,
         stream: &mut compio::net::TcpStream,
+        deadline: Instant,
     ) -> Result<(ReplicaLinkId, u16), PreambleError> {
-        let placed = self.read_and_place_preamble(stream).await;
+        let placed = self.read_and_place_preamble(stream, deadline).await;
         if placed.is_err() {
             self.count_link_event(|stats| stats.preamble_refusals += 1);
         }
@@ -1139,12 +1140,14 @@ impl IggyMessageBus {
     async fn read_and_place_preamble(
         &self,
         stream: &mut compio::net::TcpStream,
+        deadline: Instant,
     ) -> Result<(ReplicaLinkId, u16), PreambleError> {
         let (self_id, replica_count) = self
             .replica_handshake_ctx()
             .map(|ctx| (ctx.self_id, ctx.replica_count))
             .ok_or(PreambleError::NoHandshakeContext)?;
-        let bytes = replica::preamble::read_preamble(stream, self.config.handshake_grace).await?;
+        let budget = deadline.saturating_duration_since(Instant::now());
+        let bytes = replica::preamble::read_preamble(stream, budget).await?;
         let layout = self.link_layout();
         let preamble = Preamble::admit(bytes, self_id, replica_count, layout.links())?;
         let link = ReplicaLinkId {
@@ -2463,8 +2466,9 @@ mod tests {
             .0
             .expect("write");
 
+        let deadline = Instant::now() + bus.config().handshake_grace;
         let (placed, owner) = bus
-            .place_replica_inbound(&mut accepted)
+            .place_replica_inbound(&mut accepted, deadline)
             .await
             .expect("valid preamble");
         assert_eq!(placed, link(1, 1, 0));

@@ -854,7 +854,12 @@ where
         M: RestorableMetadataStm,
     {
         match payload {
-            LifecycleFrame::ReplicaInboundSetup { fd, slot, link } => {
+            LifecycleFrame::ReplicaInboundSetup {
+                fd,
+                slot,
+                link,
+                deadline,
+            } => {
                 tracing::info!(
                     shard = self.id,
                     slot,
@@ -869,6 +874,7 @@ where
                 self.bus.install_replica_inbound_fd(
                     fd,
                     link,
+                    deadline,
                     self.on_replica_message.clone(),
                     on_done,
                 );

@@ -391,8 +391,12 @@ pub(in crate::boot) fn make_replica_delegation_fns(
     let accepted: AcceptedReplicaFn = Rc::new(move |stream| {
         let coord = Rc::clone(&inbound_coord);
         let bus = Rc::clone(&inbound_bus);
-        replica_listener::admit_inbound(&inbound_bus, stream, move |stream, link, owner, slot| {
-            match coord.delegate_replica_inbound(stream, link, owner, slot) {
+        replica_listener::admit_inbound(
+            &inbound_bus,
+            stream,
+            move |stream, link, owner, slot, deadline| match coord
+                .delegate_replica_inbound(stream, link, owner, slot, deadline)
+            {
                 Ok(()) => info!(
                     replica = link.replica,
                     link = link.link,
@@ -410,8 +414,8 @@ pub(in crate::boot) fn make_replica_delegation_fns(
                         "delegate_replica_inbound failed; dropping inbound replica link"
                     );
                 }
-            }
-        });
+            },
+        );
     });
 
     let outbound_bus = Rc::clone(bus);

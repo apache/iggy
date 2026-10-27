@@ -59,6 +59,7 @@ use message_bus::installer::conn_info::{ClientConnMeta, ClientTransportKind};
 use message_bus::{ConnectionPermit, ReplicaLinkId, SendError, SharedTlsServerConfig, fd_transfer};
 use std::cell::Cell;
 use std::rc::Rc;
+use std::time::Instant;
 use tracing::warn;
 
 /// Bit position of the target-shard tag inside a minted client id: the top 16
@@ -186,8 +187,8 @@ impl ShardZeroCoordinator {
 
     /// Ship an inbound replica link to `target`, the shard that owns
     /// `link`. Shard 0 read only the placement preamble: the owning shard
-    /// runs the acceptor handshake and answers shard 0 with
-    /// [`LifecycleFrame::ReplicaInboundHandshakeDone`] echoing `slot`
+    /// runs the acceptor handshake until `deadline` and answers shard 0
+    /// with [`LifecycleFrame::ReplicaInboundHandshakeDone`] echoing `slot`
     /// (the in-flight cap slot acquired by the accept callback).
     ///
     /// The owning shard records itself in the shard-shared
@@ -208,9 +209,15 @@ impl ShardZeroCoordinator {
         link: ReplicaLinkId,
         target: u16,
         slot: u64,
+        deadline: Instant,
     ) -> Result<(), SendError> {
         self.ship_replica_fd(stream, target, "delegate_replica_inbound", |fd| {
-            LifecycleFrame::ReplicaInboundSetup { fd, slot, link }
+            LifecycleFrame::ReplicaInboundSetup {
+                fd,
+                slot,
+                link,
+                deadline,
+            }
         })
     }
 
@@ -792,16 +799,23 @@ mod tests {
         let (_server, _peer_addr) = accept.await.unwrap();
 
         let target = 2;
+        let admission_deadline = Instant::now();
         coord
-            .delegate_replica_inbound(client, LINK, target, 42)
+            .delegate_replica_inbound(client, LINK, target, 42, admission_deadline)
             .expect("delegate ok");
 
         // Target shard should observe ReplicaInboundSetup echoing the slot.
         let setup_frame = receivers[usize::from(target)].recv().await.unwrap();
         match setup_frame {
-            ShardFrame::Lifecycle(LifecycleFrame::ReplicaInboundSetup { fd, slot, link }) => {
+            ShardFrame::Lifecycle(LifecycleFrame::ReplicaInboundSetup {
+                fd,
+                slot,
+                link,
+                deadline,
+            }) => {
                 assert_eq!(slot, 42);
                 assert_eq!(link, LINK);
+                assert_eq!(deadline, admission_deadline);
                 drop(fd);
             }
             _ => panic!("expected ReplicaInboundSetup on target shard"),

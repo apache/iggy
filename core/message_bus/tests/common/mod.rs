@@ -172,12 +172,13 @@ pub fn install_replicas_locally(
     Rc::new(move |stream| {
         let install_bus = Rc::clone(&bus);
         let on_message = on_message.clone();
-        listener::admit_inbound(&bus, stream, move |stream, link, _owner, slot| {
+        listener::admit_inbound(&bus, stream, move |stream, link, _owner, slot, deadline| {
             let done_bus = Rc::clone(&install_bus);
             installer::install_replica_inbound(
                 &install_bus,
                 stream,
                 link,
+                deadline,
                 on_message,
                 Box::new(move || done_bus.replica_inbound_handshake_done(slot, link)),
             );
