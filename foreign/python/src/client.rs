@@ -490,7 +490,8 @@ impl IggyClient {
     ///     RuntimeError: If the server refuses the request, for example because
     ///         the expiry is too far in the future. An invalid name raises code 4
     ///         on TCP, QUIC, and WebSocket, before anything is sent. On HTTP, the
-    ///         server refuses it with code 50.
+    ///         server refuses it with code 300, which is also the generic HTTP
+    ///         error. Read the message to find the cause.
     ///     PendingOperationError: If the reply is lost on TCP, QUIC, or WebSocket.
     ///         See above.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[str]", imports=("collections.abc")))]

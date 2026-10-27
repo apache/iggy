@@ -376,6 +376,7 @@ class TestLoginIdentity:
             personal_access_token = await iggy_client.create_personal_access_token(
                 name, IggyExpiry.NeverExpire()
             )
+            client = None
             try:
                 host, port = get_server_config()
                 client = IggyClient(f"{host}:{port}")
@@ -389,6 +390,8 @@ class TestLoginIdentity:
                 assert identity.user_id == user.id
                 assert identity.access_token is None
             finally:
+                if client is not None:
+                    await client.shutdown()
                 _delete_personal_access_token(api, jwt, name)
         finally:
             _delete_personal_access_token(api, jwt, helper_name)
