@@ -606,6 +606,18 @@ TEST(IggyBlockingClientBuilderTest, RejectsEmptyServerAddress) {
     EXPECT_THROW((void)iggy::IggyBlockingClient::Builder().WithServerAddress(""), iggy::IggyException);
 }
 
+TEST(IggyBlockingClientBuilderTest, AcceptsAListOfServerAddresses) {
+    EXPECT_NO_THROW((void)iggy::IggyBlockingClient::Builder().WithServerAddress("127.0.0.1:8090,[::1]:8091").Build());
+}
+
+TEST(IggyBlockingClientBuilderTest, RejectsAListWithAnInvalidServerAddress) {
+    for (const char *addresses : {"127.0.0.1:8090,", "127.0.0.1:8090,,[::1]:8091", "127.0.0.1:8090,node-3"}) {
+        EXPECT_THROW((void)iggy::IggyBlockingClient::Builder().WithServerAddress(addresses).Build(),
+                     iggy::IggyException)
+            << addresses;
+    }
+}
+
 TEST(IggyBlockingClientBuilderTest, RejectsEmptyAutoLoginCredentials) {
     EXPECT_THROW((void)iggy::IggyBlockingClient::Builder().WithAutoLogin("", "password"), iggy::IggyException);
     EXPECT_THROW((void)iggy::IggyBlockingClient::Builder().WithAutoLogin("username", ""), iggy::IggyException);

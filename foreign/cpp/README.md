@@ -38,6 +38,10 @@ only after the next prepare or commit broadcast. When no other write follows,
 this delay is at most `cluster.commit_broadcast_interval` (500 ms by default).
 See [metadata freshness and counters](../../core/server/README.md#metadata-freshness-and-counters).
 
+`WithServerAddress()` and TCP connection strings take several nodes of one
+cluster, separated by commas, as in `iggy+tcp://iggy:iggy@node-1:8090,node-2:8090`.
+A new client tries each in order, then the nodes of the last roster that it read.
+
 ## Resource options
 
 Streams, topics and users take typed create and update options. Unset settings use the server default on create and keep their stored value on update. `SetRawEntries()` and `RawReset()` name keys newer than this SDK build and leave the decision to the server. `DescribeOptions()` serves each scope's catalog.

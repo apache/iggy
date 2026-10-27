@@ -5766,12 +5766,16 @@ class IggyBlockingClient final {
      * - `iggy+ws://<credentials>@<host>:<port>[?<options>]` for WebSocket.
      *
      * Credentials are either `<username>:<password>` or a personal access
-     * token. Multiple query parameters are separated with `&`.
+     * token. Multiple query parameters are separated with `&`. A TCP address can
+     * list several nodes of one cluster, separated by commas: a new client tries
+     * each in order, then the nodes of the last roster that it read.
      *
      * Connection string examples:
      *
      * - Username and password:
      *   `iggy+tcp://iggy:iggy@127.0.0.1:8090`
+     * - Several nodes of one cluster:
+     *   `iggy+tcp://iggy:iggy@node-1:8090,node-2:8090`
      * - Personal access token:
      *   `iggy+tcp://iggypat-1234567890abcdef@127.0.0.1:8090`
      * - TCP with TLS:
@@ -6657,9 +6661,13 @@ class IggyBlockingClient::Builder final {
      * @brief Sets the TCP server address.
      *
      * The address is trimmed and validated during Build(). Host names, IPv4,
-     * and bracketed IPv6 are accepted. A non-zero port is required.
+     * and bracketed IPv6 are accepted. A non-zero port is required. To reach a
+     * cluster while a node is down, list several nodes, separated by commas: a
+     * new client tries each in order, then the nodes of the last roster that it
+     * read.
      *
-     * @param server_address Server address in host:port form.
+     * @param server_address Server address in host:port form, or a
+     *        comma-separated list of them.
      * @return Reference to this builder.
      * @throws IggyException if @p server_address is empty.
      * @note Build() throws IggyException if the address is invalid.
