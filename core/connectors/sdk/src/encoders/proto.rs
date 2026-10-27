@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use base64::{Engine as Base64Engine, engine::general_purpose};
@@ -83,18 +83,31 @@ where
     D: Deserializer<'de>,
 {
     let field_mappings = Option::<HashMap<String, String>>::deserialize(deserializer)?;
-    if let Some(mappings) = &field_mappings {
-        let mut json_names = HashSet::with_capacity(mappings.len());
-        for json_name in mappings.values() {
-            if !json_names.insert(json_name.as_str()) {
-                return Err(D::Error::custom(format!(
-                    "duplicate JSON field name in field_mappings: {json_name}"
-                )));
-            }
+    validate_field_mappings(field_mappings.as_ref()).map_err(D::Error::custom)?;
+
+    Ok(field_mappings)
+}
+
+fn validate_field_mappings(field_mappings: Option<&HashMap<String, String>>) -> Result<(), Error> {
+    let Some(field_mappings) = field_mappings else {
+        return Ok(());
+    };
+
+    let mut ordered_mappings = field_mappings.iter().collect::<Vec<_>>();
+    ordered_mappings.sort_unstable_by_key(|(protobuf_name, _)| *protobuf_name);
+
+    let mut protobuf_names_by_json_name = HashMap::with_capacity(field_mappings.len());
+    for (protobuf_name, json_name) in ordered_mappings {
+        if let Some(existing_protobuf_name) =
+            protobuf_names_by_json_name.insert(json_name.as_str(), protobuf_name.as_str())
+        {
+            return Err(Error::InvalidConfigValue(format!(
+                "protobuf fields '{existing_protobuf_name}' and '{protobuf_name}' both map to JSON field '{json_name}'"
+            )));
         }
     }
 
-    Ok(field_mappings)
+    Ok(())
 }
 
 pub struct ProtoStreamEncoder {
@@ -108,6 +121,7 @@ impl ProtoStreamEncoder {
         Self::new_with_config(ProtoEncoderConfig::default())
     }
 
+    /// For fail-fast configuration and schema validation, use [`try_new`](Self::try_new).
     pub fn new_with_config(config: ProtoEncoderConfig) -> Self {
         let mut encoder = Self {
             config,
@@ -115,13 +129,27 @@ impl ProtoStreamEncoder {
             file_descriptor_set: None,
         };
 
-        if (encoder.config.schema_path.is_some() || encoder.config.descriptor_set.is_some())
-            && let Err(e) = encoder.load_schema()
+        if let Err(error) = validate_field_mappings(encoder.config.field_mappings.as_ref()) {
+            error!("Failed to validate protobuf encoder config during creation: {error}");
+        } else if (encoder.config.schema_path.is_some() || encoder.config.descriptor_set.is_some())
+            && let Err(error) = encoder.load_schema()
         {
-            tracing::error!("Failed to load schema during encoder creation: {}", e);
+            error!("Failed to load schema during encoder creation: {error}");
         }
 
         encoder
+    }
+
+    pub fn try_new(config: ProtoEncoderConfig) -> Result<Self, Error> {
+        validate_field_mappings(config.field_mappings.as_ref())?;
+
+        let mut encoder = Self {
+            config,
+            message_descriptor: None,
+            file_descriptor_set: None,
+        };
+        encoder.load_schema()?;
+        Ok(encoder)
     }
 
     pub fn update_config(
@@ -129,6 +157,8 @@ impl ProtoStreamEncoder {
         config: ProtoEncoderConfig,
         reload_schema: bool,
     ) -> Result<(), Error> {
+        validate_field_mappings(config.field_mappings.as_ref())?;
+
         let old_config = std::mem::replace(&mut self.config, config);
         if reload_schema && let Err(error) = self.load_schema() {
             self.config = old_config;
@@ -759,6 +789,13 @@ mod tests {
         config
     }
 
+    fn duplicate_field_mappings() -> HashMap<String, String> {
+        HashMap::from([
+            ("id".to_string(), "shared".to_string()),
+            ("legacy_id".to_string(), "shared".to_string()),
+        ])
+    }
+
     #[test]
     fn given_duplicate_json_names_when_deserializing_config_should_fail() {
         let config = config_value_with_field_mappings(serde_json::json!({
@@ -768,23 +805,6 @@ mod tests {
 
         let error = serde_json::from_value::<ProtoEncoderConfig>(config)
             .expect_err("duplicate JSON field names should be rejected");
-
-        assert!(
-            error
-                .to_string()
-                .contains("duplicate JSON field name in field_mappings: shared"),
-            "unexpected deserialization error: {error}"
-        );
-    }
-
-    #[test]
-    fn given_invalid_field_mappings_when_deserializing_config_should_fail() {
-        let config = config_value_with_field_mappings(serde_json::json!({
-            "id": 123
-        }));
-
-        let error = serde_json::from_value::<ProtoEncoderConfig>(config)
-            .expect_err("non-string field mapping values should be rejected");
 
         assert!(error.is_data());
     }
@@ -806,38 +826,48 @@ mod tests {
     }
 
     #[test]
-    fn given_missing_field_mappings_when_deserializing_config_should_default_to_none() {
-        let mut config = serde_json::to_value(ProtoEncoderConfig::default())
-            .expect("serialize default proto encoder config");
-        config
-            .as_object_mut()
-            .expect("proto encoder config should serialize as an object")
-            .remove("field_mappings");
+    fn given_optional_field_mappings_when_deserializing_config_should_preserve_state() {
+        let cases = [
+            (None, None),
+            (Some(serde_json::Value::Null), None),
+            (Some(serde_json::json!({})), Some(HashMap::new())),
+        ];
 
-        let deserialized = serde_json::from_value::<ProtoEncoderConfig>(config)
-            .expect("missing field mappings should be accepted");
+        for (field_mappings, expected) in cases {
+            let mut config = serde_json::to_value(ProtoEncoderConfig::default())
+                .expect("serialize default proto encoder config");
+            if let Some(field_mappings) = field_mappings {
+                config["field_mappings"] = field_mappings;
+            } else {
+                config
+                    .as_object_mut()
+                    .expect("proto encoder config should serialize as an object")
+                    .remove("field_mappings");
+            }
 
-        assert!(deserialized.field_mappings.is_none());
+            let deserialized = serde_json::from_value::<ProtoEncoderConfig>(config)
+                .expect("optional field mappings should be accepted");
+
+            assert_eq!(deserialized.field_mappings, expected);
+        }
     }
 
     #[test]
-    fn given_null_field_mappings_when_deserializing_config_should_preserve_none() {
-        let config = config_value_with_field_mappings(serde_json::Value::Null);
+    fn given_duplicate_json_names_when_trying_new_should_fail_with_both_protobuf_names() {
+        let config = ProtoEncoderConfig {
+            field_mappings: Some(duplicate_field_mappings()),
+            ..ProtoEncoderConfig::default()
+        };
 
-        let deserialized = serde_json::from_value::<ProtoEncoderConfig>(config)
-            .expect("null field mappings should be accepted");
+        let result = ProtoStreamEncoder::try_new(config);
 
-        assert!(deserialized.field_mappings.is_none());
-    }
-
-    #[test]
-    fn given_empty_field_mappings_when_deserializing_config_should_preserve_empty_map() {
-        let config = config_value_with_field_mappings(serde_json::json!({}));
-
-        let deserialized = serde_json::from_value::<ProtoEncoderConfig>(config)
-            .expect("empty field mappings should be accepted");
-
-        assert_eq!(deserialized.field_mappings, Some(HashMap::new()));
+        let Err(Error::InvalidConfigValue(message)) = result else {
+            panic!("duplicate JSON field names should return an invalid config value");
+        };
+        assert_eq!(
+            message,
+            "protobuf fields 'id' and 'legacy_id' both map to JSON field 'shared'"
+        );
     }
 
     #[test]
@@ -1021,37 +1051,22 @@ mod tests {
     }
 
     #[test]
-    fn encode_should_resolve_ambiguous_reverse_lookup_to_one_of_the_colliding_keys() {
-        // Reverse-lookup collision resolves via HashMap iteration order (not deterministic), so only pin that one of the two survives.
-        let mut field_mappings = HashMap::new();
-        field_mappings.insert("proto_a".to_string(), "shared".to_string());
-        field_mappings.insert("proto_b".to_string(), "shared".to_string());
-
+    fn given_duplicate_json_names_when_updating_config_should_reject_change() {
+        let original_field_mappings =
+            HashMap::from([("original_proto".to_string(), "original_json".to_string())]);
+        let mut encoder = ProtoStreamEncoder::new_with_config(ProtoEncoderConfig {
+            field_mappings: Some(original_field_mappings.clone()),
+            ..ProtoEncoderConfig::default()
+        });
         let config = ProtoEncoderConfig {
-            field_mappings: Some(field_mappings),
-            use_any_wrapper: false,
+            field_mappings: Some(duplicate_field_mappings()),
             ..ProtoEncoderConfig::default()
         };
-        let encoder = ProtoStreamEncoder::new_with_config(config);
 
-        let json_value = simd_json::json!({"shared": "value"});
-        let result = encoder.encode(Payload::Json(json_value));
+        let result = encoder.update_config(config, false);
 
-        assert!(result.is_ok());
-        let mut encoded_bytes = result.unwrap();
-        let decoded_json = simd_json::to_owned_value(&mut encoded_bytes).unwrap();
-
-        if let simd_json::OwnedValue::Object(map) = decoded_json {
-            assert_eq!(map.len(), 1);
-            let renamed_to_a = map.get("proto_a") == Some(&simd_json::OwnedValue::from("value"));
-            let renamed_to_b = map.get("proto_b") == Some(&simd_json::OwnedValue::from("value"));
-            assert!(
-                renamed_to_a || renamed_to_b,
-                "expected the value to land on proto_a or proto_b, got {map:?}"
-            );
-        } else {
-            panic!("Expected JSON object");
-        }
+        assert!(matches!(result, Err(Error::InvalidConfigValue(_))));
+        assert_eq!(encoder.config.field_mappings, Some(original_field_mappings));
     }
 
     #[test]
@@ -1091,15 +1106,14 @@ mod tests {
     }
 
     #[test]
-    fn given_missing_proto_file_when_loading_schema_should_return_error() {
-        let mut encoder = ProtoStreamEncoder::new_with_config(ProtoEncoderConfig {
+    fn given_missing_proto_file_when_trying_new_should_return_error() {
+        let result = ProtoStreamEncoder::try_new(ProtoEncoderConfig {
             schema_path: Some(PathBuf::from("nonexistent.proto")),
             message_type: Some("com.example.Test".to_string()),
             ..ProtoEncoderConfig::default()
         });
 
-        let result = encoder.load_schema();
-        assert!(matches!(result, Err(Error::InitError(_))), "{result:?}");
+        assert!(matches!(result, Err(Error::InitError(_))));
     }
 
     #[test]
