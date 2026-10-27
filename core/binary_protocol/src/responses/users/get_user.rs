@@ -101,6 +101,7 @@ mod tests {
             status: 1,
             username: WireName::new("admin").unwrap(),
             options: WireOptions::empty(),
+            derived_options: WireOptions::empty(),
         }
     }
 

@@ -63,7 +63,7 @@ async fn given_a_client_producing_when_its_primary_is_killed_should_resume_witho
 ) {
     let setup_client = harness.tcp_root_client().await.unwrap();
     setup_client
-        .create_stream(STREAM_NAME)
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
         .await
         .expect("create stream");
     // Eagerly flushed so every pre-kill ack is durable on the survivors and

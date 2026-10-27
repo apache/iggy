@@ -71,17 +71,19 @@ pub async fn handle(
         }
     };
 
-    let error = state
+    let validated = state
         .groups
         .validate_commit(&CommitRequest::from(&request))
         .await;
-    let topics = match (&state.bridge, error) {
-        (Some(bridge), ERROR_NONE) => {
-            let calls = OffsetCalls::new(offset_deadline(state, connection).await);
+    let topics = match (&state.bridge, validated) {
+        (Some(bridge), Ok(commit)) => {
+            // The commit stays counted until none of its Iggy calls can land, also past the
+            // deadline, so a deletion of the group's offsets waits for them.
+            let calls = OffsetCalls::new(offset_deadline(state, connection).await).keeping(commit);
             commit_all(bridge, &request, &calls).await
         }
-        (None, ERROR_NONE) => same_code(&request, ERROR_COORDINATOR_LOAD_IN_PROGRESS),
-        (_, error) => same_code(&request, error),
+        (None, Ok(_)) => same_code(&request, ERROR_COORDINATOR_LOAD_IN_PROGRESS),
+        (_, Err(error)) => same_code(&request, error),
     };
     respond_or_close(encode_response(api_version, topics), "OffsetCommit")
 }
@@ -283,6 +285,7 @@ mod tests {
             BridgeError::Iggy(IggyError::Disconnected),
             BridgeError::Iggy(IggyError::TransientNotCommitted),
             BridgeError::Iggy(IggyError::RequestTooOld),
+            BridgeError::Iggy(IggyError::LaneBlocked(7)),
         ] {
             assert_eq!(
                 retriable.to_offset_error_code(),

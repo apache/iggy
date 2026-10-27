@@ -162,13 +162,16 @@ impl ReplyTarget {
 /// result is carried through unchanged. `InProcess` hands the message back
 /// so the caller can decode the request id and fire the matching oneshot
 /// via [`ConnectionRegistry::fire_in_process`], keeping that decode off the
-/// socket path. `NoSlot` means no entry exists for the key.
+/// socket path. `NoSlot` means no entry matches the captured installation.
+/// `Stalled` means a waiting send found no room within its stall timeout: the
+/// reply is dropped and its connection closed.
 #[derive(Debug)]
 #[must_use]
 pub enum ReplyRoute {
     Delivered(Result<(), async_channel::TrySendError<BusMessage>>),
     InProcess(BusMessage),
     NoSlot(BusMessage),
+    Stalled,
 }
 
 /// Rejection reasons for [`ConnectionRegistry::install_reply_slot`].
@@ -243,13 +246,14 @@ struct Entry {
     /// this value; a stale-install cleanup presenting a different token is
     /// a no-op.
     token: InstanceToken,
-    /// Per-connection shutdown captured at install time. Only kept alive
-    /// here so its `Sender` survives until the entry is removed; dropping
-    /// it earlier would close the broadcast channel and falsely wake
-    /// readers waiting on `conn_token.wait()`. Triggered explicitly by
-    /// [`drain_rejected_registration`](crate::installer) on insert race;
-    /// implicitly dropped on entry removal.
-    _conn_shutdown: super::Shutdown,
+    /// Per-connection shutdown captured at install time. Kept here so its
+    /// `Sender` survives until the entry is removed; dropping it earlier
+    /// would close the broadcast channel and falsely wake readers waiting
+    /// on `conn_token.wait()`. Triggered by
+    /// [`ConnectionRegistry::try_send_to_instance`] when a client connection's
+    /// queue refuses a reply, and by [`ConnectionRegistry::send_to_instance`]
+    /// when it stalls. Dropped with the entry.
+    conn_shutdown: super::Shutdown,
 }
 
 /// Map of live connections keyed by some transport-specific id.
@@ -326,30 +330,108 @@ where
             .map(f)
     }
 
-    /// Route `msg` to the entry's reply target, handing it back when no
-    /// live target accepts it.
+    /// Route `msg` to the installation `instance` names, handing it back when
+    /// no live target accepts it.
     ///
-    /// Lets `send_to_client` skip the unconditional `Frozen::clone()` the
-    /// `with_sender` shape forced. Socket targets move `msg` straight into
-    /// `try_send`; in-process targets hand it back via
-    /// [`ReplyRoute::InProcess`] so the caller can resolve the request id
-    /// and fire the oneshot without decoding on the socket path.
+    /// Socket targets move `msg` straight into `try_send`; in-process targets
+    /// hand it back via [`ReplyRoute::InProcess`] so the caller can resolve
+    /// the request id and fire the oneshot without decoding on the socket
+    /// path.
     ///
     /// Returns:
     /// - [`ReplyRoute::Delivered`]: socket target; carries the `try_send`
     ///   result (`Full` / `Closed` errors carry `msg` back per
     ///   `async_channel`'s contract).
     /// - [`ReplyRoute::InProcess`]: in-process target; `msg` handed back.
-    /// - [`ReplyRoute::NoSlot`]: no entry for `key`; `msg` handed back.
-    pub fn try_send_or_return(&self, key: K, msg: BusMessage) -> ReplyRoute {
+    /// - [`ReplyRoute::NoSlot`]: no entry for `key`, or a reinstall holds it;
+    ///   `msg` handed back. A reply for a replaced installation answers a
+    ///   request the newer connection never sent, so it must neither reach
+    ///   that connection's queue nor close it on refusal.
+    ///
+    /// A `Full` refusal also closes the queue and triggers the per-connection
+    /// shutdown of this exact installation, so later sends report `Closed`
+    /// and the installer tears the socket down within `close_peer_timeout`.
+    /// The dropped reply leaves its request unanswered, and a closed
+    /// connection is what tells the client to fail it instead of waiting
+    /// out its deadline. A reinstall under the same key owns another
+    /// shutdown, so it is never closed by this refusal.
+    pub fn try_send_to_instance(
+        &self,
+        key: K,
+        instance: InstanceToken,
+        msg: BusMessage,
+    ) -> ReplyRoute {
         let entries = self.entries.borrow();
-        let Some(entry) = entries.get(&key) else {
+        let Some(entry) = entries.get(&key).filter(|entry| entry.token == instance) else {
             return ReplyRoute::NoSlot(msg);
         };
         match &entry.reply {
-            ReplyTarget::Socket(sender) => ReplyRoute::Delivered(sender.try_send(msg)),
+            ReplyTarget::Socket(sender) => {
+                let sent = sender.try_send(msg);
+                if matches!(sent, Err(async_channel::TrySendError::Full(_))) {
+                    sender.close();
+                    entry.conn_shutdown.trigger();
+                }
+                ReplyRoute::Delivered(sent)
+            }
             ReplyTarget::InProcess { .. } => ReplyRoute::InProcess(msg),
         }
+    }
+
+    /// [`Self::try_send_to_instance`] that waits up to `stall_timeout` for room
+    /// in a full socket queue before it closes the connection.
+    ///
+    /// The wait ends when the writer takes a frame off the queue, or with
+    /// `Closed` when the connection goes away, a reinstall under `key`
+    /// included, because only this installation's queue is waited on. A queue
+    /// that stays full for `stall_timeout` belongs to a client that stopped
+    /// reading. The reply is then dropped with [`ReplyRoute::Stalled`] and
+    /// this installation is shut down as a refused reply shuts it down.
+    #[allow(clippy::future_not_send)]
+    pub async fn send_to_instance(
+        &self,
+        key: K,
+        instance: InstanceToken,
+        msg: BusMessage,
+        stall_timeout: Duration,
+    ) -> ReplyRoute {
+        // Only a full queue clones the `Sender` to wait on it, so a reply that
+        // finds room costs no atomic RMW on the channel state.
+        let (sender, msg) = {
+            let entries = self.entries.borrow();
+            let Some(entry) = entries.get(&key).filter(|entry| entry.token == instance) else {
+                return ReplyRoute::NoSlot(msg);
+            };
+            match &entry.reply {
+                ReplyTarget::Socket(sender) => match sender.try_send(msg) {
+                    Err(async_channel::TrySendError::Full(msg)) => (sender.clone(), msg),
+                    sent => return ReplyRoute::Delivered(sent),
+                },
+                ReplyTarget::InProcess { .. } => return ReplyRoute::InProcess(msg),
+            }
+        };
+        let Ok(sent) = compio::time::timeout(stall_timeout, sender.send(msg)).await else {
+            sender.close();
+            if let Some(entry) = self
+                .entries
+                .borrow()
+                .get(&key)
+                .filter(|entry| entry.token == instance)
+            {
+                entry.conn_shutdown.trigger();
+            }
+            return ReplyRoute::Stalled;
+        };
+        ReplyRoute::Delivered(
+            sent.map_err(|async_channel::SendError(msg)| async_channel::TrySendError::Closed(msg)),
+        )
+    }
+
+    /// Token of the installation currently registered under `key`, for a
+    /// later [`Self::try_send_to_instance`].
+    #[must_use]
+    pub fn instance(&self, key: K) -> Option<InstanceToken> {
+        self.entries.borrow().get(&key).map(|entry| entry.token)
     }
 
     /// Fire the in-process reply registered under `request` for `key`.
@@ -465,7 +547,7 @@ where
                 writer_handle: Some(writer_handle),
                 reader_handle: Some(reader_handle),
                 token,
-                _conn_shutdown: conn_shutdown,
+                conn_shutdown,
             },
         );
         Ok(token)
@@ -498,7 +580,7 @@ where
             writer_handle: None,
             reader_handle: None,
             token,
-            _conn_shutdown: conn_shutdown,
+            conn_shutdown,
         });
         Some(token)
     }
@@ -517,7 +599,7 @@ where
     /// Unfenced: callers that need generation-safety must use
     /// [`remove_if_token_matches`](Self::remove_if_token_matches).
     pub fn remove(&self, key: K) -> bool {
-        // Dropping the Entry drops `_conn_shutdown`; see its rustdoc on
+        // Dropping the Entry drops `conn_shutdown`; see its rustdoc on
         // `Entry` for why that wakes the reader and closes the channel.
         self.entries.borrow_mut().remove(&key).is_some()
     }
@@ -794,8 +876,8 @@ impl ReplicaRegistry {
     /// `msg` back as `Err` when no slot is present.
     ///
     /// Replicas only ever register socket reply targets, so unlike
-    /// [`ConnectionRegistry::try_send_or_return`] (which returns a [`ReplyRoute`]
-    /// also covering the in-process case) this stays a flat
+    /// [`ConnectionRegistry::try_send_to_instance`] (which returns a
+    /// [`ReplyRoute`] also covering the in-process case) this stays a flat
     /// `Result<try-send outcome, BusMessage>`.
     ///
     /// # Errors
@@ -848,7 +930,7 @@ impl ReplicaRegistry {
             writer_handle: Some(writer_handle),
             reader_handle: Some(reader_handle),
             token,
-            _conn_shutdown: conn_shutdown,
+            conn_shutdown,
         });
         self.len.set(self.len.get() + 1);
         Ok(token)
@@ -856,7 +938,7 @@ impl ReplicaRegistry {
 
     /// See [`ConnectionRegistry::remove`].
     pub fn remove(&self, key: u8) -> bool {
-        // Dropping the Entry drops `_conn_shutdown`; see its rustdoc on
+        // Dropping the Entry drops `conn_shutdown`; see its rustdoc on
         // `Entry` for why that wakes the reader and closes the channel.
         if self.slots.borrow_mut()[usize::from(key)].take().is_some() {
             self.len.set(self.len.get() - 1);
@@ -950,8 +1032,10 @@ impl ReplicaRegistry {
 mod tests {
     use super::*;
     use crate::lifecycle::Shutdown;
+    use futures::poll;
     use iggy_binary_protocol::{Command, GenericHeader, HEADER_SIZE};
     use server_common::Message;
+    use std::pin::pin;
 
     #[allow(clippy::cast_possible_truncation)]
     fn make_bus_msg() -> BusMessage {
@@ -1274,19 +1358,21 @@ mod tests {
     }
 
     /// Fast-path: slot present, queue accepts. Verifies the consuming
-    /// `try_send_or_return` shape replaces `with_sender(_, |s| s.try_send(msg.clone()))`
-    /// without dropping behaviour.
+    /// `try_send_to_instance` shape replaces `with_sender(_, |s| s.try_send(msg.clone()))`
+    /// without dropping behaviour. The same reply by key alone never reaches
+    /// the socket.
     #[compio::test]
-    async fn try_send_or_return_succeeds_when_slot_present() {
+    async fn try_send_to_instance_succeeds_when_slot_present() {
         let reg: ConnectionRegistry<u8> = ConnectionRegistry::new();
         let (_shutdown, token) = Shutdown::new();
         let (tx, rx) = async_channel::bounded(8);
         let writer = spawn_dummy_writer(rx.clone());
         let reader = spawn_dummy_reader(token);
-        reg.insert(1u8, tx, writer, reader, dummy_conn_shutdown())
+        let instance = reg
+            .insert(1u8, tx, writer, reader, dummy_conn_shutdown())
             .expect("insert ok");
 
-        let outer = reg.try_send_or_return(1u8, make_bus_msg());
+        let outer = reg.try_send_to_instance(1u8, instance, make_bus_msg());
         assert!(matches!(outer, ReplyRoute::Delivered(Ok(()))));
         // Receiver drains the message; closing the writer's rx end via
         // close_peer is not necessary for this assertion.
@@ -1294,15 +1380,14 @@ mod tests {
         assert_eq!(received.total_len(), HEADER_SIZE);
     }
 
-    /// No slot for `key`: the message is handed back to the caller so the
-    /// slow path (or no-op for clients) can decide what to do.
+    /// No slot for `key`: the message is handed back to the caller.
     #[compio::test]
-    async fn try_send_or_return_returns_msg_when_slot_missing() {
+    async fn try_send_to_instance_returns_msg_when_slot_missing() {
         let reg: ConnectionRegistry<u8> = ConnectionRegistry::new();
         let msg = make_bus_msg();
         let original_len = msg.total_len();
 
-        let outcome = reg.try_send_or_return(99u8, msg);
+        let outcome = reg.try_send_to_instance(99u8, InstanceToken(1), msg);
         let ReplyRoute::NoSlot(returned) = outcome else {
             panic!("missing slot should return msg");
         };
@@ -1312,7 +1397,7 @@ mod tests {
     /// Slot present but queue full: inner `Err(TrySendError::Full(msg))` so
     /// the caller can map to `SendError::Backpressure`.
     #[compio::test]
-    async fn try_send_or_return_reports_full_when_queue_at_capacity() {
+    async fn try_send_to_instance_reports_full_when_queue_at_capacity() {
         let reg: ConnectionRegistry<u8> = ConnectionRegistry::new();
         let (_shutdown, token) = Shutdown::new();
         // Capacity-1 queue, no draining receiver.
@@ -1324,23 +1409,222 @@ mod tests {
             std::future::pending::<()>().await;
         });
         let reader = spawn_dummy_reader(token);
-        reg.insert(1u8, tx, writer, reader, dummy_conn_shutdown())
+        let instance = reg
+            .insert(1u8, tx, writer, reader, dummy_conn_shutdown())
             .expect("insert ok");
 
         // Saturate the queue.
         assert!(matches!(
-            reg.try_send_or_return(1u8, make_bus_msg()),
+            reg.try_send_to_instance(1u8, instance, make_bus_msg()),
             ReplyRoute::Delivered(Ok(()))
         ));
         // Second send: slot present, queue full.
-        let outcome = reg.try_send_or_return(1u8, make_bus_msg());
+        let outcome = reg.try_send_to_instance(1u8, instance, make_bus_msg());
         assert!(matches!(
             outcome,
             ReplyRoute::Delivered(Err(async_channel::TrySendError::Full(_)))
         ));
     }
 
-    /// Mirror of `try_send_or_return_returns_msg_when_slot_missing` for the
+    /// The waiting send delivers at once while the queue has room, waits on a
+    /// full queue until the writer takes a frame, and never closes it.
+    #[compio::test]
+    async fn send_to_instance_waits_only_for_a_full_queue() {
+        const STALL_TIMEOUT: Duration = Duration::from_secs(30);
+        let reg: ConnectionRegistry<u8> = ConnectionRegistry::new();
+        let (_shutdown, token) = Shutdown::new();
+        let (tx, rx) = async_channel::bounded(1);
+        let writer = compio::runtime::spawn(std::future::pending::<()>());
+        let reader = spawn_dummy_reader(token);
+        let instance = reg
+            .insert(1u8, tx, writer, reader, dummy_conn_shutdown())
+            .expect("insert ok");
+
+        assert!(matches!(
+            reg.send_to_instance(1u8, instance, make_bus_msg(), STALL_TIMEOUT)
+                .await,
+            ReplyRoute::Delivered(Ok(()))
+        ));
+        let mut waiting = pin!(reg.send_to_instance(1u8, instance, make_bus_msg(), STALL_TIMEOUT));
+        assert!(poll!(waiting.as_mut()).is_pending());
+        rx.recv().await.expect("the first reply is queued");
+        assert!(matches!(waiting.await, ReplyRoute::Delivered(Ok(()))));
+        assert_eq!(rx.len(), 1);
+        assert!(!rx.is_closed());
+    }
+
+    /// A client that leaves its socket unread keeps its queue full. A reply
+    /// that finds no room within the stall timeout closes that exact
+    /// connection, so the replies and tasks it pins are released, and every
+    /// reply still waiting on that queue ends with `Closed`.
+    #[compio::test]
+    async fn given_stalled_reply_queue_when_waiting_past_stall_timeout_should_close_that_connection()
+     {
+        const STALL: Duration = Duration::from_millis(50);
+        const TEST_BOUND: Duration = Duration::from_secs(5);
+        let reg: ConnectionRegistry<u8> = ConnectionRegistry::new();
+        let (stalled, stalled_rx, stalled_token) = insert_stalled(&reg, 1u8);
+        let (other, other_rx, other_token) = insert_stalled(&reg, 2u8);
+        assert!(matches!(
+            reg.send_to_instance(1u8, stalled, make_bus_msg(), STALL)
+                .await,
+            ReplyRoute::Delivered(Ok(()))
+        ));
+
+        let mut behind = pin!(reg.send_to_instance(1u8, stalled, make_bus_msg(), TEST_BOUND));
+        assert!(poll!(behind.as_mut()).is_pending());
+        let outcome = compio::time::timeout(
+            TEST_BOUND,
+            reg.send_to_instance(1u8, stalled, make_bus_msg(), STALL),
+        )
+        .await
+        .expect("a reply must stop waiting at the stall timeout");
+        assert!(matches!(outcome, ReplyRoute::Stalled));
+        assert!(
+            stalled_token.is_triggered(),
+            "the stalled connection must shut down"
+        );
+        assert!(stalled_rx.is_closed());
+        assert_eq!(
+            stalled_rx.len(),
+            1,
+            "the reply queued before the stall stays for the writer"
+        );
+        assert!(matches!(
+            behind.await,
+            ReplyRoute::Delivered(Err(async_channel::TrySendError::Closed(_)))
+        ));
+
+        assert!(
+            !other_token.is_triggered(),
+            "an unrelated connection must stay open"
+        );
+        assert!(matches!(
+            reg.send_to_instance(2u8, other, make_bus_msg(), STALL)
+                .await,
+            ReplyRoute::Delivered(Ok(()))
+        ));
+        assert_eq!(other_rx.len(), 1);
+    }
+
+    /// A refused reply leaves its request unanswered, so the refusal must
+    /// close that exact connection: its shutdown fires and later replies
+    /// report `Closed`. An unrelated connection keeps delivering, and the
+    /// fenced close the installer runs next spares a reinstall that reuses
+    /// the key.
+    #[compio::test]
+    async fn given_full_reply_queue_when_sending_should_close_only_that_connection() {
+        const CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+        let reg: ConnectionRegistry<u8> = ConnectionRegistry::new();
+        let (refused, refused_rx, refused_token) = insert_stalled(&reg, 1u8);
+        let (other, other_rx, other_token) = insert_stalled(&reg, 2u8);
+
+        assert!(matches!(
+            reg.try_send_to_instance(1u8, refused, make_bus_msg()),
+            ReplyRoute::Delivered(Ok(()))
+        ));
+        assert!(matches!(
+            reg.try_send_to_instance(1u8, refused, make_bus_msg()),
+            ReplyRoute::Delivered(Err(async_channel::TrySendError::Full(_)))
+        ));
+        assert!(
+            refused_token.is_triggered(),
+            "the refusing connection must shut down"
+        );
+        assert!(matches!(
+            reg.try_send_to_instance(1u8, refused, make_bus_msg()),
+            ReplyRoute::Delivered(Err(async_channel::TrySendError::Closed(_)))
+        ));
+        assert_eq!(
+            refused_rx.len(),
+            1,
+            "the reply queued before the refusal stays for the writer"
+        );
+
+        assert!(
+            !other_token.is_triggered(),
+            "an unrelated connection must stay open"
+        );
+        assert!(matches!(
+            reg.try_send_to_instance(2u8, other, make_bus_msg()),
+            ReplyRoute::Delivered(Ok(()))
+        ));
+        assert_eq!(other_rx.len(), 1);
+
+        assert!(
+            reg.close_peer_if_token_matches(1u8, refused, CLOSE_TIMEOUT)
+                .await
+        );
+        let (reused, reused_rx, reused_token) = insert_stalled(&reg, 1u8);
+        assert!(
+            !reg.close_peer_if_token_matches(1u8, refused, CLOSE_TIMEOUT)
+                .await,
+            "a stale close must not reach the connection that reuses the key"
+        );
+        assert!(!reused_token.is_triggered());
+        assert!(matches!(
+            reg.try_send_to_instance(1u8, reused, make_bus_msg()),
+            ReplyRoute::Delivered(Ok(()))
+        ));
+        assert_eq!(reused_rx.len(), 1);
+    }
+
+    /// A reply addressed to an installation answers that connection's
+    /// request, so a reinstall under the same key must neither take it nor be
+    /// closed by it, even with a full queue. Addressed to the reinstall, the
+    /// same refusal closes it.
+    #[compio::test]
+    async fn given_reinstalled_key_when_sending_to_old_instance_should_spare_new_connection() {
+        let reg: ConnectionRegistry<u8> = ConnectionRegistry::new();
+        let (replaced, _replaced_rx, _replaced_token) = insert_stalled(&reg, 1u8);
+        assert_eq!(reg.instance(1u8), Some(replaced));
+        assert!(reg.remove(1u8));
+        let (reused, reused_rx, reused_token) = insert_stalled(&reg, 1u8);
+        assert!(matches!(
+            reg.try_send_to_instance(1u8, reused, make_bus_msg()),
+            ReplyRoute::Delivered(Ok(()))
+        ));
+
+        assert!(matches!(
+            reg.try_send_to_instance(1u8, replaced, make_bus_msg()),
+            ReplyRoute::NoSlot(_)
+        ));
+        assert!(
+            !reused_token.is_triggered(),
+            "a reply for the replaced connection must not close the reinstall"
+        );
+        assert_eq!(reused_rx.len(), 1);
+
+        assert!(matches!(
+            reg.try_send_to_instance(1u8, reused, make_bus_msg()),
+            ReplyRoute::Delivered(Err(async_channel::TrySendError::Full(_)))
+        ));
+        assert!(reused_token.is_triggered());
+    }
+
+    /// Insert a socket entry under `key` whose capacity-1 queue nobody
+    /// drains, as when the writer is blocked on a socket the client stopped
+    /// reading. Its writer and reader exit on the per-connection shutdown.
+    fn insert_stalled(
+        reg: &ConnectionRegistry<u8>,
+        key: u8,
+    ) -> (InstanceToken, BusReceiver, crate::lifecycle::ShutdownToken) {
+        let (tx, rx) = async_channel::bounded(1);
+        let (conn_shutdown, conn_token) = Shutdown::new();
+        let stalled_rx = rx.clone();
+        let writer_token = conn_token.clone();
+        let writer = compio::runtime::spawn(async move {
+            let _stalled = stalled_rx;
+            writer_token.wait().await;
+        });
+        let reader = spawn_dummy_reader(conn_token.clone());
+        let token = reg
+            .insert(key, tx, writer, reader, conn_shutdown)
+            .expect("insert ok");
+        (token, rx, conn_token)
+    }
+
+    /// Mirror of `try_send_to_instance_returns_msg_when_slot_missing` for the
     /// fixed-array `ReplicaRegistry`. Guards the slow-path forward in
     /// `send_to_replica` against silent payload loss when no slot exists.
     #[compio::test]
@@ -1358,10 +1642,10 @@ mod tests {
     #[compio::test]
     async fn in_process_slot_receives_fired_reply() {
         let reg: ConnectionRegistry<u8> = ConnectionRegistry::new();
-        reg.insert_in_process(1u8).expect("fresh key");
+        let instance = reg.insert_in_process(1u8).expect("fresh key");
 
         let (guard, reply_rx) = reg.install_reply_slot(1u8, 42).expect("slot installs");
-        let msg = match reg.try_send_or_return(1u8, make_bus_msg()) {
+        let msg = match reg.try_send_to_instance(1u8, instance, make_bus_msg()) {
             ReplyRoute::InProcess(msg) => msg,
             other => panic!("expected InProcess route, got {other:?}"),
         };

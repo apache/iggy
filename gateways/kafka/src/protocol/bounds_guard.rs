@@ -741,6 +741,68 @@ pub fn validate_delete_topics_shape(
     Ok(())
 }
 
+/// Mirrors the field order `CreatePartitionsRequest::decode` walks.
+///
+/// Each topic's `assignments` array is nullable (a client that names no replicas sends null),
+/// and each assignment's `broker_ids` array is not.
+///
+/// # Errors
+///
+/// Returns an error when a declared array/string/bytes length cannot fit in the bytes remaining
+/// in the frame, or the body is truncated or malformed in a way that cannot be walked.
+pub fn validate_create_partitions_shape(
+    version: i16,
+    body: &Bytes,
+    max_frame_size: usize,
+) -> Result<()> {
+    let mut c = ShapeCursor::new(body.clone(), max_frame_size);
+    let flexible = version >= 2;
+
+    let topics_count = if flexible {
+        c.compact_array_count()?
+    } else {
+        c.legacy_array_count()?
+    };
+    for _ in 0..topics_count {
+        if flexible {
+            c.compact_string(false)?;
+        } else {
+            c.legacy_string(false)?;
+        }
+        let _count = c.read_i32()?;
+
+        let assignments_count = if flexible {
+            c.compact_array_count_nullable()?
+        } else {
+            c.legacy_array_count_nullable()?
+        };
+        for _ in 0..assignments_count {
+            let broker_ids_count = if flexible {
+                c.compact_array_count()?
+            } else {
+                c.legacy_array_count()?
+            };
+            for _ in 0..broker_ids_count {
+                let _broker_id = c.read_i32()?;
+            }
+            if flexible {
+                c.tagged_fields()?;
+            }
+        }
+
+        if flexible {
+            c.tagged_fields()?;
+        }
+    }
+
+    let _timeout_ms = c.read_i32()?;
+    let _validate_only = c.read_bool()?;
+    if flexible {
+        c.tagged_fields()?;
+    }
+    Ok(())
+}
+
 /// Mirrors the field order `MetadataRequest::decode` walks.
 ///
 /// # Errors
@@ -1269,6 +1331,66 @@ pub fn validate_list_groups_shape(version: i16, body: &Bytes, max_frame_size: us
     Ok(())
 }
 
+/// Mirrors the field order `DeleteGroupsRequest::decode` walks.
+///
+/// Group ids are echoed, so their lengths count toward the projected response.
+///
+/// # Errors
+///
+/// Returns an error when a declared array/string length cannot fit in the bytes remaining in the
+/// frame, or the body is truncated or malformed in a way that cannot be walked.
+pub fn validate_delete_groups_shape(
+    version: i16,
+    body: &Bytes,
+    max_frame_size: usize,
+) -> Result<()> {
+    let mut c = ShapeCursor::new(body.clone(), max_frame_size);
+    let flexible = version >= 2;
+    let groups_count = if flexible {
+        c.compact_array_count()?
+    } else {
+        c.legacy_array_count()?
+    };
+    for _ in 0..groups_count {
+        if flexible {
+            c.compact_string(false)?;
+        } else {
+            c.legacy_string(false)?;
+        }
+    }
+    if flexible {
+        c.tagged_fields()?;
+    }
+    Ok(())
+}
+
+/// Mirrors the field order `OffsetDeleteRequest::decode` walks at v0, the only version this
+/// gateway advertises.
+///
+/// Topic names are echoed, so their lengths count toward the projected response.
+///
+/// # Errors
+///
+/// Returns an error when a declared array/string length cannot fit in the bytes remaining in the
+/// frame, or the body is truncated or malformed in a way that cannot be walked.
+pub fn validate_offset_delete_shape(
+    _version: i16,
+    body: &Bytes,
+    max_frame_size: usize,
+) -> Result<()> {
+    let mut c = ShapeCursor::new(body.clone(), max_frame_size);
+    c.legacy_string(false)?;
+    let topics_count = c.legacy_array_count()?;
+    for _ in 0..topics_count {
+        c.legacy_string(false)?;
+        let partitions_count = c.legacy_array_count()?;
+        for _ in 0..partitions_count {
+            let _partition_index = c.read_i32()?;
+        }
+    }
+    Ok(())
+}
+
 /// Cap on a whole `SaslAuthenticate` body.
 ///
 /// The body is one length-prefixed blob, so capping it is the same as capping `auth_bytes`.
@@ -1386,6 +1508,60 @@ pub fn validate_alter_configs_shape(
     Ok(())
 }
 
+/// Mirrors the field order `IncrementalAlterConfigsRequest::decode` walks.
+///
+/// # Errors
+///
+/// Returns an error when a declared array or string length cannot fit in the bytes remaining
+/// in the frame, or the body is truncated or malformed in a way that cannot be walked.
+pub fn validate_incremental_alter_configs_shape(
+    version: i16,
+    body: &Bytes,
+    max_frame_size: usize,
+) -> Result<()> {
+    let mut c = ShapeCursor::new(body.clone(), max_frame_size);
+    let flexible = version >= 1;
+
+    let resources_count = if flexible {
+        c.compact_array_count()?
+    } else {
+        c.legacy_array_count()?
+    };
+    for _ in 0..resources_count {
+        let _resource_type = c.read_i8()?;
+        if flexible {
+            c.compact_string(false)?;
+        } else {
+            c.legacy_string(false)?;
+        }
+        let configs_count = if flexible {
+            c.compact_array_count()?
+        } else {
+            c.legacy_array_count()?
+        };
+        for _ in 0..configs_count {
+            if flexible {
+                c.compact_string(false)?;
+                let _config_operation = c.read_i8()?;
+                c.compact_string(true)?;
+                c.tagged_fields()?;
+            } else {
+                c.legacy_string(false)?;
+                let _config_operation = c.read_i8()?;
+                c.legacy_string(true)?;
+            }
+        }
+        if flexible {
+            c.tagged_fields()?;
+        }
+    }
+    let _validate_only = c.read_bool()?;
+    if flexible {
+        c.tagged_fields()?;
+    }
+    Ok(())
+}
+
 /// `DescribeAcls` carries a fixed-shape filter: four enums and three nullable strings.
 ///
 /// No arrays and nothing echoed into the response, so there is no amplification to project. The
@@ -1416,6 +1592,27 @@ pub fn validate_describe_acls_shape(version: i16, body: &Bytes) -> Result<()> {
     if flexible {
         c.tagged_fields()?;
     }
+    Ok(())
+}
+
+/// Mirrors the field order `DescribeClusterRequest::decode` walks. Every version is flexible.
+///
+/// Fixed-width fields only, and the response echoes none of them, so the walk exists to bound
+/// the tagged fields before `kafka_protocol` reads them.
+///
+/// # Errors
+///
+/// Returns an error when a tagged field's declared length does not fit the remaining frame.
+pub fn validate_describe_cluster_shape(version: i16, body: &Bytes) -> Result<()> {
+    let mut c = ShapeCursor::new(body.clone(), usize::MAX);
+    c.read_bool()?;
+    if version >= 1 {
+        c.read_i8()?;
+    }
+    if version >= 2 {
+        c.read_bool()?;
+    }
+    c.tagged_fields()?;
     Ok(())
 }
 
@@ -1487,8 +1684,8 @@ fn walk_offset_fetch_topics(
 mod tests {
     use bytes::BytesMut;
     use kafka_protocol::messages::{
-        DescribeGroupsRequest, LeaveGroupRequest, ListGroupsRequest, OffsetCommitRequest,
-        OffsetFetchRequest,
+        DeleteGroupsRequest, DescribeGroupsRequest, LeaveGroupRequest, ListGroupsRequest,
+        OffsetCommitRequest, OffsetDeleteRequest, OffsetFetchRequest,
     };
 
     use super::*;
@@ -1720,6 +1917,86 @@ mod tests {
             0x03, 0xE8, // first name's declared length: 1000, no bytes follow
         ]);
         assert!(validate_delete_topics_shape(1, &body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    /// Same POC class as `delete_topics_v5_huge_topic_names_count_rejected`, against
+    /// `validate_create_partitions_shape`'s own `topics` compact array count.
+    #[test]
+    fn create_partitions_v3_huge_topics_count_rejected() {
+        let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F]);
+        assert!(validate_create_partitions_shape(3, &body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    /// The nested `broker_ids` count: one topic with one assignment whose replica list claims
+    /// more entries than the frame holds.
+    #[test]
+    fn create_partitions_v3_huge_broker_ids_count_rejected() {
+        let body = Bytes::from_static(&[
+            0x02, // topics: one entry
+            0x07, b'o', b'r', b'd', b'e', b'r', b's', // name
+            0x00, 0x00, 0x00, 0x02, // count
+            0x02, // assignments: one entry
+            0xFF, 0xFF, 0xFF, 0xFF, 0x0F, // u32::MAX broker ids
+        ]);
+        assert!(validate_create_partitions_shape(3, &body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    /// Legacy shape: a declared topic-name length with nothing behind it, the `legacy_string`
+    /// branch below v2.
+    #[test]
+    fn create_partitions_v0_truncated_legacy_topic_name_rejected() {
+        let body = Bytes::from_static(&[
+            0x00, 0x00, 0x00, 0x01, // topics: legacy array count = 1
+            0x03, 0xE8, // first name's declared length: 1000, no bytes follow
+        ]);
+        assert!(validate_create_partitions_shape(0, &body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    /// The shape every client sends for `NewPartitions.increaseTo(n)`: one topic, a null
+    /// assignments array, at both wire encodings.
+    #[test]
+    fn create_partitions_well_formed_requests_accepted() {
+        let flexible = Bytes::from_static(&[
+            0x02, // topics: one entry
+            0x07, b'o', b'r', b'd', b'e', b'r', b's', // name
+            0x00, 0x00, 0x00, 0x03, // count
+            0x00, // assignments: null
+            0x00, // topic tagged fields
+            0x00, 0x00, 0x13, 0x88, // timeout_ms
+            0x00, // validate_only
+            0x00, // request tagged fields
+        ]);
+        assert!(validate_create_partitions_shape(3, &flexible, TEST_MAX_FRAME_SIZE).is_ok());
+
+        let legacy = Bytes::from_static(&[
+            0x00, 0x00, 0x00, 0x01, // topics: one entry
+            0x00, 0x06, b'o', b'r', b'd', b'e', b'r', b's', // name
+            0x00, 0x00, 0x00, 0x03, // count
+            0xFF, 0xFF, 0xFF, 0xFF, // assignments: null
+            0x00, 0x00, 0x13, 0x88, // timeout_ms
+            0x00, // validate_only
+        ]);
+        assert!(validate_create_partitions_shape(0, &legacy, TEST_MAX_FRAME_SIZE).is_ok());
+    }
+
+    /// A present assignment list, so the nested `broker_ids` walk and its tagged fields are
+    /// consumed at the right offsets and the trailer still lines up.
+    #[test]
+    fn create_partitions_v3_with_an_assignment_accepted() {
+        let body = Bytes::from_static(&[
+            0x02, // topics: one entry
+            0x07, b'o', b'r', b'd', b'e', b'r', b's', // name
+            0x00, 0x00, 0x00, 0x02, // count
+            0x02, // assignments: one entry
+            0x02, // broker_ids: one entry
+            0x00, 0x00, 0x00, 0x01, // broker id 1
+            0x00, // assignment tagged fields
+            0x00, // topic tagged fields
+            0x00, 0x00, 0x13, 0x88, // timeout_ms
+            0x01, // validate_only
+            0x00, // request tagged fields
+        ]);
+        assert!(validate_create_partitions_shape(3, &body, TEST_MAX_FRAME_SIZE).is_ok());
     }
 
     /// Reviewed POC (C2): 1 topic x 65,535 partitions was within the *old* 65,536 cumulative
@@ -2054,6 +2331,34 @@ mod tests {
     }
 
     #[test]
+    fn incremental_alter_configs_v0_huge_legacy_count_rejected() {
+        let body = Bytes::from_static(&[0x7F, 0xFF, 0xFF, 0xFF]);
+        assert!(validate_incremental_alter_configs_shape(0, &body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    #[test]
+    fn incremental_alter_configs_v1_huge_compact_count_rejected() {
+        let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F]); // u32::MAX, 5-byte varint
+        assert!(validate_incremental_alter_configs_shape(1, &body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    /// A config entry declaring a value longer than the frame is caught by the walk, at the
+    /// nullable-string position that only this request has after the operation byte.
+    #[test]
+    fn incremental_alter_configs_v0_overlong_value_rejected() {
+        let body = Bytes::from_static(&[
+            0x00, 0x00, 0x00, 0x01, // one resource
+            0x02, // resource_type
+            0x00, 0x01, b'a', // resource_name
+            0x00, 0x00, 0x00, 0x01, // one config
+            0x00, 0x01, b'k', // name
+            0x00, // config_operation
+            0x7F, 0xFF, // value length past the frame
+        ]);
+        assert!(validate_incremental_alter_configs_shape(0, &body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    #[test]
     fn describe_groups_v5_huge_group_count_rejected() {
         let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F]);
         assert!(validate_describe_groups_shape(5, &body, TEST_MAX_FRAME_SIZE).is_err());
@@ -2103,6 +2408,59 @@ mod tests {
     fn list_groups_v4_huge_states_filter_rejected() {
         let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F]);
         assert!(validate_list_groups_shape(4, &body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    #[test]
+    fn delete_groups_v0_two_groups_accepted() {
+        let body = Bytes::from_static(&[
+            0x00, 0x00, 0x00, 0x02, // groups_names: 2
+            0x00, 0x01, b'g', // first
+            0x00, 0x02, b'g', b'2', // second
+        ]);
+        assert!(validate_delete_groups_shape(0, &body, TEST_MAX_FRAME_SIZE).is_ok());
+        decode_exhaustive::<DeleteGroupsRequest>(0, body).expect("body matches the schema");
+    }
+
+    #[test]
+    fn delete_groups_v2_one_group_accepted() {
+        let body = Bytes::from_static(&[
+            0x02, // groups_names: 1
+            0x02, b'g', // group id
+            0x00, // tagged fields
+        ]);
+        assert!(validate_delete_groups_shape(2, &body, TEST_MAX_FRAME_SIZE).is_ok());
+        decode_exhaustive::<DeleteGroupsRequest>(2, body).expect("body matches the schema");
+    }
+
+    #[test]
+    fn delete_groups_v2_huge_group_count_rejected() {
+        let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F]);
+        assert!(validate_delete_groups_shape(2, &body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    #[test]
+    fn offset_delete_v0_topic_with_partitions_accepted() {
+        let body = Bytes::from_static(&[
+            0x00, 0x01, b'g', // group_id
+            0x00, 0x00, 0x00, 0x01, // topics: 1
+            0x00, 0x01, b't', // name
+            0x00, 0x00, 0x00, 0x02, // partitions: 2
+            0x00, 0x00, 0x00, 0x00, // 0
+            0x00, 0x00, 0x00, 0x01, // 1
+        ]);
+        assert!(validate_offset_delete_shape(0, &body, TEST_MAX_FRAME_SIZE).is_ok());
+        decode_exhaustive::<OffsetDeleteRequest>(0, body).expect("body matches the schema");
+    }
+
+    #[test]
+    fn offset_delete_v0_huge_partitions_count_rejected() {
+        let body = Bytes::from_static(&[
+            0x00, 0x01, b'g', // group_id
+            0x00, 0x00, 0x00, 0x01, // topics: 1
+            0x00, 0x01, b't', // name
+            0x7F, 0xFF, 0xFF, 0xFF, // partitions count
+        ]);
+        assert!(validate_offset_delete_shape(0, &body, TEST_MAX_FRAME_SIZE).is_err());
     }
 
     #[test]

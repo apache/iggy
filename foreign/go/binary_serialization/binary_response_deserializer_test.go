@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
@@ -83,9 +84,14 @@ func TestDeserializeFetchMessages_EmptyPayload(t *testing.T) {
 }
 
 func encodeStream(id uint32, createdAt uint64, topicsCount uint32, sizeBytes, messagesCount uint64, name string) []byte {
-	// Trailing 4 zero bytes: the u32 length prefix of an empty options block.
+	return encodeStreamWithOptions(id, createdAt, topicsCount, sizeBytes, messagesCount, name, nil, nil)
+}
+
+// encodeStreamWithOptions appends the explicit and derived options blocks,
+// each behind its u32 length prefix.
+func encodeStreamWithOptions(id uint32, createdAt uint64, topicsCount uint32, sizeBytes, messagesCount uint64, name string, explicit, derived []byte) []byte {
 	nameBytes := []byte(name)
-	buf := make([]byte, streamFixedSize+len(nameBytes)+4)
+	buf := make([]byte, streamFixedSize+len(nameBytes))
 	binary.LittleEndian.PutUint32(buf[0:4], id)
 	binary.LittleEndian.PutUint64(buf[4:12], createdAt)
 	binary.LittleEndian.PutUint32(buf[12:16], topicsCount)
@@ -93,6 +99,10 @@ func encodeStream(id uint32, createdAt uint64, topicsCount uint32, sizeBytes, me
 	binary.LittleEndian.PutUint64(buf[24:32], messagesCount)
 	buf[32] = byte(len(nameBytes))
 	copy(buf[33:], nameBytes)
+	for _, block := range [][]byte{explicit, derived} {
+		buf = binary.LittleEndian.AppendUint32(buf, uint32(len(block)))
+		buf = append(buf, block...)
+	}
 	return buf
 }
 
@@ -150,7 +160,7 @@ func TestDeserializeToStream_TruncatedName(t *testing.T) {
 
 func TestDeserializeToStream_TruncatedOptions(t *testing.T) {
 	full := encodeStream(1, 100, 0, 0, 0, "s")
-	for cut := 1; cut <= 4; cut++ {
+	for cut := 1; cut <= 8; cut++ {
 		_, _, err := DeserializeToStream(full[:len(full)-cut], 0)
 		if err == nil {
 			t.Fatalf("expected error for options prefix cut by %d bytes, got nil", cut)
@@ -163,9 +173,11 @@ func TestDeserializeToStream_WithOptions(t *testing.T) {
 		Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte("future_key")},
 		Value: iggcon.HeaderValue{Kind: iggcon.String, Value: []byte("value")},
 	}})
-	payload := encodeStream(7, 500, 0, 0, 0, "with-options")
-	binary.LittleEndian.PutUint32(payload[len(payload)-4:], uint32(len(options)))
-	payload = append(payload, options...)
+	derived := iggcon.GetHeadersBytes([]iggcon.HeaderEntry{{
+		Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte("encryption_key_source")},
+		Value: iggcon.HeaderValue{Kind: iggcon.String, Value: []byte("server")},
+	}})
+	payload := encodeStreamWithOptions(7, 500, 0, 0, 0, "with-options", options, derived)
 
 	stream, readBytes, err := DeserializeToStream(payload, 0)
 	if err != nil {
@@ -180,6 +192,12 @@ func TestDeserializeToStream_WithOptions(t *testing.T) {
 	}
 	if value.Kind != iggcon.String || string(value.Value) != "value" {
 		t.Errorf("Options[future_key] = %+v, want String %q", value, "value")
+	}
+	if _, explicit := stream.Options["encryption_key_source"]; explicit {
+		t.Errorf("Options = %v, a derived key must stay out of the explicit map", stream.Options)
+	}
+	if source, ok := stream.EncryptionKeySource(); !ok || source != iggcon.StreamEncryptionSourceServer {
+		t.Errorf("EncryptionKeySource = %q, %t, want %q from the derived block", source, ok, iggcon.StreamEncryptionSourceServer)
 	}
 }
 
@@ -201,11 +219,17 @@ func TestReadLengthPrefixed_RejectsALengthPastTheBuffer(t *testing.T) {
 }
 
 func TestDeserializeToStream_RejectsAnOptionsLengthPastTheBuffer(t *testing.T) {
-	payload := encodeStream(1, 100, 0, 0, 0, "s")
-	binary.LittleEndian.PutUint32(payload[len(payload)-4:], 0xFFFFFFFF)
+	for _, prefix := range []string{"explicit", "derived"} {
+		payload := encodeStream(1, 100, 0, 0, 0, "s")
+		offset := len(payload) - 4
+		if prefix == "explicit" {
+			offset -= 4
+		}
+		binary.LittleEndian.PutUint32(payload[offset:], 0xFFFFFFFF)
 
-	if _, _, err := DeserializeToStream(payload, 0); err == nil {
-		t.Fatal("expected an error for an options length of 0xFFFFFFFF, got nil")
+		if _, _, err := DeserializeToStream(payload, 0); err == nil {
+			t.Fatalf("expected an error for a %s options length of 0xFFFFFFFF, got nil", prefix)
+		}
 	}
 }
 
@@ -332,5 +356,39 @@ func TestDeserializeStream_LyingTopicsCountDoesNotPreallocate(t *testing.T) {
 
 	if _, err := DeserializeStream(payload); err == nil {
 		t.Fatal("expected error for topics count with no elements, got nil")
+	}
+}
+
+func TestDeserializeAccessTokens_ReadsExpiryAsMicroseconds(t *testing.T) {
+	const expiryMicros = 1_792_000_000_123_456
+	appendToken := func(payload []byte, name string, expiry uint64) []byte {
+		payload = append(payload, byte(len(name)))
+		payload = append(payload, name...)
+		return binary.LittleEndian.AppendUint64(payload, expiry)
+	}
+	payload := appendToken(appendToken(nil, "never", 0), "expiring", expiryMicros)
+
+	tokens, err := DeserializeAccessTokens(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tokens) != 2 {
+		t.Fatalf("got %d tokens, want 2: %+v", len(tokens), tokens)
+	}
+	if tokens[0].Name != "never" || tokens[0].Expiry != nil {
+		t.Errorf("token without expiry decoded as %s expiring at %v, want never with no expiry", tokens[0].Name, tokens[0].Expiry)
+	}
+	if tokens[1].Name != "expiring" || tokens[1].Expiry == nil || !tokens[1].Expiry.Equal(time.UnixMicro(expiryMicros)) {
+		t.Errorf("token with expiry decoded as %s expiring at %v, want expiring at %v", tokens[1].Name, tokens[1].Expiry, time.UnixMicro(expiryMicros))
+	}
+}
+
+func TestDeserializeAccessTokens_EmptyPayloadIsAnEmptyList(t *testing.T) {
+	tokens, err := DeserializeAccessTokens(nil)
+	if err != nil {
+		t.Fatalf("a user without tokens got error %v, want an empty list", err)
+	}
+	if len(tokens) != 0 {
+		t.Fatalf("got %+v, want no tokens", tokens)
 	}
 }

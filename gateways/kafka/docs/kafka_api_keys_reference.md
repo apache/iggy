@@ -90,10 +90,11 @@ Key new minimums:
 | 14 | **SyncGroup** | 1 | 5 | v4 | 🟠 Required Stub |
 | 15 | **DescribeGroups** | 0 | 6 | v5 | Implemented |
 | 16 | **ListGroups** | 1 | 5 | v3 | Implemented |
-| 42 | **DeleteGroups** | 1 | 2 | v2 | 🟡 Optional Stub |
+| 42 | **DeleteGroups** | 1 | 2 | v2 | Implemented |
 
-> DescribeGroups and ListGroups are implemented. They read this coordinator's in-memory groups.
-> See [`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md).
+> DescribeGroups and ListGroups are implemented. They read this coordinator's in-memory groups, and
+> report a group that only holds offsets in Iggy as `Empty`. DeleteGroups, and OffsetDelete (47)
+> below, delete those offsets. See [`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md).
 
 ---
 
@@ -183,7 +184,7 @@ Key new minimums:
 | 43 | **ElectLeaders** | 0 | 2 | v2 | 🟡 Optional Stub |
 | 45 | **AlterPartitionReassignments** | 0 | 0 | v0 | 🟡 Optional Stub |
 | 46 | **ListPartitionReassignments** | 0 | 0 | v0 | 🟡 Optional Stub |
-| 47 | **OffsetDelete** | 0 | 0 | never | 🟡 Optional Stub |
+| 47 | **OffsetDelete** | 0 | 0 | never | Implemented |
 | 57 | **UpdateFeatures** | 0 | 1 | v1 | 🟡 Optional Stub |
 
 ---
@@ -194,7 +195,7 @@ Key new minimums:
 | :---: | ---------- | :---------: | :---------: | :-------------: | :--------------: |
 | 55 | **DescribeQuorum** | 0 | 2 | v0 | 🟡 Optional Stub |
 | 59 | **FetchSnapshot** | 0 | 1 | v0 | 🟡 Optional Stub |
-| 60 | **DescribeCluster** | 0 | 1 | v0 | 🟡 Optional Stub |
+| 60 | **DescribeCluster** | 0 | 2 | v0 | Implemented |
 | 61 | **DescribeProducers** | 0 | 0 | v0 | 🟡 Optional Stub |
 | 64 | **UnregisterBroker** | 0 | 0 | v0 | 🟡 Optional Stub |
 | 65 | **DescribeTransactions** | 0 | 0 | v0 | 🟡 Optional Stub |
@@ -272,7 +273,7 @@ Key new minimums:
 | ---------- | :-----: | ------- |
 | 🔴 Bridge (data path) | 10 | Produce, Fetch, ListOffsets, Metadata, OffsetCommit, OffsetFetch, SaslHandshake, ApiVersions, SaslAuthenticate, ShareFetch |
 | 🟠 Required Stub (client state machine) | 10 | Consumer group (10-14), CreateTopics (19), InitProducerId (22), ConsumerGroupHeartbeat (68), ShareGroupHeartbeat (77), ShareAcknowledge (80) |
-| Implemented | 2 | DescribeGroups (15), ListGroups (16) |
+| Implemented | 3 | DescribeGroups (15), ListGroups (16), DescribeCluster (60) |
 | 🟡 Optional Stub (admin/observability) | 39 | Can return `UNSUPPORTED_VERSION` or `NOT_CONTROLLER` safely |
 | ❌ Unadvertised | 5 | AddPartitionsToTxn (24), AddOffsetsToTxn (25), EndTxn (26), TxnOffsetCommit (28), and DeleteRecords (21). Absent from ApiVersions, so a conforming client never sends one |
 | ❌ Reject (broker/KRaft internal) | 22 | Return `INVALID_REQUEST` with valid frame — never close the TCP connection |

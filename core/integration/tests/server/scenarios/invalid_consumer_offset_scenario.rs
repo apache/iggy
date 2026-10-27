@@ -86,7 +86,10 @@ pub async fn run(harness: &TestHarness) {
 }
 
 async fn initialize(client: &IggyClient, stream: &Identifier, topic: &Identifier) -> bool {
-    client.create_stream(STREAM_NAME).await.unwrap();
+    client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     client
         .create_topic(
             stream,

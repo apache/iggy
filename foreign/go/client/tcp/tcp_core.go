@@ -59,7 +59,9 @@ type IggyTcpClient struct {
 	sessionFence       uint64
 	sessionUserID      uint32
 	loggedOut          bool
+	autoLoginBlocked   bool
 	rememberedLogin    AutoLogin
+	epoch              atomic.Pointer[signInEpoch]
 	metadataWatermark  atomic.Uint64
 	operations         *operationRegistry
 	links              *replicaLinks
@@ -173,11 +175,16 @@ func WithServerAddress(address string) Option {
 	}
 }
 
-// WithAutoLogin supplies credentials for the initial session and terminal
-// session recovery. Replacement links bind the existing identity. Without it,
-// successful explicit sign-ins supply remembered credentials until logout.
-// A committed password change or rename of that user updates the stored
-// credentials, also when it is sent raw or proved by ResolveOperation.
+// WithAutoLogin supplies credentials for the initial session. Replacement
+// links bind the existing identity. A terminal session recovery signs in with
+// these credentials until the caller signs in with LoginUser or
+// LoginWithPersonalAccessToken, and as that sign-in after it. After
+// LogoutUser, only such a sign-in by the caller or a Connect after Disconnect
+// signs in again. Disconnect forgets the sign-in of the caller, so the next
+// Connect signs in with these credentials. A failed explicit sign-in or a
+// credential refusal blocks automatic sign-in until another explicit attempt.
+// A committed password change or rename updates stored credentials, also
+// when it is sent raw or proved by ResolveOperation.
 func WithAutoLogin(credentials Credentials) Option {
 	return func(opts *Options) {
 		opts.config.autoLogin = NewAutoLogin(credentials)
@@ -255,6 +262,7 @@ func NewIggyTcpClient(logger *slog.Logger, options ...Option) *IggyTcpClient {
 	client := &IggyTcpClient{config: opts.config, logger: logger, session: vsr.NewSession(), sessionFence: 1, registerGate: make(chan struct{}, 1), closed: make(chan struct{})}
 	client.operations = newOperationRegistry(opts.config.maxPendingOperations, opts.config.maxPendingBytes)
 	client.links = newReplicaLinks(client)
+	client.epoch.Store(newSignInEpoch())
 	return client
 }
 
@@ -267,14 +275,24 @@ const (
 	failoverDialTimeout       = 2 * time.Second
 )
 
-type operationDeadline struct{}
+// operationScope marks the context of a call. Its value is the sign-in epoch
+// that the call started in, which every request inside the call keeps.
+type operationScope struct{}
 
-func operationContext(ctx context.Context) (context.Context, context.CancelFunc) {
-	if ctx.Value(operationDeadline{}) != nil {
+func (c *IggyTcpClient) operationContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx.Value(operationScope{}) != nil {
 		return ctx, func() {}
 	}
 	timed, cancel := context.WithTimeout(ctx, responseReadTimeout)
-	return context.WithValue(timed, operationDeadline{}, true), cancel
+	return context.WithValue(timed, operationScope{}, c.epoch.Load()), cancel
+}
+
+// callEpoch is the sign-in epoch that the call of ctx started in.
+func (c *IggyTcpClient) callEpoch(ctx context.Context) *signInEpoch {
+	if epoch, ok := ctx.Value(operationScope{}).(*signInEpoch); ok {
+		return epoch
+	}
+	return c.epoch.Load()
 }
 
 // requestBufPool reuses wire-payload buffers across RPCs. A fresh buffer
@@ -306,10 +324,17 @@ func releaseRequestBuf(bp *[]byte) {
 // do sends the command and returns the response body. Commands implementing
 // the appender interface encode directly into a pooled buffer.
 func (c *IggyTcpClient) do(ctx context.Context, cmd command.Command) ([]byte, error) {
+	return c.doCaptured(ctx, cmd, nil, nil)
+}
+
+// doCaptured is do for a partition command that carries captured, a context
+// the caller holds, instead of the context its route names, and for a command
+// sent to the replica the caller chose.
+func (c *IggyTcpClient) doCaptured(ctx context.Context, cmd command.Command, captured *iggcon.PartitionContext, replica *uint8) ([]byte, error) {
 	if ctx == nil {
 		return nil, ierror.ErrNilContext
 	}
-	ctx, cancel := operationContext(ctx)
+	ctx, cancel := c.operationContext(ctx)
 	defer cancel()
 	bp := acquireRequestBuf()
 	defer releaseRequestBuf(bp)
@@ -325,16 +350,12 @@ func (c *IggyTcpClient) do(ctx context.Context, cmd command.Command) ([]byte, er
 		if err != nil {
 			return nil, err
 		}
-		var captured *iggcon.PartitionContext
-		if value, ok := ctx.Value(capturedPartitionContext{}).(iggcon.PartitionContext); ok {
-			captured = &value
-		}
 		if poll, ok := cmd.(*command.PollMessages); ok && poll.Strategy.Context != nil {
 			captured = poll.Strategy.Context
 		}
-		return c.sendRouted(ctx, cmd.Code(), query, frame, captured)
+		return c.drive(ctx, cmd.Code(), query, frame, captured, nil)
 	}
-	return c.drive(ctx, cmd.Code(), nil, frame, nil)
+	return c.drive(ctx, cmd.Code(), nil, frame, nil, replica)
 }
 
 // rawRequest carries a SendBinaryRequest through do, so a raw partition
@@ -363,12 +384,31 @@ func (c *IggyTcpClient) SendBinaryRequest(ctx context.Context, code uint32, payl
 	return c.do(ctx, rawRequest{code: command.Code(code), payload: payload})
 }
 
+// SendBinaryRequestToReplica sends a command code and payload to the replica with id
+// replicaID and returns that replica's raw response body. Session-control codes,
+// replicated commands, polls and consumer offset reads return ierror.ErrInvalidCommand
+// without writing to the connection. A replica the roster does not name, after one
+// roster read, returns ierror.ErrInvalidIdentifier. The replica's own refusal, such as
+// ierror.ErrNotPrimary, is returned as it is.
+func (c *IggyTcpClient) SendBinaryRequestToReplica(ctx context.Context, code uint32, payload []byte, replicaID uint8) ([]byte, error) {
+	if _, replicated := vsr.ReplicatedOperation(code); replicated || isSessionControlCode(code) || isPartitionRead(command.Code(code)) {
+		return nil, ierror.ErrInvalidCommand
+	}
+	return c.doCaptured(ctx, rawRequest{code: command.Code(code), payload: payload}, nil, &replicaID)
+}
+
 // reserveHeader returns buf truncated to exactly the header prologue, growing
 // it as needed. The prologue bytes are not zeroed here: EncodeRequestHeader
 // clears the full header when the frame is stamped, and zeroing twice would
 // write four extra cache lines per request.
 func reserveHeader(buf []byte) []byte {
 	return slices.Grow(buf[:0], vsr.HeaderSize)[:vsr.HeaderSize]
+}
+
+// isPartitionRead reports whether code reads a partition through its primary and
+// incarnation, which a request to a chosen replica does not carry.
+func isPartitionRead(code command.Code) bool {
+	return code == command.PollMessagesCode || code == command.GetOffsetCode
 }
 
 func isSessionControlCode(code uint32) bool {
@@ -402,12 +442,29 @@ func appendCommandFrame(buf []byte, cmd command.Command) ([]byte, error) {
 }
 
 func (c *IggyTcpClient) Connect(ctx context.Context) error {
+	err := c.connect(ctx)
+	var refusal *signInRefusal
+	if errors.As(err, &refusal) {
+		return refusal.err
+	}
+	return err
+}
+
+// connect is Connect, except that a refused sign-in stays a signInRefusal, so
+// the recovery and the calls that wait for the attempt can tell it apart.
+func (c *IggyTcpClient) connect(ctx context.Context) error {
 	if ctx == nil {
 		return ierror.ErrNilContext
 	}
 	if c.config.maxPendingOperations <= 0 || c.config.maxPendingBytes <= 0 {
 		return ierror.ErrInvalidConfiguration
 	}
+	epoch := c.callEpoch(ctx)
+	ctx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(epoch.ctx, cancel)
+	defer cancel()
+	defer stop()
+	ctx = context.WithValue(ctx, operationScope{}, epoch)
 	c.connectMu.Lock()
 	if attempt := c.connectionAttempt; attempt != nil {
 		c.connectMu.Unlock()
@@ -429,14 +486,16 @@ func (c *IggyTcpClient) Connect(ctx context.Context) error {
 		if lifetime == nil {
 			err = ierror.ErrNotConnected
 		} else {
-			sessionCtx, cancel := context.WithCancel(ctx)
-			stop := context.AfterFunc(lifetime, cancel)
-			budgetCtx, endBudget := operationContext(sessionCtx)
-			err = c.establishSession(budgetCtx, link)
-			endBudget()
+			sessionCtx, endSignIn := signInContext(ctx, epoch)
+			stop := context.AfterFunc(lifetime, endSignIn)
+			err = c.establishSession(sessionCtx, link)
 			stop()
-			cancel()
+			endSignIn()
 		}
+	}
+	var refusal *signInRefusal
+	if ended := epoch.err(); ended != nil && !errors.As(err, &refusal) {
+		err = ended
 	}
 	c.connectMu.Lock()
 	attempt.link, attempt.err = link, err
@@ -457,7 +516,7 @@ func (c *IggyTcpClient) ResolveOperation(ctx context.Context, operationID uint64
 	if ctx == nil {
 		return ierror.ErrNilContext
 	}
-	ctx, cancel := operationContext(ctx)
+	ctx, cancel := c.operationContext(ctx)
 	defer cancel()
 	ticket, err := c.operations.resume(ctx, operationID)
 	if errors.Is(err, ierror.ErrOperationNotRetained) {
@@ -483,8 +542,19 @@ func (c *IggyTcpClient) AbandonOperation(ctx context.Context, operationID uint64
 }
 
 func (c *IggyTcpClient) Disconnect() error {
-	c.resetSession(false)
-	c.links.disconnect(true)
+	epoch := c.resetSession(false)
+	c.mtx.Lock()
+	if c.epoch.Load() != epoch {
+		c.mtx.Unlock()
+		return nil
+	}
+	// Registration publication is fenced by the reset. Forget credentials
+	// before waiting, so completion cannot erase a later explicit sign-in.
+	c.rememberedLogin = AutoLogin{}
+	c.loggedOut = c.autoLoginBlocked
+	stopped := c.links.detach()
+	c.mtx.Unlock()
+	stopped(true)
 	c.connectMu.Lock()
 	attempt := c.connectionAttempt
 	c.connectMu.Unlock()

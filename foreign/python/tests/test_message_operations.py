@@ -29,6 +29,7 @@ from apache_iggy import (
     PartitionContext,
     Partitioning,
     PollingStrategy,
+    TopicOptions,
     UserHeaders,
 )
 from apache_iggy import SendMessage as Message
@@ -133,9 +134,7 @@ class TestMessageOperations:
         test_messages = [f"Test message {i} - {unique_id}" for i in range(1, 4)]
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         messages = [Message(msg) for msg in test_messages]
         await iggy_client.send_messages(
@@ -169,9 +168,7 @@ class TestMessageOperations:
         partition_id = 0
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         payloads = [f"Confirmation test {i}" for i in range(3)]
         response = await iggy_client.send_messages(
@@ -211,7 +208,9 @@ class TestMessageOperations:
 
         await iggy_client.create_stream(stream_name)
         await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=3
+            stream=stream_name,
+            name=topic_name,
+            options=TopicOptions(partitions_count=3),
         )
 
         response = await iggy_client.send_messages(
@@ -244,7 +243,7 @@ class TestMessageOperations:
         await iggy_client.create_topic(
             stream=stream_name,
             name=topic_name,
-            partitions_count=partitions_count,
+            options=TopicOptions(partitions_count=partitions_count),
         )
 
         responses = [
@@ -273,7 +272,9 @@ class TestMessageOperations:
 
         await iggy_client.create_stream(stream_name)
         await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=3
+            stream=stream_name,
+            name=topic_name,
+            options=TopicOptions(partitions_count=3),
         )
         partitioning = Partitioning.messages_key(key)
 
@@ -308,9 +309,7 @@ class TestMessageOperations:
         test_messages = [f"Test message {i} - {unique_id}" for i in range(1, 4)]
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         messages = [Message(msg.encode()) for msg in test_messages]
         await iggy_client.send_messages(
@@ -342,9 +341,7 @@ class TestMessageOperations:
         partition_id = 0
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         test_payload = f"Property test - {uuid.uuid4().hex[:8]}"
         message = Message(test_payload)
@@ -395,9 +392,7 @@ class TestMessageOperations:
         }
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         await iggy_client.send_messages(
             stream=stream_name,
@@ -452,9 +447,7 @@ class TestMessageOperations:
         }
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         await iggy_client.send_messages(
             stream=stream_name,
@@ -495,9 +488,7 @@ class TestMessageOperations:
         }
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         await iggy_client.send_messages(
             stream=stream_name,
@@ -797,9 +788,7 @@ class TestMessageOperations:
         expected_payload = payload.encode("utf-8")
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         await iggy_client.send_messages(
             stream=stream_name,
@@ -839,9 +828,7 @@ class TestMessageOperations:
         expected_payload = payload.encode("utf-8")
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         await iggy_client.send_messages(
             stream=stream_name,
@@ -879,9 +866,7 @@ class TestMessageOperations:
         partition_id = 0
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         await iggy_client.send_messages(
             stream=stream_name,
@@ -916,9 +901,7 @@ class TestMessageOperations:
         test_messages = [f"Count test {i} - {unique_name()}" for i in range(3)]
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         await iggy_client.send_messages(
             stream=stream_name,
@@ -951,9 +934,7 @@ class TestMessageOperations:
         test_messages = [f"Count test {i} - {unique_name()}" for i in range(3)]
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         await iggy_client.send_messages(
             stream=stream_name,
@@ -988,9 +969,7 @@ class TestMessageOperations:
         test_messages = [f"Count test {i} - {unique_name()}" for i in range(3)]
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         await iggy_client.send_messages(
             stream=stream_name,
@@ -1020,9 +999,7 @@ class TestMessageOperations:
         partition_id = 0
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         await iggy_client.send_messages(
             stream=stream_name,
@@ -1059,9 +1036,7 @@ class TestMessageOperations:
         test_messages = [f"Polling test {i} - {unique_name()}" for i in range(5)]
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         messages = [Message(msg) for msg in test_messages]
         await iggy_client.send_messages(
@@ -1094,9 +1069,7 @@ class TestMessageOperations:
         test_messages = [f"Polling test {i} - {unique_name()}" for i in range(5)]
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         messages = [Message(msg) for msg in test_messages]
         await iggy_client.send_messages(
@@ -1131,9 +1104,7 @@ class TestMessageOperations:
         test_messages = [f"Polling test {i} - {unique_name()}" for i in range(5)]
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         messages = [Message(msg) for msg in test_messages]
         await iggy_client.send_messages(
@@ -1180,9 +1151,7 @@ class TestMessageOperations:
         test_messages = [f"Polling test {i} - {unique_name()}" for i in range(3)]
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         await iggy_client.send_messages(
             stream=stream_name,
@@ -1225,9 +1194,7 @@ class TestMessageOperations:
         test_messages = [f"Polling test {i} - {unique_name()}" for i in range(5)]
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         for message in test_messages:
             await iggy_client.send_messages(
@@ -1275,9 +1242,7 @@ class TestMessageOperations:
         test_messages = [f"Polling test {i} - {unique_name()}" for i in range(3)]
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         for message in test_messages:
             await iggy_client.send_messages(
@@ -1325,9 +1290,7 @@ class TestMessageOperations:
         new_messages = [f"Polling test {i} - {unique_name()}" for i in range(2)]
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         await iggy_client.send_messages(
             stream=stream_name,
@@ -1385,9 +1348,7 @@ class TestMessageOperations:
         new_messages = [f"Polling test {i} - {unique_name()}" for i in range(2)]
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         await iggy_client.send_messages(
             stream=stream_name,
@@ -1442,9 +1403,7 @@ class TestMessageOperations:
         test_messages = [f"Consumer isolation {i} - {unique_name()}" for i in range(3)]
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
         await iggy_client.send_messages(
             stream=stream_name,
             topic=topic_name,
@@ -1477,9 +1436,7 @@ class TestMessageOperations:
         test_messages = [f"Shared consumer {i} - {unique_name()}" for i in range(3)]
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
         await iggy_client.send_messages(
             stream=stream_name,
             topic=topic_name,
@@ -1577,9 +1534,7 @@ class TestMessageOperations:
         topic_name = unique_name()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         with pytest.raises(ValueError, match="Invalid identifier"):
             await iggy_client.poll_messages(
@@ -1603,7 +1558,9 @@ class TestMessageOperations:
 
         await iggy_client.create_stream(stream_name)
         await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=partitions_count
+            stream=stream_name,
+            name=topic_name,
+            options=TopicOptions(partitions_count=partitions_count),
         )
         for partition_id in range(partitions_count):
             await iggy_client.send_messages(
@@ -1639,7 +1596,9 @@ class TestMessageOperations:
 
         await iggy_client.create_stream(stream_name)
         await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=partitions_count
+            stream=stream_name,
+            name=topic_name,
+            options=TopicOptions(partitions_count=partitions_count),
         )
         await iggy_client.create_consumer_group(stream_name, topic_name, group_name)
         await iggy_client.join_consumer_group(stream_name, topic_name, group_name)
@@ -1684,9 +1643,7 @@ class TestMessageOperations:
         group_name = unique_name()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
         await iggy_client.create_consumer_group(stream_name, topic_name, group_name)
         await iggy_client.send_messages(
             stream=stream_name,
@@ -1718,7 +1675,9 @@ class TestMessageOperations:
 
         await iggy_client.create_stream(stream_name)
         await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=partitions_count
+            stream=stream_name,
+            name=topic_name,
+            options=TopicOptions(partitions_count=partitions_count),
         )
         await iggy_client.create_consumer_group(stream_name, topic_name, group_name)
         await iggy_client.join_consumer_group(stream_name, topic_name, group_name)
@@ -1761,9 +1720,7 @@ class TestMessageOperations:
         test_messages = [f"Group polling {i} - {unique_name()}" for i in range(3)]
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
         await iggy_client.create_consumer_group(stream_name, topic_name, group_name)
         await iggy_client.join_consumer_group(stream_name, topic_name, group_name)
         await wait_for_consumer_group_assignment(

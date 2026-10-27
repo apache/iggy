@@ -20,6 +20,7 @@
 //! exercises directly: `ensure_stream_and_topic` idempotent on repeated calls, and the bridge
 //! module invoked from a real (non-unit) test rather than only compiled.
 
+use iggy::prelude::StreamCreateOptions;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::time::Duration;
@@ -92,15 +93,19 @@ async fn given_timed_out_writes_when_writing_again_should_resolve_all_client_lan
     let bridge = IggyBridge::connect(config).await.expect("bridge");
     let raw = raw_client(&server).await;
     let stream = Identifier::named("kafka").expect("stream name");
-    // The first stream write commits successfully; the second commits an already-exists rejection.
+    bridge
+        .ensure_stream_and_topic("rejected", 1)
+        .await
+        .expect("seed the topic the second write is refused for");
+    // The first topic write commits successfully; the second commits an already-exists rejection.
     for (delayed, next) in [("delayed", "next"), ("rejected", "after_rejection")] {
         replies.send(false).expect("hold replies");
         let result = bridge.create_kafka_topic(delayed, 1).await;
         assert!(matches!(result, Err(BridgeError::Timeout)), "{result:?}");
         assert!(
-            raw.get_stream(&stream)
+            raw.get_topic(&stream, &Identifier::named(delayed).expect("topic name"))
                 .await
-                .expect("stream lookup")
+                .expect("topic lookup")
                 .is_some(),
             "the canceled write committed before its reply was released"
         );
@@ -139,7 +144,7 @@ async fn given_timed_out_writes_when_writing_again_should_resolve_all_client_lan
                 .expect("next topic")
                 .is_some()
         );
-        for unsent in [delayed, "blocked", "blocked_deadline"] {
+        for unsent in ["blocked", "blocked_deadline"] {
             assert!(
                 bridge
                     .get_kafka_topic(unsent)
@@ -552,7 +557,7 @@ async fn ensure_topic_targets_the_streams_live_incarnation_after_a_delete_and_re
         .await
         .expect("delete the stream (and its topic with it)");
     let recreated = raw
-        .create_stream("kafka")
+        .create_stream("kafka", &StreamCreateOptions::default())
         .await
         .expect("recreate a stream under the same name");
     if recreated.id == original.id {

@@ -176,8 +176,11 @@ impl CreateSinkConfig {
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, ConfigEnv)]
 pub struct SinkConfig {
+    // Identity comes from the file: an env KEY would rename the sink and move its consumer group.
+    #[config_env(skip)]
     pub key: String,
     pub enabled: bool,
+    #[config_env(skip)]
     pub version: u64,
     pub name: String,
     pub path: String,
@@ -229,8 +232,11 @@ impl CreateSourceConfig {
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, ConfigEnv)]
 pub struct SourceConfig {
+    // Identity comes from the file: an env KEY would orphan saved state.
+    #[config_env(skip)]
     pub key: String,
     pub enabled: bool,
+    #[config_env(skip)]
     pub version: u64,
     pub name: String,
     pub path: String,
@@ -263,7 +269,11 @@ pub struct StreamConsumerConfig {
     #[config_env(leaf)]
     pub avro_schema_path: Option<PathBuf>,
     pub batch_length: Option<u32>,
+    /// Replaced by `max_wait` and `min_count`. Kept so that a sink that still
+    /// sets it fails to start: without the field, serde ignores the setting.
     pub poll_interval: Option<String>,
+    pub max_wait: Option<String>,
+    pub min_count: Option<u32>,
     pub consumer_group: Option<String>,
 }
 
@@ -438,7 +448,7 @@ impl std::fmt::Display for StreamConsumerConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ stream: {}, topics: {}, schema: {:?}, avro_schema_json: {:?}, avro_schema_path: {:?}, batch_length: {:?}, poll_interval: {:?}, consumer_group: {:?} }}",
+            "{{ stream: {}, topics: {}, schema: {:?}, avro_schema_json: {:?}, avro_schema_path: {:?}, batch_length: {:?}, poll_interval: {:?}, max_wait: {:?}, min_count: {:?}, consumer_group: {:?} }}",
             self.stream,
             self.topics
                 .iter()
@@ -450,6 +460,8 @@ impl std::fmt::Display for StreamConsumerConfig {
             self.avro_schema_path,
             self.batch_length,
             self.poll_interval,
+            self.max_wait,
+            self.min_count,
             self.consumer_group
         )
     }
@@ -488,6 +500,26 @@ impl ConnectorsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use configs::ConfigEnvMappings;
+
+    #[test]
+    fn given_sink_and_source_configs_when_mapped_should_exclude_key_and_version() {
+        for (name, mappings) in [
+            ("sink", SinkConfig::env_mappings()),
+            ("source", SourceConfig::env_mappings()),
+        ] {
+            assert!(
+                mappings.iter().any(|mapping| mapping.env_name == "ENABLED"),
+                "{name} should map ENABLED from the environment"
+            );
+            assert!(
+                mappings
+                    .iter()
+                    .all(|mapping| !matches!(mapping.env_name, "KEY" | "VERSION")),
+                "{name} maps key or version from the environment"
+            );
+        }
+    }
 
     #[test]
     fn given_single_component_key_when_parsed_should_succeed() {

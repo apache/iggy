@@ -294,6 +294,28 @@ for (const [name, value] of rustOperations) {
   );
 }
 
+// Retry identity: a committed reply can carry the operation the primary
+// resolved the request into, and reply correlation maps it back.
+const rustRequestOperationBody = rustOperation.match(
+  /fn request_operation\(&self\) -> Self \{\s*match self \{([\s\S]*?)\n\s*\}\n\s*\}/
+)?.[1] ?? '';
+const rustRequestOperations = new Map();
+for (const [, sources, target] of rustRequestOperationBody.matchAll(
+  /((?:Self::[A-Za-z0-9]+\s*\|?\s*)+)=>\s*\{?\s*Self::([A-Za-z0-9]+)/g
+))
+  for (const [, source] of sources.matchAll(/Self::([A-Za-z0-9]+)/g))
+    rustRequestOperations.set(source, target);
+assert.ok(
+  rustRequestOperations.size > 0,
+  'Rust request_operation mapping not found'
+);
+for (const [name, value] of rustOperations)
+  assert.equal(
+    operationModule.requestOperation?.(value),
+    rustOperations.get(rustRequestOperations.get(name) ?? name),
+    `Node requestOperation(${name}) differs from Rust request_operation`
+  );
+
 const protocolVersion =
   rustProtocolVersion.match(/pub const IGGY_PROTOCOL_VERSION: u32 = pack_protocol_version\(([0-9]+), ([0-9]+), ([0-9]+)\);/);
 assert.ok(protocolVersion, 'binary protocol wire version is missing');

@@ -20,7 +20,7 @@
 
 use std::time::Duration;
 
-use iggy_common::{IggyByteSize, IggyDuration, Validatable};
+use iggy_common::{IggyByteSize, IggyDuration, MAX_DEFERRED_POLL_WAIT_US, Validatable};
 use serde::{Deserialize, Serialize};
 use serde_with::{DisplayFromStr, serde_as};
 use server_common::sharding::PARTITION_IO_CAPACITY_MAX;
@@ -62,6 +62,10 @@ pub const SHUTDOWN_JOIN_TIMEOUT_MAX: Duration = Duration::from_secs(900);
 /// cap reins in pathological typos without disturbing reasonable
 /// production values.
 pub const RECONCILE_PERIODIC_INTERVAL_MAX: Duration = Duration::from_secs(30);
+
+/// Hard upper bound on `deferred_poll_max_inflight_bytes`, the read memory
+/// that each shard can reserve for deferred polls.
+pub const DEFERRED_POLL_INFLIGHT_BYTES_MAX: u64 = 1024 * 1024 * 1024;
 
 // Every omitted field falls back to the frozen `Default`, so a partial
 // `[sharding]` table resolves each key independently instead of
@@ -111,6 +115,27 @@ pub struct ShardingConfig {
     /// the compiled file-job layout.
     #[config_env(leaf)]
     pub partition_io_bytes_max: Option<IggyByteSize>,
+    /// Longest wait of a deferred poll or readiness wait. A longer requested
+    /// wait is shortened to it. At most 10 minutes.
+    #[serde_as(as = "DisplayFromStr")]
+    #[config_env(leaf)]
+    pub deferred_poll_max_wait: IggyDuration,
+    /// Deferred polls and readiness waits parked on one shard. A request
+    /// above the limit is refused with a retryable error.
+    pub deferred_poll_max_pending: usize,
+    /// The part of [`Self::deferred_poll_max_pending`] that one session may
+    /// hold. An HTTP request without a binary session counts against its user.
+    pub deferred_poll_max_pending_per_session: usize,
+    /// The most disk bytes that one deferred poll reserves for its read: three
+    /// times its `max_bytes`, and at least three times the largest disk chunk
+    /// (1 MiB), up to this value. Its reply carries no more than this value, unless the
+    /// first message alone is wider.
+    #[config_env(leaf)]
+    pub deferred_poll_max_read_bytes: IggyByteSize,
+    /// Disk bytes that the deferred reads of one shard reserve together. A
+    /// read that finds no room waits for one. At most 1 GiB.
+    #[config_env(leaf)]
+    pub deferred_poll_max_inflight_bytes: IggyByteSize,
     /// Wall-clock budget for a single shard's bus drain on shutdown.
     /// Drives `IggyMessageBus::shutdown(..)` from the per-shard watchdog
     /// and the parallel-join survivor path. Sized larger than typical
@@ -161,6 +186,26 @@ impl Default for ShardingConfig {
             poll_completion_capacity: SERVER_CONFIG.sharding.poll_completion_capacity as usize,
             partition_io_capacity: SERVER_CONFIG.sharding.partition_io_capacity as usize,
             partition_io_bytes_max: None,
+            deferred_poll_max_wait: SERVER_CONFIG
+                .sharding
+                .deferred_poll_max_wait
+                .parse()
+                .unwrap(),
+            deferred_poll_max_pending: SERVER_CONFIG.sharding.deferred_poll_max_pending as usize,
+            deferred_poll_max_pending_per_session: SERVER_CONFIG
+                .sharding
+                .deferred_poll_max_pending_per_session
+                as usize,
+            deferred_poll_max_read_bytes: SERVER_CONFIG
+                .sharding
+                .deferred_poll_max_read_bytes
+                .parse()
+                .unwrap(),
+            deferred_poll_max_inflight_bytes: SERVER_CONFIG
+                .sharding
+                .deferred_poll_max_inflight_bytes
+                .parse()
+                .unwrap(),
             shutdown_drain_timeout: SERVER_CONFIG
                 .sharding
                 .shutdown_drain_timeout
@@ -249,6 +294,48 @@ impl Validatable<ConfigurationError> for ShardingConfig {
                 "Invalid sharding configuration: poll_completion_capacity {} exceeds the {} \
                  cap (each shard preallocates a completion lane of this size)",
                 self.poll_completion_capacity, INBOX_CAPACITY_MAX
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        let max_wait = IggyDuration::from(Duration::from_micros(MAX_DEFERRED_POLL_WAIT_US));
+        if self.deferred_poll_max_wait.is_zero()
+            || self.deferred_poll_max_wait.get_duration() > max_wait.get_duration()
+        {
+            eprintln!(
+                "Invalid sharding.deferred_poll_max_wait: {} must be above 0 and at most {max_wait}",
+                self.deferred_poll_max_wait
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        let pending = self.deferred_poll_max_pending;
+        if pending == 0 || pending > INBOX_CAPACITY_MAX {
+            eprintln!(
+                "Invalid sharding.deferred_poll_max_pending: {pending} must be in 1..={INBOX_CAPACITY_MAX}"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        let per_session = self.deferred_poll_max_pending_per_session;
+        if per_session == 0 || per_session > pending {
+            eprintln!(
+                "Invalid sharding.deferred_poll_max_pending_per_session: {per_session} must be in \
+                 1..={pending} (deferred_poll_max_pending)"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        let read_bytes = self.deferred_poll_max_read_bytes.as_bytes_u64();
+        let inflight_bytes = self.deferred_poll_max_inflight_bytes.as_bytes_u64();
+        if read_bytes == 0 || read_bytes > inflight_bytes {
+            eprintln!(
+                "Invalid sharding.deferred_poll_max_read_bytes: {read_bytes} bytes must be in \
+                 1..={inflight_bytes} (deferred_poll_max_inflight_bytes)"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if inflight_bytes > DEFERRED_POLL_INFLIGHT_BYTES_MAX {
+            eprintln!(
+                "Invalid sharding.deferred_poll_max_inflight_bytes: {inflight_bytes} bytes must be \
+                 at most {DEFERRED_POLL_INFLIGHT_BYTES_MAX}"
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }

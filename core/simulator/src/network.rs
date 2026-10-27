@@ -153,6 +153,12 @@ impl Network {
         self.simulator.link_drop_packet_fn(from, to)
     }
 
+    /// Returns a mutable reference to the link's extra one-way delay, in ticks.
+    /// See [`PacketSimulator::link_extra_delay`].
+    pub fn link_extra_delay(&mut self, from: ProcessId, to: ProcessId) -> &mut u64 {
+        self.simulator.link_extra_delay(from, to)
+    }
+
     /// Clog a specific link (bidirectionally).
     ///
     /// Clogged links do not deliver any packets until unclogged.

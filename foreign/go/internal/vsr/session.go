@@ -46,14 +46,14 @@ var (
 // It holds the ephemeral client identifier, the session fence the server
 // assigns once Register commits, and the request watermark.
 //
-// Bound snapshots share an atomic request counter across connections. Binding
-// and resetting still require the owning transport's lock.
+// Taking a request id is safe from any goroutine. Binding and resetting
+// require the owning transport's lock.
 type Session struct {
 	bindSecret       [BindSecretBytes]byte
 	client           ClientID
 	session          uint64
 	bound            bool
-	requestCounter   *atomic.Uint64
+	requestCounter   atomic.Uint64
 	registerConsumed bool
 }
 
@@ -65,15 +65,9 @@ func NewSession() *Session {
 // NewSessionWithClientID returns an unbound session with a caller-supplied
 // client identifier.
 func NewSessionWithClientID(client ClientID) *Session {
-	counter := &atomic.Uint64{}
-	counter.Store(1)
-	return &Session{client: client, requestCounter: counter}
-}
-
-// Fork keeps the bound identity and counter while isolating connection teardown.
-func (s *Session) Fork() *Session {
-	snapshot := *s
-	return &snapshot
+	session := &Session{client: client}
+	session.requestCounter.Store(1)
+	return session
 }
 
 // BindSecret returns the registered session proof.

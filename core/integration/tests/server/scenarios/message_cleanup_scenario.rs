@@ -73,7 +73,10 @@ fn cleanup_topic_options() -> TopicCreateOptions {
 
 /// Tests time-based retention: segments are cleaned up after expiry.
 pub async fn run_expiry_after_rotation(client: &IggyClient, data_path: &Path) {
-    let stream = client.create_stream(STREAM_NAME).await.unwrap();
+    let stream = client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     let stream_id = stream.id;
 
     let topic = client
@@ -177,7 +180,10 @@ pub async fn run_expiry_after_rotation(client: &IggyClient, data_path: &Path) {
 
 /// Tests that the active segment is never deleted, even if expired.
 pub async fn run_active_segment_protection(client: &IggyClient, data_path: &Path) {
-    let stream = client.create_stream(STREAM_NAME).await.unwrap();
+    let stream = client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     let stream_id = stream.id;
 
     let expiry = Duration::from_secs(1);
@@ -240,7 +246,10 @@ pub async fn run_active_segment_protection(client: &IggyClient, data_path: &Path
 
 /// Tests size-based retention: oldest segments deleted when topic exceeds max_size.
 pub async fn run_size_based_retention(client: &IggyClient, data_path: &Path) {
-    let stream = client.create_stream(STREAM_NAME).await.unwrap();
+    let stream = client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     let stream_id = stream.id;
 
     // 4 MiB max, cleanup at 90% = 3.6 MiB. The cap has to sit above the 1 MiB
@@ -337,7 +346,10 @@ pub async fn run_size_based_retention(client: &IggyClient, data_path: &Path) {
 
 /// Tests both retention policies together: time-based AND size-based.
 pub async fn run_combined_retention(client: &IggyClient, data_path: &Path) {
-    let stream = client.create_stream(STREAM_NAME).await.unwrap();
+    let stream = client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     let stream_id = stream.id;
 
     let topic = client
@@ -403,7 +415,10 @@ pub async fn run_combined_retention(client: &IggyClient, data_path: &Path) {
 pub async fn run_expiry_with_multiple_partitions(client: &IggyClient, data_path: &Path) {
     const PARTITIONS_COUNT: u32 = 3;
 
-    let stream = client.create_stream(STREAM_NAME).await.unwrap();
+    let stream = client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     let stream_id = stream.id;
 
     let topic = client
@@ -498,7 +513,10 @@ pub async fn run_expiry_with_multiple_partitions(client: &IggyClient, data_path:
 pub async fn run_fair_size_based_cleanup_multipartition(client: &IggyClient, data_path: &Path) {
     const PARTITIONS_COUNT: u32 = 3;
 
-    let stream = client.create_stream(STREAM_NAME).await.unwrap();
+    let stream = client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     let stream_id = stream.id;
 
     // 12 MiB over 3 partitions = a 4 MiB share each. The SHARE is what has to
@@ -626,7 +644,10 @@ pub async fn run_expiry_respects_consumer_offset(client: &IggyClient, data_path:
     const TEST_STREAM: &str = "test_cleaner_barrier_stream";
     const TEST_TOPIC: &str = "test_cleaner_barrier_topic";
 
-    let stream = client.create_stream(TEST_STREAM).await.unwrap();
+    let stream = client
+        .create_stream(TEST_STREAM, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     let stream_id = stream.id;
 
     let topic = client
@@ -757,8 +778,8 @@ async fn expire_messages(client: &IggyClient, stream: &str, topic: &str) {
         .update_topic(
             &Identifier::named(stream).unwrap(),
             &Identifier::named(topic).unwrap(),
-            topic,
             &TopicUpdateOptions {
+                name: Some(topic.to_owned()),
                 message_expiry: Some(IggyExpiry::ExpireDuration(IggyDuration::from(
                     MESSAGE_EXPIRY,
                 ))),

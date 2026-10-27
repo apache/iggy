@@ -104,7 +104,7 @@ The name is an abbreviation for the Italian Greyhound - small yet extremely fast
 - **TLS** support for all transport protocols (TCP, WebSocket, QUIC, HTTPS)
 - **[Connectors](https://github.com/apache/iggy/tree/master/core/connectors)** - sinks, sources and data transformations based on the **custom Rust plugins**
 - **[Model Context Protocol](https://github.com/apache/iggy/tree/master/core/ai/mcp)** - provide context to LLM with **MCP server**
-- Optional server-side as well as client-side **data encryption** using AES-256-GCM
+- Optional server-side as well as client-side **data encryption** using AES-256-GCM, server-side with a separate key per stream
 - Optional metadata support in the form of **message headers**
 - Server-side message compression is not supported yet. Topic compression values
   are reserved for future disk/network compression support; use message headers
@@ -145,6 +145,8 @@ The official releases follow semver (for example `server-0.9.0`), and the Docker
 The server, SDKs and CLI are versioned independently. For example, server 0.9.0 ships with Rust SDK 0.11.0 and CLI 0.14.0. The [server compatibility table](https://iggy.apache.org/docs/sdk/introduction#server-compatibility) lists the SDK version for each server release.
 
 We also publish edge releases (versions with an `-edge.N` suffix, and `apache/iggy:edge`) for the SDKs and the Docker images. They track the latest changes, but are not guaranteed to be stable and are not recommended for production use.
+
+This checkout moves the binary protocol to 0.12.0 and the metadata snapshot format to 14. Both are breaking: older clients and servers do not interoperate with it, and data directories written by older releases are refused. See [Upgrade recovery](core/server/README.md#upgrade-recovery).
 
 ---
 
@@ -196,7 +198,6 @@ stream = "qw"
 topics = ["records"]
 schema = "json"
 batch_length = 1000
-poll_interval = "5ms"
 consumer_group = "qw_sink_connector"
 
 [transforms.add_fields]
@@ -258,7 +259,7 @@ The `SYS_NICE` capability, the seccomp setting and the unlimited locked memory a
 
 On operating systems other than Linux, Docker runs in a VM, so the container might run slower.
 
-To build the image from source instead, run `docker compose up` from the root of the repository. That image listens on all interfaces and keeps its data in `/local_data`. The container is named `iggy-server`, and the CLI is at `/iggy`. Set `IGGY_ROOT_USERNAME` and `IGGY_ROOT_PASSWORD` in `docker-compose.yml`. Otherwise the server generates a root password and prints it once in the container log.
+To build the image from source instead, run `docker compose up` from the root of the repository. That image listens on all interfaces and keeps its data in `/local_data`. The container is named `iggy-server`, and the CLI is at `/iggy`. The compose file requires `IGGY_ROOT_PASSWORD` from your shell (`IGGY_ROOT_PASSWORD=... docker compose up`) and defaults `IGGY_ROOT_USERNAME` to `iggy`.
 
 ---
 
@@ -284,6 +285,17 @@ When config file is not found, the default values from embedded `config.toml` fi
 
 Topic creation accepts two independent policies: `durability` for message acknowledgments and `consumer_offset_durability` for explicit offset stores and deletes. Both default to `replicated`. This means VSR quorum commit without waiting for stable storage. `persisted` also requires recoverable stable-storage copies on the replication quorum. Both policies normally store data on disk. Poll auto-commit remains asynchronous and is not covered by the poll response's completion.
 
+What each policy survives in a cluster of `n` replicas. A partition gets the `persisted` guarantees only when both `durability` and `consumer_offset_durability` are `persisted`. If either is `replicated`, the `replicated` rules below apply to the whole partition.
+
+- `persisted` keeps every acknowledged write through any pattern of crashes and restarts. It is needed to survive `q` or more replicas crashing at once, power loss of the whole cluster, or any crash in a one-replica cluster.
+- `replicated` keeps every acknowledged write as long as fewer than `q` replicas lose unflushed writes at the same time, where `q`, the replicas that acknowledge each write, is half the replicas rounded up but at most 3 (2 in a two-replica cluster). A replica that returns with that partition awaiting a state transfer counts as one of them: its log is not used, even if its WAL still holds ops.
+- Graceful restarts flush the WAL first and lose nothing, one at a time or all together. A crash (SIGKILL, OOM kill) loses the WAL writes not yet handed to the OS, and power loss also loses what the OS had not written to disk. Under `replicated`, `q` or more such crashes at once can lose the most recently acknowledged writes.
+- A restarted `replicated` replica accepts no writes and acknowledges no prepares until it joins a settled view: one a running primary sends it, or one that an election starts. Until then writes and polls sent to it, binary or HTTP, fail with `TransientNotAccepted` (HTTP 503), which clients retry.
+  When no primary answers, the restarted replicas hold an election and mark their logs as possibly incomplete. A new view starts only from `n - q + 1` replicas whose logs are not marked (2 in a two-replica cluster, a majority up to six replicas), or once every replica has reported, and the partition stays unavailable until then.
+  After a full-cluster restart that means every replica must be back. A replica whose partition awaits a state transfer still reports without a log while it is recovering; once it has joined a view it stays out of later elections until its transfer completes. A replica that never returns halts the partition indefinitely (no operator override yet).
+  Mixed versions can drop acknowledged writes, see [Upgrading](core/server/README.md#upgrading).
+- When a replica adopts a view whose headers contradict partition history it already applied, it sets that partition's local files aside in `.fenced.N` and fetches it again from a peer instead of stopping the node. A contradiction outside the headers the view carries, and a WAL append whose parent check fails, still stop the node.
+
 The data directory is configured with `path` or `IGGY_PATH`. The layout beneath it is `streams/<stream>/topics/<topic>/partitions/<partition>`, with fixed directory names.
 
 The HTTP `Iggy-Durability` header reports `replicated` or `persisted` for awaited writes, and `none` for early dispatch acceptance.
@@ -293,6 +305,10 @@ Segment flush thresholds control scheduling, independently of acknowledgment dur
 Rust HTTP callers can use `HttpClient::send_messages_with_durability` to read the advertised guarantee alongside confirmations.
 
 The CLI exposes `--durability persisted` and `--consumer-offset-durability persisted` on `topic create`. Select either independently. The policy names describe completion guarantees and do not prescribe an I/O syscall.
+
+Streams, topics and users carry options from one catalog, listed by `iggy options <scope>` and changed by one sparse update. Each encrypted stream has its own data key, wrapped under the server's `[encryption] key`, and a stream created without encryption stays plaintext for life. Rotating the server key is a two-phase change through `previous_keys` and `retired_kek_fingerprints`. See [Resource options](core/server/README.md#resource-options) and [Stream encryption](core/server/README.md#stream-encryption).
+
+Each node keeps a bounded log of the committed metadata changes, such as a stream created, a topic renamed, a user's permissions changed or a session closed. A client with `manage_servers` follows it with `metadata.changes` on every transport, `GET /metadata/changes` over HTTP or `iggy metadata changes`, and rebuilds from current state pages when its position falls out of the log. See [Metadata changes](core/server/README.md#metadata-changes).
 
 For the detailed documentation of the configuration file, please refer to the [configuration](https://iggy.apache.org/docs/server/configuration) section.
 
@@ -308,10 +324,10 @@ Run the tests:
 
 `cargo test`
 
-Set root user credentials (OPTIONAL):
+Set root user credentials before the first start:
 
 Iggy requires credentials to authenticate requests to the server.
-You can set the root user **before** starting the server.
+Set the root user **before** starting the server.
 
 (macOS/Linux)
 
@@ -327,7 +343,7 @@ $env:IGGY_ROOT_USERNAME = "iggy"
 $env:IGGY_ROOT_PASSWORD = "iggy"
 ```
 
-If no root credentials are set and no users exist yet, `iggy-server` generates a random root user password and prints it once in the server log.
+When root does not exist, the leader needs both variables or `--with-default-root-credentials` below to create it. The server never generates a root password and never writes either credential to its output or log files.
 
 Start the server:
 
@@ -341,7 +357,7 @@ it should only be used for development and testing.
 
 `cargo run --bin iggy-server -- --with-default-root-credentials`
 
-Root credentials are only set on the first server startup when the data directory doesn't exist yet. Once the server has been started and persisted data exists, the existing root credentials will be reused, and the `--with-default-root-credentials` flag or environment variables are ignored. They are still validated, though: a half-set pair or an out-of-range value aborts the boot instead of being silently dropped. To reset credentials, delete the data directory.
+The leader creates root once and records the username and password hash in the metadata journal. Followers apply that same operation. Restarts recover the stored account without the variables or the flag, even before the first metadata checkpoint. Supplying different credentials does not replace the stored account. A half-set pair or an out-of-range value still aborts startup. To change the root password, use the API or the CLI.
 
 For configuration options and detailed help:
 
@@ -465,7 +481,6 @@ let mut consumer = client
     .create_consumer_group_if_not_exists()
     .auto_join_consumer_group()
     .polling_strategy(PollingStrategy::next())
-    .poll_interval(IggyDuration::from_str("1ms")?)
     .batch_length(1000)
     .build();
 

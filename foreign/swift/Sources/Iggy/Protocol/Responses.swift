@@ -43,7 +43,9 @@ enum Responses {
         let sizeBytes = try reader.readUInt64()
         let messagesCount = try reader.readUInt64()
         let name = try reader.readName()
-        let options = try OptionsBlock.decode(try reader.readPrefixedBytes(), explicit: true)
+        let explicit = try reader.readPrefixedBytes()
+        let derived = try reader.readPrefixedBytes()
+        let options = try OptionsBlock.decodeSplit(explicit: explicit, derived: derived)
         return StreamInfo(
             id: id, createdAt: IggyTimestamp(microseconds: createdAt), name: name, sizeBytes: sizeBytes, messagesCount: messagesCount, topicsCount: topicsCount,
             options: options)
@@ -78,25 +80,14 @@ enum Responses {
         let id = try reader.readUInt32()
         let createdAt = try reader.readUInt64()
         let partitionsCount = try reader.readUInt32()
-        let messageExpiry = try reader.readUInt64()
-        let compression = try reader.readUInt8()
-        let maxTopicSize = try reader.readUInt64()
         let sizeBytes = try reader.readUInt64()
         let messagesCount = try reader.readUInt64()
         let name = try reader.readName()
         let explicit = try reader.readPrefixedBytes()
         let derived = try reader.readPrefixedBytes()
-        guard let compressionAlgorithm = CompressionAlgorithm(rawValue: compression) else {
-            throw IggyError(.invalidCommand, context: "unknown compression algorithm \(compression)")
-        }
-        // A stored expiry of zero means the topic never expires, unlike the
-        // request side where zero is the server default.
-        let expiry: IggyExpiry = messageExpiry == 0 ? .never : IggyExpiry(wireMicroseconds: messageExpiry)
         return Topic(
-            id: id, createdAt: IggyTimestamp(microseconds: createdAt), name: name, sizeBytes: sizeBytes, messageExpiry: expiry,
-            compressionAlgorithm: compressionAlgorithm, maxTopicSize: MaxTopicSize(wireValue: maxTopicSize),
-            messagesCount: messagesCount, partitionsCount: partitionsCount,
-            options: try OptionsBlock.decodeSplit(explicit: explicit, derived: derived))
+            id: id, createdAt: IggyTimestamp(microseconds: createdAt), name: name, sizeBytes: sizeBytes, messagesCount: messagesCount,
+            partitionsCount: partitionsCount, options: try OptionsBlock.decodeSplit(explicit: explicit, derived: derived))
     }
 
     static func partition(from reader: inout ByteReader) throws -> Partition {
@@ -248,7 +239,9 @@ enum Responses {
         let createdAt = try reader.readUInt64()
         let statusCode = try reader.readUInt8()
         let username = try reader.readName()
-        let options = try OptionsBlock.decode(try reader.readPrefixedBytes(), explicit: true)
+        let explicit = try reader.readPrefixedBytes()
+        let derived = try reader.readPrefixedBytes()
+        let options = try OptionsBlock.decodeSplit(explicit: explicit, derived: derived)
         guard let status = UserStatus(rawValue: statusCode) else {
             throw IggyError(.invalidUserStatus, context: "unknown user status \(statusCode)")
         }
@@ -415,15 +408,99 @@ enum Responses {
             for _ in 0..<count {
                 let key = try reader.readName()
                 let kindCode = try reader.readUInt8()
+                let flags = OptionFlags(rawValue: try reader.readUInt8())
                 let defaultValue = Array(try reader.readPrefixedBytes())
                 let description = String(decoding: try reader.readPrefixedBytes(), as: UTF8.self)
                 guard let kind = HeaderKind(rawValue: kindCode) else {
                     throw IggyError(.invalidHeaderKind, context: "unknown option kind \(kindCode)")
                 }
-                specs.append(OptionSpec(key: key, kind: kind, defaultValue: defaultValue, description: description))
+                specs.append(OptionSpec(key: key, kind: kind, flags: flags, defaultValue: defaultValue, description: description))
             }
             return specs
         }
+    }
+
+    // MARK: Metadata changes
+
+    /// Decodes a `GetMetadataChanges` reply:
+    /// `[status:u8][phase:u8][has_log_id:u8][log_id:u128][oldest_op:u64][retained_since:u64][head_op:u64]`
+    /// `[has_next:u8][cursor:44][has_more:u8][records_count:u32][record]*[items_count:u32][item]*[token_len:u16][token]`.
+    /// A changes page carries only records, a current page only items and a token.
+    static func metadataChanges(_ body: ArraySlice<UInt8>) throws -> MetadataChanges {
+        try decode(body) { reader in
+            let statusCode = try reader.readUInt8()
+            guard let status = MetadataChangeStatus(rawValue: statusCode) else {
+                throw WireError.validation("unknown metadata change status \(statusCode)")
+            }
+            let phaseCode = try reader.readUInt8()
+            guard let phase = MetadataChangePhase(rawValue: phaseCode) else {
+                throw WireError.validation("unknown metadata change phase \(phaseCode)")
+            }
+            var logID: UInt128Value?
+            if try reader.readFlag() {
+                logID = try reader.readUInt128()
+            }
+            let oldestOp = try reader.readUInt64()
+            let retainedSince = try reader.readTimestamp()
+            let headOp = try reader.readUInt64()
+            var next: MetadataChangeCursor?
+            if try reader.readFlag() {
+                next = try MetadataChangeCursor.decode(from: &reader)
+            }
+            let hasMore = try reader.readFlag()
+            let recordsCount = try reader.readCount()
+            var records: [MetadataChangeRecord] = []
+            records.reserveCapacity(min(recordsCount, reader.remaining / metadataChangeRecordMinimumSize))
+            for _ in 0..<recordsCount {
+                records.append(try metadataChangeRecord(from: &reader))
+            }
+            let itemsCount = try reader.readCount()
+            var items: [MetadataCurrentItem] = []
+            items.reserveCapacity(min(itemsCount, reader.remaining / metadataItemMinimumSize))
+            for _ in 0..<itemsCount {
+                items.append(try metadataItem(from: &reader))
+            }
+            let tokenLength = Int(try reader.readUInt16())
+            var currentPageToken: MetadataCurrentPageToken?
+            if tokenLength != 0 {
+                var tokenReader = ByteReader(try reader.readBytes(tokenLength))
+                currentPageToken = try MetadataCurrentPageToken.decode(from: &tokenReader)
+                guard tokenReader.isAtEnd else {
+                    throw WireError.validation("trailing bytes after a page token")
+                }
+            }
+            let holdsOtherContent = phase == .changes ? !items.isEmpty || currentPageToken != nil : !records.isEmpty
+            guard !holdsOtherContent else {
+                throw WireError.validation("a changes page carries only records and a current page only items")
+            }
+            return MetadataChanges(
+                status: status, phase: phase, logID: logID, oldestOp: oldestOp, retainedSince: retainedSince, headOp: headOp, next: next, hasMore: hasMore,
+                records: records, items: items, currentPageToken: currentPageToken)
+        }
+    }
+
+    /// Smallest record envelope: no actor and an empty body.
+    private static let metadataChangeRecordMinimumSize = 8 + 4 + 16 + 8 + 1 + 1 + 1 + 4
+    /// Smallest item envelope: an empty body.
+    private static let metadataItemMinimumSize = 1 + 4
+
+    /// `[op:u64][ordinal:u32][checksum:u128][timestamp:u64][has_actor:u8][actor_user_id:u32][group:u8][kind:u8][body_len:u32][body]`
+    static func metadataChangeRecord(from reader: inout ByteReader) throws -> MetadataChangeRecord {
+        let op = try reader.readUInt64()
+        let ordinal = try reader.readUInt32()
+        let checksum = try reader.readUInt128()
+        let timestamp = try reader.readTimestamp()
+        let actorUserID = try reader.readOptionalUInt32()
+        let group = try reader.readUInt8()
+        let kind = try reader.readUInt8()
+        let change = try MetadataChange.decode(group: group, kind: kind, body: try reader.readPrefixedBytes())
+        return MetadataChangeRecord(op: op, ordinal: ordinal, checksum: checksum, timestamp: timestamp, actorUserID: actorUserID, change: change)
+    }
+
+    /// `[group:u8][body_len:u32][body]`
+    static func metadataItem(from reader: inout ByteReader) throws -> MetadataCurrentItem {
+        let group = try reader.readUInt8()
+        return try MetadataCurrentItem.decode(group: group, body: try reader.readPrefixedBytes())
     }
 
     // MARK: Routing
@@ -434,6 +511,7 @@ enum Responses {
     struct PartitionRoute: Equatable {
         /// The context a request routed by the reply carries.
         let context: PartitionContext
+        let view: UInt32
         /// The configured replica id of the partition primary, as
         /// `GetClusterMetadata` reports it, never a roster position.
         let primaryReplica: UInt8
@@ -449,10 +527,9 @@ enum Responses {
         }
         return try decode(body) { reader in
             let context = PartitionContext(incarnation: try reader.readUInt64(), ownerGeneration: 0, metadataOp: try reader.readUInt64())
-            // The view and the partition count, which a client that asks only
-            // the coordinator for routes does not use.
-            try reader.skip(2 * MemoryLayout<UInt32>.size)
-            return PartitionRoute(context: context, primaryReplica: try reader.readUInt8())
+            let view = try reader.readUInt32()
+            try reader.skip(MemoryLayout<UInt32>.size)
+            return PartitionRoute(context: context, view: view, primaryReplica: try reader.readUInt8())
         }
     }
 

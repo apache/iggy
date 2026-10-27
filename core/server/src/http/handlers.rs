@@ -19,6 +19,7 @@
 //! the control-plane writes, and the data-plane produce / poll / consumer-offset
 //! routes the router binds.
 
+use std::collections::BTreeSet;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -27,13 +28,15 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
+use bytes::{Bytes, BytesMut};
 use chrono::Local;
-use consensus::{MetadataHandle, PartitionsHandle};
+use consensus::MetadataHandle;
 use iggy_binary_protocol::codes::{
     DESCRIBE_OPTIONS_CODE, GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_CONSUMER_GROUP_CODE,
-    GET_CONSUMER_GROUPS_CODE, GET_CONSUMER_OFFSET_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE,
-    GET_SNAPSHOT_FILE_CODE, GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE,
-    GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE, POLL_MESSAGES_CODE,
+    GET_CONSUMER_GROUPS_CODE, GET_CONSUMER_OFFSET_CODE, GET_METADATA_CHANGES_CODE,
+    GET_PERSONAL_ACCESS_TOKENS_CODE, GET_SNAPSHOT_FILE_CODE, GET_STATS_CODE, GET_STREAM_CODE,
+    GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE,
+    POLL_MESSAGES_CODE,
 };
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_binary_protocol::requests::consumer_groups::{
@@ -50,16 +53,16 @@ use iggy_binary_protocol::requests::personal_access_tokens::{
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::requests::streams::{
     CreateStreamRequest, DeleteStreamRequest, GetStreamRequest, GetStreamsRequest,
-    UpdateStreamRequest,
 };
-use iggy_binary_protocol::requests::system::DescribeOptionsRequest;
-use iggy_binary_protocol::requests::system::GetStatsRequest;
+use iggy_binary_protocol::requests::system::{
+    DescribeOptionsRequest, GetStatsRequest, ResourceTarget, UpdateResourceRequest,
+};
 use iggy_binary_protocol::requests::topics::{
-    CreateTopicRequest, DeleteTopicRequest, GetTopicRequest, GetTopicsRequest, UpdateTopicRequest,
+    CreateTopicRequest, DeleteTopicRequest, GetTopicRequest, GetTopicsRequest,
 };
 use iggy_binary_protocol::requests::users::{
     ChangePasswordRequest, CreateUserRequest, DeleteUserRequest, GetUserRequest, GetUsersRequest,
-    UpdatePermissionsRequest, UpdateUserRequest,
+    UpdatePermissionsRequest,
 };
 use iggy_binary_protocol::responses::clients::client_response::ConsumerGroupInfoResponse;
 use iggy_binary_protocol::responses::clients::get_client::ClientDetailsResponse;
@@ -75,9 +78,7 @@ use iggy_binary_protocol::responses::topics::get_topic::GetTopicResponse;
 use iggy_binary_protocol::responses::topics::get_topics::GetTopicsResponse;
 use iggy_binary_protocol::responses::users::get_user::UserDetailsResponse;
 use iggy_binary_protocol::responses::users::get_users::GetUsersResponse;
-use iggy_binary_protocol::{
-    Operation, WireDecode, WireEncode, WireIdentifier, WireName, WireOptions,
-};
+use iggy_binary_protocol::{Operation, WireDecode, WireEncode, WireIdentifier, WireName};
 use iggy_common::change_password::ChangePassword;
 use iggy_common::create_consumer_group::CreateConsumerGroup;
 use iggy_common::create_partitions::CreatePartitions;
@@ -94,45 +95,48 @@ use iggy_common::login_user::LoginUser;
 use iggy_common::login_with_personal_access_token::LoginWithPersonalAccessToken;
 use iggy_common::store_consumer_offset::StoreConsumerOffset;
 use iggy_common::update_permissions::UpdatePermissions;
-use iggy_common::update_stream::UpdateStream;
-use iggy_common::update_topic::UpdateTopic;
-use iggy_common::update_user::UpdateUser;
 use iggy_common::wire_conversions::{
     clients_from_wire, consumer_groups_from_wire, identifier_to_wire, option_specs_from_wire,
     permissions_to_wire, personal_access_tokens_from_wire, streams_from_wire, topics_from_wire,
     users_from_wire,
 };
 use iggy_common::{
-    ClientInfo, ClientInfoDetails, ClusterMetadata, CompressionAlgorithm, Consumer, ConsumerGroup,
-    ConsumerGroupDetails, ConsumerOffsetInfo, DEFAULT_MAX_TOPIC_SIZE, Identifier, IdentityInfo,
-    IggyError, IggyExpiry, IggyTimestamp, MaxTopicSize, OptionSpec, OptionsScope, Partitioning,
+    ClientInfo, ClientInfoDetails, ClusterMetadata, Consumer, ConsumerGroup, ConsumerGroupDetails,
+    ConsumerOffsetInfo, DEFAULT_MAX_TOPIC_SIZE, Identifier, IdentityInfo, IggyError, IggyTimestamp,
+    MetadataChanges, MetadataChangesQuery, OptionSpec, OptionStorage, OptionsScope, Partitioning,
     PersonalAccessTokenInfo, PollMessages, PolledMessages, RawPersonalAccessToken, SendMessages,
-    SendMessagesConfirmations, Stats, Stream, StreamDetails, StreamUpdateOptions, TokenInfo, Topic,
-    TopicCreateOptions, TopicDetails, TopicUpdateOptions, UPDATABLE_STREAM_OPTION_KEYS,
-    UPDATABLE_TOPIC_OPTION_KEYS, UPDATABLE_USER_OPTION_KEYS, UserInfo, UserInfoDetails,
-    UserUpdateOptions, Validatable, validate_preallocated_topic_bytes, validate_topic_segment_size,
+    SendMessagesConfirmations, Stats, Stream, StreamDetails, TokenInfo, Topic, TopicDetails,
+    UserInfo, UserInfoDetails, Validatable, descriptors_for, erase_buffer,
 };
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
 use secrecy::ExposeSecret;
+use secrecy::zeroize::Zeroizing;
 use send_wrapper::SendWrapper;
 use serde::Deserialize;
-use shard::{PartitionRead, PartitionReadReply};
+use shard::{
+    DeferredPollContext, DeferredPollRequest, PartitionRead, PartitionReadReply, PollQuotaIdentity,
+};
 
+use crate::dispatch::metadata_changes::metadata_changes_page;
 use crate::dispatch::partition::{
-    fence_poll_context, resolve_consumer_offset_request, resolve_poll_request,
-    resolve_primary_consumer_offset_request,
+    ConsumerOffsetTarget, fence_poll_context, resolve_consumer_offset_request,
+    resolve_poll_request, resolve_primary_consumer_offset_request,
 };
 use crate::dispatch::session_ops::{verify_login_credentials, verify_pat_credentials};
 use crate::http::error::{
     Consistency, ConsistencyQuery, CustomError, PartitionWriteError, ProduceAck, ProduceQuery,
     ReadError, WriteError,
 };
-use crate::http::extractor::{Authenticated, Identity};
-use crate::http::forward::{PartitionEffect, PartitionHop, PartitionRequest, route_partition};
+use crate::http::extractor::{Authenticated, Credential, Identity, JsonMembers, JsonUpdate};
+use crate::http::forward::{
+    FirstAttempt, PartitionEffect, PartitionHop, PartitionRequest, require_local_primary,
+    serve_partition,
+};
 use crate::http::metrics::{TopicUsageSample, gauge_value};
 use crate::http::reads::{
-    authorize_data_plane, authorize_read, await_recovery_barrier, gate_local_read, read_local,
+    authorize_data_plane, authorize_read, await_metadata_floor, await_recovery_barrier,
+    check_partition_freshness, check_partition_incarnation, gate_local_read, read_local,
     resolve_gate_stream, resolve_gate_topic, resolve_gate_topic_ids, resolve_gate_user,
     topic_durability,
 };
@@ -146,28 +150,25 @@ use crate::http::submit::{
     submit_committed, submit_write,
 };
 use crate::http::wire::{
-    consumer_offset_wire_request, delete_offset_wire_request, encode_send_messages,
-    poll_wire_request, store_offset_wire_request,
+    DeferredPollQuery, consumer_offset_wire_request, delete_offset_wire_request,
+    encode_send_messages, poll_wire_request, store_offset_wire_request,
 };
 use crate::reply_frame::{build_polled_messages_body, build_raw_pat_reply};
 use crate::responses::connected_client_to_response;
-use crate::rewrite::{
-    validate_option_keys, validate_topic_bounds, validate_topic_size_floor,
-    warn_unenforceable_topic_size, warn_unenforceable_topic_size_on_partition_add,
-};
 use crate::snapshot;
 
 /// `GET /ping` response body, matching the legacy HTTP server's health probe.
 const PONG: &str = "pong";
 
-/// VSR client id stamped on HTTP data-plane reads (poll / consumer-offset).
-/// HTTP reads never Register a VSR client, and shard-0 client ids are minted
-/// from 1, so 0 can never collide with a live client. `resolve_poll_request`
-/// takes a client id only for its consumer-group fencing branch, and HTTP
-/// never reaches it: `poll_wire_request` rejects `consumer_kind=consumer_group`
-/// up front. Legacy HTTP polls with client id 0 for the same reason (no
-/// persistent sessions, so no group membership).
-const HTTP_READ_CLIENT_ID: u128 = 0;
+/// VSR client id stamped on HTTP data-plane requests that hold no session:
+/// reads (poll / consumer-offset), and a write's partition capture before the
+/// node that serves it Registers one. Shard-0 client ids are minted from 1, so
+/// 0 can never collide with a live client. `resolve_poll_request` and
+/// `capture_partition_write` take a client id only for their consumer-group
+/// fencing branches, and HTTP never reaches them: the wire mappers reject
+/// `consumer_kind=consumer_group` up front. Legacy HTTP polls with client id 0
+/// for the same reason (no persistent sessions, so no group membership).
+pub(in crate::http) const HTTP_UNREGISTERED_CLIENT_ID: u128 = 0;
 
 const DURABILITY_NONE: &str = "none";
 
@@ -193,10 +194,10 @@ pub(in crate::http) async fn login_user(
     // re-commits, like every other local read. On barrier expiry, fail with a
     // retryable 503 rather than validating against rolled-back credentials:
     // this route's error currency is `IggyError -> CustomError`, and
-    // `TransientNotCommitted` is the variant `CustomError` renders 503.
+    // `TransientNotAccepted` is the variant `CustomError` renders 503.
     SendWrapper::new(crate::http::reads::await_recovery_barrier(&state.shard))
         .await
-        .map_err(|_| IggyError::TransientNotCommitted)?;
+        .map_err(|_| IggyError::TransientNotAccepted)?;
     let (user_id, created_at) = verify_login_credentials(
         &state.shard,
         &command.username,
@@ -214,7 +215,7 @@ pub(in crate::http) async fn login_with_personal_access_token(
     // `login_user`.
     SendWrapper::new(crate::http::reads::await_recovery_barrier(&state.shard))
         .await
-        .map_err(|_| IggyError::TransientNotCommitted)?;
+        .map_err(|_| IggyError::TransientNotAccepted)?;
     let (user_id, created_at) = verify_pat_credentials(&state.shard, command.token.expose_secret())
         .map_err(|error| login_error_to_iggy(&error))?;
     issue_identity(&state, user_id, created_at)
@@ -691,7 +692,10 @@ pub(in crate::http) async fn get_metrics(
                         topic: Arc::clone(&topic.name),
                         size_bytes: topic.stats.size_bytes_inconsistent(),
                         messages: topic.stats.messages_count_inconsistent(),
-                        max_size_bytes: topic.max_topic_size.resolve(DEFAULT_MAX_TOPIC_SIZE),
+                        max_size_bytes: topic
+                            .resolved
+                            .max_topic_size
+                            .resolve(DEFAULT_MAX_TOPIC_SIZE),
                     });
                 }
             }
@@ -729,7 +733,7 @@ pub(in crate::http) async fn get_metrics(
 /// `POST /snapshot`: collect a diagnostic archive and return it as a ZIP
 /// download with the same headers the legacy server sets.
 ///
-/// Gated on the snapshot rule (`read_servers || manage_servers`) through the
+/// Gated on the snapshot rule (`manage_servers`) through the
 /// shared [`gate_local_read`], which also serves it behind the post-restart
 /// barrier; the archive itself carries no metadata answer to hold. Collection
 /// shells out to system tools on a dedicated OS thread (see
@@ -775,6 +779,37 @@ pub(in crate::http) async fn get_snapshot(
         .unwrap_or_else(|_| HeaderValue::from_static("attachment"));
     headers.insert(header::CONTENT_DISPOSITION, disposition);
     Ok((headers, Body::from(archive)))
+}
+
+/// `GET /metadata/changes`: one page of this node's metadata change log, or
+/// of the current state. Local like `/snapshot`: committed records are the
+/// same on every replica of one history, so the page is never redirected.
+/// The query is strict: an unknown, repeated or malformed parameter is a 400.
+pub(in crate::http) async fn get_metadata_changes(
+    State(state): State<HttpState>,
+    identity: Identity,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> Result<Json<MetadataChanges>, ReadError> {
+    SendWrapper::new(gate_local_read(
+        &state,
+        &identity,
+        Consistency::Serializable,
+        GET_METADATA_CHANGES_CODE,
+        Permissioner::get_metadata_changes,
+    ))
+    .await?;
+    let query = MetadataChangesQuery::from_http_query(
+        pairs
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str())),
+    )
+    .map_err(ReadError::Rejected)?;
+    let page = SendWrapper::new(metadata_changes_page(&state.shard, query, identity.user_id))
+        .await
+        .map_err(ReadError::Rejected)?;
+    MetadataChanges::try_from(page)
+        .map(Json)
+        .map_err(ReadError::Rejected)
 }
 
 /// `GET /cluster/metadata`: report the live cluster topology as the same
@@ -895,20 +930,24 @@ pub(in crate::http) async fn get_client(
 /// `POST /streams`: create a stream and render the committed reply as the same
 /// `StreamDetails` JSON the legacy server returns.
 ///
-/// The accepted body is name-only (`{"name": ...}`), matching the legacy
-/// request; server's wire `CreateStreamRequest` is likewise name-only and
-/// auto-assigns the id, so there is no client-supplied stream id to honor.
+/// The body carries the name and an optional `options` object. The server
+/// assigns the id, so there is no client-supplied stream id to honor.
 pub(in crate::http) async fn create_stream(
     State(state): State<HttpState>,
     identity: Authenticated,
-    Json(command): Json<CreateStream>,
+    JsonMembers {
+        value: command,
+        members,
+    }: JsonMembers<CreateStream>,
 ) -> Result<Json<StreamDetails>, WriteError> {
+    refuse_misplaced_options(OptionsScope::Stream, &members)?;
     let request = CreateStreamRequest {
         name: WireName::new(command.name)
             .map_err(|_| WriteError::Rejected(IggyError::InvalidStreamName))?,
-        options: WireOptions::empty(),
+        options: command.options.to_wire().map_err(WriteError::Rejected)?,
     };
-    let body = request.to_bytes();
+    let body = erasing_body(&request);
+    erase_buffer(request.options.into_bytes());
     let payload = SendWrapper::new(submit_write(
         &state,
         &identity.session,
@@ -919,39 +958,20 @@ pub(in crate::http) async fn create_stream(
     Ok(Json(decode_stream_details(&payload)?))
 }
 
-/// `PUT /streams/{stream_id}`: rename a stream. A committed write returns 204
-/// with no body, matching the legacy server.
+/// `PUT /streams/{stream_id}`: update the stream's name and options. An absent
+/// or `null` key keeps its value, a key in `reset` returns to its default.
+/// Returns 204 on commit.
 pub(in crate::http) async fn update_stream(
     State(state): State<HttpState>,
     identity: Authenticated,
     Path(stream_id): Path<String>,
-    Json(command): Json<UpdateStream>,
+    update: Result<JsonUpdate, WriteError>,
 ) -> Result<StatusCode, WriteError> {
     let stream_id = Identifier::from_str_value(&stream_id).map_err(WriteError::Rejected)?;
-    let wire_options = StreamUpdateOptions {
-        raw: command.options,
-    }
-    .to_wire()
-    .map_err(WriteError::Rejected)?;
-    // Same pre-consensus gate the TCP ingress applies: a key this command may
-    // not change is denied here by name rather than riding a log entry.
-    validate_option_keys(&wire_options, UPDATABLE_STREAM_OPTION_KEYS)
-        .map_err(WriteError::Rejected)?;
-    let request = UpdateStreamRequest {
+    let target = ResourceTarget::Stream {
         stream_id: identifier_to_wire(&stream_id).map_err(WriteError::Rejected)?,
-        name: WireName::new(command.name)
-            .map_err(|_| WriteError::Rejected(IggyError::InvalidStreamName))?,
-        options: wire_options,
     };
-    let body = request.to_bytes();
-    SendWrapper::new(submit_write(
-        &state,
-        &identity.session,
-        Operation::UpdateStream,
-        body,
-    ))
-    .await?;
-    Ok(StatusCode::NO_CONTENT)
+    submit_update(&state, &identity, target, update).await
 }
 
 /// `DELETE /streams/{stream_id}`: delete a stream. Returns 204 on commit.
@@ -986,76 +1006,17 @@ pub(in crate::http) async fn create_topic(
     State(state): State<HttpState>,
     identity: Authenticated,
     Path(stream_id): Path<String>,
-    Json(command): Json<CreateTopic>,
+    JsonMembers {
+        value: command,
+        members,
+    }: JsonMembers<CreateTopic>,
 ) -> Result<Json<TopicDetails>, WriteError> {
     let stream_id = Identifier::from_str_value(&stream_id).map_err(WriteError::Rejected)?;
-    // Rejects empty/oversized name and partitions_count > MAX.
+    refuse_misplaced_options(OptionsScope::Topic, &members)?;
+    // Rejects empty/oversized name and partitions_count > MAX. The options are
+    // admitted by the submit chain, the same gate the binary transports use.
     command.validate().map_err(WriteError::Rejected)?;
-    let durability = command
-        .options
-        .get(iggy_common::topic_option_keys::DURABILITY)
-        .map(|value| value.parse())
-        .transpose()
-        .map_err(|_| WriteError::Rejected(IggyError::InvalidOptionValue("durability".to_string())))?
-        .unwrap_or_default();
-    let consumer_offset_durability = command
-        .options
-        .get(iggy_common::topic_option_keys::CONSUMER_OFFSET_DURABILITY)
-        .map(|value| value.parse())
-        .transpose()
-        .map_err(|_| {
-            WriteError::Rejected(IggyError::InvalidOptionValue(
-                "consumer_offset_durability".to_string(),
-            ))
-        })?
-        .unwrap_or_default();
-    let options = TopicCreateOptions {
-        durability,
-        consumer_offset_durability,
-        partitions_count: Some(command.partitions_count),
-        compression_algorithm: (command.compression_algorithm != CompressionAlgorithm::default())
-            .then_some(command.compression_algorithm),
-        message_expiry: (command.message_expiry != IggyExpiry::ServerDefault)
-            .then_some(command.message_expiry),
-        max_topic_size: (command.max_topic_size != MaxTopicSize::ServerDefault)
-            .then_some(command.max_topic_size),
-        raw: command.options,
-        ..TopicCreateOptions::default()
-    };
-    let wire_options = options
-        .to_explicit_wire(|key| options.raw.contains_key(key))
-        .map_err(WriteError::Rejected)?;
-    // Re-parse the encoded block so `--set`-style raw string entries get the
-    // same typed pre-consensus checks as native fields; unknown keys deny
-    // here with the key name.
-    let parsed = TopicCreateOptions::parse(&wire_options).map_err(WriteError::Rejected)?;
-    if let Some(segment_size) = parsed.segment_size {
-        validate_topic_segment_size(
-            segment_size.as_bytes_u64(),
-            iggy_common::MAX_TOPIC_SEGMENT_SIZE,
-        )
-        .map_err(WriteError::Rejected)?;
-    }
-    let segment_size = parsed.segment_size.map_or_else(
-        || iggy_common::DEFAULT_SEGMENT_SIZE,
-        |segment_size| segment_size.as_bytes_u64(),
-    );
-    if parsed
-        .preallocate_segments
-        .unwrap_or(iggy_common::DEFAULT_PREALLOCATE_SEGMENTS)
-    {
-        validate_preallocated_topic_bytes(segment_size, command.partitions_count)
-            .map_err(WriteError::Rejected)?;
-    }
-    let max_topic_size = parsed.max_topic_size.unwrap_or(MaxTopicSize::ServerDefault);
-    validate_topic_bounds(command.partitions_count, max_topic_size, segment_size)
-        .map_err(WriteError::Rejected)?;
-    warn_unenforceable_topic_size(
-        max_topic_size,
-        segment_size,
-        state.shard.bus_max_message_size(),
-        command.partitions_count,
-    );
+    let wire_options = command.options.to_wire().map_err(WriteError::Rejected)?;
     let request = CreateTopicRequest {
         stream_id: identifier_to_wire(&stream_id).map_err(WriteError::Rejected)?,
         partitions_count: command.partitions_count,
@@ -1074,73 +1035,22 @@ pub(in crate::http) async fn create_topic(
     Ok(Json(decode_topic_details(&payload)?))
 }
 
-/// `PUT /streams/{stream_id}/topics/{topic_id}`: update a topic. Returns 204.
+/// `PUT /streams/{stream_id}/topics/{topic_id}`: update the topic's name and
+/// updatable options. An absent or `null` key keeps its value, a key in `reset`
+/// returns to its default. Returns 204 on commit.
 pub(in crate::http) async fn update_topic(
     State(state): State<HttpState>,
     identity: Authenticated,
     Path((stream_id, topic_id)): Path<(String, String)>,
-    Json(command): Json<UpdateTopic>,
+    update: Result<JsonUpdate, WriteError>,
 ) -> Result<StatusCode, WriteError> {
     let stream_id = Identifier::from_str_value(&stream_id).map_err(WriteError::Rejected)?;
     let topic_id = Identifier::from_str_value(&topic_id).map_err(WriteError::Rejected)?;
-    command.validate().map_err(WriteError::Rejected)?;
-    // The named JSON fields fold into the same option keys the binary protocol
-    // uses, so REST keeps its ergonomics without giving a setting two homes.
-    let wire_options = TopicUpdateOptions {
-        compression_algorithm: command.compression_algorithm,
-        message_expiry: command.message_expiry,
-        max_topic_size: command.max_topic_size,
-        raw: command.options,
-    }
-    .to_wire()
-    .map_err(WriteError::Rejected)?;
-    // Same pre-consensus gates the TCP ingress applies: a key this command may
-    // not change is denied here by name rather than riding a log entry, and a
-    // cap below one of this topic's segments is denied for the same reason it is
-    // on create.
-    validate_option_keys(&wire_options, UPDATABLE_TOPIC_OPTION_KEYS)
-        .map_err(WriteError::Rejected)?;
-    let stream_wire = identifier_to_wire(&stream_id).map_err(WriteError::Rejected)?;
-    let topic_wire = identifier_to_wire(&topic_id).map_err(WriteError::Rejected)?;
-    if let Some(max_topic_size) = TopicCreateOptions::parse(&wire_options)
-        .map_err(WriteError::Rejected)?
-        .max_topic_size
-    {
-        let metadata = state.shard.plane.metadata();
-        let streams = metadata.mux_stm.streams();
-        let segment_size = streams
-            .topic_segment_size(&stream_wire, &topic_wire)
-            .map_or_else(
-                || iggy_common::DEFAULT_SEGMENT_SIZE,
-                |segment_size| segment_size.as_bytes_u64(),
-            );
-        validate_topic_size_floor(max_topic_size, segment_size).map_err(WriteError::Rejected)?;
-        let partitions_count = streams
-            .topic_partitions_count(&stream_wire, &topic_wire)
-            .unwrap_or(0);
-        warn_unenforceable_topic_size(
-            max_topic_size,
-            segment_size,
-            state.shard.bus_max_message_size(),
-            u32::try_from(partitions_count).unwrap_or(u32::MAX),
-        );
-    }
-    let request = UpdateTopicRequest {
-        stream_id: stream_wire,
-        topic_id: topic_wire,
-        name: WireName::new(command.name)
-            .map_err(|_| WriteError::Rejected(IggyError::InvalidTopicName))?,
-        options: wire_options,
+    let target = ResourceTarget::Topic {
+        stream_id: identifier_to_wire(&stream_id).map_err(WriteError::Rejected)?,
+        topic_id: identifier_to_wire(&topic_id).map_err(WriteError::Rejected)?,
     };
-    let body = request.to_bytes();
-    SendWrapper::new(submit_write(
-        &state,
-        &identity.session,
-        Operation::UpdateTopic,
-        body,
-    ))
-    .await?;
-    Ok(StatusCode::NO_CONTENT)
+    submit_update(&state, &identity, target, update).await
 }
 
 /// `DELETE /streams/{stream_id}/topics/{topic_id}`: delete a topic. Returns 204.
@@ -1185,14 +1095,6 @@ pub(in crate::http) async fn create_partitions(
         topic_id: identifier_to_wire(&topic_id).map_err(WriteError::Rejected)?,
         partitions_count: command.partitions_count,
     };
-    let metadata = state.shard.plane.metadata();
-    warn_unenforceable_topic_size_on_partition_add(
-        metadata.mux_stm.streams(),
-        &request.stream_id,
-        &request.topic_id,
-        state.shard.bus_max_message_size(),
-        request.partitions_count,
-    );
     let body = request.to_bytes();
     SendWrapper::new(submit_write(
         &state,
@@ -1266,6 +1168,34 @@ pub(in crate::http) async fn delete_segments(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `GET /streams/{stream_id}/topics/{topic_id}/messages/deferred`: the poll of
+/// [`poll_messages`] with [`DeferredPollQuery`] limits. The primary holds it until
+/// `min_count` messages are ready, the reply reaches `max_bytes`, or `wait_us`
+/// expires. Invalid limits are refused before the poll is resolved.
+pub(in crate::http) async fn poll_messages_deferred(
+    State(state): State<HttpState>,
+    identity: Identity,
+    Path((stream_id, topic_id)): Path<(String, String)>,
+    Query(query): Query<PollMessages>,
+    Query(wait): Query<DeferredPollQuery>,
+    Query(consistency): Query<ConsistencyQuery>,
+    Extension(request): Extension<Arc<PartitionRequest>>,
+) -> Result<Response, ReadError> {
+    let options = iggy_common::DeferredPollOptions::from(wait);
+    options.validate(query.count).map_err(ReadError::Rejected)?;
+    poll_messages_impl(
+        state,
+        identity,
+        stream_id,
+        topic_id,
+        query,
+        consistency,
+        request,
+        Some(options),
+    )
+    .await
+}
+
 /// `GET /streams/{stream_id}/topics/{topic_id}/messages`: poll a batch of
 /// messages as the same `PolledMessages` JSON the legacy server returns. The
 /// query is the same flattened `PollMessages` shape the legacy server accepts
@@ -1281,8 +1211,8 @@ pub(in crate::http) async fn delete_segments(
 /// body, decoded here by the SDK's own [`PolledMessages::from_bytes`] so the
 /// JSON is field-identical to a TCP poll. `auto_commit` rides
 /// [`resolve_poll_request`]'s args and is honored by the owning shard's poll
-/// plan. Another node relays the poll to the primary ([`route_partition`]).
-#[allow(clippy::too_many_lines)]
+/// plan. A node whose owner is not the primary relays the poll to the primary
+/// ([`serve_partition`]).
 pub(in crate::http) async fn poll_messages(
     State(state): State<HttpState>,
     identity: Identity,
@@ -1291,9 +1221,43 @@ pub(in crate::http) async fn poll_messages(
     Query(consistency): Query<ConsistencyQuery>,
     Extension(request): Extension<Arc<PartitionRequest>>,
 ) -> Result<Response, ReadError> {
+    poll_messages_impl(
+        state,
+        identity,
+        stream_id,
+        topic_id,
+        query,
+        consistency,
+        request,
+        None,
+    )
+    .await
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Immediate and deferred polls share one authorization, fencing and relay path"
+)]
+#[allow(clippy::too_many_arguments)]
+async fn poll_messages_impl(
+    state: HttpState,
+    identity: Identity,
+    stream_id: String,
+    topic_id: String,
+    query: PollMessages,
+    consistency: ConsistencyQuery,
+    request: Arc<PartitionRequest>,
+    options: Option<iggy_common::DeferredPollOptions>,
+) -> Result<Response, ReadError> {
+    let started = std::time::Instant::now();
     let stream_id = Identifier::from_str_value(&stream_id).map_err(ReadError::Rejected)?;
     let topic_id = Identifier::from_str_value(&topic_id).map_err(ReadError::Rejected)?;
-    let consistency = partition_read_consistency(&request, consistency.consistency);
+    let (consistency, metadata_floor) = SendWrapper::new(partition_read_consistency(
+        &state,
+        &request,
+        consistency.consistency,
+    ))
+    .await?;
     let rule = |permissioner: &Permissioner, uid| {
         resolve_gate_topic_ids(&state, &stream_id, &topic_id)
             .map_or(Ok(()), |(stream_id, topic_id)| {
@@ -1315,7 +1279,7 @@ pub(in crate::http) async fn poll_messages(
     };
 
     let (namespace, partition_id, consumer, args) =
-        match resolve_poll_request(&state.shard, &wire, HTTP_READ_CLIENT_ID) {
+        match resolve_poll_request(&state.shard, &wire, HTTP_UNREGISTERED_CLIENT_ID) {
             Ok(decoded) => decoded,
             // A partition id the topic does not have, or a consumer kind HTTP
             // can't poll with, is a client addressing error with its own code;
@@ -1333,56 +1297,114 @@ pub(in crate::http) async fn poll_messages(
     let rule = |permissioner: &Permissioner, uid| {
         permissioner.poll_messages(uid, namespace.stream_id(), namespace.topic_id())
     };
-    let metadata = state
-        .shard
-        .plane
-        .metadata()
-        .mux_stm
-        .streams()
-        .poll_metadata(namespace, None, HTTP_READ_CLIENT_ID)
-        .ok_or(ReadError::Rejected(IggyError::TransientNotAccepted))?;
-    let local = metadata.context(state.shard.plane.metadata().applied_frontier().get());
+    // Read per attempt: a later attempt checks the context against the
+    // metadata this node applied since.
+    let local_metadata = || {
+        let metadata = state
+            .shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .poll_metadata(namespace, None, HTTP_UNREGISTERED_CLIENT_ID)
+            .ok_or(ReadError::Rejected(IggyError::TransientNotAccepted))?;
+        let local = metadata.context(state.shard.plane.metadata().applied_frontier().get());
+        Ok::<_, ReadError>((metadata, local))
+    };
+    let (_, local) = local_metadata()?;
     let requested = request
         .route()
         .map(|route| route.context)
         .or(query.strategy.context)
         .unwrap_or(local);
+    let requested = PartitionContext {
+        metadata_op: requested.metadata_op.max(metadata_floor),
+        ..requested
+    };
     let effect = if query.auto_commit {
         PartitionEffect::Write
     } else {
         PartitionEffect::Read
     };
-    if let Some(response) = SendWrapper::new(route_partition(
-        &state, &request, namespace, requested, effect,
+    let serve_locally = async || {
+        check_partition_freshness(&state).map_err(ReadError::Rejected)?;
+        authorize_read(&state, &identity, consistency, rule)?;
+        let (metadata, local) = local_metadata()?;
+        // `poll_wire_request` refused a group poll above, so this poll has no
+        // member and names client 0, the HTTP read client.
+        fence_poll_context(requested, local, HTTP_UNREGISTERED_CLIENT_ID, partition_id)
+            .map_err(ReadError::Rejected)?;
+        let read = if let Some(options) = options {
+            let mut options = options
+                .remaining(started.elapsed())
+                .map_err(ReadError::Rejected)?;
+            let remaining = request
+                .deadline
+                .saturating_duration_since(std::time::Instant::now());
+            options.request_timeout = options.request_timeout.get_duration().min(remaining).into();
+            // A binding HTTP deadline shortens the wait, not its reply margin.
+            options.max_wait = options
+                .max_wait
+                .get_duration()
+                .min(options.request_timeout.get_duration().saturating_sub(
+                    std::time::Duration::from_micros(
+                        iggy_common::MIN_DEFERRED_POLL_REPLY_MARGIN_US,
+                    ),
+                ))
+                .into();
+            PartitionRead::DeferredPoll(Box::new(DeferredPollRequest::new(
+                consumer,
+                args.clone(),
+                metadata,
+                DeferredPollContext {
+                    session: None,
+                    user_id: identity.user_id,
+                    user_created_at: Some(identity.user_created_at.as_micros()),
+                    quota: PollQuotaIdentity::User(identity.user_id),
+                    primary: true,
+                },
+                options,
+            )))
+        } else {
+            PartitionRead::UnboundPollOnPrimary {
+                consumer,
+                args: args.clone(),
+                user_id: identity.user_id,
+                user_created_at: identity.user_created_at.as_micros(),
+                metadata,
+            }
+        };
+        let reply = state.shard.partition_read(namespace, read).await;
+        // The owner may already have auto-committed. At-most-once polls can
+        // lose a batch here, but revoked credentials must never receive it.
+        authorize_read(&state, &identity, consistency, rule)?;
+        check_partition_incarnation(&state, namespace, local.incarnation)?;
+        polled_messages_reply(&state, partition_id, reply)
+    };
+    SendWrapper::new(serve_partition(
+        &state,
+        &request,
+        namespace,
+        requested,
+        effect,
+        FirstAttempt::Local,
+        serve_locally,
     ))
     .await
-    {
-        return Ok(response);
-    }
-    authorize_read(&state, &identity, consistency, rule)?;
-    // `poll_wire_request` refused a group poll above, so this poll has no
-    // member and names client 0, the HTTP read client.
-    fence_poll_context(requested, local, HTTP_READ_CLIENT_ID, partition_id)
-        .map_err(ReadError::Rejected)?;
-    let reply = SendWrapper::new(state.shard.partition_read(
-        namespace,
-        PartitionRead::UnboundPollOnPrimary {
-            consumer,
-            args,
-            user_id: identity.user_id,
-            user_created_at: identity.user_created_at.as_micros(),
-            metadata,
-        },
-    ))
-    .await;
-    // The owner may already have auto-committed. At-most-once polls can lose a
-    // batch here, but revoked credentials must never receive it.
-    authorize_read(&state, &identity, consistency, rule)?;
+}
+
+/// The HTTP answer to the owner's reply to a poll.
+fn polled_messages_reply(
+    state: &HttpInner,
+    partition_id: u32,
+    reply: Option<PartitionReadReply>,
+) -> Result<Response, ReadError> {
     match reply {
         Some(PartitionReadReply::Poll {
             context,
             fragments,
             current_offset,
+            encryptor,
         }) => {
             // TCP parity (`build_polled_messages_reply`): the served context
             // carries at least the metadata this node applied, so a later poll
@@ -1398,7 +1420,7 @@ pub(in crate::http) async fn poll_messages(
                 current_offset,
                 context,
                 fragments,
-                state.shard.plane.partitions().config().encryptor.as_deref(),
+                encryptor.as_deref(),
             )
             .map_err(ReadError::Rejected)?;
             Ok(
@@ -1438,7 +1460,14 @@ pub(in crate::http) async fn get_consumer_offset(
 ) -> Result<Response, ReadError> {
     let stream_id = Identifier::from_str_value(&stream_id).map_err(ReadError::Rejected)?;
     let topic_id = Identifier::from_str_value(&topic_id).map_err(ReadError::Rejected)?;
-    let consistency = partition_read_consistency(&request, consistency.consistency);
+    // The local context below is read after any floor hold, so it covers the
+    // floor already.
+    let (consistency, _metadata_floor) = SendWrapper::new(partition_read_consistency(
+        &state,
+        &request,
+        consistency.consistency,
+    ))
+    .await?;
     let rule = |permissioner: &Permissioner, uid| {
         resolve_gate_topic_ids(&state, &stream_id, &topic_id)
             .map_or(Ok(()), |(stream_id, topic_id)| {
@@ -1455,9 +1484,12 @@ pub(in crate::http) async fn get_consumer_offset(
     .await?;
     let wire =
         consumer_offset_wire_request(&stream_id, &topic_id, &query).map_err(ReadError::Rejected)?;
-    let (namespace, _, _) = resolve_consumer_offset_request(&state.shard, &wire)
-        .map_err(|_| ReadError::NotFound)?
-        .ok_or(ReadError::NotFound)?;
+    let namespace = match resolve_consumer_offset_request(&state.shard, &wire) {
+        Ok((namespace, _, target)) if !matches!(target, ConsumerOffsetTarget::MissingGroup) => {
+            namespace
+        }
+        _ => return Err(ReadError::NotFound),
+    };
     let rule = |permissioner: &Permissioner, uid| {
         permissioner.get_consumer_offset(uid, namespace.stream_id(), namespace.topic_id())
     };
@@ -1469,40 +1501,62 @@ pub(in crate::http) async fn get_consumer_offset(
             .metadata()
             .mux_stm
             .streams()
-            .poll_metadata(namespace, None, HTTP_READ_CLIENT_ID)
+            .poll_metadata(namespace, None, HTTP_UNREGISTERED_CLIENT_ID)
             .ok_or(ReadError::Rejected(IggyError::TransientNotAccepted))?
             .context(state.shard.plane.metadata().applied_frontier().get()),
     };
-    if let Some(response) = SendWrapper::new(route_partition(
+    let serve_locally = async || {
+        check_partition_freshness(&state).map_err(ReadError::Rejected)?;
+        authorize_read(&state, &identity, consistency, rule)?;
+        let (namespace, partition_id, read) =
+            resolve_primary_consumer_offset_request(&state.shard, &wire, context)
+                .map_err(ReadError::Rejected)?;
+        let reply = state.shard.partition_read(namespace, read).await;
+        authorize_read(&state, &identity, consistency, rule)?;
+        check_partition_incarnation(&state, namespace, context.incarnation)?;
+        consumer_offset_reply(partition_id, reply).map(IntoResponse::into_response)
+    };
+    SendWrapper::new(serve_partition(
         &state,
         &request,
         namespace,
         context,
         PartitionEffect::Read,
+        FirstAttempt::Local,
+        serve_locally,
     ))
     .await
-    {
-        return Ok(response);
-    }
-    authorize_read(&state, &identity, consistency, rule)?;
-    let (namespace, partition_id, read) =
-        resolve_primary_consumer_offset_request(&state.shard, &wire, context)
-            .map_err(ReadError::Rejected)?;
-    let reply = SendWrapper::new(state.shard.partition_read(namespace, read)).await;
-    authorize_read(&state, &identity, consistency, rule)?;
-    consumer_offset_reply(partition_id, reply).map(IntoResponse::into_response)
 }
 
-/// A hop target reads after its metadata hold and never answers the 307 of the
-/// metadata primary, because the partition primary already serves the read.
-const fn partition_read_consistency(
+/// The consistency a partition read is gated with on this node, and the
+/// metadata op its context must cover.
+///
+/// A hop target reads after its metadata hold and never answers the 307 of
+/// the metadata primary, because the partition primary already serves the
+/// read. A linearizable read on a node that is not the metadata primary holds
+/// for the metadata primary's commit floor instead of the 307
+/// ([`await_metadata_floor`]), then authorizes, resolves and relays on state at
+/// least that fresh. Without forwarding there is no floor to read, so such a
+/// read keeps the 307.
+async fn partition_read_consistency(
+    state: &HttpInner,
     request: &PartitionRequest,
     consistency: Consistency,
-) -> Consistency {
-    match request.hop {
-        PartitionHop::Target(_) => Consistency::Serializable,
-        PartitionHop::Contacted | PartitionHop::Unrouted => consistency,
+) -> Result<(Consistency, u64), ReadError> {
+    const NO_FLOOR: u64 = 0;
+    check_partition_freshness(state).map_err(ReadError::Rejected)?;
+    if matches!(request.hop, PartitionHop::Target(_)) {
+        return Ok((Consistency::Serializable, NO_FLOOR));
     }
+    if consistency == Consistency::Serializable
+        || state.is_metadata_primary()
+        || !state.forward.active()
+    {
+        return Ok((consistency, NO_FLOOR));
+    }
+    let floor = await_metadata_floor(state, request.deadline).await?;
+    check_partition_freshness(state).map_err(ReadError::Rejected)?;
+    Ok((Consistency::Serializable, floor))
 }
 
 /// The HTTP answer to the owner's reply to a consumer offset read.
@@ -1546,19 +1600,22 @@ fn consumer_offset_reply(
 /// gate, and the committed reply reaches its in-process reply slot.
 /// The default answers 201 with the completed message durability only
 /// after the quorum commit, with the commit's per-partition confirmations as
-/// the body; `?ack=none` answers 202 + `Iggy-Durability: none` immediately
-/// after dispatch and can carry no confirmation, having awaited none.
+/// the body; `?ack=none` answers 202 + `Iggy-Durability: none` as soon as the
+/// partition plane takes the batch and can carry no confirmation, having
+/// awaited none. A refusal before the partition answers its error instead.
 ///
 /// Every 201 carries a `confirmations` list, empty when the commit reported no
 /// offsets. One shape for one meaning: a caller that had to tell "no body"
 /// apart from "empty list" would be reading the same outcome two ways.
 ///
-/// This node chooses the partition once. Another node relays the batch to the
-/// partition primary with that choice ([`route_partition`]), so `?ack=none`
-/// answers 202 only on the primary.
+/// This node chooses the partition once. A node whose owner is not the
+/// partition primary relays the batch to the primary with that choice
+/// ([`serve_partition`]). `?ack=none` answers before the owner's gate decides,
+/// so it first checks that this node is the primary ([`require_local_primary`])
+/// and answers 202 only there.
 pub(in crate::http) async fn send_messages(
     State(state): State<HttpState>,
-    identity: Authenticated,
+    credential: Credential,
     Path((stream_id, topic_id)): Path<(String, String)>,
     Query(query): Query<ProduceQuery>,
     Extension(request): Extension<Arc<PartitionRequest>>,
@@ -1571,7 +1628,7 @@ pub(in crate::http) async fn send_messages(
     // Handler-side so an HTTP denial never enters the partition plane.
     authorize_data_plane(
         &state,
-        identity.session.user_id,
+        credential.user_id,
         &stream_id,
         &topic_id,
         Permissioner::append_messages,
@@ -1594,62 +1651,69 @@ pub(in crate::http) async fn send_messages(
         .map_err(PartitionWriteError::Rejected)?;
     let (namespace, context) = capture_partition_write(
         &state,
-        &identity.session,
+        HTTP_UNREGISTERED_CLIENT_ID,
         Operation::SendMessages,
         &body,
         route.map(|route| route.context).or(command.context),
     )?;
-    if let Some(response) = SendWrapper::new(route_partition(
+    let serve_locally = async || {
+        let session = credential.session(&state).await?;
+        match query.ack {
+            ProduceAck::Replicated => {
+                let (reply, header) = partition_write_replicated(
+                    &state,
+                    &session,
+                    Operation::SendMessages,
+                    &body,
+                    namespace,
+                    context,
+                    request.deadline,
+                )
+                .await?;
+                let policy = policy.map_or(iggy_common::Durability::Replicated, |policy| {
+                    policy.confirmed_policy(&state)
+                });
+                let durability = [(DURABILITY_HEADER, HeaderValue::from_static(policy.into()))];
+                // An unreadable confirmation still answers 201: the batch committed,
+                // only its offsets did not survive the reply.
+                let confirmations = send_confirmations(&reply, &header)
+                    .map(SendMessagesConfirmations::from)
+                    .unwrap_or_default();
+                Ok::<_, PartitionWriteError>(
+                    (StatusCode::CREATED, durability, Json(confirmations)).into_response(),
+                )
+            }
+            ProduceAck::None => {
+                require_local_primary(&state, namespace)
+                    .await
+                    .map_err(PartitionWriteError::Rejected)?;
+                produce_unacked(
+                    &state,
+                    &session,
+                    body.clone(),
+                    namespace,
+                    context,
+                    request.deadline,
+                )
+                .await?;
+                Ok((
+                    StatusCode::ACCEPTED,
+                    [(DURABILITY_HEADER, HeaderValue::from_static(DURABILITY_NONE))],
+                )
+                    .into_response())
+            }
+        }
+    };
+    SendWrapper::new(serve_partition(
         &state,
         &request,
         namespace,
         context,
         PartitionEffect::Write,
+        write_first_attempt(&state, &credential),
+        serve_locally,
     ))
     .await
-    {
-        return Ok(response);
-    }
-    match query.ack {
-        ProduceAck::Replicated => {
-            let (reply, header) = SendWrapper::new(partition_write_replicated(
-                &state,
-                &identity.session,
-                Operation::SendMessages,
-                &body,
-                namespace,
-                context,
-                request.deadline,
-            ))
-            .await?;
-            let policy = policy.map_or(iggy_common::Durability::Replicated, |policy| {
-                policy.confirmed_policy(&state)
-            });
-            let durability = [(DURABILITY_HEADER, HeaderValue::from_static(policy.into()))];
-            // An unreadable confirmation still answers 201: the batch committed,
-            // only its offsets did not survive the reply.
-            let confirmations = send_confirmations(&reply, &header)
-                .map(SendMessagesConfirmations::from)
-                .unwrap_or_default();
-            Ok((StatusCode::CREATED, durability, Json(confirmations)).into_response())
-        }
-        ProduceAck::None => {
-            SendWrapper::new(produce_unacked(
-                &state,
-                &identity.session,
-                body,
-                namespace,
-                context,
-                request.deadline,
-            ))
-            .await?;
-            Ok((
-                StatusCode::ACCEPTED,
-                [(DURABILITY_HEADER, HeaderValue::from_static(DURABILITY_NONE))],
-            )
-                .into_response())
-        }
-    }
 }
 
 /// `PUT /streams/{stream_id}/topics/{topic_id}/consumer-offsets`: store a
@@ -1668,7 +1732,7 @@ pub(in crate::http) async fn send_messages(
 /// consumers and rewrite group ids server-side, identically to TCP.
 pub(in crate::http) async fn store_consumer_offset(
     State(state): State<HttpState>,
-    identity: Authenticated,
+    credential: Credential,
     Path((stream_id, topic_id)): Path<(String, String)>,
     Extension(request): Extension<Arc<PartitionRequest>>,
     Json(command): Json<StoreConsumerOffset>,
@@ -1679,7 +1743,7 @@ pub(in crate::http) async fn store_consumer_offset(
     // RBAC: authorize the offset write on (stream, topic) handler-side.
     authorize_data_plane(
         &state,
-        identity.session.user_id,
+        credential.user_id,
         &stream_id,
         &topic_id,
         Permissioner::store_consumer_offset,
@@ -1690,7 +1754,7 @@ pub(in crate::http) async fn store_consumer_offset(
         .to_bytes();
     let (namespace, context) = capture_partition_write(
         &state,
-        &identity.session,
+        HTTP_UNREGISTERED_CLIENT_ID,
         Operation::StoreConsumerOffset,
         &body,
         request
@@ -1698,28 +1762,30 @@ pub(in crate::http) async fn store_consumer_offset(
             .map(|route| route.context)
             .or(command.context),
     )?;
-    if let Some(response) = SendWrapper::new(route_partition(
+    let serve_locally = async || {
+        let session = credential.session(&state).await?;
+        partition_write_replicated(
+            &state,
+            &session,
+            Operation::StoreConsumerOffset,
+            &body,
+            namespace,
+            context,
+            request.deadline,
+        )
+        .await?;
+        Ok::<_, PartitionWriteError>(StatusCode::NO_CONTENT.into_response())
+    };
+    SendWrapper::new(serve_partition(
         &state,
         &request,
         namespace,
         context,
         PartitionEffect::Write,
+        write_first_attempt(&state, &credential),
+        serve_locally,
     ))
     .await
-    {
-        return Ok(response);
-    }
-    SendWrapper::new(partition_write_replicated(
-        &state,
-        &identity.session,
-        Operation::StoreConsumerOffset,
-        &body,
-        namespace,
-        context,
-        request.deadline,
-    ))
-    .await?;
-    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// `DELETE /streams/{stream_id}/topics/{topic_id}/consumer-offsets/{consumer_id}`:
@@ -1733,7 +1799,7 @@ pub(in crate::http) async fn store_consumer_offset(
 /// is rejected because HTTP does not persist a connection and group memberships can change.
 pub(in crate::http) async fn delete_consumer_offset(
     State(state): State<HttpState>,
-    identity: Authenticated,
+    credential: Credential,
     Path((stream_id, topic_id, consumer_id)): Path<(String, String, String)>,
     Query(query): Query<DeleteConsumerOffset>,
     Extension(request): Extension<Arc<PartitionRequest>>,
@@ -1744,7 +1810,7 @@ pub(in crate::http) async fn delete_consumer_offset(
     // RBAC: authorize the offset delete on (stream, topic) handler-side.
     authorize_data_plane(
         &state,
-        identity.session.user_id,
+        credential.user_id,
         &stream_id,
         &topic_id,
         Permissioner::delete_consumer_offset,
@@ -1759,33 +1825,46 @@ pub(in crate::http) async fn delete_consumer_offset(
         .to_bytes();
     let (namespace, context) = capture_partition_write(
         &state,
-        &identity.session,
+        HTTP_UNREGISTERED_CLIENT_ID,
         Operation::DeleteConsumerOffset,
         &body,
         request.route().map(|route| route.context),
     )?;
-    if let Some(response) = SendWrapper::new(route_partition(
+    let serve_locally = async || {
+        let session = credential.session(&state).await?;
+        partition_write_replicated(
+            &state,
+            &session,
+            Operation::DeleteConsumerOffset,
+            &body,
+            namespace,
+            context,
+            request.deadline,
+        )
+        .await?;
+        Ok::<_, PartitionWriteError>(StatusCode::NO_CONTENT.into_response())
+    };
+    SendWrapper::new(serve_partition(
         &state,
         &request,
         namespace,
         context,
         PartitionEffect::Write,
+        write_first_attempt(&state, &credential),
+        serve_locally,
     ))
     .await
-    {
-        return Ok(response);
+}
+
+/// A write whose caller holds a session here runs here first. Without one,
+/// serving here would first Register it, a metadata commit that a relay to
+/// another primary wastes, so the write looks its primary up first.
+fn write_first_attempt(state: &HttpInner, credential: &Credential) -> FirstAttempt {
+    if credential.has_session(state) {
+        FirstAttempt::Local
+    } else {
+        FirstAttempt::Lookup
     }
-    SendWrapper::new(partition_write_replicated(
-        &state,
-        &identity.session,
-        Operation::DeleteConsumerOffset,
-        &body,
-        namespace,
-        context,
-        request.deadline,
-    ))
-    .await?;
-    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// `POST /streams/{stream_id}/topics/{topic_id}/consumer-groups`: create a
@@ -1859,8 +1938,12 @@ pub(in crate::http) async fn delete_cg(
 pub(in crate::http) async fn create_user(
     State(state): State<HttpState>,
     identity: Authenticated,
-    Json(command): Json<CreateUser>,
+    JsonMembers {
+        value: command,
+        members,
+    }: JsonMembers<CreateUser>,
 ) -> Result<Json<UserInfoDetails>, WriteError> {
+    refuse_misplaced_options(OptionsScope::User, &members)?;
     // Rejects empty/oversized username or password before any consensus work.
     command.validate().map_err(WriteError::Rejected)?;
     let request = CreateUserRequest {
@@ -1869,7 +1952,7 @@ pub(in crate::http) async fn create_user(
         password: command.password.expose_secret().to_string(),
         status: command.status.as_code(),
         permissions: command.permissions.as_ref().map(permissions_to_wire),
-        options: WireOptions::empty(),
+        options: command.options.to_wire().map_err(WriteError::Rejected)?,
     };
     let body = request.to_bytes();
     let payload = SendWrapper::new(submit_write(
@@ -1882,43 +1965,71 @@ pub(in crate::http) async fn create_user(
     Ok(Json(decode_user_details(&payload)?))
 }
 
-/// `PUT /users/{user_id}`: update a user's username and/or status. Returns 204.
+/// `PUT /users/{user_id}`: update the user's username, status and options. An
+/// absent or `null` key keeps its value, a key in `reset` returns to its
+/// default. Returns 204 on commit.
 pub(in crate::http) async fn update_user(
     State(state): State<HttpState>,
     identity: Authenticated,
     Path(user_id): Path<String>,
-    Json(command): Json<UpdateUser>,
+    update: Result<JsonUpdate, WriteError>,
 ) -> Result<StatusCode, WriteError> {
     let user_id = Identifier::from_str_value(&user_id).map_err(WriteError::Rejected)?;
-    // Rejects an oversized replacement username; a no-op when username is absent.
-    command.validate().map_err(WriteError::Rejected)?;
-    let user_update_options = UserUpdateOptions {
-        raw: command.options,
-    }
-    .to_wire()
-    .map_err(WriteError::Rejected)?;
-    validate_option_keys(&user_update_options, UPDATABLE_USER_OPTION_KEYS)
-        .map_err(WriteError::Rejected)?;
-    let request = UpdateUserRequest {
+    let target = ResourceTarget::User {
         user_id: identifier_to_wire(&user_id).map_err(WriteError::Rejected)?,
-        username: command
-            .username
-            .as_deref()
-            .map(WireName::new)
-            .transpose()
-            .map_err(|_| WriteError::Rejected(IggyError::InvalidUsername))?,
-        status: command.status.map(|status| status.as_code()),
-        options: user_update_options,
     };
-    let body = request.to_bytes();
+    submit_update(&state, &identity, target, update).await
+}
+
+/// Submit an update body as the generic `UpdateResource` the binary transports
+/// send, so admission and apply are shared.
+async fn submit_update(
+    state: &HttpState,
+    identity: &Authenticated,
+    target: ResourceTarget,
+    update: Result<JsonUpdate, WriteError>,
+) -> Result<StatusCode, WriteError> {
+    let JsonUpdate(update) = update?;
+    let parts = update.to_patch().map_err(WriteError::Rejected)?;
+    let request = UpdateResourceRequest {
+        target,
+        reset: parts.reset,
+        options: parts.set,
+    };
+    let body = erasing_body(&request);
+    erase_buffer(request.options.into_bytes());
     SendWrapper::new(submit_write(
-        &state,
+        state,
         &identity.session,
-        Operation::UpdateUser,
+        Operation::UpdateResource,
         body,
     ))
     .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Encode `request` into a body that zeroes itself when its last handle drops,
+/// since its options may hold the stream key.
+fn erasing_body(request: &impl WireEncode) -> Bytes {
+    let mut buffer = BytesMut::with_capacity(request.encoded_size());
+    request.encode(&mut buffer);
+    Bytes::from_owner(Zeroizing::new(Vec::from(buffer)))
+}
+
+/// Refuses a create body member that names a stored option of `scope`, an
+/// option the client placed beside `options` instead of inside it, and names
+/// that member.
+fn refuse_misplaced_options(
+    scope: OptionsScope,
+    members: &BTreeSet<String>,
+) -> Result<(), WriteError> {
+    descriptors_for(scope)
+        .filter(|descriptor| descriptor.storage != OptionStorage::Column)
+        .map(|descriptor| <&str>::from(descriptor.key))
+        .find(|key| members.contains(*key))
+        .map_or(Ok(()), |key| {
+            Err(WriteError::MalformedMember(key.to_owned()))
+        })
 }
 
 /// `DELETE /users/{user_id}`: delete a user. Returns 204.
@@ -2127,15 +2238,46 @@ fn issue_identity(
 mod tests {
     use super::*;
 
+    use std::collections::BTreeMap;
+
     use axum::body::to_bytes;
     use iggy_binary_protocol::responses::messages::{
         SendMessagesConfirmationResponse, SendMessagesResponse,
     };
+    use iggy_common::{OptionInputMap, OptionInputValue, OptionKey};
     use serde_json::Value;
 
     use crate::http::reply::classify_partition_reply;
     use crate::http::wire::build_request_message;
     use crate::reply_frame::build_deny_reply;
+
+    /// A create body can carry the stream key, so it zeroes itself on drop and
+    /// leaves its options block for the handler to erase.
+    #[test]
+    fn given_create_with_stream_key_when_encoding_body_should_zero_on_drop_and_free_its_options() {
+        let options = OptionInputMap(BTreeMap::from([(
+            OptionKey::EncryptionKey.to_string(),
+            OptionInputValue::String(
+                "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE="
+                    .to_owned()
+                    .into(),
+            ),
+        )]));
+        let request = CreateStreamRequest {
+            name: WireName::new("orders").expect("valid name"),
+            options: options.to_wire().expect("encodes"),
+        };
+        let body = erasing_body(&request);
+        assert_eq!(body, request.to_bytes(), "the plain encoding");
+        assert!(
+            body.try_into_mut().is_err(),
+            "an owned buffer that zeroes on drop"
+        );
+        assert!(
+            request.options.into_bytes().try_into_mut().is_ok(),
+            "the only handle to the options block"
+        );
+    }
 
     /// The produce extractor keeps the caller's context, so the write is fenced
     /// with the incarnation the caller saw rather than the current one.
@@ -2191,6 +2333,44 @@ mod tests {
             .unwrap();
         let error: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(error["id"], IggyError::HistoryUnavailable.as_code());
+    }
+
+    /// A relay that lost a write's verdict answers `TransientNotCommitted`,
+    /// which licenses only a replay of the same request id. HTTP mints a new
+    /// id for every request, so no resend replays it and the write may still
+    /// commit: it must render as the 504 unknown outcome of its write kind,
+    /// never as a retryable 503.
+    #[tokio::test]
+    async fn given_not_committed_deny_when_writing_should_answer_outcome_unknown() {
+        const ERROR_BODY_LIMIT: usize = 1024;
+        for (operation, code) in [
+            (Operation::SendMessages, "produce_timeout"),
+            (Operation::StoreConsumerOffset, "offset_write_timeout"),
+        ] {
+            let request = build_request_message(operation, 42, 7, 1, &[]);
+            let deny = build_deny_reply(
+                request.header(),
+                42,
+                0,
+                9,
+                IggyError::TransientNotCommitted.as_code(),
+            );
+
+            let error = classify_partition_reply(&deny.into_generic().into_frozen())
+                .expect_err("a deny is never a commit");
+            let response = error.into_response();
+
+            assert_eq!(
+                response.status(),
+                StatusCode::GATEWAY_TIMEOUT,
+                "{operation:?}"
+            );
+            let body = to_bytes(response.into_body(), ERROR_BODY_LIMIT)
+                .await
+                .unwrap();
+            let error: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(error["code"], code);
+        }
     }
 
     /// Pins the produce response contract the SDKs decode: `snake_case` field

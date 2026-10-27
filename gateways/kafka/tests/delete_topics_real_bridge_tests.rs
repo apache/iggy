@@ -43,7 +43,8 @@ use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
 use iggy_gateway_kafka::listener::SecurityProtocol;
 use iggy_gateway_kafka::protocol::api::{
     API_KEY_DELETE_TOPICS, ERROR_INVALID_REQUEST, ERROR_NONE, ERROR_POLICY_VIOLATION,
-    ERROR_TOPIC_AUTHORIZATION_FAILED, ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState,
+    ERROR_REQUEST_TIMED_OUT, ERROR_TOPIC_AUTHORIZATION_FAILED, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+    GatewayState,
 };
 use iggy_gateway_kafka::protocol::handlers::delete_topics;
 use iggy_gateway_kafka::protocol::sasl::PlainCredentials;
@@ -349,6 +350,41 @@ async fn delete_topics_over_cap_error_message_names_the_limit() {
         error_message.is_some_and(|m| m.contains("100")),
         "error_message must name the actual cap"
     );
+}
+
+/// A `CreatePartitions` reads a topic and then adds to it by name, so `DeleteTopics` waits for its
+/// lock rather than delete the topic in between. Held past the request's 5 s deadline, the delete
+/// answers retriable `REQUEST_TIMED_OUT` (7) and the topic stays.
+#[tokio::test]
+#[serial]
+async fn delete_topics_waits_for_a_create_partitions_in_progress() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let state = connected_state(&server).await;
+    let Some(bridge) = &state.bridge else {
+        panic!("bridge must be connected")
+    };
+    bridge
+        .create_kafka_topic("orders", 1)
+        .await
+        .expect("create the topic to delete");
+
+    let held = state.hold_topic_changes().await;
+    let results = send(&state, &["orders"]).await;
+    assert_eq!(
+        results,
+        vec![(Some("orders".to_string()), ERROR_REQUEST_TIMED_OUT)]
+    );
+    let raw = raw_client(&server).await;
+    let topics = raw
+        .get_topics(&Identifier::named("kafka").expect("valid stream name"))
+        .await
+        .expect("get_topics call");
+    assert_eq!(topics.len(), 1, "nothing is deleted while the lock is held");
+
+    drop(held);
+    let results = send(&state, &["orders"]).await;
+    assert_eq!(results, vec![(Some("orders".to_string()), ERROR_NONE)]);
 }
 
 /// Refuses every login: these tests only need a SASL listener to exist beside the one they use.

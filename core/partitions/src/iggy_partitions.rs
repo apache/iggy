@@ -18,6 +18,7 @@
 #![allow(dead_code)]
 
 use crate::poll_plan::{PollPlan, PollReadResult};
+use crate::stream_keyring::{StreamKeyIdentity, StreamKeyring};
 use crate::types::PartitionsConfig;
 use crate::{IggyPartition, Partition, PollingArgs, PollingConsumer};
 use crate::{PollCompletion, PollReplication};
@@ -29,7 +30,7 @@ use iggy_binary_protocol::{
     Command, ConsensusHeader, Operation, PrepareHeader, PrepareOkHeader, ReplyHeader,
     RoutedRequestHeader,
 };
-use iggy_common::IggyError;
+use iggy_common::{EncryptorKind, IggyError, ServerKeyContext, StreamEncryption};
 use journal::superblock::{PingPongSuperblock, SuperblockStore};
 use message_bus::MessageBus;
 use server_common::Message;
@@ -39,6 +40,7 @@ use std::cell::Cell;
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::task::Waker;
 use tracing::warn;
 
@@ -110,6 +112,9 @@ where
     /// per-shard runtime is single-threaded, so runtime borrow checks
     /// suffice; callers must not hold a borrow across `.await`.
     tombstoned: RefCell<AHashMap<IggyNamespace, Option<u64>>>,
+    /// Stream encryptors by stream incarnation, opened with this node's keys.
+    /// Same single-threaded borrow rules as `tombstoned`.
+    keyring: RefCell<StreamKeyring>,
     /// Reconciler fences must not borrow a partition held by the pump across await.
     teardown: RefCell<AHashMap<IggyNamespace, crate::PartitionTeardown>>,
     consumer_group_offsets_reconcile_epoch: Rc<Cell<u64>>,
@@ -149,12 +154,14 @@ where
 {
     #[must_use]
     pub fn new(shard_id: ShardId, config: PartitionsConfig) -> Self {
+        let keyring = RefCell::new(StreamKeyring::new(Arc::clone(&config.key_context)));
         Self {
             shard_id,
             config,
             partitions: UnsafeCell::new(Vec::new()),
             namespace_to_local: UnsafeCell::new(BTreeMap::new()),
             tombstoned: RefCell::new(AHashMap::new()),
+            keyring,
             teardown: RefCell::new(AHashMap::new()),
             consumer_group_offsets_reconcile_epoch: Rc::new(Cell::new(0)),
             fence_published: Rc::default(),
@@ -168,6 +175,7 @@ where
 
     #[must_use]
     pub fn with_capacity(shard_id: ShardId, config: PartitionsConfig, capacity: usize) -> Self {
+        let keyring = RefCell::new(StreamKeyring::new(Arc::clone(&config.key_context)));
         Self {
             shard_id,
             config,
@@ -175,6 +183,7 @@ where
             // BTreeMap has no capacity hint; the Vec above absorbs the sizing.
             namespace_to_local: UnsafeCell::new(BTreeMap::new()),
             tombstoned: RefCell::new(AHashMap::new()),
+            keyring,
             teardown: RefCell::new(AHashMap::new()),
             consumer_group_offsets_reconcile_epoch: Rc::new(Cell::new(0)),
             fence_published: Rc::default(),
@@ -184,6 +193,37 @@ where
             #[cfg(debug_assertions)]
             borrow_active: Cell::new(0),
         }
+    }
+
+    /// This node's key-encryption keys, for wrapping new stream keys.
+    #[must_use]
+    pub fn key_context(&self) -> Arc<ServerKeyContext> {
+        Arc::clone(&self.config.key_context)
+    }
+
+    /// The encryptor of one stream incarnation, `None` only for a plaintext
+    /// stream.
+    ///
+    /// # Errors
+    ///
+    /// See [`StreamKeyring::resolve`]: the stream is unavailable on this node.
+    pub fn resolve_stream_encryptor(
+        &self,
+        identity: StreamKeyIdentity,
+        encryption: &StreamEncryption,
+    ) -> Result<Option<Arc<EncryptorKind>>, IggyError> {
+        self.keyring.borrow_mut().resolve(identity, encryption)
+    }
+
+    /// Whether this shard holds the key of any stream incarnation.
+    #[must_use]
+    pub fn has_stream_keys(&self) -> bool {
+        !self.keyring.borrow().is_empty()
+    }
+
+    /// Drop the encryptors of the stream incarnations `is_live` rejects.
+    pub fn retain_stream_keys(&self, is_live: impl FnMut(StreamKeyIdentity) -> bool) {
+        self.keyring.borrow_mut().retain(is_live);
     }
 
     pub fn set_persistence_notifier(&self, notifier: crate::PersistenceNotifier) {
@@ -738,10 +778,15 @@ where
     /// Read `(end_offset, lagging, created_revision)` in one partition access.
     /// The caller compares this local history with committed metadata before
     /// submitting the resolved watermark.
-    /// No sealed segment permits a no-op on a converged history; a lagging
-    /// replica must retry because it may be missing whole sealed segments.
-    /// `None` means no local partition. The caller can record that no-op with
-    /// a zero watermark and no history guard.
+    /// A replica that is not a normal primary that applied the view it
+    /// started, or that installs a transfer, may miss whole sealed segments,
+    /// so it lags for every answer. That primary's commits above `commit_min`
+    /// only seal its active segment and append after it: they leave a sealed
+    /// offset settled and make only a no-op lag. A `count` above the sealed
+    /// segments resolves to the newest one even though those commits may seal
+    /// another, so the delete can remove fewer segments than `count`. Lagging
+    /// there would answer `TransientNotAccepted` for as long as disk-bound load
+    /// keeps commits waiting. `None` means no local partition.
     pub fn segment_delete_resolution(
         &self,
         namespace: &IggyNamespace,
@@ -749,15 +794,13 @@ where
     ) -> Option<(Option<u64>, bool, u64)> {
         self.with_partition(namespace, |partition| {
             let consensus = partition.consensus();
-            let lagging = consensus.is_follower()
+            let up_to_offset = partition.nth_oldest_sealed_end_offset(count);
+            let lagging = !consensus.applied_view_start()
+                || consensus.is_follower()
                 || !consensus.is_normal()
                 || consensus.is_transferring()
-                || consensus.commit_min() < consensus.commit_max();
-            (
-                partition.nth_oldest_sealed_end_offset(count),
-                lagging,
-                partition.created_revision(),
-            )
+                || (up_to_offset.is_none() && consensus.commit_min() < consensus.commit_max());
+            (up_to_offset, lagging, partition.created_revision())
         })
     }
 }
@@ -793,14 +836,31 @@ where
             );
             return;
         }
+        let Some(partition) = self.get_mut_by_ns(&namespace) else {
+            warn!(
+                target: "iggy.partitions.diag",
+                plane = "partitions",
+                namespace_raw = namespace.inner(),
+                operation = ?message.header().operation,
+                "partition not initialized for namespace"
+            );
+            Self::answer_waiter(
+                reply.take(),
+                message.header(),
+                IggyError::TransientNotAccepted.as_code(),
+            );
+            return;
+        };
         // At-rest encryption happens HERE, once, before the op enters
         // consensus: canonicalize the wire form first so both the legacy and
         // v2 request encodings encrypt identically, then encrypt payload +
         // user headers per message. The ciphertext is what gets journaled,
         // replicated, checksummed, and persisted -- every replica stores
         // identical bytes -- and the poll reply is the single decrypt point.
+        // The partition's own encryptor: each stream has its own key, pinned
+        // to the partition when it was built.
         let message = if message.header().operation == Operation::SendMessages
-            && let Some(encryptor) = &self.config().encryptor
+            && let Some(encryptor) = partition.encryptor()
         {
             // Compute the batch checksum: this canonical output is validated by
             // `encrypt_batch_request`'s decode before re-encryption, and the
@@ -826,21 +886,6 @@ where
             }
         } else {
             message
-        };
-        let Some(partition) = self.get_mut_by_ns(&namespace) else {
-            warn!(
-                target: "iggy.partitions.diag",
-                plane = "partitions",
-                namespace_raw = namespace.inner(),
-                operation = ?message.header().operation,
-                "partition not initialized for namespace"
-            );
-            Self::answer_waiter(
-                reply.take(),
-                message.header(),
-                IggyError::TransientNotAccepted.as_code(),
-            );
-            return;
         };
         partition.on_request(message, reply).await;
     }
@@ -940,6 +985,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Segment;
     use crate::journal::MessageLookup;
     use bytes::Bytes;
     use consensus::LocalPipeline;
@@ -952,7 +998,7 @@ mod tests {
         stamp_prepare_for_persistence,
     };
     use server_common::{
-        Message,
+        Message, SegmentStorage,
         iobuf::{Frozen, Owned},
     };
     use std::sync::Arc;
@@ -986,7 +1032,7 @@ mod tests {
             validate_checksum: true,
             segment_size: IggyByteSize::from(1024 * 1024_u64),
             preallocate_segments: false,
-            encryptor: None,
+            key_context: Arc::default(),
             path_layout: crate::PartitionPathLayout::default(),
         };
         let partitions = IggyPartitions::new(ShardId::new(0), config);
@@ -1171,7 +1217,7 @@ mod tests {
         // D = 0 (last disk match), so a straddle would continue at offset 1.
         // A raw snapshot walk from offset 1 falls through to the next resident
         // op (offset 3): exactly the silent skip the gate prevents.
-        let (_, leaky_offset) = crate::journal::select_resident(
+        let (_, leaky_offset, _) = crate::journal::select_resident(
             &entries,
             MessageLookup::Offset {
                 offset: 1,
@@ -1199,7 +1245,7 @@ mod tests {
         let from_offset = 3u64;
         let contiguous = oldest_resident.is_some_and(|oldest| oldest <= from_offset);
         assert!(contiguous, "offset 3 is resident; gate must allow it");
-        let (_, contiguous_offset) = crate::journal::select_resident(
+        let (_, contiguous_offset, _) = crate::journal::select_resident(
             &entries,
             MessageLookup::Offset {
                 offset: from_offset,
@@ -1292,7 +1338,7 @@ mod tests {
         }
 
         let entries = partition.log.journal().inner.resident_entries();
-        let (_, last) = crate::journal::select_resident(
+        let (_, last, _) = crate::journal::select_resident(
             &entries,
             MessageLookup::Offset {
                 offset: 0,
@@ -1332,7 +1378,7 @@ mod tests {
             validate_checksum: false,
             segment_size: IggyByteSize::from(1024 * 1024),
             preallocate_segments: false,
-            encryptor: None,
+            key_context: Arc::default(),
             path_layout: crate::PartitionPathLayout::default(),
         };
         let partitions = IggyPartitions::new(ShardId::new(0), config);
@@ -1374,5 +1420,65 @@ mod tests {
         partitions
             .replicate_poll_completion(&namespace, replication)
             .await;
+    }
+
+    /// Under disk-bound load a primary's quorum commits wait for the writer,
+    /// so `commit_min` stays below `commit_max`. Those commits can seal the
+    /// active segment but never change a sealed one.
+    #[test]
+    fn given_commits_waiting_for_the_writer_when_resolving_segment_delete_should_settle_sealed_offsets()
+     {
+        const SEALED_END: u64 = 9;
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let segment_size = IggyByteSize::from(1024 * 1024);
+        let config = PartitionsConfig {
+            messages_required_to_save: 1,
+            size_of_messages_required_to_save: segment_size,
+            validate_checksum: false,
+            segment_size,
+            preallocate_segments: false,
+            key_context: Arc::default(),
+            path_layout: crate::PartitionPathLayout::default(),
+        };
+        let partitions = IggyPartitions::new(ShardId::new(0), config);
+        partitions.insert(namespace, build_replicated_partition());
+        let resolve = |count| {
+            partitions
+                .segment_delete_resolution(&namespace, count)
+                .map(|(up_to_offset, lagging, _)| (up_to_offset, lagging))
+        };
+        assert_eq!(
+            resolve(1),
+            Some((None, false)),
+            "a converged primary settles the no-op"
+        );
+
+        {
+            let consensus = partitions.get_by_ns(&namespace).unwrap().consensus();
+            consensus.advance_commit_max(consensus.commit_min() + 1);
+        }
+        assert_eq!(
+            resolve(1),
+            Some((None, true)),
+            "the waiting commits can still seal the first segment"
+        );
+
+        let partition = partitions.get_mut_by_ns(&namespace).unwrap();
+        let first = &mut partition.log.segments_mut()[0];
+        first.end_offset = SEALED_END;
+        first.sealed = true;
+        partition.log.add_persisted_segment(
+            Segment::new(SEALED_END + 1, segment_size),
+            SegmentStorage::default(),
+            None,
+            None,
+        );
+        for count in [1, 2] {
+            assert_eq!(
+                resolve(count),
+                Some((Some(SEALED_END), false)),
+                "count {count} resolves to a sealed segment, which the waiting commits cannot change"
+            );
+        }
     }
 }

@@ -24,31 +24,35 @@ import org.apache.iggy.message.HeaderValue;
 import java.math.BigInteger;
 import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.Map;
+import java.util.Set;
 
 /**
- * Typed builder for the topic option keys that have no parameter of their own on
- * {@code createTopic}.
+ * The options a topic is created with, one typed setter per catalog key.
  *
- * <p>Compression, message expiry and max topic size are named parameters already. The five keys here
- * would otherwise have to be spelled as raw strings paired with hand-encoded values, where a typo in
- * the key or the wrong kind for the value is only caught by the server refusing the create.
- *
- * <p>These are create-time keys: an update refuses them by name, because they describe how a
- * partition's storage was laid down. {@code describeOptions} enumerates what a given server accepts.
+ * <p>Every key here is fixed at create except {@code message_expiry} and {@code max_topic_size}, which a
+ * {@link TopicUpdate} may change later. A key left unset is resolved by the server and reported in the
+ * topic's derived options. {@code describeOptions} enumerates what a given server accepts.
  *
  * <pre>{@code
  * var options = TopicOptions.builder()
+ *         .messageExpiry(BigInteger.valueOf(604_800_000_000L))
  *         .segmentSize(BigInteger.valueOf(134_217_728))
  *         .durability(Durability.PERSISTED)
  *         .build();
- * topicsClient.createTopic(streamId, 1L, CompressionAlgorithm.None,
- *         BigInteger.ZERO, BigInteger.ZERO, "orders", options);
+ * topicsClient.createTopic(streamId, "orders", 1, options);
  * }</pre>
  */
 public final class TopicOptions {
 
-    private TopicOptions() {}
+    private final Map<String, HeaderValue> entries;
+    private final Set<String> rawKeys;
+
+    private TopicOptions(Map<String, HeaderValue> entries, Set<String> rawKeys) {
+        this.entries = entries;
+        this.rawKeys = rawKeys;
+    }
 
     public static Map<String, HeaderValue> withDurabilityDefaults(Map<String, HeaderValue> source) {
         Map<String, HeaderValue> resolved = new LinkedHashMap<>();
@@ -73,42 +77,82 @@ public final class TopicOptions {
         return new Builder();
     }
 
+    /**
+     * Every option this value sends, keyed by option name. A typed setting wins over a raw entry of the
+     * same key. The encoder writes them in ascending key order, so the order here carries no meaning.
+     */
+    public Map<String, HeaderValue> entries() {
+        return entries;
+    }
+
+    /** Raw entries print by name only, because this build cannot tell which newer keys are secret. */
+    @Override
+    public String toString() {
+        Map<String, HeaderValue> typed = new LinkedHashMap<>(entries);
+        typed.keySet().removeAll(rawKeys);
+        return "TopicOptions[options=" + typed + ", raw=" + rawKeys + "]";
+    }
+
     public static final class Builder {
 
-        private final Map<String, HeaderValue> options = new LinkedHashMap<>();
+        private final Map<String, HeaderValue> typed = new LinkedHashMap<>();
+        private final Map<String, HeaderValue> raw = new LinkedHashMap<>();
 
         private Builder() {
             durability(Durability.REPLICATED);
             consumerOffsetDurability(Durability.REPLICATED);
         }
 
+        /** The stored compression label. The server never applies it to messages. */
+        public Builder compressionAlgorithm(CompressionAlgorithm algorithm) {
+            return set(
+                    TopicOptionKey.COMPRESSION_ALGORITHM,
+                    HeaderValue.fromString(TopicSettings.compressionName(algorithm)));
+        }
+
+        /**
+         * Message expiry in microseconds, {@code 2^64 - 1} meaning never. Zero leaves the key to the server
+         * default.
+         */
+        public Builder messageExpiry(BigInteger micros) {
+            return setUnlessZero(TopicOptionKey.MESSAGE_EXPIRY, micros);
+        }
+
+        /**
+         * Topic size cap in bytes, {@code 2^64 - 1} meaning unlimited. Zero leaves the key to the server
+         * default.
+         */
+        public Builder maxTopicSize(BigInteger bytes) {
+            return setUnlessZero(TopicOptionKey.MAX_TOPIC_SIZE, bytes);
+        }
+
         /** Per-topic segment size in bytes: a 512-byte multiple within the server's bounds. */
         public Builder segmentSize(BigInteger bytes) {
-            options.put("segment_size", HeaderValue.fromUint64(bytes));
-            return this;
+            return set(TopicOptionKey.SEGMENT_SIZE, HeaderValue.fromUint64(bytes));
         }
 
         /** Message completion policy, independently defaulting to replicated. */
         public Builder durability(Durability durability) {
-            options.put("durability", HeaderValue.fromString(durability.value()));
-            return this;
+            return set(TopicOptionKey.DURABILITY, HeaderValue.fromString(durability.value()));
         }
 
         public Builder consumerOffsetDurability(Durability durability) {
-            options.put("consumer_offset_durability", HeaderValue.fromString(durability.value()));
-            return this;
+            return set(TopicOptionKey.CONSUMER_OFFSET_DURABILITY, HeaderValue.fromString(durability.value()));
+        }
+
+        /** Whether the partition set may change after create. */
+        public Builder partitionResizePolicy(PartitionResizePolicy policy) {
+            return set(TopicOptionKey.PARTITION_RESIZE_POLICY, HeaderValue.fromString(policy.value()));
         }
 
         /** Flush the journal once it holds this many messages. Must be non-zero. */
         public Builder messagesRequiredToSave(long messages) {
-            options.put("messages_required_to_save", HeaderValue.fromUint32(messages));
-            return this;
+            return set(TopicOptionKey.MESSAGES_REQUIRED_TO_SAVE, HeaderValue.fromUint32(messages));
         }
 
         /** Flush the journal once it holds this many bytes. */
         public Builder sizeOfMessagesRequiredToSave(BigInteger bytes) {
-            options.put("size_of_messages_required_to_save", HeaderValue.fromUint64(bytes));
-            return this;
+            return set(TopicOptionKey.SIZE_OF_MESSAGES_REQUIRED_TO_SAVE, HeaderValue.fromUint64(bytes));
         }
 
         /**
@@ -118,19 +162,34 @@ public final class TopicOptions {
          * {@code segment_size * partitions_count} at admission.
          */
         public Builder preallocateSegments(boolean enabled) {
-            options.put("preallocate_segments", HeaderValue.fromBool(enabled));
+            return set(TopicOptionKey.PREALLOCATE_SEGMENTS, HeaderValue.fromBool(enabled));
+        }
+
+        /** An option this build has no setter for. A typed setter wins on collision. */
+        public Builder raw(String key, HeaderValue value) {
+            raw.put(key, value);
             return this;
         }
 
-        /**
-         * The keys set on this builder, in the order they were set.
-         *
-         * <p>Wrapping a {@link LinkedHashMap} rather than calling {@code Map.copyOf}, whose
-         * iteration order is salted per JVM run: the encoder walks this map in order, so a
-         * randomized one would give the same builder a different block on every run.
-         */
-        public Map<String, HeaderValue> build() {
-            return Collections.unmodifiableMap(new LinkedHashMap<>(options));
+        public TopicOptions build() {
+            Map<String, HeaderValue> entries = new LinkedHashMap<>(raw);
+            entries.putAll(typed);
+            Set<String> rawKeys = new LinkedHashSet<>(raw.keySet());
+            rawKeys.removeAll(typed.keySet());
+            return new TopicOptions(Collections.unmodifiableMap(entries), Collections.unmodifiableSet(rawKeys));
+        }
+
+        private Builder set(TopicOptionKey key, HeaderValue value) {
+            typed.put(key.value(), value);
+            return this;
+        }
+
+        private Builder setUnlessZero(TopicOptionKey key, BigInteger value) {
+            if (value.signum() == 0) {
+                typed.remove(key.value());
+                return this;
+            }
+            return set(key, HeaderValue.fromUint64(value));
         }
     }
 }

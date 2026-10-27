@@ -60,7 +60,10 @@ async fn run(harness: &TestHarness) {
     // Primary (node 0, the view-0 primary): create the topic, produce, then poll
     // with auto_commit so the offset is committed server-side.
     let primary = harness.tcp_root_client().await.unwrap();
-    primary.create_stream(STREAM_NAME).await.unwrap();
+    primary
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     primary
         .create_topic(
             &stream,

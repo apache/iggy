@@ -35,4 +35,5 @@ class TestContext {
     String lastSentMessage;
     byte[] lastRawResponse;
     RuntimeException lastRawError;
+    RuntimeException lastCallError;
 }

@@ -32,7 +32,9 @@ export type BaseUser = {
   /** Username */
   userName: string,
   /** Options the client explicitly sent at create */
-  options: ParsedOptions
+  options: ParsedOptions,
+  /** Options the server filled */
+  derivedOptions: ParsedOptions
 };
 
 /**
@@ -90,17 +92,18 @@ export const deserializeBaseUser = (p: Buffer, pos = 0): BaseUserDeserialized =>
   const status = statusString(p.readUInt8(pos + 12));
   const userNameLength = p.readUInt8(pos + 13);
   const userName = p.subarray(pos + 14, pos + 14 + userNameLength).toString();
-  const { bytesRead: optionsBytes, options } =
-    deserializePrefixedOptions(p, pos + 14 + userNameLength);
+  const explicit = deserializePrefixedOptions(p, pos + 14 + userNameLength);
+  const derived = deserializePrefixedOptions(p, pos + 14 + userNameLength + explicit.bytesRead);
 
   return {
-    bytesRead: 14 + userNameLength + optionsBytes,
+    bytesRead: 14 + userNameLength + explicit.bytesRead + derived.bytesRead,
     data: {
       id,
       createdAt,
       status,
       userName,
-      options,
+      options: explicit.options,
+      derivedOptions: derived.options,
     }
   }
 };

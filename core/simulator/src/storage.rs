@@ -28,6 +28,7 @@ use std::io;
 use std::path::{Component, Path};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 /// Each `SimStorage` is an independent filesystem, so writer identities must not
 /// collide between instances the way bare paths would.
@@ -274,6 +275,12 @@ impl DurableStorage for SimStorage {
         Ok(Some(
             std::path::PathBuf::from(process).join(path.strip_prefix("/").unwrap_or(path)),
         ))
+    }
+
+    // Unit-test storage driven by `block_on` with no virtual timer wired in, so
+    // a writer that never drains hangs the test instead of timing out.
+    fn sleep(&self, _duration: Duration) -> impl Future<Output = ()> {
+        futures::future::pending()
     }
 
     async fn open(&self, path: &Path, mode: OpenMode) -> io::Result<SimFile> {

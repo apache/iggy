@@ -66,9 +66,11 @@ public struct ClientConfiguration: Sendable, Hashable {
     /// TLS settings; nil for plain TCP.
     public var tls: TLSOptions?
     /// Credentials to sign in with after every connection, including the
-    /// ones a reconnect establishes. Without them a reconnect cannot restore
-    /// the session, so a request that hits a dropped connection fails
-    /// instead of replaying.
+    /// ones a reconnect establishes. Once the caller signs in, a reconnect
+    /// signs in as the caller did instead, and after a logout it does not
+    /// sign in at all. Without credentials a reconnect cannot restore the
+    /// session, so a request that hits a dropped connection fails instead
+    /// of replaying.
     public var autoLogin: Credentials?
     /// How the client reconnects after losing its connection.
     public var reconnection: ReconnectionOptions

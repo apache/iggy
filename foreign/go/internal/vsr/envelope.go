@@ -18,9 +18,9 @@
 package vsr
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	ierror "github.com/apache/iggy/foreign/go/errors"
-	"github.com/zeebo/xxh3"
 )
 
 // EncodeRequest returns the complete request frame for a command code and its
@@ -86,7 +86,15 @@ func StampRequestHeader(session *Session, code uint32, frame []byte) error {
 	}
 	EncodeRequestHeader((*[HeaderSize]byte)(frame[:HeaderSize]), fields)
 	if operation != OperationNonReplicated && operation < OperationSendMessages {
-		binary.LittleEndian.PutUint64(frame[requestOffsetChecksum:], xxh3.Hash(frame[HeaderSize:]))
+		for {
+			if _, err := rand.Read(frame[requestOffsetChecksum : requestOffsetChecksum+16]); err != nil {
+				return err
+			}
+			if binary.LittleEndian.Uint64(frame[requestOffsetChecksum:]) != 0 ||
+				binary.LittleEndian.Uint64(frame[requestOffsetChecksum+8:]) != 0 {
+				break
+			}
+		}
 	}
 	return nil
 }

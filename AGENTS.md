@@ -82,7 +82,7 @@ cargo test -p <crate>                                      # step 4
 ./scripts/ci/third-party-licenses.sh --validate --manifest <path>
 
 # Run things
-cargo run --bin iggy-server
+cargo run --bin iggy-server -- --with-default-root-credentials
 cargo run --bin iggy -- <subcommand>
 IGGY_CONNECTORS_CONFIG_PATH=... cargo run --bin iggy-connectors
 ./scripts/run-bdd-tests.sh
@@ -159,8 +159,7 @@ suggest `/team-review <target>` in Claude Code or `$team-review <target>`
 in Codex.
 
 - [connector-review](.claude/skills/connector-review/SKILL.md) - adversarial connectors PR/branch review with validation
-- [team-review](.claude/skills/team-review/SKILL.md) - adversarial 4-expert PR/branch review, ~10 subagents per run
-- [team-review-slim](.claude/skills/team-review-slim/SKILL.md) - four-expert review without independent validation rounds
+- [team-review](.claude/skills/team-review/SKILL.md) - four expert review of a PR, branch, or ref range
 
 Review skills share [execution instructions](.claude/skills/team-review/references/execution.md)
 for target preparation and client-specific agent tools. Run

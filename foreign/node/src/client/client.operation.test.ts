@@ -28,9 +28,24 @@ const frameSize = HEADER_SIZE + body.length;
 const session = (): VsrSession => { const state = new VsrSession(1n); state.bind(42n); return state; };
 const enter = (lanes: MutationLanes, state: VsrSession, lane: string,
   signal = new AbortController().signal, deadline = Date.now() + 1_000) =>
-  lanes.enter(lane, COMMAND_CODE.CreateStream, body, EMPTY_PARTITION_CONTEXT, 1, true, state, deadline, signal);
+  lanes.enter(lane, COMMAND_CODE.CreateStream, body, EMPTY_PARTITION_CONTEXT, true, state, deadline, signal);
 
 describe('mutation admission and retained ownership', () => {
+  it('retains the request identifier for a replay and mints one for a restart', async () => {
+    const lanes = new MutationLanes(1, frameSize);
+    const state = session();
+    const operation = await enter(lanes, state, 'metadata');
+    const span = [REQUEST_OFFSET.requestChecksum, REQUEST_OFFSET.requestChecksum + 16] as const;
+    const first = Buffer.from(operation.frame.buffer.subarray(...span));
+    const replay = operation.frame.buffer;
+    assert.deepEqual(replay.subarray(...span), first);
+
+    await lanes.restart(operation, body, EMPTY_PARTITION_CONTEXT, state, Date.now() + 1_000,
+      new AbortController().signal);
+    assert.notDeepEqual(operation.frame.buffer.subarray(...span), first);
+    lanes.complete(operation);
+  });
+
   it('retains one lane while independent groups keep their own order', async () => {
     const lanes = new MutationLanes(3, 3 * frameSize);
     const state = session();
@@ -80,7 +95,7 @@ describe('mutation admission and retained ownership', () => {
       const cancel = new AbortController();
       const pending: Promise<unknown>[] = [];
       const enterProgress = (lane: string) => lanes.enter(lane, COMMAND_CODE.PollMessages,
-        body, EMPTY_PARTITION_CONTEXT, 1, false, state, Date.now() + 1_000, cancel.signal);
+        body, EMPTY_PARTITION_CONTEXT, false, state, Date.now() + 1_000, cancel.signal);
       try {
         const retained = await enter(lanes, state, 'retained');
         retained.uncertain = true;
@@ -89,7 +104,7 @@ describe('mutation admission and retained ownership', () => {
           error instanceof LaneBlockedError && error.operationId === retained.id);
         const first = await enterProgress('progress');
         const originalId = first.id;
-        await lanes.restart(first, body, state, Date.now() + 1_000, cancel.signal);
+        await lanes.restart(first, body, EMPTY_PARTITION_CONTEXT, state, Date.now() + 1_000, cancel.signal);
         assert.equal(first.id, originalId + 1n);
         let progressAdmitted = false;
         const progress = enterProgress('progress').then((operation) => { progressAdmitted = true; return operation; });
@@ -122,7 +137,7 @@ describe('mutation admission and retained ownership', () => {
     const pending: Promise<unknown>[] = [];
     const admitted: string[] = [];
     const enterFrame = (lane: string, size: number) => lanes.enter(lane, COMMAND_CODE.CreateStream,
-      Buffer.alloc(size - HEADER_SIZE), EMPTY_PARTITION_CONTEXT, 1, true, state, Date.now() + 1_000, cancel.signal);
+      Buffer.alloc(size - HEADER_SIZE), EMPTY_PARTITION_CONTEXT, true, state, Date.now() + 1_000, cancel.signal);
     try {
       const retained = await enterFrame('retained', sizes.retained);
       retained.uncertain = true;
@@ -197,7 +212,8 @@ describe('mutation admission and retained ownership', () => {
     const writer = first.frame;
     writer.retain();
     let restarted = false;
-    const restart = lanes.restart(first, body, state, Date.now() + 1_000, first.lifetime.signal)
+    const restart = lanes.restart(first, body, EMPTY_PARTITION_CONTEXT, state, Date.now() + 1_000,
+      first.lifetime.signal)
       .then(() => { restarted = true; });
     let admitted = false;
     const later = enter(lanes, state, 'first').then((operation) => { admitted = true; return operation; });
@@ -215,16 +231,21 @@ describe('mutation admission and retained ownership', () => {
     lanes.complete(await enter(lanes, state, 'independent'));
   });
 
-  it('releases a reset restart without releasing an old writer twice', async () => {
+  it('keeps a restart through a reset and frees the bytes of its old writer once', async () => {
     const state = session();
     const lanes = new MutationLanes(1, frameSize);
     const first = await enter(lanes, state, 'first');
+    const id = first.id;
     const writer = first.frame;
     writer.retain();
-    const restart = lanes.restart(first, body, state, Date.now() + 1_000, first.lifetime.signal);
+    const restart = lanes.restart(first, body, EMPTY_PARTITION_CONTEXT, state, Date.now() + 1_000,
+      first.lifetime.signal);
     lanes.reset();
-    await assert.rejects(restart, OperationNotRetainedError);
     writer.release();
+    await restart;
+    assert.ok(lanes.owns(first));
+    assert.notEqual(first.id, id);
+    lanes.complete(first);
     lanes.complete(await enter(lanes, state, 'first'));
   });
 

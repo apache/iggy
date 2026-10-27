@@ -36,13 +36,16 @@
 //! endpoint via [`ShardMetrics::register`] (one `shard`-labelled
 //! sub-registry per shard). Drop-site tracing supplements the counters.
 
-use prometheus_client::encoding::EncodeLabelSet;
+use prometheus_client::encoding::{EncodeLabelSet, EncodeLabelValue, LabelValueEncoder};
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
+use std::fmt::Write as _;
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, OnceLock};
 
+use iggy_binary_protocol::Command;
 use iggy_common::ConsumerKind;
 use message_bus::ReplicaReadMetrics;
 
@@ -71,18 +74,47 @@ pub struct ConsumerOffsetKindLabel {
     pub kind: &'static str,
 }
 
+/// Label for `partition_frames_incarnation_mismatch_total`: the dropped
+/// frame's [`Command`], spelled as the drop-site log prints it.
+#[derive(Clone, Hash, Eq, PartialEq, EncodeLabelSet, Debug)]
+pub struct FrameCommandLabel {
+    pub command: CommandLabel,
+}
+
+/// A [`Command`] as a label value. It is spelled only when a scrape encodes
+/// it, so counting a drop never allocates.
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+pub struct CommandLabel(pub Command);
+
+// `Command` derives no `Hash`; its discriminant identifies it.
+impl Hash for CommandLabel {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (self.0 as u8).hash(state);
+    }
+}
+
+impl EncodeLabelValue for CommandLabel {
+    fn encode(&self, encoder: &mut LabelValueEncoder<'_>) -> std::fmt::Result {
+        write!(encoder, "{:?}", self.0)
+    }
+}
+
+impl From<Command> for FrameCommandLabel {
+    fn from(command: Command) -> Self {
+        Self {
+            command: CommandLabel(command),
+        }
+    }
+}
+
 /// Variant labels used in `frame_drops_total`. Exposed as constants to
 /// catch typos at compile time and to keep the cardinality bounded.
 ///
-/// `FORWARD_CLIENT_SEND` ticks when the cross-shard client-reply forward
-/// closure fails. Unlike `CONSENSUS` drops (which VSR retransmit
-/// recovers), a `FORWARD_CLIENT_SEND` drop is terminal: the client never
-/// receives the reply and request / response semantics break above the
-/// bus. Operators should alert on this pair in the scrape (backed by the
-/// drop-site `tracing` logs) and size `inbox_capacity` for the worst-case
-/// cross-shard reply burst.
-/// `FORWARD_REPLICA_SEND` is the symmetric variant for replica forwards;
-/// VSR retransmit covers its loss so it stays informational.
+/// `FORWARD_CLIENT_SEND` ticks when the pump cannot send a deny a synchronous
+/// caller staged by client id. The production bus refuses every frame sent by
+/// id, so only a raw request without a reply channel ends up here.
+/// `FORWARD_REPLICA_SEND` ticks when a replica forward fails. VSR retransmit
+/// covers its loss, so it stays informational.
 ///
 /// `PARTITION` covers the partition plane: a frame shed because the namespace
 /// had not materialised and its park buffer was at capacity
@@ -91,7 +123,7 @@ pub struct ConsumerOffsetKindLabel {
 /// target inbox refused. A shed client request is answered with a retriable
 /// status, so the client recovers. A shed *prepare* has nobody to answer and is
 /// not covered by retransmit once its op has reached quorum
-/// (`consensus::retransmit_targets` skips `ok_quorum_received`), so the backup
+/// (`consensus::prepare_timeout_targets` skips `ok_quorum_received`), so the backup
 /// gap-stops; `tick_partitions`' sweep is what repairs it, escalating to
 /// partition state transfer when the primary has evicted the range, and
 /// `partition_prepare_gap_drops_total` is what counts the prepares that reached
@@ -104,6 +136,8 @@ pub mod frame_drop_variant {
     pub const FORWARD_CLIENT_SEND: &str = "forward_client_send";
     pub const FORWARD_REPLICA_SEND: &str = "forward_replica_send";
     pub const METADATA_COMMIT_TICK: &str = "metadata_commit_tick";
+    pub const PARTITION_PLACEMENT_VIEWS: &str = "partition_placement_views";
+    pub const PRIMARY_REBALANCE: &str = "primary_rebalance";
     /// A delegated replica handshake's outcome ack to shard 0 was
     /// dropped; the shard-0 deadline expiry recovers the slot / pending
     /// entry, so this stays informational.
@@ -112,6 +146,10 @@ pub mod frame_drop_variant {
     /// A disk poll could not reserve completion capacity or return its result
     /// to the owning shard.
     pub const PARTITION_POLL_COMPLETION: &str = "partition_poll_completion";
+    /// A reply to a client request found no connection: the installation that
+    /// was serving the request when it arrived is gone, or its queue is full.
+    /// The reply is never delivered by client id instead.
+    pub const CLIENT_REPLY: &str = "client_reply";
 }
 
 /// Reason labels used in `frame_drops_total`.
@@ -161,7 +199,7 @@ pub mod frame_drop_reason {
 // The tables only index the lazy cache below. A `{variant, reason}`
 // pair enters the `Family` (and therefore the scrape) the first time a drop
 // site produces it, so unproduced combinations never enter the scrape.
-const VARIANT_COUNT: usize = 9;
+const VARIANT_COUNT: usize = 10;
 const REASON_COUNT: usize = 11;
 
 const VARIANTS: [&str; VARIANT_COUNT] = [
@@ -174,6 +212,7 @@ const VARIANTS: [&str; VARIANT_COUNT] = [
     frame_drop_variant::REPLICA_HANDSHAKE_ACK,
     frame_drop_variant::PARTITION_PERSISTENCE_COMPLETED,
     frame_drop_variant::PARTITION_POLL_COMPLETION,
+    frame_drop_variant::CLIENT_REPLY,
 ];
 
 const REASONS: [&str; REASON_COUNT] = [
@@ -196,6 +235,63 @@ fn variant_index(s: &str) -> Option<usize> {
 
 fn reason_index(s: &str) -> Option<usize> {
     REASONS.iter().position(|r| *r == s)
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct DeferredPollMetrics {
+    pub pending: Gauge,
+    pub inflight_bytes: Gauge,
+    pub rejected: Counter,
+    pub failed: Counter,
+    pub cancelled: Counter,
+    pub expired: Counter,
+    pub filled: Counter,
+    pub late: Counter,
+}
+
+impl DeferredPollMetrics {
+    fn register(&self, registry: &mut Registry) {
+        registry.register(
+            "deferred_poll_pending",
+            "pending deferred polls",
+            self.pending.clone(),
+        );
+        registry.register(
+            "deferred_poll_inflight_bytes",
+            "reserved bytes for running or queued deferred reads",
+            self.inflight_bytes.clone(),
+        );
+        registry.register(
+            "deferred_poll_rejected",
+            "deferred polls rejected before admission",
+            self.rejected.clone(),
+        );
+        registry.register(
+            "deferred_poll_failed",
+            "admitted deferred polls rejected by a read error, fence, read budget refusal or request deadline",
+            self.failed.clone(),
+        );
+        registry.register(
+            "deferred_poll_cancelled",
+            "deferred polls cancelled by their caller",
+            self.cancelled.clone(),
+        );
+        registry.register(
+            "deferred_poll_expired",
+            "deferred polls completed at their deadline",
+            self.expired.clone(),
+        );
+        registry.register(
+            "deferred_poll_filled",
+            "deferred polls answered before their wait deadline",
+            self.filled.clone(),
+        );
+        registry.register(
+            "deferred_poll_late",
+            "deferred read completions discarded after expiry or cancellation",
+            self.late.clone(),
+        );
+    }
 }
 
 /// Per-shard metric handles.
@@ -226,6 +322,7 @@ pub struct ShardMetrics {
     partition_io_fenced: Counter,
     partition_io_timeouts: Counter,
 
+    pub(crate) deferred_polls: DeferredPollMetrics,
     partition_wal_disk_bytes: Gauge,
     partition_wal_retained_bytes: Gauge,
     partition_wal_queued_bytes: Gauge,
@@ -244,11 +341,16 @@ pub struct ShardMetrics {
     partitions_reconcile_failures_total: Counter,
     partitions_duplicate_builds_discarded_total: Counter,
     partition_transfer_refusals_total: Counter,
+    partition_applied_divergences_total: Counter,
+    partitions_untrusted_log: Gauge,
     partition_frames_rejected_stale_total: Counter,
     partition_frames_rejected_ahead_total: Counter,
+    partition_frames_incarnation_mismatch_total: Family<FrameCommandLabel, Counter>,
     partition_requests_denied_transient_total: Counter,
     partition_prepare_gap_drops_total: Counter,
     metadata_prepare_gap_drops_total: Counter,
+    partition_applied_log_contradictions_total: Counter,
+    metadata_applied_log_contradictions_total: Counter,
     metadata_read_frontier_refusals_total: Counter,
     client_requests_denied_queue_full_total: Counter,
     replica_socket_reads_total: Counter,
@@ -299,6 +401,7 @@ impl ShardMetrics {
             partition_io_quarantined_jobs: Gauge::default(),
             partition_io_fenced: Counter::default(),
             partition_io_timeouts: Counter::default(),
+            deferred_polls: DeferredPollMetrics::default(),
             partition_wal_disk_bytes: Gauge::default(),
             partition_wal_retained_bytes: Gauge::default(),
             partition_wal_queued_bytes: Gauge::default(),
@@ -320,11 +423,16 @@ impl ShardMetrics {
             partitions_reconcile_failures_total: Counter::default(),
             partitions_duplicate_builds_discarded_total: Counter::default(),
             partition_transfer_refusals_total: Counter::default(),
+            partition_applied_divergences_total: Counter::default(),
+            partitions_untrusted_log: Gauge::default(),
             partition_frames_rejected_stale_total: Counter::default(),
             partition_frames_rejected_ahead_total: Counter::default(),
+            partition_frames_incarnation_mismatch_total: Family::default(),
             partition_requests_denied_transient_total: Counter::default(),
             partition_prepare_gap_drops_total: Counter::default(),
             metadata_prepare_gap_drops_total: Counter::default(),
+            partition_applied_log_contradictions_total: Counter::default(),
+            metadata_applied_log_contradictions_total: Counter::default(),
             metadata_read_frontier_refusals_total: Counter::default(),
             client_requests_denied_queue_full_total: Counter::default(),
             replica_socket_reads_total: Counter::default(),
@@ -606,6 +714,39 @@ impl ShardMetrics {
         self.partition_transfer_refusals_total.get()
     }
 
+    /// Bumped when a view this replica adopts contradicts a partition op it
+    /// already applied, and the partition is set aside for a resync.
+    ///
+    /// Any non-zero value means committed history diverged between replicas:
+    /// the resync keeps the node serving, but the local copy it quarantined
+    /// into `.fenced.N` holds an op the group did not keep.
+    pub fn record_partition_applied_divergence(&self) {
+        self.partition_applied_divergences_total.inc();
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn partition_applied_divergences_value(&self) -> u64 {
+        self.partition_applied_divergences_total.get()
+    }
+
+    /// Republished by every partition sweep: how many of this shard's
+    /// partitions elected on a log that may lack acknowledged ops and are
+    /// waiting for a trusted quorum or every replica to report before they
+    /// serve again.
+    pub fn set_partitions_untrusted_log(&self, count: usize) {
+        self.partitions_untrusted_log
+            .set(i64::try_from(count).unwrap_or(i64::MAX));
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn partitions_untrusted_log_value(&self) -> i64 {
+        self.partitions_untrusted_log.get()
+    }
+
     /// Bumped when a parked partition frame is answered instead of served
     /// because it was addressed to an incarnation this shard no longer holds
     /// (delete + recreate recycled the namespace's slab keys). Serving it would
@@ -623,6 +764,34 @@ impl ShardMetrics {
     /// fire the alert on ordinary delete + recreate churn. Both still reject.
     pub fn record_partition_frame_rejected_ahead(&self) {
         self.partition_frames_rejected_ahead_total.inc();
+    }
+
+    /// Bumped when a partition control frame is dropped because it addresses
+    /// another incarnation of its namespace than the one this shard hosts: the
+    /// sender still runs the deleted topic, or already runs its recreation.
+    /// Expected while delete + recreate churn converges, so unlike
+    /// `partition_frames_rejected_stale_total` it is no anomaly on its own; a
+    /// rate that outlives the churn means a peer never converged on the
+    /// namespace's current incarnation.
+    ///
+    /// Returns the drops counted so far for `frame`'s command, so the drop
+    /// site's paced log can report them.
+    #[must_use]
+    pub fn record_partition_incarnation_mismatch(&self, frame: Command) -> u64 {
+        self.partition_frames_incarnation_mismatch_total
+            .get_or_create(&FrameCommandLabel::from(frame))
+            .inc()
+            .saturating_add(1)
+    }
+
+    /// Snapshot of `partition_frames_incarnation_mismatch_total` for one
+    /// command, 0 when none was dropped. Test-only accessor.
+    #[cfg(test)]
+    #[must_use]
+    pub fn partition_incarnation_mismatch_value(&self, frame: Command) -> u64 {
+        self.partition_frames_incarnation_mismatch_total
+            .get(&FrameCommandLabel::from(frame))
+            .map_or(0, |counter| counter.get())
     }
 
     /// Total frame drops across every `{variant, reason}` pair.
@@ -765,6 +934,40 @@ impl ShardMetrics {
         self.metadata_prepare_gap_drops_total.get()
     }
 
+    /// Add the views whose logs a partition refused for contradicting an op
+    /// it applied, drained from `VsrConsensus::take_applied_log_contradictions`.
+    ///
+    /// A refusing replica keeps refusing every later log of that quorum, so it
+    /// drops out of its group. Any non-zero value is a safety violation that
+    /// needs an operator. Shard-scoped for the reason given at
+    /// [`Self::record_partition_prepare_gap_drops`].
+    pub fn record_partition_applied_log_contradictions(&self, views: u64) {
+        self.partition_applied_log_contradictions_total
+            .inc_by(views);
+    }
+
+    /// Snapshot of `partition_applied_log_contradictions_total`. Test/simulator
+    /// accessor.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn partition_applied_log_contradictions_value(&self) -> u64 {
+        self.partition_applied_log_contradictions_total.get()
+    }
+
+    /// The metadata sibling of
+    /// [`Self::record_partition_applied_log_contradictions`].
+    pub fn record_metadata_applied_log_contradictions(&self, views: u64) {
+        self.metadata_applied_log_contradictions_total.inc_by(views);
+    }
+
+    /// Snapshot of `metadata_applied_log_contradictions_total`. Test/simulator
+    /// accessor.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn metadata_applied_log_contradictions_value(&self) -> u64 {
+        self.metadata_applied_log_contradictions_total.get()
+    }
+
     /// Snapshot of `partition_frames_rejected_stale_total`. Test/simulator
     /// accessor, readable from any crate under those cfgs so the crates that
     /// drive the reconciler can assert a reject did not happen.
@@ -808,6 +1011,7 @@ impl ShardMetrics {
     #[allow(clippy::too_many_lines)]
     pub fn register(&self, registry: &mut Registry) {
         self.register_persistence(registry);
+        self.deferred_polls.register(registry);
         registry.register(
             "partition_io_capacity",
             "configured partition file-job slots per shard",
@@ -885,6 +1089,18 @@ impl ShardMetrics {
             self.partition_transfer_refusals_total.clone(),
         );
         registry.register(
+            "partition_applied_divergences",
+            "adopted views that contradicted an applied partition op; non-zero means committed \
+             history diverged",
+            self.partition_applied_divergences_total.clone(),
+        );
+        registry.register(
+            "partitions_untrusted_log",
+            "partitions electing on a log that may lack acknowledged ops; a view starts only \
+             once a trusted quorum or every replica reports",
+            self.partitions_untrusted_log.clone(),
+        );
+        registry.register(
             "partition_frames_rejected_stale",
             "parked frames rejected for a dead incarnation; non-zero is a caught anomaly",
             self.partition_frames_rejected_stale_total.clone(),
@@ -893,6 +1109,12 @@ impl ShardMetrics {
             "partition_frames_rejected_ahead",
             "parked frames rejected for an epoch ahead of the materialised one",
             self.partition_frames_rejected_ahead_total.clone(),
+        );
+        registry.register(
+            "partition_frames_incarnation_mismatch",
+            "partition control frames dropped for addressing another incarnation of their \
+             namespace, by frame command",
+            self.partition_frames_incarnation_mismatch_total.clone(),
         );
         registry.register(
             "partition_requests_denied_transient",
@@ -918,6 +1140,18 @@ impl ShardMetrics {
             "metadata_prepare_gap_drops",
             "replicated metadata prepares dropped out of order by a backup's gap check",
             self.metadata_prepare_gap_drops_total.clone(),
+        );
+        registry.register(
+            "partition_applied_log_contradictions",
+            "views whose partition log this replica refused for naming another prepare at an op \
+             it applied; non-zero is a safety violation",
+            self.partition_applied_log_contradictions_total.clone(),
+        );
+        registry.register(
+            "metadata_applied_log_contradictions",
+            "views whose metadata log this replica refused for naming another prepare at an op \
+             it applied; non-zero is a safety violation",
+            self.metadata_applied_log_contradictions_total.clone(),
         );
         registry.register(
             "metadata_read_frontier_refusals",

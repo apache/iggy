@@ -37,10 +37,14 @@ cargo build
 cargo php stubs target/debug/libiggy_php.so -o /tmp/iggy-php.stubs.php
 ```
 
-Stub generation requires a debug build. On macOS, use `libiggy_php.dylib`.
-Preserve the existing Apache license header when updating `iggy-php.stubs.php`.
-The CI lint job regenerates this file and fails if the checked-in stubs drift
-from the Rust signatures.
+Stub generation requires a debug build and cargo-php 0.2.1, the version CI installs. Older
+cargo-php releases cannot load the extension. On macOS, use `libiggy_php.dylib`.
+The checked-in `iggy-php.stubs.php` is the generated file with the Apache license header
+in place of its first line and the `= null` default removed from every `public readonly
+?string` property, which PHP refuses on readonly properties. The CI lint job
+(`.github/actions/php/pre-merge/action.yml`) applies the same post-processing and fails
+if the checked-in stubs drift from the Rust signatures, so copy its commands when
+regenerating locally.
 
 ## Install
 
@@ -149,7 +153,7 @@ $consumer = $client->consumerGroup(
     \Iggy\AutoCommit::disabled(),
     true,
     true,
-    1_000_000,
+    null,
     null,
     null,
     null,
@@ -204,6 +208,109 @@ TLS connection strings use the Rust SDK connection-string format, for example:
 iggy+tcp://iggy:iggy@127.0.0.1:8090?tls=true&tls_domain=localhost&tls_ca_file=/path/to/ca.pem
 ```
 
+## Resource Options
+
+Streams and topics carry options. A read returns two arrays of option name to value: `options` holds what the creating or updating client set, `derived_options` what the server filled in. Integers above `PHP_INT_MAX`, such as the never-expire and unlimited value 18446744073709551615, are decimal strings, and the 64-bit topic arguments take an int or a decimal string.
+
+```php
+$client->createStream('orders', base64_encode(random_bytes(32)));
+$stream = $client->getStream('orders');
+echo $stream->encryption_key_source, ' ', $stream->encryption_key_fingerprint, PHP_EOL;
+
+$client->createTopic('orders', 'events', 1, 'gzip', 3_600_000_000, null, null,
+    partition_resize_policy: 'fixed');
+$client->updateTopic('orders', 'events', message_expiry_micros: '18446744073709551615',
+    reset: [Iggy\TopicOptionKey::MaxTopicSize]);
+print_r($client->getTopic('orders', 'events')->options);
+
+foreach ($client->describeOptions(Iggy\OptionsScope::Topic) as $spec) {
+    echo $spec->key, $spec->updatable ? ' updatable' : '', $spec->resettable ? ' resettable' : '', PHP_EOL;
+}
+```
+
+- The stream encryption key is the stream's own data key: 32 random bytes, passed as canonical padded standard base64. Raw bytes or any other text are refused as `Invalid encryption key` (code 70) before anything is sent. The key travels in the create request, so protecting it in transit with TLS is the caller's job. The server stores it wrapped and never returns it.
+
+  The key, the `loginUser()` password and the `fromConnectionString()` string are marked `#[\SensitiveParameter]`, so exception traces hold a `SensitiveParameterValue` in their place. The `raw` arrays of `createStream()`, `updateStream()`, `createTopic()` and `updateTopic()` are marked as well, because an unknown key may hold a secret.
+
+  Reads report only `encryption_key_source` (`stream`, `server`, or `none` for a plaintext stream), `encryption_key_fingerprint` and `encryption_kek_fingerprint`, comma-separated during a server key rotation. `Iggy\Client::encryptionKeyFingerprint($key)` computes the fingerprint of a key you hold. Without a key, a server with encryption enabled generates one.
+- `updateStream()` renames a stream and `updateTopic()` renames a topic or changes `message_expiry_micros` and `max_topic_size`. Null arguments keep stored values. `reset` takes `Iggy\StreamOptionKey` or `Iggy\TopicOptionKey` cases and returns keys to their server defaults. Only the topic's message expiry and size cap are resettable, every other case is refused with the server's error.
+- `raw` on create and update sends string-valued keys this build does not know, and `raw_reset` resets keys by name. The server decides whether each one is accepted. A name listed twice across `reset` and `raw_reset` is refused as `Invalid command`.
+- `describeOptions(Iggy\OptionsScope)` returns the server catalog as `Iggy\OptionSpec` objects with `key`, `kind`, `updatable`, `resettable`, `secret`, `read_only`, `critical`, `default_value` and `description`.
+- SDK exceptions carry the server error code in `getCode()`, for example 4103 (option cannot be updated), 4104 (option cannot be reset), 4105 (read-only option), 4108 (root user cannot be changed by this caller) and 4041 (unsupported option key).
+
+## Metadata Changes
+
+`getMetadataChanges()` reads the node's change log: one record per public result of a committed metadata operation, such as a stream created, a topic renamed, a user's permissions changed or a session closed. A mirror keeps a cursor, asks for the records after it, and stores the returned `next` cursor. The call needs root or the global `manage_servers` permission, and a query the server would refuse throws `Invalid command` (code 3) before anything is sent.
+
+```php
+use Iggy\MetadataChangeGroup;
+use Iggy\MetadataChangeStart;
+use Iggy\MetadataChangeStatus;
+
+function follow(Iggy\Client $client, array $groups): void
+{
+    $start = MetadataChangeStart::earliest();
+    while (true) {
+        $page = $client->getMetadataChanges($start, $groups);
+        switch ($page->status) {
+            case MetadataChangeStatus::Ok:
+                foreach ($page->records as $record) {
+                    echo $record->op, ' ', $record->kind?->value ?? 'unknown', PHP_EOL;
+                }
+                if ($page->next !== null) {
+                    $start = MetadataChangeStart::after($page->next);
+                }
+                if (!$page->has_more) {
+                    sleep(1);
+                }
+                break;
+            case MetadataChangeStatus::Behind:
+                usleep(100_000);
+                break;
+            default:
+                $start = rebuild($client, $groups);
+        }
+    }
+}
+
+// Pages the current state, then returns the position to follow from.
+function rebuild(Iggy\Client $client, array $groups): MetadataChangeStart
+{
+    $start = MetadataChangeStart::current();
+    while (true) {
+        $page = $client->getMetadataChanges($start, $groups);
+        if ($page->status === MetadataChangeStatus::Behind) {
+            usleep(100_000);
+            continue;
+        }
+        if ($page->status !== MetadataChangeStatus::Ok) {
+            $start = MetadataChangeStart::current();
+            continue;
+        }
+        foreach ($page->items as $item) {
+            echo $item->group?->value ?? 'unknown', PHP_EOL;
+        }
+        if ($page->current_page_token !== null) {
+            $start = MetadataChangeStart::current($page->current_page_token);
+        } elseif ($page->next !== null) {
+            return MetadataChangeStart::after($page->next);
+        } else {
+            $start = MetadataChangeStart::current();
+        }
+    }
+}
+
+follow($client, [MetadataChangeGroup::Streams, MetadataChangeGroup::Topics]);
+```
+
+- `Expired` means the log no longer holds the history after the cursor, and `Reset` means the cursor belongs to another history, for example after the data directory was rebuilt. Either way the mirror rebuilds from current state pages and then follows the changes after the anchor they return.
+- Current pages need the parent groups of every selected group, for example `Topics` with `Streams`. Keep a rebuilt state private until a change page answers `Ok` with `has_more` false and a `head_op` at or above the last current page's.
+- Pages, cursors, page tokens, records, items and bodies expose their values as readonly snake_case properties, like `StreamDetails`, for example `$record->change->stream_created_op`, so `==` compares their contents. `$record->kind` names the body class in `$record->change`, for example `Iggy\MetadataStreamChange` for `StreamCreated` and `StreamUpdated`.
+- A record or item this build does not know has a null `kind` or `group` and a `MetadataUnknownChange` or `MetadataUnknownItem` body with its codes and raw body, so a mirror can stop there rather than skip a change.
+- Stream, topic and user bodies return `options` and `derived_options` arrays like `StreamDetails`: a stream's key source and fingerprints, never its key.
+- Unsigned 64-bit values such as ops and timestamps are ints, or decimal strings above `PHP_INT_MAX`. Log ids, checksums and client ids are 128-bit decimal strings. A cursor cast to string gives its `mc1_` text and a page token its `cs1_` text, and `MetadataChangeCursor::parse()` and `MetadataCurrentPageToken::parse()` read them back, so a mirror can store its position as a string.
+- `MetadataChanges::decode()` reads the payload `sendBinaryRequest(17, ...)` returns, and `MetadataChanges::fromJson()` the body of `GET /metadata/changes`.
+
 ## API Notes
 
 - `new Iggy\Client($address, new Iggy\PendingOperationsConfig(256, 64 * 1024 * 1024))`
@@ -230,6 +337,14 @@ iggy+tcp://iggy:iggy@127.0.0.1:8090?tls=true&tls_domain=localhost&tls_ca_file=/p
   retained operations. The client keeps the proved outcomes of its last
   `max_pending_operations` replays, also across a session reset. A later
   `resolveOperation()` of a proved operation returns the same outcome without a request.
+- Receipt access follows the server's [session and revocation policy](../../core/server/README.md#sessions-and-retry-receipts).
+  An unresolved operation cannot recover its receipt after its original session
+  ends, even after a new login or account reactivation. A fresh send can duplicate it.
+- Each node counts the messages in its stream, topic and system stats. After a
+  successful send, a node that is not the partition primary shows the new count
+  only after the next prepare or commit broadcast. When no other write follows,
+  this delay is at most `cluster.commit_broadcast_interval` (500 ms by default).
+  See [metadata freshness and counters](../../core/server/README.md#metadata-freshness-and-counters).
 - Methods are exposed to PHP as camelCase, for example `createStream()` and
   `pollMessages()`.
 - Classes live in the `Iggy` namespace, for example `Iggy\Client` and
@@ -242,6 +357,9 @@ iggy+tcp://iggy:iggy@127.0.0.1:8090?tls=true&tls_domain=localhost&tls_ca_file=/p
   by default.
 - `iterMessages()` returns a PHP `Iterator` and can be used with `foreach`.
   Break out of the loop when the caller's processing limit or shutdown signal is reached.
+- Without an `AutoCommit` argument, the consumer stores no offset, as with
+  `AutoCommit::disabled()`. Store positions after processing, or each restart
+  reads the same messages again.
 - `AutoCommit::when()` may queue an offset commit before the PHP callback runs.
   If callback success must control commits, use `AutoCommit::disabled()` and call
   `storePosition($message->position())` after the callback work succeeds.
@@ -274,6 +392,7 @@ iggy+tcp://iggy:iggy@127.0.0.1:8090?tls=true&tls_domain=localhost&tls_ca_file=/p
   getters return PHP integers and are limited to `PHP_INT_MAX`.
 - `Iggy\Client::sendBinaryRequest(int $code, string $payload): string` sends a
   command code and payload and returns the raw response body.
+- `Iggy\Client::sendBinaryRequestToReplica(int $code, string $payload, int $replica_id): string` sends a raw command to one node of a cluster, named by the replica id that cluster metadata returns, for example to read that node's `GetStats`. Replicated commands, polls, consumer-offset reads and session-control codes throw an invalid-command exception before anything is sent. An unknown id throws an invalid-identifier exception, and a `NotPrimary` reply is thrown, never sent to another node.
 - `Iggy\Client` is synchronous and blocks the current PHP thread.
 - The extension owns a lazy global Tokio runtime. Do not call `pcntl_fork()` after
   the first Iggy SDK call; the child process inherits file descriptors but not

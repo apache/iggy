@@ -78,7 +78,7 @@ async fn given_advanced_metadata_view_when_survivor_restarts_should_recover_view
         .await
         .expect("connect a root client to the node");
     client
-        .create_stream(STREAM_NAME)
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
         .await
         .expect("create stream on the view-0 primary");
     assert_eq!(

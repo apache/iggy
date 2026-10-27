@@ -21,17 +21,14 @@ package org.apache.iggy;
 
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
-import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.topic.Durability;
 import org.apache.iggy.topic.TopicOptions;
-
-import java.util.Map;
 
 public final class TestConstants {
 
     public static final StreamId STREAM_NAME = StreamId.of("test-stream");
     public static final TopicId TOPIC_NAME = TopicId.of("test-topic");
-    public static final Map<String, HeaderValue> PERSISTED_TOPIC_OPTIONS = TopicOptions.builder()
+    public static final TopicOptions PERSISTED_TOPIC_OPTIONS = TopicOptions.builder()
             .durability(Durability.PERSISTED)
             .consumerOffsetDurability(Durability.PERSISTED)
             .build();

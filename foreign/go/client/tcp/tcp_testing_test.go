@@ -321,24 +321,35 @@ func servePartitionOperations(t *testing.T, conn net.Conn, handler func(index in
 
 // newPipeClient builds a client wired to one end of an in-memory pipe, with a
 // session already bound so replicated commands encode.
-func newPipeClient(t *testing.T) (*IggyTcpClient, net.Conn) {
+func newPipeClient(t testing.TB) (*IggyTcpClient, net.Conn) {
 	t.Helper()
 	serverConn, clientConn := net.Pipe()
 	client := newTestClient(t, clientConn)
 	client.session.BeginRegister()
 	require.NoError(t, client.session.Bind(100))
 	client.rememberedLogin = NewAutoLogin(NewUsernamePasswordCredentials("iggy", "secret"))
-	client.links.bootstrap.markBound(client.sessionFence, ^uint64(0))
+	client.links.bootstrap.markBound(client.sessionFence)
 	client.links.slots[0] = &replicaSlot{endpoint: "pipe", link: client.links.bootstrap, cancel: func() {}}
 	client.links.rosterOrder = []uint8{0}
-	client.links.hasRoster = true
+	client.links.hasRoster.Store(true)
 	client.links.hasPrimary = true
 	client.links.primary = 0
 	t.Cleanup(func() { _ = client.Close(); _ = serverConn.Close() })
 	return client, serverConn
 }
 
-func newTestClient(t *testing.T, conn net.Conn) *IggyTcpClient {
+// newRosterPipeClient is a pipe client that keeps its link when it installs a
+// one-node roster, which names the configured endpoint. A namespace miss of the
+// node reads that roster to confirm the node is the metadata primary.
+func newRosterPipeClient(t testing.TB) (*IggyTcpClient, net.Conn) {
+	t.Helper()
+	client, serverConn := newPipeClient(t)
+	client.config.serverAddress = "pipe"
+	client.links.bootstrap = nil
+	return client, serverConn
+}
+
+func newTestClient(t testing.TB, conn net.Conn) *IggyTcpClient {
 	t.Helper()
 	client := NewIggyTcpClient(slog.New(slog.DiscardHandler), WithHeartbeatInterval(0))
 	client.links.ctx, client.links.cancel = context.WithCancel(context.Background())

@@ -28,6 +28,7 @@ under the License.
   import type { CloseModalFn } from '#lib/types/utilTypes.js';
   import type { StreamDetails } from '#lib/domain/StreamDetails.js';
   import { fetchRouteApi } from '#lib/api/fetchRouteApi.js';
+  import { topicCreate } from '#lib/api/resourceOptions.js';
   import DurationInput from '../DurationInput.svelte';
   import { numberSizes } from '#lib/utils/constants/numberSizes.js';
   import { showToast } from '../AppToasts.svelte';
@@ -48,7 +49,7 @@ under the License.
     partitions_count: z.number().min(0).max(numberSizes.max.u32).default(1),
     message_expiry: z.number().min(0).max(Number.MAX_SAFE_INTEGER).default(0),
     compression_algorithm: z.enum(['none', 'gzip']).default('none'),
-    max_topic_size: z.number().min(0).max(numberSizes.max.u32).default(2_000_000_000)
+    max_topic_size: z.string().trim().default('')
   });
 
   const { form, errors, enhance, constraints, submitting } = superForm(defaults(zod4(schema)), {
@@ -61,13 +62,13 @@ under the License.
       const { data, ok } = await fetchRouteApi({
         method: 'POST',
         path: `/streams/${streamDetails.id}/topics`,
-        body: {
+        body: topicCreate({
           name: form.data.name,
-          partitions_count: form.data.partitions_count,
-          message_expiry: form.data.message_expiry,
-          compression_algorithm: form.data.compression_algorithm,
-          max_topic_size: form.data.max_topic_size
-        }
+          partitionsCount: form.data.partitions_count,
+          compressionAlgorithm: form.data.compression_algorithm,
+          messageExpiry: form.data.message_expiry,
+          maxTopicSize: form.data.max_topic_size
+        })
       });
 
       if (!ok) {
@@ -139,7 +140,7 @@ under the License.
     <DurationInput label="Message expiry" bind:value={$form.message_expiry} />
 
     <Select
-      label="Compression Algorithm"
+      label="Compression algorithm"
       type="text"
       name="compressionAlgorithm"
       options={['none', 'gzip']}
@@ -148,14 +149,18 @@ under the License.
       errorMessage={$errors.compression_algorithm?.[0]}
     />
 
-    <Input
-      label="Max topic size"
-      type="number"
-      name="maxTopicSize"
-      bind:value={$form.max_topic_size}
-      {...$constraints.max_topic_size}
-      errorMessage={$errors.max_topic_size?.[0]}
-    />
+    <div class="flex flex-col gap-2">
+      <Input
+        label="Max topic size"
+        name="maxTopicSize"
+        placeholder="Unlimited, or e.g. 1 GiB"
+        bind:value={$form.max_topic_size}
+        errorMessage={$errors.max_topic_size?.[0]}
+      />
+      <span class="text-xs text-shade-d200 dark:text-shade-l700 ml-1">
+        Bytes or a size such as 1 GiB. Leave empty for unlimited.
+      </span>
+    </div>
 
     <div class="flex justify-end gap-3 mt-auto">
       <Button variant="text" type="button" class="w-2/5" onclick={() => closeModal()}>Cancel</Button

@@ -373,19 +373,19 @@ struct PermissionsTests {
 struct TopicOptionsTests {
     @Test func durabilityIsAlwaysSentAndRawMayStrengthenIt() throws {
         let defaults = try TopicCreateOptions().toResourceOptions()
-        #expect(defaults[TopicOptionKey.durability] == .explicit("replicated"))
-        #expect(defaults[TopicOptionKey.consumerOffsetDurability] == .explicit("replicated"))
-        let raw = try TopicCreateOptions(raw: [TopicOptionKey.durability: "persisted"]).toResourceOptions()
-        #expect(raw[TopicOptionKey.durability] == .explicit("persisted"))
+        #expect(defaults[TopicOptionKey.durability.rawValue] == .explicit("replicated"))
+        #expect(defaults[TopicOptionKey.consumerOffsetDurability.rawValue] == .explicit("replicated"))
+        let raw = try TopicCreateOptions(raw: [TopicOptionKey.durability.rawValue: "persisted"]).toResourceOptions()
+        #expect(raw[TopicOptionKey.durability.rawValue] == .explicit("persisted"))
         // The server parses the policy case-insensitively; the canonical
         // spelling is what travels.
-        let spelled = try TopicCreateOptions(raw: [TopicOptionKey.durability: "Persisted"]).toResourceOptions()
-        #expect(spelled[TopicOptionKey.durability] == .explicit("persisted"))
+        let spelled = try TopicCreateOptions(raw: [TopicOptionKey.durability.rawValue: "Persisted"]).toResourceOptions()
+        #expect(spelled[TopicOptionKey.durability.rawValue] == .explicit("persisted"))
         #expect(throws: IggyError.self) {
-            try TopicCreateOptions(durability: .persisted, raw: [TopicOptionKey.durability: "replicated"]).toResourceOptions()
+            try TopicCreateOptions(durability: .persisted, raw: [TopicOptionKey.durability.rawValue: "replicated"]).toResourceOptions()
         }
         #expect(throws: IggyError.self) {
-            try TopicCreateOptions(raw: [TopicOptionKey.durability: "sometimes"]).toResourceOptions()
+            try TopicCreateOptions(raw: [TopicOptionKey.durability.rawValue: "sometimes"]).toResourceOptions()
         }
     }
 
@@ -394,13 +394,17 @@ struct TopicOptionsTests {
     @Test func expiryMustBePositive() throws {
         #expect(throws: IggyError(.invalidOptionValue)) { try TopicCreateOptions(messageExpiry: .after(.seconds(-5))).encode() }
         #expect(throws: IggyError(.invalidOptionValue)) { try TopicCreateOptions(messageExpiry: .after(.zero)).encode() }
-        #expect(throws: IggyError(.invalidOptionValue)) { try TopicUpdateOptions(messageExpiry: .after(.milliseconds(-1))).encode() }
+        #expect(throws: IggyError(.invalidOptionValue)) { try TopicUpdateOptions(messageExpiry: .after(.milliseconds(-1))).toPatch() }
         #expect(throws: IggyError(.invalidOptionValue)) { try TopicCreateOptions(messageExpiry: .after(.nanoseconds(500))).encode() }
         #expect(throws: IggyError(.invalidOptionValue)) { try TopicCreateOptions(messageExpiry: .after(.seconds(1 << 58))).encode() }
         let options = try TopicCreateOptions(messageExpiry: .after(.seconds(1))).toResourceOptions()
-        #expect(options[TopicOptionKey.messageExpiry] == .explicit(.uint64(1_000_000)))
-        #expect(try TopicCreateOptions(messageExpiry: .after(.microseconds(1))).toResourceOptions()[TopicOptionKey.messageExpiry] == .explicit(.uint64(1)))
-        #expect(try TopicCreateOptions(messageExpiry: .never).toResourceOptions()[TopicOptionKey.messageExpiry] == .explicit(.uint64(UInt64.max)))
-        #expect(try TopicCreateOptions(messageExpiry: .serverDefault).toResourceOptions()[TopicOptionKey.messageExpiry] == nil)
+        let key = TopicOptionKey.messageExpiry.rawValue
+        #expect(options[key] == .explicit(.uint64(1_000_000)))
+        #expect(try TopicCreateOptions(messageExpiry: .after(.microseconds(1))).toResourceOptions()[key] == .explicit(.uint64(1)))
+        #expect(try TopicCreateOptions(messageExpiry: .never).toResourceOptions()[key] == .explicit(.uint64(UInt64.max)))
+        #expect(try TopicCreateOptions(messageExpiry: .serverDefault).toResourceOptions()[key] == nil)
+        // On an update the server default changes nothing. A reset restores the default.
+        #expect(
+            try TopicUpdateOptions(name: "renamed", messageExpiry: .serverDefault, maxTopicSize: .serverDefault).toResourceOptions().keys.sorted() == ["name"])
     }
 }

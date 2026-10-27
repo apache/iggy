@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! `DescribeConfigs` and `AlterConfigs` with the bridge off.
+//! `DescribeConfigs`, `AlterConfigs` and `IncrementalAlterConfigs` with the bridge off.
 
 use kafka_protocol::messages::alter_configs_request::{
     AlterConfigsRequest, AlterConfigsResource, AlterableConfig,
@@ -25,17 +25,24 @@ use kafka_protocol::messages::describe_configs_request::{
     DescribeConfigsRequest, DescribeConfigsResource,
 };
 use kafka_protocol::messages::describe_configs_response::DescribeConfigsResponse;
+use kafka_protocol::messages::incremental_alter_configs_request::{
+    AlterConfigsResource as IncrementalAlterConfigsResource,
+    AlterableConfig as IncrementalAlterableConfig, IncrementalAlterConfigsRequest,
+};
+use kafka_protocol::messages::incremental_alter_configs_response::IncrementalAlterConfigsResponse;
 use kafka_protocol::protocol::StrBytes;
 use tokio_util::sync::CancellationToken;
 
-use bytes::Bytes;
+use iggy_gateway_kafka::auth::AuthenticatedPrincipal;
 use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
-
+use iggy_gateway_kafka::protocol::acl::PrincipalPermissions;
 use iggy_gateway_kafka::protocol::api::{
-    BrokerAdvertise, ERROR_NOT_CONTROLLER, ERROR_POLICY_VIOLATION, GatewayState, handle_request,
+    ERROR_NOT_CONTROLLER, ERROR_POLICY_VIOLATION, ERROR_TOPIC_AUTHORIZATION_FAILED, GatewayState,
     is_supported_version, supported_api_ranges,
 };
-use iggy_gateway_kafka::protocol::handlers::{alter_configs, describe_configs};
+use iggy_gateway_kafka::protocol::handlers::{
+    alter_configs, describe_configs, incremental_alter_configs,
+};
 
 #[path = "common/codec.rs"]
 mod codec;
@@ -46,6 +53,9 @@ use wire::{decode, encode};
 
 const DESCRIBE_VERSION: i16 = 4;
 const ALTER_VERSION: i16 = 2;
+const INCREMENTAL_VERSION: i16 = 1;
+/// Kafka `AlterConfigOp.OpType.SET`.
+const OP_SET: i8 = 0;
 
 fn state_without_bridge() -> GatewayState {
     GatewayState::new(
@@ -115,21 +125,112 @@ async fn alter_configs_without_a_bridge_returns_not_controller() {
     assert_eq!(response.responses[0].error_code, ERROR_NOT_CONTROLLER);
 }
 
+fn incremental_resource(name: &str) -> IncrementalAlterConfigsResource {
+    IncrementalAlterConfigsResource::default()
+        .with_resource_type(2)
+        .with_resource_name(StrBytes::from(name.to_string()))
+        .with_configs(vec![
+            IncrementalAlterableConfig::default()
+                .with_name(StrBytes::from_static_str("retention.ms"))
+                .with_config_operation(OP_SET)
+                .with_value(Some(StrBytes::from_static_str("1000"))),
+        ])
+}
+
+async fn incremental_alter(
+    principal: Option<&AuthenticatedPrincipal>,
+    resources: Vec<IncrementalAlterConfigsResource>,
+) -> IncrementalAlterConfigsResponse {
+    let request = IncrementalAlterConfigsRequest::default()
+        .with_resources(resources)
+        .with_validate_only(false);
+    let outcome = incremental_alter_configs::handle(
+        &state_without_bridge(),
+        principal,
+        INCREMENTAL_VERSION,
+        encode(&request, INCREMENTAL_VERSION),
+    )
+    .await;
+    decode(
+        outcome.expect_response("IncrementalAlterConfigs answers"),
+        INCREMENTAL_VERSION,
+    )
+}
+
 #[test]
-fn incremental_alter_configs_is_not_advertised() {
-    assert!(
-        supported_api_ranges()
-            .iter()
-            .all(|range| range.api_key != 44)
-    );
-    assert!(!is_supported_version(44, 0));
-    assert!(!is_supported_version(44, 1));
+fn incremental_alter_configs_is_advertised_at_v0_and_v1() {
+    let range = supported_api_ranges()
+        .iter()
+        .find(|range| range.api_key == 44)
+        .expect("IncrementalAlterConfigs is advertised");
+    assert_eq!((range.min_version, range.max_version), (0, 1));
+    assert!(is_supported_version(44, 0));
+    assert!(is_supported_version(44, 1));
+    assert!(!is_supported_version(44, 2));
 }
 
 #[tokio::test]
-async fn incremental_alter_configs_closes_the_connection() {
-    let outcome = handle_request(44, 1, Bytes::new(), &BrokerAdvertise::default()).await;
-    assert!(outcome.is_close());
+async fn incremental_alter_configs_without_a_bridge_returns_not_controller() {
+    let response = incremental_alter(None, vec![incremental_resource("orders")]).await;
+    assert_eq!(response.responses.len(), 1);
+    assert_eq!(response.responses[0].error_code, ERROR_NOT_CONTROLLER);
+    assert_eq!(response.responses[0].resource_name.as_str(), "orders");
+}
+
+#[tokio::test]
+async fn incremental_alter_configs_over_the_cap_is_rejected_even_with_the_bridge_off() {
+    const OVER_CAP: usize = 101;
+    let resources = (0..OVER_CAP)
+        .map(|i| incremental_resource(&format!("topic-{i}")))
+        .collect();
+    let response = incremental_alter(None, resources).await;
+    assert_eq!(response.responses.len(), OVER_CAP);
+    assert!(
+        response
+            .responses
+            .iter()
+            .all(|r| r.error_code == ERROR_POLICY_VIOLATION)
+    );
+}
+
+/// The `manage_topics` gate sits before the bridge-availability stub, so a denied principal
+/// never reaches `NOT_CONTROLLER`, and an allowed one does.
+#[tokio::test]
+async fn incremental_alter_configs_requires_manage_topics_before_the_stub() {
+    let principal = |manage_topics| AuthenticatedPrincipal {
+        username: "alice".to_string(),
+        permissions: PrincipalPermissions {
+            manage_topics,
+            ..PrincipalPermissions::default()
+        },
+        permissions_known: true,
+    };
+
+    let denied = incremental_alter(
+        Some(&principal(false)),
+        vec![
+            incremental_resource("orders"),
+            incremental_resource("payments"),
+        ],
+    )
+    .await;
+    assert_eq!(denied.responses.len(), 2);
+    assert!(
+        denied
+            .responses
+            .iter()
+            .all(|r| r.error_code == ERROR_TOPIC_AUTHORIZATION_FAILED)
+    );
+    assert!(
+        denied.responses[0]
+            .error_message
+            .as_ref()
+            .is_some_and(|message| message.as_str().contains("not authorized"))
+    );
+
+    let allowed =
+        incremental_alter(Some(&principal(true)), vec![incremental_resource("orders")]).await;
+    assert_eq!(allowed.responses[0].error_code, ERROR_NOT_CONTROLLER);
 }
 
 /// The over-100-distinct-topics cap is checked before the bridge-availability stub: with the

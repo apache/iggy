@@ -36,10 +36,10 @@ func registerReplyBody(userID uint32, session uint64, protocol uint32, version s
 }
 
 func TestProtocolVersion_PacksTheWireContractSemver(t *testing.T) {
-	assert.Equal(t, uint32(11265), ProtocolVersion)
+	assert.Equal(t, uint32(12288), ProtocolVersion)
 	assert.Equal(t, uint32(0), ProtocolVersion>>20)
-	assert.Equal(t, uint32(11), (ProtocolVersion>>10)&0x3FF)
-	assert.Equal(t, uint32(1), ProtocolVersion&0x3FF)
+	assert.Equal(t, uint32(12), (ProtocolVersion>>10)&0x3FF)
+	assert.Equal(t, uint32(0), ProtocolVersion&0x3FF)
 }
 
 func TestSerializeLoginRegister_EncodesTheDeclaredLayout(t *testing.T) {

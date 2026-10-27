@@ -100,8 +100,9 @@ pub fn encode_response(version: i16, result: &JoinResult) -> Result<Bytes> {
         (None, _) => Some(StrBytes::new()),
     };
 
-    // `skip_assignment` stays at its `false` default: the encoder bails on `true` below v9.
+    // Set only for a v9+ request: the encoder bails on `true` below v9.
     let response = JoinGroupResponse::default()
+        .with_skip_assignment(result.skip_assignment)
         .with_error_code(result.error)
         .with_generation_id(result.generation_id)
         .with_protocol_type(result.protocol_type.clone())
@@ -152,6 +153,7 @@ mod tests {
             leader: StrBytes::from_static_str("m-1"),
             member_id: StrBytes::from_static_str("m-1"),
             members: Vec::new(),
+            skip_assignment: false,
         };
         assert!(encode_response(9, &result).is_ok());
     }

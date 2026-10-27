@@ -16,6 +16,7 @@
 // under the License.
 
 using Apache.Iggy.Configuration;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Factory;
@@ -101,6 +102,44 @@ public class IggyTlsConnectionTests
         var loginResult = await client.LoginUserAsync("iggy", "iggy");
 
         loginResult.ShouldNotBeNull();
+    }
+
+    [Test]
+    public async Task given_tls_connection_when_reading_metadata_changes_should_follow_a_created_stream()
+    {
+        using var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
+        {
+            BaseAddress = await Fixture.GetIggyAddressAsync(Protocol.Tcp),
+            Protocol = Protocol.Tcp,
+            ReconnectionSettings = new ReconnectionSettings { Enabled = false },
+            TlsSettings = new TlsSettings
+            {
+                Enabled = true,
+                Hostname = "localhost",
+                CertificatePath = "Certs/iggy_ca_cert.pem"
+            }
+        });
+        await client.ConnectAsync();
+        await client.LoginUserAsync("iggy", "iggy");
+        MetadataChangeGroup[] groups = [MetadataChangeGroup.Streams];
+        var latest = await client.GetMetadataChangesAsync(new MetadataChangesQuery
+        {
+            Start = MetadataChangeStart.Latest,
+            Groups = groups
+        });
+        var name = $"changes-tls-{Guid.NewGuid():N}";
+        var stream = await client.CreateStreamAsync(name);
+
+        var page = await client.GetMetadataChangesAsync(new MetadataChangesQuery
+        {
+            Start = MetadataChangeStart.After(latest.Next.ShouldNotBeNull()),
+            Groups = groups
+        });
+
+        page.Status.ShouldBe(MetadataChangeStatus.Ok);
+        page.Records.Select(record => record.Body).OfType<MetadataStreamChange>()
+            .ShouldContain(created => created.StreamId == stream!.Id && created.Name == name);
+        await client.DeleteStreamAsync(Identifier.Numeric(stream!.Id));
     }
 
     [Test]

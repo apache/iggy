@@ -18,9 +18,12 @@
 package command
 
 import (
+	"errors"
+	"slices"
 	"testing"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 )
 
 // The options block decodes to the end of the payload, so any slack the sizing
@@ -41,12 +44,11 @@ func TestUpdateUser_MarshalBinaryLeavesNoSlack(t *testing.T) {
 		name     string
 		username *string
 		status   *iggcon.UserStatus
-		want     int
+		want     []string
 	}{
-		{"both set", &username, &status, len(userIDBytes) + 2 + len(username) + 2},
-		{"username only", &username, nil, len(userIDBytes) + 2 + len(username) + 1},
-		{"status only", nil, &status, len(userIDBytes) + 1 + 2},
-		{"neither set", nil, nil, len(userIDBytes) + 2},
+		{"both set", &username, &status, []string{"status", "username"}},
+		{"username only", &username, nil, []string{"username"}},
+		{"status only", nil, &status, []string{"status"}},
 	}
 	for _, test := range tests {
 		command := UpdateUser{UserID: userID, Username: test.username, Status: test.status}
@@ -54,9 +56,33 @@ func TestUpdateUser_MarshalBinaryLeavesNoSlack(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: unexpected error: %v", test.name, err)
 		}
-		if len(payload) != test.want {
-			t.Errorf("%s: payload length = %d, want %d", test.name, len(payload), test.want)
+		prefix := 1 + len(userIDBytes) + 1
+		if len(payload) < prefix || payload[0] != byte(iggcon.OptionsScopeUser) || payload[prefix-1] != 0 {
+			t.Fatalf("%s: payload %v does not lead with the user scope, id and no resets", test.name, payload)
 		}
+		entries, err := iggcon.DeserializeHeaders(payload[prefix:])
+		if err != nil {
+			t.Fatalf("%s: options block does not decode to the end: %v", test.name, err)
+		}
+		var keys []string
+		for _, entry := range entries {
+			keys = append(keys, string(entry.Key.Value))
+		}
+		if !slices.Equal(keys, test.want) {
+			t.Errorf("%s: keys = %v, want %v", test.name, keys, test.want)
+		}
+	}
+}
+
+func TestUpdateUser_EmptyPatchIsRefused(t *testing.T) {
+	userID, err := iggcon.NewIdentifier(uint32(7))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	command := UpdateUser{UserID: userID}
+
+	if _, err := command.MarshalBinary(); !errors.Is(err, ierror.ErrInvalidCommand) {
+		t.Errorf("err = %v, want InvalidCommand", err)
 	}
 }
 
@@ -65,7 +91,8 @@ func TestUpdateUser_MarshalBinaryDoesNotMutateUsername(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	command := UpdateUser{UserID: userID}
+	status := iggcon.Inactive
+	command := UpdateUser{UserID: userID, Status: &status}
 
 	if _, err = command.MarshalBinary(); err != nil {
 		t.Fatalf("unexpected error: %v", err)

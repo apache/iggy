@@ -22,8 +22,10 @@
 //! the newest operation of its lane, and its replay can never age out.
 //! A replay that proves the outcome records it, so a later resolve of that
 //! operation returns the same outcome without a replay.
-//! Auto-commit and Next polls share the partition gate while active. Their
-//! progress is not a replayable mutation, so uncertainty releases that gate.
+//! Offset reads, stores, deletes, auto-commit and Next polls share a separate
+//! progress gate per partition. Stores and deletes take it before the mutation
+//! gate, so waiting for a parked poll does not block sends. Retained offset
+//! mutations also block progress until resolved or abandoned.
 
 use super::SessionOwner;
 use super::pending::Reservation;
@@ -32,6 +34,7 @@ use crate::links::Frame;
 use crate::vsr::encode_request_header;
 use bytes::Bytes;
 use iggy_binary_protocol::HEADER_SIZE;
+use iggy_binary_protocol::codes::{DELETE_CONSUMER_OFFSET_CODE, STORE_CONSUMER_OFFSET_CODE};
 use iggy_binary_protocol::consensus::{Operation, operation_for_code};
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_common::IggyError;
@@ -50,13 +53,17 @@ pub(crate) enum LaneKey {
         incarnation: u64,
         partition_id: u32,
     },
+    Progress {
+        incarnation: u64,
+        partition_id: u32,
+    },
 }
 
 impl LaneKey {
     /// The lane of `code`. A write to a partition takes the lane of the
     /// incarnation that its context carries. Reads, Register and Logout take
-    /// no lane by code alone. The driver selects the partition lane for
-    /// auto-commit and Next polls from their decoded arguments.
+    /// no mutation lane by code alone. The driver selects the progress lane
+    /// for offset operations and polls from their decoded arguments.
     pub(crate) fn of(code: u32, context: &PartitionContext, partition_id: u32) -> Option<Self> {
         match operation_for_code(code) {
             Operation::NonReplicated | Operation::Register | Operation::Logout => None,
@@ -66,6 +73,23 @@ impl LaneKey {
             }),
             _ => Some(Self::Metadata),
         }
+    }
+
+    fn blocking_operation(&self, lanes: &Lanes) -> Option<u64> {
+        let retained = match *self {
+            Self::Progress {
+                incarnation,
+                partition_id,
+            } => lanes
+                .get(&Self::Partition {
+                    incarnation,
+                    partition_id,
+                })
+                .and_then(|lane| lane.retained.as_ref())
+                .filter(|retained| retained.changes_progress()),
+            _ => lanes.get(self).and_then(|lane| lane.retained.as_ref()),
+        };
+        retained.map(RetainedOperation::op)
     }
 }
 
@@ -128,11 +152,18 @@ impl RetainedOperation {
     pub(crate) fn op(&self) -> u64 {
         self.frame.header.request
     }
+
+    fn changes_progress(&self) -> bool {
+        matches!(
+            self.code,
+            STORE_CONSUMER_OFFSET_CODE | DELETE_CONSUMER_OFFSET_CODE
+        )
+    }
 }
 
 /// The right of one call to send in its lane. Dropping the ticket frees the
 /// lane, except that a mutation which left the client without a definitive
-/// outcome stays retained. A progress poll holds the same gate only while
+/// outcome stays retained. A progress poll holds its progress gate only while
 /// active; replaying its frame would not resolve its earlier progress.
 #[derive(Debug)]
 pub(crate) struct LaneTicket {
@@ -140,6 +171,8 @@ pub(crate) struct LaneTicket {
     /// `None` for a call that takes no lane.
     key: Option<LaneKey>,
     guard: Option<OwnedMutexGuard<()>>,
+    /// Offset mutations keep this gate even if abandoned during their replay.
+    progress: Option<Box<LaneTicket>>,
     operation: Option<RetainedOperation>,
     reservation: Option<Arc<Reservation>>,
     fence: u64,
@@ -165,15 +198,42 @@ impl SessionOwner {
         key: Option<LaneKey>,
         deadline: Instant,
     ) -> Result<LaneTicket, IggyError> {
+        self.enter_lane_for(key, deadline, None).await
+    }
+
+    pub(crate) async fn enter_progress_lane(
+        self: &Arc<Self>,
+        progress_key: LaneKey,
+        mutation_key: Option<LaneKey>,
+        deadline: Instant,
+    ) -> Result<LaneTicket, IggyError> {
+        let progress = self.enter_lane(Some(progress_key), deadline).await?;
+        let Some(key) = mutation_key else {
+            return Ok(progress);
+        };
+        let mut ticket = self.enter_lane(Some(key), deadline).await?;
+        ticket.progress = Some(Box::new(progress));
+        Ok(ticket)
+    }
+
+    async fn enter_lane_for(
+        self: &Arc<Self>,
+        key: Option<LaneKey>,
+        deadline: Instant,
+        resuming: Option<u64>,
+    ) -> Result<LaneTicket, IggyError> {
         let Some(key) = key else {
             return Ok(LaneTicket::new(Arc::clone(self), None, false));
         };
         let (mut ticket, gate) = {
             let mut lanes = self.lanes();
-            let lane = lanes.entry(key).or_default();
-            if let Some(retained) = &lane.retained {
-                return Err(IggyError::LaneBlocked(retained.op()));
+            if let Some(op) = key
+                .blocking_operation(&lanes)
+                .filter(|op| Some(*op) != resuming)
+            {
+                return Err(IggyError::LaneBlocked(op));
             }
+            let lane = lanes.entry(key).or_default();
             lane.tickets += 1;
             (
                 LaneTicket::new(Arc::clone(self), Some(key), false),
@@ -185,10 +245,9 @@ impl SessionOwner {
             .map_err(|_| IggyError::TransientNotAccepted)?;
         ticket.guard = Some(guard);
         // The call that held the gate can have left its operation retained.
-        let blocked = self
-            .lanes()
-            .get(&key)
-            .and_then(|lane| lane.retained.as_ref().map(RetainedOperation::op));
+        let blocked = key
+            .blocking_operation(&self.lanes())
+            .filter(|op| Some(*op) != resuming);
         if let Some(op) = blocked {
             return Err(IggyError::LaneBlocked(op));
         }
@@ -203,17 +262,45 @@ impl SessionOwner {
         op: u64,
         deadline: Instant,
     ) -> Result<(LaneTicket, RetainedOperation), IggyError> {
-        let (mut ticket, gate) = {
+        let (mut ticket, gate, progress_key) = {
             let mut lanes = self.lanes();
             let Some((key, lane)) = lanes.iter_mut().find(|(_, lane)| lane.holds(op)) else {
                 return Err(IggyError::OperationNotRetained(op));
+            };
+            let progress_key = match *key {
+                LaneKey::Partition {
+                    incarnation,
+                    partition_id,
+                } if lane
+                    .retained
+                    .as_ref()
+                    .is_some_and(RetainedOperation::changes_progress) =>
+                {
+                    Some(LaneKey::Progress {
+                        incarnation,
+                        partition_id,
+                    })
+                }
+                _ => None,
             };
             lane.tickets += 1;
             (
                 LaneTicket::new(Arc::clone(self), Some(*key), true),
                 Arc::clone(&lane.gate),
+                progress_key,
             )
         };
+        if let Some(key) = progress_key {
+            let progress = self
+                .enter_lane_for(Some(key), deadline, Some(op))
+                .await
+                .map_err(|error| match error {
+                    IggyError::TransientNotAccepted => IggyError::OperationUncertain(op),
+                    IggyError::LaneBlocked(_) => IggyError::OperationNotRetained(op),
+                    error => error,
+                })?;
+            ticket.progress = Some(Box::new(progress));
+        }
         let guard = timeout_at(deadline, gate.lock_owned())
             .await
             .map_err(|_| IggyError::OperationUncertain(op))?;
@@ -281,6 +368,7 @@ impl LaneTicket {
             owner,
             key,
             guard: None,
+            progress: None,
             operation: None,
             reservation: None,
             fence: 0,
@@ -312,14 +400,17 @@ impl LaneTicket {
         {
             return Ok(());
         }
+        if (self.sent || self.resumed) && self.operation.is_some() {
+            return Err(IggyError::Unauthenticated);
+        }
         self.operation = None;
         self.reservation = None;
         self.reservation = Some(self.owner.pending.reserve(bytes, deadline).await?);
         Ok(())
     }
 
-    /// Takes the next request id and freezes the frame of the call. A call
-    /// that starts a new operation in the same lane freezes again.
+    /// [`Self::freeze_in`] in the current lineage.
+    #[cfg(test)]
     pub(crate) fn freeze(
         &mut self,
         code: u32,
@@ -327,7 +418,27 @@ impl LaneTicket {
         context: PartitionContext,
         partition: Option<PartitionKey>,
     ) -> Result<Frame, IggyError> {
+        let lineage = self.owner.epoch().lineage;
+        self.freeze_in(lineage, code, body, context, partition)
+    }
+
+    /// Takes the next request id and freezes the frame of the call, but only
+    /// while the lineage is `lineage`. So no call freezes under a session that
+    /// the caller signed in to after the call started. A call that starts a
+    /// new operation in the same lane freezes again.
+    pub(crate) fn freeze_in(
+        &mut self,
+        lineage: u64,
+        code: u32,
+        body: Bytes,
+        context: PartitionContext,
+        partition: Option<PartitionKey>,
+    ) -> Result<Frame, IggyError> {
         let mut session = self.owner.session()?;
+        // The lineage changes only under the session lock.
+        if self.owner.epoch().lineage != lineage {
+            return Err(IggyError::Unauthenticated);
+        }
         let reservation = if self.is_mutation(code) {
             let bytes = HEADER_SIZE
                 .checked_add(body.len())
@@ -360,6 +471,15 @@ impl LaneTicket {
         });
         self.sent = false;
         Ok(frame)
+    }
+
+    pub(crate) fn revalidate(&self, lineage: u64) -> Result<bool, IggyError> {
+        let _session = self.owner.session()?;
+        let epoch = self.owner.epoch();
+        if epoch.lineage != lineage {
+            return Err(IggyError::Unauthenticated);
+        }
+        Ok(epoch.fence == self.fence)
     }
 
     pub(crate) fn fence(&self) -> u64 {
@@ -496,6 +616,13 @@ mod tests {
             ..PartitionContext::default()
         };
         LaneKey::of(SEND_MESSAGES_CODE, &context, PARTITION_ID)
+    }
+
+    fn progress_lane() -> LaneKey {
+        LaneKey::Progress {
+            incarnation: INCARNATION,
+            partition_id: PARTITION_ID,
+        }
     }
 
     /// Enters the metadata lane, freezes a write and drops the ticket after
@@ -931,14 +1058,14 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn given_a_progress_poll_when_waiting_for_reply_should_block_its_partition_only() {
+    async fn given_a_progress_poll_when_waiting_for_reply_should_allow_partition_mutations() {
         let owner = bound_owner();
         let context = PartitionContext {
             incarnation: INCARNATION,
             ..PartitionContext::default()
         };
         let mut poll = owner
-            .enter_lane(partition_lane(), deadline())
+            .enter_lane(Some(progress_lane()), deadline())
             .await
             .unwrap();
         poll.freeze(POLL_MESSAGES_CODE, Bytes::new(), context, None)
@@ -947,7 +1074,7 @@ mod tests {
         let next_id = owner.session().unwrap().current_request_id();
 
         let blocked = owner
-            .enter_lane(partition_lane(), Instant::now() + SHORT_DEADLINE)
+            .enter_lane(Some(progress_lane()), Instant::now() + SHORT_DEADLINE)
             .await;
         assert_eq!(blocked.unwrap_err(), IggyError::TransientNotAccepted);
         assert_eq!(owner.session().unwrap().current_request_id(), next_id);
@@ -966,12 +1093,17 @@ mod tests {
             )
             .await
             .unwrap();
+        let same_partition = owner
+            .enter_lane(partition_lane(), deadline())
+            .await
+            .unwrap();
         pure_read.complete();
         other_partition.complete();
+        same_partition.complete();
         poll.complete();
 
         owner
-            .enter_lane(partition_lane(), deadline())
+            .enter_lane(Some(progress_lane()), deadline())
             .await
             .unwrap()
             .complete();
@@ -984,7 +1116,7 @@ mod tests {
         for cancelled in [true, false] {
             let owner = bound_owner();
             let mut poll = owner
-                .enter_lane(partition_lane(), deadline())
+                .enter_lane(Some(progress_lane()), deadline())
                 .await
                 .unwrap();
             let frame = poll
@@ -1016,7 +1148,7 @@ mod tests {
                 Err(IggyError::OperationNotRetained(missing)) if missing == op
             ));
             owner
-                .enter_lane(partition_lane(), deadline())
+                .enter_lane(Some(progress_lane()), deadline())
                 .await
                 .unwrap()
                 .complete();
@@ -1025,45 +1157,117 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn given_a_retained_partition_mutation_when_progress_poll_enters_should_remain_blocked() {
+    async fn given_a_retained_offset_mutation_when_progress_poll_enters_should_remain_blocked() {
+        for code in [STORE_CONSUMER_OFFSET_CODE, DELETE_CONSUMER_OFFSET_CODE] {
+            for reset in [false, true] {
+                let owner = bound_owner();
+                let mut mutation = owner
+                    .enter_progress_lane(progress_lane(), partition_lane(), deadline())
+                    .await
+                    .unwrap();
+                mutation.reserve(code, 0, deadline()).await.unwrap();
+                let frame = mutation
+                    .freeze(
+                        code,
+                        Bytes::new(),
+                        PartitionContext {
+                            incarnation: INCARNATION,
+                            ..PartitionContext::default()
+                        },
+                        None,
+                    )
+                    .unwrap();
+                *mutation.sent_flag() = true;
+                drop(mutation);
+                let next_id = owner.session().unwrap().current_request_id();
+
+                let progress_poll = owner.enter_lane(Some(progress_lane()), deadline()).await;
+
+                assert!(
+                    matches!(progress_poll, Err(IggyError::LaneBlocked(op)) if op == frame.header.request)
+                );
+                assert_eq!(owner.session().unwrap().current_request_id(), next_id);
+                if reset {
+                    owner.reset().unwrap();
+                    owner.bind(NEXT_SESSION).unwrap();
+                    owner
+                        .enter_progress_lane(progress_lane(), partition_lane(), deadline())
+                        .await
+                        .unwrap()
+                        .complete();
+                    assert_eq!(lane_count(&owner), 0);
+                    continue;
+                }
+                let (replay, retained) = owner
+                    .resume(frame.header.request, deadline())
+                    .await
+                    .unwrap();
+                assert_eq!(retained.code, code);
+                owner.abandon(frame.header.request).unwrap();
+                assert!(
+                    timeout(
+                        SHORT_DEADLINE,
+                        owner.enter_lane(Some(progress_lane()), deadline())
+                    )
+                    .await
+                    .is_err(),
+                    "an abandoned replay still owns progress until it finishes"
+                );
+                replay.complete();
+                owner
+                    .enter_lane(Some(progress_lane()), deadline())
+                    .await
+                    .unwrap()
+                    .complete();
+                assert_eq!(lane_count(&owner), 0);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_store_waiting_for_mutation_when_session_resets_should_keep_its_progress_gate()
+    {
         let owner = bound_owner();
-        let mut mutation = owner
+        let lineage = owner.epoch().lineage;
+        let holder = owner
             .enter_lane(partition_lane(), deadline())
             .await
             .unwrap();
-        mutation
-            .reserve(SEND_MESSAGES_CODE, 0, deadline())
-            .await
-            .unwrap();
-        let frame = mutation
-            .freeze(
-                SEND_MESSAGES_CODE,
-                Bytes::new(),
-                PartitionContext {
-                    incarnation: INCARNATION,
-                    ..PartitionContext::default()
-                },
-                None,
-            )
-            .unwrap();
-        *mutation.sent_flag() = true;
-        drop(mutation);
-        let next_id = owner.session().unwrap().current_request_id();
+        let mut waiting =
+            Box::pin(owner.enter_progress_lane(progress_lane(), partition_lane(), deadline()));
+        assert!(futures::poll!(&mut waiting).is_pending());
 
-        let progress_poll = owner.enter_lane(partition_lane(), deadline()).await;
-
+        owner.reset().unwrap();
+        owner.bind(NEXT_SESSION).unwrap();
         assert!(
-            matches!(progress_poll, Err(IggyError::LaneBlocked(op)) if op == frame.header.request)
+            timeout(
+                SHORT_DEADLINE,
+                owner.enter_lane(Some(progress_lane()), deadline())
+            )
+            .await
+            .is_err()
         );
-        assert_eq!(owner.session().unwrap().current_request_id(), next_id);
-        let (replay, retained) = owner
-            .resume(frame.header.request, deadline())
+        holder.complete();
+        let mut store = waiting.await.unwrap();
+        store
+            .reserve(STORE_CONSUMER_OFFSET_CODE, 0, deadline())
             .await
             .unwrap();
-        assert_eq!(retained.code, SEND_MESSAGES_CODE);
-        replay.complete();
+        assert_eq!(
+            store
+                .freeze_in(
+                    lineage,
+                    STORE_CONSUMER_OFFSET_CODE,
+                    Bytes::new(),
+                    PartitionContext::default(),
+                    None
+                )
+                .unwrap_err(),
+            IggyError::Unauthenticated
+        );
+        drop(store);
         owner
-            .enter_lane(partition_lane(), deadline())
+            .enter_progress_lane(progress_lane(), partition_lane(), deadline())
             .await
             .unwrap()
             .complete();
@@ -1153,6 +1357,24 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_resumed_write_when_reset_during_routing_should_preserve_its_unknown_outcome() {
+        let owner = bound_owner();
+        let op = retain_write(&owner, partition_lane()).await;
+        let (mut replay, _retained) = owner.resume(op, deadline()).await.unwrap();
+        owner.reset().unwrap();
+
+        assert_eq!(
+            replay.reserve(SEND_MESSAGES_CODE, 0, deadline()).await,
+            Err(IggyError::Unauthenticated)
+        );
+        assert_eq!(replay.retain(), IggyError::OperationUncertain(op));
+        assert!(matches!(
+            owner.resume(op, deadline()).await,
+            Err(IggyError::OperationNotRetained(missing)) if missing == op
+        ));
     }
 
     #[tokio::test(start_paused = true)]

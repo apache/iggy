@@ -41,6 +41,12 @@ use tracing::{error, info, warn};
 /// unbounded threads.
 static SNAPSHOT_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
+/// Servers up to 0.9 generated the root password and 0.9 logged it after
+/// this marker. An upgraded node keeps those files in its log directory.
+const LEGACY_ROOT_PASSWORD_MARKER: &[u8] = b"Generated root user password:";
+
+const REDACTED: &[u8] = b" [REDACTED]\n";
+
 /// Collect a diagnostic snapshot as an in-memory ZIP archive.
 ///
 /// Collection shells out to system tools (`top -H -b -n 1` alone runs for
@@ -212,7 +218,20 @@ fn server_logs(server_config: &ServerConfig) -> io::Result<Vec<u8>> {
     log_files.sort_by_key(|(modified, _)| *modified);
     let mut content = Vec::new();
     for (_, path) in log_files {
-        content.extend_from_slice(&std::fs::read(&path)?);
+        let log = std::fs::read(&path)?;
+        for line in log.split_inclusive(|byte| *byte == b'\n') {
+            match line
+                .windows(LEGACY_ROOT_PASSWORD_MARKER.len())
+                .position(|window| window == LEGACY_ROOT_PASSWORD_MARKER)
+            {
+                Some(position) => {
+                    content
+                        .extend_from_slice(&line[..position + LEGACY_ROOT_PASSWORD_MARKER.len()]);
+                    content.extend_from_slice(REDACTED);
+                }
+                None => content.extend_from_slice(line),
+            }
+        }
     }
     Ok(content)
 }
@@ -283,6 +302,36 @@ mod tests {
         assert!(
             SnapshotInProgressGuard::acquire().is_some(),
             "flag must be free after the guard drops"
+        );
+    }
+
+    #[test]
+    fn given_legacy_generated_password_line_when_capturing_server_logs_then_should_redact_it() {
+        let data_directory = tempfile::tempdir().expect("tempdir for the data directory");
+        let config = ServerConfig {
+            path: data_directory.path().display().to_string(),
+            ..ServerConfig::default()
+        };
+        let logs_path = data_directory.path().join(&config.logging.path);
+        std::fs::create_dir_all(&logs_path).expect("log directory");
+        std::fs::write(
+            logs_path.join("iggy-server.log.1"),
+            "2026-05-01T10:00:00Z INFO Using the default root user credentials...\n\
+             2026-05-01T10:00:00Z WARN Generated root user password: hunter2LeakedValue\n\
+             2026-05-01T10:00:01Z WARN Generated root user password: otherLeakedValue. It is shown only once.\n\
+             2026-05-01T10:00:02Z INFO server running; waiting on shard threads\n",
+        )
+        .expect("legacy log file");
+
+        let content = String::from_utf8(server_logs(&config).expect("server logs"))
+            .expect("log content is UTF-8");
+
+        assert_eq!(
+            content,
+            "2026-05-01T10:00:00Z INFO Using the default root user credentials...\n\
+             2026-05-01T10:00:00Z WARN Generated root user password: [REDACTED]\n\
+             2026-05-01T10:00:01Z WARN Generated root user password: [REDACTED]\n\
+             2026-05-01T10:00:02Z INFO server running; waiting on shard threads\n"
         );
     }
 }

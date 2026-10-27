@@ -19,19 +19,21 @@ use crate::commands::cli_command::{CliCommand, PRINT_TARGET};
 use anyhow::Context;
 use async_trait::async_trait;
 use core::fmt;
-use iggy_common::create_topic::CreateTopic;
-use iggy_common::{Client, Durability};
-use iggy_common::{CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize, TopicCreateOptions};
+use iggy_common::{
+    Client, CompressionAlgorithm, Durability, Identifier, IggyExpiry, MaxTopicSize,
+    TopicCreateOptions,
+};
 use std::collections::BTreeMap;
 use tracing::{Level, event};
 
 pub struct CreateTopicCmd {
-    create_topic: CreateTopic,
+    stream_id: Identifier,
+    name: String,
+    partitions_count: u32,
+    compression_algorithm: CompressionAlgorithm,
     message_expiry: IggyExpiry,
     max_topic_size: MaxTopicSize,
-    raw_options: BTreeMap<String, String>,
-    durability: Durability,
-    consumer_offset_durability: Durability,
+    options: TopicCreateOptions,
 }
 
 impl CreateTopicCmd {
@@ -47,21 +49,26 @@ impl CreateTopicCmd {
         durability: Durability,
         consumer_offset_durability: Durability,
     ) -> Self {
-        Self {
-            create_topic: CreateTopic {
-                stream_id,
-                partitions_count,
-                compression_algorithm,
-                name,
-                message_expiry,
-                max_topic_size,
-                options: raw_options.clone(),
-            },
-            message_expiry,
-            max_topic_size,
-            raw_options,
+        let options = TopicCreateOptions {
+            partitions_count: Some(partitions_count),
+            compression_algorithm: (compression_algorithm != CompressionAlgorithm::default())
+                .then_some(compression_algorithm),
+            message_expiry: (message_expiry != IggyExpiry::ServerDefault).then_some(message_expiry),
+            max_topic_size: (max_topic_size != MaxTopicSize::ServerDefault)
+                .then_some(max_topic_size),
+            raw: raw_options,
             durability,
             consumer_offset_durability,
+            ..TopicCreateOptions::default()
+        };
+        Self {
+            stream_id,
+            name,
+            partitions_count,
+            compression_algorithm,
+            message_expiry,
+            max_topic_size,
+            options,
         }
     }
 }
@@ -74,43 +81,23 @@ impl CliCommand for CreateTopicCmd {
 
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
         client
-            .create_topic(
-                &self.create_topic.stream_id,
-                &self.create_topic.name,
-                &TopicCreateOptions {
-                    partitions_count: Some(self.create_topic.partitions_count),
-                    compression_algorithm: (self.create_topic.compression_algorithm
-                        != CompressionAlgorithm::default())
-                    .then_some(self.create_topic.compression_algorithm),
-                    message_expiry: (self.create_topic.message_expiry != IggyExpiry::ServerDefault)
-                        .then_some(self.create_topic.message_expiry),
-                    max_topic_size: (self.create_topic.max_topic_size
-                        != MaxTopicSize::ServerDefault)
-                        .then_some(self.create_topic.max_topic_size),
-                    raw: self.raw_options.clone(),
-                    durability: self.durability,
-                    consumer_offset_durability: self.consumer_offset_durability,
-                    ..TopicCreateOptions::default()
-                },
-            )
+            .create_topic(&self.stream_id, &self.name, &self.options)
             .await
             .with_context(|| {
                 format!(
                     "Problem creating topic (name: {}, partitions count: {}) in stream with ID: {}",
-                    self.create_topic.name,
-                    self.create_topic.partitions_count,
-                    self.create_topic.stream_id
+                    self.name, self.partitions_count, self.stream_id
                 )
             })?;
 
         event!(target: PRINT_TARGET, Level::INFO,
             "Topic with name: {}, partitions count: {}, compression algorithm: {}, message expiry: {}, max topic size: {} created in stream with ID: {}",
-            self.create_topic.name,
-            self.create_topic.partitions_count,
-            self.create_topic.compression_algorithm,
+            self.name,
+            self.partitions_count,
+            self.compression_algorithm,
             self.message_expiry,
             self.max_topic_size,
-            self.create_topic.stream_id,
+            self.stream_id,
         );
 
         Ok(())
@@ -119,11 +106,11 @@ impl CliCommand for CreateTopicCmd {
 
 impl fmt::Display for CreateTopicCmd {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let topic_name = &self.create_topic.name;
-        let compression_algorithm = &self.create_topic.compression_algorithm;
+        let topic_name = &self.name;
+        let compression_algorithm = &self.compression_algorithm;
         let message_expiry = &self.message_expiry;
         let max_topic_size = &self.max_topic_size;
-        let stream_id = &self.create_topic.stream_id;
+        let stream_id = &self.stream_id;
 
         write!(
             f,

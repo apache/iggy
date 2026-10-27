@@ -39,7 +39,7 @@ export const load: LayoutLoad = async () => {
   const getDetailedUser = async () => {
     let userId = authStore.userId;
 
-    if (!userId && token) {
+    if (userId === null && token) {
       try {
         const decoded = jwtDecode(token);
         userId = decoded.sub ? parseInt(decoded.sub, 10) : null;
@@ -48,7 +48,7 @@ export const load: LayoutLoad = async () => {
       }
     }
 
-    if (!userId) return null;
+    if (userId === null) return null;
 
     try {
       const data = await clientApi({ method: 'GET', path: `/users/${userId}` });

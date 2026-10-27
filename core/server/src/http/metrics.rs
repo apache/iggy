@@ -203,6 +203,14 @@ pub(in crate::http) struct HttpMetrics {
     pub(in crate::http) users: Gauge,
     pub(in crate::http) clients: Gauge,
     pub(in crate::http) topic_usage: TopicUsage,
+    /// Partition primary lookups on the owning shard for HTTP partition requests.
+    pub(in crate::http) partition_primary_probes: Counter,
+    /// Attempts to relay an HTTP partition request to another node.
+    pub(in crate::http) partition_relays: Counter,
+    /// Requests for the metadata primary's commit floor, one per attempt.
+    pub(in crate::http) metadata_floor_reads: Counter,
+    /// VSR `Register` submits for HTTP sessions, one per minted client id.
+    pub(in crate::http) session_registers: Counter,
     last_output_len: AtomicUsize,
 }
 
@@ -233,6 +241,31 @@ impl HttpMetrics {
         registry.register("messages", "total count of messages", messages.clone());
         registry.register("users", "total count of users", users.clone());
         registry.register("clients", "total count of clients", clients.clone());
+        // Not legacy parity: what routing the HTTP partition requests cost.
+        let partition_primary_probes = Counter::default();
+        let partition_relays = Counter::default();
+        let metadata_floor_reads = Counter::default();
+        let session_registers = Counter::default();
+        registry.register(
+            "http_partition_primary_probes",
+            "partition primary lookups on the owning shard for HTTP partition requests",
+            partition_primary_probes.clone(),
+        );
+        registry.register(
+            "http_partition_relays",
+            "attempts to relay an HTTP partition request to the partition primary on another node",
+            partition_relays.clone(),
+        );
+        registry.register(
+            "http_metadata_floor_reads",
+            "requests for the metadata primary's commit floor by linearizable HTTP partition reads",
+            metadata_floor_reads.clone(),
+        );
+        registry.register(
+            "http_session_registers",
+            "VSR Register submits that open an HTTP session, a metadata commit each",
+            session_registers.clone(),
+        );
         // Not a legacy-parity metric, and not a mirrored one: the source is a
         // process-wide static the scrape reads directly.
         registry.register_collector(Box::new(StatsRollupUnderflows));
@@ -262,6 +295,10 @@ impl HttpMetrics {
             users,
             clients,
             topic_usage,
+            partition_primary_probes,
+            partition_relays,
+            metadata_floor_reads,
+            session_registers,
             last_output_len: AtomicUsize::new(0),
         }
     }

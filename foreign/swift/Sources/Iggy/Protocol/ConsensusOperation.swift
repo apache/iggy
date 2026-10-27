@@ -32,13 +32,20 @@ enum ConsensusOperation: UInt8, Sendable, Hashable {
     case truncatePartition = 68
     case finalizeSession = 70
     case completeLifecycle = 71
+    /// The resolved forms of `updateResource`, one per scope. The primary
+    /// commits the generic update under one of them, so its reply carries it.
+    case updateStreamResolved = 72
+    case updateTopicResolved = 73
+    case updateUserResolved = 74
+    /// A replicated rewrap of stream keys the server proposes itself.
+    case rewrapStreamKeys = 75
 
     case createStream = 128
-    case updateStream = 129
+    // 129 was updateStream. The server keeps the code retired.
     case deleteStream = 130
     // 131 was purgeStream; the server keeps the code retired.
     case createTopic = 132
-    case updateTopic = 133
+    // 133 was updateTopic. The server keeps the code retired.
     case deleteTopic = 134
     // 135 was purgeTopic; the server keeps the code retired.
     case createPartitions = 136
@@ -47,7 +54,7 @@ enum ConsensusOperation: UInt8, Sendable, Hashable {
     case createConsumerGroup = 139
     case deleteConsumerGroup = 140
     case createUser = 141
-    case updateUser = 142
+    // 142 was updateUser. The server keeps the code retired.
     case deleteUser = 143
     case changePassword = 144
     case updatePermissions = 145
@@ -55,6 +62,7 @@ enum ConsensusOperation: UInt8, Sendable, Hashable {
     case deletePersonalAccessToken = 147
     case joinConsumerGroup = 148
     case leaveConsumerGroup = 149
+    case updateResource = 150
 
     case sendMessages = 160
     case storeConsumerOffset = 161
@@ -86,11 +94,10 @@ enum ConsensusOperation: UInt8, Sendable, Hashable {
             return true
         }
         switch self {
-        case .createStream, .updateStream, .deleteStream, .createTopic, .updateTopic,
-            .deleteTopic, .createPartitions, .deletePartitions, .createConsumerGroup,
-            .deleteConsumerGroup, .createUser, .updateUser, .deleteUser, .changePassword,
-            .updatePermissions, .createPersonalAccessToken, .deletePersonalAccessToken,
-            .joinConsumerGroup, .leaveConsumerGroup:
+        case .createStream, .deleteStream, .createTopic, .deleteTopic, .createPartitions,
+            .deletePartitions, .createConsumerGroup, .deleteConsumerGroup, .createUser,
+            .deleteUser, .changePassword, .updatePermissions, .createPersonalAccessToken,
+            .deletePersonalAccessToken, .joinConsumerGroup, .leaveConsumerGroup, .updateResource:
             return true
         default:
             return false
@@ -112,7 +119,6 @@ enum ConsensusOperation: UInt8, Sendable, Hashable {
         switch CommandCode(rawValue: code) {
         case .createUser: .createUser
         case .deleteUser: .deleteUser
-        case .updateUser: .updateUser
         case .updatePermissions: .updatePermissions
         case .changePassword: .changePassword
         case .createPersonalAccessToken: .createPersonalAccessToken
@@ -122,10 +128,8 @@ enum ConsensusOperation: UInt8, Sendable, Hashable {
         case .deleteConsumerOffset: .deleteConsumerOffset
         case .createStream: .createStream
         case .deleteStream: .deleteStream
-        case .updateStream: .updateStream
         case .createTopic: .createTopic
         case .deleteTopic: .deleteTopic
-        case .updateTopic: .updateTopic
         case .createPartitions: .createPartitions
         case .deletePartitions: .deletePartitions
         case .deleteSegments: .deleteSegments
@@ -133,6 +137,7 @@ enum ConsensusOperation: UInt8, Sendable, Hashable {
         case .deleteConsumerGroup: .deleteConsumerGroup
         case .joinConsumerGroup: .joinConsumerGroup
         case .leaveConsumerGroup: .leaveConsumerGroup
+        case .updateResource: .updateResource
         default: nil
         }
     }

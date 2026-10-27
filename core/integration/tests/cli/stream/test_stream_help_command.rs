@@ -34,7 +34,7 @@ pub async fn should_help_match() {
 Commands:
   create  Create stream with given name [alias: c]
   delete  Delete stream with given ID [alias: d]
-  update  Update stream name for given stream ID [alias: u]
+  update  Update stream name or options for given stream ID [alias: u]
   get     Get details of a single stream with given ID [alias: g]
   list    List all streams [alias: l]
   help    Print this message or the help of the given subcommand(s)

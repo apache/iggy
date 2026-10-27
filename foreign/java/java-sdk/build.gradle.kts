@@ -54,7 +54,7 @@ dependencies {
     testImplementation(libs.testcontainers.junit)
     testImplementation(platform(libs.junit.bom))
     testImplementation(libs.bundles.testing)
-    testRuntimeOnly(libs.logback.classic)
+    testImplementation(libs.logback.classic)
     testRuntimeOnly(libs.netty.dns.macos) { artifact { classifier = "osx-aarch_64" } }
 }
 

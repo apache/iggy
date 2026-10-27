@@ -62,8 +62,7 @@ var _ = ginkgo.Describe("UPDATE USER PERMISSIONS:", func() {
 			err := client.UpdateUser(
 				context.Background(),
 				randomU32Identifier(),
-				&username,
-				nil,
+				iggcon.UserUpdate{Username: &username},
 			)
 			itShouldReturnUnauthenticatedError(err)
 		})

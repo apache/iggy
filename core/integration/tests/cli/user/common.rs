@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use iggy::prelude::StreamCreateOptions;
 use iggy::prelude::{Client, Identifier, Permissions, TopicCreateOptions};
 use std::collections::BTreeMap;
 
@@ -30,7 +31,10 @@ pub(crate) async fn create_grant_targets(client: &dyn Client, permissions: Optio
         let mut created = 0;
         while client.get_stream(&stream).await.unwrap().is_none() {
             client
-                .create_stream(&format!("grant-target-{stream_id}-{created}"))
+                .create_stream(
+                    &format!("grant-target-{stream_id}-{created}"),
+                    &StreamCreateOptions::default(),
+                )
                 .await
                 .unwrap();
             created += 1;

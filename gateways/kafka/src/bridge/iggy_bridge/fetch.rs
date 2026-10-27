@@ -137,36 +137,70 @@ impl LazyClient {
         }
     }
 
-    /// Runs `call` until `deadline`. A call that times out drops the client.
-    pub(super) async fn until<T>(
+    /// Connects, then runs `call` on the client until `deadline`. A call that times out drops
+    /// the client it ran on.
+    pub(super) async fn until<T, Call, Fut>(
         &self,
+        config: &IggyBridgeConfig,
         deadline: Instant,
-        call: impl Future<Output = Result<T, BridgeError>>,
-    ) -> Result<T, BridgeError> {
-        let result = timeout_at(deadline, call)
+        call: Call,
+    ) -> Result<T, BridgeError>
+    where
+        Call: FnOnce(Arc<IggyClient>) -> Fut,
+        Fut: Future<Output = Result<T, BridgeError>>,
+    {
+        let mut used = None;
+        let run = async {
+            let client = self.connected(config).await?;
+            used = Some(Arc::clone(&client));
+            call(client).await
+        };
+        let result = timeout_at(deadline, run)
             .await
             .unwrap_or(Err(BridgeError::Timeout));
-        if matches!(result, Err(BridgeError::Timeout)) {
-            self.0.lock().await.take();
+        let timed_out = matches!(result, Err(BridgeError::Timeout));
+        if let Some(used) = used.filter(|_| timed_out) {
+            self.forget(&used).await;
         }
         result
     }
 
+    /// Drops `client` from the slot, unless another call already replaced it with a new one.
+    async fn forget(&self, client: &Arc<IggyClient>) {
+        let mut held = self.0.lock().await;
+        if held
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, client))
+        {
+            held.take();
+        }
+    }
+
     /// [`Self::until`] on a task of its own, so the deadline still drops a stuck client when the
     /// caller stops waiting first.
-    pub(super) async fn until_detached<T, Call>(
+    pub(super) async fn until_detached<T, Call, Fut>(
         &self,
+        config: IggyBridgeConfig,
         deadline: Instant,
         call: Call,
     ) -> Result<T, BridgeError>
     where
         T: Send + 'static,
-        Call: Future<Output = Result<T, BridgeError>> + Send + 'static,
+        Call: FnOnce(Arc<IggyClient>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, BridgeError>> + Send,
     {
         let client = self.clone();
-        tokio::spawn(async move { client.until(deadline, call).await })
+        tokio::spawn(async move { client.until(&config, deadline, call).await })
             .await
             .unwrap_or(Err(BridgeError::Timeout))
+    }
+
+    /// Takes the client out of the slot without signing it out, so `close` does not wait behind
+    /// a call still running on it. Leaves a client that is connecting right now.
+    pub(super) fn discard(&self) {
+        if let Ok(mut held) = self.0.try_lock() {
+            held.take();
+        }
     }
 
     /// Signs the client out and shuts it down, if it connected.
@@ -307,17 +341,15 @@ impl IggyBridge {
     }
 
     async fn probe_target(&self, target: &TopicTarget) -> Result<TopicProbe, BridgeError> {
-        let client = &self.probe_client;
-        let get_topic = async {
+        let get_topic = |client: Arc<IggyClient>| async move {
             client
-                .connected(&self.config)
-                .await?
                 .get_topic(&target.stream_id, &target.topic_id)
                 .await
                 .map_err(BridgeError::Iggy)
         };
-        let details = client
-            .until(Instant::now() + REQUEST_TIMEOUT, get_topic)
+        let details = self
+            .probe_client
+            .until(&self.config, Instant::now() + REQUEST_TIMEOUT, get_topic)
             .await?
             // A missing stream reads as `None` too. Both answer the same Kafka code.
             .ok_or_else(|| {
@@ -397,10 +429,8 @@ impl IggyBridge {
     ) -> Result<PolledMessages, BridgeError> {
         let target = self.topic_target(kafka_topic)?;
         let consumer = Consumer::default();
-        let poll = async {
-            client
-                .connected(&self.config)
-                .await?
+        let poll = |connected: Arc<IggyClient>| async move {
+            connected
                 .poll_messages(
                     &target.stream_id,
                     &target.topic_id,
@@ -415,7 +445,7 @@ impl IggyBridge {
         };
         // The SDK replays a poll that Iggy refuses for up to 30 s. Stop with the request, so the
         // slot frees.
-        client.until(deadline, poll).await
+        client.until(&self.config, deadline, poll).await
     }
 }
 
@@ -458,6 +488,14 @@ mod tests {
         Arc::new(client)
     }
 
+    fn config() -> IggyBridgeConfig {
+        IggyBridge::offline().config
+    }
+
+    fn stuck(_client: Arc<IggyClient>) -> std::future::Pending<Result<u8, BridgeError>> {
+        std::future::pending()
+    }
+
     #[tokio::test]
     async fn given_a_detached_call_whose_caller_gave_up_when_its_deadline_passes_should_drop_the_client()
      {
@@ -467,7 +505,7 @@ mod tests {
 
         let caller = tokio::time::timeout(
             Duration::from_millis(10),
-            client.until_detached(deadline, std::future::pending::<Result<u8, BridgeError>>()),
+            client.until_detached(config(), deadline, stuck),
         )
         .await;
         assert!(
@@ -488,8 +526,9 @@ mod tests {
         *client.0.lock().await = Some(Arc::clone(&held));
         let soon = || Instant::now() + Duration::from_millis(20);
 
+        let config = config();
         let ended = client
-            .until(soon(), async { Ok::<_, BridgeError>(7) })
+            .until(&config, soon(), |_| async { Ok::<_, BridgeError>(7) })
             .await;
         assert_eq!(ended.expect("the call ended in time"), 7);
         let kept = client
@@ -501,7 +540,7 @@ mod tests {
         assert!(Arc::ptr_eq(&kept, &held));
 
         let failed = client
-            .until(soon(), async {
+            .until(&config, soon(), |_| async {
                 Err::<u8, _>(BridgeError::Iggy(IggyError::Disconnected))
             })
             .await;
@@ -511,14 +550,41 @@ mod tests {
             "an error the SDK returned leaves no call behind"
         );
 
-        let stuck = client
-            .until(soon(), std::future::pending::<Result<u8, BridgeError>>())
-            .await;
-        assert!(matches!(stuck, Err(BridgeError::Timeout)));
+        let timed_out = client.until(&config, soon(), stuck).await;
+        assert!(matches!(timed_out, Err(BridgeError::Timeout)));
         assert!(
             client.0.lock().await.is_none(),
             "the next call connects a new client"
         );
+    }
+
+    #[tokio::test]
+    async fn given_a_call_past_its_deadline_when_another_call_replaced_its_client_should_keep_the_new_one()
+     {
+        let client = LazyClient::default();
+        let (old, new) = (unconnected(), unconnected());
+        client.hold(Arc::clone(&old)).await;
+        let config = config();
+        let swap = client.clone();
+        let replaced = Arc::clone(&new);
+
+        let timed_out = client
+            .until(
+                &config,
+                Instant::now() + Duration::from_millis(20),
+                |used| {
+                    assert!(Arc::ptr_eq(&used, &old));
+                    async move {
+                        swap.hold(replaced).await;
+                        std::future::pending::<Result<u8, BridgeError>>().await
+                    }
+                },
+            )
+            .await;
+
+        assert!(matches!(timed_out, Err(BridgeError::Timeout)));
+        let kept = client.held().await.expect("the new client stays");
+        assert!(Arc::ptr_eq(&kept, &new));
     }
 
     #[tokio::test]

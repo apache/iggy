@@ -33,7 +33,11 @@ pub async fn run(harness: &TestHarness) {
         .expect("Failed to get root client");
     let stream = Identifier::named(STREAM_NAME).unwrap();
     let topic = Identifier::named(TOPIC_NAME).unwrap();
-    let stream_id = client.create_stream(STREAM_NAME).await.unwrap().id;
+    let stream_id = client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap()
+        .id;
     let topic_id = client
         .create_topic(
             &stream,

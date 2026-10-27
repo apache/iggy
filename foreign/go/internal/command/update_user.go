@@ -17,80 +17,52 @@
 
 package command
 
-import "github.com/apache/iggy/foreign/go/contracts"
+import (
+	"github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
+)
 
+// UpdateUser patches a user through the generic UpdateResource command.
 type UpdateUser struct {
-	UserID   iggcon.Identifier  `json:"-"`
-	Username *string            `json:"username"`
-	Status   *iggcon.UserStatus `json:"userStatus"`
-	// Options carries the trailing options block. Users have no catalog keys
-	// yet, so the server rejects every key; the block is the extension point
-	// for the first one.
-	Options []iggcon.HeaderEntry `json:"-"`
+	UserID   iggcon.Identifier
+	Username *string
+	Status   *iggcon.UserStatus
+	Reset    []iggcon.UserOptionKey
+	RawReset []string
+	Options  []iggcon.HeaderEntry
 }
 
 func (u *UpdateUser) Code() Code {
-	return UpdateUserCode
+	return UpdateResourceCode
 }
 
 func (u *UpdateUser) MarshalBinary() ([]byte, error) {
-	userIdBytes, err := u.UserID.MarshalBinary()
-	if err != nil {
-		return nil, err
-	}
-	username := ""
+	var typed []iggcon.HeaderEntry
 	if u.Username != nil {
-		username = *u.Username
-	}
-
-	// Both presence flags are always written; only the payload behind a flag is
-	// conditional. The options block decodes to the end of the payload, so a
-	// byte of slack here is a stray zero-kind entry the server rejects.
-	length := len(userIdBytes) + 2
-	if len(username) != 0 {
-		length += 1 + len(username)
+		typed = append(typed, textOption(string(iggcon.UserOptionUsername), *u.Username))
 	}
 	if u.Status != nil {
-		length++
-	}
-
-	optionsBytes := iggcon.GetHeadersBytes(u.Options)
-	bytes := make([]byte, length+len(optionsBytes))
-	position := 0
-
-	copy(bytes[position:position+len(userIdBytes)], userIdBytes)
-	position += len(userIdBytes)
-
-	if len(username) != 0 {
-		bytes[position] = 1
-		position++
-		bytes[position] = byte(len(username))
-		position++
-		copy(bytes[position:position+len(username)], username)
-		position += len(username)
-	} else {
-		bytes[position] = 0
-		position++
-	}
-
-	if u.Status != nil {
-		bytes[position] = 1
-		position++
-		statusByte := byte(0)
-		switch *u.Status {
-		case iggcon.Active:
-			statusByte = 1
-		case iggcon.Inactive:
-			statusByte = 2
+		status, err := userStatusName(*u.Status)
+		if err != nil {
+			return nil, err
 		}
-		bytes[position] = statusByte
-		position++
-	} else {
-		bytes[position] = 0
-		position++
+		typed = append(typed, stringOption(string(iggcon.UserOptionStatus), status))
 	}
+	reset := make([]string, 0, len(u.Reset))
+	for _, key := range u.Reset {
+		reset = append(reset, string(key))
+	}
+	return encodeUpdateResource(iggcon.OptionsScopeUser, []iggcon.Identifier{u.UserID}, typed, u.Options, reset, u.RawReset)
+}
 
-	copy(bytes[position:], optionsBytes)
-
-	return bytes, nil
+// userStatusName is the status as the catalog spells it in an update.
+func userStatusName(status iggcon.UserStatus) (string, error) {
+	switch status {
+	case iggcon.Active:
+		return "active", nil
+	case iggcon.Inactive:
+		return "inactive", nil
+	default:
+		return "", ierror.ErrInvalidUserStatus
+	}
 }

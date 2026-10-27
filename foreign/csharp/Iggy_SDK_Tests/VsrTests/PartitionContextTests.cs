@@ -356,7 +356,7 @@ public sealed class PartitionContextTests
         using var node = new MockNode();
         node.Serve(request =>
         {
-            if (request.Operation == (byte)VsrOperation.UpdateStream)
+            if (request.Operation == (byte)VsrOperation.UpdateResource)
             {
                 var reply = Reply(request.Operation, new byte[4]);
                 BinaryPrimitives.WriteUInt64LittleEndian(reply.AsSpan(VsrHeader.REPLY_COMMIT_OFFSET), UpdateCommit);
@@ -371,7 +371,8 @@ public sealed class PartitionContextTests
         await SignInAsync(client);
 
         await SendAsync(client);
-        await client.UpdateStreamAsync(Identifier.Numeric(1), "renamed", TestContext.Current.CancellationToken);
+        await client.UpdateStreamAsync(Identifier.Numeric(1), new StreamUpdate { Name = "renamed" },
+            TestContext.Current.CancellationToken);
         await SendAsync(client);
 
         Assert.Equal(2, node.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
@@ -393,7 +394,7 @@ public sealed class PartitionContextTests
         await SignInAsync(client);
 
         await SendAsync(client);
-        await client.CreateStreamAsync("created", TestContext.Current.CancellationToken);
+        await client.CreateStreamAsync("created", token: TestContext.Current.CancellationToken);
         await client.CreateTopicAsync(Identifier.Numeric(1), "created", 1,
             token: TestContext.Current.CancellationToken);
         await SendAsync(client);

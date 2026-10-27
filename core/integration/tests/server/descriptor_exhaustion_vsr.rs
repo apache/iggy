@@ -103,7 +103,7 @@ async fn stop_on_offset_write_without_descriptor(harness: &mut TestHarness, writ
 
     let client = harness.tcp_root_client().await.expect("TCP root client");
     let stream = client
-        .create_stream(STREAM_NAME)
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
         .await
         .expect("create stream");
     let topic = client

@@ -24,10 +24,8 @@ import org.apache.iggy.client.blocking.TopicsClientBaseTest;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.HeaderKind;
 import org.apache.iggy.message.HeaderValue;
-import org.apache.iggy.topic.CompressionAlgorithm;
 import org.junit.jupiter.api.Test;
 
-import java.math.BigInteger;
 import java.util.Map;
 
 import static org.apache.iggy.TestConstants.STREAM_NAME;
@@ -47,13 +45,7 @@ class TopicsTcpClientTest extends TopicsClientBaseTest {
         // arrives back in the key's catalog kind whatever kind it was sent as.
         // Only the binary transport carries kinds: REST renders values as strings.
         var created = topicsClient.createTopic(
-                STREAM_NAME,
-                1L,
-                CompressionAlgorithm.None,
-                BigInteger.ZERO,
-                BigInteger.ZERO,
-                "canonical-kind-topic",
-                Map.of("durability", HeaderValue.fromString("persisted")));
+                STREAM_NAME, "canonical-kind-topic", 1L, Map.of("durability", HeaderValue.fromString("persisted")));
 
         var topic = topicsClient.getTopic(STREAM_NAME, TopicId.of(created.id())).orElseThrow();
         assertThat(topic.options().get("durability").kind()).isEqualTo(HeaderKind.String);
@@ -62,13 +54,7 @@ class TopicsTcpClientTest extends TopicsClientBaseTest {
     @Test
     void shouldRejectAnOptionKeyOutsideTheCatalog() {
         assertThatThrownBy(() -> topicsClient.createTopic(
-                        STREAM_NAME,
-                        1L,
-                        CompressionAlgorithm.None,
-                        BigInteger.ZERO,
-                        BigInteger.ZERO,
-                        "bad-options-topic",
-                        Map.of("not_a_real_option", HeaderValue.fromString("1"))))
+                        STREAM_NAME, "bad-options-topic", 1L, Map.of("not_a_real_option", HeaderValue.fromString("1"))))
                 .isInstanceOf(RuntimeException.class);
     }
 }

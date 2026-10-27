@@ -21,7 +21,7 @@ use crate::prelude::IggyError;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use tokio::sync::oneshot;
-use tracing::{error, info, trace};
+use tracing::{error, info, trace, warn};
 
 #[async_trait]
 impl<'a> IggyConsumerMessageExt<'a> for IggyConsumer {
@@ -36,15 +36,20 @@ impl<'a> IggyConsumerMessageExt<'a> for IggyConsumer {
     ///
     /// # Errors
     ///
-    /// * `IggyError::Disconnected`: The client has been disconnected.
-    /// * `IggyError::CannotEstablishConnection`: The client cannot establish a connection to iggy.
-    /// * `IggyError::StaleClient`: This client is stale and cannot be used to consume messages.
     /// * `IggyError::InvalidServerAddress`: The server address is invalid.
     /// * `IggyError::InvalidClientAddress`: The client address is invalid.
-    /// * `IggyError::NotConnected`: The client is not connected.
     /// * `IggyError::ClientShutdown`: The client has been shut down.
-    /// * `IggyError::LaneBlocked`: A retained operation requires caller recovery.
-    /// * `IggyError::OperationUncertain`: A mutation's outcome requires caller recovery.
+    /// * `IggyError::LaneBlocked`: A retained operation that the consumer does not resolve blocks
+    ///   its polls and requires caller recovery.
+    /// * Any other poll error, once the client cannot come back without the caller: it has no
+    ///   link and no replica link that tries to reconnect, and the heartbeat does not restart it,
+    ///   because reconnection is disabled or the client holds no session to resume, as after
+    ///   `disconnect()`.
+    ///
+    /// Any other error is logged and the consumption goes on. A poll never dials. The client
+    /// reconnects while a replica link tries again, and the heartbeat of `IggyClient` restarts
+    /// the links that used up their retries. Once the client has signed in again, the consumer
+    /// rejoins its group and resolves an uncertain group create or join of its own.
     ///
     async fn consume_messages<P>(
         &mut self,
@@ -54,6 +59,15 @@ impl<'a> IggyConsumerMessageExt<'a> for IggyConsumer {
     where
         P: MessageConsumer + Sync,
     {
+        // Unlike a caller of `next()`, a message consumer gets no handle to store offsets with.
+        if self.relies_on_manual_commits() {
+            warn!(
+                "Consumer: {name} on topic: {topic} and stream: {stream} never stores offsets, because it runs with AutoCommit::Disabled. With PollingStrategy::next(), each restart reads the same messages again. Set auto_commit to store them.",
+                name = self.name(),
+                topic = self.topic(),
+                stream = self.stream()
+            );
+        }
         let auto_commit = self.auto_commit();
         let store_offset_after_each_message = matches!(
             auto_commit,
@@ -114,26 +128,21 @@ impl<'a> IggyConsumerMessageExt<'a> for IggyConsumer {
                             }
                         }
                         Some(Err(err)) => {
-                            match err {
-                                IggyError::Disconnected |
-                                IggyError::CannotEstablishConnection |
-                                IggyError::StaleClient |
-                                IggyError::InvalidServerAddress |
-                                IggyError::InvalidClientAddress |
-                                IggyError::NotConnected |
-                                IggyError::LaneBlocked(_) |
-                                IggyError::OperationUncertain(_) |
-                                IggyError::ClientShutdown => {
-                                    error!("Client error: {err} for consumer: {name} on topic: {topic} and stream: {stream}",
-                                        name = self.name(), topic = self.topic(), stream = self.stream());
-                                    return Err(err);
-                                }
-                                _ => {
-                                    error!("Error while handling message: {err} for consumer: {name} on topic: {topic} and stream: {stream}",
-                                        name = self.name(), topic = self.topic(), stream = self.stream());
-                                    continue;
-                                }
+                            let ends = matches!(
+                                err,
+                                IggyError::InvalidServerAddress
+                                    | IggyError::InvalidClientAddress
+                                    | IggyError::InvalidConfiguration
+                                    | IggyError::LaneBlocked(_)
+                                    | IggyError::ClientShutdown
+                            ) || !self.client_can_recover().await;
+                            if ends {
+                                error!("Client error: {err} for consumer: {name} on topic: {topic} and stream: {stream}",
+                                    name = self.name(), topic = self.topic(), stream = self.stream());
+                                return Err(err);
                             }
+                            error!("Error while handling message: {err} for consumer: {name} on topic: {topic} and stream: {stream}",
+                                name = self.name(), topic = self.topic(), stream = self.stream());
                         }
                         None => break,
                     }

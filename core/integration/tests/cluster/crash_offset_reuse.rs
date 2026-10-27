@@ -100,7 +100,7 @@ async fn wait_until_serving(harness: &TestHarness, budget: Duration) -> IggyClie
 /// Create the stream and its single-partition topic.
 async fn create_topic(client: &IggyClient, messages_required_to_save: Option<u32>) {
     client
-        .create_stream(STREAM_NAME)
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
         .await
         .expect("create stream");
     client

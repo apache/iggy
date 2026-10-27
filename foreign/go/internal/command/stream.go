@@ -17,7 +17,10 @@
 
 package command
 
-import iggcon "github.com/apache/iggy/foreign/go/contracts"
+import (
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
+)
 
 const (
 	nameLengthOffset = 0
@@ -25,19 +28,62 @@ const (
 )
 
 type CreateStream struct {
-	Name string
+	Name    string
+	Options iggcon.StreamOptions
 }
 
 func (request *CreateStream) Code() Code {
 	return CreateStreamCode
 }
 
+// MarshalBinary refuses an invalid key, typed or raw, so it never leaves the
+// client.
 func (request *CreateStream) MarshalBinary() ([]byte, error) {
+	var typed []iggcon.HeaderEntry
+	if request.Options.EncryptionKey != nil {
+		entry, err := iggcon.EncryptionKeyOption(request.Options.EncryptionKey)
+		if err != nil {
+			return nil, err
+		}
+		typed = append(typed, entry)
+	}
+	options, err := mergeOptions(typed, request.Options.Raw)
+	if err != nil {
+		return nil, err
+	}
+	for _, entry := range options {
+		if err := validateEncryptionKeyEntry(entry); err != nil {
+			return nil, err
+		}
+	}
+	optionsBytes, err := encodeOptions(options)
+	if err != nil {
+		return nil, err
+	}
 	nameLength := len(request.Name)
-	serialized := make([]byte, payloadOffset+nameLength)
+	serialized := make([]byte, payloadOffset+nameLength, payloadOffset+nameLength+len(optionsBytes))
 	serialized[nameLengthOffset] = byte(nameLength)
 	copy(serialized[payloadOffset:], request.Name)
-	return serialized, nil
+	return append(serialized, optionsBytes...), nil
+}
+
+// validateEncryptionKeyEntry checks an encryption_key entry in either form the
+// server takes: 32 raw bytes, or their canonical base64 text.
+func validateEncryptionKeyEntry(entry iggcon.HeaderEntry) error {
+	if string(entry.Key.Value) != string(iggcon.StreamOptionEncryptionKey) {
+		return nil
+	}
+	switch entry.Value.Kind {
+	case iggcon.Raw:
+		if len(entry.Value.Value) == iggcon.StreamEncryptionKeyLength {
+			return nil
+		}
+	case iggcon.String:
+		if _, err := iggcon.DecodeEncryptionKey(string(entry.Value.Value)); err == nil {
+			return nil
+		}
+	}
+	return ierror.ErrInvalidEncryptionKey
 }
 
 type GetStream struct {
@@ -62,34 +108,29 @@ func (g *GetStreams) MarshalBinary() ([]byte, error) {
 	return []byte{}, nil
 }
 
+// UpdateStream patches a stream through the generic UpdateResource command.
 type UpdateStream struct {
-	StreamId iggcon.Identifier `json:"streamId"`
-	Name     string            `json:"name"`
-	// Options carries the trailing options block. Streams have no catalog
-	// keys yet, so the server rejects every key; the block is the extension
-	// point for the first one.
-	Options []iggcon.HeaderEntry `json:"-"`
+	StreamId iggcon.Identifier
+	Name     *string
+	Reset    []iggcon.StreamOptionKey
+	RawReset []string
+	Options  []iggcon.HeaderEntry
 }
 
 func (u *UpdateStream) Code() Code {
-	return UpdateStreamCode
+	return UpdateResourceCode
 }
 
 func (u *UpdateStream) MarshalBinary() ([]byte, error) {
-	streamIdBytes, err := u.StreamId.MarshalBinary()
-	if err != nil {
-		return nil, err
+	var typed []iggcon.HeaderEntry
+	if u.Name != nil {
+		typed = append(typed, textOption(string(iggcon.StreamOptionName), *u.Name))
 	}
-	nameLength := len(u.Name)
-	optionsBytes := iggcon.GetHeadersBytes(u.Options)
-	bytes := make([]byte, len(streamIdBytes)+1+nameLength+len(optionsBytes))
-	copy(bytes[0:len(streamIdBytes)], streamIdBytes)
-	position := len(streamIdBytes)
-	bytes[position] = byte(nameLength)
-	position++
-	position += copy(bytes[position:], u.Name)
-	copy(bytes[position:], optionsBytes)
-	return bytes, nil
+	reset := make([]string, 0, len(u.Reset))
+	for _, key := range u.Reset {
+		reset = append(reset, string(key))
+	}
+	return encodeUpdateResource(iggcon.OptionsScopeStream, []iggcon.Identifier{u.StreamId}, typed, u.Options, reset, u.RawReset)
 }
 
 type DeleteStream struct {

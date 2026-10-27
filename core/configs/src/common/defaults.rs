@@ -236,6 +236,8 @@ impl Default for EncryptionConfig {
         EncryptionConfig {
             enabled: SERVER_CONFIG.encryption.enabled,
             key: SERVER_CONFIG.encryption.key.parse().unwrap(),
+            previous_keys: Vec::new(),
+            retired_kek_fingerprints: Vec::new(),
         }
     }
 }

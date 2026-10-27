@@ -24,7 +24,9 @@ import org.apache.iggy.user.IdentityInfo;
 import org.apache.iggy.user.Permissions;
 import org.apache.iggy.user.UserInfo;
 import org.apache.iggy.user.UserInfoDetails;
+import org.apache.iggy.user.UserOptions;
 import org.apache.iggy.user.UserStatus;
+import org.apache.iggy.user.UserUpdate;
 
 import java.util.List;
 import java.util.Optional;
@@ -39,7 +41,17 @@ public interface UsersClient {
 
     List<UserInfo> getUsers();
 
-    UserInfoDetails createUser(String username, String password, UserStatus status, Optional<Permissions> permissions);
+    default UserInfoDetails createUser(
+            String username, String password, UserStatus status, Optional<Permissions> permissions) {
+        return createUser(username, password, status, permissions, UserOptions.empty());
+    }
+
+    UserInfoDetails createUser(
+            String username,
+            String password,
+            UserStatus status,
+            Optional<Permissions> permissions,
+            UserOptions options);
 
     default void deleteUser(Long userId) {
         deleteUser(UserId.of(userId));
@@ -47,11 +59,12 @@ public interface UsersClient {
 
     void deleteUser(UserId userId);
 
-    default void updateUser(Long userId, Optional<String> username, Optional<UserStatus> status) {
-        updateUser(UserId.of(userId), username, status);
+    default void updateUser(Long userId, UserUpdate update) {
+        updateUser(UserId.of(userId), update);
     }
 
-    void updateUser(UserId userId, Optional<String> username, Optional<UserStatus> status);
+    /** Changes a user's username, status or both. Every key left out keeps its value. */
+    void updateUser(UserId userId, UserUpdate update);
 
     default void updatePermissions(Long userId, Optional<Permissions> permissions) {
         updatePermissions(UserId.of(userId), permissions);

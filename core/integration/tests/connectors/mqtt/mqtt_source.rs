@@ -25,7 +25,7 @@ use iggy_common::{Consumer, Identifier, MessageClient, PollingStrategy};
 use integration::harness::{TestBinary, TestHarness, seeds};
 use integration::iggy_harness;
 use reqwest::Client;
-use rumqttc::v5::mqttbytes::v5::PublishProperties;
+use rumqttc_v5::mqttbytes::v5::PublishProperties;
 use serde_json::Value;
 use std::time::Duration;
 use std::{collections::HashSet, future::Future};

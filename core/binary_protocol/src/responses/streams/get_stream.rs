@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::WireError;
-use crate::codec::{WireDecode, WireEncode, read_u8, read_u32_le, read_u64_le};
+use crate::codec::{WireDecode, WireEncode, read_u32_le, read_u64_le};
 use crate::primitives::identifier::WireName;
 use crate::primitives::options::{
     WireOptions, decode_options_prefixed, encode_options_prefixed, options_prefixed_size,
@@ -26,10 +26,9 @@ use bytes::{BufMut, BytesMut};
 
 /// Topic header within a `GetStream` response.
 ///
-/// Wire format (50 + `name_len` + options bytes):
+/// Wire format (33 + `name_len` + options bytes):
 /// ```text
-/// [id:4][created_at:8][partitions_count:4][message_expiry:8]
-/// [compression_algorithm:1][max_topic_size:8]
+/// [id:4][created_at:8][partitions_count:4]
 /// [size_bytes:8][messages_count:8][name_len:1][name:N]
 /// [explicit_options_len:4][explicit options TLV]
 /// [derived_options_len:4][derived options TLV]
@@ -38,14 +37,12 @@ use bytes::{BufMut, BytesMut};
 /// `options` are the keys the client pinned at create; `derived_options` are
 /// the defaults the admitting primary resolved. A round-tripping client
 /// re-sends only `options`; the effective configuration is the union.
+/// Message expiry, compression and the size cap live in those blocks only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopicHeader {
     pub id: u32,
     pub created_at: u64,
     pub partitions_count: u32,
-    pub message_expiry: u64,
-    pub compression_algorithm: u8,
-    pub max_topic_size: u64,
     pub size_bytes: u64,
     pub messages_count: u64,
     pub name: WireName,
@@ -54,7 +51,7 @@ pub struct TopicHeader {
 }
 
 impl TopicHeader {
-    pub(crate) const FIXED_SIZE: usize = 4 + 8 + 4 + 8 + 1 + 8 + 8 + 8 + 1; // 50
+    pub(crate) const FIXED_SIZE: usize = 4 + 8 + 4 + 8 + 8 + 1; // 33
 }
 
 impl WireEncode for TopicHeader {
@@ -69,9 +66,6 @@ impl WireEncode for TopicHeader {
         buf.put_u32_le(self.id);
         buf.put_u64_le(self.created_at);
         buf.put_u32_le(self.partitions_count);
-        buf.put_u64_le(self.message_expiry);
-        buf.put_u8(self.compression_algorithm);
-        buf.put_u64_le(self.max_topic_size);
         buf.put_u64_le(self.size_bytes);
         buf.put_u64_le(self.messages_count);
         self.name.encode(buf);
@@ -85,13 +79,10 @@ impl WireDecode for TopicHeader {
         let id = read_u32_le(buf, 0)?;
         let created_at = read_u64_le(buf, 4)?;
         let partitions_count = read_u32_le(buf, 12)?;
-        let message_expiry = read_u64_le(buf, 16)?;
-        let compression_algorithm = read_u8(buf, 24)?;
-        let max_topic_size = read_u64_le(buf, 25)?;
-        let size_bytes = read_u64_le(buf, 33)?;
-        let messages_count = read_u64_le(buf, 41)?;
-        let (name, name_consumed) = WireName::decode(&buf[49..])?;
-        let mut consumed = 49 + name_consumed;
+        let size_bytes = read_u64_le(buf, 16)?;
+        let messages_count = read_u64_le(buf, 24)?;
+        let (name, name_consumed) = WireName::decode(&buf[32..])?;
+        let mut consumed = 32 + name_consumed;
         let (options, options_consumed) = decode_options_prefixed(buf, consumed)?;
         consumed += options_consumed;
         let (derived_options, derived_consumed) = decode_options_prefixed(buf, consumed)?;
@@ -102,9 +93,6 @@ impl WireDecode for TopicHeader {
                 id,
                 created_at,
                 partitions_count,
-                message_expiry,
-                compression_algorithm,
-                max_topic_size,
                 size_bytes,
                 messages_count,
                 name,
@@ -186,6 +174,7 @@ mod tests {
             messages_count: 200,
             name: WireName::new("my-stream").unwrap(),
             options: WireOptions::empty(),
+            derived_options: WireOptions::empty(),
         }
     }
 
@@ -194,9 +183,6 @@ mod tests {
             id,
             created_at: 1_710_000_000_000,
             partitions_count: 3,
-            message_expiry: 0,
-            compression_algorithm: 1,
-            max_topic_size: 0,
             size_bytes: 1024,
             messages_count: 100,
             name: WireName::new(name).unwrap(),

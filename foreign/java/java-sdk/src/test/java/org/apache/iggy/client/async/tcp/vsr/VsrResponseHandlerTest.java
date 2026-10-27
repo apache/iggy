@@ -24,11 +24,14 @@ import io.netty.buffer.Unpooled;
 import io.netty.channel.embedded.EmbeddedChannel;
 import org.apache.iggy.exception.IggyAuthenticationException;
 import org.apache.iggy.exception.IggyConnectionException;
+import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.exception.IggyTimeoutException;
+import org.apache.iggy.serde.CommandCode;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.charset.StandardCharsets;
@@ -37,6 +40,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -58,6 +62,83 @@ class VsrResponseHandlerTest {
     @AfterEach
     void tearDown() {
         channel.finishAndReleaseAll();
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void shouldCancelOnlyAfterTheDeferredFrameHasBeenSent(boolean cancelBeforeWrite) {
+        long requestId = 7;
+        long sessionId = 9;
+        CompletableFuture<ByteBuf> future = new CompletableFuture<>();
+        ByteBuf request = requestFrame(VsrOperation.NON_REPLICATED, requestId);
+        request.setLongLE(VsrHeaders.REQUEST_SESSION_OFFSET, sessionId);
+        request.setIntLE(VsrHeaders.REQUEST_RESERVED_CODE_OFFSET, CommandCode.Messages.POLL_DEFERRED.getValue());
+        var pending = handler.registerRequest(
+                channel,
+                request,
+                future,
+                System.nanoTime() + TimeUnit.MINUTES.toNanos(1),
+                CommandCode.Messages.POLL_DEFERRED.getValue());
+        try {
+            if (cancelBeforeWrite) {
+                future.cancel(false);
+                assertThat((Object) channel.readOutbound()).isNull();
+            }
+            channel.writeOutbound(request.retainedDuplicate());
+            pending.sent(channel);
+            if (!cancelBeforeWrite) {
+                future.cancel(false);
+            }
+            channel.runPendingTasks();
+            ByteBuf original = channel.readOutbound();
+            assertThat(original.getIntLE(VsrHeaders.REQUEST_RESERVED_CODE_OFFSET))
+                    .isEqualTo(CommandCode.Messages.POLL_DEFERRED.getValue());
+            original.release();
+            ByteBuf cancellation = channel.readOutbound();
+            assertThat(cancellation.readableBytes()).isEqualTo(VsrHeaders.HEADER_SIZE);
+            assertThat(cancellation.getIntLE(VsrHeaders.REQUEST_RESERVED_CODE_OFFSET))
+                    .isEqualTo(CommandCode.Messages.CANCEL_DEFERRED_REQUEST.getValue());
+            assertThat(VsrHeaders.readRequestId(cancellation)).isEqualTo(requestId);
+            assertThat(cancellation.getLongLE(VsrHeaders.REQUEST_SESSION_OFFSET))
+                    .isEqualTo(sessionId);
+            cancellation.release();
+            assertThat((Object) channel.readOutbound()).isNull();
+            assertThat(channel.isActive()).isTrue();
+        } finally {
+            request.release();
+        }
+    }
+
+    @Test
+    void shouldQueueTheCancellationBehindAnOriginalWriteWaitingForTheLoop() {
+        CompletableFuture<ByteBuf> future = new CompletableFuture<>();
+        ByteBuf request = requestFrame(VsrOperation.NON_REPLICATED, 7);
+        request.setIntLE(VsrHeaders.REQUEST_RESERVED_CODE_OFFSET, CommandCode.Messages.POLL_DEFERRED.getValue());
+        var pending = handler.registerRequest(
+                channel,
+                request,
+                future,
+                System.nanoTime() + TimeUnit.MINUTES.toNanos(1),
+                CommandCode.Messages.POLL_DEFERRED.getValue());
+        try {
+            // A write issued off the loop waits in its queue, and a deadline task can run before it.
+            channel.eventLoop().execute(() -> channel.writeAndFlush(request.retainedDuplicate()));
+            pending.sent(channel);
+            future.cancel(false);
+            channel.runPendingTasks();
+
+            ByteBuf first = channel.readOutbound();
+            assertThat(first.getIntLE(VsrHeaders.REQUEST_RESERVED_CODE_OFFSET))
+                    .as("a cancellation that overtakes its request cancels nothing")
+                    .isEqualTo(CommandCode.Messages.POLL_DEFERRED.getValue());
+            first.release();
+            ByteBuf second = channel.readOutbound();
+            assertThat(second.getIntLE(VsrHeaders.REQUEST_RESERVED_CODE_OFFSET))
+                    .isEqualTo(CommandCode.Messages.CANCEL_DEFERRED_REQUEST.getValue());
+            second.release();
+        } finally {
+            request.release();
+        }
     }
 
     @Test
@@ -148,6 +229,14 @@ class VsrResponseHandlerTest {
 
     @Test
     void shouldBindSessionOnRegisterReply() throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        var ticket = session.acquire(
+                        ConsensusSession.LaneKey.METADATA, true, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop())
+                .join();
+        var heldMonitor = new AtomicBoolean();
+        var waiting = ticket.awaitSession(session.lineage(), deadline, channel.eventLoop())
+                .thenRun(() -> heldMonitor.set(Thread.holdsLock(session)));
+        assertThat(waiting).isNotDone();
         CompletableFuture<ByteBuf> future = enqueue(VsrOperation.REGISTER, 0);
         ByteBuf body = Unpooled.buffer();
         body.writeIntLE(0); // result section: success
@@ -163,7 +252,10 @@ class VsrResponseHandlerTest {
             assertThat(response.readUnsignedIntLE()).isEqualTo(1);
             assertThat(session.isBound()).isTrue();
             assertThat(session.boundSession()).isEqualTo(99);
+            waiting.get();
+            assertThat(heldMonitor).isFalse();
         } finally {
+            ticket.complete();
             response.release();
         }
     }
@@ -474,6 +566,32 @@ class VsrResponseHandlerTest {
     }
 
     @Test
+    void givenResolvedUpdateReplyWhenCorrelatingShouldAcceptOnlyMatchingRequestIdentity() {
+        int updateResource = 150;
+        for (int resolved : new int[] {72, 73, 74}) {
+            assertThat(correlates(updateResource, resolved, reply -> {}))
+                    .as("resolved %s", resolved)
+                    .isTrue();
+            assertThat(correlates(
+                            updateResource,
+                            resolved,
+                            reply -> reply.setByte(
+                                    VsrHeaders.REPLY_CLIENT_OFFSET, reply.getByte(VsrHeaders.REPLY_CLIENT_OFFSET) + 1)))
+                    .as("client mismatch for %s", resolved)
+                    .isFalse();
+            assertThat(correlates(
+                            updateResource, resolved, reply -> reply.setLongLE(VsrHeaders.REPLY_CHECKSUM_OFFSET, 14)))
+                    .as("request checksum mismatch for %s", resolved)
+                    .isFalse();
+            assertThat(correlates(VsrOperation.CREATE_STREAM, resolved, reply -> {}))
+                    .as("unrelated request for %s", resolved)
+                    .isFalse();
+        }
+        assertThat(correlates(updateResource, VsrOperation.CREATE_TOPIC_WITH_ASSIGNMENTS, reply -> {}))
+                .isFalse();
+    }
+
+    @Test
     void shouldRejectUnrelatedReplyOperation() {
         CompletableFuture<ByteBuf> pending = enqueue(VsrOperation.CREATE_TOPIC, 7);
         CompletableFuture<ByteBuf> other = enqueue(VsrOperation.CREATE_STREAM, 8);
@@ -484,6 +602,36 @@ class VsrResponseHandlerTest {
         assertThat(channel.isActive()).isFalse();
         assertThatThrownBy(pending::join).hasCauseInstanceOf(IggyConnectionException.class);
         assertThatThrownBy(other::join).hasCauseInstanceOf(IggyConnectionException.class);
+    }
+
+    @ParameterizedTest
+    @EnumSource(
+            value = IggyErrorCode.class,
+            names = {
+                "TRANSIENT_NOT_COMMITTED",
+                "TRANSIENT_NOT_ACCEPTED",
+                "NOT_PRIMARY",
+                "DEFERRED_POLL_CAPACITY_EXCEEDED"
+            })
+    void shouldNotTreatATransientDeferredRefusalAsACommittedOutcome(IggyErrorCode refusal) {
+        long requestId = 7;
+        CompletableFuture<ByteBuf> result = new CompletableFuture<>();
+        ByteBuf request = requestFrame(VsrOperation.NON_REPLICATED, requestId);
+        VsrResponseHandler.PendingRequest pending = handler.registerRequest(
+                channel,
+                request,
+                result,
+                System.nanoTime() + TimeUnit.MINUTES.toNanos(1),
+                CommandCode.Messages.POLL_DEFERRED.getValue());
+        request.release();
+        ByteBuf reply = replyFrame(VsrOperation.NON_REPLICATED, requestId, Unpooled.EMPTY_BUFFER);
+        reply.setIntLE(VsrHeaders.REPLY_STATUS_OFFSET, refusal.getCode());
+
+        channel.writeInbound(reply);
+
+        assertThat(rawErrorCode(result)).isEqualTo(refusal.getCode());
+        assertThat(pending.isCommitted()).isFalse();
+        assertThat(channel.isActive()).isTrue();
     }
 
     @Test
@@ -552,6 +700,32 @@ class VsrResponseHandlerTest {
         handler.registerRequest(channel, request, future, System.nanoTime() + TimeUnit.MINUTES.toNanos(1), 1);
         request.release();
         return future;
+    }
+
+    /** Registers one committed request on a fresh link and reports whether the reply completes it. */
+    private boolean correlates(int requestOperation, int replyOperation, Consumer<ByteBuf> alteration) {
+        VsrResponseHandler link = new VsrResponseHandler(session, errorCode -> {});
+        EmbeddedChannel linkChannel = new EmbeddedChannel(link);
+        try {
+            CompletableFuture<ByteBuf> result = new CompletableFuture<>();
+            ByteBuf request = requestFrame(requestOperation, 1);
+            request.setLongLE(VsrHeaders.REQUEST_CHECKSUM_OFFSET, 13);
+            link.registerRequest(linkChannel, request, result, System.nanoTime() + TimeUnit.MINUTES.toNanos(1), 16);
+            request.release();
+            ByteBuf reply = replyFrame(replyOperation, 1, Unpooled.buffer().writeIntLE(0));
+            reply.setLongLE(VsrHeaders.REPLY_CHECKSUM_OFFSET, 13);
+            alteration.accept(reply);
+            linkChannel.writeInbound(reply);
+            assertThat(result).isDone();
+            if (result.isCompletedExceptionally()) {
+                assertThatThrownBy(result::join).hasCauseInstanceOf(IggyConnectionException.class);
+                return false;
+            }
+            result.join().release();
+            return true;
+        } finally {
+            linkChannel.finishAndReleaseAll();
+        }
     }
 
     /**

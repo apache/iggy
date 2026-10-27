@@ -34,7 +34,7 @@ TEST_F(LowLevelE2E_Message, SendAndPollMessagesRoundTrip) {
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name, error_info);
+    client->create_stream(stream_name, {}, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
@@ -78,7 +78,7 @@ TEST_F(LowLevelE2E_Message, PollMessagesVerifyMessageIds) {
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name, error_info);
+    client->create_stream(stream_name, {}, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
@@ -108,7 +108,7 @@ TEST_F(LowLevelE2E_Message, PollMessagesFromEmptyPartition) {
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name, error_info);
+    client->create_stream(stream_name, {}, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
@@ -185,7 +185,7 @@ TEST_F(LowLevelE2E_Message, SendMessagesWithInvalidPartitioningKind) {
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name, error_info);
+    client->create_stream(stream_name, {}, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
@@ -207,7 +207,7 @@ TEST_F(LowLevelE2E_Message, SendMessagesWithInvalidPartitioningValue) {
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name, error_info);
+    client->create_stream(stream_name, {}, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
@@ -234,7 +234,7 @@ TEST_F(LowLevelE2E_Message, SendMessagesToSpecificPartitionVerified) {
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name, error_info);
+    client->create_stream(stream_name, {}, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
@@ -270,7 +270,7 @@ TEST_F(LowLevelE2E_Message, SendEmptyMessageVectorThrows) {
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name, error_info);
+    client->create_stream(stream_name, {}, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
@@ -290,7 +290,7 @@ TEST_F(LowLevelE2E_Message, SendMessageWithEmptyPayloadThrows) {
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name, error_info);
+    client->create_stream(stream_name, {}, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
@@ -313,7 +313,7 @@ TEST_F(LowLevelE2E_Message, SendMessageWithOversizedPayloadThrows) {
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name, error_info);
+    client->create_stream(stream_name, {}, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
@@ -343,7 +343,7 @@ TEST_F(LowLevelE2E_Message, SendMessagesPreservesOrder) {
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name, error_info);
+    client->create_stream(stream_name, {}, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
@@ -378,7 +378,7 @@ TEST_F(LowLevelE2E_Message, SendMessagesWithDuplicateIds) {
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name, error_info);
+    client->create_stream(stream_name, {}, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
@@ -413,7 +413,7 @@ TEST_F(LowLevelE2E_Message, SendMessagesWithVariousPayloads) {
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name, error_info);
+    client->create_stream(stream_name, {}, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
@@ -481,7 +481,7 @@ TEST_F(LowLevelE2E_Message, SendAndPollMessageWithTypedHeadersRoundTrip) {
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name, error_info);
+    client->create_stream(stream_name, {}, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
@@ -571,7 +571,7 @@ TEST_F(LowLevelE2E_Message, SendMessageWithDuplicateTypedHeaderKeysThrows) {
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name, error_info);
+    client->create_stream(stream_name, {}, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
@@ -598,7 +598,7 @@ TEST_F(LowLevelE2E_Message, SendMessageWithWrongFixedWidthHeaderBytesThrows) {
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name, error_info);
+    client->create_stream(stream_name, {}, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
@@ -646,7 +646,7 @@ TEST_F(LowLevelE2E_Message, SendMessageWithInvalidTypedHeaderKindThrows) {
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name, error_info);
+    client->create_stream(stream_name, {}, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
@@ -675,7 +675,7 @@ TEST_F(LowLevelE2E_Message, SendMessageWithInvalidTypedHeaderSizesThrows) {
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name, error_info);
+    client->create_stream(stream_name, {}, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
@@ -741,7 +741,7 @@ TEST_F(LowLevelE2E_Message, SendMessageAtUserHeadersSizeBoundary) {
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name, error_info);
+    client->create_stream(stream_name, {}, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
@@ -876,7 +876,7 @@ TEST_F(LowLevelE2E_Message, PollMessagesWithInvalidConsumerKindThrows) {
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name, error_info);
+    client->create_stream(stream_name, {}, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
@@ -894,7 +894,7 @@ TEST_F(LowLevelE2E_Message, PollMessagesWithInvalidStrategyKindThrows) {
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name, error_info);
+    client->create_stream(stream_name, {}, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
@@ -912,7 +912,7 @@ TEST_F(LowLevelE2E_Message, PollMessagesCountLessThanAvailable) {
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name, error_info);
+    client->create_stream(stream_name, {}, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
@@ -941,7 +941,7 @@ TEST_F(LowLevelE2E_Message, PollMessagesWithLargeOffset) {
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name, error_info);
+    client->create_stream(stream_name, {}, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
@@ -970,7 +970,7 @@ TEST_F(LowLevelE2E_Message, PollMessagesFirstStrategy) {
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name, error_info);
+    client->create_stream(stream_name, {}, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
@@ -1006,7 +1006,7 @@ TEST_F(LowLevelE2E_Message, PollMessagesLastStrategy) {
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name, error_info);
+    client->create_stream(stream_name, {}, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
@@ -1043,7 +1043,7 @@ TEST_F(LowLevelE2E_Message, PollMessagesNextStrategyNoAutoCommit) {
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name, error_info);
+    client->create_stream(stream_name, {}, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
@@ -1086,7 +1086,7 @@ TEST_F(LowLevelE2E_Message, PollMessagesNextStrategyAutoCommit) {
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name, error_info);
+    client->create_stream(stream_name, {}, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
@@ -1135,7 +1135,7 @@ TEST_F(LowLevelE2E_Message, PollMessagesConsumerIdIndependence) {
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name, error_info);
+    client->create_stream(stream_name, {}, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
@@ -1171,7 +1171,7 @@ TEST_F(LowLevelE2E_Message, PollMessagesMultipleSendsThenPollOrder) {
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name, error_info);
+    client->create_stream(stream_name, {}, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
@@ -1221,7 +1221,7 @@ TEST_F(LowLevelE2E_Message, PollMessagesMultipleCustomIds) {
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name, error_info);
+    client->create_stream(stream_name, {}, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
@@ -1256,7 +1256,7 @@ TEST_F(LowLevelE2E_Message, PollMessagesAfterStreamDeletedThrows) {
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name, error_info);
+    client->create_stream(stream_name, {}, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
@@ -1285,7 +1285,7 @@ TEST_F(LowLevelE2E_Message, PollMessagesWithInvalidPartitionIdThrows) {
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name, error_info);
+    client->create_stream(stream_name, {}, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
@@ -1303,7 +1303,7 @@ TEST_F(LowLevelE2E_Message, PollMessagesWithCountZeroThrows) {
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name, error_info);
+    client->create_stream(stream_name, {}, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
@@ -1322,7 +1322,7 @@ TEST_F(LowLevelE2E_Message, PollMessagesWithoutSpecifyingPartition) {
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name, error_info);
+    client->create_stream(stream_name, {}, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
@@ -1359,7 +1359,7 @@ TEST_F(LowLevelE2E_Message, PollMessagesTimestampStrategy) {
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name, error_info);
+    client->create_stream(stream_name, {}, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
@@ -1424,7 +1424,7 @@ TEST_F(LowLevelE2E_Message, PollMessagesMonotonicOffsets) {
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name, error_info);
+    client->create_stream(stream_name, {}, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
@@ -1465,7 +1465,7 @@ TEST_F(LowLevelE2E_Message, SendMessagesLargeBatch) {
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name, error_info);
+    client->create_stream(stream_name, {}, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
@@ -1529,7 +1529,7 @@ TEST_F(LowLevelE2E_Message, PollMessagesWithInvalidConsumerIdThrows) {
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name, error_info);
+    client->create_stream(stream_name, {}, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
@@ -1552,7 +1552,7 @@ TEST_F(LowLevelE2E_Message, ConsumerGroupCreateJoinAndPollMessages) {
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    client->create_stream(stream_name, error_info);
+    client->create_stream(stream_name, {}, error_info);
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();

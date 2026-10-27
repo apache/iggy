@@ -50,7 +50,7 @@ func (c *IggyTcpClient) SendMessages(
 	if ctx == nil {
 		return nil, ierror.ErrNilContext
 	}
-	ctx, cancel := operationContext(ctx)
+	ctx, cancel := c.operationContext(ctx)
 	defer cancel()
 	if len(partitioning.Value) > 255 ||
 		(partitioning.Kind != iggcon.Balanced && len(partitioning.Value) == 0) {
@@ -150,13 +150,19 @@ func (c *IggyTcpClient) topicPartitionsCount(
 	}
 
 	query := binary.LittleEndian.AppendUint32([]byte(key.stream+key.topic), 0)
-	ctx, cancel := operationContext(ctx)
+	ctx, cancel := c.operationContext(ctx)
 	defer cancel()
 	c.polls.dropRoute(string(query))
 	for {
+		if err := c.waitForRecovery(ctx); err != nil {
+			return 0, err
+		}
 		_, err := c.consumerRoute(ctx, query)
 		if err == nil {
 			break
+		}
+		if c.sessionRecovers(ctx, err) {
+			continue
 		}
 		if !errors.Is(err, ierror.ErrTransientNotAccepted) {
 			return 0, err
@@ -189,7 +195,7 @@ func (c *IggyTcpClient) PollMessages(
 	if ctx == nil {
 		return nil, ierror.ErrNilContext
 	}
-	ctx, cancel := operationContext(ctx)
+	ctx, cancel := c.operationContext(ctx)
 	defer cancel()
 	// A group poll that names no partition is orchestrated client-side: the
 	// member fetches its assignment and polls the partitions it owns in turn.

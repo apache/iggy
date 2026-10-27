@@ -36,13 +36,16 @@ mod authz;
 mod failure;
 pub mod host;
 pub mod login_error;
+pub mod metadata_changes;
 pub mod partition;
 pub mod reads;
+mod segment_delete;
 pub mod session_ops;
 pub mod submit;
 #[cfg(test)]
 pub mod test_support;
 
+pub use crate::dispatch::failure::ClientOrigin;
 use crate::dispatch::failure::{
     FrameChannel, send_deny_reply, send_eviction, send_host_frame, send_pre_consensus_deny,
     send_unbound_deny_reply, send_undeclared_operation_deny,
@@ -57,14 +60,14 @@ use crate::reply_frame::build_raw_pat_reply;
 use crate::rewrite::{RewriteDeny, tcp_chain};
 use crate::session_manager::{ConnectionContext, SessionManager};
 use crate::shell::{ShellBus, ShellShard, ShellShardHandle};
-use crate::wire::verify_request_checksum;
 use ahash::{AHashMap, AHashSet};
 use configs::server::ServerConfig;
 use consensus::MetadataHandle;
 use futures::future::{Either, select};
 use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::codes::{
-    BIND_SESSION_CODE, LOGIN_USER_CODE, LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE, PING_CODE,
+    BIND_SESSION_CODE, CANCEL_DEFERRED_REQUEST_CODE, LOGIN_USER_CODE,
+    LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE, PING_CODE,
 };
 use iggy_binary_protocol::requests::system::SessionIdentity;
 use iggy_binary_protocol::requests::users::login_register::BindSecret;
@@ -79,7 +82,7 @@ use secrecy::ExposeSecret;
 use server_common::Message;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
-use std::future::poll_fn;
+use std::future::{Future, poll_fn};
 use std::mem::offset_of;
 use std::pin::pin;
 use std::rc::Rc;
@@ -87,24 +90,58 @@ use std::sync::Arc;
 use std::task::{Poll, Waker};
 use tracing::{debug, warn};
 
-type ClientRequestQueues = Rc<RefCell<AHashMap<u128, VecDeque<QueuedClientRequest>>>>;
+type ClientRequestQueues = Rc<RefCell<AHashMap<u128, ClientRequestQueue>>>;
+
+/// The frames one connection has queued for its drain, and their bytes.
+#[derive(Default)]
+struct ClientRequestQueue {
+    requests: VecDeque<QueuedClientRequest>,
+    bytes: u64,
+}
+
+impl ClientRequestQueue {
+    fn push_back(&mut self, request: QueuedClientRequest) {
+        self.bytes += request.bytes();
+        self.requests.push_back(request);
+    }
+
+    fn remove(&mut self, index: usize) -> Option<QueuedClientRequest> {
+        let request = self.requests.remove(index)?;
+        self.bytes -= request.bytes();
+        Some(request)
+    }
+}
+
+impl FromIterator<QueuedClientRequest> for ClientRequestQueue {
+    fn from_iter<I: IntoIterator<Item = QueuedClientRequest>>(requests: I) -> Self {
+        let mut queue = Self::default();
+        for request in requests {
+            queue.push_back(request);
+        }
+        queue
+    }
+}
 
 struct QueuedClientRequest {
+    origin: ClientOrigin,
     message: Message<GenericHeader>,
     // A queued metadata barrier can change the namespace resolved by this frame.
     progress: Option<(u64, Option<ConsumerProgress>)>,
 }
 
-impl From<Message<GenericHeader>> for QueuedClientRequest {
-    fn from(message: Message<GenericHeader>) -> Self {
+impl QueuedClientRequest {
+    const fn new(origin: ClientOrigin, message: Message<GenericHeader>) -> Self {
         Self {
+            origin,
             message,
             progress: None,
         }
     }
-}
 
-impl QueuedClientRequest {
+    fn bytes(&self) -> u64 {
+        self.message.as_slice().len() as u64
+    }
+
     fn progress_key(
         &mut self,
         metadata_frontier: u64,
@@ -129,13 +166,18 @@ impl QueuedClientRequest {
 /// or a logout awaits consensus, a `BIND_SESSION` can be HELD for the
 /// read-your-writes budget (see `crate::dispatch::reads`), and any frame can
 /// wait for room under the in-flight cap or for the metadata lane of
-/// [`ClientDrain`]. Without a cap, a client that keeps pipelining through such
-/// a stall grows its queue - and this node's memory - unbounded.
+/// [`ClientDrain`], or for room in the reply queue of a client that reads
+/// slowly. Without a cap, a client that keeps pipelining through such a stall
+/// grows its queue - and this node's memory - unbounded.
 ///
 /// Overflow is ANSWERED, not dropped: `TransientNotAccepted` is the honest
 /// code, since the frame provably never entered any pipeline, so the SDK may
 /// re-issue it anywhere, including here once the queue drains. Sized far above
 /// any SDK's in-flight window, so it only ever fires under a genuine stall.
+/// The deny does not wait for room in the reply queue, so with that queue
+/// full it closes the connection. `message_bus.client_request_queue_bytes_max`
+/// bounds the same queue by bytes and refuses a frame past it the same way,
+/// unless the queue is empty.
 const MAX_QUEUED_CLIENT_REQUESTS: usize = 1024;
 type ActiveClientRequests = Rc<RefCell<AHashMap<u128, Rc<ClientDrain>>>>;
 type ConsumerProgress = (u64, u8, usize);
@@ -161,17 +203,66 @@ fn enqueue_client_request<B, MJ, S, SB>(
     S: 'static,
     SB: SuperblockStore + 'static,
 {
+    // Captured on arrival: every reply to this frame, however late, goes to the
+    // connection that sent it.
+    let origin = ClientOrigin::capture(bus, client_id);
+    if let Ok(cancel) = message.try_as_typed::<RequestHeader>()
+        && cancel.header().operation == Operation::NonReplicated
+        && cancel.header().reserved == CANCEL_DEFERRED_REQUEST_CODE.to_le_bytes()
+        && cancel.body().is_empty()
+        && sessions.borrow().cancel_deferred_request(
+            client_id,
+            cancel.header().client,
+            cancel.header().session,
+            cancel.header().request,
+        )
     {
+        // Cancellation bypasses admission limits. A poll still queued behind
+        // another operation must be removed before it can be admitted.
+        let mut queues = queues.borrow_mut();
+        if let Some(queue) = queues.get_mut(&client_id) {
+            for index in (0..queue.requests.len()).rev() {
+                let matches = queue.requests[index]
+                    .message
+                    .try_as_typed::<RequestHeader>()
+                    .is_ok_and(|request| {
+                        let header = request.header();
+                        header.deferred_cancellation().is_some()
+                            && header.client == cancel.header().client
+                            && header.session == cancel.header().session
+                            && header.request == cancel.header().request
+                    });
+                if matches {
+                    queue.remove(index);
+                }
+            }
+            if queue.requests.is_empty() {
+                queues.remove(&client_id);
+            }
+        }
+        if let Some(drain) = active.borrow().get(&client_id) {
+            drain.wake();
+        }
+        return;
+    }
+    {
+        let request = QueuedClientRequest::new(origin.queued(), message);
+        let bytes_max = server_config
+            .message_bus
+            .client_request_queue_bytes_max
+            .as_bytes_u64();
         let mut queues = queues.borrow_mut();
         let queue = queues.entry(client_id).or_default();
-        if queue.len() >= MAX_QUEUED_CLIENT_REQUESTS {
+        if queue.requests.len() >= MAX_QUEUED_CLIENT_REQUESTS
+            || (!queue.requests.is_empty() && queue.bytes + request.bytes() > bytes_max)
+        {
             // Borrow released before the deny, which spawns onto this same
             // task and would otherwise re-enter the table.
             drop(queues);
-            deny_overflowing_client_request(shard_handle, client_id, message);
+            deny_overflowing_client_request(shard_handle, origin, request.message);
             return;
         }
-        queue.push_back(message.into());
+        queue.push_back(request);
     }
     let running = active.borrow().get(&client_id).cloned();
     if let Some(drain) = running {
@@ -200,7 +291,8 @@ fn enqueue_client_request<B, MJ, S, SB>(
 }
 
 /// Answer a request that arrived with this client's queue already at
-/// [`MAX_QUEUED_CLIENT_REQUESTS`] with the retryable transient denial.
+/// [`MAX_QUEUED_CLIENT_REQUESTS`] or its byte budget with the retryable
+/// transient denial.
 ///
 /// Spawned rather than awaited: the enqueue path is sync (it runs straight off
 /// frame arrival) and the reply goes out on the bus. The header decodes as in
@@ -211,7 +303,7 @@ fn enqueue_client_request<B, MJ, S, SB>(
 /// reply from.
 fn deny_overflowing_client_request<B, MJ, S, SB>(
     shard_handle: &ShellShardHandle<B, MJ, S, SB>,
-    transport_client_id: u128,
+    origin: ClientOrigin,
     message: Message<GenericHeader>,
 ) where
     B: ShellBus,
@@ -220,6 +312,7 @@ fn deny_overflowing_client_request<B, MJ, S, SB>(
     S: 'static,
     SB: SuperblockStore + 'static,
 {
+    let transport_client_id = origin.id;
     // Unreachable in practice: a listener binds only after the build backfills
     // the weak self-reference, which `crate::boot` pins with a `debug_assert`.
     // Dropped rather than admitted past the cap -- the cap exists to refuse
@@ -234,21 +327,18 @@ fn deny_overflowing_client_request<B, MJ, S, SB>(
     shard.metrics().record_client_request_denied_queue_full();
     let bus = shard.bus.clone();
     bus.spawn(async move {
-        let Some(request) =
-            decode_or_deny_client_request(&shard, transport_client_id, message).await
-        else {
+        let Some(request) = decode_or_deny_client_request(&shard, origin, message).await else {
             return;
         };
         let request = request.into_routed();
         debug!(
             transport_client_id,
             operation = ?request.header().operation,
-            queued = MAX_QUEUED_CLIENT_REQUESTS,
             "denying client request retryable: this connection's request queue is full"
         );
         send_deny_reply(
             &shard,
-            transport_client_id,
+            origin,
             request.header(),
             IggyError::TransientNotAccepted.as_code(),
         )
@@ -275,8 +365,10 @@ impl Drop for ActiveDrainSlot {
 }
 
 /// The state that the drain task of one connection shares with the requests
-/// it spawned.
+/// it runs inline or in child tasks.
 ///
+/// Reads stay on the drain until another frame queues, then the same pinned
+/// future continues in a child task with its admission and progress guards.
 /// The drain takes the frames of the connection in arrival order and runs the
 /// prologue of each. Login, logout, `BIND_SESSION` and partition admission
 /// finish on the drain. Metadata commits run in tasks, but later non-PING
@@ -291,10 +383,15 @@ impl Drop for ActiveDrainSlot {
 /// conflict, but cannot pass a queued session or metadata barrier. A PING still waits
 /// behind a frame already suspended in admission or binding.
 ///
-/// `capacity` caps running tasks at `message_bus.client_queue_capacity`.
-/// Permits end when replies are enqueued, so they do not reserve outbound
-/// queue slots. A metadata write, a segment delete, a login and a logout also take
-/// the metadata lane, which holds one of them at a time. The metadata client
+/// `capacity` caps running tasks at `message_bus.client_queue_capacity`, and a
+/// partition write counts until its reply. A reply waits for room in the
+/// outbound queue of the same size, and its task keeps the permit until then,
+/// so a burst of replies to a client that reads them never closes the
+/// connection. A frame the drain answers itself waits there too, and the
+/// frames behind it wait in the queue.
+///
+/// A metadata write, a segment delete, a login and a logout also take the
+/// metadata lane, which holds one of them at a time. The metadata client
 /// table keeps one pending write per client and refuses a lower request id
 /// after a higher one committed, so a second write in flight would fail with
 /// `TransientNotAccepted` or `RequestTooOld`. The lane also runs the rewrite of
@@ -437,6 +534,16 @@ async fn drain_client_requests<B, MJ, S, SB>(
             if drain.metadata_write.get() {
                 return false;
             }
+            // A deferred request waits for room in the queue, where a cancel
+            // still finds it, not at the cap where nothing does.
+            if drain.in_flight.get() >= drain.capacity
+                && queued
+                    .message
+                    .try_as_typed::<RequestHeader>()
+                    .is_ok_and(|request| request.header().deferred_cancellation().is_some())
+            {
+                return false;
+            }
             queued
                 .progress_key(metadata_frontier, |message| progress_key(&shard, message))
                 .is_none_or(|key| {
@@ -453,8 +560,9 @@ async fn drain_client_requests<B, MJ, S, SB>(
                 &shard,
                 &sessions,
                 &server_config,
+                &queues,
                 drain,
-                client_id,
+                queued.origin,
                 queued.message,
                 progress,
             )
@@ -482,7 +590,7 @@ fn pop_next_client_request(
     let queue = queues.get_mut(&client_id)?;
     let mut waiting = false;
     let mut barrier = false;
-    let index = queue.iter_mut().position(|queued| {
+    let index = queue.requests.iter_mut().position(|queued| {
         if is_ping(&queued.message) {
             return true;
         }
@@ -513,7 +621,7 @@ fn pop_next_client_request(
         false
     })?;
     let message = queue.remove(index);
-    if queue.is_empty() {
+    if queue.requests.is_empty() {
         queues.remove(&client_id);
     }
     message
@@ -641,7 +749,7 @@ fn undeclared_operation_header(message: &Message<GenericHeader>) -> Option<[u8; 
 #[allow(clippy::future_not_send)]
 async fn decode_or_deny_client_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    transport_client_id: u128,
+    origin: ClientOrigin,
     message: Message<GenericHeader>,
 ) -> Option<Message<RequestHeader>>
 where
@@ -651,8 +759,9 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
+    let transport_client_id = origin.id;
     if let Some(request_header) = undeclared_operation_header(&message) {
-        send_undeclared_operation_deny(shard, transport_client_id, request_header).await;
+        send_undeclared_operation_deny(shard, origin, request_header).await;
         return None;
     }
     match message.try_into_typed::<RequestHeader>() {
@@ -668,13 +777,18 @@ where
     }
 }
 
-#[allow(clippy::future_not_send, clippy::too_many_lines)]
+#[allow(
+    clippy::future_not_send,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
 async fn handle_client_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
     server_config: &Arc<ServerConfig>,
+    queues: &ClientRequestQueues,
     drain: &Rc<ClientDrain>,
-    transport_client_id: u128,
+    origin: ClientOrigin,
     message: Message<iggy_binary_protocol::GenericHeader>,
     progress: Option<InFlight>,
 ) where
@@ -684,8 +798,8 @@ async fn handle_client_request<B, MJ, S, SB>(
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    let Some(request) = decode_or_deny_client_request(shard, transport_client_id, message).await
-    else {
+    let transport_client_id = origin.id;
+    let Some(request) = decode_or_deny_client_request(shard, origin, message).await else {
         return;
     };
     // Promote to the server-internal routed shape at the boundary: the
@@ -693,25 +807,6 @@ async fn handle_client_request<B, MJ, S, SB>(
     // partition target from the payload), so it starts unset here and the
     // resolution sites below stamp it before anything routes on it.
     let request = request.into_routed();
-
-    // The last point that still sees the body the CLIENT sent; every rewrite below
-    // substitutes server-chosen bytes and carries the stamp through unchanged.
-    if let Err(error) = verify_request_checksum(&request) {
-        warn!(
-            transport_client_id,
-            operation = ?request.header().operation,
-            request = request.header().request,
-            "dropping client request whose body does not match its own checksum"
-        );
-        send_deny_reply(
-            shard,
-            transport_client_id,
-            request.header(),
-            error.as_code(),
-        )
-        .await;
-        return;
-    }
 
     // ONE `connections` walk for the whole prologue. Any request is liveness
     // proof, not just PING: an idle-but-active client (e.g. an admin issuing
@@ -721,16 +816,20 @@ async fn handle_client_request<B, MJ, S, SB>(
     // Bound, not matched: a `match` on `borrow_mut()` would hold the guard
     // across the arm that borrows again.
     let include_attachment = request.header().operation == Operation::NonReplicated;
-    let mut touched = sessions
-        .borrow_mut()
-        .touch_connection(transport_client_id, include_attachment);
+    let mut touched = sessions.borrow_mut().touch_connection(
+        transport_client_id,
+        include_attachment,
+        shard.bus.monotonic_now(),
+    );
     if touched.is_none() {
         // A transport's first frame: the peer address and transport kind live
         // on the bus, so only this path pays that lookup.
         ensure_transport_connection(shard, sessions, transport_client_id);
-        touched = sessions
-            .borrow_mut()
-            .touch_connection(transport_client_id, include_attachment);
+        touched = sessions.borrow_mut().touch_connection(
+            transport_client_id,
+            include_attachment,
+            shard.bus.monotonic_now(),
+        );
     }
     let ConnectionContext {
         bound,
@@ -762,7 +861,7 @@ async fn handle_client_request<B, MJ, S, SB>(
             );
             send_eviction(
                 shard,
-                transport_client_id,
+                origin,
                 header.client,
                 EvictionReason::MalformedLogin,
                 "legacy_login_rejection",
@@ -786,7 +885,7 @@ async fn handle_client_request<B, MJ, S, SB>(
             // way the request-checksum denial above does.
             send_unbound_deny_reply(
                 shard,
-                transport_client_id,
+                origin,
                 request.header(),
                 IggyError::Unauthenticated.as_code(),
             )
@@ -811,12 +910,15 @@ async fn handle_client_request<B, MJ, S, SB>(
                 metadata_watermark,
             };
             // `ClientDrain` says which frames stay on the drain.
-            if matches!(non_replicated_code(header), PING_CODE | BIND_SESSION_CODE) {
+            if matches!(
+                non_replicated_code(header),
+                PING_CODE | BIND_SESSION_CODE | CANCEL_DEFERRED_REQUEST_CODE
+            ) {
                 handle_non_replicated_request(
                     shard,
                     sessions,
                     server_config,
-                    transport_client_id,
+                    origin,
                     request,
                     context,
                 )
@@ -830,26 +932,47 @@ async fn handle_client_request<B, MJ, S, SB>(
             let task_shard = Rc::clone(shard);
             let task_sessions = Rc::clone(sessions);
             let task_config = Arc::clone(server_config);
-            shard.bus.spawn(async move {
+            // Heap pinning lets a suspended read move to a child task without
+            // restarting its handler or releasing its progress guard.
+            let mut read = Box::pin(async move {
                 let _in_flight = in_flight;
                 handle_non_replicated_request(
                     &task_shard,
                     &task_sessions,
                     &task_config,
-                    transport_client_id,
+                    origin,
                     request,
                     context,
                 )
                 .await;
             });
+            let completed = poll_fn(|cx| {
+                drain.parked.set(Some(cx.waker().clone()));
+                if read.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(true);
+                }
+                if queues
+                    .borrow()
+                    .get(&transport_client_id)
+                    .is_some_and(|queue| !queue.requests.is_empty())
+                {
+                    return Poll::Ready(false);
+                }
+                Poll::Pending
+            })
+            .await;
+            drain.parked.take();
+            if !completed {
+                shard.bus.spawn(read);
+            }
         }
         RequestClass::LoginRegister => {
             let _in_flight = drain.admit(Admission::MetadataLane).await;
-            handle_login_register_request(shard, sessions, transport_client_id, request).await;
+            handle_login_register_request(shard, sessions, origin, request).await;
         }
         RequestClass::Logout => {
             let _in_flight = drain.admit(Admission::MetadataLane).await;
-            handle_logout_request(shard, sessions, transport_client_id, request).await;
+            handle_logout_request(shard, sessions, origin, request).await;
         }
         RequestClass::UnboundReplicated => {
             // Replicated request on an unbound transport. Without this short-
@@ -875,7 +998,7 @@ async fn handle_client_request<B, MJ, S, SB>(
             // VSR session exists to name.
             send_eviction(
                 shard,
-                transport_client_id,
+                origin,
                 transport_client_id,
                 EvictionReason::NoSession,
                 "unbound_replicated_request",
@@ -892,8 +1015,7 @@ async fn handle_client_request<B, MJ, S, SB>(
             let task_shard = Rc::clone(shard);
             shard.bus.spawn(async move {
                 let _in_flight = in_flight;
-                handle_delete_segments_request(&task_shard, transport_client_id, bound, &request)
-                    .await;
+                handle_delete_segments_request(&task_shard, origin, bound, &request).await;
             });
         }
         RequestClass::Partition => {
@@ -907,16 +1029,14 @@ async fn handle_client_request<B, MJ, S, SB>(
                 match attachment {
                     Ok(attachment) => attachment,
                     Err(error) => {
-                        send_deny_reply(
-                            shard,
-                            transport_client_id,
-                            request.header(),
-                            error.as_code(),
-                        )
-                        .await;
+                        send_deny_reply(shard, origin, request.header(), error.as_code()).await;
                         return;
                     }
                 }
+            };
+            let in_flight = match progress {
+                Some(progress) => progress,
+                None => drain.admit(Admission::Cap).await,
             };
             // The acting user comes from the prologue's lookup. A bound
             // transport always has one, but the gate below fails closed on
@@ -926,11 +1046,11 @@ async fn handle_client_request<B, MJ, S, SB>(
                 request,
                 vsr_client_id,
                 bound_session,
-                transport_client_id,
+                origin,
                 user_id,
                 consumer_session,
                 None,
-                progress,
+                Some(in_flight),
             )
             .await;
         }
@@ -957,15 +1077,14 @@ async fn handle_client_request<B, MJ, S, SB>(
                 match tcp_chain(shard, sessions, transport_client_id, request) {
                     Ok(rewritten) => rewritten,
                     Err(RewriteDeny { stage, error }) => {
-                        send_pre_consensus_deny(shard, transport_client_id, &header, &error, stage)
-                            .await;
+                        send_pre_consensus_deny(shard, origin, &header, &error, stage).await;
                         return;
                     }
                 };
             let request_header = *request.header();
             // Replicated request: run consensus on the metadata owner (shard 0) and
             // bring the committed reply back here. This shard owns the connection,
-            // so it writes the reply to the socket via the transport client id --
+            // so it writes the reply to the connection the request arrived on --
             // shard 0 can't route by the consensus client id (no home-shard bits).
             // The wait for the commit runs off the drain, and its task holds the
             // metadata lane until the reply is out.
@@ -986,7 +1105,7 @@ async fn handle_client_request<B, MJ, S, SB>(
                     );
                     send_deny_reply(
                         shard,
-                        transport_client_id,
+                        origin,
                         &header,
                         IggyError::TransientNotCommitted.as_code(),
                     )
@@ -1020,13 +1139,13 @@ async fn handle_client_request<B, MJ, S, SB>(
                         // that one reply and a retry dedups to the empty
                         // committed body -- so the caller must delete the
                         // token and mint a new one.
-                        send_deny_reply(shard, transport_client_id, &header, error.as_code()).await;
+                        send_deny_reply(shard, origin, &header, error.as_code()).await;
                         return;
                     }
                 };
                 send_host_frame(
-                    &shard.bus,
-                    transport_client_id,
+                    shard,
+                    origin,
                     reply.into_frozen(),
                     FrameChannel::Reply,
                     "committed_reply",
@@ -1051,9 +1170,12 @@ fn ensure_transport_connection<B, MJ, S, SB>(
     let Some(meta) = shard.bus.client_meta(transport_client_id) else {
         return;
     };
-    sessions
-        .borrow_mut()
-        .ensure_connection(transport_client_id, meta.peer_addr, meta.transport);
+    sessions.borrow_mut().ensure_connection(
+        transport_client_id,
+        meta.peer_addr,
+        meta.transport,
+        shard.bus.monotonic_now(),
+    );
 }
 
 pub(in crate::dispatch) fn upgrade_shard_handle<B, MJ, S, SB>(
@@ -1134,6 +1256,7 @@ where
         user_id,
         attachment,
         watermark,
+        shard.bus.monotonic_now(),
     )?;
     Ok((user_id, session))
 }
@@ -1145,7 +1268,8 @@ mod tests {
     use crate::dispatch::host::ServerHost;
     use crate::dispatch::test_support::{
         FIRST_BOOT, SpyBus, TestMux, TestShard, UNDECLARED_OPERATION, create_one_partition,
-        create_reader_request, prepare_message, register_reply, request_message, test_shard,
+        create_reader_request, prepare_message, recreate_topic_in, register_reply, request_message,
+        test_shard, test_shard_with_frontier,
     };
     use bytes::Bytes;
     use consensus::Sequencer;
@@ -1153,43 +1277,48 @@ mod tests {
     use iggy_binary_protocol::Command;
     use iggy_binary_protocol::codes::{
         GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE,
-        GET_ME_CODE, GET_PARTITION_ROUTE_CODE, GET_STATS_CODE, POLL_MESSAGES_CODE,
+        GET_ME_CODE, GET_METADATA_CHANGES_CODE, GET_PARTITION_ROUTE_CODE, GET_STATS_CODE,
+        POLL_MESSAGES_CODE, POLL_MESSAGES_DEFERRED_CODE,
     };
-    use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
+    use iggy_binary_protocol::primitives::metadata_changes::WireMetadataChangeStatus;
     use iggy_binary_protocol::primitives::polling_strategy::WirePollingStrategy;
     use iggy_binary_protocol::requests::consumer_offsets::{
         GetConsumerOffsetRequest, StoreConsumerOffsetRequest,
     };
-    use iggy_binary_protocol::requests::messages::{GetPartitionRouteRequest, PollMessagesRequest};
+    use iggy_binary_protocol::requests::messages::{
+        DeferredPollMessagesRequest, GetPartitionRouteRequest, MIN_DEFERRED_POLL_MAX_BYTES,
+        MIN_DEFERRED_POLL_REPLY_MARGIN_US, PollMessagesRequest,
+    };
     use iggy_binary_protocol::requests::personal_access_tokens::CreatePersonalAccessTokenRequest as WireCreatePersonalAccessTokenRequest;
-    use iggy_binary_protocol::requests::streams::CreateStreamRequest;
+    use iggy_binary_protocol::requests::streams::{
+        CreateStreamRequest, UpdateStreamResolvedRequest,
+    };
     use iggy_binary_protocol::requests::system::{
-        BindSessionRequest, GetClientRequest, GetClientsRequest, GetStatsRequest,
+        BindSessionRequest, GetClientRequest, GetClientsRequest, GetMetadataChangesRequest,
+        GetStatsRequest, ResourceTarget, UpdateResourceRequest,
     };
-    use iggy_binary_protocol::requests::topics::{
-        CreateTopicRequest, CreateTopicWithAssignmentsRequest, DeleteTopicRequest,
-    };
+    use iggy_binary_protocol::requests::topics::{DeleteTopicRequest, UpdateTopicResolvedRequest};
     use iggy_binary_protocol::requests::users::login_register::{
         LoginRegisterRequest, RegisterRequest,
     };
     use iggy_binary_protocol::requests::users::login_register_with_pat::LoginRegisterWithPatRequest;
     use iggy_binary_protocol::requests::users::{
-        CreateUserRequest, DeleteUserRequest, UpdatePermissionsRequest, UpdateUserRequest,
+        CreateUserRequest, DeleteUserRequest, UpdatePermissionsRequest, UpdateUserResolvedRequest,
     };
+    use iggy_binary_protocol::responses::system::GetMetadataChangesResponse;
     use iggy_binary_protocol::{
         AckLevel, ClientVersionInfo, EvictionHeader, IGGY_PROTOCOL_VERSION, ReplyHeader,
         WireConsumer,
     };
-    use iggy_binary_protocol::{WireEncode, WireIdentifier, WireName, WireOptions};
-    use iggy_common::Identifier;
+    use iggy_binary_protocol::{WireDecode, WireEncode, WireIdentifier, WireName, WireOptions};
     use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
+    use iggy_common::{Identifier, IggyByteSize, MetadataChangeStart, MetadataChangesQuery};
     use journal::prepare_journal::PrepareJournal;
     use message_bus::installer::conn_info::ClientTransportKind;
-    use metadata::IggyMetadata;
     use metadata::impls::metadata::IggySnapshot;
     use metadata::stm::StateMachine;
-    use metadata::stm::lifecycle::{CompleteLifecycleRequest, LifecycleCompletion};
     use metadata::stm::user::{CreatePersonalAccessTokenRequest, PAT_TOKEN_HASH_BYTES};
+    use metadata::{IggyMetadata, MetadataSubmitError};
     use partitions::{IggyPartitions, PartitionPathLayout, PartitionsConfig};
     use server_common::MESSAGE_ALIGN;
     use server_common::sharding::{PartitionLocation, ShardId};
@@ -1197,11 +1326,12 @@ mod tests {
     use shard::shards_table::{PapayaShardsTable, ShardsTable};
     use shard::{
         ConnectedClientInfo, LifecycleFrame, ListClientsReply, MetadataSubmit, NoopHost,
-        PartitionConsensusConfig, PartitionRead, PartitionReadReply, ReplicaTopology, ShardFrame,
-        ShardHost, ShardIdentity, shard_channel,
+        PartitionConsensusConfig, PartitionRead, PartitionReadReply, Receiver, ReplicaTopology,
+        ShardFrame, ShardHost, ShardIdentity, shard_channel,
     };
     use std::mem::size_of;
     use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
 
     #[compio::test]
     #[allow(clippy::too_many_lines)]
@@ -1239,6 +1369,7 @@ mod tests {
                     |_| {},
                     prepare,
                 )
+                .reply
             };
             let create = CreateUserRequest {
                 username: WireName::new("original").unwrap(),
@@ -1318,6 +1449,7 @@ mod tests {
                 TRANSPORT,
                 "127.0.0.1:34567".parse().unwrap(),
                 ClientTransportKind::Tcp,
+                std::time::Instant::now(),
             );
             for session in [0, REGISTER_OP] {
                 let result = complete_session_binding(
@@ -1378,7 +1510,7 @@ mod tests {
                     handle_login_register_request(
                         &shard,
                         &sessions,
-                        TRANSPORT,
+                        ClientOrigin::capture(&shard.bus, TRANSPORT),
                         request_message(Operation::Register, client, 0, 0, body),
                     )
                     .await;
@@ -1426,31 +1558,35 @@ mod tests {
             let bus = SpyBus::default();
             let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
             let metadata = shard.plane.metadata();
+            let account_id = u32::from(status == Some(UserStatus::Inactive));
             if let Some(status) = status {
                 metadata.mux_stm.users().ensure_root_user("iggy", "hash");
-                metadata
-                    .mux_stm
-                    .update(prepare_message(
-                        Operation::UpdateUser,
-                        CLIENT,
-                        SESSION,
-                        &UpdateUserRequest {
-                            user_id: WireIdentifier::numeric(0),
-                            username: None,
-                            status: Some(status.as_code()),
-                            options: WireOptions::empty(),
-                        }
-                        .to_bytes(),
-                    ))
-                    .unwrap();
+                if status == UserStatus::Inactive {
+                    metadata
+                        .mux_stm
+                        .update(prepare_message(
+                            Operation::CreateUser,
+                            CLIENT,
+                            SESSION,
+                            &CreateUserRequest {
+                                username: WireName::new("inactive-user").unwrap(),
+                                password: "hash".to_owned(),
+                                status: status.as_code(),
+                                permissions: None,
+                                options: WireOptions::empty(),
+                            }
+                            .to_bytes(),
+                        ))
+                        .unwrap();
+                }
             }
             metadata
                 .client_table
                 .borrow_mut()
                 .commit_register(
                     client_id,
-                    0,
-                    bind_verifier(client_id, 0, &SECRET),
+                    account_id,
+                    bind_verifier(client_id, account_id, &SECRET),
                     register_reply(client_id, SESSION),
                 )
                 .unwrap();
@@ -1460,6 +1596,7 @@ mod tests {
                 TRANSPORT,
                 "127.0.0.1:34567".parse().unwrap(),
                 ClientTransportKind::Tcp,
+                std::time::Instant::now(),
             );
             let outcome = complete_session_binding(
                 &shard,
@@ -1476,7 +1613,7 @@ mod tests {
             if status == Some(UserStatus::Active)
                 && !message_bus::is_server_internal_client(client_id)
             {
-                assert_eq!(outcome.unwrap(), (0, SESSION));
+                assert_eq!(outcome.unwrap(), (account_id, SESSION));
                 assert_eq!(
                     sessions.borrow().get_session(TRANSPORT),
                     Some((client_id, SESSION))
@@ -1503,17 +1640,20 @@ mod tests {
         bind_root_session(&shard, &sessions).await;
         let server_config = Arc::new(ServerConfig::default());
 
-        handle_client_request(
+        let queues = ClientRequestQueues::default();
+        let drain = Rc::new(ClientDrain::new(&server_config));
+        let read = handle_client_request(
             &shard,
             &sessions,
             &server_config,
-            &Rc::new(ClientDrain::new(&server_config)),
-            ROOT_TRANSPORT,
+            &queues,
+            &drain,
+            ClientOrigin::capture(&shard.bus, ROOT_TRANSPORT),
             held_get_me(1, UNAPPLIED_OP),
             None,
-        )
-        .await;
-        settle().await;
+        );
+        futures::pin_mut!(read);
+        assert!(futures::poll!(read.as_mut()).is_pending());
         assert!(
             bus.client_replies.borrow().is_empty(),
             "the read must wait for op {UNAPPLIED_OP}"
@@ -1523,6 +1663,7 @@ mod tests {
             .metadata()
             .applied_frontier()
             .advance(UNAPPLIED_OP);
+        read.await;
         await_replies(&bus, 1).await;
         let replies = bus.client_replies.borrow();
         assert_eq!(replies.len(), 1);
@@ -1562,6 +1703,7 @@ mod tests {
             ROOT_TRANSPORT,
             "127.0.0.1:34567".parse().unwrap(),
             ClientTransportKind::Tcp,
+            std::time::Instant::now(),
         );
     }
 
@@ -1611,6 +1753,61 @@ mod tests {
     }
 
     #[compio::test]
+    async fn given_root_session_when_reading_metadata_changes_should_answer_pages_and_refuse_bad_bodies()
+     {
+        let (bus, shard, host) = root_host(ServerConfig::default());
+        bind_root_session(&shard, host.sessions()).await;
+        let metadata = shard.plane.metadata();
+        metadata
+            .change_log()
+            .append(
+                &PrepareHeader {
+                    op: 1,
+                    checksum: 0x5eed,
+                    ..PrepareHeader::default()
+                },
+                Vec::new(),
+            )
+            .unwrap();
+        let read = |request, body: &[u8]| {
+            let mut read = wire_request(
+                Operation::NonReplicated,
+                ROOT_CLIENT,
+                ROOT_SESSION,
+                request,
+                body,
+            );
+            bytemuck::checked::from_bytes_mut::<RequestHeader>(
+                &mut read.as_mut_slice()[..size_of::<RequestHeader>()],
+            )
+            .reserved[..4]
+                .copy_from_slice(&GET_METADATA_CHANGES_CODE.to_le_bytes());
+            read.into_generic()
+        };
+        let latest = GetMetadataChangesRequest::from(&MetadataChangesQuery {
+            start: MetadataChangeStart::Latest,
+            ..MetadataChangesQuery::default()
+        })
+        .to_bytes();
+
+        host.on_client_request(ROOT_TRANSPORT, read(1, &latest));
+        host.on_client_request(ROOT_TRANSPORT, read(2, &[0xff]));
+        await_replies(&bus, 2).await;
+
+        let replies = bus.client_replies.borrow();
+        assert_eq!(replies.len(), 2);
+        let (header, body) = replies[0].1.split_at(size_of::<ReplyHeader>());
+        assert_eq!(reply_status(header), 0);
+        let page = GetMetadataChangesResponse::decode_from(body).expect("a change page");
+        assert_eq!(page.status, WireMetadataChangeStatus::Ok);
+        assert_eq!(page.log_id, Some(0x5eed));
+        assert_eq!(
+            reply_status(&replies[1].1),
+            IggyError::InvalidCommand.as_code()
+        );
+    }
+
+    #[compio::test]
     async fn given_a_read_held_at_the_frontier_when_the_session_ends_should_refuse_stale_client() {
         let (bus, shard, host) = root_host(ServerConfig::default());
         bind_root_session(&shard, host.sessions()).await;
@@ -1649,40 +1846,73 @@ mod tests {
     #[compio::test]
     async fn given_a_read_waiting_on_a_shard_when_grants_are_revoked_should_refuse_unauthorized() {
         for (code, body) in shard_waiting_reads() {
-            assert_read_refused_after_shard_wait(code, &body, ReadRevocation::Grants).await;
+            assert_read_refused_after_shard_wait(code, &body, ReadRevocation::Grants(None)).await;
+        }
+    }
+
+    /// After the rename the names in the request resolve to nothing, so the
+    /// check after the owner answers must not resolve them again.
+    #[compio::test]
+    async fn given_a_read_by_name_waiting_on_a_shard_when_renamed_and_revoked_should_refuse_unauthorized()
+     {
+        let stream_id = WireIdentifier::named("stream").unwrap();
+        let topic_id = WireIdentifier::named("topic").unwrap();
+        for (code, body) in partition_namespace_reads(&stream_id, &topic_id) {
+            for rename in [
+                Operation::UpdateStreamResolved,
+                Operation::UpdateTopicResolved,
+            ] {
+                assert_read_refused_after_shard_wait(
+                    code,
+                    &body,
+                    ReadRevocation::Grants(Some(rename)),
+                )
+                .await;
+            }
+        }
+    }
+
+    /// A read waiting on a shard belongs to the connection that sent it, so a
+    /// connection that took the id during the wait must not get its reply.
+    #[compio::test]
+    async fn given_a_read_waiting_on_a_shard_when_the_connection_is_replaced_should_not_answer_the_new_one()
+     {
+        for (code, body) in shard_waiting_reads() {
+            assert_read_refused_after_shard_wait(code, &body, ReadRevocation::Connection).await;
         }
     }
 
     #[compio::test]
-    async fn given_a_route_waiting_on_a_shard_when_the_topic_is_recreated_should_refuse_stale_route()
+    async fn given_a_partition_read_waiting_on_a_shard_when_the_topic_is_recreated_should_refuse_not_accepted()
      {
-        let (code, body) = shard_waiting_reads()
-            .into_iter()
-            .find(|(code, _)| *code == GET_PARTITION_ROUTE_CODE)
-            .unwrap();
-        assert_read_refused_after_shard_wait(code, &body, ReadRevocation::Topic).await;
+        for (code, body) in shard_waiting_reads().into_iter().filter(|(code, _)| {
+            matches!(
+                *code,
+                GET_PARTITION_ROUTE_CODE | POLL_MESSAGES_CODE | GET_CONSUMER_OFFSET_CODE
+            )
+        }) {
+            assert_read_refused_after_shard_wait(code, &body, ReadRevocation::Topic).await;
+        }
+    }
+
+    #[compio::test]
+    async fn given_a_route_read_waiting_on_a_shard_when_topic_deletion_starts_should_refuse() {
+        let (_, body) =
+            partition_namespace_reads(&WireIdentifier::numeric(0), &WireIdentifier::numeric(0))[2]
+                .clone();
+        assert_read_refused_after_shard_wait(
+            GET_PARTITION_ROUTE_CODE,
+            &body,
+            ReadRevocation::TopicDeleting,
+        )
+        .await;
     }
 
     /// Every read that asks another shard before it answers: the client reads
     /// ask every shard, the rest ask the owner of the partition.
     fn shard_waiting_reads() -> [(u32, Bytes); 6] {
-        let offset = GetConsumerOffsetRequest {
-            consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
-            stream_id: WireIdentifier::numeric(0),
-            topic_id: WireIdentifier::numeric(0),
-            partition_id: Some(0),
-        }
-        .to_bytes();
-        let poll = PollMessagesRequest {
-            consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
-            stream_id: WireIdentifier::numeric(0),
-            topic_id: WireIdentifier::numeric(0),
-            partition_id: Some(0),
-            strategy: WirePollingStrategy::offset(0),
-            count: 1,
-            auto_commit: false,
-        }
-        .to_bytes();
+        let [poll, offset, route] =
+            partition_namespace_reads(&WireIdentifier::numeric(0), &WireIdentifier::numeric(0));
         [
             (GET_CLIENTS_CODE, GetClientsRequest.to_bytes()),
             (
@@ -1690,24 +1920,136 @@ mod tests {
                 GetClientRequest { client_id: 1 }.to_bytes(),
             ),
             (GET_STATS_CODE, GetStatsRequest.to_bytes()),
+            route,
+            poll,
+            offset,
+        ]
+    }
+
+    /// Reads of partition 0 that resolve `stream_id` and `topic_id`.
+    fn partition_namespace_reads(
+        stream_id: &WireIdentifier,
+        topic_id: &WireIdentifier,
+    ) -> [(u32, Bytes); 3] {
+        let poll = PollMessagesRequest {
+            consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
+            stream_id: stream_id.clone(),
+            topic_id: topic_id.clone(),
+            partition_id: Some(0),
+            strategy: WirePollingStrategy::offset(0),
+            count: 1,
+            auto_commit: false,
+        }
+        .to_bytes();
+        let offset = GetConsumerOffsetRequest {
+            consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
+            stream_id: stream_id.clone(),
+            topic_id: topic_id.clone(),
+            partition_id: Some(0),
+        }
+        .to_bytes();
+        [
+            (POLL_MESSAGES_CODE, poll),
+            (GET_CONSUMER_OFFSET_CODE, offset),
             (
                 GET_PARTITION_ROUTE_CODE,
                 GetPartitionRouteRequest {
-                    stream_id: WireIdentifier::numeric(0),
-                    topic_id: WireIdentifier::numeric(0),
+                    stream_id: stream_id.clone(),
+                    topic_id: topic_id.clone(),
                     partition_id: 0,
                 }
                 .to_bytes(),
             ),
-            (POLL_MESSAGES_CODE, poll),
-            (GET_CONSUMER_OFFSET_CODE, offset),
         ]
     }
 
+    #[compio::test]
+    async fn given_expired_metadata_when_partition_reads_name_revoked_or_missing_topics_should_refuse_before_authorization()
+     {
+        let epoch = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(9))
+            .unwrap();
+        let frontier = Arc::new(
+            metadata::AppliedFrontier::default()
+                .with_partition_freshness(epoch, Duration::from_secs(5)),
+        );
+        frontier.credit_partition_freshness(epoch, Duration::ZERO);
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard_with_frontier(&bus, 0, 3, FIRST_BOOT, frontier));
+        create_one_partition(&shard);
+        let sessions = bind_reader_session(&shard).await;
+        let revoke = UpdatePermissionsRequest {
+            user_id: WireIdentifier::numeric(READER),
+            permissions: None,
+        };
+        assert_eq!(
+            shard
+                .plane
+                .metadata()
+                .mux_stm
+                .update(prepare_message(
+                    Operation::UpdatePermissions,
+                    0,
+                    4,
+                    &revoke.to_bytes()
+                ))
+                .unwrap()
+                .code,
+            0
+        );
+        let config = Arc::new(ServerConfig::default());
+        let mut count = 0;
+        for name in ["stream", "missing"] {
+            for (code, body) in partition_namespace_reads(
+                &WireIdentifier::named(name).unwrap(),
+                &WireIdentifier::named("topic").unwrap(),
+            )
+            .into_iter()
+            .take(2)
+            {
+                let mut read = wire_request(
+                    Operation::NonReplicated,
+                    READER_CLIENT,
+                    READER_SESSION,
+                    1,
+                    &body,
+                );
+                let header = bytemuck::checked::from_bytes_mut::<RequestHeader>(
+                    &mut read.as_mut_slice()[..size_of::<RequestHeader>()],
+                );
+                header.reserved[..4].copy_from_slice(&code.to_le_bytes());
+                handle_client_request(
+                    &shard,
+                    &sessions,
+                    &config,
+                    &ClientRequestQueues::default(),
+                    &Rc::new(ClientDrain::new(&config)),
+                    ClientOrigin::capture(&shard.bus, READER_TRANSPORT),
+                    read.into_generic(),
+                    None,
+                )
+                .await;
+                count += 1;
+                await_replies(&bus, count).await;
+                assert_eq!(
+                    reply_status(&bus.client_replies.borrow()[count - 1].1),
+                    IggyError::TransientNotAccepted.as_code(),
+                    "{name} code{code}"
+                );
+            }
+        }
+    }
+
+    #[derive(Debug)]
     enum ReadRevocation {
         Session,
-        Grants,
+        /// Revoke the reader's grants, after renaming the partition's stream
+        /// (`UpdateStream`) or topic (`UpdateTopic`) when one is given.
+        Grants(Option<Operation>),
         Topic,
+        TopicDeleting,
+        /// The connection is replaced under the same id, so nothing answers.
+        Connection,
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1742,23 +2084,31 @@ mod tests {
             .unwrap();
         let server_config = Arc::new(ServerConfig::default());
 
-        handle_client_request(
+        let queues = ClientRequestQueues::default();
+        let drain = Rc::new(ClientDrain::new(&server_config));
+        let dispatched = handle_client_request(
             &shard,
             &sessions,
             &server_config,
-            &Rc::new(ClientDrain::new(&server_config)),
-            READER_TRANSPORT,
+            &queues,
+            &drain,
+            ClientOrigin::capture(&shard.bus, READER_TRANSPORT),
             read.into_generic(),
             None,
-        )
-        .await;
-        settle().await;
+        );
+        futures::pin_mut!(dispatched);
+        assert!(futures::poll!(dispatched.as_mut()).is_pending());
         let Ok(ShardFrame::Lifecycle(frame)) = shard_inbox.try_recv() else {
             panic!("code {code} must wait on a shard");
         };
         assert!(bus.client_replies.borrow().is_empty());
+        let case = format!("code {code} after {change:?}");
         let metadata = shard.plane.metadata();
         let refusal = match change {
+            ReadRevocation::Connection => {
+                bus.reconnect_client(READER_TRANSPORT);
+                None
+            }
             ReadRevocation::Session => {
                 assert!(metadata.client_table.borrow_mut().end_session(
                     READER_CLIENT,
@@ -1766,9 +2116,39 @@ mod tests {
                     READER_SESSION,
                     READER_SESSION + 1
                 ));
-                IggyError::StaleClient
+                Some(IggyError::StaleClient)
             }
-            ReadRevocation::Grants => {
+            ReadRevocation::Grants(rename) => {
+                if let Some(operation) = rename {
+                    let stream_id =
+                        WireIdentifier::numeric(namespace.stream_id().try_into().unwrap());
+                    let name = WireName::new("renamed").unwrap();
+                    let body = match operation {
+                        Operation::UpdateStreamResolved => UpdateStreamResolvedRequest {
+                            stream_id,
+                            name: Some(name),
+                            explicit_options: WireOptions::empty(),
+                            derived_options: WireOptions::empty(),
+                        }
+                        .to_bytes(),
+                        Operation::UpdateTopicResolved => UpdateTopicResolvedRequest {
+                            stream_id,
+                            topic_id: WireIdentifier::numeric(
+                                namespace.topic_id().try_into().unwrap(),
+                            ),
+                            name: Some(name),
+                            explicit_options: WireOptions::empty(),
+                            derived_options: WireOptions::empty(),
+                        }
+                        .to_bytes(),
+                        _ => panic!("{operation:?} renames neither a stream nor a topic"),
+                    };
+                    let renamed = metadata
+                        .mux_stm
+                        .update(prepare_message(operation, 0, 4, &body))
+                        .unwrap();
+                    assert_eq!(renamed.code, 0);
+                }
                 let revoke = UpdatePermissionsRequest {
                     user_id: WireIdentifier::numeric(READER),
                     permissions: None,
@@ -1783,78 +2163,53 @@ mod tests {
                     ))
                     .unwrap();
                 assert_eq!(revoked.code, 0);
-                IggyError::Unauthorized
+                Some(IggyError::Unauthorized)
             }
             ReadRevocation::Topic => {
-                let apply = |op, operation, body: Bytes| {
+                recreate_topic_in(&metadata.mux_stm, namespace);
+                Some(IggyError::TransientNotAccepted)
+            }
+            ReadRevocation::TopicDeleting => {
+                let delete = DeleteTopicRequest {
+                    stream_id: WireIdentifier::numeric(namespace.stream_id().try_into().unwrap()),
+                    topic_id: WireIdentifier::numeric(namespace.topic_id().try_into().unwrap()),
+                };
+                assert_eq!(
                     metadata
                         .mux_stm
-                        .update(prepare_message(operation, 0, op, &body).transmute_header(
-                            |old, header: &mut iggy_binary_protocol::PrepareHeader| {
-                                *header = old;
-                                header.op = op;
-                            },
+                        .update(prepare_message(
+                            Operation::DeleteTopic,
+                            0,
+                            4,
+                            &delete.to_bytes(),
                         ))
                         .unwrap()
-                };
-                let deleted = apply(
-                    4,
-                    Operation::DeleteTopic,
-                    DeleteTopicRequest {
-                        stream_id: WireIdentifier::numeric(
-                            namespace.stream_id().try_into().unwrap(),
-                        ),
-                        topic_id: WireIdentifier::numeric(namespace.topic_id().try_into().unwrap()),
-                    }
-                    .to_bytes(),
+                        .code,
+                    0
                 );
-                assert_eq!(deleted.code, 0);
-                let completion = CompleteLifecycleRequest::new(
-                    4,
-                    namespace.stream_id().try_into().unwrap(),
-                    vec![LifecycleCompletion {
-                        topic_id: namespace.topic_id().try_into().unwrap(),
-                        partition_id: namespace.partition_id().try_into().unwrap(),
-                        partition_op: 1,
-                    }],
-                )
-                .unwrap();
-                let completed = apply(5, Operation::CompleteLifecycle, completion.to_bytes());
-                assert_eq!(completed.code, 0);
-                let created = apply(
-                    6,
-                    Operation::CreateTopicWithAssignments,
-                    CreateTopicWithAssignmentsRequest {
-                        request: CreateTopicRequest {
-                            stream_id: WireIdentifier::numeric(
-                                namespace.stream_id().try_into().unwrap(),
-                            ),
-                            partitions_count: 1,
-                            name: WireName::new("topic").unwrap(),
-                            options: WireOptions::empty(),
-                        },
-                        derived_options: WireOptions::empty(),
-                        partitions: vec![CreatedPartitionAssignment {
-                            partition_id: namespace.partition_id().try_into().unwrap(),
-                            consensus_group_id: 2,
-                        }],
-                        created_view: 0,
-                    }
-                    .to_bytes(),
-                );
-                assert_eq!(created.code, 0);
-                IggyError::TransientNotAccepted
+                Some(IggyError::TransientNotAccepted)
             }
         };
         answer_shard_read(code, frame);
+        dispatched.await;
+        let Some(refusal) = refusal else {
+            settle().await;
+            assert_no_reply_to(&bus, READER_TRANSPORT);
+            return;
+        };
 
         await_replies(&bus, 1).await;
         let replies = bus.client_replies.borrow();
-        assert_eq!(replies.len(), 1, "code {code} must answer once");
+        assert_eq!(replies.len(), 1, "{case} must answer once");
         assert_eq!(
             reply_status(&replies[0].1),
             refusal.as_code(),
-            "code {code} must refuse a stale read"
+            "{case} must refuse a stale read"
+        );
+        assert_eq!(
+            replies[0].1.len(),
+            size_of::<ReplyHeader>(),
+            "{case} must refuse without a body"
         );
     }
 
@@ -1896,6 +2251,7 @@ mod tests {
             READER_TRANSPORT,
             "127.0.0.1:34567".parse().unwrap(),
             ClientTransportKind::Tcp,
+            std::time::Instant::now(),
         );
         complete_session_binding(
             shard,
@@ -1943,6 +2299,7 @@ mod tests {
                     context: attachment.metadata.context(0),
                     fragments: Vec::new().into(),
                     current_offset: STORED_OFFSET,
+                    encryptor: None,
                 })
                 .unwrap(),
             LifecycleFrame::PartitionRead {
@@ -1969,7 +2326,7 @@ mod tests {
     #[compio::test]
     async fn given_deactivated_user_when_reactivated_should_reject_retained_session() {
         for primary in [false, true] {
-            assert_revoked_user_cannot_resume(Operation::UpdateUser, primary).await;
+            assert_revoked_user_cannot_resume(Operation::UpdateUserResolved, primary).await;
         }
     }
 
@@ -2025,6 +2382,7 @@ mod tests {
             TRANSPORT,
             "127.0.0.1:34567".parse().unwrap(),
             ClientTransportKind::Tcp,
+            std::time::Instant::now(),
         );
         let identity = SessionIdentity {
             client_id: CLIENT,
@@ -2046,11 +2404,12 @@ mod tests {
             }
             .to_bytes()
         } else {
-            UpdateUserRequest {
+            UpdateUserResolvedRequest {
                 user_id: WireIdentifier::numeric(USER),
                 username: None,
                 status: Some(UserStatus::Inactive.as_code()),
-                options: WireOptions::empty(),
+                explicit_options: WireOptions::empty(),
+                derived_options: WireOptions::empty(),
             }
             .to_bytes()
         };
@@ -2063,6 +2422,28 @@ mod tests {
             let consensus = metadata.consensus.as_ref().unwrap();
             consensus.restore_commit_state(SESSION, SESSION);
             consensus.sequencer().set_sequence(SESSION);
+            // A client sends the generic patch, the primary resolves it.
+            let (operation, body) = if operation == Operation::UpdateUserResolved {
+                let patch = iggy_common::UserUpdateOptions {
+                    status: Some(UserStatus::Inactive),
+                    ..iggy_common::UserUpdateOptions::default()
+                }
+                .to_patch()
+                .unwrap();
+                (
+                    Operation::UpdateResource,
+                    UpdateResourceRequest {
+                        target: ResourceTarget::User {
+                            user_id: WireIdentifier::numeric(USER),
+                        },
+                        reset: patch.reset,
+                        options: patch.set,
+                    }
+                    .to_bytes(),
+                )
+            } else {
+                (operation, body)
+            };
             let request = request_message(operation, ROOT_CLIENT, 1, 1, &body).transmute_header(
                 |old, header: &mut RoutedRequestHeader| {
                     *header = old;
@@ -2083,7 +2464,8 @@ mod tests {
                 true,
                 |_| {},
                 consensus::seal_prepare_checksum(revocation),
-            );
+            )
+            .reply;
             assert_eq!(iggy_binary_protocol::result_code(reply.body()), Some(0));
         }
         let old_binding = sessions.borrow().get_session(TRANSPORT);
@@ -2100,14 +2482,15 @@ mod tests {
             )
         } else {
             prepare_message(
-                Operation::UpdateUser,
+                Operation::UpdateUserResolved,
                 0,
                 4,
-                &UpdateUserRequest {
+                &UpdateUserResolvedRequest {
                     user_id: WireIdentifier::numeric(USER),
                     username: None,
                     status: Some(UserStatus::Active.as_code()),
-                    options: WireOptions::empty(),
+                    explicit_options: WireOptions::empty(),
+                    derived_options: WireOptions::empty(),
                 }
                 .to_bytes(),
             )
@@ -2154,7 +2537,7 @@ mod tests {
                 validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 preallocate_segments: false,
-                encryptor: None,
+                key_context: Arc::default(),
                 path_layout: PartitionPathLayout::default(),
             },
         );
@@ -2190,16 +2573,10 @@ mod tests {
         })
     }
 
-    /// A frame on the reply lane must reach the client through the RUNNING
-    /// pump's reply arm: the lane split moved `ForwardClientSend` off the
-    /// main inbox, so a pump that forgot to service the new lane would
-    /// strand every cross-shard reply while the send sites happily report
-    /// success.
     #[compio::test]
-    async fn pump_live_arm_delivers_reply_lane_forwards() {
+    async fn pump_live_arm_processes_reply_lane_forwards() {
         const TRANSPORT: u128 = 92;
         let (bus, lane_sender, shard) = reply_lane_test_shard("reply-lane-live-arm-test");
-
         let (stop_tx, stop_rx) = shard::channel::<()>(1);
         let pump_shard = Rc::clone(&shard);
         let pump = compio::runtime::spawn(async move {
@@ -2207,63 +2584,57 @@ mod tests {
                 .run_message_pump(stop_rx, Arc::new(AtomicBool::new(false)))
                 .await;
         });
-
         lane_sender
             .reply_sender()
             .try_send(reply_lane_forward(TRANSPORT))
-            .expect("reply lane has capacity");
-
-        // The pump is idle on the main lane, so its bottom reply arm must
-        // serve the frame without any main-lane traffic or shutdown drain.
-        let mut delivered = false;
-        for _ in 0..500 {
-            if !bus.client_replies.borrow().is_empty() {
-                delivered = true;
-                break;
+            .unwrap();
+        // No main-lane traffic wakes the pump: only its reply arm can record this refusal.
+        compio::time::timeout(std::time::Duration::from_secs(5), async {
+            while shard.metrics().frame_drops_value() == 0 {
+                compio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
-            compio::time::sleep(std::time::Duration::from_millis(1)).await;
-        }
-        stop_tx.try_send(()).expect("stop channel has capacity");
+        })
+        .await
+        .expect("the live reply arm must process a forward");
+        stop_tx.try_send(()).unwrap();
         let _ = pump.await;
-
-        assert!(
-            delivered,
-            "the live reply arm must deliver a forward while the pump runs"
+        assert_eq!(
+            shard.metrics().frame_drop_count(
+                shard::metrics::frame_drop_variant::FORWARD_CLIENT_SEND,
+                shard::metrics::frame_drop_reason::DELIVERY_FAILED
+            ),
+            1
         );
-        let replies = bus.client_replies.borrow();
-        assert_eq!(replies[0].0, TRANSPORT, "forward must reach its client");
+        assert!(
+            bus.client_replies.borrow().is_empty(),
+            "a forward without its owner is refused"
+        );
     }
 
-    /// The shutdown path must ALSO deliver reply-lane frames: a forward
-    /// already accepted by the lane when the stop signal wins the biased
-    /// select would otherwise be silently destroyed at teardown.
     #[compio::test]
-    async fn pump_shutdown_drain_delivers_reply_lane_forwards() {
+    async fn pump_shutdown_drain_processes_reply_lane_forwards() {
         const TRANSPORT: u128 = 93;
         let (bus, lane_sender, shard) = reply_lane_test_shard("reply-lane-drain-test");
-
         lane_sender
             .reply_sender()
             .try_send(reply_lane_forward(TRANSPORT))
-            .expect("reply lane has capacity");
-
-        // Pre-armed stop: the pump exits through the biased stop arm and the
-        // post-loop drain must still deliver the reply-lane frame.
+            .unwrap();
+        // A pre-armed stop makes the shutdown drain own the queued reply frame.
         let (stop_tx, stop_rx) = shard::channel::<()>(1);
-        stop_tx.try_send(()).expect("stop channel has capacity");
+        stop_tx.try_send(()).unwrap();
         shard
             .run_message_pump(stop_rx, Arc::new(AtomicBool::new(false)))
             .await;
-
-        let replies = bus.client_replies.borrow();
         assert_eq!(
-            replies.len(),
-            1,
-            "the pump's reply-lane drain must deliver the forwarded reply"
+            shard.metrics().frame_drop_count(
+                shard::metrics::frame_drop_variant::FORWARD_CLIENT_SEND,
+                shard::metrics::frame_drop_reason::DELIVERY_FAILED
+            ),
+            1
         );
-        assert_eq!(
-            replies[0].0, TRANSPORT,
-            "the forward must reach the client it was addressed to"
+        assert!(
+            bus.client_replies.borrow().is_empty(),
+            "a forward without its owner is refused"
         );
     }
 
@@ -2315,14 +2686,13 @@ mod tests {
             "a noop host answers metadata-submit by dropping the reply sender"
         );
 
-        // Sent only now, so its delivery proves the pump outlived both
-        // host-bound frames rather than being served between them.
+        // Its processing proves the pump outlived both host-bound frames.
         lane_sender
             .reply_sender()
             .try_send(reply_lane_forward(TRANSPORT))
             .expect("reply lane has capacity");
         compio::time::timeout(BUDGET, async {
-            while bus.client_replies.borrow().is_empty() {
+            while shard.metrics().frame_drops_value() == 0 {
                 compio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
         })
@@ -2331,8 +2701,14 @@ mod tests {
         stop_tx.try_send(()).expect("stop channel has capacity");
         let _ = pump.await;
 
-        let replies = bus.client_replies.borrow();
-        assert_eq!(replies[0].0, TRANSPORT, "forward must reach its client");
+        assert_eq!(
+            shard.metrics().frame_drop_count(
+                shard::metrics::frame_drop_variant::FORWARD_CLIENT_SEND,
+                shard::metrics::frame_drop_reason::DELIVERY_FAILED
+            ),
+            1
+        );
+        assert!(bus.client_replies.borrow().is_empty());
     }
 
     /// The `GET_CLUSTER_METADATA` auth gate holds on every roster shape: it
@@ -2415,8 +2791,9 @@ mod tests {
                 &shard,
                 &sessions,
                 &server_config,
+                &ClientRequestQueues::default(),
                 &Rc::new(ClientDrain::new(&server_config)),
-                TRANSPORT,
+                ClientOrigin::capture(&shard.bus, TRANSPORT),
                 metadata_read(),
                 None,
             )
@@ -2477,7 +2854,10 @@ mod tests {
         message
     }
 
-    fn non_replicated_request(client: u128, nr_code: u32) -> Message<GenericHeader> {
+    pub(in crate::dispatch) fn non_replicated_request(
+        client: u128,
+        nr_code: u32,
+    ) -> Message<GenericHeader> {
         let mut message = wire_request(Operation::NonReplicated, client, 0, 0, &[]);
         {
             let header_size = size_of::<RequestHeader>();
@@ -2566,6 +2946,12 @@ mod tests {
             (
                 "cluster metadata is not pre-auth",
                 nr(GET_CLUSTER_METADATA_CODE),
+                false,
+                RequestClass::UnauthenticatedRead,
+            ),
+            (
+                "a deferred-request cancel is not pre-auth",
+                nr(CANCEL_DEFERRED_REQUEST_CODE),
                 false,
                 RequestClass::UnauthenticatedRead,
             ),
@@ -2676,8 +3062,9 @@ mod tests {
                 &shard,
                 &sessions,
                 &server_config,
+                &ClientRequestQueues::default(),
                 &Rc::new(ClientDrain::new(&server_config)),
-                TRANSPORT,
+                ClientOrigin::capture(&shard.bus, TRANSPORT),
                 non_replicated_request(TRANSPORT, code),
                 None,
             )
@@ -2717,8 +3104,9 @@ mod tests {
             &shard,
             &sessions,
             &server_config,
+            &ClientRequestQueues::default(),
             &Rc::new(ClientDrain::new(&server_config)),
-            TRANSPORT,
+            ClientOrigin::capture(&shard.bus, TRANSPORT),
             wire_request(Operation::CreateStream, TRANSPORT, 1, 1, &[]).into_generic(),
             None,
         )
@@ -2753,8 +3141,9 @@ mod tests {
             &shard,
             &sessions,
             &server_config,
+            &ClientRequestQueues::default(),
             &Rc::new(ClientDrain::new(&server_config)),
-            TRANSPORT,
+            ClientOrigin::capture(&shard.bus, TRANSPORT),
             non_replicated_request(TRANSPORT, PING_CODE),
             None,
         )
@@ -2769,54 +3158,6 @@ mod tests {
             "pre-auth ping must get a Reply, not an eviction"
         );
         assert_eq!(reply_status(frame), 0, "pre-auth ping must succeed");
-    }
-
-    /// The request-checksum gate runs before every probe: a replicated op
-    /// from an UNBOUND transport with a bad stamp must get the checksum deny
-    /// Reply, not the `Eviction(NoSession)` the session gate would send.
-    #[compio::test]
-    async fn checksum_mismatch_denies_before_everything() {
-        const TRANSPORT: u128 = 97;
-        const BODY: &[u8] = b"stream-body";
-        let bus = SpyBus::default();
-        let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
-        let sessions = Rc::new(RefCell::new(SessionManager::new()));
-        let server_config = Arc::new(ServerConfig::default());
-
-        let mut message = wire_request(Operation::CreateStream, TRANSPORT, 1, 1, BODY);
-        {
-            let header_size = size_of::<RequestHeader>();
-            let header = bytemuck::checked::from_bytes_mut::<RequestHeader>(
-                &mut message.as_mut_slice()[..header_size],
-            );
-            // Nonzero (zero means unstamped and skips the check) and never
-            // the body's real checksum.
-            header.request_checksum = u128::from(iggy_common::calculate_checksum(BODY)) + 1;
-        }
-        handle_client_request(
-            &shard,
-            &sessions,
-            &server_config,
-            &Rc::new(ClientDrain::new(&server_config)),
-            TRANSPORT,
-            message.into_generic(),
-            None,
-        )
-        .await;
-        let replies = bus.client_replies.borrow();
-        assert_eq!(replies.len(), 1, "bad stamp must be answered");
-        let (client, frame) = &replies[0];
-        assert_eq!(*client, TRANSPORT);
-        assert_eq!(
-            frame_command(frame),
-            Command::Reply as u8,
-            "a bad stamp must get the checksum deny, not the NoSession eviction"
-        );
-        assert_eq!(
-            reply_status(frame),
-            IggyError::InvalidFormat.as_code(),
-            "the deny status must carry the checksum error"
-        );
     }
 
     /// The late-bound self-reference as the shard build creates it: unset
@@ -2928,6 +3269,79 @@ mod tests {
         }
     }
 
+    #[compio::test]
+    async fn given_a_lockstep_read_when_drained_should_finish_without_a_child_task() {
+        const READ_REQUEST: u64 = 1;
+        let config = Arc::new(ServerConfig::default());
+        let (bus, shard, host) = root_host(ServerConfig::default());
+        bind_root_session(&shard, host.sessions()).await;
+        let queued = QueuedClientRequest::new(
+            ClientOrigin::capture(&bus, ROOT_TRANSPORT),
+            held_get_me(READ_REQUEST, 0),
+        );
+        let queues = Rc::new(RefCell::new(AHashMap::from_iter([(
+            ROOT_TRANSPORT,
+            ClientRequestQueue::from_iter([queued]),
+        )])));
+        let drain = Rc::new(ClientDrain::new(&config));
+        let spawned_before = bus.spawned.get();
+        drain_client_requests(
+            shard,
+            Rc::clone(host.sessions()),
+            config,
+            queues,
+            &drain,
+            ROOT_TRANSPORT,
+        )
+        .await;
+        assert_eq!(bus.spawned.get() - spawned_before, 0);
+        let replies = bus.client_replies.borrow();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(reply_request(&replies[0].1), READ_REQUEST);
+        assert_eq!(reply_status(&replies[0].1), 0);
+    }
+
+    #[compio::test]
+    async fn given_no_queued_frame_when_another_request_ends_should_keep_the_read_inline() {
+        const READ_REQUEST: u64 = 1;
+        let config = Arc::new(ServerConfig::default());
+        let (bus, shard, host) = root_host(ServerConfig::default());
+        bind_root_session(&shard, host.sessions()).await;
+        let queued = QueuedClientRequest::new(
+            ClientOrigin::capture(&bus, ROOT_TRANSPORT),
+            held_get_me(READ_REQUEST, UNAPPLIED_OP),
+        );
+        let queues = Rc::new(RefCell::new(AHashMap::from_iter([(
+            ROOT_TRANSPORT,
+            ClientRequestQueue::from_iter([queued]),
+        )])));
+        let drain = Rc::new(ClientDrain::new(&config));
+        let unrelated = drain.admit(Admission::Cap).await;
+        let spawned_before = bus.spawned.get();
+        let running = drain_client_requests(
+            Rc::clone(&shard),
+            Rc::clone(host.sessions()),
+            config,
+            queues,
+            &drain,
+            ROOT_TRANSPORT,
+        );
+        futures::pin_mut!(running);
+        assert!(futures::poll!(running.as_mut()).is_pending());
+        drop(unrelated);
+        assert!(futures::poll!(running.as_mut()).is_pending());
+        assert_eq!(bus.spawned.get() - spawned_before, 0);
+        assert!(bus.client_replies.borrow().is_empty());
+        shard
+            .plane
+            .metadata()
+            .applied_frontier()
+            .advance(UNAPPLIED_OP);
+        running.await;
+        assert_eq!(bus.spawned.get() - spawned_before, 0);
+        assert_eq!(bus.client_replies.borrow().len(), 1);
+    }
+
     /// A read held for the metadata frontier runs in its own task, so a `PING`
     /// behind it on the same connection gets its reply first.
     #[compio::test]
@@ -2965,8 +3379,19 @@ mod tests {
 
     #[compio::test]
     async fn given_a_held_partition_poll_when_ping_follows_should_answer_ping_before_owner_reply() {
+        assert_held_poll_promotes(WirePollingStrategy::offset(0), false).await;
+    }
+
+    #[compio::test]
+    async fn given_a_promoted_next_poll_when_store_queues_should_keep_its_progress_guard() {
+        assert_held_poll_promotes(WirePollingStrategy::next(), true).await;
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn assert_held_poll_promotes(strategy: WirePollingStrategy, store_follows: bool) {
         const POLL_REQUEST: u64 = 1;
         const PING_REQUEST: u64 = 2;
+        const STORE_REQUEST: u64 = 3;
         let bus = SpyBus::default();
         let mut shard = test_shard(&bus, 0, 1, FIRST_BOOT);
         let (sender, owner_inbox, _owner_replies) = shard_channel(0, 1, 1);
@@ -2985,7 +3410,7 @@ mod tests {
             stream_id: WireIdentifier::numeric(0),
             topic_id: WireIdentifier::numeric(0),
             partition_id: Some(0),
-            strategy: WirePollingStrategy::offset(0),
+            strategy,
             count: 1,
             auto_commit: false,
         }
@@ -3008,6 +3433,7 @@ mod tests {
             .streams()
             .created_revision_for_namespace(namespace)
             .unwrap();
+        let spawned_before = bus.spawned.get();
         host.on_client_request(ROOT_TRANSPORT, poll.into_generic());
         settle().await;
         let ShardFrame::Lifecycle(LifecycleFrame::PartitionRead {
@@ -3021,6 +3447,41 @@ mod tests {
             panic!("the owner must receive a primary-gated poll");
         };
         assert!(bus.client_replies.borrow().is_empty());
+        assert_eq!(
+            bus.spawned.get() - spawned_before,
+            1,
+            "only the connection drain is spawned"
+        );
+
+        if store_follows {
+            let body = StoreConsumerOffsetRequest {
+                consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                partition_id: Some(0),
+                offset: 7,
+                ack: AckLevel::Quorum,
+            }
+            .to_bytes();
+            let mut store = wire_request(
+                Operation::StoreConsumerOffset,
+                ROOT_CLIENT,
+                ROOT_SESSION,
+                STORE_REQUEST,
+                &body,
+            );
+            bytemuck::checked::from_bytes_mut::<RequestHeader>(
+                &mut store.as_mut_slice()[..size_of::<RequestHeader>()],
+            )
+            .partition_incarnation = shard
+                .plane
+                .metadata()
+                .mux_stm
+                .streams()
+                .created_revision_for_namespace(namespace)
+                .unwrap();
+            host.on_client_request(ROOT_TRANSPORT, store.into_generic());
+        }
 
         host.on_client_request(
             ROOT_TRANSPORT,
@@ -3032,15 +3493,277 @@ mod tests {
             assert_eq!(replies.len(), 1, "PING must not wait for partition I/O");
             assert_eq!(reply_request(&replies[0].1), PING_REQUEST);
         }
+        assert_eq!(
+            bus.spawned.get() - spawned_before,
+            2,
+            "the held read is promoted once"
+        );
+        assert!(
+            owner_inbox.try_recv().is_err(),
+            "promotion must reuse the same read"
+        );
         reply
             .try_send(PartitionReadReply::Rejected(
                 IggyError::TransientNotAccepted,
             ))
             .unwrap();
         await_replies(&bus, 2).await;
+        if store_follows {
+            settle().await;
+            if let Ok(frame) = owner_inbox.try_recv() {
+                let ShardFrame::Lifecycle(LifecycleFrame::PartitionSubmit { reply, .. }) = frame
+                else {
+                    panic!("only the queued store may reach the owner after the poll replies");
+                };
+                drop(reply);
+            }
+            await_replies(&bus, 3).await;
+        }
         let replies = bus.client_replies.borrow();
-        assert_eq!(replies.len(), 2);
+        assert_eq!(replies.len(), if store_follows { 3 } else { 2 });
         assert_eq!(reply_request(&replies[1].1), POLL_REQUEST);
+        if store_follows {
+            assert_eq!(reply_request(&replies[2].1), STORE_REQUEST);
+        }
+    }
+
+    #[compio::test]
+    async fn given_a_deferred_poll_when_resolving_progress_should_take_the_lane_of_its_plain_poll()
+    {
+        let (_bus, shard, _host) = root_host(ServerConfig::default());
+        create_one_partition(&shard);
+        let key = |code: u32, body: &[u8]| {
+            let mut message =
+                wire_request(Operation::NonReplicated, ROOT_CLIENT, ROOT_SESSION, 1, body);
+            bytemuck::checked::from_bytes_mut::<RequestHeader>(
+                &mut message.as_mut_slice()[..size_of::<RequestHeader>()],
+            )
+            .reserved[..4]
+                .copy_from_slice(&code.to_le_bytes());
+            progress_key(&shard, &message.into_generic())
+        };
+        for (strategy, auto_commit, takes_lane) in [
+            (WirePollingStrategy::next(), false, true),
+            (WirePollingStrategy::offset(0), true, true),
+            (WirePollingStrategy::offset(0), false, false),
+        ] {
+            let poll = PollMessagesRequest {
+                consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                partition_id: Some(0),
+                strategy,
+                count: 1,
+                auto_commit,
+            };
+            let plain = key(POLL_MESSAGES_CODE, &poll.to_bytes());
+            assert_eq!(plain.is_some(), takes_lane);
+            let deferred = DeferredPollMessagesRequest {
+                poll,
+                wait_us: 1,
+                min_count: 1,
+                max_bytes: u32::try_from(MIN_DEFERRED_POLL_MAX_BYTES).unwrap(),
+                request_timeout_us: 1 + MIN_DEFERRED_POLL_REPLY_MARGIN_US,
+            };
+            assert_eq!(
+                key(POLL_MESSAGES_DEFERRED_CODE, &deferred.to_bytes()),
+                plain
+            );
+        }
+    }
+
+    #[compio::test]
+    async fn given_a_full_cap_when_a_deferred_poll_queues_should_keep_it_where_a_cancel_finds_it() {
+        let (bus, shard, host) = root_host(ServerConfig::default());
+        create_one_partition(&shard);
+        bind_root_session(&shard, host.sessions()).await;
+        let mut config = ServerConfig::default();
+        config.message_bus.client_queue_capacity = 1;
+        let config = Arc::new(config);
+        let drain = Rc::new(ClientDrain::new(&config));
+        let held = drain.admit(Admission::Cap).await;
+        let message = root_deferred_poll(1, false);
+        let mut queue = ClientRequestQueue::default();
+        queue.push_back(QueuedClientRequest::new(
+            ClientOrigin::capture(&bus, ROOT_TRANSPORT),
+            message.into_generic(),
+        ));
+        let queues = Rc::new(RefCell::new(AHashMap::from_iter([(ROOT_TRANSPORT, queue)])));
+        let queued = || {
+            queues
+                .borrow()
+                .get(&ROOT_TRANSPORT)
+                .map_or(0, |queue| queue.requests.len())
+        };
+        let running = drain_client_requests(
+            Rc::clone(&shard),
+            Rc::clone(host.sessions()),
+            config,
+            Rc::clone(&queues),
+            &drain,
+            ROOT_TRANSPORT,
+        );
+        futures::pin_mut!(running);
+        assert!(futures::poll!(running.as_mut()).is_pending());
+        assert_eq!(queued(), 1, "at the cap the deferred poll stays queued");
+
+        drop(held);
+        let _ = futures::poll!(running.as_mut());
+        assert_eq!(queued(), 0, "room under the cap admits it");
+    }
+
+    #[compio::test]
+    async fn given_a_queued_deferred_poll_when_its_cancel_arrives_should_drop_it_before_admission()
+    {
+        assert_cancel_of_queued_deferred_poll(true).await;
+    }
+
+    #[compio::test]
+    async fn given_a_queued_deferred_poll_when_a_cancel_names_another_request_should_still_admit_it()
+     {
+        assert_cancel_of_queued_deferred_poll(false).await;
+    }
+
+    /// Queues an auto-commit deferred poll behind a drain whose only place
+    /// under the cap is taken, then sends a cancellation the way the transport
+    /// does. A poll admitted after its own cancellation would park and commit
+    /// with nothing left to abort it, so only that cancellation may keep it
+    /// from its owner.
+    async fn assert_cancel_of_queued_deferred_poll(cancel_names_the_poll: bool) {
+        const POLL_REQUEST: u64 = 3;
+        let cancelled = if cancel_names_the_poll {
+            POLL_REQUEST
+        } else {
+            POLL_REQUEST + 1
+        };
+        let bus = SpyBus::default();
+        let mut shard = test_shard(&bus, 0, 1, FIRST_BOOT);
+        let (sender, owner_inbox, _owner_replies) = shard_channel(0, 1, 1);
+        shard.attach_senders(vec![sender]);
+        let shard = Rc::new(shard);
+        let namespace = create_one_partition(&shard);
+        shard
+            .shards_table()
+            .insert(namespace, PartitionLocation::new(ShardId::new(0), 0));
+        commit_root_session(&shard);
+        let shard_handle = Rc::new(RefCell::new(Some(Rc::downgrade(&shard))));
+        let sessions = Rc::new(RefCell::new(SessionManager::new()));
+        bind_root_session(&shard, &sessions).await;
+        let mut server_config = ServerConfig::default();
+        server_config.message_bus.client_queue_capacity = 1;
+        let server_config = Arc::new(server_config);
+        let queues: ClientRequestQueues = Rc::default();
+        let active: ActiveClientRequests = Rc::default();
+        let enqueue = |message| {
+            enqueue_client_request(
+                &bus,
+                &shard_handle,
+                &sessions,
+                &server_config,
+                &queues,
+                &active,
+                ROOT_TRANSPORT,
+                message,
+            );
+        };
+        let poll_queued = || {
+            queues.borrow().get(&ROOT_TRANSPORT).is_some_and(|queue| {
+                queue.requests.iter().any(|queued| {
+                    queued
+                        .message
+                        .try_as_typed::<RequestHeader>()
+                        .is_ok_and(|request| request.header().request == POLL_REQUEST)
+                })
+            })
+        };
+
+        // The first read takes the only place under the cap and the second
+        // holds the drain, so the poll behind them stays queued.
+        enqueue(held_get_me(1, UNAPPLIED_OP));
+        enqueue(held_get_me(2, UNAPPLIED_OP));
+        settle().await;
+        let mut poll = root_deferred_poll(POLL_REQUEST, true);
+        bytemuck::checked::from_bytes_mut::<RequestHeader>(
+            &mut poll.as_mut_slice()[..size_of::<RequestHeader>()],
+        )
+        .partition_incarnation = shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .created_revision_for_namespace(namespace)
+            .unwrap();
+        enqueue(poll.into_generic());
+        assert!(poll_queued(), "the full cap keeps the poll queued");
+
+        enqueue(root_read(CANCEL_DEFERRED_REQUEST_CODE, cancelled).into_generic());
+        assert_eq!(
+            poll_queued(),
+            !cancel_names_the_poll,
+            "a cancellation removes only the queued poll that it names"
+        );
+
+        shard
+            .plane
+            .metadata()
+            .applied_frontier()
+            .advance(UNAPPLIED_OP);
+        await_replies(&bus, 2).await;
+        settle().await;
+        let reached_owner = std::iter::from_fn(|| owner_inbox.try_recv().ok()).any(|frame| {
+            matches!(
+                frame,
+                ShardFrame::Lifecycle(LifecycleFrame::PartitionRead {
+                    read: PartitionRead::DeferredPoll(_),
+                    ..
+                })
+            )
+        });
+        assert_eq!(
+            reached_owner, !cancel_names_the_poll,
+            "only a poll that was not cancelled reaches its owner"
+        );
+        let mut replies: Vec<u64> = bus
+            .client_replies
+            .borrow()
+            .iter()
+            .map(|(_, frame)| reply_request(frame))
+            .collect();
+        replies.sort_unstable();
+        assert_eq!(replies, [1, 2], "a cancellation gets no reply of its own");
+    }
+
+    /// A deferred poll of partition 0 by the root session, sent as `request`.
+    fn root_deferred_poll(request: u64, auto_commit: bool) -> Message<RequestHeader> {
+        let poll = DeferredPollMessagesRequest {
+            poll: PollMessagesRequest {
+                consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                partition_id: Some(0),
+                strategy: WirePollingStrategy::offset(0),
+                count: 1,
+                auto_commit,
+            },
+            wait_us: 1,
+            min_count: 1,
+            max_bytes: u32::try_from(MIN_DEFERRED_POLL_MAX_BYTES).unwrap(),
+            request_timeout_us: 1 + MIN_DEFERRED_POLL_REPLY_MARGIN_US,
+        }
+        .to_bytes();
+        let mut message = wire_request(
+            Operation::NonReplicated,
+            ROOT_CLIENT,
+            ROOT_SESSION,
+            request,
+            &poll,
+        );
+        bytemuck::checked::from_bytes_mut::<RequestHeader>(
+            &mut message.as_mut_slice()[..size_of::<RequestHeader>()],
+        )
+        .reserved[..4]
+            .copy_from_slice(&POLL_MESSAGES_DEFERRED_CODE.to_le_bytes());
+        message
     }
 
     #[compio::test]
@@ -3090,7 +3813,7 @@ mod tests {
             partition_id: Some(0),
         }
         .to_bytes();
-        let mut reads = VecDeque::new();
+        let mut reads = ClientRequestQueue::default();
         for (request, code, body) in [
             (NEXT_REQUEST, POLL_MESSAGES_CODE, poll),
             (OFFSET_REQUEST, GET_CONSUMER_OFFSET_CODE, offset),
@@ -3107,7 +3830,10 @@ mod tests {
             )
             .reserved[..4]
                 .copy_from_slice(&code.to_le_bytes());
-            reads.push_back(QueuedClientRequest::from(message.into_generic()));
+            reads.push_back(QueuedClientRequest::new(
+                ClientOrigin::capture(&bus, ROOT_TRANSPORT),
+                message.into_generic(),
+            ));
         }
         let queues = Rc::new(RefCell::new(AHashMap::from_iter([(ROOT_TRANSPORT, reads)])));
         let running = drain_client_requests(
@@ -3125,18 +3851,14 @@ mod tests {
             queues
                 .borrow()
                 .get(&ROOT_TRANSPORT)
-                .map_or(0, VecDeque::len),
+                .map_or(0, |queue| queue.requests.len()),
             2,
             "Next without auto-commit and GetConsumerOffset must both stay queued"
         );
         assert!(bus.client_replies.borrow().is_empty());
 
         drop(held);
-        assert!(futures::poll!(running.as_mut()).is_pending());
-        await_replies(&bus, 1).await;
-        while futures::poll!(running.as_mut()).is_pending() {
-            settle().await;
-        }
+        running.await;
         await_replies(&bus, 2).await;
         let replies = bus.client_replies.borrow();
         assert_eq!(
@@ -3161,7 +3883,8 @@ mod tests {
             ack: AckLevel::Quorum,
         }
         .to_bytes();
-        let mut queued = QueuedClientRequest::from(
+        let mut queued = QueuedClientRequest::new(
+            ClientOrigin::capture(&shard.bus, ROOT_TRANSPORT),
             wire_request(
                 Operation::StoreConsumerOffset,
                 ROOT_CLIENT,
@@ -3218,12 +3941,14 @@ mod tests {
         let metadata = drain.admit(Admission::MetadataLane).await;
         let queues = Rc::new(RefCell::new(AHashMap::from_iter([(
             ROOT_TRANSPORT,
-            VecDeque::from(
+            ClientRequestQueue::from_iter(
                 [
                     held_get_me(READ_REQUEST, 0),
                     root_read(PING_CODE, PING_REQUEST).into_generic(),
                 ]
-                .map(QueuedClientRequest::from),
+                .map(|message| {
+                    QueuedClientRequest::new(ClientOrigin::capture(&bus, ROOT_TRANSPORT), message)
+                }),
             ),
         )])));
         let draining = drain_client_requests(
@@ -3270,7 +3995,7 @@ mod tests {
             };
             let queues = Rc::new(RefCell::new(AHashMap::from_iter([(
                 ROOT_TRANSPORT,
-                VecDeque::from(
+                ClientRequestQueue::from_iter(
                     [
                         wire_request(
                             Operation::StoreConsumerOffset,
@@ -3284,7 +4009,12 @@ mod tests {
                         held_get_me(READ, 0),
                         root_read(PING_CODE, PING).into_generic(),
                     ]
-                    .map(QueuedClientRequest::from),
+                    .map(|message| {
+                        QueuedClientRequest::new(
+                            ClientOrigin::capture(&SpyBus::default(), ROOT_TRANSPORT),
+                            message,
+                        )
+                    }),
                 ),
             )])));
             let ready = |queued: &mut QueuedClientRequest| {
@@ -3428,6 +4158,79 @@ mod tests {
             [1, 2],
             "both reads run, and the dropped ping does not"
         );
+    }
+
+    /// Frames that would take a connection's queue past its byte budget get
+    /// the retryable deny at once, like frames past the frame cap. The frames
+    /// already queued are still served in order.
+    #[compio::test]
+    async fn given_a_queue_at_its_byte_budget_when_another_frame_arrives_should_deny_it_retryable()
+    {
+        const OVER_BUDGET: u64 = 5;
+        let ping_bytes = root_read(PING_CODE, OVER_BUDGET).as_slice().len() as u64;
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
+        commit_root_session(&shard);
+        let shard_handle = unset_shard_handle();
+        *shard_handle.borrow_mut() = Some(Rc::downgrade(&shard));
+        let sessions = Rc::new(RefCell::new(SessionManager::new()));
+        bind_root_session(&shard, &sessions).await;
+        let mut server_config = ServerConfig::default();
+        server_config.message_bus.client_queue_capacity = 1;
+        server_config.message_bus.client_request_queue_bytes_max =
+            IggyByteSize::from(2 * ping_bytes);
+        let server_config = Arc::new(server_config);
+        let queues: ClientRequestQueues = Rc::default();
+        let active: ActiveClientRequests = Rc::default();
+        let enqueue = |message| {
+            enqueue_client_request(
+                &bus,
+                &shard_handle,
+                &sessions,
+                &server_config,
+                &queues,
+                &active,
+                ROOT_TRANSPORT,
+                message,
+            );
+        };
+
+        // The first read takes the only place under the cap and the second
+        // holds the drain, so the pings behind them stay queued.
+        enqueue(held_get_me(1, UNAPPLIED_OP));
+        enqueue(held_get_me(2, UNAPPLIED_OP));
+        settle().await;
+        for request in 3..=OVER_BUDGET {
+            enqueue(root_read(PING_CODE, request).into_generic());
+        }
+        await_replies(&bus, 1).await;
+        {
+            let replies = bus.client_replies.borrow();
+            assert_eq!(
+                replies.len(),
+                1,
+                "only the frame past the budget is answered"
+            );
+            assert_eq!(reply_request(&replies[0].1), OVER_BUDGET);
+            assert_eq!(
+                reply_status(&replies[0].1),
+                IggyError::TransientNotAccepted.as_code()
+            );
+        }
+
+        shard
+            .plane
+            .metadata()
+            .applied_frontier()
+            .advance(UNAPPLIED_OP);
+        await_replies(&bus, 5).await;
+        let replies = bus.client_replies.borrow();
+        let served: Vec<u64> = replies[1..]
+            .iter()
+            .filter(|(_, frame)| reply_status(frame) == 0)
+            .map(|(_, frame)| reply_request(frame))
+            .collect();
+        assert_eq!(served, [1, 2, 3, 4]);
     }
 
     /// `BIND_SESSION` runs on the drain, so the replicated frame behind it is
@@ -3589,7 +4392,8 @@ mod tests {
             true,
             |_| {},
             prepare,
-        );
+        )
+        .reply;
         assert_eq!(iggy_binary_protocol::result_code(created.body()), Some(0));
         let create = |request, name| {
             let body = WireCreatePersonalAccessTokenRequest {
@@ -3642,6 +4446,70 @@ mod tests {
         );
     }
 
+    /// After a transient, the HTTP write path resends the PAT create it
+    /// minted, hash included. When the first copy committed, the resend must
+    /// get the cached success, so the handler returns the token it holds.
+    #[compio::test]
+    async fn given_committed_http_pat_create_when_resent_should_serve_the_held_token() {
+        const REQUEST: u64 = 1;
+        let (_bus, shard, _host) = root_host(ServerConfig::default());
+        let body = WireCreatePersonalAccessTokenRequest {
+            name: WireName::new("token").unwrap(),
+            expiry: 0,
+        }
+        .to_bytes();
+        let request = request_message(
+            Operation::CreatePersonalAccessToken,
+            ROOT_CLIENT,
+            ROOT_SESSION,
+            REQUEST,
+            &body,
+        );
+        let (minted, raw_token) =
+            crate::rewrite::http_chain(&shard, DEFAULT_ROOT_USER_ID, request).unwrap();
+        let raw_token = raw_token.expect("the HTTP rewrite mints the token");
+        // The first copy commits, but its answer never reaches the handler.
+        let metadata = shard.plane.metadata();
+        let prepare = prepare_message(
+            Operation::CreatePersonalAccessToken,
+            ROOT_CLIENT,
+            REQUEST,
+            minted.body(),
+        )
+        .transmute_header(|old, header: &mut PrepareHeader| {
+            *header = old;
+            header.op = UNAPPLIED_OP;
+        });
+        let created = metadata::apply_committed_prepare(
+            &*metadata.mux_stm,
+            &metadata.client_table,
+            true,
+            |_| {},
+            prepare,
+        )
+        .reply;
+        assert_eq!(iggy_binary_protocol::result_code(created.body()), Some(0));
+
+        let resent = submit_client_request_on_owner(&shard, minted)
+            .await
+            .expect("the resend must be answered");
+        let (header, result) = resent.as_slice().split_at(size_of::<ReplyHeader>());
+        let header = bytemuck::checked::try_pod_read_unaligned::<ReplyHeader>(header).unwrap();
+        assert!(header.has_committed_result());
+        assert_eq!(
+            iggy_binary_protocol::result_code(result),
+            Some(0),
+            "a resend of the committed frame must get its cached success"
+        );
+        assert_eq!(
+            session_ops::verify_pat_credentials(&shard, &raw_token)
+                .unwrap()
+                .0,
+            DEFAULT_ROOT_USER_ID,
+            "the token the handler holds must log in"
+        );
+    }
+
     /// The two frames differ only in the operation byte. A declared one gets
     /// the retryable deny, and an undeclared one gets `InvalidCommand`,
     /// because no retry of that frame can succeed.
@@ -3666,7 +4534,11 @@ mod tests {
             let mut frame = non_replicated_request(TRANSPORT, PING_CODE);
             frame.as_mut_slice()[offset_of!(RequestHeader, operation)] = operation;
 
-            deny_overflowing_client_request(&shard_handle, TRANSPORT, frame);
+            deny_overflowing_client_request(
+                &shard_handle,
+                ClientOrigin::capture(&shard.bus, TRANSPORT),
+                frame,
+            );
             for _ in 0..500 {
                 if !bus.client_replies.borrow().is_empty() {
                     break;
@@ -3709,50 +4581,17 @@ mod tests {
         owner: shard::TaggedSender,
         request: Message<RequestHeader>,
     ) {
-        const USER: u32 = 0;
-        let mut shard = test_shard(bus, 0, 1, FIRST_BOOT);
-        let (home, _, _) = shard_channel(1, 1, 1);
-        shard.id = 1;
-        shard.attach_senders(vec![owner, home]);
-        let attachment = {
-            let mut client_table = shard.plane.metadata().client_table.borrow_mut();
-            client_table
-                .commit_register(
-                    HOME_CLIENT,
-                    USER,
-                    [0x5a; 32],
-                    register_reply(HOME_CLIENT, HOME_SESSION),
-                )
-                .unwrap();
-            client_table
-                .attach_session(HOME_CLIENT, HOME_SESSION, USER)
-                .unwrap()
-        };
         let sessions = Rc::new(RefCell::new(SessionManager::new()));
-        sessions.borrow_mut().ensure_connection(
-            HOME_TRANSPORT,
-            "127.0.0.1:34567".parse().unwrap(),
-            ClientTransportKind::Tcp,
-        );
-        sessions
-            .borrow_mut()
-            .bind_authenticated_connection(
-                HOME_TRANSPORT,
-                HOME_CLIENT,
-                HOME_SESSION,
-                USER,
-                attachment,
-                HOME_SESSION,
-            )
-            .unwrap();
+        let shard = home_shard(bus, owner, &sessions);
         let server_config = Arc::new(ServerConfig::default());
 
         handle_client_request(
-            &Rc::new(shard),
+            &shard,
             &sessions,
             &server_config,
+            &ClientRequestQueues::default(),
             &Rc::new(ClientDrain::new(&server_config)),
-            HOME_TRANSPORT,
+            ClientOrigin::capture(&shard.bus, HOME_TRANSPORT),
             request.into_generic(),
             None,
         )
@@ -3789,6 +4628,409 @@ mod tests {
             IggyError::TransientNotCommitted.as_code(),
             "only a replay of the same request id is safe"
         );
+    }
+
+    /// Shard 1, relaying to shard 0 through `owner`, with `HOME_TRANSPORT`
+    /// bound in `sessions` to a session of `HOME_CLIENT`.
+    fn home_shard(
+        bus: &SpyBus,
+        owner: shard::TaggedSender,
+        sessions: &RefCell<SessionManager>,
+    ) -> Rc<TestShard> {
+        const USER: u32 = 0;
+        let mut shard = test_shard(bus, 0, 1, FIRST_BOOT);
+        let (home, _, _) = shard_channel(1, 1, 1);
+        shard.id = 1;
+        shard.attach_senders(vec![owner, home]);
+        let attachment = {
+            let mut client_table = shard.plane.metadata().client_table.borrow_mut();
+            client_table
+                .commit_register(
+                    HOME_CLIENT,
+                    USER,
+                    [0x5a; 32],
+                    register_reply(HOME_CLIENT, HOME_SESSION),
+                )
+                .unwrap();
+            client_table
+                .attach_session(HOME_CLIENT, HOME_SESSION, USER)
+                .unwrap()
+        };
+        sessions.borrow_mut().ensure_connection(
+            HOME_TRANSPORT,
+            "127.0.0.1:34567".parse().unwrap(),
+            ClientTransportKind::Tcp,
+            std::time::Instant::now(),
+        );
+        sessions
+            .borrow_mut()
+            .bind_authenticated_connection(
+                HOME_TRANSPORT,
+                HOME_CLIENT,
+                HOME_SESSION,
+                USER,
+                attachment,
+                HOME_SESSION,
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        Rc::new(shard)
+    }
+
+    /// A host over [`home_shard`], so requests arrive the way a connection
+    /// delivers its frames.
+    fn home_host(
+        bus: &SpyBus,
+        owner: shard::TaggedSender,
+    ) -> (
+        Rc<TestShard>,
+        ServerHost<SpyBus, PrepareJournal, IggySnapshot>,
+    ) {
+        let shard_handle = unset_shard_handle();
+        let host = ServerHost::new(bus, &shard_handle, Arc::new(ServerConfig::default()));
+        let shard = home_shard(bus, owner, host.sessions());
+        *shard_handle.borrow_mut() = Some(Rc::downgrade(&shard));
+        (shard, host)
+    }
+
+    /// Run spawned tasks until the home shard hands shard 0 a metadata
+    /// submit, and take it.
+    async fn forwarded_metadata_submit(owner_inbox: &Receiver<ShardFrame>) -> MetadataSubmit {
+        for _ in 0..500 {
+            if let Ok(frame) = owner_inbox.try_recv() {
+                let ShardFrame::Lifecycle(LifecycleFrame::MetadataSubmit(submit)) = frame else {
+                    panic!("the home shard must hand shard 0 a metadata submit");
+                };
+                return submit;
+            }
+            run_spawned_tasks().await;
+        }
+        panic!("the home shard must hand shard 0 a metadata submit");
+    }
+
+    fn assert_no_reply_to(bus: &SpyBus, client: u128) {
+        assert!(
+            bus.client_replies
+                .borrow()
+                .iter()
+                .all(|(target, _)| *target != client),
+            "a reply for a replaced connection must not reach the connection that took its id"
+        );
+    }
+
+    #[compio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn given_victim_transport_id_in_wire_header_when_signing_in_writing_and_out_should_only_change_caller()
+     {
+        const CALLER: u128 = 97;
+        const REGISTER_OP: u64 = 5;
+        const WRITE_OP: u64 = 6;
+        const PASSWORD: &str = "caller-password";
+        let bus = SpyBus::default();
+        let (owner, owner_inbox, _owner_replies) = shard_channel(0, 1, 1);
+        let (shard, host) = home_host(&bus, owner);
+        host.sessions().borrow_mut().ensure_connection(
+            CALLER,
+            "127.0.0.1:34568".parse().unwrap(),
+            ClientTransportKind::Tcp,
+            message_bus::MessageBus::monotonic_now(&bus),
+        );
+        let metadata = shard.plane.metadata();
+        metadata
+            .mux_stm
+            .users()
+            .ensure_root_user("iggy", &server_common::crypto::hash_password(PASSWORD));
+        let login = LoginRegisterRequest {
+            version_info: ClientVersionInfo {
+                protocol_version: IGGY_PROTOCOL_VERSION,
+                sdk_name: WireName::new("test-sdk").unwrap(),
+                sdk_version: WireName::new("1.0.0").unwrap(),
+            },
+            bind_secret: BindSecret::new(Box::new(ROOT_SECRET)),
+            username: WireName::new("iggy").unwrap(),
+            password: PASSWORD.into(),
+            client_context: None,
+        }
+        .to_bytes();
+        host.on_client_request(
+            CALLER,
+            wire_request(Operation::Register, HOME_TRANSPORT, 0, 0, &login).into_generic(),
+        );
+        let MetadataSubmit::Register {
+            vsr_client_id,
+            user_id,
+            registration,
+            reply,
+        } = forwarded_metadata_submit(&owner_inbox).await
+        else {
+            panic!("caller login must submit Register");
+        };
+        assert_eq!(vsr_client_id, HOME_TRANSPORT);
+        metadata
+            .client_table
+            .borrow_mut()
+            .commit_register(
+                vsr_client_id,
+                user_id,
+                registration.bind_verifier,
+                register_reply(vsr_client_id, REGISTER_OP),
+            )
+            .unwrap();
+        metadata.applied_frontier().advance(REGISTER_OP);
+        reply
+            .try_send(Ok(metadata::BoundSession {
+                epoch: REGISTER_OP,
+                watermark: 0,
+            }))
+            .unwrap();
+        let MetadataSubmit::BindSession {
+            vsr_client_id,
+            session,
+            secret,
+            reply,
+        } = forwarded_metadata_submit(&owner_inbox).await
+        else {
+            panic!("caller login must bind the committed session");
+        };
+        let binding = metadata
+            .client_table
+            .borrow_mut()
+            .bind_session(vsr_client_id, session, secret.expose_secret())
+            .unwrap();
+        reply.try_send(Ok(binding)).unwrap();
+        await_replies(&bus, 1).await;
+        assert_eq!(
+            host.sessions().borrow().get_session(CALLER),
+            Some((HOME_TRANSPORT, REGISTER_OP))
+        );
+        assert_eq!(
+            host.sessions().borrow().get_session(HOME_TRANSPORT),
+            Some((HOME_CLIENT, HOME_SESSION))
+        );
+        assert_eq!(
+            host.sessions()
+                .borrow_mut()
+                .touch_connection(
+                    HOME_TRANSPORT,
+                    false,
+                    message_bus::MessageBus::monotonic_now(&bus)
+                )
+                .unwrap()
+                .metadata_watermark,
+            HOME_SESSION
+        );
+
+        let body = CreateStreamRequest {
+            name: WireName::new("caller-stream").unwrap(),
+            options: WireOptions::empty(),
+        }
+        .to_bytes();
+        host.on_client_request(
+            CALLER,
+            wire_request(
+                Operation::CreateStream,
+                HOME_TRANSPORT,
+                HOME_SESSION,
+                1,
+                &body,
+            )
+            .into_generic(),
+        );
+        let MetadataSubmit::ClientRequest { request, reply } =
+            forwarded_metadata_submit(&owner_inbox).await
+        else {
+            panic!("caller write must reach the metadata owner");
+        };
+        let request = request.try_into_typed::<RoutedRequestHeader>().unwrap();
+        assert_eq!(request.header().session, REGISTER_OP);
+        let prepare = prepare_message(Operation::CreateStream, HOME_TRANSPORT, 1, &body)
+            .transmute_header(|mut header, prepare: &mut PrepareHeader| {
+                header.op = WRITE_OP;
+                header.session = REGISTER_OP;
+                *prepare = header;
+            });
+        let committed =
+            consensus::build_reply_message_with(prepare.header(), size_of::<u32>(), |body| {
+                body.copy_from_slice(&0_u32.to_le_bytes());
+            });
+        reply.try_send(Some(committed.into_generic())).unwrap();
+        await_replies(&bus, 2).await;
+        assert_eq!(
+            host.sessions()
+                .borrow_mut()
+                .touch_connection(CALLER, false, message_bus::MessageBus::monotonic_now(&bus))
+                .unwrap()
+                .metadata_watermark,
+            WRITE_OP
+        );
+        assert_eq!(
+            host.sessions()
+                .borrow_mut()
+                .touch_connection(
+                    HOME_TRANSPORT,
+                    false,
+                    message_bus::MessageBus::monotonic_now(&bus)
+                )
+                .unwrap()
+                .metadata_watermark,
+            HOME_SESSION
+        );
+
+        host.on_client_request(
+            CALLER,
+            wire_request(Operation::Logout, HOME_TRANSPORT, HOME_SESSION, 2, &[]).into_generic(),
+        );
+        let MetadataSubmit::Logout {
+            vsr_client_id,
+            session,
+            reply,
+            ..
+        } = forwarded_metadata_submit(&owner_inbox).await
+        else {
+            panic!("caller logout must reach the metadata owner");
+        };
+        assert_eq!((vsr_client_id, session), (HOME_TRANSPORT, REGISTER_OP));
+        reply.try_send(Ok(WRITE_OP + 1)).unwrap();
+        await_replies(&bus, 3).await;
+        assert_eq!(host.sessions().borrow().get_session(CALLER), None);
+        assert_eq!(
+            host.sessions().borrow().get_session(HOME_TRANSPORT),
+            Some((HOME_CLIENT, HOME_SESSION))
+        );
+        assert_eq!(
+            host.sessions()
+                .borrow_mut()
+                .touch_connection(
+                    HOME_TRANSPORT,
+                    false,
+                    message_bus::MessageBus::monotonic_now(&bus)
+                )
+                .unwrap()
+                .metadata_watermark,
+            HOME_SESSION
+        );
+        assert!(
+            bus.client_replies
+                .borrow()
+                .iter()
+                .all(|(client, _)| *client == CALLER)
+        );
+    }
+
+    /// A metadata write that waits for the metadata lane belongs to the
+    /// connection that sent it, so a connection that took the id during the
+    /// wait must not get its reply.
+    #[compio::test]
+    async fn given_a_metadata_write_waiting_for_the_lane_when_the_connection_is_replaced_should_not_answer_the_new_one()
+     {
+        let bus = SpyBus::default();
+        let (owner, owner_inbox, _owner_replies) = shard_channel(0, 1, 1);
+        let (_shard, host) = home_host(&bus, owner);
+        let body = DeleteUserRequest {
+            user_id: WireIdentifier::numeric(1),
+        }
+        .to_bytes();
+        for request in 1..=2 {
+            let write = wire_request(
+                Operation::DeleteUser,
+                HOME_CLIENT,
+                HOME_SESSION,
+                request,
+                &body,
+            );
+            host.on_client_request(HOME_TRANSPORT, write.into_generic());
+        }
+        let first = forwarded_metadata_submit(&owner_inbox).await;
+        bus.reconnect_client(HOME_TRANSPORT);
+        // No verdict: each write answers its own connection with a retryable deny.
+        drop(first);
+        let second = forwarded_metadata_submit(&owner_inbox).await;
+        drop(second);
+        settle().await;
+
+        assert_no_reply_to(&bus, HOME_TRANSPORT);
+    }
+
+    /// A login waits for shard 0 to commit its register. A connection that
+    /// took the id during that wait must not get the login's reply.
+    #[compio::test]
+    async fn given_a_login_waiting_on_shard_zero_when_the_connection_is_replaced_should_not_answer_the_new_one()
+     {
+        const LOGIN_TRANSPORT: u128 = 96;
+        const LOGIN_CLIENT: u128 = 0x77;
+        const USERNAME: &str = "login-user";
+        const PASSWORD: &str = "login-password";
+        let bus = SpyBus::default();
+        let (owner, owner_inbox, _owner_replies) = shard_channel(0, 1, 1);
+        let (shard, host) = home_host(&bus, owner);
+        let create = CreateUserRequest {
+            username: WireName::new(USERNAME).unwrap(),
+            password: server_common::crypto::hash_password(PASSWORD),
+            status: UserStatus::Active.as_code(),
+            permissions: None,
+            options: WireOptions::empty(),
+        };
+        let created = shard
+            .plane
+            .metadata()
+            .mux_stm
+            .update(prepare_message(
+                Operation::CreateUser,
+                0,
+                3,
+                &create.to_bytes(),
+            ))
+            .unwrap();
+        assert_eq!(created.code, 0);
+        let login = LoginRegisterRequest {
+            version_info: ClientVersionInfo {
+                protocol_version: IGGY_PROTOCOL_VERSION,
+                sdk_name: WireName::new("test-sdk").unwrap(),
+                sdk_version: WireName::new("1.0.0").unwrap(),
+            },
+            bind_secret: BindSecret::new(Box::new([0x5a; 32])),
+            username: WireName::new(USERNAME).unwrap(),
+            password: PASSWORD.into(),
+            client_context: None,
+        }
+        .to_bytes();
+        host.on_client_request(
+            LOGIN_TRANSPORT,
+            wire_request(Operation::Register, LOGIN_CLIENT, 0, 0, &login).into_generic(),
+        );
+        let MetadataSubmit::Register { reply, .. } = forwarded_metadata_submit(&owner_inbox).await
+        else {
+            panic!("a login on shard 1 must hand its register to shard 0");
+        };
+        bus.reconnect_client(LOGIN_TRANSPORT);
+        assert!(reply.try_send(Err(MetadataSubmitError::Canceled)).is_ok());
+        settle().await;
+
+        assert_no_reply_to(&bus, LOGIN_TRANSPORT);
+    }
+
+    /// A logout waits for shard 0 to commit it. A connection that took the
+    /// id during that wait must not get the logout's reply.
+    #[compio::test]
+    async fn given_a_logout_waiting_on_shard_zero_when_the_connection_is_replaced_should_not_answer_the_new_one()
+     {
+        const LOGOUT_COMMIT: u64 = 2;
+        let bus = SpyBus::default();
+        let (owner, owner_inbox, _owner_replies) = shard_channel(0, 1, 1);
+        let (_shard, host) = home_host(&bus, owner);
+        host.on_client_request(
+            HOME_TRANSPORT,
+            wire_request(Operation::Logout, HOME_CLIENT, HOME_SESSION, 1, &[]).into_generic(),
+        );
+        let MetadataSubmit::Logout { reply, .. } = forwarded_metadata_submit(&owner_inbox).await
+        else {
+            panic!("a logout on shard 1 must hand itself to shard 0");
+        };
+        bus.reconnect_client(HOME_TRANSPORT);
+        assert!(reply.try_send(Ok(LOGOUT_COMMIT)).is_ok());
+        settle().await;
+
+        assert_no_reply_to(&bus, HOME_TRANSPORT);
     }
 
     /// The group rewrite is the last step of the pre-consensus chain. A join
@@ -3835,7 +5077,10 @@ mod tests {
             .borrow_mut()
             .entry(CLIENT)
             .or_default()
-            .push_back(non_replicated_request(CLIENT, PING_CODE).into());
+            .push_back(QueuedClientRequest::new(
+                ClientOrigin::capture(&SpyBus::default(), CLIENT),
+                non_replicated_request(CLIENT, PING_CODE),
+            ));
 
         assert!(pop_next_client_request(&queues, CLIENT, |_| true).is_some());
         assert!(

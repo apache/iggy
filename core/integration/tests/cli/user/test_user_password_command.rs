@@ -22,6 +22,7 @@ use crate::cli::common::{
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::Client;
+use iggy::prelude::UserCreateOptions;
 use iggy::prelude::UserId;
 use iggy::prelude::UserStatus;
 use predicates::str::diff;
@@ -74,7 +75,13 @@ impl TestUserPasswordCmd {
 impl IggyCmdTestCase for TestUserPasswordCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
         let create_user = client
-            .create_user(&self.username, &self.password, UserStatus::Active, None)
+            .create_user(
+                &self.username,
+                &self.password,
+                UserStatus::Active,
+                None,
+                &UserCreateOptions::default(),
+            )
             .await;
         assert!(create_user.is_ok());
         let user = client

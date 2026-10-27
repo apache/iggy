@@ -149,7 +149,10 @@ async fn create_topic_assert_empty(client: &IggyClient, stream_name: &str, topic
 
 async fn create_stream_assert_empty(client: &IggyClient, stream_name: &str) {
     // 1. Create stream
-    client.create_stream(stream_name).await.unwrap();
+    client
+        .create_stream(stream_name, &StreamCreateOptions::default())
+        .await
+        .unwrap();
 
     // 2. Validate stream size and number of messages
     validate_stream(client, stream_name, 0, 0).await;

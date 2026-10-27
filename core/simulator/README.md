@@ -156,9 +156,9 @@ An invalid network configuration exits 2 before the simulator starts. Every othe
 | Network overrides | `--packet-loss-prob`, `--replay-prob`, `--one-way-delay-min`, `--one-way-delay-mean`, `--link-capacity`, `--partition-mode`, `--partition-symmetry`, `--partition-prob`, `--unpartition-prob`, `--partition-stability`, `--unpartition-stability`, `--clog-prob`, `--clog-duration-mean` |
 | Checkpointing | `--journal-slots`, `--data-dir`, `--reuse-data-dir` |
 | Quiesce | `--no-quiesce`, `--heal-before-quiesce` |
-| Gates | `--min-commits` (1), `--min-ops-compared` (1), `--require-entity-oracle`, `--require-faults` |
+| Gates | `--min-commits` (1), `--min-ops-compared` (1), `--min-data-records-compared` (1), `--require-entity-oracle`, `--require-faults` |
 
-`--plane` picks the op mix: `partition` (writes and consumer offsets), `metadata` (replicated metadata mutations), `mixed` (stream creates over a write-heavy base), `uniform` (every action equally likely, the widest per-tick coverage).
+`--plane` picks the op mix: `partition` (writes and consumer offsets), `metadata` (replicated metadata mutations), `mixed` (stream creates over a write-heavy base), `uniform` (every action equally likely, the widest per-tick coverage), `consumer` (writes and offset polls as consumers and as the fixture group while clients join and leave it; requires `--shell`).
 
 `--faults` picks a whole network profile and the individual network flags override single fields of it.
 Severity costs progress, every lost frame paying a resend timeout: on one namespace with one client, a 3-replica cluster drains roughly 440 replies in 5000 ticks on a perfect network, 240 under `light`, 40 under `heavy`.
@@ -166,6 +166,13 @@ Budget ticks accordingly instead of reading a low reply count as a stall.
 `--faults swarm` derives every network parameter from the seed, which is what a campaign wants: `none`, `light` and `heavy` are three fixed points, so a thousand seeds against `heavy` is the same network a thousand times.
 
 The gates exist because a run that commits nothing compares empty against empty and reports success. `--min-commits` and `--min-ops-compared` default to 1 for that reason; `--require-entity-oracle` additionally fails a run whose entity oracle was disarmed by an eviction and never re-armed.
+A prepare identity does not cover the message batch.
+The quiesce oracle therefore compares the applied batches of committed sends across replicas.
+It reports `data_namespaces_compared` and `data_records_compared`.
+`--min-data-records-compared` sets the minimum number of compared messages for a run that committed a send.
+A run that polls checks each served message against the committed log: when the reply arrives, a live replica of the same partition incarnation must have committed it, unless a replica crashed or restarted while the poll was in flight, and at quiesce every live replica that retains the offset must hold the same message. Lagging replicas may have shorter committed prefixes; reclaimed bytes and incarnations without live hosts are not fully compared.
+It reports `polls_compared`, `messages_compared_at_quiesce`, `messages_unverifiable_at_quiesce`, group polls and owner changes seen by group polls.
+`--min-polls-compared` (1) sets the minimum number of served polls compared on arrival.
 
 `--heal-before-quiesce` restarts every crashed replica and stops the network drawing faults before the drain. It is off by default: a drain that fails with a replica still down is how a wedge shows up, and healing first resolves the wedge instead of reporting it.
 
@@ -197,17 +204,20 @@ The suite lives at the end of `src/lib.rs`, with unit tests next to the modules 
 
 What the suite pins, by example: `workload_replay_is_deterministic` and `multi_shard_replay_is_deterministic` (the seed contract), `committed_metadata_agrees_across_replicas`, `given_advanced_view_when_metadata_replica_restarts_should_recover_view_from_superblock`, `given_superblock_write_fails_when_primary_crashes_should_withhold_votes_and_not_elect`, `checkpointing_cluster_serves_a_chunked_state_transfer`, `shell_detects_partition_borrow_held_across_await`.
 
+Shell simulations run the production heartbeat verifier on every shard and the production consumer-group liveness loop on shard 0, using the virtual monotonic clock. Crash stops those tasks; restart rebuilds them. Silent or disconnected clients lose their lease through the same ordered cleanup as the server.
+Each simulator owns a temporary system directory for liveness fences, retained across replica restarts and removed when the simulator drops. Checkpoint simulations reuse their configured directory without changing its lifetime.
+
 Constructors: `Simulator::new` (one shard per replica), `with_shards` (metadata on shard 0, partitions hash-assigned across all shards), `with_shards_shell` (the same plus the real dispatch handlers), `with_checkpoints`. Multi-shard and shell-on-multi-shard are library-only; `workload-fuzz` always builds one shard per replica.
 
 ## Not modelled
 
-- Client heartbeat verification and periodic consumer-group session expiry. Disconnect detaches a local binding and leaves the durable session live. The consumer-group tests invoke ordered cleanup explicitly; they do not cover the production timer or automatic liveness reporting.
 - Storage faults, beyond two knobs on the superblock. `SimSuperblock::set_fail_writes` and `set_yield_writes` inject a persistent write fault and an fsync-wide suspension point; `MemStorage` under the journal never fails and never tears a write. Partition superblocks are storeless, which leaves partition view recovery untested.
 - Segment files. Partition messages live in memory; they survive a restart only because the harness carries `RetainedPartitionState` across the rebuild.
 - Physical partition durability. The consensus model uses persisted topic policies and retains the partition journal, committed frontier and retry receipts together across restarts. Storage is ideal: it cannot lose a write or reorder persistence barriers. WAL/checkpoint fault tests and real-server crash tests must prove those physical properties separately.
 - Packet corruption. Packets are delayed, dropped, duplicated, partitioned and clogged, never mangled.
 - Multi-shard metadata. Shard 0 owns the only metadata consensus group.
-- I/O of any kind except the checkpoint files: no `io_uring`, no sockets, no wall clock.
+- Permanent partition failures and their durable retirement fences. Campaign fault modes do not inject these failures; the fence path requires the production compio runtime and is covered by server tests. A fatal commit bug still fails the simulator.
+- I/O outside checkpoint files: no `io_uring`, no sockets, no wall clock.
 
 ## Layout
 
@@ -231,6 +241,9 @@ src/
 
 ## CI
 
-A change under `core/simulator/**` marks the `rust-simulator` component in `.github/config/components.yml`, which scopes the Rust test tasks to it. The component is split out of `rust-cluster` so simulator-only changes do not trigger the foreign SDK suites. No fuzzing campaign runs in CI today; `workload-fuzz` is driven by hand, and a seed that fails should arrive as a test or as a finding write-up.
+A change under `core/simulator/**` marks the `rust-simulator` component in `.github/config/components.yml`, which scopes the Rust test tasks to it. The component is split out of `rust-cluster` so simulator-only changes do not trigger the foreign SDK suites.
+One fixed-seed campaign runs in CI: `tests/lifecycle_seeds.rs` runs `workload-fuzz` on the lifecycle and consumer planes through the shell, one test per seed, and fails on any exit other than 0.
+Exit 3 means that a run missed a coverage floor, for example no committed consumer group owner retirement.
+Other `workload-fuzz` runs are driven by hand, and a seed that fails should arrive as a test or as a finding write-up.
 
 Commits touching this crate take the `simulator` scope: `fix(simulator): ...`.

@@ -41,10 +41,25 @@ import Logging
 /// client usable; a client that was shut down cannot reconnect.
 ///
 /// Every operation throws ``IggyError``, or `CancellationError` when its
-/// task is cancelled. A request that hits a dropped connection is replayed
-/// over a fresh one only when it provably never reached the log, so a
+/// task is cancelled. A request that hits a dropped connection goes again
+/// over a fresh one when it provably never reached the log, or under its own
+/// request id when the reconnect binds the same session. Otherwise a
 /// replicated write whose outcome is unknown fails with
-/// ``IggyErrorCode/transientNotCommitted`` instead.
+/// ``IggyErrorCode/transientNotCommitted``. The other SDKs keep such
+/// a write in a retained-operation registry and fail it with
+/// ``IggyErrorCode/operationUncertain``. This SDK has no such registry, so
+/// it keeps `transientNotCommitted`.
+///
+/// A request that was not sent before its deadline fails with
+/// ``IggyErrorCode/transientNotAccepted``, and a retry can succeed. A call
+/// that waited for an automatic sign-in whose credentials the server
+/// refused, such as an invalid or expired personal access token, fails with
+/// ``IggyErrorCode/unauthenticated``. So does a call made before the caller
+/// signed in or out, at its next request, so that no request of the call
+/// runs under a session opened after the call started. A send with balanced
+/// or key partitioning reads the topic first, and a consumer-group poll
+/// syncs the assignment first: a sign-in between the two ends the call
+/// before the second request.
 public final class IggyClient: Sendable {
     /// The configuration the client was created with.
     public let configuration: ClientConfiguration
@@ -82,7 +97,8 @@ public final class IggyClient: Sendable {
         }
     }
 
-    /// Closes the connection and forgets the session. Requests fail with
+    /// Closes the connection and forgets the session. A call made before it
+    /// ends as after ``logout()``. Later requests fail with
     /// ``IggyErrorCode/notConnected`` until ``connect()`` is called again; no
     /// reconnect brings the client back on its own.
     public func disconnect() async {
@@ -135,35 +151,32 @@ public final class IggyClient: Sendable {
     // MARK: Authentication
 
     /// Signs in with a username and password. Any existing session on this
-    /// connection is ended first. Remembers the credentials so a reconnect
-    /// restores the session.
+    /// connection is ended first, with every call made before the sign-in,
+    /// as ``logout()`` ends them. Supersedes automatic sign-in and uses these
+    /// credentials. A failure, including invalid input or a timeout, discards
+    /// any session registered by the attempt and disables automatic sign-in
+    /// until another explicit sign-in succeeds.
     public func login(username: String, password: String) async throws -> IdentityInfo {
-        let identity = try await core.login(username: username, password: password)
-        try await settleOnLeaderAfterLogin()
-        return identity
+        try await core.login(username: username, password: password)
     }
 
-    /// Signs in with a personal access token.
+    /// Signs in with a personal access token, as
+    /// ``login(username:password:)`` does.
     public func login(personalAccessToken token: String) async throws -> IdentityInfo {
-        let identity = try await core.login(personalAccessToken: token)
-        try await settleOnLeaderAfterLogin()
-        return identity
+        try await core.login(personalAccessToken: token)
     }
 
-    /// Ends the session. The next reconnect stays signed out unless
-    /// auto-login is configured.
+    /// Ends the session. A call made before it ends at its next request or
+    /// attempt with ``IggyErrorCode/unauthenticated``, or with
+    /// ``IggyErrorCode/transientNotCommitted`` when it may have committed,
+    /// so it never runs under a session signed in after it. The client does
+    /// not sign in by itself again, not even with the configured auto-login,
+    /// until the next ``login(username:password:)``, or the first
+    /// ``connect()`` after a ``disconnect()``. A logout while the client is
+    /// not signed in, such as after a lost connection, fails with
+    /// ``IggyErrorCode/unauthenticated`` and still signs out.
     public func logout() async throws {
         try await core.logout()
-    }
-
-    /// After a manual sign-in the roster is consulted once so later
-    /// replicated writes land on the leader. The reconnect signs in again
-    /// with the credentials just remembered.
-    private func settleOnLeaderAfterLogin() async throws {
-        if try await core.handleLeaderRedirection() {
-            logger.info("Redirected to the leader, reconnecting")
-            try await core.connect()
-        }
     }
 
     // MARK: Raw requests
@@ -172,7 +185,8 @@ public final class IggyClient: Sendable {
     /// raw reply body. For commands without a typed method; the caller owns
     /// the wire format. Session-control codes, `BindSession` among them, are
     /// rejected because they must go through ``login(username:password:)``
-    /// and ``logout()``.
+    /// and ``logout()``. A committed `ChangePassword` or `UpdateUser` moves
+    /// the credentials reconnects sign in with, as the typed calls do.
     ///
     /// Partition requests carry the partition context their typed call
     /// sends: `SendMessages` with an explicit partition id, `PollMessages`,
@@ -190,20 +204,82 @@ public final class IggyClient: Sendable {
         guard !CommandCode.isSessionControl(code) else {
             throw IggyError(.invalidCommand, context: "code \(code) controls the session; use login and logout")
         }
-        if let routed = try await sendRawPartitionRequest(code: code, payload: payload) {
+        let lineage = await core.lineage
+        if let routed = try await sendRawPartitionRequest(code: code, payload: payload, lineage: lineage) {
             return routed
         }
-        return try await core.exchange(code: code, payload: payload)
+        return try await core.exchange(code: code, payload: payload, lineage: lineage)
+    }
+
+    /// Sends a command code with an already-encoded payload to the replica
+    /// with id `replica`, as the cluster roster names it, and returns its raw
+    /// reply body. Every node answers non-replicated commands such as
+    /// `GetStats` from its own state, so this reads the state of the chosen
+    /// node. The request carries the session's metadata watermark, so the
+    /// replica answers once it applied the metadata this client saw.
+    ///
+    /// Replicated commands, `PollMessages`, `GetConsumerOffset`, and
+    /// session-control codes fail with ``IggyErrorCode/invalidCommand``
+    /// before anything is sent. A
+    /// replica the roster does not list after one more roster read fails with
+    /// ``IggyErrorCode/invalidIdentifier``. A replica that cannot be reached,
+    /// or that answers ``IggyErrorCode/transientNotAccepted``, is asked again
+    /// until the request timeout. Any other refusal,
+    /// ``IggyErrorCode/notPrimary`` included, is returned and never sent to
+    /// another replica.
+    public func sendRawRequest(code: UInt32, payload: [UInt8], replica: UInt8) async throws -> [UInt8] {
+        guard !CommandCode.isSessionControl(code), code != CommandCode.pollMessages.rawValue,
+            code != CommandCode.getConsumerOffset.rawValue, ConsensusOperation.forCode(code) == .nonReplicated
+        else {
+            throw IggyError(.invalidCommand, context: "command \(code) cannot be sent to a chosen replica")
+        }
+        let lineage = try await requireAuthenticated()
+        return try await core.pollRouter.sendToReplica(
+            replica, code: code, payload: payload, lineage: lineage, coordinator: core,
+            deadline: ContinuousClock.now + core.configuration.requestTimeout)
     }
 
     // MARK: Internals shared by the domain extensions
 
-    func send(_ code: CommandCode, _ payload: [UInt8] = []) async throws -> [UInt8] {
-        try await core.exchange(code: code.rawValue, payload: payload)
+    /// One request of a call that started under `lineage`, or, for a call
+    /// of this one request, under the lineage it is sent in.
+    func send(_ code: CommandCode, _ payload: [UInt8] = [], lineage: UInt64? = nil) async throws -> [UInt8] {
+        try await core.exchange(code: code.rawValue, payload: payload, lineage: lineage)
     }
 
-    func requireAuthenticated() async throws {
+    /// Fails unless the client is signed in, and returns the lineage the
+    /// call started under, which every request of the call carries.
+    func requireAuthenticated() async throws -> UInt64 {
         try await core.requireAuthenticated()
+    }
+
+    /// As ``requireAuthenticated()`` for a call pinned to `captured`, such as
+    /// a producer send: once the caller signed in or out since, the call is
+    /// refused as unauthenticated before anything of it is written.
+    func requireAuthenticated(under captured: UInt64?) async throws -> UInt64 {
+        let started = try await requireAuthenticated()
+        guard let captured else {
+            return started
+        }
+        if let refusal = await core.lineageRefusal(captured) {
+            throw refusal
+        }
+        return captured
+    }
+
+    /// Whether the client comes back on its own after an outage.
+    var canRecover: Bool {
+        get async { await core.canRecover }
+    }
+
+    /// The lineage a call that starts now runs under.
+    var operationLineage: UInt64 {
+        get async { await core.lineage }
+    }
+
+    /// The refusal of a call pinned to `captured`, nil while it may go on.
+    func lineageRefusal(_ captured: UInt64) async -> IggyError? {
+        await core.lineageRefusal(captured)
     }
 }
 
@@ -222,35 +298,52 @@ extension IggyClient {
 
     /// The server's view of this client.
     public func getMe() async throws -> ClientInfoDetails {
-        try await requireAuthenticated()
-        return try Responses.clientDetails(try await send(.getMe)[...])
+        let lineage = try await requireAuthenticated()
+        return try Responses.clientDetails(try await send(.getMe, lineage: lineage)[...])
     }
 
     /// A connected client by its server-assigned id, or nil if unknown.
     public func getClient(id: UInt32) async throws -> ClientInfoDetails? {
-        try await requireAuthenticated()
-        let body = try await send(.getClient, Requests.getClient(clientID: id))
+        let lineage = try await requireAuthenticated()
+        let body = try await send(.getClient, Requests.getClient(clientID: id), lineage: lineage)
         return body.isEmpty ? nil : try Responses.clientDetails(body[...])
     }
 
     /// Every connected client.
     public func getClients() async throws -> [ClientInfo] {
-        try await requireAuthenticated()
-        let body = try await send(.getClients)
+        let lineage = try await requireAuthenticated()
+        let body = try await send(.getClients, lineage: lineage)
         return body.isEmpty ? [] : try Responses.clients(body[...])
     }
 
-    /// The option catalog of a resource scope: the keys create accepts, their
-    /// kinds, and this server's defaults.
+    /// The option catalog of a resource scope: every key a client can name,
+    /// its kind, what an update may do with it, and this server's default.
     public func describeOptions(scope: OptionsScope) async throws -> [OptionSpec] {
-        try await requireAuthenticated()
-        return try Responses.optionSpecs(try await send(.describeOptions, Requests.describeOptions(scope: scope))[...])
+        let lineage = try await requireAuthenticated()
+        return try Responses.optionSpecs(try await send(.describeOptions, Requests.describeOptions(scope: scope), lineage: lineage)[...])
+    }
+
+    /// Reads one page of the metadata change log or of the current state.
+    ///
+    /// The node records one change per public result of a committed metadata
+    /// operation, such as a stream created, a topic renamed, a user's
+    /// permissions changed, or a session closed. A mirror keeps a cursor,
+    /// reads the records after it, and stores the returned
+    /// ``MetadataChanges/next``. Records carry options as the read routes
+    /// return them and never key material. Needs root or the global
+    /// `manageServers` permission, and fails with
+    /// ``IggyErrorCode/unauthorized`` otherwise. An invalid query fails with
+    /// ``IggyErrorCode/invalidCommand`` before anything is sent.
+    public func getMetadataChanges(_ query: MetadataChangesQuery = MetadataChangesQuery()) async throws -> MetadataChanges {
+        let lineage = try await requireAuthenticated()
+        try query.validate()
+        return try Responses.metadataChanges(try await send(.getMetadataChanges, Requests.getMetadataChanges(query), lineage: lineage)[...])
     }
 
     /// Captures a snapshot archive of the server state.
     public func snapshot(compression: SnapshotCompression = .deflated, types: [SystemSnapshotType] = [.all]) async throws -> Snapshot {
-        try await requireAuthenticated()
-        return Snapshot(data: try await send(.getSnapshotFile, try Requests.getSnapshot(compression: compression, types: types)))
+        let lineage = try await requireAuthenticated()
+        return Snapshot(data: try await send(.getSnapshotFile, try Requests.getSnapshot(compression: compression, types: types), lineage: lineage))
     }
 
     /// The cluster roster: every node, its role, and its endpoints. Requires
