@@ -354,7 +354,10 @@ pub struct ClusterCoordinatorConfig {
     /// carries the frames of the shards in range `j`, so more links spread
     /// replication over more shards. Every node must run the same value:
     /// the replica handshake refuses a peer that differs. Shard counts may
-    /// differ between nodes.
+    /// differ between nodes. A range with fewer shards than there are peers
+    /// puts links to two peers on one shard. With
+    /// `skip_shard_zero_for_replicas` on, range 0 keeps its links off shard
+    /// 0, so it needs one shard more than there are peers.
     #[serde(default = "default_replica_connections_per_peer")]
     pub replica_connections_per_peer: u16,
     /// When `total_shards > 1`, exclude shard 0 from client placement.

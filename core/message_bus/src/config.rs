@@ -37,7 +37,8 @@
 //! clients manage their own keepalive policy at the application layer,
 //! and replica<->replica liveness is observed by VSR heartbeats rather
 //! than by `SO_KEEPALIVE`. Heartbeats never close a replica socket, so
-//! [`MessageBusConfig::replica_user_timeout`] clears a dead one.
+//! [`MessageBusConfig::replica_user_timeout`] clears a dead one once a
+//! frame waits on it. An idle dead link stays until the next frame.
 //!
 //! Neither plane is authenticated at the bus layer: identity and
 //! credential checks belong to the caller (`core/server`) via

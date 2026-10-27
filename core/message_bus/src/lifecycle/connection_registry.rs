@@ -259,7 +259,7 @@ struct Entry {
 /// Map of live connections keyed by some transport-specific id.
 ///
 /// For clients `K = u128` (the minted client id); for replicas `K = u8`
-/// (the replica id carried in the Ping handshake).
+/// (the replica id carried in the replica handshake).
 #[derive(Debug)]
 pub struct ConnectionRegistry<K>
 where

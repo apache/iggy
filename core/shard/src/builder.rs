@@ -18,8 +18,9 @@
 //! One-stop construction for an [`IggyShard`] plus, on shard 0 only, its
 //! associated [`ShardZeroCoordinator`].
 //!
-//! The coordinator owns shard-0's round-robin state for replica and
-//! client placement. Cluster-wide `replica_id -> owning_shard` routing
+//! The coordinator owns shard-0's round-robin state for client
+//! placement. Replica links go to the owner shard that the link
+//! placement names. Cluster-wide `replica_id -> owning_shard` routing
 //! flows through the cluster-shared [`message_bus::ReplicaOwnerTable`],
 //! stamped by the owning shard's installer and CAS-cleared on disconnect.
 //!

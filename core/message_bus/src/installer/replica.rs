@@ -58,7 +58,7 @@ use tracing::{debug, info, warn};
 ///
 /// Linux does not propagate `TCP_NODELAY` from the listener to the
 /// accepted fd, so we toggle it here on every installed stream, with the
-/// user timeout that clears a dead link (see
+/// user timeout that clears a dead link once a frame waits on it (see
 /// [`apply_replica_socket_options`]). A miss is logged, not a failure.
 fn spawn_replica_install<Fut>(
     bus: &Rc<IggyMessageBus>,
@@ -412,7 +412,8 @@ pub fn install_replica_conn<C: TransportConn>(
     // an installed (peer, link) is refused here without ever touching the
     // local registry: no orphan post-loop and no need for
     // `RejectedRegistration`-style drain on this path. The live link stays.
-    // A half-open one goes away through its user timeout or the peer's RST.
+    // A half-open one goes away through its user timeout or the peer's RST
+    // once a frame waits on it. An idle one stays until the next frame.
     if !bus.mark_replica_owned(link) {
         warn!(
             replica = peer_id,
@@ -438,10 +439,9 @@ pub fn install_replica_conn<C: TransportConn>(
     // the same peer id and loses, both spawned halves must skip their
     // post-loop cleanup: the loser's `replicas().remove` /
     // `close_peer_if_token_matches` calls would no-op against the winner's
-    // generation token (so they can't evict the live entry), and
-    // `notify_connection_lost` stands down whenever a live registry entry
-    // exists - but the loser also drives `replica_dispatch_loop`, which
-    // must never hand the winner's replica id to `on_message`.
+    // generation token (so they can't evict the live entry), but the loser
+    // also drives `replica_dispatch_loop`, which must never hand the
+    // winner's replica id to `on_message`.
     let install_aborted = Rc::new(Cell::new(false));
 
     // Generation token published by the registry on a successful insert.

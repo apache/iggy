@@ -32,19 +32,16 @@
 //!
 //! # Auth
 //!
-//! Neither plane is authenticated at the bus layer. Both connect first
-//! and let the caller (`core/server`) gate command access via
-//! application-level LOGIN commands:
-//!
-//! - SDK-client plane: `LOGIN_USER` / `LOGIN_WITH_PERSONAL_ACCESS_TOKEN`,
+//! - SDK-client plane: the bus does not authenticate clients. The caller
+//!   (`core/server`) gates command access with application-level LOGIN
+//!   commands: `LOGIN_USER` / `LOGIN_WITH_PERSONAL_ACCESS_TOKEN`,
 //!   pre-LOGIN allowlist `PING`, `LOGIN_USER`, `LOGIN_WITH_PAT`.
-//! - Replica plane: a future `LOGIN_REPLICA` command carries the
-//!   cluster's shared secret. Until that command succeeds the caller
-//!   MUST NOT honor consensus messages from the connection. The
-//!   `Ping` frame at connect time announces `replica_id` and
-//!   `cluster_id` (the listener checks `cluster_id` matches the local
-//!   cluster and uses `replica_id` to key its registry); it carries
-//!   no MAC.
+//! - Replica plane: every link opens with a placement preamble
+//!   ([`replica::preamble`]) and then the replica handshake
+//!   ([`replica::handshake`]). The handshake checks the cluster id, the
+//!   build, the dialer direction and the link placement. With a shared
+//!   secret configured, it also authenticates both ends with a MAC
+//!   ([`replica::auth`]).
 //!
 //! # Invariants worth naming
 //!
@@ -128,9 +125,10 @@ pub const MAX_REPLICAS: usize = 256;
 /// enforced globally on shard 0 (the sole acceptor) regardless of which
 /// shard the delegated handshake runs on.
 ///
-/// A legitimate dialer set is bounded by `self_id`
-/// (< `replica_count` <= 255), so the cap only sheds load under a
-/// hostile flood; it bounds fd / memory without ever stalling the
+/// A legitimate dialer set opens at most `self_id` times the link count
+/// sockets (`self_id` < `replica_count` <= 255). [`LinkLayout::new`]
+/// keeps that product at or below this cap, so the cap only sheds load
+/// under a hostile flood. It bounds fd / memory without ever stalling the
 /// accept loop.
 pub const MAX_INFLIGHT_REPLICA_HANDSHAKES: usize = 256;
 
@@ -475,9 +473,9 @@ pub type ConnectionLostFn = std::rc::Rc<dyn Fn(ReplicaLinkId)>;
 ///
 /// One instance covers every such link the shard owns, so the ratio of
 /// decoded frames to completed socket reads is their aggregate batching
-/// factor, which is what the read-ahead buffer exists to raise. Only link
-/// shards read replica sockets, so a nonzero value also identifies the
-/// link shard.
+/// factor, which is what the read-ahead buffer exists to raise. Only shards
+/// that own replica links read replica sockets, so a nonzero value also
+/// identifies a shard that owns a replica link.
 ///
 /// `Cell` rather than atomics: the reader task that bumps these and the
 /// shard sweep that drains them run on the same compio thread. Shared
@@ -591,7 +589,7 @@ pub struct ReplicaLinkStats {
 ///
 /// The two setters below do NOT share one install rule:
 /// - [`Self::set_connection_lost_fn`] is re-installable (`RefCell`
-///   slot); it is a test observation hook some setups swap mid-test.
+///   slot): a second install replaces the bundle close report.
 /// - [`Self::set_replica_forward_fn`] is one-shot (`OnceCell` slot) and
 ///   panics on a second install, as a bootstrap-only wiring invariant.
 ///
@@ -632,12 +630,11 @@ pub trait MessageBus {
     /// no-op default previously masked a wiring bug where shard 0 never
     /// learned a delegated replica died.
     ///
-    /// Re-installing is allowed by design - the backing slot is a
-    /// `RefCell`, so a second call overwrites the first. This is the
+    /// Re-installing is allowed by design: the backing slot is a
+    /// `RefCell`, so a second install replaces the first, the bundle close
+    /// report included. Tests rely on this to observe closes. This is the
     /// deliberate exception to the install rules of
-    /// [`Self::set_replica_forward_fn`]:
-    /// the notifier is a test observation hook some setups swap
-    /// mid-test, not a one-shot bootstrap invariant.
+    /// [`Self::set_replica_forward_fn`].
     fn set_connection_lost_fn(&self, f: ConnectionLostFn);
 
     /// Install the replica-plane inter-shard forward closure.
@@ -780,7 +777,7 @@ pub trait MessageBus {
 /// - a root [`Shutdown`] / [`ShutdownToken`] that fans cancellation to every
 ///   accept loop, read loop, periodic task, and per-connection writer task,
 /// - a [`ConnectionRegistry<u128>`] for clients (`u128` id is shard-packed),
-/// - a [`ReplicaRegistry`] for replicas (`u8` id from the Ping handshake,
+/// - a [`ReplicaRegistry`] for replicas (`u8` id from the replica handshake,
 ///   backed by a fixed-size array to avoid hash lookup on every send),
 /// - the `JoinHandle`s of background tasks (accept loops, reconnect periodic).
 ///
@@ -893,12 +890,16 @@ impl IggyMessageBus {
 
     /// Construct a bus from the validated the server schema.
     ///
-    /// Production constructor: takes a fully-validated
+    /// Single-bus constructor: takes a fully-validated
     /// [`ServerConfig`] and derives the runtime [`MessageBusConfig`]
     /// internally. Field conversions ([`iggy_common::IggyDuration`] -> [`Duration`],
     /// [`iggy_common::IggyByteSize`] -> `usize`, schema WS knobs ->
     /// tungstenite [`WebSocketConfig`]) happen once here so hot paths
     /// read pre-converted values.
+    ///
+    /// The bus gets its own owner table with the one-shard, one-link
+    /// [`LinkLayout::default`], so `replica_connections_per_peer` has no
+    /// effect. The server uses [`Self::with_config_and_owner_table`].
     ///
     /// # Panics
     ///
