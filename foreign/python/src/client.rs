@@ -214,16 +214,17 @@ impl IggyClient {
     /// Tokio runtime.
     ///
     /// Args:
-    ///     conn: A `host:port` address, a `TcpConfig`, a `QuicConfig`, an
-    ///         `HttpConfig`, or a `WebSocketConfig`. Defaults to `127.0.0.1:8090`
-    ///         over TCP with auto-login disabled. A malformed address is reported
+    ///     conn: A `host:port` address, a comma-separated list of the nodes of one
+    ///         cluster, a `TcpConfig`, a `QuicConfig`, an `HttpConfig`, or a
+    ///         `WebSocketConfig`. Defaults to `127.0.0.1:8090` over TCP with
+    ///         auto-login disabled. A malformed address is reported
     ///         differently depending on the form: the string form raises
     ///         `RuntimeError` here, while every config type raises `ValueError`
     ///         when it is constructed, before any of them reaches this call. Neither
     ///         exception is a subclass of the other.
     ///
     /// Raises:
-    ///     RuntimeError: If the address passed as a string is not a valid
+    ///     RuntimeError: If an address passed as a string is not a valid
     ///         `host:port` pair. QUIC binds its local UDP socket during
     ///         `connect()`, which reports a port already in use.
     #[new]

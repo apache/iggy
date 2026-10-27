@@ -265,6 +265,21 @@ class TestTcpConfig:
         with pytest.raises(ValueError, match="server_address"):
             TcpConfig(server_address=invalid_address)
 
+    def test_list_of_addresses_keeps_its_order_trimmed(self):
+        """Test that the nodes of a cluster can be listed, each address trimmed."""
+        config = TcpConfig(server_address=" 10.0.0.1:8090 , [::1]:8090,node-3:8090 ")
+
+        assert config.server_address == "10.0.0.1:8090,[::1]:8090,node-3:8090"
+
+    @pytest.mark.parametrize(
+        "invalid_list",
+        ["10.0.0.1:8090,", "10.0.0.1:8090,,node-3:8090", "10.0.0.1:8090,node-3"],
+    )
+    def test_list_with_an_invalid_address_is_rejected(self, invalid_list: str):
+        """Test that one malformed address fails the whole list."""
+        with pytest.raises(ValueError, match="server_address"):
+            TcpConfig(server_address=invalid_list)
+
     def test_negative_heartbeat_interval_is_rejected(self):
         """Test that a negative heartbeat interval fails at construction."""
         with pytest.raises(ValueError, match="negative"):
@@ -291,6 +306,23 @@ class TestClientConstruction:
     def test_accepts_an_address(self):
         """Test that the address form still works."""
         assert IggyClient("127.0.0.1:8090") is not None
+
+    def test_accepts_a_list_of_addresses(self):
+        """Test that the address form takes the nodes of one cluster."""
+        assert IggyClient("127.0.0.1:8090,127.0.0.1:8091") is not None
+
+    def test_connection_string_accepts_a_list_of_tcp_addresses(self):
+        """Test that a TCP connection string takes the nodes of one cluster."""
+        connection_string = "iggy://iggy:iggy@127.0.0.1:8090,127.0.0.1:8091"
+
+        assert IggyClient.from_connection_string(connection_string) is not None
+
+    def test_connection_string_rejects_a_list_of_quic_addresses(self):
+        """Test that only TCP connection strings take a list."""
+        with pytest.raises(RuntimeError):
+            IggyClient.from_connection_string(
+                "iggy+quic://iggy:iggy@127.0.0.1:8080,127.0.0.1:8081"
+            )
 
     def test_accepts_nothing(self):
         """Test that the default address is used when no argument is given."""

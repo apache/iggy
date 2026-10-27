@@ -292,13 +292,16 @@ impl TcpConfig {
     ///
     /// Args:
     ///     server_address: `host:port` of the Iggy server. Defaults to `127.0.0.1:8090`.
+    ///         To reach a cluster while a node is down, list several nodes,
+    ///         separated by commas: a new client tries each in order, then the
+    ///         nodes of the last roster that it read.
     ///     auto_login: Credentials replayed on every connect. Defaults to `AutoLogin.disabled()`.
     ///     pending_operations: Client-wide mutation limits; defaults to 256 operations and 64 MiB.
     ///     reconnection: Reconnection policy. Defaults to `TcpReconnectionConfig()`.
     ///     heartbeat_interval: Interval of heartbeats sent by the client. Defaults to 5 seconds.
     ///     tls_enabled: Whether to connect over TLS. Defaults to disabled.
     ///     tls_domain: Domain to validate the certificate against. Empty means it is
-    ///         taken from `server_address`.
+    ///         taken from the address being dialed.
     ///     tls_ca_file: Path to the CA file for TLS. Read only when `tls_enabled`
     ///         and `tls_validate_certificate` are both on; with either one off it
     ///         is kept but never consulted, so pairing it with
@@ -312,8 +315,8 @@ impl TcpConfig {
     ///         leaving it on.
     ///
     /// Raises:
-    ///     ValueError: If `server_address` is not a valid `host:port` pair, if a
-    ///         duration is negative, or if `heartbeat_interval` is zero.
+    ///     ValueError: If an address in `server_address` is not a valid `host:port`
+    ///         pair, if a duration is negative, or if `heartbeat_interval` is zero.
     #[new]
     #[pyo3(signature = (
         *,

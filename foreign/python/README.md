@@ -179,6 +179,11 @@ asyncio.run(main())
 transport. `examples/python/getting-started/producer.py` shows each swap in
 context.
 
+A TCP client can list several nodes of one cluster, separated by commas, in
+`server_address` or a connection string such as
+`iggy://iggy:iggy@node-1:8090,node-2:8090`. A new client tries each in order,
+then the nodes of the last roster that it read.
+
 Established binary sessions survive transport loss. Password/PAT changes and
 PAT expiry do not end these sessions; logout, session lease expiry and account
 deactivation do. Reconnection binds the retained session before attempting a

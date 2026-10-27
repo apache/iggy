@@ -1221,16 +1221,17 @@ class IggyClient:
         Tokio runtime.
 
         Args:
-            conn: A `host:port` address, a `TcpConfig`, a `QuicConfig`, an
-                `HttpConfig`, or a `WebSocketConfig`. Defaults to `127.0.0.1:8090`
-                over TCP with auto-login disabled. A malformed address is reported
+            conn: A `host:port` address, a comma-separated list of the nodes of one
+                cluster, a `TcpConfig`, a `QuicConfig`, an `HttpConfig`, or a
+                `WebSocketConfig`. Defaults to `127.0.0.1:8090` over TCP with
+                auto-login disabled. A malformed address is reported
                 differently depending on the form: the string form raises
                 `RuntimeError` here, while every config type raises `ValueError`
                 when it is constructed, before any of them reaches this call. Neither
                 exception is a subclass of the other.
 
         Raises:
-            RuntimeError: If the address passed as a string is not a valid
+            RuntimeError: If an address passed as a string is not a valid
                 `host:port` pair. QUIC binds its local UDP socket during
                 `connect()`, which reports a port already in use.
         """
@@ -4647,13 +4648,16 @@ class TcpConfig:
 
         Args:
             server_address: `host:port` of the Iggy server. Defaults to `127.0.0.1:8090`.
+                To reach a cluster while a node is down, list several nodes,
+                separated by commas: a new client tries each in order, then the
+                nodes of the last roster that it read.
             auto_login: Credentials replayed on every connect. Defaults to `AutoLogin.disabled()`.
             pending_operations: Client-wide mutation limits; defaults to 256 operations and 64 MiB.
             reconnection: Reconnection policy. Defaults to `TcpReconnectionConfig()`.
             heartbeat_interval: Interval of heartbeats sent by the client. Defaults to 5 seconds.
             tls_enabled: Whether to connect over TLS. Defaults to disabled.
             tls_domain: Domain to validate the certificate against. Empty means it is
-                taken from `server_address`.
+                taken from the address being dialed.
             tls_ca_file: Path to the CA file for TLS. Read only when `tls_enabled`
                 and `tls_validate_certificate` are both on; with either one off it
                 is kept but never consulted, so pairing it with
@@ -4667,8 +4671,8 @@ class TcpConfig:
                 leaving it on.
 
         Raises:
-            ValueError: If `server_address` is not a valid `host:port` pair, if a
-                duration is negative, or if `heartbeat_interval` is zero.
+            ValueError: If an address in `server_address` is not a valid `host:port`
+                pair, if a duration is negative, or if `heartbeat_interval` is zero.
         """
     def __repr__(self) -> builtins.str: ...
 
