@@ -28,7 +28,7 @@ public class TlsSettings
     public bool Enabled { get; set; }
 
     /// <summary>
-    ///     The name of the server for TLS handshake.
+    ///     The name of the server for TLS handshake. When empty, each dial checks the host that it dials.
     /// </summary>
     public string Hostname { get; set; } = string.Empty;
 

@@ -58,10 +58,12 @@ public sealed partial class TcpMessageStream
                 && node.Status == ClusterNodeStatus.Healthy)?.ReplicaId;
             var nodes = metadata.Nodes.Where(node => node.Endpoints.Tcp is > 0).ToArray();
             // A single node advertises its own view of its address, such as a bind address or a container name,
-            // which a port mapping or a port-forward hides. Only the configured endpoint is known to reach it.
+            // which a port mapping or a port-forward hides. Only a configured endpoint is known to reach it: the
+            // one that the client reached it through.
             var single = nodes.Length == 1;
             var endpoints = nodes.ToDictionary(node => node.ReplicaId, node => single
-                ? _baseAddress : ServerAddress.HostPort(node.Ip, node.Endpoints.Tcp));
+                ? ConfiguredAddressOf(_configuredAddresses, _connectedAddress)
+                : ServerAddress.HostPort(node.Ip, node.Endpoints.Tcp));
             foreach (var slot in _replicaLinks.Values.ToArray())
             {
                 if (!endpoints.TryGetValue(slot.ReplicaId, out var endpoint) || endpoint != slot.Endpoint
@@ -95,6 +97,13 @@ public sealed partial class TcpMessageStream
             }
             NotifyReplicaChange();
         }
+    }
+
+    /// <summary>The configured address that <paramref name="dialedAddress" /> spells, else the first one.</summary>
+    internal static string ConfiguredAddressOf(string[] configuredAddresses, string dialedAddress)
+    {
+        return Array.Find(configuredAddresses, address => ServerAddress.IsSame(address, dialedAddress))
+               ?? configuredAddresses[0];
     }
 
     private async Task RunReplicaLinkAsync(ReplicaSlot slot)
@@ -259,7 +268,7 @@ public sealed partial class TcpMessageStream
             }
             await socket.ConnectAsync(host, port, cancellation.Token);
             var stream = _configuration.TlsSettings.Enabled
-                ? await CreateSslStreamAndAuthenticate(socket, _configuration.TlsSettings, cancellation.Token)
+                ? await CreateSslStreamAndAuthenticate(socket, _configuration.TlsSettings, host, cancellation.Token)
                 : new NetworkStream(socket, true);
             socket = null;
             return new VsrConnection(stream, _consensusSession, _configuration.MaxResponseFrameSize,

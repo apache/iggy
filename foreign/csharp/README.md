@@ -184,7 +184,7 @@ config.LoggerFactory = loggerFactory;
 | Option                  | Default     | Description                                                                    |
 |-------------------------|-------------|--------------------------------------------------------------------------------|
 | `tls`                   | `false`     | `true` or `false`                                                              |
-| `tls_domain`            | server host | Server name for the TLS handshake, used for every node the client dials        |
+| `tls_domain`            | dialed host | Server name for the TLS handshake, used for every node the client dials        |
 | `tls_ca_file`           | empty       | CA certificate path, read when connecting, required with `tls=true`            |
 | `reconnection_retries`  | `unlimited` | Count or `unlimited`. `0` turns reconnection off, also after a lost connection |
 | `reconnection_interval` | `1s`        | Fixed delay between attempts and before the first redial, at least `1ms`       |
@@ -207,6 +207,10 @@ not percent-decoded and must not contain `@` or `:`. Bracketed IPv6 hosts such a
 `iggy://iggy:iggy@[::1]:8090` are accepted. Durations look like `500ms`, `5s` or `1m30s`. Only `iggy://` and
 `iggy+tcp://` are supported. A malformed string throws `FormatException`, whose message never
 contains the connection string.
+
+A TCP client can list several nodes of one cluster, separated by commas, in the connection string or `BaseAddress`,
+as in `iggy://iggy:iggy@node-1:8090,node-2:8090`: a new client tries each in order, then the nodes of the last roster
+that it read.
 
 ## Viewstamped Replication (VSR)
 
@@ -254,8 +258,8 @@ await client.ConnectAsync();
 - **Replica links are independent.** The client proactively opens one shared session link per roster replica.
   Calls use the advertised metadata or partition primary. Replies are matched by request id, so concurrent
   reads and different partition groups can progress independently; cancelling one call preserves other calls.
-  With a one-node roster, the client uses `BaseAddress` instead of the address that the node advertises, so a
-  port mapping or a port-forward works.
+  With a one-node roster, the client uses the `BaseAddress` entry that reached the node instead of the address that
+  the node advertises, so a port mapping or a port-forward works.
 - **The client picks partitions.** Balanced and message-key partitioning are resolved
   client-side (xxHash32 matches Rust for identical encoded key bytes and partition counts), and consumer-group polls round-robin
   over the partitions the coordinator assigned to this client.

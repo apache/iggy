@@ -35,9 +35,10 @@ public sealed class IggyClientConfigurator
     internal static readonly TimeSpan MaxInterval = TimeSpan.FromMilliseconds(uint.MaxValue - 1);
 
     /// <summary>
-    ///     The base address of the Iggy server. When the cluster has one node, the <see cref="Enums.Protocol.Tcp" />
-    ///     client uses this address instead of the address that the node advertises, so a port mapping or a
-    ///     port-forward works.
+    ///     The base address of the Iggy server. A <see cref="Enums.Protocol.Tcp" /> client can list several nodes of
+    ///     one cluster, separated by commas: a new client tries each in order, then the nodes of the last roster that
+    ///     it read. When the cluster has one node, the TCP client uses the listed address that reached it instead of
+    ///     the address that the node advertises, so a port mapping or a port-forward works.
     /// </summary>
     public required string BaseAddress { get; set; }
 
@@ -127,8 +128,9 @@ public sealed class IggyClientConfigurator
     /// <summary>
     ///     Creates a TCP configuration from a connection string in the format shared by every Iggy SDK:
     ///     <c>iggy://username:password@host:port?options</c>, or <c>iggy://token@host:port</c> to sign in with a
-    ///     personal access token. The <c>iggy+tcp://</c> scheme is accepted as well. The credentials become the
-    ///     <see cref="AutoLoginSettings" />. Heartbeat and pending-operation limits are init-only;
+    ///     personal access token. <c>host:port</c> can list several nodes of one cluster, separated by commas, as
+    ///     <see cref="BaseAddress" /> can. The <c>iggy+tcp://</c> scheme is accepted as well. The credentials
+    ///     become the <see cref="AutoLoginSettings" />. Heartbeat and pending-operation limits are init-only;
     ///     their connection-string options set them during construction.
     /// </summary>
     /// <remarks>
@@ -142,7 +144,8 @@ public sealed class IggyClientConfigurator
     ///     validated but ignored, since <c>reconnection_interval</c> paces every redial. <c>nodelay</c> is validated
     ///     but ignored too: sockets are always opened with <c>NoDelay</c>, so <c>nodelay=false</c> does not turn
     ///     Nagle back on. <c>tls=true</c> requires
-    ///     <c>tls_ca_file</c>, and one <c>tls_domain</c> covers every node the client dials.
+    ///     <c>tls_ca_file</c>, and one <c>tls_domain</c> covers every node the client dials. Without it, each dial
+    ///     checks the host that it dials.
     ///     <c>reconnection_retries=0</c> turns reconnection off entirely, so the client does not reconnect after a
     ///     lost connection either.
     /// </remarks>

@@ -60,9 +60,13 @@ internal static class ConnectionString
         }
 
         var serverAddress = serverAndOptions[0];
-        var serverHost = ParseHost(serverAddress);
+        foreach (var address in serverAddress.Split(','))
+        {
+            ValidateAddress(address);
+        }
+
         var (tlsSettings, reconnectionSettings, heartbeatInterval, maxPendingOperations, maxPendingOperationBytes) =
-            ParseOptions(serverAndOptions.ElementAtOrDefault(1), serverHost);
+            ParseOptions(serverAndOptions.ElementAtOrDefault(1));
 
         return new IggyClientConfigurator
         {
@@ -116,7 +120,7 @@ internal static class ConnectionString
             : AutoLoginSettings.For(credentials[0], credentials[1]);
     }
 
-    private static string ParseHost(string serverAddress)
+    private static void ValidateAddress(string serverAddress)
     {
         var addressMatch = AuthorityPattern.Match(serverAddress);
         if (!addressMatch.Success || !ushort.TryParse(addressMatch.Groups[3].Value, NumberStyles.None,
@@ -124,16 +128,11 @@ internal static class ConnectionString
         {
             throw Invalid();
         }
-
-        return addressMatch.Groups[1].Success
-            ? addressMatch.Groups[1].Value
-            : addressMatch.Groups[2].Value;
     }
 
-    private static (TlsSettings, ReconnectionSettings, TimeSpan, int, long) ParseOptions(string? query, string serverHost)
+    private static (TlsSettings, ReconnectionSettings, TimeSpan, int, long) ParseOptions(string? query)
     {
-        // The certificate name check needs a hostname when tls_domain is missing.
-        var tlsSettings = new TlsSettings { Hostname = serverHost };
+        var tlsSettings = new TlsSettings();
         var reconnectionSettings = new ReconnectionSettings
         {
             Enabled = true,
@@ -154,7 +153,7 @@ internal static class ConnectionString
                     tlsSettings.Enabled = ParseBoolean(name, value);
                     break;
                 case "tls_domain":
-                    tlsSettings.Hostname = value.Length == 0 ? serverHost : value;
+                    tlsSettings.Hostname = value;
                     break;
                 case "tls_ca_file":
                     tlsSettings.CertificatePath = value;

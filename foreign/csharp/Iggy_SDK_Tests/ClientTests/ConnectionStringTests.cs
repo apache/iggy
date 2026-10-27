@@ -38,7 +38,7 @@ public sealed class ConnectionStringTests
         Assert.Empty(config.AutoLoginSettings.PersonalAccessToken);
 
         Assert.False(config.TlsSettings.Enabled);
-        Assert.Equal("127.0.0.1", config.TlsSettings.Hostname);
+        Assert.Empty(config.TlsSettings.Hostname);
         Assert.Empty(config.TlsSettings.CertificatePath);
         Assert.Equal(TimeSpan.FromSeconds(5), config.HeartbeatInterval);
         Assert.Equal(256, config.MaxPendingOperations);
@@ -328,24 +328,51 @@ public sealed class ConnectionStringTests
         Assert.Equal(TimeSpan.FromMilliseconds(milliseconds), config.ReconnectionSettings.InitialDelay);
     }
 
-    [Fact]
-    public void FromConnectionString_WithTlsAndNoDomain_UsesTheServerHost()
+    /// <summary>Each dial then checks the host that it dials, so every node of a list keeps its own name.</summary>
+    [Theory]
+    [InlineData("[::1]:8090")]
+    [InlineData("localhost:8090,127.0.0.1:8091")]
+    public void FromConnectionString_WithTlsAndNoDomain_LeavesTheNameToEachDial(string addresses)
     {
         var config = IggyClientConfigurator.FromConnectionString(
-            "iggy://iggy:secret@[::1]:8090?tls=true&tls_ca_file=/ca.pem");
+            $"iggy://iggy:secret@{addresses}?tls=true&tls_ca_file=/ca.pem");
 
-        Assert.Equal("::1", config.TlsSettings.Hostname);
+        Assert.Empty(config.TlsSettings.Hostname);
     }
 
     [Theory]
     [InlineData("tls_domain=")]
     [InlineData("tls_domain=iggy.apache.org&tls_domain=")]
-    public void FromConnectionString_WithEmptyTlsDomain_UsesTheServerHost(string options)
+    public void FromConnectionString_WithEmptyTlsDomain_LeavesTheNameToEachDial(string options)
     {
         var config = IggyClientConfigurator.FromConnectionString(
             $"iggy://iggy:secret@localhost:8090?tls=true&tls_ca_file=/ca.pem&{options}");
 
-        Assert.Equal("localhost", config.TlsSettings.Hostname);
+        Assert.Empty(config.TlsSettings.Hostname);
+    }
+
+    [Fact]
+    public void FromConnectionString_WithAListOfAddresses_KeepsEveryNodeInOrder()
+    {
+        var config = IggyClientConfigurator.FromConnectionString(
+            "iggy://iggy:secret@10.0.0.1:8090,[2001:db8::1]:8090,node-3:8090?tls_domain=iggy.apache.org");
+
+        Assert.Equal("10.0.0.1:8090,[2001:db8::1]:8090,node-3:8090", config.BaseAddress);
+        Assert.Equal("iggy.apache.org", config.TlsSettings.Hostname);
+    }
+
+    [Theory]
+    [InlineData("10.0.0.1:8090,")]
+    [InlineData(",10.0.0.1:8090")]
+    [InlineData("10.0.0.1:8090,,node-3:8090")]
+    [InlineData("10.0.0.1:8090,node-3")]
+    [InlineData("10.0.0.1:8090,node-3:70000")]
+    public void FromConnectionString_WithABadAddressInTheList_Throws(string addresses)
+    {
+        var exception = Assert.Throws<FormatException>(
+            () => IggyClientConfigurator.FromConnectionString($"iggy://iggy:secret@{addresses}"));
+
+        Assert.Equal("Invalid connection string.", exception.Message);
     }
 
     [Fact]

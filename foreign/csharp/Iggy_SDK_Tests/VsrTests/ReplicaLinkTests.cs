@@ -280,6 +280,40 @@ public sealed class ReplicaLinkTests
         Assert.Equal(configured, client.GetCurrentAddress());
     }
 
+    /// <summary>
+    ///     Mirrors <c>given_a_single_node_roster_should_redial_the_configured_endpoint_that_reached_it</c> in
+    ///     <c>core/sdk/src/links/replicas.rs</c>: the first configured address is down, so only the next one is
+    ///     known to reach the node.
+    /// </summary>
+    [Fact]
+    public async Task given_a_single_node_reached_through_a_later_configured_address_when_its_link_drops_should_redial_that_address()
+    {
+        var token = TestContext.Current.CancellationToken;
+        var gone = UnusedPort();
+        var advertisedPort = UnusedPort();
+        var drop = 0;
+        using var node = new MockNode();
+        node.Serve(request => request.Code == CommandCodes.GET_STATS_CODE && Interlocked.Exchange(ref drop, 0) == 1
+            ? throw new IOException("drop")
+            : request.Code == GET_CLUSTER_METADATA_CODE ? StandaloneRoster(advertisedPort) : Answer(request));
+        var mapped = $"127.0.0.1:{node.Port}";
+        var configuration = Configuration(node.Port);
+        configuration.BaseAddress = $"127.0.0.1:{gone},{mapped}";
+        using var client = await SignedInAsync(configuration);
+
+        Assert.Equal(mapped, client.GetCurrentAddress());
+        await client.GetStatsAsync(token);
+        Assert.Equal(1, node.Connections);
+
+        Volatile.Write(ref drop, 1);
+        await client.GetStatsAsync(token);
+
+        Assert.Equal(2, node.Connections);
+        Assert.Equal(1, node.Requests(BIND_SESSION_CODE));
+        Assert.Equal(1, node.Registrations);
+        Assert.Equal(mapped, client.GetCurrentAddress());
+    }
+
     [Fact]
     public async Task given_a_single_node_when_a_reconnect_reaches_it_through_its_advertised_address_should_adopt_that_link()
     {

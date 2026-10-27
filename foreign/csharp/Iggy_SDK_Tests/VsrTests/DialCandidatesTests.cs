@@ -30,7 +30,7 @@ public sealed class DialCandidatesTests
     {
         var candidates = TcpMessageStream.DialCandidates(
             "127.0.0.1:8090",
-            "localhost:8090",
+            ["localhost:8090"],
             ["127.0.0.1:8090", "127.0.0.1:8091", "127.0.0.1:8092"]);
 
         // Neither the roster's copy of the current endpoint nor a configured address that only spells the same
@@ -47,33 +47,56 @@ public sealed class DialCandidatesTests
     {
         var candidates = TcpMessageStream.DialCandidates(
             "127.0.0.1:8090",
-            "127.0.0.1:8099",
+            ["127.0.0.1:8099"],
             ["127.0.0.1:8091", "127.0.0.1:8092"]);
 
         Assert.Equal(["127.0.0.1:8090", "127.0.0.1:8099", "127.0.0.1:8091", "127.0.0.1:8092"], candidates);
     }
 
     [Fact]
+    public void DialsEveryConfiguredAddressInOrderBeforeTheLearnedRoster()
+    {
+        var candidates = TcpMessageStream.DialCandidates(
+            "127.0.0.1:8092",
+            ["127.0.0.1:8091", "localhost:8092", "127.0.0.1:8090"],
+            ["127.0.0.1:8090", "127.0.0.1:8093"]);
+
+        Assert.Equal(["127.0.0.1:8092", "127.0.0.1:8091", "127.0.0.1:8090", "127.0.0.1:8093"], candidates);
+    }
+
+    [Fact]
     public void KeepsTheConfiguredAddressWhenNoRosterWasLearned()
     {
-        var candidates = TcpMessageStream.DialCandidates("127.0.0.1:8091", "127.0.0.1:8090", []);
+        var candidates = TcpMessageStream.DialCandidates("127.0.0.1:8091", ["127.0.0.1:8090"], []);
 
         Assert.Equal(["127.0.0.1:8091", "127.0.0.1:8090"], candidates);
     }
 
     [Fact]
-    public void FallsBackToTheConfiguredAddressBeforeTheFirstConnect()
+    public void FallsBackToTheConfiguredAddressesBeforeTheFirstConnect()
     {
-        var candidates = TcpMessageStream.DialCandidates(string.Empty, "127.0.0.1:8090", []);
+        var candidates = TcpMessageStream.DialCandidates(string.Empty, ["127.0.0.1:8091", "127.0.0.1:8090"], []);
 
-        Assert.Equal(["127.0.0.1:8090"], candidates);
+        Assert.Equal(["127.0.0.1:8091", "127.0.0.1:8090"], candidates);
     }
 
     [Fact]
     public void DialsOneEndpointWhenNothingElseIsKnown()
     {
-        var candidates = TcpMessageStream.DialCandidates("127.0.0.1:8090", "127.0.0.1:8090", []);
+        var candidates = TcpMessageStream.DialCandidates("127.0.0.1:8090", ["127.0.0.1:8090"], []);
 
         Assert.Equal(["127.0.0.1:8090"], candidates);
+    }
+
+    /// <summary>A one-node roster keeps the configured address that reached the node, in its configured spelling.</summary>
+    [Theory]
+    [InlineData("127.0.0.1:8091", "localhost:8091")]
+    [InlineData("127.0.0.1:8090", "127.0.0.1:8090")]
+    [InlineData("10.0.0.9:8090", "127.0.0.1:8090")]
+    [InlineData("", "127.0.0.1:8090")]
+    public void PicksTheConfiguredAddressThatReachedTheNodeElseTheFirst(string dialed, string expected)
+    {
+        Assert.Equal(expected,
+            TcpMessageStream.ConfiguredAddressOf(["127.0.0.1:8090", "localhost:8091"], dialed));
     }
 }

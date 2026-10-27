@@ -67,6 +67,67 @@ public sealed class EndpointFailoverTests
         Assert.False(cancellation.IsCancellationRequested);
     }
 
+    /// <summary>A bad entry fails the connect even though the entry before it answers.</summary>
+    [Theory]
+    [InlineData("{0},")]
+    [InlineData("{0},,{0}")]
+    [InlineData("{0}, ")]
+    [InlineData("{0},localhost")]
+    [InlineData("{0},localhost:invalid")]
+    public async Task given_a_list_with_a_bad_entry_when_connecting_should_report_configuration_fault_without_dialing(
+        string addresses)
+    {
+        using var node = new MockNode();
+        node.Serve(Answer);
+        using var client = new TcpMessageStream(new IggyClientConfigurator
+        {
+            BaseAddress = string.Format(addresses, $"127.0.0.1:{node.Port}"),
+            Protocol = Protocol.Tcp,
+            ReconnectionSettings = new ReconnectionSettings
+            {
+                Enabled = true,
+                MaxRetries = 0,
+                InitialDelay = TimeSpan.FromMilliseconds(1)
+            }
+        }, NullLoggerFactory.Instance);
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        cancellation.CancelAfter(TimeSpan.FromSeconds(2));
+
+        await Assert.ThrowsAsync<InvalidBaseAddressException>(() => client.ConnectAsync(cancellation.Token));
+
+        Assert.False(cancellation.IsCancellationRequested);
+        Assert.Equal(0, node.Connections);
+    }
+
+    /// <summary>
+    ///     A new client dials the configured addresses in order, so it skips the node that is down and connects
+    ///     through the next one, never the one after. Mirrors
+    ///     <c>given_configured_endpoints_when_the_first_is_down_should_connect_through_the_next</c> in
+    ///     <c>core/sdk/src/links/replicas.rs</c>.
+    /// </summary>
+    [Fact]
+    public async Task given_configured_addresses_when_the_first_is_down_should_connect_through_the_next()
+    {
+        using var down = new MockNode();
+        down.Kill();
+        using var next = new MockNode();
+        using var last = new MockNode();
+        next.Serve(Answer);
+        last.Serve(Answer);
+        using var client = new TcpMessageStream(new IggyClientConfigurator
+        {
+            BaseAddress = $" 127.0.0.1:{down.Port} , 127.0.0.1:{next.Port},127.0.0.1:{last.Port}",
+            Protocol = Protocol.Tcp,
+            ReconnectionSettings = new ReconnectionSettings { Enabled = false }
+        }, NullLoggerFactory.Instance);
+
+        await client.ConnectAsync(TestContext.Current.CancellationToken);
+        await UntilAsync(() => next.Connections == 1);
+
+        Assert.Equal($"127.0.0.1:{next.Port}", client.GetCurrentAddress());
+        Assert.Equal(0, last.Connections);
+    }
+
     [Fact]
     public async Task given_a_missing_certificate_when_retries_are_unlimited_should_report_configuration_fault()
     {

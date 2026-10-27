@@ -57,9 +57,9 @@ public sealed partial class TcpMessageStream : IIggyClient
 
     private readonly IggyClientConfigurator _configuration;
 
-    // The configurator stays settable after construction, so the endpoint the client was built for is pinned here:
-    // a later assignment must not move a live replica link or the dial order.
-    private readonly string _baseAddress;
+    // The configurator stays settable after construction, so the endpoints the client was built for are pinned
+    // here: a later assignment must not move a live replica link or the dial order.
+    private readonly string[] _configuredAddresses;
     private readonly MutationLanes _mutations;
     private readonly SemaphoreSlim _connectGate = new(1, 1);
     private readonly CancellationTokenSource _clientLifetime = new();
@@ -97,7 +97,7 @@ public sealed partial class TcpMessageStream : IIggyClient
     internal TcpMessageStream(IggyClientConfigurator configuration, ILoggerFactory loggerFactory)
     {
         _configuration = configuration;
-        _baseAddress = configuration.BaseAddress;
+        _configuredAddresses = configuration.BaseAddress.Split(',', StringSplitOptions.TrimEntries);
         _mutations = new MutationLanes(_consensusSession, configuration, SignInRecovery);
         _logger = loggerFactory.CreateLogger<TcpMessageStream>();
         _sendingSemaphore = new SemaphoreSlim(1, 1);
@@ -1125,15 +1125,22 @@ public sealed partial class TcpMessageStream : IIggyClient
 
     private string[] DialCandidates()
     {
-        return DialCandidates(_currentAddress, _baseAddress, _rosterAddresses);
+        // A bad entry fails the connect even while an earlier one answers, so a typo cannot hide until failover.
+        if (!Array.TrueForAll(_configuredAddresses, address => ServerAddress.TryParse(address, out _, out _)))
+        {
+            throw new InvalidBaseAddressException();
+        }
+
+        return DialCandidates(_currentAddress, _configuredAddresses, _rosterAddresses);
     }
 
     /// <summary>
-    ///     The endpoints one connect dials, likeliest first: where the client currently is, the address it was
-    ///     configured with, then the roster it learned while connected. Duplicates are dropped, so an endpoint the
-    ///     roster merely spells differently does not earn a second attempt.
+    ///     The endpoints one connect dials, likeliest first: where the client currently is, the addresses it was
+    ///     configured with, in order, then the roster it learned while connected. Duplicates are dropped, so an
+    ///     endpoint the roster merely spells differently does not earn a second attempt.
     /// </summary>
-    internal static string[] DialCandidates(string currentAddress, string baseAddress, string[] rosterAddresses)
+    internal static string[] DialCandidates(string currentAddress, string[] configuredAddresses,
+        string[] rosterAddresses)
     {
         var candidates = new List<string>();
         if (!string.IsNullOrEmpty(currentAddress))
@@ -1141,7 +1148,7 @@ public sealed partial class TcpMessageStream : IIggyClient
             candidates.Add(currentAddress);
         }
 
-        foreach (var endpoint in rosterAddresses.Prepend(baseAddress))
+        foreach (var endpoint in configuredAddresses.Concat(rosterAddresses))
         {
             if (!string.IsNullOrEmpty(endpoint) &&
                 !candidates.Exists(known => ServerAddress.IsSame(known, endpoint)))
@@ -1189,7 +1196,7 @@ public sealed partial class TcpMessageStream : IIggyClient
         }
     }
 
-    private async Task<Stream> CreateSslStreamAndAuthenticate(Socket socket, TlsSettings tlsSettings,
+    private async Task<Stream> CreateSslStreamAndAuthenticate(Socket socket, TlsSettings tlsSettings, string host,
         CancellationToken token)
     {
         ValidateCertificatePath(tlsSettings.CertificatePath);
@@ -1202,9 +1209,12 @@ public sealed partial class TcpMessageStream : IIggyClient
         try
         {
             // The token carries the dial bound when other endpoints are queued behind this one: a peer that
-            // accepts TCP and never answers the ClientHello has no deadline of its own here either.
+            // accepts TCP and never answers the ClientHello has no deadline of its own here either. Without a
+            // configured name, each node is checked against the host it is dialed at: the name of one configured
+            // node would fail the handshake with every other.
+            var targetHost = string.IsNullOrEmpty(tlsSettings.Hostname) ? host : tlsSettings.Hostname;
             await sslStream.AuthenticateAsClientAsync(
-                new SslClientAuthenticationOptions { TargetHost = tlsSettings.Hostname }, token);
+                new SslClientAuthenticationOptions { TargetHost = targetHost }, token);
         }
         catch
         {
