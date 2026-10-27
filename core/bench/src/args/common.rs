@@ -30,11 +30,18 @@ use bench_report::numeric_parameter::BenchmarkNumericParameter;
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser};
 use iggy::prelude::{
-    DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, IggyByteSize, IggyDuration, IggyExpiry,
-    TransportProtocol,
+    DEFAULT_POLL_MAX_BYTES, DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, DeferredPollOptions,
+    IggyByteSize, IggyDuration, IggyError, IggyExpiry, TransportProtocol,
 };
+use iggy_binary_protocol::batch::{BATCH_HEADER_SIZE, BATCH_MESSAGE_HEADER_SIZE};
+use iggy_binary_protocol::requests::messages::{
+    MAX_DEFERRED_POLL_TIMEOUT_US, MAX_DEFERRED_POLL_WAIT_US, MIN_DEFERRED_POLL_MAX_BYTES,
+    MIN_DEFERRED_POLL_REPLY_MARGIN_US,
+};
+use iggy_binary_protocol::responses::messages::poll_messages::POLL_RESPONSE_HEADER_SIZE;
 use std::num::NonZeroU32;
 use std::str::FromStr;
+use std::time::Duration;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -51,6 +58,23 @@ pub struct IggyBenchArgs {
     /// Number of messages per batch
     #[arg(long, short = 'P', value_parser = BenchmarkNumericParameter::from_str, default_value_t = BenchmarkNumericParameter::Value(DEFAULT_MESSAGES_PER_BATCH.get()))]
     pub messages_per_batch: BenchmarkNumericParameter,
+
+    /// Maximum deliberate wait for the readiness minimum.
+    #[arg(long, default_value_t = IggyDuration::ONE_SECOND)]
+    pub max_wait: IggyDuration,
+
+    /// Readiness minimum, independent of the maximum messages per batch.
+    #[arg(long, default_value_t = 1)]
+    pub min_count: u32,
+
+    /// Maximum encoded poll reply bytes, including response and batch headers.
+    /// Defaults to 1 MiB, or to one full batch when that is larger.
+    #[arg(long)]
+    pub max_bytes: Option<u32>,
+
+    /// Overall budget for routing, readiness, I/O and response handling.
+    #[arg(long, default_value_t = DeferredPollOptions::default().request_timeout)]
+    pub request_timeout: IggyDuration,
 
     /// Number of message batches per actor (producer / consumer / producing consumer).
     /// This argument is mutually exclusive with `total_messages_size`.
@@ -118,6 +142,60 @@ pub struct IggyBenchArgs {
 }
 
 impl IggyBenchArgs {
+    pub fn poll_options(&self) -> DeferredPollOptions {
+        DeferredPollOptions {
+            max_wait: self.max_wait,
+            min_count: self.min_count,
+            max_bytes: self
+                .max_bytes
+                .unwrap_or_else(|| self.batch_reply_bytes().max(DEFAULT_POLL_MAX_BYTES)),
+            request_timeout: self.request_timeout,
+        }
+    }
+
+    /// Reply bytes of the largest batch of the largest messages. A poll that starts inside a
+    /// stored batch reads one more stored batch than the batches it covers.
+    fn batch_reply_bytes(&self) -> u32 {
+        let messages = u64::from(self.messages_per_batch.max());
+        let stored_batches = messages.div_ceil(u64::from(self.messages_per_batch.min())) + 1;
+        let bytes = POLL_RESPONSE_HEADER_SIZE as u64
+            + stored_batches * BATCH_HEADER_SIZE as u64
+            + messages * (BATCH_MESSAGE_HEADER_SIZE as u64 + u64::from(self.message_size.max()));
+        u32::try_from(bytes).unwrap_or(u32::MAX)
+    }
+
+    fn poll_options_error(&self, error: &IggyError) -> String {
+        let duration = |micros| IggyDuration::from(Duration::from_micros(micros));
+        match error {
+            IggyError::InvalidMessagesCount => format!(
+                "--min-count {} must be in 1..={}, the smallest --messages-per-batch",
+                self.min_count,
+                self.messages_per_batch.min()
+            ),
+            IggyError::InvalidCommand => format!(
+                "--max-wait {} must be at most {}, and --request-timeout {} must be at least --max-wait plus {} and at most {}",
+                self.max_wait,
+                duration(MAX_DEFERRED_POLL_WAIT_US),
+                self.request_timeout,
+                duration(MIN_DEFERRED_POLL_REPLY_MARGIN_US),
+                duration(MAX_DEFERRED_POLL_TIMEOUT_US)
+            ),
+            IggyError::InvalidSizeBytes => format!(
+                "--max-bytes {} must be at least {MIN_DEFERRED_POLL_MAX_BYTES}",
+                self.poll_options().max_bytes
+            ),
+            error => error.to_string(),
+        }
+    }
+
+    /// Producer-only kinds never poll, so their names leave out the poll options.
+    const fn polls(&self) -> bool {
+        !matches!(
+            self.benchmark_kind,
+            BenchmarkKindCommand::PinnedProducer(_) | BenchmarkKindCommand::BalancedProducer(_)
+        )
+    }
+
     pub fn transport_command(&self) -> &BenchmarkTransportCommand {
         self.benchmark_kind.transport_command()
     }
@@ -138,6 +216,19 @@ impl IggyBenchArgs {
     }
 
     pub fn validate(&mut self) {
+        if let Err(error) = self.poll_options().validate(self.messages_per_batch.min()) {
+            Self::command()
+                .error(ErrorKind::ValueValidation, self.poll_options_error(&error))
+                .exit();
+        }
+        if let Some(max_bytes) = self.max_bytes
+            && max_bytes < self.batch_reply_bytes()
+        {
+            println!(
+                "Warning: --max-bytes {max_bytes} holds less than one batch ({} B), so polls return partial batches.",
+                self.batch_reply_bytes()
+            );
+        }
         if self.output_dir().is_none()
             && (self.gitref().is_some()
                 || self.identifier().is_some()
@@ -411,6 +502,16 @@ impl IggyBenchArgs {
             transport.to_string(),
         ];
 
+        if self.polls() {
+            parts.push(format!(
+                "wait{}_min{}_bytes{}_timeout{}",
+                self.max_wait,
+                self.min_count,
+                self.poll_options().max_bytes,
+                self.request_timeout
+            ));
+        }
+
         if let Some(remark) = &self.remark() {
             parts.push(remark.clone());
         }
@@ -462,10 +563,83 @@ impl IggyBenchArgs {
             self.messages_per_batch(),
         );
 
+        if self.polls() {
+            name = format!(
+                "{name}, wait {}, min {}, max {}B, timeout {}",
+                self.max_wait,
+                self.min_count,
+                self.poll_options().max_bytes,
+                self.request_timeout
+            );
+        }
+
         if let Some(remark) = &self.remark() {
             name = format!("{name} ({remark})");
         }
 
         name
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(arguments: &[&str]) -> IggyBenchArgs {
+        parse_kind("pinned-consumer", arguments)
+    }
+
+    fn parse_kind(kind: &str, arguments: &[&str]) -> IggyBenchArgs {
+        let mut command = vec!["iggy-bench"];
+        command.extend_from_slice(arguments);
+        command.extend_from_slice(&[kind, "tcp"]);
+        IggyBenchArgs::try_parse_from(command).unwrap()
+    }
+
+    fn poll_error(arguments: &[&str]) -> String {
+        let args = parse(arguments);
+        let error = args
+            .poll_options()
+            .validate(args.messages_per_batch.min())
+            .unwrap_err();
+        args.poll_options_error(&error)
+    }
+
+    #[test]
+    fn default_max_bytes_should_fit_one_full_batch() {
+        assert_eq!(parse(&[]).poll_options().max_bytes, DEFAULT_POLL_MAX_BYTES);
+
+        let larger = parse(&["-m", "1024"]);
+        let max_bytes = larger.poll_options().max_bytes;
+        assert!(max_bytes > DEFAULT_POLL_MAX_BYTES);
+        assert!(u64::from(max_bytes) >= 1000 * (BATCH_MESSAGE_HEADER_SIZE as u64 + 1024));
+
+        let explicit = parse(&["-m", "1024", "--max-bytes", "4096"]);
+        assert_eq!(explicit.poll_options().max_bytes, 4096);
+    }
+
+    #[test]
+    fn poll_option_errors_should_name_the_flag() {
+        assert!(poll_error(&["-P", "10", "--min-count", "11"]).starts_with("--min-count 11 "));
+        assert!(
+            poll_error(&["--max-wait", "5s", "--request-timeout", "5s"])
+                .contains("--request-timeout 5s must be at least --max-wait plus 1s")
+        );
+        assert!(poll_error(&["--max-bytes", "1"]).starts_with("--max-bytes 1 "));
+    }
+
+    #[test]
+    fn producer_only_names_should_leave_out_poll_options() {
+        let producer = parse_kind("pinned-producer", &["-b", "10"]);
+        assert!(!producer.generate_dir_name().contains("_wait"));
+        assert!(!producer.generate_pretty_name().contains("wait"));
+
+        let consumer = parse(&["-b", "10"]);
+        assert!(consumer.generate_dir_name().contains("_wait1s_min1_"));
+        assert!(
+            consumer
+                .generate_pretty_name()
+                .contains(", wait 1s, min 1,")
+        );
     }
 }
