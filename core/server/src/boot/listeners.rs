@@ -392,7 +392,7 @@ pub(in crate::boot) fn make_replica_delegation_fns(
         let coord = Rc::clone(&inbound_coord);
         let bus = Rc::clone(&inbound_bus);
         replica_listener::admit_inbound(&inbound_bus, stream, move |stream, link, owner, slot| {
-            match coord.delegate_replica_inbound(stream, owner, slot, link) {
+            match coord.delegate_replica_inbound(stream, link, owner, slot) {
                 Ok(()) => info!(
                     replica = link.replica,
                     link = link.link,
@@ -416,7 +416,7 @@ pub(in crate::boot) fn make_replica_delegation_fns(
 
     let outbound_bus = Rc::clone(bus);
     let dialed: DialedReplicaFn = Rc::new(move |stream, link, owner| {
-        match coord.delegate_replica_outbound(stream, owner, link) {
+        match coord.delegate_replica_outbound(stream, link, owner) {
             Ok(()) => {
                 outbound_bus.mark_dial_pending(link.replica, link.link);
                 info!(

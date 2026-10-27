@@ -205,9 +205,9 @@ impl ShardZeroCoordinator {
     pub fn delegate_replica_inbound(
         &self,
         stream: TcpStream,
+        link: ReplicaLinkId,
         target: u16,
         slot: u64,
-        link: ReplicaLinkId,
     ) -> Result<(), SendError> {
         self.ship_replica_fd(stream, target, "delegate_replica_inbound", |fd| {
             LifecycleFrame::ReplicaInboundSetup { fd, slot, link }
@@ -229,8 +229,8 @@ impl ShardZeroCoordinator {
     pub fn delegate_replica_outbound(
         &self,
         stream: TcpStream,
-        target: u16,
         link: ReplicaLinkId,
+        target: u16,
     ) -> Result<(), SendError> {
         self.ship_replica_fd(stream, target, "delegate_replica_outbound", |fd| {
             LifecycleFrame::ReplicaOutboundSetup { fd, link }
@@ -793,7 +793,7 @@ mod tests {
 
         let target = 2;
         coord
-            .delegate_replica_inbound(client, target, 42, LINK)
+            .delegate_replica_inbound(client, LINK, target, 42)
             .expect("delegate ok");
 
         // Target shard should observe ReplicaInboundSetup echoing the slot.
@@ -841,7 +841,7 @@ mod tests {
         let (_server, _peer_addr) = accept.await.unwrap();
 
         coord
-            .delegate_replica_outbound(client, 3, LINK)
+            .delegate_replica_outbound(client, LINK, 3)
             .expect("delegate ok");
 
         let setup_frame = receivers[3].recv().await.unwrap();
@@ -869,7 +869,7 @@ mod tests {
         let (stream, _peer) = tcp_pair().await;
 
         assert!(matches!(
-            coord.delegate_replica_outbound(stream, 4, LINK),
+            coord.delegate_replica_outbound(stream, LINK, 4),
             Err(SendError::RoutingFailed(4))
         ));
         assert!(receivers.iter().all(|rx| rx.try_recv().is_err()));
