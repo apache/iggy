@@ -49,7 +49,7 @@ func (c *IggyTcpClient) GetClusterMetadata(ctx context.Context) (*iggcon.Cluster
 		if err = metadata.UnmarshalBinary(body); err != nil {
 			return nil, err
 		}
-		err = c.installRoster(fence, &metadata)
+		err = c.installRoster(fence, &metadata, nil)
 		if err == nil {
 			return &metadata, nil
 		}
@@ -77,16 +77,16 @@ func (c *IggyTcpClient) refreshRoster(ctx context.Context, link *tcpLink) error 
 	if err = metadata.UnmarshalBinary(body); err != nil {
 		return err
 	}
-	return c.installRoster(fence, &metadata)
+	return c.installRoster(fence, &metadata, link)
 }
 
-// installRoster installs metadata read under the session of fence, unless a
-// session change overtook that read.
-func (c *IggyTcpClient) installRoster(fence uint64, metadata *iggcon.ClusterMetadata) error {
+// installRoster installs metadata read on via under the session of fence,
+// unless a session change overtook that read.
+func (c *IggyTcpClient) installRoster(fence uint64, metadata *iggcon.ClusterMetadata, via *tcpLink) error {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
 	if c.sessionFence != fence {
 		return ierror.ErrUnauthenticated
 	}
-	return c.links.install(metadata)
+	return c.links.install(metadata, via)
 }

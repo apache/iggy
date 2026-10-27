@@ -272,13 +272,18 @@ fails locally. Writer references keep their bytes charged after abandonment or
 session reset until the writer releases them. Calls without an earlier context
 deadline have a 30-second operation budget.
 
+`tcp.WithServerAddress` can list several nodes of one cluster, separated by
+commas, as in `node-1:8090,node-2:8090`: a new client tries each in order, then
+the nodes of the last roster that it read.
+
 Managed connections reconnect independently, with at most four simultaneous
 dials and bounded exponential jitter. Each replica connection dials the address
 that its node advertises in the cluster roster. With a one-node roster, it dials
-the `tcp.WithServerAddress` endpoint instead, so a single node behind a port
-mapping or a port-forward stays reachable. `tcp.WithHeartbeatInterval` controls
-activity on every ready replica connection; the default is five seconds and a
-nonpositive interval disables it. Logout, disconnect, and close stop the tasks.
+the `tcp.WithServerAddress` address that reached the node instead, so a single
+node behind a port mapping or a port-forward stays reachable.
+`tcp.WithHeartbeatInterval` controls activity on every ready replica
+connection; the default is five seconds and a nonpositive interval disables it.
+Logout, disconnect, and close stop the tasks.
 
 After a session loss, the client registers a new session by itself. A
 registration that loses its link or reaches no endpoint goes again after the

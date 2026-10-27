@@ -87,6 +87,7 @@ func linkReady(link *tcpLink) bool {
 }
 
 func (r *replicaLinks) connect(ctx context.Context) (*tcpLink, error) {
+	configured := r.client.config.serverAddresses()
 	r.mu.Lock()
 	if err := ctx.Err(); err != nil {
 		r.mu.Unlock()
@@ -97,6 +98,10 @@ func (r *replicaLinks) connect(ctx context.Context) (*tcpLink, error) {
 		r.mu.Unlock()
 		return nil, ierror.ErrClientShutdown
 	default:
+	}
+	if err := validateServerAddresses(configured); err != nil {
+		r.mu.Unlock()
+		return nil, err
 	}
 	if link := r.anyLocked(); link != nil {
 		r.mu.Unlock()
@@ -116,7 +121,7 @@ func (r *replicaLinks) connect(ctx context.Context) (*tcpLink, error) {
 		r.tasks = &sync.WaitGroup{}
 	}
 	lifetime := r.ctx
-	candidates := append([]string{r.client.config.serverAddress}, r.roster...)
+	candidates := append(configured, r.roster...)
 	attempt := &connectAttempt{done: make(chan struct{})}
 	r.connectAttempt = attempt
 	r.mu.Unlock()
@@ -208,7 +213,8 @@ func reconnectDelay(base time.Duration, attempt uint32) time.Duration {
 	return time.Duration(rand.Int64N(int64(cap) + 1))
 }
 
-func (r *replicaLinks) install(metadata *iggcon.ClusterMetadata) error {
+// install rebuilds the slots from the roster that via carried.
+func (r *replicaLinks) install(metadata *iggcon.ClusterMetadata, via *tcpLink) error {
 	if len(metadata.Nodes) == 0 || len(metadata.Nodes) > maxReplicaSlots {
 		return ierror.ErrInvalidCommand
 	}
@@ -236,16 +242,16 @@ func (r *replicaLinks) install(metadata *iggcon.ClusterMetadata) error {
 			hasPrimary = true
 		}
 	}
-	// A single node advertises its own view of its address, such as a bind
-	// address or a container name. Only the configured endpoint is known to
-	// reach it.
-	if len(order) == 1 {
-		endpoints[order[0]] = r.client.config.serverAddress
-	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.ctx == nil || r.ctx.Err() != nil {
 		return ierror.ErrNotConnected
+	}
+	// A single node advertises its own view of its address, such as a bind
+	// address or a container name. Only a configured address is known to
+	// reach it.
+	if len(order) == 1 {
+		endpoints[order[0]] = r.configuredEndpointLocked(via)
 	}
 	r.primary, r.hasPrimary = primary, hasPrimary
 	r.hasRoster.Store(true)
@@ -276,6 +282,20 @@ func (r *replicaLinks) install(metadata *iggcon.ClusterMetadata) error {
 	}
 	r.retireBootstrapLocked()
 	return nil
+}
+
+// configuredEndpointLocked is the configured address that via was dialed at,
+// else the first one. GetClusterMetadata does not learn the link of its read,
+// so a nil via stands for the link that such a read takes.
+func (r *replicaLinks) configuredEndpointLocked(via *tcpLink) string {
+	configured := r.client.config.serverAddresses()
+	if via == nil {
+		via = r.anyLocked()
+	}
+	if via != nil && slices.Contains(configured, via.endpoint) {
+		return via.endpoint
+	}
+	return configured[0]
 }
 
 func (r *replicaLinks) retireBootstrapLocked() {
@@ -492,7 +512,7 @@ func (r *replicaLinks) address() string {
 	if r.bootstrap != nil {
 		return r.bootstrap.endpoint
 	}
-	return r.client.config.serverAddress
+	return r.client.config.serverAddresses()[0]
 }
 
 func (r *replicaLinks) startHeartbeat() {

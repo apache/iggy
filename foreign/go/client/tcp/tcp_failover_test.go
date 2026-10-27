@@ -23,6 +23,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"slices"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -879,6 +881,24 @@ func TestFailover_UsesTheDialedEndpointAsTheServerName(t *testing.T) {
 	assert.Equal(t, "127.0.0.1:"+port, client.GetConnectionInfo().ServerAddress)
 }
 
+// Taken from the whole list, the server name matches no certificate.
+func TestFailover_TakesTheServerNameFromTheDialedAddressOfAList(t *testing.T) {
+	certificate, caPath := selfSignedCert(t)
+	server := listenVSR(t,
+		func(conn net.Conn) net.Conn {
+			return tls.Server(conn, &tls.Config{Certificates: []tls.Certificate{certificate}})
+		},
+		singleNodeHandler(t, func() string { return "127.0.0.1:8090" }))
+
+	_, port, err := net.SplitHostPort(server.address())
+	require.NoError(t, err)
+	client := newDialingClient(t, "127.0.0.2:"+port+",127.0.0.1:"+port,
+		WithTLS(WithTLSCAFile(caPath), WithTLSValidateCertificate(true)))
+
+	require.NoError(t, client.Connect(context.Background()))
+	assert.Equal(t, "127.0.0.1:"+port, client.GetConnectionInfo().ServerAddress)
+}
+
 // A TLS configuration the client itself cannot satisfy says the same thing on
 // every attempt, so it has to reach the caller instead of being redialed every
 // interval forever -- which is what the default unlimited retries did with it.
@@ -962,6 +982,46 @@ func TestFailover_RejectsAConnectWithNoEndpointToDial(t *testing.T) {
 
 	require.ErrorIs(t, client.Connect(context.Background()), ierror.ErrCannotEstablishConnection)
 	assert.Error(t, client.Ping(context.Background()))
+}
+
+func TestWithServerAddress_TrimsEachAddressOfAList(t *testing.T) {
+	client := NewIggyTcpClient(nil, WithServerAddress(" 10.0.0.1:8090 , [2001:db8::1]:8090,node-3:8090 "))
+	t.Cleanup(func() { _ = client.Close() })
+
+	assert.Equal(t, []string{"10.0.0.1:8090", "[2001:db8::1]:8090", "node-3:8090"}, client.config.serverAddresses())
+	assert.Equal(t, "10.0.0.1:8090", client.GetConnectionInfo().ServerAddress)
+}
+
+func TestConnect_RejectsAListThatHoldsABadAddress(t *testing.T) {
+	for _, addresses := range []string{
+		"10.0.0.1:8090,",
+		"10.0.0.1:8090,node-3",
+		"10.0.0.1:8090,,node-3:8090",
+	} {
+		client := NewIggyTcpClient(nil, WithServerAddress(addresses))
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		require.ErrorIs(t, client.Connect(ctx), ierror.ErrInvalidServerAddress, addresses)
+		cancel()
+		require.NoError(t, client.Close())
+	}
+}
+
+// The first pass of the sweep dials every configured address.
+func TestConnect_ConnectsThroughTheNextConfiguredAddressWhenTheFirstIsDown(t *testing.T) {
+	var server *testListener
+	server = listenVSR(t, nil, singleNodeHandler(t, func() string { return server.address() }))
+	gone := deadAddress(t)
+	dials := &dialLog{}
+	client := newDialingClient(t, gone+","+server.address(),
+		WithAutoLogin(NewUsernamePasswordCredentials("iggy", "iggy")))
+	client.logger = slog.New(dials)
+
+	require.NoError(t, client.Connect(context.Background()))
+
+	require.GreaterOrEqual(t, len(dials.addresses()), 2)
+	assert.Equal(t, []string{gone, server.address()}, dials.addresses()[:2])
+	assert.Equal(t, server.address(), client.GetConnectionInfo().ServerAddress)
+	assert.Equal(t, 1, server.connections())
 }
 
 // Concurrent Connects are one attempt, and a caller that did not run it still
@@ -1065,4 +1125,31 @@ func deadAddress(t *testing.T) string {
 	address := listener.Addr().String()
 	require.NoError(t, listener.Close())
 	return address
+}
+
+// dialLog records the address of each dial that a client logs, in order.
+type dialLog struct {
+	mtx    sync.Mutex
+	dialed []string
+}
+
+func (l *dialLog) Enabled(context.Context, slog.Level) bool { return true }
+func (l *dialLog) WithAttrs([]slog.Attr) slog.Handler       { return l }
+func (l *dialLog) WithGroup(string) slog.Handler            { return l }
+func (l *dialLog) Handle(_ context.Context, record slog.Record) error {
+	l.mtx.Lock()
+	defer l.mtx.Unlock()
+	record.Attrs(func(attr slog.Attr) bool {
+		if attr.Key == "server_address" {
+			l.dialed = append(l.dialed, attr.Value.String())
+		}
+		return true
+	})
+	return nil
+}
+
+func (l *dialLog) addresses() []string {
+	l.mtx.Lock()
+	defer l.mtx.Unlock()
+	return slices.Clone(l.dialed)
 }

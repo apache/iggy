@@ -2380,7 +2380,7 @@ func TestPartitionLookupRotatesRosterOrderAndPrefersRefusingReplicaOnce(t *testi
 	var metadata iggcon.ClusterMetadata
 	require.NoError(t, metadata.UnmarshalBinary(metadataFrame[vsr.HeaderSize:]))
 	metadata.Nodes[1], metadata.Nodes[2] = metadata.Nodes[2], metadata.Nodes[1]
-	require.NoError(t, fixture.client.links.install(&metadata))
+	require.NoError(t, fixture.client.links.install(&metadata, nil))
 	stream, topic, _ := groupConsumer(t)
 	key := newTopicKey(stream, topic)
 	query := binary.LittleEndian.AppendUint32([]byte(key.stream+key.topic), 0)

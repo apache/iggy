@@ -429,7 +429,7 @@ func TestManagedLinksNeverUseFollowerForMetadataWhenRosterHasNoEligiblePrimary(t
 	require.NotNil(t, client.links.any())
 	require.Nil(t, client.links.metadata())
 	metadata := iggcon.ClusterMetadata{Nodes: make([]iggcon.ClusterNode, maxReplicaSlots+1)}
-	require.ErrorIs(t, client.links.install(&metadata), ierror.ErrInvalidCommand)
+	require.ErrorIs(t, client.links.install(&metadata, nil), ierror.ErrInvalidCommand)
 	require.Len(t, client.links.slots, 1, "invalid discovery cannot replace healthy slots")
 }
 
@@ -507,6 +507,32 @@ func TestManagedLinks_RedialSingleNodeAtConfiguredEndpoint(t *testing.T) {
 	require.Equal(t, server.address(), client.GetConnectionInfo().ServerAddress)
 	require.Equal(t, 2, server.connections())
 	require.NoError(t, client.Ping(ctx))
+}
+
+func TestManagedLinks_RedialSingleNodeAtTheConfiguredEndpointThatReachedIt(t *testing.T) {
+	advertised := deadAddress(t)
+	gone := deadAddress(t)
+	server := listenVSR(t, nil, singleNodeHandler(t, func() string { return advertised }))
+	client := newDialingClient(t, gone+","+server.address(), WithAutoLogin(NewUsernamePasswordCredentials("iggy", "iggy")))
+	ctx, cancel := context.WithTimeout(context.Background(), managedLinkTestBudget)
+	defer cancel()
+	require.NoError(t, client.Connect(ctx))
+	adopted := client.links.replica(0)
+	require.NotNil(t, adopted)
+
+	adopted.close(ierror.ErrTransientNotCommitted)
+	require.Eventually(t, func() bool {
+		link := client.links.replica(0)
+		return link != nil && link != adopted
+	}, managedLinkTestBudget, managedLinkPoll, "the slot redials the configured endpoint that reached the node")
+	redialed := client.links.replica(0)
+	_, err := client.GetClusterMetadata(ctx)
+	require.NoError(t, err)
+
+	require.Same(t, redialed, client.links.replica(0), "a roster refresh keeps the slot")
+	require.Equal(t, server.address(), redialed.endpoint)
+	require.Equal(t, server.address(), client.GetConnectionInfo().ServerAddress)
+	require.Equal(t, 2, server.connections())
 }
 
 // registerRequests returns the sign-ins that the servers saw.
@@ -1246,7 +1272,7 @@ func TestManagedLinksIgnoreDisabledTransportEndpoints(t *testing.T) {
 	var metadata iggcon.ClusterMetadata
 	require.NoError(t, metadata.UnmarshalBinary(frame[vsr.HeaderSize:]))
 	metadata.Nodes = append(metadata.Nodes, iggcon.ClusterNode{ReplicaID: 1, IP: "127.0.0.1", Role: iggcon.RoleFollower, Status: iggcon.Healthy})
-	require.NoError(t, client.links.install(&metadata))
+	require.NoError(t, client.links.install(&metadata, nil))
 	require.False(t, client.links.contains(1))
 	require.Len(t, client.links.slots, 1)
 }

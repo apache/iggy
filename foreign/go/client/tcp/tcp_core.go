@@ -28,6 +28,8 @@ import (
 	"net"
 	"os"
 	"slices"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -71,7 +73,8 @@ type IggyTcpClient struct {
 }
 
 type config struct {
-	// serverAddress is the address of the Iggy server
+	// serverAddress is the address of the Iggy server, or a comma-separated
+	// list of the addresses of several nodes of one cluster
 	serverAddress string
 	// tlsEnabled indicates whether to use TLS when connecting to the server
 	tlsEnabled bool
@@ -102,6 +105,33 @@ func defaultTcpClientConfig() config {
 	}
 }
 
+// serverAddresses is each address of serverAddress, in order.
+func (c config) serverAddresses() []string {
+	addresses := strings.Split(c.serverAddress, ",")
+	for index, address := range addresses {
+		addresses[index] = strings.TrimSpace(address)
+	}
+	return addresses
+}
+
+// validateServerAddresses checks each address of a list. A single address is
+// not checked here, so its faults stay those of the dial.
+func validateServerAddresses(addresses []string) error {
+	if len(addresses) == 1 {
+		return nil
+	}
+	for _, address := range addresses {
+		host, port, err := net.SplitHostPort(address)
+		if err != nil || host == "" {
+			return ierror.ErrInvalidServerAddress
+		}
+		if number, err := strconv.ParseUint(port, 10, 16); err != nil || number == 0 {
+			return ierror.ErrInvalidServerAddress
+		}
+	}
+	return nil
+}
+
 type tcpClientReconnectionConfig struct {
 	enabled          bool
 	maxRetries       uint32
@@ -120,7 +150,7 @@ func defaultTcpClientReconnectionConfig() tcpClientReconnectionConfig {
 
 type tlsConfig struct {
 	// tlsDomain is the domain to use for TLS when connecting to the server
-	// If empty, automatically extracts the hostname/IP from serverAddress
+	// If empty, each dial uses the hostname/IP of the address that it dials
 	tlsDomain string
 	// tlsCAFile is the path to the CA file to use for TLS
 	tlsCAFile string
@@ -167,8 +197,11 @@ func NewPersonalAccessTokenCredentials(token string) Credentials {
 	}
 }
 
-// WithServerAddress Sets the server address for the TCP client. The link to
-// the node of a one-node cluster always dials this address.
+// WithServerAddress Sets the server address for the TCP client, or a
+// comma-separated list of the addresses of several nodes of one cluster. A new
+// client dials each in order, then the nodes of the last roster that it read.
+// The link to the node of a one-node cluster dials the configured address that
+// reached it.
 func WithServerAddress(address string) Option {
 	return func(opts *Options) {
 		opts.config.serverAddress = address
@@ -207,7 +240,7 @@ func WithTLS(tlsOpts ...TLSOption) Option {
 }
 
 // WithTLSDomain sets the TLS domain for server name indication (SNI).
-// If not provided, the domain will be automatically extracted from the server address.
+// If not provided, each dial takes the domain from the address that it dials.
 func WithTLSDomain(domain string) TLSOption {
 	return func(cfg *tlsConfig) {
 		cfg.tlsDomain = domain
