@@ -1354,8 +1354,13 @@ class IggyClient:
         `IggyExpiry.ServerDefault()` and `IggyExpiry.NeverExpire()` create a token
         that never expires.
 
-        The Python SDK cannot delete a token yet. Delete it by name with the
-        server's HTTP API.
+        Cancelling the await can leave the token created, and its secret is lost.
+        No error is raised. A later metadata call on the same client raises
+        `PendingOperationError` with kind `lane_blocked`, unless the client
+        reconnects first.
+
+        The Python SDK cannot delete a token yet. To delete one, call the server's
+        HTTP API with its name. That call needs a login token.
 
         On TCP, QUIC, and WebSocket, a lost reply raises `PendingOperationError`
         with `operation_id`. Call `resolve_operation` with that ID to learn the
@@ -1368,11 +1373,8 @@ class IggyClient:
         On TCP, QUIC, and WebSocket, a replayed create that already committed, or
         a name clash, raises `RuntimeError` with code 51
         (`PersonalAccessTokenAlreadyExists`). On HTTP, the same case raises
-        `RuntimeError` with code 300.
-
-        Cancelling the await can leave the token created, and its secret is lost.
-        No error is raised. A later metadata call on the same client raises
-        `PendingOperationError` with kind `lane_blocked`.
+        `RuntimeError` with code 300. Code 300 is also the generic HTTP error, so
+        read the message to tell a name clash from other failures.
 
         If the token was created, its secret cannot be recovered. Delete the token
         by name over HTTP, then create it again to get a usable secret.
@@ -1387,8 +1389,9 @@ class IggyClient:
         Raises:
             ValueError: If the expiry is invalid.
             RuntimeError: If the server refuses the request, for example because
-                the expiry is too far in the future. On TCP, QUIC, and WebSocket,
-                an invalid name is refused before anything is sent.
+                the expiry is too far in the future. An invalid name raises code 4
+                on TCP, QUIC, and WebSocket, before anything is sent. On HTTP, the
+                server refuses it with code 50.
             PendingOperationError: If the reply is lost on TCP, QUIC, or WebSocket.
                 See above.
         """
