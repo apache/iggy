@@ -387,7 +387,7 @@ class TestLoginIdentity:
                 user = await client.get_user("iggy")
                 assert user is not None
                 assert identity.user_id == user.id
-                assert personal_access_token not in repr(identity)
+                assert identity.access_token is None
             finally:
                 _delete_personal_access_token(api, jwt, name)
         finally:

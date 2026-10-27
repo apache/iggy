@@ -1351,9 +1351,13 @@ class IggyClient:
         Create a personal access token for the currently authenticated user.
 
         The token is returned only once, so store it when this call completes.
-        If the reply is lost, a retry raises `RuntimeError` because the token
-        already exists, and its secret cannot be recovered. Delete the token by
-        name and create it again to get a usable secret.
+        `IggyExpiry.ServerDefault()` and `IggyExpiry.NeverExpire()` create a token
+        that never expires.
+
+        If the reply is lost, the call raises `PendingOperationError` with the
+        operation ID. Call `resolve_operation` with that ID to learn the outcome.
+        If the token was created, its secret cannot be recovered. Delete the token
+        by name and create it again to get a usable secret.
 
         Args:
             name: Token name as `str`.
@@ -1364,7 +1368,9 @@ class IggyClient:
 
         Raises:
             ValueError: If the expiry is invalid.
-            RuntimeError: If the request fails.
+            RuntimeError: If the server refuses the request, for example because the
+                name is invalid or the expiry is too far in the future.
+            PendingOperationError: If the reply is lost. See above.
         """
     def get_user(
         self, user_id: builtins.str | builtins.int
