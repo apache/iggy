@@ -19,17 +19,20 @@
 
 package org.apache.iggy.client.blocking.tcp;
 
+import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
 import org.apache.iggy.client.blocking.IggyBaseClient;
 import org.apache.iggy.client.blocking.MessagesClientBaseTest;
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.DeferredPollOptions;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PollingStrategy;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.List;
 import java.util.Optional;
 
@@ -51,6 +54,48 @@ class MessagesTcpClientTest extends MessagesClientBaseTest {
      * explicit partitions only), so messages with the same key must land on
      * the same partition.
      */
+
+    @Test
+    void shouldCancelAWaitingDeferredPollWithoutCommittingItsPartialBatch() throws InterruptedException {
+        setUpStreamAndTopic();
+        messagesClient.sendMessages(
+                STREAM_NAME, TOPIC_NAME, Partitioning.partitionId(0L), List.of(Message.of("unseen")));
+        var asyncClient = AsyncIggyTcpClient.builder()
+                .host(serverHost())
+                .port(serverTcpPort())
+                .build();
+        try {
+            asyncClient.connect().join();
+            asyncClient.users().login("iggy", "iggy").join();
+            var messages = asyncClient.messages();
+            var consumer = Consumer.of(0L);
+            messages.pollMessages(
+                            STREAM_NAME, TOPIC_NAME, Optional.of(0L), consumer, PollingStrategy.first(), 1L, false)
+                    .join();
+            Duration wait = Duration.ofMillis(500);
+            var pending = messages.pollMessagesDeferred(
+                    STREAM_NAME,
+                    TOPIC_NAME,
+                    Optional.of(0L),
+                    consumer,
+                    PollingStrategy.next(),
+                    2L,
+                    true,
+                    DeferredPollOptions.defaults().withMaxWait(wait).withMinCount(2));
+            Thread.sleep(wait.dividedBy(5).toMillis());
+            assertThat(pending.cancel(false)).isTrue();
+            Thread.sleep(wait.plusMillis(100).toMillis());
+
+            var polled = messages.pollMessages(
+                            STREAM_NAME, TOPIC_NAME, Optional.of(0L), consumer, PollingStrategy.next(), 1L, false)
+                    .join();
+            assertThat(polled.messages()).hasSize(1);
+            assertThat(new String(polled.messages().get(0).payload(), StandardCharsets.UTF_8))
+                    .isEqualTo("unseen");
+        } finally {
+            asyncClient.close().join();
+        }
+    }
 
     @Test
     void shouldRouteSameMessageKeyToSamePartition() {

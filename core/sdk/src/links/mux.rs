@@ -58,12 +58,17 @@ const WEBSOCKET_CLOSE_REASON: &str = "Client requested shutdown";
 
 type Waiter = oneshot::Sender<Result<Reply, IggyError>>;
 
+struct QueuedFrame {
+    frame: Frame,
+    uses_write_permit: bool,
+}
+
 /// A connection that carries many requests at once. Dropping the link stops
 /// its tasks, which closes the connection.
 #[derive(Debug)]
 pub(crate) struct MuxLink {
     shared: Arc<MuxShared>,
-    queue: mpsc::Sender<Frame>,
+    queue: mpsc::Sender<QueuedFrame>,
     tasks: LinkTasks,
 }
 
@@ -73,6 +78,7 @@ struct MuxShared {
     no_session_eviction: AtomicBool,
     pending: StdMutex<Pending>,
     permits: Semaphore,
+    write_permits: Semaphore,
     /// Before bind, request ids repeat, so one such exchange runs at a time.
     unbound: Mutex<()>,
     /// Turns true once, when the link closes.
@@ -83,7 +89,7 @@ struct MuxShared {
 struct Pending {
     /// Cleared when the link closes. A closed link never opens again.
     open: bool,
-    waiters: HashMap<u64, Waiter>,
+    waiters: HashMap<u64, (Waiter, Option<usize>)>,
 }
 
 #[derive(Debug)]
@@ -106,6 +112,7 @@ struct PendingEntry<'a> {
     /// Set for a repeated id that reached the queue: its late reply would
     /// answer the next request with the same id.
     close_if_abandoned: bool,
+    cancellation: Option<(mpsc::OwnedPermit<QueuedFrame>, Frame)>,
 }
 
 impl MuxLink {
@@ -165,15 +172,47 @@ impl MuxLink {
             .map_err(|_| IggyError::NotConnected)?
             .map_err(|_| IggyError::NotConnected)?;
         let (waiter, reply) = oneshot::channel();
-        let mut entry = self.shared.wait_for(request, waiter)?;
+        let cancellation = if let Some(header) = frame.header.deferred_cancellation() {
+            let permit = timeout_at(deadline, self.queue.clone().reserve_owned())
+                .await
+                .map_err(|_| IggyError::NotConnected)?
+                .map_err(|_| IggyError::NotConnected)?;
+            Some((
+                permit,
+                Frame {
+                    header,
+                    body: Bytes::new(),
+                },
+            ))
+        } else {
+            None
+        };
+        let write_permit = timeout_at(deadline, self.shared.write_permits.acquire())
+            .await
+            .map_err(|_| IggyError::NotConnected)?
+            .map_err(|_| IggyError::NotConnected)?;
+        let mut entry = self
+            .shared
+            .wait_for(request, waiter, frame.response_body_limit())?;
         if !matches!(
-            timeout_at(deadline, self.queue.send(frame)).await,
+            timeout_at(
+                deadline,
+                self.queue.send(QueuedFrame {
+                    frame,
+                    uses_write_permit: true,
+                })
+            )
+            .await,
             Ok(Ok(()))
         ) {
             return Err(IggyError::NotConnected);
         }
+        // A successful enqueue transfers the permit to the writer. A failed
+        // or cancelled send still returns it through the borrowed guard.
+        write_permit.forget();
         *sent = true;
         entry.close_if_abandoned = unbound;
+        entry.cancellation = cancellation;
         match timeout_at(deadline, reply).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(IggyError::Disconnected),
@@ -216,7 +255,7 @@ impl MuxLink {
 
     fn start<Writer, Reader>(
         peer: SocketAddr,
-        writer: impl FnOnce(mpsc::Receiver<Frame>, Arc<MuxShared>) -> Writer,
+        writer: impl FnOnce(mpsc::Receiver<QueuedFrame>, Arc<MuxShared>) -> Writer,
         reader: impl FnOnce(Arc<MuxShared>) -> Reader,
     ) -> Self
     where
@@ -231,10 +270,13 @@ impl MuxLink {
                 waiters: HashMap::new(),
             }),
             permits: Semaphore::new(MAX_PENDING_PER_LINK),
+            write_permits: Semaphore::new(LINK_WRITE_QUEUE),
             unbound: Mutex::new(()),
             closed: watch::Sender::new(false),
         });
-        let (queue, frames) = mpsc::channel(LINK_WRITE_QUEUE);
+        // At most MAX_PENDING_PER_LINK slots are held for cancellation. The
+        // remaining slots let the FIFO drain, while write_permits bounds payloads.
+        let (queue, frames) = mpsc::channel(LINK_WRITE_QUEUE + MAX_PENDING_PER_LINK);
         let tasks = LinkTasks {
             writer: tokio::spawn(writer(frames, Arc::clone(&shared))),
             reader: tokio::spawn(reader(Arc::clone(&shared))),
@@ -248,7 +290,12 @@ impl MuxLink {
 }
 
 impl MuxShared {
-    fn wait_for(&self, request: u64, waiter: Waiter) -> Result<PendingEntry<'_>, IggyError> {
+    fn wait_for(
+        &self,
+        request: u64,
+        waiter: Waiter,
+        limit: Option<usize>,
+    ) -> Result<PendingEntry<'_>, IggyError> {
         let mut pending = self.lock_pending();
         if !pending.open {
             return Err(IggyError::NotConnected);
@@ -263,11 +310,12 @@ impl MuxShared {
                 Err(IggyError::NotConnected)
             }
             Entry::Vacant(entry) => {
-                entry.insert(waiter);
+                entry.insert((waiter, limit));
                 Ok(PendingEntry {
                     shared: self,
                     request,
                     close_if_abandoned: false,
+                    cancellation: None,
                 })
             }
         }
@@ -281,7 +329,7 @@ impl MuxShared {
             return self.deliver_buffered(buffer);
         }
         while let Some(&header) = message.first_chunk::<HEADER_SIZE>() {
-            let size = self.frame_size(&header)?;
+            let (size, _) = self.frame_size(&header)?;
             if message.len() < size {
                 break;
             }
@@ -295,7 +343,7 @@ impl MuxShared {
     /// Cuts every whole frame off the front of `buffer` and dispatches it.
     fn deliver_buffered(&self, buffer: &mut BytesMut) -> Result<(), IggyError> {
         while let Some(&header) = buffer.first_chunk::<HEADER_SIZE>() {
-            let size = self.frame_size(&header)?;
+            let (size, _) = self.frame_size(&header)?;
             if buffer.len() < size {
                 break;
             }
@@ -305,14 +353,25 @@ impl MuxShared {
         Ok(())
     }
 
-    fn frame_size(&self, header: &[u8; HEADER_SIZE]) -> Result<usize, IggyError> {
-        response_size(header).map_err(|_| {
+    /// The size of the frame, and whether something reads its body. Nothing
+    /// reads a reply that no request waits for.
+    fn frame_size(&self, header: &[u8; HEADER_SIZE]) -> Result<(usize, bool), IggyError> {
+        let size = response_size(header).map_err(|_| {
             error!(
                 "Received a frame shorter than its header from {}.",
                 self.peer
             );
             IggyError::Disconnected
-        })
+        })?;
+        if peek_command(header) != Command::Reply {
+            return Ok((size, true));
+        }
+        match self.lock_pending().waiters.get(&reply_request_id(header)) {
+            Some((_, Some(limit))) if size - HEADER_SIZE > *limit => {
+                Err(IggyError::InvalidSizeBytes)
+            }
+            waiter => Ok((size, waiter.is_some())),
+        }
     }
 
     /// Gives a reply to the request that waits for it. An error closes the link,
@@ -323,7 +382,7 @@ impl MuxShared {
                 let request = reply_request_id(&reply.header);
                 let waiter = self.lock_pending().waiters.remove(&request);
                 match waiter {
-                    Some(waiter) => {
+                    Some((waiter, _)) => {
                         let _ = waiter.send(Ok(reply));
                     }
                     None => trace!(
@@ -359,20 +418,26 @@ impl MuxShared {
             std::mem::take(&mut pending.waiters)
         };
         self.permits.close();
+        self.write_permits.close();
         self.closed.send_replace(true);
-        for waiter in waiters.into_values() {
+        for (waiter, _) in waiters.into_values() {
             let _ = waiter.send(Err(reason.clone()));
         }
     }
 
     /// The next frame to write, or `None` once the link closed or every
     /// sender went away.
-    async fn next_frame(&self, frames: &mut mpsc::Receiver<Frame>) -> Option<Frame> {
+    async fn next_frame(&self, frames: &mut mpsc::Receiver<QueuedFrame>) -> Option<Frame> {
         let mut closed = self.closed.subscribe();
         tokio::select! {
             biased;
             _ = closed.wait_for(|closed| *closed) => None,
-            frame = frames.recv() => frame,
+            frame = frames.recv() => frame.map(|queued| {
+                if queued.uses_write_permit {
+                    self.write_permits.add_permits(1);
+                }
+                queued.frame
+            }),
         }
     }
 
@@ -393,6 +458,14 @@ impl Drop for PendingEntry<'_> {
             .waiters
             .remove(&self.request)
             .is_some();
+        if abandoned && let Some((permit, frame)) = self.cancellation.take() {
+            // Reserved before sending the poll, so cancellation cannot lose a
+            // race with queue backpressure and always follows the original frame.
+            permit.send(QueuedFrame {
+                frame,
+                uses_write_permit: false,
+            });
+        }
         if abandoned && self.close_if_abandoned {
             debug!(
                 "Closing the link to {}: request {} left before its reply.",
@@ -405,7 +478,7 @@ impl Drop for PendingEntry<'_> {
 
 async fn write_tcp<W: AsyncWrite + Unpin>(
     mut writer: W,
-    mut frames: mpsc::Receiver<Frame>,
+    mut frames: mpsc::Receiver<QueuedFrame>,
     shared: Arc<MuxShared>,
 ) {
     while let Some(frame) = shared.next_frame(&mut frames).await {
@@ -432,7 +505,7 @@ async fn write_tcp<W: AsyncWrite + Unpin>(
 
 async fn read_tcp<R: AsyncRead + Unpin>(mut reader: R, shared: Arc<MuxShared>) {
     let reason = loop {
-        match read_tcp_reply(&mut reader).await {
+        match read_tcp_reply(&mut reader, &shared).await {
             Ok(reply) => {
                 if let Err(reason) = shared.dispatch(reply) {
                     break reason;
@@ -449,12 +522,30 @@ async fn read_tcp<R: AsyncRead + Unpin>(mut reader: R, shared: Arc<MuxShared>) {
     shared.close(&reason);
 }
 
-async fn read_tcp_reply<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Reply> {
+async fn read_tcp_reply<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    shared: &MuxShared,
+) -> io::Result<Reply> {
     let mut header = [0; HEADER_SIZE];
     reader.read_exact(&mut header).await?;
-    let size = response_size(&header)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "frame shorter than its header"))?;
+    let (size, read) = shared
+        .frame_size(&header)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
     let body_len = size - HEADER_SIZE;
+    if !read {
+        let copied = tokio::io::copy(
+            &mut (&mut *reader).take(body_len as u64),
+            &mut tokio::io::sink(),
+        )
+        .await?;
+        if copied != body_len as u64 {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        return Ok(Reply {
+            header,
+            body: Bytes::new(),
+        });
+    }
     let mut body = BytesMut::with_capacity(body_len);
     // The limit stops a read at the end of the frame, even when the buffer
     // got more capacity than it asked for.
@@ -472,7 +563,7 @@ async fn read_tcp_reply<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Repl
 
 async fn write_websocket<S: AsyncRead + AsyncWrite + Unpin>(
     mut sink: SplitSink<WebSocketStream<S>, Message>,
-    mut frames: mpsc::Receiver<Frame>,
+    mut frames: mpsc::Receiver<QueuedFrame>,
     shared: Arc<MuxShared>,
 ) {
     while let Some(frame) = shared.next_frame(&mut frames).await {
@@ -540,6 +631,7 @@ mod tests {
         CLIENT, DUPLEX_CAPACITY, LOCALHOST, read_request_header, reply, request, request_with_body,
     };
     use iggy_binary_protocol::consensus::{EvictionHeader, EvictionReason, RequestHeader};
+    use std::collections::BTreeSet;
     use std::io::IoSlice;
     use std::pin::Pin;
     use std::task::{Context, Poll};
@@ -728,6 +820,224 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn given_a_cancelled_deferred_poll_should_send_cancellation_and_keep_the_connection() {
+        let (websocket, server) = websocket_link().await;
+        for (link, mut peer) in [tcp_link(), (websocket, Peer::WebSocket(Box::new(server)))] {
+            let deadline = Instant::now() + TEST_BUDGET;
+            let mut frame = request(1, BOUND_SESSION);
+            frame.header.reserved =
+                iggy_binary_protocol::codes::POLL_MESSAGES_DEFERRED_CODE.to_le_bytes();
+            {
+                let cancelled = send(&link, frame, deadline);
+                tokio::pin!(cancelled);
+                tokio::select! {
+                    result = &mut cancelled => panic!("no reply was sent: {result:?}"),
+                    (header, _) = peer.read_request() => assert_eq!(header.request, 1),
+                }
+            }
+            let (cancel, body) = timeout(TEST_BUDGET, peer.read_request()).await.unwrap();
+            assert_eq!(
+                cancel.reserved,
+                iggy_binary_protocol::codes::CANCEL_DEFERRED_REQUEST_CODE.to_le_bytes()
+            );
+            assert_eq!(cancel.request, 1);
+            assert_eq!(cancel.session, BOUND_SESSION);
+            assert!(body.is_empty());
+
+            let answer = async {
+                let (header, _) = peer.read_request().await;
+                peer.write(reply(header.request, b"next")).await;
+            };
+            let (next, ()) = tokio::join!(send(&link, request(2, BOUND_SESSION), deadline), answer);
+            assert_eq!(next.unwrap().body[..], *b"next");
+        }
+    }
+
+    #[tokio::test]
+    async fn given_more_parked_polls_than_write_slots_when_sending_should_keep_serving_requests() {
+        const PARKED_POLLS: usize = LINK_WRITE_QUEUE * 2;
+        let (websocket, server) = websocket_link().await;
+        for (link, mut peer) in [tcp_link(), (websocket, Peer::WebSocket(Box::new(server)))] {
+            let deadline = Instant::now() + TEST_BUDGET;
+            let parked = futures::future::join_all((1..=PARKED_POLLS as u64).map(|id| {
+                let mut frame = request(id, BOUND_SESSION);
+                frame.header.reserved =
+                    iggy_binary_protocol::codes::POLL_MESSAGES_DEFERRED_CODE.to_le_bytes();
+                send(&link, frame, deadline)
+            }));
+            tokio::pin!(parked);
+            tokio::select! {
+                results = &mut parked => panic!("polls received no reply: {results:?}"),
+                result = timeout(TEST_BUDGET, async {
+                    for _ in 0..PARKED_POLLS {
+                        peer.read_request().await;
+                    }
+                    let answer = async {
+                        let (header, _) = peer.read_request().await;
+                        peer.write(reply(header.request, b"ordinary")).await;
+                    };
+                    let (result, ()) = tokio::join!(
+                        send(&link, request(PARKED_POLLS as u64 + 1, BOUND_SESSION), deadline),
+                        answer,
+                    );
+                    assert_eq!(result.unwrap().body[..], *b"ordinary");
+                }) => result.expect("parked polls must leave write capacity"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn given_aborted_polls_and_full_queue_when_writer_resumes_should_preserve_order_and_drain()
+     {
+        for websocket in [false, true] {
+            let (client, server) = duplex(DUPLEX_CAPACITY);
+            let (resume, paused) = oneshot::channel();
+            let (link, mut peer) = if websocket {
+                let (client, server) = tokio::join!(
+                    client_async("ws://localhost/", client),
+                    accept_async(server)
+                );
+                let (sink, stream) = client.unwrap().0.split();
+                (
+                    MuxLink::start(
+                        LOCALHOST,
+                        |frames, shared| async move {
+                            paused.await.unwrap();
+                            write_websocket(sink, frames, shared).await;
+                        },
+                        |shared| read_websocket(stream, shared),
+                    ),
+                    Peer::WebSocket(Box::new(server.unwrap())),
+                )
+            } else {
+                let (reader, writer) = tokio::io::split(client);
+                (
+                    MuxLink::start(
+                        LOCALHOST,
+                        |frames, shared| async move {
+                            paused.await.unwrap();
+                            write_tcp(BufWriter::new(writer), frames, shared).await;
+                        },
+                        |shared| read_tcp(BufReader::new(reader), shared),
+                    ),
+                    Peer::Tcp(server),
+                )
+            };
+            let deadline = Instant::now() + TEST_BUDGET;
+            let poll = |id| {
+                let mut frame = request(id, BOUND_SESSION);
+                frame.header.reserved =
+                    iggy_binary_protocol::codes::POLL_MESSAGES_DEFERRED_CODE.to_le_bytes();
+                send(&link, frame, deadline)
+            };
+            let mut abandoned = Box::pin(futures::future::join_all(
+                (1..=LINK_WRITE_QUEUE as u64).map(poll),
+            ));
+            timeout(TEST_BUDGET, async {
+                while link.queue.capacity() != MAX_PENDING_PER_LINK - LINK_WRITE_QUEUE {
+                    assert!(futures::poll!(&mut abandoned).is_pending());
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("every original poll must enter the FIFO before cancellation");
+            assert_eq!(link.shared.write_permits.available_permits(), 0);
+            let mut not_enqueued = Box::pin(poll((LINK_WRITE_QUEUE + 1) as u64));
+            assert!(futures::poll!(&mut not_enqueued).is_pending());
+            drop(not_enqueued);
+            assert_eq!(link.shared.write_permits.available_permits(), 0);
+            assert_eq!(
+                link.queue.capacity(),
+                MAX_PENDING_PER_LINK - LINK_WRITE_QUEUE
+            );
+            drop(abandoned);
+
+            let mut waiting = Box::pin(futures::future::join_all(
+                ((LINK_WRITE_QUEUE + 1) as u64..=(LINK_WRITE_QUEUE + MAX_PENDING_PER_LINK) as u64)
+                    .map(poll),
+            ));
+            timeout(TEST_BUDGET, async {
+                while link.queue.capacity() != 0 {
+                    assert!(futures::poll!(&mut waiting).is_pending());
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("cancellations and reservations must fill the FIFO");
+            assert_eq!(
+                link.queue.capacity(),
+                0,
+                "cancels and reservations fill the FIFO"
+            );
+            assert_eq!(link.shared.write_permits.available_permits(), 0);
+            resume.send(()).unwrap();
+
+            let mut pending_cancels = BTreeSet::new();
+            tokio::select! {
+                results = &mut waiting => panic!("polls received no reply: {results:?}"),
+                result = timeout(TEST_BUDGET, async {
+                    let mut abandoned = BTreeSet::new();
+                    for _ in 0..LINK_WRITE_QUEUE {
+                        let (header, _) = peer.read_request().await;
+                        assert!(abandoned.insert(header.request));
+                        assert_eq!(header.reserved, iggy_binary_protocol::codes::POLL_MESSAGES_DEFERRED_CODE.to_le_bytes());
+                    }
+                    for _ in 0..LINK_WRITE_QUEUE {
+                        let (header, body) = peer.read_request().await;
+                        assert!(abandoned.remove(&header.request), "cancel must match an earlier poll exactly once");
+                        assert_eq!(header.reserved, iggy_binary_protocol::codes::CANCEL_DEFERRED_REQUEST_CODE.to_le_bytes());
+                        assert!(body.is_empty());
+                    }
+                    for _ in 0..MAX_PENDING_PER_LINK {
+                        let (header, _) = peer.read_request().await;
+                        assert_eq!(header.reserved, iggy_binary_protocol::codes::POLL_MESSAGES_DEFERRED_CODE.to_le_bytes());
+                        assert!(pending_cancels.insert(header.request));
+                    }
+                }) => result.expect("queued frames must drain despite held cancel reservations"),
+            }
+            drop(waiting);
+
+            timeout(TEST_BUDGET, async {
+                for _ in 0..MAX_PENDING_PER_LINK {
+                    let (header, body) = peer.read_request().await;
+                    assert_eq!(
+                        header.reserved,
+                        iggy_binary_protocol::codes::CANCEL_DEFERRED_REQUEST_CODE.to_le_bytes()
+                    );
+                    assert!(
+                        pending_cancels.remove(&header.request),
+                        "cancel must match an earlier poll exactly once"
+                    );
+                    assert!(body.is_empty());
+                }
+                let answer = async {
+                    let (header, _) = peer.read_request().await;
+                    peer.write(reply(header.request, b"after cancellation"))
+                        .await;
+                };
+                let (result, ()) = tokio::join!(
+                    send(
+                        &link,
+                        request(
+                            (LINK_WRITE_QUEUE + MAX_PENDING_PER_LINK + 1) as u64,
+                            BOUND_SESSION
+                        ),
+                        deadline
+                    ),
+                    answer,
+                );
+                assert_eq!(result.unwrap().body[..], *b"after cancellation");
+            })
+            .await
+            .expect("all cancellations and subsequent traffic must reach the peer");
+            assert_eq!(
+                link.shared.write_permits.available_permits(),
+                LINK_WRITE_QUEUE
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn given_a_lost_link_when_requests_are_pending_should_fail_all_of_them_at_once() {
         let (link, mut peer) = tcp_link();
         let deadline = Instant::now() + TEST_BUDGET;
@@ -832,28 +1142,41 @@ mod tests {
 
         let duplicate = send(&link, request(1, BOUND_SESSION), deadline).await;
         assert_eq!(duplicate.unwrap_err(), IggyError::NotConnected);
+        assert_eq!(
+            link.shared.write_permits.available_permits(),
+            LINK_WRITE_QUEUE
+        );
         peer.write(reply(1, b"first")).await;
         assert_eq!(first.await.unwrap().body[..], *b"first");
     }
 
     #[tokio::test(start_paused = true)]
     async fn given_a_sender_waiting_for_a_permit_when_the_link_closes_should_fail_at_once() {
-        let (link, peer) = tcp_link();
-        let far = Instant::now() + Duration::from_secs(3600);
-        let all_permits = u32::try_from(MAX_PENDING_PER_LINK).unwrap();
-        let _held = link.shared.permits.acquire_many(all_permits).await.unwrap();
-        let started = Instant::now();
-        let waiting = send(&link, request(1, BOUND_SESSION), far);
-        tokio::pin!(waiting);
-        tokio::select! {
-            result = &mut waiting => panic!("no permit was free: {result:?}"),
-            () = tokio::task::yield_now() => {}
+        for write_permits in [false, true] {
+            let (link, peer) = tcp_link();
+            let far = Instant::now() + Duration::from_secs(3600);
+            let (semaphore, count) = if write_permits {
+                (&link.shared.write_permits, LINK_WRITE_QUEUE)
+            } else {
+                (&link.shared.permits, MAX_PENDING_PER_LINK)
+            };
+            let _held = semaphore
+                .acquire_many(u32::try_from(count).unwrap())
+                .await
+                .unwrap();
+            let started = Instant::now();
+            let waiting = send(&link, request(1, BOUND_SESSION), far);
+            tokio::pin!(waiting);
+            tokio::select! {
+                result = &mut waiting => panic!("no permit was free: {result:?}"),
+                () = tokio::task::yield_now() => {}
+            }
+
+            drop(peer);
+
+            assert_eq!(waiting.await.unwrap_err(), IggyError::NotConnected);
+            assert_eq!(started.elapsed(), Duration::ZERO);
         }
-
-        drop(peer);
-
-        assert_eq!(waiting.await.unwrap_err(), IggyError::NotConnected);
-        assert_eq!(started.elapsed(), Duration::ZERO);
     }
 
     #[tokio::test]
@@ -890,8 +1213,8 @@ mod tests {
         let message = Bytes::from(message);
         let (first_waiter, first) = oneshot::channel();
         let (second_waiter, second) = oneshot::channel();
-        let _first_entry = link.shared.wait_for(1, first_waiter).unwrap();
-        let _second_entry = link.shared.wait_for(2, second_waiter).unwrap();
+        let _first_entry = link.shared.wait_for(1, first_waiter, None).unwrap();
+        let _second_entry = link.shared.wait_for(2, second_waiter, None).unwrap();
         let mut buffer = BytesMut::new();
 
         link.shared
@@ -907,6 +1230,39 @@ mod tests {
             message[second_frame + HEADER_SIZE..].as_ptr()
         );
         assert!(buffer.is_empty());
+    }
+
+    #[tokio::test]
+    async fn given_reply_limits_when_requests_share_a_link_should_bound_only_the_matching_reply() {
+        const BODY_LIMIT: usize = 40;
+        let (link, _peer) = tcp_link();
+        let (limited, _limited_reply) = oneshot::channel();
+        let (ordinary, _ordinary_reply) = oneshot::channel();
+        let _limited_entry = link.shared.wait_for(1, limited, Some(BODY_LIMIT)).unwrap();
+        let _ordinary_entry = link.shared.wait_for(2, ordinary, None).unwrap();
+        let body = vec![0; BODY_LIMIT + 1];
+        let mut frames = reply(3, &body);
+        frames.extend_from_slice(&reply(2, &body));
+        let mut reader = frames.as_slice();
+
+        let orphan = read_tcp_reply(&mut reader, &link.shared).await.unwrap();
+        assert!(
+            orphan.body.is_empty(),
+            "a cancelled reply is drained without retaining its body"
+        );
+        let ordinary = read_tcp_reply(&mut reader, &link.shared).await.unwrap();
+        assert_eq!(ordinary.body.as_ref(), body);
+
+        let oversized = reply(1, &body);
+        let mut header_only = &oversized[..HEADER_SIZE];
+        let error = read_tcp_reply(&mut header_only, &link.shared)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::InvalidData,
+            "reject before reading the body"
+        );
     }
 
     #[tokio::test]

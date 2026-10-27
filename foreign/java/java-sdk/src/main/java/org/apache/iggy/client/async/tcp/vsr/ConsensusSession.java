@@ -481,6 +481,7 @@ public final class ConsensusSession {
         maxPendingBytes = bytes;
     }
 
+    /** An offset mutation takes its progress turn before joining the partition mutation queue. */
     public CompletableFuture<Ticket> acquire(
             LaneKey lane, boolean mutation, long frameBytes, long deadline, EventExecutor executor) {
         ConsensusSession owner = owner();
@@ -488,6 +489,7 @@ public final class ConsensusSession {
             return owner.acquire(lane, mutation, frameBytes, deadline, executor);
         }
         CompletableFuture<Ticket> result = new CompletableFuture<>();
+        LaneKey mutationLane = lane.progress() && mutation ? new LaneKey(lane.incarnation(), lane.partition()) : null;
         var timer = executor.schedule(
                 () -> result.completeExceptionally(
                         new IggyServerException(IggyErrorCode.TRANSIENT_NOT_ACCEPTED.getCode())),
@@ -500,24 +502,41 @@ public final class ConsensusSession {
             timer.cancel(false);
             boolean wakeNext;
             synchronized (this) {
-                var waiting = laneAdmissions.get(lane);
-                wakeNext = waiting.getFirst() == result && !lanes.containsKey(lane);
-                waiting.remove(result);
-                if (waiting.isEmpty()) {
-                    laneAdmissions.remove(lane);
+                wakeNext = removeAdmission(lane, result);
+                if (mutationLane != null) {
+                    wakeNext |= removeAdmission(mutationLane, result);
                 }
             }
             if (wakeNext) {
                 changed();
             }
         });
-        acquireWhenAvailable(lane, mutation, frameBytes, deadline, result);
+        acquireWhenAvailable(lane, mutationLane, mutation, frameBytes, deadline, result, false);
         return result;
     }
 
-    @SuppressWarnings("checkstyle:CyclomaticComplexity")
+    private boolean removeAdmission(LaneKey lane, CompletableFuture<Ticket> result) {
+        var waiting = laneAdmissions.get(lane);
+        if (waiting == null) {
+            return false;
+        }
+        boolean wakeNext = waiting.getFirst() == result && !lanes.containsKey(lane);
+        waiting.remove(result);
+        if (waiting.isEmpty()) {
+            laneAdmissions.remove(lane);
+        }
+        return wakeNext;
+    }
+
+    @SuppressWarnings({"checkstyle:CyclomaticComplexity", "checkstyle:NPathComplexity"})
     private void acquireWhenAvailable(
-            LaneKey lane, boolean mutation, long frameBytes, long deadline, CompletableFuture<Ticket> result) {
+            LaneKey lane,
+            LaneKey mutationLane,
+            boolean mutation,
+            long frameBytes,
+            long deadline,
+            CompletableFuture<Ticket> result,
+            boolean mutationQueued) {
         CompletableFuture<Void> changed = null;
         Ticket admitted = null;
         RuntimeException failure = null;
@@ -526,24 +545,43 @@ public final class ConsensusSession {
                 return;
             }
             Ticket blocking = lanes.get(lane);
+            Ticket mutationBlocking = mutationLane == null ? null : lanes.get(mutationLane);
             if (blocking != null && blocking.retained) {
                 failure = new IggyOperationException(IggyErrorCode.LANE_BLOCKED, blocking.operationId);
+            } else if (mutationBlocking != null && mutationBlocking.retained) {
+                failure = new IggyOperationException(IggyErrorCode.LANE_BLOCKED, mutationBlocking.operationId);
             } else if (mutation && frameBytes > maxPendingBytes) {
                 failure = new IggyInvalidArgumentException("Request exceeds the pending operation byte limit");
             } else if (deadline - System.nanoTime() <= 0) {
                 failure = new IggyServerException(IggyErrorCode.TRANSIENT_NOT_ACCEPTED.getCode());
-            } else if (laneAdmissions.get(lane).getFirst() != result
-                    || blocking != null
-                    || (mutation
-                            && (pendingOperations >= maxPendingOperations
-                                    || frameBytes > maxPendingBytes - pendingBytes))) {
+            } else if (laneAdmissions.get(lane).getFirst() != result || blocking != null) {
                 changed = admissionChanged;
             } else {
-                admitted = new Ticket(this, lane, mutation, frameBytes, generation);
-                lanes.put(lane, admitted);
-                if (mutation) {
-                    pendingOperations++;
-                    pendingBytes += frameBytes;
+                // A store enters the mutation queue only after its progress turn,
+                // so a parked poll cannot hold back producers through that store.
+                if (mutationLane != null && !mutationQueued) {
+                    laneAdmissions
+                            .computeIfAbsent(mutationLane, ignored -> new ArrayDeque<>())
+                            .addLast(result);
+                    mutationQueued = true;
+                }
+                if (mutationBlocking != null
+                        || (mutationLane != null
+                                && laneAdmissions.get(mutationLane).getFirst() != result)
+                        || (mutation
+                                && (pendingOperations >= maxPendingOperations
+                                        || frameBytes > maxPendingBytes - pendingBytes))) {
+                    changed = admissionChanged;
+                } else {
+                    admitted = new Ticket(this, lane, mutationLane, mutation, frameBytes, generation);
+                    lanes.put(lane, admitted);
+                    if (mutationLane != null) {
+                        lanes.put(mutationLane, admitted);
+                    }
+                    if (mutation) {
+                        pendingOperations++;
+                        pendingBytes += frameBytes;
+                    }
                 }
             }
         }
@@ -554,16 +592,28 @@ public final class ConsensusSession {
                 admitted.complete();
             }
         } else {
-            changed.thenRun(() -> acquireWhenAvailable(lane, mutation, frameBytes, deadline, result));
+            boolean queued = mutationQueued;
+            changed.thenRun(
+                    () -> acquireWhenAvailable(lane, mutationLane, mutation, frameBytes, deadline, result, queued));
         }
     }
 
     public void checkRetained(LaneKey lane) {
+        checkRetained(lane, false);
+    }
+
+    public void checkRetained(LaneKey lane, boolean mutation) {
         ConsensusSession owner = owner();
         synchronized (owner) {
             Ticket ticket = owner.lanes.get(lane);
             if (ticket != null && ticket.retained) {
                 throw new IggyOperationException(IggyErrorCode.LANE_BLOCKED, ticket.operationId);
+            }
+            if (mutation && lane.progress()) {
+                Ticket blocking = owner.lanes.get(new LaneKey(lane.incarnation(), lane.partition()));
+                if (blocking != null && blocking.retained) {
+                    throw new IggyOperationException(IggyErrorCode.LANE_BLOCKED, blocking.operationId);
+                }
             }
         }
     }
@@ -743,8 +793,12 @@ public final class ConsensusSession {
         } while (clientIdLow == 0 && clientIdHigh == 0);
     }
 
-    public record LaneKey(long incarnation, long partition) {
+    public record LaneKey(long incarnation, long partition, boolean progress) {
         public static final LaneKey METADATA = new LaneKey(0, 0);
+
+        public LaneKey(long incarnation, long partition) {
+            this(incarnation, partition, false);
+        }
     }
 
     /** A copy of the reply body of a proved commit, or no body and the code of a proved committed rejection. */
@@ -754,6 +808,7 @@ public final class ConsensusSession {
     public static final class Ticket {
         private final ConsensusSession owner;
         private final LaneKey lane;
+        private final LaneKey mutationLane;
         private final boolean mutation;
         private final long bytes;
         private long generation;
@@ -771,9 +826,16 @@ public final class ConsensusSession {
         private boolean bytesReleased;
         private boolean restarting;
 
-        private Ticket(ConsensusSession owner, LaneKey lane, boolean mutation, long bytes, long generation) {
+        private Ticket(
+                ConsensusSession owner,
+                LaneKey lane,
+                LaneKey mutationLane,
+                boolean mutation,
+                long bytes,
+                long generation) {
             this.owner = owner;
             this.lane = lane;
+            this.mutationLane = mutationLane;
             this.mutation = mutation;
             this.bytes = bytes;
             this.generation = generation;
@@ -1002,6 +1064,9 @@ public final class ConsensusSession {
                 }
                 completed = true;
                 owner.lanes.remove(lane, this);
+                if (mutationLane != null) {
+                    owner.lanes.remove(mutationLane, this);
+                }
                 owner.retained.remove(operationId, this);
                 if (mutation && !abandoned) {
                     owner.pendingOperations--;
