@@ -27,7 +27,6 @@ stream = "test_stream"
 topics = ["test_topic"]
 schema = "raw"
 batch_length = 100
-poll_interval = "5ms"
 
 [plugin_config]
 print_payload = true

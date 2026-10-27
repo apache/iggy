@@ -117,14 +117,15 @@ use tracing::{debug, warn};
 use crate::dispatch::reads::hold_for_frontier;
 use crate::http::admission::{RelayTargetRefusal, RelayTargets};
 use crate::http::error::{
-    CustomError, PartitionWriteError, ReadError, error_response, forward_busy,
-    gateway_timeout_response, primary_http_socket, relay_refused, with_retry_after,
+    CustomError, PartitionWriteError, ReadError, coded_error_response, error_response,
+    forward_busy, gateway_timeout_response, primary_http_socket, relay_refused, with_retry_after,
 };
 use crate::http::extractor::{bearer_token, credential_key, resolve_credential};
 use crate::http::relay_proof::{RELAY_PROOF_LIFETIME, RelayKey, UnprovenRelay, parse_decimal};
 use crate::http::state::{
     APPLIED_OP_HEADER, DURABILITY_HEADER, FloorReads, ForwardState, HttpInner, VIEW_HEADER,
 };
+use crate::http::wire::DeferredPollQuery;
 use crate::http::{HttpState, close_connection};
 use crate::server_error::ServerError;
 
@@ -160,11 +161,13 @@ pub(in crate::http) const METADATA_FLOOR_PATH: &str = "/cluster/metadata-floor";
 /// The route a metadata floor request proves: it relays no partition request.
 const NO_PARTITION_ROUTE: HeaderValue = HeaderValue::from_static("");
 
-/// One bound for a partition request on the node that received it: the
-/// metadata floor read and hold, every local attempt, primary lookup and relay
-/// attempt, a relayed poll body, the hop target's metadata hold, and the local
-/// lane and reply waits. A relay proof lives as long, so no relay attempt
-/// outlives its proof.
+/// One bound for an immediate partition request on the node that received it:
+/// the metadata floor read and hold, every local attempt, primary lookup and
+/// relay attempt, a relayed poll body, the hop target's metadata hold, and the
+/// local lane and reply waits. A deferred poll takes this bound from its
+/// `request_timeout` instead. Each relay attempt signs a new proof, which the
+/// hop target checks when the request head arrives, so a longer wait needs no
+/// longer proof.
 pub(in crate::http) const PARTITION_REQUEST_DEADLINE: Duration = RELAY_PROOF_LIFETIME;
 
 /// Keeps the hop target's deadline before the contacted node's, so the hop
@@ -190,7 +193,8 @@ const FORWARD_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const FORWARD_RETRY_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Cap on concurrent forwards held by this node: metadata forwards and
-/// partition relays. Deliberately its own budget: a forward
+/// partition relays. Relayed deferred polls have a second cap of the same
+/// size. Deliberately its own budget: a forward
 /// parks no reply slot and touches none of the shard bus machinery the
 /// partition-write caps protect, and counting forwards against those caps
 /// would let a slow primary starve this node's own direct clients.
@@ -368,6 +372,8 @@ pub(in crate::http) struct PartitionRequest {
     headers: HeaderMap,
     path_and_query: String,
     body: Bytes,
+    /// A deferred poll, which holds its relay slots for its whole wait.
+    deferred: bool,
     pub(in crate::http) hop: PartitionHop,
     pub(in crate::http) deadline: Instant,
 }
@@ -484,7 +490,9 @@ pub(in crate::http) fn build_forward_state(
         scheme,
         body_limit,
         in_flight: Rc::new(Cell::new(0)),
+        deferred_in_flight: Rc::new(Cell::new(0)),
         relay_targets: RelayTargets::default(),
+        deferred_relay_targets: RelayTargets::default(),
         floor_reads: FloorReads::default(),
     })
 }
@@ -685,7 +693,12 @@ async fn relay_to_primary(
         return AttemptOutcome::Relay(not_admitted());
     }
     if guard.is_none() {
-        *guard = ForwardGuard::admit(&state.forward.in_flight);
+        let in_flight = if request.deferred {
+            &state.forward.deferred_in_flight
+        } else {
+            &state.forward.in_flight
+        };
+        *guard = ForwardGuard::admit(in_flight);
         if guard.is_none() {
             return AttemptOutcome::Relay(forward_busy());
         }
@@ -962,6 +975,7 @@ fn record_relayed_floor(state: &HttpInner, user_id: u32, response: &Response) {
     state.metadata_watermarks.record(user_id, applied);
 }
 
+#[allow(clippy::too_many_lines)]
 async fn attach_partition_request(state: HttpState, request: Request, next: Next) -> Response {
     let received = Instant::now();
     let hop = match partition_hop(
@@ -978,10 +992,25 @@ async fn attach_partition_request(state: HttpState, request: Request, next: Next
         Ok(bearer) => bearer,
         Err(error) => return CustomError::from(error).into_response(),
     };
+    let deferred =
+        request.method() == Method::GET && request.uri().path().ends_with("/messages/deferred");
+    let request_budget = if deferred {
+        let query = match axum::extract::Query::<DeferredPollQuery>::try_from_uri(request.uri()) {
+            Ok(query) => query.0,
+            Err(_) => return CustomError::from(IggyError::InvalidCommand).into_response(),
+        };
+        let options = iggy_common::DeferredPollOptions::from(query);
+        if let Err(error) = options.validate(u32::MAX) {
+            return CustomError::from(error).into_response();
+        }
+        options.request_timeout.get_duration()
+    } else {
+        PARTITION_REQUEST_DEADLINE
+    };
     let deadline = received
         + match hop {
-            PartitionHop::Target(route) => route.budget.min(PARTITION_REQUEST_DEADLINE),
-            PartitionHop::Contacted | PartitionHop::Unrouted => PARTITION_REQUEST_DEADLINE,
+            PartitionHop::Target(route) => route.budget.min(request_budget),
+            PartitionHop::Contacted | PartitionHop::Unrouted => request_budget,
         };
     // The contacted node chose the partition and authenticated the caller
     // from metadata at this op. Before that op is applied here, the topic, the
@@ -1008,9 +1037,14 @@ async fn attach_partition_request(state: HttpState, request: Request, next: Next
             verified.user_id,
             verified.user_created_at,
         );
-        match state.forward.relay_targets.admit(credential) {
+        let relay_targets = if deferred {
+            &state.forward.deferred_relay_targets
+        } else {
+            &state.forward.relay_targets
+        };
+        match relay_targets.admit(credential) {
             Ok(guard) => Some(guard),
-            Err(refusal) => return relay_target_refused(refusal),
+            Err(refusal) => return relay_target_refused(refusal, deferred),
         }
     } else {
         None
@@ -1044,6 +1078,7 @@ async fn attach_partition_request(state: HttpState, request: Request, next: Next
             .map_or("/", |path_and_query| path_and_query.as_str())
             .to_owned(),
         body: body.clone(),
+        deferred,
         hop,
         deadline,
     };
@@ -1533,18 +1568,26 @@ fn not_primary(primary: Option<PartitionPrimary>) -> Response {
 
 /// The contacted node relays this answer to its caller as-is: a 429 when the
 /// caller's credential saturated its own share, a 503 under node-wide pressure.
-fn relay_target_refused(refusal: RelayTargetRefusal) -> Response {
-    with_retry_after(match refusal {
-        RelayTargetRefusal::CredentialSaturated => error_response(
+/// A deferred poll carries the id and code of `DeferredPollCapacityExceeded`
+/// instead, because deferred clients back off on that body, not on the status.
+fn relay_target_refused(refusal: RelayTargetRefusal, deferred: bool) -> Response {
+    let (status, code, reason) = match refusal {
+        RelayTargetRefusal::CredentialSaturated => (
             StatusCode::TOO_MANY_REQUESTS,
             "too_many_relayed_requests",
             "credential reached its relayed-request cap on the partition primary; await outstanding requests and retry",
         ),
-        RelayTargetRefusal::BudgetSaturated => error_response(
+        RelayTargetRefusal::BudgetSaturated => (
             StatusCode::SERVICE_UNAVAILABLE,
             "relay_target_busy",
             "partition primary is at its relay-target budget; retry with backoff",
         ),
+    };
+    with_retry_after(if deferred {
+        let capacity = IggyError::DeferredPollCapacityExceeded;
+        coded_error_response(status, capacity.as_code(), capacity.as_string(), reason)
+    } else {
+        error_response(status, code, reason)
     })
 }
 
@@ -1689,6 +1732,7 @@ mod tests {
     use shard::{LifecycleFrame, ShardFrame, shard_channel};
 
     use crate::dispatch::test_support::{create_one_partition_in, create_reader_request};
+    use crate::http::admission::MAX_IN_FLIGHT_RELAY_TARGETS;
     use crate::http::handlers::HTTP_UNREGISTERED_CLIENT_ID;
     use crate::http::reads::tests::{
         READER_CREATED_AT, READER_ID, commit_user_request, read_state, read_state_on,
@@ -2010,6 +2054,7 @@ mod tests {
             headers: forwarded_headers(&HeaderMap::new()),
             path_and_query: format!("{SEND_PATH}?consumer_id=o'brien"),
             body: Bytes::new(),
+            deferred: false,
             hop: PartitionHop::Contacted,
             deadline: Instant::now(),
         };
@@ -2395,6 +2440,152 @@ mod tests {
         );
     }
 
+    #[compio::test]
+    async fn given_full_relay_slots_when_a_deferred_poll_is_relayed_should_refuse_with_the_deferred_capacity_code()
+     {
+        const DEFERRED_POLL_PATH: &str = "/streams/stream/topics/topic/messages/deferred?consumer_id=1&partition_id=0&kind=offset&value=0&count=1";
+        let capacity = IggyError::DeferredPollCapacityExceeded;
+        for (refusal, status) in [
+            (
+                RelayTargetRefusal::CredentialSaturated,
+                StatusCode::TOO_MANY_REQUESTS,
+            ),
+            (
+                RelayTargetRefusal::BudgetSaturated,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ] {
+            let (answered, retry_after, body) =
+                refused_relayed_poll(DEFERRED_POLL_PATH, refusal).await;
+            assert_eq!((answered, retry_after), (status, true), "{refusal:?}");
+            // The Rust client reads the id and the Java client the code.
+            assert_eq!(body["id"], capacity.as_code(), "{refusal:?}");
+            assert_eq!(body["code"], capacity.as_string(), "{refusal:?}");
+        }
+    }
+
+    #[compio::test]
+    async fn given_full_relay_slots_when_an_immediate_poll_is_relayed_should_keep_the_relay_refusal()
+     {
+        const POLL_PATH: &str = "/streams/stream/topics/topic/messages?consumer_id=1&partition_id=0&kind=offset&value=0&count=1";
+        for (refusal, status, code) in [
+            (
+                RelayTargetRefusal::CredentialSaturated,
+                StatusCode::TOO_MANY_REQUESTS,
+                "too_many_relayed_requests",
+            ),
+            (
+                RelayTargetRefusal::BudgetSaturated,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "relay_target_busy",
+            ),
+        ] {
+            let (answered, retry_after, body) = refused_relayed_poll(POLL_PATH, refusal).await;
+            assert_eq!((answered, retry_after), (status, true), "{refusal:?}");
+            assert_eq!(body["id"], status.as_u16(), "{refusal:?}");
+            assert_eq!(body["code"], code, "{refusal:?}");
+        }
+    }
+
+    /// Relays a poll at `path` to a hop target whose relay slots are full in the
+    /// way `refusal` names: the share of the caller's credential, or every slot
+    /// of the node. Returns the status, whether `Retry-After` rides along, and
+    /// the body.
+    async fn refused_relayed_poll(
+        path: &str,
+        refusal: RelayTargetRefusal,
+    ) -> (StatusCode, bool, serde_json::Value) {
+        let (sender, shard_inbox, _shard_replies) = shard_channel(0, 1, 1);
+        let state = read_state_on(Some(sender), Some(KEY_MATERIAL));
+        let metadata = state.shard.plane.metadata();
+        let namespace = create_one_partition_in(&metadata.mux_stm);
+        state
+            .shard
+            .shards_table()
+            .insert(namespace, PartitionLocation::new(ShardId::new(0), 0));
+        commit_user_request(
+            &state,
+            READER_CREATED_AT,
+            Operation::CreateUser,
+            &create_reader_request().to_bytes(),
+        );
+        metadata.applied_frontier().advance(READER_CREATED_AT);
+        let route = PartitionRoute {
+            partition_id: 0,
+            context: metadata
+                .mux_stm
+                .streams()
+                .poll_metadata(namespace, None, HTTP_UNREGISTERED_CLIENT_ID)
+                .expect("the partition resolves")
+                .context(READER_CREATED_AT),
+            budget: PARTITION_REQUEST_DEADLINE,
+        };
+        let route = HeaderValue::try_from(route.to_string()).expect("a route is a header value");
+        let proof = RelayKey::derive(KEY_MATERIAL)
+            .prove(&Method::GET, path, &route, IggyTimestamp::now())
+            .expect("a proof is a header value");
+        let bearer = state
+            .jwt
+            .generate(READER_ID, IggyTimestamp::from(READER_CREATED_AT))
+            .expect("a token for the reader")
+            .access_token;
+        let mut headers = marked(&route, Some(&proof));
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::try_from(format!("Bearer {bearer}")).expect("a bearer is a header value"),
+        );
+        let credential = match refusal {
+            RelayTargetRefusal::CredentialSaturated => {
+                let Ok(verified) = resolve_credential(&state, &bearer).await else {
+                    panic!("the bearer of the reader verifies");
+                };
+                Some(credential_key(
+                    &bearer,
+                    verified.jwt_id.as_deref(),
+                    verified.user_id,
+                    verified.user_created_at,
+                ))
+            }
+            RelayTargetRefusal::BudgetSaturated => None,
+        };
+        let targets = if path.contains("/messages/deferred") {
+            &state.forward.deferred_relay_targets
+        } else {
+            &state.forward.relay_targets
+        };
+        let mut held = Vec::new();
+        let full = (0..=MAX_IN_FLIGHT_RELAY_TARGETS).find_map(|other| {
+            let key = credential
+                .clone()
+                .unwrap_or_else(|| format!("other-credential-{other}"));
+            targets.admit(key).map(|slot| held.push(slot)).err()
+        });
+        assert_eq!(full, Some(refusal), "the slots fill as the case names");
+        let service = TowerToHyperService::new(router(
+            state.clone(),
+            state.forward.body_limit,
+            None,
+            None,
+            false,
+        ));
+        let response = service
+            .call(received(Method::GET, path, headers))
+            .await
+            .expect("the hop target answers");
+        drop(held);
+        assert!(
+            shard_inbox.try_recv().is_err(),
+            "a refused relay reaches no shard"
+        );
+        let status = response.status();
+        let retry_after = response.headers().contains_key(RETRY_AFTER);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the refusal body");
+        let body = serde_json::from_slice(&body).expect("an error body");
+        (status, retry_after, body)
+    }
+
     #[test]
     fn each_relay_kind_retries_only_its_proof_of_non_admission() {
         fn reply(status: StatusCode, code: Option<u32>, kind: RelayKind) -> bool {
@@ -2682,6 +2873,7 @@ mod tests {
             headers: HeaderMap::new(),
             path_and_query: SEND_PATH.to_owned(),
             body: Bytes::new(),
+            deferred: false,
             hop,
             deadline: Instant::now() + budget,
         }

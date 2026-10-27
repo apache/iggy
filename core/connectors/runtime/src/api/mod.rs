@@ -224,7 +224,7 @@ async fn get_stats(State(context): State<Arc<RuntimeContext>>) -> Json<Connector
 mod tests {
     use super::*;
     use crate::configs::connectors::create_connectors_config_provider;
-    use crate::configs::runtime::{ConnectorsConfig, LocalConnectorsConfig};
+    use crate::configs::runtime::{ConnectorsConfig, IggyConfig, LocalConnectorsConfig};
     use crate::manager::sink::SinkManager;
     use crate::manager::source::SourceManager;
     use crate::metrics::Metrics;
@@ -375,7 +375,7 @@ mod tests {
             start_time: IggyTimestamp::now(),
             iggy_clients: Arc::new(IggyClients {
                 producer: IggyClient::default(),
-                consumer: IggyClient::default(),
+                config: IggyConfig::default(),
             }),
             state_factory: Arc::new(FileStateFactory::new(
                 directory.path().display().to_string(),

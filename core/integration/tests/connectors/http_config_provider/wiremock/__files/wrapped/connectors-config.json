@@ -26,7 +26,6 @@
             "topics": ["test_topic"],
             "schema": "json",
             "batch_length": 100,
-            "poll_interval": "5ms",
             "consumer_group": "stdout_sink_connector"
           }
         ],
