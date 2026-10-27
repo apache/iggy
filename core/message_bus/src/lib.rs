@@ -1152,7 +1152,7 @@ impl IggyMessageBus {
     /// Shard 0: the links to `replica` to dial now. Empty while the bundle
     /// of the peer is Up or tearing down.
     #[must_use]
-    pub fn replica_links_to_dial(&self, replica: u8) -> Vec<ReplicaLinkId> {
+    pub(crate) fn replica_links_to_dial(&self, replica: u8) -> Vec<ReplicaLinkId> {
         let epoch = self.bundle(replica).epoch();
         (0..self.link_layout().links())
             .map(|link| ReplicaLinkId {
@@ -1168,7 +1168,7 @@ impl IggyMessageBus {
     /// its peer and no handshake of it is in flight. A dial that outlived
     /// a teardown fails this check and is dropped.
     #[must_use]
-    pub fn wants_replica_dial(&self, link: ReplicaLinkId) -> bool {
+    pub(crate) fn wants_replica_dial(&self, link: ReplicaLinkId) -> bool {
         let bundle = self.bundle(link.replica);
         bundle.dials()
             && bundle.epoch() == link.epoch

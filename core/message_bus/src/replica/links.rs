@@ -137,9 +137,11 @@ impl Default for LinkLayout {
 /// Index of `peer` among the peers of `self_id`, in ascending id order.
 ///
 /// Replica ids are dense (`0..replica_count`, enforced by the cluster
-/// configuration), so the slot skips only the own id.
+/// configuration), so the slot skips only the own id. `peer` must differ
+/// from `self_id`.
 #[must_use]
 pub const fn peer_slot(self_id: u8, peer: u8) -> u8 {
+    debug_assert!(peer != self_id, "a node is not its own peer");
     if peer < self_id { peer } else { peer - 1 }
 }
 
